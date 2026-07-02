@@ -1,5 +1,5 @@
 // 平台绑定状态：存在 ~/.botmux/platform.json，记录这台机器绑到了哪个平台。
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -39,6 +39,19 @@ export function readPlatformBinding(): PlatformBinding | null {
 
 export function writePlatformBinding(b: PlatformBinding): void {
   atomicWriteFileSync(PLATFORM_BINDING_PATH, JSON.stringify(b, null, 2), { mode: 0o600 });
+}
+
+/**
+ * 解绑：删除本地平台绑定文件（~/.botmux/platform.json）。
+ * 平台侧 owner 点了「解绑」并吊销了 machine token 后，daemon 收到 unbound 消息时调用，
+ * 把本地凭证清干净——下次 `botmux bind` 重新写入即可重新绑定。文件不存在视为已清理。
+ */
+export function clearPlatformBinding(): void {
+  try {
+    if (existsSync(PLATFORM_BINDING_PATH)) rmSync(PLATFORM_BINDING_PATH);
+  } catch {
+    /* ignore */
+  }
 }
 
 /**

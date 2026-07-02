@@ -1,7 +1,7 @@
 // test/dashboard-ipc.test.ts
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createHmac, randomBytes } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startIpcServer, setLarkAppId, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
@@ -10,7 +10,7 @@ import * as groupsStore from '../src/services/groups-store.js';
 import * as oncallStore from '../src/services/oncall-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
-import { registerBot } from '../src/bot-registry.js';
+import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeTeamRoleFile } from '../src/core/role-resolver.js';
@@ -83,6 +83,7 @@ afterEach(async () => {
   // Reset module-level larkAppId between tests so groups endpoints don't
   // leak state across describes.
   setLarkAppId('');
+  __testOnly_resetBotRegistry();
   setIpcAuthSecret(null);
 });
 
@@ -126,6 +127,65 @@ describe('POST /api/sessions/:sessionId/close', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.ok).toBe(true);
+  });
+});
+
+describe('POST /api/sessions/:sessionId/lock', () => {
+  it('persists the lock flag and publishes a dashboard patch', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-lock-'));
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    const seen: any[] = [];
+    const off = dashboardEventBus.subscribe(e => seen.push(e));
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init();
+      const session = sessionStore.createSession('oc_lock', 'om_lock', 'lock me', 'group');
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const lockRes = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/lock`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ locked: true }),
+      });
+
+      expect(lockRes.status).toBe(200);
+      expect(await lockRes.json()).toEqual({ ok: true, locked: true });
+      expect(sessionStore.getSession(session.sessionId)?.locked).toBe(true);
+      expect(seen).toContainEqual({
+        type: 'session.update',
+        body: { sessionId: session.sessionId, patch: { locked: true } },
+      });
+
+      const unlockRes = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/lock`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ locked: false }),
+      });
+
+      expect(unlockRes.status).toBe(200);
+      expect(await unlockRes.json()).toEqual({ ok: true, locked: false });
+      expect(sessionStore.getSession(session.sessionId)?.locked).toBeUndefined();
+    } finally {
+      off();
+      sessionStore.init();
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects malformed lock payloads', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/anything/lock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ locked: 'yes' }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'bad_locked' });
   });
 });
 
@@ -327,7 +387,7 @@ describe('GET /api/events', () => {
         e => e.type === 'session.spawned' && e.body?.session?.sessionId === 'snap-1',
       );
       expect(ev).not.toBeNull();
-      expect(ev!.body.session.status).toBe('starting'); // worker:null → no screen yet
+      expect(ev!.body.session.status).toBe('dormant'); // restored worker:null → lazily resumes on next input
       expect(ev!.body.session.hasHistory).toBe(true);
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
@@ -670,6 +730,52 @@ describe('PUT /api/bot-skills', () => {
   });
 });
 
+describe('PUT /api/bot-agent', () => {
+  it('updates cli selection and model through bots.json and live config', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+        model: 'old-model',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'kimi-k2.5' }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ok: true,
+        cliId: 'codex',
+        wrapperCli: 'ttadk codex',
+        model: 'kimi-k2.5',
+        selectionKey: 'ttadk-x-codex',
+      });
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(stored).toMatchObject({
+        cliId: 'codex',
+        wrapperCli: 'ttadk codex',
+        model: 'kimi-k2.5',
+      });
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('GET /api/groups (Phase B)', () => {
   it('returns 503 when larkAppId not set', async () => {
     setLarkAppId('');
@@ -857,12 +963,12 @@ describe('POST /api/groups/create', () => {
       invalidBotIds: [],
       invalidUserIds: [],
     });
-    const addBotSpy = vi.spyOn(groupsStore, 'addBotToChat').mockResolvedValue([
+    const addSpy = vi.spyOn(groupsStore, 'addBotToChat').mockResolvedValue([
       { id: 'cli_X', ok: true },
     ]);
-    const shareLinkSpy = vi.spyOn(groupsStore, 'getChatShareLink').mockResolvedValue({
+    const linkSpy = vi.spyOn(groupsStore, 'getChatShareLink').mockResolvedValue({
       ok: true,
-      shareLink: 'https://example.test/join/oc_new',
+      shareLink: 'https://example.test/chat',
     });
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/create`, {
@@ -878,13 +984,18 @@ describe('POST /api/groups/create', () => {
       { larkAppId: 'test-app', ok: true, created: true },
       { larkAppId: 'cli_X', ok: true, created: true },
     ]);
+    expect(createSpy).toHaveBeenCalledWith('test-app', {
+      name: undefined,
+      botIds: [],
+      userIds: [],
+    });
+    expect(addSpy).toHaveBeenCalledWith('test-app', 'oc_new', ['cli_X']);
     expect(spy).toHaveBeenCalledWith('test-app', 'oc_new', process.cwd());
     expect(spy).toHaveBeenCalledWith('cli_X', 'oc_new', process.cwd());
-    expect(addBotSpy).toHaveBeenCalledWith('test-app', 'oc_new', ['cli_X']);
+    addSpy.mockRestore();
     spy.mockRestore();
     createSpy.mockRestore();
-    addBotSpy.mockRestore();
-    shareLinkSpy.mockRestore();
+    linkSpy.mockRestore();
   });
 
   it('rejects missing bindWorkingDir before creating the group', async () => {
@@ -894,6 +1005,12 @@ describe('POST /api/groups/create', () => {
       invalidBotIds: [],
       invalidUserIds: [],
     });
+    const addSpy = vi.spyOn(groupsStore, 'addBotToChat').mockResolvedValue([]);
+    const bindSpy = vi.spyOn(oncallStore, 'bindOncall').mockResolvedValue({
+      ok: true,
+      entry: { chatId: 'oc_should_not_bind', workingDir: process.cwd() },
+      created: true,
+    });
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/create`, {
       method: 'POST',
@@ -902,6 +1019,10 @@ describe('POST /api/groups/create', () => {
     });
     expect(res.status).toBe(400);
     expect(createSpy).not.toHaveBeenCalled();
+    expect(addSpy).not.toHaveBeenCalled();
+    expect(bindSpy).not.toHaveBeenCalled();
+    bindSpy.mockRestore();
+    addSpy.mockRestore();
     createSpy.mockRestore();
   });
 });

@@ -28,7 +28,12 @@ import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { Buffer } from 'node:buffer';
-import { getMiraRuntimePaths, ensureMiramcpSandboxAllows } from './mir-local-runtime.js';
+import {
+  getMiraRuntimePaths,
+  ensureMiramcpBridgeStarted,
+  ensureMiramcpSandboxAllows,
+  type MiramcpAutostartResult,
+} from './mir-local-runtime.js';
 
 interface Args {
   sessionId: string;
@@ -83,6 +88,21 @@ function prompt(): void {
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   return String(err);
+}
+
+function logMiramcpAutostart(result: MiramcpAutostartResult): void {
+  const details = [
+    `status=${result.status}`,
+    result.pid ? `pid=${result.pid}` : '',
+    result.binPath ? `bin=${result.binPath}` : '',
+    result.error ? `error=${result.error}` : '',
+  ].filter(Boolean).join(' ');
+  const message = `[mir] miramcp auto-start ${details}\n`;
+  if (result.status === 'started_pending' || result.status === 'missing_bin' || result.status === 'spawn_failed' || result.status === 'invalid_config' || result.status === 'missing_device_id') {
+    process.stderr.write(message);
+    return;
+  }
+  if (process.env.DEBUG) process.stderr.write(message);
 }
 
 function boolEnv(name: string, fallback: boolean): boolean {
@@ -316,6 +336,15 @@ class MircliClient {
     return new Promise((resolve, reject) => {
       // Precedence: adapter cliPathOverride (--mircli-bin) > MIRCLI_BIN env > PATH.
       const bin = this.mircliBin || process.env.MIRCLI_BIN || 'mircli';
+      if (boolEnv('MIRCLI_AUTO_START_MIRAMCP', true)) {
+        try {
+          logMiramcpAutostart(ensureMiramcpBridgeStarted({ mircliBin: bin }));
+        } catch (err) {
+          process.stderr.write(`[mir] miramcp auto-start threw error=${errorMessage(err)}\n`);
+          // Best-effort: mircli will surface the concrete MCP error if the
+          // bridge is still unavailable.
+        }
+      }
       // Patch the local MCP bridge sandbox so writes to this workspace aren't
       // blocked (workspace may sit outside the default /root,/tmp allow-list).
       if (boolEnv('MIRCLI_PATCH_MIRAMCP_CONFIG', true)) {

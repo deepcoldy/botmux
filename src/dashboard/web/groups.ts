@@ -2,7 +2,7 @@
 // The aggregator at /api/groups fans out to all online daemons and merges chats
 // by chatId; the dashboard displays this as a matrix where each cell shows
 // whether a bot is a member of a given chat.
-import { chatAvatarHtml, escapeHtml, loadingHtml, t } from './ui.js';
+import { chatAvatarHtml, escapeHtml, t } from './ui.js';
 import {
   hasExplicitChatRole,
   summarizeGroupProfileMatches,
@@ -26,6 +26,11 @@ type SaveProfileEntry = {
   content: string;
   status: SaveProfileEntryStatus;
 };
+type GroupAddBotResult = {
+  id?: unknown;
+  ok?: unknown;
+  error?: unknown;
+};
 
 function isValidProfileId(profileId: string): boolean {
   return PROFILE_ID_RE.test(profileId) && profileId !== '.' && profileId !== '..';
@@ -39,32 +44,6 @@ export function suggestRoleProfileIdFromChat(value: string): string {
     .replace(/^-+|-+$/g, '')
     .slice(0, 64);
   return isValidProfileId(cleaned) ? cleaned : 'profile';
-}
-
-function pageHtml(): string {
-  return `<section class="page">
-<div class="page-heading">
-  <div>
-    <p class="eyebrow">${t('nav.groups')}</p>
-    <h1>${t('groups.title')}</h1>
-    <p>${t('groups.subtitle')}</p>
-  </div>
-</div>
-<form id="g-filters" class="filters">
-  <input type="search" name="q" placeholder="${t('groups.search')}" />
-  <label><input type="checkbox" name="missing"> ${t('groups.missingOnly')}</label>
-  <button type="button" id="g-refresh">${t('groups.refresh')}</button>
-  <button type="button" id="g-create" class="primary">${t('groups.create')}</button>
-</form>
-<div id="g-loading">${loadingHtml()}</div>
-<div class="table-scroll matrix-scroll" id="g-table-wrap" hidden>
-  <table>
-    <thead id="g-head"></thead>
-    <tbody id="g-body"></tbody>
-  </table>
-</div>
-<dialog id="g-drawer"></dialog>
-</section>`;
 }
 
 async function loadGroups(): Promise<void> {
@@ -187,8 +166,47 @@ export function renderRoleProfileBootstrapSummary(
   return `<p class="hint-ok">${escapeHtml(t('groups.roleProfileBootstrapDone', { name: cleanProfileId }))}</p>`;
 }
 
-export async function renderGroupsPage(root: HTMLElement) {
-  root.innerHTML = pageHtml();
+export function renderAddBotsResultSummary(result: GroupAddBotResult[]): string {
+  const rows = Array.isArray(result) ? result : [];
+  if (!rows.length) {
+    return `<p class="hint-warn">没有返回添加结果。</p>`;
+  }
+  const okCount = rows.filter(x => !!x?.ok).length;
+  const failed = rows.length - okCount;
+  const cls = failed ? 'hint-warn' : 'hint-ok';
+  const items = rows.map(x => {
+    const id = String(x?.id ?? '?');
+    return x?.ok
+      ? `<li><code>${escapeHtml(id)}</code>: OK</li>`
+      : `<li><code>${escapeHtml(id)}</code>: failed (${escapeHtml(String(x?.error ?? 'unknown'))})</li>`;
+  }).join('');
+  return `<div class="${cls}">
+    <strong>添加结果：成功 ${okCount}/${rows.length}${failed ? `，失败 ${failed}` : ''}</strong>
+    <ul>${items}</ul>
+  </div>`;
+}
+
+export function wireGroupsPage(root: HTMLElement): () => void {
+  let disposed = false;
+  const timers = new Set<number>();
+  const delayResolvers = new Map<number, () => void>();
+  const setTimer = (fn: () => void, ms: number): number => {
+    const id = window.setTimeout(() => {
+      timers.delete(id);
+      if (!disposed) fn();
+    }, ms);
+    timers.add(id);
+    return id;
+  };
+  const delay = (ms: number): Promise<void> => new Promise(resolve => {
+    const id = window.setTimeout(() => {
+      timers.delete(id);
+      delayResolvers.delete(id);
+      resolve();
+    }, ms);
+    timers.add(id);
+    delayResolvers.set(id, resolve);
+  });
   const head = root.querySelector<HTMLElement>('#g-head')!;
   const body = root.querySelector<HTMLElement>('#g-body')!;
   const form = root.querySelector<HTMLFormElement>('#g-filters')!;
@@ -199,9 +217,12 @@ export async function renderGroupsPage(root: HTMLElement) {
     refreshBtn.disabled = true;
     try {
       await loadGroups();
+      if (disposed) return;
       rerender();
       void refreshRoleProfileContext();
-    } finally { refreshBtn.disabled = false; }
+    } finally {
+      if (!disposed) refreshBtn.disabled = false;
+    }
   };
 
   const createBtn = root.querySelector<HTMLButtonElement>('#g-create')!;
@@ -210,12 +231,17 @@ export async function renderGroupsPage(root: HTMLElement) {
   // /api/groups 要扇出到所有 daemon、逐群查成员，慢——先亮 loading，回来再换表格。
   const loadingEl = root.querySelector<HTMLElement>('#g-loading')!;
   const tableWrap = root.querySelector<HTMLElement>('#g-table-wrap')!;
-  try {
-    await loadGroups();
-  } finally {
-    loadingEl.remove();
-    tableWrap.hidden = false;
-  }
+  void (async () => {
+    try {
+      await loadGroups();
+    } finally {
+      if (disposed) return;
+      loadingEl.remove();
+      tableWrap.hidden = false;
+      rerender();
+      void refreshRoleProfileContext();
+    }
+  })();
 
   async function refreshRoleProfileContext(): Promise<void> {
     try {
@@ -225,9 +251,24 @@ export async function renderGroupsPage(root: HTMLElement) {
       roleProfileEntriesById = new Map();
       groupRoleContentByBot = new Map();
     } finally {
+      if (disposed) return;
       roleProfileContextLoaded = true;
       rerender();
     }
+  }
+
+  function setDialogStatus(el: HTMLElement, html: string): void {
+    el.innerHTML = html;
+  }
+
+  function renderDialogError(title: string, reason: unknown): string {
+    return `<p class="hint-warn"><strong>${escapeHtml(title)}</strong><br><small>${escapeHtml(String(reason ?? 'unknown'))}</small></p>`;
+  }
+
+  function restoreSubmit(btn: HTMLButtonElement | null | undefined, label: string): void {
+    if (!btn) return;
+    btn.disabled = false;
+    btn.textContent = label;
   }
 
   async function openCreateModal() {
@@ -242,6 +283,7 @@ export async function renderGroupsPage(root: HTMLElement) {
       const data = await r.json();
       roleProfiles = data.profiles ?? [];
     } catch { /* profile selector is optional */ }
+    if (disposed) return;
     drawer.innerHTML = `
       <article>
         <header><h3>${t('groups.createTitle')}</h3></header>
@@ -268,6 +310,7 @@ export async function renderGroupsPage(root: HTMLElement) {
             <legend>${t('groups.botPicker')}</legend>
             ${renderBotCheckboxes(allBots)}
           </fieldset>
+          <div data-create-status aria-live="polite"></div>
           <div class="actions">
             <button type="submit" class="primary">${t('groups.createSubmit')}</button>
             <button type="button" id="g-create-cancel">${t('groups.cancel')}</button>
@@ -285,9 +328,14 @@ export async function renderGroupsPage(root: HTMLElement) {
       const bindWorkingDir = ((fd.get('bindWorkingDir') as string) ?? '').trim();
       const roleProfileId = ((fd.get('roleProfileId') as string) ?? '').trim();
       const ids = fd.getAll('bot') as string[];
-      if (ids.length === 0) { alert('Pick at least one bot.'); return; }
+      const statusEl = drawer.querySelector<HTMLElement>('[data-create-status]')!;
+      if (ids.length === 0) {
+        setDialogStatus(statusEl, renderDialogError('请选择 bot', '至少选择一个 bot 后再创建群聊。'));
+        return;
+      }
       const submitBtn = (ev.target as HTMLFormElement).querySelector<HTMLButtonElement>('button[type=submit]');
       if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Creating...'; }
+      setDialogStatus(statusEl, '');
       try {
         const r = await fetch('/api/groups/create', {
           method: 'POST',
@@ -300,6 +348,7 @@ export async function renderGroupsPage(root: HTMLElement) {
           }),
         });
         const respBody = await r.json();
+        if (disposed) return;
         if (respBody.ok && respBody.chatId) {
           renderCreateSuccess(respBody);
           // Lark's chat.list has eventual consistency: the chat we just
@@ -325,12 +374,12 @@ export async function renderGroupsPage(root: HTMLElement) {
           void refreshRoleProfileContext();
           void refreshUntilSeen(respBody.chatId, expectedBotIds).catch(() => { /* tolerate */ });
         } else {
-          alert(`Failed: ${respBody.error ?? r.status}`);
-          drawer.close();
+          setDialogStatus(statusEl, renderDialogError('创建失败', respBody.error ?? `HTTP ${r.status}`));
+          restoreSubmit(submitBtn, t('groups.createSubmit'));
         }
       } catch (e) {
-        alert('Network error: ' + e);
-        drawer.close();
+        setDialogStatus(statusEl, renderDialogError('网络错误', e));
+        restoreSubmit(submitBtn, t('groups.createSubmit'));
       }
     };
 
@@ -368,10 +417,12 @@ export async function renderGroupsPage(root: HTMLElement) {
       // Refresh will reconcile.
       const delays = [600, 1200, 1200, 1200, 1200, 1200];
       for (const d of delays) {
-        await new Promise(r => setTimeout(r, d));
+        await delay(d);
+        if (disposed) return;
         let next: { chats: any[]; bots: any[] };
         try { next = await fetchGroups(); }
         catch { continue; }
+        if (disposed) return;
         const row = (next.chats ?? []).find((c: any) => c.chatId === chatId);
         if (row && allExpectedInChat(row, expectedBotIds)) {
           cache = next;
@@ -454,7 +505,7 @@ export async function renderGroupsPage(root: HTMLElement) {
       b.onclick = () => {
         navigator.clipboard.writeText(b.dataset.copy ?? '');
         b.textContent = t('sessions.copied');
-        setTimeout(() => { b.textContent = t('sessions.copy'); }, 800);
+        setTimer(() => { b.textContent = t('sessions.copy'); }, 800);
       };
     });
     drawer.querySelector<HTMLButtonElement>('#g-create-close')!.onclick = () => drawer.close();
@@ -534,10 +585,7 @@ export async function renderGroupsPage(root: HTMLElement) {
       </td>
     </tr>`).join('');
   }
-  rerender();
-  void refreshRoleProfileContext();
-
-  body.addEventListener('click', async e => {
+  const onAddBotsClick = async (e: MouseEvent) => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button.add-bots');
     if (!btn) return;
     const tr = btn.closest<HTMLTableRowElement>('tr[data-chat]')!;
@@ -561,6 +609,7 @@ export async function renderGroupsPage(root: HTMLElement) {
         <p>${t('groups.createHelp')}</p>
         <form id="g-addform">
           ${renderBotCheckboxes(cache.bots, inChatSet)}
+          <div data-add-status aria-live="polite"></div>
           <div class="actions">
             <button type="submit" class="primary">${t('groups.addBots')}</button>
             <button type="button" id="g-cancel">${t('groups.cancel')}</button>
@@ -575,7 +624,14 @@ export async function renderGroupsPage(root: HTMLElement) {
       ev.preventDefault();
       const fd = new FormData(ev.target as HTMLFormElement);
       const ids = fd.getAll('bot') as string[];
-      if (ids.length === 0) { alert('Pick at least one bot.'); return; }
+      const statusEl = drawer.querySelector<HTMLElement>('[data-add-status]')!;
+      if (ids.length === 0) {
+        setDialogStatus(statusEl, renderDialogError('请选择 bot', '至少选择一个 bot 后再添加。'));
+        return;
+      }
+      const submitBtn = (ev.target as HTMLFormElement).querySelector<HTMLButtonElement>('button[type=submit]');
+      if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Adding...'; }
+      setDialogStatus(statusEl, '');
       try {
         const r = await fetch(`/api/groups/${encodeURIComponent(chatId)}/add-bots`, {
           method: 'POST',
@@ -583,28 +639,38 @@ export async function renderGroupsPage(root: HTMLElement) {
           body: JSON.stringify({ larkAppIds: ids }),
         });
         const respBody = await r.json();
+        if (disposed) return;
         if (respBody.error === 'no_proxy_bot') {
-          alert('No bot is currently in this chat — add one manually in Feishu first, then retry.');
+          setDialogStatus(statusEl, renderDialogError(
+            '无法添加 bot',
+            '当前群里没有可代理操作的 bot。请先在飞书里手动拉入一个 bot，然后重试。',
+          ));
         } else if (respBody.result) {
-          const lines = respBody.result.map((x: any) =>
-            `${x.id}: ${x.ok ? 'OK' : `failed (${x.error ?? 'unknown'})`}`
-          ).join('\n');
-          alert(lines);
-          // Refresh after change
-          await loadGroups();
-          rerender();
+          const resultHtml = renderAddBotsResultSummary(respBody.result);
+          setDialogStatus(statusEl, resultHtml);
+          try {
+            await loadGroups();
+            if (disposed) return;
+            rerender();
+            void refreshRoleProfileContext();
+          } catch (e) {
+            if (!disposed) {
+              setDialogStatus(statusEl, `${resultHtml}${renderDialogError('刷新失败', `添加结果已返回，但刷新群组列表失败：${e}`)}`);
+            }
+          }
         } else {
-          alert(`Unexpected response: ${JSON.stringify(respBody)}`);
+          setDialogStatus(statusEl, renderDialogError('响应异常', JSON.stringify(respBody)));
         }
       } catch (e) {
-        alert('Network error: ' + e);
+        setDialogStatus(statusEl, renderDialogError('网络错误', e));
       } finally {
-        drawer.close();
+        if (!disposed) restoreSubmit(submitBtn, t('groups.addBots'));
       }
     };
-  });
+  };
+  body.addEventListener('click', onAddBotsClick);
 
-  body.addEventListener('click', async e => {
+  const onSaveProfileClick = async (e: MouseEvent) => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button.save-profile');
     if (!btn) return;
     const tr = btn.closest<HTMLTableRowElement>('tr[data-chat]')!;
@@ -612,7 +678,8 @@ export async function renderGroupsPage(root: HTMLElement) {
     const chat = cache.chats.find(c => c.chatId === chatId);
     if (!chat) return;
     await saveGroupRolesAsProfile(chat, btn);
-  });
+  };
+  body.addEventListener('click', onSaveProfileClick);
 
   async function saveGroupRolesAsProfile(chat: any, btn: HTMLButtonElement): Promise<void> {
     const suggestedByName = suggestRoleProfileIdFromChat(chat.name ?? '');
@@ -627,10 +694,13 @@ export async function renderGroupsPage(root: HTMLElement) {
         collectGroupProfileEntries(chat),
         fetchRoleProfileSummaries(),
       ]);
+      if (disposed) return;
       openSaveProfileDialog(chat, suggested, entries, profiles);
     } finally {
-      btn.disabled = false;
-      btn.textContent = originalText;
+      if (!disposed) {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
     }
   }
 
@@ -847,6 +917,7 @@ export async function renderGroupsPage(root: HTMLElement) {
           });
           return r.ok;
         }));
+        if (disposed) return;
         const saved = results.filter(Boolean).length;
         if (saved !== entries.length) {
           statusEl.textContent = t('groups.saveProfileFailed', { saved, total: entries.length });
@@ -860,7 +931,8 @@ export async function renderGroupsPage(root: HTMLElement) {
         statusEl.textContent = t('groups.saveProfileDone', { name: profileId, count: saved });
         statusEl.className = 'g-save-profile-status ok';
         await refreshRoleProfileContext();
-        setTimeout(() => drawer.close(), 700);
+        if (disposed) return;
+        setTimer(() => drawer.close(), 700);
       } catch (err) {
         statusEl.textContent = String(err);
         statusEl.className = 'g-save-profile-status error';
@@ -872,7 +944,7 @@ export async function renderGroupsPage(root: HTMLElement) {
     };
   }
 
-  body.addEventListener('click', async e => {
+  const onManageChatClick = async (e: MouseEvent) => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button.manage-chat');
     if (!btn) return;
     const tr = btn.closest<HTMLTableRowElement>('tr[data-chat]')!;
@@ -880,7 +952,8 @@ export async function renderGroupsPage(root: HTMLElement) {
     const chat = cache.chats.find(c => c.chatId === chatId);
     if (!chat) return;
     openManageDrawer(chat);
-  });
+  };
+  body.addEventListener('click', onManageChatClick);
 
   function openManageDrawer(chat: any) {
     const inChat = chat.memberBots.filter((m: any) => m.inChat) as any[];
@@ -973,6 +1046,7 @@ export async function renderGroupsPage(root: HTMLElement) {
               })
             : await fetch(url, { method: 'DELETE' });
           const body = await r.json().catch(() => ({}));
+          if (disposed) return;
           if (r.ok && body.ok) {
             statusEl.textContent = want
               ? `✓ 已绑定 → ${body.resolvedPath ?? wd}`
@@ -980,7 +1054,12 @@ export async function renderGroupsPage(root: HTMLElement) {
             statusEl.classList.add('hint-ok');
             // Refresh aggregator cache + matrix; drawer state stays as-is
             // (current row reflects the just-saved values).
-            try { await loadGroups(); rerender(); void refreshRoleProfileContext(); } catch { /* tolerate */ }
+            try {
+              await loadGroups();
+              if (disposed) return;
+              rerender();
+              void refreshRoleProfileContext();
+            } catch { /* tolerate */ }
           } else {
             statusEl.textContent = `✗ ${body.error ?? r.status}`;
             statusEl.classList.add('hint-warn-inline');
@@ -1006,6 +1085,7 @@ export async function renderGroupsPage(root: HTMLElement) {
           body: JSON.stringify({ larkAppIds: checked }),
         });
         const respBody = await r.json();
+        if (disposed) return;
         const lines = (respBody.result ?? []).map((x: any) => {
           if (!x.ok) return `${x.larkAppId}: 失败 (${x.error ?? 'unknown'})`;
           const closed = (x.closedSessions ?? []) as any[];
@@ -1017,11 +1097,14 @@ export async function renderGroupsPage(root: HTMLElement) {
           return `${x.larkAppId}: OK${note}`;
         }).join('\n');
         alert(lines || `Unexpected: ${JSON.stringify(respBody)}`);
-        await loadGroups(); rerender(); void refreshRoleProfileContext();
+        await loadGroups();
+        if (disposed) return;
+        rerender();
+        void refreshRoleProfileContext();
       } catch (e) {
         alert('Network error: ' + e);
       } finally {
-        drawer.close();
+        if (!disposed) drawer.close();
       }
     };
 
@@ -1043,6 +1126,7 @@ export async function renderGroupsPage(root: HTMLElement) {
             body: JSON.stringify({ larkAppId: m.larkAppId }),
           });
           const respBody = await r.json();
+          if (disposed) return;
           if (respBody.ok) {
             const closed = (respBody.closedSessions ?? []) as any[];
             const failed = closed.filter(c => !c.ok).length;
@@ -1051,7 +1135,10 @@ export async function renderGroupsPage(root: HTMLElement) {
               ? ''
               : failed === 0 ? `\n关闭了 ${ok} 个会话。` : `\n关闭了 ${ok} 个会话，${failed} 个会话关闭失败。`;
             alert(`已解散（由 ${m.botName ?? m.larkAppId} 执行）${closedNote}`);
-            await loadGroups(); rerender(); void refreshRoleProfileContext();
+            await loadGroups();
+            if (disposed) return;
+            rerender();
+            void refreshRoleProfileContext();
             drawer.close();
             return;
           }
@@ -1065,4 +1152,19 @@ export async function renderGroupsPage(root: HTMLElement) {
   }
 
   form.addEventListener('input', rerender);
+  return () => {
+    disposed = true;
+    for (const id of timers) window.clearTimeout(id);
+    timers.clear();
+    for (const resolve of delayResolvers.values()) resolve();
+    delayResolvers.clear();
+    refreshBtn.onclick = null;
+    createBtn.onclick = null;
+    form.removeEventListener('input', rerender);
+    body.removeEventListener('click', onAddBotsClick);
+    body.removeEventListener('click', onSaveProfileClick);
+    body.removeEventListener('click', onManageChatClick);
+    if (drawer.open) drawer.close();
+    drawer.replaceChildren();
+  };
 }

@@ -3,9 +3,10 @@
  *
  * Zellij is an OPT-IN backend (BACKEND_TYPE=zellij) — there's no auto-install
  * here (tmux stays the default). We only need a functional probe so the worker
- * can fall back to PTY when zellij is requested but unusable, and an env
- * sanitiser so nested-session vars don't make our `zellij` calls target the
- * wrong server.
+ * can hard-gate the session (post an actionable card, refuse to start) when
+ * zellij is requested but unusable — it no longer silently falls back to PTY —
+ * and an env sanitiser so nested-session vars don't make our `zellij` calls
+ * target the wrong server.
  *
  * The driveable automation surface (action write/dump-screen/list-panes --json,
  * headless `attach --create-background`) landed in zellij 0.40–0.44; we require

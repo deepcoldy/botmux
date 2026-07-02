@@ -235,7 +235,12 @@ export function parseForceTopicInvocation(content: string): { prompt: string } |
  *  daemon; otherwise discussion text such as `/adopt <pane>` can accidentally
  *  trigger real daemon actions. */
 export function parseSlashCommandInvocation(content: string): SlashCommandInvocation | null {
-  const trimmed = content.trimStart();
+  // trim BOTH ends: a trailing newline/space rides into the returned `content`
+  // and, for a passthrough command relayed verbatim to the CLI (raw_input), gets
+  // typed as a literal trailing newline — which breaks the CLI's slash-command
+  // detection (it sees a multi-line message, not a `/cmd`). Internal newlines for
+  // MULTILINE_COMMANDS are preserved (trim only touches the ends).
+  const trimmed = content.trim();
   if (!trimmed.startsWith('/')) return null;
 
   const lines = trimmed.split(/\r?\n/);

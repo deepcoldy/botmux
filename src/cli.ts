@@ -1429,17 +1429,45 @@ async function cmdRestart(): Promise<void> {
   await printDashboardHintWithRetry();
 }
 
-/** Wraps `ensureDependencies()`. Neither tmux nor fonts are load-bearing —
- *  ensureDependencies surfaces failures as warnings and the daemon continues
- *  on PTY backend. Only an unexpected exception (programmer error) propagates. */
+/** Wraps `ensureDependencies()`. Fonts are nice-to-have (warn only). tmux is
+ *  required since PTY 退役: if it's GENUINELY ABSENT and a bot wants the tmux
+ *  backend (and the operator hasn't opted into BACKEND_TYPE=pty), we hard-fail
+ *  here — non-zero exit, no pm2 spawn — so an unattended `start`/`restart`
+ *  surfaces the failure instead of bringing up a daemon whose every session
+ *  would gate at first message. A present-but-broken tmux (functional probe
+ *  flaked) is NOT fatal: the daemon still starts and degrades per-session, so a
+ *  transient probe failure can't block reattaching live sessions (PR#249). An
+ *  unexpected exception in the probe itself is non-fatal for the same reason. */
 async function ensureSystemDependencies(): Promise<void> {
-  const { ensureDependencies } = await import('./setup/index.js');
+  const { ensureDependencies, shouldHardFailStartupForMissingTmux } = await import('./setup/index.js');
+  let report: Awaited<ReturnType<typeof ensureDependencies>>;
   try {
-    await ensureDependencies();
+    report = await ensureDependencies();
   } catch (err: any) {
     console.error('');
     console.error(`依赖检测内部错误: ${err?.message ?? String(err)}`);
-    // Don't exit — let daemon start try anyway; worst case PTY backend works.
+    // Don't exit — a probe-internal error is not a confirmed "tmux missing".
+    return;
+  }
+
+  // loadBotsJson() returns [] when bots.json is absent (→ no bot wants tmux) and
+  // hard-exits on a malformed file (existing fast-fail) — it never throws here.
+  const anyBotWantsTmux = loadBotsJson().some(b => (b?.backendType ?? config.daemon.backendType) === 'tmux');
+  const ptyOptIn = (process.env.BACKEND_TYPE ?? '').toLowerCase() === 'pty';
+
+  if (shouldHardFailStartupForMissingTmux({
+    tmuxInstalled: report.tmux.installed,
+    tmuxBinaryPresent: report.tmux.binaryPresent === true,
+    anyBotWantsTmux,
+    ptyOptIn,
+  })) {
+    console.error('');
+    console.error('❌ tmux 未安装，已中止 daemon 启动 —— 默认走 tmux 后端的会话将全部无法运行。');
+    console.error('   请按上方指引安装 tmux 后重试。');
+    console.error('   如确需在没有 tmux 的环境运行，可显式用 PTY 兜底：BACKEND_TYPE=pty botmux start');
+    console.error('   （注意：PTY 会话不跨 daemon 重启存活，仅作应急。）');
+    console.error('');
+    process.exit(1);
   }
 }
 

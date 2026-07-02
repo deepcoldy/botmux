@@ -1,8 +1,7 @@
 {
-  "hook_event_name": "QuestionAsked",
-  "session_id": "opencode-ses_abc123",
-  "question_id": "q_001",
-  "question_text": "选择部署策略？",
+  "hook_event_name": "question.asked",
+  "session_id": "ses_abc123",
+  "question_id": "que_001",
   "tool_input": {
     "questions": [
       {
@@ -15,6 +14,5 @@
         "multiple": false
       }
     ]
-  },
-  "_opencode_request_id": "q_001"
+  }
 }

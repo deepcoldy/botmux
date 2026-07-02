@@ -13,7 +13,7 @@ function loadFixture(name: string): unknown {
 
 describe('OpenCode hook adapter', () => {
   describe('parseQuestions', () => {
-    it('QuestionAsked + 结构化 questions → 解析出 questions', () => {
+    it('question.asked + 结构化 questions → 解析出 questions', () => {
       const payload = loadFixture('opencode-ask-single.json');
       const parsed = opencode.parseQuestions(payload);
       expect(parsed).not.toBeNull();
@@ -46,12 +46,12 @@ describe('OpenCode hook adapter', () => {
       }
     });
 
-    it('旧版兼容：无 tool_input.questions → 使用 question_text', () => {
+    it('降级兼容：question.asked 无 tool_input.questions → 使用 question_text', () => {
       const payload = {
-        hook_event_name: 'QuestionAsked',
-        session_id: 'opencode-ses_x',
+        hook_event_name: 'question.asked',
+        session_id: 'ses_x',
         question_text: '你确定吗？',
-        _opencode_request_id: 'q_x',
+        question_id: 'que_x',
       };
       const parsed = opencode.parseQuestions(payload);
       expect(parsed).not.toBeNull();
@@ -60,17 +60,17 @@ describe('OpenCode hook adapter', () => {
       expect(parsed!.questions[0].options).toHaveLength(0);
     });
 
-    it('非 QuestionAsked 事件 → null', () => {
+    it('非 question.asked 事件 → null', () => {
       const payload = {
         hook_event_name: 'PermissionRequest',
         tool_name: 'Bash',
-        session_id: 'opencode-x',
+        session_id: 'ses_x',
       };
       expect(opencode.parseQuestions(payload)).toBeNull();
     });
 
     it('PreToolUse → null', () => {
-      expect(opencode.parseQuestions({ hook_event_name: 'PreToolUse', session_id: 'opencode-x' })).toBeNull();
+      expect(opencode.parseQuestions({ hook_event_name: 'PreToolUse', session_id: 'ses_x' })).toBeNull();
     });
 
     it('null / undefined → null', () => {
@@ -116,12 +116,12 @@ describe('OpenCode hook adapter', () => {
       expect(answers[1]).toEqual(['QA 团队']);
     });
 
-    it('旧版（无结构化 questions）→ { type: "answer", text: "..." }', () => {
+    it('降级（无结构化 questions）→ { type: "answer", text: "..." }', () => {
       const payload = {
-        hook_event_name: 'QuestionAsked',
-        session_id: 'opencode-ses_x',
+        hook_event_name: 'question.asked',
+        session_id: 'ses_x',
         question_text: '你确定吗？',
-        _opencode_request_id: 'q_x',
+        question_id: 'que_x',
       };
       const parsed = opencode.parseQuestions(payload)!;
       const directiveStr = opencode.formatAnswer([['确定']], parsed);
@@ -150,7 +150,7 @@ describe('OpenCode hook adapter', () => {
     });
 
     it('无 questions 结构 → 空字符串，不含 answer', () => {
-      const payload = { hook_event_name: 'QuestionAsked', session_id: 'opencode-x', question_text: 'ok?' };
+      const payload = { hook_event_name: 'question.asked', session_id: 'ses_x', question_text: 'ok?' };
       const out = opencode.passthrough(payload);
       expect(out).toBe('');
       expect(out).not.toContain('answer');

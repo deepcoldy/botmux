@@ -18,6 +18,8 @@ import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { recordBotUnionId } from '../../services/bot-union-ids-store.js';
+import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
+import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed } from './doc-comment.js';
 import { BOTMUX_REQUIRED_SCOPES, DOC_FEATURE_SCOPES, DOC_COMMENT_EVENT, buildScopeDeepLink } from '../../setup/verify-permissions.js';
@@ -28,6 +30,7 @@ import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
+import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { isGoalChat } from '../../services/goal-chat-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode } from '../../services/chat-reply-mode-store.js';
@@ -370,12 +373,16 @@ function claimEventOnce(key: string): boolean {
   return true;
 }
 
-function scheduleAckSafeEvent(key: string, work: () => Promise<void>, label: string): void {
-  if (!claimEventOnce(key)) {
+// `claim` defaults to the in-memory event-id claim; the message path passes a
+// persistent message_id claim (claimMessageOnce) so a daemon restart or the 6h
+// re-push tier can't replay an already-handled message. The claim MUST be fully
+// synchronous (see INVARIANT below) — both claimEventOnce and claimMessageOnce are.
+function scheduleAckSafeEvent(key: string, work: () => Promise<void>, label: string, claim: () => boolean = () => claimEventOnce(key)): void {
+  if (!claim()) {
     logger.info(`[event-dedupe] duplicate ${label} ignored: ${key}`);
     return;
   }
-  // INVARIANT: claimEventOnce + this setImmediate scheduling must stay fully
+  // INVARIANT: the claim above + this setImmediate scheduling must stay fully
   // synchronous (no await before we get here). WS events arrive in order and
   // setImmediate is FIFO, so same-anchor messages reach serializeByAnchor in
   // arrival order ONLY while nothing awaits ahead of the schedule. An await here
@@ -533,6 +540,9 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
 export function __resetEventClaimsForTest(): void {
   eventClaims.clear();
   cardActionInFlight.clear();
+  // The message path now dedupes via the persistent seen-message store; clear its
+  // in-memory cache too so cases reusing the same message_id don't suppress each other.
+  _resetSeenMessagesForTest();
 }
 
 export async function getGroupStats(larkAppId: string, chatId: string): Promise<{ userCount: number; botCount: number }> {
@@ -589,6 +599,30 @@ export function isKnownPeerBot(dataDir: string, larkAppId: string, senderOpenId:
     if (openId === senderOpenId) return true;
   }
   return false;
+}
+
+/**
+ * Should a FOREIGN bot sender be trusted to collaborate (route/spawn a session)
+ * WITHOUT `/grant`, because it's a teammate? Two trust sources, both rooted in
+ * tenant-stable identity or team-controlled group membership — never a name:
+ *
+ *  1. **Learned teammate** — its `union_id` (from the inbound event's
+ *     `sender.sender_id.union_id`) is in the team-bot store, i.e. we've seen it
+ *     vouched inside a team-assembled group before. Honoured in ANY chat.
+ *  2. **Team-assembled group** — the chat itself is a 拉群 group (team-controlled
+ *     membership), so a botmux bot speaking there is a vouched teammate even on
+ *     first contact (mirrors the existing oncall-chat exemption).
+ *
+ * `isKnownPeerBot` (same-deployment siblings) is checked separately by callers;
+ * this covers cross-deployment TEAM peers. Returns false when neither holds, so
+ * the caller falls back to the /grant request card.
+ */
+export function isTrustedTeamBotSender(
+  dataDir: string,
+  chatId: string | undefined,
+  senderUnionId: string | undefined,
+): boolean {
+  return isTeamBot(dataDir, senderUnionId) || isTeamGroupChat(dataDir, chatId);
 }
 
 /** Update the per-bot cross-reference from @mention data in an event.
@@ -767,7 +801,7 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
     warnedStringMentionShape = true;
     logger.warn(`[${larkAppId}] mention.id arrived in string form on the event path — Lark may have converged the WS event onto the REST shape. mentionOpenId() absorbs it, but verify group @-routing. (logged once per process)`);
   }
-  if (mentions.some((m: any) => mentionOpenId(m) === botOpenId)) {
+  if (mentions.some((m: any) => mentionMatchesBot(m, larkAppId, botOpenId))) {
     return true;
   }
 
@@ -831,6 +865,35 @@ export function mentionsAnotherMember(larkAppId: string, message: any): boolean 
   } catch { /* ignore parse errors */ }
 
   return false;
+}
+
+function mentionMatchesBot(m: any, larkAppId: string, botOpenId?: string): boolean {
+  const openId = mentionOpenId(m);
+  if (botOpenId && openId === botOpenId) return true;
+
+  // Some Lark event payloads identify bot mentions by app_id:
+  //   { id_type: "app_id", id: "cli_xxx" }
+  // Treat that as an explicit mention of this daemon, but do not let app_id
+  // flow through mentionOpenId(), which is persisted and used as an open_id.
+  const appId = mentionAppId(m);
+  return Boolean(larkAppId && appId === larkAppId);
+}
+
+function mentionIdType(m: any): string | undefined {
+  if (!m || typeof m !== 'object') return undefined;
+  if (typeof m.id_type === 'string') return m.id_type;
+  if (typeof m.idType === 'string') return m.idType;
+  return undefined;
+}
+
+function mentionAppId(m: any): string | undefined {
+  if (!m || typeof m !== 'object') return undefined;
+  if (typeof m.appId === 'string') return m.appId;
+  if (typeof m.app_id === 'string') return m.app_id;
+  const idType = mentionIdType(m);
+  if (idType === 'app_id' && typeof m.id === 'string') return m.id;
+  if (m.id && typeof m.id === 'object' && typeof m.id.app_id === 'string') return m.id.app_id;
+  return undefined;
 }
 
 // ─── Permission gates ────────────────────────────────────────────────────
@@ -941,14 +1004,24 @@ export function evaluateTalk(larkAppId: string, chatId: string | undefined, send
   return { allowed: false, reason: 'none' };
 }
 
-export function canOperate(larkAppId: string, _chatId: string | undefined, senderOpenId: string | undefined): boolean {
+export function canOperate(
+  larkAppId: string,
+  _chatId: string | undefined,
+  senderOpenId: string | undefined,
+  senderUnionId?: string | undefined,
+): boolean {
   const bot = getBot(larkAppId);
   // L1 同部署兄弟 bot 互信 operate：与 canTalk 一致——isKnownPeerBot 只认本部署
   // bots-info.json 里注册过的自家 bot。这不重开 PR #46 的封堵：人的 talk 授权
   // （chatGrant/globalGrant）仍不漏成 operate；这里只放行「自家 bot 之间」的 /
-  // 命令（让编排者能对子 bot 跑 /repo /cd 等）。跨团队/外部 bot 仍走 allowedUsers /
-  // 后续的 operate 级 grant。
+  // 命令（让编排者能对子 bot 跑 /repo /cd 等）。
   if (isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) return true;
+  // L2 跨部署「团队 peer bot」互信 operate（与 L1 兄弟 bot 对等，覆盖编排者给
+  // 队友派 /repo /cd 等）。**只认租户稳定的 union_id**（isTeamBot），不走
+  // isTrustedTeamBotSender 的「团队群成员」分支——那条按 chat 放行是 sender 无关
+  // 的，会把「团队群里的真人」也误放进 operate，破坏 allowedUsers 边界。union_id
+  // 是发送方专属、且必须先在团队群里被认证学习过才进表，所以人不会命中。
+  if (isTeamBot(config.session.dataDir, senderUnionId)) return true;
   const allowedUsers = bot.resolvedAllowedUsers;
   // globalGrants（与 allowedChatGroups 同理）确立"有白名单"语义：只配 globalGrants 也算限制态，
   // 否则 canOperate 会 fall through 到"全开放"，把 talk-only 授权变成 operate 全开——正是 PR #46
@@ -1527,8 +1600,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     'im.message.reaction.created_v1': () => {},
     'im.message.reaction.deleted_v1': () => {},
     'im.message.receive_v1': (data: any) => {
+      // Dedupe by message_id (stable across re-pushes / event_id re-mints /
+      // daemon restarts), persisted so the 6h re-push tier or a restart can't
+      // replay an already-handled message. Fall back to the in-memory event-id
+      // claim only when message_id is absent (shouldn't happen for real messages).
       const messageIdForKey = data?.message?.message_id;
-      const eventKey = `im.message.receive_v1:${larkAppId}:${eventIdForKey(data) ?? messageIdForKey ?? unkeyableEventKey()}`;
+      const eventKey = `im.message.receive_v1:${larkAppId}:${messageIdForKey ?? eventIdForKey(data) ?? unkeyableEventKey()}`;
+      const claim = messageIdForKey
+        ? () => claimMessageOnce(larkAppId, messageIdForKey)
+        : () => claimEventOnce(eventKey);
       scheduleAckSafeEvent(eventKey, async () => {
       try {
         const message = data.message;
@@ -1607,6 +1687,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               .catch(err => logger.error(`Error handling message event: ${err}`));
             return;
           }
+          // Learn teammate identity from team-assembled groups (the trust root):
+          // any bot talking in a 拉群 group is a vouched teammate, so capture its
+          // tenant-stable union_id — we then honour it as a teammate in ANY chat
+          // (see team-bots-store). Done BEFORE the @mention gate so even a non-@
+          // message in a team group teaches us the teammate. Cheap + idempotent.
+          if (senderUnionId && isTeamGroupChat(config.session.dataDir, chatId)) {
+            recordTeamBot(config.session.dataDir, { unionId: senderUnionId });
+          }
           // Foreign bot: only route on @mention of us.
           if (!isBotMentioned(larkAppId, message, undefined)) return;
           const decision = await decideRoutingWithSource(larkAppId, message);
@@ -1627,6 +1715,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             : false;
           const canFoldForeignBotThread = findOncallChat(larkAppId, chatId)
             || isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
+            || isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
             || hasChatGrant(larkAppId, chatId, senderOpenId)
             || hasGlobalGrant(larkAppId, senderOpenId);
           let replyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
@@ -1669,10 +1758,17 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // 同一存储、同一 per-chat 语义）。命中 chatGrants 的 bot 即便不在 cross-ref，
           // 也与已注册 peer 同等放行——这是「授权外部 bot 在本群协作」的入口。
           // 全局授权（globalGrants）同理：命中即在任意群放行，是上面的全局版。
+          //
+          // 团队 bot 免 /grant：isTrustedTeamBotSender 命中（sender 的租户稳定
+          // union_id 已学进 team-bots，或本群就是团队拉群组建的协作群）即放行——
+          // 与「同部署兄弟 bot」(isKnownPeerBot) 对等，但覆盖跨部署的团队 peer。
+          // 这正是「加入团队即免 introduce/grant」的接收闸：身份只认 union_id /
+          // 团队群成员，绝不认自报名字（防同名 bot 冒名蹭权）。
           if ((ctx.scope === 'chat' || decision.source === 'regular-group-thread' || forcedTopic) && !findOncallChat(larkAppId, chatId)) {
             const ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false;
             if (!ownsSession
                 && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
+                && !isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
                 && !hasChatGrant(larkAppId, chatId, senderOpenId)
                 && !hasGlobalGrant(larkAppId, senderOpenId)) {
               await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId);
@@ -1911,9 +2007,16 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // permitted senders. (The shared fold-back's replyRootId is already
           // handled by the first clause.)
           const mentionMode = resolveGroupMentionMode(larkAppId);
+          const ownedTopicGroupFollowup = !explicitlyMentionedThisBot
+            && isAllowed
+            && ownsSession
+            && routing.scope === 'thread'
+            && !!message.thread_id
+            && await getChatMode(larkAppId, chatId) === 'topic';
           const relax = (!!replyRootId && isAllowed)
             || (isAllowed && mentionMode === 'never')
             || (isAllowed && mentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message))
+            || ownedTopicGroupFollowup
             || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id)
             || (ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
           if (!relax) {
@@ -1982,7 +2085,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       } catch (err) {
         logger.error(`Error handling message event: ${err}`);
       }
-      }, 'message event');
+      }, 'message event', claim);
     },
   });
 

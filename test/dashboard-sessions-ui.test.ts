@@ -19,7 +19,7 @@ describe('dashboard sessions filters', () => {
   it('builds restart confirmation text with current status and CLI', () => {
     const message = restartConfirmMessage({ status: 'working', cliId: 'codex' });
 
-    expect(message).toContain('当前状态：working');
+    expect(message).toContain('当前状态：工作中');
     expect(message).toContain('CLI：codex');
     expect(message).toContain('确认重启');
   });

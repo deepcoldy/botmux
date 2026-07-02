@@ -16,7 +16,7 @@
   ],
   "scripts": {
     "build": "tsc && cp src/setup/lark-scopes.json dist/setup/ && pnpm dashboard:bundle && chmod +x dist/cli.js",
-    "dashboard:bundle": "esbuild src/dashboard/web/app.ts --bundle --outfile=dist/dashboard-web/app.js --platform=browser --format=iife --minify && cp src/dashboard/web/index.html dist/dashboard-web/index.html && cp src/dashboard/web/style.css dist/dashboard-web/style.css && cp src/dashboard/web/favicon.png dist/dashboard-web/favicon.png && cp src/dashboard/web/apple-touch-icon.png dist/dashboard-web/apple-touch-icon.png && cp src/dashboard/web/terminal-replay.html dist/dashboard-web/terminal-replay.html && rm -rf dist/dashboard-web/skins && cp -r src/dashboard/web/skins dist/dashboard-web/skins && rm -rf dist/dashboard-web/game && { [ ! -d src/dashboard/web/game ] || cp -r src/dashboard/web/game dist/dashboard-web/game; }",
+    "dashboard:bundle": "node scripts/build-dashboard.mjs",
     "daemon": "tsx src/index-daemon.ts",
     "daemon:start": "node dist/cli.js start",
     "daemon:stop": "node dist/cli.js stop",
@@ -50,6 +50,8 @@
     "node-pty": "^1.1.0",
     "pm2": "^6.0.0",
     "qrcode-terminal": "^0.12.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
     "ws": "^8.19.0",
     "zod": "^3.23.0"
   },
@@ -59,10 +61,14 @@
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^22.0.0",
     "@types/qrcode-terminal": "^0.12.2",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@types/react-test-renderer": "18.3.1",
     "@types/ws": "^8.18.1",
     "esbuild": "^0.28.0",
     "memfs": "^4.57.1",
     "playwright": "^1.58.2",
+    "react-test-renderer": "18.3.1",
     "tsx": "^4.20.5",
     "typescript": "^5.3.0",
     "vitest": "^4.0.18"

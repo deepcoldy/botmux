@@ -129,6 +129,13 @@ beforeEach(() => {
   mockGetMessageDetail.mockReset().mockResolvedValue({ items: [] });
 });
 
+type TestMention = {
+  key: string;
+  name: string;
+  id: { open_id?: string; app_id?: string } | string;
+  id_type?: string;
+};
+
 async function flushEventWork() {
   await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -204,7 +211,7 @@ function makeBotMessageEvent(opts: {
   chatId?: string;
   chatType?: string;
   messageId?: string;
-  mentions?: Array<{ key: string; name: string; id: { open_id: string } }>;
+  mentions?: TestMention[];
   /** Override `sender.sender_type`. Defaults to `'app'`. Use `'bot'` to model
    *  飞书在跨 bot 卡片消息场景实测投递的值。 */
   senderType?: string;
@@ -239,7 +246,7 @@ function makeUserMessageEvent(opts: {
   chatId?: string;
   chatType?: string;
   messageId?: string;
-  mentions?: Array<{ key: string; name: string; id: { open_id: string } }>;
+  mentions?: TestMention[];
 }) {
   const threadId = opts.threadId === null
     ? undefined
@@ -338,6 +345,22 @@ describe('isBotMentioned', () => {
     const message = {
       mentions: [{ key: '@_bot', name: 'BotA', id: MY_OPEN_ID, id_type: 'union_id' }],
       content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(false);
+  });
+
+  it('detects @mention via app_id mention payload', () => {
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: MY_APP_ID, id_type: 'app_id' }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(true);
+  });
+
+  it('does not treat another app_id as this bot mention', () => {
+    const message = {
+      mentions: [{ key: '@_other', name: 'Other', id: 'app-other', id_type: 'app_id' }],
+      content: JSON.stringify({ text: '@Other hello' }),
     };
     expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(false);
   });
@@ -461,6 +484,59 @@ describe('mentionsAnotherMember (ambient redirect carve-out)', () => {
       content: JSON.stringify({ text: '@BotA @Other' }),
     };
     expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(true);
+  });
+});
+
+describe('im.message.receive_v1 — message_id dedupe (re-push protection)', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    mockReplyMessage.mockClear();
+    mockGetOwnerOpenId.mockReset().mockReturnValue(undefined);
+    mockGetCachedChatMode.mockReset().mockReturnValue(undefined);
+    setupBotState();
+    handlers = makeHandlers();
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockFindOncallChat.mockReturnValue(undefined);
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  // A bot @mention in a thread routes to handleThreadReply exactly once per
+  // distinct message. We reuse that path to count how many times a (re-)delivered
+  // message is actually processed.
+  const mentionEvent = (messageId: string, eventId?: string) => {
+    const event: any = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA check this' }),
+      rootId: 'root-thread-dedupe',
+      messageId,
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    if (eventId) event.event_id = eventId; // mirror SDK parse: header.event_id is spread onto data
+    return event;
+  };
+
+  it('suppresses a re-push with the SAME message_id but a NEW event_id (old event_id-keyed dedupe would not)', async () => {
+    await capturedHandlers['im.message.receive_v1'](mentionEvent('om_repush', 'ev_first'));
+    await flushEventWork();
+    // Feishu re-delivers the same message; event_id may differ on the new delivery.
+    await capturedHandlers['im.message.receive_v1'](mentionEvent('om_repush', 'ev_second'));
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT over-suppress: two distinct messages (distinct message_id) both process', async () => {
+    await capturedHandlers['im.message.receive_v1'](mentionEvent('om_a', 'ev_a'));
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](mentionEvent('om_b', 'ev_b'));
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -1843,6 +1919,33 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     await flushEventWork();
 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('topic group default: a non-@ reply inside an owned topic continues the session', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] }); // default always
+    mockGetChatMode.mockResolvedValue('topic');
+    mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 });
+    handlers.resolveReplyThreadAlias.mockReturnValue(null);
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'owned-topic-root');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'continue without @ in a topic group' }),
+      rootId: 'owned-topic-root',
+      threadId: 'owned-topic-root',
+      messageId: 'msg-in-owned-topic-group',
+      chatId: 'chat-topic-group',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'owned-topic-root',
+      larkAppId: MY_APP_ID,
+    }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
@@ -3252,7 +3355,7 @@ describe('im.message.receive_v1 — /introduce command', () => {
 
   function makeIntroduceEvent(opts: {
     extraText?: string;
-    mentions: Array<{ key: string; name: string; id: { open_id: string } }>;
+    mentions: TestMention[];
     chatId?: string;
     messageId?: string;
   }) {

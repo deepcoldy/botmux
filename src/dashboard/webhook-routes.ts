@@ -11,7 +11,7 @@ import {
   failWebhookLifecycleGroup,
 } from '../services/webhook-lifecycle-store.js';
 import { jsonRes } from './workflow-api.js';
-import { dispatchTriggerRequest, newTriggerId, type TriggerApiDeps } from './trigger-api.js';
+import { dispatchTriggerRequest, newTriggerId, queryTriggerResult, type TriggerApiDeps } from './trigger-api.js';
 
 const replayNonces = new Map<string, number>();
 const rateBuckets = new Map<string, { windowStart: number; count: number }>();
@@ -152,6 +152,36 @@ function dynamicChatId(req: IncomingMessage, url: URL, payload: unknown): string
   return undefined;
 }
 
+function dynamicSessionId(req: IncomingMessage, url: URL, payload: unknown): string | undefined {
+  const fromQuery = url.searchParams.get('sessionId') ?? undefined;
+  if (fromQuery) return fromQuery;
+  const fromHeader = headerValue(req, 'x-botmux-session-id');
+  if (fromHeader) return fromHeader;
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    const p = payload as any;
+    if (typeof p.sessionId === 'string') return p.sessionId;
+    if (p.target && typeof p.target === 'object' && typeof p.target.sessionId === 'string') return p.target.sessionId;
+  }
+  return undefined;
+}
+
+function parseTriggerResponseOptions(
+  req: IncomingMessage,
+  url: URL,
+): { waitForFinalOutput?: true; asyncReturnSessionId?: true; timeoutMs?: number } {
+  const rawWait = url.searchParams.get('wait') ?? headerValue(req, 'x-botmux-wait');
+  const wait = rawWait === '1' || rawWait === 'true' || rawWait === 'yes';
+  const rawAsync = url.searchParams.get('async') ?? headerValue(req, 'x-botmux-async');
+  const asyncReturnSessionId = rawAsync === '1' || rawAsync === 'true' || rawAsync === 'yes';
+  const rawTimeout = url.searchParams.get('timeoutMs') ?? headerValue(req, 'x-botmux-timeout-ms');
+  const timeoutMs = rawTimeout ? Number(rawTimeout) : undefined;
+  return {
+    ...(wait ? { waitForFinalOutput: true } : {}),
+    ...(asyncReturnSessionId ? { asyncReturnSessionId: true } : {}),
+    ...(Number.isFinite(timeoutMs) ? { timeoutMs } : {}),
+  };
+}
+
 function webhookError(
   res: ServerResponse,
   status: number,
@@ -196,7 +226,7 @@ export async function handleWebhookRoute(
   //   /webhook/<connectorId>/<token>    → token baked into the URL (default)
   const m = url.pathname.match(/^\/webhook\/([^/]+)(?:\/([^/]+))?$/);
   if (!m) return false;
-  if (req.method !== 'POST') {
+  if (req.method !== 'POST' && req.method !== 'GET') {
     jsonRes(res, 405, { ok: false, errorCode: 'bad_request', error: 'method not allowed' });
     return true;
   }
@@ -206,6 +236,54 @@ export async function handleWebhookRoute(
   const connector = getConnector(connectorId);
   if (!connector || !connector.enabled) {
     webhookError(res, 404, connectorId, 'bad_request', 'unknown or disabled connector');
+    return true;
+  }
+
+  if (req.method === 'GET') {
+    // Async polling has no body, so HMAC mode signs over an empty payload.
+    const verify = connector.verify;
+    if (verify.type === 'token') {
+      const presented = extractWebhookToken(req, url, pathToken);
+      const secret = getWebhookSecret(verify.secretRef);
+      if (!presented || !secret || !verifyWebhookToken(secret, presented)) {
+        webhookError(res, 401, connectorId, 'invalid_signature', 'token verification failed');
+        return true;
+      }
+    } else {
+      const ts = headerValue(req, verify.timestampHeader);
+      const nonce = headerValue(req, verify.nonceHeader);
+      const sig = headerValue(req, verify.signatureHeader);
+      if (!ts || !nonce || !sig) {
+        webhookError(res, 401, connectorId, 'invalid_signature', 'missing signature, timestamp, or nonce header');
+        return true;
+      }
+      if (!timestampOk(ts, verify.toleranceSeconds)) {
+        webhookError(res, 401, connectorId, 'replay', 'timestamp outside tolerance window');
+        return true;
+      }
+      const secret = getWebhookSecret(verify.secretRef);
+      if (!secret || !verifyWebhookSignature(secret, ts, Buffer.alloc(0), sig)) {
+        webhookError(res, 401, connectorId, 'invalid_signature', 'signature verification failed');
+        return true;
+      }
+    }
+    const botId = connector.target.botId;
+    if (!botId) {
+      webhookError(res, 400, connectorId, 'target_required', 'target botId is required');
+      return true;
+    }
+    if (connector.target.kind !== 'turn') {
+      webhookError(res, 400, connectorId, 'bad_request', 'async polling is only supported for turn connectors');
+      return true;
+    }
+    const sessionId = url.searchParams.get('sessionId') ?? undefined;
+    const triggerId = url.searchParams.get('triggerId') ?? undefined;
+    if (!sessionId) {
+      webhookError(res, 400, connectorId, 'target_required', 'sessionId is required for async polling');
+      return true;
+    }
+    const result = await queryTriggerResult(botId, sessionId, deps, triggerId);
+    jsonRes(res, result.status, result.body);
     return true;
   }
 
@@ -259,6 +337,50 @@ export async function handleWebhookRoute(
   }
 
   const parsed = parsePayload(rawBody);
+  const responseOptions = parseTriggerResponseOptions(req, url);
+  if ((responseOptions.waitForFinalOutput || responseOptions.asyncReturnSessionId) && connector.target.kind !== 'turn') {
+    webhookError(res, 400, connectorId, 'bad_request', 'wait mode is only supported for turn connectors');
+    return true;
+  }
+  if (responseOptions.waitForFinalOutput || responseOptions.asyncReturnSessionId) {
+    const chatId = connector.target.mode === 'fixed'
+      ? connector.target.chatId
+      : dynamicChatId(req, url, parsed.payload);
+    const sessionId = dynamicSessionId(req, url, parsed.payload);
+    const allowChats = connector.target.allowChats ?? [];
+    if (chatId && allowChats.length > 0 && !allowChats.includes(chatId)) {
+      webhookError(res, 403, connectorId, 'chat_not_allowed', 'chatId is not allowed for this connector');
+      return true;
+    }
+    const trigger: TriggerRequest = {
+      source: {
+        type: 'webhook',
+        connectorId: connector.id,
+        requestId,
+        receivedAt: new Date().toISOString(),
+      },
+      target: {
+        kind: connector.target.kind,
+        botId: connector.target.botId,
+        ...(chatId ? { chatId } : {}),
+        ...(sessionId ? { sessionId } : {}),
+      },
+      envelope: {
+        format: 'botmux.webhook.v1',
+        sourceName: connector.promptEnvelope.sourceName || connector.name,
+        trusted: false,
+        headers: pickAllowedHeaders(req, connector.promptEnvelope.headerAllowlist),
+        payload: parsed.payload,
+        ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
+      },
+      ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
+      options: responseOptions,
+    };
+
+    const result = await dispatchTriggerRequest(trigger, deps);
+    jsonRes(res, result.status, result.body);
+    return true;
+  }
   if (connector.target.mode === 'new-group') {
     // Dedup is optional. Configured → events with the same extracted value share
     // one group (create once, reuse after). Not configured → every event spins
@@ -356,7 +478,7 @@ export async function handleWebhookRoute(
         ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
       },
       ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
-      options: dedupKey ? { dedupKey } : {},
+      options: { ...(dedupKey ? { dedupKey } : {}), ...responseOptions },
     };
 
     const result = await dispatchTriggerRequest(trigger, deps);
@@ -367,12 +489,12 @@ export async function handleWebhookRoute(
   const chatId = connector.target.mode === 'fixed'
     ? connector.target.chatId
     : dynamicChatId(req, url, parsed.payload);
-  if (!chatId) {
+  if (!chatId && !responseOptions.waitForFinalOutput) {
     webhookError(res, 400, connectorId, 'target_required', 'target chatId is required');
     return true;
   }
   const allowChats = connector.target.allowChats ?? [];
-  if (allowChats.length > 0 && !allowChats.includes(chatId)) {
+  if (chatId && allowChats.length > 0 && !allowChats.includes(chatId)) {
     webhookError(res, 403, connectorId, 'chat_not_allowed', 'chatId is not allowed for this connector');
     return true;
   }
@@ -399,7 +521,7 @@ export async function handleWebhookRoute(
       ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
     },
     ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
-    options: {},
+    options: responseOptions,
   };
 
   const result = await dispatchTriggerRequest(trigger, deps);

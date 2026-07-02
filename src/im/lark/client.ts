@@ -79,6 +79,11 @@ function getLarkErrorCode(err: any): number | undefined {
 }
 
 const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
+// Capability cache for the undocumented `/members/bots` endpoint. It prevents
+// repeated hits while the tenant/gateway cannot serve the API, but per-request
+// business errors (bad chat id, permission denial) must not poison other chats.
+const LIST_BOTS_API_FAILURE_TTL_MS = 3 * 60 * 1000;
+const listBotsApiFailures = new Map<string, { reason: string; expiresAt: number }>();
 
 /**
  * Send a message to a chat.
@@ -1198,6 +1203,103 @@ export type ChatBotMember = {
   mentionSource: 'cross-ref' | 'self' | 'observed' | 'fallback';
 };
 
+type ChatBotListApiItem = { botId: string; botName: string };
+type ChatBotListApiResult =
+  | { ok: true; items: ChatBotListApiItem[] }
+  | { ok: false; reason: string; cacheable: boolean };
+
+function promiseWithTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return p;
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+  return Promise.race([p, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+async function listChatBotsViaMembersBots(
+  larkAppId: string,
+  chatId: string,
+  timeoutMs: number,
+): Promise<ChatBotListApiResult> {
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await promiseWithTimeout(
+      larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/bots`),
+      timeoutMs,
+      'list chat bot members',
+    );
+    if (res?.code !== 0) return { ok: false, reason: `code=${res?.code ?? 'unknown'} msg=${res?.msg ?? ''}`, cacheable: false };
+    const rawItems = res?.data?.items;
+    if (!Array.isArray(rawItems)) return { ok: false, reason: 'invalid_items', cacheable: true };
+    const items = rawItems
+      .map((it: any) => ({
+        botId: String(it?.bot_id ?? '').trim(),
+        botName: String(it?.bot_name ?? '').trim(),
+      }))
+      .filter((it: ChatBotListApiItem) => it.botId && it.botName);
+    return { ok: true, items };
+  } catch (err: any) {
+    return { ok: false, reason: err?.message ?? String(err), cacheable: true };
+  }
+}
+
+// `/members/bots` returns the observer-scoped mention handle (`bot_id`) and
+// display name only. Bind botmux identity only when a configured bot has already
+// been proven to be in this chat and the name match is unique, OR the item's
+// observer-scoped `bot_id` equals a configured row's already-reliable open_id —
+// notably the observer's own bot, whose `/members/bots` `bot_id` IS its self-view
+// open_id. The open_id key guards against display-name drift between
+// `/members/bots` and bots-info.json (e.g. self leaking into <available_bots> as
+// a mentionable peer when its name no longer matches).
+function buildChatBotsFromMembersBotsApi(
+  items: ChatBotListApiItem[],
+  currentLarkAppId: string,
+  configured: ChatBotMember[],
+  crossRef: Map<string, string>,
+  norm: (s: string) => string,
+): ChatBotMember[] {
+  const configuredByName = new Map<string, ChatBotMember[]>();
+  const configuredByOpenId = new Map<string, ChatBotMember>();
+  for (const row of configured) {
+    const key = norm(row.displayName);
+    const arr = configuredByName.get(key);
+    if (arr) arr.push(row);
+    else configuredByName.set(key, [row]);
+    if (row.openId) configuredByOpenId.set(row.openId, row);
+  }
+
+  const out: ChatBotMember[] = [];
+  const seenOpenIds = new Set<string>();
+  for (const item of items) {
+    if (seenOpenIds.has(item.botId)) continue;
+    const key = norm(item.botName);
+    const matches = configuredByName.get(key) ?? [];
+    const bound = (matches.length === 1 ? matches[0] : undefined) ?? configuredByOpenId.get(item.botId);
+    const crossHit = crossRef.get(key);
+    const isSelf = bound?.larkAppId === currentLarkAppId;
+    const mentionSource: ChatBotMember['mentionSource'] = crossHit === item.botId
+      ? 'cross-ref'
+      : (isSelf ? 'self' : 'observed');
+
+    out.push({
+      larkAppId: bound?.larkAppId ?? '',
+      openId: item.botId,
+      name: bound?.name ?? item.botName,
+      displayName: item.botName,
+      source: bound ? 'configured' : 'introduce',
+      capability: bound?.capability,
+      hasTeamRole: bound?.hasTeamRole ?? false,
+      mentionable: true,
+      mentionSource,
+    });
+    seenOpenIds.add(item.botId);
+  }
+  return out;
+}
+
 export async function listChatBotMembers(larkAppId: string, chatId: string): Promise<ChatBotMember[]> {
   // Single name-key normalizer used for EVERY cross-source name match below
   // (cross-ref ⇄ bots-info ⇄ observed). Trim-only: strips incidental leading/
@@ -1269,6 +1371,27 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
     }),
   );
   const configured: ChatBotMember[] = configuredResults.filter((r): r is ChatBotMember => r !== null);
+
+  const discovery = config.chatBotDiscovery;
+  if (discovery?.listBotsApiEnabled) {
+    const failureKey = larkAppId;
+    const cachedFailure = listBotsApiFailures.get(failureKey);
+    const now = Date.now();
+    if (cachedFailure && cachedFailure.expiresAt > now) {
+      logger.debug(`members/bots disabled by recent failure for ${larkAppId}: ${cachedFailure.reason}`);
+    } else {
+      if (cachedFailure) listBotsApiFailures.delete(failureKey);
+      const apiResult = await listChatBotsViaMembersBots(larkAppId, chatId, discovery.listBotsApiTimeoutMs);
+      if (apiResult.ok) {
+        listBotsApiFailures.delete(failureKey);
+        return buildChatBotsFromMembersBotsApi(apiResult.items, larkAppId, configured, crossRef, norm);
+      }
+      if (apiResult.cacheable) {
+        listBotsApiFailures.set(failureKey, { reason: apiResult.reason, expiresAt: now + LIST_BOTS_API_FAILURE_TTL_MS });
+      }
+      logger.warn(`members/bots failed for ${larkAppId} in ${chatId}; falling back to legacy bot discovery: ${apiResult.reason}`);
+    }
+  }
 
   // Merge observed entries (from /introduce), scoped to the caller's observer
   // app so open_ids match how THIS daemon should @-mention them (open_id is

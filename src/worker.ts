@@ -42,6 +42,7 @@ import { findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/t
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
+import { drainPiTranscript, findPiTranscriptByPid, findPiTranscriptBySessionId } from './services/pi-transcript.js';
 import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
@@ -77,10 +78,10 @@ import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-back
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
 import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
-import { selectSessionBackend } from './adapters/backend/session-backend-selector.js';
+import { selectSessionBackend, decideBackendGate, backendGateUserMessage } from './adapters/backend/session-backend-selector.js';
 import { prepareSandbox, attachSandboxOutbox, startOutboxWatcher, sandboxEnabled, sandboxedClaudeDataDir } from './adapters/backend/sandbox.js';
 import type { BackendType, SessionBackend } from './adapters/backend/types.js';
-import { tmuxEnv } from './setup/ensure-tmux.js';
+import { tmuxEnv, probeTmuxFunctional } from './setup/ensure-tmux.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
@@ -91,7 +92,7 @@ import { detectCliUsageLimit, usageLimitStateKey, type CliUsageLimitState } from
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { redactChildEnv } from './utils/child-env.js';
 import { decideSubmitConfirmationAction, type SubmitActivityEvidence } from './services/submit-confirmation.js';
-import { config } from './config.js';
+import { config, resolveChatBotDiscoveryConfig } from './config.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
 import { createHash } from 'node:crypto';
@@ -194,7 +195,7 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -293,6 +294,13 @@ function releaseReadyGate(reason: string): void {
 const STARTUP_CMD_QUIET_MS = 500;
 const STARTUP_CMD_CAP_MS = 4_000;
 
+/** Inter-keystroke spacing when typing a slash command into CoCo char-by-char.
+ *  CoCo (Trae CLI, Ink TUI) treats "several bytes delivered in one PTY read" as a
+ *  paste, which skips command mode + the slash picker — so each char must land as
+ *  its own keystroke. 40ms is comfortably above CoCo's coalescing window (verified
+ *  against Trae CLI 0.120.45) while keeping a short command sub-second. */
+const COCO_SLASH_TYPE_THROTTLE_MS = 40;
+
 /** Type one literal input LINE into the CLI exactly like a passthrough slash
  *  command: raw text → a 200ms beat (so the TUI's slash-command picker registers
  *  the match before submit) → a separate Enter. Non-TUI backends fall back to a
@@ -300,6 +308,29 @@ const STARTUP_CMD_CAP_MS = 4_000;
  *  so both stay in lockstep. */
 async function sendRawCommandLine(be: NonNullable<typeof backend>, content: string): Promise<void> {
   if ('sendText' in be && 'sendSpecialKeys' in be) {
+    if (lastInitConfig?.cliId === 'coco') {
+      // CoCo (Trae CLI, Ink TUI) detects "several bytes in one PTY read = paste",
+      // so a one-shot sendText('/model') lands as PASTED text: command mode + the
+      // slash picker never activate and the trailing Enter submits `/model` to the
+      // model (the "/model 多一个换行" bug). Fix: type char-by-char (throttled) so
+      // each char is a distinct keystroke that opens command mode, and append ONE
+      // trailing space to a bare command so the suggestion popup is dismissed.
+      // Without that dismissal the popup captures the first Enter (CoCo then needs
+      // two), and for an interactive command like /model — which opens a model
+      // selector — a stray second Enter would confirm whatever model is highlighted.
+      // Popup gone ⇒ exactly one Enter executes (/model just opens the selector and
+      // waits). trim() first so a trailing newline carried from the Lark message
+      // isn't typed as a literal newline that re-breaks command detection.
+      const cmd = content.trim();
+      const typed = cmd.includes(' ') ? cmd : `${cmd} `;
+      for (const ch of typed) {
+        (be as any).sendText(ch);
+        await new Promise(r => setTimeout(r, COCO_SLASH_TYPE_THROTTLE_MS));
+      }
+      await new Promise(r => setTimeout(r, 200));
+      (be as any).sendSpecialKeys('Enter');
+      return;
+    }
     (be as any).sendText(content);
     await new Promise(r => setTimeout(r, 200));
     (be as any).sendSpecialKeys('Enter');
@@ -1685,7 +1716,7 @@ function codexBridgeFallbackActive(): boolean {
   // True for transcript-backed CLIs whose final output can be harvested
   // when the model forgets to call `botmux send`.
   const id = lastInitConfig?.cliId;
-  if (id === 'codex' || id === 'traex' || id === 'coco' || id === 'hermes' || id === 'mtr') return true;
+  if (id === 'codex' || id === 'traex' || id === 'coco' || id === 'hermes' || id === 'mtr' || id === 'pi') return true;
   // Cursor only harvests its transcript in adopt mode: a botmux-spawned
   // cursor session carries the botmux skill and replies via `botmux send`,
   // and we never resolve a transcript path for it — so leave that flow
@@ -1708,6 +1739,10 @@ function structuredBridgeIsMtr(): boolean {
   return lastInitConfig?.cliId === 'mtr';
 }
 
+function structuredBridgeIsPi(): boolean {
+  return lastInitConfig?.cliId === 'pi';
+}
+
 function codexBridgeIsCursor(): boolean {
   return lastInitConfig?.cliId === 'cursor';
 }
@@ -1715,6 +1750,7 @@ function codexBridgeIsCursor(): boolean {
 function structuredBridgeIngestPath(path: string, offset: number) {
   if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
   if (codexBridgeIsCursor()) return drainCursorTranscript(path, offset);
+  if (structuredBridgeIsPi()) return drainPiTranscript(path, offset);
   if (structuredBridgeIsHermes()) {
     const result = drainHermesStateDb(offset);
     return { events: result.events, newOffset: result.newOffset, pendingTail: '' };
@@ -1799,11 +1835,14 @@ function codexBridgeStartTimer(): void {
         // sid, so the lookup is just a path computation + existence check.
         const isCoco = lastInitConfig?.cliId === 'coco';
         const isTraex = lastInitConfig?.cliId === 'traex';
+        const isPi = lastInitConfig?.cliId === 'pi';
         let path: string | undefined;
         if (codexBridgePendingSessionId) {
           if (isCoco) {
             path = cocoEventsPathForSession(codexBridgePendingSessionId);
             if (path && !existsSync(path)) path = undefined;
+          } else if (isPi) {
+            path = findPiTranscriptBySessionId(codexBridgePendingSessionId, lastInitConfig?.workingDir);
           } else if (isTraex) {
             path = findTraexRolloutBySessionId(codexBridgePendingSessionId);
           } else {
@@ -1814,6 +1853,9 @@ function codexBridgeStartTimer(): void {
           if (isCoco) {
             const probed = findCocoSessionByPid(codexAdoptPendingPid);
             if (probed && existsSync(probed.eventsPath)) path = probed.eventsPath;
+          } else if (isPi) {
+            const probed = findPiTranscriptByPid(codexAdoptPendingPid);
+            if (probed) path = probed.path;
           } else if (isTraex) {
             const probed = findTraexRolloutByPid(codexAdoptPendingPid);
             if (probed) path = probed.path;
@@ -2039,7 +2081,9 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   }
   const path = lastInitConfig?.cliId === 'traex'
     ? findTraexRolloutBySessionId(cliSessionId)
-    : findCodexRolloutBySessionId(cliSessionId);
+    : lastInitConfig?.cliId === 'pi'
+      ? findPiTranscriptBySessionId(cliSessionId, lastInitConfig?.workingDir)
+      : findCodexRolloutBySessionId(cliSessionId);
   if (path) {
     codexBridgePendingSessionId = undefined;
     codexBridgeAttach(path, 'fresh-empty');
@@ -3658,19 +3702,36 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
       codexAdoptPendingPid = cfg.adoptCliPid;
       codexBridgeStartTimer();
     }
+  } else if (cfg.cliId === 'pi') {
+    const adoptStartMs = Date.now();
+    codexAdoptStartMs = adoptStartMs;
+    codexBridgeQueue.setLocalTurns(true, adoptStartMs);
+    let path: string | undefined;
+    if (cfg.cliSessionId) path = findPiTranscriptBySessionId(cfg.cliSessionId, cfg.adoptCwd ?? cfg.workingDir);
+    if (!path && cfg.adoptCliPid) {
+      const probed = findPiTranscriptByPid(cfg.adoptCliPid);
+      if (probed) path = probed.path;
+    }
+    if (path) {
+      codexBridgeAttach(path, 'split-live');
+    } else {
+      if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
+      codexAdoptPendingPid = cfg.adoptCliPid;
+      codexBridgeStartTimer();
+    }
   }
 }
 
 function adoptIdleAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): CliAdapter {
   return cfg.bridgeJsonlPath
     ? createCliAdapterSync('claude-code', undefined)
-    : cfg.cliId === 'codex' || cfg.cliId === 'traex' || cfg.cliId === 'coco' || cfg.cliId === 'mtr'
+    : cfg.cliId === 'codex' || cfg.cliId === 'traex' || cfg.cliId === 'coco' || cfg.cliId === 'mtr' || cfg.cliId === 'pi'
       ? createCliAdapterSync(cfg.cliId, undefined)
       : ({ completionPattern: undefined, readyPattern: undefined } as CliAdapter);
 }
 
 function setupAdoptInputAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
-  if (cfg.cliId === 'codex' || cfg.cliId === 'traex') {
+  if (cfg.cliId === 'codex' || cfg.cliId === 'traex' || cfg.cliId === 'pi') {
     cliAdapter = createCliAdapterSync(cfg.cliId, cfg.cliPathOverride);
   } else if (cfg.cliId === 'mtr') {
     cliAdapter = createCliAdapterSync('mtr', cfg.cliPathOverride);
@@ -3883,28 +3944,57 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   }
 
   cliAdapter = createCliAdapterSync(cfg.cliId as any, cfg.cliPathOverride);
-  // backendType=tmux trust-but-verify: an explicit per-bot config (or
-  // BACKEND_TYPE=tmux env override) bypasses config.ts's auto-detect, so
-  // the worker re-probes here. Existing botmux tmux sessions are more
-  // authoritative than the disposable "can we create a new server?" probe:
-  // abandoning one after a transient probe failure would spawn a duplicate CLI
-  // under raw PTY and make later submits invisible to the real Codex history.
+  // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
+  // config (or BACKEND_TYPE env override) bypasses config.ts's default, so the
+  // worker re-probes the requested persistent backend here. A requested
+  // tmux/herdr/zellij backend that isn't functional NO LONGER silently
+  // degrades to raw PTY — that silent fallback was the root of the "secretly
+  // running on PTY, then hitting all of PTY's problems" bug class. Instead we
+  // refuse to spawn and post an actionable card (user_notify) telling the user
+  // to install the backend, or to explicitly opt into PTY with BACKEND_TYPE=pty.
+  //
+  // Existing botmux sessions stay authoritative over the disposable "can we
+  // create a new server?" probe: a live session reattaches regardless of a
+  // transient probe failure (PR#249), so it's exempt from the gate.
   let effectiveBackend = cfg.backendType;
-  if (effectiveBackend === 'tmux') {
-    const existingSessionName = TmuxBackend.sessionName(cfg.sessionId);
-    const hasExistingSession = TmuxBackend.hasSession(existingSessionName);
-    if (!hasExistingSession && !TmuxBackend.isAvailable()) {
-      log('tmux backend requested but functional probe failed and no existing session is available — falling back to PTY backend');
-      effectiveBackend = 'pty';
+  {
+    let available = true;
+    let reason = '';
+    let hasExistingSession = false;
+    if (effectiveBackend === 'tmux') {
+      hasExistingSession = TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId));
+      if (!hasExistingSession) {
+        const probe = probeTmuxFunctional();
+        available = probe.ok;
+        if (!probe.ok) reason = probe.reason;
+      }
+    } else if (effectiveBackend === 'zellij') {
+      // Like tmux, zellij's probe is a disposable background session, so a
+      // live named session is more authoritative than a transient probe
+      // failure (PR#249 semantics) — check it first so we reattach, not gate.
+      hasExistingSession = ZellijBackend.hasSession(ZellijBackend.sessionName(cfg.sessionId));
+      if (!hasExistingSession) {
+        available = ZellijBackend.isAvailable();
+        reason = 'zellij 功能性探针失败（需 zellij >= 0.44）';
+      }
+    } else if (effectiveBackend === 'herdr') {
+      // herdr's isAvailable() is a cheap, non-destructive `herdr --version`
+      // (not a disposable session probe), so it has no PR#249 false-negative
+      // risk and needs no existing-session exemption.
+      available = HerdrBackend.isAvailable();
+      reason = 'herdr 功能性探针失败';
     }
-  }
-  if (effectiveBackend === 'herdr' && !HerdrBackend.isAvailable()) {
-    log('herdr backend requested but probe failed — falling back to PTY backend');
-    effectiveBackend = 'pty';
-  }
-  if (effectiveBackend === 'zellij' && !ZellijBackend.isAvailable()) {
-    log('zellij backend requested but functional probe failed (need zellij >= 0.44) — falling back to PTY backend');
-    effectiveBackend = 'pty';
+    const decision = decideBackendGate({ requested: effectiveBackend, available, hasExistingSession });
+    if (decision.action === 'gate') {
+      const detail = reason || decision.reason;
+      log(`${effectiveBackend} backend unavailable and silent PTY fallback is disabled (set BACKEND_TYPE=pty to opt in): ${detail}`);
+      // user_notify is delivered to the Lark thread by the daemon (type:'error'
+      // is log-only); send it BEFORE throwing so the card lands. The throw is
+      // caught by the init handler, which sends type:'error' and exits — the
+      // IPC channel flushes these small messages before exit.
+      send({ type: 'user_notify', message: backendGateUserMessage(effectiveBackend, detail), turnId: cfg.turnId });
+      throw new Error(`${effectiveBackend} backend unavailable; refusing silent PTY fallback (set BACKEND_TYPE=pty to opt in): ${detail}`);
+    }
   }
   effectiveBackendType = effectiveBackend;
   const selectedBackend = selectSessionBackend({ sessionId: cfg.sessionId, backendType: effectiveBackend });
@@ -4166,6 +4256,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   childEnv.BOTMUX_CHAT_ID = cfg.chatId;
   childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  // Inject an explicit false when disabled so child `botmux bots list` cannot
+  // drift from the daemon because of stale rcfile/tmux environment.
+  const chatBotDiscovery = resolveChatBotDiscoveryConfig();
+  childEnv.BOTMUX_LARK_LIST_BOTS_API_ENABLED = chatBotDiscovery.listBotsApiEnabled ? 'true' : 'false';
+  childEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
   // Initial value only; long-lived panes get the latest turn via the JSON pid marker.
   if (cfg.turnId) childEnv.BOTMUX_TURN_ID = cfg.turnId;
   if (injectClaudeSandbox) childEnv.IS_SANDBOX = '1';
@@ -4520,6 +4615,19 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     const source = findMtrSessionById(mtrSessionId);
     if (source) {
       mtrBridgeAttach(source, effectiveResume ? 'baseline-existing' : 'fresh-empty');
+    } else {
+      codexBridgeStartTimer();
+    }
+  } else if (cfg.cliId === 'pi') {
+    const piSessionId = effectiveCliSessionId ?? effectiveAdapterSessionId;
+    if (piSessionId) {
+      const transcriptPath = findPiTranscriptBySessionId(piSessionId, cfg.workingDir);
+      if (transcriptPath) {
+        codexBridgeAttach(transcriptPath, effectiveResume ? 'baseline-existing' : 'fresh-empty');
+      } else {
+        codexBridgePendingSessionId = piSessionId;
+        codexBridgeStartTimer();
+      }
     } else {
       codexBridgeStartTimer();
     }
@@ -5329,6 +5437,15 @@ process.on('message', async (raw: unknown) => {
           adoptMode: msg.adoptMode === true,
           passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,
         });
+        if (msg.prompt && cliAdapter?.passesInitialPromptViaArgs && !deferInitialPrompt && codexBridgeFallbackActive()) {
+          // Args-baked first prompts (notably Pi) never pass through the normal
+          // 'message' IPC path, so the structured bridge would otherwise see the
+          // transcript final answer with no pending turn to attribute it to.
+          // Mark it here before the CLI starts processing; late-attach is fine
+          // because CodexBridgeQueue is path-agnostic until ingest discovers the
+          // transcript file.
+          codexBridgeMarkPendingTurn(msg.prompt, msg.turnId);
+        }
         if (msg.prompt && (!cliAdapter?.passesInitialPromptViaArgs || deferInitialPrompt)) {
           pendingMessages.push({ content: msg.prompt, turnId: msg.turnId });
         }

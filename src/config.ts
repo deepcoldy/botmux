@@ -1,7 +1,7 @@
 import { networkInterfaces } from 'node:os';
 import type { BackendType } from './adapters/backend/types.js';
-import { probeTmuxFunctional } from './setup/ensure-tmux.js';
 import { resolveWorkerHttpHost } from './utils/worker-http.js';
+import { readGlobalConfig } from './global-config.js';
 
 /** Get the first non-loopback IPv4 address, fallback to localhost. */
 function getLocalIp(): string {
@@ -26,15 +26,19 @@ export function getDashboardExternalHost(): string {
 }
 
 /**
- * Pick the session backend. tmux is preferred (enables /adopt + per-client
- * Web terminal attach) but only if it can actually start a server. The old
- * check was `tmux -V`, which passes on machines where tmux is installed but
- * broken (perms / config / linkage) and leaves the worker spamming "error
- * connecting to /tmp/tmux-UID/default" forever. The functional probe filters
- * those out so we silently fall back to PTY.
+ * Default session backend: always tmux (PTY 退役).
+ *
+ * PTY is no longer an automatic fallback. It used to be picked here whenever
+ * the tmux functional probe failed, which meant hosts with a broken/missing
+ * tmux silently ran on PTY — and then hit PTY's whole problem set (no survival
+ * across daemon restart, scrollback-relay quirks, …) without the user ever
+ * knowing they'd been downgraded. Now the default is tmux unconditionally; if
+ * tmux isn't functional the worker hard-gates the session with an actionable
+ * card (see decideBackendGate). PTY remains reachable only via an explicit
+ * BACKEND_TYPE=pty (or per-bot backendType:'pty') opt-in.
  */
 function detectDefaultBackend(): Exclude<BackendType, 'herdr'> {
-  return probeTmuxFunctional().ok ? 'tmux' : 'pty';
+  return 'tmux';
 }
 
 // Computed once: the packaged fallback data dir. The effective dir is read
@@ -45,6 +49,35 @@ function detectDefaultBackend(): Exclude<BackendType, 'herdr'> {
 // readers (resolveTeamRoleFile / getBotCapability / …) silently look in the
 // wrong directory. Mirrors the web/dashboard externalHost getters below.
 const packagedDataDir = new URL('../data', import.meta.url).pathname;
+
+export interface ChatBotDiscoveryConfig {
+  listBotsApiEnabled: boolean;
+  listBotsApiTimeoutMs: number;
+}
+
+/**
+ * Current-chat bot discovery via Lark `/members/bots`.
+ *
+ * Enabled by default; the dashboard Settings toggle persists the choice in
+ * `~/.botmux/config.json` (`dashboard.chatBotDiscovery`). An explicit
+ * `BOTMUX_LARK_LIST_BOTS_API_ENABLED` env var still overrides the persisted
+ * value — the worker injects it into child panes so `botmux bots list` matches
+ * the daemon's `<available_bots>`, and it doubles as an escape hatch.
+ *
+ * The endpoint is not public API, so every caller must keep the legacy
+ * discovery path as fallback.
+ */
+export function resolveChatBotDiscoveryConfig(env: NodeJS.ProcessEnv = process.env): ChatBotDiscoveryConfig {
+  const envFlag = env.BOTMUX_LARK_LIST_BOTS_API_ENABLED;
+  const listBotsApiEnabled =
+    envFlag != null && envFlag !== ''
+      ? envFlag.toLowerCase() === 'true'
+      : readGlobalConfig().dashboard?.chatBotDiscovery !== false; // default ON
+  return {
+    listBotsApiEnabled,
+    listBotsApiTimeoutMs: Number(env.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS) || 3_000,
+  };
+}
 
 export const config = {
   lark: {
@@ -171,6 +204,10 @@ export const config = {
       catch { return {}; }
     })() as Record<string, unknown>,
   },
+  // Live getter: re-reads the dashboard toggle (~/.botmux/config.json, 2s
+  // cached) on each access so a Settings change takes effect without a daemon
+  // restart. The daemon's listChatBotMembers reads this per call.
+  get chatBotDiscovery() { return resolveChatBotDiscoveryConfig(); },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

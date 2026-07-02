@@ -773,6 +773,12 @@ th {
 
 tbody tr:last-child td { border-bottom: 0; }
 
+.schedules-table .schedule-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
 /* ── 首尾列固定的横向滚动矩阵（群组与 Bot）─────────────────────────────
    bot 一多中间的成员列就溢出视口，操作按钮被顶出屏幕。把圆角/阴影挪到
    滚动容器上，表格本体放开宽度横向滚，首列（群）和尾列（操作）sticky 钉住。 */
@@ -919,6 +925,22 @@ button.primary {
   border: 1px solid var(--border-soft);
 }
 
+.session-lock-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  margin-left: 6px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--warning) 38%, var(--border-soft));
+  background: color-mix(in srgb, var(--warning) 10%, var(--surface-muted));
+  color: var(--warning);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
 .cli-claude-code { background: #e8f0ff; color: #234fb4; border-color: #c8d9ff; }
 .cli-codex       { background: #fff0df; color: #a14c11; border-color: #ffd8ad; }
 .cli-codex-app   { background: #e9f7ff; color: #11638f; border-color: #bde4fa; }
@@ -953,6 +975,7 @@ button.primary {
 .status-working,
 .status-active { background: var(--accent-soft); color: var(--accent-strong); }
 .status-idle { background: var(--surface-muted); color: var(--muted); }
+.status-dormant { background: var(--surface-muted); color: var(--muted); }
 .status-closed { background: var(--danger-soft); color: var(--danger); }
 .status-analyzing { background: var(--warning-soft); color: var(--warning); }
 .status-starting { background: var(--success-soft); color: var(--success); }
@@ -1140,6 +1163,10 @@ button.primary {
   background: color-mix(in srgb, var(--accent) 5%, var(--surface-raised));
 }
 
+.session-card.locked {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+}
+
 @media (prefers-reduced-motion: reduce) {
   .session-card { animation: none; transition: none; }
   .session-board-needs-you h2::before { animation: none; }
@@ -1195,6 +1222,19 @@ button.primary {
   justify-content: space-between;
   color: var(--muted);
   font-size: 12px;
+}
+
+.session-card-status-group,
+.drawer-status-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.session-card-status-group .session-lock-badge,
+.drawer-status-line .session-lock-badge {
+  margin-left: 0;
 }
 
 .session-signal {
@@ -1487,6 +1527,10 @@ button.primary {
   background: color-mix(in srgb, var(--accent) 4%, var(--surface-raised));
 }
 
+.kanban-card.locked {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+}
+
 .kanban-card:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
@@ -1533,6 +1577,14 @@ button.primary {
 
 .kanban-card-dot[data-status="limited"] {
   background: var(--danger);
+}
+
+.kanban-card-dot[data-status="idle"] {
+  background: var(--success);
+}
+
+.kanban-card-dot[data-status="dormant"] {
+  background: var(--muted);
 }
 
 .kanban-card-dot[data-status="closed"] {
@@ -1873,6 +1925,11 @@ button.primary {
   border-color: var(--danger);
   background: color-mix(in srgb, var(--danger) 9%, var(--surface-raised));
 }
+.card-act.locked {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface-raised));
+}
 .card-act:active { transform: scale(0.9); }
 
 /* 终端访问药丸：左「终端」段(accent ghost·只读旁观) + 右「钥匙」段(accent 实心·
@@ -2069,6 +2126,9 @@ fieldset legend {
 }
 
 .bulk-bar[hidden] { display: none; }
+/* Mobile table rules are author-level and can override the UA hidden style;
+   keep hidden tables invisible across view toggles such as sessions board/table. */
+table[hidden] { display: none !important; }
 .bulk-bar #bulk-count { font-weight: 800; margin-right: 4px; }
 .idle-cleanup-bar {
   display: grid;
@@ -2558,6 +2618,66 @@ input.row-select,
   table {
     display: block;
     overflow-x: auto;
+  }
+  .schedules-table {
+    display: block;
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+  .schedules-table thead {
+    display: none;
+  }
+  .schedules-table tbody {
+    display: grid;
+    gap: 10px;
+  }
+  .schedules-table tr {
+    display: grid;
+    gap: 8px;
+    padding: 14px;
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+  .schedules-table td {
+    display: grid;
+    grid-template-columns: minmax(84px, 0.36fr) minmax(0, 1fr);
+    gap: 10px;
+    align-items: baseline;
+    min-width: 0;
+    padding: 0;
+    border-bottom: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .schedules-table td[data-label]::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 800;
+    line-height: 1.35;
+    text-transform: uppercase;
+  }
+  .schedules-table td.actions-cell {
+    grid-template-columns: 1fr;
+  }
+  .schedules-table .schedule-actions {
+    gap: 8px;
+  }
+  .schedules-table .schedule-actions button {
+    flex: 1 1 120px;
+  }
+  .schedules-table tr.schedule-empty-row {
+    padding: 0;
+  }
+  .schedules-table tr.schedule-empty-row td {
+    display: block;
+    padding: 18px;
+    text-align: center;
   }
 }
 
@@ -3372,6 +3492,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .status-analyzing { background: var(--accent-soft); color: var(--accent); }
 .status-starting { background: var(--info-soft); color: var(--info); }
 .status-idle { background: var(--success-soft); color: var(--success); }
+.status-dormant { background: var(--surface-muted); color: var(--muted); }
 .status-limited { background: var(--danger-soft); color: var(--danger); }
 
 /* ── 玻璃面板（dark 下生效；light 保持实底）─────────────────────────────── */
@@ -4346,6 +4467,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 }
 
 .skills-install-grid label:first-child,
+.skills-install-grid .skills-source-label,
 .skills-install-field-wide,
 .skills-install-note {
   grid-column: 1 / -1;
@@ -4366,7 +4488,8 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   font-weight: 700;
 }
 
-.skills-install-grid label {
+.skills-install-grid label,
+.skills-install-grid .skills-source-label {
   display: grid;
   gap: 5px;
   color: var(--muted);

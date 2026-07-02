@@ -588,7 +588,16 @@ export class TmuxPipeBackend implements SessionBackend {
     const t = shellescape(this.paneTarget);
     const env = tmuxEnv();
     try {
-      execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore', env });
+      // status bar ON: shows tmux's window list so a user who manually
+      // `tmux attach -t <session>`es can navigate windows. Zero effect on the
+      // Lark card / web terminal — both read PANE bytes (capture-pane /
+      // pipe-pane), while the status bar is a client-level overlay that never
+      // enters the pane stream (and capture-pane never includes it). The
+      // original `status off` was a defensive guard from the early
+      // capture-screenshot backend; verified geometry-neutral on the pipe
+      // backend (toggling status on a detached session changes neither pane
+      // size nor cursor), so it's safe to default ON.
+      execSync(`tmux set-option -t ${t} status on`, { stdio: 'ignore', env });
       execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
       execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
       execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env });

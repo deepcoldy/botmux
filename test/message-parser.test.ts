@@ -812,29 +812,60 @@ describe('mentionOpenId', () => {
   });
 });
 
-describe('parseEventMessage: mention open_id across both id shapes', () => {
-  function makeEvent(mentions: any[]) {
+describe('parseEventMessage: mention identity formats', () => {
+  function makeMentionEvent(mention: any) {
     return {
       sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
       message: {
         message_id: 'om_msg',
         message_type: 'text',
-        content: JSON.stringify({ text: '@Claude hi' }),
+        content: JSON.stringify({ text: '@BotA hello' }),
         chat_id: 'oc_chat',
         chat_type: 'group',
         create_time: '1000',
-        mentions,
+        mentions: [mention],
       },
     };
   }
 
   it('surfaces openId from the WS event object form', () => {
-    const { parsed } = parseEventMessage(makeEvent([{ key: '@_user_1', name: 'Claude', id: { open_id: 'ou_claude' } }]));
-    expect(parsed.mentions?.[0]?.openId).toBe('ou_claude');
+    const { parsed } = parseEventMessage(makeMentionEvent({
+      key: '@_bot',
+      name: 'BotA',
+      id: { open_id: 'ou_bot_a_open_id' },
+    }));
+    expect(parsed.mentions?.[0]).toMatchObject({
+      key: '@_bot',
+      name: 'BotA',
+      openId: 'ou_bot_a_open_id',
+    });
   });
 
-  it('surfaces openId from the REST string form', () => {
-    const { parsed } = parseEventMessage(makeEvent([{ key: '@_user_1', name: 'Claude', id: 'ou_claude', id_type: 'open_id' }]));
-    expect(parsed.mentions?.[0]?.openId).toBe('ou_claude');
+  it('keeps string open_id mention ids as openId', () => {
+    const { parsed } = parseEventMessage(makeMentionEvent({
+      key: '@_bot',
+      name: 'BotA',
+      id: 'ou_bot_a_open_id',
+    }));
+    expect(parsed.mentions?.[0]).toMatchObject({
+      key: '@_bot',
+      name: 'BotA',
+      openId: 'ou_bot_a_open_id',
+    });
+  });
+
+  it('does not expose app_id mention ids as openId', () => {
+    const { parsed } = parseEventMessage(makeMentionEvent({
+      key: '@_bot',
+      name: 'BotA',
+      id: 'app-bot-a',
+      id_type: 'app_id',
+    }));
+    expect(parsed.mentions?.[0]).toMatchObject({
+      key: '@_bot',
+      name: 'BotA',
+      idType: 'app_id',
+    });
+    expect(parsed.mentions?.[0].openId).toBeUndefined();
   });
 });

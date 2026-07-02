@@ -1,39 +1,37 @@
 /**
  * OpenCode hook adapter。
  *
- * OpenCode 通过 QuestionAsked 事件发起提问，payload 形状：
+ * OpenCode 自带原生 `question` 工具（= Claude AskUserQuestion 等价物），模型调用时服务端
+ * 发布 `question.asked` 事件并阻塞，等客户端把答案 POST 回 `/question/{id}/reply` 才解阻塞。
+ * botmux 的 OpenCode 插件（见 hook-installer.ts buildOpenCodePlugin）用 `event` 钩子拦截该
+ * 事件，把 questions 规范成下面这个 payload 喂给 `botmux hook opencode`，拿到 directive 里的
+ * `answers` 后再 POST 回 OpenCode：
  *   {
- *     hook_event_name: 'QuestionAsked',
- *     session_id: 'opencode-<id>',
- *     question_id: '<id>',      // 同 _opencode_request_id
- *     question_text: '问题文本（拍平版本）',
+ *     hook_event_name: 'question.asked',
+ *     question_id: 'que_<id>',
+ *     session_id: 'ses_<id>',
  *     tool_input: {
  *       questions: [
  *         {
  *           question: '问题文本',
  *           header: '可选标题',
  *           options: [{ label: '选项文本', description?: '描述' }, ...],
- *           multiple: boolean,
+ *           multiple?: boolean,
  *         }
  *       ]
  *     },
- *     _opencode_request_id: '<id>',
  *   }
  *
- * OpenCode 期望的 answer directive 形状（发往 /question/:id/reply）：
+ * formatAnswer 返回的 directive 形状（插件取其中的 `answers` 作为 reply body）：
  *   { type: 'answer', answers: string[][] }
  *   其中 answers[i] = 第 i 个问题选中的 label 数组；跳过的 question 填 ['']。
+ *   （自由文本作答即把该文字当作选中的 label —— OpenCode question 默认 custom:true 允许任意串。）
  *
- * 若没有结构化 questions（旧版兼容路径），改用：
- *   { type: 'answer', text: '自由文本' }
+ * passthrough（放行）= 空字符串：插件见 stdout 为空 → 不 reply，把问题留给 OpenCode
+ * 原生 picker（botmux web 终端里仍可人工作答）。绝不用空答案顶替这次提问。
  *
- * passthrough（放行）directive 形状：
- *   { type: 'answer', answers: [['']] }
- *   （每条 question 填空哨兵 ['']，让 OpenCode plugin 视为"未答"并继续）
- *
- * 参考来源：x-desktop-app/src/island/main/bridge/adapters/OpenCodeAdapter.ts
- *           x-desktop-app/src/island/main/bridge/BridgeServer.ts buildOpenCodeAnswerDirective
- *           x-desktop-app/src/island/hooks-install/opencode.ts postQuestionReply
+ * 机制已在 OpenCode 1.17.x 端到端实测确认（事件名 `question.asked`、reply 端点
+ * `POST /question/{id}/reply`、body `{ answers }`）。
  */
 
 import type { AskQuestion } from '../ask-types.js';
@@ -44,8 +42,8 @@ const openCodeAdapter: HookAskAdapter = {
     if (!payload || typeof payload !== 'object') return null;
     const p = payload as Record<string, unknown>;
 
-    // 只处理 QuestionAsked 事件
-    if (p.hook_event_name !== 'QuestionAsked') return null;
+    // 只处理 question.asked 事件（OpenCode 原生 question 工具触发，由插件规范后转发）
+    if (p.hook_event_name !== 'question.asked') return null;
 
     // 尝试从结构化 tool_input.questions 解析
     const toolInput = p.tool_input as

@@ -28,6 +28,7 @@ export const messages: Record<string, string> = {
   'card.status.starting': 'Starting…',
   'card.status.working': 'Working',
   'card.status.idle': 'Awaiting input',
+  'card.status.dormant': 'Dormant',
   'card.status.analyzing': 'Analyzing…',
   'card.status.limited': 'Limit reached',
   'card.status.retry_ready': 'Ready to retry',

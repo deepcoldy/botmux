@@ -187,6 +187,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'codex-app': 'Codex App',
   'cursor': 'Cursor',
   'gemini': 'Gemini',
+  'genius': 'Genius',
   'opencode': 'OpenCode',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
@@ -197,6 +198,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'pi': 'Pi',
   'copilot': 'Copilot',
   'oh-my-pi': 'Oh My Pi',
+  'kimi': 'Kimi',
 };
 
 export function getCliDisplayName(cliId: CliId): string {

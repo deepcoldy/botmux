@@ -19,11 +19,12 @@ describe('dashboard bot payload helpers', () => {
   });
 
   it('includes authoritative cliId in /api/bots success and error rows', () => {
-    const daemon = { larkAppId: 'cli_traex', botName: 'TraeX', cliId: 'traex' };
+    const daemon = { larkAppId: 'cli_traex', botName: 'TraeX', cliId: 'traex', model: 'glm-5.1' };
     expect(botDefaultsPayload(daemon, { defaultOncall: { enabled: false } })).toMatchObject({
       larkAppId: 'cli_traex',
       botName: 'TraeX',
       cliId: 'traex',
+      model: 'glm-5.1',
       online: true,
       defaultOncall: { enabled: false },
     });
@@ -31,6 +32,7 @@ describe('dashboard bot payload helpers', () => {
       larkAppId: 'cli_traex',
       botName: 'TraeX',
       cliId: 'traex',
+      model: 'glm-5.1',
       online: true,
       error: 'http_503',
     });

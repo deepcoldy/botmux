@@ -80,6 +80,7 @@ describe('deriveKanbanColumn', () => {
       expect(deriveKanbanColumn({ status })).toBe('in_progress');
     }
     expect(deriveKanbanColumn({ status: 'idle' })).toBe('todo');
+    expect(deriveKanbanColumn({ status: 'dormant' })).toBe('todo');
   });
 });
 

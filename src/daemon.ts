@@ -10,6 +10,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config, getDashboardExternalHost } from './config.js';
 import { repoPickerScanOptions } from './global-config.js';
+import { buildDashboardUrl } from './core/dashboard-url.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
 import { botmuxWrapperFiles } from './core/botmux-wrapper.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
@@ -3542,11 +3543,18 @@ function resolveBotDefaultWorkingDir(larkAppId: string): string | undefined {
 /**
  * Resolve the pinned working dir for a brand-new topic via the layered lookup:
  *   1) this bot's OWN oncall binding (per-bot: another bot's binding never pins
- *      this bot — cross-bot dir alignment is handled by layer 3 inherit-peer)
+ *      this bot — cross-bot dir alignment is handled by layer 4 inherit-peer)
  *   2) this bot's defaultOncall — auto-binds a brand-new chat when the flag is on
  *      (this WRITES state, so it must run identically on every spawn path)
- *   3) a sibling session's workingDir (cross-bot / chat-scope inheritance)
- *   4) this bot's `defaultWorkingDir` (pure runtime fallback)
+ *   3) this bot's OWN effective `defaultWorkingDir` (legacy `defaultWorkingDir`,
+ *      or the `defaultOncall.workingDir` all-sessions fallback — see
+ *      {@link resolveBotDefaultWorkingDir}). An explicit per-bot config is the
+ *      bot's own intent, so it OUTRANKS cross-bot inheritance: a sibling's
+ *      incidental session dir must never override a dir this bot configured for
+ *      itself. Only a bot that configured nothing of its own falls to layer 4.
+ *   4) a sibling session's workingDir (cross-bot / chat-scope inheritance) —
+ *      last-resort convenience so a freshly @mentioned collaborator bot with no
+ *      dir of its own follows the topic instead of bouncing through a repo card.
  * Returns the dir plus the oncall / inherited source so callers can log the reason.
  * Shared by the normal spawn path and the first-message `/repo` command branch so
  * both honor the defaultOncall auto-bind the same way.
@@ -3562,17 +3570,21 @@ async function resolvePinnedWorkingDir(ctx: {
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
   }
-  const inheritedFrom = !oncallEntry
+  // Layer 3: this bot's own effective default. Resolved BEFORE inheritance so an
+  // explicit per-bot dir wins over a sibling bot's active session dir.
+  const botDefaultWorkingDir = !oncallEntry
+    ? resolveBotDefaultWorkingDir(ctx.larkAppId)
+    : undefined;
+  // Layer 4: sibling/peer inheritance — only when this bot has neither an oncall
+  // binding nor any default dir of its own.
+  const inheritedFrom = (!oncallEntry && !botDefaultWorkingDir)
     ? findInheritablePeer({
         scope: ctx.scope, anchor: ctx.anchor, chatId: ctx.chatId, chatType: ctx.chatType,
         selfAppId: ctx.larkAppId,
         botToBotSameDir: getBot(ctx.larkAppId).config.botToBotSameDir !== false,
       })
     : null;
-  const botDefaultWorkingDir = (!oncallEntry && !inheritedFrom)
-    ? resolveBotDefaultWorkingDir(ctx.larkAppId)
-    : undefined;
-  const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+  const pinnedWorkingDir = oncallEntry?.workingDir ?? botDefaultWorkingDir ?? inheritedFrom?.workingDir;
   return { pinnedWorkingDir, oncallEntry, inheritedFrom };
 }
 
@@ -3873,7 +3885,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       // chat-granted users (who only pass canTalk) management commands like
       // /cd /restart /oncall bind. Previously this gate only fired in oncall chats,
       // which left a hole once per-chat grants flow through canTalk.
-      if (!canOperate(larkAppId, chatId, senderOpenId)) {
+      if (!canOperate(larkAppId, chatId, senderOpenId, senderUnionId)) {
         await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -4501,6 +4513,11 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // Strip leading @<bot> mentions so "@bot /restart" is recognized as a command.
   const cmdContent = stripLeadingMentions(content, parsed.mentions);
   const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
+  // Tenant-stable union_id of the thread sender — lets canOperate recognise a
+  // cross-deployment TEAM peer bot (isTeamBot) and grant it daemon-command
+  // operate, parity with same-deployment siblings (option B). undefined for
+  // senders Lark didn't stamp a union_id on → no team-operate, falls back.
+  const threadSenderUnionId = data?.sender?.sender_id?.union_id as string | undefined;
   const threadChatId = ctxChatId ?? data?.message?.chat_id;
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType) return;
@@ -4512,9 +4529,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // returns so those paths cannot leave stale needs-you rows behind.
   clearAgentAttentionForHumanInbound();
 
-  // Intercept OAuth callback URLs (from /login flow)
-  if (isCallbackUrl(content)) {
-    const result = await handleCallbackUrl(content);
+  // Intercept OAuth callback URLs (from /login flow). Feishu auto-prepends an
+  // @<bot> mention to every reply inside a bot-created topic, so the raw
+  // `content` reads "@bot http://127.0.0.1...". isCallbackUrl is anchored at
+  // ^https?://127.0.0.1, so the mention prefix breaks the match — fall back to
+  // the mention-stripped cmdContent so pasting the callback back into the
+  // topic still works.
+  const callbackText = isCallbackUrl(content) ? content
+    : isCallbackUrl(cmdContent) ? cmdContent : null;
+  if (callbackText) {
+    const result = await handleCallbackUrl(callbackText);
     if (result) {
       // Route through sessionReply so chat-scope (普通群) lands as a plain
       // chat message instead of a forced new thread.
@@ -4634,7 +4658,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       }
       // canOperate gate for thread-reply daemon commands — required in every chat
       // (see spawn-path gate above). Denies chat-granted users management commands.
-      if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId)) {
+      if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadSenderUnionId)) {
         sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -5202,12 +5226,11 @@ function dashboardUrlForReport(): string | undefined {
     const portFile = join(dir, '.dashboard-port');
     const tokenFile = join(dir, '.dashboard-token');
     const port = existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : String(config.dashboard.port);
-    const base = `http://${getDashboardExternalHost()}:${port}/`;
-    if (existsSync(tokenFile)) {
-      const tok = readFileSync(tokenFile, 'utf8').trim();
-      if (tok) return `${base}?t=${tok}`;
-    }
-    return base;
+    const tok = existsSync(tokenFile) ? readFileSync(tokenFile, 'utf8').trim() : '';
+    // buildDashboardUrl swaps in the central-platform machine subdomain when
+    // 远程访问 is on and this host is bound, so the restart-report DM links to the
+    // platform dashboard instead of an unreachable local host:port.
+    return buildDashboardUrl({ host: getDashboardExternalHost(), port, token: tok || undefined });
   } catch {
     return undefined;
   }

@@ -26,6 +26,8 @@ export interface Session {
   kanbanColumn?: string;
   /** 看板列内手动排序位置（拖拽时取相邻卡片中点，允许小数）。 */
   kanbanPosition?: number;
+  /** Dashboard 会话锁定：锁定后自动清理空闲会话时跳过；手动关闭仍允许。 */
+  locked?: boolean;
   /** Dashboard「创建会话」入待办池：会话已建（群已拉、bot 已邀请）但 CLI 还没起，
    *  内容暂存在 queuedPrompt 里，停在看板「待办池」列。被激活（拖到进行中 / 点
    *  「开始」/ 群里来第一条消息）时才 forkWorker 把 queuedPrompt 当首轮发给 CLI。
@@ -131,8 +133,36 @@ export interface Session {
    * session probes 'missing'. Cleared once a live worker is re-established.
    */
   suspendedColdResume?: boolean;
-  /** CLI used to spawn this session — stamped on every save so closed sessions retain it. */
+  /** CLI used to spawn this session, frozen at creation so bot-level CLI edits only affect new sessions. */
   cliId?: import('./adapters/cli/types.js').CliId;
+  /** Optional CLI binary override frozen with `cliId`; used when no wrapper launcher is set. */
+  cliPathOverride?: string;
+  /** Optional wrapper launcher frozen at creation, e.g. `ttadk codex` or `aiden x claude`. */
+  wrapperCli?: string;
+  /** Optional model frozen at creation so historical sessions resume with their original model. */
+  model?: string;
+  /**
+   * True once `cliId`/`cliPathOverride`/`wrapperCli`/`model` have been frozen for
+   * this session (see `sessionAgentConfig`). Gates the one-time freeze so it runs
+   * exactly once — on a fresh start, or on the first resume of a session created
+   * before these fields existed (back-filling the still-missing ones from the live
+   * bot config). The marker disambiguates "legacy, never frozen" from "frozen as
+   * no-wrapper", so a genuinely wrapper-less session never inherits a wrapper the
+   * bot gains later.
+   */
+  agentFrozen?: boolean;
+  /**
+   * Session backend resolved AT SPAWN TIME (tmux/herdr/zellij/pty). Stamped on
+   * fork so restore can resolve the backend authoritatively from the session
+   * itself instead of re-deriving it from the live daemon default — which
+   * changed when PTY stopped being an automatic fallback (default is now always
+   * tmux). Without this, a session that was created under the old probe-based
+   * default (e.g. implicit PTY on a tmux-less host) would, after upgrade +
+   * restart, be misread as tmux and zombie-closed because no `bmx-<sid>` pane
+   * exists. Undefined on sessions persisted before this field existed → treated
+   * conservatively (see getSessionPersistentBackendType).
+   */
+  backendType?: BackendType;
   /**
    * Sandbox decision RECORDED AT SESSION CREATION (overlay file-isolation). The
    * live bot flag (BotConfig.sandbox) can be toggled later, but a session's
@@ -176,6 +206,7 @@ export interface LarkMention {
   key: string;        // e.g. "@_user_1"
   name: string;       // display name
   openId?: string;    // open_id of the mentioned user/bot
+  idType?: string;     // e.g. "open_id" or "app_id" from Lark event payloads
 }
 
 export interface LarkMessage {

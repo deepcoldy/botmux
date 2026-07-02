@@ -1,6 +1,7 @@
 export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule';
 export type TriggerTargetKind = 'turn' | 'workflow';
-export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored';
+export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored' | 'completed';
+export type TriggerAsyncStatus = 'pending' | 'completed';
 
 export interface TriggerRequest {
   source: {
@@ -32,6 +33,9 @@ export interface TriggerRequest {
     dryRun?: boolean;
     dedupKey?: string;
     status?: 'firing' | 'resolved' | string;
+    waitForFinalOutput?: boolean;
+    asyncReturnSessionId?: boolean;
+    timeoutMs?: number;
   };
 }
 
@@ -51,6 +55,7 @@ export type TriggerErrorCode =
   | 'session_not_found'
   | 'target_required'
   | 'trigger_failed'
+  | 'wait_timeout'
   | 'workflow_trigger_not_implemented';
 
 export interface TriggerResponse {
@@ -67,6 +72,14 @@ export interface TriggerResponse {
   errorCode?: TriggerErrorCode;
   error?: string;
   promptPreview?: string;
+  output?: {
+    content: string;
+  };
+  async?: {
+    status: TriggerAsyncStatus;
+    sessionId?: string;
+    completedAt?: string;
+  };
 }
 
 export function isRecord(v: unknown): v is Record<string, unknown> {
@@ -86,7 +99,10 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   if (target.kind !== 'turn' && target.kind !== 'workflow') {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'target.kind must be turn or workflow' } };
   }
-  if (target.kind === 'turn' && typeof target.chatId !== 'string' && typeof target.sessionId !== 'string') {
+  const options = isRecord(raw.options) ? raw.options : {};
+  const waitForFinalOutput = options.waitForFinalOutput === true;
+  const asyncReturnSessionId = options.asyncReturnSessionId === true;
+  if (target.kind === 'turn' && !waitForFinalOutput && !asyncReturnSessionId && typeof target.chatId !== 'string' && typeof target.sessionId !== 'string') {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'turn target requires chatId or sessionId' } };
   }
   if (target.kind === 'workflow' && typeof target.workflowId !== 'string') {
@@ -94,6 +110,17 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   }
   if (typeof envelope.sourceName !== 'string' || envelope.trusted !== false) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'envelope.sourceName is required and envelope.trusted must be false' } };
+  }
+  if (waitForFinalOutput && target.kind !== 'turn') {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'waitForFinalOutput is only supported for turn targets' } };
+  }
+  if (waitForFinalOutput && asyncReturnSessionId) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'waitForFinalOutput and asyncReturnSessionId cannot be used together' } };
+  }
+  if (options.timeoutMs !== undefined) {
+    if (typeof options.timeoutMs !== 'number' || !Number.isFinite(options.timeoutMs) || options.timeoutMs < 1000 || options.timeoutMs > 300_000) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.timeoutMs must be between 1000 and 300000' } };
+    }
   }
   return { ok: true, request: raw as unknown as TriggerRequest };
 }

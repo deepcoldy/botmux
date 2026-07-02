@@ -5,6 +5,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { codexHome } from '../src/services/codex-paths.js';
 
@@ -28,6 +29,7 @@ import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
+import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
@@ -39,13 +41,14 @@ import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
+import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -80,7 +83,7 @@ describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
   // adapters (codex-app/mira) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -552,6 +555,55 @@ describe('cursor buildArgs', () => {
   });
 });
 
+describe('genius buildArgs', () => {
+  const adapter = createGeniusAdapter('/usr/bin/genius');
+
+  it('fresh session passes --session-id and bypasses routine approvals', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-genius', resume: false });
+    expect(args).toContain('--session-id');
+    expect(args).toContain('sess-genius');
+    expect(args).toContain('--dangerously-skip-permissions');
+    const settings = JSON.parse(args[args.indexOf('--settings') + 1]);
+    expect(settings.skipDangerousModePermissionPrompt).toBe(true);
+    expect(settings.permissions.defaultMode).toBe('bypassPermissions');
+    expect(args).not.toContain('--resume');
+  });
+
+  it('pre-authorizes botmux send when CLI bypass is disabled', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-genius', resume: false, disableCliBypass: true });
+    expect(args).toContain('--permission-mode');
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('default');
+    expect(args).toContain('--allowedTools');
+    expect(args[args.indexOf('--allowedTools') + 1]).toBe('Bash(botmux send:*)');
+    expect(args).not.toContain('--dangerously-skip-permissions');
+    expect(args).not.toContain('--allow-dangerously-skip-permissions');
+    expect(args).not.toContain('--settings');
+  });
+
+  it('resume session passes --resume', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-genius', resume: true, resumeSessionId: 'cli-genius' });
+    expect(args).toContain('--resume');
+    expect(args).toContain('cli-genius');
+    expect(args).not.toContain('--session-id');
+  });
+
+  it('exposes ~/.genius as a Claude-family transcript root for bridge fallback', () => {
+    expect(adapter.claudeDataDir).toBe(join(homedir(), '.genius'));
+    expect(adapter.claudeStateJsonPath).toBe(join(homedir(), '.genius', '.claude.json'));
+  });
+
+  it('supports type-ahead after the first prompt has booted', () => {
+    expect(adapter.supportsTypeAhead).toBe(true);
+  });
+
+  it('injects botmux guidance via append-system-prompt', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-genius', resume: false });
+    const idx = args.indexOf('--append-system-prompt');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toContain('botmux send');
+  });
+});
+
 describe('gemini buildArgs', () => {
   const adapter = createGeminiAdapter('/usr/bin/gemini');
 
@@ -958,6 +1010,15 @@ describe('readyPattern', () => {
     expect(adapter.supportsTypeAhead).toBe(true);
   });
 
+  it('genius matches current and legacy prompt indicators', () => {
+    const adapter = createGeniusAdapter('/bin/genius');
+    expect(adapter.readyPattern).toBeDefined();
+    expect(adapter.readyPattern!.test('›')).toBe(true);
+    expect(adapter.readyPattern!.test('\n› ')).toBe(true);
+    expect(adapter.readyPattern!.test('\n❯ ')).toBe(true);
+    expect(adapter.readyPattern!.test('⏵⏵ accept edits on')).toBe(true);
+  });
+
   it('codex-app matches runner prompt indicator', () => {
     const adapter = createCodexAppAdapter('/bin/codex');
     expect(adapter.readyPattern).toBeDefined();
@@ -1236,4 +1297,56 @@ describe('buildResumeCommand', () => {
     expect(a.buildResumeCommand?.({ sessionId: 'bm-cp' })).toBeNull();
   });
 
+  it('kimi emits `kimi --resume <cliSessionId>` when known, null otherwise', () => {
+    const a = createKimiAdapter('/usr/bin/kimi');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-kimi', cliSessionId: 'kimi-sess-1' }))
+      .toBe('kimi --resume kimi-sess-1');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-kimi' })).toBeNull();
+  });
+
+});
+
+describe('kimi buildArgs', () => {
+  const adapter = createKimiAdapter('/usr/bin/kimi');
+
+  it('new session passes --yolo by default', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-1', resume: false });
+    expect(args).toContain('--yolo');
+    expect(args).not.toContain('--resume');
+  });
+
+  it('passes --model when configured', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-1', resume: false, model: 'kimi-k2.5' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('kimi-k2.5');
+  });
+
+  it('omits --yolo when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-1', resume: false, disableCliBypass: true });
+    expect(args).not.toContain('--yolo');
+  });
+
+  it('ignores initialPrompt (not passed via args)', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-1', resume: false, initialPrompt: 'hello' });
+    expect(args).not.toContain('hello');
+    expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
+  });
+
+  it('resumes latest session when no resumeSessionId is available', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-1', resume: true });
+    expect(args).toContain('--continue');
+    expect(args).not.toContain('--resume');
+  });
+
+  it('resumes the provided cli session id when available', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-1', resume: true, resumeSessionId: 'kimi-session-123' });
+    expect(args).toContain('--resume');
+    expect(args[args.indexOf('--resume') + 1]).toBe('kimi-session-123');
+    expect(args).not.toContain('--continue');
+  });
+
+  it('surfaces curated model choices for setup', () => {
+    expect(adapter.modelChoices).toContain('kimi-k2.5');
+  });
 });

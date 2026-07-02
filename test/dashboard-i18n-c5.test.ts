@@ -57,6 +57,7 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.sessions.session_not_found',
   'card.dashboard.sessions.close.disabled.alreadyClosed',
   'card.dashboard.sessions.close.disabled.starting',
+  'card.status.dormant',
   // ─── sessions card (PR3 slice 2b) — locate / terminal / resume ──────
   'card.dashboard.sessions.btn.locate',
   'card.dashboard.sessions.btn.terminal',

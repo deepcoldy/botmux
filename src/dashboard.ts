@@ -41,7 +41,8 @@ import {
   TTADK_MODEL_SUGGESTIONS,
 } from './setup/cli-selection.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { invalidateGlobalConfigCache, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { buildDashboardUrl } from './core/dashboard-url.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
@@ -225,6 +226,8 @@ const attaching = new Set<string>();   // dedup concurrent attaches per appId
 interface ResolvedDashboardSettings {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  /** Experimental current-chat bot discovery via Lark `/members/bots`. Default ON. */
+  chatBotDiscovery: boolean;
   repoPickerMode: RepoPickerMode;
   /** Auto-update / auto-restart schedule (off by default). */
   maintenance: MaintenanceConfig;
@@ -244,6 +247,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
   return {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
+    chatBotDiscovery: dashboard.chatBotDiscovery !== false, // default ON
     repoPickerMode: global.repoPickerMode ?? 'all',
     maintenance: global.maintenance ?? {},
     localDevInstall: isLocalDevInstall(),
@@ -496,15 +500,14 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
   try {
     const st = statSync(fp);
     if (!st.isFile()) return false;
-    // Bundle filenames are fixed (app.js/style.css), so without revalidation
-    // browsers heuristic-cache them and serve a stale build after a deploy
-    // (new JS + old CSS → broken layout). `no-cache` + an mtime/size ETag makes
-    // the browser revalidate every load: 304 when unchanged (cheap), fresh 200
-    // when the build changed. No manual hard-refresh needed after deploy.
+    // Fixed entry filenames (index.html/app.js/style.css) need revalidation so
+    // a deploy never serves new JS with old CSS. Lazy chunks are content-hashed
+    // and can be cached immutably once the current app.js points at them.
+    const immutableChunk = relToRoot.startsWith('chunks/') || relToRoot.startsWith('chunks\\');
     const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
     const headers: Record<string, string> = {
       'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
-      'cache-control': 'no-cache',
+      'cache-control': immutableChunk ? 'public, max-age=31536000, immutable' : 'no-cache',
       etag,
     };
     if (req.headers['if-none-match'] === etag) {
@@ -574,8 +577,30 @@ function configuredCliIds(): Map<string, string> {
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string }>(bot: T, ids: Map<string, string>): T & { cliId?: string } {
-  return bot.cliId ? bot : { ...bot, cliId: ids.get(bot.larkAppId) };
+function configuredBotAgentFields(): Map<string, { cliId?: string; wrapperCli?: string; model?: string }> {
+  try {
+    return new Map(loadBotConfigs().map(b => [b.larkAppId, {
+      cliId: b.cliId,
+      wrapperCli: b.wrapperCli,
+      model: b.model,
+    }]));
+  } catch {
+    return new Map();
+  }
+}
+
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; wrapperCli?: string; model?: string }>(
+  bot: T,
+  ids: Map<string, string> | Map<string, { cliId?: string; wrapperCli?: string; model?: string }>,
+): T & { cliId?: string; wrapperCli?: string; model?: string } {
+  const raw = ids.get(bot.larkAppId);
+  const fallback = typeof raw === 'string' ? { cliId: raw } : raw;
+  return {
+    ...bot,
+    cliId: bot.cliId || fallback?.cliId,
+    wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
+    model: bot.model || fallback?.model,
+  };
 }
 
 function liveBots(): { larkAppId: string; botName: string; botOpenId?: string; cliId?: string }[] {
@@ -804,9 +829,11 @@ function verifyCliRequest(req: IncomingMessage, pathname: string):
   return { ok: true };
 }
 
-/** Build the dashboard URL for a token, using the actually-bound port. */
+/** Build the dashboard URL for a token, using the actually-bound port. Routes
+ *  through the central-platform machine subdomain when 远程访问 is on and this
+ *  host is bound (see buildDashboardUrl); falls back to the local host:port. */
 function dashboardUrlFor(token: string): string {
-  return `http://${config.dashboard.externalHost}:${boundDashboardPort}/?t=${token}`;
+  return buildDashboardUrl({ host: config.dashboard.externalHost, port: boundDashboardPort, token });
 }
 
 type SkillJobStatus = 'running' | 'succeeded' | 'failed';
@@ -1068,6 +1095,11 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/__cli/reload-binding') {
       const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
+      // `botmux bind` wrote platform.json + (default-on) remoteAccess in the CLI
+      // process; this dashboard process holds a short-TTL config cache that may
+      // still read the pre-bind value. Drop it so the immediately-following
+      // /__cli/current (and live card links) resolve the platform dashboard URL.
+      invalidateGlobalConfigCache();
       try {
         platformTunnel?.stop();
       } catch {
@@ -1712,9 +1744,9 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { ok: true, entry });
     }
 
-    // 看板放置 / 重命名：带 JSON body 的会话写操作，原样转发给 owner daemon。
+    // 看板放置 / 重命名 / 锁定：带 JSON body 的会话写操作，原样转发给 owner daemon。
     // 不在公开读白名单内 → 只读访客在 decideDashboardAuth 已被 401。
-    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(board|rename)$/))) {
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(board|rename|lock)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2];
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
@@ -2081,8 +2113,8 @@ const server = createServer(async (req, res) => {
     // PUT  /api/bots/:appId/default-oncall   — proxy to that bot's daemon
 
     if (req.method === 'GET' && url.pathname === '/api/bots') {
-      const cliIds = configuredCliIds();
-      const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, cliIds)).sort((a, b) => a.botIndex - b.botIndex);
+      const agentFields = configuredBotAgentFields();
+      const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, agentFields)).sort((a, b) => a.botIndex - b.botIndex);
       const out = await Promise.all(onlineBots.map(async d => {
         try {
           const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`);
@@ -2090,7 +2122,13 @@ const server = createServer(async (req, res) => {
             return botDefaultsPayload(d, undefined, `http_${r.status}`);
           }
           const j = await r.json() as any;
-          return botDefaultsPayload({ ...d, botName: d.botName ?? j.botName }, j);
+          return botDefaultsPayload({
+            ...d,
+            botName: d.botName ?? j.botName,
+            cliId: j.cliId || d.cliId,
+            wrapperCli: j.wrapperCli || d.wrapperCli,
+            model: j.model || d.model,
+          }, j);
         } catch (e: any) {
           return botDefaultsPayload(d, undefined, e?.message ?? String(e));
         }
@@ -2124,6 +2162,24 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-working-dir-mode`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/agent — proxy to that bot's daemon. Body
+    // `{ cliId, model }`; cliId is the dashboard selection key.
+    let mBotAgent: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotAgent = url.pathname.match(/^\/api\/bots\/([^/]+)\/agent$/))) {
+      const appId = decodeURIComponent(mBotAgent[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -2650,6 +2706,13 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
     try { clientSocket.destroy(); } catch { /* ignore */ }
   }
 });
+
+// 拉长 keep-alive 空闲超时：中心化平台反代用 keep-alive 连接池复用隧道连接，但 Node 默认
+// keepAliveTimeout 才 5s——空闲>5s 后 dashboard 把连接关了，而平台侧 Agent 可能还把它留在池里
+// 复用 → 撞到刚关的连接、首批请求 502。把它拉到 75s（headersTimeout 需更大），让池里的连接在
+// 正常使用间隔内不被这端提前关掉，平台复用稳、不再有 stale-reuse 的首批 502。本地直连无副作用。
+server.keepAliveTimeout = 75_000;
+server.headersTimeout = 80_000;
 
 // Probe upward on EADDRINUSE rather than crashing with an unhandled 'error':
 // a second botmux instance on this host (or a stray process) holding the

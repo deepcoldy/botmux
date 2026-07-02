@@ -57,10 +57,14 @@ afterEach(() => {
 });
 
 describe('resolvePinnedWorkingDir', () => {
-  it('inherits a same-anchor peer workingDir when the directory exists', async () => {
+  it('prefers THIS bot\'s own defaultWorkingDir over a valid same-anchor peer (no cross-bot dir pollution)', async () => {
     const { botRegistry, sessionStore, daemon } = await loadFreshModules();
     const peerDir = tempDir('peer-repo');
     const defaultDir = tempDir('default-repo');
+    // app-peer is already running in the same thread at peerDir; app-self has its
+    // OWN defaultWorkingDir. The bot's explicit config must win — it must NOT
+    // inherit the sibling's dir. This is the core of the per-bot-default-over-
+    // inherit fix: two bots with distinct default dirs never leak into each other.
     botRegistry.registerBot({ larkAppId: 'app-peer', larkAppSecret: 's', cliId: 'claude-code' });
     botRegistry.registerBot({
       larkAppId: 'app-self',
@@ -68,6 +72,27 @@ describe('resolvePinnedWorkingDir', () => {
       cliId: 'claude-code',
       defaultWorkingDir: defaultDir,
     });
+    await seedPeerSession(sessionStore, peerDir);
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      larkAppId: 'app-self',
+    });
+
+    expect(result.pinnedWorkingDir).toBe(defaultDir);
+    expect(result.inheritedFrom).toBeNull();
+  });
+
+  it('inherits a same-anchor peer workingDir ONLY when this bot has no oncall binding and no default dir of its own', async () => {
+    const { botRegistry, sessionStore, daemon } = await loadFreshModules();
+    const peerDir = tempDir('peer-repo');
+    // app-self configures nothing of its own → the last-resort inherit kicks in
+    // so a freshly @mentioned collaborator follows the topic.
+    botRegistry.registerBot({ larkAppId: 'app-peer', larkAppSecret: 's', cliId: 'claude-code' });
+    botRegistry.registerBot({ larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code' });
     const peer = await seedPeerSession(sessionStore, peerDir);
 
     const result = await daemon.__testOnly_resolvePinnedWorkingDir({
@@ -82,8 +107,10 @@ describe('resolvePinnedWorkingDir', () => {
     expect(result.inheritedFrom).toEqual({ sessionId: peer.sessionId, larkAppId: 'app-peer', workingDir: peerDir });
   });
 
-  it('ignores a stale inherited peer workingDir and falls back to this bot defaultWorkingDir', async () => {
+  it('uses this bot defaultWorkingDir and never consults the peer (default outranks inherit)', async () => {
     const { botRegistry, sessionStore, daemon } = await loadFreshModules();
+    // A stale peer is present, but with a default dir set the peer is never even
+    // consulted — default outranks inherit, so peer validity is irrelevant.
     const stalePeerDir = join(tmpRoot, 'deleted-peer-repo');
     const defaultDir = tempDir('default-repo');
     botRegistry.registerBot({ larkAppId: 'app-peer', larkAppSecret: 's', cliId: 'claude-code' });
@@ -165,13 +192,13 @@ describe('resolvePinnedWorkingDir', () => {
   it('does NOT inherit a valid peer when botToBotSameDir=false (per-bot opt-out)', async () => {
     const { botRegistry, sessionStore, daemon } = await loadFreshModules();
     const peerDir = tempDir('peer-repo');
-    const defaultDir = tempDir('default-repo');
+    // No default dir of its own, so the gate is what decides: off → ignore the
+    // peer entirely and fall through to the repo card (no pinned dir).
     botRegistry.registerBot({ larkAppId: 'app-peer', larkAppSecret: 's', cliId: 'claude-code' });
     botRegistry.registerBot({
       larkAppId: 'app-self',
       larkAppSecret: 's',
       cliId: 'claude-code',
-      defaultWorkingDir: defaultDir,
       botToBotSameDir: false,
     });
     await seedPeerSession(sessionStore, peerDir);
@@ -184,22 +211,19 @@ describe('resolvePinnedWorkingDir', () => {
       larkAppId: 'app-self',
     });
 
-    // Gate off → ignore the valid peer, fall through to own defaultWorkingDir.
     expect(result.inheritedFrom).toBeNull();
-    expect(result.pinnedWorkingDir).toBe(defaultDir);
+    expect(result.pinnedWorkingDir).toBeUndefined();
   });
 
-  it('inherits a valid peer when botToBotSameDir is default (on)', async () => {
+  it('inherits a valid peer when botToBotSameDir is default (on) and the bot has no default dir', async () => {
     const { botRegistry, sessionStore, daemon } = await loadFreshModules();
     const peerDir = tempDir('peer-repo');
-    const defaultDir = tempDir('default-repo');
     botRegistry.registerBot({ larkAppId: 'app-peer', larkAppSecret: 's', cliId: 'claude-code' });
     botRegistry.registerBot({
       larkAppId: 'app-self',
       larkAppSecret: 's',
       cliId: 'claude-code',
-      defaultWorkingDir: defaultDir,
-      // botToBotSameDir omitted → default on
+      // botToBotSameDir omitted → default on; no defaultWorkingDir → inherit reachable
     });
     const peer = await seedPeerSession(sessionStore, peerDir);
 
@@ -232,6 +256,31 @@ describe('resolvePinnedWorkingDir', () => {
       chatId: 'oc_dm',
       chatType: 'p2p',
       larkAppId: 'app-self',
+    });
+
+    expect(result.oncallEntry).toBeFalsy();
+    expect(result.inheritedFrom).toBeNull();
+    expect(result.pinnedWorkingDir).toBe(oncallDir);
+  });
+
+  it('Oncall-mode bot with a tombstoned chat uses its OWN defaultOncall dir, not a sibling peer', async () => {
+    const { botRegistry, sessionStore, daemon } = await loadFreshModules();
+    const oncallDir = tempDir('self-oncall-repo');
+    const peerDir = tempDir('peer-repo');
+    // Reproduces the reported incident: bot is in Oncall mode but this group was
+    // /oncall-unbound once (tombstone) so auto-bind no longer fires → no oncall
+    // entry. A sibling bot is active in the same thread at peerDir. The bot must
+    // still land in its OWN configured oncall dir, never the sibling's.
+    botRegistry.registerBot({ larkAppId: 'app-peer', larkAppSecret: 's', cliId: 'claude-code' });
+    botRegistry.registerBot({
+      larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code',
+      defaultOncall: { enabled: true, workingDir: oncallDir, since: 1 },
+      defaultOncallAutoboundChats: ['oc_chat'],
+    });
+    await seedPeerSession(sessionStore, peerDir);
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread', anchor: 'om_root', chatId: 'oc_chat', chatType: 'group', larkAppId: 'app-self',
     });
 
     expect(result.oncallEntry).toBeFalsy();

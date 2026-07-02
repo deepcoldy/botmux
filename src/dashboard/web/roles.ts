@@ -81,6 +81,23 @@ let selectedProfileId: string | null = null;
 let selectedProfileBotId: string | null = null;
 let profileEditingContent = '';
 let selectedApplyGroupId: string | null = null;
+let activeRolesGeneration = 0;
+let activeRolesTimerState: { generation: number; timers: Set<number> } | null = null;
+
+function isRolesGeneration(generation: number): boolean {
+  return activeRolesGeneration === generation;
+}
+
+function scheduleRolesTimer(fn: () => void, ms: number): number {
+  const state = activeRolesTimerState;
+  const generation = state?.generation ?? activeRolesGeneration;
+  const id = window.setTimeout(() => {
+    state?.timers.delete(id);
+    if (isRolesGeneration(generation)) fn();
+  }, ms);
+  state?.timers.add(id);
+  return id;
+}
 
 function isValidProfileId(profileId: string): boolean {
   return PROFILE_ID_RE.test(profileId) && profileId !== '.' && profileId !== '..';
@@ -90,73 +107,6 @@ function hashChatId(): string | null {
   const [, query = ''] = location.hash.split('?');
   const chatId = new URLSearchParams(query).get('chatId')?.trim();
   return chatId || null;
-}
-
-function pageHtml(tab: 'groups' | 'profiles'): string {
-  const isProfiles = tab === 'profiles';
-  return `<section class="page roles-page">
-<div class="page-heading roles-heading">
-  <div>
-    <p class="eyebrow">${t('nav.roles')}</p>
-    <h1>${t('roles.title')}</h1>
-    <p>${t('roles.subtitle')}</p>
-  </div>
-</div>
-<nav class="wf-subnav roles-subnav">
-  <a href="#/roles" ${isProfiles ? '' : 'class="active"'}>${t('roles.tabGroups')}</a>
-  <a href="#/roles/profile" ${isProfiles ? 'class="active"' : ''}>${t('roles.tabProfiles')}</a>
-</nav>
-
-<div id="roles-by-group-view" class="roles-layout" ${isProfiles ? 'hidden' : ''}>
-  <div class="roles-tree-panel">
-    <div class="roles-tree-header">
-      <input type="search" id="roles-search" placeholder="${t('roles.search')}" />
-      <button type="button" id="roles-refresh">${t('roles.refresh')}</button>
-    </div>
-    <div id="roles-tree" class="roles-tree"></div>
-  </div>
-  <div class="roles-editor-panel">
-    <div id="roles-editor-empty" class="roles-editor-empty">${t('roles.selectHint')}</div>
-    <div id="roles-editor-form" class="roles-editor-form" style="display:none">
-      <div class="roles-editor-breadcrumb">
-        <span id="roles-editor-group-name"></span>
-        <span class="roles-breadcrumb-sep">›</span>
-        <span id="roles-editor-bot-name"></span>
-      </div>
-      <div class="roles-editor-meta">
-        <span id="roles-editor-chat-id" class="roles-editor-meta-line"></span>
-      </div>
-      <textarea id="roles-editor-textarea" placeholder="${t('roles.editorPlaceholder')}" rows="14"></textarea>
-      <div class="roles-editor-footer">
-        <span id="roles-editor-bytecount" class="roles-bytecount"></span>
-        <div class="roles-editor-actions">
-          <button type="button" id="roles-delete" class="danger">${t('roles.delete')}</button>
-          <button type="button" id="roles-save" class="primary">${t('roles.save')}</button>
-        </div>
-      </div>
-      <div id="roles-preview" class="roles-preview"></div>
-    </div>
-  </div>
-</div>
-
-<div id="roles-profiles-view" class="roles-layout roles-profiles-layout" ${isProfiles ? '' : 'hidden'}>
-  <div class="roles-tree-panel">
-    <div class="roles-tree-header roles-profile-create">
-      <input type="text" id="roles-profile-id" placeholder="${t('roles.profileIdPlaceholder')}" maxlength="64" />
-      <button type="button" id="roles-profile-select">${t('roles.openProfile')}</button>
-    </div>
-    <div class="roles-tree-header">
-      <input type="search" id="roles-profile-search" placeholder="${t('roles.profileSearch')}" />
-      <button type="button" id="roles-profile-refresh">${t('roles.refresh')}</button>
-    </div>
-    <div id="roles-profile-list" class="roles-tree"></div>
-  </div>
-  <div class="roles-editor-panel">
-    <div id="roles-profile-empty" class="roles-editor-empty">${t('roles.profileSelectHint')}</div>
-    <div id="roles-profile-detail" class="roles-editor-form roles-profile-detail" style="display:none"></div>
-  </div>
-</div>
-</section>`;
 }
 
 async function loadGroups(): Promise<void> {
@@ -201,7 +151,7 @@ function roleKey(larkAppId: string, chatId: string): string {
   return `${larkAppId}\u0000${chatId}`;
 }
 
-async function loadGroupProfileContext(): Promise<void> {
+async function loadGroupProfileContext(generation = activeRolesGeneration): Promise<boolean> {
   const detailPairs = await Promise.all(profiles.map(async profile => {
     try {
       const r = await fetch(`/api/role-profiles/${encodeURIComponent(profile.profileId)}`);
@@ -211,6 +161,7 @@ async function loadGroupProfileContext(): Promise<void> {
       return [profile.profileId, [] as RoleProfileEntryLike[]] as const;
     }
   }));
+  if (!isRolesGeneration(generation)) return false;
 
   const nextEffectiveRoles = new Map<string, EffectiveRoleValue>();
   const seen = new Set<string>();
@@ -234,21 +185,24 @@ async function loadGroupProfileContext(): Promise<void> {
         }
       }),
   ));
+  if (!isRolesGeneration(generation)) return false;
 
   groupProfileEntriesById = new Map(detailPairs);
   groupEffectiveRolesByBot = nextEffectiveRoles;
+  return true;
 }
 
-async function refreshGroupProfileContext(): Promise<void> {
+async function refreshGroupProfileContext(generation = activeRolesGeneration): Promise<void> {
   try {
-    await loadGroupProfileContext();
+    const ok = await loadGroupProfileContext(generation);
+    if (!ok || !isRolesGeneration(generation)) return;
   } catch {
+    if (!isRolesGeneration(generation)) return;
     groupProfileEntriesById = new Map();
     groupEffectiveRolesByBot = new Map();
-  } finally {
-    groupProfileContextLoaded = true;
-    renderTree((document.getElementById('roles-search') as HTMLInputElement | null)?.value ?? '');
   }
+  groupProfileContextLoaded = true;
+  renderTree((document.getElementById('roles-search') as HTMLInputElement | null)?.value ?? '');
 }
 
 async function saveRole(larkAppId: string, chatId: string, content: string): Promise<boolean> {
@@ -416,11 +370,12 @@ function renderTree(filter: string = ''): void {
   });
 }
 
-async function selectBot(groupId: string, botId: string): Promise<void> {
+async function selectBot(groupId: string, botId: string, generation = activeRolesGeneration): Promise<void> {
   selectedGroupId = groupId;
   selectedBotId = botId;
 
   const role = await loadRole(botId, groupId);
+  if (!isRolesGeneration(generation)) return;
 
   const empty = document.getElementById('roles-editor-empty');
   const form = document.getElementById('roles-editor-form');
@@ -526,13 +481,14 @@ function renderProfileList(filter: string = ''): void {
   });
 }
 
-async function selectProfile(profileId: string): Promise<void> {
+async function selectProfile(profileId: string, generation = activeRolesGeneration): Promise<void> {
   if (!isValidProfileId(profileId.trim())) return;
   selectedProfileId = profileId.trim();
   selectedProfileBotId = null;
   profileEditingContent = '';
   selectedApplyGroupId = selectedApplyGroupId ?? cache[0]?.chatId ?? null;
   await loadProfileEntries(selectedProfileId);
+  if (!isRolesGeneration(generation)) return;
   renderProfileList((document.getElementById('roles-profile-search') as HTMLInputElement)?.value ?? '');
   renderProfileDetail();
 }
@@ -624,16 +580,19 @@ function renderProfileDetail(): void {
   bindProfileEditor();
 }
 
-async function selectProfileBot(botId: string): Promise<void> {
+async function selectProfileBot(botId: string, generation = activeRolesGeneration): Promise<void> {
   if (!selectedProfileId) return;
   selectedProfileBotId = botId;
   const entry = await loadProfileEntry(selectedProfileId, botId);
+  if (!isRolesGeneration(generation)) return;
   profileEditingContent = entry.content ?? '';
   await loadProfileEntries(selectedProfileId);
+  if (!isRolesGeneration(generation)) return;
   renderProfileDetail();
 }
 
 function bindProfileEditor(): void {
+  const generation = activeRolesGeneration;
   const textarea = document.getElementById('roles-profile-textarea') as HTMLTextAreaElement | null;
   if (textarea) {
     profileEditingContent = textarea.value;
@@ -652,13 +611,17 @@ function bindProfileEditor(): void {
     this.textContent = '...';
     try {
       const ok = await saveProfileEntry(selectedProfileId, selectedProfileBotId, profileEditingContent);
+      if (!isRolesGeneration(generation)) return;
       await loadProfiles();
+      if (!isRolesGeneration(generation)) return;
       await loadProfileEntries(selectedProfileId);
+      if (!isRolesGeneration(generation)) return;
       renderProfileList((document.getElementById('roles-profile-search') as HTMLInputElement)?.value ?? '');
-      void refreshGroupProfileContext();
+      void refreshGroupProfileContext(generation);
       renderProfileDetail();
       flashProfileStatus(ok ? t('roles.saved') : t('roles.saveFailed'), !ok);
     } finally {
+      if (!isRolesGeneration(generation)) return;
       this.disabled = false;
       this.textContent = t('roles.saveEntry');
     }
@@ -670,13 +633,17 @@ function bindProfileEditor(): void {
     this.disabled = true;
     try {
       await deleteProfileEntry(selectedProfileId, selectedProfileBotId);
+      if (!isRolesGeneration(generation)) return;
       profileEditingContent = '';
       await loadProfiles();
+      if (!isRolesGeneration(generation)) return;
       await loadProfileEntries(selectedProfileId);
+      if (!isRolesGeneration(generation)) return;
       renderProfileList((document.getElementById('roles-profile-search') as HTMLInputElement)?.value ?? '');
-      void refreshGroupProfileContext();
+      void refreshGroupProfileContext(generation);
       renderProfileDetail();
     } finally {
+      if (!isRolesGeneration(generation)) return;
       this.disabled = false;
     }
   });
@@ -685,8 +652,8 @@ function bindProfileEditor(): void {
     selectedApplyGroupId = (e.target as HTMLSelectElement).value;
     renderProfileApplyBots();
   });
-  document.getElementById('roles-profile-preview-apply')?.addEventListener('click', () => runProfileApply(true));
-  document.getElementById('roles-profile-apply')?.addEventListener('click', () => runProfileApply(false));
+  document.getElementById('roles-profile-preview-apply')?.addEventListener('click', () => runProfileApply(true, generation));
+  document.getElementById('roles-profile-apply')?.addEventListener('click', () => runProfileApply(false, generation));
 }
 
 function updateProfileByteCount(): void {
@@ -728,7 +695,7 @@ function renderProfileApplyBots(): void {
   }).join('');
 }
 
-async function runProfileApply(preview: boolean): Promise<void> {
+async function runProfileApply(preview: boolean, generation = activeRolesGeneration): Promise<void> {
   const profileId = selectedProfileId;
   if (!profileId) return;
   const groupId = selectedApplyGroupId ?? cache[0]?.chatId;
@@ -750,6 +717,7 @@ async function runProfileApply(preview: boolean): Promise<void> {
     const body = await r.json().catch(() => ({}));
     return { larkAppId, ok: r.ok && body.ok !== false, status: r.status, error: body.error, wouldRefuse: body.wouldRefuse };
   }));
+  if (!isRolesGeneration(generation)) return;
   if (status) {
     status.innerHTML = results.map(r => {
       const bot = allBots.find(b => b.larkAppId === r.larkAppId);
@@ -762,8 +730,9 @@ async function runProfileApply(preview: boolean): Promise<void> {
   }
   if (!preview) {
     await loadGroups();
+    if (!isRolesGeneration(generation)) return;
     renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
-    void refreshGroupProfileContext();
+    void refreshGroupProfileContext(generation);
   }
 }
 
@@ -774,49 +743,73 @@ function flashProfileStatus(text: string, isError = false): void {
   statusEl.className = `roles-saved-flash ${isError ? 'roles-save-error' : ''}`;
   statusEl.textContent = ` ${text}`;
   footer.appendChild(statusEl);
-  setTimeout(() => statusEl.remove(), isError ? 3000 : 2000);
+  scheduleRolesTimer(() => statusEl.remove(), isError ? 3000 : 2000);
 }
 
-async function renderRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles'): Promise<void> {
+export function wireRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles'): () => void {
+  const generation = activeRolesGeneration + 1;
+  activeRolesGeneration = generation;
+  const timers = new Set<number>();
+  activeRolesTimerState = { generation, timers };
+  const cleanups: Array<() => void> = [];
+  let disposed = false;
+  const isLive = () => !disposed && isRolesGeneration(generation);
+  const on = (el: Element | null, type: string, listener: EventListener) => {
+    if (!el) return;
+    el.addEventListener(type, listener);
+    cleanups.push(() => el.removeEventListener(type, listener));
+  };
+
   activeTab = tab;
-  root.innerHTML = pageHtml(tab);
   expandedGroups.clear();
+  groupProfileContextLoaded = false;
   resetEditor();
   switchTab(activeTab);
 
-  const treeEl = document.getElementById('roles-tree');
-  const profileListEl = document.getElementById('roles-profile-list');
+  const treeEl = root.querySelector<HTMLElement>('#roles-tree');
+  const profileListEl = root.querySelector<HTMLElement>('#roles-profile-list');
   if (treeEl) treeEl.innerHTML = loadingHtml();
   if (profileListEl) profileListEl.innerHTML = loadingHtml();
-  await loadGroups();
-  await loadProfiles();
-  await loadNameMaps();
 
-  if (tab === 'profiles') {
-    const requestedChatId = hashChatId();
-    if (requestedChatId && cache.some(g => g.chatId === requestedChatId)) {
-      selectedApplyGroupId = requestedChatId;
+  void (async () => {
+    await loadGroups();
+    if (!isLive()) return;
+    await loadProfiles();
+    if (!isLive()) return;
+    await loadNameMaps();
+    if (!isLive()) return;
+
+    if (tab === 'profiles') {
+      const requestedChatId = hashChatId();
+      if (requestedChatId && cache.some(g => g.chatId === requestedChatId)) {
+        selectedApplyGroupId = requestedChatId;
+      }
     }
-  }
 
-  for (const g of cache) {
-    if (botRoleCount(g) > 0) expandedGroups.add(g.chatId);
-  }
-  renderTree();
-  renderProfileList();
-  if (selectedProfileId) await selectProfile(selectedProfileId);
-  void refreshGroupProfileContext();
+    for (const g of cache) {
+      if (botRoleCount(g) > 0) expandedGroups.add(g.chatId);
+    }
+    renderTree();
+    renderProfileList();
+    if (selectedProfileId) await selectProfile(selectedProfileId, generation);
+    if (!isLive()) return;
+    void refreshGroupProfileContext(generation);
+  })();
 
-  document.getElementById('roles-search')?.addEventListener('input', (e) => {
+  on(root.querySelector('#roles-search'), 'input', (e) => {
+    if (!isLive()) return;
     renderTree((e.target as HTMLInputElement).value);
   });
 
-  document.getElementById('roles-refresh')?.addEventListener('click', async () => {
+  on(root.querySelector('#roles-refresh'), 'click', async () => {
+    if (!isLive()) return;
     await loadGroups();
+    if (!isLive()) return;
     renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
-    void refreshGroupProfileContext();
+    void refreshGroupProfileContext(generation);
     if (selectedGroupId && selectedBotId) {
       const role = await loadRole(selectedBotId, selectedGroupId);
+      if (!isLive()) return;
       const textarea = document.getElementById('roles-editor-textarea') as HTMLTextAreaElement;
       if (textarea) textarea.value = role.content ?? '';
       editingContent = role.content ?? '';
@@ -827,16 +820,19 @@ async function renderRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles')
     }
   });
 
-  document.getElementById('roles-save')?.addEventListener('click', async function(this: HTMLButtonElement) {
+  on(root.querySelector('#roles-save'), 'click', async (e) => {
     if (!selectedGroupId || !selectedBotId) return;
-    this.disabled = true;
-    this.textContent = '...';
+    const btn = e.currentTarget as HTMLButtonElement;
+    btn.disabled = true;
+    btn.textContent = '...';
     try {
       const ok = await saveRole(selectedBotId, selectedGroupId, editingContent);
+      if (!isLive()) return;
       if (ok) {
         await loadGroups();
+        if (!isLive()) return;
         renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
-        void refreshGroupProfileContext();
+        void refreshGroupProfileContext(generation);
         const delBtn = document.getElementById('roles-delete');
         if (delBtn) delBtn.style.display = '';
         const statusEl = document.createElement('span');
@@ -844,7 +840,7 @@ async function renderRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles')
         statusEl.textContent = ` ${t('roles.saved')}`;
         const footer = document.querySelector('.roles-editor-footer');
         footer?.appendChild(statusEl);
-        setTimeout(() => statusEl.remove(), 2000);
+        scheduleRolesTimer(() => statusEl.remove(), 2000);
       } else {
         const statusEl = document.createElement('span');
         statusEl.className = 'roles-saved-flash roles-save-error';
@@ -853,51 +849,63 @@ async function renderRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles')
           : ` ${t('roles.saveFailed')}`;
         const footer = document.querySelector('.roles-editor-footer');
         footer?.appendChild(statusEl);
-        setTimeout(() => statusEl.remove(), 3000);
+        scheduleRolesTimer(() => statusEl.remove(), 3000);
       }
     } finally {
-      this.disabled = false;
-      this.textContent = t('roles.save');
+      if (!isLive()) return;
+      btn.disabled = false;
+      btn.textContent = t('roles.save');
     }
   });
 
-  document.getElementById('roles-delete')?.addEventListener('click', async function(this: HTMLButtonElement) {
+  on(root.querySelector('#roles-delete'), 'click', async (e) => {
     if (!selectedGroupId || !selectedBotId) return;
     if (!confirm(t('roles.confirmDelete'))) return;
-    this.disabled = true;
-    this.textContent = '...';
+    const btn = e.currentTarget as HTMLButtonElement;
+    btn.disabled = true;
+    btn.textContent = '...';
     try {
       const ok = await deleteRole(selectedBotId, selectedGroupId);
+      if (!isLive()) return;
       if (ok) {
         await loadGroups();
+        if (!isLive()) return;
         resetEditor();
         renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
-        void refreshGroupProfileContext();
+        void refreshGroupProfileContext(generation);
       }
     } finally {
-      this.disabled = false;
-      this.textContent = t('roles.delete');
+      if (!isLive()) return;
+      btn.disabled = false;
+      btn.textContent = t('roles.delete');
     }
   });
 
-  document.getElementById('roles-editor-textarea')?.addEventListener('input', (e) => {
+  on(root.querySelector('#roles-editor-textarea'), 'input', (e) => {
+    if (!isLive()) return;
     editingContent = (e.target as HTMLTextAreaElement).value;
     updateByteCount();
     updatePreview();
   });
 
-  document.getElementById('roles-profile-search')?.addEventListener('input', (e) => {
+  on(root.querySelector('#roles-profile-search'), 'input', (e) => {
+    if (!isLive()) return;
     renderProfileList((e.target as HTMLInputElement).value);
   });
-  document.getElementById('roles-profile-refresh')?.addEventListener('click', async () => {
+  on(root.querySelector('#roles-profile-refresh'), 'click', async () => {
+    if (!isLive()) return;
     await loadGroups();
+    if (!isLive()) return;
     await loadProfiles();
-    void refreshGroupProfileContext();
+    if (!isLive()) return;
+    void refreshGroupProfileContext(generation);
     if (selectedProfileId) await loadProfileEntries(selectedProfileId);
+    if (!isLive()) return;
     renderProfileList((document.getElementById('roles-profile-search') as HTMLInputElement)?.value ?? '');
     renderProfileDetail();
   });
-  document.getElementById('roles-profile-select')?.addEventListener('click', async () => {
+  on(root.querySelector('#roles-profile-select'), 'click', async () => {
+    if (!isLive()) return;
     const input = document.getElementById('roles-profile-id') as HTMLInputElement | null;
     const profileId = input?.value.trim();
     if (!profileId) return;
@@ -907,22 +915,26 @@ async function renderRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles')
       return;
     }
     input?.setCustomValidity('');
-    await selectProfile(profileId);
+    await selectProfile(profileId, generation);
+    if (!isLive()) return;
     if (!location.hash.startsWith('#/roles/profile')) {
       location.hash = '#/roles/profile';
     } else {
       switchTab('profiles');
     }
   });
-  document.getElementById('roles-profile-id')?.addEventListener('input', (e) => {
+  on(root.querySelector('#roles-profile-id'), 'input', (e) => {
     (e.target as HTMLInputElement).setCustomValidity('');
   });
-}
 
-export async function renderRolesPage(root: HTMLElement): Promise<void> {
-  await renderRolesSurface(root, 'groups');
-}
-
-export async function renderRoleProfilesPage(root: HTMLElement): Promise<void> {
-  await renderRolesSurface(root, 'profiles');
+  return () => {
+    disposed = true;
+    if (isRolesGeneration(generation)) activeRolesGeneration += 1;
+    for (const cleanup of cleanups.splice(0)) cleanup();
+    for (const timer of timers) window.clearTimeout(timer);
+    timers.clear();
+    if (activeRolesTimerState?.generation === generation) {
+      activeRolesTimerState = null;
+    }
+  };
 }

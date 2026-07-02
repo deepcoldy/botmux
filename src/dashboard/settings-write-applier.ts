@@ -35,6 +35,7 @@ import { isLocalDevInstall } from '../utils/install-info.js';
 export interface ResolvedDashboardSettingsView {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  chatBotDiscovery: boolean;
   maintenance: MaintenanceConfig;
   localDevInstall: boolean;
   remoteAccess?: boolean;
@@ -99,6 +100,7 @@ export type ApplySettingsWriteResult =
 export type ApplySettingsWriteError =
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
+  | 'invalid_chatBotDiscovery'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_whiteboard'
@@ -143,6 +145,12 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_openTerminalInFeishu' };
     }
     patch.openTerminalInFeishu = obj.openTerminalInFeishu;
+  }
+  if ('chatBotDiscovery' in obj) {
+    if (typeof obj.chatBotDiscovery !== 'boolean') {
+      return { ok: false, error: 'invalid_chatBotDiscovery' };
+    }
+    patch.chatBotDiscovery = obj.chatBotDiscovery;
   }
 
   let touched = false;

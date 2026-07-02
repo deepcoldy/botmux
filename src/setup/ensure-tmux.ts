@@ -30,6 +30,15 @@ export interface TmuxResult {
   version?: string;
   /** True iff we ran an installer (vs. tmux was already present). */
   freshInstall: boolean;
+  /**
+   * Whether the `tmux` binary is on PATH at all, INDEPENDENT of whether it can
+   * start a server. Lets the start-gate (PR#289 Option A) distinguish "tmux
+   * genuinely absent" (deterministic → safe to hard-fail daemon startup) from
+   * "binary present but the functional probe flaked" (must degrade gracefully
+   * via the per-session gate, never block startup — see
+   * shouldHardFailStartupForMissingTmux). Set on every return.
+   */
+  binaryPresent?: boolean;
   /** Which strategy actually ran the install. */
   strategy?: PackageManager;
   /** When installed=false: human-readable reason for the caller's warning. */
@@ -230,7 +239,7 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
   // that pass -V but fail every actual tmux command.
   const initialProbe = probeTmuxFunctional();
   if (initialProbe.ok) {
-    return { installed: true, version: initialProbe.version, freshInstall: false };
+    return { installed: true, version: initialProbe.version, freshInstall: false, binaryPresent: true };
   }
 
   // If the binary exists but the server can't start, no amount of
@@ -241,6 +250,7 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
     return {
       installed: false,
       freshInstall: false,
+      binaryPresent: true,
       reason: `${versionPresent} 已安装但启动 server 失败：${initialProbe.reason}`,
       manualCommand: '排查 ~/.tmux.conf / /tmp 权限 / libevent 依赖后再试',
     };
@@ -263,7 +273,7 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
       const postInstall = probeTmuxFunctional();
       if (postInstall.ok) {
         console.log(`✅ tmux ${postInstall.version} 安装完成 (via ${pm})`);
-        return { installed: true, version: postInstall.version, freshInstall: true, strategy: pm };
+        return { installed: true, version: postInstall.version, freshInstall: true, strategy: pm, binaryPresent: true };
       }
       tried.push(`${pm}（装上了但 server 起不来：${postInstall.reason}）`);
     } else {
@@ -288,6 +298,10 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
   return {
     installed: false,
     freshInstall: false,
+    // An install attempt may have landed the binary even though the server
+    // probe still fails — re-check PATH so the start-gate doesn't treat a
+    // present-but-broken tmux as "genuinely absent".
+    binaryPresent: !!probeTmuxVersion(),
     reason: reasonLines.join('\n'),
     manualCommand: manual,
   };

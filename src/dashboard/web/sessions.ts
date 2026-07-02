@@ -119,6 +119,29 @@ function cssToken(value: unknown): string {
   return String(value ?? 'unknown').toLowerCase().replace(/[^a-z0-9_-]/g, '-');
 }
 
+export const SESSION_STATUS_OPTIONS = [
+  'starting',
+  'working',
+  'idle',
+  'dormant',
+  'analyzing',
+  'active',
+  'limited',
+  'closed',
+];
+
+export function sessionStatusText(status: unknown): string {
+  const raw = String(status ?? 'unknown');
+  const key = `sessions.status.${raw}`;
+  const label = t(key);
+  return label === key ? raw : label;
+}
+
+function statusBadgeHtml(status: unknown): string {
+  const raw = String(status ?? 'unknown');
+  return `<span class="status status-${escapeHtml(cssToken(raw))}">${escapeHtml(sessionStatusText(raw))}</span>`;
+}
+
 function repoBasename(workingDir: unknown): string {
   const value = String(workingDir ?? '').trim();
   if (!value) return '-';
@@ -128,6 +151,13 @@ function repoBasename(workingDir: unknown): string {
 
 function terminalHref(s: any): string | null {
   if (!s.webPort) return null;
+  // 经中心化平台访问时（本页是 HTTPS 机器子域 m-<id>.<host>）：终端走**同源 /s/<session>**——
+  // 平台在 443 反代该路径 → 本机 dashboard → 本地终端。不能带 :port（平台只在 443 反代，:8801 打不通）。
+  // 需要本地终端反代口(proxyPort)已起；没起则平台侧无法反代，返回 null 不给死链。
+  if (location.protocol === 'https:') {
+    return s.proxyPort ? `${location.origin}/s/${encodeURIComponent(s.sessionId)}` : null;
+  }
+  // 本地直连：http://host:port[/s/...]
   const port = s.proxyPort ?? s.webPort;
   const suffix = s.proxyPort ? `/s/${encodeURIComponent(s.sessionId)}` : '';
   return `http://${location.hostname}:${port}${suffix}`;
@@ -144,6 +174,8 @@ const ICON = {
   details: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.2" y="2.9" width="11.6" height="10.2" rx="1.8"/><path d="M9.9 2.9v10.2"/></svg>',
   terminal: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.7" y="2.7" width="12.6" height="10.6" rx="2"/><path d="M4.4 6.3 6.4 8.1 4.4 9.9"/><path d="M8.2 10.2h3.4"/></svg>',
   key: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6" cy="6.1" r="3"/><path d="M8.1 8.2 13 13.1"/><path d="M11.3 11.4 12.6 10.1"/><path d="M12.7 12.8 13.7 11.8"/></svg>',
+  lock: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.2" y="7" width="9.6" height="6.2" rx="1.4"/><path d="M5.2 7V5.2a2.8 2.8 0 0 1 5.6 0V7"/></svg>',
+  unlock: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.2" y="7" width="9.6" height="6.2" rx="1.4"/><path d="M5.2 7V5.2a2.8 2.8 0 0 1 5.2-1.4"/></svg>',
   close: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.2 4.2 11.8 11.8"/><path d="M11.8 4.2 4.2 11.8"/></svg>',
   edit: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.7 3.3 12.7 5.3 6.3 11.7 3.7 12.3 4.3 9.7 10.7 3.3z"/></svg>',
   history: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.2 4.8a2 2 0 0 1 2-2h7.6a2 2 0 0 1 2 2v4.6a2 2 0 0 1-2 2H6.6l-2.9 2.4v-2.4h-.5a2 2 0 0 1-2-2z"/><path d="M5.2 6.2h5.6M5.2 8.4h3.6"/></svg>',
@@ -156,6 +188,16 @@ const ICON = {
 /** Compact icon action button for the card bar. `kind` adds a tint variant. */
 function cardActBtn(action: string, icon: string, label: string, kind = ''): string {
   return `<button type="button" class="card-act${kind ? ' ' + kind : ''}" data-action="${action}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">${icon}</button>`;
+}
+
+function lockActionLabel(s: any): string {
+  return s.locked ? t('sessions.unlock') : t('sessions.lock');
+}
+
+function lockChipHtml(s: any): string {
+  return s.locked
+    ? `<span class="session-lock-badge" title="${escapeHtml(t('sessions.locked'))}">${escapeHtml(t('sessions.locked'))}</span>`
+    : '';
 }
 
 // Terminal access pill for a live session: a read-only "open" segment (always
@@ -202,6 +244,7 @@ function deriveSessionBoardColumn(s: any): BoardColumnId | null {
   if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited') return 'needs-you';
   if (s.status === 'starting') return 'starting';
   if (s.status === 'working' || s.status === 'analyzing' || s.status === 'active') return 'working';
+  if (s.status === 'dormant') return 'idle';
   return 'idle';
 }
 
@@ -228,7 +271,7 @@ export function restartConfirmMessage(s: any): string {
   return [
     t('sessions.restartConfirmIntro'),
     '',
-    `${t('sessions.restartConfirmStatus')}${sep}${status}`,
+    `${t('sessions.restartConfirmStatus')}${sep}${sessionStatusText(status)}`,
     `${t('sessions.restartConfirmCli')}${sep}${cli}`,
     '',
     t('sessions.restartConfirmQuestion'),
@@ -267,8 +310,7 @@ function pageHtml(): string {
       <input type="search" name="q" placeholder="${t('sessions.search')}" />
       <select name="status">
         <option value="">${t('sessions.anyStatus')}</option>
-        <option>starting</option><option>working</option><option>idle</option>
-        <option>analyzing</option><option>active</option><option>closed</option>
+        ${SESSION_STATUS_OPTIONS.map(status => `<option value="${escapeHtml(status)}">${escapeHtml(sessionStatusText(status))}</option>`).join('')}
       </select>
       <select name="adopt">
         <option value="">${t('sessions.adoptAny')}</option>
@@ -294,6 +336,8 @@ function pageHtml(): string {
     </div>
     <div id="bulk-bar" class="bulk-bar" hidden>
       <span id="bulk-count"></span>
+      <button type="button" id="bulk-lock">${t('sessions.lockSelected')}</button>
+      <button type="button" id="bulk-unlock">${t('sessions.unlockSelected')}</button>
       <button type="button" id="bulk-close" class="contrast">${t('sessions.closeSelected')}</button>
       <button type="button" id="bulk-clear">${t('sessions.clearSelection')}</button>
     </div>
@@ -502,14 +546,20 @@ function renderCreateSessionSuccess(modal: HTMLDialogElement, body: any): void {
   modal.querySelector<HTMLButtonElement>('#cs-done')!.onclick = () => modal.close();
 }
 
-export function renderSessionsPage(root: HTMLElement) {
+export function renderSessionsPage(root: HTMLElement): () => void {
   root.innerHTML = pageHtml();
+  return wireSessionsPage(root);
+}
+
+export function wireSessionsPage(root: HTMLElement): () => void {
   const tbody = root.querySelector<HTMLElement>('#sessions-table tbody')!;
   const filtersForm = root.querySelector<HTMLFormElement>('#filters')!;
   const drawer = root.querySelector<HTMLDialogElement>('#drawer')!;
   const selectAllBox = root.querySelector<HTMLInputElement>('#select-all')!;
   const bulkBar = root.querySelector<HTMLElement>('#bulk-bar')!;
   const bulkCountSpan = root.querySelector<HTMLElement>('#bulk-count')!;
+  const bulkLockBtn = root.querySelector<HTMLButtonElement>('#bulk-lock')!;
+  const bulkUnlockBtn = root.querySelector<HTMLButtonElement>('#bulk-unlock')!;
   const bulkCloseBtn = root.querySelector<HTMLButtonElement>('#bulk-close')!;
   const bulkClearBtn = root.querySelector<HTMLButtonElement>('#bulk-clear')!;
   const idleCleanupBar = root.querySelector<HTMLElement>('#idle-cleanup-bar')!;
@@ -845,7 +895,7 @@ export function renderSessionsPage(root: HTMLElement) {
       <td><input type="checkbox" class="row-select" ${checked} ${closed ? 'disabled' : ''}></td>
       <td>${escapeHtml(botDisplayName(s))}</td>
       <td><span class="badge cli-${cssToken(s.cliId)}">${escapeHtml(s.cliId ?? 'unknown')}</span></td>
-      <td><span class="status status-${escapeHtml(s.status ?? 'unknown')}">${escapeHtml(s.status ?? 'unknown')}</span></td>
+      <td>${statusBadgeHtml(s.status)}${lockChipHtml(s)}</td>
       <td class="token-cell">${formatTokenCount(s.tokenUsage?.in)}</td>
       <td class="token-cell">${formatTokenCount(s.tokenUsage?.out)}</td>
       <td title="${escapeHtml(String(s.title ?? ''))}">${escapeHtml(stripMentionPrefix(s.title ?? '').slice(0, 48))}</td>
@@ -886,14 +936,17 @@ export function renderSessionsPage(root: HTMLElement) {
     const terminal = terminalHref(s);
     const signal = boardSignalLabel(s);
     const repo = repoBasename(s.workingDir);
-    return `<article class="session-card${isSelected ? ' selected' : ''}" data-id="${escapeHtml(s.sessionId)}" aria-pressed="${isSelected}">
+    return `<article class="session-card${isSelected ? ' selected' : ''}${s.locked ? ' locked' : ''}" data-id="${escapeHtml(s.sessionId)}" aria-pressed="${isSelected}">
       <div class="session-card-top">
         ${botAvatarHtml({ name: botName, larkAppId: s.larkAppId, size: 'sm' })}
         <div class="session-card-title">
           <strong title="${escapeHtml(String(s.title ?? title))}">${escapeHtml(String(title).slice(0, 72))}</strong>
           <span>${escapeHtml(botName)} · ${escapeHtml(chatTitle ?? s.cliId ?? 'unknown')}</span>
         </div>
-        <span class="status status-${escapeHtml(s.status ?? 'unknown')}">${escapeHtml(s.status ?? 'unknown')}</span>
+        <span class="session-card-status-group">
+          ${statusBadgeHtml(s.status)}
+          ${lockChipHtml(s)}
+        </span>
       </div>
       ${repo !== '-' || s.adopt ? `<div class="session-card-meta">
         ${repo !== '-' ? `<span title="${escapeHtml(s.workingDir ?? '')}">${escapeHtml(repo)}</span>` : ''}
@@ -910,6 +963,7 @@ export function renderSessionsPage(root: HTMLElement) {
         ${cardActBtn('details', ICON.details, t('sessions.details'))}
         ${canRestartSession(s) ? cardActBtn('restart', ICON.restart, t('sessions.restart')) : ''}
         ${terminalControlsHtml(terminal)}
+        ${cardActBtn('lock', s.locked ? ICON.unlock : ICON.lock, lockActionLabel(s), s.locked ? 'locked' : '')}
         ${cardActBtn('close', ICON.close, t('sessions.close'), 'danger')}
       </div>
     </article>`;
@@ -977,15 +1031,17 @@ export function renderSessionsPage(root: HTMLElement) {
     // 对方部署的会话：数据是 host 快照，终端/历史/改名都在对方机器上做不了——
     // 只保留状态点与部署来源徽章，卡片仍可拖（团队共享编排）。
     const remote = typeof s.remoteDeployment === 'string' ? s.remoteDeployment : '';
-    return `<article class="kanban-card${remote ? ' kanban-card-remote' : ''}" data-id="${escapeHtml(s.sessionId)}" tabindex="0" role="button" draggable="true">
+    return `<article class="kanban-card${remote ? ' kanban-card-remote' : ''}${s.locked ? ' locked' : ''}" data-id="${escapeHtml(s.sessionId)}" tabindex="0" role="button" draggable="true">
       <div class="kanban-card-top">
         <span class="badge cli-${cssToken(s.cliId)}">${escapeHtml(s.cliId ?? 'unknown')}</span>
         ${s.adopt ? '<span class="badge">adopt</span>' : ''}
+        ${lockChipHtml(s)}
         ${remote ? `<span class="badge kanban-remote-badge" title="${escapeHtml(t('sessions.kanban.remoteHint', { name: remote }))}">${escapeHtml(remote)}</span>` : ''}
         <span class="kanban-card-top-right">
-          <span class="kanban-card-dot" data-status="${escapeHtml(status)}" title="${escapeHtml(status)}"></span>
+          <span class="kanban-card-dot" data-status="${escapeHtml(cssToken(status))}" title="${escapeHtml(sessionStatusText(status))}"></span>
           ${remote ? '' : `<button type="button" class="card-act kanban-card-act" data-action="history" title="${escapeHtml(t('sessions.history.title'))}" aria-label="${escapeHtml(t('sessions.history.title'))}">${ICON.history}</button>
           ${s.feishuChatLink ? `<a class="card-act kanban-card-act" href="${escapeHtml(s.feishuChatLink)}" target="_blank" rel="noopener" title="${escapeHtml(t('sessions.kanban.openFeishu'))}" aria-label="${escapeHtml(t('sessions.kanban.openFeishu'))}">${ICON.feishu}</a>` : ''}
+          <button type="button" class="card-act kanban-card-act${s.locked ? ' locked' : ''}" data-action="lock" title="${escapeHtml(lockActionLabel(s))}" aria-label="${escapeHtml(lockActionLabel(s))}">${s.locked ? ICON.unlock : ICON.lock}</button>
           <button type="button" class="card-act kanban-card-act" data-action="details" title="${escapeHtml(t('sessions.details'))}" aria-label="${escapeHtml(t('sessions.details'))}">${ICON.details}</button>
           ${canRestartSession(s) ? `<button type="button" class="card-act kanban-card-act" data-action="restart" title="${escapeHtml(t('sessions.restart'))}" aria-label="${escapeHtml(t('sessions.restart'))}">${ICON.restart}</button>` : ''}`}
         </span>
@@ -1420,7 +1476,7 @@ export function renderSessionsPage(root: HTMLElement) {
           ${botAvatarHtml({ name: botDisplayName(s), larkAppId: s.larkAppId, size: 'sm' })}
           <strong class="term-modal-name" title="${escapeHtml(String(s.title ?? title))}">${escapeHtml(String(title).slice(0, 60))}</strong>
           <button type="button" id="term-modal-edit" class="card-act" title="${escapeHtml(t('sessions.kanban.rename'))}" aria-label="${escapeHtml(t('sessions.kanban.rename'))}">${ICON.edit}</button>
-          <span class="status status-${escapeHtml(s.status ?? 'unknown')}">${escapeHtml(s.status ?? 'unknown')}</span>
+          ${statusBadgeHtml(s.status)}
         </span>
         <span class="term-modal-actions">
           ${feishu}
@@ -1502,6 +1558,11 @@ export function renderSessionsPage(root: HTMLElement) {
   function syncBulkUi(rows: any[]): void {
     bulkBar.hidden = selected.size === 0;
     bulkCountSpan.textContent = t('sessions.selectedCount', { count: selected.size });
+    const selectedRows = [...selected]
+      .map(id => store.sessions.get(id))
+      .filter((r): r is any => !!r && r.status !== 'closed');
+    bulkLockBtn.disabled = !selectedRows.some(r => !r.locked);
+    bulkUnlockBtn.disabled = !selectedRows.some(r => !!r.locked);
     const selectable = rows.filter(r => r.status !== 'closed');
     if (selectable.length === 0) {
       selectAllBox.checked = false;
@@ -1643,6 +1704,48 @@ export function renderSessionsPage(root: HTMLElement) {
     }
   }
 
+  function invalidateSessionViews(): void {
+    lastBoardHtml = '';
+    lastTableHtml = '';
+    lastKanbanHtml = '';
+  }
+
+  async function setSessionLocked(s: any, locked: boolean, btn?: HTMLButtonElement): Promise<boolean> {
+    const prev = !!s.locked;
+    if (prev === locked) return true;
+    s.locked = locked;
+    invalidateSessionViews();
+    rerender();
+    if (btn) btn.disabled = true;
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/lock`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ locked }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body?.ok === false) {
+        s.locked = prev;
+        invalidateSessionViews();
+        rerender();
+        if (r.status !== 401) alert(`${t('sessions.lockFailed')}: ${body?.error ?? r.status}`);
+        return false;
+      }
+      s.locked = !!body.locked;
+      invalidateSessionViews();
+      rerender();
+      return true;
+    } catch (e) {
+      s.locked = prev;
+      invalidateSessionViews();
+      rerender();
+      alert(`${t('sessions.lockFailed')}: ${e}`);
+      return false;
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
   // Per-session restart cooldown. The route returns 200 the instant the IPC is
   // sent — long before the worker's ~500ms+ respawn — so re-enabling the button
   // immediately let a second restart land inside the respawn window, which trips
@@ -1733,7 +1836,10 @@ export function renderSessionsPage(root: HTMLElement) {
     drawer.innerHTML = `<article>
       <header>
         <h3>${escapeHtml(stripMentionPrefix(s.title) || s.sessionId)}</h3>
-        <span class="status status-${escapeHtml(s.status ?? 'unknown')}">${escapeHtml(s.status ?? 'unknown')}</span>
+        <span class="drawer-status-line">
+          ${statusBadgeHtml(s.status)}
+          ${lockChipHtml(s)}
+        </span>
         <p><code>${escapeHtml(s.sessionId)}</code> <button data-copy="${escapeHtml(s.sessionId)}">${t('sessions.copy')}</button></p>
       </header>
       <p><b>${t('sessions.bot')}:</b> ${escapeHtml(botDisplayName(s))} · <b>${t('sessions.cli')}:</b> ${escapeHtml(s.cliId ?? '?')}</p>
@@ -1747,6 +1853,7 @@ export function renderSessionsPage(root: HTMLElement) {
         <button id="history-drawer-btn" type="button">${t('sessions.history.title')}</button>
         ${terminalControlsHtml(terminal)}
         ${canRestartSession(s) ? `<button id="restart-btn" type="button">${t('sessions.restart')}</button>` : ''}
+        ${!closed ? `<button id="lock-btn" type="button">${escapeHtml(lockActionLabel(s))}</button>` : ''}
         ${s.queued && !closed ? `<button id="start-btn" type="button" class="primary">${t('sessions.create.start')}</button>` : ''}
         ${closed ? `<button id="resume-btn" type="button" class="primary">${t('sessions.resume')}</button>` : ''}
         ${!closed ? `<button id="close-btn" type="button" class="contrast">${t('sessions.close')}</button>` : ''}
@@ -1814,6 +1921,20 @@ export function renderSessionsPage(root: HTMLElement) {
     if (closeBtn) {
       closeBtn.onclick = async () => {
         if (await closeSession(s, closeBtn)) drawer.close();
+      };
+    }
+
+    const lockBtn = drawer.querySelector<HTMLButtonElement>('#lock-btn');
+    if (lockBtn) {
+      lockBtn.onclick = async () => {
+        const next = !s.locked;
+        if (await setSessionLocked(s, next, lockBtn)) {
+          lockBtn.textContent = lockActionLabel(s);
+          const line = drawer.querySelector<HTMLElement>('.drawer-status-line');
+          if (line) {
+            line.innerHTML = `${statusBadgeHtml(s.status)}${lockChipHtml(s)}`;
+          }
+        }
       };
     }
 
@@ -1945,6 +2066,7 @@ export function renderSessionsPage(root: HTMLElement) {
       else if (action === 'write-link') void openWriteLink(s, actionButton);
       else if (action === 'locate') void locateSession(s, actionButton);
       else if (action === 'restart') void restartSession(s, actionButton);
+      else if (action === 'lock') void setSessionLocked(s, !s.locked, actionButton);
       else if (action === 'close') void closeSession(s, actionButton).then(ok => {
         if (ok) {
           selected.delete(s.sessionId);
@@ -2047,6 +2169,7 @@ export function renderSessionsPage(root: HTMLElement) {
       else if (actionButton.dataset.action === 'rename') startKanbanRename(card, s);
       else if (actionButton.dataset.action === 'history') void openHistoryModal(s);
       else if (actionButton.dataset.action === 'restart') void restartSession(s, actionButton);
+      else if (actionButton.dataset.action === 'lock') void setSessionLocked(s, !s.locked, actionButton);
       return;
     }
     if (target.closest('a, button, input, label')) return;
@@ -2269,6 +2392,55 @@ export function renderSessionsPage(root: HTMLElement) {
     if (failed > 0) alert(`Failed: ${failed}/${ids.length}`);
   });
 
+  async function setSelectedLocked(locked: boolean): Promise<void> {
+    const rows = [...selected]
+      .map(id => store.sessions.get(id))
+      .filter((s): s is any => !!s && s.status !== 'closed' && !!s.locked !== locked);
+    if (rows.length === 0) return;
+    bulkLockBtn.disabled = true;
+    bulkUnlockBtn.disabled = true;
+    const original = locked ? bulkLockBtn.textContent : bulkUnlockBtn.textContent;
+    const activeBtn = locked ? bulkLockBtn : bulkUnlockBtn;
+    let done = 0;
+    let failed = 0;
+    const queue = [...rows];
+    activeBtn.textContent = `0/${rows.length}`;
+    async function worker() {
+      while (queue.length) {
+        const s = queue.shift()!;
+        const prev = !!s.locked;
+        try {
+          const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/lock`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ locked }),
+          });
+          const body = await r.json().catch(() => ({}));
+          if (!r.ok || body?.ok === false) {
+            failed += 1;
+            s.locked = prev;
+          } else {
+            s.locked = !!body.locked;
+          }
+        } catch {
+          failed += 1;
+          s.locked = prev;
+        } finally {
+          done += 1;
+          activeBtn.textContent = `${done}/${rows.length}`;
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(6, rows.length) }, () => worker()));
+    activeBtn.textContent = original;
+    invalidateSessionViews();
+    rerender();
+    if (failed > 0) alert(`${t('sessions.lockFailed')}: ${failed}/${rows.length}`);
+  }
+
+  bulkLockBtn.addEventListener('click', () => void setSelectedLocked(true));
+  bulkUnlockBtn.addEventListener('click', () => void setSelectedLocked(false));
+
   idleCleanupThreshold.addEventListener('click', e => {
     // Don't let a threshold switch mid-cleanup repaint the count/pill against a
     // different threshold than the request that's already running.
@@ -2335,7 +2507,7 @@ export function renderSessionsPage(root: HTMLElement) {
   });
 
   filtersForm.addEventListener('input', rerender);
-  store.on(rerender);
+  const unsubscribeStore = store.on(rerender);
   // 团队看板 30s 软刷新（拉对方部署的会话快照与共享编排）；页面切走后
   // kanban 脱离 DOM，定时器自清。
   const teamBoardTimer = setInterval(() => {
@@ -2351,4 +2523,13 @@ export function renderSessionsPage(root: HTMLElement) {
   rerender();
   // bot 友好名 / 群聊标题异步解析，回来后补一次重绘（首帧先显示原值）
   void loadNameMaps().then(rerender);
+  return () => {
+    unsubscribeStore();
+    clearInterval(teamBoardTimer);
+    cancelKanbanOpen();
+    drawer.close();
+    termModal.close();
+    historyModal.close();
+    createSessionModal.close();
+  };
 }

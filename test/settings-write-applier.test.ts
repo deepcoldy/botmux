@@ -18,6 +18,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
   const settingsView: ResolvedDashboardSettingsView = {
     publicReadOnly: false,
     openTerminalInFeishu: false,
+    chatBotDiscovery: true,
     maintenance: {},
     localDevInstall: false,
   };
@@ -63,6 +64,13 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ openTerminalInFeishu: true });
   });
 
+  it('writes chatBotDiscovery toggle (off) through the dashboard segment', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ chatBotDiscovery: false }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ chatBotDiscovery: false });
+  });
+
   it('writes both dashboard fields in a single patch', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ publicReadOnly: true, openTerminalInFeishu: false }, deps);
@@ -104,6 +112,14 @@ describe('applySettingsWrite — validation errors', () => {
     if (r.ok) throw new Error('unreachable');
     expect(r.error).toBe('invalid_publicReadOnly');
     expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-boolean chatBotDiscovery → invalid_chatBotDiscovery', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ chatBotDiscovery: 'no' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('expected failure');
+    expect(r.error).toBe('invalid_chatBotDiscovery');
   });
 
   it('rejects non-boolean openTerminalInFeishu → invalid_openTerminalInFeishu', async () => {

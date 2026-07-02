@@ -95,6 +95,10 @@ export interface DashboardGlobalConfig {
   /** When true, terminal buttons on Feishu cards use Feishu's sidebar web_url
    *  wrapper. Default false opens the terminal URL directly. */
   openTerminalInFeishu?: boolean;
+  /** Experimental current-chat bot discovery via Lark `/members/bots`. Default
+   *  ON (absent ⇒ enabled); set false to disable from the dashboard. Read live
+   *  by the daemon — see config.ts `resolveChatBotDiscoveryConfig`. */
+  chatBotDiscovery?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -191,6 +195,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   const out: DashboardGlobalConfig = {};
   if (typeof d.publicReadOnly === 'boolean') out.publicReadOnly = d.publicReadOnly;
   if (typeof d.openTerminalInFeishu === 'boolean') out.openTerminalInFeishu = d.openTerminalInFeishu;
+  if (typeof d.chatBotDiscovery === 'boolean') out.chatBotDiscovery = d.chatBotDiscovery;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -275,6 +280,15 @@ export function readGlobalConfig(): GlobalConfig {
   if (typeof raw.remoteAccess === 'boolean') out.remoteAccess = raw.remoteAccess;
   readCache = { path, value: out, at: Date.now() };
   return out;
+}
+
+/** Drop the short-TTL read cache so the next readGlobalConfig re-reads from
+ *  disk. Same-process writes invalidate automatically (mergeGlobalConfig); this
+ *  is for cross-process freshness on demand — e.g. the dashboard process after
+ *  `botmux bind` (a different process) flips remoteAccess on, so the post-bind
+ *  dashboard URL reflects the new value without waiting out the TTL. */
+export function invalidateGlobalConfigCache(): void {
+  readCache = null;
 }
 
 /** 远程访问 enabled? Reads the (short-TTL cached) global config — cheap enough to

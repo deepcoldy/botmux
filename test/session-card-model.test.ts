@@ -48,6 +48,11 @@ describe('session-card-model · composeEntries / statusToDot', () => {
     expect(dot.pulse).toBe(false);
     expect(dot.label).toBe('sessions.status.unknown');
   });
+
+  it('maps dormant sessions to a grey, non-pulsing dot', () => {
+    const dot = statusToDot('dormant');
+    expect(dot).toEqual({ tone: 'neutral', pulse: false, label: 'sessions.status.dormant' });
+  });
 });
 
 describe('session-card-model · filters', () => {

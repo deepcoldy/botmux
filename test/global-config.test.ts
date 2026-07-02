@@ -34,6 +34,14 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard).toEqual({ openTerminalInFeishu: true });
   });
 
+  it('reads dashboard.chatBotDiscovery as a boolean (off)', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { chatBotDiscovery: false },
+    }));
+
+    expect(readGlobalConfig().dashboard).toEqual({ chatBotDiscovery: false });
+  });
+
   it('reads repoPickerMode as a top-level global enum', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       repoPickerMode: 'repos',

@@ -81,7 +81,9 @@ describe('createGroupWithBots', () => {
     // Default: every batched bot joins OK. Bots are added via addBotToChat (each
     // batch ≤5) since createChat is called with botIds:[]; tests that exercise
     // rejected bots override per-id (return { ok:false }).
-    mockAddBotToChat.mockImplementation((_appId: string, _chatId: string, ids: string[]) => ids.map((id) => ({ ok: true, id })));
+    mockAddBotToChat.mockImplementation(async (_appId: string, _chatId: string, ids: string[]) =>
+      ids.map(id => ({ id, ok: true })),
+    );
   });
 
   it('pulls bot owners into the chat by union_id; reports invalidOwnerUnionIds', async () => {
@@ -270,9 +272,14 @@ describe('createGroupWithBots', () => {
   it('binds the newly created chat for joined bots when bindWorkingDir is provided', async () => {
     mockCreateChat.mockResolvedValue({
       chatId: 'oc_bound',
-      invalidBotIds: ['cli_rejected_bot'],
+      invalidBotIds: [],
       invalidUserIds: [],
     });
+    mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) =>
+      ids.map(id => id === 'cli_rejected_bot'
+        ? { id, ok: false, error: 'invalid_id' }
+        : { id, ok: true }),
+    );
     mockBindOncall.mockResolvedValue({ ok: true, created: true });
 
     const result = await createGroupWithBots({
@@ -324,9 +331,14 @@ describe('createGroupWithBots', () => {
   it('reports invalidBotIds/invalidUserIds passthrough from createChat', async () => {
     mockCreateChat.mockResolvedValue({
       chatId: 'oc_x',
-      invalidBotIds: ['cli_zombie'],
+      invalidBotIds: [],
       invalidUserIds: ['ou_banned'],
     });
+    mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) =>
+      ids.map(id => id === 'cli_zombie'
+        ? { id, ok: false, error: 'invalid_id' }
+        : { id, ok: true }),
+    );
     const result = await createGroupWithBots({
       creatorLarkAppId: CREATOR,
       larkAppIds: [CREATOR, 'cli_zombie'],

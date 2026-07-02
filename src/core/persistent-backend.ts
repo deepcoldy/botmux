@@ -11,7 +11,6 @@
  * worker-pool and session-manager import it, and those two already form an
  * import cycle with each other.
  */
-import { config } from '../config.js';
 import { getBot } from '../bot-registry.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
@@ -28,19 +27,31 @@ export function isSuspendableBackendType(
 }
 
 /**
- * Resolve which persistent backend (if any) backs a session: prefer the
- * worker's stored init config — the per-session truth captured at spawn time,
- * which survives idle-suspend and tracks bot-config drift — then the bot
- * config, then the daemon default (covers lazy-restored sessions that never
- * forked a worker, where initConfig is unset).
+ * Resolve which persistent backend (if any) backs a session.
+ *
+ * Precedence, most authoritative first:
+ *   1. `ds.initConfig?.backendType` — the live worker's resolved backend this run.
+ *   2. `ds.session.backendType` — the backend stamped on the persisted session
+ *      at spawn time (survives daemon restart; see Session.backendType).
+ *   3. An explicit per-bot `backendType` — authoritative even for legacy
+ *      sessions, since the bot's choice didn't change across the PTY退役 flip.
+ *
+ * If NONE of those resolve, the session predates backendType stamping AND its
+ * bot pins no backend, so it ran on the OLD probe-based daemon default — which
+ * could have been PTY on a tmux-less host. We deliberately do NOT fall back to
+ * the current `config.daemon.backendType` (now always tmux): doing so would
+ * make `restoreActiveSessions` probe for a `bmx-<sid>` pane that never existed,
+ * find it 'missing', and zombie-close a perfectly recoverable session. Treating
+ * it as non-persistent keeps the worker-less active record for lazy resume; a
+ * genuinely surviving tmux pane still reattaches lazily on the next message
+ * (and gets stamped then).
  */
 export function getSessionPersistentBackendType(ds: DaemonSession): PersistentBackendType | undefined {
-  let backendType: BackendType | undefined = ds.initConfig?.backendType;
+  let backendType: BackendType | undefined = ds.initConfig?.backendType ?? ds.session.backendType;
   if (!backendType) {
-    backendType = config.daemon.backendType;
     try {
-      backendType = getBot(ds.larkAppId).config.backendType ?? backendType;
-    } catch { /* bot deregistered — keep daemon default */ }
+      backendType = getBot(ds.larkAppId).config.backendType;
+    } catch { /* bot deregistered */ }
   }
   return isSuspendableBackendType(backendType) ? backendType : undefined;
 }

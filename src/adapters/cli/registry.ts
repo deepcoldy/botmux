@@ -1,7 +1,8 @@
 import { spawnSync } from 'node:child_process';
-import { accessSync, constants, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
+import { locateExecutable } from '../../utils/executable.js';
 import type { CliAdapter, CliId } from './types.js';
 import { createClaudeCodeAdapter } from './claude-code.js';
 import { createSeedAdapter } from './seed.js';
@@ -12,6 +13,7 @@ import { createCodexAdapter } from './codex.js';
 import { createCodexAppAdapter } from './codex-app.js';
 import { createCursorAdapter } from './cursor.js';
 import { createGeminiAdapter } from './gemini.js';
+import { createGeniusAdapter } from './genius.js';
 import { createOpenCodeAdapter } from './opencode.js';
 import { createAntigravityAdapter } from './antigravity.js';
 import { createMtrAdapter } from './mtr.js';
@@ -22,6 +24,7 @@ import { createTraexAdapter } from './traex.js';
 import { createPiAdapter } from './pi.js';
 import { createCopilotAdapter } from './copilot.js';
 import { createOhMyPiAdapter } from './oh-my-pi.js';
+import { createKimiAdapter } from './kimi.js';
 
 /** Resolve a command name to its absolute path via shell `which`.
  *  Tries login shell first (-lc), then interactive shell (-ic) for tools
@@ -82,14 +85,7 @@ export function resolveCommand(cmd: string): string {
  * silent crash-loop. Cheap and shell-free (no rc side effects).
  */
 export function locateOnPath(cmd: string): string | null {
-  if (isAbsolute(cmd)) {
-    try { accessSync(cmd, constants.X_OK); return cmd; } catch { return null; }
-  }
-  for (const dir of (process.env.PATH ?? '').split(':').filter(Boolean)) {
-    const candidate = join(dir, cmd);
-    try { accessSync(candidate, constants.X_OK); return candidate; } catch { /* next dir */ }
-  }
-  return null;
+  return locateExecutable(cmd);
 }
 
 const adapterCache = new Map<string, CliAdapter>();
@@ -104,7 +100,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -118,6 +114,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'codex-app': return createCodexAppAdapter(pathOverride);
     case 'cursor': return createCursorAdapter(pathOverride);
     case 'gemini': return createGeminiAdapter(pathOverride);
+    case 'genius': return createGeniusAdapter(pathOverride);
     case 'opencode': return createOpenCodeAdapter(pathOverride);
     case 'antigravity': return createAntigravityAdapter(pathOverride);
     case 'mtr': return createMtrAdapter(pathOverride);
@@ -128,6 +125,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'pi': return createPiAdapter(pathOverride);
     case 'copilot': return createCopilotAdapter(pathOverride);
     case 'oh-my-pi': return createOhMyPiAdapter(pathOverride);
+    case 'kimi': return createKimiAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }

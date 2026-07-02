@@ -2,9 +2,9 @@
 // 对中心化平台保持一条出站控制 WebSocket；平台需要展示本机 dashboard 时，
 // 下发 open-stream，本端拨一条数据连接回去、裸桥接到本地 dashboard 端口。
 import net from 'node:net';
-import { hostname } from 'node:os';
+import { hostname, networkInterfaces } from 'node:os';
 import { WebSocket, createWebSocketStream } from 'ws';
-import { setPlatformTeams, type PlatformBinding, type PlatformTeam } from './binding.js';
+import { setPlatformTeams, clearPlatformBinding, type PlatformBinding, type PlatformTeam } from './binding.js';
 
 /** 本机一个 botmux bot 的概要（上报给平台，供团队页「人→机器→bot」展示 + 拉群）。 */
 export interface PlatformBotInfo {
@@ -32,7 +32,36 @@ export interface TunnelClientOptions {
 const HEARTBEAT_MS = 30_000;
 const BACKOFF_MIN_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
-const DATA_DIAL_TIMEOUT_MS = 10_000;
+// 数据流拨号：并行拨号（happy-eyeballs）。某些部署到平台 LB 某几个 VIP 的链路对新流 ~50% 丢——
+// 坏的 ECMP 分支「静默黑洞」（不回包、抓包实锤 ClientHello 无响应），好连接 ~90ms 就回。串行「拨一条
+// →黑洞等满超时→再拨」冷启动要赌好几秒；改成每波**并行拨几条、谁先到用谁、其余丢弃**：
+//  - 每波并行 DATA_DIAL_PARALLEL 条：~50% 单条成功率下，3 条里有 1 条好的概率 ~87.5% → 通常 ~90ms 就建好。
+//  - 单条超时 1s（好连接 90ms 就成，1s 足够判黑洞）；一波全黑洞才进下一波，最多 DATA_DIAL_MAX_WAVES 波。
+//  - 用完即弃、不常驻空闲连接（区别于「预热连接池」，不随机器数堆连接，可扩展）。
+//  - 平台对同一个 streamId 只 attach 第一条到的、其余自动 4004 关，协议无需改。
+//  - 配合平台连接池：建好的好连接会被复用，拨号（赌）只在冷启动/扩容发生，不是每请求。
+const DATA_DIAL_TIMEOUT_MS = 1_000;
+const DATA_DIAL_PARALLEL = 3;
+const DATA_DIAL_MAX_WAVES = 2;
+const DATA_DIAL_WAVE_BACKOFF_MS = 150;
+const DATA_DIAL_OVERALL_DEADLINE_MS = 6_000;
+
+// 本机可供平台服务端「直连反代」的候选地址（内网 IPv4:dashboardPort）。平台够得着就直连本机
+// dashboard、绕过隧道（省掉 daemon 拨号/ECMP 赌/跨 pod 转发）；够不着自动退回隧道。仅内网地址、
+// 服务端到服务端 HTTP，不涉浏览器 mixed content。
+function localDirectHosts(port: number): string[] {
+  const out: string[] = [];
+  try {
+    for (const list of Object.values(networkInterfaces())) {
+      for (const ni of list || []) {
+        if (ni.family === 'IPv4' && !ni.internal && ni.address) out.push(`${ni.address}:${port}`);
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return out;
+}
 
 export interface TunnelClientHandle {
   stop(): void;
@@ -53,7 +82,11 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
   function connect(): void {
     if (stopped) return;
     const url = `${base}/tunnel/control?token=${tokenQ}`;
-    const sock = new WebSocket(url);
+    // 关掉 permessage-deflate：隧道是裸字节桥，承载的 HTTP 自己会 gzip，WS 层再压一遍既没收益、
+    // 又会在经过中心化网关(TLB)时因压缩扩展协商被改写而触发 "Invalid WebSocket frame: RSV1 must
+    // be clear"，整条数据流当场挂掉 → dashboard 的 CSS/JS 半路断供、页面掉样式。不 offer 扩展，
+    // 中间任何一跳都不会给这条连接开压缩。
+    const sock = new WebSocket(url, { perMessageDeflate: false });
     ws = sock;
 
     sock.on('open', () => {
@@ -76,6 +109,8 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
         joinTeam(msg.teamId, msg.teamName || msg.teamId, sock);
       } else if (msg.type === 'leave-team' && msg.teamId) {
         leaveTeam(msg.teamId, sock);
+      } else if (msg.type === 'unbound') {
+        handleUnbound(sock);
       }
     });
 
@@ -117,6 +152,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       botmuxVersion: opts.getVersion(),
       dashboardToken: opts.getDashboardToken() || '',
       dashboardPort: opts.getDashboardPort(),
+      directHosts: localDirectHosts(opts.getDashboardPort()),
       memberships: teams,
       bots: opts.getBots?.() ?? [],
     });
@@ -127,6 +163,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       type: 'heartbeat',
       botmuxVersion: opts.getVersion(),
       dashboardToken: opts.getDashboardToken() || '',
+      directHosts: localDirectHosts(opts.getDashboardPort()),
       memberships: teams,
       bots: opts.getBots?.() ?? [],
     });
@@ -150,6 +187,25 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
     sendHeartbeat(sock);
   }
 
+  // 平台侧 owner 在「我的机器」点了解绑：清掉本地绑定文件并彻底停止隧道（不再重连）。
+  // 平台同时已吊销该 machine token，故即便这条消息没送达、旧 token 重连也会被握手拒掉（401）。
+  // dashboard 进程本身不退出——本机 bot 照常跑，只是不再对平台暴露；下次 `botmux bind` 即可重新绑定。
+  function handleUnbound(sock: WebSocket): void {
+    opts.log('平台已解绑本机，清除本地绑定并停止隧道');
+    stopped = true; // 必须先置位：下面 close 会触发 scheduleReconnect，stopped 让它早退、不再重连
+    cleanupSock();
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    clearPlatformBinding();
+    try {
+      sock.close(4005, 'unbound');
+    } catch {
+      /* ignore */
+    }
+  }
+
   function persistTeams(): void {
     try {
       setPlatformTeams(teams);
@@ -160,18 +216,21 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
 
   function openDataStream(streamId: string): void {
     const url = `${base}/tunnel/data?token=${tokenQ}&stream=${encodeURIComponent(streamId)}`;
-    const data = new WebSocket(url);
-    const dialTimer = setTimeout(() => {
-      try {
-        data.terminate();
-      } catch {
-        /* ignore */
-      }
-    }, DATA_DIAL_TIMEOUT_MS);
+    const startedAt = Date.now();
+    let won = false;               // 本 stream 是否已有连接胜出并桥接
+    let wave = 0;
+    const inflight = new Set<WebSocket>(); // 当前在拨/在等的连接（胜出后除胜者外全 terminate）
 
-    data.on('open', () => {
-      clearTimeout(dialTimer);
-      const dup = createWebSocketStream(data);
+    // 胜者：桥接到本地 dashboard，并把本 stream 其余在拨的连接全部关掉（用完即弃）。
+    const bridge = (winner: WebSocket): void => {
+      won = true;
+      for (const ws of inflight) {
+        if (ws === winner) continue;
+        try { ws.terminate(); } catch { /* ignore */ }
+      }
+      inflight.clear();
+      // 数据流必须关 permessage-deflate（连接创建时已设），否则大文件帧经网关压缩协商错位 → RSV1 断流。
+      const dup = createWebSocketStream(winner);
       const tcp = net.connect(opts.getDashboardPort(), '127.0.0.1');
       const kill = () => {
         try { dup.destroy(); } catch { /* ignore */ }
@@ -182,11 +241,53 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       tcp.on('close', kill);
       dup.pipe(tcp);
       tcp.pipe(dup);
-    });
-    data.on('error', (e) => {
-      clearTimeout(dialTimer);
-      opts.log('数据连接失败', { err: String(e) });
-    });
+    };
+
+    // 每波并行拨 DATA_DIAL_PARALLEL 条，谁先 open 谁胜出；一波全黑洞/失败才进下一波（有界）。
+    const dialWave = (): void => {
+      if (won) return;
+      wave++;
+      let pending = DATA_DIAL_PARALLEL;
+      const onFail = (): void => {
+        if (won) return;
+        if (--pending > 0) return; // 本波还有在拨的，等它们
+        // 本波全军覆没：预算内进下一波，否则放弃。
+        if (wave < DATA_DIAL_MAX_WAVES && Date.now() - startedAt < DATA_DIAL_OVERALL_DEADLINE_MS) {
+          setTimeout(dialWave, DATA_DIAL_WAVE_BACKOFF_MS);
+        } else {
+          opts.log('数据连接失败', { waves: wave, parallel: DATA_DIAL_PARALLEL });
+        }
+      };
+      for (let k = 0; k < DATA_DIAL_PARALLEL; k++) {
+        const data = new WebSocket(url, { perMessageDeflate: false });
+        inflight.add(data);
+        let done = false;
+        const timer = setTimeout(() => {
+          if (done) return;
+          done = true;
+          inflight.delete(data);
+          try { data.terminate(); } catch { /* ignore */ }
+          onFail();
+        }, DATA_DIAL_TIMEOUT_MS);
+        data.on('open', () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          inflight.delete(data);
+          if (won) { try { data.terminate(); } catch { /* ignore */ } return; } // 已有胜者 → 弃掉
+          bridge(data);
+        });
+        data.on('error', () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          inflight.delete(data);
+          onFail();
+        });
+      }
+    };
+
+    dialWave();
   }
 
   connect();

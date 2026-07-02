@@ -18,7 +18,7 @@ export interface SessionRow {
   larkAppId: string;
   botName: string;
   cliId: CliId | 'unknown';
-  status: StreamStatus | 'closed';
+  status: StreamStatus | 'closed' | 'dormant';
   adopt: boolean;
   spawnedAt: number;
   lastMessageAt: number;
@@ -37,6 +37,8 @@ export interface SessionRow {
    *  未设置时前端按运行状态推导默认列。 */
   kanbanColumn?: string;
   kanbanPosition?: number;
+  /** Locked sessions are protected from dashboard idle cleanup. */
+  locked?: boolean;
   ownerOpenId?: string;
   webPort: number | null;
   /** Owning daemon's advertised reverse-proxy port — WEB_EXTERNAL_PORT + botIndex
@@ -105,7 +107,8 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     cliId: ds.session.cliId ?? 'unknown',
     // 待办池(queued)会话 CLI 没起，不该算「忙」——报 'idle' 免得 overview 的忙碌
     // 计数/小圆点把它当在跑。看板列由 deriveKanbanColumn 按手动 backlog 定，不受此影响。
-    status: ds.session.queued ? 'idle' : (ds.lastScreenStatus ?? 'starting'),
+    // 重启后懒恢复的 active 会话没有 live worker / screen status：这是「休眠」而不是「启动中」。
+    status: ds.session.queued ? 'idle' : (ds.lastScreenStatus ?? (ds.worker ? 'starting' : 'dormant')),
     adopt: !!ds.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
     lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,
@@ -116,6 +119,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     title: ds.session.title,
     kanbanColumn: ds.session.kanbanColumn,
     kanbanPosition: ds.session.kanbanPosition,
+    locked: !!ds.session.locked,
     // Read from the persisted Session — single source of truth.
     // ds.ownerOpenId is a parallel in-memory copy that gets cleared on
     // restoreActiveSessions (which builds a fresh DaemonSession from disk
@@ -155,6 +159,7 @@ export function composeRowFromClosed(s: Session): SessionRow {
     title: s.title,
     kanbanColumn: s.kanbanColumn,
     kanbanPosition: s.kanbanPosition,
+    locked: !!s.locked,
     ownerOpenId: s.ownerOpenId,
     webPort: s.webPort ?? null,
     feishuChatLink: feishuChatLink(s.chatId, getBotBrand(s.larkAppId ?? '')),

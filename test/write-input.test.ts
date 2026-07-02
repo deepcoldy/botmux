@@ -42,6 +42,7 @@ import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
+import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
@@ -149,12 +150,13 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
 type AdapterEntry = [string, CliAdapter];
 
 /** Adapters that use plain sendText+Enter (tmux) / write+CR (raw) — Aiden,
- *  Gemini, OpenCode, MTR, Hermes. (Codex moved to PASTE_BUFFER_ADAPTERS: its
+ *  Gemini, Genius, OpenCode, MTR, Hermes. (Codex moved to PASTE_BUFFER_ADAPTERS: its
  *  TUI treats every literal \n as Enter, so a multi-line burst fragmented into
  *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.) */
 const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['aiden', createAidenAdapter('/bin/aiden')],
   ['gemini', createGeminiAdapter('/bin/gemini')],
+  ['genius', createGeniusAdapter('/bin/genius')],
   ['opencode', createOpenCodeAdapter('/bin/opencode')],
   ['mtr', createMtrAdapter('/bin/mtr')],
   ['hermes', createHermesAdapter('/bin/hermes')],
@@ -493,6 +495,10 @@ describe('supportsTypeAhead flag', () => {
     expect(createCodexAdapter('/bin/codex').supportsTypeAhead).toBe(true);
   });
 
+  it('genius: true (Claude-family queue accepts follow-up input after startup)', () => {
+    expect(createGeniusAdapter('/bin/genius').supportsTypeAhead).toBe(true);
+  });
+
   it('pi: undefined (uses busy marker probes instead of type-ahead)', () => {
     expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBeUndefined();
   });
@@ -513,7 +519,7 @@ describe('supportsTypeAhead flag', () => {
     expect(createCodexAdapter('/bin/codex').mergeQueuedInput).toBeUndefined();
   });
 
-  it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex'))('%s: undefined (default behavior)', (_name, adapter) => {
+  it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex' && name !== 'genius'))('%s: undefined (default behavior)', (_name, adapter) => {
     expect(adapter.supportsTypeAhead).toBeUndefined();
   });
 });
@@ -909,6 +915,70 @@ describe('claude-code writeInput submission confirmation', () => {
       JSON.stringify({ type: 'user', message: { role: 'user', content: 'slow hook still running' } }) + '\n',
     );
     expect(recheck()).toBe(true);  // Now the worker suppresses the warning
+  });
+});
+
+describe('genius writeInput submission confirmation', () => {
+  function makeGeniusJsonlForSession(sessionId: string, cwd: string): string {
+    const projectHash = cwd.replace(/[^A-Za-z0-9-]/g, '-');
+    const projectDir = join(homedir(), '.genius', 'projects', projectHash);
+    mkdirSync(projectDir, { recursive: true });
+    const path = join(projectDir, `${sessionId}.jsonl`);
+    writeFileSync(path, '');
+    return path;
+  }
+
+  it('accepts queue-operation enqueue as a confirmed type-ahead submit', async () => {
+    const cwd = '/tmp/genius-queue-submit';
+    const sessionId = 'genius-queue-session';
+    const transcriptPath = makeGeniusJsonlForSession(sessionId, cwd);
+    const adapter = createGeniusAdapter('/bin/genius');
+    const pty: PtyHandle = {
+      claudeJsonlPath: transcriptPath,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        appendFileSync(
+          transcriptPath,
+          JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: 'queued while busy' }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'queued while busy');
+
+    expect(result).toBeUndefined();
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not confirm a queue-operation enqueue for different content', async () => {
+    const cwd = '/tmp/genius-queue-mismatch';
+    const sessionId = 'genius-queue-mismatch-session';
+    const transcriptPath = makeGeniusJsonlForSession(sessionId, cwd);
+    const adapter = createGeniusAdapter('/bin/genius');
+    let appended = false;
+    const pty: PtyHandle = {
+      claudeJsonlPath: transcriptPath,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || appended) return;
+        appended = true;
+        appendFileSync(
+          transcriptPath,
+          JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: 'another prompt' }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'queued while busy');
+
+    expect(result).toMatchObject({ submitted: false });
+    expect((result as any).recheck()).toBe(false);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(4);
   });
 });
 

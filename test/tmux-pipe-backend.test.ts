@@ -397,7 +397,7 @@ describe('TmuxPipeBackend managed session', () => {
     expect(newSessionCall![1]).toContain('bmx-owned');
 
     const optionCalls = mockedExecSync.mock.calls.map(c => String(c[0]));
-    expect(optionCalls.some(c => c.includes('set-option') && c.includes('status off'))).toBe(true);
+    expect(optionCalls.some(c => c.includes('set-option') && c.includes('status on'))).toBe(true);
     expect(optionCalls.some(c => c.includes('set-option') && c.includes('mouse on'))).toBe(true);
     expect(optionCalls.some(c => c.includes('set-option') && c.includes('history-limit 50000'))).toBe(true);
     expect(optionCalls.some(c => c.includes('set-option') && c.includes('window-size largest'))).toBe(true);

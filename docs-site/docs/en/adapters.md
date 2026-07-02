@@ -20,6 +20,40 @@ botmux bridges different CLIs through adapters, selected via `cliId` in `bots.js
 
 > There are also community-contributed integrations such as MTR, ttadk, and Mira. The `model` field only takes effect for adapters that support a model parameter; others ignore it.
 
+## Mir CLI and MCP Bridge
+
+When you choose **Mira -> Mir CLI (local mircli)** in `botmux setup`, the bot is configured with `cliId: "mir"`. This adapter runs the local `mircli -p --lean`, so the same system user that runs the botmux daemon must already have Mir CLI authenticated and initialized.
+
+BotMux does not need any DevBox-specific configuration. The same rules apply on DevBox, local macOS, or other Linux machines:
+
+- `mircli` can be found by botmux, or the bot config points `cliPathOverride` at the absolute `mircli` path.
+- `~/.mira/config.json` already contains a `device_id`. This is usually written by `mircli mcp --device-id <id>` or Mir CLI's own initialization flow.
+- `miramcp` is installed in a standard Mir CLI location such as `~/.local/bin/miramcp` or `~/.local/bin/mira_cli`, or `MIRAMCP_BIN` points at the executable.
+
+When a `cliId: "mir"` session starts and receives a message, BotMux best-effort starts the MCP Bridge before invoking `mircli`:
+
+```bash
+miramcp run --device-id <device_id>
+```
+
+It first checks `~/.mira/miramcp/miramcp.pid` and local port `9801`, so an already-running bridge is reused instead of started twice. To inspect the bridge, run this as the same user that runs the botmux daemon:
+
+```bash
+mircli mcp status
+```
+
+To disable this autostart behavior, either set this in `~/.mira/config.json`:
+
+```json
+{"auto_start_bridge": false}
+```
+
+or disable it only for BotMux:
+
+```bash
+MIRCLI_AUTO_START_MIRAMCP=0 botmux start
+```
+
 ## Wrapping a wrapper / gateway integration
 
 In many cases you don't run the native CLI directly but wrap it with a gateway / router (internal proxy + SSO, model routing, etc.), such as `ccr`, `ttadk`, `aiden x claude`, `aiden x codex`. In this case you **don't need a new adapter**: `cliId` still holds the real underlying CLI (`claude-code` / `codex` …), and you only swap the launch entry point for a **wrapper script**, pointing to it with `cliPathOverride` (the "CLI executable path override" when editing a bot in `botmux setup` is exactly this).

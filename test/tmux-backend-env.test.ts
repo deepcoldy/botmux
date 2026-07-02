@@ -91,6 +91,18 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('CJADK_INTERACTIVE='))).toBe(false);
   });
 
+  it('forwards list-bots API discovery flags so CLI bots list matches daemon behavior', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_LARK_LIST_BOTS_API_ENABLED: 'true',
+      BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS: '3000',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('BOTMUX_LARK_LIST_BOTS_API_ENABLED=true');
+    expect(out).toContain('BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS=3000');
+    expect(out).not.toContain('PATH=/usr/bin');
+  });
+
   it('skips entries whose value is undefined (e.g. IS_SANDBOX outside root mode)', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',

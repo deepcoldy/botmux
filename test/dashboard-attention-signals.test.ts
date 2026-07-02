@@ -68,6 +68,16 @@ describe('attention signals', () => {
     expect(quiet.tuiPromptActive).toBe(false);
   });
 
+  it('composeRowFromActive marks restored workerless active sessions as dormant', () => {
+    expect(composeRowFromActive(makeDs()).status).toBe('dormant');
+    expect(composeRowFromActive(makeDs({ worker: {} as any })).status).toBe('starting');
+    expect(composeRowFromActive(makeDs({ lastScreenStatus: 'idle' })).status).toBe('idle');
+
+    const queued = makeDs();
+    queued.session.queued = true;
+    expect(composeRowFromActive(queued).status).toBe('idle');
+  });
+
   it('composeRowFromActive carries the agent raise-hand signal with its reason', () => {
     const raised = composeRowFromActive(makeDs({
       agentAttention: { kind: 'authz', reason: '需要 prod 部署授权', at: 1234 },
@@ -144,7 +154,7 @@ describe('attention signals', () => {
     const row = (seen[0] as any).body.session;
     expect(row.sessionId).toBe('sess-1');
     expect(row.pendingRepo).toBe(true);
-    expect(row.status).toBe('starting'); // no screen yet → starting
+    expect(row.status).toBe('dormant'); // no live worker/screen yet; pendingRepo still routes it to needs-you
   });
 
   it('announceSessionRow publishes a full session.spawned row for restored active sessions', () => {
@@ -155,7 +165,7 @@ describe('attention signals', () => {
     const row = (seen[0] as any).body.session;
     expect(row.sessionId).toBe('sess-1');
     expect(row.hasHistory).toBe(true);
-    expect(row.status).toBe('starting');
+    expect(row.status).toBe('dormant');
   });
 
   it('announcePendingRepoSession is a no-op when the session is not pending', () => {

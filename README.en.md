@@ -40,7 +40,7 @@
 
 ### Design Philosophy
 
-Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Cursor, Gemini, OpenCode, Antigravity, GitHub Copilot) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
+Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Cursor, Gemini, OpenCode, Antigravity, GitHub Copilot, Kimi Code) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
 
 ### Key Advantages
 
@@ -52,7 +52,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | CLI Capabilities | Full runtime (hooks, memory, plan mode, skills, `/` commands) | SDK API subset, missing features must be reimplemented |
 | CLI Upgrades | Zero-adaptation automatic benefit | Must track SDK version changes |
 | Memory / Context | Reuses CLI's built-in memory system, improves as the CLI evolves | Must build custom memory system, duplicating CLI-native capabilities |
-| Multi-CLI Support | 7 CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot) | Tied to a single SDK, cannot switch CLIs |
+| Multi-CLI Support | 8 CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot / Kimi Code) | Tied to a single SDK, cannot switch CLIs |
 | Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
 | Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
 | Multi-Topic Collaboration | A lead bot auto-splits the task, opens multiple topics, and dispatches several bots to work in parallel (coder + reviewer), with a Lark task list as the shared progress board | Usually manual one-by-one assignment, no unified progress board |
@@ -64,7 +64,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 ## Prerequisites
 
 - **Node.js** >= 22
-- **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `opencode`, `hermes`, `seed` (Seed CLI, a Claude Code fork), `relay` (Relay CLI, the new release of Seed), `pi`, `omp` (oh-my-pi, a Pi fork), `copilot` (GitHub Copilot CLI), `traex` (TRAE CLI), `mircli` (Mir CLI), or `agy` (Antigravity) in PATH)
+- **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `genius`, `opencode`, `hermes`, `seed` (Seed CLI, a Claude Code fork), `relay` (Relay CLI, the new release of Seed), `pi`, `omp` (oh-my-pi, a Pi fork), `copilot` (GitHub Copilot CLI), `traex` (TRAE CLI), `mircli` (Mir CLI), `agy` (Antigravity), or `kimi` (Kimi Code) in PATH)
   - **CoCo requires `0.120.32+`**: type-ahead (sending a new message while a turn is still running, parked in CoCo's own message queue) relies on 0.120.32+ behavior; earlier versions may drop or serialize input while busy — upgrade before use
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
 - **CJK fonts** (only needed for screenshot rendering of Chinese text / emoji):
@@ -82,7 +82,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 npm install -g botmux
 ```
 
-> Requires **Node.js ≥ 22**, with at least one AI coding CLI installed and authenticated (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` on your PATH). Installing **tmux** too is recommended (enables session persistence automatically).
+> Requires **Node.js ≥ 22**, with at least one AI coding CLI installed and authenticated (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` / `kimi` on your PATH). Installing **tmux** too is recommended (enables session persistence automatically).
 
 ### 2. Create the App & Configure (`botmux setup`)
 
@@ -262,7 +262,7 @@ Seamlessly connect Botmux to CLI processes already running in tmux — monitor a
 /adopt 0:2.0        # Directly adopt a tmux pane (or pass a past session id to resume-import it)
 ```
 
-- **Import past sessions** — The card's second filter lists this host's past sessions for the CLI (claude-code / seed / codex / traex / antigravity); pick one to rebuild it as a standard Botmux session via `--resume` in its original working dir — no live process required, no need to move it into tmux first
+- **Import past sessions** — The card's second filter lists this host's past sessions for the CLI (claude-code / seed / codex / traex / antigravity / genius); pick one to rebuild it as a standard Botmux session via `--resume` in its original working dir — no live process required, no need to move it into tmux first
 - **Shared mode** — After adopting, iTerm2 and Lark stay in sync: streaming card shows real-time terminal output, Lark chat input is forwarded directly to the terminal
 - **One-click takeover** — Click the "Takeover" button on the streaming card to rebuild the session with `--resume` and convert to a standard Botmux session
 - **Safe disconnect** — Click "Disconnect" to detach Botmux without affecting the original CLI

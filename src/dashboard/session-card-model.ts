@@ -16,13 +16,14 @@ import type {
   StatusDot,
 } from './card-model-types.js';
 
-/** Concrete status values a SessionRow can carry (mirrors `StreamStatus | 'closed'`). */
+/** Concrete status values a SessionRow can carry (mirrors `StreamStatus | 'closed' | 'dormant'`). */
 export type SessionStatus =
   | 'working'
   | 'idle'
   | 'analyzing'
   | 'limited'
   | 'starting'
+  | 'dormant'
   | 'closed';
 
 /** Status-chip filter value — all StreamStatus + 'closed' + 'all'. */
@@ -86,6 +87,8 @@ export function statusToDot(status: string): StatusDot {
       return { tone: 'info', pulse: true, label: 'sessions.status.starting' };
     case 'idle':
       return { tone: 'success', pulse: false, label: 'sessions.status.idle' };
+    case 'dormant':
+      return { tone: 'neutral', pulse: false, label: 'sessions.status.dormant' };
     case 'limited':
       return { tone: 'warning', pulse: false, label: 'sessions.status.limited' };
     case 'closed':
@@ -182,8 +185,9 @@ const STATUS_ORDER: Record<string, number> = {
   analyzing: 1,
   starting: 2,
   idle: 3,
-  limited: 4,
-  closed: 5,
+  dormant: 4,
+  limited: 5,
+  closed: 6,
 };
 
 function statusRank(status: string): number {

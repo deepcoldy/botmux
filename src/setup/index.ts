@@ -3,7 +3,10 @@
  * a fresh machine that just `npm i -g botmux`'d gets tmux + screenshot fonts
  * provisioned without manual setup.
  *
- * - tmux is required: a failed install throws so cli.ts can exit non-zero.
+ * - tmux is required (PTY 退役): when it's GENUINELY ABSENT and a bot wants the
+ *   tmux backend, cli.ts hard-fails `start`/`restart` (non-zero exit, no pm2
+ *   spawn) — see shouldHardFailStartupForMissingTmux. A present-but-broken tmux
+ *   degrades gracefully via the per-session worker gate instead.
  * - fonts are nice-to-have: failures only print a warning.
  * - herdr is on-demand: only runs when at least one bot in bots.json has
  *   `backendType: 'herdr'`. Avoids dragging an extra binary onto every host.
@@ -26,6 +29,37 @@ export interface DependenciesReport {
 }
 
 export { botmuxFontDir } from './ensure-fonts.js';
+
+/**
+ * Decide whether `botmux start`/`restart` should HARD-FAIL (refuse to spawn the
+ * daemon) because tmux is missing. PR#289 Option A.
+ *
+ * Hard-fail ONLY when ALL of:
+ *   - the tmux binary is GENUINELY ABSENT (`tmuxBinaryPresent === false`). This
+ *     is deterministic and implies there is no tmux server — hence no surviving
+ *     session to protect — so refusing to start loses nothing.
+ *   - at least one bot actually wants the tmux backend (`anyBotWantsTmux`). A
+ *     box whose bots all run pty/herdr/zellij doesn't need tmux at all.
+ *   - the operator hasn't opted into the PTY escape hatch (`BACKEND_TYPE=pty`).
+ *
+ * Crucially we do NOT hard-fail when the binary IS present but its functional
+ * probe failed: that probe is the same disposable `tmux new-session` check the
+ * per-session gate retries, and a transient flake there must not block the
+ * daemon from coming up and reattaching live sessions — that would re-introduce
+ * the PR#249 false-negative at startup granularity. Present-but-broken tmux
+ * degrades gracefully via the per-session worker gate (an actionable card).
+ */
+export function shouldHardFailStartupForMissingTmux(opts: {
+  tmuxInstalled: boolean;
+  tmuxBinaryPresent: boolean;
+  anyBotWantsTmux: boolean;
+  ptyOptIn: boolean;
+}): boolean {
+  if (opts.ptyOptIn) return false;
+  if (opts.tmuxInstalled) return false;
+  if (opts.tmuxBinaryPresent) return false;
+  return opts.anyBotWantsTmux;
+}
 
 const BOTS_JSON_FILE = join(homedir(), '.botmux', 'bots.json');
 
@@ -58,18 +92,30 @@ function herdrCliIds(): CliId[] {
 export async function ensureDependencies(): Promise<DependenciesReport> {
   const platform = detectPlatform();
 
-  // tmux: nice-to-have (enables /adopt + multi-pane Web terminal). Daemon
-  // still works on PTY backend without it, so failure is a warning, not fatal.
+  // tmux: REQUIRED (PTY 退役). PTY is no longer an automatic fallback, so a
+  // host without functional tmux can't start sessions unless the operator
+  // explicitly opts into the PTY escape hatch (BACKEND_TYPE=pty). Surface this
+  // loudly instead of pretending "常规对话不受影响" — that was true under the
+  // old silent-fallback behavior and is now misleading.
   const tmux = await ensureTmux(platform);
+  const ptyOptIn = (process.env.BACKEND_TYPE ?? '').toLowerCase() === 'pty';
   if (tmux.installed) {
     if (!tmux.freshInstall) console.log(`✓ tmux ${tmux.version} (existing)`);
-  } else {
+  } else if (ptyOptIn) {
     console.warn('');
-    console.warn('⚠️  tmux 不可用，已退回到 PTY backend');
+    console.warn('⚠️  tmux 不可用，但已显式设置 BACKEND_TYPE=pty —— 将使用 PTY 后端兜底。');
     console.warn(`    原因：${tmux.reason ?? '未知'}`);
-    if (tmux.manualCommand) console.warn(`    手动尝试：${tmux.manualCommand}`);
-    console.warn('    影响：/adopt（接管已有 CLI 会话）和多人 Web 终端不可用；常规对话不受影响。');
+    console.warn('    注意：PTY 会话不跨 daemon 重启存活，/adopt 与多人 Web 终端不可用。');
     console.warn('');
+  } else {
+    console.error('');
+    console.error('❌  tmux 不可用，botmux 会话将无法启动。');
+    console.error(`    原因：${tmux.reason ?? '未知'}`);
+    if (tmux.manualCommand) console.error(`    请安装：${tmux.manualCommand}`);
+    console.error('    安装好 tmux 后重试即可。');
+    console.error('    （如确需在没有 tmux 的环境运行，可显式设置环境变量 BACKEND_TYPE=pty 用 PTY 后端兜底，');
+    console.error('      但 PTY 会话不跨 daemon 重启存活，仅作应急。）');
+    console.error('');
   }
 
   // Fonts second — best-effort.

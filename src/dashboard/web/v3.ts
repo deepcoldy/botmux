@@ -60,25 +60,20 @@ function termSig(node: RunNodeView): string {
   return `${wt?.status ?? '-'}|${wt?.webPort ?? '-'}|${node.hasPtyLog ? '1' : '0'}`;
 }
 
-export function renderV3RunsPage(root: HTMLElement): () => void {
-  const m = location.hash.match(/^#\/workflows\/([^?#]+)/);
-  if (m) return renderV3DetailPage(root, decodeURIComponent(m[1]!));
-  return renderV3ListPage(root);
+export function v3RunIdFromHash(hash = location.hash): string | null {
+  const m = hash.match(/^#\/workflows\/([^?#]+)/);
+  return m ? decodeURIComponent(m[1]!) : null;
+}
+
+export function wireV3RunsPage(root: HTMLElement): () => void {
+  const runId = v3RunIdFromHash();
+  if (runId) return wireV3DetailPage(root, runId);
+  return wireV3ListPage(root);
 }
 
 // ─── List ───────────────────────────────────────────────────────────────────
 
-function renderV3ListPage(root: HTMLElement): () => void {
-  root.innerHTML = `
-    <div class="page-head">
-      <h1>工作流</h1>
-      <p class="muted">LLM 编排的 workflow 运行 — DAG 图 + 每节点终端</p>
-    </div>
-    <table class="data-table">
-      <thead><tr><th>Run</th><th>状态</th><th>节点数</th></tr></thead>
-      <tbody id="v3-tbody"></tbody>
-    </table>
-    <div id="v3-empty" class="muted" hidden style="padding:1rem">暂无工作流运行（用 <code>/workflow new</code> 发起一个）</div>`;
+function wireV3ListPage(root: HTMLElement): () => void {
   const tbody = root.querySelector<HTMLElement>('#v3-tbody')!;
   const empty = root.querySelector<HTMLElement>('#v3-empty')!;
   let timer: number | null = null;
@@ -88,6 +83,7 @@ function renderV3ListPage(root: HTMLElement): () => void {
     if (disposed || document.hidden) return;
     try {
       const r = await fetch('/api/v3/runs');
+      if (disposed) return;
       const body = r.ok ? ((await r.json()) as { runs: Array<{ runId: string; runStatus: string; nodeCount: number }> }) : { runs: [] };
       if (disposed) return;
       const runs = body.runs ?? [];
@@ -131,32 +127,7 @@ function nodeH(n: RunNodeView): number {
   return n.isLoop ? LOOP_H : PLAIN_H;
 }
 
-function renderV3DetailPage(root: HTMLElement, runId: string): () => void {
-  root.innerHTML = `
-    <div class="page-head">
-      <a href="#/workflows" class="btn-link">← 工作流</a>
-      <h1 class="v3r-title">${esc(runId)}</h1>
-      <span id="v3-runstatus" class="v3r-pill"></span>
-    </div>
-    <div class="v3r-wrap">
-      <div class="v3r-graph-card">
-        <div id="v3-graph" class="v3r-graph"></div>
-        <div class="v3r-legend">
-          <span class="lg st-pending">待机</span>
-          <span class="lg st-running">运行中</span>
-          <span class="lg st-gateWaiting">等审批</span>
-          <span class="lg st-done">完成</span>
-          <span class="lg st-skipped">已跳过</span>
-          <span class="lg st-cancelled">已取消</span>
-          <span class="lg st-blocked">受阻</span>
-          <span class="lg st-failed">失败</span>
-          <span class="lg lg-loop">⟳ 循环容器</span>
-        </div>
-      </div>
-      <div id="v3-node-panel" class="v3r-panel">
-        <p class="muted">点一个节点看详情与终端</p>
-      </div>
-    </div>`;
+function wireV3DetailPage(root: HTMLElement, runId: string): () => void {
   const graphEl = root.querySelector<HTMLElement>('#v3-graph')!;
   const panelEl = root.querySelector<HTMLElement>('#v3-node-panel')!;
   const runStatusEl = root.querySelector<HTMLElement>('#v3-runstatus')!;
@@ -510,6 +481,7 @@ function renderV3DetailPage(root: HTMLElement, runId: string): () => void {
     if (disposed || document.hidden) return;
     try {
       const r = await fetch(`/api/v3/runs/${encodeURIComponent(runId)}`);
+      if (disposed) return;
       if (!r.ok) {
         // Legacy fallback: old v2 detail links are #/workflows/<v2-run-id>, a URL
         // that now routes to v3 detail. If this id is actually a v2 run, bounce to
@@ -518,7 +490,8 @@ function renderV3DetailPage(root: HTMLElement, runId: string): () => void {
           triedV2Fallback = true;
           try {
             const v2 = await fetch(`/api/workflows/runs/${encodeURIComponent(runId)}/snapshot`);
-            if (v2.ok && !disposed) {
+            if (disposed) return;
+            if (v2.ok) {
               window.location.replace(legacyWorkflowDetailHash(runId, location.hash.split('?')[1]));
               return;
             }

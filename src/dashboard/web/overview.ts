@@ -21,7 +21,7 @@ export function __setGroupsSnapshotForTest(snapshot: { chats: any[]; bots: any[]
   groupsSnapshot = snapshot;
 }
 
-async function loadGroupsSnapshot(): Promise<void> {
+export async function loadGroupsSnapshot(): Promise<void> {
   try {
     const r = await fetch('/api/groups');
     if (!r.ok) return;
@@ -31,7 +31,7 @@ async function loadGroupsSnapshot(): Promise<void> {
   }
 }
 
-type BotCard = {
+export type BotCard = {
   botName: string;
   larkAppId?: string;
   botAvatarUrl?: string;
@@ -45,6 +45,7 @@ type BotCard = {
 };
 
 const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
+const IDLE_STATUSES = new Set(['idle', 'dormant']);
 
 /** 把会话按 bot 聚合成"数字员工"卡片数据；在线 bot 没会话也要出现（待命）。
  *  以 larkAppId 为身份键（部分会话缺 botName，按名字聚会裂成两张卡）；
@@ -110,6 +111,17 @@ const TEAM_EXPAND_KEY = 'botmux.overview.teamExpanded';
 const TEAM_CARD_MIN_W = 230;
 const TEAM_GRID_GAP = 13;
 const TEAM_COLLAPSED_ROWS = 2;
+
+function cssToken(value: unknown): string {
+  return String(value ?? 'unknown').toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+}
+
+function sessionStatusText(status: unknown): string {
+  const raw = String(status ?? 'unknown');
+  const key = `sessions.status.${raw}`;
+  const label = t(key);
+  return label === key ? raw : label;
+}
 
 function collapsedCardCount(gridEl: HTMLElement): number {
   const width = gridEl.clientWidth;
@@ -180,13 +192,14 @@ function attentionCardHtml(s: any): string {
 
 function activeSessionHtml(s: any): string {
   const botName = botDisplayName(s);
+  const status = String(s.status ?? 'unknown');
   return `<li class="sess-row">
     ${botAvatarHtml({ name: botName, larkAppId: s.larkAppId, size: 'sm' })}
     <div class="sess-tx">
       <b>${escapeHtml((stripMentionPrefix(s.title) || s.sessionId).slice(0, 64))}</b>
       <span>${escapeHtml(botName)} · ${escapeHtml(chatDisplayTitle(s) ?? s.cliId ?? 'unknown')} · ${relTime(s.lastMessageAt)}</span>
     </div>
-    <span class="status status-${escapeHtml(s.status ?? 'unknown')}">${escapeHtml(s.status ?? 'unknown')}</span>
+    <span class="status status-${escapeHtml(cssToken(status))}">${escapeHtml(sessionStatusText(status))}</span>
   </li>`;
 }
 
@@ -324,7 +337,7 @@ export async function renderOverviewPage(root: HTMLElement) {
       : `<div class="qcard qcard-empty">${t('overview.noAttention')}</div>`;
 
     const recent = active
-      .filter(s => BUSY_STATUSES.has(s.status) || s.status === 'idle')
+      .filter(s => BUSY_STATUSES.has(s.status) || IDLE_STATUSES.has(s.status))
       .sort((a, b) => Number(b.lastMessageAt ?? 0) - Number(a.lastMessageAt ?? 0))
       .slice(0, 7);
     sessionsEl.innerHTML = recent.length

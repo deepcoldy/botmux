@@ -1,6 +1,5 @@
 import * as pty from 'node-pty';
 import { execSync, execFileSync } from 'node:child_process';
-import { accessSync, constants as fsConstants } from 'node:fs';
 import { basename } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
@@ -8,6 +7,7 @@ import { probeTmuxFunctional, tmuxEnv } from '../../setup/ensure-tmux.js';
 import { REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
+import { isExecutable } from '../../utils/executable.js';
 
 /**
  * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
@@ -579,6 +579,11 @@ const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_LARK_APP_ID',
   'BOTMUX_ROOT_MESSAGE_ID',
   'BOTMUX_TURN_ID',
+  // Experimental Lark chat bot discovery. The daemon injects a canonical
+  // true/false value so `botmux bots list` inside long-lived panes matches the
+  // daemon's `<available_bots>` behavior instead of reading stale rcfile/tmux env.
+  'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
+  'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
   // Claude Code 2.1.x resume-summary 菜单的抑制阈值（issue #62）。worker 为
   // claude-code 注入一个极大值绕过菜单；只有进了这条白名单才会被透传进 tmux pane。
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
@@ -706,7 +711,11 @@ function configureTmuxSessionOptions(sessionName: string): void {
   try {
     const t = shellescape(sessionName);
     const env = tmuxEnv();
-    execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore', env });
+    // status bar ON — see TmuxPipeBackend.applySessionOptions for the rationale:
+    // shows the window list to a user who manually `tmux attach`es, and is a
+    // client-level overlay that never enters the pane stream the card / web
+    // terminal capture, so it has zero effect on them.
+    execSync(`tmux set-option -t ${t} status on`, { stdio: 'ignore', env });
     execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
     // set-clipboard is a server option — enable OSC 52 passthrough for web copy
     execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
@@ -727,15 +736,6 @@ function classifyShell(path: string): ShellKind | null {
   if (base === 'zsh') return 'zsh';
   if (base === 'sh' || base === 'dash' || base === 'ash') return 'sh';
   return null;
-}
-
-function isExecutable(path: string): boolean {
-  try {
-    accessSync(path, fsConstants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
