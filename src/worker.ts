@@ -26,6 +26,7 @@ import {
   buildReadDenyPaths,
   buildSeatbeltProfile,
   isolatedPaneReattachSafe,
+  sendCredFilePath,
   type ReadIsolationContext,
 } from './adapters/cli/read-isolation.js';
 import { killPersistentSession, type PersistentBackendType } from './core/persistent-backend.js';
@@ -4293,6 +4294,20 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
           p.startsWith('~') ? join(homedir(), p.slice(1)) : p,
         ),
       };
+      // Write this bot's OWN send-credential to a file the isolated CLI can read
+      // (its own; siblings' are denied). `botmux send` reads the secret from here
+      // instead of bots.json — so the secret never travels via env/argv (no
+      // cross-bot `ps aux` leak) and the CLI never needs to escape the sandbox.
+      try {
+        const credPath = sendCredFilePath(sessionDataDir, cfg.larkAppId);
+        writeFileSync(
+          credPath,
+          JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand }),
+          { mode: 0o600 },
+        );
+      } catch (e) {
+        log(`[read-isolation] WARN could not write send-cred file: ${(e as Error).message}`);
+      }
     }
   }
   const args = cliAdapter.buildArgs({

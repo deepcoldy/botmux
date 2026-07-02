@@ -83,6 +83,15 @@ export function defaultCredentialDenyPaths(homeDir: string): string[] {
   ];
 }
 
+/** Path of the per-bot `botmux send` credential file the worker writes under read
+ *  isolation. Lives directly in SESSION_DATA_DIR (not a denied subdir) so the bot
+ *  can read its OWN; {@link buildReadDenyPaths} denies every OTHER bot's. The
+ *  secret reaches `botmux send` only through this file — never env/argv — so it is
+ *  not exposed to sibling bots via `ps aux` / `tmux show-environment`. */
+export function sendCredFilePath(sessionDataDir: string, appId: string): string {
+  return `${sessionDataDir.replace(/\/+$/, '')}/.send-cred-${appId}`;
+}
+
 /** The de-duplicated list of absolute paths this bot must NOT be able to read.
  *
  *  Surgical, NOT a blanket deny of SESSION_DATA_DIR: `botmux send` (run by the
@@ -116,6 +125,11 @@ export function buildReadDenyPaths(ctx: ReadIsolationContext): string[] {
     `${sd}/sessions.json`,
     // Other bots' session metadata (own sessions-<self>.json stays readable)
     ...ctx.otherAppIds.map((id) => `${sd}/sessions-${id}.json`),
+    // Other bots' `botmux send` credential files (mirror sessions-<other>): the
+    // worker writes each isolated bot's OWN secret here so `botmux send` can auth
+    // WITHOUT reading bots.json and WITHOUT the secret ever touching env/argv
+    // (which `ps aux` would leak cross-bot). Own file stays readable; deny others'.
+    ...ctx.otherAppIds.map((id) => sendCredFilePath(sd, id)),
     // Per-bot extras (normalized; relative/`..` dropped, not silently kept)
     ...(ctx.extraDenyPaths ?? []).map(normalizeIsolationPath),
   ];

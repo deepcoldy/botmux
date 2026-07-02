@@ -3416,6 +3416,9 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
 }
 
 async function cmdHistory(rest: string[]): Promise<void> {
+  // Read isolation: register this bot from its cred file so the Lark client is
+  // available without reading the denied bots.json (same as cmdSend).
+  await registerSelfFromCredFile();
   // Clamp to a positive count: the underlying list helpers treat pageSize <= 0
   // (and non-finite) as "unlimited / read the whole chat", which is reserved for
   // internal callers. A stray `--limit 0` or a typo like `--limit abc` (→ NaN)
@@ -3677,6 +3680,33 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
   process.exit(1);
 }
 
+/** Under read isolation the CLI is denied bots.json, so `loadBotConfigs()` reads
+ *  nothing. The worker instead wrote THIS bot's own secret to a per-bot cred file
+ *  (its own is readable; siblings' are denied). Register just this bot from that
+ *  file so send/history find the Lark client WITHOUT reading bots.json and WITHOUT
+ *  the secret ever crossing env/argv (no cross-bot `ps aux` leak). No file /
+ *  non-isolated session → no-op, falls through to bots.json unchanged. */
+async function registerSelfFromCredFile(): Promise<void> {
+  const appId = process.env.BOTMUX_LARK_APP_ID;
+  const sd = process.env.SESSION_DATA_DIR;
+  if (!appId || !sd) return;
+  const { sendCredFilePath } = await import('./adapters/cli/read-isolation.js');
+  let cred: { larkAppSecret?: string; brand?: string };
+  try {
+    cred = JSON.parse(readFileSync(sendCredFilePath(sd, appId), 'utf-8'));
+  } catch {
+    return; // no cred file → not isolated (or first layer supplies creds elsewhere)
+  }
+  if (!cred.larkAppSecret) return;
+  const { registerBot } = await import('./bot-registry.js');
+  registerBot({
+    larkAppId: appId,
+    larkAppSecret: cred.larkAppSecret,
+    cliId: 'claude-code',
+    brand: cred.brand as 'feishu' | 'lark' | undefined,
+  } as import('./bot-registry.js').BotConfig);
+}
+
 async function cmdSend(rest: string[]): Promise<void> {
   // Sandbox relay: a file-sandboxed session has no creds/bots.json, so route
   // the send through the daemon-side outbox instead of delivering directly.
@@ -3698,20 +3728,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
-  // Read isolation: the sandboxed CLI is denied bots.json, so the usual
-  // `loadBotConfigs()` (which reads it) throws and registers nothing. When the
-  // worker injected this bot's OWN secret, register just this bot from env so
-  // the send path finds its Lark client without reading bots.json. Non-isolated
-  // sessions have no such env → behavior unchanged (falls through to bots.json).
-  if (process.env.BOTMUX_READ_ISOLATION === '1' && process.env.BOTMUX_LARK_APP_SECRET && process.env.BOTMUX_LARK_APP_ID) {
-    const { registerBot } = await import('./bot-registry.js');
-    registerBot({
-      larkAppId: process.env.BOTMUX_LARK_APP_ID,
-      larkAppSecret: process.env.BOTMUX_LARK_APP_SECRET,
-      cliId: 'claude-code',
-      brand: process.env.BOTMUX_LARK_BRAND as 'feishu' | 'lark' | undefined,
-    } as import('./bot-registry.js').BotConfig);
-  }
+  // Read isolation: the sandboxed CLI is denied bots.json → register this bot
+  // from its own worker-written cred file instead (see registerSelfFromCredFile).
+  await registerSelfFromCredFile();
   const sessionIdArg = argValue(rest, '--session-id');
   const images = argValues(rest, '--image', '--images');
   const files = argValues(rest, '--file', '--files');
