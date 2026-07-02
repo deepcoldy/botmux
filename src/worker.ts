@@ -4105,17 +4105,22 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         ? ZellijBackend.hasSession(persistentSessionName)
         : HerdrBackend.hasSession(persistentSessionName);
     if (paneLive) {
-      let markerBootId: string | null = null;
+      let marker: string | null = null;
       try {
-        markerBootId = readFileSync(
+        marker = readFileSync(
           join(process.env.SESSION_DATA_DIR ?? '', 'read-isolation', `${cfg.sessionId}.boot`),
           'utf-8',
         );
-      } catch { /* no marker → treat as stale */ }
-      if (isolatedPaneReattachSafe(markerBootId, cfg.daemonBootId)) {
-        log(`[read-isolation] reattaching persistent pane spawned isolated this daemon lifetime (${cfg.sessionId})`);
+      } catch { /* no marker → pane was spawned WITHOUT isolation */ }
+      if (isolatedPaneReattachSafe(marker)) {
+        // Pane was spawned isolated (marker present) → still confined on the running
+        // process even across daemon restarts → warm reattach is safe and preserves
+        // resume/context + tmux idle-suspend.
+        log(`[read-isolation] reattaching isolated persistent pane (${cfg.sessionId})`);
       } else {
-        log(`[read-isolation] stale/foreign persistent pane for ${cfg.sessionId} (boot-id marker mismatch) — killing + cold-spawning isolated`);
+        // No marker → pane predates isolation (or an old build) → could be running
+        // UNISOLATED → kill it so the probe below cold-spawns fresh isolated.
+        log(`[read-isolation] unmarked persistent pane for ${cfg.sessionId} (not spawned isolated) — killing + cold-spawning isolated`);
         try {
           killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
         } catch (e) {

@@ -104,16 +104,16 @@ describe('buildReadDenyPaths', () => {
     expect(claude).toContain('/Users/bot/.codex/sessions');
   });
 
-  it('isolatedPaneReattachSafe: only trusts a pane marked by THIS daemon lifetime', () => {
-    // Same boot id → pane was spawned isolated this lifetime → safe to reattach.
-    expect(isolatedPaneReattachSafe('boot-abc', 'boot-abc')).toBe(true);
-    // Different boot id → pane survived from a prior daemon (may be unisolated) → unsafe.
-    expect(isolatedPaneReattachSafe('boot-old', 'boot-new')).toBe(false);
-    // No marker → unknown provenance → unsafe (kill + cold-spawn).
-    expect(isolatedPaneReattachSafe(null, 'boot-new')).toBe(false);
-    // Empty/blank marker or boot id never counts as a match.
-    expect(isolatedPaneReattachSafe('', '')).toBe(false);
-    expect(isolatedPaneReattachSafe('  ', 'boot-new')).toBe(false);
+  it('isolatedPaneReattachSafe: trusts any pane that carries an isolation marker', () => {
+    // Marker present → pane was spawned isolated → still confined across daemon
+    // restarts → safe warm reattach (preserves resume + tmux idle-suspend).
+    expect(isolatedPaneReattachSafe('boot-abc')).toBe(true);
+    expect(isolatedPaneReattachSafe('any-old-boot-id')).toBe(true);
+    // No / blank marker → pane was NOT spawned isolated → unsafe (kill + cold-spawn).
+    expect(isolatedPaneReattachSafe(null)).toBe(false);
+    expect(isolatedPaneReattachSafe(undefined)).toBe(false);
+    expect(isolatedPaneReattachSafe('')).toBe(false);
+    expect(isolatedPaneReattachSafe('   ')).toBe(false);
   });
 
   it('never denies the running CLI own auth (ownAuthPaths) — else the wrapped CLI crashes', () => {

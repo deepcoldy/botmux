@@ -273,26 +273,23 @@ export function buildLinuxReadIsolationWrap(_denyPaths: string[]): never {
 }
 
 /**
- * Decide whether a persistent pane (tmux/zellij/herdr) may be reattached for an
- * isolated bot. Isolation is injected only at CLI *spawn* time (Claude
- * `--settings` / the Seatbelt wrapper), so reattaching a pane whose provenance we
- * can't vouch for risks resuming an UNISOLATED CLI.
+ * Decide whether a live persistent pane (tmux/zellij/herdr) may be reattached for
+ * an isolated bot. Isolation is injected at CLI *spawn* time (Claude `--settings`
+ * / the Seatbelt wrapper) and lives on the RUNNING process, so a pane that was
+ * spawned isolated STAYS isolated for its whole lifetime — including across daemon
+ * restarts (the sandbox is on the CLI process, independent of the daemon).
  *
- * We stamp a boot-id marker when we spawn an isolated CLI. A reattach is safe iff
- * the marker matches the CURRENT daemon lifetime's boot id:
- *  - suspend→resume within one daemon lifetime → same boot id → safe reattach
- *    (the still-running pane was spawned isolated by us, keeps its sandbox).
- *  - daemon restart → new boot id → stale marker (or none) → NOT safe; caller
- *    kills the pane and cold-spawns fresh isolated instead.
- * Blank marker/boot id never matches (defensive).
+ * We stamp a marker file when we spawn an isolated CLI. A reattach is safe iff that
+ * marker EXISTS: its presence means "this pane was spawned isolated", so warm
+ * reattach (preserving resume/context + tmux idle-suspend) is safe regardless of
+ * which daemon lifetime spawned it. A pane with NO marker was spawned WITHOUT
+ * isolation (before the feature was enabled, or by an old build) → NOT safe; the
+ * caller kills it and cold-spawns fresh isolated instead. (The marker's content is
+ * a daemon boot id, kept only for debugging — it is deliberately NOT compared, as
+ * comparing it would wrongly kill isolated panes on every restart and drop resume.)
  */
-export function isolatedPaneReattachSafe(
-  markerBootId: string | null | undefined,
-  currentBootId: string | null | undefined,
-): boolean {
-  const m = (markerBootId ?? '').trim();
-  const c = (currentBootId ?? '').trim();
-  return m.length > 0 && m === c;
+export function isolatedPaneReattachSafe(markerContent: string | null | undefined): boolean {
+  return (markerContent ?? '').trim().length > 0;
 }
 
 /** Extract the semver from `claude --version` output (e.g. "2.1.197 (Claude Code)"). */
