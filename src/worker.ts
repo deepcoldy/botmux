@@ -30,6 +30,7 @@ import {
   botHomePath,
   buildV2DenyPaths,
   buildV2AllowPaths,
+  buildV2FinalDenyPaths,
   type ReadIsolationContext,
 } from './adapters/cli/read-isolation.js';
 import { killPersistentSession, type PersistentBackendType } from './core/persistent-backend.js';
@@ -4604,12 +4605,25 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // plugin + per-bot skill plugin/readonly roots): these live under BOTMUX_HOME but
     // hold only skill files (no secrets, all bots read them), so re-allow them or the
     // agent loses its `botmux send`/skill toolbelt. Delivered via `--plugin-dir`.
-    const allowPaths = [
-      ...buildV2AllowPaths(v2ctx),
+    // HARDENING (review M2): only re-allow skill paths that RESOLVE UNDER an expected
+    // runtime root (the shared plugin dir, or SESSION_DATA_DIR/runtime-skills) — a
+    // poisoned/mis-generated skillPluginDir must NOT be able to re-open an arbitrary
+    // sensitive subtree of BOTMUX_HOME via a last-match allow.
+    const skillRoots = [join(homedir(), '.botmux', 'claude-plugin'), join(process.env.SESSION_DATA_DIR!, 'runtime-skills')].map(canonical);
+    const underSkillRoot = (p: string) => { const c = canonical(p); return skillRoots.some((r) => c === r || c.startsWith(r + '/')); };
+    const skillAllows = [
       join(homedir(), '.botmux', 'claude-plugin'),
       ...(cfg.skillPluginDir ? [cfg.skillPluginDir] : []),
       ...(cfg.skillReadonlyRoots ?? []),
-    ].map(canonical);
+    ].filter((p) => {
+      if (underSkillRoot(p)) return true;
+      log(`[read-isolation] WARN dropping skill allow-path outside expected roots: ${p}`);
+      return false;
+    });
+    const allowPaths = [...buildV2AllowPaths(v2ctx), ...skillAllows].map(canonical);
+    // Admin readDenyExtraPaths as a FINAL deny (after allows) so it holds even under
+    // the bot's own re-allowed BOT_HOME (review M3).
+    const finalDenyPaths = buildV2FinalDenyPaths(v2ctx).map(canonical);
     if (process.platform === 'darwin') {
       if (!locateOnPath('sandbox-exec')) {
         throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: sandbox-exec not found`);
@@ -4617,7 +4631,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       const profileDir = join(process.env.SESSION_DATA_DIR!, 'read-isolation');
       mkdirSync(profileDir, { recursive: true });
       const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
-      writeFileSync(profilePath, buildSeatbeltProfile(denyPaths, allowPaths), { mode: 0o600 });
+      writeFileSync(profilePath, buildSeatbeltProfile(denyPaths, allowPaths, finalDenyPaths), { mode: 0o600 });
       seatbeltProfilePath = profilePath;
       spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
       spawnBin = 'sandbox-exec';

@@ -12,6 +12,8 @@ import {
   botHomePath,
   buildV2DenyPaths,
   buildV2AllowPaths,
+  buildV2FinalDenyPaths,
+  assertSafeAppId,
   type ReadIsolationContext,
 } from '../src/adapters/cli/read-isolation.js';
 
@@ -300,6 +302,38 @@ describe('v2 BOTMUX_HOME model (buildV2DenyPaths / buildV2AllowPaths)', () => {
     const allowIdx = prof.indexOf('(allow file-read* (subpath "/Users/bot/.botmux/bots/cli_self"))');
     expect(denyIdx).toBeGreaterThan(-1);
     expect(allowIdx).toBeGreaterThan(denyIdx);
+  });
+
+  it('DENY covers the broadened secret set — keychain, gnupg, gcloud, 1Password, netrc (review M1)', () => {
+    const d = buildV2DenyPaths(v2());
+    expect(d).toContain('/Users/bot/Library/Keychains');
+    expect(d).toContain('/Users/bot/.gnupg');
+    expect(d).toContain('/Users/bot/.netrc');
+    expect(d).toContain('/Users/bot/.config/gcloud');
+    expect(d).toContain('/Users/bot/.config/1Password');
+    expect(d).toContain('/Users/bot/.password-store');
+  });
+
+  it('extraDenyPaths are NOT in the main deny — they are a FINAL deny that wins over BOT_HOME allow (review M3)', () => {
+    const extra = '/Users/bot/.botmux/bots/cli_self/claude/.credentials.json';
+    const ctx = v2({ extraDenyPaths: [extra] });
+    expect(buildV2DenyPaths(ctx)).not.toContain(extra);          // not in the up-front deny
+    expect(buildV2FinalDenyPaths(ctx)).toContain(extra);          // is a final deny
+    // In the profile the final deny comes AFTER the BOT_HOME allow → it wins.
+    const prof = buildSeatbeltProfile(buildV2DenyPaths(ctx), buildV2AllowPaths(ctx), buildV2FinalDenyPaths(ctx));
+    const allowIdx = prof.indexOf('(allow file-read* (subpath "/Users/bot/.botmux/bots/cli_self"))');
+    const finalIdx = prof.lastIndexOf(`(deny file-read* (subpath "${extra}"))`);
+    expect(finalIdx).toBeGreaterThan(allowIdx);
+  });
+
+  it('assertSafeAppId rejects path-traversal / separators, accepts real Feishu ids (review L2)', () => {
+    expect(assertSafeAppId('cli_aab4eaea67395bc9')).toBe('cli_aab4eaea67395bc9');
+    expect(() => assertSafeAppId('../evil')).toThrow();
+    expect(() => assertSafeAppId('a/b')).toThrow();
+    expect(() => assertSafeAppId('')).toThrow();
+    // botHomePath / buildV2AllowPaths must also reject an unsafe id
+    expect(() => botHomePath('/Users/bot/.botmux', '../x')).toThrow();
+    expect(() => buildV2AllowPaths(v2({ currentAppId: 'a/../b' }))).toThrow();
   });
 });
 

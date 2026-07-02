@@ -105,11 +105,23 @@ export function sendCredFilePath(sessionDataDir: string, appId: string): string 
 // onto another bot's data (the v1 F1 class of bug).
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** A Feishu app id is safe to use as a path segment. Enforced because appId is
+ *  concatenated into BOT_HOME / sessions-<appId>.json / .send-cred-<appId> paths and
+ *  into Seatbelt allow rules — a `/` or `..` (from a hand-edited bots.json) would
+ *  traverse out of BOTMUX_HOME or mis-scope a carve-out. Real Feishu app ids match. */
+const SAFE_APP_ID = /^[A-Za-z0-9._-]+$/;
+export function assertSafeAppId(appId: string): string {
+  if (!SAFE_APP_ID.test(appId)) {
+    throw new Error(`[read-isolation] unsafe app id used as path segment: ${JSON.stringify(appId)}`);
+  }
+  return appId;
+}
+
 /** A bot's private home under BOTMUX_HOME: `<botmuxHome>/bots/<appId>`. Holds the
  *  bot's redirected CLI config/transcripts/memory (CLAUDE_CONFIG_DIR=<here>/claude,
  *  CODEX_HOME=<here>/codex). The ONLY thing under BOTMUX_HOME v2 re-allows. */
 export function botHomePath(botmuxHome: string, appId: string): string {
-  return `${botmuxHome.replace(/\/+$/, '')}/bots/${appId}`;
+  return `${botmuxHome.replace(/\/+$/, '')}/bots/${assertSafeAppId(appId)}`;
 }
 
 export interface V2IsolationContext {
@@ -132,6 +144,9 @@ export interface V2IsolationContext {
  *  The bot's OWN data is re-opened by {@link buildV2AllowPaths}. */
 export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
   const h = ctx.homeDir.replace(/\/+$/, '');
+  // NOTE: extraDenyPaths are NOT included here — they must be emitted as a FINAL deny
+  // (after the allow carve-outs) or a BOT_HOME allow would override an admin deny of a
+  // path under it. See buildV2FinalDenyPaths + buildSeatbeltProfile's finalDeny.
   return dedupe(
     [
       ctx.botmuxHome,
@@ -139,20 +154,41 @@ export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
       `${h}/.codex`,
       `${h}/.lark-cli`,
       `${h}/.lark-cli-bots`,
-      // System credentials that live OUTSIDE BOTMUX_HOME (a fixed, known set).
+      // System credential / secret stores OUTSIDE BOTMUX_HOME (a fixed, known set —
+      // everything outside BOTMUX_HOME is open by default, so this list must be broad).
       `${h}/.ssh`,
       `${h}/.aws`,
+      `${h}/.azure`,
+      `${h}/.gnupg`,
+      `${h}/.netrc`,
       `${h}/.config/gh`,
       `${h}/.config/glab-cli`,
+      `${h}/.config/gcloud`,
+      `${h}/.config/op`,          // 1Password CLI
+      `${h}/.config/1Password`,
+      `${h}/.1password`,
+      `${h}/.password-store`,     // pass
       `${h}/.git-credentials`,
       `${h}/.npmrc`,
+      `${h}/.pypirc`,
       `${h}/.docker/config.json`,
       `${h}/.kube`,
-      ...(ctx.extraDenyPaths ?? []),
+      // macOS Keychain files — the login keychain holds the Claude/codex OAuth token
+      // and everything else. (Note: the `security` CLI reaches the keychain via securityd
+      // over mach, which a file-read Seatbelt does NOT cover — a known residual surface.)
+      `${h}/Library/Keychains`,
     ]
       .map(normalizeIsolationPath)
       .filter((p): p is string => !!p),
   );
+}
+
+/** Admin-supplied `readDenyExtraPaths`, emitted as a FINAL deny AFTER all allow
+ *  carve-outs so they win even when they target a path under the bot's own BOT_HOME
+ *  (Seatbelt applies the last matching rule). Kept separate from {@link buildV2DenyPaths}
+ *  for exactly that ordering guarantee. */
+export function buildV2FinalDenyPaths(ctx: V2IsolationContext): string[] {
+  return dedupe((ctx.extraDenyPaths ?? []).map(normalizeIsolationPath).filter((p): p is string => !!p));
 }
 
 /** v2 ALLOW carve-outs, re-opened AFTER the denies (Seatbelt last-match wins): the
@@ -163,12 +199,13 @@ export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
 export function buildV2AllowPaths(ctx: V2IsolationContext): string[] {
   const h = ctx.homeDir.replace(/\/+$/, '');
   const sd = ctx.sessionDataDir.replace(/\/+$/, '');
+  const appId = assertSafeAppId(ctx.currentAppId);
   return dedupe(
     [
-      botHomePath(ctx.botmuxHome, ctx.currentAppId),
-      `${sd}/sessions-${ctx.currentAppId}.json`,
-      sendCredFilePath(sd, ctx.currentAppId),
-      `${h}/.lark-cli-bots/${ctx.currentAppId}`,
+      botHomePath(ctx.botmuxHome, appId),
+      `${sd}/sessions-${appId}.json`,
+      sendCredFilePath(sd, appId),
+      `${h}/.lark-cli-bots/${appId}`,
     ]
       .map(normalizeIsolationPath)
       .filter((p): p is string => !!p),
@@ -336,12 +373,15 @@ export function evaluateReadIsolationGate(opts: {
  * Verified: reads of denied paths fail EPERM; carved-out subpaths read normally; the
  * wrapped CLI (which bypasses its OWN sandbox — nested Seatbelt would hang) runs fine.
  */
-export function buildSeatbeltProfile(denyPaths: string[], allowPaths: string[] = []): string {
+export function buildSeatbeltProfile(denyPaths: string[], allowPaths: string[] = [], finalDenyPaths: string[] = []): string {
   const esc = (p: string) => p.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   const lines = ['(version 1)', '(allow default)'];
   for (const p of denyPaths) lines.push(`(deny file-read* (subpath "${esc(p)}"))`);
-  // Carve-outs LAST so they override the broader denies above.
+  // Carve-outs override the broad denies above (Seatbelt applies the LAST match).
   for (const p of allowPaths) lines.push(`(allow file-read* (subpath "${esc(p)}"))`);
+  // FINAL denies win over the carve-outs — admin `readDenyExtraPaths` must hold even
+  // for a path that falls under the bot's own re-allowed BOT_HOME.
+  for (const p of finalDenyPaths) lines.push(`(deny file-read* (subpath "${esc(p)}"))`);
   return lines.join('\n') + '\n';
 }
 

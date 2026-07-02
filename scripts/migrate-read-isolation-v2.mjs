@@ -23,7 +23,11 @@ const BOTMUX_HOME = join(HOME, '.botmux');
 const BOTS_JSON = join(BOTMUX_HOME, 'bots.json');
 const GLOBAL_PROJECTS = join(HOME, '.claude', 'projects');
 
-const CLAUDE_FAMILY = new Set(['claude-code']); // 需要时可扩展 fork id
+// claude-code 的旧数据在 ~/.claude/projects(本脚本处理)。seed/relay 也是 claude 家族、
+// v2 同样会被重定向+provision,但它们的旧数据在各自 dataDir(.claude-runtime 等),源路径
+// 不同 → 本脚本不迁,改为显式告警,避免"静默丢数据"(review L1)。
+const CLAUDE_FAMILY = new Set(['claude-code']);
+const CLAUDE_FORKS = new Set(['seed', 'relay']);
 
 function cwdHash(cwd) {
   let real = cwd;
@@ -42,6 +46,10 @@ function botCwds(bot) {
 if (!existsSync(BOTS_JSON)) { console.error(`未找到 ${BOTS_JSON}`); process.exit(1); }
 const bots = JSON.parse(readFileSync(BOTS_JSON, 'utf-8'));
 const isolated = bots.filter((b) => b.readIsolation === true && CLAUDE_FAMILY.has(b.cliId));
+const forkWarn = bots.filter((b) => b.readIsolation === true && CLAUDE_FORKS.has(b.cliId));
+for (const b of forkWarn) {
+  console.warn(`⚠️  ${b.larkAppId} 是 claude 家族 fork(${b.cliId}):v2 会重定向+provision,但旧数据在其自身 dataDir(非 ~/.claude/projects),本脚本不迁——如需保留 memory/transcript 请手动拷贝。`);
+}
 
 console.log(`${APPLY ? '【APPLY】真执行' : '【DRY-RUN】仅预览(加 --apply 执行)'}`);
 console.log(`隔离 claude bot 数:${isolated.length}\n`);
