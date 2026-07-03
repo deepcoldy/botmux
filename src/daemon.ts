@@ -364,6 +364,12 @@ function silentTurnReactionsFor(ds: DaemonSession): boolean {
   } catch { return false; }
 }
 
+function receivedReactionEmojiFor(ds: DaemonSession): string {
+  try {
+    return getBot(ds.larkAppId).config.receivedReactionEmoji || RECEIVED_REACTION_EMOJI_TYPE;
+  } catch { return RECEIVED_REACTION_EMOJI_TYPE; }
+}
+
 function readSessionFreshFromDisk(sessionId: string, larkAppId: string): import('./types.js').Session | undefined {
   const paths = [
     join(config.session.dataDir, `sessions-${larkAppId}.json`),
@@ -408,7 +414,7 @@ export async function noteTurnReceived(ds: DaemonSession, triggerMessageId: stri
   // so a registered entry is always in place before its own turn can go idle.
   let reactionId: string;
   try {
-    reactionId = await addReaction(ds.larkAppId, triggerMessageId, RECEIVED_REACTION_EMOJI_TYPE);
+    reactionId = await addReaction(ds.larkAppId, triggerMessageId, receivedReactionEmojiFor(ds));
   } catch (err) {
     logger.debug(`[reaction] received add failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
     return;
