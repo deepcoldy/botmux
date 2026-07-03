@@ -88,7 +88,9 @@ Use `sandboxReadonlyPaths` when the bot needs to inspect extra local inputs with
 "sandboxReadonlyPaths": ["/srv/source-snapshots/service-a", "~/docs/runbooks"]
 ```
 
-Each existing path is mounted read-only at the same path inside the sandbox. Missing entries are ignored. This is useful for shared source snapshots, reference repos, generated docs, or other context that should not be part of the `/land` changeset.
+Each existing path is mounted read-only at the same path inside the sandbox (`~` expands to the home dir). Missing entries are ignored. This is useful for shared source snapshots, reference repos, generated docs, or other context that should not be part of the `/land` changeset.
+
+Two guardrails: `sandboxHidePaths` masks always take precedence — a read-only path overlapping a masked path can never re-expose the hidden content. And entries equal to or containing the home dir or the session working dir are ignored with a warning (they would replace the entire write-isolated overlay); paths *under* the working dir are fine.
 
 ## Network policy (`sandboxNetwork`)
 
