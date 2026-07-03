@@ -166,14 +166,27 @@ function escapeForRegex(p: string): string {
 }
 
 /** v2 PATTERN denies — Seatbelt `regex` filters that deny a whole FILENAME CLASS
- *  instead of enumerating sibling app ids. Covers the per-bot session stores
- *  (`<sd>/sessions-<appId>.json`, routing metadata): a newly-added bot's store is
- *  denied WITHOUT cold-restarting the ones already running, and no caller needs to
- *  know the sibling app ids at all. The bot's OWN store is re-allowed by carve-out
- *  (Seatbelt last-match, same mechanism as the wholesale-denied dirs). */
+ *  instead of enumerating sibling app ids. Covers:
+ *   - per-bot session stores (`<sd>/sessions-<appId>.json`, routing metadata): a
+ *     newly-added bot's store is denied WITHOUT cold-restarting the ones already
+ *     running, and no caller needs to know the sibling app ids. The bot's OWN store
+ *     is re-allowed by carve-out (Seatbelt last-match).
+ *   - EVERY `bots.json.*` sidecar (`.bak` written by setup/migration, `.tmp`, ad-hoc
+ *     `.bak.<suffix>` copies): the exact `bots.json` is subpath-denied in
+ *     {@link buildV2DenyPaths}, but its backups carry the SAME plaintext
+ *     larkAppSecret for every bot under a DIFFERENT basename, which `subpath` does
+ *     not match — so without this an isolated bot could `cat bots.json.bak` and
+ *     recover all siblings' credentials, defeating the whole isolation. */
 export function buildV2DenyRegexes(ctx: V2IsolationContext): string[] {
   const sd = ctx.sessionDataDir.replace(/\/+$/, '');
-  return [`^${escapeForRegex(sd)}/sessions-[^/]+\\.json$`];
+  const bh = ctx.botmuxHome.replace(/\/+$/, '');
+  return [
+    `^${escapeForRegex(sd)}/sessions-[^/]+\\.json$`,
+    // Any `bots.json.` sidecar (backups/temp) — trailing dot so it matches
+    // bots.json.bak / .tmp / .bak.<suffix> but NOT the exact bots.json (that is
+    // the subpath deny's job) and NOT an unrelated `bots.jsonx`.
+    `^${escapeForRegex(bh)}/bots\\.json\\.`,
+  ];
 }
 
 /** The v2 Seatbelt carve-outs that accompany {@link buildV2DenyPaths} +

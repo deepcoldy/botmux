@@ -80,7 +80,7 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     // The regex covers EVERY sessions-<appId>.json — including bots added later —
     // without any sibling-appId enumeration.
     const regexes = buildV2DenyRegexes(v2());
-    expect(regexes).toEqual(['^/Users/bot/\\.botmux/data/sessions-[^/]+\\.json$']);
+    expect(regexes[0]).toBe('^/Users/bot/\\.botmux/data/sessions-[^/]+\\.json$');
     const re = new RegExp(regexes[0]);
     expect(re.test('/Users/bot/.botmux/data/sessions-cli_other1.json')).toBe(true);
     expect(re.test('/Users/bot/.botmux/data/sessions-cli_self.json')).toBe(true); // own matches too…
@@ -88,6 +88,24 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(re.test('/Users/bot/.botmux/data/sub/sessions-x.json')).toBe(false);    // same dir only
     // …but the own file is re-opened by a carve-out allow (Seatbelt last-match).
     expect(buildV2CarveOuts(v2()).allowPaths).toContain('/Users/bot/.botmux/data/sessions-cli_self.json');
+  });
+
+  it('denies every bots.json SIDECAR (backup/temp) — .bak carries all siblings secrets', () => {
+    // Regression: the exact bots.json is subpath-denied, but its setup/migration
+    // backups (bots.json.bak, .bak.<suffix>, .tmp) carry the SAME plaintext
+    // larkAppSecret for every bot under a different basename, which subpath does
+    // NOT match. Without the sidecar regex an isolated bot could `cat bots.json.bak`
+    // and recover all siblings' credentials.
+    const re = new RegExp(buildV2DenyRegexes(v2())[1]);
+    expect(re.test('/Users/bot/.botmux/bots.json.bak')).toBe(true);
+    expect(re.test('/Users/bot/.botmux/bots.json.bak.isotest.1783089554')).toBe(true);
+    expect(re.test('/Users/bot/.botmux/bots.json.tmp')).toBe(true);
+    // The exact file is the subpath deny's job (not this regex), and unrelated
+    // basenames must not be swept in.
+    expect(re.test('/Users/bot/.botmux/bots.json')).toBe(false);
+    expect(re.test('/Users/bot/.botmux/bots.jsonx')).toBe(false);
+    // The exact bots.json is still covered by the path deny.
+    expect(buildV2DenyPaths(v2())).toContain('/Users/bot/.botmux/bots.json');
   });
 
   it('send-cred lives inside BOT_HOME (unified per-bot private storage)', () => {
@@ -113,8 +131,8 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(sendCredFilePath('/var/botmux/data', 'cli_x'))
       .toBe('/var/botmux/bots/cli_x/send-cred.json');
     // the session-store regex must also follow the custom data dir
-    expect(buildV2DenyRegexes(v2({ sessionDataDir: '/var/botmux/data' })))
-      .toEqual(['^/var/botmux/data/sessions-[^/]+\\.json$']);
+    expect(buildV2DenyRegexes(v2({ sessionDataDir: '/var/botmux/data' }))[0])
+      .toBe('^/var/botmux/data/sessions-[^/]+\\.json$');
   });
 
   it('buildV2CarveOuts: own slices allowed + traverse shims + extraDenyPaths as FINAL deny', () => {
