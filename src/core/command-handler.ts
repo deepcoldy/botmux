@@ -575,8 +575,12 @@ export async function handleCommand(
         ds.workingDir = targetPath;
         ds.session.workingDir = targetPath;
         sessionStore.updateSession(ds.session);
-        await sessionReply(rootId, t('cmd.cd.switched', { path: resolvedPath }, loc));
-        logger.info(`[${logTag}] Working directory changed to ${resolvedPath} by /cd command`);
+        if (validation.created) {
+          await sessionReply(rootId, `📁 目录不存在，已自动创建并切换：\`${resolvedPath}\``);
+        } else {
+          await sessionReply(rootId, t('cmd.cd.switched', { path: resolvedPath }, loc));
+        }
+        logger.info(`[${logTag}] Working directory changed to ${resolvedPath} by /cd command${validation.created ? ' (auto-created)' : ''}`);
         break;
       }
 
@@ -914,13 +918,14 @@ export async function handleCommand(
           const verb = result.created
             ? t('cmd.oncall.verb_bound', undefined, loc)
             : t('cmd.oncall.verb_updated', undefined, loc);
+          const createdNote = validation.created ? `\n\n📁 目录不存在，已自动创建。` : '';
           await sessionReply(rootId, t('cmd.oncall.bind_success', {
             verb,
             chatId,
             target,
             resolved: resolvedPath,
-          }, loc));
-          logger.info(`[${logTag}] /oncall bind chat=${chatId} dir=${target}`);
+          }, loc) + createdNote);
+          logger.info(`[${logTag}] /oncall bind chat=${chatId} dir=${target}${validation.created ? ' (auto-created)' : ''}`);
           break;
         }
 
