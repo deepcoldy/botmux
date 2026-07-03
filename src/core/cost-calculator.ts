@@ -301,10 +301,14 @@ const USAGE_FILE_CACHE_MAX_ENTRIES = 512;
 /** While a transcript keeps changing, serve the cached value and reparse at
  *  most once per interval — keeps row composition off the disk. */
 const USAGE_REPARSE_MIN_INTERVAL_MS = 15_000;
+/** Token usage is advisory. Never let dashboard row rendering synchronously
+ *  scan pathological multi-GB transcripts. */
+export const MAX_USAGE_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 
 /** Aiden checkpoint paths move as the session progresses (latest.json points
  *  at a new checkpoint id per turn), so positive hits expire quickly too. */
 const AIDEN_PATH_HIT_TTL_MS = 15_000;
+const warnedOversizedUsageFiles = new Set<string>();
 
 export function __resetSessionUsageCachesForTest(): void {
   usageFileCache.clear();
@@ -364,6 +368,19 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
     if (unchanged || throttled) {
       return { agg: cached.previewAgg, result: cached.result };
     }
+  }
+
+  if (st.size > MAX_USAGE_TRANSCRIPT_BYTES) {
+    const warnKey = `${key}:${st.size}`;
+    if (!warnedOversizedUsageFiles.has(warnKey)) {
+      warnedOversizedUsageFiles.add(warnKey);
+      logger.warn(
+        `Skipping token usage scan for oversized transcript ${path} ` +
+        `(${st.size} bytes > ${MAX_USAGE_TRANSCRIPT_BYTES} bytes)`,
+      );
+    }
+    if (cached) return { agg: cached.previewAgg, result: cached.result };
+    return { agg: newTokenUsageAggregate(), result: null };
   }
 
   if (usageFileCache.size >= USAGE_FILE_CACHE_MAX_ENTRIES && !usageFileCache.has(key)) {

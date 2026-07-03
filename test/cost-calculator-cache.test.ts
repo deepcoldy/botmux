@@ -15,7 +15,7 @@ vi.mock('node:fs', async (importOriginal) => {
   };
 });
 
-import { mkdtempSync, writeFileSync, appendFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, appendFileSync, rmSync, readFileSync, truncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -24,9 +24,11 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import {
+  MAX_USAGE_TRANSCRIPT_BYTES,
   readSessionTokenUsageFile,
   __resetSessionUsageCachesForTest,
 } from '../src/core/cost-calculator.js';
+import { logger } from '../src/utils/logger.js';
 
 function claudeLine(id: string | null, input: number, output: number): string {
   return JSON.stringify({
@@ -55,6 +57,7 @@ beforeEach(() => {
   now = 1_000_000_000;
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   vi.mocked(readFileSync).mockClear();
+  vi.mocked(logger.warn).mockClear();
 });
 
 afterEach(() => {
@@ -181,6 +184,28 @@ describe('readSessionTokenUsageFile caching', () => {
     appendFileSync(p, `${codexCountLine(150, 30)}\n`);
     // Latest cumulative snapshot wins — not 100+150.
     expect(readSessionTokenUsageFile(p, 'codex')).toMatchObject({ in: 150, out: 30 });
+  });
+
+  it('skips oversized transcripts instead of scanning them from byte zero', () => {
+    const p = join(dir, 'oversized.jsonl');
+    writeFileSync(p, '');
+    truncateSync(p, MAX_USAGE_TRANSCRIPT_BYTES + 1);
+
+    expect(readSessionTokenUsageFile(p, 'coco')).toBeNull();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('Skipping token usage scan for oversized transcript'));
+  });
+
+  it('keeps the cached usage if a transcript grows past the scan cap', () => {
+    const p = join(dir, 'grows-too-large.jsonl');
+    writeFileSync(p, `${claudeLine('msg_a', 100, 10)}\n`);
+    const first = readSessionTokenUsageFile(p, 'claude');
+    expect(first).toMatchObject({ turns: 1, inputTokens: 100 });
+
+    now += 20_000;
+    truncateSync(p, MAX_USAGE_TRANSCRIPT_BYTES + 1);
+
+    expect(readSessionTokenUsageFile(p, 'claude', { fresh: true })).toBe(first);
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('Skipping token usage scan for oversized transcript'));
   });
 
   it('returns null and drops the cache entry when the file disappears', () => {
