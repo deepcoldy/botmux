@@ -296,6 +296,34 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('dirMode=fixed persists defaultWorkingDir (direct start) instead of workingDir', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-'));
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      registerApp: async () => ({ ok: true, appId: 'cli_x', appSecret: 's', brand: 'feishu' }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const job = manager.start({ cliId: 'codex', workingDir: dir, dirMode: 'fixed' });
+    await job.done;
+
+    batchGetIdMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user_list: [{ email: 'admin@corp.com', user_id: 'ou_admin' }] },
+    });
+    const r = await manager.submitOwner(job.id, ['admin@corp.com']);
+    expect(r.ok).toBe(true);
+
+    const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
+    expect(bots[0]).toMatchObject({ larkAppId: 'cli_x', defaultWorkingDir: dir });
+    // 弹卡扫描根不落盘（回退默认 ~），bots.json 只留固定目录一个字段。
+    expect(bots[0].workingDir).toBeUndefined();
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('surfaces the second (open-platform) QR and finishes with a permission summary', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-'));
     const gate = deferred<void>();

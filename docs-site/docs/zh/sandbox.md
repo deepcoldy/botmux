@@ -15,8 +15,9 @@
 | ✅ **登录态持久** | CLI 的鉴权目录是**真实绑定**的——在沙盒里登录、刷新 token 都对真实生效、不会丢登录；项目改动依旧隔离 |
 | ✅ **零拷贝、省磁盘** | 基于 overlayfs，**不 clone 项目**；只有被改动的文件才占额外磁盘 |
 | ✅ **审阅后落盘** | owner 审 diff + patch 文件，确认再 `git apply` 回真实仓库，或丢弃 |
+| ✅ **额外只读输入** | 可用 `sandboxReadonlyPaths` 把兄弟仓库、生成文档、共享源码快照等只读暴露给机器人 |
 | ❌ **不隔离读** | 默认机器人能读**本机所有文件**（含 `bots.json`、`~/.ssh`、各种凭证）。要挡敏感路径需 per-bot 显式配置（见下「隐私屏蔽」） |
-| ❌ **不隔离网络** | 沙盒内可正常访问网络 / 代理，不限制出口 |
+| ⚠️ **默认不隔离网络** | 沙盒内默认可访问网络 / 代理；设 `sandboxNetwork: false` 可让会话进入独立网络命名空间 |
 
 > **一句话定位**：这是「**防误改 + 改动可审**」的隔离，不是「防一切」的安全沙箱。它保证真实仓库不被沙盒里的写操作污染、且每一笔改动都要 owner 点头才落盘；它**不**阻止机器人读取本机文件或访问网络——敏感内容请用下面的屏蔽机制挡住。
 
@@ -34,7 +35,11 @@
   "cliId": "claude-code",
   "sandbox": true,                          // 开启文件沙盒
   // 可选：屏蔽不想让机器人读到的敏感路径（默认空 = 全部可读）
-  "sandboxHidePaths": ["~/.ssh", "~/.botmux/bots.json"]
+  "sandboxHidePaths": ["~/.ssh", "~/.botmux/bots.json"],
+  // 可选：额外暴露只读路径
+  "sandboxReadonlyPaths": ["/srv/source-snapshots/service-a"],
+  // 可选：关闭沙盒内网络出口
+  "sandboxNetwork": false
 }
 ```
 
@@ -75,11 +80,33 @@
 
 被列的路径在沙盒里会被**空目录 / 空文件**遮罩。**没有默认值**——不配就是全可读（包括 `bots.json`）。按你对群成员的信任级别自行决定要挡哪些。
 
+## 额外只读路径（`sandboxReadonlyPaths`）
+
+当机器人需要查看额外本地上下文、但不应该修改这些内容时，配置 `sandboxReadonlyPaths`：
+
+```jsonc
+"sandboxReadonlyPaths": ["/srv/source-snapshots/service-a", "~/docs/runbooks"]
+```
+
+每个已存在路径会以只读方式挂到沙盒里的同一路径（`~` 会展开为家目录）；不存在的项会被忽略。适合共享源码快照、参考仓库、生成文档、运行手册等不应进入 `/land` 改动集的输入。
+
+两条护栏：`sandboxHidePaths` 遮罩永远优先——与遮罩路径重叠的只读项不会重新暴露被隐藏的内容；等于或包含家目录 / 会话工作目录的项会被忽略并告警（否则会整体顶掉写隔离 overlay），工作目录*之下*的子路径不受影响。
+
+## 网络策略（`sandboxNetwork`）
+
+默认沙盒保留网络访问，用于包安装、API 调用和 CLI 正常联网。配置：
+
+```jsonc
+"sandboxNetwork": false
+```
+
+会添加 `--unshare-net`，让 CLI 在无宿主网络的命名空间里运行。这个开关很硬：模型/API 访问、包管理器、git remote、代理都可能不可用，除非该 CLI 能完全依赖已经挂载好的本地输入工作。
+
 ## 注意事项
 
 1. **仅 Linux**：依赖 bwrap + overlayfs（非 root 自动用 fuse-overlayfs，依赖开沙盒时自动装）；Mac（sandbox-exec）暂未支持。
 2. **读不隔离**：默认全可读，挡敏感凭证要主动配 `sandboxHidePaths`（见上）。
-3. **网络不隔离**：沙盒内可访问网络 / 本机代理，不限制出口。
+3. **网络默认开放**：只有确认机器人能接受无网络 / 无代理时，才设置 `sandboxNetwork: false`。
 4. **build 产物会进改动集**：如果机器人在沙盒里跑了 `pnpm build` / 编译，产物（如 `dist/`）也会出现在 `/land` 的改动集里。落盘前**看清 diff**，别把编译产物 `apply` 覆盖真实仓库。
 5. **机器人无感**：它看到的是 overlay 合并视图，以为改的就是真文件、照常工作；「隔离」对它完全透明。
 6. **`botmux send` 照常**：沙盒里 `botmux send` 通过 daemon 中转正常发消息、附图、附件（应用凭证不进沙盒环境）。

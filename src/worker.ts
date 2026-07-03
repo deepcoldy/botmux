@@ -82,6 +82,7 @@ import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
@@ -400,31 +401,38 @@ let readyFlushSettleTimer: ReturnType<typeof setTimeout> | null = null;
 let isSettlingFirstFlush = false;
 
 /** Wait until the PTY has been quiet for READY_FLUSH_SETTLE_MS (Ink render
- *  drained), capped at READY_FLUSH_SETTLE_CAP_MS, then flush the held prompt. */
-function settleThenFlush(startedAtMs: number): void {
+ *  drained), capped at READY_FLUSH_SETTLE_CAP_MS, then flush the held prompt.
+ *  A real SessionStart/BOTMUX_READY_COMMAND signal is itself authoritative
+ *  prompt readiness; the timeout fallback only opens the gate and lets the
+ *  regular readyPattern/idle path prove readiness later. */
+function settleThenFlush(startedAtMs: number, promptReadyAfterSettle: boolean): void {
   readyFlushSettleTimer = null;
   const now = Date.now();
   const quietForMs = now - lastPtyOutputAtMs;
   if (quietForMs >= READY_FLUSH_SETTLE_MS || now - startedAtMs >= READY_FLUSH_SETTLE_CAP_MS) {
     isSettlingFirstFlush = false;
-    log(`Ready-gate settle done (quiet ${quietForMs}ms); delivering held first prompt`);
+    log(`Ready-gate settle done (quiet ${quietForMs}ms); ${promptReadyAfterSettle ? 'marking prompt ready' : 'delivering held first prompt'}`);
+    if (promptReadyAfterSettle) {
+      markPromptReady();
+      return;
+    }
     void flushPending();
     return;
   }
   const wait = Math.min(READY_FLUSH_SETTLE_MS - quietForMs, READY_FLUSH_SETTLE_CAP_MS - (now - startedAtMs));
-  readyFlushSettleTimer = setTimeout(() => settleThenFlush(startedAtMs), Math.max(50, wait));
+  readyFlushSettleTimer = setTimeout(() => settleThenFlush(startedAtMs, promptReadyAfterSettle), Math.max(50, wait));
   readyFlushSettleTimer.unref?.();
 }
 
 /** Release the ready-gate and flush anything it held. No-op when the gate was
  *  never armed (other CLIs / adopt) or already released (idempotent). */
-function releaseReadyGate(reason: string): void {
+function releaseReadyGate(reason: string, opts?: { promptReadyAfterSettle?: boolean }): void {
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
   if (readyGate.receive()) {
     log(`Ready gate released (${reason}); settling for PTY quiescence before first flush`);
     if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
     isSettlingFirstFlush = true;
-    settleThenFlush(Date.now());
+    settleThenFlush(Date.now(), opts?.promptReadyAfterSettle === true);
   }
 }
 
@@ -4535,6 +4543,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   const chatBotDiscovery = resolveChatBotDiscoveryConfig();
   childEnv.BOTMUX_LARK_LIST_BOTS_API_ENABLED = chatBotDiscovery.listBotsApiEnabled ? 'true' : 'false';
   childEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
+  if (cliAdapter.injectsReadyHook) childEnv.BOTMUX_READY_COMMAND = sessionReadyHookCommand();
   // Initial value only; long-lived panes get the latest turn via the JSON pid marker.
   if (cfg.turnId) childEnv.BOTMUX_TURN_ID = cfg.turnId;
   if (injectClaudeSandbox) childEnv.IS_SANDBOX = '1';
@@ -4686,6 +4695,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
           authPaths: cliAdapter.authPaths,
           extraExecPaths: cliAdapter.sandboxExtraExecPaths?.(),
           readonlyRoots: cfg.skillReadonlyRoots ?? [],
+          userReadonlyPaths: cfg.sandboxReadonlyPaths ?? [],
+          net: cfg.sandboxNetwork !== false,
         });
         if (sbx) {
           spawnBin = sbx.bin;
@@ -6006,9 +6017,21 @@ process.on('message', async (raw: unknown) => {
       // Claude-family SessionStart hook fired (via `botmux session-ready` →
       // daemon). The CLI's input box is genuinely rendered — release the
       // ready-gate and deliver any held first prompt. Idempotent: a later
-      // duplicate (clear/compact source) or a post-timeout fire is a no-op.
+      // duplicate (clear/compact source) is a no-op.
       log(`SessionStart ready signal received (source=${msg.source ?? '?'})`);
-      releaseReadyGate('SessionStart hook');
+      // 先记下 gate 是否已被 45s fallback 释放：ReadyGate.receive() 是一次性
+      // 语义，fallback 抢先后 releaseReadyGate 会整块跳过迟到的真信号。
+      const lateAfterFallback = readyGate.isArmed && readyGate.isReceived;
+      releaseReadyGate('SessionStart hook', { promptReadyAfterSettle: true });
+      // 冷启动超过 READY_SIGNAL_TIMEOUT_MS 的 CLI（Hermes 常态是 2-3 分钟）恰好
+      // 总落在 fallback 之后：fallback 只开闸不投递（非 type-ahead 的
+      // flushPending 是 no-op），真信号依然是权威就绪，这里直接兑现。仅限首轮
+      // （awaitingFirstPrompt）——首条 prompt 交付后 clear/compact 来源的
+      // SessionStart 保持原有 no-op 语义，绝不在会话中途误标就绪。
+      if (lateAfterFallback && awaitingFirstPrompt && !isPromptReady) {
+        log('Late ready signal after timeout fallback — marking prompt ready now');
+        markPromptReady();
+      }
       break;
     }
 

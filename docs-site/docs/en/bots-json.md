@@ -93,6 +93,15 @@ Run one bot on a GLM Coding Plan (or any Anthropic-compatible provider) while an
 | `restrictGrantCommands` | When `true`, people granted only via per-user authorization (`chatGrants` / `globalGrants`) are disabled from **all slash commands** and can only have plain conversations; owner / `allowedUsers` / oncall / whole-group members are unaffected. Defaults to `false` |
 | `autoGrantRequestCards` | Enabled by default. Set to `false` to stop automatically sending `/grant` request cards to the owner when an unauthorized person or external bot @mentions this bot in a group and the talk gate blocks it; the message is dropped silently instead |
 
+## File sandbox
+
+| Field | Description |
+|------|------|
+| `sandbox` | When `true`, launch new sessions in the Linux file sandbox. Writes are isolated and must be landed with `/land` |
+| `sandboxHidePaths` | Paths masked inside the sandbox with empty dirs/files so the bot cannot read them, e.g. `["~/.ssh", "~/.botmux/bots.json"]` |
+| `sandboxReadonlyPaths` | Extra existing paths mounted read-only inside the sandbox, useful for shared source snapshots, reference repos, or generated docs the bot should inspect but not modify |
+| `sandboxNetwork` | Network policy for sandboxed sessions. Omitted / `true` keeps current network and proxy access; `false` adds `--unshare-net` and blocks normal network egress |
+
 ## Cards and terminal
 
 | Field | Description |

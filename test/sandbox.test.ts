@@ -8,10 +8,10 @@
  * just the argv shape and the upper-walk/apply contract.
  */
 import { describe, it, expect } from 'vitest';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync } from 'node:fs';
-import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
 
@@ -99,6 +99,30 @@ describe('buildSandboxArgs (overlay model)', () => {
 
     expect(rootIdx).toBeGreaterThanOrEqual(0);
     expect(outboxIdx).toBeGreaterThan(rootIdx);
+  });
+
+  it('binds user readonly roots BEFORE privacy masks so an overlapping entry cannot re-expose masked content', () => {
+    const a = buildSandboxArgs(plan({
+      hideDirs: ['/root/.ssh'],
+      hideFiles: [{ path: '/root/.botmux/bots.json', empty: '/data/sandboxes/s1/empties/mask-0' }],
+      userReadonlyRoots: ['/root/refs'],
+    }));
+    const userIdx = tripleIdx(a, '--ro-bind', '/root/refs', '/root/refs');
+    const dirMaskIdx = a.indexOf('/root/.ssh');
+    const fileMaskIdx = tripleIdx(a, '--ro-bind', '/data/sandboxes/s1/empties/mask-0', '/root/.botmux/bots.json');
+    expect(userIdx).toBeGreaterThanOrEqual(0);
+    expect(dirMaskIdx).toBeGreaterThan(userIdx);
+    expect(fileMaskIdx).toBeGreaterThan(userIdx);
+  });
+
+  it('keeps trusted skill roots AFTER the masks (a broad hideDir must not blank skill delivery)', () => {
+    const a = buildSandboxArgs(plan({
+      hideDirs: ['/data/runtime-skills'],
+      readonlyRoots: ['/data/runtime-skills/s1/claude-plugin'],
+    }));
+    const maskIdx = a.indexOf('/data/runtime-skills');
+    const skillIdx = tripleIdx(a, '--ro-bind', '/data/runtime-skills/s1/claude-plugin', '/data/runtime-skills/s1/claude-plugin');
+    expect(skillIdx).toBeGreaterThan(maskIdx);
   });
 
   it('no clone/scrub artefacts: never binds a per-session clone "work" dir', () => {
@@ -464,7 +488,94 @@ describe('sandbox landing from upper layer', () => {
 // ── prepareSandbox: hidePaths produce the right masks ────────────────────────
 // On Linux with root we can actually mount the overlays; verify the resulting
 // argv masks an existing dir via tmpfs and a file via an empty ro-bind.
+// ── resolveUserReadonlyRoots: tilde expansion + overlay-root guard ───────────
+describe('resolveUserReadonlyRoots', () => {
+  it('tilde-expands entries against the given home and keeps only existing paths', () => {
+    const home = tmp();
+    mkdirSync(join(home, 'refs'), { recursive: true });
+    const project = tmp();
+    expect(resolveUserReadonlyRoots(['~/refs', '~/missing-xyz'], home, project)).toEqual([join(home, 'refs')]);
+  });
+
+  it('rejects entries equal to or covering an overlay root (home / project)', () => {
+    const home = tmp();
+    const project = tmp();
+    mkdirSync(join(project, 'vendor'), { recursive: true });
+    // `~` (= home), the project root itself, and `/` all swallow an overlay root → dropped.
+    // A path strictly UNDER the project stays allowed (reference-material use case).
+    expect(resolveUserReadonlyRoots(['~', project, '/', join(project, 'vendor')], home, project))
+      .toEqual([join(project, 'vendor')]);
+  });
+
+  it('rejects a non-normalized string that resolves to an overlay root (trailing slash / dot)', () => {
+    const home = tmp();
+    const project = tmp();
+    // `/repo/` and `/repo/.` both canonicalize to the project root → dropped,
+    // even though a plain string-prefix check would let them through.
+    expect(resolveUserReadonlyRoots([`${project}/`, join(project, '.')], home, project))
+      .toEqual([]);
+  });
+
+  it('rejects a symlink that resolves to the project or home overlay root', () => {
+    const home = tmp();
+    const project = tmp();
+    const linkDir = tmp();
+    const toProject = join(linkDir, 'to-project');
+    const toHome = join(linkDir, 'to-home');
+    symlinkSync(project, toProject);
+    symlinkSync(home, toHome);
+    // Both symlinks canonicalize to an overlay root → must be dropped, else bwrap
+    // would re-mount the real tree read-only and shadow write isolation.
+    expect(resolveUserReadonlyRoots([toProject, toHome], home, project)).toEqual([]);
+  });
+
+  it('allows a symlink that resolves OUTSIDE the overlay roots', () => {
+    const home = tmp();
+    const project = tmp();
+    const snap = tmp();
+    const linkDir = tmp();
+    const link = join(linkDir, 'ref');
+    symlinkSync(snap, link);
+    // The expanded original path is returned (docs promise "mounted at the same path").
+    expect(resolveUserReadonlyRoots([link], home, project)).toEqual([link]);
+  });
+
+  it('drops non-string and empty entries', () => {
+    const home = tmp();
+    const project = tmp();
+    expect(resolveUserReadonlyRoots(['', undefined as unknown as string], home, project)).toEqual([]);
+  });
+});
+
 describe.skipIf(process.platform !== 'linux')('prepareSandbox hidePaths masks', () => {
+  it('tilde-expands hidePaths so the documented `~/...` form masks the real path', () => {
+    const src = tmp();
+    writeFileSync(join(src, 'file.txt'), 'x');
+    const prev = process.env.BOTMUX_SANDBOX;
+    delete process.env.BOTMUX_SANDBOX;
+    const dataDir = tmp();
+    const sid = 'hp-tilde-' + Math.random().toString(36).slice(2);
+    // A hidePath that does NOT exist still gets an empty-placeholder mask — at the
+    // EXPANDED path, never at a literal `~/...` dest bwrap can't resolve.
+    const rel = '.botmux-sbx-test-missing-' + Math.random().toString(36).slice(2);
+    let r: ReturnType<typeof prepareSandbox> = null;
+    try {
+      r = prepareSandbox({
+        enabled: true, cliId: 'codex', sessionId: sid, sourceWorkingDir: src,
+        dataDir, cliBin: '/bin/true', cliArgs: [],
+        hidePaths: [`~/${rel}`],
+      });
+      if (r === null) return; // overlay mount unavailable in this env — skip assertions
+      const expanded = join(homedir(), rel);
+      const idx = r.args.findIndex((x, i) => x === '--ro-bind' && r!.args[i + 2] === expanded);
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(r.args).not.toContain(`~/${rel}`);
+    } finally {
+      if (r) r.cleanup();
+      if (prev !== undefined) process.env.BOTMUX_SANDBOX = prev;
+    }
+  });
+
   it('turns an existing dir hidePath into a tmpfs mask and a file into a ro-bind empty', () => {
     const src = tmp();
     writeFileSync(join(src, 'file.txt'), 'x');

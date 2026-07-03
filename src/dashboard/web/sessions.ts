@@ -37,6 +37,7 @@ import {
   selectIdleCleanupCandidates,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
+import { CLI_OPTIONS } from '../../setup/bot-config-editor.js';
 
 function th(sort: string, label: string): string {
   return `<th data-sort="${sort}" data-label="${escapeHtml(label)}">${escapeHtml(label)}</th>`;
@@ -51,25 +52,10 @@ function formatTokenCount(value: unknown): string {
   return n === null ? '-' : n.toLocaleString('en-US');
 }
 
-const CLI_FILTER_OPTIONS = [
-  'claude-code',
-  'seed',
-  'relay',
-  'codex',
-  'codex-app',
-  'cursor',
-  'gemini',
-  'opencode',
-  'mtr',
-  'hermes',
-  'mira',
-  'pi',
-  'copilot',
-  'aiden',
-  'coco',
-  'oh-my-pi',
-  'unknown',
-];
+// CLI 过滤选项从 setup 的单一事实源 CLI_OPTIONS 派生，新增 CLI 自动跟随，
+// 不再手抄一份（手抄版曾漏 antigravity/traex/mir/kimi/genius）。
+// 'unknown' 兜底：没有 cliId 的会话在 filtered() 里按 'unknown' 归类。
+const CLI_FILTER_OPTIONS = [...CLI_OPTIONS.map(o => o.id), 'unknown'];
 
 type BoardColumnId = 'needs-you' | 'starting' | 'working' | 'idle';
 

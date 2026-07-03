@@ -5,6 +5,7 @@ import { randomBytes } from 'node:crypto';
 import { hostname, homedir } from 'node:os';
 import { join } from 'node:path';
 import { readPlatformBinding, writePlatformBinding } from './binding.js';
+import { postJson, type PostJsonResult } from './platform-http.js';
 import { callDashboard } from '../cli/dashboard-endpoint.js';
 import { readGlobalConfig, mergeGlobalConfig } from '../global-config.js';
 
@@ -59,26 +60,41 @@ export async function cmdBind(args: string[]): Promise<void> {
   const machineId = existing?.machineId || randomBytes(8).toString('hex');
   const name = existing?.name || hostname();
 
-  let res: Response;
-  try {
-    res = await fetch(`${platformUrl}/api/bind`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ code, machineId }),
-    });
-  } catch (e) {
-    // Node 的 fetch 把真正的网络原因塞在 e.cause 里，String(e) 只剩裸 "TypeError: fetch failed"，
-    // 对排查毫无帮助。把 cause（ENOTFOUND/ECONNREFUSED/超时/证书等）一并打出来。
-    const cause = (e as { cause?: unknown })?.cause;
-    const detail = cause ? `${String(e)} —— ${String(cause)}` : String(e);
-    console.error(`连接平台失败（${platformUrl}）: ${detail}`);
+  // 连平台：先走系统默认解析；不通再依次用 IPv6 / IPv4 单协议族兜底（有的机器 IPv4
+  // 路由是坏的、但 IPv6 通，反之亦然）。哪个兜底成功就把协议族记进绑定文件，之后隧道
+  // 等所有平台连接默认走它；默认路径成功则不记（重绑时顺带清掉过期的偏好）。
+  const bindUrl = `${platformUrl}/api/bind`;
+  const bindPayload = { code, machineId };
+  const attempts: Array<{ family?: 4 | 6; label: string }> = [
+    { label: '默认' },
+    { family: 6, label: 'IPv6' },
+    { family: 4, label: 'IPv4' },
+  ];
+  let res: PostJsonResult | null = null;
+  let ipFamily: 4 | 6 | undefined;
+  let ipFamilyLabel = '';
+  const failures: string[] = [];
+  for (const attempt of attempts) {
+    try {
+      res = await postJson(bindUrl, bindPayload, { family: attempt.family });
+      ipFamily = attempt.family;
+      ipFamilyLabel = attempt.label;
+      break;
+    } catch (e) {
+      const err = (e as { code?: string; message?: string });
+      failures.push(`${attempt.label}: ${err.code || err.message || String(e)}`);
+    }
+  }
+  if (!res) {
+    console.error(`连接平台失败（${platformUrl}）:`);
+    for (const f of failures) console.error(`  ${f}`);
     console.error('  多为临时网络抖动或平台正在发布；请确认本机能访问平台域名后重试 `botmux bind`（重绑安全、幂等，机器身份不变）。');
     process.exit(1);
     return;
   }
 
-  const body = (await res.json().catch(() => ({}))) as { machineId?: string; machineToken?: string; error?: string };
-  if (!res.ok || !body.machineToken) {
+  const body = res.json as { machineId?: string; machineToken?: string; error?: string };
+  if (res.status < 200 || res.status >= 300 || !body.machineToken) {
     const reason = body.error || `HTTP ${res.status}`;
     console.error(`绑定失败: ${reason}`);
     if (reason.includes('invalid') || reason.includes('expired')) console.error('  绑定凭证无效或已过期，请回平台重新生成。');
@@ -91,6 +107,7 @@ export async function cmdBind(args: string[]): Promise<void> {
     machineId: body.machineId || machineId,
     machineToken: body.machineToken,
     name,
+    ...(ipFamily ? { ipFamily } : {}),
   });
 
   // 绑定平台即「默认打开远程访问开关」：之后 dashboard / 终端 / webhook 链接都走中心化平台
@@ -102,6 +119,9 @@ export async function cmdBind(args: string[]): Promise<void> {
 
   console.log(`✓ 已绑定到平台 ${platformUrl}`);
   console.log(`  机器名: ${name}`);
+  if (ipFamily) {
+    console.log(`  默认网络路径不通，本次经 ${ipFamilyLabel} 连上平台；之后与平台通信（隧道等）默认走 ${ipFamilyLabel}。`);
+  }
 
   // 事件驱动：写完绑定后直接「捅一下」正在运行的 daemon（走其本地 /__cli HMAC 接口，
   // 复用端口自发现），立即重连平台，无需重启、不轮询。没 daemon 在跑则跳过——下次启动自然读到绑定。

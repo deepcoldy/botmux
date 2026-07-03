@@ -512,6 +512,144 @@ export async function automateOpenPlatformSetup(
   }
 }
 
+// ─── 已有应用列表 / 凭证读取（setup「选择已有应用」路径）───────────────────────
+//
+// 复用同一套 Web session + console CSRF 机制，调 console 前端同款接口
+// （bundle 里的 getAppList / getAppSecret）。与 automateOpenPlatformSetup 的
+// 内联 postJson 少量重复——那条链路已实测稳定且 CSRF 种子页 / referer 都绑定
+// 具体 appId，不强行合并，避免动到已验证的自动配置路径。
+
+export interface OpenPlatformAppSummary {
+  clientId: string;
+  name: string;
+  /** 应用描述（接口给什么用什么，仅展示）。 */
+  description?: string;
+}
+
+export interface OpenPlatformApiClient {
+  apiOrigin: string;
+  postJson(path: string, body?: unknown): Promise<unknown>;
+}
+
+export type OpenPlatformClientResult =
+  | { ok: true; client: OpenPlatformApiClient }
+  | { ok: false; reason: 'missing_csrf' | 'network'; message: string };
+
+/**
+ * 用已就绪的 Web session cookies 构造开放平台 console API 客户端：加载 console
+ * 页面提取 `window.csrfToken` 与最终 origin（部分租户会把控制台重定向到
+ * open.larkoffice.com），返回可调 `/developers/v1/*` 的 postJson。
+ */
+export async function createOpenPlatformApiClient(
+  cookies: StoredCookie[],
+  opts: { fetchImpl?: typeof fetch } = {},
+): Promise<OpenPlatformClientResult> {
+  const fetcher = opts.fetchImpl ?? fetch;
+  const session = new MutableCookieJar(cookies);
+  let csrfToken: string | null = null;
+  let apiOrigin = 'https://open.feishu.cn';
+  let referer = `${apiOrigin}/app`;
+  try {
+    const page = await session.fetchTextWithUrl(fetcher, `${apiOrigin}/app`);
+    apiOrigin = new URL(page.finalUrl).origin;
+    referer = page.finalUrl;
+    csrfToken = extractOpenPlatformCsrfToken(page.text);
+  } catch (err) {
+    return { ok: false, reason: 'network', message: `读取开放平台页面失败: ${safeErrorMessage(err)}` };
+  }
+  if (!csrfToken) {
+    return {
+      ok: false,
+      reason: 'missing_csrf',
+      message: '开放平台页面没有返回 window.csrfToken；Web session 可能已过期或未完成开放平台登录',
+    };
+  }
+
+  const postJson = async (path: string, body?: unknown): Promise<unknown> => {
+    const url = `${apiOrigin}${path}`;
+    const response = await session.fetchRaw(fetcher, url, {
+      method: 'POST',
+      headers: {
+        accept: 'application/json, text/plain, */*',
+        origin: apiOrigin,
+        referer,
+        'x-csrf-token': csrfToken!,
+        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    let data: any;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    if (!response.ok) {
+      throw new OpenPlatformApiError(`HTTP ${response.status} ${path}: ${summarizeOpenPlatformPayload(data)}`, data);
+    }
+    if (data && typeof data === 'object' && typeof data.code === 'number' && data.code !== 0) {
+      throw new OpenPlatformApiError(`code=${data.code} msg=${data.msg ?? data.message ?? ''}`, data);
+    }
+    return data;
+  };
+
+  return { ok: true, client: { apiOrigin, postJson } };
+}
+
+/**
+ * 列出当前登录人可见的自建应用（console `getAppList` 同款：
+ * POST /developers/v1/app/list，body {Count, Cursor, QueryFilter}，响应
+ * data.apps + totalCount，分页拉全）。console 是内部接口，item 字段名做
+ * 宽松解析，取不到 cli_ 开头 clientId 的条目丢弃。失败抛错（含 API 错误）。
+ */
+export async function listOpenPlatformApps(
+  client: OpenPlatformApiClient,
+  opts: { pageSize?: number; maxApps?: number } = {},
+): Promise<OpenPlatformAppSummary[]> {
+  const pageSize = opts.pageSize ?? 100;
+  const maxApps = opts.maxApps ?? 500;
+  const out: OpenPlatformAppSummary[] = [];
+  for (let cursor = 0; cursor < maxApps; cursor += pageSize) {
+    const payload = await client.postJson('/developers/v1/app/list', {
+      Count: pageSize,
+      Cursor: cursor,
+      QueryFilter: {},
+    });
+    const record = asRecord(payload);
+    const data = asRecord(record.data);
+    const apps = Array.isArray(data.apps) ? data.apps : Array.isArray(record.apps) ? (record.apps as unknown[]) : [];
+    for (const item of apps) {
+      const rec = asRecord(item);
+      const clientId = pickString(rec, ['clientId', 'client_id', 'appId', 'app_id', 'appID']);
+      if (!clientId || !clientId.startsWith('cli_')) continue;
+      const name = pickString(rec, ['name', 'appName', 'app_name']) ?? clientId;
+      const description = pickString(rec, ['description', 'desc', 'appDesc', 'app_desc']);
+      out.push({ clientId, name, ...(description ? { description } : {}) });
+    }
+    const totalCount = typeof data.totalCount === 'number' ? data.totalCount
+      : typeof record.totalCount === 'number' ? (record.totalCount as number) : undefined;
+    if (apps.length < pageSize) break;
+    if (totalCount !== undefined && cursor + pageSize >= totalCount) break;
+  }
+  return out;
+}
+
+/**
+ * 读取指定应用的 App Secret（console `getAppSecret` 同款：
+ * POST /developers/v1/secret/:clientId，响应含 secret 字段）。
+ * 只读接口——绝不触碰 /v1/secret/reset/*（会轮换 secret、打断在跑的 bot）。
+ */
+export async function fetchOpenPlatformAppSecret(
+  client: OpenPlatformApiClient,
+  clientId: string,
+): Promise<string> {
+  const payload = await client.postJson(`/developers/v1/secret/${clientId}`, {});
+  const record = asRecord(payload);
+  const secret = pickString(asRecord(record.data), ['secret']) ?? pickString(record, ['secret']);
+  if (!secret) throw new Error('开放平台没有返回 secret 字段');
+  return secret;
+}
+
 async function validateFeishuWebSession(cookies: StoredCookie[], fetcher: typeof fetch): Promise<boolean> {
   if (cookies.length === 0) return false;
   const session = new MutableCookieJar(cookies);

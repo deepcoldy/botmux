@@ -8,21 +8,23 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '4': 'codex',
   '5': 'cursor',
   '6': 'gemini',
-  '7': 'genius',
-  '8': 'opencode',
-  '9': 'antigravity',
-  '10': 'mtr',
-  '11': 'hermes',
-  '12': 'codex-app',
-  '13': 'mira',
-  '14': 'seed',
-  '15': 'traex',
-  '16': 'pi',
-  '17': 'copilot',
-  '18': 'oh-my-pi',
-  '19': 'relay',
-  '20': 'mir',
-  '21': 'kimi',
+  '7': 'opencode',
+  '8': 'antigravity',
+  '9': 'mtr',
+  '10': 'hermes',
+  '11': 'codex-app',
+  '12': 'mira',
+  '13': 'seed',
+  '14': 'traex',
+  '15': 'pi',
+  '16': 'copilot',
+  '17': 'oh-my-pi',
+  '18': 'relay',
+  '19': 'mir',
+  '20': 'kimi',
+  // 新增 CLI 一律追加到尾部：序号是脚本化 setup（非 TTY 管道喂数字）的稳定接口，
+  // 插位会让老脚本静默选错 CLI。
+  '21': 'genius',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -137,6 +139,12 @@ export interface BotConfigEditInput {
   model?: string | null;
   backendType?: string;
   workingDir?: string;
+  /**
+   * 固定默认目录：新话题直接在此目录启动、不弹仓库选择卡片（与 /config 的
+   * defaultWorkingDir 同字段）。与 workingDir（仓库选择卡片的扫描根）互补：
+   * 留空不动；输入 - 清空、回到弹卡模式。目录存在性由调用方在写盘前校验。
+   */
+  defaultWorkingDir?: string;
   allowedUsers?: string;
   allowedChatGroups?: string;
   /**
@@ -389,6 +397,7 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   }
 
   applyOptionalString(out, 'workingDir', input.workingDir);
+  applyOptionalString(out, 'defaultWorkingDir', input.defaultWorkingDir);
 
   if (input.allowedUsers !== undefined) {
     const allowedUsers = input.allowedUsers.trim();

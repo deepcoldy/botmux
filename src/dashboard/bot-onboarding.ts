@@ -78,6 +78,12 @@ export interface BotOnboardingInput {
   /** 通用启动前缀（如 "aiden x claude"）；aiden×* 选项解析所得，普通 CLI 为空。 */
   wrapperCli?: string;
   workingDir?: string;
+  /**
+   * 新话题工作目录模式：'fixed' → 落 defaultWorkingDir（直接启动、不弹卡片）；
+   * 'card' → 落 workingDir（仓库选择卡片的扫描根）。缺省按 'card' 处理——
+   * 老前端 / 脚本不带该字段时行为不变；新 Web 表单默认发 'fixed'（推荐）。
+   */
+  dirMode?: 'fixed' | 'card';
   model?: string;
 }
 
@@ -227,7 +233,9 @@ export class BotOnboardingManager {
       cliId,
       // aiden × claude/codex 等启动前缀；普通 CLI 不写此字段。
       ...(input.wrapperCli ? { wrapperCli: input.wrapperCli } : {}),
-      workingDir,
+      // 'fixed' → defaultWorkingDir（新话题直接启动、不弹卡片，扫描根回退 ~）；
+      // 'card'/缺省 → workingDir（仓库选择卡片扫描根，兼容旧调用方语义）。
+      ...(input.dirMode === 'fixed' ? { defaultWorkingDir: workingDir } : { workingDir }),
     };
     if (input.model && input.model.trim()) bot.model = input.model.trim();
     // brand 落盘：只在国际版写字段，feishu 留空（向后兼容，见 normalizeBrand）。

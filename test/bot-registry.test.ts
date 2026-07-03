@@ -434,6 +434,10 @@ describe('loadBotConfigs', () => {
       cliId: 'gemini',
       cliPathOverride: '/usr/local/bin/gemini',
       disableCliBypass: true,
+      sandbox: true,
+      sandboxHidePaths: ['~/.ssh', '', 42, '/etc/secret'],
+      sandboxReadonlyPaths: ['/srv/source-a-readonly', '  /srv/source-b-readonly  ', null],
+      sandboxNetwork: false,
       backendType: 'tmux',
       workingDir: '/home/user/project',
       allowedUsers: ['alice', 'bob'],
@@ -447,6 +451,10 @@ describe('loadBotConfigs', () => {
     expect(c.cliId).toBe('gemini');
     expect(c.cliPathOverride).toBe('/usr/local/bin/gemini');
     expect(c.disableCliBypass).toBe(true);
+    expect(c.sandbox).toBe(true);
+    expect(c.sandboxHidePaths).toEqual(['~/.ssh', '/etc/secret']);
+    expect(c.sandboxReadonlyPaths).toEqual(['/srv/source-a-readonly', '/srv/source-b-readonly']);
+    expect(c.sandboxNetwork).toBe(false);
     expect(c.backendType).toBe('tmux');
     expect(c.workingDir).toBe('/home/user/project');
     expect(c.allowedUsers).toEqual(['alice', 'bob']);

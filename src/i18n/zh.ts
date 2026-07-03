@@ -75,6 +75,9 @@ export const messages: Record<string, string> = {
   'card.repo.worktree_rolled_back': '{repo} 创建 worktree 失败：{error}。已回滚本批次此前创建的 {count} 个 worktree。',
   'card.repo.toast_worktree_creating': '正在创建 worktree，完成后会在话题里通知…',
 
+  // 平台团队大厅打卡（bot-only 群，仅 bot 可见）
+  'platform.hall_announce': '🤖 团队登记打卡：本 bot 上线（登记身份 union_id 用，无需回复）',
+
   // 群内授权卡片
   'card.grant.title': '🔑 使用授权',
   'card.grant.body_request': '发送方 **{name}** 申请在本群使用我。<at id={owner}></at> 是否允许 ta 在本群与我对话？',
