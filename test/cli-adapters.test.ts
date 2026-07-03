@@ -803,6 +803,12 @@ describe('hermes buildArgs', () => {
     expect(args).not.toContain('hello hermes');
     expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
   });
+
+  it('uses explicit ready signal gate without type-ahead', () => {
+    expect(adapter.injectsReadyHook).toBe(true);
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+    expect(adapter.supportsTypeAhead).toBeFalsy();
+  });
 });
 
 describe('antigravity buildArgs', () => {

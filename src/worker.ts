@@ -68,6 +68,7 @@ import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
@@ -4264,6 +4265,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   const chatBotDiscovery = resolveChatBotDiscoveryConfig();
   childEnv.BOTMUX_LARK_LIST_BOTS_API_ENABLED = chatBotDiscovery.listBotsApiEnabled ? 'true' : 'false';
   childEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
+  if (cliAdapter.injectsReadyHook) childEnv.BOTMUX_READY_COMMAND = sessionReadyHookCommand();
   // Initial value only; long-lived panes get the latest turn via the JSON pid marker.
   if (cfg.turnId) childEnv.BOTMUX_TURN_ID = cfg.turnId;
   if (injectClaudeSandbox) childEnv.IS_SANDBOX = '1';

@@ -584,6 +584,10 @@ const BOTMUX_INJECTED_ENV_KEYS = [
   // daemon's `<available_bots>` behavior instead of reading stale rcfile/tmux env.
   'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
   'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
+  // Explicit true-ready command for CLIs (Hermes) that notify Botmux once the
+  // real TUI input composer has rendered. It must reach tmux panes via the
+  // per-pane env prefix; otherwise the ready-gate waits for fallback timeouts.
+  'BOTMUX_READY_COMMAND',
   // Claude Code 2.1.x resume-summary 菜单的抑制阈值（issue #62）。worker 为
   // claude-code 注入一个极大值绕过菜单；只有进了这条白名单才会被透传进 tmux pane。
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
