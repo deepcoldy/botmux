@@ -262,31 +262,38 @@ let readyFlushSettleTimer: ReturnType<typeof setTimeout> | null = null;
 let isSettlingFirstFlush = false;
 
 /** Wait until the PTY has been quiet for READY_FLUSH_SETTLE_MS (Ink render
- *  drained), capped at READY_FLUSH_SETTLE_CAP_MS, then flush the held prompt. */
-function settleThenFlush(startedAtMs: number): void {
+ *  drained), capped at READY_FLUSH_SETTLE_CAP_MS, then flush the held prompt.
+ *  A real SessionStart/BOTMUX_READY_COMMAND signal is itself authoritative
+ *  prompt readiness; the timeout fallback only opens the gate and lets the
+ *  regular readyPattern/idle path prove readiness later. */
+function settleThenFlush(startedAtMs: number, promptReadyAfterSettle: boolean): void {
   readyFlushSettleTimer = null;
   const now = Date.now();
   const quietForMs = now - lastPtyOutputAtMs;
   if (quietForMs >= READY_FLUSH_SETTLE_MS || now - startedAtMs >= READY_FLUSH_SETTLE_CAP_MS) {
     isSettlingFirstFlush = false;
-    log(`Ready-gate settle done (quiet ${quietForMs}ms); delivering held first prompt`);
+    log(`Ready-gate settle done (quiet ${quietForMs}ms); ${promptReadyAfterSettle ? 'marking prompt ready' : 'delivering held first prompt'}`);
+    if (promptReadyAfterSettle) {
+      markPromptReady();
+      return;
+    }
     void flushPending();
     return;
   }
   const wait = Math.min(READY_FLUSH_SETTLE_MS - quietForMs, READY_FLUSH_SETTLE_CAP_MS - (now - startedAtMs));
-  readyFlushSettleTimer = setTimeout(() => settleThenFlush(startedAtMs), Math.max(50, wait));
+  readyFlushSettleTimer = setTimeout(() => settleThenFlush(startedAtMs, promptReadyAfterSettle), Math.max(50, wait));
   readyFlushSettleTimer.unref?.();
 }
 
 /** Release the ready-gate and flush anything it held. No-op when the gate was
  *  never armed (other CLIs / adopt) or already released (idempotent). */
-function releaseReadyGate(reason: string): void {
+function releaseReadyGate(reason: string, opts?: { promptReadyAfterSettle?: boolean }): void {
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
   if (readyGate.receive()) {
     log(`Ready gate released (${reason}); settling for PTY quiescence before first flush`);
     if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
     isSettlingFirstFlush = true;
-    settleThenFlush(Date.now());
+    settleThenFlush(Date.now(), opts?.promptReadyAfterSettle === true);
   }
 }
 
@@ -5674,7 +5681,7 @@ process.on('message', async (raw: unknown) => {
       // ready-gate and deliver any held first prompt. Idempotent: a later
       // duplicate (clear/compact source) or a post-timeout fire is a no-op.
       log(`SessionStart ready signal received (source=${msg.source ?? '?'})`);
-      releaseReadyGate('SessionStart hook');
+      releaseReadyGate('SessionStart hook', { promptReadyAfterSettle: true });
       break;
     }
 

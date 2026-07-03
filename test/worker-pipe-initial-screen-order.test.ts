@@ -70,6 +70,28 @@ describe('worker pipe initial screen ordering', () => {
     expect(hardTimerIdx).toBeGreaterThan(fallbackStart);
   });
 
+  it('treats an explicit session-ready signal as prompt-ready after settle', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const settleStart = source.indexOf('function settleThenFlush');
+    const markIdx = source.indexOf('markPromptReady();', settleStart);
+    const flushIdx = source.indexOf('void flushPending();', settleStart);
+    const sessionReadyCase = source.indexOf("case 'session_ready'");
+    const signalReleaseIdx = source.indexOf(
+      "releaseReadyGate('SessionStart hook', { promptReadyAfterSettle: true });",
+      sessionReadyCase,
+    );
+    const timeoutReleaseIdx = source.indexOf("releaseReadyGate('signal timeout fallback');");
+
+    expect(settleStart).toBeGreaterThan(-1);
+    expect(markIdx).toBeGreaterThan(settleStart);
+    expect(flushIdx).toBeGreaterThan(markIdx);
+    expect(sessionReadyCase).toBeGreaterThan(-1);
+    expect(signalReleaseIdx).toBeGreaterThan(sessionReadyCase);
+    // Timeout fallback must stay conservative: it opens the gate but does not
+    // force prompt-ready for a CLI whose true ready signal never arrived.
+    expect(timeoutReleaseIdx).toBeGreaterThan(-1);
+  });
+
   it('limits busy-pattern idle probes to the active status region', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const helperStart = source.indexOf('function busyProbeRegion(content: string): string');
