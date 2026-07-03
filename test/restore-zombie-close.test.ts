@@ -36,6 +36,8 @@ const probe = vi.hoisted(() => ({ result: 'exists' as 'exists' | 'missing' | 'un
 // Mutable tmux-SERVER liveness the mocked TmuxBackend returns this test run.
 // Default 'running' so a bare 'missing' is read as a solo zombie (server up).
 const server = vi.hoisted(() => ({ state: 'running' as 'running' | 'down' | 'unknown' }));
+// Mutable bot-side wrapperCli for the wrapper-axis mismatch tests.
+const bot = vi.hoisted(() => ({ wrapperCli: undefined as string | undefined }));
 
 vi.mock('../src/config.js', () => ({
   config: {
@@ -94,7 +96,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
-    config: { larkAppId: 'app_test', cliId: 'claude-code', workingDir: '~', workingDirs: ['~'] },
+    config: { larkAppId: 'app_test', cliId: 'claude-code', wrapperCli: bot.wrapperCli, workingDir: '~', workingDirs: ['~'] },
     botName: 'TestBot',
     botOpenId: 'ou_test',
     resolvedAllowedUsers: [],
@@ -158,6 +160,7 @@ beforeEach(() => {
   wp.registry = null;
   probe.result = 'exists';
   server.state = 'running';
+  bot.wrapperCli = undefined;
   vi.mocked(closeSession).mockClear();
   vi.mocked(forkWorker).mockClear();
   vi.mocked(announceSessionRow).mockClear();
@@ -243,6 +246,67 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(map.get(sessionKey('om_cli_mismatch', 'app_test'))).toBeUndefined();
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
     expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('wrapper mismatch on restore (same cliId) → closes the active record', async () => {
+    // 'aiden x claude' and bare claude-code share cliId='claude-code' but are
+    // distinct launch choices (selectionKeyForBot keys on cliId+wrapperCli).
+    // A frozen wrapper snapshot that differs from the bot's current wrapper is
+    // the same config-switch case as a cliId change and must close too.
+    probe.result = 'missing';
+    server.state = 'down';
+    const s = makeActivePersistentSession('om_wrapper_mismatch');
+    s.wrapperCli = 'aiden x claude';
+    s.agentFrozen = true;
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(announceSessionRow).not.toHaveBeenCalled();
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(map.get(sessionKey('om_wrapper_mismatch', 'app_test'))).toBeUndefined();
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('frozen wrapper matching the bot wrapper → NOT a mismatch, session kept', async () => {
+    probe.result = 'missing';
+    server.state = 'down';
+    bot.wrapperCli = 'aiden x claude';
+    const s = makeActivePersistentSession('om_wrapper_match');
+    s.wrapperCli = 'aiden x claude';
+    s.agentFrozen = true;
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(map.get(sessionKey('om_wrapper_match', 'app_test'))).toBeDefined();
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
+  });
+
+  it('legacy unfrozen session survives a bot that gained a wrapper (back-fills on next fork)', async () => {
+    // agentFrozen=false means the session predates agent freezing: its next
+    // fork back-fills wrapper/model from the live bot config, so it launches
+    // exactly what the bot is configured for — closing it would be a false
+    // positive.
+    probe.result = 'missing';
+    server.state = 'down';
+    bot.wrapperCli = 'aiden x claude';
+    const s = makeActivePersistentSession('om_wrapper_legacy');
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(map.get(sessionKey('om_wrapper_legacy', 'app_test'))).toBeDefined();
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
   });
 
   it('"missing" + server DOWN → keeps ALL sessions (no mass-close after reboot)', async () => {
