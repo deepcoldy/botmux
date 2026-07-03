@@ -108,13 +108,55 @@ export function interactiveSelect(opts: {
       }
       // Backspace
       if (key === '\x7f' || key === '\x08') { query = query.slice(0, -1); refilter(); render(); return; }
-      // 普通可打印字符 → 追加到搜索
-      if (isPrintable(key)) { query += key; cursor = 0; refilter(); render(); return; }
+      // 普通可打印字符 → 追加到搜索。粘贴 / 快速输入会把多个字符合并成一个
+      // chunk 送达，逐字符过滤后整段追加（含控制字符的混合序列仍整体忽略）。
+      const printable = [...key].every((ch) => isPrintable(ch));
+      if (key.length > 0 && printable) { query += key; cursor = 0; refilter(); render(); return; }
       // 其它（未识别的转义序列等）忽略
     }
 
     input.on('data', onData);
   });
+}
+
+/**
+ * 通用选择题：TTY 下走 {@link interactiveSelect}（↑/↓ + 搜索 + ⏎），非 TTY
+ * 回退为「打印带序号列表 + readline 读序号」。setup 里所有"从 N 个选项里挑
+ * 一个"的问题统一走这里，与 CLI 适配器选择器同款交互。
+ *
+ * 返回选中项下标；取消（Esc / Ctrl-C）返回 null，由调用方决定取消语义
+ * （保留当前值 / 中止流程）。非 TTY 下留空返回 defaultIndex（未设则 null），
+ * 无效输入重问（stdin 关闭时 readline 读到空串 → 走默认值，不会死循环）。
+ */
+export async function pickChoice(
+  rl: ReturnType<typeof createInterface>,
+  opts: {
+    title: string;
+    items: ReadonlyArray<SelectItem>;
+    defaultIndex?: number;
+    footer?: string;
+  },
+): Promise<number | null> {
+  const { items, defaultIndex } = opts;
+  if (items.length === 0) return null;
+
+  if (!input.isTTY || !output.isTTY) {
+    const lines = items.map((o, i) => `  ${i + 1}) ${o.label}${o.hint ? `（${o.hint}）` : ''}`);
+    output.write(`\n${opts.title}\n${lines.join('\n')}\n`);
+    const defLabel = defaultIndex !== undefined ? ` [${defaultIndex + 1}]` : '';
+    for (;;) {
+      const ans = (await new Promise<string>((res) => rl.question(`选择 (1-${items.length})${defLabel}: `, res))).trim();
+      if (!ans) return defaultIndex ?? null;
+      const n = Number(ans);
+      if (Number.isInteger(n) && n >= 1 && n <= items.length) return n - 1;
+      output.write(`  无效选择: ${ans}\n`);
+    }
+  }
+
+  const idx = await interactiveSelect({ title: opts.title, items, footer: opts.footer });
+  // alt-screen 退出后什么都不留，回显选中项，让上下文可读。
+  if (idx !== null) output.write(` ✔ ${opts.title}: ${items[idx].label}\n`);
+  return idx;
 }
 
 /**

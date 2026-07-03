@@ -227,11 +227,14 @@ npm install -g botmux
 
 ### 2. 创建应用并配置（`botmux setup`）
 
-跑 `botmux setup`，按交互菜单一步步选：
+跑 `botmux setup`，全程交互式选择（↑/↓ 选择、输入即搜索、⏎ 确认、Esc 取消；非交互终端自动回退为序号输入）：
 
-1. **新建配置**：输入 `1` 回车（已有配置时输入 `2` 添加机器人）。
-2. **创建机器人**：输入 `1` → **扫码创建（推荐）**，飞书扫码完成后自动建出 PersonalAgent 应用并落盘 AppID/AppSecret，**事件订阅 + bot 能力默认已配好**，无需手动浏览器创建。底层走 `@larksuiteoapi/node-sdk` 官方 device flow。（也可输入 `2` 手动粘贴 AppID/Secret，见文末折叠的「手动创建应用」。）
-3. **选择 CLI**：选本次要接入的 CLI（如接 Claude Code 就选 `1`）。
+1. **操作**：首次安装直接进入创建流程；已有配置时先选「添加新机器人 / 重新配置 / 编辑现有机器人 / 删除机器人」。
+2. **飞书应用来源**：三选一——
+   - **扫码创建新应用（推荐）**：飞书扫码后自动建出 PersonalAgent 应用并落盘 AppID/AppSecret，**事件订阅 + bot 能力默认已配好**，无需手动浏览器创建。底层走 `@larksuiteoapi/node-sdk` 官方 device flow。
+   - **选择已有应用**：复用（或扫码获取）飞书 Web 登录态，列出你在开放平台创建过的应用，选中后**自动读取 AppID/AppSecret**——换机器重配、复用旧应用不用再去后台翻 Secret（仅飞书租户）。
+   - **手动输入 AppID/Secret**：见文末折叠的「手动创建应用」。
+3. **选择 CLI**：选本次要接入的 CLI（可搜索，如输入 `cla` 过滤出 Claude）。
 4. **新话题工作目录**：二选一——
    - **仓库选择卡片（推荐）**：新话题先弹卡片，从扫描到的 git 仓库里选一个再启动。下一问填**仓库扫描根目录**，通常是 git 项目的**父级目录**（如 `~/projects`，支持逗号分隔多个），卡片从该目录**向下**查找 git 仓库（最多 3 层）；尽量别填 `~`（要遍历太多文件夹）。
    - **固定默认目录**：新话题直接在指定目录启动、**不弹卡片**（落 `defaultWorkingDir` 字段，之后可用 `/config` 或 `botmux setup edit` 修改）。
@@ -292,7 +295,7 @@ botmux autostart enable
 
 <br>
 
-**手动创建应用**：去 [飞书开放平台](https://open.larkoffice.com/app) 建「企业自建应用」，在「凭证与基础信息」复制 **App ID / App Secret**，在 `botmux setup` 的「创建机器人」步骤选 `2` 粘贴回来。
+**手动创建应用**：去 [飞书开放平台](https://open.larkoffice.com/app) 建「企业自建应用」，在「凭证与基础信息」复制 **App ID / App Secret**，在 `botmux setup` 的「飞书应用来源」步骤选「手动输入 AppID/Secret」粘贴回来。
 
 ![创建应用](docs/setup/create-app.png)
 

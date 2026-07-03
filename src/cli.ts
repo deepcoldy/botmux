@@ -58,7 +58,7 @@ import {
   SETUP_CLI_USAGE,
   type SetupCommand,
 } from './setup/setup-args.js';
-import { pickCliSelection } from './setup/interactive-select.js';
+import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interactive-select.js';
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
@@ -564,16 +564,95 @@ async function finishOpenPlatformSetup(appId: string, brand: 'feishu' | 'lark'):
  *   AppSecret 通过 rl.question 异步读取, 不会出现在 process.argv)
  * - 任何失败都返回结构化对象, 不抛 (调用方根据 ok=false 回退)
  */
+/**
+ * 「选择已有应用」路径：复用/扫码飞书 Web 登录态 → 拉当前账号可见的自建应用
+ * 列表 → 交互选择 → 自动读取该应用的 AppSecret。任一步失败返回 ok:false，
+ * 调用方降级到手动输入。仅支持飞书 (feishu.cn) 租户（Web console 机制所限）。
+ */
+async function pickExistingAppCredentials(
+  rl: ReturnType<typeof createInterface>,
+): Promise<{ ok: true; appId: string; appSecret: string; brand: Brand } | { ok: false }> {
+  const {
+    prepareFeishuWebSession,
+    createOpenPlatformApiClient,
+    listOpenPlatformApps,
+    fetchOpenPlatformAppSecret,
+  } = await import('./setup/open-platform-automation.js');
+
+  console.log('\n获取飞书 Web 登录态（复用上次登录，过期则需重新扫码）…');
+  const prepared = await prepareFeishuWebSession({
+    onQrCode: (info) => {
+      process.stderr.write('\n请用飞书 App 扫码登录，以读取你创建过的应用列表：\n\n');
+      process.stderr.write(`${info.qrText}\n`);
+    },
+    onStatus: (message) => { process.stderr.write(`${message}\n`); },
+  });
+  if (!prepared.ok) {
+    console.log(`⚠️  飞书 Web 登录失败 (${prepared.reason}): ${prepared.message}`);
+    return { ok: false };
+  }
+
+  const clientRes = await createOpenPlatformApiClient(prepared.cookies);
+  if (!clientRes.ok) {
+    console.log(`⚠️  开放平台访问失败 (${clientRes.reason}): ${clientRes.message}`);
+    return { ok: false };
+  }
+
+  let apps;
+  try {
+    apps = await listOpenPlatformApps(clientRes.client);
+  } catch (err: any) {
+    console.log(`⚠️  拉取应用列表失败: ${err?.message ?? String(err)}`);
+    return { ok: false };
+  }
+  if (apps.length === 0) {
+    console.log('⚠️  当前账号名下没有可选的自建应用。');
+    return { ok: false };
+  }
+
+  // 已在 bots.json 里的应用打标——可以重复选（比如换机器重配），但要让人知道。
+  const configured = new Set(loadBotsJson().map(b => b?.larkAppId));
+  const idx = await pickChoice(rl, {
+    title: '选择已有应用',
+    items: apps.map(a => ({
+      label: a.name,
+      hint: `${a.clientId}${configured.has(a.clientId) ? ' · 已在 bots.json' : ''}`,
+    })),
+    footer: 'Esc 返回',
+  });
+  if (idx === null) return { ok: false };
+  const app = apps[idx];
+
+  try {
+    const appSecret = await fetchOpenPlatformAppSecret(clientRes.client, app.clientId);
+    console.log(`✅ 已选择 ${app.name} (${app.clientId})，AppSecret 已自动获取`);
+    return { ok: true, appId: app.clientId, appSecret, brand: 'feishu' };
+  } catch (err: any) {
+    console.log(`⚠️  自动读取 AppSecret 失败: ${err?.message ?? String(err)}`);
+    const manual = (await ask(rl, `请手动粘贴 ${app.clientId} 的 AppSecret（留空放弃）: `)).trim();
+    if (!manual) return { ok: false };
+    return { ok: true, appId: app.clientId, appSecret: manual, brand: 'feishu' };
+  }
+}
+
 async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promise<
   | { ok: true; appId: string; appSecret: string; brand: Brand; userOpenId?: string }
   | { ok: false; reason: 'cancelled' }
 > {
-  console.log('── 飞书应用建立 ──\n');
-  console.log('1) 扫码建应用（推荐，一步拿到 AppID/Secret，需要飞书 App 扫码）');
-  console.log('2) 手动粘 AppID/Secret（已经在开放平台创建好应用了）\n');
-  const choice = (await ask(rl, '选择 [1]: ')).trim();
+  console.log('── 飞书应用 ──\n');
+  const method = await pickChoice(rl, {
+    title: '飞书应用来源',
+    items: [
+      { label: '扫码创建新应用（推荐）', hint: '飞书 App 扫码，自动创建并拿到 AppID/Secret' },
+      { label: '选择已有应用', hint: '飞书 Web 登录列出你创建过的应用，自动取 AppID/Secret（仅飞书租户）' },
+      { label: '手动输入 AppID/Secret', hint: '已在开放平台创建好应用' },
+    ],
+    defaultIndex: 0,
+    footer: 'Esc 取消 setup',
+  });
+  if (method === null) return { ok: false, reason: 'cancelled' };
 
-  if (choice !== '2') {
+  if (method === 0) {
     // 动态导入避免冷启动加载 SDK
     const { tryRegisterApp } = await import('./setup/register-app.js');
     const result = await tryRegisterApp();
@@ -603,13 +682,23 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
     console.log('   降级到手动输入 AppID/Secret。\n');
   }
 
+  if (method === 1) {
+    const existing = await pickExistingAppCredentials(rl);
+    if (existing.ok) return existing;
+    console.log('   降级到手动输入 AppID/Secret。\n');
+  }
+
   // 手动 fallback / 手动选项：扫码路径已用 tenant_brand 自动识别；手动路径
   // 没有这个信号，兜底让用户手选租户类型（决定建应用 / 运行时的域名）。
-  console.log('\n租户类型：');
-  console.log('  1) 飞书（中国版，open.feishu.cn）');
-  console.log('  2) Lark（国际版，open.larksuite.com）');
-  const brandChoice = (await ask(rl, '选择 [1]: ')).trim();
-  const brand: Brand = brandChoice === '2' ? 'lark' : 'feishu';
+  const brandIdx = await pickChoice(rl, {
+    title: '租户类型',
+    items: [
+      { label: '飞书（中国版）', hint: 'open.feishu.cn' },
+      { label: 'Lark（国际版）', hint: 'open.larksuite.com' },
+    ],
+    defaultIndex: 0,
+  });
+  const brand: Brand = brandIdx === 1 ? 'lark' : 'feishu';
 
   console.log(`\n请在浏览器打开 ${larkHosts(brand).openApi}/app 创建应用，然后回来粘 ID/Secret。\n`);
   const appId = (await ask(rl, 'AppID (cli_xxx): ')).trim();
@@ -717,14 +806,18 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   // 新话题工作目录：两种模式二选一。旧问法只问「默认工作目录」但写的是
   // workingDir——那只是仓库选择卡片的扫描根，新话题照样弹卡，误导性强；
   // 真正「直接进目录、不弹卡」的是 defaultWorkingDir，现在显式让用户选。
-  printInputHelp('新话题工作目录', [
-    '1) 仓库选择卡片：新话题先弹卡片，从扫描到的 git 仓库中选一个再启动（推荐）。',
-    '2) 固定默认目录：新话题直接在指定目录启动、不弹卡片（之后可用 /config 或 botmux setup edit 修改）。',
-  ]);
-  const dirMode = (await ask(rl, '工作目录模式: 1) 仓库选择卡片  2) 固定默认目录  (1/2) [1]: ')).trim();
+  const dirMode = await pickChoice(rl, {
+    title: '新话题工作目录',
+    items: [
+      { label: '仓库选择卡片（推荐）', hint: '新话题先弹卡片，从扫描到的 git 仓库中选一个再启动' },
+      { label: '固定默认目录', hint: '新话题直接在指定目录启动、不弹卡片' },
+    ],
+    defaultIndex: 0,
+    footer: '之后可用 /config 或 botmux setup edit 修改',
+  });
   let workingDir: string | undefined;
   let defaultWorkingDir: string | undefined;
-  if (dirMode === '2') {
+  if (dirMode === 1) {
     // 必填 + 存在性校验循环（与 promptRequiredOwner 同款姿势）——运行时 daemon
     // 对无效 defaultWorkingDir 只会静默回退弹卡，setup 阶段必须挡住。
     for (;;) {
@@ -822,6 +915,33 @@ function formatBotConfigTable(bots: any[]): string {
   return [render(headers), ...rows.map(render)].join('\n');
 }
 
+/**
+ * 从 bots 列表交互选择一个机器人，返回下标；取消 / 找不到返回 undefined。
+ * TTY 用可搜索选择器；非 TTY 保持旧文本语义（进程名 / AppID——见
+ * parseBotSelection 上的注释，刻意不接受裸序号，避免 off-by-one 歧义）。
+ */
+async function pickBotSelection(
+  rl: ReturnType<typeof createInterface>,
+  bots: any[],
+  title: string,
+): Promise<number | undefined> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    const selected = await ask(rl, '选择机器人（进程名 或 AppID）: ');
+    return parseBotSelection(selected, bots);
+  }
+  const idx = await interactiveSelect({
+    title,
+    items: bots.map((b, i) => ({
+      label: botProcessName(b, i, PM2_NAME),
+      hint: `${b?.larkAppId ?? ''} · ${b?.cliId ?? 'claude-code'}`,
+    })),
+    footer: 'Esc 取消',
+  });
+  if (idx === null) return undefined;
+  console.log(` ✔ ${title}: ${botProcessName(bots[idx], idx, PM2_NAME)}`);
+  return idx;
+}
+
 async function promptEditBotConfig(
   rl: ReturnType<typeof createInterface>,
   bot: Record<string, any>,
@@ -890,15 +1010,18 @@ async function promptEditBotConfig(
 
   // 新话题工作目录：模式二选一（与 promptBotConfig 的新建流程同款问法）。
   const currentDirMode = bot.defaultWorkingDir
-    ? `2（固定默认目录: ${bot.defaultWorkingDir}）`
-    : `1（仓库选择卡片，扫描根: ${bot.workingDir ?? '~'}）`;
-  printInputHelp('新话题工作目录', [
-    '1) 仓库选择卡片：新话题先弹卡片选 git 仓库；下一问填卡片的扫描根目录。',
-    '2) 固定默认目录：新话题直接在指定目录启动、不弹卡片。',
-    `当前模式: ${currentDirMode}。留空保留当前配置。`,
-  ]);
-  const dirMode = (await ask(rl, '工作目录模式 (1/2) [保留当前]: ')).trim();
-  if (dirMode === '1') {
+    ? `固定默认目录: ${bot.defaultWorkingDir}`
+    : `仓库选择卡片，扫描根: ${bot.workingDir ?? '~'}`;
+  const dirMode = await pickChoice(rl, {
+    title: '新话题工作目录',
+    items: [
+      { label: '保留当前配置', hint: currentDirMode },
+      { label: '仓库选择卡片', hint: '新话题先弹卡片选 git 仓库；下一问填卡片的扫描根目录' },
+      { label: '固定默认目录', hint: '新话题直接在指定目录启动、不弹卡片' },
+    ],
+    defaultIndex: 0,
+  });
+  if (dirMode === 1) {
     printInputHelp('仓库扫描根目录', [
       '仓库选择卡片会列出这些目录下的 git 仓库，支持逗号分隔多个。',
       '留空保留当前值；输入 - 清空并回到默认 ~。',
@@ -908,14 +1031,12 @@ async function promptEditBotConfig(
       console.log('   已切回仓库选择卡片模式，原固定默认目录将被清空。');
       input.defaultWorkingDir = '-';
     }
-  } else if (dirMode === '2') {
+  } else if (dirMode === 2) {
     printInputHelp('固定默认目录', [
       '新话题直接在此目录启动、不弹仓库选择卡片。',
       '留空保留当前值；输入 - 清空并回到仓库选择卡片模式。',
     ]);
     input.defaultWorkingDir = await ask(rl, `固定默认目录 [${formatOptionalValue(bot.defaultWorkingDir)}]: `);
-  } else if (dirMode) {
-    console.log('   ⚠️ 未识别的选择，保留当前工作目录配置。');
   }
 
   printInputHelp('允许的用户', [
@@ -1266,9 +1387,24 @@ async function cmdSetup(): Promise<void> {
     console.log('');
 
     const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const action = await ask(rl, '操作: 1) 添加新机器人  2) 重新配置  3) 编辑现有机器人  4) 删除机器人  (1/2/3/4) [1]: ');
+    const action = await pickChoice(rl, {
+      title: '操作',
+      items: [
+        { label: '添加新机器人' },
+        { label: '重新配置', hint: '丢弃现有配置，重建为单机器人配置' },
+        { label: '编辑现有机器人' },
+        { label: '删除机器人' },
+      ],
+      defaultIndex: 0,
+      footer: 'Esc 退出',
+    });
+    if (action === null) {
+      rl.close();
+      console.log('\n已取消。');
+      return;
+    }
 
-    if (action === '2') {
+    if (action === 1) {
       console.log('\n── 重新配置 ──\n');
       const newBot = await promptBotConfig(rl);
       rl.close();
@@ -1288,13 +1424,12 @@ async function cmdSetup(): Promise<void> {
       return;
     }
 
-    if (action === '3') {
+    if (action === 2) {
       console.log('\n── 编辑现有机器人 ──\n');
-      const selected = await ask(rl, '选择机器人（进程名 或 AppID）: ');
-      const index = parseBotSelection(selected, bots);
+      const index = await pickBotSelection(rl, bots, '选择要编辑的机器人');
       if (index === undefined) {
         rl.close();
-        console.log('\n❌ 找不到指定机器人，配置未修改。');
+        console.log('\n❌ 未选择机器人，配置未修改。');
         return;
       }
 
@@ -1347,18 +1482,19 @@ async function cmdSetup(): Promise<void> {
       return;
     }
 
-    if (action === '4') {
+    if (action === 3) {
       console.log('\n── 删除机器人 ──\n');
-      const selected = await ask(rl, '选择机器人（进程名 或 AppID）: ');
-      const result = removeBotConfig(bots, selected);
-      if (!result) {
+      const delIndex = await pickBotSelection(rl, bots, '选择要删除的机器人');
+      if (delIndex === undefined) {
         rl.close();
-        console.log('\n❌ 找不到指定机器人，配置未修改。');
+        console.log('\n❌ 未选择机器人，配置未修改。');
         return;
       }
+      const nextBots = bots.slice();
+      const [removed] = nextBots.splice(delIndex, 1);
       const confirm = (await ask(
         rl,
-        `确认删除 ${botProcessName(result.removed, result.index, PM2_NAME)} (${result.removed.larkAppId})? (y/N): `,
+        `确认删除 ${botProcessName(removed, delIndex, PM2_NAME)} (${removed.larkAppId})? (y/N): `,
       )).trim().toLowerCase();
       rl.close();
       if (confirm !== 'y' && confirm !== 'yes') {
@@ -1368,8 +1504,8 @@ async function cmdSetup(): Promise<void> {
 
       copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
       console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
-      writeBotsJsonAtomic(result.bots);
-      console.log(`✅ 已删除机器人 ${botProcessName(result.removed, result.index, PM2_NAME)} (${result.removed.larkAppId})`);
+      writeBotsJsonAtomic(nextBots);
+      console.log(`✅ 已删除机器人 ${botProcessName(removed, delIndex, PM2_NAME)} (${removed.larkAppId})`);
       console.log(`下一步: botmux restart\n`);
       return;
     }
@@ -1391,9 +1527,22 @@ async function cmdSetup(): Promise<void> {
     // --- Single-bot mode (.env exists) ---
     console.log(`当前使用单机器人配置: ${ENV_FILE}`);
     const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const action = await ask(rl, '操作: 1) 添加新机器人  2) 覆盖当前配置  (1/2): ');
+    const action = await pickChoice(rl, {
+      title: '操作',
+      items: [
+        { label: '添加新机器人', hint: '迁移 .env 到 bots.json 多机器人配置' },
+        { label: '覆盖当前配置' },
+      ],
+      defaultIndex: 0,
+      footer: 'Esc 退出',
+    });
+    if (action === null) {
+      rl.close();
+      console.log('\n已取消。');
+      return;
+    }
 
-    if (action === '2') {
+    if (action === 1) {
       rl.close();
       const ok = await writeSingleBotConfig();
       if (ok) {
