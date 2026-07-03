@@ -10,8 +10,8 @@
 import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync } from 'node:fs';
-import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
+import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
 
@@ -145,6 +145,20 @@ describe('buildSandboxArgs (overlay model)', () => {
     for (const flag of ['--unshare-user', '--unshare-pid', '--unshare-ipc']) {
       expect(a).toContain(flag);
     }
+  });
+});
+
+describe('resolveSandboxMountPath', () => {
+  it('canonicalizes a symlink mount target so bwrap does not bind over the symlink path', () => {
+    const root = tmp();
+    const realHome = join(root, 'real-home');
+    const linkHome = join(root, 'home-link');
+    mkdirSync(realHome);
+    symlinkSync(realHome, linkHome);
+
+    expect(resolveSandboxMountPath(linkHome)).toBe(realpathSync(realHome));
+
+    rmSync(root, { recursive: true, force: true });
   });
 });
 
@@ -566,7 +580,7 @@ describe.skipIf(process.platform !== 'linux')('prepareSandbox hidePaths masks', 
         hidePaths: [`~/${rel}`],
       });
       if (r === null) return; // overlay mount unavailable in this env — skip assertions
-      const expanded = join(homedir(), rel);
+      const expanded = join(resolveSandboxMountPath(homedir()), rel);
       const idx = r.args.findIndex((x, i) => x === '--ro-bind' && r!.args[i + 2] === expanded);
       expect(idx).toBeGreaterThanOrEqual(0);
       expect(r.args).not.toContain(`~/${rel}`);

@@ -260,6 +260,13 @@ function canonicalize(p: string): string {
   try { return realpathSync(p); } catch { return resolve(p); }
 }
 
+/** bwrap cannot bind-mount over a symlink mount destination. Some hosts expose
+ *  $HOME through a symlink, so bind overlays at canonical targets while preserving
+ *  user-facing paths (for example HOME env) elsewhere. */
+export function resolveSandboxMountPath(p: string): string {
+  return canonicalize(p);
+}
+
 /**
  * Resolve user-configured sandboxReadonlyPaths: tilde-expand, drop non-existent
  * entries, and REJECT entries that (after resolving symlinks + normalizing) are
@@ -386,7 +393,8 @@ export function prepareSandbox(opts: {
   const needFuse = process.env.BOTMUX_SANDBOX_FUSE === '1' || process.getuid?.() !== 0;
   if (!ensureSandboxDeps(needFuse)) return null;
 
-  const sessionRoot = join(opts.dataDir, 'sandboxes', opts.sessionId);
+  const dataDir = resolveSandboxMountPath(opts.dataDir);
+  const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
   const outbox = join(sessionRoot, 'outbox');
   const shimBin = join(sessionRoot, 'shimbin');
   const empties = join(sessionRoot, 'empties');
@@ -400,10 +408,11 @@ export function prepareSandbox(opts: {
   const homeWork = join(vartmp, 'home-work');
   for (const d of [outbox, shimBin, empties]) mkdirSync(d, { recursive: true });
 
-  const home = homedir();
+  const envHome = homedir();
+  const home = resolveSandboxMountPath(envHome);
   // BOTMUX_SANDBOX_SRC overrides the LOWER project source for spike testing only.
-  const projectSource = process.env.BOTMUX_SANDBOX_SRC || opts.sourceWorkingDir;
-  const projectMount = opts.sourceWorkingDir;
+  const projectSource = resolveSandboxMountPath(process.env.BOTMUX_SANDBOX_SRC || opts.sourceWorkingDir);
+  const projectMount = resolveSandboxMountPath(opts.sourceWorkingDir);
 
   // A same-session re-spawn (e.g. in-pane /clear) re-enters here; unmount any
   // stale merged overlays first so we don't stack a second mount on the same dir.
@@ -498,7 +507,7 @@ export function prepareSandbox(opts: {
   // Authoritative child env via bwrap --setenv (works on pty AND tmux — the tmux
   // backend only forwards a fixed whitelist, which excludes HOME/PATH/relay).
   const env: Record<string, string> = {
-    HOME: home,                                      // home overlay is bound AT the real home path
+    HOME: envHome,                                   // preserve the user's original HOME string
     BOTMUX_SEND_RELAY: outbox,                       // routes `botmux send` to the daemon outbox watcher
     PATH: `/run/sbxbin:${process.env.PATH ?? ''}`,   // /run/sbxbin first so `botmux` = the relay shim
   };
@@ -539,7 +548,8 @@ export function prepareSandbox(opts: {
  */
 export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }): { outbox: string; workDir: string; cleanup: () => void } | null {
   if (process.platform !== 'linux') return null;
-  const sessionRoot = join(opts.dataDir, 'sandboxes', opts.sessionId);
+  const dataDir = resolveSandboxMountPath(opts.dataDir);
+  const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
   const outbox = join(sessionRoot, 'outbox');
   const projUpper = join(sessionRoot, 'proj-upper');
   if (!existsSync(outbox) && !existsSync(projUpper)) return null; // never sandboxed
@@ -563,7 +573,7 @@ export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }
 /** Reclaim one session's overlay residue: unmount both merged overlays + rm the
  *  per-session tree (incl. the /var/tmp home scratch). Idempotent / best-effort. */
 function reclaimSandbox(dataDir: string, sid: string): void {
-  const sessionRoot = join(dataDir, 'sandboxes', sid);
+  const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sid);
   unmountOverlay(join(sessionRoot, 'proj-merged'));
   unmountOverlay(join(sessionRoot, 'home-merged'));
   try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
@@ -613,7 +623,8 @@ function liveSandboxSids(): Set<string> {
  * daemon lifetime — one daemon per bot can run for days).
  */
 export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<string>): void {
-  const root = join(dataDir, 'sandboxes');
+  const sandboxDataDir = resolveSandboxMountPath(dataDir);
+  const root = join(sandboxDataDir, 'sandboxes');
   let sids: string[] = [];
   try { sids = readdirSync(root); } catch { return; } // no sandboxes dir yet
   // Grace before reclaiming an ACTIVE-but-unmounted sandbox: a worker that just
@@ -645,7 +656,7 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
       try { ageOk = now - statSync(sessionRoot).mtimeMs > ACTIVE_DEAD_GRACE_MS; } catch { ageOk = false; }
       if (!ageOk) continue; // too fresh — could be a worker mid-spawn
     }
-    reclaimSandbox(dataDir, sid);
+    reclaimSandbox(sandboxDataDir, sid);
   }
 }
 
