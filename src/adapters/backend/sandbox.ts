@@ -20,9 +20,9 @@
  * sandbox-exec approach and is handled elsewhere.
  */
 import { homedir } from 'node:os';
-import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, statSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
+import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, statSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
-import { join, dirname, relative } from 'node:path';
+import { join, dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 
@@ -244,26 +244,45 @@ function resolveExistingPaths(paths: readonly string[] | undefined, home: string
 
 /** Does readonly-binding `p` swallow the overlay root `root` (p === root or an
  *  ancestor of it)? Later binds win in bwrap, so such a bind would replace the
- *  whole write-isolated overlay with the real read-only tree. */
+ *  whole write-isolated overlay with the real read-only tree. Both args must be
+ *  canonicalized first — a raw `/repo/`, `/repo/../repo`, or a symlink to the
+ *  project would slip past a plain string-prefix check yet still shadow the
+ *  overlay once bwrap normalizes/resolves the mount. */
 function coversRoot(p: string, root: string): boolean {
-  return p === root || root.startsWith(p.endsWith('/') ? p : `${p}/`);
+  if (p === root) return true;
+  const prefix = p.endsWith('/') ? p : `${p}/`; // '/' stays '/', '/a' → '/a/'
+  return root.startsWith(prefix);
+}
+
+/** Canonicalize an existing path: resolve symlinks + `.`/`..`/trailing slash.
+ *  Falls back to a lexical resolve if realpath fails (e.g. a racing unlink). */
+function canonicalize(p: string): string {
+  try { return realpathSync(p); } catch { return resolve(p); }
 }
 
 /**
  * Resolve user-configured sandboxReadonlyPaths: tilde-expand, drop non-existent
- * entries, and REJECT entries equal to or an ancestor of an overlay root
- * (home / projectMount) — those would shadow the entire write-isolated overlay.
- * Entries strictly UNDER an overlay root stay allowed: that's the documented
- * "reference material, read-only, excluded from /land" use case.
+ * entries, and REJECT entries that (after resolving symlinks + normalizing) are
+ * equal to or an ancestor of an overlay root (home / projectMount) — those would
+ * shadow the entire write-isolated overlay with the real read-only tree,
+ * silently breaking write isolation. The overlap check runs on the CANONICAL
+ * path so a symlink (`/tmp/ref -> /repo`) or a non-normalized string (`/repo/`,
+ * `/repo/../repo`) can't alias past the guard. Entries strictly UNDER an overlay
+ * root stay allowed: that's the documented "reference material, read-only,
+ * excluded from /land" use case. Returns the tilde-expanded original paths (the
+ * docs promise "mounted at the same path"); bwrap resolves any symlink source.
  * Exported for tests.
  */
 export function resolveUserReadonlyRoots(
   paths: readonly string[] | undefined, home: string, projectMount: string,
 ): string[] {
+  const homeReal = canonicalize(home);
+  const projReal = canonicalize(projectMount);
   const out: string[] = [];
   for (const p of resolveExistingPaths(paths, home)) {
-    if (coversRoot(p, home) || coversRoot(p, projectMount)) {
-      console.error(`[sandbox] sandboxReadonlyPaths entry ignored (would shadow the write-isolated overlay): ${p}`);
+    const real = canonicalize(p);
+    if (coversRoot(real, homeReal) || coversRoot(real, projReal)) {
+      console.error(`[sandbox] sandboxReadonlyPaths entry ignored (resolves to an overlay root, would shadow write isolation): ${p}`);
       continue;
     }
     out.push(p);

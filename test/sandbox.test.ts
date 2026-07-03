@@ -507,6 +507,39 @@ describe('resolveUserReadonlyRoots', () => {
       .toEqual([join(project, 'vendor')]);
   });
 
+  it('rejects a non-normalized string that resolves to an overlay root (trailing slash / dot)', () => {
+    const home = tmp();
+    const project = tmp();
+    // `/repo/` and `/repo/.` both canonicalize to the project root → dropped,
+    // even though a plain string-prefix check would let them through.
+    expect(resolveUserReadonlyRoots([`${project}/`, join(project, '.')], home, project))
+      .toEqual([]);
+  });
+
+  it('rejects a symlink that resolves to the project or home overlay root', () => {
+    const home = tmp();
+    const project = tmp();
+    const linkDir = tmp();
+    const toProject = join(linkDir, 'to-project');
+    const toHome = join(linkDir, 'to-home');
+    symlinkSync(project, toProject);
+    symlinkSync(home, toHome);
+    // Both symlinks canonicalize to an overlay root → must be dropped, else bwrap
+    // would re-mount the real tree read-only and shadow write isolation.
+    expect(resolveUserReadonlyRoots([toProject, toHome], home, project)).toEqual([]);
+  });
+
+  it('allows a symlink that resolves OUTSIDE the overlay roots', () => {
+    const home = tmp();
+    const project = tmp();
+    const snap = tmp();
+    const linkDir = tmp();
+    const link = join(linkDir, 'ref');
+    symlinkSync(snap, link);
+    // The expanded original path is returned (docs promise "mounted at the same path").
+    expect(resolveUserReadonlyRoots([link], home, project)).toEqual([link]);
+  });
+
   it('drops non-string and empty entries', () => {
     const home = tmp();
     const project = tmp();
