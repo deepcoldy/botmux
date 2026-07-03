@@ -4528,6 +4528,13 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = redactChildEnv(process.env);
+  // Put the daemon-written wrapper dir (~/.botmux/bin/botmux = THIS build) ahead of any
+  // stale npm-global botmux in PATH, so the agent's `botmux` is always this build. Matters
+  // most under read isolation: only this build has the send-cred reader — a shadowing stale
+  // build can't read bots.json (Seatbelt-denied) → `botmux send` fails "Bot not registered".
+  // (The tmux backend re-prepends this in its pane script after rcfile load; this covers the
+  // pty/direct-spawn path, whose child inherits childEnv.PATH directly.)
+  childEnv.PATH = `${join(homedir(), '.botmux', 'bin')}:${childEnv.PATH ?? ''}`;
   // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find the
   // daemon socket, route the card back to this thread, and resolve the
   // approver allowlist against session.owner. Missing env → exit 2.

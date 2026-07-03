@@ -642,14 +642,19 @@ export function buildBotmuxEnvAssignments(
  *
  * The `cd` step makes the CLI's cwd survive a wayward `cd` in the user's
  * rcfile. The `unset` step removes bare creds the pane inherited from the tmux
- * server's global env (REDACTED_ENV_UNSET_CLAUSE). The `exec /usr/bin/env` step
- * injects botmux's per-bot/per-session overrides AFTER rcfile load so they
- * can't be shadowed by leftover exports.
+ * server's global env (REDACTED_ENV_UNSET_CLAUSE). The PATH prepend puts the
+ * daemon-written wrapper dir (~/.botmux/bin, which holds THIS build's `botmux`)
+ * ahead of any npm-global botmux the rcfile put earlier in PATH — otherwise the
+ * agent's `botmux` could resolve to a stale build. Critical under read isolation:
+ * only the wrapper build has the send-cred reader; a shadowing stale build can't
+ * read bots.json (Seatbelt-denied) → `botmux send` fails "Bot not registered".
+ * The `exec /usr/bin/env` step injects botmux's per-bot/per-session overrides
+ * AFTER rcfile load so they can't be shadowed by leftover exports.
  *
  * POSIX-syntax (works in bash/zsh/sh); fish/csh/nu users get remapped to
  * bash/zsh/sh by resolveUserShell() so they hit the same SCRIPT path.
  */
-export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${REDACTED_ENV_UNSET_CLAUSE} && exec /usr/bin/env "$@"`;
+export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${REDACTED_ENV_UNSET_CLAUSE} && export PATH="$HOME/.botmux/bin:$PATH" && exec /usr/bin/env "$@"`;
 
 export const DIAGNOSTIC_SHELL_SCRIPT = [
   'cd -- "$1" 2>/dev/null || cd "$HOME" 2>/dev/null || cd /',
@@ -681,6 +686,8 @@ export function buildDebugKeepShellScript(shellPath: string): string {
     // Same redaction as SHELL_WRAPPER_SCRIPT — so neither the CLI nor the
     // interactive debug shell that follows sees server/rcfile-inherited creds.
     REDACTED_ENV_UNSET_CLAUSE,
+    // Same PATH prepend as SHELL_WRAPPER_SCRIPT (wrapper build wins over stale npm-global).
+    'export PATH="$HOME/.botmux/bin:$PATH"',
     '/usr/bin/env "$@"',
     `printf '\\n[botmux debug] CLI exited (status %d) — interactive shell active. Type exit to close the session.\\n' "$?" >&2`,
     `exec '${safeShell}' -i`,
