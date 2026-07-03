@@ -276,6 +276,91 @@ describe('POST /api/sessions/:sessionId/restart', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/suspend', () => {
+  it('suspends a live session via suspendWorker (manual_suspend reason)', async () => {
+    const ds = {
+      session: { sessionId: 's-susp', cliId: 'claude-code' },
+      worker: { send: vi.fn(), killed: false },
+      adoptedFrom: undefined,
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-susp/suspend`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, sessionId: 's-susp', suspended: true });
+    expect(suspendSpy).toHaveBeenCalledWith(ds, 'manual_suspend');
+    findSpy.mockRestore();
+    suspendSpy.mockRestore();
+  });
+
+  it('404s for sessions that are not active', async () => {
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/missing/suspend`, { method: 'POST' });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'session_not_active' });
+    findSpy.mockRestore();
+  });
+
+  it('rejects adopt/observed sessions (suspending would kill the user pane)', async () => {
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-adopt-susp', cliId: 'codex' },
+      worker: { send: vi.fn(), killed: false },
+      adoptedFrom: { source: 'tmux', tmuxTarget: '0:1.0', cwd: '/x' },
+    } as any);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-adopt-susp/suspend`, { method: 'POST' });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'adopt_suspend_unsupported' });
+    expect(suspendSpy).not.toHaveBeenCalled();
+    findSpy.mockRestore();
+    suspendSpy.mockRestore();
+  });
+
+  it('is idempotent when the worker is already gone (idle-suspended earlier)', async () => {
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-gone', cliId: 'codex' },
+      worker: null,
+      adoptedFrom: undefined,
+    } as any);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-gone/suspend`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, suspended: false, reason: 'no_live_worker' });
+    expect(suspendSpy).not.toHaveBeenCalled();
+    findSpy.mockRestore();
+    suspendSpy.mockRestore();
+  });
+
+  it('409s when the backend is not suspendable (suspendWorker returns false)', async () => {
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-pty', cliId: 'codex' },
+      worker: { send: vi.fn(), killed: false },
+      adoptedFrom: undefined,
+    } as any);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(false);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-pty/suspend`, { method: 'POST' });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'backend_not_suspendable' });
+    findSpy.mockRestore();
+    suspendSpy.mockRestore();
+  });
+});
+
 describe('POST /api/sessions/:sessionId/resume', () => {
   it('wakes a resumed session immediately when wake=1 is set', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-'));

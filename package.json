@@ -24,7 +24,7 @@
     "daemon:logs": "node dist/cli.js logs",
     "daemon:status": "node dist/cli.js status",
     "use:here": "node scripts/claim-botmux-bin.mjs",
-    "creds:sync": "node scripts/sync-isolated-creds.mjs",
+    "creds:sync": "node dist/cli.js suspend --isolated",
     "switch:here": "pnpm build && pnpm use:here",
     "test": "vitest run --project unit",
     "test:all": "vitest run",

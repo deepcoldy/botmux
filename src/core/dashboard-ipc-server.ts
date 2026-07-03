@@ -30,7 +30,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, getUserProfile } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
@@ -251,6 +251,32 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
   forkWorker(ds, '', ds.hasHistory);
   postRestartNotice(ds, true);
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: true });
+});
+
+/** Manually suspend one active session: kill the worker + CLI/pane, session
+ *  stays active and cold-resumes from its transcript on the next message —
+ *  the same semantics the idle-worker sweeper applies over the live cap.
+ *  Primary use: `botmux suspend --isolated` after a credential rotation, so
+ *  isolated bots' next cold spawn re-provisions the freshest creds. */
+ipcRoute('POST', '/api/sessions/:sessionId/suspend', (_req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  // Adopt/observed sessions: botmux never owned the CLI — suspending would kill
+  // the user's real tmux/zellij pane. Same guard as /restart.
+  if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
+    return jsonRes(res, 409, { ok: false, error: 'adopt_suspend_unsupported' });
+  }
+  if (!ds.worker || ds.worker.killed) {
+    // Worker already gone (idle-suspended / crash-stopped) — the goal state is
+    // already reached, so report idempotent success without a live kill.
+    return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: false, reason: 'no_live_worker' });
+  }
+  if (!suspendWorker(ds, 'manual_suspend')) {
+    // Live worker but a non-suspendable (pty) backend: killing it would drop the
+    // in-memory conversation with no persistent pane to resume from lazily.
+    return jsonRes(res, 409, { ok: false, error: 'backend_not_suspendable' });
+  }
+  jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: true });
 });
 
 /** 解析 session（活跃优先，已关闭兜底）。活跃会话取 ds.session —— registry 与
