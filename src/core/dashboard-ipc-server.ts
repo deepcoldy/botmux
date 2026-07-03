@@ -35,7 +35,7 @@ import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessi
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, getUserProfile } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
-import { resumeSession, spawnDashboardSession, activateQueuedSession } from './session-manager.js';
+import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
@@ -1477,7 +1477,10 @@ ipcRoute('PUT', '/api/bot-brand-label', async (req, res) => {
 
 // Per-bot agent launch settings. Body `{ cliId, model }` where `cliId` is the
 // dashboard selection key (plain adapter id or a wrapper option such as
-// `ttadk-x-codex`). Changes affect the next spawned CLI session.
+// `ttadk-x-codex`). Changes affect the next spawned CLI session; existing
+// sessions frozen on a different cliId/wrapperCli are closed immediately, so
+// a later lazy resume can't resurrect the old CLI (#346 covered the restart
+// path; this covers the hot-switch path).
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { cliId?: unknown; model?: unknown };
@@ -1510,6 +1513,10 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   else bot.config.wrapperCli = undefined;
   bot.config.model = model || undefined;
 
+  // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
+  // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
+  const closedMismatchedSessions = await closeCliMismatchedSessionsForBot(cachedLarkAppId);
+
   const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli);
   jsonRes(res, 200, {
     ok: true,
@@ -1517,6 +1524,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     wrapperCli: selected.wrapperCli ?? null,
     model: model || null,
     selectionKey,
+    closedMismatchedSessions,
   });
 });
 

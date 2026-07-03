@@ -11,7 +11,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession } from './worker-pool.js';
+import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, probePersistentBackendServer, killPersistentSession, type PersistentBackendType } from './persistent-backend.js';
@@ -80,21 +80,49 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
   return null;
 }
 
-async function closeRestoredSessionIfCliMismatch(ds: DaemonSession): Promise<boolean> {
+async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<boolean> {
   const mismatch = sessionBotCliMismatch(ds);
   if (!mismatch) return false;
 
   const tag = ds.session.sessionId.substring(0, 8);
   const backendType = getSessionPersistentBackendType(ds);
-  if (backendType) {
+  // 仅在没有活 worker 时预杀 backing pane：restore 守卫处 ds 尚未进 registry，
+  // closeSession→killWorker 摸不到 pane，必须在这里亲手杀；而活 worker（运行时
+  // 热切场景）走 closeSession 的 close IPC 由 worker 侧优雅拆除 backing——先硬杀
+  // pane 会跟 worker 的退出处理赛跑。
+  if (backendType && (!ds.worker || ds.worker.killed)) {
     const backendName = persistentSessionName(backendType, ds.session.sessionId);
-    logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing restored active session and killing ${backendType} ${backendName}`);
+    logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session and killing ${backendType} ${backendName}`);
     killPersistentSession(backendType, backendName);
   } else {
-    logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing restored active session`);
+    logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session`);
   }
   await closeSession(ds.session.sessionId);
   return true;
+}
+
+/**
+ * Runtime counterpart of the restore-time CLI-mismatch guard（#346 只堵了重启
+ * 路径）：bot 的启动选择（cliId / wrapperCli）在 daemon 运行中被热切后，存量会话
+ * 仍冻结着旧 CLI，下一条消息（或 terminal 唤醒）会把旧 CLI lazy resume 回来。
+ * 热切端点在改完配置后调用本函数，把该 bot 名下失配的活跃会话连同 backing pane
+ * 一起关掉。
+ *
+ * 豁免口径与 restoreActiveSessions 一致：queued（待办池）会话从没起过 CLI；
+ * adopt 会话接管的是用户自己的外部 CLI，其 cliId 与 bot 配置不同是合法状态。
+ */
+export async function closeCliMismatchedSessionsForBot(larkAppId: string): Promise<number> {
+  const registry = getActiveSessionsRegistry();
+  if (!registry) return 0;
+  let closed = 0;
+  // 先快照再遍历：closeSession 会在迭代途中从 registry 删项。
+  for (const ds of [...registry.values()]) {
+    if (ds.larkAppId !== larkAppId) continue;
+    if (ds.session.queued) continue;
+    if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
+    if (await closeActiveSessionIfCliMismatch(ds)) closed++;
+  }
+  return closed;
 }
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
@@ -887,7 +915,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // patch a streaming card. Cleared on the first real CLI input.
       suppressRecoveryCard: true,
     };
-    if (await closeRestoredSessionIfCliMismatch(ds)) continue;
+    if (await closeActiveSessionIfCliMismatch(ds)) continue;
     const anchor = sessionAnchorId(ds);
     messageQueue.ensureQueue(anchor);
     if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
@@ -969,7 +997,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     // check on the reattach path too — persistent-backend reattach ignores the
     // bin/args handed to backend.spawn(), so anything that slips through here
     // would silently resurrect the old frozen CLI.
-    if (await closeRestoredSessionIfCliMismatch(ds)) continue;
+    if (await closeActiveSessionIfCliMismatch(ds)) continue;
 
     const tag = ds.session.sessionId.substring(0, 8);
     logger.info(`[${tag}] ${backendType} session alive, queued for re-attach`);

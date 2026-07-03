@@ -67,6 +67,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
   forkAdoptWorker: vi.fn(),
   killStalePids: vi.fn(),
+  getActiveSessionsRegistry: vi.fn(() => wp.registry ?? undefined),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, key: string, ds: any) => {
@@ -147,7 +148,8 @@ vi.mock('../src/core/session-activity.js', () => ({
   markSessionActivity: vi.fn(),
 }));
 
-import { restoreActiveSessions } from '../src/core/session-manager.js';
+import { restoreActiveSessions, closeCliMismatchedSessionsForBot } from '../src/core/session-manager.js';
+import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { forkWorker, closeSession } from '../src/core/worker-pool.js';
 import { announceSessionRow } from '../src/core/session-activity.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -395,5 +397,115 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).toHaveBeenCalled();
     expect(vi.mocked(forkWorker).mock.calls[0]![0].session.sessionId).toBe(s.sessionId);
     expect(map.get(sessionKey('om_exists', 'app_test'))).toBeDefined();
+  });
+});
+
+// ─── Runtime hot-switch sweep (closeCliMismatchedSessionsForBot) ─────────────
+//
+// The dashboard PUT /api/bot-agent hot-swaps a bot's cliId/wrapperCli without a
+// daemon restart, so the restore-time guard never runs; this sweep is its
+// runtime counterpart. Same mismatch predicate, same exemptions (queued /
+// adopt), scoped to one bot's larkAppId.
+describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', () => {
+  /** Register a minimal restored-style DaemonSession into wp.registry. */
+  function registerDs(s: ReturnType<typeof makeActivePersistentSession>, larkAppId = 'app_test') {
+    const ds = {
+      session: s,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId: s.chatId,
+      chatType: 'group' as const,
+      scope: 'thread' as const,
+      spawnedAt: Date.now(),
+      cliVersion: '1.0.0-test',
+      lastMessageAt: Date.now(),
+      hasHistory: true,
+      workingDir: s.workingDir,
+    } as unknown as DaemonSession;
+    wp.registry!.set(sessionKey(s.rootMessageId, larkAppId), ds);
+    return ds;
+  }
+
+  beforeEach(() => {
+    wp.registry = new Map<string, DaemonSession>();
+  });
+
+  it('closes mismatched sessions of this bot, keeps matching ones', async () => {
+    const stale = makeActivePersistentSession('om_rt_stale');
+    stale.cliId = 'codex';
+    sessionStore.updateSession(stale);
+    registerDs(stale);
+    const fresh = makeActivePersistentSession('om_rt_fresh');
+    registerDs(fresh);
+
+    const closed = await closeCliMismatchedSessionsForBot('app_test');
+
+    expect(closed).toBe(1);
+    expect(closeSession).toHaveBeenCalledWith(stale.sessionId);
+    expect(sessionStore.getSession(stale.sessionId)!.status).toBe('closed');
+    expect(wp.registry!.get(sessionKey('om_rt_stale', 'app_test'))).toBeUndefined();
+    expect(sessionStore.getSession(fresh.sessionId)!.status).toBe('active');
+    expect(wp.registry!.get(sessionKey('om_rt_fresh', 'app_test'))).toBeDefined();
+  });
+
+  it('closes wrapper-axis mismatches for frozen sessions', async () => {
+    const s = makeActivePersistentSession('om_rt_wrapper');
+    s.wrapperCli = 'aiden x claude';
+    s.agentFrozen = true;
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('exempts queued and adopt sessions, and other bots\' sessions', async () => {
+    const queued = makeActivePersistentSession('om_rt_queued');
+    queued.cliId = 'codex';
+    queued.queued = true;
+    sessionStore.updateSession(queued);
+    registerDs(queued);
+
+    const adopt = makeActivePersistentSession('om_rt_adopt');
+    adopt.cliId = 'codex';
+    adopt.title = 'Adopt: my-pane';
+    adopt.adoptedFrom = { source: 'tmux', tmuxTarget: 'ext:0.0', cliId: 'codex', cwd: '/tmp' } as any;
+    sessionStore.updateSession(adopt);
+    registerDs(adopt);
+
+    const otherBot = makeActivePersistentSession('om_rt_other');
+    otherBot.cliId = 'codex';
+    otherBot.larkAppId = 'app_other';
+    sessionStore.updateSession(otherBot);
+    registerDs(otherBot, 'app_other');
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(closeSession).not.toHaveBeenCalled();
+    for (const s of [queued, adopt, otherBot]) {
+      expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
+    }
+  });
+
+  it('live-worker mismatch → closes gracefully WITHOUT pre-killing the backing pane', async () => {
+    // With a live worker, closeSession's close IPC lets the worker tear down
+    // its own backing session; a daemon-side hard kill first would race the
+    // worker's exit handling. Pre-kill is reserved for worker-less records.
+    const s = makeActivePersistentSession('om_rt_live');
+    s.cliId = 'codex';
+    sessionStore.updateSession(s);
+    const ds = registerDs(s);
+    (ds as any).worker = { killed: false };
+    vi.mocked(TmuxBackend.killSession).mockClear();
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(TmuxBackend.killSession).not.toHaveBeenCalled();
+  });
+
+  it('returns 0 when the registry is not initialized', async () => {
+    wp.registry = null;
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
   });
 });
