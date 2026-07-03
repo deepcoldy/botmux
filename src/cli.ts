@@ -3009,7 +3009,9 @@ async function cmdSuspend(): Promise<void> {
   const isolated = argv.includes('--isolated');
   const botIdx = argv.indexOf('--bot');
   const botAppId = botIdx >= 0 ? argv[botIdx + 1] : undefined;
-  const positional = argv.filter((a, i) => !a.startsWith('--') && i !== botIdx + 1);
+  // Exclude the --bot VALUE only when --bot is actually present; otherwise botIdx=-1
+  // makes botIdx+1=0 and wrongly drops the first positional (the session-id / `all`).
+  const positional = argv.filter((a, i) => !a.startsWith('--') && !(botIdx >= 0 && i === botIdx + 1));
   const target = positional[0];
 
   if (!target && !botAppId && !isolated) {
