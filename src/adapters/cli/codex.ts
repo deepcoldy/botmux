@@ -327,6 +327,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // but reject numbered menu choices. This remains necessary for wrappers
     // such as Aiden that cannot forward the startup-update config override.
     readyPattern: /›(?!\s*\d+\.)|\d+% left/,
+    // Codex cold starts can exceed the worker's 15s soft first-prompt timeout.
+    // Wait for the real composer marker so the bare-shell guard does not treat
+    // a still-loading zsh wrapper as a failed launch.
+    deferFirstPromptTimeoutUntilReady: true,
     defaultPassthroughCommands: ['/goal'],
     buildSessionRenameCommand: (title) => `/rename ${title}`,
     systemHints: BOTMUX_SHELL_HINTS,
