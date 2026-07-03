@@ -295,20 +295,21 @@ describe('resolveCliId', () => {
   });
 
   it('maps setup menu indices to cliIds', () => {
-    // 序号以 src/setup/bot-config-editor.ts 的 CLI_ID_CHOICES 为准
-    //（#336 接入 Genius 在 7 号插位，其后整体顺移一位）。
+    // 序号以 src/setup/bot-config-editor.ts 的 CLI_ID_CHOICES 为准；
+    // 新 CLI 一律追加尾部，历史序号保持稳定（脚本化 setup 依赖）。
     expect(resolveCliId('1')).toBe('claude-code');
     expect(resolveCliId('4')).toBe('codex');
-    expect(resolveCliId('7')).toBe('genius');
-    expect(resolveCliId('8')).toBe('opencode');
-    expect(resolveCliId('10')).toBe('mtr');
-    expect(resolveCliId('11')).toBe('hermes');
-    expect(resolveCliId('12')).toBe('codex-app');
-    expect(resolveCliId('13')).toBe('mira');
-    expect(resolveCliId('14')).toBe('seed');
-    expect(resolveCliId('15')).toBe('traex');
-    expect(resolveCliId('16')).toBe('pi');
-    expect(resolveCliId('17')).toBe('copilot');
+    expect(resolveCliId('7')).toBe('opencode');
+    expect(resolveCliId('9')).toBe('mtr');
+    expect(resolveCliId('10')).toBe('hermes');
+    expect(resolveCliId('11')).toBe('codex-app');
+    expect(resolveCliId('12')).toBe('mira');
+    expect(resolveCliId('13')).toBe('seed');
+    expect(resolveCliId('14')).toBe('traex');
+    expect(resolveCliId('15')).toBe('pi');
+    expect(resolveCliId('16')).toBe('copilot');
+    expect(resolveCliId('20')).toBe('kimi');
+    expect(resolveCliId('21')).toBe('genius');
   });
 
   it('passes through literal cliIds unchanged', () => {
