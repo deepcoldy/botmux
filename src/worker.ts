@@ -5679,9 +5679,21 @@ process.on('message', async (raw: unknown) => {
       // Claude-family SessionStart hook fired (via `botmux session-ready` →
       // daemon). The CLI's input box is genuinely rendered — release the
       // ready-gate and deliver any held first prompt. Idempotent: a later
-      // duplicate (clear/compact source) or a post-timeout fire is a no-op.
+      // duplicate (clear/compact source) is a no-op.
       log(`SessionStart ready signal received (source=${msg.source ?? '?'})`);
+      // 先记下 gate 是否已被 45s fallback 释放：ReadyGate.receive() 是一次性
+      // 语义，fallback 抢先后 releaseReadyGate 会整块跳过迟到的真信号。
+      const lateAfterFallback = readyGate.isArmed && readyGate.isReceived;
       releaseReadyGate('SessionStart hook', { promptReadyAfterSettle: true });
+      // 冷启动超过 READY_SIGNAL_TIMEOUT_MS 的 CLI（Hermes 常态是 2-3 分钟）恰好
+      // 总落在 fallback 之后：fallback 只开闸不投递（非 type-ahead 的
+      // flushPending 是 no-op），真信号依然是权威就绪，这里直接兑现。仅限首轮
+      // （awaitingFirstPrompt）——首条 prompt 交付后 clear/compact 来源的
+      // SessionStart 保持原有 no-op 语义，绝不在会话中途误标就绪。
+      if (lateAfterFallback && awaitingFirstPrompt && !isPromptReady) {
+        log('Late ready signal after timeout fallback — marking prompt ready now');
+        markPromptReady();
+      }
       break;
     }
 
