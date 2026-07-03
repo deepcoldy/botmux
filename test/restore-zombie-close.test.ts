@@ -15,6 +15,7 @@
  *   - missing  → closeSession (Map eviction + store closed), no fork
  *   - unknown  → keep the active record (no close, no fork) for lazy recovery
  *   - exists   → auto-fork to re-attach, no close
+ *   - CLI mismatch → closeSession, so a worker-less old session cannot lazy-resume
  *
  * Heavy collaborators are mocked at the module boundary; the session-store runs
  * for real against a temp dir, and the worker-pool mock faithfully reproduces
@@ -219,6 +220,28 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(ds).toBeDefined();              // active record retained…
     expect(ds!.worker).toBeNull();         // …worker-less, resumes on next message
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('active'); // NOT closed
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('CLI mismatch on restore → closes the active record even when the backend server is down', async () => {
+    // This is the config-switch case: the bot now points at a different CLI,
+    // but an old active session still has its original cliId frozen. If restore
+    // kept it worker-less for lazy resume, the next @mention would resurrect the
+    // old CLI instead of creating a clean session with the current bot config.
+    probe.result = 'missing';
+    server.state = 'down';
+    const s = makeActivePersistentSession('om_cli_mismatch');
+    s.cliId = 'codex';
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(announceSessionRow).not.toHaveBeenCalled();
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(map.get(sessionKey('om_cli_mismatch', 'app_test'))).toBeUndefined();
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
     expect(forkWorker).not.toHaveBeenCalled();
   });
 

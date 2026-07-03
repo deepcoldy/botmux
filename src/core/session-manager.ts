@@ -58,6 +58,31 @@ function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageL
   return usageLimitStateKey(a) === usageLimitStateKey(b) && a.retryReady === b.retryReady;
 }
 
+function sessionBotCliMismatch(ds: DaemonSession): { sessionCliId: CliId; botCliId: CliId } | null {
+  const sessionCliId = ds.session.cliId;
+  if (!sessionCliId) return null;
+  let botCliId: CliId | undefined;
+  try { botCliId = getBot(ds.larkAppId).config.cliId; } catch { return null; }
+  return botCliId && sessionCliId !== botCliId ? { sessionCliId, botCliId } : null;
+}
+
+async function closeRestoredSessionIfCliMismatch(ds: DaemonSession): Promise<boolean> {
+  const mismatch = sessionBotCliMismatch(ds);
+  if (!mismatch) return false;
+
+  const tag = ds.session.sessionId.substring(0, 8);
+  const backendType = getSessionPersistentBackendType(ds);
+  if (backendType) {
+    const backendName = persistentSessionName(backendType, ds.session.sessionId);
+    logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCliId}, bot=${mismatch.botCliId}), closing restored active session and killing ${backendType} ${backendName}`);
+    killPersistentSession(backendType, backendName);
+  } else {
+    logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCliId}, bot=${mismatch.botCliId}), closing restored active session`);
+  }
+  await closeSession(ds.session.sessionId);
+  return true;
+}
+
 // ─── Path helpers ────────────────────────────────────────────────────────────
 
 export { expandHome };
@@ -848,6 +873,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // patch a streaming card. Cleared on the first real CLI input.
       suppressRecoveryCard: true,
     };
+    if (await closeRestoredSessionIfCliMismatch(ds)) continue;
     const anchor = sessionAnchorId(ds);
     messageQueue.ensureQueue(anchor);
     if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
@@ -924,18 +950,15 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       continue;
     }
 
-    // Guard against re-attaching to a persistent session that was started with a
-    // different CLI than the bot is currently configured for. Persistent backend
-    // reattach ignores the bin/args handed to backend.spawn(), so changing a
-    // bot's cliId in bots.json should kill the stale backing session instead of
-    // silently resurrecting the old CLI on restart.
+    // Belt-and-suspenders guard for any restored entry that reaches this loop:
+    // close the botmux active record too, otherwise a later lazy resume can
+    // resurrect the old frozen CLI even after the backing pane is killed.
     const tag = ds.session.sessionId.substring(0, 8);
-    const sessionCliId = ds.session.cliId;
-    let botCliId: CliId | undefined;
-    try { botCliId = getBot(ds.larkAppId).config.cliId; } catch { /* bot deregistered */ }
-    if (sessionCliId && botCliId && sessionCliId !== botCliId) {
-      logger.warn(`[${tag}] CLI mismatch (session=${sessionCliId}, bot=${botCliId}), killing stale ${backendType} ${backendName}`);
+    const mismatch = sessionBotCliMismatch(ds);
+    if (mismatch) {
+      logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCliId}, bot=${mismatch.botCliId}), closing stale active session and killing ${backendType} ${backendName}`);
       killPersistentSession(backendType, backendName);
+      await closeSession(ds.session.sessionId);
       continue;
     }
 
