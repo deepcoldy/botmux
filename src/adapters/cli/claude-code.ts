@@ -449,27 +449,12 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     id: variant.id,
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     supportsTypeAhead: true,
+    // Isolation = worker-side whole-process Seatbelt wrapper. Claude's built-in
+    // --settings sandbox is NOT used: it only sandboxes Bash (main process
+    // unsandboxed, and network Bash commands can ESCAPE it). Claude's own data
+    // is redirected into BOT_HOME via CLAUDE_CONFIG_DIR, so resume/memory work
+    // while the global ~/.claude stays denied.
     supportsReadIsolation: true,
-    // Whole-process Seatbelt wrapper (like Codex), NOT Claude's built-in --settings
-    // sandbox. The built-in only sandboxes Bash (main process unsandboxed → resume
-    // works, but network Bash commands can ESCAPE it) and needs a separate
-    // permissions.deny for the Read tool (with a deny>allow rule that blocks the
-    // memory carve-out). The external wrapper confines the WHOLE process at the
-    // kernel: no escape, one rule set covers Bash + Read tool + main process, and
-    // Seatbelt's allow-after-deny carves the bot's own project dir back in (resume +
-    // memory). Resume is preserved by allowing ~/.claude/projects/<own-cwd-hash>.
-    readIsolationMechanism: 'external-wrapper',
-    // Re-allow THIS bot's own project dir (transcripts for resume + memory) after the
-    // blanket ~/.claude/projects deny — other bots' project dirs stay denied.
-    readIsolationAllowPaths(cwd: string, dataDir: string): string[] {
-      return [claudeProjectDir(cwd, dataDir)];
-    },
-    readIsolationTranscriptRoots(homeDir: string, dataDir?: string) {
-      return {
-        own: dataDir ? join(dataDir, 'projects') : undefined,
-        foreign: [join(homeDir, '.codex', 'sessions')],
-      };
-    },
     claudeDataDir: variant.dataDir,
     claudeStateJsonPath: variant.stateJsonPath,
     spawnEnv: variant.spawnEnv,
@@ -524,7 +509,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir, readIsolation }) {
+    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -556,14 +541,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         inlineSettings.skipDangerousModePermissionPrompt = true;
         inlineSettings.permissions = { defaultMode: 'bypassPermissions' };
       }
-      // Per-bot local read isolation is enforced by the worker's WHOLE-PROCESS
-      // Seatbelt wrapper (readIsolationMechanism: 'external-wrapper'), NOT here —
-      // Claude does NOT inject its built-in --settings sandbox / permissions.deny.
-      // Injecting them would (a) block the memory carve-out (permissions deny>allow)
-      // and (b) risk nested sandboxing. The `readIsolation` context is unused in
-      // buildArgs for that reason; the outer sandbox-exec is the sole enforcer.
-      void readIsolation;
       // 仅在有内容（bypass 键）时才传 --settings；disableCliBypass 下没东西可传就不传。
+      // （读隔离由 worker 的整进程 Seatbelt wrapper 强制，这里不注入任何 sandbox 设置——
+      // 注入内置 sandbox 会嵌套沙箱且 permissions deny>allow 会挡掉 memory carve-out。）
       if (Object.keys(inlineSettings).length > 0) {
         args.push('--settings', JSON.stringify(inlineSettings));
       }

@@ -126,26 +126,19 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   return {
     id: 'codex',
     // codex 0.137's own filesystem profile can't express a read blocklist, so
-    // isolation is enforced by an EXTERNAL macOS Seatbelt wrapper (worker-side).
+    // isolation is enforced by the worker's whole-process macOS Seatbelt wrapper.
     // e2e verified: codex under `sandbox-exec -f <profile>` (with bypass) is
-    // blocked from denied paths and runs normally.
+    // blocked from denied paths and runs normally; its sessions/auth live in the
+    // per-bot BOT_HOME via CODEX_HOME redirection.
     supportsReadIsolation: true,
-    readIsolationMechanism: 'external-wrapper',
     authPaths: ['~/.codex/auth.json'],
-    // Codex keeps all sessions in ONE shared ~/.codex/sessions (not per-bot-separable),
-    // so it does NOT deny its own transcript root (left readable so codex can resume —
-    // a known limitation). It denies the OTHER family's: Claude's ~/.claude/projects.
-    readIsolationTranscriptRoots(homeDir: string) {
-      return { own: undefined, foreign: [join(homeDir, '.claude', 'projects')] };
-    },
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, readIsolation }) {
-      // Read isolation for Codex is enforced by the worker's Seatbelt wrapper
-      // (readIsolationMechanism='external-wrapper'), NOT by codex's own profile
-      // (codex 0.137 can't express a read blocklist). So spawn args are unchanged
-      // — keep bypass so codex's own nested sandbox is OFF and the outer Seatbelt
-      // profile is the sole enforcer.
+      // Read isolation for Codex is enforced by the worker's Seatbelt wrapper,
+      // NOT by codex's own profile (codex 0.137 can't express a read blocklist).
+      // So spawn args are unchanged — keep bypass so codex's own nested sandbox
+      // is OFF and the outer Seatbelt profile is the sole enforcer.
       const baseArgs = [
         ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
         '--no-alt-screen',

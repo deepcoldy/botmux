@@ -83,11 +83,12 @@ export interface CliAdapter {
     disableCliBypass?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */
     skillPluginDir?: string;
-    /** Per-bot local read isolation intent + context. When present AND the
-     *  adapter reports {@link supportsReadIsolation}, the adapter translates it
-     *  into its CLI's native permission mechanism (Claude: sandbox + permissions
-     *  in `--settings`). Absent → no isolation injected. */
-    readIsolation?: import('./read-isolation.js').ReadIsolationContext;
+    /** True when this session runs under per-bot read isolation (the worker
+     *  wraps the whole CLI process in a Seatbelt sandbox). Adapters use it for
+     *  isolation-specific spawn tweaks only (e.g. Codex forwards its env to
+     *  shell subprocesses so `botmux send` finds its cred file) — the isolation
+     *  itself is enforced worker-side, not via CLI args. */
+    readIsolation?: boolean;
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
@@ -242,43 +243,14 @@ export interface CliAdapter {
    *  correct for both shapes. */
   readonly supportsTypeAhead?: boolean;
 
-  /** True when this adapter can enforce per-bot local read isolation (translate
-   *  a {@link import('./read-isolation.js').ReadIsolationContext} into the CLI's
-   *  native permission mechanism). The worker gates on this: a bot with
-   *  `readIsolation` on but an adapter that does NOT support it is fail-closed
-   *  (refuse to start) rather than run silently unisolated. */
+  /** True when this adapter supports running under per-bot read isolation (its
+   *  data root is redirectable into BOT_HOME — CLAUDE_CONFIG_DIR / CODEX_HOME —
+   *  and it runs correctly under the worker's whole-process Seatbelt wrapper,
+   *  with its own built-in sandbox bypassed so nested sandboxing can't hang).
+   *  The worker gates on this: a bot with `readIsolation` on but an adapter
+   *  that does NOT support it is fail-closed (refuse to start) rather than run
+   *  silently unisolated. */
   readonly supportsReadIsolation?: boolean;
-
-  /** How this adapter enforces read isolation:
-   *   - 'settings': the adapter injects native config via buildArgs (Claude:
-   *     `--settings` sandbox + permissions.deny). Preferred when the CLI has a
-   *     resume-safe built-in (doesn't sandbox the CLI's own main process).
-   *   - 'external-wrapper' (DEFAULT when unset): the worker wraps the whole CLI
-   *     process in an OS sandbox that denies the sensitive paths — CLI-agnostic
-   *     external blocklist (macOS Seatbelt via `sandbox-exec`; Linux bwrap = TODO).
-   *     Any adapter that declares supportsReadIsolation without a 'settings'
-   *     built-in falls here automatically, so new agents are covered for free.
-   *     The CLI must bypass its OWN sandbox (nested sandboxing hangs). */
-  readonly readIsolationMechanism?: 'settings' | 'external-wrapper';
-
-  /** Paths to RE-ALLOW (carve out) inside the external-wrapper Seatbelt profile,
-   *  AFTER the blanket denies — i.e. CLI-specific "own data" the deny list scoops up
-   *  too broadly. Claude denies its whole `~/.claude/projects` tree, then re-allows
-   *  THIS session's own `projects/<cwd-hash>` here so its main process can read its
-   *  transcripts (resume) + memory while other bots' stay denied. Adapters with no
-   *  such carve-out (e.g. Codex, whose own sessions dir is simply never denied) omit
-   *  this. Keeps the worker CLI-agnostic — it just concatenates whatever the adapter
-   *  returns. `dataDir` is the EFFECTIVE (post-redirect) data root the worker resolved. */
-  readIsolationAllowPaths?(cwd: string, dataDir: string): string[];
-
-  /** The transcript dirs read isolation must deny for THIS CLI: `own` is this CLI's
-   *  OWN transcript root to deny (Claude → `<dataDir>/projects`, denied wholesale then
-   *  carved back per-project via {@link readIsolationAllowPaths}; Codex → undefined,
-   *  its shared `~/.codex/sessions` is left readable so it can resume — a known
-   *  limitation), and `foreign` lists OTHER CLI families' transcript roots this bot
-   *  never uses and must not read (Claude denies Codex's, and vice-versa). Lets the
-   *  worker fill the isolation context without branching on CLI family. */
-  readIsolationTranscriptRoots?(homeDir: string, dataDir?: string): { own?: string; foreign: string[] };
 
   /** When true, the worker's soft first-prompt timeout keeps queued input held
    *  until this adapter's `readyPattern` appears. Use only for CLIs whose startup

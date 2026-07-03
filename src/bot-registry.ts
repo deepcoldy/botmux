@@ -308,25 +308,18 @@ export interface BotConfig {
   sandboxHidePaths?: string[];
   /**
    * Per-bot LOCAL READ ISOLATION (distinct from the Linux bwrap `sandbox`
-   * above). When true, the bot's agent is confined by its CLI's native
-   * permission mechanism so it cannot read OTHER bots' session data / lark-cli
-   * credentials / the full bots.json / common host credentials. Translated
-   * per-CLI by the adapter (Claude: `--settings` sandbox + permissions.deny —
-   * verified on macOS Seatbelt; Codex: permission profile — design/待实测).
-   * Only honored on CLIs whose adapter reports `supportsReadIsolation`; a bot
-   * that sets this on an unsupported CLI is fail-closed (refused) rather than
-   * run unisolated. Default false → no behavior change.
+   * above). When true, the bot's CLI data is redirected into its own BOT_HOME
+   * and the whole CLI process is wrapped in a macOS Seatbelt sandbox, so its
+   * agent cannot read OTHER bots' session data / lark-cli credentials / the
+   * full bots.json / common host credentials. Only honored on CLIs whose
+   * adapter reports `supportsReadIsolation` and on macOS; a bot that sets this
+   * where it cannot be enforced is fail-closed (refused) rather than run
+   * unisolated. Default false → no behavior change.
    */
   readIsolation?: boolean;
   /** Extra absolute paths to deny reading, appended to the built-in default
    *  credential set. Only meaningful when `readIsolation` is true. */
   readDenyExtraPaths?: string[];
-  /** Strict allowlist mode: deny the whole home and allow only the workspace +
-   *  {@link readAllowPaths}. Most robust ("any credential, zero enumeration")
-   *  but requires listing what the bot legitimately needs to read. */
-  readIsolationStrict?: boolean;
-  /** Strict-mode read allow set (workspace roots + tool dirs the bot needs). */
-  readAllowPaths?: string[];
   backendType?: BackendType;
   /**
    * Max simultaneously-LIVE sessions for this bot. When the bot's live session
@@ -1126,10 +1119,6 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: Array.isArray(entry.readDenyExtraPaths)
         ? entry.readDenyExtraPaths.filter((p: unknown): p is string => typeof p === 'string' && !!p.trim())
-        : [],
-      readIsolationStrict: entry.readIsolationStrict === true,
-      readAllowPaths: Array.isArray(entry.readAllowPaths)
-        ? entry.readAllowPaths.filter((p: unknown): p is string => typeof p === 'string' && !!p.trim())
         : [],
       backendType: entry.backendType,
       // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).

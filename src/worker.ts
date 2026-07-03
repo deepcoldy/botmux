@@ -20,17 +20,14 @@ import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
   evaluateReadIsolationGate,
-  parseClaudeVersion,
-  versionAtLeast,
-  MIN_CLAUDE_SANDBOX_VERSION,
-  buildReadDenyPaths,
   buildSeatbeltProfile,
   isolatedPaneReattachSafe,
   sendCredFilePath,
   botHomePath,
   buildV2DenyPaths,
+  buildV2DenyRegexes,
   buildV2CarveOuts,
-  type ReadIsolationContext,
+  type V2IsolationContext,
 } from './adapters/cli/read-isolation.js';
 import { killPersistentSession, type PersistentBackendType } from './core/persistent-backend.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
@@ -155,15 +152,15 @@ function provisionIsolatedBotHome(
     if (isClaude) {
       const cdir = join(botHome, 'claude');
       mkdirSync(cdir, { recursive: true });
-      // Auth: Claude keeps its OAuth token in the macOS Keychain (not in a file), and
-      // a fresh CLAUDE_CONFIG_DIR does NOT inherit it → write it as <cdir>/.credentials.json
-      // (verified: Claude logs in from that file). Same shared account for every bot.
-      const credPath = join(cdir, '.credentials.json');
-      if (!existsSync(credPath)) {
-        const r = spawnSync('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], { encoding: 'utf-8' });
-        const tok = (r.stdout ?? '').trim();
-        if (tok) writeFileSync(credPath, tok + '\n', { mode: 0o600 });
-        else log(`[read-isolation] WARN could not read Claude keychain token — bot may hit login screen`);
+      // Auth: a fresh CLAUDE_CONFIG_DIR does NOT inherit the shared account's OAuth
+      // token → keep <cdir>/.credentials.json synced to the FRESHEST valid credential
+      // on EVERY spawn (verified: Claude logs in from that file). Refreshing here (not
+      // just seeding once) means a re-login elsewhere self-heals on the next cold
+      // spawn — no separate sync step needed. Same shared account for every bot.
+      const fresh = freshestClaudeCred();
+      if (fresh) writeCredIfChanged(join(cdir, '.credentials.json'), fresh);
+      else if (!existsSync(join(cdir, '.credentials.json'))) {
+        log(`[read-isolation] WARN no Claude credential found (keychain or ~/.claude/.credentials.json) — bot may hit login screen`);
       }
       // State: seed <cdir>/.claude.json from the GLOBAL one MINUS `projects` (keeps the
       // onboarding/promo "seen" flags + account so no dialogs appear, without leaking
@@ -179,17 +176,55 @@ function provisionIsolatedBotHome(
     } else {
       const cdir = join(botHome, 'codex');
       mkdirSync(cdir, { recursive: true });
-      // Codex auth/config ARE files → copy the shared account's auth.json + config.toml
-      // into the per-bot CODEX_HOME (once). Sessions/memory/state start fresh there.
-      for (const f of ['auth.json', 'config.toml']) {
-        const dst = join(cdir, f);
-        const src = join(homedir(), '.codex', f);
-        if (!existsSync(dst) && existsSync(src)) copyFileSync(src, dst);
-      }
+      // auth.json: keep synced to the shared account's copy on EVERY spawn (a re-login
+      // elsewhere rotates the refresh token, which would strand a stale per-bot copy).
+      const authSrc = join(homedir(), '.codex', 'auth.json');
+      if (existsSync(authSrc)) writeCredIfChanged(join(cdir, 'auth.json'), readFileSync(authSrc, 'utf-8'));
+      // config.toml: seed ONCE (it may carry per-bot customizations afterwards).
+      const cfgDst = join(cdir, 'config.toml');
+      const cfgSrc = join(homedir(), '.codex', 'config.toml');
+      if (!existsSync(cfgDst) && existsSync(cfgSrc)) copyFileSync(cfgSrc, cfgDst);
     }
   } catch (e) {
     log(`[read-isolation] WARN provisioning bot home failed: ${(e as Error).message}`);
   }
+}
+
+/** Pick the FRESHEST valid Claude OAuth credential: macOS keychain vs the global
+ *  `~/.claude/.credentials.json`, by `claudeAiOauth.expiresAt` (longest runway
+ *  wins — a re-login updates one of the two, and this picks whichever is newer).
+ *  Returns the raw credential JSON string, or null when neither source exists. */
+function freshestClaudeCred(): string | null {
+  const cands: { raw: string; exp: number }[] = [];
+  const expOf = (raw: string): number => {
+    try { return Number(JSON.parse(raw)?.claudeAiOauth?.expiresAt) || 0; } catch { return 0; }
+  };
+  try {
+    const p = join(homedir(), '.claude', '.credentials.json');
+    if (existsSync(p)) {
+      const raw = readFileSync(p, 'utf-8').trim();
+      if (raw) cands.push({ raw, exp: expOf(raw) });
+    }
+  } catch { /* unreadable file → skip candidate */ }
+  try {
+    const r = spawnSync('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], { encoding: 'utf-8' });
+    const raw = (r.stdout ?? '').trim();
+    if (raw) cands.push({ raw, exp: expOf(raw) });
+  } catch { /* no keychain (non-mac) → skip candidate */ }
+  if (!cands.length) return null;
+  cands.sort((a, b) => b.exp - a.exp);
+  return cands[0].raw;
+}
+
+/** Write a credential file (mode 0600) only when its content actually changed —
+ *  avoids needless mtime churn on every spawn. Trailing-newline differences are
+ *  ignored for the comparison; the written form is newline-terminated. */
+function writeCredIfChanged(dst: string, raw: string): void {
+  const body = raw.endsWith('\n') ? raw : raw + '\n';
+  try {
+    if (existsSync(dst) && readFileSync(dst, 'utf-8').trim() === raw.trim()) return;
+  } catch { /* unreadable existing file → overwrite below */ }
+  writeFileSync(dst, body, { mode: 0o600 });
 }
 
 /** Seed a fresh per-bot `.claude.json` from the global top-level flags (minus projects)
@@ -3935,32 +3970,6 @@ function scheduleBusyPatternIdleProbe(source: string): void {
   busyPatternIdleProbeTimer.unref?.();
 }
 
-/** Memoized: does the resolved Claude binary support the built-in sandbox
- *  (>= MIN_CLAUDE_SANDBOX_VERSION)? Spawned once per binary path. On any
- *  failure returns false so the gate fail-closes rather than silently
- *  running an old Claude that ignores the `sandbox` key. */
-const claudeSandboxVersionCache = new Map<string, boolean>();
-function claudeSupportsSandbox(bin: string): boolean {
-  const cached = claudeSandboxVersionCache.get(bin);
-  if (cached !== undefined) return cached;
-  let ok = false;
-  let parsed = false; // did `--version` actually return a parseable version?
-  try {
-    const r = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 8000 });
-    const v = parseClaudeVersion(`${r.stdout ?? ''}${r.stderr ?? ''}`);
-    if (v) { parsed = true; ok = versionAtLeast(v, MIN_CLAUDE_SANDBOX_VERSION); }
-  } catch {
-    parsed = false;
-  }
-  // Only cache a DEFINITIVE answer (we got a version string). A transient
-  // `claude --version` timeout/spawn failure (e.g. machine under load) must NOT
-  // be memoized as "unsupported" — that would permanently fail-close an
-  // otherwise-capable claude for this daemon's lifetime. Leave uncached so the
-  // next spawn retries; this spawn still fail-closes (safe) on a null result.
-  if (parsed) claudeSandboxVersionCache.set(bin, ok);
-  return ok;
-}
-
 function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // (startupCommands one-shot is re-armed below, AFTER the reattach-vs-fresh
   // prediction — only a genuinely fresh CLI process replays them; see
@@ -4164,16 +4173,23 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // v2 read isolation: relocate the CLI's data root into the per-bot BOT_HOME
   // (`<BOTMUX_HOME>/bots/<appId>/{claude,codex}`) so each bot's transcripts/memory
   // land in its OWN (Seatbelt-allowed) dir, NOT the shared/global ~/.claude|~/.codex
-  // (which v2 denies wholesale). Computed EARLY — like willFileSandbox above — so
+  // (which v2 denies wholesale). Decided EARLY — like willFileSandbox above — so
   // every JSONL/bridge/resume path below already targets the per-bot dir. The
   // matching CLAUDE_CONFIG_DIR/CODEX_HOME env, per-bot provisioning and Seatbelt
-  // wrapper are applied at spawn time further down.
-  const willReadIsolate =
-    cfg.readIsolation === true &&
-    cliAdapter.supportsReadIsolation === true &&
-    (cliAdapter.readIsolationMechanism ?? 'external-wrapper') === 'external-wrapper' &&
-    process.platform === 'darwin' &&
-    !!process.env.SESSION_DATA_DIR;
+  // wrapper are applied at spawn time further down. This gate is the SINGLE
+  // decision point: configured-but-unenforceable fail-closes HERE (never run a
+  // session unisolated that asked for isolation).
+  const readIsolationGate = evaluateReadIsolationGate({
+    configured: cfg.readIsolation === true,
+    adapterSupports: cliAdapter.supportsReadIsolation === true,
+    wrapperCliSet: !!cfg.wrapperCli,
+    platform: process.platform,
+    sessionDataDirSet: !!process.env.SESSION_DATA_DIR,
+  });
+  if (readIsolationGate.failClosedReason) {
+    throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: ${readIsolationGate.failClosedReason}`);
+  }
+  const willReadIsolate = readIsolationGate.enabled;
   // Every bot — isolated OR not — gets its own BOT_HOME dir as a ready-made private-
   // storage slot. An isolated sibling denies this path regardless of whether the owner
   // is isolated (deny uses the full bots.json), so a non-isolated bot can drop private
@@ -4373,72 +4389,38 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
   }) || (effectiveResume && cliAdapter.initialPromptArgsIgnoredOnResume === true);
-  // Per-bot local read isolation: gate (fail-closed) + assemble the context the
-  // adapter translates into its CLI's native permission mechanism. The worker is
-  // on the host (NOT sandboxed), so it holds the sibling app ids / secret; only
-  // the spawned CLI child is confined.
-  let readIsolationCtx: ReadIsolationContext | undefined;
-  {
-    const configured = cfg.readIsolation === true;
-    // The built-in-sandbox VERSION probe only matters for the 'settings' mechanism.
-    // Claude now uses the whole-process Seatbelt wrapper ('external-wrapper'), which
-    // needs no specific Claude version — so skip the probe (and its flaky --version
-    // call) for it, exactly as for Codex.
-    const isoMechanism = cliAdapter.readIsolationMechanism ?? 'external-wrapper';
-    const gate = evaluateReadIsolationGate({
-      configured,
-      adapterSupports: cliAdapter.supportsReadIsolation === true,
-      wrapperCliSet: !!cfg.wrapperCli,
-      versionOk: configured && isoMechanism === 'settings' ? claudeSupportsSandbox(cliAdapter.resolvedBin) : true,
-    });
-    if (gate.failClosedReason) {
-      throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: ${gate.failClosedReason}`);
-    }
-    if (gate.enabled) {
-      // A reattach that reaches here is safe: the stale-pane guard above already
-      // killed any persistent pane not stamped by this daemon lifetime, so
-      // `willReattachPersistent` can now only be true for a pane WE spawned
-      // isolated this lifetime (suspend→resume) — still the confined process.
-      const sessionDataDir = process.env.SESSION_DATA_DIR;
-      if (!sessionDataDir) {
-        throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: missing SESSION_DATA_DIR`);
-      }
-      const transcriptRoots = cliAdapter.readIsolationTranscriptRoots?.(homedir(), claudeDataDir) ?? { foreign: [] };
-      readIsolationCtx = {
-        currentAppId: cfg.larkAppId,
-        otherAppIds: cfg.otherBotAppIds ?? [],
-        sessionDataDir,
-        homeDir: homedir(),
-        // CLI-agnostic: the adapter says which transcript roots to deny — its OWN
-        // (denied wholesale, carved back per-project by readIsolationAllowPaths; or
-        // undefined if its store isn't per-bot-separable) + the OTHER families' roots.
-        ownTranscriptRoot: transcriptRoots.own,
-        foreignTranscriptDirs: transcriptRoots.foreign,
-        extraDenyPaths: cfg.readDenyExtraPaths,
-        strict: cfg.readIsolationStrict,
-        allowPaths: cfg.readAllowPaths,
-        // Keep the running CLI's own auth readable (external wrapper sandboxes
-        // its main process — e.g. codex must read ~/.codex/auth.json or it crashes).
-        ownAuthPaths: (cliAdapter.authPaths ?? []).map((p) =>
-          p.startsWith('~') ? join(homedir(), p.slice(1)) : p,
-        ),
-      };
-      // Write this bot's OWN send-credential into its BOT_HOME (the same per-bot
-      // private storage as its CLI data; siblings' BOT_HOMEs are whole-denied).
-      // `botmux send` reads the secret from here instead of bots.json — so the
-      // secret never travels via env/argv (no cross-bot `ps aux` leak) and the CLI
-      // never needs to escape the sandbox.
-      try {
-        const credPath = sendCredFilePath(sessionDataDir, cfg.larkAppId);
-        mkdirSync(dirname(credPath), { recursive: true });
-        writeFileSync(
-          credPath,
-          JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand }),
-          { mode: 0o600 },
-        );
-      } catch (e) {
-        log(`[read-isolation] WARN could not write send-cred file: ${(e as Error).message}`);
-      }
+  // Per-bot local read isolation: assemble the Seatbelt profile context (the gate
+  // already fail-closed above — reaching here with willReadIsolate means it is
+  // enforceable). The worker is on the host (NOT sandboxed), so it holds the
+  // secret; only the spawned CLI child is confined. A reattach that reaches here
+  // is safe: the stale-pane guard above already killed any persistent pane not
+  // stamped as isolated, so `willReattachPersistent` can now only be true for a
+  // pane spawned isolated (still the confined process).
+  let readIsolationCtx: V2IsolationContext | undefined;
+  if (willReadIsolate) {
+    const sessionDataDir = process.env.SESSION_DATA_DIR!;
+    readIsolationCtx = {
+      homeDir: homedir(),
+      botmuxHome: dirname(sessionDataDir),
+      sessionDataDir,
+      currentAppId: cfg.larkAppId,
+      extraDenyPaths: cfg.readDenyExtraPaths,
+    };
+    // Write this bot's OWN send-credential into its BOT_HOME (the same per-bot
+    // private storage as its CLI data; siblings' BOT_HOMEs are whole-denied).
+    // `botmux send` reads the secret from here instead of bots.json — so the
+    // secret never travels via env/argv (no cross-bot `ps aux` leak) and the CLI
+    // never needs to escape the sandbox.
+    try {
+      const credPath = sendCredFilePath(sessionDataDir, cfg.larkAppId);
+      mkdirSync(dirname(credPath), { recursive: true });
+      writeFileSync(
+        credPath,
+        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand }),
+        { mode: 0o600 },
+      );
+    } catch (e) {
+      log(`[read-isolation] WARN could not write send-cred file: ${(e as Error).message}`);
     }
   }
   const args = cliAdapter.buildArgs({
@@ -4453,7 +4435,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     model: ttadkGateway ? undefined : cfg.model,
     disableCliBypass: cfg.disableCliBypass === true,
     skillPluginDir: cfg.skillPluginDir,
-    readIsolation: readIsolationCtx,
+    readIsolation: willReadIsolate,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
@@ -4591,69 +4573,51 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   let spawnArgs = args;
   let spawnCwd = cfg.workingDir;
 
-  // External-wrapper read isolation (Codex + any adapter without a 'settings'
-  // built-in — the DEFAULT): wrap the whole CLI process in an OS sandbox that
+  // Read isolation: wrap the whole CLI process in a macOS Seatbelt sandbox that
   // denies reads of the sensitive paths (blocklist). The CLI bypasses its OWN
-  // sandbox (see adapter) so the outer wrapper is the sole enforcer. Platform-
-  // dispatched: macOS Seatbelt today; Linux bwrap is a TODO placeholder.
-  const readIsolationMechanism = cliAdapter.readIsolationMechanism ?? 'external-wrapper';
-  if (readIsolationCtx && readIsolationMechanism === 'external-wrapper') {
-    // Strict allowlist mode (deny home, allow only readAllowPaths) is implemented ONLY
-    // for the legacy 'settings' path. The external wrapper would silently fall back to
-    // the BLOCKLIST here — a security downgrade for a bot that asked for allowlist — so
-    // fail-closed instead of running weaker isolation than configured.
-    if (readIsolationCtx.strict) {
-      throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: strict allowlist mode (readIsolationStrict) is not supported by the external-wrapper isolation path; refusing to silently downgrade to blocklist`);
-    }
+  // sandbox (see adapter) so the outer wrapper is the sole enforcer. Non-darwin
+  // platforms already fail-closed at the gate above (Linux bwrap is a TODO).
+  if (readIsolationCtx) {
     // Seatbelt matches CANONICAL paths (it resolves symlinks), so realpath every
     // deny/allow before emitting the profile — otherwise a sensitive root reached
     // through a symlinked prefix (e.g. a symlinked home / SESSION_DATA_DIR) would
     // silently fail-open (the /tmp→/private/tmp class of miss). realpath-if-exists:
     // a non-existent path has nothing to read, so its literal form is harmless.
+    // The ROOT dirs are canonicalized FIRST (profileCtx) so the regex patterns —
+    // which can't be realpath'd as a result — are built on canonical prefixes too.
     const canonical = (p: string) => { try { return realpathSync(p); } catch { return p; } };
     // v2 HYBRID model: whole-deny ~/.claude|~/.codex (F1 fix — own CLI data is redirected
     // into BOT_HOME, readable) + surgical-deny only the cross-bot-SENSITIVE parts of the
-    // otherwise-readable ~/.botmux + system creds. The bots/ DIR is denied WHOLESALE (so a
-    // newly-added bot is covered without cold-restarting this one, and `ls bots/` can't
-    // enumerate siblings); the own BOT_HOME is re-opened via carve-outs — an allow subpath
-    // + a file-read-metadata traverse shim on bots/ so Codex can realpath() its CODEX_HOME
-    // through the denied parent. Admin readDenyExtraPaths become FINAL denies (win over the
+    // otherwise-readable ~/.botmux + system creds. Per-bot dirs (bots/, .lark-cli-bots/)
+    // are denied WHOLESALE and per-bot session files by filename PATTERN, so a newly-
+    // added bot is covered without cold-restarting this one and nothing enumerates
+    // sibling app ids; the own slice is re-opened via carve-outs — allow subpaths + a
+    // file-read-metadata traverse shim so Codex can realpath() its CODEX_HOME through
+    // the denied parent. Admin readDenyExtraPaths become FINAL denies (win over the
     // own-allow).
-    const v2ctx = {
-      homeDir: readIsolationCtx.homeDir,
-      botmuxHome: dirname(readIsolationCtx.sessionDataDir),
-      sessionDataDir: readIsolationCtx.sessionDataDir,
-      currentAppId: readIsolationCtx.currentAppId,
-      otherAppIds: readIsolationCtx.otherAppIds ?? [],
-      extraDenyPaths: readIsolationCtx.extraDenyPaths,
+    const profileCtx: V2IsolationContext = {
+      ...readIsolationCtx,
+      homeDir: canonical(readIsolationCtx.homeDir),
+      botmuxHome: canonical(readIsolationCtx.botmuxHome),
+      sessionDataDir: canonical(readIsolationCtx.sessionDataDir),
     };
-    const denyPaths = buildV2DenyPaths(v2ctx).map(canonical);
-    const carve = buildV2CarveOuts(v2ctx);
+    const denyPaths = buildV2DenyPaths(profileCtx).map(canonical);
+    const denyRegexes = buildV2DenyRegexes(profileCtx);
+    const carve = buildV2CarveOuts(profileCtx);
     const allowPaths = carve.allowPaths.map(canonical);
     const finalDenyPaths = carve.finalDenyPaths.map(canonical);
     const traverseDirs = carve.traverseDirs.map(canonical);
-    if (process.platform === 'darwin') {
-      if (!locateOnPath('sandbox-exec')) {
-        throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: sandbox-exec not found`);
-      }
-      const profileDir = join(process.env.SESSION_DATA_DIR!, 'read-isolation');
-      mkdirSync(profileDir, { recursive: true });
-      const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
-      writeFileSync(profilePath, buildSeatbeltProfile(denyPaths, allowPaths, finalDenyPaths, traverseDirs), { mode: 0o600 });
-      seatbeltProfilePath = profilePath;
-      spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
-      spawnBin = 'sandbox-exec';
-      log(`[read-isolation] wrapping ${cliAdapter.id} in Seatbelt: sandbox-exec -f ${profilePath}`);
-    } else if (process.platform === 'linux') {
-      // TODO(read-isolation/linux): wrap in bwrap with `--ro-bind / /` +
-      // `--tmpfs`/empty-bind over each denyPath (or an equivalent landlock/
-      // seccomp policy) so the deny list is enforced kernel-side, mirroring the
-      // macOS Seatbelt profile. Until implemented, fail-closed rather than run
-      // unisolated. See buildLinuxReadIsolationWrap() placeholder.
-      throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: Linux external-wrapper isolation not yet implemented (bwrap TODO)`);
-    } else {
-      throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: external-wrapper isolation unsupported on ${process.platform}`);
+    if (!locateOnPath('sandbox-exec')) {
+      throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: sandbox-exec not found`);
     }
+    const profileDir = join(process.env.SESSION_DATA_DIR!, 'read-isolation');
+    mkdirSync(profileDir, { recursive: true });
+    const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
+    writeFileSync(profilePath, buildSeatbeltProfile(denyPaths, allowPaths, finalDenyPaths, traverseDirs, denyRegexes), { mode: 0o600 });
+    seatbeltProfilePath = profilePath;
+    spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
+    spawnBin = 'sandbox-exec';
+    log(`[read-isolation] wrapping ${cliAdapter.id} in Seatbelt: sandbox-exec -f ${profilePath}`);
   }
   // [read-isolation] Fresh isolated spawn on a persistent backend: stamp the pane
   // with this daemon's boot id so a later suspend→resume reattach can be trusted

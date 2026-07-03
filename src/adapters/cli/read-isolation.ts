@@ -1,55 +1,24 @@
 /**
- * Per-bot local read isolation — the CLI-agnostic core.
+ * Per-bot local read isolation (v2) — the CLI-agnostic core.
  *
- * Common layer expresses the ISOLATION INTENT + CONTEXT (which paths a bot may
- * or may not read); each CLI adapter translates it into that CLI's native
- * permission mechanism. This module is pure (no fs / no spawn) so it is fully
- * unit-testable and shared across adapters. The Claude adapter consumes
- * {@link buildClaudeReadIsolationSettings}; a Codex adapter would consume the
- * same {@link ReadIsolationContext} to emit a permission profile instead.
+ * Model (HYBRID): each isolated bot's CLI data is relocated into its own
+ * BOT_HOME (`<botmuxHome>/bots/<appId>`, via CLAUDE_CONFIG_DIR / CODEX_HOME),
+ * then the whole CLI process is wrapped in an OS sandbox (macOS Seatbelt via
+ * `sandbox-exec -f <profile>`) that denies reads of: the GLOBAL CLI data dirs,
+ * system credential stores, and every cross-bot-sensitive part of ~/.botmux —
+ * with the bot's OWN slice re-allowed by carve-outs. The wrapped CLI bypasses
+ * its own built-in sandbox, so the outer Seatbelt profile is the sole enforcer
+ * (covers the main process + every Bash subprocess — no escape).
+ *
+ * This module is pure (no fs / no spawn) so it is fully unit-testable and
+ * shared across adapters; the worker resolves the impure inputs (realpath,
+ * platform, adapter capability) and emits the profile.
  *
  * Threat model: a semi-trusted Feishu user driving bot A's agent must not be
  * able to read bot B's session data or credentials (bots.json is the full
  * multi-bot cred file; each bot's lark-cli config holds its app secret in
  * plaintext). See the design doc for the two-layer rationale.
  */
-
-/** Minimum Claude Code version whose built-in sandbox supports
- *  `sandbox.filesystem.denyRead` + credential-scoped blocking. */
-export const MIN_CLAUDE_SANDBOX_VERSION = '2.1.187';
-
-export interface ReadIsolationContext {
-  /** The current bot's Feishu app id (its own lark-cli config dir stays readable). */
-  currentAppId: string;
-  /** Every OTHER bot's app id — their lark-cli config dirs are denied. */
-  otherAppIds: string[];
-  /** botmux session data root (SESSION_DATA_DIR): sessions-*.json, frozen-cards, ... */
-  sessionDataDir: string;
-  /** The bot user's home directory. */
-  homeDir: string;
-  /** The running CLI's OWN transcript root to deny, e.g. Claude's
-   *  `<home>/.claude/projects`. Optional: Codex sessions live in one shared
-   *  `~/.codex/sessions` (not per-bot-separable), so Codex omits it to avoid denying
-   *  the bot its own history. (Adapter-supplied via readIsolationTranscriptRoots.) */
-  ownTranscriptRoot?: string;
-  /** Transcript roots of OTHER CLI families this bot does NOT use — denied fully.
-   *  A Codex bot must not read Claude bots' `~/.claude/projects`, and a Claude bot
-   *  must not read Codex bots' `~/.codex/sessions`. (The bot's OWN transcript root
-   *  is handled by {@link ownTranscriptRoot} for Claude; Codex's own shared
-   *  `~/.codex/sessions` stays readable so it can resume — a known limitation.) */
-  foreignTranscriptDirs?: string[];
-  /** Per-bot extra deny paths (BotConfig.readDenyExtraPaths). */
-  extraDenyPaths?: string[];
-  /** Strict allowlist mode: deny the whole home, allow only {@link allowPaths}. */
-  strict?: boolean;
-  /** Strict-mode allow set (workspace + anything the bot legitimately needs). */
-  allowPaths?: string[];
-  /** The running CLI's OWN auth/home paths that must stay readable (resolved
-   *  absolute). Critical for the external-wrapper path, which sandboxes the CLI's
-   *  MAIN process too: denying e.g. Codex's `~/.codex/auth.json` makes codex fail
-   *  to authenticate and crash-loop. Excluded from the deny set. */
-  ownAuthPaths?: string[];
-}
 
 /** Normalize a path for the deny/allow lists: require ABSOLUTE, strip trailing
  *  slashes, reject `..` traversal. Returns null for anything unusable so the
@@ -61,26 +30,6 @@ export function normalizeIsolationPath(p: string): string | null {
   if (!t.startsWith('/')) return null;
   if (t.split('/').includes('..')) return null;
   return t;
-}
-
-/** Common credential locations denied by default (opt-in feature, but once on
- *  these are covered without the user enumerating them). */
-export function defaultCredentialDenyPaths(homeDir: string): string[] {
-  const h = homeDir.replace(/\/+$/, '');
-  return [
-    `${h}/.ssh`,
-    `${h}/.aws`,
-    `${h}/.config/gh`,
-    `${h}/.config/glab-cli`,
-    `${h}/.npmrc`,
-    `${h}/.docker/config.json`,
-    `${h}/.kube`,
-    `${h}/.git-credentials`,
-    // Other coding CLIs' auth (a Claude bot has no need to read these)
-    `${h}/.codex/auth.json`,
-    `${h}/.claude/.credentials.json`,
-    `${h}/.claude.json`,
-  ];
 }
 
 /** Path of the per-bot `botmux send` credential file the worker writes under read
@@ -101,19 +50,6 @@ export function sendCredFilePath(sessionDataDir: string, appId: string): string 
   const botmuxHome = sessionDataDir.replace(/\/+$/, '').replace(/\/[^/]+$/, '');
   return `${botHomePath(botmuxHome, appId)}/send-cred.json`;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// v2 read isolation: BOTMUX_HOME per-bot model (default-deny allowlist).
-//
-// Instead of enumerating every sensitive path to DENY (blocklist — fail-open if
-// one is missed), v2 relocates each bot's private CLI data into a per-bot home
-// under BOTMUX_HOME (via CLAUDE_CONFIG_DIR / CODEX_HOME), then denies the whole
-// BOTMUX_HOME + the GLOBAL CLI dirs + system creds, and re-allows ONLY this bot's
-// own home + its own per-appId botmux files. Code/repos outside BOTMUX_HOME stay
-// open (the bot can still roam & work). Carve-outs are keyed on the IMMUTABLE
-// appId (never the user-controllable cwd), so a semi-trusted user cannot /cd them
-// onto another bot's data (the v1 F1 class of bug).
-// ─────────────────────────────────────────────────────────────────────────────
 
 /** A Feishu app id is safe to use as a path segment. Enforced because appId is
  *  concatenated into BOT_HOME (and its send-cred.json) / sessions-<appId>.json paths and
@@ -146,11 +82,10 @@ export interface V2IsolationContext {
   botmuxHome: string;
   /** botmux session data root (SESSION_DATA_DIR, e.g. `~/.botmux/data`). */
   sessionDataDir: string;
-  /** This bot's Feishu app id. */
+  /** This bot's Feishu app id. All carve-outs are keyed on it (immutable, never the
+   *  user-controllable cwd) — sibling data needs NO enumeration: per-bot dirs are
+   *  denied WHOLESALE and per-bot session files by a filename-pattern regex. */
   currentAppId: string;
-  /** Every OTHER bot's app id — their per-bot data (lark config, session file, send-cred,
-   *  BOT_HOME) is denied. */
-  otherAppIds: string[];
   /** Per-bot extra deny paths (BotConfig.readDenyExtraPaths). */
   extraDenyPaths?: string[];
 }
@@ -164,16 +99,14 @@ export interface V2IsolationContext {
  *  cross-bot-SENSITIVE parts are denied surgically: bots.json, logs, other bots' lark
  *  configs / session files / send-creds / BOT_HOMEs, and the shared conversation-content
  *  dirs. Own BOT_HOME + own session/cred + config/registry stay readable by default.
- *  Plus the system-credential stores. Everything else (code/repos/runtime) stays open. */
+ *  Plus the system-credential stores. Everything else (code/repos/runtime) stays open.
+ *
+ *  NOTE: per-bot session stores (`sessions-<appId>.json`) are denied by PATTERN — see
+ *  {@link buildV2DenyRegexes} — so no sibling-appId enumeration is needed anywhere. */
 export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
   const h = ctx.homeDir.replace(/\/+$/, '');
   const bh = ctx.botmuxHome.replace(/\/+$/, '');
   const sd = ctx.sessionDataDir.replace(/\/+$/, '');
-  // Validate every sibling appId up front: they're interpolated into sessions-<id>.json /
-  // .lark-cli-bots/<id> paths below, so a `/` or `..` (hand-edited bots.json) must be
-  // rejected — not silently mis-scoped. (The wholesale bots/ deny no longer routes them
-  // through botHomePath, which used to be the incidental guard.)
-  const others = (ctx.otherAppIds ?? []).map(assertSafeAppId);
   return dedupe(
     [
       // ── F1: whole-deny the CLI data dirs (own is redirected to BOT_HOME) ──
@@ -207,7 +140,6 @@ export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
       // newly-added bot is covered without cold-restart, and `ls .lark-cli-bots/` can't
       // enumerate siblings. Own is re-allowed via buildV2CarveOuts (+ traverse shim).
       `${h}/.lark-cli-bots`,
-      ...others.map((id) => `${sd}/sessions-${id}.json`),   // other bots' session stores
       // WHOLESALE-deny the bots/ dir (every sibling BOT_HOME + their send-cred). Own is
       // re-allowed via buildV2CarveOuts (allow subpath own + file-read-metadata traverse
       // shim so the CLI can realpath its redirected config). Denying the DIR (not each
@@ -228,10 +160,27 @@ export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
   );
 }
 
-/** The v2 Seatbelt carve-outs that accompany {@link buildV2DenyPaths}. Because the deny
- *  list WHOLESALE-denies `<botmuxHome>/bots`, these re-open the bot's OWN slice:
- *   - allowPaths: the own BOT_HOME subpath (redirected CLI data + creds + send-cred).
- *   - traverseDirs: `bots/` itself, as file-read-metadata ONLY — lets the CLI realpath()
+/** Escape a literal path for embedding in a Seatbelt regex filter. */
+function escapeForRegex(p: string): string {
+  return p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** v2 PATTERN denies — Seatbelt `regex` filters that deny a whole FILENAME CLASS
+ *  instead of enumerating sibling app ids. Covers the per-bot session stores
+ *  (`<sd>/sessions-<appId>.json`, routing metadata): a newly-added bot's store is
+ *  denied WITHOUT cold-restarting the ones already running, and no caller needs to
+ *  know the sibling app ids at all. The bot's OWN store is re-allowed by carve-out
+ *  (Seatbelt last-match, same mechanism as the wholesale-denied dirs). */
+export function buildV2DenyRegexes(ctx: V2IsolationContext): string[] {
+  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
+  return [`^${escapeForRegex(sd)}/sessions-[^/]+\\.json$`];
+}
+
+/** The v2 Seatbelt carve-outs that accompany {@link buildV2DenyPaths} +
+ *  {@link buildV2DenyRegexes}. They re-open the bot's OWN slice of each denied class:
+ *   - allowPaths: the own BOT_HOME subpath (redirected CLI data + creds + send-cred),
+ *     the own lark-cli config dir, and the own session store file.
+ *   - traverseDirs: `bots/` etc., as file-read-metadata ONLY — lets the CLI realpath()
  *     its config dir THROUGH the denied parent WITHOUT allowing `ls bots/` (enumeration).
  *   - finalDenyPaths: admin `readDenyExtraPaths`, emitted AFTER the allows so an admin
  *     deny UNDER the own BOT_HOME still wins (Seatbelt last-match). */
@@ -241,11 +190,18 @@ export function buildV2CarveOuts(ctx: V2IsolationContext): {
   finalDenyPaths: string[];
 } {
   const bh = ctx.botmuxHome.replace(/\/+$/, '');
+  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
   const h = ctx.homeDir.replace(/\/+$/, '');
   const self = assertSafeAppId(ctx.currentAppId);
   return {
-    // Re-open the bot's OWN slice of each WHOLESALE-denied per-bot dir.
-    allowPaths: [botHomePath(bh, self), `${h}/.lark-cli-bots/${self}`],
+    // Re-open the bot's OWN slice of each wholesale/pattern-denied per-bot class.
+    allowPaths: [
+      botHomePath(bh, self),
+      `${h}/.lark-cli-bots/${self}`,
+      // Own routing metadata (`botmux send` reads it to route replies); siblings'
+      // stay denied by the buildV2DenyRegexes filename pattern.
+      `${sd}/sessions-${self}.json`,
+    ],
     // file-read-metadata on the wholesale-denied parents so the CLI/skill can realpath()
     // through them WITHOUT `ls` (enumeration) leaking.
     traverseDirs: [`${bh}/bots`, `${h}/.lark-cli-bots`],
@@ -255,134 +211,11 @@ export function buildV2CarveOuts(ctx: V2IsolationContext): {
   };
 }
 
-/** The de-duplicated list of absolute paths this bot must NOT be able to read.
- *
- *  Surgical, NOT a blanket deny of SESSION_DATA_DIR: `botmux send` (run by the
- *  agent) must still read its OWN `sessions-<ownAppId>.json` to route replies.
- *  So we deny the conversation-CONTENT subdirs (transcripts, frozen cards, turn
- *  sends, crash diagnostics) + OTHER bots' session metadata files + all creds,
- *  while leaving this bot's own routing file + the daemon's own bookkeeping
- *  readable. Excludes the bot's OWN lark-cli config dir (its skills need it). */
-export function buildReadDenyPaths(ctx: ReadIsolationContext): string[] {
-  const h = ctx.homeDir.replace(/\/+$/, '');
-  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
-  const ownLarkCliDir = `${h}/.lark-cli-bots/${ctx.currentAppId}`;
-  const paths: (string | null)[] = [
-    // Credentials
-    `${h}/.botmux/bots.json`,
-    `${h}/.lark-cli`,
-    ...ctx.otherAppIds.map((id) => `${h}/.lark-cli-bots/${id}`),
-    ...defaultCredentialDenyPaths(h),
-    // Conversation content + other-bot local state (all bots')
-    ...(ctx.ownTranscriptRoot ? [ctx.ownTranscriptRoot] : []),
-    // Cross-CLI transcript roots this bot doesn't own (Codex denies Claude's
-    // ~/.claude/projects; Claude denies Codex's ~/.codex/sessions).
-    ...(ctx.foreignTranscriptDirs ?? []),
-    `${sd}/frozen-cards`,
-    `${sd}/turn-sends`,
-    `${sd}/crash-diagnostics`,
-    `${sd}/attachments`,
-    `${sd}/whiteboards`,
-    // Legacy single-file session store (pre per-app split) can hold cross-bot
-    // metadata; own routing uses sessions-<self>.json so this stays safe to deny.
-    `${sd}/sessions.json`,
-    // Other bots' session metadata (own sessions-<self>.json stays readable)
-    ...ctx.otherAppIds.map((id) => `${sd}/sessions-${id}.json`),
-    // Other bots' `botmux send` credential files (now inside each BOT_HOME): the
-    // worker writes each isolated bot's OWN secret there so `botmux send` can auth
-    // WITHOUT reading bots.json and WITHOUT the secret ever touching env/argv
-    // (which `ps aux` would leak cross-bot). Own file stays readable; deny others'.
-    ...ctx.otherAppIds.map((id) => sendCredFilePath(sd, id)),
-    // Per-bot extras (normalized; relative/`..` dropped, not silently kept)
-    ...(ctx.extraDenyPaths ?? []).map(normalizeIsolationPath),
-  ];
-  // Drop from the DENY set anything that is a preserved path or lives UNDER one
-  // (the bot's own lark-cli dir + the running CLI's own auth/state — denying its own
-  // auth would crash the wrapped main process). Deliberately does NOT drop a deny that
-  // is a PARENT of a preserved path: dropping the parent would reopen the parent's
-  // OTHER children too (e.g. dropping `~/.lark-cli-bots` to preserve one bot's dir
-  // would expose every sibling bot's). Instead the caller re-allows each preserved
-  // path as a Seatbelt allow carve-out, so a parent deny stays and only the specific
-  // preserved file/dir is re-opened.
-  const ownNorm = normalizeIsolationPath(ownLarkCliDir);
-  const preserve = new Set([ownNorm, ...(ctx.ownAuthPaths ?? []).map(normalizeIsolationPath)].filter(Boolean));
-  const isPreserved = (p: string) =>
-    preserve.has(p) || [...preserve].some((k) => k !== null && (p === k || p.startsWith(k + '/')));
-  return dedupe(
-    paths
-      .map((p) => (p ? normalizeIsolationPath(p) : null))
-      .filter((p): p is string => !!p && !isPreserved(p)),
-  );
-}
-
-/** Claude permission-rule path: absolute paths need a `//` double-slash prefix
- *  (single-slash silently fails to match — verified empirically). */
-function claudePermPath(abs: string): string {
-  return '//' + abs.replace(/^\/+/, '');
-}
-
-interface ClaudeSandboxFilesystem {
-  denyRead: string[];
-  allowRead?: string[];
-}
-export interface ClaudeReadIsolationSettings {
-  permissions: { deny: string[] };
-  sandbox: {
-    enabled: true;
-    failIfUnavailable: true;
-    filesystem: ClaudeSandboxFilesystem;
-  };
-}
-
 /**
- * Translate the intent into Claude Code `--settings`:
- *  - `sandbox.filesystem.denyRead` (kernel: Seatbelt/bwrap) covers Bash & every
- *    subprocess it spawns.
- *  - `permissions.deny` Read/Grep/Glob (CLI-enforced, survives bypassPermissions)
- *    covers the built-in file tools.
- * Both are needed — the sandbox does not govern the built-in Read tool.
- */
-export function buildClaudeReadIsolationSettings(ctx: ReadIsolationContext): ClaudeReadIsolationSettings {
-  const denyPaths = buildReadDenyPaths(ctx);
-  const permDeny: string[] = [];
-  for (const p of denyPaths) {
-    const pp = claudePermPath(p);
-    // Exact (for files) + subtree glob (for dirs); Grep/Glob for search tools.
-    permDeny.push(`Read(${pp})`, `Read(${pp}/**)`, `Grep(${pp}/**)`, `Glob(${pp}/**)`);
-  }
-
-  if (ctx.strict) {
-    const h = ctx.homeDir.replace(/\/+$/, '');
-    const ownLarkCliDir = `${h}/.lark-cli-bots/${ctx.currentAppId}`;
-    const allowRead = dedupe(
-      [...(ctx.allowPaths ?? []).map(normalizeIsolationPath), ownLarkCliDir].filter(
-        (p): p is string => !!p,
-      ),
-    );
-    return {
-      permissions: { deny: permDeny },
-      sandbox: {
-        enabled: true,
-        failIfUnavailable: true,
-        filesystem: { denyRead: [h], allowRead },
-      },
-    };
-  }
-
-  return {
-    permissions: { deny: permDeny },
-    sandbox: {
-      enabled: true,
-      failIfUnavailable: true,
-      filesystem: { denyRead: denyPaths },
-    },
-  };
-}
-
-/**
- * Decide whether read isolation should be enabled for a session, or fail-closed.
- * Pure: the caller resolves the impure inputs (adapter capability, wrapperCli,
- * whether the CLI version meets {@link MIN_CLAUDE_SANDBOX_VERSION}).
+ * Decide whether read isolation is enabled for a session, or fail-closed.
+ * Pure: the caller resolves the impure inputs. This is the SINGLE decision
+ * point — the worker computes it once and uses it for BOT_HOME redirection,
+ * provisioning, and the Seatbelt wrapper alike.
  *  - not configured → `{ enabled: false }` (no error).
  *  - configured but unenforceable → `{ enabled: false, failClosedReason }` — the
  *    caller MUST refuse to start the session rather than run unisolated.
@@ -392,27 +225,36 @@ export function evaluateReadIsolationGate(opts: {
   configured: boolean;
   adapterSupports: boolean;
   wrapperCliSet: boolean;
-  versionOk: boolean;
+  /** process.platform — the Seatbelt wrapper exists on macOS only (Linux bwrap
+   *  is unimplemented; fail-closed rather than run unisolated). */
+  platform: string;
+  /** SESSION_DATA_DIR present (BOT_HOME + profile paths derive from it). */
+  sessionDataDirSet: boolean;
 }): { enabled: boolean; failClosedReason?: string } {
   if (!opts.configured) return { enabled: false };
   if (!opts.adapterSupports)
     return { enabled: false, failClosedReason: 'the CLI adapter does not support read isolation' };
   if (opts.wrapperCliSet)
-    return { enabled: false, failClosedReason: 'wrapperCli strips --settings, read isolation cannot be enforced' };
-  if (!opts.versionOk)
-    return { enabled: false, failClosedReason: `Claude Code >= ${MIN_CLAUDE_SANDBOX_VERSION} required for read isolation` };
+    return { enabled: false, failClosedReason: 'wrapperCli strips the CLI spawn args, read isolation cannot be enforced' };
+  if (opts.platform !== 'darwin')
+    return {
+      enabled: false,
+      failClosedReason:
+        opts.platform === 'linux'
+          ? 'Linux external-wrapper isolation not yet implemented (bwrap TODO)'
+          : `external-wrapper isolation unsupported on ${opts.platform}`,
+    };
+  if (!opts.sessionDataDirSet)
+    return { enabled: false, failClosedReason: 'missing SESSION_DATA_DIR' };
   return { enabled: true };
 }
 
 /**
- * macOS Seatbelt (sandbox-exec) profile for the EXTERNAL-wrapper isolation path
- * (Codex + Claude + any CLI without a usable built-in read-deny). Blocklist: allow
- * everything, deny reads of the sensitive paths, THEN re-allow the {@link allowPaths}
- * carve-outs — `subpath` covers a file or a whole subtree. Rule ORDER matters:
- * Seatbelt applies the LAST matching rule, so an allow listed AFTER a broader deny
- * re-opens that subpath. Used e.g. to deny the whole `~/.claude/projects` tree but
- * re-allow the bot's OWN `projects/<own-cwd-hash>` (so its main process can read its
- * transcripts for resume + its memory, while every other bot's stays denied).
+ * macOS Seatbelt (sandbox-exec) profile for the whole-process isolation wrapper.
+ * Blocklist: allow everything, deny reads of the sensitive paths/patterns, THEN
+ * re-allow the carve-outs — `subpath` covers a file or a whole subtree. Rule ORDER
+ * matters: Seatbelt applies the LAST matching rule, so an allow listed AFTER a
+ * broader deny re-opens that subpath, and the final denies win over the allows.
  * Verified: reads of denied paths fail EPERM; carved-out subpaths read normally; the
  * wrapped CLI (which bypasses its OWN sandbox — nested Seatbelt would hang) runs fine.
  */
@@ -421,10 +263,18 @@ export function buildSeatbeltProfile(
   allowPaths: string[] = [],
   finalDenyPaths: string[] = [],
   traverseDirs: string[] = [],
+  denyRegexes: string[] = [],
 ): string {
   const esc = (p: string) => p.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  // Regex literals (#"…") pass backslashes RAW to the regex engine — do NOT
+  // double-escape them. A `"` would terminate the literal; swap it for `.`
+  // (single-char wildcard that still matches the quote) instead of breaking syntax.
+  const escRe = (r: string) => r.replace(/"/g, '.');
   const lines = ['(version 1)', '(allow default)'];
   for (const p of denyPaths) lines.push(`(deny file-read* (subpath "${esc(p)}"))`);
+  // Filename-pattern denies (e.g. every bot's sessions-<appId>.json) — no sibling
+  // enumeration; the own file is re-opened by an allow below (last-match).
+  for (const r of denyRegexes) lines.push(`(deny file-read* (regex #"${escRe(r)}"))`);
   // Traversal metadata-allows: a carve-out under a DENIED parent (e.g. BOT_HOME under
   // ~/.botmux) is reachable for a plain open (Seatbelt matches the final path), but a
   // realpath()/stat of an INTERMEDIATE dir is denied — which crashes CLIs that
@@ -441,27 +291,11 @@ export function buildSeatbeltProfile(
 }
 
 /**
- * PLACEHOLDER — Linux equivalent of {@link buildSeatbeltProfile}. Seatbelt is
- * macOS-only; on Linux the external-wrapper path should use bubblewrap: wrap the
- * CLI in `bwrap --ro-bind / /` (read-all base) then mask each deny path with an
- * empty `--tmpfs`/`--bind` (dir) or empty-file bind (file), or an equivalent
- * landlock policy. Returns the `bwrap` argv prefix to prepend before the CLI.
- *
- * NOT YET IMPLEMENTED — the worker fail-closes on Linux until this is filled in
- * and e2e-verified (bwrap availability, userns/AppArmor caveats, no double-bwrap
- * with botmux's existing `sandbox` field). Kept as a typed seam so wiring the
- * platform dispatch doesn't need to change.
- */
-export function buildLinuxReadIsolationWrap(_denyPaths: string[]): never {
-  throw new Error('read-isolation: Linux bwrap wrapper not implemented yet');
-}
-
-/**
  * Decide whether a live persistent pane (tmux/zellij/herdr) may be reattached for
- * an isolated bot. Isolation is injected at CLI *spawn* time (Claude `--settings`
- * / the Seatbelt wrapper) and lives on the RUNNING process, so a pane that was
- * spawned isolated STAYS isolated for its whole lifetime — including across daemon
- * restarts (the sandbox is on the CLI process, independent of the daemon).
+ * an isolated bot. Isolation is injected at CLI *spawn* time (the Seatbelt
+ * wrapper) and lives on the RUNNING process, so a pane that was spawned isolated
+ * STAYS isolated for its whole lifetime — including across daemon restarts (the
+ * sandbox is on the CLI process, independent of the daemon).
  *
  * We stamp a marker file when we spawn an isolated CLI. A reattach is safe iff that
  * marker EXISTS: its presence means "this pane was spawned isolated", so warm
@@ -474,24 +308,6 @@ export function buildLinuxReadIsolationWrap(_denyPaths: string[]): never {
  */
 export function isolatedPaneReattachSafe(markerContent: string | null | undefined): boolean {
   return (markerContent ?? '').trim().length > 0;
-}
-
-/** Extract the semver from `claude --version` output (e.g. "2.1.197 (Claude Code)"). */
-export function parseClaudeVersion(stdout: string): string | null {
-  const m = stdout.match(/(\d+)\.(\d+)\.(\d+)/);
-  return m ? `${m[1]}.${m[2]}.${m[3]}` : null;
-}
-
-/** Numeric (not lexical) semver comparison: is `v` >= `min`? */
-export function versionAtLeast(v: string, min: string): boolean {
-  const a = v.split('.').map((n) => parseInt(n, 10) || 0);
-  const b = min.split('.').map((n) => parseInt(n, 10) || 0);
-  for (let i = 0; i < Math.max(a.length, b.length); i++) {
-    const x = a[i] ?? 0;
-    const y = b[i] ?? 0;
-    if (x !== y) return x > y;
-  }
-  return true;
 }
 
 function dedupe(xs: string[]): string[] {
