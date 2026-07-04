@@ -14,6 +14,8 @@ import {
   listWebhookSecretRefs,
   setWebhookSecret,
 } from '../services/webhook-key.js';
+import { platformMachineBaseUrl } from '../platform/binding.js';
+import { isRemoteAccessEnabled } from '../global-config.js';
 import { listTriggerLogs, pruneTriggerLogs, summarizeTriggerLogs, type TriggerLogStats } from '../services/trigger-log-store.js';
 import type { TriggerErrorCode } from '../services/trigger-types.js';
 import { jsonRes } from './workflow-api.js';
@@ -72,16 +74,7 @@ function normalizeLifecycleExtractors(v: unknown): ConnectorDefinition['lifecycl
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
   const r = v as Record<string, unknown>;
   if (typeof r.dedupKey !== 'string' || !r.dedupKey.trim()) return null;
-  if (typeof r.status !== 'string' || !r.status.trim()) return null;
-  const rawMap = record(r.statusMap);
-  const statusMap = Object.fromEntries(
-    Object.entries(rawMap).filter((e): e is [string, string] => typeof e[1] === 'string'),
-  );
-  return {
-    dedupKey: r.dedupKey.trim(),
-    status: r.status.trim(),
-    ...(Object.keys(statusMap).length > 0 ? { statusMap } : {}),
-  };
+  return { dedupKey: r.dedupKey.trim() };
 }
 
 function normalizeConnectorInput(
@@ -114,17 +107,21 @@ function normalizeConnectorInput(
   if (targetMode === 'fixed' && !chatId) return { ok: false, error: 'fixed_chat_required' };
   const workflowId = typeof target.workflowId === 'string' && target.workflowId.trim() ? target.workflowId.trim() : prior?.target.workflowId;
   if (targetKind === 'workflow' && !workflowId) return { ok: false, error: 'workflow_id_required' };
+  // Dedup is now OPTIONAL for new-group (null = a fresh group per event).
   const lifecycleExtractors = c.lifecycleExtractors === undefined
     ? (prior?.lifecycleExtractors ?? null)
     : normalizeLifecycleExtractors(c.lifecycleExtractors);
-  if (targetMode === 'new-group' && !lifecycleExtractors) {
-    return { ok: false, error: 'lifecycle_extractors_required' };
-  }
 
   const secretRef =
     opts.secretRef ||
     (typeof verify.secretRef === 'string' && verify.secretRef.trim() ? verify.secretRef.trim() : prior?.verify.secretRef);
   if (!secretRef) return { ok: false, error: 'secret_required' };
+
+  // Default new connectors to the easy `token` mode; HMAC is the advanced opt-in.
+  const verifyType: ConnectorDefinition['verify']['type'] =
+    verify.type === 'hmac-sha256' || verify.type === 'token'
+      ? verify.type
+      : prior?.verify.type ?? 'token';
 
   const now = new Date().toISOString();
   const next: ConnectorDefinition = {
@@ -132,7 +129,7 @@ function normalizeConnectorInput(
     name,
     enabled: bool(c.enabled, prior?.enabled ?? true),
     verify: {
-      type: 'hmac-sha256',
+      type: verifyType,
       secretRef,
       signatureHeader: typeof verify.signatureHeader === 'string' && verify.signatureHeader.trim()
         ? verify.signatureHeader.trim().toLowerCase()
@@ -163,6 +160,11 @@ function normalizeConnectorInput(
         : prior?.promptEnvelope.headerAllowlist ?? [],
       includeRawText: bool(promptEnvelope.includeRawText, prior?.promptEnvelope.includeRawText ?? false),
       maxBodyBytes: positiveInt(promptEnvelope.maxBodyBytes, prior?.promptEnvelope.maxBodyBytes ?? 256 * 1024, 1, 10 * 1024 * 1024),
+      // A provided string sets/clears the trusted instruction (empty = clear);
+      // when the field is absent entirely, keep whatever the prior had.
+      ...(typeof promptEnvelope.instruction === 'string'
+        ? (promptEnvelope.instruction.trim() ? { instruction: promptEnvelope.instruction.trim().slice(0, 8000) } : {})
+        : prior?.promptEnvelope.instruction ? { instruction: prior.promptEnvelope.instruction } : {}),
     },
     loggingPolicy: {
       storePayload: bool(loggingPolicy.storePayload, prior?.loggingPolicy.storePayload ?? false),
@@ -182,10 +184,20 @@ function normalizeConnectorInput(
   return { ok: true, connector: next };
 }
 
-function publicWebhookUrl(req: IncomingMessage, connectorId: string): string {
-  const proto = typeof req.headers['x-forwarded-proto'] === 'string' ? req.headers['x-forwarded-proto'] : 'http';
-  const host = req.headers.host ?? 'localhost';
-  return `${proto}://${host}/webhook/${encodeURIComponent(connectorId)}`;
+function publicWebhookUrl(req: IncomingMessage, connectorId: string, token?: string): string {
+  // 远程访问开启且绑定平台后用「机器子域」中心域名（外部/内网可达，经隧道回本机）；否则回退本机 host。
+  // 经隧道访问时 req.headers.host 会被平台改写成 127.0.0.1，故必须优先用 binding 推导的中心域名。
+  const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
+  let origin: string;
+  if (platformBase) {
+    origin = platformBase;
+  } else {
+    const proto = typeof req.headers['x-forwarded-proto'] === 'string' ? req.headers['x-forwarded-proto'] : 'http';
+    origin = `${proto}://${req.headers.host ?? 'localhost'}`;
+  }
+  const base = `${origin}/webhook/${encodeURIComponent(connectorId)}`;
+  // token mode: bake the secret into the path so the whole URL is the credential.
+  return token ? `${base}/${encodeURIComponent(token)}` : base;
 }
 
 export async function handleConnectorApi(
@@ -267,12 +279,13 @@ export async function handleConnectorApi(
         return true;
       }
       const connector = upsertConnector(normalized.connector);
+      const plaintext = providedSecret ?? generatedSecret;
       jsonRes(res, 201, {
         ok: true,
         connector,
         secretRef: record.ref,
         ...(generatedSecret ? { secret: generatedSecret } : {}),
-        webhookUrl: publicWebhookUrl(req, connector.id),
+        webhookUrl: publicWebhookUrl(req, connector.id, connector.verify.type === 'token' ? plaintext : undefined),
       });
     } catch (e: any) {
       jsonRes(res, 400, { ok: false, error: e?.message ?? 'bad_json' });
@@ -293,13 +306,16 @@ export async function handleConnectorApi(
         const body = await readJsonBody<any>(req);
         let generatedSecret: string | undefined;
         let secretRef: string | undefined;
+        let plaintextForUrl: string | undefined;
         if (typeof body.secret === 'string' && body.secret) {
           secretRef = prior.verify.secretRef || createWebhookSecret(body.secret).ref;
           setWebhookSecret(secretRef, body.secret);
+          plaintextForUrl = body.secret;
         } else if (body.rotateSecret === true) {
           generatedSecret = generateWebhookSecretPlaintext();
           secretRef = prior.verify.secretRef || createWebhookSecret(generatedSecret).ref;
           setWebhookSecret(secretRef, generatedSecret);
+          plaintextForUrl = generatedSecret;
         }
         const normalized = normalizeConnectorInput({ ...body, id }, { id, prior, secretRef });
         if (!normalized.ok) {
@@ -312,7 +328,7 @@ export async function handleConnectorApi(
           connector,
           ...(secretRef ? { secretRef } : {}),
           ...(generatedSecret ? { secret: generatedSecret } : {}),
-          webhookUrl: publicWebhookUrl(req, connector.id),
+          webhookUrl: publicWebhookUrl(req, connector.id, connector.verify.type === 'token' ? plaintextForUrl : undefined),
         });
       } catch (e: any) {
         jsonRes(res, 400, { ok: false, error: e?.message ?? 'bad_json' });

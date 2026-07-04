@@ -32,6 +32,10 @@ export interface ProjectInfo {
   branch: string;
 }
 
+export interface ProjectScanOptions {
+  includeWorktrees?: boolean;
+}
+
 /**
  * Describe a single directory as a project: its basename + current git ref,
  * or null if the directory isn't a git repo/worktree. Used by `/repo <path>`
@@ -71,7 +75,7 @@ function getGitCommonDir(dir: string): string {
 /** Index 0 of `git worktree list --porcelain` is always the main worktree.
  *  All entries share its basename as `name`, so display stays stable
  *  regardless of which sibling readdir hits first. */
-function scanRepoFromAnyWorktree(anyWorktreePath: string): ProjectInfo[] {
+function scanRepoFromAnyWorktree(anyWorktreePath: string, options: ProjectScanOptions = {}): ProjectInfo[] {
   const fallback: ProjectInfo[] = [{
     name: basename(anyWorktreePath),
     path: anyWorktreePath,
@@ -111,7 +115,10 @@ function scanRepoFromAnyWorktree(anyWorktreePath: string): ProjectInfo[] {
   if (entries.length === 0) return fallback;
 
   const repoName = basename(entries[0]!.path);
-  return entries.map((wt, i) => ({
+  const includeWorktrees = options.includeWorktrees !== false;
+  return entries
+    .filter((_wt, i) => includeWorktrees || i === 0)
+    .map((wt, i) => ({
     name: repoName,
     path: wt.path,
     type: i === 0 ? 'repo' : 'worktree',
@@ -127,7 +134,7 @@ function compareProjects(a: ProjectInfo, b: ProjectInfo): number {
 /**
  * Scan a directory for git repositories and their worktrees.
  */
-export function scanProjects(baseDir: string, maxDepth: number = 3): ProjectInfo[] {
+export function scanProjects(baseDir: string, maxDepth: number = 3, options: ProjectScanOptions = {}): ProjectInfo[] {
   const projects: ProjectInfo[] = [];
   const seenRepos = new Set<string>();   // by git-common-dir
   const seenPaths = new Set<string>();   // by absolute path
@@ -147,7 +154,7 @@ export function scanProjects(baseDir: string, maxDepth: number = 3): ProjectInfo
       if (seenRepos.has(commonDir)) return;
       seenRepos.add(commonDir);
 
-      for (const p of scanRepoFromAnyWorktree(dir)) {
+      for (const p of scanRepoFromAnyWorktree(dir, options)) {
         if (!seenPaths.has(p.path)) {
           seenPaths.add(p.path);
           projects.push(p);
@@ -179,12 +186,12 @@ export function scanProjects(baseDir: string, maxDepth: number = 3): ProjectInfo
 /**
  * Scan multiple directories and deduplicate by path.
  */
-export function scanMultipleProjects(baseDirs: string[], maxDepth: number = 3): ProjectInfo[] {
+export function scanMultipleProjects(baseDirs: string[], maxDepth: number = 3, options: ProjectScanOptions = {}): ProjectInfo[] {
   const seen = new Set<string>();
   const merged: ProjectInfo[] = [];
 
   for (const dir of baseDirs) {
-    for (const project of scanProjects(dir, maxDepth)) {
+    for (const project of scanProjects(dir, maxDepth, options)) {
       if (!seen.has(project.path)) {
         seen.add(project.path);
         merged.push(project);

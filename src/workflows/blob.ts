@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
+import { atomicWriteFile } from '../utils/atomic-write.js';
 import { canonicalJsonStringify } from './definition.js';
 import type { EventLog } from './events/append.js';
 import type { OutputRef } from './events/payloads.js';
@@ -32,7 +33,8 @@ export async function writeBlob(
 ): Promise<OutputRef> {
   const hash = createHash('sha256').update(buf).digest('hex');
   const path = join(log.blobDir, hash);
-  await fs.writeFile(path, buf);
+  // 原子写：路径即 sha256，裸写半截会留下「名字对、内容错」的 blob。
+  await atomicWriteFile(path, buf);
   return {
     outputHash: `sha256:${hash}`,
     outputPath: path,

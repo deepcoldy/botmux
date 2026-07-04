@@ -37,7 +37,10 @@ export class PtyBackend implements SessionBackend {
       cols: opts.cols,
       rows: opts.rows,
       cwd: opts.cwd,
-      env: opts.env,
+      // No shared backing server here, so per-bot env (opts.injectEnv) is safe
+      // to merge straight into the child env — appended last so it wins over a
+      // same-named key already in opts.env.
+      env: opts.injectEnv ? { ...opts.env, ...opts.injectEnv } : opts.env,
     });
     logger.debug(`[pty] spawned pid=${this.process.pid}`);
   }

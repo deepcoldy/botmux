@@ -19,6 +19,8 @@ export interface ChatBrief {
   description?: string;
   chatMode?: string;
   ownerId?: string;
+  /** 群头像 URL（/open-apis/im/v1/chats 的 avatar 字段）。 */
+  avatar?: string;
 }
 
 /**
@@ -45,6 +47,7 @@ export async function listChats(larkAppId: string): Promise<ChatBrief[]> {
         description: c.description,
         chatMode: c.chat_mode,
         ownerId: c.owner_id,
+        avatar: c.avatar,
       });
     }
     pageToken = res.data?.has_more ? res.data?.page_token : undefined;

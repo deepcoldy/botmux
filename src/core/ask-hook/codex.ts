@@ -48,12 +48,17 @@ const codexAdapter: HookAskAdapter = {
     return null;
   },
 
-  formatAnswer(answersByQuestion: ReadonlyArray<ReadonlyArray<string>>, parsed: ParsedAsk): string {
+  formatAnswer(
+    answersByQuestion: ReadonlyArray<ReadonlyArray<string>>,
+    parsed: ParsedAsk,
+    comment?: string | null,
+  ): string {
     // 由于 parseQuestions 总返回 null，此方法在正常流程中不会被调用。
     // 保留实现以满足接口约定：使用 allow + 空 decision 形状。
     // TODO(dogfood): 验证 codex directive 形状
     void answersByQuestion;
     void parsed;
+    void comment;
     const directive = {
       hookSpecificOutput: {
         hookEventName: 'PermissionRequest',

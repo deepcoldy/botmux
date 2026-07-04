@@ -66,8 +66,34 @@ export class Aggregator {
   ownerOf(sessionId: string): string | undefined {
     return this.sessions.get(sessionId)?.larkAppId;
   }
+
+  /** sessionId → owning bot daemon's terminal reverse-proxy port. Used by the
+   *  dashboard `/s/*` bridge to route a terminal request to the right daemon's
+   *  proxy (each bot daemon runs its own terminal proxy on proxyBasePort+idx).
+   *  undefined when the session is unknown or its daemon's proxy isn't up. */
+  terminalProxyPortOf(sessionId: string): number | undefined {
+    return this.sessions.get(sessionId)?.proxyPort as number | undefined;
+  }
+
+  /** Whether a session row with this id exists at all in the aggregator,
+   *  regardless of `larkAppId` presence. Mirrors `scheduleExists`; lets
+   *  the Route B write gate tell apart "legacy row with no owner" from
+   *  "unknown id" so the close/resume/locate handler can route legacy rows
+   *  to the caller's bot instead of 404'ing them. */
+  sessionExists(sessionId: string): boolean {
+    return this.sessions.has(sessionId);
+  }
   scheduleOwnerOf(id: string): string | undefined {
     return (this.schedules.get(id) as { larkAppId?: string } | undefined)?.larkAppId;
+  }
+
+  /** Whether a schedule row with this id exists at all in the aggregator,
+   *  regardless of `larkAppId` presence. Used by the Route B write gate to
+   *  distinguish a "legacy row with no owner" from a genuinely "unknown id"
+   *  — the former should still proxy somewhere (the caller's bot), the
+   *  latter is a 404 (codex 2026-06-10 schedules slice 2a blocker). */
+  scheduleExists(id: string): boolean {
+    return this.schedules.has(id);
   }
 
   on(fn: (e: DashboardEvent & { larkAppId: string }) => void): () => void {

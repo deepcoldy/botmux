@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License MIT"></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg" alt="Node.js >= 20">
+  <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg" alt="Node.js >= 22">
   <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm version"></a>
   <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux?style=social" alt="GitHub Stars"></a>
 </p>
@@ -15,13 +15,14 @@
   <a href="#design-philosophy">Design</a> &middot;
   <a href="#key-advantages">Advantages</a> &middot;
   <a href="#5-minute-setup">Quick Start</a> &middot;
-  <a href="#usage">Usage</a> &middot;
-  <a href="#configuration">Config</a>
+  <a href="https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/"><b>📖 Docs</b></a>
 </p>
 
 [中文](README.md) | English
 
-**Plug any AI coding CLI into Lark (Feishu) topic groups — one thread per session, streaming cards, web terminal, zero glue code.**
+**Plug any AI coding CLI into Feishu/Lark — every DM, group or topic gets its own CLI session, with live-streaming cards, a web terminal, and zero glue code.**
+
+> 📖 **Full docs** (commands / config / best practices / troubleshooting): **<https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/>** — this README only covers why and how to get started fast.
 
 | Lark Streaming Cards | Web Terminal | tmux Session Management | Multi-Bot Collaboration |
 |:-:|:-:|:-:|:-:|
@@ -39,7 +40,7 @@
 
 ### Design Philosophy
 
-Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Cursor, Gemini, OpenCode, Antigravity) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
+Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Cursor, Gemini, OpenCode, Antigravity, GitHub Copilot, Kimi Code) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
 
 ### Key Advantages
 
@@ -51,9 +52,10 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | CLI Capabilities | Full runtime (hooks, memory, plan mode, skills, `/` commands) | SDK API subset, missing features must be reimplemented |
 | CLI Upgrades | Zero-adaptation automatic benefit | Must track SDK version changes |
 | Memory / Context | Reuses CLI's built-in memory system, improves as the CLI evolves | Must build custom memory system, duplicating CLI-native capabilities |
-| Multi-CLI Support | 6 CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity) | Tied to a single SDK, cannot switch CLIs |
+| Multi-CLI Support | 8 CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot / Kimi Code) | Tied to a single SDK, cannot switch CLIs |
 | Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
 | Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
+| Multi-Topic Collaboration | A lead bot auto-splits the task, opens multiple topics, and dispatches several bots to work in parallel (coder + reviewer), with a Lark task list as the shared progress board | Usually manual one-by-one assignment, no unified progress board |
 | Terminal Access | tmux attach directly into the CLI process, same as local dev experience | No direct terminal access |
 | Installation | `npm install -g botmux`, 5-min Lark setup | Easy to install, but more configuration needed |
 
@@ -61,8 +63,8 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 
 ## Prerequisites
 
-- **Node.js** >= 20
-- **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `opencode`, `hermes`, or `agy` (Antigravity) in PATH)
+- **Node.js** >= 22
+- **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `genius`, `opencode`, `hermes`, `seed` (Seed CLI, a Claude Code fork), `relay` (Relay CLI, the new release of Seed), `pi`, `omp` (oh-my-pi, a Pi fork), `copilot` (GitHub Copilot CLI), `traex` (TRAE CLI), `mircli` (Mir CLI), `agy` (Antigravity), or `kimi` (Kimi Code) in PATH)
   - **CoCo requires `0.120.32+`**: type-ahead (sending a new message while a turn is still running, parked in CoCo's own message queue) relies on 0.120.32+ behavior; earlier versions may drop or serialize input while busy — upgrade before use
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
 - **CJK fonts** (only needed for screenshot rendering of Chinese text / emoji):
@@ -72,34 +74,58 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 
 ## 5-Minute Setup
 
-> 💡 **TL;DR**: `npm i -g botmux` → `botmux setup` and pick "scan-to-create" to get the AppID/AppSecret in one shot (Step 2) → `botmux start`. PersonalAgent apps come with event subscriptions and bot capability pre-configured, so only Step 4 (permissions) + Step 5 (optional redirect URL) + Step 6 (publish) require browser clicks; the setup wizard writes a JSON file with a one-line clipboard copy command and prints deep-links to each remaining step.
+> 💡 **TL;DR**: `npm i -g botmux` → `botmux setup` and **scan two QR codes** to get a working bot → `botmux start`. The 1st scan creates the app and saves the AppID/AppSecret (event subscriptions + bot capability pre-configured); the 2nd scan lets botmux's built-in Feishu Web login **import permissions, configure the redirect URL, and create + submit a publish version automatically**. The entire Open Platform config (create app / permissions / redirect / publish) is handled by setup; pass `--no-open-platform-auto` to skip the second auto-config step and use the manual steps folded at the end.
 
-### Step 1: Install botmux
+### 1. Install botmux
 
 ```bash
 npm install -g botmux
 ```
 
-> Requires **Node.js ≥ 20**, with at least one AI coding CLI installed and authenticated (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` on your PATH). Installing **tmux** too is recommended (enables session persistence automatically).
+> Requires **Node.js ≥ 22**, with at least one AI coding CLI installed and authenticated (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` / `kimi` on your PATH). Installing **tmux** too is recommended (enables session persistence automatically).
 
-### Step 2: Create the App & Configure (`botmux setup`)
+### 2. Create the App & Configure (`botmux setup`)
 
-Run `botmux setup` and follow the interactive menu:
+Run `botmux setup` — every choice is an interactive picker (↑/↓ to move, type to filter, ⏎ to confirm, Esc to cancel; non-interactive terminals fall back to numbered input):
 
-1. **New config**: type `1` and press Enter (with an existing config, type `2` to add a bot).
-2. **Create the bot**:
-   - Type `1` → **Scan-to-create (recommended)**: scan with the Lark mobile app and a PersonalAgent app is created with AppID/AppSecret persisted automatically, **with event subscriptions + bot capability pre-configured** — no manual browser navigation. Uses the official `@larksuiteoapi/node-sdk` device flow.
-   - Type `2` → **Manual**: go to the [Lark Open Platform](https://open.larkoffice.com/app), create a "Custom App", copy **App ID / App Secret** from "Credentials & Basic Info", and paste them back.
-3. **Pick the CLI**: choose the CLI to bridge (e.g. type `1` for Claude Code).
-4. **Default working dir**: usually the **parent directory** of your git projects (e.g. `~/projects`); new topics scan **downward** for git repos (up to 3 levels). Avoid `~` (too many folders to traverse).
+1. **Action**: a fresh install goes straight into the create flow; with an existing config, first pick "add / reconfigure / edit / remove bot".
+2. **App source** — pick one of three:
+   - **Scan to create a new app (recommended)**: scan with the Lark mobile app and a PersonalAgent app is created with AppID/AppSecret persisted automatically, **with event subscriptions + bot capability pre-configured** — no manual browser navigation. Uses the official `@larksuiteoapi/node-sdk` device flow.
+   - **Pick an existing app**: reuse (or QR-login to get) a Feishu web session, list the apps you previously created on the Open Platform, and have the **AppID/AppSecret fetched automatically** — no digging through the console when re-configuring on a new machine (Feishu tenants only).
+   - **Enter AppID/Secret manually** — see "Create the app manually" folded below.
+3. **Pick the CLI**: choose the CLI to bridge (searchable — type `cla` to filter Claude).
+4. **Working dir for new topics** — pick one of two modes:
+   - **Fixed default dir (recommended)**: new topics start straight in the given directory with **no card** (persisted as `defaultWorkingDir`; change later via `/config` or `botmux setup edit`). Pick this if you want the bot to just work in one directory.
+   - **Repo-select card**: each new topic pops a card listing scanned git repos to choose from — good when you hop between repos. The follow-up question asks for the **repo scan root(s)** — usually the **parent directory** of your git projects (e.g. `~/projects`, comma-separated for multiple); the card scans **downward** for git repos (up to 3 levels). Avoid `~` (too many folders to traverse).
 
-> ⚠️ **Currently only Feishu (feishu.cn) tenants are supported.** If scan detects a Lark international (larksuite.com) tenant, setup aborts — the daemon runtime (Lark Client/WSClient/event-dispatcher) hasn't been wired up for the `larksuite.com` domain yet. A follow-up PR will add full Lark support.
+Then comes the **2nd scan**: botmux's built-in Feishu Web login automatically imports permissions, configures the `http://127.0.0.1:9768/callback` redirect URL, and creates + submits a publish version. On failure it falls back and prints the manual steps (folded below) without affecting the config already written; importing only part of the permissions still counts as success — add the rest later on the Open Platform.
 
-At the end, setup validates credentials with a `tenant_access_token` call (only writing `bots.json` on success), writes the full scope JSON to `~/.botmux/lark-scopes.json`, and prints a one-line clipboard copy command plus deep-links to each remaining step.
+> ✅ **Both Feishu (feishu.cn) and Lark international (larksuite.com) tenants are supported.** Scan-to-create auto-detects the tenant brand (China / international) and remembers it — no manual choice needed; the manual paste path asks once. Each bot connects to its own brand's domain, so one machine can run Feishu and Lark bots side by side, with login credentials isolated per app.
 
-![Create App](docs/setup/create-app.png)
+At the end, setup validates credentials with a `tenant_access_token` call (only writing `bots.json` on success) and writes the full scope JSON to `~/.botmux/lark-scopes.json` for reference.
 
-### Step 3: Start
+<details>
+<summary><b>Scripted (non-TUI) setup</b> — field-level subcommands for coding agents / automation, independent of the interactive question order</summary>
+
+```bash
+botmux setup list --json                     # list bots (secret masked)
+botmux setup add \
+  --app-id cli_xxx --app-secret xxx \
+  --allowed-users alice@example.com \
+  --cli codex --working-dir ~/projects       # add (credentials still validated before writing)
+botmux setup edit botmux-0 --cli claude-code \
+  --default-working-dir /data/proj           # per-field edits; pass - to clear a field
+botmux setup remove botmux-1 --yes           # non-interactive removal requires --yes
+botmux setup help                            # full flag reference
+```
+
+- `--working-dir` is the repo-select card's scan root; `--default-working-dir` is the fixed default dir (new topics start there directly, no card) — the same two modes as the TUI question.
+- `--json` prints machine-readable results (with `ok` / `error`); Open Platform auto-config is skipped by default — opt in with `--open-platform-auto` (requires QR scan).
+- If you previously scripted setup by piping numbered answers into the TUI, migrate to these subcommands: whenever the question sequence changes (this release adds the working-dir mode question), piped answers silently shift.
+
+</details>
+
+### 3. Start
 
 ```bash
 botmux start
@@ -107,9 +133,32 @@ botmux start
 
 > `start` re-validates credentials before forking workers; missing scopes only WARN, they don't block the daemon. If you later need to verify the event subscription, Lark requires the daemon to be running so it can detect the WebSocket connection.
 
-### Step 4: Add Permissions
+### 4. Create a Group and Start Chatting
 
-Run the copy-to-clipboard command setup printed, then go to "Permissions & Scopes" → "Batch Import/Export" and paste. Submit for review — visibility "only me" auto-approves.
+1. Create a **topic-enabled group** in Lark
+2. Open group settings → Group Bots → add the bot you just created
+3. Send a message in the group — the bot responds automatically
+
+![Add bot to group](docs/setup/add-bot-to-group.png)
+
+### 5. Enable Boot-time Autostart (recommended)
+
+After confirming the bot can send/receive messages, run:
+
+```bash
+botmux autostart enable
+```
+
+<details>
+<summary><b>Manual Open Platform config: create app / permissions / redirect / publish (fallback)</b> —— handled automatically by botmux setup during the 2nd scan; expand only if auto-config failed or you want to verify manually</summary>
+
+<br>
+
+**Create the app manually**: go to the [Lark Open Platform](https://open.larkoffice.com/app), create a "Custom App", copy **App ID / App Secret** from "Credentials & Basic Info", and pick "Enter AppID/Secret manually" at `botmux setup`'s "App source" step to paste them back.
+
+![Create App](docs/setup/create-app.png)
+
+**Add permissions**: run the copy-to-clipboard command setup printed, then go to "Permissions & Scopes" → "Batch Import/Export" and paste. Submit for review — visibility "only me" auto-approves.
 
 ![Permissions](docs/setup/permissions.png)
 
@@ -126,50 +175,27 @@ cat ~/.botmux/lark-scopes.json
 base64 -w0 < ~/.botmux/lark-scopes.json | awk 'BEGIN{printf "\033]52;c;"}{printf "%s",$0}END{printf "\a"}'
 ```
 
-> Scan-created PersonalAgent apps have `im.message.receive_v1` + `card.action.trigger` subscribed and the bot capability enabled out of the box, per botmux maintainer testing. Lark hasn't documented this as stable behavior, so **if the bot receives no messages at all after setup**, see "Step 8: Troubleshoot — bot not receiving messages" below for a manual fallback.
+**Add redirect URL (optional)**: if you plan to use `/login` inside Lark to let botmux act on your behalf for docs / calendar / wiki / sheets, add a redirect URL under "Security Settings" → "Redirect URL": `http://127.0.0.1:9768/callback`. Skip this if you only need bot messaging.
 
-### Step 5: Add Redirect URL (optional)
-
-If you plan to use `/login` inside Lark to let botmux act on your behalf for docs / calendar / wiki / sheets, add a redirect URL under "Security Settings" → "Redirect URL":
-
-```
-http://127.0.0.1:9768/callback
-```
-
-Skip this step if you only need bot messaging.
-
-### Step 6: Publish the App
-
-Go to "Version Management & Release", click "Create Version" and publish. Set availability to "Visible to me only" for automatic approval.
+**Publish**: go to "Version Management & Release", click "Create Version" and publish. Set availability to "Visible to me only" for automatic approval.
 
 ![Publish](docs/setup/publish.png)
 
-### Step 7: Create a Group and Start Chatting
+</details>
 
-1. Create a **topic-enabled group** in Lark
-2. Go to Group Settings → Bots → Add the bot you just created
-3. Send a message in the group — the bot responds automatically
+<details>
+<summary><b>Troubleshoot — bot not receiving messages</b></summary>
 
-![Add bot to group](docs/setup/add-bot-to-group.png)
+<br>
 
-### Step 8: Troubleshoot — bot not receiving messages (fallback)
+PersonalAgent apps come with event subscription + bot capability configured by default, so normally you don't touch this. If the bot **receives no messages at all** (not even DMs) after following the steps above, verify these two:
 
-PersonalAgent apps come with event subscriptions and bot capability pre-configured; in normal cases you don't touch this. If the bot **receives no messages at all** after setup (not even DMs), verify these two settings:
+- **Event subscription**: Open Platform → your app → Events & Callbacks → should subscribe to `im.message.receive_v1` + `card.action.trigger` (subscribed by default; add manually if missing). The delivery method must be "Receive events via long connection" (WebSocket), with the botmux daemon running.
+- **Bot capability**: Open Platform → your app → Features → Bot should be enabled (on by default); name/avatar are editable.
 
-- **Event subscription**: Open Platform → your app → Events & Callbacks → should be subscribed to `im.message.receive_v1` + `card.action.trigger`. If missing, add them manually. Subscription mode must be "Receive via persistent connection" (WebSocket), and the botmux daemon must be running.
-- **Bot capability**: Open Platform → your app → Features → Bot should be enabled (it is by default). Adjust name/avatar if needed.
+Then restart the daemon: `botmux restart`.
 
-After verifying, restart: `botmux restart`.
-
-### Step 9: Enable Boot-time Autostart (recommended)
-
-Once the bot is sending and receiving messages cleanly, run:
-
-```bash
-botmux autostart enable
-```
-
-This registers the daemon with your user's init system (launchd on macOS, user systemd on Linux). **No sudo required.** After a reboot — or after logging back in — the daemon comes up on its own. See [CLI Commands § Boot-time Autostart](#boot-time-autostart) below for the full reference.
+</details>
 
 ---
 
@@ -177,11 +203,13 @@ This registers the daemon with your user's init system (launchd on macOS, user s
 
 ### Streaming Cards
 
-Each conversation turn gets a live-updating Feishu card that shows:
+Each conversation turn gets a live-updating Feishu card — your main window for sensing and driving the CLI from phone/Lark:
 
-- Real-time terminal output rendered as Markdown, TUI chrome auto-filtered to show only actual work output
-- Status indicator: Starting > Working > Idle
-- Action buttons: Open Terminal, Get Write Link, Restart CLI, Close Session
+- **Live terminal screenshot streamed to the card** (rendered headlessly via xterm into a PNG, faithfully reproducing the CLI's TUI); one-tap "show/hide output", "export text", "page up/down"
+- **Live status**: Starting → Analyzing → Working / Executing → Idle; marks "limit reached · retryable" when quota runs out
+- **Act right from the card**: open (writable) terminal, 🔑 get write link, restart / close / take over the session, re-send last task
+- **One new card per turn**, the previous one frozen as an archive; after `/relay` moves a session to another group, the old card auto-freezes as an archive
+- **Closing leaves a resumable card** (with the CLI's native resume command) — click back in anytime
 
 
 ### Web Terminal (Interactive)
@@ -195,7 +223,35 @@ On mobile/tablet, a floating shortcut toolbar provides Esc, Ctrl+C, Tab, arrow k
 
 ### Multi-Bot Collaboration
 
-Run multiple Lark bots on a single machine, each mapped to a different CLI. In the same group chat, messages are routed via @mention — each bot gets its own isolated CLI process. With a single bot in the group, it responds automatically without @. In a regular (non-topic) group, `@<bot1> @<bot2> /t xxx` spawns one independent thread per mentioned bot anchored at the same message. Send `@<bot1> @<bot2> /introduce` once so they register each other's open_id; afterwards each bot can explicitly @-mention the others from within its own session (see [§ Slash Commands](#slash-commands)).
+Run multiple Lark bots on a single machine, each mapped to a different CLI. In the same group chat, messages are routed via @mention — each bot gets its own isolated CLI process. With a single bot in the group, it responds automatically without @. In a regular (non-topic) group, `@<bot1> @<bot2> /t xxx` spawns one independent thread per mentioned bot anchored at the same message. Send `@<bot1> @<bot2> /introduce` once so they register each other's open_id; afterwards each bot can explicitly @-mention the others from within its own session (commands: [📖 Docs · Slash Commands](https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/slash-commands)).
+
+### Multi-Topic Collaboration
+
+The next level up from "Multi-Bot Collaboration": a lead bot (the **orchestrator**) splits one large task into multiple **sub-projects**, **automatically opens several topics** in the group, dispatches a team of bots into each topic to drive it in parallel (commonly "one writes the code + one reviews"), uses a single **Lark task list** as the shared progress board everyone reads from, and finally collects the results and aggregates them. A single regular group becomes a parallel workbench, and you can see overall progress at a glance from the Lark task panel.
+
+**How it runs** — the `botmux-orchestrate` skill walks the orchestrator through the full flow:
+
+> Split into sub-projects → propose a "sub-project ↔ bot" assignment → send it to you for **a single approval** (confirmable via card) → create the Lark task list → open each topic and dispatch → collect the reports → aggregate
+
+Under the hood, dispatching is done by `botmux dispatch`: it seeds a topic in the group and @-mentions the chosen bots, spawning an independent session for each.
+
+```bash
+botmux dispatch --title "Implement login module" \
+  --bot "ou_xxx:Alice:coder" --bot "ou_yyy:Bob:reviewer" \
+  --repo /path/to/repo --brief-file /tmp/brief.md
+```
+
+- `--repo <dir>` — presets each sub-bot's working directory (absolute path, must exist on the sub-bot's machine), so the session spawns straight into it and **skips the "select repo" card**.
+- `--standby` — **must be paired with `--repo`** (and cannot be combined with `--into`): sends `/repo` once to bring the bot up in the given directory on standby without a brief; activate it later with `--into ... --brief(-file)`.
+- `--into <topic root>` — return to an existing topic and append one message (activate standby bots / add coordination); still requires `--bot`, and outside standby mode must carry `--brief` or `--brief-file`.
+
+When a sub-bot finishes, it reports progress/completion back with `botmux report` from inside its own sub-topic. This routes the report into the orchestrator's **own** session (which still holds full context) instead of @-mentioning the orchestrator inside the sub-topic — where it has no session and the @ would spawn a fresh, context-less one. The orchestrator then aggregates the collected reports.
+
+**Collaboration boundaries:**
+
+- **"Own" bots in the same deployment trust each other** — the orchestrator can run operate-level commands like `/repo` directly against them (same conversation permissions as your own bots). Authorization for external bots is two-tiered: `/grant @bot` only grants "talk / be spawned by chat-scope" permission (talk-only — it does not touch `allowedUsers` and cannot run operate-level commands); to let an external bot run operate-level commands like `/repo`, add it to `allowedUsers` (or grant operate-level access later). `/introduce` only handles discovery / registering open_id and **grants no permissions**.
+- Sub-bots must already be in the group and @-mentionable (i.e. have the `im:message.group_at_msg.include_bot` permission).
+- A single topic can hold multiple bots, and they @-mention each other to collaborate within the topic (e.g. the coder @-mentions the reviewer once the code is done).
 
 ### Tmux Persistence
 
@@ -228,10 +284,11 @@ BACKEND_TYPE=pty botmux start
 Seamlessly connect Botmux to CLI processes already running in tmux — monitor and interact from your phone via Lark.
 
 ```
-/adopt              # Scan tmux, show selection card
-/adopt 0:2.0        # Directly adopt a specific tmux pane
+/adopt              # Selection card: ① take over a running session ② resume a past session from disk
+/adopt 0:2.0        # Directly adopt a tmux pane (or pass a past session id to resume-import it)
 ```
 
+- **Import past sessions** — The card's second filter lists this host's past sessions for the CLI (claude-code / seed / codex / traex / antigravity / genius); pick one to rebuild it as a standard Botmux session via `--resume` in its original working dir — no live process required, no need to move it into tmux first
 - **Shared mode** — After adopting, iTerm2 and Lark stay in sync: streaming card shows real-time terminal output, Lark chat input is forwarded directly to the terminal
 - **One-click takeover** — Click the "Takeover" button on the streaming card to rebuild the session with `--resume` and convert to a standard Botmux session
 - **Safe disconnect** — Click "Disconnect" to detach Botmux without affecting the original CLI
@@ -266,7 +323,7 @@ Anthropic's official Telegram channel — which exposes each action as an
 MCP tool — the Skill + CLI combo skips the MCP handshake on every CLI
 launch, doesn't burn tool-list tokens, and works across every CLI that
 can read a system prompt and shell out (Claude Code / Codex / Cursor /
-Gemini / OpenCode / Antigravity), with no MCP protocol support required.
+Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support required.
 
 ### Dashboard
 
@@ -275,6 +332,7 @@ Gemini / OpenCode / Antigravity), with no MCP protocol support required.
 - One-click locate back to the Feishu thread / open Web Terminal / multi-select batch close
 - Create a new group with auto owner-transfer + @-mention notification
 - Disband or leave a chat (associated sessions auto-closed)
+- **Session Insights** (owner-only, read-only): parse each session's transcript to view action spans / work timeline / context curve / failure aggregates + diagnostic suggestions; send `/insight` in chat for the current session's summary card
 - **Workflows console**:
   - Run List (5 s poll) + Run Detail with summary, dangling-work red panel, node/activity table, event timeline, and a **parallel-execution timeline** (attempt-level), auto-stopping polling once the run reaches a terminal state
   - **Cancel a run directly from the dashboard**; approve / reject `humanGate` with reviewer comments
@@ -290,269 +348,55 @@ Gemini / OpenCode / Antigravity), with no MCP protocol support required.
 ### Workflow
 
 1. Send a message in a Lark topic group to create a new thread; or in a regular group send `/t <prompt>` to force-open a new topic
-2. The bot shows a repo selection card — pick a project or click "Start directly" (chats bound via `/oncall bind` skip this step)
+2. The bot shows a repo selection card — pick a project or click "Start directly" (a bot bound via `/oncall bind` skips this step; binding is per-bot)
 3. The CLI spawns in the selected directory
 4. A live streaming card appears in the thread, showing real-time terminal output with markdown rendering
 5. Each reply creates a new streaming card for that turn; previous cards freeze at their last state
 6. Click "Get Write Link" on the card to receive a write-enabled terminal URL via DM
 7. The CLI replies in the thread via the `botmux send` command (wired through the `botmux-send` Skill)
 
-### Slash Commands
-
-Send these straight into a topic — the daemon intercepts them (no clash with the underlying CLI's own slash commands: any `/xxx` botmux doesn't recognize is forwarded verbatim to the CLI). Send `/help` anytime to see the same list inside the topic.
-
-**📌 Session management**
-
-| Command | Description |
-|---------|-------------|
-| `/repo` | While a repo is pending selection, launch in the default workingDir; mid-session, show the project selector card (interactive dropdown + text list) |
-| `/repo <N>` | Switch to Nth project from last scan |
-| `/repo <path\|name>` | Skip the selector card; pass a path (relative/absolute) or a first-level project name under workingDir |
-| `/cd <path>` | Change working directory and restart the CLI process |
-| `/status` | Show session info (uptime, terminal URL, etc.) |
-| `/restart` | Restart CLI process (keeps the session context) |
-| `/close` | Close session and send a resumable card (with the CLI's native resume command) |
-| `/t <prompt>` / `/topic <prompt>` | Force-open a new topic from a non-topic group (shows the repo selector); empty prompt is allowed — fill it in after picking the repo |
-
-**🔀 Forwarded to the underlying CLI**
-
-| Command | Description |
-|---------|-------------|
-| `/compact` `/model` `/clear` `/plugin` `/usage` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` | Sent verbatim to the underlying CLI for its own built-in slash commands (e.g. Claude Code's `/compact` / `/context`, Codex's `/diff` / `/btw`) |
-
-**⏰ Scheduled tasks** (syntax & examples in [§ Scheduled Task Management](#scheduled-task-management))
-
-| Command | Description |
-|---------|-------------|
-| `/schedule <natural language / cron>` | Create a task, e.g. `/schedule 每日17:50 check AI news` |
-| `/schedule list` | List all scheduled tasks |
-| `/schedule remove\|enable\|disable\|run <id>` | Remove / enable / disable / run once |
-
-**📡 Session adoption**
-
-| Command | Description |
-|---------|-------------|
-| `/adopt` | Scan local tmux and pop a card to adopt a running CLI session |
-| `/adopt <tmux_pane>` | Adopt a specific tmux pane directly (e.g. `/adopt 0:2.0`) |
-
-**🔐 User authorization**
-
-| Command | Description |
-|---------|-------------|
-| `/login` | Lark user OAuth — afterwards you can download third-party card images and call cloud-doc/calendar APIs as yourself |
-| `/login status` | Show current OAuth status |
-
-**🛎️ Oncall mode (group chats)**
-
-| Command | Description |
-|---------|-------------|
-| `/oncall bind <path>` | Bind current chat to a project dir, skip the repo card (any group member can @ the bot; buttons / daemon commands still gated by `allowedUsers`) |
-| `/oncall unbind` | Unbind the current chat |
-| `/oncall status` | Inspect the current chat's oncall binding |
-
-**🔑 Access grants (owner only)**
-
-| Command | Description |
-|---------|-------------|
-| `@bot /grant @someone` | Pop an authorization card to add the user to the "this chat" or "global" allowlist; you can @ several people/bots at once (one card lists every target, one scope click applies to all); if a granted target is a bot, it's auto-registered into the roster on success (an implicit `/introduce`) for cross-bot collaboration; also auto-pops (and @s the owner) when an unauthorized user @-mentions the bot |
-| `@bot /revoke @someone` | Revoke the user's this-chat + global access; you can @ several people/bots at once |
-
-**🆕 One-shot session group**
-
-| Command | Description |
-|---------|-------------|
-| `/group <name>` (alias `/g`) | Auto-create a new Lark group, invite you, transfer ownership; the whole group acts as one chat-scope CLI session. Empty name falls back to a timestamp. The group does **not** auto-start a session — just go in and start chatting with the bot. Any bots you @-mention in the command are pulled into the new group (the first mentioned bot does the creating). |
-
-**👥 Multi-bot collaboration**
-
-| Command | Description |
-|---------|-------------|
-| `@botA @botB /t <prompt>` | With multiple bots, each @-mentioned bot opens its own independent topic from the same message |
-| `@botA @botB /introduce` | Bots register each other's open_id so they can later explicitly @-mention one another across sessions (any @ order, extra text allowed; roster-only, grants no permission — **anyone in the chat can run it, no authorization needed**) |
-
-**❓ Help**
-
-| Command | Description |
-|---------|-------------|
-| `/help` | Show the full command list above, inside the topic |
-
-### Scheduled Task Management
-
-Two creation paths are covered above in [Scheduled Tasks](#scheduled-tasks); below is just the slash-command syntax and management commands.
-
-```bash
-# Chinese NL
-/schedule 每日17:50 check AI news
-/schedule 工作日每天9:00 run health check
-/schedule 每周一10:00 generate weekly report
-
-# One-shot
-/schedule 30分钟后 verify deployment
-/schedule 明天9:00 standup reminder
-
-# English / cron
-/schedule every 2h probe services
-/schedule 30m remind me to drink water
-/schedule 0 9 * * * good morning
-
-# Manage
-/schedule list
-/schedule remove|enable|disable|run <id>
-```
-
-**Execution behavior**: the task fires inside the **original thread where it was created** — no new topic per run. Working directory is preserved. If the original session is still alive, the prompt is injected into it; otherwise a fresh worker spawns bound to the same thread root.
-
 ---
 
-## Configuration
+### Per-Bot Environment Variables (run a bot on GLM / a third-party provider)
 
-Configure bots via `~/.botmux/bots.json`. Run `botmux setup` to create it interactively, or edit manually.
-
-```bash
-# Interactive setup
-botmux setup
-```
-
-When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfigure from scratch, edit an existing bot, or delete a bot config. The edit/delete flow accepts the process name shown by `botmux status` (e.g. `botmux-1` or a custom `botmux-claude-main`) or the `larkAppId`; empty input keeps the current value, and `-` clears optional fields such as `name`, `model`, `backendType`, `workingDir`, and `allowedUsers`. Changing `larkAppId` asks for confirmation because historical session/chat state under the old app ID is not migrated automatically. Deleting a bot only removes one local `bots.json` entry; it does not delete the Lark app, historical messages, or local session data. Run `botmux restart` for changes to take effect.
-
-**bots.json format:**
+Each `bots.json` entry can define its own `env` object, injected into **that bot's CLI process**. Typical use: run one bot on a GLM Coding Plan / third-party Anthropic·OpenAI-compatible provider while another keeps using official Claude — just point the former at the provider's endpoint and key:
 
 ```json
-[
-  {
-    "larkAppId": "cli_xxx_bot1",
-    "larkAppSecret": "secret_1",
-    "name": "claude-main",
-    "cliId": "claude-code",
-    "model": "sonnet",
-    "workingDir": "~/projects",
-    "allowedUsers": ["alice@company.com"],
-    "allowedChatGroups": ["oc_xxx_team"]
-  },
-  {
-    "larkAppId": "cli_xxx_bot2",
-    "larkAppSecret": "secret_2",
-    "cliId": "codex",
-    "model": "gpt-5-codex",
-    "workingDir": "~/work"
+{
+  "cliId": "claude-code",
+  "workingDir": "~/projects",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "your GLM Coding Plan key"
   }
-]
+}
 ```
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `larkAppId` | Yes | Lark app ID |
-| `larkAppSecret` | Yes | Lark app secret |
-| `name` | No | Process name suffix shown by `botmux status`; e.g. `claude-main` appears as `botmux-claude-main`, defaults to `botmux-<index>` |
-| `cliId` | No | CLI adapter, defaults to `claude-code` (options: `aiden`, `coco`, `codex`, `codex-app`, `cursor`, `gemini`, `opencode`, `antigravity`, `hermes`) |
-| `model` | No | Model name used when spawning the CLI. Currently honored by: `claude-code`, `codex`, `coco`, `cursor`, `gemini`, `opencode`; other adapters ignore the field. Leave empty to use the CLI default. `botmux setup` proposes per-CLI candidates plus a free-form Other option. |
-| `cliPathOverride` | No | Absolute path to the CLI entry, for wrappers / routers; typical use: `ccr`, `claude-w`, `aiden-x-claude`, etc. |
-| `backendType` | No | Session backend: `pty` or `tmux` (auto-detected by default) |
-| `workingDir` | No | Default working directory, supports comma-separated. The new-topic repo-select card scans for git repos **from this directory downward** (recursive, up to 3 levels), no longer climbing to the parent: point it at a repos root (e.g. `~/projects`) to list every repo beneath it, or at a single repo to list just that repo (and its linked worktrees) |
-| `defaultWorkingDir` | No | Single-repo default: new topics with no oncall binding and no peer-session inheritance spawn directly here, skipping the repo-select card. `/cd <path>` still switches mid-session; the next new topic falls back to this default. **Difference from `defaultOncall`:** does NOT write `oncallChats` and does NOT change the `canTalk` / `canOperate` permission model |
-| `allowedUsers` | No | Allowed users (**full emails** like `alice@example.com`, or open_ids `ou_xxx`). Email prefixes can't be resolved and are dropped. Required (at least one entry, as owner) when `allowedChatGroups` is set |
-| `allowedChatGroups` | No | Talk-open chats (`chat_id`, for example `oc_xxx`). Any member talking **inside these chats** can use the bot (decided by the message's chat — new members work immediately, removed members lose access, no restart needed); grants `canTalk` only, sensitive ops still require `allowedUsers`. Equivalent to the owner running `/grant` (no target) in that chat. |
-| `globalGrants` | No | Global talk allowlist (`open_id` list, e.g. `ou_xxx`; humans or bots). Listed entries can talk to the bot in **any** chat; grants `canTalk` only, sensitive ops still require `allowedUsers`. Usually written via the owner's `/grant` card (the "grant talk globally" button); can also be set manually here. |
-| `oncallChats` | No | Oncall bindings (written by `/oncall bind`), e.g. `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`; any group member can @ the bot |
+> For GLM in China use `https://open.bigmodel.cn/api/anthropic`. For an OpenAI-protocol CLI like Codex, set `OPENAI_BASE_URL` / `OPENAI_API_KEY` (the provider's OpenAI-compatible endpoint) instead of `ANTHROPIC_*`. Also handy for `HTTPS_PROXY` or CLI feature flags.
 
-**Config priority:** `BOTS_CONFIG` env var > `~/.botmux/bots.json`
+Notes:
 
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BOTS_CONFIG` | _(unset)_ | Path to bots.json (overrides default location) |
-| `WEB_HOST` | `0.0.0.0` | HTTP server bind address |
-| `WEB_EXTERNAL_HOST` | _(auto-detect LAN IP)_ | External hostname/IP for terminal URLs |
-| `SESSION_DATA_DIR` | `~/.botmux/data` | Where sessions and queues are stored |
-| `DEBUG` | _(unset)_ | Set to `1` for debug logging |
-
-### File Locations
-
-| Path | Description |
-|------|-------------|
-| `~/.botmux/bots.json` | Bot configuration |
-| `~/.botmux/data/` | Session data, message queues |
-| `~/.botmux/logs/` | Daemon logs |
+- `env` accepts valid env-var names with string/number/boolean values; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored, so config can't hijack session routing or creds.
+- Injected **per session** into the CLI process (effective from the next session). On the tmux/zellij backends it goes in via each pane's `/usr/bin/env` prefix, **never the shared server env**, so one bot's provider config can't leak into another's.
+- Also editable in the dashboard ("Bot defaults → Environment variables", owner-authenticated) or via `/config set env '{...}'`.
+- Not a secret vault: values live in `bots.json` and the process environment in plaintext, visible to local diagnostic tools.
 
 ---
 
-## CLI Commands
+## 📖 Documentation
 
-| Command | Description |
-|---------|-------------|
-| `botmux setup` | Interactive setup (first-time / add / edit / delete bots) |
-| `botmux start` | Start daemon (PM2 managed) |
-| `botmux stop` | Stop daemon |
-| `botmux restart` | Restart daemon (auto-restores active sessions) |
-| `botmux logs` | View daemon logs (`--lines N` for more) |
-| `botmux status` | Show daemon status |
-| `botmux upgrade` | Upgrade to latest version |
-| `botmux list` | List all active sessions (alias: `ls`) |
-| `botmux delete <id>` | Close a session by ID prefix (alias: `del`/`rm`) |
-| `botmux delete all` | Close all active sessions |
-| `botmux delete stopped` | Clean up zombie sessions with dead processes |
-| `botmux autostart enable` | Register boot-time autostart (macOS launchd / Linux user systemd, no sudo) |
-| `botmux autostart disable` | Unregister boot-time autostart |
-| `botmux autostart status` | Show autostart status |
-| `botmux dashboard` | Print a fresh Web Dashboard URL (rotates the token; previous URL becomes invalid) |
+The full reference — commands, config, best practices, troubleshooting — lives in the docs site; not duplicated here —
 
-### Boot-time Autostart
+### 👉 https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/
 
-`botmux autostart enable` registers the daemon with your user's init system so it comes back automatically after a reboot:
-
-- **macOS**: writes `~/Library/LaunchAgents/com.botmux.daemon.plist` and loads it via `launchctl bootstrap`. **No sudo required.**
-- **Linux**: writes `~/.config/systemd/user/botmux.service` and runs `systemctl --user enable --now`. **No sudo required.**
-  - On servers / headless boxes the user systemd manager stops when you log out. To survive logouts and reboots, also run `sudo loginctl enable-linger <your-user>` — `autostart enable` warns when linger is off.
-  - Containers / SSH-only sessions without a user DBus fall back to printing manual instructions.
-- The `node` and `cli.js` paths baked into the unit come from `process.execPath` at install time. After switching nvm/fnm versions, run `botmux autostart enable` once to rewrite. `botmux start`/`restart` also detect path drift and refresh the unit in place — no manual step needed.
-- `enable` / `disable` **only manage the autostart hook — they do not touch a running daemon**. To start the daemon right away run `botmux start`; to stop it run `botmux stop`. This avoids the "I just wanted to turn off autostart, why did my service also die" footgun.
-- If you prefer letting systemd own the lifecycle (`systemctl --user start/stop botmux`), that works too — the unit declares `ExecStop=botmux stop` for a clean shutdown path.
-
-### Agent-facing subcommands
-
-Run from inside a botmux-spawned CLI session — session context is auto-detected via ancestor process markers:
-
-| Subcommand | Description |
-|------------|-------------|
-| `botmux send [content]` | Send a message to the current thread (stdin / heredoc / `--content-file`; `--images` / `--files` / `--mention` flags) |
-| `botmux bots list` | List bots in the current chat (includes `open_id` for `--mention`) |
-| `botmux history [--limit N]` | Fetch session message history (JSON); topic groups → in-thread, regular groups → whole chat |
-| `botmux quoted <message_id>` | Fetch a single quoted message (JSON); the ID comes from the daemon-injected `[用户引用了消息 用 botmux quoted om_xxx 查看]` prefix |
-| `botmux schedule add <schedule> <prompt>` | Create a scheduled task bound to the current thread |
-| `botmux schedule list/remove/pause/resume/run` | Manage scheduled tasks |
-
-These require the `~/.botmux/bin/botmux` wrapper, which the daemon writes at startup and prepends to the worker's `PATH` — always matches the running daemon's version (no `npm i -g` needed).
-
----
-
-## Web Dashboard
-
-botmux ships a LAN-accessible Web Dashboard for managing all sessions and scheduled tasks across every configured bot.
-
-```bash
-botmux dashboard
-# prints: http://<lan-ip>:7891/?t=<token>
-```
-
-Each invocation rotates the token — previous URLs are invalidated immediately. This is by design, so a leaked link stops working as soon as you fetch a new one.
-
-v1 features:
-- **Sessions board** — every active and closed session across every bot, filterable by CLI / status / adopt / free-text. The detail drawer exposes a "📍 定位到飞书话题" button that posts a marker into the original thread (workaround for Feishu having no public topic deep-link), then opens AppLink to the chat. Also: copy IDs, close session, open xterm.
-- **Schedules board** — every scheduled task across every bot, with Run-now / Pause / Resume actions.
-
-Environment variables (set in `~/.botmux/.env`):
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `BOTMUX_DASHBOARD_HOST` | `0.0.0.0` | Dashboard HTTP bind address |
-| `BOTMUX_DASHBOARD_PORT` | `7891` | Dashboard HTTP port |
-| `BOTMUX_DASHBOARD_EXTERNAL_HOST` | `WEB_EXTERNAL_HOST` or LAN-IP autodetect | Host used in the printed URL |
-| `BOTMUX_DAEMON_IPC_BASE_PORT` | `7892` | Per-daemon IPC port = base + botIndex |
-
-The dashboard runs as its own pm2 process (`botmux-dashboard`) — `pnpm daemon:restart` brings it up alongside every bot daemon. Each daemon exposes a localhost-only IPC at `127.0.0.1:7892+botIndex`; the dashboard process is a thin reverse proxy + token gate. The HMAC secret at `~/.botmux/.dashboard-secret` (mode `0600`) is generated on first start and is used only to sign `botmux dashboard` rotation requests — it never reaches the browser.
-
----
+| Topic | Docs |
+|-------|------|
+| Slash commands / CLI commands / agent-facing subcommands | [Commands](https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/slash-commands) |
+| `bots.json` fields / env vars / file locations | [Configuration](https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/bots-json) |
+| Multi-CLI adapters (incl. wrapper / gateway integration) | [Adapters](https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/adapters) |
+| Scenario-based best practices (Oncall / alerting-ops / solo dev / team) | [Best Practices](https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/best-practices) |
+| Common pitfalls / FAQ | [Pitfalls](https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/pitfalls) · [FAQ](https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/faq) |
+| Features: scheduled tasks / Oncall / Dashboard / multi-bot / session relay | [Schedule](https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/schedule) · [Oncall](https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/oncall) · [Dashboard](https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/dashboard) · [Multi-bot](https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/multi-bot) · [Relay](https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/relay) |
 
 ## Contributing
 

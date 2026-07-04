@@ -1,11 +1,6 @@
-import type { ConnectorDefinition } from './connector-store.js';
-
-export type ExtractedLifecycleStatus = 'firing' | 'resolved';
-
-export interface ExtractedWebhookLifecycle {
-  dedupKey: string;
-  status: ExtractedLifecycleStatus;
-}
+// Dedup-key extraction for new-group connectors. (The firing/resolved "status"
+// lifecycle was removed — external systems don't reliably send a recovery
+// signal, so groups are never auto-closed; dedup is now the only knob.)
 
 function pathSegments(path: string): string[] | null {
   const trimmed = path.trim();
@@ -37,25 +32,9 @@ function stringValue(v: unknown): string | undefined {
   return undefined;
 }
 
-function normalizeStatus(raw: string, map: Record<string, string> | undefined): ExtractedLifecycleStatus | undefined {
-  const lower = raw.trim().toLowerCase();
-  const mapped = map?.[raw] ?? map?.[lower] ?? lower;
-  const normalized = String(mapped).trim().toLowerCase();
-  if (['resolved', 'recovered', 'closed', 'ok'].includes(normalized)) return 'resolved';
-  if (['firing', 'active', 'triggered', 'open', 'alerting'].includes(normalized)) return 'firing';
-  return undefined;
-}
-
-export function extractWebhookLifecycle(
-  payload: unknown,
-  extractors: ConnectorDefinition['lifecycleExtractors'],
-): { ok: true; lifecycle: ExtractedWebhookLifecycle } | { ok: false; error: string } {
-  if (!extractors) return { ok: false, error: 'lifecycle_extractors_required' };
-  const dedupKey = stringValue(getJsonPathValue(payload, extractors.dedupKey));
-  if (!dedupKey) return { ok: false, error: 'dedup_key_not_found' };
-  const rawStatus = stringValue(getJsonPathValue(payload, extractors.status));
-  if (!rawStatus) return { ok: false, error: 'status_not_found' };
-  const status = normalizeStatus(rawStatus, extractors.statusMap);
-  if (!status) return { ok: false, error: 'status_not_supported' };
-  return { ok: true, lifecycle: { dedupKey, status } };
+/** Pull the dedup value at `path` from the (untrusted) webhook payload, coerced
+ *  to a non-empty string. Returns undefined when the path is missing/empty —
+ *  the caller decides whether that's an error (dedup configured but not found). */
+export function extractDedupKey(payload: unknown, path: string): string | undefined {
+  return stringValue(getJsonPathValue(payload, path));
 }

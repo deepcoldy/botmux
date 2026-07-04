@@ -120,6 +120,27 @@ function isOptionalSurvey(text: string): boolean {
   return OPTIONAL_SURVEY_PATTERNS.some((re) => re.test(text));
 }
 
+/** Remove survey lines (plus the option row that follows each) from a snapshot.
+ *  The survey banner is RESIDENT — it stays on screen for the whole session
+ *  until dismissed. Matching the WHOLE snapshot against it used to veto every
+ *  analysis, which blinded the analyzer to real prompts sharing the screen
+ *  (e.g. AskUserQuestion rendered above a survey banner was never detected).
+ *  Stripping the survey's own lines keeps it invisible to the AI without
+ *  suppressing anything else. */
+export function stripOptionalSurveyLines(text: string): string {
+  if (!isOptionalSurvey(text)) return text;
+  const lines = text.split('\n');
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (isOptionalSurvey(lines[i])) {
+      i++; // also drop the following line — the survey's option row
+      continue;
+    }
+    out.push(lines[i]);
+  }
+  return out.join('\n');
+}
+
 export class ScreenAnalyzer {
   private config: ScreenAnalyzerConfig;
   private callbacks: ScreenAnalyzerCallbacks;
@@ -204,24 +225,21 @@ export class ScreenAnalyzer {
     // Layer 2: Cumulative stability — require N consecutive unchanged snapshots
     if (this.stableCount < this.config.stableCount) return;
 
-    // Layer 3: AI-driven cooldown
-    if (this.waitingForContentChange && truncated === this.lastAnalyzedSnapshot) return;
-    if (this.timerCooldownUntil > Date.now()) return;
+    // Strip the resident optional-survey banner (e.g. Claude session feedback)
+    // BEFORE the cooldown comparison and the AI call. The survey itself never
+    // warrants a card, but it must not veto detection of a real prompt that
+    // shares the screen with it — so it is removed line-wise, not screen-wise.
+    const cleaned = stripOptionalSurveyLines(truncated);
 
-    // Skip optional research surveys (e.g. Claude session feedback) — they have
-    // a "Dismiss" option and don't actually block the CLI, so no card needed.
-    if (isOptionalSurvey(truncated)) {
-      this.lastAnalyzedSnapshot = truncated;
-      this.waitingForContentChange = true;
-      this.callbacks.log('ScreenAnalyzer: optional survey detected — skipping AI call');
-      return;
-    }
+    // Layer 3: AI-driven cooldown
+    if (this.waitingForContentChange && cleaned === this.lastAnalyzedSnapshot) return;
+    if (this.timerCooldownUntil > Date.now()) return;
 
     // All layers passed — call AI
     this._analyzing = true;
     this.callbacks.onAnalyzing();
     try {
-      await this.analyze(truncated);
+      await this.analyze(cleaned);
     } finally {
       this._analyzing = false;
     }
@@ -259,7 +277,10 @@ export class ScreenAnalyzer {
 
     if (analysis.needsInteraction && analysis.options && analysis.options.length > 0) {
       // Safety net: AI may still flag an optional survey as a prompt — drop it.
-      if (isOptionalSurvey(analysis.description ?? '') || isOptionalSurvey(snapshot)) {
+      // Only the AI's own description is matched here: the snapshot already had
+      // survey lines stripped, and whole-snapshot matching is what used to
+      // swallow real prompts that merely shared the screen with a survey.
+      if (isOptionalSurvey(analysis.description ?? '')) {
         this.callbacks.log(`ScreenAnalyzer: dropping optional survey prompt — "${analysis.description}"`);
         return;
       }

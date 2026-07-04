@@ -41,6 +41,9 @@
 import { makeFingerprint, normaliseForFingerprint } from './bridge-turn-queue.js';
 import type { CodexBridgeEvent } from './codex-transcript.js';
 
+const UNMATCHED_REPLAY_WINDOW_MS = 5_000;
+const MAX_BUFFERED_UNMATCHED_EVENTS = 20;
+
 export interface CodexPendingTurn {
   turnId: string;
   started: boolean;
@@ -67,6 +70,7 @@ export class CodexBridgeQueue {
   private queue: CodexPendingTurn[] = [];
   private collecting: CodexPendingTurn | null = null;
   private localTurnsEnabled = false;
+  private bufferedUnmatched: CodexBridgeEvent[] = [];
   /** Lower bound (ms) for synthesising local turns — protects against a
    *  fresh-empty attach replaying historical iTerm conversation as
    *  "live" local input. Typically set to the moment adopt was wired up. */
@@ -85,6 +89,7 @@ export class CodexBridgeQueue {
   setLocalTurns(enabled: boolean, lowerBoundMs: number = Date.now()): void {
     this.localTurnsEnabled = enabled;
     this.localLowerBoundMs = lowerBoundMs;
+    if (enabled) this.bufferedUnmatched = [];
   }
 
   /** Push a pending Lark turn anchored to the message text. The fingerprint
@@ -99,6 +104,7 @@ export class CodexBridgeQueue {
       contentFingerprint: makeFingerprint(message),
       markTimeMs,
     });
+    this.replayBufferedUnmatched(markTimeMs);
   }
 
   /** Drop all pending turns. Used when the worker decides it can't reliably
@@ -106,6 +112,7 @@ export class CodexBridgeQueue {
   clearPending(): CodexPendingTurn[] {
     const dropped = this.queue.splice(0);
     if (this.collecting && dropped.includes(this.collecting)) this.collecting = null;
+    this.bufferedUnmatched = [];
     return dropped;
   }
 
@@ -115,85 +122,110 @@ export class CodexBridgeQueue {
     for (const ev of events) {
       if (!ev.uuid || this.seen.has(ev.uuid)) continue;
       this.seen.add(ev.uuid);
-      if (ev.kind === 'user') {
-        // First decide whether this user event is a REAL turn-start: either it
-        // matches the head pending Lark turn's fingerprint (and isn't tooOld),
-        // or — in adopt mode — it synthesises a local turn. Both the HOL-drop
-        // and the actual start key off this decision.
-        const next = this.queue.find(t => !t.started);
-        const tooOld = !!next && next.markTimeMs !== undefined && ev.timestampMs < next.markTimeMs - 5_000;
-        let fingerprintOk = true;
-        if (next?.contentFingerprint) {
-          fingerprintOk = normaliseForFingerprint(ev.text).includes(next.contentFingerprint);
-        }
-        const willStartNext = !!next && !tooOld && fingerprintOk;
-        const willSynthLocal = !willStartNext && this.localTurnsEnabled && ev.timestampMs >= this.localLowerBoundMs - 5_000;
+      this.ingestOne(ev, true);
+    }
+  }
 
-        // HOL-block drop (codex 0.134.0 active-turn steer): when a real new
-        // turn-start arrives while a turn is still collecting with no finalText,
-        // codex steered/merged this input into the active turn — it processes
-        // both as ONE turn and emits a single combined assistant_final, so the
-        // collecting turn will NEVER get its own final. Drop it now, otherwise
-        // it sits at the queue head forever and `drainEmittable()` wedges
-        // (started, no finalText → breaks the FIFO scan). Gating on "is a real
-        // turn-start" reuses the tooOld/fingerprint freshness already proven for
-        // turn-start, so the same 5s-skew invariant applies to both: a replayed
-        // historical user event is tooOld → won't start a turn → won't evict a
-        // live collecting turn; and a non-matching stray user event (non-adopt)
-        // is ignored rather than treated as a turn boundary. Mirrors Claude's
-        // BridgeTurnQueue.handleTurnStart HOL drop (which keys off "no assistant
-        // text yet" — the streaming-transcript equivalent of "no finalText").
-        if ((willStartNext || willSynthLocal) && this.collecting && this.collecting.finalText === undefined) {
-          const idx = this.queue.indexOf(this.collecting);
-          if (idx >= 0) this.queue.splice(idx, 1);
-          this.collecting = null;
-        }
+  private replayBufferedUnmatched(markTimeMs: number): void {
+    if (this.bufferedUnmatched.length === 0) return;
+    const replay = this.bufferedUnmatched.filter(ev => ev.timestampMs >= markTimeMs - UNMATCHED_REPLAY_WINDOW_MS);
+    this.bufferedUnmatched = [];
+    for (const ev of replay) this.ingestOne(ev, false);
+  }
 
-        if (willStartNext) {
-          next!.started = true;
-          next!.sourceSessionId = ev.sourceSessionId;
-          // Anchor the bridge-fallback suppression window to when the turn
-          // ACTUALLY started processing (the transcript user event's
-          // timestamp), not when the worker marked it. With type-ahead the
-          // worker marks turn N+1 immediately after turn N (both at flush
-          // time), but CoCo only writes turn N+1's user event when it
-          // dequeues it — i.e. after turn N's assistant_final. Without this
-          // override the [markTimeMs, nextTurn.markTimeMs) windows are all
-          // bunched at flush time, so turn N's own `botmux send` (which
-          // lands seconds later, after the model replies) falls OUTSIDE its
-          // own window and the fallback isn't suppressed → duplicate emit.
-          // `max` (not bare assignment) keeps the lower bound from ever
-          // moving backwards: a dequeue event can only be at or after the
-          // mark, and the -5s tooOld tolerance must not be able to widen the
-          // window into a previous turn's sends. Mirrors what Claude's
-          // BridgeTurnQueue.handleTurnStart does with eventTimeMs.
-          if (next!.markTimeMs === undefined) next!.markTimeMs = ev.timestampMs;
-          else next!.markTimeMs = Math.max(next!.markTimeMs, ev.timestampMs);
-          this.collecting = next!;
-        } else if (willSynthLocal) {
-          // Adopt mode local input: user typed in iTerm, no Lark
-          // fingerprint match. Synthesise a local turn so the assistant
-          // reply still reaches Lark. Insert AHEAD of any unstarted Lark
-          // turn so emit order matches when the event hit the transcript.
-          const localTurn: CodexPendingTurn = {
-            turnId: `codex-local-${ev.uuid}`,
-            started: true,
-            isLocal: true,
-            userText: ev.text,
-            markTimeMs: ev.timestampMs,
-            sourceSessionId: ev.sourceSessionId,
-          };
-          const insertAt = this.queue.findIndex(t => !t.started);
-          if (insertAt === -1) this.queue.push(localTurn);
-          else this.queue.splice(insertAt, 0, localTurn);
-          this.collecting = localTurn;
-        }
-      } else if (ev.kind === 'assistant_final') {
-        if (this.collecting) {
-          if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) continue;
-          this.collecting.finalText = ev.text;
-          this.collecting = null;
-        }
+  private rememberUnmatched(ev: CodexBridgeEvent): void {
+    this.bufferedUnmatched.push(ev);
+    if (this.bufferedUnmatched.length > MAX_BUFFERED_UNMATCHED_EVENTS) {
+      this.bufferedUnmatched.splice(0, this.bufferedUnmatched.length - MAX_BUFFERED_UNMATCHED_EVENTS);
+    }
+  }
+
+  private ingestOne(ev: CodexBridgeEvent, bufferUnmatched: boolean): void {
+    if (ev.kind === 'user') {
+      // First decide whether this user event is a REAL turn-start: either it
+      // matches the head pending Lark turn's fingerprint (and isn't tooOld),
+      // or — in adopt mode — it synthesises a local turn. Both the HOL-drop
+      // and the actual start key off this decision.
+      const next = this.queue.find(t => !t.started);
+      const tooOld = !!next && next.markTimeMs !== undefined && ev.timestampMs < next.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
+      let fingerprintOk = true;
+      if (next?.contentFingerprint) {
+        fingerprintOk = normaliseForFingerprint(ev.text).includes(next.contentFingerprint);
+      }
+      const willStartNext = !!next && !tooOld && fingerprintOk;
+      const willSynthLocal = !willStartNext && this.localTurnsEnabled && ev.timestampMs >= this.localLowerBoundMs - UNMATCHED_REPLAY_WINDOW_MS;
+
+      // HOL-block drop (codex 0.134.0 active-turn steer): when a real new
+      // turn-start arrives while a turn is still collecting with no finalText,
+      // codex steered/merged this input into the active turn — it processes
+      // both as ONE turn and emits a single combined assistant_final, so the
+      // collecting turn will NEVER get its own final. Drop it now, otherwise
+      // it sits at the queue head forever and `drainEmittable()` wedges
+      // (started, no finalText → breaks the FIFO scan). Gating on "is a real
+      // turn-start" reuses the tooOld/fingerprint freshness already proven for
+      // turn-start, so the same 5s-skew invariant applies to both: a replayed
+      // historical user event is tooOld → won't start a turn → won't evict a
+      // live collecting turn; and a non-matching stray user event (non-adopt)
+      // is ignored rather than treated as a turn boundary. Mirrors Claude's
+      // BridgeTurnQueue.handleTurnStart HOL drop (which keys off "no assistant
+      // text yet" — the streaming-transcript equivalent of "no finalText").
+      if ((willStartNext || willSynthLocal) && this.collecting && this.collecting.finalText === undefined) {
+        const idx = this.queue.indexOf(this.collecting);
+        if (idx >= 0) this.queue.splice(idx, 1);
+        this.collecting = null;
+      }
+
+      if (willStartNext) {
+        next!.started = true;
+        next!.sourceSessionId = ev.sourceSessionId;
+        // Anchor the bridge-fallback suppression window to when the turn
+        // ACTUALLY started processing (the transcript user event's
+        // timestamp), not when the worker marked it. With type-ahead the
+        // worker marks turn N+1 immediately after turn N (both at flush
+        // time), but CoCo only writes turn N+1's user event when it
+        // dequeues it — i.e. after turn N's assistant_final. Without this
+        // override the [markTimeMs, nextTurn.markTimeMs) windows are all
+        // bunched at flush time, so turn N's own `botmux send` (which
+        // lands seconds later, after the model replies) falls OUTSIDE its
+        // own window and the fallback isn't suppressed → duplicate emit.
+        // `max` (not bare assignment) keeps the lower bound from ever
+        // moving backwards: a dequeue event can only be at or after the
+        // mark, and the -5s tooOld tolerance must not be able to widen the
+        // window into a previous turn's sends. Mirrors what Claude's
+        // BridgeTurnQueue.handleTurnStart does with eventTimeMs.
+        if (next!.markTimeMs === undefined) next!.markTimeMs = ev.timestampMs;
+        else next!.markTimeMs = Math.max(next!.markTimeMs, ev.timestampMs);
+        this.collecting = next!;
+      } else if (willSynthLocal) {
+        // Adopt mode local input: user typed in iTerm, no Lark
+        // fingerprint match. Synthesise a local turn so the assistant
+        // reply still reaches Lark. Insert AHEAD of any unstarted Lark
+        // turn so emit order matches when the event hit the transcript.
+        const localTurn: CodexPendingTurn = {
+          turnId: `codex-local-${ev.uuid}`,
+          started: true,
+          isLocal: true,
+          userText: ev.text,
+          markTimeMs: ev.timestampMs,
+          sourceSessionId: ev.sourceSessionId,
+        };
+        const insertAt = this.queue.findIndex(t => !t.started);
+        if (insertAt === -1) this.queue.push(localTurn);
+        else this.queue.splice(insertAt, 0, localTurn);
+        this.collecting = localTurn;
+      } else if (bufferUnmatched && !this.localTurnsEnabled) {
+        // Cursor can write the Lark/user line to JSONL before the daemon IPC
+        // that marks the turn reaches this worker. Keep a tiny recent buffer
+        // so mark() can replay it instead of losing the line to `seen`.
+        this.rememberUnmatched(ev);
+      }
+    } else if (ev.kind === 'assistant_final') {
+      if (this.collecting) {
+        if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
+        this.collecting.finalText = ev.text;
+        this.collecting = null;
+      } else if (bufferUnmatched && !this.localTurnsEnabled) {
+        this.rememberUnmatched(ev);
       }
     }
   }

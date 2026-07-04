@@ -5,9 +5,7 @@ import type { CliAdapter, PtyHandle } from './types.js';
 
 const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+import { delay } from '../../utils/timing.js';
 
 function isMtrSessionId(value: string | undefined): value is string {
   return typeof value === 'string' && /^ses_[0-9A-Za-z]+$/.test(value);
@@ -28,10 +26,18 @@ function nativeSessionId(sessionId: string, cliSessionId?: string): string {
 }
 
 export function createMtrAdapter(pathOverride?: string): CliAdapter {
-  const bin = resolveCommand(pathOverride ?? 'mtr');
+  // resolvedBin is lazy: setup constructs adapters only to read static
+  // modelChoices and must not shell out (see resolveCommand); the binary path
+  // is a spawn-time concern.
+  const rawBin = pathOverride ?? 'mtr';
+  let cachedBin: string | undefined;
   return {
     id: 'mtr',
-    resolvedBin: bin,
+    // Whole dir kept REAL: mtr shares opencode's data dir and keeps its own SQLite
+    // DB there (mtr.db, WAL mode) — the sandbox home overlay lacks the fcntl locks
+    // SQLite needs (same failure as codex, see codex.ts).
+    authPaths: ['~/.local/share/opencode'],
+    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, initialPrompt }) {
       const mtrSessionId = nativeSessionId(sessionId, resumeSessionId);

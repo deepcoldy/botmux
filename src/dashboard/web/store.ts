@@ -2,10 +2,24 @@
 type Session = Record<string, any> & { sessionId: string; status: string };
 type Schedule = Record<string, any> & { id: string };
 
+export interface StoreSnapshot {
+  sessions: ReadonlyMap<string, Session>;
+  schedules: ReadonlyMap<string, Schedule>;
+  online: boolean;
+  version: number;
+}
+
 class Store {
   sessions = new Map<string, Session>();
   schedules = new Map<string, Schedule>();
   online = true;
+  private version = 0;
+  private snapshot: StoreSnapshot = {
+    sessions: this.sessions,
+    schedules: this.schedules,
+    online: this.online,
+    version: this.version,
+  };
   private listeners = new Set<() => void>();
 
   upsertSessions(rows: Session[]) {
@@ -41,7 +55,17 @@ class Store {
     if (this.online !== v) { this.online = v; this.emit(); }
   }
   on(fn: () => void) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
-  private emit() { for (const fn of this.listeners) fn(); }
+  getSnapshot(): StoreSnapshot { return this.snapshot; }
+  private emit() {
+    this.version += 1;
+    this.snapshot = {
+      sessions: this.sessions,
+      schedules: this.schedules,
+      online: this.online,
+      version: this.version,
+    };
+    for (const fn of this.listeners) fn();
+  }
 }
 
 export const store = new Store();

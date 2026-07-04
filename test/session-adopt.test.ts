@@ -34,6 +34,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
       JSON.stringify({ type: 'session', url: _url }),
   ),
   buildAdoptSelectCard: vi.fn(() => JSON.stringify({ type: 'adopt_select' })),
+  buildCodexAppThreadSelectCard: vi.fn(() => JSON.stringify({ type: 'codex_app_thread_select' })),
   getCliDisplayName: vi.fn(() => 'Claude'),
 }));
 
@@ -61,6 +62,10 @@ vi.mock('../src/services/session-store.js', () => ({
   createSession: vi.fn(),
 }));
 
+vi.mock('../src/services/codex-app-threads.js', () => ({
+  listCodexAppThreads: vi.fn(async () => []),
+}));
+
 vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
   const orig = await importOriginal<typeof import('../src/core/worker-pool.js')>();
   return {
@@ -74,6 +79,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
 
 vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
+  ensureSessionWhiteboard: vi.fn(),
   buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
   expandHome: vi.fn((p: string) => p),
   getProjectScanDir: vi.fn(() => '/tmp'),
@@ -103,6 +109,8 @@ import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-hand
 import { killWorker, forkWorker } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { deleteMessage } from '../src/im/lark/client.js';
+import { getBot } from '../src/bot-registry.js';
+import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -171,6 +179,17 @@ function makeAdoptSelectEvent(rootId: string, selectedValue: string, operatorOpe
   };
 }
 
+function makeCodexAppThreadSelectEvent(rootId: string, selectedValue: string, operatorOpenId = 'ou_user') {
+  return {
+    action: {
+      option: selectedValue,
+      value: { key: 'codex_app_thread_select', root_id: rootId },
+    },
+    operator: { open_id: operatorOpenId },
+    context: { open_message_id: 'om_card_msg' },
+  };
+}
+
 function flush(): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, 0));
 }
@@ -180,6 +199,12 @@ function flush(): Promise<void> {
 describe('Adopt card actions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+    } as any);
+    vi.mocked(listCodexAppThreads).mockResolvedValue([]);
   });
 
   // ── Disconnect ──────────────────────────────────────────────────────────
@@ -309,6 +334,12 @@ describe('Adopt card actions', () => {
       // Mock discoverAdoptableSessions to return empty (target gone)
       vi.doMock('../src/core/session-discovery.js', () => ({
         discoverAdoptableSessions: vi.fn(() => []),
+        // card-handler now also pulls adoptTargetKey to disambiguate herdr
+        // vs. tmux targets in the dropdown's selected-value. The empty
+        // session list short-circuits before adoptTargetKey is invoked, so
+        // the noop impl is fine.
+        adoptTargetKey: vi.fn(() => ''),
+        adoptTargetLabel: vi.fn(() => ''),
       }));
 
       const ds = makeDaemonSession();
@@ -345,6 +376,45 @@ describe('Adopt card actions', () => {
 
       // Should not crash, no session reply for parse error
       expect(killWorker).not.toHaveBeenCalled();
+    });
+
+    it('should resume selected Codex App thread without adopt metadata', async () => {
+      vi.mocked(getBot).mockReturnValue({
+        config: {
+          larkAppId: APP_ID,
+          larkAppSecret: 'secret',
+          cliId: 'codex-app',
+          cliPathOverride: '/opt/codex',
+        },
+        resolvedAllowedUsers: [],
+        botOpenId: 'ou_bot',
+      } as any);
+      vi.mocked(listCodexAppThreads).mockResolvedValueOnce([
+        {
+          threadId: 'thread-1',
+          name: 'Existing Codex App thread',
+          preview: 'preview',
+          cwd: '/repo/codex-app',
+          updatedAtMs: 1780000000000,
+        },
+      ]);
+      const ds = makeDaemonSession();
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      const selectedValue = JSON.stringify({ threadId: 'thread-1' });
+      await handleCardAction(makeCodexAppThreadSelectEvent(ROOT_ID, selectedValue), deps, APP_ID);
+      await flush();
+
+      expect(ds.adoptedFrom).toBeUndefined();
+      expect(ds.workingDir).toBe('/repo/codex-app');
+      expect(ds.session.cliSessionId).toBe('thread-1');
+      expect(ds.session.cliId).toBe('codex-app');
+      expect(ds.session.adoptedFrom).toBeUndefined();
+      expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
+      expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card_msg');
     });
 
     it('should return early when rootId is missing', async () => {

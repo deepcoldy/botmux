@@ -8,6 +8,8 @@ import {
   coerceWorkflowParams,
   executeWorkflowCommand,
   parseWorkflowCommand,
+  parseWorkflowGrillTrigger,
+  buildWorkflowGrillPrompt,
 } from '../src/im/lark/workflow-slash-command.js';
 import {
   WORKFLOW_APPROVE_ACTION,
@@ -50,44 +52,103 @@ afterEach(() => {
   rmSync(baseDir, { recursive: true, force: true });
 });
 
-describe('/workflow command parsing', () => {
-  it('parses /workflow run with key=value params', () => {
-    expect(parseWorkflowCommand('/workflow run hello name=SF date=2026-05-19')).toEqual({
+describe('/template (v2 模板) command parsing', () => {
+  it('parses /template run with key=value params', () => {
+    expect(parseWorkflowCommand('/template run hello name=SF date=2026-05-19')).toEqual({
       kind: 'run',
       workflowId: 'hello',
       rawParams: { name: 'SF', date: '2026-05-19' },
     });
   });
 
-  it('parses /workflow cancel with run id', () => {
-    expect(parseWorkflowCommand('/workflow cancel hello-20260520-abcd1234')).toEqual({
+  it('parses /template cancel with run id', () => {
+    expect(parseWorkflowCommand('/template cancel hello-20260520-abcd1234')).toEqual({
       kind: 'cancel',
       runId: 'hello-20260520-abcd1234',
     });
   });
 
   it('rejects non key=value params', () => {
-    expect(parseWorkflowCommand('/workflow run hello name')).toMatchObject({
+    expect(parseWorkflowCommand('/template run hello name')).toMatchObject({
       kind: 'invalid',
       error: expect.stringContaining('key=value'),
     });
   });
 
   it('rejects malformed cancel commands', () => {
-    expect(parseWorkflowCommand('/workflow cancel')).toMatchObject({
+    expect(parseWorkflowCommand('/template cancel')).toMatchObject({
       kind: 'invalid',
       error: expect.stringContaining('runId'),
     });
-    expect(parseWorkflowCommand('/workflow cancel hello extra')).toMatchObject({
+    expect(parseWorkflowCommand('/template cancel hello extra')).toMatchObject({
       kind: 'invalid',
       error: expect.stringContaining('只接受 runId'),
     });
-    expect(parseWorkflowCommand('/workflow cancel ../escape')).toMatchObject({
+    expect(parseWorkflowCommand('/template cancel ../escape')).toMatchObject({
       kind: 'invalid',
       error: expect.stringContaining('runId 只能包含'),
     });
   });
+});
 
+describe('/workflow run|cancel legacy（软降级：仍解析为 v2，与 /template 同构）', () => {
+  it('legacy /workflow run still parses as v2 run (改名提示由 daemon 从原始 content 判定)', () => {
+    expect(parseWorkflowCommand('/workflow run hello name=SF')).toEqual({
+      kind: 'run',
+      workflowId: 'hello',
+      rawParams: { name: 'SF' },
+    });
+  });
+
+  it('legacy /workflow cancel still parses as v2 cancel', () => {
+    expect(parseWorkflowCommand('/workflow cancel hello-20260520-abcd1234')).toEqual({
+      kind: 'cancel',
+      runId: 'hello-20260520-abcd1234',
+    });
+  });
+});
+
+describe('parseWorkflowGrillTrigger（/workflow 即兴 grill 入口）', () => {
+  it('parses /workflow new <goal>', () => {
+    expect(parseWorkflowGrillTrigger('/workflow new 调研三家竞品出对比报告')).toEqual({
+      kind: 'goal',
+      goal: '调研三家竞品出对比报告',
+    });
+  });
+
+  it('parses bare /workflow <goal> (无 new 前缀)', () => {
+    expect(parseWorkflowGrillTrigger('/workflow 把日志拉下来分析再出图')).toEqual({
+      kind: 'goal',
+      goal: '把日志拉下来分析再出图',
+    });
+  });
+
+  it('returns usage for bare /workflow and /workflow new with no goal', () => {
+    expect(parseWorkflowGrillTrigger('/workflow')).toEqual({ kind: 'usage' });
+    expect(parseWorkflowGrillTrigger('/workflow   ')).toEqual({ kind: 'usage' });
+    expect(parseWorkflowGrillTrigger('/workflow new')).toEqual({ kind: 'usage' });
+    expect(parseWorkflowGrillTrigger('/workflow new   ')).toEqual({ kind: 'usage' });
+  });
+
+  it('does NOT swallow legacy run/cancel (那是 v2，返回 null)', () => {
+    expect(parseWorkflowGrillTrigger('/workflow run hello name=SF')).toBeNull();
+    expect(parseWorkflowGrillTrigger('/workflow cancel hello-x')).toBeNull();
+  });
+
+  it('returns null for non-/workflow and word-boundary mismatches', () => {
+    expect(parseWorkflowGrillTrigger('/template run hello')).toBeNull();
+    expect(parseWorkflowGrillTrigger('/workflowfoo bar')).toBeNull();
+    expect(parseWorkflowGrillTrigger('帮我做个 workflow')).toBeNull();
+  });
+
+  it('buildWorkflowGrillPrompt embeds the goal and nudges the skill', () => {
+    const prompt = buildWorkflowGrillPrompt('调研三家竞品');
+    expect(prompt).toContain('botmux-workflow');
+    expect(prompt).toContain('调研三家竞品');
+  });
+});
+
+describe('workflow param coercion', () => {
   it('coerces simple workflow params and rejects missing required values', () => {
     expect(coerceWorkflowParams(def, { name: 'alice', retries: '2', dryRun: 'true' })).toEqual({
       name: 'alice',
@@ -185,7 +246,7 @@ describe('executeWorkflowCommand', () => {
 
     expect(cancelWorkflowRunFn).toHaveBeenCalledWith(
       'hello-20260520-abcd1234',
-      'cancelled via /workflow cancel',
+      'cancelled via /template cancel',
       { expectedChatId: 'oc_chat', by: 'ou_user' },
     );
     expect(result).toEqual({

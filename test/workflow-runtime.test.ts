@@ -687,6 +687,7 @@ describe('botSnapshots reach the spawner', () => {
               cliId: 'codex',
               displayName: 'Pinned',
               workingDir: '/runs/pinned-cwd',
+              cliPathOverride: '/opt/botmux-mc-codex',
             }
           : undefined,
     });
@@ -714,6 +715,7 @@ describe('botSnapshots reach the spawner', () => {
       cliId: 'codex',
       displayName: 'Pinned',
       workingDir: '/runs/pinned-cwd',
+      cliPathOverride: '/opt/botmux-mc-codex',
     });
     expect(captured[0]!.workingDir).toBe('/runs/pinned-cwd');
   });

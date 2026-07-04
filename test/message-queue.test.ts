@@ -28,6 +28,17 @@ vi.mock('node:fs', () => ({
     if (!(p in files)) throw new Error(`ENOENT: ${p}`);
     return files[p];
   },
+  // atomic-write（tmp+rename）会经过这两个调用
+  renameSync: (from: string, to: string) => {
+    if (!(from in files)) throw new Error(`ENOENT: ${from}`);
+    files[to] = files[from];
+    delete files[from];
+  },
+  unlinkSync: (p: string) => {
+    if (!(p in files)) throw new Error(`ENOENT: ${p}`);
+    delete files[p];
+  },
+  promises: {},
 }));
 
 vi.mock('../src/config.js', () => ({

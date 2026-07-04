@@ -3,11 +3,27 @@ import { config as dotenvConfig } from 'dotenv';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
+import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
+
+// Under pm2 the daemon's stdout/stderr are pipes to the God daemon. A broken
+// pipe (log streaming detaches, God daemon restart) would otherwise emit an
+// unhandled 'error' and crash the daemon, which has no uncaughtException trap.
+installStdioEpipeGuard();
 
 // Legacy: load .env for global settings (WEB_HOST, WEB_EXTERNAL_HOST, etc.)
 // Bot config now lives in bots.json; this is kept for backward compatibility.
 const globalEnv = join(homedir(), '.botmux', '.env');
 dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
+
+// A daemon is never a session. pm2 startOrRestart injects the caller's
+// environment into restarted apps, so a `botmux restart` issued from inside a
+// botmux session leaks session-scoped vars into this long-lived process —
+// hook-runner's CLI gate would then mistake the daemon for CLI context and
+// forward every hook event to the daemon itself (/api/hooks/emit) in an
+// infinite self-loop. Scrub unconditionally at boot.
+for (const k of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_ROOT_MESSAGE_ID']) {
+  delete process.env[k];
+}
 
 async function main() {
   // Resolve global UI locale from ~/.botmux/config.json BEFORE loading

@@ -14,7 +14,7 @@ import { mkdtempSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach } from 'vitest';
-import { withFileLock } from '../src/utils/file-lock.js';
+import { withFileLock, withFileLockSync } from '../src/utils/file-lock.js';
 
 describe('withFileLock', () => {
   let target: string;
@@ -28,6 +28,12 @@ describe('withFileLock', () => {
   it('runs fn and releases the lock', async () => {
     const result = await withFileLock(target, async () => 'ok');
     expect(result).toBe('ok');
+    expect(existsSync(target + '.lock')).toBe(false);
+  });
+
+  it('runs sync fn and releases the lock', () => {
+    const result = withFileLockSync(target, () => 'ok-sync');
+    expect(result).toBe('ok-sync');
     expect(existsSync(target + '.lock')).toBe(false);
   });
 
@@ -68,7 +74,11 @@ describe('withFileLock', () => {
 
     let threw: Error | null = null;
     try {
-      await withFileLock(target, async () => 'unreachable');
+      // The behavior under test (refuse to steal a live lock, then time out)
+      // is independent of the timeout length, so use a short maxWaitMs instead
+      // of waiting the full 5s default — keeps this from being the slowest
+      // unit-test in the suite.
+      await withFileLock(target, async () => 'unreachable', { maxWaitMs: 500 });
     } catch (e: any) {
       threw = e;
     }

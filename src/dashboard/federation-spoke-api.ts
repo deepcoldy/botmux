@@ -13,7 +13,8 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { config } from '../config.js';
 import { jsonRes } from './workflow-api.js';
@@ -24,6 +25,7 @@ import { addMembership, listMemberships, removeMembership } from '../services/fe
 import type { FederatedBot } from '../services/federation-store.js';
 import { listFederatedDeployments } from '../services/federation-store.js';
 import { ensureDefaultTeam, DEFAULT_TEAM_ID, listTeams, createTeam, deleteTeam, getTeam } from '../services/team-store.js';
+import { listTeamGroups, recordTeamGroup } from '../services/team-groups-store.js';
 import { createInvite, deleteInvitesForTeam } from '../services/invite-store.js';
 import { removeTeamFederation, removeDeployment } from '../services/federation-store.js';
 import { loadBotConfigs, registerBot, getBot, type BotConfig } from '../bot-registry.js';
@@ -42,6 +44,9 @@ export interface OwnerCandidate { unionId: string; name: string }
  *  without network. */
 interface OwnerResolveDeps {
   configs?: () => BotConfig[];
+  /** Auth-only callers only need union_id membership and should not pay a
+   *  best-effort contact lookup just to decorate direct `on_` candidates. */
+  skipNames?: boolean;
   /** Ensure a usable Lark client exists for cfg. The DASHBOARD process has no bot
    *  registry (it proxies to daemons), so getBotClient() would throw — register
    *  the cfg on demand (it carries the app secret from bots.json). */
@@ -67,6 +72,7 @@ export async function resolveOwnerCandidatesFromAllowedUsers(d: OwnerResolveDeps
   const ensureClient = d.ensureClient ?? ((cfg: BotConfig) => { try { getBot(cfg.larkAppId); } catch { registerBot(cfg); } });
   const resolveAllowed = d.resolveAllowed ?? (async (id, a) => (await resolveAllowedUsersWithMap(id, a)).resolved);
   const resolveUnion = d.resolveUnion ?? resolveUserUnionId;
+  const skipNames = d.skipNames === true;
   let configs: BotConfig[] = [];
   try { configs = loadConfigs(); } catch { return []; }
   const byUnion = new Map<string, OwnerCandidate>();
@@ -78,13 +84,15 @@ export async function resolveOwnerCandidatesFromAllowedUsers(d: OwnerResolveDeps
     for (const v of allowed) {
       if (!v.startsWith('on_') || byUnion.has(v)) continue;
       let name = '';
-      try {
-        ensureClient(cfg);
-        const res = await (getBot(cfg.larkAppId).client as any).contact.v3.user.get({
-          path: { user_id: v }, params: { user_id_type: 'union_id' },
-        });
-        if (res.code === 0) name = res.data?.user?.name ?? '';
-      } catch { /* best-effort */ }
+      if (!skipNames) {
+        try {
+          ensureClient(cfg);
+          const res = await (getBot(cfg.larkAppId).client as any).contact.v3.user.get({
+            path: { user_id: v }, params: { user_id_type: 'union_id' },
+          });
+          if (res.code === 0) name = res.data?.user?.name ?? '';
+        } catch { /* best-effort */ }
+      }
       byUnion.set(v, { unionId: v, name });
     }
 
@@ -118,7 +126,7 @@ function writeTeamRole(dataDir: string, larkAppId: string, content: string): voi
   mkdirSync(dirname(fp), { recursive: true });
   let out = content.trim();
   while (Buffer.byteLength(out, 'utf-8') > MAX_ROLE_BYTES) out = out.slice(0, -1);
-  writeFileSync(fp, out, 'utf-8');
+  atomicWriteFileSync(fp, out);
 }
 
 async function readBody(req: IncomingMessage, maxBytes = 64 * 1024): Promise<any> {
@@ -162,8 +170,28 @@ function localBots(dataDir: string, live?: LiveBot[]): FederatedBot[] {
   }));
 }
 
-/** Push this deployment's current bots to every joined hub. Best-effort. */
-export async function syncAllMemberships(dataDir: string, fetcher: Fetcher = fetch, live?: LiveBot[]): Promise<{ synced: number; failed: number }> {
+/** 上报给团队看板的会话裁剪行所需的最小字段（来源 SessionRow）。 */
+export interface TeamSessionRowLike {
+  sessionId: string;
+  botName?: string;
+  cliId?: string;
+  status?: string;
+  title?: string;
+  chatId: string;
+  scope?: string;
+  adopt?: boolean;
+  lastMessageAt?: number;
+}
+
+/** Push this deployment's current bots to every joined hub. Best-effort.
+ *  传 sessionsProvider 时顺带上报团队看板的会话裁剪行：hub 在 sync 响应里下发
+ *  该团队的协作群清单，按 chatId 过滤本地会话 POST 回 hub（活跃优先，截 200）。 */
+export async function syncAllMemberships(
+  dataDir: string,
+  fetcher: Fetcher = fetch,
+  live?: LiveBot[],
+  sessionsProvider?: () => TeamSessionRowLike[],
+): Promise<{ synced: number; failed: number }> {
   const bots = localBots(dataDir, live);
   const me = getDeploymentIdentity(dataDir);
   let synced = 0, failed = 0;
@@ -175,9 +203,87 @@ export async function syncAllMemberships(dataDir: string, fetcher: Fetcher = fet
         body: JSON.stringify({ syncToken: m.syncToken, bots, ownerUnionId: me.ownerUnionId, ownerName: me.ownerName, name: me.name }),
       });
       if (r.ok) synced++; else failed++;
+      if (r.ok) {
+        try {
+          const j = await r.json().catch(() => ({} as any));
+          const groupChatIds: unknown[] = Array.isArray(j?.groupChatIds) ? j.groupChatIds : [];
+          // Mirror this team's 拉群 groups onto THIS (member) deployment so its
+          // auth gate sees the same trust boundary as the hub — a teammate bot
+          // talking in one of these groups is then learned + trusted locally
+          // (see [[team-bots-store]] / isTeamGroupChat). Recorded regardless of
+          // sessionsProvider; the session-report below is the separate concern.
+          for (const cid of groupChatIds) recordTeamGroup(dataDir, m.teamId, String(cid));
+          if (groupChatIds.length && sessionsProvider) {
+            const teamChats = new Set(groupChatIds.map(String));
+            const sessions = sessionsProvider()
+              .filter(s => teamChats.has(String(s.chatId)))
+              .sort((a, b) => {
+                // 活跃优先，再按最近活跃倒序——截断时先丢最旧的已关闭会话
+                const ac = a.status === 'closed' ? 1 : 0;
+                const bc = b.status === 'closed' ? 1 : 0;
+                if (ac !== bc) return ac - bc;
+                return Number(b.lastMessageAt ?? 0) - Number(a.lastMessageAt ?? 0);
+              })
+              .slice(0, 200)
+              .map(s => ({
+                sessionId: s.sessionId,
+                botName: s.botName,
+                cliId: s.cliId,
+                status: s.status,
+                title: s.title,
+                chatId: s.chatId,
+                scope: s.scope,
+                adopt: s.adopt || undefined,
+                lastMessageAt: Number(s.lastMessageAt ?? 0),
+              }));
+            await fetchWithTimeout(fetcher, `${m.hubUrl}/api/federation/team-sessions`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', authorization: `Bearer ${m.syncToken}` },
+              body: JSON.stringify({ sessions }),
+            });
+          }
+        } catch { /* 上报失败不影响心跳同步本身 */ }
+      }
     } catch { failed++; }
   }
   return { synced, failed };
+}
+
+/** Persist a resolved owner as THIS deployment's identity, claim its unassigned
+ *  bots (no-steal: only bots without a manual owner), then push the new identity
+ *  to every joined hub. Shared verbatim by the interactive bind paths (/pair
+ *  consume, dashboard auto-bind) and the headless startup auto-bind, so the three
+ *  never drift apart. */
+export async function bindDeploymentOwnerAndClaim(
+  dataDir: string,
+  owner: { unionId?: string; name?: string },
+  opts: { fetcher?: Fetcher; live?: LiveBot[] } = {},
+): Promise<{ synced: number; failed: number }> {
+  setDeploymentOwner(dataDir, owner);
+  for (const b of buildTeamRoster(dataDir, undefined, undefined, opts.live).bots) {
+    setBotOwner(dataDir, b.larkAppId, { unionId: owner.unionId, name: owner.name }, { override: false });
+  }
+  return syncAllMemberships(dataDir, opts.fetcher ?? fetch, opts.live).catch(() => ({ synced: 0, failed: 0 }));
+}
+
+/** Headless single-candidate auto-bind, for a standalone (non-team) deployment so
+ *  the owner identity gets set WITHOUT a manual dashboard click — the left-rail
+ *  avatar then shows, 拉群 can pull the operator in, and bots are claimed. Resolves
+ *  the owner from the bots' OWN allowedUsers (no /pair, immune to the dataDir-split
+ *  that /pair has). Only acts when there is exactly ONE candidate (unambiguous); a
+ *  multi-person deployment still needs the dashboard picker. Idempotent: a no-op
+ *  once bound (cheap local read, no network). */
+export async function autoBindOwnerIfUnambiguous(
+  dataDir: string,
+  opts: { fetcher?: Fetcher; live?: LiveBot[]; ownerCandidates?: () => Promise<OwnerCandidate[]> } = {},
+): Promise<{ status: 'already_bound' | 'bound' | 'need_choice' | 'no_candidates'; owner?: OwnerCandidate; candidates?: OwnerCandidate[] }> {
+  if (getDeploymentIdentity(dataDir).ownerUnionId) return { status: 'already_bound' };
+  const candidates = await (opts.ownerCandidates ?? resolveOwnerCandidatesFromAllowedUsers)();
+  if (candidates.length === 0) return { status: 'no_candidates' };
+  if (candidates.length > 1) return { status: 'need_choice', candidates };
+  const owner = candidates[0];
+  await bindDeploymentOwnerAndClaim(dataDir, owner, opts);
+  return { status: 'bound', owner };
 }
 
 export interface FederationSpokeDeps {
@@ -207,7 +313,8 @@ export async function handleFederationSpokeApi(
   const LOCAL = new Set(['/api/team/local', '/api/team/local-invite', '/api/team/rename-deployment', '/api/team/federated-group',
     '/api/team/identity/start', '/api/team/identity/status', '/api/team/identity/consume', '/api/team/identity/auto-bind',
     '/api/team/hosted']);
-  const REMOTE = new Set(['/api/team/join-remote', '/api/team/remote-roster', '/api/team/sync-remote', '/api/team/leave-remote', '/api/team/remote-group']);
+  const REMOTE = new Set(['/api/team/join-remote', '/api/team/remote-roster', '/api/team/sync-remote', '/api/team/leave-remote', '/api/team/remote-group',
+    '/api/team/remote-board', '/api/team/remote-board-move']);
   const localBotEdit = path.match(/^\/api\/team\/local-bots\/([^/]+)\/(capability|role)$/);
   const memberDel = path.match(/^\/api\/team\/hosted\/([^/]+)\/members\/([^/]+)$/);
   const hostedDel = path.match(/^\/api\/team\/hosted\/([^/]+)$/);
@@ -304,15 +411,10 @@ export async function handleFederationSpokeApi(
     const c = consumePairing(dataDir, String(body?.pairingId ?? ''), String(body?.browserToken ?? ''));
     if (!c.ok) { jsonRes(res, 409, { ok: false, error: c.reason }); return true; }
     const owner = { unionId: c.claimedBy.unionId, name: c.claimedBy.name };
-    setDeploymentOwner(dataDir, owner);
-    // Own THIS deployment's bots (no-steal: only unassigned; keep manual owners).
-    for (const b of buildTeamRoster(dataDir, undefined, undefined, live).bots) {
-      setBotOwner(dataDir, b.larkAppId, { unionId: owner.unionId, name: owner.name }, { override: false });
-    }
-    // Push the new owner identity to every joined hub NOW (best-effort) so a 拉群
-    // immediately after binding can derive the operator — don't wait for the
-    // 2-min periodic sync, otherwise #3 (operator not invited) reproduces.
-    const sync = await syncAllMemberships(dataDir, fetcher, live).catch(() => ({ synced: 0, failed: 0 }));
+    // Bind + claim bots + push to hubs NOW (best-effort) so a 拉群 immediately after
+    // binding can derive the operator — don't wait for the 2-min periodic sync,
+    // otherwise #3 (operator not invited) reproduces.
+    const sync = await bindDeploymentOwnerAndClaim(dataDir, owner, { fetcher, live });
     jsonRes(res, 200, { ok: true, owner, hubsSynced: sync.synced, hubsFailed: sync.failed });
     return true;
   }
@@ -330,11 +432,7 @@ export async function handleFederationSpokeApi(
     const chosen = want ? candidates.find(c => c.unionId === want) : (candidates.length === 1 ? candidates[0] : undefined);
     if (!chosen) { jsonRes(res, 200, { ok: true, needChoice: true, candidates }); return true; }
     const owner = { unionId: chosen.unionId, name: chosen.name };
-    setDeploymentOwner(dataDir, owner);
-    for (const b of buildTeamRoster(dataDir, undefined, undefined, live).bots) {
-      setBotOwner(dataDir, b.larkAppId, { unionId: owner.unionId, name: owner.name }, { override: false });
-    }
-    const sync = await syncAllMemberships(dataDir, fetcher, live).catch(() => ({ synced: 0, failed: 0 }));
+    const sync = await bindDeploymentOwnerAndClaim(dataDir, owner, { fetcher, live });
     jsonRes(res, 200, { ok: true, owner, hubsSynced: sync.synced, hubsFailed: sync.failed });
     return true;
   }
@@ -387,6 +485,8 @@ export async function handleFederationSpokeApi(
     const suggestedHubUrl = `http://${config.dashboard.externalHost}:${config.dashboard.port}`;
     const teams = listTeams(dataDir).map(t => ({
       teamId: t.id, name: t.name, isDefault: t.id === DEFAULT_TEAM_ID,
+      // dashboard 团队页发起过的协作群 —— 看板团队筛选的白名单之一
+      groupChatIds: listTeamGroups(dataDir, t.id).map(b => b.chatId),
       ...buildFederatedRoster(dataDir, t.id, botConfigOrder(), undefined, live),
     }));
     jsonRes(res, 200, { ok: true, deployment: me, suggestedHubUrl, teams });
@@ -493,6 +593,44 @@ export async function handleFederationSpokeApi(
       }
     }
     jsonRes(res, 200, { ok: true, memberships: out });
+    return true;
+  }
+
+  // ── 远程团队看板代理：成员的浏览器 → 本地 dashboard → hub ──────────────────
+  // key = `${hubUrl}::${teamId}`（与 membership 存储键、前端团队 key 同构）。
+  if (path === '/api/team/remote-board' && method === 'GET') {
+    const key = String(url.searchParams.get('key') ?? '');
+    const m = listMemberships(dataDir).find(mm => `${mm.hubUrl}::${mm.teamId}` === key);
+    if (!m) { jsonRes(res, 404, { ok: false, error: 'membership_not_found' }); return true; }
+    try {
+      const r = await fetchWithTimeout(fetcher, `${m.hubUrl}/api/federation/team-board`, {
+        headers: { authorization: `Bearer ${m.syncToken}` },
+      });
+      const j = await r.json().catch(() => ({} as any));
+      jsonRes(res, r.ok ? 200 : 502, j);
+    } catch (e) {
+      jsonRes(res, 502, { ok: false, ...hubError(e) });
+    }
+    return true;
+  }
+
+  if (path === '/api/team/remote-board-move' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const key = String(body?.key ?? '');
+    const m = listMemberships(dataDir).find(mm => `${mm.hubUrl}::${mm.teamId}` === key);
+    if (!m) { jsonRes(res, 404, { ok: false, error: 'membership_not_found' }); return true; }
+    try {
+      const r = await fetchWithTimeout(fetcher, `${m.hubUrl}/api/federation/team-board-move`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${m.syncToken}` },
+        body: JSON.stringify({ sessionId: body?.sessionId, column: body?.column, position: body?.position }),
+      });
+      const j = await r.json().catch(() => ({} as any));
+      jsonRes(res, r.ok ? 200 : 502, j);
+    } catch (e) {
+      jsonRes(res, 502, { ok: false, ...hubError(e) });
+    }
     return true;
   }
 

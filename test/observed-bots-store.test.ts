@@ -179,4 +179,35 @@ describe('observed-bots-store', () => {
     recordObservedBots(dataDir, APP_A, 'oc_chat1', [], 'introduce', 1);
     expect(existsSync(join(dataDir, `observed-bots-${APP_A}-oc_chat1.json`))).toBe(false);
   });
+
+  it('replaces an old openId when the same name is observed with a new openId', () => {
+    recordObservedBots(dataDir, APP_A, 'oc_chat1', [{ openId: 'ou_old', name: 'BotB' }], 'introduce', 1_000);
+    recordObservedBots(dataDir, APP_A, 'oc_chat1', [{ openId: 'ou_new', name: 'BotB' }], 'introduce', 2_000);
+
+    const out = listObservedBots(dataDir, APP_A, 'oc_chat1', undefined, 2_000);
+    expect(out).toEqual<ObservedBot[]>([
+      { openId: 'ou_new', name: 'BotB', source: 'introduce', firstSeenAt: 2_000, lastSeenAt: 2_000 },
+    ]);
+
+    const fp = join(dataDir, `observed-bots-${APP_A}-oc_chat1.json`);
+    const json = JSON.parse(readFileSync(fp, 'utf-8'));
+    expect(json).not.toHaveProperty('ou_old');
+  });
+
+  it('uses the last same-name entry within a single observed batch', () => {
+    recordObservedBots(
+      dataDir,
+      APP_A,
+      'oc_chat1',
+      [
+        { openId: 'ou_first', name: 'BotB' },
+        { openId: 'ou_second', name: 'BotB' },
+      ],
+      'introduce',
+      1_000,
+    );
+
+    const out = listObservedBots(dataDir, APP_A, 'oc_chat1', undefined, 1_000);
+    expect(out.map(b => b.openId)).toEqual(['ou_second']);
+  });
 });

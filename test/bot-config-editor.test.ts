@@ -3,6 +3,7 @@ import {
   applyBotConfigEdits,
   assertUniqueBotProcessNames,
   assertOwnerWhenChatGroups,
+  botProcessEnv,
   botProcessName,
   findInvalidAllowedUserEntries,
   hasOwnerEntry,
@@ -13,6 +14,43 @@ import {
   removeBotConfig,
   resolveCliId,
 } from '../src/setup/bot-config-editor.js';
+
+describe('botProcessEnv', () => {
+  it('keeps valid process env keys and stringifies primitive values', () => {
+    expect(botProcessEnv({
+      env: {
+        HTTPS_PROXY: 'http://127.0.0.1:7890',
+        OPENAI_TIMEOUT_MS: 30000,
+        FEATURE_FLAG: true,
+        EMPTY_VALUE: '',
+      },
+    })).toEqual({
+      HTTPS_PROXY: 'http://127.0.0.1:7890',
+      OPENAI_TIMEOUT_MS: '30000',
+      FEATURE_FLAG: 'true',
+      EMPTY_VALUE: '',
+    });
+  });
+
+  it('drops invalid keys and non-primitive values', () => {
+    expect(botProcessEnv({
+      env: {
+        '1BAD': 'x',
+        'BAD-NAME': 'x',
+        OK_NAME: ['x'],
+        ALSO_OK: { nested: true },
+        NULLISH: null,
+        VALID_NAME: false,
+      },
+    })).toEqual({ VALID_NAME: 'false' });
+  });
+
+  it('returns an empty object when env is missing or not an object', () => {
+    expect(botProcessEnv({})).toEqual({});
+    expect(botProcessEnv({ env: [] })).toEqual({});
+    expect(botProcessEnv({ env: 'HTTPS_PROXY=x' })).toEqual({});
+  });
+});
 
 describe('parseBotSelection', () => {
   const bots = [
@@ -96,6 +134,34 @@ describe('applyBotConfigEdits', () => {
       allowedUsers: ['alice@example.com', 'ou_bob'],
       oncallChats: [{ chatId: 'oc_1', workingDir: '~/repo' }],
     });
+  });
+
+  it('sets wrapperCli (aiden gateway) and clears it when switching to a plain CLI', () => {
+    const gateway = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+    }, {
+      cliChoice: 'claude-code',
+      wrapperCli: 'aiden x claude',
+    });
+    expect(gateway.cliId).toBe('claude-code');
+    expect(gateway.wrapperCli).toBe('aiden x claude');
+
+    // Switching to a plain CLI passes wrapperCli: null → the stale prefix is dropped.
+    const plain = applyBotConfigEdits(gateway, { cliChoice: '4', wrapperCli: null });
+    expect(plain.cliId).toBe('codex');
+    expect(plain.wrapperCli).toBeUndefined();
+  });
+
+  it('leaves wrapperCli untouched when the field is undefined', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      wrapperCli: 'aiden x claude',
+    }, { workingDir: '~/x' });
+    expect(out.wrapperCli).toBe('aiden x claude');
   });
 
   it('edits and clears allowedChatGroups', () => {
@@ -198,10 +264,9 @@ describe('applyBotConfigEdits', () => {
     expect(cleared.model).toBeUndefined();
   });
 
-  // 防回归：cli.ts 的 promptEditBotConfig 在切到不支持 model 的 adapter
-  // （aiden/mtr/agy 等没声明 modelChoices）时会把 input.model 设成 null
-  // 强制清空旧 model — 这里只测 applyBotConfigEdits 把 null 解释为"删字段"
-  // 的契约，覆盖 Codex review 反馈的"切 CLI 后旧 model 残留"边界。
+  // 防回归：cli.ts 的 promptEditBotConfig 在切换 CLI 时会把 input.model 设成
+  // null 强制清空旧 model — 这里只测 applyBotConfigEdits 把 null 解释为
+  // "删字段"的契约，覆盖"切 CLI 后旧 model 残留"边界。
   it('input.model === null clears the field even when cliChoice also changes', () => {
     const updated = applyBotConfigEdits({
       larkAppId: 'app',
@@ -230,6 +295,8 @@ describe('resolveCliId', () => {
   });
 
   it('maps setup menu indices to cliIds', () => {
+    // 序号以 src/setup/bot-config-editor.ts 的 CLI_ID_CHOICES 为准；
+    // 新 CLI 一律追加尾部，历史序号保持稳定（脚本化 setup 依赖）。
     expect(resolveCliId('1')).toBe('claude-code');
     expect(resolveCliId('4')).toBe('codex');
     expect(resolveCliId('7')).toBe('opencode');
@@ -237,6 +304,12 @@ describe('resolveCliId', () => {
     expect(resolveCliId('10')).toBe('hermes');
     expect(resolveCliId('11')).toBe('codex-app');
     expect(resolveCliId('12')).toBe('mira');
+    expect(resolveCliId('13')).toBe('seed');
+    expect(resolveCliId('14')).toBe('traex');
+    expect(resolveCliId('15')).toBe('pi');
+    expect(resolveCliId('16')).toBe('copilot');
+    expect(resolveCliId('20')).toBe('kimi');
+    expect(resolveCliId('21')).toBe('genius');
   });
 
   it('passes through literal cliIds unchanged', () => {
@@ -246,6 +319,8 @@ describe('resolveCliId', () => {
     expect(resolveCliId('mtr')).toBe('mtr');
     expect(resolveCliId('hermes')).toBe('hermes');
     expect(resolveCliId('mira')).toBe('mira');
+    expect(resolveCliId('pi')).toBe('pi');
+    expect(resolveCliId('copilot')).toBe('copilot');
   });
 
   it('throws on typos so they do not leak into bots.json', () => {

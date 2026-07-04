@@ -14,7 +14,8 @@
  *   3. Multi-turn: new card creation + old card freeze (nonce-based isolation)
  *   4. restart / close button actions
  *   5. Old card toggle ignored (card_nonce mismatch)
- *   6. get_write_link sends DM to operator
+ *   6. get_write_link delivers the write-link card privately (ephemeral in a
+ *      group, DM fallback in p2p)
  *
  * Run:  pnpm vitest run test/card-integration.test.ts
  */
@@ -135,6 +136,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
 
 vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
+  ensureSessionWhiteboard: vi.fn(),
   buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
   // card-handler now persists streaming-card state on every toggle so it
   // survives daemon restart; the integration tests don't care about disk
@@ -185,6 +187,7 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
       updatedAt: Date.now(),
       pid: null,
       chatType: 'group',
+      scope: 'chat',
     },
     worker: { killed: false, send: vi.fn() } as any,
     workerPort: 8080,
@@ -192,6 +195,10 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
     larkAppId: APP_ID,
     chatId: 'oc_chat',
     chatType: 'group',
+    // Flat 普通群 session: status confirmations (restart/close/resume/not-ready)
+    // go out as "visible-to-you" ephemeral cards. Thread-scope sessions take the
+    // visible in-thread reply instead — covered by the thread-scope cases below.
+    scope: 'chat',
     spawnedAt: Date.now(),
     cliVersion: '1.0',
     lastMessageAt: Date.now(),
@@ -453,6 +460,7 @@ describe('Card integration: full event flow', () => {
 
   describe('Scenario 4: restart and close button actions', () => {
     it('restart with live worker should send restart IPC message', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
       const workerSend = vi.fn();
       const ds = makeDaemonSession({
         worker: { killed: false, send: workerSend } as any,
@@ -464,12 +472,12 @@ describe('Card integration: full event flow', () => {
       await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
 
       expect(workerSend).toHaveBeenCalledWith({ type: 'restart' });
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('重启'),
-        undefined,
-        APP_ID,
+      // The confirmation is delivered ephemeral to the clicker (group chat + an
+      // operator open_id), not as a visible group reply.
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+        APP_ID, ds.chatId, 'ou_user', expect.stringContaining('重启'),
       );
+      expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
     it('restart without worker should re-fork', async () => {
@@ -484,6 +492,7 @@ describe('Card integration: full event flow', () => {
     });
 
     it('close should kill worker and remove session', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession();
       const sessions = new Map<string, DaemonSession>();
       const sKey = sessionKey(ROOT_ID, APP_ID);
@@ -494,14 +503,13 @@ describe('Card integration: full event flow', () => {
 
       expect(killWorker).toHaveBeenCalledWith(ds);
       expect(sessions.has(sKey)).toBe(false);
-      // Closed reply is now an interactive card with a Resume button; the
-      // mocked builder embeds the type marker so we assert on that shape.
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('"type":"closed"'),
-        'interactive',
-        APP_ID,
+      // Closed reply is an interactive card with a Resume button, delivered
+      // ephemeral to the clicker (group chat + operator open_id); the mocked
+      // builder embeds the type marker so we assert on that shape.
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+        APP_ID, ds.chatId, 'ou_user', expect.stringContaining('"type":"closed"'),
       );
+      expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
     it('close in private mode sends the closed card ephemeral to owners, not the group', async () => {
@@ -510,7 +518,7 @@ describe('Card integration: full event flow', () => {
       // privateCard on + an owner in allowedUsers. Sticky (close path calls
       // getBot several times); restored in finally so it can't leak.
       vi.mocked(botRegMod.getBot).mockReturnValue({
-        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: true },
+        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: true, allowedUsers: ['ou_owner'] },
         resolvedAllowedUsers: ['ou_owner'],
         botOpenId: 'ou_bot',
       } as any);
@@ -551,7 +559,7 @@ describe('Card integration: full event flow', () => {
       // still go ephemeral — its visibility is pinned to the card, not to the
       // current (mutable) config.
       vi.mocked(botRegMod.getBot).mockReturnValue({
-        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: false },
+        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: false, allowedUsers: ['ou_owner'] },
         resolvedAllowedUsers: ['ou_owner'],
         botOpenId: 'ou_bot',
       } as any);
@@ -584,6 +592,7 @@ describe('Card integration: full event flow', () => {
     });
 
     it('resume should call resumeSession and reply with success notice', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
       const sessionId = 'closed-uuid-1';
       const sessions = new Map<string, DaemonSession>();
       const deps = makeDeps(sessions);
@@ -594,25 +603,27 @@ describe('Card integration: full event flow', () => {
       vi.mocked(sessionStoreMod.getSession).mockReturnValue({
         sessionId, chatId: 'oc_chat', rootMessageId: ROOT_ID,
         title: 'closed', status: 'closed', createdAt: '2026-01-01T00:00:00.000Z',
-        larkAppId: APP_ID, scope: 'thread', cliId: 'claude-code',
+        larkAppId: APP_ID, scope: 'chat', cliId: 'claude-code',
       } as any);
 
       const sm = await import('../src/core/session-manager.js');
       const fakeDs: any = {
         session: { sessionId, cliId: 'claude-code' },
         larkAppId: APP_ID,
+        chatId: 'oc_chat',
+        chatType: 'group',
+        scope: 'chat',  // flat 普通群 → resume notice goes out ephemeral
       };
       vi.mocked(sm.resumeSession).mockReturnValue({ ok: true, ds: fakeDs } as any);
 
       await handleCardAction(makeResumeEvent(ROOT_ID, sessionId), deps, APP_ID);
 
       expect(sm.resumeSession).toHaveBeenCalledWith(sessionId, sessions);
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('已恢复'),
-        undefined,
-        APP_ID,
+      // Success notice is delivered ephemeral to the clicker (group + operator).
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+        APP_ID, 'oc_chat', 'ou_user', expect.stringContaining('已恢复'),
       );
+      expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
     it('resume should surface anchor_occupied error from resumeSession', async () => {
@@ -701,7 +712,8 @@ describe('Card integration: full event flow', () => {
       // operator, then verify resumeSession was never called and no reply went out.
       const botRegMod = await import('../src/bot-registry.js');
       vi.mocked(botRegMod.getBot).mockReturnValueOnce({
-        config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' } as any,
+        // config.allowedUsers 是原始配置（hasAllowlist 据此判定）；resolvedAllowedUsers 是解析结果。
+        config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_other_user'] } as any,
         resolvedAllowedUsers: ['ou_other_user'],
         botOpenId: 'ou_bot',
       } as any);
@@ -726,29 +738,142 @@ describe('Card integration: full event flow', () => {
     });
   });
 
-  // ── Scenario 5: get_write_link DM ────────────────────────────────────
+  // ── Scenario 4b: thread-scope confirmations stay in-thread (no leak) ───
+  //
+  // Regression guard: the ephemeral API has no thread anchor, so a 话题 (a
+  // thread-scope session inside a 普通群) must NOT use ephemeral — the
+  // restart/close/resume confirmation has to stay in the topic via the visible
+  // in-thread reply (sessionReply → reply_in_thread). Flat 普通群 (scope:'chat',
+  // tested in Scenario 4) keeps the ephemeral "visible-to-you" behaviour.
 
-  describe('Scenario 5: get_write_link sends DM', () => {
-    it('should send session card via DM to operator', async () => {
+  describe('Scenario 4b: thread-scope status cards stay in the thread', () => {
+    it('restart confirmation in a thread-scope session is a visible in-thread reply, never ephemeral', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const workerSend = vi.fn();
       const ds = makeDaemonSession({
-        workerPort: 9090,
-        workerToken: 'write_tok',
+        scope: 'thread',
+        worker: { killed: false, send: workerSend } as any,
       });
       const sessions = new Map<string, DaemonSession>();
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
 
-      await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
+      await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
+
+      expect(workerSend).toHaveBeenCalledWith({ type: 'restart' });
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID, expect.stringContaining('重启'), undefined, APP_ID,
+      );
+    });
+
+    it('close card in a thread-scope session is replied in-thread, never ephemeral', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession({ scope: 'thread' });
+      const sessions = new Map<string, DaemonSession>();
+      const sKey = sessionKey(ROOT_ID, APP_ID);
+      sessions.set(sKey, ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
+
+      expect(killWorker).toHaveBeenCalledWith(ds);
+      expect(sessions.has(sKey)).toBe(false);
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID, expect.stringContaining('"type":"closed"'), 'interactive', APP_ID,
+      );
+    });
+
+    it('resume notice in a thread-scope session is replied in-thread, never ephemeral', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const sessionId = 'closed-uuid-thread';
+      const sessions = new Map<string, DaemonSession>();
+      const deps = makeDeps(sessions);
+
+      const sessionStoreMod = await import('../src/services/session-store.js');
+      vi.mocked(sessionStoreMod.getSession).mockReturnValue({
+        sessionId, chatId: 'oc_chat', rootMessageId: ROOT_ID,
+        title: 'closed', status: 'closed', createdAt: '2026-01-01T00:00:00.000Z',
+        larkAppId: APP_ID, scope: 'thread', cliId: 'claude-code',
+      } as any);
+
+      const sm = await import('../src/core/session-manager.js');
+      const fakeDs: any = {
+        session: { sessionId, cliId: 'claude-code' },
+        larkAppId: APP_ID,
+        chatId: 'oc_chat',
+        chatType: 'group',
+        scope: 'thread',  // 话题里恢复 → 确认留在话题内
+      };
+      vi.mocked(sm.resumeSession).mockReturnValue({ ok: true, ds: fakeDs } as any);
+
+      await handleCardAction(makeResumeEvent(ROOT_ID, sessionId), deps, APP_ID);
+
+      expect(sm.resumeSession).toHaveBeenCalledWith(sessionId, sessions);
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID, expect.stringContaining('已恢复'), undefined, APP_ID,
+      );
+    });
+  });
+
+  // ── Scenario 5: get_write_link delivers the write-link card privately ──
+
+  describe('Scenario 5: get_write_link delivers the write-link card privately', () => {
+    it('sends an ephemeral "visible-to-you" card in a group chat, not a DM', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession({
+        workerPort: 9090,
+        workerToken: 'write_tok',
+        chatType: 'group',
+      });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      const res = await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
       await flush();
 
+      // 有权限点击：同步立即回执 success toast（投递是异步 fire-and-forget，不等它完成）。
+      expect(res?.toast?.type).toBe('success');
+      expect(res?.toast?.content).toContain('已私密发送');
+      // 普通群 → 仅点击者可见的 ephemeral 私密卡，不发 DM。
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+        APP_ID, ds.chatId, 'ou_user', expect.stringContaining('"type":"session"'),
+      );
+      const card = parseCard(vi.mocked(clientMod.sendEphemeralCard).mock.calls[0][3] as string);
+      expect(card.type).toBe('session');
+      expect(card.showManageButtons).toBe(true);
+      expect(fakeLark.dms).toHaveLength(0);
+    });
+
+    it('falls back to a private DM in a p2p chat (ephemeral unsupported there)', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession({
+        workerPort: 9090,
+        workerToken: 'write_tok',
+        chatType: 'p2p',
+      });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      const res = await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
+      await flush();
+
+      // 有权限：同样同步回执 success toast（不区分投递通道）。
+      expect(res?.toast?.type).toBe('success');
+      // 单聊 → 跳过注定失败的 ephemeral，直接私聊 DM（DM 落在同一个 1:1 会话里）。
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
       expect(fakeLark.dms).toHaveLength(1);
       expect(fakeLark.dms[0].args[0]).toBe(APP_ID);
       expect(fakeLark.dms[0].args[1]).toBe('ou_user');
-      const dmCard = parseCard(fakeLark.dms[0].args[2]);
-      expect(dmCard.type).toBe('session');
+      expect(parseCard(fakeLark.dms[0].args[2]).type).toBe('session');
     });
 
     it('should reply with warning when terminal not ready', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession({
         workerPort: null,
         workerToken: null,
@@ -760,12 +885,12 @@ describe('Card integration: full event flow', () => {
       await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
 
       expect(fakeLark.dms).toHaveLength(0);
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('尚未就绪'),
-        undefined,
-        APP_ID,
+      // The "not ready" warning is delivered ephemeral to the clicker (group +
+      // operator), not as a visible group reply.
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+        APP_ID, ds.chatId, 'ou_user', expect.stringContaining('尚未就绪'),
       );
+      expect(deps.sessionReply).not.toHaveBeenCalled();
     });
   });
 
@@ -825,14 +950,24 @@ describe('Card integration: full event flow', () => {
       expect(fakeLark.patches).toHaveLength(0);
     });
 
-    it('action on non-existent session should be a no-op', async () => {
+    it('close / toggle on a non-existent session return a failure toast; restart stays a silent no-op', async () => {
       const sessions = new Map<string, DaemonSession>();
       const deps = makeDeps(sessions);
 
-      await handleCardAction(makeToggleEvent('om_nonexistent', NONCE_CURRENT), deps, APP_ID);
-      await handleCardAction(makeRestartEvent('om_nonexistent'), deps, APP_ID);
-      await handleCardAction(makeCloseEvent('om_nonexistent'), deps, APP_ID);
+      // 会话已不在线：close /「显示输出」给失败 toast（消除「按钮坏了」的错觉）。
+      const toggleRes = await handleCardAction(makeToggleEvent('om_nonexistent', NONCE_CURRENT), deps, APP_ID);
+      expect(toggleRes?.toast?.type).toBe('warning');
+      expect(toggleRes?.toast?.content).toContain('不在线');
 
+      const closeRes = await handleCardAction(makeCloseEvent('om_nonexistent'), deps, APP_ID);
+      expect(closeRes?.toast?.type).toBe('warning');
+      expect(closeRes?.toast?.content).toContain('不在线');
+
+      // restart 未纳入本次失败 toast 范围，维持既有「静默 no-op」。
+      const restartRes = await handleCardAction(makeRestartEvent('om_nonexistent'), deps, APP_ID);
+      expect(restartRes?.toast).toBeUndefined();
+
+      // 三者都不应产生卡片 PATCH。
       expect(fakeLark.patches).toHaveLength(0);
     });
 

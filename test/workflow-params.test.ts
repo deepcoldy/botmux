@@ -1,7 +1,7 @@
 /**
  * Tests for the shared `coerceWorkflowParams` module.
  *
- * Locks the IM (`/workflow run`) and CLI (`botmux workflow run`) input
+ * Locks the IM (`/template run`) and CLI (`botmux workflow run`) input
  * coercion contract: type / required / default / unknown-rejection rules,
  * plus the JSON-channel escape hatch for `object` / `array` params.
  */

@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { resolveAllowedUsersWithMap } from '../src/im/lark/client.js';
 import { registerBot } from '../src/bot-registry.js';
+import { logger } from '../src/utils/logger.js';
 
 // Regression for PR #72: setup/onboarding now writes owners as `on_` union_id,
 // but the runtime permission layer (canTalk/canOperate) only matches the app's
@@ -12,6 +13,13 @@ const APP = 'app-union-resolve-test';
 function stubClient(userGet: any, batchGetId?: any) {
   const st = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', botName: 'B' } as any);
   (st as any).client = {
+    // PR #310 routes contact.v3.user.get through the generic no-body c.request()
+    // (larkGet). Emulate that endpoint here and delegate to the same userGet stub
+    // so the assertions on path.user_id / params.user_id_type still hold.
+    request: async ({ url, params }: any) => {
+      const user_id = decodeURIComponent(String(url).split('/').pop());
+      return userGet({ path: { user_id }, params });
+    },
     contact: { v3: { user: {
       get: userGet,
       batchGetId: batchGetId ?? (async () => ({ code: 0, data: { user_list: [] } })),
@@ -40,5 +48,42 @@ describe('resolveAllowedUsersWithMap — on_ union_id entries (PR#72 lockout fix
     const { resolved } = await resolveAllowedUsersWithMap(APP, ['ou_plain', 'on_xyz']);
 
     expect(resolved).toEqual(['ou_plain', 'ou_from_union']);
+  });
+
+  // Regression for PR #240: resolution must keep `allowedUsers` config order so
+  // `owner = first ou_` follows the configured ranking. The pre-fix logic bucketed
+  // literal `ou_` ahead of resolved on_/email entries, so an `on_` owner listed
+  // FIRST got displaced by any later literal `ou_` group member. The previous test
+  // happens to put `ou_` first, so it never exercises the reorder — this one does.
+  it('keeps config order when on_ owner precedes literal ou_ members (no displacement)', async () => {
+    stubClient(async ({ path }: any) =>
+      ({ code: 0, data: { user: { open_id: 'ou_owner', union_id: path.user_id, name: 'Owner' } } }));
+
+    // Real-world shape: creator written as on_ (first), then group members appended
+    // as literal ou_, with the creator also re-appearing as a literal ou_ duplicate.
+    const { resolved } = await resolveAllowedUsersWithMap(
+      APP, ['on_owner', 'ou_memberA', 'ou_memberB', 'ou_owner'],
+    );
+
+    // Owner stays first (was displaced to position 3 under the old bucketing),
+    // and the duplicate ou_owner is deduped to its first occurrence.
+    expect(resolved).toEqual(['ou_owner', 'ou_memberA', 'ou_memberB']);
+    expect(resolved[0]).toBe('ou_owner');
+  });
+
+  it('warns when a literal ou_ entry belongs to another app scope', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    stubClient(async ({ path, params }: any) => {
+      expect(path.user_id).toBe('ou_other_app');
+      expect(params.user_id_type).toBe('open_id');
+      return { code: 99992361, msg: 'user not found in app scope' };
+    });
+
+    const { resolved, map } = await resolveAllowedUsersWithMap(APP, ['ou_other_app']);
+
+    expect(resolved).toEqual(['ou_other_app']);
+    expect(map.get('ou_other_app')).toBe('ou_other_app');
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('open_id ou_other_app belongs to another app'));
+    warn.mockRestore();
   });
 });

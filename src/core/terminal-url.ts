@@ -1,4 +1,6 @@
 import { config } from '../config.js';
+import { platformMachineBaseUrl } from '../platform/binding.js';
+import { isRemoteAccessEnabled } from '../global-config.js';
 
 /**
  * Builds the public URL for a session's web terminal. When the per-daemon
@@ -7,6 +9,13 @@ import { config } from '../config.js';
  * we fall back to the worker's own port so links never go dead — the proxy is
  * an enhancement, not a hard dependency. externalHost is read live (not
  * snapshotted) so cards stay correct across network changes.
+ *
+ * When WEB_EXTERNAL_PORT is configured the proxy-mode link advertises that port
+ * (set via setTerminalExternalPort) instead of the local proxy port, so a relay
+ * host can front the terminal on a different port number. It only applies in
+ * proxy mode — the single fronting port maps cleanly to one external port; the
+ * direct fallback uses per-session worker ports that one external port can't
+ * represent, so the override is ignored there.
  */
 
 interface TerminalUrlSession {
@@ -17,6 +26,10 @@ interface TerminalUrlSession {
 
 let proxyPort = 0;
 let proxyReady = false;
+// Port advertised in proxy-mode links, overriding the local proxy port.
+// 0 = unset → advertise the local proxy port. Set from WEB_EXTERNAL_PORT +
+// botIndex so a relay can front the terminal on a different port number.
+let externalPort = 0;
 
 /** Marks the proxy live on `port`. Called only after a successful bind. */
 export function setTerminalProxyPort(port: number): void {
@@ -24,20 +37,48 @@ export function setTerminalProxyPort(port: number): void {
   proxyReady = true;
 }
 
+/** Override the port shown in proxy-mode links (WEB_EXTERNAL_PORT + botIndex).
+ *  0 reverts to advertising the local proxy port. */
+export function setTerminalExternalPort(port: number): void {
+  externalPort = port;
+}
+
 /** Bound proxy port, or 0 when the proxy is not available. */
 export function getTerminalProxyPort(): number {
   return proxyReady ? proxyPort : 0;
+}
+
+/** Port clients should use to reach the proxy: the configured external port
+ *  (WEB_EXTERNAL_PORT + botIndex) when set, else the bound proxy port; 0 when
+ *  the proxy isn't up. Single source of truth for the proxy-mode port that both
+ *  buildTerminalUrl (card links) and the dashboard rows advertise, so they agree
+ *  on the same external port instead of diverging. */
+export function getTerminalAdvertisedPort(): number {
+  return proxyReady ? externalPort || proxyPort : 0;
 }
 
 /** Test/edge helper: revert to the no-proxy (direct-port) state. */
 export function resetTerminalProxy(): void {
   proxyPort = 0;
   proxyReady = false;
+  externalPort = 0;
 }
 
 export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean } = {}): string {
+  // When 远程访问 is enabled AND this daemon is bound to the central platform AND
+  // the local terminal proxy is up, route terminal links through the machine
+  // subdomain (`https://m-<machineId>.<platformHost>/s/<sessionId>`). The platform
+  // reverse-proxies that subdomain to this daemon's dashboard, which in turn
+  // proxies `/s/*` to the local terminal proxy — so terminals are reachable
+  // centrally with no `:port`. Write access there is gated by the platform login
+  // (not a URL token), so we deliberately omit `?token=`. When 远程访问 is off the
+  // platform base is null and we fall through to the local URL behavior.
+  if (proxyReady) {
+    const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
+    if (platformBase) return `${platformBase}/s/${ds.session.sessionId}`;
+  }
   const base = proxyReady
-    ? `http://${config.web.externalHost}:${proxyPort}/s/${ds.session.sessionId}`
+    ? `http://${config.web.externalHost}:${getTerminalAdvertisedPort()}/s/${ds.session.sessionId}`
     : `http://${config.web.externalHost}:${ds.workerPort ?? ds.session.webPort}`;
   if (opts.write && ds.workerToken) return `${base}?token=${ds.workerToken}`;
   return base;

@@ -1,13 +1,12 @@
 /**
- * Unit tests for the daemon-side `POST /api/asks` helpers — parseAskBody and
- * the §6 approver-fallback chain. Pure-function tests, no HTTP server, no
- * bot-registry mocking.
+ * Unit tests for the daemon-side `POST /api/asks` body parser (parseAskBody).
+ * Pure-function tests, no HTTP server, no bot-registry mocking.
  *
  * Run:  pnpm vitest run test/ask-api.test.ts
  */
 import { describe, expect, it } from 'vitest';
 
-import { parseAskBody, resolveAskApprovers } from '../src/core/ask-api.js';
+import { parseAskBody } from '../src/core/ask-api.js';
 
 function validBody(over: Record<string, unknown> = {}) {
   return {
@@ -21,7 +20,6 @@ function validBody(over: Record<string, unknown> = {}) {
     ],
     prompt: '继续发版吗？',
     timeoutMs: 60_000,
-    approvers: [],
     ...over,
   };
 }
@@ -36,7 +34,6 @@ describe('parseAskBody — happy path', () => {
     expect(out.questions).toHaveLength(1);
     expect(out.questions[0].options).toHaveLength(2);
     expect(out.questions[0].options[0]).toEqual({ key: 'yes', label: '继续' });
-    expect(out.approvers).toEqual([]);
     expect(out.rootMessageId).toBe('om_root');
   });
 
@@ -45,14 +42,6 @@ describe('parseAskBody — happy path', () => {
     expect('error' in out).toBe(false);
     if ('error' in out) return;
     expect(out.rootMessageId).toBeNull();
-  });
-
-  it('filters blank entries from approvers array', () => {
-    const out = parseAskBody(
-      validBody({ approvers: ['ou_a', '', '   ', 'ou_b'] }),
-    );
-    if ('error' in out) throw new Error('expected ok');
-    expect(out.approvers).toEqual(['ou_a', 'ou_b']);
   });
 });
 
@@ -126,7 +115,7 @@ describe('parseAskBody — questions[] 多问多选', () => {
   it('接受 questions[]（多问多选）', () => {
     const body = parseAskBody({
       sessionId: 's', chatId: 'c', larkAppId: 'a', rootMessageId: null,
-      timeoutMs: 60000, approvers: [],
+      timeoutMs: 60000,
       questions: [
         { prompt: 'q1', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] },
         { prompt: 'q2', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
@@ -139,83 +128,13 @@ describe('parseAskBody — questions[] 多问多选', () => {
   it('兼容旧 options[]+prompt：归一成单问单选', () => {
     const body = parseAskBody({
       sessionId: 's', chatId: 'c', larkAppId: 'a', rootMessageId: null,
-      timeoutMs: 60000, approvers: [], prompt: 'go?', options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }],
+      timeoutMs: 60000, prompt: 'go?', options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }],
     });
     if (!('error' in body)) { expect(body.questions).toHaveLength(1); expect(body.questions[0].prompt).toBe('go?'); expect(body.questions[0].multiSelect).toBe(false); }
   });
 
   it('每问 options<2 报错', () => {
-    const body = parseAskBody({ sessionId: 's', chatId: 'c', larkAppId: 'a', rootMessageId: null, timeoutMs: 60000, approvers: [], questions: [{ prompt: 'q', multiSelect: false, options: [{ key: 'x', label: 'X' }] }] });
+    const body = parseAskBody({ sessionId: 's', chatId: 'c', larkAppId: 'a', rootMessageId: null, timeoutMs: 60000, questions: [{ prompt: 'q', multiSelect: false, options: [{ key: 'x', label: 'X' }] }] });
     expect('error' in body).toBe(true);
-  });
-});
-
-describe('resolveAskApprovers — §6 fallback chain', () => {
-  const allowDefault = ['ou_owner', 'ou_admin', 'ou_other'];
-
-  it('explicit --approver list wins outright (ignores fallback)', () => {
-    const got = resolveAskApprovers({
-      larkAppId: 'cli_app',
-      sessionId: 'sess-1',
-      explicit: ['ou_explicit_a', 'ou_explicit_b'],
-      getBotAllowedUsers: () => allowDefault,
-      getSessionOwner: () => 'ou_owner',
-    });
-    expect([...got].sort()).toEqual(['ou_explicit_a', 'ou_explicit_b']);
-  });
-
-  it('filters blank entries from explicit list', () => {
-    const got = resolveAskApprovers({
-      larkAppId: 'cli_app',
-      sessionId: 'sess-1',
-      explicit: ['ou_a', '   ', ''],
-      getBotAllowedUsers: () => allowDefault,
-      getSessionOwner: () => 'ou_owner',
-    });
-    expect([...got]).toEqual(['ou_a']);
-  });
-
-  it('owner ∩ allowedUsers when explicit is empty and owner exists in allowlist', () => {
-    const got = resolveAskApprovers({
-      larkAppId: 'cli_app',
-      sessionId: 'sess-1',
-      explicit: [],
-      getBotAllowedUsers: () => allowDefault,
-      getSessionOwner: () => 'ou_owner',
-    });
-    expect([...got]).toEqual(['ou_owner']);
-  });
-
-  it('falls back to full allowedUsers when owner is not in allowlist', () => {
-    const got = resolveAskApprovers({
-      larkAppId: 'cli_app',
-      sessionId: 'sess-1',
-      explicit: [],
-      getBotAllowedUsers: () => allowDefault,
-      getSessionOwner: () => 'ou_stranger',
-    });
-    expect([...got].sort()).toEqual([...allowDefault].sort());
-  });
-
-  it('falls back to full allowedUsers when owner is unknown', () => {
-    const got = resolveAskApprovers({
-      larkAppId: 'cli_app',
-      sessionId: 'sess-1',
-      explicit: [],
-      getBotAllowedUsers: () => allowDefault,
-      getSessionOwner: () => undefined,
-    });
-    expect([...got].sort()).toEqual([...allowDefault].sort());
-  });
-
-  it('returns empty set when neither explicit, owner, nor allowedUsers exist', () => {
-    const got = resolveAskApprovers({
-      larkAppId: 'cli_app',
-      sessionId: 'sess-1',
-      explicit: [],
-      getBotAllowedUsers: () => [],
-      getSessionOwner: () => undefined,
-    });
-    expect(got.size).toBe(0);
   });
 });

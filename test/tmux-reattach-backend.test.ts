@@ -18,7 +18,24 @@ vi.mock('../src/adapters/backend/tmux-pipe-backend.js', () => ({
   },
 }));
 
+vi.mock('../src/adapters/backend/herdr-backend.js', () => ({
+  HerdrBackend: class MockHerdrBackend {
+    static sessionName = vi.fn((id: string) => `bmx-${id.slice(0, 8)}`);
+    static hasSession = vi.fn(() => false);
+    constructor(public sessionName: string, public opts?: unknown) {}
+  },
+}));
+
+vi.mock('../src/adapters/backend/zellij-backend.js', () => ({
+  ZellijBackend: class MockZellijBackend {
+    static sessionName = vi.fn((id: string) => `bmx-${id.slice(0, 8)}`);
+    static hasSession = vi.fn(() => false);
+    constructor(public sessionName: string, public opts?: unknown) {}
+  },
+}));
+
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import { ZellijBackend } from '../src/adapters/backend/zellij-backend.js';
 import { selectSessionBackend } from '../src/adapters/backend/session-backend-selector.js';
 
 describe('selectSessionBackend', () => {
@@ -30,7 +47,7 @@ describe('selectSessionBackend', () => {
   it('uses owned pipe backend when reattaching to an existing tmux session', () => {
     vi.mocked(TmuxBackend.hasSession).mockReturnValue(true);
 
-    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', useTmux: true });
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'tmux' });
 
     expect(selected.isTmuxMode).toBe(true);
     expect(selected.isPipeMode).toBe(true);
@@ -42,7 +59,7 @@ describe('selectSessionBackend', () => {
   it('uses managed pipe backend for a new tmux session', () => {
     vi.mocked(TmuxBackend.hasSession).mockReturnValue(false);
 
-    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', useTmux: true });
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'tmux' });
 
     expect(selected.isTmuxMode).toBe(true);
     expect(selected.isPipeMode).toBe(true);
@@ -51,11 +68,24 @@ describe('selectSessionBackend', () => {
     expect((selected.backend as any).opts).toEqual({ createSession: true, ownsSession: true });
   });
 
-  it('uses pty backend when tmux is disabled', () => {
-    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', useTmux: false });
+  it('uses pty backend when backend is pty', () => {
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'pty' });
 
     expect(selected.isTmuxMode).toBe(false);
     expect(selected.isPipeMode).toBe(false);
+    expect(selected.isZellijMode).toBe(false);
     expect('tmuxBackend' in selected).toBe(false);
+  });
+
+  it('uses zellij backend when backend is zellij', () => {
+    vi.mocked(ZellijBackend.hasSession).mockReturnValue(false);
+
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'zellij' });
+
+    expect(selected.isZellijMode).toBe(true);
+    expect(selected.isTmuxMode).toBe(false);
+    expect(selected.isPipeMode).toBe(false);
+    expect(selected.backend.constructor.name).toBe('MockZellijBackend');
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: false });
   });
 });

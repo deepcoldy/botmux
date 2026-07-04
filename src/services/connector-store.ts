@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 
-export type ConnectorVerifyType = 'hmac-sha256';
+export type ConnectorVerifyType = 'hmac-sha256' | 'token';
 export type ConnectorTargetMode = 'dynamic' | 'fixed' | 'new-group';
 export type ConnectorTargetKind = 'turn' | 'workflow';
 
@@ -35,16 +35,19 @@ export interface ConnectorDefinition {
     headerAllowlist: string[];
     includeRawText: boolean;
     maxBodyBytes: number;
+    // Trusted task ("what should the bot do with this event"); injected above the
+    // untrusted event data when a turn fires. Empty/absent = no extra instruction.
+    instruction?: string;
   };
   loggingPolicy: {
     storePayload: boolean;
     storeHeaders: boolean;
     retentionDays: number;
   };
+  // new-group dedup: null = no dedup (every event → a fresh group); { dedupKey }
+  // = events whose payload yields the same value at `dedupKey` share one group.
   lifecycleExtractors: null | {
     dedupKey: string;
-    status: string;
-    statusMap?: Record<string, string>;
   };
   rateLimit?: {
     windowSeconds: number;

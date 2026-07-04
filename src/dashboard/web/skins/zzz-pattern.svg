@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 173.2 300" width="173.2" height="300" preserveAspectRatio="none">
+  <!--
+    ZZZ heatmap-pattern: pointy-top hex grid, side=100, fundamental tile = (s√3, 3s).
+    Tile size 173.2×300 is a perfect lattice repeat unit — CSS background-image: repeat
+    will line up with no seams. Drawn hexes at (0,0), (86.6,150) and the 4 corner copies
+    so partials wrap correctly across the tile boundary.
+  -->
+  <rect width="173.2" height="300" fill="#0d0e1f"/>
+  <g fill="none" stroke="#c5f541" stroke-width="2" opacity="0.16" stroke-linejoin="round">
+    <polygon points="86.6,50 173.2,100 173.2,200 86.6,250 0,200 0,100"/>
+    <polygon points="0,-100 86.6,-50 86.6,50 0,100 -86.6,50 -86.6,-50"/>
+    <polygon points="173.2,-100 259.8,-50 259.8,50 173.2,100 86.6,50 86.6,-50"/>
+    <polygon points="0,200 86.6,250 86.6,350 0,400 -86.6,350 -86.6,250"/>
+    <polygon points="173.2,200 259.8,250 259.8,350 173.2,400 86.6,350 86.6,250"/>
+  </g>
+  <g fill="#ffd93d" opacity="0.4">
+    <circle cx="0" cy="100" r="2.4"/>
+    <circle cx="173.2" cy="100" r="2.4"/>
+    <circle cx="86.6" cy="250" r="2.4"/>
+    <circle cx="0" cy="-100" r="2.4"/>
+    <circle cx="173.2" cy="-100" r="2.4"/>
+    <circle cx="0" cy="400" r="2.4"/>
+    <circle cx="173.2" cy="400" r="2.4"/>
+  </g>
+</svg>

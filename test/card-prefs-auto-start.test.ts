@@ -62,6 +62,8 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(prefs.autoStartOnGroupJoin).toBe(false);
     expect(prefs.autoStartOnNewTopic).toBe(false);
     expect(prefs.autoStartOnGroupJoinPrompt).toBe('');
+    expect(prefs.regularGroupReplyMode).toBe('chat');
+    expect(prefs.regularGroupMentionMode).toBe('always');
   });
 
   it('persists toggles + prompt to bots.json and syncs in-memory config (FR-9)', async () => {
@@ -73,6 +75,8 @@ describe('card-prefs store — 主动开工 fields', () => {
       autoStartOnGroupJoin: true,
       autoStartOnGroupJoinPrompt: '  先做代码审查再回答 ',
       autoStartOnNewTopic: true,
+      regularGroupReplyMode: 'shared',
+      regularGroupMentionMode: 'never',
     });
 
     expect(r.ok).toBe(true);
@@ -80,6 +84,8 @@ describe('card-prefs store — 主动开工 fields', () => {
       expect(r.prefs.autoStartOnGroupJoin).toBe(true);
       expect(r.prefs.autoStartOnNewTopic).toBe(true);
       expect(r.prefs.autoStartOnGroupJoinPrompt).toBe('  先做代码审查再回答 ');
+      expect(r.prefs.regularGroupReplyMode).toBe('shared');
+      expect(r.prefs.regularGroupMentionMode).toBe('never');
     }
 
     // On disk
@@ -87,12 +93,56 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(disk.autoStartOnGroupJoin).toBe(true);
     expect(disk.autoStartOnNewTopic).toBe(true);
     expect(disk.autoStartOnGroupJoinPrompt).toBe('  先做代码审查再回答 ');
+    expect(disk.regularGroupReplyMode).toBe('shared');
+    expect(disk.regularGroupMentionMode).toBe('never');
 
     // In-memory registry synced (routing reads bot.config directly, no restart)
     const cfg = registry.getBot('app_default').config;
     expect(cfg.autoStartOnGroupJoin).toBe(true);
     expect(cfg.autoStartOnNewTopic).toBe(true);
     expect(cfg.autoStartOnGroupJoinPrompt).toBe('  先做代码审查再回答 ');
+    expect(cfg.regularGroupReplyMode).toBe('shared');
+    expect(cfg.regularGroupMentionMode).toBe('never');
+  });
+
+  it('silentTurnReactions round-trips through the dashboard card-prefs store', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotCardPrefs('app_default').silentTurnReactions).toBe(false);
+
+    const on = await store.updateBotCardPrefs('app_default', { silentTurnReactions: true });
+    expect(on.ok && on.prefs.silentTurnReactions).toBe(true);
+    expect(readConfig().silentTurnReactions).toBe(true);
+    expect(registry.getBot('app_default').config.silentTurnReactions).toBe(true);
+
+    // Off removes the key (keeps bots.json tidy) and clears in-memory config.
+    const off = await store.updateBotCardPrefs('app_default', { silentTurnReactions: false });
+    expect(off.ok && off.prefs.silentTurnReactions).toBe(false);
+    expect(readConfig().silentTurnReactions).toBeUndefined();
+    expect(registry.getBot('app_default').config.silentTurnReactions).toBeUndefined();
+  });
+
+  it('botToBotSameDir is default-TRUE: persists only explicit false, clears on true', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    // Default ON when unset.
+    expect(store.getBotCardPrefs('app_default').botToBotSameDir).toBe(true);
+
+    // Turning OFF persists an explicit `false` to disk + syncs in-memory config.
+    const off = await store.updateBotCardPrefs('app_default', { botToBotSameDir: false });
+    expect(off.ok && off.prefs.botToBotSameDir).toBe(false);
+    expect(readConfig().botToBotSameDir).toBe(false);
+    expect(registry.getBot('app_default').config.botToBotSameDir).toBe(false);
+
+    // Turning back ON drops the key (absent === default on) + clears in-memory.
+    const on = await store.updateBotCardPrefs('app_default', { botToBotSameDir: true });
+    expect(on.ok && on.prefs.botToBotSameDir).toBe(true);
+    expect(readConfig().botToBotSameDir).toBeUndefined();
+    expect(registry.getBot('app_default').config.botToBotSameDir).toBeUndefined();
   });
 
   it('removes keys when toggled off / prompt blanked (keeps bots.json tidy)', async () => {
@@ -100,6 +150,7 @@ describe('card-prefs store — 主动开工 fields', () => {
       autoStartOnGroupJoin: true,
       autoStartOnGroupJoinPrompt: '旧的 prompt',
       autoStartOnNewTopic: true,
+      regularGroupReplyMode: 'new-topic',
     });
     const { registry, store } = await freshModules();
     registry.loadBotConfigs().forEach(c => registry.registerBot(c));
@@ -108,21 +159,24 @@ describe('card-prefs store — 主动开工 fields', () => {
       autoStartOnGroupJoin: false,
       autoStartOnGroupJoinPrompt: '   ',
       autoStartOnNewTopic: false,
+      regularGroupReplyMode: 'chat',
     });
 
     const disk = readConfig();
     expect(disk.autoStartOnGroupJoin).toBeUndefined();
     expect(disk.autoStartOnNewTopic).toBeUndefined();
     expect(disk.autoStartOnGroupJoinPrompt).toBeUndefined();
+    expect(disk.regularGroupReplyMode).toBeUndefined();
 
     const cfg = registry.getBot('app_default').config;
     expect(cfg.autoStartOnGroupJoin).toBeUndefined();
     expect(cfg.autoStartOnNewTopic).toBeUndefined();
     expect(cfg.autoStartOnGroupJoinPrompt).toBeUndefined();
+    expect(cfg.regularGroupReplyMode).toBeUndefined();
   });
 
   it('partial patch leaves untouched fields intact', async () => {
-    writeConfig({ autoStartOnNewTopic: true });
+    writeConfig({ autoStartOnNewTopic: true, regularGroupReplyMode: 'new-topic' });
     const { registry, store } = await freshModules();
     registry.loadBotConfigs().forEach(c => registry.registerBot(c));
 
@@ -132,5 +186,6 @@ describe('card-prefs store — 主动开工 fields', () => {
     const disk = readConfig();
     expect(disk.autoStartOnGroupJoin).toBe(true);
     expect(disk.autoStartOnNewTopic).toBe(true);
+    expect(disk.regularGroupReplyMode).toBe('new-topic');
   });
 });

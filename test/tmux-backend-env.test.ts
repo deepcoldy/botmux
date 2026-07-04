@@ -25,7 +25,9 @@ import { join } from 'node:path';
 import {
   buildBotmuxEnvAssignments,
   buildDebugKeepShellScript,
+  DIAGNOSTIC_SHELL_SCRIPT,
   resolveUserShell,
+  resolveShellOverride,
   SHELL_WRAPPER_SCRIPT,
 } from '../src/adapters/backend/tmux-backend.js';
 
@@ -41,6 +43,7 @@ describe('buildBotmuxEnvAssignments()', () => {
       SESSION_DATA_DIR: '/home/u/.botmux/data',
       IS_SANDBOX: '1',
       BOTMUX_LARK_APP_ID: 'cli_namespaced',
+      BOTMUX_TURN_ID: 'om_turn',
       // None of the rest should appear — those come from rcfile.
       PATH: '/usr/bin',
       HOME: '/home/u',
@@ -54,6 +57,7 @@ describe('buildBotmuxEnvAssignments()', () => {
       'SESSION_DATA_DIR=/home/u/.botmux/data',
       'IS_SANDBOX=1',
       'BOTMUX_LARK_APP_ID=cli_namespaced',
+      'BOTMUX_TURN_ID=om_turn',
     ]);
     expect(out.some(s => s.startsWith('LARK_APP_ID='))).toBe(false);
     expect(out.some(s => s.startsWith('LARK_APP_SECRET='))).toBe(false);
@@ -69,6 +73,43 @@ describe('buildBotmuxEnvAssignments()', () => {
       PATH: '/usr/bin',
     });
     expect(out).toContain('CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=2147483647');
+    expect(out).not.toContain('PATH=/usr/bin');
+  });
+
+  it('forwards CJADK_INTERACTIVE so cjadk runs non-interactive in the tmux pane', () => {
+    // The worker injects CJADK_INTERACTIVE=0 for `cjadk <agent>` wrapperCli
+    // launches (mirrors cjadk's own `cjadk feishu` wrapper). Like every other
+    // injected key it ONLY reaches the pane via this allowlist — without it the
+    // pane inherits an interactive cjadk (startup selector + input quirks).
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      CJADK_INTERACTIVE: '0',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('CJADK_INTERACTIVE=0');
+    // Non-cjadk bots don't set it → it must not appear.
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('CJADK_INTERACTIVE='))).toBe(false);
+  });
+
+  it('forwards list-bots API discovery flags so CLI bots list matches daemon behavior', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_LARK_LIST_BOTS_API_ENABLED: 'true',
+      BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS: '3000',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('BOTMUX_LARK_LIST_BOTS_API_ENABLED=true');
+    expect(out).toContain('BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS=3000');
+    expect(out).not.toContain('PATH=/usr/bin');
+  });
+
+  it('forwards BOTMUX_READY_COMMAND so Hermes can release the first-prompt ready gate', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_READY_COMMAND: '"/usr/local/bin/node" "/opt/botmux/dist/cli.js" session-ready',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('BOTMUX_READY_COMMAND="/usr/local/bin/node" "/opt/botmux/dist/cli.js" session-ready');
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
@@ -137,6 +178,46 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).toContain('BOTMUX_LARK_APP_ID=cli_namespaced');
     expect(out).toContain('BOTMUX_SESSION_ID=sess_xxx');
     expect(out).toContain('SESSION_DATA_DIR=/d');
+  });
+
+  // ── Per-bot env (bots.json `env`) injected via the 2nd arg ──────────────────
+  it('appends per-bot injectEnv AFTER the botmux-managed keys (so it wins last)', () => {
+    const out = buildBotmuxEnvAssignments(
+      { BOTMUX: '1', SESSION_DATA_DIR: '/d' },
+      { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic', ANTHROPIC_AUTH_TOKEN: 'glm-key' },
+    );
+    expect(out).toEqual([
+      'BOTMUX=1',
+      'SESSION_DATA_DIR=/d',
+      'ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic',
+      'ANTHROPIC_AUTH_TOKEN=glm-key',
+    ]);
+  });
+
+  it('forwards per-bot injectEnv even when there is no botmux-managed env at all', () => {
+    expect(buildBotmuxEnvAssignments(undefined, { OPENAI_BASE_URL: 'https://x/v1' }))
+      .toEqual(['OPENAI_BASE_URL=https://x/v1']);
+    expect(buildBotmuxEnvAssignments({}, { HTTPS_PROXY: 'http://127.0.0.1:7890' }))
+      .toEqual(['HTTPS_PROXY=http://127.0.0.1:7890']);
+  });
+
+  it('re-sanitizes injectEnv: drops botmux-reserved keys even if they sneak in', () => {
+    const out = buildBotmuxEnvAssignments(
+      { BOTMUX: '1' },
+      {
+        ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+        BOTMUX_SESSION_ID: 'hijack',     // reserved → dropped
+        LARK_APP_SECRET: 's',            // reserved → dropped
+        CLAUDE_CONFIG_DIR: '/tmp/evil',  // reserved → dropped
+        'BAD-NAME': 'x',                 // invalid name → dropped
+      },
+    );
+    expect(out).toEqual(['BOTMUX=1', 'ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic']);
+  });
+
+  it('no injectEnv arg leaves output identical to the legacy whitelist-only behavior', () => {
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1', SESSION_DATA_DIR: '/d' }))
+      .toEqual(['BOTMUX=1', 'SESSION_DATA_DIR=/d']);
   });
 });
 
@@ -217,6 +298,65 @@ describe('resolveUserShell()', () => {
     expect(spec.shell).not.toBe(bogus);
     expect(['/bin/zsh', '/bin/bash', '/bin/sh']).toContain(spec.shell);
   });
+
+  it('launchShell override (absolute path) wins over $SHELL', () => {
+    // The escape hatch for a login $SHELL whose rcfile exec-trampolines into
+    // another shell: pinning launchShell launches the CLI under it directly.
+    tmpDir = mkdtempSync(join(tmpdir(), 'bmx-shell-'));
+    const bash = join(tmpDir, 'bash');
+    const zsh = join(tmpDir, 'zsh');
+    writeFileSync(bash, '#!/bin/sh\nexec "$@"\n'); chmodSync(bash, 0o755);
+    writeFileSync(zsh, '#!/bin/sh\nexec "$@"\n'); chmodSync(zsh, 0o755);
+    const spec = resolveUserShell({ SHELL: bash }, zsh);
+    expect(spec.shell).toBe(zsh);
+    expect(spec.flags).toEqual(['-l', '-i']);  // zsh-flavoured, not bash's ['-i']
+  });
+
+  it('falls back to $SHELL when the launchShell override is not found/executable', () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'bmx-shell-'));
+    const bash = join(tmpDir, 'bash');
+    writeFileSync(bash, '#!/bin/sh\nexec "$@"\n'); chmodSync(bash, 0o755);
+    const spec = resolveUserShell({ SHELL: bash }, '/no/such/zsh');
+    expect(spec.shell).toBe(bash);
+    expect(spec.flags).toEqual(['-i']);
+  });
+});
+
+describe('resolveShellOverride()', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) { rmSync(tmpDir, { recursive: true, force: true }); tmpDir = undefined; }
+  });
+
+  it('resolves an absolute path and classifies its flags', () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'bmx-shell-'));
+    const zsh = join(tmpDir, 'zsh');
+    writeFileSync(zsh, '#!/bin/sh\nexec "$@"\n'); chmodSync(zsh, 0o755);
+    const spec = resolveShellOverride(zsh);
+    expect(spec?.shell).toBe(zsh);
+    expect(spec?.flags).toEqual(['-l', '-i']);
+  });
+
+  it('resolves a bare name from the conventional locations (or null if absent)', () => {
+    // bash/sh exist on essentially every CI image; assert the spec is sane when found.
+    const spec = resolveShellOverride('sh');
+    if (spec) {
+      expect(spec.shell.endsWith('/sh')).toBe(true);
+      expect(spec.flags).toEqual([]);
+    }
+  });
+
+  it('returns null for a non-existent override and for a blank string', () => {
+    expect(resolveShellOverride('/no/such/shell-xyz')).toBeNull();
+    expect(resolveShellOverride('   ')).toBeNull();
+  });
+
+  it('returns null (ignored) for an unsupported shell like fish', () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'bmx-shell-'));
+    const fish = join(tmpDir, 'fish');
+    writeFileSync(fish, '#!/bin/sh\nexec "$@"\n'); chmodSync(fish, 0o755);
+    expect(resolveShellOverride(fish)).toBeNull();
+  });
 });
 
 describe('buildDebugKeepShellScript()', () => {
@@ -293,6 +433,39 @@ describe('debug keep-shell wrapper end-to-end', () => {
       expect(result.stderr).toContain('[botmux debug]');
       expect(result.stderr).toContain('status 7'); // surfaced fake CLI exit
       expect(result.stdout).toContain('PROBE-RAN');
+    },
+  );
+});
+
+describe('diagnostic shell wrapper', () => {
+  const hasEnvBin = existsSync('/usr/bin/env');
+
+  it('keeps a shell alive after printing the preserved output', () => {
+    expect(DIAGNOSTIC_SHELL_SCRIPT).toContain('cat -- "$2"');
+    expect(DIAGNOSTIC_SHELL_SCRIPT).toContain('Auto-restart is paused');
+    expect(DIAGNOSTIC_SHELL_SCRIPT).toMatch(/exec "\$3" -i$/);
+  });
+
+  it.skipIf(!hasEnvBin)(
+    'prints the diagnostic file and then hands off to the shell',
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), 'bmx-diag-'));
+      try {
+        const diag = join(dir, 'diag.ansi');
+        writeFileSync(diag, 'startup failed\nmissing token\n');
+        const probeScript = DIAGNOSTIC_SHELL_SCRIPT.replace('exec "$3" -i', 'echo DIAG-SHELL-READY');
+        const result = spawnSync(
+          '/bin/sh',
+          ['-c', probeScript, '_', dir, diag, '/bin/sh'],
+          { encoding: 'utf-8', env: { HOME: dir, PATH: '/usr/bin:/bin' } },
+        );
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain('startup failed');
+        expect(result.stdout).toContain('missing token');
+        expect(result.stdout).toContain('DIAG-SHELL-READY');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     },
   );
 });

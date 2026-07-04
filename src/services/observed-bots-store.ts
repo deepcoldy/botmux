@@ -90,6 +90,12 @@ export function recordObservedBots(
 
   const data = readFile(dataDir, larkAppId, chatId);
   for (const b of valid) {
+    for (const [existingOpenId, entry] of Object.entries(data)) {
+      if (entry.name === b.name && existingOpenId !== b.openId) {
+        delete data[existingOpenId];
+      }
+    }
+
     const prior = data[b.openId];
     if (prior) {
       data[b.openId] = { ...prior, name: b.name, lastSeenAt: now };

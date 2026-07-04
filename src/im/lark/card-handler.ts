@@ -4,52 +4,179 @@
  * Extracted from daemon.ts for modularity.
  */
 import { execSync } from 'node:child_process';
+import { basename as pathBasename, dirname, join } from 'node:path';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
-import { canOperate } from './event-dispatcher.js';
-import { sendUserMessage, updateMessage, deleteMessage, replyMessage, sendMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent } from './card-builder.js';
+import { canOperate, canTalk } from './event-dispatcher.js';
+import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard, buildRepoSelectCard } from './card-builder.js';
+import { computeSandboxDiff, applySandboxDiff } from '../../services/sandbox-land.js';
+import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData } from '../../services/bot-config-store.js';
+import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
+import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
-import { checkNonce, clearPending, markDenied } from './grant-pending.js';
+import { checkNonce, clearPending, markDenied, getPendingQuota } from './grant-pending.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
 import {
   handleWorkflowApprovalAction,
   isWorkflowApprovalAction,
   type WorkflowApprovalHandlerDeps,
 } from './workflow-card-handler.js';
+import {
+  handleV3GateAction,
+  isV3GateAction,
+  type V3GateCardHandlerDeps,
+} from './v3-gate-card-handler.js';
+import type { V3GateActionValue } from './v3-gate-card.js';
+import {
+  handleV3BlockedAction,
+  isV3BlockedAction,
+  type V3BlockedCardHandlerDeps,
+} from './v3-blocked-card-handler.js';
+import type { V3BlockedActionValue, V3AskAnswerActionValue } from './v3-blocked-card.js';
+import {
+  handleV3LoopGrantAction,
+  isV3LoopGrantAction,
+  type V3LoopGrantCardHandlerDeps,
+} from './v3-loop-grant-card-handler.js';
+import type { V3LoopGrantActionValue } from './v3-loop-grant-card.js';
+import {
+  handleV3RevisitGrantAction,
+  isV3RevisitGrantAction,
+  type V3RevisitGrantCardHandlerDeps,
+} from './v3-revisit-grant-card-handler.js';
+import type { V3RevisitGrantActionValue } from './v3-revisit-grant-card.js';
 import { handleAskCardAction, isAskCardAction } from './ask-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
+import { buildClosedSessionCard } from '../../core/closed-session-card.js';
+import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
-import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput } from '../../core/session-manager.js';
+import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
+import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
+import { publishAttentionPatch } from '../../core/session-activity.js';
+import { fallbackTurnId } from '../../core/reply-target.js';
+import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { t, localeForBot } from '../../i18n/index.js';
+import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch } from '../../services/git-worktree.js';
+import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
+import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
 export interface CardHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
-  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
   lastRepoScan: Map<string, ProjectInfo[]>;
   workflowApprovalDeps?: WorkflowApprovalHandlerDeps;
   workflowApprovalResolved?: (runId: string) => void | Promise<void>;
+  /** v3 humanGate 审批卡点击处理（driveRun 由 daemon 接的 v3 gate runner 提供）. */
+  v3GateDeps?: V3GateCardHandlerDeps;
+  /** v3 blocked 重试卡点击处理（同一个 runner 的 driveRun）. */
+  v3BlockedDeps?: V3BlockedCardHandlerDeps;
+  /** v3 loop 追加一轮卡点击处理（同一个 runner 的 driveRun）. */
+  v3LoopGrantDeps?: V3LoopGrantCardHandlerDeps;
+  /** v3 回溯预算准许卡点击处理（同一个 runner 的 driveRun）. */
+  v3RevisitGrantDeps?: V3RevisitGrantCardHandlerDeps;
 }
 
-interface CardActionData {
-  operator?: { open_id?: string };
+/**
+ * Lark card action callback envelope.
+ *
+ * Exported so module-specific dashboard handlers can share the callback type
+ * without redeclaring it.
+ *
+ * Trust model:
+ *   - `operator.open_id` and `operator.union_id` are Lark-verified payload
+ *     fields. Treat them as the only legitimate source of caller identity.
+ *   - `action.value` is round-tripped from the card schema and IS NOT
+ *     verified by Lark. NEVER read identity fields (`union_id`, `open_id`,
+ *     `user_id`, …) from `action.value`.
+ */
+export interface CardActionData {
+  operator?: {
+    open_id?: string;
+    /** Lark-verified union_id, present on card v2 callbacks where the tenant
+     *  enables `with_union_id`. Absent when Lark doesn't carry it; callers
+     *  fall back to `resolveUserUnionId` via `resolveCardOperatorUnionId`. */
+    union_id?: string;
+  };
   action?: {
     value?: Record<string, string>;
-    option?: string;
-    form_value?: Record<string, string>;  // V2 form input values
+    option?: unknown;
+    options?: unknown;
+    form_value?: Record<string, unknown>;  // V2 form input values
   };
   context?: { open_message_id?: string };
   open_message_id?: string;
+}
+
+/** Resolved operator identity returned by `resolveCardOperatorUnionId`. */
+export interface CardOperatorIdentity {
+  /** Verified `on_`-prefixed union_id, or `undefined` when verification fails. */
+  unionId?: string;
+  /** The verified `operator.open_id` echoed back for audit/log purposes. Never
+   *  used as an authn/authz proxy when `unionId` is absent. */
+  openId?: string;
+}
+
+/** Optional deps for `resolveCardOperatorUnionId` — production omits, tests
+ *  inject a fake `resolveUserUnionId` to avoid hitting the Lark contact API. */
+export interface ResolveCardOperatorUnionIdDeps {
+  resolveUserUnionId?: (larkAppId: string, openId: string) => Promise<{ unionId?: string; name?: string }>;
+}
+
+/**
+ * Resolve the verified `union_id` of the operator who clicked a card button.
+ *
+ * Three-state semantics:
+ *  1. `operator.union_id` starts with `on_` → trust it directly.
+ *  2. `operator.union_id` is present but does NOT start with `on_` (e.g.
+ *     `ou_xxx`, malformed) → reject; do NOT fallback. Trusting `open_id`
+ *     after a malformed verified field would be a bypass.
+ *  3. `operator.union_id` is absent → fall back to
+ *     `resolveUserUnionId(larkAppId, openId)`, accepting only `on_`-prefixed
+ *     results.
+ *
+ * In every failure mode (missing open_id, fallback returns no unionId,
+ * fallback throws) the function returns `{ openId }` with `unionId` left
+ * undefined, so callers fail closed.
+ *
+ * `action.value` is NEVER read here — see the unit tests that pin that
+ * contract.
+ */
+export async function resolveCardOperatorUnionId(
+  data: CardActionData,
+  larkAppId: string,
+  deps: ResolveCardOperatorUnionIdDeps = {},
+): Promise<CardOperatorIdentity> {
+  const openId = data.operator?.open_id;
+  if (!openId) return {};
+  const verified = data.operator?.union_id;
+  if (typeof verified === 'string') {
+    // Verified field present — must be on_ prefix or we reject. Fallback is
+    // deliberately skipped: a malformed verified identity is a stronger
+    // negative signal than its absence.
+    if (verified.startsWith('on_')) return { unionId: verified, openId };
+    return { openId };
+  }
+  // Verified field absent — fallback to the contact API. Wrapped in try/catch
+  // so resolver errors don't bubble up and surprise card-callback paths.
+  const resolver = deps.resolveUserUnionId ?? defaultResolveUserUnionId;
+  try {
+    const { unionId } = await resolver(larkAppId, openId);
+    if (typeof unionId === 'string' && unionId.startsWith('on_')) {
+      return { unionId, openId };
+    }
+    return { openId };
+  } catch {
+    return { openId };
+  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -59,6 +186,22 @@ function tag(ds: DaemonSession): string {
 }
 
 const LEGACY_SELF_HEAL_ACTIONS = new Set(['toggle_display', 'toggle_stream', 'refresh_screenshot']);
+
+// 🔊 语音总结 once-only guard: card message ids that already triggered a voice
+// summary. Keyed by the clicked card's message id so any number of users
+// clicking the same reply only ever generates ONE voice bubble (防刷屏).
+// In-memory (per daemon lifetime) — a restart resets it, which at worst allows
+// one re-trigger on an old card; acceptable. Capped to avoid unbounded growth.
+const voicedCardIds = new Set<string>();
+
+// Instruction injected into the session when the voice button is clicked. The
+// model (which still has its just-sent reply in context) condenses it into
+// spoken prose and emits it via `botmux send --voice`. Kept terse and explicit
+// so the model produces ONE voice bubble and no stray text card. Resolved per
+// the bot's locale so an English-mode bot gets the English instruction.
+function voiceSummaryInstruction(locale?: Locale): string {
+  return t('card.voice.summary_instruction', undefined, locale);
+}
 
 function isLegacySelfHealAction(actionType?: string): boolean {
   return !!actionType && LEGACY_SELF_HEAL_ACTIONS.has(actionType);
@@ -118,12 +261,222 @@ function validateCardCliBinding(ds: DaemonSession, value?: Record<string, string
   return false;
 }
 
+function stringListFromLarkMultiSelect(raw: unknown): string[] {
+  const tokens = Array.isArray(raw)
+    ? raw.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const token of tokens) {
+    if (seen.has(token)) continue;
+    seen.add(token);
+    result.push(token);
+  }
+  return result;
+}
+
+function multiWorktreeParentPath(repoPaths: string[], name: string): string {
+  const first = repoPaths[0];
+  const parentRoot = first ? dirname(first) : process.cwd();
+  return join(parentRoot, dirSuffixForBranch(name));
+}
+
+function worktreeChildNameForRepo(repoPath: string, projects: ProjectInfo[] | undefined): string {
+  return projects?.find(p => p.path === repoPath)?.name ?? pathBasename(repoPath);
+}
+
+function duplicateMultiWorktreeChildNames(repoPaths: string[], projects: ProjectInfo[] | undefined): string[] {
+  const seen = new Set<string>();
+  const dupes = new Set<string>();
+  for (const repoPath of repoPaths) {
+    const childName = worktreeChildNameForRepo(repoPath, projects);
+    if (seen.has(childName)) dupes.add(childName);
+    else seen.add(childName);
+  }
+  return [...dupes];
+}
+
+/**
+ * Commit a resolved working directory onto a repo-select session: pin it, then
+ * either fork the pending CLI (first selection) or close + recreate the session
+ * (mid-session switch). Shared by the dropdown flow, the worktree flow (which
+ * funnels back in with the freshly created worktree path) and the manual
+ * directory-entry form. Extracted to module scope so the form-submit branch can
+ * reuse the exact same spawn/switch path instead of duplicating it.
+ */
+async function commitRepoSelection(
+  ctx: {
+    ds: DaemonSession;
+    rootId: string;
+    cardMessageId?: string;
+    larkAppId?: string;
+    operatorOpenId?: string;
+    activeSessions: Map<string, DaemonSession>;
+    sessionReply: (rid: string, content: string, msgType?: string, turnId?: string) => Promise<string>;
+  },
+  dirPath: string,
+  dirLabel: string,
+  // The worktree flow already posted a precise "worktree 已创建：path 分支 …"
+  // line before funnelling in here — suppress the redundant "已选择/已切换"
+  // confirmation so the user sees a single message, not two.
+  opts?: { suppressConfirmReply?: boolean },
+): Promise<void> {
+  const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply } = ctx;
+  const locTarget = localeForBot(ds.larkAppId);
+  // `/close` deletes the active-map entry without touching sessionId or
+  // pendingRepo — identity against the map is the only tell that the session
+  // this flow captured is gone. Checked alongside the generation snapshots.
+  const repoSessionKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
+  const sessionStillActive = () => activeSessions.get(repoSessionKey) === ds;
+  const commitGenSessionId = ds.session.sessionId;
+
+  if (ds.pendingRepo) {
+    // First spawn: pin the new cwd onto the CURRENT session before forking.
+    ds.workingDir = dirPath;
+    ds.session.workingDir = dirPath;
+    sessionStore.updateSession(ds.session);
+    const selfBot = getBot(ds.larkAppId);
+    const botCfg = selfBot.config;
+    const effectiveCliId = sessionCliId(ds);
+    // First-time repo selection — now spawn CLI with the original prompt
+    ds.pendingRepo = false;
+    publishAttentionPatch(ds);
+    const pendingPrompt = ds.pendingPrompt ?? '';
+    const pendingRawInput = ds.pendingRawInput;
+    // Raw-input cold start still wraps any input buffered while the repo card
+    // was pending — see the skip_repo branch for the rationale.
+    const hasBufferedInput =
+      pendingPrompt.trim().length > 0 ||
+      (ds.pendingAttachments?.length ?? 0) > 0 ||
+      (ds.pendingFollowUps?.length ?? 0) > 0;
+    if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
+    const wrappedPrompt = (!pendingRawInput || hasBufferedInput)
+      ? buildNewTopicPrompt(
+          pendingPrompt,
+          ds.session.sessionId,
+          effectiveCliId,
+          botCfg.cliPathOverride,
+          ds.pendingAttachments,
+          ds.pendingMentions,
+          await getAvailableBots(ds.larkAppId, ds.chatId),
+          ds.pendingFollowUps,
+          { name: selfBot.botName, openId: selfBot.botOpenId },
+          locTarget,
+          ds.pendingSender,
+          { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
+        )
+      : '';
+    const prompt = pendingRawInput ? '' : wrappedPrompt;
+    // Last-line defence: prompt prep awaited above — if anything replaced
+    // OR closed the session in that window, forking now would clobber it
+    // (or resurrect a /close'd session).
+    if (!sessionStillActive() || ds.session.sessionId !== commitGenSessionId) {
+      logger.warn(`[${tag(ds)}] Session replaced or closed while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds.session.sessionId}, active=${sessionStillActive()}) — aborting this fork`);
+      return;
+    }
+    if (pendingRawInput && hasBufferedInput) {
+      ds.pendingFollowUpInput = {
+        userPrompt: pendingPrompt || (ds.pendingFollowUps?.join('\n\n') ?? ''),
+        cliInput: wrappedPrompt,
+      };
+    }
+    rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? prompt);
+    ds.pendingPrompt = undefined;
+    ds.pendingAttachments = undefined;
+    ds.pendingMentions = undefined;
+    ds.pendingSender = undefined;
+    ds.pendingFollowUps = undefined;
+    forkWorker(ds, prompt);
+    // A card click has no turn of its own — anchor the confirmation to the
+    // session's current reply-target turn so a shared fold-back topic keeps
+    // it in-thread (same leak as the /repo command path).
+    if (!opts?.suppressConfirmReply) {
+      await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: dirLabel }, locTarget), undefined, fallbackTurnId(ds, undefined));
+    }
+    logger.info(`[${tag(ds)}] Repo selected: ${dirPath}, spawning CLI`);
+  } else {
+    // Mid-session repo switch — close old session, start fresh.
+    // Safety net (mirrors the `/repo` text-command path): build the same
+    // "session closed" card `/close` emits BEFORE displacing the old session
+    // (it reads the live session's identity off `ds`). The new session reuses
+    // this anchor, so the old context would otherwise vanish without a trace
+    // (relay/adopt/resume all hit `anchor_occupied`). The card keeps it
+    // visible and carries the terminal `claude --resume` command.
+    //
+    // The new cwd is NOT written onto the old session here — it would pollute
+    // the displaced session's stored workingDir (and the closed card), so
+    // `claude --resume` later would reopen the old context in the new repo's
+    // cwd. The new repo is pinned onto the fresh session below instead.
+    const closedCard = buildClosedSessionCard(ds, locTarget);
+
+    killWorker(ds);
+    // Park the current card in `frozenCards` so the next POST under the new
+    // session sweeps it via recall. closeSession() wipes the on-disk
+    // frozen-cards file under the OLD sessionId, but the in-memory Map
+    // travels with `ds` into the new session and still carries the
+    // old messageId for deletion. If fork or POST fails, the parked card
+    // stays in the thread instead of vanishing prematurely.
+    parkStreamCard(ds);
+    sessionStore.closeSession(ds.session.sessionId);
+
+    await deliverEphemeralOrReply(
+      ds,
+      operatorOpenId,
+      closedCard,
+      'interactive',
+      () => sessionReply(rootId, closedCard, 'interactive'),
+    );
+
+    const session = sessionStore.createSession(ds.chatId, rootId, dirLabel, ds.chatType);
+    ds.session = session;
+    ds.lastUserPrompt = undefined;
+    ds.lastCliInput = undefined;
+    // Pin workingDir + larkAppId onto the new session before forkWorker.
+    // Without this, a daemon restart restores the session with an empty
+    // workingDir and the worker spawns in the bot's default cwd, so
+    // `claude --resume` looks in the wrong .claude/projects/<hash>/ dir and
+    // exits code 0 immediately, crash-looping until the rate-limiter trips.
+    ds.workingDir = dirPath;
+    ds.session.workingDir = dirPath;
+    ds.session.larkAppId = ds.larkAppId;
+    sessionStore.updateSession(ds.session);
+    ds.hasHistory = false;
+    // Re-persist the parked card under the NEW sessionId so a daemon crash
+    // before the next POST doesn't strand it. closeSession() above wiped
+    // the on-disk file under the OLD sessionId; without this re-save, the
+    // in-memory Map only survives in process memory.
+    if (ds.frozenCards && ds.frozenCards.size > 0) {
+      saveFrozenCards(ds.session.sessionId, ds.frozenCards);
+    }
+    // Drop the old turn's streaming-card reference so worker_ready POSTs a
+    // fresh card for the new session instead of PATCHing the previous one.
+    ds.streamCardId = undefined;
+    ds.streamCardNonce = undefined;
+    ds.streamCardPending = undefined;
+    ds.lastScreenContent = undefined;
+    ds.lastScreenStatus = undefined;
+    forkWorker(ds, '', false);
+    if (!opts?.suppressConfirmReply) {
+      await sessionReply(rootId, t('cmd.repo.switched_to', { name: dirLabel }, locTarget));
+    }
+    logger.info(`[${tag(ds)}] Repo switched to ${dirPath}, new session created`);
+  }
+
+  // Withdraw the repo selection card
+  if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+  ds.repoCardMessageId = undefined;
+}
+
 // ─── Main handler ─────────────────────────────────────────────────────────
 
 export async function handleCardAction(data: CardActionData, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
   const { activeSessions, lastRepoScan } = deps;
-  const sessionReply = (rid: string, content: string, msgType?: string) =>
-    deps.sessionReply(rid, content, msgType, larkAppId);
+  // turnId is forwarded only when the caller actually has a turn anchor
+  // (e.g. the pendingRepo confirmation) — most card actions have none.
+  const sessionReply = (rid: string, content: string, msgType?: string, turnId?: string) =>
+    turnId !== undefined
+      ? deps.sessionReply(rid, content, msgType, larkAppId, turnId)
+      : deps.sessionReply(rid, content, msgType, larkAppId);
   const action = data?.action;
   const value = action?.value;
   const cardMessageId = data?.context?.open_message_id ?? data?.open_message_id;
@@ -139,6 +492,30 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
+  // ─── 沙盒落盘卡（land_apply / land_discard）──────────────────────────────────
+  // 不绑 session（sessionId + workingDir 都在 value 里）。owner 强闸门：只有 owner 能把
+  // 隔离副本的改动应用回真实磁盘。agent 在沙盒里无感，不参与。
+  if (value?.action && (value.action === 'land_apply' || value.action === 'land_discard') && larkAppId) {
+    const loc = localeForBot(larkAppId);
+    const owner = getOwnerOpenId(larkAppId);
+    if (!operatorOpenId || operatorOpenId !== owner) {
+      logger.info(`Land action "${value.action}" blocked for non-owner: ${operatorOpenId}`);
+      return { toast: { type: 'error', content: t('card.land.toast_owner_only', undefined, loc) } };
+    }
+    if (value.action === 'land_discard') {
+      return JSON.parse(buildLandResultCard('discarded', '', loc));
+    }
+    const sid: string = value.sessionId;
+    const wd: string = value.workingDir;
+    if (!sid || !wd) return JSON.parse(buildLandResultCard('failed', t('card.land.stale', undefined, loc), loc));
+    const d = computeSandboxDiff(config.session.dataDir, sid, loc);
+    if (!d.ok) return JSON.parse(buildLandResultCard('failed', d.error, loc));
+    if (d.empty) return JSON.parse(buildLandResultCard('discarded', '', loc));
+    const a = applySandboxDiff(wd, config.session.dataDir, sid, loc);
+    if (!a.ok) return JSON.parse(buildLandResultCard('failed', a.error, loc));
+    logger.info(`Land applied: ${d.files} files (+${d.insertions}/-${d.deletions}) → ${wd}`);
+    return JSON.parse(buildLandResultCard('applied', t('card.land.applied_body', { files: d.files, ins: d.insertions, del: d.deletions, dir: wd }, loc), loc));
+  }
   // ─── 群内授权卡片动作（grant_chat / grant_global / grant_deny，talk-only）─────
   // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
   if (value?.action && (value.action === 'grant_chat' || value.action === 'grant_global' || value.action === 'grant_deny') && larkAppId) {
@@ -172,12 +549,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const names: string[] = Array.isArray(value.target_names) ? value.target_names : [];
     const idToName = new Map<string, string>();
     targets.forEach((tt, i) => idToName.set(tt, names[i] ?? ''));
+    // 额度挂在 pending 上（/grant @x N 解析所得；多目标共用同一额度）；clearPending 前先读出来。
+    const quota = getPendingQuota(larkAppId, grantChatId, targets[0]);
     const granted: string[] = [];
     const failed: Array<{ openId: string; reason: string }> = [];
     for (const tt of targets) {
       const res = kind === 'global'
-        ? await addGlobalGrant(larkAppId, tt)
-        : await addChatGrant(larkAppId, grantChatId, tt);
+        ? await addGlobalGrant(larkAppId, tt, quota)
+        : await addChatGrant(larkAppId, grantChatId, tt, quota);
       if (res.ok) { clearPending(larkAppId, grantChatId, tt); granted.push(tt); }
       else { failed.push({ openId: tt, reason: res.reason }); logger.warn(`Grant action "${value.action}" store failed for ${tt}: ${res.reason}`); }
     }
@@ -190,16 +569,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // 清掉后失败 target 可重新走 /grant 或自助申请；失败清单下面在原线程明确告知 owner，
     // 不做「撤卡 + 静默失败 + pending 永久卡住」。
     for (const f of failed) clearPending(larkAppId, grantChatId, f.openId);
-    const target = granted;
+    // 一次查通讯录判定哪些 grantee 是真人（vs bot），结果同时供下面两处复用：
+    //   1. observed 花名册自动登记（只收 bot，剔真人）；
+    //   2. 通知卡 @ 渲染（只 @ 真人，bot 用纯文本名字 —— 见下方注释）。
+    // 缺 contact 读权限/查询瞬时失败 → 一律按 bot 处理（false）：登记侧沿用历史「全部登记」回退，
+    // 通知侧则把对方当 bot 不 @（宁可少 @ 一次真人，也不误唤醒 bot 拉空会话）。
+    const humanFlags = await Promise.all(granted.map(id => isHumanOpenId(larkAppId, id).catch(() => false)));
     // /grant @bot 成功后顺带把「bot」目标登记进 observed 花名册（等价内部跑一次 /introduce），
     // 授权 + 可点名一步到位。写的是 observed-bots-store（让本 daemon 能 @ 回对方），不影响
     // isKnownPeerBot 接收闸（那查的是 cross-ref，两套独立存储），零额外路由权。best-effort。
     // 真人**不**登记：查通讯录确认是真人就剔除，避免污染 <available_bots> 误导模型。
-    // 注意：grant 自动登记是新增路径，缺 contact 读权限/查询瞬时失败时真人会被当 bot 误登记
-    // （/introduce 同款过滤但本就登记全部，对它无回退损失）。该 scope 已是 critical 且启动自检
-    // 缺失即 DM 管理员，把这条污染面收敛到「管理员未按提示开权限」的窗口（见 isHumanOpenId）。
     try {
-      const humanFlags = await Promise.all(granted.map(id => isHumanOpenId(larkAppId, id).catch(() => false)));
       const botEntries = granted
         .map((id, i) => ({ id, human: humanFlags[i] }))
         .filter(x => !x.human)
@@ -212,52 +592,150 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     } catch (err) {
       logger.warn(`grant auto-introduce (observed) failed (grant still applied): ${err}`);
     }
-    // 授权成功后：在原线程 @ 被授权人发通知 + 撤回授权卡（用户要求）。
-    // 这两步失败不回滚授权（已落库），仅记日志，并兜底用 in-place patch 让 owner 看到结果。
+    // 通知卡的 grantee 渲染参数：bot 只用纯文本名字（不 <at>，否则唤醒对方 bot 误拉空会话），真人 @ 点名。
+    const notifyTargets = granted.map((id, i) => ({ openId: id, name: idToName.get(id) || undefined, isBot: !humanFlags[i] }));
+    // 授权成功后：
+    //   1. 先同步返回 callback 响应（in-place patch 成「已授权」终态卡），避免飞书等待
+    //      太久或 deleteMessage 与 callback 响应竞态导致客户端 300000 报错；
+    //   2. 通知卡 + 部分失败告知 + 撤回原卡 走后台 fire-and-forget（不阻塞 callback）。
+    const resultCardBody = JSON.parse(buildGrantResultCard(kind, loc));
     if (cardMessageId) {
-      // 通知是 best-effort（@被授权人）；失败不影响主流程，只记日志。
-      //
-      // reply_in_thread 只在「卡片本身已处于话题里」时才开：
-      //   - 话题群 / 普通群内话题 → 卡片有 thread_id → 线程化回复，落进原话题；
-      //   - 普通群顶层消息       → 卡片无 thread_id → reply_in_thread 会凭空开一个
-      //                            新话题（用户不想要），改为普通回复直接落到群里。
-      // thread_id 是「是否真的在话题里」的权威信号（见 event-dispatcher.decideRouting）。
-      // 探测失败时退回线程化回复，保持话题群下的原有行为。
       let replyInThread = true;
       try {
         const detail = await getMessageDetail(larkAppId, cardMessageId);
         const item = detail?.items?.[0];
-        // 拿不到 message item 视为探测失败（走 catch 退回 true），而不是误判成
-        // 「无 thread_id → 普通回复」——后者会在话题群里破坏原有的线程化行为。
         if (!item) throw new Error('no message item in getMessageDetail response');
         replyInThread = Boolean(item.thread_id);
       } catch (err) {
         logger.debug(`grant notify thread-mode probe failed, defaulting to thread reply: ${err}`);
       }
-      try {
-        await replyMessage(larkAppId, cardMessageId, buildGrantNotifyCard(kind, target, loc), 'interactive', replyInThread);
-      } catch (err) {
-        logger.warn(`grant notify failed (grant still applied): ${err}`);
-      }
-      // 部分授权失败：在原线程明确告知 owner（绝不静默撤卡）。失败 target 的 pending 已清，
-      // owner 据此可重新 /grant 重试。
-      if (failed.length > 0) {
-        const failNames = failed.map(f => idToName.get(f.openId) || f.openId).join('、');
-        await replyMessage(larkAppId, cardMessageId, t('card.grant.partial_failed', { names: failNames }, loc), 'text', replyInThread)
-          .catch(err => logger.warn(`grant partial-failure notice failed: ${err}`));
-      }
-      // 撤回授权卡。deleteMessage 返回 boolean——只有确认撤回成功才不返回 patch；
-      // 否则（SDK 吞错/非 0 code）落到 in-place patch，避免卡片留在原地无终态。
-      const withdrawn = await deleteMessage(larkAppId, cardMessageId);
-      if (withdrawn) return;
-      logger.warn(`grant card withdraw failed (grant still applied); falling back to in-place patch`);
+      // fire-and-forget: 通知卡 + 部分失败文字 + 撤回原卡
+      Promise.resolve()
+        .then(async () => {
+          try {
+            await replyMessage(larkAppId, cardMessageId, buildGrantNotifyCard(kind, notifyTargets, loc, quota), 'interactive', replyInThread);
+          } catch (err) {
+            logger.warn(`grant notify failed (grant still applied): ${err}`);
+          }
+          if (failed.length > 0) {
+            const failNames = failed.map(f => idToName.get(f.openId) || f.openId).join('、');
+            try {
+              await replyMessage(larkAppId, cardMessageId, t('card.grant.partial_failed', { names: failNames }, loc), 'text', replyInThread);
+            } catch (err) {
+              logger.warn(`grant partial-failure notice failed: ${err}`);
+            }
+          }
+          try {
+            await deleteMessage(larkAppId, cardMessageId);
+          } catch (err) {
+            logger.debug(`grant card withdraw (post-callback) failed: ${err}`);
+          }
+        })
+        .catch(err => logger.error(`grant post-callback background tasks failed: ${err}`));
     }
-    // 兜底（无 card message_id，或撤回失败）：靠 callback 返回 patch 原地更新卡。
-    return JSON.parse(buildGrantResultCard(kind, loc));
+    return resultCardBody;
   }
 
   if (isAskCardAction(value?.action)) {
     return handleAskCardAction(data);
+  }
+
+  // Dashboard callbacks dispatch before session lookup. They do not require an
+  // active DaemonSession and use dashboard-internal Route B endpoints.
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('dash_settings_') &&
+    larkAppId
+  ) {
+    const { handleSettingsCardAction } = await import('./settings-card.js');
+    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    const settingsLocale = localeForBot(larkAppId);
+    // Success returns `{ card }` only so Lark replaces the card in the same
+    // callback response. Slow fallback is handled by the event dispatcher.
+    return handleSettingsCardAction(data, larkAppId, {
+      createClient: (appId: string) => createDaemonClientFor(appId),
+      locale: settingsLocale,
+    });
+  }
+
+  // ─── `/dashboard sessions` callbacks ─────────────────────────────────
+  // Same response shape as dash_settings_*: success returns `{ card }` only,
+  // no toast, so Lark renders the new list in a single pass.
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('dash_sessions_') &&
+    larkAppId
+  ) {
+    const { handleSessionsCardAction } = await import('./sessions-card.js');
+    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    const sessionsLocale = localeForBot(larkAppId);
+    return handleSessionsCardAction(data, larkAppId, {
+      createClient: (appId: string) => createDaemonClientFor(appId),
+      locale: sessionsLocale,
+    });
+  }
+
+  // ─── `/dashboard schedules` callbacks ────────────────────────────────
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('dash_schedules_') &&
+    larkAppId
+  ) {
+    const { handleSchedulesCardAction } = await import('./schedules-card.js');
+    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    const schedulesLocale = localeForBot(larkAppId);
+    return handleSchedulesCardAction(data, larkAppId, {
+      createClient: (appId: string) => createDaemonClientFor(appId),
+      locale: schedulesLocale,
+    });
+  }
+
+  // ─── `/dashboard workflows` callbacks ────────────────────────────────
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('dash_workflows_') &&
+    larkAppId
+  ) {
+    const { handleWorkflowsCardAction } = await import('./workflows-card.js');
+    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    const workflowsLocale = localeForBot(larkAppId);
+    return handleWorkflowsCardAction(data, larkAppId, {
+      createClient: (appId: string) => createDaemonClientFor(appId),
+      locale: workflowsLocale,
+    });
+  }
+
+  // ─── `/dashboard groups` callbacks ───────────────────────────────────
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('dash_groups_') &&
+    larkAppId
+  ) {
+    const { handleGroupsCardAction } = await import('./groups-card.js');
+    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    const groupsLocale = localeForBot(larkAppId);
+    return handleGroupsCardAction(data, larkAppId, {
+      createClient: (appId: string) => createDaemonClientFor(appId),
+      locale: groupsLocale,
+    });
+  }
+
+  // ─── `/dashboard overview` callbacks ─────────────────────────────────
+  // Goto buttons rebuild the TARGET card by re-fetching the corresponding
+  // dedicated Route B endpoint (sessions-list / schedules-list /
+  // settings-snapshot). No new endpoints, no multi_url cross-card jumps.
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('dash_overview_') &&
+    larkAppId
+  ) {
+    const { handleOverviewCardAction } = await import('./overview-card.js');
+    const { createDaemonClientFor } = await import('../../daemon-internal-client-wrapper.js');
+    const overviewLocale = localeForBot(larkAppId);
+    return handleOverviewCardAction(data, larkAppId, {
+      createClient: (appId: string) => createDaemonClientFor(appId),
+      locale: overviewLocale,
+    });
   }
 
   // ─── /relay picker: state-changing actions (select / page / search) ────
@@ -273,6 +751,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const loc = localeForBot(larkAppId);
     const targetChatId = value.target_chat_id;
     const targetRootId = value.root_id;
+    // root_id IS the relay target anchor (chatId for chat-scope, 话题 root for
+    // thread-scope). target_scope tells the confirm/re-render which it is;
+    // target_chat_type (group | p2p) rides along so confirm can flip the
+    // session's chatType for DM targets. Default 'group' covers legacy cards.
+    const targetScope = (value.target_scope as 'thread' | 'chat') ?? 'chat';
+    const targetChatType = (value.target_chat_type as 'group' | 'p2p') ?? 'group';
     const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!targetChatId || !targetRootId || !operatorOpenId) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'missing_value' }, loc) } };
@@ -312,8 +796,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       nextSelected = value.session_id;
     }
 
+    // Exclude by the target ANCHOR (root_id), not chatId — keeps 同群 other-
+    // topic sessions in the candidate list on re-render, matching初次渲染.
     const { collectRelayPickerEntries } = await import('../../services/relay-picker.js');
-    const entries = await collectRelayPickerEntries(activeSessions, larkAppId, targetChatId, operatorOpenId);
+    const entries = await collectRelayPickerEntries(activeSessions, larkAppId, targetRootId, operatorOpenId);
     const { buildRelayPickerCard } = await import('./card-builder.js');
     const cardJson = buildRelayPickerCard(
       entries,
@@ -331,11 +817,115 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         searchQuery: nextSearch,
         page: nextPage,
       },
+      targetScope,
+      targetChatType,
     );
     // Return an updated card body — event-dispatcher wraps this as
     // { card: { type: 'raw', data: <body> } } so Lark patches the picker
     // in place rather than appending a new message.
     return JSON.parse(cardJson);
+  }
+
+  // ─── /botconfig 交互卡片：切换布尔开关 / 选择 cli·model·lang / 消息额度，就地刷新 ──
+  const CONFIG_CARD_ACTIONS = ['config_toggle', 'config_set', 'config_quota', 'config_text_open', 'config_text_save'];
+  if (value?.action && larkAppId && CONFIG_CARD_ACTIONS.includes(value.action)) {
+    // 卡片携带的渲染语言（`/botconfig en` 的覆盖）优先；缺省回落 bot 默认。
+    const vLoc = (value as any)?.loc;
+    const loc = isLocale(vLoc) ? vLoc : localeForBot(larkAppId);
+    let cbot;
+    try { cbot = getBot(larkAppId); } catch { return { toast: { type: 'error', content: t('cmd.config.no_bot', undefined, loc) } }; }
+    // 严格 owner/allowlist 闸（与文字版 /botconfig 同口径）：拒开放模式 + 非 admin。
+    const admins = cbot.resolvedAllowedUsers;
+    if (admins.length === 0 || !operatorOpenId || !admins.includes(operatorOpenId)) {
+      return { toast: { type: 'error', content: t('cmd.config.not_admin', undefined, loc) } };
+    }
+    // ttadk 网关 bot 用 ttadk 网关模型候选（glm-5.1…），非底层适配器的 opus/gpt-5
+    // （否则被 worker 注入成 `ttadk -m opus` 用错模型启动失败）；CoCo 无候选。
+    const modelChoices = (() => {
+      const ttadkChoices = ttadkConfigModelChoices(cbot.config.wrapperCli);
+      if (ttadkChoices !== null) return ttadkChoices;
+      try { return createCliAdapterSync(cbot.config.cliId, cbot.config.cliPathOverride).modelChoices ?? []; } catch { return []; }
+    })();
+    const reRender = () => {
+      const d = getConfigCardData(larkAppId, modelChoices);
+      return d ? { card: { type: 'raw' as const, data: JSON.parse(buildConfigCard(d, loc)) } } : {};
+    };
+    // 「文本设置」子卡：点主卡按钮 → **私信新发**一张含输入框的子卡（v1 form 须新发、
+    // 不能 patch，否则空卡）。子卡每个字段一个 form，保存即写、回 toast、卡片保持
+    // （不回 card → 不 patch，避免 form 重渲染异常）。
+    if (value.action === 'config_text_open') {
+      const d = getConfigCardData(larkAppId, modelChoices);
+      if (!d) return { toast: { type: 'error', content: t('cmd.config.no_bot', undefined, loc) } };
+      try {
+        await sendUserMessage(larkAppId, operatorOpenId!, buildConfigTextCard(d, loc), 'interactive');
+        return { toast: { type: 'success', content: t('card.config.text_sent', undefined, loc) } };
+      } catch {
+        return { toast: { type: 'error', content: t('card.config.text_send_fail', undefined, loc) } };
+      }
+    }
+    if (value.action === 'config_text_save') {
+      const fk = (value as any)?.field as string | undefined;
+      const fv: Record<string, string> = (action as any)?.form_value ?? {};
+      const raw = String((fk ? fv[fk] : '') ?? '').trim();
+      if (fk === 'teamRole') {
+        if (raw) writeTeamRoleFile(larkAppId, raw.slice(0, 4096)); else deleteTeamRoleFile(larkAppId);
+        logger.info(`[config:${larkAppId}] team role ${raw ? 'set' : 'cleared'} via card`);
+        return { toast: { type: 'success', content: t('card.config.text_saved', undefined, loc) } };
+      }
+      const spec = fk ? findConfigField(fk) : undefined;
+      if (!spec) return { toast: { type: 'error', content: t('cmd.config.unknown_field', { field: fk ?? '?', fields: '' }, loc) } };
+      // 留空 = 清除；非空一律过 coerceConfigValue 按 kind 归一化/校验（stringList
+      // 拆数组、string 执行 maxLen 等 spec 约束），与 /config 文字入口、dashboard
+      // PUT 同一校验点，避免卡片入口绕过。
+      let valueToApply: string | string[] | null;
+      if (!raw) {
+        valueToApply = null;
+      } else {
+        const coerced = coerceConfigValue(spec, raw);
+        if (!coerced.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: coerced.reason }, loc) } };
+        // 文本子卡只承载 string / stringList 字段；narrow 给 applyConfigField。
+        valueToApply = coerced.value as string | string[];
+      }
+      const r = await applyConfigField(larkAppId, spec, valueToApply);
+      if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
+      logger.info(`[config:${larkAppId}] text field ${spec.key} saved via card`);
+      return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` } };
+    }
+
+    // 消息额度（grant-prefs，非 CONFIG_FIELDS 字段）：'off' = 关闭，正整数 = 设定。
+    if (value.action === 'config_quota') {
+      const raw = (action as any)?.option ?? '';
+      const n = raw === 'off' ? null : Number(raw);
+      const limit = n && Number.isInteger(n) && n > 0 ? n : null;
+      const qr = await updateBotGrantPrefs(larkAppId, { messageQuotaDefaultLimit: limit });
+      if (!qr.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: qr.reason }, loc) } };
+      return { toast: { type: 'success', content: `✓ quota = ${limit ?? 'off'}` }, ...reRender() };
+    }
+
+    const field = value.field as string | undefined;
+    const spec = field ? findConfigField(field) : undefined;
+    if (!spec || spec.kind === 'allowedUsers') {
+      return { toast: { type: 'error', content: t('cmd.config.unknown_field', { field: field ?? '?', fields: '' }, loc) } };
+    }
+
+    let r;
+    if (value.action === 'config_toggle') {
+      if (spec.kind !== 'boolean') return { toast: { type: 'error', content: t('cmd.config.invalid_bool', { field: spec.key, value: '' }, loc) } };
+      const cur = (cbot.config as any)[spec.configKey] === true;
+      r = await applyConfigField(larkAppId, spec, !cur);
+    } else {
+      const raw = (action as any)?.option ?? (action as any)?.input_value ?? '';
+      if (raw === CONFIG_UNSET) {
+        if (!spec.clearable) return { toast: { type: 'error', content: t('cmd.config.not_clearable', { field: spec.key }, loc) }, ...reRender() };
+        r = await applyConfigField(larkAppId, spec, null);
+      } else {
+        const coerced = coerceConfigValue(spec, raw);
+        if (!coerced.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: coerced.reason }, loc) }, ...reRender() };
+        r = await applyConfigField(larkAppId, spec, coerced.value);
+      }
+    }
+    if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
+    return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` }, ...reRender() };
   }
 
   // ─── /relay picker: confirm transfer (stage 2 → done) ──────────────────
@@ -347,6 +937,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const sourceSessionId = value.session_id;
     const targetChatId = value.target_chat_id;
     const targetRootId = value.root_id;
+    // root_id IS the target anchor for thread-scope (the 话题 root); for chat-
+    // scope the anchor is chatId and root_id is unused for routing.
+    // target_chat_type tells transferSession whether the destination is a DM
+    // (p2p) so the session's chatType flips with it; legacy cards lack the
+    // field and default to 'group' (their pickers never offered DM targets).
+    const targetScope = (value.target_scope as 'thread' | 'chat') ?? 'chat';
+    const targetChatType = (value.target_chat_type as 'group' | 'p2p') ?? 'group';
+    const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootId;
     const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!sourceSessionId || !targetChatId || !targetRootId) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'missing_value' }, loc) } };
@@ -376,7 +974,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (sourceDs.session.ownerOpenId && sourceDs.session.ownerOpenId !== operatorOpenId) {
       return { toast: { type: 'error', content: t('card.relay.toast_not_owner', undefined, loc) } };
     }
-    if (sourceDs.chatId === targetChatId) {
+    // Anchor-based self-relay guard: a thread-scope source in the SAME chat
+    // (different 话题) is a legitimate cross-topic move, so refuse only when the
+    // source and target anchors are identical.
+    if (sessionAnchorId(sourceDs) === targetAnchor) {
       return { toast: { type: 'error', content: t('card.relay.toast_same_chat', undefined, loc) } };
     }
     // Real-session preflight — done BEFORE M1 send so a refusal doesn't
@@ -399,8 +1000,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const targetConflict = [...activeSessions.values()].find(c =>
       c !== sourceDs
       && c.larkAppId === larkAppId
-      && c.chatId === targetChatId
-      && c.scope === 'chat'
+      && sessionAnchorId(c) === targetAnchor
       && !!c.worker
     );
     if (targetConflict) {
@@ -417,24 +1017,34 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return;
     }
     // Resolve a friendly source chat label for the M1 announcement — falls
-    // back to the raw chatId if Lark can't return a name.
+    // back to the raw chatId if Lark can't return a name. A p2p source has no
+    // chat name (chat.get often fails or returns empty for DMs) — use the
+    // locale-aware 单聊 label instead of leaking a raw oc_ id into the M1.
     const { getChatName } = await import('./client.js');
-    const sourceLabel = (await getChatName(larkAppId, sourceDs.chatId)) ?? sourceDs.chatId;
-    // Send the M1 announcement — its message_id becomes the new
-    // rootMessageId after the transfer (mirrors /relay --create's flow).
+    const sourceLabel = sourceDs.chatType === 'p2p'
+      ? t('card.relay.type_p2p', undefined, loc)
+      : (await getChatName(larkAppId, sourceDs.chatId)) ?? sourceDs.chatId;
+    // Send the M1 announcement.
+    //   chat-scope: a plain top-level message; its id becomes the (audit-only)
+    //               rootMessageId after the transfer (mirrors /relay --create).
+    //   thread-scope: reply_in_thread INTO the target 话题 (anchor) so the
+    //               announcement lands in the 话题; the session anchors on the
+    //               话题 root (targetAnchor), NOT the M1 id.
     let m1MessageId: string;
     try {
-      const m1Text = t('cmd.relay.m1_announce', { sourceChat: sourceLabel, groupName: targetChatId }, loc);
-      m1MessageId = await sendMessage(larkAppId, targetChatId, m1Text, 'text');
+      const m1Text = t(targetChatType === 'p2p' ? 'cmd.relay.m1_announce_dm' : 'cmd.relay.m1_announce', { sourceChat: sourceLabel, groupName: targetChatId }, loc);
+      m1MessageId = targetScope === 'thread'
+        ? await replyMessage(larkAppId, targetAnchor, m1Text, 'text', /*replyInThread*/ true)
+        : await sendMessage(larkAppId, targetChatId, m1Text, 'text');
     } catch (err: any) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: err?.message ?? 'send_m1_failed' }, loc) } };
     }
     const { transferSession } = await import('../../core/worker-pool.js');
-    // Target is always a regular group in the picker path — picker-mode's
-    // entry guard in command-handler.ts refused p2p / topic before the card
-    // even rendered. Passing literal 'group' here makes that contract
-    // explicit at the call site.
-    const r = await transferSession(sourceDs.session.sessionId, targetChatId, m1MessageId, 'group');
+    // chat-scope → anchor on the M1 id (audit-only); thread-scope → anchor on
+    // the 话题 root (targetAnchor) so future replies in the 话题 route here.
+    const r = targetScope === 'thread'
+      ? await transferSession(sourceDs.session.sessionId, targetChatId, targetAnchor, targetChatType, 'thread')
+      : await transferSession(sourceDs.session.sessionId, targetChatId, m1MessageId, targetChatType, 'chat');
     if (!r.ok) {
       // Best-effort: orphan M1 cleanup so a failed transfer doesn't leave a
       // misleading "已接力" message in the target chat (王皓's "明明失败了
@@ -465,7 +1075,33 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'success', content: t('card.relay.toast_success', undefined, loc) } };
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  // v3 humanGate 审批卡（独立 namespace，不混 v0.2 wait path）。**在通用 sensitive
+  // 权限门之前**处理（codex medium）：v3 卡 value 没有 root_id/session_id，通用门只能
+  // 用 chatId=undefined 做粗判，可能误拦；v3 自己的 `canResolve(binding, operator)`
+  // 才有 run binding 的 chatId，是权威权限门。
+  if (isV3GateAction(value?.action)) {
+    if (!deps.v3GateDeps) return;
+    return await handleV3GateAction(value as unknown as V3GateActionValue, operatorOpenId, deps.v3GateDeps);
+  }
+  if (isV3BlockedAction(value?.action)) {
+    if (!deps.v3BlockedDeps) return;
+    return await handleV3BlockedAction(
+      value as unknown as V3BlockedActionValue | V3AskAnswerActionValue,
+      operatorOpenId,
+      deps.v3BlockedDeps,
+      action?.form_value,
+    );
+  }
+  if (isV3RevisitGrantAction(value?.action)) {
+    if (!deps.v3RevisitGrantDeps) return;
+    return await handleV3RevisitGrantAction(value as unknown as V3RevisitGrantActionValue, operatorOpenId, deps.v3RevisitGrantDeps);
+  }
+  if (isV3LoopGrantAction(value?.action)) {
+    if (!deps.v3LoopGrantDeps) return;
+    return await handleV3LoopGrantAction(value as unknown as V3LoopGrantActionValue, operatorOpenId, deps.v3LoopGrantDeps);
+  }
+
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -486,14 +1122,23 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       : undefined;
     const effectiveAppId = larkAppId ?? ds?.larkAppId ?? closedForCtx?.larkAppId;
     const chatId = ds?.chatId ?? closedForCtx?.chatId;
-    // pendingRepo 阶段，会话发起人（含 chat-granted 用户）可以 skip_repo 起会话——
-    // 与 repo 下拉选择同款例外，否则被授权人连自己的首次会话都启动不了。
+    // pendingRepo 阶段，会话发起人（含 chat-granted 用户）可以 skip_repo / 手动填目录
+    // 起会话——与 repo 下拉选择同款例外，否则被授权人连自己的首次会话都启动不了。
+    // 注意：worktree_toggle_mode 故意不在此列——它持久写 bot 级 worktreeMultiPicker
+    // （影响该 bot 所有后续会话），属管理动作，必须走 canOperate，不能让 talk-only/
+    // chat-granted 用户借「开自己的 pending 卡」绕过去改 bot 配置。
     const pendingRepoOwnerException =
-      value.action === 'skip_repo' && !!ds?.pendingRepo &&
+      (value.action === 'skip_repo' || value.action === 'repo_manual_submit' || value.action === 'repo_worktree_submit') && !!ds?.pendingRepo &&
       !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
     if (effectiveAppId) {
       if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
         logger.info(`Card action "${value.action}" blocked for non-operator user: ${operatorOpenId} (chat=${chatId})`);
+        // get_write_link 显式破例：其余敏感动作沿用「静默 block（仅日志）」的既有设计
+        // （test/card-handler-repo-select.test.ts 把这点 pin 住了），但「获取操作链接」是
+        // 用户主动点的取权动作，静默会让人以为按钮坏了——给一条明确的「无操作权限」toast。
+        if (value.action === 'get_write_link') {
+          return { toast: { type: 'warning', content: t('card.action.write_link_no_permission', undefined, localeForBot(effectiveAppId)) } };
+        }
         return;
       }
     } else {
@@ -507,13 +1152,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         || bots.some(b => (b.config.globalGrants?.length ?? 0) > 0);
       if (hasAllowlist && (!operatorOpenId || !allowedUsers.includes(operatorOpenId))) {
         logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
+        // 与上面 non-operator 分支同理：仅 get_write_link 破例给 toast，其余保持静默。
+        if (value.action === 'get_write_link') {
+          return { toast: { type: 'warning', content: t('card.action.write_link_no_permission', undefined, localeForBot(larkAppId)) } };
+        }
         return;
       }
     }
   }
 
   if (isWorkflowApprovalAction(value?.action)) {
-    const result = await handleWorkflowApprovalAction(data, deps.workflowApprovalDeps);
+    const locWf = localeForBot(larkAppId);
+    const workflowData = data as Parameters<typeof handleWorkflowApprovalAction>[0];
+    const result = await handleWorkflowApprovalAction(workflowData, deps.workflowApprovalDeps, locWf);
     const runId = value?.run_id;
     if (result?.ok && !result.duplicate && runId) {
       await deps.workflowApprovalResolved?.(runId);
@@ -521,7 +1172,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // Non-approver: surface a toast so the clicker knows nothing happened
     // (instead of silently leaving the buttons active).
     if (result && !result.ok && result.error === 'not_approver') {
-      return { toast: { type: 'warning', content: '你不在该审批人名单里，无法操作' } };
+      return { toast: { type: 'warning', content: t('toast.not_in_approver_list', undefined, locWf) } };
     }
     // Successful resolve / reject / cancel: replace the clicked card with a
     // frozen "已通过/已拒绝/已取消" body so the buttons can't be re-submitted
@@ -547,6 +1198,34 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     if (ds && !validateCardCliBinding(ds, value)) return;
 
+    // 🔊 语音总结 — no permission gate (任意人可点). Inject a condense-and-speak
+    // instruction into the session; the model emits the voice via
+    // `botmux send --voice`. Dedup per card so only one voice is generated.
+    if (actionType === 'voice_summary') {
+      const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.voice.toast_session_gone', undefined, locDs) } };
+      }
+      // 权限：仅 canTalk / canOperate 用户可点；其他人提示需授权（无声门会让人以为按钮坏了）。
+      if (!canTalk(ds.larkAppId, ds.chatId, operatorOpenId) && !canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
+        logger.info(`[${tag(ds)}] voice_summary blocked for unauthorized user: ${operatorOpenId ?? '?'}`);
+        return { toast: { type: 'warning', content: t('card.voice.toast_need_auth', undefined, locDs) } };
+      }
+      const dedupeKey = cardMessageId ?? `${sessionAnchorId(ds)}::voice`;
+      if (voicedCardIds.has(dedupeKey)) {
+        return { toast: { type: 'info', content: t('card.voice.toast_already', undefined, locDs) } };
+      }
+      voicedCardIds.add(dedupeKey);
+      if (voicedCardIds.size > 5000) { voicedCardIds.clear(); voicedCardIds.add(dedupeKey); }
+      if (ds.worker && !ds.worker.killed) {
+        ds.worker.send({ type: 'message', content: voiceSummaryInstruction(locDs) } as DaemonToWorker);
+      } else {
+        forkWorker(ds, voiceSummaryInstruction(locDs), ds.hasHistory);
+      }
+      logger.info(`[${tag(ds)}] voice_summary triggered by ${operatorOpenId ?? '?'}`);
+      return { toast: { type: 'success', content: t('card.voice.toast_wait', undefined, locDs) } };
+    }
+
     if (actionType === 'restart' && ds) {
       // Adopt sessions: hard-reject. botmux never owned the user's CLI;
       // restarting would mean killing their tmux pane / Claude process,
@@ -565,44 +1244,31 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         logger.info(`[${tag(ds)}] Restart via card button`);
         ds.worker.send({ type: 'restart' } as DaemonToWorker);
         const cliName = getCliDisplayName(effectiveCliId);
-        await sessionReply(rootId, t('card.action.restarted', { cliName }, locDs));
+        const restartedMsg = t('card.action.restarted', { cliName }, locDs);
+        await deliverEphemeralOrReply(ds, operatorOpenId, restartedMsg, 'text', () => sessionReply(rootId, restartedMsg));
       } else {
         logger.info(`[${tag(ds)}] Re-forking worker via card button`);
         forkWorker(ds, '', ds.hasHistory);
         const cliName = getCliDisplayName(effectiveCliId);
-        await sessionReply(rootId, t('card.action.restarted_fresh', { cliName }, locDs));
+        const restartedFreshMsg = t('card.action.restarted_fresh', { cliName }, locDs);
+        await deliverEphemeralOrReply(ds, operatorOpenId, restartedFreshMsg, 'text', () => sessionReply(rootId, restartedFreshMsg));
         // DM card will be sent by the ready handler when worker starts
       }
     }
 
-    if (actionType === 'close' && ds) {
-      const closedSessionId = ds.session.sessionId;
-      const closedTitle = ds.session.title;
+    if (actionType === 'close') {
+      if (!ds) {
+        // 会话已不在 activeSessions（已关过 / 卡片过期 / daemon 重启丢失）——点「关闭
+        // 会话」却静默无反应会让人以为按钮坏了，给一条失败 toast（成功路径不弹，已关卡即反馈）。
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+      }
       const botCfg = getBot(ds.larkAppId).config;
-      const closedCliId = ds.session.cliId ?? botCfg.cliId;
-      const closedAnchor = sessionAnchorId(ds);
-      const closedWorkingDir = ds.session.workingDir;
-      const cliResumeCommand = (() => {
-        try {
-          const adapter = createCliAdapterSync(closedCliId, botCfg.cliPathOverride);
-          return adapter.buildResumeCommand?.({
-            sessionId: closedSessionId,
-            cliSessionId: ds.session.cliSessionId,
-          }) ?? null;
-        } catch { return null; }
-      })();
+      // Build the closed card BEFORE killWorker/closeSession — it reads the
+      // live session's identity off `ds`.
+      const card = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
       killWorker(ds);
-      sessionStore.closeSession(closedSessionId);
+      sessionStore.closeSession(ds.session.sessionId);
       activeSessions.delete(sKey);
-      const card = buildSessionClosedCard(
-        closedSessionId,
-        closedAnchor,
-        closedTitle,
-        closedCliId,
-        closedWorkingDir,
-        cliResumeCommand,
-        localeForBot(ds.larkAppId),
-      );
       // The closed card carries session title / CLI name / workingDir / resume
       // command. In private-card mode those must not leak to the group — send the
       // closed card ephemeral to the same owner audience instead. No group
@@ -618,7 +1284,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
         logger.info(`[${tag(ds)}] Closed via card button (private close card → ${audience.length} owner(s))`);
       } else {
-        await sessionReply(rootId, card, 'interactive');
+        await deliverEphemeralOrReply(ds, operatorOpenId, card, 'interactive', () => sessionReply(rootId, card, 'interactive'));
         logger.info(`[${tag(ds)}] Closed via card button`);
       }
     }
@@ -632,7 +1298,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const result = await resumeSession(targetSessionId, activeSessions);
         if (result.ok) {
           const cliName = getCliDisplayName(result.ds.session.cliId ?? getBot(result.ds.larkAppId).config.cliId);
-          await sessionReply(rootId, t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId)));
+          const resumeMsg = t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+          await deliverEphemeralOrReply(result.ds, operatorOpenId, resumeMsg, 'text', () => sessionReply(rootId, resumeMsg));
           logger.info(`[${targetSessionId.substring(0, 8)}] Resumed via card button`);
         } else if (result.error === 'not_found') {
           await sessionReply(rootId, t('card.action.resume_not_found', { short: targetSessionId.substring(0, 8) }, locDsResume));
@@ -794,13 +1461,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.tuiPromptOptions = undefined;
           ds.tuiPromptMultiSelect = undefined;
           ds.tuiToggledIndices = undefined;
+          publishAttentionPatch(ds);
           try { return JSON.parse(buildTuiPromptProcessingCard(finalText, locDs)); } catch { /* fall through */ }
         }
       }
     }
 
     if (actionType === 'tui_text_input' && ds) {
-      const inputText = action?.form_value?.tui_custom_input ?? '';
+      const inputTextRaw = action?.form_value?.tui_custom_input;
+      const inputText = typeof inputTextRaw === 'string' ? inputTextRaw : '';
       let inputKeys: string[] = [];
       try { inputKeys = JSON.parse(value?.input_keys ?? '[]'); } catch { /* bad json */ }
       const locDs = localeForBot(ds.larkAppId);
@@ -816,6 +1485,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
         ds.tuiPromptCardId = undefined;
         ds.tuiPromptOptions = undefined;
+        publishAttentionPatch(ds);
       }
       try {
         return JSON.parse(buildTuiPromptResolvedCard(inputText || t('card.action.tui_custom_input', undefined, locDs), locDs));
@@ -828,28 +1498,40 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const locDs = localeForBot(ds.larkAppId);
       if (ds.workerPort && ds.workerToken) {
         const writeUrl = buildTerminalUrl(ds, { write: true });
-        const dmCardJson = buildSessionCard(
+        const cardJson = buildSessionCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
           writeUrl,
           ds.session.title || getCliDisplayName(effectiveCliId),
           effectiveCliId,
-          true, // showManageButtons — DM card includes restart & close
+          true, // showManageButtons — write-link card includes restart & close
           !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
           locDs,
         );
-        sendUserMessage(ds.larkAppId, operatorOpenId, dmCardJson, 'interactive').catch(err =>
-          logger.warn(`[${tag(ds)}] Failed to DM write link: ${err}`),
-        );
-        logger.info(`[${tag(ds)}] Sent write link via DM to ${operatorOpenId}`);
+        // 普通群发「仅自己可见」私密卡，话题群 / 单聊自动回退私聊 DM（两条通道都私密，
+        // 不泄露写入 token）。fire-and-forget，保持卡片回调快速返回。
+        void deliverWriteLinkCard(ds, operatorOpenId, cardJson);
+        // 乐观回执：投递是异步的（话题群要先 ephemeral 失败再 DM，两次往返 await 容易
+        // 超过 2500ms 的 ACK 窗口而被丢弃），点完立即弹 toast，让用户知道链接已私密发出。
+        return { toast: { type: 'success', content: t('card.action.write_link_sent', undefined, locDs) } };
       } else {
-        await sessionReply(rootId, t('card.action.terminal_not_ready', undefined, locDs));
+        // 普通群发「仅自己可见」私密卡；话题群 / 单聊不支持 ephemeral，回退为同样内容的
+        // 卡片回复（而非纯文本），三种场景都渲染成卡片，行为不变。
+        const notReadyCard = JSON.stringify({
+          config: { wide_screen_mode: true },
+          elements: [{ tag: 'markdown', content: t('card.action.terminal_not_ready', undefined, locDs) }],
+        });
+        await deliverEphemeralOrReply(ds, operatorOpenId, notReadyCard, 'interactive', () => sessionReply(rootId, notReadyCard, 'interactive'));
       }
     }
 
     // Display toggle: hidden ↔ screenshot. 'toggle_stream' is the legacy alias
     // from pre-screenshot cards and is mapped to toggle_display semantics.
-    if ((actionType === 'toggle_display' || actionType === 'toggle_stream') && ds) {
+    if (actionType === 'toggle_display' || actionType === 'toggle_stream') {
+      if (!ds) {
+        // 同 close：会话已不在线时「显示 / 隐藏输出」静默无反应 → 给失败 toast（成功不弹）。
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+      }
       const clickedNonce: string | undefined = value?.card_nonce;
       const isFrozenClick = clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce;
 
@@ -1093,22 +1775,41 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const effectiveCliId = sessionCliId(ds);
         // Skip repo selection — spawn CLI with default working dir
         ds.pendingRepo = false;
+        publishAttentionPatch(ds);
         const pendingPrompt = ds.pendingPrompt ?? '';
-        const prompt = buildNewTopicPrompt(
-          pendingPrompt,
-          ds.session.sessionId,
-          effectiveCliId,
-          botCfg.cliPathOverride,
-          ds.pendingAttachments,
-          ds.pendingMentions,
-          await getAvailableBots(ds.larkAppId, ds.chatId),
-          ds.pendingFollowUps,
-          { name: selfBot.botName, openId: selfBot.botOpenId },
-          locDs,
-          ds.pendingSender,
-          { larkAppId: ds.larkAppId, chatId: ds.chatId },
-        );
-        rememberLastCliInput(ds, pendingPrompt, prompt);
+        const pendingRawInput = ds.pendingRawInput;
+        // Raw-input cold start still wraps any input buffered while the repo
+        // card was pending (follow-ups / attachments) — delivered right after
+        // the raw input on prompt_ready instead of being dropped.
+        const hasBufferedInput =
+          pendingPrompt.trim().length > 0 ||
+          (ds.pendingAttachments?.length ?? 0) > 0 ||
+          (ds.pendingFollowUps?.length ?? 0) > 0;
+        if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
+        const wrappedPrompt = (!pendingRawInput || hasBufferedInput)
+          ? buildNewTopicPrompt(
+              pendingPrompt,
+              ds.session.sessionId,
+              effectiveCliId,
+              botCfg.cliPathOverride,
+              ds.pendingAttachments,
+              ds.pendingMentions,
+              await getAvailableBots(ds.larkAppId, ds.chatId),
+              ds.pendingFollowUps,
+              { name: selfBot.botName, openId: selfBot.botOpenId },
+              locDs,
+              ds.pendingSender,
+              { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
+            )
+          : '';
+        const prompt = pendingRawInput ? '' : wrappedPrompt;
+        if (pendingRawInput && hasBufferedInput) {
+          ds.pendingFollowUpInput = {
+            userPrompt: pendingPrompt || (ds.pendingFollowUps?.join('\n\n') ?? ''),
+            cliInput: wrappedPrompt,
+          };
+        }
+        rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? prompt);
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
         ds.pendingMentions = undefined;
@@ -1124,6 +1825,84 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
       ds.repoCardMessageId = undefined;
     }
+
+    // Manual working-directory entry from the repo card form. The project scan
+    // may not surface every useful directory; this mirrors `/repo <path>` from
+    // the card. Permission is gated at the top (isSensitive + pendingRepoOwner
+    // exception), same as skip_repo. Always a plain commit — worktree creation
+    // needs a scanned git repo root, not an arbitrary path.
+    if (actionType === 'repo_manual_submit' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      const rawPath = String(action?.form_value?.repo_manual_path ?? '').trim();
+      if (!rawPath) {
+        return { toast: { type: 'error', content: t('card.repo.manual_empty', undefined, locDs) } };
+      }
+      const validation = validateWorkingDir(rawPath, locDs);
+      if (!validation.ok) {
+        return { toast: { type: 'error', content: validation.error } };
+      }
+      // A worktree creation in flight holds the commit lock — a manual switch
+      // interleaving there would double-fork (same guard as the plain switch).
+      if (ds.worktreeCreating) {
+        return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locDs) } };
+      }
+      const selectedPath = validation.resolvedPath;
+      const displayName = pathBasename(selectedPath) || selectedPath;
+      await commitRepoSelection(
+        { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply },
+        selectedPath,
+        displayName,
+      );
+    }
+
+    if (actionType === 'worktree_toggle_mode' && ds) {
+      // Flip the persisted per-bot worktree picker mode (single ⇄ multi), then
+      // re-send a fresh repo card in the new mode — a form can't ride an
+      // in-place patch, so the old card is withdrawn and a new one posted.
+      const locDs = localeForBot(ds.larkAppId);
+      const spec = findConfigField('worktreeMultiPicker');
+      if (!spec) return;
+      const next = getBot(ds.larkAppId).config.worktreeMultiPicker !== true;
+      const r = await applyConfigField(ds.larkAppId, spec, next);
+      if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, locDs) } };
+      const projects = lastRepoScan.get(ds.chatId) ?? [];
+      // await so a rejected delete is caught here (not an unhandled rejection);
+      // a missing/already-gone card is fine — we post the fresh one regardless.
+      if (ds.repoCardMessageId && ds.larkAppId) { try { await deleteMessage(ds.larkAppId, ds.repoCardMessageId); } catch { /* card already gone */ } }
+      const newCard = buildRepoSelectCard(projects, getSessionWorkingDir(ds), rootId, locDs, next);
+      ds.repoCardMessageId = await sessionReply(rootId, newCard, 'interactive');
+      return { toast: { type: 'info', content: t(next ? 'card.repo.toast_worktree_mode_switched' : 'card.repo.toast_worktree_mode_switched_back', undefined, locDs) } };
+    }
+
+    if (actionType === 'repo_worktree_submit' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      const selectedPaths = stringListFromLarkMultiSelect(action?.form_value?.repo_worktree_paths);
+      if (selectedPaths.length === 0) {
+        return { toast: { type: 'error', content: t('card.repo.worktree_empty', undefined, locDs) } };
+      }
+      if (ds.worktreeCreating) {
+        return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locDs) } };
+      }
+      const branch = String(action?.form_value?.repo_worktree_branch ?? '').trim() || undefined;
+      const multiParent = selectedPaths.length > 1
+        ? multiWorktreeParentPath(selectedPaths, branch ?? await worktreeSlugFromContextAI(ds.session.title, ds.pendingPrompt) ?? 'worktree')
+        : undefined;
+      if (multiParent) {
+        const duplicateNames = duplicateMultiWorktreeChildNames(selectedPaths, lastRepoScan.get(ds.chatId));
+        if (duplicateNames.length > 0) {
+          return { toast: { type: 'error', content: t('card.repo.worktree_child_conflict', { names: duplicateNames.join(', ') }, locDs) } };
+        }
+      }
+      const rootIdForAction = rootId;
+      void handleCardAction({
+        ...data,
+        action: {
+          value: { key: 'repo_worktree', root_id: rootIdForAction, repo_worktree_paths_json: JSON.stringify(selectedPaths), ...(branch ? { branch } : {}), ...(multiParent ? { parent_path: multiParent } : {}) },
+          option: selectedPaths[0],
+        },
+      }, deps, larkAppId);
+      return { toast: { type: 'info', content: t('card.repo.toast_worktree_creating', undefined, locDs) } };
+    }
     return;
   }
 
@@ -1133,8 +1912,61 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     logger.warn('Card action received but no option or action value');
     return;
   }
+  if (Array.isArray(option)) {
+    logger.warn('Card action received multi options for a single-select handler');
+    return;
+  }
+  if (typeof option !== 'string') {
+    logger.warn('Card action received non-string option for a single-select handler');
+    return;
+  }
 
   // Handle adopt session selection
+  if (action?.value?.key === 'codex_app_thread_select' && option) {
+    const rootId = action?.value?.root_id;
+    if (!rootId) return;
+
+    const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
+    const ds = activeSessions.get(sKey);
+    if (!ds) return;
+
+    if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
+      logger.info(`codex_app_thread_select blocked for non-operator user: ${operatorOpenId} (chat=${ds.chatId})`);
+      return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(ds.larkAppId)) } };
+    }
+
+    let selected: { threadId: string };
+    try { selected = JSON.parse(option); } catch { return; }
+    if (!selected.threadId) return;
+
+    const botCfg = getBot(ds.larkAppId).config;
+    if (botCfg.cliId !== 'codex-app') return;
+
+    const { listCodexAppThreads } = await import('../../services/codex-app-threads.js');
+    let threads: Awaited<ReturnType<typeof listCodexAppThreads>>;
+    try {
+      threads = await listCodexAppThreads({
+        codexBin: botCfg.cliPathOverride,
+        cwd: getSessionWorkingDir(ds),
+        limit: 80,
+      });
+    } catch (err: any) {
+      await sessionReply(rootId, t('cmd.codex_app_adopt.list_failed', { error: err?.message ?? String(err) }, localeForBot(ds.larkAppId)));
+      return;
+    }
+    const target = threads.find(t => t.threadId === selected.threadId);
+    if (!target) {
+      await sessionReply(rootId, t('cmd.codex_app_adopt.thread_not_found', { threadId: selected.threadId }, localeForBot(ds.larkAppId)));
+      if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+      return;
+    }
+
+    const { startCodexAppThreadSession } = await import('../../core/command-handler.js');
+    await startCodexAppThreadSession(target, ds, { activeSessions, sessionReply: deps.sessionReply, getActiveCount: () => 0, lastRepoScan }, larkAppId);
+    if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+    return;
+  }
+
   if (action?.value?.key === 'adopt_select' && option) {
     const rootId = action?.value?.root_id;
     if (!rootId) return;
@@ -1149,15 +1981,39 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(ds.larkAppId)) } };
     }
 
-    // Parse selected session info
-    let selected: { tmuxTarget: string; cliPid: number };
+    // Parse selected session info (tmux/herdr: key; zellij: zellijSession+zellijPaneId)
+    let selected: { key?: string; source?: string; tmuxTarget?: string; zellijSession?: string; zellijPaneId?: string; cliPid?: number };
     try { selected = JSON.parse(option); } catch { return; }
 
-    // Re-discover to get full session info and validate
-    const { discoverAdoptableSessions } = await import('../../core/session-discovery.js');
-    const botCliId = getBot(ds.larkAppId).config.cliId;
-    const sessions = discoverAdoptableSessions(botCliId);
-    const target = sessions.find(s => s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid);
+    // Re-discover to get full session info and validate. Backend determines
+    // which discovery to run (re-confirms the pane + pid are still alive).
+    const botCfg = getBot(ds.larkAppId).config;
+    let target: Awaited<ReturnType<typeof resolveAdoptTarget>>;
+    async function resolveAdoptTarget() {
+      if (selected.zellijPaneId) {
+        const { discoverAdoptableZellijSessions } = await import('../../core/zellij-adopt-discovery.js');
+        // Match by (session, paneId) only — a paneId uniquely identifies the
+        // pane within a session, and the resolved CLI pid can legitimately
+        // differ from the card's snapshot (wrapper⇄native pid shift), so
+        // requiring an exact pid match would spuriously report 已退出. Use the
+        // freshly-discovered entry (with its current pid).
+        return discoverAdoptableZellijSessions(botCfg.cliId)
+          .find(s => s.zellijSession === selected.zellijSession && s.zellijPaneId === selected.zellijPaneId);
+      }
+      const { discoverAdoptableSessions, adoptTargetKey } = await import('../../core/session-discovery.js');
+      return discoverAdoptableSessions(botCfg.cliId)
+        .find(s => selected.key
+          ? adoptTargetKey(s) === selected.key
+          : s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid);
+    }
+    // Discovery scans a live process tree and can transiently miss a pane under
+    // load (a racing `ps` snapshot); retry a few times before giving up so a
+    // momentary miss doesn't surface as "目标 CLI 会话已退出".
+    target = await resolveAdoptTarget();
+    for (let attempt = 0; !target && attempt < 3; attempt++) {
+      await new Promise(r => setTimeout(r, 150));
+      target = await resolveAdoptTarget();
+    }
     if (!target) {
       await sessionReply(rootId, t('cmd.adopt.target_exited', undefined, localeForBot(ds.larkAppId)));
       if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
@@ -1171,10 +2027,48 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return;
   }
 
-  // Handle repo select card (option-based dropdown)
+  // Second adopt filter: resume a session discovered on disk (paseo-style
+  // import). Re-spawns the bot's CLI via `--resume <id>` in the recorded cwd.
+  if (action?.value?.key === 'adopt_resume_select' && option) {
+    const rootId = action?.value?.root_id;
+    if (!rootId) return;
+
+    const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
+    const ds = activeSessions.get(sKey);
+    if (!ds) return;
+
+    if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
+      logger.info(`adopt_resume_select blocked for non-operator user: ${operatorOpenId} (chat=${ds.chatId})`);
+      return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(ds.larkAppId)) } };
+    }
+
+    let selected: { cliSessionId?: string; cwd?: string };
+    try { selected = JSON.parse(option); } catch { return; }
+    if (!selected.cliSessionId) return;
+
+    // Re-discover from disk to validate the session still exists (and is not
+    // already live in another botmux session) before committing to the resume.
+    const botCfg = getBot(ds.larkAppId).config;
+    const { discoverResumableSessionsForBot, startResumeImportSession } = await import('../../core/command-handler.js');
+    const resumable = await discoverResumableSessionsForBot(botCfg.cliId, botCfg.cliPathOverride, activeSessions);
+    const target = resumable.find(r => r.cliSessionId === selected.cliSessionId);
+    if (!target) {
+      await sessionReply(rootId, t('cmd.adopt.resume_not_found', { id: selected.cliSessionId }, localeForBot(ds.larkAppId)));
+      if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+      return;
+    }
+
+    await startResumeImportSession(target, ds, { activeSessions, sessionReply: deps.sessionReply, getActiveCount: () => 0, lastRepoScan }, larkAppId);
+    if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+    return;
+  }
+
+  // Handle repo select card (option-based dropdowns: plain switch, or
+  // `repo_worktree` = create a worktree from the picked repo and open that).
+  const isWorktreeOpen = action?.value?.key === 'repo_worktree';
   const selectedPath = option;
   const rootId = action?.value?.root_id;
-  logger.info(`Card action: repo switch to ${selectedPath} (root_id: ${rootId})`);
+  logger.info(`Card action: repo ${isWorktreeOpen ? 'worktree-open' : 'switch'} to ${selectedPath} (root_id: ${rootId})`);
 
   if (!rootId) {
     logger.warn('Card action: no root_id in action value');
@@ -1202,86 +2096,137 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   const cached = lastRepoScan.get(targetDs.chatId);
   const project = cached?.find(p => p.path === selectedPath);
   const displayName = project ? `${project.name} (${project.branch})` : selectedPath;
-
-  targetDs.workingDir = selectedPath;
-  targetDs.session.workingDir = selectedPath;
-  sessionStore.updateSession(targetDs.session);
-
-  const locTarget = localeForBot(targetDs.larkAppId);
-  if (targetDs.pendingRepo) {
-    const selfBot = getBot(targetDs.larkAppId);
-    const botCfg = selfBot.config;
-    const effectiveCliId = sessionCliId(targetDs);
-    // First-time repo selection — now spawn CLI with the original prompt
-    targetDs.pendingRepo = false;
-    const pendingPrompt = targetDs.pendingPrompt ?? '';
-    const prompt = buildNewTopicPrompt(
-      pendingPrompt,
-      targetDs.session.sessionId,
-      effectiveCliId,
-      botCfg.cliPathOverride,
-      targetDs.pendingAttachments,
-      targetDs.pendingMentions,
-      await getAvailableBots(targetDs.larkAppId, targetDs.chatId),
-      targetDs.pendingFollowUps,
-      { name: selfBot.botName, openId: selfBot.botOpenId },
-      locTarget,
-      targetDs.pendingSender,
-      { larkAppId: targetDs.larkAppId, chatId: targetDs.chatId },
-    );
-    rememberLastCliInput(targetDs, pendingPrompt, prompt);
-    targetDs.pendingPrompt = undefined;
-    targetDs.pendingAttachments = undefined;
-    targetDs.pendingMentions = undefined;
-    targetDs.pendingSender = undefined;
-    targetDs.pendingFollowUps = undefined;
-    forkWorker(targetDs, prompt);
-    await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: displayName }, locTarget));
-    logger.info(`[${tag(targetDs)}] Repo selected: ${selectedPath}, spawning CLI`);
-  } else {
-    // Mid-session repo switch — close old session, start fresh.
-    killWorker(targetDs);
-    // Park the current card in `frozenCards` so the next POST under the new
-    // session sweeps it via recall. closeSession() wipes the on-disk
-    // frozen-cards file under the OLD sessionId, but the in-memory Map
-    // travels with `targetDs` into the new session and still carries the
-    // old messageId for deletion. If fork or POST fails, the parked card
-    // stays in the thread instead of vanishing prematurely.
-    parkStreamCard(targetDs);
-    sessionStore.closeSession(targetDs.session.sessionId);
-    const session = sessionStore.createSession(targetDs.chatId, rootId, displayName, targetDs.chatType);
-    targetDs.session = session;
-    targetDs.lastUserPrompt = undefined;
-    targetDs.lastCliInput = undefined;
-    // Pin workingDir + larkAppId onto the new session before forkWorker.
-    // Without this, a daemon restart restores the session with an empty
-    // workingDir and the worker spawns in the bot's default cwd, so
-    // `claude --resume` looks in the wrong .claude/projects/<hash>/ dir and
-    // exits code 0 immediately, crash-looping until the rate-limiter trips.
-    targetDs.session.workingDir = selectedPath;
-    targetDs.session.larkAppId = targetDs.larkAppId;
-    sessionStore.updateSession(targetDs.session);
-    targetDs.hasHistory = false;
-    // Re-persist the parked card under the NEW sessionId so a daemon crash
-    // before the next POST doesn't strand it. closeSession() above wiped
-    // the on-disk file under the OLD sessionId; without this re-save, the
-    // in-memory Map only survives in process memory.
-    if (targetDs.frozenCards && targetDs.frozenCards.size > 0) {
-      saveFrozenCards(targetDs.session.sessionId, targetDs.frozenCards);
+  let selectedWorktreePaths = [selectedPath];
+  if (isWorktreeOpen && typeof action?.value?.repo_worktree_paths_json === 'string') {
+    try {
+      selectedWorktreePaths = stringListFromLarkMultiSelect(JSON.parse(action.value.repo_worktree_paths_json));
+    } catch {
+      selectedWorktreePaths = [];
     }
-    // Drop the old turn's streaming-card reference so worker_ready POSTs a
-    // fresh card for the new session instead of PATCHing the previous one.
-    targetDs.streamCardId = undefined;
-    targetDs.streamCardNonce = undefined;
-    targetDs.streamCardPending = undefined;
-    targetDs.lastScreenContent = undefined;
-    targetDs.lastScreenStatus = undefined;
-    forkWorker(targetDs, '', false);
-    await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, locTarget));
-    logger.info(`[${tag(targetDs)}] Repo switched to ${selectedPath}, new session created`);
+    if (selectedWorktreePaths.length === 0) {
+      return { toast: { type: 'error', content: t('card.repo.worktree_empty', undefined, localeForBot(targetDs.larkAppId)) } };
+    }
   }
 
-  // Withdraw the repo selection card
-  if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
-  targetDs.repoCardMessageId = undefined;
+  const locTarget = localeForBot(targetDs.larkAppId);
+
+  // `/close` deletes the active-map entry without touching sessionId or
+  // pendingRepo — identity against the map is the only tell that the session
+  // this flow captured is gone. Checked alongside the generation snapshots.
+  const repoSessionKey = sessionKey(rootId, larkAppId!);
+  const sessionStillActive = () => activeSessions.get(repoSessionKey) === targetDs;
+
+  // Shared commit context for a resolved directory — funnels the dropdown,
+  // worktree and manual-entry flows through the same module-level
+  // commitRepoSelection (pin dir, then fork pending CLI or close+recreate).
+  const commitCtx = { ds: targetDs, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply };
+
+  if (isWorktreeOpen) {
+    // Worktree creation involves a `git fetch` that can take many seconds —
+    // ack the card action immediately with a toast and finish asynchronously.
+    // On failure the card (and pendingRepo state) stays put so the user can
+    // pick again or fall back to a plain switch.
+    if (targetDs.worktreeCreating) {
+      // The async path escapes the card-action in-flight dedup — gate repeats
+      // here, or two creations would race and the loser's commitSelection
+      // would yank the session the winner just spawned.
+      return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locTarget) } };
+    }
+    const parentPath = action?.value?.parent_path;
+    if (selectedWorktreePaths.length > 1 && parentPath) {
+      const duplicateNames = duplicateMultiWorktreeChildNames(selectedWorktreePaths, cached);
+      if (duplicateNames.length > 0) {
+        return { toast: { type: 'error', content: t('card.repo.worktree_child_conflict', { names: duplicateNames.join(', ') }, locTarget) } };
+      }
+    }
+    targetDs.worktreeCreating = true;
+    // Session generation snapshot: if another selection lands while git runs
+    // (pendingRepo consumed, or the session swapped), committing this worktree
+    // afterwards would kill that fresh session — notify instead of switching.
+    const startSessionId = targetDs.session.sessionId;
+    const wasPending = !!targetDs.pendingRepo;
+    const sessionChanged = () =>
+      !sessionStillActive() ||
+      targetDs.session.sessionId !== startSessionId ||
+      !!targetDs.pendingRepo !== wasPending;
+    const notSwitched = async (creation: { path: string; branch: string }, when: string) => {
+      logger.info(`[${tag(targetDs)}] Worktree ${creation.path} created but session changed ${when} — not switching`);
+      await sessionReply(rootId, t('cmd.repo.worktree_created_not_switched', { path: creation.path, branch: creation.branch }, locTarget));
+    };
+    void (async () => {
+      try {
+        let creation;
+        // Track each successful (sourceRepo → created worktree) so a later repo's
+        // failure in a multi-repo batch can roll the earlier ones back instead of
+        // leaking orphaned worktree dirs/branches.
+        const created: Array<{ repo: string; result: { path: string; branch: string; baseRef: string } }> = [];
+        try {
+          const branch = action?.value?.branch?.trim() || undefined;
+          const slug = branch ? undefined : await worktreeSlugFromContextAI(targetDs.session.title, targetDs.pendingPrompt);
+          for (const repoPath of selectedWorktreePaths) {
+            const result = await createRepoWorktree(repoPath, {
+              branch,
+              slug,
+              worktreePath: selectedWorktreePaths.length > 1 && parentPath
+                ? join(parentPath, worktreeChildNameForRepo(repoPath, cached))
+                : undefined,
+            });
+            created.push({ repo: repoPath, result });
+          }
+          creation = selectedWorktreePaths.length > 1 && parentPath
+            ? {
+                path: parentPath,
+                branch: branch ?? created.map(c => c.result.branch).join(', '),
+                baseRef: Array.from(new Set(created.map(c => c.result.baseRef))).join(', '),
+              }
+            : created[0]!.result;
+        } catch (e) {
+          // The repo that threw is the one right after the last success.
+          const failedRepo = selectedWorktreePaths[created.length] ?? selectedPath;
+          const errMsg = e instanceof Error ? e.message : String(e);
+          logger.warn(`[${tag(targetDs)}] Worktree creation failed for ${failedRepo}: ${errMsg}`);
+          let rolledBack = 0;
+          for (const c of created) {
+            try { await removeRepoWorktree(c.repo, c.result.path); rolledBack++; }
+            catch (re) { logger.warn(`[${tag(targetDs)}] rollback of ${c.result.path} failed: ${re instanceof Error ? re.message : re}`); }
+          }
+          await sessionReply(rootId, rolledBack > 0
+            ? t('card.repo.worktree_rolled_back', { repo: pathBasename(failedRepo), error: errMsg, count: rolledBack }, locTarget)
+            : t('cmd.repo.worktree_failed', { error: errMsg }, locTarget));
+          return;
+        }
+        if (sessionChanged()) return notSwitched(creation, 'mid-flight');
+        await sessionReply(rootId, t('cmd.repo.worktree_created', {
+          path: creation.path, branch: creation.branch, base: creation.baseRef,
+        }, locTarget));
+        // The reply above awaited a Lark round-trip — a plain switch (which is
+        // NOT gated by worktreeCreating) can land in that window. Re-check
+        // right before committing, or we'd kill the session it just spawned.
+        if (sessionChanged()) return notSwitched(creation, 'during reply');
+        try {
+          // The "worktree 已创建：…" notice above already confirms the switch —
+          // suppress commitRepoSelection's own "已选择/已切换" to avoid a dup.
+          await commitRepoSelection(commitCtx, creation.path, `${pathBasename(creation.path)} (${creation.branch})`, { suppressConfirmReply: true });
+        } catch (e) {
+          // The worktree DOES exist at this point — only the switch failed.
+          // Don't report it as a creation failure, or the user retries and
+          // trips over "worktree target already exists".
+          logger.warn(`[${tag(targetDs)}] Worktree ${creation.path} created but switching failed: ${e instanceof Error ? e.message : e}`);
+          await sessionReply(rootId, t('cmd.repo.worktree_switch_failed', { path: creation.path, error: e instanceof Error ? e.message : String(e) }, locTarget));
+        }
+      } finally {
+        targetDs.worktreeCreating = false;
+      }
+    })();
+    return { toast: { type: 'info', content: t('card.repo.toast_worktree_creating', undefined, locTarget) } };
+  }
+
+  // Plain switch — blocked while a worktree creation/commit is in flight. The
+  // worktree commit awaits (Lark replies, prompt prep) after its generation
+  // checks; a plain selection interleaving there would double-fork. One lock
+  // gates both kinds until the commit settles.
+  if (targetDs.worktreeCreating) {
+    return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locTarget) } };
+  }
+  await commitRepoSelection(commitCtx, selectedPath, displayName);
 }

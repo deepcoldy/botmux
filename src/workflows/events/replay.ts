@@ -222,6 +222,7 @@ export type RunState = {
       cliId?: string;
       displayName?: string;
       workingDir?: string;
+      cliPathOverride?: string;
     }
   >;
 };

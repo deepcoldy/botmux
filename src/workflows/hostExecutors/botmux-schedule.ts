@@ -26,7 +26,7 @@ export type ScheduleInput = {
    *  and must not be part of canonical input.  See schedule-store
    *  canonicalScheduleInput. */
   repeat?: { times: number | null };
-  deliver?: 'origin' | 'local';
+  deliver?: 'origin' | 'local' | 'new-topic';
 };
 
 export type ScheduleOutput = {
@@ -52,7 +52,7 @@ const ScheduleInputSchema = z.object({
   scope: z.enum(['thread', 'chat']).optional(),
   larkAppId: z.string().optional(),
   repeat: z.object({ times: z.number().int().nonnegative().nullable() }).optional(),
-  deliver: z.enum(['origin', 'local']).optional(),
+  deliver: z.enum(['origin', 'local', 'new-topic']).optional(),
 });
 
 export function parseScheduleInput(input: unknown): ScheduleInput {

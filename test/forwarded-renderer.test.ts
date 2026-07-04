@@ -20,10 +20,11 @@ describe('renderForwardedXml: single layer, single sender', () => {
       { senderOpenId: 'ou_alice', senderType: 'user', content: 'third' },
     ];
     const out = renderForwardedXml(nodes);
-    expect(out).toContain('<participants>\n  <p id="A" open_id="ou_alice" type="user" />\n</participants>');
-    expect(out).toContain('<msg from="A">first</msg>');
-    expect(out).toContain('<msg from="A">second</msg>');
-    expect(out).toContain('<msg from="A">third</msg>');
+    expect(out).toContain('  <participants>\n    <p id="A" open_id="ou_alice" type="user" />\n  </participants>');
+    // Top-level messages indent two spaces under <forwarded_messages>.
+    expect(out).toContain('\n  <msg from="A">first</msg>');
+    expect(out).toContain('\n  <msg from="A">second</msg>');
+    expect(out).toContain('\n  <msg from="A">third</msg>');
     // Only ONE participant entry despite three messages.
     expect(out.match(/<p id=/g)?.length).toBe(1);
   });
@@ -84,11 +85,12 @@ describe('renderForwardedXml: nested merge_forward', () => {
     expect(out).toContain('<p id="A" open_id="ou_outer" type="user" />');
     expect(out).toContain('<p id="B" open_id="ou_inner1" type="user" />');
     expect(out).toContain('<p id="C" open_id="ou_inner2" type="user" />');
-    // Outer wrapper carries type="merged_forward" and inner messages indent.
-    expect(out).toContain('<msg from="A" type="merged_forward">');
-    expect(out).toContain('  <msg from="B">msg1</msg>');
-    expect(out).toContain('  <msg from="C">msg2</msg>');
-    expect(out).toContain('  <msg from="B">msg3</msg>');
+    // Outer wrapper indents 2 under <forwarded_messages>; inner messages indent
+    // a further 2 (4 total).
+    expect(out).toContain('  <msg from="A" type="merged_forward">');
+    expect(out).toContain('    <msg from="B">msg1</msg>');
+    expect(out).toContain('    <msg from="C">msg2</msg>');
+    expect(out).toContain('    <msg from="B">msg3</msg>');
     expect(out).toContain('</msg>'); // closing tag for the merged_forward
   });
 });
@@ -116,7 +118,9 @@ describe('renderForwardedXml: multiline content', () => {
       { senderOpenId: 'ou_a', senderType: 'user', content: 'line1\nline2\nline3' },
     ];
     const out = renderForwardedXml(nodes);
-    expect(out).toContain('<msg from="A">\n  line1\n  line2\n  line3\n</msg>');
+    // <msg> indents 2 under <forwarded_messages>; its content lines indent a
+    // further 2 (4 total), closing tag back at 2.
+    expect(out).toContain('  <msg from="A">\n    line1\n    line2\n    line3\n  </msg>');
   });
 });
 

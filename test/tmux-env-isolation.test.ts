@@ -18,6 +18,9 @@
  */
 import { describe, it, expect } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { tmuxEnv, probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 
 describe('tmuxEnv()', () => {
@@ -143,6 +146,30 @@ describe('tmux subcommand with stale $TMUX', () => {
       } finally {
         if (before === undefined) delete process.env.TMUX;
         else process.env.TMUX = before;
+      }
+    },
+  );
+
+  it.skipIf(!tmuxAvailable)(
+    'probeTmuxFunctional() removes its disposable probe socket',
+    () => {
+      const beforeTmpdir = process.env.TMUX_TMPDIR;
+      const probeTmpdir = mkdtempSync(join(tmpdir(), 'botmux-tmux-probe-'));
+      process.env.TMUX_TMPDIR = probeTmpdir;
+
+      try {
+        const result = probeTmuxFunctional();
+        if (!result.ok) return;
+
+        const socketDir = join(probeTmpdir, `tmux-${process.getuid?.() ?? 0}`);
+        const probeSockets = readdirSync(socketDir, { withFileTypes: true })
+          .filter(entry => entry.name.startsWith('bmx-probe-'))
+          .map(entry => entry.name);
+        expect(probeSockets).toEqual([]);
+      } finally {
+        if (beforeTmpdir === undefined) delete process.env.TMUX_TMPDIR;
+        else process.env.TMUX_TMPDIR = beforeTmpdir;
+        rmSync(probeTmpdir, { recursive: true, force: true });
       }
     },
   );

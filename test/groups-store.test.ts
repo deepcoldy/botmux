@@ -34,6 +34,7 @@ vi.mock('../src/bot-registry.js', () => ({
                 description: 'first chat',
                 chat_mode: 'group',
                 owner_id: 'ou_owner',
+                avatar: 'https://avatar.example/c1.png',
               },
             ],
             has_more: false,
@@ -77,6 +78,7 @@ describe('groups-store wrappers', () => {
     expect(out[0].description).toBe('first chat');
     expect(out[0].chatMode).toBe('group');
     expect(out[0].ownerId).toBe('ou_owner');
+    expect(out[0].avatar).toBe('https://avatar.example/c1.png');
   });
 
   it('isInChat returns boolean', async () => {

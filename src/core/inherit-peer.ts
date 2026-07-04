@@ -17,7 +17,11 @@
  *   topic is "isolate the context", and silently inheriting overrides it.
  *   See docs/superpowers/specs/2026-05-10-force-topic-mode-design.md.
  */
+import { statSync } from 'node:fs';
+import { resolve } from 'node:path';
 import * as sessionStore from '../services/session-store.js';
+import { logger } from '../utils/logger.js';
+import { expandHomePath } from '../utils/working-dir.js';
 
 export interface InheritOptions {
   scope: 'thread' | 'chat';
@@ -25,6 +29,11 @@ export interface InheritOptions {
   chatId: string;
   chatType: 'group' | 'p2p';
   selfAppId: string;
+  /** Per-bot gate on the RECEIVING (self) bot: when false, this bot never
+   *  inherits a sibling bot's workingDir — it falls through to its own repo
+   *  card / default instead. Default true (undefined = on). Surfaced in the
+   *  dashboard as "bot@bot 同目录拉起". */
+  botToBotSameDir?: boolean;
 }
 
 export interface InheritedPeer {
@@ -33,14 +42,34 @@ export interface InheritedPeer {
   workingDir: string;
 }
 
+function resolvePeerWorkingDir(workingDir: string): string {
+  return resolve(expandHomePath(workingDir));
+}
+
+function isValidPeerWorkingDir(workingDir: string): boolean {
+  try {
+    return statSync(resolvePeerWorkingDir(workingDir)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 export function findInheritablePeer(opts: InheritOptions): InheritedPeer | null {
   const { scope, anchor, chatId, selfAppId } = opts;
+  // Receiving bot opted out of cross-bot same-dir inheritance → never inherit.
+  if (opts.botToBotSameDir === false) return null;
   const sameAnchorPeers = scope === 'thread'
     ? sessionStore.findActiveSessionsByRoot(anchor)
     : sessionStore.findActiveChatScopeSessionsByChat(chatId);
-  const peer = sameAnchorPeers.find(p => p.larkAppId !== selfAppId && !!p.workingDir);
-  if (peer && peer.workingDir) {
-    return { sessionId: peer.sessionId, larkAppId: peer.larkAppId, workingDir: peer.workingDir };
+  for (const peer of sameAnchorPeers) {
+    if (peer.larkAppId === selfAppId || !peer.workingDir) continue;
+    if (isValidPeerWorkingDir(peer.workingDir)) {
+      return { sessionId: peer.sessionId, larkAppId: peer.larkAppId, workingDir: peer.workingDir };
+    }
+    logger.warn(
+      `[inherit-peer] ignored inherited peer workingDir from session ${peer.sessionId.substring(0, 8)} ` +
+      `(app=${peer.larkAppId ?? 'unknown'}): ${resolvePeerWorkingDir(peer.workingDir)} is missing or not a directory`,
+    );
   }
   return null;
 }

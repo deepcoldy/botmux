@@ -1,9 +1,13 @@
 export interface PtyHandle {
   write(data: string): void;
-  /** Send text literally via tmux send-keys -l (tmux mode only). */
-  sendText?(text: string): void;
-  /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only). */
-  sendSpecialKeys?(...keys: string[]): void;
+  /** Send text literally via tmux send-keys -l (tmux mode only).
+   *  Returns `false` when the write was dropped (e.g. send-keys failed while the
+   *  pane is still alive) so callers can surface a non-submission; `void`/`true`
+   *  means the write was issued. Backends that can't tell return void. */
+  sendText?(text: string): void | boolean;
+  /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
+   *  Returns `false` on a dropped write (see sendText). */
+  sendSpecialKeys?(...keys: string[]): void | boolean;
   /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it). */
   pasteText?(text: string): void;
   /** Absolute path to Claude Code's session JSONL; set by worker for claude-code adapter.
@@ -17,6 +21,34 @@ export interface PtyHandle {
   /** Working directory the CLI was spawned in; cross-checked against the pid file's
    *  cwd field to reject pid reuse / unrelated processes. */
   cliCwd?: string;
+}
+
+export type SubmitRecheckResult = boolean | {
+  submitted: boolean;
+  cliSessionId?: string;
+};
+
+/** A session discovered on disk that botmux can resume (import) into a topic —
+ *  surfaced by `/adopt`'s second filter. Unlike an AdoptableSession (a live
+ *  tmux/zellij pane botmux *observes*), this is a stored transcript botmux
+ *  re-spawns via `<cli> --resume <cliSessionId>` in `cwd`; the original CLI need
+ *  not be running. */
+export interface ResumableSession {
+  /** CLI-native session id passed to `--resume` (jsonl basename / rollout
+   *  session_meta id / antigravity conversationId). */
+  cliSessionId: string;
+  /** Working directory the session ran in — where botmux re-spawns the CLI. */
+  cwd: string;
+  /** Human title (first real user prompt, truncated). */
+  title: string;
+  /** Epoch ms of last activity (transcript mtime / last submit), for sort + display. */
+  lastActivityAt: number;
+}
+
+export interface SkillDeliveryCapability {
+  readonly nativeKind: 'claude-plugin' | 'skill-root';
+  readonly supportsScopedSession: boolean;
+  readonly supportsExclusive: boolean;
 }
 
 export interface CliAdapter {
@@ -47,11 +79,23 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
+    /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
+    disableCliBypass?: boolean;
+    /** Optional session-scoped skill plugin/root prepared by botmux. */
+    skillPluginDir?: string;
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
    *  The worker skips queuing the prompt for stdin write. */
   readonly passesInitialPromptViaArgs?: boolean;
+
+  /** Only meaningful with passesInitialPromptViaArgs. When true, the CLI
+   *  silently drops its initial-prompt launch flag on a RESUME spawn (e.g.
+   *  OpenCode applies `--prompt` to new sessions only and ignores it with
+   *  `-s <id>`), so the worker routes the initial prompt through the normal
+   *  input queue instead of baking it into args — otherwise the message that
+   *  triggered the resume would be lost. */
+  readonly initialPromptArgsIgnoredOnResume?: boolean;
 
   /** Build a shell command string the user can paste into a terminal to
    *  resume this CLI session locally — independent of botmux. Used by the
@@ -59,9 +103,9 @@ export interface CliAdapter {
    *  conversation outside the bot.
    *
    *  Returns `null` when the CLI doesn't support precise per-session resume
-   *  from CLI args (e.g. opencode, gemini's "latest only" mode), or when
-   *  the CLI-native session id can't be resolved (e.g. codex history file
-   *  is missing). The card falls back to a static note in those cases.
+   *  from CLI args (e.g. gemini's "latest only" mode), or when the CLI-native
+   *  session id can't be resolved (e.g. codex history file is missing).
+   *  The card falls back to a static note in those cases.
    *
    *  Implementations should print the *default* binary name (`claude`,
    *  `codex`, etc.) rather than `cliPathOverride` — the override is a
@@ -97,7 +141,7 @@ export interface CliAdapter {
      *  without waiting for transcript confirmation (for example an unsupported
      *  terminal keybinding). Worker surfaces this immediately. */
     failureReason?: string;
-    recheck?: () => boolean | Promise<boolean>;
+    recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;
 
   /** Optional: absolute path (with ~ expansion handled by caller) to the CLI's
@@ -115,6 +159,11 @@ export interface CliAdapter {
    *  (and mis-fire) them. Mutually exclusive with `skillsDir`. */
   readonly pluginDir?: string;
 
+  /** Optional native skill delivery support for user/team custom skills.
+   *  This is separate from `skillsDir`/`pluginDir`, which are still used by
+   *  botmux-owned built-in bridge skills. */
+  readonly skillDelivery?: SkillDeliveryCapability;
+
   /** hook 安装描述：spawn 时写入各 CLI 的 hook 配置，使 askUserQuestion 事件转发到
    *  `botmux hook <cliId>`。undefined = 不通过 hook 接管 askUserQuestion。 */
   readonly hookInstall?: {
@@ -122,14 +171,33 @@ export interface CliAdapter {
     readonly configPath: string;
     /** 写入格式：决定 installer 如何合并进既有配置。 */
     readonly format: 'claude-settings' | 'opencode-plugin';
+    /** 可选（仅 claude-settings）：同时把 SessionStart「真就绪」hook 命令写进**全局**
+     *  settings.json。进程级 --settings 也带一份（见 buildArgs），二者幂等（worker 的
+     *  session_ready 处理对重复触发 no-op）。装全局是为了 wrapperCli=`aiden x claude`
+     *  这类会剥掉 --settings 的启动器——它们拿不到进程级 hook，只能靠全局这条拿就绪信号，
+     *  否则首条 prompt 会空等 45s 超时。命令缺 BOTMUX_* env 时静默 exit 0，不扰独立 claude。 */
+    readonly sessionStartCommand?: string;
   };
 
   /** true = 该 CLI 通过 hook 接管 askUserQuestion（不再装 botmux-ask skill 兜底）。
-   *  注入机制由各 adapter 自行决定（Claude 走 --settings、OpenCode 走插件）。 */
+   *  注入机制由各 adapter 自行决定（Claude 走 --settings、OpenCode 走插件、
+   *  CoCo 走 ensureAskHook 装插件）。 */
   readonly asksViaHook?: boolean;
+
+  /** 命令式 hook 安装钩子：适用于无法靠纯写文件完成、需要 spawn CLI 子命令的场景
+   *  （CoCo 需要 `coco plugin install`）。声明式写文件的 CLI 用 `hookInstall`；本方法
+   *  与 `hookInstall` 互斥。每个 daemon 生命周期由 ensureCliSkills 调用一次。
+   *  实现内部自行 try/catch，失败只 warn 不抛。 */
+  ensureAskHook?(): void;
 
   /** Completion marker regex (beyond generic quiescence). undefined = quiescence only. */
   readonly completionPattern?: RegExp;
+
+  /** Busy marker regex — matches when the CLI is explicitly rendering a
+   *  still-running state. Used for re-attached persistent sessions where there
+   *  may be no new PTY output: if the current screen does NOT match this marker,
+   *  the worker may safely let quiescence mark the session idle. */
+  readonly busyPattern?: RegExp;
 
   /** Ready marker regex — matches when the CLI's input prompt is rendered and
    *  functional.  When set, the idle detector suppresses quiescence-based idle
@@ -138,6 +206,15 @@ export interface CliAdapter {
    *
    *  Examples: CoCo `⏵⏵` status bar, Codex `›` prompt indicator. */
   readonly readyPattern?: RegExp;
+
+  /** Claude-family CLIs only. When true, the adapter injects a `SessionStart`
+   *  hook at spawn (process-level `--settings`) that calls `botmux session-ready`
+   *  once the CLI's input box is genuinely rendered. The worker arms a ready-gate
+   *  on this flag and holds the FIRST prompt until the signal arrives (or a
+   *  fallback timeout), so a startup launcher's selector `❯` — which falsely
+   *  matches `readyPattern` — can't trip an early flush that the selector eats.
+   *  undefined/false → no gate (every other CLI behaves exactly as before). */
+  readonly injectsReadyHook?: boolean;
 
   /** CLI-specific system hints injected into the initial prompt.
    *  e.g. "use Read tool for attachments", "don't use PlanMode" */
@@ -160,6 +237,18 @@ export interface CliAdapter {
    *  correct for both shapes. */
   readonly supportsTypeAhead?: boolean;
 
+  /** When true, the worker's soft first-prompt timeout keeps queued input held
+   *  until this adapter's `readyPattern` appears. Use only for CLIs whose startup
+   *  screens can accept and swallow stdin before the real composer exists; the
+   *  worker still enforces a longer hard timeout so the first prompt cannot hang
+   *  forever if the ready marker changes or the CLI stalls. */
+  readonly deferFirstPromptTimeoutUntilReady?: boolean;
+
+  /** When true, worker may squash additional queued Lark messages into the
+   *  pending tail instead of preserving one botmux turn per queued message.
+   *  Keep this opt-in: most adapters rely on distinct turnId / card routing. */
+  readonly mergeQueuedInput?: boolean;
+
   /** Whether CLI uses alternate screen buffer */
   readonly altScreen: boolean;
 
@@ -169,6 +258,107 @@ export interface CliAdapter {
    *  presented as-is; the setup prompt always appends an "Other / custom"
    *  free-text option, so this list is curation, not a hard whitelist. */
   readonly modelChoices?: readonly string[];
+
+  /** Claude-family CLIs only (claude-code, seed). The data root holding
+   *  `projects/<hash>/<id>.jsonl`, `sessions/<pid>.json`, `tasks/`,
+   *  `keybindings.json` and `settings.json`. When set, the worker drives the
+   *  JSONL submit-confirmation, bridge fallback and pid resolution against this
+   *  dir (instead of hardcoding `~/.claude`). undefined → not Claude-family. */
+  readonly claudeDataDir?: string;
+
+  /** Claude-family CLIs only. Path to the `.claude.json` folder-trust / state
+   *  file (pre-accepted at spawn so a fresh workingDir doesn't block on the
+   *  interactive trust dialog). `~/.claude.json` for Claude Code; inside the
+   *  data root for forks that set CLAUDE_CONFIG_DIR. */
+  readonly claudeStateJsonPath?: string;
+
+  /** Paths (files or dirs) holding THIS CLI's auth / login state that must stay
+   *  REAL + writable inside the file sandbox. The sandbox isolates writes (so the
+   *  agent's project edits are reviewable), but a CLI's token refresh / login
+   *  must PERSIST to the real auth — otherwise the sandboxed CLI loses its login
+   *  (see seed's `bytecloud-auth`). The sandbox binds each existing path rw over
+   *  the isolated overlay so auth reads/refreshes/logins hit the real files.
+   *  `~` is expanded. Default to NARROW (auth only) so session history stays
+   *  isolated — but widen to the CLI's whole state dir when it keeps SQLite DBs
+   *  there (e.g. codex): the overlayfs home lacks the POSIX fcntl locks SQLite
+   *  needs, so a narrow carve-out leaves the CLI unable to start.
+   *  undefined / empty → no carve-out. */
+  readonly authPaths?: readonly string[];
+
+  /** Absolute paths of ADDITIONAL executables this adapter spawns as a SECOND
+   *  stage INSIDE the file sandbox, beyond `resolvedBin` (the bwrap target). The
+   *  sandbox masks `/run` with a fresh tmpfs; any such binary living under
+   *  `/run/...` (fnm/nvm/volta bin symlink farms) would then vanish and crash-loop
+   *  the CLI, so the sandbox re-exposes their containing dirs read-only.
+   *
+   *  Most adapters omit this — their `resolvedBin` IS the binary that runs. It is
+   *  for adapters whose `resolvedBin` is a launcher: codex-app's `resolvedBin` is
+   *  node running the runner, while the REAL `codex` (spawned later for the
+   *  app-server) is the one that must survive `--tmpfs /run`.
+   *
+   *  Return ONLY executable paths — never plain path args like the working dir,
+   *  whose parent dir re-bind would shadow the project overlay and widen exposure.
+   *  Resolved lazily / read AFTER buildArgs() (so a lazily-resolved bin is cached).
+   *  Missing/empty → no extra re-expose. */
+  sandboxExtraExecPaths?(): readonly string[];
+
+  /** Extra env merged into the spawned child's environment. Used by Claude-family
+   *  forks to point the CLI at its data root (e.g. Seed's `CLAUDE_CONFIG_DIR`).
+   *  Keys placed here are also forwarded through the tmux backend (see
+   *  BOTMUX_INJECTED_ENV_KEYS). undefined → inherit the worker env unchanged. */
+  readonly spawnEnv?: Readonly<Record<string, string>>;
+
+  /** Optional: pre-flight check for resume targets.
+   *
+   *  Called with `resume=true` before spawn so a missing conversation JSONL /
+   *  rollout / DB entry does not produce a CLI-level "No conversation found"
+   *  exit code 1 — which would otherwise be amplified into an auto-restart
+   *  crash loop by the daemon's claude_exit handler.
+   *
+   *  Return `true` = resume target looks present (spawn normally with --resume).
+   *  Return `false` = target is provably missing → worker will fall back to a
+   *  FRESH session (resume=false, drop cliSessionId, log + user_notify once).
+   *  Return `undefined` / omit = adapter cannot tell cheaply → rely on the
+   *  worker's SECONDARY guard (2nd restart forces fresh) so unknown-shape CLIs
+   *  still degrade without crash-looping.
+   *
+   *  Must be synchronous, cheap, and conservative. An adapter that can verify
+   *  the resume target without spawning a subprocess implements this; others
+   *  simply leave it undefined (the secondary guard is always active). */
+  checkResumeTargetExists?(opts: {
+    sessionId: string;
+    /** CLI-native session id from session.cliSessionId, when available. */
+    cliSessionId?: string;
+    /** Working directory the CLI will spawn in. Used by Claude-family to
+     *  locate <projects>/<cwdHash>/<id>.jsonl. */
+    workingDir?: string;
+    /** Claude-family data dir (~/.claude, ~/.claude-runtime, …) so the probe
+     *  targets the SAME root the adapter will actually write into. */
+    dataDir?: string;
+  }): boolean | undefined;
+
+  /** Optional: discover sessions resumable from this CLI's on-disk transcript
+   *  store (powers `/adopt`'s second filter — paseo-style import). Daemon-side,
+   *  pure filesystem (no PTY / subprocess), most-recent first, capped to `limit`.
+   *  undefined = this CLI has no discoverable per-session store (resume only via
+   *  botmux's own id, an opaque store, or no per-session resume at all). */
+  listResumableSessions?(opts: {
+    limit: number;
+    /** CLI-native session ids to skip (sessions botmux already runs live). Applied
+     *  BEFORE truncating to `limit` — and, where the id is the on-disk filename
+     *  (claude-family), before parsing — so a host with many live sessions still
+     *  surfaces `limit` resumable ones instead of being starved by exclusion. */
+    exclude?: ReadonlySet<string>;
+  }): Promise<ResumableSession[]>;
+
+  /** Optional CLI version command override. Defaults to `[resolvedBin, '--version']`. */
+  versionCommand?(): { bin: string; args: string[] };
+
+  /** Slash commands this CLI natively supports and botmux should pass through
+   *  by default for this adapter. Unlike the global passthrough allowlist, these
+   *  are scoped to the current CLI so unsupported commands do not leak to other
+   *  adapters. */
+  readonly defaultPassthroughCommands?: readonly string[];
 }
 
-export type CliId = 'claude-code' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'kimi';

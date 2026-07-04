@@ -142,3 +142,83 @@ describe('grant-store', () => {
   });
 
 });
+
+describe('grant-store message quota', () => {
+  it('addChatGrant with quota writes a scope-aware quotaState record (disk + memory)', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { registry, store } = await freshModules();
+    await store.addChatGrant('a1', 'oc_1', 'ou_g', 5);
+    expect(readConfig().quotaState).toEqual({ 'chat:oc_1:ou_g': { limit: 5, used: 0 } });
+    expect(registry.getBot('a1').config.quotaState).toEqual({ 'chat:oc_1:ou_g': { limit: 5, used: 0 } });
+  });
+
+  it('re-granting with a new quota resets used to 0 (refill); without quota deletes the record', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { store } = await freshModules();
+    await store.addChatGrant('a1', 'oc_1', 'ou_g', 5);
+    await store.consumeQuota('a1', 'chat:oc_1:ou_g');
+    await store.consumeQuota('a1', 'chat:oc_1:ou_g');
+    expect(readConfig().quotaState['chat:oc_1:ou_g'].used).toBe(2);
+    await store.addChatGrant('a1', 'oc_1', 'ou_g', 3); // refill
+    expect(readConfig().quotaState['chat:oc_1:ou_g']).toEqual({ limit: 3, used: 0 });
+    await store.addChatGrant('a1', 'oc_1', 'ou_g'); // no quota → unlimited (record gone)
+    expect(readConfig().quotaState).toBeUndefined();
+  });
+
+  it('addGlobalGrant with quota uses the global key', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { store } = await freshModules();
+    await store.addGlobalGrant('a1', 'ou_g', 7);
+    expect(readConfig().quotaState).toEqual({ 'global:ou_g': { limit: 7, used: 0 } });
+  });
+
+  it('consumeQuota: tracked=false when no record; increments; exhausted on last; allow=false past limit', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { store } = await freshModules();
+    expect(await store.consumeQuota('a1', 'chat:oc_1:ou_none')).toMatchObject({ tracked: false, allow: true });
+    await store.addChatGrant('a1', 'oc_1', 'ou_g', 2);
+    expect(await store.consumeQuota('a1', 'chat:oc_1:ou_g')).toMatchObject({ tracked: true, allow: true, exhausted: false, used: 1, limit: 2 });
+    expect(await store.consumeQuota('a1', 'chat:oc_1:ou_g')).toMatchObject({ tracked: true, allow: true, exhausted: true, used: 2, limit: 2 });
+    // already at/over limit → allow:false (block + heal)
+    expect(await store.consumeQuota('a1', 'chat:oc_1:ou_g')).toMatchObject({ tracked: true, allow: false });
+  });
+
+  it('removeChatGrant clears only the chat grant + its quota key, leaves global intact', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'], chatGrants: { oc_1: ['ou_g'] }, globalGrants: ['ou_g'],
+      quotaState: { 'chat:oc_1:ou_g': { limit: 5, used: 1 }, 'global:ou_g': { limit: 9, used: 2 } } });
+    const { registry, store } = await freshModules();
+    const r = await store.removeChatGrant('a1', 'oc_1', 'ou_g');
+    expect(r).toEqual({ ok: true, removed: true });
+    const disk = readConfig();
+    expect(disk.chatGrants).toEqual({});
+    expect(disk.globalGrants).toEqual(['ou_g']);       // global untouched
+    expect(disk.quotaState).toEqual({ 'global:ou_g': { limit: 9, used: 2 } });
+    expect(registry.getBot('a1').config.quotaState).toEqual({ 'global:ou_g': { limit: 9, used: 2 } });
+  });
+
+  it('removeGlobalGrant clears only the global grant + its quota key', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'], globalGrants: ['ou_g', 'ou_other'],
+      quotaState: { 'global:ou_g': { limit: 9, used: 2 } } });
+    const { store } = await freshModules();
+    const r = await store.removeGlobalGrant('a1', 'ou_g');
+    expect(r).toEqual({ ok: true, removed: true });
+    expect(readConfig().globalGrants).toEqual(['ou_other']);
+    expect(readConfig().quotaState).toBeUndefined();
+  });
+
+  it('manual revokeGrant also clears both scope quota keys for the target', async () => {
+    writeConfig({ allowedUsers: ['ou_owner', 'ou_g'], chatGrants: { oc_1: ['ou_g'] }, globalGrants: ['ou_g'],
+      quotaState: { 'chat:oc_1:ou_g': { limit: 5, used: 1 }, 'global:ou_g': { limit: 9, used: 2 } } });
+    const { store } = await freshModules();
+    const r = await store.revokeGrant('a1', 'oc_1', 'ou_g');
+    expect(r.ok).toBe(true);
+    expect(readConfig().quotaState).toBeUndefined();
+  });
+
+  it('exposes scope-aware key builders', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { store } = await freshModules();
+    expect(store.chatQuotaKey('oc_1', 'ou_g')).toBe('chat:oc_1:ou_g');
+    expect(store.globalQuotaKey('ou_g')).toBe('global:ou_g');
+  });
+});

@@ -12,8 +12,12 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
+const updateMessageMock = vi.fn(async () => {});
+const addReactionMock = vi.fn(async () => 'reaction_id');
 vi.mock('../src/im/lark/client.js', () => ({
-  updateMessage: vi.fn(async () => {}),
+  updateMessage: (...args: any[]) => updateMessageMock(...args),
+  addReaction: (...args: any[]) => addReactionMock(...args),
+  removeReaction: vi.fn(async () => {}),
   sendUserMessage: vi.fn(async () => {}),
   deleteMessage: vi.fn(async () => {}),
   getChatInfo: vi.fn(),
@@ -39,6 +43,7 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
   getAllBots: vi.fn(() => []),
   getBotClient: vi.fn(),
+  resolveBrandLabel: vi.fn(() => undefined),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -180,6 +185,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // First attempt is delayed 0ms; flush microtasks + timers
     await vi.advanceTimersByTimeAsync(10);
     expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][4]).toBe('turn-1');
     expect(ds.lastBridgeEmittedUuid).toBe('uuid-1');
   });
 
@@ -212,6 +218,66 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).not.toContain('<at id=ou_foreign_bot></at>');
   });
 
+  it('addresses Mira daemon fallback output back to the bot dispatcher', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.session.cliId = 'mira';
+    ds.session.ownerOpenId = undefined;
+    ds.ownerOpenId = undefined;
+    ds.session.creatorOpenId = 'ou_dispatcher_bot';
+    ds.session.quoteTargetSenderIsBot = true;
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    expect(cardJson).toContain('<at id=ou_dispatcher_bot></at>');
+  });
+
+  it('addresses Mira fallback output to a known-bot owner (/repo-primed dispatch)', async () => {
+    // `botmux dispatch --repo` primes the thread with "@bot /repo <path>",
+    // which records the dispatching bot as ownerOpenId (daemon /repo
+    // session-create path) instead of nulling it like @-mention auto-create.
+    writeFileSync(
+      join('/tmp/test-sessions', 'bot-openids-app_test.json'),
+      JSON.stringify({ Orchestrator: 'ou_orch_bot' }),
+    );
+
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.session.cliId = 'mira';
+    ds.session.ownerOpenId = 'ou_orch_bot';
+    ds.ownerOpenId = 'ou_orch_bot';
+    ds.session.creatorOpenId = 'ou_orch_bot';
+    ds.session.quoteTargetSenderIsBot = true;
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    expect(cardJson).toContain('<at id=ou_orch_bot></at>');
+  });
+
   it('keeps daemon final-output footer addressing for a human owner', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -233,6 +299,34 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
     const cardJson = sessionReply.mock.calls[0][1] as string;
     expect(cardJson).toContain('<at id=ou_human></at>');
+  });
+
+  it('always delivers the answer as a fresh message (never PATCHes a card in place)', async () => {
+    // The placeholder pending-card + its PATCH delivery were removed entirely
+    // (message.patch is silent — no Feishu notification/unread). The bridge
+    // final-output now unconditionally goes out as a brand-new reply.
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.session.quoteTargetId = 'om_user';
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    // Turn reactions are driven off message acceptance (noteTurnReceived) and
+    // the idle edge (finishTurnReactions), not the bridge final-output path.
+    expect(addReactionMock).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBe('uuid-1');
   });
 
   it('retries on transient failure and commits after success', async () => {

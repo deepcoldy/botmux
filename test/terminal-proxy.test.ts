@@ -192,3 +192,72 @@ describe('terminal proxy — WebSocket', () => {
     expect(ws.readyState).not.toBe(WebSocket.OPEN);
   });
 });
+
+describe('terminal proxy — on-demand wake (ensureWorkerPort)', () => {
+  it('wakes a worker via ensureWorkerPort when no live worker is registered', async () => {
+    const workerPort = await startFakeWorker();
+    let woke = 0;
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: () => undefined,                       // nothing live
+      ensureWorkerPort: async (sid) => { woke++; return sid === 'sleeping' ? workerPort : undefined; },
+    });
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/s/sleeping/`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('worker-saw:/');
+    expect(woke).toBe(1);
+  });
+
+  it('does NOT call ensureWorkerPort when a live worker exists (fast path)', async () => {
+    const workerPort = await startFakeWorker();
+    let woke = 0;
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: () => workerPort,
+      ensureWorkerPort: async () => { woke++; return undefined; },
+    });
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/s/sess1/`);
+    expect(res.status).toBe(200);
+    expect(woke).toBe(0);
+  });
+
+  it('returns 502 when neither a live worker nor a wake is possible', async () => {
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: () => undefined,
+      ensureWorkerPort: async () => undefined,
+    });
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/s/gone/`);
+    expect(res.status).toBe(502);
+  });
+
+  it('collapses an ensureWorkerPort error to 502 (not a crash)', async () => {
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: () => undefined,
+      ensureWorkerPort: async () => { throw new Error('boom'); },
+    });
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/s/x/`);
+    expect(res.status).toBe(502);
+  });
+
+  it('wakes a worker for a WS upgrade too', async () => {
+    const workerPort = await startFakeWorker();
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: () => undefined,
+      ensureWorkerPort: async () => workerPort,
+    });
+    const ws = new WebSocket(`ws://127.0.0.1:${proxy.port}/s/sleeping/?token=abc`);
+    const messages: string[] = [];
+    await new Promise<void>((resolve, reject) => {
+      ws.on('open', () => ws.send('ping'));
+      ws.on('message', (data) => { messages.push(data.toString()); if (messages.length === 2) resolve(); });
+      ws.on('error', reject);
+      setTimeout(() => reject(new Error('ws timeout')), 3000);
+    });
+    ws.close();
+    expect(messages[0]).toBe('hello-path:/?token=abc');
+    expect(messages[1]).toBe('echo:ping');
+  });
+});

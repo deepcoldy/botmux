@@ -1,9 +1,8 @@
 /**
  * Pure helpers for the daemon's `POST /api/asks` IPC route.
  *
- * Kept separate from daemon.ts so the body-validator and the approver
- * fallback chain (§6) are unit-testable without spinning up an HTTP server,
- * registering bots, or mounting a full session map.
+ * Kept separate from daemon.ts so the body-validator is unit-testable without
+ * spinning up an HTTP server, registering bots, or mounting a full session map.
  */
 
 import type { AskOption, AskQuestion } from './ask-types.js';
@@ -17,8 +16,6 @@ export interface AskApiBody {
   questions: AskQuestion[];
   /** Already in milliseconds. CLI side converts from `--timeout` seconds. */
   timeoutMs: number;
-  /** Empty array → use the §6 fallback chain. */
-  approvers: string[];
 }
 
 export type AskApiBodyError =
@@ -95,10 +92,6 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     return { error: 'bad_timeoutMs' };
   }
 
-  const approvers = Array.isArray(r.approvers)
-    ? r.approvers.filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
-    : [];
-
   let questions: AskQuestion[];
 
   if (Array.isArray(r.questions)) {
@@ -135,30 +128,5 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     rootMessageId: r.rootMessageId as string | null,
     questions,
     timeoutMs: r.timeoutMs,
-    approvers,
   };
-}
-
-/** Resolve the approver allowlist per §6 fallback chain:
- *   1. explicit `--approver` list from CLI args (non-empty wins outright)
- *   2. session.ownerOpenId ∩ bot.allowedUsers (single-owner topic chats)
- *   3. bot.allowedUsers (shared chats / no owner / owner not in allow)
- *
- *  Pure function: caller injects the lookups. The daemon wires
- *  `getBotAllowedUsers = (id) => getBot(id).resolvedAllowedUsers` and
- *  `getSessionOwner` = scan over activeSessions; tests pass stub funcs. */
-export function resolveAskApprovers(args: {
-  larkAppId: string;
-  sessionId: string;
-  explicit: ReadonlyArray<string>;
-  getBotAllowedUsers: (larkAppId: string) => ReadonlyArray<string>;
-  getSessionOwner: (sessionId: string) => string | undefined;
-}): Set<string> {
-  const explicit = args.explicit.filter((s) => s.trim().length > 0);
-  if (explicit.length > 0) return new Set(explicit);
-
-  const allow = args.getBotAllowedUsers(args.larkAppId);
-  const owner = args.getSessionOwner(args.sessionId);
-  if (owner && allow.includes(owner)) return new Set([owner]);
-  return new Set(allow);
 }

@@ -4,15 +4,28 @@
  * Run: pnpm vitest run test/builtin-skills.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES } from '../src/skills/definitions.js';
+import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME } from '../src/skills/definitions.js';
 
 describe('built-in botmux-send skill', () => {
-  it('teaches heredoc usage for multiline sends', () => {
+  it('teaches safe multiline sends across Unix and Windows shells', () => {
     const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-send');
     expect(skill).toBeDefined();
     expect(skill!.content).toContain("botmux send <<'EOF'");
-    expect(skill!.content).toContain('botmux send "第一行\\n第二行"');
-    expect(skill!.content).toContain('字面量');
+    expect(skill!.content).toContain('Windows/PowerShell');
+    expect(skill!.content).toContain('--content-file');
+    expect(skill!.content).toContain('Set-Content -LiteralPath $msg -Encoding utf8');
+    expect(skill!.content).toContain('不要把中文直接通过 here-string');
+  });
+
+  it('warns that mention-back/no-mention are switches without values', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-send');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('--mention-back');
+    expect(skill!.content).toContain('--no-mention');
+    expect(skill!.content).toContain('是开关，后面不跟任何参数');
+    expect(skill!.content).toContain('--mention <open_id:名字>');
+    expect(skill!.content).toContain('--content-file > 位置参数 > stdin');
+    expect(skill!.content).toContain('多行正文推荐只放在 heredoc/stdin 中');
   });
 });
 
@@ -84,6 +97,33 @@ describe('built-in botmux-workflow-create skill', () => {
   });
 });
 
+describe('built-in botmux-workflow skill (v3 grill → 编排 → 跑)', () => {
+  it('注册了，且教全套 host 命令序 + spec 契约 + 防误触发确认', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-workflow');
+    expect(skill).toBeDefined();
+    // 全套 host 命令序
+    expect(skill!.content).toContain('botmux workflow new');
+    expect(skill!.content).toContain('botmux workflow spec-finalize');
+    expect(skill!.content).toContain('botmux workflow approve-spec');
+    expect(skill!.content).toContain('botmux workflow architect');
+    expect(skill!.content).toContain('botmux workflow approve-dag');
+    expect(skill!.content).toContain('botmux v3 run');
+    // spec 契约：7 字段 + input_needs 自由文本铁律
+    expect(skill!.content).toContain('"schemaVersion": 1');
+    expect(skill!.content).toContain('input_needs');
+    expect(skill!.content).toContain('绝不要写成上游 sketchId 列表');
+    expect(skill!.content).toContain('risk_gate');
+    // 防误触发 + 两道 gate
+    expect(skill!.content).toContain('Gate-1');
+    expect(skill!.content).toContain('Gate-2');
+    // 跟 v0.2 / workflow-create 区分（v2 模板入口已改名 /template）
+    expect(skill!.content).toContain('/template run <id>');
+    expect(skill!.content).toContain('botmux-workflow-create');
+    // 转义没出 bug：description 里不该出现裸反斜杠-反引号
+    expect(skill!.content).not.toContain('\\`');
+  });
+});
+
 describe('built-in botmux-bots skill (collaboration roster)', () => {
   it('documents the enhanced roster fields and the mentionable rule', () => {
     const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-bots');
@@ -109,6 +149,62 @@ describe('built-in botmux-handoff skill', () => {
     expect(skill!.content).toContain('mentionable');
     expect(skill!.content).toContain('/introduce');
     expect(skill!.content).toContain('botmux send --mention');
+  });
+});
+
+describe('built-in botmux-whiteboard skill', () => {
+  it('is NOT in BUILTIN_SKILLS — installed conditionally on the whiteboard toggle', () => {
+    // The whiteboard feature is off by default, so its skill must not be written
+    // unconditionally. It is materialised only when enabled, via
+    // ensureWhiteboardSkill (see ensure-whiteboard-skill.test.ts).
+    expect(BUILTIN_SKILLS.find(s => s.name === WHITEBOARD_SKILL_NAME)).toBeUndefined();
+    expect(WHITEBOARD_SKILL_NAME).toBe('botmux-whiteboard');
+  });
+
+  it('teaches disabled/default-safe usage', () => {
+    expect(WHITEBOARD_SKILL).toContain('botmux whiteboard status');
+    expect(WHITEBOARD_SKILL).toContain('默认关闭');
+    expect(WHITEBOARD_SKILL).toContain('botmux whiteboard update');
+    expect(WHITEBOARD_SKILL).not.toContain('botmux whiteboard post');
+    expect(WHITEBOARD_SKILL).toContain('write --yes');
+    expect(WHITEBOARD_SKILL).toContain('不要写');
+    expect(WHITEBOARD_SKILL).toContain('botmux send');
+  });
+});
+
+describe('botmux-worker-budget skill retired (moved to per-bot dashboard field)', () => {
+  it('is no longer a standalone skill and is pruned on upgrade', () => {
+    expect(BUILTIN_SKILLS.find(s => s.name === 'botmux-worker-budget')).toBeUndefined();
+    expect(RETIRED_SKILL_NAMES).toContain('botmux-worker-budget');
+  });
+});
+
+describe('agent raise-hand folded into botmux-send (--attention)', () => {
+  it('botmux-needs-help is retired, not a standalone skill', () => {
+    expect(BUILTIN_SKILLS.find(s => s.name === 'botmux-needs-help')).toBeUndefined();
+    expect(RETIRED_SKILL_NAMES).toContain('botmux-needs-help');
+  });
+
+  it('botmux-send description mentions --attention so a blocked agent discovers it', () => {
+    const send = BUILTIN_SKILLS.find(s => s.name === 'botmux-send');
+    expect(send).toBeDefined();
+    // Skills are matched by DESCRIPTION — the blocked-scenario trigger must live
+    // in the frontmatter, or a stuck agent won't realize send has --attention.
+    const fm = send!.content.split('---')[1] ?? '';
+    expect(fm).toContain('--attention');
+    expect(fm).toMatch(/硬阻碍|需要人|授权/);
+  });
+
+  it('botmux-send body teaches --attention usage + abuse boundaries', () => {
+    const send = BUILTIN_SKILLS.find(s => s.name === 'botmux-send')!;
+    expect(send.content).toContain('botmux send --attention');
+    expect(send.content).toContain('--attention=decision');
+    // non-blocking + auto-clear contract, and steer to ask for option-choices
+    expect(send.content).toContain('非阻塞');
+    expect(send.content).toContain('自动撤下');
+    expect(send.content).toContain('botmux ask');
+    // guards documented: not with --top-level/--chat-id/--into
+    expect(send.content).toContain('--top-level');
   });
 });
 

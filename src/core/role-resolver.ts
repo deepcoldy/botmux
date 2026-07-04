@@ -13,12 +13,14 @@
  * bot to adopt different personas in different Lark groups.
  */
 
-import { existsSync, readFileSync, statSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, mkdirSync, unlinkSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 
 const MAX_ROLE_BYTES = 4 * 1024; // 4 KB
+const ROLE_CHAT_ID_RE = /^(?:oc|om)_[A-Za-z0-9_-]{1,128}$/;
 
 interface CacheEntry {
   mtimeMs: number;
@@ -33,6 +35,7 @@ function cacheKey(larkAppId: string, chatId: string): string {
 
 /** Absolute path to the role file for a given bot + chat. */
 function roleFilePath(larkAppId: string, chatId: string): string {
+  assertRoleChatId(chatId);
   return join(config.session.dataDir, 'roles', larkAppId, `${chatId}.md`);
 }
 
@@ -43,6 +46,16 @@ function teamRoleFilePath(larkAppId: string): string {
 
 function teamCacheKey(larkAppId: string): string {
   return `team::${larkAppId}`;
+}
+
+export function isValidRoleChatId(chatId: string): boolean {
+  return ROLE_CHAT_ID_RE.test(chatId);
+}
+
+function assertRoleChatId(chatId: string): void {
+  if (!isValidRoleChatId(chatId)) {
+    throw new Error(`invalid chat id: ${chatId}`);
+  }
 }
 
 /** Truncate `content` to at most MAX_ROLE_BYTES UTF-8 bytes. */
@@ -107,6 +120,7 @@ function readRoleFile(filePath: string, key: string, logLabel: string): string |
  */
 export function resolveRoleFile(larkAppId: string, chatId: string): string | null {
   if (!larkAppId || !chatId) return null;
+  if (!isValidRoleChatId(chatId)) return null;
   return readRoleFile(roleFilePath(larkAppId, chatId), cacheKey(larkAppId, chatId), `chat=${chatId}`);
 }
 
@@ -126,13 +140,14 @@ export function writeRoleFile(larkAppId: string, chatId: string, content: string
   mkdirSync(dirname(filePath), { recursive: true });
   // Truncate by UTF-8 byte length, not JS string length
   const trimmed = truncateToByteLimit(content.trim());
-  writeFileSync(filePath, trimmed, 'utf-8');
+  atomicWriteFileSync(filePath, trimmed);
   cache.delete(cacheKey(larkAppId, chatId)); // invalidate so next read picks up the new content
   logger.info(`[role] wrote chat=${chatId} file=${filePath} (${Buffer.byteLength(trimmed, 'utf-8')} bytes)`);
 }
 
 /** Delete a role file for a chat. */
 export function deleteRoleFile(larkAppId: string, chatId: string): boolean {
+  if (!isValidRoleChatId(chatId)) return false;
   const filePath = roleFilePath(larkAppId, chatId);
   try {
     unlinkSync(filePath);
@@ -159,7 +174,7 @@ export function writeTeamRoleFile(larkAppId: string, content: string): void {
   const filePath = teamRoleFilePath(larkAppId);
   mkdirSync(dirname(filePath), { recursive: true });
   const trimmed = truncateToByteLimit(content.trim());
-  writeFileSync(filePath, trimmed, 'utf-8');
+  atomicWriteFileSync(filePath, trimmed);
   cache.delete(teamCacheKey(larkAppId));
   logger.info(`[role] wrote team app=${larkAppId} file=${filePath} (${Buffer.byteLength(trimmed, 'utf-8')} bytes)`);
 }

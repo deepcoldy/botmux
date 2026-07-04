@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard } from '../src/im/lark/md-card.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -772,5 +772,100 @@ describe('parseEventMessage: parentId surfacing', () => {
   it('treats empty-string parent_id as absent', () => {
     const { parsed } = parseEventMessage(makeEvent({ parent_id: '' }));
     expect(parsed.parentId).toBeUndefined();
+  });
+});
+
+// ─── mentionOpenId: tolerate both Lark mention.id shapes ──────────────────
+//
+// WS event (im.message.receive_v1) → id is an OBJECT { open_id, ... }.
+// REST API (im.message.get / list) → id is a bare STRING "ou_xxx" + id_type.
+// The helper must read open_id from either so a Lark shape convergence can't
+// silently break @-detection.
+
+describe('mentionOpenId', () => {
+  it('reads open_id from the WS event object form', () => {
+    expect(mentionOpenId({ id: { open_id: 'ou_abc', union_id: 'on_x', user_id: '' } })).toBe('ou_abc');
+  });
+
+  it('reads the bare string form when id_type is open_id', () => {
+    expect(mentionOpenId({ id: 'ou_abc', id_type: 'open_id' })).toBe('ou_abc');
+  });
+
+  it('reads the bare string form when id_type is absent (mentions are open_id-keyed)', () => {
+    expect(mentionOpenId({ id: 'ou_abc' })).toBe('ou_abc');
+  });
+
+  it('returns undefined for a string id whose id_type is not open_id', () => {
+    // union_id/user_id strings (possible without open_id scope) must not be
+    // returned as an open_id and mis-compared against a botOpenId.
+    expect(mentionOpenId({ id: 'on_abc', id_type: 'union_id' })).toBeUndefined();
+    expect(mentionOpenId({ id: 'b199821f', id_type: 'user_id' })).toBeUndefined();
+  });
+
+  it('returns undefined for empty / missing ids', () => {
+    expect(mentionOpenId({ id: { open_id: '' } })).toBeUndefined();
+    expect(mentionOpenId({ id: '' })).toBeUndefined();
+    expect(mentionOpenId({ id: null })).toBeUndefined();
+    expect(mentionOpenId({})).toBeUndefined();
+    expect(mentionOpenId(undefined)).toBeUndefined();
+    expect(mentionOpenId(null)).toBeUndefined();
+  });
+});
+
+describe('parseEventMessage: mention identity formats', () => {
+  function makeMentionEvent(mention: any) {
+    return {
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: {
+        message_id: 'om_msg',
+        message_type: 'text',
+        content: JSON.stringify({ text: '@BotA hello' }),
+        chat_id: 'oc_chat',
+        chat_type: 'group',
+        create_time: '1000',
+        mentions: [mention],
+      },
+    };
+  }
+
+  it('surfaces openId from the WS event object form', () => {
+    const { parsed } = parseEventMessage(makeMentionEvent({
+      key: '@_bot',
+      name: 'BotA',
+      id: { open_id: 'ou_bot_a_open_id' },
+    }));
+    expect(parsed.mentions?.[0]).toMatchObject({
+      key: '@_bot',
+      name: 'BotA',
+      openId: 'ou_bot_a_open_id',
+    });
+  });
+
+  it('keeps string open_id mention ids as openId', () => {
+    const { parsed } = parseEventMessage(makeMentionEvent({
+      key: '@_bot',
+      name: 'BotA',
+      id: 'ou_bot_a_open_id',
+    }));
+    expect(parsed.mentions?.[0]).toMatchObject({
+      key: '@_bot',
+      name: 'BotA',
+      openId: 'ou_bot_a_open_id',
+    });
+  });
+
+  it('does not expose app_id mention ids as openId', () => {
+    const { parsed } = parseEventMessage(makeMentionEvent({
+      key: '@_bot',
+      name: 'BotA',
+      id: 'app-bot-a',
+      id_type: 'app_id',
+    }));
+    expect(parsed.mentions?.[0]).toMatchObject({
+      key: '@_bot',
+      name: 'BotA',
+      idType: 'app_id',
+    });
+    expect(parsed.mentions?.[0].openId).toBeUndefined();
   });
 });

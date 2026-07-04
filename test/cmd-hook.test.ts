@@ -74,6 +74,22 @@ describe('runHook', () => {
     });
   });
 
+  describe('(a2) 自定义回复（comment）→ stdout 含自定义文字', () => {
+    it('answered 含 comment + 空 answers → directive 用 comment 作答', async () => {
+      const customStub = async (): Promise<AskResult> => ({
+        kind: 'answered',
+        answers: [[]],
+        by: 'ou_user1',
+        comment: '我想先灰度 10% 再全量',
+        timedOut: false,
+      });
+      const result = await runHook(claudeAskPayload, FULL_ENV, customStub, 'claude-code');
+      expect(result.stdout).toBeTruthy();
+      const answers = JSON.parse(result.stdout).hookSpecificOutput.decision.updatedInput.answers as Record<string, string>;
+      expect(answers['继续还是取消？']).toBe('我想先灰度 10% 再全量');
+    });
+  });
+
   describe('(b) postAskFn 抛错 → 输出 passthrough，不抛出', () => {
     it('任何 postAsk 错误均优雅放行', async () => {
       const stub = makeThrowingStub('daemon unreachable');
@@ -271,6 +287,24 @@ describe('runHook', () => {
       expect(region).toContain("process.env.BOTMUX_WORKFLOW === '1'");
       expect(region).toContain('process.exit(2)');
       expect(region.toLowerCase()).toContain('refused');
+    });
+  });
+
+  describe('workflow 里举手走 send 自身的 gate（attention 已并入 send，不再是独立命令）', () => {
+    it('cmdAttention 已移除，send --attention 由 send 的 BOTMUX_WORKFLOW gate 覆盖', () => {
+      const src = readFileSync(
+        new URL('../src/cli.ts', import.meta.url),
+        'utf-8',
+      );
+      // 旧的独立举手入口已删除——举手并入 `botmux send --attention`。
+      expect(src.includes('async function cmdAttention(')).toBe(false);
+      // send 顶部已有 workflow-subagent gate（subagent 里 send 直接 refused），
+      // --attention 是 send 的一个 flag，因此天然被同一道 gate 覆盖。
+      const cmdSendIdx = src.indexOf('async function cmdSend(');
+      expect(cmdSendIdx).toBeGreaterThanOrEqual(0);
+      const region = src.slice(cmdSendIdx, cmdSendIdx + 1500);
+      expect(region).toContain("process.env.BOTMUX_WORKFLOW === '1'");
+      expect(region).toContain('process.exit(2)');
     });
   });
 });

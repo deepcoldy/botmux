@@ -9,6 +9,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildCardBodyElements,
+  buildImageCardElements,
   buildMarkdownCard,
   buildContextualReplyCard,
   brandFooterSegment,
@@ -266,6 +267,146 @@ describe('buildMarkdownCard footer brand', () => {
     expect(els.some((e: any) => e.text_size === 'notation_small_v2')).toBe(false);
     expect(JSON.stringify(els)).not.toContain('botmux');
     expect(els.some((e: any) => e.tag === 'markdown' && /hi/.test(e.content))).toBe(true);
+  });
+});
+
+describe('buildCardBodyElements image rows', () => {
+  it('a line of 2+ raw images → one side-by-side column_set row', () => {
+    const out = buildCardBodyElements('**Menu**\n\n![](img_v2_k1) ![](img_v2_k2)\n\n![](img_v2_k3)');
+    const rows = out.filter(e => e.tag === 'column_set');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].columns.map((c: any) => c.elements[0].img_key)).toEqual(['img_v2_k1', 'img_v2_k2']);
+    expect(rows[0].columns[0].elements[0].mode).toBe('fit_horizontal');
+    // a lone trailing image stays inline markdown, not a row
+    const md = mdElements(out).map(e => e.content).join('\n');
+    expect(md).toContain('![](img_v2_k3)');
+  });
+
+  it('a line with a single image is NOT turned into a row', () => {
+    const out = buildCardBodyElements('![](img_v2_only)');
+    expect(out.some(e => e.tag === 'column_set')).toBe(false);
+  });
+
+  it('image-looking lines inside code fences are left intact (no row)', () => {
+    const out = buildCardBodyElements('```\n![](img_v2_a) ![](img_v2_b)\n```');
+    expect(out.some(e => e.tag === 'column_set')).toBe(false);
+    expect(mdElements(out).map(e => e.content).join('\n')).toContain('![](img_v2_a) ![](img_v2_b)');
+  });
+
+  it('a row of non-img_key srcs (model URL/text images) is NOT promoted', () => {
+    // A model reply emitting `![](https://…) ![](…)` must not become a native
+    // img row — a URL "img_key" makes Feishu reject the whole card. Stays md.
+    const url = '![](https://x.test/a.png) ![](https://x.test/b.png)';
+    const out = buildCardBodyElements(url);
+    expect(out.some(e => e.tag === 'column_set')).toBe(false);
+    expect(mdElements(out).map(e => e.content).join('\n')).toContain('https://x.test/a.png');
+  });
+
+  it('a row mixing one img_key and one URL is NOT promoted (all-or-nothing)', () => {
+    const out = buildCardBodyElements('![](img_v2_real) ![](https://x.test/b.png)');
+    expect(out.some(e => e.tag === 'column_set')).toBe(false);
+  });
+
+  it('near-miss srcs (img_v2foo.png / img_v2:x) are NOT treated as img_keys', () => {
+    // Full-key match required: a bare versioned prefix without the `_<id>` part
+    // (or with stray punctuation) is not a real key → no native row.
+    expect(buildCardBodyElements('![](img_v2foo.png) ![](img_v3bar.png)')
+      .some(e => e.tag === 'column_set')).toBe(false);
+    expect(buildCardBodyElements('![](img_v2:x) ![](img_v3:y)')
+      .some(e => e.tag === 'column_set')).toBe(false);
+  });
+
+  it('image line inside a 4-backtick block with an inner 3-backtick fence stays code', () => {
+    // The inner ``` must NOT close the outer ```` block; the image line after
+    // it is still code, so it must not be promoted to a native row.
+    const input = '````\n```\n![](img_v2_a) ![](img_v2_b)\n```\n````';
+    const out = buildCardBodyElements(input);
+    expect(out.some(e => e.tag === 'column_set')).toBe(false);
+    expect(mdElements(out).map(e => e.content).join('\n')).toContain('![](img_v2_a) ![](img_v2_b)');
+  });
+
+  it('a 4-space indented image line (indented code block) is NOT promoted', () => {
+    const out = buildCardBodyElements('text\n\n    ![](img_v2_a) ![](img_v2_b)');
+    expect(out.some(e => e.tag === 'column_set')).toBe(false);
+  });
+});
+
+describe('buildImageCardElements', () => {
+  const K = ['img_v2_a', 'img_v2_b', 'img_v2_c', 'img_v2_d'];
+
+  it('no images → identical to buildCardBodyElements', () => {
+    expect(buildImageCardElements('hello **world**', [])).toEqual(
+      buildCardBodyElements('hello **world**'),
+    );
+  });
+
+  it('no placeholders → images appended full-width (stacked) at the end', () => {
+    const out = buildImageCardElements('intro text', K.slice(0, 2));
+    const md = mdElements(out).map(e => e.content).join('\n');
+    expect(md).toContain('intro text');
+    expect(md).toContain('![](img_v2_a)');
+    expect(md).toContain('![](img_v2_b)');
+    // appended on separate lines → stacked, not a side-by-side row
+    expect(out.some(e => e.tag === 'column_set')).toBe(false);
+  });
+
+  it('single-index placeholder → inline full-width image, no trailing dup', () => {
+    const out = buildImageCardElements('see ![](img:0) done', [K[0]]);
+    const md = mdElements(out).map(e => e.content).join('\n');
+    expect(md).toContain('![](img_v2_a)');
+    expect(out.some(e => e.tag === 'column_set')).toBe(false);
+  });
+
+  it('grouped placeholder of 2 → one column_set row of 2 side-by-side imgs', () => {
+    const out = buildImageCardElements('![](img:0,1)', K.slice(0, 2));
+    const row = out.find(e => e.tag === 'column_set');
+    expect(row).toBeTruthy();
+    expect(row.columns).toHaveLength(2);
+    expect(row.columns.map((c: any) => c.elements[0].img_key)).toEqual(['img_v2_a', 'img_v2_b']);
+    expect(row.columns.every((c: any) => c.width === 'weighted')).toBe(true);
+  });
+
+  it('grouped placeholder of 3 → one row of 3', () => {
+    const out = buildImageCardElements('![](img:0,1,2)', K.slice(0, 3));
+    const row = out.find(e => e.tag === 'column_set');
+    expect(row.columns).toHaveLength(3);
+  });
+
+  it('two grouped placeholders → two separate rows', () => {
+    const out = buildImageCardElements('![](img:0,1)\n\n![](img:2,3)', K);
+    const rows = out.filter(e => e.tag === 'column_set');
+    expect(rows).toHaveLength(2);
+    expect(rows[0].columns.map((c: any) => c.elements[0].img_key)).toEqual(['img_v2_a', 'img_v2_b']);
+    expect(rows[1].columns.map((c: any) => c.elements[0].img_key)).toEqual(['img_v2_c', 'img_v2_d']);
+  });
+
+  it('text around a group splits into markdown before/after the row', () => {
+    const out = buildImageCardElements('top\n\n![](img:0,1)\n\nbottom', K.slice(0, 2));
+    expect(out[0]).toMatchObject({ tag: 'markdown', content: 'top' });
+    expect(out[1].tag).toBe('column_set');
+    expect(out[2]).toMatchObject({ tag: 'markdown', content: 'bottom' });
+  });
+
+  it('mixed: grouped row + an unreferenced image appended at the end', () => {
+    const out = buildImageCardElements('![](img:0,1)', K.slice(0, 3));
+    expect(out.some(e => e.tag === 'column_set')).toBe(true);
+    const md = mdElements(out).map(e => e.content).join('\n');
+    expect(md).toContain('![](img_v2_c)'); // index 2 never referenced → trailing
+    expect(md).not.toContain('img_v2_a');  // a,b live in the row, not markdown
+  });
+
+  it('out-of-range indices in a group are dropped; sole valid one → single img', () => {
+    const out = buildImageCardElements('![](img:0,9)', [K[0]]);
+    // index 9 invalid → group collapses to a single full-width inline image.
+    expect(out.some(e => e.tag === 'column_set')).toBe(false);
+    expect(mdElements(out).map(e => e.content).join('\n')).toContain('![](img_v2_a)');
+  });
+
+  it('group with all indices out of range → literal text preserved', () => {
+    const out = buildImageCardElements('![](img:7,8)', [K[0]]);
+    expect(out.some(e => e.tag === 'column_set')).toBe(false);
+    const md = mdElements(out).map(e => e.content).join('');
+    expect(md).toContain('![](img:7,8)');
   });
 });
 

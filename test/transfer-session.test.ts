@@ -25,6 +25,7 @@ vi.mock('../src/bot-registry.js', () => ({
     botName: 'TestBot',
   })),
   getAllBots: vi.fn(() => []),
+  getBotBrand: vi.fn(() => 'feishu'),
 }));
 
 vi.mock('../src/core/dashboard-events.js', () => ({
@@ -102,8 +103,9 @@ describe('transferSession', () => {
     sessionId: string,
     targetChatId: string,
     targetRootMessageId: string,
-    targetChatType: 'group' = 'group',
-  ) => transferSession(sessionId, targetChatId, targetRootMessageId, targetChatType, {
+    targetChatType: 'group' | 'p2p' = 'group',
+    targetScope: 'thread' | 'chat' = 'chat',
+  ) => transferSession(sessionId, targetChatId, targetRootMessageId, targetChatType, targetScope, {
     forkWorkerImpl: forkWorkerSpy as any,
     killWorkerImpl: killWorkerSpy as any,
   });
@@ -114,19 +116,46 @@ describe('transferSession', () => {
     setActiveSessionsRegistry(registry);
   });
 
-  it('refuses with target_chat_type_unsupported when target chat type is not group (depth defense)', async () => {
-    // TS narrows targetChatType to 'group' for normal callers — this case
-    // simulates a bypass (e.g. peer HTTP endpoint feeding a body field
+  it('refuses with target_chat_type_unsupported when target chat type is neither group nor p2p (depth defense)', async () => {
+    // TS narrows targetChatType to 'group' | 'p2p' for normal callers — this
+    // case simulates a bypass (e.g. peer HTTP endpoint feeding a body field
     // through, or a future caller passing through a raw chatType string).
     // The runtime check inside transferSession must catch it.
     const ds = makeDs();
     registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
-    const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target', 'p2p' as any);
+    const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target', 'channel' as any);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toBe('target_chat_type_unsupported');
     expect(forkWorkerSpy).not.toHaveBeenCalled();
     // Source ds must not have been mutated.
     expect(ds.chatId).toBe('oc_source');
+  });
+
+  it('DM flat target (p2p, chat scope): rewrites chatType to p2p and anchors on the DM chatId', async () => {
+    const ds = makeDs();  // thread-scope source in oc_source
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const r = await callTransfer(ds.session.sessionId, 'oc_dm', 'om_M1_dm', 'p2p', 'chat');
+    expect(r.ok).toBe(true);
+    expect(ds.session.chatType).toBe('p2p');
+    expect(ds.chatType).toBe('p2p');
+    expect(ds.session.scope).toBe('chat');
+    expect(ds.chatId).toBe('oc_dm');
+    // chat-scope anchors on chatId; rootMessageId keeps the M1 id (audit-only).
+    expect(ds.session.rootMessageId).toBe('om_M1_dm');
+    expect(registry.has(sessionKey('oc_dm', 'cli_app_test'))).toBe(true);
+    expect(registry.has(sessionKey('om_source_root', 'cli_app_test'))).toBe(false);
+  });
+
+  it('DM topic target (p2p, thread scope): rewrites chatType to p2p and anchors on the DM 话题 root', async () => {
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const r = await callTransfer(ds.session.sessionId, 'oc_dm', 'om_dm_topic_root', 'p2p', 'thread');
+    expect(r.ok).toBe(true);
+    expect(ds.session.chatType).toBe('p2p');
+    expect(ds.chatType).toBe('p2p');
+    expect(ds.session.scope).toBe('thread');
+    expect(ds.session.rootMessageId).toBe('om_dm_topic_root');
+    expect(registry.has(sessionKey('om_dm_topic_root', 'cli_app_test'))).toBe(true);
   });
 
   it('returns session_not_active when sessionId not in registry', async () => {
@@ -148,13 +177,49 @@ describe('transferSession', () => {
     expect(adoptDs.chatId).toBe('oc_source');
   });
 
-  it('returns same_chat when target chatId equals current chatId', async () => {
-    const ds = makeDs();
-    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
-    const r = await callTransfer(ds.session.sessionId, 'oc_source', 'om_target_root');
+  it('returns same_anchor when a chat-scope source targets its own chat (chat→chat)', async () => {
+    const ds = makeDs({ scope: 'chat' });
+    ds.session.scope = 'chat';
+    // chat-scope source anchors on chatId
+    registry.set(sessionKey('oc_source', 'cli_app_test'), ds);
+    const r = await callTransfer(ds.session.sessionId, 'oc_source', 'om_target_root', 'group', 'chat');
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toBe('same_chat');
+    if (!r.ok) expect(r.error).toBe('same_anchor');
     expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+
+  it('returns same_anchor when relaying a thread session onto its own root', async () => {
+    const ds = makeDs();  // thread-scope anchored at om_source_root
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const r = await callTransfer(ds.session.sessionId, 'oc_source', 'om_source_root', 'group', 'thread');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toBe('same_anchor');
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+
+  it('allows same-chat cross-topic move (thread source → a different thread anchor)', async () => {
+    const ds = makeDs();  // thread-scope anchored at om_source_root in oc_source
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const r = await callTransfer(ds.session.sessionId, 'oc_source', 'om_other_root', 'group', 'thread');
+    expect(r.ok).toBe(true);
+    expect(ds.session.scope).toBe('thread');
+    expect(ds.session.rootMessageId).toBe('om_other_root');
+    expect(ds.chatId).toBe('oc_source');
+    expect(registry.has(sessionKey('om_other_root', 'cli_app_test'))).toBe(true);
+    expect(registry.has(sessionKey('om_source_root', 'cli_app_test'))).toBe(false);
+  });
+
+  it('thread-scope target rewrites scope/rootMessageId and rekeys by anchor', async () => {
+    const ds = makeDs();  // thread-scope source, chat oc_source
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_topic_root', 'group', 'thread');
+    expect(r.ok).toBe(true);
+    expect(ds.session.scope).toBe('thread');
+    expect(ds.scope).toBe('thread');
+    expect(ds.session.rootMessageId).toBe('om_topic_root');
+    expect(ds.chatId).toBe('oc_target');
+    expect(registry.has(sessionKey('om_topic_root', 'cli_app_test'))).toBe(true);
+    expect(registry.has(sessionKey('om_source_root', 'cli_app_test'))).toBe(false);
   });
 
   it('refuses with not_started_yet when source is a daemon-command scratch (no worker + no persisted CLI markers)', async () => {

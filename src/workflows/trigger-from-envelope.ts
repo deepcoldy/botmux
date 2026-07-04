@@ -49,6 +49,7 @@ export async function triggerWorkflowFromEnvelope(
     triggerId,
     source: req.source,
     envelope: req.envelope,
+    ...(req.instruction ? { instruction: req.instruction } : {}),
     options: req.options ?? {},
   });
 

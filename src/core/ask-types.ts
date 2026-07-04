@@ -33,14 +33,20 @@ export interface AskQuestion {
  *  v0.1.8 变更：`answered` 变体的 `selected: string` 升级为
  *  `answers: ReadonlyArray<ReadonlyArray<string>>`，其中 `answers[i]`
  *  对应第 i 个问题（`questions[i]`）选中的 key 数组。
- *  向后兼容：单问单选场景用 `toLegacySelected` 取回旧的 `string`。 */
+ *  向后兼容：单问单选场景用 `toLegacySelected` 取回旧的 `string`。
+ *
+ *  自定义回复（comment）：用户在话题里直接回一句文字当答案时，broker 用
+ *  `submitCustomReply` settle，此时 `answers` 各问为空数组、`comment` 携带
+ *  用户原文。CLI hook adapter 的 `formatAnswer` 据此把没有选中项的问题回落到
+ *  这段自定义文字（替代语义，见 §自定义回复）。按钮路径的 comment 仍为 null。 */
 export type AskResult =
   | {
       kind: 'answered';
       /** answers[i] = questions[i] 选中的 key 数组。 */
       answers: ReadonlyArray<ReadonlyArray<string>>;
       by: string;
-      comment: null;
+      /** 自定义回复原文（用户在话题里直接打字作答）；按钮选择时为 null。 */
+      comment: string | null;
       timedOut: false;
     }
   | {
@@ -59,24 +65,25 @@ export type AskResult =
       timedOut: false;
     };
 
-/** JSON envelope emitted by `botmux ask buttons --json`. Keeps `comment` as a
- *  forward-compat `null` slot — v0.1.8 may flip it to `string`.
+/** JSON envelope emitted by `botmux ask buttons --json`.
  *
  *  v0.1.8 新增 `answers: string[][] | null`（多问多选完整答案），
- *  保留 `selected: string | null` 做向后兼容（等价于 `toLegacySelected`）。 */
+ *  保留 `selected: string | null` 做向后兼容（等价于 `toLegacySelected`）。
+ *  `comment` 携带用户的自定义回复原文（话题直接打字作答），无则 null。 */
 export interface AskJsonOutput {
   /** 向后兼容：单问单选时等于 `answers[0][0]`，否则为 null。 */
   selected: string | null;
   /** v0.1.8 新增：按问题分组的完整答案，answered 时非 null。 */
   answers: string[][] | null;
   by: string | null;
-  comment: null;
+  /** 自定义回复原文；按钮选择 / 超时 / 失效时为 null。 */
+  comment: string | null;
   timedOut: boolean;
 }
 
 /** Input accepted by broker.registerAsk. Caller (CLI subcommand → daemon IPC
- *  handler) is responsible for env validation, parameter parsing, and resolving
- *  the approver allowlist before reaching the broker.
+ *  handler) is responsible for env validation and parameter parsing. Click
+ *  authorization is the bot's canTalk gate, injected via `setCanTalkChecker`.
  *
  *  v0.1.8 变更：`options`/`prompt` 字段替换为 `questions: ReadonlyArray<AskQuestion>`。 */
 export interface CreateAskInput {
@@ -86,10 +93,6 @@ export interface CreateAskInput {
   rootMessageId: string | null;
   /** Session that issued the ask — used for audit + future replay scoping. */
   sessionId: string;
-  /** Pre-resolved open_id allowlist. Empty set means no one can answer; the
-   *  caller (not the broker) must enforce the §6 approver fallback chain so the
-   *  broker stays IM-agnostic. */
-  approvers: ReadonlySet<string>;
   /** 问题列表，调用方保证每问 `options.length ≥ 2` 且 key 唯一。 */
   questions: ReadonlyArray<AskQuestion>;
   /** Absolute deadline; computed by caller from `--timeout`. Broker won't
@@ -111,7 +114,6 @@ export interface PendingAsk {
   chatId: string;
   rootMessageId: string | null;
   sessionId: string;
-  approvers: ReadonlySet<string>;
   /** 问题列表，替代旧的 `options` + `prompt`。 */
   questions: ReadonlyArray<AskQuestion>;
   /** 当前已勾选答案快照。仅 daemon/card 内部使用；CLI IPC 边界不暴露。 */
@@ -130,7 +132,7 @@ export interface PendingAsk {
 export type AskClickOutcome =
   /** First valid click — caller's Promise resolves with `kind:'answered'`. */
   | 'accepted'
-  /** Clicker's open_id not in approvers — caller shows "你没有权限". */
+  /** Clicker can't canTalk to the bot in this chat — caller shows "你没有权限". */
   | 'unauthorized'
   /** No such askId, nonce mismatch, or unknown option — caller shows
    *  "此 ask 已失效（daemon 重启）". Covers the §8 stale-card case. */

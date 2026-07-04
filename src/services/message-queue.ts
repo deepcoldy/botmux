@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -45,7 +46,8 @@ function readOffset(rootMessageId: string): number {
 }
 
 function writeOffset(rootMessageId: string, offset: number): void {
-  writeFileSync(getOffsetFile(rootMessageId), String(offset), 'utf-8');
+  // 原子写：offset 半截（如 "12" 只写出 "1"）会导致重启后消息重读或跳读。
+  atomicWriteFileSync(getOffsetFile(rootMessageId), String(offset));
 }
 
 /** Reset offset to re-read all messages from a given byte position (0 = beginning). */

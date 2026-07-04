@@ -14,11 +14,11 @@
  */
 import { describe, it, expect } from 'vitest';
 import { BridgeTurnQueue, makeFingerprint } from '../src/services/bridge-turn-queue.js';
-import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
+import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';
 
-function user(uuid: string, content: string = `<input ${uuid}>`): TranscriptEvent {
-  return { type: 'user', uuid, message: { role: 'user', content } };
+function user(uuid: string, content: string = `<input ${uuid}>`, timestamp?: string): TranscriptEvent {
+  return { type: 'user', uuid, timestamp, message: { role: 'user', content } };
 }
 function assistant(uuid: string, text: string, sidechain = false): TranscriptEvent {
   const ev: TranscriptEvent = {
@@ -592,12 +592,12 @@ describe('BridgeTurnQueue', () => {
   // anchors on "Claude actually started processing this turn" — not on the
   // earlier moment the worker wrote to PTY.
   describe('attachment(queued_command) attribution', () => {
-    function queuedCommand(uuid: string, prompt: string, timestamp?: string): TranscriptEvent {
+    function queuedCommand(uuid: string, prompt: string, timestamp?: string, commandMode?: string): TranscriptEvent {
       return {
         type: 'attachment',
         uuid,
         timestamp,
-        attachment: { type: 'queued_command', prompt },
+        attachment: { type: 'queued_command', prompt, commandMode },
       };
     }
 
@@ -745,6 +745,87 @@ describe('BridgeTurnQueue', () => {
       expect(peek).toHaveLength(1);
       expect(peek[0].turnId).toBe('t1');
       expect(peek[0].assistantUuids).toEqual(['a1']);
+    });
+
+    it('task-notification queued_command is filtered: does not split the active Lark turn', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1', makeFingerprint('run the research task'), Date.parse('2026-06-10T13:05:58.982Z'));
+      q.ingest([
+        user('u1', 'run the research task', '2026-06-10T13:06:06.637Z'),
+        assistant('a-start', 'I will inspect the repo first.'),
+        queuedCommand(
+          'q-task',
+          '<task-notification>\n<task-id>agent-1</task-id>\n<status>completed</status>\n</task-notification>',
+          '2026-06-10T13:09:30.130Z',
+          'task-notification',
+        ),
+        queuedCommand(
+          'q-task-no-mode',
+          '<task-notification>\n<task-id>agent-2</task-id>\n<status>completed</status>\n</task-notification>',
+          '2026-06-10T13:10:00.000Z',
+        ),
+        assistant('a-final', 'Final answer after the task notification.'),
+      ]);
+
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].turnId).toBe('t1');
+      expect(ready[0].isLocal).toBeFalsy();
+      expect(ready[0].assistantUuids).toEqual(['a-start', 'a-final']);
+    });
+
+    it('task notifications do not cap the send-marker window before the final botmux send', () => {
+      const q = new BridgeTurnQueue();
+      const firstPrompt = '<user_message>research startup hooks</user_message>';
+      q.mark('turn-1', makeFingerprint(firstPrompt), Date.parse('2026-06-10T13:05:58.982Z'));
+      q.ingest([
+        {
+          type: 'user',
+          uuid: 'u-lark',
+          timestamp: '2026-06-10T13:06:06.637Z',
+          message: { role: 'user', content: firstPrompt },
+        },
+        assistant('a-start', '我来先看图片和现有的启动检测逻辑，然后调研 Claude/Codex 的 hooks 能力。'),
+        queuedCommand(
+          'q-agent-a',
+          '<task-notification>\n<task-id>a777</task-id>\n<status>completed</status>\n</task-notification>',
+          '2026-06-10T13:09:30.130Z',
+          'task-notification',
+        ),
+        assistant('a-progress', 'Claude 侧完整闭环验证通过。清理现场，等 Codex 调研结果：'),
+        queuedCommand(
+          'q-agent-b',
+          '<task-notification>\n<task-id>a586</task-id>\n<status>completed</status>\n</task-notification>',
+          '2026-06-10T13:15:07.250Z',
+          'task-notification',
+        ),
+        assistant('a-final', '调研完成，结论已发飞书。简要总结：最终收尾文本。'),
+      ]);
+
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].turnId).toBe('turn-1');
+      expect(ready[0].isLocal).toBeFalsy();
+      expect(ready[0].assistantUuids).toEqual(['a-start', 'a-progress', 'a-final']);
+
+      const assistantText = [
+        '我来先看图片和现有的启动检测逻辑，然后调研 Claude/Codex 的 hooks 能力。',
+        'Claude 侧完整闭环验证通过。清理现场，等 Codex 调研结果：',
+        '调研完成，结论已发飞书。简要总结：最终收尾文本。',
+      ].join('\n\n');
+      const markers: BridgeSendMarker[] = [{
+        sentAtMs: Date.parse('2026-06-10T13:15:50.924Z'),
+        messageId: 'om_final',
+        contentLength: 1646,
+      }];
+      expect(
+        shouldSuppressBridgeEmit(
+          { markTimeMs: ready[0].markTimeMs, isLocal: ready[0].isLocal, finalText: assistantText },
+          undefined,
+          markers,
+          false,
+        ),
+      ).toBe(true);
     });
   });
 });

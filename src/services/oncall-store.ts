@@ -14,10 +14,11 @@
  * write race. The lock is also re-acquired around the read so the modify
  * step always works against the latest on-disk snapshot.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { getBot, type BotDefaultOncall, type OncallChat } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
 import { logger } from '../utils/logger.js';
+import { expandHomePath } from '../utils/working-dir.js';
 
 // ─── Manual binding ───────────────────────────────────────────────────────
 
@@ -178,6 +179,66 @@ export async function updateBotDefaultOncall(
 }
 
 /**
+ * Atomically set the per-bot「默认工作目录模式」(dashboard 三选一). The two underlying
+ * fields — `defaultWorkingDir` and `defaultOncall` — are mutually exclusive, so BOTH
+ * are written inside a SINGLE `rmwBotEntry` lock. Doing them as two separate locked
+ * writes (applyConfigField + updateBotDefaultOncall) lets two concurrent saves for
+ * different modes interleave and leave `defaultOncall.enabled` AND `defaultWorkingDir`
+ * both set — an inconsistent state where the UI shows oncall (derived from
+ * `defaultOncall.enabled`) but runtime pins `defaultWorkingDir` (see
+ * `effectiveDefaultWorkingDir`). PR #311 Codex review.
+ *
+ *   • 'off'     → clear defaultWorkingDir; disable defaultOncall (keep its prior dir
+ *                 so a later toggle back to oncall round-trips without retyping).
+ *   • 'default' → set defaultWorkingDir=dir; disable defaultOncall (keep prior dir).
+ *   • 'oncall'  → enable defaultOncall(dir) + re-stamp `since`; clear defaultWorkingDir.
+ *
+ * Caller validates `workingDir` (dir existence) first; it is ignored for 'off'.
+ */
+export async function setWorkingDirMode(
+  larkAppId: string,
+  mode: 'off' | 'default' | 'oncall',
+  workingDir: string,
+): Promise<
+  | { ok: true; defaultOncall: BotDefaultOncall; defaultWorkingDir: string | null }
+  | { ok: false; reason: string }
+> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+
+  const dir = (workingDir ?? '').trim();
+  let nextOncall: BotDefaultOncall | null = null;
+  let nextWorkingDir: string | null = null;
+
+  const r = await rmwBotEntry<null>(larkAppId, (entry) => {
+    const prior: BotDefaultOncall | undefined = entry.defaultOncall;
+    if (mode === 'oncall') {
+      nextOncall = { enabled: true, workingDir: dir, since: Date.now() };
+      nextWorkingDir = null;
+    } else {
+      // off / default → disable defaultOncall, keep its prior workingDir for round-trip.
+      nextOncall = { enabled: false, workingDir: prior?.workingDir ?? '', since: prior?.since ?? 0 };
+      nextWorkingDir = mode === 'default' ? dir : null;
+    }
+    entry.defaultOncall = nextOncall;
+    if (nextWorkingDir === null) delete entry.defaultWorkingDir;
+    else entry.defaultWorkingDir = nextWorkingDir;
+    return { write: true, result: null };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+
+  // Sync in-memory config (runtime reads bot.config directly — no restart needed).
+  bot.config.defaultOncall = nextOncall!;
+  bot.config.defaultWorkingDir = nextWorkingDir ?? undefined;
+  logger.info(
+    `[oncall:${larkAppId}] working-dir mode=${mode} ` +
+    `(defaultWorkingDir=${nextWorkingDir ?? '∅'}, oncall.enabled=${nextOncall!.enabled}, ` +
+    `oncall.dir=${nextOncall!.workingDir || '∅'})`,
+  );
+  return { ok: true, defaultOncall: nextOncall!, defaultWorkingDir: nextWorkingDir };
+}
+
+/**
  * Auto-bind a chat as part of the defaultOncall flow. Atomically:
  *   1. RE-CHECK tombstone + existing binding against the freshest on-disk
  *      snapshot. The daemon's fast-path tombstone check is informational —
@@ -248,6 +309,39 @@ export async function autoBindOncallFromDefault(
 
   logger.info(`[oncall:${larkAppId}] auto-bind (default) chat=${chatId} dir=${workingDir}`);
   return { ok: true, entry: next, created: r.result.created };
+}
+
+/**
+ * 前置 auto-bind：dispatcher 在权限判断前调用，保证 oncall 群的首条 @bot 消息
+ * 不被误判为"无权限"弹授权申请卡。
+ *
+ * 做了与 daemon 侧一致的快速短路：非群聊 / defaultOncall 未开 / 已在 tombstone 列表
+ * / chat 已有显式 oncall 绑定 → 立刻 return；否则调 autoBindOncallFromDefault
+ * （内部会在锁内做权威二次校验）。idempotent，daemon spawn 路径二次调用安全。
+ */
+export async function ensureDefaultOncallBound(
+  larkAppId: string,
+  chatId: string,
+  chatType: 'group' | 'p2p',
+): Promise<OncallChat | undefined> {
+  if (chatType !== 'group') return undefined;
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return undefined; }
+  const def = bot.config.defaultOncall;
+  if (!def?.enabled || !def.workingDir) return undefined;
+  // fast-path: tombstone 或已显式绑定 —— 跳过磁盘写
+  if ((bot.config.defaultOncallAutoboundChats ?? []).includes(chatId)) return undefined;
+  if (bot.config.oncallChats?.some(c => c.chatId === chatId)) return undefined;
+  const resolved = expandHomePath(def.workingDir);
+  let isDir = false;
+  try { isDir = statSync(resolved).isDirectory(); } catch { /* not a dir */ }
+  if (!isDir) {
+    logger.warn(`[oncall:${larkAppId}] defaultOncall workingDir invalid (${resolved}); skipping auto-bind chat=${chatId}`);
+    return undefined;
+  }
+  const r = await autoBindOncallFromDefault(larkAppId, chatId, def.workingDir);
+  if (!r.ok || r.skipped) return undefined;
+  return r.entry;
 }
 
 // Test helper — read raw bots.json synchronously. Not for production use.

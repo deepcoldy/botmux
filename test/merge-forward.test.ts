@@ -124,13 +124,9 @@ describe('expandMergeForward: resources', () => {
 describe('expandMergeForward: interactive cards via parent userCardContent', () => {
   beforeEach(() => getMessageDetailMock.mockReset());
 
-  // Lark's merge_forward + userCardContent:true now returns real v2 card
-  // bodies for interactive children (this used to 500 — see fd0f688 — but
-  // is now fixed). We try true first; on failure fall back to false so we
-  // still get the simplified shape rather than dropping the whole tree.
-  // Per-sub refetch is NOT used: forwarded cards from a foreign tenant
-  // return 232010 on the single-message endpoint even when the parent is
-  // readable.
+  // We try userCardContent:true on the parent first. When it works (some
+  // merge_forward shapes), interactive children already carry real v2 bodies
+  // and no per-sub refetch is needed — so this path stays a single API call.
   it('passes userCardContent:true on the parent call and surfaces real card bodies', async () => {
     getMessageDetailMock.mockResolvedValueOnce({
       items: [
@@ -154,16 +150,28 @@ describe('expandMergeForward: interactive cards via parent userCardContent', () 
     expect(getMessageDetailMock).toHaveBeenCalledWith('app_test', 'om_root', { userCardContent: true });
   });
 
-  it('falls back to userCardContent:false when the true call throws (e.g. legacy 500)', async () => {
-    getMessageDetailMock.mockRejectedValueOnce(new Error('Request failed with status code 500'));
-    getMessageDetailMock.mockResolvedValueOnce({
+  // When the parent userCardContent:true 500s (still common — Lark code 2200),
+  // we fall back to userCardContent:false, which returns rich reply cards as a
+  // bare "请升级…" placeholder. We then PER-SUB refetch each degraded card with
+  // userCardContent:true on its own message_id to recover the real v2 body.
+  it('recovers a degraded sub-card via per-sub refetch (same-tenant)', async () => {
+    getMessageDetailMock.mockRejectedValueOnce(new Error('Request failed with status code 500')); // parent true → 500
+    getMessageDetailMock.mockResolvedValueOnce({ // parent false → simplified fallback shell
       items: [
         { message_id: 'om_card', upper_message_id: 'om_root', msg_type: 'interactive',
           sender: { id: 'ou_alice', sender_type: 'user' },
           body: { content: JSON.stringify({
-            // Simplified fallback — what we get on the false path.
             title: null,
             elements: [[{ tag: 'text', text: '请升级至最新版本客户端，以查看内容' }]],
+          }) } },
+      ],
+    });
+    getMessageDetailMock.mockResolvedValueOnce({ // per-sub om_card true → real body
+      items: [
+        { message_id: 'om_card', msg_type: 'interactive',
+          body: { content: JSON.stringify({
+            schema: '2.0',
+            body: { elements: [{ tag: 'div', text: { content: '真实卡片内容' } }] },
           }) } },
       ],
     });
@@ -171,12 +179,40 @@ describe('expandMergeForward: interactive cards via parent userCardContent', () 
     const parsed = fakeParsed();
     await expandMergeForward('app_test', 'om_root', parsed);
 
+    expect(parsed.content).toContain('真实卡片内容');
+    expect(parsed.content).not.toContain('请升级至最新版本客户端');
+
+    expect(getMessageDetailMock).toHaveBeenCalledTimes(3);
+    expect(getMessageDetailMock).toHaveBeenNthCalledWith(1, 'app_test', 'om_root', { userCardContent: true });
+    expect(getMessageDetailMock).toHaveBeenNthCalledWith(2, 'app_test', 'om_root', { userCardContent: false });
+    expect(getMessageDetailMock).toHaveBeenNthCalledWith(3, 'app_test', 'om_card', { userCardContent: true });
+  });
+
+  // Cross-tenant sub-cards 232010 on the single-message endpoint even when the
+  // parent merge_forward is readable — the per-sub refetch is caught and we keep
+  // the simplified shape rather than dropping the card.
+  it('keeps the simplified shape when the per-sub refetch fails (cross-tenant 232010)', async () => {
+    getMessageDetailMock.mockRejectedValueOnce(new Error('Request failed with status code 500')); // parent true → 500
+    getMessageDetailMock.mockResolvedValueOnce({ // parent false → fallback shell
+      items: [
+        { message_id: 'om_card', upper_message_id: 'om_root', msg_type: 'interactive',
+          sender: { id: 'ou_alice', sender_type: 'user' },
+          body: { content: JSON.stringify({
+            title: null,
+            elements: [[{ tag: 'text', text: '请升级至最新版本客户端，以查看内容' }]],
+          }) } },
+      ],
+    });
+    getMessageDetailMock.mockRejectedValueOnce(new Error('lark 232010 different tenants')); // per-sub refetch → 232010
+
+    const parsed = fakeParsed();
+    await expandMergeForward('app_test', 'om_root', parsed);
+
     expect(parsed.msgType).toBe('merge_forward_expanded');
     expect(parsed.content).toContain('请升级至最新版本客户端');
 
-    expect(getMessageDetailMock).toHaveBeenCalledTimes(2);
-    expect(getMessageDetailMock).toHaveBeenNthCalledWith(1, 'app_test', 'om_root', { userCardContent: true });
-    expect(getMessageDetailMock).toHaveBeenNthCalledWith(2, 'app_test', 'om_root', { userCardContent: false });
+    expect(getMessageDetailMock).toHaveBeenCalledTimes(3);
+    expect(getMessageDetailMock).toHaveBeenNthCalledWith(3, 'app_test', 'om_card', { userCardContent: true });
   });
 });
 

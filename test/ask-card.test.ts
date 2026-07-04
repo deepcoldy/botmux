@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { PendingAsk } from '../src/core/ask-types.js';
 
@@ -14,6 +14,7 @@ import {
   _resetForTest,
   registerAsk,
   setCardDispatcher,
+  setCanTalkChecker,
   submitAsk,
 } from '../src/core/ask-broker.js';
 import {
@@ -28,13 +29,18 @@ import {
 
 const mockedSubmitAsk = vi.mocked(submitAsk);
 
+// 答复鉴权 = canTalk。卡片点击测试里默认只放行 ou_owner，其余（如 ou_intruder）拒绝。
+beforeEach(() => {
+  setCanTalkChecker((_app, _chat, openId) => openId === 'ou_owner');
+});
+
 afterEach(() => {
   _resetForTest();
   // 只清计数/记录，不重置实现（spy 默认透传真实 submitAsk）
   mockedSubmitAsk.mockClear();
 });
 
-/** 构造一个带 questions/askId/nonce/deadlineAt/approvers 的 PendingAsk。 */
+/** 构造一个带 questions/askId/nonce/deadlineAt 的 PendingAsk。 */
 function makePending(overrides: Partial<PendingAsk> = {}): PendingAsk {
   return {
     askId: 'ask-1',
@@ -43,7 +49,6 @@ function makePending(overrides: Partial<PendingAsk> = {}): PendingAsk {
     chatId: 'oc_chat',
     rootMessageId: 'om_root',
     sessionId: 'sess-1',
-    approvers: new Set(['ou_owner']),
     questions: [
       {
         prompt: '线上 latency 涨了 30%，下一步怎么处理？',
@@ -88,15 +93,15 @@ describe('buildAskCard', () => {
     expect(blob).toContain('"key":"a"');
   });
 
-  it('单问卡片：渲染 prompt、approver、ask_id、nonce', () => {
+  it('单问卡片：渲染 prompt、可答复栏、ask_id、nonce', () => {
     const card = JSON.parse(buildAskCard(makePending()));
     const text = JSON.stringify(card);
 
     expect(card.header.title.content).toBe('botmux ask');
     expect(text).toContain('线上 latency');
-    // approver 应在卡片的 meta div fields 中（经 escapeMd 处理后 _ 被转义为 \_）
+    // 可答复栏 = canTalk 语义，统一显示「本群可对话成员」，不再按 open_id 列名单
     const metaDiv = card.elements[0];
-    expect(metaDiv.fields[1].text.content).toContain('ou\\_owner');
+    expect(metaDiv.fields[1].text.content).toContain('可对话成员');
     expect(text).toContain('"ask_id":"ask-1"');
     expect(text).toContain('"nonce":"nonce-1"');
     // 单问单选：稳定 action button，点击即答；不使用会被飞书 silent-drop 的 form/select_static
@@ -104,6 +109,28 @@ describe('buildAskCard', () => {
     expect(text).not.toContain('select_static');
     expect(text).not.toContain('"tag":"form"');
     expect(text).toContain('继续发布');
+  });
+
+  it('未 settle 卡片：含自定义回复提示（直接在话题里回复）', () => {
+    const text = buildAskCard(makePending());
+    expect(text).toContain('直接在话题');
+  });
+
+  it('settled 态（answered + comment）：渲染自定义回复文字与标签', () => {
+    const ask = makePending({
+      questions: [{ prompt: 'q', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] }],
+    });
+    const text = buildAskCard(ask, {
+      kind: 'answered',
+      answers: [[]],
+      by: 'ou_u',
+      comment: '我想先灰度 10%',
+      timedOut: false,
+    });
+    expect(text).toContain('自定义回复');
+    expect(text).toContain('我想先灰度 10%');
+    // header 仍为 answered 绿
+    expect(JSON.parse(text).header.template).toBe('green');
   });
 
   it('多问/多选：使用 buttons + submit，不使用 form/select_static', () => {
@@ -191,7 +218,6 @@ describe('handleAskCardAction', () => {
       chatId: 'oc_chat',
       rootMessageId: 'om_root',
       sessionId: 'sess-1',
-      approvers: new Set(['ou_owner']),
       questions: makePending().questions,
       timeoutMs: 10_000,
     });
@@ -242,7 +268,6 @@ describe('handleAskCardAction', () => {
       chatId: 'oc_chat',
       rootMessageId: 'om_root',
       sessionId: 'sess-1',
-      approvers: new Set(['ou_owner']),
       questions: makePending().questions,
       timeoutMs: 10_000,
     });
@@ -276,7 +301,6 @@ describe('handleAskCardAction', () => {
       chatId: 'oc_chat',
       rootMessageId: 'om_root',
       sessionId: 'sess-1',
-      approvers: new Set(['ou_owner']),
       questions: [
         { prompt: 'q', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
       ],
@@ -354,7 +378,6 @@ describe('handleAskCardAction: ask_submit 路径', () => {
       chatId: 'oc_chat',
       rootMessageId: 'om_root',
       sessionId: 'sess-1',
-      approvers: new Set(['ou_owner']),
       questions: [
         {
           prompt: '问题1',
@@ -384,7 +407,6 @@ describe('handleAskCardAction: ask_submit 路径', () => {
       chatId: 'oc_chat',
       rootMessageId: 'om_root',
       sessionId: 'sess-1',
-      approvers: new Set(['ou_owner']),
       questions: [
         { prompt: 'q', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
       ],
@@ -447,7 +469,6 @@ describe('handleAskCardAction: ask_submit 路径', () => {
       chatId: 'oc_chat',
       rootMessageId: 'om_root',
       sessionId: 'sess-1',
-      approvers: new Set(['ou_owner']),
       questions: [
         { prompt: 'q', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
       ],
@@ -486,7 +507,6 @@ describe('handleAskCardAction: ask_submit 路径', () => {
       chatId: 'oc_chat',
       rootMessageId: 'om_root',
       sessionId: 'sess-1',
-      approvers: new Set(['ou_owner']),
       questions: [
         { prompt: 'q1', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] },
         { prompt: 'q2', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },

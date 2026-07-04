@@ -1,7 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createHmac } from 'node:crypto';
 import {
+  mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync, statSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
   verifyHmac, generateToken, parseCookie, decideDashboardAuth,
+  loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
 } from '../src/dashboard/auth.js';
 
 const SECRET = 'a'.repeat(43); // base64url 32 bytes
@@ -52,6 +58,93 @@ describe('generateToken', () => {
   it('returns 43-char base64url (32 bytes)', () => {
     const t = generateToken();
     expect(t).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  });
+});
+
+describe('token persistence (survives restart, rotates only on `botmux dashboard`)', () => {
+  let dir: string;
+  let tokenPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'botmux-token-'));
+    tokenPath = join(dir, 'nested', '.dashboard-token');
+  });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('loadPersistedToken returns null when the file is absent', () => {
+    expect(loadPersistedToken(tokenPath)).toBeNull();
+  });
+
+  it('persistToken then loadPersistedToken round-trips the token (creates dirs)', () => {
+    const tok = generateToken();
+    persistToken(tokenPath, tok);
+    expect(loadPersistedToken(tokenPath)).toBe(tok);
+  });
+
+  it('persisted token survives a simulated restart (same file, new process)', () => {
+    const tok = generateToken();
+    persistToken(tokenPath, tok);
+    // A "restart" re-reads from disk — the previously-issued token is still active.
+    expect(loadPersistedToken(tokenPath)).toBe(tok);
+  });
+
+  it('re-running `botmux dashboard` overwrites the old token (old link invalidated)', () => {
+    const first = generateToken();
+    persistToken(tokenPath, first);
+    const second = generateToken();
+    persistToken(tokenPath, second);
+    expect(second).not.toBe(first);
+    expect(loadPersistedToken(tokenPath)).toBe(second);
+  });
+
+  it('persistToken writes the file with 0600 perms', () => {
+    persistToken(tokenPath, generateToken());
+    expect(statSync(tokenPath).mode & 0o777).toBe(0o600);
+  });
+
+  it('loadPersistedToken trims surrounding whitespace/newlines', () => {
+    const p = join(dir, 'spaced-token');
+    writeFileSync(p, '  tok-with-space\n');
+    expect(loadPersistedToken(p)).toBe('tok-with-space');
+  });
+
+  it('loadPersistedToken returns null for an empty file', () => {
+    const p = join(dir, 'empty-token');
+    writeFileSync(p, '   \n');
+    expect(loadPersistedToken(p)).toBeNull();
+    expect(existsSync(p)).toBe(true);
+  });
+
+  it('loadPersistedToken returns null when path is a directory (unreadable)', () => {
+    // dir itself exists but is not a file — read throws, helper swallows.
+    expect(loadPersistedToken(dir)).toBeNull();
+  });
+});
+
+describe('dashboard secret persistence', () => {
+  let dir: string;
+  let secretPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'botmux-secret-'));
+    secretPath = join(dir, 'nested', '.dashboard-secret');
+  });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('loadDashboardSecret returns null when file is absent or whitespace-only', () => {
+    expect(loadDashboardSecret(secretPath)).toBeNull();
+    const p = join(dir, 'empty-secret');
+    writeFileSync(p, '   \n');
+    expect(loadDashboardSecret(p)).toBeNull();
+  });
+
+  it('loadOrCreateDashboardSecret overwrites whitespace-only file with a fresh 0600 secret', () => {
+    mkdirSync(join(dir, 'nested'));
+    writeFileSync(secretPath, ' \n');
+    const secret = loadOrCreateDashboardSecret(secretPath);
+    expect(secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(loadDashboardSecret(secretPath)).toBe(secret);
+    expect(statSync(secretPath).mode & 0o777).toBe(0o600);
   });
 });
 
@@ -135,6 +228,40 @@ describe('decideDashboardAuth — public surface', () => {
       activeToken: TOK,
     });
     expect(d.kind).toBe('allow');
+  });
+
+  it('DELETE /api/whiteboards/:id without token → deny401', () => {
+    const d = decideDashboardAuth({
+      method: 'DELETE',
+      pathname: '/api/whiteboards/wb_test',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+      publicReadOnly: true,
+    });
+    expect(d.kind).toBe('deny401');
+  });
+
+  it('GET /game/index.html — HD2D office shell allow without any token', () => {
+    const d = decideDashboardAuth({
+      method: 'GET',
+      pathname: '/game/index.html',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('allow');
+  });
+
+  it('POST /api/game/download without token → deny401 (gated: triggers a ~74MB fetch)', () => {
+    const d = decideDashboardAuth({
+      method: 'POST',
+      pathname: '/api/game/download',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('deny401');
   });
 });
 
@@ -294,5 +421,102 @@ describe('decideDashboardAuth — ?t=<token> cookie set redirect', () => {
       activeToken: '',
     });
     expect(d.kind).toBe('deny401');
+  });
+});
+
+describe('decideDashboardAuth — publicReadOnly mode', () => {
+  const TOK = 'tok-active';
+
+  it('tokenless GET /api/sessions → allow (read-only visitor)', () => {
+    const d = decideDashboardAuth({
+      method: 'GET', pathname: '/api/sessions', hasTokenParam: false,
+      presentedToken: undefined, activeToken: TOK, publicReadOnly: true,
+    });
+    expect(d.kind).toBe('allow');
+  });
+
+  it('tokenless GET /events (SSE) → allow', () => {
+    const d = decideDashboardAuth({
+      method: 'GET', pathname: '/events', hasTokenParam: false,
+      presentedToken: undefined, activeToken: TOK, publicReadOnly: true,
+    });
+    expect(d.kind).toBe('allow');
+  });
+
+  it('tokenless POST (write) → still deny401', () => {
+    const d = decideDashboardAuth({
+      method: 'POST', pathname: '/api/sessions/sess-1/close', hasTokenParam: false,
+      presentedToken: undefined, activeToken: TOK, publicReadOnly: true,
+    });
+    expect(d.kind).toBe('deny401');
+  });
+
+  it('tokenless GET raw PTY log → still deny401 (sensitive carve-out)', () => {
+    const d = decideDashboardAuth({
+      method: 'GET', pathname: '/api/workflows/run-1/nodes/n1/terminal-log/raw', hasTokenParam: false,
+      presentedToken: undefined, activeToken: TOK, publicReadOnly: true,
+    });
+    expect(d.kind).toBe('deny401');
+  });
+
+  it('publicReadOnly off → tokenless GET /api/sessions denied (legacy behavior)', () => {
+    const d = decideDashboardAuth({
+      method: 'GET', pathname: '/api/sessions', hasTokenParam: false,
+      presentedToken: undefined, activeToken: TOK, publicReadOnly: false,
+    });
+    expect(d.kind).toBe('deny401');
+  });
+
+  it('stale token GET behaves like tokenless read-only (no 401 wall)', () => {
+    const d = decideDashboardAuth({
+      method: 'GET', pathname: '/api/schedules', hasTokenParam: false,
+      presentedToken: 'rotated-away', activeToken: TOK, publicReadOnly: true,
+    });
+    expect(d.kind).toBe('allow');
+  });
+
+  it('management/config reads stay behind the token even in publicReadOnly', () => {
+    for (const pathname of [
+      '/api/connectors',
+      '/api/connectors/stats',
+      '/api/webhook-secrets',
+      '/api/trigger-logs',
+      '/api/bot-onboarding/ob-1',
+      // Allow-list is fail-closed: these read endpoints are NOT public-readable
+      // (role/persona content, per-bot oncall config, CLI option metadata).
+      '/api/roles/cli_app/oc_chat',
+      '/api/bots',
+      '/api/skills',
+      '/api/cli-options',
+      // Mints a token-bearing writable terminal URL — never public, even in
+      // publicReadOnly (the daemon IPC behind it is also loopback-HMAC gated).
+      '/api/sessions/sess-1/write-link',
+      // A path that doesn't exist yet must also default to private.
+      '/api/some-future-read',
+    ]) {
+      const d = decideDashboardAuth({
+        method: 'GET', pathname, hasTokenParam: false,
+        presentedToken: undefined, activeToken: TOK, publicReadOnly: true,
+      });
+      expect(d.kind, pathname).toBe('deny401');
+    }
+  });
+
+  it('allow-listed watch-work reads are public in publicReadOnly', () => {
+    for (const pathname of ['/api/sessions', '/api/schedules', '/api/settings', '/api/groups', '/events']) {
+      const d = decideDashboardAuth({
+        method: 'GET', pathname, hasTokenParam: false,
+        presentedToken: undefined, activeToken: TOK, publicReadOnly: true,
+      });
+      expect(d.kind, pathname).toBe('allow');
+    }
+  });
+
+  it('token holder still reads management endpoints in publicReadOnly', () => {
+    const d = decideDashboardAuth({
+      method: 'GET', pathname: '/api/connectors', hasTokenParam: false,
+      presentedToken: TOK, activeToken: TOK, publicReadOnly: true,
+    });
+    expect(d.kind).toBe('allow');
   });
 });

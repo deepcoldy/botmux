@@ -1,15 +1,18 @@
 import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync } from 'node:fs';
 import { dirname, extname, basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
-import { Client, LoggerLevel } from '@larksuiteoapi/node-sdk';
-import { getBotClient, getAllBots, getBot } from '../../bot-registry.js';
+import { Client } from '@larksuiteoapi/node-sdk';
+import { getBotClient, getAllBots, getBot, formatLarkError } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
 import { config } from '../../config.js';
+import { emitHookEvent } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
+import { BoundedMap } from '../../utils/bounded-map.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
+import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -32,14 +35,34 @@ export async function larkGet(c: any, url: string, params: LarkRequestParams = {
   return c.request({ method: 'GET', url, params });
 }
 
-// Cached lightweight Lark clients for all configured bots (for isInChat checks)
+// Cached lightweight Lark clients for all configured bots (for isInChat checks).
+//
+// These clients exist solely for the is_in_chat probe below, where failures are
+// EXPECTED for configured bots that can't be checked against this chat
+// (other-tenant bot → 232010, app missing im:chat scopes → 99991672). The SDK's
+// generic request() dumps the full AxiosError through its logger before
+// rethrowing, so with the default console logger every probe miss splashed a
+// ~100-line stack/config blob into `botmux bots list` stdout / daemon logs.
+// Silencing via loggerLevel is impossible — the SDK's LoggerProxy does
+// `params.loggerLevel || LoggerLevel.info` and `LoggerLevel.fatal` is 0/falsy —
+// so route the SDK's own logging to a condensed debug line instead. The probe's
+// catch below stays the primary reporter (also one debug line per miss).
+const fmtProbe = (msg: any[]) => msg.map((m) => formatLarkError(m) ?? (typeof m === 'string' ? m : String(m))).join(' ');
+const probeLarkLogger = {
+  fatal: (...msg: any[]) => logger.debug(`[lark:isInChat] ${fmtProbe(msg)}`),
+  error: (...msg: any[]) => logger.debug(`[lark:isInChat] ${fmtProbe(msg)}`),
+  warn:  (...msg: any[]) => logger.debug(`[lark:isInChat] ${fmtProbe(msg)}`),
+  info:  (..._msg: any[]) => { /* 'client ready' × every configured bot — noise */ },
+  debug: (..._msg: any[]) => { /* dropped */ },
+  trace: (..._msg: any[]) => { /* dropped */ },
+};
 let allBotClients: Array<{ appId: string; cliId: string; client: InstanceType<typeof Client> }> | null = null;
 function getAllBotClients() {
   if (!allBotClients) {
     allBotClients = loadBotConfigs().map((cfg) => ({
       appId: cfg.larkAppId,
       cliId: cfg.cliId,
-      client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, loggerLevel: LoggerLevel.error }),
+      client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, domain: sdkDomain(normalizeBrand(cfg.brand)), logger: probeLarkLogger }),
     }));
   }
   return allBotClients;
@@ -55,12 +78,32 @@ export class MessageWithdrawnError extends Error {
   }
 }
 
+/**
+ * Thrown ONLY when a resource download genuinely needs (re-)authorization: no
+ * usable User Token on disk, or the User Token was rejected as unauthorized
+ * (HTTP 401). Callers gate the "/login" prompt on `instanceof` this — NOT on a
+ * substring of the message — so an ordinary download failure (4xx/5xx for a
+ * cross-tenant / card-image / withdrawn resource) is no longer misreported as
+ * "missing User Token, please /login" even though a valid token was used.
+ */
+export class UserTokenMissingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UserTokenMissingError';
+  }
+}
+
 /** Extract Lark error code from AxiosError or SDK error. */
 function getLarkErrorCode(err: any): number | undefined {
   return err?.response?.data?.code ?? err?.code;
 }
 
 const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
+// Capability cache for the undocumented `/members/bots` endpoint. It prevents
+// repeated hits while the tenant/gateway cannot serve the API, but per-request
+// business errors (bad chat id, permission denial) must not poison other chats.
+const LIST_BOTS_API_FAILURE_TTL_MS = 3 * 60 * 1000;
+const listBotsApiFailures = new Map<string, { reason: string; expiresAt: number }>();
 
 /**
  * Send a message to a chat.
@@ -72,7 +115,7 @@ const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
  * idempotencyKey here so retries don't re-send.  Existing callers omit
  * the param and get exactly the pre-Step-6 behavior.
  */
-export async function sendMessage(larkAppId: string, chatId: string, content: string, msgType: string = 'text', uuid?: string): Promise<string> {
+export async function sendMessage(larkAppId: string, chatId: string, content: string, msgType: string = 'text', uuid?: string, hookContext?: Record<string, unknown>): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
@@ -102,6 +145,15 @@ export async function sendMessage(larkAppId: string, chatId: string, content: st
   const messageId = res.data?.message_id;
   if (!messageId) throw new Error('No message_id in response');
   logger.info(`Sent message ${messageId} to chat ${chatId}`);
+  emitHookEvent('outbound.send', {
+    ...hookContext,
+    larkAppId,
+    chatId,
+    messageId,
+    msgType,
+    uuid,
+    content,
+  });
   return messageId;
 }
 
@@ -112,7 +164,7 @@ export async function sendMessage(larkAppId: string, chatId: string, content: st
  * spike report §1.4 for the reply-specific test results, including the
  * cross-parent dedupe behavior that informs the inputHash design.
  */
-export async function replyMessage(larkAppId: string, messageId: string, content: string, msgType: string = 'text', replyInThread: boolean = false, uuid?: string): Promise<string> {
+export async function replyMessage(larkAppId: string, messageId: string, content: string, msgType: string = 'text', replyInThread: boolean = false, uuid?: string, hookContext?: Record<string, unknown>): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
@@ -142,6 +194,16 @@ export async function replyMessage(larkAppId: string, messageId: string, content
   const replyId = res.data?.message_id;
   if (!replyId) throw new Error('No message_id in reply response');
   logger.info(`Replied ${replyId} to message ${messageId} [msgType=${msgType}, replyInThread=${replyInThread}]`);
+  emitHookEvent('outbound.reply', {
+    ...hookContext,
+    larkAppId,
+    messageId,
+    replyId,
+    msgType,
+    replyInThread,
+    uuid,
+    content,
+  });
   return replyId;
 }
 
@@ -200,6 +262,41 @@ export async function resolveUnionIdFromOpenId(
     logger.debug(`[union_id] resolve threw for ${openId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
     return null;
   }
+}
+
+/** 用户资料（名字+头像）查询缓存：key = appId:idType:id。负结果也缓存——
+ *  不在通讯录可见范围（41050）的用户每次查都会失败，别反复打 API。 */
+const userProfileCache = new Map<string, { name: string; avatarUrl?: string } | null>();
+const USER_PROFILE_CACHE_MAX = 1000;
+
+/**
+ * Best-effort 拉用户资料（名字 + 头像 URL）。拿不到（缺 scope / 不在可见
+ * 范围 / 网络错误）返回 null，调用方自行回退占位。
+ */
+export async function getUserProfile(
+  larkAppId: string,
+  userId: string,
+  idType: 'open_id' | 'union_id' = 'open_id',
+): Promise<{ name: string; avatarUrl?: string } | null> {
+  const key = `${larkAppId}:${idType}:${userId}`;
+  const hit = userProfileCache.get(key);
+  if (hit !== undefined) return hit;
+  let out: { name: string; avatarUrl?: string } | null = null;
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(userId)}`, {
+      user_id_type: idType,
+    });
+    const u = res?.code === 0 ? res?.data?.user : null;
+    if (u?.name) {
+      out = { name: String(u.name), avatarUrl: u.avatar?.avatar_72 ?? u.avatar?.avatar_240 ?? undefined };
+    }
+  } catch (err) {
+    logger.debug(`[user-profile] lookup threw for ${userId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+  }
+  if (userProfileCache.size >= USER_PROFILE_CACHE_MAX) userProfileCache.clear();
+  userProfileCache.set(key, out);
+  return out;
 }
 
 /**
@@ -332,7 +429,9 @@ export async function getChatName(larkAppId: string, chatId: string): Promise<st
  * chat) which the user perceives as a loading spinner. Mirrors the TTL
  * cache `getChatMode` already has. */
 interface ChatInfoCacheEntry { name: string | null; mode: ChatMode; cachedAt: number }
-const chatInfoCache = new Map<string, ChatInfoCacheEntry>();
+// Bounded: keyed per (appId, chatId); TTL handles freshness on read, the cap
+// stops the entry count growing with every distinct chat the bot ever touches.
+const chatInfoCache = new BoundedMap<string, ChatInfoCacheEntry>(1000);
 const CHAT_INFO_TTL_MS = 5 * 60 * 1000;
 
 export async function getChatNameAndMode(
@@ -384,7 +483,7 @@ export async function getChatNameAndMode(
  *                perspective (chat-scope by default) */
 export type ChatMode = 'group' | 'topic' | 'p2p';
 
-const chatModeCache = new Map<string, { mode: ChatMode; cachedAt: number }>();
+const chatModeCache = new BoundedMap<string, { mode: ChatMode; cachedAt: number }>(1000);
 const CHAT_MODE_TTL_MS = 5 * 60 * 1000; // 5 min — chat_mode can change when a group is converted to topic mode
 
 /** Resolve the conversational topology of a chat (话题群 vs 普通群 vs p2p).
@@ -443,6 +542,12 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
     logger.warn(`getChatModeStrict(${chatId}) errored: ${err?.message ?? err}`);
     return 'unknown';
   }
+}
+
+export function getCachedChatMode(larkAppId: string, chatId: string): ChatMode | undefined {
+  const cached = chatModeCache.get(`${larkAppId}::${chatId}`);
+  if (cached && Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS) return cached.mode;
+  return undefined;
 }
 
 export async function getChatMode(
@@ -587,15 +692,16 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
 
   // Fallback: User Token from botmux OAuth (/login)
   const bot = getBot(larkAppId);
-  const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret);
+  const brand = normalizeBrand(bot.config.brand);
+  const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
   if (!userToken) {
-    throw new Error(
+    throw new UserTokenMissingError(
       `App Token 无法下载此资源，且未找到可用的 User Token。` +
       `请在话题中发送 /login 完成授权后重试。`
     );
   }
 
-  await downloadWithUserToken(userToken, messageId, fileKey, type, savePath);
+  await downloadWithUserToken(userToken, messageId, fileKey, type, savePath, brand);
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via User Token)`);
 }
 
@@ -614,14 +720,21 @@ async function downloadWithAppToken(larkAppId: string, messageId: string, fileKe
   await writeResourceToDisk(res, savePath);
 }
 
-async function downloadWithUserToken(userToken: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
-  const url = `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=${type}`;
+async function downloadWithUserToken(userToken: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, brand: Brand = 'feishu'): Promise<void> {
+  const url = `${larkHosts(brand).openApi}/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=${type}`;
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${userToken}` },
   });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error(`User Token download failed: HTTP ${res.status} ${body}`);
+    // 401 = the token itself was rejected (expired / wrong scope) → genuinely
+    // needs re-login. Any other status (403/404/4xx/5xx) means the token is
+    // fine but THIS resource can't be fetched (cross-tenant, card image,
+    // withdrawn) — surface as a plain failure so it does NOT trigger /login.
+    if (res.status === 401) {
+      throw new UserTokenMissingError(`User Token 已失效（HTTP 401）。请在话题中发送 /login 重新授权后重试。`);
+    }
+    throw new Error(`Resource download failed: HTTP ${res.status} ${body}`);
   }
   const buf = Buffer.from(await res.arrayBuffer());
   writeFileSync(savePath, buf);
@@ -661,15 +774,20 @@ export async function uploadImage(larkAppId: string, imagePath: string): Promise
   return imageKey;
 }
 
-export async function uploadFile(larkAppId: string, filePath: string): Promise<string> {
+export async function uploadFile(larkAppId: string, filePath: string, opts?: { duration?: number }): Promise<string> {
   const c = getBotClient(larkAppId);
   const buf = readFileSync(filePath);
   const ext = extname(filePath).toLowerCase();
   const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
   const fileName = basename(filePath);
+  // `duration` (ms) only applies to opus voice uploads — it sets the length
+  // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
+  const duration = fileType === 'opus' && opts?.duration
+    ? Math.max(1000, Math.round(opts.duration))
+    : undefined;
   // SDK returns { file_key } directly (not wrapped in { code, data })
   const res = await c.im.v1.file.create({
-    data: { file_type: fileType as any, file_name: fileName, file: buf },
+    data: { file_type: fileType as any, file_name: fileName, file: buf, ...(duration ? { duration } : {}) },
   });
   const fileKey = res?.file_key;
   if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
@@ -701,8 +819,8 @@ export async function resolveAllowedUsersWithMap(
   const unionIds: string[] = [];
   for (const v of raw) {
     if (v.startsWith('ou_')) {
-      openIds.push(v);
       map.set(v, v);
+      openIds.push(v);
     } else if (v.startsWith('on_')) {
       // union_id (跨应用稳定)：运行时权限/私信/卡片全是 open_id 原生的，
       // 启动时用本 app 凭证把 on_ 翻成本 app 的 ou_，下游一律照旧用 open_id。
@@ -711,60 +829,87 @@ export async function resolveAllowedUsersWithMap(
       emails.push(v);
     }
   }
-  if (emails.length === 0 && unionIds.length === 0) return { resolved: openIds, map };
 
-  const c = getBotClient(larkAppId);
+  if (emails.length > 0 || unionIds.length > 0 || openIds.length > 0) {
+    const c = getBotClient(larkAppId);
 
-  // union_id → 本 app open_id（单条查询；失败则丢弃该条，与 email 解析失败同口径）。
-  for (const uid of unionIds) {
-    try {
-      const res = await (c as any).contact.v3.user.get({
-        path: { user_id: uid },
-        params: { user_id_type: 'union_id' },
-      });
-      const oid = res?.data?.user?.open_id as string | undefined;
-      if (res.code === 0 && oid) {
-        openIds.push(oid);
-        map.set(uid, oid);
-        logger.info(`Resolved ${uid} → ${oid}`);
-      } else {
-        logger.warn(`Failed to resolve union_id ${uid} to open_id: ${res?.msg} (code: ${res?.code})`);
+    // Literal open_id is app-scoped. Keep it as-is for compatibility, but
+    // diagnose the common misconfiguration where a different app's ou_ is copied
+    // into this bot's allowedUsers and owner checks silently lock everyone out.
+    for (const oid of openIds) {
+      try {
+        const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(oid)}`, { user_id_type: 'open_id' });
+        if (res?.code === 99992361) {
+          logger.warn(`allowedUsers open_id ${oid} belongs to another app for ${larkAppId}; use email or union_id (on_) instead.`);
+        } else if (res?.code && res.code !== 0) {
+          logger.debug(`verify allowedUsers open_id ${oid} non-zero code: ${res.code} ${res.msg ?? ''}`);
+        }
+      } catch (err: any) {
+        logger.debug(`verify allowedUsers open_id ${oid} failed: ${err?.message ?? err}`);
       }
-    } catch (err: any) {
-      logger.warn(`resolve union_id ${uid} failed: ${err?.message ?? err}`);
+    }
+
+    // union_id → 本 app open_id（单条查询；失败则丢弃该条，与 email 解析失败同口径）。
+    for (const uid of unionIds) {
+      try {
+        const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(uid)}`, { user_id_type: 'union_id' });
+        const oid = res?.data?.user?.open_id as string | undefined;
+        if (res.code === 0 && oid) {
+          map.set(uid, oid);
+          logger.info(`Resolved ${uid} → ${oid}`);
+        } else {
+          logger.warn(`Failed to resolve union_id ${uid} to open_id: ${res?.msg} (code: ${res?.code})`);
+        }
+      } catch (err: any) {
+        logger.warn(`resolve union_id ${uid} failed: ${err?.message ?? err}`);
+      }
+    }
+
+    if (emails.length > 0) {
+      try {
+        const res = await (c as any).contact.v3.user.batchGetId({
+          params: { user_id_type: 'open_id' },
+          data: { emails, include_resigned: false },
+        });
+        if (res.code !== 0) {
+          logger.warn(`Failed to resolve emails to open_ids: ${res.msg} (code: ${res.code})`);
+        } else {
+          const userList: any[] = res.data?.user_list ?? [];
+          // 先按 normalized(email) → user_id 建查找表，再对原始请求的 raw email 逐个回填 map，
+          // 保证 map 的 key 与 allowedUsers 里的字面值完全一致（防 API 大小写/规范化错配）。
+          const byNorm = new Map<string, string>();
+          for (const item of userList) {
+            if (item.user_id && item.email) byNorm.set(String(item.email).toLowerCase(), item.user_id);
+            else if (!item.user_id) logger.warn(`Could not resolve email: ${item.email}`);
+          }
+          for (const rawEmail of emails) {
+            const uid = byNorm.get(rawEmail.toLowerCase());
+            if (uid) {
+              map.set(rawEmail, uid);
+              logger.info(`Resolved ${rawEmail} → ${uid}`);
+            }
+          }
+        }
+      } catch (err: any) {
+        logger.warn(`resolveAllowedUsers failed: ${err.message}`);
+      }
     }
   }
 
-  if (emails.length === 0) return { resolved: openIds, map };
-  try {
-    const res = await (c as any).contact.v3.user.batchGetId({
-      params: { user_id_type: 'open_id' },
-      data: { emails, include_resigned: false },
-    });
-    if (res.code !== 0) {
-      logger.warn(`Failed to resolve emails to open_ids: ${res.msg} (code: ${res.code})`);
-      return { resolved: openIds, map };
+  // 解析不改变顺序：按 allowedUsers 的「原始配置顺序」回填 open_id，使
+  // 「owner = 第一个 ou_」忠实反映配置里的排位（union/邮箱条目不再被甩到 ou_ 之后）。
+  // 不可解析的条目丢弃；同一 open_id 去重并保留首次出现位置（同一人可能同时以
+  // union/邮箱和字面 ou_ 两种形式登记）。
+  const seen = new Set<string>();
+  const resolved: string[] = [];
+  for (const v of raw) {
+    const oid = map.get(v);
+    if (oid && !seen.has(oid)) {
+      seen.add(oid);
+      resolved.push(oid);
     }
-    const userList: any[] = res.data?.user_list ?? [];
-    // 先按 normalized(email) → user_id 建查找表，再对原始请求的 raw email 逐个回填 map，
-    // 保证 map 的 key 与 allowedUsers 里的字面值完全一致（防 API 大小写/规范化错配）。
-    const byNorm = new Map<string, string>();
-    for (const item of userList) {
-      if (item.user_id && item.email) byNorm.set(String(item.email).toLowerCase(), item.user_id);
-      else if (!item.user_id) logger.warn(`Could not resolve email: ${item.email}`);
-    }
-    for (const rawEmail of emails) {
-      const uid = byNorm.get(rawEmail.toLowerCase());
-      if (uid) {
-        openIds.push(uid);
-        map.set(rawEmail, uid);
-        logger.info(`Resolved ${rawEmail} → ${uid}`);
-      }
-    }
-  } catch (err: any) {
-    logger.warn(`resolveAllowedUsers failed: ${err.message}`);
   }
-  return { resolved: openIds, map };
+  return { resolved, map };
 }
 
 /**
@@ -776,10 +921,7 @@ export async function resolveUserUnionId(larkAppId: string, openId: string): Pro
   if (!openId) return {};
   try {
     const c = getBotClient(larkAppId);
-    const res = await (c as any).contact.v3.user.get({
-      path: { user_id: openId },
-      params: { user_id_type: 'open_id' },
-    });
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, { user_id_type: 'open_id' });
     if (res.code === 0 && res.data?.user) {
       return { unionId: res.data.user.union_id ?? undefined, name: res.data.user.name ?? undefined };
     }
@@ -830,16 +972,21 @@ async function resolveThreadId(c: any, rootMessageId: string): Promise<string | 
  *  Callers can still ask for more via pageSize — we just paginate harder. */
 const LARK_MESSAGE_LIST_MAX_PAGE = 50;
 
+function wantsUnlimitedMessages(pageSize: number): boolean {
+  return pageSize <= 0 || !Number.isFinite(pageSize);
+}
+
 /** List thread messages using container_id_type="thread" (fast path). */
 async function listByThread(c: any, threadId: string, pageSize: number): Promise<any[]> {
   const allMessages: any[] = [];
   let pageToken: string | undefined;
+  const unlimited = wantsUnlimitedMessages(pageSize);
 
   do {
     const res = await larkGet(c, '/open-apis/im/v1/messages', {
       container_id_type: 'thread',
       container_id: threadId,
-      page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
+      page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
       sort_type: 'ByCreateTimeAsc',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
@@ -853,10 +1000,10 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
     }
 
     pageToken = res.data?.page_token;
-    if (allMessages.length >= pageSize) break;
+    if (!unlimited && allMessages.length >= pageSize) break;
   } while (pageToken);
 
-  return allMessages.slice(0, pageSize);
+  return unlimited ? allMessages : allMessages.slice(0, pageSize);
 }
 
 /** List chat-container messages, most-recent first but returned chronologically
@@ -871,12 +1018,13 @@ export async function listChatMessages(
   const c = getBotClient(larkAppId);
   const allMessages: any[] = [];
   let pageToken: string | undefined;
+  const unlimited = wantsUnlimitedMessages(pageSize);
 
   do {
     const res = await larkGet(c, '/open-apis/im/v1/messages', {
       container_id_type: 'chat',
       container_id: chatId,
-      page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
+      page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
       sort_type: 'ByCreateTimeDesc',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
@@ -890,11 +1038,61 @@ export async function listChatMessages(
     }
 
     pageToken = res.data?.page_token;
-    if (allMessages.length >= pageSize) break;
+    if (!unlimited && allMessages.length >= pageSize) break;
   } while (pageToken);
 
   // Cap to pageSize newest, then reverse to chronological for the caller.
-  return allMessages.slice(0, pageSize).reverse();
+  return (unlimited ? allMessages : allMessages.slice(0, pageSize)).reverse();
+}
+
+export interface ChatMessageScanOptions {
+  /** Lark page size per request. Clamped to the API max of 50. */
+  pageSize?: number;
+  /**
+   * Called while scanning newest -> oldest. Returning true stops after the
+   * current message has been included in the returned chronological list.
+   */
+  stopAfter?: (message: any, seenCount: number) => boolean;
+}
+
+/** Scan chat-container messages newest -> oldest until the caller's stop
+ * condition is met, then return the scanned window chronologically. */
+export async function listChatMessagesUntil(
+  larkAppId: string,
+  chatId: string,
+  options: ChatMessageScanOptions = {},
+): Promise<any[]> {
+  const c = getBotClient(larkAppId);
+  const allMessages: any[] = [];
+  let pageToken: string | undefined;
+  const rawPageSize = Number.isFinite(options.pageSize) ? Math.floor(options.pageSize as number) : LARK_MESSAGE_LIST_MAX_PAGE;
+  const pageSize = Math.min(Math.max(rawPageSize, 1), LARK_MESSAGE_LIST_MAX_PAGE);
+
+  do {
+    const res = await larkGet(c, '/open-apis/im/v1/messages', {
+      container_id_type: 'chat',
+      container_id: chatId,
+      page_size: pageSize,
+      sort_type: 'ByCreateTimeDesc',
+      ...(pageToken ? { page_token: pageToken } : {}),
+    });
+
+    if (res.code !== 0) {
+      throw new Error(`Failed to list chat messages: ${res.msg} (code: ${res.code})`);
+    }
+
+    const items = res.data?.items ?? [];
+    for (const item of items) {
+      allMessages.push(item);
+      if (options.stopAfter?.(item, allMessages.length)) {
+        return allMessages.reverse();
+      }
+    }
+
+    pageToken = res.data?.page_token;
+  } while (pageToken);
+
+  return allMessages.reverse();
 }
 
 export interface AmbientChatMessageOptions {
@@ -956,12 +1154,13 @@ export async function listAmbientChatMessages(
 async function listByChatFilter(c: any, chatId: string, rootMessageId: string, pageSize: number): Promise<any[]> {
   const allMessages: any[] = [];
   let pageToken: string | undefined;
+  const unlimited = wantsUnlimitedMessages(pageSize);
 
   do {
     const res = await larkGet(c, '/open-apis/im/v1/messages', {
       container_id_type: 'chat',
       container_id: chatId,
-      page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
+      page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
       sort_type: 'ByCreateTimeDesc',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
@@ -979,11 +1178,11 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
     }
 
     pageToken = res.data?.page_token;
-    if (allMessages.length >= pageSize) break;
+    if (!unlimited && allMessages.length >= pageSize) break;
   } while (pageToken);
 
   allMessages.sort((a, b) => (a.create_time ?? '').localeCompare(b.create_time ?? ''));
-  return allMessages;
+  return unlimited ? allMessages : allMessages.slice(0, pageSize);
 }
 
 /**
@@ -1024,7 +1223,110 @@ export type ChatBotMember = {
   mentionSource: 'cross-ref' | 'self' | 'observed' | 'fallback';
 };
 
+type ChatBotListApiItem = { botId: string; botName: string };
+type ChatBotListApiResult =
+  | { ok: true; items: ChatBotListApiItem[] }
+  | { ok: false; reason: string; cacheable: boolean };
+
+function promiseWithTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return p;
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+  return Promise.race([p, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+async function listChatBotsViaMembersBots(
+  larkAppId: string,
+  chatId: string,
+  timeoutMs: number,
+): Promise<ChatBotListApiResult> {
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await promiseWithTimeout(
+      larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/bots`),
+      timeoutMs,
+      'list chat bot members',
+    );
+    if (res?.code !== 0) return { ok: false, reason: `code=${res?.code ?? 'unknown'} msg=${res?.msg ?? ''}`, cacheable: false };
+    const rawItems = res?.data?.items;
+    if (!Array.isArray(rawItems)) return { ok: false, reason: 'invalid_items', cacheable: true };
+    const items = rawItems
+      .map((it: any) => ({
+        botId: String(it?.bot_id ?? '').trim(),
+        botName: String(it?.bot_name ?? '').trim(),
+      }))
+      .filter((it: ChatBotListApiItem) => it.botId && it.botName);
+    return { ok: true, items };
+  } catch (err: any) {
+    return { ok: false, reason: err?.message ?? String(err), cacheable: true };
+  }
+}
+
+// `/members/bots` returns the observer-scoped mention handle (`bot_id`) and
+// display name only. Bind botmux identity only when a configured bot has already
+// been proven to be in this chat and the name match is unique, OR the item's
+// observer-scoped `bot_id` equals a configured row's already-reliable open_id —
+// notably the observer's own bot, whose `/members/bots` `bot_id` IS its self-view
+// open_id. The open_id key guards against display-name drift between
+// `/members/bots` and bots-info.json (e.g. self leaking into <available_bots> as
+// a mentionable peer when its name no longer matches).
+function buildChatBotsFromMembersBotsApi(
+  items: ChatBotListApiItem[],
+  currentLarkAppId: string,
+  configured: ChatBotMember[],
+  crossRef: Map<string, string>,
+  norm: (s: string) => string,
+): ChatBotMember[] {
+  const configuredByName = new Map<string, ChatBotMember[]>();
+  const configuredByOpenId = new Map<string, ChatBotMember>();
+  for (const row of configured) {
+    const key = norm(row.displayName);
+    const arr = configuredByName.get(key);
+    if (arr) arr.push(row);
+    else configuredByName.set(key, [row]);
+    if (row.openId) configuredByOpenId.set(row.openId, row);
+  }
+
+  const out: ChatBotMember[] = [];
+  const seenOpenIds = new Set<string>();
+  for (const item of items) {
+    if (seenOpenIds.has(item.botId)) continue;
+    const key = norm(item.botName);
+    const matches = configuredByName.get(key) ?? [];
+    const bound = (matches.length === 1 ? matches[0] : undefined) ?? configuredByOpenId.get(item.botId);
+    const crossHit = crossRef.get(key);
+    const isSelf = bound?.larkAppId === currentLarkAppId;
+    const mentionSource: ChatBotMember['mentionSource'] = crossHit === item.botId
+      ? 'cross-ref'
+      : (isSelf ? 'self' : 'observed');
+
+    out.push({
+      larkAppId: bound?.larkAppId ?? '',
+      openId: item.botId,
+      name: bound?.name ?? item.botName,
+      displayName: item.botName,
+      source: bound ? 'configured' : 'introduce',
+      capability: bound?.capability,
+      hasTeamRole: bound?.hasTeamRole ?? false,
+      mentionable: true,
+      mentionSource,
+    });
+    seenOpenIds.add(item.botId);
+  }
+  return out;
+}
+
 export async function listChatBotMembers(larkAppId: string, chatId: string): Promise<ChatBotMember[]> {
+  // Single name-key normalizer used for EVERY cross-source name match below
+  // (cross-ref ⇄ bots-info ⇄ observed). Trim-only: strips incidental leading/
+  // trailing whitespace but stays case-sensitive, so two genuinely distinct bots
+  // whose names differ only in case ("Claude" vs "claude") never collide.
+  const norm = (s: string) => s.trim();
+
   // Read per-bot cross-reference: other bots' open_ids as seen by larkAppId's app.
   // This is populated from @mention data in Lark events (the only reliable source,
   // since Lark open_id is per-app scoped — a bot's self-reported open_id is
@@ -1035,7 +1337,7 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
     if (existsSync(crossRefPath)) {
       const data: Record<string, string> = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
       for (const [name, openId] of Object.entries(data)) {
-        crossRef.set(name.toLowerCase(), openId);
+        crossRef.set(norm(name), openId);
       }
     }
   } catch { /* ignore */ }
@@ -1060,7 +1362,7 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
         if (res.code === 0 && res.data?.is_in_chat) {
           const info = appIdToInfo.get(appId);
           // Prefer cross-reference (correct per-app open_id), fall back to self-seen
-          const crossHit = info?.botName ? crossRef.get(info.botName.toLowerCase()) : undefined;
+          const crossHit = info?.botName ? crossRef.get(norm(info.botName)) : undefined;
           const openId = crossHit ?? info?.botOpenId ?? appId;
           const isSelf = appId === larkAppId;
           // Reliable @-mention only when the per-app open_id was learned via
@@ -1083,12 +1385,33 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
           };
         }
       } catch (err) {
-        logger.debug(`isInChat check failed for ${appId}: ${err}`);
+        logger.debug(`isInChat check failed for ${appId}: ${formatLarkError(err) ?? err}`);
       }
       return null;
     }),
   );
   const configured: ChatBotMember[] = configuredResults.filter((r): r is ChatBotMember => r !== null);
+
+  const discovery = config.chatBotDiscovery;
+  if (discovery?.listBotsApiEnabled) {
+    const failureKey = larkAppId;
+    const cachedFailure = listBotsApiFailures.get(failureKey);
+    const now = Date.now();
+    if (cachedFailure && cachedFailure.expiresAt > now) {
+      logger.debug(`members/bots disabled by recent failure for ${larkAppId}: ${cachedFailure.reason}`);
+    } else {
+      if (cachedFailure) listBotsApiFailures.delete(failureKey);
+      const apiResult = await listChatBotsViaMembersBots(larkAppId, chatId, discovery.listBotsApiTimeoutMs);
+      if (apiResult.ok) {
+        listBotsApiFailures.delete(failureKey);
+        return buildChatBotsFromMembersBotsApi(apiResult.items, larkAppId, configured, crossRef, norm);
+      }
+      if (apiResult.cacheable) {
+        listBotsApiFailures.set(failureKey, { reason: apiResult.reason, expiresAt: now + LIST_BOTS_API_FAILURE_TTL_MS });
+      }
+      logger.warn(`members/bots failed for ${larkAppId} in ${chatId}; falling back to legacy bot discovery: ${apiResult.reason}`);
+    }
+  }
 
   // Merge observed entries (from /introduce), scoped to the caller's observer
   // app so open_ids match how THIS daemon should @-mention them (open_id is
@@ -1101,8 +1424,15 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   //   2) Otherwise (no/ambiguous match) → append as an external bot.
   try {
     const observedList = listObservedBots(config.session.dataDir, larkAppId, chatId);
+    const latestObservedByName = new Map<string, (typeof observedList)[number]>();
+    for (const o of observedList) {
+      const k = norm(o.name);
+      const existing = latestObservedByName.get(k);
+      if (!existing || o.lastSeenAt > existing.lastSeenAt) {
+        latestObservedByName.set(k, o);
+      }
+    }
     const seenOpenIds = new Set(configured.map(b => b.openId));
-    const norm = (s: string) => s.trim().toLowerCase();
     const byName = new Map<string, number[]>();
     configured.forEach((b, i) => {
       const k = norm(b.displayName);
@@ -1110,29 +1440,32 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
       if (arr) arr.push(i); else byName.set(k, [i]);
     });
 
-    for (const o of observedList) {
-      if (seenOpenIds.has(o.openId)) continue;
+    for (const o of latestObservedByName.values()) {
+      const crossHit = crossRef.get(norm(o.name));
+      const openId = crossHit ?? o.openId;
+      const mentionSource: ChatBotMember['mentionSource'] = crossHit ? 'cross-ref' : 'observed';
+      if (seenOpenIds.has(openId)) continue;
       const matches = byName.get(norm(o.name)) ?? [];
       if (matches.length === 1) {
         const row = configured[matches[0]];
         // Upgrade only if not already a reliable cross-ref handle.
         if (row.mentionSource !== 'cross-ref') {
-          configured[matches[0]] = { ...row, openId: o.openId, mentionable: true, mentionSource: 'observed' };
-          seenOpenIds.add(o.openId);
+          configured[matches[0]] = { ...row, openId, mentionable: true, mentionSource };
+          seenOpenIds.add(openId);
         }
         continue; // matched → never also append as an external duplicate
       }
       configured.push({
         larkAppId: '',
-        openId: o.openId,
+        openId,
         name: o.name,
         displayName: o.name,
         source: 'introduce',
         hasTeamRole: false,
         mentionable: true,
-        mentionSource: 'observed',
+        mentionSource,
       });
-      seenOpenIds.add(o.openId);
+      seenOpenIds.add(openId);
     }
   } catch (err) {
     logger.debug(`Failed to load observed bots for ${chatId}: ${err}`);

@@ -2,23 +2,25 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+import { delay } from '../../utils/timing.js';
 
 export function createAidenAdapter(pathOverride?: string): CliAdapter {
-  const bin = resolveCommand(pathOverride ?? 'aiden');
+  // resolvedBin is lazy: setup constructs adapters only to read static
+  // modelChoices and must not shell out (see resolveCommand); the binary path
+  // is a spawn-time concern.
+  const rawBin = pathOverride ?? 'aiden';
+  let cachedBin: string | undefined;
   return {
     id: 'aiden',
-    resolvedBin: bin,
+    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume }) {
+    buildArgs({ sessionId, resume, disableCliBypass }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', sessionId);
       }
       // Aiden auto-generates session id for new sessions
-      args.push('--permission-mode', 'agentFull');
+      if (!disableCliBypass) args.push('--permission-mode', 'agentFull');
       return args;
     },
 

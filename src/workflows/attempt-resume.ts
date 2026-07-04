@@ -1,9 +1,11 @@
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import type { BackendType } from '../adapters/backend/types.js';
 import type { DaemonToWorker } from '../types.js';
 import type { Locale } from '../i18n/index.js';
 import {
@@ -22,12 +24,16 @@ import {
   isValidPathSegment,
   isValidRunId,
 } from './ops-projection.js';
+import { prependBotmuxBin } from '../core/botmux-wrapper.js';
 
 export const ATTEMPT_RESUME_SCHEMA_VERSION = 1;
 export const ATTEMPT_RESUME_IDLE_MS = 30 * 60 * 1000;
 export const ATTEMPT_RESUME_GRACE_MS = 5000;
-export const RESUME_REQUIRES_CLI_SESSION_ID = new Set(['antigravity', 'codex-app', 'cursor', 'mira']);
-export const RESUME_USES_SESSION_ID = new Set(['aiden', 'coco', 'claude-code', 'codex', 'mtr', 'hermes']);
+// opencode 也在此列：它的 --session 需要 DB 里真实存在的 ses_* id。主路径（daemon
+// 会话）有 <session_id> 文本反查兜底，但 workflow attempt 的 prompt 不带该块，
+// 只能依赖 writeInput 捕获到的 cliSessionId；缺失时宁可明确报错也不静默新起会话。
+export const RESUME_REQUIRES_CLI_SESSION_ID = new Set(['antigravity', 'codex-app', 'cursor', 'mira', 'opencode']);
+export const RESUME_USES_SESSION_ID = new Set(['aiden', 'coco', 'claude-code', 'seed', 'relay', 'codex', 'mtr', 'hermes', 'pi', 'mir']);
 
 export type AttemptResumeStatus = 'starting' | 'live' | 'closed';
 
@@ -59,7 +65,7 @@ export type AttemptResumeBot = {
   larkAppSecret: string;
   cliId: string;
   cliPathOverride?: string;
-  backendType?: 'pty' | 'tmux';
+  backendType?: BackendType;
   botName?: string;
   botOpenId?: string;
   locale?: Locale;
@@ -235,7 +241,7 @@ export class AttemptResumeManager {
       cwd: workingDir,
       env: {
         ...process.env,
-        PATH: `${join(homedir(), '.botmux', 'bin')}:${process.env.PATH ?? ''}`,
+        PATH: prependBotmuxBin(join(homedir(), '.botmux', 'bin'), process.env.PATH),
         BOTMUX_WORKFLOW: '1',
         BOTMUX_WORKFLOW_RESUME: '1',
         BOTMUX_WORKFLOW_RUN_ID: input.runId,
@@ -456,7 +462,7 @@ export class AttemptResumeManager {
       ...(status === 'closed' ? { closedAt: now, closeReason: entry.closeReason } : {}),
     };
     mkdirSync(dirname(entry.sidecarPath), { recursive: true });
-    writeFileSync(entry.sidecarPath, JSON.stringify(sidecar, null, 2), 'utf-8');
+    atomicWriteFileSync(entry.sidecarPath, JSON.stringify(sidecar, null, 2));
   }
 
   private resumeUrl(webPort: number, writeToken: string): string {

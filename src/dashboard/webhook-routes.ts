@@ -1,19 +1,17 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { getConnector, type ConnectorDefinition } from '../services/connector-store.js';
 import { getWebhookSecret } from '../services/webhook-key.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import { appendTriggerLog } from '../services/trigger-log-store.js';
-import { extractWebhookLifecycle } from '../services/webhook-lifecycle-extractors.js';
+import { extractDedupKey } from '../services/webhook-lifecycle-extractors.js';
 import {
   activateWebhookLifecycleGroup,
   beginWebhookLifecycleFiring,
   failWebhookLifecycleGroup,
-  resolveWebhookLifecycleGroup,
-  type WebhookLifecycleRecord,
 } from '../services/webhook-lifecycle-store.js';
 import { jsonRes } from './workflow-api.js';
-import { dispatchTriggerRequest, newTriggerId, type TriggerApiDeps } from './trigger-api.js';
+import { dispatchTriggerRequest, newTriggerId, queryTriggerResult, type TriggerApiDeps } from './trigger-api.js';
 
 const replayNonces = new Map<string, number>();
 const rateBuckets = new Map<string, { windowStart: number; count: number }>();
@@ -23,10 +21,6 @@ export type WebhookRouteDeps = TriggerApiDeps & {
     connector: ConnectorDefinition,
     args: { dedupKey: string },
   ) => Promise<{ chatId: string; creatorLarkAppId?: string }>;
-  closeLifecycleGroup?: (
-    connector: ConnectorDefinition,
-    record: WebhookLifecycleRecord,
-  ) => Promise<{ ok: boolean; error?: string }>;
 };
 
 function headerValue(req: IncomingMessage, name: string): string | undefined {
@@ -67,6 +61,32 @@ export function verifyWebhookSignature(secret: string, ts: string, rawBody: Buff
     .digest();
   const got = parseSignature(sig);
   return !!got && got.length === expected.length && timingSafeEqual(got, expected);
+}
+
+// Bearer-token mode: the presented token IS the secret. Constant-time compare,
+// no body integrity / replay protection (that's the usability/security trade —
+// see `token` verify mode). Empty presented token never matches.
+export function verifyWebhookToken(secret: string, presented: string): boolean {
+  if (!secret || !presented) return false;
+  const a = Buffer.from(secret, 'utf-8');
+  const b = Buffer.from(presented, 'utf-8');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+// Token carriers, in priority order: path segment > ?token= query > Authorization
+// Bearer > x-botmux-token header. Path is the default (whole URL = credential).
+function extractWebhookToken(req: IncomingMessage, url: URL, pathToken: string | undefined): string | undefined {
+  if (pathToken) return pathToken;
+  const fromQuery = url.searchParams.get('token');
+  if (fromQuery) return fromQuery;
+  const auth = headerValue(req, 'authorization');
+  if (auth) {
+    const m = auth.match(/^Bearer\s+(.+)$/i);
+    if (m) return m[1].trim();
+  }
+  const fromHeader = headerValue(req, 'x-botmux-token');
+  if (fromHeader) return fromHeader;
+  return undefined;
 }
 
 function timestampOk(ts: string, toleranceSeconds: number): boolean {
@@ -132,6 +152,36 @@ function dynamicChatId(req: IncomingMessage, url: URL, payload: unknown): string
   return undefined;
 }
 
+function dynamicSessionId(req: IncomingMessage, url: URL, payload: unknown): string | undefined {
+  const fromQuery = url.searchParams.get('sessionId') ?? undefined;
+  if (fromQuery) return fromQuery;
+  const fromHeader = headerValue(req, 'x-botmux-session-id');
+  if (fromHeader) return fromHeader;
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    const p = payload as any;
+    if (typeof p.sessionId === 'string') return p.sessionId;
+    if (p.target && typeof p.target === 'object' && typeof p.target.sessionId === 'string') return p.target.sessionId;
+  }
+  return undefined;
+}
+
+function parseTriggerResponseOptions(
+  req: IncomingMessage,
+  url: URL,
+): { waitForFinalOutput?: true; asyncReturnSessionId?: true; timeoutMs?: number } {
+  const rawWait = url.searchParams.get('wait') ?? headerValue(req, 'x-botmux-wait');
+  const wait = rawWait === '1' || rawWait === 'true' || rawWait === 'yes';
+  const rawAsync = url.searchParams.get('async') ?? headerValue(req, 'x-botmux-async');
+  const asyncReturnSessionId = rawAsync === '1' || rawAsync === 'true' || rawAsync === 'yes';
+  const rawTimeout = url.searchParams.get('timeoutMs') ?? headerValue(req, 'x-botmux-timeout-ms');
+  const timeoutMs = rawTimeout ? Number(rawTimeout) : undefined;
+  return {
+    ...(wait ? { waitForFinalOutput: true } : {}),
+    ...(asyncReturnSessionId ? { asyncReturnSessionId: true } : {}),
+    ...(Number.isFinite(timeoutMs) ? { timeoutMs } : {}),
+  };
+}
+
 function webhookError(
   res: ServerResponse,
   status: number,
@@ -171,17 +221,69 @@ export async function handleWebhookRoute(
   url: URL,
   deps: WebhookRouteDeps,
 ): Promise<boolean> {
-  const m = url.pathname.match(/^\/webhook\/([^/]+)$/);
+  // Second path segment (optional) carries the bearer token for `token` mode:
+  //   /webhook/<connectorId>            → token via query / Authorization header
+  //   /webhook/<connectorId>/<token>    → token baked into the URL (default)
+  const m = url.pathname.match(/^\/webhook\/([^/]+)(?:\/([^/]+))?$/);
   if (!m) return false;
-  if (req.method !== 'POST') {
+  if (req.method !== 'POST' && req.method !== 'GET') {
     jsonRes(res, 405, { ok: false, errorCode: 'bad_request', error: 'method not allowed' });
     return true;
   }
 
   const connectorId = decodeURIComponent(m[1]);
+  const pathToken = m[2] ? decodeURIComponent(m[2]) : undefined;
   const connector = getConnector(connectorId);
   if (!connector || !connector.enabled) {
     webhookError(res, 404, connectorId, 'bad_request', 'unknown or disabled connector');
+    return true;
+  }
+
+  if (req.method === 'GET') {
+    // Async polling has no body, so HMAC mode signs over an empty payload.
+    const verify = connector.verify;
+    if (verify.type === 'token') {
+      const presented = extractWebhookToken(req, url, pathToken);
+      const secret = getWebhookSecret(verify.secretRef);
+      if (!presented || !secret || !verifyWebhookToken(secret, presented)) {
+        webhookError(res, 401, connectorId, 'invalid_signature', 'token verification failed');
+        return true;
+      }
+    } else {
+      const ts = headerValue(req, verify.timestampHeader);
+      const nonce = headerValue(req, verify.nonceHeader);
+      const sig = headerValue(req, verify.signatureHeader);
+      if (!ts || !nonce || !sig) {
+        webhookError(res, 401, connectorId, 'invalid_signature', 'missing signature, timestamp, or nonce header');
+        return true;
+      }
+      if (!timestampOk(ts, verify.toleranceSeconds)) {
+        webhookError(res, 401, connectorId, 'replay', 'timestamp outside tolerance window');
+        return true;
+      }
+      const secret = getWebhookSecret(verify.secretRef);
+      if (!secret || !verifyWebhookSignature(secret, ts, Buffer.alloc(0), sig)) {
+        webhookError(res, 401, connectorId, 'invalid_signature', 'signature verification failed');
+        return true;
+      }
+    }
+    const botId = connector.target.botId;
+    if (!botId) {
+      webhookError(res, 400, connectorId, 'target_required', 'target botId is required');
+      return true;
+    }
+    if (connector.target.kind !== 'turn') {
+      webhookError(res, 400, connectorId, 'bad_request', 'async polling is only supported for turn connectors');
+      return true;
+    }
+    const sessionId = url.searchParams.get('sessionId') ?? undefined;
+    const triggerId = url.searchParams.get('triggerId') ?? undefined;
+    if (!sessionId) {
+      webhookError(res, 400, connectorId, 'target_required', 'sessionId is required for async polling');
+      return true;
+    }
+    const result = await queryTriggerResult(botId, sessionId, deps, triggerId);
+    jsonRes(res, result.status, result.body);
     return true;
   }
 
@@ -198,101 +300,155 @@ export async function handleWebhookRoute(
     return true;
   }
 
+  // `requestId` becomes source.requestId on the trigger. HMAC mode reuses the
+  // caller's nonce; token mode has no nonce so we mint one.
   const verify = connector.verify;
-  const ts = headerValue(req, verify.timestampHeader);
-  const nonce = headerValue(req, verify.nonceHeader);
-  const sig = headerValue(req, verify.signatureHeader);
-  if (!ts || !nonce || !sig) {
-    webhookError(res, 401, connectorId, 'invalid_signature', 'missing signature, timestamp, or nonce header');
-    return true;
-  }
-  if (!timestampOk(ts, verify.toleranceSeconds)) {
-    webhookError(res, 401, connectorId, 'replay', 'timestamp outside tolerance window');
-    return true;
-  }
-  if (!claimNonce(connector.id, nonce, verify.toleranceSeconds)) {
-    webhookError(res, 409, connectorId, 'replay', 'nonce replay detected');
-    return true;
-  }
-  const secret = getWebhookSecret(verify.secretRef);
-  if (!secret || !verifyWebhookSignature(secret, ts, rawBody, sig)) {
-    webhookError(res, 401, connectorId, 'invalid_signature', 'signature verification failed');
-    return true;
+  let requestId: string;
+  if (verify.type === 'token') {
+    const presented = extractWebhookToken(req, url, pathToken);
+    const secret = getWebhookSecret(verify.secretRef);
+    if (!presented || !secret || !verifyWebhookToken(secret, presented)) {
+      webhookError(res, 401, connectorId, 'invalid_signature', 'token verification failed');
+      return true;
+    }
+    requestId = `whk_${randomUUID()}`;
+  } else {
+    const ts = headerValue(req, verify.timestampHeader);
+    const nonce = headerValue(req, verify.nonceHeader);
+    const sig = headerValue(req, verify.signatureHeader);
+    if (!ts || !nonce || !sig) {
+      webhookError(res, 401, connectorId, 'invalid_signature', 'missing signature, timestamp, or nonce header');
+      return true;
+    }
+    if (!timestampOk(ts, verify.toleranceSeconds)) {
+      webhookError(res, 401, connectorId, 'replay', 'timestamp outside tolerance window');
+      return true;
+    }
+    if (!claimNonce(connector.id, nonce, verify.toleranceSeconds)) {
+      webhookError(res, 409, connectorId, 'replay', 'nonce replay detected');
+      return true;
+    }
+    const secret = getWebhookSecret(verify.secretRef);
+    if (!secret || !verifyWebhookSignature(secret, ts, rawBody, sig)) {
+      webhookError(res, 401, connectorId, 'invalid_signature', 'signature verification failed');
+      return true;
+    }
+    requestId = nonce;
   }
 
   const parsed = parsePayload(rawBody);
+  const responseOptions = parseTriggerResponseOptions(req, url);
+  if ((responseOptions.waitForFinalOutput || responseOptions.asyncReturnSessionId) && connector.target.kind !== 'turn') {
+    webhookError(res, 400, connectorId, 'bad_request', 'wait mode is only supported for turn connectors');
+    return true;
+  }
+  if (responseOptions.waitForFinalOutput || responseOptions.asyncReturnSessionId) {
+    const chatId = connector.target.mode === 'fixed'
+      ? connector.target.chatId
+      : dynamicChatId(req, url, parsed.payload);
+    const sessionId = dynamicSessionId(req, url, parsed.payload);
+    const allowChats = connector.target.allowChats ?? [];
+    if (chatId && allowChats.length > 0 && !allowChats.includes(chatId)) {
+      webhookError(res, 403, connectorId, 'chat_not_allowed', 'chatId is not allowed for this connector');
+      return true;
+    }
+    const trigger: TriggerRequest = {
+      source: {
+        type: 'webhook',
+        connectorId: connector.id,
+        requestId,
+        receivedAt: new Date().toISOString(),
+      },
+      target: {
+        kind: connector.target.kind,
+        botId: connector.target.botId,
+        ...(chatId ? { chatId } : {}),
+        ...(sessionId ? { sessionId } : {}),
+      },
+      envelope: {
+        format: 'botmux.webhook.v1',
+        sourceName: connector.promptEnvelope.sourceName || connector.name,
+        trusted: false,
+        headers: pickAllowedHeaders(req, connector.promptEnvelope.headerAllowlist),
+        payload: parsed.payload,
+        ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
+      },
+      ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
+      options: responseOptions,
+    };
+
+    const result = await dispatchTriggerRequest(trigger, deps);
+    jsonRes(res, result.status, result.body);
+    return true;
+  }
   if (connector.target.mode === 'new-group') {
-    const extracted = extractWebhookLifecycle(parsed.payload, connector.lifecycleExtractors);
-    if (!extracted.ok) {
-      webhookError(res, 400, connectorId, 'lifecycle_extract_failed', extracted.error);
-      return true;
-    }
-    const { dedupKey, status } = extracted.lifecycle;
+    // Dedup is optional. Configured → events with the same extracted value share
+    // one group (create once, reuse after). Not configured → every event spins
+    // up a fresh group. (No firing/resolved status; groups are never auto-closed.)
+    const dedupPath = connector.lifecycleExtractors?.dedupKey;
+    let chatId: string | undefined;
+    let dedupKey: string | undefined;
+    let action: 'create' | 'reuse' = 'create';
 
-    if (status === 'resolved') {
-      const resolved = await resolveWebhookLifecycleGroup(connector.id, dedupKey);
-      let closeResult: { ok: boolean; error?: string } | undefined;
-      if (resolved.action === 'close' && resolved.record?.chatId) {
-        closeResult = deps.closeLifecycleGroup
-          ? await deps.closeLifecycleGroup(connector, resolved.record)
-          : { ok: false, error: 'closeLifecycleGroup hook not configured' };
-      }
-      const body = webhookOkLog(connector.id, 'ignored', `lifecycle ${resolved.action}`);
-      jsonRes(res, closeResult?.ok === false ? 502 : 200, {
-        ...body,
-        lifecycle: { dedupKey, status, action: resolved.action, chatId: resolved.record?.chatId },
-        ...(closeResult?.ok === false ? { ok: false, errorCode: 'trigger_failed', error: closeResult.error } : {}),
-      });
-      return true;
-    }
-
-    const begun = await beginWebhookLifecycleFiring(connector.id, dedupKey);
-    if (begun.action === 'creating') {
-      jsonRes(res, 202, {
-        ...webhookOkLog(connector.id, 'ignored', 'lifecycle group creation already in progress'),
-        lifecycle: { dedupKey, status, action: 'creating' },
-      });
-      return true;
-    }
-
-    let chatId = begun.action === 'reuse' ? begun.record.chatId : undefined;
-    if (begun.action === 'create') {
-      if (!deps.createLifecycleGroup) {
-        await failWebhookLifecycleGroup(connector.id, dedupKey, begun.record.lifecycleId);
-        webhookError(res, 501, connector.id, 'group_create_failed', 'createLifecycleGroup hook not configured');
+    if (dedupPath) {
+      const value = extractDedupKey(parsed.payload, dedupPath);
+      if (!value) {
+        webhookError(res, 400, connectorId, 'lifecycle_extract_failed', 'dedup_key_not_found');
         return true;
       }
-      let created: { chatId: string; creatorLarkAppId?: string };
-      try {
-        created = await deps.createLifecycleGroup(connector, { dedupKey });
-      } catch (e: any) {
-        await failWebhookLifecycleGroup(connector.id, dedupKey, begun.record.lifecycleId);
-        webhookError(res, 502, connector.id, 'group_create_failed', e?.message ?? String(e));
-        return true;
-      }
-      const activated = await activateWebhookLifecycleGroup(
-        connector.id,
-        dedupKey,
-        begun.record.lifecycleId,
-        created.chatId,
-        { creatorLarkAppId: created.creatorLarkAppId },
-      );
-      if (activated.status === 'pending_resolved') {
-        const closeResult = deps.closeLifecycleGroup && activated.record
-          ? await deps.closeLifecycleGroup(connector, activated.record)
-          : { ok: true };
-        jsonRes(res, closeResult.ok ? 200 : 502, {
-          ...webhookOkLog(connector.id, 'ignored', 'lifecycle resolved before group activation'),
-          lifecycle: { dedupKey, status: 'resolved', action: 'closed', chatId: created.chatId },
-          ...(closeResult.ok ? {} : { ok: false, errorCode: 'trigger_failed', error: closeResult.error }),
+      dedupKey = value;
+      const begun = await beginWebhookLifecycleFiring(connector.id, dedupKey);
+      if (begun.action === 'creating') {
+        jsonRes(res, 202, {
+          ...webhookOkLog(connector.id, 'ignored', 'lifecycle group creation already in progress'),
+          lifecycle: { dedupKey, action: 'creating' },
         });
         return true;
       }
-      if (activated.status !== 'active' || !activated.record?.chatId) {
-        webhookError(res, 409, connector.id, 'replay', 'lifecycle record was replaced before activation');
+      if (begun.action === 'reuse') {
+        action = 'reuse';
+        chatId = begun.record.chatId;
+      } else {
+        if (!deps.createLifecycleGroup) {
+          await failWebhookLifecycleGroup(connector.id, dedupKey, begun.record.lifecycleId);
+          webhookError(res, 501, connector.id, 'group_create_failed', 'createLifecycleGroup hook not configured');
+          return true;
+        }
+        let created: { chatId: string; creatorLarkAppId?: string };
+        try {
+          created = await deps.createLifecycleGroup(connector, { dedupKey });
+        } catch (e: any) {
+          await failWebhookLifecycleGroup(connector.id, dedupKey, begun.record.lifecycleId);
+          webhookError(res, 502, connector.id, 'group_create_failed', e?.message ?? String(e));
+          return true;
+        }
+        const activated = await activateWebhookLifecycleGroup(
+          connector.id,
+          dedupKey,
+          begun.record.lifecycleId,
+          created.chatId,
+          { creatorLarkAppId: created.creatorLarkAppId },
+        );
+        if (activated.status !== 'active' || !activated.record?.chatId) {
+          webhookError(res, 409, connector.id, 'replay', 'lifecycle record was replaced before activation');
+          return true;
+        }
+        chatId = activated.record.chatId;
+      }
+    } else {
+      // No dedup: a brand-new group per event (the group name uses the requestId
+      // for uniqueness). No lifecycle store record is kept — nothing to reuse.
+      if (!deps.createLifecycleGroup) {
+        webhookError(res, 501, connector.id, 'group_create_failed', 'createLifecycleGroup hook not configured');
         return true;
       }
-      chatId = activated.record.chatId;
+      try {
+        const created = await deps.createLifecycleGroup(connector, { dedupKey: requestId.slice(0, 16) });
+        chatId = created.chatId;
+      } catch (e: any) {
+        webhookError(res, 502, connector.id, 'group_create_failed', e?.message ?? String(e));
+        return true;
+      }
     }
 
     if (!chatId) {
@@ -304,7 +460,7 @@ export async function handleWebhookRoute(
       source: {
         type: 'webhook',
         connectorId: connector.id,
-        requestId: nonce,
+        requestId,
         receivedAt: new Date().toISOString(),
       },
       target: {
@@ -321,23 +477,24 @@ export async function handleWebhookRoute(
         payload: parsed.payload,
         ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
       },
-      options: { dedupKey, status },
+      ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
+      options: { ...(dedupKey ? { dedupKey } : {}), ...responseOptions },
     };
 
     const result = await dispatchTriggerRequest(trigger, deps);
-    jsonRes(res, result.status, { ...result.body, lifecycle: { dedupKey, action: begun.action, chatId } });
+    jsonRes(res, result.status, { ...result.body, lifecycle: { ...(dedupKey ? { dedupKey } : {}), action, chatId } });
     return true;
   }
 
   const chatId = connector.target.mode === 'fixed'
     ? connector.target.chatId
     : dynamicChatId(req, url, parsed.payload);
-  if (!chatId) {
+  if (!chatId && !responseOptions.waitForFinalOutput) {
     webhookError(res, 400, connectorId, 'target_required', 'target chatId is required');
     return true;
   }
   const allowChats = connector.target.allowChats ?? [];
-  if (allowChats.length > 0 && !allowChats.includes(chatId)) {
+  if (chatId && allowChats.length > 0 && !allowChats.includes(chatId)) {
     webhookError(res, 403, connectorId, 'chat_not_allowed', 'chatId is not allowed for this connector');
     return true;
   }
@@ -346,7 +503,7 @@ export async function handleWebhookRoute(
     source: {
       type: 'webhook',
       connectorId: connector.id,
-      requestId: nonce,
+      requestId,
       receivedAt: new Date().toISOString(),
     },
     target: {
@@ -363,7 +520,8 @@ export async function handleWebhookRoute(
       payload: parsed.payload,
       ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
     },
-    options: {},
+    ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
+    options: responseOptions,
   };
 
   const result = await dispatchTriggerRequest(trigger, deps);

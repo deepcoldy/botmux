@@ -1,0 +1,13 @@
+{
+  "name": "botmux-docs",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "rspress dev",
+    "build": "rspress build",
+    "preview": "rspress preview"
+  },
+  "devDependencies": {
+    "@rspress/core": "^2.0.13"
+  }
+}

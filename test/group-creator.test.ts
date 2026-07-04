@@ -20,24 +20,39 @@ const mockTransferChatOwner = vi.fn();
 const mockGetChatOwner = vi.fn();
 const mockGetChatShareLink = vi.fn();
 const mockAddUsersByUnionId = vi.fn();
+const mockAddBotToChat = vi.fn();
 vi.mock('../src/services/groups-store.js', () => ({
   createChat: (...args: any[]) => mockCreateChat(...args),
   transferChatOwner: (...args: any[]) => mockTransferChatOwner(...args),
   getChatOwner: (...args: any[]) => mockGetChatOwner(...args),
   getChatShareLink: (...args: any[]) => mockGetChatShareLink(...args),
   addUsersToChatByUnionId: (...args: any[]) => mockAddUsersByUnionId(...args),
+  addBotToChat: (...args: any[]) => mockAddBotToChat(...args),
 }));
 
 const SHARE_LINK = 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=tok';
 
 const mockSendMessage = vi.fn();
+const mockListChatBotMembers = vi.fn();
 vi.mock('../src/im/lark/client.js', () => ({
   sendMessage: (...args: any[]) => mockSendMessage(...args),
+  listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
 }));
 
 const mockBindOncall = vi.fn();
 vi.mock('../src/services/oncall-store.js', () => ({
   bindOncall: (...args: any[]) => mockBindOncall(...args),
+}));
+
+const mockReadRoleProfileEntry = vi.fn();
+vi.mock('../src/services/role-profile-store.js', () => ({
+  isValidRoleProfileId: (id: string) => /^[A-Za-z0-9._-]{1,64}$/.test(id) && id !== '.' && id !== '..',
+  readRoleProfileEntry: (...args: any[]) => mockReadRoleProfileEntry(...args),
+}));
+
+const mockWriteRoleFile = vi.fn();
+vi.mock('../src/core/role-resolver.js', () => ({
+  writeRoleFile: (...args: any[]) => mockWriteRoleFile(...args),
 }));
 
 import { createGroupWithBots } from '../src/services/group-creator.js';
@@ -53,12 +68,19 @@ describe('createGroupWithBots', () => {
     mockGetChatOwner.mockReset();
     mockGetChatShareLink.mockReset();
     mockSendMessage.mockReset();
+    mockListChatBotMembers.mockReset();
     mockBindOncall.mockReset();
     mockAddUsersByUnionId.mockReset();
+    mockAddBotToChat.mockReset();
+    mockReadRoleProfileEntry.mockReset();
+    mockWriteRoleFile.mockReset();
     // Default: share-link fetch succeeds. group-creator always calls this after
     // createChat; individual tests override to exercise the fallback path.
     mockGetChatShareLink.mockResolvedValue({ ok: true, shareLink: SHARE_LINK });
     mockAddUsersByUnionId.mockResolvedValue({ invalidUserIds: [] });
+    mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) =>
+      ids.map(id => ({ id, ok: true })),
+    );
   });
 
   it('pulls bot owners into the chat by union_id; reports invalidOwnerUnionIds', async () => {
@@ -115,6 +137,8 @@ describe('createGroupWithBots', () => {
       shareLink: SHARE_LINK,
       shareLinkError: null,
       oncallBindings: [],
+      roleProfileBootstrapMessageId: null,
+      roleProfileBootstrapError: null,
     });
   });
 
@@ -139,7 +163,8 @@ describe('createGroupWithBots', () => {
     expect(mockCreateChat).toHaveBeenCalledTimes(1);
     const args = mockCreateChat.mock.calls[0];
     expect(args[0]).toBe(CREATOR);
-    expect(args[1].botIds).toEqual([OTHER_BOT]);  // creator filtered out
+    expect(args[1].botIds).toEqual([]);  // bots are added after createChat
+    expect(mockAddBotToChat).toHaveBeenCalledWith(CREATOR, 'oc_x', [OTHER_BOT]);
   });
 
   it('skips transfer when invitee was rejected by Lark', async () => {
@@ -241,9 +266,14 @@ describe('createGroupWithBots', () => {
   it('binds the newly created chat for joined bots when bindWorkingDir is provided', async () => {
     mockCreateChat.mockResolvedValue({
       chatId: 'oc_bound',
-      invalidBotIds: ['cli_rejected_bot'],
+      invalidBotIds: [],
       invalidUserIds: [],
     });
+    mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) =>
+      ids.map(id => id === 'cli_rejected_bot'
+        ? { id, ok: false, error: 'invalid_id' }
+        : { id, ok: true }),
+    );
     mockBindOncall.mockResolvedValue({ ok: true, created: true });
 
     const result = await createGroupWithBots({
@@ -295,9 +325,14 @@ describe('createGroupWithBots', () => {
   it('reports invalidBotIds/invalidUserIds passthrough from createChat', async () => {
     mockCreateChat.mockResolvedValue({
       chatId: 'oc_x',
-      invalidBotIds: ['cli_zombie'],
+      invalidBotIds: [],
       invalidUserIds: ['ou_banned'],
     });
+    mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) =>
+      ids.map(id => id === 'cli_zombie'
+        ? { id, ok: false, error: 'invalid_id' }
+        : { id, ok: true }),
+    );
     const result = await createGroupWithBots({
       creatorLarkAppId: CREATOR,
       larkAppIds: [CREATOR, 'cli_zombie'],
@@ -305,5 +340,85 @@ describe('createGroupWithBots', () => {
     });
     expect(result.invalidBotIds).toEqual(['cli_zombie']);
     expect(result.invalidUserIds).toEqual(['ou_banned']);
+  });
+
+  it('materializes the creator role directly and posts a bootstrap command for peers', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_profile', invalidBotIds: [], invalidUserIds: [] });
+    mockListChatBotMembers.mockResolvedValue([
+      { larkAppId: CREATOR, openId: 'ou_creator', mentionable: true, displayName: 'Creator' },
+      { larkAppId: OTHER_BOT, openId: 'ou_other', mentionable: true, displayName: 'Other' },
+    ]);
+    mockSendMessage.mockResolvedValue('om_bootstrap');
+    mockReadRoleProfileEntry.mockReturnValue('creator role');
+
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR, OTHER_BOT],
+      roleProfileId: 'collab-main',
+    });
+
+    expect(mockReadRoleProfileEntry).toHaveBeenCalledWith(expect.any(String), 'collab-main', CREATOR);
+    expect(mockWriteRoleFile).toHaveBeenCalledWith(CREATOR, 'oc_profile', 'creator role');
+    expect(mockListChatBotMembers).toHaveBeenCalledWith(CREATOR, 'oc_profile');
+    expect(mockSendMessage).toHaveBeenCalledWith(
+      CREATOR,
+      'oc_profile',
+      '<at user_id="ou_other"></at> /role profile apply collab-main --quiet',
+      'text',
+    );
+    expect(result.roleProfileBootstrapMessageId).toBe('om_bootstrap');
+    expect(result.roleProfileBootstrapError).toBeNull();
+  });
+
+  it('does not post a bootstrap command for a creator-only role profile group', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_profile_solo', invalidBotIds: [], invalidUserIds: [] });
+    mockReadRoleProfileEntry.mockReturnValue('solo creator role');
+
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      roleProfileId: 'collab-main',
+    });
+
+    expect(mockWriteRoleFile).toHaveBeenCalledWith(CREATOR, 'oc_profile_solo', 'solo creator role');
+    expect(mockListChatBotMembers).not.toHaveBeenCalled();
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result.roleProfileBootstrapMessageId).toBeNull();
+    expect(result.roleProfileBootstrapError).toBeNull();
+  });
+
+  it('reports no_applicable_entries for a solo group whose creator has no profile entry', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_profile_noentry', invalidBotIds: [], invalidUserIds: [] });
+    mockReadRoleProfileEntry.mockReturnValue(null);
+
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      roleProfileId: 'collab-main',
+    });
+
+    expect(mockWriteRoleFile).not.toHaveBeenCalled();
+    expect(mockListChatBotMembers).not.toHaveBeenCalled();
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result.roleProfileBootstrapMessageId).toBeNull();
+    expect(result.roleProfileBootstrapError).toBe('no_applicable_entries');
+  });
+
+  it('treats a solo group creator with an explicit empty entry as a valid (clear) entry', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_profile_empty', invalidBotIds: [], invalidUserIds: [] });
+    mockReadRoleProfileEntry.mockReturnValue(''); // explicit empty entry = clear, not missing
+
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      roleProfileId: 'collab-main',
+    });
+
+    // Nothing to write on a fresh chat, but '' is a real entry → not flagged.
+    expect(mockWriteRoleFile).not.toHaveBeenCalled();
+    expect(mockListChatBotMembers).not.toHaveBeenCalled();
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result.roleProfileBootstrapMessageId).toBeNull();
+    expect(result.roleProfileBootstrapError).toBeNull();
   });
 });

@@ -1,6 +1,6 @@
 # botmux
 
-飞书话题群 ↔ AI 编程 CLI 桥接。Daemon 监听飞书消息，每个新话题自动 spawn 一个独立 CLI 进程（Claude Code / Codex / Gemini / OpenCode / Antigravity）。
+飞书话题群 ↔ AI 编程 CLI 桥接。Daemon 监听飞书消息，每个新话题自动 spawn 一个独立 CLI 进程（Claude Code / Codex / Gemini / Genius / OpenCode / Antigravity / Pi）。
 
 ## 构建 & 运行
 
@@ -11,6 +11,30 @@ pnpm daemon:logs          # 查看日志
 ```
 
 - 每次修改后需要 `pnpm build` 然后 `pnpm daemon:restart`
+
+### 全局 `botmux` 指向哪个 checkout（多 checkout 切换）
+
+全局 `botmux` 命令走 `~/.botmux/bin/botmux` 这个瘦 wrapper（需 `~/.botmux/bin` 在 PATH 上，一次性写进 shell rc：`export PATH="$HOME/.botmux/bin:$PATH"`）。wrapper 指向哪个 checkout 的 `dist/cli.js`，由「最后写它的人」决定——daemon 启动时会写，本地多 checkout 间切换时用下面命令显式认领：
+
+```bash
+pnpm use:here             # 把全局 botmux wrapper 指向「当前 checkout」（仅改指向，不重启 daemon）
+pnpm switch:here          # = build + use:here 一步到位
+botmux restart            # use:here 后裸命令已解析到本 checkout，daemon 也从这重启
+BOTMUX_NO_CLAIM=1 pnpm use:here   # 逃生阀：本次不认领
+```
+
+- 故意**没**挂进 `build`——review/验证别人 PR 时纯 `pnpm build` 不会悄悄抢走全局指向
+- 实现见 `scripts/claim-botmux-bin.mjs`（与 `daemon.ts` 写的 wrapper 同构、幂等）
+
+### 改动需用户手动测试时 → 部署本 checkout 到 live daemon
+
+当某个改动需要用户在飞书里**手动验证**（而非纯单测能覆盖），改完并自测绿后，执行：
+
+```bash
+pnpm switch:here && botmux restart
+```
+
+把本 checkout 的 build 部署到 live daemon 供用户测试（`switch:here` = build + 把全局 `botmux` 指向本 checkout；`botmux restart` 从这里重启 daemon 并自动恢复 active sessions）。否则用户测的还是旧代码（典型症状：新加的命令/配置「找不到」）。⚠️ 这会让**所有 bot** 都跑本 checkout 的 build；测试/合并完成后记得切回 canonical checkout，以免该 review worktree 被删后全局 shim 失效。
 
 ## 模块结构
 
@@ -72,5 +96,5 @@ git push origin v1.x.x-canary.0
 3. `src/adapters/cli/registry.ts` 添加 import、switch case、export
 4. `src/worker.ts` 的 `CLI_DISPLAY_NAMES` 添加显示名
 5. `src/im/lark/card-builder.ts` 的 `cliDisplayNames` 添加显示名
-6. `src/cli.ts` 的 setup 交互菜单添加选项
+6. `src/setup/bot-config-editor.ts` 的 `CLI_ID_CHOICES`（序号映射，**新 CLI 一律追加到尾部**——历史序号是脚本化 setup 的稳定接口，插位会让老脚本静默选错）+ `CLI_DISPLAY_LABELS`（dashboard 添加机器人下拉的展示名，缺了会回退显示 id）。setup 级联菜单、dashboard 下拉与 sessions 页 CLI 过滤器均从 `CLI_OPTIONS` 派生，自动跟随，无需另改
 7. `README.md`、`README.en.md` 更新 CLI 列表

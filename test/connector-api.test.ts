@@ -71,6 +71,55 @@ describe('connector-api write routes', () => {
     expect(raw).toContain(created.connector.verify.secretRef);
   });
 
+  it('defaults to token mode and bakes the secret into the webhook URL path', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Easy alerts',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+      }),
+    }));
+    expect(created.connector.verify.type).toBe('token');
+    expect(created.webhookUrl).toContain(`/webhook/${created.connector.id}/${created.secret}`);
+  });
+
+  it('round-trips a trusted promptEnvelope.instruction and clears it on empty', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Alert handler',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+        promptEnvelope: { sourceName: 'alerts', instruction: '  总结告警并 @ oncall  ' },
+      }),
+    }));
+    expect(created.connector.promptEnvelope.instruction).toBe('总结告警并 @ oncall');
+
+    const id = created.connector.id;
+    const cleared = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ promptEnvelope: { sourceName: 'alerts', instruction: '' } }),
+    }));
+    expect(cleared.connector.promptEnvelope.instruction).toBeUndefined();
+  });
+
+  it('keeps HMAC mode when explicitly requested and omits the token from the URL', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Signed alerts',
+        verify: { type: 'hmac-sha256' },
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+      }),
+    }));
+    expect(created.connector.verify.type).toBe('hmac-sha256');
+    expect(created.webhookUrl).toMatch(new RegExp(`/webhook/${created.connector.id}$`));
+    expect(created.webhookUrl).not.toContain(created.secret);
+  });
+
   it('updates enabled state and rotates an existing connector secret', async () => {
     const created = await json(await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',
@@ -103,29 +152,30 @@ describe('connector-api write routes', () => {
     expect(JSON.stringify(await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(id)}`)))).not.toContain(rotated.secret);
   });
 
-  it('requires lifecycle extractors for new-group connectors and preserves botIds', async () => {
-    const bad = await fetch(`${baseUrl}/api/connectors`, {
+  it('allows a new-group connector with NO dedup (every event → fresh group) and preserves botIds', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        name: 'Auto war-room',
+        name: 'Per-event rooms',
         target: { mode: 'new-group', kind: 'turn', botId: 'app1', botIds: ['app2'] },
       }),
-    });
-    expect(bad.status).toBe(400);
-    expect((await json(bad)).error).toBe('lifecycle_extractors_required');
+    }));
+    expect(created.connector.target.botIds).toEqual(['app1', 'app2']);
+    expect(created.connector.lifecycleExtractors).toBeNull();
+  });
 
+  it('stores a dedup-only lifecycleExtractors (status dropped) for new-group', async () => {
     const created = await json(await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         name: 'Auto war-room',
-        target: { mode: 'new-group', kind: 'turn', botId: 'app1', botIds: ['app2'] },
+        target: { mode: 'new-group', kind: 'turn', botId: 'app1' },
         lifecycleExtractors: { dedupKey: '$.alert.id', status: '$.alert.state' },
       }),
     }));
-    expect(created.connector.target.botIds).toEqual(['app1', 'app2']);
-    expect(created.connector.lifecycleExtractors).toEqual({ dedupKey: '$.alert.id', status: '$.alert.state' });
+    expect(created.connector.lifecycleExtractors).toEqual({ dedupKey: '$.alert.id' });
   });
 
   it('manages standalone webhook secrets as metadata-only reads', async () => {

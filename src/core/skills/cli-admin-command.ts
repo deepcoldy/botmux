@@ -1,0 +1,248 @@
+import { existsSync } from 'node:fs';
+import { githubToGitUrl, parseSkillInstallSource } from './sources.js';
+import { validateSkillPackageDir } from './package.js';
+import {
+  installGitSkill,
+  installLocalSkill,
+  readSkillRegistry,
+  removeInstalledSkill,
+  updateInstalledSkill,
+} from '../../services/skill-registry-store.js';
+import type { BotConfig } from '../../bot-registry.js';
+import { loadBotConfigs } from '../../bot-registry.js';
+import { readGlobalConfig } from '../../global-config.js';
+import { createCliAdapterSync } from '../../adapters/cli/registry.js';
+import type { CliId } from '../../adapters/cli/types.js';
+import { discoverProjectSkills } from './discovery.js';
+import { resolveSkillPolicy } from './policy.js';
+import { analyzeSkillReferences, type SkillReferenceSummary } from './references.js';
+import type { SkillPackage, SkillSource } from './types.js';
+
+export interface AdminCommandResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+function argValue(args: string[], name: string): string | undefined {
+  const i = args.indexOf(name);
+  return i >= 0 ? args[i + 1] : undefined;
+}
+
+function hasFlag(args: string[], name: string): boolean {
+  return args.includes(name);
+}
+
+function findBotConfig(selector: string | undefined): BotConfig | undefined {
+  if (!selector) return undefined;
+  const bots = loadBotConfigs();
+  const asNumber = Number(selector);
+  if (Number.isInteger(asNumber) && asNumber > 0) return bots[asNumber - 1];
+  return bots.find((bot) => bot.larkAppId === selector || bot.name === selector);
+}
+
+function skillLine(skill: SkillPackage & { priorityReason?: string }): string {
+  return [
+    skill.name,
+    skill.priorityReason ?? '',
+    skill.description ?? '',
+  ].filter((part) => part.length > 0).join('\t');
+}
+
+function runDoctor(): AdminCommandResult {
+  const registry = readSkillRegistry();
+  const skills = Object.values(registry.skills).sort((a, b) => a.name.localeCompare(b.name));
+  const lines = [
+    `installed: ${skills.length}`,
+  ];
+  let broken = 0;
+  for (const skill of skills) {
+    const exists = existsSync(skill.rootDir);
+    const valid = exists ? validateSkillPackageDir(skill.rootDir) : { ok: false as const, reason: 'missing_root' };
+    if (valid.ok) {
+      lines.push(`ok\t${skill.name}\t${skill.rootDir}`);
+    } else {
+      broken++;
+      lines.push(`broken\t${skill.name}\t${valid.reason}\t${skill.rootDir}`);
+    }
+  }
+  return { code: broken > 0 ? 1 : 0, stdout: lines.join('\n') + '\n', stderr: '' };
+}
+
+function runResolve(args: string[]): AdminCommandResult {
+  const botSelector = argValue(args, '--bot');
+  const cwd = argValue(args, '--cwd') ?? process.cwd();
+  if (!botSelector) return { code: 2, stdout: '', stderr: 'usage: botmux skills resolve --bot <appId|name|index> [--cwd <repo>]\n' };
+  const bot = findBotConfig(botSelector);
+  if (!bot) return { code: 2, stdout: '', stderr: `bot not found: ${botSelector}\n` };
+  if (!bot.skills) {
+    return {
+      code: 0,
+      stdout: [
+        `bot: ${bot.name ?? bot.larkAppId}`,
+        `cli: ${bot.cliId}`,
+        'skills: default',
+        'note: bot has no custom skill policy; CLI-native skills remain unchanged',
+      ].join('\n') + '\n',
+      stderr: '',
+    };
+  }
+
+  const globalSkills = readGlobalConfig().skills;
+  const result = resolveSkillPolicy({
+    registrySkills: Object.values(readSkillRegistry().skills),
+    projectSkills: discoverProjectSkills(cwd),
+    globalProjectSkills: globalSkills?.trustProjectSkills,
+    globalDelivery: globalSkills?.delivery,
+    botPolicy: bot.skills,
+    workingDir: cwd,
+  });
+  const lines = [
+    `bot: ${bot.name ?? bot.larkAppId}`,
+    `cli: ${bot.cliId}`,
+    `cwd: ${cwd}`,
+    `mode: ${result.mode}`,
+    `delivery: ${result.delivery}`,
+    `skills: ${result.prioritySkills.length}`,
+    ...result.prioritySkills.map(skillLine),
+  ];
+  if (result.diagnostics.length > 0) {
+    lines.push('diagnostics:');
+    for (const diagnostic of result.diagnostics) {
+      lines.push(`${diagnostic.level}\t${diagnostic.code}\t${diagnostic.message}`);
+    }
+  }
+  return { code: 0, stdout: lines.join('\n') + '\n', stderr: '' };
+}
+
+function deliverySummary(cliId: CliId, requested: 'auto' | 'prompt' | 'native'): string {
+  const adapter = createCliAdapterSync(cliId);
+  const native = adapter.skillDelivery?.nativeKind ?? 'none';
+  if (requested === 'prompt') return `cli: ${cliId}\nrequested: prompt\nnative: ${native}\ndelivery: prompt\n`;
+  if (requested === 'native') {
+    const delivery = native === 'none' ? 'unsupported' : 'hybrid';
+    return `cli: ${cliId}\nrequested: native\nnative: ${native}\ndelivery: ${delivery}\n`;
+  }
+  const delivery = native === 'none' ? 'prompt' : 'hybrid';
+  return `cli: ${cliId}\nrequested: auto\nnative: ${native}\ndelivery: ${delivery}\n`;
+}
+
+function runDelivery(args: string[]): AdminCommandResult {
+  const botSelector = argValue(args, '--bot');
+  let cliId = argValue(args, '--cli') as CliId | undefined;
+  let requested = argValue(args, '--mode') as 'auto' | 'prompt' | 'native' | undefined;
+  if (requested && requested !== 'auto' && requested !== 'prompt' && requested !== 'native') {
+    return { code: 2, stdout: '', stderr: 'usage: botmux skills delivery [--bot <appId|name|index>] [--cli <cliId>] [--mode auto|prompt|native]\n' };
+  }
+  if (botSelector) {
+    const bot = findBotConfig(botSelector);
+    if (!bot) return { code: 2, stdout: '', stderr: `bot not found: ${botSelector}\n` };
+    cliId ??= bot.cliId;
+    requested ??= readGlobalConfig().skills?.delivery ?? 'auto';
+  }
+  if (!cliId) return { code: 2, stdout: '', stderr: 'usage: botmux skills delivery [--bot <appId|name|index>] [--cli <cliId>] [--mode auto|prompt|native]\n' };
+  try {
+    return { code: 0, stdout: deliverySummary(cliId, requested ?? 'auto'), stderr: '' };
+  } catch (err: any) {
+    return { code: 2, stdout: '', stderr: `${err?.message ?? err}\n` };
+  }
+}
+
+function findSkillReferences(skillName: string): SkillReferenceSummary {
+  let bots: BotConfig[] = [];
+  try {
+    bots = loadBotConfigs();
+  } catch {
+    // CLI commands can run before bots.json exists; skip bot refs in that case.
+  }
+  return analyzeSkillReferences(skillName, { bots });
+}
+
+function formatSkillReferenceWarning(refs: SkillReferenceSummary): string {
+  const lines = ['skill_in_use'];
+  if (refs.bots.length > 0) lines.push(`bots: ${refs.bots.map((bot) => bot.botName).join(', ')}`);
+  lines.push('use --force to remove anyway');
+  return lines.join('\n') + '\n';
+}
+
+export function runSkillsAdminCommand(args: string[]): AdminCommandResult {
+  const sub = args[0] ?? 'list';
+  try {
+    if (sub === 'list') {
+      const skills = Object.values(readSkillRegistry().skills).sort((a, b) => a.name.localeCompare(b.name));
+      const lines = skills.map((skill) => `${skill.name}\t${skill.description ?? ''}`.trimEnd());
+      return { code: 0, stdout: lines.join('\n') + (lines.length > 0 ? '\n' : ''), stderr: '' };
+    }
+    if (sub === 'inspect') {
+      const name = args[1];
+      const skill = name ? readSkillRegistry().skills[name] : undefined;
+      if (!skill) return { code: 2, stdout: '', stderr: 'skill not found\n' };
+      return { code: 0, stdout: JSON.stringify(skill, null, 2) + '\n', stderr: '' };
+    }
+    if (sub === 'validate') {
+      const dir = args[1];
+      if (!dir) return { code: 2, stdout: '', stderr: 'usage: botmux skills validate <dir>\n' };
+      const result = validateSkillPackageDir(dir);
+      return result.ok ? { code: 0, stdout: 'ok\n', stderr: '' } : { code: 1, stdout: '', stderr: `${result.reason}\n` };
+    }
+    if (sub === 'install') {
+      const source = args[1];
+      if (!source) return { code: 2, stdout: '', stderr: 'usage: botmux skills install <path|git|github>\n' };
+      const parsed = parseSkillInstallSource(source);
+      if (parsed.kind === 'local') {
+        const pkg = installLocalSkill(parsed.value, { link: hasFlag(args, '--link') });
+        return { code: 0, stdout: `installed ${pkg.name}\n`, stderr: '' };
+      }
+      if (parsed.kind === 'git') {
+        const path = argValue(args, '--path');
+        if (!path) return { code: 2, stdout: '', stderr: 'git install requires --path <skill-path>\n' };
+        const pkg = installGitSkill({ url: parsed.value, path, ref: argValue(args, '--ref') });
+        return { code: 0, stdout: `installed ${pkg.name}\n`, stderr: '' };
+      }
+      const gh = parsed.github;
+      if (!gh) return { code: 2, stdout: '', stderr: 'invalid github source\n' };
+      const path = argValue(args, '--path') ?? gh.path;
+      if (!path) return { code: 2, stdout: '', stderr: 'github install requires a repo path or --path <skill-path>\n' };
+      // Fall back to the ref parsed from a browser URL (…/tree/<ref>/…) when
+      // --ref isn't given, matching the dashboard install path.
+      const ref = argValue(args, '--ref') ?? gh.ref;
+      const sourceOverride: SkillSource = { type: 'github', owner: gh.owner, repo: gh.repo, path, ...(ref ? { ref } : {}) };
+      const pkg = installGitSkill({
+        url: githubToGitUrl(gh.owner, gh.repo),
+        path,
+        ref,
+        sourceOverride,
+      });
+      return { code: 0, stdout: `installed ${pkg.name}\n`, stderr: '' };
+    }
+    if (sub === 'remove') {
+      const name = args[1];
+      if (!name) return { code: 2, stdout: '', stderr: 'usage: botmux skills remove <name> [--force]\n' };
+      if (!readSkillRegistry().skills[name]) return { code: 1, stdout: '', stderr: 'skill_not_installed\n' };
+      const refs = findSkillReferences(name);
+      if (!hasFlag(args, '--force') && refs.bots.length > 0) {
+        return { code: 1, stdout: '', stderr: formatSkillReferenceWarning(refs) };
+      }
+      const result = removeInstalledSkill(name);
+      return result.ok ? { code: 0, stdout: `removed ${name}\n`, stderr: '' } : { code: 1, stdout: '', stderr: `${result.reason}\n` };
+    }
+    if (sub === 'update') {
+      const name = args[1];
+      if (!name) return { code: 2, stdout: '', stderr: 'usage: botmux skills update <name>\n' };
+      const result = updateInstalledSkill(name);
+      return result.ok ? { code: 0, stdout: `updated ${result.skill.name}\n`, stderr: '' } : { code: 1, stdout: '', stderr: `${result.reason}\n` };
+    }
+    if (sub === 'doctor') {
+      return runDoctor();
+    }
+    if (sub === 'resolve') {
+      return runResolve(args.slice(1));
+    }
+    if (sub === 'delivery') {
+      return runDelivery(args.slice(1));
+    }
+    return { code: 2, stdout: '', stderr: `unknown skills command: ${sub}\n` };
+  } catch (err: any) {
+    return { code: 1, stdout: '', stderr: `${err?.message ?? err}\n` };
+  }
+}

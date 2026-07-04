@@ -1,0 +1,20 @@
+# Session Adopt
+
+Seamlessly adopt a CLI process that's **already running in your local tmux** into botmux, so you can view progress and interact via Lark on your phone.
+
+<video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780421531476_adopt-video.aud.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+
+```
+/adopt              # Scan the local tmux and pop up a selection card
+/adopt 0:2.0        # Adopt the specified tmux pane directly
+```
+
+## Three actions
+
+- **Shared mode**: after adopting, the local terminal (e.g., iTerm2) and Lark sync bidirectionally — the streaming card shows terminal output in real time, and input from the Lark chat box passes straight through to the terminal. The local tmux stays connected the whole time.
+- **One-click adopt-over**: tap "🔄 Adopt Over" on the streaming card, and botmux rebuilds the session with `--resume`, converting it into a standard botmux session.
+- **Safe disconnect**: tap "⏏ Disconnect," and botmux stops observing, leaving the original CLI unaffected.
+
+## Typical usage
+
+Running Claude Code in the tmux on your office computer and have to leave halfway through? Send `/adopt` from Lark on your phone → pick the session → instant sync. Keep going on your phone on the road, and tap "Disconnect" when you're back at your computer to pick up where you left off. **It's not remote control — it's true multi-device sharing.**

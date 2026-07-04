@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
+import { writeRunnerInput } from './runner-input.js';
 
 function runnerPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -18,21 +19,33 @@ function pushOpt(args: string[], key: string, value: string | undefined): void {
   args.push(key, value);
 }
 
-function encodeInput(content: string): string {
-  return Buffer.from(JSON.stringify({ type: 'message', content }), 'utf8').toString('base64');
-}
-
 export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
-  const codexBin = resolveCommand(pathOverride ?? 'codex');
+  // Resolve the wrapped `codex` binary lazily, on first buildArgs (spawn time),
+  // so constructing the adapter during `botmux setup` doesn't shell out via
+  // resolveCommand. resolvedBin is the node runner, not codex itself.
+  const rawCodexBin = pathOverride ?? 'codex';
+  let cachedCodexBin: string | undefined;
   return {
     id: 'codex-app',
+    // Whole ~/.codex kept REAL (see codex.ts): its SQLite state/log DBs can't get
+    // fcntl locks on the sandbox home overlay, so codex hangs ~57s then exits 1.
+    authPaths: ['~/.codex'],
     resolvedBin: process.execPath,
+
+    // resolvedBin is node-running-the-runner; the REAL codex is spawned later for
+    // the app-server (codex-app-runner.ts). Declare it so the file sandbox can
+    // re-expose its bin dir when it lives under /run (fnm/nvm) — else --tmpfs /run
+    // masks it and the in-sandbox app-server spawn ENOENTs into a crash-loop. Same
+    // lazy resolve+cache as buildArgs; only an executable path, never the cwd.
+    sandboxExtraExecPaths() {
+      return [(cachedCodexBin ??= resolveCommand(rawCodexBin))];
+    },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale }) {
       const args = [
         runnerPath(),
         '--session-id', sessionId,
-        '--codex-bin', codexBin,
+        '--codex-bin', (cachedCodexBin ??= resolveCommand(rawCodexBin)),
       ];
       if (resume && resumeSessionId) args.push('--thread-id', resumeSessionId);
       pushOpt(args, '--cwd', workingDir);
@@ -50,18 +63,10 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      const line = `::botmux-codex-app:${encodeInput(content)}`;
-      try {
-        if (pty.sendText && pty.sendSpecialKeys) {
-          pty.sendText(line);
-          pty.sendSpecialKeys('Enter');
-        } else {
-          pty.write(line + '\r');
-        }
-      } catch {
-        return { submitted: false };
-      }
-      return { submitted: true };
+      // Chunked + throttled stdin injection — a single send-keys of the whole
+      // (potentially ~20KB) control line overruns the pane pty input buffer and
+      // gets dropped. See runner-input.ts.
+      return writeRunnerInput(pty, '::botmux-codex-app:', content);
     },
 
     completionPattern: undefined,

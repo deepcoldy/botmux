@@ -19,6 +19,14 @@ import {
   type FederatedBot,
 } from '../services/federation-store.js';
 import { buildFederatedRoster } from '../services/federation-roster.js';
+import { listTeamGroups } from '../services/team-groups-store.js';
+import {
+  listTeamReports,
+  readTeamBoard,
+  recordTeamSessions,
+  sanitizeReportedSessions,
+  setTeamBoardEntry,
+} from '../services/team-board-store.js';
 import { findMembershipByDelegationToken } from '../services/federation-membership-store.js';
 import { buildTeamRoster, type LiveBot } from '../services/team-roster.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
@@ -200,7 +208,53 @@ export async function handleFederationApi(
       name: typeof body?.name === 'string' ? body.name : undefined,
     });
     if (!ok) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
-    jsonRes(res, 200, { ok: true });
+    // 顺带下发该团队的协作群清单——spoke 据此筛出要上报给团队看板的会话。
+    const synced = getDeploymentByToken(dataDir, syncToken);
+    jsonRes(res, 200, {
+      ok: true,
+      groupChatIds: synced ? listTeamGroups(dataDir, synced.teamId).map(b => b.chatId) : [],
+    });
+    return true;
+  }
+
+  // ── 团队看板（申晗架构：编排存 host，会话源数据各部署自持）────────────────
+  // 成员上报会话裁剪行：白名单清洗后按 deploymentId 覆盖式落盘。
+  if (path === '/api/federation/team-sessions' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const found = getDeploymentByToken(dataDir, bearerOnly(req));
+    if (!found) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const sessions = sanitizeReportedSessions(body?.sessions);
+    recordTeamSessions(dataDir, found.teamId, found.deployment.deploymentId, found.deployment.name, sessions);
+    jsonRes(res, 200, { ok: true, accepted: sessions.length });
+    return true;
+  }
+
+  // 成员拉取团队看板：共享编排 + 各部署最近一次上报（含调用方自己的，
+  // 前端按 deploymentId 去掉自己那份，本地数据走实时 store）。
+  if (path === '/api/federation/team-board' && method === 'GET') {
+    const found = getDeploymentByToken(dataDir, federationToken(req, url));
+    if (!found) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    jsonRes(res, 200, {
+      ok: true,
+      teamId: found.teamId,
+      deploymentId: found.deployment.deploymentId,
+      board: readTeamBoard(dataDir, found.teamId),
+      reports: listTeamReports(dataDir, found.teamId),
+      groupChatIds: listTeamGroups(dataDir, found.teamId).map(b => b.chatId),
+    });
+    return true;
+  }
+
+  // 成员拖拽团队看板卡片：编排是全团队共享的一份，谁拖都写 host 这里。
+  if (path === '/api/federation/team-board-move' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const found = getDeploymentByToken(dataDir, bearerOnly(req));
+    if (!found) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const entry = setTeamBoardEntry(dataDir, found.teamId, String(body?.sessionId ?? ''), body?.column, body?.position);
+    if (!entry) { jsonRes(res, 400, { ok: false, error: 'bad_request' }); return true; }
+    jsonRes(res, 200, { ok: true, entry });
     return true;
   }
 
@@ -295,6 +349,15 @@ export async function handleFederationApi(
     if (cached) { jsonRes(res, cached.status, cached.body); return true; }
     const chatId = String(body?.chatId ?? '').trim();
     const viaLarkAppId = String(body?.viaLarkAppId ?? '').trim();
+    // Via-bot candidates to try IN ORDER. The hub sends every bot of THIS
+    // deployment that's already a member of the chat; we fall through them so a
+    // bot lacking im:chat.members:write_only (99991672) or owner visibility
+    // (232024) doesn't strand the owner — another of our bots can still add them.
+    // Back-compat: older hubs send only viaLarkAppId.
+    const rawCandidates: unknown[] = Array.isArray(body?.viaCandidates) ? body.viaCandidates : [];
+    const viaCandidates: string[] = Array.from(new Set(
+      [viaLarkAppId, ...rawCandidates.filter((x): x is string => typeof x === 'string')].map(s => s.trim()).filter(Boolean),
+    ));
     const rawOwners: unknown[] = Array.isArray(body?.ownerUnionIds) ? body.ownerUnionIds : [];
     const ownerUnionIds: string[] = Array.from(new Set(rawOwners.filter((x): x is string => typeof x === 'string')));
     if (!chatId || ownerUnionIds.length === 0) { jsonRes(res, 400, { ok: false, error: 'bad_request' }); return true; }
@@ -302,6 +365,9 @@ export async function handleFederationApi(
     const roster = buildTeamRoster(dataDir, undefined, undefined, deps.liveBots?.());
     // Guardrail: viaLarkAppId must be one of OUR local bots.
     if (!roster.bots.some(b => b.larkAppId === viaLarkAppId)) { jsonRes(res, 400, { ok: false, error: 'not_a_local_bot' }); return true; }
+    // Drop any candidate that isn't one of OUR local bots (the hub may list bots
+    // we no longer host); viaLarkAppId itself is guaranteed present by the check above.
+    const localCandidates = viaCandidates.filter(via => roster.bots.some(b => b.larkAppId === via));
     // Capability limit: only add people who are OUR owners (this deployment's owner
     // or a local bot's owner). A delegationToken holder must NOT use our bot to pull
     // arbitrary in-scope users into arbitrary chats. Non-owners → invalid, no Lark call.
@@ -313,8 +379,17 @@ export async function handleFederationApi(
       if (!ensureLocalClient(via)) return { invalidUserIds: ids };
       return addUsersToChatByUnionId(via, chat, ids);
     });
-    const ar = toAdd.length > 0 ? await addOwners(viaLarkAppId, chatId, toAdd) : { invalidUserIds: [] };
-    const result = { status: 200, body: { ok: true, invalidUserIds: [...notOurs, ...ar.invalidUserIds] } };
+    // Try each local candidate in turn, narrowing to the owners still not added.
+    // Stop as soon as everyone landed; a bot that can't add them (no write scope
+    // / no visibility) just leaves them in `remaining` for the next candidate.
+    let remaining = [...toAdd];
+    for (const via of localCandidates) {
+      if (remaining.length === 0) break;
+      const ar = await addOwners(via, chatId, remaining);
+      const invalid = new Set(ar.invalidUserIds);
+      remaining = remaining.filter(u => invalid.has(u));
+    }
+    const result = { status: 200, body: { ok: true, invalidUserIds: [...notOurs, ...remaining] } };
     idemSet(idemKey, result);
     jsonRes(res, result.status, result.body);
     return true;

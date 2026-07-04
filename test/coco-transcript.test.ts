@@ -105,6 +105,62 @@ describe('drainCocoEvents', () => {
     const r2 = drainCocoEvents(path, r1.newOffset);
     expect(r2.events.map(e => e.text)).toEqual(['new']);
   });
+
+  it('drains large records across chunk boundaries without allocating the full delta as one string', () => {
+    const hugePrompt = 'p'.repeat(80_000);
+    const hugeReply = 'r'.repeat(90_000);
+    writeFileSync(path, line(originalUser(hugePrompt)) + line(assistant(hugeReply)));
+
+    const r = drainCocoEvents(path, 0);
+
+    expect(r.events.map((e) => [e.kind, e.text.length])).toEqual([
+      ['user', hugePrompt.length],
+      ['assistant_final', hugeReply.length],
+    ]);
+    expect(r.pendingTail).toBe('');
+    expect(r.newOffset).toBe(statSync(path).size);
+  });
+
+  it('preserves UTF-8 multi-byte characters split across the default scan chunk boundary', () => {
+    const chunkBoundary = 64 * 1024;
+    const marker = '你';
+    const suffix = '尾巴';
+    const buildOriginalUserLine = (content: string) => line({
+      id: 'fixed-user-id',
+      created_at: '2026-04-30T02:33:13.000+08:00',
+      message: { message: { role: 'user', content, extra: { is_original_user_input: true } } },
+    });
+    const prefixBytes = Buffer.byteLength(buildOriginalUserLine(`${marker}${suffix}`).split(marker)[0], 'utf8');
+    const fillerLen = chunkBoundary - prefixBytes - 1;
+    const promptText = `${'a'.repeat(fillerLen)}${marker}${suffix}`;
+    const promptLine = buildOriginalUserLine(promptText);
+    const markerOffset = Buffer.byteLength(promptLine.slice(0, promptLine.indexOf(marker)), 'utf8');
+
+    expect(markerOffset).toBeGreaterThanOrEqual(chunkBoundary - 2);
+    expect(markerOffset).toBeLessThan(chunkBoundary);
+
+    writeFileSync(path, promptLine + line(assistant('收到')));
+
+    const r = drainCocoEvents(path, 0);
+
+    expect(r.events.map((e) => [e.kind, e.text])).toEqual([
+      ['user', promptText],
+      ['assistant_final', '收到'],
+    ]);
+  });
+
+  it('preserves a large partial trailing line as pendingTail until newline arrives', () => {
+    const hugePrompt = 'q'.repeat(80_000);
+    writeFileSync(path, line(originalUser('seed')) + JSON.stringify(originalUser(hugePrompt)).slice(0, -10));
+
+    const r1 = drainCocoEvents(path, 0);
+    expect(r1.events.map((e) => e.text)).toEqual(['seed']);
+    expect(r1.pendingTail.length).toBeGreaterThan(70_000);
+
+    appendFileSync(path, JSON.stringify(originalUser(hugePrompt)).slice(-10) + '\n');
+    const r2 = drainCocoEvents(path, r1.newOffset);
+    expect(r2.events.map((e) => e.text)).toEqual([hugePrompt]);
+  });
 });
 
 describe('findCocoSessionByPid', () => {

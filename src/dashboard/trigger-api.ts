@@ -31,6 +31,31 @@ export type TriggerApiDeps = {
   proxyToDaemon: (larkAppId: string, daemonPath: string, init: RequestInit) => Promise<Response>;
 };
 
+export async function queryTriggerResult(
+  botId: string,
+  sessionId: string,
+  deps: TriggerApiDeps,
+  triggerId?: string,
+): Promise<{ status: number; body: TriggerResponse }> {
+  const suffix = triggerId ? `?triggerId=${encodeURIComponent(triggerId)}` : '';
+  const upstream = await deps.proxyToDaemon(botId, `/api/sessions/${encodeURIComponent(sessionId)}/trigger-result${suffix}`, {
+    method: 'GET',
+  });
+  const text = await upstream.text();
+  let parsed: TriggerResponse;
+  try {
+    parsed = JSON.parse(text) as TriggerResponse;
+  } catch {
+    parsed = {
+      ok: false,
+      triggerId: newTriggerId(),
+      error: `non-json upstream response (${upstream.status})`,
+      errorCode: 'trigger_failed',
+    };
+  }
+  return { status: upstream.status, body: parsed };
+}
+
 export async function dispatchTriggerRequest(
   body: TriggerRequest,
   deps: TriggerApiDeps,

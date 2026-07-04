@@ -90,6 +90,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
 
 vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
+  ensureSessionWhiteboard: vi.fn(),
   buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
   getAvailableBots: vi.fn(() => []),
   // card-handler's toggle path calls persistStreamCardState after flipping

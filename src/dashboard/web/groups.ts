@@ -2,31 +2,48 @@
 // The aggregator at /api/groups fans out to all online daemons and merges chats
 // by chatId; the dashboard displays this as a matrix where each cell shows
 // whether a bot is a member of a given chat.
-import { escapeHtml, t } from './ui.js';
+import { chatAvatarHtml, escapeHtml, t } from './ui.js';
+import {
+  hasExplicitChatRole,
+  summarizeGroupProfileMatches,
+  type EffectiveRoleValue,
+  type RoleProfileEntryLike,
+  type RoleProfileSummaryLike,
+} from './role-profile-match.js';
 
 let cache: { chats: any[]; bots: any[] } = { chats: [], bots: [] };
+const PROFILE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const roleKey = (larkAppId: string, chatId: string) => `${larkAppId}\u0000${chatId}`;
+let roleProfiles: RoleProfileSummaryLike[] = [];
+let roleProfileEntriesById = new Map<string, RoleProfileEntryLike[]>();
+let groupRoleContentByBot = new Map<string, EffectiveRoleValue>();
+let roleProfileContextLoaded = false;
 
-function pageHtml(): string {
-  return `<section class="page">
-<div class="page-heading">
-  <div>
-    <p class="eyebrow">${t('nav.groups')}</p>
-    <h1>${t('groups.title')}</h1>
-    <p>${t('groups.subtitle')}</p>
-  </div>
-</div>
-<form id="g-filters" class="filters">
-  <input type="search" name="q" placeholder="${t('groups.search')}" />
-  <label><input type="checkbox" name="missing"> ${t('groups.missingOnly')}</label>
-  <button type="button" id="g-refresh">${t('groups.refresh')}</button>
-  <button type="button" id="g-create" class="primary">${t('groups.create')}</button>
-</form>
-<table>
-  <thead id="g-head"></thead>
-  <tbody id="g-body"></tbody>
-</table>
-<dialog id="g-drawer"></dialog>
-</section>`;
+type SaveProfileEntryStatus = 'chat' | 'team' | 'empty' | 'error';
+type SaveProfileEntry = {
+  larkAppId: string;
+  botName?: string;
+  content: string;
+  status: SaveProfileEntryStatus;
+};
+type GroupAddBotResult = {
+  id?: unknown;
+  ok?: unknown;
+  error?: unknown;
+};
+
+function isValidProfileId(profileId: string): boolean {
+  return PROFILE_ID_RE.test(profileId) && profileId !== '.' && profileId !== '..';
+}
+
+export function suggestRoleProfileIdFromChat(value: string): string {
+  const cleaned = String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+  return isValidProfileId(cleaned) ? cleaned : 'profile';
 }
 
 async function loadGroups(): Promise<void> {
@@ -39,6 +56,56 @@ async function loadGroups(): Promise<void> {
 async function fetchGroups(): Promise<{ chats: any[]; bots: any[] }> {
   const r = await fetch('/api/groups');
   return r.json();
+}
+
+async function loadGroupRoleProfileContext(): Promise<void> {
+  const profileResp = await fetch('/api/role-profiles');
+  const profileBody = await profileResp.json().catch(() => ({}));
+  const nextProfiles = Array.isArray(profileBody.profiles) ? profileBody.profiles as RoleProfileSummaryLike[] : [];
+
+  const detailPairs = await Promise.all(nextProfiles.map(async profile => {
+    try {
+      const r = await fetch(`/api/role-profiles/${encodeURIComponent(profile.profileId)}`);
+      const body = await r.json().catch(() => ({}));
+      return [profile.profileId, Array.isArray(body.entries) ? body.entries as RoleProfileEntryLike[] : []] as const;
+    } catch {
+      return [profile.profileId, [] as RoleProfileEntryLike[]] as const;
+    }
+  }));
+
+  const nextGroupRoles = new Map<string, EffectiveRoleValue>();
+  const seenRoleKeys = new Set<string>();
+  await Promise.all((cache.chats ?? []).flatMap((chat: any) =>
+    (chat.memberBots ?? [])
+      .filter((bot: any) => bot?.inChat && bot?.larkAppId)
+      .map(async (bot: any) => {
+        const key = roleKey(bot.larkAppId, chat.chatId);
+        if (seenRoleKeys.has(key)) return;
+        seenRoleKeys.add(key);
+        try {
+          const r = await fetch(`/api/roles/${encodeURIComponent(bot.larkAppId)}/${encodeURIComponent(chat.chatId)}`);
+          const body = await r.json().catch(() => ({}));
+          const hasEffectiveRole = body?.hasEffectiveRole ?? body?.hasRole;
+          const effectiveContent = 'effectiveContent' in body ? body.effectiveContent : body.content;
+          nextGroupRoles.set(key, {
+            content: hasEffectiveRole ? String(effectiveContent ?? '') : null,
+            source: body?.effectiveSource ?? (body?.hasRole ? 'chat' : 'none'),
+          });
+        } catch {
+          nextGroupRoles.set(key, null);
+        }
+      }),
+  ));
+
+  roleProfiles = nextProfiles;
+  roleProfileEntriesById = new Map(detailPairs);
+  groupRoleContentByBot = nextGroupRoles;
+}
+
+async function fetchRoleProfileSummaries(): Promise<RoleProfileSummaryLike[]> {
+  const r = await fetch('/api/role-profiles');
+  const body = await r.json().catch(() => ({}));
+  return Array.isArray(body.profiles) ? body.profiles as RoleProfileSummaryLike[] : [];
 }
 
 /** True iff every expected bot id appears in the row's memberBots with
@@ -73,8 +140,73 @@ export function renderBotCheckboxes(
     `).join('');
 }
 
-export async function renderGroupsPage(root: HTMLElement) {
-  root.innerHTML = pageHtml();
+export function renderRoleProfileBootstrapSummary(
+  profileId: string,
+  messageId?: unknown,
+  error?: unknown,
+): string {
+  const cleanProfileId = String(profileId ?? '').trim();
+  if (!cleanProfileId) return '';
+
+  if (error) {
+    return `<p class="hint-warn">${escapeHtml(t('groups.roleProfileBootstrapFailed', {
+      name: cleanProfileId,
+      reason: String(error),
+    }))}</p>`;
+  }
+
+  const cleanMessageId = typeof messageId === 'string' && messageId.trim() ? messageId.trim() : '';
+  if (cleanMessageId) {
+    return `<p class="hint-ok">${escapeHtml(t('groups.roleProfileBootstrapSent', {
+      name: cleanProfileId,
+      messageId: cleanMessageId,
+    }))}</p>`;
+  }
+
+  return `<p class="hint-ok">${escapeHtml(t('groups.roleProfileBootstrapDone', { name: cleanProfileId }))}</p>`;
+}
+
+export function renderAddBotsResultSummary(result: GroupAddBotResult[]): string {
+  const rows = Array.isArray(result) ? result : [];
+  if (!rows.length) {
+    return `<p class="hint-warn">没有返回添加结果。</p>`;
+  }
+  const okCount = rows.filter(x => !!x?.ok).length;
+  const failed = rows.length - okCount;
+  const cls = failed ? 'hint-warn' : 'hint-ok';
+  const items = rows.map(x => {
+    const id = String(x?.id ?? '?');
+    return x?.ok
+      ? `<li><code>${escapeHtml(id)}</code>: OK</li>`
+      : `<li><code>${escapeHtml(id)}</code>: failed (${escapeHtml(String(x?.error ?? 'unknown'))})</li>`;
+  }).join('');
+  return `<div class="${cls}">
+    <strong>添加结果：成功 ${okCount}/${rows.length}${failed ? `，失败 ${failed}` : ''}</strong>
+    <ul>${items}</ul>
+  </div>`;
+}
+
+export function wireGroupsPage(root: HTMLElement): () => void {
+  let disposed = false;
+  const timers = new Set<number>();
+  const delayResolvers = new Map<number, () => void>();
+  const setTimer = (fn: () => void, ms: number): number => {
+    const id = window.setTimeout(() => {
+      timers.delete(id);
+      if (!disposed) fn();
+    }, ms);
+    timers.add(id);
+    return id;
+  };
+  const delay = (ms: number): Promise<void> => new Promise(resolve => {
+    const id = window.setTimeout(() => {
+      timers.delete(id);
+      delayResolvers.delete(id);
+      resolve();
+    }, ms);
+    timers.add(id);
+    delayResolvers.set(id, resolve);
+  });
   const head = root.querySelector<HTMLElement>('#g-head')!;
   const body = root.querySelector<HTMLElement>('#g-body')!;
   const form = root.querySelector<HTMLFormElement>('#g-filters')!;
@@ -83,20 +215,75 @@ export async function renderGroupsPage(root: HTMLElement) {
 
   refreshBtn.onclick = async () => {
     refreshBtn.disabled = true;
-    try { await loadGroups(); rerender(); } finally { refreshBtn.disabled = false; }
+    try {
+      await loadGroups();
+      if (disposed) return;
+      rerender();
+      void refreshRoleProfileContext();
+    } finally {
+      if (!disposed) refreshBtn.disabled = false;
+    }
   };
 
   const createBtn = root.querySelector<HTMLButtonElement>('#g-create')!;
-  createBtn.onclick = () => openCreateModal();
+  createBtn.onclick = () => { void openCreateModal(); };
 
-  await loadGroups();
+  // /api/groups 要扇出到所有 daemon、逐群查成员，慢——先亮 loading，回来再换表格。
+  const loadingEl = root.querySelector<HTMLElement>('#g-loading')!;
+  const tableWrap = root.querySelector<HTMLElement>('#g-table-wrap')!;
+  void (async () => {
+    try {
+      await loadGroups();
+    } finally {
+      if (disposed) return;
+      loadingEl.remove();
+      tableWrap.hidden = false;
+      rerender();
+      void refreshRoleProfileContext();
+    }
+  })();
 
-  function openCreateModal() {
+  async function refreshRoleProfileContext(): Promise<void> {
+    try {
+      await loadGroupRoleProfileContext();
+    } catch {
+      roleProfiles = [];
+      roleProfileEntriesById = new Map();
+      groupRoleContentByBot = new Map();
+    } finally {
+      if (disposed) return;
+      roleProfileContextLoaded = true;
+      rerender();
+    }
+  }
+
+  function setDialogStatus(el: HTMLElement, html: string): void {
+    el.innerHTML = html;
+  }
+
+  function renderDialogError(title: string, reason: unknown): string {
+    return `<p class="hint-warn"><strong>${escapeHtml(title)}</strong><br><small>${escapeHtml(String(reason ?? 'unknown'))}</small></p>`;
+  }
+
+  function restoreSubmit(btn: HTMLButtonElement | null | undefined, label: string): void {
+    if (!btn) return;
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+
+  async function openCreateModal() {
     const allBots = cache.bots;
     if (allBots.length === 0) {
       alert(t('groups.noBotsOnline'));
       return;
     }
+    let roleProfiles: Array<{ profileId: string }> = [];
+    try {
+      const r = await fetch('/api/role-profiles');
+      const data = await r.json();
+      roleProfiles = data.profiles ?? [];
+    } catch { /* profile selector is optional */ }
+    if (disposed) return;
     drawer.innerHTML = `
       <article>
         <header><h3>${t('groups.createTitle')}</h3></header>
@@ -111,10 +298,19 @@ export async function renderGroupsPage(root: HTMLElement) {
             <input type="text" name="bindWorkingDir" placeholder="e.g. ~/projects/botmux">
             <small>${t('groups.bindDirHelp')}</small>
           </label>
+          <label class="form-row">
+            <span>${t('groups.roleProfile')}</span>
+            <select name="roleProfileId">
+              <option value="">${t('groups.roleProfileNone')}</option>
+              ${roleProfiles.map(p => `<option value="${escapeHtml(p.profileId)}">${escapeHtml(p.profileId)}</option>`).join('')}
+            </select>
+            <small>${t('groups.roleProfileHelp')}</small>
+          </label>
           <fieldset>
             <legend>${t('groups.botPicker')}</legend>
             ${renderBotCheckboxes(allBots)}
           </fieldset>
+          <div data-create-status aria-live="polite"></div>
           <div class="actions">
             <button type="submit" class="primary">${t('groups.createSubmit')}</button>
             <button type="button" id="g-create-cancel">${t('groups.cancel')}</button>
@@ -130,17 +326,29 @@ export async function renderGroupsPage(root: HTMLElement) {
       const fd = new FormData(ev.target as HTMLFormElement);
       const name = ((fd.get('name') as string) ?? '').trim();
       const bindWorkingDir = ((fd.get('bindWorkingDir') as string) ?? '').trim();
+      const roleProfileId = ((fd.get('roleProfileId') as string) ?? '').trim();
       const ids = fd.getAll('bot') as string[];
-      if (ids.length === 0) { alert('Pick at least one bot.'); return; }
+      const statusEl = drawer.querySelector<HTMLElement>('[data-create-status]')!;
+      if (ids.length === 0) {
+        setDialogStatus(statusEl, renderDialogError('请选择 bot', '至少选择一个 bot 后再创建群聊。'));
+        return;
+      }
       const submitBtn = (ev.target as HTMLFormElement).querySelector<HTMLButtonElement>('button[type=submit]');
       if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Creating...'; }
+      setDialogStatus(statusEl, '');
       try {
         const r = await fetch('/api/groups/create', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ name: name || undefined, larkAppIds: ids, bindWorkingDir: bindWorkingDir || undefined }),
+          body: JSON.stringify({
+            name: name || undefined,
+            larkAppIds: ids,
+            bindWorkingDir: bindWorkingDir || undefined,
+            roleProfileId: roleProfileId || undefined,
+          }),
         });
         const respBody = await r.json();
+        if (disposed) return;
         if (respBody.ok && respBody.chatId) {
           renderCreateSuccess(respBody);
           // Lark's chat.list has eventual consistency: the chat we just
@@ -163,14 +371,15 @@ export async function renderGroupsPage(root: HTMLElement) {
           if (typeof respBody.creator === 'string' && respBody.creator) expectedBotIds.add(respBody.creator);
           injectOptimisticChat(respBody.chatId, name || respBody.chatId, validIds, respBody.creator);
           rerender();
+          void refreshRoleProfileContext();
           void refreshUntilSeen(respBody.chatId, expectedBotIds).catch(() => { /* tolerate */ });
         } else {
-          alert(`Failed: ${respBody.error ?? r.status}`);
-          drawer.close();
+          setDialogStatus(statusEl, renderDialogError('创建失败', respBody.error ?? `HTTP ${r.status}`));
+          restoreSubmit(submitBtn, t('groups.createSubmit'));
         }
       } catch (e) {
-        alert('Network error: ' + e);
-        drawer.close();
+        setDialogStatus(statusEl, renderDialogError('网络错误', e));
+        restoreSubmit(submitBtn, t('groups.createSubmit'));
       }
     };
 
@@ -208,14 +417,17 @@ export async function renderGroupsPage(root: HTMLElement) {
       // Refresh will reconcile.
       const delays = [600, 1200, 1200, 1200, 1200, 1200];
       for (const d of delays) {
-        await new Promise(r => setTimeout(r, d));
+        await delay(d);
+        if (disposed) return;
         let next: { chats: any[]; bots: any[] };
         try { next = await fetchGroups(); }
         catch { continue; }
+        if (disposed) return;
         const row = (next.chats ?? []).find((c: any) => c.chatId === chatId);
         if (row && allExpectedInChat(row, expectedBotIds)) {
           cache = next;
           rerender();
+          void refreshRoleProfileContext();
           return;
         }
       }
@@ -224,7 +436,12 @@ export async function renderGroupsPage(root: HTMLElement) {
 
   function renderCreateSuccess(resp: any) {
     const chatId = String(resp.chatId);
-    const appLink = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
+    // 优先用服务端返回的 shareLink（由 Lark/飞书建群 API 给出，天然带正确品牌域名）；
+    // 仅当缺失（share-link API 失败）时回退到 applink。浏览器侧拿不到 brand，这个
+    // 回退默认 feishu host——属极少触发的兜底，不影响 Lark 正常建群（有 shareLink）。
+    const appLink = typeof resp.shareLink === 'string' && resp.shareLink
+      ? resp.shareLink
+      : `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
     const invalidBots = (resp.invalidBotIds ?? []) as string[];
     const invalidUsers = (resp.invalidUserIds ?? []) as string[];
     const auto = resp.autoInvitedOpenId as string | null | undefined;
@@ -263,6 +480,11 @@ export async function renderGroupsPage(root: HTMLElement) {
       invalidBots.length ? `<li>无效 bot id: <code>${invalidBots.map(escapeHtml).join(', ')}</code></li>` : '',
       invalidUsers.length ? `<li>无效用户 open_id: <code>${invalidUsers.map(escapeHtml).join(', ')}</code></li>` : '',
     ].filter(Boolean).join('');
+    const profileNote = renderRoleProfileBootstrapSummary(
+      typeof resp.roleProfileId === 'string' ? resp.roleProfileId : '',
+      resp.roleProfileBootstrapMessageId,
+      resp.roleProfileBootstrapError,
+    );
 
     drawer.innerHTML = `
       <article>
@@ -271,6 +493,7 @@ export async function renderGroupsPage(root: HTMLElement) {
         <p><b>创建者:</b> <code>${escapeHtml(resp.creator ?? '?')}</code></p>
         ${inviteNote}
         ${bindNote}
+        ${profileNote}
         ${invalidNote ? `<ul>${invalidNote}</ul>` : ''}
         <div class="actions">
           <a class="btn-link primary" href="${appLink}" target="_blank" rel="noopener">${t('groups.openGroup')}</a>
@@ -282,10 +505,34 @@ export async function renderGroupsPage(root: HTMLElement) {
       b.onclick = () => {
         navigator.clipboard.writeText(b.dataset.copy ?? '');
         b.textContent = t('sessions.copied');
-        setTimeout(() => { b.textContent = t('sessions.copy'); }, 800);
+        setTimer(() => { b.textContent = t('sessions.copy'); }, 800);
       };
     });
     drawer.querySelector<HTMLButtonElement>('#g-create-close')!.onclick = () => drawer.close();
+  }
+
+  function renderGroupProfileStatus(chat: any): string {
+    if (!roleProfiles.length || !roleProfileContextLoaded) return '';
+    const rolesByBot = new Map<string, EffectiveRoleValue>();
+    for (const bot of chat.memberBots ?? []) {
+      if (!bot?.inChat) continue;
+      rolesByBot.set(bot.larkAppId, groupRoleContentByBot.get(roleKey(bot.larkAppId, chat.chatId)) ?? null);
+    }
+    if (!hasExplicitChatRole(rolesByBot)) return '';
+    const matches = summarizeGroupProfileMatches(chat.memberBots ?? [], roleProfiles, roleProfileEntriesById, rolesByBot);
+    const best = matches[0];
+    if (!best) {
+      return `<div class="g-profile-status muted">${t('groups.profileStatusUnmatched')}</div>`;
+    }
+    const key = best.kind === 'full' ? 'groups.profileStatusFullChat' : 'groups.profileStatusPartial';
+    return `<div class="g-profile-status ${best.kind}">
+      ${escapeHtml(t(key, {
+        name: best.profileId,
+        matched: best.matched,
+        total: best.total,
+        chat: best.chatMatched,
+      }))}
+    </div>`;
   }
 
   function renderHead() {
@@ -316,8 +563,14 @@ export async function renderGroupsPage(root: HTMLElement) {
     }
     body.innerHTML = filtered.map(c => `<tr data-chat="${escapeHtml(c.chatId)}">
       <td>
-        <strong>${escapeHtml(c.name ?? c.chatId)}</strong><br>
-        <small><code>${escapeHtml(c.chatId)}</code></small>
+        <div class="g-chat-cell">
+          ${chatAvatarHtml({ chatId: c.chatId, name: c.name, avatarUrl: c.avatar, size: 'sm' })}
+          <div class="g-chat-meta">
+            <strong>${escapeHtml(c.name ?? c.chatId)}</strong><br>
+            <small><code>${escapeHtml(c.chatId)}</code></small>
+            ${renderGroupProfileStatus(c)}
+          </div>
+        </div>
       </td>
       ${cache.bots.map(b => {
         const m = c.memberBots.find((m: any) => m.larkAppId === b.larkAppId);
@@ -327,13 +580,12 @@ export async function renderGroupsPage(root: HTMLElement) {
       }).join('')}
       <td>
         <button class="add-bots" type="button">${t('groups.addBots')}</button>
+        <button class="save-profile" type="button">${t('groups.saveAsProfile')}</button>
         <button class="manage-chat" type="button">${t('groups.manage')}</button>
       </td>
     </tr>`).join('');
   }
-  rerender();
-
-  body.addEventListener('click', async e => {
+  const onAddBotsClick = async (e: MouseEvent) => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button.add-bots');
     if (!btn) return;
     const tr = btn.closest<HTMLTableRowElement>('tr[data-chat]')!;
@@ -357,6 +609,7 @@ export async function renderGroupsPage(root: HTMLElement) {
         <p>${t('groups.createHelp')}</p>
         <form id="g-addform">
           ${renderBotCheckboxes(cache.bots, inChatSet)}
+          <div data-add-status aria-live="polite"></div>
           <div class="actions">
             <button type="submit" class="primary">${t('groups.addBots')}</button>
             <button type="button" id="g-cancel">${t('groups.cancel')}</button>
@@ -371,7 +624,14 @@ export async function renderGroupsPage(root: HTMLElement) {
       ev.preventDefault();
       const fd = new FormData(ev.target as HTMLFormElement);
       const ids = fd.getAll('bot') as string[];
-      if (ids.length === 0) { alert('Pick at least one bot.'); return; }
+      const statusEl = drawer.querySelector<HTMLElement>('[data-add-status]')!;
+      if (ids.length === 0) {
+        setDialogStatus(statusEl, renderDialogError('请选择 bot', '至少选择一个 bot 后再添加。'));
+        return;
+      }
+      const submitBtn = (ev.target as HTMLFormElement).querySelector<HTMLButtonElement>('button[type=submit]');
+      if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Adding...'; }
+      setDialogStatus(statusEl, '');
       try {
         const r = await fetch(`/api/groups/${encodeURIComponent(chatId)}/add-bots`, {
           method: 'POST',
@@ -379,28 +639,312 @@ export async function renderGroupsPage(root: HTMLElement) {
           body: JSON.stringify({ larkAppIds: ids }),
         });
         const respBody = await r.json();
+        if (disposed) return;
         if (respBody.error === 'no_proxy_bot') {
-          alert('No bot is currently in this chat — add one manually in Feishu first, then retry.');
+          setDialogStatus(statusEl, renderDialogError(
+            '无法添加 bot',
+            '当前群里没有可代理操作的 bot。请先在飞书里手动拉入一个 bot，然后重试。',
+          ));
         } else if (respBody.result) {
-          const lines = respBody.result.map((x: any) =>
-            `${x.id}: ${x.ok ? 'OK' : `failed (${x.error ?? 'unknown'})`}`
-          ).join('\n');
-          alert(lines);
-          // Refresh after change
-          await loadGroups();
-          rerender();
+          const resultHtml = renderAddBotsResultSummary(respBody.result);
+          setDialogStatus(statusEl, resultHtml);
+          try {
+            await loadGroups();
+            if (disposed) return;
+            rerender();
+            void refreshRoleProfileContext();
+          } catch (e) {
+            if (!disposed) {
+              setDialogStatus(statusEl, `${resultHtml}${renderDialogError('刷新失败', `添加结果已返回，但刷新群组列表失败：${e}`)}`);
+            }
+          }
         } else {
-          alert(`Unexpected response: ${JSON.stringify(respBody)}`);
+          setDialogStatus(statusEl, renderDialogError('响应异常', JSON.stringify(respBody)));
         }
       } catch (e) {
-        alert('Network error: ' + e);
+        setDialogStatus(statusEl, renderDialogError('网络错误', e));
       } finally {
-        drawer.close();
+        if (!disposed) restoreSubmit(submitBtn, t('groups.addBots'));
       }
     };
-  });
+  };
+  body.addEventListener('click', onAddBotsClick);
 
-  body.addEventListener('click', async e => {
+  const onSaveProfileClick = async (e: MouseEvent) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button.save-profile');
+    if (!btn) return;
+    const tr = btn.closest<HTMLTableRowElement>('tr[data-chat]')!;
+    const chatId = tr.dataset.chat!;
+    const chat = cache.chats.find(c => c.chatId === chatId);
+    if (!chat) return;
+    await saveGroupRolesAsProfile(chat, btn);
+  };
+  body.addEventListener('click', onSaveProfileClick);
+
+  async function saveGroupRolesAsProfile(chat: any, btn: HTMLButtonElement): Promise<void> {
+    const suggestedByName = suggestRoleProfileIdFromChat(chat.name ?? '');
+    const suggested = suggestedByName === 'profile'
+      ? suggestRoleProfileIdFromChat(chat.chatId)
+      : suggestedByName;
+    btn.disabled = true;
+    const originalText = btn.textContent;
+    btn.textContent = t('groups.saveProfileSaving');
+    try {
+      const [entries, profiles] = await Promise.all([
+        collectGroupProfileEntries(chat),
+        fetchRoleProfileSummaries(),
+      ]);
+      if (disposed) return;
+      openSaveProfileDialog(chat, suggested, entries, profiles);
+    } finally {
+      if (!disposed) {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+    }
+  }
+
+  async function collectGroupProfileEntries(chat: any): Promise<SaveProfileEntry[]> {
+    const inChat = (chat.memberBots ?? []).filter((bot: any) => bot?.inChat && bot?.larkAppId);
+    const roleRows = await Promise.all(inChat.map(async (bot: any) => {
+      try {
+        const r = await fetch(`/api/roles/${encodeURIComponent(bot.larkAppId)}/${encodeURIComponent(chat.chatId)}`);
+        const body = await r.json().catch(() => ({}));
+        const hasEffectiveRole = body?.hasEffectiveRole ?? body?.hasRole;
+        const effectiveContent = 'effectiveContent' in body ? body.effectiveContent : body.content;
+        const content = hasEffectiveRole ? String(effectiveContent ?? '').trim() : '';
+        const source = body?.effectiveSource === 'chat' || body?.effectiveSource === 'team'
+          ? body.effectiveSource as SaveProfileEntryStatus
+          : null;
+        return {
+          larkAppId: bot.larkAppId as string,
+          botName: bot.botName,
+          content,
+          status: content ? (source ?? 'chat') : 'empty',
+        };
+      } catch {
+        return {
+          larkAppId: bot.larkAppId as string,
+          botName: bot.botName,
+          content: '',
+          status: 'error' as const,
+        };
+      }
+    }));
+    return roleRows;
+  }
+
+  function openSaveProfileDialog(
+    chat: any,
+    suggestedProfileId: string,
+    entries: SaveProfileEntry[],
+    profiles: RoleProfileSummaryLike[],
+  ): void {
+    const sortedProfiles = [...profiles].sort((a, b) => a.profileId.localeCompare(b.profileId));
+    const profileButtons = sortedProfiles
+      .map((profile, index) => `
+        <button type="button"
+                class="g-save-profile-pick ${index === 0 ? 'selected' : ''}"
+                data-profile-id="${escapeHtml(profile.profileId)}"
+                aria-pressed="${index === 0 ? 'true' : 'false'}">
+          <span>${escapeHtml(profile.profileId)}</span>
+          <small>${escapeHtml(t('groups.saveProfileExistingMeta', { count: profile.entryCount ?? 0 }))}</small>
+        </button>`)
+      .join('');
+    const hasExistingProfiles = sortedProfiles.length > 0;
+    const emptyCount = entries.filter(entry => entry.status === 'empty').length;
+    const failedCount = entries.filter(entry => entry.status === 'error').length;
+    const canSubmitSnapshot = entries.length > 0 && failedCount === 0;
+    const entryRows = entries.map(entry => `
+      <div class="g-save-profile-entry ${entry.status === 'error' ? 'error' : ''}">
+        <div>
+          <strong>${escapeHtml(entry.botName ?? entry.larkAppId)}</strong>
+          <code>${escapeHtml(entry.larkAppId)}</code>
+        </div>
+        <span class="g-save-profile-entry-status ${entry.status === 'error' ? 'error' : 'ok'}">
+          ${t(entry.status === 'error' ? 'groups.saveProfileStatus.error' : 'groups.saveProfileStatus.entry')}
+        </span>
+      </div>`).join('');
+    drawer.innerHTML = `
+      <article class="g-save-profile-dialog">
+        <header>
+          <h3>${t('groups.saveProfileTitle')}</h3>
+          <p>${escapeHtml(t('groups.saveProfileIntro', {
+            name: chat.name ?? chat.chatId,
+            count: entries.length,
+          }))}</p>
+        </header>
+        <form id="g-save-profile-form">
+          <section class="g-save-profile-panel">
+            <div class="g-save-profile-section-head">
+              <span>${t('groups.saveProfileScope')}</span>
+              <small>${t('groups.saveProfileScopeHelp')}</small>
+            </div>
+            <div class="g-save-profile-stats">
+              <span>${t('groups.saveProfileBotCount')} <strong>${entries.length}</strong></span>
+              ${failedCount ? `<span class="warn">${t('groups.saveProfileLoadFailed')} <strong>${failedCount}</strong></span>` : ''}
+            </div>
+            <div class="g-save-profile-entry-list">
+              ${entryRows || `<div class="g-save-profile-empty">${t('groups.saveProfileNoRoles')}</div>`}
+            </div>
+          </section>
+
+          <div class="form-row">
+            <span>${t('groups.saveProfileMode')}</span>
+            <div class="g-save-profile-switch" role="tablist" aria-label="${t('groups.saveProfileMode')}">
+              <button type="button" class="active" data-save-profile-mode="new">${t('groups.saveProfileNew')}</button>
+              <button type="button" data-save-profile-mode="overwrite" ${hasExistingProfiles ? '' : 'disabled'}>${t('groups.saveProfileOverwrite')}</button>
+            </div>
+          </div>
+          <label class="form-row" data-profile-mode-row="new">
+            <span>${t('groups.saveProfileIdLabel')}</span>
+            <input type="text" name="profileId" value="${escapeHtml(suggestedProfileId)}" maxlength="64" autocomplete="off">
+            <small>${t('groups.saveProfileInvalid')}</small>
+          </label>
+          <div class="form-row" data-profile-mode-row="overwrite" hidden>
+            <span>${t('groups.saveProfileExistingLabel')}</span>
+            ${hasExistingProfiles
+              ? `<div class="g-save-profile-picker">${profileButtons}</div>`
+              : `<div class="g-save-profile-summary warn">${t('groups.saveProfileExistingEmpty')}</div>`}
+            <small>${t('groups.saveProfileOverwriteHelp')}</small>
+          </div>
+          <div class="g-save-profile-target">
+            <span>${t('groups.saveProfileTarget')}</span>
+            <code data-save-profile-target>${escapeHtml(suggestedProfileId)}</code>
+            <small data-save-profile-target-mode>${t('groups.saveProfileTargetNew')}</small>
+          </div>
+          <div class="g-save-profile-summary ${canSubmitSnapshot ? '' : 'warn'}">
+            ${failedCount
+              ? escapeHtml(t('groups.saveProfileFailedLoadSummary', { count: failedCount }))
+              : entries.length
+              ? escapeHtml(emptyCount
+                ? t('groups.saveProfileEntrySummaryWithEmpty', { count: entries.length, emptyCount })
+                : t('groups.saveProfileEntrySummary', { count: entries.length }))
+              : escapeHtml(t('groups.saveProfileNoRoles'))}
+          </div>
+          <div class="g-save-profile-status" data-save-profile-status></div>
+          <div class="actions">
+            <button type="submit" class="primary" ${canSubmitSnapshot ? '' : 'disabled'}>${t('groups.saveProfileSubmit')}</button>
+            <button type="button" id="g-save-profile-cancel">${t('groups.cancel')}</button>
+          </div>
+        </form>
+      </article>`;
+    drawer.showModal();
+
+    const formEl = drawer.querySelector<HTMLFormElement>('#g-save-profile-form')!;
+    const modeRows = [...drawer.querySelectorAll<HTMLElement>('[data-profile-mode-row]')];
+    const statusEl = drawer.querySelector<HTMLElement>('[data-save-profile-status]')!;
+    const submitBtn = formEl.querySelector<HTMLButtonElement>('button[type=submit]')!;
+    const modeButtons = [...formEl.querySelectorAll<HTMLButtonElement>('[data-save-profile-mode]')];
+    const profilePickButtons = [...formEl.querySelectorAll<HTMLButtonElement>('[data-profile-id]')];
+    const profileIdInput = formEl.querySelector<HTMLInputElement>('input[name=profileId]')!;
+    const targetEl = formEl.querySelector<HTMLElement>('[data-save-profile-target]')!;
+    const targetModeEl = formEl.querySelector<HTMLElement>('[data-save-profile-target-mode]')!;
+    let selectedMode: 'new' | 'overwrite' = 'new';
+    let selectedExistingProfileId = sortedProfiles[0]?.profileId ?? '';
+
+    function currentProfileId(): string {
+      return selectedMode === 'overwrite'
+        ? selectedExistingProfileId
+        : profileIdInput.value.trim();
+    }
+
+    function updateMode(): void {
+      for (const row of modeRows) {
+        row.hidden = row.dataset.profileModeRow !== selectedMode;
+      }
+      for (const button of modeButtons) {
+        const isActive = button.dataset.saveProfileMode === selectedMode;
+        button.classList.toggle('active', isActive);
+        button.setAttribute('aria-pressed', String(isActive));
+      }
+      for (const button of profilePickButtons) {
+        const isSelected = button.dataset.profileId === selectedExistingProfileId;
+        button.classList.toggle('selected', isSelected);
+        button.setAttribute('aria-pressed', String(isSelected));
+      }
+      submitBtn.textContent = selectedMode === 'overwrite'
+        ? t('groups.saveProfileOverwriteSubmit')
+        : t('groups.saveProfileSubmit');
+      submitBtn.disabled = !canSubmitSnapshot || (selectedMode === 'overwrite' && !selectedExistingProfileId);
+      targetEl.textContent = currentProfileId() || '-';
+      targetModeEl.textContent = selectedMode === 'overwrite'
+        ? t('groups.saveProfileTargetOverwrite')
+        : t('groups.saveProfileTargetNew');
+      statusEl.textContent = '';
+      statusEl.className = 'g-save-profile-status';
+    }
+
+    modeButtons.forEach(button => {
+      button.addEventListener('click', () => {
+        const mode = button.dataset.saveProfileMode === 'overwrite' ? 'overwrite' : 'new';
+        if (mode === 'overwrite' && !hasExistingProfiles) return;
+        selectedMode = mode;
+        updateMode();
+      });
+    });
+    profilePickButtons.forEach(button => {
+      button.addEventListener('click', () => {
+        selectedExistingProfileId = button.dataset.profileId ?? '';
+        selectedMode = 'overwrite';
+        updateMode();
+      });
+    });
+    profileIdInput.addEventListener('input', updateMode);
+    updateMode();
+
+    drawer.querySelector<HTMLButtonElement>('#g-save-profile-cancel')!.onclick = () => drawer.close();
+    formEl.onsubmit = async ev => {
+      ev.preventDefault();
+      if (!canSubmitSnapshot) return;
+      const profileId = currentProfileId();
+      if (!isValidProfileId(profileId)) {
+        statusEl.textContent = t('groups.saveProfileInvalid');
+        statusEl.className = 'g-save-profile-status error';
+        return;
+      }
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = t('groups.saveProfileSaving');
+      statusEl.textContent = t('groups.saveProfileSaving');
+      statusEl.className = 'g-save-profile-status';
+      try {
+        const results = await Promise.all(entries.map(async entry => {
+          const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(entry.larkAppId)}`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ content: entry.content, allowEmpty: true }),
+          });
+          return r.ok;
+        }));
+        if (disposed) return;
+        const saved = results.filter(Boolean).length;
+        if (saved !== entries.length) {
+          statusEl.textContent = t('groups.saveProfileFailed', { saved, total: entries.length });
+          statusEl.className = 'g-save-profile-status error';
+          submitBtn.disabled = false;
+          submitBtn.textContent = selectedMode === 'overwrite'
+            ? t('groups.saveProfileOverwriteSubmit')
+            : t('groups.saveProfileSubmit');
+          return;
+        }
+        statusEl.textContent = t('groups.saveProfileDone', { name: profileId, count: saved });
+        statusEl.className = 'g-save-profile-status ok';
+        await refreshRoleProfileContext();
+        if (disposed) return;
+        setTimer(() => drawer.close(), 700);
+      } catch (err) {
+        statusEl.textContent = String(err);
+        statusEl.className = 'g-save-profile-status error';
+        submitBtn.disabled = false;
+        submitBtn.textContent = selectedMode === 'overwrite'
+          ? t('groups.saveProfileOverwriteSubmit')
+          : t('groups.saveProfileSubmit');
+      }
+    };
+  }
+
+  const onManageChatClick = async (e: MouseEvent) => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button.manage-chat');
     if (!btn) return;
     const tr = btn.closest<HTMLTableRowElement>('tr[data-chat]')!;
@@ -408,7 +952,8 @@ export async function renderGroupsPage(root: HTMLElement) {
     const chat = cache.chats.find(c => c.chatId === chatId);
     if (!chat) return;
     openManageDrawer(chat);
-  });
+  };
+  body.addEventListener('click', onManageChatClick);
 
   function openManageDrawer(chat: any) {
     const inChat = chat.memberBots.filter((m: any) => m.inChat) as any[];
@@ -501,6 +1046,7 @@ export async function renderGroupsPage(root: HTMLElement) {
               })
             : await fetch(url, { method: 'DELETE' });
           const body = await r.json().catch(() => ({}));
+          if (disposed) return;
           if (r.ok && body.ok) {
             statusEl.textContent = want
               ? `✓ 已绑定 → ${body.resolvedPath ?? wd}`
@@ -508,7 +1054,12 @@ export async function renderGroupsPage(root: HTMLElement) {
             statusEl.classList.add('hint-ok');
             // Refresh aggregator cache + matrix; drawer state stays as-is
             // (current row reflects the just-saved values).
-            try { await loadGroups(); rerender(); } catch { /* tolerate */ }
+            try {
+              await loadGroups();
+              if (disposed) return;
+              rerender();
+              void refreshRoleProfileContext();
+            } catch { /* tolerate */ }
           } else {
             statusEl.textContent = `✗ ${body.error ?? r.status}`;
             statusEl.classList.add('hint-warn-inline');
@@ -534,6 +1085,7 @@ export async function renderGroupsPage(root: HTMLElement) {
           body: JSON.stringify({ larkAppIds: checked }),
         });
         const respBody = await r.json();
+        if (disposed) return;
         const lines = (respBody.result ?? []).map((x: any) => {
           if (!x.ok) return `${x.larkAppId}: 失败 (${x.error ?? 'unknown'})`;
           const closed = (x.closedSessions ?? []) as any[];
@@ -545,11 +1097,14 @@ export async function renderGroupsPage(root: HTMLElement) {
           return `${x.larkAppId}: OK${note}`;
         }).join('\n');
         alert(lines || `Unexpected: ${JSON.stringify(respBody)}`);
-        await loadGroups(); rerender();
+        await loadGroups();
+        if (disposed) return;
+        rerender();
+        void refreshRoleProfileContext();
       } catch (e) {
         alert('Network error: ' + e);
       } finally {
-        drawer.close();
+        if (!disposed) drawer.close();
       }
     };
 
@@ -571,6 +1126,7 @@ export async function renderGroupsPage(root: HTMLElement) {
             body: JSON.stringify({ larkAppId: m.larkAppId }),
           });
           const respBody = await r.json();
+          if (disposed) return;
           if (respBody.ok) {
             const closed = (respBody.closedSessions ?? []) as any[];
             const failed = closed.filter(c => !c.ok).length;
@@ -579,7 +1135,10 @@ export async function renderGroupsPage(root: HTMLElement) {
               ? ''
               : failed === 0 ? `\n关闭了 ${ok} 个会话。` : `\n关闭了 ${ok} 个会话，${failed} 个会话关闭失败。`;
             alert(`已解散（由 ${m.botName ?? m.larkAppId} 执行）${closedNote}`);
-            await loadGroups(); rerender();
+            await loadGroups();
+            if (disposed) return;
+            rerender();
+            void refreshRoleProfileContext();
             drawer.close();
             return;
           }
@@ -593,4 +1152,19 @@ export async function renderGroupsPage(root: HTMLElement) {
   }
 
   form.addEventListener('input', rerender);
+  return () => {
+    disposed = true;
+    for (const id of timers) window.clearTimeout(id);
+    timers.clear();
+    for (const resolve of delayResolvers.values()) resolve();
+    delayResolvers.clear();
+    refreshBtn.onclick = null;
+    createBtn.onclick = null;
+    form.removeEventListener('input', rerender);
+    body.removeEventListener('click', onAddBotsClick);
+    body.removeEventListener('click', onSaveProfileClick);
+    body.removeEventListener('click', onManageChatClick);
+    if (drawer.open) drawer.close();
+    drawer.replaceChildren();
+  };
 }

@@ -22,6 +22,13 @@ export interface TerminalProxyOptions {
   host?: string;
   /** Resolve a sessionId to its live worker HTTP port (undefined if not running). */
   resolvePort: (sessionId: string) => number | undefined;
+  /**
+   * Optional on-demand wake: when `resolvePort` finds no live worker, re-fork it
+   * (re-attaching the surviving tmux/zellij pane) and resolve once its port is
+   * up. Lets terminals open after a quiet restart without first messaging the
+   * session. Returns undefined when there's nothing to wake. Slow path only.
+   */
+  ensureWorkerPort?: (sessionId: string) => Promise<number | undefined>;
   /** Max upward port probes when `port` is taken (EADDRINUSE). Default 20; 0 disables. */
   maxProbe?: number;
 }
@@ -52,6 +59,15 @@ export function parseTarget(rawUrl: string): { sessionId: string; rest: string }
 export function startTerminalProxy(opts: TerminalProxyOptions): Promise<TerminalProxyHandle> {
   const host = opts.host ?? '0.0.0.0';
 
+  // Fast sync lookup; fall back to the on-demand wake (slow path) only when no
+  // live worker is registered. Errors in the wake collapse to "not serveable".
+  const resolvePortMaybeWake = async (sessionId: string): Promise<number | undefined> => {
+    const live = opts.resolvePort(sessionId);
+    if (live) return live;
+    if (!opts.ensureWorkerPort) return undefined;
+    try { return await opts.ensureWorkerPort(sessionId); } catch { return undefined; }
+  };
+
   const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const parsed = parseTarget(req.url ?? '');
     if (!parsed) {
@@ -59,7 +75,7 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
       res.end('not found');
       return;
     }
-    const port = opts.resolvePort(parsed.sessionId);
+    resolvePortMaybeWake(parsed.sessionId).then((port) => {
     if (!port) {
       res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('session not running');
@@ -77,12 +93,16 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
       res.end('proxy error');
     });
     req.pipe(upstream);
+    }).catch(() => {
+      if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('proxy error');
+    });
   });
 
   server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
     const parsed = parseTarget(req.url ?? '');
     if (!parsed) return clientSocket.destroy();
-    const port = opts.resolvePort(parsed.sessionId);
+    resolvePortMaybeWake(parsed.sessionId).then((port) => {
     if (!port) return clientSocket.destroy();
 
     const upstream = httpRequest({
@@ -129,6 +149,7 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
     });
     upstream.on('error', () => clientSocket.destroy());
     upstream.end();
+    }).catch(() => clientSocket.destroy());
   });
 
   // When the preferred port is taken, probe upward to the next free port so the

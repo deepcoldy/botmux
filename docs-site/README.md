@@ -1,60 +1,48 @@
 # botmux 文档站
 
-botmux 的中文功能文档站，发布在**飞书妙笔（HTML Box）**上。
+botmux 的中文功能文档站，基于 [**rspress**](https://rspress.dev/) 构建，发布在**飞书妙搭（Miaoda）**上。
 
-- 线上地址：<https://magic.solutionsuite.cn/html-box/vkWHeJn1Fn2>
-- 源码：本目录的 [`index.html`](./index.html)
+- 线上地址：<https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/>
+- 源码：本目录（`docs/` 下的 Markdown + `rspress.config.ts`）
 
-## 形态
+## 形态与托管（重要）
 
-一个**自包含的单文件 HTML 应用**（妙笔 HTML Box 是「一个 HTML = 一个应用」模型，扛不了多页静态站，所以做成单页富 SPA）：
+飞书妙搭只服务 **HTML 页面**，**不服务本地打包出来的 JS/CSS 资源文件**（请求会回退到 index.html）。所以这里采用「**HTML 壳发妙搭 + 资源走外链 CDN**」的方案：
 
-- 左侧导航树 + 站内搜索（`/` 唤起）+ 代码高亮 + 移动端自适应（汉堡菜单）
-- 依赖（Tailwind / marked / highlight.js）走 CDN
-- **文档内容**内嵌在 `<script type="text/markdown" data-doc="...">` 块里，写纯 Markdown 即可
-- **导航结构**由 JS 里的 `NAV` 数组定义（每项 `[data-doc, 标题]`，需与某个 markdown 块的 `data-doc` 对应）
-- 图片走 **TOS 外链**（不内联，保持 HTML 精简）
+- `rspress build` 产出多页静态站（`doc_build/`：每个路由一个 `.html` + `static/` 里的 JS/CSS/分包/搜索索引）。
+- **`static/` 整个推到 GitHub 的一个 git tag**（`docs-assets-vN`），用 [jsDelivr](https://www.jsdelivr.com/) 当 CDN 服务它；`rspress.config.ts` 里的 `assetPrefix` 指向这个 jsDelivr 前缀。
+- **只有那些 `.html` 壳发到妙搭**。浏览器打开妙搭给的 HTML → 主包 / 分包 / 搜索索引全部从 jsDelivr 加载，妙搭不碰资源。
+- `base` 设为妙搭子路径 `/app/app_4k9smq6rdxher/`，路由链接走妙搭、资源链接走 jsDelivr，互不干扰。
+- jsDelivr 对 **tag** 是不可变缓存（更新秒生效、免 purge），所以每次部署都发到一个**新的 tag 版本号**（`docs-assets-v1` → `v2` → …）。
 
-> ⚠️ 妙笔把页面跑在 **无 `allow-same-origin` 的 sandbox iframe** 里：写 `location.hash` 会触发 iframe 重载、把视图打回首页，所以路由不依赖 hash、点击直接 `render()`（代码里有 `IN_IFRAME` 判断）。改路由相关逻辑时注意这点。
+> 选妙搭而不是妙笔：rspress 是多页框架，妙笔 HTML Box 是单页 + 无 same-origin 沙箱，跑不了 rspress 路由；妙搭支持多 HTML 路由，所以文档站在妙搭。
 
-## 维护（改内容）
-
-直接编辑 `index.html`：
-
-- 改/加某节内容 → 改对应的 `<script type="text/markdown" data-doc="xxx">` 块（纯 Markdown）。
-- 加新一节 → 新增一个 markdown 块 + 在 `NAV` 数组里加一项指向它的 `data-doc`。
-- 本地预览 → 浏览器直接打开 `index.html` 即可（本地非 iframe，hash 路由可用）。
-
-### 加图片
-
-截图 / GIF 先传 TOS 拿公开 URL，再在 Markdown 里 `![](url)` 外链（**不要内联 base64**，会撑大 HTML）：
+## 本地预览
 
 ```bash
-# magic-builder 技能里的上传脚本
-node <magic-builder>/upload-file-to-tos/scripts/upload.js ./your-image.png -q
+cd docs-site
+pnpm install
+pnpm dev          # 本地热更新预览（assetPrefix 在本地不影响，直接读本地 static）
 ```
 
-## 发布（到飞书妙笔）
+## 改内容
 
-发布用妙笔官方的 **magic-builder** 技能，**token 只存在你本机、永不进仓库**：
+- 改 / 加某页 → 编辑 `docs/<id>.md`；新增页记得在 `rspress.config.ts` 的 `themeConfig.sidebar` 里挂上。
+- 页面间跳转用站内路由：`[文字](/relay)`、`[文字](/slash-commands)`。
+- **图片**：截图传 TOS（或任意公开图床）拿外链，markdown 里 `![](url)` 引用。
+- **视频**：必须写在 **`.mdx`** 文件里（`.md` 里 `<video>` 会被解析器丢弃），用 JSX 形式：
+  ```mdx
+  <video src="https://.../x.mp4" controls preload="metadata" style={{ width: '100%', borderRadius: '8px' }}></video>
+  ```
+  视频建议先压一下（`ffmpeg -crf 30 -movflags +faststart`），`preload="metadata"` 让它点开才加载。
 
-1. 安装 magic-builder 技能：下载并解压 <https://magic-builder.tos-cn-beijing.volces.com/skills/magic-builder.skill.zip>
-2. 拿**你自己的**妙笔开发 token：给妙笔机器人（<https://applink.larkoffice.com/T94fcr4NqQPz>）发 `dev`，复制返回的 token。
-3. 存 token（写到 `~/.magic-token`，已被 `.gitignore` 忽略，**绝不要提交**）：
-   ```bash
-   node <magic-builder>/publish-magic-page/scripts/publish.js token <你的token>
-   ```
-4. 发布：
-   ```bash
-   node <magic-builder>/publish-magic-page/scripts/publish.js publish docs-site/index.html --title "botmux 文档"
-   ```
+## 发布
 
-### 谁能发布？会暴露我的 token 吗？
+```bash
+cd docs-site
+./deploy.sh 4      # 把资源发到 docs-assets-v4 并发布 HTML 壳；每次部署版本号 +1
+```
 
-- **不会暴露**：token 只在各自本机的 `~/.magic-token` 里，从不进仓库。每个维护者用**自己的**妙笔账号 token。
-- **人人可维护源码**：`index.html` 在仓库里，任何人都能改、提 PR。
-- **关于官方线上 URL**：妙笔 app 绑定在「发布者的妙笔账号」下。
-  - 用你自己的 token 首次发布，会在**你账号下新建一个 app**（你自己的预览 URL）——适合自测 / 预览。
-  - 要更新**官方那个站**（`vkWHeJn1Fn2`），需由持有该 app 的妙笔账号 token 的人来发（magic-builder 按「相对路径 → remoteId」映射做原地更新，所以**在仓库根目录、用同一文件路径**发布即可命中原 app，不会产生重复）。
+`deploy.sh` 会：把 `assetPrefix` 指到新 tag → `rspress build` → 把 `static/` 推到该 tag（jsDelivr 立即可服务）→ 把 HTML 壳（去掉 `static/`）发到妙搭 app。
 
-> 简言之：**源码人人可改、可各自发预览；官方站的更新由 owner 跑一条命令完成**。
+前提：`pnpm install` 过、`lark-cli auth login --domain apps` 登录过妙搭、能 ssh push 到 `deepcoldy/botmux`。妙搭 app（`app_4k9smq6rdxher`）绑定在文档维护者的妙搭账号下，更新官方站需由持有该账号的人来跑。

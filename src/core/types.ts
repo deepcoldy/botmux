@@ -47,10 +47,24 @@ export interface DaemonSession {
   lastMessageAt: number;
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
-  initConfig?: DaemonToWorker;   // stored for restart
+  initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
+  worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
+  /** One-shot CLI slash command to send literally after the worker reports
+   *  prompt_ready. Used when a new topic starts with an adapter-default
+   *  passthrough command such as `/goal`: the CLI must see raw `/...`, not a
+   *  botmux-wrapped `<user_message>`. In-memory only to avoid replaying after
+   *  daemon restart. */
+  pendingRawInput?: string;
+  /** Wrapped prompt for messages buffered while a pendingRawInput session
+   *  waited for repo selection (pendingFollowUps / attachments). Built at the
+   *  fork site (where prompt-building context lives) and delivered right
+   *  after the raw input on prompt_ready, so the buffered messages queue as
+   *  the next turn instead of being dropped. In-memory only, like
+   *  pendingRawInput. */
+  pendingFollowUpInput?: { userPrompt: string; cliInput: string };
   pendingAttachments?: LarkAttachment[];
   pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
   /** Sender (open_id + type + resolved name) of the initial message — stashed
@@ -62,11 +76,24 @@ export interface DaemonSession {
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
   streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
+  /** Set on sessions restored after a daemon restart: suppresses the automatic
+   *  card post/patch from the recovery re-fork so a restart stays silent in the
+   *  group (the owner gets a private DM summary instead). Cleared on the first
+   *  real CLI input (rememberLastCliInput) — the next turn posts a card normally.
+   *  In-memory only. See core/restart-report.ts. */
+  suppressRecoveryCard?: boolean;
   /** Session-scoped override: when true, the streaming card is posted/patched
    *  even if the bot has `disableStreamingCard` set. Flipped on by the `/card`
    *  command so a user can manually summon a live card in an otherwise-quiet
    *  session. In-memory only (resets on daemon restart). */
   streamingCardForced?: boolean;
+  /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
+   *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
+   *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
+   *  batched messages each get their own reaction). Every pending ✋ here is
+   *  flipped to ✅ when the turn returns to idle. In-memory only (a daemon
+   *  restart mid-turn just leaves a stale ✋ — purely cosmetic). */
+  pendingAckReactions?: Array<{ messageId: string; reactionId?: string }>;
   /** Card body display mode. Default 'hidden'. When user clicks 显示输出, defaults to 'screenshot'. */
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */
@@ -77,17 +104,46 @@ export interface DaemonSession {
   usageLimitRetryTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
+  currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
   currentTurnTitle?: string;      // title for the current turn's streaming card
   cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)
   pendingCardId?: string;         // card message_id captured at schedule time — prevents stale reads when streamCardId changes between schedule and flush
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
+  /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
+   *  webhook triggers waiting for a response in this session. Key is turnId. */
+  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void }>;
+  /** Async webhook trigger state keyed by triggerId. `sessionId` polling reads
+   *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
+   *  pass the triggerId returned by the initial async activation response. */
+  asyncTriggerResults?: Map<string, {
+    status: 'pending' | 'completed';
+    createdAt: number;
+    completedAt?: number;
+    content?: string;
+  }>;
+  latestAsyncTriggerId?: string;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;
   tuiToggledIndices?: number[];  // tracks toggled options for multi-select card PATCH
+  /** Agent-raised "needs human" signal (`botmux send --attention`). Non-blocking:
+   *  the agent flags it hit a blocker only a human can clear (authorization,
+   *  an irreversible decision, missing access) and goes on to end its turn.
+   *  Feeds the dashboard needs-you column with the human-readable `reason`.
+   *  Cleared when the user next replies to the session or when the session
+   *  closes. Distinct from tuiPromptCardId (which is a
+   *  rendered TUI menu detected by screen-analyzer) — this is deliberate,
+   *  agent-initiated, and carries no rendered options. */
+  agentAttention?: { kind: string; reason: string; at: number };
+  /** 文档评论入口（/subscribe-lark-doc）：本会话「来自文档评论的轮」的回复落点
+   *  映射。key = turnId（= 触发评论的 reply_id/comment_id，随消息传给 worker 再
+   *  随 final_output 传回）；value = 该回哪个文档的哪条评论。deliverFinalOutput
+   *  命中后把正文发表为文档评论而非飞书卡片，并删除该项。仅内存（轮是瞬时的）。 */
+  docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string }>;
   /** Last assistant uuid emitted via the adopt bridge final_output pipeline.
    *  Used by the daemon to dedupe successive `final_output` IPCs (e.g. when
    *  the worker re-drains the transcript after a noisy idle). */
@@ -97,15 +153,25 @@ export interface DaemonSession {
    *  (closeSession) and the worker-process exit handler may try to publish;
    *  this guard prevents double-counting on the dashboard side. */
   exitEventEmitted?: boolean;
-  /** Present when this session was created via /adopt (shared observation mode). */
+  /** Present when this session was created via /adopt (shared observation mode).
+   *  Either tmuxTarget (tmux) OR zellijSession+zellijPaneId (zellij) is set. */
   adoptedFrom?: {
-    tmuxTarget: string;       // e.g. "0:2.0" — user's original tmux pane
-    originalCliPid: number;   // CLI process PID in the user's pane
+    /** Source backend of the external session. Absent means legacy tmux metadata. */
+    source?: 'tmux' | 'herdr' | 'zellij';
+    tmuxTarget?: string;       // e.g. "0:2.0" — user's original tmux pane
+    zellijSession?: string;    // zellij session name (zellij backend)
+    zellijPaneId?: string;     // e.g. "terminal_1" — observe/drive target
+    herdrSessionName?: string;
+    herdrTarget?: string;
+    herdrPaneId?: string;
+    herdrAgentName?: string;
+    herdrTerminalId?: string;
+    originalCliPid?: number;   // CLI process PID in the user's pane, when the source exposes one
     sessionId?: string;       // CLI session ID (for takeover/resume)
     cliId?: import('../adapters/cli/types.js').CliId;  // recognized CLI type
     cwd: string;              // CLI working directory
-    paneCols?: number;        // tmux pane width at adopt time
-    paneRows?: number;        // tmux pane height at adopt time
+    paneCols?: number;        // pane width at adopt time
+    paneRows?: number;        // pane height at adopt time
   };
 }
 

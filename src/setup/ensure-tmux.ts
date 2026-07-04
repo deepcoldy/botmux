@@ -21,6 +21,8 @@
  * tmux command would fail. Functional probe + soft fallback fixes both.
  */
 import { execSync, spawnSync } from 'node:child_process';
+import { unlinkSync } from 'node:fs';
+import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
 
 export interface TmuxResult {
@@ -28,6 +30,15 @@ export interface TmuxResult {
   version?: string;
   /** True iff we ran an installer (vs. tmux was already present). */
   freshInstall: boolean;
+  /**
+   * Whether the `tmux` binary is on PATH at all, INDEPENDENT of whether it can
+   * start a server. Lets the start-gate (PR#289 Option A) distinguish "tmux
+   * genuinely absent" (deterministic → safe to hard-fail daemon startup) from
+   * "binary present but the functional probe flaked" (must degrade gracefully
+   * via the per-session gate, never block startup — see
+   * shouldHardFailStartupForMissingTmux). Set on every return.
+   */
+  binaryPresent?: boolean;
   /** Which strategy actually ran the install. */
   strategy?: PackageManager;
   /** When installed=false: human-readable reason for the caller's warning. */
@@ -102,6 +113,18 @@ export function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv
   };
 }
 
+function cleanupTmuxProbeSocket(sockName: string, env: NodeJS.ProcessEnv = process.env): void {
+  if (typeof process.getuid !== 'function') return;
+
+  const baseDir = env.TMUX_TMPDIR || '/tmp';
+  const socketPath = join(baseDir, `tmux-${process.getuid()}`, sockName);
+  try {
+    unlinkSync(socketPath);
+  } catch {
+    // Best-effort: some tmux builds unlink the socket themselves.
+  }
+}
+
 /**
  * Functional tmux probe — actually starts a tmux server and tears it down.
  *
@@ -131,13 +154,16 @@ export function probeTmuxFunctional(): { ok: true; version: string } | { ok: fal
     env: tmuxEnv(),
   });
   if (run.status !== 0) {
+    spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+    cleanupTmuxProbeSocket(sockName);
     const stderr = (run.stderr?.toString() ?? '').trim();
     return { ok: false, reason: stderr || `tmux new-session 失败 (exit ${run.status})` };
   }
-  // Tear down the probe server. Best-effort — if this leaks, the kernel
-  // will GC the abstract socket when the (now-empty) tmux server exits on
-  // its own once the only client (which we didn't attach) goes away.
+  // Tear down the probe server and remove the socket file. Some platforms leave
+  // bmx-probe-* sockets behind after the server exits; thousands of stale
+  // entries make later probe storms slower and easier to time out.
   spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+  cleanupTmuxProbeSocket(sockName);
   return { ok: true, version };
 }
 
@@ -154,7 +180,7 @@ function sudoPrefix(cmd: string[], info: PlatformInfo): string[] | undefined {
 /** Build the install argv for a given package manager. Pure: returns argv[]
  *  ready for spawnSync, no side effects. Returns undefined if escalation
  *  isn't possible. */
-function buildInstallArgv(pm: PackageManager, pkg: string, info: PlatformInfo): string[] | undefined {
+export function buildInstallArgv(pm: PackageManager, pkg: string, info: PlatformInfo): string[] | undefined {
   switch (pm) {
     case 'brew':    return ['brew', 'install', pkg];
     case 'conda':   return ['conda', 'install', '-y', '-c', 'conda-forge', pkg];
@@ -173,7 +199,7 @@ function buildInstallArgv(pm: PackageManager, pkg: string, info: PlatformInfo): 
  *  (which is pure) — it runs once just before the apt install attempt.
  *  Failure here is non-fatal; the actual install will fail loudly if it
  *  can't find the package. */
-function aptUpdateBeforeInstall(info: PlatformInfo): void {
+export function aptUpdateBeforeInstall(info: PlatformInfo): void {
   const argv = sudoPrefix(['apt-get', 'update'], info);
   if (!argv) return;
   try {
@@ -182,7 +208,7 @@ function aptUpdateBeforeInstall(info: PlatformInfo): void {
 }
 
 /** Suggest the manual command we'd have run, for the failure message. */
-function suggestManualCommand(pm: PackageManager, pkg: string): string {
+export function suggestManualCommand(pm: PackageManager, pkg: string): string {
   switch (pm) {
     case 'brew': return `brew install ${pkg}`;
     case 'conda': return `conda install -y -c conda-forge ${pkg}`;
@@ -196,7 +222,7 @@ function suggestManualCommand(pm: PackageManager, pkg: string): string {
   }
 }
 
-function runInstall(argv: string[]): boolean {
+export function runInstall(argv: string[]): boolean {
   const result = spawnSync(argv[0]!, argv.slice(1), {
     stdio: 'inherit',
     timeout: 10 * 60_000, // 10 min — apt-get on slow networks
@@ -213,7 +239,7 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
   // that pass -V but fail every actual tmux command.
   const initialProbe = probeTmuxFunctional();
   if (initialProbe.ok) {
-    return { installed: true, version: initialProbe.version, freshInstall: false };
+    return { installed: true, version: initialProbe.version, freshInstall: false, binaryPresent: true };
   }
 
   // If the binary exists but the server can't start, no amount of
@@ -224,6 +250,7 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
     return {
       installed: false,
       freshInstall: false,
+      binaryPresent: true,
       reason: `${versionPresent} 已安装但启动 server 失败：${initialProbe.reason}`,
       manualCommand: '排查 ~/.tmux.conf / /tmp 权限 / libevent 依赖后再试',
     };
@@ -246,7 +273,7 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
       const postInstall = probeTmuxFunctional();
       if (postInstall.ok) {
         console.log(`✅ tmux ${postInstall.version} 安装完成 (via ${pm})`);
-        return { installed: true, version: postInstall.version, freshInstall: true, strategy: pm };
+        return { installed: true, version: postInstall.version, freshInstall: true, strategy: pm, binaryPresent: true };
       }
       tried.push(`${pm}（装上了但 server 起不来：${postInstall.reason}）`);
     } else {
@@ -271,6 +298,10 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
   return {
     installed: false,
     freshInstall: false,
+    // An install attempt may have landed the binary even though the server
+    // probe still fails — re-check PATH so the start-gate doesn't treat a
+    // present-but-broken tmux as "genuinely absent".
+    binaryPresent: !!probeTmuxVersion(),
     reason: reasonLines.join('\n'),
     manualCommand: manual,
   };

@@ -6,6 +6,7 @@ import type {
 } from '../../core/ask-types.js';
 import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
+import { t, localeForBot, type Locale } from '../../i18n/index.js';
 import { replyMessage, sendMessage, updateMessage } from './client.js';
 
 /** 旧单选即答动作（保留兼容旧卡片回调；Task 5 新增 ask_submit 路径）。 */
@@ -83,25 +84,28 @@ export async function handleAskCardAction(
   const askId = asString(value?.ask_id);
   const nonce = asString(value?.nonce);
   const by = data.operator?.open_id;
+  // Resolve the bot locale from the pending ask (best-effort — a stale/missing
+  // ask falls back to the process-default locale).
+  const locale = localeForBot(askId ? getAskSnapshot(askId)?.larkAppId : undefined);
   if (!askId || !nonce || !by) {
-    return staleToast();
+    return staleToast(locale);
   }
 
   // 旧单选即答路径：按钮直接携带 key，调用 tryResolveAsk（单问单选便捷封装）
   if (action === ASK_SELECT_ACTION) {
     const selected = asString(value?.key);
-    if (!selected) return staleToast();
-    return toastForOutcome(tryResolveAsk({ askId, nonce, selected, by }));
+    if (!selected) return staleToast(locale);
+    return toastForOutcome(tryResolveAsk({ askId, nonce, selected, by }), locale);
   }
 
   if (action === ASK_TOGGLE_ACTION) {
     const questionIndex = asNumber(value?.question_index);
     const key = asString(value?.key);
-    if (!Number.isInteger(questionIndex) || !key) return staleToast();
+    if (!Number.isInteger(questionIndex) || !key) return staleToast(locale);
     const outcome = toggleAsk({ askId, nonce, questionIndex, key, by });
-    if (outcome !== 'toggled') return toastForOutcome(outcome);
+    if (outcome !== 'toggled') return toastForOutcome(outcome, locale);
     const updated = getAskSnapshot(askId);
-    if (!updated) return staleToast();
+    if (!updated) return staleToast(locale);
     return JSON.parse(buildAskCard(updated)) as Record<string, unknown>;
   }
 
@@ -112,12 +116,12 @@ export async function handleAskCardAction(
       // 推断问题数量：找最大 qN 的 N+1
       const questionCount = guessQuestionCount(formValue);
       const selections = parseFormSelections(formValue, questionCount);
-      return toastForOutcome(submitAsk({ askId, nonce, by, selections }));
+      return toastForOutcome(submitAsk({ askId, nonce, by, selections }), locale);
     }
-    return toastForOutcome(submitAsk({ askId, nonce, by }));
+    return toastForOutcome(submitAsk({ askId, nonce, by }), locale);
   }
 
-  return staleToast();
+  return staleToast(locale);
 }
 
 /**
@@ -133,15 +137,16 @@ export async function handleAskCardAction(
  * 已 settle 时：渲染状态摘要，展示每问的选中标签（answered），或超时/失效信息。
  */
 export function buildAskCard(ask: PendingAsk, result?: AskResult): string {
+  const locale = localeForBot(ask.larkAppId);
   const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
-  const status = result ? settleStatus(result, ask) : undefined;
+  const status = result ? settleStatus(result, ask, locale) : undefined;
 
   // 截止时间 + 可答复人 字段行（settled 与 unsettled 均展示）
   const metaDiv = {
     tag: 'div',
     fields: [
-      { is_short: true, text: { tag: 'lark_md', content: `**截止**\n${escapeMd(deadline)}` } },
-      { is_short: true, text: { tag: 'lark_md', content: `**可答复**\n${escapeMd(approverSummary(ask))}` } },
+      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.deadline', undefined, locale)}**\n${escapeMd(deadline)}` } },
+      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${escapeMd(approverSummary(ask, locale))}` } },
     ],
   };
 
@@ -169,7 +174,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult): string {
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**问题 ${i + 1}**\n${escapeMd(truncate(q.prompt, 512))}`,
+          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(truncate(q.prompt, 512, locale))}`,
         },
       });
 
@@ -206,7 +211,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult): string {
         actions: [
           {
             tag: 'button',
-            text: { tag: 'plain_text', content: '提交' },
+            text: { tag: 'plain_text', content: t('card.ask.submit', undefined, locale) },
             type: 'primary',
             value: {
               action: ASK_SUBMIT_ACTION,
@@ -217,13 +222,22 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult): string {
         ],
       });
     }
+
+    // 自定义回复提示：选项都不满意时，直接在话题里回复一句文字即可当答案。
+    elements.push({ tag: 'hr' });
+    elements.push({
+      tag: 'note',
+      elements: [
+        { tag: 'plain_text', content: t('card.ask.custom_reply_hint', undefined, locale) },
+      ],
+    });
   }
 
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: {
       template: result ? templateForResult(result) : 'blue',
-      title: { tag: 'plain_text', content: result ? 'botmux ask 已结束' : 'botmux ask' },
+      title: { tag: 'plain_text', content: result ? t('card.ask.title_done', undefined, locale) : t('card.ask.title', undefined, locale) },
     },
     elements,
   });
@@ -281,24 +295,24 @@ export function parseFormSelections(
   return result;
 }
 
-function toastForOutcome(outcome: AskClickOutcome): { toast: { type: string; content: string } } | undefined {
+function toastForOutcome(outcome: AskClickOutcome, locale?: Locale): { toast: { type: string; content: string } } | undefined {
   switch (outcome) {
     case 'accepted':
       return undefined;
     case 'unauthorized':
-      return { toast: { type: 'warning', content: '你没有权限回答这个 ask' } };
+      return { toast: { type: 'warning', content: t('card.ask.toast.unauthorized', undefined, locale) } };
     case 'already_settled':
-      return { toast: { type: 'info', content: '这个 ask 已经被回答或结束' } };
+      return { toast: { type: 'info', content: t('card.ask.toast.already_settled', undefined, locale) } };
     case 'stale':
-      return staleToast();
+      return staleToast(locale);
     case 'toggled':
       // 累积勾选，不弹 toast
       return undefined;
   }
 }
 
-function staleToast(): { toast: { type: string; content: string } } {
-  return { toast: { type: 'warning', content: '⚠️ 此 ask 已失效' } };
+function staleToast(locale?: Locale): { toast: { type: string; content: string } } {
+  return { toast: { type: 'warning', content: t('card.ask.toast.stale', undefined, locale) } };
 }
 
 /**
@@ -307,22 +321,28 @@ function staleToast(): { toast: { type: string; content: string } } {
  * answered：遍历每个问题，把选中的 key 映射为 label 并渲染。
  * timedOut / invalidated：展示对应说明。
  */
-function settleStatus(result: AskResult, ask: PendingAsk): string {
+function settleStatus(result: AskResult, ask: PendingAsk, locale?: Locale): string {
   if (result.kind === 'answered') {
+    // 自定义回复（替代语义）：没有任何选中项、只有一段自定义文字 → 单独渲染。
+    const hasSelection = result.answers.some((keys) => keys.length > 0);
+    if (result.comment && !hasSelection) {
+      return `**${t('card.ask.custom_reply', undefined, locale)}**\n${escapeMd(result.comment)}\n${t('common.operator', { by: escapeMd(short(result.by, 28)) }, locale)}`;
+    }
     // 每问一行：问题N：<选中标签>
     const lines = result.answers.map((keys, i) => {
       const q = ask.questions[i];
-      if (!q) return `问题${i + 1}：（无法解析）`;
+      if (!q) return t('card.ask.q_unparseable', { n: i + 1 }, locale);
       const labels = keys.map((key) => q.options.find((o) => o.key === key)?.label ?? key);
-      return `问题${i + 1}：${labels.join(', ')}`;
+      return t('card.ask.q_summary_line', { n: i + 1, labels: labels.join(', ') }, locale);
     });
     const summary = lines.join('\n');
-    return `**已选择**\n${escapeMd(summary)}\n操作人：${escapeMd(short(result.by, 28))}`;
+    const commentLine = result.comment ? `\n${t('card.ask.supplement', { comment: escapeMd(result.comment) }, locale)}` : '';
+    return `**${t('card.ask.selected', undefined, locale)}**\n${escapeMd(summary)}${commentLine}\n${t('common.operator', { by: escapeMd(short(result.by, 28)) }, locale)}`;
   }
   if (result.kind === 'timedOut') {
-    return '**超时未答**';
+    return `**${t('card.ask.timed_out', undefined, locale)}**`;
   }
-  return `**已失效**\n${escapeMd(result.reason)}`;
+  return `**${t('card.ask.invalidated', undefined, locale)}**\n${escapeMd(result.reason)}`;
 }
 
 function templateForResult(result: AskResult): string {
@@ -333,11 +353,10 @@ function templateForResult(result: AskResult): string {
   }
 }
 
-function approverSummary(ask: PendingAsk): string {
-  if (ask.approvers.size === 0) return '无可用答复人';
-  const values = [...ask.approvers].map((id) => short(id, 18));
-  if (values.length <= 3) return values.join(', ');
-  return `${values.slice(0, 3).join(', ')} +${values.length - 3}`;
+function approverSummary(_ask: PendingAsk, locale?: Locale): string {
+  // 答复权限 = canTalk：谁能在该群跟 bot 说话谁就能答。卡片统一显示「本群可对话成员」，
+  // 不再按 open_id 列名单（鉴权在 broker 点击时按 canTalk 判定）。
+  return t('card.ask.answerable_talk_members', undefined, locale);
 }
 
 function asString(value: unknown): string | undefined {
@@ -364,9 +383,9 @@ function appendActionRows(elements: Array<Record<string, unknown>>, actions: Arr
   }
 }
 
-function truncate(s: string, maxChars: number): string {
-  if (s.length <= maxChars) return s || '（空）';
-  return `${s.slice(0, maxChars)}\n\n…（已截断）`;
+function truncate(s: string, maxChars: number, locale?: Locale): string {
+  if (s.length <= maxChars) return s || t('common.empty_paren', undefined, locale);
+  return `${s.slice(0, maxChars)}\n\n${t('common.truncated_short', undefined, locale)}`;
 }
 
 function escapeMd(s: string): string {

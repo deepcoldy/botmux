@@ -64,6 +64,7 @@ vi.mock('../src/services/session-store.js', () => ({
 }));
 
 vi.mock('../src/core/session-manager.js', () => ({
+  ensureSessionWhiteboard: vi.fn(),
   persistStreamCardState: (...args: any[]) => persistStreamCardStateMock(...args),
 }));
 

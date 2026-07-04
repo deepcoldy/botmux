@@ -107,6 +107,7 @@ export const BotSnapshotSchema = z.object({
   cliId: z.string().optional(),
   displayName: z.string().optional(),
   workingDir: z.string().optional(),
+  cliPathOverride: z.string().optional(),
 });
 export type BotSnapshot = z.infer<typeof BotSnapshotSchema>;
 

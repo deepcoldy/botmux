@@ -6,7 +6,10 @@
  *
  * Run:  pnpm vitest run test/card-builder.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import {
   buildSessionCard,
   buildStreamingCard,
@@ -14,10 +17,28 @@ import {
   buildSessionClosedCard,
   buildRelayPickerCard,
   buildPrivateSnapshotCard,
+  buildConfigCard,
   getCliDisplayName,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
+import { globalConfigPath } from '../src/global-config.js';
+
+// The terminal button's URL wrapping now depends on the global dashboard
+// setting `openTerminalInFeishu` (read via readGlobalConfig at build time):
+// default → direct URL, opt-in → Feishu sidebar wrapper. Isolate HOME to an
+// empty temp dir so these tests see the DEFAULT (no config.json → direct),
+// independent of whatever the test runner's real ~/.botmux/config.json holds.
+let cardTestHome: string;
+beforeEach(() => {
+  cardTestHome = mkdtempSync(join(tmpdir(), 'botmux-card-builder-'));
+  vi.stubEnv('HOME', cardTestHome);
+  mkdirSync(dirname(globalConfigPath()), { recursive: true });
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+  rmSync(cardTestHome, { recursive: true, force: true });
+});
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -34,6 +55,34 @@ function buttonTexts(actions: any[]): string[] {
   return actions
     .filter((a: any) => a.tag === 'button')
     .map((a: any) => a.text.content);
+}
+
+function allActions(card: any): any[] {
+  return card.elements
+    .filter((e: any) => e.tag === 'action')
+    .flatMap((e: any) => e.actions ?? []);
+}
+
+function expectSidebarUrl(actual: string, targetUrl: string): void {
+  const u = new URL(actual);
+  expect(`${u.origin}${u.pathname}`).toBe('https://applink.feishu.cn/client/web_url/open');
+  expect(u.searchParams.get('mode')).toBe('sidebar-semi');
+  expect(u.searchParams.get('min_width')).toBe('350');
+  expect(u.searchParams.get('width')).toBe('800');
+  expect(u.searchParams.get('max_width')).toBe('1200');
+  expect(u.searchParams.get('reload')).toBe('false');
+  expect(u.searchParams.get('url')).toBe(targetUrl);
+}
+
+/** Default mode: the terminal button links straight to the terminal URL on
+ *  every platform field (no Feishu sidebar wrapper). */
+function expectDirectUrl(actual: string, targetUrl: string): void {
+  expect(actual).toBe(targetUrl);
+}
+
+/** Opt into the Feishu sidebar wrapper for the current (isolated) HOME. */
+function enableOpenTerminalInFeishu(): void {
+  writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { openTerminalInFeishu: true } }));
 }
 
 // ─── getCliDisplayName ────────────────────────────────────────────────────
@@ -73,6 +122,49 @@ describe('getCliDisplayName', () => {
 
   it('should return "Mira" for mira', () => {
     expect(getCliDisplayName('mira')).toBe('Mira');
+  });
+
+  it('should return "Pi" for pi', () => {
+    expect(getCliDisplayName('pi')).toBe('Pi');
+  });
+});
+
+describe('buildConfigCard', () => {
+  it('renders silentTurnReactions as a card-behaviour toggle', () => {
+    const card = parse(buildConfigCard({
+      larkAppId: 'app_cfg',
+      botName: 'Config Bot',
+      cliId: 'codex',
+      cliOptions: [{ id: 'codex', label: 'Codex' }],
+      model: null,
+      modelChoices: [],
+      lang: null,
+      p2pMode: null,
+      brandLabel: null,
+      defaultWorkingDir: null,
+      autoStartPrompt: null,
+      customPassthroughCommands: null,
+      startupCommands: null,
+      teamRole: null,
+      quota: null,
+      admins: 1,
+      booleans: [
+        { key: 'disableStreamingCard', on: false },
+        { key: 'silentTurnReactions', on: true },
+        { key: 'writableTerminalLinkInCard', on: false },
+        { key: 'privateCard', on: false },
+        { key: 'autoStartOnGroupJoin', on: false },
+        { key: 'autoStartOnNewTopic', on: false },
+        { key: 'disableCliBypass', on: false },
+        { key: 'restrictGrantCommands', on: false },
+      ],
+    }, 'en'));
+
+    const toggle = allActions(card).find((a: any) => a.value?.field === 'silentTurnReactions');
+    expect(toggle).toBeTruthy();
+    expect(toggle.value.action).toBe('config_toggle');
+    expect(toggle.type).toBe('primary');
+    expect(toggle.text.content).toContain('Disable status reactions');
   });
 });
 
@@ -125,8 +217,19 @@ describe('buildSessionCard', () => {
       const terminalBtn = actions[0];
       expect(terminalBtn.type).toBe('primary');
       expect(terminalBtn.text.content).toContain('打开终端');
-      expect(terminalBtn.multi_url.url).toBe(URL);
-      expect(terminalBtn.multi_url.pc_url).toBe(URL);
+      expectDirectUrl(terminalBtn.multi_url.url, URL);
+      expectDirectUrl(terminalBtn.multi_url.pc_url, URL);
+      expect(terminalBtn.multi_url.android_url).toBe(URL);
+      expect(terminalBtn.multi_url.ios_url).toBe(URL);
+    });
+
+    it('wraps the terminal link in the Feishu sidebar when openTerminalInFeishu is on', () => {
+      enableOpenTerminalInFeishu();
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));
+      const terminalBtn = findActions(card)[0];
+      expectSidebarUrl(terminalBtn.multi_url.url, URL);
+      expectSidebarUrl(terminalBtn.multi_url.pc_url, URL);
+      // mobile fields stay direct in both modes
       expect(terminalBtn.multi_url.android_url).toBe(URL);
       expect(terminalBtn.multi_url.ios_url).toBe(URL);
     });
@@ -470,7 +573,10 @@ describe('buildStreamingCard', () => {
       const actions = findActions(card);
       const termBtn = actions.find((a: any) => a.multi_url);
       expect(termBtn).toBeDefined();
-      expect(termBtn.multi_url.url).toBe(URL);
+      expectDirectUrl(termBtn.multi_url.url, URL);
+      expectDirectUrl(termBtn.multi_url.pc_url, URL);
+      expect(termBtn.multi_url.android_url).toBe(URL);
+      expect(termBtn.multi_url.ios_url).toBe(URL);
       expect(termBtn.type).toBe('primary');
     });
 
@@ -516,6 +622,24 @@ describe('buildRepoSelectCard', () => {
     { name: 'gamma', path: '/home/user/gamma', type: 'repo', branch: 'develop' },
   ];
 
+  // The current-dir text + 「直接开启会话」and the manual input + button are
+  // each wrapped in a column_set for same-row layout, so a plain top-level
+  // .find() no longer reaches the div / input / button. Walk into column_set
+  // columns and form elements to collect every node by tag.
+  function deepFind(card: any, tag: string): any[] {
+    const out: any[] = [];
+    const walk = (els: any[]) => {
+      for (const el of els ?? []) {
+        if (el?.tag === tag) out.push(el);
+        if (Array.isArray(el?.columns)) el.columns.forEach((c: any) => walk(c.elements));
+        if (Array.isArray(el?.elements)) walk(el.elements);
+        if (Array.isArray(el?.actions)) walk(el.actions);
+      }
+    };
+    walk(card.elements);
+    return out;
+  }
+
   it('should return valid JSON', () => {
     const json = buildRepoSelectCard(projects);
     expect(() => JSON.parse(json)).not.toThrow();
@@ -537,20 +661,27 @@ describe('buildRepoSelectCard', () => {
   describe('current path display', () => {
     it('should show currentPath when provided', () => {
       const card = parse(buildRepoSelectCard(projects, '/home/user/alpha'));
-      const divEl = card.elements.find((e: any) => e.tag === 'div');
+      const divEl = deepFind(card, 'div')[0];
       expect(divEl.text.content).toContain('/home/user/alpha');
     });
 
     it('should show "N/A" when currentPath is undefined', () => {
       const card = parse(buildRepoSelectCard(projects));
-      const divEl = card.elements.find((e: any) => e.tag === 'div');
+      const divEl = deepFind(card, 'div')[0];
       expect(divEl.text.content).toContain('N/A');
     });
 
     it('should escape markdown special chars in currentPath', () => {
       const card = parse(buildRepoSelectCard(projects, '/home/user/[special]'));
-      const divEl = card.elements.find((e: any) => e.tag === 'div');
+      const divEl = deepFind(card, 'div')[0];
       expect(divEl.text.content).toContain('\\[special\\]');
+    });
+
+    it('uses the "当前工作目录" label (not "项目")', () => {
+      const card = parse(buildRepoSelectCard(projects, '/home/user/alpha'));
+      const divEl = deepFind(card, 'div')[0];
+      expect(divEl.text.content).toContain('当前工作目录');
+      expect(divEl.text.content).not.toContain('当前活跃项目');
     });
   });
 
@@ -630,14 +761,20 @@ describe('buildRepoSelectCard', () => {
   // ── Skip repo button ──────────────────────────────────────────────────
 
   describe('skip repo button', () => {
-    it('should include "直接开启会话" button with primary type', () => {
+    it('should include "直接开启会话" button with primary type, paired with the current-dir row', () => {
       const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
-      const actionEl = card.elements.find((e: any) => e.tag === 'action');
-      const skipBtn = actionEl.actions.find((a: any) => a.value?.action === 'skip_repo');
+      const skipBtn = deepFind(card, 'button').find((b: any) => b.value?.action === 'skip_repo');
       expect(skipBtn).toBeDefined();
       expect(skipBtn.type).toBe('primary');
       expect(skipBtn.text.content).toContain('直接开启会话');
       expect(skipBtn.value.root_id).toBe('om_root');
+      // It now lives in the top column_set (next to 当前工作目录), NOT in the
+      // switch-dropdown action row.
+      const switchRow = card.elements.find((e: any) => e.tag === 'action');
+      expect(switchRow.actions.some((a: any) => a.value?.action === 'skip_repo')).toBe(false);
+      expect(card.elements[0].tag).toBe('column_set');
+      const topButtons = deepFind({ elements: [card.elements[0]] }, 'button');
+      expect(topButtons.some((b: any) => b.value?.action === 'skip_repo')).toBe(true);
     });
   });
 
@@ -656,13 +793,121 @@ describe('buildRepoSelectCard', () => {
   // ── Element structure ─────────────────────────────────────────────────
 
   describe('element structure', () => {
-    it('should have 4 top-level elements: div, hr, action, note', () => {
+    it('single mode (default): 6 elements — dir+skip, switch, worktree row, manual form, note', () => {
       const card = parse(buildRepoSelectCard(projects));
-      expect(card.elements).toHaveLength(4);
-      expect(card.elements[0].tag).toBe('div');
+      expect(card.elements).toHaveLength(6);
+      expect(card.elements[0].tag).toBe('column_set'); // 当前工作目录 + 直接开启会话
       expect(card.elements[1].tag).toBe('hr');
-      expect(card.elements[2].tag).toBe('action');
-      expect(card.elements[3].tag).toBe('note');
+      expect(card.elements[2].tag).toBe('action');     // 选择仓库并切换 dropdown
+      expect(card.elements[3].tag).toBe('column_set'); // worktree dropdown + 🔀 多仓库 toggle (one row)
+      expect(card.elements[4].tag).toBe('form');       // manual entry
+      expect(card.elements[5].tag).toBe('note');
+    });
+
+    it('single mode: worktree dropdown weight-fills + toggle button auto-right in ONE column_set (mirrors manual row, no wrap)', () => {
+      const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
+      const row = card.elements[3];
+      expect(row.tag).toBe('column_set');
+      expect(row.flex_mode).toBe('none');                       // forces one line on mobile too
+      expect(row.columns[0].width).toBe('weighted');            // dropdown fills, like the manual input
+      const sel = row.columns[0].elements[0];
+      expect(sel.tag).toBe('select_static');
+      expect(sel.value.key).toBe('repo_worktree');
+      const btnCol = row.columns[row.columns.length - 1];
+      expect(btnCol.width).toBe('auto');                        // button hugs the right edge, aligns with 使用此目录
+      const toggle = btnCol.elements[0];
+      expect(toggle.tag).toBe('button');
+      expect(toggle.value.action).toBe('worktree_toggle_mode');
+      expect(toggle.value.root_id).toBe('om_root');
+    });
+
+    it('multi mode: worktree row becomes the inline multi-select form + a 🔀 单仓库 toggle row', () => {
+      const card = parse(buildRepoSelectCard(projects, undefined, 'om_root', undefined, true));
+      const form = card.elements.find((e: any) => e.tag === 'form' && e.name === 'repo_worktree_submit_form');
+      expect(form).toBeDefined();
+      const sel = deepFind({ elements: [form] }, 'multi_select_static').find((s: any) => s.name === 'repo_worktree_paths');
+      expect(sel?.required).toBe(true);
+      const branch = deepFind({ elements: [form] }, 'input').find((i: any) => i.name === 'repo_worktree_branch');
+      expect(branch).toBeDefined();
+      const submit = deepFind({ elements: [form] }, 'button').find((b: any) => b.name === 'repo_worktree_submit');
+      expect(submit.value.action).toBe('repo_worktree_submit');
+      // No single-select dropdown in multi mode
+      expect(deepFind(card, 'select_static').find((s: any) => s.value?.key === 'repo_worktree')).toBeUndefined();
+      // a right-aligned toggle row to switch back to single
+      const toggleBtn = deepFind(card, 'button').find((b: any) => b.value?.action === 'worktree_toggle_mode');
+      expect(toggleBtn).toBeDefined();
+    });
+
+    it('mode toggle is omitted with only one main repo (batching one repo is pointless)', () => {
+      const single: ProjectInfo[] = [
+        { name: 'alpha', path: '/home/user/alpha', type: 'repo', branch: 'main' },
+        { name: 'beta', path: '/home/user/beta', type: 'worktree', branch: 'feat-x' },
+      ];
+      const card = parse(buildRepoSelectCard(single));
+      expect(deepFind(card, 'button').find((b: any) => b.value?.action === 'worktree_toggle_mode')).toBeUndefined();
+    });
+
+    it('manual-entry form carries an input + form_submit button (same row via column_set)', () => {
+      const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
+      const form = card.elements.find((e: any) => e.tag === 'form' && e.name === 'repo_manual_form');
+      expect(form).toBeDefined();
+      // input + button now share a row inside a column_set under the form
+      expect(form.elements[0].tag).toBe('column_set');
+      const input = deepFind({ elements: [form] }, 'input')[0];
+      expect(input.name).toBe('repo_manual_path');
+      const btn = deepFind({ elements: [form] }, 'button').find((b: any) => b.name === 'repo_manual_submit');
+      expect(btn.action_type).toBe('form_submit');
+      expect(btn.value.action).toBe('repo_manual_submit');
+      expect(btn.value.root_id).toBe('om_root');
+    });
+
+    it('keeps the manual-entry form even when no main repos exist (worktree action omitted)', () => {
+      const onlyWorktrees: ProjectInfo[] = [
+        { name: 'beta', path: '/home/user/beta', type: 'worktree', branch: 'feat-x' },
+      ];
+      const card = parse(buildRepoSelectCard(onlyWorktrees));
+      // column_set(dir+skip), hr, switch action, form, note — worktree action dropped, form stays
+      expect(card.elements.map((e: any) => e.tag)).toEqual(['column_set', 'hr', 'action', 'form', 'note']);
+    });
+  });
+
+  // ── Worktree-open dropdown ─────────────────────────────────────────────
+
+  describe('worktree-open dropdown (single mode)', () => {
+    // Single mode (default): the worktree control is an INSTANT single-select
+    // (pick a repo → fires immediately, no submit). Multi mode is reached via the
+    // persisted 「切换多仓库选择器」toggle (covered above).
+    function worktreeSelect(card: any): any {
+      return deepFind(card, 'select_static').find((sel: any) => sel.value?.key === 'repo_worktree');
+    }
+
+    it('should list only main repos (no existing worktrees)', () => {
+      const card = parse(buildRepoSelectCard(projects));
+      const sel = worktreeSelect(card);
+      expect(sel.tag).toBe('select_static');
+      expect(sel.value.key).toBe('repo_worktree');
+      const labels = sel.options.map((o: any) => o.text.content);
+      expect(labels).toHaveLength(2);
+      expect(labels.join()).toContain('alpha');
+      expect(labels.join()).toContain('gamma');
+      expect(labels.join()).not.toContain('beta');
+    });
+
+    it('fires instantly: carries the repo path as the option value and root_id (no submit button)', () => {
+      const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
+      const sel = worktreeSelect(card);
+      expect(sel.options[0].value).toBe('/home/user/alpha');
+      expect(sel.value.root_id).toBe('om_root');
+      // No worktree form / submit button in single mode.
+      expect(card.elements.find((e: any) => e.tag === 'form' && e.name === 'repo_worktree_submit_form')).toBeUndefined();
+    });
+
+    it('should be omitted when no main repos exist', () => {
+      const onlyWorktrees: ProjectInfo[] = [
+        { name: 'beta', path: '/home/user/beta', type: 'worktree', branch: 'feat-x' },
+      ];
+      const card = parse(buildRepoSelectCard(onlyWorktrees));
+      expect(worktreeSelect(card)).toBeUndefined();
     });
   });
 
@@ -776,6 +1021,34 @@ describe('buildRelayPickerCard', () => {
     expect(input.behaviors[0].type).toBe('callback');
     expect(input.behaviors[0].value.action).toBe('relay_search');
     expect(input.behaviors[0].value.target_chat_id).toBe('oc_target');
+  });
+
+  it('carries target_scope in interactive values (defaults to chat, thread when passed)', () => {
+    // Default → chat-scope (legacy普通群-flat behavior).
+    const flat = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_target', 'oc_target', 'ou_invoker_test'));
+    expect(searchInput(flat).behaviors[0].value.target_scope).toBe('chat');
+    expect(containers(flat)[0].behaviors[0].value.target_scope).toBe('chat');
+    // Explicit thread → carried through so the confirm handler routes 话题.
+    const topic = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_target', 'om_topic_root', 'ou_invoker_test', undefined, undefined, 'thread'));
+    expect(searchInput(topic).behaviors[0].value.target_scope).toBe('thread');
+    expect(containers(topic)[0].behaviors[0].value.target_scope).toBe('thread');
+    expect(containers(topic)[0].behaviors[0].value.root_id).toBe('om_topic_root');
+  });
+
+  it('carries target_chat_type in interactive values (defaults to group, p2p when passed) and swaps DM copy', () => {
+    // Default → group (legacy behavior + legacy cards).
+    const grp = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_target', 'oc_target', 'ou_invoker_test'));
+    expect(searchInput(grp).behaviors[0].value.target_chat_type).toBe('group');
+    expect(containers(grp)[0].behaviors[0].value.target_chat_type).toBe('group');
+    expect(grp.header.title.content).toMatch(/本群|this group/);
+    // p2p → carried through so relay_confirm flips the session chatType; the
+    // header + confirm copy switch to the DM variants.
+    const dm = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_dm', 'om_dm_root', 'ou_invoker_test', undefined, { selectedSessionId: fixtureEntries(1)[0].sessionId }, 'thread', 'p2p'));
+    expect(searchInput(dm).behaviors[0].value.target_chat_type).toBe('p2p');
+    expect(containers(dm)[0].behaviors[0].value.target_chat_type).toBe('p2p');
+    expect(dm.header.title.content).toMatch(/单聊|DM/);
+    const confirmBtn = JSON.stringify(dm.body.elements);
+    expect(confirmBtn).toMatch(/接力到本单聊|into this DM/);
   });
 
   it('renders "no relayable sessions" notice when entries empty (form still shown)', () => {
@@ -987,7 +1260,10 @@ describe('buildPrivateSnapshotCard', () => {
     expect(actions.sort()).toEqual(['close', 'get_write_link']);
     // open-terminal is a URL button (no callback action)
     const link = btns.find((b: any) => b.multi_url);
-    expect(link.multi_url.url).toBe('https://t.example/ro');
+    expectDirectUrl(link.multi_url.url, 'https://t.example/ro');
+    expectDirectUrl(link.multi_url.pc_url, 'https://t.example/ro');
+    expect(link.multi_url.android_url).toBe('https://t.example/ro');
+    expect(link.multi_url.ios_url).toBe('https://t.example/ro');
     // none of the patch-driven / quick-key controls leak in
     for (const bad of ['toggle_display', 'export_text', 'refresh_screenshot', 'term_action']) {
       expect(actions).not.toContain(bad);

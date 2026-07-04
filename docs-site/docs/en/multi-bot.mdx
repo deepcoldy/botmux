@@ -1,0 +1,30 @@
+# Multi-bot Collaboration
+
+Multiple Lark bots can run on the same machine, and each bot can be bound to a different CLI. Add them to the same group and you can have different models "duke it out" against each other.
+
+<video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780421535360_multibot-video.aud.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+
+## Routing rules
+
+- **Only one bot in the group**: no @ needed, it responds automatically.
+- **Multiple bots in the group**: use `@mention` to specify the recipient.
+- `@botA @botB /t <prompt>`: have **each @-mentioned bot** independently open a new topic on the same message, each running on its own.
+
+## Letting bots know each other
+
+By default, bots **don't receive** each other's regular messages in the group. To let them relay and collaborate:
+
+1. First send `@botA @botB /introduce` once — they register each other's open_id (any @ order, extra text allowed).
+2. After that, each bot can explicitly @ the other in its own session with `botmux send --mention <the other's open_id>`, triggering the other to relay.
+
+> A hard fact about cross-bot collaboration: **if you don't `--mention` the other bot, it won't be triggered at all**. Get the other bot's open_id from `botmux bots list` or from the `<available_bots>` block in messages.
+
+## Typical scenarios
+
+- **Code review**: have Claude Code and Codex review the same MR together, picking holes in each other's views when they disagree.
+- **Design review**: two AIs each propose a solution and find flaws in each other's.
+- **Write/review separation**: one writes, one reviews, iterating to convergence.
+
+Configuration is minimal: one Lark app per bot, add them to the same group, and the processes are fully isolated.
+
+> Related: use [Roles & Teams](/en/roles) to give each bot a persona and capability tags; use [One-click session group](/en/group) to add multiple bots to a new group in one sentence; use [Session Relay](/en/relay) to move a session into a collaboration group.

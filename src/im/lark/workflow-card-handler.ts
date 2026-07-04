@@ -1,4 +1,5 @@
 import { logger } from '../../utils/logger.js';
+import { type Locale } from '../../i18n/index.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { EventLog } from '../../workflows/events/append.js';
 import { replay } from '../../workflows/events/replay.js';
@@ -89,6 +90,7 @@ export function workflowFrozenStoreId(runId: string): string {
 export async function handleWorkflowApprovalAction(
   data: WorkflowCardActionData,
   deps: WorkflowApprovalHandlerDeps = {},
+  locale?: Locale,
 ): Promise<WorkflowApprovalHandlerResult | undefined> {
   const value = data.action?.value;
   const action = value?.action;
@@ -180,7 +182,7 @@ export async function handleWorkflowApprovalAction(
     kind: resolutionKind,
     by,
     comment,
-  });
+  }, locale);
 
   return { ok: true, duplicate: false, cardNonce, result, resolvedCardJson };
 }
@@ -189,12 +191,13 @@ function buildResolvedCardJson(
   events: WorkflowEvent[],
   activityId: string,
   resolution: { kind: WorkflowApprovalResolutionKind; by: string; comment?: string },
+  locale?: Locale,
 ): string | undefined {
   try {
     const waitEvent = findLatestWaitCreated(events, activityId);
     if (!waitEvent) return undefined;
     const snapshot = replay(events);
-    return buildWorkflowApprovalCard(waitEvent, snapshot, { resolution });
+    return buildWorkflowApprovalCard(waitEvent, snapshot, { resolution }, locale);
   } catch (err) {
     logger.warn(`failed to build resolved approval card: ${err instanceof Error ? err.message : String(err)}`);
     return undefined;

@@ -69,6 +69,7 @@ describe('createRun', () => {
         cliId: 'codex',
         displayName: 'Codex Loopy',
         workingDir: '/tmp/codex',
+        cliPathOverride: '/opt/botmux-mc-codex',
       },
     });
 
@@ -99,6 +100,7 @@ describe('createRun', () => {
         cliId: 'codex',
         displayName: 'Codex Loopy',
         workingDir: '/tmp/codex',
+        cliPathOverride: '/opt/botmux-mc-codex',
       },
     });
 

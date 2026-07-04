@@ -1,0 +1,167 @@
+# bots.json Configuration
+
+Configure bots via `~/.botmux/bots.json`. Run `botmux setup` to create it interactively, or edit it by hand. The file is an array; each element is a bot (in production, one bot maps to one dedicated daemon process).
+
+```json
+[
+  {
+    "larkAppId": "cli_xxx_bot1",
+    "larkAppSecret": "secret_1",
+    "name": "claude-main",
+    "cliId": "claude-code",
+    "model": "sonnet",
+    "lang": "zh",
+    "workingDir": "~/projects",
+    "allowedUsers": ["alice@company.com"],
+    "allowedChatGroups": ["oc_xxx_team"],
+    "oncallChats": [{ "chatId": "oc_xxx_oncall", "workingDir": "~/projects/foo" }]
+  },
+  {
+    "larkAppId": "cli_xxx_bot2",
+    "larkAppSecret": "secret_2",
+    "cliId": "codex",
+    "model": "gpt-5-codex",
+    "workingDir": "~/work",
+    "autoStartOnNewTopic": true
+  }
+]
+```
+
+There are many fields, listed below grouped by purpose. The vast majority are **optional** — just `larkAppId` / `larkAppSecret` is enough to get running, and you add the rest as needed.
+
+## Required
+
+| Field | Description |
+|------|------|
+| `larkAppId` | Lark app App ID |
+| `larkAppSecret` | Lark app App Secret |
+
+## CLI and model
+
+| Field | Description |
+|------|------|
+| `name` | Process name suffix, e.g. `claude-main` → `botmux-claude-main`; leave empty to default to `botmux-<index>` |
+| `cliId` | CLI adapter, defaults to `claude-code`. See [Multi-CLI adapters](/en/adapters) |
+| `model` | Model name used to launch the CLI (e.g. `claude --model opus`); leave empty to use the CLI default. Multiple bots with the same `cliId` can run different models. Each adapter's `modelChoices` are the candidates offered in `botmux setup` |
+| `cliPathOverride` | Absolute path to the CLI entry point, for wrapping a wrapper / router (ccr, claude-w, aiden-x-claude, etc.) |
+| `disableCliBypass` | When `true`, the CLI's auto-approve / sandbox-bypass flags (`--yolo`, `--dangerously-*`) are not appended automatically; omitted / `false` keeps the original behavior |
+| `backendType` | Session backend, one of `pty` / `tmux` / `herdr` / `zellij`. Leave empty to **auto-detect**: chooses `tmux` if tmux is available, otherwise `pty` (`herdr` and `zellij` are never auto-selected and must be specified explicitly). `tmux` / `herdr` / `zellij` are all persistent sessions and fall back to `pty` automatically if the corresponding binary probe fails (`zellij` requires ≥ 0.44); `pty` attaches directly to the process and does not persist across restarts. See [tmux backend](/en/tmux) |
+| `launchShell` | Shell used to launch the CLI, overriding the daemon's `$SHELL`: a shell name (`zsh` / `bash` / `sh`) or an absolute path (e.g. `/usr/bin/zsh`). For when the login `$SHELL` (e.g. bash) has an rcfile that `exec`-trampolines into another shell (`exec zsh`), pre-empting the CLI under botmux's `bash -i` launch so the session never starts (bare-shell `parse error`) — pinning it launches under that shell directly, bypassing the skipped rcfile. **Note**: PATH / nvm / pnpm must then live in the chosen shell's rcfiles (e.g. `.zshrc` / `.zprofile`). Empty = use `$SHELL`. Takes effect next session; `tmux` / `zellij` backends only (`pty` execs the CLI directly and is unaffected). Also configurable in the dashboard ("Bot defaults → Launch shell") or via `/config launchShell <value>` |
+| `lang` | The bot's UI language, `zh` / `en`; leave empty to fall back to the `BOTMUX_LANG` / `LANG` environment variable |
+| `customPassthroughCommands` | On top of the fixed passthrough allowlist and the current CLI adapter's default-allowed commands, additionally pass through slash commands to the underlying CLI, e.g. `["/export"]` (Claude Code / Codex default-allow `/goal`). Auto-normalized (a missing `/` is added, lowercased, only `[a-z0-9:_-]` kept, deduplicated); entries that would shadow a botmux daemon command (e.g. `/status`) are dropped and have no effect even if configured. Use `/list-slash-command` to view the full allowlist. See [Slash commands](/en/slash-commands) |
+| `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. Also editable in the dashboard ("Bot defaults → Environment variables") |
+
+### Run a bot on GLM / a third-party provider (per-bot env)
+
+Run one bot on a GLM Coding Plan (or any Anthropic-compatible provider) while another keeps using official Claude — give the former an `env`:
+
+```json
+{
+  "cliId": "claude-code",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "your GLM Coding Plan key"
+  }
+}
+```
+
+- For GLM in China, use `https://open.bigmodel.cn/api/anthropic` for `ANTHROPIC_BASE_URL`.
+- For an OpenAI-protocol CLI like Codex, set `OPENAI_BASE_URL` / `OPENAI_API_KEY` (the provider's OpenAI-compatible endpoint) instead of `ANTHROPIC_*`.
+- **Isolation**: env is injected per-session into the CLI process, consistently across backends (tmux / zellij inject it per-pane, never into the shared server env), so one bot's provider config can't leak into another's.
+- **Security**: values live in `bots.json` and the process environment in plaintext — not a secret vault; chat surfaces like `/config get` mask the values (the owner-authenticated dashboard editor shows real values).
+- Takes effect from the next **session**.
+
+## Working directory
+
+| Field | Description |
+|------|------|
+| `workingDir` | Default working directory, supports a comma-separated list. Recursively searches **downward** for git repositories from this directory (up to 3 levels), never scans upward |
+| `workingDirs` | Array form of working directories (`["~/a", "~/b"]`); takes precedence over the comma-separated form of `workingDir` when explicitly configured |
+| `defaultWorkingDir` | Default directory for a single repository: with no oncall and no sibling session in the same group, enters it directly and skips the repo selection card. `/cd` can still switch mid-session. Purely a runtime fallback — does not write state and does not change the permission model |
+
+## Permissions and authorization
+
+| Field | Description |
+|------|------|
+| `allowedUsers` | The operate-permission list (**full email** or `ou_xxx`). When `allowedChatGroups` is configured, at least one is required to serve as owner |
+| `allowedChatGroups` | Conversable groups (`oc_xxx`). Any member of the group can converse (only `canTalk`); sensitive operations are still controlled by `allowedUsers` |
+| `oncallChats` | Oncall bindings, `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`. See [oncall](/en/oncall) |
+| `defaultOncall` | The bot's default: the first new topic in a new group chat is automatically bound to oncall. `{ "enabled": true, "workingDir": "~/foo", "since": <epoch ms> }`; older groups that already existed before `since` are unaffected |
+| `globalGrants` | Global conversable list (`ou_xxx`, people or bots). Can converse in any group, only `canTalk` |
+| `chatGrants` | Per-group, per-user authorization `{ "oc_xxx": ["ou_yyy"] }`, only grants `canTalk`. Usually written by the `/grant` card, but can also be configured by hand |
+| `messageQuota` | Message-quota switch `{ "defaultLimit": N }`: once a positive integer is configured, a `/grant` without a number applies an N-message quota; if not configured, authorization is unlimited. Only constrains talk authorization, does not affect `canOperate` |
+| `restrictGrantCommands` | When `true`, people granted only via per-user authorization (`chatGrants` / `globalGrants`) are disabled from **all slash commands** and can only have plain conversations; owner / `allowedUsers` / oncall / whole-group members are unaffected. Defaults to `false` |
+| `autoGrantRequestCards` | Enabled by default. Set to `false` to stop automatically sending `/grant` request cards to the owner when an unauthorized person or external bot @mentions this bot in a group and the talk gate blocks it; the message is dropped silently instead |
+
+## File sandbox
+
+| Field | Description |
+|------|------|
+| `sandbox` | When `true`, launch new sessions in the Linux file sandbox. Writes are isolated and must be landed with `/land` |
+| `sandboxHidePaths` | Paths masked inside the sandbox with empty dirs/files so the bot cannot read them, e.g. `["~/.ssh", "~/.botmux/bots.json"]` |
+| `sandboxReadonlyPaths` | Extra existing paths mounted read-only inside the sandbox, useful for shared source snapshots, reference repos, or generated docs the bot should inspect but not modify |
+| `sandboxNetwork` | Network policy for sandboxed sessions. Omitted / `true` keeps current network and proxy access; `false` adds `--unshare-net` and blocks normal network egress |
+
+## Cards and terminal
+
+| Field | Description |
+|------|------|
+| `brandLabel` | Branding text at the bottom of the card. `undefined` = default `botmux` link; `""` = hidden; any other string = rendered as-is (supports markdown). Purely cosmetic, does not affect routing / permissions |
+| `disableStreamingCard` | When `true`, no real-time streaming session card is sent at all (the Web Terminal still runs and the final reply still arrives via `botmux send`, there's just no auto-refreshing status card). For users who find the real-time card noisy |
+| `silentTurnReactions` | When `true`, card-off sessions no longer add GoGoGo / DONE reactions to the triggering message. Only affects the lightweight status reactions used when `disableStreamingCard` or `noCardChats` suppresses live cards; defaults to `false` |
+| `writableTerminalLinkInCard` | When `true`, the card body directly embeds a **writable** terminal link (with token, anyone who can see the card can operate it); by default it's hidden behind a "Get write permission" button and sent privately to whoever clicks. Meaningless when `disableStreamingCard` is enabled |
+| `privateCard` | When `true`, `/card` uses an ephemeral private card visible only to `allowedUsers` (talk grantees and the bare triggerer don't receive it), only effective in plain `group` chats, and cannot live-update. Only affects the `/card` command itself |
+
+## Proactive start
+
+| Field | Description |
+|------|------|
+| `autoStartOnGroupJoin` | When `true`, the bot starts working automatically when added to a new group containing at least one `allowedUsers` member (no @ needed). Requires subscribing the `im.chat.member.bot.added_v1` event for this app in the Lark admin console |
+| `autoStartOnGroupJoinPrompt` | Paired with the above: the first-round prompt for proactive start; if empty / blank, opens with an empty message and lets the bot read the group context itself. Meaningless when `autoStartOnGroupJoin` is off |
+| `autoStartOnNewTopic` | When `true`, the first message of every new topic in a topic group starts working automatically without an @ (no effect in plain groups). Defaults to passive (only @ triggers) |
+
+## Summary command
+
+| Field | Description |
+|------|------|
+| `summaryRange` | History range used by the explicit `@bot /summary` command. `limit` is the latest N messages in a regular group, defaulting to 50; `sinceHours` is the latest N hours in a regular group, defaulting to 24. Set either field to `0` to remove that limit. Topic groups always read the current topic/thread history, then apply the summary window |
+
+Example:
+
+```json
+{
+  "summaryRange": {
+    "limit": 50,
+    "sinceHours": 24
+  }
+}
+```
+
+- Only the explicit `@bot /summary` command triggers a summary. Messages that do not mention the bot still follow the existing group/topic routing rules and are not woken up by keywords.
+- The dashboard "/summary Range" controls this `summaryRange` field.
+- If an earlier `@same bot /summary` exists before the current trigger, the summary window includes only messages after that earlier command and up to the current trigger; otherwise botmux falls back to `limit` / `sinceHours`.
+- `limit` and `sinceHours` are also safety caps. If both are `0`, that dimension is not limited.
+
+## Legacy content trigger config
+
+| Field | Description |
+|------|------|
+| `contentTriggers` | **Legacy / no longer active.** Older builds used this field for keyword / regex triggers without an @mention, but current message routing no longer wakes a bot from `contentTriggers`. The parser keeps this field only for `bots.json` compatibility: if an old dashboard-managed trigger named `dashboard-default-summary-trigger` exists, botmux may read its `limit` / `sinceHours` as a fallback for `summaryRange`. New configs should use `summaryRange` |
+
+## Voice
+
+| Field | Description |
+|------|------|
+| `voice` | The bot's voice-engine override, merged field-by-field on top of the global `voice` block in `~/.botmux/config.json` (per-bot takes precedence). When valid voice credentials are present, a "🔊 Voice summary" button appears on reply cards. See [Voice summary](/en/voice) |
+
+## Runtime state (auto-maintained, do not edit)
+
+The following fields are written by botmux itself and persisted into `bots.json` alongside authorizations / switches. They are listed only for reference — **do not edit them by hand**:
+
+| Field | Description |
+|------|------|
+| `defaultOncallAutoboundChats` | The chat_ids that `defaultOncall` has already auto-bound (append-only). Once recorded, it won't auto-bind again even if later unbound |
+| `quotaState` | Scope-level message-quota counters `{ "chat:<cid>:<oid>" \| "global:<oid>": { limit, used } }`; when exhausted, automatically revokes the corresponding scope's authorization |
+| `noCardChats` | The "don't send streaming cards in this group" list written by `/card off\|on` |
+
+> **Configuration precedence**: the `BOTS_CONFIG` environment variable → `~/.botmux/bots.json`. Run `botmux restart` after editing to take effect.

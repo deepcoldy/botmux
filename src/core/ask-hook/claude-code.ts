@@ -88,23 +88,32 @@ const claudeCodeAdapter: HookAskAdapter = {
     return { questions, raw: payload };
   },
 
-  formatAnswer(answersByQuestion: ReadonlyArray<ReadonlyArray<string>>, parsed: ParsedAsk): string {
+  formatAnswer(
+    answersByQuestion: ReadonlyArray<ReadonlyArray<string>>,
+    parsed: ParsedAsk,
+    comment?: string | null,
+  ): string {
     const rawPayload = parsed.raw;
     const rawQuestions = extractRawQuestions(rawPayload);
     const eventName = hookEventName(rawPayload);
+    const customText = (comment ?? '').trim();
 
     // Claude updatedInput.answers: { 问题文本: 'label1, label2' }；缺席的 question 不写 key。
     const answers: Record<string, string> = {};
     parsed.questions.forEach((q, i) => {
       const selectedKeys = answersByQuestion[i];
-      if (!selectedKeys || selectedKeys.length === 0) return;
-
-      // 把 key 映射回 label（用于人类可读的 answers 值）
-      const labels = selectedKeys.map((k) => {
-        const opt = q.options.find((o) => o.key === k);
-        return opt ? opt.label : k;
-      });
-      answers[q.prompt] = labels.join(', ');
+      if (selectedKeys && selectedKeys.length > 0) {
+        // 把 key 映射回 label（用于人类可读的 answers 值）
+        const labels = selectedKeys.map((k) => {
+          const opt = q.options.find((o) => o.key === k);
+          return opt ? opt.label : k;
+        });
+        answers[q.prompt] = labels.join(', ');
+      } else if (customText) {
+        // 自定义回复（替代语义）：该问无选中项 → 回落到用户的自定义文字。
+        // Claude Code 的 AskUserQuestion 原生支持任意文本答案（即"Other"路径）。
+        answers[q.prompt] = customText;
+      }
     });
 
     const directive = buildAllowDirective(eventName, rawQuestions, answers);

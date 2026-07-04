@@ -72,6 +72,18 @@ describe('registerBot', () => {
     expect(client.opts.appSecret).toBe('secret_001');
   });
 
+  it('should default the SDK Client domain to feishu when brand is unset', () => {
+    const state = mod.registerBot(makeCfg());
+    const client = state.client as unknown as { opts: Record<string, unknown> };
+    expect(client.opts.domain).toBe('https://open.feishu.cn');
+  });
+
+  it('should point the SDK Client domain at larksuite.com when brand is lark', () => {
+    const state = mod.registerBot(makeCfg({ brand: 'lark' }));
+    const client = state.client as unknown as { opts: Record<string, unknown> };
+    expect(client.opts.domain).toBe('https://open.larksuite.com');
+  });
+
   it('should set resolvedAllowedUsers from config.allowedUsers', () => {
     const cfg = makeCfg({ allowedUsers: ['u1', 'u2'] });
     const state = mod.registerBot(cfg);
@@ -97,6 +109,98 @@ describe('registerBot', () => {
     const state = mod.getBot('app_test_001');
     expect(state.config.larkAppSecret).toBe('new');
     expect(mod.getAllBots()).toHaveLength(1);
+  });
+});
+
+// ─── brand parsing ──────────────────────────────────────────────────────────
+
+describe('parseBotConfigsFromText — brand', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('keeps brand "lark" when configured', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', brand: 'lark' },
+    ]));
+    expect(cfg.brand).toBe('lark');
+  });
+
+  it('leaves brand undefined when unset (defaults to feishu downstream)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.brand).toBeUndefined();
+  });
+
+  it('drops bogus brand values to undefined', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', brand: 'wechat' },
+    ]));
+    expect(cfg.brand).toBeUndefined();
+  });
+
+  it('keeps a positive-integer maxLiveWorkers cap', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', maxLiveWorkers: 8 },
+    ]));
+    expect(cfg.maxLiveWorkers).toBe(8);
+  });
+
+  it('leaves maxLiveWorkers undefined (= unlimited) when unset', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.maxLiveWorkers).toBeUndefined();
+  });
+
+  it('drops ≤0 / fractional / non-numeric maxLiveWorkers to undefined', () => {
+    for (const bad of [0, -2, 1.5, '4', null] as const) {
+      const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', maxLiveWorkers: bad },
+      ]));
+      expect(cfg.maxLiveWorkers).toBeUndefined();
+    }
+  });
+
+  it('keeps a trimmed displayName and drops blank/non-string values', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', displayName: '  小助手  ' },
+    ]));
+    expect(cfg.displayName).toBe('小助手');
+    for (const bad of [undefined, '', '   ', 42, null] as const) {
+      const [c] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', displayName: bad },
+      ]));
+      expect(c.displayName).toBeUndefined();
+    }
+  });
+
+  it('effectiveBotDisplayName prefers displayName > probed botName > larkAppId', () => {
+    const state = mod.registerBot({ larkAppId: 'app_x', larkAppSecret: 's', cliId: 'claude-code' } as any);
+    expect(mod.effectiveBotDisplayName(state)).toBe('app_x');
+    state.botName = 'Claude';
+    expect(mod.effectiveBotDisplayName(state)).toBe('Claude');
+    state.config.displayName = '小助手';
+    expect(mod.effectiveBotDisplayName(state)).toBe('小助手');
+  });
+
+  it('normalizes startupCommands (adds leading /, keeps args, dedupes)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', startupCommands: ['effort ultracode', '/model opus', '/effort ultracode', '', 7] },
+    ]));
+    expect(cfg.startupCommands).toEqual(['/effort ultracode', '/model opus']);
+  });
+
+  it('leaves startupCommands undefined when unset / empty / non-array', () => {
+    for (const val of [undefined, [], '/effort ultracode', ['', '   ']] as const) {
+      const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', startupCommands: val },
+      ]));
+      expect(cfg.startupCommands).toBeUndefined();
+    }
   });
 });
 
@@ -351,6 +455,11 @@ describe('loadBotConfigs', () => {
       name: 'codex-main',
       cliId: 'gemini',
       cliPathOverride: '/usr/local/bin/gemini',
+      disableCliBypass: true,
+      sandbox: true,
+      sandboxHidePaths: ['~/.ssh', '', 42, '/etc/secret'],
+      sandboxReadonlyPaths: ['/srv/source-a-readonly', '  /srv/source-b-readonly  ', null],
+      sandboxNetwork: false,
       backendType: 'tmux',
       workingDir: '/home/user/project',
       allowedUsers: ['alice', 'bob'],
@@ -363,10 +472,27 @@ describe('loadBotConfigs', () => {
     expect(c.name).toBe('codex-main');
     expect(c.cliId).toBe('gemini');
     expect(c.cliPathOverride).toBe('/usr/local/bin/gemini');
+    expect(c.disableCliBypass).toBe(true);
+    expect(c.sandbox).toBe(true);
+    expect(c.sandboxHidePaths).toEqual(['~/.ssh', '/etc/secret']);
+    expect(c.sandboxReadonlyPaths).toEqual(['/srv/source-a-readonly', '/srv/source-b-readonly']);
+    expect(c.sandboxNetwork).toBe(false);
     expect(c.backendType).toBe('tmux');
     expect(c.workingDir).toBe('/home/user/project');
     expect(c.allowedUsers).toEqual(['alice', 'bob']);
     expect(c.allowedChatGroups).toEqual(['oc_team', 'oc_project']);
+  });
+
+  it('defaults disableCliBypass to false when omitted', () => {
+    process.env.BOTS_CONFIG = '/tmp/no-disable-cli-bypass.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+    }]));
+
+    const configs = mod.loadBotConfigs();
+    expect(configs[0].disableCliBypass).toBe(false);
   });
 
   it('should split comma-separated workingDir into workingDirs', () => {

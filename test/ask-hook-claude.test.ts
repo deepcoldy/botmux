@@ -153,6 +153,35 @@ describe('Claude Code hook adapter', () => {
     });
   });
 
+  describe('formatAnswer 自定义回复（comment）', () => {
+    it('单问无选项 + comment → answers[prompt] = 自定义文字', () => {
+      const payload = { ...(loadFixture('claude-ask-single.json') as any), hook_event_name: 'PreToolUse' };
+      const parsed = claude.parseQuestions(payload)!;
+      const directiveStr = claude.formatAnswer([[]], parsed, '我想先灰度 10% 再决定');
+      const directive = JSON.parse(directiveStr) as Record<string, unknown>;
+      const updatedInput = (directive.hookSpecificOutput as any).updatedInput as Record<string, unknown>;
+      expect(updatedInput.answers).toMatchObject({ '继续部署还是回滚？': '我想先灰度 10% 再决定' });
+    });
+
+    it('comment 为 null → 行为与旧版一致（仅用选中 label）', () => {
+      const payload = { ...(loadFixture('claude-ask-single.json') as any), hook_event_name: 'PreToolUse' };
+      const parsed = claude.parseQuestions(payload)!;
+      const directiveStr = claude.formatAnswer([['继续部署']], parsed, null);
+      const updatedInput = (JSON.parse(directiveStr).hookSpecificOutput as any).updatedInput;
+      expect(updatedInput.answers).toMatchObject({ '继续部署还是回滚？': '继续部署' });
+    });
+
+    it('多问 + comment：未选中的问题用 comment，已选中的问题仍用 label', () => {
+      const payload = loadFixture('claude-ask-multi.json');
+      const parsed = claude.parseQuestions(payload)!;
+      // 第一问选了 staging，第二问没选 → 第二问回落到 comment
+      const directiveStr = claude.formatAnswer([['staging'], []], parsed, '我自己决定通知方式');
+      const answers = (JSON.parse(directiveStr).hookSpecificOutput as any).decision.updatedInput.answers as Record<string, string>;
+      expect(answers['选择测试环境？']).toBe('staging');
+      expect(answers['通知方式？']).toBe('我自己决定通知方式');
+    });
+  });
+
   describe('passthrough（真放行 = 空 stdout）', () => {
     // 回归保护（Codex P1.1）：passthrough 必须是 no-op（空串），绝不能输出
     // allow + updatedInput——否则会用空 answers 顶替 tool input，把提问"答空"掉。

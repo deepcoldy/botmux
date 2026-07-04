@@ -98,6 +98,30 @@ describe('installHook — claude-settings', () => {
     expect(found.matcher).toBe('AskUserQuestion');
   });
 
+  it('(d) sessionStartCommand 时同时写入 SessionStart 就绪 hook，且幂等去重（路径变化也算同一条）', () => {
+    const readyCmd = '/usr/bin/node /path/to/cli.js session-ready';
+    installHook('claude-code', { configPath, format: 'claude-settings', sessionStartCommand: readyCmd }, hookCommand);
+
+    let settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    let ss: any[] = settings.hooks?.SessionStart ?? [];
+    expect(ss.some((g) => g.hooks?.some((e: any) => e.command === readyCmd))).toBe(true);
+
+    // 幂等：用 npm-global 风格的不同 cli.js 绝对路径再装，应替换而非叠加（仍只有一条 botmux 就绪 hook）
+    const readyCmd2 = '/opt/npm/lib/node_modules/botmux/dist/cli.js session-ready';
+    installHook('claude-code', { configPath, format: 'claude-settings', sessionStartCommand: readyCmd2 }, hookCommand);
+    settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    ss = settings.hooks?.SessionStart ?? [];
+    const botmuxReady = ss.filter((g) => g.hooks?.some((e: any) => e.command.includes('cli.js') && e.command.trimEnd().endsWith('session-ready')));
+    expect(botmuxReady.length).toBe(1);
+    expect(botmuxReady[0].hooks[0].command).toBe(readyCmd2);
+  });
+
+  it('(e) 不传 sessionStartCommand 时不写 SessionStart（保持旧行为）', () => {
+    installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(settings.hooks?.SessionStart).toBeUndefined();
+  });
+
   it('(c2) 已有同 hookCommand 的 PreToolUse entry 不会重复追加', () => {
     // 第一次安装
     installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
@@ -190,12 +214,21 @@ describe('installHook — opencode-plugin', () => {
     configPath = join(tmpDir, '.config', 'opencode', 'plugin', 'botmux-ask.js');
   });
 
-  it('插件用 argv 形式 spawnSync(cmd, args)，不拆 shell 字符串（Codex P1.2 回归）', () => {
+  it('插件用 argv 形式 spawn(cmd, args)，不拆 shell 字符串（Codex P1.2 回归）', () => {
     installHook('opencode', { configPath, format: 'opencode-plugin' }, hookCommand);
     const content = readFileSync(configPath, 'utf-8');
 
+    // 监听 question.asked 事件并经 event 钩子拦截（OpenCode 插件无专用 question 钩子）
     expect(content).toContain('question.asked');
-    expect(content).toContain('spawnSync(');
+    expect(content).toContain('event:');
+    // 插件导出必须是「函数」（OpenCode 要求；导出对象会报 "Plugin export is not a function"）
+    expect(content).toContain('export const BotmuxAsk = async');
+    // 异步 spawn（绝不能用 spawnSync 同步阻塞 OpenCode 单线程事件总线）
+    expect(content).toContain('spawn(');
+    expect(content).not.toContain('spawnSync(');
+    // 答案 POST 回 OpenCode 的 reply 端点解阻塞
+    expect(content).toContain('/question/');
+    expect(content).toContain('/reply');
     // args 以 JSON 数组嵌入，包含 hook 子命令与 cliId
     expect(content).toContain('"hook"');
     expect(content).toContain('"opencode"');

@@ -2,9 +2,7 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+import { delay } from '../../utils/timing.js';
 
 /** PTYs that have already received a writeInput. The first write lands while
  *  cursor-agent's TUI is still doing its startup render, so it needs a longer
@@ -13,17 +11,21 @@ function delay(ms: number): Promise<void> {
 const cursorFirstWriteSeen = new WeakSet<PtyHandle>();
 
 export function createCursorAdapter(pathOverride?: string): CliAdapter {
-  const bin = resolveCommand(pathOverride ?? 'cursor-agent');
+  // resolvedBin is lazy: setup constructs adapters only to read static
+  // modelChoices and must not shell out (see resolveCommand); the binary path
+  // is a spawn-time concern.
+  const rawBin = pathOverride ?? 'cursor-agent';
+  let cachedBin: string | undefined;
   return {
     id: 'cursor',
-    resolvedBin: bin,
+    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ resume, resumeSessionId, model }) {
+    buildArgs({ resume, resumeSessionId, model, disableCliBypass }) {
       // --force skips approvals so the model can act inside the topic without
       // every shell/edit bouncing back to Lark for confirmation — same posture
       // as codex's --dangerously-bypass-approvals-and-sandbox and claude-code's
       // --dangerously-skip-permissions.
-      const base = ['--force'];
+      const base = disableCliBypass ? [] : ['--force'];
       if (model && model.trim()) {
         base.push('--model', model.trim());
       }

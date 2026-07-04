@@ -17,8 +17,11 @@
  * - 网络/接口错误一律返回结构化结果, 不抛
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { type Brand, larkHosts } from '../im/lark/lark-hosts.js';
+import { DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
 
-export type Brand = 'feishu' | 'lark';
+// Brand 的单一事实源在 im/lark/lark-hosts.ts；这里 re-export 保持既有导入路径可用。
+export type { Brand };
 
 export interface RequiredScope {
   /** 飞书 scope 名 (`im:message` 等) */
@@ -58,9 +61,9 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   // isInChat 抛 Access denied 被吞，bot 静默掉出 roster，/group fail-closed 建不了群。
   { name: 'im:chat.members:read', desc: '群成员读取（/group 建群解析、判断 bot 是否在群）', critical: true },
   // 拉群把人/机器人加进群（chatMembers.create）需要写权限；缺它时建群能成、加成员
-  // 报 code 99991672 Access denied → 跨部署拉群「机器人进了但人没进」。非 critical：
-  // 核心收发消息不依赖它，只 /group 与跨部署 federation 拉群需要，缺失只 WARN。
-  { name: 'im:chat.members:write_only', desc: '群成员写入（/group、跨部署拉群把人和机器人加进群）', critical: false },
+  // 报 code 99991672 Access denied → 跨部署拉群「机器人进了但人没进」。拉群是核心刚需
+  // 功能，标 critical：缺它时启动自检直接 DM 管理员，不再静默报「all scopes granted」。
+  { name: 'im:chat.members:write_only', desc: '群成员写入（/group、跨部署拉群把人和机器人加进群）', critical: true },
   // 除用户基本信息外，/grant 自动登记 & /introduce 用它查通讯录区分真人/机器人
   // （isHumanOpenId）：缺这权限时真人无法被剔除，会混进机器人协作名单 <available_bots>
   // 误导模型。已是 critical，启动自检（checkRequiredScopes）缺失即 DM 管理员。
@@ -72,6 +75,28 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   { name: 'application:application:self_manage', desc: '应用自查 (免审批)', critical: false },
 ];
 
+/** 文档评论入口（/subscribe-lark-doc）专用的 app 权限。**不在** BOTMUX_REQUIRED_SCOPES
+ *  里——它是 opt-in 特性，只对「已订阅过文档」的 bot 启动自检（见
+ *  event-dispatcher.checkRequiredScopes 的文档就绪分支），不给没用该特性的 bot 添噪。
+ *  名字单一事实源 = utils/user-token.DOC_COMMENT_OAUTH_SCOPES（同名 OAuth user scope），
+ *  这里补中文说明；test 兜底两者一致 + 都在 lark-scopes.json manifest 内。 */
+const DOC_SCOPE_DESC: Record<string, string> = {
+  'docs:document.subscription': '订阅云文档事件（评论新增）',
+  'docs:event:subscribe': '云文档事件订阅',
+  'docs:document.comment:read': '读取文档评论',
+  'docs:document.comment:create': '回复 / 新建文档评论',
+  'wiki:wiki:readonly': '解析 wiki 节点（订阅 wiki 文档时）',
+};
+export const DOC_FEATURE_SCOPES: RequiredScope[] = DOC_COMMENT_OAUTH_SCOPES.map((name) => ({
+  name,
+  desc: DOC_SCOPE_DESC[name] ?? name,
+  critical: false,
+}));
+
+/** 文档评论入口需要订阅的事件——飞书无「列出已订阅事件」的 API，无法自检，仅在
+ *  启动就绪检查里据此提醒管理员去开发者后台订阅。 */
+export const DOC_COMMENT_EVENT = 'drive.notice.comment_add_v1';
+
 export interface RemainingStep {
   title: string;
   /** 飞书开放平台深链, 用户点了直接到对应页 */
@@ -79,18 +104,15 @@ export interface RemainingStep {
 }
 
 export function buildScopeDeepLink(appId: string, scopeName: string, brand: Brand = 'feishu'): string {
-  const host = brand === 'lark' ? 'open.larksuite.com' : 'open.feishu.cn';
-  return `https://${host}/app/${appId}/auth?q=${encodeURIComponent(scopeName)}&op_from=openapi&token_type=tenant`;
+  return `${larkHosts(brand).openApi}/app/${appId}/auth?q=${encodeURIComponent(scopeName)}&op_from=openapi&token_type=tenant`;
 }
 
 export function buildEventSubDeepLink(appId: string, brand: Brand = 'feishu'): string {
-  const host = brand === 'lark' ? 'open.larksuite.com' : 'open.feishu.cn';
-  return `https://${host}/app/${appId}/dev-config/event-sub`;
+  return `${larkHosts(brand).openApi}/app/${appId}/dev-config/event-sub`;
 }
 
 export function buildAppHomeDeepLink(appId: string, brand: Brand = 'feishu'): string {
-  const host = brand === 'lark' ? 'open.larksuite.com' : 'open.feishu.cn';
-  return `https://${host}/app/${appId}`;
+  return `${larkHosts(brand).openApi}/app/${appId}`;
 }
 
 // ─── Credential validation ─────────────────────────────────────────────────
@@ -115,8 +137,7 @@ export async function validateCredentials(
   opts: { budgetMs?: number; signal?: AbortSignal } = {},
 ): Promise<CredentialValidation> {
   const budgetMs = opts.budgetMs ?? 10_000;
-  const host = brand === 'lark' ? 'open.larksuite.com' : 'open.feishu.cn';
-  const url = `https://${host}/open-apis/auth/v3/tenant_access_token/internal`;
+  const url = `${larkHosts(brand).openApi}/open-apis/auth/v3/tenant_access_token/internal`;
 
   // 自家 AbortController 控制总超时; 同时把上层传进来的 signal 也接上.
   const ac = new AbortController();

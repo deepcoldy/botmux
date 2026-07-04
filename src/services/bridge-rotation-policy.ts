@@ -184,3 +184,51 @@ export function decideFingerprintSwitch(
   }
   return { action: 'switch', path: exact[0], reason: 'unknown-sid-exact' };
 }
+
+// ─── Absent-baseline self-heal ─────────────────────────────────────────────
+
+export interface AbsentBaselineHealInput {
+  /** Whether the bridge has already completed baseline (gate already open). */
+  baselineDone: boolean;
+  /** Whether a `bridgeJsonlPath` is currently pinned. */
+  hasJsonlPath: boolean;
+  /** Whether that pinned path currently exists on disk. */
+  jsonlFileExists: boolean;
+}
+
+/**
+ * Decide whether a pending Lark turn arriving against a not-yet-baselined
+ * bridge should SELF-HEAL by arming fresh-empty readiness, instead of being
+ * dropped with "baseline not ready".
+ *
+ * Background: in `baseline-existing` (resume / restart-restore) mode the
+ * worker pins `bridgeJsonlPath` to `<sessionId>.jsonl` and waits for that
+ * file to appear before baselining. If Claude wrote its transcript under a
+ * DIFFERENT sessionId than the one we guessed — `--session-id` not honoured,
+ * a stale resume id, or an /adopt sid persisted as the botmux sid — the
+ * guessed file never appears, `baselineDone` stays false forever, and every
+ * turn is dropped ("baseline not ready"). The bridge is then permanently
+ * stuck on a path that does not exist (the user-reported "message went into
+ * the PTY but final_output was never attributed" symptom). The pid-state
+ * resolver that would normally correct this needs a live CLI pid, which is
+ * often missing on restart-restore — so the only recovery path that still
+ * works is the exact-content fingerprint scan, and IT is starved because no
+ * turn is ever marked.
+ *
+ * An ABSENT file has no prior history to absorb, so it is safe to declare
+ * fresh-empty readiness (offset 0, baseline done) here: the pending turn
+ * then gets marked, which arms the per-tick exact-content fingerprint
+ * recovery (`decideFingerprintSwitch`) to discover the jsonl Claude actually
+ * appended this message to and switch the bridge onto it — no dependence on
+ * Claude's internal pid-state / tasks files, so it is Claude-version-robust.
+ *
+ * Returns true ONLY when baseline isn't done, a path is pinned, and that
+ * path is absent. When the file EXISTS (the genuine slow-resume-with-history
+ * case), this returns false so normal lazy-baseline runs instead and prior
+ * turns are absorbed rather than re-emitted.
+ */
+export function shouldHealAbsentBaseline(input: AbsentBaselineHealInput): boolean {
+  if (input.baselineDone) return false;
+  if (!input.hasJsonlPath) return false;
+  return !input.jsonlFileExists;
+}

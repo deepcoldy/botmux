@@ -71,14 +71,22 @@ function collectParticipants(
   return map;
 }
 
+/**
+ * Top-level entries (the <participants> block and every <msg>) indent this far
+ * under <forwarded_messages>, so the whole forwarded block reads as a properly
+ * nested tree rather than a flat column-0 dump. Nested merged_forward children
+ * indent a further two spaces on top of this (see renderNodes).
+ */
+const BASE_INDENT = '  ';
+
 function renderParticipants(map: Map<string, ParticipantInfo>): string {
   const items: string[] = [];
   for (const [key, info] of map) {
     const openIdAttr = key.startsWith('__unknown_') ? '' : ` open_id="${xmlEscape(key)}"`;
     const nameAttr = info.name ? ` name="${xmlEscape(info.name)}"` : '';
-    items.push(`  <p id="${info.alias}"${openIdAttr} type="${info.type}"${nameAttr} />`);
+    items.push(`${BASE_INDENT}  <p id="${info.alias}"${openIdAttr} type="${info.type}"${nameAttr} />`);
   }
-  return `<participants>\n${items.join('\n')}\n</participants>`;
+  return `${BASE_INDENT}<participants>\n${items.join('\n')}\n${BASE_INDENT}</participants>`;
 }
 
 function renderNodes(
@@ -121,7 +129,7 @@ export function renderForwardedXml(nodes: ForwardedNode[]): string {
   const collectCounter = { n: 0 };
   const participants = collectParticipants(nodes, new Map(), collectCounter);
   const renderCounter = { n: 0 };
-  const body = renderNodes(nodes, participants, renderCounter);
+  const body = renderNodes(nodes, participants, renderCounter, BASE_INDENT);
   return [
     '<forwarded_messages>',
     renderParticipants(participants),

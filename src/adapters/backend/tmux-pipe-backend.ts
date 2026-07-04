@@ -32,6 +32,7 @@ import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SpawnOpts } from './types.js';
 import { tmuxEnv } from '../../setup/ensure-tmux.js';
 import { buildBotmuxEnvAssignments, resolveUserShell, SHELL_WRAPPER_SCRIPT, TmuxBackend } from './tmux-backend.js';
+import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 
 function shellescape(s: string): string {
   // Single-quote-escape, replacing internal ' with '\''
@@ -43,6 +44,42 @@ function shellescape(s: string): string {
  *  to xterm.js (which treats bare LF as "down one row, keep column"). */
 export function normaliseCaptureLineEndings(s: string): string {
   return s.replace(/\r?\n/g, '\r\n');
+}
+
+/**
+ * Compose the web-terminal seed body from a normalised capture-pane snapshot
+ * and the pane's cursor position.
+ *
+ * The receiving xterm replays this body and then resumes the LIVE pipe-pane
+ * byte stream. Claude Code (and other Ink TUIs) repaint their bottom block with
+ * height-RELATIVE moves (`\x1b[<n>A` + `\r\n`), so the FIRST live redraw assumes
+ * the cursor sits exactly where the pane's cursor is. Raw capture-pane output
+ * carries no cursor position and ends with a trailing newline — that newline
+ * scrolls the receiving grid one row PAST the content (desyncing the viewport
+ * from the app's coordinates) and parks the cursor on the bottom row instead of
+ * the app's real row. The first relative redraw then lands a row low, and
+ * because the CLI tracks position relatively, every subsequent frame stays
+ * shifted (the status-line update bleeds into the line below — the bug 申晗
+ * reported).
+ *
+ * Fix: strip the SINGLE trailing line terminator so no extra scroll happens,
+ * then restore the cursor with CUP (`\x1b[row;colH`). Strip exactly one `\r\n`,
+ * NOT a greedy `(\r\n)+` — capture-pane emits every pane row including trailing
+ * BLANK rows below the cursor (Claude's bottom row is usually blank). Greedily
+ * stripping would delete those blank rows and shift the whole grid up one row,
+ * parking the cursor above the real input line (an upward drift — the same bug,
+ * mirrored). CUP is viewport-relative and tmux's `cursor_x`/`cursor_y` are
+ * 0-based viewport coordinates, so +1 each lands correctly even when the capture
+ * includes full scrollback. Verified against a real 208x62 Claude pane.
+ * Exported for tests.
+ */
+export function composeSeedBody(
+  normalisedCapture: string,
+  cursor: { x: number; y: number } | null,
+): string {
+  const body = normalisedCapture.replace(/\r\n$/, '');
+  if (!cursor) return body;
+  return body + `\x1b[${cursor.y + 1};${cursor.x + 1}H`;
 }
 
 export class TmuxPipeBackend implements SessionBackend {
@@ -73,6 +110,10 @@ export class TmuxPipeBackend implements SessionBackend {
   private static readonly RECENT_OUTPUT_MAX = 4096;
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
   private lifecycleTimer: NodeJS.Timeout | null = null;
+  /** Debounce transient pane-probe failures so one flaky `tmux display-message`
+   *  (timeout / server hiccup under fd pressure) doesn't tear down an adopted
+   *  pane that's still alive. See recordPaneProbe. (pid-death stays decisive.) */
+  private readonly livenessGate = new LivenessGate(ADOPT_LIVENESS_MAX_FAILURES);
   private cols = 200;
   private rows = 50;
   private exited = false;
@@ -81,6 +122,9 @@ export class TmuxPipeBackend implements SessionBackend {
   private readonly createSession: boolean;
   private readonly ownsSession: boolean;
   private readonly _isReattach: boolean;
+  /** Adopt-mode CLI pid. Pane liveness alone is insufficient because the CLI
+   *  can exit back to the user's shell while the tmux pane stays alive. */
+  private readonly watchCliPid: number | undefined;
 
   /** Claude Code session JSONL path — set by worker for claude-code sessions so
    *  the claude-code adapter can verify paste+Enter submissions via file growth. */
@@ -99,11 +143,12 @@ export class TmuxPipeBackend implements SessionBackend {
     return this._isReattach;
   }
 
-  constructor(paneTarget: string, opts?: { createSession?: boolean; ownsSession?: boolean; isReattach?: boolean }) {
+  constructor(paneTarget: string, opts?: { createSession?: boolean; ownsSession?: boolean; isReattach?: boolean; cliPid?: number }) {
     this.paneTarget = paneTarget;
     this.createSession = opts?.createSession ?? false;
     this.ownsSession = opts?.ownsSession ?? false;
     this._isReattach = opts?.isReattach ?? false;
+    this.watchCliPid = opts?.cliPid;
     // Per-instance fifo so concurrent adopt sessions don't collide.
     this.fifoPath = join(tmpdir(), `botmux-pipe-${randomBytes(8).toString('hex')}.fifo`);
   }
@@ -186,10 +231,10 @@ export class TmuxPipeBackend implements SessionBackend {
     this.sendText(data);
   }
 
-  sendText(text: string): void {
-    if (this.exited) return;
+  sendText(text: string): boolean {
+    if (this.exited) return false;
     this.exitCopyModeIfNeeded();
-    this.guardedSend('send-keys (text)', () => {
+    return this.guardedSend('send-keys (text)', () => {
       execFileSync('tmux', ['send-keys', '-t', this.paneTarget, '-l', '--', text], {
         stdio: 'ignore',
         timeout: 5000,
@@ -198,10 +243,10 @@ export class TmuxPipeBackend implements SessionBackend {
     });
   }
 
-  sendSpecialKeys(...keys: string[]): void {
-    if (this.exited) return;
+  sendSpecialKeys(...keys: string[]): boolean {
+    if (this.exited) return false;
     this.exitCopyModeIfNeeded();
-    this.guardedSend(`send-keys ${keys.join(' ')}`, () => {
+    return this.guardedSend(`send-keys ${keys.join(' ')}`, () => {
       execFileSync('tmux', ['send-keys', '-t', this.paneTarget, ...keys], {
         stdio: 'ignore',
         timeout: 5000,
@@ -224,18 +269,34 @@ export class TmuxPipeBackend implements SessionBackend {
   pasteText(text: string): void {
     if (this.exited) return;
     this.exitCopyModeIfNeeded();
+    const bufferName = `botmux-${randomBytes(8).toString('hex')}`;
     this.guardedSend('paste-buffer', () => {
-      execFileSync('tmux', ['load-buffer', '-'], {
-        input: text,
-        stdio: ['pipe', 'ignore', 'ignore'],
-        timeout: 5000,
-        env: tmuxEnv(),
-      });
-      execFileSync('tmux', ['paste-buffer', '-t', this.paneTarget, '-d', '-p'], {
-        stdio: 'ignore',
-        timeout: 5000,
-        env: tmuxEnv(),
-      });
+      let loaded = false;
+      try {
+        execFileSync('tmux', ['load-buffer', '-b', bufferName, '-'], {
+          input: text,
+          stdio: ['pipe', 'ignore', 'ignore'],
+          timeout: 5000,
+          env: tmuxEnv(),
+        });
+        loaded = true;
+        execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', this.paneTarget, '-d', '-p'], {
+          stdio: 'ignore',
+          timeout: 5000,
+          env: tmuxEnv(),
+        });
+        loaded = false;
+      } finally {
+        if (loaded) {
+          try {
+            execFileSync('tmux', ['delete-buffer', '-b', bufferName], {
+              stdio: 'ignore',
+              timeout: 1000,
+              env: tmuxEnv(),
+            });
+          } catch { /* best-effort cleanup after a failed paste */ }
+        }
+      }
     });
   }
 
@@ -261,14 +322,20 @@ export class TmuxPipeBackend implements SessionBackend {
    *
    * Either way this method never throws — every send-keys caller (web-terminal
    * keys, TUI input, the typing loop) stays crash-safe without its own guard.
+   *
+   * Returns true when the write succeeded, false when it was dropped (pane gone
+   * or a pane-alive hiccup). Callers that verify submission (runner adapters)
+   * read this to report a non-submission; the many fire-and-forget callers
+   * (web-terminal keys, copy-mode) just ignore it.
    */
-  private guardedSend(op: string, run: () => void): void {
+  private guardedSend(op: string, run: () => void): boolean {
     try {
       run();
+      return true;
     } catch (err: any) {
       // A kill()/handlePaneExit() may have flipped exited between the guard
       // and here; if so the teardown already happened.
-      if (this.exited) return;
+      if (this.exited) return false;
       const alive = this.isPaneAlive();
       process.stderr.write(
         `[tmux-pipe-backend] ${op} failed (pane ${alive ? 'ALIVE' : 'GONE'}): ${err?.message ?? err}\n`,
@@ -284,6 +351,7 @@ export class TmuxPipeBackend implements SessionBackend {
         }
         this.handlePaneExit();
       }
+      return false;
     }
   }
 
@@ -400,18 +468,72 @@ export class TmuxPipeBackend implements SessionBackend {
 
   private startLifecycleWatcher(): void {
     this.stopLifecycleWatcher();
+    this.livenessGate.reset();
     this.lifecycleTimer = setInterval(() => {
       if (this.exited) return;
-      try {
-        const paneId = execSync(
-          `tmux display-message -p -t ${shellescape(this.paneTarget)} '#{pane_id}'`,
-          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 2000, env: tmuxEnv() },
-        ).trim();
-        if (!paneId) this.handlePaneExit();
-      } catch {
+      // The watched CLI pid (adopt mode) is a pure process.kill(pid,0) syscall —
+      // it can only report ESRCH (gone) or EPERM (alive), never a transient
+      // timeout / EMFILE failure. So pid-death is DECISIVE: tear down at once.
+      // This keeps the ≤1s guard against routing Lark input into the user's bare
+      // shell after the CLI exits to a still-alive pane. Only the flaky pane
+      // probe below gets debounced.
+      if (!this.isCliPidAlive()) {
+        process.stderr.write(`[tmux-pipe-backend] adopted CLI pid ${this.watchCliPid} exited; detaching observer\n`);
         this.handlePaneExit();
+        return;
       }
+      this.recordPaneProbe(this.isPaneAddressable(2000));
     }, 1000);
+  }
+
+  /** Is the pane still addressable in tmux? This `display-message` IS the flaky,
+   *  fd/server-dependent signal (command timeout / busy server under EMFILE) —
+   *  which is why recordPaneProbe debounces it. `timeoutMs` lets the final
+   *  confirm wait longer than the 1s poll so an overloaded server can still
+   *  answer before we declare a live pane dead. */
+  private isPaneAddressable(timeoutMs: number): boolean {
+    try {
+      const paneId = execSync(
+        `tmux display-message -p -t ${shellescape(this.paneTarget)} '#{pane_id}'`,
+        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs, env: tmuxEnv() },
+      ).trim();
+      return paneId.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Debounce the (flaky) pane-addressability probe. Tearing down on the FIRST
+   * failed probe produced the spurious "⏏ /adopt的 CLI 会话已断开" — a tmux command
+   * timeout / busy server (e.g. under EMFILE fd pressure) momentarily fails the
+   * probe while the pane is still alive and the CLI still receiving messages.
+   * Only after ADOPT_LIVENESS_MAX_FAILURES consecutive failures, AND a final
+   * lenient-timeout re-probe that still fails, do we detach. Any success resets.
+   * (pid-death is handled decisively in the watcher — see startLifecycleWatcher.)
+   */
+  private recordPaneProbe(alive: boolean): void {
+    if (this.exited) return;
+    if (!this.livenessGate.record(alive)) {
+      if (!alive) {
+        process.stderr.write(
+          `[tmux-pipe-backend] adopt pane probe failed (${this.livenessGate.consecutiveFailures}/${ADOPT_LIVENESS_MAX_FAILURES}); retrying before teardown\n`,
+        );
+      }
+      return;
+    }
+    // Threshold reached — one final authoritative probe with a more lenient
+    // timeout so a transiently overloaded tmux server gets a fair chance to
+    // answer before we detach a pane that's actually still alive.
+    if (this.isPaneAddressable(3000)) {
+      this.livenessGate.reset();
+      process.stderr.write('[tmux-pipe-backend] adopt pane recovered on final check; staying attached\n');
+      return;
+    }
+    process.stderr.write(
+      `[tmux-pipe-backend] adopted pane gone after ${ADOPT_LIVENESS_MAX_FAILURES} consecutive probe failures; detaching observer\n`,
+    );
+    this.handlePaneExit();
   }
 
   private stopLifecycleWatcher(): void {
@@ -425,6 +547,12 @@ export class TmuxPipeBackend implements SessionBackend {
     if (this.exited) return;
     this.exited = true;
     this.stopLifecycleWatcher();
+    if (this.pipeAttached) {
+      try {
+        execSync(`tmux pipe-pane -t ${shellescape(this.paneTarget)}`, { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+      } catch { /* pane may already be gone — benign */ }
+      this.pipeAttached = false;
+    }
     if (this.readStream) {
       try { this.readStream.destroy(); } catch { /* already closed */ }
       this.readStream = null;
@@ -434,8 +562,8 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   private createDetachedSession(bin: string, args: string[], opts: SpawnOpts): void {
-    const shellSpec = resolveUserShell();
-    const envAssignments = buildBotmuxEnvAssignments(opts.env);
+    const shellSpec = resolveUserShell(process.env, opts.launchShell);
+    const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
     execFileSync('tmux', [
       'new-session',
       '-d',
@@ -460,7 +588,16 @@ export class TmuxPipeBackend implements SessionBackend {
     const t = shellescape(this.paneTarget);
     const env = tmuxEnv();
     try {
-      execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore', env });
+      // status bar ON: shows tmux's window list so a user who manually
+      // `tmux attach -t <session>`es can navigate windows. Zero effect on the
+      // Lark card / web terminal — both read PANE bytes (capture-pane /
+      // pipe-pane), while the status bar is a client-level overlay that never
+      // enters the pane stream (and capture-pane never includes it). The
+      // original `status off` was a defensive guard from the early
+      // capture-screenshot backend; verified geometry-neutral on the pipe
+      // backend (toggling status on a detached session changes neither pane
+      // size nor cursor), so it's safe to default ON.
+      execSync(`tmux set-option -t ${t} status on`, { stdio: 'ignore', env });
       execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
       execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
       execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env });
@@ -482,7 +619,7 @@ export class TmuxPipeBackend implements SessionBackend {
    *  makes the snapshot render correctly. The live pipe-pane stream itself
    *  doesn't need this fix — applications write proper `\r\n`. */
   captureCurrentScreen(): string {
-    return this.captureWithBounds('-S - -E -');
+    return this.captureWithBounds('-S - -E -', { restoreCursor: true });
   }
 
   /** Snapshot ONLY the currently visible pane (no scrollback). Equivalent to
@@ -496,7 +633,7 @@ export class TmuxPipeBackend implements SessionBackend {
     return this.captureWithBounds('');
   }
 
-  private captureWithBounds(bounds: string): string {
+  private captureWithBounds(bounds: string, opts?: { restoreCursor?: boolean }): string {
     if (this.exited) return '';
     try {
       const altOn = this.isPaneInAltBuffer();
@@ -506,6 +643,10 @@ export class TmuxPipeBackend implements SessionBackend {
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000, maxBuffer: 16 * 1024 * 1024, env: tmuxEnv() },
       );
       const normalised = normaliseCaptureLineEndings(raw);
+      const body = opts?.restoreCursor
+        ? composeSeedBody(normalised, this.getCursorPosition())
+        : normalised;
+
       if (altOn) {
         // The pane's CLI (e.g. Claude Code, vim) is in the alternate screen
         // buffer. capture-pane returns the alt-buffer's content but no
@@ -513,11 +654,29 @@ export class TmuxPipeBackend implements SessionBackend {
         // with `enter alt screen + home + clear` so xterm.js renders it in
         // the alt buffer instead of leaking it into the main buffer where
         // it would persist after the application exits.
-        return `\x1b[?1049h\x1b[H\x1b[2J${normalised}`;
+        return `\x1b[?1049h\x1b[H\x1b[2J${body}`;
       }
-      return normalised;
+      return body;
     } catch {
       return '';
+    }
+  }
+
+  /** Current pane cursor position (0-based, viewport-relative — matches xterm
+   *  CUP semantics). Used to restore the cursor in the web-terminal seed so the
+   *  CLI's first height-relative redraw lands on the right row. */
+  private getCursorPosition(): { x: number; y: number } | null {
+    if (this.exited) return null;
+    try {
+      const out = execSync(
+        `tmux display-message -p -t ${shellescape(this.paneTarget)} '#{cursor_x} #{cursor_y}'`,
+        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 2000, env: tmuxEnv() },
+      ).trim();
+      const [x, y] = out.split(/\s+/).map(s => parseInt(s, 10));
+      if (Number.isFinite(x) && Number.isFinite(y) && x >= 0 && y >= 0) return { x, y };
+      return null;
+    } catch {
+      return null;
     }
   }
 
@@ -570,6 +729,17 @@ export class TmuxPipeBackend implements SessionBackend {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /** Unknown pid → pane-only liveness. EPERM still means the process exists. */
+  private isCliPidAlive(): boolean {
+    if (this.watchCliPid === undefined) return true;
+    try {
+      process.kill(this.watchCliPid, 0);
+      return true;
+    } catch (err: any) {
+      return err?.code === 'EPERM';
     }
   }
 

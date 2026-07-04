@@ -43,6 +43,10 @@ vi.mock('../src/services/observed-bots-store.js', async (importOriginal) => {
 
 const deps = { activeSessions: new Map(), sessionReply: vi.fn(async () => 'mid'), lastRepoScan: new Map() } as any;
 
+// 通知卡 / 部分失败文字 / 撤回原卡现在走 fire-and-forget 后台（handleCardAction 先同步返回
+// 终态卡避免 callback 超时 → 300000）。一次宏任务把整条后台微任务链排空再断言后台副作用。
+const flushBackground = () => new Promise(resolve => setTimeout(resolve, 0));
+
 async function fresh() {
   vi.resetModules();
   const registry = await import('../src/bot-registry.js');
@@ -77,11 +81,13 @@ describe('card-handler 部分授权失败', () => {
     const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_ok', 'ou_fail']);
     await handler.handleCardAction(multiAction(['ou_ok', 'ou_fail'], ['好机器人', '坏目标'], nonce), deps, 'h1');
 
-    // 失败 target 的 pending 必须清掉：checkNonce/isThrottled 都不再挡它
+    // 失败 target 的 pending 必须清掉：checkNonce/isThrottled 都不再挡它（同步发生，扣 pending 在落库阶段）
     expect(pending.checkNonce('h1', 'oc_1', 'ou_fail', nonce)).toBe(false);
     expect(pending.isThrottled('h1', 'oc_1', 'ou_fail')).toBe(false);
     // 成功 target 也清了
     expect(pending.checkNonce('h1', 'oc_1', 'ou_ok', nonce)).toBe(false);
+
+    await flushBackground();   // 通知 + 失败清单文字 + 撤卡走后台 fire-and-forget
 
     // owner 收到失败清单（含失败目标名），且不是静默
     const partialReply = replyMock.mock.calls.find(c => typeof c[2] === 'string' && String(c[2]).includes('坏目标'));
