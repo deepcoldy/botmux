@@ -23,10 +23,18 @@
 import { spawnSync } from 'node:child_process';
 import {
   existsSync, readdirSync, lstatSync, copyFileSync, mkdirSync, rmSync, readFileSync,
-  readlinkSync, symlinkSync, unlinkSync,
+  readlinkSync, symlinkSync, unlinkSync, realpathSync,
 } from 'node:fs';
-import { join, dirname, relative } from 'node:path';
+import { join, dirname, relative, resolve } from 'node:path';
 import { t, type Locale } from '../i18n/index.js';
+
+/** Canonicalize dataDir the same way prepareSandbox does: the sandbox tree is
+ *  created under the CANONICAL dataDir, so a symlink `config.session.dataDir`
+ *  would otherwise make `/land` / diff / patch look under the wrong path and
+ *  find no changeset. Best-effort — falls back to a plain normalize. */
+function canonicalDataDir(dataDir: string): string {
+  try { return realpathSync(dataDir); } catch { return resolve(dataDir); }
+}
 
 export interface LandDiff {
   ok: true;
@@ -52,7 +60,7 @@ interface UpperChange {
 
 /** Locate the project overlay UPPER dir (= SandboxSpawn.workDir) for a session. */
 export function upperDir(dataDir: string, sessionId: string): string {
-  return join(dataDir, 'sandboxes', sessionId, 'proj-upper');
+  return join(canonicalDataDir(dataDir), 'sandboxes', sessionId, 'proj-upper');
 }
 
 /**
@@ -65,7 +73,7 @@ export function upperDir(dataDir: string, sessionId: string): string {
  */
 function projectLower(dataDir: string, sessionId: string): string {
   try {
-    const meta = JSON.parse(readFileSync(join(dataDir, 'sandboxes', sessionId, 'meta.json'), 'utf8'));
+    const meta = JSON.parse(readFileSync(join(canonicalDataDir(dataDir), 'sandboxes', sessionId, 'meta.json'), 'utf8'));
     return typeof meta?.projectLower === 'string' ? meta.projectLower : '';
   } catch { return ''; }
 }

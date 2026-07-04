@@ -262,8 +262,9 @@ function canonicalize(p: string): string {
 }
 
 /** bwrap cannot bind-mount over a symlink mount destination. Some hosts expose
- *  $HOME through a symlink, so bind overlays at canonical targets while preserving
- *  user-facing paths (for example HOME env) elsewhere. */
+ *  $HOME through a symlink, so bind overlays — and set the child HOME env — at
+ *  canonical targets so the mount point always exists and $HOME resolves even
+ *  when the symlink's parent is masked inside the sandbox. */
 export function resolveSandboxMountPath(p: string): string {
   return canonicalize(p);
 }
@@ -336,9 +337,18 @@ export interface SandboxSpawn {
  *  data dir (e.g. CLAUDE_CONFIG_DIR / `.claude-runtime`): the HOME overlay's
  *  ephemeral UPPER copy. The worker redirects its jsonl/bridge watch here so it
  *  sees the sandboxed CLI's writes (which are invisible at the real host path).
- *  Mirrors prepareSandbox's homeUpper layout — keep in sync. */
+ *  Mirrors prepareSandbox's homeUpper layout — keep in sync.
+ *
+ *  The home overlay is bound (and $HOME set) at the CANONICAL home, so copy-ups
+ *  land relative to that root. Compute the in-home relative path robustly whether
+ *  realDataDir arrives in symlink or canonical form: adapters build it from the
+ *  raw homedir() (so the raw base cancels cleanly in the common case), but a
+ *  canonicalized dataDir under a symlink home would escape home-upper via `..` —
+ *  fall back to the canonical base so it can't. */
 export function sandboxedClaudeDataDir(sessionId: string, realDataDir: string): string {
-  return join(VARTMP_ROOT, sessionId, 'home-upper', relative(homedir(), realDataDir));
+  const raw = relative(homedir(), realDataDir);
+  const rel = raw.startsWith('..') ? relative(resolveSandboxMountPath(homedir()), realDataDir) : raw;
+  return join(VARTMP_ROOT, sessionId, 'home-upper', rel);
 }
 
 /** Proxy env vars forwarded into the sandbox so the CLI reaches the API even on

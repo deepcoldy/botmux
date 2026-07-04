@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
-import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
 
@@ -159,6 +159,33 @@ describe('resolveSandboxMountPath', () => {
     expect(resolveSandboxMountPath(linkHome)).toBe(realpathSync(realHome));
 
     rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('sandboxedClaudeDataDir (symlink HOME redirect)', () => {
+  it('keeps the redirect inside home-upper whether the dataDir is symlink- or canonical-form', () => {
+    // The home overlay binds (and $HOME is set) at the canonical home, so copy-ups
+    // land under home-upper relative to that root. A dataDir passed in CANONICAL
+    // form under a symlink HOME used to escape via `..` (relative(symlinkHome,
+    // canonicalData)) — breaking the Claude bridge redirect for exactly the
+    // symlink-HOME case this file hardens. Both forms must stay in home-upper.
+    const root = tmp();
+    const realHome = join(root, 'real-home');
+    const linkHome = join(root, 'home-link');
+    mkdirSync(realHome);
+    symlinkSync(realHome, linkHome);
+    const prevHome = process.env.HOME;
+    process.env.HOME = linkHome; // os.homedir() reads $HOME per call on Linux
+    try {
+      const symlinkForm = join(linkHome, '.claude');
+      const canonicalForm = join(realpathSync(linkHome), '.claude');
+      const expected = join('/var/tmp/botmux-sbx', 'sid-x', 'home-upper', '.claude');
+      expect(sandboxedClaudeDataDir('sid-x', symlinkForm)).toBe(expected);
+      expect(sandboxedClaudeDataDir('sid-x', canonicalForm)).toBe(expected);
+    } finally {
+      if (prevHome !== undefined) process.env.HOME = prevHome;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -354,6 +381,26 @@ describe('sandbox landing from upper layer', () => {
     // both files visible in the stat summary
     expect(d.statText).toContain('added.txt');
     expect(d.statText).toContain('sub/edited.txt');
+  });
+
+  it('resolves a symlink dataDir to the same canonical upper prepareSandbox created', () => {
+    // prepareSandbox canonicalizes dataDir before creating <dataDir>/sandboxes/…,
+    // so /land must canonicalize too or it looks under the symlink path and finds
+    // nothing. Write the changeset under the CANONICAL dir, ask via the SYMLINK.
+    const realData = tmp(); const sid = 's-symlink-datadir';
+    const linkData = join(tmp(), 'data-link');
+    symlinkSync(realData, linkData);
+    const up = upperDir(realData, sid);           // canonical upper (where writes land)
+    mkdirSync(up, { recursive: true });
+    writeFileSync(join(up, 'x.txt'), 'hi\n');
+    // upperDir must map the symlink dataDir onto the same canonical upper
+    expect(upperDir(linkData, sid)).toBe(up);
+    const d = computeSandboxDiff(linkData, sid);  // query via the symlink
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.empty).toBe(false);
+    expect(d.statText).toContain('x.txt');
+    rmSync(linkData, { force: true });
   });
 
   it('computeSandboxDiff reports empty when the upper has no changes', () => {
