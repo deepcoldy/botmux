@@ -1390,8 +1390,8 @@ describe('traex/coco sandbox authPaths', () => {
     expect(adapter.authPaths).toEqual(['~/.trae/cli']);
   });
 
-  it('coco keeps the whole ~/.trae/cli real in the sandbox (shared trae dir, bridge reads real paths)', () => {
+  it('coco keeps ~/.trae/cli (shared trae state/SQLite) AND ~/.cache/coco (transcripts the bridge reads) real', () => {
     const adapter = createCocoAdapter('/bin/coco');
-    expect(adapter.authPaths).toEqual(['~/.trae/cli']);
+    expect(adapter.authPaths).toEqual(['~/.trae/cli', '~/.cache/coco']);
   });
 });
