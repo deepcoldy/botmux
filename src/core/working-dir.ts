@@ -17,18 +17,29 @@ export function expandHome(p: string): string {
  * with full filesystem access, so an allowlist would be theater. We only do
  * the typo guards: exists and is a directory.
  *
- * Auto-create: if the path doesn't exist, we `mkdir -p` it (owner explicitly
- * asked for it, creating an empty dir is harmless). Callers can check the
- * `created` flag to inform the user.
+ * Auto-create is opt-in (`opts.autoCreate`): only commands where the owner is
+ * explicitly typing a fresh path right now (`/cd`, `/oncall bind`) pass it —
+ * a missing path gets `mkdir -p` and `created: true` so the caller can tell
+ * the user. Every other call site (stored/derived paths at trigger time,
+ * dashboard writes, repo cards) keeps the exists-check as its typo guard —
+ * silently materializing an empty dir there would mask a stale or mistyped
+ * path instead of surfacing it.
  */
-export function validateWorkingDir(input: string, locale?: Locale): { ok: true; resolvedPath: string; created?: boolean } | { ok: false; error: string } {
+export function validateWorkingDir(
+  input: string,
+  locale?: Locale,
+  opts?: { autoCreate?: boolean },
+): { ok: true; resolvedPath: string; created?: boolean } | { ok: false; error: string } {
   const resolvedPath = resolve(expandHome(input));
   if (!existsSync(resolvedPath)) {
+    if (!opts?.autoCreate) {
+      return { ok: false, error: t('cmd.cd.dir_not_exist', { path: resolvedPath }, locale) };
+    }
     try {
       mkdirSync(resolvedPath, { recursive: true });
       return { ok: true, resolvedPath, created: true };
     } catch (e: any) {
-      return { ok: false, error: t('cmd.cd.cannot_read', { path: resolvedPath, msg: e?.message ?? String(e) }, locale) };
+      return { ok: false, error: t('cmd.cd.cannot_create', { path: resolvedPath, msg: e?.message ?? String(e) }, locale) };
     }
   }
   let isDir = false;
