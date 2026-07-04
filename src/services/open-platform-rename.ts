@@ -64,25 +64,51 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
-/** contactRange / visible 明细里的条目 → id 列表（{id} 形态宽松解析）。 */
-function idList(value: unknown): string[] {
+// visible/online 各集合的 id 字段族：console 内部接口的条目形态没有公开契约，
+// members 实测是 { id }，departments / groups 未实测——按开放平台常见命名把
+// 候选 key 都列上，并配合下面的 fail-closed 兜底。
+const MEMBER_ID_KEYS = ['id', 'openId', 'open_id', 'userId', 'user_id', 'memberId', 'member_id'];
+const DEPARTMENT_ID_KEYS = ['id', 'departmentId', 'department_id', 'openDepartmentId', 'open_department_id'];
+const GROUP_ID_KEYS = ['id', 'groupId', 'group_id', 'chatId', 'chat_id', 'openChatId', 'open_chat_id'];
+
+/** 可见范围条目形态未识别 —— 绝不能发布可能改变可见性的版本，fail closed。 */
+class VisibilityParseError extends Error {
+  constructor(readonly collection: string) {
+    super(`visible/online ${collection} 条目形态未识别，已中止改名（避免把非空可见范围发布成空）`);
+  }
+}
+
+function pickIdByKeys(item: unknown, keys: string[]): string {
+  if (typeof item === 'string') return item;
+  if (typeof item === 'number' && Number.isFinite(item)) return String(item);
+  const rec = asRecord(item);
+  for (const key of keys) {
+    const v = rec[key];
+    if (typeof v === 'string' && v) return v;
+    if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  }
+  return '';
+}
+
+/**
+ * 条目 → id 列表。fail closed：任何一个条目解析不出 id 就抛
+ * {@link VisibilityParseError}——部分丢失同样会收窄可见范围，宁可中止改名
+ * 走 displayName 降级，也不发布一个"看起来成功"但少了人的版本。
+ */
+function idList(value: unknown, keys: string[], collection: string): string[] {
   if (!Array.isArray(value)) return [];
-  return value
-    .map((item) => {
-      if (typeof item === 'string') return item;
-      const id = asRecord(item).id;
-      return typeof id === 'string' ? id : typeof id === 'number' ? String(id) : '';
-    })
-    .filter(Boolean);
+  const ids = value.map((item) => pickIdByKeys(item, keys)).filter(Boolean);
+  if (ids.length < value.length) throw new VisibilityParseError(collection);
+  return ids;
 }
 
 /** visible/online 的白/黑名单块 → 版本 payload 的 visibleSuggest 形态。 */
-function visibilityBlock(raw: unknown): { departments: string[]; members: string[]; groups: string[]; isAll: number } {
+function visibilityBlock(raw: unknown, label: string): { departments: string[]; members: string[]; groups: string[]; isAll: number } {
   const rec = asRecord(raw);
   return {
-    departments: idList(rec.departments),
-    members: idList(rec.members),
-    groups: idList(rec.groups),
+    departments: idList(rec.departments, DEPARTMENT_ID_KEYS, `${label}.departments`),
+    members: idList(rec.members, MEMBER_ID_KEYS, `${label}.members`),
+    groups: idList(rec.groups, GROUP_ID_KEYS, `${label}.groups`),
     isAll: rec.isAll === 1 || rec.isAll === true ? 1 : 0,
   };
 }
@@ -152,7 +178,18 @@ export async function renameBotOnOpenPlatform(
   }
 
   try {
-    // 2) 写基础信息（名字）。
+    // 2) 预读并解析所有后续要用的数据 —— 在第一笔写操作之前完成。可见范围
+    //    条目形态未识别会在这里 fail closed（VisibilityParseError），此时
+    //    连名字都还没写，零副作用地退回 displayName 降级。
+    //    群内显示名跟随已发布版本 → 必须建新版本并发布；可见范围原样镜像
+    //    线上版本（白/黑名单都带上），改名绝不改变谁能看到这个应用。
+    const online = asRecord(asRecord(await client.postJson(`/developers/v1/visible/online/${appId}`, {})).data);
+    const visibleSuggest = visibilityBlock(online.whiteList ?? online, 'whiteList');
+    const blackVisibleSuggest = visibilityBlock(online.blackList, 'blackList');
+    const versionList = await client.postJson(`/developers/v1/app_version/list/${appId}`, {});
+    const appVersion = nextAppVersion(versionList);
+
+    // 3) 写基础信息（名字）。
     await client.postJson(`/developers/v1/base_info/${appId}`, {
       clientId: appId,
       name: newName,
@@ -161,14 +198,10 @@ export async function renameBotOnOpenPlatform(
       i18n,
     });
 
-    // 3) 群内显示名跟随已发布版本 → 必须建新版本并发布。可见范围原样镜像
-    //    线上版本（白/黑名单都带上），改名绝不改变谁能看到这个应用。
-    const online = asRecord(asRecord(await client.postJson(`/developers/v1/visible/online/${appId}`, {})).data);
-    const versionList = await client.postJson(`/developers/v1/app_version/list/${appId}`, {});
-    const appVersion = nextAppVersion(versionList);
+    // 4) 建版发布。
     const payload = buildAppVersionCreatePayload(appVersion, []) as unknown as Record<string, unknown>;
-    payload.visibleSuggest = visibilityBlock(online.whiteList ?? online);
-    payload.blackVisibleSuggest = visibilityBlock(online.blackList);
+    payload.visibleSuggest = visibleSuggest;
+    payload.blackVisibleSuggest = blackVisibleSuggest;
     payload.changeLog = `Rename to ${newName}`;
     payload.remark = 'Rename bot via botmux dashboard';
     const created = await client.postJson(`/developers/v1/app_version/create/${appId}`, payload);

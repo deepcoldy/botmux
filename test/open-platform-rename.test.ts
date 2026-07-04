@@ -97,6 +97,85 @@ describe('renameBotOnOpenPlatform', () => {
     });
 
     expect(calls.some(c => c.path === '/developers/v1/publish/commit/cli_x/v-123')).toBe(true);
+
+    // 读取/解析（visible/online、版本列表）都发生在第一笔写（base_info）之前，
+    // 这样可见范围 fail-closed 时零副作用。
+    const firstWrite = calls.findIndex(c => c.path.startsWith('/developers/v1/base_info/'));
+    expect(calls.findIndex(c => c.path.startsWith('/developers/v1/visible/online/'))).toBeLessThan(firstWrite);
+    expect(calls.findIndex(c => c.path.startsWith('/developers/v1/app_version/list/'))).toBeLessThan(firstWrite);
+  });
+
+  it('parses departments/groups id field families (departmentId / openChatId / numeric / plain string)', async () => {
+    const calls: Call[] = [];
+    const r = await renameBotOnOpenPlatform('cli_x', '新名字', undefined, {
+      loadCookies: () => COOKIES,
+      clientFactory: fakeClient(calls, {
+        '/developers/v1/app/cli_x': BASE_INFO,
+        '/developers/v1/base_info/cli_x': { code: 0 },
+        '/developers/v1/visible/online/cli_x': {
+          data: {
+            whiteList: {
+              departments: [{ departmentId: 'od-1' }, { open_department_id: 'od-2' }, 'od-3'],
+              groups: [{ openChatId: 'oc-1' }, { chat_id: 'oc-2' }],
+              isAll: 0,
+              members: [{ openId: 'ou_1' }, { user_id: 12345 }],
+            },
+            blackList: { departments: [], groups: [], isAll: 0, members: [] },
+          },
+        },
+        '/developers/v1/app_version/list/cli_x': VERSION_LIST,
+        '/developers/v1/app_version/create/cli_x': { data: { versionId: 'v-124' } },
+        '/developers/v1/publish/commit/cli_x/v-124': { code: 0 },
+      }),
+    });
+    expect(r).toMatchObject({ ok: true });
+    const createCall = calls.find(c => c.path.startsWith('/developers/v1/app_version/create/'))!;
+    expect(createCall.body).toMatchObject({
+      visibleSuggest: {
+        departments: ['od-1', 'od-2', 'od-3'],
+        groups: ['oc-1', 'oc-2'],
+        members: ['ou_1', '12345'],
+        isAll: 0,
+      },
+    });
+  });
+
+  it('fails closed BEFORE any mutation when a visibility entry shape is unrecognized', async () => {
+    const calls: Call[] = [];
+    const r = await renameBotOnOpenPlatform('cli_x', '新名字', undefined, {
+      loadCookies: () => COOKIES,
+      clientFactory: fakeClient(calls, {
+        '/developers/v1/app/cli_x': BASE_INFO,
+        '/developers/v1/visible/online/cli_x': {
+          data: {
+            whiteList: { departments: [{ weirdKey: 'od-1' }], groups: [], isAll: 0, members: [] },
+            blackList: { departments: [], groups: [], isAll: 0, members: [] },
+          },
+        },
+      }),
+    });
+    expect(r).toMatchObject({ ok: false, reason: 'api_error' });
+    if (!r.ok) expect(r.message).toContain('whiteList.departments');
+    // 名字没有被写、也没有建版：唯一的写接口 base_info / create / commit 都未被调用。
+    expect(calls.every(c => !c.path.includes('/base_info/') && !c.path.includes('/app_version/create/') && !c.path.includes('/publish/commit/'))).toBe(true);
+  });
+
+  it('fails closed on PARTIAL parse loss too (one member id unparseable)', async () => {
+    const calls: Call[] = [];
+    const r = await renameBotOnOpenPlatform('cli_x', '新名字', undefined, {
+      loadCookies: () => COOKIES,
+      clientFactory: fakeClient(calls, {
+        '/developers/v1/app/cli_x': BASE_INFO,
+        '/developers/v1/visible/online/cli_x': {
+          data: {
+            whiteList: { departments: [], groups: [], isAll: 0, members: [{ id: 'u1' }, { avatar: 'no-id-here' }] },
+            blackList: { departments: [], groups: [], isAll: 0, members: [] },
+          },
+        },
+      }),
+    });
+    expect(r).toMatchObject({ ok: false, reason: 'api_error' });
+    expect(calls.every(c => !c.path.includes('/base_info/'))).toBe(true);
   });
 
   it('rejects lark-brand tenants without touching the network', async () => {
