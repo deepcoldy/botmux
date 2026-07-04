@@ -308,9 +308,12 @@ describe('codex buildArgs', () => {
     expect(args.join('\n')).not.toContain('BOTMUX_TURN_ID');
   });
 
-  it('keeps Codex home untouched', () => {
+  it('keeps the whole ~/.codex real in the sandbox (SQLite needs fcntl locks the home overlay lacks)', () => {
     expect(adapter.buildSpawnEnv).toBeUndefined();
-    expect(adapter.authPaths).toEqual(['~/.codex/auth.json']);
+    // Not just auth.json: codex's state_*.sqlite / logs_*.sqlite live under
+    // ~/.codex and time out (~57s → exit 1) if the dir is on the overlayfs home,
+    // which doesn't support POSIX byte-range locks. Bind the whole dir real.
+    expect(adapter.authPaths).toEqual(['~/.codex']);
     // skillsDir resolves under CODEX_HOME (default ~/.codex) so it tracks where
     // Codex actually scans skills when CODEX_HOME is overridden.
     expect(adapter.skillsDir).toBe(join(codexHome(), 'skills'));

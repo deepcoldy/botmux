@@ -27,7 +27,9 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
   let cachedCodexBin: string | undefined;
   return {
     id: 'codex-app',
-    authPaths: ['~/.codex/auth.json'],
+    // Whole ~/.codex kept REAL (see codex.ts): its SQLite state/log DBs can't get
+    // fcntl locks on the sandbox home overlay, so codex hangs ~57s then exits 1.
+    authPaths: ['~/.codex'],
     resolvedBin: process.execPath,
 
     // resolvedBin is node-running-the-runner; the REAL codex is spawned later for

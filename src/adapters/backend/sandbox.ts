@@ -166,7 +166,8 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   a.push('--bind', plan.homeMerged, plan.home);
   a.push('--bind', plan.projectMerged, plan.projectMount);
   // CLI auth/login dirs kept REAL + writable (bind over the isolated home) so token
-  // refresh / login persists. Narrow (auth only) → session history stays isolated.
+  // refresh / login persists. Narrow (auth only) keeps session history isolated;
+  // some CLIs widen to their whole state dir for SQLite locks (CliAdapter.authPaths).
   for (const p of plan.authReal ?? []) a.push('--bind', p, p);
   // User-configured read-only inputs — BEFORE the masks so hidePaths always win
   // over an overlapping (e.g. ancestor) readonly entry.

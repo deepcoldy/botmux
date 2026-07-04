@@ -125,7 +125,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'codex',
-    authPaths: ['~/.codex/auth.json'],
+    // Whole ~/.codex kept REAL, not just auth.json: codex opens SQLite state/log
+    // DBs there (state_*.sqlite / logs_*.sqlite). Under the file sandbox the home
+    // is an overlayfs merge, and overlayfs (kernel + fuse) doesn't support the
+    // POSIX fcntl locks SQLite needs — the connection pool blocks ~57s then codex
+    // exits 1 ("pool timed out"). Binding the dir real gives working locks and
+    // keeps login/history persistent (same rationale as auth.json).
+    authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass }) {
