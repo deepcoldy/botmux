@@ -33,6 +33,8 @@ type OnboardingJob = {
   cliId?: string;
   workingDir?: string;
   addedBotIndex?: number;
+  liveStarted?: boolean;
+  liveStartMessage?: string;
   permission?: OnboardingPermission;
   remainingSteps?: RemainingStep[];
   error?: string;
@@ -144,8 +146,11 @@ function renderJob(job: OnboardingJob, ownerError?: string): void {
       + (job.workingDir ? ` ｜ <b>${t('botOnboarding.metaDir')}:</b> <code>${escapeHtml(job.workingDir)}</code>` : '')
       + `</p>`
     : '';
+  // 落盘完成后：新 bot 已自动上线（start-bot 成功）→ 「无需重启」；否则回退到重启提示。
   const restartHint = job.status === 'completed'
-    ? `<p class="hint-ok">${t('botOnboarding.restartHint')}</p>`
+    ? (job.liveStarted
+        ? `<p class="hint-ok">${t('botOnboarding.liveOk')}</p>`
+        : `<p class="hint-ok">${t('botOnboarding.restartHint')}</p>`)
     : '';
   d.innerHTML = `<article>
     <header>

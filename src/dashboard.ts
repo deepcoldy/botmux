@@ -45,7 +45,7 @@ import { invalidWorkingDirs } from './utils/working-dir.js';
 import { invalidateGlobalConfigCache, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
 import { buildDashboardUrl } from './core/dashboard-url.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
-import { isLocalDevInstall, botmuxVersion } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxVersion, botmuxCliEntry } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
 import { fetchLatestVersion, fetchReleasesSince, isNewerVersion, type ChangelogResult } from './core/update-check.js';
 import { GITHUB_REPO } from './core/restart-report.js';
@@ -215,7 +215,60 @@ function signDaemonTokenHeaders(): Record<string, string> {
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
-const botOnboarding = new BotOnboardingManager({ botsJsonPath: BOTS_JSON_PATH });
+/**
+ * Bring a freshly-onboarded bot online without a fleet-wide restart by spawning
+ * `botmux start-bot <appId> --json` (see cli.ts:ensureBotDaemonStarted). The new
+ * daemon is forked+supervised by pm2 (reparented off this process), self-registers
+ * and opens its Feishu WSClient, then publishes a descriptor the DaemonRegistry
+ * auto-discovers — so no dashboard reload is needed either. Runs `botmux` on the
+ * SAME host as the dashboard (shared pm2 home / bots.json — the documented
+ * dashboard↔daemon co-location assumption). Resolves best-effort; the caller
+ * falls back to the restart hint on failure.
+ */
+function spawnStartBotLive(appId: string): Promise<{ ok: boolean; message?: string }> {
+  return new Promise((resolve) => {
+    let out = '';
+    let err = '';
+    let settled = false;
+    const done = (r: { ok: boolean; message?: string }) => { if (!settled) { settled = true; resolve(r); } };
+    try {
+      const child = spawn(process.execPath, [botmuxCliEntry(), 'start-bot', appId, '--json'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: process.env,
+      });
+      const timer = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        done({ ok: false, message: 'start-bot 超时（30s）' });
+      }, 30_000);
+      timer.unref?.();
+      child.stdout?.on('data', (d) => { out += String(d); });
+      child.stderr?.on('data', (d) => { err += String(d); });
+      child.on('error', (e) => {
+        clearTimeout(timer);
+        done({ ok: false, message: e instanceof Error ? e.message : String(e) });
+      });
+      child.on('exit', (code) => {
+        clearTimeout(timer);
+        // `start-bot --json` prints a single StartBotLiveResult object; prefer its
+        // own message/processName over the raw exit code.
+        let parsed: any;
+        try { parsed = JSON.parse(out.trim()); } catch { /* non-JSON → fall through */ }
+        if (code === 0) {
+          done({ ok: true, message: parsed?.processName ? `${parsed.processName} 已上线` : undefined });
+        } else {
+          done({ ok: false, message: parsed?.message || err.trim() || `start-bot 退出码 ${code}` });
+        }
+      });
+    } catch (e) {
+      done({ ok: false, message: e instanceof Error ? e.message : String(e) });
+    }
+  });
+}
+
+const botOnboarding = new BotOnboardingManager({
+  botsJsonPath: BOTS_JSON_PATH,
+  startBotLive: spawnStartBotLive,
+});
 // 飞书 Web 登录态刷新（机器人改名缺登录态时的 dashboard 扫码入口）。机器级单例，
 // 写 ~/.botmux/feishu-session.json，与 setup / onboarding 复用同一份登录态。
 const feishuLogin = new FeishuLoginManager();

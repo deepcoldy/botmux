@@ -65,6 +65,14 @@ export interface BotOnboardingSnapshot {
   cliId?: string;
   workingDir?: string;
   addedBotIndex?: number;
+  /**
+   * 新 bot 是否已自动上线（`botmux start-bot`，无需整组 botmux restart）。
+   * true = 已拉起单个 daemon 进程并开始收飞书消息；false = 尝试失败（回退到
+   * 「请重启」提示）；undefined = 未尝试（无 startBotLive 注入，如单测）。
+   */
+  liveStarted?: boolean;
+  /** 自动上线的诊断信息（成功给进程名，失败给原因），供前端提示。 */
+  liveStartMessage?: string;
   permission?: BotOnboardingPermission;
   /** 自动配置失败时的手动权限步骤 (深链) */
   remainingSteps?: RemainingStep[];
@@ -102,6 +110,16 @@ export interface BotOnboardingManagerOptions {
   automateOpenPlatform?: AutomateOpenPlatformFn;
   renderQrDataUrl?: (url: string) => string;
   now?: () => number;
+  /**
+   * Bring the just-persisted bot online without a fleet-wide restart. Wired in
+   * the dashboard to spawn `botmux start-bot <appId>`: the new daemon
+   * self-registers, opens its Feishu WSClient long-connection, and publishes a
+   * descriptor the dashboard auto-discovers — so a newly added bot works with no
+   * `botmux restart`. Best-effort: a rejection/`ok:false` just falls back to the
+   * restart hint. Omitted in tests → onboarding behaves as before (persist only,
+   * `liveStarted` stays undefined).
+   */
+  startBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
 }
 
 export interface BotOnboardingJob {
@@ -150,6 +168,7 @@ export class BotOnboardingManager {
   private readonly automateOpenPlatform: AutomateOpenPlatformFn;
   private readonly renderQrDataUrl: (url: string) => string;
   private readonly now: () => number;
+  private readonly startBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
 
   constructor(private readonly opts: BotOnboardingManagerOptions) {
     this.registerApp = opts.registerApp ?? tryRegisterApp;
@@ -157,6 +176,22 @@ export class BotOnboardingManager {
     this.automateOpenPlatform = opts.automateOpenPlatform ?? automateOpenPlatformSetup;
     this.renderQrDataUrl = opts.renderQrDataUrl ?? renderQrSvgDataUrl;
     this.now = opts.now ?? (() => Date.now());
+    this.startBotLive = opts.startBotLive;
+  }
+
+  /**
+   * Best-effort auto-start of the just-persisted bot's daemon (no fleet restart).
+   * Records the outcome on the job snapshot so the frontend shows "已自动上线"
+   * instead of the restart hint. Never throws.
+   */
+  private async runLiveStart(id: string, appId: string): Promise<void> {
+    if (!this.startBotLive) return;
+    try {
+      const r = await this.startBotLive(appId);
+      this.patch(id, { liveStarted: r.ok, liveStartMessage: r.message });
+    } catch (err) {
+      this.patch(id, { liveStarted: false, liveStartMessage: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   start(input: BotOnboardingInput = {}): BotOnboardingJob {
@@ -262,6 +297,7 @@ export class BotOnboardingManager {
 
     if (ownerEntry) {
       const addedBotIndex = this.persistBot({ ...bot, allowedUsers: [ownerEntry] });
+      await this.runLiveStart(id, result.appId);
       this.finalizePermissions(id, result.appId, result.brand, addedBotIndex, auto, 'completed');
     } else {
       // owner 没法自动确认：bot 先不落盘, 暂存内存等用户手动填 owner 校验通过后再写。
@@ -324,6 +360,7 @@ export class BotOnboardingManager {
     // 校验通过才落盘：此刻 bot 第一次进入 bots.json, 且带着非空 allowedUsers。
     const addedBotIndex = this.persistBot({ ...pending, allowedUsers: entries });
     this.pendingBots.delete(id);
+    await this.runLiveStart(id, appId);
     this.patch(id, { status: 'completed', addedBotIndex });
     return { ok: true };
   }
