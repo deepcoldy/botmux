@@ -3,12 +3,13 @@
  * 登录态 + console 内部 `/developers/v1/*` 接口），把 dashboard 的「机器人改名」
  * 落到飞书应用本身，而不只是 botmux 侧展示名。
  *
- * 实测链路（2026-07-04 在测试 app 上打通）：
+ * 实测链路（2026-07-04 在测试 app 上打通；先读后写，读取/解析失败零副作用）：
  *   1. `app/:clientId`            — 读当前基础信息（langs / primaryLang / i18n / desc）
- *   2. `base_info/:clientId`      — 写新名字（所有已配语言的 name 都改，desc 保留）
- *   3. `visible/online/:clientId` — 读**线上版本**的可见范围（白/黑名单）
- *   4. `app_version/list` → 算下一个版本号 → `app_version/create`（可见范围
- *      原样镜像线上版本，绝不收窄/放宽）→ `publish/commit`
+ *   2. `visible/online/:clientId` — 读**线上版本**的可见范围（白/黑名单）并
+ *      fail-closed 解析；`app_version/list` 算下一个版本号
+ *   3. `base_info/:clientId`      — 写新名字（所有已配语言的 name 都改，desc 保留）
+ *   4. `app_version/create`（可见范围原样镜像线上版本，绝不收窄/放宽）
+ *      → `publish/commit`
  * 关键事实：只改基础信息时，群里 bot 显示名**不会**变——它跟随已发布版本；
  * 必须建新版本并发布（自建应用租户内秒过审）后 `/bot/v3/info` 才返回新名。
  *
