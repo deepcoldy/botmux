@@ -141,6 +141,16 @@ describe('bot-config store', () => {
     store.setDisplayNameRefresher(null);
   });
 
+  it('coerceConfigValue enforces the displayName length cap (spec.maxLen) for every entry point', async () => {
+    const { store } = await freshModules();
+    const spec = store.findConfigField('displayName')!;
+    expect(store.coerceConfigValue(spec, 'x'.repeat(64))).toEqual({ ok: true, value: 'x'.repeat(64) });
+    expect(store.coerceConfigValue(spec, 'x'.repeat(65))).toEqual({ ok: false, reason: 'too_long' });
+    // Fields without maxLen stay uncapped (e.g. brandLabel markdown can be long).
+    const brand = store.findConfigField('brandLabel')!;
+    expect(store.coerceConfigValue(brand, 'y'.repeat(200)).ok).toBe(true);
+  });
+
   it('parses bot skill policy while leaving omitted policy undefined', async () => {
     const { registry } = await freshModules();
     const [plain, skilled, advancedOnly] = registry.parseBotConfigsFromText(JSON.stringify([

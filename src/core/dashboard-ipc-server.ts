@@ -1523,8 +1523,14 @@ ipcRoute('PUT', '/api/bot-display-name', async (req, res) => {
   const spec = findConfigField('displayName');
   if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
   const raw = typeof body.displayName === 'string' ? body.displayName.trim() : '';
-  if (raw.length > 64) return jsonRes(res, 400, { ok: false, error: 'too_long' });
-  const value: string | null = raw || null;  // 空白 = 清除 → 回飞书名称
+  // 空白 = 清除 → 回飞书名称；非空走 coerceConfigValue（长度上限等校验与
+  // IM /config 入口共用，见字段 spec 的 maxLen）。
+  let value: string | null = null;
+  if (raw) {
+    const c = coerceConfigValue(spec, raw);
+    if (!c.ok) return jsonRes(res, 400, { ok: false, error: c.reason });
+    value = c.value as string;
+  }
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   // botName = 刷新后的有效展示名（displayName ?? 飞书名），供前端就地更新标题。

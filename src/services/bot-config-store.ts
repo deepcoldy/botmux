@@ -42,6 +42,8 @@ export interface ConfigFieldSpec {
   clearable: boolean;
   /** kind==='enum' 时的合法取值（已小写）。 */
   enumValues?: readonly string[];
+  /** kind==='string' 的最大长度（trim 后计），超出 coerce 报 too_long。缺省不限。 */
+  maxLen?: number;
   /** kind==='stringList' 的自定义解析器（自由文本 → 归一化数组）。缺省用
    *  customPassthroughCommands 的逗号/空格分隔解析；带参数的命令行字段
    *  （如 startupCommands）须指定按逗号/换行分隔、保留内部空格的解析器。 */
@@ -56,7 +58,7 @@ export interface ConfigFieldSpec {
  * 在此登记但走 {@link setBotAllowedUsers} 的专用异步路径（重解析 + 防自锁）。
  */
 export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
-  { key: 'displayName', configKey: 'displayName', kind: 'string', effect: 'immediate', clearable: true, hint: '自定义展示名（dashboard 名册/会话列表用）；不改飞书群内应用名；unset 回飞书名称' },
+  { key: 'displayName', configKey: 'displayName', kind: 'string', effect: 'immediate', clearable: true, maxLen: 64, hint: '自定义展示名（dashboard 名册/会话列表用，≤64 字符）；不改飞书群内应用名；unset 回飞书名称' },
   { key: 'model', configKey: 'model', kind: 'string', effect: 'next-session', clearable: true, hint: 'CLI 模型名（如 opus）；unset 回 CLI 默认' },
   { key: 'cli', configKey: 'cliId', kind: 'cli', effect: 'next-session', clearable: false, hint: 'CLI 适配器（序号 1-16 或 id，如 claude-code）' },
   { key: 'launchShell', configKey: 'launchShell', kind: 'string', effect: 'next-session', clearable: true, hint: '启动 CLI 用的 shell（zsh|bash|sh 或绝对路径），覆盖 $SHELL；用于 .bashrc/.zshrc 里 exec 切到别的 shell 导致会话起不来的场景；注意 PATH/nvm 要放进所选 shell 的 rc；unset 回 $SHELL' },
@@ -260,7 +262,7 @@ export async function setBotAllowedUsers(
 
 export type CoerceResult =
   | { ok: true; value: unknown }
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'empty' };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'empty' | 'too_long' };
 
 /**
  * 把一个**原始**字段值（来自卡片下拉/输入或别处）按字段 kind 解析校验成可落盘的
@@ -319,6 +321,9 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
       }
     }
     default: // 'string'
+      // 长度上限统一在这里生效（spec.maxLen），dashboard PUT 与 IM /config 两个
+      // 入口共用，不再各自分叉校验。
+      if (spec.maxLen && s.length > spec.maxLen) return { ok: false, reason: 'too_long' };
       return { ok: true, value: s };
   }
 }
