@@ -110,13 +110,15 @@ export function hasKnownBotMention(
  * detection needs to be code-aware; positions are irrelevant, so each matched
  * region collapses to a single space.
  *
- * Fenced blocks (```…```) are removed first so their triple-backtick fences
- * aren't misread as inline runs; then balanced inline runs (`…`, ``…``) go.
- * Unbalanced stray backticks are left as-is — harmless literal chars.
+ * Fenced blocks (a run of ≥3 backticks or ≥3 tildes, closed by an equal-length
+ * run) are removed first so their fences aren't misread as inline runs; then
+ * balanced inline backtick runs (`…`, ``…``) go. `~~strike~~` (double tilde) is
+ * NOT a fence and is deliberately left intact — an @Bot inside strikethrough is
+ * still a real prose mention. Unbalanced stray backticks are harmless literals.
  */
 export function stripCodeSpans(text: string): string {
   return text
-    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/(`{3,}|~{3,})[\s\S]*?\1/g, ' ')
     .replace(/(`+)[\s\S]*?\1/g, ' ');
 }
 

@@ -258,6 +258,14 @@ describe('stripCodeSpans', () => {
     expect(hasAt('```\nbotmux send --mention @Codex\n```', 'Codex')).toBe(false);
   });
 
+  it('blanks a tilde-fenced code block', () => {
+    expect(hasAt('~~~\nbotmux send --mention @Codex\n~~~', 'Codex')).toBe(false);
+  });
+
+  it('keeps @Bot inside ~~strikethrough~~ (not a fence)', () => {
+    expect(hasAt('~~@Codex~~ 还是要 @', 'Codex')).toBe(true);
+  });
+
   it('keeps a real prose @Bot so genuine handoffs still match', () => {
     expect(hasAt('@Codex 你接手一下', 'Codex')).toBe(true);
   });
