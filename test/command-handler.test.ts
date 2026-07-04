@@ -24,6 +24,7 @@ vi.mock('node:fs', async (importOriginal) => {
     ...actual,
     existsSync: vi.fn(() => true),
     statSync: vi.fn(() => ({ isDirectory: () => true })),
+    mkdirSync: vi.fn(),
     readFileSync: vi.fn((p: any, ...rest: any[]) => {
       if (typeof p === 'string' && p.includes('bots-info.json')) return JSON.stringify(BOTS_INFO);
       return (actual.readFileSync as any)(p, ...rest);
@@ -398,7 +399,7 @@ import { createGroupWithBots } from '../src/services/group-creator.js';
 import { getAllBots, getBot } from '../src/bot-registry.js';
 import { generateAuthUrl, getTokenStatus } from '../src/utils/user-token.js';
 import { bindOncall } from '../src/services/oncall-store.js';
-import { existsSync, statSync, readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, statSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { codexHome } from '../src/services/codex-paths.js';
@@ -1164,16 +1165,33 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('没有活跃的会话');
     });
 
-    it('should reply directory not found when path does not exist', async () => {
+    it('should auto-create the directory and switch when path does not exist', async () => {
       vi.mocked(existsSync).mockReturnValue(false);
 
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
 
-      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /nonexistent/path'), deps, LARK_APP_ID);
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /brand-new/path'), deps, LARK_APP_ID);
 
+      expect(mkdirSync).toHaveBeenCalledWith('/brand-new/path', { recursive: true });
+      expect(killWorker).toHaveBeenCalledWith(ds);
+      expect(ds.workingDir).toBe('/brand-new/path');
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(replyContent).toContain('目录不存在');
+      expect(replyContent).toContain('已自动创建并切换');
+    });
+
+    it('should reject /cd when auto-create fails', async () => {
+      vi.mocked(existsSync).mockReturnValue(false);
+      vi.mocked(mkdirSync).mockImplementationOnce(() => { throw new Error('EACCES: permission denied'); });
+
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /brand-new/denied'), deps, LARK_APP_ID);
+
+      expect(killWorker).not.toHaveBeenCalled();
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('无法创建目录');
     });
 
     it('should switch working directory and kill worker when path is valid', async () => {
@@ -2039,7 +2057,7 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('已绑定 oncall');
     });
 
-    it('should reject /oncall bind on a non-existent path', async () => {
+    it('should auto-create a non-existent path on /oncall bind and note it', async () => {
       vi.mocked(existsSync).mockReturnValue(false);
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
@@ -2047,14 +2065,34 @@ describe('handleCommand', () => {
       await handleCommand(
         '/oncall',
         ROOT_ID,
-        makeLarkMessage('/oncall bind /nonexistent/path'),
+        makeLarkMessage('/oncall bind /brand-new/oncall-dir'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(mkdirSync).toHaveBeenCalledWith('/brand-new/oncall-dir', { recursive: true });
+      expect(bindOncall).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, '/brand-new/oncall-dir');
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('已自动创建');
+    });
+
+    it('should reject /oncall bind when auto-create fails', async () => {
+      vi.mocked(existsSync).mockReturnValue(false);
+      vi.mocked(mkdirSync).mockImplementationOnce(() => { throw new Error('EACCES: permission denied'); });
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/oncall',
+        ROOT_ID,
+        makeLarkMessage('/oncall bind /brand-new/denied'),
         deps,
         LARK_APP_ID,
       );
 
       expect(bindOncall).not.toHaveBeenCalled();
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(replyContent).toContain('目录不存在');
+      expect(replyContent).toContain('无法创建目录');
     });
 
     it('should reject /oncall bind path that exists but is not a directory', async () => {
