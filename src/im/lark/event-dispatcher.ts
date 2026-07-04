@@ -19,7 +19,7 @@ import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId } from '.
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
-import { isPlatformTeamBot, isPlatformHallChat } from '../../services/platform-team-store.js';
+import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMemberChat } from '../../services/platform-team-store.js';
 import { recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed } from './doc-comment.js';
@@ -927,6 +927,7 @@ export type TalkReason =
   | 'oncall'
   | 'peer'
   | 'teamBot'
+  | 'teamMember'
   | 'allowedChatGroup'
   | 'open'
   | 'chatGrant'
@@ -977,11 +978,25 @@ function hasConfiguredAllowlist(bot: ReturnType<typeof getBot>): boolean {
     || (bot.config.globalGrants?.length ?? 0) > 0;
 }
 
-export function canTalk(larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined, senderUnionId?: string): boolean {
-  return evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId).allowed;
+export function canTalk(
+  larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined,
+  senderUnionId?: string, memberUnionId?: string,
+): boolean {
+  return evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId).allowed;
 }
 
-export function evaluateTalk(larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined, senderUnionId?: string): TalkEvaluation {
+/**
+ * @param senderUnionId  BOT-trust union（teamBot 腿）——调用方必须已按 sender_type
+ *   锁定为「飞书盖章的 bot 发送方」（daemon 的 teamTrustUnionId），否则恶意成员把
+ *   真人 union 报成 bot 就能让真人继承 bot 信任。
+ * @param memberUnionId  发送方 union（teamMember 腿）——可为真人 union（未锁 bot）。
+ *   仅授 chat 作用域内的 talk、不授 operate，且要求 union 在该团队的成员名单里
+ *   （memberUnionIds 来自平台鉴权的团队成员，非机器自报），故喂真人 union 是安全的。
+ */
+export function evaluateTalk(
+  larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined,
+  senderUnionId?: string, memberUnionId?: string,
+): TalkEvaluation {
   const bot = getBot(larkAppId);
   // allowedChatGroups 是"talk-open 的 chat_id 列表"：当前消息来自其中之一即放行（仅 canTalk）。
   // 成员关系隐含在"能在该 chat 发言"里 —— 退群者发不了言自动失权，新人进群即生效，无需成员快照。
@@ -1005,6 +1020,12 @@ export function evaluateTalk(larkAppId: string, chatId: string | undefined, send
   // 稳定 union_id（bot 专属，人不会进这两张表），不看 chatId，不授 operate。
   if (senderUnionId && (isTeamBot(config.session.dataDir, senderUnionId) || isPlatformTeamBot(config.session.dataDir, senderUnionId))) {
     return { allowed: true, reason: 'teamBot' };
+  }
+  // 平台团队成员（人）：发送者 union_id 是本群所属平台团队的成员 → talk 免 grant。
+  // 严格 chat 作用域（isPlatformTeamMemberChat 要求成员与群在同一团队），只放 talk：
+  // canOperate 不引这一腿，/restart 等仍限 allowedUsers。滕鹏飞在团队群里 @ bot 即免卡。
+  if (memberUnionId && isPlatformTeamMemberChat(config.session.dataDir, chatId, memberUnionId)) {
+    return { allowed: true, reason: 'teamMember' };
   }
   if (chatId && bot.config.allowedChatGroups?.includes(chatId)) return { allowed: true, reason: 'allowedChatGroup' };
 
@@ -1093,10 +1114,11 @@ async function maybeSendGrantRequestCard(
  * - 'ignore'      -> not addressed to bot at all
  */
 export async function checkGroupMessageAccess(
-  larkAppId: string, message: any, chatId: string, senderOpenId: string | undefined,
+  larkAppId: string, message: any, chatId: string, senderOpenId: string | undefined, memberUnionId?: string,
 ): Promise<'allowed' | 'not_allowed' | 'ignore'> {
   const mentioned = isBotMentioned(larkAppId, message, senderOpenId);
-  const isAllowed = canTalk(larkAppId, chatId, senderOpenId);
+  // 群消息访问检查只在人路径调用，union 走 memberUnionId 腿（不进 bot-trust）。
+  const isAllowed = canTalk(larkAppId, chatId, senderOpenId, undefined, memberUnionId);
 
   logger.debug(`Check group message access: mentioned=${mentioned}, isAllowed=${isAllowed}`);
   if (mentioned) {
@@ -1822,13 +1844,17 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         }
 
         const senderOpenId = sender?.sender_id?.open_id as string | undefined;
+        // 人的 union_id：平台团队成员 talk-免grant 腿（isPlatformTeamMemberChat）要用。
+        const humanSenderUnionId = sender?.sender_id?.union_id as string | undefined;
         // defaultOncall 自动绑定必须在 canTalk 权限判断前完成，否则已开 defaultOncall
         // 的群首次 @bot 时 oncallChats 中还没有该 chat → evaluateTalk 判无权限 → 误弹
         // 自助授权申请卡。ensureDefaultOncallBound 本身带 fast-path 短路且 idempotent。
         await ensureDefaultOncallBound(larkAppId, chatId, chatType).catch(err =>
           logger.warn(`[oncall:${larkAppId}] pre-permission auto-bind failed for ${chatId.substring(0, 12)}: ${err}`),
         );
-        const isAllowed = canTalk(larkAppId, chatId, senderOpenId);
+        // 人的路径（bot 发送方已在上面的分支 return）：union 走 memberUnionId 腿，
+        // 不进 bot-trust 腿——teamBot 只认 bot-locked union。
+        const isAllowed = canTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId);
 
         // /introduce — collaboration handshake. Intercept before any routing
         // so the command never reaches a CLI session (each @ed bot's daemon
@@ -2068,7 +2094,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id)
             || (ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
           if (!relax) {
-            const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
+            const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId, humanSenderUnionId);
             if (access === 'not_allowed') {
               // 入口 A：无权限者 @bot → 弹授权申请卡（@owner），代替「无操作权限」。
               // 覆盖 ownsSession 真假两种情况，但绝不把该消息喂进已有 session。

@@ -529,10 +529,12 @@ export async function enforceMessageQuotaForCliInput(
   messageId: string,
   anchor: string,
   senderUnionId?: string,
+  memberUnionId?: string,
 ): Promise<boolean> {
-  // senderUnionId 让 evaluateTalk 认出跨部署团队 peer bot（teamBot 腿）——否则
-  // 外部 bot 闸门放进来的团队 bot 消息会在这里被复查拦掉、静默丢弃。
-  const ev = evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId);
+  // senderUnionId（bot-locked）让 evaluateTalk 认出跨部署团队 peer bot（teamBot 腿）；
+  // memberUnionId（可为真人 union）走 teamMember 腿——否则外部闸门/群闸门放进来的
+  // 团队 bot 或团队成员消息会在这里复查处被静默丢弃（#332 端到端断点，人腿同理）。
+  const ev = evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId);
   if (!ev.allowed) {
     logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
@@ -2331,8 +2333,10 @@ async function startInitialPassthroughSession(args: {
   parsed: LarkMessage;
   commandContent: string;
   senderOpenId?: string;
-  /** Sender's tenant-stable union_id (quota gate's teamBot leg). */
+  /** Bot-locked union_id (quota gate's teamBot leg — bot senders only). */
   senderUnionId?: string;
+  /** Raw sender union_id (quota gate's teamMember leg — may be a human). */
+  memberUnionId?: string;
   /** Ownership is the CALLER's call — required fields, no sender fallback.
    *  A bot-started cold start must pass undefined (mirrors the auto-create
    *  path): a foreign-bot owner makes daemon-generated footers wake that bot
@@ -2343,9 +2347,9 @@ async function startInitialPassthroughSession(args: {
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
-    parsed, commandContent, senderOpenId, senderUnionId, ownerOpenId, ownerUnionId, creatorOpenId,
+    parsed, commandContent, senderOpenId, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId,
   } = args;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId)) {
     return;
   }
 
@@ -2571,6 +2575,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
           commandContent,
           senderOpenId,
           senderUnionId: teamTrustUnionId,
+          memberUnionId: senderUnionId, // 原始 union（人腿），不锁 bot
           // New-topic senders are humans here (mirrors the normal new-topic
           // spawn path, which assigns ownership unconditionally too).
           ownerOpenId: senderOpenId,
@@ -2655,7 +2660,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     }
   }
 
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId)) {
     return;
   }
 
@@ -3224,6 +3229,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           commandContent,
           senderOpenId: threadSenderOpenId,
           senderUnionId: threadTeamTrustUnionId,
+          memberUnionId: threadSenderUnionId, // 原始 union（人腿），不锁 bot
           // Bot-started cold starts get no human owner (mirrors the auto-create
           // path) — see the ownership note on startInitialPassthroughSession.
           ownerOpenId: isForeignBot ? undefined : threadSenderOpenId,
@@ -3373,7 +3379,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   }
 
   const quotaSenderOpenId = threadSenderOpenId;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor, threadTeamTrustUnionId)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor, threadTeamTrustUnionId, threadSenderUnionId)) {
     return;
   }
 

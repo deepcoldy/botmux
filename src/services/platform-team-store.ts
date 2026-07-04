@@ -45,6 +45,9 @@ export interface PlatformTeamSyncTeam {
   /** Team-assembled group chats (机器人大厅 first) — trusted like 拉群 groups. */
   groupChatIds: string[];
   bots: PlatformTeamBot[];
+  /** Team members' (people's) union_ids — the human talk-免grant leg: a member
+   *  is trusted to TALK (never operate) inside this team's group chats. */
+  memberUnionIds: string[];
 }
 
 export interface PlatformTeamSyncPayload {
@@ -93,7 +96,10 @@ function sanitizeTeam(raw: unknown): PlatformTeamSyncTeam | null {
       bots.push({ appId, unionId: unionId || undefined, name });
     }
   }
-  return { teamId, teamName, groupChatIds, bots };
+  const memberUnionIds = Array.isArray(t.memberUnionIds)
+    ? t.memberUnionIds.filter((u): u is string => typeof u === 'string' && !!u.trim()).map((u) => u.trim())
+    : [];
+  return { teamId, teamName, groupChatIds, bots, memberUnionIds };
 }
 
 /**
@@ -156,6 +162,28 @@ export function isPlatformTeamBot(dataDir: string, unionId: string | undefined):
   if (!data) return false;
   for (const t of data.teams) {
     for (const b of t.bots) if (b.unionId === id) return true;
+  }
+  return false;
+}
+
+/** Is `unionId` a HUMAN member of a platform team AND is `chatId` one of that
+ *  team's group chats? The talk-免grant leg for people: a teammate speaking in
+ *  the team's own group is trusted to TALK without /grant — but scoped to those
+ *  groups (not everywhere), and TALK only (operate stays allowedUsers-gated, the
+ *  caller must never route this predicate into canOperate). Both conditions must
+ *  hold on the SAME team so cross-team leakage is impossible. */
+export function isPlatformTeamMemberChat(
+  dataDir: string,
+  chatId: string | undefined,
+  unionId: string | undefined,
+): boolean {
+  const cid = (chatId ?? '').trim();
+  const uid = (unionId ?? '').trim();
+  if (!cid || !uid) return false;
+  const data = readFile(dataDir);
+  if (!data) return false;
+  for (const t of data.teams) {
+    if (t.memberUnionIds.includes(uid) && t.groupChatIds.includes(cid)) return true;
   }
   return false;
 }
