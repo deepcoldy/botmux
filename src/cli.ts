@@ -78,6 +78,7 @@ import {
   hasKnownBotMention,
   knownBotOpenIdsFromCrossRef,
   orderedFooterRecipients,
+  stripCodeSpans,
   type BotMentionEntry,
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
@@ -4605,6 +4606,12 @@ async function cmdSend(rest: string[]): Promise<void> {
       // bot（正是要避免的循环 @）。botEntries/crossRef 仍需加载供 footer 寻址用。
       if (!noMention) {
       const alreadyMentioned = new Set(mentions.map(m => m.open_id));
+      // Scan a code-span-stripped copy so a bot name quoted inside backticks or a
+      // fenced block (e.g. an example `botmux send --mention @Bot …` or an
+      // explanatory `@Bot`) is not auto-injected as a real handoff — that spurious
+      // <at> would wake a bot the model never meant to @. Explicit --mention still
+      // works (it doesn't go through this prose scan).
+      const textForBotScan = stripCodeSpans(text);
       // Sort by name length desc so longer names ("Claude分身") win over their
       // prefix ("Claude") when both could match — break-on-first-hit otherwise
       // routes "@Claude分身" to Claude.
@@ -4648,7 +4655,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           // `@Claude2` doesn't match name "Claude" and `@Claude分身好的` doesn't
           // either-half-match.
           const re = new RegExp(`(?<![A-Za-z0-9_])@${escName}(?![\\p{L}\\p{N}_])`, 'iu');
-          if (!re.test(text)) continue;
+          if (!re.test(textForBotScan)) continue;
           // Lark open_id is per-app scoped. Use sender-scoped id from cross-ref
           // only — falling back to entry.botOpenId would feed Lark a wrong-scope
           // id (target's self-scoped) and the API would reject it. Skip + warn
