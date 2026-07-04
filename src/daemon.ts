@@ -17,7 +17,8 @@ import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
-import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat, effectiveDefaultWorkingDir, type BotState, type OncallChat } from './bot-registry.js';
+import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat, effectiveDefaultWorkingDir, effectiveBotDisplayName, type BotState, type OncallChat } from './bot-registry.js';
+import { setDisplayNameRefresher } from './services/bot-config-store.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -3883,7 +3884,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const ipcPort = config.dashboard.ipcBasePort + idx;
   const desc: DaemonDescriptor = {
     larkAppId: cfg.larkAppId,
-    botName: cfg.larkAppId,
+    botName: cfg.displayName ?? cfg.larkAppId,
     cliId: cfg.cliId,
     botIndex: idx,
     ipcPort,
@@ -3896,6 +3897,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // briefly sees an unusable on_/email (the resolution below rewrites this field).
     resolvedAllowedUsers: getBot(cfg.larkAppId).resolvedAllowedUsers.filter(u => u.startsWith('ou_')),
   };
+  // 展示名热更新：displayName 变更（dashboard PUT / IM `/config displayName`）落盘
+  // 后立即用有效展示名刷新 descriptor + SessionRow.botName，无需重启 daemon。
+  setDisplayNameRefresher(() => {
+    const effective = effectiveBotDisplayName(getBot(cfg.larkAppId));
+    setBotName(effective);
+    if (effective !== desc.botName) {
+      desc.botName = effective;
+      try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+    }
+  });
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
@@ -3915,10 +3926,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Wire the workflow runner for /api/trigger (kind=workflow): reuse the same
   // heavy deps as the catalog run route.
   setWorkflowRunner((input) => triggerWorkflowRun(input, workflowTriggerDeps()));
-  // Seed dashboard IPC botName with the bot's config id; the friendly name from
-  // /bot/v3/info is wired into the registry descriptor (below) but the IPC server
-  // also needs its own copy for SessionRow.botName.
-  setBotName(cfg.larkAppId);
+  // Seed dashboard IPC botName with the custom displayName (falling back to the
+  // bot's config id); the friendly name from /bot/v3/info is wired into the
+  // registry descriptor (below) but the IPC server also needs its own copy for
+  // SessionRow.botName.
+  setBotName(cfg.displayName ?? cfg.larkAppId);
   setLarkAppId(cfg.larkAppId);
   selfV3LarkAppId = cfg.larkAppId; // scope v3 humanGate cold-attach / start to this bot
 
@@ -4026,9 +4038,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Probe bot open_id and persist to bots-info.json. When the friendly
     // botName comes back from /bot/v3/info, refresh the dashboard descriptor
     // so the registry shows "Claude" / "Codex" instead of the raw app id.
+    // A custom displayName (bots.json) beats the probed Lark name — the probe
+    // must not overwrite a rename seeded at startup.
     probeBotOpenId(cfg.larkAppId).then(() => {
       writeBotInfoFile(config.session.dataDir);
-      const probedName = bot.botName;
+      const probedName = cfg.displayName ?? bot.botName;
       const probedAvatar = bot.botAvatarUrl;
       let descChanged = false;
       if (probedName && probedName !== desc.botName) {

@@ -288,6 +288,7 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
       </header>
       <div class="bd-body bd-grid">
         <section class="bd-tile">
+          ${renderDisplayNameSection(b)}
           ${renderBotAgentSection(b, cli)}
           <section class="bd-section">
             <h3 class="bd-section-title">${t('botDefaults.sectionWorkingDir')}</h3>
@@ -373,6 +374,41 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
     if (item.error) return `<p class="hint-warn-inline">${escapeHtml(t('botDefaults.profileRoleDetailLoadFailed', { error: item.error }))}</p>`;
     if (!item.loaded) return `<p class="empty">${t('botDefaults.profileRoleClickToLoad')}</p>`;
     return `<pre>${escapeHtml(item.content ?? '')}</pre>`;
+  }
+
+  // 展示名（备注名）：null/空 = 未设（跟随飞书名称），非空 = 自定义。状态行始终
+  // 带出飞书原名，避免改完不知道原来叫什么。
+  function displayNameStateLabel(name: string | null, larkName: string | null): string {
+    const lark = larkName ?? '—';
+    return name
+      ? t('botDefaults.displayNameStateCustom', { name: lark })
+      : t('botDefaults.displayNameStateDefault', { name: lark });
+  }
+
+  // 机器人改名：覆盖 dashboard 全站（名册/会话列表/下拉）显示的名字；留空＝跟随
+  // 飞书名称。飞书群内的应用名没有改名 API，这里改不了（help 里说明）。
+  // PUT /api/bots/:appId/display-name 落 bots.json（displayName），daemon 热更新。
+  function renderDisplayNameSection(b: any): string {
+    const name: string | null = typeof b.displayName === 'string' && b.displayName ? b.displayName : null;
+    const larkName: string | null = typeof b.larkBotName === 'string' && b.larkBotName ? b.larkBotName : null;
+    return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionDisplayName')}</h3>
+      <div class="bd-row bd-display-name">
+        <label>
+          <span>${t('botDefaults.displayNameLabel')}</span>
+          <input type="text" data-input="displayName" maxlength="64"
+            placeholder="${escapeHtml(larkName ?? t('botDefaults.displayNamePlaceholder'))}"
+            value="${escapeHtml(name ?? '')}">
+        </label>
+        <small data-display-name-state>${escapeHtml(displayNameStateLabel(name, larkName))}</small>
+        <small class="bd-help">${t('botDefaults.displayNameHelp')}</small>
+        <div class="actions">
+          <button type="button" class="primary" data-action="save-display-name">${t('botDefaults.displayNameSave')}</button>
+          <button type="button" data-action="reset-display-name">${t('botDefaults.displayNameReset')}</button>
+          <span class="oncall-status" data-display-name-status></span>
+        </div>
+      </div>
+    </section>`;
   }
 
   // brandLabel is null when unset (→ default botmux), '' when off, else custom.
@@ -1021,6 +1057,64 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
       }
       if (brandResetBtn) {
         brandResetBtn.addEventListener('click', () => putBrand(null, brandResetBtn));
+      }
+
+      // ── 展示名（备注名）────────────────────────────────────────────────────
+      const displayNameInput = card.querySelector<HTMLInputElement>('input[data-input=displayName]');
+      const displayNameSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-display-name]');
+      const displayNameResetBtn = card.querySelector<HTMLButtonElement>('button[data-action=reset-display-name]');
+      const displayNameStatusEl = card.querySelector<HTMLSpanElement>('[data-display-name-status]');
+      const displayNameStateEl = card.querySelector<HTMLElement>('[data-display-name-state]');
+
+      // PUT displayName（null/'' = 清除 → 跟随飞书名称），成功后就地更新缓存、
+      // 卡片标题与左侧名册项，不整卡重绘（避免吹掉 toast）。
+      async function putDisplayName(name: string | null, btn: HTMLButtonElement) {
+        if (!displayNameStatusEl) return;
+        displayNameStatusEl.textContent = '';
+        displayNameStatusEl.className = 'oncall-status';
+        btn.disabled = true;
+        try {
+          const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/display-name`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ displayName: name }),
+          });
+          const body = await r.json().catch(() => ({}));
+          if (r.ok && body.ok) {
+            const next: string | null = body.displayName ?? null;
+            displayNameStatusEl.textContent = '✓';
+            displayNameStatusEl.classList.add('hint-ok');
+            if (displayNameInput) displayNameInput.value = next ?? '';
+            const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+            const effective: string = (typeof body.botName === 'string' && body.botName)
+              ? body.botName
+              : (next ?? cached?.larkBotName ?? appId);
+            if (cached) { cached.displayName = next; cached.botName = effective; }
+            if (displayNameStateEl) {
+              displayNameStateEl.textContent = displayNameStateLabel(next, cached?.larkBotName ?? null);
+            }
+            const headEl = card.querySelector<HTMLElement>('.bd-profile-id strong');
+            if (headEl) headEl.textContent = effective;
+            const rosterName = rosterEl.querySelector<HTMLElement>(`.bd-roster-item[data-appid="${CSS.escape(appId)}"] .bd-roster-tx b`);
+            if (rosterName) rosterName.textContent = effective;
+          } else {
+            displayNameStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+            displayNameStatusEl.classList.add('hint-warn-inline');
+          }
+        } catch (e: any) {
+          displayNameStatusEl.textContent = `✗ ${e?.message ?? e}`;
+          displayNameStatusEl.classList.add('hint-warn-inline');
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      if (displayNameInput && displayNameSaveBtn) {
+        // 留空保存 = 清除自定义名（跟随飞书名称），与「恢复」等价。
+        displayNameSaveBtn.addEventListener('click', () => putDisplayName(displayNameInput.value.trim() || null, displayNameSaveBtn));
+      }
+      if (displayNameResetBtn) {
+        displayNameResetBtn.addEventListener('click', () => putDisplayName(null, displayNameResetBtn));
       }
 
       // ── Card behaviour toggles (auto-save on change) ──────────────────────

@@ -2289,6 +2289,26 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/display-name — proxy to that bot's daemon. Body
+    // `{ displayName: string | null }` (null/'' = clear → fall back to the
+    // probed Lark app name; a non-empty string overrides the dashboard-wide
+    // display name for this bot).
+    let mBotDisplayName: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotDisplayName = url.pathname.match(/^\/api\/bots\/([^/]+)\/display-name$/))) {
+      const appId = decodeURIComponent(mBotDisplayName[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-display-name`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/max-live-workers — proxy to that bot's daemon. Body
     // `{ maxLiveWorkers: number | null }` (null = clear → fall back to the
     // built-in default of 30; a positive integer overrides it).

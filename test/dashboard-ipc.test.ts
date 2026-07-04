@@ -689,6 +689,65 @@ describe('PUT /api/bot-agent', () => {
   });
 });
 
+describe('PUT /api/bot-display-name', () => {
+  it('sets/clears the custom display name through bots.json + live config, and surfaces it on the defaults GET', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-displayname-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-displayname-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      // Set (input is trimmed).
+      const res = await fetch(`${base}/api/bot-display-name`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ displayName: '  小助手  ' }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, displayName: '小助手' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].displayName).toBe('小助手');
+
+      // Surfaces on the bot-defaults GET for the dashboard edit box.
+      const get = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(get).toMatchObject({ displayName: '小助手' });
+
+      // Over-long name rejected without touching config.
+      const long = await fetch(`${base}/api/bot-display-name`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ displayName: 'x'.repeat(65) }),
+      });
+      expect(long.status).toBe(400);
+      expect(await long.json()).toMatchObject({ ok: false, error: 'too_long' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].displayName).toBe('小助手');
+
+      // Clear (null → follow the Feishu name; key removed from bots.json).
+      const clear = await fetch(`${base}/api/bot-display-name`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ displayName: null }),
+      });
+      expect(clear.status).toBe(200);
+      expect(await clear.json()).toMatchObject({ ok: true, displayName: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].displayName).toBeUndefined();
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('GET /api/groups (Phase B)', () => {
   it('returns 503 when larkAppId not set', async () => {
     setLarkAppId('');

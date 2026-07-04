@@ -1349,9 +1349,20 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const d = getBot(cachedLarkAppId).config.defaultWorkingDir;
     if (typeof d === 'string' && d.trim()) defaultWorkingDir = d;
   } catch { /* none */ }
+  // 展示名编辑框数据：displayName = 自定义备注名（null = 未设，跟随飞书名称）；
+  // larkBotName = 飞书探测到的应用名（供 placeholder /「恢复默认」提示用）。
+  let displayName: string | null = null;
+  let larkBotName: string | null = null;
+  try {
+    const bot = getBot(cachedLarkAppId);
+    displayName = bot.config.displayName ?? null;
+    larkBotName = bot.botName ?? null;
+  } catch { /* none */ }
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
+    displayName,
+    larkBotName,
     cliId,
     wrapperCli,
     model,
@@ -1496,6 +1507,28 @@ ipcRoute('PUT', '/api/bot-brand-label', async (req, res) => {
   const r = await brandStore.updateBotBrandLabel(cachedLarkAppId, next);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, brandLabel: r.brandLabel });
+});
+
+// Per-bot 自定义展示名 displayName。Body `{ displayName: string | null }`:
+//   • 非空字符串 → 设为自定义展示名（dashboard 名册/会话列表用；不改飞书群内应用名）
+//   • null / ''  → 清除（回落飞书探测名）
+// 走 applyConfigField（与 /config displayName 同一写盘 + 热更新路径）；store 里的
+// displayNameRefresher 钩子会同步刷新 dashboard descriptor 与 SessionRow.botName。
+ipcRoute('PUT', '/api/bot-display-name', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { displayName?: unknown };
+  try { body = await readJsonBody<{ displayName?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('displayName');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.displayName === 'string' ? body.displayName.trim() : '';
+  if (raw.length > 64) return jsonRes(res, 400, { ok: false, error: 'too_long' });
+  const value: string | null = raw || null;  // 空白 = 清除 → 回飞书名称
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  // botName = 刷新后的有效展示名（displayName ?? 飞书名），供前端就地更新标题。
+  jsonRes(res, 200, { ok: true, displayName: value, botName: getBotName() });
 });
 
 // Per-bot agent launch settings. Body `{ cliId, model }` where `cliId` is the
