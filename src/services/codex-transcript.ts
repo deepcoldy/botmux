@@ -113,6 +113,10 @@ export interface CodexBridgeEvent {
    *  user, output_text for assistant). */
   text: string;
   sourceSessionId?: string;
+  /** Keep the pending turn's original markTimeMs instead of moving it to the
+   *  transcript user timestamp. Used by bridges whose committed user
+   *  timestamp can lag behind in-turn delivery markers. */
+  preserveMarkTimeMs?: boolean;
 }
 
 /** Extract the last completed user/assistant turn from a Codex / CoCo bridge

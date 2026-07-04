@@ -417,6 +417,42 @@ describe('CodexBridgeQueue', () => {
 });
 
 describe('CodexBridgeQueue + bridge-fallback gate (type-ahead suppression windows)', () => {
+  it('preserves Hermes markTime so late-committed user rows do not miss in-turn sends', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'hermes prompt', 1_000);
+    q.ingest([
+      { ...userEv('hermes prompt', 'u-hermes', 12_000), preserveMarkTimeMs: true },
+      asstEv('hermes reply', 'a-hermes', 15_000),
+    ]);
+
+    const markers: BridgeSendMarker[] = [{ sentAtMs: 8_000 }];
+    expect(emitDecisions(q, markers)).toEqual([{ turnId: 't1', suppressed: true }]);
+  });
+
+  it('keeps adjacent Hermes queued-turn windows separate during batch drains', () => {
+    const makeQueue = () => {
+      const q = new CodexBridgeQueue();
+      q.mark('t1', 'first hermes prompt', 1_000);
+      q.mark('t2', 'second hermes prompt', 1_001);
+      q.ingest([
+        { ...userEv('first hermes prompt', `u1-${++nextUuid}`, 12_000), preserveMarkTimeMs: true },
+        asstEv('first hermes reply', `a1-${++nextUuid}`, 15_000),
+        { ...userEv('second hermes prompt', `u2-${++nextUuid}`, 22_000), preserveMarkTimeMs: true },
+        asstEv('second hermes reply', `a2-${++nextUuid}`, 25_000),
+      ]);
+      return q;
+    };
+
+    expect(emitDecisions(makeQueue(), [{ sentAtMs: 14_000 }, { sentAtMs: 20_000 }])).toEqual([
+      { turnId: 't1', suppressed: true },
+      { turnId: 't2', suppressed: true },
+    ]);
+    expect(emitDecisions(makeQueue(), [{ sentAtMs: 20_000 }])).toEqual([
+      { turnId: 't1', suppressed: false },
+      { turnId: 't2', suppressed: true },
+    ]);
+  });
+
   it('does not let explicit progress sends suppress a later transcript final answer', () => {
     const q = new CodexBridgeQueue();
     q.mark('t1', 'please design the sync plan', 1_000);

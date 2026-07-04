@@ -71,6 +71,7 @@ export class CodexBridgeQueue {
   private collecting: CodexPendingTurn | null = null;
   private localTurnsEnabled = false;
   private bufferedUnmatched: CodexBridgeEvent[] = [];
+  private lastClosedAssistantFinalTimeMs: number | undefined;
   /** Lower bound (ms) for synthesising local turns — protects against a
    *  fresh-empty attach replaying historical iTerm conversation as
    *  "live" local input. Typically set to the moment adopt was wired up. */
@@ -113,6 +114,7 @@ export class CodexBridgeQueue {
     const dropped = this.queue.splice(0);
     if (this.collecting && dropped.includes(this.collecting)) this.collecting = null;
     this.bufferedUnmatched = [];
+    this.lastClosedAssistantFinalTimeMs = undefined;
     return dropped;
   }
 
@@ -193,8 +195,25 @@ export class CodexBridgeQueue {
         // mark, and the -5s tooOld tolerance must not be able to widen the
         // window into a previous turn's sends. Mirrors what Claude's
         // BridgeTurnQueue.handleTurnStart does with eventTimeMs.
-        if (next!.markTimeMs === undefined) next!.markTimeMs = ev.timestampMs;
-        else next!.markTimeMs = Math.max(next!.markTimeMs, ev.timestampMs);
+        //
+        // Hermes is the exception: its SQLite message timestamps can be
+        // committed near turn completion, after in-turn `botmux send` markers
+        // have already landed. Preserve the original worker mark so those
+        // markers stay inside the bridge-fallback suppression window. For
+        // adjacent queued Hermes turns, still advance the next turn to at
+        // least the previous assistant final so batch-drain boundaries don't
+        // collapse to back-to-back enqueue times.
+        if (next!.markTimeMs === undefined) {
+          next!.markTimeMs = ev.preserveMarkTimeMs === true && this.lastClosedAssistantFinalTimeMs !== undefined
+            ? this.lastClosedAssistantFinalTimeMs
+            : ev.timestampMs;
+        } else if (ev.preserveMarkTimeMs === true) {
+          if (this.lastClosedAssistantFinalTimeMs !== undefined) {
+            next!.markTimeMs = Math.max(next!.markTimeMs, this.lastClosedAssistantFinalTimeMs);
+          }
+        } else {
+          next!.markTimeMs = Math.max(next!.markTimeMs, ev.timestampMs);
+        }
         this.collecting = next!;
       } else if (willSynthLocal) {
         // Adopt mode local input: user typed in iTerm, no Lark
@@ -223,6 +242,7 @@ export class CodexBridgeQueue {
       if (this.collecting) {
         if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
         this.collecting.finalText = ev.text;
+        this.lastClosedAssistantFinalTimeMs = ev.timestampMs;
         this.collecting = null;
       } else if (bufferUnmatched && !this.localTurnsEnabled) {
         this.rememberUnmatched(ev);
