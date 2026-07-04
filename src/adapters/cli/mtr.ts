@@ -33,7 +33,10 @@ export function createMtrAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'mtr',
-    authPaths: ['~/.local/share/opencode/auth.json'],
+    // Whole dir kept REAL: mtr shares opencode's data dir and keeps its own SQLite
+    // DB there (mtr.db, WAL mode) — the sandbox home overlay lacks the fcntl locks
+    // SQLite needs (same failure as codex, see codex.ts).
+    authPaths: ['~/.local/share/opencode'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, initialPrompt }) {

@@ -119,7 +119,11 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'coco',
-    authPaths: ['~/.trae/cli/auth.json'],
+    // Whole ~/.trae/cli kept REAL (shared with traex): sessions/events.jsonl and
+    // the codex-style SQLite DBs live here, and the daemon's transcript bridge
+    // reads them at the REAL path — on the overlay they'd be invisible (and a
+    // first login inside the sandbox would be lost with the upper).
+    authPaths: ['~/.trae/cli'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, model, disableCliBypass }) {
