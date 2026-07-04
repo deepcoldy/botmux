@@ -4,7 +4,7 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startIpcServer, setLarkAppId, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
 import * as oncallStore from '../src/services/oncall-store.js';
@@ -689,11 +689,11 @@ describe('PUT /api/bot-agent', () => {
   });
 });
 
-describe('PUT /api/bot-display-name', () => {
-  it('sets/clears the custom display name through bots.json + live config, and surfaces it on the defaults GET', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-displayname-ipc-'));
+describe('PUT /api/bot-rename', () => {
+  async function withRenameServer(fn: (base: string, configPath: string) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-rename-ipc-'));
     const configPath = join(dir, 'bots.json');
-    const appId = 'test-displayname-app';
+    const appId = 'test-rename-app';
     const prevBotsConfig = process.env.BOTS_CONFIG;
     try {
       process.env.BOTS_CONFIG = configPath;
@@ -705,46 +705,81 @@ describe('PUT /api/bot-display-name', () => {
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      const base = `http://127.0.0.1:${handle.port}`;
-
-      // Set (input is trimmed).
-      const res = await fetch(`${base}/api/bot-display-name`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ displayName: '  小助手  ' }),
-      });
-      expect(res.status).toBe(200);
-      expect(await res.json()).toMatchObject({ ok: true, displayName: '小助手' });
-      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].displayName).toBe('小助手');
-
-      // Surfaces on the bot-defaults GET for the dashboard edit box.
-      const get = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(get).toMatchObject({ displayName: '小助手' });
-
-      // Over-long name rejected without touching config.
-      const long = await fetch(`${base}/api/bot-display-name`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ displayName: 'x'.repeat(65) }),
-      });
-      expect(long.status).toBe(400);
-      expect(await long.json()).toMatchObject({ ok: false, error: 'too_long' });
-      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].displayName).toBe('小助手');
-
-      // Clear (null → follow the Feishu name; key removed from bots.json).
-      const clear = await fetch(`${base}/api/bot-display-name`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ displayName: null }),
-      });
-      expect(clear.status).toBe(200);
-      expect(await clear.json()).toMatchObject({ ok: true, displayName: null });
-      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].displayName).toBeUndefined();
+      await fn(`http://127.0.0.1:${handle.port}`, configPath);
     } finally {
+      setBotRenamer(null);
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+
+  it('renames via the wired Open Platform renamer (mode=feishu, no displayName written)', async () => {
+    await withRenameServer(async (base, configPath) => {
+      const seen: string[] = [];
+      setBotRenamer(async (name) => { seen.push(name); return { ok: true, name }; });
+
+      const res = await fetch(`${base}/api/bot-rename`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: '  新名字  ' }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, mode: 'feishu' });
+      expect(seen).toEqual(['新名字']); // trimmed before hitting the renamer
+      // Feishu rename succeeded → no local alias persisted by the route.
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].displayName).toBeUndefined();
+    });
+  });
+
+  it('falls back to the local displayName with a warning when the renamer fails', async () => {
+    await withRenameServer(async (base, configPath) => {
+      setBotRenamer(async () => ({ ok: false, reason: 'no_session', message: 'run botmux setup' }));
+
+      const res = await fetch(`${base}/api/bot-rename`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: '小助手' }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ok: true,
+        mode: 'local',
+        warning: 'no_session',
+        message: 'run botmux setup',
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].displayName).toBe('小助手');
+
+      // The local alias surfaces on the bot-defaults GET.
+      const get = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(get).toMatchObject({ displayName: '小助手' });
+    });
+  });
+
+  it('rejects empty and over-long names without calling the renamer', async () => {
+    await withRenameServer(async (base, configPath) => {
+      let called = 0;
+      setBotRenamer(async (name) => { called++; return { ok: true, name }; });
+
+      const empty = await fetch(`${base}/api/bot-rename`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: '   ' }),
+      });
+      expect(empty.status).toBe(400);
+      expect(await empty.json()).toMatchObject({ ok: false, error: 'name_required' });
+
+      const long = await fetch(`${base}/api/bot-rename`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'x'.repeat(65) }),
+      });
+      expect(long.status).toBe(400);
+      expect(await long.json()).toMatchObject({ ok: false, error: 'too_long' });
+
+      expect(called).toBe(0);
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].displayName).toBeUndefined();
+    });
   });
 });
 

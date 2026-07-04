@@ -2289,17 +2289,17 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // PUT /api/bots/:appId/display-name — proxy to that bot's daemon. Body
-    // `{ displayName: string | null }` (null/'' = clear → fall back to the
-    // probed Lark app name; a non-empty string overrides the dashboard-wide
-    // display name for this bot).
-    let mBotDisplayName: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotDisplayName = url.pathname.match(/^\/api\/bots\/([^/]+)\/display-name$/))) {
-      const appId = decodeURIComponent(mBotDisplayName[1]);
+    // PUT /api/bots/:appId/rename — proxy to that bot's daemon. Body
+    // `{ name: string }`. Daemon tries the Open Platform automation first
+    // (really renames the Feishu app + publishes a version); on failure it
+    // falls back to the botmux-side display name and reports `warning`.
+    let mBotRename: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotRename = url.pathname.match(/^\/api\/bots\/([^/]+)\/rename$/))) {
+      const appId = decodeURIComponent(mBotRename[1]);
       const chunks: Buffer[] = [];
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-display-name`, {
+      const upstream = await proxyToDaemon(appId, `/api/bot-rename`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

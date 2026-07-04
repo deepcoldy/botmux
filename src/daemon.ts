@@ -18,7 +18,8 @@ import { statSync } from 'node:fs';
 import { addReaction, getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat, effectiveDefaultWorkingDir, effectiveBotDisplayName, type BotState, type OncallChat } from './bot-registry.js';
-import { setDisplayNameRefresher } from './services/bot-config-store.js';
+import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
+import { renameBotOnOpenPlatform } from './services/open-platform-rename.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -64,7 +65,7 @@ import {
   sweepGlobalBotmuxSkills,
   writableTerminalLinkFor,
 } from './core/worker-pool.js';
-import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner } from './core/dashboard-ipc-server.js';
+import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner, setBotRenamer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
@@ -3897,15 +3898,36 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // briefly sees an unusable on_/email (the resolution below rewrites this field).
     resolvedAllowedUsers: getBot(cfg.larkAppId).resolvedAllowedUsers.filter(u => u.startsWith('ou_')),
   };
-  // 展示名热更新：displayName 变更（dashboard PUT / IM `/config displayName`）落盘
-  // 后立即用有效展示名刷新 descriptor + SessionRow.botName，无需重启 daemon。
-  setDisplayNameRefresher(() => {
+  // 名称状态刷新：displayName 或飞书真名变化后，用有效展示名刷新 descriptor +
+  // SessionRow.botName，无需重启 daemon。displayName 路径经 bot-config-store 的
+  // 钩子触发；真·改名路径在下面的 renamer 里直接调用。
+  const refreshBotNameState = () => {
     const effective = effectiveBotDisplayName(getBot(cfg.larkAppId));
     setBotName(effective);
     if (effective !== desc.botName) {
       desc.botName = effective;
       try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
     }
+  };
+  setDisplayNameRefresher(refreshBotNameState);
+  // 机器人真·改名（dashboard 档案头 ✎）：开放平台自动化改飞书应用名并发布新版本
+  // （群内显示名跟随已发布版本，见 services/open-platform-rename.ts）。成功后同步
+  // 内存 botName / bots-info 名册 / descriptor，并清掉冗余的 displayName 别名——
+  // 飞书名已经是新名，保持单一事实来源。
+  setBotRenamer(async (newName) => {
+    const r = await renameBotOnOpenPlatform(cfg.larkAppId, newName, cfg.brand);
+    if (!r.ok) return r;
+    const bot = getBot(cfg.larkAppId);
+    bot.botName = newName;
+    const spec = findConfigField('displayName');
+    if (spec && bot.config.displayName) {
+      // applyConfigField 的 displayName 钩子会顺带触发 refreshBotNameState。
+      await applyConfigField(cfg.larkAppId, spec, null);
+    } else {
+      refreshBotNameState();
+    }
+    try { writeBotInfoFile(config.session.dataDir); } catch { /* best effort */ }
+    return r;
   });
   // Initialise worker pool with daemon callbacks
   initWorkerPool({

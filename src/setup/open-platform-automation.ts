@@ -851,7 +851,7 @@ class MutableCookieJar {
   }
 }
 
-class OpenPlatformApiError extends Error {
+export class OpenPlatformApiError extends Error {
   constructor(message: string, readonly payload: unknown) {
     super(message);
   }
@@ -935,7 +935,8 @@ function mapScopeIds(scopeNames: string[], catalog: OpenPlatformScopeEntry[], bu
   return { ids: uniqueStrings(ids), missing };
 }
 
-function nextAppVersion(payload: unknown): string {
+/** 从 app_version/list 响应算下一个版本号（最新已发布 +1，无发布版 → 0.0.1）。 */
+export function nextAppVersion(payload: unknown): string {
   const data = asRecord(asRecord(payload).data);
   const versions = Array.isArray(data.versions) ? data.versions : [];
   const published = versions
@@ -960,7 +961,8 @@ function extractContactRangeMemberIds(payload: unknown): string[] {
     .filter((id): id is string => Boolean(id)));
 }
 
-function extractVersionId(payload: unknown): string | undefined {
+/** 从 app_version/create 响应提取 versionId（多种响应形态兼容）。 */
+export function extractVersionId(payload: unknown): string | undefined {
   const direct = pickString(asRecord(payload), ['versionId', 'version_id', 'id']);
   if (direct) return direct;
   const data = asRecord(asRecord(payload).data);
