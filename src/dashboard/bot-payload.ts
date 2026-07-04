@@ -30,6 +30,10 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
   if (error) return { ...base, error };
   return {
     ...base,
+    // 展示名编辑框：displayName = 自定义备注名（null = 跟随飞书名称）；
+    // larkBotName = 飞书探测到的应用名（placeholder / 恢复默认提示）。
+    displayName: typeof j?.displayName === 'string' ? j.displayName : null,
+    larkBotName: typeof j?.larkBotName === 'string' ? j.larkBotName : null,
     defaultOncall: j?.defaultOncall,
     defaultWorkingDir: typeof j?.defaultWorkingDir === 'string' ? j.defaultWorkingDir : null,
     autoboundChatCount: j?.autoboundChatCount ?? 0,

@@ -915,8 +915,13 @@ async function handleConfigCommand(
         value = coerced.value;
         break;
       }
-      default: // 'string'
-        value = rawValue;
+      default: { // 'string'
+        // 与 dashboard PUT 同口径：string 字段也过 coerceConfigValue（长度上限
+        // maxLen 等约束在 spec 上，避免 IM 文本入口绕过校验）。
+        const coerced = coerceConfigValue(spec, rawValue);
+        if (!coerced.ok) { await reply(t('cmd.config.write_failed', { reason: coerced.reason }, loc)); return; }
+        value = coerced.value;
+      }
     }
 
     const r = await applyConfigField(larkAppId, spec, value);

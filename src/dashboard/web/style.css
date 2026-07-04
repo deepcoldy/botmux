@@ -4287,6 +4287,48 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   color: var(--faint);
   font-size: 10.5px;
 }
+/* 机器人改名（档案头 ✎ → 行内编辑器） */
+.bd-name-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.bd-name-row strong { display: inline; }
+.bd-name-edit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  flex: none;
+  /* 常驻淡显、悬停点亮——比 hover 才出现更易被发现，又不抢名字的视觉重心 */
+  opacity: 0.65;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+.bd-name-edit:hover {
+  opacity: 1;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}
+.bd-name-edit svg { width: 14px; height: 14px; }
+.bd-name-editor { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.bd-name-editor[hidden] { display: none; }
+.bd-name-input {
+  font-size: 15px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-soft);
+  background: var(--surface);
+  color: inherit;
+  width: min(240px, 56vw);
+}
+.bd-name-input:focus { outline: none; border-color: var(--accent); }
+.bd-name-editor button { padding: 4px 12px; font-size: 12px; }
+.bd-name-status { display: block; margin-top: 4px; font-size: 11.5px; }
+.bd-name-status:empty { display: none; }
 .bd-profile-meta {
   margin: 0 0 0 auto;
   display: grid;

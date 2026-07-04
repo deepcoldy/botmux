@@ -874,18 +874,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       const spec = fk ? findConfigField(fk) : undefined;
       if (!spec) return { toast: { type: 'error', content: t('cmd.config.unknown_field', { field: fk ?? '?', fields: '' }, loc) } };
-      // 多值字段（stringList，如 customPassthroughCommands）：留空 = 清除，否则按 kind
-      // 归一化成数组再落盘；普通文本字段沿用原始字符串。
+      // 留空 = 清除；非空一律过 coerceConfigValue 按 kind 归一化/校验（stringList
+      // 拆数组、string 执行 maxLen 等 spec 约束），与 /config 文字入口、dashboard
+      // PUT 同一校验点，避免卡片入口绕过。
       let valueToApply: string | string[] | null;
       if (!raw) {
         valueToApply = null;
-      } else if (spec.kind === 'stringList') {
+      } else {
         const coerced = coerceConfigValue(spec, raw);
         if (!coerced.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: coerced.reason }, loc) } };
-        // stringList 的 coerce 只会产出 string[]（永不 boolean）；narrow 给 applyConfigField。
-        valueToApply = coerced.value as string[];
-      } else {
-        valueToApply = raw;
+        // 文本子卡只承载 string / stringList 字段；narrow 给 applyConfigField。
+        valueToApply = coerced.value as string | string[];
       }
       const r = await applyConfigField(larkAppId, spec, valueToApply);
       if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };

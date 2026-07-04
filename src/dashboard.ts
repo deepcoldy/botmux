@@ -2289,6 +2289,26 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/rename — proxy to that bot's daemon. Body
+    // `{ name: string }`. Daemon tries the Open Platform automation first
+    // (really renames the Feishu app + publishes a version); on failure it
+    // falls back to the botmux-side display name and reports `warning`.
+    let mBotRename: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotRename = url.pathname.match(/^\/api\/bots\/([^/]+)\/rename$/))) {
+      const appId = decodeURIComponent(mBotRename[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-rename`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/max-live-workers — proxy to that bot's daemon. Body
     // `{ maxLiveWorkers: number | null }` (null = clear → fall back to the
     // built-in default of 30; a positive integer overrides it).

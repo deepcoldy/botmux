@@ -113,6 +113,44 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.model).toBeUndefined();
   });
 
+  it('displayName round-trips, fires the refresher hook, and clears on null', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('displayName')!;
+    expect(spec.effect).toBe('immediate');
+
+    let refreshed = 0;
+    store.setDisplayNameRefresher(() => { refreshed++; });
+
+    const r1 = await store.applyConfigField('app_default', spec, '小助手');
+    expect(r1.ok).toBe(true);
+    expect(readConfig().displayName).toBe('小助手');
+    expect(registry.getBot('app_default').config.displayName).toBe('小助手');
+    expect(refreshed).toBe(1);
+
+    const r2 = await store.applyConfigField('app_default', spec, null);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().displayName).toBeUndefined();
+    expect(registry.getBot('app_default').config.displayName).toBeUndefined();
+    expect(refreshed).toBe(2);
+
+    // A throwing refresher must not fail the apply (best-effort hook).
+    store.setDisplayNameRefresher(() => { throw new Error('boom'); });
+    const r3 = await store.applyConfigField('app_default', spec, 'X');
+    expect(r3.ok).toBe(true);
+    expect(readConfig().displayName).toBe('X');
+    store.setDisplayNameRefresher(null);
+  });
+
+  it('coerceConfigValue enforces the displayName length cap (spec.maxLen) for every entry point', async () => {
+    const { store } = await freshModules();
+    const spec = store.findConfigField('displayName')!;
+    expect(store.coerceConfigValue(spec, 'x'.repeat(64))).toEqual({ ok: true, value: 'x'.repeat(64) });
+    expect(store.coerceConfigValue(spec, 'x'.repeat(65))).toEqual({ ok: false, reason: 'too_long' });
+    // Fields without maxLen stay uncapped (e.g. brandLabel markdown can be long).
+    const brand = store.findConfigField('brandLabel')!;
+    expect(store.coerceConfigValue(brand, 'y'.repeat(200)).ok).toBe(true);
+  });
+
   it('parses bot skill policy while leaving omitted policy undefined', async () => {
     const { registry } = await freshModules();
     const [plain, skilled, advancedOnly] = registry.parseBotConfigsFromText(JSON.stringify([

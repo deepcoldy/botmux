@@ -685,6 +685,60 @@ describe('/botconfig skills JSON text command', () => {
   });
 });
 
+describe('/botconfig string field goes through coerceConfigValue (maxLen)', () => {
+  it('rejects an over-long displayName and persists a valid one', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-displayname-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'codex',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'Codex',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'codex' as const,
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+
+    try {
+      // 65 chars > spec maxLen 64 → the IM text entry point must reject too.
+      await handleCommand(
+        '/botconfig',
+        ROOT_ID,
+        makeLarkMessage(`/botconfig set displayName ${'x'.repeat(65)}`, { senderId: 'ou_sender' }),
+        makeDeps(),
+        'app-1',
+      );
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].displayName).toBeUndefined();
+      expect((bot.config as any).displayName).toBeUndefined();
+
+      await handleCommand(
+        '/botconfig',
+        ROOT_ID,
+        makeLarkMessage('/botconfig set displayName 小助手', { senderId: 'ou_sender' }),
+        makeDeps(),
+        'app-1',
+      );
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].displayName).toBe('小助手');
+      expect((bot.config as any).displayName).toBe('小助手');
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+});
+
 describe('PASSTHROUGH_COMMANDS set', () => {
   it('should contain expected slash commands forwarded to CLI', () => {
     for (const cmd of ['/compact', '/model', '/clear', '/plugin', '/usage', '/context', '/cost', '/mcp', '/diff', '/btw']) {
