@@ -278,7 +278,10 @@ export interface CliAdapter {
    *  must PERSIST to the real auth — otherwise the sandboxed CLI loses its login
    *  (see seed's `bytecloud-auth`). The sandbox binds each existing path rw over
    *  the isolated overlay so auth reads/refreshes/logins hit the real files.
-   *  `~` is expanded. Keep NARROW (auth only) so session history stays isolated.
+   *  `~` is expanded. Default to NARROW (auth only) so session history stays
+   *  isolated — but widen to the CLI's whole state dir when it keeps SQLite DBs
+   *  there (e.g. codex): the overlayfs home lacks the POSIX fcntl locks SQLite
+   *  needs, so a narrow carve-out leaves the CLI unable to start.
    *  undefined / empty → no carve-out. */
   readonly authPaths?: readonly string[];
 

@@ -2289,6 +2289,26 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/rename — proxy to that bot's daemon. Body
+    // `{ name: string }`. Daemon tries the Open Platform automation first
+    // (really renames the Feishu app + publishes a version); on failure it
+    // falls back to the botmux-side display name and reports `warning`.
+    let mBotRename: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotRename = url.pathname.match(/^\/api\/bots\/([^/]+)\/rename$/))) {
+      const appId = decodeURIComponent(mBotRename[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-rename`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/max-live-workers — proxy to that bot's daemon. Body
     // `{ maxLiveWorkers: number | null }` (null = clear → fall back to the
     // built-in default of 30; a positive integer overrides it).
@@ -2767,18 +2787,40 @@ function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
   void maybeAnnounceHallPresence();
 }
 
-// 大厅打卡（union_id 自学触发）节流：per-bot 最小间隔 + 每进程尝试上限。打卡消息
-// 本身只有 bot 可见（大厅是 bot-only 群），上限只是防御发送持续失败时的无谓重试。
-const hallAnnounceState = new Map<string, { lastAt: number; tries: number }>();
+// 大厅打卡节流：按「发送 bot ×大厅」记最小间隔与尝试上限——按 bot 记会让多团队
+// bot 在第一个大厅烧光预算后，新加入的大厅永远轮空（实测踩过）。只有真正发出
+// 消息才消耗次数；状态落盘，重启不重发（否则每次重启都往大厅刷一轮）。
 const HALL_ANNOUNCE_MIN_INTERVAL_MS = 10 * 60 * 1000;
 const HALL_ANNOUNCE_MAX_TRIES = 6;
+const hallAnnounceStatePath = () => join(config.session.dataDir, 'hall-announce-state.json');
+function readHallAnnounceState(): Record<string, { lastAt: number; tries: number }> {
+  try { return JSON.parse(readFileSync(hallAnnounceStatePath(), 'utf-8')); } catch { return {}; }
+}
+/** 记录一次打卡尝试。consumeTry=false 只刷新 lastAt（发送失败：保住 10 分钟退避
+ *  但不烧预算——否则 daemon 掉线期间就把 6 次上限烧光、恢复后永久跳过，Codex review）。 */
+function bumpHallAnnounceState(key: string, consumeTry: boolean): void {
+  const all = readHallAnnounceState();
+  const cur = all[key];
+  all[key] = { lastAt: Date.now(), tries: (cur?.tries ?? 0) + (consumeTry ? 1 : 0) };
+  try { atomicWriteFileSync(hallAnnounceStatePath(), JSON.stringify(all, null, 2) + '\n'); } catch { /* 尽力而为 */ }
+}
+/** 发送方 daemon 的 mention cross-ref（name → 本 app 视角 open_id）。 */
+function readBotCrossRef(appId: string): Record<string, string> {
+  try { return JSON.parse(readFileSync(join(config.session.dataDir, `bot-openids-${appId}.json`), 'utf-8')); } catch { return {}; }
+}
 
 /**
- * 让还没学到自己 union_id 的本地 bot 去团队大厅发一条打卡消息：自家消息回声
- * （event-dispatcher isSelfMessage 分支）带回 sender.sender_id.union_id → 落盘
- * bot-union-ids → 下个心跳上报平台进 roster。一辈子一次；学到即永久跳过。
- * 顺带的副作用：大厅在各成员机器的 team-groups 里（team-sync 镜像），其他
- * daemon 收到这条消息会直接 recordTeamBot 学到该 bot——roster 之外的即时互学。
+ * 大厅打卡编排（union_id 自学）。实测大厅（bot-only 群）只有「直接点名 @」会
+ * 投递事件——普通消息、自 @、@all 全部静默，自家回声在大多数应用上永远等不来。
+ * 机制（与 event-dispatcher 的 hall 分支对偶）：
+ * - 有未入册成员的大厅里，每个本机 bot 点名 @ 自己 cross-ref 能解析到的未入册
+ *   成员（含别的机器的——mention 跨机器投递，对方跑新版即可学）；被点到的直接
+ *   从 mentions[] 学到自己的 union_id。已入册 bot 也参与——纯教学。
+ * - 自己未入册时消息带 #hall-echo，被点到的 bot 回 @ 一次（open_id 取事件
+ *   sender_id，无需 cross-ref）→ 打卡者从回执学到自己。任一方向可解析即收敛。
+ * 消息只在有意义时才发：解析不到任何目标时不发不计次（唯一例外：未入册 bot 的
+ * 首次尝试发一条裸打卡，给有 receive-all scope 的应用留回声机会）。状态落盘，
+ * 重启不重发——解析不到目标反复裸发刷屏这个坑踩过了（自动review 实测）。
  */
 async function maybeAnnounceHallPresence(): Promise<void> {
   try {
@@ -2787,30 +2829,51 @@ async function maybeAnnounceHallPresence(): Promise<void> {
     if (teams.length === 0) return;
     const localBotIds = new Set(readPlatformBotsInfo().map(b => b.appId));
     const now = Date.now();
+    const state = readHallAnnounceState();
     for (const team of teams) {
       const hallChatId = team.groupChatIds[0];
       if (!hallChatId) continue;
+      // 未入册成员（全大厅，含别的机器）：本机的以本地 store 为准（比 roster 新鲜），
+      // 远端的以 roster 的 unionId 为准。
+      const isLearned = (b: { appId: string; unionId?: string }) =>
+        localBotIds.has(b.appId) ? !!getBotUnionId(dataDir, b.appId) : !!b.unionId;
+      const unlearned = team.bots.filter(b => !isLearned(b));
+      if (unlearned.length === 0) continue;
+      const unlearnedNames = new Set(unlearned.map(b => b.name).filter(Boolean) as string[]);
       for (const bot of team.bots) {
-        if (!localBotIds.has(bot.appId)) continue;            // 别的机器的 bot
-        if (getBotUnionId(dataDir, bot.appId)) continue;      // 已学到 → 永久跳过
-        const st = hallAnnounceState.get(bot.appId);
+        if (!localBotIds.has(bot.appId)) continue;            // 只编排本机 bot
+        const selfLearned = isLearned(bot);
+        const throttleKey = `${bot.appId}::${hallChatId}`;
+        const st = state[throttleKey];
         if (st && (now - st.lastAt < HALL_ANNOUNCE_MIN_INTERVAL_MS || st.tries >= HALL_ANNOUNCE_MAX_TRIES)) continue;
-        hallAnnounceState.set(bot.appId, { lastAt: now, tries: (st?.tries ?? 0) + 1 });
+        // 点名目标 = 自己 cross-ref 能解析到的未入册成员（发不出 @ 的目标点了也白点）。
+        const crossRef = readBotCrossRef(bot.appId);
+        const targets = [...unlearnedNames].filter(n => n !== bot.name && typeof crossRef[n] === 'string').slice(0, 4);
+        // 没有可教的目标：已入册 → 无事可做；未入册 → 仅首次发裸打卡碰回声运气，
+        // 之后静默等别人教（不发不计次，cross-ref 或 roster 变化后自然恢复）。
+        if (targets.length === 0 && (selfLearned || (st?.tries ?? 0) > 0)) continue;
+        // 成功发出才消耗预算；失败只刷新 lastAt 保住退避间隔（见 bumpHallAnnounceState）。
+        let sent = false;
         try {
           const r = await proxyToDaemon(bot.appId, '/api/platform/hall-announce', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ chatId: hallChatId }),
+            body: JSON.stringify({ chatId: hallChatId, mentionNames: targets }),
           });
-          const j = await r.json().catch(() => ({} as { ok?: boolean; error?: string }));
+          const j = await r.json().catch(() => ({} as { ok?: boolean; error?: string; mentioned?: string[]; unresolved?: string[]; skipped?: string }));
           if (!r.ok || !(j as { ok?: boolean }).ok) {
             logger.warn(`[platform-tunnel] 大厅打卡失败 bot=${bot.appId} chat=${hallChatId.substring(0, 12)}: ${(j as { error?: string }).error ?? r.status}`);
           } else {
-            logger.info(`[platform-tunnel] 大厅打卡已发 bot=${bot.appId} chat=${hallChatId.substring(0, 12)}（等待回声学 union_id）`);
+            sent = !(j as { skipped?: string }).skipped;
+            const mentioned = (j as { mentioned?: string[] }).mentioned ?? [];
+            const unresolved = (j as { unresolved?: string[] }).unresolved ?? [];
+            if (sent) logger.info(`[platform-tunnel] 大厅打卡已发 bot=${bot.appId} chat=${hallChatId.substring(0, 12)}${mentioned.length ? ` 点名=[${mentioned.join(',')}]` : ''}${unresolved.length ? ` 未解析=[${unresolved.join(',')}]` : ''}`);
           }
         } catch (e) {
           logger.warn(`[platform-tunnel] 大厅打卡请求异常 bot=${bot.appId}: ${(e as Error).message}`);
         }
+        bumpHallAnnounceState(throttleKey, sent);
+        state[throttleKey] = { lastAt: now, tries: (st?.tries ?? 0) + (sent ? 1 : 0) };
       }
     }
   } catch (e) {

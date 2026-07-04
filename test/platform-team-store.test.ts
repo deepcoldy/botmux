@@ -12,6 +12,7 @@ import {
   applyPlatformTeamSync,
   getPlatformTeamSyncRev,
   isPlatformTeamBot,
+  isPlatformHallChat,
   listPlatformTeams,
   PLATFORM_TEAM_PREFIX,
 } from '../src/services/platform-team-store.js';
@@ -67,6 +68,19 @@ describe('applyPlatformTeamSync', () => {
     applyPlatformTeamSync(dataDir, payload('rev2', [])); // machine left all platform teams
     expect(isTeamGroupChat(dataDir, 'oc_legacy')).toBe(true);
     expect(isTeamGroupChat(dataDir, 'oc_hall')).toBe(false);
+  });
+
+  it('isPlatformHallChat matches only the FIRST chatId per team (hall-first protocol)', () => {
+    applyPlatformTeamSync(dataDir, payload('rev1', [team('t1', ['oc_hall_a', 'oc_team_group'], [])]));
+    expect(isPlatformHallChat(dataDir, 'oc_hall_a')).toBe(true);
+    // 非首位的团队群不是大厅——bot 互 @ 必须正常路由，不能被吞
+    expect(isPlatformHallChat(dataDir, 'oc_team_group')).toBe(false);
+    expect(isPlatformHallChat(dataDir, 'oc_other')).toBe(false);
+    expect(isPlatformHallChat(dataDir, '')).toBe(false);
+    expect(isPlatformHallChat(dataDir, undefined)).toBe(false);
+    // 团队消失后不再命中（follow membership，无残留信任面）
+    applyPlatformTeamSync(dataDir, payload('rev2', []));
+    expect(isPlatformHallChat(dataDir, 'oc_hall_a')).toBe(false);
   });
 
   it('rejects a payload without rev and sanitizes malformed teams', () => {

@@ -85,7 +85,7 @@ describe('feishu web terminal', () => {
     const popupHandler = (p: Page) => { terminalPage = p; };
     context.on('page', popupHandler);
 
-    await agent.aiAct('点击右侧话题详情面板最底部当前会话流式卡片里的"🖥️ 打开终端"按钮');
+    await agent.aiAct('点击右侧话题详情面板最底部当前会话流式卡片里的"🖥️ 打开 Web 终端"按钮');
 
     // Wait briefly for popup
     await page.waitForTimeout(5000);

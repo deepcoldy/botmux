@@ -141,6 +141,9 @@ spawn child processes — no extra protocol support required from the CLI.
 3. Add a case to the switch in `src/adapters/cli/registry.ts`
 4. Set `"cliId": "<new-id>"` in `bots.json` to use it
 
+> Full checklist — display names, setup choices, README updates:
+> see [`src/adapters/cli/CLAUDE.md`](src/adapters/cli/CLAUDE.md).
+
 The `CliAdapter` interface requires:
 
 | Method / Property | Description |

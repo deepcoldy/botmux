@@ -281,7 +281,7 @@ export async function waitForStreamingCard(
   // Step 5: Wait for streaming card.
   await agent.aiWaitFor(
     '主内容区正在显示的测试话题里出现当前会话的流式卡片；' +
-      '卡片必须带有"显示输出"、"打开终端"、"获取操作链接"或"关闭会话"这类会话操作按钮；' +
+      '卡片必须带有"显示输出"、"打开 Web 终端"、"获取操作链接"或"关闭会话"这类会话操作按钮；' +
       '卡片标题包含"启动中"、"工作中"、"等待输入"或"正在分析"之一，或正文已经出现 Codex 的 usage/rate limit/model switch 提示；' +
       '"项目仓库管理"和"直接开启会话"的仓库选择卡不能算作流式卡片',
     { timeoutMs, checkIntervalMs: 5_000 },
@@ -435,7 +435,7 @@ export async function showStreamingOutput(
         .click({ timeout: 5_000 });
     } catch {
       await agent.aiAct(
-        '点击主内容区正在显示的测试话题最底部，当前会话流式卡片里的"📖 显示输出"按钮；不要点击"打开终端"按钮',
+        '点击主内容区正在显示的测试话题最底部，当前会话流式卡片里的"📖 显示输出"按钮；不要点击"打开 Web 终端"按钮',
       );
     }
     await page.waitForTimeout(2000);

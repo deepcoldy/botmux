@@ -9,7 +9,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config } from '../../config.js';
-import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
@@ -19,8 +19,8 @@ import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId } from '.
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
-import { isPlatformTeamBot } from '../../services/platform-team-store.js';
-import { recordBotUnionId } from '../../services/bot-union-ids-store.js';
+import { isPlatformTeamBot, isPlatformHallChat } from '../../services/platform-team-store.js';
+import { recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed } from './doc-comment.js';
 import { BOTMUX_REQUIRED_SCOPES, DOC_FEATURE_SCOPES, DOC_COMMENT_EVENT, buildScopeDeepLink } from '../../setup/verify-permissions.js';
@@ -36,6 +36,9 @@ import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode } from '../../services/chat-reply-mode-store.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
+
+// 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
+const hallEchoReplied = new Set<string>();
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -1644,6 +1647,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // Lark open_id is per-app: these IDs are correct for our app context.
         if (message.mentions?.length > 0) {
           updateBotOpenIdCrossRef(config.session.dataDir, larkAppId, message.mentions);
+          // Learn our OWN union_id from any @ of ourselves: Lark stamps every
+          // mention with the target's union_id, and mention-driven delivery
+          // works even where the self-message echo never arrives（无 receive-all
+          // scope 的应用收不到自己发的消息；bot-only 大厅实测完全不推事件）。
+          if (recordBotUnionIdFromMentions(config.session.dataDir, larkAppId, getBot(larkAppId).botOpenId, message.mentions)) {
+            logger.info(`[${larkAppId}] learned own bot union_id from @mention`);
+          }
         }
 
         const chatId = message.chat_id;
@@ -1696,6 +1706,31 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           const senderUnionId = sender.sender_id?.union_id as string | undefined;
           if (senderUnionId && isTeamGroupChat(config.session.dataDir, chatId)) {
             recordTeamBot(config.session.dataDir, { unionId: senderUnionId });
+          }
+          // 机器人大厅：bot 消息只用于身份登记（上面已学 sender union / mentions
+          // 自学 / cross-ref），绝不当任务路由——大厅打卡会点名 @ 同伴，不吞掉的话
+          // 接收 bot 会把打卡当任务拉起会话在大厅里回话（实测）。只吞 bot 发送方：
+          // 人类经隐藏入口进大厅后 @ bot 仍正常应答。
+          if (isPlatformHallChat(config.session.dataDir, chatId)) {
+            // 回执互教：打卡者点名了我们且带 #hall-echo（= 它还没学到自己的
+            // union_id）→ @ 回它一次。open_id 直接取事件 sender_id（本 app 视角，
+            // 无需 cross-ref），打卡者从回执的 mentions[] 学到自己。每进程每发送者
+            // 只回一次；回执不带标记，链路必然终止。
+            try {
+              const text: unknown = JSON.parse(message.content ?? '{}')?.text;
+              if (
+                typeof text === 'string' && text.includes('#hall-echo') && senderOpenId &&
+                isBotMentioned(larkAppId, message, undefined) &&
+                !hallEchoReplied.has(`${larkAppId}::${senderOpenId}`)
+              ) {
+                hallEchoReplied.add(`${larkAppId}::${senderOpenId}`);
+                void sendMessage(larkAppId, chatId, `<at user_id="${senderOpenId}"></at> 已登记`, 'text')
+                  .then(() => logger.info(`[${larkAppId}] hall echo reply sent to ${senderOpenId.substring(0, 12)}`))
+                  .catch((e) => logger.warn(`[${larkAppId}] hall echo reply failed: ${(e as Error).message}`));
+              }
+            } catch { /* content 非 JSON → 忽略 */ }
+            logger.debug(`[${larkAppId}] hall bot message swallowed after learning (chat=${chatId.substring(0, 12)})`);
+            return;
           }
           // Foreign bot: only route on @mention of us.
           if (!isBotMentioned(larkAppId, message, undefined)) return;

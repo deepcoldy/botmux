@@ -5,12 +5,15 @@
  * pushes it to member deployments (see [[platform-team-store]]), so receivers
  * can trust a teammate bot in ANY chat without /grant. But a bot cannot ask
  * Feishu for its own union_id — /bot/v3/info doesn't return it and the contact
- * API can't resolve bot open_ids. The only reliable source is the bot's own
- * message ECHO: a group message the bot sends is delivered back to its own
- * daemon (im:message.group_msg) with `sender.sender_id.union_id` stamped.
+ * API can't resolve bot open_ids. Two event-borne sources exist:
+ * - @mention 盖章（主腿）: mentions[] 里每个被 @ 实体都带 union_id，且 @ 驱动
+ *   的事件投递不需要额外 scope——bot 在任何群被 @ 一次就学到自己的 union_id。
+ * - 自家消息回声（兜底）: bot 发的群消息回推自己 daemon 时 sender.sender_id
+ *   带 union_id——但仅限有 receive-all 群消息 scope 的应用，且 bot-only 大厅
+ *   实测完全不推事件，回声独木难支。
  *
- * Written from the event dispatcher's self-message branch (once per bot —
- * idempotent), read by the platform tunnel heartbeat (PlatformBotInfo.unionId).
+ * Written from the event dispatcher (once per bot — idempotent), read by the
+ * platform tunnel heartbeat (PlatformBotInfo.unionId).
  *
  * Storage: `{dataDir}/bot-union-ids.json` — { [larkAppId]: { unionId, learnedAt } }
  */
@@ -61,4 +64,30 @@ export function recordBotUnionId(
   data[app] = { unionId: uid, learnedAt: now };
   atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n');
   return true;
+}
+
+/** A mention entry from a Lark message event (shape-tolerant subset). */
+type MentionLike = { id?: { open_id?: string; union_id?: string } | string };
+
+/**
+ * Learn our OWN union_id from a message's mentions[]: Lark stamps every
+ * mentioned entity with its union_id. Matches self strictly by open_id（app_id
+ * 形态的 mention 不带 union_id，无从学起，忽略）。Returns true iff the store
+ * changed. Idempotent — safe to call on every event.
+ */
+export function recordBotUnionIdFromMentions(
+  dataDir: string,
+  larkAppId: string,
+  selfOpenId: string | undefined,
+  mentions: MentionLike[] | undefined,
+  now: number = Date.now(),
+): boolean {
+  if (!selfOpenId || !mentions?.length) return false;
+  for (const m of mentions) {
+    const id = m && typeof m.id === 'object' ? m.id : undefined;
+    if (id?.open_id === selfOpenId && typeof id.union_id === 'string' && id.union_id.trim()) {
+      return recordBotUnionId(dataDir, larkAppId, id.union_id, now);
+    }
+  }
+  return false;
 }

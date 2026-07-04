@@ -379,6 +379,18 @@ interface DaemonSessionLedgerOpts {
   ledgerDir?: string;
 }
 
+/** The CLI-native session id a ledger record should carry. coco is spawned
+ *  with `--session-id <botmux sessionId>` and the worker never sets a separate
+ *  cliSessionId (there is nothing to adopt) — but the botmux session id IS
+ *  coco's on-disk session identity (~/.cache/coco/sessions/<sessionId>/), and
+ *  ledger consumers (kaboo) key their native-parser exclusions on
+ *  cliSessionId. Defaulting it closes the gap: coco sessions get ownership
+ *  markers and self-describing usage records like every other CLI. */
+function ledgerCliSessionId(s: { cliId?: string; sessionId: string; cliSessionId?: string }): string | undefined {
+  if (s.cliSessionId) return s.cliSessionId;
+  return s.cliId === 'coco' ? s.sessionId : undefined;
+}
+
 function ledgerArgsForDaemonSession(ds: DaemonSession): Omit<RecordSessionUsageArgs, 'usage'> & { usage: SessionTokenUsage | null } {
   const s = ds.session;
   const workingDir = ds.workingDir ?? s.workingDir;
@@ -396,7 +408,7 @@ function ledgerArgsForDaemonSession(ds: DaemonSession): Omit<RecordSessionUsageA
     usage,
     larkAppId: ds.larkAppId ?? s.larkAppId,
     cliId: s.cliId,
-    cliSessionId: s.cliSessionId,
+    cliSessionId: ledgerCliSessionId(s),
     chatId: s.chatId,
     title: s.title,
     workingDir,
@@ -490,7 +502,7 @@ export function recordOwnershipForDaemonSession(ds: DaemonSession, opts?: Daemon
     const s = ds.session;
     return recordSessionOwnership({
       sessionId: s.sessionId,
-      cliSessionId: s.cliSessionId,
+      cliSessionId: ledgerCliSessionId(s),
       larkAppId: ds.larkAppId ?? s.larkAppId,
       cliId: s.cliId,
       chatId: s.chatId,

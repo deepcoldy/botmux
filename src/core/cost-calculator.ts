@@ -127,6 +127,12 @@ function usageKindForCli(cliId: SessionTokenUsageQuery['cliId']): UsageKind {
     case 'relay':
       return 'claude';
     case 'codex':
+    // TRAE rollouts are byte-identical to Codex (see traex-transcript.ts):
+    // token_count events carry the cumulative totals, and the active model
+    // rides on turn_context/session_meta payloads. The generic fold picked up
+    // the tokens but never the model, so traex ledger records shipped with
+    // model "" (consumers like kaboo fall back to "unknown").
+    case 'traex':
       return 'codex';
     case 'coco':
       return 'coco';

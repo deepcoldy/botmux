@@ -17,7 +17,9 @@ import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
-import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat, effectiveDefaultWorkingDir, type BotState, type OncallChat } from './bot-registry.js';
+import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChat, effectiveDefaultWorkingDir, effectiveBotDisplayName, type BotState, type OncallChat } from './bot-registry.js';
+import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
+import { renameBotOnOpenPlatform } from './services/open-platform-rename.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -63,7 +65,7 @@ import {
   sweepGlobalBotmuxSkills,
   writableTerminalLinkFor,
 } from './core/worker-pool.js';
-import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner } from './core/dashboard-ipc-server.js';
+import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner, setBotRenamer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
@@ -3883,7 +3885,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const ipcPort = config.dashboard.ipcBasePort + idx;
   const desc: DaemonDescriptor = {
     larkAppId: cfg.larkAppId,
-    botName: cfg.larkAppId,
+    botName: cfg.displayName ?? cfg.larkAppId,
     cliId: cfg.cliId,
     botIndex: idx,
     ipcPort,
@@ -3896,6 +3898,37 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // briefly sees an unusable on_/email (the resolution below rewrites this field).
     resolvedAllowedUsers: getBot(cfg.larkAppId).resolvedAllowedUsers.filter(u => u.startsWith('ou_')),
   };
+  // 名称状态刷新：displayName 或飞书真名变化后，用有效展示名刷新 descriptor +
+  // SessionRow.botName，无需重启 daemon。displayName 路径经 bot-config-store 的
+  // 钩子触发；真·改名路径在下面的 renamer 里直接调用。
+  const refreshBotNameState = () => {
+    const effective = effectiveBotDisplayName(getBot(cfg.larkAppId));
+    setBotName(effective);
+    if (effective !== desc.botName) {
+      desc.botName = effective;
+      try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+    }
+  };
+  setDisplayNameRefresher(refreshBotNameState);
+  // 机器人真·改名（dashboard 档案头 ✎）：开放平台自动化改飞书应用名并发布新版本
+  // （群内显示名跟随已发布版本，见 services/open-platform-rename.ts）。成功后同步
+  // 内存 botName / bots-info 名册 / descriptor，并清掉冗余的 displayName 别名——
+  // 飞书名已经是新名，保持单一事实来源。
+  setBotRenamer(async (newName) => {
+    const r = await renameBotOnOpenPlatform(cfg.larkAppId, newName, cfg.brand);
+    if (!r.ok) return r;
+    const bot = getBot(cfg.larkAppId);
+    bot.botName = newName;
+    const spec = findConfigField('displayName');
+    if (spec && bot.config.displayName) {
+      // applyConfigField 的 displayName 钩子会顺带触发 refreshBotNameState。
+      await applyConfigField(cfg.larkAppId, spec, null);
+    } else {
+      refreshBotNameState();
+    }
+    try { writeBotInfoFile(config.session.dataDir); } catch { /* best effort */ }
+    return r;
+  });
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
@@ -3915,10 +3948,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Wire the workflow runner for /api/trigger (kind=workflow): reuse the same
   // heavy deps as the catalog run route.
   setWorkflowRunner((input) => triggerWorkflowRun(input, workflowTriggerDeps()));
-  // Seed dashboard IPC botName with the bot's config id; the friendly name from
-  // /bot/v3/info is wired into the registry descriptor (below) but the IPC server
-  // also needs its own copy for SessionRow.botName.
-  setBotName(cfg.larkAppId);
+  // Seed dashboard IPC botName with the custom displayName (falling back to the
+  // bot's config id); the friendly name from /bot/v3/info is wired into the
+  // registry descriptor (below) but the IPC server also needs its own copy for
+  // SessionRow.botName.
+  setBotName(cfg.displayName ?? cfg.larkAppId);
   setLarkAppId(cfg.larkAppId);
   selfV3LarkAppId = cfg.larkAppId; // scope v3 humanGate cold-attach / start to this bot
 
@@ -4026,9 +4060,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Probe bot open_id and persist to bots-info.json. When the friendly
     // botName comes back from /bot/v3/info, refresh the dashboard descriptor
     // so the registry shows "Claude" / "Codex" instead of the raw app id.
+    // A custom displayName (bots.json) beats the probed Lark name — the probe
+    // must not overwrite a rename seeded at startup.
     probeBotOpenId(cfg.larkAppId).then(() => {
       writeBotInfoFile(config.session.dataDir);
-      const probedName = bot.botName;
+      const probedName = cfg.displayName ?? bot.botName;
       const probedAvatar = bot.botAvatarUrl;
       let descChanged = false;
       if (probedName && probedName !== desc.botName) {

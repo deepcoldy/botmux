@@ -165,6 +165,28 @@ describe('parseBotConfigsFromText — brand', () => {
     }
   });
 
+  it('keeps a trimmed displayName and drops blank/non-string values', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', displayName: '  小助手  ' },
+    ]));
+    expect(cfg.displayName).toBe('小助手');
+    for (const bad of [undefined, '', '   ', 42, null] as const) {
+      const [c] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', displayName: bad },
+      ]));
+      expect(c.displayName).toBeUndefined();
+    }
+  });
+
+  it('effectiveBotDisplayName prefers displayName > probed botName > larkAppId', () => {
+    const state = mod.registerBot({ larkAppId: 'app_x', larkAppSecret: 's', cliId: 'claude-code' } as any);
+    expect(mod.effectiveBotDisplayName(state)).toBe('app_x');
+    state.botName = 'Claude';
+    expect(mod.effectiveBotDisplayName(state)).toBe('Claude');
+    state.config.displayName = '小助手';
+    expect(mod.effectiveBotDisplayName(state)).toBe('小助手');
+  });
+
   it('normalizes startupCommands (adds leading /, keeps args, dedupes)', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'a', larkAppSecret: 's', startupCommands: ['effort ultracode', '/model opus', '/effort ultracode', '', 7] },
