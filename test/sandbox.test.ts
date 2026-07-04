@@ -623,4 +623,42 @@ describe.skipIf(process.platform !== 'linux')('prepareSandbox hidePaths masks', 
       if (prev !== undefined) process.env.BOTMUX_SANDBOX = prev;
     }
   });
+
+  it('sets child HOME to the canonical mount path, not a symlink form (dangles when its parent is masked)', () => {
+    // Regression: binding the home overlay at the canonical target but leaving
+    // env.HOME as the symlink string breaks the inverse of the bug this file
+    // fixes — a HOME symlink whose parent is masked inside the sandbox (e.g. a
+    // /tmp path shadowed by the tmpfs) can't resolve, so HOME dangles and the
+    // CLI can't read/write it. env.HOME MUST equal the path the overlay binds.
+    const src = tmp();
+    writeFileSync(join(src, 'file.txt'), 'x');
+    const realHome = tmp();
+    const linkHome = join(tmpdir(), 'sbx-linkhome-' + Math.random().toString(36).slice(2));
+    symlinkSync(realHome, linkHome);
+    const prevSandbox = process.env.BOTMUX_SANDBOX;
+    const prevHome = process.env.HOME;
+    delete process.env.BOTMUX_SANDBOX;
+    process.env.HOME = linkHome; // os.homedir() reads $HOME per call on Linux
+    const dataDir = tmp();
+    const sid = 'symhome-' + Math.random().toString(36).slice(2);
+    let r: ReturnType<typeof prepareSandbox> = null;
+    try {
+      r = prepareSandbox({
+        enabled: true, cliId: 'codex', sessionId: sid, sourceWorkingDir: src,
+        dataDir, cliBin: '/bin/true', cliArgs: [],
+      });
+      if (r === null) return; // overlay mount unavailable in this env — skip assertions
+      const canonicalHome = realpathSync(linkHome);
+      expect(r.env.HOME).toBe(canonicalHome);
+      expect(r.env.HOME).not.toBe(linkHome);
+      // the home overlay is bound AT that same canonical path
+      const bound = r.args.some((x, i) => x === '--bind' && r!.args[i + 2] === canonicalHome);
+      expect(bound).toBe(true);
+    } finally {
+      if (r) r.cleanup();
+      if (prevHome !== undefined) process.env.HOME = prevHome;
+      if (prevSandbox !== undefined) process.env.BOTMUX_SANDBOX = prevSandbox;
+      rmSync(linkHome, { force: true });
+    }
+  });
 });

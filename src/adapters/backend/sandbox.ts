@@ -408,8 +408,7 @@ export function prepareSandbox(opts: {
   const homeWork = join(vartmp, 'home-work');
   for (const d of [outbox, shimBin, empties]) mkdirSync(d, { recursive: true });
 
-  const envHome = homedir();
-  const home = resolveSandboxMountPath(envHome);
+  const home = resolveSandboxMountPath(homedir());
   // BOTMUX_SANDBOX_SRC overrides the LOWER project source for spike testing only.
   const projectSource = resolveSandboxMountPath(process.env.BOTMUX_SANDBOX_SRC || opts.sourceWorkingDir);
   const projectMount = resolveSandboxMountPath(opts.sourceWorkingDir);
@@ -507,7 +506,8 @@ export function prepareSandbox(opts: {
   // Authoritative child env via bwrap --setenv (works on pty AND tmux — the tmux
   // backend only forwards a fixed whitelist, which excludes HOME/PATH/relay).
   const env: Record<string, string> = {
-    HOME: envHome,                                   // preserve the user's original HOME string
+    HOME: home,                                      // MUST match where the overlay is bound (canonical);
+                                                     // a symlink-form HOME dangles when its parent is masked (e.g. tmpfs /tmp)
     BOTMUX_SEND_RELAY: outbox,                       // routes `botmux send` to the daemon outbox watcher
     PATH: `/run/sbxbin:${process.env.PATH ?? ''}`,   // /run/sbxbin first so `botmux` = the relay shim
   };
