@@ -4693,6 +4693,14 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   white-space: nowrap;
 }
 
+.skills-install-selection-dialog {
+  width: min(720px, calc(100vw - 44px));
+}
+
+.skills-install-selection-body {
+  max-height: 460px;
+}
+
 .skills-local-discovery-panel {
   justify-content: space-between;
   padding: 10px;

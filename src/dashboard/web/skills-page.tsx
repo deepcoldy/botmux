@@ -128,25 +128,39 @@ interface SkillsInstallPanelProps {
   installRef: string;
   installStatus: StatusMessage;
   installBusy: boolean;
-  installScanBusy?: boolean;
+  installDiscovering?: boolean;
+  installSelectionOpen?: boolean;
   installCandidates?: InstallSkillCandidate[];
   selectedInstallSkills?: Set<string>;
   onInstallSourceChange: (value: string) => void;
   onInstallPathChange: (value: string) => void;
   onInstallRefChange: (value: string) => void;
-  onScan?: () => void;
   onToggleInstallSkill?: (name: string) => void;
   onSelectAllInstallSkills?: (selected: boolean) => void;
+  onConfirmInstallSelection?: () => void;
+  onCloseInstallSelection?: () => void;
   onInstall: () => void;
   onOpenNativeDiscovery: () => void;
 }
 
 export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
   const tr = useT();
+  const selectionDialogRef = useRef<HTMLDialogElement | null>(null);
   const candidates = props.installCandidates ?? [];
   const selectedInstallSkills = props.selectedInstallSkills ?? new Set<string>();
   const allSelected = candidates.length > 0 && candidates.every(candidate => selectedInstallSkills.has(candidate.name));
-  const busy = props.installBusy || props.installScanBusy;
+  const busy = props.installBusy || props.installDiscovering;
+
+  useEffect(() => {
+    const dialog = selectionDialogRef.current;
+    if (!dialog) return;
+    if (props.installSelectionOpen && !dialog.open) {
+      try { dialog.showModal(); } catch { /* dialog may already be opening */ }
+    } else if (!props.installSelectionOpen && dialog.open) {
+      dialog.close();
+    }
+  }, [props.installSelectionOpen, candidates.length]);
+
   return (
     <article className="bd-card skills-install-panel">
       <div className="skills-install-title">
@@ -195,44 +209,10 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
           </label>
         </details>
         <div className="skills-install-actions">
-          {props.onScan ? (
-            <button type="button" data-action="scan-source-skills" disabled={busy} onClick={() => props.onScan?.()}>
-              {props.installScanBusy ? tr('skills.scanning') : tr('skills.scan')}
-            </button>
-          ) : null}
-          <button type="button" className="primary" data-action="install" disabled={props.installBusy} onClick={() => props.onInstall()}>
-            {candidates.length > 0 ? tr('skills.installSelected') : tr('skills.installSubmit')}
+          <button type="button" className="primary" data-action="install" disabled={busy} onClick={() => props.onInstall()}>
+            {props.installDiscovering ? tr('skills.scanning') : props.installBusy ? tr('skills.jobRunning') : tr('skills.installSubmit')}
           </button>
         </div>
-        {candidates.length > 0 ? (
-          <div className="skills-candidate-list" data-install-candidates>
-            <div className="skills-candidate-list-head">
-              <span>{tr('skills.scanFound', { count: candidates.length })}</span>
-              {props.onSelectAllInstallSkills ? (
-                <button
-                  type="button"
-                  data-action="toggle-all-source-skills"
-                  onClick={() => props.onSelectAllInstallSkills?.(!allSelected)}
-                >
-                  {allSelected ? tr('skills.discoverClearSelection') : tr('skills.discoverSelectAll')}
-                </button>
-              ) : null}
-            </div>
-            {candidates.map(candidate => (
-              <label key={`${candidate.name}:${candidate.path}`} className="skills-candidate-row">
-                <input
-                  type="checkbox"
-                  checked={selectedInstallSkills.has(candidate.name)}
-                  onChange={() => props.onToggleInstallSkill?.(candidate.name)}
-                />
-                <span>
-                  <strong>{candidate.name}</strong>
-                  <small>{candidate.path}{candidate.description ? ` · ${candidate.description}` : ''}</small>
-                </span>
-              </label>
-            ))}
-          </div>
-        ) : null}
         <div className="skills-local-discovery-panel">
           <div>
             <strong>{tr('skills.localDiscoverTitle')}</strong>
@@ -246,6 +226,64 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
       <div className="actions">
         <span className={statusClass(props.installStatus)} data-skills-status>{props.installStatus?.text ?? ''}</span>
       </div>
+      <dialog
+        className="skills-discovery-dialog skills-install-selection-dialog"
+        data-install-selection-dialog
+        ref={selectionDialogRef}
+        onClose={() => props.onCloseInstallSelection?.()}
+      >
+        <article>
+          <header>
+            <h3>{tr('skills.installSelectionTitle')}</h3>
+            <p>{tr('skills.installSelectionHelp', { count: candidates.length })}</p>
+          </header>
+          <div className="skills-discovery-body skills-install-selection-body">
+            <div className="skills-candidate-list" data-install-candidates>
+              <div className="skills-candidate-list-head">
+                <span>{tr('skills.scanFound', { count: candidates.length })}</span>
+                {props.onSelectAllInstallSkills ? (
+                  <button
+                    type="button"
+                    data-action="toggle-all-source-skills"
+                    disabled={props.installBusy}
+                    onClick={() => props.onSelectAllInstallSkills?.(!allSelected)}
+                  >
+                    {allSelected ? tr('skills.discoverClearSelection') : tr('skills.discoverSelectAll')}
+                  </button>
+                ) : null}
+              </div>
+              {candidates.map(candidate => (
+                <label key={`${candidate.name}:${candidate.path}`} className="skills-candidate-row">
+                  <input
+                    type="checkbox"
+                    checked={selectedInstallSkills.has(candidate.name)}
+                    disabled={props.installBusy}
+                    onChange={() => props.onToggleInstallSkill?.(candidate.name)}
+                  />
+                  <span>
+                    <strong>{candidate.name}</strong>
+                    <small>{candidate.path}{candidate.description ? ` · ${candidate.description}` : ''}</small>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+          <footer className="actions">
+            <button type="button" data-action="close-install-selection" disabled={props.installBusy} onClick={() => props.onCloseInstallSelection?.()}>
+              {tr('skills.installSelectionCancel')}
+            </button>
+            <button
+              type="button"
+              className="primary"
+              data-action="confirm-install-selection"
+              disabled={props.installBusy || selectedInstallSkills.size === 0}
+              onClick={() => props.onConfirmInstallSelection?.()}
+            >
+              {props.installBusy ? tr('skills.jobRunning') : tr('skills.installSelected')}
+            </button>
+          </footer>
+        </article>
+      </dialog>
     </article>
   );
 }
@@ -271,7 +309,8 @@ function SkillsPage() {
   const [installRef, setInstallRef] = useState('');
   const [installStatus, setInstallStatus] = useState<StatusMessage>(null);
   const [installBusy, setInstallBusy] = useState(false);
-  const [installScanBusy, setInstallScanBusy] = useState(false);
+  const [installDiscovering, setInstallDiscovering] = useState(false);
+  const [installSelectionOpen, setInstallSelectionOpen] = useState(false);
   const [installCandidates, setInstallCandidates] = useState<InstallSkillCandidate[]>([]);
   const [selectedInstallSkills, setSelectedInstallSkills] = useState<Set<string>>(() => new Set());
   const [discoveryOpen, setDiscoveryOpen] = useState(false);
@@ -424,42 +463,57 @@ function SkillsPage() {
   function clearInstallDiscovery(): void {
     setInstallCandidates([]);
     setSelectedInstallSkills(new Set());
+    setInstallSelectionOpen(false);
   }
 
-  function installRequestBody(): Record<string, unknown> {
-    const selected = [...selectedInstallSkills];
+  function sourceRequestBody(): Record<string, unknown> {
     return {
       source: installSource.trim(),
       path: installPath.trim() || undefined,
       ref: installRef.trim() || undefined,
+    };
+  }
+
+  function installRequestBody(skillNames?: string[]): Record<string, unknown> {
+    const selected = skillNames ?? [...selectedInstallSkills];
+    return {
+      ...sourceRequestBody(),
       skillNames: selected.length > 0 ? selected : undefined,
     };
   }
 
-  async function scanInstallSource(): Promise<void> {
-    if (!installSource.trim()) {
-      setInstallStatus({ text: tr('skills.sourceRequired'), ok: false });
-      return;
-    }
-    setInstallScanBusy(true);
+  async function discoverInstallCandidates(): Promise<InstallSkillCandidate[]> {
+    setInstallDiscovering(true);
     setInstallStatus({ text: tr('skills.scanning'), ok: true });
     try {
       const body = await jsonRequest('/api/skills/discover', {
         method: 'POST',
-        body: JSON.stringify(installRequestBody()),
+        body: JSON.stringify(sourceRequestBody()),
       });
-      if (!mountedRef.current) return;
+      if (!mountedRef.current) return [];
       const skills = Array.isArray(body.discovery?.skills) ? body.discovery.skills as InstallSkillCandidate[] : [];
       setInstallCandidates(skills);
       setSelectedInstallSkills(new Set(skills.map(skill => skill.name)));
-      setInstallStatus({
-        text: skills.length > 0 ? tr('skills.scanFound', { count: skills.length }) : tr('skills.scanEmpty'),
-        ok: skills.length > 0,
+      return skills;
+    } finally {
+      if (mountedRef.current) setInstallDiscovering(false);
+    }
+  }
+
+  async function submitSkillInstall(skillNames?: string[]): Promise<void> {
+    setInstallBusy(true);
+    try {
+      const body = await jsonRequest('/api/skills/install', {
+        method: 'POST',
+        body: JSON.stringify(installRequestBody(skillNames)),
       });
+      if (!mountedRef.current) return;
+      await waitForSkillJob(body.job as SkillJob, setInstallStatus);
+      if (mountedRef.current) clearInstallDiscovery();
     } catch (err: any) {
       if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
     } finally {
-      if (mountedRef.current) setInstallScanBusy(false);
+      if (mountedRef.current) setInstallBusy(false);
     }
   }
 
@@ -481,24 +535,32 @@ function SkillsPage() {
       setInstallStatus({ text: tr('skills.sourceRequired'), ok: false });
       return;
     }
-    if (installCandidates.length > 0 && selectedInstallSkills.size === 0) {
+    try {
+      setInstallSelectionOpen(false);
+      const skills = await discoverInstallCandidates();
+      if (!mountedRef.current) return;
+      if (skills.length === 0) {
+        setInstallStatus({ text: tr('skills.scanEmpty'), ok: false });
+        return;
+      }
+      if (skills.length === 1) {
+        await submitSkillInstall([skills[0].name]);
+        return;
+      }
+      setInstallStatus({ text: tr('skills.scanFound', { count: skills.length }), ok: true });
+      setInstallSelectionOpen(true);
+    } catch (err: any) {
+      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
+    }
+  }
+
+  async function confirmInstallSelection(): Promise<void> {
+    const selected = [...selectedInstallSkills];
+    if (selected.length === 0) {
       setInstallStatus({ text: tr('skills.discoverNothingSelected'), ok: false });
       return;
     }
-    setInstallBusy(true);
-    try {
-      const body = await jsonRequest('/api/skills/install', {
-        method: 'POST',
-        body: JSON.stringify(installRequestBody()),
-      });
-      if (!mountedRef.current) return;
-      await waitForSkillJob(body.job as SkillJob, setInstallStatus);
-      if (mountedRef.current) clearInstallDiscovery();
-    } catch (err: any) {
-      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
-    } finally {
-      if (mountedRef.current) setInstallBusy(false);
-    }
+    await submitSkillInstall(selected);
   }
 
   async function registerDiscoveredSkills(): Promise<void> {
@@ -701,7 +763,8 @@ function SkillsPage() {
               installRef={installRef}
               installStatus={installStatus}
               installBusy={installBusy}
-              installScanBusy={installScanBusy}
+              installDiscovering={installDiscovering}
+              installSelectionOpen={installSelectionOpen}
               installCandidates={installCandidates}
               selectedInstallSkills={selectedInstallSkills}
               onInstallSourceChange={(value) => {
@@ -716,9 +779,10 @@ function SkillsPage() {
                 setInstallRef(value);
                 clearInstallDiscovery();
               }}
-              onScan={() => void scanInstallSource()}
               onToggleInstallSkill={toggleInstallCandidate}
               onSelectAllInstallSkills={selectAllInstallCandidates}
+              onConfirmInstallSelection={() => void confirmInstallSelection()}
+              onCloseInstallSelection={() => setInstallSelectionOpen(false)}
               onInstall={() => void installSkill()}
               onOpenNativeDiscovery={() => setDiscoveryOpen(true)}
             />
