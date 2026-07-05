@@ -4633,12 +4633,28 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .skills-advanced-options summary {
   display: flex;
   align-items: center;
+  gap: 6px;
   min-height: 36px;
   padding-right: 92px;
   cursor: pointer;
   color: var(--fg);
   font-size: 12px;
   font-weight: 700;
+}
+
+.skills-advanced-marker {
+  width: 0;
+  height: 0;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-left: 6px solid currentColor;
+  flex: 0 0 auto;
+  transform-origin: 45% 50%;
+  transition: transform 140ms ease;
+}
+
+.skills-advanced-options[open] .skills-advanced-marker {
+  transform: rotate(90deg);
 }
 
 .skills-advanced-fields {

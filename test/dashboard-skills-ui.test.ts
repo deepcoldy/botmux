@@ -89,6 +89,7 @@ describe('dashboard skills install panel', () => {
     const actionRow = root.findByProps({ className: 'skills-install-action-row' });
 
     expect(actionRow.findAllByProps({ 'data-skills-advanced': true })).toHaveLength(1);
+    expect(actionRow.findAllByProps({ className: 'skills-advanced-marker' })).toHaveLength(1);
     expect(actionRow.findAllByProps({ 'data-action': 'install' })).toHaveLength(1);
   });
 

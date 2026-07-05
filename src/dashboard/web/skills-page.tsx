@@ -189,7 +189,10 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
         </div>
         <div className="skills-install-action-row">
           <details className="skills-advanced-options" data-skills-advanced={true} open={false}>
-            <summary>{tr('skills.advanced')}</summary>
+            <summary>
+              <span className="skills-advanced-marker" aria-hidden="true" />
+              <span>{tr('skills.advanced')}</span>
+            </summary>
             <div className="skills-advanced-fields">
               <label className="skills-install-field-wide"><span>{tr('skills.path')}</span>
                 <input
