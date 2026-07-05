@@ -50,6 +50,7 @@ import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsa
 import type { CliId } from '../adapters/cli/types.js';
 import { prepareSessionSkillPrompt } from './skills/session-runtime.js';
 import { prepareSkillDelivery } from './skills/delivery.js';
+import { resolveEffectivePluginIds } from './plugins/effective.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
@@ -1775,6 +1776,8 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     }
   });
 
+  const pluginIds = resolveEffectivePluginIds(botCfg, readGlobalConfig());
+
   // Send init config — use per-bot settings
   const initMsg: DaemonToWorker = {
     type: 'init',
@@ -1826,6 +1829,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     turnId: initTurnId ?? ds.currentReplyTarget?.turnId,
     skillPluginDir,
     skillReadonlyRoots,
+    pluginIds,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;

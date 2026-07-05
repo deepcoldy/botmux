@@ -20,7 +20,7 @@
  *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -104,6 +104,7 @@ import {
 import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
 import { writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 import { stripLegacyPendingCardFields } from './services/session-store.js';
+import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -1763,6 +1764,7 @@ async function cmdStart(): Promise<void> {
 
   cleanupLegacyPm2();
   const cfg = ecosystemConfig();
+  await reconcilePluginServicesForCli();
   runPm2(['start', cfg]);
   const bots = loadBotsJson();
   const count = bots.length || 1;
@@ -1905,7 +1907,7 @@ function cleanupLegacyPm2(): boolean {
   return true;
 }
 
-function cmdStop(): void {
+async function cmdStop(): Promise<void> {
   killDuplicatePm2GodDaemons();
   cleanupLegacyPm2();
   let stopped = false;
@@ -1920,6 +1922,7 @@ function cmdStop(): void {
   } catch { /* */ }
   // Wipe abandoned dashboard-daemon descriptors left behind by stopped daemons.
   cleanupStaleDaemonDescriptors();
+  await stopPluginServicesForCli();
   if (!stopped) console.log('daemon 未在运行。');
 }
 
@@ -1945,6 +1948,7 @@ async function cmdRestart(): Promise<void> {
   await ensureSystemDependencies();
   const cfg = ecosystemConfig();
   cleanupLegacyPm2();
+  await stopPluginServicesForCli();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
   if (includePm2) {
@@ -1952,6 +1956,7 @@ async function cmdRestart(): Promise<void> {
   }
   // Wipe abandoned dashboard-daemon descriptors left behind by killed daemons.
   cleanupStaleDaemonDescriptors();
+  await reconcilePluginServicesForCli();
   runPm2(['start', cfg]);
   if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
     console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
@@ -3631,6 +3636,17 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        voice disable   关闭语音功能（移除配置）
   vc-agent tat-gate|poll
                        飞书会议智能体 P0：校验 TAT 会中事件读取、轮询会议事件并触发 workflow
+  plugin              管理 botmux 插件
+       plugin install <npm-package|local-dir>
+                       安装并校验 botmux 插件；不执行插件代码、不启动 service
+       plugin enable <id> --bot <bot|all> / --global
+                       启用插件给指定 bot 或全局默认；不影响 host service
+       plugin disable <id> --bot <bot|all> / --global
+                       禁用插件引用；不影响 host service
+       plugin run <command> [args...] [--plugin <id>]
+                       执行插件注册的 CLI 命令
+       plugin service status|start|stop [id|--all]
+                       查看/管理插件 host service
   whiteboard status|enable|disable
                        本地项目白板（默认关闭；enable 只打开能力，不创建白板）
        current --create / list / read / update / write --yes
@@ -6753,6 +6769,331 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
   }
 }
 
+function pluginPm2Options() {
+  return { pm2Bin: pm2Bin(), pm2Home: PM2_HOME, nodePath: process.execPath };
+}
+
+function formatPluginServiceReports(reports: Array<{ pluginId: string; serviceName: string; action: string; status?: string; warning?: string }>): string {
+  if (reports.length === 0) return '无插件 host service。';
+  return reports.map(r => {
+    const status = r.status ? ` (${r.status})` : '';
+    const warning = r.warning ? ` ⚠ ${r.warning}` : '';
+    return `- ${r.pluginId}/${r.serviceName}: ${r.action}${status}${warning}`;
+  }).join('\n');
+}
+
+async function reconcilePluginServicesForCli(pluginIds?: string[]): Promise<void> {
+  const { ensureManagedHostServices } = await import('./core/plugins/service-manager.js');
+  const reports = await ensureManagedHostServices(pluginPm2Options(), pluginIds);
+  const notable = reports.filter(r => r.action === 'started' || r.action === 'failed' || r.warning);
+  if (notable.length > 0) {
+    console.log('\n插件 host service:');
+    console.log(formatPluginServiceReports(notable));
+  }
+}
+
+async function stopPluginServicesForCli(pluginIds?: string[]): Promise<void> {
+  const { stopManagedHostServices } = await import('./core/plugins/service-manager.js');
+  const reports = stopManagedHostServices(pluginPm2Options(), pluginIds);
+  if (reports.length > 0) {
+    console.log('\n插件 host service:');
+    console.log(formatPluginServiceReports(reports));
+  }
+}
+
+function requirePluginId(raw: string | undefined): string {
+  const id = raw?.trim();
+  if (!id || !isValidPluginId(id)) {
+    console.error('❌ 插件 id 非法。要求: 小写字母开头，只能包含小写字母/数字/._-，长度 1-64。');
+    process.exit(1);
+  }
+  return id;
+}
+
+function findArgValue(args: string[], flag: string): string | undefined {
+  const idx = args.indexOf(flag);
+  return idx >= 0 ? args[idx + 1] : undefined;
+}
+
+function addPluginId(list: unknown, pluginId: string): string[] {
+  const current = normalizePluginIdList(list) ?? [];
+  return current.includes(pluginId) ? current : [...current, pluginId];
+}
+
+function removePluginId(list: unknown, pluginId: string): string[] {
+  return (normalizePluginIdList(list) ?? []).filter(id => id !== pluginId);
+}
+
+function updateGlobalPluginBinding(pluginId: string, enable: boolean): void {
+  const current = readGlobalConfig().plugins ?? [];
+  const next = enable ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+  mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
+}
+
+function updateBotPluginBinding(pluginId: string, botSelector: string, enable: boolean): number {
+  const bots = loadBotsJson();
+  if (bots.length === 0) {
+    console.error('❌ 未找到 bots.json 或没有 bot 配置。');
+    process.exit(1);
+  }
+  const indexes = botSelector === 'all'
+    ? bots.map((_, index) => index)
+    : (() => {
+        const idx = parseBotSelection(botSelector, bots);
+        if (idx === undefined) {
+          console.error(`❌ 找不到 bot: ${botSelector}`);
+          process.exit(1);
+        }
+        return [idx];
+      })();
+  for (const idx of indexes) {
+    const next = enable ? addPluginId(bots[idx].plugins, pluginId) : removePluginId(bots[idx].plugins, pluginId);
+    if (next.length > 0) bots[idx].plugins = next;
+    else delete bots[idx].plugins;
+  }
+  writeBotsAtomic(BOTS_JSON_FILE, bots);
+  return indexes.length;
+}
+
+function removePluginBindingsEverywhere(pluginId: string): void {
+  updateGlobalPluginBinding(pluginId, false);
+  const bots = loadBotsJson();
+  let changed = false;
+  for (const bot of bots) {
+    const next = removePluginId(bot.plugins, pluginId);
+    const before = normalizePluginIdList(bot.plugins) ?? [];
+    if (before.length !== next.length) changed = true;
+    if (next.length > 0) bot.plugins = next;
+    else delete bot.plugins;
+  }
+  if (changed) writeBotsAtomic(BOTS_JSON_FILE, bots);
+}
+
+async function removePluginSkillRegistryEntries(pluginId: string): Promise<void> {
+  const { readSkillRegistry, removeInstalledSkill } = await import('./services/skill-registry-store.js');
+  const { pluginCurrentDir, pluginHome, resolvePluginPath } = await import('./core/plugins/paths.js');
+  const { getInstalledPlugin } = await import('./services/plugin-registry-store.js');
+  const roots = new Set<string>([pluginHome(pluginId)]);
+  const record = getInstalledPlugin(pluginId);
+  for (const entry of record?.manifest.skills ?? []) {
+    try {
+      const skillDir = resolvePluginPath(pluginCurrentDir(pluginId), entry.path, 'skill_path');
+      roots.add(skillDir);
+      if (existsSync(skillDir)) roots.add(realpathSync(skillDir));
+    } catch {
+      /* best effort cleanup */
+    }
+  }
+  const isWithinPluginSkill = (value: string | undefined): boolean => {
+    if (!value) return false;
+    const candidates = [value];
+    try { if (existsSync(value)) candidates.push(realpathSync(value)); } catch { /* ignore */ }
+    return candidates.some(candidate => [...roots].some(root => candidate === root || candidate.startsWith(`${root}/`)));
+  };
+  const registry = readSkillRegistry();
+  for (const skill of Object.values(registry.skills)) {
+    const sourcePath = skill.source.type === 'local-link' ? skill.source.path : undefined;
+    if (isWithinPluginSkill(skill.rootDir) || isWithinPluginSkill(sourcePath)) {
+      removeInstalledSkill(skill.name);
+    }
+  }
+}
+
+function assertPluginInstalled(pluginId: string): void {
+  const { plugins } = readPluginRegistryCached();
+  if (!plugins[pluginId]) {
+    console.error(`❌ 插件未安装: ${pluginId}`);
+    console.error(`   先运行: botmux plugin install ${pluginId}`);
+    process.exit(1);
+  }
+}
+
+let pluginRegistryCache: import('./core/plugins/types.js').PluginRegistryFile | null = null;
+function readPluginRegistryCached(): import('./core/plugins/types.js').PluginRegistryFile {
+  if (pluginRegistryCache) return pluginRegistryCache;
+  // Synchronous top-level dynamic import is not available; this function is
+  // only used after cmdPlugin has loaded the registry into the cache.
+  throw new Error('plugin_registry_cache_not_loaded');
+}
+
+async function loadPluginRegistryForCommand(): Promise<import('./core/plugins/types.js').PluginRegistryFile> {
+  const { readPluginRegistry } = await import('./services/plugin-registry-store.js');
+  pluginRegistryCache = readPluginRegistry();
+  return pluginRegistryCache;
+}
+
+function printPluginUsage(): void {
+  console.log(`用法:
+  botmux plugin list
+  botmux plugin install <npm-package|local-dir> [--link]
+  botmux plugin uninstall <plugin-id> [--force]
+  botmux plugin enable <plugin-id> --bot <bot-index|name|appId|all>
+  botmux plugin enable <plugin-id> --global
+  botmux plugin disable <plugin-id> --bot <bot-index|name|appId|all>
+  botmux plugin disable <plugin-id> --global
+  botmux plugin run <command> [args...] [--plugin <plugin-id>]
+  botmux plugin service status
+  botmux plugin service start [plugin-id|--all]
+  botmux plugin service stop [plugin-id|--all]
+`);
+}
+
+function stripPluginRunFlags(args: string[]): { pluginId?: string; args: string[] } {
+  const out: string[] = [];
+  let pluginId: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--plugin') {
+      pluginId = requirePluginId(args[i + 1]);
+      i++;
+      continue;
+    }
+    out.push(args[i]);
+  }
+  return { pluginId, args: out };
+}
+
+async function cmdPlugin(args: string[]): Promise<void> {
+  const sub = (args[0] ?? 'list').toLowerCase();
+  if (sub === 'help' || sub === '--help' || sub === '-h') {
+    printPluginUsage();
+    return;
+  }
+
+  if (sub === 'install') {
+    const spec = args[1];
+    if (!spec) { printPluginUsage(); process.exit(1); }
+    const { installPlugin } = await import('./core/plugins/install.js');
+    const result = installPlugin(spec, { link: args.includes('--link') });
+    console.log(`✅ 已安装插件 ${result.record.id} (${result.record.packageName}@${result.record.version})`);
+    return;
+  }
+
+  const registry = await loadPluginRegistryForCommand();
+
+  if (sub === 'list' || sub === 'ls') {
+    const plugins = Object.values(registry.plugins).sort((a, b) => a.id.localeCompare(b.id));
+    if (plugins.length === 0) {
+      console.log('暂无已安装插件。');
+      return;
+    }
+    const globalPlugins = new Set(readGlobalConfig().plugins ?? []);
+    const bots = loadBotsJson();
+    for (const plugin of plugins) {
+      const enabledBots = bots
+        .map((bot, index) => ({ label: botProcessName(bot, index), enabled: (normalizePluginIdList(bot.plugins) ?? []).includes(plugin.id) }))
+        .filter(item => item.enabled)
+        .map(item => item.label);
+      const flags = [
+        globalPlugins.has(plugin.id) ? 'global' : '',
+        enabledBots.length > 0 ? `bots=${enabledBots.join(',')}` : '',
+      ].filter(Boolean).join(' ');
+      console.log(`${plugin.id}\t${plugin.packageName}@${plugin.version}${flags ? `\t${flags}` : ''}`);
+    }
+    return;
+  }
+
+  if (sub === 'enable' || sub === 'disable') {
+    const pluginId = requirePluginId(args[1]);
+    assertPluginInstalled(pluginId);
+    const enable = sub === 'enable';
+    if (args.includes('--global')) {
+      updateGlobalPluginBinding(pluginId, enable);
+      console.log(`✅ 已${enable ? '启用' : '禁用'}全局默认插件: ${pluginId}`);
+      return;
+    }
+    const botSelector = findArgValue(args, '--bot');
+    if (!botSelector) {
+      console.error(`❌ ${sub} 需要指定 --bot <bot-index|name|appId|all>，或使用 --global。`);
+      process.exit(1);
+    }
+    const count = updateBotPluginBinding(pluginId, botSelector, enable);
+    console.log(`✅ 已为 ${count} 个 bot ${enable ? '启用' : '禁用'}插件: ${pluginId}`);
+    return;
+  }
+
+  if (sub === 'run' || sub === 'exec') {
+    const rawCommand = args[1];
+    if (!rawCommand) { printPluginUsage(); process.exit(1); }
+    const { pluginId, args: commandArgs } = stripPluginRunFlags(args.slice(2));
+    if (pluginId) assertPluginInstalled(pluginId);
+    const { collectPluginCliCommands } = await import('./core/plugins/runtime.js');
+    const commands = await collectPluginCliCommands(pluginId ? [pluginId] : undefined);
+    const matches = commands.filter(command => command.name === rawCommand);
+    if (matches.length === 0) {
+      console.error(`❌ 找不到插件 CLI 命令: ${rawCommand}`);
+      const available = commands.map(command => `${command.name} (${command.pluginId})`).sort();
+      if (available.length > 0) console.error(`   可用命令: ${available.join(', ')}`);
+      process.exit(1);
+    }
+    if (matches.length > 1 && !pluginId) {
+      console.error(`❌ 插件 CLI 命令冲突: ${rawCommand}`);
+      console.error(`   使用 --plugin 指定: ${matches.map(command => command.pluginId).join(', ')}`);
+      process.exit(1);
+    }
+    const command = matches[0];
+    const record = registry.plugins[command.pluginId];
+    const { pluginCurrentDir } = await import('./core/plugins/paths.js');
+    const result = await command.run({
+      runtime: 'cli',
+      pluginId: command.pluginId,
+      pluginDir: pluginCurrentDir(command.pluginId),
+      packageName: record?.packageName ?? command.pluginId,
+      version: record?.version ?? '0.0.0',
+      manifest: record?.manifest ?? { schemaVersion: 1, id: command.pluginId },
+      args: commandArgs,
+    });
+    if (typeof result === 'string') console.log(result);
+    if (typeof result === 'number') process.exitCode = result;
+    return;
+  }
+
+  if (sub === 'uninstall' || sub === 'remove' || sub === 'rm') {
+    const pluginId = requirePluginId(args[1]);
+    assertPluginInstalled(pluginId);
+    const dependents = Object.values(registry.plugins)
+      .filter(plugin => plugin.id !== pluginId && plugin.manifest.dependencies?.plugins?.[pluginId])
+      .map(plugin => plugin.id);
+    if (dependents.length > 0 && !args.includes('--force')) {
+      console.error(`❌ 不能卸载 ${pluginId}，仍被这些插件依赖: ${dependents.join(', ')}`);
+      console.error('   如确认要破坏依赖关系，使用 --force。');
+      process.exit(1);
+    }
+    await stopPluginServicesForCli([pluginId]);
+    await removePluginSkillRegistryEntries(pluginId);
+    const { removeInstalledPlugin } = await import('./services/plugin-registry-store.js');
+    const { pluginHome } = await import('./core/plugins/paths.js');
+    removeInstalledPlugin(pluginId);
+    removePluginBindingsEverywhere(pluginId);
+    rmSync(pluginHome(pluginId), { recursive: true, force: true });
+    console.log(`✅ 已卸载插件: ${pluginId}`);
+    return;
+  }
+
+  if (sub === 'service' || sub === 'services') {
+    const action = (args[1] ?? 'status').toLowerCase();
+    const rawId = args[2];
+    const pluginIds = !rawId || rawId === '--all' ? undefined : [requirePluginId(rawId)];
+    if (action === 'status' || action === 'list') {
+      const { listPluginServiceStatus } = await import('./core/plugins/service-manager.js');
+      console.log(formatPluginServiceReports(listPluginServiceStatus(pluginPm2Options())));
+      return;
+    }
+    if (action === 'start') {
+      await reconcilePluginServicesForCli(pluginIds);
+      return;
+    }
+    if (action === 'stop') {
+      await stopPluginServicesForCli(pluginIds);
+      return;
+    }
+    printPluginUsage();
+    process.exit(1);
+  }
+
+  printPluginUsage();
+  process.exit(1);
+}
+
 switch (command) {
   case '--version':
   case '-v':      console.log(getVersion()); break;
@@ -6766,7 +7107,7 @@ switch (command) {
   }
   case 'start':   await cmdStart(); break;
   case 'start-bot': await cmdStartBot(process.argv.slice(3)); break;
-  case 'stop':    cmdStop(); break;
+  case 'stop':    await cmdStop(); break;
   case 'restart': await cmdRestart(); break;
   case 'logs':    cmdLogs(); break;
   case 'status':  cmdStatus(); break;
@@ -6868,6 +7209,8 @@ switch (command) {
     await cmdVcAgent(process.argv[3] ?? '', process.argv.slice(4));
     break;
   }
+  case 'plugin':
+  case 'plugins':  await cmdPlugin(process.argv.slice(3)); break;
   case 'whiteboard':
   case 'wb':       await cmdWhiteboard(process.argv[3] ?? 'status', process.argv.slice(4)); break;
   case 'thread':   {

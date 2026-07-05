@@ -112,6 +112,8 @@ import { detectCliUsageLimit, usageLimitStateKey, type CliUsageLimitState } from
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { redactChildEnv } from './utils/child-env.js';
 import { decideSubmitConfirmationAction, type SubmitActivityEvidence } from './services/submit-confirmation.js';
+import { resolvePluginMcpServers } from './core/plugins/runtime.js';
+import { writePluginMcpConfig } from './core/plugins/mcp.js';
 import { config, resolveChatBotDiscoveryConfig } from './config.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
@@ -4641,6 +4643,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     else childEnv.CODEX_HOME = join(isolationBotHome, 'codex');
   }
 
+  if (cfg.pluginMcpServers?.length) {
+    const mcpConfigPath = writePluginMcpConfig(cfg.sessionId, cfg.pluginMcpServers);
+    childEnv.BOTMUX_PLUGIN_MCP_SERVERS = JSON.stringify(cfg.pluginMcpServers);
+    if (mcpConfigPath) childEnv.BOTMUX_PLUGIN_MCP_CONFIG = mcpConfigPath;
+  }
+
   // Per-bot env (bots.json `env`): extra vars for THIS bot's CLI only — e.g.
   // ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN to run a bot on GLM/a 3rd-party
   // provider, an HTTPS_PROXY, or a CLI feature flag. Passed as injectEnv (NOT
@@ -5910,6 +5918,16 @@ process.on('message', async (raw: unknown) => {
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}, render=${renderCols}x${renderRows}${msg.adoptMode ? ' (adopt-pane)' : ''}`);
 
       try {
+        if (msg.pluginIds?.length) {
+          msg.pluginMcpServers = await resolvePluginMcpServers({
+            pluginIds: msg.pluginIds,
+            botId: msg.larkAppId,
+            sessionId: msg.sessionId,
+          });
+          if (msg.pluginMcpServers.length > 0) {
+            log(`Loaded ${msg.pluginMcpServers.length} plugin MCP server(s) from ${msg.pluginIds.join(',')}`);
+          }
+        }
         if (msg.turnId) {
           currentBotmuxTurnId = msg.turnId;
           writeCliPidMarker();

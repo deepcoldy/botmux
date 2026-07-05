@@ -89,6 +89,14 @@ describe('global dashboard config', () => {
     expect(globalVcMeetingAgentListenerBotAppId()).toBe('cli_listener');
   });
 
+  it('reads global plugin defaults as a sanitized id list', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      plugins: ['agent-chrome', 'bad/id', 'agent-chrome', 'gitlab'],
+    }));
+
+    expect(readGlobalConfig().plugins).toEqual(['agent-chrome', 'gitlab']);
+  });
+
   it('readGlobalConfig sees fresh values immediately after a merge (cache invalidation)', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { publicReadOnly: true } }));
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(true); // primes the TTL cache
