@@ -4607,27 +4607,43 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   align-items: center;
 }
 
-.skills-advanced-options,
+.skills-install-action-row,
 .skills-candidate-list,
 .skills-local-discovery-panel {
   grid-column: 1 / -1;
 }
 
-.skills-advanced-options {
+.skills-install-action-row {
+  position: relative;
   display: grid;
-  gap: 9px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  align-items: start;
   padding: 9px 0 0;
   border-top: 1px solid var(--border-soft);
 }
 
+.skills-advanced-options {
+  display: grid;
+  gap: 0;
+  min-width: 0;
+  padding: 0;
+}
+
 .skills-advanced-options summary {
+  display: flex;
+  align-items: center;
+  min-height: 36px;
+  padding-right: 92px;
   cursor: pointer;
   color: var(--fg);
   font-size: 12px;
   font-weight: 700;
 }
 
-.skills-advanced-options label {
+.skills-advanced-fields {
+  display: grid;
+  gap: 9px;
   margin-top: 8px;
 }
 
@@ -4640,8 +4656,12 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 }
 
 .skills-install-actions {
-  grid-column: 1 / -1;
-  flex-wrap: wrap;
+  position: absolute;
+  top: 9px;
+  right: 0;
+  justify-content: flex-end;
+  min-height: 36px;
+  flex-wrap: nowrap;
 }
 
 .skills-install-actions button,
@@ -5622,6 +5642,21 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   .skills-candidate-list-head {
     display: grid;
     justify-items: stretch;
+  }
+}
+
+@media (max-width: 460px) {
+  .skills-install-action-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .skills-advanced-options summary {
+    padding-right: 0;
+  }
+  .skills-install-actions {
+    position: static;
+    justify-content: flex-start;
+    justify-items: start;
   }
 }
 

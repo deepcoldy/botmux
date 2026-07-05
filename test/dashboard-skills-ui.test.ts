@@ -72,6 +72,26 @@ describe('dashboard skills install panel', () => {
     expect(root.findByProps({ 'data-skills-advanced': true }).props.open).toBe(false);
   });
 
+  it('places install action beside the advanced options toggle', () => {
+    const renderer = TestRenderer.create(React.createElement(SkillsInstallPanel, {
+      installSource: '',
+      installPath: '',
+      installRef: '',
+      installStatus: null,
+      installBusy: false,
+      onInstallSourceChange: vi.fn(),
+      onInstallPathChange: vi.fn(),
+      onInstallRefChange: vi.fn(),
+      onInstall: vi.fn(),
+      onOpenNativeDiscovery: vi.fn(),
+    }));
+    const root = renderer.root;
+    const actionRow = root.findByProps({ className: 'skills-install-action-row' });
+
+    expect(actionRow.findAllByProps({ 'data-skills-advanced': true })).toHaveLength(1);
+    expect(actionRow.findAllByProps({ 'data-action': 'install' })).toHaveLength(1);
+  });
+
   it('keeps multi-skill install selection inside the install confirmation dialog', () => {
     const renderer = TestRenderer.create(React.createElement(SkillsInstallPanel, {
       installSource: 'https://github.com/acme/skills',

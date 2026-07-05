@@ -187,31 +187,35 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
           <span><strong>{tr('skills.sourceHelpRemoteLabel')}</strong>{tr('skills.sourceHelpRemote')}</span>
           <span><strong>{tr('skills.sourceHelpLocalLabel')}</strong>{tr('skills.sourceHelpLocal')}</span>
         </div>
-        <details className="skills-advanced-options" data-skills-advanced={true} open={false}>
-          <summary>{tr('skills.advanced')}</summary>
-          <label className="skills-install-field-wide"><span>{tr('skills.path')}</span>
-            <input
-              type="text"
-              data-install="path"
-              placeholder={tr('skills.pathPlaceholder')}
-              value={props.installPath}
-              onChange={e => props.onInstallPathChange(e.currentTarget.value)}
-            />
-          </label>
-          <label className="skills-install-field-wide"><span>{tr('skills.ref')}</span>
-            <input
-              type="text"
-              data-install="ref"
-              placeholder={tr('skills.refPlaceholder')}
-              value={props.installRef}
-              onChange={e => props.onInstallRefChange(e.currentTarget.value)}
-            />
-          </label>
-        </details>
-        <div className="skills-install-actions">
-          <button type="button" className="primary" data-action="install" disabled={busy} onClick={() => props.onInstall()}>
-            {props.installDiscovering ? tr('skills.scanning') : props.installBusy ? tr('skills.jobRunning') : tr('skills.installSubmit')}
-          </button>
+        <div className="skills-install-action-row">
+          <details className="skills-advanced-options" data-skills-advanced={true} open={false}>
+            <summary>{tr('skills.advanced')}</summary>
+            <div className="skills-advanced-fields">
+              <label className="skills-install-field-wide"><span>{tr('skills.path')}</span>
+                <input
+                  type="text"
+                  data-install="path"
+                  placeholder={tr('skills.pathPlaceholder')}
+                  value={props.installPath}
+                  onChange={e => props.onInstallPathChange(e.currentTarget.value)}
+                />
+              </label>
+              <label className="skills-install-field-wide"><span>{tr('skills.ref')}</span>
+                <input
+                  type="text"
+                  data-install="ref"
+                  placeholder={tr('skills.refPlaceholder')}
+                  value={props.installRef}
+                  onChange={e => props.onInstallRefChange(e.currentTarget.value)}
+                />
+              </label>
+            </div>
+          </details>
+          <div className="skills-install-actions">
+            <button type="button" className="primary" data-action="install" disabled={busy} onClick={() => props.onInstall()}>
+              {props.installDiscovering ? tr('skills.scanning') : props.installBusy ? tr('skills.jobRunning') : tr('skills.installSubmit')}
+            </button>
+          </div>
         </div>
         <div className="skills-local-discovery-panel">
           <div>
