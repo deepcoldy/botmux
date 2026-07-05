@@ -458,10 +458,13 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     claudeDataDir: variant.dataDir,
     claudeStateJsonPath: variant.stateJsonPath,
     spawnEnv: variant.spawnEnv,
-    // Under the external wrapper the MAIN process is sandboxed too, so Claude's own
-    // state file (~/.claude.json — account/login/folder-trust state) must stay
-    // readable or Claude drops to the login screen. Preserve it alongside auth.
-    authPaths: [...(variant.authPaths ?? []), ...(variant.stateJsonPath ? [variant.stateJsonPath] : [])],
+    // Only the CLI's own login/creds (variant.authPaths) are kept real+writable in the
+    // FILE sandbox. Deliberately NOT ~/.claude.json: read isolation is enforced by the
+    // worker's whole-process Seatbelt wrapper, which does NOT consult authPaths — it
+    // redirects ~/.claude via CLAUDE_CONFIG_DIR and denies the global. So adding the
+    // state file here had zero isolation benefit and only side-effected the (unrelated)
+    // file sandbox — binding ~/.claude.json real+writable, weakening its write isolation.
+    authPaths: variant.authPaths,
     skillDelivery: { nativeKind: 'claude-plugin', supportsScopedSession: true, supportsExclusive: false },
 
     /** Prove the resume JSONL exists (or at least the project dir does, so the
