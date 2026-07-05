@@ -41,6 +41,12 @@ interface SkillJob {
   error?: string;
 }
 
+interface InstallSkillCandidate {
+  name: string;
+  path: string;
+  description?: string;
+}
+
 type StatusMessage = { text: string; ok: boolean } | null;
 type DeliveryMode = 'auto' | 'prompt' | 'native';
 type ProjectTrustMode = 'off' | 'all';
@@ -116,6 +122,134 @@ function statusClass(status: StatusMessage): string {
   return `oncall-status${status ? ` ${status.ok ? 'hint-ok' : 'hint-warn-inline'}` : ''}`;
 }
 
+interface SkillsInstallPanelProps {
+  installSource: string;
+  installPath: string;
+  installRef: string;
+  installStatus: StatusMessage;
+  installBusy: boolean;
+  installScanBusy?: boolean;
+  installCandidates?: InstallSkillCandidate[];
+  selectedInstallSkills?: Set<string>;
+  onInstallSourceChange: (value: string) => void;
+  onInstallPathChange: (value: string) => void;
+  onInstallRefChange: (value: string) => void;
+  onScan?: () => void;
+  onToggleInstallSkill?: (name: string) => void;
+  onSelectAllInstallSkills?: (selected: boolean) => void;
+  onInstall: () => void;
+  onOpenNativeDiscovery: () => void;
+}
+
+export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
+  const tr = useT();
+  const candidates = props.installCandidates ?? [];
+  const selectedInstallSkills = props.selectedInstallSkills ?? new Set<string>();
+  const allSelected = candidates.length > 0 && candidates.every(candidate => selectedInstallSkills.has(candidate.name));
+  const busy = props.installBusy || props.installScanBusy;
+  return (
+    <article className="bd-card skills-install-panel">
+      <div className="skills-install-title">
+        <h3 className="bd-section-title">{tr('skills.install')}</h3>
+        <span className="skills-help-tip">
+          <button type="button" className="skills-help-button" aria-label={tr('skills.installInfoLabel')}>?</button>
+          <span className="skills-help-popover" role="tooltip">{tr('skills.installInfo')}</span>
+        </span>
+      </div>
+      <div className="skills-install-grid">
+        <label className="skills-source-label"><span>{tr('skills.source')}</span>
+          <div className="skills-source-control">
+            <input
+              type="text"
+              data-install="source"
+              aria-label={tr('skills.source')}
+              placeholder={tr('skills.sourcePlaceholder')}
+              value={props.installSource}
+              onChange={e => props.onInstallSourceChange(e.currentTarget.value)}
+            />
+          </div>
+        </label>
+        <div className="bd-section-note skills-install-note">
+          <span><strong>{tr('skills.sourceHelpRemoteLabel')}</strong>{tr('skills.sourceHelpRemote')}</span>
+          <span><strong>{tr('skills.sourceHelpLocalLabel')}</strong>{tr('skills.sourceHelpLocal')}</span>
+        </div>
+        <details className="skills-advanced-options" data-skills-advanced={true} open={false}>
+          <summary>{tr('skills.advanced')}</summary>
+          <label className="skills-install-field-wide"><span>{tr('skills.path')}</span>
+            <input
+              type="text"
+              data-install="path"
+              placeholder={tr('skills.pathPlaceholder')}
+              value={props.installPath}
+              onChange={e => props.onInstallPathChange(e.currentTarget.value)}
+            />
+          </label>
+          <label className="skills-install-field-wide"><span>{tr('skills.ref')}</span>
+            <input
+              type="text"
+              data-install="ref"
+              placeholder={tr('skills.refPlaceholder')}
+              value={props.installRef}
+              onChange={e => props.onInstallRefChange(e.currentTarget.value)}
+            />
+          </label>
+        </details>
+        <div className="skills-install-actions">
+          {props.onScan ? (
+            <button type="button" data-action="scan-source-skills" disabled={busy} onClick={() => props.onScan?.()}>
+              {props.installScanBusy ? tr('skills.scanning') : tr('skills.scan')}
+            </button>
+          ) : null}
+          <button type="button" className="primary" data-action="install" disabled={props.installBusy} onClick={() => props.onInstall()}>
+            {candidates.length > 0 ? tr('skills.installSelected') : tr('skills.installSubmit')}
+          </button>
+        </div>
+        {candidates.length > 0 ? (
+          <div className="skills-candidate-list" data-install-candidates>
+            <div className="skills-candidate-list-head">
+              <span>{tr('skills.scanFound', { count: candidates.length })}</span>
+              {props.onSelectAllInstallSkills ? (
+                <button
+                  type="button"
+                  data-action="toggle-all-source-skills"
+                  onClick={() => props.onSelectAllInstallSkills?.(!allSelected)}
+                >
+                  {allSelected ? tr('skills.discoverClearSelection') : tr('skills.discoverSelectAll')}
+                </button>
+              ) : null}
+            </div>
+            {candidates.map(candidate => (
+              <label key={`${candidate.name}:${candidate.path}`} className="skills-candidate-row">
+                <input
+                  type="checkbox"
+                  checked={selectedInstallSkills.has(candidate.name)}
+                  onChange={() => props.onToggleInstallSkill?.(candidate.name)}
+                />
+                <span>
+                  <strong>{candidate.name}</strong>
+                  <small>{candidate.path}{candidate.description ? ` · ${candidate.description}` : ''}</small>
+                </span>
+              </label>
+            ))}
+          </div>
+        ) : null}
+        <div className="skills-local-discovery-panel">
+          <div>
+            <strong>{tr('skills.localDiscoverTitle')}</strong>
+            <span>{tr('skills.localDiscoverHelp')}</span>
+          </div>
+          <button type="button" data-action="open-native-skill-discovery" onClick={() => props.onOpenNativeDiscovery()}>
+            {tr('skills.localDiscover')}
+          </button>
+        </div>
+      </div>
+      <div className="actions">
+        <span className={statusClass(props.installStatus)} data-skills-status>{props.installStatus?.text ?? ''}</span>
+      </div>
+    </article>
+  );
+}
+
 function SkillsPage() {
   const tr = useT();
   const mountedRef = useRef(true);
@@ -137,6 +271,9 @@ function SkillsPage() {
   const [installRef, setInstallRef] = useState('');
   const [installStatus, setInstallStatus] = useState<StatusMessage>(null);
   const [installBusy, setInstallBusy] = useState(false);
+  const [installScanBusy, setInstallScanBusy] = useState(false);
+  const [installCandidates, setInstallCandidates] = useState<InstallSkillCandidate[]>([]);
+  const [selectedInstallSkills, setSelectedInstallSkills] = useState<Set<string>>(() => new Set());
   const [discoveryOpen, setDiscoveryOpen] = useState(false);
   const [discoveryBusy, setDiscoveryBusy] = useState(false);
   const [activeDiscoveryKey, setActiveDiscoveryKey] = useState<string | null>(null);
@@ -284,19 +421,79 @@ function SkillsPage() {
       .map(bot => bot.botName ?? bot.larkAppId);
   }
 
+  function clearInstallDiscovery(): void {
+    setInstallCandidates([]);
+    setSelectedInstallSkills(new Set());
+  }
+
+  function installRequestBody(): Record<string, unknown> {
+    const selected = [...selectedInstallSkills];
+    return {
+      source: installSource.trim(),
+      path: installPath.trim() || undefined,
+      ref: installRef.trim() || undefined,
+      skillNames: selected.length > 0 ? selected : undefined,
+    };
+  }
+
+  async function scanInstallSource(): Promise<void> {
+    if (!installSource.trim()) {
+      setInstallStatus({ text: tr('skills.sourceRequired'), ok: false });
+      return;
+    }
+    setInstallScanBusy(true);
+    setInstallStatus({ text: tr('skills.scanning'), ok: true });
+    try {
+      const body = await jsonRequest('/api/skills/discover', {
+        method: 'POST',
+        body: JSON.stringify(installRequestBody()),
+      });
+      if (!mountedRef.current) return;
+      const skills = Array.isArray(body.discovery?.skills) ? body.discovery.skills as InstallSkillCandidate[] : [];
+      setInstallCandidates(skills);
+      setSelectedInstallSkills(new Set(skills.map(skill => skill.name)));
+      setInstallStatus({
+        text: skills.length > 0 ? tr('skills.scanFound', { count: skills.length }) : tr('skills.scanEmpty'),
+        ok: skills.length > 0,
+      });
+    } catch (err: any) {
+      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
+    } finally {
+      if (mountedRef.current) setInstallScanBusy(false);
+    }
+  }
+
+  function toggleInstallCandidate(name: string): void {
+    setSelectedInstallSkills(current => {
+      const next = new Set(current);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  }
+
+  function selectAllInstallCandidates(selected: boolean): void {
+    setSelectedInstallSkills(selected ? new Set(installCandidates.map(candidate => candidate.name)) : new Set());
+  }
+
   async function installSkill(): Promise<void> {
+    if (!installSource.trim()) {
+      setInstallStatus({ text: tr('skills.sourceRequired'), ok: false });
+      return;
+    }
+    if (installCandidates.length > 0 && selectedInstallSkills.size === 0) {
+      setInstallStatus({ text: tr('skills.discoverNothingSelected'), ok: false });
+      return;
+    }
     setInstallBusy(true);
     try {
       const body = await jsonRequest('/api/skills/install', {
         method: 'POST',
-        body: JSON.stringify({
-          source: installSource.trim(),
-          path: installPath.trim() || undefined,
-          ref: installRef.trim() || undefined,
-        }),
+        body: JSON.stringify(installRequestBody()),
       });
       if (!mountedRef.current) return;
       await waitForSkillJob(body.job as SkillJob, setInstallStatus);
+      if (mountedRef.current) clearInstallDiscovery();
     } catch (err: any) {
       if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
     } finally {
@@ -498,60 +695,33 @@ function SkillsPage() {
               </div>
             </article>
 
-            <article className="bd-card skills-install-panel">
-              <div className="skills-install-title">
-                <h3 className="bd-section-title">{tr('skills.install')}</h3>
-                <span className="skills-help-tip">
-                  <button type="button" className="skills-help-button" aria-label={tr('skills.installInfoLabel')}>?</button>
-                  <span className="skills-help-popover" role="tooltip">{tr('skills.installInfo')}</span>
-                </span>
-              </div>
-              <div className="skills-install-grid">
-                <div className="skills-source-label"><span>{tr('skills.source')}</span>
-                  <div className="skills-source-control">
-                    <input
-                      type="text"
-                      data-install="source"
-                      aria-label={tr('skills.source')}
-                      placeholder={tr('skills.sourcePlaceholder')}
-                      value={installSource}
-                      onChange={e => setInstallSource(e.currentTarget.value)}
-                    />
-                    <button type="button" data-action="discover-native-skills" onClick={() => setDiscoveryOpen(true)}>
-                      {tr('skills.discover')}
-                    </button>
-                  </div>
-                </div>
-                <div className="bd-section-note skills-install-note">
-                  <span><strong>{tr('skills.sourceHelpRemoteLabel')}</strong>{tr('skills.sourceHelpRemote')}</span>
-                  <span><strong>{tr('skills.sourceHelpLocalLabel')}</strong>{tr('skills.sourceHelpLocal')}</span>
-                </div>
-                <label className="skills-install-field-wide"><span>{tr('skills.path')}</span>
-                  <input
-                    type="text"
-                    data-install="path"
-                    placeholder={tr('skills.pathPlaceholder')}
-                    value={installPath}
-                    onChange={e => setInstallPath(e.currentTarget.value)}
-                  />
-                </label>
-                <label className="skills-install-field-wide"><span>{tr('skills.ref')}</span>
-                  <input
-                    type="text"
-                    data-install="ref"
-                    placeholder={tr('skills.refPlaceholder')}
-                    value={installRef}
-                    onChange={e => setInstallRef(e.currentTarget.value)}
-                  />
-                </label>
-              </div>
-              <div className="actions">
-                <button type="button" className="primary" data-action="install" disabled={installBusy} onClick={() => void installSkill()}>
-                  {tr('skills.installSubmit')}
-                </button>
-                <span className={statusClass(installStatus)} data-skills-status>{installStatus?.text ?? ''}</span>
-              </div>
-            </article>
+            <SkillsInstallPanel
+              installSource={installSource}
+              installPath={installPath}
+              installRef={installRef}
+              installStatus={installStatus}
+              installBusy={installBusy}
+              installScanBusy={installScanBusy}
+              installCandidates={installCandidates}
+              selectedInstallSkills={selectedInstallSkills}
+              onInstallSourceChange={(value) => {
+                setInstallSource(value);
+                clearInstallDiscovery();
+              }}
+              onInstallPathChange={(value) => {
+                setInstallPath(value);
+                clearInstallDiscovery();
+              }}
+              onInstallRefChange={(value) => {
+                setInstallRef(value);
+                clearInstallDiscovery();
+              }}
+              onScan={() => void scanInstallSource()}
+              onToggleInstallSkill={toggleInstallCandidate}
+              onSelectAllInstallSkills={selectAllInstallCandidates}
+              onInstall={() => void installSkill()}
+              onOpenNativeDiscovery={() => setDiscoveryOpen(true)}
+            />
           </aside>
 
           <section className="skills-main-panel">

@@ -5,7 +5,6 @@ import { MAX_LOCAL_LINK_SOURCES, parseDashboardSkillInstallRequest, parseInstall
 describe('dashboard skill install request parsing', () => {
   it('rejects lightweight install errors before starting a job', () => {
     expect(() => parseDashboardSkillInstallRequest({ source: '' })).toThrow(/source_required/);
-    expect(() => parseDashboardSkillInstallRequest({ source: 'git+https://github.com/acme/skills.git' })).toThrow(/path_required/);
     expect(() => parseDashboardSkillInstallRequest({
       source: 'git+https://token@example.com/acme/skills.git',
       path: 'skills/deploy',
@@ -14,6 +13,25 @@ describe('dashboard skill install request parsing', () => {
       source: 'git+https://github.com/acme/skills.git',
       path: '../deploy',
     })).toThrow(/invalid_git_skill_path/);
+  });
+
+  it('accepts repository roots for discovery-backed remote installs', () => {
+    expect(parseDashboardSkillInstallRequest({ source: 'git+https://github.com/acme/skills.git' })).toMatchObject({
+      kind: 'git',
+      url: 'https://github.com/acme/skills.git',
+    });
+    expect(parseDashboardSkillInstallRequest({ source: 'https://github.com/acme/skills' })).toMatchObject({
+      kind: 'github',
+      owner: 'acme',
+      repo: 'skills',
+    });
+    expect(parseDashboardSkillInstallRequest({
+      source: 'https://github.com/acme/skills',
+      skillNames: ['deploy', 'review'],
+    })).toMatchObject({
+      kind: 'github',
+      skillNames: ['deploy', 'review'],
+    });
   });
 
   it('parses GitHub shorthand paths and explicit overrides', () => {

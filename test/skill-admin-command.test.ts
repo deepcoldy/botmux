@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -9,6 +10,10 @@ import { readSkillRegistry } from '../src/services/skill-registry-store.js';
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, content);
+}
+
+function run(cmd: string, args: string[], cwd: string): string {
+  return execFileSync(cmd, args, { cwd, encoding: 'utf-8' }).trim();
 }
 
 describe('botmux skills admin command', () => {
@@ -50,6 +55,36 @@ describe('botmux skills admin command', () => {
 
     expect(updated.stdout).toContain('updated deploy');
     expect(readSkillRegistry().skills.deploy.description).toBe('New');
+  });
+
+  it('discovers and installs a selected skill from a git repository root', () => {
+    const repo = join(src, 'repo');
+    mkdirSync(repo);
+    run('git', ['init'], repo);
+    run('git', ['config', 'user.email', 'botmux@example.com'], repo);
+    run('git', ['config', 'user.name', 'botmux'], repo);
+    write(join(repo, 'skills', 'deploy', 'SKILL.md'), '---\nname: deploy\n---\n# Deploy');
+    write(join(repo, 'skills', 'review', 'SKILL.md'), '---\nname: review\ndescription: Review code\n---\n# Review');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'add skills'], repo);
+    const source = `git+file://${repo}`;
+
+    const discovered = runSkillsAdminCommand(['discover', source, '--ref', 'HEAD']);
+    expect(discovered.code).toBe(0);
+    expect(discovered.stdout).toContain('deploy\tskills/deploy');
+    expect(discovered.stdout).toContain('review\tskills/review\tReview code');
+
+    const blocked = runSkillsAdminCommand(['install', source, '--ref', 'HEAD']);
+    expect(blocked.code).toBe(1);
+    expect(blocked.stderr).toContain('multiple_skills_found');
+
+    const installed = runSkillsAdminCommand(['install', source, '--ref', 'HEAD', '--skill', 'review']);
+    expect(installed).toMatchObject({ code: 0 });
+    expect(installed.stdout).toContain('installed review');
+    expect(readSkillRegistry().skills.review.source).toMatchObject({
+      type: 'git',
+      path: 'skills/review',
+    });
   });
 
   it('requires --force when removing a skill referenced by bot policy', () => {

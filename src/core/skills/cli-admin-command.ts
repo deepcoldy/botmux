@@ -2,8 +2,11 @@ import { existsSync } from 'node:fs';
 import { githubToGitUrl, parseSkillInstallSource } from './sources.js';
 import { validateSkillPackageDir } from './package.js';
 import {
+  discoverGitSkillCandidates,
+  discoverLocalSkillCandidates,
+  installGitSkillsFromSource,
   installGitSkill,
-  installLocalSkill,
+  installLocalSkillsFromSource,
   readSkillRegistry,
   removeInstalledSkill,
   updateInstalledSkill,
@@ -29,8 +32,40 @@ function argValue(args: string[], name: string): string | undefined {
   return i >= 0 ? args[i + 1] : undefined;
 }
 
+function argValues(args: string[], name: string): string[] {
+  const values: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === name && args[i + 1]) values.push(args[i + 1]);
+  }
+  return values;
+}
+
 function hasFlag(args: string[], name: string): boolean {
   return args.includes(name);
+}
+
+function selectedSkillNames(args: string[]): string[] {
+  return [...new Set(argValues(args, '--skill')
+    .flatMap(value => value.split(','))
+    .map(value => value.trim())
+    .filter(Boolean))];
+}
+
+function formatInstalled(skills: SkillPackage[]): string {
+  return skills.map(skill => `installed ${skill.name}`).join('\n') + '\n';
+}
+
+function formatSkillDiscovery(discovery: ReturnType<typeof discoverLocalSkillCandidates>): string {
+  const lines: string[] = [];
+  if (discovery.commit) lines.push(`commit\t${discovery.commit}`);
+  for (const skill of discovery.skills) {
+    lines.push([
+      skill.name,
+      skill.path,
+      skill.description ?? '',
+    ].filter(part => part.length > 0).join('\t'));
+  }
+  return lines.join('\n') + (lines.length > 0 ? '\n' : '');
 }
 
 function findBotConfig(selector: string | undefined): BotConfig | undefined {
@@ -148,6 +183,36 @@ function runDelivery(args: string[]): AdminCommandResult {
   }
 }
 
+function runDiscover(args: string[]): AdminCommandResult {
+  const source = args[0];
+  if (!source) return { code: 2, stdout: '', stderr: 'usage: botmux skills discover <path|git|github> [--path <repo-path>] [--ref <ref>] [--full-depth] [--json]\n' };
+  const fullDepth = hasFlag(args, '--full-depth');
+  const parsed = parseSkillInstallSource(source);
+  let discovery: ReturnType<typeof discoverLocalSkillCandidates>;
+  if (parsed.kind === 'local') {
+    discovery = discoverLocalSkillCandidates(parsed.value, { fullDepth });
+  } else if (parsed.kind === 'git') {
+    discovery = discoverGitSkillCandidates({
+      url: parsed.value,
+      ref: argValue(args, '--ref'),
+      path: argValue(args, '--path'),
+      fullDepth,
+    });
+  } else {
+    const gh = parsed.github;
+    if (!gh) return { code: 2, stdout: '', stderr: 'invalid github source\n' };
+    discovery = discoverGitSkillCandidates({
+      url: githubToGitUrl(gh.owner, gh.repo),
+      ref: argValue(args, '--ref') ?? gh.ref,
+      path: argValue(args, '--path') ?? gh.path,
+      fullDepth,
+    });
+  }
+  if (hasFlag(args, '--json')) return { code: 0, stdout: JSON.stringify(discovery, null, 2) + '\n', stderr: '' };
+  if (discovery.skills.length === 0) return { code: 1, stdout: '', stderr: 'no_skills_found\n' };
+  return { code: 0, stdout: formatSkillDiscovery(discovery), stderr: '' };
+}
+
 function findSkillReferences(skillName: string): SkillReferenceSummary {
   let bots: BotConfig[] = [];
   try {
@@ -185,35 +250,54 @@ export function runSkillsAdminCommand(args: string[]): AdminCommandResult {
       const result = validateSkillPackageDir(dir);
       return result.ok ? { code: 0, stdout: 'ok\n', stderr: '' } : { code: 1, stdout: '', stderr: `${result.reason}\n` };
     }
+    if (sub === 'discover') {
+      return runDiscover(args.slice(1));
+    }
     if (sub === 'install') {
       const source = args[1];
-      if (!source) return { code: 2, stdout: '', stderr: 'usage: botmux skills install <path|git|github>\n' };
+      if (!source) return { code: 2, stdout: '', stderr: 'usage: botmux skills install <path|git|github> [--path <repo-path>] [--ref <ref>] [--skill <name>] [--all]\n' };
       const parsed = parseSkillInstallSource(source);
+      const selection = {
+        skillNames: selectedSkillNames(args),
+        all: hasFlag(args, '--all'),
+        fullDepth: hasFlag(args, '--full-depth'),
+      };
       if (parsed.kind === 'local') {
-        const pkg = installLocalSkill(parsed.value, { link: hasFlag(args, '--link') });
-        return { code: 0, stdout: `installed ${pkg.name}\n`, stderr: '' };
+        const pkgs = installLocalSkillsFromSource(parsed.value, { link: hasFlag(args, '--link'), ...selection });
+        return { code: 0, stdout: formatInstalled(pkgs), stderr: '' };
       }
       if (parsed.kind === 'git') {
         const path = argValue(args, '--path');
-        if (!path) return { code: 2, stdout: '', stderr: 'git install requires --path <skill-path>\n' };
-        const pkg = installGitSkill({ url: parsed.value, path, ref: argValue(args, '--ref') });
-        return { code: 0, stdout: `installed ${pkg.name}\n`, stderr: '' };
+        if (path) {
+          const pkg = installGitSkill({ url: parsed.value, path, ref: argValue(args, '--ref') });
+          return { code: 0, stdout: `installed ${pkg.name}\n`, stderr: '' };
+        }
+        const pkgs = installGitSkillsFromSource({ url: parsed.value, ref: argValue(args, '--ref'), ...selection });
+        return { code: 0, stdout: formatInstalled(pkgs), stderr: '' };
       }
       const gh = parsed.github;
       if (!gh) return { code: 2, stdout: '', stderr: 'invalid github source\n' };
       const path = argValue(args, '--path') ?? gh.path;
-      if (!path) return { code: 2, stdout: '', stderr: 'github install requires a repo path or --path <skill-path>\n' };
       // Fall back to the ref parsed from a browser URL (…/tree/<ref>/…) when
       // --ref isn't given, matching the dashboard install path.
       const ref = argValue(args, '--ref') ?? gh.ref;
-      const sourceOverride: SkillSource = { type: 'github', owner: gh.owner, repo: gh.repo, path, ...(ref ? { ref } : {}) };
-      const pkg = installGitSkill({
+      const sourceOverride: SkillSource = { type: 'github', owner: gh.owner, repo: gh.repo, path: path ?? '.', ...(ref ? { ref } : {}) };
+      if (path) {
+        const pkg = installGitSkill({
+          url: githubToGitUrl(gh.owner, gh.repo),
+          path,
+          ref,
+          sourceOverride,
+        });
+        return { code: 0, stdout: `installed ${pkg.name}\n`, stderr: '' };
+      }
+      const pkgs = installGitSkillsFromSource({
         url: githubToGitUrl(gh.owner, gh.repo),
-        path,
         ref,
         sourceOverride,
+        ...selection,
       });
-      return { code: 0, stdout: `installed ${pkg.name}\n`, stderr: '' };
+      return { code: 0, stdout: formatInstalled(pkgs), stderr: '' };
     }
     if (sub === 'remove') {
       const name = args[1];

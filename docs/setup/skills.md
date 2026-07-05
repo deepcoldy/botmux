@@ -49,14 +49,18 @@ botmux skill resources deploy-runbook
 
 ```bash
 botmux skills install ./skills/deploy-runbook
+botmux skills install ./skills --skill deploy-runbook
 botmux skills install ./skills/deploy-runbook --link
 ```
 
 `--link` 用于开发态，registry 记录原目录；不加 `--link` 会 vendor copy 到 `~/.botmux/skills/store`。
 
-Git 仓库安装：
+Git 仓库安装可以直接给仓库根目录。仓库里只有一个 Skill 时会直接安装；多个 Skill 时先用 `discover` 查看候选，再用 `--skill` 指定一个或用 `--all` 安装全部：
 
 ```bash
+botmux skills discover git+https://github.com/acme/agent-skills.git
+botmux skills install git+https://github.com/acme/agent-skills.git --skill deploy-runbook
+botmux skills install git+https://github.com/acme/agent-skills.git --all
 botmux skills install git+https://github.com/acme/agent-skills.git --path skills/deploy-runbook
 botmux skills install git@github.com:acme/agent-skills.git --path skills/deploy-runbook --ref v1.2.0
 ```
@@ -64,6 +68,7 @@ botmux skills install git@github.com:acme/agent-skills.git --path skills/deploy-
 GitHub 简写：
 
 ```bash
+botmux skills install github:acme/agent-skills --skill deploy-runbook
 botmux skills install github:acme/agent-skills/skills/deploy-runbook
 botmux skills install github:acme/agent-skills --path skills/deploy-runbook --ref main
 ```

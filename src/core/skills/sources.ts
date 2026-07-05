@@ -134,10 +134,15 @@ export function parseSkillInstallSource(raw: string): ParsedSkillInstallSource {
     };
   }
   assertNoGitUrlCredentials(raw);
+  if (raw.startsWith('git+')) {
+    const value = raw.replace(/^git\+/, '');
+    assertAllowedGitProtocol(value);
+    return { kind: 'git', value };
+  }
   const githubSource = parseGitHubBrowserUrl(raw);
   if (githubSource) return githubSource;
-  if (raw.startsWith('git+') || raw.endsWith('.git') || raw.startsWith('git@')) {
-    const value = raw.replace(/^git\+/, '');
+  if (raw.endsWith('.git') || raw.startsWith('git@')) {
+    const value = raw;
     assertAllowedGitProtocol(value);
     return { kind: 'git', value };
   }
