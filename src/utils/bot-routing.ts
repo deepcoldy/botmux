@@ -103,12 +103,40 @@ export function hasKnownBotMention(
 }
 
 /**
+ * Blank out Markdown code spans/blocks so a bot name written *inside code* — an
+ * example command in backticks, a fenced snippet, a quoted `@Bot` in an
+ * explanation — is NOT mistaken for a real `@Bot` handoff by the prose
+ * auto-injection scanner (which would otherwise wake that bot). Only presence
+ * detection needs to be code-aware; positions are irrelevant, so each matched
+ * region collapses to a single space.
+ *
+ * Fenced blocks (a run of ≥3 backticks or ≥3 tildes, closed by an equal-length
+ * run) are removed first so their fences aren't misread as inline runs; then
+ * balanced inline backtick runs (`…`, ``…``) go. `~~strike~~` (double tilde) is
+ * NOT a fence and is deliberately left intact — an @Bot inside strikethrough is
+ * still a real prose mention. Unbalanced stray backticks are harmless literals.
+ */
+export function stripCodeSpans(text: string): string {
+  return text
+    .replace(/(`{3,}|~{3,})[\s\S]*?\1/g, ' ')
+    .replace(/(`+)[\s\S]*?\1/g, ' ');
+}
+
+/**
  * Decide who a botmux-generated reply should @ in the footer.
  *
- * The footer is an implicit convenience for human readers. It must not wake a
+ * The footer's `发送给：@owner` is an implicit convenience for human readers —
+ * it is NOT the message's explicit @ targets (those come from --mention /
+ * --mention-back / prose @Name and are rendered separately). It must not wake a
  * bot: bot-to-bot routing should be explicit in the message body/--mention.
- * When the body already contains an explicit bot target, keep the footer on a
- * human owner if one exists; only bot recipients are suppressed.
+ *
+ * When the reply explicitly targets a known bot (a handoff), this default
+ * owner-courtesy ping is redundant noise, so it is suppressed entirely
+ * (`sendTo: undefined`). To also loop a human in on a handoff, the caller opts
+ * in explicitly via --mention-back / --mention <owner>, which land in
+ * `mentions[]` and render regardless of this function — i.e. owner-addressing
+ * is opt-IN for handoffs, not opt-out. Without an explicit bot target the
+ * default addressing (owner / oncall last-caller) is unchanged.
  */
 export function buildFooterAddressing(
   s: { ownerOpenId?: string; lastCallerOpenId?: string },
@@ -122,12 +150,19 @@ export function buildFooterAddressing(
   const botIds = opts.knownBotOpenIds ?? new Set<string>();
   const ownerHuman = owner && !botIds.has(owner) ? owner : undefined;
 
+  // Explicit bot handoff → drop the default owner/caller courtesy ping. The
+  // message is addressed to another bot; a human who should see it is added
+  // explicitly (--mention-back) and rides in mentions[], not here.
+  if (opts.hasExplicitBotMention) return { sendTo: undefined, cc: [] };
+
   if (!opts.isOncall) return { sendTo: ownerHuman, cc: [] };
 
   const caller = s.lastCallerOpenId ?? owner;
   const callerIsBot = !!caller && botIds.has(caller);
 
-  if (opts.hasExplicitBotMention || callerIsBot) {
+  // Oncall + last caller is a bot (but this reply itself has no explicit bot
+  // target) → fall back to the human owner rather than pinging the bot caller.
+  if (callerIsBot) {
     return { sendTo: ownerHuman, cc: [] };
   }
 

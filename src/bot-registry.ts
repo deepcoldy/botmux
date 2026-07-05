@@ -258,6 +258,14 @@ export interface BotConfig {
   brand?: Brand;
   /** Optional process-name suffix; the daemon's process name is rendered as `botmux-<name>` (defaults to `botmux-<index>`). */
   name?: string;
+  /**
+   * 自定义展示名（备注名）。设置后 dashboard 全站（名册 / 会话列表 / 各 bot
+   * 下拉）用它替代飞书探测到的应用名展示；未设置则跟随飞书名称。纯展示字段：
+   * 不影响 pm2 进程名（那是 {@link name}）、不改飞书群内显示的应用名（开放
+   * 平台无改名 API，只能在开发者后台改）、也不进跨 bot @ 路由的 bots-info
+   * 名册。可从 dashboard Bot Defaults 页或 `/config displayName` 修改，热更新。
+   */
+  displayName?: string;
   cliId: CliId;
   cliPathOverride?: string;
   /**
@@ -770,6 +778,15 @@ export function getAllBots(): BotState[] {
   return Array.from(bots.values());
 }
 
+/**
+ * Bot 的有效展示名：自定义 displayName > 飞书探测名 botName > larkAppId。
+ * 仅用于展示面（dashboard descriptor / SessionRow）；@ 路由与 bots-info
+ * 名册仍用飞书真名。
+ */
+export function effectiveBotDisplayName(state: BotState): string {
+  return state.config.displayName || state.botName || state.config.larkAppId;
+}
+
 /** Lookup the oncall binding for a given bot+chat, if any. */
 export function findOncallChat(larkAppId: string, chatId: string): OncallChat | undefined {
   const bot = bots.get(larkAppId);
@@ -1119,6 +1136,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
+      displayName: typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : undefined,
       cliId: entry.cliId ?? 'claude-code',
       cliPathOverride: entry.cliPathOverride,
       wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()

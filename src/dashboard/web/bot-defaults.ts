@@ -30,6 +30,94 @@ export function displayCliId(bot: any, sessionFallback: string): string {
   return typeof bot?.cliId === 'string' && bot.cliId ? bot.cliId : sessionFallback;
 }
 
+// 飞书 Web 登录态刷新 modal：POST /api/feishu-login/start 起扫码流程，轮询
+// /api/feishu-login/status 展示二维码/进度，扫码成功后回调 onSuccess（重试改名）。
+// 机器级单例流程，同一时刻只需一个 overlay。
+function openFeishuLoginModal(onSuccess: () => void): void {
+  document.querySelector('.feishu-login-overlay')?.remove();
+  const overlay = document.createElement('div');
+  overlay.className = 'feishu-login-overlay';
+  overlay.innerHTML = `
+    <div class="feishu-login-modal" role="dialog" aria-modal="true">
+      <button type="button" class="feishu-login-close" data-close aria-label="${escapeHtml(t('feishuLogin.close'))}">✕</button>
+      <h3 class="feishu-login-title">${escapeHtml(t('feishuLogin.title'))}</h3>
+      <p class="feishu-login-hint" data-hint>${escapeHtml(t('feishuLogin.starting'))}</p>
+      <div class="feishu-login-qr" data-qr></div>
+      <div class="feishu-login-actions">
+        <button type="button" class="primary" data-retry hidden>${escapeHtml(t('feishuLogin.retry'))}</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const hintEl = overlay.querySelector<HTMLElement>('[data-hint]')!;
+  const qrEl = overlay.querySelector<HTMLElement>('[data-qr]')!;
+  const retryBtn = overlay.querySelector<HTMLButtonElement>('[data-retry]')!;
+  let timer: number | null = null;
+  const stopTimer = () => { if (timer !== null) { window.clearInterval(timer); timer = null; } };
+  const cleanup = () => { stopTimer(); overlay.remove(); };
+
+  overlay.addEventListener('click', (e) => {
+    const el = e.target as HTMLElement;
+    if (el === overlay || el.closest('[data-close]')) cleanup();
+  });
+
+  function render(login: any): 'active' | 'done' {
+    if (!login) return 'active';
+    if (login.status === 'awaiting_scan' && login.qrDataUrl) {
+      qrEl.innerHTML = `<img class="qr-image" src="${login.qrDataUrl}" alt="${escapeHtml(t('feishuLogin.qrAlt'))}">`;
+      hintEl.textContent = login.message || t('feishuLogin.scanHint');
+      retryBtn.hidden = true;
+      return 'active';
+    }
+    if (login.status === 'starting') {
+      hintEl.textContent = login.message || t('feishuLogin.starting');
+      return 'active';
+    }
+    if (login.status === 'success') {
+      stopTimer();
+      qrEl.innerHTML = '';
+      hintEl.textContent = t('feishuLogin.success');
+      window.setTimeout(() => { cleanup(); onSuccess(); }, 900);
+      return 'done';
+    }
+    // failed
+    stopTimer();
+    qrEl.innerHTML = '';
+    hintEl.textContent = t('feishuLogin.failed', { reason: login.message || login.reason || '' });
+    retryBtn.hidden = false;
+    return 'done';
+  }
+
+  async function poll(): Promise<void> {
+    try {
+      const r = await fetch('/api/feishu-login/status');
+      const body = await r.json().catch(() => ({}));
+      render(body.login);
+    } catch { /* transient — keep polling */ }
+  }
+
+  async function begin(): Promise<void> {
+    stopTimer();
+    hintEl.textContent = t('feishuLogin.starting');
+    qrEl.innerHTML = '';
+    retryBtn.hidden = true;
+    let phase: 'active' | 'done' = 'active';
+    try {
+      const r = await fetch('/api/feishu-login/start', { method: 'POST' });
+      const body = await r.json().catch(() => ({}));
+      phase = render(body.login);
+    } catch (e: any) {
+      hintEl.textContent = t('feishuLogin.failed', { reason: e?.message ?? String(e) });
+      retryBtn.hidden = false;
+      return;
+    }
+    if (phase === 'active' && timer === null) timer = window.setInterval(() => void poll(), 1500);
+  }
+
+  retryBtn.addEventListener('click', () => void begin());
+  void begin();
+}
+
 type BotProfileRoleItem = {
   profileId: string;
   loaded?: boolean;
@@ -276,9 +364,22 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
       <header class="bd-profile-head">
         ${botAvatarHtml({ name, larkAppId: b.larkAppId, dot: 'ok' })}
         <div class="bd-profile-id">
-          <strong>${escapeHtml(name)}</strong>
+          <span class="bd-name-row" data-name-row>
+            <strong data-bot-name>${escapeHtml(name)}</strong>
+            <button type="button" class="bd-name-edit" data-action="edit-bot-name"
+              title="${escapeHtml(t('botDefaults.renameTitle'))}" aria-label="${escapeHtml(t('botDefaults.renameTitle'))}">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
+            </button>
+          </span>
+          <span class="bd-name-editor" data-name-editor hidden>
+            <input type="text" class="bd-name-input" data-input="botRename" maxlength="64" value="${escapeHtml(name)}">
+            <button type="button" class="primary" data-action="save-bot-name">${t('botDefaults.renameSave')}</button>
+            <button type="button" data-action="cancel-bot-name">${t('botDefaults.renameCancel')}</button>
+          </span>
           ${cli ? `<span class="mate-role">${escapeHtml(cli)}</span>` : ''}
           <code>${escapeHtml(b.larkAppId)}</code>
+          <small class="bd-name-status oncall-status" data-name-status></small>
+          <button type="button" class="bd-feishu-login" data-action="feishu-login" hidden>${t('feishuLogin.entry')}</button>
         </div>
         <div class="bd-profile-meta bd-meta">
           <small class="bd-meta-ok">● ${t('botDefaults.metaOnline')}</small>
@@ -1021,6 +1122,122 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
       }
       if (brandResetBtn) {
         brandResetBtn.addEventListener('click', () => putBrand(null, brandResetBtn));
+      }
+
+      // ── 机器人改名（档案头 ✎ → 行内输入框）────────────────────────────────
+      // 主路径走飞书开放平台真改应用名（daemon 侧自动建版发布，约 5-10 秒）；
+      // 失败自动降级为仅改 dashboard 展示名并明示原因。成功后就地更新卡片标题、
+      // 左侧名册与缓存，不整卡重绘（避免吹掉状态提示）。
+      const nameRowEl = card.querySelector<HTMLElement>('[data-name-row]');
+      const nameEditorEl = card.querySelector<HTMLElement>('[data-name-editor]');
+      const nameStrongEl = card.querySelector<HTMLElement>('[data-bot-name]');
+      const nameInputEl = card.querySelector<HTMLInputElement>('input[data-input=botRename]');
+      const nameEditBtn = card.querySelector<HTMLButtonElement>('button[data-action=edit-bot-name]');
+      const nameSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-bot-name]');
+      const nameCancelBtn = card.querySelector<HTMLButtonElement>('button[data-action=cancel-bot-name]');
+      const nameStatusEl = card.querySelector<HTMLElement>('[data-name-status]');
+      const feishuLoginBtn = card.querySelector<HTMLButtonElement>('button[data-action=feishu-login]');
+
+      function setNameEditMode(on: boolean): void {
+        if (!nameRowEl || !nameEditorEl) return;
+        nameRowEl.hidden = on;
+        nameEditorEl.hidden = !on;
+        if (on && nameInputEl) {
+          nameInputEl.value = nameStrongEl?.textContent ?? '';
+          nameInputEl.focus();
+          nameInputEl.select();
+        }
+      }
+
+      function renameWarningText(warning: string, message?: string): string {
+        const known = ['no_session', 'session_expired', 'no_access', 'unsupported_brand'];
+        const detail = known.includes(warning)
+          ? t(`botDefaults.renameWarn.${warning}`)
+          : (message || warning);
+        return t('botDefaults.renameLocalOnly', { reason: detail });
+      }
+
+      async function submitRename(): Promise<void> {
+        if (!nameInputEl || !nameStatusEl) return;
+        const name = nameInputEl.value.trim();
+        if (!name) {
+          nameStatusEl.textContent = `✗ ${t('botDefaults.renameEmpty')}`;
+          nameStatusEl.className = 'bd-name-status oncall-status hint-warn-inline';
+          return;
+        }
+        nameInputEl.disabled = true;
+        if (nameSaveBtn) nameSaveBtn.disabled = true;
+        if (nameCancelBtn) nameCancelBtn.disabled = true;
+        nameStatusEl.className = 'bd-name-status oncall-status';
+        nameStatusEl.textContent = `⏳ ${t('botDefaults.renaming')}`;
+        try {
+          const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/rename`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ name }),
+          });
+          const body = await r.json().catch(() => ({}));
+          if (r.ok && body.ok) {
+            const effective: string = (typeof body.botName === 'string' && body.botName) ? body.botName : name;
+            const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+            if (cached) {
+              cached.botName = effective;
+              if (body.mode === 'feishu') { cached.larkBotName = name; cached.displayName = null; }
+              else cached.displayName = name;
+            }
+            if (nameStrongEl) nameStrongEl.textContent = effective;
+            const rosterName = rosterEl.querySelector<HTMLElement>(`.bd-roster-item[data-appid="${CSS.escape(appId)}"] .bd-roster-tx b`);
+            if (rosterName) rosterName.textContent = effective;
+            setNameEditMode(false);
+            if (body.mode === 'feishu') {
+              nameStatusEl.textContent = `✓ ${t('botDefaults.renameOkFeishu')}`;
+              nameStatusEl.classList.add('hint-ok');
+              if (feishuLoginBtn) feishuLoginBtn.hidden = true;
+            } else {
+              nameStatusEl.textContent = `⚠ ${renameWarningText(String(body.warning ?? ''), body.message)}`;
+              nameStatusEl.classList.add('hint-warn-inline');
+              if (typeof body.message === 'string' && body.message) nameStatusEl.title = body.message;
+              // 登录态缺失/过期 → 亮出「扫码登录」，让用户当场刷登录态后重试真改名。
+              const needsLogin = body.warning === 'no_session' || body.warning === 'session_expired';
+              if (feishuLoginBtn) feishuLoginBtn.hidden = !needsLogin;
+            }
+          } else {
+            nameStatusEl.textContent = `✗ ${t('botDefaults.renameFailed', { error: String(body.error ?? r.status) })}`;
+            nameStatusEl.classList.add('hint-warn-inline');
+          }
+        } catch (e: any) {
+          nameStatusEl.textContent = `✗ ${t('botDefaults.renameFailed', { error: e?.message ?? String(e) })}`;
+          nameStatusEl.classList.add('hint-warn-inline');
+        } finally {
+          nameInputEl.disabled = false;
+          if (nameSaveBtn) nameSaveBtn.disabled = false;
+          if (nameCancelBtn) nameCancelBtn.disabled = false;
+        }
+      }
+
+      if (nameEditBtn) {
+        nameEditBtn.addEventListener('click', () => {
+          if (nameStatusEl) { nameStatusEl.textContent = ''; nameStatusEl.className = 'bd-name-status oncall-status'; }
+          if (feishuLoginBtn) feishuLoginBtn.hidden = true;
+          setNameEditMode(true);
+        });
+      }
+      // 「扫码登录飞书」→ 弹二维码 modal，扫码成功后自动重试真改名。
+      if (feishuLoginBtn) {
+        feishuLoginBtn.addEventListener('click', () => {
+          openFeishuLoginModal(() => {
+            feishuLoginBtn.hidden = true;
+            void submitRename();
+          });
+        });
+      }
+      if (nameCancelBtn) nameCancelBtn.addEventListener('click', () => setNameEditMode(false));
+      if (nameSaveBtn) nameSaveBtn.addEventListener('click', () => void submitRename());
+      if (nameInputEl) {
+        nameInputEl.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') { e.preventDefault(); void submitRename(); }
+          else if (e.key === 'Escape') setNameEditMode(false);
+        });
       }
 
       // ── Card behaviour toggles (auto-save on change) ──────────────────────

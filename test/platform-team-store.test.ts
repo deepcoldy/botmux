@@ -13,6 +13,7 @@ import {
   getPlatformTeamSyncRev,
   isPlatformTeamBot,
   isPlatformHallChat,
+  isPlatformTeamMemberChat,
   listPlatformTeams,
   PLATFORM_TEAM_PREFIX,
 } from '../src/services/platform-team-store.js';
@@ -22,8 +23,12 @@ let dataDir: string;
 beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'botmux-pfteam-')); });
 
 const payload = (rev: string, teams: unknown[]) => ({ rev, teams });
-const team = (teamId: string, chatIds: string[], bots: Array<{ appId: string; unionId?: string }>) =>
-  ({ teamId, teamName: teamId, groupChatIds: chatIds, bots });
+const team = (
+  teamId: string,
+  chatIds: string[],
+  bots: Array<{ appId: string; unionId?: string }>,
+  memberUnionIds: string[] = [],
+) => ({ teamId, teamName: teamId, groupChatIds: chatIds, bots, memberUnionIds });
 
 describe('applyPlatformTeamSync', () => {
   it('persists rev + teams and answers the roster predicate', () => {
@@ -81,6 +86,27 @@ describe('applyPlatformTeamSync', () => {
     // 团队消失后不再命中（follow membership，无残留信任面）
     applyPlatformTeamSync(dataDir, payload('rev2', []));
     expect(isPlatformHallChat(dataDir, 'oc_hall_a')).toBe(false);
+  });
+
+  it('isPlatformTeamMemberChat: member in a team group → true; scoped to same team, talk-only', () => {
+    applyPlatformTeamSync(dataDir, payload('rev1', [
+      team('t1', ['oc_hall1', 'oc_group1'], [{ appId: 'cli_a', unionId: 'on_bot' }], ['on_alice', 'on_bob']),
+      team('t2', ['oc_hall2'], [{ appId: 'cli_b', unionId: 'on_bot2' }], ['on_carol']),
+    ]));
+    // 成员在本团队的群里（大厅或协作群）→ true
+    expect(isPlatformTeamMemberChat(dataDir, 'oc_hall1', 'on_alice')).toBe(true);
+    expect(isPlatformTeamMemberChat(dataDir, 'oc_group1', 'on_bob')).toBe(true);
+    // 跨团队不泄漏：t2 成员在 t1 群里 → false；t1 成员在 t2 群里 → false
+    expect(isPlatformTeamMemberChat(dataDir, 'oc_hall1', 'on_carol')).toBe(false);
+    expect(isPlatformTeamMemberChat(dataDir, 'oc_hall2', 'on_alice')).toBe(false);
+    // 非成员 union、非团队群、空值 → false
+    expect(isPlatformTeamMemberChat(dataDir, 'oc_hall1', 'on_bot')).toBe(false); // bot 不是 member
+    expect(isPlatformTeamMemberChat(dataDir, 'oc_other', 'on_alice')).toBe(false);
+    expect(isPlatformTeamMemberChat(dataDir, '', 'on_alice')).toBe(false);
+    expect(isPlatformTeamMemberChat(dataDir, 'oc_hall1', undefined)).toBe(false);
+    // 团队消失 → 不再命中
+    applyPlatformTeamSync(dataDir, payload('rev2', []));
+    expect(isPlatformTeamMemberChat(dataDir, 'oc_hall1', 'on_alice')).toBe(false);
   });
 
   it('rejects a payload without rev and sanitizes malformed teams', () => {

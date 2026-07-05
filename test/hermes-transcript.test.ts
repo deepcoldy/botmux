@@ -54,7 +54,7 @@ describe('hermes transcript reader', () => {
     expect(drainHermesStateDb(1, '/tmp/state.db')).toEqual({
       newOffset: 5,
       events: [
-        { uuid: 'hermes:2', timestampMs: 100000, kind: 'user', text: 'hello', sourceSessionId: 'h1' },
+        { uuid: 'hermes:2', timestampMs: 100000, kind: 'user', text: 'hello', sourceSessionId: 'h1', preserveMarkTimeMs: true },
         { uuid: 'hermes:4', timestampMs: 102000, kind: 'assistant_final', text: 'hi', sourceSessionId: 'h1' },
       ],
     });

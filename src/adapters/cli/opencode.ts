@@ -153,7 +153,10 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'opencode',
-    authPaths: ['~/.local/share/opencode/auth.json'],
+    // Whole dir kept REAL, not just auth.json: opencode keeps its global SQLite DB
+    // (opencode.db, WAL mode) here, and the sandbox home overlay lacks the POSIX
+    // fcntl locks SQLite needs (same failure as codex, see codex.ts).
+    authPaths: ['~/.local/share/opencode'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, initialPrompt, model }) {

@@ -78,6 +78,7 @@ import {
   hasKnownBotMention,
   knownBotOpenIdsFromCrossRef,
   orderedFooterRecipients,
+  stripCodeSpans,
   type BotMentionEntry,
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
@@ -1274,6 +1275,9 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
     }
 
     const index = existing.length;
+    // daemon 在跑就直接把新 bot 那一个进程拉起来，免整组 botmux restart。
+    const live = ensureBotDaemonStarted(bot.larkAppId, { quiet: cmd.json });
+    const next = live.ok ? 'live' : (live.reason === 'fleet_down' ? 'botmux start' : 'botmux restart');
     if (cmd.json) {
       console.log(JSON.stringify({
         ok: true,
@@ -1282,7 +1286,8 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
         botsFile: BOTS_JSON_FILE,
         envMigrated: migratedEnv || undefined,
         openPlatform: cmd.openPlatformAuto ? 'attempted' : 'skipped',
-        next: 'botmux restart',
+        live,
+        next,
       }, null, 2));
     } else {
       console.log(`✅ 已添加机器人 ${botProcessName(bot, index, PM2_NAME)} (${bot.larkAppId})，共 ${index + 1} 个`);
@@ -1291,7 +1296,13 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
       if (!cmd.openPlatformAuto) {
         console.log('   已跳过开放平台自动配置（权限导入/发版）。需要时加 --open-platform-auto（要扫码），或运行交互式 botmux setup。');
       }
-      console.log('下一步: botmux restart');
+      if (live.ok) {
+        console.log(`✅ 已自动上线（${live.processName}），无需重启其它机器人。`);
+      } else if (live.reason === 'fleet_down') {
+        console.log('下一步: botmux start（daemon 尚未运行）');
+      } else {
+        console.log(`⚠️  自动上线失败（${live.message}）。下一步: botmux restart`);
+      }
     }
     return;
   }
@@ -1567,7 +1578,7 @@ async function cmdSetup(): Promise<void> {
     console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length + 1} 个`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot));
-    console.log(`下一步: botmux restart\n`);
+    printAddBotLiveHint(newBot.larkAppId);
     return;
     }
 
@@ -1624,7 +1635,7 @@ async function cmdSetup(): Promise<void> {
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     console.log(`   旧配置已备份: ${ENV_FILE}.bak`);
     await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot));
-    console.log(`下一步: botmux restart\n`);
+    printAddBotLiveHint(newBot.larkAppId);
 
   } else {
     // --- Fresh install ---
@@ -1938,6 +1949,120 @@ async function cmdRestart(): Promise<void> {
     console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
   }
   await printDashboardHintWithRetry();
+}
+
+/**
+ * pm2 process list filtered to botmux entries (bot daemons + dashboard). Returns
+ * `[]` when pm2 isn't running or has no botmux apps at all.
+ */
+function listBotmuxPm2Apps(): Array<{ name: string; online: boolean }> {
+  try {
+    const apps = JSON.parse(pm2Capture(['jlist'])) as any[];
+    return (Array.isArray(apps) ? apps : [])
+      .filter(a => a && (a.name === PM2_NAME || String(a.name).startsWith(`${PM2_NAME}-`)))
+      .map(a => ({ name: String(a.name), online: a?.pm2_env?.status === 'online' }));
+  } catch {
+    return [];
+  }
+}
+
+export type StartBotLiveResult =
+  | { ok: true; state: 'started' | 'already-online'; processName: string }
+  | { ok: false; reason: 'not_found' | 'fleet_down' | 'pm2_error'; message: string };
+
+/**
+ * Bring a SINGLE bot's daemon online without touching any other bot's process.
+ * The key to "add a bot without `botmux restart`": a new bot is always APPENDED
+ * to bots.json (stable index), so the existing daemons (indices 0..N-1) keep
+ * running unchanged — we only need to spawn the new bot's own process.
+ *
+ * We regenerate ecosystem.config.json (which now includes the new app at index
+ * N) and run `pm2 start --only <processName>`, which starts exactly that one app
+ * and leaves every already-online daemon untouched (unlike `botmux restart`,
+ * which tears down the whole fleet). The new daemon runs its slice of
+ * startDaemon() — registerBot + WSClient long-connection + descriptor publish —
+ * so it starts receiving Feishu messages and the dashboard auto-discovers it via
+ * its freshly-written descriptor.
+ *
+ * Idempotent: a no-op when the target is already online. When the whole fleet is
+ * down (no botmux pm2 apps — the dashboard itself isn't running either), we do
+ * NOT start a lone bot; that case belongs to `botmux start`, which brings up the
+ * entire ecosystem (all bots + dashboard).
+ */
+function ensureBotDaemonStarted(appId: string, opts: { quiet?: boolean } = {}): StartBotLiveResult {
+  const bots = loadBotsJson();
+  const index = bots.findIndex(b => b?.larkAppId === appId);
+  if (index < 0) {
+    return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
+  }
+  const processName = botProcessName(bots[index], index, PM2_NAME);
+
+  const running = listBotmuxPm2Apps();
+  if (running.length === 0) {
+    return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start' };
+  }
+  if (running.some(a => a.name === processName && a.online)) {
+    return { ok: true, state: 'already-online', processName };
+  }
+
+  const cfg = ecosystemConfig();
+  try {
+    // `--only <name>` filters the ecosystem to just this app, so pm2 starts only
+    // the new bot's daemon and never restarts the already-online ones.
+    runPm2(['start', cfg, '--only', processName], !opts.quiet);
+  } catch (e) {
+    return { ok: false, reason: 'pm2_error', message: e instanceof Error ? e.message : String(e) };
+  }
+  return { ok: true, state: 'started', processName };
+}
+
+/**
+ * `botmux start-bot <larkAppId>` — bring one freshly-added bot online without a
+ * fleet-wide restart. Invoked by `botmux setup add` (inline) and by the
+ * dashboard onboarding flow (spawned as a subprocess). `--json` for scripted
+ * callers.
+ */
+async function cmdStartBot(argv: string[]): Promise<void> {
+  const wantsJson = argv.includes('--json');
+  const appId = argv.find(a => !a.startsWith('-'));
+  if (!appId) {
+    const msg = '用法: botmux start-bot <larkAppId> —— 拉起单个新机器人的 daemon（不重启其它 bot）';
+    if (wantsJson) console.log(JSON.stringify({ ok: false, reason: 'missing_app_id', message: msg }));
+    else console.error(`❌ ${msg}`);
+    process.exit(1);
+  }
+  ensureConfigDir();
+  const r = ensureBotDaemonStarted(appId, { quiet: wantsJson });
+  if (wantsJson) {
+    console.log(JSON.stringify(r, null, 2));
+    if (!r.ok) process.exitCode = 1;
+    return;
+  }
+  if (r.ok) {
+    if (r.state === 'already-online') console.log(`✅ ${r.processName} 已在运行，无需操作`);
+    else console.log(`✅ 已拉起 ${r.processName}（未重启其它机器人）`);
+    return;
+  }
+  if (r.reason === 'fleet_down') {
+    console.error('ℹ️  daemon 未在运行。请用 `botmux start` 启动整个进程组。');
+  } else {
+    console.error(`❌ 拉起失败 (${r.reason}): ${r.message}`);
+  }
+  process.exit(1);
+}
+
+/** Print the post-add "next step" line for interactive setup: auto-start the new
+ *  bot's own daemon when the fleet is up (no fleet-wide restart), else fall back
+ *  to the botmux start / restart hint. */
+function printAddBotLiveHint(appId: string): void {
+  const live = ensureBotDaemonStarted(appId);
+  if (live.ok) {
+    console.log(`✅ 已自动上线（${live.processName}），无需重启其它机器人。\n`);
+  } else if (live.reason === 'fleet_down') {
+    console.log('下一步: botmux start（daemon 尚未运行）\n');
+  } else {
+    console.log(`⚠️  自动上线失败（${live.message}）。下一步: botmux restart\n`);
+  }
 }
 
 /** Wraps `ensureDependencies()`. Fonts are nice-to-have (warn only). tmux is
@@ -4747,6 +4872,12 @@ async function cmdSend(rest: string[]): Promise<void> {
       // bot（正是要避免的循环 @）。botEntries/crossRef 仍需加载供 footer 寻址用。
       if (!noMention) {
       const alreadyMentioned = new Set(mentions.map(m => m.open_id));
+      // Scan a code-span-stripped copy so a bot name quoted inside backticks or a
+      // fenced block (e.g. an example `botmux send --mention @Bot …` or an
+      // explanatory `@Bot`) is not auto-injected as a real handoff — that spurious
+      // <at> would wake a bot the model never meant to @. Explicit --mention still
+      // works (it doesn't go through this prose scan).
+      const textForBotScan = stripCodeSpans(text);
       // Sort by name length desc so longer names ("Claude分身") win over their
       // prefix ("Claude") when both could match — break-on-first-hit otherwise
       // routes "@Claude分身" to Claude.
@@ -4790,7 +4921,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           // `@Claude2` doesn't match name "Claude" and `@Claude分身好的` doesn't
           // either-half-match.
           const re = new RegExp(`(?<![A-Za-z0-9_])@${escName}(?![\\p{L}\\p{N}_])`, 'iu');
-          if (!re.test(text)) continue;
+          if (!re.test(textForBotScan)) continue;
           // Lark open_id is per-app scoped. Use sender-scoped id from cross-ref
           // only — falling back to entry.botOpenId would feed Lark a wrong-scope
           // id (target's self-scoped) and the API would reject it. Skip + warn
@@ -6370,6 +6501,7 @@ switch (command) {
     break;
   }
   case 'start':   await cmdStart(); break;
+  case 'start-bot': await cmdStartBot(process.argv.slice(3)); break;
   case 'stop':    cmdStop(); break;
   case 'restart': await cmdRestart(); break;
   case 'logs':    cmdLogs(); break;

@@ -308,9 +308,12 @@ describe('codex buildArgs', () => {
     expect(args.join('\n')).not.toContain('BOTMUX_TURN_ID');
   });
 
-  it('keeps Codex home untouched', () => {
+  it('keeps the whole ~/.codex real in the sandbox (SQLite needs fcntl locks the home overlay lacks)', () => {
     expect(adapter.buildSpawnEnv).toBeUndefined();
-    expect(adapter.authPaths).toEqual(['~/.codex/auth.json']);
+    // Not just auth.json: codex's state_*.sqlite / logs_*.sqlite live under
+    // ~/.codex and time out (~57s → exit 1) if the dir is on the overlayfs home,
+    // which doesn't support POSIX byte-range locks. Bind the whole dir real.
+    expect(adapter.authPaths).toEqual(['~/.codex']);
     // skillsDir resolves under CODEX_HOME (default ~/.codex) so it tracks where
     // Codex actually scans skills when CODEX_HOME is overridden.
     expect(adapter.skillsDir).toBe(join(codexHome(), 'skills'));
@@ -646,6 +649,12 @@ describe('gemini buildArgs', () => {
 describe('opencode buildArgs', () => {
   const adapter = createOpenCodeAdapter('/usr/bin/opencode');
 
+  it('keeps the whole opencode data dir real in the sandbox (SQLite needs fcntl locks the home overlay lacks)', () => {
+    // Not just auth.json: opencode's global opencode.db (WAL) lives here and
+    // can't lock on the overlayfs home — same failure mode as codex.
+    expect(adapter.authPaths).toEqual(['~/.local/share/opencode']);
+  });
+
   it('returns empty args for basic case', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false });
     expect(args).toEqual([]);
@@ -747,6 +756,10 @@ describe('oh-my-pi buildArgs', () => {
 
 describe('mtr buildArgs', () => {
   const adapter = createMtrAdapter('/usr/bin/mtr');
+
+  it('keeps the whole opencode data dir real in the sandbox (mtr.db needs fcntl locks the home overlay lacks)', () => {
+    expect(adapter.authPaths).toEqual(['~/.local/share/opencode']);
+  });
 
   it('fresh session passes deterministic --set-session and initial prompt', () => {
     const args = adapter.buildArgs({ sessionId: 'bm-session-1', resume: false, initialPrompt: 'hello mtr' });
@@ -1365,5 +1378,20 @@ describe('kimi buildArgs', () => {
 
   it('surfaces curated model choices for setup', () => {
     expect(adapter.modelChoices).toContain('kimi-k2.5');
+  });
+});
+
+describe('traex/coco sandbox authPaths', () => {
+  it('traex keeps the whole ~/.trae/cli real in the sandbox (codex-based, same SQLite lock hazard)', () => {
+    // traex keeps codex-style state_*.sqlite / logs_*.sqlite + rollout sessions
+    // under ~/.trae/cli; the daemon bridge reads them at the REAL path, and the
+    // overlayfs home lacks the fcntl locks SQLite needs (see codex.ts).
+    const adapter = createTraexAdapter('/bin/traex');
+    expect(adapter.authPaths).toEqual(['~/.trae/cli']);
+  });
+
+  it('coco keeps ~/.trae/cli (shared trae state/SQLite) AND ~/.cache/coco (transcripts the bridge reads) real', () => {
+    const adapter = createCocoAdapter('/bin/coco');
+    expect(adapter.authPaths).toEqual(['~/.trae/cli', '~/.cache/coco']);
   });
 });

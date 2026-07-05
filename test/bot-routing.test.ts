@@ -14,6 +14,7 @@ import {
   hasKnownBotMention,
   orderedFooterRecipients,
   pickBotEntryByName,
+  stripCodeSpans,
 } from '../src/utils/bot-routing.js';
 
 type Entry = { larkAppId: string; botName: string | null };
@@ -150,18 +151,20 @@ describe('buildFooterAddressing', () => {
     )).toEqual({ sendTo: 'ou_human_caller', cc: [] });
   });
 
-  it('falls back to the human owner when the body explicitly targets a bot', () => {
+  it('suppresses owner addressing in oncall when the body explicitly targets a bot', () => {
+    // Handoff to another bot: the default owner-courtesy ping is redundant noise
+    // and is dropped. A human is looped in only via explicit --mention-back.
     expect(buildFooterAddressing(
       { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_claude_bot' },
       { isOncall: true, hasExplicitBotMention: true, knownBotOpenIds },
-    )).toEqual({ sendTo: 'ou_owner', cc: [] });
+    )).toEqual({ sendTo: undefined, cc: [] });
   });
 
-  it('keeps human owner footer outside oncall when explicitly targeting a bot', () => {
+  it('suppresses owner addressing outside oncall when explicitly targeting a bot', () => {
     expect(buildFooterAddressing(
       { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_human_caller' },
       { isOncall: false, hasExplicitBotMention: true, knownBotOpenIds },
-    )).toEqual({ sendTo: 'ou_owner', cc: [] });
+    )).toEqual({ sendTo: undefined, cc: [] });
   });
 
   it('drops explicit-bot addressing when the owner is also a bot', () => {
@@ -233,5 +236,46 @@ describe('orderedFooterRecipients', () => {
 
   it('returns empty when nothing to address', () => {
     expect(orderedFooterRecipients({})).toEqual([]);
+  });
+});
+
+describe('stripCodeSpans', () => {
+  // The prose `@Bot` auto-injection scans this stripped copy: a bot name inside
+  // code must NOT survive (else it wakes a bot the model only quoted), while a
+  // name in real prose must survive so a genuine handoff still fires.
+  const hasAt = (s: string, name: string) =>
+    new RegExp(`@${name}(?![\\p{L}\\p{N}_])`, 'u').test(stripCodeSpans(s));
+
+  it('blanks an inline single-backtick code span', () => {
+    expect(hasAt('示例：`botmux send --mention @Codex …`', 'Codex')).toBe(false);
+  });
+
+  it('blanks a double-backtick code span', () => {
+    expect(hasAt('写成 ``@Codex`` 只是举例', 'Codex')).toBe(false);
+  });
+
+  it('blanks a fenced code block', () => {
+    expect(hasAt('```\nbotmux send --mention @Codex\n```', 'Codex')).toBe(false);
+  });
+
+  it('blanks a tilde-fenced code block', () => {
+    expect(hasAt('~~~\nbotmux send --mention @Codex\n~~~', 'Codex')).toBe(false);
+  });
+
+  it('keeps @Bot inside ~~strikethrough~~ (not a fence)', () => {
+    expect(hasAt('~~@Codex~~ 还是要 @', 'Codex')).toBe(true);
+  });
+
+  it('keeps a real prose @Bot so genuine handoffs still match', () => {
+    expect(hasAt('@Codex 你接手一下', 'Codex')).toBe(true);
+  });
+
+  it('keeps prose @Bot even when the same name is also quoted in code', () => {
+    // real handoff in prose + an incidental code mention → still detected
+    expect(hasAt('@Codex 看这条 `--mention @Codex`', 'Codex')).toBe(true);
+  });
+
+  it('leaves an unbalanced stray backtick harmless (name still in prose)', () => {
+    expect(hasAt('这里有个 ` 未闭合，@Codex 仍要 @', 'Codex')).toBe(true);
   });
 });

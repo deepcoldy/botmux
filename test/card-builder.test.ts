@@ -33,6 +33,10 @@ let cardTestHome: string;
 beforeEach(() => {
   cardTestHome = mkdtempSync(join(tmpdir(), 'botmux-card-builder-'));
   vi.stubEnv('HOME', cardTestHome);
+  // The local-CLI button is gated on localTerminalCapable() (headless hosts
+  // hide it) — pin a GUI-looking env so the button assertions below are
+  // deterministic on headless CI runners.
+  vi.stubEnv('DISPLAY', ':0');
   mkdirSync(dirname(globalConfigPath()), { recursive: true });
 });
 afterEach(() => {
@@ -216,7 +220,7 @@ describe('buildSessionCard', () => {
       const actions = findActions(card);
       const terminalBtn = actions[0];
       expect(terminalBtn.type).toBe('primary');
-      expect(terminalBtn.text.content).toContain('打开终端');
+      expect(terminalBtn.text.content).toContain('打开 Web 终端');
       expectDirectUrl(terminalBtn.multi_url.url, URL);
       expectDirectUrl(terminalBtn.multi_url.pc_url, URL);
       expect(terminalBtn.multi_url.android_url).toBe(URL);
@@ -244,6 +248,37 @@ describe('buildSessionCard', () => {
       expect(linkBtn.value.session_id).toBe(SID);
     });
 
+    it('should include local terminal callback button', () => {
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex'));
+      const actions = findActions(card);
+      const localBtn = actions.find((a: any) => a.value?.action === 'open_local_terminal');
+      expect(localBtn).toBeDefined();
+      expect(localBtn.text.content).toContain('打开 Codex');
+      expect(localBtn.multi_url).toBeUndefined();
+      expect(localBtn.value.root_id).toBe(ROOT);
+      expect(localBtn.value.session_id).toBe(SID);
+    });
+
+    it('uses the same local open label for Codex App sessions', () => {
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex-app'));
+      const actions = findActions(card);
+      const localBtn = actions.find((a: any) => a.value?.action === 'open_local_terminal');
+      expect(localBtn.text.content).toContain('打开 Codex');
+      expect(localBtn.text.content).not.toContain('App');
+    });
+
+    // On macOS the host is always terminal-capable, so the hidden state is untestable there.
+    it.skipIf(process.platform === 'darwin')('hides the local terminal button on headless hosts', () => {
+      vi.stubEnv('DISPLAY', undefined);
+      vi.stubEnv('WAYLAND_DISPLAY', undefined);
+      vi.stubEnv('BOTMUX_TERMINAL', undefined);
+      vi.stubEnv('TERMINAL', undefined);
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));
+      const actions = findActions(card);
+      expect(actions.some((a: any) => a.value?.action === 'open_local_terminal')).toBe(false);
+      expect(actions).toHaveLength(3);
+    });
+
     it('should NOT include restart button', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));
       const actions = findActions(card);
@@ -262,20 +297,20 @@ describe('buildSessionCard', () => {
       expect(closeBtn.value.session_id).toBe(SID);
     });
 
-    it('should have exactly 3 buttons (terminal, get_write_link, close)', () => {
+    it('should have exactly 4 buttons (terminal, local terminal, get_write_link, close)', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));
       const actions = findActions(card);
-      expect(actions).toHaveLength(3);
+      expect(actions).toHaveLength(4);
     });
   });
 
   // ── DM card (showManageButtons = true) ─────────────────────────────────
 
   describe('DM card (showManageButtons=true)', () => {
-    it('should label terminal button as "打开可操作终端"', () => {
+    it('should label terminal button as "打开可操作 Web 终端"', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, undefined, true));
       const actions = findActions(card);
-      expect(actions[0].text.content).toContain('打开可操作终端');
+      expect(actions[0].text.content).toContain('打开可操作 Web 终端');
     });
 
     it('should include restart button with CLI display name', () => {
@@ -302,10 +337,10 @@ describe('buildSessionCard', () => {
       expect(closeBtn).toBeDefined();
     });
 
-    it('should have exactly 3 buttons (terminal, restart, close)', () => {
+    it('should have exactly 4 buttons (terminal, local terminal, restart, close)', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, undefined, true));
       const actions = findActions(card);
-      expect(actions).toHaveLength(3);
+      expect(actions).toHaveLength(4);
     });
   });
 
@@ -597,10 +632,10 @@ describe('buildStreamingCard', () => {
       expect(closeBtn.type).toBe('danger');
     });
 
-    it('should have exactly 4 buttons (toggle, terminal, get_write_link, close)', () => {
+    it('should have exactly 5 buttons (toggle, terminal, local terminal, get_write_link, close)', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       const actions = findActions(card);
-      expect(actions).toHaveLength(4);
+      expect(actions).toHaveLength(5);
     });
   });
 
@@ -1253,11 +1288,11 @@ describe('buildPrivateSnapshotCard', () => {
       .flatMap((e: any) => e.actions ?? []);
   }
 
-  it('exposes exactly open-terminal (link), get_write_link, close — no patch-driven controls', () => {
+  it('exposes open-terminal link, local-terminal callback, get_write_link, close — no patch-driven controls', () => {
     const card = build({ screen: 'hello' });
     const btns = allButtons(card);
     const actions = btns.map((b: any) => b.value?.action).filter(Boolean);
-    expect(actions.sort()).toEqual(['close', 'get_write_link']);
+    expect(actions.sort()).toEqual(['close', 'get_write_link', 'open_local_terminal']);
     // open-terminal is a URL button (no callback action)
     const link = btns.find((b: any) => b.multi_url);
     expectDirectUrl(link.multi_url.url, 'https://t.example/ro');

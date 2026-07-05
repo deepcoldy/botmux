@@ -36,6 +36,20 @@ describe('dashboard bot payload helpers', () => {
     });
   });
 
+  it('passes through displayName / larkBotName and normalizes missing to null', () => {
+    const daemon = { larkAppId: 'app_a', botName: '小助手', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, { displayName: '小助手', larkBotName: 'Claude' })).toMatchObject({
+      displayName: '小助手',
+      larkBotName: 'Claude',
+    });
+    // Unset custom name / probe not landed yet → both null.
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ displayName: null, larkBotName: null });
+    expect(botDefaultsPayload(daemon, { displayName: 42, larkBotName: {} })).toMatchObject({
+      displayName: null,
+      larkBotName: null,
+    });
+  });
+
   it('passes through defaultWorkingDir (string) and normalizes missing to null', () => {
     const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
     expect(botDefaultsPayload(daemon, { defaultWorkingDir: '/root/iserver/botmux' })).toMatchObject({

@@ -83,7 +83,7 @@ function getSegmentedRow(cardJson: string, field: string): {
 function labelFragmentFor(field: string): string {
   switch (field) {
     case 'publicReadOnly': return '公开只读模式';
-    case 'openTerminalInFeishu': return '飞书内打开终端';
+    case 'openTerminalInFeishu': return '飞书内打开 Web 终端';
     case 'autoUpdate': return '每日自动更新';
     case 'autoRestart': return '更新后自动重启';
     default: throw new Error('unknown field');

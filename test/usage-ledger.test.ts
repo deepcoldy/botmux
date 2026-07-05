@@ -469,4 +469,31 @@ describe('ownership records', () => {
     const rec = recordOwnershipForDaemonSession(ds, { ledgerDir: dir });
     expect(rec).toMatchObject({ kind: 'ownership', cliSessionId: 'cli-sess-own' });
   });
+
+  it('recordOwnershipForDaemonSession defaults coco cliSessionId to the botmux sessionId', () => {
+    vi.mocked(getSessionTokenUsage).mockReturnValue(null);
+    // botmux spawns coco with `--session-id <botmux sessionId>` and never sets
+    // a separate cliSessionId — without the default no coco ownership marker
+    // was ever written (recordSessionOwnership bails on empty cliSessionId),
+    // so consumers could not exclude the on-disk coco session before its
+    // first usage delta landed.
+    const ds = {
+      larkAppId: 'cli_app',
+      workingDir: '/live-repo',
+      session: {
+        sessionId: 'aee4d7b5-966f-4c04-87fa-9d08aca80a92',
+        cliId: 'coco',
+        chatId: 'oc_chat',
+        title: 'coco 会话',
+      },
+    } as any;
+
+    const rec = recordOwnershipForDaemonSession(ds, { ledgerDir: dir });
+    expect(rec).toMatchObject({
+      kind: 'ownership',
+      cliId: 'coco',
+      sessionId: 'aee4d7b5-966f-4c04-87fa-9d08aca80a92',
+      cliSessionId: 'aee4d7b5-966f-4c04-87fa-9d08aca80a92',
+    });
+  });
 });

@@ -119,7 +119,12 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'coco',
-    authPaths: ['~/.trae/cli/auth.json'],
+    // ~/.trae/cli kept REAL (shared with traex): login + shared Trae state incl.
+    // the codex-style SQLite DBs (fcntl locks don't work on the overlay home).
+    // ~/.cache/coco kept REAL too: the transcript bridge reads events.jsonl at
+    // the REAL ~/.cache/coco/sessions/<sid>/ path (see coco-transcript.ts) — on
+    // the overlay the CLI's writes would be invisible to the daemon.
+    authPaths: ['~/.trae/cli', '~/.cache/coco'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, model, disableCliBypass }) {

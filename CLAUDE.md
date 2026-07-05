@@ -1,6 +1,6 @@
 # botmux
 
-飞书话题群 ↔ AI 编程 CLI 桥接。Daemon 监听飞书消息，每个新话题自动 spawn 一个独立 CLI 进程（Claude Code / Codex / Gemini / Genius / OpenCode / Antigravity / Pi）。
+飞书话题群 ↔ AI 编程 CLI 桥接。Daemon 监听飞书消息，每个新话题自动 spawn 一个独立 CLI 进程（Claude Code / Codex / Gemini 等 20+ 种，完整列表见 README）。
 
 ## 构建 & 运行
 
@@ -12,29 +12,27 @@ pnpm daemon:logs          # 查看日志
 
 - 每次修改后需要 `pnpm build` 然后 `pnpm daemon:restart`
 
-### 全局 `botmux` 指向哪个 checkout（多 checkout 切换）
+### 多 checkout：全局 `botmux` 指向谁
 
-全局 `botmux` 命令走 `~/.botmux/bin/botmux` 这个瘦 wrapper（需 `~/.botmux/bin` 在 PATH 上，一次性写进 shell rc：`export PATH="$HOME/.botmux/bin:$PATH"`）。wrapper 指向哪个 checkout 的 `dist/cli.js`，由「最后写它的人」决定——daemon 启动时会写，本地多 checkout 间切换时用下面命令显式认领：
+全局 `botmux` 命令走 `~/.botmux/bin/botmux` 瘦 wrapper，指向「最后认领的 checkout」的 `dist/cli.js`（daemon 启动时也会写）：
 
 ```bash
-pnpm use:here             # 把全局 botmux wrapper 指向「当前 checkout」（仅改指向，不重启 daemon）
+pnpm use:here             # 把全局 botmux 指向当前 checkout（仅改指向，不重启 daemon）
 pnpm switch:here          # = build + use:here 一步到位
-botmux restart            # use:here 后裸命令已解析到本 checkout，daemon 也从这重启
 BOTMUX_NO_CLAIM=1 pnpm use:here   # 逃生阀：本次不认领
 ```
 
-- 故意**没**挂进 `build`——review/验证别人 PR 时纯 `pnpm build` 不会悄悄抢走全局指向
-- 实现见 `scripts/claim-botmux-bin.mjs`（与 `daemon.ts` 写的 wrapper 同构、幂等）
+纯 `pnpm build` 故意不认领——review/验证别人 PR 时不会悄悄抢走全局指向。实现见 `scripts/claim-botmux-bin.mjs`。
 
 ### 改动需用户手动测试时 → 部署本 checkout 到 live daemon
 
-当某个改动需要用户在飞书里**手动验证**（而非纯单测能覆盖），改完并自测绿后，执行：
+当改动需要用户在飞书里**手动验证**（而非纯单测能覆盖），改完自测绿后执行：
 
 ```bash
 pnpm switch:here && botmux restart
 ```
 
-把本 checkout 的 build 部署到 live daemon 供用户测试（`switch:here` = build + 把全局 `botmux` 指向本 checkout；`botmux restart` 从这里重启 daemon 并自动恢复 active sessions）。否则用户测的还是旧代码（典型症状：新加的命令/配置「找不到」）。⚠️ 这会让**所有 bot** 都跑本 checkout 的 build；测试/合并完成后记得切回 canonical checkout，以免该 review worktree 被删后全局 shim 失效。
+否则用户测的还是旧代码（典型症状：新加的命令/配置「找不到」）。⚠️ 这会让**所有 bot** 都跑本 checkout 的 build；测试/合并完成后记得切回 canonical checkout，以免 review worktree 被删后全局 shim 失效。
 
 ## 模块结构
 
@@ -43,58 +41,33 @@ pnpm switch:here && botmux restart
 - `server.ts` — Web 终端 HTTP 服务（xterm.js）
 - `bot-registry.ts` — 多机器人配置加载 + 状态管理
 - `config.ts` — 全局配置
-- `adapters/cli/` — CLI 适配器（参数构建、输入写入、Skill 目录），每种 CLI 一个文件
-- `skills/` — 开箱即用的 Skill 定义（`botmux-send`/`botmux-schedule`/`botmux-bots`/`botmux-history`/`botmux-quoted`）+ installer
+- `adapters/cli/` — CLI 适配器，每种 CLI 一个文件（新增适配器的完整步骤见 `src/adapters/cli/CLAUDE.md`）
 - `adapters/backend/` — 会话后端：`PtyBackend`、`TmuxBackend`
+- `skills/` — 开箱即用的 Skill 定义 + installer
 - `core/types.ts` — `DaemonSession` 是核心类型，所有模块从此导入
 - `core/` — `worker-pool`、`command-handler`、`session-manager`、`cost-calculator`、`scheduler`
 - `im/lark/` — 飞书：事件路由（`event-dispatcher`）、卡片（`card-builder`/`card-handler`）、API（`client`）、消息解析（`message-parser`）
 - `utils/` — `idle-detector`（CLI 空闲检测）、`terminal-renderer`（xterm.js 截屏）、`logger`
 
+## 影响范围评估（改前必做）
+
+任何改动落地前，先想清楚它波及的**其它平台、其它 CLI、其它会话类型**——本仓库是多 CLI × 多后端 × 多 IM 的横向架构，一处改动很容易踩到共用代码路径。默认「牵一发动全身」，主动排查回归面，别只测自己那条路。
+
+- **跨平台**：改了 macOS 相关逻辑要同时考虑 Linux（daemon 实际跑在 Linux）；涉及路径、shell、进程、PTY、编码的代码尤其要两边都想到
+- **跨 CLI**：改某个 CLI 适配器时，确认没动到 `adapters/cli/` 的共用基类/工具（`shared-hints`、`runner-input`、`registry` 等）或 worker 侧共用逻辑，否则可能连带影响其它 20+ 个 CLI。共用改动要在至少一个「别的 CLI」上验证仍可用
+- **跨后端 / 跨会话类型**：改动涉及 `PtyBackend` vs `TmuxBackend`、话题会话 vs 群会话 vs adopt/restore、sandbox on vs off、v3 workflow vs 普通会话时，逐一核对受影响的组合
+- **改公共层**（`core/`、`config.ts`、`bot-registry.ts`、`im/lark/`）时影响面最大——PR 描述里写清评估结论：动了什么共用路径、哪些平台/CLI/会话类型受影响、各自怎么验证的
+
+## PR 规范
+
+- 标题与 commit message 同格式：`type(scope): 中文描述`
+- 描述用**中文说明**：改了什么、为什么、影响面（涉及哪些模块/会话类型）
+- 附**实际测试验证**：贴出跑过的命令和关键结果（`pnpm build`、`pnpm test`、相关 e2e），不要只写「应该没问题」；需要 live 验证的先 `pnpm switch:here && botmux restart` 在飞书里实测并注明结果
+- UI 类改动（飞书卡片 / dashboard / web 终端）附**截图示意**，让 reviewer 不用跑代码就能看到效果
+
 ## Git 提交 & 发版规范
 
-- **日常提交**：正常 `git commit` + `git push`，不会触发发版
-- **发版**：打 `v*` tag 并 push 即可，GitHub Action 自动从 tag 提取版本号写入 `package.json` 后发布 npm + 创建 GitHub Release
-- **不要**手动修改 `package.json` 的 `version` 字段来发版，CI 会自动处理
-- **正式版（latest）必须从 master 出**：CI 校验被打 tag 的 commit 含最新 `origin/master`（直接在 master 上打 tag，或在已 rebase 到最新 master 的子分支上打）。落后/分叉的分支打正式版会被拒绝。要从非 master 分支灰度，用 `-canary`/`-beta`/`-rc` 后缀走旁路 dist-tag
 - commit message 格式：`type(scope): 中文描述`。`type`（feat/fix/docs/chore 等）和 `scope`（模块名）保留英文，冒号后的描述用中文
-- 发版的 annotated tag message 用中文撰写，CI 会把 tag message 作为 GitHub Release body
-
-### dist-tag 路由（CI 自动判断，不用手动指定）
-
-| tag 格式 | npm dist-tag | GitHub prerelease | 用途 |
-| --- | --- | --- | --- |
-| `v1.2.3` | `latest` | 否 | 正式发版，默认安装 |
-| `v1.2.3-canary.N` | `canary` | 是 | 内测、灰度验证；`npm i botmux@canary` |
-| `v1.2.3-beta.N` | `beta` | 是 | beta 预览 |
-| `v1.2.3-rc.N` | `rc` | 是 | 发版候选 |
-| 其它带 `-` 后缀 | `next` | 是 | 兜底，不污染 latest |
-
-**canary 不会覆盖 latest**，stable 用户依旧拿 stable。要验证 canary：`npm i -g botmux@canary` 或 `npx botmux@canary`。
-
-```bash
-# 日常开发
-git add <files> && git commit -m "fix(cli): 修复某某问题" && git push
-
-# 正式发版（仅在用户明确要求时执行）
-git tag -a v1.x.x -m "中文 changelog 标题
-
-详细改动说明..."
-git push origin v1.x.x
-
-# Canary 发版（基于待发正式版号，递增 .N）
-git tag -a v1.x.x-canary.0 -m "canary: 加诊断日志排查截图卡死
-
-详细改动说明..."
-git push origin v1.x.x-canary.0
-```
-
-## 添加新 CLI 适配器
-
-1. `src/adapters/cli/` 下创建新文件，实现 `CliAdapter` 接口
-2. `src/adapters/cli/types.ts` 的 `CliId` 联合类型中添加新 ID
-3. `src/adapters/cli/registry.ts` 添加 import、switch case、export
-4. `src/worker.ts` 的 `CLI_DISPLAY_NAMES` 添加显示名
-5. `src/im/lark/card-builder.ts` 的 `cliDisplayNames` 添加显示名
-6. `src/setup/bot-config-editor.ts` 的 `CLI_ID_CHOICES`（序号映射，**新 CLI 一律追加到尾部**——历史序号是脚本化 setup 的稳定接口，插位会让老脚本静默选错）+ `CLI_DISPLAY_LABELS`（dashboard 添加机器人下拉的展示名，缺了会回退显示 id）。setup 级联菜单、dashboard 下拉与 sessions 页 CLI 过滤器均从 `CLI_OPTIONS` 派生，自动跟随，无需另改
-7. `README.md`、`README.en.md` 更新 CLI 列表
+- 日常 `git commit` + `git push` 不会触发发版；打 `v*` annotated tag 并 push 才发版（**仅在用户明确要求时**），CI 自动从 tag 提取版本号发布 npm + 创建 GitHub Release
+- **不要**手动修改 `package.json` 的 `version` 字段；tag message 用中文撰写，CI 会用作 Release body
+- **正式版（latest）必须从 master 出**：CI 校验被打 tag 的 commit 含最新 `origin/master`。非 master 分支灰度用 `-canary.N`/`-beta.N`/`-rc.N` 后缀（CI 自动路由到对应 npm dist-tag，其它 `-` 后缀兜底到 `next`，都不污染 latest）；验证 canary：`npm i -g botmux@canary`

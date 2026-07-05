@@ -129,9 +129,16 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // isolation is enforced by the worker's whole-process macOS Seatbelt wrapper.
     // e2e verified: codex under `sandbox-exec -f <profile>` (with bypass) is
     // blocked from denied paths and runs normally; its sessions/auth live in the
-    // per-bot BOT_HOME via CODEX_HOME redirection.
+    // per-bot BOT_HOME via CODEX_HOME redirection. (Read isolation does NOT consult
+    // authPaths — that only feeds the bwrap file sandbox below.)
     supportsReadIsolation: true,
-    authPaths: ['~/.codex/auth.json'],
+    // Whole ~/.codex kept REAL, not just auth.json: codex opens SQLite state/log
+    // DBs there (state_*.sqlite / logs_*.sqlite). Under the file sandbox the home
+    // is an overlayfs merge, and overlayfs (kernel + fuse) doesn't support the
+    // POSIX fcntl locks SQLite needs — the connection pool blocks ~57s then codex
+    // exits 1 ("pool timed out"). Binding the dir real gives working locks and
+    // keeps login/history persistent (same rationale as auth.json).
+    authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, readIsolation }) {

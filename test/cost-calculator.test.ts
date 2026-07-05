@@ -39,6 +39,10 @@ vi.mock('../src/services/codex-transcript.js', () => ({
   findCodexSessionIdByBotmuxSessionId: vi.fn(() => undefined),
 }));
 
+vi.mock('../src/services/traex-transcript.js', () => ({
+  findTraexRolloutBySessionId: vi.fn(() => undefined),
+}));
+
 vi.mock('../src/services/aiden-checkpoints.js', () => ({
   findAidenLatestCheckpointBySessionId: vi.fn(() => undefined),
   findAidenLatestCheckpointByBotmuxSessionId: vi.fn(() => undefined),
@@ -73,6 +77,7 @@ vi.mock('../src/adapters/cli/registry.js', () => ({
 import { existsSync, readFileSync } from 'node:fs';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../src/services/aiden-checkpoints.js';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from '../src/services/codex-transcript.js';
+import { findTraexRolloutBySessionId } from '../src/services/traex-transcript.js';
 import {
   getSessionJsonlPath,
   getSessionCost,
@@ -121,6 +126,8 @@ beforeEach(() => {
   vi.mocked(findCodexRolloutBySessionId).mockReturnValue(undefined);
   vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReset();
   vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue(undefined);
+  vi.mocked(findTraexRolloutBySessionId).mockReset();
+  vi.mocked(findTraexRolloutBySessionId).mockReturnValue(undefined);
   vi.mocked(findAidenLatestCheckpointBySessionId).mockReset();
   vi.mocked(findAidenLatestCheckpointBySessionId).mockReturnValue(undefined);
   vi.mocked(findAidenLatestCheckpointByBotmuxSessionId).mockReset();
@@ -491,6 +498,48 @@ describe('getSessionTokenUsage', () => {
     });
     expect(findCodexSessionIdByBotmuxSessionId).toHaveBeenCalledWith('botmux-sid');
     expect(findCodexRolloutBySessionId).toHaveBeenCalledWith('codex-sid');
+  });
+
+  it('reports TraeX rollouts via the codex fold, capturing the turn_context model', () => {
+    vi.mocked(findTraexRolloutBySessionId).mockReturnValue('/home/testuser/.trae/cli/sessions/2026/06/30/rollout-traex-sid.jsonl');
+    // Real TRAE rollout shapes: codex-format turn_context carries the model;
+    // token_count carries cumulative totals. Under the old 'generic' fold the
+    // model was never read and records shipped with model "".
+    setupJsonl([
+      JSON.stringify({
+        type: 'turn_context',
+        payload: { turn_id: 't-1', model: 'openrouter-1', model_provider: 'trae' },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: {
+              input_tokens: 52634,
+              cached_input_tokens: 0,
+              output_tokens: 307,
+            },
+          },
+        },
+      }),
+    ].join('\n'));
+
+    expect(getSessionTokenUsage({
+      cliId: 'traex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'traex-sid',
+    })).toEqual({
+      in: 52634,
+      out: 307,
+      inputTokens: 52634,
+      outputTokens: 307,
+      cacheReadTokens: 0,
+      cacheCreateTokens: 0,
+      turns: 0,
+      model: 'openrouter-1',
+    });
+    expect(findTraexRolloutBySessionId).toHaveBeenCalledWith('traex-sid');
   });
 
   it('reports CoCo nested response_meta usage without counting agent_end duplicates', () => {

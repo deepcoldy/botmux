@@ -65,6 +65,17 @@ let workflowRunner: ((input: TriggerInput) => Promise<TriggerResult>) | null = n
 export function setWorkflowRunner(fn: (input: TriggerInput) => Promise<TriggerResult>): void {
   workflowRunner = fn;
 }
+
+// 机器人真·改名 renamer，由 daemon 启动时注册（开放平台自动化 + daemon 侧
+// botName/descriptor/bots-info 同步都在 daemon 的闭包里做）。未注册（测试环境）
+// 时 PUT /api/bot-rename 降级为仅改 displayName。
+export type BotRenameOutcome =
+  | { ok: true; name: string }
+  | { ok: false; reason: string; message: string };
+let botRenamer: ((newName: string) => Promise<BotRenameOutcome>) | null = null;
+export function setBotRenamer(fn: ((newName: string) => Promise<BotRenameOutcome>) | null): void {
+  botRenamer = fn;
+}
 import {
   composeRowFromActive,
   composeRowFromClosed,
@@ -1375,9 +1386,20 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const d = getBot(cachedLarkAppId).config.defaultWorkingDir;
     if (typeof d === 'string' && d.trim()) defaultWorkingDir = d;
   } catch { /* none */ }
+  // 展示名编辑框数据：displayName = 自定义备注名（null = 未设，跟随飞书名称）；
+  // larkBotName = 飞书探测到的应用名（供 placeholder /「恢复默认」提示用）。
+  let displayName: string | null = null;
+  let larkBotName: string | null = null;
+  try {
+    const bot = getBot(cachedLarkAppId);
+    displayName = bot.config.displayName ?? null;
+    larkBotName = bot.botName ?? null;
+  } catch { /* none */ }
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
+    displayName,
+    larkBotName,
     cliId,
     wrapperCli,
     model,
@@ -1522,6 +1544,50 @@ ipcRoute('PUT', '/api/bot-brand-label', async (req, res) => {
   const r = await brandStore.updateBotBrandLabel(cachedLarkAppId, next);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, brandLabel: r.brandLabel });
+});
+
+// 机器人改名（dashboard 档案头 ✎ 入口）。Body `{ name: string }`。
+// 主路径：daemon 注册的 renamer 走开放平台自动化真改飞书应用名（改基础信息 +
+// 建版发布，群内显示名生效）；失败（Web 登录态过期 / 非协作者 / lark 租户等）
+// 自动降级为仅改 botmux 展示名 displayName，并把原因作为 warning 返回给前端。
+// 响应：{ ok, mode: 'feishu'|'local', botName, warning?, message? }。
+ipcRoute('PUT', '/api/bot-rename', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { name?: unknown };
+  try { body = await readJsonBody<{ name?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('displayName');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!raw) return jsonRes(res, 400, { ok: false, error: 'name_required' });
+  // 长度等校验与 IM /config 入口共用（字段 spec 的 maxLen，coerceConfigValue 执行）。
+  const c = coerceConfigValue(spec, raw);
+  if (!c.ok) return jsonRes(res, 400, { ok: false, error: c.reason });
+  const name = c.value as string;
+
+  // 主路径：开放平台真改名（daemon 注册；成功时 daemon 侧已同步 botName /
+  // descriptor / bots-info 并清掉冗余的 displayName）。
+  if (botRenamer) {
+    let renamed: BotRenameOutcome;
+    try {
+      renamed = await botRenamer(name);
+    } catch (err) {
+      renamed = { ok: false, reason: 'api_error', message: err instanceof Error ? err.message : String(err) };
+    }
+    if (renamed.ok) {
+      return jsonRes(res, 200, { ok: true, mode: 'feishu', botName: getBotName() });
+    }
+    // 降级：仅改 botmux 展示名，带上飞书侧失败原因让前端明示。
+    const fallback = await applyConfigField(cachedLarkAppId, spec, name);
+    if (!fallback.ok) return jsonRes(res, 400, { ok: false, error: fallback.reason, warning: renamed.reason, message: renamed.message });
+    return jsonRes(res, 200, { ok: true, mode: 'local', botName: getBotName(), warning: renamed.reason, message: renamed.message });
+  }
+
+  // 无 renamer（daemon 未注册，理论上只在测试环境出现）→ 直接走本地展示名。
+  const r = await applyConfigField(cachedLarkAppId, spec, name);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, mode: 'local', botName: getBotName(), warning: 'renamer_not_wired' });
 });
 
 // Per-bot agent launch settings. Body `{ cliId, model }` where `cliId` is the

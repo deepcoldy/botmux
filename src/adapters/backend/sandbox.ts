@@ -166,7 +166,8 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   a.push('--bind', plan.homeMerged, plan.home);
   a.push('--bind', plan.projectMerged, plan.projectMount);
   // CLI auth/login dirs kept REAL + writable (bind over the isolated home) so token
-  // refresh / login persists. Narrow (auth only) → session history stays isolated.
+  // refresh / login persists. Narrow (auth only) keeps session history isolated;
+  // some CLIs widen to their whole state dir for SQLite locks (CliAdapter.authPaths).
   for (const p of plan.authReal ?? []) a.push('--bind', p, p);
   // User-configured read-only inputs — BEFORE the masks so hidePaths always win
   // over an overlapping (e.g. ancestor) readonly entry.
@@ -260,6 +261,14 @@ function canonicalize(p: string): string {
   try { return realpathSync(p); } catch { return resolve(p); }
 }
 
+/** bwrap cannot bind-mount over a symlink mount destination. Some hosts expose
+ *  $HOME through a symlink, so bind overlays — and set the child HOME env — at
+ *  canonical targets so the mount point always exists and $HOME resolves even
+ *  when the symlink's parent is masked inside the sandbox. */
+export function resolveSandboxMountPath(p: string): string {
+  return canonicalize(p);
+}
+
 /**
  * Resolve user-configured sandboxReadonlyPaths: tilde-expand, drop non-existent
  * entries, and REJECT entries that (after resolving symlinks + normalizing) are
@@ -328,9 +337,18 @@ export interface SandboxSpawn {
  *  data dir (e.g. CLAUDE_CONFIG_DIR / `.claude-runtime`): the HOME overlay's
  *  ephemeral UPPER copy. The worker redirects its jsonl/bridge watch here so it
  *  sees the sandboxed CLI's writes (which are invisible at the real host path).
- *  Mirrors prepareSandbox's homeUpper layout — keep in sync. */
+ *  Mirrors prepareSandbox's homeUpper layout — keep in sync.
+ *
+ *  The home overlay is bound (and $HOME set) at the CANONICAL home, so copy-ups
+ *  land relative to that root. Compute the in-home relative path robustly whether
+ *  realDataDir arrives in symlink or canonical form: adapters build it from the
+ *  raw homedir() (so the raw base cancels cleanly in the common case), but a
+ *  canonicalized dataDir under a symlink home would escape home-upper via `..` —
+ *  fall back to the canonical base so it can't. */
 export function sandboxedClaudeDataDir(sessionId: string, realDataDir: string): string {
-  return join(VARTMP_ROOT, sessionId, 'home-upper', relative(homedir(), realDataDir));
+  const raw = relative(homedir(), realDataDir);
+  const rel = raw.startsWith('..') ? relative(resolveSandboxMountPath(homedir()), realDataDir) : raw;
+  return join(VARTMP_ROOT, sessionId, 'home-upper', rel);
 }
 
 /** Proxy env vars forwarded into the sandbox so the CLI reaches the API even on
@@ -386,7 +404,8 @@ export function prepareSandbox(opts: {
   const needFuse = process.env.BOTMUX_SANDBOX_FUSE === '1' || process.getuid?.() !== 0;
   if (!ensureSandboxDeps(needFuse)) return null;
 
-  const sessionRoot = join(opts.dataDir, 'sandboxes', opts.sessionId);
+  const dataDir = resolveSandboxMountPath(opts.dataDir);
+  const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
   const outbox = join(sessionRoot, 'outbox');
   const shimBin = join(sessionRoot, 'shimbin');
   const empties = join(sessionRoot, 'empties');
@@ -400,10 +419,10 @@ export function prepareSandbox(opts: {
   const homeWork = join(vartmp, 'home-work');
   for (const d of [outbox, shimBin, empties]) mkdirSync(d, { recursive: true });
 
-  const home = homedir();
+  const home = resolveSandboxMountPath(homedir());
   // BOTMUX_SANDBOX_SRC overrides the LOWER project source for spike testing only.
-  const projectSource = process.env.BOTMUX_SANDBOX_SRC || opts.sourceWorkingDir;
-  const projectMount = opts.sourceWorkingDir;
+  const projectSource = resolveSandboxMountPath(process.env.BOTMUX_SANDBOX_SRC || opts.sourceWorkingDir);
+  const projectMount = resolveSandboxMountPath(opts.sourceWorkingDir);
 
   // A same-session re-spawn (e.g. in-pane /clear) re-enters here; unmount any
   // stale merged overlays first so we don't stack a second mount on the same dir.
@@ -498,7 +517,8 @@ export function prepareSandbox(opts: {
   // Authoritative child env via bwrap --setenv (works on pty AND tmux — the tmux
   // backend only forwards a fixed whitelist, which excludes HOME/PATH/relay).
   const env: Record<string, string> = {
-    HOME: home,                                      // home overlay is bound AT the real home path
+    HOME: home,                                      // MUST match where the overlay is bound (canonical);
+                                                     // a symlink-form HOME dangles when its parent is masked (e.g. tmpfs /tmp)
     BOTMUX_SEND_RELAY: outbox,                       // routes `botmux send` to the daemon outbox watcher
     PATH: `/run/sbxbin:${process.env.PATH ?? ''}`,   // /run/sbxbin first so `botmux` = the relay shim
   };
@@ -539,7 +559,8 @@ export function prepareSandbox(opts: {
  */
 export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }): { outbox: string; workDir: string; cleanup: () => void } | null {
   if (process.platform !== 'linux') return null;
-  const sessionRoot = join(opts.dataDir, 'sandboxes', opts.sessionId);
+  const dataDir = resolveSandboxMountPath(opts.dataDir);
+  const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
   const outbox = join(sessionRoot, 'outbox');
   const projUpper = join(sessionRoot, 'proj-upper');
   if (!existsSync(outbox) && !existsSync(projUpper)) return null; // never sandboxed
@@ -563,7 +584,7 @@ export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }
 /** Reclaim one session's overlay residue: unmount both merged overlays + rm the
  *  per-session tree (incl. the /var/tmp home scratch). Idempotent / best-effort. */
 function reclaimSandbox(dataDir: string, sid: string): void {
-  const sessionRoot = join(dataDir, 'sandboxes', sid);
+  const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sid);
   unmountOverlay(join(sessionRoot, 'proj-merged'));
   unmountOverlay(join(sessionRoot, 'home-merged'));
   try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
@@ -613,7 +634,8 @@ function liveSandboxSids(): Set<string> {
  * daemon lifetime — one daemon per bot can run for days).
  */
 export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<string>): void {
-  const root = join(dataDir, 'sandboxes');
+  const sandboxDataDir = resolveSandboxMountPath(dataDir);
+  const root = join(sandboxDataDir, 'sandboxes');
   let sids: string[] = [];
   try { sids = readdirSync(root); } catch { return; } // no sandboxes dir yet
   // Grace before reclaiming an ACTIVE-but-unmounted sandbox: a worker that just
@@ -645,7 +667,7 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
       try { ageOk = now - statSync(sessionRoot).mtimeMs > ACTIVE_DEAD_GRACE_MS; } catch { ageOk = false; }
       if (!ageOk) continue; // too fresh — could be a worker mid-spawn
     }
-    reclaimSandbox(dataDir, sid);
+    reclaimSandbox(sandboxDataDir, sid);
   }
 }
 

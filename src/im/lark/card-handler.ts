@@ -58,6 +58,7 @@ import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStr
 import { publishAttentionPatch } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
+import { openLocalTerminalForSession } from '../../core/local-terminal-opener.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
@@ -874,18 +875,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       const spec = fk ? findConfigField(fk) : undefined;
       if (!spec) return { toast: { type: 'error', content: t('cmd.config.unknown_field', { field: fk ?? '?', fields: '' }, loc) } };
-      // 多值字段（stringList，如 customPassthroughCommands）：留空 = 清除，否则按 kind
-      // 归一化成数组再落盘；普通文本字段沿用原始字符串。
+      // 留空 = 清除；非空一律过 coerceConfigValue 按 kind 归一化/校验（stringList
+      // 拆数组、string 执行 maxLen 等 spec 约束），与 /config 文字入口、dashboard
+      // PUT 同一校验点，避免卡片入口绕过。
       let valueToApply: string | string[] | null;
       if (!raw) {
         valueToApply = null;
-      } else if (spec.kind === 'stringList') {
+      } else {
         const coerced = coerceConfigValue(spec, raw);
         if (!coerced.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: coerced.reason }, loc) } };
-        // stringList 的 coerce 只会产出 string[]（永不 boolean）；narrow 给 applyConfigField。
-        valueToApply = coerced.value as string[];
-      } else {
-        valueToApply = raw;
+        // 文本子卡只承载 string / stringList 字段；narrow 给 applyConfigField。
+        valueToApply = coerced.value as string | string[];
       }
       const r = await applyConfigField(larkAppId, spec, valueToApply);
       if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
@@ -1102,7 +1102,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return await handleV3LoopGrantAction(value as unknown as V3LoopGrantActionValue, operatorOpenId, deps.v3LoopGrantDeps);
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -1137,8 +1137,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // get_write_link 显式破例：其余敏感动作沿用「静默 block（仅日志）」的既有设计
         // （test/card-handler-repo-select.test.ts 把这点 pin 住了），但「获取操作链接」是
         // 用户主动点的取权动作，静默会让人以为按钮坏了——给一条明确的「无操作权限」toast。
-        if (value.action === 'get_write_link') {
-          return { toast: { type: 'warning', content: t('card.action.write_link_no_permission', undefined, localeForBot(effectiveAppId)) } };
+        if (value.action === 'get_write_link' || value.action === 'open_local_terminal') {
+          const key = value.action === 'open_local_terminal'
+            ? 'card.action.local_terminal_no_permission'
+            : 'card.action.write_link_no_permission';
+          return { toast: { type: 'warning', content: t(key, undefined, localeForBot(effectiveAppId)) } };
         }
         return;
       }
@@ -1154,8 +1157,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (hasAllowlist && (!operatorOpenId || !allowedUsers.includes(operatorOpenId))) {
         logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
         // 与上面 non-operator 分支同理：仅 get_write_link 破例给 toast，其余保持静默。
-        if (value.action === 'get_write_link') {
-          return { toast: { type: 'warning', content: t('card.action.write_link_no_permission', undefined, localeForBot(larkAppId)) } };
+        if (value.action === 'get_write_link' || value.action === 'open_local_terminal') {
+          const key = value.action === 'open_local_terminal'
+            ? 'card.action.local_terminal_no_permission'
+            : 'card.action.write_link_no_permission';
+          return { toast: { type: 'warning', content: t(key, undefined, localeForBot(larkAppId)) } };
         }
         return;
       }
@@ -1491,6 +1497,26 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       try {
         return JSON.parse(buildTuiPromptResolvedCard(inputText || t('card.action.tui_custom_input', undefined, locDs), locDs));
       } catch { /* fall through */ }
+    }
+
+    if (actionType === 'open_local_terminal') {
+      const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
+      }
+      const result = openLocalTerminalForSession(ds);
+      if (result.ok) {
+        logger.info(`[${tag(ds)}] Local terminal open requested via card (${result.launcher}, ${result.backend})`);
+        return { toast: { type: 'success', content: t('card.action.local_terminal_opened', { cliName: getCliDisplayName(sessionCliId(ds)) }, locDs) } };
+      }
+      logger.warn(`[${tag(ds)}] Local terminal open failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}`);
+      if (result.error === 'cli_unavailable') {
+        return { toast: { type: 'warning', content: t('card.action.local_cli_missing', { cliName: getCliDisplayName(sessionCliId(ds)), executable: result.executable ?? sessionCliId(ds) }, locDs) } };
+      }
+      if (result.error === 'resume_unavailable' || result.error === 'unsupported_platform' || result.error === 'launcher_unavailable') {
+        return { toast: { type: 'warning', content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(sessionCliId(ds)) }, locDs) } };
+      }
+      return { toast: { type: 'error', content: t('card.action.local_terminal_failed', { reason: result.detail ?? result.error }, locDs) } };
     }
 
     if (actionType === 'get_write_link' && ds && operatorOpenId) {

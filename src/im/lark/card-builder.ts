@@ -6,6 +6,7 @@ import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js'
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { t, type Locale } from '../../i18n/index.js';
+import { localTerminalCapable } from '../../core/local-terminal-opener.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 
@@ -250,6 +251,23 @@ export function terminalMultiUrl(url: string): Record<string, string> {
     : directMultiUrl(url);
 }
 
+function localCliLabel(cliName: string): string {
+  return cliName.replace(/\s+(App|CLI)$/i, '');
+}
+
+/** Zero or one local-CLI open button — only on hosts that can actually pop a
+ *  native terminal (macOS, or Linux with a GUI session); headless servers get
+ *  no button instead of one that always toasts "unsupported". */
+function openLocalTerminalButtons(actionBase: Record<string, string>, cliName: string, locale?: Locale): any[] {
+  if (!localTerminalCapable()) return [];
+  return [{
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.btn.open_local_cli', { cliName: localCliLabel(cliName) }, locale) },
+    type: 'default',
+    value: { action: 'open_local_terminal', ...actionBase },
+  }];
+}
+
 /**
  * Build a Feishu interactive card with terminal button + action buttons.
  * @param showManageButtons - When true, include restart & close buttons (used in the private write-link card — delivered as a "visible-to-you" ephemeral card in plain groups, or DM'd as fallback).
@@ -274,6 +292,7 @@ export function buildSessionCard(
       type: 'primary',
       multi_url: terminalMultiUrl(terminalUrl),
     },
+    ...openLocalTerminalButtons(actionBase, cliName, locale),
   ];
   if (!showManageButtons) {
     actions.push({
@@ -718,6 +737,7 @@ export function buildStreamingCard(
     type: 'primary',
     multi_url: terminalMultiUrl(terminalUrl),
   });
+  headerActions.push(...openLocalTerminalButtons(actionBase, cliName, locale));
   if (status === 'limited' && usageLimit?.retryReady) {
     headerActions.push({
       tag: 'button',
@@ -882,6 +902,7 @@ export function buildPrivateSnapshotCard(
         type: 'primary',
         multi_url: terminalMultiUrl(terminalUrl),
       },
+      ...openLocalTerminalButtons(actionBase, cliName, locale),
       {
         tag: 'button',
         text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
