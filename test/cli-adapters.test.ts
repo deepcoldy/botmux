@@ -42,7 +42,7 @@ import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
-import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
+import type { CliAdapter, CliId, PtyHandle } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -707,8 +707,8 @@ describe('oh-my-pi buildArgs', () => {
     expect(args).toContain('--approval-mode');
     expect(args[args.indexOf('--approval-mode') + 1]).toBe('yolo');
     expect(args).toContain('--no-title');
-    expect(args.at(-1)).toBe('hello omp');
-    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    expect(args).not.toContain('hello omp');
+    expect(adapter.passesInitialPromptViaArgs).toBe(false);
     expect(adapter.altScreen).toBe(true);
   });
 
@@ -737,6 +737,38 @@ describe('oh-my-pi buildArgs', () => {
     const idx = args.indexOf('--cwd');
     expect(idx).toBeGreaterThanOrEqual(0);
     expect(args[idx + 1]).toBe('/repo/root');
+  });
+
+  it('submits pasted tmux input with LF instead of symbolic Enter', async () => {
+    const events: string[] = [];
+    const pty = {
+      write(data: string) { events.push(`write:${JSON.stringify(data)}`); },
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      pasteText(text: string) { events.push(`paste:${text}`); },
+      sendSpecialKeys(...keys: string[]) { events.push(`keys:${keys.join(',')}`); },
+    } satisfies PtyHandle;
+
+    await adapter.writeInput(pty, 'review this');
+
+    expect(events).toEqual(['paste:review this', 'write:"\\n"']);
+  });
+
+  it('submits raw PTY input with bracketed paste and LF', async () => {
+    const events: string[] = [];
+    const pty = {
+      write(data: string) { events.push(data); },
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+    } satisfies PtyHandle;
+
+    await adapter.writeInput(pty, 'review this');
+
+    expect(events).toEqual(['\x1b[200~review this\x1b[201~', '\n']);
   });
 
   it('skillsDir points to ~/.omp/agent/skills', () => {
