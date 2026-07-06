@@ -378,6 +378,14 @@ export interface BotConfig {
    * NOT change the canTalk / canOperate permission model (unlike defaultOncall).
    */
   defaultWorkingDir?: string;
+  /**
+   * 「仅默认目录」模式下的开关：新会话启动前，先在 `defaultWorkingDir`（须是 git 仓库）
+   * 基于远端默认分支自动创建一个 linked worktree，再把会话 cwd 指向该 worktree，实现
+   * 每个新会话一个隔离 checkout。仅在 mode==='default'（defaultWorkingDir 有值）时有意义；
+   * 非 git 仓库 / 创建失败时回退直接用 defaultWorkingDir 启动。复用 `/repo wt` 的
+   * createRepoWorktree。见 services/default-worktree.ts。
+   */
+  defaultWorkingDirAutoWorktree?: boolean;
   /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */
   defaultOncall?: BotDefaultOncall;
   /**
@@ -1184,6 +1192,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       defaultWorkingDir: typeof entry.defaultWorkingDir === 'string' && entry.defaultWorkingDir.trim()
         ? entry.defaultWorkingDir.trim()
         : undefined,
+      // Only meaningful alongside defaultWorkingDir (仅默认目录 mode); only explicit
+      // true is persisted (undefined = off) so bots.json stays clean.
+      defaultWorkingDirAutoWorktree: entry.defaultWorkingDirAutoWorktree === true || undefined,
       chatReplyModes,
       chatGrants,
       globalGrants,

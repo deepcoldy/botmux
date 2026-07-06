@@ -41,6 +41,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     larkBotName: typeof j?.larkBotName === 'string' ? j.larkBotName : null,
     defaultOncall: j?.defaultOncall,
     defaultWorkingDir: typeof j?.defaultWorkingDir === 'string' ? j.defaultWorkingDir : null,
+    defaultWorkingDirAutoWorktree: j?.defaultWorkingDirAutoWorktree === true,
     autoboundChatCount: j?.autoboundChatCount ?? 0,
     brandLabel: j?.brandLabel ?? null,
     sandbox: j?.sandbox === true,

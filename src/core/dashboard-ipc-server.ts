@@ -1394,9 +1394,11 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   // defaultOncall in the dashboard 3-way selector; the frontend derives the
   // current mode from (defaultOncall.enabled ? oncall : defaultWorkingDir ? default : off).
   let defaultWorkingDir: string | null = null;
+  let defaultWorkingDirAutoWorktree = false;
   try {
-    const d = getBot(cachedLarkAppId).config.defaultWorkingDir;
-    if (typeof d === 'string' && d.trim()) defaultWorkingDir = d;
+    const cfg = getBot(cachedLarkAppId).config;
+    if (typeof cfg.defaultWorkingDir === 'string' && cfg.defaultWorkingDir.trim()) defaultWorkingDir = cfg.defaultWorkingDir;
+    defaultWorkingDirAutoWorktree = cfg.defaultWorkingDirAutoWorktree === true;
   } catch { /* none */ }
   // 展示名编辑框数据：displayName = 自定义备注名（null = 未设，跟随飞书名称）；
   // larkBotName = 飞书探测到的应用名（供 placeholder /「恢复默认」提示用）。
@@ -1418,6 +1420,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     defaultWorkingDir,
+    defaultWorkingDirAutoWorktree,
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
@@ -1914,8 +1917,8 @@ ipcRoute('PUT', '/api/bot-default-oncall', async (req, res) => {
 // next-session 生效（运行中会话需 /restart）。
 ipcRoute('PUT', '/api/bot-working-dir-mode', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { mode?: unknown; workingDir?: unknown };
-  try { body = await readJsonBody<{ mode?: unknown; workingDir?: unknown }>(req); }
+  let body: { mode?: unknown; workingDir?: unknown; autoWorktree?: unknown };
+  try { body = await readJsonBody<{ mode?: unknown; workingDir?: unknown; autoWorktree?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const mode = body.mode;
@@ -1923,6 +1926,8 @@ ipcRoute('PUT', '/api/bot-working-dir-mode', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
   }
   const workingDir = typeof body.workingDir === 'string' ? body.workingDir.trim() : '';
+  // 「仅默认目录」模式下的「自动创建 worktree」开关；其余模式 setWorkingDirMode 会强制清掉。
+  const autoWorktree = body.autoWorktree === true;
 
   // 非「关闭」模式必须给一个真实存在的目录。
   let resolvedPath = '';
@@ -1933,11 +1938,12 @@ ipcRoute('PUT', '/api/bot-working-dir-mode', async (req, res) => {
     resolvedPath = v.resolvedPath;
   }
 
-  const r = await oncallStore.setWorkingDirMode(cachedLarkAppId, mode, workingDir);
+  const r = await oncallStore.setWorkingDirMode(cachedLarkAppId, mode, workingDir, autoWorktree);
   if (!r.ok) return jsonRes(res, 400, r);
   return jsonRes(res, 200, {
     ok: true, mode,
     defaultWorkingDir: r.defaultWorkingDir,
+    defaultWorkingDirAutoWorktree: r.defaultWorkingDirAutoWorktree,
     defaultOncall: r.defaultOncall,
     resolvedPath: resolvedPath || undefined,
   });

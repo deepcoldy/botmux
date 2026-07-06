@@ -43,6 +43,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
 import { resolveRoleInjection } from './role-resolver.js';
 import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../services/whiteboard-store.js';
+import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -1468,6 +1469,35 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
   const larkAppId = ds.larkAppId;
   const bot = getBot(larkAppId);
   const locale = localeForBot(larkAppId);
+
+  // 仅默认目录 + auto-worktree：ds.workingDir 命中本 bot 自己的默认目录（且非本群 oncall 绑定）时，
+  // 走 pendingRepo 挂起 + 异步提交：把会话置 pendingRepo（入站路由 buffer 并发消息、不抢 fork），
+  // 在关键路径之外经 runAutoWorktreeCommit 建 worktree 并 commitRepoSelection 提交+fork（detach，
+  // 立即返回，不阻塞 dashboard 建会话 IPC 响应）。dashboard「建会话」立即开跑 / 待办池激活都走这里。
+  // 非 git 仓库 / 建失败 → 回退默认目录（提示经 notify 发）。registry 拿不到时兜底走原同步路径。
+  const registry = getActiveSessionsRegistry();
+  if (registry && ds.workingDir && !ds.worktreeCreating && botAutoWorktreeEnabled(larkAppId)) {
+    const isBotDefaultDir = !findOncallChat(larkAppId, ds.chatId)?.workingDir
+      && ds.workingDir === expandHome(effectiveDefaultWorkingDir(bot.config) ?? '');
+    if (isBotDefaultDir) {
+      const baseDir = ds.workingDir;
+      ds.pendingRepo = true;         // router buffers concurrent msgs; commit clears it
+      ds.pendingPrompt = userContent; // folded into the first turn by commitRepoSelection
+      // (The pending dashboard row is announced inside runAutoWorktreeCommit so all
+      // three spawn callers get it from one place — no publish needed here.)
+      const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
+      const { sendMessage } = await import('../im/lark/client.js');
+      void runAutoWorktreeCommit({
+        ds, anchor: ds.chatId, larkAppId, baseDir,
+        title: ds.session.title, prompt: userContent,
+        operatorOpenId: ds.session.ownerOpenId, activeSessions: registry,
+        notify: (m) => sendMessage(larkAppId, ds.chatId, m),
+      });
+      logger.info(`[createSession] session ${ds.session.sessionId.substring(0, 8)} → pending, building worktree off ${baseDir}`);
+      return;
+    }
+  }
+
   const buildPrompt = () => buildNewTopicPrompt(
     userContent, ds.session.sessionId, bot.config.cliId, bot.config.cliPathOverride,
     undefined, undefined, undefined, undefined,

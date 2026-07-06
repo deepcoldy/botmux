@@ -96,7 +96,7 @@ import {
 import { beginReplyTargetTurn, fallbackTurnId, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
-import { handleCardAction } from './im/lark/card-handler.js';
+import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
 import {
   executeWorkflowCommand,
@@ -146,6 +146,7 @@ import { getRunsDir } from './workflows/runs-dir.js';
 import { loadEffectInputSidecar } from './workflows/effect-input.js';
 import { isValidWorkflowId } from './workflows/catalog.js';
 import { triggerWorkflowRun } from './workflows/trigger-run.js';
+import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import type { RawParamInput } from './workflows/params.js';
 import type { AbortCancelReason } from './workflows/runtime.js';
 import {
@@ -2298,10 +2299,46 @@ async function resolvePinnedWorkingDir(ctx: {
       })
     : null;
   const pinnedWorkingDir = oncallEntry?.workingDir ?? botDefaultWorkingDir ?? inheritedFrom?.workingDir;
-  return { pinnedWorkingDir, oncallEntry, inheritedFrom };
+  // Did the pinned dir come from this bot's OWN 仅默认目录 (layer 3)? Only that layer
+  // opts into auto-worktree — oncall bindings / sibling inheritance never do. When
+  // there's no oncall entry, pinnedWorkingDir IS botDefaultWorkingDir whenever the
+  // latter is set (it wins over inherit), so `!oncallEntry && botDefaultWorkingDir`
+  // fully characterizes "came from the bot's own default".
+  const pinnedFromBotDefault = !oncallEntry && !!botDefaultWorkingDir;
+  return { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault };
 }
 
 export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
+
+/**
+ * 该新会话是否要走「仅默认目录 + 自动建 worktree」：pinned dir 来自本 bot 自己的
+ * defaultWorkingDir (layer 3) 且开关打开。为真时，spawn 路径不再同步 fork，而是把会话登记
+ * 成 `pendingRepo` 挂起态（入站路由自动 buffer 并发消息、不抢 fork），随后在关键路径之外经
+ * {@link runAutoWorktreeCommit} 建 worktree 并 commit+fork。见 default-worktree.ts / card-handler。*/
+function willAutoWorktree(larkAppId: string, pinnedWorkingDir: string | undefined, pinnedFromBotDefault: boolean): boolean {
+  return !!pinnedWorkingDir && pinnedFromBotDefault && botAutoWorktreeEnabled(larkAppId);
+}
+
+/**
+ * Kick off the DETACHED auto-worktree build for an already-registered `pendingRepo`
+ * session, and surface it on the dashboard immediately (`announcePendingRepoSession`
+ * — otherwise the row is invisible until the worktree's git fetch completes). Shared
+ * by every daemon new-session spawn path (passthrough / new-topic / group-join /
+ * safety-net). Does NOT `noteTurnReceived` (no ✋ ack): the turn only truly starts
+ * when runAutoWorktreeCommit → commitRepoSelection forks, and forking may not happen
+ * (build fails / user /closes) — an early ✋ would be orphaned. The pending dashboard
+ * row is announced inside runAutoWorktreeCommit (one place for all callers). */
+function startAutoWorktreePending(ds: DaemonSession, args: {
+  anchor: string; baseDir: string; title?: string; prompt: string; operatorOpenId?: string;
+}): void {
+  void runAutoWorktreeCommit({
+    ds, anchor: args.anchor, larkAppId: ds.larkAppId, baseDir: args.baseDir,
+    title: args.title, prompt: args.prompt, operatorOpenId: args.operatorOpenId,
+    activeSessions,
+    notify: (m) => sessionReply(args.anchor, m, 'text', ds.larkAppId),
+  });
+  logger.info(`[${tag(ds)}] auto-worktree → pending, building worktree off ${args.baseDir}`);
+}
 
 async function replyInvalidWorkingDirs(
   anchor: string,
@@ -2380,7 +2417,10 @@ async function startInitialPassthroughSession(args: {
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, { ...parsed, content: commandContent });
 
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  // Auto-worktree: register PENDING (router buffers, no force-fork) and build the
+  // worktree off the critical path (see willAutoWorktree / runAutoWorktreeCommit).
+  const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -2394,7 +2434,7 @@ async function startInitialPassthroughSession(args: {
     cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
     lastMessageAt: now,
     hasHistory: false,
-    pendingRepo: !pinnedWorkingDir,
+    pendingRepo: !pinnedWorkingDir || autoWt,
     pendingPrompt: '',
     pendingRawInput: commandContent,
     ownerOpenId,
@@ -2409,6 +2449,14 @@ async function startInitialPassthroughSession(args: {
   sessionStore.updateSession(ds.session);
   activeSessions.set(sessionKey(anchor, larkAppId), ds);
 
+  if (pinnedWorkingDir && autoWt) {
+    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    // 挂起态提交：worktree 建好后经 runAutoWorktreeCommit → commitRepoSelection 拉起
+    // pendingRawInput 冷启动会话。detach → 立即返回，不阻塞本条消息处理。
+    startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: commandContent, operatorOpenId: ownerOpenId });
+    return;
+  }
+
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     rememberLastCliInput(ds, commandContent, commandContent);
@@ -2418,7 +2466,7 @@ async function startInitialPassthroughSession(args: {
       : inheritedFrom
       ? `inherited from sibling session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
       : `bot defaultWorkingDir`;
-    logger.info(`[${tag(ds)}] ${reason} → workingDir=${pinnedWorkingDir}, queued initial raw passthrough ${commandContent.substring(0, 40)}`);
+    logger.info(`[${tag(ds)}] ${reason} → workingDir=${ds.workingDir}, queued initial raw passthrough ${commandContent.substring(0, 40)}`);
     return;
   }
 
@@ -2729,7 +2777,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Pin the working dir via the layered oncall / inherit / default lookup
   // (auto-binds a defaultOncall chat as a side effect). Shared with the
   // first-message `/repo` command branch so both paths stay consistent.
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
+  // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
+  const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -2743,7 +2794,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
     lastMessageAt: now,
     hasHistory: false,
-    pendingRepo: !pinnedWorkingDir,
+    pendingRepo: !pinnedWorkingDir || autoWt,
     pendingPrompt: promptContent,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
     pendingMentions: parsed.mentions,
@@ -2760,6 +2811,15 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   sessionStore.updateSession(ds.session);
   activeSessions.set(sessionKey(anchor, larkAppId), ds);
 
+  // Auto-worktree: session is registered PENDING; build the worktree off the
+  // critical path, then commitRepoSelection pins it + forks (folding in any
+  // messages buffered during creation). detach → return immediately.
+  if (pinnedWorkingDir && autoWt) {
+    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: promptContent, operatorOpenId: senderOpenId });
+    return;
+  }
+
   // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
@@ -2774,7 +2834,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       : inheritedFrom
       ? `inherited from sibling session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
       : `bot defaultWorkingDir`;
-    logger.info(`[${tag(ds)}] ${reason} → workingDir=${pinnedWorkingDir}, skipped repo select`);
+    logger.info(`[${tag(ds)}] ${reason} → workingDir=${ds.workingDir}, skipped repo select`);
     return;
   }
 
@@ -2926,7 +2986,8 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       return;
     }
 
-    const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+    const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+    const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
     refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
 
     const session = sessionStore.createSession(chatId, anchor, title, chatType);
@@ -2953,7 +3014,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
       lastMessageAt: now,
       hasHistory: false,
-      pendingRepo: !pinnedWorkingDir,
+      pendingRepo: !pinnedWorkingDir || autoWt,
       pendingPrompt: promptBody,
       ownerOpenId: operatorOpenId,
       currentTurnTitle: title,
@@ -2971,6 +3032,13 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), undefined,
       { larkAppId, chatId, whiteboardId: ds.session.whiteboardId },
     );
+
+    // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
+    if (pinnedWorkingDir && autoWt) {
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+      startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title, prompt: promptBody, operatorOpenId });
+      return;
+    }
 
     // Pinned working dir → spawn immediately.
     if (pinnedWorkingDir) {
@@ -3453,7 +3521,11 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     }
     if (!ds.pendingFollowUps) ds.pendingFollowUps = [];
     ds.pendingFollowUps.push(enriched);
-    await sessionReply(anchor, tr('daemon.choose_repo_first', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+    // Auto-worktree pending (worktreeCreating) has no repo card to point at — the
+    // message IS buffered (folded on commit), so just say "hold on, building worktree"
+    // instead of the misleading "pick a repo from the card above".
+    const pendingReplyKey = ds.worktreeCreating ? 'daemon.worktree_building_wait' : 'daemon.choose_repo_first';
+    await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
     return;
   }
 
@@ -3505,13 +3577,14 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 
     // Use the same layered oncall / inherit / default lookup as handleNewTopic
     // so stale inherited peers are ignored consistently in both spawn paths.
-    const { pinnedWorkingDir, oncallEntry, inheritedFrom } = await resolvePinnedWorkingDir({
+    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
       scope,
       anchor,
       chatId: autoCreateChatId,
       chatType: autoCreateChatType,
       larkAppId,
     });
+    const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
     // Now we know the message will spawn or pend a real session — resolve
     // sender (may await contact API budget) since every downstream branch
     // injects it either into the immediate prompt or stashes it on
@@ -3530,7 +3603,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
       lastMessageAt: now,
       hasHistory: false,
-      pendingRepo: !pinnedWorkingDir,
+      pendingRepo: !pinnedWorkingDir || autoWt,
       pendingPrompt: promptContent,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
@@ -3546,6 +3619,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     beginReplyTargetTurn(newDs, replyRootId, parsed.messageId);
     sessionStore.updateSession(newDs.session);
     activeSessions.set(sessionKey(anchor, larkAppId), newDs);
+
+    // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
+    if (pinnedWorkingDir && autoWt) {
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
+      startAutoWorktreePending(newDs, { anchor, baseDir: pinnedWorkingDir, title: parsed.content.substring(0, 50), prompt: promptContent, operatorOpenId: ownerOpenId });
+      return;
+    }
 
     // Pinned (oncall binding or inherited from peer bot in same thread):
     // spawn CLI immediately, skip repo selection.

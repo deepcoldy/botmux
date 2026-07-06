@@ -410,6 +410,14 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
                   value="${escapeHtml(wdDirValue)}">
               </label>
             </div>
+            <div class="bd-row" data-wd-worktree-row ${wdMode === 'default' ? '' : 'hidden'}>
+              <label class="toggle-row">
+                <input type="checkbox" data-input="autoWorktree" ${b.defaultWorkingDirAutoWorktree ? 'checked' : ''}>
+                <span class="switch" aria-hidden="true"></span>
+                <span class="toggle-tx"><strong>${t('botDefaults.autoWorktree')}</strong>
+                <small>${t('botDefaults.autoWorktreeHelp')}</small></span>
+              </label>
+            </div>
             <div class="actions">
               <button type="button" class="primary" data-action="save-working-dir">${t('botDefaults.save')}</button>
               <span class="oncall-status" data-status></span>
@@ -945,6 +953,8 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
       const wdModeSel = card.querySelector<HTMLSelectElement>('select[data-input=workingDirMode]');
       const input = card.querySelector<HTMLInputElement>('input[data-input=workingDir]');
       const wdDirRow = card.querySelector<HTMLElement>('[data-wd-dir-row]');
+      const wdWorktreeRow = card.querySelector<HTMLElement>('[data-wd-worktree-row]');
+      const autoWorktreeInput = card.querySelector<HTMLInputElement>('input[data-input=autoWorktree]');
       const saveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-working-dir]');
       const statusEl = card.querySelector<HTMLSpanElement>('[data-status]');
       if (!wdModeSel || !input || !saveBtn || !statusEl) return; // error card
@@ -1022,9 +1032,11 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
       }
 
       // 选「关闭」隐藏目录输入框；选其它则显示并聚焦（off 不需要目录）。
+      // 「自动创建 worktree」开关仅「仅默认目录」模式可见（脱离该模式无意义）。
       wdModeSel.addEventListener('change', () => {
         const off = wdModeSel.value === 'off';
         if (wdDirRow) wdDirRow.hidden = off;
+        if (wdWorktreeRow) wdWorktreeRow.hidden = wdModeSel.value !== 'default';
         if (!off) input.focus();
       });
 
@@ -1038,12 +1050,14 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
           statusEl.classList.add('hint-warn-inline');
           return;
         }
+        // 「自动创建 worktree」仅「仅默认目录」模式有效；其它模式一律传 false（后端也会强制清）。
+        const autoWorktree = mode === 'default' && !!autoWorktreeInput?.checked;
         saveBtn.disabled = true;
         try {
           const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/working-dir-mode`, {
             method: 'PUT',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ mode, workingDir }),
+            body: JSON.stringify({ mode, workingDir, autoWorktree }),
           });
           const body = await r.json().catch(() => ({}));
           if (r.ok && body.ok) {
@@ -1057,6 +1071,7 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
             if (cached) {
               if (body.defaultOncall) cached.defaultOncall = body.defaultOncall;
               cached.defaultWorkingDir = body.defaultWorkingDir ?? null;
+              cached.defaultWorkingDirAutoWorktree = body.defaultWorkingDirAutoWorktree === true;
             }
             // Oncall 模式 re-stamps `since` → reflect it in the meta line.
             const metaEl = card.querySelector<HTMLElement>('[data-oncall-since]');

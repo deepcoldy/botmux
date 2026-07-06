@@ -3,13 +3,14 @@ import * as groupsStore from '../services/groups-store.js';
 import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
 import { getBot, effectiveDefaultWorkingDir } from '../bot-registry.js';
-import { getChatMode, sendMessage, type ChatMode } from '../im/lark/client.js';
+import { getChatMode, sendMessage, replyMessage, type ChatMode } from '../im/lark/client.js';
 import { resolveRegularGroupMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpContent, buildNewTopicPrompt, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
 import { forkWorker, getCurrentCliVersion } from './worker-pool.js';
+import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import * as messageQueue from '../services/message-queue.js';
 import type { DaemonSession } from './types.js';
 import { sessionKey } from './types.js';
@@ -76,16 +77,18 @@ export function externalEventOpensOwnTopic(chatMode: ChatMode, regularGroupMode:
   return chatMode === 'topic' || regularGroupMode === 'new-topic';
 }
 
-function resolveWorkingDir(larkAppId: string, chatId: string): { ok: true; workingDir: string } | { ok: false; error: string } {
+function resolveWorkingDir(larkAppId: string, chatId: string): { ok: true; workingDir: string; fromBotDefault: boolean } | { ok: false; error: string } {
   const bot = getBot(larkAppId);
-  const candidate =
-    oncallStore.getOncallStatus(larkAppId, chatId)?.workingDir ||
-    effectiveDefaultWorkingDir(bot.config) ||
-    bot.config.workingDir ||
-    '~';
+  const oncall = oncallStore.getOncallStatus(larkAppId, chatId)?.workingDir;
+  const botDefault = effectiveDefaultWorkingDir(bot.config);
+  const candidate = oncall || botDefault || bot.config.workingDir || '~';
   const v = validateWorkingDir(candidate, localeForBot(larkAppId));
   if (!v.ok) return { ok: false, error: v.error };
-  return { ok: true, workingDir: v.resolvedPath };
+  // 仅当命中本 bot 自己的 defaultWorkingDir（layer 3，非 oncall 绑定）时才允许 auto-worktree。
+  // 无 oncall 时 candidate 就是 botDefault（它排在 bot.config.workingDir/'~' 之前），故
+  // `!oncall && botDefault` 即可刻画"来自本 bot 默认目录"。
+  const fromBotDefault = !oncall && !!botDefault;
+  return { ok: true, workingDir: v.resolvedPath, fromBotDefault };
 }
 
 function activeBySessionId(activeSessions: Map<string, DaemonSession>, sessionId: string): DaemonSession | undefined {
@@ -313,6 +316,40 @@ export async function triggerSessionTurn(
     workingDir: wd.workingDir,
   };
 
+  // 仅默认目录 + auto-worktree：chat 驱动的 webhook 开新会话且落在本 bot 自己的默认目录时，走
+  // pendingRepo 挂起 + 异步提交（登记挂起→关键路径外建 worktree→commitRepoSelection 提交+fork），
+  // detach 后立即返回 queued。规则：**仅普通 webhook 适用**——HTTP 应答模式（waitForFinalOutput /
+  // asyncReturnSessionId）与虚拟会话是程序化「请求-应答」调用，每次一个 worktree 既反直觉又会
+  // 泄漏（无回收），一律在基目录直接跑、不建 worktree。commitRepoSelection 会自己 buildNewTopicPrompt /
+  // ensureSessionWhiteboard，故此分支跳过上面那套（省一次 getAvailableBots 通讯录往返）。
+  const useAutoWt = !isHttpVirtualSession
+    && !req.options?.waitForFinalOutput
+    && !req.options?.asyncReturnSessionId
+    && wd.fromBotDefault
+    && botAutoWorktreeEnabled(larkAppId);
+  if (useAutoWt) {
+    // Register BEFORE the detached commit so its guard + the router's pendingRepo
+    // buffering both see the session. pendingRepo=true → no force-fork in the window.
+    newDs.pendingRepo = true;      // router buffers concurrent events; commit clears it
+    newDs.pendingPrompt = prompt;  // folded into the first turn by commitRepoSelection
+    deps.activeSessions.set(sessionKey(anchor, larkAppId), newDs);
+    const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
+    void runAutoWorktreeCommit({
+      ds: newDs, anchor, larkAppId, baseDir: wd.workingDir, title: triggerTitle(req),
+      operatorOpenId: session.ownerOpenId, activeSessions: deps.activeSessions,
+      // Thread-scope anchor is a topic-root message id (om_…) → reply-in-thread;
+      // chat-scope anchor is a chat_id → plain send. (Fixes the om_→chat_id misroute.)
+      notify: (m) => scope === 'thread' ? replyMessage(larkAppId, anchor, m, 'text', true) : sendMessage(larkAppId, anchor, m),
+    });
+    return {
+      ok: true,
+      triggerId,
+      action: 'queued',
+      target: { kind: 'turn', sessionId: session.sessionId, chatId },
+      message: 'queued new session turn (building worktree)',
+    };
+  }
+
   ensureSessionWhiteboard(newDs);
   const promptInput = buildNewTopicPrompt(
     prompt,
@@ -328,7 +365,9 @@ export async function triggerSessionTurn(
     undefined,
     { larkAppId, chatId, whiteboardId: newDs.session.whiteboardId },
   );
-
+  // Register right before the fork branches (no await between here and forkWorker)
+  // so a concurrent inbound message can't observe this session worker-less and
+  // race a duplicate re-fork — the set-and-fork atomicity the original path had.
   deps.activeSessions.set(sessionKey(anchor, larkAppId), newDs);
   rememberLastCliInput(newDs, prompt, promptInput);
 
