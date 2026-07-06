@@ -61,6 +61,11 @@ const DATA_DIAL_MAX_WAVES = 2;
 const DATA_DIAL_WAVE_BACKOFF_MS = 150;
 const DATA_DIAL_OVERALL_DEADLINE_MS = 6_000;
 
+// 控制连接并行拨号（happy-eyeballs）：一轮并行拨几条、谁先握手成功用谁，兜住入口 VIP 对新建连接
+// ~35% 的黑洞。单条超时给足 TLS 握手时间（好连接 ~40ms，黑洞则等满超时判负）。
+const CONTROL_DIAL_PARALLEL = 3;
+const CONTROL_DIAL_TIMEOUT_MS = 5_000;
+
 // 本机可供平台服务端「直连反代」的候选地址（内网 IPv4:dashboardPort）。平台够得着就直连本机
 // dashboard、绕过隧道（省掉 daemon 拨号/ECMP 赌/跨 pod 转发）；够不着自动退回隧道。仅内网地址、
 // 服务端到服务端 HTTP，不涉浏览器 mixed content。
@@ -85,6 +90,8 @@ export interface TunnelClientHandle {
 export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClientHandle {
   let stopped = false;
   let ws: WebSocket | null = null;
+  // 当前一轮控制连接并行拨号中「在拨/在等」的候选（胜出/停止时用于清理）。
+  let controlDials: Set<WebSocket> | null = null;
   let heartbeat: NodeJS.Timeout | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
   let backoff = BACKOFF_MIN_MS;
@@ -101,36 +108,110 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
 
   const flipFamily = (f: 4 | 6 | undefined): 4 | 6 => (f === 6 ? 4 : 6);
 
+  // 控制连接并行拨号（happy-eyeballs）。入口 VIP 对「新建连接」丢包很高（实测 ~35%，TLS 握手黑洞、
+  // 非 SYN 层），单发+退避会反复撞黑洞、迟迟连不上 → 用户以为「连不上要 restart」。改成一轮并行拨
+  // CONTROL_DIAL_PARALLEL 条、谁先握手成功用谁、其余 terminate；一整轮全败才按 backoff 重连。
+  // ~60% 单条成功率下，3 条并行一轮成功率 ~94%，把「连不上」窗口从「撞黑洞×退避」压到一轮内。
+  // 数据流早已这么做（openDataStream），这里给控制连接补上。
   function connect(): void {
     if (stopped) return;
     const url = `${base}/tunnel/control?token=${tokenQ}`;
     // 连续 3 次连不上后，每隔一次用另一个协议族试探（默认/4 ↔ 6），兜住单协议族路由坏掉的机器。
     const attemptFamily = connectFails >= 3 && connectFails % 2 === 1 ? flipFamily(ipFamily) : ipFamily;
-    // 关掉 permessage-deflate：隧道是裸字节桥，承载的 HTTP 自己会 gzip，WS 层再压一遍既没收益、
-    // 又会在经过中心化网关(TLB)时因压缩扩展协商被改写而触发 "Invalid WebSocket frame: RSV1 must
-    // be clear"，整条数据流当场挂掉 → dashboard 的 CSS/JS 半路断供、页面掉样式。不 offer 扩展，
-    // 中间任何一跳都不会给这条连接开压缩。
-    const sock = new WebSocket(url, { perMessageDeflate: false, family: attemptFamily });
-    ws = sock;
-    let opened = false;
 
-    sock.on('open', () => {
-      opened = true;
-      connectFails = 0;
-      backoff = BACKOFF_MIN_MS;
-      if (attemptFamily !== ipFamily) {
-        ipFamily = attemptFamily;
-        try {
-          setPlatformIpFamily(attemptFamily);
-        } catch {
-          /* 落盘失败不影响本进程内生效 */
-        }
-        opts.log(`隧道经 IPv${attemptFamily} 连通，已设为本机与平台通信的默认协议族`);
+    let settled = false; // 本轮已有胜者或已判负
+    let pending = CONTROL_DIAL_PARALLEL;
+    const dials = new Set<WebSocket>();
+    controlDials = dials;
+
+    const dropLosers = (winner: WebSocket | null): void => {
+      for (const c of dials) {
+        if (c === winner) continue;
+        try { c.removeAllListeners(); } catch { /* ignore */ }
+        try { c.terminate(); } catch { /* ignore */ }
       }
-      opts.log('隧道已连接平台');
-      sendRegister(sock);
-      heartbeat = setInterval(() => sendHeartbeat(sock), HEARTBEAT_MS);
-    });
+      dials.clear();
+    };
+
+    const onDialFail = (): void => {
+      if (settled) return;
+      if (--pending > 0) return; // 本轮还有在拨的，等它们
+      settled = true;
+      connectFails++; // 一整轮都没连上才计一次失败（驱动 backoff + 协议族翻转）
+      dropLosers(null);
+      scheduleReconnect();
+    };
+
+    for (let k = 0; k < CONTROL_DIAL_PARALLEL; k++) {
+      // 关掉 permessage-deflate：隧道是裸字节桥，承载的 HTTP 自己会 gzip，WS 层再压一遍既没收益、
+      // 又会在经过中心化网关(TLB)时因压缩扩展协商被改写而触发 "RSV1 must be clear" 断流。
+      const sock = new WebSocket(url, { perMessageDeflate: false, family: attemptFamily });
+      dials.add(sock);
+      let done = false;
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        dials.delete(sock);
+        try { sock.terminate(); } catch { /* ignore */ }
+        onDialFail();
+      }, CONTROL_DIAL_TIMEOUT_MS);
+
+      sock.on('open', () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        if (settled) { try { sock.terminate(); } catch { /* ignore */ } return; } // 已有胜者 → 弃掉
+        settled = true;
+        dials.delete(sock);
+        dropLosers(sock);
+        // 摘掉建连期临时 listener，换上正式收发 handler
+        try { sock.removeAllListeners('open'); } catch { /* ignore */ }
+        try { sock.removeAllListeners('error'); } catch { /* ignore */ }
+        try { sock.removeAllListeners('unexpected-response'); } catch { /* ignore */ }
+        adoptControl(sock, attemptFamily);
+      });
+
+      sock.on('unexpected-response', (_req, res) => {
+        opts.log('隧道握手被拒', { status: res.statusCode });
+        if (res.statusCode === 401) opts.log('机器 token 失效，请重新 botmux bind');
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        dials.delete(sock);
+        try { sock.terminate(); } catch { /* ignore */ }
+        onDialFail();
+      });
+
+      sock.on('error', () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        dials.delete(sock);
+        try { sock.terminate(); } catch { /* ignore */ }
+        // 建连期错误不逐条刷屏（撞黑洞是常态）；一整轮全败才由 scheduleReconnect 侧体现。
+        onDialFail();
+      });
+    }
+  }
+
+  // 采纳某条已握手成功的控制连接：重置失败计数/落盘生效协议族、挂正式收发 handler、发 register、起心跳。
+  function adoptControl(sock: WebSocket, attemptFamily: 4 | 6 | undefined): void {
+    ws = sock;
+    controlDials = null;
+    connectFails = 0;
+    backoff = BACKOFF_MIN_MS;
+    if (attemptFamily !== ipFamily) {
+      ipFamily = attemptFamily;
+      try {
+        setPlatformIpFamily(attemptFamily);
+      } catch {
+        /* 落盘失败不影响本进程内生效 */
+      }
+      opts.log(`隧道经 IPv${attemptFamily} 连通，已设为本机与平台通信的默认协议族`);
+    }
+    opts.log('隧道已连接平台');
+    sendRegister(sock);
+    heartbeat = setInterval(() => sendHeartbeat(sock), HEARTBEAT_MS);
 
     sock.on('message', (data) => {
       let msg: { type?: string; streamId?: string; teamId?: string; teamName?: string; rev?: string; teams?: unknown[] };
@@ -159,13 +240,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       }
     });
 
-    sock.on('unexpected-response', (_req, res) => {
-      opts.log('隧道握手被拒', { status: res.statusCode });
-      if (res.statusCode === 401) opts.log('机器 token 失效，请重新 botmux bind');
-    });
-
     sock.on('close', () => {
-      if (!opened) connectFails++; // 只统计「没连上」，连上后正常掉线不算
       cleanupSock();
       scheduleReconnect();
     });
@@ -348,6 +423,14 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
+      }
+      // 干掉本轮还在并行拨号中的候选连接（stop 可能发生在握手成功之前）。
+      if (controlDials) {
+        for (const c of controlDials) {
+          try { c.removeAllListeners(); } catch { /* ignore */ }
+          try { c.terminate(); } catch { /* ignore */ }
+        }
+        controlDials = null;
       }
       try {
         ws?.close();
