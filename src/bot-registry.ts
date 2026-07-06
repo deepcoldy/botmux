@@ -368,6 +368,16 @@ export interface BotConfig {
   oncallChats?: OncallChat[];
   /** UI language for this bot: 'zh' or 'en'. Falls back to BOTMUX_LANG / LANG env when unset. */
   lang?: Locale;
+  /** How this bot's built-in botmux bridge skills reach its CLI (only meaningful
+   *  for CLIs with a global `skillsDir` — codex/gemini/opencode/…):
+   *   - `global`: install into the CLI's shared global skills dir (leaks into the
+   *     user's own standalone CLI). For users who never run the CLI by hand.
+   *   - `prompt`: inject a session-scoped skill catalog into the prompt +
+   *     `botmux skill show <name>` on demand. No leak.
+   *   - `off`: routing hints + `botmux --help` only.
+   *  Unset ⇒ fall back to the machine-wide `skills.builtinInjection` (default
+   *  `prompt`). See services skills/injection-mode.ts. */
+  skillInjection?: 'global' | 'prompt' | 'off';
   /**
    * Per-bot default working directory. When set, new topics that have no
    * oncall binding and no sibling-session inheritance skip the repo-select
@@ -1208,6 +1218,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       env,
       skills,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
+      skillInjection: entry.skillInjection === 'global' || entry.skillInjection === 'prompt' || entry.skillInjection === 'off'
+        ? entry.skillInjection : undefined,
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,

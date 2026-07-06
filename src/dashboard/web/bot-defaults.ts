@@ -189,6 +189,43 @@ export function renderBotAgentSection(b: any, sessionFallback: string): string {
   const model = typeof b?.model === 'string' ? b.model : '';
   const suggestions = modelSuggestionsForOption(selectedCliOption(key));
   const disabled = selectedCliOption(key)?.gateway === 'ttadk' && selectedCliOption(key)?.acceptsModel === false;
+  // botmux skills 注入方式. `support` decides how the control renders:
+  //  - 'dynamic' (claude-family, --plugin-dir): disabled, shows 动态注入 as the
+  //    fixed mode — not configurable.
+  //  - 'global' (codex-family, global skills dir): prompt/global/off selectable;
+  //    动态注入 shown but disabled (hint: this CLI can't do dynamic injection).
+  //  - 'none' (no skill dir): the whole row is omitted.
+  // The selected value is the RESOLVED mode (per-bot override → machine default),
+  // which is `prompt` out of the box — so there is no separate "follow" option.
+  const siSupport: string = b?.skillInjectionSupport === 'dynamic' ? 'dynamic' : b?.skillInjectionSupport === 'global' ? 'global' : 'none';
+  const siOverride: string = (b?.skillInjection === 'global' || b?.skillInjection === 'prompt' || b?.skillInjection === 'off') ? b.skillInjection : '';
+  const siDefault: string = (b?.skillInjectionDefault === 'global' || b?.skillInjectionDefault === 'off') ? b.skillInjectionDefault : 'prompt';
+  const siResolved: string = siOverride || siDefault; // 'prompt' | 'global' | 'off'
+  const skillRow = siSupport === 'none' ? '' : siSupport === 'dynamic'
+    ? `<div class="bd-row">
+        <label>
+          <span>${t('botDefaults.skillInjection')}</span>
+          <select data-input="skillInjection" disabled>
+            <option value="dynamic" selected>${escapeHtml(t('botDefaults.skillInjectionDynamic'))}</option>
+          </select>
+        </label>
+        <small class="bd-help">${t('botDefaults.skillInjectionHelpDynamic')}</small>
+      </div>`
+    : `<div class="bd-row">
+        <label>
+          <span>${t('botDefaults.skillInjection')}</span>
+          <select data-input="skillInjection">
+            <option value="dynamic" disabled>${escapeHtml(t('botDefaults.skillInjectionDynamicUnsupported'))}</option>
+            <option value="prompt" ${siResolved === 'prompt' ? 'selected' : ''}>${escapeHtml(t('botDefaults.skillInjectionPrompt'))}</option>
+            <option value="global" ${siResolved === 'global' ? 'selected' : ''}>${escapeHtml(t('botDefaults.skillInjectionGlobal'))}</option>
+            <option value="off" ${siResolved === 'off' ? 'selected' : ''}>${escapeHtml(t('botDefaults.skillInjectionOff'))}</option>
+          </select>
+        </label>
+        <small class="bd-help">${t('botDefaults.skillInjectionHelp')}</small>
+        <div class="actions">
+          <span class="oncall-status" data-skill-injection-status></span>
+        </div>
+      </div>`;
   return `<section class="bd-section">
       <h3 class="bd-section-title">${t('botDefaults.sectionAgent')}</h3>
       <div class="bd-row">
@@ -213,6 +250,7 @@ export function renderBotAgentSection(b: any, sessionFallback: string): string {
           <span class="oncall-status" data-agent-status></span>
         </div>
       </div>
+      ${skillRow}
     </section>`;
 }
 
@@ -1491,6 +1529,42 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
             p2pStatusEl.classList.add('hint-warn-inline');
           } finally {
             p2pModeSel.disabled = false;
+          }
+        });
+      }
+
+      // ── 内置技能注入模式 skillInjection select ────────────────────────────
+      // '' = 清回机器级默认（botmux skills injection）；global|prompt|off 显式覆盖。
+      // 走 /api/bots/:appId/skill-injection → applyConfigField（与 /config 同路径）。
+      const skillInjSel = card.querySelector<HTMLSelectElement>('select[data-input=skillInjection]');
+      const skillInjStatusEl = card.querySelector<HTMLSpanElement>('[data-skill-injection-status]');
+      if (skillInjSel && skillInjStatusEl) {
+        skillInjSel.addEventListener('change', async () => {
+          const mode = skillInjSel.value; // '' | 'global' | 'prompt' | 'off'
+          skillInjStatusEl.textContent = '';
+          skillInjStatusEl.className = 'oncall-status';
+          skillInjSel.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/skill-injection`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ skillInjection: mode }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              skillInjStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+              skillInjStatusEl.classList.add('hint-ok');
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.skillInjection = body.skillInjection ?? null;
+            } else {
+              skillInjStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              skillInjStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            skillInjStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            skillInjStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            skillInjSel.disabled = false;
           }
         });
       }

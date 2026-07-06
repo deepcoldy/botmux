@@ -64,6 +64,21 @@ export interface GlobalConfig {
 export interface GlobalSkillConfig {
   trustProjectSkills?: 'off' | 'trusted' | 'all';
   delivery?: 'auto' | 'prompt' | 'native';
+  /** Machine-wide default for how botmux's **built-in bridge skills**
+   *  (botmux-send / botmux-schedule / …) reach CLIs that only support a GLOBAL
+   *  skills directory (codex/gemini/opencode/… — everything with `skillsDir`,
+   *  i.e. no per-session `--plugin-dir` injection like Claude Code):
+   *   - `global`: install the skill files into the CLI's shared global dir
+   *     (e.g. `~/.codex/skills`). Full native experience, but the user's own
+   *     standalone `codex`/`gemini` sees & can mis-fire them. Right for hosts
+   *     whose users NEVER run those CLIs by hand.
+   *   - `prompt` (default): don't touch the global dir; inject a compact skill
+   *     catalog into the session prompt and let the model pull full instructions
+   *     on demand via `botmux skill show <name>`. Session-scoped → no leak.
+   *   - `off`: inject neither files nor catalog — only the routing hints + a
+   *     pointer at `botmux --help`. Lightest; relies on CLI help completeness.
+   *  A per-bot `skillInjection` (bots.json) overrides this. Unset ⇒ `prompt`. */
+  builtinInjection?: 'global' | 'prompt' | 'off';
 }
 
 export interface MaintenanceConfig {
@@ -208,6 +223,9 @@ function readGlobalSkills(raw: unknown): GlobalSkillConfig | undefined {
   }
   if (r.delivery === 'auto' || r.delivery === 'prompt' || r.delivery === 'native') {
     out.delivery = r.delivery;
+  }
+  if (r.builtinInjection === 'global' || r.builtinInjection === 'prompt' || r.builtinInjection === 'off') {
+    out.builtinInjection = r.builtinInjection;
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }

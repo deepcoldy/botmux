@@ -3655,6 +3655,16 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        拉取当前会话的消息历史 (JSON)。默认按 session scope：话题/话题群 → 话题内，普通群 → 整群；
                                        thread 会话里可用 --scope ambient 读取 thread 外的群聊上下文
   quoted <message_id>                  拉取被引用的单条消息 (JSON)，message_id 取自 daemon 注入的引用提示行
+  ask buttons --options "a,b" "<问题>"  把选择题做成按钮卡片抛给飞书，等用户点选后返回其选择
+                                       （无 hook 的 CLI 用它把决策引到人；也可省略 buttons 走裸别名）
+  skill list                           列出本会话可用的技能（用户自定义 + botmux 内置）及其描述
+  skill show <name>                    读取某技能的完整 SKILL.md 说明（prompt 注入模式下按需拉取内置技能全文）
+
+编排 / workflow（进阶，多为 v3/多话题协作场景）:
+  workflow <run|resume|cancel|ls|tail|validate|show> [...]
+                                       运行 / 管理 workflow（详见 \`botmux workflow help\`）
+  dispatch --bot <name> [...]          多话题编排：开子话题并把 bot 派进去（详见 \`botmux dispatch --help\`）
+  report [...]                         v3/编排场景向上汇报进度或结果（详见 \`botmux report --help\`）
 
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"]
@@ -3665,6 +3675,16 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        导出 cliId/model/角色/能力标签 + 接入指引；
                                        默认 team 级角色，--from-chat 取某群角色内容；
                                        缺省写 ./<name或appid>.botmux-preset.json，--out - 走 stdout
+
+botmux skills 注入方式（仅影响 codex/gemini/opencode 等只支持全局 skills 目录的 CLI）:
+  skills injection [global|prompt|off]  查看/设置机器级默认（无参=查看）
+       prompt（默认）  不落全局盘，把技能目录注入进会话 prompt，按需 \`botmux skill show\`——
+                       不会泄漏到你手动跑的 codex/gemini
+       global          装进 CLI 全局 skills 目录（体验原生，但独立 CLI 也会看到）
+       off             只留路由提示 + \`botmux --help\`，让模型自行摸索
+  （per-bot 可在 bots.json 用 "skillInjection" 字段覆盖机器级默认）
+
+提示: 多数子命令支持 \`botmux <子命令> --help\` 查看完整参数。
 
 配置目录: ~/.botmux/
 文档: https://github.com/deepcoldy/botmux
