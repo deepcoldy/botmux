@@ -9,6 +9,7 @@ import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkS
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, removeGlobalBotmuxSkills } from '../skills/installer.js';
+import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
@@ -841,41 +842,64 @@ const skillsInstalledCliIds = new Set<string>();
  */
 export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
-  // botmux-whiteboard skill 跟随白板能力开关，且**每次 spawn 都重新评估**（不进
-  // 下面 skillsInstalledCliIds 的一次性缓存）——这样运行时在 dashboard/CLI 切换白板
-  // 开关，下一个会话即生效，无需重启 daemon。skill 落点与其它内置 skill 同目录
-  // （plugin 模式下是 {pluginDir}/skills），spawn 时一并经 --plugin-dir 注入。
-  const wbSkillsDir = adapter.pluginDir ? join(adapter.pluginDir, 'skills') : adapter.skillsDir;
-  ensureWhiteboardSkill(cliId, wbSkillsDir, whiteboardEnabled());
+
+  // Claude-family CLIs deliver skills per-session via `--plugin-dir` (no global
+  // leak), so they always materialise their plugin dir — the builtin-injection
+  // mode does not apply to them. Everything below the branch is the global-dir
+  // path (codex/gemini/opencode/…) where the mode decides whether we install.
+  if (adapter.pluginDir) {
+    const pluginSkillsDir = join(adapter.pluginDir, 'skills');
+    // 白板 skill 每次 spawn 重新评估（跟随运行时开关），不进 once-cache。
+    ensureWhiteboardSkill(cliId, pluginSkillsDir, whiteboardEnabled());
+    if (skillsInstalledCliIds.has(cliId)) return;
+    ensurePluginSkills(cliId, adapter.pluginDir);
+    if (adapter.hookInstall) {
+      try { installHook(cliId, adapter.hookInstall, hookCommandFor(cliId)); }
+      catch (err) { logger.warn(`[hook] install failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
+    }
+    if (adapter.ensureAskHook) {
+      try { adapter.ensureAskHook(); }
+      catch (err) { logger.warn(`[hook] ensureAskHook failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
+    }
+    ensureAskSkill(cliId, pluginSkillsDir, !adapter.asksViaHook);
+    skillsInstalledCliIds.add(cliId);
+    return;
+  }
+
+  // Global-skillsDir CLIs: only write the shared dir when SOME bot on that dir
+  // resolves to `global` mode. `prompt`/`off` keep the dir clean so the user's
+  // own standalone `codex`/`gemini` never sees (and mis-fires) botmux skills —
+  // those modes deliver the skills via the session prompt instead (see
+  // session-manager buildNewTopicPrompt + skills/injection-mode.ts).
+  const skillsDir = adapter.skillsDir;
+  const globalInstall = skillsDir ? shouldInstallGlobalSkills(skillsDir) : false;
+  // 白板 skill + 泄漏清理都**每次 spawn 重新评估**（在 once-cache 之前），保证在
+  // CLI 真正执行前生效——而不仅在 daemon 启动那一次：
+  //  - 白板：跟随运行时开关，仅 global 模式落全局盘。
+  //  - prompt/off 泄漏清理：每个新会话拉起 CLI 前，把共享 skills 目录里的 botmux
+  //    技能清掉。这样「运行时从 global 切到 prompt/off」「旧版本或外部重新写入的
+  //    残留」都会在下一个会话的 CLI 启动前被扫干净，用户手动跑的独立 codex/gemini
+  //    立刻不再看到 botmux 技能，无需等 daemon 重启。只动 `botmux-` 命名空间，
+  //    绝不碰用户自定义 skill。
+  ensureWhiteboardSkill(cliId, skillsDir, globalInstall && whiteboardEnabled());
+  if (!globalInstall && skillsDir) removeGlobalBotmuxSkills(skillsDir);
 
   if (skillsInstalledCliIds.has(cliId)) return;
-  if (adapter.pluginDir) {
-    // 动态注入：skill 写进插件目录，spawn 时用 --plugin-dir 注入，仅本次会话可见。
-    // 不再写全局 skillsDir。（全局 ~/.claude/skills 的历史残留清理改由
-    // cleanupGlobalBotmuxSkillsOnce 在启动时独立于 cliId 执行。）
-    ensurePluginSkills(cliId, adapter.pluginDir);
-  } else {
-    ensureSkills(cliId, adapter.skillsDir);
-  }
-  // askUserQuestion 接管策略：hook 优先 + 非 hook CLI 用 skill 兜底。
-  // - asksViaHook=true（Claude/OpenCode）：通过 hook 拦截原生 AskUserQuestion，删掉
-  //   botmux-ask skill，避免 skill 与 hook 双重弹卡。
-  //   Claude 走 --settings 进程级注入；OpenCode 走 hookInstall 插件写文件。
-  // - asksViaHook 未设（Codex/Cursor/尚未接 hook 的终端原生 CLI）：保留 botmux-ask
-  //   skill 作兜底，让 agent 仍可用 `botmux ask` 把选择题引到飞书。
+  // 安装是稳定动作，留在 once-cache 里跑一次即可（幂等，内容相同不重写）。
+  if (globalInstall) ensureSkills(cliId, skillsDir);
+  // askUserQuestion 接管策略与 skill 文件无关：hook 该装还得装（Codex 无 hook，
+  // 靠 botmux-ask skill / catalog 兜底）。
   if (adapter.hookInstall) {
     try { installHook(cliId, adapter.hookInstall, hookCommandFor(cliId)); }
     catch (err) { logger.warn(`[hook] install failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   }
-  // 命令式 hook 安装（CoCo 走 `coco plugin install`，纯写文件搞不定）。内部自带
-  // try/catch，失败只 warn；与 hookInstall 互斥。
   if (adapter.ensureAskHook) {
     try { adapter.ensureAskHook(); }
     catch (err) { logger.warn(`[hook] ensureAskHook failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   }
-  // botmux-ask 落在与其它 skill 同一目录：plugin 模式下是 {pluginDir}/skills。
-  const askSkillsDir = adapter.pluginDir ? join(adapter.pluginDir, 'skills') : adapter.skillsDir;
-  ensureAskSkill(cliId, askSkillsDir, !adapter.asksViaHook);
+  // botmux-ask 兜底 skill 也只在 global 模式落全局盘；prompt 模式它进 catalog，
+  // off 模式靠 `botmux ask`（见 help）。
+  ensureAskSkill(cliId, skillsDir, globalInstall && !adapter.asksViaHook);
   skillsInstalledCliIds.add(cliId);
 }
 

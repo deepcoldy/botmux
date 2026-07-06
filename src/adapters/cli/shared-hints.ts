@@ -57,8 +57,13 @@ export function buildBotmuxSystemPromptText(opts: {
   locale?: Locale;
   botName?: string;
   botOpenId?: string;
+  /** Optional built-in skill catalog / help pointer for injectsSessionContext
+   *  CLIs that have a global `skillsDir` (genius) running in `prompt` / `off`
+   *  mode — appended after the routing/identity blocks. Claude Code delivers
+   *  skills via --plugin-dir and passes nothing here. */
+  builtinSkillBlock?: string;
 }): string {
-  const { locale, botName, botOpenId } = opts;
+  const { locale, botName, botOpenId, builtinSkillBlock } = opts;
   const unknown = t('ai.identity.unknown', undefined, locale);
   const identityBlock =
     botName || botOpenId
@@ -107,5 +112,6 @@ export function buildBotmuxSystemPromptText(opts: {
     ...whiteboardRouting,
     '</botmux_routing>',
     ...identityBlock,
+    ...(builtinSkillBlock ? ['', builtinSkillBlock] : []),
   ].join('\n');
 }

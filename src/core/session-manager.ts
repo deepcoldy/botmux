@@ -14,6 +14,12 @@ import { logger } from '../utils/logger.js';
 import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
+import {
+  resolveSkillInjectionModeForApp,
+  builtinSkillEntries,
+  buildBuiltinSkillCatalogBlock,
+  builtinSkillHelpPointer,
+} from '../skills/injection-mode.js';
 import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, probePersistentBackendServer, killPersistentSession, type PersistentBackendType } from './persistent-backend.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
 import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
@@ -421,6 +427,26 @@ export function buildNewTopicPrompt(
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
     : '';
 
+  // Built-in skill delivery for CLIs without a per-session skill channel
+  // (codex/gemini/opencode/… — those with a global `skillsDir`). In `prompt`
+  // mode we inline a compact skill catalog here instead of installing files
+  // into the CLI's shared global dir; in `off` mode we only point at the CLI
+  // help. `global` mode installs files (worker-pool ensureCliSkills) and adds
+  // nothing to the prompt. Claude-family (injectsSessionContext) inject skills
+  // via --plugin-dir, so they're excluded.
+  let skillBlock = '';
+  if (!adapter.injectsSessionContext && adapter.skillsDir) {
+    const mode = resolveSkillInjectionModeForApp(opts?.larkAppId);
+    if (mode === 'prompt') {
+      // excludeRoutingCovered: send/history/quoted/bots live in <botmux_routing>
+      // already, so the catalog carries only the additional task capabilities.
+      const entries = builtinSkillEntries({ asksViaHook: adapter.asksViaHook, whiteboardEnabled: whiteboardEnabled(), excludeRoutingCovered: true });
+      skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
+    } else if (mode === 'off') {
+      skillBlock = builtinSkillHelpPointer(locale);
+    }
+  }
+
   const unknown = t('ai.identity.unknown', undefined, locale);
   let identityBlock = '';
   if (botIdentity && (botIdentity.name || botIdentity.openId)) {
@@ -477,6 +503,7 @@ export function buildNewTopicPrompt(
   // misread as part of the user's text.
   if (!adapter.injectsSessionContext) {
     if (routingBlock) parts.push(routingBlock);
+    if (skillBlock) parts.push(skillBlock);
     if (identityBlock) parts.push(identityBlock);
     parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
   }
