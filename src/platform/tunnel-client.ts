@@ -128,6 +128,10 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       for (const c of dials) {
         if (c === winner) continue;
         try { c.removeAllListeners(); } catch { /* ignore */ }
+        // 关键：补一个吞异常的 error handler。对仍在 CONNECTING 的 ws 调 terminate() 会「异步」emit('error')
+        //（"WebSocket was closed before the connection was established"）；上面刚把 error listener 摘了，
+        // 没 handler 就成未捕获 'error' 事件把 dashboard 进程打挂 → 无限重连、平台侧 machine_offline。
+        c.on('error', () => { /* swallow */ });
         try { c.terminate(); } catch { /* ignore */ }
       }
       dials.clear();
@@ -428,6 +432,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       if (controlDials) {
         for (const c of controlDials) {
           try { c.removeAllListeners(); } catch { /* ignore */ }
+          c.on('error', () => { /* swallow：同 dropLosers，terminate CONNECTING 态会异步 emit('error') */ });
           try { c.terminate(); } catch { /* ignore */ }
         }
         controlDials = null;
