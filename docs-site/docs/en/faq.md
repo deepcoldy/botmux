@@ -28,6 +28,19 @@ First figure out which `/login` it is:
 - **Lark-side App Token rejected when calling the API**: Send `/login` in the topic → click the authorization link → copy the callback URL the browser redirects to (`http://127.0.0.1:9768/callback?...`; it's normal for the page not to load) back into the topic.
 - **Model-gateway-side 403**: This is unrelated to Lark authorization and is usually an environment-variable / gateway-token issue. A common root cause is bash users putting variables in `.bash_profile` where `bash -i` doesn't read them (see [Common Pitfalls](/en/pitfalls)).
 
+**macOS note: claude's login token has two stores — keychain and file — and a split between them is the main reason claude shows `Please run /login` on macOS.**
+
+- **keychain** (the keychain item `Claude Code-credentials`): used by **claude running in the GUI** and by **botmux's default (non-isolated) config**;
+- **file** (`~/.claude/.credentials.json`): running `/login` over **SSH can only write here**.
+
+The catch: **as long as the keychain item exists, claude reads the token from the keychain and never reads the file** — even when the file holds the freshly updated token. So you get "SSH `/login` clearly succeeded (it only wrote the file), yet the GUI / non-isolated bot still reads the stale keychain token and says `Please run /login`." On top of that, claude rotates the refresh token on each refresh, so whichever process refreshes first invalidates the other's token, dropping everyone's login.
+
+**Recommended (converge onto the file as the single source):**
+
+1. **Don't use claude code in the GUI** — the GUI writes / refreshes the token into the keychain, creating a second source out of nowhere;
+2. **Update the token by running `/login` over SSH**, so both SSH and botmux use the file as the login-token source;
+3. If a stale keychain item already exists, delete it to converge onto the single file source.
+
 ## Does it support Lark (international, larksuite.com)?
 
 Yes. Both Feishu (feishu.cn) and Lark (international, larksuite.com) work: when you scan to create an app, the tenant type (China / international) is **detected automatically** and remembered; when you paste the AppID/Secret manually, it asks you to choose once. Each bot independently connects to the corresponding domain based on its edition, and the same machine can run Feishu and Lark bots simultaneously, with login credentials isolated per app and not interfering with each other.

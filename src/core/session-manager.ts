@@ -41,7 +41,7 @@ import { repoPickerScanOptions } from '../global-config.js';
 import { usageLimitStateKey } from '../utils/cli-usage-limit.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
-import { resolveRole } from './role-resolver.js';
+import { resolveRoleInjection } from './role-resolver.js';
 import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../services/whiteboard-store.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
@@ -315,11 +315,20 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: L
   return `<attachments hint="${xmlEscape(t('ai.attach.hint', undefined, locale))}">\n${items.join('\n')}\n</attachments>`;
 }
 
-function renderRoleContextBlock(larkAppId: string | undefined, chatId: string | undefined): string {
+function renderRoleContextBlock(
+  larkAppId: string | undefined,
+  chatId: string | undefined,
+  opts?: { followUp?: boolean },
+): string {
   if (!larkAppId || !chatId) return '';
 
-  const { content: roleContent, source: roleSource } = resolveRole(larkAppId, chatId);
+  const { content: roleContent, source: roleSource, injectMode } = resolveRoleInjection(larkAppId, chatId);
   if (!roleContent) return '';
+
+  // "inject once" mode: emit the role only on the opening/refork turn (which
+  // rebuilds the CLI's full context) and skip it on follow-up messages, so a
+  // large persona isn't re-sent every round. Default 'every' keeps re-injecting.
+  if (opts?.followUp && injectMode === 'once') return '';
 
   const ctx = roleSource === 'team' ? 'team' : 'group';
   return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${roleContent}\n</role>`;
@@ -506,7 +515,7 @@ export function buildFollowUpContent(
   opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string },
 ): string {
   const parts: string[] = [];
-  const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
+  const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext

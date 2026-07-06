@@ -9,7 +9,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config, getDashboardExternalHost } from './config.js';
 import { repoPickerScanOptions } from './global-config.js';
-import { buildDashboardUrl } from './core/dashboard-url.js';
+import { buildDashboardUrls } from './core/dashboard-url.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
 import { botmuxWrapperFiles } from './core/botmux-wrapper.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
@@ -366,6 +366,12 @@ function silentTurnReactionsFor(ds: DaemonSession): boolean {
   } catch { return false; }
 }
 
+function receivedReactionEmojiFor(ds: DaemonSession): string {
+  try {
+    return getBot(ds.larkAppId).config.receivedReactionEmoji || RECEIVED_REACTION_EMOJI_TYPE;
+  } catch { return RECEIVED_REACTION_EMOJI_TYPE; }
+}
+
 function readSessionFreshFromDisk(sessionId: string, larkAppId: string): import('./types.js').Session | undefined {
   const paths = [
     join(config.session.dataDir, `sessions-${larkAppId}.json`),
@@ -410,7 +416,7 @@ export async function noteTurnReceived(ds: DaemonSession, triggerMessageId: stri
   // so a registered entry is always in place before its own turn can go idle.
   let reactionId: string;
   try {
-    reactionId = await addReaction(ds.larkAppId, triggerMessageId, RECEIVED_REACTION_EMOJI_TYPE);
+    reactionId = await addReaction(ds.larkAppId, triggerMessageId, receivedReactionEmojiFor(ds));
   } catch (err) {
     logger.debug(`[reaction] received add failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
     return;
@@ -3836,19 +3842,21 @@ function resolvePrimaryOwnerOpenId(larkAppId: string): string | undefined {
 /** Build the current dashboard URL (active token, not a rotation) from the
  *  dashboard process's persisted `.dashboard-port` / `.dashboard-token`. Falls
  *  back to a token-less base URL if the dashboard hasn't published a token yet. */
-function dashboardUrlForReport(): string | undefined {
+function dashboardUrlForReport(): { url?: string; localUrl?: string } {
   try {
     const dir = join(homedir(), '.botmux');
     const portFile = join(dir, '.dashboard-port');
     const tokenFile = join(dir, '.dashboard-token');
     const port = existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : String(config.dashboard.port);
     const tok = existsSync(tokenFile) ? readFileSync(tokenFile, 'utf8').trim() : '';
-    // buildDashboardUrl swaps in the central-platform machine subdomain when
+    // buildDashboardUrls swaps in the central-platform machine subdomain when
     // 远程访问 is on and this host is bound, so the restart-report DM links to the
-    // platform dashboard instead of an unreachable local host:port.
-    return buildDashboardUrl({ host: getDashboardExternalHost(), port, token: tok || undefined });
+    // platform dashboard instead of an unreachable local host:port. In that case
+    // localUrl carries the direct host:port fallback so the owner can still reach
+    // the dashboard if the platform is down.
+    return buildDashboardUrls({ host: getDashboardExternalHost(), port, token: tok || undefined });
   } catch {
-    return undefined;
+    return {};
   }
 }
 
@@ -4239,10 +4247,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // After an intentional restart, DM the owner a summary. Delayed a few
     // seconds so the dashboard process can publish its token first.
     setTimeout(() => {
+      const dash = dashboardUrlForReport();
       void sendRestartReportIfPending({
         primaryLarkAppId: cfg.larkAppId,
         ownerOpenId: resolvePrimaryOwnerOpenId(cfg.larkAppId),
-        dashboardUrl: dashboardUrlForReport(),
+        dashboardUrl: dash.url,
+        dashboardLocalUrl: dash.localUrl,
         sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive').then(() => undefined),
         log: (m) => logger.info(`[restart-report] ${m}`),
       });

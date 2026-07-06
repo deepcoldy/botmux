@@ -27,11 +27,14 @@ interface GroupInfo {
   memberBots: BotInfo[];
 }
 
+type RoleInjectMode = 'every' | 'once';
+
 interface RoleData {
   chatId: string;
   content: string | null;
   byteLength: number;
   hasRole: boolean;
+  injectMode?: RoleInjectMode;
   effectiveContent?: string | null;
   effectiveSource?: string;
   hasEffectiveRole?: boolean;
@@ -60,7 +63,10 @@ interface RoleProfileEntryData {
   hasEntry: boolean;
 }
 
-const MAX_ROLE_BYTES = 4096;
+// Keep in sync with MAX_ROLE_BYTES in core/role-resolver.ts (this is a browser
+// bundle, so it can't import the Node module — mirror the value here).
+const MAX_ROLE_BYTES = 32768;
+const ROLE_WARN_BYTES = Math.floor(MAX_ROLE_BYTES * 0.95);
 const PROFILE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
 let cache: GroupInfo[] = [];
@@ -75,6 +81,7 @@ let activeTab: 'groups' | 'profiles' = 'groups';
 let selectedGroupId: string | null = null;
 let selectedBotId: string | null = null;
 let editingContent = '';
+let editingInjectMode: RoleInjectMode = 'every';
 let expandedGroups = new Set<string>();
 
 let selectedProfileId: string | null = null;
@@ -205,11 +212,22 @@ async function refreshGroupProfileContext(generation = activeRolesGeneration): P
   renderTree((document.getElementById('roles-search') as HTMLInputElement | null)?.value ?? '');
 }
 
-async function saveRole(larkAppId: string, chatId: string, content: string): Promise<boolean> {
+async function saveRole(larkAppId: string, chatId: string, content: string, injectMode: RoleInjectMode): Promise<boolean> {
   const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, injectMode }),
+  });
+  return r.ok;
+}
+
+/** Persist only the injection mode (no content) — used when toggling the mode
+ *  select, which can apply even to a chat whose role comes from the team default. */
+async function saveInjectMode(larkAppId: string, chatId: string, injectMode: RoleInjectMode): Promise<boolean> {
+  const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ injectMode }),
   });
   return r.ok;
 }
@@ -395,10 +413,13 @@ async function selectBot(groupId: string, botId: string, generation = activeRole
   if (chatIdEl) chatIdEl.textContent = `${groupId}  ·  ${botId}`;
 
   editingContent = role.content ?? '';
+  editingInjectMode = role.injectMode === 'once' ? 'once' : 'every';
   if (textarea) {
     textarea.value = editingContent;
     textarea.focus();
   }
+  const injectSel = document.getElementById('roles-editor-inject-mode') as HTMLSelectElement | null;
+  if (injectSel) injectSel.value = editingInjectMode;
   updateByteCount();
   updatePreview();
   renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
@@ -412,7 +433,7 @@ function updateByteCount(): void {
   if (!el) return;
   const len = byteLength(editingContent);
   el.textContent = `${len} / ${MAX_ROLE_BYTES} bytes`;
-  el.className = `roles-bytecount ${len > 3800 ? 'warn' : ''} ${len > MAX_ROLE_BYTES ? 'over' : ''}`;
+  el.className = `roles-bytecount ${len > ROLE_WARN_BYTES ? 'warn' : ''} ${len > MAX_ROLE_BYTES ? 'over' : ''}`;
   updateSaveButton(len);
 }
 
@@ -437,6 +458,7 @@ function resetEditor(): void {
   selectedGroupId = null;
   selectedBotId = null;
   editingContent = '';
+  editingInjectMode = 'every';
 
   const empty = document.getElementById('roles-editor-empty');
   const form = document.getElementById('roles-editor-form');
@@ -662,7 +684,7 @@ function updateProfileByteCount(): void {
   if (!el) return;
   const len = byteLength(profileEditingContent);
   el.textContent = `${len} / ${MAX_ROLE_BYTES} bytes`;
-  el.className = `roles-bytecount ${len > 3800 ? 'warn' : ''} ${len > MAX_ROLE_BYTES ? 'over' : ''}`;
+  el.className = `roles-bytecount ${len > ROLE_WARN_BYTES ? 'warn' : ''} ${len > MAX_ROLE_BYTES ? 'over' : ''}`;
   if (btn) btn.disabled = len > MAX_ROLE_BYTES || profileEditingContent.trim().length === 0;
 }
 
@@ -813,6 +835,9 @@ export function wireRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles'):
       const textarea = document.getElementById('roles-editor-textarea') as HTMLTextAreaElement;
       if (textarea) textarea.value = role.content ?? '';
       editingContent = role.content ?? '';
+      editingInjectMode = role.injectMode === 'once' ? 'once' : 'every';
+      const injectSel = document.getElementById('roles-editor-inject-mode') as HTMLSelectElement | null;
+      if (injectSel) injectSel.value = editingInjectMode;
       updateByteCount();
       updatePreview();
       const delBtn = document.getElementById('roles-delete');
@@ -826,7 +851,7 @@ export function wireRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles'):
     btn.disabled = true;
     btn.textContent = '...';
     try {
-      const ok = await saveRole(selectedBotId, selectedGroupId, editingContent);
+      const ok = await saveRole(selectedBotId, selectedGroupId, editingContent, editingInjectMode);
       if (!isLive()) return;
       if (ok) {
         await loadGroups();
@@ -886,6 +911,35 @@ export function wireRolesSurface(root: HTMLElement, tab: 'groups' | 'profiles'):
     editingContent = (e.target as HTMLTextAreaElement).value;
     updateByteCount();
     updatePreview();
+  });
+
+  // Injection-mode select auto-saves on change (it can apply even when the chat
+  // has no own role and inherits the team default, so it doesn't ride only on
+  // the content Save button).
+  on(root.querySelector('#roles-editor-inject-mode'), 'change', async (e) => {
+    if (!isLive()) return;
+    if (!selectedGroupId || !selectedBotId) return;
+    const sel = e.target as HTMLSelectElement;
+    const mode: RoleInjectMode = sel.value === 'once' ? 'once' : 'every';
+    const prev = editingInjectMode;
+    editingInjectMode = mode;
+    sel.disabled = true;
+    try {
+      const ok = await saveInjectMode(selectedBotId, selectedGroupId, mode);
+      if (!isLive()) return;
+      if (!ok) {
+        editingInjectMode = prev;
+        sel.value = prev;
+      }
+      const statusEl = document.createElement('span');
+      statusEl.className = `roles-saved-flash ${ok ? '' : 'roles-save-error'}`;
+      statusEl.textContent = ` ${ok ? t('roles.saved') : t('roles.saveFailed')}`;
+      root.querySelector('.roles-editor-inject')?.appendChild(statusEl);
+      scheduleRolesTimer(() => statusEl.remove(), ok ? 2000 : 3000);
+    } finally {
+      if (!isLive()) return;
+      sel.disabled = false;
+    }
   });
 
   on(root.querySelector('#roles-profile-search'), 'input', (e) => {

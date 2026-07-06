@@ -21,6 +21,10 @@ export interface RestartReportInput {
   /** Unfinished sessions across all bots. */
   sessionCount: number;
   dashboardUrl?: string;
+  /** Local host:port direct link — set only when `dashboardUrl` routes through
+   *  the central platform, so the owner can still reach the dashboard if the
+   *  platform is down. */
+  dashboardLocalUrl?: string;
   /** kind==='update' only: the version delta + changelog body. */
   oldVersion?: string;
   newVersion?: string;
@@ -46,6 +50,7 @@ export function buildRestartReportText(input: RestartReportInput, locale?: Local
 
   lines.push(t('restart.unfinished_sessions', { count: input.sessionCount }, locale));
   if (input.dashboardUrl) lines.push(t('restart.dashboard', { url: input.dashboardUrl }, locale));
+  if (input.dashboardLocalUrl) lines.push(t('restart.dashboard_local', { url: input.dashboardLocalUrl }, locale));
 
   if (input.kind === 'update' && input.changelog && input.changelog.trim()) {
     lines.push('');
@@ -77,6 +82,9 @@ export interface RestartReportWiring {
   /** Owner to DM (bot-0's first resolved allowedUser); undefined → skip the DM. */
   ownerOpenId: string | undefined;
   dashboardUrl: string | undefined;
+  /** Local host:port direct fallback link (set only when dashboardUrl is a
+   *  central-platform link). */
+  dashboardLocalUrl?: string | undefined;
   /** Send the interactive card as a p2p DM to the owner. */
   sendCard: (openId: string, cardJson: string) => Promise<void>;
   now?: number;
@@ -108,6 +116,7 @@ export async function sendRestartReportIfPending(w: RestartReportWiring): Promis
     version,
     sessionCount,
     dashboardUrl: w.dashboardUrl,
+    dashboardLocalUrl: w.dashboardLocalUrl,
     oldVersion: intent.oldVersion,
     newVersion: intent.newVersion,
     changelog,

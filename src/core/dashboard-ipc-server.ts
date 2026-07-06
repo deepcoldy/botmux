@@ -42,7 +42,7 @@ import { locateLimiter } from './dashboard-locate.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
-import { isValidRoleChatId, resolveRole, resolveRoleFile, writeRoleFile, deleteRoleFile } from './role-resolver.js';
+import { isValidRoleChatId, resolveRole, resolveRoleFile, writeRoleFile, deleteRoleFile, readRoleInjectMode, writeRoleInjectMode, deleteRoleInjectMode, type RoleInjectMode } from './role-resolver.js';
 import {
   deleteRoleProfileEntry,
   deleteRoleProfileIfEmpty,
@@ -1190,9 +1190,9 @@ ipcRoute('DELETE', '/api/oncall/:chatId', async (_req, res, p) => {
 });
 
 // ─── Role management (dashboard) ───────────────────────────────────────────
-// GET    /api/roles/:chatId  → { chatId, content, byteLength, effectiveContent, effectiveSource }
-// PUT    /api/roles/:chatId  body: {content} → write role file
-// DELETE /api/roles/:chatId  → remove role file
+// GET    /api/roles/:chatId  → { chatId, content, byteLength, injectMode, effectiveContent, effectiveSource }
+// PUT    /api/roles/:chatId  body: {content?, injectMode?} → write role file and/or injection mode
+// DELETE /api/roles/:chatId  → remove role file (and injection-mode sidecar)
 
 ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
@@ -1204,6 +1204,7 @@ ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
     content,
     byteLength: content ? Buffer.byteLength(content, 'utf-8') : 0,
     hasRole: content !== null,
+    injectMode: readRoleInjectMode(cachedLarkAppId, p.chatId),
     effectiveContent: effective.content,
     effectiveSource: effective.source,
     effectiveByteLength: effective.content ? Buffer.byteLength(effective.content, 'utf-8') : 0,
@@ -1214,13 +1215,23 @@ ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
 ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
-  let body: { content?: unknown };
-  try { body = await readJsonBody<{ content?: string }>(req); }
+  let body: { content?: unknown; injectMode?: unknown };
+  try { body = await readJsonBody<{ content?: string; injectMode?: string }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  const content = typeof body.content === 'string' ? body.content.trim() : '';
-  if (!content) return jsonRes(res, 400, { ok: false, error: 'content_required' });
+  // injectMode is a per-chat setting that can be updated on its own (no content)
+  // — e.g. toggling "inject once" for a chat whose effective role is the team
+  // default. Only 'every'/'once' are accepted; anything else is ignored.
+  const injectMode: RoleInjectMode | undefined =
+    body.injectMode === 'once' ? 'once' : body.injectMode === 'every' ? 'every' : undefined;
+  const hasContentField = typeof body.content === 'string';
+  const content = hasContentField ? (body.content as string).trim() : '';
+  if (!hasContentField && injectMode === undefined) {
+    return jsonRes(res, 400, { ok: false, error: 'content_or_inject_mode_required' });
+  }
+  if (hasContentField && !content) return jsonRes(res, 400, { ok: false, error: 'content_required' });
   try {
-    writeRoleFile(cachedLarkAppId, p.chatId, content);
+    if (hasContentField) writeRoleFile(cachedLarkAppId, p.chatId, content);
+    if (injectMode !== undefined) writeRoleInjectMode(cachedLarkAppId, p.chatId, injectMode);
     jsonRes(res, 200, { ok: true });
   } catch (e) {
     jsonRes(res, 500, { ok: false, error: String(e) });
@@ -1231,6 +1242,7 @@ ipcRoute('DELETE', '/api/roles/:chatId', async (_req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   const existed = deleteRoleFile(cachedLarkAppId, p.chatId);
+  deleteRoleInjectMode(cachedLarkAppId, p.chatId);
   jsonRes(res, 200, { ok: true, existed });
 });
 

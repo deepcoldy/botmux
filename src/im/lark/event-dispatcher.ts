@@ -1823,7 +1823,16 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // 与「同部署兄弟 bot」(isKnownPeerBot) 对等，但覆盖跨部署的团队 peer。
           // 这正是「加入团队即免 introduce/grant」的接收闸：身份只认 union_id /
           // 团队群成员，绝不认自报名字（防同名 bot 冒名蹭权）。
-          if ((ctx.scope === 'chat' || decision.source === 'regular-group-thread' || forcedTopic) && !findOncallChat(larkAppId, chatId)) {
+          //
+          // 开放模式（未配任何 allowlist：allowedUsers / allowedChatGroups /
+          // globalGrants 全空）与人侧 evaluateTalk 的 `reason:'open'`（1011 行）对齐：
+          // 「谁都能触发」本应人、bot 同权。过去这道 gate 漏了这一腿，导致开放模式下
+          // 外部 bot @ 仍被丢弃，必须真人先 @ 一次建 session（ownsSession=true）才救活。
+          // 补上 hasConfiguredAllowlist 短路后两条路径统一：一旦配了任一 allowlist，
+          // 立刻恢复「限制态」设闸，安全边界不变。
+          if ((ctx.scope === 'chat' || decision.source === 'regular-group-thread' || forcedTopic)
+              && !findOncallChat(larkAppId, chatId)
+              && hasConfiguredAllowlist(getBot(larkAppId))) {
             const ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false;
             if (!ownsSession
                 && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)

@@ -109,6 +109,8 @@
 | `brandLabel` | 卡片底部品牌文案。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。纯样式，不影响路由 / 权限 |
 | `disableStreamingCard` | `true` 时彻底不发实时流式 session 卡片（web 终端仍跑、最终答复仍经 `botmux send` 到达，只是没有自动刷新的状态卡）。给嫌实时卡吵的用户 |
 | `silentTurnReactions` | `true` 时，无卡片会话不再给触发消息添加 GoGoGo / DONE reaction。只影响 `disableStreamingCard` 或 `noCardChats` 关闭实时卡片后的轻量状态提示；默认 `false` |
+| `receivedReactionEmoji` | 无卡片会话「已收到」reaction 的飞书 emoji_type；`undefined`=默认 `GoGoGo`（冲!）。自由字符串，填错只是静默不加表情（best-effort） |
+| `doneReactionEmoji` | 无卡片会话「已完成」reaction 的飞书 emoji_type；`undefined`=默认 `DONE`（✅）。设成与 `receivedReactionEmoji` 相同值可让完成态不翻脸——适合 idle 判定可能提前触发的 CLI（如 Pi），避免过早出现误导性的 ✅ |
 | `writableTerminalLinkInCard` | `true` 时卡片正文直接内嵌**可写**终端链接（带 token，看得到卡片的人都能操作）；默认藏在「获取写权限」按钮后私发给点击者。`disableStreamingCard` 开启时无意义 |
 | `privateCard` | `true` 时 `/card` 走 ephemeral 私有卡片，仅 `allowedUsers` 可见（talk 授权与裸触发者收不到），仅普通 `group` 聊天有效，且不能 live 更新。只作用于 `/card` 命令本身 |
 

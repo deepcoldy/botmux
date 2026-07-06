@@ -51,6 +51,14 @@ function RolesPage(props: { tab: RolesTab }) {
             <div className="roles-editor-meta">
               <span id="roles-editor-chat-id" className="roles-editor-meta-line" />
             </div>
+            <div className="roles-editor-inject">
+              <label htmlFor="roles-editor-inject-mode">{tr('roles.injectModeLabel')}</label>
+              <select id="roles-editor-inject-mode">
+                <option value="every">{tr('roles.injectModeEvery')}</option>
+                <option value="once">{tr('roles.injectModeOnce')}</option>
+              </select>
+              <span className="roles-editor-inject-hint">{tr('roles.injectModeHint')}</span>
+            </div>
             <textarea id="roles-editor-textarea" placeholder={tr('roles.editorPlaceholder')} rows={14} />
             <div className="roles-editor-footer">
               <span id="roles-editor-bytecount" className="roles-bytecount" />

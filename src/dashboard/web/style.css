@@ -327,6 +327,35 @@ a { color: inherit; }
   white-space: nowrap;
 }
 
+/* 文档站外链——沿用主题菜单 chip 的外观，和其它 topbar 控件对齐 */
+.topbar-docs-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: border-color .15s ease;
+}
+.topbar-docs-link:hover { border-color: var(--muted); }
+.topbar-docs-link svg {
+  display: block;
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 /* Theme dropdown — custom listbox so each option can show a real Lucide line
    icon (a native <select> can't render SVG). Sits with the other topbar chips. */
 .theme-menu { position: relative; }
@@ -2932,6 +2961,31 @@ input.row-select,
   font-size: 11px;
   color: var(--faint);
   font-family: var(--mono);
+}
+.roles-editor-inject {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 2px 0 -2px;
+}
+.roles-editor-inject > label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+}
+/* Inherit the global themed <select> look (surface bg, border, chevron); only
+   nudge it more compact for this inline control. */
+.roles-editor-inject > select {
+  min-height: 28px;
+  padding: 3px 26px 3px 9px;
+  font-size: 12px;
+}
+.roles-editor-inject-hint {
+  font-size: 11px;
+  color: var(--faint);
+  flex: 1 1 240px;
+  min-width: 160px;
 }
 .roles-profile-detail {
   gap: 16px;

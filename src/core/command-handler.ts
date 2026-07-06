@@ -51,7 +51,7 @@ import { canOperate } from '../im/lark/event-dispatcher.js';
 import { buildSafeInsightReport } from '../services/insight/report.js';
 import type { SafeInsightReport } from '../services/insight/types.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
-import { writeRoleFile, deleteRoleFile, resolveRole, resolveRoleFile, resolveTeamRoleFile, writeTeamRoleFile, deleteTeamRoleFile } from './role-resolver.js';
+import { writeRoleFile, deleteRoleFile, resolveRole, resolveRoleFile, resolveTeamRoleFile, writeTeamRoleFile, deleteTeamRoleFile, MAX_ROLE_BYTES } from './role-resolver.js';
 import { getBotCapability, setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
 import {
   deleteRoleProfileEntry,
@@ -505,7 +505,7 @@ async function handleRoleCommand(
       const content = teamSet[1].trim();
       if (!content) { await sessionReply(rootId, t('role.set_empty', undefined, loc)); return; }
       writeTeamRoleFile(larkAppId, content);
-      await sessionReply(rootId, t('role.team_saved', { bytes: Buffer.byteLength(content, 'utf-8'), max: 4096 }, loc));
+      await sessionReply(rootId, t('role.team_saved', { bytes: Buffer.byteLength(content, 'utf-8'), max: MAX_ROLE_BYTES }, loc));
       return;
     }
     if (teamArgs === 'delete' || teamArgs === '删除') {
@@ -514,7 +514,7 @@ async function handleRoleCommand(
     }
     const content = resolveTeamRoleFile(larkAppId);
     if (content) {
-      await sessionReply(rootId, `${t('role.team_current', undefined, loc)}\n\`\`\`markdown\n${content}\n\`\`\`\n${t('role.byte_count', { bytes: Buffer.byteLength(content, 'utf-8'), max: 4096 }, loc)}`);
+      await sessionReply(rootId, `${t('role.team_current', undefined, loc)}\n\`\`\`markdown\n${content}\n\`\`\`\n${t('role.byte_count', { bytes: Buffer.byteLength(content, 'utf-8'), max: MAX_ROLE_BYTES }, loc)}`);
     } else {
       await sessionReply(rootId, t('role.team_empty', undefined, loc));
     }
@@ -548,7 +548,7 @@ async function handleRoleCommand(
     if (content) {
       const len = Buffer.byteLength(content, 'utf-8');
       const srcLabel = source === 'chat' ? t('role.src_chat', undefined, loc) : t('role.src_team', undefined, loc);
-      await sessionReply(rootId, `${t('role.current', undefined, loc)} ${srcLabel}\n\`\`\`markdown\n${content}\n\`\`\`\n${t('role.byte_count', { bytes: len, max: 4096 }, loc)}`);
+      await sessionReply(rootId, `${t('role.current', undefined, loc)} ${srcLabel}\n\`\`\`markdown\n${content}\n\`\`\`\n${t('role.byte_count', { bytes: len, max: MAX_ROLE_BYTES }, loc)}`);
     } else {
       await sessionReply(rootId, t('role.empty', undefined, loc));
     }
@@ -565,7 +565,7 @@ async function handleRoleCommand(
     }
     writeRoleFile(larkAppId, chatId, content);
     const len = Buffer.byteLength(content, 'utf-8');
-    await sessionReply(rootId, t('role.saved_via_cmd', { bytes: len, max: 4096 }, loc));
+    await sessionReply(rootId, t('role.saved_via_cmd', { bytes: len, max: MAX_ROLE_BYTES }, loc));
     return;
   }
 

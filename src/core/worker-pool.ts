@@ -174,6 +174,12 @@ function silentTurnReactions(ds: DaemonSession): boolean {
   } catch { return false; }
 }
 
+function doneReactionEmojiFor(ds: DaemonSession): string {
+  try {
+    return getBot(ds.larkAppId).config.doneReactionEmoji || DONE_REACTION_EMOJI_TYPE;
+  } catch { return DONE_REACTION_EMOJI_TYPE; }
+}
+
 // Per-bot opt-in: the writable terminal link to embed directly in the streaming
 // card body (token included). Returns undefined unless the bot enabled it AND
 // the worker port/token are known. Exported for card-handler's re-renders so the
@@ -2551,6 +2557,7 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   // Detach the batch first so a second idle edge can't double-flip it.
   ds.pendingAckReactions = [];
   const silent = silentTurnReactions(ds);
+  const doneEmoji = doneReactionEmojiFor(ds);
   for (const ack of list) {
     if (ack.reactionId) {
       try {
@@ -2561,7 +2568,7 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
     }
     if (silent) continue;
     try {
-      await addReaction(ds.larkAppId, ack.messageId, DONE_REACTION_EMOJI_TYPE);
+      await addReaction(ds.larkAppId, ack.messageId, doneEmoji);
     } catch (err: any) {
       logger.debug(`[reaction] failed to add done reaction to ${ack.messageId}: ${err?.message ?? err}`);
     }

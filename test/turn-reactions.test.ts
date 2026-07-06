@@ -45,7 +45,7 @@ function makeDs(over: Partial<DaemonSession> = {}): DaemonSession {
 
 // Reactions are auto-on for card-off sessions, so the gate is driven by
 // disableStreamingCard (streaming card on → no reactions; off → reactions).
-function registerWith(reactionsOn: boolean, opts: { silentTurnReactions?: boolean } = {}) {
+function registerWith(reactionsOn: boolean, opts: { silentTurnReactions?: boolean; receivedReactionEmoji?: string; doneReactionEmoji?: string } = {}) {
   registerBot({
     larkAppId: APP,
     larkAppSecret: 's',
@@ -53,6 +53,8 @@ function registerWith(reactionsOn: boolean, opts: { silentTurnReactions?: boolea
     allowedUsers: ['ou_o'],
     disableStreamingCard: reactionsOn || undefined,
     silentTurnReactions: opts.silentTurnReactions || undefined,
+    receivedReactionEmoji: opts.receivedReactionEmoji,
+    doneReactionEmoji: opts.doneReactionEmoji,
   });
 }
 
@@ -186,5 +188,33 @@ describe('two-phase turn reactions', () => {
     await finishTurnReactions(ds);
     expect(mocks.removeReaction).not.toHaveBeenCalled();
     expect(mocks.addReaction).not.toHaveBeenCalled();
+  });
+
+  it('custom emoji: bots.json overrides the received / done emoji_type', async () => {
+    registerWith(true, { receivedReactionEmoji: 'OK', doneReactionEmoji: 'Thumbsup' });
+    const ds = makeDs();
+
+    await noteTurnReceived(ds, 'om_a');
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'OK');
+
+    mocks.addReaction.mockClear();
+    await finishTurnReactions(ds);
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'Thumbsup');
+  });
+
+  it('received == done emoji: turn-end keeps the marker unchanged (Pi premature-idle guard)', async () => {
+    // Both configured to GoGoGo — a premature idle removes then re-adds the same
+    // 冲!, so a misleading ✅ never appears even if idle fires mid-turn.
+    registerWith(true, { receivedReactionEmoji: 'GoGoGo', doneReactionEmoji: 'GoGoGo' });
+    const ds = makeDs();
+
+    await noteTurnReceived(ds, 'om_a');
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
+
+    mocks.addReaction.mockClear();
+    await finishTurnReactions(ds);
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
+    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
   });
 });

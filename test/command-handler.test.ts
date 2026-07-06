@@ -55,6 +55,7 @@ vi.mock('../src/global-config.js', () => ({
 
 // Mock role/profile stores so /role routing tests assert on calls (no real FS).
 vi.mock('../src/core/role-resolver.js', () => ({
+  MAX_ROLE_BYTES: 32 * 1024,
   writeRoleFile: vi.fn(),
   deleteRoleFile: vi.fn(() => true),
   resolveRoleFile: vi.fn(() => null),

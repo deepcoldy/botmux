@@ -10,7 +10,7 @@ vi.mock('../src/platform/binding.js', () => ({
   platformMachineBaseUrl: vi.fn(() => null),
 }));
 
-import { buildDashboardUrl } from '../src/core/dashboard-url.js';
+import { buildDashboardUrl, buildDashboardUrls } from '../src/core/dashboard-url.js';
 import { isRemoteAccessEnabled } from '../src/global-config.js';
 import { platformMachineBaseUrl } from '../src/platform/binding.js';
 
@@ -63,5 +63,46 @@ describe('buildDashboardUrl', () => {
     expect(buildDashboardUrl({ host: '1.2.3.4', port: 7891 })).toBe(
       'https://m-deadbeef.botmux.example/',
     );
+  });
+});
+
+describe('buildDashboardUrls', () => {
+  beforeEach(() => {
+    setRemote(false);
+    setPlatform(null);
+  });
+
+  it('local-only: no localUrl fallback when the primary is already local', () => {
+    expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' })).toEqual({
+      url: 'http://1.2.3.4:7891/?t=abc',
+      localUrl: undefined,
+    });
+  });
+
+  it('remote-on but unbound: stays local, still no fallback (primary is local)', () => {
+    setRemote(true);
+    setPlatform(null);
+    expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' })).toEqual({
+      url: 'http://1.2.3.4:7891/?t=abc',
+      localUrl: undefined,
+    });
+  });
+
+  it('remote-on + bound: platform primary + local ip:port fallback (same token)', () => {
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' })).toEqual({
+      url: 'https://m-deadbeef.botmux.example/?t=abc',
+      localUrl: 'http://1.2.3.4:7891/?t=abc',
+    });
+  });
+
+  it('remote-on + bound, token-less: both forms drop the token query', () => {
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891 })).toEqual({
+      url: 'https://m-deadbeef.botmux.example/',
+      localUrl: 'http://1.2.3.4:7891/',
+    });
   });
 });

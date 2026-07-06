@@ -869,7 +869,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const fv: Record<string, string> = (action as any)?.form_value ?? {};
       const raw = String((fk ? fv[fk] : '') ?? '').trim();
       if (fk === 'teamRole') {
-        if (raw) writeTeamRoleFile(larkAppId, raw.slice(0, 4096)); else deleteTeamRoleFile(larkAppId);
+        // writeTeamRoleFile truncates by UTF-8 byte length (MAX_ROLE_BYTES); do
+        // not pre-slice by JS char count here (would mis-cut CJK).
+        if (raw) writeTeamRoleFile(larkAppId, raw); else deleteTeamRoleFile(larkAppId);
         logger.info(`[config:${larkAppId}] team role ${raw ? 'set' : 'cleared'} via card`);
         return { toast: { type: 'success', content: t('card.config.text_saved', undefined, loc) } };
       }

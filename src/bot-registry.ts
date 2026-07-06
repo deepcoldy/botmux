@@ -486,6 +486,19 @@ export interface BotConfig {
    */
   silentTurnReactions?: boolean;
   /**
+   * Feishu emoji_type for the "received" turn reaction in card-off sessions.
+   * Undefined → default GoGoGo (冲!). Free-form string; a bad emoji_type just
+   * silently fails to attach (addReaction is best-effort).
+   */
+  receivedReactionEmoji?: string;
+  /**
+   * Feishu emoji_type for the "done" turn reaction. Undefined → default DONE (✅).
+   * Set this EQUAL to receivedReactionEmoji to keep the marker visually
+   * unchanged on turn-end — useful for CLIs whose idle detection can fire early
+   * (e.g. Pi during model-thinking gaps), where a premature ✅ would mislead.
+   */
+  doneReactionEmoji?: string;
+  /**
    * Conversation mode for 1:1 private chats (DMs) with the bot:
    *   - 'thread' (default, stored as undefined): every top-level DM message
    *     starts a fresh thread-scoped session — the official/legacy behavior,
@@ -1189,6 +1202,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
       silentTurnReactions: entry.silentTurnReactions === true || undefined,
+      receivedReactionEmoji: typeof entry.receivedReactionEmoji === 'string' && entry.receivedReactionEmoji.trim()
+        ? entry.receivedReactionEmoji.trim() : undefined,
+      doneReactionEmoji: typeof entry.doneReactionEmoji === 'string' && entry.doneReactionEmoji.trim()
+        ? entry.doneReactionEmoji.trim() : undefined,
       // Only 'chat' is meaningful; 'thread' (and anything else) normalizes to
       // undefined — the legacy thread-per-message default. Keeps bots.json clean.
       p2pMode: entry.p2pMode === 'chat' ? 'chat' : undefined,

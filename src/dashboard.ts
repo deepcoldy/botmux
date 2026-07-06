@@ -43,7 +43,7 @@ import {
 } from './setup/cli-selection.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { invalidateGlobalConfigCache, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
-import { buildDashboardUrl } from './core/dashboard-url.js';
+import { buildDashboardUrls, type DashboardUrls } from './core/dashboard-url.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxCliEntry } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
@@ -868,11 +868,12 @@ function verifyCliRequest(req: IncomingMessage, pathname: string):
   return { ok: true };
 }
 
-/** Build the dashboard URL for a token, using the actually-bound port. Routes
- *  through the central-platform machine subdomain when 远程访问 is on and this
- *  host is bound (see buildDashboardUrl); falls back to the local host:port. */
-function dashboardUrlFor(token: string): string {
-  return buildDashboardUrl({ host: config.dashboard.externalHost, port: boundDashboardPort, token });
+/** Build the dashboard URL(s) for a token, using the actually-bound port. The
+ *  primary `url` routes through the central-platform machine subdomain when
+ *  远程访问 is on and this host is bound (see buildDashboardUrls); `localUrl`
+ *  carries the direct host:port fallback in that case (undefined otherwise). */
+function dashboardUrlsFor(token: string): DashboardUrls {
+  return buildDashboardUrls({ host: config.dashboard.externalHost, port: boundDashboardPort, token });
 }
 
 type SkillJobStatus = 'running' | 'succeeded' | 'failed';
@@ -1124,7 +1125,7 @@ const server = createServer(async (req, res) => {
       } catch (e) {
         logger.warn(`[dashboard] Failed to persist token to ${TOKEN_PATH}: ${(e as Error).message}`);
       }
-      return jsonRes(res, 200, { url: dashboardUrlFor(activeToken) });
+      return jsonRes(res, 200, dashboardUrlsFor(activeToken));
     }
 
     // CLI read current URL (HMAC + loopback only) — for the start/restart hint.
@@ -1135,7 +1136,7 @@ const server = createServer(async (req, res) => {
       const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
       if (!activeToken) return jsonRes(res, 404, { error: 'no_active_token' });
-      return jsonRes(res, 200, { url: dashboardUrlFor(activeToken) });
+      return jsonRes(res, 200, dashboardUrlsFor(activeToken));
     }
 
     // CLI 通知绑定变化（HMAC + loopback）——`botmux bind` 写完绑定后捅一下，立即重连平台，

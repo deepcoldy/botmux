@@ -58,11 +58,63 @@ describe('role-resolver storage', () => {
     expect(deleteRoleFile('app1', 'oc_y')).toBe(false); // already gone
   });
 
-  it('truncates content to 4 KB by UTF-8 byte length (CJK is 3 bytes)', async () => {
-    const { writeRoleFile, resolveRoleFile } = await fresh();
-    writeRoleFile('app1', 'oc_big', '中'.repeat(2000)); // 6000 bytes
+  it('truncates content to MAX_ROLE_BYTES by UTF-8 byte length, on a char boundary', async () => {
+    const { writeRoleFile, resolveRoleFile, MAX_ROLE_BYTES } = await fresh();
+    // Write well over the limit in CJK (3 bytes each) so truncation must fire.
+    const overCount = Math.ceil(MAX_ROLE_BYTES / 3) + 1000;
+    writeRoleFile('app1', 'oc_big', '中'.repeat(overCount));
     const got = resolveRoleFile('app1', 'oc_big')!;
-    expect(Buffer.byteLength(got, 'utf-8')).toBeLessThanOrEqual(4096);
+    expect(Buffer.byteLength(got, 'utf-8')).toBeLessThanOrEqual(MAX_ROLE_BYTES);
+    // No partial/replacement char at the cut (would appear as U+FFFD).
+    expect(got).not.toContain('�');
+    // The raised limit is well above the old 4 KB.
+    expect(MAX_ROLE_BYTES).toBeGreaterThan(4096);
+  });
+});
+
+describe('role injection mode', () => {
+  it('defaults to "every" and round-trips "once" / back to "every"', async () => {
+    const { readRoleInjectMode, writeRoleInjectMode } = await fresh();
+    expect(readRoleInjectMode('app1', 'oc_m')).toBe('every');
+    writeRoleInjectMode('app1', 'oc_m', 'once');
+    expect(readRoleInjectMode('app1', 'oc_m')).toBe('once');
+    writeRoleInjectMode('app1', 'oc_m', 'every'); // removes the sidecar
+    expect(readRoleInjectMode('app1', 'oc_m')).toBe('every');
+  });
+
+  it('resolveRoleInjection carries the mode alongside the effective role', async () => {
+    const { writeRoleFile, writeTeamRoleFile, writeRoleInjectMode, resolveRoleInjection } = await fresh();
+    // No role → injectMode is 'every' regardless.
+    expect(resolveRoleInjection('app1', 'oc_r')).toEqual({ content: null, source: 'none', injectMode: 'every' });
+    // Mode applies to the team default too (per-chat setting, not per-source).
+    writeTeamRoleFile('app1', 'TEAM');
+    writeRoleInjectMode('app1', 'oc_r', 'once');
+    expect(resolveRoleInjection('app1', 'oc_r')).toEqual({ content: 'TEAM', source: 'team', injectMode: 'once' });
+    // A per-chat override wins for content; mode is unchanged.
+    writeRoleFile('app1', 'oc_r', 'CHAT');
+    expect(resolveRoleInjection('app1', 'oc_r')).toEqual({ content: 'CHAT', source: 'chat', injectMode: 'once' });
+  });
+
+  it('buildFollowUpContent omits the <role> block when mode is "once", keeps it on "every"', async () => {
+    await fresh();
+    const { writeRoleFile, writeRoleInjectMode } = await import('../src/core/role-resolver.js');
+    writeRoleFile('app1', 'oc_once', 'ONCE_PERSONA');
+    const { buildNewTopicPrompt, buildFollowUpContent } = await import('../src/core/session-manager.js');
+
+    // every (default): role present in both opening + follow-up
+    expect(buildFollowUpContent('hi', 's1', { larkAppId: 'app1', chatId: 'oc_once' })).toContain('ONCE_PERSONA');
+
+    // once: opening keeps it, follow-up drops it
+    writeRoleInjectMode('app1', 'oc_once', 'once');
+    const opening = buildNewTopicPrompt(
+      'hi', 's1', 'claude-code', undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { larkAppId: 'app1', chatId: 'oc_once' },
+    );
+    expect(opening).toContain('ONCE_PERSONA');
+    const followUp = buildFollowUpContent('hi again', 's1', { larkAppId: 'app1', chatId: 'oc_once' });
+    expect(followUp).not.toContain('ONCE_PERSONA');
+    expect(followUp).not.toContain('<role');
   });
 });
 

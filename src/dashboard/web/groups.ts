@@ -347,7 +347,9 @@ export function wireGroupsPage(root: HTMLElement): () => void {
             roleProfileId: roleProfileId || undefined,
           }),
         });
-        const respBody = await r.json();
+        // 兜底：平台反代抖动时可能回非 JSON 体（旧平台）或 502。别再让 r.json() 抛
+        // SyntaxError 弹「网络错误」——解析失败就当作一次失败，走下面的「创建失败」分支。
+        const respBody = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
         if (disposed) return;
         if (respBody.ok && respBody.chatId) {
           renderCreateSuccess(respBody);

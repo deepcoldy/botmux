@@ -28,6 +28,19 @@
 - **飞书侧 App Token 调 API 被拒**：话题里发 `/login` → 点授权链接 → 把浏览器跳转的 callback URL（`http://127.0.0.1:9768/callback?...`，页面打不开是正常的）复制回话题。
 - **模型网关侧 403**：跟飞书授权无关，多为环境变量 / 网关 token 问题，常见根因是 bash 用户把变量写在 `.bash_profile` 没被 `bash -i` 读到（见 [常见踩坑](/pitfalls)）。
 
+**macOS 补充：claude 的登录 token 有 keychain / 文件「双存储」，两者分裂是 macOS 下 claude 报 `Please run /login` 的主要原因。**
+
+- **keychain**（钥匙串条目 `Claude Code-credentials`）：**GUI 里跑 claude** 和 **botmux 默认（非隔离）配置**都走这里；
+- **文件**（`~/.claude/.credentials.json`）：**SSH 里跑 `/login` 只能写到这里**。
+
+坑点：**只要 keychain 条目存在，claude 就只读 keychain 里的 token、不会去读文件**——哪怕文件里才是刚更新的新 token。于是会出现「SSH `/login` 明明成功了（只写进了文件），GUI / 非隔离 bot 却仍读 keychain 里的旧 token、报 `Please run /login`」。再叠加 claude 刷新时 refresh token 会轮换，谁先刷就把对方的 token 作废，导致集体掉登录。
+
+**推荐做法（统一收敛到「文件」单一源）：**
+
+1. **禁止在 GUI 下使用 claude code**——GUI 会往 keychain 写 / 刷 token，凭空制造第二个源；
+2. **统一通过 SSH 跑 `/login` 更新 token**，让 SSH 和 botmux 都以文件作为登录 token 的来源；
+3. keychain 里若已残留旧条目，删掉它、收敛到单一文件源。
+
 ## 支持 Lark 国际版（larksuite.com）吗？
 
 支持。飞书 (feishu.cn) 和 Lark 国际版 (larksuite.com) 都能用：扫码建应用时**自动识别**租户类型（国内 / 国际）并记住，手动粘 AppID/Secret 时会让你选一次。每个机器人按所属版本独立连对应域名，同一台机器可同时跑飞书和 Lark 机器人，登录凭证按应用隔离、互不干扰。

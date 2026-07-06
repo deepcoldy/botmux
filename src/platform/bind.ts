@@ -143,6 +143,8 @@ export async function cmdBind(args: string[]): Promise<void> {
     });
     if (cur.ok) {
       console.log(`  面板: ${cur.url}`);
+      // 附带本地直连兜底：中心化平台异常时仍可直接 ip:port 访问 dashboard。
+      if (cur.localUrl) console.log(`  本地直连(平台异常时可用): ${cur.localUrl}`);
     } else {
       console.log('  面板: 运行 `botmux dashboard` 获取中心化平台链接。');
     }

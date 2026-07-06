@@ -10,7 +10,9 @@ import {
 import { join, dirname, resolve, sep } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
-export const MAX_ROLE_PROFILE_ENTRY_BYTES = 4 * 1024;
+// Keep in sync with MAX_ROLE_BYTES in core/role-resolver.ts — applying a
+// profile writes its entry into a chat role, so the two limits must match.
+export const MAX_ROLE_PROFILE_ENTRY_BYTES = 32 * 1024;
 export const MAX_ROLE_PROFILE_ID_LENGTH = 64;
 
 const PROFILE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
@@ -77,11 +79,12 @@ function entryPath(dataDir: string, profileId: string, larkAppId: string): strin
 }
 
 function truncateToByteLimit(content: string): string {
-  let out = content;
-  while (Buffer.byteLength(out, 'utf-8') > MAX_ROLE_PROFILE_ENTRY_BYTES) {
-    out = out.slice(0, -1);
-  }
-  return out;
+  const buf = Buffer.from(content, 'utf-8');
+  if (buf.length <= MAX_ROLE_PROFILE_ENTRY_BYTES) return content;
+  // Back off past UTF-8 continuation bytes so we never split a codepoint.
+  let end = MAX_ROLE_PROFILE_ENTRY_BYTES;
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+  return buf.subarray(0, end).toString('utf-8');
 }
 
 function normalizeContent(content: string): string {

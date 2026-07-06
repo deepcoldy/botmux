@@ -49,6 +49,29 @@ describe('buildRestartReportText', () => {
     expect(md.toLowerCase()).not.toContain('changelog');
   });
 
+  it('adds a local ip:port fallback line when the dashboard link is a platform URL', () => {
+    const md = buildRestartReportText({
+      kind: 'manual',
+      version: '2.65.0',
+      sessionCount: 0,
+      dashboardUrl: 'https://m-deadbeef.example/?t=tok',
+      dashboardLocalUrl: 'http://10.0.0.1:7891/?t=tok',
+    });
+    expect(md).toContain('https://m-deadbeef.example/?t=tok'); // platform primary
+    expect(md).toContain('http://10.0.0.1:7891/?t=tok');       // local fallback
+  });
+
+  it('omits the local fallback line when there is no platform URL (local-only host)', () => {
+    const md = buildRestartReportText({
+      kind: 'manual',
+      version: '2.65.0',
+      sessionCount: 0,
+      dashboardUrl: 'http://10.0.0.1:7891/?t=tok',
+    });
+    // Only the single dashboard line — no separate "本地直连 / Local direct" line.
+    expect(md).not.toMatch(/本地直连|Local direct/);
+  });
+
   it('update restart: shows old→new and the changelog body', () => {
     const md = buildRestartReportText({
       kind: 'update',

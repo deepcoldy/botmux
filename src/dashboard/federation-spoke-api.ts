@@ -116,7 +116,8 @@ export async function resolveOwnerCandidatesFromAllowedUsers(d: OwnerResolveDeps
   return [...byUnion.values()];
 }
 
-const MAX_ROLE_BYTES = 4 * 1024;
+// Keep in sync with MAX_ROLE_BYTES in core/role-resolver.ts.
+const MAX_ROLE_BYTES = 32 * 1024;
 /** Team-level role file at {dataDir}/team-roles/{larkAppId}.md (matches role-resolver). */
 function teamRolePath(dataDir: string, larkAppId: string): string {
   return join(dataDir, 'team-roles', `${larkAppId}.md`);
@@ -125,7 +126,12 @@ function writeTeamRole(dataDir: string, larkAppId: string, content: string): voi
   const fp = teamRolePath(dataDir, larkAppId);
   mkdirSync(dirname(fp), { recursive: true });
   let out = content.trim();
-  while (Buffer.byteLength(out, 'utf-8') > MAX_ROLE_BYTES) out = out.slice(0, -1);
+  const buf = Buffer.from(out, 'utf-8');
+  if (buf.length > MAX_ROLE_BYTES) {
+    let end = MAX_ROLE_BYTES;
+    while (end > 0 && (buf[end] & 0xc0) === 0x80) end--; // don't split a codepoint
+    out = buf.subarray(0, end).toString('utf-8');
+  }
   atomicWriteFileSync(fp, out);
 }
 
