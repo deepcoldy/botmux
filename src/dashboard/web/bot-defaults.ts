@@ -410,14 +410,12 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
                   value="${escapeHtml(wdDirValue)}">
               </label>
             </div>
-            <div class="bd-row" data-wd-worktree-row ${wdMode === 'default' ? '' : 'hidden'}>
-              <label class="toggle-row">
-                <input type="checkbox" data-input="autoWorktree" ${b.defaultWorkingDirAutoWorktree ? 'checked' : ''}>
-                <span class="switch" aria-hidden="true"></span>
-                <span class="toggle-tx"><strong>${t('botDefaults.autoWorktree')}</strong>
-                <small>${t('botDefaults.autoWorktreeHelp')}</small></span>
-              </label>
-            </div>
+            <label class="toggle-row" data-wd-worktree-row ${wdMode === 'default' ? '' : 'hidden'}>
+              <input type="checkbox" data-input="autoWorktree" ${b.defaultWorkingDirAutoWorktree ? 'checked' : ''}>
+              <span class="switch" aria-hidden="true"></span>
+              <span class="toggle-tx"><strong>${t('botDefaults.autoWorktree')}</strong>
+              <small>${t('botDefaults.autoWorktreeHelp')}</small></span>
+            </label>
             <div class="actions">
               <button type="button" class="primary" data-action="save-working-dir">${t('botDefaults.save')}</button>
               <span class="oncall-status" data-status></span>
