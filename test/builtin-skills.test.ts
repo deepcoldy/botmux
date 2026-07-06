@@ -4,7 +4,7 @@
  * Run: pnpm vitest run test/builtin-skills.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME } from '../src/skills/definitions.js';
+import { ASK_SKILL, BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME } from '../src/skills/definitions.js';
 
 describe('built-in botmux-send skill', () => {
   it('teaches safe multiline sends across Unix and Windows shells', () => {
@@ -215,5 +215,12 @@ describe('botmux-ask skill 条件兜底（hook 优先 + 非 hook CLI 保留）',
 
   it('不在 RETIRED_SKILL_NAMES（改为按 CLI 条件管理，非全量退役）', () => {
     expect(RETIRED_SKILL_NAMES).not.toContain('botmux-ask');
+  });
+
+  it('明确说明 ask 只返回 stdout，需要用户可见回复时必须接 botmux send', () => {
+    expect(ASK_SKILL).toContain('不会自动把 stdout 发回飞书');
+    expect(ASK_SKILL).toContain('botmux send --mention-back');
+    expect(ASK_SKILL).toContain('需要用户可见回复时');
+    expect(ASK_SKILL).toContain('choice=$(...)');
   });
 });
