@@ -91,7 +91,7 @@ import { loadBotConfigs } from './bot-registry.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
-import { installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
+import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
 import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
 import { isValidRoleProfileId } from './services/role-profile-store.js';
 import { mergeSafeInsightOverviews } from './services/insight/report.js';
@@ -883,6 +883,7 @@ interface SkillJob {
   createdAt: string;
   updatedAt: string;
   skill?: SkillPackage;
+  skills?: SkillPackage[];
   error?: string;
 }
 
@@ -897,6 +898,7 @@ function publicSkillJob(job: SkillJob): Record<string, unknown> {
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     skill: job.skill ? sanitizeSkillForDashboard(job.skill) : undefined,
+    skills: job.skills?.map(sanitizeSkillForDashboard),
     error: job.error,
   };
 }
@@ -909,7 +911,7 @@ function trimSkillJobs(): void {
   }
 }
 
-function startSkillJob(type: SkillJob['type'], run: () => Promise<SkillPackage>): SkillJob {
+function startSkillJob(type: SkillJob['type'], run: () => Promise<SkillPackage | SkillPackage[]>): SkillJob {
   const now = new Date().toISOString();
   const job: SkillJob = {
     id: randomBytes(8).toString('hex'),
@@ -922,7 +924,14 @@ function startSkillJob(type: SkillJob['type'], run: () => Promise<SkillPackage>)
   trimSkillJobs();
   setImmediate(() => void (async () => {
     try {
-      job.skill = await run();
+      const result = await run();
+      if (Array.isArray(result)) {
+        job.skills = result;
+        job.skill = result[0];
+      } else {
+        job.skill = result;
+        job.skills = [result];
+      }
       job.status = 'succeeded';
     } catch (err: any) {
       job.error = redactGitUrlCredentials(err?.message ?? String(err));
@@ -1458,6 +1467,23 @@ const server = createServer(async (req, res) => {
       const currentSkills = readGlobalConfig().skills ?? {};
       mergeGlobalConfig({ skills: { ...currentSkills, ...patch } });
       return jsonRes(res, 200, { ok: true, ...dashboardSkillsPayload() });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/skills/discover') {
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+      try {
+        const discoverRequest = parseDashboardSkillInstallRequest(body);
+        const discovery = await discoverDashboardSkills(discoverRequest);
+        return jsonRes(res, 200, { ok: true, discovery });
+      } catch (err: any) {
+        return jsonRes(res, 400, { ok: false, error: redactGitUrlCredentials(err?.message ?? String(err)) });
+      }
     }
 
     if (req.method === 'POST' && url.pathname === '/api/skills/install') {

@@ -5,8 +5,10 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
+  discoverGitSkillCandidates,
   installGitSkill,
   installGitSkillAsync,
+  installGitSkillsFromSourceAsync,
   readSkillRegistry,
   removeInstalledSkill,
   updateInstalledSkill,
@@ -56,6 +58,48 @@ describe('git skill install', () => {
       path: 'skills/deploy',
       ref: 'HEAD',
       commit,
+    });
+  });
+
+  it('discovers skills from a git repository root', () => {
+    write(join(repo, 'skills', 'review', 'SKILL.md'), '---\nname: review\ndescription: Review code\n---\n# Review');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'add review skill'], repo);
+
+    const discovered = discoverGitSkillCandidates({ url: repo, ref: 'HEAD' });
+
+    expect(discovered.commit).toBe(run('git', ['rev-parse', 'HEAD'], repo));
+    expect(discovered.skills.map(skill => [skill.name, skill.path])).toEqual([
+      ['deploy', 'skills/deploy'],
+      ['review', 'skills/review'],
+    ]);
+    expect(discovered.skills.find(skill => skill.name === 'review')?.description).toBe('Review code');
+  });
+
+  it('installs the only discovered skill from a repository root', async () => {
+    const [pkg] = await installGitSkillsFromSourceAsync({ url: repo, ref: 'HEAD' });
+
+    expect(pkg.name).toBe('deploy');
+    expect(readSkillRegistry().skills.deploy.source).toMatchObject({
+      type: 'git',
+      url: repo,
+      path: 'skills/deploy',
+    });
+  });
+
+  it('requires a selection when a repository root contains multiple skills', async () => {
+    write(join(repo, 'skills', 'review', 'SKILL.md'), '---\nname: review\n---\n# Review');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'add review skill'], repo);
+
+    await expect(installGitSkillsFromSourceAsync({ url: repo, ref: 'HEAD' })).rejects.toThrow(/multiple_skills_found/);
+
+    const packages = await installGitSkillsFromSourceAsync({ url: repo, ref: 'HEAD', skillNames: ['review'] });
+    expect(packages.map(pkg => pkg.name)).toEqual(['review']);
+    expect(readSkillRegistry().skills.review.source).toMatchObject({
+      type: 'git',
+      url: repo,
+      path: 'skills/review',
     });
   });
 
