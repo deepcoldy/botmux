@@ -127,6 +127,17 @@ describe('callDashboard', () => {
     expect(r).toEqual({ ok: true, url: 'http://host:7891/?t=fresh' });
   });
 
+  it('surfaces the dashboard-provided localUrl fallback (platform link case)', async () => {
+    setPort(7891);
+    // Dashboard returns both a platform primary URL and a local ip:port fallback.
+    const fetchImpl = (async () => new Response(
+      JSON.stringify({ url: 'https://m-x.example/?t=fresh', localUrl: 'http://10.0.0.1:7891/?t=fresh' }),
+      { status: 200 },
+    )) as unknown as typeof fetch;
+    const r = await callDashboard({ configDir: dir, defaultPort: 7891, path: '/__cli/rotate', fetchImpl });
+    expect(r).toEqual({ ok: true, url: 'https://m-x.example/?t=fresh', localUrl: 'http://10.0.0.1:7891/?t=fresh' });
+  });
+
   it('does NOT mislabel a daemon-IPC 404 as no-active-token; self-heals to the real dashboard', async () => {
     // Recorded port points at daemon IPC (the reported bug); real dashboard is 7901.
     setPort(7893);

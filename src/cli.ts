@@ -2221,6 +2221,8 @@ async function printDashboardHintWithRetry(): Promise<void> {
     last = await callDashboardEndpoint('/__cli/current');
     if (last.ok) {
       console.log(`   面板: botmux dashboard (${last.url})`);
+      // 走中心化平台链接时，附带本地直连兜底，平台异常也能直接 ip:port 访问。
+      if (last.localUrl) console.log(`   本地直连(平台异常时可用): ${last.localUrl}`);
       return;
     }
     // Terminal states — file-backed secret/token won't appear mid-poll, unlike
@@ -2250,7 +2252,9 @@ async function printDashboardHintWithRetry(): Promise<void> {
 async function cmdDashboard(): Promise<void> {
   const r = await callDashboardEndpoint('/__cli/rotate');
   if (r.ok) {
+    // 首行保持纯 URL（脚本/复制取第一行即可）；走中心化平台时再补一行本地直连兜底。
     console.log(r.url);
+    if (r.localUrl) console.log(`本地直连(平台异常时可用): ${r.localUrl}`);
     return;
   }
   const portFile = join(CONFIG_DIR, '.dashboard-port');

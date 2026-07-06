@@ -1090,6 +1090,7 @@ export const messages: Record<string, string> = {
   'restart.version': 'Version: {version}',
   'restart.unfinished_sessions': 'Unfinished sessions: {count}',
   'restart.dashboard': 'Dashboard: {url}',
+  'restart.dashboard_local': 'Local direct (if the platform is down): {url}',
   'restart.changelog_label': 'What’s new:',
   'restart.changelog_link_fallback': 'Details: {url}',
   'restart.card_title': 'botmux maintenance notice',

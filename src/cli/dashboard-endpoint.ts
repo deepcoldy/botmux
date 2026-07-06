@@ -40,7 +40,7 @@ export type DashboardFailReason =
   | 'wrong-service';
 
 export type DashboardResult =
-  | { ok: true; url: string }
+  | { ok: true; url: string; localUrl?: string }
   | { ok: false; reason: DashboardFailReason; detail?: string };
 
 type FetchImpl = typeof fetch;
@@ -127,9 +127,11 @@ export async function requestDashboardAt(opts: {
   }
   // reload-binding 不返回 url，200 即成功（仅用于「捅一下 daemon 重连」）
   if (path === '/__cli/reload-binding') return { ok: true, url: '' };
-  const body = await res.json().catch(() => ({})) as { url?: string };
+  const body = await res.json().catch(() => ({})) as { url?: string; localUrl?: string };
   if (!body.url) return { ok: false, reason: 'http-error', detail: 'malformed response (no url)' };
-  return { ok: true, url: body.url };
+  // localUrl is present only when the dashboard link routes through the central
+  // platform — a direct host:port fallback for when the platform is down.
+  return { ok: true, url: body.url, localUrl: body.localUrl };
 }
 
 /** A result that proves we actually reached the dashboard (vs. wrong port). */
