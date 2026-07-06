@@ -101,6 +101,10 @@ export type WorkerSessionInfo = {
   botName: string;
   cliId?: string;
   workingDir?: string;
+  sandbox?: boolean;
+  sandboxHidePaths?: string[];
+  sandboxReadonlyPaths?: string[];
+  sandboxNetwork?: boolean;
   webPort?: number;
   logPath?: string;
   startedAt: number;

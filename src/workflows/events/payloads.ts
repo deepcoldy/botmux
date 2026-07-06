@@ -108,6 +108,10 @@ export const BotSnapshotSchema = z.object({
   displayName: z.string().optional(),
   workingDir: z.string().optional(),
   cliPathOverride: z.string().optional(),
+  sandbox: z.boolean().optional(),
+  sandboxHidePaths: z.array(z.string()).optional(),
+  sandboxReadonlyPaths: z.array(z.string()).optional(),
+  sandboxNetwork: z.boolean().optional(),
 });
 export type BotSnapshot = z.infer<typeof BotSnapshotSchema>;
 

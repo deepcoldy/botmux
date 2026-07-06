@@ -15,6 +15,7 @@ import {
   WORKFLOW_OUTPUT_BEGIN,
   WORKFLOW_OUTPUT_END,
 } from '../src/workflows/spawn-bot.js';
+import { ATTEMPT_TERMINAL_SIDECAR } from '../src/workflows/attempt-terminal.js';
 
 // ─── scripted worker process ──────────────────────────────────────────────
 
@@ -206,6 +207,61 @@ describe('createWorkflowDaemonSpawn', () => {
       ),
     );
     expect(init!.chatId).toContain('wf-chat');
+  });
+
+  it('passes frozen sandbox policy to the one-shot worker init', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wf-sandbox-'));
+    const sent: unknown[] = [];
+    const factory = scriptedFactory((s) => {
+      s.onSend((msg) => sent.push(msg));
+      s.emit({ type: 'ready', port: 1, token: 't' });
+      s.emit({
+        type: 'final_output',
+        content: `${WORKFLOW_OUTPUT_BEGIN}{}${WORKFLOW_OUTPUT_END}`,
+        lastUuid: 'u',
+        turnId: 't1',
+      });
+      s.emit({ type: 'screen_update', content: '', status: 'idle' });
+    });
+    const deps = createWorkflowDaemonSpawn({
+      resolveLarkCredentials: () => fakeCreds,
+      quiesceMs: 30,
+      factory,
+    });
+
+    try {
+      await deps.runOneShot({
+        ...baseInput,
+        attemptLogPath: join(dir, 'terminal.log'),
+        botSnapshot: {
+          ...baseInput.botSnapshot,
+          sandbox: true,
+          sandboxHidePaths: ['~/.ssh'],
+          sandboxReadonlyPaths: ['/srv/readonly'],
+          sandboxNetwork: false,
+        },
+      });
+
+      const init = sent.find(
+        (m): m is Record<string, unknown> =>
+          typeof m === 'object' && m !== null && (m as Record<string, unknown>).type === 'init',
+      );
+      expect(init).toMatchObject({
+        sandbox: true,
+        sandboxHidePaths: ['~/.ssh'],
+        sandboxReadonlyPaths: ['/srv/readonly'],
+        sandboxNetwork: false,
+      });
+      const sidecar = JSON.parse(readFileSync(join(dir, ATTEMPT_TERMINAL_SIDECAR), 'utf-8'));
+      expect(sidecar).toMatchObject({
+        sandbox: true,
+        sandboxHidePaths: ['~/.ssh'],
+        sandboxReadonlyPaths: ['/srv/readonly'],
+        sandboxNetwork: false,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('credential resolver gets the bot name from input', async () => {

@@ -27,6 +27,7 @@ import {
   type RunNodeResult,
   type WorkerSessionInfo,
 } from './contract.js';
+import { workflowSandboxInitFields } from '../spawn-policy.js';
 
 type WorkerEvent = WorkerToDaemon;
 
@@ -111,6 +112,7 @@ async function runNodeImpl(
     // P2: 受限 bot / restricted 节点 → worker 关闭 CLI 权限旁路（adapter 据此
     // 不再注入 --dangerously-skip-permissions / --yolo 等 bypass flag）。
     disableCliBypass: req.botSnapshot.disableCliBypass === true,
+    ...workflowSandboxInitFields(req.botSnapshot),
     backendType: 'pty' as const,
     prompt: '',
     resume: false,

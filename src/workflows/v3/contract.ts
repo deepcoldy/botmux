@@ -224,6 +224,12 @@ export interface BotSnapshot {
    *  `override.permissionMode:'restricted'` can additionally set this per
    *  dispatch; nothing can clear it (no-escalation red line, P2). */
   disableCliBypass?: boolean;
+  /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
+   *  these fields when spawning outside the main forkWorker path. */
+  sandbox?: boolean;
+  sandboxHidePaths?: string[];
+  sandboxReadonlyPaths?: string[];
+  sandboxNetwork?: boolean;
   /** The resolved working directory for this run. */
   workingDir: string;
 }

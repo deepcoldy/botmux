@@ -165,6 +165,45 @@ describe('AttemptResumeManager', () => {
     }
   });
 
+  it('passes sandbox policy to the dashboard resume worker init', async () => {
+    const tmp = join(tmpdir(), `wf-resume-${Date.now()}-${Math.random()}`);
+    const ids = seedAttempt(tmp);
+    const { factory, handles } = makeFactory((h) => {
+      h.emit({ type: 'ready', port: 4567, token: 'write-token' });
+    });
+    try {
+      const manager = new AttemptResumeManager({
+        runsDir: tmp,
+        externalHost: 'dash.local',
+        workerPath: '/worker.js',
+        factory,
+        resolveBot: () => ({
+          ...bot,
+          sandbox: true,
+          sandboxHidePaths: ['~/.ssh'],
+          sandboxReadonlyPaths: ['/srv/readonly'],
+          sandboxNetwork: false,
+        }),
+      });
+
+      const result = await manager.start(ids);
+
+      expect(result.ok).toBe(true);
+      const init = handles[0]?.sent.find(
+        (msg): msg is Record<string, unknown> =>
+          typeof msg === 'object' && msg !== null && (msg as any).type === 'init',
+      );
+      expect(init).toMatchObject({
+        sandbox: true,
+        sandboxHidePaths: ['~/.ssh'],
+        sandboxReadonlyPaths: ['/srv/readonly'],
+        sandboxNetwork: false,
+      });
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it('allows session-id based CLIs to resume without a native cliSessionId', async () => {
     const tmp = join(tmpdir(), `wf-resume-${Date.now()}-${Math.random()}`);
     const ids = seedAttempt(tmp, { cliSessionId: null, cliId: 'coco' });

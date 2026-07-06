@@ -61,6 +61,42 @@ describe('v3 ephemeral pool', () => {
     expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
   });
 
+  it('passes frozen sandbox policy to the goal-mode worker init', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const base = request();
+    const req = {
+      ...base,
+      botSnapshot: {
+        ...base.botSnapshot,
+        sandbox: true,
+        sandboxHidePaths: ['~/.ssh'],
+        sandboxReadonlyPaths: ['/srv/readonly'],
+        sandboxNetwork: false,
+      },
+    };
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+
+    expect(worker.init).toMatchObject({
+      sandbox: true,
+      sandboxHidePaths: ['~/.ssh'],
+      sandboxReadonlyPaths: ['/srv/readonly'],
+      sandboxNetwork: false,
+    });
+
+    worker.emitExit(0);
+    await promise;
+  });
+
   it('notifies session readiness as soon as the worker web terminal is ready', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);
