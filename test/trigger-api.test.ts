@@ -44,6 +44,30 @@ describe('trigger request contract', () => {
     expect(v.ok).toBe(true);
   });
 
+  it('accepts a rootMessageId turn target when chatId is also present', () => {
+    const req = request();
+    req.target.rootMessageId = 'om_root';
+    const v = validateTriggerRequest(req);
+    expect(v.ok).toBe(true);
+  });
+
+  it('requires chatId alongside rootMessageId', () => {
+    const req = request();
+    delete (req.target as any).chatId;
+    req.target.rootMessageId = 'om_root';
+    const v = validateTriggerRequest(req);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('target_required');
+  });
+
+  it('rejects empty rootMessageId', () => {
+    const req = request();
+    req.target.rootMessageId = '   ';
+    const v = validateTriggerRequest(req);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('target_required');
+  });
+
   it('rejects wait-mode timeout outside the bounded range', () => {
     const req = request();
     req.options = { waitForFinalOutput: true, timeoutMs: 999 };

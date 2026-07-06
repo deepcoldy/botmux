@@ -165,6 +165,19 @@ function dynamicSessionId(req: IncomingMessage, url: URL, payload: unknown): str
   return undefined;
 }
 
+function dynamicRootMessageId(req: IncomingMessage, url: URL, payload: unknown): string | undefined {
+  const fromQuery = url.searchParams.get('rootMessageId') ?? undefined;
+  if (fromQuery) return fromQuery;
+  const fromHeader = headerValue(req, 'x-botmux-root-message-id');
+  if (fromHeader) return fromHeader;
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    const p = payload as any;
+    if (typeof p.rootMessageId === 'string') return p.rootMessageId;
+    if (p.target && typeof p.target === 'object' && typeof p.target.rootMessageId === 'string') return p.target.rootMessageId;
+  }
+  return undefined;
+}
+
 function parseTriggerResponseOptions(
   req: IncomingMessage,
   url: URL,
@@ -347,6 +360,7 @@ export async function handleWebhookRoute(
       ? connector.target.chatId
       : dynamicChatId(req, url, parsed.payload);
     const sessionId = dynamicSessionId(req, url, parsed.payload);
+    const rootMessageId = dynamicRootMessageId(req, url, parsed.payload);
     const allowChats = connector.target.allowChats ?? [];
     if (chatId && allowChats.length > 0 && !allowChats.includes(chatId)) {
       webhookError(res, 403, connectorId, 'chat_not_allowed', 'chatId is not allowed for this connector');
@@ -364,6 +378,7 @@ export async function handleWebhookRoute(
         botId: connector.target.botId,
         ...(chatId ? { chatId } : {}),
         ...(sessionId ? { sessionId } : {}),
+        ...(rootMessageId ? { rootMessageId } : {}),
       },
       envelope: {
         format: 'botmux.webhook.v1',
@@ -489,6 +504,11 @@ export async function handleWebhookRoute(
   const chatId = connector.target.mode === 'fixed'
     ? connector.target.chatId
     : dynamicChatId(req, url, parsed.payload);
+  const rootMessageId = dynamicRootMessageId(req, url, parsed.payload);
+  if (rootMessageId && !chatId) {
+    webhookError(res, 400, connectorId, 'target_required', 'rootMessageId requires target chatId');
+    return true;
+  }
   if (!chatId && !responseOptions.waitForFinalOutput) {
     webhookError(res, 400, connectorId, 'target_required', 'target chatId is required');
     return true;
@@ -510,6 +530,7 @@ export async function handleWebhookRoute(
       kind: connector.target.kind,
       botId: connector.target.botId,
       chatId,
+      ...(rootMessageId ? { rootMessageId } : {}),
       workflowId: connector.target.workflowId,
     },
     envelope: {

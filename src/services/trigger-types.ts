@@ -15,6 +15,7 @@ export interface TriggerRequest {
     botId?: string;
     chatId?: string;
     sessionId?: string;
+    rootMessageId?: string;
     workflowId?: string;
   };
   envelope: {
@@ -102,8 +103,17 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   const options = isRecord(raw.options) ? raw.options : {};
   const waitForFinalOutput = options.waitForFinalOutput === true;
   const asyncReturnSessionId = options.asyncReturnSessionId === true;
-  if (target.kind === 'turn' && !waitForFinalOutput && !asyncReturnSessionId && typeof target.chatId !== 'string' && typeof target.sessionId !== 'string') {
-    return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'turn target requires chatId or sessionId' } };
+  const hasChatId = typeof target.chatId === 'string' && target.chatId.trim().length > 0;
+  const hasSessionId = typeof target.sessionId === 'string' && target.sessionId.trim().length > 0;
+  const hasRootMessageId = typeof target.rootMessageId === 'string' && target.rootMessageId.trim().length > 0;
+  if (target.rootMessageId !== undefined && !hasRootMessageId) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'target.rootMessageId must be a non-empty string' } };
+  }
+  if (hasRootMessageId && !hasChatId && !hasSessionId) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'turn target with rootMessageId requires chatId unless sessionId is specified' } };
+  }
+  if (target.kind === 'turn' && !waitForFinalOutput && !asyncReturnSessionId && !hasChatId && !hasSessionId && !hasRootMessageId) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'turn target requires chatId, sessionId, or rootMessageId' } };
   }
   if (target.kind === 'workflow' && typeof target.workflowId !== 'string') {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'workflow target requires workflowId' } };

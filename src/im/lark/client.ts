@@ -670,6 +670,24 @@ export async function getMessageDetail(
   return res.data;
 }
 
+export async function getMessageChatId(larkAppId: string, messageId: string): Promise<string | null> {
+  try {
+    const detail = await getMessageDetail(larkAppId, messageId, { userCardContent: false });
+    const candidates = [
+      detail?.items?.[0]?.chat_id,
+      detail?.chat_id,
+      detail?.message?.chat_id,
+    ];
+    for (const v of candidates) {
+      if (typeof v === 'string' && v.trim()) return v.trim();
+    }
+    return null;
+  } catch (err) {
+    logger.debug(`[message] failed to resolve chat_id for ${messageId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
 export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
   const dir = dirname(savePath);
   if (!existsSync(dir)) {

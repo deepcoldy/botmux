@@ -198,6 +198,38 @@ describe('webhook token mode', () => {
     expect(h.status).toBe(200);
   });
 
+  it('forwards rootMessageId from query, header, and payload', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'queued', target: { kind: 'turn', chatId: 'oc_fixed' } }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    await seedTokenConnector();
+
+    const query = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value?rootMessageId=om_query`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(query.status).toBe(200);
+    const header = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-botmux-root-message-id': 'om_header' },
+      body: '{}',
+    });
+    expect(header.status).toBe(200);
+    const payload = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: { rootMessageId: 'om_payload' } }),
+    });
+    expect(payload.status).toBe(200);
+
+    expect(captured.map(x => x.target.rootMessageId)).toEqual(['om_query', 'om_header', 'om_payload']);
+    expect(captured.every(x => x.target.chatId === 'oc_fixed')).toBe(true);
+  });
+
   it('rejects when no token is presented at all', async () => {
     await startWebhookServer();
     await seedTokenConnector();

@@ -3,7 +3,7 @@ import * as groupsStore from '../services/groups-store.js';
 import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
 import { getBot, effectiveDefaultWorkingDir } from '../bot-registry.js';
-import { getChatMode, sendMessage, type ChatMode } from '../im/lark/client.js';
+import { getChatMode, getMessageChatId, sendMessage, type ChatMode } from '../im/lark/client.js';
 import { resolveRegularGroupMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -151,6 +151,37 @@ function buildAsyncQueuedResponse(
     message,
   };
 }
+
+async function validateRootMessageTarget(
+  larkAppId: string,
+  chatId: string | undefined,
+  rootMessageId: string,
+): Promise<{ ok: true; chatId: string } | { ok: false; errorCode: 'target_required' | 'chat_not_allowed'; error: string }> {
+  if (!chatId) {
+    return { ok: false, errorCode: 'target_required', error: 'turn target with rootMessageId requires chatId' };
+  }
+  const actualChatId = await getMessageChatId(larkAppId, rootMessageId);
+  if (!actualChatId) {
+    return { ok: false, errorCode: 'target_required', error: `rootMessageId is not visible or has no chat_id: ${rootMessageId}` };
+  }
+  if (actualChatId !== chatId) {
+    return { ok: false, errorCode: 'chat_not_allowed', error: 'rootMessageId does not belong to target chatId' };
+  }
+  return { ok: true, chatId };
+}
+
+function buildExistingSessionContent(ds: DaemonSession, prompt: string, larkAppId: string, chatId: string): string {
+  ensureSessionWhiteboard(ds);
+  return buildFollowUpContent(prompt, ds.session.sessionId, {
+    isAdoptMode: false,
+    cliId: ds.session.cliId,
+    locale: localeForBot(larkAppId),
+    larkAppId,
+    chatId,
+    whiteboardId: ds.session.whiteboardId,
+  });
+}
+
 export async function triggerSessionTurn(
   req: TriggerRequest,
   deps: TriggerSessionDeps,
@@ -168,19 +199,29 @@ export async function triggerSessionTurn(
   const prompt = buildUntrustedEventPrompt(req, triggerId);
   const promptPreview = prompt.length > 4000 ? prompt.slice(0, 4000) + '\n...[truncated]' : prompt;
 
+  const rootMessageId = typeof req.target.rootMessageId === 'string' ? req.target.rootMessageId.trim() : '';
   let ds = req.target.sessionId ? activeBySessionId(deps.activeSessions, req.target.sessionId) : undefined;
   if (req.target.sessionId && !ds) {
     return { ok: false, errorCode: 'session_not_found', error: `active session not found: ${req.target.sessionId}` };
   }
 
   let chatId = req.target.chatId ?? ds?.chatId;
+  if (rootMessageId && !req.target.sessionId) {
+    const rootTarget = await validateRootMessageTarget(larkAppId, chatId, rootMessageId);
+    if (!rootTarget.ok) {
+      return { ok: false, errorCode: rootTarget.errorCode, error: rootTarget.error };
+    }
+    chatId = rootTarget.chatId;
+    ds = deps.activeSessions.get(sessionKey(rootMessageId, larkAppId));
+  }
+
   if (!chatId) {
     if (req.options?.waitForFinalOutput) {
       chatId = `http_wait_${randomUUID()}`;
     } else if (req.options?.asyncReturnSessionId) {
       chatId = `http_async_${randomUUID()}`;
     } else {
-      return { ok: false, errorCode: 'target_required', error: 'turn target requires chatId or an active sessionId' };
+      return { ok: false, errorCode: 'target_required', error: 'turn target requires chatId, rootMessageId, or an active sessionId' };
     }
   }
 
@@ -195,14 +236,10 @@ export async function triggerSessionTurn(
 
   // Mirror the inbound @ routing: a 普通群 in `new-topic` mode forks a fresh
   // session per top-level event, so an external event must NOT fold into the
-  // group's chat-scope session. resolveRegularGroupMode is the same single source
-  // of truth event-dispatcher's regularGroupRouting reads — webhook delivery was
-  // the one path that ignored it. (A 话题群 keys its sessions by anchor message id,
-  // so its chat-scope key is never populated; the reuse lookup is already a no-op
-  // there and the scope branch below routes it per-topic via externalEventOpensOwnTopic
-  // regardless.) chat / shared / chat-topic keep folding, as they do for a top-level @.
+  // group's one chat-scope session. Explicit rootMessageId is a stricter target:
+  // it always routes to that thread anchor after daemon-side chat ownership check.
   const regularGroupMode: ChatReplyMode = isHttpVirtualSession ? 'chat' : resolveRegularGroupMode(larkAppId, chatId);
-  if (!ds && !req.target.sessionId && !isHttpVirtualSession && regularGroupMode !== 'new-topic') {
+  if (!ds && !req.target.sessionId && !rootMessageId && !isHttpVirtualSession && regularGroupMode !== 'new-topic') {
     ds = deps.activeSessions.get(sessionKey(chatId, larkAppId));
   }
 
@@ -218,15 +255,7 @@ export async function triggerSessionTurn(
   }
 
   if (ds?.worker && !ds.worker.killed) {
-    ensureSessionWhiteboard(ds);
-    const content = buildFollowUpContent(prompt, ds.session.sessionId, {
-      isAdoptMode: false,
-      cliId: ds.session.cliId,
-      locale: localeForBot(larkAppId),
-      larkAppId,
-      chatId,
-      whiteboardId: ds.session.whiteboardId,
-    });
+    const content = buildExistingSessionContent(ds, prompt, larkAppId, chatId);
     markSessionActivity(ds);
     rememberLastCliInput(ds, prompt, content);
 
@@ -268,6 +297,49 @@ export async function triggerSessionTurn(
     };
   }
 
+  if (ds && rootMessageId) {
+    const content = buildExistingSessionContent(ds, prompt, larkAppId, chatId);
+    markSessionActivity(ds);
+    rememberLastCliInput(ds, prompt, content);
+
+    if (req.options?.waitForFinalOutput) {
+      return waitForSessionFinalOutput(
+        ds,
+        triggerId,
+        req.options?.timeoutMs ?? 120_000,
+        (text) => ({
+          ok: true,
+          triggerId,
+          action: 'completed',
+          target: { kind: 'turn', sessionId: ds!.session.sessionId, chatId },
+          output: { content: text },
+          message: 'delivered to existing session and completed',
+        }),
+        () => forkWorker(ds!, content, { resume: ds!.hasHistory, turnId: triggerId }),
+      );
+    }
+
+    if (req.options?.asyncReturnSessionId) {
+      beginAsyncTrigger(ds, triggerId);
+      forkWorker(ds, content, { resume: ds.hasHistory, turnId: triggerId });
+      return buildAsyncQueuedResponse(
+        triggerId,
+        ds.session.sessionId,
+        chatId,
+        'delivered to existing session; poll by sessionId or triggerId for final output',
+      );
+    }
+
+    forkWorker(ds, content, { resume: ds.hasHistory, turnId: triggerId });
+    return {
+      ok: true,
+      triggerId,
+      action: 'queued',
+      target: { kind: 'turn', sessionId: ds.session.sessionId, chatId },
+      message: 'queued existing session turn',
+    };
+  }
+
   const wd = resolveWorkingDir(larkAppId, chatId);
   if (!wd.ok) {
     return { ok: false, errorCode: 'trigger_failed', error: wd.error };
@@ -277,9 +349,10 @@ export async function triggerSessionTurn(
   const chatMode: ChatMode = isHttpVirtualSession
     ? 'group'
     : await getChatMode(larkAppId, chatId, { forceRefresh: true });
-  let scope: 'thread' | 'chat' = 'chat';
-  let anchor = chatId;
-  const shouldOpenOwnTopic = !isHttpVirtualSession
+  let scope: 'thread' | 'chat' = rootMessageId ? 'thread' : 'chat';
+  let anchor = rootMessageId || chatId;
+  const shouldOpenOwnTopic = !rootMessageId
+    && !isHttpVirtualSession
     && externalEventOpensOwnTopic(chatMode, regularGroupMode);
   if (shouldOpenOwnTopic) {
     anchor = await sendMessage(larkAppId, chatId, t('trigger.external_event', { source: req.envelope.sourceName }, localeForBot(larkAppId)));
