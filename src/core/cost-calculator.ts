@@ -312,6 +312,7 @@ const warnedOversizedUsageFiles = new Set<string>();
 
 export function __resetSessionUsageCachesForTest(): void {
   usageFileCache.clear();
+  warnedOversizedUsageFiles.clear();
   __resetTranscriptResolverCacheForTest();
 }
 
@@ -371,9 +372,10 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
   }
 
   if (st.size > MAX_USAGE_TRANSCRIPT_BYTES) {
-    const warnKey = `${key}:${st.size}`;
-    if (!warnedOversizedUsageFiles.has(warnKey)) {
-      warnedOversizedUsageFiles.add(warnKey);
+    // Warn once per transcript, not per observed size: an actively-growing
+    // oversized file would otherwise re-warn and leak a Set entry every reparse.
+    if (!warnedOversizedUsageFiles.has(key)) {
+      warnedOversizedUsageFiles.add(key);
       logger.warn(
         `Skipping token usage scan for oversized transcript ${path} ` +
         `(${st.size} bytes > ${MAX_USAGE_TRANSCRIPT_BYTES} bytes)`,

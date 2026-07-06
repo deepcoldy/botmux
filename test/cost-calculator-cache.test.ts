@@ -208,6 +208,19 @@ describe('readSessionTokenUsageFile caching', () => {
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('Skipping token usage scan for oversized transcript'));
   });
 
+  it('warns once per oversized transcript even as it keeps growing', () => {
+    const p = join(dir, 'still-growing.jsonl');
+    writeFileSync(p, '');
+    truncateSync(p, MAX_USAGE_TRANSCRIPT_BYTES + 1);
+    expect(readSessionTokenUsageFile(p, 'coco')).toBeNull();
+
+    now += 20_000;
+    truncateSync(p, MAX_USAGE_TRANSCRIPT_BYTES + 4096);
+    expect(readSessionTokenUsageFile(p, 'coco', { fresh: true })).toBeNull();
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
   it('returns null and drops the cache entry when the file disappears', () => {
     const p = join(dir, 's.jsonl');
     writeFileSync(p, `${claudeLine('msg_a', 100, 10)}\n`);
