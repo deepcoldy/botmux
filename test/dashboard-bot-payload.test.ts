@@ -36,6 +36,37 @@ describe('dashboard bot payload helpers', () => {
     });
   });
 
+  it('derives agentSelectionKey from cliId + wrapperCli so the 修改CLI dropdown highlights wrapper gateways', () => {
+    // 裸 CLI：选择键 = cliId。
+    expect(botDefaultsPayload(
+      { larkAppId: 'app_a', botName: 'BotA', cliId: 'claude-code' },
+      { defaultOncall: { enabled: false } },
+    )).toMatchObject({ cliId: 'claude-code', agentSelectionKey: 'claude-code' });
+
+    // wrapper 网关：选择键 = 对应的 aiden×/ttadk×/cjadk× 选项键（而非裸 cliId），
+    // 否则前端下拉高亮回落到裸 cliId，重载后 wrapper 丢失、再保存被剥掉。
+    expect(botDefaultsPayload(
+      { larkAppId: 'app_a', botName: 'BotA', cliId: 'claude-code', wrapperCli: 'aiden x claude' },
+      { defaultOncall: { enabled: false } },
+    )).toMatchObject({
+      cliId: 'claude-code',
+      wrapperCli: 'aiden x claude',
+      agentSelectionKey: 'aiden-x-claude',
+    });
+    expect(botDefaultsPayload(
+      { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex', wrapperCli: 'ttadk codex' },
+      { defaultOncall: { enabled: false } },
+    )).toMatchObject({ agentSelectionKey: 'ttadk-x-codex' });
+    expect(botDefaultsPayload(
+      { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex', wrapperCli: 'cjadk codex' },
+      { defaultOncall: { enabled: false } },
+    )).toMatchObject({ agentSelectionKey: 'cjadk-x-codex' });
+
+    // 无 cliId（配置缺失）→ 不下发 agentSelectionKey，前端回落默认 claude-code。
+    expect(botDefaultsPayload({ larkAppId: 'app_a' }, {}))
+      .not.toHaveProperty('agentSelectionKey');
+  });
+
   it('passes through displayName / larkBotName and normalizes missing to null', () => {
     const daemon = { larkAppId: 'app_a', botName: '小助手', cliId: 'codex' };
     expect(botDefaultsPayload(daemon, { displayName: '小助手', larkBotName: 'Claude' })).toMatchObject({

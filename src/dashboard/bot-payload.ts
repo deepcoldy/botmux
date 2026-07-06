@@ -1,4 +1,5 @@
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
+import { selectionKeyForBot } from '../setup/cli-selection.js';
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
@@ -25,6 +26,10 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...(bot.cliId ? { cliId: bot.cliId } : {}),
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.model ? { model: bot.model } : {}),
+    // 「修改 CLI」下拉的当前选中项（cliId+wrapperCli → 选择键），wrapper 网关形态
+    // （aiden×claude / ttadk×codex 等）据此才能高亮回对应选项，否则前端回落到裸
+    // cliId、丢失 wrapper 语义（重载后下拉复位、再保存会把 wrapper 剥掉）。
+    ...(bot.cliId ? { agentSelectionKey: selectionKeyForBot(bot.cliId, bot.wrapperCli) } : {}),
     online: true,
   };
   if (error) return { ...base, error };
