@@ -297,4 +297,49 @@ describe('default-oncall store persistence', () => {
     expect(persisted.defaultWorkingDir).toBeUndefined();
     expect(persisted.defaultOncall.enabled).toBe(false);
   });
+
+  // ── setWorkingDirMode: 「仅默认目录」+ 自动创建 worktree 开关 ─────────────────────
+  it('setWorkingDirMode default with autoWorktree persists defaultWorkingDirAutoWorktree + syncs in-memory', async () => {
+    writeConfig({});
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.setWorkingDirMode('app_default', 'default', '/repos/dwd', true);
+
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.defaultWorkingDir).toBe('/repos/dwd');
+      expect(r.defaultWorkingDirAutoWorktree).toBe(true);
+    }
+    expect(readConfig().defaultWorkingDirAutoWorktree).toBe(true);
+    expect(registry.getBot('app_default').config.defaultWorkingDirAutoWorktree).toBe(true);
+  });
+
+  it('setWorkingDirMode default with autoWorktree=false does NOT persist the flag', async () => {
+    writeConfig({ defaultWorkingDir: '/repos/dwd', defaultWorkingDirAutoWorktree: true }); // prior on
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.setWorkingDirMode('app_default', 'default', '/repos/dwd', false);
+
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.defaultWorkingDirAutoWorktree).toBe(false);
+    expect(readConfig().defaultWorkingDirAutoWorktree).toBeUndefined(); // cleared, keeps bots.json clean
+    expect(registry.getBot('app_default').config.defaultWorkingDirAutoWorktree).toBeUndefined();
+  });
+
+  it('setWorkingDirMode force-clears autoWorktree outside default mode (oncall / off)', async () => {
+    writeConfig({ defaultWorkingDir: '/repos/dwd', defaultWorkingDirAutoWorktree: true });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    // Even if a stale/forged autoWorktree=true rides in with a non-default mode,
+    // it must be dropped — the toggle is meaningless without defaultWorkingDir.
+    const r = await store.setWorkingDirMode('app_default', 'oncall', '/repos/oncall', true);
+
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.defaultWorkingDirAutoWorktree).toBe(false);
+    expect(readConfig().defaultWorkingDirAutoWorktree).toBeUndefined();
+    expect(registry.getBot('app_default').config.defaultWorkingDirAutoWorktree).toBeUndefined();
+  });
 });

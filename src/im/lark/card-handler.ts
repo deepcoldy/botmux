@@ -55,7 +55,7 @@ import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
-import { publishAttentionPatch } from '../../core/session-activity.js';
+import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import { openLocalTerminalForSession } from '../../core/local-terminal-opener.js';
@@ -305,7 +305,7 @@ function duplicateMultiWorktreeChildNames(repoPaths: string[], projects: Project
  * directory-entry form. Extracted to module scope so the form-submit branch can
  * reuse the exact same spawn/switch path instead of duplicating it.
  */
-async function commitRepoSelection(
+export async function commitRepoSelection(
   ctx: {
     ds: DaemonSession;
     rootId: string;
@@ -466,6 +466,70 @@ async function commitRepoSelection(
   // Withdraw the repo selection card
   if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
   ds.repoCardMessageId = undefined;
+}
+
+/**
+ * 仅默认目录 + auto-worktree 的**异步**提交：`ds` 必须已注册进 activeSessions 且处于
+ * `pendingRepo` 挂起态（prompt 已 buffer，入站路由不会去抢 fork——见 daemon.ts pendingRepo
+ * 分支），本函数在**关键路径之外**（调用方 `void` 掉、立即返回）跑：
+ *   1) 在 `baseDir` 建独立 worktree（非 git / 失败 → 回退 baseDir，均经 `notify` 发提示）
+ *   2) 用与「选仓库卡」完全相同的 {@link commitRepoSelection} 提交该目录并 fork——复用其
+ *      prompt 重建（会 fold 进等待期间 buffer 的后续消息）、代际守卫、僵尸防护。
+ *
+ * 这样避免了把 git fetch（可长达 30s）同步塞进 spawn/fork 链路的三宗罪：放大重复 spawn
+ * 竞态、worker=null 期间被路由在**基目录**抢 fork、阻塞 dashboard/webhook 响应。
+ *
+ * 永不抛出：worktree 失败已在内部回退；commitRepoSelection 异常被兜底 log（会话仍留在
+ * pendingRepo，用户可 /repo 自救），绝不让 unhandled rejection 掀掉 daemon。
+ */
+export async function runAutoWorktreeCommit(deps: {
+  ds: DaemonSession;
+  anchor: string;
+  larkAppId: string;
+  baseDir: string;
+  title?: string;
+  prompt?: string;
+  operatorOpenId?: string;
+  activeSessions: Map<string, DaemonSession>;
+  notify: (message: string) => Promise<unknown> | void;
+}): Promise<void> {
+  const { ds, anchor, larkAppId, baseDir, title, prompt, operatorOpenId, activeSessions, notify } = deps;
+  ds.worktreeCreating = true;
+  // Surface the pending row NOW (all three callers funnel through here, so this is
+  // the single place that guarantees the session is visible on SSE-only dashboards
+  // during the up-to-30s build) — commitRepoSelection's forkWorker is what would
+  // otherwise emit session.spawned, far too late.
+  announcePendingRepoSession(ds);
+  try {
+    const { maybeCreateDefaultWorktree } = await import('../../services/default-worktree.js');
+    const wt = await maybeCreateDefaultWorktree(larkAppId, baseDir, {
+      isBotDefaultDir: true, title, prompt, locale: localeForBot(larkAppId), notify,
+    });
+    // Commit even on fallback (wt.dir === baseDir) — the session must still start.
+    // commitRepoSelection has its own /close + generation guards and, for a
+    // pendingRepo session, folds any messages buffered during creation (pendingPrompt
+    // + pendingFollowUps) into the first turn. suppressConfirmReply: the worktree
+    // helper already posted the '已创建/回退' line, so skip the '已选择' confirmation.
+    await commitRepoSelection(
+      {
+        ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,
+        // Never reached under suppressConfirmReply for a pendingRepo session.
+        sessionReply: async () => '',
+      },
+      wt.dir,
+      pathBasename(wt.dir),
+      { suppressConfirmReply: true },
+    );
+  } catch (e) {
+    // No recovery fork here: forking with an empty prompt would DROP the buffered
+    // first turn (pendingPrompt lives only in-memory, not the message queue). Leave
+    // the session as commitRepoSelection left it — the inbound router's worker=null
+    // branch re-forks (with the pinned dir) on the user's next message, and a still-
+    // pending session keeps buffering. Loud log so the rare mid-commit throw is seen.
+    logger.error(`[${tag(ds)}] auto-worktree commit failed (session recoverable on next message): ${e instanceof Error ? e.message : e}`);
+  } finally {
+    ds.worktreeCreating = false;
+  }
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────

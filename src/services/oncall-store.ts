@@ -193,20 +193,26 @@ export async function updateBotDefaultOncall(
  *   • 'default' → set defaultWorkingDir=dir; disable defaultOncall (keep prior dir).
  *   • 'oncall'  → enable defaultOncall(dir) + re-stamp `since`; clear defaultWorkingDir.
  *
+ * `autoWorktree` only applies to 'default' mode (每个新会话自动建 worktree)：写入其中，
+ * 其余模式一律清掉（该开关脱离 defaultWorkingDir 无意义，避免残留脏态）。
+ *
  * Caller validates `workingDir` (dir existence) first; it is ignored for 'off'.
  */
 export async function setWorkingDirMode(
   larkAppId: string,
   mode: 'off' | 'default' | 'oncall',
   workingDir: string,
+  autoWorktree = false,
 ): Promise<
-  | { ok: true; defaultOncall: BotDefaultOncall; defaultWorkingDir: string | null }
+  | { ok: true; defaultOncall: BotDefaultOncall; defaultWorkingDir: string | null; defaultWorkingDirAutoWorktree: boolean }
   | { ok: false; reason: string }
 > {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
   const dir = (workingDir ?? '').trim();
+  // The toggle only rides along with 'default' mode; force it off otherwise.
+  const nextAutoWorktree = mode === 'default' && autoWorktree === true;
   let nextOncall: BotDefaultOncall | null = null;
   let nextWorkingDir: string | null = null;
 
@@ -223,6 +229,8 @@ export async function setWorkingDirMode(
     entry.defaultOncall = nextOncall;
     if (nextWorkingDir === null) delete entry.defaultWorkingDir;
     else entry.defaultWorkingDir = nextWorkingDir;
+    if (nextAutoWorktree) entry.defaultWorkingDirAutoWorktree = true;
+    else delete entry.defaultWorkingDirAutoWorktree;
     return { write: true, result: null };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
@@ -230,12 +238,13 @@ export async function setWorkingDirMode(
   // Sync in-memory config (runtime reads bot.config directly — no restart needed).
   bot.config.defaultOncall = nextOncall!;
   bot.config.defaultWorkingDir = nextWorkingDir ?? undefined;
+  bot.config.defaultWorkingDirAutoWorktree = nextAutoWorktree || undefined;
   logger.info(
     `[oncall:${larkAppId}] working-dir mode=${mode} ` +
-    `(defaultWorkingDir=${nextWorkingDir ?? '∅'}, oncall.enabled=${nextOncall!.enabled}, ` +
-    `oncall.dir=${nextOncall!.workingDir || '∅'})`,
+    `(defaultWorkingDir=${nextWorkingDir ?? '∅'}, autoWorktree=${nextAutoWorktree}, ` +
+    `oncall.enabled=${nextOncall!.enabled}, oncall.dir=${nextOncall!.workingDir || '∅'})`,
   );
-  return { ok: true, defaultOncall: nextOncall!, defaultWorkingDir: nextWorkingDir };
+  return { ok: true, defaultOncall: nextOncall!, defaultWorkingDir: nextWorkingDir, defaultWorkingDirAutoWorktree: nextAutoWorktree };
 }
 
 /**

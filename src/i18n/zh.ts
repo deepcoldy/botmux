@@ -263,6 +263,12 @@ export const messages: Record<string, string> = {
   'cmd.repo.worktree_in_progress': '⏳ 已有一个 worktree 正在创建，请稍候…',
   'cmd.repo.worktree_created_not_switched': '🌿 worktree 已创建：`{path}`（分支 `{branch}`），但会话状态已变化，未自动切换。需要时可用 `/repo {path}` 打开。',
   'cmd.repo.worktree_switch_failed': '⚠️ worktree 已创建：`{path}`，但自动切换失败：{error}\n可用 `/repo {path}` 手动打开。',
+  // 「仅默认目录」模式开启「自动创建 worktree」后，新会话启动时用（daemon 交互新话题 /
+  // dashboard 建会话 / webhook 外部事件三条路复用）。
+  'worktree.auto_creating': '🌿 正在为本会话创建独立 worktree（含 git fetch，可能需要几秒）…',
+  'worktree.auto_created': '🌿 已为本会话自动创建独立 worktree：`{path}`\n分支 `{branch}`，基于 `{base}`。原默认目录不受影响。',
+  'worktree.auto_fallback': '⚠️ 无法在默认目录 `{dir}` 创建 worktree（{error}），已回退到直接在默认目录启动会话。',
+  'worktree.err_not_git': '默认目录不是 git 仓库（或暂时无法确认）',
   'cmd.skip.opened': '▶️ 已直接开启会话（工作目录：{cwd}）',
   'cmd.status.running': '运行中',
   'cmd.status.waiting': '等待中',
@@ -708,6 +714,7 @@ export const messages: Record<string, string> = {
   'daemon.cmd_needs_active_cli': '{cmd} 需要活跃的 CLI 进程，当前话题无运行中的会话。',
   'daemon.enriched_mentions_label': '消息中的 @mention：',
   'daemon.choose_repo_first': '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。',
+  'daemon.worktree_building_wait': '正在创建 worktree（含 git fetch，可能需要几秒），您的消息已暂存，创建完成后会自动一并发送。',
 
   // ─── /dashboard command group (PR3 C1) ─────────────────────────────────
   'card.dashboard.owner_only': '🔒 `/dashboard` 命令组仅 Bot 管理员（allowedUsers）可用。',

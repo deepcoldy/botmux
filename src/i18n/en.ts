@@ -260,6 +260,12 @@ export const messages: Record<string, string> = {
   'cmd.repo.worktree_in_progress': '⏳ A worktree is already being created — please wait…',
   'cmd.repo.worktree_created_not_switched': '🌿 Worktree created: `{path}` (branch `{branch}`), but the session changed meanwhile — not switched automatically. Use `/repo {path}` to open it.',
   'cmd.repo.worktree_switch_failed': '⚠️ Worktree created at `{path}`, but switching to it failed: {error}\nUse `/repo {path}` to open it manually.',
+  // Used when 「default-directory-only」mode has「auto-create worktree」on, at new
+  // session start (shared by interactive new topic / dashboard create / webhook).
+  'worktree.auto_creating': '🌿 Creating an isolated worktree for this session (includes a git fetch, may take a few seconds)…',
+  'worktree.auto_created': '🌿 Auto-created an isolated worktree for this session: `{path}`\nBranch `{branch}`, based on `{base}`. Your default directory is untouched.',
+  'worktree.auto_fallback': '⚠️ Could not create a worktree in the default directory `{dir}` ({error}); fell back to starting the session directly in the default directory.',
+  'worktree.err_not_git': 'default directory is not a git repository (or could not be confirmed)',
   'cmd.skip.opened': '▶️ Session started (working dir: {cwd})',
   'cmd.status.running': 'running',
   'cmd.status.waiting': 'idle',
@@ -705,6 +711,7 @@ export const messages: Record<string, string> = {
   'daemon.cmd_needs_active_cli': '{cmd} needs an active CLI process; no running session in this topic.',
   'daemon.enriched_mentions_label': '@mentions in this message:',
   'daemon.choose_repo_first': 'Pick a repo from the card above first — your message is queued and will be sent once a repo is chosen.',
+  'daemon.worktree_building_wait': 'Creating a worktree (includes a git fetch, may take a few seconds) — your message is queued and will be sent together once it is ready.',
 
   // ─── /dashboard command group (PR3 C1) ─────────────────────────────────
   'card.dashboard.owner_only': '🔒 The `/dashboard` command group is restricted to bot admins (allowedUsers).',
