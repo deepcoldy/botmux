@@ -72,6 +72,14 @@ async function resolveBaseRef(repo: string): Promise<string> {
   return 'HEAD';
 }
 
+/** Cheap, network-free check that `dir` is inside a git work tree. Used to
+ *  decide BEFORE posting a "creating worktree…" notice whether creation can even
+ *  be attempted — a non-git default dir fails instantly and silently rather than
+ *  spamming a creating→failed message pair on every new session. */
+export async function isGitWorkTree(dir: string): Promise<boolean> {
+  return (await tryGit(['rev-parse', '--is-inside-work-tree'], resolve(dir), 5_000)) === 'true';
+}
+
 /** Branch names may contain `/` etc. — flatten to a filesystem-safe suffix. */
 export function dirSuffixForBranch(branch: string): string {
   return branch.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'branch';

@@ -189,6 +189,43 @@ export function renderBotAgentSection(b: any, sessionFallback: string): string {
   const model = typeof b?.model === 'string' ? b.model : '';
   const suggestions = modelSuggestionsForOption(selectedCliOption(key));
   const disabled = selectedCliOption(key)?.gateway === 'ttadk' && selectedCliOption(key)?.acceptsModel === false;
+  // botmux skills 注入方式. `support` decides how the control renders:
+  //  - 'dynamic' (claude-family, --plugin-dir): disabled, shows 动态注入 as the
+  //    fixed mode — not configurable.
+  //  - 'global' (codex-family, global skills dir): prompt/global/off selectable;
+  //    动态注入 shown but disabled (hint: this CLI can't do dynamic injection).
+  //  - 'none' (no skill dir): the whole row is omitted.
+  // The selected value is the RESOLVED mode (per-bot override → machine default),
+  // which is `prompt` out of the box — so there is no separate "follow" option.
+  const siSupport: string = b?.skillInjectionSupport === 'dynamic' ? 'dynamic' : b?.skillInjectionSupport === 'global' ? 'global' : 'none';
+  const siOverride: string = (b?.skillInjection === 'global' || b?.skillInjection === 'prompt' || b?.skillInjection === 'off') ? b.skillInjection : '';
+  const siDefault: string = (b?.skillInjectionDefault === 'global' || b?.skillInjectionDefault === 'off') ? b.skillInjectionDefault : 'prompt';
+  const siResolved: string = siOverride || siDefault; // 'prompt' | 'global' | 'off'
+  const skillRow = siSupport === 'none' ? '' : siSupport === 'dynamic'
+    ? `<div class="bd-row">
+        <label>
+          <span>${t('botDefaults.skillInjection')}</span>
+          <select data-input="skillInjection" disabled>
+            <option value="dynamic" selected>${escapeHtml(t('botDefaults.skillInjectionDynamic'))}</option>
+          </select>
+        </label>
+        <small class="bd-help">${t('botDefaults.skillInjectionHelpDynamic')}</small>
+      </div>`
+    : `<div class="bd-row">
+        <label>
+          <span>${t('botDefaults.skillInjection')}</span>
+          <select data-input="skillInjection">
+            <option value="dynamic" disabled>${escapeHtml(t('botDefaults.skillInjectionDynamicUnsupported'))}</option>
+            <option value="prompt" ${siResolved === 'prompt' ? 'selected' : ''}>${escapeHtml(t('botDefaults.skillInjectionPrompt'))}</option>
+            <option value="global" ${siResolved === 'global' ? 'selected' : ''}>${escapeHtml(t('botDefaults.skillInjectionGlobal'))}</option>
+            <option value="off" ${siResolved === 'off' ? 'selected' : ''}>${escapeHtml(t('botDefaults.skillInjectionOff'))}</option>
+          </select>
+        </label>
+        <small class="bd-help">${t('botDefaults.skillInjectionHelp')}</small>
+        <div class="actions">
+          <span class="oncall-status" data-skill-injection-status></span>
+        </div>
+      </div>`;
   return `<section class="bd-section">
       <h3 class="bd-section-title">${t('botDefaults.sectionAgent')}</h3>
       <div class="bd-row">
@@ -213,6 +250,7 @@ export function renderBotAgentSection(b: any, sessionFallback: string): string {
           <span class="oncall-status" data-agent-status></span>
         </div>
       </div>
+      ${skillRow}
     </section>`;
 }
 
@@ -410,6 +448,12 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
                   value="${escapeHtml(wdDirValue)}">
               </label>
             </div>
+            <label class="toggle-row" data-wd-worktree-row ${wdMode === 'default' ? '' : 'hidden'}>
+              <input type="checkbox" data-input="autoWorktree" ${b.defaultWorkingDirAutoWorktree ? 'checked' : ''}>
+              <span class="switch" aria-hidden="true"></span>
+              <span class="toggle-tx"><strong>${t('botDefaults.autoWorktree')}</strong>
+              <small>${t('botDefaults.autoWorktreeHelp')}</small></span>
+            </label>
             <div class="actions">
               <button type="button" class="primary" data-action="save-working-dir">${t('botDefaults.save')}</button>
               <span class="oncall-status" data-status></span>
@@ -945,6 +989,8 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
       const wdModeSel = card.querySelector<HTMLSelectElement>('select[data-input=workingDirMode]');
       const input = card.querySelector<HTMLInputElement>('input[data-input=workingDir]');
       const wdDirRow = card.querySelector<HTMLElement>('[data-wd-dir-row]');
+      const wdWorktreeRow = card.querySelector<HTMLElement>('[data-wd-worktree-row]');
+      const autoWorktreeInput = card.querySelector<HTMLInputElement>('input[data-input=autoWorktree]');
       const saveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-working-dir]');
       const statusEl = card.querySelector<HTMLSpanElement>('[data-status]');
       if (!wdModeSel || !input || !saveBtn || !statusEl) return; // error card
@@ -1022,9 +1068,11 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
       }
 
       // 选「关闭」隐藏目录输入框；选其它则显示并聚焦（off 不需要目录）。
+      // 「自动创建 worktree」开关仅「仅默认目录」模式可见（脱离该模式无意义）。
       wdModeSel.addEventListener('change', () => {
         const off = wdModeSel.value === 'off';
         if (wdDirRow) wdDirRow.hidden = off;
+        if (wdWorktreeRow) wdWorktreeRow.hidden = wdModeSel.value !== 'default';
         if (!off) input.focus();
       });
 
@@ -1038,12 +1086,14 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
           statusEl.classList.add('hint-warn-inline');
           return;
         }
+        // 「自动创建 worktree」仅「仅默认目录」模式有效；其它模式一律传 false（后端也会强制清）。
+        const autoWorktree = mode === 'default' && !!autoWorktreeInput?.checked;
         saveBtn.disabled = true;
         try {
           const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/working-dir-mode`, {
             method: 'PUT',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ mode, workingDir }),
+            body: JSON.stringify({ mode, workingDir, autoWorktree }),
           });
           const body = await r.json().catch(() => ({}));
           if (r.ok && body.ok) {
@@ -1057,6 +1107,7 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
             if (cached) {
               if (body.defaultOncall) cached.defaultOncall = body.defaultOncall;
               cached.defaultWorkingDir = body.defaultWorkingDir ?? null;
+              cached.defaultWorkingDirAutoWorktree = body.defaultWorkingDirAutoWorktree === true;
             }
             // Oncall 模式 re-stamps `since` → reflect it in the meta line.
             const metaEl = card.querySelector<HTMLElement>('[data-oncall-since]');
@@ -1478,6 +1529,42 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
             p2pStatusEl.classList.add('hint-warn-inline');
           } finally {
             p2pModeSel.disabled = false;
+          }
+        });
+      }
+
+      // ── 内置技能注入模式 skillInjection select ────────────────────────────
+      // '' = 清回机器级默认（botmux skills injection）；global|prompt|off 显式覆盖。
+      // 走 /api/bots/:appId/skill-injection → applyConfigField（与 /config 同路径）。
+      const skillInjSel = card.querySelector<HTMLSelectElement>('select[data-input=skillInjection]');
+      const skillInjStatusEl = card.querySelector<HTMLSpanElement>('[data-skill-injection-status]');
+      if (skillInjSel && skillInjStatusEl) {
+        skillInjSel.addEventListener('change', async () => {
+          const mode = skillInjSel.value; // '' | 'global' | 'prompt' | 'off'
+          skillInjStatusEl.textContent = '';
+          skillInjStatusEl.className = 'oncall-status';
+          skillInjSel.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/skill-injection`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ skillInjection: mode }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              skillInjStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+              skillInjStatusEl.classList.add('hint-ok');
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.skillInjection = body.skillInjection ?? null;
+            } else {
+              skillInjStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              skillInjStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            skillInjStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            skillInjStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            skillInjSel.disabled = false;
           }
         });
       }

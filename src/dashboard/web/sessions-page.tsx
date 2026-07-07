@@ -31,9 +31,8 @@ function SessionsPage() {
           <p>{tr('sessions.subtitle')}</p>
         </div>
         <div className="sessions-view-controls">
-          <button type="button" id="create-session-btn" className="primary create-session-btn">
-            {'+ '}{tr('sessions.create.button')}
-          </button>
+          {/* 「创建会话」按钮已提到全局顶栏（index.html + wireCreateSessionButton），
+              弹窗 #create-session-modal 也随之全局化，此处不再渲染 */}
           <span id="kanban-team-stats" className="kanban-team-stats" hidden />
           <select id="kanban-team" className="kanban-team-select" aria-label={tr('sessions.kanban.groupTeam')} hidden />
           <div className="segmented kanban-groupby" id="kanban-groupby" role="group" aria-label={tr('sessions.kanban.groupBy')} hidden>
@@ -115,7 +114,6 @@ function SessionsPage() {
       <dialog id="drawer" />
       <dialog id="term-modal" className="term-modal" />
       <dialog id="history-modal" className="history-modal" />
-      <dialog id="create-session-modal" className="create-session-modal" />
     </section>
   );
 }

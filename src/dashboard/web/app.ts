@@ -189,6 +189,9 @@ function applyAuthVisibility(): void {
   }
   const addBot = document.getElementById('add-bot-btn');
   if (addBot) addBot.style.display = isAuthed ? '' : 'none';
+  // 创建会话同为管理动作（/api/sessions/create token-gated），只读访客隐藏。
+  const createSession = document.getElementById('create-session-btn');
+  if (createSession) createSession.style.display = isAuthed ? '' : 'none';
 }
 
 // Show a small dot on the Settings nav when a newer botmux version is published,
@@ -367,11 +370,28 @@ function wireSidebarToggle() {
   });
 }
 
+// 全局顶栏「创建会话」按钮：点击时按需动态 import 较重的 sessions 模块并拉起弹窗，
+// 让创建逻辑留在懒加载 chunk 里、不撑大主包（对应 wireBotOnboardingButton，但走懒加载）。
+function wireCreateSessionButton(): void {
+  const btn = document.getElementById('create-session-btn') as HTMLButtonElement | null;
+  if (!btn) return;
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      const mod = await import('./sessions.js');
+      await mod.openCreateSessionModal();
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
 // Keep bootstrap sequencing explicit even though the dashboard bundle is ESM.
 void (async () => {
   ui.init();
   wireChromeControls();
   wireBotOnboardingButton();
+  wireCreateSessionButton();
   ui.on(() => {
     paintChrome();
     paintAttentionStrip();

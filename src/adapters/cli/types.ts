@@ -73,6 +73,10 @@ export interface CliAdapter {
     initialPrompt?: string;
     botName?: string;
     botOpenId?: string;
+    /** This bot's larkAppId. Lets injectsSessionContext adapters (genius) resolve
+     *  their per-bot built-in skill injection mode for the system-prompt catalog;
+     *  inline-prompt CLIs get theirs from session-manager instead. */
+    larkAppId?: string;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
     /** Optional model name from BotConfig.model. Adapters whose CLI accepts a

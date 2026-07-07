@@ -2369,6 +2369,26 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/skill-injection — proxy to that bot's daemon. Body
+    // `{ skillInjection: 'global'|'prompt'|'off'|'' }` (''/other clears back to
+    // the machine default). Governs how botmux built-in skills reach global-
+    // skillsDir CLIs (codex/gemini/…).
+    let mBotSkillInjection: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotSkillInjection = url.pathname.match(/^\/api\/bots\/([^/]+)\/skill-injection$/))) {
+      const appId = decodeURIComponent(mBotSkillInjection[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-skill-injection`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/grant-prefs — proxy to that bot's daemon. Body carries
     // any subset of `{ restrictGrantCommands?: boolean, autoGrantRequestCards?: boolean,
     // messageQuotaDefaultLimit?: number|null }`.

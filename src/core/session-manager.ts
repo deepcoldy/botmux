@@ -14,6 +14,12 @@ import { logger } from '../utils/logger.js';
 import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
+import {
+  resolveSkillInjectionModeForApp,
+  builtinSkillEntries,
+  buildBuiltinSkillCatalogBlock,
+  builtinSkillHelpPointer,
+} from '../skills/injection-mode.js';
 import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, probePersistentBackendServer, killPersistentSession, type PersistentBackendType } from './persistent-backend.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
 import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
@@ -43,6 +49,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
 import { resolveRoleInjection } from './role-resolver.js';
 import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../services/whiteboard-store.js';
+import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -420,6 +427,26 @@ export function buildNewTopicPrompt(
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
     : '';
 
+  // Built-in skill delivery for CLIs without a per-session skill channel
+  // (codex/gemini/opencode/… — those with a global `skillsDir`). In `prompt`
+  // mode we inline a compact skill catalog here instead of installing files
+  // into the CLI's shared global dir; in `off` mode we only point at the CLI
+  // help. `global` mode installs files (worker-pool ensureCliSkills) and adds
+  // nothing to the prompt. Claude-family (injectsSessionContext) inject skills
+  // via --plugin-dir, so they're excluded.
+  let skillBlock = '';
+  if (!adapter.injectsSessionContext && adapter.skillsDir) {
+    const mode = resolveSkillInjectionModeForApp(opts?.larkAppId);
+    if (mode === 'prompt') {
+      // excludeRoutingCovered: send/history/quoted/bots live in <botmux_routing>
+      // already, so the catalog carries only the additional task capabilities.
+      const entries = builtinSkillEntries({ asksViaHook: adapter.asksViaHook, whiteboardEnabled: whiteboardEnabled(), excludeRoutingCovered: true });
+      skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
+    } else if (mode === 'off') {
+      skillBlock = builtinSkillHelpPointer(locale);
+    }
+  }
+
   const unknown = t('ai.identity.unknown', undefined, locale);
   let identityBlock = '';
   if (botIdentity && (botIdentity.name || botIdentity.openId)) {
@@ -476,6 +503,7 @@ export function buildNewTopicPrompt(
   // misread as part of the user's text.
   if (!adapter.injectsSessionContext) {
     if (routingBlock) parts.push(routingBlock);
+    if (skillBlock) parts.push(skillBlock);
     if (identityBlock) parts.push(identityBlock);
     parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
   }
@@ -1468,6 +1496,35 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
   const larkAppId = ds.larkAppId;
   const bot = getBot(larkAppId);
   const locale = localeForBot(larkAppId);
+
+  // 仅默认目录 + auto-worktree：ds.workingDir 命中本 bot 自己的默认目录（且非本群 oncall 绑定）时，
+  // 走 pendingRepo 挂起 + 异步提交：把会话置 pendingRepo（入站路由 buffer 并发消息、不抢 fork），
+  // 在关键路径之外经 runAutoWorktreeCommit 建 worktree 并 commitRepoSelection 提交+fork（detach，
+  // 立即返回，不阻塞 dashboard 建会话 IPC 响应）。dashboard「建会话」立即开跑 / 待办池激活都走这里。
+  // 非 git 仓库 / 建失败 → 回退默认目录（提示经 notify 发）。registry 拿不到时兜底走原同步路径。
+  const registry = getActiveSessionsRegistry();
+  if (registry && ds.workingDir && !ds.worktreeCreating && botAutoWorktreeEnabled(larkAppId)) {
+    const isBotDefaultDir = !findOncallChat(larkAppId, ds.chatId)?.workingDir
+      && ds.workingDir === expandHome(effectiveDefaultWorkingDir(bot.config) ?? '');
+    if (isBotDefaultDir) {
+      const baseDir = ds.workingDir;
+      ds.pendingRepo = true;         // router buffers concurrent msgs; commit clears it
+      ds.pendingPrompt = userContent; // folded into the first turn by commitRepoSelection
+      // (The pending dashboard row is announced inside runAutoWorktreeCommit so all
+      // three spawn callers get it from one place — no publish needed here.)
+      const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
+      const { sendMessage } = await import('../im/lark/client.js');
+      void runAutoWorktreeCommit({
+        ds, anchor: ds.chatId, larkAppId, baseDir,
+        title: ds.session.title, prompt: userContent,
+        operatorOpenId: ds.session.ownerOpenId, activeSessions: registry,
+        notify: (m) => sendMessage(larkAppId, ds.chatId, m),
+      });
+      logger.info(`[createSession] session ${ds.session.sessionId.substring(0, 8)} → pending, building worktree off ${baseDir}`);
+      return;
+    }
+  }
+
   const buildPrompt = () => buildNewTopicPrompt(
     userContent, ds.session.sessionId, bot.config.cliId, bot.config.cliPathOverride,
     undefined, undefined, undefined, undefined,

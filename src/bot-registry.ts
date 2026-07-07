@@ -368,6 +368,16 @@ export interface BotConfig {
   oncallChats?: OncallChat[];
   /** UI language for this bot: 'zh' or 'en'. Falls back to BOTMUX_LANG / LANG env when unset. */
   lang?: Locale;
+  /** How this bot's built-in botmux bridge skills reach its CLI (only meaningful
+   *  for CLIs with a global `skillsDir` — codex/gemini/opencode/…):
+   *   - `global`: install into the CLI's shared global skills dir (leaks into the
+   *     user's own standalone CLI). For users who never run the CLI by hand.
+   *   - `prompt`: inject a session-scoped skill catalog into the prompt +
+   *     `botmux skill show <name>` on demand. No leak.
+   *   - `off`: routing hints + `botmux --help` only.
+   *  Unset ⇒ fall back to the machine-wide `skills.builtinInjection` (default
+   *  `prompt`). See services skills/injection-mode.ts. */
+  skillInjection?: 'global' | 'prompt' | 'off';
   /**
    * Per-bot default working directory. When set, new topics that have no
    * oncall binding and no sibling-session inheritance skip the repo-select
@@ -378,6 +388,14 @@ export interface BotConfig {
    * NOT change the canTalk / canOperate permission model (unlike defaultOncall).
    */
   defaultWorkingDir?: string;
+  /**
+   * 「仅默认目录」模式下的开关：新会话启动前，先在 `defaultWorkingDir`（须是 git 仓库）
+   * 基于远端默认分支自动创建一个 linked worktree，再把会话 cwd 指向该 worktree，实现
+   * 每个新会话一个隔离 checkout。仅在 mode==='default'（defaultWorkingDir 有值）时有意义；
+   * 非 git 仓库 / 创建失败时回退直接用 defaultWorkingDir 启动。复用 `/repo wt` 的
+   * createRepoWorktree。见 services/default-worktree.ts。
+   */
+  defaultWorkingDirAutoWorktree?: boolean;
   /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */
   defaultOncall?: BotDefaultOncall;
   /**
@@ -1184,6 +1202,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       defaultWorkingDir: typeof entry.defaultWorkingDir === 'string' && entry.defaultWorkingDir.trim()
         ? entry.defaultWorkingDir.trim()
         : undefined,
+      // Only meaningful alongside defaultWorkingDir (仅默认目录 mode); only explicit
+      // true is persisted (undefined = off) so bots.json stays clean.
+      defaultWorkingDirAutoWorktree: entry.defaultWorkingDirAutoWorktree === true || undefined,
       chatReplyModes,
       chatGrants,
       globalGrants,
@@ -1197,6 +1218,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       env,
       skills,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
+      skillInjection: entry.skillInjection === 'global' || entry.skillInjection === 'prompt' || entry.skillInjection === 'off'
+        ? entry.skillInjection : undefined,
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,

@@ -327,6 +327,10 @@ a { color: inherit; }
   white-space: nowrap;
 }
 
+.topbar-create-session {
+  white-space: nowrap;
+}
+
 /* 文档站外链——沿用主题菜单 chip 的外观，和其它 topbar 控件对齐 */
 .topbar-docs-link {
   display: inline-flex;

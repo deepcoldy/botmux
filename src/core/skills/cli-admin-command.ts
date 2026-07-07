@@ -13,8 +13,9 @@ import {
 } from '../../services/skill-registry-store.js';
 import type { BotConfig } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
-import { readGlobalConfig } from '../../global-config.js';
+import { readGlobalConfig, mergeGlobalConfig } from '../../global-config.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
+import { globalBuiltinSkillInjectionDefault, isSkillInjectionMode } from '../../skills/injection-mode.js';
 import type { CliId } from '../../adapters/cli/types.js';
 import { discoverProjectSkills } from './discovery.js';
 import { resolveSkillPolicy } from './policy.js';
@@ -183,6 +184,31 @@ function runDelivery(args: string[]): AdminCommandResult {
   }
 }
 
+/**
+ * Get/set the machine-wide default for built-in bridge-skill injection into
+ * global-skillsDir CLIs (codex/gemini/opencode/…). No arg → print the current
+ * effective default; `global|prompt|off` → persist it; `unset` → clear it so the
+ * built-in `prompt` default applies. Per-bot overrides live in bots.json
+ * (`skillInjection`) and win over this. Mirrors `botmux skills delivery`.
+ */
+function runInjection(args: string[]): AdminCommandResult {
+  const arg = args[0];
+  if (!arg) {
+    return { code: 0, stdout: `builtinInjection: ${globalBuiltinSkillInjectionDefault()}\n`, stderr: '' };
+  }
+  const existing = readGlobalConfig().skills ?? {};
+  if (arg === 'unset') {
+    const { builtinInjection: _drop, ...rest } = existing;
+    mergeGlobalConfig({ skills: Object.keys(rest).length > 0 ? rest : null });
+    return { code: 0, stdout: `builtinInjection unset → ${globalBuiltinSkillInjectionDefault()}\n`, stderr: '' };
+  }
+  if (!isSkillInjectionMode(arg)) {
+    return { code: 2, stdout: '', stderr: 'usage: botmux skills injection [global|prompt|off|unset]\n' };
+  }
+  mergeGlobalConfig({ skills: { ...existing, builtinInjection: arg } });
+  return { code: 0, stdout: `builtinInjection: ${arg}\n`, stderr: '' };
+}
+
 function runDiscover(args: string[]): AdminCommandResult {
   const source = args[0];
   if (!source) return { code: 2, stdout: '', stderr: 'usage: botmux skills discover <path|git|github> [--path <repo-path>] [--ref <ref>] [--full-depth] [--json]\n' };
@@ -324,6 +350,9 @@ export function runSkillsAdminCommand(args: string[]): AdminCommandResult {
     }
     if (sub === 'delivery') {
       return runDelivery(args.slice(1));
+    }
+    if (sub === 'injection') {
+      return runInjection(args.slice(1));
     }
     return { code: 2, stdout: '', stderr: `unknown skills command: ${sub}\n` };
   } catch (err: any) {

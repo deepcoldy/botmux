@@ -84,6 +84,8 @@ describe('resolvePinnedWorkingDir', () => {
 
     expect(result.pinnedWorkingDir).toBe(defaultDir);
     expect(result.inheritedFrom).toBeNull();
+    // Its OWN defaultWorkingDir (layer 3) → auto-worktree may opt in here.
+    expect(result.pinnedFromBotDefault).toBe(true);
   });
 
   it('inherits a same-anchor peer workingDir ONLY when this bot has no oncall binding and no default dir of its own', async () => {
@@ -105,6 +107,8 @@ describe('resolvePinnedWorkingDir', () => {
 
     expect(result.pinnedWorkingDir).toBe(peerDir);
     expect(result.inheritedFrom).toEqual({ sessionId: peer.sessionId, larkAppId: 'app-peer', workingDir: peerDir });
+    // Inherited from a sibling, not this bot's own default → auto-worktree stays out.
+    expect(result.pinnedFromBotDefault).toBe(false);
   });
 
   it('uses this bot defaultWorkingDir and never consults the peer (default outranks inherit)', async () => {
