@@ -247,4 +247,65 @@ describe('plugin manifest and registry basics', () => {
       env: { BOT_ID: 'dev-bot' },
     });
   });
+
+  it('includes dependency plugin static and dynamic MCP when resolving selected plugins', async () => {
+    const base = join(home, 'plugin-base-src');
+    mkdirSync(join(base, 'dist'), { recursive: true });
+    writeFileSync(join(base, 'package.json'), JSON.stringify({
+      name: '@botmux/plugin-base-demo',
+      version: '0.1.0',
+      type: 'module',
+      keywords: ['botmux-plugin'],
+      botmux: {
+        schemaVersion: 1,
+        id: 'base-demo',
+        main: './dist/plugin.js',
+        hooks: ['worker'],
+        mcp: [{ name: 'base-static', command: ['node', './dist/base-static.js'] }],
+      },
+    }));
+    writeFileSync(join(base, 'dist', 'plugin.js'), `
+      export default {
+        apply(api, ctx) {
+          if (ctx.runtime !== 'worker') return;
+          api.worker.configureMcp.tap('base-demo', (mcp) => {
+            mcp.addMcpServer('base-dynamic', { command: ['node', './dist/base-dynamic.js', mcp.sessionId] });
+          });
+        }
+      };
+    `);
+
+    const addon = join(home, 'plugin-addon-src');
+    mkdirSync(join(addon, 'dist'), { recursive: true });
+    writeFileSync(join(addon, 'package.json'), JSON.stringify({
+      name: '@botmux/plugin-addon-demo',
+      version: '0.1.0',
+      type: 'module',
+      keywords: ['botmux-plugin'],
+      botmux: {
+        schemaVersion: 1,
+        id: 'addon-demo',
+        main: './dist/plugin.js',
+        hooks: ['worker'],
+        dependencies: { plugins: { 'base-demo': '>=0.1.0' } },
+        mcp: [{ name: 'addon-static', command: ['node', './dist/addon-static.js'] }],
+      },
+    }));
+    writeFileSync(join(addon, 'dist', 'plugin.js'), `
+      export default {
+        apply(api, ctx) {
+          if (ctx.runtime !== 'worker') return;
+          api.worker.configureMcp.tap('addon-demo', (mcp) => {
+            mcp.addMcpServer('addon-dynamic', { command: ['node', './dist/addon-dynamic.js', mcp.botId] });
+          });
+        }
+      };
+    `);
+
+    installLocalPlugin(base);
+    installLocalPlugin(addon);
+
+    const mcp = await resolvePluginMcpServers({ pluginIds: ['addon-demo'], botId: 'dev-bot', sessionId: 's-1' });
+    expect(mcp.map(server => server.name)).toEqual(['base-static', 'addon-static', 'base-dynamic', 'addon-dynamic']);
+  });
 });

@@ -209,12 +209,14 @@ export async function collectPluginCliCommands(pluginIds?: readonly string[]): P
 }
 
 export async function resolvePluginMcpServers(input: ResolvePluginMcpInput): Promise<ResolvedPluginMcpServer[]> {
-  const out = resolveStaticPluginMcpServers(input);
+  const records = orderedPluginRecords(input.pluginIds);
+  const expandedInput = { ...input, pluginIds: records.map(record => record.id) };
+  const out = resolveStaticPluginMcpServers(expandedInput);
   const seen = new Map<string, string>();
   for (const server of out) seen.set(server.name, server.pluginId);
 
   const taps: WorkerMcpTap[] = [];
-  for (const record of orderedPluginRecords(input.pluginIds)) {
+  for (const record of records) {
     if (!hasRuntimeHook(record, 'worker')) continue;
     const apply = await importPluginApply(record);
     if (!apply) continue;
