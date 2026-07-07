@@ -26,6 +26,7 @@ export interface PluginHostService {
   command?: string[];
   port?: number;
   healthUrl?: string;
+  openUrl?: string;
   description?: string;
 }
 

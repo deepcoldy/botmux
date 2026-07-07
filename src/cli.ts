@@ -6788,12 +6788,13 @@ function pluginPm2Options() {
   return { pm2Bin: pm2Bin(), pm2Home: PM2_HOME, nodePath: process.execPath };
 }
 
-function formatPluginServiceReports(reports: Array<{ pluginId: string; serviceName: string; action: string; status?: string; warning?: string }>): string {
+function formatPluginServiceReports(reports: Array<{ pluginId: string; serviceName: string; action: string; status?: string; openUrl?: string; warning?: string }>): string {
   if (reports.length === 0) return '无插件 host service。';
   return reports.map(r => {
     const status = r.status ? r.action === 'stopped' ? ` (was ${r.status})` : ` (${r.status})` : '';
+    const openUrl = r.openUrl ? ` url=${r.openUrl}` : '';
     const warning = r.warning ? ` ⚠ ${r.warning}` : '';
-    return `- ${r.pluginId}/${r.serviceName}: ${r.action}${status}${warning}`;
+    return `- ${r.pluginId}/${r.serviceName}: ${r.action}${status}${openUrl}${warning}`;
   }).join('\n');
 }
 

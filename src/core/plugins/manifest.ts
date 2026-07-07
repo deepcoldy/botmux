@@ -114,8 +114,17 @@ function readServices(raw: unknown): Record<string, PluginHostService> | undefin
       ? record.port
       : undefined;
     const healthUrl = optionalString(record.healthUrl);
+    const openUrl = optionalString(record.openUrl);
     const description = optionalString(record.description);
-    out[name] = { scope: 'host', mode, ...(command ? { command } : {}), ...(port ? { port } : {}), ...(healthUrl ? { healthUrl } : {}), ...(description ? { description } : {}) };
+    out[name] = {
+      scope: 'host',
+      mode,
+      ...(command ? { command } : {}),
+      ...(port ? { port } : {}),
+      ...(healthUrl ? { healthUrl } : {}),
+      ...(openUrl ? { openUrl } : {}),
+      ...(description ? { description } : {}),
+    };
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }

@@ -53,6 +53,7 @@ describe('plugin manifest and registry basics', () => {
             command: ['node', './dist/acs.js'],
             port: 9300,
             healthUrl: 'http://127.0.0.1:9300/health',
+            openUrl: 'http://127.0.0.1:9300/',
           },
         },
         mcp: [{ name: 'agent-chrome', command: ['node', './dist/mcp.js'], env: { ACS_URL: '${plugin.settings.acsUrl}' } }],
@@ -62,6 +63,7 @@ describe('plugin manifest and registry basics', () => {
     expect(pkg.botmux.id).toBe('agent-chrome');
     expect(pkg.botmux.main).toBe('dist/plugin.js');
     expect(pkg.botmux.services?.agentChrome.command).toEqual(['node', 'dist/acs.js']);
+    expect(pkg.botmux.services?.agentChrome.openUrl).toBe('http://127.0.0.1:9300/');
     expect(pkg.botmux.mcp?.[0].env).toEqual({ ACS_URL: '${plugin.settings.acsUrl}' });
   });
 

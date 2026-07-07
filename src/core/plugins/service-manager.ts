@@ -20,6 +20,7 @@ export interface PluginServiceReport {
   pm2Name: string;
   action: 'started' | 'already-running' | 'stopped' | 'not-running' | 'external' | 'failed' | 'status';
   status?: string;
+  openUrl?: string;
   warning?: string;
 }
 
@@ -138,6 +139,11 @@ function appMatchesCurrent(app: Pm2AppInfo, currentDir: string, currentRealpath:
   }
 }
 
+function serviceOpenUrl(service: PluginHostService): string | undefined {
+  if (service.openUrl) return service.openUrl;
+  return service.port ? `http://127.0.0.1:${service.port}/` : undefined;
+}
+
 function writeServiceState(
   pluginId: string,
   serviceName: string,
@@ -182,24 +188,25 @@ export async function ensureManagedHostServices(
       if (selected && !selected.has(record.id)) continue;
       for (const [serviceName, service] of serviceEntries(record)) {
         const pm2Name = pluginServicePm2Name(record.id, serviceName);
+        const openUrl = serviceOpenUrl(service);
         if (service.mode === 'external') {
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'external' });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'external', ...(openUrl ? { openUrl } : {}) });
           continue;
         }
         if (!service.command?.length) {
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', warning: 'missing command' });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', ...(openUrl ? { openUrl } : {}), warning: 'missing command' });
           continue;
         }
         const current = pluginCurrentDir(record.id);
         if (!existsSync(current)) {
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', warning: `missing current dir: ${current}` });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', ...(openUrl ? { openUrl } : {}), warning: `missing current dir: ${current}` });
           continue;
         }
         const currentRealpath = realpathSync(current);
         const app = apps.get(pm2Name);
         if (app?.status === 'online' && appMatchesCurrent(app, current, currentRealpath)) {
           writeServiceState(record.id, serviceName, pm2Name, record, current, currentRealpath);
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'already-running', status: app.status });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'already-running', status: app.status, ...(openUrl ? { openUrl } : {}) });
           continue;
         }
         try {
@@ -217,10 +224,11 @@ export async function ensureManagedHostServices(
             serviceName,
             pm2Name,
             action: 'started',
+            ...(openUrl ? { openUrl } : {}),
             ...(reason || healthWarning ? { warning: [reason, healthWarning].filter(Boolean).join('; ') } : {}),
           });
         } catch (err: any) {
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', status: app?.status, warning: err?.message ?? String(err) });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', status: app?.status, ...(openUrl ? { openUrl } : {}), warning: err?.message ?? String(err) });
         }
       }
     }
@@ -241,19 +249,20 @@ export function stopManagedHostServices(
       if (selected && !selected.has(record.id)) continue;
       for (const [serviceName, service] of serviceEntries(record)) {
         const pm2Name = pluginServicePm2Name(record.id, serviceName);
+        const openUrl = serviceOpenUrl(service);
         if (service.mode !== 'managed') continue;
         const status = apps.get(pm2Name)?.status;
         if (!status) {
           deleteServiceState(record.id, serviceName);
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'not-running' });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'not-running', ...(openUrl ? { openUrl } : {}) });
           continue;
         }
         try {
           runPm2(opts, ['delete', pm2Name], 20_000);
           deleteServiceState(record.id, serviceName);
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'stopped', status });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'stopped', status, ...(openUrl ? { openUrl } : {}) });
         } catch (err: any) {
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', status, warning: err?.message ?? String(err) });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', status, ...(openUrl ? { openUrl } : {}), warning: err?.message ?? String(err) });
         }
       }
     }
@@ -267,10 +276,11 @@ export function listPluginServiceStatus(opts: PluginPm2Options): PluginServiceRe
   for (const record of Object.values(registry.plugins)) {
     for (const [serviceName, service] of serviceEntries(record)) {
       const pm2Name = pluginServicePm2Name(record.id, serviceName);
+      const openUrl = serviceOpenUrl(service);
       if (service.mode === 'external') {
-        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'external' });
+        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'external', ...(openUrl ? { openUrl } : {}) });
       } else {
-        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'status', status: pm2AppStatus(opts, pm2Name) ?? 'stopped' });
+        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'status', status: pm2AppStatus(opts, pm2Name) ?? 'stopped', ...(openUrl ? { openUrl } : {}) });
       }
     }
   }
