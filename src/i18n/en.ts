@@ -523,6 +523,7 @@ export const messages: Record<string, string> = {
   'ai.routing.heredoc_example': "  Correct multi-line example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
   'ai.routing.usage_images': '- Attach images: `botmux send --images /path/to/img.png "caption"`',
   'ai.routing.usage_files': '- Attach files: `botmux send --files /path/to/file.pdf "FYI"`',
+  'ai.routing.usage_videos': '- Attach video previews: `botmux send --videos /path/to/replay.mp4 --video-covers /path/to/cover.png --no-mention "preview"`',
   'ai.routing.usage_history': '- Need prior context? Use `botmux history` to read this session\'s history.',
   'ai.routing.usage_bots_list': '- List collaborator bots in the group: `botmux bots list`',
 
@@ -543,7 +544,7 @@ export const messages: Record<string, string> = {
   // ─── AI hints (non-Claude CLIs: BOTMUX_SHELL_HINTS) ──────────────────────
   'ai.shell.intro': 'You are running inside a Lark (Feishu) topic group. The user reads on Lark and cannot see your terminal output.',
   'ai.shell.commands_are_shell': 'IMPORTANT: `botmux send` / `botmux history` / `botmux quoted` / `botmux bots` are SHELL commands (CLI programs installed in $PATH), NOT MCP tools. Run them via the Bash tool — don\'t look for them in the MCP tool list.',
-  'ai.shell.how_to_send': 'To send a message to the user (the only way): run `botmux send "your message"` via Bash. Attach images with `--images /path`, files with `--files /path`.',
+  'ai.shell.how_to_send': 'To send a message to the user (the only way): run `botmux send "your message"` via Bash. Attach images with `--images /path`, files with `--files /path`, video previews with `--videos /path.mp4 --video-covers /cover.png`.',
   'ai.shell.multiline_heredoc': 'Multi-line messages MUST use a heredoc — never `botmux send "line1\\nline2"`, since `\\n` may appear literally in Lark.',
   'ai.shell.heredoc_example': "Correct multi-line example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
   'ai.shell.helpers': 'Helpers: `botmux history` (read this session\'s history — thread/topic sessions are topic-scoped; regular-group chat-scope sessions are group-wide), `botmux quoted <message_id>` (fetch a quoted message — only use it when the prompt header shows `[user quoted message ...]`), `botmux bots list` (list other bots in the group).',

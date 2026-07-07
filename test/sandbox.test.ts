@@ -270,11 +270,19 @@ describe('codex-app sandboxExtraExecPaths', () => {
 // path flags / sandbox-chosen session-id are rejected.
 describe('validateRelayRequest', () => {
   it('accepts plain basenames + allowlisted presentation flags', () => {
-    const r = validateRelayRequest({ contentFile: 'c.content', attachments: ['a.png'], flags: ['--mention-back', '--mention', 'ou:X', '--voice'] });
+    const r = validateRelayRequest({
+      contentFile: 'c.content',
+      attachments: ['a.png'],
+      videos: ['replay.mp4'],
+      videoCovers: ['cover.png'],
+      flags: ['--mention-back', '--mention', 'ou:X', '--voice'],
+    });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.value.contentName).toBe('c.content');
     expect(r.value.attachmentNames).toEqual(['a.png']);
+    expect(r.value.videoNames).toEqual(['replay.mp4']);
+    expect(r.value.videoCoverNames).toEqual(['cover.png']);
     expect(r.value.flags).toEqual(['--mention-back', '--mention', 'ou:X', '--voice']);
   });
 
@@ -295,6 +303,8 @@ describe('validateRelayRequest', () => {
   it('rejects non-basename content / attachment names (../ traversal)', () => {
     expect(validateRelayRequest({ contentFile: '../../etc/passwd' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', attachments: ['../secret'] }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', videos: ['../secret.mp4'] }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', videoCovers: ['../cover.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'a/b' }).ok).toBe(false);
     expect(validateRelayRequest({ /* missing contentFile */ flags: [] }).ok).toBe(false);
   });

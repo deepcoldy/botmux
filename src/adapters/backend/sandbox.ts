@@ -675,25 +675,34 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
 // watcher NEVER executes sandbox-supplied argv — it rebuilds the command from
 // these validated fields. This is the security boundary: a malicious agent can
 // write any outbox file, so everything here is treated as untrusted.
-//   { contentFile: <basename in outbox>, attachments: [<basename>...], flags: [...] }
+//   { contentFile: <basename in outbox>, attachments: [<basename>...], videos: [<basename>...], videoCovers: [<basename>...], flags: [...] }
 export interface RelayRequest {
   contentFile?: unknown;
   attachments?: unknown;
+  videos?: unknown;
+  videoCovers?: unknown;
   flags?: unknown;
 }
 // Presentation-only flags the sandbox may pass through. Path-bearing flags
-// (--content-file/--file(s)/--image(s)), routing flags (--chat-id/--into/
-// --top-level), and --session-id are NOT allowlisted: content/attachments come
-// from validated outbox files, and session-id is forced by the worker.
+// (--content-file/--file(s)/--image(s)/--video(s)), routing flags
+// (--chat-id/--into/--top-level), and --session-id are NOT allowlisted:
+// content/attachments come from validated outbox files, and session-id is
+// forced by the worker.
 const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice']);
 const RELAY_FLAGS_VAL = new Set(['--mention', '--quote']);
 
-export interface ValidatedRelay { contentName: string; attachmentNames: string[]; flags: string[]; }
+export interface ValidatedRelay {
+  contentName: string;
+  attachmentNames: string[];
+  videoNames: string[];
+  videoCoverNames: string[];
+  flags: string[];
+}
 
 /**
  * PURE validation of an outbox relay request (schema + flag allowlist only — no
  * filesystem access, so it's deterministically testable):
- *  - contentFile/attachments must be plain basenames (no `/`, `\`, `..`).
+ *  - contentFile/attachments/videos/videoCovers must be plain basenames (no `/`, `\`, `..`).
  *  - only allowlisted presentation flags pass; any other flag → reject (this
  *    rejects raw `--content-file`/`--session-id`/path flags etc.).
  * The TOCTOU-safe filesystem read is handled separately by materializeOutboxFile,
@@ -708,6 +717,16 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
   for (const a of Array.isArray(req.attachments) ? req.attachments : []) {
     if (!safeName(a)) return { ok: false, error: 'attachment must be a plain outbox basename' };
     attachmentNames.push(a);
+  }
+  const videoNames: string[] = [];
+  for (const a of Array.isArray(req.videos) ? req.videos : []) {
+    if (!safeName(a)) return { ok: false, error: 'video must be a plain outbox basename' };
+    videoNames.push(a);
+  }
+  const videoCoverNames: string[] = [];
+  for (const a of Array.isArray(req.videoCovers) ? req.videoCovers : []) {
+    if (!safeName(a)) return { ok: false, error: 'video cover must be a plain outbox basename' };
+    videoCoverNames.push(a);
   }
   const flags: string[] = [];
   const rawFlags = Array.isArray(req.flags) ? req.flags : [];
@@ -726,7 +745,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
     }
     return { ok: false, error: `flag not allowed: ${f}` };
   }
-  return { ok: true, value: { contentName: req.contentFile, attachmentNames, flags } };
+  return { ok: true, value: { contentName: req.contentFile, attachmentNames, videoNames, videoCoverNames, flags } };
 }
 
 /**
@@ -818,11 +837,31 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
         staged.push(dest); attPaths.push(dest);
       });
       if (attBad) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: attachment not a regular file in outbox'); continue; }
+      let videoBad = false;
+      const videoPaths: string[] = [];
+      v.value.videoNames.forEach((vn, i) => {
+        if (videoBad) return;
+        const dest = join(staging, `${id}-video${i}-${vn}`);
+        if (!materializeOutboxFile(outbox, vn, dest)) { videoBad = true; return; }
+        staged.push(dest); videoPaths.push(dest);
+      });
+      if (videoBad) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: video not a regular file in outbox'); continue; }
+      let coverBad = false;
+      const videoCoverPaths: string[] = [];
+      v.value.videoCoverNames.forEach((cn, i) => {
+        if (coverBad) return;
+        const dest = join(staging, `${id}-video-cover${i}-${cn}`);
+        if (!materializeOutboxFile(outbox, cn, dest)) { coverBad = true; return; }
+        staged.push(dest); videoCoverPaths.push(dest);
+      });
+      if (coverBad) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: video cover not a regular file in outbox'); continue; }
 
       const hostArgs = [
         ...v.value.flags,
         '--content-file', contentDest,
         ...attPaths.flatMap(a => ['--files', a]),
+        ...videoPaths.flatMap(a => ['--videos', a]),
+        ...videoCoverPaths.flatMap(a => ['--video-covers', a]),
         '--session-id', sessionId,  // forced — sandbox cannot target another session
       ];
       const child = spawn(process.execPath, [cli, 'send', ...hostArgs], { env });

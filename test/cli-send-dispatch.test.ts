@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments } from '../src/cli/send-dispatch.js';
+import {
+  dispatchPrimaryMessage,
+  findStdinAliasAttachment,
+  sendFileAttachments,
+  sendVideoAttachments,
+  validateVideoAttachments,
+} from '../src/cli/send-dispatch.js';
 
 class MessageWithdrawnError extends Error {}
 
@@ -134,5 +140,117 @@ describe('sendFileAttachments (best-effort, never throws after primary send)', (
       { path: '/x', error: 'dispatch down' },
       { path: '/y', error: 'dispatch down' },
     ]);
+  });
+});
+
+describe('validateVideoAttachments', () => {
+  it('accepts repeated mp4 videos with matching image covers', () => {
+    expect(validateVideoAttachments(['/tmp/a.mp4', '/tmp/b.MP4'], ['/tmp/a.png', '/tmp/b.JPG'])).toEqual({
+      ok: true,
+      videos: [
+        { videoPath: '/tmp/a.mp4', coverPath: '/tmp/a.png', durationMs: 0 },
+        { videoPath: '/tmp/b.MP4', coverPath: '/tmp/b.JPG', durationMs: 0 },
+      ],
+    });
+  });
+
+  it('rejects missing or mismatched covers as usage errors', () => {
+    expect(validateVideoAttachments(['/tmp/a.mp4'], [])).toEqual({
+      ok: false,
+      error: '--videos 与 --video-covers 数量必须一致（videos=1, covers=0）',
+    });
+    expect(validateVideoAttachments([], ['/tmp/a.png'])).toEqual({
+      ok: false,
+      error: '--video-covers 需要配套 --videos 使用',
+    });
+  });
+
+  it('rejects unsupported video and cover extensions', () => {
+    expect(validateVideoAttachments(['/tmp/a.mov'], ['/tmp/a.png'])).toEqual({
+      ok: false,
+      error: '不支持的视频格式: /tmp/a.mov（目前仅支持 .mp4）',
+    });
+    expect(validateVideoAttachments(['/tmp/a.mp4'], ['/tmp/a.svg'])).toEqual({
+      ok: false,
+      error: '不支持的视频封面格式: /tmp/a.svg（支持 .png/.jpg/.jpeg/.gif/.webp/.bmp）',
+    });
+  });
+});
+
+describe('sendVideoAttachments (best-effort media messages)', () => {
+  it('uploads the mp4 and cover, then dispatches Lark media content', async () => {
+    const uploadFile = vi.fn(async (_app: string, p: string) => `file:${p}`);
+    const uploadImage = vi.fn(async (_app: string, p: string) => `image:${p}`);
+    const dispatch = vi.fn(async (content: string, msgType: string) => `om:${msgType}:${content}`);
+
+    const res = await sendVideoAttachments(
+      { uploadFile, uploadImage, dispatch },
+      'cli_app',
+      [{ videoPath: '/tmp/replay.mp4', coverPath: '/tmp/cover.png', durationMs: 0 }],
+    );
+
+    expect(res.failed).toEqual([]);
+    expect(res.sent).toEqual([
+      'om:media:{"file_key":"file:/tmp/replay.mp4","image_key":"image:/tmp/cover.png","duration":0}',
+    ]);
+    expect(uploadFile).toHaveBeenCalledWith('cli_app', '/tmp/replay.mp4');
+    expect(uploadImage).toHaveBeenCalledWith('cli_app', '/tmp/cover.png');
+    expect(dispatch).toHaveBeenCalledWith(
+      '{"file_key":"file:/tmp/replay.mp4","image_key":"image:/tmp/cover.png","duration":0}',
+      'media',
+    );
+  });
+
+  it('captures a failing video upload without rejecting and still sends later videos', async () => {
+    const uploadFile = vi.fn(async (_app: string, p: string) => {
+      if (p === '/tmp/bad.mp4') throw new Error('upload failed');
+      return `file:${p}`;
+    });
+    const uploadImage = vi.fn(async (_app: string, p: string) => `image:${p}`);
+    const dispatch = vi.fn(async (content: string) => `om:${content}`);
+
+    const res = await sendVideoAttachments(
+      { uploadFile, uploadImage, dispatch },
+      'cli_app',
+      [
+        { videoPath: '/tmp/bad.mp4', coverPath: '/tmp/bad.png', durationMs: 0 },
+        { videoPath: '/tmp/good.mp4', coverPath: '/tmp/good.png', durationMs: 0 },
+      ],
+    );
+
+    expect(res.sent).toEqual([
+      'om:{"file_key":"file:/tmp/good.mp4","image_key":"image:/tmp/good.png","duration":0}',
+    ]);
+    expect(res.failed).toEqual([{ path: '/tmp/bad.mp4', coverPath: '/tmp/bad.png', error: 'upload failed' }]);
+  });
+
+  it('captures cover upload and dispatch failures without rejecting', async () => {
+    const coverUploadFails = await sendVideoAttachments(
+      {
+        uploadFile: vi.fn(async () => 'file:key'),
+        uploadImage: vi.fn(async () => { throw new Error('cover failed'); }),
+        dispatch: vi.fn(async () => 'om_media'),
+      },
+      'cli_app',
+      [{ videoPath: '/tmp/a.mp4', coverPath: '/tmp/a.png', durationMs: 0 }],
+    );
+    expect(coverUploadFails).toEqual({
+      sent: [],
+      failed: [{ path: '/tmp/a.mp4', coverPath: '/tmp/a.png', error: 'cover failed' }],
+    });
+
+    const dispatchFails = await sendVideoAttachments(
+      {
+        uploadFile: vi.fn(async () => 'file:key'),
+        uploadImage: vi.fn(async () => 'image:key'),
+        dispatch: vi.fn(async () => { throw new Error('dispatch failed'); }),
+      },
+      'cli_app',
+      [{ videoPath: '/tmp/b.mp4', coverPath: '/tmp/b.png', durationMs: 0 }],
+    );
+    expect(dispatchFails).toEqual({
+      sent: [],
+      failed: [{ path: '/tmp/b.mp4', coverPath: '/tmp/b.png', error: 'dispatch failed' }],
+    });
   });
 });
