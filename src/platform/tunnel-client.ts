@@ -65,6 +65,9 @@ const DATA_DIAL_OVERALL_DEADLINE_MS = 6_000;
 // ~35% 的黑洞。单条超时给足 TLS 握手时间（好连接 ~40ms，黑洞则等满超时判负）。
 const CONTROL_DIAL_PARALLEL = 3;
 const CONTROL_DIAL_TIMEOUT_MS = 5_000;
+// 控制连接 WS 层保活：空闲时也定时 ping（保持链路有流量，避免被 LB/NAT idle 掐成半开）；
+// 一个周期内没等到 pong 就判半死、terminate 触发重连（不用干等几分钟 TCP 超时）。
+const CONTROL_PING_MS = 30_000;
 
 // 本机可供平台服务端「直连反代」的候选地址（内网 IPv4:dashboardPort）。平台够得着就直连本机
 // dashboard、绕过隧道（省掉 daemon 拨号/ECMP 赌/跨 pod 转发）；够不着自动退回隧道。仅内网地址、
@@ -93,6 +96,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
   // 当前一轮控制连接并行拨号中「在拨/在等」的候选（胜出/停止时用于清理）。
   let controlDials: Set<WebSocket> | null = null;
   let heartbeat: NodeJS.Timeout | null = null;
+  let pingTimer: NodeJS.Timeout | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
   let backoff = BACKOFF_MIN_MS;
   // 本机平台团队（成员关系下沉到部署本地）
@@ -217,6 +221,22 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
     sendRegister(sock);
     heartbeat = setInterval(() => sendHeartbeat(sock), HEARTBEAT_MS);
 
+    // WS ping/pong 保活 + 半开探测。心跳是 daemon→平台的单向应用消息，掩盖不了「平台→daemon 方向
+    // 被 idle 掐断」；WS ping 由平台自动回 pong，双向都有流量→防 idle 掐断，且丢 pong 能快速判半开。
+    let pongAlive = true;
+    sock.on('pong', () => { pongAlive = true; });
+    pingTimer = setInterval(() => {
+      if (sock.readyState !== WebSocket.OPEN) return;
+      if (!pongAlive) {
+        // 上一周期的 ping 没等到 pong → 连接多半半开了，主动断开触发重连。
+        opts.log('控制连接 ping 无 pong，判定半开，重连');
+        try { sock.terminate(); } catch { /* ignore */ } // → 'close' → cleanupSock + scheduleReconnect
+        return;
+      }
+      pongAlive = false;
+      try { sock.ping(); } catch { /* ignore */ }
+    }, CONTROL_PING_MS);
+
     sock.on('message', (data) => {
       let msg: { type?: string; streamId?: string; teamId?: string; teamName?: string; rev?: string; teams?: unknown[] };
       try {
@@ -258,6 +278,10 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
     if (heartbeat) {
       clearInterval(heartbeat);
       heartbeat = null;
+    }
+    if (pingTimer) {
+      clearInterval(pingTimer);
+      pingTimer = null;
     }
   }
 
