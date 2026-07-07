@@ -533,20 +533,30 @@ input:disabled {
 }
 
 .topbar-actions > button,
+.topbar-actions > a,
 .logs-actions button {
   height: 32px;
-  border-color: var(--border);
+  border: 1px solid var(--border);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.045);
   color: var(--text);
 }
 
 .topbar-actions > button:hover:not(:disabled),
+.topbar-actions > a:hover,
 .logs-actions button:hover:not(:disabled) {
   border-color: rgba(91, 227, 255, 0.34);
   background: rgba(255, 255, 255, 0.08);
 }
 
+.topbar-actions > a {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 14px;
+  text-decoration: none;
+}
+
+#create-session-btn,
 #add-bot-btn {
   border-color: transparent;
   background: linear-gradient(120deg, var(--accent), var(--info));
@@ -554,6 +564,7 @@ input:disabled {
   box-shadow: 0 4px 16px rgba(91, 227, 255, 0.24);
 }
 
+#create-session-btn:hover:not(:disabled),
 #add-bot-btn:hover:not(:disabled) {
   background: var(--accent-strong);
   border-color: var(--accent-strong);

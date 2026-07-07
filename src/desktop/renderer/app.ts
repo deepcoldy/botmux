@@ -130,7 +130,9 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'action.stop': '停止',
     'action.restart': '重启',
     'action.takeover': '连接当前 CLI',
+    'action.createSession': '创建会话',
     'action.addBot': '添加机器人',
+    'action.docs': '文档',
     'action.logs': '日志',
     'action.openHome': '打开目录',
     'action.copy': '复制',
@@ -141,6 +143,7 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'path.home': 'Botmux 目录',
     'path.logs': '日志文件夹',
     'dashboard.openBotOnboarding': '正在打开添加机器人...',
+    'dashboard.openCreateSession': '正在打开创建会话...',
     'dashboard.openingPage': '正在打开页面...',
     'dashboard.urlUnavailable': '控制台 URL 暂不可用。',
     'dashboard.openFailed': '打开页面失败：{error}',
@@ -207,7 +210,9 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'action.stop': 'Stop',
     'action.restart': 'Restart',
     'action.takeover': 'Connect current CLI',
+    'action.createSession': 'Create session',
     'action.addBot': 'Add bot',
+    'action.docs': 'Docs',
     'action.logs': 'Logs',
     'action.openHome': 'Open folder',
     'action.copy': 'Copy',
@@ -218,6 +223,7 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'path.home': 'Botmux home',
     'path.logs': 'Logs folder',
     'dashboard.openBotOnboarding': 'Opening add bot...',
+    'dashboard.openCreateSession': 'Opening create session...',
     'dashboard.openingPage': 'Opening page...',
     'dashboard.urlUnavailable': 'Dashboard URL is not available yet.',
     'dashboard.openFailed': 'Open page failed: {error}',
@@ -248,6 +254,7 @@ const startBtn = byId<HTMLButtonElement>('start-btn');
 const stopBtn = byId<HTMLButtonElement>('stop-btn');
 const restartBtn = byId<HTMLButtonElement>('restart-btn');
 const takeoverBtn = byId<HTMLButtonElement>('takeover-btn');
+const createSessionBtn = byId<HTMLButtonElement>('create-session-btn');
 const addBotBtn = byId<HTMLButtonElement>('add-bot-btn');
 const logsBtn = byId<HTMLButtonElement>('logs-btn');
 const homeBtn = byId<HTMLButtonElement>('home-btn');
@@ -388,6 +395,9 @@ function wireControls(): void {
     clearDashboard(t('runtime.restartMessage'));
     void runRuntimeAction(t('action.takeover'), api => api.takeover());
   });
+  createSessionBtn.addEventListener('click', () => {
+    void openCreateSession();
+  });
   addBotBtn.addEventListener('click', () => {
     void openBotOnboarding();
   });
@@ -524,6 +534,7 @@ function paintControls(state: DesktopRuntimeState | null): void {
   restartBtn.disabled = disabled || unmanagedRuntime || !status || status === 'not_configured' || status === 'starting';
   takeoverBtn.hidden = true;
   takeoverBtn.disabled = true;
+  createSessionBtn.disabled = bridgeUnavailable || unmanagedRuntime;
   addBotBtn.disabled = bridgeUnavailable || unmanagedRuntime;
   logsBtn.disabled = bridgeUnavailable;
   homeBtn.disabled = bridgeUnavailable;
@@ -685,6 +696,12 @@ async function openBotOnboarding(): Promise<void> {
   // The desktop shell hides the dashboard topbar, so pass a one-shot route
   // action that lets the embedded dashboard open its own onboarding modal.
   await openDashboardRoute('#/?open=bot-onboarding', t('dashboard.openBotOnboarding'));
+}
+
+async function openCreateSession(): Promise<void> {
+  // The dashboard's create-session button lives in its hidden topbar; Desktop
+  // mirrors it through the same one-shot hash-action contract as Add Bot.
+  await openDashboardRoute('#/?open=create-session', t('dashboard.openCreateSession'));
 }
 
 async function openDashboardRoute(route: string, notice = t('dashboard.openingPage')): Promise<void> {

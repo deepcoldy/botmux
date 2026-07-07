@@ -54,6 +54,31 @@ describe('desktop dashboard shell mode', () => {
     expect(onboardingSource).toContain("action.params.delete('open')");
   });
 
+  it('mirrors dashboard topbar actions hidden by the desktop shell', () => {
+    const html = readFileSync(
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
+      'utf-8',
+    );
+    const rendererSource = readFileSync(
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
+      'utf-8',
+    );
+    const dashboardSource = readFileSync(
+      fileURLToPath(new URL('../../src/dashboard/web/app.ts', import.meta.url)),
+      'utf-8',
+    );
+
+    // Dashboard topbar is hidden in the Electron webview, so Desktop must keep
+    // the user-visible entry points that master moved into that topbar.
+    expect(html).toContain('id="create-session-btn"');
+    expect(html).toContain('id="docs-link"');
+    expect(rendererSource).toContain("#/?open=create-session");
+    expect(rendererSource).toContain('openCreateSession');
+    expect(dashboardSource).toContain('consumeCreateSessionRouteAction');
+    expect(dashboardSource).toContain("params.get('open') !== 'create-session'");
+    expect(dashboardSource).toContain("import('./sessions.js')");
+  });
+
   it('lets the embedded dashboard honor the desktop locale from hash params', () => {
     const appSource = readFileSync(
       fileURLToPath(new URL('../../src/dashboard/web/app.ts', import.meta.url)),

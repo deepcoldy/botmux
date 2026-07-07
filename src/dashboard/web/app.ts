@@ -42,6 +42,24 @@ function applyShellLocaleFromHash(): boolean {
   return true;
 }
 
+function consumeCreateSessionRouteAction(): boolean {
+  const queryIndex = location.hash.indexOf('?');
+  if (queryIndex < 0) return false;
+  const params = new URLSearchParams(location.hash.slice(queryIndex + 1));
+  if (params.get('open') !== 'create-session') return false;
+
+  const path = location.hash.slice(0, queryIndex) || '#/';
+  params.delete('open');
+  const query = params.toString();
+  // Desktop uses this hash flag as a one-shot command because the dashboard
+  // topbar is hidden inside the Electron webview.
+  history.replaceState(null, '', query ? `${path}?${query}` : path);
+  void import('./sessions.js')
+    .then(mod => mod.openCreateSessionModal())
+    .catch(err => console.error('failed to open create session modal', err));
+  return true;
+}
+
 // Management pages are token-gated end-to-end (no public GET) — a read-only
 // visitor must not reach them. `data-route` values from index.html's nav.
 const MANAGE_ROUTES = ['roles', 'role-profiles', 'bot-defaults', 'skills', 'team', 'connectors', 'insights', 'whiteboards'];
@@ -313,7 +331,10 @@ async function route() {
       // Desktop shell topbar actions arrive as hash query commands because the
       // embedded dashboard topbar is hidden. Consume after route render so the
       // page is stable before opening a modal.
-      if (isAuthed) consumeBotOnboardingRouteAction();
+      if (isAuthed) {
+        consumeBotOnboardingRouteAction();
+        consumeCreateSessionRouteAction();
+      }
     }
   }
 }
