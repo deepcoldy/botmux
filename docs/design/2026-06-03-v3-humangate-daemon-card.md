@@ -1,6 +1,6 @@
 # v3 humanGate → 飞书审批卡（daemon 接线）设计稿
 
-> 2026-06-03 claude 起草（md-first）。老滕指令「和 codex 一起，把 humanGate 的逻辑加上」。
+> 2026-06-03 claude 起草（md-first）。用户指令「和 codex 一起，把 humanGate 的逻辑加上」。
 > codex 已先给方向（同意 Fork A + 6 条钉死点），本稿把它们落成可实现方案 + 给 codex 二轮 review。
 > 范围：**让 v3 的 humanGate 节点在飞书弹审批卡、点了才继续、daemon 重启能恢复**。
 >
@@ -82,7 +82,7 @@ type V3RunOutcome =
 ## 4. Fork A 详细设计
 
 ### 4.1 run 触发（codex #1）
-`botmux workflow approve-dag <id>` **只做 Gate-2 状态推进**（dag_ready→dag_approved），不变。新增明确启动动作，二选一（请 codex/老滕 拍）：
+`botmux workflow approve-dag <id>` **只做 Gate-2 状态推进**（dag_ready→dag_approved），不变。新增明确启动动作，二选一（请 codex/用户 拍）：
 - **(a) daemon HTTP IPC**：`POST /api/v3/runs/:id/start`（dashboard / grill skill 都能调）。daemon 读 runDir 的 spec/dag/botsSnapshot/chatBinding → 创建 `v3Runs` entry → `driveV3Run(id)`。
 - **(b) approve-dag --start**：CLI flag，但 approve-dag 跑在 agent worker（非 daemon 进程），仍要 IPC 到 daemon 才能进程内驱动 → 本质还是绕到 (a)。
 

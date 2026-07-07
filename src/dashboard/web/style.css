@@ -8322,7 +8322,7 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .insights-page .spanchip-sys { color: var(--mut); opacity: .8; }
 .insights-page .spanchip-sys.on { opacity: 1; }
 
-/* full-text prompt modal (老滕: 弹窗看全文) — fixed overlay + centred reading panel */
+/* full-text prompt modal (用户: 弹窗看全文) — fixed overlay + centred reading panel */
 .insights-page .insight-modal { position: fixed; inset: 0; z-index: 1000; }
 .insights-page .insight-modal[hidden] { display: none; }
 .insights-page .modal-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, .55); }

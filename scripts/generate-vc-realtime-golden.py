@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Generate realtime voice protobuf golden vectors from the starter Python pb2.
+"""Generate realtime voice protobuf golden vectors from reference Python pb2 modules.
 
 Usage:
-  python3 scripts/generate-vc-realtime-golden.py --starter-dir /path/to/doubao-voice-meeting-starter
+  python3 scripts/generate-vc-realtime-golden.py --reference-dir /path/to/reference-protos
 
-The starter directory must contain frontier_pb2.py and meeting_realtime_pb2.py.
+The reference directory must contain frontier_pb2.py and meeting_realtime_pb2.py.
 If your system Python does not have protobuf, install it in a throwaway target:
   python3 -m pip install --target /tmp/protobuf-6.31.1 protobuf==6.31.1
-  PYTHONPATH=/tmp/protobuf-6.31.1 python3 scripts/generate-vc-realtime-golden.py --starter-dir ...
+  PYTHONPATH=/tmp/protobuf-6.31.1 python3 scripts/generate-vc-realtime-golden.py --reference-dir ...
 """
 
 from __future__ import annotations
@@ -24,20 +24,20 @@ FRAME_TYPE_NORMAL = 0
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--starter-dir", required=True, help="Directory containing starter pb2 modules")
+    parser.add_argument("--reference-dir", required=True, help="Directory containing reference pb2 modules")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    starter_dir = pathlib.Path(args.starter_dir).resolve()
-    sys.path.insert(0, str(starter_dir))
+    reference_dir = pathlib.Path(args.reference_dir).resolve()
+    sys.path.insert(0, str(reference_dir))
 
     try:
         import frontier_pb2  # type: ignore[import-not-found]
         import meeting_realtime_pb2 as mr  # type: ignore[import-not-found]
     except ImportError as exc:
-        raise SystemExit(f"failed to import starter pb2 modules from {starter_dir}: {exc}") from exc
+        raise SystemExit(f"failed to import reference pb2 modules from {reference_dir}: {exc}") from exc
 
     fmt = mr.AudioFormat(type="audio/pcm", encoding="s16le", sample_rate=24000)
     session = mr.Session(

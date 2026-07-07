@@ -1,8 +1,8 @@
 # Dashboard 会话 Status Board（方案 A 轻量版）
 
-> 2026-06-05 | 老滕拍板：先做 A，claude + codex 一起讨论一起做。worktree：`/root/claude-code-workspace/botmux-seedclaw`（master @ 8979b81）。
-> 背景：老滕看了 seedclaw Issues 看板截图，想从会话管理维度优化 dashboard 展示。讨论结论：不照搬任务 kanban（session 状态机器推导、高频跳变、无 Done 语义），做**按状态分列的 status board**。
-> 状态：待 codex review/认领 → 实现 → mock 截图给老滕过目。
+> 2026-06-05 | 用户拍板：先做 A，协作讨论后实现。worktree：`botmux-seedclaw`（master 基线）。
+> 背景：用户看了 seedclaw Issues 看板截图，想从会话管理维度优化 dashboard 展示。讨论结论：不照搬任务 kanban（session 状态机器推导、高频跳变、无 Done 语义），做**按状态分列的 status board**。
+> 状态：待 codex review/认领 → 实现 → mock 截图给用户过目。
 
 ## 1. 目标 / 非目标
 
@@ -75,4 +75,4 @@ tuiPromptActive?: boolean;
 - [ ] 等选仓库、TUI 卡挂起、limited 的会话出现在 needs-you 列，且字段变化后 5s 内移列
 - [ ] 列计数正确；closed 不出现在 board
 - [ ] `pnpm build` + 现有 dashboard 测试不挂；deriveBoardColumn 有单测
-- [ ] mock/实跑截图发话题，老滕过目
+- [ ] mock/实跑截图发话题，用户过目

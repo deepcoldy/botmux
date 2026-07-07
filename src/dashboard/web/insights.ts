@@ -217,7 +217,7 @@ type DerivedOverview = {
 // The overview reflects the CURRENT filter/search: aggregate the visible records
 // client-side so the metric cards, top-failed-tools and recommendations all move
 // when you filter. Otherwise only the session list narrows while the prominent
-// numbers stay frozen, and filtering feels dead (the issue 老滕 hit). Non-ok
+// numbers stay frozen, and filtering feels dead. Non-ok
 // reports contribute nothing, so the unfiltered view ≈ the server aggregate.
 function aggregateRecords(records: InsightRecord[]): DerivedOverview {
   const agg: SafeInsightAggregate = {
@@ -814,7 +814,7 @@ function intentPhrase(intent?: SafeSpanIntent): string {
   return [intent.kind !== 'unknown' ? intentLabel(intent.kind) : '', intent.subject, intent.detail].filter(Boolean).join(' · ');
 }
 
-// Turn tag → one-line「怎么优化」(老滕 point 1: the page must say what to DO, not just what happened).
+// Turn tag → one-line「怎么优化」(the page must say what to DO, not just what happened).
 const ADVICE_TAGS: SafeSpanTag[] = ['failure', 'retry', 'read_write_imbalance', 'slow'];
 function turnAdvice(tags: SafeSpanTag[]): string {
   for (const tag of ADVICE_TAGS) if (tags.includes(tag)) { const o = t(`insights.advice.${tag}`); if (o !== `insights.advice.${tag}`) return o; }
@@ -860,7 +860,7 @@ function opGlyph(s: SafeSpan, current: boolean): string {
 
 // One compact evidence row: turn · status · what→result · tags · duration · 详情 toggle.
 // Far denser than the old card; the drawer (span.detail) carries the rest on demand.
-// The whole header line is the toggle (老滕: 点单个 span 就展开，不用专门点详情按钮); the pill is a
+// The whole header line is the toggle (用户: 点单个 span 就展开，不用专门点详情按钮); the pill is a
 // state indicator only. data-span-idx lives on the line so clicks in the open drawer don't toggle.
 function renderSpanRow(spans: SafeSpan[], idx: number, hot: boolean, open: boolean, detailable = true): string {
   const s = spans[idx]!;
@@ -934,7 +934,7 @@ const SPAN_TAGS: SafeSpanTag[] = ['failure', 'slow', 'retry', 'read_write_imbala
 
 // 文件改动 + 跑过的命令 — session-level work summary (codex's workSummary, detail=spans, owner-only).
 // Two panels at the top of 动作 span: which files were touched (read/edit counts + line churn) and
-// which commands ran (deduped + ×repeat + failures). Ported from the reference tool (老滕's ask).
+// which commands ran (deduped + ×repeat + failures). Ported from the reference tool.
 function renderWorkSummary(report: SafeInsightReport): string {
   const ws = report.workSummary;
   if (!ws || (!ws.fileChanges?.length && !ws.commandsRun?.length)) return '';
@@ -961,7 +961,7 @@ function renderWorkSummary(report: SafeInsightReport): string {
 }
 
 // 动作 span tab → compact evidence table. Tag chips filter (全部/失败/慢/…); each row expands
-// to its 详情 drawer. Replaces the old giant cards + duplicated full timeline (老滕 point 2).
+// to its 详情 drawer. Replaces the old giant cards + duplicated full timeline.
 function renderEvidence(report: SafeInsightReport, focus: { rec: DiagnosticRecommendation | null; spanIdx: Set<number> }, spanFilter: string, openSpans: Set<number>): string {
   const spans = report.spans ?? [];
   const work = renderWorkSummary(report);
@@ -994,7 +994,7 @@ export function renderDetailShell(rec: InsightRecord | undefined): string {
 // 逐轮对账 tab → per-turn timeline. ALL visible turns (codex's report.turnTimeline), normal
 // turns collapsed to a one-line event strip, flagged turns severity-coloured with a「怎么优化」
 // line; expand for the full ordered event rows. Owner-only prompt 原文 (turnTimeline[].prompt,
-// detail=spans only) renders at the turn head. Answers 老滕 point 3: all turns + a real timeline.
+// detail=spans only) renders at the turn head. Covers all turns + a real timeline.
 // Display-only: strip botmux-injected scaffolding (sender/mentions/reminders/quote notices)
 // from the owner-only prompt so the actual user text shows. The report still carries the raw
 // (truncated, credential-scrubbed) text; this is a readability projection, not a security one.
@@ -1017,7 +1017,7 @@ function cleanPromptText(raw: string): string {
     .trim();
 }
 
-// Owner-only prompt 原文 rendered as Markdown (老滕: prompt 里可能有 markdown，想 prettier 展示).
+// Owner-only prompt 原文 rendered as Markdown (用户: prompt 里可能有 markdown，想 prettier 展示).
 // html:false → any literal <…> in the prompt is escaped, never raw HTML/script; validateLink
 // whitelists http/https/mailto so a javascript:/data: link can't slip through; links open in a
 // new tab with noopener. The output is markdown-it's own safe tag set, so innerHTML of it is safe.
@@ -1047,8 +1047,8 @@ function turnEventGlyph(e: TurnTimelineEvent): string {
 }
 
 // Prompt source attribution (codex's prompt.source: name/type/flags only, no open_id). Surfaces
-// WHO actually sent the turn — 老滕/其他人 (👤), a bot (🤖), or an a2a forward (🤝) — answering
-// 老滕's「区分 a2a / 其他人消息」, driven by codex's authoritative source.kind. a2a shows the
+// WHO actually sent the turn — user/other people (👤), a bot (🤖), or an a2a forward (🤝) —
+// driven by codex's authoritative source.kind. a2a shows the
 // specific sending agent (agentName ?? senderName); system = injected task-notification callbacks.
 function promptSourceChip(src?: { kind?: string; agentName?: string; senderName?: string }): string {
   if (!src?.kind) return '';
@@ -1068,7 +1068,7 @@ function promptMentions(src?: { mentionedNames?: string[] }): string {
   return `<span class="tp-mentions">${escapeHtml(t('insights.srcMentions'))} ${ms.map(n => '@' + escapeHtml(n)).join(' ')}</span>`;
 }
 
-// Full-text prompt modal (老滕: 做个弹窗看全文). Bigger centred reading surface for one turn's
+// Full-text prompt modal (用户: 做个弹窗看全文). Bigger centred reading surface for one turn's
 // prompt — source badge + markdown (or 原文) + truncation note. Same safe markdown path as inline.
 function renderPromptModalInner(turnIndex: number, prompt: TurnPromptPreview | undefined, raw: boolean): string {
   const src = prompt?.source;
@@ -1093,14 +1093,14 @@ function renderPromptModalInner(turnIndex: number, prompt: TurnPromptPreview | u
 }
 
 // One turn card: prompt 原文 + op-strip + 怎么优化 advice + expandable event rows. Each event row
-// is detailable so its 详情 drawer carries the raw command/output too (老滕: 对账 tab 下也要看到命令和结果).
+// is detailable so its 详情 drawer carries the raw command/output too (用户: 对账 tab 下也要看到命令和结果).
 function renderTurnCard(report: SafeInsightReport, spans: SafeSpan[], tn: TurnTimelineTurn, focus: { turnIdx: Set<number> }, openTurns: Set<number>, openSpans: Set<number>, openPrompts: Set<number>, rawPrompts: Set<number>): string {
   const open = openTurns.has(tn.turnIndex);
   const hot = focus.turnIdx.has(tn.turnIndex) ? ' hot' : '';
   const m = tn.metrics;
   const advice = tn.severity !== 'info' ? turnAdvice(tn.tags) : '';
   const strip = tn.events.map(turnEventGlyph).join('');
-  // Prompt 原文: render as Markdown by default (老滕 wants prettier), clamped so a long prompt can't
+  // Prompt 原文: render as Markdown by default, clamped so a long prompt can't
   // blow the timeline; 展开 lifts the clamp (still scroll-capped), 原文 shows the raw text instead.
   const ptext = tn.prompt?.text ? (cleanPromptText(tn.prompt.text) || tn.prompt.text) : '';
   const promptExpanded = openPrompts.has(tn.turnIndex);
@@ -1147,7 +1147,7 @@ function renderTurnCard(report: SafeInsightReport, spans: SafeSpan[], tn: TurnTi
   </div>`;
 }
 
-// Classify a turn by who started it, straight from codex's source.kind (老滕's 发起人 filter):
+// Classify a turn by who started it, straight from codex's source.kind:
 // user (a person), a2a_agent (another bot), system (task-notification callbacks). Unattributed → user.
 type LedgerSender = 'all' | 'user' | 'a2a_agent' | 'system';
 function turnSenderKind(tn: TurnTimelineTurn): Exclude<LedgerSender, 'all'> {
@@ -1349,7 +1349,7 @@ function turnMainPhase(tn: TurnTimelineTurn): string {
 // compaction marker (only a session-level count exists — don't fake per-turn compaction points).
 function renderTurnRail(report: SafeInsightReport, focus: { turnIdx: Set<number> }, recByTurn: Map<number, string[]>): string {
   // Serial main line — MUST be in turn order. turnTimeline arrives unsorted (the ledger sorts it too),
-  // so sort by turnIndex here or the rail reads as random (老滕: 顺序乱).
+  // so sort by turnIndex here or the rail reads as random (用户: 顺序乱).
   const turns = [...(report.turnTimeline ?? [])].sort((a, b) => a.turnIndex - b.turnIndex);
   if (turns.length < 2) return '';
   const focused = focus.turnIdx.size > 0;
@@ -1429,7 +1429,7 @@ function renderContextCurve(report: SafeInsightReport): string {
   const line = pts.map((p, i) => `${xs(i).toFixed(2)},${ys(p.v).toFixed(2)}`).join(' ');
   const area = `0,${H} ${line} ${W},${H}`;
   // Invisible full-height hover bands per point — hovering anywhere in a turn's x-slice shows that
-  // turn's exact context tokens via the shared tooltip (老滕: hover 要有具体数值).
+  // turn's exact context tokens via the shared tooltip (用户: hover 要有具体数值).
   const band = W / n;
   const hits = pts.map((p, i) => `<rect class="ctxhit" x="${Math.max(0, xs(i) - band / 2).toFixed(2)}" y="0" width="${band.toFixed(2)}" height="${H}" data-tip="${escapeHtml(`${t('insights.ctxTurn', { n: p.turn })} · ${fmtInt(p.v)} tok`)}"></rect>`).join('');
   const mid = fmtInt(Math.round(max / 2));
@@ -1451,7 +1451,7 @@ function renderContextCurve(report: SafeInsightReport): string {
 
 // Shared hover tooltip: any [data-tip] element inside a bound host (rail / gantt / context curve)
 // shows its text in the persistent #insight-tip box, tracking the cursor. Native `title` is too slow
-// and unreliable on the thin bars (老滕: 工作时序 hover 没提示).
+// and unreliable on the thin bars (用户: 工作时序 hover 没提示).
 function bindTip(host: HTMLElement, tipEl: HTMLElement): void {
   host.addEventListener('mousemove', e => {
     const el = (e.target as HTMLElement).closest<HTMLElement>('[data-tip]');
@@ -1768,7 +1768,7 @@ export function wireInsightsPage(root: HTMLElement): () => void {
     const body = detail.querySelector<HTMLElement>('#insight-detail-body');
     if (!body || !detailReport) return;
     // A full innerHTML replace recreates the scroll container, snapping the in-panel list back to
-    // the top — which read as a page refresh (老滕). Preserve the active tab's list scroll (and
+    // the top — which read as a page refresh (用户). Preserve the active tab's list scroll (and
     // window scroll) across the re-render so toggling a 详情 drawer feels in-place.
     const sel = `.insight-tab-panel[data-panel="${detailTab}"] .spantable, .insight-tab-panel[data-panel="${detailTab}"] .turnlist, .insight-tab-panel[data-panel="${detailTab}"] .convothread`;
     const prevTop = body.querySelector<HTMLElement>(sel)?.scrollTop ?? 0;
@@ -1811,7 +1811,7 @@ export function wireInsightsPage(root: HTMLElement): () => void {
   }
 
   // Full-text prompt modal — lives in the persistent page shell (#insight-modal), not in the
-  // re-rendered detail body. Prompt text is fetched full on demand (老滕: 弹窗别截断) via the
+  // re-rendered detail body. Prompt text is fetched full on demand (用户: 弹窗别截断) via the
   // per-turn endpoint, since the bulk timeline only carries a 400-char preview.
   function paintModal(): void {
     const m = root.querySelector<HTMLElement>('#insight-modal');
@@ -1899,7 +1899,7 @@ export function wireInsightsPage(root: HTMLElement): () => void {
     for (const btn of body.querySelectorAll<HTMLButtonElement>('.spanfilter [data-spanfilter]')) {
       btn.addEventListener('click', () => { spanFilter = btn.dataset.spanfilter || 'all'; paintDetailBody(); });
     }
-    // 详情 drawer toggles — the whole span header line is the target (老滕: 点 span 行即展开).
+    // 详情 drawer toggles — the whole span header line is the target (用户: 点 span 行即展开).
     for (const el of body.querySelectorAll<HTMLElement>('.sprow-line[data-span-idx]')) {
       const toggle = () => {
         const i = Number(el.dataset.spanIdx);
@@ -1940,7 +1940,7 @@ export function wireInsightsPage(root: HTMLElement): () => void {
         paintDetailBody();
       });
     }
-    // Prompt 全文弹窗 (老滕: 做个弹窗看全文) — fetches the full text on demand.
+    // Prompt 全文弹窗 (用户: 做个弹窗看全文) — fetches the full text on demand.
     for (const btn of body.querySelectorAll<HTMLButtonElement>('.tp-toggle[data-prompt-full]')) {
       btn.addEventListener('click', () => void openModal(Number(btn.dataset.promptFull)));
     }

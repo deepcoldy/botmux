@@ -4,7 +4,7 @@
 // this session?") must be removed line-wise from snapshots. Whole-snapshot
 // survey matching used to veto every analysis while the banner was on screen,
 // which blinded the analyzer to real prompts (AskUserQuestion + survey 同屏
-// 被整屏误吞 — 2026-06-05 老滕演示「需要你」状态时踩到).
+// 被整屏误吞 — 2026-06-05 用户演示「需要你」状态时踩到).
 import { describe, expect, it } from 'vitest';
 import { stripOptionalSurveyLines } from '../src/utils/screen-analyzer.js';
 

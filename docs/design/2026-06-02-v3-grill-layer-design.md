@@ -1,8 +1,8 @@
 # v3 grill 层设计（grill-me 主控 → spec.md → architect 交接）
 
 - 日期：2026-06-02
-- 状态：**v2 定稿 — codex review 合入 + 老滕 grill 完毕 LGTM（2026-06-02），进实现**
-- 老滕已拍：入口=skill（不污染 ~/.claude/skills，落私有 plugin）｜ 命名 B（/workflow run vs /workflow new）｜ grill 逐问(a) ｜ 进 grill 前确认句保留 ｜ 两道 gate 保留 ｜ spec=叙事+节点草图yaml + host parse
+- 状态：**v2 定稿 — codex review 合入 + 用户 grill 完毕 LGTM（2026-06-02），进实现**
+- 用户已拍：入口=skill（不污染 ~/.claude/skills，落私有 plugin）｜ 命名 B（/workflow run vs /workflow new）｜ grill 逐问(a) ｜ 进 grill 前确认句保留 ｜ 两道 gate 保留 ｜ spec=叙事+节点草图yaml + host parse
 - 工作模式：md-first（本机 md 做讨论载体，不上飞书文档）
 - 关联：`2026-06-01-next-gen-workflow-design.md`（v3 总设计，grill 在其 §2 / §4.1 Layer A / Q2 / Q10 / §7 已有方法论级定调）；execution runtime 已真机跑通（1/2 节点全绿）
 
@@ -10,7 +10,7 @@
 
 只设计 **grill 这一层（Layer A）**。execution runtime（ephemeral worker + 文件 IPC + 调度）已建好。architect（Layer B）这里只定**边界与交接形态**，细节另开稿。
 
-老滕指令：「grill 这一层」+「和 codex-loopy 一起讨论搞」。本稿即讨论起点。
+用户指令：「grill 这一层」+「和 codex-loopy 一起讨论搞」。本稿即讨论起点。
 
 ## 1. 核心洞察：grill 跟 execution 是两种生物
 
@@ -143,26 +143,26 @@ status: grilling | spec_ready | spec_approved | architect_running | dag_ready | 
 
 ## 5. OPEN QUESTIONS
 
-### 5.1 已和 codex 收敛（v2 定稿，老滕可推翻）
+### 5.1 已和 codex 收敛（v2 定稿，用户可推翻）
 - **OQ-A 运行形态** → grill = live-session skill（非新 worker）。✓ codex 认
 - **OQ-B spec 粒度** → 「需求分解草图」非「半 DAG」；7 字段；`input_needs` 文本不画边；机器可读 + handoff 前必过 parse。✓ codex 收紧
 - **OQ-C grill 不进 runtime** → 纯 skill + 薄命令（建 run / 写 spec / handoff）；不写 journal、不进 scheduler。✓ codex 认
 - **OQ-E architect = goal-worker** → 复用引擎，强约束（只读 spec、只写 dag.json+notes、不起 runtime）；host 侧 validateDag 不信自称。✓ codex 认 + 加约束
 - **OQ-F gate 数** → 两道保留不合并（gate-1 需求对不对 / gate-2 编译对不对）。✓ codex 认
 
-### 5.2 留给老滕 grill 的
-- **OQ-D run 出生点 / runId 命名**：grill 开始即诞生 runId+runDir。命名建议 `<slug>-<yymmdd-hhmm>`（slug 从需求一句话取）。grill 是普通 live 会话，不受 workflow 脚本里 Date.now 禁用限制，可正常取时间。老滕认不？
-- **OQ-G 触发入口 + 跟 v0.2 区分**【老滕 2026-06-02 拍：入口=skill，命名走 B 默认】：v0.2 在飞书已有入口 `/workflow run <模板名>`（`botmux-workflow-create` 设计存模板 → 按名反复跑，节点写死 prompt）。v3 入口必须跟它区分清楚。
+### 5.2 留给用户 grill 的
+- **OQ-D run 出生点 / runId 命名**：grill 开始即诞生 runId+runDir。命名建议 `<slug>-<yymmdd-hhmm>`（slug 从需求一句话取）。grill 是普通 live 会话，不受 workflow 脚本里 Date.now 禁用限制，可正常取时间。用户认不？
+- **OQ-G 触发入口 + 跟 v0.2 区分**【用户 2026-06-02 拍：入口=skill，命名走 B 默认】：v0.2 在飞书已有入口 `/workflow run <模板名>`（`botmux-workflow-create` 设计存模板 → 按名反复跑，节点写死 prompt）。v3 入口必须跟它区分清楚。
   - **✓ 锁：v3 入口 = 一个 botmux 内置 skill**（既能显式 `/workflow new` 打、也能 bot 读描述自主触发）。
-  - **✓ 隔离确认（老滕追问"会注册进 ~/.claude/skills 吗"）**：不会。botmux 给 claude 的 skill 全落 `~/.botmux/claude-plugin/skills/<name>/SKILL.md`（私有目录），靠 spawn 时 `--plugin-dir`(claude-code.ts:464, CLAUDE_PLUGIN_DIR=~/.botmux/claude-plugin) flag 挂载，**不碰 ~/.claude/skills**；另有 `removeGlobalBotmuxSkills` 清老版本误装。standalone claude/seed 不带 flag 加载不到；codex 根本没走磁盘 skill 安装；只有 gemini/cursor/opencode/mtr 因无 per-launch plugin 能力写进它们全局 skillsDir（既有妥协，非 v3 引入，且都不在 v3 执行支持集）。
+  - **✓ 隔离确认（用户追问"会注册进 ~/.claude/skills 吗"）**：不会。botmux 给 claude 的 skill 全落 `~/.botmux/claude-plugin/skills/<name>/SKILL.md`（私有目录），靠 spawn 时 `--plugin-dir`(claude-code.ts:464, CLAUDE_PLUGIN_DIR=~/.botmux/claude-plugin) flag 挂载，**不碰 ~/.claude/skills**；另有 `removeGlobalBotmuxSkills` 清老版本误装。standalone claude/seed 不带 flag 加载不到；codex 根本没走磁盘 skill 安装；只有 gemini/cursor/opencode/mtr 因无 per-launch plugin 能力写进它们全局 skillsDir（既有妥协，非 v3 引入，且都不在 v3 执行支持集）。
   - **命名 B 默认（可推翻）**：`/workflow run <模板>`(v0.2不动) ｜ `/workflow new <目标>`(v3，名 new/auto/goal 待定)。备选 A 单开 `/goal`|`/plan` 彻底分家。
   - **本质区别**：v0.2 =「模板模式」（已知流程、反复跑、参数化）；v3 =「即兴模式」（模糊一次性目标、当场 grill+编排+跑一次、节点 /goal 自主）。
   - **claude 推荐 B（子命令区分，同一 /workflow 家族）**：`/workflow run <模板名>`（v0.2 不动）｜ `/workflow new <一句话目标>`（v3，子命令名 new/auto/goal 待定）。用户脑里一个 workflow 概念，run=老模板 / new=现场来。
   - 备选 A：v3 单开 `/goal`|`/plan <目标>`，彻底分家（更清晰、多记一词）。备选 C：裸 `/workflow <目标>` 默认 v3，`run <名>` 才 v0.2（省字、语义压两层）。
-  - **入口本质是 skill，不是写死命令（老滕 2026-06-02 关切「命令启动 LLM 还能触发吗」）**：botmux skill 自带「触发场景」描述，bot 读描述自主判断要不要用（botmux-schedule/workflow-create 已如此）。所以 v3 入口 skill 天然两条触发路径：① 用户显式打 `/workflow new <目标>`；② bot 读 skill 描述、识别到"复合可拆解任务"**自主触发 grill**——用户不用知道命令。→ 之前说的"不做意图识别"措辞不准，**纠正为：不另造自定义分类器，直接用 skill 描述自带的匹配（这就是 LLM 触发，免费可靠）**，贴合 v3「由 LLM 决策流程」内核。
-  - **防过度触发（默认保留确认句）**：skill 描述别写太宽，否则普通求助（"看下这 bug"）也被卷进 grill。缓解 = 真进 grill 前 bot 先确认一句「我理解你想做一整套 workflow（先问几个问题再自动跑），对吗？」，确认才进。**默认保留这句**（老滕未要求去掉；想更激进直接进可后调）。
+  - **入口本质是 skill，不是写死命令（用户 2026-06-02 关切「命令启动 LLM 还能触发吗」）**：botmux skill 自带「触发场景」描述，bot 读描述自主判断要不要用（botmux-schedule/workflow-create 已如此）。所以 v3 入口 skill 天然两条触发路径：① 用户显式打 `/workflow new <目标>`；② bot 读 skill 描述、识别到"复合可拆解任务"**自主触发 grill**——用户不用知道命令。→ 之前说的"不做意图识别"措辞不准，**纠正为：不另造自定义分类器，直接用 skill 描述自带的匹配（这就是 LLM 触发，免费可靠）**，贴合 v3「由 LLM 决策流程」内核。
+  - **防过度触发（默认保留确认句）**：skill 描述别写太宽，否则普通求助（"看下这 bug"）也被卷进 grill。缓解 = 真进 grill 前 bot 先确认一句「我理解你想做一整套 workflow（先问几个问题再自动跑），对吗？」，确认才进。**默认保留这句**（用户未要求去掉；想更激进直接进可后调）。
   - `botmux-orchestrate` 暂不动。
-- **OQ-H 异步飞书 grill UX**【老滕 2026-06-02 拍：a 逐问】：锁定 grill-me 原法「一次只问一个问题」（不走"先甩完整 spec 挑刺"）。配套：允许用户批量回答（bot 自己拆对应）、working spec 落盘可 resume、逃生阀随时收尾（G5）。
+- **OQ-H 异步飞书 grill UX**【用户 2026-06-02 拍：a 逐问】：锁定 grill-me 原法「一次只问一个问题」（不走"先甩完整 spec 挑刺"）。配套：允许用户批量回答（bot 自己拆对应）、working spec 落盘可 resume、逃生阀随时收尾（G5）。
 
 ## 6. grill 层 MVP scope（v2）
 
@@ -177,7 +177,7 @@ status: grilling | spec_ready | spec_approved | architect_running | dag_ready | 
 - ❌ spec 版本 diff / 多人协作 grill
 - ❌ gate-2 复杂审批卡片（先朴素文本摘要 + 确认，但 gate 本身必须在）
 
-**实现拆分建议（待老滕拍后细化）**：grill skill（人格+bootstrap，纯 prompt）｜ host 控制器（薄命令：run birth / spec parse+校验 / status 状态机 / 驱动 architect+validateDag+两道 gate / 末了 kick `botmux v3 run`）｜ architect goal（固定 goal 模板，复用引擎）。grill 侧 claude 起、host 控制器 claude×codex 分（沿用引擎那次的 owner 边界），architect goal 模板谁起待定。
+**实现拆分建议（待用户拍后细化）**：grill skill（人格+bootstrap，纯 prompt）｜ host 控制器（薄命令：run birth / spec parse+校验 / status 状态机 / 驱动 architect+validateDag+两道 gate / 末了 kick `botmux v3 run`）｜ architect goal（固定 goal 模板，复用引擎）。grill 侧 claude 起、host 控制器 claude×codex 分（沿用引擎那次的 owner 边界），architect goal 模板谁起待定。
 
 ## 7. 风险
 

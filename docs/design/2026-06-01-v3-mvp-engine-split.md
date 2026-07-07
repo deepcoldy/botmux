@@ -1,7 +1,7 @@
 # v3 MVP 引擎 —— claude × codex 分工 + 接口契约
 
 - 日期：2026-06-01
-- 上游设计：`2026-06-01-next-gen-workflow-design.md`（v2，老滕已拍：A 方案先做引擎 / v0.2 不管 / v3 独立新功能）
+- 上游设计：`2026-06-01-next-gen-workflow-design.md`（v2，用户已拍：A 方案先做引擎 / v0.2 不管 / v3 独立新功能）
 - 目标：**端到端跑通一个 hand-written `dag.json`**，验证三件最不确定的事 —— ephemeral worker + 文件 IPC + 并发调度。grill/architect 自动化壳**本期不做**。
 - 协作：claude-loopy（调度+持久化侧）× codex-loopy（执行+IPC 侧），共享同一 working tree。
 
@@ -111,7 +111,7 @@ interface GoalInputs {
 | `BOTMUX_GOAL_ATTEMPT_DIR` | 本 attempt 目录（logs/manifest/work 都在下面） |
 | `BOTMUX_V3_GOAL` | `'1'`，标记 goal-mode 运行，worker 的 chat/card/ask 副作用静默（codex point 4） |
 
-**goal-mode 交付（老滕 2026-06-01 指令后改定，as-built）**：用 **Claude Code / Codex 原生 `/goal` 命令**，不做其他 CLI 适配；v3 goal 节点只支持 `claude-code` + `codex`（`V3_SUPPORTED_CLIS`，runtime run-start 守卫）。
+**goal-mode 交付（用户 2026-06-01 指令后改定，as-built）**：用 **Claude Code / Codex 原生 `/goal` 命令**，不做其他 CLI 适配；v3 goal 节点只支持 `claude-code` + `codex`（`V3_SUPPORTED_CLIS`，runtime run-start 守卫）。
 - ⚠️ 原生 `/goal` 语义是「设完成条件、持续干到满足」，**不**认识 `BOTMUX_GOAL_*`。所以 ephemeral-pool 不发裸 `/goal`，而是 `buildGoalCommand(req)`：把契约塞进 goal 内容当完成条件——「目标在 `$BOTMUX_GOAL_PATH`、inputs 在 `$BOTMUX_GOAL_INPUTS_PATH`、只写 `$BOTMUX_GOAL_OUTPUT_DIR`、完成条件=写 `$BOTMUX_GOAL_MANIFEST_PATH` 的 schemaVersion=1 manifest」。命令文案里的 env 名 / schemaVersion / kind 枚举都从 `contract.ts` 常量生成，不漂。
 - worker init `prompt=''`，`ready` 后走 `raw_input` 发 `/goal <contract>`（原生 slash passthrough，不走普通聊天包装）。
 - 这**反转了 v1 的 blocker #2**（原为兼容所有 CLI 才用 skill+bootstrap、绕开 slash）——收窄到只支持有 `/goal` 的两家后，该顾虑消失；`botmux-goal` skill 已移除。

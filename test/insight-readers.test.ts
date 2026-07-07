@@ -170,7 +170,7 @@ describe('insight span readers', () => {
             '[用户引用了消息 用 botmux quoted om_x 查看]',
             '请分析这轮失败，token=sk-1234567890abcdef',
             '</user_message>',
-            '<sender type="user" open_id="ou_secret" name="老滕" />',
+            '<sender type="user" open_id="ou_secret" name="用户" />',
             '<mentions><mention name="codex" /></mentions>',
           ].join('\n'),
         },
@@ -184,7 +184,7 @@ describe('insight span readers', () => {
       source: {
         kind: 'user',
         senderType: 'user',
-        senderName: '老滕',
+        senderName: '用户',
         mentionedNames: ['codex'],
       },
     });

@@ -409,7 +409,7 @@ export interface VcMeetingConsumerConfig {
 
 export interface VcMeetingRealtimeVoiceConfig {
   /**
-   * Enables realtime voice. This opens the ByteView realtime WebSocket after bot
+   * Enables realtime voice. This opens the meeting realtime WebSocket after bot
    * join; without vc:meeting.bot.realtime:write or meeting-side speaking
    * permission it fail-closes with an explicit warning and never sends audio.
    */
@@ -451,7 +451,7 @@ export interface BotConfig {
   /**
    * 通用启动前缀（按空格拆 token）：worker spawn 时把启动命令拼成
    * `<wrapperCli> <CLI 参数>`（首 token 当 bin 走 PATH 解析），无需 wrapper 脚本、跨系统。
-   * 典型值 `"aiden x claude"` / `"aiden x codex"`（内网网关 aiden-aiproxy + SSO），也能
+   * 典型值 `"aiden x claude"` / `"aiden x codex"`（企业网关 + SSO），也能
    * 承载 ccr / claude-w 等任意启动器。`cliId` 仍是底层适配器（claude→claude-code、
    * codex→codex），所有适配器机制（hook / bridge / resume）照常工作；设了 wrapperCli 后
    * 它的首 token 取代 cliId 的默认 bin（cliPathOverride 不再生效）。检测到前缀是

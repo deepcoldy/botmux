@@ -534,7 +534,7 @@ export async function runWorkflow(
     }
   }
 
-  // CLI-scope guard (老滕 directive): goal-mode rides the native `/goal`
+  // CLI-scope guard: goal-mode rides the native `/goal`
   // command, which only Claude Code / Codex support.  Fail the whole run up
   // front — clearly — rather than spawning a worker on an unsupported CLI that
   // would never understand `/goal`.
