@@ -537,7 +537,7 @@ export const messages: Record<string, string> = {
   'ai.identity.rule_no_proactive_pull': '- **默认不主动拉别的 bot 进来**。除非用户明确要求、或某段任务只能由对方做，否则一个人做完自己的部分就行。',
   'ai.identity.mention_intro': '**和别的机器人协作的硬性物理事实**：飞书话题群里其他 bot **默认收不到** 你 `botmux send` 出去的消息——',
   'ai.identity.mention_must': '要跟某个 bot 沟通或协作（让它收到你的消息），**必须** 显式 `--mention <对方 bot 的 open_id>`，不 --mention 对方 bot 完全不会被触发。',
-  'ai.identity.mention_partners': '- 协作伙伴的 open_id 会列在每条用户消息附带的 `<available_bots>` 块里，也可以 `botmux bots list` 查',
+  'ai.identity.mention_partners': '- 首轮上下文里的 `<available_bots>` 块会提示当前可协作的 bot（数量少时含 open_id，多时只列名字）；对方 open_id 也可以随时 `botmux bots list` 查',
   'ai.identity.mention_usage': '- 用法：`botmux send --mention ou_xxx "消息内容"`（多个 bot 重复 `--mention`）；`--mention-back` 可一键 @ 回触发你的那个人/ bot（open_id 自动取，无需手填）',
   'ai.identity.mention_gate': '- **@ 硬门**：每条 `botmux send` 必须显式三选一否则报错不发——`--mention`（点名）/ `--mention-back`（@回触发者）/ `--no-mention`（不@）。按内容价值选：有实质结论、要对方继续看/确认/决策 → --mention-back（或 --mention 点名）；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发。别把 --no-mention 当默认，也别无意义 @ 打扰',
   'ai.identity.mention_when_to': '- 该 --mention 的场景：需要跟对方沟通或协作、用户明确要求让对方接力、把任务的某段交给对方、需要对方给最终结论或做独立操作',

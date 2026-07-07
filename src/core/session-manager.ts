@@ -45,7 +45,7 @@ import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { repoPickerScanOptions } from '../global-config.js';
 import { usageLimitStateKey } from '../utils/cli-usage-limit.js';
-import { t, localeForBot, type Locale } from '../i18n/index.js';
+import { t, localeForBot, getDefaultLocale, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
 import { resolveRoleInjection } from './role-resolver.js';
 import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../services/whiteboard-store.js';
@@ -497,7 +497,11 @@ export function buildNewTopicPrompt(
         );
         botBlock = `<available_bots hint="${xmlEscape(t('ai.available_bots.hint', undefined, locale))}">\n${items.join('\n')}\n</available_bots>`;
       } else {
-        const sep = locale === 'en' ? ', ' : '、';
+        // Resolve the locale the same way t() does (explicit arg → process
+        // default) so the separator matches the rendered sentence's language —
+        // otherwise an undefined `locale` under an 'en' default would produce an
+        // English sentence joined with the Chinese enumeration comma.
+        const sep = (locale ?? getDefaultLocale()) === 'en' ? ', ' : '、';
         const names = unmentionedBots.map(b => b.displayName).join(sep);
         const line = t('ai.available_bots.collapsed_line', { count: unmentionedBots.length, names }, locale);
         botBlock = `<available_bots hint="${xmlEscape(t('ai.available_bots.hint_collapsed', undefined, locale))}" count="${unmentionedBots.length}">\n${xmlEscape(line)}\n</available_bots>`;
