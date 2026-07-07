@@ -265,7 +265,8 @@ function lastInteractiveCardAction(action: string): Record<string, string> {
   if (!cardMessage) throw new Error('no interactive card was sent');
   const card = JSON.parse(cardMessage.content);
   for (const item of interactiveCardActionItems(card)) {
-    if (item?.value?.action === action) return item.value;
+    const value = interactiveCardActionValue(item);
+    if (value?.action === action) return value;
   }
   throw new Error(`card action not found: ${action}`);
 }
@@ -275,7 +276,7 @@ function lastInteractiveCardButton(label: string): Record<string, string> {
   if (!cardMessage) throw new Error('no interactive card was sent');
   const card = JSON.parse(cardMessage.content);
   for (const item of interactiveCardActionItems(card)) {
-    if (item?.tag === 'button' && item?.text?.content === label) return item.value;
+    if (item?.tag === 'button' && item?.text?.content === label) return interactiveCardActionValue(item);
   }
   throw new Error(`card button not found: ${label}`);
 }
@@ -284,12 +285,10 @@ function lastInteractiveCardSelectOption(label: string): { value: Record<string,
   const cardMessage = [...sentMessages].reverse().find(msg => msg.msgType === 'interactive');
   if (!cardMessage) throw new Error('no interactive card was sent');
   const card = JSON.parse(cardMessage.content);
-  for (const element of card.elements ?? []) {
-    for (const action of element.actions ?? []) {
-      if (action?.tag !== 'select_static') continue;
-      for (const option of action.options ?? []) {
-        if (option?.text?.content === label) return { value: action.value, option: option.value };
-      }
+  for (const action of interactiveCardActionItems(card)) {
+    if (action?.tag !== 'select_static') continue;
+    for (const option of action.options ?? []) {
+      if (option?.text?.content === label) return { value: interactiveCardActionValue(action), option: option.value };
     }
   }
   throw new Error(`card select option not found: ${label}`);
@@ -320,6 +319,7 @@ function interactiveCardActionItems(card: any): any[] {
   const actions: any[] = [];
   const visitElements = (elements: any[]): void => {
     for (const element of elements ?? []) {
+      if (element?.tag === 'button' || element?.tag === 'select_static') actions.push(element);
       if (Array.isArray(element.actions)) actions.push(...element.actions);
       if (Array.isArray(element.elements)) visitElements(element.elements);
       for (const column of element.columns ?? []) {
@@ -328,7 +328,34 @@ function interactiveCardActionItems(card: any): any[] {
     }
   };
   visitElements(card.elements ?? []);
+  visitElements(card.body?.elements ?? []);
   return actions;
+}
+
+function interactiveCardActionValue(action: any): Record<string, string> {
+  return action?.value ?? action?.behaviors?.find((item: any) => item?.type === 'callback')?.value ?? {};
+}
+
+function interactiveCardMarkdownContent(card: any): string {
+  const elements = [...(card.elements ?? []), ...(card.body?.elements ?? [])];
+  const markdown = elements.find((element: any) => element?.tag === 'markdown');
+  return markdown?.content ?? markdown?.text?.content ?? '';
+}
+
+function interactiveCardInputNames(card: any): string[] {
+  const names: string[] = [];
+  const visitElements = (elements: any[]): void => {
+    for (const element of elements ?? []) {
+      if (element?.tag === 'input' && typeof element.name === 'string') names.push(element.name);
+      if (Array.isArray(element.elements)) visitElements(element.elements);
+      for (const column of element.columns ?? []) {
+        if (Array.isArray(column.elements)) visitElements(column.elements);
+      }
+    }
+  };
+  visitElements(card.elements ?? []);
+  visitElements(card.body?.elements ?? []);
+  return names;
 }
 
 describe('VC meeting daemon session lifecycle', () => {
@@ -1034,6 +1061,8 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(sentMessages[0].msgType).toBe('text');
     expect(sentMessages[1].msgType).toBe('interactive');
     const card = JSON.parse(sentMessages[1].content);
+    expect(card.schema).toBe('2.0');
+    expect(interactiveCardInputNames(card)).toContain('vc_meeting_custom_interval_seconds');
     const labels = interactiveCardLabels(card);
     expect(labels).toContain('只监听消息');
     expect(labels).toContain('Claude Loopy');
@@ -1046,7 +1075,7 @@ describe('VC meeting daemon session lifecycle', () => {
       action: { value: lastInteractiveCardButton('只监听消息') },
     }, APP_ID);
     expect(staged.header.title.content).toBe('会议处理方式');
-    expect(staged.elements[0].content).toContain('只监听消息（待确认）');
+    expect(interactiveCardMarkdownContent(staged)).toContain('只监听消息（待确认）');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_222222222')?.consumerMode).not.toBe('listenOnly');
 
     const result = await __vcMeetingAgentTest.handleCardAction({
@@ -1124,8 +1153,8 @@ describe('VC meeting daemon session lifecycle', () => {
     }, APP_ID);
 
     expect(result.header.title.content).toBe('会议处理方式');
-    expect(result.elements[0].content).toContain('90 秒');
-    expect(result.elements[0].content).toContain('待确认');
+    expect(interactiveCardMarkdownContent(result)).toContain('90 秒');
+    expect(interactiveCardMarkdownContent(result)).toContain('待确认');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.syncIntervalMs).toBeUndefined();
 
     // agent 下拉同样暂存；点"确认"后组合一次性生效。
@@ -1135,7 +1164,7 @@ describe('VC meeting daemon session lifecycle', () => {
       action: agentSelect,
     }, APP_ID);
     expect(stagedCard.header.title.content).toBe('会议处理方式');
-    expect(stagedCard.elements[0].content).toContain('Claude Loopy');
+    expect(interactiveCardMarkdownContent(stagedCard)).toContain('Claude Loopy');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.selectedAgentAppId).toBeUndefined();
 
     const selected = await __vcMeetingAgentTest.handleCardAction({
