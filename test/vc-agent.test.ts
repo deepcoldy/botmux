@@ -111,6 +111,39 @@ describe('vc-agent normalizer and state', () => {
     });
   });
 
+  it('normalizes chat sender from the activity operator wrapper', () => {
+    const batch = normalizeVcMeetingEvents({
+      header: {
+        event_id: 'evt_push_chat_operator',
+        event_type: 'vc.bot.meeting_activity_v1',
+        create_time: '1780000000000',
+      },
+      event: {
+        meeting_actitivty_items: [
+          {
+            activity_event_type: 'chat_received',
+            meeting: { id: 'm_push' },
+            operator: { id: 'ou_operator', name: 'Operator' },
+            chat_received_items: [
+              {
+                message_id: 'msg_push_operator',
+                message_type: 1,
+                text: 'operator chat',
+              },
+            ],
+          },
+        ],
+      },
+    }, { meetingId: 'm_push', source: 'push' });
+
+    expect(batch.items).toHaveLength(1);
+    expect(batch.items[0]).toMatchObject({
+      type: 'chat_received',
+      sender: { openId: 'ou_operator', name: 'Operator' },
+      text: 'operator chat',
+    });
+  });
+
   it('treats exit-zero lark-cli ok=false payloads as failed API calls', () => {
     expect(() => assertLarkCliJsonOk({ ok: true }, 'meeting text message send')).not.toThrow();
     expect(() => assertLarkCliJsonOk({ ok: false, error: 'permission denied' }, 'meeting text message send'))
