@@ -8,7 +8,7 @@
  *   botmux setup list|add|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
  *   botmux start          — start daemon (pm2)
  *   botmux stop           — stop daemon
- *   botmux restart [--include-pm2] — restart daemon (optionally restart PM2 God too)
+ *   botmux restart [--include-pm2] [--include-plugin-services] — restart daemon (optionally restart PM2 God / plugin services)
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
  *   botmux upgrade        — upgrade to latest version
@@ -1806,12 +1806,16 @@ function sleepSyncMs(ms: number): void {
 }
 
 /** Delete all pm2 processes matching botmux / botmux-* under the given PM2_HOME. */
+function isBotmuxCoreProcessName(name: string): boolean {
+  return name === PM2_NAME || (name.startsWith(`${PM2_NAME}-`) && !name.startsWith(`${PM2_NAME}-plugin-`));
+}
+
 function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
   let entries: Array<{ name: string; pid: number; online: boolean }>;
   try {
     const apps = JSON.parse(pm2Capture(['jlist'], home)) as any[];
     entries = (Array.isArray(apps) ? apps : [])
-      .filter(a => a && (a.name === PM2_NAME || String(a.name).startsWith(`${PM2_NAME}-`)))
+      .filter(a => a && isBotmuxCoreProcessName(String(a.name)))
       .map(a => ({ name: String(a.name), pid: Number(a.pid) || 0, online: a?.pm2_env?.status === 'online' }));
   } catch (e) {
     console.error(`[restart] pm2 jlist failed (pm2 not running or no apps?): ${e instanceof Error ? e.message : e}`);
@@ -1915,7 +1919,7 @@ async function cmdStop(): Promise<void> {
     const output = pm2Capture(['jlist']);
     const apps = JSON.parse(output) as any[];
     for (const app of apps) {
-      if (app.name === PM2_NAME || app.name.startsWith(`${PM2_NAME}-`)) {
+      if (isBotmuxCoreProcessName(String(app.name))) {
         try { runPm2(['stop', app.name]); stopped = true; } catch { /* */ }
       }
     }
@@ -1934,6 +1938,7 @@ async function cmdRestart(): Promise<void> {
   }
   ensureConfigDir();
   const includePm2 = process.argv.includes('--include-pm2');
+  const includePluginServices = process.argv.includes('--include-plugin-services');
   // Drop a restart-intent breadcrumb so the fresh daemon knows this was an
   // intentional restart and DMs the owner a summary. `IfAbsent` preserves a
   // richer breadcrumb (update / auto-restart) already written by the
@@ -1948,7 +1953,7 @@ async function cmdRestart(): Promise<void> {
   await ensureSystemDependencies();
   const cfg = ecosystemConfig();
   cleanupLegacyPm2();
-  await stopPluginServicesForCli();
+  if (includePluginServices) await stopPluginServicesForCli();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
   if (includePm2) {
@@ -1956,8 +1961,8 @@ async function cmdRestart(): Promise<void> {
   }
   // Wipe abandoned dashboard-daemon descriptors left behind by killed daemons.
   cleanupStaleDaemonDescriptors();
-  await reconcilePluginServicesForCli();
   runPm2(['start', cfg]);
+  if (includePluginServices) await reconcilePluginServicesForCli();
   if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
     console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
   }
@@ -3605,7 +3610,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               默认使用 botmux 内置 Feishu Web QR 登录尝试自动导入权限/redirect/发布版本；可加 --no-open-platform-auto 跳过
   start       启动 daemon
   stop        停止 daemon
-  restart     重启 daemon（自动恢复活跃会话；--include-pm2 同时重启 PM2 God）
+  restart     重启 daemon（默认不重启插件 service；--include-plugin-services 显式重启插件 service；--include-pm2 同时重启 PM2 God）
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
   upgrade     升级到最新版本
