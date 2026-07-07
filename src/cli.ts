@@ -7,7 +7,7 @@
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
  *   botmux setup list|add|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
  *   botmux start          — start daemon (pm2)
- *   botmux stop           — stop daemon
+ *   botmux stop [--include-plugin-services] — stop daemon (optionally stop plugin services)
  *   botmux restart [--include-pm2] [--include-plugin-services] — restart daemon (optionally restart PM2 God / plugin services)
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
@@ -1773,8 +1773,8 @@ async function cmdStart(): Promise<void> {
 
   cleanupLegacyPm2();
   const cfg = ecosystemConfig();
-  await reconcilePluginServicesForCli();
   runPm2(['start', cfg]);
+  await reconcilePluginServicesForCli();
   const bots = loadBotsJson();
   const count = bots.length || 1;
   console.log(`\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
@@ -1921,6 +1921,7 @@ function cleanupLegacyPm2(): boolean {
 }
 
 async function cmdStop(): Promise<void> {
+  const includePluginServices = process.argv.includes('--include-plugin-services');
   killDuplicatePm2GodDaemons();
   cleanupLegacyPm2();
   let stopped = false;
@@ -1935,7 +1936,7 @@ async function cmdStop(): Promise<void> {
   } catch { /* */ }
   // Wipe abandoned dashboard-daemon descriptors left behind by stopped daemons.
   cleanupStaleDaemonDescriptors();
-  await stopPluginServicesForCli();
+  if (includePluginServices) await stopPluginServicesForCli();
   if (!stopped) console.log('daemon 未在运行。');
 }
 
@@ -1962,9 +1963,9 @@ async function cmdRestart(): Promise<void> {
   await ensureSystemDependencies();
   const cfg = ecosystemConfig();
   cleanupLegacyPm2();
-  if (includePluginServices) await stopPluginServicesForCli();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
+  if (includePluginServices) await stopPluginServicesForCli();
   if (includePm2) {
     killPm2GodDaemon();
   }
@@ -3618,7 +3619,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   setup       交互式配置（首次使用 / 添加机器人）
               默认使用 botmux 内置 Feishu Web QR 登录尝试自动导入权限/redirect/发布版本；可加 --no-open-platform-auto 跳过
   start       启动 daemon
-  stop        停止 daemon
+  stop        停止 daemon（默认不停止插件 service；--include-plugin-services 显式停止插件 service）
   restart     重启 daemon（默认不重启插件 service；--include-plugin-services 显式重启插件 service；--include-pm2 同时重启 PM2 God）
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
@@ -6790,7 +6791,7 @@ function pluginPm2Options() {
 function formatPluginServiceReports(reports: Array<{ pluginId: string; serviceName: string; action: string; status?: string; warning?: string }>): string {
   if (reports.length === 0) return '无插件 host service。';
   return reports.map(r => {
-    const status = r.status ? ` (${r.status})` : '';
+    const status = r.status ? r.action === 'stopped' ? ` (was ${r.status})` : ` (${r.status})` : '';
     const warning = r.warning ? ` ⚠ ${r.warning}` : '';
     return `- ${r.pluginId}/${r.serviceName}: ${r.action}${status}${warning}`;
   }).join('\n');
@@ -6799,10 +6800,9 @@ function formatPluginServiceReports(reports: Array<{ pluginId: string; serviceNa
 async function reconcilePluginServicesForCli(pluginIds?: string[]): Promise<void> {
   const { ensureManagedHostServices } = await import('./core/plugins/service-manager.js');
   const reports = await ensureManagedHostServices(pluginPm2Options(), pluginIds);
-  const notable = reports.filter(r => r.action === 'started' || r.action === 'failed' || r.warning);
-  if (notable.length > 0) {
+  if (reports.length > 0) {
     console.log('\n插件 host service:');
-    console.log(formatPluginServiceReports(notable));
+    console.log(formatPluginServiceReports(reports));
   }
 }
 
