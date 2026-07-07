@@ -35,6 +35,7 @@ export interface VcMeetingConsumerCardInput {
   selectedAgentLabel?: string;
   // 暂存态（pending 状态下已选但未确认的组合）：下拉只暂存，点"确认"才生效。
   stagedMode?: 'agent' | 'listenOnly';
+  stagedAgentAppId?: string;
   stagedAgentLabel?: string;
   stagedIntervalMs?: number;
   error?: string;
@@ -257,111 +258,96 @@ function consumerStatusBody(input: VcMeetingConsumerCardInput): { template: stri
 }
 
 export function buildVcMeetingConsumerCard(input: VcMeetingConsumerCardInput): string {
-  if (input.status === 'pending') return buildVcMeetingConsumerPendingCard(input);
-
-  const { template, title, body } = consumerStatusBody(input);
-  const card: Record<string, unknown> = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: title },
-      template,
-    },
-    elements: [
-      { tag: 'markdown', content: body },
-    ],
-  };
-  return JSON.stringify(card);
-}
-
-function vcMeetingConsumerCallback(value: Record<string, unknown>): Array<Record<string, unknown>> {
-  return [{ type: 'callback', value }];
-}
-
-function buildVcMeetingConsumerPendingCard(input: VcMeetingConsumerCardInput): string {
   const { template, title, body } = consumerStatusBody(input);
   const elements: Record<string, unknown>[] = [
     { tag: 'markdown', content: body },
-    ...(input.candidates.length > 0 ? [{
-      tag: 'select_static',
-      placeholder: { tag: 'plain_text', content: '选择 agent' },
-      width: 'fill',
-      behaviors: vcMeetingConsumerCallback({
-        action: 'vc_meeting_consumer_stage',
-        stage_kind: 'agent',
-        meeting_id: input.meeting.id,
-        nonce: input.nonce,
-      }),
-      options: input.candidates.map(candidate => ({
-        text: { tag: 'plain_text', content: consumerCandidateOptionLabel(candidate) },
-        value: candidate.larkAppId,
-      })),
-    }] : []),
-    {
-      tag: 'select_static',
-      placeholder: { tag: 'plain_text', content: '同步间隔' },
-      width: 'fill',
-      behaviors: vcMeetingConsumerCallback({
-        action: 'vc_meeting_consumer_stage',
-        stage_kind: 'interval',
-        meeting_id: input.meeting.id,
-        nonce: input.nonce,
-      }),
-      options: [
-        { text: { tag: 'plain_text', content: '15 秒' }, value: '15000' },
-        { text: { tag: 'plain_text', content: '30 秒' }, value: '30000' },
-        { text: { tag: 'plain_text', content: '60 秒' }, value: '60000' },
-        { text: { tag: 'plain_text', content: '90 秒' }, value: '90000' },
-      ],
-    },
-    {
-      tag: 'form',
-      name: 'vc_meeting_consumer_confirm_form',
-      elements: [
-        {
-          tag: 'input',
-          name: CONSUMER_SYNC_INTERVAL_INPUT_NAME,
-          label: { tag: 'plain_text', content: '自定义同步间隔（秒）' },
-          placeholder: { tag: 'plain_text', content: '例如 45，范围 15-3600' },
-          default_value: consumerSyncIntervalCustomDefault(input.stagedIntervalMs ?? input.syncIntervalMs),
-        },
-        {
-          tag: 'button',
-          name: 'vc_meeting_consumer_confirm_submit',
-          text: { tag: 'plain_text', content: '确认' },
-          type: 'primary_filled',
-          width: 'fill',
-          form_action_type: 'submit',
-          value: {
-            action: 'vc_meeting_consumer_confirm',
-            meeting_id: input.meeting.id,
-            nonce: input.nonce,
-          },
-        },
-      ],
-    },
-    {
-      tag: 'button',
-      text: { tag: 'plain_text', content: '只监听消息' },
-      type: 'default',
-      behaviors: vcMeetingConsumerCallback({
-        action: 'vc_meeting_consumer_stage',
-        stage_kind: 'listenOnly',
-        meeting_id: input.meeting.id,
-        nonce: input.nonce,
-      }),
-    },
-    {
-      tag: 'button',
-      text: { tag: 'plain_text', content: '使用默认设置' },
-      type: 'default',
-      behaviors: vcMeetingConsumerCallback({
-        action: 'vc_meeting_consumer_select',
-        consumer_mode: 'default',
-        meeting_id: input.meeting.id,
-        nonce: input.nonce,
-      }),
-    },
   ];
+  if (input.status === 'pending') {
+    elements.push(
+      ...(input.candidates.length > 0 ? [{
+        tag: 'select_static',
+        placeholder: { tag: 'plain_text', content: '选择 agent' },
+        width: 'fill',
+        initial_option: input.stagedMode === 'agent' ? input.stagedAgentAppId : undefined,
+        behaviors: vcMeetingConsumerCallback({
+          action: 'vc_meeting_consumer_stage',
+          stage_kind: 'agent',
+          meeting_id: input.meeting.id,
+          nonce: input.nonce,
+        }),
+        options: input.candidates.map(candidate => ({
+          text: { tag: 'plain_text', content: consumerCandidateOptionLabel(candidate) },
+          value: candidate.larkAppId,
+        })),
+      }] : []),
+      {
+        tag: 'select_static',
+        placeholder: { tag: 'plain_text', content: '同步间隔' },
+        width: 'fill',
+        initial_option: consumerSyncIntervalPresetValue(input.stagedIntervalMs ?? input.syncIntervalMs),
+        behaviors: vcMeetingConsumerCallback({
+          action: 'vc_meeting_consumer_stage',
+          stage_kind: 'interval',
+          meeting_id: input.meeting.id,
+          nonce: input.nonce,
+        }),
+        options: [
+          { text: { tag: 'plain_text', content: '15 秒' }, value: '15000' },
+          { text: { tag: 'plain_text', content: '30 秒' }, value: '30000' },
+          { text: { tag: 'plain_text', content: '60 秒' }, value: '60000' },
+          { text: { tag: 'plain_text', content: '90 秒' }, value: '90000' },
+        ],
+      },
+      {
+        tag: 'form',
+        name: 'vc_meeting_consumer_confirm_form',
+        elements: [
+          {
+            tag: 'input',
+            name: CONSUMER_SYNC_INTERVAL_INPUT_NAME,
+            label: { tag: 'plain_text', content: '自定义同步间隔（秒）' },
+            placeholder: { tag: 'plain_text', content: '例如 45，范围 15-3600' },
+            default_value: consumerSyncIntervalCustomDefault(input.stagedIntervalMs ?? input.syncIntervalMs),
+          },
+          {
+            tag: 'button',
+            name: 'vc_meeting_consumer_confirm_submit',
+            text: { tag: 'plain_text', content: '确认' },
+            type: 'primary_filled',
+            width: 'fill',
+            form_action_type: 'submit',
+            value: {
+              action: 'vc_meeting_consumer_confirm',
+              meeting_id: input.meeting.id,
+              nonce: input.nonce,
+            },
+          },
+        ],
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: '只监听消息' },
+        type: 'default',
+        behaviors: vcMeetingConsumerCallback({
+          action: 'vc_meeting_consumer_stage',
+          stage_kind: 'listenOnly',
+          meeting_id: input.meeting.id,
+          nonce: input.nonce,
+        }),
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: '使用默认设置' },
+        type: 'default',
+        behaviors: vcMeetingConsumerCallback({
+          action: 'vc_meeting_consumer_select',
+          consumer_mode: 'default',
+          meeting_id: input.meeting.id,
+          nonce: input.nonce,
+        }),
+      },
+    );
+  }
   const card: Record<string, unknown> = {
     schema: '2.0',
     config: {
@@ -380,6 +366,16 @@ function buildVcMeetingConsumerPendingCard(input: VcMeetingConsumerCardInput): s
     },
   };
   return JSON.stringify(card);
+}
+
+function vcMeetingConsumerCallback(value: Record<string, unknown>): Array<Record<string, unknown>> {
+  return [{ type: 'callback', value }];
+}
+
+function consumerSyncIntervalPresetValue(ms: number | undefined): string | undefined {
+  if (!ms || !Number.isFinite(ms)) return undefined;
+  const value = String(Math.round(ms));
+  return ['15000', '30000', '60000', '90000'].includes(value) ? value : undefined;
 }
 
 function outputChannelLabel(channel: VcMeetingOutputChannel): string {

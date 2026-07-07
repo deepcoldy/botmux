@@ -1074,8 +1074,7 @@ describe('VC meeting daemon session lifecycle', () => {
       operator: { open_id: TARGET_OPEN_ID },
       action: { value: lastInteractiveCardButton('只监听消息') },
     }, APP_ID);
-    expect(staged.header.title.content).toBe('会议处理方式');
-    expect(interactiveCardMarkdownContent(staged)).toContain('只监听消息（待确认）');
+    expect(staged.toast.content).toContain('已暂存');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_222222222')?.consumerMode).not.toBe('listenOnly');
 
     const result = await __vcMeetingAgentTest.handleCardAction({
@@ -1152,9 +1151,7 @@ describe('VC meeting daemon session lifecycle', () => {
       action: intervalSelect,
     }, APP_ID);
 
-    expect(result.header.title.content).toBe('会议处理方式');
-    expect(interactiveCardMarkdownContent(result)).toContain('90 秒');
-    expect(interactiveCardMarkdownContent(result)).toContain('待确认');
+    expect(result.toast.content).toContain('已暂存');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.syncIntervalMs).toBeUndefined();
 
     // agent 下拉同样暂存；点"确认"后组合一次性生效。
@@ -1163,8 +1160,7 @@ describe('VC meeting daemon session lifecycle', () => {
       operator: { open_id: TARGET_OPEN_ID },
       action: agentSelect,
     }, APP_ID);
-    expect(stagedCard.header.title.content).toBe('会议处理方式');
-    expect(interactiveCardMarkdownContent(stagedCard)).toContain('Claude Loopy');
+    expect(stagedCard.toast.content).toContain('已暂存');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.selectedAgentAppId).toBeUndefined();
 
     const selected = await __vcMeetingAgentTest.handleCardAction({
@@ -1173,7 +1169,7 @@ describe('VC meeting daemon session lifecycle', () => {
     }, APP_ID);
 
     expect(selected.header.title.content).toBe('会议 agent 已启用');
-    expect(selected.elements[0].content).toContain('90 秒');
+    expect(interactiveCardMarkdownContent(selected)).toContain('90 秒');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.syncIntervalMs).toBe(90_000);
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_242424242')?.selectedAgentAppId).toBe(AGENT_APP_ID);
   });
@@ -1226,7 +1222,7 @@ describe('VC meeting daemon session lifecycle', () => {
     }, APP_ID);
 
     expect(selected.header.title.content).toBe('会议 agent 已启用');
-    expect(selected.elements[0].content).toContain('45 秒');
+    expect(interactiveCardMarkdownContent(selected)).toContain('45 秒');
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_252525252')?.syncIntervalMs).toBe(45_000);
     expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_252525252')?.selectedAgentAppId).toBe(AGENT_APP_ID);
   });
@@ -1394,8 +1390,8 @@ describe('VC meeting daemon session lifecycle', () => {
     const result = await selectConsumerAgentViaCard('Claude Loopy');
 
     expect(result.header.title.content).toBe('仅同步会议消息');
-    expect(result.elements[0].content).toContain('选择 agent 失败，已回退只监听');
-    expect(result.elements[0].content).toContain('add failed');
+    expect(interactiveCardMarkdownContent(result)).toContain('选择 agent 失败，已回退只监听');
+    expect(interactiveCardMarkdownContent(result)).toContain('add failed');
     const stored = runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_444444444');
     expect(stored?.consumerMode).toBe('listenOnly');
     expect(stored?.selectedAgentAppId).toBeUndefined();
@@ -1435,8 +1431,8 @@ describe('VC meeting daemon session lifecycle', () => {
 
     expect(addBotToChatCalls).toHaveLength(0);
     expect(result.header.title.content).toBe('仅同步会议消息');
-    expect(result.elements[0].content).toContain('选择 agent 失败，已回退只监听');
-    expect(result.elements[0].content).toContain('has no workingDir');
+    expect(interactiveCardMarkdownContent(result)).toContain('选择 agent 失败，已回退只监听');
+    expect(interactiveCardMarkdownContent(result)).toContain('has no workingDir');
     const stored = runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_777777777');
     expect(stored?.consumerMode).toBe('listenOnly');
     expect(stored?.selectedAgentAppId).toBeUndefined();

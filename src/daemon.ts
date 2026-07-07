@@ -3459,6 +3459,7 @@ function vcMeetingConsumerCardForSession(
     ...(session.consumerPendingChoice?.mode === 'agent'
       ? {
         stagedMode: 'agent' as const,
+        stagedAgentAppId: session.consumerPendingChoice.agentAppId,
         stagedAgentLabel: (() => {
           const staged = session.consumerPendingChoice;
           const candidate = vcMeetingConsumerCandidates(cfg).find(item => item.larkAppId === staged.agentAppId);
@@ -4809,7 +4810,7 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
     // 用户在操作：重置超时（保留同一 nonce），超时到点按暂存态收敛。
     extendVcMeetingConsumerSelectionTimeout(key, session, cfg);
     logger.info(`[vc-agent] meeting consumer staged meeting=${meetingId} kind=${stageKind}`);
-    return vcMeetingConsumerCardForSession('pending', session, cfg);
+    return { toast: { type: 'success', content: '已暂存，点击确认后生效' } };
   }
 
   if (action === 'vc_meeting_consumer_confirm') {
