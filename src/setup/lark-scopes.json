@@ -151,6 +151,8 @@
       "task:tasklist:write",
       "translation:text",
       "vc:meeting.bot.join:write",
+      "vc:meeting.bot.realtime:write",
+      "vc:meeting.message:write",
       "vc:meeting.meetingevent:read",
       "wiki:member:create",
       "wiki:member:retrieve",

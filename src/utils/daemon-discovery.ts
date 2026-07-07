@@ -17,6 +17,8 @@ import { config } from '../config.js';
 export interface OnlineDaemonInfo {
   larkAppId: string;
   ipcPort: number;
+  botName?: string;
+  cliId?: string;
   pid?: number;
   lastHeartbeat?: number;
 }
@@ -45,6 +47,8 @@ export function listOnlineDaemons(): OnlineDaemonInfo[] {
       out.push({
         larkAppId: d.larkAppId,
         ipcPort: d.ipcPort,
+        ...(typeof d.botName === 'string' && d.botName.trim() ? { botName: d.botName.trim() } : {}),
+        ...(typeof d.cliId === 'string' && d.cliId.trim() ? { cliId: d.cliId.trim() } : {}),
         pid: d.pid,
         lastHeartbeat: d.lastHeartbeat,
       });

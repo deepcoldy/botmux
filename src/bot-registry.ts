@@ -96,23 +96,88 @@ function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | und
   const entry = raw as Record<string, unknown>;
   const out: VcMeetingAgentConfig = {};
   if (entry.enabled === true) out.enabled = true;
-  if (entry.autoJoin === true) out.autoJoin = true;
-  const workflowId = normalizeNonEmptyString(entry.workflowId);
-  const chatId = normalizeNonEmptyString(entry.chatId);
   const notificationChatId = normalizeNonEmptyString(entry.notificationChatId);
+  const listenerChatId = normalizeNonEmptyString(entry.listenerChatId);
   const attentionTargetOpenId = normalizeNonEmptyString(entry.attentionTargetOpenId);
   const larkCliProfile = normalizeNonEmptyString(entry.larkCliProfile);
-  const instruction = normalizeNonEmptyString(entry.instruction);
+  const inviteTtlMs = normalizePositiveInt(entry.inviteTtlMs);
   const stabilizeMs = normalizePositiveInt(entry.stabilizeMs);
   const flushIntervalMs = normalizePositiveInt(entry.flushIntervalMs);
-  if (workflowId) out.workflowId = workflowId;
-  if (chatId) out.chatId = chatId;
+  const realtimeVoice = normalizeVcMeetingRealtimeVoiceConfig(entry.realtimeVoice);
+  const meetingConsumer = normalizeVcMeetingConsumerConfig(entry.meetingConsumer);
   if (notificationChatId) out.notificationChatId = notificationChatId;
+  if (listenerChatId) out.listenerChatId = listenerChatId;
   if (attentionTargetOpenId) out.attentionTargetOpenId = attentionTargetOpenId;
   if (larkCliProfile) out.larkCliProfile = larkCliProfile;
-  if (instruction) out.instruction = instruction;
+  if (inviteTtlMs !== undefined) out.inviteTtlMs = inviteTtlMs;
   if (stabilizeMs !== undefined) out.stabilizeMs = stabilizeMs;
   if (flushIntervalMs !== undefined) out.flushIntervalMs = flushIntervalMs;
+  if (realtimeVoice) out.realtimeVoice = realtimeVoice;
+  if (meetingConsumer) out.meetingConsumer = meetingConsumer;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function normalizeVcMeetingConsumerConfig(raw: unknown): VcMeetingConsumerConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const entry = raw as Record<string, unknown>;
+  const out: VcMeetingConsumerConfig = {};
+  if (entry.enabled === true) out.enabled = true;
+  if (entry.enabled === false) out.enabled = false;
+  if (entry.defaultMode === 'listenOnly' || entry.defaultMode === 'agent') out.defaultMode = entry.defaultMode;
+  const defaultAgentAppId = normalizeNonEmptyString(entry.defaultAgentAppId) ?? normalizeNonEmptyString(entry.defaultAgent);
+  const selectionTimeoutMs = normalizePositiveInt(entry.selectionTimeoutMs);
+  const injectIntervalMs = normalizePositiveInt(entry.injectIntervalMs);
+  const minBatchChars = normalizePositiveInt(entry.minBatchChars);
+  const minBatchItems = normalizePositiveInt(entry.minBatchItems);
+  const maxInjectIntervalMs = normalizePositiveInt(entry.maxInjectIntervalMs);
+  const candidates = normalizeVcMeetingConsumerCandidates(entry.agentCandidates ?? entry.agents);
+  if (defaultAgentAppId) out.defaultAgentAppId = defaultAgentAppId;
+  if (selectionTimeoutMs !== undefined) out.selectionTimeoutMs = selectionTimeoutMs;
+  if (injectIntervalMs !== undefined) out.injectIntervalMs = injectIntervalMs;
+  if (minBatchChars !== undefined) out.minBatchChars = minBatchChars;
+  if (minBatchItems !== undefined) out.minBatchItems = minBatchItems;
+  if (maxInjectIntervalMs !== undefined) out.maxInjectIntervalMs = maxInjectIntervalMs;
+  if (candidates.length > 0) out.agentCandidates = candidates;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function normalizeVcMeetingConsumerCandidates(raw: unknown): VcMeetingConsumerAgentConfig[] {
+  if (!Array.isArray(raw)) return [];
+  const out: VcMeetingConsumerAgentConfig[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    let larkAppId: string | undefined;
+    let label: string | undefined;
+    if (typeof item === 'string') {
+      larkAppId = item.trim();
+    } else if (item && typeof item === 'object' && !Array.isArray(item)) {
+      const entry = item as Record<string, unknown>;
+      larkAppId = normalizeNonEmptyString(entry.larkAppId) ?? normalizeNonEmptyString(entry.appId);
+      label = normalizeNonEmptyString(entry.label) ?? normalizeNonEmptyString(entry.name);
+    }
+    if (!larkAppId || seen.has(larkAppId)) continue;
+    seen.add(larkAppId);
+    out.push({
+      larkAppId,
+      ...(label ? { label } : {}),
+    });
+  }
+  return out;
+}
+
+function normalizeVcMeetingRealtimeVoiceConfig(raw: unknown): VcMeetingRealtimeVoiceConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const entry = raw as Record<string, unknown>;
+  const out: VcMeetingRealtimeVoiceConfig = {};
+  if (entry.enabled === true) out.enabled = true;
+  const sampleRate = normalizePositiveInt(entry.sampleRate);
+  const channels = normalizePositiveInt(entry.channels);
+  const frameMs = normalizePositiveInt(entry.frameMs);
+  const testSpeakOnStartText = normalizeNonEmptyString(entry.testSpeakOnStartText);
+  if (sampleRate !== undefined) out.sampleRate = sampleRate;
+  if (channels !== undefined) out.channels = channels;
+  if (frameMs !== undefined) out.frameMs = frameMs;
+  if (testSpeakOnStartText) out.testSpeakOnStartText = testSpeakOnStartText;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -281,15 +346,66 @@ export interface BotDefaultOncall {
 
 export interface VcMeetingAgentConfig {
   enabled?: boolean;
-  autoJoin?: boolean;
-  workflowId?: string;
-  chatId?: string;
+  /** Existing chat used for meeting transcript/chat sync. If unset, confirmation creates a listener group. */
+  listenerChatId?: string;
   notificationChatId?: string;
   attentionTargetOpenId?: string;
   larkCliProfile?: string;
-  instruction?: string;
+  /** Pending invite confirmation TTL. Defaults to 30 minutes. */
+  inviteTtlMs?: number;
+  /** Transcript stability window before listener-group sync emits a sentence. */
   stabilizeMs?: number;
+  /** Listener-group sync interval. */
   flushIntervalMs?: number;
+  /** Realtime voice v0. Disabled by default; requires realtime scope and meeting-side AI speaking permission. */
+  realtimeVoice?: VcMeetingRealtimeVoiceConfig;
+  /** Optional listener-group consumer. Card choices are driven entirely by this bots.json block. */
+  meetingConsumer?: VcMeetingConsumerConfig;
+}
+
+export interface VcMeetingConsumerAgentConfig {
+  /** Target bot app id to receive meeting chunks through daemon-side injection. */
+  larkAppId: string;
+  /** Human-readable card label. Falls back to bot registry name / app id. */
+  label?: string;
+}
+
+export interface VcMeetingConsumerConfig {
+  /** When false, listener groups only sync meeting messages and do not show the agent-selection card. */
+  enabled?: boolean;
+  /** Timeout/default behavior. Defaults to listenOnly. */
+  defaultMode?: 'listenOnly' | 'agent';
+  /** Used only when defaultMode is agent. Accepts defaultAgent as a legacy alias in bots.json. */
+  defaultAgentAppId?: string;
+  /** Card selection timeout. Defaults in daemon; should normally be < flushIntervalMs. */
+  selectionTimeoutMs?: number;
+  /** Agent injection cadence, independent from listener-group flush interval. */
+  injectIntervalMs?: number;
+  /** Minimum rendered meeting delta characters before injecting to the agent. Defaults in daemon. */
+  minBatchChars?: number;
+  /** Minimum meeting delta item count before injecting to the agent. Defaults in daemon. */
+  minBatchItems?: number;
+  /** Maximum time to hold a non-empty meeting delta before injecting to the agent. Defaults in daemon. */
+  maxInjectIntervalMs?: number;
+  /** Optional allowlist. Omitted or [] means all online configured bots with a usable working dir are shown; use enabled:false to disable. */
+  agentCandidates?: VcMeetingConsumerAgentConfig[];
+}
+
+export interface VcMeetingRealtimeVoiceConfig {
+  /**
+   * Enables realtime voice. This opens the ByteView realtime WebSocket after bot
+   * join; without vc:meeting.bot.realtime:write or meeting-side speaking
+   * permission it fail-closes with an explicit warning and never sends audio.
+   */
+  enabled?: boolean;
+  /** Expected PCM sample rate for session.create, default 24000. */
+  sampleRate?: number;
+  /** Expected PCM channel count for session.create, default mono. */
+  channels?: number;
+  /** Upstream PCM frame duration, default 100ms (4800B at 24kHz mono s16le). */
+  frameMs?: number;
+  /** M0 dogfood only: speak this text once after realtime session.created. */
+  testSpeakOnStartText?: string;
 }
 
 export interface BotConfig {

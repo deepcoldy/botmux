@@ -87,7 +87,7 @@ import {
   updateInstalledSkillAsync,
 } from './services/skill-registry-store.js';
 import { redactGitUrlCredentials } from './core/skills/sources.js';
-import { loadBotConfigs } from './bot-registry.js';
+import { loadBotConfigs, type BotConfig } from './bot-registry.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
@@ -101,6 +101,11 @@ import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncM
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
+import { larkHosts } from './im/lark/lark-hosts.js';
+import {
+  VC_MEETING_FEATURE_SCOPES,
+  VC_MEETING_REALTIME_VOICE_SCOPES,
+} from './setup/verify-permissions.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -284,6 +289,18 @@ interface ResolvedDashboardSettings {
   openTerminalInFeishu: boolean;
   /** Experimental current-chat bot discovery via Lark `/members/bots`. Default ON. */
   chatBotDiscovery: boolean;
+  /** Machine-wide VC meeting listener kill-switch. Default ON. */
+  vcMeetingAgent: {
+    enabled: boolean;
+    listenerBotAppId?: string | null;
+    listenerBotOptions: Array<{
+      larkAppId: string;
+      botName?: string | null;
+      cliId?: string;
+      vcMeetingAgentEnabled: boolean;
+      hasLarkCliProfile: boolean;
+    }>;
+  };
   repoPickerMode: RepoPickerMode;
   /** Auto-update / auto-restart schedule (off by default). */
   maintenance: MaintenanceConfig;
@@ -297,6 +314,97 @@ interface ResolvedDashboardSettings {
   remoteAccess: boolean;
 }
 
+function vcMeetingListenerBotOptions(): ResolvedDashboardSettings['vcMeetingAgent']['listenerBotOptions'] {
+  try {
+    const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
+    return loadBotConfigs().map(bot => ({
+      larkAppId: bot.larkAppId,
+      botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
+      cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
+      vcMeetingAgentEnabled: bot.vcMeetingAgent?.enabled === true,
+      hasLarkCliProfile: typeof bot.vcMeetingAgent?.larkCliProfile === 'string' && bot.vcMeetingAgent.larkCliProfile.trim().length > 0,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+async function fetchGrantedScopesForBotConfig(bot: BotConfig): Promise<{ ok: true; granted: Set<string> } | { ok: false; error: string }> {
+  const brand = bot.brand === 'lark' ? 'lark' : 'feishu';
+  const openApi = larkHosts(brand).openApi;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 10_000);
+  try {
+    const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: bot.larkAppId, app_secret: bot.larkAppSecret }),
+      signal: ac.signal,
+    });
+    const tokenData = await tokenRes.json() as any;
+    if (tokenData?.code !== 0 || typeof tokenData?.tenant_access_token !== 'string') {
+      return { ok: false, error: `vcMeetingAgent_listenerBot_invalid_credentials: code=${tokenData?.code ?? '?'} msg=${tokenData?.msg ?? ''}` };
+    }
+    const infoRes = await fetch(
+      `${openApi}/open-apis/application/v6/applications/${bot.larkAppId}?lang=zh_cn`,
+      { headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` }, signal: ac.signal },
+    );
+    const infoData = await infoRes.json() as any;
+    if (infoData?.code === 99991672) {
+      return { ok: false, error: 'vcMeetingAgent_listenerBot_scope_check_unavailable: missing application:application:self_manage' };
+    }
+    if (infoData?.code !== 0) {
+      return { ok: false, error: `vcMeetingAgent_listenerBot_scope_check_failed: code=${infoData?.code ?? '?'} msg=${infoData?.msg ?? ''}` };
+    }
+    const scopesRaw: any[] =
+      infoData.data?.app?.scopes
+      ?? infoData.data?.application?.scopes
+      ?? infoData.data?.scopes
+      ?? [];
+    if (!Array.isArray(scopesRaw) || scopesRaw.length === 0) {
+      return { ok: false, error: 'vcMeetingAgent_listenerBot_scope_check_failed: empty scopes' };
+    }
+    const granted = new Set(
+      scopesRaw.map(s => typeof s === 'string' ? s : s?.scope).filter(Boolean) as string[],
+    );
+    return { ok: true, granted };
+  } catch (err: any) {
+    return {
+      ok: false,
+      error: ac.signal.aborted
+        ? 'vcMeetingAgent_listenerBot_scope_check_timeout'
+        : `vcMeetingAgent_listenerBot_scope_check_failed: ${err?.message ?? err}`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function validateVcMeetingListenerBotAppId(appId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  let bots: BotConfig[];
+  try {
+    bots = loadBotConfigs();
+  } catch (err: any) {
+    return { ok: false, error: `vcMeetingAgent_listenerBot_config_unavailable: ${err?.message ?? err}` };
+  }
+  const bot = bots.find(b => b.larkAppId === appId);
+  if (!bot) return { ok: false, error: 'vcMeetingAgent_listenerBot_unknown' };
+  const cfg = bot.vcMeetingAgent;
+  if (cfg?.enabled !== true) return { ok: false, error: 'vcMeetingAgent_listenerBot_disabled' };
+  if (!cfg.larkCliProfile) return { ok: false, error: 'vcMeetingAgent_listenerBot_missing_larkCliProfile' };
+
+  const granted = await fetchGrantedScopesForBotConfig(bot);
+  if (!granted.ok) return granted;
+  const required = cfg.realtimeVoice?.enabled === true
+    ? [...VC_MEETING_FEATURE_SCOPES, ...VC_MEETING_REALTIME_VOICE_SCOPES]
+    : VC_MEETING_FEATURE_SCOPES;
+  const missing = required.filter(scope => !granted.granted.has(scope.name));
+  if (missing.length > 0) {
+    return { ok: false, error: `vcMeetingAgent_listenerBot_missing_scopes: ${missing.map(s => s.name).join(',')}` };
+  }
+  return { ok: true };
+}
+
 function resolveDashboardSettings(): ResolvedDashboardSettings {
   const global = readGlobalConfig();
   const dashboard = global.dashboard ?? {};
@@ -304,6 +412,11 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
     chatBotDiscovery: dashboard.chatBotDiscovery !== false, // default ON
+    vcMeetingAgent: {
+      enabled: global.vcMeetingAgent?.enabled !== false,
+      listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,
+      listenerBotOptions: vcMeetingListenerBotOptions(),
+    },
     repoPickerMode: global.repoPickerMode ?? 'all',
     maintenance: global.maintenance ?? {},
     localDevInstall: isLocalDevInstall(),
@@ -321,6 +434,7 @@ async function reloadLocaleOnAllDaemons(): Promise<void> {
   ));
 }
 const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
+settingsWriteApplierDeps.validateVcMeetingListenerBotAppId = validateVcMeetingListenerBotAppId;
 
 /** Helper to render a {status, body} HandlerResult through `res`. */
 function writeHandlerResult(res: import('node:http').ServerResponse, result: GroupsHandlerResult): void {

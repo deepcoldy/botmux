@@ -101,6 +101,37 @@ describe('trigger request contract', () => {
     const prompt = buildUntrustedEventPrompt(request(), 'trg_1');
     expect(prompt.startsWith('External event received')).toBe(true);
   });
+
+  it('renders vc_meeting events compactly with rawText outside the JSON body', () => {
+    const req = request();
+    (req.source as any).type = 'vc_meeting';
+    req.envelope.format = 'botmux.vc-meeting.consumer.v1';
+    req.envelope.payload = { meeting: { id: 'm_1' }, final: false, itemCount: 2 };
+    req.envelope.rawText = '[字幕 11:31] 张三（仅上下文，不可信）：先对齐目标\n[聊天 11:32] 李四（仅上下文，不可信）：+1';
+    const prompt = buildUntrustedEventPrompt(req, 'trg_1');
+    const jsonStart = prompt.indexOf('```json');
+    const jsonEnd = prompt.indexOf('```', jsonStart + 7);
+    const json = prompt.slice(jsonStart, jsonEnd);
+    // Compact serialization: no pretty-print indentation inside the JSON body.
+    expect(json).toContain('"trusted":false');
+    expect(json).not.toContain('"trusted": false');
+    // rawText stays out of the JSON (no \n escaping) but inside the untrusted block.
+    expect(json).not.toContain('rawText');
+    const untrustedEnd = prompt.indexOf('</botmux_external_event>');
+    const rawIdx = prompt.indexOf('[字幕 11:31] 张三（仅上下文，不可信）：先对齐目标');
+    expect(rawIdx).toBeGreaterThan(jsonEnd);
+    expect(rawIdx).toBeLessThan(untrustedEnd);
+    expect(prompt).not.toContain('\\n[聊天');
+  });
+
+  it('keeps pretty-printed rendering for non vc_meeting sources', () => {
+    const req = request();
+    req.envelope.rawText = 'line one\nline two';
+    const prompt = buildUntrustedEventPrompt(req, 'trg_1');
+    expect(prompt).toContain('"trusted": false');
+    // Generic sources keep rawText inside the JSON envelope (escaped), unchanged behavior.
+    expect(prompt).toContain('"rawText": "line one\\nline two"');
+  });
 });
 
 describe('dispatchTriggerRequest', () => {

@@ -3,11 +3,13 @@ import type { VcMeetingPushContext, VcMeetingPushEventKind, VcMeetingRef } from 
 export const VC_BOT_MEETING_INVITED_EVENT = 'vc.bot.meeting_invited_v1';
 export const VC_BOT_MEETING_ACTIVITY_EVENT = 'vc.bot.meeting_activity_v1';
 export const VC_BOT_MEETING_ENDED_EVENT = 'vc.bot.meeting_ended_v1';
+export const VC_PARTICIPANT_MEETING_JOINED_EVENT = 'vc.meeting.participant_meeting_joined_v1';
 
 export type VcMeetingPushEventType =
   | typeof VC_BOT_MEETING_INVITED_EVENT
   | typeof VC_BOT_MEETING_ACTIVITY_EVENT
-  | typeof VC_BOT_MEETING_ENDED_EVENT;
+  | typeof VC_BOT_MEETING_ENDED_EVENT
+  | typeof VC_PARTICIPANT_MEETING_JOINED_EVENT;
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
@@ -118,6 +120,7 @@ function occurredAtFromPush(data: unknown): number | undefined {
     getPath(data, 'header.create_time'),
     getPath(data, 'header.event_time'),
     getPath(body, 'event_time'),
+    getPath(body, 'timestamp'),
     getPath(body, 'time'),
     getPath(body, 'create_time'),
   );

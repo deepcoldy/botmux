@@ -125,7 +125,12 @@ export interface VcMeetingIngestResult {
   changedTranscripts: VcTranscriptStateEntry[];
 }
 
-export interface VcMeetingWorkflowPayload {
+/**
+ * Structured meeting-state window used by polling debug output and future
+ * listener-group / agent-consumer emitters. This is not a workflow trigger
+ * envelope; P2 may wrap it for a workflow consumer explicitly if needed.
+ */
+export interface VcMeetingStatePayload {
   format: 'botmux.vc-meeting.v1';
   source: 'lark-cli:vc:+meeting-events' | 'lark:vc.bot.meeting_activity_v1';
   meeting: VcMeetingRef;
@@ -148,7 +153,11 @@ export interface VcMeetingWorkflowPayload {
   };
 }
 
-export type VcMeetingPushEventKind = 'meeting_invited' | 'meeting_activity' | 'meeting_ended';
+export type VcMeetingPushEventKind =
+  | 'meeting_invited'
+  | 'meeting_activity'
+  | 'meeting_ended'
+  | 'participant_meeting_joined';
 
 export interface VcMeetingPushContext {
   larkAppId: string;

@@ -202,6 +202,102 @@ describe('parseBotConfigsFromText — brand', () => {
       expect(cfg.startupCommands).toBeUndefined();
     }
   });
+
+  it('normalizes vcMeetingAgent.realtimeVoice without enabling it by default', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        vcMeetingAgent: {
+          enabled: true,
+          realtimeVoice: {
+            enabled: true,
+            sampleRate: 24000,
+            channels: 1,
+            frameMs: 20,
+            testSpeakOnStartText: '测试语音',
+          },
+        },
+      },
+    ]));
+    expect(cfg.vcMeetingAgent?.realtimeVoice).toEqual({
+      enabled: true,
+      sampleRate: 24000,
+      channels: 1,
+      frameMs: 20,
+      testSpeakOnStartText: '测试语音',
+    });
+
+    const [defaultCfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'b', larkAppSecret: 's', vcMeetingAgent: { enabled: true } },
+    ]));
+    expect(defaultCfg.vcMeetingAgent?.realtimeVoice).toBeUndefined();
+  });
+
+  it('normalizes vcMeetingAgent.meetingConsumer from bots.json', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        vcMeetingAgent: {
+          enabled: true,
+          meetingConsumer: {
+            enabled: true,
+            defaultMode: 'agent',
+            defaultAgent: 'cli_agent_default',
+            selectionTimeoutMs: 20_000,
+            injectIntervalMs: 60_000,
+            minBatchChars: 500,
+            minBatchItems: 10,
+            maxInjectIntervalMs: 180_000,
+            agentCandidates: [
+              { larkAppId: 'cli_agent_default', label: 'Claude' },
+              'cli_agent_codex',
+              { appId: 'cli_agent_default', label: 'Duplicate' },
+              { larkAppId: '   ' },
+              42,
+            ],
+          },
+        },
+      },
+    ]));
+    expect(cfg.vcMeetingAgent?.meetingConsumer).toEqual({
+      enabled: true,
+      defaultMode: 'agent',
+      defaultAgentAppId: 'cli_agent_default',
+      selectionTimeoutMs: 20_000,
+      injectIntervalMs: 60_000,
+      minBatchChars: 500,
+      minBatchItems: 10,
+      maxInjectIntervalMs: 180_000,
+      agentCandidates: [
+        { larkAppId: 'cli_agent_default', label: 'Claude' },
+        { larkAppId: 'cli_agent_codex' },
+      ],
+    });
+  });
+
+  it('keeps meetingConsumer disabled/listenOnly configuration explicit', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        vcMeetingAgent: {
+          enabled: true,
+          meetingConsumer: {
+            enabled: false,
+            defaultMode: 'listenOnly',
+            defaultAgentAppId: '',
+            agentCandidates: [],
+          },
+        },
+      },
+    ]));
+    expect(cfg.vcMeetingAgent?.meetingConsumer).toEqual({
+      enabled: false,
+      defaultMode: 'listenOnly',
+    });
+  });
 });
 
 // ─── getBot / getBotClient ────────────────────────────────────────────────

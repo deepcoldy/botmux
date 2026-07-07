@@ -3,12 +3,12 @@ import { normalizeVcMeetingEvents } from '../src/vc-agent/normalizer.js';
 import {
   beginVcIngestionPass,
   beginVcPollingPass,
-  buildVcMeetingWorkflowPayload,
+  buildVcMeetingStatePayload,
   collectStableTranscriptItems,
   createVcMeetingSessionState,
   ingestNormalizedVcMeetingItems,
 } from '../src/vc-agent/meeting-state.js';
-import { buildVcMeetingTriggerRequest } from '../src/vc-agent/trigger.js';
+import { assertLarkCliJsonOk } from '../src/vc-agent/polling-source.js';
 
 describe('vc-agent normalizer and state', () => {
   it('normalizes polling meeting event items without relying on push event names', () => {
@@ -109,6 +109,12 @@ describe('vc-agent normalizer and state', () => {
       messageType: '1',
       text: 'push chat',
     });
+  });
+
+  it('treats exit-zero lark-cli ok=false payloads as failed API calls', () => {
+    expect(() => assertLarkCliJsonOk({ ok: true }, 'meeting text message send')).not.toThrow();
+    expect(() => assertLarkCliJsonOk({ ok: false, error: 'permission denied' }, 'meeting text message send'))
+      .toThrow('meeting text message send failed: permission denied');
   });
 
   it('drops repeated non-transcript items by item key', () => {
@@ -233,32 +239,23 @@ describe('vc-agent normalizer and state', () => {
     expect(state.ingestion.lastSeenEventTime).toBe(1_780_000_002_000);
   });
 
-  it('builds workflow trigger payloads for vc_meeting source', () => {
+  it('builds structured meeting-state payloads for vc_meeting source', () => {
     const state = createVcMeetingSessionState({
       meeting: { id: 'm_1', topic: 'Weekly' },
       attentionTargetOpenId: 'ou_target',
       notificationChatId: 'oc_notify',
     });
     beginVcPollingPass(state, new Date('2026-07-01T00:00:00.000Z'));
-    const payload = buildVcMeetingWorkflowPayload(state, [], { pageToken: 'next' });
-    const trigger = buildVcMeetingTriggerRequest({
-      larkAppId: 'cli_a',
-      workflowId: 'meeting-agent-attention',
-      chatId: 'oc_target',
-      payload,
-    });
+    const payload = buildVcMeetingStatePayload(state, [], { pageToken: 'next' });
 
-    expect(trigger.source.type).toBe('vc_meeting');
-    expect(trigger.target).toMatchObject({
-      kind: 'workflow',
-      botId: 'cli_a',
-      chatId: 'oc_target',
-      workflowId: 'meeting-agent-attention',
-    });
-    expect(trigger.envelope.format).toBe('botmux.vc-meeting.v1');
-    expect(trigger.envelope.payload).toMatchObject({
+    expect(payload).toMatchObject({
+      format: 'botmux.vc-meeting.v1',
       meeting: { id: 'm_1', topic: 'Weekly' },
       poll: { ordinal: 1, pageToken: 'next' },
+      session: {
+        attentionTargetOpenId: 'ou_target',
+        notificationChatId: 'oc_notify',
+      },
     });
   });
 

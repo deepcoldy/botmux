@@ -20,6 +20,12 @@ export interface JoinMeetingOptions extends LarkCliRunOptions {
   password?: string;
 }
 
+export interface SendMeetingMessageOptions extends LarkCliRunOptions {
+  meetingId: string;
+  text: string;
+  uuid?: string;
+}
+
 function parseCliJson(stdout: string): unknown {
   const trimmed = stdout.trim();
   if (!trimmed) return {};
@@ -43,6 +49,29 @@ export function runLarkCliJson(args: string[]): unknown {
     throw new Error(`lark-cli ${args.join(' ')} failed: ${stderr || stdout || `exit ${result.status}`}`);
   }
   return parseCliJson(result.stdout ?? '');
+}
+
+function firstErrorString(...values: unknown[]): string | undefined {
+  for (const v of values) {
+    if (typeof v === 'string' && v.trim()) return v.trim();
+    if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  }
+  return undefined;
+}
+
+export function assertLarkCliJsonOk(raw: unknown, context: string): void {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+  const obj = raw as Record<string, unknown>;
+  if (obj.ok !== false) return;
+  const message = firstErrorString(
+    obj.error,
+    obj.message,
+    obj.msg,
+    obj.error_msg,
+    obj.code,
+    obj.error_code,
+  );
+  throw new Error(`${context} failed: ${message ?? 'lark-cli returned ok=false'}`);
 }
 
 function withProfile(args: string[], profile?: string): string[] {
@@ -113,4 +142,25 @@ export function fetchMeetingEventsAsBot(opts: FetchMeetingEventsOptions): { raw:
   ], opts.profile);
   const raw = runLarkCliJson(args);
   return { raw, batch: normalizeVcMeetingEvents(raw, { meetingId: opts.meetingId, source: 'polling' }) };
+}
+
+export function sendMeetingTextMessageAsBot(opts: SendMeetingMessageOptions): { raw: unknown } {
+  const args = withProfile([
+    'vc',
+    '+meeting-message-send',
+    '--as',
+    'bot',
+    '--meeting-id',
+    opts.meetingId,
+    '--msg-type',
+    'text',
+    '--text',
+    opts.text,
+    ...(opts.uuid ? ['--uuid', opts.uuid] : []),
+    '--format',
+    'json',
+  ], opts.profile);
+  const raw = runLarkCliJson(args);
+  assertLarkCliJsonOk(raw, 'meeting text message send');
+  return { raw };
 }

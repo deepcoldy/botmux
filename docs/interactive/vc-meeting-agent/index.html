@@ -1,0 +1,1225 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Botmux 智能体会议能力说明</title>
+  <style>
+    /* ── 设计语汇 ─────────────────────────────────────────────────────────
+       主题取自产品自身的世界：飞书会议的实况字幕、30s 同步节拍、审批门。
+       结构性标签（眉题/编号/时间戳/状态）一律等宽字体 = 协议控制台的声部；
+       正文保持人文无衬线。深蓝黑面板只用于字幕流与代码。 */
+    :root {
+      --paper: #f2f5fa;
+      --card: #ffffff;
+      --ink: #16233b;
+      --ink-2: #3d4c66;
+      --muted: #6b7a94;
+      --faint: #94a1b8;
+      --line: #dde4ef;
+      --line-2: #cbd5e5;
+      --blue: #3364f0;
+      --blue-deep: #2249c4;
+      --blue-soft: #e8eefd;
+      --live: #0fa968;
+      --live-soft: #e2f6ec;
+      --gate: #b07a18;
+      --gate-soft: #fdf3dd;
+      --block: #d14343;
+      --block-soft: #fdeaea;
+      --panel: #101b33;
+      --panel-2: #1a2745;
+      --panel-ink: #dbe4f8;
+      --panel-muted: #8093b8;
+      --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      --sans: -apple-system, "PingFang SC", "HarmonyOS Sans SC", "Noto Sans CJK SC", "Microsoft YaHei", system-ui, sans-serif;
+      --radius: 10px;
+      --shadow: 0 1px 2px rgba(22, 35, 59, 0.05), 0 10px 32px rgba(22, 35, 59, 0.07);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--sans);
+      font-size: 15px;
+      line-height: 1.75;
+    }
+    button, select, input, textarea { font: inherit; }
+    code {
+      font-family: var(--mono);
+      font-size: 0.86em;
+      background: var(--blue-soft);
+      color: var(--blue-deep);
+      border-radius: 4px;
+      padding: 1px 5px;
+    }
+    ::selection { background: rgba(51, 100, 240, 0.18); }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 288px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    /* ── 侧栏：深蓝黑锚定 ── */
+    .side {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: auto;
+      background: var(--panel);
+      color: var(--panel-ink);
+      padding: 30px 22px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+    }
+    .brand .kicker {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      color: #6f8fe8;
+      margin-bottom: 10px;
+    }
+    .brand h1 {
+      margin: 0 0 8px;
+      font-size: 21px;
+      line-height: 1.3;
+      font-weight: 700;
+      color: #f2f5fc;
+    }
+    .brand p {
+      margin: 0;
+      color: var(--panel-muted);
+      font-size: 12.5px;
+      line-height: 1.65;
+    }
+    .nav { display: grid; gap: 2px; }
+    .nav a {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      color: var(--panel-muted);
+      text-decoration: none;
+      border-radius: 7px;
+      padding: 8px 10px;
+      font-size: 13.5px;
+      border-left: 2px solid transparent;
+      transition: color 120ms ease, background 120ms ease;
+    }
+    .nav a i {
+      font-style: normal;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: #4d629a;
+      min-width: 18px;
+    }
+    .nav a:hover { color: #e6ecfa; background: rgba(255, 255, 255, 0.05); }
+    .nav a.active {
+      color: #ffffff;
+      background: rgba(51, 100, 240, 0.22);
+      border-left-color: var(--blue);
+    }
+    .nav a.active i { color: #8fabf5; }
+    .side-live {
+      margin-top: auto;
+      border: 1px solid #223154;
+      border-radius: 9px;
+      padding: 12px;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      color: var(--panel-muted);
+      display: grid;
+      gap: 6px;
+    }
+    .side-live .row { display: flex; align-items: center; gap: 8px; }
+    .side-live b { color: #6fe0ab; font-weight: 600; }
+    .side-note {
+      color: #56688f;
+      font-size: 11.5px;
+      line-height: 1.7;
+    }
+
+    main { min-width: 0; }
+
+    /* ── Hero ── */
+    .hero {
+      padding: 52px clamp(26px, 5vw, 68px) 0;
+      background:
+        radial-gradient(1100px 420px at 85% -10%, rgba(51, 100, 240, 0.10), transparent 62%),
+        linear-gradient(180deg, #eef2f9, var(--paper));
+      border-bottom: 1px solid var(--line);
+    }
+    .hero-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(340px, 0.95fr);
+      gap: clamp(24px, 4vw, 56px);
+      align-items: center;
+      padding-bottom: 44px;
+    }
+    .hero-tags { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+    .tag {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.03em;
+      color: var(--blue-deep);
+      background: var(--blue-soft);
+      border: 1px solid rgba(51, 100, 240, 0.25);
+      border-radius: 999px;
+      padding: 4px 10px;
+      white-space: nowrap;
+    }
+    .hero h2 {
+      margin: 0;
+      font-size: clamp(30px, 3.6vw, 44px);
+      line-height: 1.24;
+      font-weight: 800;
+      letter-spacing: 0.01em;
+    }
+    .hero h2 em {
+      font-style: normal;
+      color: var(--blue);
+    }
+    .hero .lede {
+      margin: 18px 0 0;
+      max-width: 620px;
+      color: var(--ink-2);
+      font-size: 15.5px;
+    }
+    .hero-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 8px;
+      padding: 10px 18px;
+      min-height: 40px;
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      border: 1px solid var(--line-2);
+      background: var(--card);
+      color: var(--ink);
+      transition: transform 120ms ease, box-shadow 120ms ease;
+    }
+    .btn:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(22, 35, 59, 0.10); }
+    .btn.primary {
+      background: var(--blue);
+      border-color: var(--blue);
+      color: #fff;
+      box-shadow: 0 8px 22px rgba(51, 100, 240, 0.28);
+    }
+    .hero-stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 26px;
+      margin-top: 30px;
+      font-family: var(--mono);
+    }
+    .hero-stats .stat b {
+      display: block;
+      font-size: 21px;
+      font-weight: 700;
+      color: var(--ink);
+    }
+    .hero-stats .stat span {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+
+    /* ── 签名元素：监听群实况面板 ── */
+    .live-panel {
+      background: var(--panel);
+      border-radius: 14px;
+      box-shadow: 0 24px 60px rgba(16, 27, 51, 0.35);
+      overflow: hidden;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      color: var(--panel-ink);
+    }
+    .live-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 13px 16px;
+      background: var(--panel-2);
+      border-bottom: 1px solid #24345c;
+    }
+    .rec {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--live);
+      flex: none;
+      animation: rec-pulse 2.2s ease-in-out infinite;
+    }
+    @keyframes rec-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(15, 169, 104, 0.55); }
+      55% { box-shadow: 0 0 0 6px rgba(15, 169, 104, 0); }
+    }
+    .live-head .title { color: #eef2fc; font-weight: 600; }
+    .live-head .meet-no { color: var(--panel-muted); font-size: 11.5px; }
+    .live-head .beat {
+      margin-left: auto;
+      text-align: right;
+      font-size: 10.5px;
+      color: var(--panel-muted);
+    }
+    .beat-bar {
+      width: 74px;
+      height: 3px;
+      margin-top: 5px;
+      border-radius: 2px;
+      background: #26365e;
+      overflow: hidden;
+    }
+    .beat-bar b {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: linear-gradient(90deg, var(--blue), #6fe0ab);
+      animation: beat 8s linear infinite;
+    }
+    @keyframes beat { from { width: 0; } to { width: 100%; } }
+    .live-body { padding: 14px 16px 16px; display: grid; gap: 9px; }
+    .ln {
+      display: grid;
+      grid-template-columns: 44px minmax(0, 1fr);
+      gap: 10px;
+      align-items: baseline;
+      opacity: 0;
+      transform: translateY(6px);
+      animation: ln-in 0.5s ease forwards;
+    }
+    @keyframes ln-in { to { opacity: 1; transform: none; } }
+    .ln .t { color: #4d629a; font-size: 11px; }
+    .ln .who { color: #9db4ef; }
+    .ln .who.agent { color: #6fe0ab; }
+    .ln .msg { color: var(--panel-ink); }
+    .ln .msg .at { color: #f0b64f; }
+    .ln.sys .msg { color: #f0b64f; }
+    .ln.gate .msg { color: #8fe6bd; }
+    .ln:nth-child(1) { animation-delay: 0.4s; }
+    .ln:nth-child(2) { animation-delay: 1.5s; }
+    .ln:nth-child(3) { animation-delay: 2.7s; }
+    .ln:nth-child(4) { animation-delay: 3.5s; }
+    .ln:nth-child(5) { animation-delay: 4.9s; }
+    .ln:nth-child(6) { animation-delay: 6.1s; }
+    .live-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 11px 16px;
+      border-top: 1px solid #24345c;
+      font-size: 11px;
+      color: var(--panel-muted);
+    }
+    .live-foot b { color: #6fe0ab; font-weight: 600; }
+
+    /* ── 主路径横带 ── */
+    .path {
+      list-style: none;
+      margin: 0 calc(clamp(26px, 5vw, 68px) * -1);
+      padding: 22px clamp(26px, 5vw, 68px) 26px;
+      border-top: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.6);
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 18px;
+      counter-reset: path;
+    }
+    .path li { counter-increment: path; position: relative; min-width: 0; }
+    .path li::before {
+      content: "0" counter(path);
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--blue);
+      display: block;
+      margin-bottom: 6px;
+    }
+    .path li::after {
+      content: "";
+      position: absolute;
+      top: 7px;
+      left: 30px;
+      right: 6px;
+      height: 1px;
+      background: var(--line-2);
+    }
+    .path li:last-child::after { display: none; }
+    .path strong { display: block; font-size: 13.5px; font-weight: 700; }
+    .path span { display: block; color: var(--muted); font-size: 12px; line-height: 1.6; margin-top: 3px; }
+
+    /* ── 正文 ── */
+    .content { padding: 46px clamp(26px, 5vw, 68px) 72px; max-width: 1240px; }
+    section { scroll-margin-top: 20px; margin: 0 0 64px; }
+    .section-head {
+      display: grid;
+      grid-template-columns: 86px minmax(0, 1fr) auto;
+      gap: 18px;
+      align-items: start;
+      margin-bottom: 22px;
+      padding-bottom: 16px;
+      border-bottom: 2px solid var(--ink);
+    }
+    .sec-mark { padding-top: 6px; }
+    .sec-mark .no {
+      display: block;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--faint);
+    }
+    .sec-mark .phase {
+      display: inline-block;
+      margin-top: 6px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--blue-deep);
+      background: var(--blue-soft);
+      border-radius: 4px;
+      padding: 2px 7px;
+    }
+    .section-head h3 {
+      margin: 0;
+      font-size: clamp(24px, 2.6vw, 32px);
+      line-height: 1.2;
+      font-weight: 800;
+    }
+    .section-head .sub {
+      margin: 8px 0 0;
+      color: var(--muted);
+      max-width: 760px;
+      font-size: 14px;
+    }
+    .section-side { align-self: end; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--card);
+      color: var(--ink-2);
+      font-family: var(--mono);
+      font-size: 11.5px;
+      border: 1px solid var(--line-2);
+      white-space: nowrap;
+    }
+
+    .grid { display: grid; gap: 14px; }
+    .grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .card {
+      background: var(--card);
+      border-radius: var(--radius);
+      padding: 18px;
+      box-shadow: var(--shadow);
+      min-width: 0;
+    }
+    .card h4 { margin: 0 0 8px; font-size: 15.5px; font-weight: 700; }
+    .card p { margin: 0; color: var(--ink-2); font-size: 13.5px; }
+    .card ul, .card ol { margin: 10px 0 0; padding-left: 18px; color: var(--ink-2); font-size: 13.5px; }
+    .card li + li { margin-top: 7px; }
+    .card li::marker { color: var(--blue); }
+
+    /* 状态章：等宽小写声部 */
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 9px;
+      border-radius: 5px;
+      font-family: var(--mono);
+      font-size: 11px;
+      white-space: nowrap;
+      border: 1px solid transparent;
+    }
+    .status::before { content: "●"; font-size: 7px; }
+    .status.ok { color: #0c7f50; background: var(--live-soft); }
+    .status.warn { color: #8a5d0d; background: var(--gate-soft); }
+    .status.info { color: var(--blue-deep); background: var(--blue-soft); }
+    .status.req { color: #fff; background: var(--ink); }
+    .status.req::before { content: "◆"; }
+    .status.opt { color: var(--muted); background: transparent; border-color: var(--line-2); }
+    .status.opt::before { content: "◇"; }
+
+    /* ── 前置依赖 ── */
+    .deps-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .segmented {
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      padding: 4px;
+      background: #e6ebf4;
+      border-radius: 9px;
+    }
+    .segmented button {
+      border: 0;
+      background: transparent;
+      border-radius: 6px;
+      padding: 7px 14px;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .segmented button.active {
+      background: var(--card);
+      color: var(--ink);
+      box-shadow: 0 1px 4px rgba(22, 35, 59, 0.12);
+    }
+    .dep-list {
+      background: var(--card);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .dep {
+      display: grid;
+      grid-template-columns: minmax(170px, 0.7fr) minmax(0, 1.6fr) auto;
+      gap: 18px;
+      align-items: start;
+      padding: 17px 20px;
+    }
+    .dep + .dep { border-top: 1px solid var(--line); }
+    .dep.hidden { display: none; }
+    .dep strong { display: block; font-size: 14px; font-weight: 700; }
+    .dep small { color: var(--muted); font-size: 12px; }
+    .dep .desc { color: var(--ink-2); font-size: 13.5px; }
+    .dep .flags { display: grid; gap: 6px; justify-items: end; }
+
+    /* ── 运行流程 ── */
+    .scenario {
+      display: grid;
+      grid-template-columns: 232px minmax(0, 1fr);
+      gap: 20px;
+      align-items: start;
+    }
+    .scenario-menu { display: grid; gap: 4px; position: sticky; top: 18px; }
+    .scenario-menu button {
+      text-align: left;
+      border: 0;
+      border-left: 2px solid var(--line-2);
+      background: transparent;
+      border-radius: 0 7px 7px 0;
+      padding: 10px 14px;
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 13.5px;
+      font-weight: 600;
+    }
+    .scenario-menu button:hover { color: var(--ink); background: rgba(255, 255, 255, 0.7); }
+    .scenario-menu button.active {
+      border-left-color: var(--blue);
+      background: var(--card);
+      color: var(--blue-deep);
+      box-shadow: var(--shadow);
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .timeline { position: relative; display: grid; gap: 10px; }
+    .timeline::before {
+      content: "";
+      position: absolute;
+      left: 15px;
+      top: 12px;
+      bottom: 12px;
+      width: 2px;
+      background: linear-gradient(180deg, var(--blue), var(--line-2));
+    }
+    .event {
+      position: relative;
+      display: grid;
+      grid-template-columns: 32px minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .dot {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: var(--card);
+      border: 2px solid var(--blue);
+      display: grid;
+      place-items: center;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--blue-deep);
+      z-index: 1;
+    }
+    .event-body {
+      background: var(--card);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      box-shadow: var(--shadow);
+    }
+    .event-body h4 { margin: 0 0 5px; font-size: 14.5px; font-weight: 700; }
+    .event-body p { margin: 0; color: var(--ink-2); font-size: 13.5px; }
+
+    /* ── 功能卡 ── */
+    .feature { position: relative; padding-top: 16px; }
+    .feature .status { position: absolute; top: 14px; right: 14px; }
+    .feature h4 { margin-top: 6px; padding-right: 70px; }
+
+    /* ── 提示带 ── */
+    .callout {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+      border-radius: var(--radius);
+      padding: 15px 18px;
+      font-size: 13.5px;
+      line-height: 1.7;
+    }
+    .callout .k {
+      font-family: var(--mono);
+      font-size: 11px;
+      border-radius: 4px;
+      padding: 2px 8px;
+      margin-top: 2px;
+      white-space: nowrap;
+    }
+    .callout.danger { background: var(--block-soft); color: #6e2323; border-left: 4px solid var(--block); }
+    .callout.danger .k { background: var(--block); color: #fff; }
+
+    /* ── checklist / code ── */
+    .copy-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .copy-row h4 { margin: 0; }
+    .copy-btn {
+      border: 1px solid var(--line-2);
+      background: var(--card);
+      border-radius: 7px;
+      padding: 6px 12px;
+      cursor: pointer;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--ink-2);
+    }
+    .copy-btn:hover { border-color: var(--blue); color: var(--blue-deep); }
+    .progress {
+      width: 100%;
+      height: 6px;
+      background: #e6ebf4;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .progress b {
+      display: block;
+      width: 0;
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--blue), var(--live));
+      transition: width 220ms ease;
+    }
+    .checklist { display: grid; gap: 6px; }
+    .check {
+      display: grid;
+      grid-template-columns: 24px minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+      padding: 11px 12px;
+      border-radius: 8px;
+      background: transparent;
+      cursor: pointer;
+      transition: background 120ms ease;
+    }
+    .check:hover { background: var(--blue-soft); }
+    .check input {
+      width: 17px;
+      height: 17px;
+      margin-top: 3px;
+      accent-color: var(--blue);
+      cursor: pointer;
+    }
+    .check strong { font-size: 13.5px; font-weight: 700; }
+    .check span { display: block; color: var(--muted); font-size: 12.5px; }
+    .check:has(input:checked) strong { color: var(--faint); text-decoration: line-through; text-decoration-color: var(--line-2); }
+    .code {
+      background: var(--panel);
+      color: #cfe0f6;
+      border-radius: var(--radius);
+      padding: 16px;
+      overflow: auto;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      line-height: 1.6;
+      white-space: pre;
+      margin: 0;
+    }
+
+    /* ── FAQ ── */
+    details {
+      background: var(--card);
+      border-radius: var(--radius);
+      padding: 4px 18px;
+      box-shadow: var(--shadow);
+    }
+    details + details { margin-top: 10px; }
+    summary {
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 14.5px;
+      padding: 12px 0;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    summary::-webkit-details-marker { display: none; }
+    summary::before {
+      content: "+";
+      font-family: var(--mono);
+      font-size: 15px;
+      color: var(--blue);
+      width: 22px;
+      height: 22px;
+      flex: none;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--line-2);
+      border-radius: 6px;
+      transition: transform 140ms ease;
+    }
+    details[open] summary::before { content: "−"; transform: rotate(180deg); }
+    details p { margin: 0 0 14px 34px; color: var(--ink-2); font-size: 13.5px; }
+
+    .footer {
+      border-top: 1px solid var(--line);
+      padding: 24px clamp(26px, 5vw, 68px);
+      color: var(--faint);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .ln { opacity: 1; transform: none; animation: none; }
+      .rec { animation: none; }
+      .beat-bar b { animation: none; width: 62%; }
+      .btn:hover { transform: none; }
+    }
+
+    @media (max-width: 1080px) {
+      .hero-grid { grid-template-columns: 1fr; }
+      .path { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+      .path li::after { display: none; }
+      .grid.cols-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 980px) {
+      .layout { grid-template-columns: 1fr; }
+      .side { position: relative; height: auto; }
+      .side-live { display: none; }
+      .nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 640px) {
+      .nav { grid-template-columns: 1fr; }
+      .hero { padding-top: 34px; }
+      .content { padding-top: 30px; }
+      .section-head { grid-template-columns: 1fr; gap: 6px; }
+      .sec-mark { display: flex; gap: 10px; align-items: center; padding-top: 0; }
+      .sec-mark .phase { margin-top: 0; }
+      .section-side { display: none; }
+      .grid.cols-2, .grid.cols-3 { grid-template-columns: 1fr; }
+      .scenario { grid-template-columns: 1fr; }
+      .scenario-menu { position: static; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .path { grid-template-columns: 1fr; }
+      .dep { grid-template-columns: 1fr; gap: 8px; }
+      .dep .flags { justify-items: start; grid-auto-flow: column; }
+      .segmented { width: 100%; }
+      .segmented button { flex: 1 1 auto; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="side">
+      <div class="brand">
+        <div class="kicker">BOTMUX · VC AGENT</div>
+        <h1>智能体会议能力说明</h1>
+        <p>前置依赖、运行链路、权限门槛、交互体验和 dogfood 状态的交互版说明。</p>
+      </div>
+      <nav class="nav" aria-label="文档导航">
+        <a href="#overview"><i>01</i>总览</a>
+        <a href="#deps"><i>02</i>前置依赖</a>
+        <a href="#flows"><i>03</i>运行流程</a>
+        <a href="#features"><i>04</i>Botmux 功能</a>
+        <a href="#safety"><i>05</i>安全与审批</a>
+        <a href="#ops"><i>06</i>配置与验证</a>
+        <a href="#faq"><i>07</i>常见问题</a>
+      </nav>
+      <div class="side-live" aria-hidden="true">
+        <div class="row"><span class="rec"></span><b>dogfood 已跑通</b></div>
+        <div>入会 · 建群 · 注入 · 弹幕 · 语音 M0 · 恢复</div>
+      </div>
+      <div class="side-note">
+        版本：2026-07-07。基于最近一轮开发、真机会测和设计文档整理。实时会议内容属于不可信输入，默认不长期落盘。
+      </div>
+    </aside>
+
+    <main>
+      <header class="hero" id="overview">
+        <div class="hero-grid">
+          <div>
+            <div class="hero-tags">
+              <span class="tag">显式邀请优先</span>
+              <span class="tag">审批默认从严</span>
+              <span class="tag">监听和处理分离</span>
+            </div>
+            <h2>让 Bot 进入飞书会议，把会中信息变成<em>可处理的智能体上下文</em>。</h2>
+            <p class="lede">当前能力已经覆盖：会议 Bot 入会、实时字幕/聊天同步、监听群工作台、agent 选择与注入、会中弹幕发送、实时语音 M0、输出审批、跨 daemon 路由、重启恢复和全局 kill-switch。</p>
+            <div class="hero-actions">
+              <a class="btn primary" href="#deps">查看前置依赖</a>
+              <a class="btn" href="#ops">打开上线清单</a>
+            </div>
+            <div class="hero-stats">
+              <div class="stat"><b>4</b><span>核心事件链路</span></div>
+              <div class="stat"><b>30s</b><span>默认监听/注入节奏</span></div>
+              <div class="stat"><b>3</b><span>输出策略 禁用/审批/允许</span></div>
+            </div>
+          </div>
+          <div class="live-panel" role="img" aria-label="监听群实况示意：字幕同步、fast signal 注入与输出审批">
+            <div class="live-head">
+              <span class="rec"></span>
+              <span class="title">正在监听</span>
+              <span class="meet-no">会议 651803684</span>
+              <span class="beat">同步节拍 30s<span class="beat-bar"><b></b></span></span>
+            </div>
+            <div class="live-body">
+              <div class="ln"><span class="t">00:12</span><span class="msg"><span class="who">滕鹏飞</span> · 这轮先验证选择卡确认按钮的交互</span></div>
+              <div class="ln"><span class="t">00:19</span><span class="msg"><span class="who">滕鹏飞</span> · <span class="at">@claude-loopy</span> 记录一下这个结论</span></div>
+              <div class="ln sys"><span class="t">00:19</span><span class="msg">⚡ fast signal → 跳过节拍，立即注入 agent</span></div>
+              <div class="ln"><span class="t">00:21</span><span class="msg"><span class="who agent">claude-loopy</span> · 已记录。确认卡：暂存 → 确认后生效。</span></div>
+              <div class="ln gate"><span class="t">00:47</span><span class="msg">输出审批 · 会中弹幕 → 已批准，发往会议聊天</span></div>
+              <div class="ln"><span class="t">00:48</span><span class="msg"><span class="who agent">bot@会议</span> · 结论已同步，详见监听群。</span></div>
+            </div>
+            <div class="live-foot">
+              <span>listener group · chat-scope session</span>
+              <span>主路径 <b>dogfood 已跑通</b></span>
+            </div>
+          </div>
+        </div>
+        <ol class="path" aria-label="主路径">
+          <li><strong>邀请 Bot 入会</strong><span>用户在会议里手动邀请监听 bot，这是显式授权。</span></li>
+          <li><strong>创建监听群</strong><span>bot join 后新建或复用监听群，同步字幕/聊天/参会状态。</span></li>
+          <li><strong>选择处理 agent</strong><span>卡片选择 agent 与同步间隔，也可只监听不处理。</span></li>
+          <li><strong>注入同一会话</strong><span>会议增量进入目标 agent 的 chat-scope 会话，群里 @agent 可接上下文。</span></li>
+          <li><strong>输出审批</strong><span>agent 想发会中弹幕或语音时，授权人先审后发。</span></li>
+        </ol>
+      </header>
+
+      <div class="content">
+        <section id="deps">
+          <div class="section-head">
+            <div class="sec-mark"><span class="no">02</span><span class="phase">会前</span></div>
+            <div>
+              <h3>前置依赖</h3>
+              <p class="sub">分成应用权限、事件订阅、会议侧开关、botmux 配置和真实验证五类。缺任一类时，症状通常不是代码报错，而是“没有事件”“入会失败”或“读不到 transcript”。</p>
+            </div>
+            <div class="section-side"><span class="pill">保存配置时会做部分权限校验</span></div>
+          </div>
+
+          <div class="deps-toolbar">
+            <div class="segmented" role="tablist" aria-label="依赖过滤">
+              <button class="active" data-dep-filter="all">全部</button>
+              <button data-dep-filter="required">必需</button>
+              <button data-dep-filter="optional">可选</button>
+              <button data-dep-filter="external">外部</button>
+            </div>
+            <span class="pill" id="depCount">0 项</span>
+          </div>
+
+          <div class="dep-list" id="depList">
+            <div class="dep" data-kind="required external">
+              <div><strong>VC 应用权限</strong><small>开放平台权限并发布版本</small></div>
+              <div class="desc">至少需要 <code>vc:meeting.bot.join:write</code>、<code>vc:meeting.meetingevent:read</code>、<code>vc:meeting.message:write</code>。实时语音另需 <code>vc:meeting.bot.realtime:write</code>。</div>
+              <div class="flags"><span class="status req">必需</span><span class="status ok">已验证</span></div>
+            </div>
+            <div class="dep" data-kind="required external">
+              <div><strong>事件订阅</strong><small>开放平台事件订阅页</small></div>
+              <div class="desc">订阅并发布 <code>vc.bot.meeting_invited_v1</code>、<code>vc.bot.meeting_activity_v1</code>、<code>vc.bot.meeting_ended_v1</code>。用户态 <code>participant_meeting_joined</code> 已降级为后续能力。</div>
+              <div class="flags"><span class="status req">必需</span><span class="status ok">已验证</span></div>
+            </div>
+            <div class="dep" data-kind="required external">
+              <div><strong>会议侧开关</strong><small>每场会议的安全条件</small></div>
+              <div class="desc">会议必须允许智能体加入。实时语音还需要打开“允许 AI 智能体发言”。AI Summary/会议智能能力开关也应在会侧开启。</div>
+              <div class="flags"><span class="status req">必需</span><span class="status warn">会侧门槛</span></div>
+            </div>
+            <div class="dep" data-kind="required">
+              <div><strong>监听 bot 身份</strong><small>Dashboard 全局配置</small></div>
+              <div class="desc">全局选择一个用于会议监听的 bot app。保存时校验该 bot 启用 <code>vcMeetingAgent</code>、配置 <code>larkCliProfile</code> 并具备 VC 权限。</div>
+              <div class="flags"><span class="status req">必需</span><span class="status ok">已接入</span></div>
+            </div>
+            <div class="dep" data-kind="required">
+              <div><strong>lark-cli VC 能力</strong><small>入会、读事件、发会中消息</small></div>
+              <div class="desc">使用 <code>vc +meeting-join</code>、<code>vc +meeting-events</code>、<code>vc +meeting-message-send</code>。会中弹幕发送以 requestId 作为 uuid 幂等键。</div>
+              <div class="flags"><span class="status req">必需</span><span class="status ok">已验证</span></div>
+            </div>
+            <div class="dep" data-kind="required">
+              <div><strong>真实 TAT 读门</strong><small>必须真会有人说话/发消息</small></div>
+              <div class="desc">入会后用应用身份读到真实 <code>transcript_received</code> 或 <code>chat_received</code>，不是只有 meeting metadata，也不是 <code>app_scope_not_applied</code>。</div>
+              <div class="flags"><span class="status req">必需</span><span class="status ok">真机通过</span></div>
+            </div>
+            <div class="dep" data-kind="optional">
+              <div><strong>实时语音协议</strong><small>Frontier + meeting_realtime protobuf</small></div>
+              <div class="desc">实时语音通过 websocket endpoint、session.created 握手、100ms PCM 分帧和单一 daemon voice session 发声。</div>
+              <div class="flags"><span class="status opt">可选</span><span class="status info">M0 可用</span></div>
+            </div>
+            <div class="dep" data-kind="optional">
+              <div><strong>用户态主动监听</strong><small>用户 OAuth 订阅/轮询</small></div>
+              <div class="desc">用于“用户一进会就主动询问是否监听”。因增量价值低、隐私/授权成本高，当前不作为 MVP。</div>
+              <div class="flags"><span class="status opt">可选</span><span class="status warn">暂缓</span></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="flows">
+          <div class="section-head">
+            <div class="sec-mark"><span class="no">03</span><span class="phase">会中</span></div>
+            <div>
+              <h3>运行流程</h3>
+              <p class="sub">当前主路径是手动邀请 Bot。agent 消费、会中弹幕和语音都挂在同一场会议 session 上，结束后统一收尾。</p>
+            </div>
+          </div>
+
+          <div class="scenario">
+            <div class="scenario-menu" aria-label="流程场景">
+              <button class="active" data-scenario="manual">手动邀请监听</button>
+              <button data-scenario="consumer">选择 agent 处理</button>
+              <button data-scenario="text">会中弹幕输出</button>
+              <button data-scenario="voice">实时语音输出</button>
+              <button data-scenario="restart">重启恢复</button>
+            </div>
+            <div>
+              <div class="tab-panel active" data-scenario-panel="manual">
+                <div class="timeline">
+                  <div class="event"><div class="dot">1</div><div class="event-body"><h4>用户邀请 bot 入会</h4><p><code>meeting_invited</code> 到达 daemon，视为显式授权，不再二次私聊确认。</p></div></div>
+                  <div class="event"><div class="dot">2</div><div class="event-body"><h4>bot 用指定 profile join</h4><p>join 必须绑定当前 listener bot 的 <code>larkCliProfile</code>，禁止落到 lark-cli 默认 profile。</p></div></div>
+                  <div class="event"><div class="dot">3</div><div class="event-body"><h4>创建监听群</h4><p>监听群用于同步稳定字幕、会中聊天、参会变化、输出审批卡和 agent 讨论。</p></div></div>
+                  <div class="event"><div class="dot">4</div><div class="event-body"><h4>activity ingest</h4><p>push 和 polling fallback 写入同一份 per-meeting state，按 sentence_id/message_id 去重。</p></div></div>
+                  <div class="event"><div class="dot">5</div><div class="event-body"><h4>ended 收尾</h4><p>最终 flush、发送结束记录、清 runtime record，并用 tombstone 拦住迟到 activity 复活 session。</p></div></div>
+                </div>
+              </div>
+              <div class="tab-panel" data-scenario-panel="consumer">
+                <div class="grid cols-2">
+                  <div class="card"><h4>卡片选择</h4><p>监听群发 agent 选择卡。下拉只暂存，点击“确认”才生效；可选择只监听，也可选 30/60/120 秒同步间隔。</p></div>
+                  <div class="card"><h4>跨 daemon 注入</h4><p>若目标 agent 不在会议 bot daemon 内，会议 daemon 调目标 daemon 的 <code>/api/trigger</code>，保证注入和用户 @agent 落入同一个 chat-scope session。</p></div>
+                  <div class="card"><h4>单 tick 同拍</h4><p>同一个 timer 周期先 flush 监听群，再评估 agent 注入，避免群消息和 agent 上下文存在固定相位差。</p></div>
+                  <div class="card"><h4>catch-up</h4><p>用户在监听群 @agent 时，会先 best-effort 拉一次最新稳定会议内容，再放行用户 turn。</p></div>
+                </div>
+              </div>
+              <div class="tab-panel" data-scenario-panel="text">
+                <div class="card">
+                  <h4>会中弹幕不是监听群消息</h4>
+                  <p>agent 通过 <code>botmux vc-agent request-output --channel text</code> 提交请求，daemon 发审批卡。授权人批准后走 <code>lark-cli vc +meeting-message-send --msg-type text</code>，消息出现在会议聊天/弹幕里。</p>
+                  <ul>
+                    <li>默认需要审批；本场可切到自动文本。</li>
+                    <li>失败时卡片展示真实错误；<code>ok:false</code> 不会被误判成功。</li>
+                    <li>发送 uuid 使用 requestId，避免重复发送。</li>
+                  </ul>
+                </div>
+              </div>
+              <div class="tab-panel" data-scenario-panel="voice">
+                <div class="card">
+                  <h4>实时语音由 daemon 统一执行</h4>
+                  <p>agent 只能提交语音请求，不能直接连实时音频 WS。授权人批准后，daemon 复用会议 session 持有的 voice session，合成 PCM 后按 100ms 帧推给会议。</p>
+                  <ul>
+                    <li>需要 <code>vc:meeting.bot.realtime:write</code> 和会议侧“允许 AI 智能体发言”。</li>
+                    <li>实时协议使用 session.create 握手，等 <code>session.created</code> 后才推音频。</li>
+                    <li>失败可降级成会中弹幕或监听群文本，取决于审批选择。</li>
+                  </ul>
+                </div>
+              </div>
+              <div class="tab-panel" data-scenario-panel="restart">
+                <div class="grid cols-2">
+                  <div class="card"><h4>runtime store</h4><p>已开始监听的会议会保存 <code>meetingId</code>、<code>listenerChatId</code>、consumer 选择、输出策略和同步间隔。</p></div>
+                  <div class="card"><h4>恢复策略</h4><p>daemon 重启后恢复监听路由和 timers；不恢复待审批 nonce。全局开关关闭时跳过恢复。</p></div>
+                  <div class="card"><h4>重启边界</h4><p>已 ACK 未 flush 的最近窗口内容可能丢失；后续可通过 restore-time polling reconcile 补偿。</p></div>
+                  <div class="card"><h4>僵尸保护</h4><p>ended 事件和 close 都会移除 runtime record；迟到 activity 用 ended tombstone 拦截。</p></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="features">
+          <div class="section-head">
+            <div class="sec-mark"><span class="no">04</span><span class="phase">工作台</span></div>
+            <div>
+              <h3>Botmux 功能介绍</h3>
+              <p class="sub">这不是单纯转发 VC 事件，而是一套会议工作台：监听、同步、选择 agent、上下文注入、输出审批和可运维配置。</p>
+            </div>
+          </div>
+
+          <div class="grid cols-3">
+            <div class="card feature"><span class="status ok">已实现</span><h4>会议监听群</h4><p>每场会议创建或复用一个群，把稳定字幕、聊天、参会/共享状态和结束状态发进去。</p></div>
+            <div class="card feature"><span class="status ok">已实现</span><h4>Agent Consumer</h4><p>在监听群卡片选择处理 agent，会议内容按增量注入同一 chat-scope session。</p></div>
+            <div class="card feature"><span class="status ok">已实现</span><h4>跨 daemon 路由</h4><p>会议 bot 和处理 agent 可以在不同 PM2 daemon，注入会转发到目标 agent 自己的 daemon。</p></div>
+            <div class="card feature"><span class="status ok">已实现</span><h4>可配置节奏</h4><p>默认 30 秒单 tick；卡片可选择 30/60/120 秒。catch-up 和 fast signal 可提前注入。</p></div>
+            <div class="card feature"><span class="status ok">已实现</span><h4>会中弹幕</h4><p>审批通过后，bot 以会议身份向会议聊天发送文本消息，不是发到监听群。</p></div>
+            <div class="card feature"><span class="status info">M0</span><h4>实时语音</h4><p>支持 TTS PCM 到会议实时音频链路。默认由审批卡控制，避免 agent 随意开口。</p></div>
+            <div class="card feature"><span class="status ok">已实现</span><h4>全局开关</h4><p>Dashboard Settings 可一键关闭本机新会议监听；进行中的会议自然收尾，重启后不会恢复。</p></div>
+            <div class="card feature"><span class="status ok">已实现</span><h4>监听 bot 身份</h4><p>全局指定哪个 bot app 负责监听。保存时校验 VC 权限、larkCliProfile 和 bot 级开关。</p></div>
+            <div class="card feature"><span class="status warn">后续</span><h4>最终总结</h4><p>会议结束后的全量总结应由 rolling summary 或全量 transcript 输入驱动，不用空 run 伪装完成。</p></div>
+          </div>
+        </section>
+
+        <section id="safety">
+          <div class="section-head">
+            <div class="sec-mark"><span class="no">05</span><span class="phase">输出门</span></div>
+            <div>
+              <h3>安全与审批</h3>
+              <p class="sub">会议内容属于不可信输入。防护重点不是让 agent “更听话”，而是把会中对外动作收敛到 daemon 审批门。</p>
+            </div>
+          </div>
+
+          <div class="grid cols-2">
+            <div class="card">
+              <h4>默认输出策略</h4>
+              <ul>
+                <li>文本：默认审批，可在本场切到自动文本。</li>
+                <li>语音：默认禁止或审批；不建议在 dogfood 期开放免审。</li>
+                <li>权限只是意愿，实际能力还受 scope、会议侧开关和 endpoint 可用性硬门约束。</li>
+              </ul>
+            </div>
+            <div class="card">
+              <h4>只认授权用户的指令</h4>
+              <ul>
+                <li>会议转写按 speaker 标注“授权用户/仅上下文”。</li>
+                <li>非授权用户说出的命令只作为上下文，不作为 agent 指令执行。</li>
+                <li>声纹归因不是密码学保证，所以审批卡仍是外发动作的硬门。</li>
+              </ul>
+            </div>
+            <div class="card">
+              <h4>审批卡</h4>
+              <ul>
+                <li>同意语音、改发弹幕、拒绝。</li>
+                <li>单 channel 同时只保留一个 pending，请求超时自动拒绝。</li>
+                <li>审批结果会回注给 agent，避免重复请求。</li>
+              </ul>
+            </div>
+            <div class="card">
+              <h4>隐私边界</h4>
+              <ul>
+                <li>raw transcript/chat 默认不长期落盘。</li>
+                <li>监听群是会议内容可见面，群成员必须明确。</li>
+                <li>主动 ambient 监听暂缓，避免每用户 OAuth 和隐私撤销复杂度。</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="callout danger" style="margin-top:14px">
+            <span class="k">边界</span>
+            <div>daemon 门能挡住“会场话术注入 agent 后经正常工具面发声/发弹幕”的主威胁；它不是进程级沙箱。若 agent 进程被视为完全不可信，需要另做沙箱和密钥隔离。</div>
+          </div>
+        </section>
+
+        <section id="ops">
+          <div class="section-head">
+            <div class="sec-mark"><span class="no">06</span><span class="phase">上线</span></div>
+            <div>
+              <h3>配置与验证</h3>
+              <p class="sub">上线前按 checklist 走一遍。此清单保存在浏览器本地，只用于当前阅读进度。</p>
+            </div>
+            <div class="section-side"><button class="copy-btn" id="resetChecks" type="button">重置勾选</button></div>
+          </div>
+
+          <div class="grid cols-2">
+            <div class="card">
+              <div class="copy-row">
+                <h4>上线 checklist</h4>
+                <span class="status info" id="checkSummary">0/0</span>
+              </div>
+              <div class="progress" aria-label="完成进度"><b id="checkProgress"></b></div>
+              <div class="checklist" id="checklist" style="margin-top:12px">
+                <label class="check"><input type="checkbox"><div><strong>开放平台权限已申请并发布</strong><span>join/read/message/realtime 按需要齐全。</span></div></label>
+                <label class="check"><input type="checkbox"><div><strong>事件订阅已发布</strong><span>meeting_invited/activity/ended 三个 bot 事件已生效。</span></div></label>
+                <label class="check"><input type="checkbox"><div><strong>会议侧允许智能体加入</strong><span>实时语音场景额外确认允许 AI 智能体发言。</span></div></label>
+                <label class="check"><input type="checkbox"><div><strong>Dashboard 全局开关打开</strong><span>选择正确的会议监听 bot 身份。</span></div></label>
+                <label class="check"><input type="checkbox"><div><strong>bot 级 vcMeetingAgent 配置完成</strong><span>enabled、larkCliProfile、attentionTargetOpenId/allowedUsers 等。</span></div></label>
+                <label class="check"><input type="checkbox"><div><strong>真会读门通过</strong><span>有人发言/聊天时能收到 transcript/chat activity。</span></div></label>
+                <label class="check"><input type="checkbox"><div><strong>输出审批链路通过</strong><span>text 弹幕、voice 请求失败/成功都能正确显示结果。</span></div></label>
+              </div>
+            </div>
+            <div class="card">
+              <div class="copy-row">
+                <h4>bots.json 片段</h4>
+                <button class="copy-btn" type="button" data-copy="#cfgSnippet">复制</button>
+              </div>
+              <pre class="code" id="cfgSnippet">{
+  "larkAppId": "cli_xxx",
+  "larkAppSecret": "...",
+  "displayName": "会议监听 Bot",
+  "cliId": "claude-code",
+  "vcMeetingAgent": {
+    "enabled": true,
+    "larkCliProfile": "cli_xxx",
+    "attentionTargetOpenId": "ou_user",
+    "flushIntervalMs": 30000,
+    "stabilizeMs": 5000,
+    "meetingConsumer": {
+      "enabled": true,
+      "selectionTimeoutMs": 20000,
+      "agentCandidates": ["cli_codex_or_claude"]
+    },
+    "realtimeVoice": {
+      "enabled": false
+    }
+  }
+}</pre>
+            </div>
+          </div>
+
+          <div class="grid cols-2" style="margin-top:14px">
+            <div class="card">
+              <h4>Dogfood 已验证</h4>
+              <ul>
+                <li>invite / join / activity 的 meeting.id 一致。</li>
+                <li>真实 activity 字幕没有 is_final / revision，稳定化依赖 wall-clock。</li>
+                <li>manual invite 端到端通过：入会、建群、同步、结束收尾。</li>
+                <li>跨 daemon 注入、catch-up、会中弹幕发送、实时语音 M0 均已跑通。</li>
+              </ul>
+            </div>
+            <div class="card">
+              <h4>已知边界</h4>
+              <ul>
+                <li>participant_joined 主动监听不是 MVP，用户态订阅/OAuth 成本较高。</li>
+                <li>restart 边界可能丢掉已 ACK 未 flush 的短窗口内容，后续用 polling reconcile 改进。</li>
+                <li>会议原生智能纪要/妙记属于会后产物查询，不等价于实时会议 agent consumer。</li>
+                <li>最终总结需要 rolling summary 或全量 transcript 输入，是 P2+。</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+
+        <section id="faq">
+          <div class="section-head">
+            <div class="sec-mark"><span class="no">07</span><span class="phase">答疑</span></div>
+            <div>
+              <h3>常见问题</h3>
+            </div>
+          </div>
+          <details>
+            <summary>为什么不默认监听用户加入的所有会议？</summary>
+            <p>这需要用户态事件/OAuth、token 刷新、撤销、隐私告知和用户到 bot 的路由。相比“手动邀请 bot”只多了 ambient 便利性，MVP 阶段性价比不高。</p>
+          </details>
+          <details>
+            <summary>监听群里的 agent 为什么能回答“刚才谁提到 X”？</summary>
+            <p>会议内容注入和用户 @agent 都落到目标 agent daemon 的同一个 chat-scope session。用户 @ 时还会先做一次 best-effort catch-up，减少“我听到了但 agent 还没 flush 到”的时序差。</p>
+          </details>
+          <details>
+            <summary>会中弹幕和监听群文本有什么区别？</summary>
+            <p>会中弹幕通过 VC meeting message API 发到会议聊天里，所有会议参会人可见；监听群文本只在 botmux 创建的监听群里可见。</p>
+          </details>
+          <details>
+            <summary>为什么输出需要审批？</summary>
+            <p>会议转写可能包含提示词注入，speaker 归因也不是强认证。默认审批把“对真实会议说话/发消息”的执行权放在 daemon 和授权用户手里。</p>
+          </details>
+        </section>
+      </div>
+
+      <footer class="footer">
+        BOTMUX VC AGENT · 由最近开发过程和 dogfood 结果整理生成 · 适用于功能介绍、接入评审和上线检查
+      </footer>
+    </main>
+  </div>
+
+  <script>
+    const depButtons = document.querySelectorAll('[data-dep-filter]');
+    const deps = Array.from(document.querySelectorAll('.dep'));
+    const depCount = document.getElementById('depCount');
+    function applyDepFilter(kind) {
+      let visible = 0;
+      deps.forEach(dep => {
+        const show = kind === 'all' || dep.dataset.kind.split(' ').includes(kind);
+        dep.classList.toggle('hidden', !show);
+        if (show) visible += 1;
+      });
+      depCount.textContent = visible + ' 项';
+      depButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.depFilter === kind));
+    }
+    depButtons.forEach(btn => btn.addEventListener('click', () => applyDepFilter(btn.dataset.depFilter)));
+    applyDepFilter('all');
+
+    const scenarioButtons = document.querySelectorAll('[data-scenario]');
+    const scenarioPanels = document.querySelectorAll('[data-scenario-panel]');
+    scenarioButtons.forEach(btn => {
+      btn.addEventListener('click', () => {
+        const key = btn.dataset.scenario;
+        scenarioButtons.forEach(b => b.classList.toggle('active', b === btn));
+        scenarioPanels.forEach(panel => panel.classList.toggle('active', panel.dataset.scenarioPanel === key));
+      });
+    });
+
+    const navLinks = Array.from(document.querySelectorAll('.nav a'));
+    const sections = navLinks.map(a => document.querySelector(a.getAttribute('href'))).filter(Boolean);
+    const observer = new IntersectionObserver(entries => {
+      const current = entries.filter(e => e.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+      if (!current) return;
+      navLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + current.target.id));
+    }, { rootMargin: '-35% 0px -55% 0px', threshold: [0, 0.25, 0.5, 1] });
+    sections.forEach(section => observer.observe(section));
+
+    const checks = Array.from(document.querySelectorAll('#checklist input[type="checkbox"]'));
+    const progress = document.getElementById('checkProgress');
+    const summary = document.getElementById('checkSummary');
+    const storeKey = 'botmux-vc-agent-doc-checks';
+    function saveChecks() {
+      localStorage.setItem(storeKey, JSON.stringify(checks.map(c => c.checked)));
+    }
+    function renderChecks() {
+      const done = checks.filter(c => c.checked).length;
+      progress.style.width = checks.length ? (done / checks.length * 100) + '%' : '0';
+      summary.textContent = done + '/' + checks.length;
+    }
+    try {
+      const saved = JSON.parse(localStorage.getItem(storeKey) || '[]');
+      checks.forEach((check, i) => { check.checked = saved[i] === true; });
+    } catch {}
+    checks.forEach(check => check.addEventListener('change', () => { saveChecks(); renderChecks(); }));
+    document.getElementById('resetChecks').addEventListener('click', () => {
+      checks.forEach(check => { check.checked = false; });
+      saveChecks();
+      renderChecks();
+    });
+    renderChecks();
+
+    document.querySelectorAll('[data-copy]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const target = document.querySelector(btn.dataset.copy);
+        if (!target) return;
+        const original = btn.textContent;
+        try {
+          await navigator.clipboard.writeText(target.textContent);
+          btn.textContent = '已复制';
+          setTimeout(() => { btn.textContent = original; }, 1200);
+        } catch {
+          btn.textContent = '复制失败';
+          setTimeout(() => { btn.textContent = original; }, 1200);
+        }
+      });
+    });
+  </script>
+</body>
+</html>

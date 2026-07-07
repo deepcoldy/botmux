@@ -101,6 +101,12 @@ export const DOC_COMMENT_EVENT = 'drive.notice.comment_add_v1';
 export const VC_MEETING_FEATURE_SCOPES: RequiredScope[] = [
   { name: 'vc:meeting.bot.join:write', desc: '会议智能体入会 / 离会', critical: false },
   { name: 'vc:meeting.meetingevent:read', desc: '读取 / 订阅会中事件流', critical: false },
+  { name: 'vc:meeting.message:write', desc: '发送会中文本消息 / 弹幕', critical: false },
+];
+
+/** Realtime voice is only required when vcMeetingAgent.realtimeVoice.enabled is true. */
+export const VC_MEETING_REALTIME_VOICE_SCOPES: RequiredScope[] = [
+  { name: 'vc:meeting.bot.realtime:write', desc: '会议智能体实时语音发言', critical: false },
 ];
 
 /** VC bot push 事件。开放平台当前没有公开 API 可列出已订阅事件，只能给管理员检查清单。 */
@@ -108,6 +114,7 @@ export const VC_MEETING_BOT_EVENTS = [
   'vc.bot.meeting_invited_v1',
   'vc.bot.meeting_activity_v1',
   'vc.bot.meeting_ended_v1',
+  'vc.meeting.participant_meeting_joined_v1',
 ] as const;
 
 export interface RemainingStep {

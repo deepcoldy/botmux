@@ -19,6 +19,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     publicReadOnly: false,
     openTerminalInFeishu: false,
     chatBotDiscovery: true,
+    vcMeetingAgent: { enabled: true },
     maintenance: {},
     localDevInstall: false,
   };
@@ -43,6 +44,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     isLocalDevInstall: vi.fn(() => false),
     resolveDashboardSettings: vi.fn(() => settingsView),
     isLocale: ((v: unknown): v is 'zh' | 'en' => v === 'zh' || v === 'en'),
+    validateVcMeetingListenerBotAppId: vi.fn(async () => ({ ok: true as const })),
     ...overrides,
   };
 }
@@ -102,6 +104,33 @@ describe('applySettingsWrite happy paths', () => {
     expect(r.ok).toBe(true);
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ whiteboard: { enabled: true } });
   });
+
+  it('writes vcMeetingAgent.enabled toggle via mergeGlobalConfig', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ vcMeetingAgent: { enabled: false } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: false } });
+  });
+
+  it('writes vcMeetingAgent.listenerBotAppId after validating the selected bot', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ vcMeetingAgent: { enabled: true } })),
+    });
+    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: ' cli_listener ' } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.validateVcMeetingListenerBotAppId).toHaveBeenCalledWith('cli_listener');
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: true, listenerBotAppId: 'cli_listener' } });
+  });
+
+  it('clears vcMeetingAgent.listenerBotAppId without validating', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ vcMeetingAgent: { enabled: true, listenerBotAppId: 'cli_listener' } })),
+    });
+    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: null } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.validateVcMeetingListenerBotAppId).not.toHaveBeenCalled();
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: true } });
+  });
 });
 
 describe('applySettingsWrite — validation errors', () => {
@@ -136,6 +165,44 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
     expect(r.error).toBe('invalid_whiteboard');
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-object vcMeetingAgent → invalid_vcMeetingAgent', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ vcMeetingAgent: 'off' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('invalid_vcMeetingAgent');
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-boolean vcMeetingAgent.enabled → invalid_vcMeetingAgent_enabled', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ vcMeetingAgent: { enabled: 'no' } }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('invalid_vcMeetingAgent_enabled');
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects invalid vcMeetingAgent.listenerBotAppId', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: 123 } }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('invalid_vcMeetingAgent_listenerBotAppId');
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects vcMeetingAgent.listenerBotAppId when validation fails', async () => {
+    const deps = makeDeps({
+      validateVcMeetingListenerBotAppId: vi.fn(async () => ({ ok: false as const, error: 'vcMeetingAgent_listenerBot_missing_scopes: vc:meeting.bot.join:write' })),
+    });
+    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: 'cli_bad' } }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('vcMeetingAgent_listenerBot_missing_scopes: vc:meeting.bot.join:write');
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 

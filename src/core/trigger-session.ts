@@ -27,10 +27,15 @@ function triggerTitle(req: TriggerRequest): string {
 }
 
 export function buildUntrustedEventPrompt(req: TriggerRequest, triggerId: string): string {
+  // vc_meeting 注入是高频增量（一场会几十次 turn），走精简渲染：rawText 移出
+  // JSON 作为纯文本行（免掉 \n 转义膨胀，LLM 也更好读），其余 body 紧凑序列化。
+  // 其他 connector 保持原有 pretty-print 行为不变。
+  const compact = req.source.type === 'vc_meeting';
+  const { rawText, ...envelopeRest } = req.envelope;
   const body = {
     triggerId,
     source: req.source,
-    envelope: req.envelope,
+    envelope: compact ? envelopeRest : req.envelope,
     options: req.options ?? {},
   };
   const lines: string[] = [];
@@ -59,8 +64,9 @@ export function buildUntrustedEventPrompt(req: TriggerRequest, triggerId: string
     '',
     '<botmux_external_event trusted="false">',
     '```json',
-    JSON.stringify(body, null, 2),
+    compact ? JSON.stringify(body) : JSON.stringify(body, null, 2),
     '```',
+    ...(compact && rawText ? [rawText] : []),
     '</botmux_external_event>',
   );
   return lines.join('\n');

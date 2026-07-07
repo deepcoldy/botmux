@@ -8,7 +8,7 @@ import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
-import { config } from '../../config.js';
+import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
@@ -29,6 +29,7 @@ import {
   DOC_COMMENT_EVENT,
   VC_MEETING_BOT_EVENTS,
   VC_MEETING_FEATURE_SCOPES,
+  VC_MEETING_REALTIME_VOICE_SCOPES,
   buildEventSubDeepLink,
   buildScopeDeepLink,
 } from '../../setup/verify-permissions.js';
@@ -49,6 +50,7 @@ import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
   VC_BOT_MEETING_INVITED_EVENT,
+  VC_PARTICIPANT_MEETING_JOINED_EVENT,
   type VcMeetingPushEventType,
 } from '../../vc-agent/push-source.js';
 import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agent/types.js';
@@ -299,8 +301,16 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // subscription status cannot be listed via public API, so we surface the
     // exact required event keys as an explicit operator checklist.
     try {
-      if (bot.config.vcMeetingAgent?.enabled === true) {
-        const missingVc = VC_MEETING_FEATURE_SCOPES.filter(s => !grantedScopes.has(s.name));
+      const globalVcListenerAppId = vcMeetingAgentGlobalListenerBotAppId();
+      if (
+        isVcMeetingAgentGloballyEnabled()
+        && bot.config.vcMeetingAgent?.enabled === true
+        && (!globalVcListenerAppId || globalVcListenerAppId === larkAppId)
+      ) {
+        const requiredVcScopes = bot.config.vcMeetingAgent.realtimeVoice?.enabled === true
+          ? [...VC_MEETING_FEATURE_SCOPES, ...VC_MEETING_REALTIME_VOICE_SCOPES]
+          : VC_MEETING_FEATURE_SCOPES;
+        const missingVc = requiredVcScopes.filter(s => !grantedScopes.has(s.name));
         const eventList = VC_MEETING_BOT_EVENTS.map(e => `\`${e}\``).join('、');
         const eventSubUrl = buildEventSubDeepLink(bot.config.larkAppId, brand);
         if (missingVc.length > 0) {
@@ -1245,6 +1255,14 @@ export interface EventHandlers {
   handleDocComment?: (ctx: DocCommentContext) => Promise<void>;
   /** VC bot meeting push events (`vc.bot.meeting_*_v1`). ACK-safe; daemon owns meeting session state. */
   handleVcMeetingPush?: (ctx: VcMeetingPushContext) => Promise<void>;
+  /** Best-effort hook before a human inbound turn reaches the CLI session. Used
+   *  by VC meeting listener groups to catch up pending meeting context before a
+   *  user asks the selected agent a follow-up question. */
+  beforeSessionTurn?: (
+    data: any,
+    ctx: RoutingContext,
+    meta: { senderOpenId?: string; explicitlyMentionedThisBot: boolean },
+  ) => Promise<void>;
 }
 
 /** 一条已通过订阅 + 触发范围 + 自触发过滤的文档评论，交给 daemon 投递。 */
@@ -1712,6 +1730,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'meeting_activity', VC_BOT_MEETING_ACTIVITY_EVENT),
     [VC_BOT_MEETING_ENDED_EVENT]: (data: any) =>
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'meeting_ended', VC_BOT_MEETING_ENDED_EVENT),
+    [VC_PARTICIPANT_MEETING_JOINED_EVENT]: (data: any) =>
+      handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'participant_meeting_joined', VC_PARTICIPANT_MEETING_JOINED_EVENT),
     'card.action.trigger': (data: any) => handleCardActionAckSafe(data, larkAppId, handlers),
     // 表情回复事件——一旦在开发者后台订阅了 reaction，SDK 每收到一次都会因
     // 没有 handler 打 "no im.message.reaction.created_v1 handle" 警告刷屏。
@@ -2234,6 +2254,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             ? { name: 'summary-command', chatKind: summaryCommandMatch.chatKind }
             : undefined,
         };
+        if (explicitlyMentionedThisBot) {
+          await handlers.beforeSessionTurn?.(data, ctx, { senderOpenId, explicitlyMentionedThisBot });
+          ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
+        }
         // Serialize per anchor so two messages to the same thread/chat are
         // processed in arrival order — never concurrently. Without this a fast
         // second message interleaves with the first's async session-spawn and is
@@ -2262,7 +2286,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       try {
         const et: string = data?.header?.event_type ?? data?.event_type ?? data?.type ?? 'unknown';
         const isCommentish = typeof et === 'string' && et.includes('comment');
-        const isVcMeeting = typeof et === 'string' && et.startsWith('vc.bot.meeting_');
+        const isVcMeeting = typeof et === 'string' && (et.startsWith('vc.bot.meeting_') || et === VC_PARTICIPANT_MEETING_JOINED_EVENT);
         if (isCommentish) {
           const ev = data?.event ?? data;
           const p = parseCommentEvent(data);
@@ -2272,7 +2296,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             ? 'meeting_invited'
             : et === VC_BOT_MEETING_ENDED_EVENT
               ? 'meeting_ended'
-              : 'meeting_activity';
+              : et === VC_PARTICIPANT_MEETING_JOINED_EVENT
+                ? 'participant_meeting_joined'
+                : 'meeting_activity';
           const parsed = parseVcMeetingPushEvent({ data, larkAppId, kind, eventType: et as VcMeetingPushEventType });
           logger.info(`[ws-event] ${larkAppId} event_type=${et} eventId=${parsed.eventId ?? '?'} meetingId=${parsed.meeting.id || '?'} items=${Array.isArray((data?.event ?? data)?.meeting_actitivty_items) ? (data?.event ?? data).meeting_actitivty_items.length : '?'}`);
         } else if (process.env.DEBUG) {

@@ -5,7 +5,7 @@ import type {
   VcMeetingRef,
   VcMeetingSource,
   VcMeetingSessionState,
-  VcMeetingWorkflowPayload,
+  VcMeetingStatePayload,
   VcTranscriptStateEntry,
 } from './types.js';
 
@@ -175,11 +175,11 @@ export function markVcTranscriptItemsFlushed(
   }
 }
 
-export function buildVcMeetingWorkflowPayload(
+export function buildVcMeetingStatePayload(
   state: VcMeetingSessionState,
   items: NormalizedVcMeetingItem[],
   page: { pageToken?: string; hasMore?: boolean } = {},
-): VcMeetingWorkflowPayload {
+): VcMeetingStatePayload {
   const transcripts = Object.values(state.dedup.transcriptBySentenceId);
   return {
     format: 'botmux.vc-meeting.v1',

@@ -1,7 +1,11 @@
 import { networkInterfaces } from 'node:os';
 import type { BackendType } from './adapters/backend/types.js';
 import { resolveWorkerHttpHost } from './utils/worker-http.js';
-import { readGlobalConfig } from './global-config.js';
+import {
+  globalVcMeetingAgentListenerBotAppId,
+  isGlobalVcMeetingAgentEnabled,
+  readGlobalConfig,
+} from './global-config.js';
 
 /** Get the first non-loopback IPv4 address, fallback to localhost. */
 function getLocalIp(): string {
@@ -77,6 +81,20 @@ export function resolveChatBotDiscoveryConfig(env: NodeJS.ProcessEnv = process.e
     listBotsApiEnabled,
     listBotsApiTimeoutMs: Number(env.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS) || 3_000,
   };
+}
+
+/** Machine-wide VC meeting listener kill-switch.
+ *
+ * Missing means ON for backwards compatibility. This is intentionally separate
+ * from per-bot vcMeetingAgent.enabled: the global setting allows the host to
+ * stop accepting/restoring VC meeting listeners without editing each bot.
+ */
+export function isVcMeetingAgentGloballyEnabled(): boolean {
+  return isGlobalVcMeetingAgentEnabled();
+}
+
+export function vcMeetingAgentGlobalListenerBotAppId(): string | undefined {
+  return globalVcMeetingAgentListenerBotAppId();
 }
 
 export const config = {

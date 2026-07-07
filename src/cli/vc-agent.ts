@@ -1,17 +1,27 @@
 import {
   beginVcPollingPass,
-  buildVcMeetingWorkflowPayload,
+  buildVcMeetingStatePayload,
   collectStableTranscriptItems,
   createVcMeetingSessionState,
   ingestNormalizedVcMeetingItems,
 } from '../vc-agent/meeting-state.js';
 import { fetchMeetingEventsAsBot, joinMeetingAsBot } from '../vc-agent/polling-source.js';
 import {
-  buildVcMeetingTriggerRequest,
-  dispatchVcMeetingWorkflow,
-  findOnlineDaemon,
-} from '../vc-agent/trigger.js';
+  DEFAULT_REALTIME_VOICE_CHANNELS,
+  DEFAULT_REALTIME_VOICE_FRAME_MS,
+  DEFAULT_REALTIME_VOICE_SAMPLE_RATE,
+  connectRealtimeVoiceTransport,
+  createProtoRealtimeVoiceProtocol,
+  fetchRealtimeVoiceEndpoint,
+  RealtimeVoiceSession,
+} from '../vc-agent/realtime/index.js';
+import { loadBotConfigs, registerBot } from '../bot-registry.js';
+import { config } from '../config.js';
+import { listVcMeetingRuntimeSessions } from '../services/vc-meeting-runtime-store.js';
+import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import type { NormalizedVcMeetingItem } from '../vc-agent/types.js';
+
+const VC_AGENT_SPEAK_MAX_TEXT_LENGTH = 200;
 
 function argValue(args: string[], name: string): string | undefined {
   const eq = args.find((a) => a.startsWith(`${name}=`));
@@ -37,14 +47,27 @@ function usage(): void {
 
 Commands:
   tat-gate   Verify bot identity can read real transcript/chat items from a meeting
-  poll       Run the P0 polling bridge and trigger a workflow with stable meeting state
+  poll       Run the P0 polling bridge and print stable meeting-state JSON
+  request-output
+             Ask the daemon to review/send a meeting agent text or voice output
+  speak      Speak one TTS utterance into an active meeting via realtime voice
 
 Examples:
   botmux vc-agent tat-gate --meeting-id <meeting_id>
   botmux vc-agent tat-gate --meeting-number 123456789
-  botmux vc-agent poll --meeting-id <meeting_id> --bot <larkAppId> --chat-id <oc_xxx> --workflow-id meeting-agent-attention
+  botmux vc-agent poll --meeting-id <meeting_id> --once
   botmux vc-agent poll --meeting-id <meeting_id> --page-token-mode incremental ...
+  botmux vc-agent request-output --lark-app-id cli_xxx --meeting-id <meeting_id> --channel text --content "..."
+  botmux vc-agent speak --lark-app-id cli_xxx --meeting-id <meeting_id> --text "大家好"
 `);
+}
+
+let botRegistryLoaded = false;
+
+function ensureBotRegistryLoaded(): void {
+  if (botRegistryLoaded) return;
+  for (const cfg of loadBotConfigs()) registerBot(cfg);
+  botRegistryLoaded = true;
 }
 
 function resolveMeetingId(args: string[], opts: { allowJoin?: boolean } = {}): { meetingId: string; joined: boolean } {
@@ -125,15 +148,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function cmdPoll(args: string[]): Promise<void> {
-  const larkAppId = argValue(args, '--bot') ?? process.env.BOTMUX_LARK_APP_ID;
-  const chatId = argValue(args, '--chat-id');
-  const workflowId = argValue(args, '--workflow-id');
-  if (!larkAppId) throw new Error('missing --bot <larkAppId> (or BOTMUX_LARK_APP_ID)');
-  if (!chatId) throw new Error('missing --chat-id <oc_...>');
-  if (!workflowId) throw new Error('missing --workflow-id <id>');
-  const daemon = findOnlineDaemon(larkAppId);
   const dryRun = hasFlag(args, '--dry-run');
-  if (!daemon && !dryRun) throw new Error(`no online botmux daemon found for bot ${larkAppId}`);
 
   const { meetingId, joined } = resolveMeetingId(args, { allowJoin: !dryRun });
   const state = createVcMeetingSessionState({
@@ -148,9 +163,8 @@ async function cmdPoll(args: string[]): Promise<void> {
   const lookbackMs = intArg(args, '--lookback-ms', 30_000, 0, 30 * 60_000);
   const pageTokenMode = parsePageTokenMode(args);
   const idlePollsBeforeSoftClose = intArg(args, '--idle-polls-before-soft-close', 0, 0, 10_000);
-  const instruction = argValue(args, '--instruction');
 
-  console.error(`vc-agent polling started: meetingId=${meetingId}${joined ? ' joined=true' : ''} workflow=${workflowId} chat=${chatId}`);
+  console.error(`vc-agent polling started: meetingId=${meetingId}${joined ? ' joined=true' : ''} output=json`);
 
   for (let poll = 0; poll < maxPolls; poll += 1) {
     beginVcPollingPass(state);
@@ -172,24 +186,12 @@ async function cmdPoll(args: string[]): Promise<void> {
     const stableTranscripts = collectStableTranscriptItems(state, { stabilizePollWindows });
     const outgoing: NormalizedVcMeetingItem[] = [...ingest.acceptedItems, ...stableTranscripts];
     if (outgoing.length > 0) {
-      const payload = buildVcMeetingWorkflowPayload(state, outgoing, {
+      const payload = buildVcMeetingStatePayload(state, outgoing, {
         pageToken: batch.pageToken,
         hasMore: batch.hasMore,
       });
-      if (dryRun) {
-        console.log(JSON.stringify(payload, null, 2));
-      } else {
-        const trigger = buildVcMeetingTriggerRequest({
-          larkAppId,
-          chatId,
-          workflowId,
-          payload,
-          instruction,
-        });
-        const result = await dispatchVcMeetingWorkflow({ daemon: daemon!, trigger });
-        if (!result.ok) throw new Error(`workflow trigger failed: ${result.error ?? result.errorCode ?? 'unknown error'}`);
-        console.error(`vc-agent dispatched poll=${state.ingestion.pollOrdinal} items=${outgoing.length} trigger=${result.triggerId ?? ''}`);
-      }
+      console.log(JSON.stringify(payload));
+      console.error(`vc-agent emitted poll=${state.ingestion.pollOrdinal} items=${outgoing.length}`);
     }
 
     if (idlePollsBeforeSoftClose > 0 && state.ingestion.emptyPollCount >= idlePollsBeforeSoftClose) {
@@ -198,6 +200,98 @@ async function cmdPoll(args: string[]): Promise<void> {
     }
     if (poll + 1 < maxPolls) await sleep(pollMs);
   }
+}
+
+async function cmdSpeak(args: string[]): Promise<void> {
+  const larkAppId = argValue(args, '--lark-app-id') ?? argValue(args, '--app-id') ?? argValue(args, '--profile');
+  const meetingId = argValue(args, '--meeting-id');
+  const text = argValue(args, '--text')?.trim();
+  if (!larkAppId) throw new Error('missing --lark-app-id');
+  if (!meetingId) throw new Error('missing --meeting-id');
+  if (!text) throw new Error('missing --text');
+  if (text.length > VC_AGENT_SPEAK_MAX_TEXT_LENGTH) {
+    throw new Error(`--text is too long; keep meeting speech within ${VC_AGENT_SPEAK_MAX_TEXT_LENGTH} characters`);
+  }
+
+  ensureBotRegistryLoaded();
+  if (!hasFlag(args, '--operator-override')) {
+    const record = listVcMeetingRuntimeSessions(config.session.dataDir, larkAppId)
+      .find(item => item.meeting.id === meetingId);
+    if (record?.voiceOutputPolicy !== 'allow') {
+      throw new Error('direct vc-agent speak is disabled for meeting agents; use vc-agent request-output or pass --operator-override for human dogfood');
+    }
+  }
+  const endpoint = await fetchRealtimeVoiceEndpoint(larkAppId, meetingId);
+  const transport = await connectRealtimeVoiceTransport(endpoint.websocketUrl);
+  const session = new RealtimeVoiceSession({
+    larkAppId,
+    meetingId,
+    protocol: createProtoRealtimeVoiceProtocol(),
+    transport,
+    audioFormat: {
+      sampleRate: intArg(args, '--sample-rate', DEFAULT_REALTIME_VOICE_SAMPLE_RATE, 8_000, 48_000),
+      channels: intArg(args, '--channels', DEFAULT_REALTIME_VOICE_CHANNELS, 1, 2),
+      frameMs: intArg(args, '--frame-ms', DEFAULT_REALTIME_VOICE_FRAME_MS, 20, 1_000),
+    },
+  });
+  let started = false;
+  try {
+    await session.start();
+    started = true;
+    const result = await session.speak(text);
+    console.log(JSON.stringify({
+      ok: true,
+      meetingId,
+      larkAppId,
+      frames: result.frames,
+      durationMs: result.durationMs,
+    }, null, 2));
+  } finally {
+    await session.stop(started ? 'cli-speak-finished' : 'cli-speak-failed').catch(() => { /* ignore cleanup errors */ });
+  }
+}
+
+async function cmdRequestOutput(args: string[]): Promise<void> {
+  const larkAppId = argValue(args, '--lark-app-id') ?? argValue(args, '--app-id') ?? argValue(args, '--profile');
+  const meetingId = argValue(args, '--meeting-id');
+  const channel = argValue(args, '--channel');
+  const content = argValue(args, '--content')?.trim();
+  const reason = argValue(args, '--reason')?.trim();
+  const fallbackText = argValue(args, '--fallback-text')?.trim();
+  if (!larkAppId) throw new Error('missing --lark-app-id');
+  if (!meetingId) throw new Error('missing --meeting-id');
+  if (channel !== 'text' && channel !== 'voice') throw new Error('--channel must be text or voice');
+  if (!content) throw new Error('missing --content');
+  if (content.length > VC_AGENT_SPEAK_MAX_TEXT_LENGTH) {
+    throw new Error(`--content is too long; keep output within ${VC_AGENT_SPEAK_MAX_TEXT_LENGTH} characters`);
+  }
+  if (fallbackText && fallbackText.length > VC_AGENT_SPEAK_MAX_TEXT_LENGTH) {
+    throw new Error(`--fallback-text is too long; keep output within ${VC_AGENT_SPEAK_MAX_TEXT_LENGTH} characters`);
+  }
+  ensureBotRegistryLoaded();
+  const daemon = findOnlineDaemon(larkAppId);
+  if (!daemon) throw new Error(`daemon offline for ${larkAppId}`);
+  const response = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/vc-meetings/output-request`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      larkAppId,
+      meetingId,
+      channel,
+      content,
+      ...(reason ? { reason } : {}),
+      ...(fallbackText ? { fallbackText } : {}),
+    }),
+  });
+  const raw = await response.text();
+  let body: unknown = raw;
+  try {
+    body = raw ? JSON.parse(raw) : {};
+  } catch {
+    // Keep the raw body for operator-visible debugging.
+  }
+  console.log(typeof body === 'string' ? body : JSON.stringify(body, null, 2));
+  if (response.status >= 400) process.exit(2);
 }
 
 function parsePageTokenMode(args: string[]): 'time-window' | 'incremental' {
@@ -218,6 +312,14 @@ export async function cmdVcAgent(command: string, args: string[]): Promise<void>
     }
     if (command === 'poll') {
       await cmdPoll(args);
+      return;
+    }
+    if (command === 'request-output') {
+      await cmdRequestOutput(args);
+      return;
+    }
+    if (command === 'speak') {
+      await cmdSpeak(args);
       return;
     }
     usage();

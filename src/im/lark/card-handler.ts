@@ -84,6 +84,9 @@ export interface CardHandlerDeps {
   v3LoopGrantDeps?: V3LoopGrantCardHandlerDeps;
   /** v3 回溯预算准许卡点击处理（同一个 runner 的 driveRun）. */
   v3RevisitGrantDeps?: V3RevisitGrantCardHandlerDeps;
+  /** VC meeting invite/consumer card actions. Implemented in daemon to
+   *  keep meeting sessions, tombstones, and listener-group state single-owned. */
+  vcMeetingCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
 }
 
 /**
@@ -703,6 +706,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   if (isAskCardAction(value?.action)) {
     return handleAskCardAction(data);
+  }
+
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('vc_meeting_') &&
+    larkAppId
+  ) {
+    if (!deps.vcMeetingCardAction) {
+      return { toast: { type: 'error', content: '会议监听处理器未启用' } };
+    }
+    return deps.vcMeetingCardAction(data, larkAppId);
   }
 
   // Dashboard callbacks dispatch before session lookup. They do not require an

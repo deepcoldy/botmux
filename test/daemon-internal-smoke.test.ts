@@ -29,6 +29,7 @@ function makeStubDeps(): DaemonInternalApiDeps {
     resolveDashboardSettings: () => ({
       publicReadOnly: false,
       openTerminalInFeishu: false,
+      vcMeetingAgent: { enabled: true },
       maintenance: {},
       localDevInstall: false,
     }),
@@ -42,6 +43,7 @@ function makeStubDeps(): DaemonInternalApiDeps {
       resolveDashboardSettings: () => ({
         publicReadOnly: false,
         openTerminalInFeishu: false,
+        vcMeetingAgent: { enabled: true },
         maintenance: {},
         localDevInstall: false,
       }),

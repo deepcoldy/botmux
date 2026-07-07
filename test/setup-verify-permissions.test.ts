@@ -324,6 +324,7 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
     expect(VC_MEETING_FEATURE_SCOPES.map(s => s.name).sort()).toEqual([
       'vc:meeting.bot.join:write',
       'vc:meeting.meetingevent:read',
+      'vc:meeting.message:write',
     ]);
     expect(VC_MEETING_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
   });
@@ -333,6 +334,7 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
       'vc.bot.meeting_invited_v1',
       'vc.bot.meeting_activity_v1',
       'vc.bot.meeting_ended_v1',
+      'vc.meeting.participant_meeting_joined_v1',
     ]);
   });
 });

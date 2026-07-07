@@ -8,7 +8,7 @@
  * JSON-over-WS, internal) and `openai` (OpenAI-compatible HTTP, open-source
  * default). Neither pulls a heavyweight dependency into the package.
  */
-import { encodePcmToOpus, toSpoken, type OpusResult } from './audio.js';
+import { encodePcmToOpus, toSpoken, type OpusResult, type Pcm } from './audio.js';
 import { samiSynthesizePcm, type SamiCreds } from './sami.js';
 import { openaiSynthesizePcm, type OpenAITtsConfig } from './openai.js';
 import { readGlobalConfig } from '../../global-config.js';
@@ -81,20 +81,27 @@ function effectiveSpeaker(v: VoiceConfig): string {
 }
 
 /**
- * Synthesize `text` into an ogg/opus file for a Feishu voice bubble.
- * Caller owns the returned temp dir and must rm -rf it after sending.
- * Throws when voice isn't configured for this bot or synthesis fails.
+ * Synthesize `text` into raw signed-16 PCM. Realtime VC voice uses this
+ * intermediate directly; IM voice bubbles encode it to ogg/opus below.
  */
-export async function synthesizeVoiceOpus(larkAppId: string | undefined, text: string): Promise<OpusResult> {
+export async function synthesizeVoicePcmForMessage(larkAppId: string | undefined, text: string): Promise<Pcm> {
   const cfg = resolveVoiceConfig(larkAppId);
   if (!cfg) throw new Error('未配置语音引擎：在 ~/.botmux/config.json 的 voice 块或 bots.json 里配置 SAMI / OpenAI 兼容引擎。');
   const spoken = toSpoken(text);
   if (!spoken) throw new Error('精简后没有可朗读的内容');
   const speaker = effectiveSpeaker(cfg);
 
-  const pcm = cfg.engine === 'openai'
+  return cfg.engine === 'openai'
     ? await openaiSynthesizePcm(cfg.openai as OpenAITtsConfig, spoken, { speaker, rate: cfg.rate })
     : await samiSynthesizePcm(cfg.sami as SamiCreds, spoken, { speaker, rate: cfg.rate });
+}
 
+/**
+ * Synthesize `text` into an ogg/opus file for a Feishu voice bubble.
+ * Caller owns the returned temp dir and must rm -rf it after sending.
+ * Throws when voice isn't configured for this bot or synthesis fails.
+ */
+export async function synthesizeVoiceOpus(larkAppId: string | undefined, text: string): Promise<OpusResult> {
+  const pcm = await synthesizeVoicePcmForMessage(larkAppId, text);
   return encodePcmToOpus(pcm);
 }

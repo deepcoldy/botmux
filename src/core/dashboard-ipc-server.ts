@@ -29,7 +29,7 @@ import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '.
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
 import { readGlobalConfig } from '../global-config.js';
-import { normalizeChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
+import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker } from './worker-pool.js';
@@ -411,6 +411,19 @@ ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
   });
   if (!r.ok) return jsonRes(res, r.error === 'session_exists' ? 409 : 500, r);
   jsonRes(res, 200, r);
+});
+
+ipcRoute('POST', '/api/chat-reply-mode', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, reason: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, reason: 'invalid_json' }); }
+  const chatId = typeof (body as any)?.chatId === 'string' ? (body as any).chatId.trim() : '';
+  const mode = normalizeChatReplyMode(typeof (body as any)?.mode === 'string' ? (body as any).mode : undefined);
+  if (!chatId) return jsonRes(res, 400, { ok: false, reason: 'chatId_required' });
+  if (!mode) return jsonRes(res, 400, { ok: false, reason: 'invalid_mode' });
+  const result = await setChatReplyMode(cachedLarkAppId, chatId, mode);
+  if (!result.ok) return jsonRes(res, 500, { ok: false, reason: result.reason });
+  jsonRes(res, 200, { ok: true, mode: result.mode });
 });
 
 // 会话历史：实时拉取该会话所在话题/群的飞书消息（与 botmux history 同链路，
@@ -1013,6 +1026,13 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
   }
   const valid = validateTriggerRequest(body);
   if (!valid.ok) return jsonRes(res, valid.status, valid.body);
+  if (valid.request.target.botId && valid.request.target.botId !== cachedLarkAppId) {
+    return jsonRes(res, 400, {
+      ok: false,
+      errorCode: 'bot_not_found',
+      error: `request target botId ${valid.request.target.botId} does not match daemon ${cachedLarkAppId}`,
+    });
+  }
   try {
     let result;
     if (valid.request.target.kind === 'workflow') {

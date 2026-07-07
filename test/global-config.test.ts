@@ -3,7 +3,9 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  globalVcMeetingAgentListenerBotAppId,
   globalConfigPath,
+  isGlobalVcMeetingAgentEnabled,
   mergeDashboardConfig,
   mergeGlobalConfig,
   readGlobalConfig,
@@ -70,6 +72,21 @@ describe('global dashboard config', () => {
       trustProjectSkills: 'trusted',
       delivery: 'prompt',
     });
+  });
+
+  it('reads vcMeetingAgent.enabled as a top-level global kill-switch', () => {
+    expect(isGlobalVcMeetingAgentEnabled()).toBe(true);
+    mergeGlobalConfig({ vcMeetingAgent: { enabled: false } });
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: false });
+    expect(isGlobalVcMeetingAgentEnabled()).toBe(false);
+    mergeGlobalConfig({ vcMeetingAgent: { enabled: true } });
+    expect(isGlobalVcMeetingAgentEnabled()).toBe(true);
+  });
+
+  it('reads vcMeetingAgent.listenerBotAppId as the global VC listener app', () => {
+    mergeGlobalConfig({ vcMeetingAgent: { enabled: true, listenerBotAppId: ' cli_listener ' } });
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: true, listenerBotAppId: 'cli_listener' });
+    expect(globalVcMeetingAgentListenerBotAppId()).toBe('cli_listener');
   });
 
   it('readGlobalConfig sees fresh values immediately after a merge (cache invalidation)', () => {

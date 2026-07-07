@@ -59,6 +59,7 @@ function makeDeps(over: Partial<DaemonInternalApiDeps> = {}): DaemonInternalApiD
     resolveDashboardSettings: vi.fn(() => ({
       publicReadOnly: false,
       openTerminalInFeishu: false,
+      vcMeetingAgent: { enabled: true },
       maintenance: {},
       localDevInstall: false,
     })),
@@ -71,6 +72,7 @@ function makeDeps(over: Partial<DaemonInternalApiDeps> = {}): DaemonInternalApiD
     resolveDashboardSettings: () => ({
       publicReadOnly: false,
       openTerminalInFeishu: false,
+      vcMeetingAgent: { enabled: true },
       maintenance: {},
       localDevInstall: false,
     }),
@@ -114,7 +116,7 @@ describe('dispatch: read endpoints', () => {
     const api = createDaemonInternalApi(makeDeps());
     const r = await api.dispatchForTest('GET', url('/__daemon/settings-snapshot'));
     expect(r.status).toBe(200);
-    expect(r.body).toEqual({ settings: { publicReadOnly: false, openTerminalInFeishu: false, maintenance: {}, localDevInstall: false } });
+    expect(r.body).toEqual({ settings: { publicReadOnly: false, openTerminalInFeishu: false, vcMeetingAgent: { enabled: true }, maintenance: {}, localDevInstall: false } });
   });
 
   it('GET /__daemon/groups-matrix returns { chats, bots }', async () => {
