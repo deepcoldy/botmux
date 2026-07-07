@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readlinkSync, rmSync, realpathSync } from 'node:
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { buildPm2SpawnCommand } from '../../cli/pm2-command.js';
+import { config } from '../../config.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import { readPluginRegistry } from '../../services/plugin-registry-store.js';
@@ -21,6 +22,7 @@ export interface PluginServiceReport {
   action: 'started' | 'already-running' | 'stopped' | 'not-running' | 'external' | 'failed' | 'status';
   status?: string;
   openUrl?: string;
+  healthUrl?: string;
   warning?: string;
 }
 
@@ -139,9 +141,28 @@ function appMatchesCurrent(app: Pm2AppInfo, currentDir: string, currentRealpath:
   }
 }
 
+function isLoopbackHost(hostname: string): boolean {
+  return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1' || hostname === '[::1]';
+}
+
+function rewriteLoopbackServiceUrl(rawUrl: string | undefined): string | undefined {
+  if (!rawUrl) return undefined;
+  try {
+    const url = new URL(rawUrl);
+    if (isLoopbackHost(url.hostname)) url.hostname = config.dashboard.externalHost;
+    return url.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
 function serviceOpenUrl(service: PluginHostService): string | undefined {
-  if (service.openUrl) return service.openUrl;
-  return service.port ? `http://127.0.0.1:${service.port}/` : undefined;
+  if (service.openUrl) return rewriteLoopbackServiceUrl(service.openUrl);
+  return service.port ? `http://${config.dashboard.externalHost}:${service.port}/` : undefined;
+}
+
+function serviceHealthUrl(service: PluginHostService): string | undefined {
+  return rewriteLoopbackServiceUrl(service.healthUrl);
 }
 
 function writeServiceState(
@@ -189,24 +210,25 @@ export async function ensureManagedHostServices(
       for (const [serviceName, service] of serviceEntries(record)) {
         const pm2Name = pluginServicePm2Name(record.id, serviceName);
         const openUrl = serviceOpenUrl(service);
+        const publicHealthUrl = serviceHealthUrl(service);
         if (service.mode === 'external') {
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'external', ...(openUrl ? { openUrl } : {}) });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'external', ...(openUrl ? { openUrl } : {}), ...(publicHealthUrl ? { healthUrl: publicHealthUrl } : {}) });
           continue;
         }
         if (!service.command?.length) {
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', ...(openUrl ? { openUrl } : {}), warning: 'missing command' });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', ...(openUrl ? { openUrl } : {}), ...(publicHealthUrl ? { healthUrl: publicHealthUrl } : {}), warning: 'missing command' });
           continue;
         }
         const current = pluginCurrentDir(record.id);
         if (!existsSync(current)) {
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', ...(openUrl ? { openUrl } : {}), warning: `missing current dir: ${current}` });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', ...(openUrl ? { openUrl } : {}), ...(publicHealthUrl ? { healthUrl: publicHealthUrl } : {}), warning: `missing current dir: ${current}` });
           continue;
         }
         const currentRealpath = realpathSync(current);
         const app = apps.get(pm2Name);
         if (app?.status === 'online' && appMatchesCurrent(app, current, currentRealpath)) {
           writeServiceState(record.id, serviceName, pm2Name, record, current, currentRealpath);
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'already-running', status: app.status, ...(openUrl ? { openUrl } : {}) });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'already-running', status: app.status, ...(openUrl ? { openUrl } : {}), ...(publicHealthUrl ? { healthUrl: publicHealthUrl } : {}) });
           continue;
         }
         try {
@@ -225,10 +247,11 @@ export async function ensureManagedHostServices(
             pm2Name,
             action: 'started',
             ...(openUrl ? { openUrl } : {}),
+            ...(publicHealthUrl ? { healthUrl: publicHealthUrl } : {}),
             ...(reason || healthWarning ? { warning: [reason, healthWarning].filter(Boolean).join('; ') } : {}),
           });
         } catch (err: any) {
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', status: app?.status, ...(openUrl ? { openUrl } : {}), warning: err?.message ?? String(err) });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', status: app?.status, ...(openUrl ? { openUrl } : {}), ...(publicHealthUrl ? { healthUrl: publicHealthUrl } : {}), warning: err?.message ?? String(err) });
         }
       }
     }
@@ -250,19 +273,20 @@ export function stopManagedHostServices(
       for (const [serviceName, service] of serviceEntries(record)) {
         const pm2Name = pluginServicePm2Name(record.id, serviceName);
         const openUrl = serviceOpenUrl(service);
+        const publicHealthUrl = serviceHealthUrl(service);
         if (service.mode !== 'managed') continue;
         const status = apps.get(pm2Name)?.status;
         if (!status) {
           deleteServiceState(record.id, serviceName);
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'not-running', ...(openUrl ? { openUrl } : {}) });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'not-running', ...(openUrl ? { openUrl } : {}), ...(publicHealthUrl ? { healthUrl: publicHealthUrl } : {}) });
           continue;
         }
         try {
           runPm2(opts, ['delete', pm2Name], 20_000);
           deleteServiceState(record.id, serviceName);
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'stopped', status, ...(openUrl ? { openUrl } : {}) });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'stopped', status, ...(openUrl ? { openUrl } : {}), ...(publicHealthUrl ? { healthUrl: publicHealthUrl } : {}) });
         } catch (err: any) {
-          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', status, ...(openUrl ? { openUrl } : {}), warning: err?.message ?? String(err) });
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', status, ...(openUrl ? { openUrl } : {}), ...(publicHealthUrl ? { healthUrl: publicHealthUrl } : {}), warning: err?.message ?? String(err) });
         }
       }
     }
@@ -277,10 +301,11 @@ export function listPluginServiceStatus(opts: PluginPm2Options): PluginServiceRe
     for (const [serviceName, service] of serviceEntries(record)) {
       const pm2Name = pluginServicePm2Name(record.id, serviceName);
       const openUrl = serviceOpenUrl(service);
+      const publicHealthUrl = serviceHealthUrl(service);
       if (service.mode === 'external') {
-        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'external', ...(openUrl ? { openUrl } : {}) });
+        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'external', ...(openUrl ? { openUrl } : {}), ...(publicHealthUrl ? { healthUrl: publicHealthUrl } : {}) });
       } else {
-        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'status', status: pm2AppStatus(opts, pm2Name) ?? 'stopped', ...(openUrl ? { openUrl } : {}) });
+        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'status', status: pm2AppStatus(opts, pm2Name) ?? 'stopped', ...(openUrl ? { openUrl } : {}), ...(publicHealthUrl ? { healthUrl: publicHealthUrl } : {}) });
       }
     }
   }

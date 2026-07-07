@@ -6,7 +6,7 @@
  *   botmux setup          — interactive first-time configuration
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
  *   botmux setup list|add|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
- *   botmux start          — start daemon (pm2)
+ *   botmux start [--include-plugin-services] — start daemon (optionally start plugin services)
  *   botmux stop [--include-plugin-services] — stop daemon (optionally stop plugin services)
  *   botmux restart [--include-pm2] [--include-plugin-services] — restart daemon (optionally restart PM2 God / plugin services)
  *   botmux logs [--lines] — view daemon logs
@@ -1734,6 +1734,7 @@ async function cmdStart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
+  const includePluginServices = process.argv.includes('--include-plugin-services');
   killDuplicatePm2GodDaemons();
   preflightNodeSanity();
   await ensureSystemDependencies();
@@ -1774,7 +1775,7 @@ async function cmdStart(): Promise<void> {
   cleanupLegacyPm2();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
-  await reconcilePluginServicesForCli();
+  if (includePluginServices) await reconcilePluginServicesForCli();
   const bots = loadBotsJson();
   const count = bots.length || 1;
   console.log(`\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
@@ -3618,7 +3619,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 命令:
   setup       交互式配置（首次使用 / 添加机器人）
               默认使用 botmux 内置 Feishu Web QR 登录尝试自动导入权限/redirect/发布版本；可加 --no-open-platform-auto 跳过
-  start       启动 daemon
+  start       启动 daemon（默认不启动插件 service；--include-plugin-services 显式启动插件 service）
   stop        停止 daemon（默认不停止插件 service；--include-plugin-services 显式停止插件 service）
   restart     重启 daemon（默认不重启插件 service；--include-plugin-services 显式重启插件 service；--include-pm2 同时重启 PM2 God）
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）

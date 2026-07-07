@@ -34,6 +34,7 @@ interface PluginServiceReport {
   status?: string;
   warning?: string;
   openUrl?: string;
+  healthUrl?: string;
 }
 
 interface ManagedPlugin {
@@ -117,20 +118,25 @@ function serviceReportFor(plugin: ManagedPlugin, serviceName: string): PluginSer
 }
 
 function serviceLabel(service: PluginServiceDeclaration, report?: PluginServiceReport): string {
-  if (service.mode === 'external') return '外部自管';
+  if (service.mode === 'external') return 'external';
   if (!report) return 'unknown';
   if (report.status) return report.status;
   return report.action;
 }
 
-function serviceLifecycleLabel(service: PluginServiceDeclaration): string | undefined {
-  if (service.mode === 'managed') return 'botmux 可启停';
-  if (service.mode === 'external') return '外部自管';
+function serviceControlLabel(service: PluginServiceDeclaration): string | undefined {
+  if (service.mode === 'managed') return 'Dashboard/CLI 可手动启停';
+  if (service.mode === 'external') return '外部系统启停';
   return service.mode;
 }
 
+function serviceLifecycleLabel(service: PluginServiceDeclaration): string {
+  if (service.mode === 'managed') return '不随 botmux start/stop/restart 自动启停';
+  if (service.mode === 'external') return '不随 botmux 生命周期启停';
+  return '未知生命周期策略';
+}
+
 function serviceStatusClass(service: PluginServiceDeclaration, report?: PluginServiceReport): string {
-  if (service.mode === 'external') return 'plugin-status-muted';
   const label = serviceLabel(service, report);
   if (label === 'online' || label === 'started' || label === 'already-running') return 'plugin-status-ok';
   if (label === 'stopped' || label === 'not-running') return 'plugin-status-idle';
@@ -139,9 +145,14 @@ function serviceStatusClass(service: PluginServiceDeclaration, report?: PluginSe
 }
 
 function serviceOpenUrl(service: PluginServiceDeclaration, report?: PluginServiceReport): string | undefined {
-  if (service.openUrl) return service.openUrl;
   if (report?.openUrl) return report.openUrl;
+  if (service.openUrl) return service.openUrl;
   return service.port ? `http://127.0.0.1:${service.port}/` : undefined;
+}
+
+function serviceHealthUrl(service: PluginServiceDeclaration, report?: PluginServiceReport): string | undefined {
+  if (report?.healthUrl) return report.healthUrl;
+  return service.healthUrl;
 }
 
 function renderServiceRows(plugin: ManagedPlugin): string {
@@ -151,14 +162,17 @@ function renderServiceRows(plugin: ManagedPlugin): string {
     const report = serviceReportFor(plugin, name);
     const managed = service.mode === 'managed';
     const label = serviceLabel(service, report);
+    const control = serviceControlLabel(service);
     const lifecycle = serviceLifecycleLabel(service);
     const parts = [
-      lifecycle ? `lifecycle=${lifecycle}` : '',
+      control ? `control=${control}` : '',
+      `lifecycle=${lifecycle}`,
       service.scope ? `scope=${service.scope}` : '',
       service.port ? `port=${service.port}` : '',
     ].filter(Boolean);
-    const health = service.healthUrl
-      ? `<a class="plugin-link" href="${escapeHtml(service.healthUrl)}" target="_blank" rel="noreferrer">health</a>`
+    const healthUrl = serviceHealthUrl(service, report);
+    const health = healthUrl
+      ? `<a class="plugin-link" href="${escapeHtml(healthUrl)}" target="_blank" rel="noreferrer">health</a>`
       : '';
     const openUrl = serviceOpenUrl(service, report);
     const open = openUrl
@@ -173,7 +187,7 @@ function renderServiceRows(plugin: ManagedPlugin): string {
           <button type="button" class="btn-link" data-plugin-service="${escapeHtml(plugin.id)}" data-action="start">Start</button>
           <button type="button" class="btn-link" data-plugin-service="${escapeHtml(plugin.id)}" data-action="stop">Stop</button>
         </div>`
-      : '<span class="plugin-muted">外部自管，botmux 不启停</span>';
+      : '<span class="plugin-muted">外部控制，dashboard 不起停</span>';
     return `
       <div class="plugin-service-row">
         <div>
