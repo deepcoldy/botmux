@@ -402,6 +402,15 @@ function hermesFollowupReminder(locale?: Locale): string {
   return '普通文字回复不要调用 `botmux send`；直接把给用户看的答案写在 final，botmux 会自动转发到飞书。只有图片/文件/语音、跨群/顶层发送、特殊 @ 路由等特殊投递才用 `botmux send`；如果本轮已经用过，不要在 final 里再写第二份答案或发送成功回执。';
 }
 
+/**
+ * Peer count at/below which the `<available_bots>` block inlines the full
+ * roster (name + open_id). Above it the block collapses to a one-line pointer
+ * that lists names only and defers open_ids to `botmux bots list`, so a
+ * many-bot group doesn't spend a long open_id list on the first message of a
+ * topic that never collaborates.
+ */
+const AVAILABLE_BOTS_INLINE_MAX = 3;
+
 export function buildNewTopicPrompt(
   userMessage: string,
   sessionId: string,
@@ -476,10 +485,23 @@ export function buildNewTopicPrompt(
     const mentionedOpenIds = new Set(mentions?.map(m => m.openId).filter(Boolean));
     const unmentionedBots = availableBots.filter(b => !mentionedOpenIds.has(b.openId));
     if (unmentionedBots.length > 0) {
-      const items = unmentionedBots.map(
-        b => `  <bot name="${xmlEscape(b.displayName)}" open_id="${xmlEscape(b.openId)}" />`,
-      );
-      botBlock = `<available_bots hint="${xmlEscape(t('ai.available_bots.hint', undefined, locale))}">\n${items.join('\n')}\n</available_bots>`;
+      // ≤ threshold peers: inline the full roster with open_ids so any
+      // cross-bot message (a question, collaboration, or full handoff) needs
+      // zero round-trip. Above it: collapse to a one-line pointer — names only
+      // for awareness, open_ids deferred to an on-demand `botmux bots list` —
+      // so a many-bot group doesn't pay a long open_id list on every solo
+      // topic. Either way this block is emitted once, on the first message.
+      if (unmentionedBots.length <= AVAILABLE_BOTS_INLINE_MAX) {
+        const items = unmentionedBots.map(
+          b => `  <bot name="${xmlEscape(b.displayName)}" open_id="${xmlEscape(b.openId)}" />`,
+        );
+        botBlock = `<available_bots hint="${xmlEscape(t('ai.available_bots.hint', undefined, locale))}">\n${items.join('\n')}\n</available_bots>`;
+      } else {
+        const sep = locale === 'en' ? ', ' : '、';
+        const names = unmentionedBots.map(b => b.displayName).join(sep);
+        const line = t('ai.available_bots.collapsed_line', { count: unmentionedBots.length, names }, locale);
+        botBlock = `<available_bots hint="${xmlEscape(t('ai.available_bots.hint_collapsed', undefined, locale))}" count="${unmentionedBots.length}">\n${xmlEscape(line)}\n</available_bots>`;
+      }
     }
   }
 

@@ -533,11 +533,11 @@ export const messages: Record<string, string> = {
   'ai.identity.rule_silent_when_other': '- If the whole message is for another bot, stay silent — do not reply',
   'ai.identity.rule_no_proactive_pull': '- **Do not proactively pull other bots in by default.** Unless the user explicitly asks, or a segment can only be done by another bot, finish your part and stop.',
   'ai.identity.mention_intro': '**Hard fact about cross-bot collaboration**: in a Lark topic group, other bots **do NOT receive** the messages you send via `botmux send` by default —',
-  'ai.identity.mention_must': 'To hand work off to another bot, you **MUST** explicitly pass `--mention <other-bot-open-id>`. Without `--mention`, the other bot is not triggered at all.',
+  'ai.identity.mention_must': 'To communicate or collaborate with another bot (so it receives your message), you **MUST** explicitly pass `--mention <other-bot-open-id>`. Without `--mention`, the other bot is not triggered at all.',
   'ai.identity.mention_partners': '- Collaborator `open_id`s are listed in the `<available_bots>` block attached to every user message. You can also run `botmux bots list`.',
   'ai.identity.mention_usage': '- Usage: `botmux send --mention ou_xxx "message"` (repeat `--mention` for multiple bots). `--mention-back` @s back whoever (person or bot) triggered this turn — open_id is pulled from the session, no need to type it.',
   'ai.identity.mention_gate': '- **@ hard-gate**: every `botmux send` MUST explicitly pick one or it errors out — `--mention` (name someone) / `--mention-back` (@ the triggerer) / `--no-mention` (none). Choose by message VALUE: a substantive conclusion the other party should read/confirm/decide on → --mention-back (or --mention); pure record / low-priority progress / short ack → --no-mention; a contentless "got it" is better not sent at all. Do not let --no-mention become the default, and do not @ people for nothing.',
-  'ai.identity.mention_when_to': '- When to `--mention`: the user explicitly asks for the handoff, you\'re passing a sub-task to the other bot, or you need them to give the final result / take an independent action.',
+  'ai.identity.mention_when_to': '- When to `--mention`: you need to communicate or collaborate with the other bot, the user explicitly asks for a handoff, you\'re passing a sub-task to it, or you need them to give the final result / take an independent action.',
   'ai.identity.mention_when_not': '- When NOT to `--mention`: pure status updates / acknowledgements / thanks — fold them into the next message that has real content, to avoid mutual ping-spam.',
 
   // ─── AI hints (non-Claude CLIs: BOTMUX_SHELL_HINTS) ──────────────────────
@@ -548,12 +548,14 @@ export const messages: Record<string, string> = {
   'ai.shell.heredoc_example': "Correct multi-line example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
   'ai.shell.helpers': 'Helpers: `botmux history` (read this session\'s history — thread/topic sessions are topic-scoped; regular-group chat-scope sessions are group-wide), `botmux quoted <message_id>` (fetch a quoted message — only use it when the prompt header shows `[user quoted message ...]`), `botmux bots list` (list other bots in the group).',
   'ai.shell.when_to_send': 'When to send: key conclusions, plans (wait for user approval before acting), final results, progress updates. A bare `print`/`echo` does NOT count as a reply.',
-  'ai.shell.mention_gate': '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id:name>` (name a person/bot; REQUIRED to hand work to another bot) / `--mention-back` (@ the sender of the message you are replying to) / `--no-mention` (none). Choose by VALUE: substantive conclusion the other party should read/confirm/decide → --mention-back; pure record / low-priority / short ack → --no-mention; a contentless "got it" is better not sent. Do not default to --no-mention, and do not @ people for nothing.',
+  'ai.shell.mention_gate': '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id:name>` (name a person/bot; REQUIRED to communicate or collaborate with another bot) / `--mention-back` (@ the sender of the message you are replying to) / `--no-mention` (none). Choose by VALUE: substantive conclusion the other party should read/confirm/decide → --mention-back; pure record / low-priority / short ack → --no-mention; a contentless "got it" is better not sent. Do not default to --no-mention, and do not @ people for nothing.',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
   'ai.attach.hint': 'Read these with the Read tool. The index matches the [image N] / [file N] placeholders in the body.',
-  'ai.identity.short_routing': 'Reminder: handing work off to another bot REQUIRES `botmux send --mention <their open_id>` — without it, the other bot is not triggered.',
-  'ai.available_bots.hint': 'To hand work off to a bot listed here you MUST --mention its open_id (botmux send --mention ou_xxx ...). Without --mention the other bot receives nothing.',
+  'ai.identity.short_routing': 'Reminder: communicating or collaborating with another bot REQUIRES `botmux send --mention <their open_id>` — without it, the other bot is not triggered.',
+  'ai.available_bots.hint': 'To communicate or collaborate with a bot listed here you MUST --mention its open_id (botmux send --mention ou_xxx ...). Without --mention the other bot receives nothing.',
+  'ai.available_bots.hint_collapsed': 'To communicate or collaborate with another bot, first run `botmux bots list` to get its open_id, then --mention it. Without --mention the other bot receives nothing.',
+  'ai.available_bots.collapsed_line': 'There are {count} collaborator bots in this chat: {names}.',
   'ai.followup.reminder': 'Replies must go via `botmux send` — terminal output does not reach the user.',
   'ai.cursor.sender_note': 'The sender tag is metadata identifying the current speaker — never copy its open_id or name (e.g. ou_xxx:Alice) into your botmux send body or opening line; to @ the triggerer use botmux send --mention-back.',
   'ai.bridge.attachments_label': '[Attachments]',
