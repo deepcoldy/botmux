@@ -9,6 +9,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { randomBytes, createHmac } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { config } from './config.js';
@@ -119,6 +120,11 @@ import { larkHosts } from './im/lark/lark-hosts.js';
 import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
 import { readPluginRegistry } from './services/plugin-registry-store.js';
 import { pluginCurrentDir, resolvePluginPath } from './core/plugins/paths.js';
+import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
+import { listPluginServiceStatus, ensureManagedHostServices, stopManagedHostServices } from './core/plugins/service-manager.js';
+import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from './setup/bots-store.js';
+import { botProcessName } from './setup/bot-config-editor.js';
+import type { InstalledPluginRecord } from './core/plugins/types.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -947,6 +953,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(__dirname, 'dashboard-web');
 const DEV_RELOAD_MARKER = join(WEB_DIR, '.botmux-dashboard-dev');
 const DEV_RELOAD_VERSION = join(WEB_DIR, '.botmux-dashboard-reload');
+const PKG_ROOT = dirname(__dirname);
+const DASHBOARD_REQUIRE = createRequire(import.meta.url);
+const PM2_HOME = join(homedir(), '.botmux', 'pm2');
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -1085,6 +1094,200 @@ function servePluginStatic(res: ServerResponse, pathname: string): boolean {
   } catch {
     return false;
   }
+}
+
+function dashboardPm2Bin(): string {
+  if (process.platform === 'win32') {
+    const cmd = join(PKG_ROOT, 'node_modules', '.bin', 'pm2.cmd');
+    if (existsSync(cmd)) return cmd;
+  }
+  try {
+    return DASHBOARD_REQUIRE.resolve('pm2/bin/pm2');
+  } catch {
+    /* fall through */
+  }
+  const direct = join(PKG_ROOT, 'node_modules', 'pm2', 'bin', 'pm2');
+  if (existsSync(direct)) return direct;
+  const symlink = join(PKG_ROOT, 'node_modules', '.bin', 'pm2');
+  if (existsSync(symlink)) return symlink;
+  return 'pm2';
+}
+
+function pluginPm2Options() {
+  return { pm2Bin: dashboardPm2Bin(), pm2Home: PM2_HOME, nodePath: process.execPath };
+}
+
+function addPluginId(list: unknown, pluginId: string): string[] {
+  const current = normalizePluginIdList(list) ?? [];
+  return current.includes(pluginId) ? current : [...current, pluginId];
+}
+
+function removePluginId(list: unknown, pluginId: string): string[] {
+  return (normalizePluginIdList(list) ?? []).filter(id => id !== pluginId);
+}
+
+function pluginEnabledPatch(body: unknown): boolean | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const enabled = (body as { enabled?: unknown }).enabled;
+  return typeof enabled === 'boolean' ? enabled : null;
+}
+
+function requireInstalledPlugin(pluginId: string): InstalledPluginRecord | null {
+  if (!isValidPluginId(pluginId)) return null;
+  return readPluginRegistry().plugins[pluginId] ?? null;
+}
+
+function cleanPluginListForInstalled(list: unknown, installed: Set<string>): string[] {
+  return (normalizePluginIdList(list) ?? []).filter(id => installed.has(id));
+}
+
+function readDashboardBots(): Array<{ larkAppId: string; label: string; name?: string; cliId?: string; online: boolean; index: number }> {
+  const online = new Map(registry.list().map(d => [d.larkAppId, d]));
+  return readBotsJsonOrEmpty(BOTS_JSON_PATH)
+    .map((bot, index) => {
+      const larkAppId = typeof bot?.larkAppId === 'string' ? bot.larkAppId : '';
+      if (!larkAppId) return null;
+      const daemon = online.get(larkAppId);
+      const configuredName = typeof bot?.name === 'string' ? bot.name : undefined;
+      const daemonName = daemon?.botName && daemon.botName !== larkAppId ? daemon.botName : undefined;
+      const displayName = daemonName ?? configuredName;
+      const label = displayName
+        ? `${botProcessName(bot, index)} (${displayName})`
+        : botProcessName(bot, index);
+      const cliId = typeof bot?.cliId === 'string' ? bot.cliId : daemon?.cliId;
+      return {
+        larkAppId,
+        label,
+        ...(displayName ? { name: displayName } : {}),
+        ...(cliId ? { cliId } : {}),
+        online: !!daemon,
+        index,
+      };
+    })
+    .filter((item): item is { larkAppId: string; label: string; name?: string; cliId?: string; online: boolean; index: number } => !!item);
+}
+
+function listDashboardPluginsPayload(): Record<string, unknown> {
+  const registryFile = readPluginRegistry();
+  const installed = new Set(Object.keys(registryFile.plugins));
+  const globalPlugins = cleanPluginListForInstalled(readGlobalConfig().plugins, installed);
+  const globalSet = new Set(globalPlugins);
+  const rawBots = readBotsJsonOrEmpty(BOTS_JSON_PATH);
+  const bots = readDashboardBots();
+  const botEnabled = new Map<string, string[]>();
+  for (const bot of rawBots) {
+    const appId = typeof bot?.larkAppId === 'string' ? bot.larkAppId : '';
+    if (!appId) continue;
+    botEnabled.set(appId, cleanPluginListForInstalled(bot.plugins, installed));
+  }
+  const serviceReports = listPluginServiceStatus(pluginPm2Options());
+  const serviceByPlugin = new Map<string, typeof serviceReports>();
+  for (const report of serviceReports) {
+    const bucket = serviceByPlugin.get(report.pluginId) ?? [];
+    bucket.push(report);
+    serviceByPlugin.set(report.pluginId, bucket);
+  }
+  const plugins = Object.values(registryFile.plugins)
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map(record => ({
+      id: record.id,
+      packageName: record.packageName,
+      version: record.version,
+      source: record.source,
+      installedAt: record.installedAt,
+      updatedAt: record.updatedAt,
+      displayName: record.manifest.displayName,
+      hooks: record.manifest.hooks ?? [],
+      capabilities: record.manifest.capabilities ?? [],
+      dependencies: record.manifest.dependencies?.plugins ?? {},
+      skillsCount: record.manifest.skills?.length ?? 0,
+      mcpCount: record.manifest.mcp?.length ?? 0,
+      dashboard: (record.manifest.dashboard ?? []).map(entry => ({
+        ...entry,
+        url: `/plugins/${encodeURIComponent(record.id)}/${entry.entry}`,
+      })),
+      services: record.manifest.services ?? {},
+      serviceReports: serviceByPlugin.get(record.id) ?? [],
+      enabledGlobal: globalSet.has(record.id),
+      enabledBots: bots.filter(bot => (botEnabled.get(bot.larkAppId) ?? []).includes(record.id)).map(bot => bot.larkAppId),
+    }));
+  return { plugins, bots, globalPlugins };
+}
+
+function writeGlobalPluginBinding(pluginId: string, enabled: boolean): void {
+  const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+  const next = enabled ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+  mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
+}
+
+function writeBotPluginBinding(pluginId: string, larkAppId: string, enabled: boolean): boolean {
+  const bots = readBotsJsonOrEmpty(BOTS_JSON_PATH);
+  const idx = bots.findIndex(bot => bot?.larkAppId === larkAppId);
+  if (idx < 0) return false;
+  const current = normalizePluginIdList(bots[idx].plugins) ?? [];
+  const next = enabled ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+  if (next.length > 0) bots[idx].plugins = next;
+  else delete bots[idx].plugins;
+  writeBotsJsonAtomic(BOTS_JSON_PATH, bots);
+  return true;
+}
+
+function pluginJson(res: ServerResponse, status: number, body: unknown): true {
+  jsonRes(res, status, body);
+  return true;
+}
+
+async function handlePluginManagementApi(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+): Promise<boolean> {
+  if (req.method === 'GET' && url.pathname === '/api/plugins') {
+    return pluginJson(res, 200, listDashboardPluginsPayload());
+  }
+
+  let match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/global$/);
+  if (match) {
+    if (req.method !== 'PUT') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    let body: unknown;
+    try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
+    const enabled = pluginEnabledPatch(body);
+    if (enabled === null) return pluginJson(res, 400, { ok: false, error: 'invalid_enabled' });
+    writeGlobalPluginBinding(pluginId, enabled);
+    return pluginJson(res, 200, { ok: true, ...listDashboardPluginsPayload() });
+  }
+
+  match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/bots\/([^/]+)$/);
+  if (match) {
+    if (req.method !== 'PUT') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    const larkAppId = decodeURIComponent(match[2]);
+    if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    let body: unknown;
+    try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
+    const enabled = pluginEnabledPatch(body);
+    if (enabled === null) return pluginJson(res, 400, { ok: false, error: 'invalid_enabled' });
+    if (!writeBotPluginBinding(pluginId, larkAppId, enabled)) {
+      return pluginJson(res, 404, { ok: false, error: 'bot_not_found' });
+    }
+    return pluginJson(res, 200, { ok: true, ...listDashboardPluginsPayload() });
+  }
+
+  match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/services\/(start|stop)$/);
+  if (match) {
+    if (req.method !== 'POST') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    const action = match[2];
+    if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    const reports = action === 'start'
+      ? await ensureManagedHostServices(pluginPm2Options(), [pluginId])
+      : stopManagedHostServices(pluginPm2Options(), [pluginId]);
+    return pluginJson(res, 200, { ok: true, reports, ...listDashboardPluginsPayload() });
+  }
+
+  return false;
 }
 
 // ─── HTTP routing ────────────────────────────────────────────────────────────
@@ -1714,6 +1917,11 @@ const server = createServer(async (req, res) => {
         res.write(`event: reload\ndata: ${JSON.stringify({ version: next })}\n\n`);
       }, 500);
       req.on('close', () => clearInterval(timer));
+      return;
+    }
+
+    if ((url.pathname === '/api/plugins' || url.pathname.startsWith('/api/plugins/'))
+      && await handlePluginManagementApi(req, res, url)) {
       return;
     }
 
