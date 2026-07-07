@@ -83,5 +83,8 @@ export interface PluginServiceState {
   pluginId: string;
   serviceName: string;
   pm2Name?: string;
+  version?: string;
+  currentDir?: string;
+  currentRealpath?: string;
   updatedAt: string;
 }

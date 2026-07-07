@@ -309,6 +309,15 @@ function ensureUniqueBotProcessNames(bots: any[]): void {
     console.error('   请修改 bots.json 中的 name，确保进程名唯一。');
     process.exit(1);
   }
+  const pluginPrefix = `${PM2_NAME}-plugin-`;
+  for (let i = 0; i < bots.length; i++) {
+    const name = botProcessName(bots[i], i, PM2_NAME);
+    if (name.startsWith(pluginPrefix)) {
+      console.error(`❌ bot 进程名 ${name} 使用了插件 service 保留前缀 ${pluginPrefix}`);
+      console.error('   请修改 bots.json 中的 name，避免以 plugin- 开头。');
+      process.exit(1);
+    }
+  }
 }
 
 function ecosystemConfig(): string {

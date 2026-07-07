@@ -1,10 +1,11 @@
-import { existsSync, mkdirSync, rmSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, mkdirSync, readlinkSync, rmSync, realpathSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { buildPm2SpawnCommand } from '../../cli/pm2-command.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
+import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import { readPluginRegistry } from '../../services/plugin-registry-store.js';
-import { pluginCurrentDir, pluginServiceStatePath } from './paths.js';
+import { pluginCurrentDir, pluginServiceStatePath, pluginsHome } from './paths.js';
 import type { InstalledPluginRecord, PluginHostService, PluginServiceState } from './types.js';
 
 export interface PluginPm2Options {
@@ -20,6 +21,13 @@ export interface PluginServiceReport {
   action: 'started' | 'already-running' | 'stopped' | 'not-running' | 'external' | 'failed' | 'status';
   status?: string;
   warning?: string;
+}
+
+interface Pm2AppInfo {
+  name: string;
+  pid?: number;
+  status?: string;
+  cwd?: string;
 }
 
 export function pluginServicePm2Name(pluginId: string, serviceName: string): string {
@@ -57,9 +65,26 @@ function listPm2Apps(opts: PluginPm2Options): any[] {
   }
 }
 
+function toPm2AppInfo(entry: any): Pm2AppInfo | undefined {
+  const name = typeof entry?.name === 'string' ? entry.name : undefined;
+  if (!name) return undefined;
+  const status = entry?.pm2_env?.status ? String(entry.pm2_env.status) : undefined;
+  const cwd = entry?.pm2_env?.pm_cwd ? String(entry.pm2_env.pm_cwd) : undefined;
+  const pid = Number(entry?.pid) || undefined;
+  return { name, ...(pid ? { pid } : {}), ...(status ? { status } : {}), ...(cwd ? { cwd } : {}) };
+}
+
+function pm2AppsByName(opts: PluginPm2Options): Map<string, Pm2AppInfo> {
+  const out = new Map<string, Pm2AppInfo>();
+  for (const entry of listPm2Apps(opts)) {
+    const app = toPm2AppInfo(entry);
+    if (app) out.set(app.name, app);
+  }
+  return out;
+}
+
 function pm2AppStatus(opts: PluginPm2Options, pm2Name: string): string | undefined {
-  const app = listPm2Apps(opts).find((entry) => entry?.name === pm2Name);
-  return app?.pm2_env?.status ? String(app.pm2_env.status) : undefined;
+  return pm2AppsByName(opts).get(pm2Name)?.status;
 }
 
 async function checkHealth(url: string | undefined): Promise<string | undefined> {
@@ -87,13 +112,49 @@ async function checkHealth(url: string | undefined): Promise<string | undefined>
   return lastError || `health ${url} timed out`;
 }
 
-function writeServiceState(pluginId: string, serviceName: string, pm2Name: string): void {
+function serviceLockTarget(): string {
+  mkdirSync(pluginsHome(), { recursive: true });
+  return join(pluginsHome(), 'service-manager');
+}
+
+function processCwdRealpath(pid: number | undefined): string | undefined {
+  if (!pid || process.platform !== 'linux') return undefined;
+  try {
+    return realpathSync(readlinkSync(`/proc/${pid}/cwd`));
+  } catch {
+    return undefined;
+  }
+}
+
+function appMatchesCurrent(app: Pm2AppInfo, currentDir: string, currentRealpath: string): boolean {
+  const procCwd = processCwdRealpath(app.pid);
+  if (procCwd) return procCwd === currentRealpath;
+  if (!app.cwd) return false;
+  if (app.cwd === currentDir || app.cwd === currentRealpath) return true;
+  try {
+    return realpathSync(app.cwd) === currentRealpath;
+  } catch {
+    return false;
+  }
+}
+
+function writeServiceState(
+  pluginId: string,
+  serviceName: string,
+  pm2Name: string,
+  record: InstalledPluginRecord,
+  currentDir: string,
+  currentRealpath: string,
+): void {
   const file = pluginServiceStatePath(pluginId, serviceName);
   mkdirSync(dirname(file), { recursive: true });
   const state: PluginServiceState = {
     pluginId,
     serviceName,
     pm2Name,
+    version: record.version,
+    currentDir,
+    currentRealpath,
     updatedAt: new Date().toISOString(),
   };
   atomicWriteFileSync(file, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
@@ -112,77 +173,92 @@ export async function ensureManagedHostServices(
   opts: PluginPm2Options,
   pluginIds?: readonly string[],
 ): Promise<PluginServiceReport[]> {
-  const registry = readPluginRegistry();
-  const selected = pluginIds ? new Set(pluginIds) : undefined;
-  const reports: PluginServiceReport[] = [];
-  for (const record of Object.values(registry.plugins)) {
-    if (selected && !selected.has(record.id)) continue;
-    for (const [serviceName, service] of serviceEntries(record)) {
-      const pm2Name = pluginServicePm2Name(record.id, serviceName);
-      if (service.mode === 'external') {
-        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'external' });
-        continue;
-      }
-      if (!service.command?.length) {
-        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', warning: 'missing command' });
-        continue;
-      }
-      const current = pluginCurrentDir(record.id);
-      if (!existsSync(current)) {
-        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', warning: `missing current dir: ${current}` });
-        continue;
-      }
-      const status = pm2AppStatus(opts, pm2Name);
-      if (status === 'online') {
-        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'already-running', status });
-        continue;
-      }
-      try {
-        runPm2(opts, ['start', service.command[0], '--name', pm2Name, '--cwd', current, '--', ...service.command.slice(1)], 30_000);
-        writeServiceState(record.id, serviceName, pm2Name);
-        reports.push({
-          pluginId: record.id,
-          serviceName,
-          pm2Name,
-          action: 'started',
-          warning: await checkHealth(service.healthUrl),
-        });
-      } catch (err: any) {
-        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', warning: err?.message ?? String(err) });
+  return withFileLock(serviceLockTarget(), async () => {
+    const registry = readPluginRegistry();
+    const selected = pluginIds ? new Set(pluginIds) : undefined;
+    const reports: PluginServiceReport[] = [];
+    const apps = pm2AppsByName(opts);
+    for (const record of Object.values(registry.plugins)) {
+      if (selected && !selected.has(record.id)) continue;
+      for (const [serviceName, service] of serviceEntries(record)) {
+        const pm2Name = pluginServicePm2Name(record.id, serviceName);
+        if (service.mode === 'external') {
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'external' });
+          continue;
+        }
+        if (!service.command?.length) {
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', warning: 'missing command' });
+          continue;
+        }
+        const current = pluginCurrentDir(record.id);
+        if (!existsSync(current)) {
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', warning: `missing current dir: ${current}` });
+          continue;
+        }
+        const currentRealpath = realpathSync(current);
+        const app = apps.get(pm2Name);
+        if (app?.status === 'online' && appMatchesCurrent(app, current, currentRealpath)) {
+          writeServiceState(record.id, serviceName, pm2Name, record, current, currentRealpath);
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'already-running', status: app.status });
+          continue;
+        }
+        try {
+          if (app) runPm2(opts, ['delete', pm2Name], 20_000);
+          runPm2(opts, ['start', service.command[0], '--name', pm2Name, '--cwd', current, '--', ...service.command.slice(1)], 30_000);
+          writeServiceState(record.id, serviceName, pm2Name, record, current, currentRealpath);
+          const reason = app
+            ? app.status === 'online'
+              ? 'recreated because process cwd/version did not match current plugin'
+              : `recreated from pm2 status ${app.status ?? 'unknown'}`
+            : undefined;
+          const healthWarning = await checkHealth(service.healthUrl);
+          reports.push({
+            pluginId: record.id,
+            serviceName,
+            pm2Name,
+            action: 'started',
+            ...(reason || healthWarning ? { warning: [reason, healthWarning].filter(Boolean).join('; ') } : {}),
+          });
+        } catch (err: any) {
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', status: app?.status, warning: err?.message ?? String(err) });
+        }
       }
     }
-  }
-  return reports;
+    return reports;
+  }, { maxWaitMs: 30_000 });
 }
 
 export function stopManagedHostServices(
   opts: PluginPm2Options,
   pluginIds?: readonly string[],
 ): PluginServiceReport[] {
-  const registry = readPluginRegistry();
-  const selected = pluginIds ? new Set(pluginIds) : undefined;
-  const reports: PluginServiceReport[] = [];
-  for (const record of Object.values(registry.plugins)) {
-    if (selected && !selected.has(record.id)) continue;
-    for (const [serviceName, service] of serviceEntries(record)) {
-      const pm2Name = pluginServicePm2Name(record.id, serviceName);
-      if (service.mode !== 'managed') continue;
-      const status = pm2AppStatus(opts, pm2Name);
-      if (!status) {
-        deleteServiceState(record.id, serviceName);
-        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'not-running' });
-        continue;
-      }
-      try {
-        runPm2(opts, ['delete', pm2Name], 20_000);
-        deleteServiceState(record.id, serviceName);
-        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'stopped', status });
-      } catch (err: any) {
-        reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', status, warning: err?.message ?? String(err) });
+  return withFileLockSync(serviceLockTarget(), () => {
+    const registry = readPluginRegistry();
+    const selected = pluginIds ? new Set(pluginIds) : undefined;
+    const reports: PluginServiceReport[] = [];
+    const apps = pm2AppsByName(opts);
+    for (const record of Object.values(registry.plugins)) {
+      if (selected && !selected.has(record.id)) continue;
+      for (const [serviceName, service] of serviceEntries(record)) {
+        const pm2Name = pluginServicePm2Name(record.id, serviceName);
+        if (service.mode !== 'managed') continue;
+        const status = apps.get(pm2Name)?.status;
+        if (!status) {
+          deleteServiceState(record.id, serviceName);
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'not-running' });
+          continue;
+        }
+        try {
+          runPm2(opts, ['delete', pm2Name], 20_000);
+          deleteServiceState(record.id, serviceName);
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'stopped', status });
+        } catch (err: any) {
+          reports.push({ pluginId: record.id, serviceName, pm2Name, action: 'failed', status, warning: err?.message ?? String(err) });
+        }
       }
     }
-  }
-  return reports;
+    return reports;
+  }, { maxWaitMs: 30_000 });
 }
 
 export function listPluginServiceStatus(opts: PluginPm2Options): PluginServiceReport[] {
