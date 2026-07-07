@@ -1899,6 +1899,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
   it('shared follow-up with mention mode topic yields when the reply @mentions ANOTHER bot', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'topic' });
     mockGetChatMode.mockResolvedValue('group');
+    mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 2 });
     handlers.resolveReplyThreadAlias.mockReturnValue({ chatId: 'chat-reply-mode', sessionId: 'sess-chat' });
     handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
     const event = makeUserMessageEvent({
