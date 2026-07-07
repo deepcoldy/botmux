@@ -4,14 +4,13 @@ import type {
   BotmuxPluginManifest,
   PluginDashboardEntry,
   PluginHook,
-  PluginHostService,
   PluginMcpServer,
   PluginPackageManifest,
+  PluginServiceConfig,
   PluginSkillEntry,
 } from './types.js';
 
 const VALID_HOOKS = new Set<PluginHook>(['cli', 'daemon', 'worker', 'dashboard', 'adapters']);
-const SAFE_KEY_RE = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/;
 
 function asRecord(value: unknown, field: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`invalid_${field}`);
@@ -97,36 +96,12 @@ function readCommand(raw: unknown, field: string): string[] | undefined {
     : part);
 }
 
-function readServices(raw: unknown): Record<string, PluginHostService> | undefined {
+function readService(raw: unknown): PluginServiceConfig | undefined {
   if (raw === undefined) return undefined;
-  const services = asRecord(raw, 'botmux_services');
-  const out: Record<string, PluginHostService> = {};
-  for (const [name, value] of Object.entries(services)) {
-    if (!SAFE_KEY_RE.test(name)) throw new Error(`invalid_plugin_service_name:${name}`);
-    const record = asRecord(value, 'botmux_service');
-    const scope = record.scope === undefined ? 'host' : record.scope;
-    const mode = record.mode === undefined ? 'external' : record.mode;
-    if (scope !== 'host') throw new Error(`invalid_plugin_service_scope:${name}`);
-    if (mode !== 'managed' && mode !== 'external') throw new Error(`invalid_plugin_service_mode:${name}`);
-    const command = readCommand(record.command, `service_command_${name}`);
-    if (mode === 'managed' && !command) throw new Error(`plugin_managed_service_missing_command:${name}`);
-    const port = typeof record.port === 'number' && Number.isInteger(record.port) && record.port > 0 && record.port <= 65535
-      ? record.port
-      : undefined;
-    const healthUrl = optionalString(record.healthUrl);
-    const openUrl = optionalString(record.openUrl);
-    const description = optionalString(record.description);
-    out[name] = {
-      scope: 'host',
-      mode,
-      ...(command ? { command } : {}),
-      ...(port ? { port } : {}),
-      ...(healthUrl ? { healthUrl } : {}),
-      ...(openUrl ? { openUrl } : {}),
-      ...(description ? { description } : {}),
-    };
-  }
-  return Object.keys(out).length > 0 ? out : undefined;
+  const record = asRecord(raw, 'botmux_service');
+  const mode = record.mode === undefined ? 'manual' : record.mode;
+  if (mode !== 'manual' && mode !== 'lifecycle') throw new Error('invalid_plugin_service_mode');
+  return { mode };
 }
 
 function readEnv(raw: unknown, field: string): Record<string, string> | undefined {
@@ -171,7 +146,9 @@ export function parseBotmuxManifest(raw: unknown): BotmuxPluginManifest {
   const dependencies = readDependencies(record.dependencies);
   const skills = readSkills(record.skills);
   const dashboard = readDashboard(record.dashboard);
-  const services = readServices(record.services);
+  if (record.services !== undefined) throw new Error('deprecated_plugin_services_field');
+  const service = readService(record.service);
+  if (service && !main) throw new Error('plugin_service_missing_main');
   const mcp = readMcp(record.mcp);
   return {
     schemaVersion: 1,
@@ -183,7 +160,7 @@ export function parseBotmuxManifest(raw: unknown): BotmuxPluginManifest {
     ...(dependencies ? { dependencies } : {}),
     ...(skills ? { skills } : {}),
     ...(dashboard ? { dashboard } : {}),
-    ...(services ? { services } : {}),
+    ...(service ? { service } : {}),
     ...(mcp ? { mcp } : {}),
   };
 }

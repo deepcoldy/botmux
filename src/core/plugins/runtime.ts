@@ -10,7 +10,7 @@ import {
   resolvePluginPath,
 } from './paths.js';
 import { resolveStaticPluginMcpServers, type ResolvedPluginMcpServer, type ResolvePluginMcpInput } from './mcp.js';
-import type { BotmuxPluginManifest, InstalledPluginRecord, PluginRuntime } from './types.js';
+import type { BotmuxPluginManifest, InstalledPluginRecord, PluginHook, PluginRuntime } from './types.js';
 
 export interface PluginApplyContext {
   runtime: PluginRuntime;
@@ -19,6 +19,21 @@ export interface PluginApplyContext {
   packageName: string;
   version: string;
   manifest: BotmuxPluginManifest;
+}
+
+export interface PluginServiceRuntimeInfo {
+  status?: string;
+  pid?: number;
+  port?: number;
+  openUrl?: string;
+  healthUrl?: string;
+  [key: string]: unknown;
+}
+
+export interface PluginServiceController {
+  start?(ctx: PluginApplyContext, previousState?: PluginServiceRuntimeInfo): PluginServiceRuntimeInfo | Promise<PluginServiceRuntimeInfo>;
+  stop?(ctx: PluginApplyContext, previousState?: PluginServiceRuntimeInfo): void | PluginServiceRuntimeInfo | Promise<void | PluginServiceRuntimeInfo>;
+  status?(ctx: PluginApplyContext, previousState?: PluginServiceRuntimeInfo): PluginServiceRuntimeInfo | Promise<PluginServiceRuntimeInfo>;
 }
 
 export interface PluginConfigApi {
@@ -118,7 +133,7 @@ function createConfigApi(pluginId: string): PluginConfigApi {
   };
 }
 
-function hasRuntimeHook(record: InstalledPluginRecord, runtime: PluginRuntime): boolean {
+function hasRuntimeHook(record: InstalledPluginRecord, runtime: Extract<PluginHook, PluginRuntime>): boolean {
   if (!record.manifest.main) return false;
   const hooks = record.manifest.hooks;
   return !hooks || hooks.includes(runtime);
@@ -157,6 +172,31 @@ async function importPluginApply(record: InstalledPluginRecord): Promise<((api: 
   if (typeof exported === 'function') return exported;
   if (exported && typeof exported.apply === 'function') return exported.apply.bind(exported);
   throw new Error(`plugin_apply_not_found:${record.id}`);
+}
+
+export async function loadPluginServiceController(record: InstalledPluginRecord): Promise<PluginServiceController | undefined> {
+  if (!record.manifest.service) return undefined;
+  if (!record.manifest.main) throw new Error(`plugin_service_missing_main:${record.id}`);
+  const pluginDir = pluginCurrentDir(record.id);
+  const entry = resolvePluginPath(pluginDir, record.manifest.main, 'main');
+  if (!existsSync(entry)) throw new Error(`plugin_main_not_found:${record.id}:${record.manifest.main}`);
+  const mod = await import(pathToFileURL(entry).href);
+  const exported = mod.default ?? mod;
+  const applyService = typeof mod.applyService === 'function'
+    ? mod.applyService
+    : exported && typeof exported.applyService === 'function'
+      ? exported.applyService.bind(exported)
+      : undefined;
+  const controller = applyService
+    ? await applyService(baseApi(record, 'service'), baseContext(record, 'service'))
+    : exported && typeof exported.service === 'object'
+      ? exported.service
+      : undefined;
+  if (!controller || typeof controller !== 'object') throw new Error(`plugin_service_controller_not_found:${record.id}`);
+  if (typeof controller.start !== 'function' && typeof controller.stop !== 'function' && typeof controller.status !== 'function') {
+    throw new Error(`plugin_service_controller_empty:${record.id}`);
+  }
+  return controller as PluginServiceController;
 }
 
 function baseContext(record: InstalledPluginRecord, runtime: PluginRuntime): PluginApplyContext {

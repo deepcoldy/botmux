@@ -39,8 +39,8 @@ export function pluginSettingsPath(pluginId: string): string {
   return join(pluginHome(pluginId), 'settings.json');
 }
 
-export function pluginServiceStatePath(pluginId: string, serviceName: string): string {
-  return join(pluginHome(pluginId), 'services', `${serviceName}.json`);
+export function pluginServiceStatePath(pluginId: string): string {
+  return join(pluginHome(pluginId), 'service.json');
 }
 
 export function ensurePluginHome(pluginId: string): string {

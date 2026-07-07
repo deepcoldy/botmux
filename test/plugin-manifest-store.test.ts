@@ -46,24 +46,14 @@ describe('plugin manifest and registry basics', () => {
         dependencies: { plugins: { gitlab: '^1.0.0' } },
         skills: [{ path: './skills/browser' }],
         dashboard: [{ id: 'agent-chrome', route: '#/plugins/agent-chrome', entry: './dashboard/index.html' }],
-        services: {
-          agentChrome: {
-            scope: 'host',
-            mode: 'managed',
-            command: ['node', './dist/acs.js'],
-            port: 9300,
-            healthUrl: 'http://127.0.0.1:9300/health',
-            openUrl: 'http://127.0.0.1:9300/',
-          },
-        },
+        service: { mode: 'manual' },
         mcp: [{ name: 'agent-chrome', command: ['node', './dist/mcp.js'], env: { ACS_URL: '${plugin.settings.acsUrl}' } }],
       },
     });
 
     expect(pkg.botmux.id).toBe('agent-chrome');
     expect(pkg.botmux.main).toBe('dist/plugin.js');
-    expect(pkg.botmux.services?.agentChrome.command).toEqual(['node', 'dist/acs.js']);
-    expect(pkg.botmux.services?.agentChrome.openUrl).toBe('http://127.0.0.1:9300/');
+    expect(pkg.botmux.service?.mode).toBe('manual');
     expect(pkg.botmux.mcp?.[0].env).toEqual({ ACS_URL: '${plugin.settings.acsUrl}' });
   });
 

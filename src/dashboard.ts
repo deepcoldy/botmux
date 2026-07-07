@@ -9,7 +9,6 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { createRequire } from 'node:module';
 import { randomBytes, createHmac } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { config } from './config.js';
@@ -121,7 +120,7 @@ import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, handleRe
 import { readPluginRegistry } from './services/plugin-registry-store.js';
 import { pluginCurrentDir, resolvePluginPath } from './core/plugins/paths.js';
 import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
-import { listPluginServiceStatus, ensureManagedHostServices, stopManagedHostServices } from './core/plugins/service-manager.js';
+import { listPluginServiceStatus, startPluginServices, stopPluginServices } from './core/plugins/service-manager.js';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from './setup/bots-store.js';
 import { botProcessName } from './setup/bot-config-editor.js';
 import type { InstalledPluginRecord } from './core/plugins/types.js';
@@ -953,9 +952,6 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(__dirname, 'dashboard-web');
 const DEV_RELOAD_MARKER = join(WEB_DIR, '.botmux-dashboard-dev');
 const DEV_RELOAD_VERSION = join(WEB_DIR, '.botmux-dashboard-reload');
-const PKG_ROOT = dirname(__dirname);
-const DASHBOARD_REQUIRE = createRequire(import.meta.url);
-const PM2_HOME = join(homedir(), '.botmux', 'pm2');
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -1096,27 +1092,6 @@ function servePluginStatic(res: ServerResponse, pathname: string): boolean {
   }
 }
 
-function dashboardPm2Bin(): string {
-  if (process.platform === 'win32') {
-    const cmd = join(PKG_ROOT, 'node_modules', '.bin', 'pm2.cmd');
-    if (existsSync(cmd)) return cmd;
-  }
-  try {
-    return DASHBOARD_REQUIRE.resolve('pm2/bin/pm2');
-  } catch {
-    /* fall through */
-  }
-  const direct = join(PKG_ROOT, 'node_modules', 'pm2', 'bin', 'pm2');
-  if (existsSync(direct)) return direct;
-  const symlink = join(PKG_ROOT, 'node_modules', '.bin', 'pm2');
-  if (existsSync(symlink)) return symlink;
-  return 'pm2';
-}
-
-function pluginPm2Options() {
-  return { pm2Bin: dashboardPm2Bin(), pm2Home: PM2_HOME, nodePath: process.execPath };
-}
-
 function addPluginId(list: unknown, pluginId: string): string[] {
   const current = normalizePluginIdList(list) ?? [];
   return current.includes(pluginId) ? current : [...current, pluginId];
@@ -1167,7 +1142,7 @@ function readDashboardBots(): Array<{ larkAppId: string; label: string; name?: s
     .filter((item): item is { larkAppId: string; label: string; name?: string; cliId?: string; online: boolean; index: number } => !!item);
 }
 
-function listDashboardPluginsPayload(): Record<string, unknown> {
+async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
   const registryFile = readPluginRegistry();
   const installed = new Set(Object.keys(registryFile.plugins));
   const globalPlugins = cleanPluginListForInstalled(readGlobalConfig().plugins, installed);
@@ -1180,7 +1155,7 @@ function listDashboardPluginsPayload(): Record<string, unknown> {
     if (!appId) continue;
     botEnabled.set(appId, cleanPluginListForInstalled(bot.plugins, installed));
   }
-  const serviceReports = listPluginServiceStatus(pluginPm2Options());
+  const serviceReports = await listPluginServiceStatus();
   const serviceByPlugin = new Map<string, typeof serviceReports>();
   for (const report of serviceReports) {
     const bucket = serviceByPlugin.get(report.pluginId) ?? [];
@@ -1206,8 +1181,8 @@ function listDashboardPluginsPayload(): Record<string, unknown> {
         ...entry,
         url: `/plugins/${encodeURIComponent(record.id)}/${entry.entry}`,
       })),
-      services: record.manifest.services ?? {},
-      serviceReports: serviceByPlugin.get(record.id) ?? [],
+      service: record.manifest.service,
+      serviceReport: serviceByPlugin.get(record.id)?.[0],
       enabledGlobal: globalSet.has(record.id),
       enabledBots: bots.filter(bot => (botEnabled.get(bot.larkAppId) ?? []).includes(record.id)).map(bot => bot.larkAppId),
     }));
@@ -1243,7 +1218,7 @@ async function handlePluginManagementApi(
   url: URL,
 ): Promise<boolean> {
   if (req.method === 'GET' && url.pathname === '/api/plugins') {
-    return pluginJson(res, 200, listDashboardPluginsPayload());
+    return pluginJson(res, 200, await listDashboardPluginsPayload());
   }
 
   let match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/global$/);
@@ -1256,7 +1231,7 @@ async function handlePluginManagementApi(
     const enabled = pluginEnabledPatch(body);
     if (enabled === null) return pluginJson(res, 400, { ok: false, error: 'invalid_enabled' });
     writeGlobalPluginBinding(pluginId, enabled);
-    return pluginJson(res, 200, { ok: true, ...listDashboardPluginsPayload() });
+    return pluginJson(res, 200, { ok: true, ...(await listDashboardPluginsPayload()) });
   }
 
   match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/bots\/([^/]+)$/);
@@ -1272,7 +1247,7 @@ async function handlePluginManagementApi(
     if (!writeBotPluginBinding(pluginId, larkAppId, enabled)) {
       return pluginJson(res, 404, { ok: false, error: 'bot_not_found' });
     }
-    return pluginJson(res, 200, { ok: true, ...listDashboardPluginsPayload() });
+    return pluginJson(res, 200, { ok: true, ...(await listDashboardPluginsPayload()) });
   }
 
   match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/services\/(start|stop)$/);
@@ -1282,9 +1257,9 @@ async function handlePluginManagementApi(
     const action = match[2];
     if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
     const reports = action === 'start'
-      ? await ensureManagedHostServices(pluginPm2Options(), [pluginId])
-      : stopManagedHostServices(pluginPm2Options(), [pluginId]);
-    return pluginJson(res, 200, { ok: true, reports, ...listDashboardPluginsPayload() });
+      ? await startPluginServices([pluginId])
+      : await stopPluginServices([pluginId]);
+    return pluginJson(res, 200, { ok: true, reports, ...(await listDashboardPluginsPayload()) });
   }
 
   return false;

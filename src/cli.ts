@@ -6,9 +6,9 @@
  *   botmux setup          — interactive first-time configuration
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
  *   botmux setup list|add|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
- *   botmux start [--include-plugin-services] — start daemon (optionally start plugin services)
- *   botmux stop [--include-plugin-services] — stop daemon (optionally stop plugin services)
- *   botmux restart [--include-pm2] [--include-plugin-services] — restart daemon (optionally restart PM2 God / plugin services)
+ *   botmux start          — start daemon and lifecycle plugin services
+ *   botmux stop [--with-plugin] — stop daemon (optionally stop lifecycle plugin services)
+ *   botmux restart [--include-pm2] [--with-plugin] — restart daemon (optionally restart PM2 God / lifecycle plugin services)
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
  *   botmux upgrade        — upgrade to latest version
@@ -1734,7 +1734,6 @@ async function cmdStart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
-  const includePluginServices = process.argv.includes('--include-plugin-services');
   killDuplicatePm2GodDaemons();
   preflightNodeSanity();
   await ensureSystemDependencies();
@@ -1775,7 +1774,7 @@ async function cmdStart(): Promise<void> {
   cleanupLegacyPm2();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
-  if (includePluginServices) await reconcilePluginServicesForCli();
+  await reconcilePluginServicesForCli(undefined, { lifecycleOnly: true });
   const bots = loadBotsJson();
   const count = bots.length || 1;
   console.log(`\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
@@ -1922,7 +1921,7 @@ function cleanupLegacyPm2(): boolean {
 }
 
 async function cmdStop(): Promise<void> {
-  const includePluginServices = process.argv.includes('--include-plugin-services');
+  const includePluginServices = process.argv.includes('--with-plugin');
   killDuplicatePm2GodDaemons();
   cleanupLegacyPm2();
   let stopped = false;
@@ -1937,7 +1936,7 @@ async function cmdStop(): Promise<void> {
   } catch { /* */ }
   // Wipe abandoned dashboard-daemon descriptors left behind by stopped daemons.
   cleanupStaleDaemonDescriptors();
-  if (includePluginServices) await stopPluginServicesForCli();
+  if (includePluginServices) await stopPluginServicesForCli(undefined, { lifecycleOnly: true });
   if (!stopped) console.log('daemon 未在运行。');
 }
 
@@ -1949,7 +1948,7 @@ async function cmdRestart(): Promise<void> {
   }
   ensureConfigDir();
   const includePm2 = process.argv.includes('--include-pm2');
-  const includePluginServices = process.argv.includes('--include-plugin-services');
+  const includePluginServices = process.argv.includes('--with-plugin');
   // Drop a restart-intent breadcrumb so the fresh daemon knows this was an
   // intentional restart and DMs the owner a summary. `IfAbsent` preserves a
   // richer breadcrumb (update / auto-restart) already written by the
@@ -1966,14 +1965,14 @@ async function cmdRestart(): Promise<void> {
   cleanupLegacyPm2();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
-  if (includePluginServices) await stopPluginServicesForCli();
+  if (includePluginServices) await stopPluginServicesForCli(undefined, { lifecycleOnly: true });
   if (includePm2) {
     killPm2GodDaemon();
   }
   // Wipe abandoned dashboard-daemon descriptors left behind by killed daemons.
   cleanupStaleDaemonDescriptors();
   runPm2(['start', cfg]);
-  if (includePluginServices) await reconcilePluginServicesForCli();
+  if (includePluginServices) await reconcilePluginServicesForCli(undefined, { lifecycleOnly: true });
   if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
     console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
   }
@@ -3619,9 +3618,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 命令:
   setup       交互式配置（首次使用 / 添加机器人）
               默认使用 botmux 内置 Feishu Web QR 登录尝试自动导入权限/redirect/发布版本；可加 --no-open-platform-auto 跳过
-  start       启动 daemon（默认不启动插件 service；--include-plugin-services 显式启动插件 service）
-  stop        停止 daemon（默认不停止插件 service；--include-plugin-services 显式停止插件 service）
-  restart     重启 daemon（默认不重启插件 service；--include-plugin-services 显式重启插件 service；--include-pm2 同时重启 PM2 God）
+  start       启动 daemon，并启动 mode=lifecycle 的插件 service
+  stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=lifecycle 的插件 service）
+  restart     重启 daemon（默认不重启插件 service；--with-plugin 显式重启 mode=lifecycle 的插件 service；--include-pm2 同时重启 PM2 God）
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
   upgrade     升级到最新版本
@@ -6785,32 +6784,35 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
   }
 }
 
-function pluginPm2Options() {
-  return { pm2Bin: pm2Bin(), pm2Home: PM2_HOME, nodePath: process.execPath };
-}
-
-function formatPluginServiceReports(reports: Array<{ pluginId: string; serviceName: string; action: string; status?: string; openUrl?: string; warning?: string }>): string {
+function formatPluginServiceReports(reports: Array<{ pluginId: string; action: string; status?: string; mode?: string; openUrl?: string; warning?: string }>): string {
   if (reports.length === 0) return '无插件 host service。';
   return reports.map(r => {
     const status = r.status ? r.action === 'stopped' ? ` (was ${r.status})` : ` (${r.status})` : '';
+    const mode = r.mode ? ` mode=${r.mode}` : '';
     const openUrl = r.openUrl ? ` url=${r.openUrl}` : '';
     const warning = r.warning ? ` ⚠ ${r.warning}` : '';
-    return `- ${r.pluginId}/${r.serviceName}: ${r.action}${status}${openUrl}${warning}`;
+    return `- ${r.pluginId}: ${r.action}${status}${mode}${openUrl}${warning}`;
   }).join('\n');
 }
 
-async function reconcilePluginServicesForCli(pluginIds?: string[]): Promise<void> {
-  const { ensureManagedHostServices } = await import('./core/plugins/service-manager.js');
-  const reports = await ensureManagedHostServices(pluginPm2Options(), pluginIds);
+async function reconcilePluginServicesForCli(
+  pluginIds?: string[],
+  options: { lifecycleOnly?: boolean } = {},
+): Promise<void> {
+  const { startPluginServices } = await import('./core/plugins/service-manager.js');
+  const reports = await startPluginServices(pluginIds, options);
   if (reports.length > 0) {
     console.log('\n插件 host service:');
     console.log(formatPluginServiceReports(reports));
   }
 }
 
-async function stopPluginServicesForCli(pluginIds?: string[]): Promise<void> {
-  const { stopManagedHostServices } = await import('./core/plugins/service-manager.js');
-  const reports = stopManagedHostServices(pluginPm2Options(), pluginIds);
+async function stopPluginServicesForCli(
+  pluginIds?: string[],
+  options: { lifecycleOnly?: boolean } = {},
+): Promise<void> {
+  const { stopPluginServices } = await import('./core/plugins/service-manager.js');
+  const reports = await stopPluginServices(pluginIds, options);
   if (reports.length > 0) {
     console.log('\n插件 host service:');
     console.log(formatPluginServiceReports(reports));
@@ -7091,7 +7093,7 @@ async function cmdPlugin(args: string[]): Promise<void> {
     const pluginIds = !rawId || rawId === '--all' ? undefined : [requirePluginId(rawId)];
     if (action === 'status' || action === 'list') {
       const { listPluginServiceStatus } = await import('./core/plugins/service-manager.js');
-      console.log(formatPluginServiceReports(listPluginServiceStatus(pluginPm2Options())));
+      console.log(formatPluginServiceReports(await listPluginServiceStatus()));
       return;
     }
     if (action === 'start') {

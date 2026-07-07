@@ -1,7 +1,6 @@
-export type PluginRuntime = 'cli' | 'daemon' | 'worker' | 'dashboard';
-export type PluginHook = PluginRuntime | 'adapters';
-export type PluginServiceScope = 'host';
-export type PluginServiceMode = 'managed' | 'external';
+export type PluginRuntime = 'cli' | 'daemon' | 'worker' | 'dashboard' | 'service';
+export type PluginHook = Exclude<PluginRuntime, 'service'> | 'adapters';
+export type PluginServiceMode = 'manual' | 'lifecycle';
 
 export interface PluginDashboardEntry {
   id: string;
@@ -20,14 +19,8 @@ export interface PluginMcpServer {
   env?: Record<string, string>;
 }
 
-export interface PluginHostService {
-  scope: PluginServiceScope;
+export interface PluginServiceConfig {
   mode: PluginServiceMode;
-  command?: string[];
-  port?: number;
-  healthUrl?: string;
-  openUrl?: string;
-  description?: string;
 }
 
 export interface BotmuxPluginManifest {
@@ -42,7 +35,7 @@ export interface BotmuxPluginManifest {
   };
   skills?: PluginSkillEntry[];
   dashboard?: PluginDashboardEntry[];
-  services?: Record<string, PluginHostService>;
+  service?: PluginServiceConfig;
   mcp?: PluginMcpServer[];
 }
 
@@ -82,10 +75,14 @@ export interface PluginSettingsFile {
 
 export interface PluginServiceState {
   pluginId: string;
-  serviceName: string;
-  pm2Name?: string;
   version?: string;
   currentDir?: string;
   currentRealpath?: string;
   updatedAt: string;
+  status?: string;
+  pid?: number;
+  port?: number;
+  openUrl?: string;
+  healthUrl?: string;
+  [key: string]: unknown;
 }

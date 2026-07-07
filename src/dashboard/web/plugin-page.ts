@@ -18,20 +18,16 @@ interface DashboardBotEntry {
 }
 
 interface PluginServiceDeclaration {
-  scope?: string;
-  mode?: 'managed' | 'external' | string;
-  port?: number;
-  healthUrl?: string;
-  openUrl?: string;
-  description?: string;
+  mode?: 'manual' | 'lifecycle' | string;
 }
 
 interface PluginServiceReport {
   pluginId: string;
-  serviceName: string;
-  pm2Name: string;
   action: string;
+  mode?: 'manual' | 'lifecycle' | string;
   status?: string;
+  pid?: number;
+  port?: number;
   warning?: string;
   openUrl?: string;
   healthUrl?: string;
@@ -49,8 +45,8 @@ interface ManagedPlugin {
   skillsCount?: number;
   mcpCount?: number;
   dashboard?: Array<{ id: string; route: string; entry: string; url: string }>;
-  services?: Record<string, PluginServiceDeclaration>;
-  serviceReports?: PluginServiceReport[];
+  service?: PluginServiceDeclaration;
+  serviceReport?: PluginServiceReport;
   enabledGlobal?: boolean;
   enabledBots?: string[];
 }
@@ -113,68 +109,60 @@ function renderTags(values: readonly string[] | undefined): string {
   return values.map(value => `<span class="plugin-chip">${escapeHtml(value)}</span>`).join('');
 }
 
-function serviceReportFor(plugin: ManagedPlugin, serviceName: string): PluginServiceReport | undefined {
-  return plugin.serviceReports?.find(report => report.serviceName === serviceName);
-}
-
-function serviceLabel(service: PluginServiceDeclaration, report?: PluginServiceReport): string {
-  if (service.mode === 'external') return 'external';
+function serviceLabel(report?: PluginServiceReport): string {
   if (!report) return 'unknown';
   if (report.status) return report.status;
   return report.action;
 }
 
 function serviceControlLabel(service: PluginServiceDeclaration): string | undefined {
-  if (service.mode === 'managed') return 'Dashboard/CLI 可手动启停';
-  if (service.mode === 'external') return '外部系统启停';
+  if (service.mode === 'manual' || service.mode === 'lifecycle') return 'Dashboard/CLI 可手动启停';
   return service.mode;
 }
 
 function serviceLifecycleLabel(service: PluginServiceDeclaration): string {
-  if (service.mode === 'managed') return '不随 botmux start/stop/restart 自动启停';
-  if (service.mode === 'external') return '不随 botmux 生命周期启停';
+  if (service.mode === 'manual') return '不随 botmux start/stop/restart 自动启停';
+  if (service.mode === 'lifecycle') return '随 botmux start 启动；stop/restart 需 --with-plugin 才处理';
   return '未知生命周期策略';
 }
 
 function serviceStatusClass(service: PluginServiceDeclaration, report?: PluginServiceReport): string {
-  const label = serviceLabel(service, report);
+  const label = serviceLabel(report);
   if (label === 'online' || label === 'started' || label === 'already-running') return 'plugin-status-ok';
   if (label === 'stopped' || label === 'not-running') return 'plugin-status-idle';
   if (label === 'failed') return 'plugin-status-bad';
   return 'plugin-status-muted';
 }
 
-function serviceOpenUrl(service: PluginServiceDeclaration, report?: PluginServiceReport): string | undefined {
+function serviceOpenUrl(report?: PluginServiceReport): string | undefined {
   if (report?.openUrl) return report.openUrl;
-  if (service.openUrl) return service.openUrl;
-  return service.port ? `http://127.0.0.1:${service.port}/` : undefined;
+  return undefined;
 }
 
-function serviceHealthUrl(service: PluginServiceDeclaration, report?: PluginServiceReport): string | undefined {
+function serviceHealthUrl(report?: PluginServiceReport): string | undefined {
   if (report?.healthUrl) return report.healthUrl;
-  return service.healthUrl;
+  return undefined;
 }
 
 function renderServiceRows(plugin: ManagedPlugin): string {
-  const entries = Object.entries(plugin.services ?? {});
-  if (entries.length === 0) return '<div class="plugin-muted">没有 host service 声明</div>';
-  return entries.map(([name, service]) => {
-    const report = serviceReportFor(plugin, name);
-    const managed = service.mode === 'managed';
-    const label = serviceLabel(service, report);
+  const service = plugin.service;
+  if (!service) return '<div class="plugin-muted">没有 host service 声明</div>';
+  const report = plugin.serviceReport;
+  const controllable = service.mode === 'manual' || service.mode === 'lifecycle';
+  const label = serviceLabel(report);
     const control = serviceControlLabel(service);
     const lifecycle = serviceLifecycleLabel(service);
     const parts = [
       control ? `control=${control}` : '',
       `lifecycle=${lifecycle}`,
-      service.scope ? `scope=${service.scope}` : '',
-      service.port ? `port=${service.port}` : '',
+      report?.port ? `port=${report.port}` : '',
+      report?.pid ? `pid=${report.pid}` : '',
     ].filter(Boolean);
-    const healthUrl = serviceHealthUrl(service, report);
+    const healthUrl = serviceHealthUrl(report);
     const health = healthUrl
       ? `<a class="plugin-link" href="${escapeHtml(healthUrl)}" target="_blank" rel="noreferrer">health</a>`
       : '';
-    const openUrl = serviceOpenUrl(service, report);
+    const openUrl = serviceOpenUrl(report);
     const open = openUrl
       ? `<a class="plugin-link" href="${escapeHtml(openUrl)}" target="_blank" rel="noreferrer">open</a>`
       : '';
@@ -182,17 +170,17 @@ function renderServiceRows(plugin: ManagedPlugin): string {
     const warning = report?.warning
       ? `<div class="plugin-warning">${escapeHtml(report.warning)}</div>`
       : '';
-    const actions = managed
+    const actions = controllable
       ? `<div class="plugin-service-actions">
           <button type="button" class="btn-link" data-plugin-service="${escapeHtml(plugin.id)}" data-action="start">Start</button>
           <button type="button" class="btn-link" data-plugin-service="${escapeHtml(plugin.id)}" data-action="stop">Stop</button>
         </div>`
-      : '<span class="plugin-muted">外部控制，dashboard 不起停</span>';
+      : '<span class="plugin-muted">未知 service mode</span>';
     return `
       <div class="plugin-service-row">
         <div>
           <div class="plugin-service-title">
-            <strong>${escapeHtml(name)}</strong>
+            <strong>${escapeHtml(plugin.id)}</strong>
             <span class="plugin-status ${serviceStatusClass(service, report)}">${escapeHtml(label)}</span>
           </div>
           <div class="plugin-service-meta">${escapeHtml(parts.join(' / ') || '-')} ${links}</div>
@@ -201,7 +189,6 @@ function renderServiceRows(plugin: ManagedPlugin): string {
         ${actions}
       </div>
     `;
-  }).join('');
 }
 
 function renderBotToggles(plugin: ManagedPlugin, bots: DashboardBotEntry[]): string {
