@@ -110,6 +110,8 @@ export function resolveDispatchWorkerBotUnionIds(input: {
   bots: DispatchBot[];
   workerNames?: string[];
   workerMetas?: DispatchWorkerMeta[];
+  /** Authoritative platform team roster. Checked before learned/legacy rosters. */
+  platformTeamBots?: DispatchWorkerUnionBot[];
   learnedBotUnionIdsByName?: Record<string, string>;
   federationBots: DispatchWorkerUnionBot[];
   senderScopedBotOpenIds?: Record<string, string>;
@@ -127,16 +129,46 @@ export function resolveDispatchWorkerBotUnionIds(input: {
     if (n && u) learnedUnionByName.set(n, u);
   }
 
-  const byAppId = new Map<string, DispatchWorkerUnionBot>();
-  const byCliId = new Map<string, DispatchWorkerUnionBot[]>();
-  const byName = new Map<string, DispatchWorkerUnionBot[]>();
-  for (const bot of input.federationBots) {
-    if (!bot.botUnionId?.trim()) continue;
-    if (bot.larkAppId) byAppId.set(bot.larkAppId, bot);
-    const cliKey = bot.cliId?.trim().toLowerCase();
-    if (cliKey) byCliId.set(cliKey, [...(byCliId.get(cliKey) ?? []), bot]);
-    const nameKey = bot.name?.trim().toLowerCase();
-    if (nameKey) byName.set(nameKey, [...(byName.get(nameKey) ?? []), bot]);
+  function indexRoster(bots: DispatchWorkerUnionBot[]): {
+    byAppId: Map<string, DispatchWorkerUnionBot>;
+    byCliId: Map<string, DispatchWorkerUnionBot[]>;
+    byName: Map<string, DispatchWorkerUnionBot[]>;
+  } {
+    const byAppId = new Map<string, DispatchWorkerUnionBot>();
+    const byCliId = new Map<string, DispatchWorkerUnionBot[]>();
+    const byName = new Map<string, DispatchWorkerUnionBot[]>();
+    for (const bot of bots) {
+      if (!bot.botUnionId?.trim()) continue;
+      if (bot.larkAppId) byAppId.set(bot.larkAppId, bot);
+      const cliKey = bot.cliId?.trim().toLowerCase();
+      if (cliKey) byCliId.set(cliKey, [...(byCliId.get(cliKey) ?? []), bot]);
+      const nameKey = bot.name?.trim().toLowerCase();
+      if (nameKey) byName.set(nameKey, [...(byName.get(nameKey) ?? []), bot]);
+    }
+    return { byAppId, byCliId, byName };
+  }
+
+  const platform = indexRoster(input.platformTeamBots ?? []);
+  const federation = indexRoster(input.federationBots);
+
+  function resolveFromRoster(roster: ReturnType<typeof indexRoster>, labels: string[], meta?: DispatchWorkerMeta): string {
+    if (meta?.larkAppId) {
+      const byMeta = roster.byAppId.get(meta.larkAppId)?.botUnionId?.trim();
+      if (byMeta) return byMeta;
+    }
+    for (const label of labels) {
+      const byApp = roster.byAppId.get(label)?.botUnionId?.trim();
+      if (byApp) return byApp;
+    }
+    for (const label of labels) {
+      const union = uniqueUnion(roster.byName.get(label.toLowerCase()));
+      if (union) return union;
+    }
+    for (const label of labels) {
+      const union = uniqueUnion(roster.byCliId.get(label.toLowerCase()));
+      if (union) return union;
+    }
+    return '';
   }
 
   function uniqueUnion(match: DispatchWorkerUnionBot[] | undefined): string {
@@ -151,26 +183,18 @@ export function resolveDispatchWorkerBotUnionIds(input: {
     const labels = [senderScopedName, spec?.openId, spec?.name, workerNameByOpenId.get(openId), meta?.cliId, meta?.larkAppId]
       .map((label) => label?.trim())
       .filter((label): label is string => !!label);
+
+    const platformUnion = resolveFromRoster(platform, labels, meta);
+    if (platformUnion) return platformUnion;
+
     for (const label of labels) {
       const learned = learnedUnionByName.get(label.toLowerCase());
       if (learned) return learned;
     }
-    if (meta?.larkAppId) {
-      const byMeta = byAppId.get(meta.larkAppId)?.botUnionId?.trim();
-      if (byMeta) return byMeta;
-    }
-    for (const label of labels) {
-      const byApp = byAppId.get(label)?.botUnionId?.trim();
-      if (byApp) return byApp;
-    }
-    for (const label of labels) {
-      const union = uniqueUnion(byName.get(label.toLowerCase()));
-      if (union) return union;
-    }
-    for (const label of labels) {
-      const union = uniqueUnion(byCliId.get(label.toLowerCase()));
-      if (union) return union;
-    }
+
+    const federationUnion = resolveFromRoster(federation, labels, meta);
+    if (federationUnion) return federationUnion;
+
     return '';
   });
 }

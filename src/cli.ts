@@ -7109,14 +7109,32 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   let workerBotUnionIds: string[] = [];
   try {
     const { buildFederatedRoster } = await import('./services/federation-roster.js');
-    const { listBotUnionIds } = await import('./services/bot-union-ids-store.js');
-    const roster = buildFederatedRoster(resolveDataDir());
+    const { listBotUnionIds } = await import('./services/observed-bot-union-ids-store.js');
+    const { listPlatformTeams } = await import('./services/platform-team-store.js');
+    const dataDir = resolveDataDir();
+    const roster = buildFederatedRoster(dataDir);
+    const botConfigByAppId = new Map(botConfigs.map((cfg) => [cfg.larkAppId, cfg]));
+    const botInfoByAppId = new Map(botInfoEntries.map((entry) => [entry.larkAppId, entry]));
+    const platformTeamBots = listPlatformTeams(dataDir).flatMap((team) =>
+      team.bots.map((bot) => {
+        const info = botInfoByAppId.get(bot.appId);
+        const cfg = botConfigByAppId.get(bot.appId);
+        const cliId = info?.cliId || cfg?.cliId || '';
+        return {
+          larkAppId: bot.appId,
+          cliId,
+          name: bot.name?.trim() || info?.botName?.trim() || cliId || bot.appId,
+          botUnionId: bot.unionId,
+        };
+      }),
+    );
     workerBotUnionIds = resolveDispatchWorkerBotUnionIds({
       openIds: built.mentionedOpenIds,
       bots,
       workerNames,
       workerMetas,
-      learnedBotUnionIdsByName: listBotUnionIds(resolveDataDir()),
+      platformTeamBots,
+      learnedBotUnionIdsByName: listBotUnionIds(dataDir),
       federationBots: roster.bots,
       senderScopedBotOpenIds,
     });

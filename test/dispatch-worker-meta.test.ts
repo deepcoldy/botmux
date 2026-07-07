@@ -94,6 +94,36 @@ describe('dispatch worker metadata resolver', () => {
     })).toEqual(['on_bot_coco']);
   });
 
+  it('prefers authoritative platform team bot union ids before learned or legacy federation sources', () => {
+    expect(resolveDispatchWorkerBotUnionIds({
+      openIds: ['ou_seen_by_l2'],
+      bots: [{ openId: 'ou_seen_by_l2', name: 'traex-loopy' }],
+      workerNames: ['traex-loopy'],
+      workerMetas: [{ larkAppId: 'cli_traex', cliId: 'traex' }],
+      platformTeamBots: [
+        { larkAppId: 'cli_traex', cliId: 'traex', name: 'traex-loopy', botUnionId: 'on_platform_traex' },
+      ],
+      learnedBotUnionIdsByName: { 'traex-loopy': 'on_learned_traex' },
+      federationBots: [
+        { larkAppId: 'cli_traex', cliId: 'traex', name: 'traex-loopy', botUnionId: 'on_roster_traex' },
+      ],
+    })).toEqual(['on_platform_traex']);
+  });
+
+  it('resolves platform team bot union ids by lark app id even without a stable display name', () => {
+    expect(resolveDispatchWorkerBotUnionIds({
+      openIds: ['ou_seen_by_l2'],
+      bots: [{ openId: 'ou_seen_by_l2' }],
+      workerNames: ['ou_seen_by_l2'],
+      workerMetas: [{ larkAppId: 'cli_remote_worker', cliId: '' }],
+      platformTeamBots: [
+        { larkAppId: 'cli_remote_worker', cliId: '', name: 'cli_remote_worker', botUnionId: 'on_platform_remote' },
+      ],
+      learnedBotUnionIdsByName: {},
+      federationBots: [],
+    })).toEqual(['on_platform_remote']);
+  });
+
   it('prefers locally learned bot union ids by name before federation roster fallback', () => {
     expect(resolveDispatchWorkerBotUnionIds({
       openIds: ['ou_seen_by_l2'],
