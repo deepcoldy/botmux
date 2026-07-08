@@ -6949,12 +6949,12 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     botmux dispatch --into <话题根消息id> --bot <spec> [--bot ...] (--brief ... | --brief-file ...)
 
 说明:
-  默认群级派活: 在目标群直接 @ worker，适合单 worker / 顺序 / 轻量子任务。
-  --new-topic: 显式开隔离话题，适合多 worker 并行、深度协作或防刷屏。
+  默认群级派活: 在目标群直接 @ 执行者，适合单执行者 / 顺序 / 轻量子任务。
+  --new-topic: 显式开隔离话题，适合多执行者并行、深度协作或防刷屏。
   --repo:   先用 /repo 给每个子 bot 定好工作目录——spawn 时不弹「选仓库」卡、不用手点。
   --standby: 配合 --repo——只把 bot 拉起来定好目录待命（不派简报），之后用 --into 或群级消息派具体任务。
   --into:   不建种子，直接回到已有话题线程 @ bot 追加一条。
-  返回 JSON（含 delivery=chat|thread），供编排者登记派活位置。
+  返回 JSON（含 delivery=chat|thread），供主控/监管者登记派活位置。
 
 选项:
   --title <t>           子项目标题（新开话题时必填）
@@ -6965,7 +6965,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --standby             仅 --repo 待命，不派简报
   --new-topic           显式为本次派活开独立话题（默认不开）
   --task-id <id>        覆盖可信交付任务号（默认自动生成 task-<slug>-<hash8>）
-  --acceptance-hint <t> 主 agent 打算如何验收，随任务简报和账本一起传给 worker
+  --acceptance-hint <t> 监管者打算如何验收，随任务简报和交付记录一起传给执行者
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
   --chat-id <id>        覆盖目标群（默认当前会话所在群）
   --session-id <id>     指定来源会话（默认自动推断）`);
@@ -7266,7 +7266,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
  */
 async function cmdReport(rest: string[]): Promise<void> {
   if (rest.includes('--help') || rest.includes('-h')) {
-    console.log(`botmux report — 把子项目进展/完成回报给派活的主编排会话
+    console.log(`botmux report — 把结果提交给派任务的监管者（主控）会话
 
 用法:
   botmux report "子项目X 完成，产出在 …"
@@ -7274,20 +7274,20 @@ async function cmdReport(rest: string[]): Promise<void> {
   botmux report --task <taskId> "完成说明" --artifact <产物路径> [--artifact ...]
 
 说明:
-  「多话题协作模式」里你（子 bot）干完后不要在本话题 @ 主bot——本话题没有主bot的会话，
-  @ 会另起一个无上下文的新会话。本命令把回报发回主编排会话所在的话题、并 @ 主编排 bot，
-  使其带完整上下文继续聚合。仅在被 botmux dispatch 派活的子项目会话里可用。
+  「多话题协作模式」里你（执行者）干完后不要在本话题 @ 主 bot——本话题没有它的会话，
+  @ 会另起一个无上下文的新会话。本命令把提交发回监管者会话所在的话题、并 @ 它，
+  使其带完整上下文继续验收。仅在被 botmux dispatch 派任务的执行者会话里可用。
 
-  带 --task：这是「可信交付」回报——把完成记录连同证据落到账本，主 agent 据此验收。
-  没有证据（--artifact / --artifact-text）的 --task 回报会被拒绝（不算完成）。
+  带 --task：这是「可信交付」提交——把完成记录连同证据写入交付记录，监管者据此验收。
+  没有证据（--artifact / --artifact-text）的 --task 提交会被拒绝（不算完成）。
 
 选项:
-  --content-file <path>       从文件读取回报内容（即完成说明 summary）
+  --content-file <path>       从文件读取提交内容（即完成说明 summary）
   --session-id <id>           指定来源会话（默认自动推断）
-  --task <taskId>             被派活时简报里给你的任务号；带上即走可信交付
-  --artifact <path>           产物路径证据（主 agent 必须读得到），可重复
+  --task <taskId>             被派任务时简报里给你的任务号；带上即走可信交付
+  --artifact <path>           产物路径证据（监管者必须读得到），可重复
   --artifact-text <name=内容>  自包含内容证据（测试输出/文件片段/diff），可重复
-  --id <reportId>             显式 reportId（崩溃重试严格幂等；默认按内容派生）`);
+  --id <reportId>             显式提交 ID（崩溃重试严格幂等；默认按内容派生）`);
     return;
   }
 
@@ -7305,7 +7305,7 @@ async function cmdReport(rest: string[]): Promise<void> {
   }
   if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
   if (!content.trim()) {
-    console.error('没有回报内容。用法: botmux report "子项目X 完成 + 产出位置"');
+    console.error('没有提交内容。用法: botmux report "子项目X 完成 + 产出位置"');
     process.exit(1);
   }
 
