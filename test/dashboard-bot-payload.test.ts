@@ -56,6 +56,21 @@ describe('dashboard bot payload helpers', () => {
     });
   });
 
+  it('passes substituteMode through for bot defaults', () => {
+    const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
+    const substituteMode = {
+      enabled: true,
+      targets: [{ userId: 'u_alice', name: 'Alice' }],
+      disclosure: 'prefix',
+    };
+    expect(botDefaultsPayload(daemon, { substituteMode })).toMatchObject({
+      substituteMode,
+    });
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({
+      substituteMode: null,
+    });
+  });
+
   it('projects dashboard summary range for /api/bots', () => {
     const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({

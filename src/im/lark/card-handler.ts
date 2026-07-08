@@ -363,7 +363,7 @@ async function commitRepoSelection(
           { name: selfBot.botName, openId: selfBot.botOpenId },
           locTarget,
           ds.pendingSender,
-          { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
+          { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger: ds.pendingSubstituteTrigger },
         )
       : '';
     const prompt = pendingRawInput ? '' : wrappedPrompt;
@@ -384,6 +384,7 @@ async function commitRepoSelection(
     ds.pendingPrompt = undefined;
     ds.pendingAttachments = undefined;
     ds.pendingMentions = undefined;
+    ds.pendingSubstituteTrigger = undefined;
     ds.pendingSender = undefined;
     ds.pendingFollowUps = undefined;
     forkWorker(ds, prompt);
@@ -1800,7 +1801,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               { name: selfBot.botName, openId: selfBot.botOpenId },
               locDs,
               ds.pendingSender,
-              { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
+              { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger: ds.pendingSubstituteTrigger },
             )
           : '';
         const prompt = pendingRawInput ? '' : wrappedPrompt;
@@ -1814,6 +1815,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
         ds.pendingMentions = undefined;
+        ds.pendingSubstituteTrigger = undefined;
         ds.pendingSender = undefined;
         ds.pendingFollowUps = undefined;
         forkWorker(ds, prompt);

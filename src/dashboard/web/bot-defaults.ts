@@ -84,6 +84,32 @@ function agentSelectionKey(bot: any, sessionFallback: string): string {
   return cli || 'claude-code';
 }
 
+function substituteTargetsText(mode: any): string {
+  const targets = Array.isArray(mode?.targets) ? mode.targets : [];
+  return JSON.stringify(targets, null, 2);
+}
+
+function parseSubstituteTargets(raw: string): Array<Record<string, string>> | null {
+  const text = raw.trim();
+  if (!text) return [];
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { return null; }
+  if (!Array.isArray(parsed)) return null;
+  const out: Array<Record<string, string>> = [];
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    const src = item as Record<string, unknown>;
+    const target: Record<string, string> = {};
+    for (const key of ['openId', 'userId', 'unionId', 'email', 'name']) {
+      const val = src[key];
+      if (typeof val === 'string' && val.trim()) target[key] = val.trim();
+    }
+    if (!target.openId && !target.userId && !target.unionId && !target.email) return null;
+    out.push(target);
+  }
+  return out;
+}
+
 function selectedCliOption(key: string): CliOption | undefined {
   return cliOptions.find(o => o.id === key);
 }
@@ -318,7 +344,7 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
           ${renderSandboxSection(b)}
         </section>
         <section class="bd-tile">${renderRoleSection(b)}</section>
-        <section class="bd-tile">${renderSessionModeSection(b)}${renderCrossBotSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderLaunchShellSection(b)}${renderEnvSection(b)}</section>
+        <section class="bd-tile">${renderSessionModeSection(b)}${renderSubstituteModeSection(b)}${renderCrossBotSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderLaunchShellSection(b)}${renderEnvSection(b)}</section>
         <section class="bd-tile">${renderCardBehaviorSection(b)}${renderSummaryTriggerSection(b)}${renderBrandSection(b)}</section>
         <section class="bd-tile">${renderGrantSection(b)}</section>
       </div>
@@ -564,6 +590,39 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
         <div class="actions">
           <span class="oncall-status" data-doc-subscribe-mode-status></span>
         </div>
+      </div>
+    </section>`;
+  }
+
+  function renderSubstituteModeSection(b: any): string {
+    const mode = b.substituteMode && typeof b.substituteMode === 'object' ? b.substituteMode : null;
+    const enabled = mode?.enabled === true;
+    const disclosure = mode?.disclosure === 'none' ? 'none' : 'prefix';
+    return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionSubstitute')}</h3>
+      <label class="toggle-row">
+        <input type="checkbox" data-action="toggle-substitute-mode" ${enabled ? 'checked' : ''}>
+        <span class="switch" aria-hidden="true"></span>
+        <span class="toggle-tx"><strong>${t('botDefaults.substituteEnabled')}</strong>
+        <small>${t('botDefaults.substituteHelp')}</small></span>
+      </label>
+      <div class="bd-row">
+        <label>
+          <span>${t('botDefaults.substituteDisclosure')}</span>
+          <select data-input="substituteDisclosure">
+            <option value="prefix" ${disclosure === 'prefix' ? 'selected' : ''}>${escapeHtml(t('botDefaults.substituteDisclosurePrefix'))}</option>
+            <option value="none" ${disclosure === 'none' ? 'selected' : ''}>${escapeHtml(t('botDefaults.substituteDisclosureNone'))}</option>
+          </select>
+        </label>
+      </div>
+      <textarea data-input="substituteTargets" rows="6"
+        placeholder="${escapeHtml(t('botDefaults.substituteTargetsPlaceholder'))}"
+        style="width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px">${escapeHtml(substituteTargetsText(mode))}</textarea>
+      <small class="bd-help">${t('botDefaults.substituteTargetsHelp')}</small>
+      <div class="actions">
+        <button type="button" class="primary" data-action="save-substitute-mode">${t('botDefaults.substituteSave')}</button>
+        <button type="button" data-action="off-substitute-mode">${t('botDefaults.substituteOff')}</button>
+        <span class="oncall-status" data-substitute-status></span>
       </div>
     </section>`;
   }
@@ -1305,6 +1364,68 @@ export function wireBotDefaultsPage(root: HTMLElement): PageDisposer {
             docModeSel,
             docModeStatusEl,
           );
+        });
+      }
+
+      // ── 替身模式 substituteMode ─────────────────────────────────────────
+      const substituteEnabledCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-substitute-mode]');
+      const substituteDisclosureSel = card.querySelector<HTMLSelectElement>('select[data-input=substituteDisclosure]');
+      const substituteTargetsTa = card.querySelector<HTMLTextAreaElement>('textarea[data-input=substituteTargets]');
+      const substituteSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-substitute-mode]');
+      const substituteOffBtn = card.querySelector<HTMLButtonElement>('button[data-action=off-substitute-mode]');
+      const substituteStatusEl = card.querySelector<HTMLSpanElement>('[data-substitute-status]');
+
+      async function putSubstituteMode(body: any, btn: HTMLButtonElement) {
+        if (!substituteStatusEl) return;
+        substituteStatusEl.textContent = '';
+        substituteStatusEl.className = 'oncall-status';
+        btn.disabled = true;
+        try {
+          const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/substitute-mode`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const resp = await r.json().catch(() => ({}));
+          if (r.ok && resp.ok) {
+            substituteStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+            substituteStatusEl.classList.add('hint-ok');
+            const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+            if (cached) cached.substituteMode = resp.substituteMode ?? null;
+            if (substituteEnabledCb) substituteEnabledCb.checked = !!resp.substituteMode?.enabled;
+            if (substituteDisclosureSel) substituteDisclosureSel.value = resp.substituteMode?.disclosure === 'none' ? 'none' : 'prefix';
+            if (substituteTargetsTa) substituteTargetsTa.value = substituteTargetsText(resp.substituteMode);
+          } else {
+            substituteStatusEl.textContent = `✗ ${resp.error ?? r.status}`;
+            substituteStatusEl.classList.add('hint-warn-inline');
+          }
+        } catch (e: any) {
+          substituteStatusEl.textContent = `✗ ${e?.message ?? e}`;
+          substituteStatusEl.classList.add('hint-warn-inline');
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      if (substituteSaveBtn && substituteTargetsTa && substituteDisclosureSel && substituteEnabledCb) {
+        substituteSaveBtn.addEventListener('click', () => {
+          if (!substituteStatusEl) return;
+          const targets = parseSubstituteTargets(substituteTargetsTa.value);
+          if (!targets) {
+            substituteStatusEl.textContent = `✗ ${t('botDefaults.substituteTargetsInvalid')}`;
+            substituteStatusEl.className = 'oncall-status hint-warn-inline';
+            return;
+          }
+          putSubstituteMode({
+            enabled: substituteEnabledCb.checked,
+            targets,
+            disclosure: substituteDisclosureSel.value === 'none' ? 'none' : 'prefix',
+          }, substituteSaveBtn);
+        });
+      }
+      if (substituteOffBtn) {
+        substituteOffBtn.addEventListener('click', () => {
+          putSubstituteMode({ enabled: false, targets: [] }, substituteOffBtn);
         });
       }
 

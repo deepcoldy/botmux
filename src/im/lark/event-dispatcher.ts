@@ -15,7 +15,7 @@ import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId } from './message-parser.js';
+import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, extractMentionIdentities, type MentionIdentity } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
@@ -25,6 +25,7 @@ import { BOTMUX_REQUIRED_SCOPES, DOC_FEATURE_SCOPES, DOC_COMMENT_EVENT, buildSco
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
+import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
@@ -34,6 +35,7 @@ import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode } from '../../services/chat-reply-mode-store.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
+import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -865,6 +867,41 @@ export function mentionsAnotherMember(larkAppId: string, message: any): boolean 
   return false;
 }
 
+function substituteTargetMatchesMention(target: {
+  openId?: string;
+  userId?: string;
+  unionId?: string;
+}, mention: MentionIdentity): boolean {
+  return Boolean(
+    (target.openId && mention.openId === target.openId) ||
+    (target.userId && mention.userId === target.userId) ||
+    (target.unionId && mention.unionId === target.unionId),
+  );
+}
+
+export function resolveSubstituteTrigger(
+  larkAppId: string,
+  message: any,
+): import('../../types.js').SubstituteTrigger | undefined {
+  const cfg = getBot(larkAppId).config.substituteMode;
+  if (!cfg?.enabled || !cfg.targets?.length) return undefined;
+  const mentions = extractMentionIdentities(message);
+  for (const mention of mentions) {
+    const target = cfg.targets.find(t => substituteTargetMatchesMention(t, mention));
+    if (!target) continue;
+    return {
+      target: {
+        name: target.name ?? mention.name,
+        openId: target.openId ?? mention.openId,
+        userId: target.userId ?? mention.userId,
+        unionId: target.unionId ?? mention.unionId,
+      },
+      disclosure: cfg.disclosure ?? 'prefix',
+    };
+  }
+  return undefined;
+}
+
 function mentionMatchesBot(m: any, larkAppId: string, botOpenId?: string): boolean {
   const openId = mentionOpenId(m);
   if (botOpenId && openId === botOpenId) return true;
@@ -1120,6 +1157,10 @@ export interface RoutingContext {
   promptOverride?: string;
   /** Metadata for the summary command that produced promptOverride. */
   summaryCommand?: SummaryCommandRuntimeContext;
+  /** This turn was triggered by @mentioning a configured substitute person. */
+  substituteTrigger?: import('../../types.js').SubstituteTrigger;
+  /** The dispatcher already accepted this turn outside the normal canTalk gate. */
+  bypassTalkGate?: boolean;
   larkAppId: string;
 }
 
@@ -1782,6 +1823,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           return;
         }
 
+        if (await tryHandleSubstituteCommand(larkAppId, message, senderOpenId)) {
+          return;
+        }
+
         // /grant、/revoke — 群内授权元命令。在路由/spawn 之前拦截（仅 owner，需明确 @ 本 bot），
         // 否则会被当成 prompt 喂给 CLI 会话。
         if (await tryHandleGrantCommand(larkAppId, message, senderOpenId)) {
@@ -1812,6 +1857,26 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         let routingSource = decision.source;
         let replyRootId: string | undefined;
         const explicitlyMentionedThisBot = isBotMentioned(larkAppId, message, senderOpenId);
+        let substituteTrigger = chatType === 'group'
+          && await getChatMode(larkAppId, chatId) === 'group'
+          && isSubstituteEnabledForChat(larkAppId, chatId)
+          ? resolveSubstituteTrigger(larkAppId, message)
+          : undefined;
+        if (substituteTrigger && !explicitlyMentionedThisBot) {
+          const rawText = extractMessageTextForRouting(message);
+          const stripped = rawText ? stripLeadingMentions(rawText.trim(), message?.mentions ?? []).trim() : '';
+          if (stripped.startsWith('/')) substituteTrigger = undefined;
+        }
+        if (substituteTrigger) {
+          routing.scope = 'chat';
+          routing.anchor = chatId;
+          routingSource = 'regular-group-chat';
+          if (message.root_id && message.thread_id) replyRootId = message.root_id;
+          logger.info(
+            `[substitute:${larkAppId}] mention target=${substituteTrigger.target.name ?? substituteTrigger.target.openId ?? substituteTrigger.target.userId ?? substituteTrigger.target.unionId ?? 'unknown'} ` +
+            `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)} → chat-scope`,
+          );
+        }
 
         // Shared-mode follow-up: a non-@ message inside a Lark thread can belong
         // to the regular group's chat-scope session when that root was registered
@@ -1882,7 +1947,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // /t / /topic in 普通群: flip routing to thread-scope so the bot's
         // first reply seeds a fresh Lark thread, even if a chat-scope session
         // is currently active in this chat.
-        const forceTopicApplied = maybeApplyForceTopicOverride(routing, message, messageId);
+        const forceTopicApplied = substituteTrigger ? false : maybeApplyForceTopicOverride(routing, message, messageId);
         if (forceTopicApplied) {
           logger.info(`[/t] Force-topic override: msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
         }
@@ -1991,6 +2056,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             && !!message.thread_id
             && await getChatMode(larkAppId, chatId) === 'topic';
           const relax = (!!replyRootId && isAllowed)
+            || !!substituteTrigger
             || (isAllowed && mentionMode === 'never')
             || (isAllowed && mentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message))
             || ownedTopicGroupFollowup
@@ -2050,6 +2116,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           summaryCommand: summaryCommandTriggered && summaryCommandMatch
             ? { name: 'summary-command', chatKind: summaryCommandMatch.chatKind }
             : undefined,
+          substituteTrigger,
+          bypassTalkGate: !!substituteTrigger,
         };
         // Serialize per anchor so two messages to the same thread/chat are
         // processed in arrival order — never concurrently. Without this a fast

@@ -528,9 +528,11 @@ export async function enforceMessageQuotaForCliInput(
   senderOpenId: string | undefined,
   messageId: string,
   anchor: string,
+  bypassTalkGate = false,
 ): Promise<boolean> {
   const ev = evaluateTalk(larkAppId, chatId, senderOpenId);
   if (!ev.allowed) {
+    if (bypassTalkGate) return true;
     logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
   }
@@ -2425,7 +2427,7 @@ async function startInitialPassthroughSession(args: {
 
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
-  const { chatId, messageId, chatType, larkAppId, replyRootId } = ctx;
+  const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger } = ctx;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
@@ -2467,7 +2469,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     )) {
       return;
     }
-    if (scope === 'chat') {
+    if (!substituteTrigger && scope === 'chat') {
       scope = 'thread';
       anchor = messageId;
     }
@@ -2641,7 +2643,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     }
   }
 
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, ctx.bypassTalkGate === true)) {
     return;
   }
 
@@ -2670,6 +2672,18 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
 
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
 
+  // Pin the working dir via the layered oncall / inherit / default lookup
+  // (auto-binds a defaultOncall chat as a side effect). Shared with the
+  // first-message `/repo` command branch so both paths stay consistent.
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const senderCanTalk = evaluateTalk(larkAppId, chatId, senderOpenId).allowed;
+  const untrustedSubstituteNeedsOwnerDir = substituteTrigger && !senderCanTalk && (!pinnedWorkingDir || !!inheritedFrom);
+  if (untrustedSubstituteNeedsOwnerDir) {
+    await sessionReply(anchor, tr('cmd.substitute.need_working_dir', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+    logger.info(`[substitute:${larkAppId}] dropped ungranted substitute turn without own pinned working dir chat=${chatId.substring(0, 12)} msg=${messageId.substring(0, 12)}`);
+    return;
+  }
+
   // Create session in pending-repo state — don't spawn CLI yet.
   // For thread-scope, rootMessageId == anchor (the thread root). Critical
   // because sessionAnchorId() uses rootMessageId for thread-scope, and the
@@ -2682,9 +2696,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
   const session = sessionStore.createSession(chatId, rootIdForStore, parsed.content.substring(0, 50), chatType);
   const now = Date.now();
+  const ownerOpenId = substituteTrigger && !senderCanTalk ? undefined : senderOpenId;
+  const ownerUnionId = substituteTrigger && !senderCanTalk ? undefined : senderUnionId;
   session.larkAppId = larkAppId;
-  session.ownerOpenId = senderOpenId;
-  session.ownerUnionId = senderUnionId;
+  session.ownerOpenId = ownerOpenId;
+  session.ownerUnionId = ownerUnionId;
   session.lastCallerOpenId = senderOpenId;
   // First turn of a brand-new topic: seed quoteTarget* so the very first
   // `botmux send` can --mention-back / 引用 the triggering message (chat scope).
@@ -2699,10 +2715,6 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
 
-  // Pin the working dir via the layered oncall / inherit / default lookup
-  // (auto-binds a defaultOncall chat as a side effect). Shared with the
-  // first-message `/repo` command branch so both paths stay consistent.
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -2720,8 +2732,9 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     pendingPrompt: promptContent,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
     pendingMentions: parsed.mentions,
+    pendingSubstituteTrigger: substituteTrigger,
     pendingSender: newTopicSender,
-    ownerOpenId: senderOpenId,
+    ownerOpenId,
     currentTurnTitle: content.substring(0, 50),
     workingDir: pinnedWorkingDir,
   };
@@ -2738,7 +2751,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     const selfBot = getBot(larkAppId);
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId });
+    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger });
     rememberLastCliInput(ds, promptContent, prompt);
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId);
     forkWorker(ds, prompt);
@@ -2770,7 +2783,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ds.pendingRepo = false;
     const selfBot = getBot(larkAppId);
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId });
+    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger });
     rememberLastCliInput(ds, promptContent, prompt);
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId);
     forkWorker(ds, prompt);
@@ -3014,7 +3027,7 @@ function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
 }
 
 async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> {
-  const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId } = ctx;
+  const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId, substituteTrigger, bypassTalkGate } = ctx;
   await resolveNonsupportMessage(data, larkAppId);
   const { parsed, resources } = parseEventMessage(data);
 
@@ -3353,7 +3366,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   }
 
   const quotaSenderOpenId = threadSenderOpenId;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor, bypassTalkGate === true)) {
     return;
   }
 
@@ -3500,6 +3513,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       pendingPrompt: promptContent,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
+      pendingSubstituteTrigger: substituteTrigger,
       pendingSender: autoCreateSender,
       ownerOpenId,
       currentTurnTitle: parsed.content.substring(0, 50),
@@ -3519,7 +3533,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
       const selfBot = getBot(larkAppId);
       ensureSessionWhiteboard(newDs);
-      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId });
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger });
       rememberLastCliInput(newDs, promptContent, prompt);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId);
       forkWorker(newDs, prompt);
@@ -3551,7 +3565,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       newDs.pendingRepo = false;
       const selfBot = getBot(larkAppId);
       ensureSessionWhiteboard(newDs);
-      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId });
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger });
       rememberLastCliInput(newDs, promptContent, prompt);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId);
       forkWorker(newDs, prompt);
@@ -3590,6 +3604,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           larkAppId,
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
+          substituteTrigger,
         });
     beginNewTurn(ds, parsed.content);
     rememberLastCliInput(ds, promptContent, msgContent);

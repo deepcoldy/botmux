@@ -27,6 +27,17 @@ vi.mock('node:fs', async (importOriginal) => {
     mkdirSync: vi.fn(),
   };
 });
+
+vi.mock('node-pty', () => ({
+  spawn: vi.fn(() => ({
+    onData: vi.fn(),
+    onExit: vi.fn(),
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+  })),
+}));
+
 // bots-info.json 走原子写 helper；这里直接代理到 mockWriteFileSync，
 // 断言面（最终路径 + 完整内容）与裸 writeFileSync 时代保持一致。
 vi.mock('../src/utils/atomic-write.js', () => ({
@@ -86,6 +97,12 @@ vi.mock('../src/services/observed-bots-store.js', () => ({
   listObservedBots: (...args: any[]) => mockListObservedBots(...args),
 }));
 
+const mockIsSubstituteEnabledForChat = vi.fn(() => true);
+vi.mock('../src/services/substitute-chat-toggle-store.js', () => ({
+  isSubstituteEnabledForChat: (...args: any[]) => mockIsSubstituteEnabledForChat(...args),
+  setSubstituteEnabledForChat: vi.fn(),
+}));
+
 // Capture the registered event handlers from EventDispatcher.register()
 let capturedHandlers: Record<string, Function> = {};
 
@@ -127,12 +144,13 @@ beforeEach(() => {
   mockListChatMessagesUntil.mockReset().mockResolvedValue([]);
   mockListThreadMessages.mockReset().mockResolvedValue([]);
   mockGetMessageDetail.mockReset().mockResolvedValue({ items: [] });
+  mockIsSubstituteEnabledForChat.mockReset().mockReturnValue(true);
 });
 
 type TestMention = {
   key: string;
   name: string;
-  id: { open_id?: string; app_id?: string } | string;
+  id: { open_id?: string; user_id?: string; union_id?: string; app_id?: string } | string;
   id_type?: string;
 };
 
@@ -156,6 +174,11 @@ function setupBotState(opts?: {
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
 	  p2pMode?: 'thread' | 'chat';
 	  summaryRange?: { limit?: number; sinceHours?: number };
+	  substituteMode?: {
+	    enabled: boolean;
+	    targets: Array<{ openId?: string; userId?: string; unionId?: string; name?: string }>;
+	    disclosure?: 'prefix' | 'none';
+	  };
 	}) {
   mockGetBot.mockReturnValue({
     config: {
@@ -175,6 +198,7 @@ function setupBotState(opts?: {
 	      chatReplyModes: opts?.chatReplyModes,
 	      p2pMode: opts?.p2pMode,
 	      summaryRange: opts?.summaryRange,
+	      substituteMode: opts?.substituteMode,
 	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
     resolvedAllowedUsers: opts?.allowedUsers ?? [],
@@ -1649,6 +1673,165 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('substituteMode: @substitute in a regular group routes to the group chat session without @bot', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupReplyMode: 'new-topic',
+      substituteMode: {
+        enabled: true,
+        targets: [{ userId: 'u_sub', name: 'Sub Person' }],
+        disclosure: 'prefix',
+      },
+    });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person help with this' }),
+      messageId: 'msg-substitute',
+      chatId: 'chat-substitute',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { user_id: 'u_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-substitute',
+      larkAppId: MY_APP_ID,
+      bypassTalkGate: true,
+      substituteTrigger: {
+        target: { name: 'Sub Person', userId: 'u_sub' },
+        disclosure: 'prefix',
+      },
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('substituteMode: @substitute from a non-canTalk sender still routes to CLI', async () => {
+    setupBotState({
+      allowedUsers: ['ou_other_allowed'],
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+      },
+    });
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person help with this' }),
+      messageId: 'msg-substitute-denied',
+      chatId: 'chat-substitute-denied',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-substitute-denied',
+      bypassTalkGate: true,
+      substituteTrigger: {
+        target: { name: 'Sub Person', openId: 'ou_sub' },
+        disclosure: 'prefix',
+      },
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('substituteMode: non-canTalk first turn reaches handleNewTopic with bypassTalkGate', async () => {
+    setupBotState({
+      allowedUsers: ['ou_other_allowed'],
+      substituteMode: {
+        enabled: true,
+        targets: [{ userId: 'u_sub', name: 'Sub Person' }],
+      },
+    });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person start a session' }),
+      messageId: 'msg-substitute-first-turn',
+      chatId: 'chat-substitute-first-turn',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { user_id: 'u_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-substitute-first-turn',
+      bypassTalkGate: true,
+    }));
+  });
+
+  it('substituteMode: post inline at can match a userId target', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      substituteMode: {
+        enabled: true,
+        targets: [{ userId: 'u_sub', name: 'Sub Person' }],
+      },
+    });
+    mockGetChatMode.mockResolvedValue('group');
+    const postContent = JSON.stringify({
+      zh_cn: { content: [[
+        { tag: 'at', user_id: 'u_sub', user_name: 'Sub Person' },
+        { tag: 'text', text: ' help with this' },
+      ]] },
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: postContent,
+      messageId: 'msg-substitute-post',
+      chatId: 'chat-substitute-post',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-substitute-post',
+      substituteTrigger: expect.objectContaining({
+        target: expect.objectContaining({ userId: 'u_sub' }),
+      }),
+    }));
+  });
+
+  it('substituteMode: per-chat off switch disables @substitute routing', async () => {
+    setupBotState({
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+      },
+    });
+    mockIsSubstituteEnabledForChat.mockReturnValue(false);
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person help with this' }),
+      messageId: 'msg-substitute-off',
+      chatId: 'chat-substitute-off',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
   it('default chat-mode @ inside a regular-group topic reuses the group chat session', async () => {

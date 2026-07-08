@@ -159,6 +159,49 @@ describe('bot-config store', () => {
     expect(invalid.silentTurnReactions).toBeUndefined();
   });
 
+  it('parses substituteMode only when enabled with valid targets', async () => {
+    const { registry } = await freshModules();
+    const [enabled, disabled, empty] = registry.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'sub-on',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        substituteMode: {
+          enabled: true,
+          disclosure: 'none',
+          targets: [
+            { userId: 'u_target', name: 'Target User' },
+            { openId: 'ou_target', email: 'target@example.com' },
+            { bogus: true },
+          ],
+        },
+      },
+      {
+        larkAppId: 'sub-disabled',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        substituteMode: { enabled: false, targets: [{ userId: 'u_target' }] },
+      },
+      {
+        larkAppId: 'sub-empty',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        substituteMode: { enabled: true, targets: [{ name: 'No ids' }] },
+      },
+    ]));
+
+    expect(enabled.substituteMode).toEqual({
+      enabled: true,
+      disclosure: 'none',
+      targets: [
+        { userId: 'u_target', name: 'Target User' },
+        { openId: 'ou_target', email: 'target@example.com' },
+      ],
+    });
+    expect(disabled.substituteMode).toBeUndefined();
+    expect(empty.substituteMode).toBeUndefined();
+  });
+
   it('sets and unsets JSON skills policy through /config store', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('skills')!;

@@ -1,0 +1,107 @@
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('@larksuiteoapi/node-sdk', () => {
+  class FakeClient {
+    opts: Record<string, unknown>;
+    constructor(opts: Record<string, unknown>) {
+      this.opts = opts;
+    }
+  }
+  return { Client: FakeClient };
+});
+
+async function freshModules() {
+  vi.resetModules();
+  const registry = await import('../src/bot-registry.js');
+  const store = await import('../src/services/substitute-mode-store.js');
+  return { registry, store };
+}
+
+describe('substitute-mode store', () => {
+  let configPath: string;
+
+  beforeEach(() => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-substitute-mode-'));
+    configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+  });
+
+  afterEach(() => {
+    delete process.env.BOTS_CONFIG;
+  });
+
+  function writeConfig(entry: Record<string, unknown> = {}) {
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app_default',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      ...entry,
+    }], null, 2), 'utf-8');
+  }
+
+  function readConfig(): any {
+    return JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+  }
+
+  it('persists substituteMode and syncs in-memory config', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotSubstituteMode('app_default', {
+      enabled: true,
+      disclosure: 'none',
+      targets: [
+        { userId: 'u_alice', name: 'Alice' },
+        { openId: 'ou_bob', email: 'bob@example.com' },
+      ],
+    });
+
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.substituteMode).toEqual({
+        enabled: true,
+        disclosure: 'none',
+        targets: [
+          { userId: 'u_alice', name: 'Alice' },
+          { openId: 'ou_bob', email: 'bob@example.com' },
+        ],
+      });
+    }
+    expect(readConfig().substituteMode).toEqual(registry.getBot('app_default').config.substituteMode);
+  });
+
+  it('turns substituteMode off by deleting the key', async () => {
+    writeConfig({
+      substituteMode: {
+        enabled: true,
+        targets: [{ userId: 'u_alice', name: 'Alice' }],
+      },
+    });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotSubstituteMode('app_default', { enabled: false, targets: [] });
+
+    expect(r).toEqual({ ok: true, substituteMode: null });
+    expect(readConfig().substituteMode).toBeUndefined();
+    expect(registry.getBot('app_default').config.substituteMode).toBeUndefined();
+  });
+
+  it('rejects enabled mode without a matchable target', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotSubstituteMode('app_default', {
+      enabled: true,
+      targets: [{ name: 'No id' }],
+    });
+
+    expect(r).toEqual({ ok: false, reason: 'targets_required' });
+    expect(readConfig().substituteMode).toBeUndefined();
+  });
+});

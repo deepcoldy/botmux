@@ -2207,6 +2207,24 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/substitute-mode — proxy to that bot's daemon. Body
+    // carries `{ enabled, targets, disclosure }`.
+    let mBotSubstituteMode: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotSubstituteMode = url.pathname.match(/^\/api\/bots\/([^/]+)\/substitute-mode$/))) {
+      const appId = decodeURIComponent(mBotSubstituteMode[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-substitute-mode`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/summary-range — proxy to that bot's daemon. Body
     // `{ limit, sinceHours }`; daemon updates the explicit /summary range.
     let mBotSummaryRange: RegExpMatchArray | null;
