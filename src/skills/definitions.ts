@@ -1278,9 +1278,11 @@ botmux dispatch --chat-id "<goalChatId>" --title "<subtask>" \\
 #### L2-2.5 a2a：派给跨设备 / 外部 worker（goal 可选用的跨设备交付协议）
 **a2a 不是新编排模式**，而是 goal 在需要时可选用的「跨设备 agent-to-agent 交付协议」——本机 botmux worker、飞书里的**人**、**别人机器上的 botmux bot**、**非-botmux 的 agent** 可以并存当 worker，goal/L2/charter/watchdog/看板一切照旧。本机 botmux worker 不用管这节（照常 \`botmux report\`，享进程探活 + 自动重派）；把**外部 worker** 纳入时才走 a2a：
 
-- **交付/回报方向（worker→你的账本）= 按 union_id 授权，免 /grant**：dispatch 时把 worker 的 \`workerBotUnionIds\`（首选）带上——union_id 租户级稳定、且**每条入站事件都带**，是最可靠的 worker 身份；\`workerOpenIds\`(open_id) 作兜底。只有「被派了这个活的 worker」发的信封才摄取入账，其它当普通聊天忽略。信封摄取在权限门**之前**、用 union_id 自证，所以回报这条**不需要 /grant**。
-- **冷启动**：跨设备 bot 的 union_id 花名册里**不带**，得它在群里先 @ 你一次，你的 daemon 才从那条事件学到（\`[bot-union-id] learned …\`）；学到后 dispatch 才解析得出 \`workerBotUnionIds\`。
-- **派活方向（你→让远端 bot 真接活）= 需要对方给你 /grant**：远端那台得对它的 bot 做一次 \`@该bot /grant @你的bot\`（或把你放进 allowedUsers），否则你的 @ 派活会被对方权限门当「没对话权限」挡掉（跨设备 bot 不是同部署互信 peer，goal 群也不吃 oncall 全开放豁免）。
+- **默认路径：先用平台团队拉群**。跨设备 botmux worker 优先让各机器先 \`botmux bind\` 到平台、加入同一个平台团队，再由平台团队/协作群把目标相关 bot 拉进同一个 goal 群。平台团队会下发可信 roster，并通过大厅打卡 / 群内自学把 bot 身份补齐；同团队 bot 之间默认可协作，通常不需要手工 \`/introduce\` 或逐个 \`/grant\`。
+- **同机 worker 不走平台**：同一台机器上的 bot 直接按普通 goal 群派活即可，不需要平台拉群，也不需要把 a2a 说明塞进 brief。
+- **交付/回报方向（worker→你的账本）= 按 union_id 授权，免 /grant**：dispatch 时把 worker 的 \`workerBotUnionIds\`（首选，来自平台 roster / 已观察到的 bot 身份）带上；\`workerOpenIds\`(open_id) 作兜底。只有「被派了这个活的 worker」发的信封才摄取入账，其它当普通聊天忽略。信封摄取在权限门**之前**、用 union_id 自证，所以回报这条**不需要 /grant**。
+- **兜底冷启动**：如果没有平台团队 / 目标 bot 还没进 roster，就让远端 bot 在群里先 @ 你一次，你的 daemon 会从那条事件学到它的 union_id（\`[bot-union-id] learned …\`）；学到后 dispatch 才解析得出 \`workerBotUnionIds\`。这是兜底，不是默认流程。
+- **派活方向（你→让远端 bot 真接活）**：同平台团队 bot 走团队互信；如果没走平台团队，才需要对方给你 \`/grant\`（或把你放进 allowedUsers），否则你的 @ 派活可能被对方权限门挡掉。
 - **它在 goal 群用「交付信封」交活 / 求助**（纯文本，daemon 自动摄取成 TaskReported / TaskHelpRequested）。⚠️ 必须**原始文本**，别用会渲染卡片的 \`botmux send\`。把下面格式**抄进给它的 brief**：
   \`\`\`
   [botmux-report v1]
