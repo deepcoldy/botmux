@@ -16,7 +16,7 @@ export type GoalNarrationEvent =
       key: string;
       taskId: string;
       title?: string;
-      mode: '自动对账' | '监管者验收' | '监管者代办';
+      mode: '自动核验' | '自动对账' | '监管者验收' | '监管者代办';
     }
   | {
       type: 'rejected';
@@ -82,6 +82,10 @@ function stripLeadingMentions(text: string | undefined): string {
   return t;
 }
 
+function displayAcceptMode(mode: '自动核验' | '自动对账' | '监管者验收' | '监管者代办'): string {
+  return mode === '自动对账' ? '自动核验' : mode;
+}
+
 export function buildGoalNarrationText(event: GoalNarrationEvent): string {
   if (event.type === 'human-decision') {
     // Title stays neutral ("回复", not "决策"): a reply in the parent thread may
@@ -97,7 +101,7 @@ export function buildGoalNarrationText(event: GoalNarrationEvent): string {
     return [
       `✅ 已验收 · ${event.taskId}`,
       cleanLine(event.title),
-      `方式：${event.mode}`,
+      `方式：${displayAcceptMode(event.mode)}`,
     ].filter(Boolean).join('\n');
   }
   if (event.type === 'rejected') {

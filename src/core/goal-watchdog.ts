@@ -170,7 +170,7 @@ async function sendGoalWatchdogNotification(event: GoalWatchdogNotifyEvent): Pro
         key: `narr:accepted:${event.task.taskId}:${eventId}`,
         taskId: event.task.taskId,
         title: event.task.title,
-        mode: '自动对账',
+        mode: '自动核验',
       },
     }, { sendMessage });
     return;

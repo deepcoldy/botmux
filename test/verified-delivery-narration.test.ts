@@ -3,13 +3,15 @@ import { buildGoalNarrationText, emitGoalNarration } from '../src/verified-deliv
 
 describe('verified delivery narration', () => {
   it('renders human-readable lifecycle messages', () => {
-    expect(buildGoalNarrationText({
+    const accepted = buildGoalNarrationText({
       type: 'accepted',
       key: 'k1',
       taskId: 'task-1',
       title: '写报告',
       mode: '自动对账',
-    })).toContain('✅ 已验收 · task-1');
+    });
+    expect(accepted).toContain('✅ 已验收 · task-1');
+    expect(accepted).toContain('方式：自动核验');
 
     const decision = buildGoalNarrationText({
       type: 'human-decision',
