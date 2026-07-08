@@ -2174,6 +2174,7 @@ table[hidden] { display: none !important; }
 /* ── Session monitor room ───────────────────────────────────────────────── */
 .monitor-room-page {
   min-height: calc(100vh - 120px);
+  align-content: start;
 }
 
 .monitor-room-actions {
