@@ -64,6 +64,12 @@ export interface ParsedHelpEnvelope {
 
 export type ParsedEnvelope = ParsedReportEnvelope | ParsedHelpEnvelope;
 
+export interface UnsupportedDeliveryEnvelope {
+  kind: 'report' | 'help';
+  version: string;
+  supportedVersion: 'v1';
+}
+
 const HELP_KINDS: ReadonlySet<string> = new Set<HelpKind>([
   'access', 'ambiguous', 'impossible', 'repeated_failure', 'other',
 ]);
@@ -204,4 +210,13 @@ export function parseDeliveryEnvelope(text: string | undefined): ParsedEnvelope 
   if (!summary) return null; // a report with no summary is not verifiable
   const reportId = fields.get('reportid') || undefined;
   return { kind: 'report', taskId, reportId, summary, evidence };
+}
+
+export function detectUnsupportedDeliveryEnvelope(text: string | undefined): UnsupportedDeliveryEnvelope | null {
+  if (!text || !text.includes('[botmux-')) return null;
+  const m = text.match(/\[botmux-(report|help)\s+([^\]\s]+)\]/i);
+  if (!m) return null;
+  const version = m[2].trim().toLowerCase();
+  if (version === 'v1') return null;
+  return { kind: m[1].toLowerCase() as 'report' | 'help', version, supportedVersion: 'v1' };
 }

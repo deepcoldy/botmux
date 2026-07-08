@@ -272,7 +272,7 @@ import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js';
 import { emitGoalNarration } from './verified-delivery/narration.js';
 import { openLedger } from './verified-delivery/ledger.js';
-import { parseDeliveryEnvelope, type EnvelopeEvidence } from './verified-delivery/envelope.js';
+import { detectUnsupportedDeliveryEnvelope, parseDeliveryEnvelope, type EnvelopeEvidence } from './verified-delivery/envelope.js';
 import {
   DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
   injectGoalSupervisorTurn,
@@ -15569,7 +15569,14 @@ async function maybeIngestDeliveryEnvelope(input: {
   chatId?: string;
 }): Promise<boolean> {
   const envelope = parseDeliveryEnvelope(input.parsed.content);
-  if (!envelope) return false;
+  if (!envelope) {
+    const unsupported = detectUnsupportedDeliveryEnvelope(input.parsed.content);
+    if (unsupported) {
+      logger.warn(`[delivery-envelope] unsupported version kind=${unsupported.kind} version=${unsupported.version} supported=${unsupported.supportedVersion} msg=${input.parsed.messageId}`);
+      return true;
+    }
+    return false;
+  }
   const goalChatId = input.chatId ?? input.parsed.chatId;
   const senderOpenId = input.parsed.senderId;
   const senderUnionId = input.parsed.senderUnionId?.trim();
