@@ -82,6 +82,29 @@ export async function sendFileAttachments(
 const VIDEO_EXTENSIONS = new Set(['.mp4']);
 const VIDEO_COVER_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
 
+/**
+ * Decide whether a send is a "pure video" send — one delivered as a standalone
+ * Lark media message with no text/card primary.
+ *
+ * A media message CANNOT embed an `<at>`, so a send that also carries mentions
+ * must NOT be pure-video: it has to go through the card path (which renders the
+ * @ on the footer) and send the video as a follow-up attachment. Otherwise the
+ * mention silently never fires while the success output still reports it.
+ */
+export function shouldSendAsPureVideo(input: {
+  hasBodyText: boolean;
+  imageCount: number;
+  fileCount: number;
+  videoCount: number;
+  mentionCount: number;
+}): boolean {
+  return !input.hasBodyText
+    && input.imageCount === 0
+    && input.fileCount === 0
+    && input.videoCount > 0
+    && input.mentionCount === 0;
+}
+
 export type VideoAttachmentInput = {
   videoPath: string;
   coverPath: string;

@@ -64,7 +64,7 @@ import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
-import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments, sendVideoAttachments, validateVideoAttachments } from './cli/send-dispatch.js';
+import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { npmGlobalUpdateCwd } from './core/maintenance.js';
@@ -5021,7 +5021,19 @@ async function cmdSend(rest: string[]): Promise<void> {
     let messageId: string;
     let failedAttachments: { path: string; error: string }[] = [];
     let failedVideoAttachments: { path: string; coverPath: string; error: string }[] = [];
-    const pureVideoSend = !text.trim() && imageKeys.length === 0 && files.length === 0 && videoAttachments.length > 0;
+    // Pure-video fast path: send the preview as a standalone media message.
+    // A send that also carries mentions is deliberately excluded (media messages
+    // can't embed `<at>`), so it falls through to the card branch which renders
+    // the @ on the footer and sends the video as a follow-up attachment — same
+    // shape as an attachment-only `--files … --mention …` send, whose card body
+    // is likewise empty. See shouldSendAsPureVideo.
+    const pureVideoSend = shouldSendAsPureVideo({
+      hasBodyText: !!text.trim(),
+      imageCount: imageKeys.length,
+      fileCount: files.length,
+      videoCount: videoAttachments.length,
+      mentionCount: mentions.length,
+    });
     if (pureVideoSend) {
       const videoResult = await sendVideoAttachments(
         { uploadFile, uploadImage, dispatch }, appId, videoAttachments,

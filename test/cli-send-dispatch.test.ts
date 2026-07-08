@@ -5,6 +5,7 @@ import {
   findStdinAliasAttachment,
   sendFileAttachments,
   sendVideoAttachments,
+  shouldSendAsPureVideo,
   validateVideoAttachments,
 } from '../src/cli/send-dispatch.js';
 
@@ -140,6 +141,32 @@ describe('sendFileAttachments (best-effort, never throws after primary send)', (
       { path: '/x', error: 'dispatch down' },
       { path: '/y', error: 'dispatch down' },
     ]);
+  });
+});
+
+describe('shouldSendAsPureVideo', () => {
+  const base = { hasBodyText: false, imageCount: 0, fileCount: 0, videoCount: 1, mentionCount: 0 };
+
+  it('is a pure media send only for a bare video with no text/attachments/mentions', () => {
+    expect(shouldSendAsPureVideo(base)).toBe(true);
+    expect(shouldSendAsPureVideo({ ...base, videoCount: 2 })).toBe(true);
+  });
+
+  it('is NOT pure-video when mentions are present (media messages cannot embed <at>)', () => {
+    // Regression guard: with a mention the send must go through the card path so
+    // the @ actually fires — otherwise the mention silently drops while the
+    // success output still reports `mentioned`.
+    expect(shouldSendAsPureVideo({ ...base, mentionCount: 1 })).toBe(false);
+  });
+
+  it('is NOT pure-video when text/image/file body content coexists', () => {
+    expect(shouldSendAsPureVideo({ ...base, hasBodyText: true })).toBe(false);
+    expect(shouldSendAsPureVideo({ ...base, imageCount: 1 })).toBe(false);
+    expect(shouldSendAsPureVideo({ ...base, fileCount: 1 })).toBe(false);
+  });
+
+  it('is NOT pure-video when there is no video at all', () => {
+    expect(shouldSendAsPureVideo({ ...base, videoCount: 0 })).toBe(false);
   });
 });
 
