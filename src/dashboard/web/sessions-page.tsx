@@ -45,6 +45,7 @@ function SessionsPage() {
             <button type="button" data-view="board">{tr('sessions.viewBoard')}</button>
             <button type="button" data-view="table">{tr('sessions.viewTable')}</button>
           </div>
+          <button type="button" id="monitor-room-open" className="monitor-room-open">{tr('sessions.monitorRoom')}</button>
         </div>
       </div>
       <form id="filters" className="filters sessions-filters">
@@ -85,6 +86,7 @@ function SessionsPage() {
       </div>
       <div id="bulk-bar" className="bulk-bar" hidden>
         <span id="bulk-count" />
+        <button type="button" id="bulk-monitor-room">{tr('sessions.addToMonitorRoom')}</button>
         <button type="button" id="bulk-lock">{tr('sessions.lockSelected')}</button>
         <button type="button" id="bulk-unlock">{tr('sessions.unlockSelected')}</button>
         <button type="button" id="bulk-close" className="contrast">{tr('sessions.closeSelected')}</button>

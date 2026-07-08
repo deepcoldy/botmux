@@ -158,6 +158,15 @@ export const dashboardRoutes: DashboardRoute[] = [
     },
   },
   {
+    id: 'monitor-room',
+    routePrefix: '#/monitor-room',
+    rerenderOnUiChange: true,
+    load: async () => {
+      const mod = await import('./monitor-room.js');
+      return root => mod.renderMonitorRoomPage(root);
+    },
+  },
+  {
     id: 'office',
     routePrefix: '#/office',
     rerenderOnUiChange: false,
