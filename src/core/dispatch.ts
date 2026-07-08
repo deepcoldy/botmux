@@ -95,7 +95,7 @@ export function buildDispatchMessages(input: {
     content.push([{ tag: 'text', text: '分工：' }]);
     for (const b of input.bots) {
       const label = b.name || b.openId;
-      content.push([{ tag: 'text', text: `· ${label}：${b.role ?? '执行'}` }]);
+      content.push([{ tag: 'text', text: `· ${label}：${b.role ?? '执行者'}` }]);
     }
   }
 

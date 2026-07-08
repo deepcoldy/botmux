@@ -201,7 +201,7 @@ function taskRow(t: BoardTask, selected: boolean): string {
     ? `<span class="gb-reason">${escapeHtml(t.rejectReason)}</span>` : '';
   const provTag = t.status !== 'accepted' ? ''
     : t.autoReconciled
-      ? '<span class="gb-via gb-via-auto" title="系统自动对账：执行者已提交，自动按验收标准核对后裁定">🤖 自动对账</span>'
+      ? '<span class="gb-via gb-via-auto" title="系统自动核验：执行者已提交，自动按验收标准核对后裁定">🤖 自动核验</span>'
       : supervisorBridged(t)
         ? '<span class="gb-via gb-via-bridge" title="执行者未主动提交，监管者独立核验后代办提交并验收">🤝 监管者代办</span>'
         : '<span class="gb-via gb-via-agent" title="监管者自主核验后裁定">🧠 自主验收</span>';
@@ -265,7 +265,7 @@ function trailHtml(t: BoardTask): string {
   const parts: string[] = [];
   if (t.checkedBy) {
     const prov = t.autoReconciled
-      ? ' <span class="gb-via gb-via-auto" title="系统自动核对交付证据后裁定">🤖 自动对账</span>'
+      ? ' <span class="gb-via gb-via-auto" title="系统自动核对交付证据后裁定">🤖 自动核验</span>'
       : supervisorBridged(t)
         ? ' <span class="gb-via gb-via-bridge" title="执行者未主动提交，监管者独立核验后代办提交并验收">🤝 监管者代办</span>'
         : ' <span class="gb-via gb-via-agent" title="监管者自主核验">🧠 自主验收</span>';
@@ -373,7 +373,7 @@ function notificationRetriesHtml(records: GoalNotificationRetryRecord[]): string
 function sealHtml(t: BoardTask): string {
   if (t.status !== 'accepted') return '';
   const by = botName(t.checkedBy);
-  const kind = t.autoReconciled ? '自动对账' : supervisorBridged(t) ? '监管代办' : '自主核验';
+  const kind = t.autoReconciled ? '自动核验' : supervisorBridged(t) ? '监管代办' : '自主核验';
   const checks = t.evidenceChecked?.length ?? 0;
   const cmds = t.ranCommands?.length ?? 0;
   const bits = [checks ? `核验 ${checks} 项证据` : '', cmds ? `跑 ${cmds} 条命令` : ''].filter(Boolean).join(' · ');
