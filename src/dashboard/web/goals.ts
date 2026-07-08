@@ -32,7 +32,7 @@ interface BoardTask {
 interface BoardNarration { goalChatId: string; type: string; taskId?: string; text: string; ts: number }
 interface GoalNotificationRetryRecord {
   id: string; ownerLarkAppId: string; kind: 'human-attention' | 'completion-confirm'; status?: 'pending' | 'dead';
-  goalChatId: string; goalTitle?: string; taskId?: string; summary: string; attentionKind?: string; attentionReason?: string;
+  goalChatId: string; goalTitle?: string; taskId?: string; taskTitle?: string; summary: string; attentionKind?: string; attentionReason?: string;
   attempts: number; nextAttemptAt: number; lastError?: string; deadAt?: number; deadReason?: string; createdAt: number; updatedAt: number;
 }
 interface BoardGoal {
@@ -351,12 +351,13 @@ function notificationRetriesHtml(records: GoalNotificationRetryRecord[]): string
     <div class="gb-retries-list">${visible.map(r => {
       const dead = r.status === 'dead';
       const title = displayGoalName(r.goalChatId, r.goalTitle);
+      const taskLabel = r.taskTitle?.trim() || (r.taskId ? `任务号 ${shortId(r.taskId)}` : '');
       const label = r.kind === 'completion-confirm' ? '完成确认卡' : '升级/需要人拍板';
       const status = dead ? `已停止自动重试 · ${r.deadReason ?? 'dead-letter'}` : `下次重试 ${fmtTs(r.nextAttemptAt)}`;
       return `<div class="gb-retry ${dead ? 'dead' : ''}" data-retry-id="${escapeHtml(r.id)}">
         <div class="gb-retry-main">
           <strong>${dead ? '需人工处理' : '重试中'} · ${label}</strong>
-          <span>${escapeHtml(title)}${r.taskId ? ` · <code>${escapeHtml(r.taskId)}</code>` : ''}</span>
+          <span>${escapeHtml(title)}${taskLabel ? ` · ${escapeHtml(taskLabel)}` : ''}</span>
           <small>${escapeHtml(status)} · attempts=${r.attempts}${r.lastError ? ` · ${escapeHtml(r.lastError)}` : ''}</small>
         </div>
         <div class="gb-retry-actions">
@@ -387,11 +388,12 @@ function sealHtml(t: BoardTask): string {
 }
 function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
   if (!t) return '<div class="gb-detail-empty"><p>选择一个子任务<br>查看验收痕迹</p></div>';
+  const heading = t.title?.trim() || '未命名任务';
   return `<div class="gb-detail-head">
-      <div class="gb-led-id gb-led-id-lg">${escapeHtml(t.taskId)}</div>
+      <div class="gb-detail-title-main">${escapeHtml(heading)}</div>
       <span class="gb-pill gb-pill-${t.status}">${STATUS_LABEL[t.status] ?? escapeHtml(t.status)}</span>
     </div>
-    ${t.title ? `<p class="gb-detail-title">${escapeHtml(t.title)}</p>` : ''}
+    <p class="gb-detail-title">任务号：<span class="gb-debug-id" title="${escapeHtml(t.taskId)}">${escapeHtml(shortId(t.taskId))}</span></p>
     ${t.workerOpenIds?.length ? `<p class="gb-detail-worker">执行者：${t.workerOpenIds.map((w, i) => {
       const nm = t.workerNames?.[i]?.trim();
       return `<span class="gb-who">${escapeHtml(nm || botName(w))}</span>`;
