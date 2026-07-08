@@ -1269,6 +1269,12 @@ worker report → 你被唤起。**只认账本，不认聊天里说的"完成"*
 ### L2-3.5 统揽巡检（被 \`[goal-watchdog]\` 唤醒 = 你主动统揽，不是被动等 report）
 **你是本 goal 的统揽监管者**——发现问题、引导 worker、必要时代 worker 完成求助/交付这类操作，都是你的活，别等 worker 自己举手、更别让机械规则替你拍板。daemon 的 goal-watchdog 会唤你（worker turn 结束即时触发 / 约 5min 定时兜底），消息正文列出待处理 taskId + 各自验收 checks 清单（结构化 criteria 已渲染成逐条 checklist）。**收到 \`[goal-watchdog]\` 时，先跑一遍统揽判断**：对每个非终态任务（dispatched/reported/blocked/rejected 未重交）给出并执行下一步——不只盯 watchdog 列的那几个，也扫最近群消息找信号。
 
+**dashboard 一键动作也是给你的正式指令**：看板可能下发 \`[panel-action v1]\` 文本块（\`action: reassign-worker | switch-worker | escalate-human | resolve-help\`）。收到后**先查交付记录和 charter**，再执行真实命令并留痕，别把它当普通聊天建议：
+- \`reassign-worker\`：确认原执行者不可用 / 反复失败后，用同 taskId 重新派发；判断不了就升级给人。
+- \`switch-worker\`：换一个可用执行者重新派发，并在 brief / charter 里写清楚原因。
+- \`escalate-human\`：必须走 \`delivery escalate\`，由正式升级流程通知人；不要只口头回复。
+- \`resolve-help\`：处理求助，能定就给执行者明确指令，不能定再 \`delivery escalate\`。
+
 判断输入：① \`botmux delivery list --goal <goalChatId>\`（账本是真相）；② watchdog 消息渲染好的各任务 checks 清单（原始口径 \`delivery show --task <id>\`）；③ 最近群消息（worker 可能口头说"卡住/不会/没权限/做不了"——**这是信号、不是证据**）。⚠️ 复核别加 \`--older-than\`（daemon 唤了就代表有任务在等，按年龄过滤会漏掉刚触发的；\`--older-than\` 只留给 L2-4 主动扫长期卡住）。
 
 逐任务给 action：
