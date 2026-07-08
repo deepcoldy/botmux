@@ -27,6 +27,31 @@ function cardTitle(s: any): string {
   return stripMentionPrefix(s?.title) || String(s?.sessionId ?? '');
 }
 
+export function monitorRoomFrameGeometry(
+  viewport: { width: number; height: number },
+  frame: { width: number; height: number },
+): { width: number; height: number; scale: number } {
+  const width = Math.max(1, Math.floor(viewport.width));
+  const height = Math.max(1, Math.floor(viewport.height));
+  const frameWidth = Math.max(1, frame.width);
+  const frameHeight = Math.max(1, frame.height);
+  const scale = Math.min(1, frameWidth / width, frameHeight / height);
+  return { width, height, scale };
+}
+
+function syncMonitorRoomFrameScales(root: HTMLElement): void {
+  const viewport = { width: window.innerWidth, height: window.innerHeight };
+  root.querySelectorAll<HTMLElement>('.monitor-room-frame-wrap').forEach(wrap => {
+    const frame = wrap.querySelector<HTMLIFrameElement>('.monitor-room-frame');
+    if (!frame) return;
+    const rect = wrap.getBoundingClientRect();
+    const g = monitorRoomFrameGeometry(viewport, { width: rect.width, height: rect.height });
+    frame.style.width = `${g.width}px`;
+    frame.style.height = `${g.height}px`;
+    frame.style.transform = `scale(${g.scale})`;
+  });
+}
+
 function sessionPanelHtml(sessionId: string): string {
   const s = store.sessions.get(sessionId);
   if (!s) {
@@ -110,6 +135,7 @@ export function renderMonitorRoomPage(root: HTMLElement): () => void {
           <p>${escapeHtml(t('monitorRoom.emptyHelp'))}</p>
           <a class="btn-link" href="#/sessions">${escapeHtml(t('monitorRoom.openSessions'))}</a>
         </div>`;
+    syncMonitorRoomFrameScales(root);
   }
 
   grid.addEventListener('click', e => {
@@ -126,7 +152,12 @@ export function renderMonitorRoomPage(root: HTMLElement): () => void {
   });
 
   const unsubscribe = store.on(render);
+  const resize = () => syncMonitorRoomFrameScales(root);
+  window.addEventListener('resize', resize);
   render();
   void loadNameMaps().then(render);
-  return () => unsubscribe();
+  return () => {
+    window.removeEventListener('resize', resize);
+    unsubscribe();
+  };
 }

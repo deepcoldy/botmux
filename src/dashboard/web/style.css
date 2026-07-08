@@ -2267,10 +2267,11 @@ table[hidden] { display: none !important; }
 }
 
 .monitor-room-frame-wrap {
+  position: relative;
   flex: 1;
   min-height: 320px;
   aspect-ratio: 16 / 10;
-  display: flex;
+  overflow: hidden;
   background: #000;
 }
 
@@ -2279,12 +2280,15 @@ table[hidden] { display: none !important; }
 }
 
 .monitor-room-frame {
-  flex: 1;
+  position: absolute;
+  left: 0;
+  top: 0;
   width: 100%;
   height: 100%;
   min-height: 0;
   border: 0;
   background: #000;
+  transform-origin: 0 0;
 }
 
 .monitor-room-placeholder,

@@ -7,6 +7,7 @@ import {
   removeMonitorRoomSessionId,
   type StorageLike,
 } from '../src/dashboard/web/monitor-room-store.js';
+import { monitorRoomFrameGeometry } from '../src/dashboard/web/monitor-room.js';
 import { sessionTerminalHref, type SessionTerminalLocation } from '../src/dashboard/web/session-terminal.js';
 
 function makeStorage(): StorageLike & { data: Map<string, string> } {
@@ -55,5 +56,21 @@ describe('session terminal href', () => {
   it('uses same-origin proxy urls on https platform pages', () => {
     expect(sessionTerminalHref({ sessionId: 'a b', webPort: 3001, proxyPort: 8801 }, platform)).toBe('https://m-1.example.test/s/a%20b');
     expect(sessionTerminalHref({ sessionId: 'abc', webPort: 3001 }, platform)).toBeNull();
+  });
+});
+
+describe('monitor room frame geometry', () => {
+  it('renders the terminal at the full viewport and scales it down into the card', () => {
+    expect(monitorRoomFrameGeometry(
+      { width: 2000, height: 1300 },
+      { width: 600, height: 390 },
+    )).toEqual({ width: 2000, height: 1300, scale: 0.3 });
+  });
+
+  it('does not upscale when a card is larger than the terminal viewport', () => {
+    expect(monitorRoomFrameGeometry(
+      { width: 1000, height: 700 },
+      { width: 1200, height: 900 },
+    )).toEqual({ width: 1000, height: 700, scale: 1 });
   });
 });
