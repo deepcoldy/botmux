@@ -149,6 +149,106 @@ export function validateVideoAttachments(
   return { ok: true, videos: out };
 }
 
+export type NormalizedInteractiveCardResult =
+  | { ok: true; card: Record<string, unknown>; cardJson: string }
+  | { ok: false; error: string };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseJson(raw: string, label: string): { ok: true; value: unknown } | { ok: false; error: string } {
+  try {
+    return { ok: true, value: JSON.parse(raw) };
+  } catch (err: any) {
+    return { ok: false, error: `${label} 不是合法 JSON: ${err?.message ?? String(err)}` };
+  }
+}
+
+function cardObjectFromValue(value: unknown, label: string): { ok: true; card: Record<string, unknown> } | { ok: false; error: string } {
+  let card = value;
+  if (typeof card === 'string') {
+    const parsed = parseJson(card, label);
+    if (!parsed.ok) return parsed;
+    card = parsed.value;
+  }
+  if (!isRecord(card)) {
+    return { ok: false, error: `${label} 必须是 JSON object` };
+  }
+  return { ok: true, card };
+}
+
+function findDisallowedCardCallback(value: unknown, path = 'card'): string | null {
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const found = findDisallowedCardCallback(value[i], `${path}[${i}]`);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (!isRecord(value)) return null;
+
+  if (value.type === 'callback') return `${path}.type`;
+  if (isRecord(value.value) && typeof value.value.action === 'string') {
+    return `${path}.value.action`;
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    const found = findDisallowedCardCallback(child, `${path}.${key}`);
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * Normalize user-supplied Lark/Feishu interactive card JSON into the raw card
+ * body expected by the Lark send/reply APIs. Accepts either:
+ *   - direct card JSON: {"schema":"2.0", ...}
+ *   - webhook/openapi-style wrapper: {"msg_type":"interactive","card":{...}}
+ *   - wrapper with string/object content: {"msg_type":"interactive","content":"{...}"}
+ *
+ * Deliberately rejects callback actions. botmux owns a broad card-action
+ * namespace (close/restart/ask/relay/dashboard/etc.); arbitrary callbacks from
+ * a CLI-created card would be routed through those handlers with host-side
+ * privileges after a user clicks. Display cards and open-url buttons still work.
+ */
+export function normalizeInteractiveCardInput(raw: string): NormalizedInteractiveCardResult {
+  if (!raw.trim()) return { ok: false, error: '自定义卡片 JSON 不能为空' };
+
+  const parsed = parseJson(raw, '自定义卡片 JSON');
+  if (!parsed.ok) return parsed;
+
+  let cardSource = parsed.value;
+  if (isRecord(parsed.value)) {
+    const msgType = typeof parsed.value.msg_type === 'string'
+      ? parsed.value.msg_type
+      : typeof parsed.value.msgType === 'string'
+        ? parsed.value.msgType
+        : undefined;
+    if (msgType !== undefined) {
+      if (msgType !== 'interactive') {
+        return { ok: false, error: `自定义卡片 wrapper 的 msg_type 必须是 interactive（当前: ${msgType}）` };
+      }
+      if ('card' in parsed.value) cardSource = parsed.value.card;
+      else if ('content' in parsed.value) cardSource = parsed.value.content;
+      else return { ok: false, error: 'interactive wrapper 必须包含 card 或 content 字段' };
+    }
+  }
+
+  const normalized = cardObjectFromValue(cardSource, '自定义卡片');
+  if (!normalized.ok) return normalized;
+
+  const callbackPath = findDisallowedCardCallback(normalized.card);
+  if (callbackPath) {
+    return {
+      ok: false,
+      error: `自定义卡片暂不允许 callback 行为（${callbackPath}），请改用 open_url 等展示/跳转能力`,
+    };
+  }
+
+  return { ok: true, card: normalized.card, cardJson: JSON.stringify(normalized.card) };
+}
+
 export type SendVideoAttachmentsDeps = {
   uploadFile: (appId: string, path: string) => Promise<string>;
   uploadImage: (appId: string, path: string) => Promise<string>;

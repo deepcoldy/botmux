@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   dispatchPrimaryMessage,
   findStdinAliasAttachment,
+  normalizeInteractiveCardInput,
   sendFileAttachments,
   sendVideoAttachments,
   shouldSendAsPureVideo,
@@ -201,6 +202,63 @@ describe('validateVideoAttachments', () => {
       ok: false,
       error: '不支持的视频封面格式: /tmp/a.svg（支持 .png/.jpg/.jpeg/.gif/.webp/.bmp）',
     });
+  });
+});
+
+describe('normalizeInteractiveCardInput', () => {
+  const card = {
+    schema: '2.0',
+    body: {
+      direction: 'vertical',
+      elements: [{ tag: 'markdown', content: 'hello' }],
+    },
+  };
+
+  it('accepts direct card JSON and serializes it for interactive send', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify(card));
+
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.card).toEqual(card);
+    expect(res.cardJson).toBe(JSON.stringify(card));
+  });
+
+  it('unwraps msg_type=interactive with card object or string content', () => {
+    const wrappedCard = normalizeInteractiveCardInput(JSON.stringify({
+      msg_type: 'interactive',
+      card,
+    }));
+    expect(wrappedCard.ok).toBe(true);
+    if (wrappedCard.ok) expect(wrappedCard.card).toEqual(card);
+
+    const wrappedContent = normalizeInteractiveCardInput(JSON.stringify({
+      msg_type: 'interactive',
+      content: JSON.stringify(card),
+    }));
+    expect(wrappedContent.ok).toBe(true);
+    if (wrappedContent.ok) expect(wrappedContent.card).toEqual(card);
+  });
+
+  it('rejects non-interactive wrappers, invalid JSON, and non-object cards', () => {
+    expect(normalizeInteractiveCardInput('{').ok).toBe(false);
+    expect(normalizeInteractiveCardInput(JSON.stringify({ msg_type: 'text', content: '{}' })).ok).toBe(false);
+    expect(normalizeInteractiveCardInput(JSON.stringify({ msg_type: 'interactive', content: '[]' })).ok).toBe(false);
+  });
+
+  it('rejects callback actions so custom cards cannot enter botmux action handlers', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      schema: '2.0',
+      body: {
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: 'close' },
+          behaviors: [{ type: 'callback', value: { action: 'close', root_id: 'om_root' } }],
+        }],
+      },
+    }));
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain('callback');
   });
 });
 
