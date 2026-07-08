@@ -5,10 +5,12 @@ import {
   normalizeSessionsViewMode,
   readStoredBoardOrder,
   readStoredKanbanGroupBy,
+  readStoredSessionsShowUnknownChats,
   readStoredSessionsViewMode,
   type SessionsViewMode,
   writeStoredBoardOrder,
   writeStoredKanbanGroupBy,
+  writeStoredSessionsShowUnknownChats,
   writeStoredSessionsViewMode,
 } from './preferences.js';
 import {
@@ -145,6 +147,14 @@ export function sessionLocationText(s: any): string {
   if (name) return `${sessionChatKindLabel(s)} · ${name}`;
   if (chatId) return `${sessionChatKindLabel(s)} · ${chatId}`;
   return t('sessions.chatUnknown');
+}
+
+export function isUnknownChatSession(
+  s: any,
+  resolveTitle: (session: any) => string | null = chatDisplayTitle,
+): boolean {
+  const chatId = String(s?.chatId ?? '').trim();
+  return !!chatId && !resolveTitle(s);
 }
 
 function sessionLocationTitle(s: any): string {
@@ -291,6 +301,9 @@ export function canRestartSession(s: any): boolean {
 }
 
 function pageHtml(): string {
+  const showUnknownChatsChecked = readStoredSessionsShowUnknownChats(
+    typeof window === 'undefined' ? undefined : window.localStorage,
+  ) ? ' checked' : '';
   return `<section class="page">
     <div class="page-heading">
       <div>
@@ -328,6 +341,7 @@ function pageHtml(): string {
         <option value="">${t('sessions.chatAny')}</option>
       </select>
       ${renderCliFilterGroup()}
+      <label class="filter-toggle"><input type="checkbox" name="showUnknownChats"${showUnknownChatsChecked}> <span>${t('sessions.showUnknownChats')}</span></label>
       <label class="filter-toggle"><input type="checkbox" name="active" checked> <span>${t('sessions.activeOnly')}</span></label>
     </form>
     <div id="idle-cleanup-bar" class="idle-cleanup-bar">
@@ -563,6 +577,7 @@ export function wireSessionsPage(root: HTMLElement): () => void {
   const tbody = root.querySelector<HTMLElement>('#sessions-table tbody')!;
   const filtersForm = root.querySelector<HTMLFormElement>('#filters')!;
   const chatSelect = root.querySelector<HTMLSelectElement>('select[name="chat"]')!;
+  const showUnknownChatsInput = root.querySelector<HTMLInputElement>('input[name="showUnknownChats"]');
   const drawer = root.querySelector<HTMLDialogElement>('#drawer')!;
   const selectAllBox = root.querySelector<HTMLInputElement>('#select-all')!;
   const bulkBar = root.querySelector<HTMLElement>('#bulk-bar')!;
@@ -635,6 +650,10 @@ export function wireSessionsPage(root: HTMLElement): () => void {
   })();
   let idleCleanupBusy = false;
   let idleCleanupHours: IdleCleanupHours = 24;
+
+  if (showUnknownChatsInput) {
+    showUnknownChatsInput.checked = readStoredSessionsShowUnknownChats(window.localStorage);
+  }
 
   function selectedIdleCleanupHours(): IdleCleanupHours {
     return idleCleanupHours;
@@ -1524,11 +1543,13 @@ export function wireSessionsPage(root: HTMLElement): () => void {
     const adopt = f.get('adopt') as string;
     const chat = f.get('chat') as string;
     const active = !!f.get('active');
+    const showUnknownChats = !!f.get('showUnknownChats');
     // 看板视图的「已完成」列收纳已关闭会话——「仅活跃」开关不再把它们整体
     // 滤掉，否则该列永远是空的。
     const keepClosed = viewMode === 'kanban';
     const rows = [...store.sessions.values()]
       .filter(s => !cliFilterActive || cli.includes(s.cliId ?? 'unknown'))
+      .filter(s => showUnknownChats || !isUnknownChatSession(s))
       .filter(s => !status || s.status === status)
       .filter(s => !adopt || (adopt === 'yes') === !!s.adopt)
       .filter(s => !chat || String(s.chatId ?? '') === chat)
@@ -1628,10 +1649,12 @@ export function wireSessionsPage(root: HTMLElement): () => void {
 
   function syncChatFilterOptions(): void {
     const prev = chatSelect.value;
+    const showUnknownChats = !!filtersForm.querySelector<HTMLInputElement>('input[name="showUnknownChats"]')?.checked;
     const options = new Map<string, string>();
     for (const row of store.sessions.values()) {
       const chatId = String(row.chatId ?? '').trim();
       if (!chatId) continue;
+      if (!showUnknownChats && isUnknownChatSession(row)) continue;
       const label = sessionLocationText(row);
       const existing = options.get(chatId);
       if (!existing || label < existing) options.set(chatId, label);
@@ -2542,6 +2565,13 @@ export function wireSessionsPage(root: HTMLElement): () => void {
   });
 
   filtersForm.addEventListener('input', rerender);
+  filtersForm.addEventListener('change', event => {
+    const target = event.target as HTMLInputElement | null;
+    if (target?.name === 'showUnknownChats') {
+      writeStoredSessionsShowUnknownChats(window.localStorage, target.checked);
+      rerender();
+    }
+  });
   const unsubscribeStore = store.on(rerender);
   // 团队看板 30s 软刷新（拉对方部署的会话快照与共享编排）；页面切走后
   // kanban 脱离 DOM，定时器自清。

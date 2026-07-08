@@ -3,6 +3,7 @@ import { IDLE_CLEANUP_HOUR_OPTIONS } from '../session-cleanup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { renderCliFilterGroup, SESSION_STATUS_OPTIONS, sessionStatusText, wireSessionsPage } from './sessions.js';
 import { useT } from './react-hooks.js';
+import { readStoredSessionsShowUnknownChats } from './preferences.js';
 
 function SortHeader(props: { sort: string; label: string }) {
   return <th data-sort={props.sort} data-label={props.label}>{props.label}</th>;
@@ -64,6 +65,13 @@ function SessionsPage() {
           <option value="">{tr('sessions.chatAny')}</option>
         </select>
         <span style={{ display: 'contents' }} dangerouslySetInnerHTML={{ __html: renderCliFilterGroup() }} />
+        <label className="filter-toggle">
+          <input
+            type="checkbox"
+            name="showUnknownChats"
+            defaultChecked={readStoredSessionsShowUnknownChats(typeof window === 'undefined' ? undefined : window.localStorage)}
+          /> <span>{tr('sessions.showUnknownChats')}</span>
+        </label>
         <label className="filter-toggle">
           <input type="checkbox" name="active" defaultChecked /> <span>{tr('sessions.activeOnly')}</span>
         </label>

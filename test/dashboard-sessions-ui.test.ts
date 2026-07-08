@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { canRestartSession, renderCliFilterGroup, restartConfirmMessage, sessionLocationText } from '../src/dashboard/web/sessions.js';
+import {
+  canRestartSession,
+  isUnknownChatSession,
+  renderCliFilterGroup,
+  restartConfirmMessage,
+  sessionLocationText,
+} from '../src/dashboard/web/sessions.js';
 
 describe('dashboard sessions filters', () => {
   it('renders CLI filters as same-name checkboxes checked by default for multi-select filtering', () => {
@@ -35,5 +41,13 @@ describe('dashboard sessions filters', () => {
     expect(sessionLocationText({ chatType: 'group', chatId: 'oc_group' })).toBe('群聊 · oc_group');
     expect(sessionLocationText({ chatType: 'p2p', chatId: 'oc_dm' })).toBe('单聊 · oc_dm');
     expect(sessionLocationText({})).toBe('未知聊天');
+  });
+
+  it('treats sessions with chatId but no resolved chat title as unknown chats', () => {
+    const row = { chatType: 'group', chatId: 'oc_stale' };
+
+    expect(isUnknownChatSession(row, () => null)).toBe(true);
+    expect(isUnknownChatSession(row, () => 'SellerIM Agent 集中营')).toBe(false);
+    expect(isUnknownChatSession({}, () => null)).toBe(false);
   });
 });

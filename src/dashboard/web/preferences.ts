@@ -4,6 +4,7 @@ export type SessionsViewMode = 'kanban' | 'board' | 'table';
 
 export const THEME_STORAGE_KEY = 'botmux.dashboard.theme';
 export const SESSIONS_VIEW_STORAGE_KEY = 'botmux.dashboard.sessions.view';
+export const SESSIONS_SHOW_UNKNOWN_CHATS_STORAGE_KEY = 'botmux.dashboard.sessions.showUnknownChats';
 
 export function normalizeThemeMode(value: unknown): ThemeMode | null {
   return value === 'system' || value === 'light' || value === 'dark' ? value : null;
@@ -26,6 +27,14 @@ export function readStoredThemeMode(storage: Storage | undefined): ThemeMode {
 
 export function readStoredSessionsViewMode(storage: Storage | undefined): SessionsViewMode {
   return normalizeSessionsViewMode(storage?.getItem(SESSIONS_VIEW_STORAGE_KEY)) ?? 'board';
+}
+
+export function readStoredSessionsShowUnknownChats(storage: Storage | undefined): boolean {
+  try {
+    return storage?.getItem(SESSIONS_SHOW_UNKNOWN_CHATS_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
 }
 
 // ── 看板列顺序（用户可拖拽/按钮自定义，从左到右）─────────────────────────────
@@ -64,6 +73,14 @@ export function writeStoredSessionsViewMode(storage: Storage | undefined, mode: 
     storage?.setItem(SESSIONS_VIEW_STORAGE_KEY, mode);
   } catch {
     // Some embedded browsers deny localStorage. The current page still updates.
+  }
+}
+
+export function writeStoredSessionsShowUnknownChats(storage: Storage | undefined, show: boolean): void {
+  try {
+    storage?.setItem(SESSIONS_SHOW_UNKNOWN_CHATS_STORAGE_KEY, show ? '1' : '0');
+  } catch {
+    // localStorage 不可用时只在当前页生效
   }
 }
 

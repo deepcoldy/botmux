@@ -9,9 +9,11 @@ import {
   normalizeSkin,
   normalizeThemeMode,
   readStoredSessionsViewMode,
+  readStoredSessionsShowUnknownChats,
   readStoredSidebarMode,
   readStoredSkin,
   resolveThemeMode,
+  writeStoredSessionsShowUnknownChats,
 } from '../src/dashboard/web/preferences.js';
 
 describe('dashboard locale preferences', () => {
@@ -79,6 +81,31 @@ describe('sessions view mode preference', () => {
     expect(readStoredSessionsViewMode(make(null))).toBe('board');
     expect(readStoredSessionsViewMode(make('nope'))).toBe('board');
     expect(readStoredSessionsViewMode(make('kanban'))).toBe('kanban');
+  });
+});
+
+describe('sessions unknown chat preference', () => {
+  it('is disabled by default and enabled only by the explicit 1 value', () => {
+    const make = (value: string | null): Storage =>
+      ({ getItem: () => value }) as unknown as Storage;
+
+    expect(readStoredSessionsShowUnknownChats(undefined)).toBe(false);
+    expect(readStoredSessionsShowUnknownChats(make(null))).toBe(false);
+    expect(readStoredSessionsShowUnknownChats(make('0'))).toBe(false);
+    expect(readStoredSessionsShowUnknownChats(make('1'))).toBe(true);
+  });
+
+  it('persists the toggle as a localStorage boolean flag', () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    } as unknown as Storage;
+
+    writeStoredSessionsShowUnknownChats(storage, true);
+    expect(readStoredSessionsShowUnknownChats(storage)).toBe(true);
+    writeStoredSessionsShowUnknownChats(storage, false);
+    expect(readStoredSessionsShowUnknownChats(storage)).toBe(false);
   });
 });
 
