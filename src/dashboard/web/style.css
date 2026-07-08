@@ -22811,8 +22811,12 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .attn-sec:first-of-type { border-top: none; }
 .attn-sec-head { padding: 4px 13px; font-size: .7rem; text-transform: uppercase; letter-spacing: .04em; color: var(--faint); }
 .attn-sec-n { font-family: var(--mono); }
-.attn-row { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 7px 13px; background: none; border: none; border-left: 3px solid transparent; font: inherit; font-size: .82rem; color: var(--fg); cursor: pointer; }
+.attn-row-wrap { display: flex; align-items: stretch; border-left: 3px solid transparent; }
+.attn-row { display: flex; align-items: center; gap: 10px; flex: 1 1 auto; min-width: 0; width: 100%; text-align: left; padding: 7px 13px; background: none; border: none; font: inherit; font-size: .82rem; color: var(--fg); cursor: pointer; }
 .attn-row:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.attn-action { flex: none; align-self: center; margin: 5px 13px 5px 0; padding: 4px 9px; border: 1px solid var(--border-soft); border-radius: 6px; background: var(--surface-raised); color: var(--muted); font: inherit; font-size: .74rem; cursor: pointer; white-space: nowrap; }
+.attn-action:hover { color: var(--fg); border-color: color-mix(in srgb, var(--accent) 35%, var(--border-soft)); background: color-mix(in srgb, var(--accent) 7%, var(--surface)); }
+.attn-action:disabled { opacity: .65; cursor: default; }
 .attn-next { flex: none; font-weight: 600; min-width: 9.5em; }
 .attn-task { flex: none; font-family: var(--mono); font-size: .76rem; color: var(--accent-strong); max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attn-task-none { color: var(--faint); }
@@ -22906,7 +22910,9 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .attn-sec { padding: 4px 0 6px; }
 .attn-sec-head { padding: 9px 16px 5px; letter-spacing: .06em; }
 /* rows: flat ledger lines — reset the inherited 999px button pill + give real padding */
+.attn-row-wrap { border-radius: 0; }
 .attn-row { border-radius: 0; padding: 9px 16px; gap: 12px; }
+.attn-action { margin: 6px 16px 6px 0; }
 .attn-next { letter-spacing: .005em; }
 .attn-needsHuman { border-left-color: var(--gb-human); }
 .attn-needsHuman .attn-next { color: color-mix(in srgb, var(--gb-human) 58%, var(--fg)); font-weight: 700; }
@@ -22916,6 +22922,11 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .attn-systemRisk { border-left-color: var(--danger); }
 .attn-blocked { border-left-color: var(--warning); }
 .attn-more { padding: 6px 16px 12px; }
+@media (max-width: 720px) {
+  .attn-row-wrap { flex-wrap: wrap; }
+  .attn-row { flex-basis: 100%; }
+  .attn-action { margin: 0 16px 8px auto; }
+}
 
 /* ── stroke 2: 验收印 — promote provenance badges to embossed verification seals ─ */
 .gb-via { border-radius: 5px; padding: 2px 8px; letter-spacing: .015em; }
