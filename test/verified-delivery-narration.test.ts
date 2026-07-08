@@ -36,7 +36,7 @@ describe('verified delivery narration', () => {
     // F5: cleanup card reports the cross-daemon close count.
     const cleanup = buildGoalNarrationText({ type: 'cleanup', key: 'k4', closed: 3 });
     expect(cleanup).toContain('🧹 会话已清理 · 关闭 3 个会话');
-    expect(cleanup).toContain('全部 bot');
+    expect(cleanup).toContain('本机可管理');
 
     // B2: deterministic re-dispatch card names the dead worker + the task.
     const reassigned = buildGoalNarrationText({ type: 'reassigned', key: 'k5', taskId: 'task-9', deadWorker: 'traex-loopy' });
@@ -73,4 +73,3 @@ describe('verified delivery narration', () => {
     expect(sent).toHaveLength(1);
   });
 });
-

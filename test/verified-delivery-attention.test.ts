@@ -30,7 +30,7 @@ describe('classifyTaskDisposition — the shared pure rule', () => {
   });
 
   it('reported → readyToVerify (ledger-only: status=reported, no verdict)', () => {
-    expect(classifyTaskDisposition(task('reported'))).toEqual({ bucket: 'readyToVerify', reason: 'awaiting_verdict', next: '已有 report，等验收' });
+    expect(classifyTaskDisposition(task('reported'))).toEqual({ bucket: 'readyToVerify', reason: 'awaiting_verdict', next: '已有提交，等验收' });
   });
 
   it('accepted → completed (the ONLY thing that is "completed")', () => {
