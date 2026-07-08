@@ -45,6 +45,10 @@ export interface Session {
   webPort?: number;
   larkAppId?: string;
   ownerOpenId?: string;       // topic creator's open_id — for @mention in replies
+  /** Best-effort human-readable title for direct/p2p chats. Lark chat APIs
+   *  often return an empty chat name for p2p, so dashboard rows carry the
+   *  initiating user's display name here when we can resolve it. */
+  chatDisplayName?: string;
   /** open_id of whoever created this session (the first sender), app-scoped to
    *  this bot. UNLIKE ownerOpenId, this is set even for bot-started (foreign-bot)
    *  sessions and is NEVER overwritten by later activity — so it stably points at

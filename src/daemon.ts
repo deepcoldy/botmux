@@ -197,6 +197,16 @@ function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): 
   const hit = diskSessions.find(s => s.status === 'active' && s.larkAppId === larkAppId && s.chatId === chatId && sessionHasReplyThreadAlias(s, rootId));
   return hit ? { chatId: hit.chatId, sessionId: hit.sessionId } : null;
 }
+
+function setDirectChatDisplayNameFromSender(
+  session: Session,
+  chatType: 'group' | 'p2p' | undefined,
+  sender?: { type?: 'user' | 'bot'; name?: string },
+): void {
+  if (chatType !== 'p2p' || sender?.type !== 'user') return;
+  const name = String(sender.name ?? '').trim();
+  if (name) session.chatDisplayName = name;
+}
 /**
  * Per-run state for active workflow loops.
  *
@@ -2404,9 +2414,13 @@ async function startInitialPassthroughSession(args: {
 
   const botCfg = getBot(larkAppId).config;
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
+  const directChatSender = chatType === 'p2p'
+    ? await resolveSender(larkAppId, senderOpenId, parsed.senderType)
+    : undefined;
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
   const session = sessionStore.createSession(chatId, rootIdForStore, commandContent.substring(0, 50), chatType);
   const now = Date.now();
+  setDirectChatDisplayNameFromSender(session, chatType, directChatSender);
   session.larkAppId = larkAppId;
   session.ownerOpenId = ownerOpenId;
   session.creatorOpenId = creatorOpenId;
@@ -2675,6 +2689,13 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       const cmdRootIdForStore = scope === 'thread' ? anchor : messageId;
       const session = sessionStore.createSession(chatId, cmdRootIdForStore, cmdContent.substring(0, 50), chatType);
       const now = Date.now();
+      if (chatType === 'p2p') {
+        setDirectChatDisplayNameFromSender(
+          session,
+          chatType,
+          await resolveSender(larkAppId, senderOpenId, parsed.senderType),
+        );
+      }
       session.larkAppId = larkAppId;
       session.ownerOpenId = senderOpenId;
       session.ownerUnionId = senderUnionId;
@@ -2761,6 +2782,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
   const session = sessionStore.createSession(chatId, rootIdForStore, parsed.content.substring(0, 50), chatType);
   const now = Date.now();
+  setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
   session.larkAppId = larkAppId;
   session.ownerOpenId = senderOpenId;
   session.ownerUnionId = senderUnionId;
@@ -3365,6 +3387,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       if (!existingDs && threadChatId && !SESSIONLESS_DAEMON_COMMANDS.has(cmd)) {
         const session = sessionStore.createSession(threadChatId, anchor, cmdContent.substring(0, 50), ctxChatType);
         const now = Date.now();
+        if (ctxChatType === 'p2p') {
+          setDirectChatDisplayNameFromSender(
+            session,
+            ctxChatType,
+            await getThreadSender(),
+          );
+        }
         session.larkAppId = larkAppId;
         session.ownerOpenId = threadSenderOpenId;
         session.creatorOpenId = threadSenderOpenId;  // stable creator (= dispatch orchestrator for /repo prime) — see Session.creatorOpenId
@@ -3594,6 +3623,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // injects it either into the immediate prompt or stashes it on
     // pendingSender for the deferred spawn.
     const autoCreateSender = await getThreadSender();
+    setDirectChatDisplayNameFromSender(session, autoCreateChatType, autoCreateSender);
     const newDs: DaemonSession = {
       session,
       worker: null,

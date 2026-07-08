@@ -31,9 +31,10 @@ export function readStoredSessionsViewMode(storage: Storage | undefined): Sessio
 
 export function readStoredSessionsShowUnknownChats(storage: Storage | undefined): boolean {
   try {
-    return storage?.getItem(SESSIONS_SHOW_UNKNOWN_CHATS_STORAGE_KEY) === '1';
+    const raw = storage?.getItem(SESSIONS_SHOW_UNKNOWN_CHATS_STORAGE_KEY);
+    return raw == null ? true : raw === '1';
   } catch {
-    return false;
+    return true;
   }
 }
 

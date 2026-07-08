@@ -12,6 +12,7 @@ import { getTerminalAdvertisedPort } from './terminal-url.js';
 import { getBotBrand } from '../bot-registry.js';
 import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
 import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
+import { getIdentity } from '../im/lark/identity-cache.js';
 
 export interface SessionRow {
   sessionId: string;
@@ -26,6 +27,7 @@ export interface SessionRow {
   workingDir?: string;
   chatId: string;
   chatType?: 'group' | 'p2p';
+  chatDisplayName?: string;
   rootMessageId: string;
   threadId?: string;
   /** Conversation unit ('thread' = topic-anchored, 'chat' = plain chat scope).
@@ -100,6 +102,20 @@ function sessionTokenUsage(s: Session, workingDir?: string): SessionTokenUsage |
   });
 }
 
+function directChatDisplayName(s: Session, larkAppId?: string): string | undefined {
+  if (s.chatType !== 'p2p') return undefined;
+  const persisted = String(s.chatDisplayName ?? '').trim();
+  if (persisted) return persisted;
+  const appId = larkAppId ?? s.larkAppId;
+  if (!appId) return undefined;
+  for (const openId of [s.ownerOpenId, s.creatorOpenId, s.lastCallerOpenId]) {
+    if (!openId) continue;
+    const name = String(getIdentity(appId, openId)?.name ?? '').trim();
+    if (name) return name;
+  }
+  return undefined;
+}
+
 export function composeRowFromActive(ds: DaemonSession): SessionRow {
   return {
     sessionId: ds.session.sessionId,
@@ -116,6 +132,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     workingDir: ds.workingDir,
     chatId: ds.chatId,
     chatType: ds.chatType,
+    chatDisplayName: directChatDisplayName(ds.session, ds.larkAppId),
     rootMessageId: ds.session.rootMessageId,
     scope: ds.session.scope,
     title: ds.session.title,
@@ -157,6 +174,7 @@ export function composeRowFromClosed(s: Session): SessionRow {
     workingDir: s.workingDir,
     chatId: s.chatId,
     chatType: s.chatType,
+    chatDisplayName: directChatDisplayName(s, s.larkAppId),
     rootMessageId: s.rootMessageId,
     scope: s.scope,
     title: s.title,

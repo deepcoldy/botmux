@@ -85,12 +85,12 @@ describe('sessions view mode preference', () => {
 });
 
 describe('sessions unknown chat preference', () => {
-  it('is disabled by default and enabled only by the explicit 1 value', () => {
+  it('is enabled by default and disabled only by the explicit 0 value', () => {
     const make = (value: string | null): Storage =>
       ({ getItem: () => value }) as unknown as Storage;
 
-    expect(readStoredSessionsShowUnknownChats(undefined)).toBe(false);
-    expect(readStoredSessionsShowUnknownChats(make(null))).toBe(false);
+    expect(readStoredSessionsShowUnknownChats(undefined)).toBe(true);
+    expect(readStoredSessionsShowUnknownChats(make(null))).toBe(true);
     expect(readStoredSessionsShowUnknownChats(make('0'))).toBe(false);
     expect(readStoredSessionsShowUnknownChats(make('1'))).toBe(true);
   });

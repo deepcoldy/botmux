@@ -70,8 +70,10 @@ describe('dashboard SessionRow token usage', () => {
     const active = makeDs();
     active.chatType = 'p2p';
     active.session.chatType = 'p2p';
+    active.session.chatDisplayName = '韩毅';
 
     expect(composeRowFromActive(active).chatType).toBe('p2p');
+    expect(composeRowFromActive(active).chatDisplayName).toBe('韩毅');
     expect(composeRowFromClosed({
       sessionId: 'closed-1',
       chatId: 'oc_group',
