@@ -14,9 +14,11 @@ import { describe, it, expect, vi } from 'vitest';
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
 vi.mock('node:child_process', () => ({
-  execFile: vi.fn(),
+  execFile: vi.fn((_file: string, _args: string[], cb?: (...args: any[]) => void) => {
+    if (typeof cb === 'function') cb(null, '', '');
+    return {} as any;
+  }),
   execSync: vi.fn(() => ''),
-  execFile: vi.fn(),
   execFileSync: vi.fn(() => ''),
 }));
 
@@ -76,6 +78,7 @@ vi.mock('../src/services/whiteboard-store.js', () => ({
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
   killStalePids: vi.fn(),
+  getActiveSessionsRegistry: vi.fn(() => undefined),
   getCurrentCliVersion: vi.fn(() => '1.0.0'),
 }));
 

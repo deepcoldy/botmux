@@ -189,6 +189,15 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
         // 建连期错误不逐条刷屏（撞黑洞是常态）；一整轮全败才由 scheduleReconnect 侧体现。
         onDialFail();
       });
+
+      sock.on('close', () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        dials.delete(sock);
+        // 建连期 close 可能不伴随 error；仍应把这条拨号计为失败，否则整轮会卡到超时。
+        onDialFail();
+      });
     }
   }
 

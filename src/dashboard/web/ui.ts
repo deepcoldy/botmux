@@ -15,7 +15,6 @@ import {
   type SkinId,
 } from './preferences.js';
 import { applyCyberFx } from './cyber-fx.js';
-import { playSkinIntro } from './skin-intro.js';
 
 type UiListener = () => void;
 
@@ -24,7 +23,7 @@ class DashboardUiState {
   themeMode: ThemeMode = 'system';
   resolvedTheme: ResolvedTheme = 'light';
   skin: SkinId = 'default';
-  // Dashboard cookie-auth state, mirrored from /api/settings by app.ts's
+  // Dashboard cookie-auth state, mirrored from /api/settings by app.tsx's
   // loadAuthState(). Gates write-only affordances rendered per-row (e.g. the
   // writable-terminal "🔑" segment in the sessions board) — read-only visitors
   // must not see a control whose endpoint they'd 401 on. Defaults true so a
@@ -111,10 +110,6 @@ class DashboardUiState {
   private applySkin(animate = false): void {
     document.documentElement.dataset.skin = this.skin;
     applyCyberFx(this.skin === 'cyber', animate);
-    // 2077 plays its own boot loader; the other skins get a themed switch-in intro.
-    if (animate && this.skin !== 'cyber' && this.skin !== 'default') {
-      playSkinIntro(this.skin);
-    }
   }
 
   private applyLocale(): void {
@@ -126,13 +121,7 @@ class DashboardUiState {
 const SKIN_THEME: Record<SkinId, ResolvedTheme> = {
   default: 'light',
   cyber: 'dark',
-  genshin: 'light',
   fallout: 'dark',
-  prts: 'dark',
-  bluearchive: 'dark',
-  zzz: 'dark',
-  dragonball: 'light',
-  ikun: 'dark',
 };
 
 function navigatorLanguages(): readonly string[] {
@@ -354,11 +343,6 @@ export function stripMentionPrefix(title: unknown): string {
   const raw = String(title ?? '');
   const out = raw.replace(/^(?:@\S+\s*)+/, '').trim();
   return out || raw;
-}
-
-/** 全站统一的页面级 loading 占位（慢接口在途时先渲染这个，避免白屏假死）。 */
-export function loadingHtml(label?: string): string {
-  return `<div class="page-loading" role="status"><i class="page-loading-spin" aria-hidden="true"></i>${escapeHtml(label ?? t('common.loading'))}</div>`;
 }
 
 /** 会话当前是否卡在等人，以及等什么（全局 strip 和工作台共用同一判定）。 */

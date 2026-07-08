@@ -3,7 +3,7 @@
  * capability into a 3-section card DTO (access / cards / maintenance).
  *
  * Zero IO. Type-only imports. The input shape mirrors
- * `src/dashboard/web/settings.ts:6-11` but is redeclared locally so the model
+ * `src/dashboard/web/settings-page.tsx` but is redeclared locally so the model
  * does not pull in browser-side jsdom assets.
  */
 

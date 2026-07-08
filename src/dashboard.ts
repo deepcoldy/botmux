@@ -928,6 +928,8 @@ resourceMonitor.start();
 // Path to the bundled frontend (sibling of dist/dashboard.js)
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(__dirname, 'dashboard-web');
+const DEV_RELOAD_MARKER = join(WEB_DIR, '.botmux-dashboard-dev');
+const DEV_RELOAD_VERSION = join(WEB_DIR, '.botmux-dashboard-reload');
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -957,6 +959,38 @@ function serveFileAbs(res: ServerResponse, fp: string): boolean {
   return true;
 }
 
+function dashboardDevReloadEnabled(): boolean {
+  return process.env.BOTMUX_DASHBOARD_DEV_RELOAD === '1' || existsSync(DEV_RELOAD_MARKER);
+}
+
+function dashboardDevReloadVersion(): string | null {
+  try {
+    const st = statSync(DEV_RELOAD_VERSION);
+    if (!st.isFile()) return null;
+    return `${st.size}:${Math.floor(st.mtimeMs)}`;
+  } catch {
+    return null;
+  }
+}
+
+function devReloadSnippet(): string {
+  return `
+<script type="module">
+(() => {
+  if (!('__BOTMUX_DASHBOARD_DEV_RELOAD__' in window)) {
+    Object.defineProperty(window, '__BOTMUX_DASHBOARD_DEV_RELOAD__', { value: true });
+    const source = new EventSource('/__dev/reload');
+    source.addEventListener('reload', () => location.reload());
+  }
+})();
+</script>`;
+}
+
+function injectDevReload(html: string): string {
+  const snippet = devReloadSnippet();
+  return html.includes('</body>') ? html.replace('</body>', `${snippet}\n</body>`) : `${html}\n${snippet}`;
+}
+
 function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const fp = resolve(WEB_DIR, rel);
@@ -972,18 +1006,27 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
     // and can be cached immutably once the current app.js points at them.
     const immutableChunk = relToRoot.startsWith('chunks/') || relToRoot.startsWith('chunks\\');
     const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
+    const devIndex = relToRoot === 'index.html' && dashboardDevReloadEnabled();
     const headers: Record<string, string> = {
       'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
-      'cache-control': immutableChunk ? 'public, max-age=31536000, immutable' : 'no-cache',
+      'cache-control': devIndex ? 'no-store' : immutableChunk ? 'public, max-age=31536000, immutable' : 'no-cache',
       etag,
     };
-    if (req.headers['if-none-match'] === etag) {
+    if (!devIndex && req.headers['if-none-match'] === etag) {
       res.writeHead(304, headers);
       res.end();
       return true;
     }
     res.writeHead(200, headers);
-    res.end(readFileSync(fp));
+    if (req.method === 'HEAD') {
+      res.end();
+      return true;
+    }
+    if (devIndex) {
+      res.end(injectDevReload(readFileSync(fp, 'utf8')));
+    } else {
+      res.end(readFileSync(fp));
+    }
     return true;
   } catch {
     return false;
@@ -1601,10 +1644,36 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // ─── Static frontend (index.html + /assets/* + /game/*) ────────────────
+    if (req.method === 'GET' && url.pathname === '/__dev/reload') {
+      if (!dashboardDevReloadEnabled()) return jsonRes(res, 404, { error: 'dev_reload_disabled' });
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+      });
+      let last = dashboardDevReloadVersion();
+      res.write(`event: ready\ndata: ${JSON.stringify({ version: last })}\n\n`);
+      const timer = setInterval(() => {
+        const next = dashboardDevReloadVersion();
+        if (!next || next === last) return;
+        last = next;
+        res.write(`event: reload\ndata: ${JSON.stringify({ version: next })}\n\n`);
+      }, 500);
+      req.on('close', () => clearInterval(timer));
+      return;
+    }
+
+    // ─── Static frontend (index.html + /assets/* + /game/* + root icons) ───
     if (
-      req.method === 'GET' &&
-      (url.pathname === '/' || url.pathname.startsWith('/assets/') || url.pathname.startsWith('/game/'))
+      (req.method === 'GET' || req.method === 'HEAD') &&
+      (
+        url.pathname === '/' ||
+        url.pathname === '/favicon.ico' ||
+        url.pathname === '/favicon.png' ||
+        url.pathname === '/apple-touch-icon.png' ||
+        url.pathname.startsWith('/assets/') ||
+        url.pathname.startsWith('/game/')
+      )
     ) {
       // HD2D runtime binaries (index.wasm / index.pck) are NOT shipped — they
       // are downloaded on demand into the cache dir and served from there.
@@ -1614,9 +1683,11 @@ const server = createServer(async (req, res) => {
         if (fp && serveFileAbs(res, fp)) return;
         res.writeHead(404); res.end(); return;
       }
-      // Map /assets/foo.js → WEB_DIR/foo.js; /game/* is served as-is.
+      // Map /assets/foo.js → WEB_DIR/foo.js; /favicon.ico is an alias for the PNG favicon.
       const lookupPath = url.pathname.startsWith('/assets/')
         ? '/' + url.pathname.slice(8)
+        : url.pathname === '/favicon.ico'
+          ? '/favicon.png'
         : url.pathname;
       if (serveStatic(req, res, lookupPath)) return;
     }

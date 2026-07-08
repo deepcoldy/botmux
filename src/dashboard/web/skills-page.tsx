@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { botAvatarHtml, loadingHtml } from './ui.js';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { DropdownMenu, FieldTitle, Html, LoadingState, SectionHeader, dropdownLabel } from './dashboard-components.js';
+import { botAvatarHtml } from './ui.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 
@@ -52,11 +53,6 @@ type DeliveryMode = 'auto' | 'prompt' | 'native';
 type ProjectTrustMode = 'off' | 'all';
 
 const INSTALLED_SKILLS_ROWS_PER_PAGE = 2;
-
-function Html(props: { html: string; as?: 'span' | 'div' }) {
-  const Tag = props.as ?? 'span';
-  return <Tag style={{ display: 'contents' }} dangerouslySetInnerHTML={{ __html: props.html }} />;
-}
 
 function nativeLibraryLabel(path: string | undefined, tr: ReturnType<typeof useT>): string | null {
   const p = String(path ?? '').replace(/\\/g, '/');
@@ -122,7 +118,37 @@ function statusClass(status: StatusMessage): string {
   return `oncall-status${status ? ` ${status.ok ? 'hint-ok' : 'hint-warn-inline'}` : ''}`;
 }
 
+function SkillSegmented<T extends string>(props: {
+  value: T;
+  options: Array<{ value: T; label: ReactNode; help?: ReactNode }>;
+  disabled?: boolean;
+  onChange(value: T): void;
+}): JSX.Element {
+  const current = props.options.find(option => option.value === props.value);
+  return (
+    <div className="skills-segmented-control">
+      <div className="segmented skills-segmented" role="group">
+        {props.options.map(option => (
+          <button
+            key={option.value}
+            type="button"
+            className={props.value === option.value ? 'active' : ''}
+            aria-pressed={props.value === option.value ? 'true' : 'false'}
+            title={typeof option.help === 'string' ? option.help : undefined}
+            disabled={props.disabled}
+            onClick={() => props.onChange(option.value)}
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+      {current?.help ? <span className="skills-setting-hint">{current.help}</span> : null}
+    </div>
+  );
+}
+
 interface SkillsInstallPanelProps {
+  showTitle?: boolean;
   installSource: string;
   installPath: string;
   installRef: string;
@@ -163,15 +189,26 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
 
   return (
     <article className="bd-card skills-install-panel">
-      <div className="skills-install-title">
-        <h3 className="bd-section-title">{tr('skills.install')}</h3>
-        <span className="skills-help-tip">
-          <button type="button" className="help-icon-button skills-help-button" aria-label={tr('skills.installInfoLabel')}>?</button>
-          <span className="skills-help-popover" role="tooltip">{tr('skills.installInfo')}</span>
-        </span>
-      </div>
+      {props.showTitle === false ? null : <div className="skills-install-title">
+        <h3 className="bd-section-title">
+          <FieldTitle help={tr('skills.installInfo')} helpLabel={tr('skills.installInfoLabel')}>
+            {tr('skills.install')}
+          </FieldTitle>
+        </h3>
+      </div>}
       <div className="skills-install-grid">
-        <label className="skills-source-label"><span>{tr('skills.source')}</span>
+        <label className="skills-source-label">
+          <FieldTitle
+            help={(
+              <span className="skills-source-help">
+                <span><strong>{tr('skills.sourceHelpRemoteLabel')}</strong>{tr('skills.sourceHelpRemote')}</span>
+                <span><strong>{tr('skills.sourceHelpLocalLabel')}</strong>{tr('skills.sourceHelpLocal')}</span>
+              </span>
+            )}
+            helpLabel={tr('skills.source')}
+          >
+            {tr('skills.source')}
+          </FieldTitle>
           <div className="skills-source-control">
             <input
               type="text"
@@ -183,56 +220,46 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
             />
           </div>
         </label>
-        <div className="bd-section-note skills-install-note">
-          <span><strong>{tr('skills.sourceHelpRemoteLabel')}</strong>{tr('skills.sourceHelpRemote')}</span>
-          <span><strong>{tr('skills.sourceHelpLocalLabel')}</strong>{tr('skills.sourceHelpLocal')}</span>
+        <label className="skills-install-field-wide skills-install-path-field"><span>{tr('skills.path')}</span>
+          <input
+            type="text"
+            data-install="path"
+            placeholder={tr('skills.pathPlaceholder')}
+            value={props.installPath}
+            onChange={e => props.onInstallPathChange(e.currentTarget.value)}
+          />
+        </label>
+        <label className="skills-install-field-wide skills-install-ref-field"><span>{tr('skills.ref')}</span>
+          <input
+            type="text"
+            data-install="ref"
+            placeholder={tr('skills.refPlaceholder')}
+            value={props.installRef}
+            onChange={e => props.onInstallRefChange(e.currentTarget.value)}
+          />
+        </label>
+        <div className="skills-install-actions">
+          <button type="button" data-action="install" disabled={busy} onClick={() => props.onInstall()}>
+            {props.installDiscovering ? tr('skills.scanning') : props.installBusy ? tr('skills.jobRunning') : tr('skills.installSubmit')}
+          </button>
         </div>
-        <div className="skills-install-action-row">
-          <details className="skills-advanced-options" data-skills-advanced={true} open={false}>
-            <summary>
-              <span className="skills-advanced-marker" aria-hidden="true" />
-              <span>{tr('skills.advanced')}</span>
-            </summary>
-            <div className="skills-advanced-fields">
-              <label className="skills-install-field-wide"><span>{tr('skills.path')}</span>
-                <input
-                  type="text"
-                  data-install="path"
-                  placeholder={tr('skills.pathPlaceholder')}
-                  value={props.installPath}
-                  onChange={e => props.onInstallPathChange(e.currentTarget.value)}
-                />
-              </label>
-              <label className="skills-install-field-wide"><span>{tr('skills.ref')}</span>
-                <input
-                  type="text"
-                  data-install="ref"
-                  placeholder={tr('skills.refPlaceholder')}
-                  value={props.installRef}
-                  onChange={e => props.onInstallRefChange(e.currentTarget.value)}
-                />
-              </label>
+        <div className="skills-install-bottom-row">
+          <div className="skills-local-discovery-panel">
+            <div>
+              <strong>{tr('skills.localDiscoverTitle')}</strong>
+              <span>{tr('skills.localDiscoverHelp')}</span>
             </div>
-          </details>
-          <div className="skills-install-actions">
-            <button type="button" className="primary" data-action="install" disabled={busy} onClick={() => props.onInstall()}>
-              {props.installDiscovering ? tr('skills.scanning') : props.installBusy ? tr('skills.jobRunning') : tr('skills.installSubmit')}
+            <button type="button" data-action="open-native-skill-discovery" onClick={() => props.onOpenNativeDiscovery()}>
+              {tr('skills.localDiscover')}
             </button>
           </div>
         </div>
-        <div className="skills-local-discovery-panel">
-          <div>
-            <strong>{tr('skills.localDiscoverTitle')}</strong>
-            <span>{tr('skills.localDiscoverHelp')}</span>
-          </div>
-          <button type="button" data-action="open-native-skill-discovery" onClick={() => props.onOpenNativeDiscovery()}>
-            {tr('skills.localDiscover')}
-          </button>
+      </div>
+      {props.installStatus ? (
+        <div className="actions skills-install-status-row">
+          <span className={statusClass(props.installStatus)} data-skills-status>{props.installStatus.text}</span>
         </div>
-      </div>
-      <div className="actions">
-        <span className={statusClass(props.installStatus)} data-skills-status>{props.installStatus?.text ?? ''}</span>
-      </div>
+      ) : null}
       <dialog
         className="skills-discovery-dialog skills-install-selection-dialog"
         data-install-selection-dialog
@@ -710,170 +737,147 @@ function SkillsPage() {
   const configuredBotCount = bots.filter(bot => policyConfigured(bot.skills)).length;
   const attachedSkillRefCount = bots.reduce((sum, bot) => sum + policyReferenceCount(bot.skills), 0);
 
-  const body = loading
-    ? <Html html={loadingHtml()} as="div" />
-    : loadError
-      ? <p className="hint-warn">{loadError}</p>
-      : (
-        <div className="skills-page-grid">
-          <aside className="skills-side-rail">
-            <article className="bd-card skills-defaults-panel">
-              <h3 className="bd-section-title">{tr('skills.globalDefaults')}</h3>
-              <div className="skills-control-block">
-                <span className="skills-control-label">{tr('skills.globalProject')}</span>
-                <div className="skills-choice-group skills-choice-group-compact skills-project-group">
-                  {([
-                    ['off', tr('skills.globalProjectOff'), tr('skills.globalProjectOffHelp')],
-                    ['all', tr('skills.globalProjectAll'), tr('skills.globalProjectAllHelp')],
-                  ] as const).map(([value, label, help]) => (
-                    <button
-                      key={value}
-                      type="button"
-                      className={`skills-choice${trustProjectSkills === value ? ' selected' : ''}`}
-                      data-global-project-value={value}
-                      aria-pressed={trustProjectSkills === value ? 'true' : 'false'}
-                      disabled={globalBusy === 'project'}
-                      onClick={() => void updateGlobalProject(value)}
-                    >
-                      <strong>{label}</strong><small>{help}</small>
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="skills-control-block">
-                <span className="skills-control-label">{tr('skills.globalDelivery')}</span>
-                <div className="skills-choice-group skills-delivery-group">
-                  {([
-                    ['auto', tr('skills.deliveryAuto'), tr('skills.deliveryAutoHelp')],
-                    ['prompt', tr('skills.deliveryPrompt'), tr('skills.deliveryPromptHelp')],
-                    ['native', tr('skills.deliveryNative'), tr('skills.deliveryNativeHelp')],
-                  ] as const).map(([value, label, help]) => (
-                    <button
-                      key={value}
-                      type="button"
-                      className={`skills-choice${delivery === value ? ' selected' : ''}`}
-                      data-global-delivery-value={value}
-                      aria-pressed={delivery === value ? 'true' : 'false'}
-                      disabled={globalBusy === 'delivery'}
-                      onClick={() => void updateGlobalDelivery(value)}
-                    >
-                      <strong>{label}</strong><small>{help}</small>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </article>
+  const headingActions = (
+    <div className="page-heading-actions skills-heading-actions">
+      <div className="skills-metric-strip">
+        <span><small>{tr('skills.metricInstalled')}</small><strong>{skills.length}</strong></span>
+        <span><small>{tr('skills.metricBots')}</small><strong>{configuredBotCount}/{bots.length}</strong></span>
+        <span><small>{tr('skills.metricAttached')}</small><strong>{attachedSkillRefCount}</strong></span>
+      </div>
+      <button type="button" id="skills-refresh" className="page-primary-action" disabled={loading} onClick={() => void refresh()}>{tr('skills.refresh')}</button>
+    </div>
+  );
 
-            <SkillsInstallPanel
-              installSource={installSource}
-              installPath={installPath}
-              installRef={installRef}
-              installStatus={installStatus}
-              installBusy={installBusy}
-              installDiscovering={installDiscovering}
-              installSelectionOpen={installSelectionOpen}
-              installCandidates={installCandidates}
-              selectedInstallSkills={selectedInstallSkills}
-              onInstallSourceChange={(value) => {
-                setInstallSource(value);
-                clearInstallDiscovery();
-              }}
-              onInstallPathChange={(value) => {
-                setInstallPath(value);
-                clearInstallDiscovery();
-              }}
-              onInstallRefChange={(value) => {
-                setInstallRef(value);
-                clearInstallDiscovery();
-              }}
-              onToggleInstallSkill={toggleInstallCandidate}
-              onSelectAllInstallSkills={selectAllInstallCandidates}
-              onConfirmInstallSelection={() => void confirmInstallSelection()}
-              onCloseInstallSelection={() => setInstallSelectionOpen(false)}
-              onInstall={() => void installSkill()}
-              onOpenNativeDiscovery={() => setDiscoveryOpen(true)}
-            />
-          </aside>
-
-          <section className="skills-main-panel">
-            <section className="skills-overview">
-              <div className="skills-overview-copy">
-                <h2>{tr('skills.overviewTitle')}</h2>
-                <p>{tr('skills.overviewBody')}</p>
-              </div>
-              <div className="skills-metric-strip">
-                <span><small>{tr('skills.metricInstalled')}</small><strong>{skills.length}</strong></span>
-                <span><small>{tr('skills.metricBots')}</small><strong>{configuredBotCount}/{bots.length}</strong></span>
-                <span><small>{tr('skills.metricAttached')}</small><strong>{attachedSkillRefCount}</strong></span>
-              </div>
+  const body = (
+    <div className="skills-page-stack">
+      {loading ? <LoadingState label={tr('common.loading')} /> : loadError ? <p className="hint-warn">{loadError}</p> : (
+        <>
+          <div className="skills-config-row">
+            <section className="skills-config-block">
+              <SectionHeader title={tr('skills.globalDefaults')} />
+              <article className="bd-card skills-defaults-panel skills-config-card">
+                <div className="skills-control-block">
+                  <span className="skills-control-label">{tr('skills.globalProject')}</span>
+                  <SkillSegmented
+                    value={trustProjectSkills}
+                    disabled={globalBusy === 'project'}
+                    options={[
+                      { value: 'off', label: tr('skills.globalProjectOff'), help: tr('skills.globalProjectOffHelp') },
+                      { value: 'all', label: tr('skills.globalProjectAll'), help: tr('skills.globalProjectAllHelp') },
+                    ]}
+                    onChange={value => void updateGlobalProject(value)}
+                  />
+                </div>
+                <div className="skills-control-block">
+                  <span className="skills-control-label">{tr('skills.globalDelivery')}</span>
+                  <SkillSegmented
+                    value={delivery}
+                    disabled={globalBusy === 'delivery'}
+                    options={[
+                      { value: 'auto', label: tr('skills.deliveryAuto'), help: tr('skills.deliveryAutoHelp') },
+                      { value: 'prompt', label: tr('skills.deliveryPrompt'), help: tr('skills.deliveryPromptHelp') },
+                      { value: 'native', label: tr('skills.deliveryNative'), help: tr('skills.deliveryNativeHelp') },
+                    ]}
+                    onChange={value => void updateGlobalDelivery(value)}
+                  />
+                </div>
+              </article>
             </section>
 
-            <section className="skills-bots-panel">
-              <div className="skills-section-head skills-section-head-row">
-                <div>
-                  <h2>{tr('skills.bots')}</h2>
-                  <p>{tr('skills.botsHelp')}</p>
-                </div>
+            <section className="skills-config-block">
+              <SectionHeader
+                title={<FieldTitle help={tr('skills.installInfo')} helpLabel={tr('skills.installInfoLabel')}>{tr('skills.install')}</FieldTitle>}
+              />
+              <SkillsInstallPanel
+                showTitle={false}
+                installSource={installSource}
+                installPath={installPath}
+                installRef={installRef}
+                installStatus={installStatus}
+                installBusy={installBusy}
+                installDiscovering={installDiscovering}
+                installSelectionOpen={installSelectionOpen}
+                installCandidates={installCandidates}
+                selectedInstallSkills={selectedInstallSkills}
+                onInstallSourceChange={(value) => {
+                  setInstallSource(value);
+                  clearInstallDiscovery();
+                }}
+                onInstallPathChange={(value) => {
+                  setInstallPath(value);
+                  clearInstallDiscovery();
+                }}
+                onInstallRefChange={(value) => {
+                  setInstallRef(value);
+                  clearInstallDiscovery();
+                }}
+                onToggleInstallSkill={toggleInstallCandidate}
+                onSelectAllInstallSkills={selectAllInstallCandidates}
+                onConfirmInstallSelection={() => void confirmInstallSelection()}
+                onCloseInstallSelection={() => setInstallSelectionOpen(false)}
+                onInstall={() => void installSkill()}
+                onOpenNativeDiscovery={() => setDiscoveryOpen(true)}
+              />
+            </section>
+
+            <section className="skills-config-block">
+              <SectionHeader title={tr('skills.bots')} count={tr('skills.botCount', { count: bots.length })} hint={tr('skills.botsHelp')}>
                 {bots.length > 3 ? (
                   <div className="skills-bot-rail-actions">
                     <button type="button" className="skills-rail-button" data-action="scroll-bots" data-dir="-1" aria-label={tr('skills.scrollBotsPrev')} title={tr('skills.scrollBotsPrev')} onClick={() => scrollBots(-1)}>&lsaquo;</button>
-                    <span className="skills-count-pill">{tr('skills.botCount', { count: bots.length })}</span>
                     <button type="button" className="skills-rail-button" data-action="scroll-bots" data-dir="1" aria-label={tr('skills.scrollBotsNext')} title={tr('skills.scrollBotsNext')} onClick={() => scrollBots(1)}>&rsaquo;</button>
                   </div>
-                ) : <span className="skills-count-pill">{tr('skills.botCount', { count: bots.length })}</span>}
-              </div>
-              <div className="skills-bot-grid" ref={botGridRef}>
-                {bots.map(bot => (
-                  <BotPolicyCard
-                    key={bot.larkAppId}
-                    bot={bot}
-                    installedNames={installedNames}
-                    skills={skills}
-                    status={botStatuses[bot.larkAppId] ?? null}
-                    busyKey={botBusy}
-                    onUpdate={updateBotSkill}
-                  />
-                ))}
-              </div>
-            </section>
-
-            <section className="bd-card skills-installed-panel">
-              <div className="skills-section-head skills-section-head-row">
-                <div>
-                  <h2>{tr('skills.installed')}</h2>
-                  <p>{tr('skills.installedHelp')}</p>
+                ) : null}
+              </SectionHeader>
+              <section className="bd-card skills-bots-panel skills-config-card">
+                <div className="skills-bot-grid" ref={botGridRef}>
+                  {bots.map(bot => (
+                    <BotPolicyCard
+                      key={bot.larkAppId}
+                      bot={bot}
+                      installedNames={installedNames}
+                      skills={skills}
+                      status={botStatuses[bot.larkAppId] ?? null}
+                      busyKey={botBusy}
+                      onUpdate={updateBotSkill}
+                    />
+                  ))}
                 </div>
-                {installedPageCount <= 1 ? (
-                  <span className="skills-count-pill">{tr('skills.skillCount', { count: skills.length })}</span>
-                ) : (
-                  <div className="skills-installed-toolbar">
-                    <span className="skills-count-pill">{tr('skills.skillCount', { count: skills.length })}</span>
-                    <div className="skills-pager">
-                      <button
-                        type="button"
-                        className="skills-pager-button"
-                        data-action="page-installed-skills"
-                        data-dir="-1"
-                        aria-label={tr('skills.prevPage')}
-                        title={tr('skills.prevPage')}
-                        disabled={installedSkillsPage === 0}
-                        onClick={() => setInstalledSkillsPage(page => Math.max(0, page - 1))}
-                      >&lsaquo;</button>
-                      <span>{tr('skills.pageStatus', { page: installedSkillsPage + 1, pages: installedPageCount })}</span>
-                      <button
-                        type="button"
-                        className="skills-pager-button"
-                        data-action="page-installed-skills"
-                        data-dir="1"
-                        aria-label={tr('skills.nextPage')}
-                        title={tr('skills.nextPage')}
-                        disabled={installedSkillsPage >= installedPageCount - 1}
-                        onClick={() => setInstalledSkillsPage(page => Math.min(installedPageCount - 1, page + 1))}
-                      >&rsaquo;</button>
-                    </div>
+              </section>
+            </section>
+          </div>
+
+          <section className="skills-installed-block">
+            <SectionHeader title={tr('skills.installed')} count={tr('skills.skillCount', { count: skills.length })} hint={tr('skills.installedHelp')}>
+              {installedPageCount > 1 ? (
+                <div className="skills-installed-toolbar">
+                  <div className="skills-pager">
+                    <button
+                      type="button"
+                      className="skills-pager-button"
+                      data-action="page-installed-skills"
+                      data-dir="-1"
+                      aria-label={tr('skills.prevPage')}
+                      title={tr('skills.prevPage')}
+                      disabled={installedSkillsPage === 0}
+                      onClick={() => setInstalledSkillsPage(page => Math.max(0, page - 1))}
+                    >&lsaquo;</button>
+                    <span>{tr('skills.pageStatus', { page: installedSkillsPage + 1, pages: installedPageCount })}</span>
+                    <button
+                      type="button"
+                      className="skills-pager-button"
+                      data-action="page-installed-skills"
+                      data-dir="1"
+                      aria-label={tr('skills.nextPage')}
+                      title={tr('skills.nextPage')}
+                      disabled={installedSkillsPage >= installedPageCount - 1}
+                      onClick={() => setInstalledSkillsPage(page => Math.min(installedPageCount - 1, page + 1))}
+                    >&rsaquo;</button>
                   </div>
-                )}
-              </div>
+                </div>
+              ) : null}
+            </SectionHeader>
+            <section className="bd-card skills-installed-panel">
               {skills.length === 0 ? <p className="empty">{tr('skills.empty')}</p> : (
                 <div className="skills-list">
                   {visibleSkills.map(skill => (
@@ -898,77 +902,97 @@ function SkillsPage() {
             </section>
           </section>
 
-          <dialog className="skills-discovery-dialog" id="skills-discovery-dialog" ref={discoveryDialogRef} onClose={() => setDiscoveryOpen(false)}>
+          <dialog
+            className="skills-discovery-dialog"
+            id="skills-discovery-dialog"
+            ref={discoveryDialogRef}
+            onClose={() => setDiscoveryOpen(false)}
+            onClick={event => {
+              if (event.target === event.currentTarget) setDiscoveryOpen(false);
+            }}
+          >
             <article>
               <header>
                 <h3>{tr('skills.discoverTitle')}</h3>
                 <p>{tr('skills.discoverHelp')}</p>
+                <button
+                  type="button"
+                  className="skills-discovery-close"
+                  data-action="close-discovery"
+                  aria-label={tr('skills.discoverClose')}
+                  title={tr('skills.discoverClose')}
+                  onClick={() => setDiscoveryOpen(false)}
+                />
               </header>
               <div className="skills-discovery-body">
                 {!activeDiscoveryGroup ? <p className="empty">{tr('skills.discoverEmpty')}</p> : (
                   <>
-                    <div className="skills-discovery-tabs" role="tablist" aria-label={tr('skills.discoverTitle')}>
-                      {nativeSkillGroups.map(group => {
+                    <div className="skills-discovery-layout">
+                      <div className="skills-discovery-tabs" role="tablist" aria-label={tr('skills.discoverTitle')}>
+                        {nativeSkillGroups.map(group => {
+                          const key = discoveryGroupKey(group);
+                          const selected = key === activeKey;
+                          return (
+                            <button
+                              key={key}
+                              type="button"
+                              role="tab"
+                              data-discovery-tab={key}
+                              className={selected ? 'selected' : ''}
+                              aria-selected={selected ? 'true' : 'false'}
+                              onClick={() => setActiveDiscoveryKey(key)}
+                            >
+                              <strong>{group.label ?? group.cliId}</strong>
+                              <small>{tr('skills.skillCount', { count: group.skills.length })}</small>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="skills-discovery-main">
+                        <div className="skills-discovery-path"><code>{activeDiscoveryGroup.rootDir}</code></div>
+                        {nativeSkillGroups.map(group => {
                         const key = discoveryGroupKey(group);
                         const selected = key === activeKey;
                         return (
-                          <button
-                            key={key}
-                            type="button"
-                            role="tab"
-                            data-discovery-tab={key}
-                            className={selected ? 'selected' : ''}
-                            aria-selected={selected ? 'true' : 'false'}
-                            onClick={() => setActiveDiscoveryKey(key)}
-                          >
-                            <strong>{group.label ?? group.cliId}</strong>
-                            <small>{tr('skills.skillCount', { count: group.skills.length })}</small>
-                          </button>
+                          <section className="skills-discovery-group" data-discovery-panel={key} hidden={!selected} key={key}>
+                            {group.skills.length === 0 ? <p className="empty">{tr('skills.discoverGroupEmpty')}</p> : (
+                              <div className="skills-discovery-list">
+                                {group.skills.map(skill => {
+                                  const already = installedNames.has(skill.name);
+                                  const path = skill.rootDir ?? skill.source?.root ?? '';
+                                  return (
+                                    <label className={`skills-discovery-row${already ? ' installed' : ''}`} key={`${skill.name}:${path}`}>
+                                      <input
+                                        type="checkbox"
+                                        data-discovered-skill
+                                        value={path}
+                                        disabled={already}
+                                        checked={!already && selectedDiscovered.has(path)}
+                                        onChange={e => {
+                                          const checked = e.currentTarget.checked;
+                                          setSelectedDiscovered(prev => {
+                                            const next = new Set(prev);
+                                            if (checked) next.add(path);
+                                            else next.delete(path);
+                                            return next;
+                                          });
+                                        }}
+                                      />
+                                      <span>
+                                        <strong>{skill.name}</strong>
+                                        {skill.description ? <small>{skill.description}</small> : null}
+                                      </span>
+                                      {already ? <em>{tr('skills.discoverRegistered')}</em> : null}
+                                    </label>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </section>
                         );
                       })}
+                      </div>
                     </div>
-                    <div className="skills-discovery-path"><code>{activeDiscoveryGroup.rootDir}</code></div>
-                    {nativeSkillGroups.map(group => {
-                      const key = discoveryGroupKey(group);
-                      const selected = key === activeKey;
-                      return (
-                        <section className="skills-discovery-group" data-discovery-panel={key} hidden={!selected} key={key}>
-                          {group.skills.length === 0 ? <p className="empty">{tr('skills.discoverGroupEmpty')}</p> : (
-                            <div className="skills-discovery-list">
-                              {group.skills.map(skill => {
-                                const already = installedNames.has(skill.name);
-                                const path = skill.rootDir ?? skill.source?.root ?? '';
-                                return (
-                                  <label className={`skills-discovery-row${already ? ' installed' : ''}`} key={`${skill.name}:${path}`}>
-                                    <input
-                                      type="checkbox"
-                                      data-discovered-skill
-                                      value={path}
-                                      disabled={already}
-                                      checked={!already && selectedDiscovered.has(path)}
-                                      onChange={e => {
-                                        const checked = e.currentTarget.checked;
-                                        setSelectedDiscovered(prev => {
-                                          const next = new Set(prev);
-                                          if (checked) next.add(path);
-                                          else next.delete(path);
-                                          return next;
-                                        });
-                                      }}
-                                    />
-                                    <span>
-                                      <strong>{skill.name}</strong>
-                                      {skill.description ? <small>{skill.description}</small> : null}
-                                    </span>
-                                    {already ? <em>{tr('skills.discoverRegistered')}</em> : null}
-                                  </label>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </section>
-                      );
-                    })}
                   </>
                 )}
               </div>
@@ -991,22 +1015,22 @@ function SkillsPage() {
                 <button type="button" className="primary" data-action="register-discovered-skills" disabled={discoveryBusy} onClick={() => void registerDiscoveredSkills()}>
                   {tr('skills.discoverRegister')}
                 </button>
-                <button type="button" data-action="close-discovery" onClick={() => setDiscoveryOpen(false)}>{tr('skills.discoverClose')}</button>
               </footer>
             </article>
           </dialog>
-        </div>
-      );
+        </>
+      )}
+    </div>
+  );
 
   return (
-    <section className="page">
+    <section className="page skills-page">
       <div className="page-heading">
         <div>
           <p className="eyebrow">{tr('nav.skills')}</p>
           <h1>{tr('skills.title')}</h1>
-          <p>{tr('skills.subtitle')}</p>
         </div>
-        <button type="button" id="skills-refresh" disabled={loading} onClick={() => void refresh()}>{tr('skills.refresh')}</button>
+        {headingActions}
       </div>
       <div id="skills-body">{body}</div>
     </section>
@@ -1027,6 +1051,7 @@ export function BotPolicyCard(props: {
   const names = priorityNames(bot.skills);
   const attached = new Set(names);
   const attachOptions = skills.filter(skill => !attached.has(skill.name));
+  const attachMenuOptions = attachOptions.map(skill => ({ value: skill.name, label: skill.name }));
   const [selected, setSelected] = useState(attachOptions[0]?.name ?? '');
 
   useEffect(() => {
@@ -1051,11 +1076,16 @@ export function BotPolicyCard(props: {
     <article className="bd-card skills-bot-card" data-appid={bot.larkAppId}>
       <header className="skills-bot-head">
         <Html html={botAvatarHtml({ name: label, larkAppId: bot.larkAppId, size: 'sm', dot: 'ok' })} />
-        <div><strong>{label}</strong><code>{bot.larkAppId}</code></div>
-        <span className="skills-count-pill">{tr('skills.skillCount', { count: names.length })}</span>
+        <div className="skills-bot-title-line">
+          <strong>{label}</strong>
+          <span className="skills-count-pill">{tr('skills.skillCount', { count: names.length })}</span>
+        </div>
+        <code>{bot.larkAppId}</code>
       </header>
-      <section className="bd-section">
-        <h3 className="bd-section-title">{tr('skills.priority')}</h3>
+      <section className="skills-policy-panel">
+        <div className="skills-priority-head">
+          <h3 className="skills-priority-title">{tr('skills.priority')}</h3>
+        </div>
         {names.length === 0 ? <p className="bd-section-note">{tr('skills.noPriority')}</p> : (
           <div className="skills-chip-list">
             {names.map(name => {
@@ -1077,12 +1107,17 @@ export function BotPolicyCard(props: {
             })}
           </div>
         )}
-        <div className="actions skills-attach-row">
+        <div className="skills-attach-row">
           {attachOptions.length === 0 ? <button type="button" disabled>{tr('skills.attach')}</button> : (
             <>
-              <select data-attach-picker value={selected} onChange={e => setSelected(e.currentTarget.value)}>
-                {attachOptions.map(skill => <option value={skill.name} key={skill.name}>{skill.name}</option>)}
-              </select>
+              <DropdownMenu
+                className="skills-attach-menu"
+                ariaLabel={tr('skills.attach')}
+                value={selected}
+                label={dropdownLabel(attachMenuOptions, selected)}
+                options={attachMenuOptions}
+                onChange={setSelected}
+              />
               <button
                 type="button"
                 data-action="attach-skill"

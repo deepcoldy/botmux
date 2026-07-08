@@ -11,191 +11,43 @@ export interface DashboardRoute {
   load(): DashboardRouteLoadResult;
 }
 
+function pageRoute<T extends Record<K, DashboardRouteRenderer>, K extends keyof T & string>(
+  id: string,
+  routePrefix: string,
+  importer: () => Promise<T>,
+  renderName: K,
+  rerenderOnUiChange = false,
+): DashboardRoute {
+  return {
+    id,
+    routePrefix,
+    rerenderOnUiChange,
+    load: async () => {
+      const mod = await importer();
+      return mod[renderName];
+    },
+  };
+}
+
 export const dashboardRoutes: DashboardRoute[] = [
-  {
-    id: 'legacy-workflow',
-    routePrefix: '#/legacy-workflow',
-    load: async () => {
-      const mod = await import('./workflows.js');
-      return root => mod.renderWorkflowsPage(root);
-    },
-  },
-  {
-    id: 'workflows',
-    routePrefix: '#/workflows',
-    rerenderOnUiChange: false,
-    load: async () => {
-      const mod = await import('./v3-page.js');
-      return root => mod.renderV3RunsPage(root);
-    },
-  },
-  {
-    id: 'groups',
-    routePrefix: '#/groups',
-    // Groups is currently a render-once React scaffold around the existing
-    // imperative matrix/dialog controller, so locale/theme changes full-remount
-    // it until those controller-owned subtrees become React components.
-    rerenderOnUiChange: true,
-    load: async () => {
-      const mod = await import('./groups-page.js');
-      return root => mod.renderGroupsPage(root);
-    },
-  },
-  {
-    id: 'settings',
-    routePrefix: '#/settings',
-    rerenderOnUiChange: false,
-    load: async () => {
-      const mod = await import('./settings-page.js');
-      return root => mod.renderSettingsPage(root);
-    },
-  },
-  {
-    id: 'bot-defaults',
-    routePrefix: '#/bot-defaults',
-    // Bot defaults is currently a render-once React scaffold around the
-    // imperative settings controller, so ui changes still full-remount it to
-    // refresh translations without partial React renders fighting innerHTML.
-    rerenderOnUiChange: true,
-    load: async () => {
-      const mod = await import('./bot-defaults-page.js');
-      return root => mod.renderBotDefaultsPage(root);
-    },
-  },
-  {
-    id: 'skills',
-    routePrefix: '#/skills',
-    rerenderOnUiChange: false,
-    load: async () => {
-      const mod = await import('./skills-page.js');
-      return root => mod.renderSkillsPage(root);
-    },
-  },
-  {
-    id: 'connectors',
-    routePrefix: '#/connectors',
-    rerenderOnUiChange: false,
-    load: async () => {
-      const mod = await import('./connectors.js');
-      return root => mod.renderConnectorsPage(root);
-    },
-  },
-  {
-    id: 'team-manage',
-    routePrefix: '#/team/manage',
-    // Team pages are render-once React scaffolds around the existing
-    // federation controller, so ui changes full-remount translated subtrees.
-    rerenderOnUiChange: true,
-    load: async () => {
-      const mod = await import('./team-federation-page.js');
-      return root => mod.renderTeamManagePage(root);
-    },
-  },
-  {
-    id: 'team',
-    routePrefix: '#/team',
-    // Team pages are render-once React scaffolds around the existing
-    // federation controller, so ui changes full-remount translated subtrees.
-    rerenderOnUiChange: true,
-    load: async () => {
-      const mod = await import('./team-federation-page.js');
-      return root => mod.renderTeamFederationPage(root);
-    },
-  },
-  {
-    id: 'roles-profile',
-    routePrefix: '#/roles/profile',
-    // Roles still uses a render-once React scaffold around the imperative
-    // editor/profile controller, so ui changes full-remount it until the
-    // controller-owned subtrees become reactive components.
-    rerenderOnUiChange: true,
-    load: async () => {
-      const mod = await import('./roles-page.js');
-      return root => mod.renderRoleProfilesPage(root);
-    },
-  },
-  {
-    id: 'roles',
-    routePrefix: '#/roles',
-    // Roles still uses a render-once React scaffold around the imperative
-    // editor/profile controller, so ui changes full-remount it until the
-    // controller-owned subtrees become reactive components.
-    rerenderOnUiChange: true,
-    load: async () => {
-      const mod = await import('./roles-page.js');
-      return root => mod.renderRolesPage(root);
-    },
-  },
-  {
-    id: 'schedules',
-    routePrefix: '#/schedules',
-    rerenderOnUiChange: false,
-    load: async () => {
-      const mod = await import('./schedules.js');
-      return root => mod.renderSchedulesPage(root);
-    },
-  },
-  {
-    id: 'whiteboards',
-    routePrefix: '#/whiteboards',
-    rerenderOnUiChange: false,
-    load: async () => {
-      const mod = await import('./whiteboards-page.js');
-      return root => mod.renderWhiteboardsPage(root);
-    },
-  },
-  {
-    id: 'monitoring',
-    routePrefix: '#/monitoring',
-    rerenderOnUiChange: false,
-    load: async () => {
-      const mod = await import('./monitoring-page.js');
-      return root => mod.renderMonitoringPage(root);
-    },
-  },
-  {
-    id: 'sessions',
-    routePrefix: '#/sessions',
-    // Sessions is a render-once React scaffold around the legacy imperative
-    // controller. Keep full remounts on locale/theme changes until the
-    // controller is split into reactive components, so translated scaffold text
-    // and command-owned DOM stay in sync without partial React re-renders.
-    rerenderOnUiChange: true,
-    load: async () => {
-      const mod = await import('./sessions-page.js');
-      return root => mod.renderSessionsPage(root);
-    },
-  },
-  {
-    id: 'monitor-room',
-    routePrefix: '#/monitor-room',
-    rerenderOnUiChange: true,
-    load: async () => {
-      const mod = await import('./monitor-room.js');
-      return root => mod.renderMonitorRoomPage(root);
-    },
-  },
-  {
-    id: 'office',
-    routePrefix: '#/office',
-    rerenderOnUiChange: false,
-    load: async () => {
-      const mod = await import('./office-page.js');
-      return root => mod.renderOfficePage(root);
-    },
-  },
-  {
-    id: 'insights',
-    routePrefix: '#/insights',
-    // Insights is a render-once React scaffold around a large imperative
-    // workbench controller; remount on ui changes until that controller is
-    // split into reactive components.
-    rerenderOnUiChange: true,
-    load: async () => {
-      const mod = await import('./insights-page.js');
-      return root => mod.renderInsightsPage(root);
-    },
-  },
+  pageRoute('legacy-workflow', '#/legacy-workflow', () => import('./legacy-workflow-page.js'), 'renderLegacyWorkflowPage'),
+  pageRoute('workflows', '#/workflows', () => import('./v3-page.js'), 'renderV3RunsPage'),
+  pageRoute('groups', '#/groups', () => import('./groups-page.js'), 'renderGroupsPage'),
+  pageRoute('settings', '#/settings', () => import('./settings-page.js'), 'renderSettingsPage'),
+  pageRoute('bot-defaults', '#/bot-defaults', () => import('./bot-defaults-page.js'), 'renderBotDefaultsPage'),
+  pageRoute('skills', '#/skills', () => import('./skills-page.js'), 'renderSkillsPage'),
+  pageRoute('connectors', '#/connectors', () => import('./connectors-page.js'), 'renderConnectorsPage'),
+  pageRoute('team-manage', '#/team/manage', () => import('./team-federation-page.js'), 'renderTeamManagePage'),
+  pageRoute('team', '#/team', () => import('./team-federation-page.js'), 'renderTeamFederationPage'),
+  pageRoute('roles-profile', '#/roles/profile', () => import('./roles-page.js'), 'renderRoleProfilesPage'),
+  pageRoute('roles', '#/roles', () => import('./roles-page.js'), 'renderRolesPage'),
+  pageRoute('schedules', '#/schedules', () => import('./schedules-page.js'), 'renderSchedulesPage'),
+  pageRoute('whiteboards', '#/whiteboards', () => import('./whiteboards-page.js'), 'renderWhiteboardsPage'),
+  pageRoute('monitoring', '#/monitoring', () => import('./monitoring-page.js'), 'renderMonitoringPage'),
+  pageRoute('sessions', '#/sessions', () => import('./sessions-page.js'), 'renderSessionsPage'),
+  pageRoute('monitor-room', '#/monitor-room', () => import('./monitor-room.js'), 'renderMonitorRoomPage', true),
+  pageRoute('office', '#/office', () => import('./office-page.js'), 'renderOfficePage'),
+  pageRoute('insights', '#/insights', () => import('./insights-page.js'), 'renderInsightsPage'),
 ];
 
 export function findDashboardRoute(hash: string): DashboardRoute | undefined {

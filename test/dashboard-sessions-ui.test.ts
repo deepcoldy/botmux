@@ -1,25 +1,66 @@
 import { describe, expect, it } from 'vitest';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { SessionsKanbanView, type SessionsKanbanCallbacks, type SessionsKanbanState } from '../src/dashboard/web/sessions-kanban.js';
 import {
   canRestartSession,
+  CLI_FILTER_OPTIONS,
   isUnknownChatSession,
-  renderCliFilterGroup,
   restartConfirmMessage,
   sessionLocationText,
 } from '../src/dashboard/web/sessions.js';
 
-describe('dashboard sessions filters', () => {
-  it('renders CLI filters as same-name checkboxes checked by default for multi-select filtering', () => {
-    const html = renderCliFilterGroup();
+const kanbanCallbacks: SessionsKanbanCallbacks = {
+  canRestartSession: row => row.status !== 'closed',
+  getTeamChatIds: () => new Set<string>(),
+  icons: {
+    details: '<svg></svg>',
+    feishu: '<svg></svg>',
+    history: '<svg></svg>',
+    lock: '<svg></svg>',
+    restart: '<svg></svg>',
+    unlock: '<svg></svg>',
+  },
+  lockActionLabel: row => (row.locked ? 'unlock' : 'lock'),
+  sessionStatusText: status => String(status ?? 'unknown'),
+  onDetails: () => {},
+  onHistory: () => {},
+  onMoveRows: () => {},
+  onNeedTeamBoard: () => {},
+  onNeedTeams: () => {},
+  onOpenTerminal: () => {},
+  onRename: () => {},
+  onRestart: () => {},
+  onTeamScope: () => {},
+  onToggleLock: () => {},
+};
 
-    expect(html).toContain('type="checkbox"');
-    expect(html).toContain('name="cli"');
-    expect(html).toContain('value="codex"');
-    expect(html).toContain('value="codex-app"');
-    expect(html).toContain('value="mira"');
-    expect(html).toContain('value="pi"');
-    expect(html).toMatch(/value="codex" checked/);
-    expect(html).toMatch(/value="pi" checked/);
-    expect(html).not.toContain('<select');
+function renderKanban(state: Partial<SessionsKanbanState>): string {
+  const fullState: SessionsKanbanState = {
+    rows: [],
+    groupBy: 'flow',
+    teams: [],
+    teamsLoaded: true,
+    teamKey: '',
+    teamBoardData: null,
+    teamBoardKey: '',
+    ...state,
+  };
+  return renderToStaticMarkup(createElement(SessionsKanbanView, {
+    host: null,
+    ...kanbanCallbacks,
+    ...fullState,
+  }));
+}
+
+describe('dashboard sessions filters', () => {
+  it('derives CLI filter options from the shared CLI registry', () => {
+    expect(CLI_FILTER_OPTIONS).toContain('codex');
+    expect(CLI_FILTER_OPTIONS).toContain('codex-app');
+    expect(CLI_FILTER_OPTIONS).toContain('mira');
+    expect(CLI_FILTER_OPTIONS).toContain('pi');
+    expect(CLI_FILTER_OPTIONS).toContain('unknown');
+    expect(new Set(CLI_FILTER_OPTIONS).size).toBe(CLI_FILTER_OPTIONS.length);
   });
 
   it('builds restart confirmation text with current status and CLI', () => {
@@ -52,5 +93,55 @@ describe('dashboard sessions filters', () => {
     expect(isUnknownChatSession(row, () => 'SellerIM Agent 集中营')).toBe(false);
     expect(isUnknownChatSession(namedDirect)).toBe(false);
     expect(isUnknownChatSession({}, () => null)).toBe(false);
+  });
+});
+
+describe('dashboard sessions kanban react view', () => {
+  it('renders the five workflow columns with existing kanban DOM semantics', () => {
+    const html = renderKanban({
+      rows: [
+        { sessionId: 's-backlog', status: 'idle', kanbanColumn: 'backlog', cliId: 'codex', title: 'Backlog', botName: 'Bot A', lastMessageAt: 1000 },
+        { sessionId: 's-todo', status: 'idle', cliId: 'codex', title: 'Todo', botName: 'Bot A', lastMessageAt: 2000 },
+        { sessionId: 's-progress', status: 'working', cliId: 'codex', title: 'Working', botName: 'Bot A', lastMessageAt: 3000 },
+        { sessionId: 's-review', status: 'limited', cliId: 'codex', title: 'Review', botName: 'Bot A', lastMessageAt: 4000 },
+        { sessionId: 's-done', status: 'closed', cliId: 'codex', title: 'Done', botName: 'Bot A', lastMessageAt: 5000 },
+      ],
+    });
+
+    for (const column of ['backlog', 'todo', 'in_progress', 'in_review', 'done']) {
+      expect(html).toContain(`kanban-column kanban-${column}`);
+      expect(html).toContain(`data-col="${column}"`);
+    }
+    expect(html).toContain('class="kanban-col-list"');
+    expect(html).toContain('class="kanban-card');
+    expect(html).toContain('data-id="s-progress"');
+    expect(html).toContain('role="button"');
+    expect(html).toContain('class="session-signal"');
+    expect(html).toContain('class="card-act kanban-card-act"');
+  });
+
+  it('clusters cards by chat and preserves the done column cap', () => {
+    const closedRows = Array.from({ length: 55 }, (_, i) => ({
+      sessionId: `closed-${i}`,
+      chatId: `done-${i}`,
+      status: 'closed',
+      cliId: 'codex',
+      title: `Closed ${i}`,
+      botName: 'Bot A',
+      lastMessageAt: i,
+      kanbanPosition: i,
+    }));
+    const html = renderKanban({
+      rows: [
+        { sessionId: 'cluster-a', chatId: 'oc_1', status: 'working', cliId: 'codex', title: 'A', botName: 'Bot A', lastMessageAt: 100 },
+        { sessionId: 'cluster-b', chatId: 'oc_1', status: 'working', cliId: 'codex', title: 'B', botName: 'Bot A', lastMessageAt: 99 },
+        ...closedRows,
+      ],
+    });
+
+    expect(html).toContain('class="kanban-cluster"');
+    expect(html).toContain('data-chat="oc_1"');
+    expect((html.match(/data-id="closed-/g) ?? []).length).toBe(50);
+    expect(html).toContain('还有 5 个未显示');
   });
 });
