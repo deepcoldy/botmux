@@ -1,11 +1,26 @@
 import { describe, expect, it } from 'vitest';
-import { formatHelpEnvelope, formatReportEnvelope, parseDeliveryEnvelope } from '../src/verified-delivery/envelope.js';
+import { detectUnsupportedDeliveryEnvelope, formatHelpEnvelope, formatReportEnvelope, parseDeliveryEnvelope } from '../src/verified-delivery/envelope.js';
 
 describe('delivery envelope parser', () => {
   it('returns null for non-envelope text (fast path)', () => {
     expect(parseDeliveryEnvelope(undefined)).toBeNull();
     expect(parseDeliveryEnvelope('')).toBeNull();
     expect(parseDeliveryEnvelope('随便聊一句，没有信封')).toBeNull();
+  });
+
+  it('detects unsupported envelope versions for loud diagnostics', () => {
+    expect(detectUnsupportedDeliveryEnvelope('[botmux-report v2]\ntaskId: t')).toEqual({
+      kind: 'report',
+      version: 'v2',
+      supportedVersion: 'v1',
+    });
+    expect(detectUnsupportedDeliveryEnvelope('@bot [botmux-help v9]\ntaskId: t')).toEqual({
+      kind: 'help',
+      version: 'v9',
+      supportedVersion: 'v1',
+    });
+    expect(detectUnsupportedDeliveryEnvelope('[botmux-report v1]\ntaskId: t')).toBeNull();
+    expect(detectUnsupportedDeliveryEnvelope('普通聊天')).toBeNull();
   });
 
   it('parses a report envelope with all evidence kinds', () => {
