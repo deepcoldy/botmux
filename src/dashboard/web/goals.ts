@@ -425,11 +425,17 @@ function attnRow(t: AttnTask): string {
   const title = [t.disposition.next, t.title || t.taskId, displayGoalName(t.goalChatId, t.goalTitle)]
     .filter(Boolean)
     .join(' · ');
-  return `<button type="button" class="attn-row attn-${escapeHtml(t.disposition.bucket)}" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}" title="${escapeHtml(title)}">
+  const canWake = !['needsHuman', 'completed'].includes(t.disposition.bucket);
+  const actionLabel = t.disposition.bucket === 'readyToVerify' ? '通知验收' : '通知监管者';
+  const action = canWake
+    ? `<button type="button" class="attn-action attn-wake" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}">${actionLabel}</button>`
+    : '';
+  return `<div class="attn-row-wrap attn-${escapeHtml(t.disposition.bucket)}">
+  <button type="button" class="attn-row" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}" title="${escapeHtml(title)}">
     <span class="attn-next">${escapeHtml(t.disposition.next)}</span>
     ${task}<span class="attn-goal">${goal}</span>${who}${src}${ev}
     <span class="attn-age">${t.lastActivityAt ? fmtTs(t.lastActivityAt) : ''}</span>
-  </button>`;
+  </button>${action}</div>`;
 }
 function attnSection(label: string, rows: AttnTask[]): string {
   if (!rows.length) return '';
@@ -548,9 +554,38 @@ export function renderGoalsPage(root: HTMLElement): () => void {
     }
   }
 
+  async function triggerWatchdog(btn: HTMLButtonElement): Promise<void> {
+    const goal = btn.dataset.goal ?? '';
+    const task = btn.dataset.task || undefined;
+    if (!goal) return;
+    const oldText = btn.textContent ?? '通知监管者';
+    btn.disabled = true;
+    btn.textContent = '处理中…';
+    try {
+      const res = await fetch(`/api/goals/${encodeURIComponent(goal)}/watchdog`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ taskId: task }),
+      });
+      const json = await res.json().catch(() => null) as { injected?: number; reconciled?: number; revived?: number; reassigned?: number; rateLimited?: number; error?: string } | null;
+      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
+      const acted = (json?.injected ?? 0) + (json?.reconciled ?? 0) + (json?.revived ?? 0) + (json?.reassigned ?? 0);
+      btn.textContent = acted > 0 ? '已通知' : (json?.rateLimited ? '冷却中' : '已检查');
+      setTimeout(() => { void load(); }, 600);
+    } catch (err) {
+      btn.textContent = '失败';
+      btn.title = (err as Error).message;
+      setTimeout(() => { btn.textContent = oldText; btn.disabled = false; }, 1800);
+      return;
+    }
+    setTimeout(() => { btn.disabled = false; }, 1200);
+  }
+
   // attention band: clicking a row drills into that goal+task, reusing the grid
   // and detail panel below (needsHuman/blocked rows land on the existing decision box).
   gbAttnEl.addEventListener('click', (e) => {
+    const wake = (e.target as HTMLElement).closest<HTMLButtonElement>('.attn-wake');
+    if (wake) { void triggerWatchdog(wake); return; }
     const row = (e.target as HTMLElement).closest<HTMLElement>('.attn-row');
     if (!row) return;
     const goal = row.dataset.goal || null;

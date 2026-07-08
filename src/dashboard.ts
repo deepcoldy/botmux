@@ -2744,6 +2744,54 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/goal-notification-retries') {
       return jsonRes(res, 200, { records: listGoalNotificationRetries() });
     }
+    const mGoalWatchdog = url.pathname.match(/^\/api\/goals\/([^/]+)\/watchdog$/);
+    if (req.method === 'POST' && mGoalWatchdog) {
+      const goalChatId = decodeURIComponent(mGoalWatchdog[1]);
+      let parsed: any = {};
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        parsed = {};
+      }
+      const taskId = typeof parsed?.taskId === 'string' && parsed.taskId.trim() ? parsed.taskId.trim() : undefined;
+      const reason = `dashboard_attention${taskId ? `:${taskId}` : ''}`;
+      let contacted = 0;
+      let injected = 0;
+      let reconciled = 0;
+      let revived = 0;
+      let reassigned = 0;
+      let busy = 0;
+      let rateLimited = 0;
+      let lastError: any = null;
+      await Promise.all(registry.list().map(async (d) => {
+        try {
+          const upstream = await fetch(`http://127.0.0.1:${d.ipcPort}/api/goal/watchdog`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ goalChatId, reason }),
+            signal: AbortSignal.timeout(3_000),
+          });
+          contacted++;
+          const txt = await upstream.text();
+          let json: any = null;
+          try { json = txt ? JSON.parse(txt) : null; } catch { /* keep null */ }
+          if (!upstream.ok) {
+            lastError = json ?? { status: upstream.status, body: txt };
+            return;
+          }
+          const results = Array.isArray(json?.results) ? json.results : [];
+          injected += results.filter((r: any) => r?.status === 'injected').length;
+          reconciled += results.filter((r: any) => r?.status === 'reconciled').length;
+          revived += results.filter((r: any) => r?.status === 'revived').length;
+          reassigned += results.filter((r: any) => r?.status === 'reassigned').length;
+          busy += results.filter((r: any) => r?.status === 'busy').length;
+          rateLimited += results.filter((r: any) => r?.status === 'rate-limited').length;
+        } catch (err: any) {
+          lastError = { error: err?.message ?? String(err) };
+        }
+      }));
+      return jsonRes(res, 200, { ok: true, goalChatId, taskId, contacted, injected, reconciled, revived, reassigned, busy, rateLimited, lastError });
+    }
     const mGoalNotificationRetry = url.pathname.match(/^\/api\/goal-notification-retries\/([^/]+)\/(retry|clear)$/);
     if (req.method === 'POST' && mGoalNotificationRetry) {
       const id = decodeURIComponent(mGoalNotificationRetry[1]);
