@@ -12,6 +12,11 @@ function findAll(node: any, pred: (n: any) => boolean, out: any[] = []): any[] {
   return out;
 }
 
+function visibleText(node: any): string {
+  const textNodes = findAll(node, (n) => n?.tag === 'plain_text' || n?.tag === 'lark_md');
+  return textNodes.map((n) => n.content ?? '').join('\n');
+}
+
 describe('buildGoalHumanAttentionCard', () => {
   it('renders a decision form that carries goal routing context', () => {
     const card = JSON.parse(buildGoalHumanAttentionCard({
@@ -51,6 +56,26 @@ describe('buildGoalHumanAttentionCard', () => {
       parent_session_id: 'l1-session',
       supervisor_session_id: 'l2-session',
     });
+  });
+
+  it('keeps internal chat ids out of visible card text while preserving routing values', () => {
+    const card = JSON.parse(buildGoalHumanAttentionCard({
+      goalChatId: 'oc_goal',
+      taskId: 'task-secret-123',
+      taskTitle: '确认 CSV 引号策略',
+      attentionKind: 'decision',
+      attentionReason: '需要选择方案',
+      summary: '请拍板',
+      notificationMessageId: 'om_notice',
+      notificationLarkAppId: 'cli_panel',
+      parentChatId: 'oc_parent',
+    }));
+
+    expect(visibleText(card)).toContain('当前目标');
+    expect(visibleText(card)).toContain('确认 CSV 引号策略');
+    expect(visibleText(card)).not.toContain('oc_goal');
+    const submit = findAll(card, (n) => n?.tag === 'button' && n?.value?.action === 'goal_parent_decision')[0];
+    expect(submit.value).toMatchObject({ goal_chat_id: 'oc_goal', task_id: 'task-secret-123', task_title: '确认 CSV 引号策略' });
   });
 
   it('uses the help header for help attention', () => {

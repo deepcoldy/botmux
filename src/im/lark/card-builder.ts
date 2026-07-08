@@ -2043,6 +2043,7 @@ export interface GoalHumanAttentionCardInput {
   goalChatId: string;
   goalLink?: string;
   taskId?: string;
+  taskTitle?: string;
   attentionKind?: string;
   attentionReason?: string;
   decisionOptions?: GoalDecisionOption[];
@@ -2055,6 +2056,17 @@ export interface GoalHumanAttentionCardInput {
   supervisorSessionId?: string;
 }
 
+function goalDisplayTitle(input: { goalTitle?: string; goalChatId?: string }): string {
+  return input.goalTitle?.trim() || '当前目标';
+}
+
+function taskDisplayTitle(input: { taskTitle?: string; taskId?: string }): string | undefined {
+  const title = input.taskTitle?.trim();
+  if (title) return title;
+  if (!input.taskId?.trim()) return undefined;
+  return `任务号 ${input.taskId.trim()}`;
+}
+
 export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput): string {
   const kind = input.attentionKind ?? 'blocked';
   const isHelp = kind === 'help';
@@ -2062,7 +2074,8 @@ export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput):
     ? { template: 'blue', title: '🆘 执行者求助，需要支援' }
     : { template: kind === 'blocked' ? 'orange' : 'red', title: '⚠️ 任务需要你拍板' };
   const mention = input.ownerOpenId ? `<at id=${input.ownerOpenId}></at> ` : '';
-  const title = input.goalTitle ?? input.goalChatId;
+  const title = goalDisplayTitle(input);
+  const taskTitle = taskDisplayTitle(input);
   const actionValue: Record<string, string> = {
     action: 'goal_parent_decision',
     goal_chat_id: input.goalChatId,
@@ -2072,6 +2085,7 @@ export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput):
     summary: truncateCardText(input.summary, 1000),
   };
   if (input.taskId) actionValue.task_id = input.taskId;
+  if (input.taskTitle) actionValue.task_title = input.taskTitle;
   if (input.goalTitle) actionValue.goal_title = input.goalTitle;
   if (input.attentionKind) actionValue.attention_kind = input.attentionKind;
   if (input.attentionReason) actionValue.attention_reason = input.attentionReason;
@@ -2082,7 +2096,7 @@ export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput):
   const fields = [
     { is_short: true, text: { tag: 'lark_md', content: `**目标**\n${escapeMd(title)}` } },
     { is_short: true, text: { tag: 'lark_md', content: `**类型**\n${escapeMd(isHelp ? '求助' : '需拍板')}` } },
-    input.taskId ? { is_short: true, text: { tag: 'lark_md', content: `**任务**\n\`${escapeMd(input.taskId)}\`` } } : undefined,
+    taskTitle ? { is_short: true, text: { tag: 'lark_md', content: `**任务**\n${escapeMd(taskTitle)}` } } : undefined,
   ].filter(Boolean);
 
   const elements: any[] = [
@@ -2174,10 +2188,11 @@ export function buildGoalHumanAttentionCard(input: GoalHumanAttentionCardInput):
 }
 
 export function buildGoalHumanAttentionResolvedCard(input: GoalHumanAttentionCardInput & { decisionText: string; decisionMode?: 'option' | 'free-text' }): string {
-  const title = input.goalTitle ?? input.goalChatId;
+  const title = goalDisplayTitle(input);
+  const taskTitle = taskDisplayTitle(input);
   const fields = [
     { is_short: true, text: { tag: 'lark_md', content: `**目标**\n${escapeMd(title)}` } },
-    input.taskId ? { is_short: true, text: { tag: 'lark_md', content: `**任务**\n\`${escapeMd(input.taskId)}\`` } } : undefined,
+    taskTitle ? { is_short: true, text: { tag: 'lark_md', content: `**任务**\n${escapeMd(taskTitle)}` } } : undefined,
     { is_short: true, text: { tag: 'lark_md', content: `**状态**\n监管者处理中` } },
   ].filter(Boolean);
   const elements: any[] = [
