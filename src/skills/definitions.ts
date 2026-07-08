@@ -1236,7 +1236,7 @@ botmux dispatch --chat-id "<goalChatId>" --title "<subtask>" \\
 - \`dispatch\` 已自动把「干完用 \`botmux report --task <id>\` 带证据回报、别在群里口头说完成」的完成协议追加进简报，worker 照做。
 - **worker 的「需人定夺 / 卡住」只走你(L2)**：要人拍板 / 缺权限 / 有歧义，worker 该用 \`botmux help --task <id>\`（落账并唤你）或直接 @ 你，**绝不自己越级 @ 群外的人 / 老板**——越级 @ 会和你随后的正式升级重复、两次打扰人。对外升级由你(L2)统一用 \`delivery escalate\` 做。简报里把这条对 worker 写明（dispatch 追加的协议也会带，但你派多 bot 协作[coder+reviewer]时尤其强调一句）。
 - 工作目录已在建群时 \`--working-dir\` 绑好，dispatch 免传 \`--repo\`；要先拉起 worker 待命用 \`--standby\`。
-- 给 worker 的 brief 只放该 subtask 需要的上下文（含你从 charter 摘录的相关目标 / 约束），别把整份 charter 倒给它。
+- 给 worker 的 brief 只放该 subtask 需要的上下文（含你从 charter 摘录的相关目标 / 约束），别把整份 charter 倒给它。**brief 控制在 ~10 行内**：目标、关键约束、期望产出、验收口径各一两行；背景资料给路径/链接，别贴全文——提交/求助协议 dispatch 会自动追加，你不用写。
 - coder 写完先 @ reviewer review，过了再 report。
 
 #### L2-2.5 a2a：派给跨设备 / 外部 worker（goal 可选用的跨设备交付协议）
