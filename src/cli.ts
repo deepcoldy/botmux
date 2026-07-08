@@ -5035,8 +5035,13 @@ async function cmdSend(rest: string[]): Promise<void> {
       mentionCount: mentions.length,
     });
     if (pureVideoSend) {
+      // No card/text primary here, so the FIRST media message must carry the
+      // quote chain itself (dispatchPrimary applies the chat-scope quoteTargetId
+      // and updates primaryQuotedId). Otherwise a bare `--videos … --no-mention`
+      // reply in a 普通群 lands as a standalone message that doesn't quote the
+      // trigger — unlike file-only/image-only sends whose primary card quotes.
       const videoResult = await sendVideoAttachments(
-        { uploadFile, uploadImage, dispatch }, appId, videoAttachments,
+        { uploadFile, uploadImage, dispatch, primaryDispatch: dispatchPrimary }, appId, videoAttachments,
       );
       failedVideoAttachments = videoResult.failed;
       if (videoResult.sent.length === 0) {

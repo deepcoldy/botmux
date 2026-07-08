@@ -153,6 +153,13 @@ export type SendVideoAttachmentsDeps = {
   uploadFile: (appId: string, path: string) => Promise<string>;
   uploadImage: (appId: string, path: string) => Promise<string>;
   dispatch: (content: string, msgType: string) => Promise<string>;
+  // Optional: dispatch used for the FIRST successfully-sent video only. A
+  // pure-video send (no text/card primary) has no other message to carry the
+  // quote/reply chain, so its first media message must go through the primary
+  // dispatch (which applies the chat-scope quoteTargetId) to stay consistent
+  // with card/file/image sends. Later videos remain best-effort via `dispatch`.
+  // Omitted for secondary sends (card is already the primary) → all use `dispatch`.
+  primaryDispatch?: (content: string, msgType: string) => Promise<string>;
 };
 
 export type SendVideoAttachmentsResult = {
@@ -167,6 +174,10 @@ export async function sendVideoAttachments(
 ): Promise<SendVideoAttachmentsResult> {
   const sent: string[] = [];
   const failed: { path: string; coverPath: string; error: string }[] = [];
+  // The first video that actually goes out uses `primaryDispatch` (quote chain);
+  // every later one uses plain `dispatch`. Tracked on success only, so if the
+  // first video's upload fails the next one inherits the primary slot.
+  let primaryUsed = false;
   for (const video of videos) {
     try {
       const fileKey = await deps.uploadFile(appId, video.videoPath);
@@ -176,7 +187,10 @@ export async function sendVideoAttachments(
         image_key: imageKey,
         duration: video.durationMs,
       });
-      sent.push(await deps.dispatch(content, 'media'));
+      const send = (!primaryUsed && deps.primaryDispatch) ? deps.primaryDispatch : deps.dispatch;
+      const messageId = await send(content, 'media');
+      primaryUsed = true;
+      sent.push(messageId);
     } catch (err: any) {
       failed.push({
         path: video.videoPath,

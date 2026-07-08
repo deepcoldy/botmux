@@ -280,4 +280,54 @@ describe('sendVideoAttachments (best-effort media messages)', () => {
       failed: [{ path: '/tmp/b.mp4', coverPath: '/tmp/b.png', error: 'dispatch failed' }],
     });
   });
+
+  it('routes the FIRST video through primaryDispatch (quote chain) and later videos through dispatch', async () => {
+    // Pure-video sends have no card primary, so the first media message must go
+    // through primaryDispatch to keep the chat-scope quote/reply chain — the rest
+    // stay best-effort via plain dispatch. Regression guard for Codex P2.
+    const uploadFile = vi.fn(async (_app: string, p: string) => `file:${p}`);
+    const uploadImage = vi.fn(async (_app: string, p: string) => `image:${p}`);
+    const primaryDispatch = vi.fn(async (content: string) => `primary:${content}`);
+    const dispatch = vi.fn(async (content: string) => `plain:${content}`);
+
+    const res = await sendVideoAttachments(
+      { uploadFile, uploadImage, dispatch, primaryDispatch },
+      'cli_app',
+      [
+        { videoPath: '/tmp/a.mp4', coverPath: '/tmp/a.png', durationMs: 0 },
+        { videoPath: '/tmp/b.mp4', coverPath: '/tmp/b.png', durationMs: 0 },
+      ],
+    );
+
+    expect(primaryDispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(res.failed).toEqual([]);
+    expect(res.sent[0]).toBe('primary:{"file_key":"file:/tmp/a.mp4","image_key":"image:/tmp/a.png","duration":0}');
+    expect(res.sent[1]).toBe('plain:{"file_key":"file:/tmp/b.mp4","image_key":"image:/tmp/b.png","duration":0}');
+  });
+
+  it('hands the primary (quote) slot to the next video when the first one fails to send', async () => {
+    const uploadFile = vi.fn(async (_app: string, p: string) => {
+      if (p === '/tmp/a.mp4') throw new Error('upload failed');
+      return `file:${p}`;
+    });
+    const uploadImage = vi.fn(async (_app: string, p: string) => `image:${p}`);
+    const primaryDispatch = vi.fn(async (content: string) => `primary:${content}`);
+    const dispatch = vi.fn(async (content: string) => `plain:${content}`);
+
+    const res = await sendVideoAttachments(
+      { uploadFile, uploadImage, dispatch, primaryDispatch },
+      'cli_app',
+      [
+        { videoPath: '/tmp/a.mp4', coverPath: '/tmp/a.png', durationMs: 0 },
+        { videoPath: '/tmp/b.mp4', coverPath: '/tmp/b.png', durationMs: 0 },
+      ],
+    );
+
+    // a.mp4 upload failed → primary slot inherited by b.mp4.
+    expect(primaryDispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(res.sent).toEqual(['primary:{"file_key":"file:/tmp/b.mp4","image_key":"image:/tmp/b.png","duration":0}']);
+    expect(res.failed).toEqual([{ path: '/tmp/a.mp4', coverPath: '/tmp/a.png', error: 'upload failed' }]);
+  });
 });
