@@ -360,10 +360,12 @@ const PROXY_ENV_KEYS = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY'
  * is off / unsupported / a required overlay mount fails (fail-safe = the worker
  * treats null as a hard error and does NOT silently run unsandboxed).
  *
- * Layout under <dataDir>/sandboxes/<sessionId>/: outbox, shimbin, proj-upper
- * (the landable changeset), proj-work, proj-merged, home-merged. The HOME
- * overlay's upper/work live under /var/tmp/botmux-sbx/<sessionId>/ because
- * overlayfs forbids upper/work inside the lower (= the real home).
+ * Layout under <dataDir>/sandboxes/<sessionId>/: shimbin, proj-upper (the
+ * landable changeset), proj-work, proj-merged, home-merged. The HOME overlay's
+ * upper/work and the daemon-mediated outbox live under
+ * /var/tmp/botmux-sbx/<sessionId>/ because overlayfs forbids upper/work inside
+ * the lower (= the real home), and keeping the outbox outside HOME avoids a
+ * nested bind under the HOME overlay on bwrap hosts that hang on that pattern.
  */
 export function prepareSandbox(opts: {
   /** Whether the sandbox is on for THIS session (per-bot BotConfig.sandbox OR
@@ -406,7 +408,6 @@ export function prepareSandbox(opts: {
 
   const dataDir = resolveSandboxMountPath(opts.dataDir);
   const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
-  const outbox = join(sessionRoot, 'outbox');
   const shimBin = join(sessionRoot, 'shimbin');
   const empties = join(sessionRoot, 'empties');
   const projUpper = join(sessionRoot, 'proj-upper');   // THE LANDABLE CHANGESET
@@ -415,6 +416,7 @@ export function prepareSandbox(opts: {
   const homeMerged = join(sessionRoot, 'home-merged');  // merged may live under sessionRoot
   // HOME overlay upper/work MUST be OUTSIDE the home lower (overlayfs constraint).
   const vartmp = join(VARTMP_ROOT, opts.sessionId);
+  const outbox = join(vartmp, 'outbox');
   const homeUpper = join(vartmp, 'home-upper');
   const homeWork = join(vartmp, 'home-work');
   for (const d of [outbox, shimBin, empties]) mkdirSync(d, { recursive: true });
@@ -555,20 +557,25 @@ export function prepareSandbox(opts: {
  * path back so the watcher can keep servicing the live CLI's `botmux send`, plus
  * the workDir (upper changeset for landing) and a cleanup that tears the residue
  * down at close/exit. Returns null if the session has no sandbox tree on disk
- * (never sandboxed). Linux-only, mirrors prepareSandbox's layout.
+ * (never sandboxed). Linux-only, mirrors prepareSandbox's layout. New sessions
+ * keep outbox under /var/tmp/botmux-sbx/<sid>/outbox; fall back to the legacy
+ * <dataDir>/sandboxes/<sid>/outbox for sessions that were already running
+ * before the layout changed.
  */
 export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }): { outbox: string; workDir: string; cleanup: () => void } | null {
   if (process.platform !== 'linux') return null;
   const dataDir = resolveSandboxMountPath(opts.dataDir);
   const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
-  const outbox = join(sessionRoot, 'outbox');
+  const vartmp = join(VARTMP_ROOT, opts.sessionId);
+  const newOutbox = join(vartmp, 'outbox');
+  const legacyOutbox = join(sessionRoot, 'outbox');
   const projUpper = join(sessionRoot, 'proj-upper');
-  if (!existsSync(outbox) && !existsSync(projUpper)) return null; // never sandboxed
+  if (!existsSync(newOutbox) && !existsSync(legacyOutbox) && !existsSync(projUpper)) return null; // never sandboxed
+  const outbox = existsSync(newOutbox) ? newOutbox : (existsSync(legacyOutbox) ? legacyOutbox : newOutbox);
   // Ensure the outbox exists (the watcher reads it); never (re)mount here.
   try { mkdirSync(outbox, { recursive: true }); } catch { /* */ }
   const projMerged = join(sessionRoot, 'proj-merged');
   const homeMerged = join(sessionRoot, 'home-merged');
-  const vartmp = join(VARTMP_ROOT, opts.sessionId);
   return {
     outbox,
     workDir: projUpper,
@@ -639,9 +646,9 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
   let sids: string[] = [];
   try { sids = readdirSync(root); } catch { return; } // no sandboxes dir yet
   // Grace before reclaiming an ACTIVE-but-unmounted sandbox: a worker that just
-  // (re)spawned creates the outbox/shimbin dirs a few syscalls BEFORE it mounts
-  // the overlay. Without this, a sweep firing in that tiny window would nuke an
-  // in-progress session's outbox. Non-active orphans are reclaimed immediately
+  // (re)spawned creates the sandbox dirs a few syscalls BEFORE it mounts the
+  // overlay. Without this, a sweep firing in that tiny window would nuke an
+  // in-progress session's shimbin/project tree. Non-active orphans are reclaimed immediately
   // (no live worker can be mid-spawn for a session that isn't active).
   const ACTIVE_DEAD_GRACE_MS = 60_000;
   const now = Date.now();

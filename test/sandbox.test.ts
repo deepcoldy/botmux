@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
-import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, attachSandboxOutbox, resolveSandboxMountPath, sandboxedClaudeDataDir, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
 
@@ -352,6 +352,74 @@ describe('prepareSandbox enabled gate', () => {
       dataDir: tmp(), cliBin: '/bin/true', cliArgs: [],
     });
     expect(r).toBeNull();
+  });
+});
+
+describe.skipIf(process.platform !== 'linux')('sandbox outbox layout', () => {
+  it('reattaches to the new /var/tmp outbox outside dataDir', () => {
+    const dataDir = tmp();
+    const sid = 'outbox-new-' + Math.random().toString(36).slice(2);
+    const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sid);
+    const projUpper = join(sessionRoot, 'proj-upper');
+    const newOutbox = join('/var/tmp/botmux-sbx', sid, 'outbox');
+    mkdirSync(projUpper, { recursive: true });
+    mkdirSync(newOutbox, { recursive: true });
+
+    const r = attachSandboxOutbox({ sessionId: sid, dataDir });
+    try {
+      expect(r).not.toBeNull();
+      expect(r!.outbox).toBe(newOutbox);
+      expect(r!.outbox.startsWith(sessionRoot)).toBe(false);
+      expect(r!.workDir).toBe(projUpper);
+    } finally {
+      r?.cleanup();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to legacy dataDir outbox for already-running sessions', () => {
+    const dataDir = tmp();
+    const sid = 'outbox-legacy-' + Math.random().toString(36).slice(2);
+    const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sid);
+    const projUpper = join(sessionRoot, 'proj-upper');
+    const legacyOutbox = join(sessionRoot, 'outbox');
+    mkdirSync(projUpper, { recursive: true });
+    mkdirSync(legacyOutbox, { recursive: true });
+
+    const r = attachSandboxOutbox({ sessionId: sid, dataDir });
+    try {
+      expect(r).not.toBeNull();
+      expect(r!.outbox).toBe(legacyOutbox);
+      expect(r!.workDir).toBe(projUpper);
+    } finally {
+      r?.cleanup();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('prepareSandbox exposes BOTMUX_SEND_RELAY from /var/tmp when mounts are available', () => {
+    const src = tmp();
+    writeFileSync(join(src, 'file.txt'), 'x');
+    const dataDir = tmp();
+    const sid = 'outbox-prepare-' + Math.random().toString(36).slice(2);
+    let r: ReturnType<typeof prepareSandbox> = null;
+    try {
+      r = prepareSandbox({
+        enabled: true, cliId: 'codex', sessionId: sid, sourceWorkingDir: src,
+        dataDir, cliBin: '/bin/true', cliArgs: [],
+      });
+      if (r === null) return; // overlay mount unavailable in this env — skip assertions
+      const expected = join('/var/tmp/botmux-sbx', sid, 'outbox');
+      const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sid);
+      expect(r.outbox).toBe(expected);
+      expect(r.env.BOTMUX_SEND_RELAY).toBe(expected);
+      expect(r.outbox.startsWith(sessionRoot)).toBe(false);
+      expect(r.args.some((x, i) => x === '--bind' && r!.args[i + 1] === expected && r!.args[i + 2] === expected)).toBe(true);
+    } finally {
+      r?.cleanup();
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(src, { recursive: true, force: true });
+    }
   });
 });
 
