@@ -1347,7 +1347,7 @@ botmux goal notify-parent --done --summary "Goal 已完成：各 subtask 产出 
 - **为什么不用 \`send --chat-id 主群\`**：L1/L2 是同一个 bot，L2 \`send\` 到主群对 L1 是 self-message → 被 self-guard 挡、唤不起 L1。\`goal notify-parent\` 是 daemon-native 唤起（按 supervise 时存的 parent 坐标定位 L1 会话、注入 \`[goal-parent-notify]\` turn），绕开 self-guard。
 - session 在 L2 上下文里自动推断（也可 \`--session-id <L2>\` / \`--goal <goalChatId>\` 显式指定）；长摘要用 \`--summary-file <path>\`。
 - 这是 goal 群结果**回流主群**的唯一出口——L1 被唤起后查账本 / charter 汇总给用户（L1-5）。
-- ⚖️ **小结里"谁干的"按账本归因，别张冠李戴**：写"谁 escalate / accept / report"时，以 \`delivery show --task <id>\` 的 \`by / checkedBy / actor\` 字段为准，**别把"watchdog 唤醒我 / 给我 \`[worker-health]\` 事实"当成"watchdog 替我做了 escalate/accept"**——watchdog 只负责唤醒和摆事实，真正盖章的是执行那条命令的人/会话。你(L2)自己跑的 \`delivery escalate/accept\` 就写"我(L2)…"，系统 reconcile 自动验收就写"系统自动对账…"。**别把自己的动作安到 watchdog/系统头上**（叙述夸大会误导人，账本字段才是唯一真相）。
+- ⚖️ **小结里"谁干的"按账本归因，别张冠李戴**：写"谁 escalate / accept / report"时，以 \`delivery show --task <id>\` 的 \`by / checkedBy / actor\` 字段为准，**别把"watchdog 唤醒我 / 给我 \`[worker-health]\` 事实"当成"watchdog 替我做了 escalate/accept"**——watchdog 只负责唤醒和摆事实，真正盖章的是执行那条命令的人/会话。你(L2)自己跑的 \`delivery escalate/accept\` 就写"我(L2)…"，系统 reconcile 自动验收就写"系统自动核验…"。**别把自己的动作安到 watchdog/系统头上**（叙述夸大会误导人，账本字段才是唯一真相）。
 
 ## 登记 & 恢复（账本是真相源，记忆只是缓存）
 **L2 尤其要靠查账本 + charter 恢复**：被唤起 / 断点续跑 / 怀疑漏了什么时，先 \`botmux delivery list --goal <goalChatId>\` 从账本重建任务真相、\`botmux goal charter read --goal <goalChatId> --json\` 读 goal 目标/状态，再动手——L2 自己的记忆、本地 scratch、飞书任务板都可能过期，账本 + charter 不会。L1 复核同理。

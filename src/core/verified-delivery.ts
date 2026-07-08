@@ -28,18 +28,12 @@ export function buildVerifiedDeliveryInstructions(input: {
   taskId: string;
   acceptanceHint?: string;
 }): string {
-  const lines = [
-    '— 交付要求 —',
-    `任务号: ${input.taskId}`,
-    `完成：botmux report --task ${input.taskId} "做了什么/结果如何" --artifact <监管者可读取的路径>`,
-    '路径读不到就直接贴关键内容：--artifact-text name=关键输出/测试结果/diff',
-    `卡住：botmux help --task ${input.taskId} --kind access|ambiguous|impossible|repeated_failure|other --blocker "卡在哪、缺什么"`,
-    '需要人拍板也先求助监管者，不要直接 @ 人或老板。',
-  ];
-  if (input.acceptanceHint?.trim()) {
-    lines.push(`验收：${input.acceptanceHint.trim()}`);
-  }
-  return lines.join('\n');
+  const standard = input.acceptanceHint?.trim() ? `；完成标准：${input.acceptanceHint.trim()}` : '';
+  return [
+    `【任务】任务号：${input.taskId}${standard}`,
+    `【怎么提交】botmux report --task ${input.taskId} "做了什么/结果" --artifact <监管者能读取的路径>；路径读不到加 --artifact-text "测试结果=9 passed"；没有证据不算完成。`,
+    `【卡住怎么办】botmux help --task ${input.taskId} --kind access|ambiguous|impossible|repeated_failure|other --blocker "卡在哪、缺什么"；需要人拍板也先求助监管者，别直接 @ 人。`,
+  ].join('\n');
 }
 
 export function appendVerifiedDeliveryInstructions(input: {

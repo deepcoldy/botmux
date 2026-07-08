@@ -117,7 +117,7 @@ describe('goal watchdog', () => {
     expect(injected[0].prompt).toContain('t1');
     expect(injected[0].prompt).toContain('bucket=inProgress');
     expect(injected[0].prompt).toContain('reason=dispatched');
-    expect(injected[0].prompt).toContain('next=等 worker 干活/report');
+    expect(injected[0].prompt).toContain('next=等执行者提交结果');
   });
 
   it('falls back to L2 prompt for legacy free-text acceptance hints', async () => {
