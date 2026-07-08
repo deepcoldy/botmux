@@ -745,7 +745,7 @@ describe('oh-my-pi buildArgs', () => {
     expect(args[idx + 1]).toBe('/repo/root');
   });
 
-  it('submits pasted tmux input with LF instead of symbolic Enter', async () => {
+  it('types tmux input and submits with symbolic Enter', async () => {
     const events: string[] = [];
     const pty = {
       write(data: string) { events.push(`write:${JSON.stringify(data)}`); },
@@ -754,15 +754,16 @@ describe('oh-my-pi buildArgs', () => {
       onExit() {},
       kill() {},
       pasteText(text: string) { events.push(`paste:${text}`); },
+      sendText(text: string) { events.push(`text:${text}`); },
       sendSpecialKeys(...keys: string[]) { events.push(`keys:${keys.join(',')}`); },
     } satisfies PtyHandle;
 
     await adapter.writeInput(pty, 'review this');
 
-    expect(events).toEqual(['paste:review this', 'write:"\\n"']);
+    expect(events).toEqual(['text:review this', 'keys:Enter']);
   });
 
-  it('submits raw PTY input with bracketed paste and LF', async () => {
+  it('types raw PTY input and submits with CR', async () => {
     const events: string[] = [];
     const pty = {
       write(data: string) { events.push(data); },
@@ -774,7 +775,61 @@ describe('oh-my-pi buildArgs', () => {
 
     await adapter.writeInput(pty, 'review this');
 
-    expect(events).toEqual(['\x1b[200~review this\x1b[201~', '\n']);
+    expect(events).toEqual(['review this', '\r']);
+  });
+
+  it('chunks long tmux input without bracketed paste placeholder path', async () => {
+    const events: string[] = [];
+    const pty = {
+      write(data: string) { events.push(`write:${data.length}`); },
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      pasteText(text: string) { events.push(`paste:${text.length}`); },
+      sendText(text: string) { events.push(`text:${text.length}`); },
+      sendSpecialKeys(...keys: string[]) { events.push(`keys:${keys.join(',')}`); },
+    } satisfies PtyHandle;
+
+    await adapter.writeInput(pty, 'x'.repeat(1200));
+
+    expect(events).toEqual(['text:512', 'text:512', 'text:176', 'keys:Enter']);
+  });
+
+  it('reports not submitted when tmux literal text write is dropped', async () => {
+    const events: string[] = [];
+    const pty = {
+      write(data: string) { events.push(`write:${data}`); },
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      pasteText(text: string) { events.push(`paste:${text}`); },
+      sendText(text: string) { events.push(`text:${text}`); return false; },
+      sendSpecialKeys(...keys: string[]) { events.push(`keys:${keys.join(',')}`); },
+    } satisfies PtyHandle;
+
+    await expect(adapter.writeInput(pty, 'review this')).resolves.toEqual({ submitted: false });
+
+    expect(events).toEqual(['text:review this']);
+  });
+
+  it('reports not submitted when tmux Enter is dropped after typing content', async () => {
+    const events: string[] = [];
+    const pty = {
+      write(data: string) { events.push(`write:${data}`); },
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      pasteText(text: string) { events.push(`paste:${text}`); },
+      sendText(text: string) { events.push(`text:${text}`); },
+      sendSpecialKeys(...keys: string[]) { events.push(`keys:${keys.join(',')}`); return false; },
+    } satisfies PtyHandle;
+
+    await expect(adapter.writeInput(pty, 'review this')).resolves.toEqual({ submitted: false });
+
+    expect(events).toEqual(['text:review this', 'keys:Enter', 'keys:Enter', 'keys:Enter']);
   });
 
   it('skillsDir points to ~/.omp/agent/skills', () => {

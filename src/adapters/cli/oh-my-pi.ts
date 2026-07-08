@@ -4,6 +4,56 @@ import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
 
+const OMP_INPUT_CHUNK_CHARS = 512;
+const OMP_INPUT_THROTTLE_MS = 20;
+
+function chunkTextByCodePoint(text: string, maxChars: number): string[] {
+  const chunks: string[] = [];
+  let current = '';
+  for (const ch of text) {
+    current += ch;
+    if (current.length >= maxChars) {
+      chunks.push(current);
+      current = '';
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+async function typeText(pty: PtyHandle, content: string): Promise<boolean> {
+  const chunks = chunkTextByCodePoint(content, OMP_INPUT_CHUNK_CHARS);
+  for (const chunk of chunks) {
+    try {
+      if (pty.sendText) {
+        if (pty.sendText(chunk) === false) return false;
+      } else {
+        pty.write(chunk);
+      }
+    } catch {
+      return false;
+    }
+    await delay(OMP_INPUT_THROTTLE_MS);
+  }
+  return true;
+}
+
+function submitEnter(pty: PtyHandle, attempts = 3): boolean {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      if (pty.sendSpecialKeys) {
+        if (pty.sendSpecialKeys('Enter') !== false) return true;
+      } else {
+        pty.write('\r');
+        return true;
+      }
+    } catch {
+      // retry below
+    }
+  }
+  return false;
+}
+
 /** Adapter for oh-my-pi coding agent's native TUI (`omp`). */
 export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'omp');
@@ -42,19 +92,16 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      // OMP's editor submits on a plain LF (`\n`) in current releases; tmux's
-      // symbolic Enter / CR can leave the text sitting in the composer. Use LF
-      // for both the tmux paste path and raw PTY fallback so every dispatched
-      // Leader→OMP message is actually submitted, not just pasted.
-      if (pty.pasteText) {
-        pty.pasteText(content);
-        await delay(200);
-        pty.write('\n');
-      } else {
-        pty.write(`\x1b[200~${content}\x1b[201~`);
-        await delay(1000);
-        pty.write('\n');
-      }
+      // OMP collapses large bracketed pastes into a `[Paste #N]` placeholder.
+      // A programmatic Enter immediately after that placeholder can be ignored,
+      // leaving the message stranded until a human presses Enter. Type literal
+      // text instead: OMP preserves embedded newlines in the composer, and the
+      // final real Enter submits one user message. Chunking avoids tmux/PTY input
+      // buffer pressure on long botmux briefs.
+      const typed = await typeText(pty, content);
+      if (!typed) return { submitted: false };
+      if (!submitEnter(pty)) return { submitted: false };
+      return { submitted: true };
     },
 
     completionPattern: undefined,
