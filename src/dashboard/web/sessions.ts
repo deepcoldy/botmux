@@ -2105,7 +2105,7 @@ export function wireSessionsPage(root: HTMLElement): () => void {
   });
 
   monitorRoomOpenBtn.addEventListener('click', () => {
-    window.open(monitorRoomUrl(), '_blank', 'noopener');
+    window.location.href = monitorRoomUrl();
   });
 
   groupByBox.querySelectorAll<HTMLButtonElement>('[data-groupby]').forEach(btn => {

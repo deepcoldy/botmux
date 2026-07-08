@@ -2,12 +2,15 @@ import { describe, expect, it } from 'vitest';
 import {
   addMonitorRoomSessionIds,
   clearMonitorRoomSessionIds,
+  MONITOR_ROOM_AUTO_ACTIVE_STORAGE_KEY,
   MONITOR_ROOM_STORAGE_KEY,
+  readMonitorRoomAutoActive,
   readMonitorRoomSessionIds,
   removeMonitorRoomSessionId,
   type StorageLike,
+  writeMonitorRoomAutoActive,
 } from '../src/dashboard/web/monitor-room-store.js';
-import { monitorRoomFrameGeometry } from '../src/dashboard/web/monitor-room.js';
+import { monitorRoomFrameGeometry, monitorRoomGridGeometry } from '../src/dashboard/web/monitor-room.js';
 import { sessionTerminalHref, type SessionTerminalLocation } from '../src/dashboard/web/session-terminal.js';
 
 function makeStorage(): StorageLike & { data: Map<string, string> } {
@@ -42,6 +45,21 @@ describe('monitor room local session set', () => {
     expect(readMonitorRoomSessionIds(storage)).toEqual([]);
     expect(storage.data.has(MONITOR_ROOM_STORAGE_KEY)).toBe(false);
   });
+
+  it('keeps the auto-active fallback off by default and persists it separately', () => {
+    const storage = makeStorage();
+
+    expect(readMonitorRoomAutoActive(storage)).toBe(false);
+
+    writeMonitorRoomAutoActive(true, storage);
+    expect(readMonitorRoomAutoActive(storage)).toBe(true);
+    expect(storage.data.get(MONITOR_ROOM_AUTO_ACTIVE_STORAGE_KEY)).toBe('1');
+    expect(readMonitorRoomSessionIds(storage)).toEqual([]);
+
+    writeMonitorRoomAutoActive(false, storage);
+    expect(readMonitorRoomAutoActive(storage)).toBe(false);
+    expect(storage.data.has(MONITOR_ROOM_AUTO_ACTIVE_STORAGE_KEY)).toBe(false);
+  });
 });
 
 describe('session terminal href', () => {
@@ -72,5 +90,34 @@ describe('monitor room frame geometry', () => {
       { width: 1000, height: 700 },
       { width: 1200, height: 900 },
     )).toEqual({ width: 1000, height: 700, scale: 1 });
+  });
+});
+
+describe('monitor room grid geometry', () => {
+  it('keeps card frames at the current viewport ratio without using a fixed terminal size', () => {
+    const layout = monitorRoomGridGeometry(
+      { width: 1200, height: 1800 },
+      { width: 900, top: 260 },
+      6,
+    );
+
+    expect(layout.columns).toBeGreaterThan(1);
+    expect(layout.frameWidth / layout.frameHeight).toBeCloseTo(1200 / 1800, 2);
+  });
+
+  it('recomputes wider landscape cards from the same session count', () => {
+    const portrait = monitorRoomGridGeometry(
+      { width: 1200, height: 1800 },
+      { width: 900, top: 260 },
+      6,
+    );
+    const landscape = monitorRoomGridGeometry(
+      { width: 1800, height: 1200 },
+      { width: 1500, top: 260 },
+      6,
+    );
+
+    expect(landscape.frameWidth / landscape.frameHeight).toBeCloseTo(1800 / 1200, 2);
+    expect(landscape.frameWidth).toBeGreaterThan(portrait.frameWidth);
   });
 });

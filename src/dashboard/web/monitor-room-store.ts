@@ -1,4 +1,5 @@
 export const MONITOR_ROOM_STORAGE_KEY = 'botmux.dashboard.monitorRoom.sessions.v1';
+export const MONITOR_ROOM_AUTO_ACTIVE_STORAGE_KEY = 'botmux.dashboard.monitorRoom.autoActiveWhenEmpty.v1';
 
 export interface StorageLike {
   getItem(key: string): string | null;
@@ -53,6 +54,26 @@ export function removeMonitorRoomSessionId(id: string, storage: StorageLike | nu
 
 export function clearMonitorRoomSessionIds(storage: StorageLike | null = defaultStorage()): void {
   writeMonitorRoomSessionIds([], storage);
+}
+
+export function readMonitorRoomAutoActive(storage: StorageLike | null = defaultStorage()): boolean {
+  if (!storage) return false;
+  try {
+    return storage.getItem(MONITOR_ROOM_AUTO_ACTIVE_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function writeMonitorRoomAutoActive(enabled: boolean, storage: StorageLike | null = defaultStorage()): boolean {
+  if (!storage) return enabled;
+  try {
+    if (enabled) storage.setItem(MONITOR_ROOM_AUTO_ACTIVE_STORAGE_KEY, '1');
+    else storage.removeItem(MONITOR_ROOM_AUTO_ACTIVE_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures; the caller's checked state remains the source of truth for this turn.
+  }
+  return enabled;
 }
 
 export function monitorRoomUrl(loc: Location = window.location): string {
