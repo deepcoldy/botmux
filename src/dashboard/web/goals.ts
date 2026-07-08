@@ -427,9 +427,18 @@ function attnRow(t: AttnTask): string {
     .join(' · ');
   const canWake = !['needsHuman', 'completed'].includes(t.disposition.bucket);
   const actionLabel = t.disposition.bucket === 'readyToVerify' ? '通知验收' : '通知监管者';
-  const action = canWake
+  const wake = canWake
     ? `<button type="button" class="attn-action attn-wake" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}">${actionLabel}</button>`
     : '';
+  // 一键动作（真动作，区别于轻量唤醒）：走既有「下发决策」通道注入 [panel-action v1]，
+  // 由监管者查交付记录后执行真命令并留痕——dashboard 不直接写账、不直接派活。
+  const panelActs: Array<[string, string]> = !t.taskId ? []
+    : t.disposition.bucket === 'systemRisk' ? [['reassign-worker', '重派'], ['escalate-human', '升级给人']]
+    : t.disposition.bucket === 'blocked' ? [['resolve-help', '处理求助'], ['escalate-human', '升级给人']]
+    : [];
+  const acts = panelActs.map(([act, label]) =>
+    `<button type="button" class="attn-action attn-panel-act" data-act="${act}" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}" data-reason="${escapeHtml(t.disposition.reason)}">${label}</button>`).join('');
+  const action = acts + wake;
   return `<div class="attn-row-wrap attn-${escapeHtml(t.disposition.bucket)}">
   <button type="button" class="attn-row" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}" title="${escapeHtml(title)}">
     <span class="attn-next">${escapeHtml(t.disposition.next)}</span>
@@ -581,9 +590,57 @@ export function renderGoalsPage(root: HTMLElement): () => void {
     setTimeout(() => { btn.disabled = false; }, 1200);
   }
 
+  // One-click REAL actions ([panel-action v1]): inject a structured instruction
+  // into the goal's supervisor via the existing decision channel. The supervisor
+  // re-checks the ledger, runs the real command (dispatch/escalate) and leaves
+  // attribution — the dashboard never writes the ledger or dispatches directly.
+  const PANEL_ACT_META: Record<string, { instruction: string }> = {
+    'reassign-worker': { instruction: '请先核对交付记录与执行者状态；确认原执行者不可用或反复失败后，用同一任务号重新派发；拿不准就升级给人。' },
+    'switch-worker': { instruction: '请换一个可用执行者重新派发，并在交付记录里写清原因。' },
+    'escalate-human': { instruction: '请走正式「升级给人」流程（delivery escalate），附清楚背景；能预判方向就带上推荐选项。' },
+    'resolve-help': { instruction: '请处理该执行者的求助：能定的直接给处置指示，不能定的再升级给人。' },
+  };
+  async function sendPanelAction(btn: HTMLButtonElement): Promise<void> {
+    const goal = btn.dataset.goal ?? '';
+    const task = btn.dataset.task ?? '';
+    const act = btn.dataset.act ?? '';
+    const meta = PANEL_ACT_META[act];
+    if (!goal || !task || !meta) return;
+    const text = [
+      '[panel-action v1]',
+      `action: ${act}`,
+      `taskId: ${task}`,
+      `reason: ${btn.dataset.reason || '看板一键动作'}`,
+      `instruction: ${meta.instruction}`,
+    ].join('\n');
+    const oldText = btn.textContent ?? '';
+    btn.disabled = true;
+    btn.textContent = '下发中…';
+    try {
+      const res = await fetch(`/api/goals/${encodeURIComponent(goal)}/decision`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ taskId: task, text }),
+      });
+      if (!res.ok) {
+        let code = '';
+        try { code = ((await res.json()) as { error?: string })?.error ?? ''; } catch { /* non-json */ }
+        throw new Error(code === 'no_supervisor' ? '目标当前没有在线监管者（会话可能已关）' : code || `HTTP ${res.status}`);
+      }
+      btn.textContent = '已下发 ✓';
+      btn.title = '已注入监管者，由它核对交付记录后执行并留痕';
+      setTimeout(() => { btn.textContent = oldText; btn.disabled = false; }, 2600);
+    } catch (err) {
+      btn.textContent = '失败';
+      btn.title = (err as Error).message;
+      setTimeout(() => { btn.textContent = oldText; btn.disabled = false; }, 2200);
+    }
+  }
+
   // attention band: clicking a row drills into that goal+task, reusing the grid
   // and detail panel below (needsHuman/blocked rows land on the existing decision box).
   gbAttnEl.addEventListener('click', (e) => {
+    const panelAct = (e.target as HTMLElement).closest<HTMLButtonElement>('.attn-panel-act');
+    if (panelAct) { void sendPanelAction(panelAct); return; }
     const wake = (e.target as HTMLElement).closest<HTMLButtonElement>('.attn-wake');
     if (wake) { void triggerWatchdog(wake); return; }
     const row = (e.target as HTMLElement).closest<HTMLElement>('.attn-row');
