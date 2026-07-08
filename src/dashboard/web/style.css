@@ -22755,8 +22755,10 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .gb-detail { background: var(--surface); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 14px; position: sticky; top: 14px; max-height: calc(100vh - 180px); overflow-y: auto; }
 .gb-detail-empty, .gb-main-empty { color: var(--faint); text-align: center; padding: 40px 16px; font-size: .85rem; }
 .gb-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.gb-detail-title-main { min-width: 0; flex: 1 1 180px; font-weight: 700; color: var(--fg); overflow-wrap: anywhere; }
 .gb-led-id-lg { font-size: .82rem; word-break: break-all; }
 .gb-detail-title { color: var(--muted); font-size: .85rem; margin: 6px 0 0; }
+.gb-debug-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--faint); }
 .gb-detail-worker { font-size: .78rem; color: var(--muted); margin: 6px 0 0; }
 .gb-who { color: var(--fg); font-weight: 600; }
 .gb-sec { margin-top: 16px; }
