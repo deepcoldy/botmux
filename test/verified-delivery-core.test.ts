@@ -23,7 +23,8 @@ describe('verified-delivery core helpers', () => {
     expect(text).toContain('任务号: task-api-1234abcd');
     expect(text).toContain('botmux report --task task-api-1234abcd');
     expect(text).toContain('botmux help --task task-api-1234abcd'); // 卡住时的求助指引
-    expect(text).toContain('验收提示: run npm test');
+    expect(text).toContain('验收：run npm test');
+    expect(text.split('\n')).toHaveLength(7);
   });
 
   it('appends verified delivery instructions after the original brief', () => {
@@ -31,7 +32,7 @@ describe('verified-delivery core helpers', () => {
       brief: '先完成实现',
       taskId: 'task-x-11111111',
     });
-    expect(out).toContain('先完成实现\n\n— 可信交付协议 —');
+    expect(out).toContain('先完成实现\n\n— 交付要求 —');
   });
 
   it('builds a reject retry message that can be sent back into the worker topic', () => {
