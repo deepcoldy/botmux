@@ -87,7 +87,8 @@ import {
   updateInstalledSkillAsync,
 } from './services/skill-registry-store.js';
 import { redactGitUrlCredentials } from './core/skills/sources.js';
-import { loadBotConfigs, type BotConfig } from './bot-registry.js';
+import { getBot, loadBotConfigs, type BotConfig } from './bot-registry.js';
+import { rmwBotEntry } from './services/config-store.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
@@ -405,6 +406,40 @@ async function validateVcMeetingListenerBotAppId(appId: string): Promise<{ ok: t
   return { ok: true };
 }
 
+async function ensureVcMeetingListenerBotConfig(appId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const r = await rmwBotEntry<null>(appId, (entry) => {
+    const raw = entry.vcMeetingAgent;
+    const current = raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? raw as Record<string, unknown>
+      : {};
+    const next = { ...current };
+    let changed = raw !== current;
+    if (next.enabled !== true) {
+      next.enabled = true;
+      changed = true;
+    }
+    if (typeof next.larkCliProfile !== 'string' || !next.larkCliProfile.trim()) {
+      next.larkCliProfile = appId;
+      changed = true;
+    }
+    entry.vcMeetingAgent = next;
+    return { write: changed, result: null };
+  });
+  if (!r.ok) return { ok: false, error: `vcMeetingAgent_listenerBot_config_write_failed: ${r.reason}` };
+
+  try {
+    const bot = getBot(appId);
+    bot.config.vcMeetingAgent = {
+      ...(bot.config.vcMeetingAgent ?? {}),
+      enabled: true,
+      larkCliProfile: bot.config.vcMeetingAgent?.larkCliProfile || appId,
+    };
+  } catch {
+    // The dashboard can edit bots.json even when that bot's daemon is offline.
+  }
+  return { ok: true };
+}
+
 function resolveDashboardSettings(): ResolvedDashboardSettings {
   const global = readGlobalConfig();
   const dashboard = global.dashboard ?? {};
@@ -434,6 +469,7 @@ async function reloadLocaleOnAllDaemons(): Promise<void> {
   ));
 }
 const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
+settingsWriteApplierDeps.ensureVcMeetingListenerBotConfig = ensureVcMeetingListenerBotConfig;
 settingsWriteApplierDeps.validateVcMeetingListenerBotAppId = validateVcMeetingListenerBotAppId;
 
 /** Helper to render a {status, body} HandlerResult through `res`. */

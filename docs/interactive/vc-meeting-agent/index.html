@@ -1440,13 +1440,23 @@
             <div class="step">
               <div class="step-no">5</div>
               <div>
-                <h4>配置 botmux</h4>
-                <p>把下面的片段合进 <code>bots.json</code>（替换 App ID / profile / 你的 open_id），然后在 Dashboard → Settings 里确认「允许本机使用会议监听能力」开启、会议监听 bot 身份指向这个 app。保存时 botmux 会自动校验 VC 权限。</p>
+                <h4>配置 botmux <span class="status ok">命令优先</span></h4>
+                <p>不要把手改 <code>bots.json</code> 当主路径。先用 <code>botmux setup</code> 注册或更新 bot（写盘前会校验凭证），再到 Dashboard → Settings 开启「允许本机使用会议监听能力」并选择监听 bot；保存时 Dashboard 会自动给选中的 bot 补会议监听默认配置并校验 VC 权限。</p>
                 <div class="copy-row" style="margin-top:12px">
-                  <h4 style="font-size:13.5px">bots.json 片段</h4>
+                  <h4 style="font-size:13.5px">命令方式</h4>
                   <button class="copy-btn" type="button" data-copy="#cfgSnippet">复制</button>
                 </div>
-                <pre class="code" id="cfgSnippet">{
+                <pre class="code" id="cfgSnippet">botmux setup list --json
+botmux setup add --app-id cli_xxx --app-secret &lt;SECRET&gt; \
+  --allowed-users &lt;你的邮箱或 open_id&gt; --cli &lt;claude-code|codex&gt; --json
+botmux restart</pre>
+                <details class="ref" style="margin-top:12px">
+                  <summary>高级参考：vcMeetingAgent 字段（排查用，不作为用户主路径）</summary>
+                  <div class="copy-row" style="margin-top:12px">
+                    <h4 style="font-size:13.5px">JSON 参考</h4>
+                    <button class="copy-btn" type="button" data-copy="#vcCfgSnippet">复制</button>
+                  </div>
+                  <pre class="code" id="vcCfgSnippet">{
   "larkAppId": "cli_xxx",
   "larkAppSecret": "...",
   "displayName": "会议监听 Bot",
@@ -1467,6 +1477,7 @@
     }
   }
 }</pre>
+                </details>
                 <div class="step-actions">
                   <label class="step-done-toggle"><input type="checkbox" data-onb="4">标记完成</label>
                 </div>
@@ -1481,7 +1492,7 @@
                 <ul class="scope-list">
                   <li>① 申请可选 scope <code>vc:meeting.bot.realtime:write</code>（第 3 步里有单独申请链接）并发布版本；</li>
                   <li>② 准备可用的语音合成服务凭证（按你的部署环境选择供应商），记录 <code>appkey</code> / <code>AccessKey</code> / <code>SecretKey</code> 等必要字段；</li>
-                  <li>③ 本机配置：<code>botmux voice</code>（交互式选择 TTS provider、粘贴凭证，缺 opus 编码器会自动装）→ bots.json 里该 bot 的 <code>realtimeVoice.enabled</code> 改 <code>true</code> → <code>botmux restart</code>；</li>
+                  <li>③ 本机配置：<code>botmux voice</code>（交互式选择 TTS provider、粘贴凭证，缺 opus 编码器会自动装）→ 让本机 agent 或运维开启该 bot 的 <code>realtimeVoice.enabled</code> → <code>botmux restart</code>；</li>
                   <li>④ 每场会议在会议侧打开「允许 AI 智能体发言」。</li>
                 </ul>
                 <div class="step-actions">
@@ -1933,8 +1944,10 @@ botmux setup add --app-id ${appId || '<APP_ID>'} --app-secret <SECRET> \\
   vc.bot.meeting_ended_v1
   注意：事件订阅没有 API 可校验，缺订阅的症状是 daemon 静默收不到 push
 
-## 4. 写 vcMeetingAgent 配置
-编辑 ~/.botmux/bots.json，给该 bot 增加（保留已有字段）：
+## 4. 配置会议监听
+先让用户打开 Dashboard → Settings：开启「允许本机使用会议监听能力」并选择这个 bot。
+保存时 Dashboard 会自动给选中的 bot 写入 vcMeetingAgent.enabled / larkCliProfile 并校验权限。
+不要把手改 JSON 作为用户待办。只有脚本化环境没有 Dashboard 时，你再最小修改 ~/.botmux/bots.json：
   "vcMeetingAgent": {
     "enabled": true,
     "larkCliProfile": "${appId || '<APP_ID>'}",
@@ -1942,15 +1955,14 @@ botmux setup add --app-id ${appId || '<APP_ID>'} --app-secret <SECRET> \\
     "flushIntervalMs": 30000,
     "meetingConsumer": { "enabled": true }
   }
-确认全局开关与监听身份：~/.botmux/config.json 的 vcMeetingAgent 段
-（或让用户在 Dashboard → Settings 勾选「会议监听」并选中该 bot）
+确认全局开关与监听身份已由 Dashboard 写入 ~/.botmux/config.json 的 vcMeetingAgent 段。
 
 ## 5. （可选）开通语音发言——先问用户要不要，不要则跳过
 botmux voice status   # 已配置 TTS 则只需下面第 3 小步
 # a) [人工] 申请 realtime scope 并发布版本：vc:meeting.bot.realtime:write
 # b) [人工] 准备可用的 TTS provider 凭证
 # c) botmux voice（交互式，需用户在终端粘贴凭证，你不要代填）
-#    然后把 bots.json 该 bot 的 "realtimeVoice": { "enabled": true }
+#    然后由你最小写入该 bot 的 "realtimeVoice": { "enabled": true }，不要让用户手改 JSON
 # d) 提醒用户：每场会议需在会议侧打开「允许 AI 智能体发言」
 
 ## 6. 重启并验证

@@ -80,6 +80,8 @@ export interface SettingsWriteApplierDeps {
   reloadLocaleOnAllDaemons?: () => Promise<void>;
   /** Validate a global VC listener bot selection before persisting it. */
   validateVcMeetingListenerBotAppId?: (appId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+  /** Ensure the selected bot has the per-bot meeting-listener defaults needed by validation/runtime. */
+  ensureVcMeetingListenerBotConfig?: (appId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
 }
 
 /** Production deps wiring — call once per dashboard process. */
@@ -210,6 +212,10 @@ export async function applySettingsWrite(
         delete next.listenerBotAppId;
       } else if (typeof vc.listenerBotAppId === 'string' && vc.listenerBotAppId.trim()) {
         const listenerBotAppId = vc.listenerBotAppId.trim();
+        if (deps.ensureVcMeetingListenerBotConfig) {
+          const ensured = await deps.ensureVcMeetingListenerBotConfig(listenerBotAppId);
+          if (!ensured.ok) return { ok: false, error: ensured.error };
+        }
         if (deps.validateVcMeetingListenerBotAppId) {
           const validation = await deps.validateVcMeetingListenerBotAppId(listenerBotAppId);
           if (!validation.ok) return { ok: false, error: validation.error };
