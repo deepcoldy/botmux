@@ -189,6 +189,20 @@ describe('built-in botmux-handoff skill', () => {
   });
 });
 
+describe('built-in botmux-orchestrate skill', () => {
+  it('teaches L2 how to execute dashboard panel actions through the ledger workflow', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-orchestrate');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('[panel-action v1]');
+    expect(skill!.content).toContain('reassign-worker');
+    expect(skill!.content).toContain('switch-worker');
+    expect(skill!.content).toContain('escalate-human');
+    expect(skill!.content).toContain('resolve-help');
+    expect(skill!.content).toContain('先查交付记录和 charter');
+    expect(skill!.content).toContain('delivery escalate');
+  });
+});
+
 describe('built-in botmux-whiteboard skill', () => {
   it('is NOT in BUILTIN_SKILLS — installed conditionally on the whiteboard toggle', () => {
     // The whiteboard feature is off by default, so its skill must not be written
