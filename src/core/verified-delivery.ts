@@ -30,7 +30,7 @@ export function buildVerifiedDeliveryInstructions(input: {
 }): string {
   const standard = input.acceptanceHint?.trim() ? `；完成标准：${input.acceptanceHint.trim()}` : '';
   return [
-    `【任务】任务号：${input.taskId}${standard}`,
+    `【任务】按上面的任务简报执行${standard}。提交时使用任务号：${input.taskId}`,
     `【怎么提交】botmux report --task ${input.taskId} "做了什么/结果" --artifact <监管者能读取的路径>；路径读不到加 --artifact-text "测试结果=9 passed"；没有证据不算完成。`,
     `【卡住怎么办】botmux help --task ${input.taskId} --kind access|ambiguous|impossible|repeated_failure|other --blocker "卡在哪、缺什么"；需要人拍板也先求助监管者，别直接 @ 人。`,
   ].join('\n');

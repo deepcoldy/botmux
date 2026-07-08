@@ -4678,6 +4678,7 @@ function retryRecordFromHumanAttention(input: {
   const goalChatId = meta?.goalChatId ?? input.supervisor?.chatId;
   if (!parentChatId || !goalChatId) return null;
   const goalTitle = meta?.title ?? input.supervisor?.session.title?.replace(/^\[Goal\]\s*/, '');
+  const taskTitle = input.taskId ? openLedger().task(input.taskId)?.title : undefined;
   const candidates = goalParentSenderCandidates(input.parent?.larkAppId, input.supervisor?.larkAppId, currentDaemonLarkAppId);
   const now = Date.now();
   return {
@@ -4692,6 +4693,7 @@ function retryRecordFromHumanAttention(input: {
     goalChatId,
     goalTitle,
     taskId: input.taskId,
+    taskTitle,
     summary: input.summary,
     attentionKind: input.attentionKind,
     attentionReason: input.attentionReason,
@@ -4749,6 +4751,7 @@ async function sendGoalHumanAttentionRecord(record: GoalNotificationRetryRecord)
       goalChatId: record.goalChatId,
       goalLink,
       taskId: record.taskId,
+      taskTitle: record.taskTitle,
       attentionKind: record.attentionKind,
       attentionReason: record.attentionReason,
       decisionOptions: record.decisionOptions,
@@ -4772,6 +4775,7 @@ async function sendGoalHumanAttentionRecord(record: GoalNotificationRetryRecord)
           goalChatId: record.goalChatId,
           goalTitle: record.goalTitle,
           taskId: record.taskId,
+          taskTitle: record.taskTitle,
           summary: record.summary,
           attentionKind: record.attentionKind,
           attentionReason: record.attentionReason,
@@ -4820,20 +4824,19 @@ function buildGoalCompletionConfirmCard(input: {
   supervisorSessionId?: string;
 }): string {
   const mention = input.ownerOpenId ? `<at id=${input.ownerOpenId}></at> ` : '';
-  const title = input.goalTitle ?? input.goalChatId;
+  const title = input.goalTitle?.trim() || '当前目标';
   return JSON.stringify({
     config: { wide_screen_mode: true },
-    header: { template: 'green', title: { tag: 'plain_text', content: `Goal 完成：${title}` } },
+    header: { template: 'green', title: { tag: 'plain_text', content: `目标完成：${title}` } },
     elements: [
       {
         tag: 'div',
         text: {
           tag: 'lark_md',
           content: [
-            `${mention}L2 监管者报告 goal 已完成。`,
-            `**Goal**: ${title}`,
-            `**goalChatId**: \`${input.goalChatId}\``,
-            input.goalLink ? `[打开 goal 群](${input.goalLink})` : undefined,
+            `${mention}监管者报告目标已完成。`,
+            `**目标**：${title}`,
+            input.goalLink ? `[打开目标群](${input.goalLink})` : undefined,
             '',
             input.summary,
           ].filter(Boolean).join('\n'),

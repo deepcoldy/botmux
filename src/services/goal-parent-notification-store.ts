@@ -15,6 +15,7 @@ export interface GoalParentNotificationRecord {
   goalChatId: string;
   goalTitle?: string;
   taskId?: string;
+  taskTitle?: string;
   summary: string;
   attentionKind?: string;
   attentionReason?: string;
