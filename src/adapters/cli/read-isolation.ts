@@ -155,7 +155,12 @@ export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
       // re-allowed via buildV2CarveOuts; siblings' buckets + the legacy flat
       // per-messageId layout stay denied.
       `${sd}/attachments`,
-      `${sd}/whiteboards`,
+      // whiteboards/ is deliberately NOT denied (owner decision): whiteboards are
+      // shared content, meant to be visible across the bots that collaborate on
+      // them. NOTE the store is currently GLOBAL (no per-chat scoping), so a
+      // sandboxed bot can `whiteboard list`/`read` boards from other chats too —
+      // an accepted tradeoff until whiteboards are bucketed by chat/appId. Also
+      // un-denying the read avoids the read-modify-write clobber a deny would cause.
       // Queued inbound messages (queues/<rootMessageId>.jsonl = full LarkMessage
       // content for EVERY bot). Daemon-side only — the CLI never reads it.
       `${sd}/queues`,
