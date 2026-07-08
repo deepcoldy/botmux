@@ -27,8 +27,13 @@ import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 
 /** Host root for the HOME overlay's upper/work — MUST be OUTSIDE the home lower
- *  (overlayfs forbids upper/work inside lower). */
-const VARTMP_ROOT = '/var/tmp/botmux-sbx';
+ *  (overlayfs forbids upper/work inside lower). Keep it per-uid: /var/tmp is a
+ *  shared multi-user surface, and a global 0700 root would let the first user
+ *  that starts sandbox block every other Unix user on the same machine. */
+export function sandboxVartmpRoot(): string {
+  const uid = process.getuid?.() ?? 0;
+  return `/var/tmp/botmux-sbx-${uid}`;
+}
 
 /** Create a daemon-private directory and repair legacy/default mkdir modes.
  *  Anything under /var/tmp is on a shared multi-user surface, while the outbox
@@ -340,7 +345,7 @@ export interface SandboxSpawn {
   outbox: string;
   /** Project overlay UPPER dir — THE LANDABLE CHANGESET (used by sandbox-land). */
   workDir: string;
-  /** HOME overlay UPPER dir (/var/tmp/botmux-sbx/<sid>/home-upper). The sandboxed
+  /** HOME overlay UPPER dir (/var/tmp/botmux-sbx-<uid>/<sid>/home-upper). The sandboxed
    *  CLI's $HOME writes — INCLUDING its session jsonl under CLAUDE_CONFIG_DIR —
    *  land here (invisible at the real path). The worker redirects its bridge/idle
    *  watch into this via sandboxedClaudeDataDir() so it sees the CLI's turns. */
@@ -364,7 +369,7 @@ export interface SandboxSpawn {
 export function sandboxedClaudeDataDir(sessionId: string, realDataDir: string): string {
   const raw = relative(homedir(), realDataDir);
   const rel = raw.startsWith('..') ? relative(resolveSandboxMountPath(homedir()), realDataDir) : raw;
-  return join(VARTMP_ROOT, sessionId, 'home-upper', rel);
+  return join(sandboxVartmpRoot(), sessionId, 'home-upper', rel);
 }
 
 /** Proxy env vars forwarded into the sandbox so the CLI reaches the API even on
@@ -379,7 +384,7 @@ const PROXY_ENV_KEYS = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY'
  * Layout under <dataDir>/sandboxes/<sessionId>/: shimbin, proj-upper (the
  * landable changeset), proj-work, proj-merged, home-merged. The HOME overlay's
  * upper/work and the daemon-mediated outbox live under
- * /var/tmp/botmux-sbx/<sessionId>/ because overlayfs forbids upper/work inside
+ * /var/tmp/botmux-sbx-<uid>/<sessionId>/ because overlayfs forbids upper/work inside
  * the lower (= the real home), and keeping the outbox outside HOME avoids a
  * nested bind under the HOME overlay on bwrap hosts that hang on that pattern.
  */
@@ -431,11 +436,11 @@ export function prepareSandbox(opts: {
   const projMerged = join(sessionRoot, 'proj-merged');
   const homeMerged = join(sessionRoot, 'home-merged');  // merged may live under sessionRoot
   // HOME overlay upper/work MUST be OUTSIDE the home lower (overlayfs constraint).
-  const vartmp = join(VARTMP_ROOT, opts.sessionId);
+  const vartmp = join(sandboxVartmpRoot(), opts.sessionId);
   const outbox = join(vartmp, 'outbox');
   const homeUpper = join(vartmp, 'home-upper');
   const homeWork = join(vartmp, 'home-work');
-  if (!ensurePrivateDir(VARTMP_ROOT) || !ensurePrivateDir(vartmp) || !ensurePrivateDir(outbox)) return null;
+  if (!ensurePrivateDir(sandboxVartmpRoot()) || !ensurePrivateDir(vartmp) || !ensurePrivateDir(outbox)) return null;
   for (const d of [outbox, shimBin, empties]) mkdirSync(d, { recursive: true });
 
   const home = resolveSandboxMountPath(homedir());
@@ -575,7 +580,7 @@ export function prepareSandbox(opts: {
  * the workDir (upper changeset for landing) and a cleanup that tears the residue
  * down at close/exit. Returns null if the session has no sandbox tree on disk
  * (never sandboxed). Linux-only, mirrors prepareSandbox's layout. New sessions
- * keep outbox under /var/tmp/botmux-sbx/<sid>/outbox; fall back to the legacy
+ * keep outbox under /var/tmp/botmux-sbx-<uid>/<sid>/outbox; fall back to the legacy
  * <dataDir>/sandboxes/<sid>/outbox for sessions that were already running
  * before the layout changed.
  */
@@ -583,7 +588,7 @@ export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }
   if (process.platform !== 'linux') return null;
   const dataDir = resolveSandboxMountPath(opts.dataDir);
   const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
-  const vartmp = join(VARTMP_ROOT, opts.sessionId);
+  const vartmp = join(sandboxVartmpRoot(), opts.sessionId);
   const newOutbox = join(vartmp, 'outbox');
   const legacyOutbox = join(sessionRoot, 'outbox');
   const projUpper = join(sessionRoot, 'proj-upper');
@@ -591,7 +596,7 @@ export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }
   const outbox = existsSync(newOutbox) ? newOutbox : (existsSync(legacyOutbox) ? legacyOutbox : newOutbox);
   // Ensure the outbox exists (the watcher reads it); never (re)mount here.
   if (outbox === newOutbox) {
-    if (!ensurePrivateDir(VARTMP_ROOT) || !ensurePrivateDir(vartmp) || !ensurePrivateDir(outbox)) return null;
+    if (!ensurePrivateDir(sandboxVartmpRoot()) || !ensurePrivateDir(vartmp) || !ensurePrivateDir(outbox)) return null;
   } else if (!ensurePrivateDir(outbox)) return null;
   const projMerged = join(sessionRoot, 'proj-merged');
   const homeMerged = join(sessionRoot, 'home-merged');
@@ -614,19 +619,19 @@ function reclaimSandbox(dataDir: string, sid: string): void {
   unmountOverlay(join(sessionRoot, 'proj-merged'));
   unmountOverlay(join(sessionRoot, 'home-merged'));
   try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
-  try { rmSync(join(VARTMP_ROOT, sid), { recursive: true, force: true }); } catch { /* */ }
+  try { rmSync(join(sandboxVartmpRoot(), sid), { recursive: true, force: true }); } catch { /* */ }
 }
 
 /** Scan the process table for sandbox session-ids referenced by any running
  *  process's argv. A live bwrap's bind/overlay paths contain `sandboxes/<sid>`
- *  and `botmux-sbx/<sid>`, so this physically detects which sandbox dirs are
+ *  and `botmux-sbx-<uid>/<sid>`, so this physically detects which sandbox dirs are
  *  still in use — by overlay sessions AND old clone-model sessions alike. Used as
  *  a hard guard so the sweep never deletes a dir out from under a live CLI. */
 function liveSandboxSids(): Set<string> {
   const live = new Set<string>();
   let pids: string[];
   try { pids = readdirSync('/proc'); } catch { return live; }
-  const re = /(?:sandboxes|botmux-sbx)\/([^/\0]+)/g;
+  const re = /(?:sandboxes|botmux-sbx(?:-[^/\0]+)?)\/([^/\0]+)/g;
   for (const pid of pids) {
     if (!/^\d+$/.test(pid)) continue;
     let cmd: string;

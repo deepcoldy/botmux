@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync, statSync } from 'node:fs';
-import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, attachSandboxOutbox, resolveSandboxMountPath, sandboxedClaudeDataDir, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, attachSandboxOutbox, resolveSandboxMountPath, sandboxedClaudeDataDir, sandboxVartmpRoot, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
 
@@ -179,7 +179,7 @@ describe('sandboxedClaudeDataDir (symlink HOME redirect)', () => {
     try {
       const symlinkForm = join(linkHome, '.claude');
       const canonicalForm = join(realpathSync(linkHome), '.claude');
-      const expected = join('/var/tmp/botmux-sbx', 'sid-x', 'home-upper', '.claude');
+      const expected = join(sandboxVartmpRoot(), 'sid-x', 'home-upper', '.claude');
       expect(sandboxedClaudeDataDir('sid-x', symlinkForm)).toBe(expected);
       expect(sandboxedClaudeDataDir('sid-x', canonicalForm)).toBe(expected);
     } finally {
@@ -356,12 +356,17 @@ describe('prepareSandbox enabled gate', () => {
 });
 
 describe.skipIf(process.platform !== 'linux')('sandbox outbox layout', () => {
+  it('uses a per-uid /var/tmp root so users do not contend for one global 0700 dir', () => {
+    const uid = process.getuid?.() ?? 0;
+    expect(sandboxVartmpRoot()).toBe(`/var/tmp/botmux-sbx-${uid}`);
+  });
+
   it('reattaches to the new /var/tmp outbox outside dataDir', () => {
     const dataDir = tmp();
     const sid = 'outbox-new-' + Math.random().toString(36).slice(2);
     const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sid);
     const projUpper = join(sessionRoot, 'proj-upper');
-    const newOutbox = join('/var/tmp/botmux-sbx', sid, 'outbox');
+    const newOutbox = join(sandboxVartmpRoot(), sid, 'outbox');
     mkdirSync(projUpper, { recursive: true });
     mkdirSync(newOutbox, { recursive: true });
 
@@ -371,8 +376,8 @@ describe.skipIf(process.platform !== 'linux')('sandbox outbox layout', () => {
       expect(r!.outbox).toBe(newOutbox);
       expect(r!.outbox.startsWith(sessionRoot)).toBe(false);
       expect(r!.workDir).toBe(projUpper);
-      expect(statSync(join('/var/tmp/botmux-sbx')).mode & 0o077).toBe(0);
-      expect(statSync(join('/var/tmp/botmux-sbx', sid)).mode & 0o077).toBe(0);
+      expect(statSync(sandboxVartmpRoot()).mode & 0o077).toBe(0);
+      expect(statSync(join(sandboxVartmpRoot(), sid)).mode & 0o077).toBe(0);
       expect(statSync(newOutbox).mode & 0o077).toBe(0);
     } finally {
       r?.cleanup();
@@ -413,14 +418,14 @@ describe.skipIf(process.platform !== 'linux')('sandbox outbox layout', () => {
         dataDir, cliBin: '/bin/true', cliArgs: [],
       });
       if (r === null) return; // overlay mount unavailable in this env — skip assertions
-      const expected = join('/var/tmp/botmux-sbx', sid, 'outbox');
+      const expected = join(sandboxVartmpRoot(), sid, 'outbox');
       const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sid);
       expect(r.outbox).toBe(expected);
       expect(r.env.BOTMUX_SEND_RELAY).toBe(expected);
       expect(r.outbox.startsWith(sessionRoot)).toBe(false);
       expect(r.args.some((x, i) => x === '--bind' && r!.args[i + 1] === expected && r!.args[i + 2] === expected)).toBe(true);
-      expect(statSync(join('/var/tmp/botmux-sbx')).mode & 0o077).toBe(0);
-      expect(statSync(join('/var/tmp/botmux-sbx', sid)).mode & 0o077).toBe(0);
+      expect(statSync(sandboxVartmpRoot()).mode & 0o077).toBe(0);
+      expect(statSync(join(sandboxVartmpRoot(), sid)).mode & 0o077).toBe(0);
       expect(statSync(expected).mode & 0o077).toBe(0);
     } finally {
       r?.cleanup();

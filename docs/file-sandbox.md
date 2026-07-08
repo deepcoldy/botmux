@@ -25,9 +25,9 @@ worker spawnCli
        ├─ <dataDir>/sandboxes/<sid>/proj-merged    项目 overlay merged
        ├─ <dataDir>/sandboxes/<sid>/home-merged    HOME overlay merged
        ├─ <dataDir>/sandboxes/<sid>/shimbin        botmux relay shim
-       ├─ /var/tmp/botmux-sbx/<sid>/home-upper     HOME 写入 upper
-       ├─ /var/tmp/botmux-sbx/<sid>/home-work      HOME overlay workdir
-       └─ /var/tmp/botmux-sbx/<sid>/outbox         botmux send relay outbox
+       ├─ /var/tmp/botmux-sbx-<uid>/<sid>/home-upper     HOME 写入 upper
+       ├─ /var/tmp/botmux-sbx-<uid>/<sid>/home-work      HOME overlay workdir
+       └─ /var/tmp/botmux-sbx-<uid>/<sid>/outbox         botmux send relay outbox
   └─ bwrap … -- <cli> <原 args>                    把 CLI 关进 namespace
   └─ startOutboxWatcher()                          daemon 侧代投递（持凭证）
 ```
@@ -37,9 +37,9 @@ worker spawnCli
 - 真实文件系统先以只读方式暴露，CLI 启动所需的系统工具链、Node、CLI 安装目录、认证配置等可以正常读取。
 - `$HOME` 和项目目录分别由 host 侧 overlay merged 目录 bind 回原路径；读走真实 lower，写入 copy-up 到对应 upper。
 - 项目改动集中在 `<dataDir>/sandboxes/<sid>/proj-upper`，供后续 diff/land 使用。
-- HOME 写入集中在 `/var/tmp/botmux-sbx/<sid>/home-upper`，避免 overlayfs upper/work 位于 HOME lower 内部。
-- outbox 放在 `/var/tmp/botmux-sbx/<sid>/outbox`，避免在 HOME overlay 内部再 bind 子目录导致部分 bwrap 环境卡在挂载阶段。
-- `/var/tmp/botmux-sbx`、`<sid>`、`outbox` 都会收紧到 `0700`；relay 内容/附件/请求/响应文件以 `0600` 写入，避免公共多用户机器上被其他本地用户读取。
+- HOME 写入集中在 `/var/tmp/botmux-sbx-<uid>/<sid>/home-upper`，避免 overlayfs upper/work 位于 HOME lower 内部。
+- outbox 放在 `/var/tmp/botmux-sbx-<uid>/<sid>/outbox`，避免在 HOME overlay 内部再 bind 子目录导致部分 bwrap 环境卡在挂载阶段。
+- `/var/tmp/botmux-sbx-<uid>`、`<sid>`、`outbox` 都会收紧到 `0700`；relay 内容/附件/请求/响应文件以 `0600` 写入，避免公共多用户机器上被其他本地用户读取。
 
 **bwrap 绑定策略**（`buildSandboxArgs`）：
 
@@ -56,7 +56,7 @@ worker spawnCli
 
 `botmux send` 原本**直连飞书**（读 `bots.json` 拿密钥）。沙盒里没有宿主 bot 配置/凭证，所以：
 
-1. 沙盒内 `botmux send` 检测到 `BOTMUX_SEND_RELAY=/var/tmp/botmux-sbx/<sid>/outbox`，把内容、附件和 allowlist 后的展示参数写进 outbox，**不直连飞书**。
+1. 沙盒内 `botmux send` 检测到 `BOTMUX_SEND_RELAY=/var/tmp/botmux-sbx-<uid>/<sid>/outbox`，把内容、附件和 allowlist 后的展示参数写进 outbox，**不直连飞书**。
 2. daemon 侧 `startOutboxWatcher` 拾取 `.req.json`，把 outbox 内的内容/附件 TOCTOU-safe 地复制到 host-private staging。
 3. daemon 在**沙盒外**用真实凭证重跑 `send` 投递，并把 `.res.json` 写回 outbox。
 
@@ -70,7 +70,7 @@ worker spawnCli
 <dataDir>/sandboxes/<sid>/outbox
 ```
 
-daemon restart reattach 时会优先寻找新路径 `/var/tmp/botmux-sbx/<sid>/outbox`；如果不存在，会 fallback 到旧路径，以便升级前已经运行的 sandbox 会话继续 relay。新建 sandbox 会话只使用 `/var/tmp/botmux-sbx/<sid>/outbox`。
+daemon restart reattach 时会优先寻找新路径 `/var/tmp/botmux-sbx-<uid>/<sid>/outbox`；如果不存在，会 fallback 到旧路径，以便升级前已经运行的 sandbox 会话继续 relay。新建 sandbox 会话只使用 `/var/tmp/botmux-sbx-<uid>/<sid>/outbox`。
 
 ## 落盘（把改动交回）
 
