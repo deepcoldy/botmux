@@ -45,6 +45,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     autoboundChatCount: j?.autoboundChatCount ?? 0,
     brandLabel: j?.brandLabel ?? null,
     sandbox: j?.sandbox === true,
+    readIsolation: j?.readIsolation === true,
+    readIsolationSupported: j?.readIsolationSupported === true,
     disableStreamingCard: j?.disableStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,

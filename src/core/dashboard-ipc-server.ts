@@ -15,6 +15,30 @@ import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
+import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
+
+/** Whether read isolation can actually be ENFORCED for this bot right now — the
+ *  SAME gate the worker fail-closes on (adapter support + no wrapperCli + macOS).
+ *  The dashboard uses it to disable the toggle and to reject persisting an
+ *  unenforceable flag, so flipping it on can never brick the bot's next session
+ *  (the worker would otherwise refuse to start). Turning it OFF is always allowed. */
+function readIsolationEnforceableFor(cfg: { cliId?: string; cliPathOverride?: string; wrapperCli?: string }): boolean {
+  let adapterSupports = false;
+  try {
+    adapterSupports = createCliAdapterSync(cfg.cliId as never, cfg.cliPathOverride).supportsReadIsolation === true;
+  } catch { /* CLI missing / unknown adapter → treat as unenforceable */ }
+  return evaluateReadIsolationGate({
+    configured: true,
+    adapterSupports,
+    wrapperCliSet: !!cfg.wrapperCli,
+    platform: process.platform,
+    sessionDataDirSet: true,
+  }).enabled;
+}
+function readIsolationEnforceable(larkAppId: string): boolean {
+  try { return readIsolationEnforceableFor(getBot(larkAppId).config); } catch { return false; }
+}
 import * as observedBotsStore from '../services/observed-bots-store.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
@@ -37,7 +61,7 @@ import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessi
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
-import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
@@ -1521,6 +1545,10 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
+    readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
+    // Full enforceability (adapter support + no wrapperCli + macOS) — the UI
+    // disables the toggle wherever the worker would fail-close on it.
+    readIsolationSupported: readIsolationEnforceable(cachedLarkAppId),
     disableStreamingCard: cardPrefs.disableStreamingCard,
     silentTurnReactions: cardPrefs.silentTurnReactions,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
@@ -1756,12 +1784,22 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   }
   const model = typeof body.model === 'string' ? body.model.trim() : '';
 
+  // If the new CLI/wrapper can no longer enforce a currently-on read isolation,
+  // auto-clear the flag here so the next session doesn't fail-close on it. (The
+  // read-isolation toggle validates at enable time; changing the agent afterwards
+  // is the other way a bot could end up configured-but-unenforceable.)
+  let readIsolationCleared = false;
   const r = await rmwBotEntry(cachedLarkAppId, (entry) => {
     entry.cliId = selected.cliId;
     if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
     else delete entry.wrapperCli;
     if (model) entry.model = model;
     else delete entry.model;
+    if (entry.readIsolation === true &&
+        !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: entry.cliPathOverride, wrapperCli: selected.wrapperCli })) {
+      delete entry.readIsolation;
+      readIsolationCleared = true;
+    }
     return { write: true, result: null };
   });
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
@@ -1771,6 +1809,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
   else bot.config.wrapperCli = undefined;
   bot.config.model = model || undefined;
+  if (readIsolationCleared) bot.config.readIsolation = false;
 
   // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
   // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
@@ -1784,6 +1823,12 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     model: model || null,
     selectionKey,
     closedMismatchedSessions,
+    // Report the (possibly auto-cleared) read-isolation state + whether the new
+    // agent can still enforce it, so the dashboard updates its toggle immediately
+    // instead of showing a stale enabled/supported state until a full refetch.
+    readIsolation: bot.config.readIsolation === true,
+    readIsolationSupported: readIsolationEnforceableFor(bot.config),
+    readIsolationCleared,
   });
 });
 
@@ -1988,6 +2033,33 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
+});
+
+// Per-bot read-isolation toggle. Body `{ enabled: boolean }`. When on, this bot's
+// CLI sessions run under macOS Seatbelt read-deny (siblings' creds/sessions/content
+// unreadable). The macOS counterpart of the file sandbox above.
+ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { enabled?: unknown };
+  try { body = await readJsonBody<{ enabled?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const enable = body.enabled === true;
+  // The worker FAIL-CLOSES (refuses to start the session) for a configured
+  // readIsolation that can't be enforced: non-darwin, an adapter without
+  // supportsReadIsolation, or a wrapperCli gateway. Reject enabling it in exactly
+  // those cases so the toggle can never brick the bot's next session. (Turning it
+  // OFF is always allowed — recovers a flag that became unenforceable.)
+  if (enable && !readIsolationEnforceable(cachedLarkAppId)) {
+    return jsonRes(res, 400, { ok: false, error: 'read_isolation_unenforceable' });
+  }
+  const r = await sandboxStore.updateBotReadIsolation(cachedLarkAppId, enable);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  // Read isolation only takes effect at COLD spawn (provisionIsolatedBotHome +
+  // Seatbelt wrapper run then). Suspend this bot's active sessions so the next
+  // message cold-restarts under the new state — otherwise close+resume would keep
+  // running the old, un-provisioned state and the toggle would silently no-op.
+  const suspendedSessions = await suspendActiveSessionsForBot(cachedLarkAppId);
+  jsonRes(res, 200, { ok: true, readIsolation: r.readIsolation, suspendedSessions });
 });
 
 // 实时切换 UI 语言（locale），无需重启 daemon。`botmux lang` / Dashboard 语言开关

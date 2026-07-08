@@ -11,7 +11,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry } from './worker-pool.js';
+import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { assertSafeAppId } from '../adapters/cli/read-isolation.js';
@@ -131,6 +131,45 @@ export async function closeCliMismatchedSessionsForBot(larkAppId: string): Promi
     if (await closeActiveSessionIfCliMismatch(ds)) closed++;
   }
   return closed;
+}
+
+/**
+ * Suspend (kill the CLI/pane, keep the session active) every non-queued,
+ * non-adopt active session of a bot, so the NEXT message cold-restarts them.
+ * Used by the read-isolation toggle: read isolation is applied only at cold
+ * spawn (via provisionIsolatedBotHome + the Seatbelt wrapper), so flipping the
+ * flag must force a cold restart — otherwise a user who close+resumes keeps
+ * running the old (un-provisioned) state and the toggle silently no-ops.
+ * Exemptions mirror closeCliMismatchedSessionsForBot (queued never started a
+ * CLI; adopt sessions own a user's external CLI). Returns the count suspended.
+ */
+export async function suspendActiveSessionsForBot(larkAppId: string): Promise<number> {
+  const registry = getActiveSessionsRegistry();
+  if (!registry) return 0;
+  let restarted = 0;
+  for (const ds of [...registry.values()]) {
+    if (ds.larkAppId !== larkAppId) continue;
+    if (ds.session.queued) continue;
+    if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
+    // Prefer suspend (keeps the session; --resume continues context on the next
+    // message). But suspendWorker no-ops for a NON-suspendable backend (explicit
+    // PTY) — leaving the old unisolated process running would silently defeat the
+    // toggle. Fall back to closeSession there so the stale process is torn down and
+    // the next message cold-spawns fresh under the new isolation state either way.
+    if (suspendWorker(ds, 'read_isolation_toggle')) {
+      restarted++;
+    } else if (ds.worker && !ds.worker.killed) {
+      // suspendWorker no-op'd but a LIVE worker is running → non-suspendable
+      // backend (explicit PTY). Close it so the stale unisolated process is torn
+      // down (next message cold-spawns fresh under the new flag).
+      await closeSession(ds.session.sessionId);
+      restarted++;
+    }
+    // else: no live worker (already idle-suspended) → the next message already
+    // cold-resumes; it'll pick up the new isolation flag. Don't close it (that
+    // would delete a resumable idle session).
+  }
+  return restarted;
 }
 
 // ─── Path helpers ────────────────────────────────────────────────────────────

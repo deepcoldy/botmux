@@ -2845,6 +2845,23 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/read-isolation — proxy to that bot's daemon. Body `{ enabled: boolean }`.
+    let mBotReadIso: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotReadIso = url.pathname.match(/^\/api\/bots\/([^/]+)\/read-isolation$/))) {
+      const appId = decodeURIComponent(mBotReadIso[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-read-isolation`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/card-prefs — proxy to that bot's daemon. Body carries
     // any subset of per-bot behavior booleans / prompt strings.
     let mBotCardPrefs: RegExpMatchArray | null;
