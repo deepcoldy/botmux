@@ -892,6 +892,12 @@ tr[data-chat]:hover { background: var(--surface-muted); cursor: pointer; }
   text-align: center;
   font-variant-numeric: tabular-nums;
 }
+.session-location-cell {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 button,
 .btn-link {

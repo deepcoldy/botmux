@@ -60,6 +60,9 @@ function SessionsPage() {
           <option value="yes">{tr('sessions.adoptYes')}</option>
           <option value="no">{tr('sessions.adoptNo')}</option>
         </select>
+        <select name="chat" aria-label={tr('sessions.location')}>
+          <option value="">{tr('sessions.chatAny')}</option>
+        </select>
         <span style={{ display: 'contents' }} dangerouslySetInnerHTML={{ __html: renderCliFilterGroup() }} />
         <label className="filter-toggle">
           <input type="checkbox" name="active" defaultChecked /> <span>{tr('sessions.activeOnly')}</span>
@@ -97,6 +100,7 @@ function SessionsPage() {
             <SortHeader sort="botName" label={tr('sessions.bot')} />
             <SortHeader sort="cliId" label={tr('sessions.cli')} />
             <SortHeader sort="status" label={tr('sessions.status')} />
+            <SortHeader sort="chat" label={tr('sessions.location')} />
             <SortHeader sort="tokenIn" label={tr('sessions.tokenIn')} />
             <SortHeader sort="tokenOut" label={tr('sessions.tokenOut')} />
             <SortHeader sort="title" label={tr('sessions.titleCol')} />

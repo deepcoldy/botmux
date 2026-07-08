@@ -15,7 +15,7 @@ vi.mock('../src/core/cost-calculator.js', () => ({
 }));
 
 import { getSessionTokenUsage } from '../src/core/cost-calculator.js';
-import { composeRowFromActive } from '../src/core/dashboard-rows.js';
+import { composeRowFromActive, composeRowFromClosed } from '../src/core/dashboard-rows.js';
 
 function makeDs(): DaemonSession {
   return {
@@ -64,5 +64,22 @@ describe('dashboard SessionRow token usage', () => {
       turns: 3,
       model: 'test-model',
     });
+  });
+
+  it('carries chatType for active and closed rows', () => {
+    const active = makeDs();
+    active.chatType = 'p2p';
+    active.session.chatType = 'p2p';
+
+    expect(composeRowFromActive(active).chatType).toBe('p2p');
+    expect(composeRowFromClosed({
+      sessionId: 'closed-1',
+      chatId: 'oc_group',
+      chatType: 'group',
+      rootMessageId: 'om_root',
+      title: 'closed',
+      status: 'closed',
+      createdAt: new Date(1000).toISOString(),
+    }).chatType).toBe('group');
   });
 });

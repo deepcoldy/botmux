@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canRestartSession, renderCliFilterGroup, restartConfirmMessage } from '../src/dashboard/web/sessions.js';
+import { canRestartSession, renderCliFilterGroup, restartConfirmMessage, sessionLocationText } from '../src/dashboard/web/sessions.js';
 
 describe('dashboard sessions filters', () => {
   it('renders CLI filters as same-name checkboxes checked by default for multi-select filtering', () => {
@@ -29,5 +29,11 @@ describe('dashboard sessions filters', () => {
     expect(canRestartSession({ status: 'closed', adopt: false })).toBe(false);
     expect(canRestartSession({ status: 'idle', adopt: true })).toBe(false);
     expect(canRestartSession({ status: 'starting', pendingRepo: true })).toBe(false);
+  });
+
+  it('formats session location labels for group chats and direct chats', () => {
+    expect(sessionLocationText({ chatType: 'group', chatId: 'oc_group' })).toBe('群聊 · oc_group');
+    expect(sessionLocationText({ chatType: 'p2p', chatId: 'oc_dm' })).toBe('单聊 · oc_dm');
+    expect(sessionLocationText({})).toBe('未知聊天');
   });
 });

@@ -25,6 +25,7 @@ export interface SessionRow {
   closedAt?: number;
   workingDir?: string;
   chatId: string;
+  chatType?: 'group' | 'p2p';
   rootMessageId: string;
   threadId?: string;
   /** Conversation unit ('thread' = topic-anchored, 'chat' = plain chat scope).
@@ -114,6 +115,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,
     workingDir: ds.workingDir,
     chatId: ds.chatId,
+    chatType: ds.chatType,
     rootMessageId: ds.session.rootMessageId,
     scope: ds.session.scope,
     title: ds.session.title,
@@ -154,6 +156,7 @@ export function composeRowFromClosed(s: Session): SessionRow {
     closedAt: s.closedAt ? Date.parse(s.closedAt) : undefined,
     workingDir: s.workingDir,
     chatId: s.chatId,
+    chatType: s.chatType,
     rootMessageId: s.rootMessageId,
     scope: s.scope,
     title: s.title,
