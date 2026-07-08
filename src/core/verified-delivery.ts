@@ -29,18 +29,15 @@ export function buildVerifiedDeliveryInstructions(input: {
   acceptanceHint?: string;
 }): string {
   const lines = [
-    '— 可信交付协议 —',
+    '— 交付要求 —',
     `任务号: ${input.taskId}`,
-    '完成后必须用结构化回报交付，不能只在群里说“完成”：',
-    `botmux report --task ${input.taskId} --summary "做了什么/结果如何" --artifact <主agent可读取的产物路径>`,
-    '如果主 agent 读不到产物路径，请改用 inline 证据（测试输出/关键文件内容/diff），确保主 agent 能验证。',
-    '如果你无法完成（缺权限/需求有歧义/客观做不到/反复失败），不要硬撑、也不要只在群里说做不了，用求助：',
-    `botmux help --task ${input.taskId} --blocker "具体卡在哪、缺什么" --kind access|ambiguous|impossible|repeated_failure|other`,
-    '求助会落账并唤醒监管者来处理；监管者定不了的会升级给人。',
-    '需要人拍板、澄清或补权限时，只用 botmux help 或 @ 你的监管者（L2）；不要直接 @ 群里的人或老板，升级由监管者统一对外处理。',
+    `完成：botmux report --task ${input.taskId} "做了什么/结果如何" --artifact <监管者可读取的路径>`,
+    '路径读不到就改用 inline 证据：--artifact-text name=关键输出/测试结果/diff',
+    `卡住：botmux help --task ${input.taskId} --kind access|ambiguous|impossible|repeated_failure|other --blocker "卡在哪、缺什么"`,
+    '需要人拍板也先求助监管者，不要直接 @ 人或老板。',
   ];
   if (input.acceptanceHint?.trim()) {
-    lines.push(`验收提示: ${input.acceptanceHint.trim()}`);
+    lines.push(`验收：${input.acceptanceHint.trim()}`);
   }
   return lines.join('\n');
 }
