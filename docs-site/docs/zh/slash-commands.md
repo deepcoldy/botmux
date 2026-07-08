@@ -116,7 +116,7 @@
 
 ## 👥 多机器人协作
 
-`@botA @botB /t <prompt>`（各自开新话题）· `@botA @botB /introduce`（互相登记 open_id）
+`@botA @botB /t <prompt>`（各自开新话题）· `botmux bots list`（查看当前群可协作 bot）· `@botA @botB /introduce`（旧版 / 外部 bot 兜底登记，一般不再需要）
 
 ## ⏰ 定时 & ❓帮助
 

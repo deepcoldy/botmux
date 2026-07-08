@@ -34,6 +34,7 @@ import type {
 } from './spawn-bot.js';
 import { WorkflowSpawnCancelledError } from './spawn-bot.js';
 import type { AbortCancelReason, WorkerSessionInfo } from './runtime.js';
+import { workflowSandboxInitFields } from './spawn-policy.js';
 import {
   ATTEMPT_TERMINAL_SCHEMA_VERSION,
   ATTEMPT_TERMINAL_SIDECAR,
@@ -252,6 +253,7 @@ async function runOneShotImpl(
     backendType: 'pty' as const,
     prompt: input.prompt,
     resume: false,
+    ...workflowSandboxInitFields(input.botSnapshot),
     larkAppId: creds.larkAppId,
     larkAppSecret: creds.larkAppSecret,
     botName: input.botName,
@@ -364,6 +366,7 @@ async function runOneShotImpl(
         workingDir: cwd,
         webPort,
         logPath: input.attemptLogPath,
+        ...workflowSandboxInitFields(input.botSnapshot),
         startedAt,
         endedAt: Date.now(),
       };
@@ -567,6 +570,10 @@ function writeAttemptTerminalSidecar(
       botName: session.botName,
       cliId: session.cliId,
       workingDir: session.workingDir,
+      sandbox: session.sandbox,
+      sandboxHidePaths: session.sandboxHidePaths,
+      sandboxReadonlyPaths: session.sandboxReadonlyPaths,
+      sandboxNetwork: session.sandboxNetwork,
       logPath: session.logPath,
       startedAt: session.startedAt,
       updatedAt: now,

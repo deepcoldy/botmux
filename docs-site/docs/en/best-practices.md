@@ -53,9 +53,10 @@ One person, multi-bot collaborative development.
 
 Multiple people on a team, with their own bots working together.
 
-- **A Lark limitation**: bots under different people's names **don't sense each other by default** (they don't receive each other's messages in the group).
-- **Approach 1 · introduce**: first `@everyone's bot /introduce` to have them establish mutual awareness (registering open_ids), then have a **lead bot** divide work and coordinate among the other bots.
-- **Approach 2 · Team feature (recommended, no introduce needed)**: in the Dashboard "Teams" section, tag bots under multiple people's names and pull them into a team for **cross-deployment discovery**, then directly select them to create a group and start collaborating — no need to introduce every time.
+- **A Lark limitation**: bots still are not triggered by each other's regular messages; relay requires an explicit `--mention` to the target bot.
+- **Default discovery**: `botmux bots list` discovers bots in the current group through the group bot roster and shows `mentionable`; models also see relay targets in the `<available_bots>` block.
+- **Team feature (recommended)**: in the Dashboard "Teams" section, tag bots under multiple people's names and pull them into a team for **cross-deployment discovery**, then directly select them to create a group and start collaborating — the main path no longer needs `/introduce`.
+- **Legacy fallback**: only run `@everyone's bot /introduce` when an external bot is missing or shows `mentionable=false`.
 
 ![Dashboard Teams · cross-deployment collaboration](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033301213_dash-team.png)
 

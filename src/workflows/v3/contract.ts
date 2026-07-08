@@ -152,33 +152,33 @@ export const GOAL_ANSWER_FILE = 'answer.json';
 
 export type GoalAsk =
   | {
-      /** The single question to put to the human. */
-      question: string;
-      /** 2–6 concrete options the human picks from; each becomes a card button. */
-      options: string[];
-      freeText?: false;
-    }
+    /** The single question to put to the human. */
+    question: string;
+    /** 2–6 concrete options the human picks from; each becomes a card button. */
+    options: string[];
+    freeText?: false;
+  }
   | {
-      /** The single question to put to the human. */
-      question: string;
-      /** Ask the human to provide free-form text instead of picking an option. */
-      freeText: true;
-      options?: never;
-    };
+    /** The single question to put to the human. */
+    question: string;
+    /** Ask the human to provide free-form text instead of picking an option. */
+    freeText: true;
+    options?: never;
+  };
 
 export type GoalAnswer =
   | {
-      /** The option the human selected (one of {@link GoalAsk.options}). */
-      selected: string;
-      /** open_id of the human who answered. */
-      by: string;
-    }
+    /** The option the human selected (one of {@link GoalAsk.options}). */
+    selected: string;
+    /** open_id of the human who answered. */
+    by: string;
+  }
   | {
-      /** Free-form text the human provided. */
-      text: string;
-      /** open_id of the human who answered. */
-      by: string;
-    };
+    /** Free-form text the human provided. */
+    text: string;
+    /** open_id of the human who answered. */
+    by: string;
+  };
 
 // ─── Supported CLIs ─────────────────────────────────────────────────────────
 
@@ -224,6 +224,12 @@ export interface BotSnapshot {
    *  `override.permissionMode:'restricted'` can additionally set this per
    *  dispatch; nothing can clear it (no-escalation red line, P2). */
   disableCliBypass?: boolean;
+  /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
+   *  these fields when spawning outside the main forkWorker path. */
+  sandbox?: boolean;
+  sandboxHidePaths?: string[];
+  sandboxReadonlyPaths?: string[];
+  sandboxNetwork?: boolean;
   /** The resolved working directory for this run. */
   workingDir: string;
 }

@@ -107,6 +107,7 @@ export function buildBotmuxSystemPromptText(opts: {
     t('ai.routing.heredoc_example', undefined, locale),
     t('ai.routing.usage_images', undefined, locale),
     t('ai.routing.usage_files', undefined, locale),
+    t('ai.routing.usage_videos', undefined, locale),
     t('ai.routing.usage_history', undefined, locale),
     t('ai.routing.usage_bots_list', undefined, locale),
     ...whiteboardRouting,

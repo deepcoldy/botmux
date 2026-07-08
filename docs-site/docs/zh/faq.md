@@ -47,7 +47,7 @@
 
 ## 多个机器人怎么互相协作？
 
-先 `@botA @botB /introduce` 互相登记 open_id；之后用 `botmux send --mention <对方 open_id>` 显式触发对方。不 `--mention` 对方 bot 不会被触发。
+先用 `botmux bots list` 或消息里的 `<available_bots>` 找到目标 bot 的 `openId`，再用 `botmux send --mention <对方 openId>` 显式触发对方。不 `--mention` 对方 bot 不会被触发。`/introduce` 现在只是旧版 / 外部 bot 兜底：目标缺失或 `mentionable=false` 时再手动登记一次。
 
 ## daemon 重启会丢上下文吗？
 

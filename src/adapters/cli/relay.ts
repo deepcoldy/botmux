@@ -4,8 +4,8 @@ import { resolveCommand } from './registry.js';
 import { createClaudeFamilyAdapter } from './claude-code.js';
 import type { CliAdapter } from './types.js';
 
-/** Relay CLI (`@bytedance-relay/claude-code`, binary `relay`) is the current
- *  release name of what used to ship as Seed — a ByteDance fork of Claude Code.
+/** Relay CLI (binary `relay`) is the current
+ *  release name of what used to ship as Seed — a fork of Claude Code.
  *  It is identical to Claude Code in flags, slash commands and on-disk session
  *  layout (per-project JSONL transcripts, `sessions/<pid>.json`, `tasks/` fd
  *  locks, keybindings.json, settings.json hooks); it differs only in the binary

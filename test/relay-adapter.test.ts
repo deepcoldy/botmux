@@ -1,7 +1,7 @@
 /**
  * relay-adapter.test.ts
  *
- * Relay CLI (`@bytedance-relay/claude-code`) is the current release name of the
+ * Relay CLI is the current release name of the
  * Seed fork — a Claude Code fork that reuses the entire Claude-family adapter,
  * only relocating its data root and renaming the binary. Relay 3.x defaults that
  * data root to `~/.relay` (honoring `RELAY_CONFIG_DIR`), NOT the legacy

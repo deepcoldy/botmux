@@ -126,6 +126,7 @@ import { _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pendin
 const MY_APP_ID = 'app-bot-a';
 const MY_OPEN_ID = 'ou_bot_a_open_id';
 const OTHER_BOT_OPEN_ID = 'ou_bot_b_open_id';
+const OTHER_BOT_APP_ID = 'app-bot-b';
 const USER_OPEN_ID = 'ou_user_123';
 
 beforeEach(() => {
@@ -156,7 +157,7 @@ function setupBotState(opts?: {
   configAllowedUsers?: string[];
   restrictGrantCommands?: boolean;
   regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared' | 'chat-topic';
-	  regularGroupMentionMode?: 'always' | 'topic' | 'never';
+	  regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
 	  autoStartOnNewTopic?: boolean;
 	  autoGrantRequestCards?: boolean;
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
@@ -501,6 +502,14 @@ describe('isBotMentioned', () => {
     expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(false);
   });
 
+  it('does not treat another app_id object as this bot mention', () => {
+    const message = {
+      mentions: [{ key: '@_other', name: 'Other', id: { app_id: 'app-other' } }],
+      content: JSON.stringify({ text: '@Other hello' }),
+    };
+    expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(false);
+  });
+
   it('detects @mention in post content at tags (bot-sent messages)', () => {
     // Bot-sent post messages embed @mentions as inline `at` nodes in content,
     // NOT in the message.mentions array
@@ -568,6 +577,30 @@ describe('mentionsAnotherMember (ambient redirect carve-out)', () => {
       content: JSON.stringify({ text: '@Other 你看下' }),
     };
     expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(true);
+  });
+
+  it('returns true when another bot is @mentioned via app_id string form', () => {
+    const message = {
+      mentions: [{ key: '@_other', name: 'OtherBot', id: 'app-other-bot', id_type: 'app_id' }],
+      content: JSON.stringify({ text: '@OtherBot 你来答' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(true);
+  });
+
+  it('returns true when another bot is @mentioned via app_id object form', () => {
+    const message = {
+      mentions: [{ key: '@_other', name: 'OtherBot', id: { app_id: 'app-other-bot' } }],
+      content: JSON.stringify({ text: '@OtherBot 你来答' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(true);
+  });
+
+  it('returns false when only THIS bot is @mentioned via app_id string form', () => {
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: MY_APP_ID, id_type: 'app_id' }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(false);
   });
 
   it('returns false when only THIS bot is @mentioned via string-form id (no false redirect)', () => {
@@ -1999,6 +2032,31 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  it('shared follow-up with mention mode topic yields when the reply @mentions ANOTHER bot', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'topic' });
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 2 });
+    handlers.resolveReplyThreadAlias.mockReturnValue({ chatId: 'chat-reply-mode', sessionId: 'sess-chat' });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotB 这个交给你' }),
+      mentions: [{ key: '@_bot_b', name: 'BotB', id: OTHER_BOT_APP_ID, id_type: 'app_id' }],
+      rootId: 'msg-topic-alias-1',
+      threadId: 'msg-topic-alias-1',
+      messageId: 'msg-topic-alias-other-bot',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.resolveReplyThreadAlias).not.toHaveBeenCalled();
+  });
+
   it('shared follow-up thread reply WITHOUT @ is ignored by default (mention mode always → @ required even in topics)', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] }); // default = always
     mockGetChatMode.mockResolvedValue('group');
@@ -2072,6 +2130,30 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       anchor: 'owned-topic-root',
       larkAppId: MY_APP_ID,
     }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('mention mode topic: a reply inside an owned thread that @mentions ANOTHER bot is ignored — yields the turn', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'topic' });
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 2 });
+    handlers.resolveReplyThreadAlias.mockReturnValue(null);
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'owned-topic-root');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotB 你来看这个' }),
+      mentions: [{ key: '@_bot_b', name: 'BotB', id: { app_id: OTHER_BOT_APP_ID } }],
+      rootId: 'owned-topic-root',
+      threadId: 'owned-topic-root',
+      messageId: 'msg-topic-tier-other-bot',
+      chatId: 'chat-topic-tier-other-bot',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 

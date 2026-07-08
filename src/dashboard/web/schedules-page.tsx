@@ -11,11 +11,14 @@ export interface ScheduleFilters {
   enabledOnly: boolean;
 }
 
-export function fmtScheduleDate(s?: string): string {
+export function fmtScheduleDate(s?: string, timeZone?: string): string {
   if (!s) return '—';
   try {
     const d = new Date(s);
-    return d.toLocaleString();
+    // Render in the scheduler's effective zone (with a short zone suffix so a
+    // viewer in another zone isn't misled). Empty tz ⇒ browser-local (legacy).
+    const opts = timeZone ? { timeZone, timeZoneName: 'short' as const } : undefined;
+    return d.toLocaleString(undefined, opts);
   } catch { return s; }
 }
 
@@ -47,6 +50,7 @@ function repeatLabel(s: ScheduleRow): string {
 function SchedulesPage() {
   const tr = useT();
   const scheduleRows = useStoreSelector(snapshot => [...snapshot.schedules.values()] as ScheduleRow[]);
+  const scheduleTz = useStoreSelector(snapshot => snapshot.scheduleTimeZone);
   const [filters, setFilters] = useState<ScheduleFilters>({ q: '', kind: '', enabledOnly: false });
   const [pending, setPending] = useState<string | null>(null);
   const labels = {
@@ -142,8 +146,8 @@ function SchedulesPage() {
               <td data-label={labels.bot}>{s.botName ?? s.larkAppId ?? '-'}</td>
               <td data-label={labels.schedule}><code>{s.parsed?.display ?? '?'}</code></td>
               <td data-label={labels.delivery}>{deliveryLabel(s, tr)}</td>
-              <td data-label={labels.next}>{fmtScheduleDate(s.nextRunAt)}</td>
-              <td data-label={labels.last}>{fmtScheduleDate(s.lastRunAt)} {s.lastStatus === 'error' ? '⚠️' : ''}</td>
+              <td data-label={labels.next}>{fmtScheduleDate(s.nextRunAt, scheduleTz)}</td>
+              <td data-label={labels.last}>{fmtScheduleDate(s.lastRunAt, scheduleTz)} {s.lastStatus === 'error' ? '⚠️' : ''}</td>
               <td data-label={labels.repeat}>{repeatLabel(s)}</td>
               <td data-label={labels.enabled}>{s.enabled ? '✓' : '✗'}</td>
               <td className="actions-cell" data-label={labels.actions}>

@@ -8,7 +8,7 @@
  * Run:  pnpm vitest run test/scheduler.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseNaturalSchedule, parseSchedule, computeNextRun, extractDeliveryMode } from '../src/core/scheduler.js';
+import { parseNaturalSchedule, parseSchedule, computeNextRun, extractDeliveryMode, planCronRealign } from '../src/core/scheduler.js';
 
 // ─── Helper ──────────────────────────────────────────────────────────────────
 
@@ -466,6 +466,30 @@ describe('One-shot Chinese patterns', () => {
     expect(runAt.getHours()).toBe(9);
     expect(runAt.getMinutes()).toBe(0);
   });
+
+  it('明天X点 honors an explicit schedule timezone (host-independent wall clock)', () => {
+    // The one-shot「明天HH:MM」path now resolves to scheduleTimeZone() (env →
+    // config → host), NOT host-local setHours(). With an explicit override the
+    // wall clock must land at HH:MM in THAT zone regardless of the host TZ — the
+    // exact bug being fixed (on a non-+8 host, cron used Asia/Shanghai while
+    // one-shot used host-local, so they disagreed).
+    const prev = process.env.BOTMUX_SCHEDULE_TIMEZONE;
+    process.env.BOTMUX_SCHEDULE_TIMEZONE = 'Asia/Shanghai';
+    try {
+      const result = parseNaturalSchedule('明天9:00 看下邮件');
+      expect(result).not.toBeNull();
+      const runAt = new Date(result!.parsed.runAt!);
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'Asia/Shanghai', hourCycle: 'h23', hour: '2-digit', minute: '2-digit',
+      }).formatToParts(runAt);
+      expect(parts.find(p => p.type === 'hour')!.value).toBe('09');
+      expect(parts.find(p => p.type === 'minute')!.value).toBe('00');
+      expect(runAt.getTime()).toBeGreaterThan(Date.now());
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SCHEDULE_TIMEZONE;
+      else process.env.BOTMUX_SCHEDULE_TIMEZONE = prev;
+    }
+  });
 });
 
 // ─── New: parseSchedule() — bare schedule parser for CLI ─────────────────────
@@ -547,12 +571,68 @@ describe('computeNextRun', () => {
     expect(next).toBeNull();
   });
 
-  it('cron: returns next wall-clock occurrence', () => {
-    // 0 9 * * * — daily at 09:00
+  it('cron: returns next wall-clock occurrence in the HOST-LOCAL timezone', () => {
+    // 0 9 * * * — daily at 09:00. computeNextRun now uses the host's local timezone
+    // (scheduleTimeZone()), matching how one-shot「明天9点」is parsed via setHours().
+    // Pre-fix it was hard-coded to Asia/Shanghai, so on any non-+8 host getHours()
+    // would NOT be 9. Host-independent assertion: both sides read the same local zone.
     const next = computeNextRun({ kind: 'cron', expr: '0 9 * * *', display: '每天 9:00' });
     expect(next).toBeTruthy();
     const nextDate = new Date(next!);
-    // Since timezone is Asia/Shanghai, getUTCHours should be 1 (09 - 08) except during DST (none in CN)
     expect(nextDate.getTime()).toBeGreaterThan(Date.now());
+    expect(nextDate.getHours()).toBe(9);
+    expect(nextDate.getMinutes()).toBe(0);
+  });
+});
+
+// ─── Timezone-change re-alignment (Codex review finding #1) ──────────────────
+
+describe('planCronRealign — recompute cron nextRunAt on timezone change', () => {
+  const STALE = '2020-01-01T00:00:00.000Z'; // clearly in the past & wrong-zone
+  const mk = (over: Record<string, unknown>) => ({
+    id: 'x', name: 'x', enabled: true, nextRunAt: STALE, ...over,
+  } as any);
+
+  it('recomputes an enabled cron task to a future instant; skips interval/once/disabled', () => {
+    const tasks = [
+      mk({ id: 'cron1', parsed: { kind: 'cron', expr: '0 9 * * *', display: '每天 9:00' } }),
+      mk({ id: 'interval1', parsed: { kind: 'interval', minutes: 30, display: 'every 30m' } }),
+      mk({ id: 'once1', parsed: { kind: 'once', runAt: STALE, display: 'once' } }),
+      mk({ id: 'cronDisabled', enabled: false, parsed: { kind: 'cron', expr: '0 9 * * *', display: '每天 9:00' } }),
+    ];
+    const plan = planCronRealign(tasks);
+    // Only the enabled cron task is re-planned.
+    expect(plan.map(p => p.id)).toEqual(['cron1']);
+    expect(new Date(plan[0].nextRunAt).getTime()).toBeGreaterThan(Date.now());
+    expect(plan[0].nextRunAt).not.toBe(STALE);
+  });
+
+  it('honors the ownership predicate (skips tasks another daemon owns)', () => {
+    const tasks = [
+      mk({ id: 'mine', parsed: { kind: 'cron', expr: '0 9 * * *', display: 'd' } }),
+      mk({ id: 'theirs', parsed: { kind: 'cron', expr: '0 9 * * *', display: 'd' } }),
+    ];
+    const plan = planCronRealign(tasks, t => t.id === 'mine');
+    expect(plan.map(p => p.id)).toEqual(['mine']);
+  });
+
+  it('is idempotent: a cron task already at the correct next-run is not re-planned', () => {
+    const parsed = { kind: 'cron' as const, expr: '0 9 * * *', display: 'd' };
+    const current = computeNextRun(parsed)!; // already the correct next occurrence
+    const plan = planCronRealign([mk({ id: 'cron1', parsed, nextRunAt: current })]);
+    expect(plan).toEqual([]);
+  });
+
+  it('startup future-only predicate skips PAST-DUE cron so catch-up is preserved', () => {
+    // startScheduler() re-aligns only future-dated cron; a past-due nextRunAt is
+    // left for the tick catch-up/fast-forward path (don't drop a missed run).
+    const now = Date.now();
+    const parsed = { kind: 'cron' as const, expr: '0 9 * * *', display: 'd' };
+    const tasks = [
+      mk({ id: 'future', parsed, nextRunAt: new Date(now + 3_600_000).toISOString() }),
+      mk({ id: 'pastdue', parsed, nextRunAt: new Date(now - 3_600_000).toISOString() }),
+    ];
+    const plan = planCronRealign(tasks, t => !!t.nextRunAt && new Date(t.nextRunAt).getTime() > Date.now());
+    expect(plan.map(p => p.id)).toEqual(['future']);
   });
 });

@@ -53,9 +53,10 @@
 
 团队里多个人、各自的机器人一起干活。
 
-- **飞书的限制**：不同人名下的机器人**默认互相感知不到**（收不到对方在群里的消息）。
-- **方式一 · introduce**：先 `@大家的 bot /introduce` 让它们彼此建立感知（登记 open_id），然后由一个**主机器人**给其他机器人分工协作。
-- **方式二 · 团队功能（推荐，免 introduce）**：在 Dashboard「团队」里把多个人名下的 Bot 打上标签、拉到一个团队，**跨部署互相发现**，直接勾选拉群开协作——不用每次都 introduce。
+- **飞书的限制**：bot 仍然不会被对方普通消息触发，协作接力必须显式 `--mention` 对方。
+- **默认发现**：`botmux bots list` 会通过群机器人列表发现当前群里的 bot，并显示 `mentionable`；模型也会在 `<available_bots>` 里看到可接力对象。
+- **团队功能（推荐）**：在 Dashboard「团队」里把多个人名下的 Bot 打上标签、拉到一个团队，**跨部署互相发现**，直接勾选拉群开协作——主路径不再需要 `/introduce`。
+- **旧版兜底**：只有外部 bot 缺失或 `mentionable=false` 时，再发 `@大家的 bot /introduce` 手动登记一次。
 
 ![Dashboard 团队 · 跨部署协作](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033301213_dash-team.png)
 

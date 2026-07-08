@@ -73,6 +73,13 @@ export interface GlobalConfig {
    *  host:port URLs. Off by default — only local links are emitted. Gated in
    *  buildTerminalUrl / publicWebhookUrl via isRemoteAccessEnabled(). */
   remoteAccess?: boolean;
+  /** Machine-wide timezone for USER scheduled tasks (scheduler). An IANA name
+   *  (e.g. 'Asia/Shanghai'). Overrides the host's auto-detected local zone for
+   *  cron firing, one-shot「明天HH:MM」parsing, and all schedule displays —
+   *  see utils/timezone.ts `scheduleTimeZone()`. Absent ⇒ follow the host zone.
+   *  Stored lenient here; final IANA validity is enforced on write
+   *  (settings-write-applier) and re-checked at resolve time. */
+  scheduleTimeZone?: string;
 }
 
 export interface GlobalSkillConfig {
@@ -324,6 +331,12 @@ export function readGlobalConfig(): GlobalConfig {
   const skills = readGlobalSkills(raw.skills);
   if (skills) out.skills = skills;
   if (typeof raw.remoteAccess === 'boolean') out.remoteAccess = raw.remoteAccess;
+  // Lenient: keep any non-empty string. IANA validity is enforced on write and
+  // re-checked in scheduleTimeZone() (invalid ⇒ falls back to the host zone),
+  // so a stale/hand-edited bad value degrades gracefully rather than crashing.
+  if (typeof raw.scheduleTimeZone === 'string' && raw.scheduleTimeZone.trim()) {
+    out.scheduleTimeZone = raw.scheduleTimeZone.trim();
+  }
   readCache = { path, value: out, at: Date.now() };
   return out;
 }

@@ -1,10 +1,9 @@
 // test/tunnel-client-ip-family.test.ts
-// 隧道客户端的协议族逻辑：绑定里的 ipFamily 透传给控制/数据连接；
-// 连续连不上时隔次换协议族试探，换族连通即采纳并落盘为新默认。
+// 隧道客户端不再强制单协议族：WebSocket 构造始终不传 family，
+// 让 Node 内置 happy-eyeballs 自动选最优路径（IPv4/IPv6 谁先到用谁）。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const { FakeWebSocket } = vi.hoisted(() => {
-  // vi.hoisted 在模块 import 初始化前执行，引用不到 node:events —— 手写极简事件类
   class FakeWebSocket {
     static OPEN = 1;
     static instances: FakeWebSocket[] = [];
@@ -34,18 +33,16 @@ const { FakeWebSocket } = vi.hoisted(() => {
 });
 vi.mock('ws', () => ({ WebSocket: FakeWebSocket, createWebSocketStream: vi.fn() }));
 
-const setPlatformIpFamily = vi.fn();
 vi.mock('../src/platform/binding.js', () => ({
   setPlatformTeams: vi.fn(),
-  setPlatformIpFamily: (...a: unknown[]) => setPlatformIpFamily(...a),
   clearPlatformBinding: vi.fn(),
 }));
 
 import { startPlatformTunnelClient } from '../src/platform/tunnel-client.js';
 
-function makeOpts(ipFamily?: 4 | 6) {
+function makeOpts() {
   return {
-    binding: { platformUrl: 'https://platform.test', machineId: 'm-1', machineToken: 'tok', ipFamily },
+    binding: { platformUrl: 'https://platform.test', machineId: 'm-1', machineToken: 'tok' },
     getDashboardPort: () => 7891,
     getDashboardToken: () => 'dt',
     getVersion: () => '0.0.0-test',
@@ -53,71 +50,61 @@ function makeOpts(ipFamily?: 4 | 6) {
   };
 }
 
-describe('tunnel-client 协议族', () => {
+describe('tunnel-client 不强制协议族', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     FakeWebSocket.instances.length = 0;
-    setPlatformIpFamily.mockReset();
   });
   afterEach(() => {
     vi.useRealTimers();
   });
 
-  it('绑定里的 ipFamily 透传给控制连接', () => {
-    const handle = startPlatformTunnelClient(makeOpts(6));
-    expect(FakeWebSocket.instances[0].opts.family).toBe(6);
+  it('控制连接不传 family，让 happy-eyeballs 自动选路', () => {
+    const handle = startPlatformTunnelClient(makeOpts());
+    expect(FakeWebSocket.instances.length).toBeGreaterThan(0);
+    for (const inst of FakeWebSocket.instances) {
+      expect(inst.opts.family).toBeUndefined();
+    }
     handle.stop();
   });
 
-  it('连续 3 次连不上后隔次换协议族；换族连通即落盘并用于数据流', async () => {
+  it('重连时仍然不传 family', async () => {
     const handle = startPlatformTunnelClient(makeOpts());
     const inst = FakeWebSocket.instances;
-    // 前 3 次按默认协议族拨，全部连不上（close 且从未 open）
-    for (let i = 0; i < 3; i++) {
-      expect(inst[i].opts.family).toBeUndefined();
-      inst[i].emit('close');
-      await vi.advanceTimersByTimeAsync(1000 * 2 ** i); // 重连退避 1s/2s/4s
+    // 第一次拨号失败 → 触发重连
+    inst[0].emit('close');
+    await vi.advanceTimersByTimeAsync(2000);
+    // 第二次拨号也不传 family
+    expect(FakeWebSocket.instances.length).toBeGreaterThan(1);
+    for (const s of FakeWebSocket.instances) {
+      expect(s.opts.family).toBeUndefined();
     }
-    // 第 4 次：换 IPv6 试探
-    expect(inst.length).toBe(4);
-    expect(inst[3].opts.family).toBe(6);
-    inst[3].readyState = FakeWebSocket.OPEN;
-    inst[3].emit('open');
-    expect(setPlatformIpFamily).toHaveBeenCalledWith(6);
-    // 数据流跟随已采纳的协议族
-    inst[3].emit('message', JSON.stringify({ type: 'open-stream', streamId: 's-1' }));
-    const dials = inst.slice(4);
-    expect(dials.length).toBeGreaterThan(0);
-    expect(dials.every((d) => d.opts.family === 6)).toBe(true);
     handle.stop();
   });
 
-  it('已固定 IPv6 但连不上时，试探切回 IPv4', async () => {
-    const handle = startPlatformTunnelClient(makeOpts(6));
-    const inst = FakeWebSocket.instances;
-    for (let i = 0; i < 3; i++) {
-      expect(inst[i].opts.family).toBe(6);
-      inst[i].emit('close');
-      await vi.advanceTimersByTimeAsync(1000 * 2 ** i);
-    }
-    expect(inst[3].opts.family).toBe(4);
-    inst[3].readyState = FakeWebSocket.OPEN;
-    inst[3].emit('open');
-    expect(setPlatformIpFamily).toHaveBeenCalledWith(4);
-    handle.stop();
-  });
-
-  it('连上后正常掉线不计入失败，不触发换族', async () => {
+  it('数据流也不传 family', async () => {
     const handle = startPlatformTunnelClient(makeOpts());
     const inst = FakeWebSocket.instances;
-    for (let i = 0; i < 5; i++) {
-      inst[i].readyState = FakeWebSocket.OPEN;
-      inst[i].emit('open'); // 每次都连得上
-      inst[i].emit('close'); // 然后掉线
-      await vi.advanceTimersByTimeAsync(1000); // 连上过 → 退避回到最小 1s
+    // 让控制连接握手成功
+    inst[0].readyState = FakeWebSocket.OPEN;
+    inst[0].emit('open');
+    // 平台下发 open-stream
+    inst[0].emit('message', JSON.stringify({ type: 'open-stream', streamId: 's-1' }));
+    const dataDials = FakeWebSocket.instances.slice(1);
+    expect(dataDials.length).toBeGreaterThan(0);
+    for (const d of dataDials) {
+      expect(d.opts.family).toBeUndefined();
     }
-    expect(inst.every((s) => s.opts.family === undefined)).toBe(true);
-    expect(setPlatformIpFamily).not.toHaveBeenCalled();
+    handle.stop();
+  });
+
+  it('绑定文件里有 ipFamily 也不影响（隧道忽略该字段）', () => {
+    const opts = makeOpts();
+    (opts.binding as Record<string, unknown>).ipFamily = 4;
+    const handle = startPlatformTunnelClient(opts);
+    for (const inst of FakeWebSocket.instances) {
+      expect(inst.opts.family).toBeUndefined();
+    }
     handle.stop();
   });
 });

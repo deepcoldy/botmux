@@ -1,7 +1,7 @@
 /**
  * seed-adapter.test.ts
  *
- * Seed CLI (`@bytedance-seed/claude-code`) is a Claude Code fork that reuses the
+ * Seed CLI is a Claude Code fork that reuses the
  * entire Claude-family adapter, only relocating its data root to the package's
  * `.claude-runtime` and renaming the binary. These tests lock in the variant
  * wiring: data-root derivation, CLAUDE_CONFIG_DIR injection, the `.claude.json`

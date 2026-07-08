@@ -355,6 +355,14 @@ EOF
 botmux send --files /tmp/report.pdf "报告已生成，请查收附件。"
 \`\`\`
 
+### 带视频预览
+
+\`--videos <path>\` 发送本地 H.264 MP4 预览消息，可重复；\`--video-covers <path>\` 按顺序提供每个视频的封面图片（当前必须显式提供 cover）。视频会作为飞书/Lark media message 单独发送；正文存在时先发正文卡片，再发视频。
+
+\`\`\`bash
+botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "RRH replay preview"
+\`\`\`
+
 ### @mention 其他机器人协作
 
 \`\`\`bash
@@ -434,6 +442,8 @@ botmux send --top-level --chat-id oc_xxxxxxxxxxxx "📦 自动推送内容..."
 | \`--content-file <path>\` | 从文件读取内容（优先于 stdin/positional） |
 | \`--images <path>\` | 内联图片，可重复多次 |
 | \`--files <path>\` | 附件文件，可重复多次，每个单独发送 |
+| \`--videos <path>\` | 视频预览 MP4，可重复；每个必须有对应 \`--video-covers\` |
+| \`--video-covers <path>\` | 视频封面图片，可重复，按顺序对应 \`--videos\` |
 | \`--mention <open_id[:name]>\` | @mention，可重复。带 \`:name\` 时文本里的 \`@name\` 会被替换成 \<at\> 标签；只传 open_id 则在消息末尾追加 @。用 \`botmux bots list\` 查 open_id |
 | \`--mention-back\` | @ 回本轮触发消息的发送者（open_id 自动从会话取）。满足 @ 硬门 |
 | \`--no-mention\` | 明确声明本条不 @ 任何人。满足 @ 硬门 |

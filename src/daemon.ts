@@ -917,6 +917,10 @@ const workflowAttemptResumes = new AttemptResumeManager({
         botName: bot.botName ?? terminal.botName,
         botOpenId: bot.botOpenId,
         locale: botLocale(bot.config),
+        sandbox: terminal.sandbox ?? (bot.config.sandbox === true),
+        sandboxHidePaths: terminal.sandboxHidePaths ?? bot.config.sandboxHidePaths ?? [],
+        sandboxReadonlyPaths: terminal.sandboxReadonlyPaths ?? bot.config.sandboxReadonlyPaths ?? [],
+        sandboxNetwork: terminal.sandboxNetwork ?? (bot.config.sandboxNetwork !== false),
       };
     } catch {
       return undefined;

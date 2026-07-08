@@ -12,12 +12,16 @@ Multiple Lark bots can run on the same machine, and each bot can be bound to a d
 
 ## Letting bots know each other
 
-By default, bots **don't receive** each other's regular messages in the group. To let them relay and collaborate:
+The main path no longer requires a manual `/introduce`: botmux discovers bots in the current Lark group via the group bot roster by default. Collaboration groups created with `/group`, the Dashboard "New Group" flow, or the Teams panel also use the team roster so cross-deployment bots can recognize each other.
 
-1. First send `@botA @botB /introduce` once — they register each other's open_id (any @ order, extra text allowed).
-2. After that, each bot can explicitly @ the other in its own session with `botmux send --mention <the other's open_id>`, triggering the other to relay.
+For handoffs, have the model check:
 
-> A hard fact about cross-bot collaboration: **if you don't `--mention` the other bot, it won't be triggered at all**. Get the other bot's open_id from `botmux bots list` or from the `<available_bots>` block in messages.
+- `botmux bots list`: lists bots in the current group, capability tags, `openId`, and `mentionable`.
+- The `<available_bots>` block in the message context: hints which bots can be relayed to.
+
+After that, a bot can explicitly @ the other from its own session with `botmux send --mention <the other's openId>`, triggering the relay.
+
+> A hard fact about cross-bot collaboration: **if you don't `--mention` the other bot, it won't be triggered at all**. `/introduce` is still kept as a legacy / external-bot fallback: use `@botA @botB /introduce` only when the target is missing from `botmux bots list` or shows `mentionable=false`.
 
 ## Typical scenarios
 

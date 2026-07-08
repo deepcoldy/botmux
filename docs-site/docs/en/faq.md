@@ -47,7 +47,7 @@ Yes. Both Feishu (feishu.cn) and Lark (international, larksuite.com) work: when 
 
 ## How do multiple bots collaborate with each other?
 
-First run `@botA @botB /introduce` to register each other's open_id; afterwards, use `botmux send --mention <the other's open_id>` to explicitly trigger the other bot. Without `--mention`, the other bot won't be triggered.
+Use `botmux bots list` or the `<available_bots>` block to find the target bot's `openId`, then explicitly trigger it with `botmux send --mention <the other's openId>`. Without `--mention`, the other bot won't be triggered. `/introduce` is now only a legacy / external-bot fallback: use it when the target is missing or shows `mentionable=false`.
 
 ## Does restarting the daemon lose context?
 

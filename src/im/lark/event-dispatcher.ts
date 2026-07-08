@@ -908,14 +908,21 @@ export function mentionsAnotherMember(larkAppId: string, message: any): boolean 
   const mentions: any[] = message.mentions ?? [];
   for (const m of mentions) {
     // mentionOpenId() tolerates both the WS event object shape ({ open_id }) and
-    // the REST bare-string shape (a bot @ is a "cli_…" string). A naked
-    // m.id.open_id silently misses the string form → the redirect carve-out
-    // breaks and the ambient bot keeps answering instead of backing off.
+    // the REST bare-string shape. Bot mentions may also arrive as app_id
+    // (id_type='app_id' / { app_id }) with no open_id; isBotMentioned handles
+    // that shape via mentionMatchesBot(), so the redirect/yield check must too.
     const oid = mentionOpenId(m);
-    if (!oid) continue;
-    if (oid === botOpenId) continue; // that's me
-    if (oid === 'all') continue;     // @all → everyone incl. me
-    return true;                     // a specific other member
+    if (oid) {
+      if (oid === botOpenId) continue; // that's me
+      if (oid === 'all') continue;     // @all → everyone incl. me
+      return true;                     // a specific other member
+    }
+    const appId = mentionAppId(m);
+    if (appId) {
+      if (appId === larkAppId) continue; // that's me, addressed by app_id
+      if (appId === 'all') continue;
+      return true;                       // another bot addressed by app_id
+    }
   }
 
   // 2. inline `at` nodes in post content (bot-sent / rich messages)
@@ -2012,13 +2019,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // "@ required" so this fold-back is skipped (non-@ thread chatter falls
         // through to the gate below and is ignored — only an explicit @ continues
         // a shared topic); 'topic', 'never' and 'ambient' enable the seamless
-        // no-@ fold-back. Carve-out: under 'ambient', a non-@ reply that @mentions
-        // another specific member (person/bot) is a redirect to someone else →
-        // back off, don't fold it in (mentionsAnotherMember). 'never'
-        // (unconditional) and 'topic' are unaffected.
+        // no-@ fold-back. Carve-out: under 'topic' / 'ambient', a non-@ reply
+        // that @mentions another specific member (person/bot) is a redirect to
+        // someone else → back off, don't fold it in (mentionsAnotherMember).
+        // 'never' stays unconditional by design.
+        const mentionModeForAlias = resolveGroupMentionMode(larkAppId);
         if (!explicitlyMentionedThisBot
-            && resolveGroupMentionMode(larkAppId) !== 'always'
-            && !(resolveGroupMentionMode(larkAppId) === 'ambient' && mentionsAnotherMember(larkAppId, message))
+            && mentionModeForAlias !== 'always'
+            && !((mentionModeForAlias === 'topic' || mentionModeForAlias === 'ambient') && mentionsAnotherMember(larkAppId, message))
             && routing.scope === 'thread' && message.root_id && message.thread_id && chatType === 'group') {
           const alias = handlers.resolveReplyThreadAlias?.(message.root_id, chatId, larkAppId) ?? null;
           if (alias) {
@@ -2171,7 +2179,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           //   • 'topic' — only inside a topic the bot already owns: a non-@ reply
           //     INSIDE such a thread (new-topic / 话题群 thread the bot owns, or a
           //     shared-topic alias via replyRootId) continues without @, while a
-          //     brand-new top-level conversation still requires @.
+          //     brand-new top-level conversation still requires @. If the user
+          //     explicitly @mentions another member/bot without @ing this bot,
+          //     treat it as a hand-off and stay quiet.
           // Both gated on isAllowed so restricted groups still only react to
           // permitted senders. (The shared fold-back's replyRootId is already
           // handled by the first clause.)
@@ -2197,7 +2207,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             || (isAllowed && mentionMode === 'never')
             || (isAllowed && mentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message))
             || ownedTopicGroupFollowup
-            || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id)
+            || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsAnotherMember(larkAppId, message))
             || (ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
           if (!relax) {
             const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId, humanSenderUnionId);

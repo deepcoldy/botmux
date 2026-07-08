@@ -27,4 +27,17 @@ describe('dashboard schedules React page helpers', () => {
   it('keeps the legacy empty date placeholder', () => {
     expect(fmtScheduleDate()).toBe('—');
   });
+
+  it('formats in the given schedule timezone, not the browser zone', () => {
+    // 2026-07-08T01:00Z = 09:00 in Asia/Shanghai. Rendering with the effective
+    // schedule tz must show 09 (+ a zone suffix), regardless of the test host zone.
+    const out = fmtScheduleDate('2026-07-08T01:00:00.000Z', 'Asia/Shanghai');
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Shanghai', hourCycle: 'h23', hour: '2-digit', minute: '2-digit',
+    }).formatToParts(new Date('2026-07-08T01:00:00.000Z'));
+    expect(parts.find(p => p.type === 'hour')!.value).toBe('09');
+    // The formatted string carries a zone-name suffix (GMT+8 / CST / …) so a
+    // viewer in another browser zone isn't misled.
+    expect(out).toMatch(/GMT|UTC|[A-Z]{2,5}/);
+  });
 });

@@ -335,6 +335,10 @@ function snapshotFromConfig(
     name?: string;
     workingDir?: string;
     cliPathOverride?: string;
+    sandbox?: boolean;
+    sandboxHidePaths?: string[];
+    sandboxReadonlyPaths?: string[];
+    sandboxNetwork?: boolean;
   },
 ): BotSnapshot {
   return {
@@ -343,6 +347,10 @@ function snapshotFromConfig(
     displayName: cfg.name ?? requestedName,
     ...(cfg.workingDir ? { workingDir: cfg.workingDir } : {}),
     ...(cfg.cliPathOverride ? { cliPathOverride: cfg.cliPathOverride } : {}),
+    ...(cfg.sandbox === true ? { sandbox: true } : {}),
+    ...(cfg.sandboxHidePaths?.length ? { sandboxHidePaths: [...cfg.sandboxHidePaths] } : {}),
+    ...(cfg.sandboxReadonlyPaths?.length ? { sandboxReadonlyPaths: [...cfg.sandboxReadonlyPaths] } : {}),
+    ...(cfg.sandboxNetwork === false ? { sandboxNetwork: false } : {}),
   };
 }
 

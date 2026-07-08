@@ -19,6 +19,7 @@ import {
   type WorkerHandle,
   type WorkerProcessFactory,
 } from './daemon-spawn.js';
+import { workflowSandboxInitFields } from './spawn-policy.js';
 import {
   isPathInsideDir,
   isValidPathSegment,
@@ -69,6 +70,10 @@ export type AttemptResumeBot = {
   botName?: string;
   botOpenId?: string;
   locale?: Locale;
+  sandbox?: boolean;
+  sandboxHidePaths?: string[];
+  sandboxReadonlyPaths?: string[];
+  sandboxNetwork?: boolean;
 };
 
 export type AttemptResumeStartResult =
@@ -294,6 +299,7 @@ export class AttemptResumeManager {
       resume: true,
       originalSessionId,
       ...(terminal.terminal.cliSessionId ? { cliSessionId: terminal.terminal.cliSessionId } : {}),
+      ...workflowSandboxInitFields(bot),
       larkAppId: bot.larkAppId,
       larkAppSecret: bot.larkAppSecret,
       botName: bot.botName ?? terminal.terminal.botName,

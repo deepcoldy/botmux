@@ -382,14 +382,14 @@ function buildHermesBotmuxHints(locale?: Locale): string[] {
   if (locale === 'en') {
     return [
       'You are running in a Feishu/Lark chat through botmux. For ordinary text replies, write the user-facing answer as your final assistant message; botmux automatically forwards that final output to Feishu/Lark.',
-      'Do not call `botmux send` for normal text answers. Use `botmux send` only for special delivery needs: files/images, voice, cross-chat/top-level sends, or explicit mention routing to another person/bot.',
+      'Do not call `botmux send` for normal text answers. Use `botmux send` only for special delivery needs: files/images/videos, voice, cross-chat/top-level sends, or explicit mention routing to another person/bot.',
       '`botmux send` / `botmux history` / `botmux quoted` / `botmux bots` are shell commands installed in $PATH; run them via Bash/terminal tools when needed.',
       'If you already used `botmux send` for special delivery in this turn, do not put a second copy of the answer, messageId, or send-success receipt in the final assistant message.',
     ];
   }
   return [
     '你运行在飞书（Lark）聊天中。普通文字回复请直接写在 assistant final 里，botmux 会自动把 final_output 转发到飞书。',
-    '普通文本答案不要调用 `botmux send`。只有需要图片/文件/语音、跨群或顶层发送、显式 @ 某人/某 bot 等特殊投递能力时，才使用 `botmux send`。',
+    '普通文本答案不要调用 `botmux send`。只有需要图片/文件/视频/语音、跨群或顶层发送、显式 @ 某人/某 bot 等特殊投递能力时，才使用 `botmux send`。',
     '`botmux send` / `botmux history` / `botmux quoted` / `botmux bots` 是已安装在 $PATH 的 shell 命令；需要时通过 Bash/terminal 工具执行。',
     '如果本轮已经为了特殊投递调用过 `botmux send`，final 里不要再写第二份正文、messageId 或“发送成功/已处理”回执。',
   ];
@@ -397,9 +397,9 @@ function buildHermesBotmuxHints(locale?: Locale): string[] {
 
 function hermesFollowupReminder(locale?: Locale): string {
   if (locale === 'en') {
-    return 'For ordinary text replies, do not call `botmux send`; put the user-facing answer in final and botmux will forward it to Feishu/Lark. Use `botmux send` only for special delivery such as files/images, voice, cross-chat/top-level sends, or explicit mention routing. If already used, do not add a second answer or send-success receipt in final.';
+    return 'For ordinary text replies, do not call `botmux send`; put the user-facing answer in final and botmux will forward it to Feishu/Lark. Use `botmux send` only for special delivery such as files/images/videos, voice, cross-chat/top-level sends, or explicit mention routing. If already used, do not add a second answer or send-success receipt in final.';
   }
-  return '普通文字回复不要调用 `botmux send`；直接把给用户看的答案写在 final，botmux 会自动转发到飞书。只有图片/文件/语音、跨群/顶层发送、特殊 @ 路由等特殊投递才用 `botmux send`；如果本轮已经用过，不要在 final 里再写第二份答案或发送成功回执。';
+  return '普通文字回复不要调用 `botmux send`；直接把给用户看的答案写在 final，botmux 会自动转发到飞书。只有图片/文件/视频/语音、跨群/顶层发送、特殊 @ 路由等特殊投递才用 `botmux send`；如果本轮已经用过，不要在 final 里再写第二份答案或发送成功回执。';
 }
 
 export function buildNewTopicPrompt(

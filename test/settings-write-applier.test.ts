@@ -309,6 +309,53 @@ describe('applySettingsWrite — validation errors', () => {
   });
 });
 
+describe('applySettingsWrite — scheduleTimeZone', () => {
+  it('persists a valid IANA zone via mergeGlobalConfig', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ scheduleTimeZone: 'Asia/Shanghai' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ scheduleTimeZone: 'Asia/Shanghai' });
+  });
+
+  it('trims surrounding whitespace before persisting', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ scheduleTimeZone: '  America/New_York  ' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ scheduleTimeZone: 'America/New_York' });
+  });
+
+  it('rejects an invalid zone → invalid_scheduleTimeZone (no write)', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ scheduleTimeZone: 'Mars/Phobos' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('invalid_scheduleTimeZone');
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-string zone → invalid_scheduleTimeZone', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ scheduleTimeZone: 42 }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('invalid_scheduleTimeZone');
+  });
+
+  it("clears the override on '' → mergeGlobalConfig({ scheduleTimeZone: null })", async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ scheduleTimeZone: '' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ scheduleTimeZone: null });
+  });
+
+  it('clears the override on null → mergeGlobalConfig({ scheduleTimeZone: null })', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ scheduleTimeZone: null }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ scheduleTimeZone: null });
+  });
+});
+
 describe('applySettingsWrite — IO surface', () => {
   it('does not touch maintenance merge when only dashboard fields are present', async () => {
     const deps = makeDeps();

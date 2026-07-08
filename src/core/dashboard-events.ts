@@ -10,6 +10,7 @@ export type DashboardEvent =
   | { type: 'schedule.updated';  body: { id: string; patch: Record<string, any> } }
   | { type: 'schedule.deleted';  body: { id: string } }
   | { type: 'schedule.fired';    body: { id: string; runAt: number; status: 'ok'|'error'; error?: string } }
+  | { type: 'schedule.timezone'; body: { timezone: string } }
   | { type: 'heartbeat';         body: { ts: number } };
 
 export type Subscriber = (event: DashboardEvent) => void;

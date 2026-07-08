@@ -16,6 +16,10 @@ export type AttemptTerminalSidecar = {
   botName?: string;
   cliId?: string;
   workingDir?: string;
+  sandbox?: boolean;
+  sandboxHidePaths?: string[];
+  sandboxReadonlyPaths?: string[];
+  sandboxNetwork?: boolean;
   logPath?: string;
   startedAt: number;
   updatedAt: number;

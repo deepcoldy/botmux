@@ -16,6 +16,7 @@
 
 import { Cron } from 'croner';
 import type { ParsedSchedule } from '../types.js';
+import { scheduleTimeZone } from '../utils/timezone.js';
 import type {
   ButtonState,
   PaginationMeta,
@@ -23,7 +24,6 @@ import type {
   StatusDot,
 } from './card-model-types.js';
 
-const DEFAULT_TIMEZONE = 'Asia/Shanghai';
 const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 100;
 const DEFAULT_PROMPT_TRUNCATE = 200;
@@ -69,7 +69,7 @@ export interface ScheduleFilterQuery extends PaginationParams {
 export interface RowRenderContext {
   /** Epoch ms — required so relative-time outputs are deterministic. */
   nowMs: number;
-  /** IANA timezone for cron next-run math; defaults to 'Asia/Shanghai'. */
+  /** IANA timezone for cron next-run math; defaults to the host's local zone (scheduleTimeZone()). */
   timezone?: string;
   /** Cap prompt length in detail DTO; defaults to 200. */
   promptTruncateAt?: number;
@@ -273,9 +273,10 @@ export function toScheduleDetailDto(task: ScheduleCardTaskInput, ctx: RowRenderC
  *  - `once`:  one entry if `runAt >= nowMs` AND `lastRunAt` is absent; else [].
  *  - `interval`: minutes>0 required; base = lastRunAt ?? nowMs; aligns to first
  *               future run > nowMs.
- *  - `cron`:  uses `croner` with `Asia/Shanghai` (or override) timezone.
+ *  - `cron`:  uses `croner` with the host's local timezone (or an injected override).
  *
- * Pure: nowMs + timezone injected; no implicit clock reads.
+ * Pure w.r.t. the clock: nowMs is injected. `timezone` is injected too; when
+ * omitted it falls back to the host's local zone (scheduleTimeZone()).
  */
 export function computeNextNRuns(
   task: ScheduleCardTaskInput,
@@ -283,7 +284,7 @@ export function computeNextNRuns(
   ctx: { nowMs: number; timezone?: string },
 ): string[] {
   if (n <= 0) return [];
-  const tz = ctx.timezone ?? DEFAULT_TIMEZONE;
+  const tz = ctx.timezone ?? scheduleTimeZone();
   const { parsed } = task;
 
   if (parsed.kind === 'once') {

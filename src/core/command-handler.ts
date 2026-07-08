@@ -23,6 +23,7 @@ import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolv
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
+import { scheduleTimeZone } from '../utils/timezone.js';
 import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
@@ -600,7 +601,7 @@ async function handleScheduleCommand(
   // forms include the wall-clock components the user cares about; the
   // difference is just punctuation and digit order.
   const timeLocale = loc === 'en' ? 'en-US' : 'zh-CN';
-  const timeZone = 'Asia/Shanghai';
+  const timeZone = scheduleTimeZone();
 
   // /schedule list | /schedule 列表
   if (!trimmed || trimmed === 'list' || trimmed === '列表') {

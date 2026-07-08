@@ -6,8 +6,8 @@ import { createClaudeFamilyAdapter } from './claude-code.js';
 import { logger } from '../../utils/logger.js';
 import type { CliAdapter } from './types.js';
 
-/** Seed CLI (`@bytedance-seed/claude-code`, binary `seed`) is a ByteDance fork
- *  of Claude Code: identical flags, slash commands, and on-disk session layout
+/** Seed CLI is a fork of Claude Code:
+ *  identical flags, slash commands, and on-disk session layout
  *  (per-project JSONL transcripts, `sessions/<pid>.json`, `tasks/` fd locks,
  *  keybindings.json, settings.json hooks). It differs only in the binary name,
  *  its auth, and its data root — which it isolates to a

@@ -131,8 +131,10 @@ function ActiveSessionRow({ session }: { session: SessionRow }) {
   );
 }
 
-function ScheduleMini({ schedule }: { schedule: ScheduleRow }) {
-  const next = schedule.nextRunAt ? new Date(schedule.nextRunAt).toLocaleString() : '-';
+function ScheduleMini({ schedule, timeZone }: { schedule: ScheduleRow; timeZone?: string }) {
+  const next = schedule.nextRunAt
+    ? new Date(schedule.nextRunAt).toLocaleString(undefined, timeZone ? { timeZone, timeZoneName: 'short' } : undefined)
+    : '-';
   return (
     <li className="overview-list-row">
       <div>
@@ -175,9 +177,10 @@ function OverviewPage() {
   const [teamExpanded, setTeamExpanded] = useState(readTeamExpanded);
   const [collapsedN, setCollapsedN] = useState(TEAM_COLLAPSED_ROWS * 3);
   const [namesVersion, forceNamesRefresh] = useState(0);
-  const { sessions, schedules } = useStoreSelector(snapshot => ({
+  const { sessions, schedules, scheduleTimeZone } = useStoreSelector(snapshot => ({
     sessions: [...snapshot.sessions.values()] as SessionRow[],
     schedules: [...snapshot.schedules.values()] as ScheduleRow[],
+    scheduleTimeZone: snapshot.scheduleTimeZone,
   }));
 
   useEffect(() => {
@@ -291,7 +294,7 @@ function OverviewPage() {
               <a className="btn-link" href="#/schedules">{tr('overview.viewAll')}</a>
             </header>
             <ul className="overview-list" id="next-schedules">
-              {upcoming.length ? upcoming.map(s => <ScheduleMini key={s.id} schedule={s} />) : <li className="empty">{tr('overview.noSchedules')}</li>}
+              {upcoming.length ? upcoming.map(s => <ScheduleMini key={s.id} schedule={s} timeZone={scheduleTimeZone} />) : <li className="empty">{tr('overview.noSchedules')}</li>}
             </ul>
           </section>
         </div>

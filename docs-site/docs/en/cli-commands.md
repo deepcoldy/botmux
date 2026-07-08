@@ -37,7 +37,7 @@ Session info is inferred automatically from ancestor-process markers, so the age
 
 | Command | Description |
 |------|------|
-| `botmux send [content]` | Send a message to the current topic (stdin / heredoc / `--content-file`; `--images`/`--files`/`--mention`) |
+| `botmux send [content]` | Send a message to the current topic (stdin / heredoc / `--content-file`; `--images`/`--files`/`--videos`/`--mention`) |
 | `botmux bots list` | List the bots in the current group (including open_id) |
 | `botmux history [--limit N]` | Pull the session history (JSON) |
 | `botmux quoted <message_id>` | Pull a single quoted message (JSON) |

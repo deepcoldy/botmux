@@ -43,6 +43,7 @@ import {
 } from './setup/cli-selection.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { invalidateGlobalConfigCache, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import { buildDashboardUrls, type DashboardUrls } from './core/dashboard-url.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxCliEntry } from './utils/install-info.js';
@@ -313,6 +314,16 @@ interface ResolvedDashboardSettings {
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
+  /** Configured schedule-task timezone override (IANA), or null when unset
+   *  ⇒ the scheduler follows `hostTimeZone`. */
+  scheduleTimeZone: string | null;
+  /** Host's auto-detected local zone (e.g. 'America/Los_Angeles'). */
+  hostTimeZone: string;
+  /** The TRUE effective zone the scheduler fires/displays in = scheduleTimeZone()
+   *  (env `BOTMUX_SCHEDULE_TIMEZONE` → config → host). The UI must use THIS for
+   *  "currently effective" — never reconstruct it from configured||host, which
+   *  ignores the env override. */
+  effectiveScheduleTimeZone: string;
 }
 
 function vcMeetingListenerBotOptions(): ResolvedDashboardSettings['vcMeetingAgent']['listenerBotOptions'] {
@@ -511,6 +522,9 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     localDevInstall: isLocalDevInstall(),
     whiteboard: { enabled: global.whiteboard?.enabled === true },
     remoteAccess: global.remoteAccess === true,
+    scheduleTimeZone: global.scheduleTimeZone ?? null,
+    hostTimeZone: hostLocalTimeZone(),
+    effectiveScheduleTimeZone: scheduleTimeZone(),
   };
 }
 
@@ -1527,7 +1541,10 @@ const server = createServer(async (req, res) => {
       const schedules = authed
         ? aggregator.getSchedules()
         : redactSchedulesForPublic(aggregator.getSchedules());
-      return jsonRes(res, 200, { schedules });
+      // Effective schedule timezone: nextRunAt/lastRunAt instants must be
+      // rendered in the zone the scheduler fires in (not the viewer's browser
+      // zone), so the web schedule/overview lists match cron/card/CLI displays.
+      return jsonRes(res, 200, { schedules, timezone: scheduleTimeZone() });
     }
     if (req.method === 'GET' && url.pathname === '/api/settings') {
       // `authed` lets the Settings page disable toggles for read-only

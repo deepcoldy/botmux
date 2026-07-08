@@ -86,8 +86,8 @@ export function resolveGroupJoinPrompt(configured: string | undefined): string {
 /**
  * 场景①: D7 gate with retry — wait for an allowedUser to appear in the chat.
  *
- * Alarm/oncall platforms that auto-create incident chats (e.g. ByteDance
- * Nexus) add the bot FIRST and the human members moments later. A one-shot
+ * Alarm/oncall platforms that auto-create incident chats 
+ * add the bot FIRST and the human members moments later. A one-shot
  * membership snapshot taken at bot.added time races against that and loses:
  * the chat looks like it has no allowedUser and auto-start is silently
  * skipped even though the owner lands in the chat a second later. Re-check

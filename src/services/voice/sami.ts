@@ -1,5 +1,5 @@
 /**
- * SAMI (ByteDance speech) TTS adapter — pure JSON-over-WebSocket, no SDK.
+ * SAMI (Internal speech) TTS adapter — pure JSON-over-WebSocket, no SDK.
  *
  * The official `@byted-sami/speech-sdk` is a browser bundle (needs window/
  * document shims + a subprocess), but the `tts.sync` endpoint it drives is

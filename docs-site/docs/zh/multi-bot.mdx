@@ -12,12 +12,16 @@
 
 ## 让机器人互相认识
 
-机器人之间默认**收不到**对方在群里发的普通消息。要让它们接力协作：
+现在主路径不再需要手动 `/introduce`：botmux 会默认通过飞书群机器人列表自动发现当前群里的 bot；用 `/group`、Dashboard「新建群」或团队面板拉起的协作群，还会通过团队花名册让跨部署 bot 互相识别。
 
-1. 先发一次 `@botA @botB /introduce` —— 它们互相登记 open_id（@ 顺序任意，可带额外文本）。
-2. 之后各 bot 就能在自己的会话里用 `botmux send --mention <对方 open_id>` 显式 @ 对方，触发对方接力。
+协作时让模型优先查看：
 
-> 跨 bot 协作的硬性事实：**不 `--mention` 对方 bot，对方完全不会被触发**。对方的 open_id 从 `botmux bots list` 或消息里的 `<available_bots>` 块拿。
+- `botmux bots list`：列出当前群可协作的 bot、能力标签、`openId`、`mentionable`。
+- 消息里的 `<available_bots>` 块：会随上下文提示哪些 bot 可被接力。
+
+之后 bot 在自己的会话里用 `botmux send --mention <对方 openId>` 显式 @ 对方即可触发接力。
+
+> 跨 bot 协作的硬性事实：**不 `--mention` 对方 bot，对方完全不会被触发**。`/introduce` 仍保留为旧版 / 外部 bot 兜底：只有当 `botmux bots list` 里目标 bot 缺失或 `mentionable=false` 时，再在群里发 `@botA @botB /introduce` 手动登记一次。
 
 ## 典型场景
 

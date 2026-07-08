@@ -526,6 +526,7 @@ export const messages: Record<string, string> = {
   'ai.routing.heredoc_example': "  正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
   'ai.routing.usage_images': '- 附带图片：`botmux send --images /path/to/img.png "说明文字"`',
   'ai.routing.usage_files': '- 附带文件：`botmux send --files /path/to/file.pdf "请查收"`',
+  'ai.routing.usage_videos': '- 附带视频预览：`botmux send --videos /path/to/replay.mp4 --video-covers /path/to/cover.png --no-mention "预览"`',
   'ai.routing.usage_history': '- 需要上下文时用 `botmux history` 读取之前的对话。',
   'ai.routing.usage_bots_list': '- 查看可协作的机器人：`botmux bots list`',
 
@@ -546,7 +547,7 @@ export const messages: Record<string, string> = {
   // ─── AI hints (non-Claude CLIs: BOTMUX_SHELL_HINTS) ──────────────────────
   'ai.shell.intro': '你运行在飞书（Lark）话题群中。用户在飞书阅读回复，看不到你的终端输出。',
   'ai.shell.commands_are_shell': '重要：botmux send / botmux history / botmux quoted / botmux bots 都是 shell 命令（CLI 程序，已安装在 $PATH），不是 MCP 工具。必须通过 Bash 工具执行，不要到 MCP 工具列表里找。',
-  'ai.shell.how_to_send': '把消息发给用户（唯一方式）：用 Bash 执行 `botmux send "消息内容"`；附带图片用 `--images /path`，附带文件用 `--files /path`。',
+  'ai.shell.how_to_send': '把消息发给用户（唯一方式）：用 Bash 执行 `botmux send "消息内容"`；附带图片用 `--images /path`，附带文件用 `--files /path`，附带视频预览用 `--videos /path.mp4 --video-covers /cover.png`。',
   'ai.shell.multiline_heredoc': '多行消息必须用 heredoc，禁止写成 `botmux send "第一行\\n第二行"`；否则 `\\n` 可能按字面量显示在飞书里。',
   'ai.shell.heredoc_example': "正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',

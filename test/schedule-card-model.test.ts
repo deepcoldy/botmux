@@ -243,3 +243,16 @@ describe('schedule-card-model · invariants', () => {
     expect(toScheduleDetailDto(absent, ctx).repeat).toBeUndefined();
   });
 });
+
+describe('schedule-card-model · computeNextNRuns 默认时区 = 本地', () => {
+  it('未注入 timezone 时,cron next-run 落在系统本地整点(默认不再写死 Asia/Shanghai)', () => {
+    const task = makeTask({ parsed: cron('0 9 * * *') });
+    // 不传 timezone → 默认取 scheduleTimeZone()(系统本地)。断言用本地 getHours,
+    // 与实现同源;改动前默认 Asia/Shanghai,在非 +8 机器上此处会 != 9。
+    const runs = computeNextNRuns(task, 1, { nowMs: FIXED_NOW });
+    expect(runs).toHaveLength(1);
+    const d = new Date(runs[0]);
+    expect(d.getHours()).toBe(9);
+    expect(d.getMinutes()).toBe(0);
+  });
+});

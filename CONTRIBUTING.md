@@ -123,7 +123,7 @@ teach the agent when/how to use them.
 
 | Subcommand | Description |
 |------------|-------------|
-| `botmux send [content]` | Send message to current thread (stdin / heredoc / `--content-file`; `--images` / `--files` / `--mention` flags) |
+| `botmux send [content]` | Send message to current thread (stdin / heredoc / `--content-file`; `--images` / `--files` / `--videos` / `--mention` flags) |
 | `botmux bots list` | List bots in current chat with their `open_id`s |
 | `botmux thread messages [--limit N]` | Fetch thread message history (JSON) |
 | `botmux schedule add <schedule> <prompt>` | Create scheduled task bound to current thread |

@@ -1,5 +1,6 @@
 import { Cron } from 'croner';
 import * as scheduleStore from '../services/schedule-store.js';
+import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
@@ -8,6 +9,11 @@ import type { ScheduledTask, ParsedSchedule } from '../types.js';
 // Callback set by daemon to execute a scheduled task
 let executeCallback: ((task: ScheduledTask) => Promise<void>) | null = null;
 let tickTimer: NodeJS.Timeout | null = null;
+// Last effective schedule timezone seen by the tick loop. When it changes
+// (dashboard config / env / host), enabled CRON tasks' persisted nextRunAt was
+// computed under the OLD zone and must be recomputed — otherwise they'd fire
+// once at the stale wall-clock time. null = not yet initialized (first tick).
+let lastTickTz: string | null = null;
 
 /** Owner-filter state — each daemon process runs its own scheduler but only
  *  executes tasks whose larkAppId matches.  Legacy tasks without a larkAppId
@@ -157,9 +163,9 @@ function parseChineseSchedule(input: string): { parsed: ParsedSchedule; rest: st
   if (m) {
     const t = parseTimeHM(m[1]);
     if (t) {
-      const d = new Date();
-      d.setDate(d.getDate() + 1);
-      d.setHours(t.hour, t.minute, 0, 0);
+      // 「明天HH:MM」是墙上时间：解析到 scheduleTimeZone()（与 cron 触发/显示同源），
+      // 而非主机本地 setHours() —— 否则在非目标时区主机上，一次性与重复类会错开一个时差。
+      const d = zonedTomorrowAt(scheduleTimeZone(), t.hour, t.minute);
       return { parsed: { kind: 'once', runAt: d.toISOString(), display: `明天 ${t.hour}:${String(t.minute).padStart(2,'0')}` }, rest: t.rest };
     }
   }
@@ -211,11 +217,15 @@ export function parseSchedule(input: string): ParsedSchedule {
     }
   }
 
-  // ISO timestamp
+  // ISO timestamp. NOTE: a string WITH an explicit offset/Z is absolute; a bare
+  // `YYYY-MM-DDTHH:MM` (no offset) is parsed by JS in the HOST-local zone, NOT
+  // scheduleTimeZone() — this is deliberate (an explicit timestamp carries its
+  // own zone contract; we don't reinterpret it). Only the DISPLAY uses the
+  // effective zone. The NL「明天HH:MM」path (above) is the tz-aware one.
   if (/^\d{4}-\d{2}-\d{2}(T| |$)/.test(s)) {
     const dt = new Date(s);
     if (!isNaN(dt.getTime())) {
-      return { kind: 'once', runAt: dt.toISOString(), display: `once at ${dt.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}` };
+      return { kind: 'once', runAt: dt.toISOString(), display: `once at ${dt.toLocaleString('zh-CN', { timeZone: scheduleTimeZone() })}` };
     }
   }
 
@@ -307,7 +317,7 @@ export function computeNextRun(parsed: ParsedSchedule, lastRunAt?: string): stri
   if (parsed.kind === 'cron') {
     if (!parsed.expr) return null;
     try {
-      const job = new Cron(parsed.expr, { timezone: 'Asia/Shanghai' });
+      const job = new Cron(parsed.expr, { timezone: scheduleTimeZone() });
       const next = job.nextRun(new Date(now));
       return next ? next.toISOString() : null;
     } catch {
@@ -325,7 +335,7 @@ function computeGraceSeconds(parsed: ParsedSchedule): number {
     periodSec = parsed.minutes * 60;
   } else if (parsed.kind === 'cron' && parsed.expr) {
     try {
-      const job = new Cron(parsed.expr, { timezone: 'Asia/Shanghai' });
+      const job = new Cron(parsed.expr, { timezone: scheduleTimeZone() });
       const first = job.nextRun(new Date());
       const second = first ? job.nextRun(first) : null;
       periodSec = first && second ? (second.getTime() - first.getTime()) / 1000 : MIN_GRACE_SECONDS;
@@ -344,6 +354,17 @@ function computeGraceSeconds(parsed: ParsedSchedule): number {
 async function tick(): Promise<void> {
   const tasks = scheduleStore.listTasks();
   const now = Date.now();
+
+  // Re-align to a changed effective timezone before the fire loop.
+  const tz = scheduleTimeZone();
+  if (lastTickTz !== null && lastTickTz !== tz) {
+    applyCronRealign(planCronRealign(tasks, taskBelongsToThisDaemon));
+    // Tell the dashboard/web the effective zone changed so open tabs re-render
+    // schedule times in the new zone (even when no cron task needed recompute).
+    dashboardEventBus.publish({ type: 'schedule.timezone', body: { timezone: tz } });
+    logger.info(`[scheduler] schedule timezone ${lastTickTz} → ${tz}; re-aligned enabled cron next-runs`);
+  }
+  lastTickTz = tz;
 
   for (const task of tasks) {
     if (!task.enabled) continue;
@@ -413,6 +434,38 @@ async function tick(): Promise<void> {
   }
 }
 
+/**
+ * Plan which enabled CRON tasks need their `nextRunAt` recomputed after the
+ * effective schedule timezone changed. CRON is the only tz-dependent kind
+ * (wall-clock); `interval` is a relative period and `once` is a fixed instant,
+ * so both are skipped. `computeNextRun()` returns the next FUTURE occurrence,
+ * so applying these updates never causes an immediate or duplicate fire.
+ * Pure (no store writes) → unit-testable; tick() applies the returned plan.
+ */
+export function planCronRealign(
+  tasks: ScheduledTask[],
+  belongs: (t: ScheduledTask) => boolean = () => true,
+): Array<{ id: string; nextRunAt: string }> {
+  const updates: Array<{ id: string; nextRunAt: string }> = [];
+  for (const task of tasks) {
+    if (!task.enabled || task.parsed.kind !== 'cron') continue;
+    if (!belongs(task)) continue;
+    const next = computeNextRun(task.parsed);
+    if (next && next !== task.nextRunAt) updates.push({ id: task.id, nextRunAt: next });
+  }
+  return updates;
+}
+
+/** Persist a realign plan AND publish `schedule.updated` per task so the
+ *  dashboard aggregator + open web tabs reflect the new nextRunAt (a bare
+ *  scheduleStore.updateTask inside the daemon does not reach them on its own). */
+function applyCronRealign(updates: Array<{ id: string; nextRunAt: string }>): void {
+  for (const u of updates) {
+    scheduleStore.updateTask(u.id, { nextRunAt: u.nextRunAt });
+    dashboardEventBus.publish({ type: 'schedule.updated', body: { id: u.id, patch: { nextRunAt: u.nextRunAt } } });
+  }
+}
+
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 export function startScheduler(): void {
@@ -427,6 +480,20 @@ export function startScheduler(): void {
       if (next) scheduleStore.updateTask(task.id, { nextRunAt: next });
     }
   }
+
+  // Startup re-align: if the effective timezone changed while the daemon was
+  // STOPPED (config/env edited during downtime), enabled cron tasks' persisted
+  // FUTURE nextRunAt is stale (the live-change path in tick() couldn't catch it).
+  // Recompute future-dated ones — idempotent when tz is unchanged (same next
+  // occurrence). Past-due values are left for tick()'s catch-up/fast-forward so
+  // a genuine missed run isn't silently dropped.
+  const startupNow = Date.now();
+  applyCronRealign(planCronRealign(
+    tasks,
+    t => taskBelongsToThisDaemon(t) && !!t.nextRunAt && new Date(t.nextRunAt).getTime() > startupNow,
+  ));
+  // Seed lastTickTz so the first tick doesn't redundantly re-align what we just did.
+  lastTickTz = scheduleTimeZone();
 
   // Run first tick shortly after startup, then on interval
   setTimeout(() => { tick().catch(err => logger.error(`[scheduler] tick error: ${err.message}`)); }, 5000);
