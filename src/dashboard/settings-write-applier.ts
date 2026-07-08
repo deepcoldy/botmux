@@ -80,8 +80,8 @@ export interface SettingsWriteApplierDeps {
   reloadLocaleOnAllDaemons?: () => Promise<void>;
   /** Validate a global VC listener bot selection before mutating bot/global config. */
   validateVcMeetingListenerBotAppId?: (appId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
-  /** Enable the selected bot's per-bot meeting-listener config after validation passes. */
-  ensureVcMeetingListenerBotConfig?: (appId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+  /** Sync per-bot meeting-listener config after validation passes or when clearing the selection. */
+  syncVcMeetingListenerBotConfig?: (listenerBotAppId: string | null, previousListenerBotAppId?: string | null) => Promise<{ ok: true } | { ok: false; error: string }>;
 }
 
 /** Production deps wiring — call once per dashboard process. */
@@ -200,7 +200,8 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_vcMeetingAgent' };
     }
     const vc = raw as Record<string, unknown>;
-    const next = { ...(deps.readGlobalConfig().vcMeetingAgent ?? {}) };
+    const currentVcMeetingAgent = deps.readGlobalConfig().vcMeetingAgent ?? {};
+    const next = { ...currentVcMeetingAgent };
     if ('enabled' in vc) {
       if (typeof vc.enabled !== 'boolean') {
         return { ok: false, error: 'invalid_vcMeetingAgent_enabled' };
@@ -209,6 +210,10 @@ export async function applySettingsWrite(
     }
     if ('listenerBotAppId' in vc) {
       if (vc.listenerBotAppId === null || vc.listenerBotAppId === '') {
+        if (deps.syncVcMeetingListenerBotConfig) {
+          const synced = await deps.syncVcMeetingListenerBotConfig(null, currentVcMeetingAgent.listenerBotAppId ?? null);
+          if (!synced.ok) return { ok: false, error: synced.error };
+        }
         delete next.listenerBotAppId;
       } else if (typeof vc.listenerBotAppId === 'string' && vc.listenerBotAppId.trim()) {
         const listenerBotAppId = vc.listenerBotAppId.trim();
@@ -216,9 +221,9 @@ export async function applySettingsWrite(
           const validation = await deps.validateVcMeetingListenerBotAppId(listenerBotAppId);
           if (!validation.ok) return { ok: false, error: validation.error };
         }
-        if (deps.ensureVcMeetingListenerBotConfig) {
-          const ensured = await deps.ensureVcMeetingListenerBotConfig(listenerBotAppId);
-          if (!ensured.ok) return { ok: false, error: ensured.error };
+        if (deps.syncVcMeetingListenerBotConfig) {
+          const synced = await deps.syncVcMeetingListenerBotConfig(listenerBotAppId, currentVcMeetingAgent.listenerBotAppId ?? null);
+          if (!synced.ok) return { ok: false, error: synced.error };
         }
         next.listenerBotAppId = listenerBotAppId;
       } else {

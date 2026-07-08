@@ -85,7 +85,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, readBotSkillPolicy } from '../bot-registry.js';
+import { getBotBrand, getBot, loadBotConfigs, readBotSkillPolicy } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, Session } from '../types.js';
 import type { DaemonSession } from './types.js';
@@ -1936,6 +1936,21 @@ ipcRoute('POST', '/api/locale/reload', async (_req, res) => {
   }
 
   jsonRes(res, 200, { ok: true, defaultLocale: resolvedDefault, botLang });
+});
+
+// Hot-reload the current daemon's per-bot config from bots.json after another
+// process edits the shared config file. Keep the live Lark client / resolved
+// allowlist intact; VC listener routing only needs the vcMeetingAgent block.
+ipcRoute('POST', '/api/bot-config/reload', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  try {
+    const latest = loadBotConfigs().find(bot => bot.larkAppId === cachedLarkAppId);
+    if (!latest) return jsonRes(res, 404, { ok: false, error: 'bot_not_in_config' });
+    getBot(cachedLarkAppId).config.vcMeetingAgent = latest.vcMeetingAgent;
+    jsonRes(res, 200, { ok: true, larkAppId: cachedLarkAppId, vcMeetingAgentEnabled: latest.vcMeetingAgent?.enabled === true });
+  } catch (err: any) {
+    jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
 });
 
 ipcRoute('PUT', '/api/bot-default-oncall', async (req, res) => {

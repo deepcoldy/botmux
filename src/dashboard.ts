@@ -87,8 +87,8 @@ import {
   updateInstalledSkillAsync,
 } from './services/skill-registry-store.js';
 import { redactGitUrlCredentials } from './core/skills/sources.js';
-import { getBot, loadBotConfigs, type BotConfig } from './bot-registry.js';
-import { rmwBotEntry } from './services/config-store.js';
+import { getBot, loadBotConfigs, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
@@ -405,32 +405,88 @@ async function validateVcMeetingListenerBotAppId(appId: string): Promise<{ ok: t
   return { ok: true };
 }
 
-async function ensureVcMeetingListenerBotConfig(appId: string): Promise<{ ok: true } | { ok: false; error: string }> {
-  const r = await rmwBotEntry<null>(appId, (entry) => {
-    const raw = entry.vcMeetingAgent;
-    const current = raw && typeof raw === 'object' && !Array.isArray(raw)
-      ? raw as Record<string, unknown>
-      : {};
-    const next = { ...current };
-    let changed = raw !== current;
-    if (next.enabled !== true) {
-      next.enabled = true;
-      changed = true;
-    }
-    entry.vcMeetingAgent = next;
-    return { write: changed, result: null };
-  });
-  if (!r.ok) return { ok: false, error: `vcMeetingAgent_listenerBot_config_write_failed: ${r.reason}` };
+function normalizeVcMeetingAgentRecord(raw: unknown): Record<string, unknown> {
+  return raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? { ...(raw as Record<string, unknown>) }
+    : {};
+}
 
+function compactVcMeetingAgentEntry(entry: Record<string, unknown>, next: Record<string, unknown>): void {
+  if (Object.keys(next).length > 0) entry.vcMeetingAgent = next;
+  else delete entry.vcMeetingAgent;
+}
+
+function refreshLocalVcMeetingAgentConfig(appId: string): void {
   try {
-    const bot = getBot(appId);
-    bot.config.vcMeetingAgent = {
-      ...(bot.config.vcMeetingAgent ?? {}),
-      enabled: true,
-    };
+    const latest = loadBotConfigs().find(bot => bot.larkAppId === appId);
+    const live = getBot(appId);
+    live.config.vcMeetingAgent = latest?.vcMeetingAgent as VcMeetingAgentConfig | undefined;
   } catch {
-    // The dashboard can edit bots.json even when that bot's daemon is offline.
+    // This dashboard process may not host the target bot daemon.
   }
+}
+
+async function reloadVcMeetingBotConfigOnDaemons(appIds: string[]): Promise<void> {
+  const unique = [...new Set(appIds.filter(Boolean))];
+  for (const appId of unique) refreshLocalVcMeetingAgentConfig(appId);
+  await Promise.all(unique.map(async appId => {
+    const d = registry.getByAppId(appId);
+    if (!d) return;
+    await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-config/reload`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(10_000),
+    }).catch(() => undefined);
+  }));
+}
+
+async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, previousListenerBotAppId?: string | null): Promise<{ ok: true } | { ok: false; error: string }> {
+  const nextAppId = listenerBotAppId?.trim() || null;
+  const prevAppId = previousListenerBotAppId?.trim() || null;
+  if (!nextAppId && !prevAppId) return { ok: true };
+
+  const changedAppIds = new Set<string>();
+  try {
+    const path = requireConfigPath();
+    await withFileLock(path, async () => {
+      const raw = await readRawConfig(path);
+      let changed = false;
+
+      if (nextAppId) {
+        const idx = findEntryIndex(raw, nextAppId);
+        if (idx < 0) throw new Error('bot_not_in_config');
+        const entry = raw[idx] as Record<string, unknown>;
+        const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
+        if (next.enabled !== true) {
+          next.enabled = true;
+          next.dashboardManagedListener = true;
+          changed = true;
+        }
+        compactVcMeetingAgentEntry(entry, next);
+        changedAppIds.add(nextAppId);
+      }
+
+      if (prevAppId && prevAppId !== nextAppId) {
+        const idx = findEntryIndex(raw, prevAppId);
+        if (idx >= 0) {
+          const entry = raw[idx] as Record<string, unknown>;
+          const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
+          if (next.dashboardManagedListener === true) {
+            delete next.dashboardManagedListener;
+            if (next.enabled === true) delete next.enabled;
+            compactVcMeetingAgentEntry(entry, next);
+            changed = true;
+            changedAppIds.add(prevAppId);
+          }
+        }
+      }
+
+      if (changed) await writeRawConfigAtomic(path, raw);
+    });
+  } catch (err: any) {
+    return { ok: false, error: `vcMeetingAgent_listenerBot_config_write_failed: ${err?.message ?? err}` };
+  }
+
+  if (changedAppIds.size > 0) await reloadVcMeetingBotConfigOnDaemons([...changedAppIds]);
   return { ok: true };
 }
 
@@ -463,7 +519,7 @@ async function reloadLocaleOnAllDaemons(): Promise<void> {
   ));
 }
 const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
-settingsWriteApplierDeps.ensureVcMeetingListenerBotConfig = ensureVcMeetingListenerBotConfig;
+settingsWriteApplierDeps.syncVcMeetingListenerBotConfig = syncVcMeetingListenerBotConfig;
 settingsWriteApplierDeps.validateVcMeetingListenerBotAppId = validateVcMeetingListenerBotAppId;
 
 /** Helper to render a {status, body} HandlerResult through `res`. */

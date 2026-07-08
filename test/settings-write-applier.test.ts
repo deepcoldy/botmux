@@ -44,7 +44,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     isLocalDevInstall: vi.fn(() => false),
     resolveDashboardSettings: vi.fn(() => settingsView),
     isLocale: ((v: unknown): v is 'zh' | 'en' => v === 'zh' || v === 'en'),
-    ensureVcMeetingListenerBotConfig: vi.fn(async () => ({ ok: true as const })),
+    syncVcMeetingListenerBotConfig: vi.fn(async () => ({ ok: true as const })),
     validateVcMeetingListenerBotAppId: vi.fn(async () => ({ ok: true as const })),
     ...overrides,
   };
@@ -113,16 +113,16 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: false } });
   });
 
-  it('validates then enables vcMeetingAgent.listenerBotAppId before writing the selected bot', async () => {
+  it('validates then syncs vcMeetingAgent.listenerBotAppId before writing the selected bot', async () => {
     const deps = makeDeps({
-      readGlobalConfig: vi.fn(() => ({ vcMeetingAgent: { enabled: true } })),
+      readGlobalConfig: vi.fn(() => ({ vcMeetingAgent: { enabled: true, listenerBotAppId: 'cli_old' } })),
     });
     const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: ' cli_listener ' } }, deps);
     expect(r.ok).toBe(true);
     expect(deps.validateVcMeetingListenerBotAppId).toHaveBeenCalledWith('cli_listener');
-    expect(deps.ensureVcMeetingListenerBotConfig).toHaveBeenCalledWith('cli_listener');
+    expect(deps.syncVcMeetingListenerBotConfig).toHaveBeenCalledWith('cli_listener', 'cli_old');
     expect(vi.mocked(deps.validateVcMeetingListenerBotAppId).mock.invocationCallOrder[0])
-      .toBeLessThan(vi.mocked(deps.ensureVcMeetingListenerBotConfig).mock.invocationCallOrder[0]);
+      .toBeLessThan(vi.mocked(deps.syncVcMeetingListenerBotConfig).mock.invocationCallOrder[0]);
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: true, listenerBotAppId: 'cli_listener' } });
   });
 
@@ -132,8 +132,8 @@ describe('applySettingsWrite happy paths', () => {
     });
     const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: null } }, deps);
     expect(r.ok).toBe(true);
-    expect(deps.ensureVcMeetingListenerBotConfig).not.toHaveBeenCalled();
     expect(deps.validateVcMeetingListenerBotAppId).not.toHaveBeenCalled();
+    expect(deps.syncVcMeetingListenerBotConfig).toHaveBeenCalledWith(null, 'cli_listener');
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: true } });
   });
 });
@@ -208,20 +208,20 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
     expect(r.error).toBe('vcMeetingAgent_listenerBot_missing_scopes: vc:meeting.bot.join:write');
-    expect(deps.ensureVcMeetingListenerBotConfig).not.toHaveBeenCalled();
+    expect(deps.syncVcMeetingListenerBotConfig).not.toHaveBeenCalled();
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 
   it('rejects vcMeetingAgent.listenerBotAppId when per-bot defaults cannot be written', async () => {
     const deps = makeDeps({
-      ensureVcMeetingListenerBotConfig: vi.fn(async () => ({ ok: false as const, error: 'vcMeetingAgent_listenerBot_config_write_failed: bot_not_in_config' })),
+      syncVcMeetingListenerBotConfig: vi.fn(async () => ({ ok: false as const, error: 'vcMeetingAgent_listenerBot_config_write_failed: bot_not_in_config' })),
     });
     const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: 'cli_missing' } }, deps);
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
     expect(r.error).toBe('vcMeetingAgent_listenerBot_config_write_failed: bot_not_in_config');
     expect(deps.validateVcMeetingListenerBotAppId).toHaveBeenCalledWith('cli_missing');
-    expect(deps.ensureVcMeetingListenerBotConfig).toHaveBeenCalledWith('cli_missing');
+    expect(deps.syncVcMeetingListenerBotConfig).toHaveBeenCalledWith('cli_missing', null);
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 
