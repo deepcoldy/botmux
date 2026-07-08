@@ -32,7 +32,7 @@ export function buildVerifiedDeliveryInstructions(input: {
     '— 交付要求 —',
     `任务号: ${input.taskId}`,
     `完成：botmux report --task ${input.taskId} "做了什么/结果如何" --artifact <监管者可读取的路径>`,
-    '路径读不到就改用 inline 证据：--artifact-text name=关键输出/测试结果/diff',
+    '路径读不到就直接贴关键内容：--artifact-text name=关键输出/测试结果/diff',
     `卡住：botmux help --task ${input.taskId} --kind access|ambiguous|impossible|repeated_failure|other --blocker "卡在哪、缺什么"`,
     '需要人拍板也先求助监管者，不要直接 @ 人或老板。',
   ];
@@ -68,7 +68,7 @@ export function buildRejectRetryContent(input: {
   }
   nodes.push({
     tag: 'text',
-    text: `任务 ${input.task.taskId} 的回报 ${input.reportId} 未通过验收：${input.reason}`,
+    text: `任务 ${input.task.taskId} 的提交 ${input.reportId} 未通过验收：${input.reason}`,
   });
 
   const paras: PostParagraph[] = [nodes];
@@ -80,7 +80,7 @@ export function buildRejectRetryContent(input: {
   }
   paras.push([{ tag: 'text', text: `修完后请继续用同一任务号重新交付：botmux report --task ${input.task.taskId} ...` }]);
   if (input.reason === REJECT_REASON.EVIDENCE_UNREACHABLE) {
-    paras.push([{ tag: 'text', text: '当前证据主 agent 读不到；请改交可读取路径或 inline 自包含证据。' }]);
+    paras.push([{ tag: 'text', text: '当前证据监管者读不到；请改交可读取路径，或直接贴关键内容。' }]);
   }
   return paras;
 }

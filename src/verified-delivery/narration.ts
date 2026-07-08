@@ -104,7 +104,7 @@ export function buildGoalNarrationText(event: GoalNarrationEvent): string {
     return [
       `❌ 已驳回 · ${event.taskId}`,
       `原因：${cleanLine(event.reason, '未说明')}`,
-      '待 worker 修复后重新 report',
+      '待执行者修复后重新提交结果',
     ].join('\n');
   }
   if (event.type === 'escalated') {
@@ -117,19 +117,19 @@ export function buildGoalNarrationText(event: GoalNarrationEvent): string {
   if (event.type === 'cleanup') {
     return [
       `🧹 会话已清理 · 关闭 ${event.closed} 个会话`,
-      '本 goal 全部 bot 的会话已收尾（goal 群保留，不退群/不删群）',
+      '本机可管理的目标群会话已收尾（群保留，不退群/不删群）',
     ].join('\n');
   }
   if (event.type === 'reassigned') {
     return [
       `🔄 已自动重派 · ${event.taskId}`,
-      `原 worker${event.deadWorker ? `（${cleanLine(event.deadWorker)}）` : ''}确认掉线，任务已重新派发`,
+      `原执行者${event.deadWorker ? `（${cleanLine(event.deadWorker)}）` : ''}确认掉线，任务已重新派发`,
       '监管者继续盯，无需重复操作',
     ].join('\n');
   }
   return [
     `🆘 求助 · ${event.taskId}`,
-    cleanLine(event.detail, 'worker 请求监管者协助'),
+    cleanLine(event.detail, '执行者请求监管者协助'),
     '监管者介入中',
   ].join('\n');
 }
@@ -155,4 +155,3 @@ export async function emitGoalNarration(input: EmitGoalNarrationInput, deps: Emi
     throw err;
   }
 }
-

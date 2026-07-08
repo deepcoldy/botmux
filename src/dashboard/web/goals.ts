@@ -72,7 +72,7 @@ interface AttentionBoard {
 }
 
 const STATUS_LABEL: Record<string, string> = {
-  dispatched: '待交付', reported: '已报告', accepted: '已验收', rejected: '已驳回',
+  dispatched: '待交付', reported: '已提交', accepted: '已验收', rejected: '已驳回',
   blocked: '求助中', escalated: '已升级人工',
 };
 const HELP_KIND_LABEL: Record<string, string> = {
@@ -83,7 +83,7 @@ const HELP_KIND_LABEL: Record<string, string> = {
 type StageState = 'done' | 'active' | 'fail' | 'pending';
 const STAGES: Array<{ key: string; label: string }> = [
   { key: 'dispatch', label: '派发' },
-  { key: 'report', label: '报告' },
+  { key: 'report', label: '提交' },
   { key: 'check', label: '核验' },
   { key: 'verdict', label: '验收' },
 ];
@@ -201,10 +201,10 @@ function taskRow(t: BoardTask, selected: boolean): string {
     ? `<span class="gb-reason">${escapeHtml(t.rejectReason)}</span>` : '';
   const provTag = t.status !== 'accepted' ? ''
     : t.autoReconciled
-      ? '<span class="gb-via gb-via-auto" title="goal-watchdog 机器对账：worker 已交付，自动跑结构化验收检查后裁定">🤖 自动对账</span>'
+      ? '<span class="gb-via gb-via-auto" title="系统自动对账：执行者已提交，自动按验收标准核对后裁定">🤖 自动对账</span>'
       : supervisorBridged(t)
-        ? '<span class="gb-via gb-via-bridge" title="worker 未自报，监管者独立核验后代办交付+验收">🤝 监管者代办</span>'
-        : '<span class="gb-via gb-via-agent" title="监管 agent 自主核验后裁定">🧠 自主验收</span>';
+        ? '<span class="gb-via gb-via-bridge" title="执行者未主动提交，监管者独立核验后代办提交并验收">🤝 监管者代办</span>'
+        : '<span class="gb-via gb-via-agent" title="监管者自主核验后裁定">🧠 自主验收</span>';
   const helpTag = t.status === 'blocked' && t.help
     ? `<span class="gb-via gb-via-blocked" title="${escapeHtml(t.help.blocker)}">🚧 ${escapeHtml(HELP_KIND_LABEL[t.help.kind ?? 'other'] ?? '求助')}</span>`
     : t.status === 'escalated' && t.escalation
@@ -248,7 +248,7 @@ function acceptanceHtml(t: BoardTask): string {
 }
 function timelineHtml(t: BoardTask): string {
   const steps: Array<[string, number | undefined]> = [
-    ['派发', t.dispatchedAt], ['报告', t.latestReportedAt],
+    ['派发', t.dispatchedAt], ['提交', t.latestReportedAt],
     [t.latestVerdict === 'rejected' ? '驳回' : '验收', t.latestVerdictAt],
   ];
   const dispatched = t.dispatchedAt;
@@ -260,15 +260,15 @@ function timelineHtml(t: BoardTask): string {
 }
 function trailHtml(t: BoardTask): string {
   if (!t.checkedBy && !t.evidenceChecked?.length && !t.ranCommands?.length && !t.evidence?.length) {
-    return t.reportCount ? '<p class="gb-muted">尚未验收</p>' : '<p class="gb-muted">worker 尚未报告</p>';
+    return t.reportCount ? '<p class="gb-muted">尚未验收</p>' : '<p class="gb-muted">执行者尚未提交结果</p>';
   }
   const parts: string[] = [];
   if (t.checkedBy) {
     const prov = t.autoReconciled
-      ? ' <span class="gb-via gb-via-auto" title="goal-watchdog 机器对账，worker 已交付，确定性裁定">🤖 自动对账</span>'
+      ? ' <span class="gb-via gb-via-auto" title="系统自动核对交付证据后裁定">🤖 自动对账</span>'
       : supervisorBridged(t)
-        ? ' <span class="gb-via gb-via-bridge" title="worker 未自报，监管者独立核验后代办交付+验收">🤝 监管者代办</span>'
-        : ' <span class="gb-via gb-via-agent" title="监管 agent 自主核验">🧠 自主验收</span>';
+        ? ' <span class="gb-via gb-via-bridge" title="执行者未主动提交，监管者独立核验后代办提交并验收">🤝 监管者代办</span>'
+        : ' <span class="gb-via gb-via-agent" title="监管者自主核验">🧠 自主验收</span>';
     parts.push(`<div class="gb-kv"><span>核验人</span>${escapeHtml(botName(t.checkedBy))}${prov}</div>`);
   }
   if (t.evidenceChecked?.length) parts.push(`<div class="gb-kv"><span>核验了</span><ul>${t.evidenceChecked.map(e => `<li>${escapeHtml(e)}</li>`).join('')}</ul></div>`);
@@ -282,13 +282,13 @@ function trailHtml(t: BoardTask): string {
   return parts.join('');
 }
 function attemptsHtml(t: BoardTask): string {
-  if (!t.attempts.length) return '<p class="gb-muted">无报告</p>';
+  if (!t.attempts.length) return '<p class="gb-muted">无提交记录</p>';
   return `<ol class="gb-attempts">${t.attempts.map((a, i) => {
     const v = a.verdict === 'accepted' ? '<span class="gb-pill gb-pill-accepted">已验收</span>'
       : a.verdict === 'rejected' ? '<span class="gb-pill gb-pill-rejected">已驳回</span>'
         : '<span class="gb-pill gb-pill-reported">待核验</span>';
-    const via = a.verdictVia === 'reconcile' ? '<span class="gb-via gb-via-auto" title="机器对账">🤖</span>'
-      : a.verdict ? '<span class="gb-via gb-via-agent" title="监管 agent 自主核验">🧠</span>' : '';
+    const via = a.verdictVia === 'reconcile' ? '<span class="gb-via gb-via-auto" title="系统自动核对">🤖</span>'
+      : a.verdict ? '<span class="gb-via gb-via-agent" title="监管者自主核验">🧠</span>' : '';
     return `<li><div class="gb-att-head"><span class="gb-att-n">#${i + 1}</span>${v}${via}<span class="gb-att-time">${fmtTs(a.ts)}</span></div>
       <div class="gb-att-sum">${escapeHtml(a.summary)}</div>
       ${a.reason ? `<div class="gb-att-reason">原因：${escapeHtml(a.reason)}</div>` : ''}</li>`;
@@ -299,7 +299,7 @@ function helpHtml(t: BoardTask): string {
   if (t.help) {
     const kind = t.help.kind ? `<span class="gb-help-kind">${escapeHtml(HELP_KIND_LABEL[t.help.kind] ?? t.help.kind)}</span> ` : '';
     const who = t.help.workerOpenId ? ` <span class="gb-muted">— ${escapeHtml(botName(t.help.workerOpenId))}</span>` : '';
-    parts.push(`<div class="gb-kv"><span>🚧 worker 求助</span><div>${kind}${escapeHtml(t.help.blocker)}${who}</div></div>`);
+    parts.push(`<div class="gb-kv"><span>🚧 执行者求助</span><div>${kind}${escapeHtml(t.help.blocker)}${who}</div></div>`);
   }
   if (t.escalation) {
     const by = t.escalation.by ? ` <span class="gb-muted">— ${escapeHtml(botName(t.escalation.by))}</span>` : '';
@@ -316,11 +316,11 @@ function helpHtml(t: BoardTask): string {
  *  the ledger stays the truth — this only feeds L2 a decision, never writes a verdict. */
 function decisionHtml(t: BoardTask, goalChatId: string): string {
   if (!(t.escalation || t.status === 'blocked')) return '';
-  const cue = t.escalation ? '这条已升级到你，拍个方向给监管者' : 'worker 在求助，给监管者一个处置指示';
+  const cue = t.escalation ? '这条已升级到你，拍个方向给监管者' : '执行者在求助，给监管者一个处置指示';
   return `<div class="gb-sec gb-sec-decide" data-goal="${escapeHtml(goalChatId)}" data-task="${escapeHtml(t.taskId)}">
     <h3>下发决策 → 监管者</h3>
-    <p class="gb-decide-hint">${cue}。它会去引导 worker / 代办 / 重派 / 关闭升级；账本仍是唯一真相。</p>
-    <textarea class="gb-decide-input" rows="3" placeholder="例如：权限我已开通让 worker 重试；或：改用方案 B 重派；或：这条放弃，标记不做…"></textarea>
+    <p class="gb-decide-hint">${cue}。监管者会去引导执行者、代办、重派或关闭升级；最终状态以交付记录为准。</p>
+    <textarea class="gb-decide-input" rows="3" placeholder="例如：权限我已开通，让执行者重试；或：改用方案 B 重派；或：这条放弃，标记不做…"></textarea>
     <div class="gb-decide-row">
       <button type="button" class="gb-decide-send">下发给监管者</button>
       <span class="gb-decide-status" aria-live="polite"></span>
@@ -373,7 +373,7 @@ function notificationRetriesHtml(records: GoalNotificationRetryRecord[]): string
 function sealHtml(t: BoardTask): string {
   if (t.status !== 'accepted') return '';
   const by = botName(t.checkedBy);
-  const kind = t.autoReconciled ? '机器对账' : supervisorBridged(t) ? '监管代办' : '自主核验';
+  const kind = t.autoReconciled ? '自动对账' : supervisorBridged(t) ? '监管代办' : '自主核验';
   const checks = t.evidenceChecked?.length ?? 0;
   const cmds = t.ranCommands?.length ?? 0;
   const bits = [checks ? `核验 ${checks} 项证据` : '', cmds ? `跑 ${cmds} 条命令` : ''].filter(Boolean).join(' · ');
@@ -392,7 +392,7 @@ function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
       <span class="gb-pill gb-pill-${t.status}">${STATUS_LABEL[t.status] ?? escapeHtml(t.status)}</span>
     </div>
     ${t.title ? `<p class="gb-detail-title">${escapeHtml(t.title)}</p>` : ''}
-    ${t.workerOpenIds?.length ? `<p class="gb-detail-worker">执行 worker：${t.workerOpenIds.map((w, i) => {
+    ${t.workerOpenIds?.length ? `<p class="gb-detail-worker">执行者：${t.workerOpenIds.map((w, i) => {
       const nm = t.workerNames?.[i]?.trim();
       return `<span class="gb-who">${escapeHtml(nm || botName(w))}</span>`;
     }).join('、')}</p>` : ''}
@@ -402,7 +402,7 @@ function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
     <div class="gb-sec"><h3>生命周期</h3>${timelineHtml(t)}</div>
     <div class="gb-sec"><h3>验收标准</h3>${acceptanceHtml(t)}</div>
     <div class="gb-sec"><h3>验收痕迹</h3>${trailHtml(t)}</div>
-    <div class="gb-sec"><h3>报告历史 (${t.attempts.length})</h3>${attemptsHtml(t)}</div>`;
+    <div class="gb-sec"><h3>提交历史 (${t.attempts.length})</h3>${attemptsHtml(t)}</div>`;
 }
 
 // ── Operator View attention band (cross-goal first screen) ────────────────────
@@ -413,7 +413,7 @@ function attnRow(t: AttnTask): string {
   const src = t.disposition.bucket === 'systemRisk'
     ? (t.source === 'live'
         ? `<span class="attn-src attn-src-live" title="${escapeHtml(t.liveDetail ?? '现场探测，可能瞬时')}">🔴 实时</span>`
-        : '<span class="attn-src attn-src-ledger" title="账本/存储派生，稳态事实">📒 账本</span>')
+        : '<span class="attn-src attn-src-ledger" title="交付记录/存储派生，稳态事实">📒 记录</span>')
     : '';
   const sum = t.recentEvidence?.latestSummary;
   const ev = sum ? `<span class="attn-ev" title="${escapeHtml(sum)}">${escapeHtml(sum.length > 56 ? sum.slice(0, 56) + '…' : sum)}</span>` : '';
@@ -453,8 +453,8 @@ function attentionBandHtml(a: AttentionBoard): string {
 function shell(): string {
   return `<section class="page goalboard">
 <div class="page-heading">
-  <div><p class="eyebrow">可信交付</p><h1>目标看板</h1>
-  <p>每个目标下子任务的交付生命周期：派发 → 报告 → 核验 → 验收。账本是唯一真相。</p></div>
+  <div><p class="eyebrow">交付验收</p><h1>目标看板</h1>
+  <p>每个目标下子任务的交付流程：派发 → 提交 → 核验 → 验收。交付记录是最终依据。</p></div>
   <div><button type="button" id="gb-refresh" class="gb-refresh-btn">↻ 刷新</button></div>
 </div>
 <div id="gb-attn"></div>
@@ -531,7 +531,7 @@ export function renderGoalsPage(root: HTMLElement): () => void {
         let code = '';
         try { code = (await res.json())?.error ?? ''; } catch { /* non-json */ }
         throw new Error(
-          code === 'no_supervisor' ? '该 goal 当前没有在线监管者(L2)，无法下发（会话可能已关）'
+          code === 'no_supervisor' ? '该目标当前没有在线监管者，无法下发（会话可能已关）'
           : code === 'missing_text' ? '指示不能为空'
           : `下发失败：${code || 'HTTP ' + res.status}`,
         );

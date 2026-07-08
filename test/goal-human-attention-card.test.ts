@@ -34,7 +34,7 @@ describe('buildGoalHumanAttentionCard', () => {
     expect(card.header.title.content).toContain('任务需要你拍板');
     expect(JSON.stringify(card)).toContain('<at id=ou_owner></at>');
 
-    const linkButton = findAll(card, (n) => n?.tag === 'button' && n?.text?.content === '打开 goal 群')[0];
+    const linkButton = findAll(card, (n) => n?.tag === 'button' && n?.text?.content === '打开目标群')[0];
     expect(linkButton.multi_url.url).toContain('openChatId=oc_goal');
 
     const input = findAll(card, (n) => n?.tag === 'input' && n?.name === 'goal_parent_decision_text')[0];
@@ -58,10 +58,10 @@ describe('buildGoalHumanAttentionCard', () => {
       goalChatId: 'oc_goal',
       parentChatId: 'oc_parent',
       attentionKind: 'help',
-      summary: 'worker 缺权限',
+      summary: '执行者缺权限',
     }));
     expect(card.header.template).toBe('blue');
-    expect(card.header.title.content).toContain('worker 求助');
+    expect(card.header.title.content).toContain('执行者求助');
   });
 
   it('renders recommended decision option buttons alongside free text', () => {

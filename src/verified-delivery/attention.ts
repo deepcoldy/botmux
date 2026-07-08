@@ -90,14 +90,14 @@ export function classifyTaskDisposition(task: ClassifiableTask, ctx: Disposition
     case 'blocked':
       return { bucket: 'blocked', reason: task.help?.kind ? `help:${task.help.kind}` : 'help', next: '等监管澄清/重派' };
     case 'reported':
-      return { bucket: 'readyToVerify', reason: 'awaiting_verdict', next: '已有 report，等验收' };
+      return { bucket: 'readyToVerify', reason: 'awaiting_verdict', next: '已有提交，等验收' };
     case 'accepted':
       return { bucket: 'completed', reason: 'accepted', next: '已验收' };
     case 'dispatched':
-      return activeRisk() ?? { bucket: 'inProgress', reason: 'dispatched', next: '等 worker 干活/report' };
+      return activeRisk() ?? { bucket: 'inProgress', reason: 'dispatched', next: '等执行者提交结果' };
     case 'rejected':
       // NOT terminal: the worker is expected to fix and re-report.
-      return activeRisk() ?? { bucket: 'inProgress', reason: 'rejected_retrying', next: '已驳回，等 worker 重新 report' };
+      return activeRisk() ?? { bucket: 'inProgress', reason: 'rejected_retrying', next: '已驳回，等执行者重新提交' };
     default: {
       // Compile-time exhaustiveness: adding a TaskStatus without a case fails here.
       const _exhaustive: never = task.status;
