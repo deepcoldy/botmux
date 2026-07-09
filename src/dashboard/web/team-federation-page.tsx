@@ -572,7 +572,14 @@ function RosterBotRow(props: {
               data-app={bot.larkAppId}
               defaultValue={bot.capability || ''}
               placeholder={tr('team.capPh')}
-              onChange={ev => props.onCapabilityChange(bot.larkAppId, ev.target.value)}
+              onBlur={ev => {
+                // Commit once on blur (old native onchange semantics), not per keystroke —
+                // a PUT per character can persist a truncated prefix under network reordering.
+                const next = ev.target.value;
+                if (next === (bot.capability || '')) return;
+                props.onCapabilityChange(bot.larkAppId, next);
+              }}
+              onKeyDown={ev => { if (ev.key === 'Enter') { ev.preventDefault(); ev.currentTarget.blur(); } }}
             />
           </label>
         ) : (

@@ -334,6 +334,9 @@ function DashboardShell(): JSX.Element {
   useEffect(() => {
     const open = () => setAuthExpiredOpen(true);
     window.addEventListener(AUTH_EXPIRED_EVENT, open);
+    // Catch a 401 that latched expiredShown before this listener mounted (else the overlay
+    // would be permanently suppressed by the module-level guard).
+    if (expiredShown) setAuthExpiredOpen(true);
     return () => window.removeEventListener(AUTH_EXPIRED_EVENT, open);
   }, []);
   useEffect(() => {

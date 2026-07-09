@@ -1220,12 +1220,11 @@ function GroupsPage() {
     const validIds = selectedIds.filter(id => !invalidBotIds.includes(id));
     const expectedBotIds = new Set<string>(validIds);
     if (typeof resp.creator === 'string' && resp.creator) expectedBotIds.add(resp.creator);
-    let optimistic: GroupsSnapshot | null = null;
-    setSnapshot(cur => {
-      optimistic = injectOptimisticChat(cur, chatId, name || chatId, validIds, resp.creator);
-      return optimistic;
-    });
-    if (optimistic) void refreshRoleProfileContext(optimistic);
+    // Compute the optimistic snapshot from committed state (setSnapshot keeps snapshotRef in
+    // sync) so the profile-context refresh always sees it — not a null from a deferred updater.
+    const optimistic = injectOptimisticChat(snapshotRef.current, chatId, name || chatId, validIds, resp.creator);
+    setSnapshot(optimistic);
+    void refreshRoleProfileContext(optimistic);
     void refreshUntilSeen(chatId, expectedBotIds).catch(() => { /* tolerate */ });
   }
 

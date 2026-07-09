@@ -74,6 +74,7 @@ function FieldTitle(props: { children: ReactNode; help?: ReactNode }) {
 type DropdownFieldOption<T extends string> = {
   value: T;
   label: ReactNode;
+  disabled?: boolean;
 };
 
 function DropdownField<T extends string>(props: {
@@ -789,6 +790,8 @@ export function BotAgentSection(props: {
     { value: 'dynamic', label: tr('botDefaults.skillInjectionDynamic') },
   ];
   const skillOptions = [
+    // Non-selectable cue: dynamic injection isn't available for this CLI (parity with the old UI).
+    { value: 'dynamic', label: tr('botDefaults.skillInjectionDynamicUnsupported'), disabled: true },
     { value: 'prompt', label: tr('botDefaults.skillInjectionPrompt') },
     { value: 'global', label: tr('botDefaults.skillInjectionGlobal') },
     { value: 'off', label: tr('botDefaults.skillInjectionOff') },
@@ -1108,12 +1111,15 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   useEffect(() => {
     let active = true;
     const roleUrl = `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`;
-    setStatus(null);
     if (typeof bot.teamRole === 'string') {
+      // Already resolved (incl. right after our own save, which patchBot's teamRole
+      // re-fires this effect) — sync the field but DON'T clear status, or the freshly
+      // set "✓ 已保存/已删除" toast gets wiped a frame later.
       setLoaded(true);
       setRole(bot.teamRole);
       return () => { active = false; };
     }
+    setStatus(null);
     setLoaded(false);
     setRole('');
     void (async () => {

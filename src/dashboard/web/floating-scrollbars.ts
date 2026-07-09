@@ -20,6 +20,7 @@ let bars = new Map<HTMLElement, Partial<Record<Axis, FloatingBar>>>();
 let resizeObserver: ResizeObserver | null = null;
 let mutationObserver: MutationObserver | null = null;
 let frame = 0;
+let mutationTimer = 0;
 let hoveredTarget: HTMLElement | null = null;
 
 function hostFor(target: HTMLElement): HTMLElement {
@@ -153,6 +154,17 @@ function scheduleUpdate(): void {
   });
 }
 
+// Structural churn (the React shell re-renders on every SSE tick) is coalesced on a short
+// timer so the full-tree rescan in readTargets() runs at most ~once per 120ms instead of on
+// every animation frame during activity. Scroll/resize stay on the immediate rAF path.
+function scheduleRescan(): void {
+  if (mutationTimer) return;
+  mutationTimer = window.setTimeout(() => {
+    mutationTimer = 0;
+    scheduleUpdate();
+  }, 120);
+}
+
 function updateFloatingScrollbars(): void {
   const root = rootEl;
   if (!root) return;
@@ -231,7 +243,17 @@ export function initFloatingScrollbars(root: HTMLElement): void {
     : new ResizeObserver(scheduleUpdate);
   resizeObserver?.observe(root);
 
-  mutationObserver = new MutationObserver(() => scheduleUpdate());
+  mutationObserver = new MutationObserver(records => {
+    // Skip mutations we cause ourselves (writing to the scrollbar layer/tracks); otherwise
+    // updateBar's style/class writes on a layer mounted inside an open <dialog> (which lives
+    // in the observed subtree) would re-trigger the observer → a self-sustaining rAF loop.
+    for (const record of records) {
+      const node = record.target;
+      if (node instanceof Element && node.closest('.floating-scrollbar-layer')) continue;
+      scheduleRescan();
+      return;
+    }
+  });
   mutationObserver.observe(root, {
     attributes: true,
     attributeFilter: ['class', 'style', 'hidden', 'open'],

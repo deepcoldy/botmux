@@ -9,7 +9,6 @@ import {
   type KeyboardEvent,
   type MouseEvent,
 } from 'react';
-import { createRoot, type Root } from 'react-dom/client';
 import { LoadingState } from './dashboard-components.js';
 import type { KanbanGroupBy } from './preferences.js';
 import {
@@ -812,27 +811,4 @@ export function SessionsKanbanView(props: SessionsKanbanProps): JSX.Element {
       ))}
     </>
   );
-}
-
-export interface SessionsKanbanController {
-  render(state: SessionsKanbanState): void;
-  dispose(): void;
-}
-
-export function createSessionsKanbanController(
-  host: HTMLElement,
-  callbacks: SessionsKanbanCallbacks,
-): SessionsKanbanController {
-  let mounted = true;
-  const root: Root = createRoot(host);
-  return {
-    render(state: SessionsKanbanState) {
-      if (!mounted) return;
-      root.render(<SessionsKanbanView host={host} {...callbacks} {...state} />);
-    },
-    dispose() {
-      mounted = false;
-      root.unmount();
-    },
-  };
 }

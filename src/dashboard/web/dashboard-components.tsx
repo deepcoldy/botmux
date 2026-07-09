@@ -4,6 +4,8 @@ import { createPortal } from 'react-dom';
 export type DropdownOption<T extends string> = {
   value: T;
   label: ReactNode;
+  /** Non-selectable informational entry (e.g. a mode the current CLI can't use). */
+  disabled?: boolean;
 };
 
 export function dropdownLabel<T extends string>(options: DropdownOption<T>[], value: T): ReactNode {
@@ -269,8 +271,11 @@ type DropdownMenuProps<T extends string> = {
 export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): JSX.Element {
   const detailsRef = useRef<HTMLDetailsElement | null>(null);
   const choose = (next: T, button: HTMLButtonElement) => {
-    props.onChange(next);
     button.closest('details')?.removeAttribute('open');
+    // Re-selecting the already-active value is a no-op: close the menu but skip
+    // onChange, so auto-saving dropdowns don't fire a redundant write + "saved" flash.
+    if (next === props.value) return;
+    props.onChange(next);
   };
 
   useEffect(() => {
@@ -321,6 +326,7 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): JSX
           <button
             key={option.value}
             type="button"
+            disabled={option.disabled}
             aria-current={props.value === option.value ? 'true' : undefined}
             onClick={event => choose(option.value, event.currentTarget)}
           >

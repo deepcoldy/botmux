@@ -363,7 +363,7 @@ function LegacyWorkflowDetailPage(props: { runId: string; focusAttemptId?: strin
   const [resumePending, setResumePending] = useState<Set<string>>(() => new Set());
   const [resumeErrors, setResumeErrors] = useState<Map<string, string>>(() => new Map());
   const [openBlocks, setOpenBlocks] = useState<Set<string>>(() => new Set());
-  const [scrollTops, setScrollTops] = useState<Map<string, number>>(() => new Map());
+  const scrollTopsRef = useRef<Map<string, number>>(new Map());
   const disposedRef = useRef(false);
   const inflightRef = useRef(false);
 
@@ -594,7 +594,7 @@ function LegacyWorkflowDetailPage(props: { runId: string; focusAttemptId?: strin
 
   const blockState = useMemo<BlockState>(() => ({
     openBlocks,
-    scrollTops,
+    scrollTops: scrollTopsRef.current,
     setBlockOpen: (key, open) => {
       setOpenBlocks((prev) => {
         const next = new Set(prev);
@@ -603,14 +603,12 @@ function LegacyWorkflowDetailPage(props: { runId: string; focusAttemptId?: strin
         return next;
       });
     },
+    // Ref, not state: scrolling an IO preview shouldn't setState → re-render the whole detail
+    // page on every scroll tick. The value is only read imperatively to restore preRef.scrollTop.
     setBlockScrollTop: (key, top) => {
-      setScrollTops((prev) => {
-        const next = new Map(prev);
-        next.set(key, top);
-        return next;
-      });
+      scrollTopsRef.current.set(key, top);
     },
-  }), [openBlocks, scrollTops]);
+  }), [openBlocks]);
 
   const approvalState = useMemo<ApprovalState>(() => ({
     comments: approvalComments,
@@ -1022,11 +1020,23 @@ function AttemptIOCard(props: {
     ? ioBlockKey(keyPrefix, terminalSurfaceLabel(terminalSurface.kind))
     : null;
 
+  const scrolledRef = useRef(false);
   useEffect(() => {
-    if (!focusMatch || !terminalSurface || !terminalBlockKey) return;
-    props.blockState.setBlockOpen(terminalBlockKey, true);
-    cardRef.current?.scrollIntoView({ block: 'center' });
-    props.onFocusConsumed();
+    if (!focusMatch) {
+      scrolledRef.current = false;
+      return;
+    }
+    // Scroll the focused card into view once as soon as it exists — don't wait for the terminal
+    // sidecar (it may arrive a detail-poll later, or never for a terminal-less attempt).
+    if (!scrolledRef.current) {
+      scrolledRef.current = true;
+      cardRef.current?.scrollIntoView({ block: 'center' });
+    }
+    // Expand the terminal block + consume the deep-link focus once the surface is available.
+    if (terminalSurface && terminalBlockKey) {
+      props.blockState.setBlockOpen(terminalBlockKey, true);
+      props.onFocusConsumed();
+    }
   }, [focusMatch, props, terminalBlockKey, terminalSurface]);
 
   return (

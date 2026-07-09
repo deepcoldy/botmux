@@ -1569,7 +1569,11 @@ function InsightsPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [tab, setTab] = useState<InsightTab>(initial.tab);
   const [filter, setFilter] = useState<InsightFilter>(initial.filter);
-  const [cliFilter, setCliFilter] = useState<Set<string>>(initial.cli);
+  const [cliFilter, setCliFilter] = useState<Set<string>>(
+    // Single-select model: a legacy multi-CLI deep-link (?cli=a,b) collapses to its first CLI
+    // so the dropdown label always matches the active filter (was: showed "all" while filtering ≥2).
+    initial.cli.size > 1 ? new Set([[...initial.cli][0]!]) : initial.cli,
+  );
   const [q, setQ] = useState(initial.q);
   const [project, setProject] = useState(initial.project);
   const [timeWin, setTimeWin] = useState(initial.time);

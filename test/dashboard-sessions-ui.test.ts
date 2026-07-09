@@ -9,6 +9,7 @@ import {
   restartConfirmMessage,
   sessionLocationText,
 } from '../src/dashboard/web/sessions.js';
+import { CliFilterGroup } from '../src/dashboard/web/sessions-page.js';
 
 const kanbanCallbacks: SessionsKanbanCallbacks = {
   canRestartSession: row => row.status !== 'closed',
@@ -93,6 +94,28 @@ describe('dashboard sessions filters', () => {
     expect(isUnknownChatSession(row, () => 'SellerIM Agent 集中营')).toBe(false);
     expect(isUnknownChatSession(namedDirect)).toBe(false);
     expect(isUnknownChatSession({}, () => null)).toBe(false);
+  });
+
+  it('renders the CLI filter as a multi-select checkbox group, not a dropdown', () => {
+    const html = renderToStaticMarkup(createElement(CliFilterGroup, {
+      selected: new Set(CLI_FILTER_OPTIONS),
+      onToggle: () => {},
+    }));
+    // One checkbox per CLI option, named "cli" — never a <select> dropdown.
+    expect(html).toContain('name="cli"');
+    expect(html).not.toContain('<select');
+    expect((html.match(/type="checkbox"/g) ?? []).length).toBe(CLI_FILTER_OPTIONS.length);
+    // Full set selected ⇒ summary shows "all", not the partial/active marker.
+    expect(html).not.toContain('cli-filter-active');
+  });
+
+  it('reflects a partial CLI selection (unchecked entries + active marker)', () => {
+    const selected = new Set(CLI_FILTER_OPTIONS.filter(cli => cli !== 'codex'));
+    const html = renderToStaticMarkup(createElement(CliFilterGroup, { selected, onToggle: () => {} }));
+    expect(html).toContain('value="codex"');
+    expect(html).toContain('cli-filter-active');
+    // Exactly the deselected CLI is unchecked.
+    expect((html.match(/checked=""/g) ?? []).length).toBe(CLI_FILTER_OPTIONS.length - 1);
   });
 });
 

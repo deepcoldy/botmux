@@ -2,10 +2,19 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { TimeZoneRow } from '../src/dashboard/web/settings-page.js';
+import { FieldTitle } from '../src/dashboard/web/dashboard-components.js';
 
 /** Find the single <input> node in the rendered tree. */
 function findInput(r: TestRenderer.ReactTestRenderer) {
   return r.root.findByType('input');
+}
+
+/**
+ * The effective-zone hint moved from an inline <small> into the field title's `?` InfoTip
+ * (its `help` prop) per the dashboard UI baseline; assert on that help text.
+ */
+function findHint(r: TestRenderer.ReactTestRenderer): string {
+  return String(r.root.findByType(FieldTitle).props.help);
 }
 
 type RowProps = { value: string; host: string; effective: string; disabled: boolean; onSave: (tz: string | null) => void };
@@ -27,7 +36,7 @@ describe('TimeZoneRow (dashboard settings)', () => {
     expect(input.props.placeholder).toBe('America/Los_Angeles');
     const options = r.root.findAllByType('option');
     expect(options.some(o => o.props.value === 'Asia/Shanghai')).toBe(true);
-    const hint = String(r.root.findByType('small').props.children);
+    const hint = findHint(r);
     expect(hint).toContain('America/Los_Angeles'); // host
     expect(hint).toContain('Asia/Shanghai');        // effective
   });
@@ -35,14 +44,14 @@ describe('TimeZoneRow (dashboard settings)', () => {
   it('empty value ⇒ placeholder = host; effective (=host) shown in hint', () => {
     const { r } = render({ value: '', host: 'America/Los_Angeles', effective: 'America/Los_Angeles' });
     expect(findInput(r).props.value).toBe('');
-    expect(String(r.root.findByType('small').props.children)).toContain('America/Los_Angeles');
+    expect(findHint(r)).toContain('America/Los_Angeles');
   });
 
   it('env override: hint shows the backend effective (NOT configured||host)', () => {
     // env BOTMUX_SCHEDULE_TIMEZONE=Asia/Tokyo → configured empty, host LA, but the
     // TRUE effective is Tokyo. The hint must reflect Tokyo, not host/configured.
     const { r } = render({ value: '', host: 'America/Los_Angeles', effective: 'Asia/Tokyo' });
-    const hint = String(r.root.findByType('small').props.children);
+    const hint = findHint(r);
     expect(hint).toContain('Asia/Tokyo');
   });
 
