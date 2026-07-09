@@ -72,6 +72,7 @@ import { buildTerminalUrl } from '../../core/terminal-url.js';
 import { listOnlineDaemons } from '../../utils/daemon-discovery.js';
 import { emitGoalNarration } from '../../verified-delivery/narration.js';
 import { getGoalParentNotification, type GoalParentNotificationRecord } from '../../services/goal-parent-notification-store.js';
+import { closeGoalChat } from '../../services/goal-chat-store.js';
 import { chatAppLink } from './lark-hosts.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
@@ -1505,7 +1506,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
     }));
     const closed = perDaemon.reduce((a, b) => a + b, 0);
-    logger.info(`[goal-cleanup] ${operatorOpenId ?? '?'} closed ${closed} chat-scope sessions across daemons for goal=${goalChatId}`);
+    const closedRegistry = closeGoalChat(goalChatId, { closedBy: operatorOpenId });
+    logger.info(`[goal-cleanup] ${operatorOpenId ?? '?'} closed ${closed} chat-scope sessions across daemons for goal=${goalChatId}; registryClosed=${Boolean(closedRegistry)}`);
     // Narrate into the goal group so observers see the cleanup actually fired —
     // the sessions are gone, but the card is sent by the bot directly (not via a
     // session), so the goal group still gets a visible 🧹 marker.
@@ -1521,7 +1523,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       header: { template: 'green', title: { tag: 'plain_text', content: 'Goal 会话已清理' } },
       elements: [{
         tag: 'div',
-        text: { tag: 'lark_md', content: `已清理 **${closed}** 个 goal 群 chat-scope 会话（已覆盖全部 bot/daemon）。\n\nGoal 群保留，不退群、不删群。` },
+        text: { tag: 'lark_md', content: `已清理 **${closed}** 个 goal 群 chat-scope 会话（已覆盖全部 bot/daemon）。\n\n已停止该 goal 的自动恢复；Goal 群保留，不退群、不删群。` },
       }],
     };
   }

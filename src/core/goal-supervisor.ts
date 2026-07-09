@@ -355,6 +355,11 @@ export async function ensureGoalSupervisorFromRegistry(
   deps: GoalSupervisorDeps,
   opts: EnsureGoalSupervisorOptions = {},
 ): Promise<EnsureGoalSupervisorResult> {
+  const rec = getGoalChat(goalChatId);
+  if (rec?.closedAt) {
+    return { ok: false, goalChatId, errorCode: 'goal_closed', error: `goal chat was closed at ${rec.closedAt}` };
+  }
+
   const active = findGoalSupervisorByGoal(deps.activeSessions, deps.larkAppId, goalChatId);
   if (active?.session.goalSupervisor) {
     return {
@@ -365,7 +370,6 @@ export async function ensureGoalSupervisorFromRegistry(
     };
   }
 
-  const rec = getGoalChat(goalChatId);
   if (!rec) {
     return { ok: false, goalChatId, errorCode: 'goal_not_registered', error: 'goal chat is not registered' };
   }

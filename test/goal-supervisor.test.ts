@@ -1,10 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
   buildGoalParentNotificationPrompt,
   buildGoalSupervisorPrompt,
+  ensureGoalSupervisorFromRegistry,
   findGoalParentSession,
 } from '../src/core/goal-supervisor.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
+import { _resetGoalChatStoreForTest } from '../src/services/goal-chat-store.js';
+
+afterEach(() => {
+  _resetGoalChatStoreForTest();
+});
 
 function ds(input: {
   sessionId: string;
@@ -113,5 +119,30 @@ describe('goal supervisor prompt', () => {
     expect(prompt).toContain('goalChatId: oc_goal');
     expect(prompt).toContain('全部任务 accepted。');
     expect(prompt).toContain('账本仍是真相源');
+  });
+
+  it('does not auto-revive a goal that cleanup has closed', async () => {
+    _resetGoalChatStoreForTest([{
+      chatId: 'oc_goal',
+      title: 'Closed goal',
+      larkAppId: 'cli_main',
+      parentChatId: 'oc_parent',
+      closedAt: new Date(1000).toISOString(),
+      closedBy: 'ou_owner',
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(1000).toISOString(),
+    }]);
+
+    const result = await ensureGoalSupervisorFromRegistry('oc_goal', {
+      larkAppId: 'cli_main',
+      activeSessions: new Map(),
+    }, { now: 2000 });
+
+    expect(result).toEqual({
+      ok: false,
+      goalChatId: 'oc_goal',
+      errorCode: 'goal_closed',
+      error: 'goal chat was closed at 1970-01-01T00:00:01.000Z',
+    });
   });
 });

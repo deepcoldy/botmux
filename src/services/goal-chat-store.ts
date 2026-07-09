@@ -25,6 +25,8 @@ export interface GoalChatRecord {
   supervisorCreatedAt?: string;
   lastReviveAt?: string;
   reviveAttempts?: string[];
+  closedAt?: string;
+  closedBy?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -46,6 +48,11 @@ export interface RegisterGoalChatInput {
   supervisorCreatedAt?: string;
   lastReviveAt?: string;
   reviveAttempts?: string[];
+}
+
+export interface CloseGoalChatInput {
+  now?: number;
+  closedBy?: string;
 }
 
 let loadedFrom: string | null = null;
@@ -104,6 +111,14 @@ function writeFile(next: Map<string, GoalChatRecord>): void {
   loadIfNeeded();
 }
 
+function persist(next: Map<string, GoalChatRecord>): void {
+  if (testOverride) {
+    goalChats = next;
+    return;
+  }
+  writeFile(next);
+}
+
 export function registerGoalChat(chatId: string, input: RegisterGoalChatInput = {}): GoalChatRecord {
   testOverride = false;
   const id = chatId.trim();
@@ -130,6 +145,25 @@ export function registerGoalChat(chatId: string, input: RegisterGoalChatInput = 
   const next = new Map(goalChats);
   next.set(id, rec);
   writeFile(next);
+  return rec;
+}
+
+export function closeGoalChat(chatId: string | undefined, input: CloseGoalChatInput = {}): GoalChatRecord | undefined {
+  const id = chatId?.trim();
+  if (!id) return undefined;
+  loadIfNeeded();
+  const prev = goalChats.get(id);
+  if (!prev) return undefined;
+  const nowIso = new Date(input.now ?? Date.now()).toISOString();
+  const rec: GoalChatRecord = {
+    ...prev,
+    closedAt: nowIso,
+    closedBy: input.closedBy?.trim() || prev.closedBy,
+    updatedAt: nowIso,
+  };
+  const next = new Map(goalChats);
+  next.set(id, rec);
+  persist(next);
   return rec;
 }
 
