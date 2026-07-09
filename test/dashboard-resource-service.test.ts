@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createResourceMonitorService, toResourceMonitorSessionSeed } from '../src/dashboard/resource-monitor-service.js';
+import { createResourceMonitorService, toResourceMonitorDaemonSeed, toResourceMonitorSessionSeed } from '../src/dashboard/resource-monitor-service.js';
 import type { ProcfsSample } from '../src/core/resource-monitor/types.js';
 
 function sample(processes: ProcfsSample['processes'], totalCpuTicks = 1000, idleCpuTicks = 0): ProcfsSample {
@@ -40,6 +40,28 @@ describe('ResourceMonitorService', () => {
       agentAttention: { kind: '123', reason: '', at: 30_000 },
       workerPid: 20,
       adoptCliPid: 30,
+    });
+  });
+
+  it('maps dashboard daemon rows with explicit runtime status', () => {
+    expect(toResourceMonitorDaemonSeed({
+      larkAppId: 'app-online',
+      botName: 'Online',
+      pid: 10,
+    })).toEqual({
+      larkAppId: 'app-online',
+      botName: 'Online',
+      pid: 10,
+      status: 'online',
+    });
+
+    expect(toResourceMonitorDaemonSeed({
+      larkAppId: 'app-offline',
+      botName: 'Offline',
+    })).toEqual({
+      larkAppId: 'app-offline',
+      botName: 'Offline',
+      status: 'offline',
     });
   });
 

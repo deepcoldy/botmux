@@ -107,7 +107,7 @@ import { automateOpenPlatformSetup } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 import { larkHosts } from './im/lark/lark-hosts.js';
-import { createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
+import { createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorDaemonSeed, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -919,11 +919,7 @@ const resourceMonitor = createResourceMonitorService({
       .filter(s => s.status !== 'closed')
       .map(s => toResourceMonitorSessionSeed(s, names.get(String(s.larkAppId ?? ''))));
   },
-  listDaemons: () => registry.list().map(d => ({
-    larkAppId: d.larkAppId,
-    botName: d.botName,
-    pid: d.pid,
-  })),
+  listDaemons: () => registry.list().map(toResourceMonitorDaemonSeed),
 });
 resourceMonitor.start();
 

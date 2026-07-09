@@ -60,6 +60,12 @@ export interface ResourceMonitorDashboardSessionRow {
   adoptCliPid?: unknown;
 }
 
+export interface ResourceMonitorDashboardDaemonRow {
+  larkAppId?: unknown;
+  botName?: unknown;
+  pid?: unknown;
+}
+
 export function toResourceMonitorSessionSeed(row: ResourceMonitorDashboardSessionRow, botNameOverride?: string): ResourceSessionSeed {
   const larkAppId = String(row.larkAppId ?? '');
   const workerPid = typeof row.workerPid === 'number' ? row.workerPid : undefined;
@@ -85,6 +91,18 @@ export function toResourceMonitorSessionSeed(row: ResourceMonitorDashboardSessio
     ...(attention !== undefined ? { agentAttention: attention } : {}),
     ...(workerPid !== undefined ? { workerPid } : {}),
     ...(adoptCliPid !== undefined ? { adoptCliPid } : {}),
+  };
+}
+
+export function toResourceMonitorDaemonSeed(row: ResourceMonitorDashboardDaemonRow): ResourceDaemonSeed {
+  const larkAppId = String(row.larkAppId ?? '');
+  const pid = typeof row.pid === 'number' ? row.pid : undefined;
+
+  return {
+    larkAppId,
+    botName: String(row.botName ?? larkAppId),
+    ...(pid !== undefined ? { pid } : {}),
+    status: pid ? 'online' : 'offline',
   };
 }
 
