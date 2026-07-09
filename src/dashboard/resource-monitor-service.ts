@@ -296,11 +296,39 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
     }
   }
 
+  function runtimeSummaryFromSeeds(supported: boolean, sampledAt: number, now: number) {
+    return buildRuntimeMonitorSummary({
+      supported,
+      sampledAt,
+      intervalMs,
+      nowMs: now,
+      bots: deps.listDaemons().map(daemon => ({
+        larkAppId: daemon.larkAppId,
+        botName: daemon.botName ?? daemon.larkAppId,
+        daemonStatus: daemon.status ?? (daemon.pid ? 'unknown' : 'offline'),
+      })),
+      sessions: deps.listSessions().map(session => ({
+        sessionId: session.sessionId,
+        larkAppId: session.larkAppId,
+        botName: session.botName ?? session.larkAppId,
+        title: session.title,
+        status: session.status,
+        spawnedAt: session.spawnedAt,
+        lastMessageAt: session.lastMessageAt,
+        agentAttention: session.agentAttention,
+      })),
+    });
+  }
+
   function sampleOnce(): void {
     const now = nowMs();
     const sample = sampleProcfs(now);
     if (!sample.supported) {
-      currentSnapshot = emptyCurrent(sample.sampledAt || now, intervalMs);
+      const sampledAt = sample.sampledAt || now;
+      currentSnapshot = {
+        ...emptyCurrent(sampledAt, intervalMs),
+        runtime: runtimeSummaryFromSeeds(false, sampledAt, now),
+      };
       previousTotalCpuTicks = undefined;
       previousIdleCpuTicks = undefined;
       previousProcessTicks = new Map();

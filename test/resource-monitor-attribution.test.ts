@@ -74,4 +74,28 @@ describe('attributeResources', () => {
     expect(result.botmux).toEqual({ rssBytes: 400, cpuPct: 4 });
     expect(result.bots).toEqual([]);
   });
+
+  it('uses explicit daemon status before process-presence fallback', () => {
+    const result = attributeResources({
+      processes,
+      processCpuPct: new Map([[10, 1], [40, 5]]),
+      sessions: [],
+      daemons: [
+        { larkAppId: 'app-online', botName: 'Online', status: 'online' },
+        { larkAppId: 'app-offline', botName: 'Offline', pid: 40, status: 'offline' },
+        { larkAppId: 'app-unknown', botName: 'Unknown', pid: 999 },
+        { larkAppId: 'app-missing', botName: 'Missing' },
+      ],
+      cliMarkers: new Map(),
+      previousSessionStats: new Map(),
+      nowMs: 10_000,
+    });
+
+    expect(result.bots.map(bot => [bot.larkAppId, bot.daemonStatus])).toEqual([
+      ['app-online', 'online'],
+      ['app-offline', 'offline'],
+      ['app-unknown', 'unknown'],
+      ['app-missing', 'offline'],
+    ]);
+  });
 });

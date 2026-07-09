@@ -82,6 +82,66 @@ describe('ResourceMonitorService', () => {
     expect(svc.current().runtime.sessions.longestWaiting).toMatchObject({ sessionId: 'wait', durationMs: 30_000 });
   });
 
+  it('summarizes runtime health from service daemon and session seeds', () => {
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      sampleProcfs: () => sample([
+        { pid: 10, ppid: 1, rssBytes: 10, cpuTicks: 10, cmd: 'offline-daemon' },
+        { pid: 20, ppid: 1, rssBytes: 10, cpuTicks: 10, cmd: 'worker-run' },
+        { pid: 30, ppid: 1, rssBytes: 10, cpuTicks: 10, cmd: 'worker-start' },
+      ]),
+      listSessions: () => [
+        { sessionId: 'run', larkAppId: 'app-online', botName: 'Online', title: 'run', status: 'working', spawnedAt: 10_000, workerPid: 20 },
+        {
+          sessionId: 'wait',
+          larkAppId: 'app-online',
+          botName: 'Online',
+          title: 'wait',
+          status: 'active',
+          spawnedAt: 40_000,
+          lastMessageAt: 60_000,
+          agentAttention: { kind: 'blocked', reason: 'need input', at: 70_000 },
+        },
+        { sessionId: 'start', larkAppId: 'app-offline', botName: 'Offline', title: 'start', status: 'starting', spawnedAt: 80_000, workerPid: 30 },
+      ],
+      listDaemons: () => [
+        { larkAppId: 'app-online', botName: 'Online', status: 'online' },
+        { larkAppId: 'app-offline', botName: 'Offline', pid: 10, status: 'offline' },
+      ],
+      readCliMarkers: () => new Map(),
+      nowMs: () => 100_000,
+    });
+
+    svc.sampleOnce();
+
+    expect(svc.current().runtime.sampleHealth.status).toBe('fresh');
+    expect(svc.current().runtime.daemons).toEqual({ total: 2, online: 1, offline: 1 });
+    expect(svc.current().runtime.sessions).toMatchObject({
+      total: 3,
+      working: 1,
+      starting: 1,
+      waiting: 1,
+      unattributed: 1,
+    });
+    expect(svc.current().runtime.sessions.longestRunning).toMatchObject({ sessionId: 'run', durationMs: 90_000 });
+    expect(svc.current().runtime.sessions.longestWaiting).toMatchObject({ sessionId: 'wait', durationMs: 30_000 });
+    expect(svc.current().bots.find(bot => bot.larkAppId === 'app-online')?.runtime.sessions).toEqual({
+      total: 2,
+      working: 1,
+      starting: 0,
+      waiting: 1,
+    });
+    expect(svc.current().bots.find(bot => bot.larkAppId === 'app-offline')?.runtime).toEqual({
+      daemonStatus: 'offline',
+      sessions: {
+        total: 1,
+        working: 0,
+        starting: 1,
+        waiting: 0,
+      },
+    });
+  });
+
   it('keeps all current sessions but only tracked sessions in history', () => {
     let tick = 0;
     let now = 0;
@@ -133,8 +193,10 @@ describe('ResourceMonitorService', () => {
         mem: { memTotalBytes: 0, memAvailableBytes: 0, swapTotalBytes: 0, swapFreeBytes: 0 },
         processes: [],
       }),
-      listSessions: () => [],
-      listDaemons: () => [],
+      listSessions: () => [
+        { sessionId: 'live', larkAppId: 'app', botName: 'bot', status: 'working', spawnedAt: 100 },
+      ],
+      listDaemons: () => [{ larkAppId: 'app', botName: 'bot', status: 'online' }],
       readCliMarkers: () => new Map(),
       nowMs: () => 123,
     });
@@ -148,6 +210,9 @@ describe('ResourceMonitorService', () => {
       bots: [],
       sessions: [],
     });
+    expect(svc.current().runtime.sampleHealth.status).toBe('unsupported');
+    expect(svc.current().runtime.daemons).toEqual({ total: 1, online: 1, offline: 0 });
+    expect(svc.current().runtime.sessions).toMatchObject({ total: 1, working: 1 });
     expect(svc.history('3h')).toMatchObject({
       ok: true,
       supported: false,

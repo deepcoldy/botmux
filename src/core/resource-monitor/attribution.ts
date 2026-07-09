@@ -23,6 +23,7 @@ export interface ResourceDaemonSeed {
   larkAppId: string;
   botName?: string;
   pid?: number;
+  status?: 'online' | 'offline' | 'unknown';
 }
 
 export interface CliMarkerInfo {
@@ -220,7 +221,7 @@ export function attributeResources(input: AttributionInput): AttributionResult {
       const bucket = sessionRuntimeBucket(session);
       if (bucket === 'working' || bucket === 'starting' || bucket === 'waiting') runtimeSessions[bucket] += 1;
     }
-    const daemonStatus = daemon.pid === undefined ? 'unknown' : byPid.has(daemon.pid) ? 'online' : 'offline';
+    const daemonStatus = daemon.status ?? (daemon.pid && byPid.has(daemon.pid) ? 'online' : daemon.pid ? 'unknown' : 'offline');
     return {
       larkAppId: daemon.larkAppId,
       botName: daemon.botName ?? daemon.larkAppId,
