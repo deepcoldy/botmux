@@ -841,6 +841,14 @@ export interface BotConfig {
    * 单条订阅的触发范围之后可在 dashboard 逐文档改（doc-subscriptions 表）。
    */
   docSubscribeDefaultMode?: 'mention-only' | 'all';
+  /**
+   * 文档 → 本地仓库/目录映射。当文档评论触发且无活跃 session 时，auto-create
+   * session 会按 fileToken 查此表确定 agent 的 workingDir。
+   * 键是飞书文档的 file_token（wiki 已解析为底层 obj_token），值是本地绝对路径。
+   * 例：{ "KszRdLt6MoNtBFxNjBmm3jlhyWd": "/home/me/my-repo" }
+   * 也可以在 `/subscribe-lark-doc --dir /path` 时逐文档指定。
+   */
+  docRepoMap?: Record<string, string>;
   /** Per-bot range for explicit `@bot /summary`; defaults to 50 messages / 24h. */
   summaryRange?: SummaryRangeConfig;
   /**
@@ -1508,6 +1516,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
       // undefined 让 bots.json 保持干净。
       docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : undefined,
+      // 文档 → 本地仓库映射。file_token → 绝对路径。
+      docRepoMap: entry.docRepoMap && typeof entry.docRepoMap === 'object' && !Array.isArray(entry.docRepoMap)
+        ? Object.fromEntries(
+            Object.entries(entry.docRepoMap as Record<string, unknown>)
+              .filter(([, v]) => typeof v === 'string' && v.trim())
+              .map(([k, v]) => [k, (v as string).trim()])
+          )
+        : undefined,
       summaryRange,
       contentTriggers,
       voice,

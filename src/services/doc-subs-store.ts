@@ -40,6 +40,8 @@ export interface DocSubscription {
   docTitle?: string;
   /** 发起订阅的用户 open_id。 */
   ownerOpenId?: string;
+  /** 该文档绑定的本地仓库/目录。agent 在此目录下运行（auto-create session 时使用）。 */
+  workingDir?: string;
   createdAt: number;
 }
 

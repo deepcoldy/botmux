@@ -1698,6 +1698,9 @@ async function processCommentEvent(
   // 1) 查订阅表；未订阅的文档自动创建一条（mention-only，@bot 才触发）
   let sub = getDocSubscription(config.session.dataDir, larkAppId, fileToken);
   if (!sub) {
+    // 从 bot 配置的 docRepoMap 查该文档绑定的仓库目录
+    const botCfg = getBot(larkAppId).config;
+    const mappedDir = botCfg.docRepoMap?.[fileToken];
     const autoSub: DocSubscription = {
       fileToken,
       fileType: parsed.fileType || 'docx',
@@ -1707,11 +1710,12 @@ async function processCommentEvent(
       chatId: `doc:${fileToken}`,
       commentTriggerMode: 'mention-only',
       ownerOpenId: parsed.operatorOpenId,
+      workingDir: mappedDir,
       createdAt: Date.now(),
     };
     putDocSubscription(config.session.dataDir, larkAppId, autoSub);
     sub = autoSub;
-    logger.info(`[doc-comment] auto-subscribed file=${fileToken.slice(0, 12)} type=${parsed.fileType || 'docx'} (mention-only, anchor=doc:${fileToken.slice(0, 12)})`);
+    logger.info(`[doc-comment] auto-subscribed file=${fileToken.slice(0, 12)} type=${parsed.fileType || 'docx'} (mention-only${mappedDir ? `, wd=${mappedDir}` : ''}, anchor=doc:${fileToken.slice(0, 12)})`);
   }
 
   // 关掉 open_id 启动竞态：probeBotOpenId 在启动时 fire-and-forget，若评论事件

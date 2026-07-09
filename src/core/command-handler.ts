@@ -1757,7 +1757,10 @@ export async function handleCommand(
         if (arg === 'list' || arg === '列表') {
           const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor);
           if (!subs.length) { await sessionReply(rootId, t('cmd.subdoc.none', undefined, loc)); break; }
-          const lines = subs.map(s => `• ${s.docTitle || s.fileToken}（${modeLabel(s.commentTriggerMode)}）`);
+          const lines = subs.map(s => {
+            const wd = s.workingDir ? ` 📂${s.workingDir}` : '';
+            return `• ${s.docTitle || s.fileToken}（${modeLabel(s.commentTriggerMode)}）${wd}`;
+          });
           await sessionReply(rootId, [t('cmd.subdoc.list_title', undefined, loc), ...lines].join('\n'));
           break;
         }
@@ -1773,6 +1776,23 @@ export async function handleCommand(
         }
 
         if (!arg) { await sessionReply(rootId, t('cmd.subdoc.usage', undefined, loc)); break; }
+
+        // 解析 --dir <path> 参数（指定该文档绑定的本地仓库/目录）
+        const dirMatch = arg.match(/--dir\s+(\S+)/);
+        const docWorkingDir = dirMatch ? dirMatch[1] : undefined;
+        const docRef = arg.replace(/--dir\s+\S+/, '').trim();
+        if (!docRef) { await sessionReply(rootId, t('cmd.subdoc.usage', undefined, loc)); break; }
+
+        // 校验 --dir 路径
+        let validatedDir: string | undefined;
+        if (docWorkingDir) {
+          const v = validateWorkingDir(docWorkingDir, loc);
+          if (!v.ok) {
+            await sessionReply(rootId, v.error);
+            break;
+          }
+          validatedDir = v.resolvedPath;
+        }
 
         // 评论事件官方推荐用户身份订阅，tenant 订阅大概率收不到推送 → 需要带文档 scope
         // 的 User Token。文档 scope 不在通用 /login 里（避免污染所有 bot 的登录），
@@ -1794,7 +1814,7 @@ export async function handleCommand(
         if (!userTok) { await replyDocLogin(); break; }
 
         try {
-          const file = await resolveDocFile(larkAppId, arg);
+          const file = await resolveDocFile(larkAppId, docRef);
           await subscribeDocFile(larkAppId, file);
           const mode: CommentTriggerMode = subCfg.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only';
           const { previous } = putDocSubscription(dataDir, larkAppId, {
@@ -1806,16 +1826,21 @@ export async function handleCommand(
             chatId: ds.chatId,
             commentTriggerMode: mode,
             ownerOpenId: message.senderId,
+            workingDir: validatedDir,
             createdAt: Date.now(),
           });
           const title = file.fileToken.slice(0, 12);
           const rebound = previous && previous.sessionAnchor !== anchor;
-          await sessionReply(rootId, t(
+          let replyText = t(
             rebound ? 'cmd.subdoc.subscribed_moved' : 'cmd.subdoc.subscribed',
             { title, mode: modeLabel(mode) },
             loc,
-          ));
-          logger.info(`[${logTag}] /subscribe-lark-doc → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${rebound ? ' (rebound)' : ''}`);
+          );
+          if (validatedDir) {
+            replyText += `\n📂 工作目录：${validatedDir}`;
+          }
+          await sessionReply(rootId, replyText);
+          logger.info(`[${logTag}] /subscribe-lark-doc → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${validatedDir ? ` wd=${validatedDir}` : ''}${rebound ? ' (rebound)' : ''}`);
         } catch (err) {
           // token 缺失 / 失效 / 缺文档 scope（403）→ 给带文档 scope 的重新授权链接。
           if (err instanceof UserTokenMissingError) {

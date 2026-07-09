@@ -7777,8 +7777,8 @@ async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx
   const botCfg = getBot(larkAppId).config;
   const loc = localeForBot(larkAppId);
 
-  // 解析 workingDir
-  const workingDir = (sub as any).workingDir
+  // 解析 workingDir：订阅时指定的 > bot 配置 defaultWorkingDir > bot 配置 workingDir > ~
+  const workingDir = sub.workingDir
     ?? effectiveDefaultWorkingDir(botCfg)
     ?? botCfg.workingDir
     ?? '~';
