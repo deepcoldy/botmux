@@ -144,9 +144,9 @@ export interface DaemonSession {
    *  随 final_output 传回）；value = 该回哪个文档的哪条评论。deliverFinalOutput
    *  命中后把正文发表为文档评论而非飞书卡片，并删除该项。仅内存（轮是瞬时的）。 */
   docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string }>;
-  /** Last assistant uuid emitted via the adopt bridge final_output pipeline.
-   *  Used by the daemon to dedupe successive `final_output` IPCs (e.g. when
-   *  the worker re-drains the transcript after a noisy idle). */
+  /** Last scoped dedupe key emitted via the bridge final_output pipeline.
+   *  Format is `${sessionId}:${lastUuid || turnId}` so different sessions can
+   *  never suppress each other's final_output payloads. */
   lastBridgeEmittedUuid?: string;
   /** Flag flipped to true once a `session.exited` dashboard event has been
    *  published for this session. Both the dashboard-driven close path

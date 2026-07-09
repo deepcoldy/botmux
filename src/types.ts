@@ -351,6 +351,10 @@ export type WorkerToDaemon =
   | { type: 'user_notify'; message: string; turnId?: string }
   | {
       type: 'final_output';
+      /** Worker-side botmux session identity. Daemon validates this before
+       *  routing the reply so a stale/wrongly-bound worker cannot post into
+       *  another Lark thread. Optional for one release to accept older workers. */
+      sessionId?: string;
       content: string;
       lastUuid: string;
       turnId: string;

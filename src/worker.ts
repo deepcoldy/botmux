@@ -5707,10 +5707,13 @@ if(!${isTmuxMode && !isPipeMode}){
 // ─── IPC Communication ───────────────────────────────────────────────────────
 
 function send(msg: WorkerToDaemon): void {
-  if (isWorkflowWorker() && msg.type === 'final_output') {
+  const payload: WorkerToDaemon = msg.type === 'final_output' && sessionId
+    ? { ...msg, sessionId }
+    : msg;
+  if (isWorkflowWorker() && payload.type === 'final_output') {
     workflowFinalOutputSent = true;
   }
-  process.send?.(msg);
+  process.send?.(payload);
 }
 
 function log(msg: string): void {
