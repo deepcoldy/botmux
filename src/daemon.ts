@@ -241,6 +241,7 @@ type VcMeetingDaemonSession = {
   listenerChatId?: string;
   pendingItems: NormalizedVcMeetingItem[];
   flushTimer?: ReturnType<typeof setInterval>;
+  restoreTickTimer?: ReturnType<typeof setTimeout>;
   flushing: boolean;
   flushPromise?: Promise<VcMeetingListenerFlushResult>;
   startPromise?: Promise<VcMeetingStartResult>;
@@ -318,8 +319,11 @@ type VcMeetingPendingOutputRequest = {
   nonce: string;
   agentAppId: string;
   content: string;
+  contentParts?: string[];
   reason?: string;
+  reasonParts?: string[];
   fallbackText?: string;
+  fallbackTextParts?: string[];
   createdAt: number;
   expiresAt: number;
   cardMessageId?: string;
@@ -368,6 +372,7 @@ const DEFAULT_VC_MEETING_CONSUMER_MIN_BATCH_ITEMS = 1;
 const DEFAULT_VC_MEETING_CONSUMER_MAX_INJECT_INTERVAL_MS = 180_000;
 const DEFAULT_VC_MEETING_TEXT_REVIEW_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_VC_MEETING_VOICE_REVIEW_TIMEOUT_MS = 3 * 60_000;
+const VC_MEETING_RESTORE_IMMEDIATE_TICK_DELAY_MS = 6_000;
 const VC_MEETING_END_MESSAGE_RETRY_DELAYS_MS = [1_000, 3_000, 8_000] as const;
 const DEFAULT_VC_REALTIME_TEST_SPEAK_CLOSE_GRACE_MS = 3_000;
 const VC_MEETING_LISTENER_MESSAGE_MAX_CHARS = 3_200;
@@ -3004,7 +3009,7 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     session.selectedAgentAppId = record.selectedAgentAppId;
     session.selectedAgentLabel = record.selectedAgentLabel;
     session.consumerPaused = record.consumerPaused;
-    if (session.consumerMode === 'agent') session.consumerLastInjectedAtMs = Date.now();
+    if (session.consumerMode === 'agent') session.consumerLastInjectedAtMs = undefined;
     session.textOutputPolicy = record.textOutputPolicy ?? defaultVcMeetingTextOutputPolicy();
     session.voiceOutputPolicy = record.voiceOutputPolicy ?? defaultVcMeetingVoiceOutputPolicy(cfg);
     session.syncIntervalMs = record.syncIntervalMs;
@@ -3017,7 +3022,10 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
       (record.temporaryInstructionUnionIds ?? []).map(unionId => [unionId, true] as const),
     );
     scheduleVcMeetingListenerFlush(key, cfg);
-    if (session.consumerMode === 'agent') scheduleVcMeetingConsumerInjection(key, cfg);
+    if (session.consumerMode === 'agent') {
+      scheduleVcMeetingConsumerInjection(key, cfg);
+      scheduleVcMeetingRestoreImmediateTick(key, cfg);
+    }
     if (session.consumerMode === 'pending') {
       const remaining = Math.max(0, (session.consumerSelectionExpiresAt ?? Date.now()) - Date.now());
       armVcMeetingConsumerSelectionTimer(key, cfg, remaining);
@@ -3184,6 +3192,7 @@ function cleanupVcMeetingDaemonSession(session: VcMeetingDaemonSession, reason: 
     clearInterval(session.flushTimer);
     session.flushTimer = undefined;
   }
+  clearVcMeetingRestoreTickTimer(session);
   clearVcMeetingConsumerSelectionTimer(session);
   clearVcMeetingConsumerInjectTimer(session);
   clearVcMeetingOutputRequests(session);
@@ -3679,6 +3688,13 @@ function clearVcMeetingConsumerInjectTimer(session: VcMeetingDaemonSession): voi
   if (session.consumerInjectTimer) {
     clearInterval(session.consumerInjectTimer);
     session.consumerInjectTimer = undefined;
+  }
+}
+
+function clearVcMeetingRestoreTickTimer(session: VcMeetingDaemonSession): void {
+  if (session.restoreTickTimer) {
+    clearTimeout(session.restoreTickTimer);
+    session.restoreTickTimer = undefined;
   }
 }
 
@@ -4220,6 +4236,25 @@ function clearVcMeetingOutputRequests(session: VcMeetingDaemonSession): void {
   session.pendingOutputRequests = {};
 }
 
+function armVcMeetingOutputRequestTimer(
+  key: string,
+  req: VcMeetingPendingOutputRequest,
+): void {
+  clearVcMeetingOutputRequestTimer(req);
+  req.timer = setTimeout(() => {
+    const current = vcMeetingSessions.get(key);
+    const pending = current?.pendingOutputRequests[req.channel];
+    if (!current || !pending || pending.id !== req.id || pending.applying) return;
+    void rejectVcMeetingOutputRequest(
+      current,
+      pending,
+      'expired',
+      `你的 ${req.channel === 'voice' ? '语音' : '会中弹幕'} 输出请求已超时并被自动拒绝。`,
+    );
+  }, vcMeetingOutputReviewTimeoutMs(req.channel));
+  if (typeof req.timer.unref === 'function') req.timer.unref();
+}
+
 async function expireVcMeetingOutputRequestsOnClose(session: VcMeetingDaemonSession): Promise<void> {
   const pending = Object.values(session.pendingOutputRequests);
   for (const req of pending) {
@@ -4243,6 +4278,42 @@ function vcMeetingPendingOutputById(
   return undefined;
 }
 
+function vcMeetingOutputContentParts(req: VcMeetingPendingOutputRequest): string[] {
+  return req.contentParts?.length ? [...req.contentParts] : [req.content];
+}
+
+function vcMeetingOutputReasonParts(req: VcMeetingPendingOutputRequest): string[] {
+  return req.reasonParts?.length ? [...req.reasonParts] : (req.reason ? [req.reason] : []);
+}
+
+function vcMeetingOutputFallbackParts(req: VcMeetingPendingOutputRequest): string[] | undefined {
+  if (req.channel !== 'voice') return undefined;
+  if (req.fallbackTextParts?.length) return [...req.fallbackTextParts];
+  if (req.fallbackText) return [req.fallbackText];
+  return vcMeetingOutputContentParts(req);
+}
+
+function vcMeetingOutputFallbackPartForInput(input: { channel: VcMeetingOutputChannel; content: string; fallbackText?: string }): string | undefined {
+  if (input.channel !== 'voice') return undefined;
+  return input.fallbackText?.trim() || input.content;
+}
+
+function normalizeVcMeetingVoicePart(part: string): string {
+  const stripped = part.trim().replace(/[。.!！?？]+$/u, '').trim();
+  return stripped || part.trim();
+}
+
+function joinVcMeetingOutputParts(channel: VcMeetingOutputChannel, parts: string[]): string {
+  if (channel === 'voice') {
+    return `${parts.map(normalizeVcMeetingVoicePart).filter(Boolean).join('。')}。`;
+  }
+  return parts.join('\n');
+}
+
+function vcMeetingOutputOverflowMessage(channel: VcMeetingOutputChannel): string {
+  return `合并后会超过${channel === 'voice' ? '语音' : '会中弹幕'}长度上限，请等当前审批完成后再发。`;
+}
+
 function vcMeetingOutputReviewCardForRequest(
   session: VcMeetingDaemonSession,
   req: VcMeetingPendingOutputRequest,
@@ -4257,8 +4328,10 @@ function vcMeetingOutputReviewCardForRequest(
     nonce: req.nonce,
     agentLabel: session.selectedAgentLabel ?? req.agentAppId,
     content: req.content,
+    ...(req.contentParts?.length && req.contentParts.length > 1 ? { contentItems: req.contentParts } : {}),
     ...(req.reason ? { reason: req.reason } : {}),
     ...(req.fallbackText ? { fallbackText: req.fallbackText } : {}),
+    ...(req.fallbackTextParts?.length && req.fallbackTextParts.length > 1 ? { fallbackTextItems: req.fallbackTextParts } : {}),
     textOutputAvailable: vcMeetingTextOutputAvailable(),
     ...(opts.error ? { error: opts.error } : {}),
   }));
@@ -4398,7 +4471,7 @@ async function submitVcMeetingOutputRequest(input: {
   content: string;
   reason?: string;
   fallbackText?: string;
-}): Promise<{ ok: true; status: 'sent' | 'pending'; requestId?: string } | { ok: false; error: string }> {
+}): Promise<{ ok: true; status: 'sent' | 'pending'; requestId?: string; merged?: boolean } | { ok: false; error: string }> {
   const cfg = effectiveVcMeetingAgentConfig(input.larkAppId);
   const key = vcMeetingSessionKey(input.larkAppId, input.meetingId);
   const session = vcMeetingSessions.get(key);
@@ -4422,8 +4495,11 @@ async function submitVcMeetingOutputRequest(input: {
     nonce: randomVcMeetingNonce(),
     agentAppId: session.selectedAgentAppId,
     content: input.content,
+    contentParts: [input.content],
     ...(input.reason ? { reason: input.reason } : {}),
+    ...(input.reason ? { reasonParts: [input.reason] } : {}),
     ...(input.fallbackText ? { fallbackText: input.fallbackText } : {}),
+    ...(input.fallbackText ? { fallbackTextParts: [input.fallbackText] } : {}),
     createdAt: now,
     expiresAt: now + vcMeetingOutputReviewTimeoutMs(input.channel),
   };
@@ -4443,27 +4519,64 @@ async function submitVcMeetingOutputRequest(input: {
     return { ok: false, error: `上一条${input.channel === 'voice' ? '语音' : '会中弹幕'}输出请求正在执行，稍后重试` };
   }
   if (prior) {
-    await rejectVcMeetingOutputRequest(
-      session,
-      prior,
-      'superseded',
-    ).catch((err) => {
-      logger.warn(`[vc-agent] supersede output request failed meeting=${input.meetingId}: ${err instanceof Error ? err.message : String(err)}`);
-    });
+    const mergedContentParts = [...vcMeetingOutputContentParts(prior), input.content];
+    const mergedContent = joinVcMeetingOutputParts(input.channel, mergedContentParts);
+    const priorFallbackParts = vcMeetingOutputFallbackParts(prior);
+    const nextFallbackPart = vcMeetingOutputFallbackPartForInput(input);
+    const mergedFallbackParts = priorFallbackParts || nextFallbackPart
+      ? [...(priorFallbackParts ?? []), ...(nextFallbackPart ? [nextFallbackPart] : [])]
+      : undefined;
+    const mergedFallbackText = mergedFallbackParts?.length
+      ? joinVcMeetingOutputParts('text', mergedFallbackParts)
+      : undefined;
+    if (mergedContent.length > VC_MEETING_OUTPUT_MAX_CONTENT_CHARS || (mergedFallbackText?.length ?? 0) > VC_MEETING_OUTPUT_MAX_CONTENT_CHARS) {
+      return { ok: false, error: vcMeetingOutputOverflowMessage(input.channel) };
+    }
+    const mergedReasonParts = [...vcMeetingOutputReasonParts(prior), ...(input.reason ? [input.reason] : [])];
+    const mergedReq: VcMeetingPendingOutputRequest = {
+      ...prior,
+      nonce: randomVcMeetingNonce(),
+      content: mergedContent,
+      contentParts: mergedContentParts,
+      expiresAt: now + vcMeetingOutputReviewTimeoutMs(input.channel),
+      applying: false,
+      timer: undefined,
+    };
+    if (mergedReasonParts.length > 0) {
+      mergedReq.reason = mergedReasonParts.join('；');
+      mergedReq.reasonParts = mergedReasonParts;
+    } else {
+      delete mergedReq.reason;
+      delete mergedReq.reasonParts;
+    }
+    if (mergedFallbackText) {
+      mergedReq.fallbackText = mergedFallbackText;
+      mergedReq.fallbackTextParts = mergedFallbackParts;
+    } else {
+      delete mergedReq.fallbackText;
+      delete mergedReq.fallbackTextParts;
+    }
+    clearVcMeetingOutputRequestTimer(prior);
+    try {
+      await patchVcMeetingOutputReviewCard(session, mergedReq, 'pending');
+      Object.assign(prior, mergedReq);
+      session.pendingOutputRequests[input.channel] = prior;
+      armVcMeetingOutputRequestTimer(key, prior);
+      logger.info(`[vc-agent] output review merged meeting=${input.meetingId} channel=${input.channel} request=${prior.id} parts=${mergedContentParts.length}`);
+      return { ok: true, status: 'pending', requestId: prior.id, merged: true };
+    } catch (err) {
+      logger.warn(`[vc-agent] merge output review card patch failed meeting=${input.meetingId}; falling back to supersede: ${err instanceof Error ? err.message : String(err)}`);
+      await rejectVcMeetingOutputRequest(
+        session,
+        prior,
+        'superseded',
+      ).catch((rejectErr) => {
+        logger.warn(`[vc-agent] supersede output request failed meeting=${input.meetingId}: ${rejectErr instanceof Error ? rejectErr.message : String(rejectErr)}`);
+      });
+    }
   }
 
-  const cardJson = buildVcMeetingOutputReviewCard({
-    status: 'pending',
-    meeting: session.state.meeting,
-    channel: req.channel,
-    requestId: req.id,
-    nonce: req.nonce,
-    agentLabel: session.selectedAgentLabel ?? session.selectedAgentAppId,
-    content: req.content,
-    ...(req.reason ? { reason: req.reason } : {}),
-    ...(req.fallbackText ? { fallbackText: req.fallbackText } : {}),
-    textOutputAvailable: vcMeetingTextOutputAvailable(),
-  });
+  const cardJson = JSON.stringify(vcMeetingOutputReviewCardForRequest(session, req, 'pending'));
   try {
     req.cardMessageId = await sendMessage(
       session.larkAppId,
@@ -4476,18 +4589,7 @@ async function submitVcMeetingOutputRequest(input: {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
   session.pendingOutputRequests[input.channel] = req;
-  req.timer = setTimeout(() => {
-    const current = vcMeetingSessions.get(key);
-    const pending = current?.pendingOutputRequests[input.channel];
-    if (!current || !pending || pending.id !== req.id || pending.applying) return;
-    void rejectVcMeetingOutputRequest(
-      current,
-      pending,
-      'expired',
-      `你的 ${input.channel === 'voice' ? '语音' : '会中弹幕'} 输出请求已超时并被自动拒绝。`,
-    );
-  }, vcMeetingOutputReviewTimeoutMs(input.channel));
-  if (typeof req.timer.unref === 'function') req.timer.unref();
+  armVcMeetingOutputRequestTimer(key, req);
   logger.info(`[vc-agent] output review requested meeting=${input.meetingId} channel=${input.channel} request=${req.id}`);
   return { ok: true, status: 'pending', requestId: req.id };
 }
@@ -4780,6 +4882,7 @@ function buildVcMeetingConsumerInstruction(opts: {
       ...(channels.length > 0
         ? [`需要对外输出仍用：botmux vc-agent request-output --lark-app-id ${opts.larkAppId} --meeting-id ${opts.meetingId} --channel ${channels.join('|')} --content "..." --reason "..."。`]
         : []),
+      ...(channels.length > 0 ? ['多条结论尽量合成一条输出请求；如果已有同类型输出在审批中，daemon 会尝试合并到同一张审批卡。'] : []),
       opts.final
         ? '这是会议结束前后的收尾增量；如果已有足够上下文，可以给出简短最终整理。'
         : '请结合已有会话上下文判断是否需要回应。',
@@ -4812,6 +4915,7 @@ function buildVcMeetingConsumerInstruction(opts: {
     '处理目标：维护会议上下文，只在有明确价值时对群内发言。',
     '不要逐条复述字幕；优先输出决策点、待办、风险、需要用户关注或发言的点。',
     '当需要提醒参会人、提出建议、推动决策或指出风险时，提交一条简短输出请求。',
+    '多条结论尽量合成一条输出请求；如果已有同类型输出在审批中，daemon 会尝试合并到同一张审批卡。',
     '如果本批内容只是普通闲聊或没有新信息，请保持沉默。',
     opts.final
       ? '这是会议结束前后的收尾增量；如果已有足够上下文，可以给出简短最终整理。'
@@ -4939,7 +5043,11 @@ async function injectVcMeetingConsumerSession(
   return work;
 }
 
-async function runVcMeetingSessionTick(key: string, cfg: VcMeetingAgentConfig): Promise<void> {
+async function runVcMeetingSessionTick(
+  key: string,
+  cfg: VcMeetingAgentConfig,
+  opts: { forceConsumerInject?: boolean } = {},
+): Promise<void> {
   const session = vcMeetingSessions.get(key);
   if (!session) return;
   if (expireIdleVcMeetingDaemonSession(key, session)) return;
@@ -4947,10 +5055,24 @@ async function runVcMeetingSessionTick(key: string, cfg: VcMeetingAgentConfig): 
   if (!flush.ok) {
     logger.warn(`[vc-agent] scheduled listener flush failed ${key}: ${flush.error ?? 'unknown'}`);
   }
-  const injected = await injectVcMeetingConsumerSession(key, cfg);
+  const injected = await injectVcMeetingConsumerSession(key, cfg, { force: opts.forceConsumerInject });
   if (!injected.ok) {
     logger.warn(`[vc-agent] scheduled consumer inject failed ${key}: ${injected.error ?? 'unknown'}`);
   }
+}
+
+function scheduleVcMeetingRestoreImmediateTick(key: string, cfg: VcMeetingAgentConfig): void {
+  const session = vcMeetingSessions.get(key);
+  if (!session || session.restoreTickTimer || session.ended) return;
+  session.restoreTickTimer = setTimeout(() => {
+    const current = vcMeetingSessions.get(key);
+    if (!current || current.ended) return;
+    current.restoreTickTimer = undefined;
+    runVcMeetingSessionTick(key, cfg, { forceConsumerInject: true }).catch((err) => {
+      logger.warn(`[vc-agent] restore immediate meeting tick failed ${key}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }, VC_MEETING_RESTORE_IMMEDIATE_TICK_DELAY_MS);
+  if (typeof session.restoreTickTimer.unref === 'function') session.restoreTickTimer.unref();
 }
 
 function scheduleVcMeetingConsumerInjection(key: string, cfg: VcMeetingAgentConfig): void {
@@ -5336,6 +5458,7 @@ async function closeVcMeetingDaemonSession(key: string, cfg: VcMeetingAgentConfi
     clearInterval(session.flushTimer);
     session.flushTimer = undefined;
   }
+  clearVcMeetingRestoreTickTimer(session);
   clearVcMeetingConsumerSelectionTimer(session);
   clearVcMeetingConsumerInjectTimer(session);
   await expireVcMeetingOutputRequestsOnClose(session);
@@ -5884,6 +6007,7 @@ export const __vcMeetingAgentTest = {
   reset: () => {
     for (const session of vcMeetingSessions.values()) {
       if (session.flushTimer) clearInterval(session.flushTimer);
+      clearVcMeetingRestoreTickTimer(session);
       clearVcMeetingConsumerSelectionTimer(session);
       clearVcMeetingConsumerInjectTimer(session);
       clearVcMeetingOutputRequests(session);
