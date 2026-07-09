@@ -148,6 +148,10 @@ export interface DaemonSession {
    *  Format is `${sessionId}:${lastUuid || turnId}` so different sessions can
    *  never suppress each other's final_output payloads. */
   lastBridgeEmittedUuid?: string;
+  /** Native Hermes messages.session_id bound by this worker after seeing the
+   *  botmux-injected `<session_id>...` marker in Hermes state.db. Used as a
+   *  daemon-side second check for Hermes final_output routing. */
+  hermesBridgeSourceSessionId?: string;
   /** Flag flipped to true once a `session.exited` dashboard event has been
    *  published for this session. Both the dashboard-driven close path
    *  (closeSession) and the worker-process exit handler may try to publish;

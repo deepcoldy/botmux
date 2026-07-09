@@ -2469,6 +2469,21 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         break;
       }
 
+      case 'bridge_source_session': {
+        if (msg.bridge !== 'hermes') break;
+        if (ds.worker && ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored Hermes source binding from stale worker: ${msg.sourceSessionId}`);
+          break;
+        }
+        if (ds.hermesBridgeSourceSessionId && ds.hermesBridgeSourceSessionId !== msg.sourceSessionId) {
+          logger.warn(`[${t}] Hermes bridge sourceSessionId changed ${ds.hermesBridgeSourceSessionId} → ${msg.sourceSessionId}`);
+        } else {
+          logger.info(`[${t}] Hermes bridge sourceSessionId bound: ${msg.sourceSessionId}`);
+        }
+        ds.hermesBridgeSourceSessionId = msg.sourceSessionId;
+        break;
+      }
+
       case 'user_notify': {
         logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
@@ -2490,6 +2505,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // another session.
         if (!msg.content || !msg.content.trim()) break;
         if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
+        if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
         if (!msg.sessionId) {
           logger.warn(`[${t}] final_output missing sessionId; accepting for compatibility (session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`);
         }
@@ -2581,6 +2597,28 @@ function shouldDropMismatchedFinalOutput(
   logger.error(
     `[${t}] Dropped final_output with mismatched sessionId ` +
     `(msg=${msg.sessionId}, session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+  );
+  return true;
+}
+
+function shouldDropMismatchedHermesFinalOutput(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  t: string,
+): boolean {
+  if (!msg.sourceHermesSessionId) {
+    if (!ds.hermesBridgeSourceSessionId) return false;
+    logger.error(
+      `[${t}] Dropped Hermes final_output without sourceHermesSessionId ` +
+      `(expected=${ds.hermesBridgeSourceSessionId}, session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+    );
+    return true;
+  }
+  if (ds.hermesBridgeSourceSessionId === msg.sourceHermesSessionId) return false;
+  logger.error(
+    `[${t}] Dropped Hermes final_output with mismatched sourceHermesSessionId ` +
+    `(msg=${msg.sourceHermesSessionId}, expected=${ds.hermesBridgeSourceSessionId ?? 'unbound'}, ` +
+    `session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
   );
   return true;
 }

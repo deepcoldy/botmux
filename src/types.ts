@@ -345,6 +345,7 @@ export type WorkerToDaemon =
   | { type: 'prompt_ready' }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string }
   | { type: 'error'; message: string }
+  | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string }
   | { type: 'tui_prompt_resolved'; selectedText?: string }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState }
@@ -355,6 +356,11 @@ export type WorkerToDaemon =
        *  routing the reply so a stale/wrongly-bound worker cannot post into
        *  another Lark thread. Optional for one release to accept older workers. */
       sessionId?: string;
+      /** Native Hermes messages.session_id that actually produced this
+       *  content. Daemon validates it against the worker's bound Hermes
+       *  source session so worker-side sessionId stamping cannot hide a
+       *  foreign state.db row. */
+      sourceHermesSessionId?: string;
       content: string;
       lastUuid: string;
       turnId: string;

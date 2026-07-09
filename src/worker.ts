@@ -55,6 +55,7 @@ import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, 
 import { findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
+import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
 import { drainPiTranscript, findPiTranscriptByPid, findPiTranscriptBySessionId } from './services/pi-transcript.js';
 import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
@@ -706,6 +707,7 @@ let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
+let hermesBridgeSourceSessionId: string | undefined;
 let mtrBridgeSource: MtrTranscriptSource | undefined;
 let mtrBridgeOffset = 0;
 let mtrBridgeBaselineDone = false;
@@ -2035,6 +2037,7 @@ function codexBridgeStartTimer(): void {
 function hermesBridgeAttach(mode: 'baseline-existing' | 'fresh-empty'): void {
   hermesBridgeOffset = currentHermesStateOffset();
   hermesBridgeBaselineDone = true;
+  hermesBridgeSourceSessionId = undefined;
   log(`Hermes bridge ${mode}: state.db offset=${hermesBridgeOffset}`);
   codexBridgeStartTimer();
 }
@@ -2043,9 +2046,21 @@ function hermesBridgeIngest(): void {
   if (!hermesBridgeBaselineDone) return;
   const result = drainHermesStateDb(hermesBridgeOffset);
   hermesBridgeOffset = result.newOffset;
-  if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(result.events);
-  if (result.events.some(e => e.kind === 'assistant_final')) {
+  const filtered = filterHermesEventsForBotmuxSession(result.events, {
+    botmuxSessionId: sessionId,
+    boundSourceSessionId: hermesBridgeSourceSessionId,
+  });
+  if (filtered.newlyBoundSourceSessionId) {
+    hermesBridgeSourceSessionId = filtered.newlyBoundSourceSessionId;
+    send({ type: 'bridge_source_session', bridge: 'hermes', sourceSessionId: filtered.newlyBoundSourceSessionId });
+    log(`Hermes bridge bound sourceSessionId=${filtered.newlyBoundSourceSessionId}`);
+  }
+  for (const drop of filtered.drops) {
+    log(`Hermes bridge dropped ${drop.kind} ${drop.uuid} from sourceSessionId=${drop.sourceSessionId ?? '?'} expected=${drop.expectedSourceSessionId ?? hermesBridgeSourceSessionId ?? 'unbound'} reason=${drop.reason}`);
+  }
+  if (filtered.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
+  codexBridgeQueue.ingest(filtered.events);
+  if (filtered.events.some(e => e.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
   }
 }
@@ -2307,6 +2322,7 @@ function emitReadyCodexTurns(): void {
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
     if (!turn.finalText) continue;
+    const sourceHermesSessionId = structuredBridgeIsHermes() ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: turn.finalText }, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
@@ -2321,6 +2337,7 @@ function emitReadyCodexTurns(): void {
       if (!fields) continue;
       send({
         type: 'final_output',
+        ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
         content: fields.content,
         lastUuid: turn.turnId,
         turnId: turn.turnId,
@@ -2329,7 +2346,13 @@ function emitReadyCodexTurns(): void {
       });
       continue;
     }
-    send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: turn.turnId });
+    send({
+      type: 'final_output',
+      ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
+      content: turn.finalText,
+      lastUuid: turn.turnId,
+      turnId: turn.turnId,
+    });
   }
 }
 
@@ -2348,6 +2371,7 @@ function stopCodexBridge(): void {
   codexBridgeBaselineDone = false;
   hermesBridgeOffset = 0;
   hermesBridgeBaselineDone = false;
+  hermesBridgeSourceSessionId = undefined;
   mtrBridgeSource = undefined;
   mtrBridgeOffset = 0;
   mtrBridgeBaselineDone = false;
