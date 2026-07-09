@@ -102,7 +102,10 @@ describe('dashboard monitoring session table', () => {
     expect(textContent(pressure)).toContain('1s');
 
     const unavailable = root.findByProps({ className: 'panel resource-unavailable' });
-    expect(textContent(unavailable)).toContain('procfs_unavailable');
+    expect(unavailable.findByProps({ className: 'resource-unavailable-card' })).toBeTruthy();
+    expect(textContent(unavailable)).toContain('资源采样仅支持 Linux');
+    expect(textContent(unavailable)).toContain('运行健康仍可继续查看');
+    expect(textContent(unavailable)).not.toContain('procfs_unavailable');
     expect(root.findAllByProps({ className: 'panel resource-pressure' })).toHaveLength(0);
   });
 
@@ -272,5 +275,17 @@ describe('dashboard monitoring session table', () => {
     expect(css).toMatch(/\.resource-page > \.resource-pressure\s*\{[^}]*z-index:\s*30[^}]*overflow:\s*visible/s);
     expect(css).toMatch(/\.metric-card \.resource-help-popover\s*\{[^}]*z-index:\s*40/s);
     expect(css).toMatch(/\.resource-help-tip:hover \.resource-help-popover,\s*\.resource-help-tip:focus-within \.resource-help-popover\s*\{[^}]*pointer-events:\s*auto/s);
+  });
+
+  it('uses a compact unsupported resource sampling empty state', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/monitoring-page.tsx', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    expect(page).toContain('resource-unavailable-card');
+    expect(page).toContain("monitoring.unsupportedTitle");
+    expect(page).toContain("monitoring.unsupportedHint");
+    expect(page).not.toContain("<p>{current?.reason ?? 'procfs_unavailable'}</p>");
+    expect(css).toContain('.resource-unavailable-card');
+    expect(css).toContain('.resource-unavailable-status');
   });
 });

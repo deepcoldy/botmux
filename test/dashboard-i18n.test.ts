@@ -69,6 +69,11 @@ describe('dashboard i18n helpers', () => {
       'monitoring.longestWaiting',
       'monitoring.unattributedSessions',
       'monitoring.unattributedHint',
+      'monitoring.unsupportedKicker',
+      'monitoring.unsupportedTitle',
+      'monitoring.unsupportedHint',
+      'monitoring.unsupportedRuntimeOk',
+      'monitoring.unsupportedResourceOnly',
     ];
 
     const zh = createDashboardTranslator('zh');

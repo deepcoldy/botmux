@@ -420,8 +420,18 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
 
       {!supported ? (
         <section className="panel resource-unavailable">
-          <h2>{tr('monitoring.unsupported')}</h2>
-          <p>{current?.reason ?? 'procfs_unavailable'}</p>
+          <div className="resource-unavailable-card">
+            <span className="resource-unavailable-status" aria-hidden="true" />
+            <div className="resource-unavailable-copy">
+              <span>{tr('monitoring.unsupportedKicker')}</span>
+              <h2>{tr('monitoring.unsupportedTitle')}</h2>
+              <p>{tr('monitoring.unsupportedHint')}</p>
+            </div>
+            <div className="resource-unavailable-tags" aria-label={tr('monitoring.unsupported')}>
+              <span>{tr('monitoring.unsupportedRuntimeOk')}</span>
+              <span>{tr('monitoring.unsupportedResourceOnly')}</span>
+            </div>
+          </div>
         </section>
       ) : (
         <>
