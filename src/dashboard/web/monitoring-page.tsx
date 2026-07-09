@@ -6,10 +6,12 @@ type ResourceCurrent = {
   supported?: boolean;
   reason?: string;
   sampledAt?: number;
+  intervalMs?: number;
   host?: { cpuPct?: number; memUsedPct?: number; load1?: number };
   botmux?: { cpuPct?: number; rssBytes?: number };
   bots?: ResourceBot[];
   sessions?: ResourceSession[];
+  runtime?: RuntimeSummary;
   rankings?: { tracked?: string[] };
 };
 
@@ -32,9 +34,44 @@ type ResourceSeries = {
 type ResourceBot = {
   larkAppId: string;
   botName: string;
+  daemonStatus?: string;
   daemon?: { cpuPct?: number; rssBytes?: number };
   sessions?: { count?: number; cpuPct?: number; rssBytes?: number };
+  runtime?: {
+    daemonStatus?: string;
+    sessions?: {
+      total?: number;
+      working?: number;
+      starting?: number;
+      waiting?: number;
+    };
+  };
   total?: { cpuPct?: number; rssBytes?: number };
+};
+
+type RuntimeSummary = {
+  sampleHealth?: { status?: string; sampledAt?: number; ageMs?: number; intervalMs?: number };
+  daemons?: { total?: number; online?: number; offline?: number };
+  sessions?: {
+    total?: number;
+    working?: number;
+    starting?: number;
+    idle?: number;
+    waiting?: number;
+    unknown?: number;
+    unattributed?: number;
+    longestRunning?: RuntimeSessionRef;
+    longestWaiting?: RuntimeSessionRef;
+  };
+};
+
+type RuntimeSessionRef = {
+  sessionId: string;
+  larkAppId: string;
+  botName: string;
+  title?: string;
+  status?: string;
+  durationMs?: number;
 };
 
 type ResourceSession = {
@@ -69,6 +106,30 @@ function formatBytes(value: unknown): string {
 function formatPct(value: unknown): string {
   const n = Number(value);
   return Number.isFinite(n) ? `${n.toFixed(1)}%` : '-';
+}
+
+function formatCount(value: unknown): string {
+  const n = Number(value);
+  return Number.isFinite(n) ? String(n) : '0';
+}
+
+function formatDuration(value: unknown): string {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms <= 0) return '-';
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 60) return `${Math.max(1, minutes)}m`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours}h ${rest}m` : `${hours}h`;
+}
+
+function runtimeSampleStatus(value: unknown): 'fresh' | 'stale' | 'unsupported' | 'unknown' {
+  return value === 'fresh' || value === 'stale' || value === 'unsupported' ? value : 'unknown';
+}
+
+function runtimeSessionLabel(session: RuntimeSessionRef | undefined): string {
+  if (!session) return '-';
+  return `${session.botName || '-'} · ${session.title || session.sessionId}`;
 }
 
 function metricValue(session: ResourceSession, sort: SortKey): number | string {
@@ -190,6 +251,93 @@ function HelpTip({ label, text }: { label: string; text: string }) {
   );
 }
 
+function RuntimeHealth({ current }: { current: ResourceCurrent }) {
+  const tr = useT();
+  const runtime = current.runtime;
+  const sampleStatus = runtimeSampleStatus(runtime?.sampleHealth?.status);
+  const daemonTotal = runtime?.daemons?.total ?? 0;
+  const daemonOnline = runtime?.daemons?.online ?? 0;
+  const daemonOffline = runtime?.daemons?.offline ?? Math.max(0, daemonTotal - daemonOnline);
+  const sessionTotal = runtime?.sessions?.total ?? 0;
+  const working = runtime?.sessions?.working ?? 0;
+  const starting = runtime?.sessions?.starting ?? 0;
+
+  return (
+    <section className="panel runtime-health-panel">
+      <header className="panel-header">
+        <div>
+          <h2>{tr('monitoring.runtimeHealth')}</h2>
+          <p>{tr('monitoring.runtimeHealthHint')}</p>
+        </div>
+      </header>
+      <div className="runtime-health-grid">
+        <section className="metric-card runtime-health-card">
+          <span>{tr('monitoring.sampleHealth')}</span>
+          <strong><span className={`runtime-status-pill ${sampleStatus}`}>{tr(`monitoring.sample.${sampleStatus}`)}</span></strong>
+          <small>{tr('monitoring.sampleAge')} {formatDuration(runtime?.sampleHealth?.ageMs)}</small>
+        </section>
+        <section className="metric-card runtime-health-card">
+          <span>{tr('monitoring.daemonHealth')}</span>
+          <strong>{formatCount(daemonOnline)}/{formatCount(daemonTotal)}</strong>
+          <small>{formatCount(daemonOffline)} {tr('monitoring.offline')}</small>
+        </section>
+        <section className="metric-card runtime-health-card">
+          <span>{tr('monitoring.sessionHealth')}</span>
+          <strong>{formatCount(sessionTotal)}</strong>
+          <small>{tr('monitoring.working')} {formatCount(working)} · {tr('monitoring.starting')} {formatCount(starting)}</small>
+        </section>
+        <section className="metric-card runtime-health-card">
+          <span>{tr('monitoring.resourcePressure')}</span>
+          <strong>{formatPct(current.host?.cpuPct)}</strong>
+          <small>{tr('monitoring.hostMemory')} {formatPct(current.host?.memUsedPct)} · RSS {formatBytes(current.botmux?.rssBytes)}</small>
+        </section>
+      </div>
+    </section>
+  );
+}
+
+function RuntimeSessionPressure({ runtime }: { runtime?: RuntimeSummary }) {
+  const tr = useT();
+  const sessions = runtime?.sessions;
+  const running = sessions?.longestRunning;
+  const waiting = sessions?.longestWaiting;
+
+  return (
+    <section className="panel runtime-session-pressure">
+      <header className="panel-header">
+        <div>
+          <h2>{tr('monitoring.sessionPressure')}</h2>
+          <p>{tr('monitoring.sessionPressureHint')}</p>
+        </div>
+      </header>
+      <div className="runtime-session-grid">
+        <section className="metric-card runtime-session-card">
+          <span>{tr('monitoring.statusDistribution')}</span>
+          <strong>{formatCount(sessions?.total)}</strong>
+          <small>
+            {tr('monitoring.working')} {formatCount(sessions?.working)} · {tr('monitoring.starting')} {formatCount(sessions?.starting)} · {tr('monitoring.waiting')} {formatCount(sessions?.waiting)} · {tr('monitoring.idle')} {formatCount(sessions?.idle)} · {tr('monitoring.unknown')} {formatCount(sessions?.unknown)}
+          </small>
+        </section>
+        <section className="metric-card runtime-session-card">
+          <span>{tr('monitoring.longestRunning')}</span>
+          <strong>{runtimeSessionLabel(running)}</strong>
+          <small>{formatDuration(running?.durationMs)}</small>
+        </section>
+        <section className="metric-card runtime-session-card">
+          <span>{tr('monitoring.longestWaiting')}</span>
+          <strong>{runtimeSessionLabel(waiting)}</strong>
+          <small>{formatDuration(waiting?.durationMs)}</small>
+        </section>
+        <section className="metric-card runtime-session-card">
+          <span>{tr('monitoring.unattributedSessions')}</span>
+          <strong>{formatCount(sessions?.unattributed)}</strong>
+          <small>{tr('monitoring.unattributedHint')}</small>
+        </section>
+      </div>
+    </section>
+  );
+}
+
 function MonitoringPage() {
   const tr = useT();
   const [current, setCurrent] = useState<ResourceCurrent | null>(null);
@@ -239,10 +387,12 @@ function MonitoringPage() {
       <div className="page-heading">
         <div>
           <p className="eyebrow">{tr('monitoring.eyebrow')}</p>
-          <h1>{tr('monitoring.title')}</h1>
-          <p>{tr('monitoring.subtitle')}</p>
+          <h1>{tr('monitoring.runtimeTitle')}</h1>
+          <p>{tr('monitoring.runtimeSubtitle')}</p>
         </div>
       </div>
+
+      {current ? <RuntimeHealth current={current} /> : null}
 
       {!supported ? (
         <section className="panel resource-unavailable">
@@ -251,19 +401,27 @@ function MonitoringPage() {
         </section>
       ) : (
         <>
-          <div className="resource-metrics">
-            <section className="metric-card"><span>{tr('monitoring.hostCpu')}</span><strong>{formatPct(current?.host?.cpuPct)}</strong><small>load {Number(current?.host?.load1 ?? 0).toFixed(2)}</small></section>
-            <section className="metric-card"><span>{tr('monitoring.hostMemory')}</span><strong>{formatPct(current?.host?.memUsedPct)}</strong><small>{tr('monitoring.memoryOnly')}</small></section>
-            <section className="metric-card">
-              <div className="metric-label-with-help">
-                <span>{tr('monitoring.botmuxRss')}</span>
-                <HelpTip label={tr('monitoring.rssHelpLabel')} text={tr('monitoring.rssHelp')} />
+          <section className="panel resource-pressure">
+            <header className="panel-header">
+              <div>
+                <h2>{tr('monitoring.resourcePressure')}</h2>
+                <p>{tr('monitoring.resourcePressureHint')}</p>
               </div>
-              <strong>{formatBytes(current?.botmux?.rssBytes)}</strong>
-              <small>{formatPct(current?.botmux?.cpuPct)}</small>
-            </section>
-            <section className="metric-card"><span>{tr('monitoring.trackedSessions')}</span><strong>{current?.rankings?.tracked?.length ?? 0}</strong><small>{tr('monitoring.currentSessions')} {(current?.sessions ?? []).length}</small></section>
-          </div>
+            </header>
+            <div className="resource-metrics runtime-pressure-grid">
+              <section className="metric-card"><span>{tr('monitoring.hostCpu')}</span><strong>{formatPct(current?.host?.cpuPct)}</strong><small>load {Number(current?.host?.load1 ?? 0).toFixed(2)}</small></section>
+              <section className="metric-card"><span>{tr('monitoring.hostMemory')}</span><strong>{formatPct(current?.host?.memUsedPct)}</strong><small>{tr('monitoring.memoryOnly')}</small></section>
+              <section className="metric-card">
+                <div className="metric-label-with-help">
+                  <span>{tr('monitoring.botmuxRss')}</span>
+                  <HelpTip label={tr('monitoring.rssHelpLabel')} text={tr('monitoring.rssHelp')} />
+                </div>
+                <strong>{formatBytes(current?.botmux?.rssBytes)}</strong>
+                <small>{formatPct(current?.botmux?.cpuPct)}</small>
+              </section>
+              <section className="metric-card"><span>{tr('monitoring.trackedSessions')}</span><strong>{current?.rankings?.tracked?.length ?? 0}</strong><small>{tr('monitoring.currentSessions')} {(current?.sessions ?? []).length}</small></section>
+            </div>
+          </section>
 
           <section className="panel resource-trends">
             <header className="panel-header">
@@ -291,27 +449,38 @@ function MonitoringPage() {
               </article>
             </div>
           </section>
+        </>
+      )}
 
+      {current ? <RuntimeSessionPressure runtime={current.runtime} /> : null}
+
+      {supported ? (
+        <>
           <section className="panel">
             <header className="panel-header">
               <div>
-                <h2>{tr('monitoring.bots')}</h2>
-                <p>{tr('monitoring.botsHint')}</p>
+                <h2>{tr('monitoring.botRuntime')}</h2>
+                <p>{tr('monitoring.botRuntimeHint')}</p>
               </div>
             </header>
             <div className="resource-table resource-bot-table">
               <div className="resource-row resource-row-head">
-                <span>{tr('monitoring.bot')}</span><span>{tr('monitoring.cpu')}</span><span>{tr('monitoring.rss')}</span><span>{tr('monitoring.daemon')}</span><span>{tr('monitoring.sessionsCount')}</span>
+                <span>{tr('monitoring.bot')}</span><span>{tr('monitoring.daemon')}</span><span>{tr('monitoring.sessionsCount')}</span><span>{tr('monitoring.working')}</span><span>{tr('monitoring.starting')}</span><span>{tr('monitoring.cpu')}</span><span>{tr('monitoring.rss')}</span>
               </div>
-              {(current?.bots ?? []).map(bot => (
-                <div className="resource-row" key={bot.larkAppId}>
-                  <b>{bot.botName}</b>
-                  <span>{formatPct(bot.total?.cpuPct)}</span>
-                  <span>{formatBytes(bot.total?.rssBytes)}</span>
-                  <span>{formatBytes(bot.daemon?.rssBytes)} · {formatPct(bot.daemon?.cpuPct)}</span>
-                  <span>{bot.sessions?.count ?? 0}</span>
-                </div>
-              ))}
+              {(current?.bots ?? []).map(bot => {
+                const botRuntime = bot.runtime?.sessions;
+                return (
+                  <div className="resource-row" key={bot.larkAppId}>
+                    <b>{bot.botName}</b>
+                    <span>{bot.runtime?.daemonStatus ?? bot.daemonStatus ?? 'unknown'}</span>
+                    <span>{formatCount(botRuntime?.total ?? bot.sessions?.count)}</span>
+                    <span>{formatCount(botRuntime?.working)}</span>
+                    <span>{formatCount(botRuntime?.starting)}</span>
+                    <span>{formatPct(bot.total?.cpuPct)}</span>
+                    <span>{formatBytes(bot.total?.rssBytes)}</span>
+                  </div>
+                );
+              })}
             </div>
           </section>
 
@@ -358,7 +527,7 @@ function MonitoringPage() {
             </div>
           </section>
         </>
-      )}
+      ) : null}
     </section>
   );
 }

@@ -34,4 +34,45 @@ describe('dashboard i18n helpers', () => {
       expect.stringContaining('Best for'),
     ]);
   });
+
+  it('renders runtime monitoring labels in both locales', () => {
+    const keys = [
+      'monitoring.runtimeTitle',
+      'monitoring.runtimeSubtitle',
+      'monitoring.runtimeHealth',
+      'monitoring.runtimeHealthHint',
+      'monitoring.resourcePressure',
+      'monitoring.resourcePressureHint',
+      'monitoring.sessionPressure',
+      'monitoring.sessionPressureHint',
+      'monitoring.botRuntime',
+      'monitoring.botRuntimeHint',
+      'monitoring.sampleHealth',
+      'monitoring.sampleAge',
+      'monitoring.sample.fresh',
+      'monitoring.sample.stale',
+      'monitoring.sample.unsupported',
+      'monitoring.sample.unknown',
+      'monitoring.daemonHealth',
+      'monitoring.sessionHealth',
+      'monitoring.offline',
+      'monitoring.working',
+      'monitoring.starting',
+      'monitoring.waiting',
+      'monitoring.idle',
+      'monitoring.statusDistribution',
+      'monitoring.longestRunning',
+      'monitoring.longestWaiting',
+      'monitoring.unattributedSessions',
+      'monitoring.unattributedHint',
+    ];
+
+    const zh = createDashboardTranslator('zh');
+    const en = createDashboardTranslator('en');
+    for (const key of keys) {
+      expect(zh(key), key).not.toBe(key);
+      expect(en(key), key).not.toBe(key);
+    }
+    expect(en('monitoring.hostMemory')).toBe('Memory');
+  });
 });

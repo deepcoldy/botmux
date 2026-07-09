@@ -662,12 +662,91 @@ main {
   z-index: 10;
 }
 
+.resource-page > .resource-pressure {
+  z-index: 30;
+}
+
 .resource-metrics {
   position: relative;
   z-index: 30;
   display: grid;
   grid-template-columns: repeat(4, minmax(150px, 1fr));
   gap: 12px;
+}
+
+.runtime-health-grid,
+.runtime-session-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 12px;
+  padding: 14px;
+}
+
+.runtime-pressure-grid {
+  padding: 14px;
+}
+
+.runtime-health-card,
+.runtime-session-card {
+  min-width: 0;
+}
+
+.runtime-health-card strong {
+  font-size: 24px;
+}
+
+.runtime-session-card strong {
+  overflow: hidden;
+  font-size: 17px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-health-card small,
+.runtime-session-card small {
+  line-height: 1.4;
+}
+
+.runtime-status-pill {
+  display: inline-flex !important;
+  align-items: center;
+  width: fit-content;
+  min-height: 24px;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--muted) !important;
+  font-size: 12px !important;
+  font-weight: 800 !important;
+  line-height: 1;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.runtime-status-pill.fresh {
+  border-color: color-mix(in srgb, var(--success) 34%, var(--border));
+  background: var(--success-soft);
+  color: var(--success) !important;
+}
+
+.runtime-status-pill.stale {
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--border));
+  background: var(--warning-soft);
+  color: var(--warning) !important;
+}
+
+.runtime-status-pill.unsupported {
+  border-color: var(--border);
+  background: var(--surface-muted);
+  color: var(--faint) !important;
+}
+
+.runtime-status-pill.unknown {
+  border-color: var(--border-soft);
+  background: transparent;
+  color: var(--muted) !important;
 }
 
 .resource-unavailable {
@@ -807,7 +886,7 @@ main {
 }
 
 .resource-bot-table .resource-row {
-  grid-template-columns: minmax(160px, 1.2fr) repeat(4, minmax(84px, 1fr));
+  grid-template-columns: minmax(150px, 1.2fr) minmax(86px, .75fr) repeat(3, minmax(72px, .55fr)) repeat(2, minmax(84px, .75fr));
 }
 
 .resource-session-table .resource-row {
@@ -878,6 +957,8 @@ main {
 @media (max-width: 900px) {
   .resource-strip,
   .resource-metrics,
+  .runtime-health-grid,
+  .runtime-session-grid,
   .resource-bot-table .resource-row,
   .resource-session-table .resource-row {
     grid-template-columns: 1fr;

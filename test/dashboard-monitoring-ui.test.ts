@@ -25,6 +25,22 @@ function makeSession(index: number) {
 }
 
 describe('dashboard monitoring session table', () => {
+  it('declares runtime monitoring sections and status classes', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/monitoring-page.tsx', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    expect(page).toContain("monitoring.runtimeHealth");
+    expect(page).toContain("monitoring.resourcePressure");
+    expect(page).toContain("monitoring.sessionPressure");
+    expect(page).toContain("monitoring.botRuntime");
+    expect(page).toContain("runtime-health-grid");
+    expect(page).toContain("runtime-pressure-grid");
+    expect(page).toContain("runtime-status-pill");
+    expect(css).toContain(".runtime-health-grid");
+    expect(css).toContain(".runtime-pressure-grid");
+    expect(css).toContain(".runtime-status-pill");
+  });
+
   it('keeps all session rows in a ten-row scroll body under a fixed header', () => {
     const renderer = TestRenderer.create(React.createElement(SessionResourceTable, {
       sessions: Array.from({ length: 12 }, (_, index) => makeSession(index + 1)),
