@@ -35,6 +35,7 @@ import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { AskArgsError, parseAskOptions } from './core/ask-args.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
+import { normalizeRepoRemote } from './core/repo-requirement.js';
 import { normalizeDispatchBotsForSender, resolveDispatchWorkerBotUnionIds, resolveDispatchWorkerMetas } from './core/dispatch-worker-meta.js';
 import {
   appendVerifiedDeliveryInstructions,
@@ -6943,7 +6944,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 用法:
   群级派活（默认，不开话题）:
     botmux dispatch --title "子项目标题" --bot <open_id[:名字[:角色]]> [--bot ...] \\
-        [--brief "简报" | --brief-file <path>] [--repo <工作目录>] [--standby] \\
+        [--brief "简报" | --brief-file <path>] [--repo <工作目录> | --needs-repo <远端URL或别名>] [--standby] \\
         [--task-id <id>] [--acceptance-hint <text>] [--new-topic]
   往已有话题追加（激活待命 bot / 追加协调）:
     botmux dispatch --into <话题根消息id> --bot <spec> [--bot ...] (--brief ... | --brief-file ...)
@@ -6952,6 +6953,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   默认群级派活: 在目标群直接 @ 执行者，适合单执行者 / 顺序 / 轻量子任务。
   --new-topic: 显式开隔离话题，适合多执行者并行、深度协作或防刷屏。
   --repo:   先用 /repo 给每个子 bot 定好工作目录——spawn 时不弹「选仓库」卡、不用手点。
+  --needs-repo: 跨设备派活时声明所需项目；接收端用自己的本地目录自检，缺少时立即求助。
   --standby: 配合 --repo——只把 bot 拉起来定好目录待命（不派简报），之后用 --into 或群级消息派具体任务。
   --into:   不建种子，直接回到已有话题线程 @ bot 追加一条。
   返回 JSON（含 delivery=chat|thread），供主控/监管者登记派活位置。
@@ -6962,6 +6964,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --brief <text>        子项目简报 / 追加内容
   --brief-file <path>   从文件读取简报
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
+  --needs-repo <id>     所需 git 项目（推荐 remote URL，也可用接收端已登记的别名）
   --standby             仅 --repo 待命，不派简报
   --new-topic           显式为本次派活开独立话题（默认不开）
   --task-id <id>        覆盖可信交付任务号（默认自动生成 task-<slug>-<hash8>）
@@ -6978,6 +6981,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const briefFile = argValue(rest, '--brief-file');
   const overrideChatId = argValue(rest, '--chat-id');
   const repo = argValue(rest, '--repo');
+  const needsRepoRaw = argValue(rest, '--needs-repo')?.trim();
+  // Put a credential-free canonical identity on the wire/ledger when the input
+  // is a remote URL; aliases pass through unchanged for receiver-local lookup.
+  const needsRepo = needsRepoRaw ? (normalizeRepoRemote(needsRepoRaw) ?? needsRepoRaw) : undefined;
   const intoRoot = argValue(rest, '--into');
   const explicitTaskId = argValue(rest, '--task-id');
   const acceptanceHint = argValue(rest, '--acceptance-hint');
@@ -7020,8 +7027,20 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('至少要用 --bot 指派一个 bot。用法见 botmux dispatch --help');
     process.exit(1);
   }
+  if (rest.includes('--needs-repo') && !needsRepo) {
+    console.error('--needs-repo 需要一个 git remote URL 或项目别名。');
+    process.exit(1);
+  }
   if (standby && !repo) {
     console.error('--standby 需要配合 --repo（先定好工作目录把 bot 拉起待命）。');
+    process.exit(1);
+  }
+  if (repo && needsRepo) {
+    console.error('--repo 与 --needs-repo 不能同用：前者共享路径，后者让每台机器自行解析项目。');
+    process.exit(1);
+  }
+  if (needsRepo && (standby || intoRoot)) {
+    console.error('--needs-repo 只用于新任务派发，不能与 --standby 或 --into 同用。');
     process.exit(1);
   }
   if (standby && intoRoot) {
@@ -7088,7 +7107,12 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   });
   let built;
   try {
-    built = buildDispatchMessages({ title: title.trim() || '子项目', brief, bots });
+    built = buildDispatchMessages({
+      title: title.trim() || '子项目',
+      brief,
+      bots,
+      repoRequirement: needsRepo && taskId ? { taskId, repo: needsRepo } : undefined,
+    });
   } catch (err: any) {
     console.error(`dispatch 构建失败: ${err.message}`);
     process.exit(1);
@@ -7181,6 +7205,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
           workerLarkAppIds: hasWorkerMeta ? workerLarkAppIds : undefined,
           workerCliIds: hasWorkerMeta ? workerCliIds : undefined,
           workerBotUnionIds: hasWorkerBotUnionIds ? workerBotUnionIds : undefined,
+          requiredRepo: needsRepo || undefined,
           brief,
           acceptanceHint: acceptanceHint?.trim() || undefined,
           acceptanceCriteria: parsedAcceptance.criteria,
@@ -7241,6 +7266,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       primeMessageId: primeId,
       kickoffMessageId: kickoffId,
       repo: repo ?? null,
+      requiredRepo: needsRepo ?? null,
       chatId: targetChatId,
       bots: built.mentionedOpenIds,
     }));

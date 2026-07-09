@@ -200,6 +200,9 @@ describe('built-in botmux-orchestrate skill', () => {
     expect(skill!.content).toContain('resolve-help');
     expect(skill!.content).toContain('先查交付记录和 charter');
     expect(skill!.content).toContain('delivery escalate');
+    expect(skill!.content).toContain('--needs-repo <git remote URL>');
+    expect(skill!.content).toContain('缺少项目环境');
+    expect(skill!.content).toContain('不弹仓库选择卡、不暂存任务');
   });
 });
 

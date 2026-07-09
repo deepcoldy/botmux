@@ -72,6 +72,7 @@ import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
+import { rememberRepoCapability } from './repo-requirement.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
@@ -1582,6 +1583,11 @@ export async function handleCommand(
           if (ds!.repoCardMessageId) {
             deleteMessage(ds!.larkAppId, ds!.repoCardMessageId);
             ds!.repoCardMessageId = undefined;
+          }
+          try {
+            rememberRepoCapability(selectedPath);
+          } catch (err) {
+            logger.warn(`[${logTag}] Failed to remember repo capability ${selectedPath}: ${err instanceof Error ? err.message : String(err)}`);
           }
           logger.info(`[${logTag}] Repo selected via ${how}: ${selectedPath}`);
         };

@@ -142,6 +142,9 @@ export function validateLedgerEventDraft(draft: LedgerEventDraft): LedgerInvaria
   switch (draft.type) {
     case 'TaskDispatched':
       validateWorkerArrays(payload, errors);
+      if (payload.requiredRepo !== undefined && !nonEmpty(payload.requiredRepo)) {
+        errors.push('requiredRepo must be non-empty when provided');
+      }
       validateAcceptanceCriteriaShape(payload.acceptanceCriteria, 'acceptanceCriteria', errors);
       break;
     case 'TaskReported': {

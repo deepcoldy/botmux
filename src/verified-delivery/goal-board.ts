@@ -64,6 +64,7 @@ export interface GoalBoardTask {
   workerLarkAppIds?: string[];
   workerCliIds?: string[];
   workerBotUnionIds?: string[];
+  requiredRepo?: string;
   latestReportId?: string;
   reportCount: number;
   /** Structured verify plan (preferred); undefined for legacy tasks. */
@@ -193,6 +194,7 @@ function toBoardTask(t: TaskView, timing: TaskTiming | undefined): GoalBoardTask
     workerLarkAppIds: t.workerLarkAppIds,
     workerCliIds: t.workerCliIds,
     workerBotUnionIds: t.workerBotUnionIds,
+    requiredRepo: t.requiredRepo,
     latestReportId: t.latestReportId,
     reportCount: t.reports.length,
     attempts: t.reports.map((r) => {

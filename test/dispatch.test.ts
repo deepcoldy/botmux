@@ -25,6 +25,8 @@ import {
   resolveReportTarget,
   resolveSendTarget,
 } from '../src/core/dispatch.js';
+import { parseDispatchRepoRequirement } from '../src/core/repo-requirement.js';
+import { parseEventMessage } from '../src/im/lark/message-parser.js';
 
 describe('parseDispatchBotSpec', () => {
   it('parses a bare open_id', () => {
@@ -91,6 +93,50 @@ describe('buildDispatchMessages', () => {
 
   it('throws on an empty title', () => {
     expect(() => buildDispatchMessages({ title: '   ', brief: 'b', bots })).toThrow();
+  });
+
+  it('appends repo preflight metadata after human task content', () => {
+    const r = buildDispatchMessages({
+      title: 't',
+      brief: '完成任务',
+      bots,
+      repoRequirement: { taskId: 'task-1', repo: 'https://github.com/acme/project.git' },
+    });
+    const text = allText(r.threadContent);
+    const parsed = parseDispatchRepoRequirement(text);
+    expect(parsed).toMatchObject({
+      taskId: 'task-1',
+      repo: 'https://github.com/acme/project.git',
+    });
+    expect(parsed?.content).toContain('完成任务');
+    expect(parsed?.content).toContain('Alice：coder');
+    expect(parsed?.content).not.toContain('[botmux-dispatch v1]');
+  });
+
+  it('survives the real Lark post parser before receiver preflight', () => {
+    const r = buildDispatchMessages({
+      title: 't',
+      brief: '跨设备任务',
+      bots,
+      repoRequirement: { taskId: 'task-post-1', repo: 'git@git.example.com:team/repo.git' },
+    });
+    const event = {
+      sender: { sender_id: { open_id: 'ou_supervisor', union_id: 'on_supervisor' }, sender_type: 'bot' },
+      message: {
+        message_id: 'om_dispatch',
+        message_type: 'post',
+        content: JSON.stringify({ zh_cn: { title: '', content: r.threadContent } }),
+        chat_id: 'oc_goal',
+        chat_type: 'group',
+        create_time: '1000',
+      },
+    };
+    const larkText = parseEventMessage(event).parsed.content;
+    expect(parseDispatchRepoRequirement(larkText)).toMatchObject({
+      taskId: 'task-post-1',
+      repo: 'git@git.example.com:team/repo.git',
+      content: expect.stringContaining('跨设备任务'),
+    });
   });
 });
 
