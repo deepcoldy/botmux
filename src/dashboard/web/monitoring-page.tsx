@@ -4,6 +4,7 @@ import { useT } from './react-hooks.js';
 
 type ResourceCurrent = {
   supported?: boolean;
+  cpuReady?: boolean;
   reason?: string;
   sampledAt?: number;
   intervalMs?: number;
@@ -112,6 +113,14 @@ function formatBytes(value: unknown): string {
 function formatPct(value: unknown): string {
   const n = Number(value);
   return Number.isFinite(n) ? `${n.toFixed(1)}%` : '-';
+}
+
+function formatCpuPct(value: unknown, cpuReady: boolean): string {
+  return cpuReady ? formatPct(value) : '-';
+}
+
+function currentCpuReady(current: ResourceCurrent | null | undefined): boolean {
+  return current?.cpuReady !== false;
 }
 
 function formatCount(value: unknown): string {
@@ -225,7 +234,7 @@ function RankReasons({ reasons }: { reasons?: string[] }) {
   return <span className="resource-reasons">{(reasons ?? []).join(', ') || '-'}</span>;
 }
 
-export function SessionResourceTable({ sessions }: { sessions: ResourceSession[] }) {
+export function SessionResourceTable({ sessions, cpuReady = true }: { sessions: ResourceSession[]; cpuReady?: boolean }) {
   const tr = useT();
   return (
     <div className="resource-table resource-session-table">
@@ -237,7 +246,7 @@ export function SessionResourceTable({ sessions }: { sessions: ResourceSession[]
           <div className={`resource-row${session.tracked ? ' is-tracked' : ''}`} key={session.sessionId}>
             <b>{session.title || session.sessionId}</b>
             <span>{session.botName}</span>
-            <span>{formatPct(session.current?.cpu1mPct ?? session.current?.cpuPct)}</span>
+            <span>{formatCpuPct(session.current?.cpu1mPct ?? session.current?.cpuPct, cpuReady)}</span>
             <span>{formatBytes(session.current?.rssBytes)}</span>
             <span>{formatBytes(session.current?.rssGrowth5mBytes)}</span>
             <span>{session.confidence ?? 'unknown'}</span>
@@ -261,6 +270,7 @@ function HelpTip({ label, text }: { label: string; text: string }) {
 function RuntimeHealth({ current }: { current: ResourceCurrent }) {
   const tr = useT();
   const runtime = current.runtime;
+  const cpuReady = currentCpuReady(current);
   const sampleStatus = runtimeSampleStatus(runtime?.sampleHealth?.status);
   const daemonTotal = runtime?.daemons?.total;
   const daemonOnline = runtime?.daemons?.online;
@@ -299,7 +309,7 @@ function RuntimeHealth({ current }: { current: ResourceCurrent }) {
         </section>
         <section className="metric-card runtime-health-card">
           <span>{tr('monitoring.resourcePressure')}</span>
-          <strong>{formatPct(current.host?.cpuPct)}</strong>
+          <strong>{formatCpuPct(current.host?.cpuPct, cpuReady)}</strong>
           <small>{tr('monitoring.hostMemory')} {formatPct(current.host?.memUsedPct)} · RSS {formatBytes(current.botmux?.rssBytes)}</small>
         </section>
       </div>
@@ -387,6 +397,7 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
   const sessions = useMemo(() => sortedSessions(current?.sessions ?? [], sort), [current?.sessions, sort]);
   const hottest = sessions[0];
   const supported = current?.supported !== false;
+  const cpuReady = currentCpuReady(current);
   const chartLabels = {
     hostStartLabel: historyStartLabel(history?.host?.timestamps, current?.sampledAt, tr),
     botmuxStartLabel: historyStartLabel(history?.botmux?.timestamps, current?.sampledAt, tr),
@@ -421,7 +432,7 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
               </div>
             </header>
             <div className="resource-metrics runtime-pressure-grid">
-              <section className="metric-card"><span>{tr('monitoring.hostCpu')}</span><strong>{formatPct(current?.host?.cpuPct)}</strong><small>load {Number(current?.host?.load1 ?? 0).toFixed(2)}</small></section>
+              <section className="metric-card"><span>{tr('monitoring.hostCpu')}</span><strong>{formatCpuPct(current?.host?.cpuPct, cpuReady)}</strong><small>load {Number(current?.host?.load1 ?? 0).toFixed(2)}</small></section>
               <section className="metric-card"><span>{tr('monitoring.hostMemory')}</span><strong>{formatPct(current?.host?.memUsedPct)}</strong><small>{tr('monitoring.memoryOnly')}</small></section>
               <section className="metric-card">
                 <div className="metric-label-with-help">
@@ -429,7 +440,7 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
                   <HelpTip label={tr('monitoring.rssHelpLabel')} text={tr('monitoring.rssHelp')} />
                 </div>
                 <strong>{formatBytes(current?.botmux?.rssBytes)}</strong>
-                <small>{formatPct(current?.botmux?.cpuPct)}</small>
+                <small>{formatCpuPct(current?.botmux?.cpuPct, cpuReady)}</small>
               </section>
               <section className="metric-card"><span>{tr('monitoring.trackedSessions')}</span><strong>{current?.rankings?.tracked?.length ?? 0}</strong><small>{tr('monitoring.currentSessions')} {(current?.sessions ?? []).length}</small></section>
             </div>
@@ -488,7 +499,7 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
                     <span>{formatCount(botRuntime?.total ?? bot.sessions?.count)}</span>
                     <span>{formatCount(botRuntime?.working)}</span>
                     <span>{formatCount(botRuntime?.starting)}</span>
-                    <span>{formatPct(bot.total?.cpuPct)}</span>
+                    <span>{formatCpuPct(bot.total?.cpuPct, cpuReady)}</span>
                     <span>{formatBytes(bot.total?.rssBytes)}</span>
                   </div>
                 );
@@ -511,7 +522,7 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
                 </button>
               ))}
             </div>
-            <SessionResourceTable sessions={sessions} />
+            <SessionResourceTable sessions={sessions} cpuReady={cpuReady} />
           </section>
 
           <section className="panel">

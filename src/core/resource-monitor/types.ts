@@ -104,6 +104,7 @@ export interface ResourceBotCurrent {
 export interface ResourceCurrentSnapshot {
   ok: true;
   supported: boolean;
+  cpuReady?: boolean;
   sampledAt: number;
   intervalMs: number;
   reason?: 'procfs_unavailable';

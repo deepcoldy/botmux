@@ -66,6 +66,12 @@ export interface ResourceMonitorDashboardDaemonRow {
   pid?: unknown;
 }
 
+export interface ResourceMonitorBotConfigRow {
+  larkAppId?: unknown;
+  displayName?: unknown;
+  name?: unknown;
+}
+
 export function toResourceMonitorSessionSeed(row: ResourceMonitorDashboardSessionRow, botNameOverride?: string): ResourceSessionSeed {
   const larkAppId = String(row.larkAppId ?? '');
   const workerPid = typeof row.workerPid === 'number' ? row.workerPid : undefined;
@@ -106,6 +112,35 @@ export function toResourceMonitorDaemonSeed(row: ResourceMonitorDashboardDaemonR
   };
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+export function buildResourceMonitorDaemonSeeds(
+  configs: ResourceMonitorBotConfigRow[],
+  onlineRows: ResourceMonitorDashboardDaemonRow[],
+): ResourceDaemonSeed[] {
+  const onlineByAppId = new Map<string, ResourceMonitorDashboardDaemonRow>();
+  for (const row of onlineRows) {
+    const larkAppId = nonEmptyString(row.larkAppId);
+    if (larkAppId) onlineByAppId.set(larkAppId, row);
+  }
+
+  return configs.flatMap((cfg) => {
+    const larkAppId = nonEmptyString(cfg.larkAppId);
+    if (!larkAppId) return [];
+    const online = onlineByAppId.get(larkAppId);
+    return [toResourceMonitorDaemonSeed({
+      larkAppId,
+      botName: nonEmptyString(online?.botName)
+        ?? nonEmptyString(cfg.displayName)
+        ?? nonEmptyString(cfg.name)
+        ?? larkAppId,
+      ...(typeof online?.pid === 'number' ? { pid: online.pid } : {}),
+    })];
+  });
+}
+
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
@@ -142,6 +177,7 @@ function emptyCurrent(sampledAt: number, intervalMs: number, supported = false):
   return {
     ok: true,
     supported,
+    cpuReady: false,
     sampledAt,
     intervalMs,
     ...(supported ? {} : { reason: 'procfs_unavailable' as const }),
@@ -335,6 +371,7 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
         spawnedAt: session.spawnedAt,
         lastMessageAt: session.lastMessageAt,
         agentAttention: session.agentAttention,
+        confidence: 'unknown',
       })),
     });
   }
@@ -356,7 +393,11 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
       return;
     }
 
-    const totalDelta = previousTotalCpuTicks === undefined ? 0 : Math.max(0, sample.totalCpuTicks - previousTotalCpuTicks);
+    const prevTotalCpuTicks = previousTotalCpuTicks;
+    const prevIdleCpuTicks = previousIdleCpuTicks;
+    const hasCpuBaseline = prevTotalCpuTicks !== undefined && prevIdleCpuTicks !== undefined;
+    const totalDelta = hasCpuBaseline ? Math.max(0, sample.totalCpuTicks - prevTotalCpuTicks) : 0;
+    const cpuReady = hasCpuBaseline && totalDelta > 0;
     const cpuByPid = processCpuPct(sample.processes, previousProcessTicks, totalDelta);
     const attribution = attributeResources({
       processes: sample.processes,
@@ -390,6 +431,7 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
     currentSnapshot = {
       ok: true,
       supported: true,
+      cpuReady,
       sampledAt,
       intervalMs,
       host,

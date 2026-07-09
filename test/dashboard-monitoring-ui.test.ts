@@ -141,6 +141,74 @@ describe('dashboard monitoring session table', () => {
     expect(textContent(botRow!.children[4] as ReactTestInstance)).toBe('-');
   });
 
+  it('renders current CPU as unavailable before a CPU delta baseline is ready', () => {
+    const renderer = TestRenderer.create(React.createElement(MonitoringPage, {
+      initialCurrent: {
+        supported: true,
+        cpuReady: false,
+        host: { cpuPct: 0, memUsedPct: 40, load1: 0.25 },
+        botmux: { cpuPct: 0, rssBytes: 128 * 1024 * 1024 },
+        bots: [{
+          larkAppId: 'app-a',
+          botName: 'CpuPendingBot',
+          daemonStatus: 'online',
+          runtime: { daemonStatus: 'online', sessions: { total: 1, working: 1, starting: 0, waiting: 0 } },
+          total: { cpuPct: 0, rssBytes: 256 * 1024 * 1024 },
+        }],
+        sessions: [{
+          sessionId: 'session-a',
+          larkAppId: 'app-a',
+          botName: 'CpuPendingBot',
+          title: 'CPU Pending',
+          status: 'working',
+          confidence: 'descendant',
+          current: {
+            cpuPct: 0,
+            cpu1mPct: 0,
+            rssBytes: 64 * 1024 * 1024,
+            rssGrowth5mBytes: 4 * 1024 * 1024,
+          },
+        }],
+        runtime: {
+          sampleHealth: { status: 'fresh', ageMs: 0 },
+          daemons: { total: 1, online: 1, offline: 0 },
+          sessions: { total: 1, working: 1, starting: 0, idle: 0, waiting: 0, unknown: 0, unattributed: 0 },
+        },
+        rankings: { tracked: [] },
+      },
+      initialHistory: { supported: true, bots: [], sessions: [] },
+      poll: false,
+    }));
+    const root = renderer.root;
+
+    const healthCards = root
+      .findByProps({ className: 'panel runtime-health-panel' })
+      .findAllByProps({ className: 'metric-card runtime-health-card' });
+    expect(textContent(healthCards[3].findByType('strong'))).toBe('-');
+    expect(textContent(healthCards[3])).toContain('40.0%');
+    expect(textContent(healthCards[3])).toContain('128 MiB');
+
+    const pressureCards = root
+      .findByProps({ className: 'panel resource-pressure' })
+      .findAllByProps({ className: 'metric-card' });
+    expect(textContent(pressureCards[0].findByType('strong'))).toBe('-');
+    expect(textContent(pressureCards[1].findByType('strong'))).toBe('40.0%');
+    expect(textContent(pressureCards[2].findByType('small'))).toBe('-');
+    expect(textContent(pressureCards[2].findByType('strong'))).toBe('128 MiB');
+
+    const botTable = root.findByProps({ className: 'resource-table resource-bot-table' });
+    const botRow = botTable.findAllByProps({ className: 'resource-row' })
+      .find(row => textContent(row).includes('CpuPendingBot'));
+    expect(textContent(botRow!.children[5] as ReactTestInstance)).toBe('-');
+    expect(textContent(botRow!.children[6] as ReactTestInstance)).toBe('256 MiB');
+
+    const sessionTable = root.findByProps({ className: 'resource-table resource-session-table' });
+    const sessionRow = sessionTable.findAllByProps({ className: 'resource-row' })
+      .find(row => textContent(row).includes('CPU Pending'));
+    expect(textContent(sessionRow!.children[2] as ReactTestInstance)).toBe('-');
+    expect(textContent(sessionRow!.children[3] as ReactTestInstance)).toBe('64 MiB');
+  });
+
   it('limits the session body height with CSS instead of dropping rows', () => {
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
 

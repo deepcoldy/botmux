@@ -85,8 +85,15 @@ function collectSubtree(rootPid: number | undefined, children: Map<number, numbe
   return out;
 }
 
-function addPidTree(target: Set<number>, rootPid: number | undefined, children: Map<number, number[]>): void {
+function addPidTree(
+  target: Set<number>,
+  rootPid: number | undefined,
+  children: Map<number, number[]>,
+  byPid: Map<number, ProcessResourceSample>,
+): boolean {
+  if (!rootPid || rootPid <= 0 || !byPid.has(rootPid)) return false;
   for (const pid of collectSubtree(rootPid, children)) target.add(pid);
+  return true;
 }
 
 function metricFor(pids: Iterable<number>, byPid: Map<number, ProcessResourceSample>, processCpuPct: Map<number, number>): { rssBytes: number; cpuPct: number } {
@@ -141,25 +148,24 @@ export function attributeResources(input: AttributionInput): AttributionResult {
     const pids = new Set<number>();
     const markerPids = markerPidsBySession.get(session.sessionId) ?? [];
     const cliPids = [...markerPids];
+    let workerPid: number | undefined;
     let confidence: ResourceAttributionConfidence = 'unknown';
 
     if (session.workerPid) {
-      addPidTree(pids, session.workerPid, children);
-      if (pids.size > 0) confidence = 'descendant';
+      if (addPidTree(pids, session.workerPid, children, byPid)) {
+        workerPid = session.workerPid;
+        confidence = 'descendant';
+      }
     }
     for (const markerPid of markerPids) {
-      addPidTree(pids, markerPid, children);
-      if (byPid.has(markerPid)) pids.add(markerPid);
-      if (byPid.has(markerPid)) confidence = 'marker';
+      if (addPidTree(pids, markerPid, children, byPid)) confidence = 'marker';
     }
     if (session.adoptCliPid) {
       cliPids.push(session.adoptCliPid);
-      addPidTree(pids, session.adoptCliPid, children);
-      if (byPid.has(session.adoptCliPid)) pids.add(session.adoptCliPid);
-      if (byPid.has(session.adoptCliPid)) confidence = 'adopted';
+      if (addPidTree(pids, session.adoptCliPid, children, byPid)) confidence = 'adopted';
     }
 
-    return { session, pids, workerPid: session.workerPid, cliPids, confidence };
+    return { session, pids, workerPid, cliPids, confidence };
   });
 
   removeAmbiguousPids(candidates);
@@ -202,8 +208,8 @@ export function attributeResources(input: AttributionInput): AttributionResult {
       rankReasons: [],
       confidence: candidate.pids.size > 0 ? candidate.confidence : 'unknown',
       pids: {
-        workerPid: candidate.workerPid,
-        cliPids: candidate.cliPids,
+        ...(candidate.workerPid !== undefined ? { workerPid: candidate.workerPid } : {}),
+        ...(candidate.cliPids.length ? { cliPids: candidate.cliPids } : {}),
         sampledPids: candidate.pids.size,
       },
     } satisfies ResourceSessionCurrent;

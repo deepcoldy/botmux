@@ -142,8 +142,8 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
       ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
       : undefined,
     tokenUsage: sessionTokenUsage(ds.session, ds.workingDir),
-    workerPid: ds.worker?.pid ?? ds.session.pid,
-    adoptCliPid: ds.adoptedFrom?.originalCliPid,
+    ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
+    ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
   };
 }
 

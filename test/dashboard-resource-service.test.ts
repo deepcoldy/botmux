@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createResourceMonitorService, toResourceMonitorDaemonSeed, toResourceMonitorSessionSeed } from '../src/dashboard/resource-monitor-service.js';
+import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, toResourceMonitorDaemonSeed, toResourceMonitorSessionSeed } from '../src/dashboard/resource-monitor-service.js';
 import type { ProcfsSample } from '../src/core/resource-monitor/types.js';
 
 function sample(processes: ProcfsSample['processes'], totalCpuTicks = 1000, idleCpuTicks = 0): ProcfsSample {
@@ -63,6 +63,32 @@ describe('ResourceMonitorService', () => {
       botName: 'Offline',
       status: 'offline',
     });
+  });
+
+  it('builds daemon seeds for configured online and offline bots', () => {
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      sampleProcfs: () => sample([
+        { pid: 10, ppid: 1, rssBytes: 10, cpuTicks: 10, cmd: 'online-daemon' },
+      ]),
+      listSessions: () => [],
+      listDaemons: () => buildResourceMonitorDaemonSeeds([
+        { larkAppId: 'app-online', larkAppSecret: 'secret', displayName: 'Configured Online', cliId: 'codex' },
+        { larkAppId: 'app-offline', larkAppSecret: 'secret', displayName: 'Configured Offline', cliId: 'codex' },
+      ], [
+        { larkAppId: 'app-online', botName: 'Online Registry', pid: 10 },
+      ]),
+      readCliMarkers: () => new Map(),
+      nowMs: () => 100_000,
+    });
+
+    svc.sampleOnce();
+
+    expect(svc.current().runtime.daemons).toEqual({ total: 2, online: 1, offline: 1 });
+    expect(svc.current().bots.map(bot => [bot.larkAppId, bot.botName, bot.daemonPid, bot.daemonStatus])).toEqual([
+      ['app-online', 'Online Registry', 10, 'online'],
+      ['app-offline', 'Configured Offline', undefined, 'offline'],
+    ]);
   });
 
   it('builds runtime summary from session seed timestamps and attention', () => {
@@ -233,13 +259,14 @@ describe('ResourceMonitorService', () => {
     expect(svc.current()).toMatchObject({
       ok: true,
       supported: false,
+      cpuReady: false,
       reason: 'procfs_unavailable',
       bots: [],
       sessions: [],
     });
     expect(svc.current().runtime.sampleHealth.status).toBe('unsupported');
     expect(svc.current().runtime.daemons).toEqual({ total: 4, online: 1, offline: 1 });
-    expect(svc.current().runtime.sessions).toMatchObject({ total: 1, working: 1 });
+    expect(svc.current().runtime.sessions).toMatchObject({ total: 1, working: 1, unattributed: 1 });
     expect(svc.history('3h')).toMatchObject({
       ok: true,
       supported: false,
@@ -267,6 +294,41 @@ describe('ResourceMonitorService', () => {
 
     expect(svc.current().host?.cpuPct).toBe(30);
     expect(svc.current().botmux?.cpuPct).toBe(10);
+  });
+
+  it('marks CPU unavailable until the second supported sample has a usable delta', () => {
+    let tick = 0;
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      sampleProcfs: () => tick++ === 0
+        ? sample([
+          { pid: 10, ppid: 1, rssBytes: 10, cpuTicks: 10, cmd: 'botmux' },
+          { pid: 20, ppid: 10, rssBytes: 20, cpuTicks: 20, cmd: 'worker' },
+        ], 100, 80)
+        : sample([
+          { pid: 10, ppid: 1, rssBytes: 10, cpuTicks: 20, cmd: 'botmux' },
+          { pid: 20, ppid: 10, rssBytes: 20, cpuTicks: 40, cmd: 'worker' },
+        ], 200, 150),
+      listSessions: () => [{ sessionId: 's1', larkAppId: 'app', botName: 'bot', status: 'working', workerPid: 20 }],
+      listDaemons: () => [{ larkAppId: 'app', botName: 'bot', pid: 10 }],
+      listBotmuxPids: () => [10],
+      readCliMarkers: () => new Map(),
+      nowMs: () => tick * 10_000,
+    });
+
+    svc.sampleOnce();
+
+    expect(svc.current().cpuReady).toBe(false);
+    expect(svc.current().host?.cpuPct).toBe(0);
+    expect(svc.current().botmux?.cpuPct).toBe(0);
+    expect(svc.current().sessions[0].current.cpuPct).toBe(0);
+
+    svc.sampleOnce();
+
+    expect(svc.current().cpuReady).toBe(true);
+    expect(svc.current().host?.cpuPct).toBe(30);
+    expect(svc.current().botmux?.cpuPct).toBe(30);
+    expect(svc.current().sessions[0].current.cpuPct).toBe(20);
   });
 
   it('includes the dashboard process in botmux totals when no bot daemons are registered', () => {

@@ -45,6 +45,33 @@ describe('dashboard resource row fields', () => {
     expect(row.adoptCliPid).toBe(4321);
   });
 
+  it('does not expose a stale persisted session pid when no live worker exists', () => {
+    const ds = {
+      session: {
+        sessionId: 's1',
+        larkAppId: 'app',
+        cliId: 'codex',
+        status: 'active',
+        createdAt: '2026-07-09T00:00:00.000Z',
+        chatId: 'oc_1',
+        rootMessageId: 'om_1',
+        pid: 9876,
+      },
+      larkAppId: 'app',
+      chatId: 'oc_1',
+      chatType: 'group',
+      scope: 'thread',
+      workerPort: null,
+      workerToken: null,
+      spawnedAt: 1,
+      lastMessageAt: 2,
+    } as unknown as DaemonSession;
+
+    const row = composeRowFromActive(ds);
+
+    expect(row).not.toHaveProperty('workerPid');
+  });
+
   it('does not add resource pid fields to closed rows', () => {
     const row = composeRowFromClosed({
       sessionId: 's1',

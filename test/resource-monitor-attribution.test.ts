@@ -59,6 +59,30 @@ describe('attributeResources', () => {
     expect(result.sessions.find(s => s.sessionId === 's2')?.current.rssBytes).toBe(200);
   });
 
+  it('does not attribute descendants through a worker pid missing from the sampled process set', () => {
+    const result = attributeResources({
+      processes: [
+        { pid: 201, ppid: 200, rssBytes: 300, cpuTicks: 3000, cmd: 'stale-child' },
+      ],
+      processCpuPct: new Map([[201, 3]]),
+      sessions: [
+        { sessionId: 'stale', larkAppId: 'app-a', botName: 'A', status: 'working', workerPid: 200 },
+      ],
+      daemons: [{ larkAppId: 'app-a', botName: 'A' }],
+      cliMarkers: new Map(),
+      previousSessionStats: new Map(),
+      nowMs: 10_000,
+    });
+
+    const session = result.sessions[0];
+    expect(session.confidence).toBe('unknown');
+    expect(session.current.rssBytes).toBe(0);
+    expect(session.current.cpuPct).toBe(0);
+    expect(session.pids.sampledPids).toBe(0);
+    expect(session.pids).not.toHaveProperty('workerPid');
+    expect(result.bots[0].sessions.rssBytes).toBe(0);
+  });
+
   it('includes the dashboard process in botmux totals even without bot daemons', () => {
     const result = attributeResources({
       processes,
