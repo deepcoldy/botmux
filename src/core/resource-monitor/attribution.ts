@@ -4,6 +4,7 @@ import type {
   ResourceBotCurrent,
   ResourceSessionCurrent,
 } from './types.js';
+import { sessionRuntimeBucket } from './runtime.js';
 
 export interface ResourceSessionSeed {
   sessionId: string;
@@ -11,6 +12,9 @@ export interface ResourceSessionSeed {
   botName?: string;
   title?: string;
   status?: string;
+  spawnedAt?: number;
+  lastMessageAt?: number;
+  agentAttention?: { kind: string; reason: string; at: number };
   workerPid?: number;
   adoptCliPid?: number;
 }
@@ -183,6 +187,9 @@ export function attributeResources(input: AttributionInput): AttributionResult {
       botName: candidate.session.botName ?? candidate.session.larkAppId,
       title: candidate.session.title,
       status: candidate.session.status ?? 'unknown',
+      spawnedAt: candidate.session.spawnedAt,
+      lastMessageAt: candidate.session.lastMessageAt,
+      agentAttention: candidate.session.agentAttention,
       current: {
         rssBytes: currentMetric.rssBytes,
         cpuPct: currentMetric.cpuPct,
@@ -206,13 +213,25 @@ export function attributeResources(input: AttributionInput): AttributionResult {
     if (daemon.pid && byPid.has(daemon.pid)) daemonPids.add(daemon.pid);
     const daemonMetric = metricFor(daemonPids, byPid, input.processCpuPct);
     const sessionMetric = metricFor(sessionPidsByBot.get(daemon.larkAppId) ?? [], byPid, input.processCpuPct);
-    const count = sessions.filter(session => session.larkAppId === daemon.larkAppId).length;
+    const botSessions = sessions.filter(session => session.larkAppId === daemon.larkAppId);
+    const count = botSessions.length;
+    const runtimeSessions = { total: count, working: 0, starting: 0, waiting: 0 };
+    for (const session of botSessions) {
+      const bucket = sessionRuntimeBucket(session);
+      if (bucket === 'working' || bucket === 'starting' || bucket === 'waiting') runtimeSessions[bucket] += 1;
+    }
+    const daemonStatus = daemon.pid === undefined ? 'unknown' : byPid.has(daemon.pid) ? 'online' : 'offline';
     return {
       larkAppId: daemon.larkAppId,
       botName: daemon.botName ?? daemon.larkAppId,
       daemonPid: daemon.pid,
+      daemonStatus,
       daemon: daemonMetric,
       sessions: { ...sessionMetric, count },
+      runtime: {
+        daemonStatus,
+        sessions: runtimeSessions,
+      },
       total: {
         rssBytes: daemonMetric.rssBytes + sessionMetric.rssBytes,
         cpuPct: daemonMetric.cpuPct + sessionMetric.cpuPct,

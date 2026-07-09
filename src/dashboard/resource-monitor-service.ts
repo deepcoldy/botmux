@@ -11,6 +11,7 @@ import {
 } from '../core/resource-monitor/attribution.js';
 import { sampleProcfs as defaultSampleProcfs } from '../core/resource-monitor/procfs.js';
 import { NumericRingSeries } from '../core/resource-monitor/ring-buffer.js';
+import { buildRuntimeMonitorSummary } from '../core/resource-monitor/runtime.js';
 import { selectTrackedSessions } from '../core/resource-monitor/top-selector.js';
 import type {
   HostResourceCurrent,
@@ -86,6 +87,14 @@ function emptyCurrent(sampledAt: number, intervalMs: number, supported = false):
     ...(supported ? {} : { reason: 'procfs_unavailable' as const }),
     bots: [],
     sessions: [],
+    runtime: buildRuntimeMonitorSummary({
+      supported,
+      sampledAt,
+      intervalMs,
+      nowMs: sampledAt,
+      bots: [],
+      sessions: [],
+    }),
     rankings: { topCpu: [], topRss: [], topGrowth: [], tracked: [] },
   };
 }
@@ -289,15 +298,24 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
       rankReasons: selection.reasonsBySession.get(session.sessionId) ?? [],
     }));
     const host = hostCurrent(sample, previousTotalCpuTicks, previousIdleCpuTicks);
+    const sampledAt = sample.sampledAt || now;
     currentSnapshot = {
       ok: true,
       supported: true,
-      sampledAt: sample.sampledAt || now,
+      sampledAt,
       intervalMs,
       host,
       botmux: attribution.botmux,
       bots: attribution.bots,
       sessions,
+      runtime: buildRuntimeMonitorSummary({
+        supported: true,
+        sampledAt,
+        intervalMs,
+        nowMs: now,
+        bots: attribution.bots,
+        sessions,
+      }),
       rankings: {
         topCpu: selection.topCpu,
         topRss: selection.topRss,

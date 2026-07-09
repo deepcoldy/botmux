@@ -1,5 +1,52 @@
 export type ResourceAttributionConfidence = 'exact' | 'marker' | 'adopted' | 'descendant' | 'unknown';
 export type ResourceRankReason = 'cpu' | 'rss' | 'rssGrowth' | 'grace';
+export type RuntimeSampleStatus = 'fresh' | 'stale' | 'unsupported';
+export type RuntimeSessionBucket = 'working' | 'starting' | 'idle' | 'waiting' | 'unknown';
+export type RuntimeDaemonStatus = 'online' | 'offline' | 'unknown';
+
+export interface RuntimeSessionRef {
+  sessionId: string;
+  larkAppId: string;
+  botName: string;
+  title?: string;
+  status?: string;
+  durationMs: number;
+}
+
+export interface RuntimeMonitorSummary {
+  sampleHealth: {
+    status: RuntimeSampleStatus;
+    sampledAt: number;
+    ageMs: number;
+    intervalMs: number;
+  };
+  daemons: {
+    total: number;
+    online: number;
+    offline: number;
+  };
+  sessions: {
+    total: number;
+    working: number;
+    starting: number;
+    idle: number;
+    waiting: number;
+    unknown: number;
+    unattributed: number;
+    longestRunning?: RuntimeSessionRef;
+    longestWaiting?: RuntimeSessionRef;
+  };
+}
+
+export interface ResourceBotRuntime {
+  daemonStatus: RuntimeDaemonStatus;
+  sessions: {
+    total: number;
+    working: number;
+    starting: number;
+    waiting: number;
+  };
+}
 
 export interface HostResourceCurrent {
   cpuPct: number;
@@ -23,6 +70,9 @@ export interface ResourceSessionCurrent {
   botName: string;
   title?: string;
   status: string;
+  spawnedAt?: number;
+  lastMessageAt?: number;
+  agentAttention?: { kind: string; reason: string; at: number };
   current: {
     rssBytes: number;
     cpuPct: number;
@@ -44,8 +94,10 @@ export interface ResourceBotCurrent {
   larkAppId: string;
   botName: string;
   daemonPid?: number;
+  daemonStatus: RuntimeDaemonStatus;
   daemon: ResourceMetricCurrent;
   sessions: ResourceMetricCurrent & { count: number };
+  runtime: ResourceBotRuntime;
   total: ResourceMetricCurrent;
 }
 
@@ -59,6 +111,7 @@ export interface ResourceCurrentSnapshot {
   botmux?: ResourceMetricCurrent;
   bots: ResourceBotCurrent[];
   sessions: ResourceSessionCurrent[];
+  runtime: RuntimeMonitorSummary;
   rankings: {
     topCpu: string[];
     topRss: string[];
