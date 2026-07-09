@@ -492,6 +492,7 @@ export const messages: Record<string, string> = {
   'help.heading_grant': '🔑 使用授权（owner 专用）：',
   'help.grant': '@机器人 /grant @某人   - 授权对方在本群对话（可一次 @ 多人/多 bot）；/grant（不带人）授权本群所有成员对话',
   'help.revoke': '@机器人 /revoke @某人  - 撤销对方本群对话权（可一次 @ 多人/多 bot）；/revoke（不带人）撤销整群授权',
+  'help.vc_auth': '/vc-auth @成员     - 会议监听中临时授权本场指令源；/vc-auth revoke @成员 撤销；/vc-auth list 查看',
   'help.heading_config': '⚙️ 远程改配置（owner 专用，写盘即热更新、无需重启）：',
   'help.config_get': '/botconfig get  - 查看本机器人当前运营配置',
   'help.config_set': '/botconfig set <字段> <值>  - 改 model/cli/lang/开关等；/botconfig help 看全部字段',
