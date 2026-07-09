@@ -18,6 +18,9 @@ import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
 import { VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 
+/** Baseline events that every botmux bot needs — must NOT be overwritten by VC-only subscriptions. */
+export const BOT_BASELINE_EVENTS = ['im.message.receive_v1', 'card.action.trigger'] as const;
+
 export const BOTMUX_REDIRECT_URL = 'http://127.0.0.1:9768/callback';
 const FEISHU_ACCOUNTS_ORIGIN = 'https://accounts.feishu.cn';
 const ASK_FEISHU_ORIGIN = 'https://ask.feishu.cn';
@@ -502,18 +505,22 @@ export async function automateOpenPlatformSetup(
   // doesn't exist or fails, the user can still add them manually in the console.
   // We try multiple known internal API patterns since the console frontend
   // endpoint varies by tenant/version.
+  // IMPORTANT: Always include BOT_BASELINE_EVENTS alongside VC events — the
+  // internal update endpoint is replacement-style, so sending only VC events
+  // would wipe im.message.receive_v1 / card.action.trigger and break messaging.
+  const allEvents = [...BOT_BASELINE_EVENTS, ...VC_MEETING_BOT_EVENTS];
   let subscribedEventCount = 0;
   let eventWarning: string | undefined;
   const eventEndpoints = [
     {
       path: `/developers/v1/event/update/${options.appId}`,
-      body: buildEventSubscriptionPayload(options.appId, [...VC_MEETING_BOT_EVENTS]),
+      body: buildEventSubscriptionPayload(options.appId, allEvents),
     },
     {
       path: `/developers/v1/event/update/${options.appId}`,
       body: {
         clientId: options.appId,
-        eventNameList: [...VC_MEETING_BOT_EVENTS],
+        eventNameList: allEvents,
         isDeveloperPanel: true,
       },
     },
@@ -521,7 +528,7 @@ export async function automateOpenPlatformSetup(
       path: `/developers/v1/event_callback/update/${options.appId}`,
       body: {
         clientId: options.appId,
-        eventNames: [...VC_MEETING_BOT_EVENTS],
+        eventNames: allEvents,
         isDeveloperPanel: true,
       },
     },
@@ -529,7 +536,7 @@ export async function automateOpenPlatformSetup(
   for (const attempt of eventEndpoints) {
     try {
       await postJson(attempt.path, attempt.body);
-      subscribedEventCount = VC_MEETING_BOT_EVENTS.length;
+      subscribedEventCount = allEvents.length;
       eventWarning = undefined;
       break;
     } catch (err: any) {

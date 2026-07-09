@@ -104,7 +104,9 @@ import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 import { automateOpenPlatformSetup } from './setup/open-platform-automation.js';
+import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
+import { larkHosts } from './im/lark/lark-hosts.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -391,6 +393,94 @@ async function reloadVcMeetingBotConfigOnDaemons(appIds: string[]): Promise<void
   }));
 }
 
+/**
+ * Fetch the set of actually granted scopes for a bot app via Feishu Open API.
+ * Used after automateOpenPlatformSetup to verify that VC meeting scopes were
+ * actually applied (not just "requested").
+ */
+async function fetchGrantedScopesForBot(bot: { larkAppId: string; larkAppSecret: string; brand?: string }): Promise<{ ok: true; granted: Set<string> } | { ok: false; error: string }> {
+  const brand = bot.brand === 'lark' ? 'lark' : 'feishu';
+  const openApi = larkHosts(brand).openApi;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 10_000);
+  try {
+    const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: bot.larkAppId, app_secret: bot.larkAppSecret }),
+      signal: ac.signal,
+    });
+    const tokenData = await tokenRes.json() as any;
+    if (tokenData?.code !== 0 || typeof tokenData?.tenant_access_token !== 'string') {
+      return { ok: false, error: `invalid_credentials: code=${tokenData?.code ?? '?'} msg=${tokenData?.msg ?? ''}` };
+    }
+    const infoRes = await fetch(
+      `${openApi}/open-apis/application/v6/applications/${bot.larkAppId}?lang=zh_cn`,
+      { headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` }, signal: ac.signal },
+    );
+    const infoData = await infoRes.json() as any;
+    if (infoData?.code === 99991672) {
+      return { ok: false, error: 'missing application:application:self_manage' };
+    }
+    if (infoData?.code !== 0) {
+      return { ok: false, error: `scope_check_failed: code=${infoData?.code ?? '?'} msg=${infoData?.msg ?? ''}` };
+    }
+    const scopesRaw: any[] =
+      infoData.data?.app?.scopes
+      ?? infoData.data?.application?.scopes
+      ?? infoData.data?.scopes
+      ?? [];
+    const granted = new Set(
+      scopesRaw.map((s: any) => typeof s === 'string' ? s : s?.scope).filter(Boolean) as string[],
+    );
+    return { ok: true, granted };
+  } catch (err: any) {
+    return {
+      ok: false,
+      error: ac.signal.aborted ? 'timeout' : `${err?.message ?? err}`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Validate that a bot has the required VC meeting scopes granted.
+ * Checks both VC_MEETING_FEATURE_SCOPES and (if realtimeVoice is enabled)
+ * VC_MEETING_REALTIME_VOICE_SCOPES.
+ */
+async function validateVcMeetingScopesForBot(bot: { larkAppId: string; larkAppSecret: string; brand?: string; vcMeetingAgent?: any }): Promise<{ ok: true } | { ok: false; error: string }> {
+  const result = await fetchGrantedScopesForBot(bot);
+  if (!result.ok) return { ok: false, error: result.error };
+  const needsRealtime = bot.vcMeetingAgent?.realtimeVoice?.enabled === true;
+  const required = needsRealtime
+    ? [...VC_MEETING_FEATURE_SCOPES, ...VC_MEETING_REALTIME_VOICE_SCOPES]
+    : VC_MEETING_FEATURE_SCOPES;
+  const missing = required.filter(s => !result.granted.has(s.name));
+  if (missing.length > 0) {
+    return { ok: false, error: `缺少权限: ${missing.map(s => s.name).join(', ')}` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Wait for FeishuLoginManager to produce a QR code after start().
+ * The start() method returns immediately with status='starting'; the QR code
+ * is set asynchronously in the onQrCode callback. Poll until qrDataUrl appears
+ * or we hit the timeout.
+ */
+async function waitForFeishuLoginQr(timeoutMs = 8_000, intervalMs = 200): Promise<string | null> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const snap = feishuLogin.get();
+    if (snap?.qrDataUrl) return snap.qrDataUrl;
+    // Also stop waiting if login already failed
+    if (snap?.status === 'failed' || snap?.status === 'success') return null;
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return null;
+}
+
 async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, previousListenerBotAppId?: string | null): Promise<{ ok: true } | { ok: false; error: string; feishuLoginQr?: string }> {
   const nextAppId = listenerBotAppId?.trim() || null;
   const prevAppId = previousListenerBotAppId?.trim() || null;
@@ -424,6 +514,13 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
     const brand = bot?.brand === 'lark' ? 'lark' : 'feishu';
     if (brand === 'lark') {
       logger.info(`[vc-agent] skipping open-platform automation for lark-brand bot ${nextAppId} (feishu.cn only)`);
+      // For lark brand, still validate that required scopes exist before saving
+      if (bot) {
+        const scopeCheck = await validateVcMeetingScopesForBot(bot);
+        if (!scopeCheck.ok) {
+          return { ok: false, error: `vcMeetingAgent_listenerBot_missing_scopes: ${scopeCheck.error}` };
+        }
+      }
     } else {
       try {
         const result = await automateOpenPlatformSetup({
@@ -436,6 +533,19 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
           logger.info(`[vc-agent] auto-imported ${result.scopeCount} scopes, subscribed ${result.subscribedEventCount} events for listener bot ${nextAppId}`);
           if (result.scopeWarning) logger.warn(`[vc-agent] scope import warning: ${result.scopeWarning}`);
           if (result.eventWarning) logger.warn(`[vc-agent] event subscription warning: ${result.eventWarning}`);
+          // Post-validation: verify VC meeting scopes are actually granted after automation.
+          // The internal scope/update may silently skip some scopes (e.g. not available
+          // in this tenant). Without this check, a bot without VC scopes could be saved
+          // as global listener and silently drop all meeting events.
+          if (bot) {
+            const scopeCheck = await validateVcMeetingScopesForBot(bot);
+            if (!scopeCheck.ok) {
+              return {
+                ok: false,
+                error: `vcMeetingAgent_listenerBot_missing_scopes_after_auto: ${scopeCheck.error}。请到开放平台手动开通 VC 会议权限后重试。`,
+              };
+            }
+          }
         } else {
           const reason = result.reason;
           // Session/login-related failures are hard failures — return QR so user can re-login.
@@ -448,17 +558,33 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
             || reason === 'timeout'
             || reason === 'login_failed'
           ) {
-            const loginSnap = feishuLogin.start();
+            feishuLogin.start();
+            // feishuLogin.start() returns immediately with status='starting'; the QR
+            // code is set asynchronously in onQrCode. Wait briefly for it to be ready
+            // so the frontend can display it inline instead of showing an error without
+            // a scan entry.
+            const qrDataUrl = await waitForFeishuLoginQr();
             const hint = '请用飞书扫码完成开放平台登录，登录后重新选择监听 bot 即可自动配置权限';
             return {
               ok: false,
               error: `vcMeetingAgent_listenerBot_scope_auto_import_failed: ${reason}: ${hint}`,
-              feishuLoginQr: loginSnap.qrDataUrl,
+              feishuLoginQr: qrDataUrl ?? undefined,
             };
           }
           // Non-login failures (network, api_error, etc.) are best-effort — don't
           // block the save. The user can fix scopes manually in the console.
           logger.warn(`[vc-agent] open-platform automation failed for ${nextAppId}: ${reason}: ${result.message}`);
+          // Even on non-login automation failure, verify scopes before saving —
+          // if the bot genuinely lacks VC permissions, don't silently make it listener.
+          if (bot) {
+            const scopeCheck = await validateVcMeetingScopesForBot(bot);
+            if (!scopeCheck.ok) {
+              return {
+                ok: false,
+                error: `vcMeetingAgent_listenerBot_missing_scopes: ${scopeCheck.error}。自动化配置失败(${reason})且权限未满足，请手动开通后重试。`,
+              };
+            }
+          }
         }
       } catch (err: any) {
         logger.warn(`[vc-agent] open-platform automation error for ${nextAppId}: ${err?.message ?? err}`);
