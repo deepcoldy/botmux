@@ -10,7 +10,7 @@ import {
   type StorageLike,
   writeMonitorRoomAutoActive,
 } from '../src/dashboard/web/monitor-room-store.js';
-import { monitorRoomFrameGeometry, monitorRoomGridGeometry } from '../src/dashboard/web/monitor-room.js';
+import { monitorRoomFrameGeometry, monitorRoomGridGeometry, monitorRoomPanelBodyKey } from '../src/dashboard/web/monitor-room.js';
 import { sessionTerminalHref, type SessionTerminalLocation } from '../src/dashboard/web/session-terminal.js';
 
 function makeStorage(): StorageLike & { data: Map<string, string> } {
@@ -119,5 +119,33 @@ describe('monitor room grid geometry', () => {
 
     expect(landscape.frameWidth / landscape.frameHeight).toBeCloseTo(1800 / 1200, 2);
     expect(landscape.frameWidth).toBeGreaterThan(portrait.frameWidth);
+  });
+});
+
+describe('monitor room panel body key', () => {
+  const local: SessionTerminalLocation = { protocol: 'http:', origin: 'http://localhost:8801', hostname: 'localhost' };
+
+  it('returns "missing" for null or undefined session', () => {
+    expect(monitorRoomPanelBodyKey(null)).toBe('missing');
+    expect(monitorRoomPanelBodyKey(undefined)).toBe('missing');
+  });
+
+  it('embeds the terminal URL so iframe rebuilds when URL changes', () => {
+    const direct = monitorRoomPanelBodyKey({ sessionId: 'a', webPort: 3001 }, local);
+    const proxied = monitorRoomPanelBodyKey({ sessionId: 'a', webPort: 3001, proxyPort: 8801 }, local);
+    expect(direct).toBe('frame:http://localhost:3001');
+    expect(proxied).toBe('frame:http://localhost:8801/s/a');
+    expect(direct).not.toBe(proxied);
+  });
+
+  it('status-only change does not change bodyKey — iframe survives SSE updates', () => {
+    const running = monitorRoomPanelBodyKey({ sessionId: 'a', webPort: 3001, status: 'running', lastMessageAt: 1 }, local);
+    const idle = monitorRoomPanelBodyKey({ sessionId: 'a', webPort: 3001, status: 'idle', lastMessageAt: 2 }, local);
+    expect(running).toBe(idle);
+  });
+
+  it('does not include removable — removable is a header-only concern', () => {
+    const key = monitorRoomPanelBodyKey({ sessionId: 'x', webPort: 1 }, local);
+    expect(key).not.toContain('removable');
   });
 });

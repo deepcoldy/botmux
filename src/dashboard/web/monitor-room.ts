@@ -105,6 +105,98 @@ export function monitorRoomFrameGeometry(
   return { width, height, scale };
 }
 
+interface MonitorCardEntry {
+  article: HTMLElement;
+  head: HTMLElement;
+  frameWrap: HTMLElement;
+  bodyKey: string;
+}
+
+export function monitorRoomPanelBodyKey(
+  session: any | null | undefined,
+  loc?: { protocol: string; origin: string; hostname: string } | null,
+): string {
+  if (!session) return 'missing';
+  const url = sessionTerminalHref(session, loc ?? null);
+  return `frame:${url ?? 'none'}`;
+}
+
+function cardHeadHtml(sessionId: string, removable: boolean): string {
+  const s = store.sessions.get(sessionId);
+  const removeButton = removable ? removeButtonHtml(sessionId) : '';
+  if (!s) {
+    return `<div class="monitor-room-card-title">
+      <strong>${escapeHtml(sessionId)}</strong>
+      <span>${escapeHtml(t('monitorRoom.missing'))}</span>
+    </div>${removeButton}`;
+  }
+  const title = cardTitle(s);
+  const url = sessionTerminalHref(s);
+  const botName = botDisplayName(s);
+  const singleOpen = url ? popoverButtonHtml(sessionId) : '';
+  return `<div class="monitor-room-card-title">
+    ${botAvatarHtml({ name: botName, larkAppId: s.larkAppId, size: 'sm' })}
+    <span class="monitor-room-card-meta">
+      <strong title="${escapeHtml(String(s.title ?? title))}">${escapeHtml(title)}</strong>
+      <small>${escapeHtml(botName)} · ${statusBadgeHtml(s.status)} · ${escapeHtml(t('monitorRoom.updated', { time: relTime(s.lastMessageAt) }))}</small>
+    </span>
+  </div>
+  <div class="monitor-room-card-actions">
+    ${singleOpen}
+    ${removeButton}
+  </div>`;
+}
+
+function cardFrameHtml(sessionId: string): string {
+  const s = store.sessions.get(sessionId);
+  if (!s) {
+    return `<div class="monitor-room-placeholder">${escapeHtml(t('monitorRoom.missingHelp'))}</div>`;
+  }
+  const url = sessionTerminalHref(s);
+  return url
+    ? `<iframe class="monitor-room-frame" src="${escapeHtml(url)}" allow="clipboard-read; clipboard-write"></iframe>`
+    : `<div class="monitor-room-placeholder">
+        <b>${escapeHtml(t('monitorRoom.terminalUnavailable'))}</b>
+        <span>${escapeHtml(t('monitorRoom.terminalUnavailableHelp'))}</span>
+      </div>`;
+}
+
+function ensureCardEntry(
+  entries: Map<string, MonitorCardEntry>,
+  grid: HTMLElement,
+  sessionId: string,
+): MonitorCardEntry {
+  const existing = entries.get(sessionId);
+  if (existing) return existing;
+  const article = document.createElement('article');
+  article.className = 'monitor-room-card';
+  article.dataset.id = sessionId;
+  const head = document.createElement('header');
+  head.className = 'monitor-room-card-head';
+  const frameWrap = document.createElement('div');
+  frameWrap.className = 'monitor-room-frame-wrap';
+  article.appendChild(head);
+  article.appendChild(frameWrap);
+  grid.appendChild(article);
+  const entry: MonitorCardEntry = { article, head, frameWrap, bodyKey: '' };
+  entries.set(sessionId, entry);
+  return entry;
+}
+
+function syncCardBody(entry: MonitorCardEntry, sessionId: string, bodyKey: string): void {
+  if (entry.bodyKey === bodyKey) return;
+  entry.frameWrap.innerHTML = cardFrameHtml(sessionId);
+  entry.bodyKey = bodyKey;
+}
+
+function emptyPlaceholderHtml(usingAutoActive: boolean): string {
+  return `<div class="monitor-room-empty">
+      <h2>${escapeHtml(t(usingAutoActive ? 'monitorRoom.autoEmptyTitle' : 'monitorRoom.emptyTitle'))}</h2>
+      <p>${escapeHtml(t(usingAutoActive ? 'monitorRoom.autoEmptyHelp' : 'monitorRoom.emptyHelp'))}</p>
+      <a class="btn-link" href="#/sessions">${escapeHtml(t('monitorRoom.openSessions'))}</a>
+    </div>`;
+}
+
 function syncMonitorRoomFrameScales(root: HTMLElement, grid: HTMLElement): void {
   const viewport = { width: window.innerWidth, height: window.innerHeight };
   const gridRect = grid.getBoundingClientRect();
@@ -133,49 +225,6 @@ function removeButtonHtml(sessionId: string): string {
 
 function popoverButtonHtml(sessionId: string): string {
   return `<button type="button" class="card-act" data-popout="${escapeHtml(sessionId)}" title="${escapeHtml(t('monitorRoom.openTerminal'))}" aria-label="${escapeHtml(t('monitorRoom.openTerminal'))}">↗</button>`;
-}
-
-function sessionPanelHtml(sessionId: string, options: { removable: boolean }): string {
-  const s = store.sessions.get(sessionId);
-  const removeButton = options.removable ? removeButtonHtml(sessionId) : '';
-  if (!s) {
-    return `<article class="monitor-room-card monitor-room-card-empty" data-id="${escapeHtml(sessionId)}">
-      <header class="monitor-room-card-head">
-        <div class="monitor-room-card-title">
-          <strong>${escapeHtml(sessionId)}</strong>
-          <span>${escapeHtml(t('monitorRoom.missing'))}</span>
-        </div>
-        ${removeButton}
-      </header>
-      <div class="monitor-room-placeholder">${escapeHtml(t('monitorRoom.missingHelp'))}</div>
-    </article>`;
-  }
-  const title = cardTitle(s);
-  const url = sessionTerminalHref(s);
-  const botName = botDisplayName(s);
-  const singleOpen = url ? popoverButtonHtml(sessionId) : '';
-  const body = url
-    ? `<iframe class="monitor-room-frame" src="${escapeHtml(url)}" allow="clipboard-read; clipboard-write"></iframe>`
-    : `<div class="monitor-room-placeholder">
-        <b>${escapeHtml(t('monitorRoom.terminalUnavailable'))}</b>
-        <span>${escapeHtml(t('monitorRoom.terminalUnavailableHelp'))}</span>
-      </div>`;
-  return `<article class="monitor-room-card" data-id="${escapeHtml(sessionId)}">
-    <header class="monitor-room-card-head">
-      <div class="monitor-room-card-title">
-        ${botAvatarHtml({ name: botName, larkAppId: s.larkAppId, size: 'sm' })}
-        <span class="monitor-room-card-meta">
-          <strong title="${escapeHtml(String(s.title ?? title))}">${escapeHtml(title)}</strong>
-          <small>${escapeHtml(botName)} · ${statusBadgeHtml(s.status)} · ${escapeHtml(t('monitorRoom.updated', { time: relTime(s.lastMessageAt) }))}</small>
-        </span>
-      </div>
-      <div class="monitor-room-card-actions">
-        ${singleOpen}
-        ${removeButton}
-      </div>
-    </header>
-    <div class="monitor-room-frame-wrap">${body}</div>
-  </article>`;
 }
 
 function pageHtml(): string {
@@ -273,11 +322,25 @@ export function renderMonitorRoomPage(root: HTMLElement): () => void {
     panel.focus();
   }
 
+  const cardEntries = new Map<string, MonitorCardEntry>();
+  let emptyPlaceholder: HTMLElement | null = null;
+  let syncRafId = 0;
+  let resizeObserver: ResizeObserver | null = null;
+
+  function scheduleSync(): void {
+    if (syncRafId) return;
+    syncRafId = requestAnimationFrame(() => {
+      syncRafId = 0;
+      syncMonitorRoomFrameScales(root, grid);
+    });
+  }
+
   function render(): void {
     const manualIds = readMonitorRoomSessionIds();
     const autoActive = readMonitorRoomAutoActive();
     const usingAutoActive = manualIds.length === 0 && autoActive;
     const ids = usingAutoActive ? activeSessionIds() : manualIds;
+    const removable = !usingAutoActive;
     const liveCount = ids.filter(id => !!sessionTerminalHref(store.sessions.get(id))).length;
     autoActiveInput.checked = autoActive;
     summary.textContent = usingAutoActive && ids.length
@@ -287,14 +350,44 @@ export function renderMonitorRoomPage(root: HTMLElement): () => void {
       : t('monitorRoom.emptySummary');
     clearBtn.disabled = manualIds.length === 0;
     grid.dataset.count = String(ids.length);
-    grid.innerHTML = ids.length
-      ? ids.map(id => sessionPanelHtml(id, { removable: !usingAutoActive })).join('')
-      : `<div class="monitor-room-empty">
-          <h2>${escapeHtml(t(usingAutoActive ? 'monitorRoom.autoEmptyTitle' : 'monitorRoom.emptyTitle'))}</h2>
-          <p>${escapeHtml(t(usingAutoActive ? 'monitorRoom.autoEmptyHelp' : 'monitorRoom.emptyHelp'))}</p>
-          <a class="btn-link" href="#/sessions">${escapeHtml(t('monitorRoom.openSessions'))}</a>
-        </div>`;
-    syncMonitorRoomFrameScales(root, grid);
+
+    // Remove empty placeholder if we now have sessions
+    if (ids.length > 0 && emptyPlaceholder) {
+      emptyPlaceholder.remove();
+      emptyPlaceholder = null;
+    }
+
+    // Keyed DOM update: keep stable <article> elements for existing sessionIds
+    const seenKeys = new Set(ids);
+    for (const [id, entry] of cardEntries) {
+      if (!seenKeys.has(id)) {
+        entry.article.remove();
+        cardEntries.delete(id);
+      }
+    }
+
+    if (ids.length === 0) {
+      // Show empty placeholder without wiping grid
+      if (!emptyPlaceholder) {
+        emptyPlaceholder = document.createElement('div');
+        emptyPlaceholder.className = 'monitor-room-empty';
+        grid.appendChild(emptyPlaceholder);
+      }
+      emptyPlaceholder.innerHTML = emptyPlaceholderHtml(usingAutoActive);
+    } else {
+      ids.forEach((id, index) => {
+        const entry = ensureCardEntry(cardEntries, grid, id);
+        // Visual order via CSS `order` property — avoids DOM node reordering
+        entry.article.style.order = String(index);
+        // Update header (always refresh meta: status, time, title)
+        entry.head.innerHTML = cardHeadHtml(id, removable);
+        // Update body/iframe only when URL or missing state changed
+        const bodyKey = monitorRoomPanelBodyKey(store.sessions.get(id));
+        syncCardBody(entry, id, bodyKey);
+      });
+    }
+
+    scheduleSync();
   }
 
   grid.addEventListener('click', e => {
@@ -321,13 +414,19 @@ export function renderMonitorRoomPage(root: HTMLElement): () => void {
   });
 
   const unsubscribe = store.on(render);
-  const resize = () => syncMonitorRoomFrameScales(root, grid);
-  window.addEventListener('resize', resize);
+  window.addEventListener('resize', scheduleSync);
+  if (typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(scheduleSync);
+    resizeObserver.observe(root);
+    resizeObserver.observe(grid);
+  }
   render();
   void loadNameMaps().then(render);
   return () => {
     closePopover?.();
-    window.removeEventListener('resize', resize);
+    window.removeEventListener('resize', scheduleSync);
+    if (resizeObserver) resizeObserver.disconnect();
+    if (syncRafId) cancelAnimationFrame(syncRafId);
     unsubscribe();
   };
 }
