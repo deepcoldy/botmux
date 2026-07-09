@@ -78,5 +78,9 @@ describe('dashboard i18n helpers', () => {
       expect(en(key), key).not.toBe(key);
     }
     expect(en('monitoring.hostMemory')).toBe('Memory');
+    expect(zh('monitoring.unattributedSessions')).toBe('未关联进程');
+    expect(zh('monitoring.unattributedHint')).toContain('可靠 PID 关联');
+    expect(en('monitoring.unattributedSessions')).toBe('No Linked Process');
+    expect(en('monitoring.unattributedHint')).toContain('reliable PID link');
   });
 });
