@@ -22,6 +22,7 @@ import type {
   ResourceHistorySnapshot,
   ResourceHistorySeries,
   ResourceSessionCurrent,
+  RuntimeMonitorSummary,
 } from '../core/resource-monitor/types.js';
 
 export interface ResourceMonitorDeps {
@@ -296,7 +297,7 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
     }
   }
 
-  function runtimeSummaryFromSeeds(supported: boolean, sampledAt: number, now: number) {
+  function runtimeSummaryFromSeeds(supported: boolean, sampledAt: number, now: number): RuntimeMonitorSummary {
     return buildRuntimeMonitorSummary({
       supported,
       sampledAt,

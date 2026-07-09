@@ -83,7 +83,8 @@ describe('attributeResources', () => {
       daemons: [
         { larkAppId: 'app-online', botName: 'Online', status: 'online' },
         { larkAppId: 'app-offline', botName: 'Offline', pid: 40, status: 'offline' },
-        { larkAppId: 'app-unknown', botName: 'Unknown', pid: 999 },
+        { larkAppId: 'app-explicit-unknown', botName: 'Explicit Unknown', pid: 40, status: 'unknown' },
+        { larkAppId: 'app-missing-pid', botName: 'Missing PID', pid: 999 },
         { larkAppId: 'app-missing', botName: 'Missing' },
       ],
       cliMarkers: new Map(),
@@ -94,7 +95,8 @@ describe('attributeResources', () => {
     expect(result.bots.map(bot => [bot.larkAppId, bot.daemonStatus])).toEqual([
       ['app-online', 'online'],
       ['app-offline', 'offline'],
-      ['app-unknown', 'unknown'],
+      ['app-explicit-unknown', 'unknown'],
+      ['app-missing-pid', 'offline'],
       ['app-missing', 'offline'],
     ]);
   });

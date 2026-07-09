@@ -196,7 +196,12 @@ describe('ResourceMonitorService', () => {
       listSessions: () => [
         { sessionId: 'live', larkAppId: 'app', botName: 'bot', status: 'working', spawnedAt: 100 },
       ],
-      listDaemons: () => [{ larkAppId: 'app', botName: 'bot', status: 'online' }],
+      listDaemons: () => [
+        { larkAppId: 'app', botName: 'bot', status: 'online' },
+        { larkAppId: 'pid-only', botName: 'pid-only', pid: 999 },
+        { larkAppId: 'no-pid', botName: 'no-pid' },
+        { larkAppId: 'explicit-unknown', botName: 'explicit-unknown', status: 'unknown' },
+      ],
       readCliMarkers: () => new Map(),
       nowMs: () => 123,
     });
@@ -211,7 +216,7 @@ describe('ResourceMonitorService', () => {
       sessions: [],
     });
     expect(svc.current().runtime.sampleHealth.status).toBe('unsupported');
-    expect(svc.current().runtime.daemons).toEqual({ total: 1, online: 1, offline: 0 });
+    expect(svc.current().runtime.daemons).toEqual({ total: 4, online: 1, offline: 1 });
     expect(svc.current().runtime.sessions).toMatchObject({ total: 1, working: 1 });
     expect(svc.history('3h')).toMatchObject({
       ok: true,
