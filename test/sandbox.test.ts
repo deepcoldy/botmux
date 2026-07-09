@@ -10,7 +10,7 @@
 import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync, unlinkSync } from 'node:fs';
 import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
@@ -426,7 +426,7 @@ describe('sandbox landing from upper layer', () => {
     if (!d.ok) return;
     expect(d.empty).toBe(false);
     expect(d.statText).toContain('x.txt');
-    rmSync(linkData, { force: true });
+    unlinkSync(linkData);
   });
 
   it('computeSandboxDiff reports empty when the upper has no changes', () => {
