@@ -107,6 +107,10 @@ export type OpenPlatformAutomationResult =
         | 'api_error';
       message: string;
       sessionFile?: string;
+      /** Number of events successfully subscribed (0 when event update failed before downstream error). */
+      subscribedEventCount?: number;
+      /** Warning from event subscription attempt, if any. */
+      eventWarning?: string;
     };
 
 export interface OpenPlatformAutomationOptions {
@@ -582,7 +586,14 @@ export async function automateOpenPlatformSetup(
       versionId,
     };
   } catch (err: any) {
-    return { ok: false, reason: 'api_error', message: `开放平台自动配置失败: ${safeErrorMessage(err)}`, sessionFile };
+    return {
+      ok: false,
+      reason: 'api_error',
+      message: `开放平台自动配置失败: ${safeErrorMessage(err)}`,
+      sessionFile,
+      subscribedEventCount,
+      eventWarning,
+    };
   }
 }
 

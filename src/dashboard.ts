@@ -594,6 +594,15 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
               };
             }
           }
+          // Also check event subscription status — if event update failed (all 3
+          // endpoints) before the downstream api_error hit, the bot still won't
+          // receive meeting invite events → listener black hole.
+          if (result.eventWarning && (result.subscribedEventCount ?? 0) === 0) {
+            return {
+              ok: false,
+              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: 事件订阅失败(${result.eventWarning})，bot 无法接收会议邀请事件。自动化配置失败(${reason})，请手动订阅 VC 会议事件后重试。`,
+            };
+          }
         }
       } catch (err: any) {
         logger.warn(`[vc-agent] open-platform automation error for ${nextAppId}: ${err?.message ?? err}`);
