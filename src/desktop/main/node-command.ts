@@ -19,6 +19,7 @@ export interface BuildExternalBotmuxCommandInput {
   botmuxHome: string;
   args: string[];
   baseEnv: NodeJS.ProcessEnv;
+  pathEnv?: string;
 }
 
 export function buildBotmuxCommand(input: BuildBotmuxCommandInput): BotmuxCommand {
@@ -41,13 +42,7 @@ export function buildExternalBotmuxCommand(input: BuildExternalBotmuxCommandInpu
     ...input.baseEnv,
     // External CLI bins often use /usr/bin/env node; Finder-launched apps have
     // a small PATH, so put the bin's directory first before invoking it.
-    PATH: prependPathEntries(input.baseEnv.PATH, [
-      dirname(input.binPath),
-      '/opt/homebrew/bin',
-      '/usr/local/bin',
-      '/usr/bin',
-      '/bin',
-    ]),
+    PATH: buildExternalPath(input.baseEnv.PATH, input.binPath, input.pathEnv),
     PM2_HOME: join(input.botmuxHome, 'pm2'),
     SESSION_DATA_DIR: join(input.botmuxHome, 'data'),
   };
@@ -60,9 +55,22 @@ export function buildExternalBotmuxCommand(input: BuildExternalBotmuxCommandInpu
   };
 }
 
-function prependPathEntries(current: string | undefined, entries: string[]): string {
+function buildExternalPath(current: string | undefined, binPath: string, pathEnv: string | undefined): string {
+  return joinPathEntries([
+    dirname(binPath),
+    pathEnv,
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+    current,
+  ]);
+}
+
+function joinPathEntries(entries: Array<string | undefined>): string {
   const seen = new Set<string>();
-  const ordered = [...entries, ...(current ? current.split(delimiter) : [])]
+  const ordered = entries
+    .flatMap(entry => entry ? entry.split(delimiter) : [])
     .map(entry => entry.trim())
     .filter(entry => {
       if (!entry || seen.has(entry)) return false;

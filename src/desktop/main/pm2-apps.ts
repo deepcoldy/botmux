@@ -34,7 +34,7 @@ export function listPm2Apps(
     ...baseEnv,
     // External PM2 bins use /usr/bin/env node; Finder-launched apps need a
     // repaired PATH so discovery does not depend on the user's shell startup.
-    PATH: withRuntimePath(baseEnv.PATH, runtime.binPath),
+    PATH: withRuntimePath(baseEnv.PATH, runtime.binPath, runtime.pathEnv),
     PM2_HOME: paths.pm2Home,
     SESSION_DATA_DIR: paths.dataDir,
   };
@@ -87,9 +87,10 @@ export function listPm2Apps(
   });
 }
 
-function withRuntimePath(current: string | undefined, binPath: string): string {
+function withRuntimePath(current: string | undefined, binPath: string, pathEnv: string | undefined): string {
   const entries = [
     dirname(binPath),
+    ...(pathEnv ? pathEnv.split(delimiter) : []),
     '/opt/homebrew/bin',
     '/usr/local/bin',
     '/usr/bin',

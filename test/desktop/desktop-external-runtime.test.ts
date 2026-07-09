@@ -165,6 +165,33 @@ describe('desktop external CLI runtime wiring', () => {
     });
   });
 
+  it('keeps the login shell PATH for a wrapper discovered through zsh', () => {
+    const shellPath = '/Users/me/.nvm/versions/node/v22.22.2/bin:/usr/bin:/bin';
+    const files = new Map([
+      ['/home/.botmux/bin/botmux', '#!/bin/sh\nexec node "/Users/me/src/botmux/dist/cli.js" "$@"\n'],
+      ['/Users/me/src/botmux/.git', ''],
+      ['/Users/me/src/botmux/package.json', JSON.stringify({ name: 'botmux', version: '0.0.0' })],
+      ['/Users/me/src/botmux/dist/cli.js', ''],
+    ]);
+
+    const candidate = discoverExternalRuntimeCandidate(paths, {
+      platform: 'darwin',
+      execFileSync: file => file === '/bin/zsh'
+        ? `__BOTMUX_PATH__${shellPath}\n/home/.botmux/bin/botmux\n`
+        : '',
+      existsSync: path => files.has(path),
+      readFileSync: path => files.get(path) ?? '',
+      realpathSync: path => path,
+      statSync: path => ({ size: files.get(path)?.length ?? 100_000 }),
+    });
+
+    expect(candidate).toMatchObject({
+      binPath: '/home/.botmux/bin/botmux',
+      root: '/Users/me/src/botmux',
+      pathEnv: shellPath,
+    });
+  });
+
   it('does not invent an app-private runtime when no global CLI can be resolved', () => {
     const candidate = discoverExternalRuntimeCandidate(paths, {
       binPaths: [],

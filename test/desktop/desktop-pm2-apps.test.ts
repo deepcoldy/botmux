@@ -93,4 +93,28 @@ describe('desktop PM2 app listing', () => {
     expect(child.kill).toHaveBeenCalled();
     vi.useRealTimers();
   });
+
+  it('uses the discovered login shell PATH when spawning PM2 for a wrapper runtime', async () => {
+    const child = childProcessStub();
+    const spawn = vi.fn(() => child);
+    const shellPath = '/Users/me/.nvm/versions/node/v22.22.2/bin:/usr/bin:/bin';
+    const promise = listPm2Apps(paths, {
+      ...runtime,
+      binPath: '/home/.botmux/bin/botmux',
+      pathEnv: shellPath,
+    }, {
+      existsSync: () => true,
+      spawn: spawn as any,
+      env: { PATH: '/usr/bin:/bin' },
+      timeoutMs: 10_000,
+    });
+
+    child.stdout.emit('data', '[]');
+    child.emit('close', 0);
+
+    await expect(promise).resolves.toEqual([]);
+    const pathEntries = (spawn.mock.calls[0]![2] as any).env.PATH.split(':');
+    expect(pathEntries.indexOf('/Users/me/.nvm/versions/node/v22.22.2/bin')).toBeGreaterThan(-1);
+    expect(pathEntries.indexOf('/Users/me/.nvm/versions/node/v22.22.2/bin')).toBeLessThan(pathEntries.indexOf('/usr/bin'));
+  });
 });

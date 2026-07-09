@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { callDashboard, type DashboardResult } from '../../cli/dashboard-endpoint.js';
 import type { DesktopPaths, DesktopRuntimeState, RuntimeSource } from '../shared/types.js';
 import { buildExternalBotmuxCommand, type BotmuxCommand } from './node-command.js';
-import { classifyRuntimeSource, countActiveBotmuxApps, type Pm2AppSummary } from './runtime-source.js';
+import { classifyRuntimeSource, countActiveBotmuxDaemonApps, type Pm2AppSummary } from './runtime-source.js';
 
 export interface RunResult {
   code: number;
@@ -20,6 +20,7 @@ export interface ExternalRuntimeCandidate {
   root: string;
   cliPath: string;
   binPath: string;
+  pathEnv?: string;
   version: string;
   runtimeSource?: Exclude<RuntimeSource, 'none'>;
 }
@@ -107,6 +108,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
       botmuxHome: deps.paths.botmuxHome,
       args,
       baseEnv: deps.env,
+      pathEnv: runtime.pathEnv,
     });
   }
 
@@ -229,7 +231,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
       try {
         const pm2Apps = await deps.pm2Apps(active);
         const source = classifyRuntimeSource({ pm2Apps });
-        const onlineDaemonCount = countActiveBotmuxApps(pm2Apps);
+        const onlineDaemonCount = countActiveBotmuxDaemonApps(pm2Apps);
         if (source.running) {
           return {
             status: 'running',

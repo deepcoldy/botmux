@@ -18,6 +18,12 @@ type ExecFile = (
 interface InstallEntry {
   binPath: string;
   root: string;
+  pathEnv?: string;
+}
+
+interface DiscoveredBin {
+  binPath: string;
+  pathEnv?: string;
 }
 
 interface InstallProbeDeps {
@@ -35,12 +41,14 @@ export interface ExternalRuntimeDiscoveryDeps {
   statSync?: StatFile;
 }
 
+const LOGIN_SHELL_PATH_MARKER = '__BOTMUX_PATH__';
+
 export function discoverExternalRuntimeCandidate(
   paths: DesktopPaths,
   deps: ExternalRuntimeDiscoveryDeps = {},
 ): ExternalRuntimeCandidate | null {
   const probeDeps = createInstallProbeDeps(deps);
-  const binPaths = deps.binPaths ?? listBotmuxBins(paths, deps);
+  const binPaths = deps.binPaths?.map(binPath => ({ binPath })) ?? listBotmuxBins(paths, deps);
   const entries = analyzeBotmuxBins(binPaths, probeDeps);
   return selectExternalRuntimeCandidate(entries, paths, deps);
 }
@@ -65,6 +73,7 @@ export function selectExternalRuntimeCandidate(
       root,
       cliPath,
       binPath: entry.binPath,
+      ...(entry.pathEnv ? { pathEnv: entry.pathEnv } : {}),
       version,
       // Desktop only binds the user's global `botmux` command. A pnpm-linked
       // development checkout is still the global CLI contract from App's view.
@@ -102,13 +111,13 @@ function createInstallProbeDeps(deps: ExternalRuntimeDiscoveryDeps): InstallProb
   };
 }
 
-function analyzeBotmuxBins(binPaths: string[], deps: InstallProbeDeps): InstallEntry[] {
+function analyzeBotmuxBins(binPaths: DiscoveredBin[], deps: InstallProbeDeps): InstallEntry[] {
   const seenBin = new Set<string>();
   const seenRoot = new Set<string>();
   const entries: InstallEntry[] = [];
 
   for (const raw of binPaths) {
-    const binPath = raw.trim();
+    const binPath = raw.binPath.trim();
     if (!binPath || seenBin.has(binPath)) continue;
     seenBin.add(binPath);
 
@@ -116,7 +125,7 @@ function analyzeBotmuxBins(binPaths: string[], deps: InstallProbeDeps): InstallE
     const root = resolved?.root ?? binPath;
     if (seenRoot.has(root)) continue;
     seenRoot.add(root);
-    entries.push({ binPath, root });
+    entries.push({ binPath, root, pathEnv: raw.pathEnv });
   }
 
   return entries;
@@ -145,27 +154,32 @@ function resolveBotmuxBin(binPath: string, deps: InstallProbeDeps): { root: stri
   };
 }
 
-function listBotmuxBins(paths: DesktopPaths, deps: ExternalRuntimeDiscoveryDeps): string[] {
+function listBotmuxBins(paths: DesktopPaths, deps: ExternalRuntimeDiscoveryDeps): DiscoveredBin[] {
   const execFile = deps.execFileSync ?? (defaultExecFileSync as unknown as ExecFile);
   const platform = deps.platform ?? process.platform;
-  const bins = [
-    ...runWhich(execFile, platform),
+  const bins: DiscoveredBin[] = [
+    ...runWhich(execFile, platform).map(binPath => ({ binPath })),
     // macOS GUI apps often miss the user's login shell PATH, so ask zsh too.
     ...(platform === 'darwin' ? runLoginShellWhich(execFile) : []),
     // User-owned wrappers are useful fallbacks, but should not override the CLI
     // that the user's shell actually resolves for `botmux`.
-    join(paths.botmuxHome, 'bin', 'botmux'),
-    '/opt/homebrew/bin/botmux',
-    '/usr/local/bin/botmux',
+    { binPath: join(paths.botmuxHome, 'bin', 'botmux') },
+    { binPath: '/opt/homebrew/bin/botmux' },
+    { binPath: '/usr/local/bin/botmux' },
   ];
 
-  const seen = new Set<string>();
-  return bins.filter(bin => {
-    const trimmed = bin.trim();
-    if (!trimmed || seen.has(trimmed)) return false;
-    seen.add(trimmed);
-    return true;
-  });
+  const byBin = new Map<string, DiscoveredBin>();
+  for (const bin of bins) {
+    const trimmed = bin.binPath.trim();
+    if (!trimmed) continue;
+    const existing = byBin.get(trimmed);
+    if (existing) {
+      if (!existing.pathEnv && bin.pathEnv) existing.pathEnv = bin.pathEnv;
+      continue;
+    }
+    byBin.set(trimmed, { ...bin, binPath: trimmed });
+  }
+  return [...byBin.values()];
 }
 
 function runWhich(execFile: ExecFile, platform: NodeJS.Platform): string[] {
@@ -182,14 +196,14 @@ function runWhich(execFile: ExecFile, platform: NodeJS.Platform): string[] {
   }
 }
 
-function runLoginShellWhich(execFile: ExecFile): string[] {
+function runLoginShellWhich(execFile: ExecFile): DiscoveredBin[] {
   try {
-    const out = execFile('/bin/zsh', ['-lc', 'which -a botmux'], {
+    const out = execFile('/bin/zsh', ['-lc', `printf '${LOGIN_SHELL_PATH_MARKER}%s\\n' "$PATH"; which -a botmux`], {
       encoding: 'utf-8',
       timeout: 3_000,
       stdio: ['ignore', 'pipe', 'ignore'],
     });
-    return splitCommandOutput(out);
+    return splitLoginShellWhichOutput(out);
   } catch {
     return [];
   }
@@ -218,6 +232,16 @@ function readPackageVersion(
 
 function splitCommandOutput(out: string): string[] {
   return out.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+}
+
+function splitLoginShellWhichOutput(out: string): DiscoveredBin[] {
+  const lines = splitCommandOutput(out);
+  const markerIndex = lines.findIndex(line => line.startsWith(LOGIN_SHELL_PATH_MARKER));
+  const pathEnv = markerIndex >= 0
+    ? lines[markerIndex]!.slice(LOGIN_SHELL_PATH_MARKER.length).trim() || undefined
+    : undefined;
+  const binLines = markerIndex >= 0 ? lines.slice(markerIndex + 1) : lines;
+  return binLines.map(binPath => ({ binPath, ...(pathEnv ? { pathEnv } : {}) }));
 }
 
 function isSemverVersion(version: string): boolean {

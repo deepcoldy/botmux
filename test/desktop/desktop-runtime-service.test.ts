@@ -100,7 +100,7 @@ describe('runtime service', () => {
     expect(run).not.toHaveBeenCalled();
   });
 
-  it('reports running when the selected global CLI sees botmux PM2 apps', async () => {
+  it('reports running without counting dashboard as an online daemon', async () => {
     const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
     const svc = createRuntimeService({
       paths,
@@ -125,7 +125,7 @@ describe('runtime service', () => {
       runtimeSource: 'global-cli',
       runtimeVersion: '2.9.0',
       runtimePath: '/Users/me/src/botmux/dist/dashboard.js',
-      onlineDaemonCount: 1,
+      onlineDaemonCount: 0,
     });
     expect(run).toHaveBeenCalledWith(expect.objectContaining({
       command: '/usr/local/bin/botmux',
@@ -136,6 +136,31 @@ describe('runtime service', () => {
       }),
     }));
     expect(run.mock.calls[0]![0].env).not.toHaveProperty('ELECTRON_RUN_AS_NODE');
+  });
+
+  it('keeps the discovered login shell PATH when invoking a wrapper runtime', async () => {
+    const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
+    const shellPath = '/Users/me/.nvm/versions/node/v22.22.2/bin:/usr/bin:/bin';
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin:/bin' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      run,
+      externalRuntime: {
+        ...globalCli(),
+        binPath: '/home/.botmux/bin/botmux',
+        pathEnv: shellPath,
+      },
+      pm2Apps: async () => [],
+    });
+
+    await svc.start();
+
+    const pathEntries = run.mock.calls[0]![0].env.PATH!.split(':');
+    expect(pathEntries.indexOf('/Users/me/.nvm/versions/node/v22.22.2/bin')).toBeGreaterThan(-1);
+    expect(pathEntries.indexOf('/Users/me/.nvm/versions/node/v22.22.2/bin')).toBeLessThan(pathEntries.indexOf('/usr/bin'));
   });
 
   it('reports stopped when global CLI is installed and no botmux PM2 app is running', async () => {

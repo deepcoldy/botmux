@@ -31,8 +31,8 @@ export function classifyRuntimeSource(input: RuntimeSourceInput): RuntimeSource 
   };
 }
 
-export function countActiveBotmuxApps(pm2Apps: Pm2AppSummary[]): number {
-  return activeBotmuxApps(pm2Apps).length;
+export function countActiveBotmuxDaemonApps(pm2Apps: Pm2AppSummary[]): number {
+  return pm2Apps.filter(isBotmuxDaemonApp).filter(isActivePm2App).length;
 }
 
 export function parsePm2Apps(stdout: string): Pm2AppSummary[] {
@@ -62,6 +62,10 @@ function activeBotmuxApps(pm2Apps: Pm2AppSummary[]): Pm2AppSummary[] {
 
 function isBotmuxApp(app: Pm2AppSummary): boolean {
   return app.name === 'botmux-dashboard' || app.name === 'botmux' || app.name.startsWith('botmux-');
+}
+
+function isBotmuxDaemonApp(app: Pm2AppSummary): boolean {
+  return app.name !== 'botmux-dashboard' && (app.name === 'botmux' || app.name.startsWith('botmux-'));
 }
 
 function isActivePm2App(app: Pm2AppSummary): boolean {
