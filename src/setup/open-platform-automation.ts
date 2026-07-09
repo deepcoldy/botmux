@@ -16,6 +16,7 @@ import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
+import { VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 
 export const BOTMUX_REDIRECT_URL = 'http://127.0.0.1:9768/callback';
 const FEISHU_ACCOUNTS_ORIGIN = 'https://accounts.feishu.cn';
@@ -70,6 +71,8 @@ export type OpenPlatformAutomationResult =
       scopeCount: number;
       skippedScopeCount: number;
       scopeWarning?: string;
+      subscribedEventCount: number;
+      eventWarning?: string;
       versionId?: string;
     }
   | {
@@ -260,6 +263,15 @@ export function buildSafeSettingPayload(appId: string) {
   return {
     clientId: appId,
     redirectURL: [BOTMUX_REDIRECT_URL],
+  };
+}
+
+/** Build payload for subscribing events via the developer console internal API. */
+export function buildEventSubscriptionPayload(appId: string, events: string[]) {
+  return {
+    clientId: appId,
+    eventNames: events,
+    isDeveloperPanel: true,
   };
 }
 
@@ -486,6 +498,45 @@ export async function automateOpenPlatformSetup(
     }
   }
 
+  // Best-effort auto-subscribe VC meeting bot events. Non-fatal: if the endpoint
+  // doesn't exist or fails, the user can still add them manually in the console.
+  // We try multiple known internal API patterns since the console frontend
+  // endpoint varies by tenant/version.
+  let subscribedEventCount = 0;
+  let eventWarning: string | undefined;
+  const eventEndpoints = [
+    {
+      path: `/developers/v1/event/update/${options.appId}`,
+      body: buildEventSubscriptionPayload(options.appId, [...VC_MEETING_BOT_EVENTS]),
+    },
+    {
+      path: `/developers/v1/event/update/${options.appId}`,
+      body: {
+        clientId: options.appId,
+        eventNameList: [...VC_MEETING_BOT_EVENTS],
+        isDeveloperPanel: true,
+      },
+    },
+    {
+      path: `/developers/v1/event_callback/update/${options.appId}`,
+      body: {
+        clientId: options.appId,
+        eventNames: [...VC_MEETING_BOT_EVENTS],
+        isDeveloperPanel: true,
+      },
+    },
+  ];
+  for (const attempt of eventEndpoints) {
+    try {
+      await postJson(attempt.path, attempt.body);
+      subscribedEventCount = VC_MEETING_BOT_EVENTS.length;
+      eventWarning = undefined;
+      break;
+    } catch (err: any) {
+      eventWarning = safeErrorMessage(err);
+    }
+  }
+
   try {
     await postJson(`/developers/v1/safe_setting/update/${options.appId}`, buildSafeSettingPayload(options.appId));
     const contactRange = await postJson(`/developers/v1/contact_range/${options.appId}`, {});
@@ -505,6 +556,8 @@ export async function automateOpenPlatformSetup(
       scopeCount: importedScopeCount,
       skippedScopeCount,
       scopeWarning,
+      subscribedEventCount,
+      eventWarning,
       versionId,
     };
   } catch (err: any) {

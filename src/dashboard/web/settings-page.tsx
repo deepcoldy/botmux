@@ -20,6 +20,9 @@ interface DashboardSettings {
       vcMeetingAgentEnabled?: boolean;
       hasLarkCliProfile?: boolean;
     }>;
+    larkCliVersion?: string | null;
+    larkCliMeetsRequirement?: boolean;
+    larkCliMinVersion?: string;
   };
   repoPickerMode: 'all' | 'repos';
   maintenance: MaintenanceCfg;
@@ -65,6 +68,9 @@ function parseSettings(s: any): DashboardSettings {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: typeof s?.vcMeetingAgent?.listenerBotAppId === 'string' ? s.vcMeetingAgent.listenerBotAppId : null,
       listenerBotOptions: Array.isArray(s?.vcMeetingAgent?.listenerBotOptions) ? s.vcMeetingAgent.listenerBotOptions : [],
+      larkCliVersion: s?.vcMeetingAgent?.larkCliVersion === undefined ? undefined : (s.vcMeetingAgent.larkCliVersion ?? null),
+      larkCliMeetsRequirement: s?.vcMeetingAgent?.larkCliMeetsRequirement === true,
+      larkCliMinVersion: typeof s?.vcMeetingAgent?.larkCliMinVersion === 'string' ? s.vcMeetingAgent.larkCliMinVersion : undefined,
     },
     repoPickerMode: s?.repoPickerMode === 'repos' ? 'repos' : 'all',
     maintenance: (s?.maintenance && typeof s.maintenance === 'object') ? s.maintenance : {},
@@ -106,6 +112,7 @@ function SettingsPage() {
   const [bound, setBound] = useState(false);
   const [savingKey, setSavingKey] = useState<string | null>(null);
   const [settingsMsg, setSettingsMsg] = useState<StatusMessage>(null);
+  const [feishuLoginQr, setFeishuLoginQr] = useState<string | null>(null);
 
   const [upStatus, setUpStatus] = useState<UpdateStatus | null>(null);
   const [upStatusError, setUpStatusError] = useState<string | null>(null);
@@ -209,7 +216,13 @@ function SettingsPage() {
       });
       const body = await r.json().catch(() => ({}));
       if (!mountedRef.current) return;
-      if (!r.ok || body.ok === false) throw new Error(body?.error ?? `HTTP ${r.status}`);
+      if (!r.ok || body.ok === false) {
+        if (body?.feishuLoginQr && typeof body.feishuLoginQr === 'string') {
+          setFeishuLoginQr(body.feishuLoginQr);
+        }
+        throw new Error(body?.error ?? `HTTP ${r.status}`);
+      }
+      setFeishuLoginQr(null);
       const saved = parseSettings(body.settings);
       setSettings(saved);
       // Sync the shared store to the TRUE effective zone (env → config → host,
@@ -344,6 +357,8 @@ function SettingsPage() {
       canWrite={canWrite}
       bound={bound}
       savingKey={savingKey}
+      feishuLoginQr={feishuLoginQr}
+      setFeishuLoginQr={setFeishuLoginQr}
       onSave={saveSettings}
     />
   ) : loadError ? (
@@ -506,10 +521,12 @@ function SettingsBody(props: {
   canWrite: boolean;
   bound: boolean;
   savingKey: string | null;
+  feishuLoginQr: string | null;
+  setFeishuLoginQr: (v: string | null) => void;
   onSave(key: string, payload: unknown, optimistic: (settings: DashboardSettings) => DashboardSettings): Promise<void>;
 }) {
   const tr = useT();
-  const { settings, canWrite, bound, savingKey } = props;
+  const { settings, canWrite, bound, savingKey, feishuLoginQr, setFeishuLoginQr } = props;
   const dis = !canWrite;
   const autoUpdate = taskUi(settings.maintenance, 'autoUpdate');
   const autoUpdateDisabled = !canWrite || settings.localDevInstall;
@@ -596,6 +613,32 @@ function SettingsBody(props: {
           </select>
           <HelpText text={tr('settings.vcMeetingListenerBotHelp')} />
         </label>
+        {typeof settings.vcMeetingAgent.larkCliVersion === 'string' ? (
+          settings.vcMeetingAgent.larkCliMeetsRequirement ? (
+            <p className="st-larkcli-ok">
+              lark-cli {settings.vcMeetingAgent.larkCliVersion} ✓
+            </p>
+          ) : (
+            <p className="st-larkcli-warn">
+              ⚠️ lark-cli {settings.vcMeetingAgent.larkCliVersion} 版本过低，VC bot 入会需要 ≥ {settings.vcMeetingAgent.larkCliMinVersion}。请运行 <code>npm i -g @larksuite/cli@latest</code> 升级。
+            </p>
+          )
+        ) : (
+          <p className="st-larkcli-warn">
+            ⚠️ 未检测到 lark-cli，请先安装：<code>npm i -g @larksuite/cli</code>
+          </p>
+        )}
+        {feishuLoginQr ? (
+          <div className="st-feishu-qr">
+            <p className="st-feishu-qr-hint">需要飞书开放平台登录才能自动配置 VC 权限，请扫码：</p>
+            <img src={feishuLoginQr} alt="飞书扫码登录" className="st-feishu-qr-img" />
+            <button
+              type="button"
+              className="st-btn st-btn-ghost"
+              onClick={() => setFeishuLoginQr(null)}
+            >关闭</button>
+          </div>
+        ) : null}
       </SectionCard>
 
       <SectionCard

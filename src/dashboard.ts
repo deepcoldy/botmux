@@ -103,11 +103,8 @@ import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncM
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
-import { larkHosts } from './im/lark/lark-hosts.js';
-import {
-  VC_MEETING_FEATURE_SCOPES,
-  VC_MEETING_REALTIME_VOICE_SCOPES,
-} from './setup/verify-permissions.js';
+import { automateOpenPlatformSetup } from './setup/open-platform-automation.js';
+import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -302,6 +299,12 @@ interface ResolvedDashboardSettings {
       vcMeetingAgentEnabled: boolean;
       hasLarkCliProfile: boolean;
     }>;
+    /** Detected lark-cli version, or null if not installed. */
+    larkCliVersion?: string | null;
+    /** True when the installed lark-cli meets the VC bot minimum version. */
+    larkCliMeetsRequirement?: boolean;
+    /** Minimum lark-cli version required for VC bot meeting commands. */
+    larkCliMinVersion?: string;
   };
   repoPickerMode: RepoPickerMode;
   /** Auto-update / auto-restart schedule (off by default). */
@@ -341,56 +344,6 @@ function vcMeetingListenerBotOptions(): ResolvedDashboardSettings['vcMeetingAgen
   }
 }
 
-async function fetchGrantedScopesForBotConfig(bot: BotConfig): Promise<{ ok: true; granted: Set<string> } | { ok: false; error: string }> {
-  const brand = bot.brand === 'lark' ? 'lark' : 'feishu';
-  const openApi = larkHosts(brand).openApi;
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 10_000);
-  try {
-    const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ app_id: bot.larkAppId, app_secret: bot.larkAppSecret }),
-      signal: ac.signal,
-    });
-    const tokenData = await tokenRes.json() as any;
-    if (tokenData?.code !== 0 || typeof tokenData?.tenant_access_token !== 'string') {
-      return { ok: false, error: `vcMeetingAgent_listenerBot_invalid_credentials: code=${tokenData?.code ?? '?'} msg=${tokenData?.msg ?? ''}` };
-    }
-    const infoRes = await fetch(
-      `${openApi}/open-apis/application/v6/applications/${bot.larkAppId}?lang=zh_cn`,
-      { headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` }, signal: ac.signal },
-    );
-    const infoData = await infoRes.json() as any;
-    if (infoData?.code === 99991672) {
-      return { ok: false, error: 'vcMeetingAgent_listenerBot_scope_check_unavailable: missing application:application:self_manage' };
-    }
-    if (infoData?.code !== 0) {
-      return { ok: false, error: `vcMeetingAgent_listenerBot_scope_check_failed: code=${infoData?.code ?? '?'} msg=${infoData?.msg ?? ''}` };
-    }
-    const scopesRaw: any[] =
-      infoData.data?.app?.scopes
-      ?? infoData.data?.application?.scopes
-      ?? infoData.data?.scopes
-      ?? [];
-    if (!Array.isArray(scopesRaw) || scopesRaw.length === 0) {
-      return { ok: false, error: 'vcMeetingAgent_listenerBot_scope_check_failed: empty scopes' };
-    }
-    const granted = new Set(
-      scopesRaw.map(s => typeof s === 'string' ? s : s?.scope).filter(Boolean) as string[],
-    );
-    return { ok: true, granted };
-  } catch (err: any) {
-    return {
-      ok: false,
-      error: ac.signal.aborted
-        ? 'vcMeetingAgent_listenerBot_scope_check_timeout'
-        : `vcMeetingAgent_listenerBot_scope_check_failed: ${err?.message ?? err}`,
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 async function validateVcMeetingListenerBotAppId(appId: string): Promise<{ ok: true } | { ok: false; error: string }> {
   let bots: BotConfig[];
@@ -401,18 +354,6 @@ async function validateVcMeetingListenerBotAppId(appId: string): Promise<{ ok: t
   }
   const bot = bots.find(b => b.larkAppId === appId);
   if (!bot) return { ok: false, error: 'vcMeetingAgent_listenerBot_unknown' };
-  const cfg = bot.vcMeetingAgent ?? {};
-  if (!cfg.larkCliProfile) return { ok: false, error: 'vcMeetingAgent_listenerBot_missing_larkCliProfile' };
-
-  const granted = await fetchGrantedScopesForBotConfig(bot);
-  if (!granted.ok) return granted;
-  const required = cfg.realtimeVoice?.enabled === true
-    ? [...VC_MEETING_FEATURE_SCOPES, ...VC_MEETING_REALTIME_VOICE_SCOPES]
-    : VC_MEETING_FEATURE_SCOPES;
-  const missing = required.filter(scope => !granted.granted.has(scope.name));
-  if (missing.length > 0) {
-    return { ok: false, error: `vcMeetingAgent_listenerBot_missing_scopes: ${missing.map(s => s.name).join(',')}` };
-  }
   return { ok: true };
 }
 
@@ -450,10 +391,80 @@ async function reloadVcMeetingBotConfigOnDaemons(appIds: string[]): Promise<void
   }));
 }
 
-async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, previousListenerBotAppId?: string | null): Promise<{ ok: true } | { ok: false; error: string }> {
+async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, previousListenerBotAppId?: string | null): Promise<{ ok: true } | { ok: false; error: string; feishuLoginQr?: string }> {
   const nextAppId = listenerBotAppId?.trim() || null;
   const prevAppId = previousListenerBotAppId?.trim() || null;
   if (!nextAppId && !prevAppId) return { ok: true };
+
+  // Require lark-cli >= MIN_LARK_CLI_VERSION_FOR_VC_BOT for VC bot meeting commands
+  // (vc +meeting-join/events/message-send --as bot). Earlier versions silently reject
+  // `--as bot` with "this command only supports: user", so the listener bot can
+  // never actually join a meeting.
+  if (nextAppId) {
+    const larkCli = checkLarkCliVersion();
+    if (!larkCli) {
+      return { ok: false, error: 'vcMeetingAgent_listenerBot_larkCli_not_found: 未检测到 lark-cli，请先安装 `npm i -g @larksuite/cli`' };
+    }
+    if (!larkCli.meetsVcBotRequirement) {
+      return {
+        ok: false,
+        error: `vcMeetingAgent_listenerBot_larkCli_too_old: 当前 lark-cli ${larkCli.version} 不支持 VC bot 入会，需要 >= ${MIN_LARK_CLI_VERSION_FOR_VC_BOT}。请运行 \`npm i -g @larksuite/cli@latest\` 升级`,
+      };
+    }
+  }
+
+  // Best-effort auto-import VC meeting scopes via Open Platform automation.
+  // Run BEFORE writing bots.json so that hard failures (missing session, needs QR)
+  // don't leave per-bot vcMeetingAgent in a half-configured state.
+  // For `brand: 'lark'` bots the open-platform automation only supports feishu.cn;
+  // skip it silently and let the user configure manually.
+  if (nextAppId) {
+    const bots = loadBotConfigs();
+    const bot = bots.find(b => b.larkAppId === nextAppId);
+    const brand = bot?.brand === 'lark' ? 'lark' : 'feishu';
+    if (brand === 'lark') {
+      logger.info(`[vc-agent] skipping open-platform automation for lark-brand bot ${nextAppId} (feishu.cn only)`);
+    } else {
+      try {
+        const result = await automateOpenPlatformSetup({
+          appId: nextAppId,
+          brand,
+          maxWaitMs: 5_000,
+          onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
+        });
+        if (result.ok) {
+          logger.info(`[vc-agent] auto-imported ${result.scopeCount} scopes, subscribed ${result.subscribedEventCount} events for listener bot ${nextAppId}`);
+          if (result.scopeWarning) logger.warn(`[vc-agent] scope import warning: ${result.scopeWarning}`);
+          if (result.eventWarning) logger.warn(`[vc-agent] event subscription warning: ${result.eventWarning}`);
+        } else {
+          const reason = result.reason;
+          // Session/login-related failures are hard failures — return QR so user can re-login.
+          // Without a valid Open Platform session, scope/event auto-import is impossible.
+          if (
+            reason === 'missing_session'
+            || reason === 'invalid_session'
+            || reason === 'missing_csrf'
+            || reason === 'qr_expired'
+            || reason === 'timeout'
+            || reason === 'login_failed'
+          ) {
+            const loginSnap = feishuLogin.start();
+            const hint = '请用飞书扫码完成开放平台登录，登录后重新选择监听 bot 即可自动配置权限';
+            return {
+              ok: false,
+              error: `vcMeetingAgent_listenerBot_scope_auto_import_failed: ${reason}: ${hint}`,
+              feishuLoginQr: loginSnap.qrDataUrl,
+            };
+          }
+          // Non-login failures (network, api_error, etc.) are best-effort — don't
+          // block the save. The user can fix scopes manually in the console.
+          logger.warn(`[vc-agent] open-platform automation failed for ${nextAppId}: ${reason}: ${result.message}`);
+        }
+      } catch (err: any) {
+        logger.warn(`[vc-agent] open-platform automation error for ${nextAppId}: ${err?.message ?? err}`);
+      }
+    }
+  }
 
   const changedAppIds = new Set<string>();
   try {
@@ -472,6 +483,22 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
           next.enabled = true;
           next.dashboardManagedListener = true;
           entryChanged = true;
+        }
+        if (!next.larkCliProfile) {
+          next.larkCliProfile = nextAppId;
+          entryChanged = true;
+        }
+        const mc = next.meetingConsumer;
+        if (!mc || typeof mc !== 'object' || Array.isArray(mc)) {
+          next.meetingConsumer = { enabled: true };
+          entryChanged = true;
+        } else {
+          const mcRec = mc as Record<string, unknown>;
+          if (mcRec.enabled !== true) {
+            mcRec.enabled = true;
+            next.meetingConsumer = mcRec;
+            entryChanged = true;
+          }
         }
         if (entryChanged) {
           compactVcMeetingAgentEntry(entry, next);
@@ -502,12 +529,14 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
   }
 
   if (changedAppIds.size > 0) await reloadVcMeetingBotConfigOnDaemons([...changedAppIds]);
+
   return { ok: true };
 }
 
 function resolveDashboardSettings(): ResolvedDashboardSettings {
   const global = readGlobalConfig();
   const dashboard = global.dashboard ?? {};
+  const larkCli = checkLarkCliVersion();
   return {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
@@ -516,6 +545,9 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       enabled: global.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,
       listenerBotOptions: vcMeetingListenerBotOptions(),
+      larkCliVersion: larkCli?.version ?? null,
+      larkCliMeetsRequirement: larkCli?.meetsVcBotRequirement ?? false,
+      larkCliMinVersion: MIN_LARK_CLI_VERSION_FOR_VC_BOT,
     },
     repoPickerMode: global.repoPickerMode ?? 'all',
     maintenance: global.maintenance ?? {},
@@ -1570,7 +1602,11 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
       const result = await applySettingsWrite(parsed, settingsWriteApplierDeps);
-      if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.error });
+      if (!result.ok) {
+        const body: Record<string, unknown> = { ok: false, error: result.error };
+        if ('feishuLoginQr' in result && result.feishuLoginQr) body.feishuLoginQr = result.feishuLoginQr;
+        return jsonRes(res, 400, body);
+      }
       return jsonRes(res, 200, { ok: true, settings: result.settings });
     }
 
