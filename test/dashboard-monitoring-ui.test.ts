@@ -216,6 +216,13 @@ describe('dashboard monitoring session table', () => {
     expect(page).toContain("tr('monitoring.runtimeTitle')");
     expect(page).not.toContain("tr('monitoring.title')</span>");
     expect(page).toContain("resources?.cpuReady === false ? '-'");
+    expect(page).toContain('resource-strip-metric');
+    expect(page).toContain('combinedHealth');
+    expect(page).not.toContain('hottestResource');
+
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+    expect(css).toContain('.resource-strip:hover');
+    expect(css).toContain('.resource-health-dot.danger');
   });
 
   it('limits the session body height with CSS instead of dropping rows', () => {

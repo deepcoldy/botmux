@@ -19,10 +19,16 @@ type ScheduleRow = Record<string, any> & { id: string };
 type ResourceSummary = {
   supported?: boolean;
   cpuReady?: boolean;
-  host?: { cpuPct?: number; memUsedPct?: number };
+  host?: { cpuPct?: number; memUsedPct?: number; memTotalBytes?: number };
   botmux?: { rssBytes?: number };
-  sessions?: Array<{ title?: string; sessionId: string; botName?: string; current?: { cpu1mPct?: number; cpuPct?: number } }>;
+  sessions?: Array<{ sessionId: string }>;
+  runtime?: {
+    sampleHealth?: { status?: string };
+    sessions?: { total?: number; working?: number; starting?: number; waiting?: number };
+  };
 };
+type ResourceHealth = 'ok' | 'warn' | 'danger' | 'unknown';
+type RuntimeSessionSummary = NonNullable<NonNullable<ResourceSummary['runtime']>['sessions']>;
 
 const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
 const IDLE_STATUSES = new Set(['idle', 'dormant']);
@@ -65,6 +71,55 @@ function resourceBytes(value: unknown): string {
   if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GiB`;
   if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(0)} MiB`;
   return `${Math.max(1, Math.round(n / 1024))} KiB`;
+}
+
+function pctHealth(value: unknown, warnAt: number, dangerAt: number, ready = true): ResourceHealth {
+  const n = Number(value);
+  if (!ready || !Number.isFinite(n)) return 'unknown';
+  if (n >= dangerAt) return 'danger';
+  if (n >= warnAt) return 'warn';
+  return 'ok';
+}
+
+function rssHealth(rssBytes: unknown, memTotalBytes: unknown): ResourceHealth {
+  const rss = Number(rssBytes);
+  if (!Number.isFinite(rss) || rss <= 0) return 'unknown';
+  const total = Number(memTotalBytes);
+  if (Number.isFinite(total) && total > 0) return pctHealth((rss / total) * 100, 30, 50);
+  const gib = rss / (1024 ** 3);
+  if (gib >= 32) return 'danger';
+  if (gib >= 16) return 'warn';
+  return 'ok';
+}
+
+function sampleHealth(status: unknown): ResourceHealth {
+  if (status === 'fresh') return 'ok';
+  if (status === 'stale') return 'danger';
+  return 'unknown';
+}
+
+function sessionPressureHealth(sessions?: RuntimeSessionSummary): ResourceHealth {
+  if (!sessions) return 'unknown';
+  const waiting = Number(sessions.waiting ?? 0);
+  const starting = Number(sessions.starting ?? 0);
+  if (waiting >= 5 || starting >= 20) return 'danger';
+  if (waiting > 0 || starting >= 10) return 'warn';
+  return 'ok';
+}
+
+function combinedHealth(values: ResourceHealth[]): ResourceHealth {
+  if (values.includes('danger')) return 'danger';
+  if (values.includes('warn')) return 'warn';
+  if (values.includes('ok')) return 'ok';
+  return 'unknown';
+}
+
+function sessionSummaryText(resources: ResourceSummary | null, tr: (key: string) => string): string {
+  const runtime = resources?.runtime?.sessions;
+  const total = runtime?.total ?? resources?.sessions?.length;
+  if (!Number.isFinite(Number(total))) return '-';
+  const waiting = Number(runtime?.waiting ?? 0);
+  return `${Number(total)} · ${tr('monitoring.waiting')} ${waiting}`;
 }
 
 function collapsedCardCount(gridEl: HTMLElement | null): number {
@@ -259,13 +314,18 @@ function OverviewPage() {
       .slice(0, 5),
     [schedules],
   );
-  const hottestResource = useMemo(() => {
-    const rows = resources?.sessions ?? [];
-    return [...rows].sort((a, b) => Number(b.current?.cpu1mPct ?? b.current?.cpuPct ?? 0) - Number(a.current?.cpu1mPct ?? a.current?.cpuPct ?? 0))[0];
-  }, [resources]);
   const hostCpuText = resources?.supported === false
     ? '-'
     : resources?.cpuReady === false ? '-' : resourcePct(resources?.host?.cpuPct);
+  const memoryText = resources?.supported === false ? '-' : resourcePct(resources?.host?.memUsedPct);
+  const botmuxRssText = resources?.supported === false ? '-' : resourceBytes(resources?.botmux?.rssBytes);
+  const cpuHealth = pctHealth(resources?.host?.cpuPct, 70, 90, resources?.supported !== false && resources?.cpuReady !== false);
+  const memoryHealth = pctHealth(resources?.host?.memUsedPct, 75, 90, resources?.supported !== false);
+  const botmuxHealth = resources?.supported === false ? 'unknown' : rssHealth(resources?.botmux?.rssBytes, resources?.host?.memTotalBytes);
+  const sessionsHealth = sessionPressureHealth(resources?.runtime?.sessions);
+  const overallHealth = resources?.supported === false
+    ? 'unknown'
+    : combinedHealth([sampleHealth(resources?.runtime?.sampleHealth?.status), cpuHealth, memoryHealth, botmuxHealth, sessionsHealth]);
 
   const toggleTeam = () => {
     setTeamExpanded(v => {
@@ -290,11 +350,31 @@ function OverviewPage() {
       </div>
 
       <a className="resource-strip" href="#/monitoring">
-        <span>{tr('monitoring.runtimeTitle')}</span>
-        <b>{tr('monitoring.hostCpu')} {hostCpuText}</b>
-        <b>{tr('monitoring.hostMemory')} {resources?.supported === false ? '-' : resourcePct(resources?.host?.memUsedPct)}</b>
-        <b>{tr('monitoring.botmuxRss')} {resources?.supported === false ? '-' : resourceBytes(resources?.botmux?.rssBytes)}</b>
-        <small>{hottestResource ? `${hottestResource.botName ?? ''} · ${hottestResource.title || hottestResource.sessionId}` : tr('monitoring.noHotSession')}</small>
+        <span className="resource-strip-title">
+          <i className={`resource-health-dot ${overallHealth}`} aria-hidden="true" />
+          <span>{tr('monitoring.runtimeTitle')}</span>
+          <em>{tr(`monitoring.health.${overallHealth}`)}</em>
+        </span>
+        <span className={`resource-strip-metric ${cpuHealth}`}>
+          <i className={`resource-health-dot ${cpuHealth}`} aria-hidden="true" />
+          <span>{tr('monitoring.hostCpu')}</span>
+          <strong>{hostCpuText}</strong>
+        </span>
+        <span className={`resource-strip-metric ${memoryHealth}`}>
+          <i className={`resource-health-dot ${memoryHealth}`} aria-hidden="true" />
+          <span>{tr('monitoring.hostMemory')}</span>
+          <strong>{memoryText}</strong>
+        </span>
+        <span className={`resource-strip-metric ${botmuxHealth}`}>
+          <i className={`resource-health-dot ${botmuxHealth}`} aria-hidden="true" />
+          <span>{tr('monitoring.botmuxRss')}</span>
+          <strong>{botmuxRssText}</strong>
+        </span>
+        <span className={`resource-strip-metric ${sessionsHealth}`}>
+          <i className={`resource-health-dot ${sessionsHealth}`} aria-hidden="true" />
+          <span>{tr('monitoring.sessions')}</span>
+          <strong>{sessionSummaryText(resources, tr)}</strong>
+        </span>
       </a>
 
       <div className="sect-head">

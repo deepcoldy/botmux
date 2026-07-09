@@ -623,32 +623,99 @@ main {
 
 .resource-strip {
   display: grid;
-  grid-template-columns: minmax(120px, 1fr) repeat(3, minmax(110px, auto)) minmax(180px, 1.4fr);
+  grid-template-columns: minmax(132px, 1fr) repeat(4, max-content);
   gap: 12px;
   align-items: center;
   margin-bottom: 18px;
-  padding: 11px 14px;
+  padding: 10px 14px;
   color: inherit;
   text-decoration: none;
   background: var(--surface);
   border: 1px solid var(--border-soft);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
+  transition: transform .16s ease, border-color .16s ease, background-color .16s ease;
 }
 
-.resource-strip span {
+.resource-strip:hover {
+  transform: translateY(-1px);
+  border-color: var(--accent);
+  background: var(--surface-raised);
+}
+
+.resource-strip-title,
+.resource-strip-metric {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+
+.resource-strip-title {
   color: var(--muted);
   font-size: 12px;
   font-weight: 800;
   text-transform: uppercase;
 }
 
-.resource-strip b,
-.resource-strip small {
-  min-width: 0;
+.resource-strip-title em {
+  color: var(--fg);
+  font-style: normal;
+  text-transform: none;
+}
+
+.resource-strip-metric {
+  padding-left: 12px;
+  border-left: 1px solid var(--border-soft);
+  font-variant-numeric: tabular-nums;
+}
+
+.resource-strip-metric span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.resource-strip-metric strong {
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 850;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+}
+
+.resource-health-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.resource-health-dot.ok {
+  background: var(--success);
+}
+
+.resource-health-dot.warn {
+  background: var(--warning);
+}
+
+.resource-health-dot.danger {
+  background: var(--danger);
+}
+
+.resource-strip-metric.ok strong {
+  color: var(--success);
+}
+
+.resource-strip-metric.warn strong {
+  color: var(--warning);
+}
+
+.resource-strip-metric.danger strong {
+  color: var(--danger);
 }
 
 .resource-page {
