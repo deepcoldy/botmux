@@ -551,11 +551,29 @@ const inflightInputs = new InflightInputTracker();
  *  start work before their history/transcript submit marker is observable. */
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
+function readProcStarttime(pid: number): string | undefined {
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const closeParen = raw.lastIndexOf(')');
+    if (closeParen < 0) return undefined;
+    const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
+    return fields[19] || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function writeCliPidMarker(): void {
   if (!cliPidMarker || !sessionId) return;
   try {
     // 原子写：daemon 侧（killStalePids 等）随时读这个 marker JSON。
-    atomicWriteFileSync(cliPidMarker, JSON.stringify({ sessionId, turnId: currentBotmuxTurnId ?? null }));
+    const markerPid = Number(basename(cliPidMarker));
+    const procStart = Number.isInteger(markerPid) && markerPid > 0 ? readProcStarttime(markerPid) : undefined;
+    atomicWriteFileSync(cliPidMarker, JSON.stringify({
+      sessionId,
+      turnId: currentBotmuxTurnId ?? null,
+      ...(procStart ? { procStart } : {}),
+    }));
   } catch (err: any) {
     log(`Failed to update CLI PID marker: ${err?.message ?? err}`);
   }

@@ -29,6 +29,6 @@ describe('resource procfs parsers', () => {
   it('parses process stat with spaces and parentheses in comm', () => {
     const stat = '1234 (node (worker)) S 12 0 0 0 0 0 0 0 0 0 100 50 0 0 20 0 1 0 12345 999 42';
 
-    expect(parseProcessStat(stat)).toEqual({ pid: 1234, ppid: 12, cpuTicks: 150, rssPages: 42 });
+    expect(parseProcessStat(stat)).toEqual({ pid: 1234, ppid: 12, cpuTicks: 150, startTicks: 12345, rssPages: 42 });
   });
 });

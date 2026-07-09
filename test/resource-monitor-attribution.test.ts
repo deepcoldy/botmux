@@ -59,6 +59,26 @@ describe('attributeResources', () => {
     expect(result.sessions.find(s => s.sessionId === 's2')?.current.rssBytes).toBe(200);
   });
 
+  it('rejects stale marker pids when process start ticks do not match', () => {
+    const result = attributeResources({
+      processes: [
+        { pid: 21, ppid: 1, rssBytes: 300, cpuTicks: 3000, startTicks: 222, cmd: 'reused-pid' },
+      ],
+      processCpuPct: new Map([[21, 3]]),
+      sessions: [
+        { sessionId: 's1', larkAppId: 'app-a', botName: 'A', status: 'working' },
+      ],
+      daemons: [{ larkAppId: 'app-a', botName: 'A' }],
+      cliMarkers: new Map([[21, { sessionId: 's1', procStart: '111' }]]),
+      previousSessionStats: new Map(),
+      nowMs: 10_000,
+    });
+
+    expect(result.sessions[0].confidence).toBe('unknown');
+    expect(result.sessions[0].current.rssBytes).toBe(0);
+    expect(result.bots[0].sessions.rssBytes).toBe(0);
+  });
+
   it('does not attribute descendants through a worker pid missing from the sampled process set', () => {
     const result = attributeResources({
       processes: [

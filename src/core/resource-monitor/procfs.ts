@@ -49,7 +49,7 @@ export function parseMeminfo(raw: string): ProcfsSample['mem'] {
   };
 }
 
-export function parseProcessStat(raw: string): { pid: number; ppid: number; cpuTicks: number; rssPages: number } | null {
+export function parseProcessStat(raw: string): { pid: number; ppid: number; cpuTicks: number; startTicks: number; rssPages: number } | null {
   const open = raw.indexOf('(');
   const close = raw.lastIndexOf(')');
   if (open < 0 || close < open) return null;
@@ -59,9 +59,10 @@ export function parseProcessStat(raw: string): { pid: number; ppid: number; cpuT
   const ppid = Number(fieldsAfterComm[1]);
   const utime = Number(fieldsAfterComm[11]) || 0;
   const stime = Number(fieldsAfterComm[12]) || 0;
+  const startTicks = Number(fieldsAfterComm[19]) || 0;
   const rssPages = Number(fieldsAfterComm[21]) || 0;
   if (!Number.isInteger(pid) || !Number.isInteger(ppid)) return null;
-  return { pid, ppid, cpuTicks: utime + stime, rssPages };
+  return { pid, ppid, cpuTicks: utime + stime, startTicks, rssPages };
 }
 
 export function sampleProcfs(nowMs = Date.now()): ProcfsSample {
@@ -92,6 +93,7 @@ export function sampleProcfs(nowMs = Date.now()): ProcfsSample {
           ppid: parsed.ppid,
           rssBytes: parsed.rssPages * PAGE_SIZE_BYTES,
           cpuTicks: parsed.cpuTicks,
+          startTicks: parsed.startTicks,
           cmd,
         });
       } catch {

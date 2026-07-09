@@ -253,8 +253,13 @@ function markerFromRaw(raw: string): CliMarkerInfo | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
   try {
-    const parsed = JSON.parse(trimmed) as { sessionId?: unknown };
-    return typeof parsed.sessionId === 'string' && parsed.sessionId ? { sessionId: parsed.sessionId } : null;
+    const parsed = JSON.parse(trimmed) as { sessionId?: unknown; procStart?: unknown };
+    return typeof parsed.sessionId === 'string' && parsed.sessionId
+      ? {
+        sessionId: parsed.sessionId,
+        ...(typeof parsed.procStart === 'string' && parsed.procStart ? { procStart: parsed.procStart } : {}),
+      }
+      : null;
   } catch {
     return { sessionId: trimmed };
   }
@@ -349,6 +354,18 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
         rssBytes: session.current.rssBytes,
         rssGrowth5mBytes: session.current.rssGrowth5mBytes,
       });
+    }
+  }
+
+  function pruneInactiveHistory(bots: ResourceBotCurrent[], sessions: ResourceSessionCurrent[]): void {
+    const activeBotIds = new Set(bots.map(bot => bot.larkAppId));
+    for (const id of botSeries.keys()) {
+      if (!activeBotIds.has(id)) botSeries.delete(id);
+    }
+
+    const trackedSessionIds = new Set(sessions.filter(session => session.tracked).map(session => session.sessionId));
+    for (const id of sessionSeries.keys()) {
+      if (!trackedSessionIds.has(id)) sessionSeries.delete(id);
     }
   }
 
@@ -455,6 +472,7 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
       },
     };
     appendHistory(currentSnapshot.sampledAt, cpuReady, host, attribution.botmux, attribution.bots, sessions);
+    pruneInactiveHistory(attribution.bots, sessions);
     previousTotalCpuTicks = sample.totalCpuTicks;
     previousIdleCpuTicks = sample.idleCpuTicks;
     previousProcessTicks = snapshotProcessTicks(sample.processes);

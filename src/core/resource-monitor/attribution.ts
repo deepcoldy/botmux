@@ -28,6 +28,7 @@ export interface ResourceDaemonSeed {
 
 export interface CliMarkerInfo {
   sessionId: string;
+  procStart?: string;
 }
 
 export interface PreviousSessionStat {
@@ -139,6 +140,10 @@ export function attributeResources(input: AttributionInput): AttributionResult {
   const children = collectChildren(input.processes);
   const markerPidsBySession = new Map<string, number[]>();
   for (const [pid, marker] of input.cliMarkers) {
+    const proc = byPid.get(pid);
+    if (marker.procStart && (!proc || proc.startTicks === undefined || String(proc.startTicks) !== marker.procStart)) {
+      continue;
+    }
     const arr = markerPidsBySession.get(marker.sessionId) ?? [];
     arr.push(pid);
     markerPidsBySession.set(marker.sessionId, arr);

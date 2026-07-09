@@ -145,6 +145,7 @@ export interface ProcessResourceSample {
   ppid: number;
   rssBytes: number;
   cpuTicks: number;
+  startTicks?: number;
   cmd?: string;
 }
 

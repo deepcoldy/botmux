@@ -228,6 +228,53 @@ describe('ResourceMonitorService', () => {
     expect(svc.history('1h').sessions.map(s => s.sessionId)).toEqual(['hot']);
   });
 
+  it('prunes history for sessions after they leave the tracked set', () => {
+    let tick = 0;
+    let now = 0;
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      topSessionLimit: 1,
+      topGraceMs: 0,
+      sessionHistoryMs: 60_000,
+      aggregateHistoryMs: 60_000,
+      sampleProcfs: () => {
+        const samples = [
+          [
+            { pid: 20, ppid: 1, rssBytes: 100, cpuTicks: 10, cmd: 'worker-a' },
+            { pid: 30, ppid: 1, rssBytes: 10, cpuTicks: 10, cmd: 'worker-b' },
+          ],
+          [
+            { pid: 20, ppid: 1, rssBytes: 10, cpuTicks: 20, cmd: 'worker-a' },
+            { pid: 30, ppid: 1, rssBytes: 200, cpuTicks: 200, cmd: 'worker-b' },
+          ],
+          [
+            { pid: 20, ppid: 1, rssBytes: 300, cpuTicks: 500, cmd: 'worker-a' },
+            { pid: 30, ppid: 1, rssBytes: 10, cpuTicks: 210, cmd: 'worker-b' },
+          ],
+        ] as ProcfsSample['processes'][];
+        return sample(samples[Math.min(tick++, samples.length - 1)], 1000 + tick * 1000);
+      },
+      listSessions: () => [
+        { sessionId: 'a', larkAppId: 'app', botName: 'bot', title: 'A', status: 'working', workerPid: 20 },
+        { sessionId: 'b', larkAppId: 'app', botName: 'bot', title: 'B', status: 'working', workerPid: 30 },
+      ],
+      listDaemons: () => [{ larkAppId: 'app', botName: 'bot' }],
+      readCliMarkers: () => new Map(),
+      nowMs: () => (now += 10_000),
+    });
+
+    svc.sampleOnce();
+    expect(svc.history('1h').sessions.map(s => s.sessionId)).toEqual(['a']);
+
+    svc.sampleOnce();
+    expect(svc.history('1h').sessions.map(s => s.sessionId)).toEqual(['b']);
+
+    svc.sampleOnce();
+    const history = svc.history('1h').sessions;
+    expect(history.map(s => s.sessionId)).toEqual(['a']);
+    expect(history[0].series.rssBytes).toEqual([300]);
+  });
+
   it('returns unsupported snapshots without throwing', () => {
     const svc = createResourceMonitorService({
       intervalMs: 10_000,
