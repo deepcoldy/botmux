@@ -50,7 +50,6 @@ function sessionRef(session: RuntimeSessionInput, durationMs: number): RuntimeSe
 function longestRunning(sessions: RuntimeSessionInput[], nowMs: number): RuntimeSessionRef | undefined {
   let best: RuntimeSessionRef | undefined;
   for (const session of sessions) {
-    if (sessionRuntimeBucket(session) !== 'working') continue;
     const start = Number(session.spawnedAt ?? 0);
     if (!Number.isFinite(start) || start <= 0) continue;
     const ref = sessionRef(session, Math.max(0, nowMs - start));

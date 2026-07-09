@@ -87,6 +87,22 @@ describe('runtime monitor helpers', () => {
     expect(summary.sessions.longestWaiting).toMatchObject({ sessionId: 'wait', durationMs: 30_000 });
   });
 
+  it('uses the longest live session as longest running even when it is idle', () => {
+    const summary = buildRuntimeMonitorSummary({
+      supported: true,
+      sampledAt: 100_000,
+      intervalMs: 10_000,
+      nowMs: 110_000,
+      bots: [],
+      sessions: [
+        session({ sessionId: 'idle-old', status: 'idle', spawnedAt: 10_000 }),
+        session({ sessionId: 'working-new', status: 'working', spawnedAt: 80_000 }),
+      ],
+    });
+
+    expect(summary.sessions.longestRunning).toMatchObject({ sessionId: 'idle-old', durationMs: 100_000 });
+  });
+
   it('marks stale and unsupported samples explicitly', () => {
     expect(buildRuntimeMonitorSummary({
       supported: true,

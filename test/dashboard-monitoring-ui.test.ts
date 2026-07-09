@@ -106,6 +106,30 @@ describe('dashboard monitoring session table', () => {
     expect(root.findAllByProps({ className: 'panel resource-pressure' })).toHaveLength(0);
   });
 
+  it('renders zero sample age as fresh data instead of missing data', () => {
+    const renderer = TestRenderer.create(React.createElement(MonitoringPage, {
+      initialCurrent: {
+        supported: true,
+        host: { cpuPct: 1, memUsedPct: 2, load1: 0.1 },
+        botmux: { cpuPct: 1, rssBytes: 128 * 1024 * 1024 },
+        bots: [],
+        sessions: [],
+        rankings: { tracked: [] },
+        runtime: {
+          sampleHealth: { status: 'fresh', ageMs: 0 },
+          daemons: { total: 0, online: 0, offline: 0 },
+          sessions: { total: 0, working: 0, starting: 0, idle: 0, waiting: 0, unknown: 0, unattributed: 0 },
+        },
+      },
+      initialHistory: { supported: true, bots: [], sessions: [] },
+      poll: false,
+    }));
+
+    const healthText = textContent(renderer.root.findByProps({ className: 'panel runtime-health-panel' }));
+    expect(healthText).toContain('0s');
+    expect(healthText).not.toContain('数据年龄 -');
+  });
+
   it('renders missing runtime counts as unknown without hiding resource fallback counts', () => {
     const renderer = TestRenderer.create(React.createElement(MonitoringPage, {
       initialCurrent: {
