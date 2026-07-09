@@ -2606,6 +2606,7 @@ function shouldDropMismatchedHermesFinalOutput(
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   t: string,
 ): boolean {
+  if (ds.session.cliId !== 'hermes') return false;
   if (!msg.sourceHermesSessionId) {
     if (!ds.hermesBridgeSourceSessionId) return false;
     logger.error(

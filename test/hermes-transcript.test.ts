@@ -42,9 +42,9 @@ describe('hermes transcript reader', () => {
     spawnSyncMock.mockReturnValue({
       status: 0,
       stdout: JSON.stringify([
-        { id: 2, session_id: 'h1', role: 'user', content: 'hello', timestamp: 100 },
+        { id: 2, session_id: ' h1 ', role: 'user', content: 'hello', timestamp: 100 },
         { id: 3, session_id: 'h1', role: 'assistant', content: `${CONTENT_JSON_PREFIX}[{"text":"thinking"}]`, timestamp: 101, finish_reason: 'tool_calls' },
-        { id: 4, session_id: 'h1', role: 'assistant', content: `${CONTENT_JSON_PREFIX}[{"text":"hi"}]`, timestamp: 102, finish_reason: 'stop' },
+        { id: 4, session_id: ' h1 ', role: 'assistant', content: `${CONTENT_JSON_PREFIX}[{"text":"hi"}]`, timestamp: 102, finish_reason: 'stop' },
         { id: 5, session_id: 'h1', role: 'assistant', content: '', timestamp: 103, finish_reason: 'stop' },
       ]),
       stderr: '',

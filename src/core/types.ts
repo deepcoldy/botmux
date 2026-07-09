@@ -150,7 +150,8 @@ export interface DaemonSession {
   lastBridgeEmittedUuid?: string;
   /** Native Hermes messages.session_id bound by this worker after seeing the
    *  botmux-injected `<session_id>...` marker in Hermes state.db. Used as a
-   *  daemon-side second check for Hermes final_output routing. */
+   *  daemon-side consistency check for Hermes final_output after worker-side
+   *  source filtering has already selected the state.db rows. */
   hermesBridgeSourceSessionId?: string;
   /** Flag flipped to true once a `session.exited` dashboard event has been
    *  published for this session. Both the dashboard-driven close path

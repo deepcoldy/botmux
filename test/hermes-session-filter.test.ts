@@ -46,6 +46,22 @@ describe('filterHermesEventsForBotmuxSession', () => {
     ]);
   });
 
+  it('rebinds when the same botmux session marker appears in a new Hermes session', () => {
+    const result = filterHermesEventsForBotmuxSession([
+      assistant('a-old', 'hermes-A', 'old final'),
+      user('u-new', ' hermes-C ', '<session_id>botmux-A</session_id>\nafter clear'),
+      assistant('a-new', 'hermes-C', 'new final'),
+      assistant('a-old-late', 'hermes-A', 'late old final'),
+    ], { botmuxSessionId: 'botmux-A', boundSourceSessionId: 'hermes-A' });
+
+    expect(result.newlyBoundSourceSessionId).toBe('hermes-C');
+    expect(result.boundSourceSessionId).toBe('hermes-C');
+    expect(result.events.map(e => e.uuid)).toEqual(['a-old', 'u-new', 'a-new']);
+    expect(result.drops.map(d => [d.uuid, d.reason, d.expectedSourceSessionId])).toEqual([
+      ['a-old-late', 'foreign_source', 'hermes-C'],
+    ]);
+  });
+
   it('isolates two botmux workers reading the same interleaved Hermes rows', () => {
     const sharedEvents = [
       user('u-A', 'hermes-A', '<session_id>botmux-A</session_id>\nquestion A'),

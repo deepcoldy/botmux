@@ -357,9 +357,9 @@ export type WorkerToDaemon =
        *  another Lark thread. Optional for one release to accept older workers. */
       sessionId?: string;
       /** Native Hermes messages.session_id that actually produced this
-       *  content. Daemon validates it against the worker's bound Hermes
-       *  source session so worker-side sessionId stamping cannot hide a
-       *  foreign state.db row. */
+       *  content. Daemon uses it as a second consistency check after the
+       *  worker-side Hermes state.db filter, catching stale/missing stamps
+       *  without making this field the sole source-binding mechanism. */
       sourceHermesSessionId?: string;
       content: string;
       lastUuid: string;

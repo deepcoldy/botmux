@@ -90,12 +90,13 @@ export function drainHermesStateDb(fromOffset: number, dbPath = HERMES_STATE_DB)
     if (typeof row.id === 'number' && row.id > newOffset) newOffset = row.id;
     const text = decodeContent(row.content).trim();
     if (!text) continue;
+    const sourceSessionId = row.session_id?.trim() || undefined;
     const timestampMs = typeof row.timestamp === 'number' ? row.timestamp * 1000 : Date.now();
     if (row.role === 'user') {
-      events.push({ uuid: `hermes:${row.id}`, timestampMs, kind: 'user', text, sourceSessionId: row.session_id, preserveMarkTimeMs: true });
+      events.push({ uuid: `hermes:${row.id}`, timestampMs, kind: 'user', text, sourceSessionId, preserveMarkTimeMs: true });
     } else if (row.role === 'assistant') {
       if (row.finish_reason !== 'stop') continue;
-      events.push({ uuid: `hermes:${row.id}`, timestampMs, kind: 'assistant_final', text, sourceSessionId: row.session_id });
+      events.push({ uuid: `hermes:${row.id}`, timestampMs, kind: 'assistant_final', text, sourceSessionId });
     }
   }
   return { events, newOffset };

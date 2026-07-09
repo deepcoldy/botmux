@@ -32,9 +32,10 @@ export function filterHermesEventsForBotmuxSession(
 
   for (const ev of events) {
     const sourceSessionId = ev.sourceSessionId?.trim() || undefined;
+    const hasBotmuxMarker = ev.kind === 'user' && !!sourceSessionId && ev.text.includes(marker);
 
     if (!boundSourceSessionId) {
-      if (ev.kind === 'user' && sourceSessionId && ev.text.includes(marker)) {
+      if (hasBotmuxMarker) {
         boundSourceSessionId = sourceSessionId;
         newlyBoundSourceSessionId = sourceSessionId;
       } else {
@@ -46,6 +47,9 @@ export function filterHermesEventsForBotmuxSession(
         });
         continue;
       }
+    } else if (hasBotmuxMarker && sourceSessionId !== boundSourceSessionId) {
+      boundSourceSessionId = sourceSessionId;
+      newlyBoundSourceSessionId = sourceSessionId;
     }
 
     if (!sourceSessionId || sourceSessionId !== boundSourceSessionId) {
