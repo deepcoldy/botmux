@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -35,6 +36,17 @@ describe('hermes transcript reader', () => {
 
     expect(resolveHermesStateDbPath({ HERMES_HOME: ' /tmp/hermes-profile ' })).toBe('/tmp/hermes-profile/state.db');
     expect(resolveHermesStateDbPath({})).toBe(join(homedir(), '.hermes', 'state.db'));
+  });
+
+  it('matches the hermes-botmux-session wrapper profile path when requested', async () => {
+    const { resolveHermesStateDbPath } = await import('../src/services/hermes-transcript.js');
+    const sessionId = 'e453e682-c110-4f27-a68b-17017004a4ca';
+    const hash = createHash('sha256').update(sessionId).digest('hex').slice(0, 16);
+
+    expect(resolveHermesStateDbPath(
+      { HERMES_HOME: '/home/litongde/.hermes', BOTMUX_SESSION_ID: sessionId },
+      { botmuxSessionProfile: true },
+    )).toBe(`/home/litongde/.hermes/profiles/botmux-${hash}/state.db`);
   });
 
   it('returns empty events when state.db does not exist', async () => {

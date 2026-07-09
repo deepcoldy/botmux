@@ -9,6 +9,7 @@
  * not call `botmux send`.
  */
 import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -26,7 +27,21 @@ interface HermesMessageRow {
   finish_reason?: string | null;
 }
 
-export function resolveHermesStateDbPath(env: Record<string, string | undefined> = process.env): string {
+export function resolveHermesStateDbPath(
+  env: Record<string, string | undefined> = process.env,
+  opts: { botmuxSessionProfile?: boolean } = {},
+): string {
+  const explicitStateDb = env.BOTMUX_HERMES_STATE_DB?.trim();
+  if (explicitStateDb) return explicitStateDb;
+  if (opts.botmuxSessionProfile) {
+    const sessionId = env.BOTMUX_SESSION_ID?.trim();
+    if (sessionId) {
+      const sourceHome = env.HERMES_BOTMUX_SOURCE_HOME?.trim() || env.HERMES_HOME?.trim() || join(homedir(), '.hermes');
+      const profilesRoot = env.HERMES_BOTMUX_PROFILES_ROOT?.trim() || join(sourceHome, 'profiles');
+      const sessionHash = createHash('sha256').update(sessionId).digest('hex').slice(0, 16);
+      return join(profilesRoot, `botmux-${sessionHash}`, 'state.db');
+    }
+  }
   const hermesHome = env.HERMES_HOME?.trim();
   return hermesHome ? join(hermesHome, 'state.db') : HERMES_STATE_DB;
 }

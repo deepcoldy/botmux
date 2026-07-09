@@ -4604,8 +4604,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
   const perBotInjectKeys = Object.keys(perBotInjectEnv);
   if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
+  const hermesUsesBotmuxSessionProfile = basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session';
   hermesBridgeDbPath = cfg.cliId === 'hermes'
-    ? resolveHermesStateDbPath({ ...childEnv, ...perBotInjectEnv })
+    ? resolveHermesStateDbPath(
+      { ...childEnv, ...perBotInjectEnv },
+      { botmuxSessionProfile: hermesUsesBotmuxSessionProfile },
+    )
     : undefined;
 
   // ── File sandbox (oncall): wrap the CLI in bwrap so it can only touch a
