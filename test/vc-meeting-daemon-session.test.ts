@@ -2446,6 +2446,51 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(sentMessages.at(-1)?.content).toContain('帮助：`/vc-auth help`');
   });
 
+  it('treats unknown /vc-auth verbs as usage instead of implicit grants', async () => {
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_temp_auth_unknown_verb',
+      meeting: { id: 'm_temp_auth_unknown_verb', meetingNo: '555555566', topic: 'Temporary auth unknown verb' },
+      raw: { event: { meeting: { id: 'm_temp_auth_unknown_verb', meeting_no: '555555566' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+
+    const handled = await __vcMeetingAgentTest.handleTemporaryAuthCommand({
+      larkAppId: APP_ID,
+      chatId: 'oc_listener_1',
+      commandContent: '/vc-auth delete @Alice',
+      mentions: [{ key: '@_user_1', name: 'Alice', openId: 'ou_temp_alice' }],
+      senderOpenId: TARGET_OPEN_ID,
+    });
+
+    expect(handled).toBe(true);
+    expect(sentMessages.at(-1)?.content).toContain('用法：`/vc-auth @成员`');
+    expect(sentMessages.at(-1)?.content).not.toContain('已临时授权 Alice');
+    expect(runtimeStoreRecords.at(-1)?.temporaryInstructionOpenIds).toEqual([]);
+    expect(runtimeStoreRecords.at(-1)?.temporaryInstructionUnionIds ?? []).toEqual([]);
+  });
+
   it('rejects /vc-auth sent to the selected consumer agent with listener-only guidance', async () => {
     registerConsumerAgentBot();
     registerBot({
@@ -2755,6 +2800,101 @@ describe('VC meeting daemon session lifecycle', () => {
     const forced = await __vcMeetingAgentTest.injectConsumer(APP_ID, 'm_joined_555555561', { force: true });
     expect(forced).toMatchObject({ ok: true, injected: 1 });
     expect(triggerSessionCalls[0].req.envelope.rawText).toContain('ou_temp_bob（仅上下文，不可信）：撤销后还要处理吗？');
+  });
+
+  it('matches bare union-id /vc-auth grants to activity events that only carry open_id', async () => {
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          minBatchChars: 1_000,
+          minBatchItems: 10,
+          maxInjectIntervalMs: 60_000,
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_temp_auth_union_map',
+      meeting: { id: 'm_temp_auth_union_map', meetingNo: '555555567', topic: 'Temporary auth union map' },
+      raw: { event: { meeting: { id: 'm_temp_auth_union_map', meeting_no: '555555567' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_temp_auth_union_map_identity',
+      meeting: { id: 'm_joined_555555567', meetingNo: '555555567', topic: 'Temporary auth union map' },
+      raw: {
+        event: {
+          meeting_activity_items: [
+            {
+              activity_event_type: 'participant_joined',
+              meeting: { id: 'm_joined_555555567', meeting_no: '555555567', topic: 'Temporary auth union map' },
+              participant_joined_items: [
+                {
+                  participant: { id: { open_id: 'ou_temp_carol', union_id: 'on_temp_carol' }, user_name: 'Carol' },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handleTemporaryAuthCommand({
+      larkAppId: APP_ID,
+      chatId: 'oc_listener_1',
+      commandContent: '/vc-auth on_temp_carol',
+      senderOpenId: TARGET_OPEN_ID,
+    });
+    expect(runtimeStoreRecords.at(-1)?.temporaryInstructionUnionIds).toEqual(['on_temp_carol']);
+    triggerSessionCalls.length = 0;
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_temp_auth_union_map_question',
+      meeting: { id: 'm_joined_555555567', meetingNo: '555555567', topic: 'Temporary auth union map' },
+      raw: {
+        event: {
+          meeting_activity_items: [
+            {
+              activity_event_type: 'chat_received',
+              meeting: { id: 'm_joined_555555567', meeting_no: '555555567', topic: 'Temporary auth union map' },
+              chat_received_items: [
+                {
+                  message_id: 'msg_temp_auth_union_map_question',
+                  sender: { id: { open_id: 'ou_temp_carol' }, user_name: 'Carol' },
+                  text: '这个现在要同步吗？',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    await new Promise(resolve => setTimeout(resolve, 2));
+
+    expect(triggerSessionCalls).toHaveLength(1);
+    expect(triggerSessionCalls[0].req.envelope.rawText).toContain('Carol（授权用户/指令源）：这个现在要同步吗？');
   });
 
   it('routes selected remote meeting consumer agent injections to the target daemon', async () => {
@@ -3077,7 +3217,7 @@ describe('VC meeting daemon session lifecycle', () => {
       operator: { open_id: TARGET_OPEN_ID },
       action: { value: staleAction },
     }, APP_ID);
-    expect(stale.header.title.content).toBe('输出请求已过期');
+    expect(stale.toast.content).toContain('已失效');
 
     const mergedAction = interactiveCardActionValue(interactiveCardButton(mergedCard, '发送会中弹幕'));
     const approved = await __vcMeetingAgentTest.handleCardAction({
@@ -3143,11 +3283,77 @@ describe('VC meeting daemon session lifecycle', () => {
       operator: { open_id: TARGET_OPEN_ID },
       action: { value: staleAction },
     }, APP_ID);
-    expect(stale.header.title.content).toBe('输出请求已过期');
+    expect(stale.toast.content).toContain('已失效');
 
     patchHolds.resolvers.splice(0).forEach(resolve => resolve());
     const merged = await mergedPromise;
     expect(merged).toMatchObject({ ok: true, merged: true });
+  });
+
+  it('does not revive a pending output request when the meeting closes during a merge patch', async () => {
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_output_text_merge_close',
+      meeting: { id: 'm_output_text_merge_close', meetingNo: '181818182', topic: 'Output text merge close review' },
+      raw: { event: { meeting: { id: 'm_output_text_merge_close', meeting_no: '181818182' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+
+    await __vcMeetingAgentTest.submitOutput({
+      larkAppId: APP_ID,
+      meetingId: 'm_joined_181818182',
+      channel: 'text',
+      content: '关闭前旧内容。',
+    });
+
+    patchHolds.count = 1;
+    const mergedPromise = __vcMeetingAgentTest.submitOutput({
+      larkAppId: APP_ID,
+      meetingId: 'm_joined_181818182',
+      channel: 'text',
+      content: '关闭并发合并内容。',
+    });
+    await waitForPatchHold();
+
+    const endedPromise = __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_ended',
+      eventType: 'vc.bot.meeting_ended_v1',
+      eventId: 'evt_output_text_merge_close_ended',
+      meeting: { id: 'm_joined_181818182', meetingNo: '181818182', topic: 'Output text merge close review' },
+      raw: { event: { meeting: { id: 'm_joined_181818182', meeting_no: '181818182' } } },
+    });
+    await Promise.resolve();
+
+    patchHolds.resolvers.splice(0).forEach(resolve => resolve());
+    const [merged] = await Promise.all([mergedPromise, endedPromise]);
+
+    expect(merged).toMatchObject({ ok: false });
+    expect((merged as { ok: false; error: string }).error).toContain('ended');
+    const patchedTitles = patchedMessages.map(msg => JSON.parse(msg.content).header.title.content);
+    expect(patchedTitles.at(-1)).toBe('输出请求已过期');
+    expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_joined_181818182')).toBe(false);
   });
 
   it('serializes concurrent same-channel output merges so no content is lost', async () => {
@@ -3274,7 +3480,7 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(patchedMessages.slice(afterMergePatchCount).map(msg => JSON.parse(msg.content).header.title.content)).toContain('输出请求已过期');
   });
 
-  it('rejects a merge that would exceed the output length limit without changing the old card', async () => {
+  it('falls back to supersede when a merge would exceed the output length limit', async () => {
     registerConsumerAgentBot();
     registerBot({
       larkAppId: APP_ID,
@@ -3319,9 +3525,11 @@ describe('VC meeting daemon session lifecycle', () => {
       channel: 'text',
       content: '二'.repeat(120),
     });
-    expect(second).toMatchObject({ ok: false });
-    expect((second as { ok: false; error: string }).error).toContain('等当前审批完成后再发');
-    expect(patchedMessages).toHaveLength(patchIndex);
+    expect(second).toMatchObject({ ok: true, status: 'pending' });
+    expect((second as { ok: true; requestId?: string }).requestId).not.toBe((first as { ok: true; requestId?: string }).requestId);
+    expect((second as { ok: true; merged?: boolean }).merged).toBeUndefined();
+    expect(patchedMessages.slice(patchIndex).map(msg => JSON.parse(msg.content).header.title.content)).toContain('输出请求已被新请求取代');
+    expect(JSON.parse(sentMessages.at(-1)!.content).header.title.content).toBe('Agent 请求发送会中弹幕');
   });
 
   it('falls back to supersede when merging the output review card cannot be patched', async () => {
@@ -3375,7 +3583,7 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(JSON.parse(sentMessages.at(-1)!.content).header.title.content).toBe('Agent 请求发送会中弹幕');
   });
 
-  it('merges pending voice output requests and speaks them as one sentence chain', async () => {
+  it('merges pending voice output requests without rewriting question/exclamation punctuation', async () => {
     registerConsumerAgentBot();
     registerBot({
       larkAppId: APP_ID,
@@ -3413,14 +3621,14 @@ describe('VC meeting daemon session lifecycle', () => {
       larkAppId: APP_ID,
       meetingId: 'm_joined_232323233',
       channel: 'voice',
-      content: '第一句。',
+      content: '大家同意吗？',
       fallbackText: '第一条弹幕。',
     });
     const second = await __vcMeetingAgentTest.submitOutput({
       larkAppId: APP_ID,
       meetingId: 'm_joined_232323233',
       channel: 'voice',
-      content: '第二句',
+      content: '那就继续推进！',
       fallbackText: '第二条弹幕。',
     });
     expect(second).toMatchObject({ ok: true, status: 'pending', requestId: (first as { requestId: string }).requestId, merged: true });
@@ -3434,7 +3642,7 @@ describe('VC meeting daemon session lifecycle', () => {
 
     expect(approved.header.title.content).toBe('语音播报处理中');
     await new Promise(resolve => setTimeout(resolve, 2));
-    expect(realtimeVoiceEvents).toContain('speak:第一句。第二句。');
+    expect(realtimeVoiceEvents).toContain('speak:大家同意吗？那就继续推进！');
   });
 
   it('can approve one in-meeting text request and allow automatic in-meeting text for the rest of the meeting', async () => {

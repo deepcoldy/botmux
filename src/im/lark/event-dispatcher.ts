@@ -2319,7 +2319,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
                 : 'meeting_activity';
           const parsed = parseVcMeetingPushEvent({ data, larkAppId, kind, eventType: et as VcMeetingPushEventType });
           logger.info(`[ws-event] ${larkAppId} event_type=${et} eventId=${parsed.eventId ?? '?'} meetingId=${parsed.meeting.id || '?'} items=${Array.isArray((data?.event ?? data)?.meeting_actitivty_items) ? (data?.event ?? data).meeting_actitivty_items.length : '?'}`);
-          if (et === VC_BOT_MEETING_ACTIVITY_EVENT) {
+          if (et === VC_BOT_MEETING_ACTIVITY_EVENT && process.env.DEBUG) {
             logger.info(`[ws-event:raw] ${larkAppId} event_type=${et} eventId=${parsed.eventId ?? '?'} payload=${vcMeetingEventPayloadForLog(data)}`);
           }
         } else if (process.env.DEBUG) {

@@ -489,6 +489,7 @@ export const messages: Record<string, string> = {
   'help.heading_grant': '🔑 Access grants (owner only):',
   'help.grant': '@bot /grant @someone   - Let them talk in this chat (you can @ several at once); /grant (no target) opens the whole chat to talk',
   'help.revoke': '@bot /revoke @someone  - Revoke their talk access (you can @ several at once); /revoke (no target) revokes the whole-chat grant',
+  'help.vc_auth': '/vc-auth @someone     - Temporarily trust an in-meeting instruction source; /vc-auth revoke @someone revokes; /vc-auth list shows current grants',
   'help.heading_config': '⚙️ Edit config remotely (owner only; written + hot-applied, no restart):',
   'help.config_get': '/botconfig get  - Show this bot\'s current operational config',
   'help.config_set': '/botconfig set <field> <value>  - Change model/cli/lang/toggles; /botconfig help for all fields',

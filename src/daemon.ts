@@ -3811,8 +3811,23 @@ function isVcMeetingInstructionSourceActor(
   actor: Pick<VcMeetingActor, 'openId' | 'unionId'> | undefined,
 ): boolean {
   if (!actor) return false;
-  if (actor.openId && vcMeetingInstructionSourceOpenIds(session, cfg).has(actor.openId)) return true;
-  if (actor.unionId && vcMeetingInstructionSourceUnionIds(session, cfg).has(actor.unionId)) return true;
+  const openId = actor.openId?.trim();
+  const unionId = actor.unionId?.trim();
+  const sourceOpenIds = vcMeetingInstructionSourceOpenIds(session, cfg);
+  const sourceUnionIds = vcMeetingInstructionSourceUnionIds(session, cfg);
+  if (openId && sourceOpenIds.has(openId)) return true;
+  if (unionId && sourceUnionIds.has(unionId)) return true;
+  if (openId) {
+    const mappedUnionId = session.actorUnionIdsByOpenId?.[openId]?.trim();
+    if (mappedUnionId && sourceUnionIds.has(mappedUnionId)) return true;
+    for (const sourceUnionId of sourceUnionIds) {
+      if (session.actorOpenIdsByUnionId?.[sourceUnionId]?.trim() === openId) return true;
+    }
+  }
+  if (unionId) {
+    const mappedOpenId = session.actorOpenIdsByUnionId?.[unionId]?.trim();
+    if (mappedOpenId && sourceOpenIds.has(mappedOpenId)) return true;
+  }
   return false;
 }
 
@@ -3839,7 +3854,7 @@ function isVcMeetingConsumerSelectionAllowedOperator(session: VcMeetingDaemonSes
 }
 
 type VcMeetingTemporaryAuthCommand =
-  | { action: 'help' | 'list'; targets: [] }
+  | { action: 'help' | 'list' | 'invalid'; targets: [] }
   | { action: 'grant' | 'revoke'; targets: VcMeetingTemporaryAuthTarget[] };
 
 type VcMeetingTemporaryAuthTarget = {
@@ -3891,7 +3906,8 @@ function parseVcMeetingTemporaryAuthCommand(
   else if (verb === 'list') action = 'list';
   else if (verb === 'revoke' || verb === 'rm' || verb === 'remove') action = 'revoke';
   else if (verb === 'grant' || verb === 'add') action = 'grant';
-  if (action === 'help' || action === 'list') return { action, targets: [] };
+  else if (verb && !/^o[un]_[A-Za-z0-9_-]+$/.test(verb)) action = 'invalid';
+  if (action === 'help' || action === 'list' || action === 'invalid') return { action, targets: [] };
 
   const targets = new Map<string, VcMeetingTemporaryAuthTarget>();
   for (const mention of mentions ?? []) {
@@ -4205,7 +4221,7 @@ async function handleVcMeetingTemporaryAuthCommand(input: {
     getBot(input.larkAppId).botOpenId,
   );
   if (!parsed) return false;
-  if (parsed.action === 'help') {
+  if (parsed.action === 'help' || parsed.action === 'invalid') {
     await sessionReply(input.anchor, vcMeetingTemporaryAuthUsage(), 'text', input.larkAppId);
     return true;
   }
@@ -4271,6 +4287,12 @@ async function expireVcMeetingOutputRequestsOnClose(session: VcMeetingDaemonSess
   session.pendingOutputRequests = {};
 }
 
+async function waitVcMeetingOutputSubmits(session: VcMeetingDaemonSession): Promise<void> {
+  const pending = Object.values(session.outputSubmitPromises ?? {}).filter((promise): promise is Promise<unknown> => !!promise);
+  if (pending.length === 0) return;
+  await Promise.allSettled(pending);
+}
+
 function vcMeetingPendingOutputById(
   session: VcMeetingDaemonSession,
   requestId: string,
@@ -4303,19 +4325,16 @@ function vcMeetingOutputFallbackPartForInput(input: { channel: VcMeetingOutputCh
 }
 
 function normalizeVcMeetingVoicePart(part: string): string {
-  const stripped = part.trim().replace(/[。.!！?？]+$/u, '').trim();
-  return stripped || part.trim();
+  const trimmed = part.trim();
+  if (!trimmed) return '';
+  return /[。.!！?？]$/u.test(trimmed) ? trimmed : `${trimmed}。`;
 }
 
 function joinVcMeetingOutputParts(channel: VcMeetingOutputChannel, parts: string[]): string {
   if (channel === 'voice') {
-    return `${parts.map(normalizeVcMeetingVoicePart).filter(Boolean).join('。')}。`;
+    return parts.map(normalizeVcMeetingVoicePart).filter(Boolean).join('');
   }
   return parts.join('\n');
-}
-
-function vcMeetingOutputOverflowMessage(channel: VcMeetingOutputChannel): string {
-  return `合并后会超过${channel === 'voice' ? '语音' : '会中弹幕'}长度上限，请等当前审批完成后再发。`;
 }
 
 function vcMeetingOutputReviewCardForRequest(
@@ -4559,52 +4578,66 @@ async function submitVcMeetingOutputRequestImpl(input: {
       ? joinVcMeetingOutputParts('text', mergedFallbackParts)
       : undefined;
     if (mergedContent.length > VC_MEETING_OUTPUT_MAX_CONTENT_CHARS || (mergedFallbackText?.length ?? 0) > VC_MEETING_OUTPUT_MAX_CONTENT_CHARS) {
-      return { ok: false, error: vcMeetingOutputOverflowMessage(input.channel) };
-    }
-    const mergedReasonParts = [...vcMeetingOutputReasonParts(prior), ...(input.reason ? [input.reason] : [])];
-    const nextNonce = randomVcMeetingNonce();
-    const mergedReq: VcMeetingPendingOutputRequest = {
-      ...prior,
-      nonce: nextNonce,
-      content: mergedContent,
-      contentParts: mergedContentParts,
-      expiresAt: now + vcMeetingOutputReviewTimeoutMs(input.channel),
-      timer: undefined,
-    };
-    if (mergedReasonParts.length > 0) {
-      mergedReq.reason = mergedReasonParts.join('；');
-      mergedReq.reasonParts = mergedReasonParts;
-    } else {
-      delete mergedReq.reason;
-      delete mergedReq.reasonParts;
-    }
-    if (mergedFallbackText) {
-      mergedReq.fallbackText = mergedFallbackText;
-      mergedReq.fallbackTextParts = mergedFallbackParts;
-    } else {
-      delete mergedReq.fallbackText;
-      delete mergedReq.fallbackTextParts;
-    }
-    prior.nonce = nextNonce;
-    clearVcMeetingOutputRequestTimer(prior);
-    try {
-      await patchVcMeetingOutputReviewCard(session, mergedReq, 'pending');
-      const { applying: _applying, timer: _timer, ...mergedReqState } = mergedReq;
-      Object.assign(prior, mergedReqState);
-      session.pendingOutputRequests[input.channel] = prior;
-      armVcMeetingOutputRequestTimer(key, prior);
-      logger.info(`[vc-agent] output review merged meeting=${input.meetingId} channel=${input.channel} request=${prior.id} parts=${mergedContentParts.length}`);
-      return { ok: true, status: 'pending', requestId: prior.id, merged: true };
-    } catch (err) {
-      logger.warn(`[vc-agent] merge output review card patch failed meeting=${input.meetingId}; falling back to supersede: ${err instanceof Error ? err.message : String(err)}`);
-      await rejectVcMeetingOutputRequest(
-        session,
-        prior,
-        'superseded',
-      ).catch((rejectErr) => {
-        logger.warn(`[vc-agent] supersede output request failed meeting=${input.meetingId}: ${rejectErr instanceof Error ? rejectErr.message : String(rejectErr)}`);
+      logger.info(`[vc-agent] output review merge overflow meeting=${input.meetingId} channel=${input.channel}; falling back to supersede`);
+      await rejectVcMeetingOutputRequest(session, prior, 'superseded').catch((rejectErr) => {
+        logger.warn(`[vc-agent] supersede output request after merge overflow failed meeting=${input.meetingId}: ${rejectErr instanceof Error ? rejectErr.message : String(rejectErr)}`);
       });
+    } else {
+      const mergedReasonParts = [...vcMeetingOutputReasonParts(prior), ...(input.reason ? [input.reason] : [])];
+      const nextNonce = randomVcMeetingNonce();
+      const mergedReq: VcMeetingPendingOutputRequest = {
+        ...prior,
+        nonce: nextNonce,
+        content: mergedContent,
+        contentParts: mergedContentParts,
+        expiresAt: now + vcMeetingOutputReviewTimeoutMs(input.channel),
+        timer: undefined,
+      };
+      if (mergedReasonParts.length > 0) {
+        mergedReq.reason = mergedReasonParts.join('；');
+        mergedReq.reasonParts = mergedReasonParts;
+      } else {
+        delete mergedReq.reason;
+        delete mergedReq.reasonParts;
+      }
+      if (mergedFallbackText) {
+        mergedReq.fallbackText = mergedFallbackText;
+        mergedReq.fallbackTextParts = mergedFallbackParts;
+      } else {
+        delete mergedReq.fallbackText;
+        delete mergedReq.fallbackTextParts;
+      }
+      prior.nonce = nextNonce;
+      clearVcMeetingOutputRequestTimer(prior);
+      try {
+        await patchVcMeetingOutputReviewCard(session, mergedReq, 'pending');
+        if (session.ended || vcMeetingSessions.get(key) !== session) {
+          await patchVcMeetingOutputReviewCard(session, mergedReq, 'expired').catch((patchErr) => {
+            logger.warn(`[vc-agent] output review card close re-patch failed meeting=${input.meetingId}: ${patchErr instanceof Error ? patchErr.message : String(patchErr)}`);
+          });
+          return { ok: false, error: 'meeting session not found or ended' };
+        }
+        const { applying: _applying, timer: _timer, ...mergedReqState } = mergedReq;
+        Object.assign(prior, mergedReqState);
+        session.pendingOutputRequests[input.channel] = prior;
+        armVcMeetingOutputRequestTimer(key, prior);
+        logger.info(`[vc-agent] output review merged meeting=${input.meetingId} channel=${input.channel} request=${prior.id} parts=${mergedContentParts.length}`);
+        return { ok: true, status: 'pending', requestId: prior.id, merged: true };
+      } catch (err) {
+        logger.warn(`[vc-agent] merge output review card patch failed meeting=${input.meetingId}; falling back to supersede: ${err instanceof Error ? err.message : String(err)}`);
+        await rejectVcMeetingOutputRequest(
+          session,
+          prior,
+          'superseded',
+        ).catch((rejectErr) => {
+          logger.warn(`[vc-agent] supersede output request failed meeting=${input.meetingId}: ${rejectErr instanceof Error ? rejectErr.message : String(rejectErr)}`);
+        });
+      }
     }
+  }
+
+  if (session.ended || vcMeetingSessions.get(key) !== session) {
+    return { ok: false, error: 'meeting session not found or ended' };
   }
 
   const cardJson = JSON.stringify(vcMeetingOutputReviewCardForRequest(session, req, 'pending'));
@@ -4618,6 +4651,12 @@ async function submitVcMeetingOutputRequestImpl(input: {
     );
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  if (session.ended || vcMeetingSessions.get(key) !== session) {
+    await patchVcMeetingOutputReviewCard(session, req, 'expired').catch((patchErr) => {
+      logger.warn(`[vc-agent] output review card close patch failed meeting=${input.meetingId}: ${patchErr instanceof Error ? patchErr.message : String(patchErr)}`);
+    });
+    return { ok: false, error: 'meeting session not found or ended' };
   }
   session.pendingOutputRequests[input.channel] = req;
   armVcMeetingOutputRequestTimer(key, req);
@@ -4643,15 +4682,7 @@ async function reviewVcMeetingOutputRequest(input: {
   }
   const found = vcMeetingPendingOutputById(session, input.requestId);
   if (!found || found.req.nonce !== input.nonce) {
-    return vcMeetingOutputReviewCardForRequest(session, {
-      id: input.requestId,
-      channel: 'text',
-      nonce: '',
-      agentAppId: session.selectedAgentAppId ?? '',
-      content: '请求已过期',
-      createdAt: Date.now(),
-      expiresAt: Date.now(),
-    }, 'expired');
+    return { toast: { type: 'warning', content: '这张输出审批卡已失效，请以最新卡片为准' } };
   }
   const { channel, req } = found;
   if (req.applying) return { toast: { type: 'info', content: '输出请求正在处理中' } };
@@ -5492,6 +5523,7 @@ async function closeVcMeetingDaemonSession(key: string, cfg: VcMeetingAgentConfi
   clearVcMeetingRestoreTickTimer(session);
   clearVcMeetingConsumerSelectionTimer(session);
   clearVcMeetingConsumerInjectTimer(session);
+  await waitVcMeetingOutputSubmits(session);
   await expireVcMeetingOutputRequestsOnClose(session);
   if (session.flushPromise) await session.flushPromise;
   if (session.consumerInjectPromise) await session.consumerInjectPromise;
@@ -6448,10 +6480,17 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const invocation = parseSlashCommandInvocation(cmdContent);
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
+    const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, cmd);
+    if (restrictedText) {
+      await sessionReply(anchor, restrictedText, 'text', larkAppId);
+      return;
+    }
     if (cmd === '/vc-auth') {
-      // /vc-auth has its own meeting-scoped approver gate, so it runs before
-      // the generic slash-command grant restriction.
-      if (await handleVcMeetingTemporaryAuthCommand({
+      if (!canOperate(larkAppId, chatId, senderOpenId, teamTrustUnionId)) {
+        await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        return;
+      }
+      await handleVcMeetingTemporaryAuthCommand({
         larkAppId,
         chatId,
         anchor,
@@ -6459,13 +6498,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         mentions: parsed.mentions,
         senderOpenId,
         senderUnionId,
-      })) {
-        return;
-      }
-    }
-    const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, cmd);
-    if (restrictedText) {
-      await sessionReply(anchor, restrictedText, 'text', larkAppId);
+      });
       return;
     }
     // /card needs no fresh session: off/on only toggle per-chat config, and a
@@ -7151,10 +7184,17 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     const { cmd, content: commandContent } = invocation;
     const existingDs = activeSessions.get(sessionKey(anchor, larkAppId));
     const effectiveThreadChatId = existingDs?.chatId ?? threadChatId;
+    const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, threadSenderOpenId, cmd);
+    if (restrictedText) {
+      await sessionReply(anchor, restrictedText, 'text', larkAppId);
+      return;
+    }
     if (cmd === '/vc-auth') {
-      // /vc-auth has its own meeting-scoped approver gate, so it runs before
-      // the generic slash-command grant restriction.
-      if (await handleVcMeetingTemporaryAuthCommand({
+      if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId)) {
+        await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        return;
+      }
+      await handleVcMeetingTemporaryAuthCommand({
         larkAppId,
         chatId: effectiveThreadChatId,
         anchor,
@@ -7162,13 +7202,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         mentions: parsed.mentions,
         senderOpenId: threadSenderOpenId,
         senderUnionId: threadSenderUnionId,
-      })) {
-        return;
-      }
-    }
-    const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, threadSenderOpenId, cmd);
-    if (restrictedText) {
-      await sessionReply(anchor, restrictedText, 'text', larkAppId);
+      });
       return;
     }
     if (resolvePassthroughCommands(larkAppId).has(cmd)) {
