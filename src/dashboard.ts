@@ -546,6 +546,15 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
               };
             }
           }
+          // Event subscription is also critical: if all 3 event update endpoints
+          // failed (eventWarning set, subscribedEventCount === 0), the bot won't
+          // receive vc.bot.meeting_*_v1 push events → meeting invite black hole.
+          if (result.eventWarning && result.subscribedEventCount === 0) {
+            return {
+              ok: false,
+              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: 事件订阅全部失败(${result.eventWarning})，bot 无法接收会议邀请事件。请到开放平台手动订阅 VC 会议事件后重试。`,
+            };
+          }
         } else {
           const reason = result.reason;
           // Session/login-related failures are hard failures — return QR so user can re-login.

@@ -18,8 +18,22 @@ import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
 import { VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 
-/** Baseline events that every botmux bot needs — must NOT be overwritten by VC-only subscriptions. */
-export const BOT_BASELINE_EVENTS = ['im.message.receive_v1', 'card.action.trigger'] as const;
+/**
+ * All non-VC events that botmux dispatcher consumes. Must be included in every
+ * event subscription update — the internal `/event/update` endpoint is
+ * replacement-style, so omitting any of these would silently disable the
+ * corresponding botmux capability (receiving messages, card actions, being
+ * added to groups, doc comments, message reactions).
+ */
+export const BOT_BASELINE_EVENTS = [
+  'im.message.receive_v1',
+  'card.action.trigger',
+  'im.chat.member.bot.added_v1',
+  'drive.file.comment_add_v1',
+  'drive.notice.comment_add_v1',
+  'im.message.reaction.created_v1',
+  'im.message.reaction.deleted_v1',
+] as const;
 
 export const BOTMUX_REDIRECT_URL = 'http://127.0.0.1:9768/callback';
 const FEISHU_ACCOUNTS_ORIGIN = 'https://accounts.feishu.cn';
