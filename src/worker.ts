@@ -399,6 +399,10 @@ let readyFlushSettleTimer: ReturnType<typeof setTimeout> | null = null;
  *  holds (just like the gate) so a message arriving mid-settle can't type-ahead
  *  past the settle and re-trigger paste-burst. */
 let isSettlingFirstFlush = false;
+/** IdleDetector can fire during the post-ready settle. Do not mark the prompt
+ *  ready yet, or flushPending will be blocked by isSettlingFirstFlush and a
+ *  later markPromptReady call would return early with the first prompt stranded. */
+let promptReadyDetectedDuringSettle = false;
 
 /** Wait until the PTY has been quiet for READY_FLUSH_SETTLE_MS (Ink render
  *  drained), capped at READY_FLUSH_SETTLE_CAP_MS, then flush the held prompt.
@@ -411,8 +415,10 @@ function settleThenFlush(startedAtMs: number, promptReadyAfterSettle: boolean): 
   const quietForMs = now - lastPtyOutputAtMs;
   if (quietForMs >= READY_FLUSH_SETTLE_MS || now - startedAtMs >= READY_FLUSH_SETTLE_CAP_MS) {
     isSettlingFirstFlush = false;
-    log(`Ready-gate settle done (quiet ${quietForMs}ms); ${promptReadyAfterSettle ? 'marking prompt ready' : 'delivering held first prompt'}`);
-    if (promptReadyAfterSettle) {
+    const shouldMarkPromptReady = promptReadyAfterSettle || promptReadyDetectedDuringSettle;
+    promptReadyDetectedDuringSettle = false;
+    log(`Ready-gate settle done (quiet ${quietForMs}ms); ${shouldMarkPromptReady ? 'marking prompt ready' : 'delivering held first prompt'}`);
+    if (shouldMarkPromptReady) {
       markPromptReady();
       return;
     }
@@ -3188,6 +3194,11 @@ function markPromptReady(): void {
     log('Idle detected but holding for SessionStart ready signal (startup selector guard)');
     return;
   }
+  if (isSettlingFirstFlush) {
+    promptReadyDetectedDuringSettle = true;
+    log('Idle detected during ready-gate settle; deferring prompt-ready until settle completes');
+    return;
+  }
   isPromptReady = true;
   // CLI 实际启动成功（回到 prompt）：复位连续重启计数。
   // 任何能到这一步的 spawn 都算"成功"——后续即便再崩溃（不是 resume 目标不存在
@@ -4999,6 +5010,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
   if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
   isSettlingFirstFlush = false;
+  promptReadyDetectedDuringSettle = false;
   // Reset quiescence baseline so the settle measures silence from THIS spawn.
   lastPtyOutputAtMs = Date.now();
   if (shouldArmReadyGate({
@@ -5115,6 +5127,7 @@ function killCli(): void {
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
   if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
   isSettlingFirstFlush = false;
+  promptReadyDetectedDuringSettle = false;
   stopScreenAnalyzer();
   stopScreenUpdates();
   backend?.kill();

@@ -92,6 +92,31 @@ describe('worker pipe initial screen ordering', () => {
     expect(timeoutReleaseIdx).toBeGreaterThan(-1);
   });
 
+  it('defers idle detected during ready-gate settle so the first prompt still flushes', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const markStart = source.indexOf('function markPromptReady');
+    const markEnd = source.indexOf('function persistCliSessionId', markStart);
+    const mark = source.slice(markStart, markEnd);
+    const settleStart = source.indexOf('function settleThenFlush');
+    const settleEnd = source.indexOf('/** Release the ready-gate', settleStart);
+    const settle = source.slice(settleStart, settleEnd);
+
+    const settleGuardIdx = mark.indexOf('if (isSettlingFirstFlush)');
+    const deferredFlagIdx = mark.indexOf('promptReadyDetectedDuringSettle = true;', settleGuardIdx);
+    const readySetIdx = mark.indexOf('isPromptReady = true;');
+    expect(settleGuardIdx).toBeGreaterThan(-1);
+    expect(deferredFlagIdx).toBeGreaterThan(settleGuardIdx);
+    expect(deferredFlagIdx).toBeLessThan(readySetIdx);
+
+    expect(settle).toContain('const shouldMarkPromptReady = promptReadyAfterSettle || promptReadyDetectedDuringSettle;');
+    expect(settle.indexOf('promptReadyDetectedDuringSettle = false;')).toBeGreaterThan(
+      settle.indexOf('const shouldMarkPromptReady = promptReadyAfterSettle || promptReadyDetectedDuringSettle;'),
+    );
+    expect(settle.indexOf('markPromptReady();')).toBeGreaterThan(
+      settle.indexOf('const shouldMarkPromptReady = promptReadyAfterSettle || promptReadyDetectedDuringSettle;'),
+    );
+  });
+
   it('honors a true ready signal that arrives AFTER the timeout fallback (slow cold start)', () => {
     // ReadyGate.receive() is one-shot: once the 45s fallback fires, a later
     // releaseReadyGate from the real signal is skipped entirely. A CLI whose
