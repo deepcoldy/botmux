@@ -664,6 +664,7 @@ main {
 
 .resource-page > .resource-pressure {
   z-index: 30;
+  overflow: visible;
 }
 
 .resource-metrics {

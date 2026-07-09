@@ -161,6 +161,7 @@ describe('dashboard monitoring session table', () => {
     expect(css).toMatch(/\.resource-page\s*\{[^}]*isolation:\s*isolate/s);
     expect(css).toMatch(/\.resource-metrics\s*\{[^}]*position:\s*relative[^}]*z-index:\s*30/s);
     expect(css).toMatch(/\.resource-page > \.panel\s*\{[^}]*position:\s*relative[^}]*z-index:\s*10/s);
+    expect(css).toMatch(/\.resource-page > \.resource-pressure\s*\{[^}]*z-index:\s*30[^}]*overflow:\s*visible/s);
     expect(css).toMatch(/\.metric-card \.resource-help-popover\s*\{[^}]*z-index:\s*40/s);
     expect(css).toMatch(/\.resource-help-tip:hover \.resource-help-popover,\s*\.resource-help-tip:focus-within \.resource-help-popover\s*\{[^}]*pointer-events:\s*auto/s);
   });
