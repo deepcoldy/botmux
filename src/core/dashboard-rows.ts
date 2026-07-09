@@ -66,6 +66,10 @@ export interface SessionRow {
   agentAttention?: { kind: string; reason: string; at: number };
   /** Native Agent CLI token usage for this session. Null means unavailable. */
   tokenUsage?: SessionTokenUsage | null;
+  /** Worker process PID, active rows only. Used by dashboard resource attribution. */
+  workerPid?: number;
+  /** Adopted external CLI PID, active rows only when the source backend exposed it. */
+  adoptCliPid?: number;
 }
 
 export function feishuChatLink(chatId: string, brand: Brand = 'feishu'): string {
@@ -138,6 +142,8 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
       ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
       : undefined,
     tokenUsage: sessionTokenUsage(ds.session, ds.workingDir),
+    workerPid: ds.worker?.pid ?? ds.session.pid,
+    adoptCliPid: ds.adoptedFrom?.originalCliPid,
   };
 }
 

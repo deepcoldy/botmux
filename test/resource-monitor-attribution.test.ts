@@ -1,0 +1,77 @@
+import { describe, expect, it } from 'vitest';
+import { attributeResources } from '../src/core/resource-monitor/attribution.js';
+import type { ProcessResourceSample } from '../src/core/resource-monitor/types.js';
+
+const processes: ProcessResourceSample[] = [
+  { pid: 10, ppid: 1, rssBytes: 100, cpuTicks: 1000, cmd: 'daemon-a' },
+  { pid: 20, ppid: 10, rssBytes: 200, cpuTicks: 2000, cmd: 'worker-a' },
+  { pid: 21, ppid: 20, rssBytes: 300, cpuTicks: 3000, cmd: 'cli-a' },
+  { pid: 30, ppid: 10, rssBytes: 400, cpuTicks: 4000, cmd: 'unrelated' },
+  { pid: 40, ppid: 1, rssBytes: 500, cpuTicks: 5000, cmd: 'daemon-b' },
+  { pid: 50, ppid: 1, rssBytes: 600, cpuTicks: 6000, cmd: 'adopted-cli' },
+];
+
+describe('attributeResources', () => {
+  it('attributes all current sessions and keeps bot aggregates independent of Top selection', () => {
+    const result = attributeResources({
+      processes,
+      processCpuPct: new Map([[10, 1], [20, 2], [21, 3], [30, 4], [40, 5], [50, 6]]),
+      sessions: [
+        { sessionId: 's1', larkAppId: 'app-a', botName: 'A', title: 'one', status: 'working', workerPid: 20 },
+        { sessionId: 's2', larkAppId: 'app-a', botName: 'A', title: 'two', status: 'idle' },
+        { sessionId: 's3', larkAppId: 'app-b', botName: 'B', title: 'adopted', status: 'working', adoptCliPid: 50 },
+      ],
+      daemons: [
+        { larkAppId: 'app-a', botName: 'A', pid: 10 },
+        { larkAppId: 'app-b', botName: 'B', pid: 40 },
+      ],
+      cliMarkers: new Map([[21, { sessionId: 's1' }]]),
+      previousSessionStats: new Map(),
+      nowMs: 10_000,
+    });
+
+    expect(result.sessions.map(s => s.sessionId)).toEqual(['s1', 's2', 's3']);
+    expect(result.sessions.find(s => s.sessionId === 's1')?.current.rssBytes).toBe(500);
+    expect(result.sessions.find(s => s.sessionId === 's1')?.current.cpuPct).toBe(5);
+    expect(result.sessions.find(s => s.sessionId === 's1')?.confidence).toBe('marker');
+    expect(result.sessions.find(s => s.sessionId === 's2')?.confidence).toBe('unknown');
+    expect(result.sessions.find(s => s.sessionId === 's3')?.confidence).toBe('adopted');
+    expect(result.bots.find(b => b.larkAppId === 'app-a')?.sessions.rssBytes).toBe(500);
+    expect(result.bots.find(b => b.larkAppId === 'app-a')?.daemon.rssBytes).toBe(100);
+    expect(result.bots.find(b => b.larkAppId === 'app-b')?.total.rssBytes).toBe(1100);
+  });
+
+  it('does not force ambiguous marker processes into a session', () => {
+    const result = attributeResources({
+      processes,
+      processCpuPct: new Map([[21, 3]]),
+      sessions: [
+        { sessionId: 's1', larkAppId: 'app-a', botName: 'A', status: 'working' },
+        { sessionId: 's2', larkAppId: 'app-a', botName: 'A', status: 'working' },
+      ],
+      daemons: [{ larkAppId: 'app-a', botName: 'A' }],
+      cliMarkers: new Map([[21, { sessionId: 's1' }], [20, { sessionId: 's2' }]]),
+      previousSessionStats: new Map(),
+      nowMs: 10_000,
+    });
+
+    expect(result.sessions.find(s => s.sessionId === 's1')?.current.rssBytes).toBe(0);
+    expect(result.sessions.find(s => s.sessionId === 's2')?.current.rssBytes).toBe(200);
+  });
+
+  it('includes the dashboard process in botmux totals even without bot daemons', () => {
+    const result = attributeResources({
+      processes,
+      processCpuPct: new Map([[30, 4]]),
+      sessions: [],
+      daemons: [],
+      botmuxPids: [30],
+      cliMarkers: new Map(),
+      previousSessionStats: new Map(),
+      nowMs: 10_000,
+    });
+
+    expect(result.botmux).toEqual({ rssBytes: 400, cpuPct: 4 });
+    expect(result.bots).toEqual([]);
+  });
+});

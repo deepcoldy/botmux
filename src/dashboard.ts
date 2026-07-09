@@ -107,6 +107,7 @@ import { automateOpenPlatformSetup } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 import { larkHosts } from './im/lark/lark-hosts.js';
+import { createResourceMonitorService, handleResourceMonitorApi } from './dashboard/resource-monitor-service.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -907,6 +908,38 @@ registry.on(syncSubscriptions);
 // daemon doesn't block the others.
 await Promise.all(registry.list().map(attachDaemon));
 
+const resourceMonitor = createResourceMonitorService({
+  intervalMs: 10_000,
+  topSessionLimit: 30,
+  sessionHistoryMs: 3 * 60 * 60_000,
+  aggregateHistoryMs: 24 * 60 * 60_000,
+  listSessions: () => {
+    const names = new Map(registry.list().map(d => [d.larkAppId, d.botName] as const));
+    return aggregator.getSessions()
+      .filter(s => s.status !== 'closed')
+      .map(s => {
+        const larkAppId = String(s.larkAppId ?? '');
+        const workerPid = typeof s.workerPid === 'number' ? s.workerPid : undefined;
+        const adoptCliPid = typeof s.adoptCliPid === 'number' ? s.adoptCliPid : undefined;
+        return {
+          sessionId: String(s.sessionId),
+          larkAppId,
+          botName: String(names.get(larkAppId) ?? s.botName ?? larkAppId),
+          title: typeof s.title === 'string' ? s.title : undefined,
+          status: String(s.status ?? 'unknown'),
+          ...(workerPid !== undefined ? { workerPid } : {}),
+          ...(adoptCliPid !== undefined ? { adoptCliPid } : {}),
+        };
+      });
+  },
+  listDaemons: () => registry.list().map(d => ({
+    larkAppId: d.larkAppId,
+    botName: d.botName,
+    pid: d.pid,
+  })),
+});
+resourceMonitor.start();
+
 // ─── Static frontend ─────────────────────────────────────────────────────────
 
 // Path to the bundled frontend (sibling of dist/dashboard.js)
@@ -1626,6 +1659,10 @@ const server = createServer(async (req, res) => {
     }
 
     // ─── Public API (cookie/token already validated above) ──────────────────
+
+    if (await handleResourceMonitorApi(req, res, url, resourceMonitor)) {
+      return;
+    }
 
     if (req.method === 'GET' && url.pathname === '/api/sessions') {
       // Sessions spawned before a bot config carried a display name store the
@@ -3406,6 +3443,7 @@ function shutdown(): void {
   for (const off of subs.values()) off();
   subs.clear();
   registry.stop();
+  resourceMonitor.stop();
   platformTunnel?.stop();
   server.close(() => process.exit(0));
   // Hard-exit fallback after 5s

@@ -1,0 +1,132 @@
+import { describe, expect, it } from 'vitest';
+import { createResourceMonitorService } from '../src/dashboard/resource-monitor-service.js';
+import type { ProcfsSample } from '../src/core/resource-monitor/types.js';
+
+function sample(processes: ProcfsSample['processes'], totalCpuTicks = 1000, idleCpuTicks = 0): ProcfsSample {
+  return {
+    supported: true,
+    sampledAt: Date.now(),
+    totalCpuTicks,
+    idleCpuTicks,
+    loadavg: { load1: 1, load5: 1, load15: 1 },
+    mem: { memTotalBytes: 1000, memAvailableBytes: 500, swapTotalBytes: 100, swapFreeBytes: 100 },
+    processes,
+  };
+}
+
+describe('ResourceMonitorService', () => {
+  it('keeps all current sessions but only tracked sessions in history', () => {
+    let tick = 0;
+    let now = 0;
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      topSessionLimit: 1,
+      sessionHistoryMs: 60_000,
+      aggregateHistoryMs: 60_000,
+      sampleProcfs: () => tick++ === 0
+        ? sample([
+          { pid: 10, ppid: 1, rssBytes: 10, cpuTicks: 10, cmd: 'daemon' },
+          { pid: 20, ppid: 10, rssBytes: 10, cpuTicks: 10, cmd: 'worker-hot' },
+          { pid: 30, ppid: 10, rssBytes: 10, cpuTicks: 10, cmd: 'worker-cold' },
+        ], 100)
+        : sample([
+          { pid: 10, ppid: 1, rssBytes: 10, cpuTicks: 20, cmd: 'daemon' },
+          { pid: 20, ppid: 10, rssBytes: 100, cpuTicks: 100, cmd: 'worker-hot' },
+          { pid: 30, ppid: 10, rssBytes: 10, cpuTicks: 20, cmd: 'worker-cold' },
+        ], 200),
+      listSessions: () => [
+        { sessionId: 'hot', larkAppId: 'app', botName: 'bot', title: 'hot', status: 'working', workerPid: 20 },
+        { sessionId: 'cold', larkAppId: 'app', botName: 'bot', title: 'cold', status: 'idle', workerPid: 30 },
+      ],
+      listDaemons: () => [{ larkAppId: 'app', botName: 'bot', pid: 10 }],
+      readCliMarkers: () => new Map(),
+      nowMs: () => (now += 10_000),
+    });
+
+    svc.sampleOnce();
+    svc.sampleOnce();
+
+    expect(svc.current().sessions.map(s => s.sessionId)).toEqual(['hot', 'cold']);
+    expect(svc.current().rankings.tracked).toEqual(['hot']);
+    expect(svc.current().bots[0].sessions.count).toBe(2);
+    expect(svc.current().bots[0].sessions.rssBytes).toBe(110);
+    expect(svc.history('1h').sessions.map(s => s.sessionId)).toEqual(['hot']);
+  });
+
+  it('returns unsupported snapshots without throwing', () => {
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      sampleProcfs: () => ({
+        supported: false,
+        sampledAt: 123,
+        reason: 'procfs_unavailable',
+        totalCpuTicks: 0,
+        idleCpuTicks: 0,
+        loadavg: { load1: 0, load5: 0, load15: 0 },
+        mem: { memTotalBytes: 0, memAvailableBytes: 0, swapTotalBytes: 0, swapFreeBytes: 0 },
+        processes: [],
+      }),
+      listSessions: () => [],
+      listDaemons: () => [],
+      readCliMarkers: () => new Map(),
+      nowMs: () => 123,
+    });
+
+    svc.sampleOnce();
+
+    expect(svc.current()).toMatchObject({
+      ok: true,
+      supported: false,
+      reason: 'procfs_unavailable',
+      bots: [],
+      sessions: [],
+    });
+    expect(svc.history('3h')).toMatchObject({
+      ok: true,
+      supported: false,
+      bots: [],
+      sessions: [],
+    });
+  });
+
+  it('computes host CPU from /proc/stat idle deltas instead of visible process totals', () => {
+    let tick = 0;
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      sampleProcfs: () => tick++ === 0
+        ? sample([{ pid: 10, ppid: 1, rssBytes: 10, cpuTicks: 10, cmd: 'botmux' }], 100, 80)
+        : sample([{ pid: 10, ppid: 1, rssBytes: 10, cpuTicks: 20, cmd: 'botmux' }], 200, 150),
+      listSessions: () => [],
+      listDaemons: () => [{ larkAppId: 'app', botName: 'bot', pid: 10 }],
+      listBotmuxPids: () => [10],
+      readCliMarkers: () => new Map(),
+      nowMs: () => tick * 10_000,
+    });
+
+    svc.sampleOnce();
+    svc.sampleOnce();
+
+    expect(svc.current().host?.cpuPct).toBe(30);
+    expect(svc.current().botmux?.cpuPct).toBe(10);
+  });
+
+  it('includes the dashboard process in botmux totals when no bot daemons are registered', () => {
+    let tick = 0;
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      sampleProcfs: () => tick++ === 0
+        ? sample([{ pid: 99, ppid: 1, rssBytes: 100, cpuTicks: 10, cmd: 'dashboard' }], 100, 80)
+        : sample([{ pid: 99, ppid: 1, rssBytes: 150, cpuTicks: 30, cmd: 'dashboard' }], 200, 150),
+      listSessions: () => [],
+      listDaemons: () => [],
+      listBotmuxPids: () => [99],
+      readCliMarkers: () => new Map(),
+      nowMs: () => tick * 10_000,
+    });
+
+    svc.sampleOnce();
+    svc.sampleOnce();
+
+    expect(svc.current().botmux).toEqual({ rssBytes: 150, cpuPct: 20 });
+  });
+});

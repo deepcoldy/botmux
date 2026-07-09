@@ -16,6 +16,12 @@ import { buildBotCards, loadGroupsSnapshot, type BotCard } from './overview.js';
 
 type SessionRow = Record<string, any> & { sessionId: string };
 type ScheduleRow = Record<string, any> & { id: string };
+type ResourceSummary = {
+  supported?: boolean;
+  host?: { cpuPct?: number; memUsedPct?: number };
+  botmux?: { rssBytes?: number };
+  sessions?: Array<{ title?: string; sessionId: string; botName?: string; current?: { cpu1mPct?: number; cpuPct?: number } }>;
+};
 
 const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
 const IDLE_STATUSES = new Set(['idle', 'dormant']);
@@ -45,6 +51,19 @@ function sessionStatusText(status: unknown, tr: (key: string) => string): string
   const key = `sessions.status.${raw}`;
   const label = tr(key);
   return label === key ? raw : label;
+}
+
+function resourcePct(value: unknown): string {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${n.toFixed(1)}%` : '-';
+}
+
+function resourceBytes(value: unknown): string {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return '-';
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GiB`;
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(0)} MiB`;
+  return `${Math.max(1, Math.round(n / 1024))} KiB`;
 }
 
 function collapsedCardCount(gridEl: HTMLElement | null): number {
@@ -177,6 +196,7 @@ function OverviewPage() {
   const [teamExpanded, setTeamExpanded] = useState(readTeamExpanded);
   const [collapsedN, setCollapsedN] = useState(TEAM_COLLAPSED_ROWS * 3);
   const [namesVersion, forceNamesRefresh] = useState(0);
+  const [resources, setResources] = useState<ResourceSummary | null>(null);
   const { sessions, schedules, scheduleTimeZone } = useStoreSelector(snapshot => ({
     sessions: [...snapshot.sessions.values()] as SessionRow[],
     schedules: [...snapshot.schedules.values()] as ScheduleRow[],
@@ -193,6 +213,25 @@ function OverviewPage() {
   useEffect(() => {
     void loadGroupsSnapshot().then(() => forceNamesRefresh(v => v + 1));
     void loadNameMaps().then(() => forceNamesRefresh(v => v + 1));
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    const load = async () => {
+      try {
+        const res = await fetch('/api/resources/current', { cache: 'no-store' });
+        const json = await res.json();
+        if (!disposed) setResources(json);
+      } catch {
+        if (!disposed) setResources({ supported: false });
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 10_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
   }, []);
 
   const active = useMemo(() => sessions.filter(s => s.status !== 'closed'), [sessions]);
@@ -219,6 +258,10 @@ function OverviewPage() {
       .slice(0, 5),
     [schedules],
   );
+  const hottestResource = useMemo(() => {
+    const rows = resources?.sessions ?? [];
+    return [...rows].sort((a, b) => Number(b.current?.cpu1mPct ?? b.current?.cpuPct ?? 0) - Number(a.current?.cpu1mPct ?? a.current?.cpuPct ?? 0))[0];
+  }, [resources]);
 
   const toggleTeam = () => {
     setTeamExpanded(v => {
@@ -241,6 +284,14 @@ function OverviewPage() {
           <span className="pill">{tr('overview.onlineBots')} <b>{onlineBots}</b></span>
         </div>
       </div>
+
+      <a className="resource-strip" href="#/monitoring">
+        <span>{tr('monitoring.title')}</span>
+        <b>{tr('monitoring.hostCpu')} {resources?.supported === false ? '-' : resourcePct(resources?.host?.cpuPct)}</b>
+        <b>{tr('monitoring.hostMemory')} {resources?.supported === false ? '-' : resourcePct(resources?.host?.memUsedPct)}</b>
+        <b>{tr('monitoring.botmuxRss')} {resources?.supported === false ? '-' : resourceBytes(resources?.botmux?.rssBytes)}</b>
+        <small>{hottestResource ? `${hottestResource.botName ?? ''} · ${hottestResource.title || hottestResource.sessionId}` : tr('monitoring.noHotSession')}</small>
+      </a>
 
       <div className="sect-head">
         <h2>{tr('overview.team')}</h2><span>{tr('overview.teamHint')}</span>
