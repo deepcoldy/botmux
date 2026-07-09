@@ -22710,6 +22710,11 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   background: var(--surface); border: 1px solid var(--border-soft);
   border-left: 3px solid transparent; border-radius: var(--radius);
   padding: 9px 11px; display: flex; flex-direction: column; gap: 7px;
+  /* 全局 button 基线是 inline-flex+align-items:center，复合卡片按钮必须显式回 stretch，
+     否则子行收缩成内容宽并居中，长标题会溢出卡片两侧 */
+  align-items: stretch; justify-content: flex-start;
+  /* rail 超高时滚动，不许 flex 压扁卡片（压扁会把 foot 挤出卡外） */
+  flex: none;
   transition: border-color .15s, background .15s, transform .1s;
 }
 .gb-goal:hover { border-color: var(--border); transform: translateX(1px); }
@@ -22863,7 +22868,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .attn-sec-head { padding: 4px 13px; font-size: .7rem; text-transform: uppercase; letter-spacing: .04em; color: var(--faint); }
 .attn-sec-n { font-family: var(--mono); }
 .attn-row-wrap { display: flex; align-items: stretch; border-left: 3px solid transparent; }
-.attn-row { display: flex; align-items: center; gap: 10px; flex: 1 1 auto; min-width: 0; width: 100%; text-align: left; padding: 7px 13px; background: none; border: none; font: inherit; font-size: .82rem; color: var(--fg); cursor: pointer; }
+.attn-row { display: flex; align-items: center; justify-content: flex-start; gap: 10px; flex: 1 1 auto; min-width: 0; width: 100%; text-align: left; padding: 7px 13px; background: none; border: none; font: inherit; font-size: .82rem; color: var(--fg); cursor: pointer; }
 .attn-row:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
 .attn-action { flex: none; align-self: center; margin: 5px 13px 5px 0; padding: 4px 9px; border: 1px solid var(--border-soft); border-radius: 6px; background: var(--surface-raised); color: var(--muted); font: inherit; font-size: .74rem; cursor: pointer; white-space: nowrap; }
 .attn-action:hover { color: var(--fg); border-color: color-mix(in srgb, var(--accent) 35%, var(--border-soft)); background: color-mix(in srgb, var(--accent) 7%, var(--surface)); }
