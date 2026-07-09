@@ -69,6 +69,20 @@ const NAV_ITEMS: NavItem[] = [
       </>
     ),
   },
+  { id: 'sessions', href: '#/sessions', labelKey: 'nav.sessions', icon: <path d="M2 3.5h12v7H6l-3 3v-3H2z" /> },
+  {
+    id: 'groups',
+    href: '#/groups',
+    labelKey: 'nav.groups',
+    icon: (
+      <>
+        <circle cx="5.6" cy="5.8" r="2.4" />
+        <circle cx="11" cy="6.8" r="1.9" />
+        <path d="M1.8 13.2c.5-2.4 2-3.6 3.8-3.6s3.3 1.2 3.8 3.6M9.8 12.6c.4-1.7 1.5-2.6 2.8-2.6 1 0 1.9.5 2.4 1.6" />
+      </>
+    ),
+  },
+  { id: 'roles', href: '#/roles', labelKey: 'nav.roles', manage: true, icon: <><path d="M8 1.8l5.2 2v3.4c0 3.4-2.2 5.9-5.2 7-3-1.1-5.2-3.6-5.2-7V3.8z" /><path d="M5.8 8l1.6 1.6 2.8-3" /></> },
   {
     id: 'monitoring',
     href: '#/monitoring',
@@ -80,7 +94,6 @@ const NAV_ITEMS: NavItem[] = [
       </>
     ),
   },
-  { id: 'sessions', href: '#/sessions', labelKey: 'nav.sessions', icon: <path d="M2 3.5h12v7H6l-3 3v-3H2z" /> },
   { id: 'insights', href: '#/insights', labelKey: 'nav.insights', manage: true, icon: <><path d="M2 2v12h12M5 11V7M8.5 11V4.5M12 11V8.5" /></> },
   {
     id: 'workflows',
@@ -95,26 +108,13 @@ const NAV_ITEMS: NavItem[] = [
       </>
     ),
   },
-  {
-    id: 'groups',
-    href: '#/groups',
-    labelKey: 'nav.groups',
-    icon: (
-      <>
-        <circle cx="5.6" cy="5.8" r="2.4" />
-        <circle cx="11" cy="6.8" r="1.9" />
-        <path d="M1.8 13.2c.5-2.4 2-3.6 3.8-3.6s3.3 1.2 3.8 3.6M9.8 12.6c.4-1.7 1.5-2.6 2.8-2.6 1 0 1.9.5 2.4 1.6" />
-      </>
-    ),
-  },
   { id: 'schedules', href: '#/schedules', labelKey: 'nav.schedules', icon: <><circle cx="8" cy="8" r="6.2" /><path d="M8 4.5V8l2.4 1.6" /></> },
   { id: 'whiteboards', href: '#/whiteboards', labelKey: 'nav.whiteboards', manage: true, icon: <><rect x="2.2" y="2.2" width="11.6" height="11.6" rx="2" /><path d="M4.8 5.2h6.4M4.8 8h6.4M4.8 10.8h4" /></> },
-  { id: 'roles', href: '#/roles', labelKey: 'nav.roles', manage: true, icon: <><path d="M8 1.8l5.2 2v3.4c0 3.4-2.2 5.9-5.2 7-3-1.1-5.2-3.6-5.2-7V3.8z" /><path d="M5.8 8l1.6 1.6 2.8-3" /></> },
+  { id: 'office', href: '#/office', labelKey: 'nav.office', icon: <><rect x="3" y="4" width="10" height="7" rx="2" /><circle cx="6" cy="7.5" r="1" /><circle cx="10" cy="7.5" r="1" /><path d="M8 4V2M4.5 11v2M11.5 11v2" /></> },
   { id: 'bot-defaults', href: '#/bot-defaults', labelKey: 'nav.botDefaults', manage: true, icon: <><rect x="2.5" y="5" width="11" height="8" rx="2" /><circle cx="5.8" cy="9" r="1" /><circle cx="10.2" cy="9" r="1" /><path d="M8 5V2.5M5.5 13v1.2M10.5 13v1.2" /></> },
   { id: 'skills', href: '#/skills', labelKey: 'nav.skills', manage: true, icon: <><path d="M3 2.5h10v3H3zM3 7h10v6.5H3z" /><path d="M5.4 9.2h5.2M5.4 11.2h3.8" /></> },
   { id: 'team', href: '#/team', labelKey: 'nav.team', manage: true, icon: <><circle cx="8" cy="8" r="6.2" /><path d="M1.8 8h12.4M8 1.8c-2 1.8-2 10.6 0 12.4 2-1.8 2-10.6 0-12.4z" /></> },
   { id: 'connectors', href: '#/connectors', labelKey: 'nav.connectors', manage: true, icon: <><path d="M5.5 6.5v-3a2.5 2.5 0 0 1 5 0v3" /><rect x="3.5" y="6.5" width="9" height="7" rx="2" /></> },
-  { id: 'office', href: '#/office', labelKey: 'nav.office', icon: <><rect x="3" y="4" width="10" height="7" rx="2" /><circle cx="6" cy="7.5" r="1" /><circle cx="10" cy="7.5" r="1" /><path d="M8 4V2M4.5 11v2M11.5 11v2" /></> },
   { id: 'settings', href: '#/settings', labelKey: 'nav.settings', icon: <><circle cx="8" cy="8" r="2.2" /><path d="M8 1.8v2M8 12.2v2M3.6 3.6L5 5M11 11l1.4 1.4M1.8 8h2M12.2 8h2M3.6 12.4L5 11M11 5l1.4-1.4" /></> },
 ];
 
@@ -145,6 +145,12 @@ function isActiveNav(item: NavItem, hash: string): boolean {
   if (
     item.id === 'workflows' &&
     (current === '#/legacy-workflow' || current.startsWith('#/legacy-workflow?') || current.startsWith('#/legacy-workflow/'))
+  ) {
+    return true;
+  }
+  if (
+    item.id === 'sessions' &&
+    (current === '#/monitor-room' || current.startsWith('#/monitor-room?') || current.startsWith('#/monitor-room/'))
   ) {
     return true;
   }

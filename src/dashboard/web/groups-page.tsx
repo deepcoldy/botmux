@@ -1312,6 +1312,9 @@ function GroupsPage() {
           <p className="eyebrow">{tr('nav.groups')}</p>
           <h1>{tr('groups.title')}</h1>
         </div>
+        <div className="page-heading-actions">
+          <button type="button" id="g-create" className="page-primary-action" onClick={() => void openCreateDialog()}>{tr('groups.create')}</button>
+        </div>
       </div>
       <form id="g-filters" className="filters dashboard-toolbar groups-toolbar" onSubmit={ev => ev.preventDefault()}>
         <input
@@ -1342,7 +1345,6 @@ function GroupsPage() {
           {tr('groups.matrixTitle')} {loading ? '-/-' : `${rows.length}/${snapshot.chats.length}`}
         </span>
         <button type="button" id="g-refresh" disabled={refreshing} onClick={() => void refresh()}>{tr('groups.refresh')}</button>
-        <button type="button" id="g-create" className="page-primary-action" onClick={() => void openCreateDialog()}>{tr('groups.create')}</button>
       </form>
       {loadError ? <p className="hint-warn">加载群组失败：{loadError}</p> : null}
       <section className="overview-block groups-matrix-section">

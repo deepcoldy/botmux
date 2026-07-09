@@ -238,21 +238,23 @@ function popoverButtonHtml(sessionId: string): string {
 function pageHtml(): string {
   return `<section class="page monitor-room-page">
     <div class="page-heading">
-      <div>
+      <div class="monitor-room-heading-main">
         <p class="eyebrow">${escapeHtml(t('monitorRoom.eyebrow'))}</p>
-        <h1>${escapeHtml(t('monitorRoom.title'))}</h1>
-        <p>${escapeHtml(t('monitorRoom.subtitle'))}</p>
+        <div class="monitor-room-title-row">
+          <a class="btn-link monitor-room-back" href="#/sessions">← ${escapeHtml(t('monitorRoom.backToSessions'))}</a>
+          <h1>${escapeHtml(t('monitorRoom.title'))}</h1>
+          <span id="monitor-room-summary" class="monitor-room-summary"></span>
+        </div>
       </div>
-      <div class="monitor-room-actions">
-        <label class="monitor-room-toggle" title="${escapeHtml(t('monitorRoom.autoActiveHelp'))}">
+      <div class="monitor-room-actions dashboard-toolbar">
+        <label class="monitor-room-toggle filter-toggle" title="${escapeHtml(t('monitorRoom.autoActiveHelp'))}">
           <input type="checkbox" id="monitor-room-auto-active">
-          <span>${escapeHtml(t('monitorRoom.autoActive'))}</span>
+          <span class="filter-toggle-label">${escapeHtml(t('monitorRoom.autoActive'))}</span>
+          <span class="filter-toggle-switch" aria-hidden="true"></span>
         </label>
-        <a class="btn-link" href="#/sessions">${escapeHtml(t('monitorRoom.backToSessions'))}</a>
         <button type="button" id="monitor-room-clear" class="contrast">${escapeHtml(t('monitorRoom.clear'))}</button>
       </div>
     </div>
-    <div id="monitor-room-summary" class="monitor-room-summary"></div>
     <div id="monitor-room-grid" class="monitor-room-grid"></div>
   </section>`;
 }

@@ -439,11 +439,6 @@ export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: s
 
 function SessionsFilters(props: {
   chatOptions: ChatFilterOption[];
-  createAction?: {
-    busy: boolean;
-    onClick: () => void;
-    visible: boolean;
-  };
   filters: FiltersState;
   idleCleanup: IdleCleanupBarProps;
   setFilters: (updater: (prev: FiltersState) => FiltersState) => void;
@@ -529,16 +524,6 @@ function SessionsFilters(props: {
         <span className="filter-toggle-switch" aria-hidden="true" />
       </label>
       <IdleCleanupBar {...props.idleCleanup} />
-      {props.createAction?.visible ? (
-        <button
-          type="button"
-          className="page-primary-action create-session-btn"
-          disabled={props.createAction.busy}
-          onClick={() => props.createAction?.onClick()}
-        >
-          {t('sessions.create.button')}
-        </button>
-      ) : null}
     </form>
   );
 }
@@ -2510,16 +2495,21 @@ function SessionsPage(): JSX.Element {
           <button type="button" id="monitor-room-open" className="monitor-room-open" onClick={() => { window.location.href = monitorRoomUrl(); }}>
             {t('sessions.monitorRoom')}
           </button>
+          {ui.authed ? (
+            <button
+              type="button"
+              className="page-primary-action create-session-btn"
+              disabled={createLoading}
+              onClick={() => void openCreateSession()}
+            >
+              {t('sessions.create.button')}
+            </button>
+          ) : null}
         </div>
       </div>
 
       <SessionsFilters
         chatOptions={chatOptions}
-        createAction={{
-          busy: createLoading,
-          onClick: () => void openCreateSession(),
-          visible: ui.authed,
-        }}
         filters={filters}
         setFilters={setFilters}
         idleCleanup={{
