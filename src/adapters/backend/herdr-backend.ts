@@ -1,5 +1,7 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import * as pty from 'node-pty';
 import type { BackendType, SessionBackend, SpawnOpts, SessionProbe } from './types.js';
+import { logger } from '../../utils/logger.js';
 
 export type PersistentBackendType = Exclude<BackendType, 'pty'>;
 
@@ -34,6 +36,11 @@ const STATUS_WAIT_TIMEOUT_MS = 30_000;
 const SETTLED_STATUSES = ['done', 'blocked', 'idle'] as const;
 
 type JsonCommandResult = { ok: true; value: any | undefined } | { ok: false };
+
+export interface HerdrWebTerminalSize {
+  cols: number;
+  rows: number;
+}
 
 function tryJsonCommand(args: string[], opts?: { timeout?: number; input?: string; env?: NodeJS.ProcessEnv }): JsonCommandResult {
   try {
@@ -121,6 +128,10 @@ export class HerdrBackend implements SessionBackend {
   private cols = 200;
   private rows = 50;
   private agentProbeFailures = 0;
+  private webAttach: pty.IPty | null = null;
+  private webOwner: object | null = null;
+  private webSize: HerdrWebTerminalSize | null = null;
+  private readonly webViewers = new Map<object, HerdrWebTerminalSize | null>();
 
   private childEnv: Record<string, string> | undefined;
 
@@ -283,6 +294,49 @@ export class HerdrBackend implements SessionBackend {
     this.rows = rows;
   }
 
+  acquireWebTerminal(viewer: object): HerdrWebTerminalSize | null {
+    if (this.opts.externalTarget || this.exited) return null;
+    if (!this.webViewers.has(viewer)) this.webViewers.set(viewer, null);
+    return this.webOwner && this.webOwner !== viewer ? this.webSize : null;
+  }
+
+  resizeWebTerminal(viewer: object, cols: number, rows: number): HerdrWebTerminalSize | null {
+    if (this.opts.externalTarget || this.exited || !this.webViewers.has(viewer)) return null;
+    const size = { cols, rows };
+    this.webViewers.set(viewer, size);
+    if (!this.webOwner) this.webOwner = viewer;
+    if (this.webOwner !== viewer) return null;
+
+    if (this.webAttach) {
+      this.webAttach.resize(cols, rows);
+    } else if (!this.startWebAttach(size)) {
+      return null;
+    }
+    this.cols = cols;
+    this.rows = rows;
+    this.webSize = size;
+    return size;
+  }
+
+  releaseWebTerminal(viewer: object): object | null {
+    if (this.opts.externalTarget || !this.webViewers.has(viewer)) return null;
+    const wasOwner = this.webOwner === viewer;
+    this.webViewers.delete(viewer);
+    if (!wasOwner) return null;
+
+    if (this.webViewers.size === 0) {
+      this.resetWebTerminal();
+      return null;
+    }
+    const promoted = this.webViewers.keys().next().value as object;
+    this.webOwner = promoted;
+    return promoted;
+  }
+
+  isWebTerminalOwner(viewer: object): boolean {
+    return this.webOwner === viewer;
+  }
+
   onData(cb: (data: string) => void): void {
     this.dataCbs.push(cb);
   }
@@ -294,6 +348,7 @@ export class HerdrBackend implements SessionBackend {
   kill(): void {
     if (this.exited) return;
     this.exited = true;
+    this.resetWebTerminal();
     this.stopPolling();
     this.stopStatusWatcher();
     this.serverProcess = null;
@@ -352,6 +407,49 @@ export class HerdrBackend implements SessionBackend {
       sleepSync(SERVER_BOOT_POLL_MS);
     }
     throw new Error(`failed to start herdr session ${this.sessionName}`);
+  }
+
+  private startWebAttach(size: HerdrWebTerminalSize): boolean {
+    const target = this.paneId ?? this.agentName;
+    try {
+      const attach = pty.spawn('herdr', [
+        '--session', this.sessionName,
+        'agent', 'attach', target,
+      ], {
+        name: 'xterm-256color',
+        cols: size.cols,
+        rows: size.rows,
+        env: this.childEnv ?? {},
+      });
+      this.webAttach = attach;
+      attach.onData(() => { /* drain only; polling remains the single output source */ });
+      attach.onExit(({ exitCode, signal }) => {
+        if (this.webAttach !== attach) return;
+        this.webAttach = null;
+        logger.warn(
+          `[herdr] web terminal attach exited session=${this.sessionName} target=${target} ` +
+          `code=${exitCode} signal=${signal ?? 'null'}`,
+        );
+      });
+      return true;
+    } catch (err: any) {
+      logger.error(
+        `[herdr] web terminal attach failed session=${this.sessionName} target=${target}: ` +
+        `${err?.message ?? err}`,
+      );
+      return false;
+    }
+  }
+
+  private resetWebTerminal(): void {
+    const attach = this.webAttach;
+    this.webAttach = null;
+    this.webOwner = null;
+    this.webSize = null;
+    this.webViewers.clear();
+    if (attach) {
+      try { attach.kill(); } catch { /* already gone */ }
+    }
   }
 
   private getAgent(): any | undefined {
@@ -547,6 +645,7 @@ export class HerdrBackend implements SessionBackend {
   private handleExit(code: number | null, signal: string | null): void {
     if (this.exited) return;
     this.exited = true;
+    this.resetWebTerminal();
     this.stopPolling();
     this.stopStatusWatcher();
     for (const cb of this.exitCbs) {

@@ -5358,6 +5358,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         });
       } else {
         // ── Shared relay (PtyBackend OR tmux pipe mode) ──
+        const herdrWebBackend = backend instanceof HerdrBackend && !lastInitConfig?.adoptMode
+          ? backend
+          : null;
+        const initialHerdrSize = herdrWebBackend?.acquireWebTerminal(ws);
+        if (initialHerdrSize) {
+          ws.send(`\x1b]1989;follower;${initialHerdrSize.cols};${initialHerdrSize.rows}\x07`);
+        }
         // History seed: prefer tmux's authoritative capture-pane in pipe mode
         // (clean grid + scrollback) over replaying the raw cumulative byte
         // stream, which scrolls stale Ink redraw/spinner frames into scrollback
@@ -5388,7 +5395,21 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           try {
             const msg = JSON.parse(String(raw));
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
-              backend?.resize(msg.cols, msg.rows);
+              if (herdrWebBackend) {
+                const size = herdrWebBackend.resizeWebTerminal(ws, msg.cols, msg.rows);
+                if (size) {
+                  for (const client of wsClients) {
+                    if (
+                      client.readyState === WebSocket.OPEN &&
+                      !herdrWebBackend.isWebTerminalOwner(client)
+                    ) {
+                      client.send(`\x1b]1989;follower;${size.cols};${size.rows}\x07`);
+                    }
+                  }
+                }
+              } else {
+                backend?.resize(msg.cols, msg.rows);
+              }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               if (!authedClients.has(ws)) {
                 // Read-only: allow ONLY wheel scroll sequences (SGR buttons 64-67).
@@ -5404,6 +5425,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
 
         ws.on('close', () => {
           wsClients.delete(ws);
+          const promoted = herdrWebBackend?.releaseWebTerminal(ws) as WebSocket | null | undefined;
+          if (promoted?.readyState === WebSocket.OPEN) {
+            promoted.send('\x1b]1989;owner\x07');
+          }
         });
       }
     });
@@ -5608,6 +5633,21 @@ window.addEventListener('resize',onViewportResize);
   ws.onopen=function(){el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize()};
   ws.onmessage=function(e){
     var data=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);
+    // Managed Herdr has one authoritative pane grid shared by every viewer.
+    // Followers render at the owner's grid; a promoted owner re-fits to its
+    // own viewport and reports the new size back to the worker.
+    var _hf=data.match(/\\x1b\\]1989;follower;(\\d+);(\\d+)\\x07/);
+    if(_hf){
+      fixedSize=true;var _hc=+_hf[1],_hr=+_hf[2];
+      if(_hc>0&&_hr>0){try{term.resize(_hc,_hr)}catch(ex){}_lastC=_hc;_lastR=_hr}
+      data=data.replace(_hf[0],'');
+    }
+    var _ho=data.match(/\\x1b\\]1989;owner\\x07/);
+    if(_ho){
+      fixedSize=false;data=data.replace(_ho[0],'');
+      try{fit.fit()}catch(ex){}
+      _lastC=_lastR=0;sendResize();
+    }
     // botmux OSC 1989: pin the xterm to the adopted pane's fixed size (the pane
     // can't be resized, so FitAddon-to-browser would wrap the snapshot lines).
     var _fs=data.match(/\\x1b\\]1989;(\\d+);(\\d+)\\x07/);
