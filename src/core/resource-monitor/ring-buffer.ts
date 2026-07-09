@@ -26,6 +26,18 @@ export class NumericRingSeries {
     this.count = Math.min(this.count + 1, this.capacity);
   }
 
+  pushSparse(timestamp: number, metrics: Record<string, number | undefined>): void {
+    this.timestamps[this.next] = timestamp;
+    for (const name of this.metricNames) {
+      const arr = this.values.get(name);
+      if (!arr) continue;
+      const value = metrics[name];
+      arr[this.next] = Number.isFinite(value) ? Number(value) : Number.NaN;
+    }
+    this.next = (this.next + 1) % this.capacity;
+    this.count = Math.min(this.count + 1, this.capacity);
+  }
+
   toJSON(sinceMs?: number): { timestamps: number[] } & Record<string, number[]> {
     const indices: number[] = [];
     for (let offset = 0; offset < this.count; offset++) {
@@ -39,7 +51,7 @@ export class NumericRingSeries {
     };
     for (const name of this.metricNames) {
       const arr = this.values.get(name);
-      out[name] = arr ? indices.map(idx => arr[idx]) : [];
+      out[name] = arr ? indices.map(idx => arr[idx]).filter(Number.isFinite) : [];
     }
     return out;
   }

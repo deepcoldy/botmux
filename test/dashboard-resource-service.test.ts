@@ -331,6 +331,38 @@ describe('ResourceMonitorService', () => {
     expect(svc.current().sessions[0].current.cpuPct).toBe(20);
   });
 
+  it('does not write first-sample CPU zeroes into history before CPU is ready', () => {
+    let tick = 0;
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      aggregateHistoryMs: 60_000,
+      sampleProcfs: () => tick++ === 0
+        ? sample([{ pid: 10, ppid: 1, rssBytes: 100, cpuTicks: 10, cmd: 'botmux' }], 100, 80)
+        : sample([{ pid: 10, ppid: 1, rssBytes: 150, cpuTicks: 30, cmd: 'botmux' }], 200, 150),
+      listSessions: () => [],
+      listDaemons: () => [{ larkAppId: 'app', botName: 'bot', pid: 10 }],
+      listBotmuxPids: () => [10],
+      readCliMarkers: () => new Map(),
+      nowMs: () => tick * 10_000,
+    });
+
+    svc.sampleOnce();
+
+    expect(svc.current().cpuReady).toBe(false);
+    expect(svc.history('1h').host?.cpuPct).toEqual([]);
+    expect(svc.history('1h').host?.memUsedPct).toEqual([50]);
+    expect(svc.history('1h').botmux?.cpuPct).toEqual([]);
+    expect(svc.history('1h').botmux?.rssBytes).toEqual([100]);
+
+    svc.sampleOnce();
+
+    expect(svc.current().cpuReady).toBe(true);
+    expect(svc.history('1h').host?.cpuPct).toEqual([30]);
+    expect(svc.history('1h').host?.memUsedPct).toEqual([50, 50]);
+    expect(svc.history('1h').botmux?.cpuPct).toEqual([20]);
+    expect(svc.history('1h').botmux?.rssBytes).toEqual([100, 150]);
+  });
+
   it('includes the dashboard process in botmux totals when no bot daemons are registered', () => {
     let tick = 0;
     const svc = createResourceMonitorService({

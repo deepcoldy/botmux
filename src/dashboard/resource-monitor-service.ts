@@ -335,16 +335,17 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
     return series;
   }
 
-  function appendHistory(sampledAt: number, host: HostResourceCurrent, botmux: { cpuPct: number; rssBytes: number }, bots: ResourceBotCurrent[], sessions: ResourceSessionCurrent[]): void {
-    hostSeries.push(sampledAt, { cpuPct: host.cpuPct, memUsedPct: host.memUsedPct });
-    botmuxSeries.push(sampledAt, { cpuPct: botmux.cpuPct, rssBytes: botmux.rssBytes });
+  function appendHistory(sampledAt: number, cpuReady: boolean, host: HostResourceCurrent, botmux: { cpuPct: number; rssBytes: number }, bots: ResourceBotCurrent[], sessions: ResourceSessionCurrent[]): void {
+    const push = cpuReady ? 'push' : 'pushSparse';
+    hostSeries[push](sampledAt, { cpuPct: cpuReady ? host.cpuPct : undefined, memUsedPct: host.memUsedPct });
+    botmuxSeries[push](sampledAt, { cpuPct: cpuReady ? botmux.cpuPct : undefined, rssBytes: botmux.rssBytes });
     for (const bot of bots) {
-      botHistory(bot).push(sampledAt, { cpuPct: bot.total.cpuPct, rssBytes: bot.total.rssBytes });
+      botHistory(bot)[push](sampledAt, { cpuPct: cpuReady ? bot.total.cpuPct : undefined, rssBytes: bot.total.rssBytes });
     }
     for (const session of sessions) {
       if (!session.tracked) continue;
-      trackedSessionHistory(session).push(sampledAt, {
-        cpuPct: session.current.cpu1mPct,
+      trackedSessionHistory(session)[push](sampledAt, {
+        cpuPct: cpuReady ? session.current.cpu1mPct : undefined,
         rssBytes: session.current.rssBytes,
         rssGrowth5mBytes: session.current.rssGrowth5mBytes,
       });
@@ -453,7 +454,7 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
         tracked: selection.trackedIds,
       },
     };
-    appendHistory(currentSnapshot.sampledAt, host, attribution.botmux, attribution.bots, sessions);
+    appendHistory(currentSnapshot.sampledAt, cpuReady, host, attribution.botmux, attribution.bots, sessions);
     previousTotalCpuTicks = sample.totalCpuTicks;
     previousIdleCpuTicks = sample.idleCpuTicks;
     previousProcessTicks = snapshotProcessTicks(sample.processes);

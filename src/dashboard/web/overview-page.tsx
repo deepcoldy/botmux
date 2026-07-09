@@ -18,6 +18,7 @@ type SessionRow = Record<string, any> & { sessionId: string };
 type ScheduleRow = Record<string, any> & { id: string };
 type ResourceSummary = {
   supported?: boolean;
+  cpuReady?: boolean;
   host?: { cpuPct?: number; memUsedPct?: number };
   botmux?: { rssBytes?: number };
   sessions?: Array<{ title?: string; sessionId: string; botName?: string; current?: { cpu1mPct?: number; cpuPct?: number } }>;
@@ -262,6 +263,9 @@ function OverviewPage() {
     const rows = resources?.sessions ?? [];
     return [...rows].sort((a, b) => Number(b.current?.cpu1mPct ?? b.current?.cpuPct ?? 0) - Number(a.current?.cpu1mPct ?? a.current?.cpuPct ?? 0))[0];
   }, [resources]);
+  const hostCpuText = resources?.supported === false
+    ? '-'
+    : resources?.cpuReady === false ? '-' : resourcePct(resources?.host?.cpuPct);
 
   const toggleTeam = () => {
     setTeamExpanded(v => {
@@ -286,8 +290,8 @@ function OverviewPage() {
       </div>
 
       <a className="resource-strip" href="#/monitoring">
-        <span>{tr('monitoring.title')}</span>
-        <b>{tr('monitoring.hostCpu')} {resources?.supported === false ? '-' : resourcePct(resources?.host?.cpuPct)}</b>
+        <span>{tr('monitoring.runtimeTitle')}</span>
+        <b>{tr('monitoring.hostCpu')} {hostCpuText}</b>
         <b>{tr('monitoring.hostMemory')} {resources?.supported === false ? '-' : resourcePct(resources?.host?.memUsedPct)}</b>
         <b>{tr('monitoring.botmuxRss')} {resources?.supported === false ? '-' : resourceBytes(resources?.botmux?.rssBytes)}</b>
         <small>{hottestResource ? `${hottestResource.botName ?? ''} · ${hottestResource.title || hottestResource.sessionId}` : tr('monitoring.noHotSession')}</small>

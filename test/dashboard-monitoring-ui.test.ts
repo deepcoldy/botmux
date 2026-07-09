@@ -209,6 +209,15 @@ describe('dashboard monitoring session table', () => {
     expect(textContent(sessionRow!.children[3] as ReactTestInstance)).toBe('64 MiB');
   });
 
+  it('keeps overview resource strip aligned with runtime CPU readiness', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/overview-page.tsx', import.meta.url), 'utf8');
+
+    expect(page).toContain('cpuReady?: boolean');
+    expect(page).toContain("tr('monitoring.runtimeTitle')");
+    expect(page).not.toContain("tr('monitoring.title')</span>");
+    expect(page).toContain("resources?.cpuReady === false ? '-'");
+  });
+
   it('limits the session body height with CSS instead of dropping rows', () => {
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
 
