@@ -117,7 +117,14 @@ export function monitorRoomPanelBodyKey(
   loc?: { protocol: string; origin: string; hostname: string } | null,
 ): string {
   if (!session) return 'missing';
-  const url = sessionTerminalHref(session, loc ?? null);
+  // Pass `loc` straight through: when the caller omits it (the production
+  // render() path calls this with no loc), sessionTerminalHref falls back to
+  // the live window.location default. Coercing undefined → null here would
+  // defeat that default and pin the key to a constant `frame:none`, so the
+  // iframe would never rebuild when a session's terminal URL appears or changes
+  // (e.g. proxyPort comes up on the HTTPS dashboard) — the panel would stay
+  // stuck on the "terminal unavailable" placeholder until a full page reload.
+  const url = sessionTerminalHref(session, loc);
   return `frame:${url ?? 'none'}`;
 }
 

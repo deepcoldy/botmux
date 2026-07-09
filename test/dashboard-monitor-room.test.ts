@@ -148,4 +148,23 @@ describe('monitor room panel body key', () => {
     const key = monitorRoomPanelBodyKey({ sessionId: 'x', webPort: 1 }, local);
     expect(key).not.toContain('removable');
   });
+
+  it('falls back to the live window.location when no loc is passed (production render path)', () => {
+    // render() calls monitorRoomPanelBodyKey(session) with NO loc. It must still
+    // reflect the real terminal URL so the iframe rebuilds when the URL changes
+    // (e.g. proxyPort comes up). A previous `loc ?? null` coercion pinned the key
+    // to a constant `frame:none`, defeating URL-change detection in the browser.
+    const prev = (globalThis as any).window;
+    (globalThis as any).window = { location: local };
+    try {
+      const before = monitorRoomPanelBodyKey({ sessionId: 'a', webPort: 3001 });
+      const after = monitorRoomPanelBodyKey({ sessionId: 'a', webPort: 3001, proxyPort: 8801 });
+      expect(before).toBe('frame:http://localhost:3001');
+      expect(after).toBe('frame:http://localhost:8801/s/a');
+      expect(before).not.toBe(after);
+    } finally {
+      if (prev === undefined) delete (globalThis as any).window;
+      else (globalThis as any).window = prev;
+    }
+  });
 });
