@@ -196,12 +196,13 @@ function syncCardBody(entry: MonitorCardEntry, sessionId: string, bodyKey: strin
   entry.bodyKey = bodyKey;
 }
 
+// Returns the inner content only — the host element already carries the
+// `.monitor-room-empty` class, so wrapping in another same-class <div> here
+// would double the empty-state padding/min-height.
 function emptyPlaceholderHtml(usingAutoActive: boolean): string {
-  return `<div class="monitor-room-empty">
-      <h2>${escapeHtml(t(usingAutoActive ? 'monitorRoom.autoEmptyTitle' : 'monitorRoom.emptyTitle'))}</h2>
+  return `<h2>${escapeHtml(t(usingAutoActive ? 'monitorRoom.autoEmptyTitle' : 'monitorRoom.emptyTitle'))}</h2>
       <p>${escapeHtml(t(usingAutoActive ? 'monitorRoom.autoEmptyHelp' : 'monitorRoom.emptyHelp'))}</p>
-      <a class="btn-link" href="#/sessions">${escapeHtml(t('monitorRoom.openSessions'))}</a>
-    </div>`;
+      <a class="btn-link" href="#/sessions">${escapeHtml(t('monitorRoom.openSessions'))}</a>`;
 }
 
 function syncMonitorRoomFrameScales(root: HTMLElement, grid: HTMLElement): void {
