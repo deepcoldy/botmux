@@ -95,6 +95,12 @@ type ResourceSession = {
 
 type SortKey = 'cpu' | 'rss' | 'growth' | 'bot' | 'status';
 
+type MonitoringPageProps = {
+  initialCurrent?: ResourceCurrent | null;
+  initialHistory?: ResourceHistory | null;
+  poll?: boolean;
+};
+
 function formatBytes(value: unknown): string {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return '-';
@@ -110,12 +116,13 @@ function formatPct(value: unknown): string {
 
 function formatCount(value: unknown): string {
   const n = Number(value);
-  return Number.isFinite(n) ? String(n) : '0';
+  return Number.isFinite(n) ? String(n) : '-';
 }
 
 function formatDuration(value: unknown): string {
   const ms = Number(value);
   if (!Number.isFinite(ms) || ms <= 0) return '-';
+  if (ms < 60_000) return `${Math.max(1, Math.floor(ms / 1000))}s`;
   const minutes = Math.floor(ms / 60_000);
   if (minutes < 60) return `${Math.max(1, minutes)}m`;
   const hours = Math.floor(minutes / 60);
@@ -255,12 +262,16 @@ function RuntimeHealth({ current }: { current: ResourceCurrent }) {
   const tr = useT();
   const runtime = current.runtime;
   const sampleStatus = runtimeSampleStatus(runtime?.sampleHealth?.status);
-  const daemonTotal = runtime?.daemons?.total ?? 0;
-  const daemonOnline = runtime?.daemons?.online ?? 0;
-  const daemonOffline = runtime?.daemons?.offline ?? Math.max(0, daemonTotal - daemonOnline);
-  const sessionTotal = runtime?.sessions?.total ?? 0;
-  const working = runtime?.sessions?.working ?? 0;
-  const starting = runtime?.sessions?.starting ?? 0;
+  const daemonTotal = runtime?.daemons?.total;
+  const daemonOnline = runtime?.daemons?.online;
+  const daemonOffline = runtime?.daemons?.offline ?? (
+    Number.isFinite(Number(daemonTotal)) && Number.isFinite(Number(daemonOnline))
+      ? Math.max(0, Number(daemonTotal) - Number(daemonOnline))
+      : undefined
+  );
+  const sessionTotal = runtime?.sessions?.total;
+  const working = runtime?.sessions?.working;
+  const starting = runtime?.sessions?.starting;
 
   return (
     <section className="panel runtime-health-panel">
@@ -338,13 +349,14 @@ function RuntimeSessionPressure({ runtime }: { runtime?: RuntimeSummary }) {
   );
 }
 
-function MonitoringPage() {
+export function MonitoringPage({ initialCurrent = null, initialHistory = null, poll = true }: MonitoringPageProps = {}) {
   const tr = useT();
-  const [current, setCurrent] = useState<ResourceCurrent | null>(null);
-  const [history, setHistory] = useState<ResourceHistory | null>(null);
+  const [current, setCurrent] = useState<ResourceCurrent | null>(initialCurrent);
+  const [history, setHistory] = useState<ResourceHistory | null>(initialHistory);
   const [sort, setSort] = useState<SortKey>('cpu');
 
   useEffect(() => {
+    if (!poll) return;
     let disposed = false;
     async function load() {
       try {
@@ -370,7 +382,7 @@ function MonitoringPage() {
       disposed = true;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [poll]);
 
   const sessions = useMemo(() => sortedSessions(current?.sessions ?? [], sort), [current?.sessions, sort]);
   const hottest = sessions[0];

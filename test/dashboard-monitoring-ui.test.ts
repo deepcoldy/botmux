@@ -1,9 +1,9 @@
 import { readFileSync } from 'node:fs';
 import React from 'react';
-import TestRenderer from 'react-test-renderer';
+import TestRenderer, { type ReactTestInstance } from 'react-test-renderer';
 import { describe, expect, it } from 'vitest';
 
-import { SessionResourceTable } from '../src/dashboard/web/monitoring-page.js';
+import { MonitoringPage, SessionResourceTable } from '../src/dashboard/web/monitoring-page.js';
 
 function makeSession(index: number) {
   return {
@@ -22,6 +22,13 @@ function makeSession(index: number) {
       rssGrowth5mBytes: index * 1024,
     },
   };
+}
+
+function textContent(node: ReactTestInstance): string {
+  return node.children.map(child => {
+    if (typeof child === 'string' || typeof child === 'number') return String(child);
+    return textContent(child as ReactTestInstance);
+  }).join('');
 }
 
 describe('dashboard monitoring session table', () => {
@@ -57,6 +64,81 @@ describe('dashboard monitoring session table', () => {
       typeof node.props.className === 'string' && node.props.className.startsWith('resource-row'));
     expect(rows).toHaveLength(12);
     expect(scrollBody.findAll(node => node.props.className === 'resource-row is-tracked')).toHaveLength(2);
+  });
+
+  it('keeps runtime health visible when resource sampling is unsupported', () => {
+    const renderer = TestRenderer.create(React.createElement(MonitoringPage, {
+      initialCurrent: {
+        supported: false,
+        reason: 'procfs_unavailable',
+        runtime: {
+          sampleHealth: { status: 'fresh', ageMs: 5_000 },
+          daemons: { total: 2, online: 1, offline: 1 },
+          sessions: {
+            total: 3,
+            working: 2,
+            starting: 1,
+            idle: 0,
+            waiting: 0,
+            unknown: 0,
+            unattributed: 1,
+            longestRunning: { sessionId: 'run', larkAppId: 'app-a', botName: 'AI', title: 'Run', durationMs: 59_000 },
+            longestWaiting: { sessionId: 'wait', larkAppId: 'app-a', botName: 'AI', title: 'Wait', durationMs: 1_000 },
+          },
+        },
+      },
+      initialHistory: { supported: false, bots: [], sessions: [] },
+      poll: false,
+    }));
+    const root = renderer.root;
+
+    const health = root.findByProps({ className: 'panel runtime-health-panel' });
+    expect(health.findByProps({ className: 'runtime-status-pill fresh' })).toBeTruthy();
+    expect(textContent(health)).toContain('1/2');
+    expect(textContent(health)).toContain('5s');
+
+    const pressure = root.findByProps({ className: 'panel runtime-session-pressure' });
+    expect(textContent(pressure)).toContain('59s');
+    expect(textContent(pressure)).toContain('1s');
+
+    const unavailable = root.findByProps({ className: 'panel resource-unavailable' });
+    expect(textContent(unavailable)).toContain('procfs_unavailable');
+    expect(root.findAllByProps({ className: 'panel resource-pressure' })).toHaveLength(0);
+  });
+
+  it('renders missing runtime counts as unknown without hiding resource fallback counts', () => {
+    const renderer = TestRenderer.create(React.createElement(MonitoringPage, {
+      initialCurrent: {
+        supported: true,
+        host: { cpuPct: 12, memUsedPct: 34, load1: 0.5 },
+        botmux: { cpuPct: 3, rssBytes: 512 * 1024 * 1024 },
+        bots: [{
+          larkAppId: 'app-a',
+          botName: 'FallbackBot',
+          daemonStatus: 'online',
+          sessions: { count: 4 },
+          total: { cpuPct: 1.5, rssBytes: 256 * 1024 * 1024 },
+        }],
+        sessions: [],
+        rankings: { tracked: [] },
+      },
+      initialHistory: { supported: true, bots: [], sessions: [] },
+      poll: false,
+    }));
+    const root = renderer.root;
+
+    const healthText = textContent(root.findByProps({ className: 'panel runtime-health-panel' }));
+    expect(healthText).toContain('-/-');
+    expect(healthText).not.toContain('0/0');
+    expect(healthText).not.toContain('工作中 0');
+
+    const botTable = root.findByProps({ className: 'resource-table resource-bot-table' });
+    const botRow = botTable.findAllByProps({ className: 'resource-row' })
+      .find(row => textContent(row).includes('FallbackBot'));
+    expect(botRow).toBeTruthy();
+    expect(textContent(botRow!.children[2] as ReactTestInstance)).toBe('4');
+    expect(textContent(botRow!.children[3] as ReactTestInstance)).toBe('-');
+    expect(textContent(botRow!.children[4] as ReactTestInstance)).toBe('-');
   });
 
   it('limits the session body height with CSS instead of dropping rows', () => {
