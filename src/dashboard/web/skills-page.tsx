@@ -166,7 +166,7 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
       <div className="skills-install-title">
         <h3 className="bd-section-title">{tr('skills.install')}</h3>
         <span className="skills-help-tip">
-          <button type="button" className="skills-help-button" aria-label={tr('skills.installInfoLabel')}>?</button>
+          <button type="button" className="help-icon-button skills-help-button" aria-label={tr('skills.installInfoLabel')}>?</button>
           <span className="skills-help-popover" role="tooltip">{tr('skills.installInfo')}</span>
         </span>
       </div>

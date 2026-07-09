@@ -341,8 +341,10 @@ export function botDisplayName(s: Record<string, any>): string {
   return String(s.botName ?? s.larkAppId ?? '-');
 }
 
-/** 会话所在群聊的标题；单聊或群列表里查不到时返回 null（由调用方回退）。 */
+/** 会话所在聊天的标题；p2p 优先使用后端行上的直聊显示名，群聊走 /api/groups 名字表。 */
 export function chatDisplayTitle(s: Record<string, any>): string | null {
+  const rowName = String(s.chatDisplayName ?? '').trim();
+  if (rowName) return rowName;
   return (s.chatId && chatNameById.get(s.chatId)) || null;
 }
 

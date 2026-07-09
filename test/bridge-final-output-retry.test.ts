@@ -73,7 +73,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
   LoggerLevel: { info: 2 },
 }));
 
-import { initWorkerPool } from '../src/core/worker-pool.js';
+import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
@@ -131,6 +131,8 @@ function finalOutputMsg(): Extract<WorkerToDaemon, { type: 'final_output' }> {
   return { type: 'final_output', content: 'final answer', lastUuid: 'uuid-1', turnId: 'turn-1' };
 }
 
+const SCOPED_DEDUPE_KEY = 'sid-final-out:uuid-1';
+
 describe('Bridge final_output delivery (P2 retry)', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -175,7 +177,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const dispatcher = async (msg: WorkerToDaemon) => {
       if (msg.type !== 'final_output') return;
       if (!msg.content || !msg.content.trim()) return;
-      if (msg.lastUuid && ds.lastBridgeEmittedUuid === msg.lastUuid) return;
+      if (msg.lastUuid && ds.lastBridgeEmittedUuid === `${msg.sessionId ?? ds.session.sessionId}:${msg.lastUuid}`) return;
       // Direct call to the public path:
       const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
       __testOnly_deliverFinalOutput(ds, msg, 'tag', 0);
@@ -186,7 +188,30 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(sessionReply.mock.calls[0][4]).toBe('turn-1');
-    expect(ds.lastBridgeEmittedUuid).toBe('uuid-1');
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('drops final_output whose worker sessionId does not match the daemon session', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: 'sid-other-worker',
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
   });
 
   it('does not address daemon final-output footers to a known bot owner', async () => {
@@ -326,7 +351,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // Turn reactions are driven off message acceptance (noteTurnReceived) and
     // the idle edge (finishTurnReactions), not the bridge final-output path.
     expect(addReactionMock).not.toHaveBeenCalled();
-    expect(ds.lastBridgeEmittedUuid).toBe('uuid-1');
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
   it('retries on transient failure and commits after success', async () => {
@@ -360,7 +385,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // Attempt 3 (delay 15000)
     await vi.advanceTimersByTimeAsync(15000);
     expect(sessionReply).toHaveBeenCalledTimes(3);
-    expect(ds.lastBridgeEmittedUuid).toBe('uuid-1');
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
   it('gives up after 3 attempts and does NOT commit dedup', async () => {
@@ -404,7 +429,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     // Single attempt, no further retries
     expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(ds.lastBridgeEmittedUuid).toBe('uuid-1');
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
     expect(closeSession).toHaveBeenCalledWith(ds);
   });
 

@@ -145,6 +145,15 @@ export const dashboardRoutes: DashboardRoute[] = [
     },
   },
   {
+    id: 'monitoring',
+    routePrefix: '#/monitoring',
+    rerenderOnUiChange: false,
+    load: async () => {
+      const mod = await import('./monitoring-page.js');
+      return root => mod.renderMonitoringPage(root);
+    },
+  },
+  {
     id: 'sessions',
     routePrefix: '#/sessions',
     // Sessions is a render-once React scaffold around the legacy imperative

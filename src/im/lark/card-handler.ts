@@ -367,7 +367,7 @@ export async function commitRepoSelection(
           { name: selfBot.botName, openId: selfBot.botOpenId },
           locTarget,
           ds.pendingSender,
-          { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
+          { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger: ds.pendingSubstituteTrigger },
         )
       : '';
     const prompt = pendingRawInput ? '' : wrappedPrompt;
@@ -388,6 +388,7 @@ export async function commitRepoSelection(
     ds.pendingPrompt = undefined;
     ds.pendingAttachments = undefined;
     ds.pendingMentions = undefined;
+    ds.pendingSubstituteTrigger = undefined;
     ds.pendingSender = undefined;
     ds.pendingFollowUps = undefined;
     forkWorker(ds, prompt);
@@ -431,6 +432,7 @@ export async function commitRepoSelection(
       () => sessionReply(rootId, closedCard, 'interactive'),
     );
 
+    const oldSession = ds.session;
     const session = sessionStore.createSession(ds.chatId, rootId, dirLabel, ds.chatType);
     ds.session = session;
     ds.lastUserPrompt = undefined;
@@ -443,6 +445,10 @@ export async function commitRepoSelection(
     ds.workingDir = dirPath;
     ds.session.workingDir = dirPath;
     ds.session.larkAppId = ds.larkAppId;
+    ds.session.chatDisplayName = oldSession.chatDisplayName;
+    ds.session.ownerOpenId = oldSession.ownerOpenId;
+    ds.session.creatorOpenId = oldSession.creatorOpenId;
+    ds.session.lastCallerOpenId = oldSession.lastCallerOpenId;
     sessionStore.updateSession(ds.session);
     ds.hasHistory = false;
     // Re-persist the parked card under the NEW sessionId so a daemon crash
@@ -1906,7 +1912,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               { name: selfBot.botName, openId: selfBot.botOpenId },
               locDs,
               ds.pendingSender,
-              { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
+              { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger: ds.pendingSubstituteTrigger },
             )
           : '';
         const prompt = pendingRawInput ? '' : wrappedPrompt;
@@ -1920,6 +1926,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
         ds.pendingMentions = undefined;
+        ds.pendingSubstituteTrigger = undefined;
         ds.pendingSender = undefined;
         ds.pendingFollowUps = undefined;
         forkWorker(ds, prompt);

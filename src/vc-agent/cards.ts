@@ -49,8 +49,10 @@ export interface VcMeetingOutputReviewCardInput {
   nonce: string;
   agentLabel?: string;
   content: string;
+  contentItems?: string[];
   reason?: string;
   fallbackText?: string;
+  fallbackTextItems?: string[];
   textOutputAvailable?: boolean;
   error?: string;
 }
@@ -400,12 +402,28 @@ function outputChannelLabel(channel: VcMeetingOutputChannel): string {
 function outputReviewStatusBody(input: VcMeetingOutputReviewCardInput): { template: string; title: string; body: string } {
   const lines = baseLines({ meeting: input.meeting, status: 'pending', targetOpenId: '', nonce: '' });
   const textOutputUnavailable = input.textOutputAvailable === false;
+  const contentItems = input.contentItems && input.contentItems.length > 1 ? input.contentItems : undefined;
+  const fallbackTextItems = input.fallbackTextItems && input.fallbackTextItems.length > 1 ? input.fallbackTextItems : undefined;
+  const contentLines = contentItems
+    ? [
+        `**内容**：已合并 ${contentItems.length} 条`,
+        ...contentItems.map((item, index) => `${index + 1}. ${escapeMd(item)}`),
+      ]
+    : [`**内容**：${escapeMd(input.content)}`];
+  const fallbackLines = input.fallbackText && !textOutputUnavailable
+    ? fallbackTextItems
+      ? [
+          `**会中弹幕降级文本**：已合并 ${fallbackTextItems.length} 条`,
+          ...fallbackTextItems.map((item, index) => `${index + 1}. ${escapeMd(item)}`),
+        ]
+      : [`**会中弹幕降级文本**：${escapeMd(input.fallbackText)}`]
+    : [];
   const base = [
     `**Agent**：${escapeMd(input.agentLabel || '会议 agent')}`,
     `**类型**：${outputChannelLabel(input.channel)}`,
-    `**内容**：${escapeMd(input.content)}`,
+    ...contentLines,
     ...(input.reason ? [`**理由**：${escapeMd(input.reason)}`] : []),
-    ...(input.fallbackText && !textOutputUnavailable ? [`**会中弹幕降级文本**：${escapeMd(input.fallbackText)}`] : []),
+    ...fallbackLines,
     ...(textOutputUnavailable && input.channel === 'voice' ? ['**会中弹幕降级**：当前不可用，发送 API 尚未接入。'] : []),
     ...(textOutputUnavailable && input.channel === 'text' ? ['**状态**：当前不可执行，会中弹幕发送 API 尚未接入。'] : []),
     '',

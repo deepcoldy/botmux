@@ -100,9 +100,9 @@ botmux suspend --isolated       # 挂起所有隔离 bot 的活跃会话(--dry-r
 |---|---|
 | 全局 CLI 数据 | `~/.claude`、`~/.claude.json`、`~/.codex`（整目录；自己的已重定向到 BOT_HOME） |
 | 系统凭证库 | `~/.ssh ~/.aws ~/.azure ~/.gnupg ~/.netrc ~/.git-credentials ~/.npmrc ~/.pypirc ~/.docker/config.json ~/.kube`、`~/.config/{gh,glab-cli,gcloud,op,1Password}`、`~/.1password ~/.password-store`、`~/Library/Keychains` |
-| botmux 敏感（surgical，`~/.botmux` 整体不 deny） | `bots.json` **及其一切备份**（`bots.json.bak` / `.bak.*` / `.tmp`）、`logs`、`~/.lark-cli`；**整目录 wholesale-deny** `~/.botmux/bots` 和 `~/.lark-cli-bots`；所有 bot 的 `data/sessions-<appId>.json`（**文件名 regex 整类 deny**）；`data/sessions.json`；`data/{frozen-cards,turn-sends,crash-diagnostics,attachments,whiteboards}` |
+| botmux 敏感（surgical，`~/.botmux` 整体不 deny） | `bots.json` **及其一切备份**（`bots.json.bak` / `.bak.*` / `.tmp`）、`logs`、`~/.lark-cli`、`feishu-session.json`（网页登录态，可开新 bot）、`.dashboard-secret`（loopback-HMAC 签名密钥，可给任意会话铸造可写终端 token）、`.dashboard-token`（dashboard bearer）；**整目录 wholesale-deny** `~/.botmux/bots` 和 `~/.lark-cli-bots`；所有 bot 的 `data/sessions-<appId>.json`、`data/identities-<appId>.json`（对话者姓名 PII）、遗留 `data/.send-cred-<appId>`（**文件名 regex 整类 deny**）；`data/sessions.json`；`data/{frozen-cards,turn-sends,crash-diagnostics,attachments,whiteboards,queues,read-isolation}`、`data/schedules.json`。<br>`.dashboard-port`（纯端口号，无凭证价值）留可读——`botmux dashboard`/`term-link` 是 owner 管理命令，隔离 agent 不该签 HMAC，deny secret 对 send/list/status 零影响 |
 
-**保留可读**：自己的 BOT_HOME `~/.botmux/bots/<自己>`、自己的 `~/.lark-cli-bots/<自己>`、自己的 `data/sessions-<自己>.json`（`botmux send` 路由需要）、`~/.botmux` 其余骨架（config/registry/pm2——`botmux send/list/status` 要广读），以及 BOT_HOME 外的代码 / 仓库（agent 照常干活）。
+**保留可读**：自己的 BOT_HOME `~/.botmux/bots/<自己>`、自己的 `~/.lark-cli-bots/<自己>`、自己的 `data/sessions-<自己>.json`（`botmux send` 路由需要）、**自己的附件桶 `data/attachments/<自己appId>/`**（飞书里用户上传的文件按 appId 分桶落盘，spawn 时静态的 Seatbelt 规则才有锚点可开洞；兄弟桶与旧扁平布局仍 deny）、`~/.botmux` 其余骨架（config/registry/pm2——`botmux send/list/status` 要广读），以及 BOT_HOME 外的代码 / 仓库（agent 照常干活）。
 
 > 全部用**整类规则**（整目录 wholesale + 文件名 regex），不枚举任何兄弟 appId——**新增 bot 天然被覆盖，无需冷重启已在跑的隔离 bot**。所有 carve-out 都锚在**不可变的 appId**（不是用户可控的 cwd），防 `/cd` 打洞。
 

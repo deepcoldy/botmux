@@ -39,6 +39,8 @@ describe('vc meeting runtime store', () => {
       syncIntervalMs: 120_000,
       consumerSelectionExpiresAt: 21_000,
       consumerCardMessageId: 'om_card_1',
+      temporaryInstructionOpenIds: ['ou_temp_1', 'ou_temp_1', ' ', 'ou_temp_2'],
+      temporaryInstructionUnionIds: ['on_temp_1', 'on_temp_1', ' ', 'on_temp_2'],
     }, 1_000);
 
     expect(listVcMeetingRuntimeSessions(dir, 'cli_a', 1_500)).toEqual([{
@@ -52,6 +54,8 @@ describe('vc meeting runtime store', () => {
       syncIntervalMs: 120_000,
       consumerSelectionExpiresAt: 21_000,
       consumerCardMessageId: 'om_card_1',
+      temporaryInstructionOpenIds: ['ou_temp_1', 'ou_temp_2'],
+      temporaryInstructionUnionIds: ['on_temp_1', 'on_temp_2'],
       createdAt: 1_000,
       updatedAt: 1_000,
       expiresAt: 86_401_000,

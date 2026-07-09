@@ -16,6 +16,24 @@ import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
+import { VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
+
+/**
+ * All non-VC events that botmux dispatcher consumes. Must be included in every
+ * event subscription update — the internal `/event/update` endpoint is
+ * replacement-style, so omitting any of these would silently disable the
+ * corresponding botmux capability (receiving messages, card actions, being
+ * added to groups, doc comments, message reactions).
+ */
+export const BOT_BASELINE_EVENTS = [
+  'im.message.receive_v1',
+  'card.action.trigger',
+  'im.chat.member.bot.added_v1',
+  'drive.file.comment_add_v1',
+  'drive.notice.comment_add_v1',
+  'im.message.reaction.created_v1',
+  'im.message.reaction.deleted_v1',
+] as const;
 
 export const BOTMUX_REDIRECT_URL = 'http://127.0.0.1:9768/callback';
 const FEISHU_ACCOUNTS_ORIGIN = 'https://accounts.feishu.cn';
@@ -70,6 +88,8 @@ export type OpenPlatformAutomationResult =
       scopeCount: number;
       skippedScopeCount: number;
       scopeWarning?: string;
+      subscribedEventCount: number;
+      eventWarning?: string;
       versionId?: string;
     }
   | {
@@ -87,6 +107,10 @@ export type OpenPlatformAutomationResult =
         | 'api_error';
       message: string;
       sessionFile?: string;
+      /** Number of events successfully subscribed (0 when event update failed before downstream error). */
+      subscribedEventCount?: number;
+      /** Warning from event subscription attempt, if any. */
+      eventWarning?: string;
     };
 
 export interface OpenPlatformAutomationOptions {
@@ -260,6 +284,15 @@ export function buildSafeSettingPayload(appId: string) {
   return {
     clientId: appId,
     redirectURL: [BOTMUX_REDIRECT_URL],
+  };
+}
+
+/** Build payload for subscribing events via the developer console internal API. */
+export function buildEventSubscriptionPayload(appId: string, events: string[]) {
+  return {
+    clientId: appId,
+    eventNames: events,
+    isDeveloperPanel: true,
   };
 }
 
@@ -486,6 +519,49 @@ export async function automateOpenPlatformSetup(
     }
   }
 
+  // Best-effort auto-subscribe VC meeting bot events. Non-fatal: if the endpoint
+  // doesn't exist or fails, the user can still add them manually in the console.
+  // We try multiple known internal API patterns since the console frontend
+  // endpoint varies by tenant/version.
+  // IMPORTANT: Always include BOT_BASELINE_EVENTS alongside VC events — the
+  // internal update endpoint is replacement-style, so sending only VC events
+  // would wipe im.message.receive_v1 / card.action.trigger and break messaging.
+  const allEvents = [...BOT_BASELINE_EVENTS, ...VC_MEETING_BOT_EVENTS];
+  let subscribedEventCount = 0;
+  let eventWarning: string | undefined;
+  const eventEndpoints = [
+    {
+      path: `/developers/v1/event/update/${options.appId}`,
+      body: buildEventSubscriptionPayload(options.appId, allEvents),
+    },
+    {
+      path: `/developers/v1/event/update/${options.appId}`,
+      body: {
+        clientId: options.appId,
+        eventNameList: allEvents,
+        isDeveloperPanel: true,
+      },
+    },
+    {
+      path: `/developers/v1/event_callback/update/${options.appId}`,
+      body: {
+        clientId: options.appId,
+        eventNames: allEvents,
+        isDeveloperPanel: true,
+      },
+    },
+  ];
+  for (const attempt of eventEndpoints) {
+    try {
+      await postJson(attempt.path, attempt.body);
+      subscribedEventCount = allEvents.length;
+      eventWarning = undefined;
+      break;
+    } catch (err: any) {
+      eventWarning = safeErrorMessage(err);
+    }
+  }
+
   try {
     await postJson(`/developers/v1/safe_setting/update/${options.appId}`, buildSafeSettingPayload(options.appId));
     const contactRange = await postJson(`/developers/v1/contact_range/${options.appId}`, {});
@@ -505,10 +581,19 @@ export async function automateOpenPlatformSetup(
       scopeCount: importedScopeCount,
       skippedScopeCount,
       scopeWarning,
+      subscribedEventCount,
+      eventWarning,
       versionId,
     };
   } catch (err: any) {
-    return { ok: false, reason: 'api_error', message: `开放平台自动配置失败: ${safeErrorMessage(err)}`, sessionFile };
+    return {
+      ok: false,
+      reason: 'api_error',
+      message: `开放平台自动配置失败: ${safeErrorMessage(err)}`,
+      sessionFile,
+      subscribedEventCount,
+      eventWarning,
+    };
   }
 }
 

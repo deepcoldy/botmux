@@ -5,10 +5,12 @@ import {
   normalizeSessionsViewMode,
   readStoredBoardOrder,
   readStoredKanbanGroupBy,
+  readStoredSessionsShowUnknownChats,
   readStoredSessionsViewMode,
   type SessionsViewMode,
   writeStoredBoardOrder,
   writeStoredKanbanGroupBy,
+  writeStoredSessionsShowUnknownChats,
   writeStoredSessionsViewMode,
 } from './preferences.js';
 import {
@@ -137,6 +139,36 @@ function repoBasename(workingDir: unknown): string {
   return parts.at(-1) ?? value;
 }
 
+function sessionChatKindLabel(s: any): string {
+  return s?.chatType === 'p2p' ? t('sessions.directChat') : t('sessions.groupChat');
+}
+
+export function sessionLocationText(s: any): string {
+  const chatId = String(s?.chatId ?? '').trim();
+  const name = chatDisplayTitle(s);
+  if (name) return `${sessionChatKindLabel(s)} · ${name}`;
+  if (chatId) return `${sessionChatKindLabel(s)} · ${chatId}`;
+  return t('sessions.chatUnknown');
+}
+
+export function isUnknownChatSession(
+  s: any,
+  resolveTitle: (session: any) => string | null = chatDisplayTitle,
+): boolean {
+  const chatId = String(s?.chatId ?? '').trim();
+  return !!chatId && !resolveTitle(s);
+}
+
+function sessionLocationTitle(s: any): string {
+  const label = sessionLocationText(s);
+  const chatId = String(s?.chatId ?? '').trim();
+  return chatId && !label.includes(chatId) ? `${label} · ${chatId}` : label;
+}
+
+function sessionSearchText(s: any): string {
+  return `${JSON.stringify(s)} ${sessionLocationText(s)} ${sessionLocationTitle(s)}`.toLowerCase();
+}
+
 export const terminalHref = sessionTerminalHref;
 
 // Cohesive icon set for the session-card action bar — stroke-based (CSS sets
@@ -259,6 +291,9 @@ export function canRestartSession(s: any): boolean {
 }
 
 function pageHtml(): string {
+  const showUnknownChatsChecked = readStoredSessionsShowUnknownChats(
+    typeof window === 'undefined' ? undefined : window.localStorage,
+  ) ? ' checked' : '';
   return `<section class="page">
     <div class="page-heading">
       <div>
@@ -293,7 +328,11 @@ function pageHtml(): string {
         <option value="yes">${t('sessions.adoptYes')}</option>
         <option value="no">${t('sessions.adoptNo')}</option>
       </select>
+      <select name="chat" aria-label="${t('sessions.location')}">
+        <option value="">${t('sessions.chatAny')}</option>
+      </select>
       ${renderCliFilterGroup()}
+      <label class="filter-toggle"><input type="checkbox" name="showUnknownChats"${showUnknownChatsChecked}> <span>${t('sessions.showUnknownChats')}</span></label>
       <label class="filter-toggle"><input type="checkbox" name="active" checked> <span>${t('sessions.activeOnly')}</span></label>
     </form>
     <div id="idle-cleanup-bar" class="idle-cleanup-bar">
@@ -324,6 +363,7 @@ function pageHtml(): string {
         ${th('botName', t('sessions.bot'))}
         ${th('cliId', t('sessions.cli'))}
         ${th('status', t('sessions.status'))}
+        ${th('chat', t('sessions.location'))}
         ${th('tokenIn', t('sessions.tokenIn'))}
         ${th('tokenOut', t('sessions.tokenOut'))}
         ${th('title', t('sessions.titleCol'))}
@@ -528,6 +568,8 @@ export function renderSessionsPage(root: HTMLElement): () => void {
 export function wireSessionsPage(root: HTMLElement): () => void {
   const tbody = root.querySelector<HTMLElement>('#sessions-table tbody')!;
   const filtersForm = root.querySelector<HTMLFormElement>('#filters')!;
+  const chatSelect = root.querySelector<HTMLSelectElement>('select[name="chat"]')!;
+  const showUnknownChatsInput = root.querySelector<HTMLInputElement>('input[name="showUnknownChats"]');
   const drawer = root.querySelector<HTMLDialogElement>('#drawer')!;
   const selectAllBox = root.querySelector<HTMLInputElement>('#select-all')!;
   const bulkBar = root.querySelector<HTMLElement>('#bulk-bar')!;
@@ -566,6 +608,7 @@ export function wireSessionsPage(root: HTMLElement): () => void {
   let lastBoardHtml = '';
   let lastTableHtml = '';
   let lastKanbanHtml = '';
+  let lastChatFilterHtml = '';
   let boardAnimated = false;
   // 看板交互态：拖拽中的卡片 id / 标题就地编辑中 —— 两者期间都跳过看板重绘，
   // 否则 SSE 触发的 innerHTML 重建会把拖拽源/输入框拍没。
@@ -601,6 +644,10 @@ export function wireSessionsPage(root: HTMLElement): () => void {
   })();
   let idleCleanupBusy = false;
   let idleCleanupHours: IdleCleanupHours = 24;
+
+  if (showUnknownChatsInput) {
+    showUnknownChatsInput.checked = readStoredSessionsShowUnknownChats(window.localStorage);
+  }
 
   function selectedIdleCleanupHours(): IdleCleanupHours {
     return idleCleanupHours;
@@ -865,11 +912,13 @@ export function wireSessionsPage(root: HTMLElement): () => void {
   function rowHtml(s: any): string {
     const closed = s.status === 'closed';
     const checked = selected.has(s.sessionId) ? 'checked' : '';
+    const location = sessionLocationText(s);
     return `<tr data-id="${escapeHtml(s.sessionId)}">
       <td><input type="checkbox" class="row-select" ${checked} ${closed ? 'disabled' : ''}></td>
       <td>${escapeHtml(botDisplayName(s))}</td>
       <td><span class="badge cli-${cssToken(s.cliId)}">${escapeHtml(s.cliId ?? 'unknown')}</span></td>
       <td>${statusBadgeHtml(s.status)}${lockChipHtml(s)}</td>
+      <td class="session-location-cell" title="${escapeHtml(sessionLocationTitle(s))}">${escapeHtml(location)}</td>
       <td class="token-cell">${formatTokenCount(s.tokenUsage?.in)}</td>
       <td class="token-cell">${formatTokenCount(s.tokenUsage?.out)}</td>
       <td title="${escapeHtml(String(s.title ?? ''))}">${escapeHtml(stripMentionPrefix(s.title ?? '').slice(0, 48))}</td>
@@ -1486,16 +1535,20 @@ export function wireSessionsPage(root: HTMLElement): () => void {
     const cliFilterActive = cli.length > 0 && cli.length < CLI_FILTER_OPTIONS.length;
     const status = f.get('status') as string;
     const adopt = f.get('adopt') as string;
+    const chat = f.get('chat') as string;
     const active = !!f.get('active');
+    const showUnknownChats = !!f.get('showUnknownChats');
     // 看板视图的「已完成」列收纳已关闭会话——「仅活跃」开关不再把它们整体
     // 滤掉，否则该列永远是空的。
     const keepClosed = viewMode === 'kanban';
     const rows = [...store.sessions.values()]
       .filter(s => !cliFilterActive || cli.includes(s.cliId ?? 'unknown'))
+      .filter(s => showUnknownChats || !isUnknownChatSession(s))
       .filter(s => !status || s.status === status)
       .filter(s => !adopt || (adopt === 'yes') === !!s.adopt)
+      .filter(s => !chat || String(s.chatId ?? '') === chat)
       .filter(s => !active || keepClosed || s.status !== 'closed')
-      .filter(s => !q || JSON.stringify(s).toLowerCase().includes(q));
+      .filter(s => !q || sessionSearchText(s).includes(q));
     rows.sort(compareRows);
     return rows;
   }
@@ -1505,6 +1558,7 @@ export function wireSessionsPage(root: HTMLElement): () => void {
     if (key === 'tokenIn') return tokenCount(s.tokenUsage?.in) ?? -1;
     if (key === 'tokenOut') return tokenCount(s.tokenUsage?.out) ?? -1;
     if (key === 'adopt') return !!s.adopt;
+    if (key === 'chat') return sessionLocationText(s).toLowerCase();
     return String(s[key] ?? '').toLowerCase();
   }
 
@@ -1588,7 +1642,31 @@ export function wireSessionsPage(root: HTMLElement): () => void {
     countEl.classList.toggle('cli-filter-active', checked !== boxes.length);
   }
 
+  function syncChatFilterOptions(): void {
+    const prev = chatSelect.value;
+    const showUnknownChats = !!filtersForm.querySelector<HTMLInputElement>('input[name="showUnknownChats"]')?.checked;
+    const options = new Map<string, string>();
+    for (const row of store.sessions.values()) {
+      const chatId = String(row.chatId ?? '').trim();
+      if (!chatId) continue;
+      if (!showUnknownChats && isUnknownChatSession(row)) continue;
+      const label = sessionLocationText(row);
+      const existing = options.get(chatId);
+      if (!existing || label < existing) options.set(chatId, label);
+    }
+    const rows = [...options.entries()].sort((a, b) => a[1].localeCompare(b[1]));
+    const html = `<option value="">${escapeHtml(t('sessions.chatAny'))}</option>${rows.map(([chatId, label]) =>
+      `<option value="${escapeHtml(chatId)}">${escapeHtml(label)}</option>`
+    ).join('')}`;
+    if (html !== lastChatFilterHtml) {
+      chatSelect.innerHTML = html;
+      lastChatFilterHtml = html;
+    }
+    chatSelect.value = prev && options.has(prev) ? prev : '';
+  }
+
   function rerender(): void {
+    syncChatFilterOptions();
     const rows = filtered();
     for (const sid of [...selected]) {
       const s = store.sessions.get(sid);
@@ -1602,7 +1680,7 @@ export function wireSessionsPage(root: HTMLElement): () => void {
     if (viewMode === 'table') {
       const tableHtml = rows.length
         ? rows.map(rowHtml).join('')
-        : `<tr><td colspan="12" class="empty">${t('sessions.empty')}</td></tr>`;
+        : `<tr><td colspan="13" class="empty">${t('sessions.empty')}</td></tr>`;
       if (tableHtml !== lastTableHtml) {
         lastTableHtml = tableHtml;
         tbody.innerHTML = tableHtml;
@@ -1818,7 +1896,7 @@ export function wireSessionsPage(root: HTMLElement): () => void {
         <p><code>${escapeHtml(s.sessionId)}</code> <button data-copy="${escapeHtml(s.sessionId)}">${t('sessions.copy')}</button></p>
       </header>
       <p><b>${t('sessions.bot')}:</b> ${escapeHtml(botDisplayName(s))} · <b>${t('sessions.cli')}:</b> ${escapeHtml(s.cliId ?? '?')}</p>
-      ${chatDisplayTitle(s) ? `<p><b>${t('sessions.chat')}:</b> ${escapeHtml(chatDisplayTitle(s)!)}</p>` : ''}
+      <p><b>${t('sessions.location')}:</b> ${escapeHtml(sessionLocationText(s))}</p>
       <p><b>chatId:</b> <code>${escapeHtml(s.chatId ?? '')}</code> <button data-copy="${escapeHtml(s.chatId ?? '')}">${t('sessions.copy')}</button></p>
       <p><b>rootMessageId:</b> <code>${escapeHtml(s.rootMessageId ?? '')}</code> <button data-copy="${escapeHtml(s.rootMessageId ?? '')}">${t('sessions.copy')}</button></p>
       ${s.threadId ? `<p><b>threadId:</b> <code>${escapeHtml(s.threadId)}</code></p>` : ''}
@@ -2496,6 +2574,13 @@ export function wireSessionsPage(root: HTMLElement): () => void {
   });
 
   filtersForm.addEventListener('input', rerender);
+  filtersForm.addEventListener('change', event => {
+    const target = event.target as HTMLInputElement | null;
+    if (target?.name === 'showUnknownChats') {
+      writeStoredSessionsShowUnknownChats(window.localStorage, target.checked);
+      rerender();
+    }
+  });
   const unsubscribeStore = store.on(rerender);
   // 团队看板 30s 软刷新（拉对方部署的会话快照与共享编排）；页面切走后
   // kanban 脱离 DOM，定时器自清。

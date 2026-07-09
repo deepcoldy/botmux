@@ -126,6 +126,58 @@ describe('vc-agent normalizer and state', () => {
     });
   });
 
+  it('normalizes push activity payloads with nested speaker id objects', () => {
+    const batch = normalizeVcMeetingEvents({
+      header: {
+        event_id: 'evt_push_nested_id',
+        event_type: 'vc.bot.meeting_activity_v1',
+      },
+      event: {
+        meeting_activity_items: [
+          {
+            activity_event_type: 'transcript_received',
+            meeting: {
+              id: 'm_push_nested_id',
+              meeting_no: '455282654',
+              host_user: {
+                id: { open_id: 'ou_host_nested', union_id: 'on_host_nested', user_id: 'host_uid' },
+                user_name: 'Host',
+              },
+            },
+            transcript_received_items: [
+              {
+                sentence_id: 'sent_nested_id',
+                speaker: {
+                  id: { open_id: 'ou_speaker_nested', union_id: 'on_speaker_nested', user_id: 'speaker_uid' },
+                  user_name: 'Speaker',
+                  user_type: 1,
+                },
+                start_time_ms: '1783573991399',
+                end_time_ms: '1783573992719',
+                language: 'zh_cn',
+                text: 'nested id transcript',
+              },
+            ],
+          },
+        ],
+      },
+    }, { meetingId: 'm_push_nested_id', source: 'push' });
+
+    expect(batch.meeting).toMatchObject({
+      id: 'm_push_nested_id',
+      meetingNo: '455282654',
+      hostOpenId: 'ou_host_nested',
+      hostName: 'Host',
+    });
+    expect(batch.items).toHaveLength(1);
+    expect(batch.items[0]).toMatchObject({
+      type: 'transcript_received',
+      itemKey: 'transcript:sent_nested_id',
+      speaker: { openId: 'ou_speaker_nested', unionId: 'on_speaker_nested', name: 'Speaker', userType: 1 },
+      text: 'nested id transcript',
+    });
+  });
+
   it('normalizes chat message fields nested under message with wrapper operator actor', () => {
     const batch = normalizeVcMeetingEvents({
       event: {

@@ -51,9 +51,9 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
   restoreUsageLimitRuntimeState: vi.fn(),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => { map.set(k, ds); }),
+  getActiveSessionsRegistry: vi.fn(() => null),
   isRelayableRealSession: vi.fn(() => false),
   closeSession: vi.fn(),
-  getActiveSessionsRegistry: vi.fn(() => null),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -80,7 +80,7 @@ vi.mock('../src/core/dashboard-rows.js', () => ({
 }));
 vi.mock('../src/core/role-resolver.js', () => ({
   resolveRole: vi.fn(() => ({ content: null, source: undefined })),
-  resolveRoleInjection: vi.fn(() => ({ content: null, source: undefined })),
+  resolveRoleInjection: vi.fn(() => ({ content: null, source: undefined, injectMode: 'none' })),
 }));
 vi.mock('../src/services/whiteboard-store.js', () => ({
   whiteboardEnabled: vi.fn(() => false),

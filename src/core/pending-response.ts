@@ -6,4 +6,5 @@
 // keeps the marker visually unchanged on turn-end — handy for CLIs whose idle
 // detection can fire early (e.g. Pi), where a premature ✅ would mislead.
 export const RECEIVED_REACTION_EMOJI_TYPE = 'GoGoGo';
+export const SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE = 'Get';
 export const DONE_REACTION_EMOJI_TYPE = 'DONE';

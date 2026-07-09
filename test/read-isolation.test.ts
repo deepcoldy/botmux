@@ -64,6 +64,18 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(d).toContain('/Users/bot/.botmux/data/sessions.json'); // legacy shared store
     expect(d).toContain('/Users/bot/.botmux/data/frozen-cards');
     expect(d).toContain('/Users/bot/.botmux/data/turn-sends');
+    expect(d).toContain('/Users/bot/.botmux/data/queues');        // all bots' inbound message content
+    expect(d).toContain('/Users/bot/.botmux/data/read-isolation'); // profiles enumerate sibling sessions
+    // schedules.json is a read-modify-write store — denying the read makes a
+    // sandboxed `botmux schedule` load an empty map then overwrite the shared
+    // file, wiping every bot's tasks. Deliberately NOT denied (accept the minor
+    // leak of others' scheduled prompts) until schedule-store fail-closes. PR #387.
+    expect(d).not.toContain('/Users/bot/.botmux/data/schedules.json');
+    expect(d).toContain('/Users/bot/.botmux/feishu-session.json'); // Feishu web login session (can mint bots)
+    expect(d).toContain('/Users/bot/.botmux/.dashboard-secret');   // loopback-HMAC signing key (mints write tokens)
+    expect(d).toContain('/Users/bot/.botmux/.dashboard-token');    // dashboard admin bearer token
+    // `.dashboard-port` is a bare port number (no credential value) — must stay readable
+    expect(d).not.toContain('/Users/bot/.botmux/.dashboard-port');
     // NO per-sibling enumeration anywhere: sibling session stores are covered by the
     // filename-pattern regex (buildV2DenyRegexes), not per-appId path entries.
     expect(d.some((p) => p.includes('cli_other'))).toBe(false);
@@ -108,6 +120,41 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(buildV2DenyPaths(v2())).toContain('/Users/bot/.botmux/bots.json');
   });
 
+  it('own attachments bucket re-allowed under the wholesale attachments/ deny (Feishu uploads)', () => {
+    // The agent must read files the user uploads in chat. attachments/ is keyed
+    // per-appId (getAttachmentsDir) precisely because the Seatbelt profile is
+    // static at spawn time — only a spawn-time-known key (the appId) can anchor
+    // the carve-out. Siblings' buckets and the legacy flat attachments/<messageId>
+    // layout stay under the wholesale deny.
+    const d = buildV2DenyPaths(v2());
+    expect(d).toContain('/Users/bot/.botmux/data/attachments');
+    const carve = buildV2CarveOuts(v2());
+    expect(carve.allowPaths).toContain('/Users/bot/.botmux/data/attachments/cli_self');
+    // traverse shim so Read/realpath can stat through the denied parent without listing it
+    expect(carve.traverseDirs).toContain('/Users/bot/.botmux/data/attachments');
+  });
+
+  it('denies LEGACY data-root send-cred files by pattern (pre-BOT_HOME leftovers)', () => {
+    // Older builds wrote `<sd>/.send-cred-<appId>` at the data root; current builds
+    // write inside BOT_HOME. The leftovers still hold live send credentials and the
+    // data root is readable by design — so the legacy filename class must be denied.
+    const re = new RegExp(buildV2DenyRegexes(v2()).find(r => r.includes('send-cred'))!);
+    expect(re.test('/Users/bot/.botmux/data/.send-cred-cli_other1')).toBe(true);
+    expect(re.test('/Users/bot/.botmux/data/.send-cred-cli_self')).toBe(true); // own legacy too — CLI reads BOT_HOME copy
+    expect(re.test('/Users/bot/.botmux/data/send-cred.json')).toBe(false);
+  });
+
+  it('denies every identities-<appId>.json (interlocutor PII cache) — no own carve-out', () => {
+    // open_id→display-name caches are daemon-side prompt-injection data; the CLI
+    // never reads them, so unlike sessions-<appId>.json the OWN file gets no allow.
+    const re = new RegExp(buildV2DenyRegexes(v2()).find(r => r.includes('identities'))!);
+    expect(re.test('/Users/bot/.botmux/data/identities-cli_other1.json')).toBe(true);
+    expect(re.test('/Users/bot/.botmux/data/identities-cli_self.json')).toBe(true);
+    expect(re.test('/Users/bot/.botmux/data/sub/identities-x.json')).toBe(false); // same dir only
+    const carve = buildV2CarveOuts(v2());
+    expect(carve.allowPaths.some(p => p.includes('identities-'))).toBe(false);
+  });
+
   it('send-cred lives inside BOT_HOME (unified per-bot private storage)', () => {
     // The botmux-send credential is stored in the bot's BOT_HOME, the SAME private
     // storage as its CLI data — one deny mechanism protects both (and any future
@@ -142,9 +189,14 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
       '/Users/bot/.botmux/bots/cli_self',
       '/Users/bot/.lark-cli-bots/cli_self',
       '/Users/bot/.botmux/data/sessions-cli_self.json',
+      '/Users/bot/.botmux/data/attachments/cli_self',
     ]);
     // traverse shim on each wholesale-denied parent (stat/realpath, not listing)
-    expect(carve.traverseDirs).toEqual(['/Users/bot/.botmux/bots', '/Users/bot/.lark-cli-bots']);
+    expect(carve.traverseDirs).toEqual([
+      '/Users/bot/.botmux/bots',
+      '/Users/bot/.lark-cli-bots',
+      '/Users/bot/.botmux/data/attachments',
+    ]);
     expect(carve.finalDenyPaths).toEqual([]);
     // an admin deny UNDER the own BOT_HOME must WIN over the carve-out → goes to finalDeny
     const extra = '/Users/bot/.botmux/bots/cli_self/claude/.credentials.json';
