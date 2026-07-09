@@ -9,9 +9,10 @@
  */
 import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
-import { join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
-import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { dirname, join } from 'node:path';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, readRelayRequestFile, startOutboxWatcher, prepareSandbox, attachSandboxOutbox, resolveSandboxMountPath, sandboxedClaudeDataDir, sandboxVartmpRoot, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
 
@@ -176,15 +177,37 @@ describe('sandboxedClaudeDataDir (symlink HOME redirect)', () => {
     symlinkSync(realHome, linkHome);
     const prevHome = process.env.HOME;
     process.env.HOME = linkHome; // os.homedir() reads $HOME per call on Linux
+    const sid = 'sid-x-' + Math.random().toString(36).slice(2);
     try {
+      rmSync(join('/var/tmp/botmux-sbx', sid), { recursive: true, force: true });
+      rmSync(join(sandboxVartmpRoot(), sid), { recursive: true, force: true });
       const symlinkForm = join(linkHome, '.claude');
       const canonicalForm = join(realpathSync(linkHome), '.claude');
-      const expected = join('/var/tmp/botmux-sbx', 'sid-x', 'home-upper', '.claude');
-      expect(sandboxedClaudeDataDir('sid-x', symlinkForm)).toBe(expected);
-      expect(sandboxedClaudeDataDir('sid-x', canonicalForm)).toBe(expected);
+      const expected = join(sandboxVartmpRoot(), sid, 'home-upper', '.claude');
+      expect(sandboxedClaudeDataDir(sid, symlinkForm)).toBe(expected);
+      expect(sandboxedClaudeDataDir(sid, canonicalForm)).toBe(expected);
     } finally {
       if (prevHome !== undefined) process.env.HOME = prevHome;
+      rmSync(join('/var/tmp/botmux-sbx', sid), { recursive: true, force: true });
+      rmSync(join(sandboxVartmpRoot(), sid), { recursive: true, force: true });
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux')('falls back to legacy /var/tmp home-upper for upgraded persistent sessions', () => {
+    const sid = 'legacy-home-upper-' + Math.random().toString(36).slice(2);
+    const legacyHomeUpper = join('/var/tmp/botmux-sbx', sid, 'home-upper');
+    const nextHomeUpper = join(sandboxVartmpRoot(), sid, 'home-upper');
+    const dataDir = join(homedir(), '.claude');
+    try {
+      rmSync(join('/var/tmp/botmux-sbx', sid), { recursive: true, force: true });
+      rmSync(join(sandboxVartmpRoot(), sid), { recursive: true, force: true });
+      mkdirSync(legacyHomeUpper, { recursive: true });
+      expect(existsSync(nextHomeUpper)).toBe(false);
+      expect(sandboxedClaudeDataDir(sid, dataDir)).toBe(join(legacyHomeUpper, '.claude'));
+    } finally {
+      rmSync(join('/var/tmp/botmux-sbx', sid), { recursive: true, force: true });
+      rmSync(join(sandboxVartmpRoot(), sid), { recursive: true, force: true });
     }
   });
 });
@@ -354,6 +377,82 @@ describe('materializeOutboxFile (TOCTOU)', () => {
   });
 });
 
+describe('readRelayRequestFile (TOCTOU)', () => {
+  it('reads a small regular request file', () => {
+    const outbox = tmp();
+    const req = join(outbox, 'x.req.json');
+    writeFileSync(req, JSON.stringify({ contentFile: 'c.content', flags: [] }));
+    try {
+      expect(readRelayRequestFile(req)).toContain('c.content');
+    } finally {
+      rmSync(outbox, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a symlink request file', () => {
+    const outbox = tmp(); const secretDir = tmp();
+    const secret = join(secretDir, 'secret.req.json');
+    writeFileSync(secret, JSON.stringify({ contentFile: 'secret.content' }));
+    symlinkSync(secret, join(outbox, 'x.req.json'));
+    try {
+      expect(readRelayRequestFile(join(outbox, 'x.req.json'))).toBeNull();
+    } finally {
+      rmSync(outbox, { recursive: true, force: true });
+      rmSync(secretDir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux')('refuses a FIFO request file without blocking', () => {
+    const outbox = tmp();
+    const fifo = join(outbox, 'x.req.json');
+    spawnSync('mkfifo', [fifo]);
+    const start = Date.now();
+    try {
+      expect(readRelayRequestFile(fifo)).toBeNull();
+      expect(Date.now() - start).toBeLessThan(2000);
+    } finally {
+      rmSync(outbox, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an oversized request file', () => {
+    const outbox = tmp();
+    const req = join(outbox, 'x.req.json');
+    writeFileSync(req, 'x'.repeat(64 * 1024 + 1));
+    try {
+      expect(readRelayRequestFile(req)).toBeNull();
+    } finally {
+      rmSync(outbox, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('startOutboxWatcher request hardening', () => {
+  it.skipIf(process.platform !== 'linux')('rejects a FIFO .req.json without blocking the worker tick', async () => {
+    const root = tmp();
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox, { recursive: true });
+    const req = join(outbox, 'bad.req.json');
+    spawnSync('mkfifo', [req]);
+
+    const stop = startOutboxWatcher(outbox, process.env, 'sid-hardening');
+    try {
+      const deadline = Date.now() + 3000;
+      let res: string | null = null;
+      while (Date.now() < deadline) {
+        const p = join(outbox, 'bad.res.json');
+        if (existsSync(p)) { res = readFileSync(p, 'utf8'); break; }
+        await new Promise(r => setTimeout(r, 50));
+      }
+      expect(res).not.toBeNull();
+      expect(JSON.parse(res!).stderr).toContain('relay rejected: request not a regular file or too large');
+    } finally {
+      stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 // ── prepareSandbox: the per-bot toggle must actually engage bwrap ────────────
 describe('prepareSandbox enabled gate', () => {
   it('returns null when not enabled (regardless of env)', () => {
@@ -362,6 +461,137 @@ describe('prepareSandbox enabled gate', () => {
       dataDir: tmp(), cliBin: '/bin/true', cliArgs: [],
     });
     expect(r).toBeNull();
+  });
+});
+
+describe.skipIf(process.platform !== 'linux')('sandbox outbox layout', () => {
+  it('uses a per-uid /var/tmp root so users do not contend for one global 0700 dir', () => {
+    const uid = process.getuid?.() ?? 0;
+    expect(sandboxVartmpRoot()).toBe(`/var/tmp/botmux-sbx-${uid}`);
+  });
+
+  it('reattaches to the new /var/tmp outbox outside dataDir', () => {
+    const dataDir = tmp();
+    const sid = 'outbox-new-' + Math.random().toString(36).slice(2);
+    const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sid);
+    const projUpper = join(sessionRoot, 'proj-upper');
+    const newOutbox = join(sandboxVartmpRoot(), sid, 'outbox');
+    mkdirSync(projUpper, { recursive: true });
+    mkdirSync(newOutbox, { recursive: true });
+
+    const r = attachSandboxOutbox({ sessionId: sid, dataDir });
+    try {
+      expect(r).not.toBeNull();
+      expect(r!.outbox).toBe(newOutbox);
+      expect(r!.outbox.startsWith(sessionRoot)).toBe(false);
+      expect(r!.workDir).toBe(projUpper);
+      expect(statSync(sandboxVartmpRoot()).mode & 0o077).toBe(0);
+      expect(statSync(join(sandboxVartmpRoot(), sid)).mode & 0o077).toBe(0);
+      expect(statSync(newOutbox).mode & 0o077).toBe(0);
+    } finally {
+      r?.cleanup();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to legacy dataDir outbox for already-running sessions', () => {
+    const dataDir = tmp();
+    const sid = 'outbox-legacy-' + Math.random().toString(36).slice(2);
+    const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sid);
+    const projUpper = join(sessionRoot, 'proj-upper');
+    const legacyOutbox = join(sessionRoot, 'outbox');
+    mkdirSync(projUpper, { recursive: true });
+    mkdirSync(legacyOutbox, { recursive: true });
+
+    const r = attachSandboxOutbox({ sessionId: sid, dataDir });
+    try {
+      expect(r).not.toBeNull();
+      expect(r!.outbox).toBe(legacyOutbox);
+      expect(r!.workDir).toBe(projUpper);
+      expect(statSync(legacyOutbox).mode & 0o077).toBe(0);
+    } finally {
+      r?.cleanup();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to legacy /var/tmp outbox for upgraded persistent sessions', () => {
+    const dataDir = tmp();
+    const sid = 'outbox-legacy-vartmp-' + Math.random().toString(36).slice(2);
+    const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sid);
+    const projUpper = join(sessionRoot, 'proj-upper');
+    const legacyVartmp = join('/var/tmp/botmux-sbx', sid);
+    const legacyOutbox = join(legacyVartmp, 'outbox');
+    const nextVartmp = join(sandboxVartmpRoot(), sid);
+    mkdirSync(projUpper, { recursive: true });
+    rmSync(legacyVartmp, { recursive: true, force: true });
+    rmSync(nextVartmp, { recursive: true, force: true });
+    mkdirSync(legacyOutbox, { recursive: true });
+
+    const r = attachSandboxOutbox({ sessionId: sid, dataDir });
+    try {
+      expect(r).not.toBeNull();
+      expect(r!.outbox).toBe(legacyOutbox);
+      expect(r!.workDir).toBe(projUpper);
+      expect(statSync(legacyVartmp).mode & 0o077).toBe(0);
+      expect(statSync(legacyOutbox).mode & 0o077).toBe(0);
+    } finally {
+      r?.cleanup();
+      expect(existsSync(legacyVartmp)).toBe(false);
+      expect(existsSync(nextVartmp)).toBe(false);
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an outbox symlink on the shared /var/tmp surface', () => {
+    const dataDir = tmp();
+    const sid = 'outbox-symlink-' + Math.random().toString(36).slice(2);
+    const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sid);
+    const projUpper = join(sessionRoot, 'proj-upper');
+    const legacyVartmp = join('/var/tmp/botmux-sbx', sid);
+    const legacyOutbox = join(legacyVartmp, 'outbox');
+    const target = join(tmp(), 'attacker-outbox');
+    mkdirSync(projUpper, { recursive: true });
+    rmSync(legacyVartmp, { recursive: true, force: true });
+    mkdirSync(legacyVartmp, { recursive: true });
+    mkdirSync(target, { recursive: true });
+    symlinkSync(target, legacyOutbox);
+
+    try {
+      expect(attachSandboxOutbox({ sessionId: sid, dataDir })).toBeNull();
+    } finally {
+      rmSync(legacyVartmp, { recursive: true, force: true });
+      rmSync(dirname(target), { recursive: true, force: true });
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('prepareSandbox exposes BOTMUX_SEND_RELAY from /var/tmp when mounts are available', () => {
+    const src = tmp();
+    writeFileSync(join(src, 'file.txt'), 'x');
+    const dataDir = tmp();
+    const sid = 'outbox-prepare-' + Math.random().toString(36).slice(2);
+    let r: ReturnType<typeof prepareSandbox> = null;
+    try {
+      r = prepareSandbox({
+        enabled: true, cliId: 'codex', sessionId: sid, sourceWorkingDir: src,
+        dataDir, cliBin: '/bin/true', cliArgs: [],
+      });
+      if (r === null) return; // overlay mount unavailable in this env — skip assertions
+      const expected = join(sandboxVartmpRoot(), sid, 'outbox');
+      const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sid);
+      expect(r.outbox).toBe(expected);
+      expect(r.env.BOTMUX_SEND_RELAY).toBe(expected);
+      expect(r.outbox.startsWith(sessionRoot)).toBe(false);
+      expect(r.args.some((x, i) => x === '--bind' && r!.args[i + 1] === expected && r!.args[i + 2] === expected)).toBe(true);
+      expect(statSync(sandboxVartmpRoot()).mode & 0o077).toBe(0);
+      expect(statSync(join(sandboxVartmpRoot(), sid)).mode & 0o077).toBe(0);
+      expect(statSync(expected).mode & 0o077).toBe(0);
+    } finally {
+      r?.cleanup();
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(src, { recursive: true, force: true });
+    }
   });
 });
 

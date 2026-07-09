@@ -20,15 +20,63 @@
  * sandbox-exec approach and is handled elsewhere.
  */
 import { homedir } from 'node:os';
-import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, statSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
+import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, statSync, lstatSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join, dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 
 /** Host root for the HOME overlay's upper/work — MUST be OUTSIDE the home lower
- *  (overlayfs forbids upper/work inside lower). */
-const VARTMP_ROOT = '/var/tmp/botmux-sbx';
+ *  (overlayfs forbids upper/work inside lower). Keep it per-uid: /var/tmp is a
+ *  shared multi-user surface, and a global 0700 root would let the first user
+ *  that starts sandbox block every other Unix user on the same machine. */
+const LEGACY_VARTMP_ROOT = '/var/tmp/botmux-sbx';
+
+export function sandboxVartmpRoot(): string {
+  const uid = process.getuid?.() ?? 0;
+  return `/var/tmp/botmux-sbx-${uid}`;
+}
+
+function legacySandboxVartmpDir(sessionId: string): string {
+  return join(LEGACY_VARTMP_ROOT, sessionId);
+}
+
+function sandboxVartmpDir(sessionId: string): string {
+  return join(sandboxVartmpRoot(), sessionId);
+}
+
+function sandboxHomeUpperDir(sessionId: string): string {
+  const next = join(sandboxVartmpDir(sessionId), 'home-upper');
+  const legacy = join(legacySandboxVartmpDir(sessionId), 'home-upper');
+  // Published versions stored HOME upper under the global /var/tmp/botmux-sbx.
+  // A daemon upgrade may reattach a still-running tmux sandbox whose bwrap
+  // namespace continues writing that old overlay upper. If the new per-uid upper
+  // does not exist, keep the bridge pointed at the legacy path.
+  if (existsSync(legacy) && !existsSync(next)) return legacy;
+  return next;
+}
+
+/** Create a daemon-private directory and repair legacy/default mkdir modes.
+ *  Anything under /var/tmp is on a shared multi-user surface, while the outbox
+ *  carries in-flight Lark message bodies/attachments. Refuse to proceed unless
+ *  the path is a real directory owned by this daemon user, and group/other bits
+ *  are gone after chmod. */
+function ensurePrivateDir(dir: string): boolean {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const lst = lstatSync(dir);
+    if (lst.isSymbolicLink() || !lst.isDirectory()) return false;
+    const stBefore = statSync(dir);
+    const uid = process.getuid?.();
+    if (typeof uid === 'number' && stBefore.uid !== uid) return false;
+    chmodSync(dir, 0o700); // repair dirs created before this hardening or under a loose umask
+    const st = statSync(dir);
+    return st.isDirectory() && (typeof uid !== 'number' || st.uid === uid) && (st.mode & 0o077) === 0;
+  } catch (err) {
+    console.error(`[sandbox] failed to prepare private dir ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
 
 // ───────────────────────────── overlay primitives ────────────────────────────
 
@@ -324,7 +372,7 @@ export interface SandboxSpawn {
   outbox: string;
   /** Project overlay UPPER dir — THE LANDABLE CHANGESET (used by sandbox-land). */
   workDir: string;
-  /** HOME overlay UPPER dir (/var/tmp/botmux-sbx/<sid>/home-upper). The sandboxed
+  /** HOME overlay UPPER dir (/var/tmp/botmux-sbx-<uid>/<sid>/home-upper). The sandboxed
    *  CLI's $HOME writes — INCLUDING its session jsonl under CLAUDE_CONFIG_DIR —
    *  land here (invisible at the real path). The worker redirects its bridge/idle
    *  watch into this via sandboxedClaudeDataDir() so it sees the CLI's turns. */
@@ -348,7 +396,7 @@ export interface SandboxSpawn {
 export function sandboxedClaudeDataDir(sessionId: string, realDataDir: string): string {
   const raw = relative(homedir(), realDataDir);
   const rel = raw.startsWith('..') ? relative(resolveSandboxMountPath(homedir()), realDataDir) : raw;
-  return join(VARTMP_ROOT, sessionId, 'home-upper', rel);
+  return join(sandboxHomeUpperDir(sessionId), rel);
 }
 
 /** Proxy env vars forwarded into the sandbox so the CLI reaches the API even on
@@ -360,10 +408,12 @@ const PROXY_ENV_KEYS = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY'
  * is off / unsupported / a required overlay mount fails (fail-safe = the worker
  * treats null as a hard error and does NOT silently run unsandboxed).
  *
- * Layout under <dataDir>/sandboxes/<sessionId>/: outbox, shimbin, proj-upper
- * (the landable changeset), proj-work, proj-merged, home-merged. The HOME
- * overlay's upper/work live under /var/tmp/botmux-sbx/<sessionId>/ because
- * overlayfs forbids upper/work inside the lower (= the real home).
+ * Layout under <dataDir>/sandboxes/<sessionId>/: shimbin, proj-upper (the
+ * landable changeset), proj-work, proj-merged, home-merged. The HOME overlay's
+ * upper/work and the daemon-mediated outbox live under
+ * /var/tmp/botmux-sbx-<uid>/<sessionId>/ because overlayfs forbids upper/work inside
+ * the lower (= the real home), and keeping the outbox outside HOME avoids a
+ * nested bind under the HOME overlay on bwrap hosts that hang on that pattern.
  */
 export function prepareSandbox(opts: {
   /** Whether the sandbox is on for THIS session (per-bot BotConfig.sandbox OR
@@ -406,7 +456,6 @@ export function prepareSandbox(opts: {
 
   const dataDir = resolveSandboxMountPath(opts.dataDir);
   const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
-  const outbox = join(sessionRoot, 'outbox');
   const shimBin = join(sessionRoot, 'shimbin');
   const empties = join(sessionRoot, 'empties');
   const projUpper = join(sessionRoot, 'proj-upper');   // THE LANDABLE CHANGESET
@@ -414,9 +463,11 @@ export function prepareSandbox(opts: {
   const projMerged = join(sessionRoot, 'proj-merged');
   const homeMerged = join(sessionRoot, 'home-merged');  // merged may live under sessionRoot
   // HOME overlay upper/work MUST be OUTSIDE the home lower (overlayfs constraint).
-  const vartmp = join(VARTMP_ROOT, opts.sessionId);
+  const vartmp = sandboxVartmpDir(opts.sessionId);
+  const outbox = join(vartmp, 'outbox');
   const homeUpper = join(vartmp, 'home-upper');
   const homeWork = join(vartmp, 'home-work');
+  if (!ensurePrivateDir(sandboxVartmpRoot()) || !ensurePrivateDir(vartmp) || !ensurePrivateDir(outbox)) return null;
   for (const d of [outbox, shimBin, empties]) mkdirSync(d, { recursive: true });
 
   const home = resolveSandboxMountPath(homedir());
@@ -542,6 +593,7 @@ export function prepareSandbox(opts: {
       unmountOverlay(homeMerged);
       try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
       try { rmSync(vartmp, { recursive: true, force: true }); } catch { /* */ }
+      try { rmSync(legacySandboxVartmpDir(opts.sessionId), { recursive: true, force: true }); } catch { /* */ }
     },
   };
 }
@@ -555,20 +607,30 @@ export function prepareSandbox(opts: {
  * path back so the watcher can keep servicing the live CLI's `botmux send`, plus
  * the workDir (upper changeset for landing) and a cleanup that tears the residue
  * down at close/exit. Returns null if the session has no sandbox tree on disk
- * (never sandboxed). Linux-only, mirrors prepareSandbox's layout.
+ * (never sandboxed). Linux-only, mirrors prepareSandbox's layout. New sessions
+ * keep outbox under /var/tmp/botmux-sbx-<uid>/<sid>/outbox; fall back to legacy
+ * /var/tmp/botmux-sbx/<sid>/outbox or <dataDir>/sandboxes/<sid>/outbox for
+ * sessions that were already running before the layout changed.
  */
 export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }): { outbox: string; workDir: string; cleanup: () => void } | null {
   if (process.platform !== 'linux') return null;
   const dataDir = resolveSandboxMountPath(opts.dataDir);
   const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
-  const outbox = join(sessionRoot, 'outbox');
+  const vartmp = sandboxVartmpDir(opts.sessionId);
+  const newOutbox = join(vartmp, 'outbox');
+  const legacyVartmpOutbox = join(legacySandboxVartmpDir(opts.sessionId), 'outbox');
+  const legacyOutbox = join(sessionRoot, 'outbox');
   const projUpper = join(sessionRoot, 'proj-upper');
-  if (!existsSync(outbox) && !existsSync(projUpper)) return null; // never sandboxed
+  if (!existsSync(newOutbox) && !existsSync(legacyVartmpOutbox) && !existsSync(legacyOutbox) && !existsSync(projUpper)) return null; // never sandboxed
+  const outbox = existsSync(newOutbox) ? newOutbox : (existsSync(legacyVartmpOutbox) ? legacyVartmpOutbox : (existsSync(legacyOutbox) ? legacyOutbox : newOutbox));
   // Ensure the outbox exists (the watcher reads it); never (re)mount here.
-  try { mkdirSync(outbox, { recursive: true }); } catch { /* */ }
+  if (outbox === newOutbox) {
+    if (!ensurePrivateDir(sandboxVartmpRoot()) || !ensurePrivateDir(vartmp) || !ensurePrivateDir(outbox)) return null;
+  } else if (outbox === legacyVartmpOutbox) {
+    if (!ensurePrivateDir(legacySandboxVartmpDir(opts.sessionId)) || !ensurePrivateDir(outbox)) return null;
+  } else if (!ensurePrivateDir(outbox)) return null;
   const projMerged = join(sessionRoot, 'proj-merged');
   const homeMerged = join(sessionRoot, 'home-merged');
-  const vartmp = join(VARTMP_ROOT, opts.sessionId);
   return {
     outbox,
     workDir: projUpper,
@@ -577,6 +639,7 @@ export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }
       unmountOverlay(homeMerged);
       try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
       try { rmSync(vartmp, { recursive: true, force: true }); } catch { /* */ }
+      try { rmSync(legacySandboxVartmpDir(opts.sessionId), { recursive: true, force: true }); } catch { /* */ }
     },
   };
 }
@@ -588,19 +651,20 @@ function reclaimSandbox(dataDir: string, sid: string): void {
   unmountOverlay(join(sessionRoot, 'proj-merged'));
   unmountOverlay(join(sessionRoot, 'home-merged'));
   try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
-  try { rmSync(join(VARTMP_ROOT, sid), { recursive: true, force: true }); } catch { /* */ }
+  try { rmSync(join(sandboxVartmpRoot(), sid), { recursive: true, force: true }); } catch { /* */ }
+  try { rmSync(legacySandboxVartmpDir(sid), { recursive: true, force: true }); } catch { /* */ }
 }
 
 /** Scan the process table for sandbox session-ids referenced by any running
  *  process's argv. A live bwrap's bind/overlay paths contain `sandboxes/<sid>`
- *  and `botmux-sbx/<sid>`, so this physically detects which sandbox dirs are
+ *  and `botmux-sbx-<uid>/<sid>`, so this physically detects which sandbox dirs are
  *  still in use — by overlay sessions AND old clone-model sessions alike. Used as
  *  a hard guard so the sweep never deletes a dir out from under a live CLI. */
 function liveSandboxSids(): Set<string> {
   const live = new Set<string>();
   let pids: string[];
   try { pids = readdirSync('/proc'); } catch { return live; }
-  const re = /(?:sandboxes|botmux-sbx)\/([^/\0]+)/g;
+  const re = /(?:sandboxes|botmux-sbx(?:-[^/\0]+)?)\/([^/\0]+)/g;
   for (const pid of pids) {
     if (!/^\d+$/.test(pid)) continue;
     let cmd: string;
@@ -639,9 +703,9 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
   let sids: string[] = [];
   try { sids = readdirSync(root); } catch { return; } // no sandboxes dir yet
   // Grace before reclaiming an ACTIVE-but-unmounted sandbox: a worker that just
-  // (re)spawned creates the outbox/shimbin dirs a few syscalls BEFORE it mounts
-  // the overlay. Without this, a sweep firing in that tiny window would nuke an
-  // in-progress session's outbox. Non-active orphans are reclaimed immediately
+  // (re)spawned creates the sandbox dirs a few syscalls BEFORE it mounts the
+  // overlay. Without this, a sweep firing in that tiny window would nuke an
+  // in-progress session's shimbin/project tree. Non-active orphans are reclaimed immediately
   // (no live worker can be mid-spawn for a session that isn't active).
   const ACTIVE_DEAD_GRACE_MS = 60_000;
   const now = Date.now();
@@ -779,6 +843,39 @@ export function materializeOutboxFile(outbox: string, name: string, dest: string
   finally { closeSync(fd); if (outFd !== null) closeSync(outFd); }
 }
 
+const RELAY_REQUEST_MAX_BYTES = 64 * 1024;
+
+/**
+ * TOCTOU-safe read of the `.req.json` trigger file itself. The request file is
+ * also sandbox-controlled input, so it needs the same hardening as content and
+ * attachments: no symlinks, no FIFO/device files, no blocking opens, and a small
+ * size cap before JSON.parse. Returns null on any unsafe/non-regular/oversized
+ * input so the watcher can reject and keep its event loop moving.
+ */
+export function readRelayRequestFile(reqPath: string): string | null {
+  let fd: number;
+  try { fd = openSync(reqPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); }
+  catch { return null; }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) return null;
+    if (st.size > RELAY_REQUEST_MAX_BYTES) return null;
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const buf = Buffer.alloc(Math.min(8192, RELAY_REQUEST_MAX_BYTES));
+    for (;;) {
+      const n = readSync(fd, buf, 0, buf.length, null);
+      if (n <= 0) break;
+      total += n;
+      if (total > RELAY_REQUEST_MAX_BYTES) return null;
+      chunks.push(Buffer.from(buf.subarray(0, n)));
+    }
+    return Buffer.concat(chunks, total).toString('utf8');
+  } catch { return null; }
+  finally { closeSync(fd); }
+}
+
 /**
  * Daemon/worker-side outbox watcher. The sandboxed `botmux send` (relay mode)
  * drops `<id>.req.json`; we validate (validateRelayRequest) and then MATERIALIZE
@@ -798,7 +895,7 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
 
   const finish = (id: string, reqPath: string, name: string, staged: string[], code: number, stdout: string, stderr: string) => {
     // 原子写：沙盒侧 CLI 在 existsSync 轮询这个 res.json，rename 保证它读到完整 JSON。
-    try { atomicWriteFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr })); } catch { /* */ }
+    try { atomicWriteFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr }), { mode: 0o600 }); } catch { /* */ }
     try { rmSync(reqPath, { force: true }); } catch { /* */ }
     for (const p of staged) { try { rmSync(p, { force: true }); } catch { /* */ } }
     inFlight.delete(name);
@@ -814,13 +911,15 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
       const id = name.slice(0, -'.req.json'.length);
       const staged: string[] = [];
       let req: RelayRequest;
-      try { req = JSON.parse(readFileSync(reqPath, 'utf8')); }
+      const reqText = readRelayRequestFile(reqPath);
+      if (reqText === null) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: request not a regular file or too large'); continue; }
+      try { req = JSON.parse(reqText); }
       catch { finish(id, reqPath, name, staged, 1, '', 'relay: bad json'); continue; }
 
       const v = validateRelayRequest(req);
       if (!v.ok) { finish(id, reqPath, name, staged, 1, '', `relay rejected: ${v.error}`); continue; }
 
-      try { mkdirSync(staging, { recursive: true }); } catch { /* */ }
+      try { mkdirSync(staging, { recursive: true, mode: 0o700 }); chmodSync(staging, 0o700); } catch { /* */ }
       // Materialize content (TOCTOU-safe) into the private staging dir.
       const contentDest = join(staging, `${id}.content`);
       if (!materializeOutboxFile(outbox, v.value.contentName, contentDest)) {

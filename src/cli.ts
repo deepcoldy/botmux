@@ -4437,13 +4437,13 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
   // sandbox: the sandbox can't make the host read an arbitrary path.
   const contentBase = `${id}.content`;
   const cfile = join(relayDir, contentBase);
-  writeFileSync(cfile, content);
+  writeFileSync(cfile, content, { mode: 0o600 });
 
   // Copy attachments into the outbox; carry only basenames.
   const copyOutboxAttachment = (p: string, out: string[]): void => {
     if (!p || !existsSync(p)) return;
     const base = `${id}-${randomBytes(4).toString('hex')}-${basename(p)}`;
-    try { writeFileSync(join(relayDir, base), readFileSync(p)); out.push(base); } catch { /* skip unreadable */ }
+    try { writeFileSync(join(relayDir, base), readFileSync(p), { mode: 0o600 }); out.push(base); } catch { /* skip unreadable */ }
   };
   const attachments: string[] = [];
   for (const p of argValues(rest, '--image', '--images', '--file', '--files')) {
@@ -4472,7 +4472,7 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
   }
   // 原子写：req.json 是 host watcher 的触发文件，rename 让它「完整出现」，
   // watcher 永远不会读到半截 JSON（tmp 后缀不匹配 .req.json 过滤）。
-  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, attachments, videos, videoCovers, flags }));
+  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, attachments, videos, videoCovers, flags }), { mode: 0o600 });
 
   const resPath = join(relayDir, `${id}.res.json`);
   const deadlineMs = Date.now() + 120_000;
