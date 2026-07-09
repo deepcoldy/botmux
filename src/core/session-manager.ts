@@ -1435,7 +1435,7 @@ export async function executeScheduledTask(
     task.deliver === 'new-topic' ? 'thread'
       : scope === 'chat' && anchor !== task.chatId ? 'thread'
         : scope;
-  const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`);
+  const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group');
   const now = Date.now();
   session.larkAppId = larkAppId;
   session.scope = runtimeScope;
