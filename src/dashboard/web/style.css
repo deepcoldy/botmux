@@ -8496,3 +8496,14 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .create-session-modal .cs-advanced summary { cursor: pointer; color: var(--muted); }
 .create-session-modal .cs-empty { color: var(--muted); margin: 0; }
 .create-session-modal .cs-warn { color: var(--warn, #c60); }
+
+/* Feishu login QR code inline display */
+.st-feishu-qr { margin-top: 12px; padding: 16px; background: var(--bg-elevated, #f8f8f8); border-radius: 8px; text-align: center; }
+.st-feishu-qr-hint { margin: 0 0 12px; font-size: 13px; color: var(--muted, #666); }
+.st-feishu-qr-img { width: 200px; height: 200px; display: block; margin: 0 auto 12px; }
+.st-btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border, #ddd); background: var(--bg, #fff); cursor: pointer; font-size: 13px; }
+.st-btn:hover { background: var(--bg-hover, #f0f0f0); }
+.st-btn-ghost { border-color: transparent; color: var(--muted, #666); }
+.st-larkcli-ok { margin: 8px 0 0; font-size: 12px; color: var(--success, #2a7); }
+.st-larkcli-warn { margin: 8px 0 0; font-size: 12px; color: var(--warning, #c80); background: var(--bg-elevated, #fff8e6); padding: 8px 12px; border-radius: 6px; }
+.st-larkcli-warn code { font-size: 11px; background: rgba(0,0,0,0.06); padding: 1px 4px; border-radius: 3px; }

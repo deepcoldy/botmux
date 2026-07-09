@@ -2,6 +2,45 @@ import { spawnSync } from 'node:child_process';
 import { normalizeVcMeetingEvents } from './normalizer.js';
 import type { NormalizedVcMeetingBatch } from './types.js';
 
+/** Minimum lark-cli version that supports `--as bot` for VC meeting commands. */
+export const MIN_LARK_CLI_VERSION_FOR_VC_BOT = '1.0.66';
+
+export interface LarkCliVersionInfo {
+  /** Raw version string, e.g. "1.0.66". */
+  version: string;
+  /** True when `version >= MIN_LARK_CLI_VERSION_FOR_VC_BOT`. */
+  meetsVcBotRequirement: boolean;
+}
+
+/**
+ * Run `lark-cli --version` and parse the result. Returns `null` when lark-cli
+ * is not installed or the version string cannot be parsed.
+ */
+export function checkLarkCliVersion(): LarkCliVersionInfo | null {
+  const result = spawnSync('lark-cli', ['--version'], {
+    encoding: 'utf-8',
+    timeout: 5_000,
+  });
+  if (result.status !== 0) return null;
+  const match = (result.stdout ?? '').trim().match(/(\d+\.\d+\.\d+)/);
+  if (!match) return null;
+  const version = match[1];
+  return {
+    version,
+    meetsVcBotRequirement: compareSemver(version, MIN_LARK_CLI_VERSION_FOR_VC_BOT) >= 0,
+  };
+}
+
+function compareSemver(a: string, b: string): number {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
 export interface LarkCliRunOptions {
   profile?: string;
 }
@@ -18,6 +57,8 @@ export interface FetchMeetingEventsOptions extends LarkCliRunOptions {
 export interface JoinMeetingOptions extends LarkCliRunOptions {
   meetingNumber: string;
   password?: string;
+  /** Correlation ID forwarded from the invite event (lark-cli >= 1.0.66). */
+  callId?: string;
 }
 
 export interface SendMeetingMessageOptions extends LarkCliRunOptions {
@@ -59,19 +100,25 @@ function firstErrorString(...values: unknown[]): string | undefined {
   return undefined;
 }
 
+/** Check both lark-cli convenience-command format ({ok:false}) and raw API format ({code:!0}). */
 export function assertLarkCliJsonOk(raw: unknown, context: string): void {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
   const obj = raw as Record<string, unknown>;
-  if (obj.ok !== false) return;
-  const message = firstErrorString(
-    obj.error,
-    obj.message,
-    obj.msg,
-    obj.error_msg,
-    obj.code,
-    obj.error_code,
-  );
-  throw new Error(`${context} failed: ${message ?? 'lark-cli returned ok=false'}`);
+  if (obj.ok === false) {
+    const message = firstErrorString(
+      obj.error,
+      obj.message,
+      obj.msg,
+      obj.error_msg,
+      obj.code,
+      obj.error_code,
+    );
+    throw new Error(`${context} failed: ${message ?? 'lark-cli returned ok=false'}`);
+  }
+  if (typeof obj.code === 'number' && obj.code !== 0) {
+    const message = firstErrorString(obj.msg, obj.message, obj.error);
+    throw new Error(`${context} failed: ${message ?? `code=${obj.code}`}`);
+  }
 }
 
 function withProfile(args: string[], profile?: string): string[] {
@@ -105,6 +152,10 @@ export function extractMeetingIdFromJoin(raw: unknown): string | undefined {
   );
 }
 
+/**
+ * Join a VC meeting as a bot via `lark-cli vc +meeting-join --as bot`.
+ * Requires lark-cli >= 1.0.66.
+ */
 export function joinMeetingAsBot(opts: JoinMeetingOptions): { meetingId: string; raw: unknown } {
   const args = withProfile([
     'vc',
@@ -113,16 +164,22 @@ export function joinMeetingAsBot(opts: JoinMeetingOptions): { meetingId: string;
     'bot',
     '--meeting-number',
     opts.meetingNumber,
+    ...(opts.callId ? ['--call-id', opts.callId] : []),
+    ...(opts.password ? ['--password', opts.password] : []),
     '--format',
     'json',
-    ...(opts.password ? ['--password', opts.password] : []),
   ], opts.profile);
   const raw = runLarkCliJson(args);
+  assertLarkCliJsonOk(raw, 'meeting join');
   const meetingId = extractMeetingIdFromJoin(raw);
   if (!meetingId) throw new Error('meeting join succeeded but response did not contain meeting.id');
   return { meetingId, raw };
 }
 
+/**
+ * Fetch VC meeting events via `lark-cli vc +meeting-events --as bot`.
+ * Requires lark-cli >= 1.0.66.
+ */
 export function fetchMeetingEventsAsBot(opts: FetchMeetingEventsOptions): { raw: unknown; batch: NormalizedVcMeetingBatch } {
   const args = withProfile([
     'vc',
@@ -141,9 +198,14 @@ export function fetchMeetingEventsAsBot(opts: FetchMeetingEventsOptions): { raw:
     'json',
   ], opts.profile);
   const raw = runLarkCliJson(args);
+  assertLarkCliJsonOk(raw, 'meeting events fetch');
   return { raw, batch: normalizeVcMeetingEvents(raw, { meetingId: opts.meetingId, source: 'polling' }) };
 }
 
+/**
+ * Send a text message to a VC meeting via `lark-cli vc +meeting-message-send --as bot`.
+ * Requires lark-cli >= 1.0.66.
+ */
 export function sendMeetingTextMessageAsBot(opts: SendMeetingMessageOptions): { raw: unknown } {
   const args = withProfile([
     'vc',
