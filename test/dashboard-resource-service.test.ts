@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createResourceMonitorService } from '../src/dashboard/resource-monitor-service.js';
+import { createResourceMonitorService, toResourceMonitorSessionSeed } from '../src/dashboard/resource-monitor-service.js';
 import type { ProcfsSample } from '../src/core/resource-monitor/types.js';
 
 function sample(processes: ProcfsSample['processes'], totalCpuTicks = 1000, idleCpuTicks = 0): ProcfsSample {
@@ -15,6 +15,73 @@ function sample(processes: ProcfsSample['processes'], totalCpuTicks = 1000, idle
 }
 
 describe('ResourceMonitorService', () => {
+  it('maps dashboard session rows with runtime fields into resource seeds', () => {
+    const seed = toResourceMonitorSessionSeed({
+      sessionId: 's1',
+      larkAppId: 'app',
+      botName: 'row-bot',
+      title: 'topic',
+      status: 'active',
+      spawnedAt: 10_000,
+      lastMessageAt: 20_000,
+      agentAttention: { kind: 123, reason: null, at: 30_000 },
+      workerPid: 20,
+      adoptCliPid: 30,
+    }, 'registry-bot');
+
+    expect(seed).toEqual({
+      sessionId: 's1',
+      larkAppId: 'app',
+      botName: 'registry-bot',
+      title: 'topic',
+      status: 'active',
+      spawnedAt: 10_000,
+      lastMessageAt: 20_000,
+      agentAttention: { kind: '123', reason: '', at: 30_000 },
+      workerPid: 20,
+      adoptCliPid: 30,
+    });
+  });
+
+  it('builds runtime summary from session seed timestamps and attention', () => {
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      sampleProcfs: () => sample([
+        { pid: 10, ppid: 1, rssBytes: 10, cpuTicks: 10, cmd: 'daemon' },
+        { pid: 20, ppid: 10, rssBytes: 10, cpuTicks: 10, cmd: 'worker-run' },
+        { pid: 30, ppid: 10, rssBytes: 10, cpuTicks: 10, cmd: 'worker-wait' },
+      ]),
+      listSessions: () => [
+        { sessionId: 'run', larkAppId: 'app', botName: 'bot', title: 'run', status: 'working', spawnedAt: 10_000, workerPid: 20 },
+        {
+          sessionId: 'wait',
+          larkAppId: 'app',
+          botName: 'bot',
+          title: 'wait',
+          status: 'active',
+          spawnedAt: 40_000,
+          lastMessageAt: 60_000,
+          agentAttention: { kind: 'blocked', reason: 'need input', at: 70_000 },
+          workerPid: 30,
+        },
+      ],
+      listDaemons: () => [{ larkAppId: 'app', botName: 'bot', pid: 10 }],
+      readCliMarkers: () => new Map(),
+      nowMs: () => 100_000,
+    });
+
+    svc.sampleOnce();
+
+    expect(svc.current().runtime.sessions).toMatchObject({
+      total: 2,
+      working: 1,
+      waiting: 1,
+      starting: 0,
+    });
+    expect(svc.current().runtime.sessions.longestRunning).toMatchObject({ sessionId: 'run', durationMs: 90_000 });
+    expect(svc.current().runtime.sessions.longestWaiting).toMatchObject({ sessionId: 'wait', durationMs: 30_000 });
+  });
+
   it('keeps all current sessions but only tracked sessions in history', () => {
     let tick = 0;
     let now = 0;

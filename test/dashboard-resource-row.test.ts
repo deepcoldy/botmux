@@ -16,6 +16,7 @@ describe('dashboard resource row fields', () => {
         cliId: 'codex',
         status: 'active',
         createdAt: '2026-07-09T00:00:00.000Z',
+        lastMessageAt: '2026-07-09T00:00:02.000Z',
         chatId: 'oc_1',
         rootMessageId: 'om_1',
         title: 'topic',
@@ -31,11 +32,15 @@ describe('dashboard resource row fields', () => {
       lastMessageAt: 2,
       cliVersion: 'x',
       hasHistory: false,
+      agentAttention: { kind: 'blocked', reason: 'need input', at: 3 },
       adoptedFrom: { originalCliPid: 4321, cwd: '/repo' },
     } as unknown as DaemonSession;
 
     const row = composeRowFromActive(ds);
 
+    expect(row.spawnedAt).toBe(Date.parse('2026-07-09T00:00:00.000Z'));
+    expect(row.lastMessageAt).toBe(Date.parse('2026-07-09T00:00:02.000Z'));
+    expect(row.agentAttention).toEqual({ kind: 'blocked', reason: 'need input', at: 3 });
     expect(row.workerPid).toBe(1234);
     expect(row.adoptCliPid).toBe(4321);
   });

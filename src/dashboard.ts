@@ -107,7 +107,7 @@ import { automateOpenPlatformSetup } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 import { larkHosts } from './im/lark/lark-hosts.js';
-import { createResourceMonitorService, handleResourceMonitorApi } from './dashboard/resource-monitor-service.js';
+import { createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -917,20 +917,7 @@ const resourceMonitor = createResourceMonitorService({
     const names = new Map(registry.list().map(d => [d.larkAppId, d.botName] as const));
     return aggregator.getSessions()
       .filter(s => s.status !== 'closed')
-      .map(s => {
-        const larkAppId = String(s.larkAppId ?? '');
-        const workerPid = typeof s.workerPid === 'number' ? s.workerPid : undefined;
-        const adoptCliPid = typeof s.adoptCliPid === 'number' ? s.adoptCliPid : undefined;
-        return {
-          sessionId: String(s.sessionId),
-          larkAppId,
-          botName: String(names.get(larkAppId) ?? s.botName ?? larkAppId),
-          title: typeof s.title === 'string' ? s.title : undefined,
-          status: String(s.status ?? 'unknown'),
-          ...(workerPid !== undefined ? { workerPid } : {}),
-          ...(adoptCliPid !== undefined ? { adoptCliPid } : {}),
-        };
-      });
+      .map(s => toResourceMonitorSessionSeed(s, names.get(String(s.larkAppId ?? ''))));
   },
   listDaemons: () => registry.list().map(d => ({
     larkAppId: d.larkAppId,

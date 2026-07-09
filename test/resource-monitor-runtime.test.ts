@@ -49,6 +49,10 @@ describe('runtime monitor helpers', () => {
     expect(sessionRuntimeBucket(session({ sessionId: 's3', status: 'idle' }))).toBe('idle');
     expect(sessionRuntimeBucket(session({ sessionId: 's4', status: 'active', agentAttention: { kind: 'blocked', reason: 'need input', at: 10_000 } }))).toBe('waiting');
     expect(sessionRuntimeBucket(session({ sessionId: 's5', status: 'mystery' }))).toBe('unknown');
+    expect(sessionRuntimeBucket(session({ sessionId: 's6', status: 'waiting' }))).toBe('waiting');
+    expect(sessionRuntimeBucket(session({ sessionId: 's7', status: 'analyzing' }))).toBe('working');
+    expect(sessionRuntimeBucket(session({ sessionId: 's8', status: 'active' }))).toBe('working');
+    expect(sessionRuntimeBucket(session({ sessionId: 's9', status: 'dormant' }))).toBe('idle');
   });
 
   it('builds fresh runtime summary with daemon and session pressure', () => {
@@ -101,5 +105,21 @@ describe('runtime monitor helpers', () => {
       bots: [],
       sessions: [],
     }).sampleHealth.status).toBe('unsupported');
+  });
+
+  it('uses last message and spawn times as waiting duration fallbacks', () => {
+    const summary = buildRuntimeMonitorSummary({
+      supported: true,
+      sampledAt: 100_000,
+      intervalMs: 10_000,
+      nowMs: 110_000,
+      bots: [],
+      sessions: [
+        session({ sessionId: 'last-message', status: 'waiting', lastMessageAt: 80_000 }),
+        session({ sessionId: 'spawned', status: 'waiting', spawnedAt: 60_000 }),
+      ],
+    });
+
+    expect(summary.sessions.longestWaiting).toMatchObject({ sessionId: 'spawned', durationMs: 50_000 });
   });
 });

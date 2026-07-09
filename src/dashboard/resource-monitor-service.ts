@@ -46,6 +46,47 @@ export interface ResourceMonitorService {
   history(range: '1h' | '3h' | '24h'): ResourceHistorySnapshot;
 }
 
+export interface ResourceMonitorDashboardSessionRow {
+  sessionId?: unknown;
+  larkAppId?: unknown;
+  botName?: unknown;
+  title?: unknown;
+  status?: unknown;
+  spawnedAt?: unknown;
+  lastMessageAt?: unknown;
+  agentAttention?: { kind?: unknown; reason?: unknown; at?: unknown } | null;
+  workerPid?: unknown;
+  adoptCliPid?: unknown;
+}
+
+export function toResourceMonitorSessionSeed(row: ResourceMonitorDashboardSessionRow, botNameOverride?: string): ResourceSessionSeed {
+  const larkAppId = String(row.larkAppId ?? '');
+  const workerPid = typeof row.workerPid === 'number' ? row.workerPid : undefined;
+  const adoptCliPid = typeof row.adoptCliPid === 'number' ? row.adoptCliPid : undefined;
+  const spawnedAt = typeof row.spawnedAt === 'number' ? row.spawnedAt : undefined;
+  const lastMessageAt = typeof row.lastMessageAt === 'number' ? row.lastMessageAt : undefined;
+  const attention = row.agentAttention && typeof row.agentAttention.at === 'number'
+    ? {
+      kind: String(row.agentAttention.kind ?? ''),
+      reason: String(row.agentAttention.reason ?? ''),
+      at: row.agentAttention.at,
+    }
+    : undefined;
+
+  return {
+    sessionId: String(row.sessionId),
+    larkAppId,
+    botName: String(botNameOverride ?? row.botName ?? larkAppId),
+    title: typeof row.title === 'string' ? row.title : undefined,
+    status: String(row.status ?? 'unknown'),
+    ...(spawnedAt !== undefined ? { spawnedAt } : {}),
+    ...(lastMessageAt !== undefined ? { lastMessageAt } : {}),
+    ...(attention !== undefined ? { agentAttention: attention } : {}),
+    ...(workerPid !== undefined ? { workerPid } : {}),
+    ...(adoptCliPid !== undefined ? { adoptCliPid } : {}),
+  };
+}
+
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
