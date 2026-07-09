@@ -138,6 +138,10 @@ export interface TaskView {
    *  `senderUnionId ∈ workerBotUnionIds` with no prior observation. Distinct from
    *  workerLarkAppIds/workerCliIds, which serve local re-dispatch/health. */
   workerBotUnionIds?: string[];
+  /** Canonical git remote URL (preferred) or local alias required by this task.
+   *  The receiving daemon resolves it on its own machine before starting the
+   *  worker; paths are intentionally never shared across devices. */
+  requiredRepo?: string;
   acceptanceHint?: string;    // legacy free-text intent (kept for back-compat / display)
   acceptanceCriteria?: AcceptanceCriteria; // P1 #7: structured, validated verify plan (preferred)
   status: TaskStatus;
@@ -178,6 +182,8 @@ export interface TaskDispatchedPayload {
    *  Does NOT replace workerLarkAppIds/workerCliIds, which serve local
    *  re-dispatch/health — different responsibility, kept independently. */
   workerBotUnionIds?: string[];
+  /** Canonical git remote URL (preferred) or receiver-local alias. */
+  requiredRepo?: string;
   brief?: string;
   acceptanceHint?: string;
   acceptanceCriteria?: AcceptanceCriteria;

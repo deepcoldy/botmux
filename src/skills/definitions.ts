@@ -1224,7 +1224,7 @@ botmux goal supervise --chat-id "<goalChatId>" \\
 - 🔒 **goal 群对话默认收窄（安全）**：\`goal supervise\` 会把这个 goal 群登记为「授权制」——群里只有**发起人（群主）+ 编排用的自家 bot（L2 / worker，peer 互信）**能和 bot 对话；其他人 @ bot 会被拦下（弹授权卡，需群主显式 grant 才放行）。这样即便日后把第三方拉进 goal 群，也没人能随意占用你的 bot / 烧额度。普通 \`/g\` 群不受影响（仍是开放 oncall）。
 - ♻️ **L2 监工会自愈（不用你操心）**：\`goal supervise\` 把这个 goal 的监工坐标登记下来后，万一 L2 因崩溃/网络挂掉，daemon 的 goal-watchdog 发现"还有未完成任务却没活 L2"时会**自动按登记信息重起 L2**，不用你重新 \`goal supervise\`。带崩溃预算：短时间内反复挂会停止复活、转而**升级给人**（避免无限重启）。被自动复活后 L2 会重新 \`delivery list\` + \`goal charter read\` 重建状态、接着巡检。
 
-> repo 预设：\`--repo\` 让子 bot 起会话直接进该目录、免手点「选仓库」卡。注意**跨 owner 的 repo 预设可能受授权限制**——若子 bot 已配 defaultWorkingDir，可省略 \`--repo\`。
+> repo 预设：\`--repo\` 让**同机**子 bot 起会话直接进该目录、免手点「选仓库」卡；它传的是本机路径，**不要用于跨设备派活**。跨设备代码任务用 L2-2.5 的 \`--needs-repo <remote-url>\`，由接收机器自行找到本地目录。
 > **OnCall 省 \`--repo\` 现按 bot 计**：OnCall 绑定是 per-bot 的——只有**目标子 bot 自己**在该群绑了 OnCall（\`@该bot /oncall bind <仓库路径>\`，多个 bot 一起绑用 \`@bot1 @bot2 /oncall bind <路径>\`）或配了 \`defaultWorkingDir\` 时，dispatch 才可省 \`--repo\`。否则子 bot **不会**跨 bot 继承群目录（除非同话题已有 sibling 在跑可继承），dispatch 仍应显式传 \`--repo\`，不然子 bot 会弹「选仓库」卡。
 > 想「先把 bot 拉起待命、稍后再派具体任务」：用 \`--standby\`（只定目录不派简报），之后用 \`botmux dispatch --into <话题root> --bot ... --brief ...\` 激活。
 
@@ -1283,6 +1283,8 @@ botmux dispatch --chat-id "<goalChatId>" --title "<subtask>" \\
 - **交付/回报方向（worker→你的账本）= 按 union_id 授权，免 /grant**：dispatch 时把 worker 的 \`workerBotUnionIds\`（首选，来自平台 roster / 已观察到的 bot 身份）带上；\`workerOpenIds\`(open_id) 作兜底。只有「被派了这个活的 worker」发的信封才摄取入账，其它当普通聊天忽略。信封摄取在权限门**之前**、用 union_id 自证，所以回报这条**不需要 /grant**。
 - **兜底冷启动**：如果没有平台团队 / 目标 bot 还没进 roster，就让远端 bot 在群里先 @ 你一次，你的 daemon 会从那条事件学到它的 union_id（\`[bot-union-id] learned …\`）；学到后 dispatch 才解析得出 \`workerBotUnionIds\`。这是兜底，不是默认流程。
 - **派活方向（你→让远端 bot 真接活）**：同平台团队 bot 走团队互信；如果没走平台团队，才需要对方给你 \`/grant\`（或把你放进 allowedUsers），否则你的 @ 派活可能被对方权限门挡掉。
+- **代码任务先声明项目，不传本机路径**：跨设备 \`dispatch\` 用 \`--needs-repo <git remote URL>\`（优先 canonical remote URL，别用你机器上的绝对路径）。接收端会在启动执行者前检查自己的本地目录：路径存在、是 git repo、origin 匹配才开工；检查通过后协议块会被剥掉，执行者只看到任务正文。
+- **远端缺项目时按求助处理**：接收端会直接发 \`kind=access\` 的“缺少项目环境”求助，不弹仓库选择卡、不暂存任务。你先查交付记录，再选择：把“准备项目环境（clone/setup）”作为一个可验收任务、换执行者，或升级给人；不要让 daemon 擅自判失败。
 - **它在 goal 群用「交付信封」交活 / 求助**（纯文本，daemon 自动摄取成 TaskReported / TaskHelpRequested）。⚠️ 必须**原始文本**，别用会渲染卡片的 \`botmux send\`。把下面格式**抄进给它的 brief**：
   \`\`\`
   [botmux-report v1]

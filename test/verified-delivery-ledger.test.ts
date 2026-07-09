@@ -19,7 +19,7 @@ describe('verified-delivery ledger', () => {
     const led = openLedger({ baseDir });
     led.append(draft({
       type: 'TaskDispatched', actor: 'orchestrator', taskId: 'task-1', chatId: 'oc_x', idempotencyKey: 'dispatched:task-1',
-      payload: { taskId: 'task-1', title: 'do X', workerTopicRoot: 'om_root', workerOpenIds: ['ou_w'], acceptanceHint: 'run check.py exit 0' },
+      payload: { taskId: 'task-1', title: 'do X', workerTopicRoot: 'om_root', workerOpenIds: ['ou_w'], requiredRepo: 'github.com/acme/project', acceptanceHint: 'run check.py exit 0' },
     }));
     const inline = led.writeInlineEvidence('PASS: all good\n', 'check-output');
     led.append(draft({
@@ -35,6 +35,7 @@ describe('verified-delivery ledger', () => {
     expect(t.status).toBe('accepted');
     expect(t.acceptanceHint).toBe('run check.py exit 0');
     expect(t.workerTopicRoot).toBe('om_root');
+    expect(t.requiredRepo).toBe('github.com/acme/project');
     expect(t.reports).toHaveLength(1);
     expect(t.reports[0]).toMatchObject({ reportId: 'r1', verdict: 'accepted', ranCommands: ['python check.py'] });
     expect(t.reports[0].evidence).toHaveLength(2);
@@ -99,6 +100,12 @@ describe('verified-delivery ledger', () => {
 
   it('refuses misaligned worker metadata and malformed acceptanceCriteria', () => {
     const led = openLedger({ baseDir });
+    expect(() => led.append(draft({
+      type: 'TaskDispatched',
+      taskId: 'task-repo',
+      idempotencyKey: 'dispatched:task-repo',
+      payload: { taskId: 'task-repo', requiredRepo: '   ' },
+    }))).toThrow(/requiredRepo must be non-empty/);
     expect(() => led.append(draft({
       type: 'TaskDispatched',
       taskId: 'task-meta',

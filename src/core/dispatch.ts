@@ -14,6 +14,7 @@
  * (cli.ts) performs the actual sendMessage + replyMessage.
  */
 
+import { formatDispatchRepoRequirement, type DispatchRepoRequirement } from './repo-requirement.js';
 export { resolveSendTarget } from './reply-target.js';
 
 export interface DispatchBot {
@@ -64,6 +65,8 @@ export function buildDispatchMessages(input: {
   title: string;
   brief: string;
   bots: DispatchBot[];
+  /** Machine-readable repo preflight, stripped by the receiver before CLI input. */
+  repoRequirement?: DispatchRepoRequirement;
 }): DispatchMessages {
   const title = input.title.trim();
   if (!title) throw new Error('dispatch requires a title');
@@ -96,6 +99,13 @@ export function buildDispatchMessages(input: {
     for (const b of input.bots) {
       const label = b.name || b.openId;
       content.push([{ tag: 'text', text: `· ${label}：${b.role ?? '执行者'}` }]);
+    }
+  }
+
+  if (input.repoRequirement) {
+    content.push([{ tag: 'text', text: '' }]);
+    for (const line of formatDispatchRepoRequirement(input.repoRequirement).split('\n')) {
+      content.push([{ tag: 'text', text: line }]);
     }
   }
 
