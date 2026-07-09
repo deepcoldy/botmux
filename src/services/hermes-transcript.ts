@@ -26,6 +26,11 @@ interface HermesMessageRow {
   finish_reason?: string | null;
 }
 
+export function resolveHermesStateDbPath(env: Record<string, string | undefined> = process.env): string {
+  const hermesHome = env.HERMES_HOME?.trim();
+  return hermesHome ? join(hermesHome, 'state.db') : HERMES_STATE_DB;
+}
+
 function decodeContent(content: unknown): string {
   if (content === null || content === undefined) return '';
   if (typeof content !== 'string') return String(content);

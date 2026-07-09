@@ -1,5 +1,7 @@
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('node:fs', async () => {
@@ -26,6 +28,13 @@ describe('hermes transcript reader', () => {
   beforeEach(() => {
     existsSyncMock.mockReset();
     spawnSyncMock.mockReset();
+  });
+
+  it('resolves the state DB from HERMES_HOME when Hermes runs under a profile', async () => {
+    const { resolveHermesStateDbPath } = await import('../src/services/hermes-transcript.js');
+
+    expect(resolveHermesStateDbPath({ HERMES_HOME: ' /tmp/hermes-profile ' })).toBe('/tmp/hermes-profile/state.db');
+    expect(resolveHermesStateDbPath({})).toBe(join(homedir(), '.hermes', 'state.db'));
   });
 
   it('returns empty events when state.db does not exist', async () => {
