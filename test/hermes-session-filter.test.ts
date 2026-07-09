@@ -45,4 +45,30 @@ describe('filterHermesEventsForBotmuxSession', () => {
       ['a-missing', 'missing_source'],
     ]);
   });
+
+  it('isolates two botmux workers reading the same interleaved Hermes rows', () => {
+    const sharedEvents = [
+      user('u-A', 'hermes-A', '<session_id>botmux-A</session_id>\nquestion A'),
+      user('u-B', 'hermes-B', '<session_id>botmux-B</session_id>\nquestion B'),
+      assistant('a-B', 'hermes-B', 'answer B'),
+      assistant('a-A', 'hermes-A', 'answer A'),
+    ];
+
+    const workerA = filterHermesEventsForBotmuxSession(sharedEvents, { botmuxSessionId: 'botmux-A' });
+    const workerB = filterHermesEventsForBotmuxSession(sharedEvents, { botmuxSessionId: 'botmux-B' });
+
+    expect(workerA.boundSourceSessionId).toBe('hermes-A');
+    expect(workerA.events.map(e => e.uuid)).toEqual(['u-A', 'a-A']);
+    expect(workerA.drops.map(d => [d.uuid, d.reason])).toEqual([
+      ['u-B', 'foreign_source'],
+      ['a-B', 'foreign_source'],
+    ]);
+
+    expect(workerB.boundSourceSessionId).toBe('hermes-B');
+    expect(workerB.events.map(e => e.uuid)).toEqual(['u-B', 'a-B']);
+    expect(workerB.drops.map(d => [d.uuid, d.reason])).toEqual([
+      ['u-A', 'unbound'],
+      ['a-A', 'foreign_source'],
+    ]);
+  });
 });

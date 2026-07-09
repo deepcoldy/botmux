@@ -269,6 +269,30 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
   });
 
+  it('drops Hermes final_output with sourceHermesSessionId before daemon has a binding', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+      sourceHermesSessionId: 'hermes-A',
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+  });
+
   it('drops Hermes final_output without sourceHermesSessionId after a source is bound', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
