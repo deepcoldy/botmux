@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import type {
   DiagnosticRecommendation,
   InsightConversationMessage,
@@ -87,10 +88,30 @@ import {
 } from './insights.js';
 
 type ModalState = { turnIndex: number | null; raw: boolean; prompt: TurnPromptPreview | null; loading: boolean };
-type PaletteState = { open: boolean; q: string; idx: number; anchor?: { top: number; right: number } };
+type PaletteAnchor = { top: number; left: number; width: number; maxHeight: number };
+type PaletteState = { open: boolean; q: string; idx: number; anchor?: PaletteAnchor };
 type ScrollTarget = { kind: 'span'; index: number } | { kind: 'turn'; index: number } | null;
 type TooltipState = { text: string; x: number; y: number; visible: boolean };
 const CLI_FILTER_ALL = '__all__';
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.min(Math.max(n, min), max);
+}
+
+function paletteAnchorFromButton(button: HTMLElement): PaletteAnchor {
+  const rect = button.getBoundingClientRect();
+  const margin = 12;
+  const width = Math.min(420, Math.max(280, window.innerWidth - margin * 2));
+  const left = clamp(
+    Math.round(rect.left + rect.width / 2 - width / 2),
+    margin,
+    Math.max(margin, window.innerWidth - width - margin),
+  );
+  const naturalTop = Math.round(rect.bottom + 8);
+  const top = clamp(naturalTop, margin, Math.max(margin, window.innerHeight - 132));
+  const maxHeight = Math.max(140, Math.floor(window.innerHeight - top - margin));
+  return { top, left, width, maxHeight };
+}
 
 function toggleSet<T>(set: Set<T>, value: T): Set<T> {
   const next = new Set(set);
@@ -1516,14 +1537,23 @@ function CommandPalette({ palette, items, onClose, onInput, onChoose }: {
 }) {
   if (!palette.open) return null;
   const anchored = !!palette.anchor;
-  return (
-    <div id="insight-palette" className="insight-palette">
+  const panelStyle = anchored
+    ? {
+        top: palette.anchor!.top,
+        left: palette.anchor!.left,
+        width: palette.anchor!.width,
+        '--palette-panel-max-height': `${palette.anchor!.maxHeight}px`,
+        '--palette-list-max-height': `${Math.max(80, palette.anchor!.maxHeight - 54)}px`,
+      } as CSSProperties
+    : undefined;
+  const node = (
+    <div id="insight-palette" className={`insights-page insight-palette ${anchored ? 'palette-anchored' : 'palette-centered'}`}>
       <div className="modal-backdrop" onClick={onClose} />
       <div
         className={`palette-panel${anchored ? ' anchored' : ''}`}
         role="dialog"
         aria-modal="false"
-        style={anchored ? { top: palette.anchor!.top, right: palette.anchor!.right } : undefined}
+        style={panelStyle}
       >
         <input type="search" className="palette-input" placeholder={t('insights.palettePlaceholder')} value={palette.q} autoFocus onChange={event => onInput(event.currentTarget.value)} />
         <div className="palette-list">
@@ -1536,6 +1566,7 @@ function CommandPalette({ palette, items, onClose, onInput, onChoose }: {
       </div>
     </div>
   );
+  return createPortal(node, document.body);
 }
 
 function readInitialState() {
@@ -1894,7 +1925,7 @@ function InsightsPage() {
     const onKey = (event: KeyboardEvent) => {
       if ((event.key === 'k' || event.key === 'K') && (event.metaKey || event.ctrlKey)) {
         event.preventDefault();
-        setPalette(p => p.open ? { open: false, q: '', idx: 0 } : { open: true, q: '', idx: 0 });
+        setPalette(p => p.open ? { open: false, q: '', idx: 0 } : { open: true, q: '', idx: 0, anchor: undefined });
         return;
       }
       if (palette.open) {
@@ -1937,29 +1968,11 @@ function InsightsPage() {
       <div className="page-heading">
         <div>
           <p className="eyebrow">{tr('nav.insights')}</p>
-          <h1>{tr('insights.title')}</h1>
-        </div>
-        <div className="insight-head-acts">
-          <button
-            type="button"
-            id="insight-palette-open"
-            className="ins-clear"
-            onClick={event => {
-              const rect = event.currentTarget.getBoundingClientRect();
-              setPalette({
-                open: true,
-                q: '',
-                idx: 0,
-                anchor: {
-                  top: Math.round(rect.bottom + 8),
-                  right: Math.max(12, Math.round(window.innerWidth - rect.right)),
-                },
-              });
-            }}
-          >
-            {tr('insights.paletteOpen')}
-          </button>
-          <button type="button" id="insight-refresh" className="primary" disabled={refreshing} onClick={() => void refresh()}>{tr('insights.refresh')}</button>
+          <div className="insight-title-line">
+            <h1>{tr('insights.title')}</h1>
+            <InsightTabs active={tab} onChange={next => setTab(next)} />
+            <div id="insight-status" className="insight-page-status">{statusText}</div>
+          </div>
         </div>
       </div>
       <form id="insight-filters" className="filters dashboard-toolbar insights-filters" onSubmit={event => event.preventDefault()}>
@@ -2006,11 +2019,25 @@ function InsightsPage() {
           <span className="filter-toggle-switch" aria-hidden="true" />
         </label>
         <button type="button" id="insight-clear" className="ins-clear" onClick={clearFilters}>{tr('insights.clear')}</button>
+        <div className="insight-head-acts">
+          <button
+            type="button"
+            id="insight-palette-open"
+            className="ins-clear"
+            onClick={event => {
+              setPalette({
+                open: true,
+                q: '',
+                idx: 0,
+                anchor: paletteAnchorFromButton(event.currentTarget),
+              });
+            }}
+          >
+            {tr('insights.paletteOpen')}
+          </button>
+          <button type="button" id="insight-refresh" className="primary" disabled={refreshing} onClick={() => void refresh()}>{tr('insights.refresh')}</button>
+        </div>
       </form>
-      <div className="insight-tab-row">
-        <InsightTabs active={tab} onChange={next => setTab(next)} />
-        <div id="insight-status" className="insight-page-status">{statusText}</div>
-      </div>
       <div className="insight-panel" role="tabpanel" data-tabpanel="overview" hidden={tab !== 'overview'}>
         <div id="insight-overview">{overview ? <OverviewContent data={overview} /> : null}</div>
       </div>

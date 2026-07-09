@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { DropdownMenu, LoadingState, SectionHeader, dropdownLabel } from './dashboard-components.js';
+import { DropdownMenu, SectionHeader, dropdownLabel } from './dashboard-components.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import {
@@ -271,7 +271,7 @@ function TeamHomePage() {
   }
 
   return (
-    <section className="page team-page">
+    <section className="page team-page team-home-page">
       <div className="page-heading">
         <div>
           <p className="eyebrow">{tr('team.eyebrow')}</p>
@@ -285,10 +285,10 @@ function TeamHomePage() {
           <p className="team-identity-row">
             {tr('team.myIdentity')}<b id="tf-owner">{ownerLabel}</b>
             <button type="button" id="tf-autobind" className="page-primary-action" onClick={() => void handleAutoBind()}>{tr('team.bindBtn')}</button>
+            <span id="tf-bind-out" className="team-bind-status" hidden={bindState.kind === 'hidden'}>
+              <BindOutput state={bindState} tr={tr} onPick={unionId => void handleAutoBind(unionId)} />
+            </span>
           </p>
-          <div id="tf-bind-out" className="team-inline-output" hidden={bindState.kind === 'hidden'}>
-            <BindOutput state={bindState} tr={tr} onPick={unionId => void handleAutoBind(unionId)} />
-          </div>
         </div>
       </section>
       <section className="overview-block team-roster-section">
@@ -358,7 +358,7 @@ function toggleSet(prev: Set<string>, key: string): Set<string> {
 function BindOutput(props: { state: BindState; tr: Translator; onPick(unionId: string): void }) {
   const { state, tr } = props;
   if (state.kind === 'hidden') return null;
-  if (state.kind === 'loading') return <LoadingState label={tr(state.key)} className="team-bind-loading" compact />;
+  if (state.kind === 'loading') return <span className="team-bind-loading">{tr(state.key)}</span>;
   if (state.kind === 'ok') return <span className="ok">{tr('team.bound2', { name: state.name })}</span>;
   if (state.kind === 'choice') {
     return (
@@ -545,9 +545,26 @@ function RosterBotRow(props: {
 }) {
   const { bot, tr } = props;
   const dim = bot.deployment.stale ? { opacity: .55 } : undefined;
+  const togglePicked = () => props.onPick(props.teamKey, bot.larkAppId, !props.picked);
   return (
-    <article className="team-bot-row" style={dim}>
-      <label className={`team-check-pill${props.picked ? ' selected' : ''}`}>
+    <article
+      className={`team-bot-row${props.picked ? ' selected' : ''}`}
+      style={dim}
+      role="checkbox"
+      aria-checked={props.picked}
+      tabIndex={0}
+      onClick={ev => {
+        if (isTeamRowInteractiveTarget(ev.target)) return;
+        togglePicked();
+      }}
+      onKeyDown={ev => {
+        if (ev.key !== 'Enter' && ev.key !== ' ') return;
+        if (isTeamRowInteractiveTarget(ev.target)) return;
+        ev.preventDefault();
+        togglePicked();
+      }}
+    >
+      <label className={`team-check-pill${props.picked ? ' selected' : ''}`} onClick={ev => ev.stopPropagation()}>
         <input
           type="checkbox"
           className="tf-pick"
@@ -556,7 +573,7 @@ function RosterBotRow(props: {
           checked={props.picked}
           onChange={ev => props.onPick(props.teamKey, bot.larkAppId, ev.target.checked)}
         />
-        <span className="filter-toggle-switch" aria-hidden="true" />
+        <span className="team-check-dot" aria-hidden="true" />
       </label>
       <div className="team-bot-main">
         <strong>{bot.name}</strong>
@@ -583,7 +600,7 @@ function RosterBotRow(props: {
             />
           </label>
         ) : (
-          bot.capability ? bot.capability : <span className="muted">—</span>
+          bot.capability || null
         )}
       </div>
       <div className="team-role-cell">
@@ -595,6 +612,11 @@ function RosterBotRow(props: {
       </div>
     </article>
   );
+}
+
+function isTeamRowInteractiveTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return Boolean(target.closest('button, input, textarea, select, a, label, [contenteditable="true"]'));
 }
 
 function TeamGroupOutput(props: { output?: TeamOutput; tr: Translator }) {

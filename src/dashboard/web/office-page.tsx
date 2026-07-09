@@ -94,12 +94,14 @@ function OfficePage() {
 
   if (status?.state === 'ready') {
     return (
-      <iframe
-        src="/game/index.html"
-        title="HD2D Office"
-        style={{ flex: 1, width: '100%', minHeight: 0, border: 'none', display: 'block', background: '#0b0d12' }}
-        allow="autoplay"
-      />
+      <div className="office-frame-shell">
+        <iframe
+          className="office-game-frame"
+          src="/game/index.html"
+          title="HD2D Office"
+          allow="autoplay"
+        />
+      </div>
     );
   }
 
@@ -157,21 +159,11 @@ function OfficeLoader(props: {
         <>
           <input
             id="hd2d-proxy"
+            className="office-proxy-input"
             type="text"
             value={props.proxy}
             onChange={e => props.onProxyChange(e.currentTarget.value)}
             placeholder="HTTP 代理（可选，如 http://127.0.0.1:7890）"
-            style={{
-              width: '100%',
-              boxSizing: 'border-box',
-              marginBottom: 12,
-              padding: '8px 10px',
-              borderRadius: 'var(--radius-lg)',
-              border: '1px solid var(--border)',
-              background: 'var(--surface-raised)',
-              color: 'inherit',
-              fontSize: 12,
-            }}
           />
           <div style={{ fontSize: 11, opacity: 0.5, marginBottom: 14, textAlign: 'left' }}>
             连不上 GitHub 时填代理（仅用于下载本资源，会记住）。留空走直连/系统代理环境变量。
@@ -197,13 +189,17 @@ export function renderOfficePage(root: HTMLElement): PageDisposer {
     padding: root.style.padding,
     flex: root.style.flex,
     minHeight: root.style.minHeight,
+    minWidth: root.style.minWidth,
     display: root.style.display,
+    overflow: root.style.overflow,
   };
   root.style.maxWidth = 'none';
   root.style.padding = '0';
   root.style.flex = '1 1 auto';
   root.style.minHeight = '0';
+  root.style.minWidth = '0';
   root.style.display = 'flex';
+  root.style.overflow = 'hidden';
 
   const dispose = mountReactPage(root, <OfficePage />);
   return () => {
@@ -212,6 +208,8 @@ export function renderOfficePage(root: HTMLElement): PageDisposer {
     root.style.padding = prev.padding;
     root.style.flex = prev.flex;
     root.style.minHeight = prev.minHeight;
+    root.style.minWidth = prev.minWidth;
     root.style.display = prev.display;
+    root.style.overflow = prev.overflow;
   };
 }

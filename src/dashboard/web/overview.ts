@@ -1,4 +1,5 @@
 import { attentionReason, botNameForAppId } from './ui.js';
+import { fetchGroupsSnapshot } from './groups-api.js';
 
 let groupsSnapshot: { chats: any[]; bots: any[] } = { chats: [], bots: [] };
 
@@ -8,9 +9,7 @@ export function __setGroupsSnapshotForTest(snapshot: { chats: any[]; bots: any[]
 
 export async function loadGroupsSnapshot(): Promise<void> {
   try {
-    const r = await fetch('/api/groups');
-    if (!r.ok) return;
-    groupsSnapshot = await r.json();
+    groupsSnapshot = await fetchGroupsSnapshot();
   } catch {
     // Overview stays useful even when Lark group APIs are unavailable.
   }

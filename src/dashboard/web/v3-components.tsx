@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { SectionHeader } from './dashboard-components.js';
 import { legacyWorkflowDetailHash } from './legacy-workflow-link.js';
 import { useT } from './react-hooks.js';
 import { fetchV3RunDetail, fetchV3Runs, probeLegacyV2RunSnapshot, shouldProbeLegacyV2Fallback } from './v3-api.js';
+import { WorkflowVersionSwitch } from './workflow-version-switch.js';
 import {
   V3_DECISION_LABEL,
   V3_GRAPH,
@@ -129,7 +130,7 @@ function V3ListPage(): JSX.Element {
   const headingActions = (
     <div className="page-heading-actions v3r-run-toolbar">
       <span className="v3r-run-count">{runs.length}</span>
-      <a className="sect-head-action" href="#/legacy-workflow">旧版运行</a>
+      <WorkflowVersionSwitch active="v3" />
     </div>
   );
 
@@ -200,14 +201,15 @@ function V3DetailPage(props: { runId: string }): JSX.Element {
 
   return (
     <>
-      <div className="page-heading">
-        <div>
+      <div className="page-heading v3r-detail-heading">
+        <div className="v3r-title-row">
           <p className="eyebrow">{tr('nav.workflows')}</p>
+          <a href="#/workflows" className="btn-link v3r-back-link">← {tr('nav.workflows')}</a>
           <h1>{props.runId}</h1>
+          <span className={`${statusClass} v3r-run-status-pill`}>{statusText}</span>
         </div>
         <div className="page-heading-actions">
-          <span className={statusClass}>{statusText}</span>
-          <a href="#/workflows" className="btn-link">← {tr('nav.workflows')}</a>
+          <WorkflowVersionSwitch active="v3" />
         </div>
       </div>
       <div className="v3r-wrap">
@@ -224,7 +226,12 @@ function V3DetailPage(props: { runId: string }): JSX.Element {
         <section className="overview-block v3r-node-section">
           <SectionHeader
             title="节点详情"
-            hint={selectedNode ? <code>{selectedNode.id}</code> : '选择一个节点'}
+            hint={selectedNode ? (
+              <span className={`v3r-pill v3r-node-status-pill st-${selectedNode.status}`}>
+                <i className="dot" />
+                {V3_NODE_LABEL[selectedNode.status]}
+              </span>
+            ) : '选择一个节点'}
           />
           <NodePanel
             runId={props.runId}
@@ -262,33 +269,63 @@ function DagGraph(props: {
   onSelect: (nodeId: string) => void;
 }): JSX.Element {
   const layout = useMemo(() => props.view ? buildGraphLayout(props.view) : null, [props.view]);
+  const graphRef = useRef<HTMLDivElement | null>(null);
+
+  useLayoutEffect(() => {
+    const graph = graphRef.current;
+    if (!graph || !layout) return undefined;
+
+    let frame = 0;
+    const centerGraph = () => {
+      frame = 0;
+      graph.scrollLeft = Math.max(0, (graph.scrollWidth - graph.clientWidth) / 2);
+      graph.scrollTop = Math.max(0, (graph.scrollHeight - graph.clientHeight) / 2);
+    };
+    const scheduleCenter = () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(centerGraph);
+    };
+
+    scheduleCenter();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(scheduleCenter);
+    observer?.observe(graph);
+    const stage = graph.querySelector('.v3r-graph-stage');
+    if (stage) observer?.observe(stage);
+
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      observer?.disconnect();
+    };
+  }, [layout]);
 
   return (
-    <div id="v3-graph" className="v3r-graph">
+    <div id="v3-graph" className="v3r-graph" ref={graphRef}>
       {layout ? (
-        <svg width={layout.width} height={layout.height} viewBox={`0 0 ${layout.width} ${layout.height}`} style={{ display: 'block' }}>
-          <defs>
-            <marker id="v3arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-              <path d="M0,0 L10,5 L0,10 z" fill="var(--faint, #8b98aa)" />
-            </marker>
-          </defs>
-          {layout.edges.map((edge) => (
-            <path
-              key={`${edge.fromId}->${edge.toId}`}
-              className={`v3r-edge${edge.live ? ' live' : ''}`}
-              d={`M${edge.x1},${edge.y1} C${edge.mx},${edge.y1} ${edge.mx},${edge.y2} ${edge.x2},${edge.y2}`}
-              markerEnd="url(#v3arrow)"
-            />
-          ))}
-          {layout.nodes.map((box) => (
-            <DagNode
-              key={box.node.id}
-              box={box}
-              selected={box.node.id === props.selectedId}
-              onSelect={props.onSelect}
-            />
-          ))}
-        </svg>
+        <div className="v3r-graph-stage">
+          <svg width={layout.width} height={layout.height} viewBox={`0 0 ${layout.width} ${layout.height}`}>
+            <defs>
+              <marker id="v3arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="var(--faint, #8b98aa)" />
+              </marker>
+            </defs>
+            {layout.edges.map((edge) => (
+              <path
+                key={`${edge.fromId}->${edge.toId}`}
+                className={`v3r-edge${edge.live ? ' live' : ''}`}
+                d={`M${edge.x1},${edge.y1} C${edge.mx},${edge.y1} ${edge.mx},${edge.y2} ${edge.x2},${edge.y2}`}
+                markerEnd="url(#v3arrow)"
+              />
+            ))}
+            {layout.nodes.map((box) => (
+              <DagNode
+                key={box.node.id}
+                box={box}
+                selected={box.node.id === props.selectedId}
+                onSelect={props.onSelect}
+              />
+            ))}
+          </svg>
+        </div>
       ) : null}
     </div>
   );
@@ -311,7 +348,6 @@ function DagNode(props: {
       onClick={() => props.onSelect(node.id)}
     >
       <rect className="v3r-box" x={box.x} y={box.y} width={V3_GRAPH.nodeWidth} height={V3_GRAPH.plainHeight} rx="10" />
-      <rect className="v3r-bar" x={box.x} y={box.y + 8} width="3" height={V3_GRAPH.plainHeight - 16} rx="1.5" />
       <text className="v3r-nid" x={box.x + 14} y={box.y + 20}>{trunc(node.id, 18)}</text>
       <text className="v3r-nstatus" x={box.x + 14} y={box.y + 37}>{V3_NODE_LABEL[node.status]}</text>
     </g>
@@ -411,11 +447,6 @@ function NodePanel(props: {
   return (
     <div id="v3-node-panel" className="v3r-panel">
       <div id="v3-node-meta">
-        <div className="v3r-panel-head">
-          {node.isLoop ? <span className="v3r-loop-mark">⟳</span> : null}
-          <span className="v3r-nodeid">{node.id}</span>
-          <span className={`v3r-pill st-${node.status}`}><i className="dot" />{V3_NODE_LABEL[node.status]}</span>
-        </div>
         {node.goal ? <p className="v3r-goal">{node.goal}</p> : null}
         {node.depends.length ? (
           <p className="v3r-deps">

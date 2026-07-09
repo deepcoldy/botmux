@@ -15,7 +15,7 @@ import {
 } from './bot-defaults.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
-import { DropdownMenu, Html, LoadingState, dropdownLabel } from './dashboard-components.js';
+import { DropdownMenu, Html, InfoTip as BaseInfoTip, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { botAvatarHtml, loadNameMaps, ui } from './ui.js';
 
 type StatusMessage = { text: string; ok?: boolean } | null;
@@ -54,12 +54,7 @@ function StatusSpan(props: { status: StatusMessage; attr?: Record<string, string
 
 function InfoTip(props: { children: ReactNode }) {
   const ariaLabel = typeof props.children === 'string' ? props.children : undefined;
-  return (
-    <span className="bd-info-tip" tabIndex={0} aria-label={ariaLabel} onClick={event => event.preventDefault()}>
-      <span className="bd-info-mark" aria-hidden="true">?</span>
-      <span className="bd-info-pop" role="tooltip">{props.children}</span>
-    </span>
-  );
+  return <BaseInfoTip className="bd-info-tip" label={ariaLabel}>{props.children}</BaseInfoTip>;
 }
 
 function FieldTitle(props: { children: ReactNode; help?: ReactNode }) {
@@ -301,40 +296,44 @@ function BotDefaultsPage() {
           <p className="eyebrow">{tr('nav.botDefaults')}</p>
           <h1>{tr('botDefaults.title')}</h1>
         </div>
+        <div className="page-heading-actions">
+          <button type="button" id="bd-refresh" disabled={refreshing} onClick={() => void reload()}>{tr('botDefaults.refresh')}</button>
+          {ui.authed ? (
+            <button
+              type="button"
+              className="page-primary-action add-bot-btn"
+              disabled={onboardingBusy}
+              onClick={() => {
+                setOnboardingBusy(true);
+                void openBotOnboarding().finally(() => setOnboardingBusy(false));
+              }}
+            >
+              {tr('botOnboarding.add')}
+            </button>
+          ) : null}
+        </div>
       </div>
-      <form id="bd-filters" className="filters dashboard-toolbar" onSubmit={event => event.preventDefault()}>
-        <input
-          type="search"
-          name="q"
-          placeholder={tr('botDefaults.search')}
-          value={query}
-          onChange={event => setQuery(event.currentTarget.value)}
-        />
-        <button type="button" id="bd-refresh" disabled={refreshing} onClick={() => void reload()}>{tr('botDefaults.refresh')}</button>
-        {ui.authed ? (
-          <button
-            type="button"
-            className="page-primary-action add-bot-btn"
-            disabled={onboardingBusy}
-            onClick={() => {
-              setOnboardingBusy(true);
-              void openBotOnboarding().finally(() => setOnboardingBusy(false));
-            }}
-          >
-            {tr('botOnboarding.add')}
-          </button>
-        ) : null}
-      </form>
       <div className="bd-layout">
         <aside id="bd-roster" className="bd-roster">
-          {!loadError && filtered.map(bot => (
-            <RosterItem
-              key={bot.larkAppId}
-              bot={bot}
-              selected={bot.larkAppId === selectedAppId}
-              onSelect={() => setSelectedAppId(bot.larkAppId)}
+          <form id="bd-filters" className="filters dashboard-toolbar" onSubmit={event => event.preventDefault()}>
+            <input
+              type="search"
+              name="q"
+              placeholder={tr('botDefaults.search')}
+              value={query}
+              onChange={event => setQuery(event.currentTarget.value)}
             />
-          ))}
+          </form>
+          <div className="bd-roster-list">
+            {!loadError && filtered.map(bot => (
+              <RosterItem
+                key={bot.larkAppId}
+                bot={bot}
+                selected={bot.larkAppId === selectedAppId}
+                onSelect={() => setSelectedAppId(bot.larkAppId)}
+              />
+            ))}
+          </div>
         </aside>
         <div id="bd-list" className="bd-detail">{detail}</div>
       </div>
@@ -408,12 +407,18 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
           <Html html={botAvatarHtml({ name, larkAppId: bot.larkAppId, dot: 'ok' })} />
         </div>
         <div className="bd-profile-main">
-          <BotProfileIdentity bot={bot} cli={cli} patchBot={patchBot} />
-        </div>
-        <div className="bd-profile-meta bd-meta">
-          <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>
-          <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small>
-          <small>{tr('botDefaults.autobound', { count: bot.autoboundChatCount ?? 0 })}</small>
+          <BotProfileIdentity
+            bot={bot}
+            cli={cli}
+            patchBot={patchBot}
+            meta={(
+              <>
+                <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>
+                <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small>
+                <small>{tr('botDefaults.autobound', { count: bot.autoboundChatCount ?? 0 })}</small>
+              </>
+            )}
+          />
         </div>
       </header>
       <div className="bd-body bd-grid">
@@ -449,7 +454,7 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
 function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   return (
-    <section className="bd-section">
+    <section className="bd-section bd-runtime-env">
       <h3 className="bd-section-title">{tr('botDefaults.sectionRuntimeEnv')}</h3>
       <StartupCommandsSection bot={props.bot} patchBot={props.patchBot} />
       <LaunchShellSection bot={props.bot} patchBot={props.patchBot} />
@@ -458,7 +463,7 @@ function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: Patch
   );
 }
 
-function BotProfileIdentity(props: { bot: BotDefaultsRow; cli: string; patchBot: PatchBot }) {
+function BotProfileIdentity(props: { bot: BotDefaultsRow; cli: string; patchBot: PatchBot; meta?: ReactNode }) {
   const tr = useT();
   const { bot, cli, patchBot } = props;
   const name = bot.botName ?? bot.larkAppId;
@@ -528,41 +533,48 @@ function BotProfileIdentity(props: { bot: BotDefaultsRow; cli: string; patchBot:
 
   return (
     <div className="bd-profile-id">
-      <span className="bd-name-row" data-name-row hidden={editing}>
-        <strong data-bot-name>{name}</strong>
-        <button
-          type="button"
-          className="bd-name-edit"
-          data-action="edit-bot-name"
-          title={tr('botDefaults.renameTitle')}
-          aria-label={tr('botDefaults.renameTitle')}
-          onClick={() => setEditMode(true)}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" /></svg>
-        </button>
-      </span>
-      <span className="bd-name-editor" data-name-editor hidden={!editing}>
-        <input
-          type="text"
-          className="bd-name-input"
-          data-input="botRename"
-          maxLength={64}
-          value={draft}
-          disabled={busy}
-          onChange={event => setDraft(event.currentTarget.value)}
-          onKeyDown={event => {
-            if (event.key === 'Enter') {
-              event.preventDefault();
-              void submitRename();
-            } else if (event.key === 'Escape') {
-              setEditMode(false);
-            }
-          }}
-        />
-        <button type="button" className="primary" data-action="save-bot-name" disabled={busy} onClick={() => void submitRename()}>{tr('botDefaults.renameSave')}</button>
-        <button type="button" data-action="cancel-bot-name" disabled={busy} onClick={() => setEditMode(false)}>{tr('botDefaults.renameCancel')}</button>
-      </span>
-      {cli ? <span className="mate-role">{cli}</span> : null}
+      {!editing ? (
+        <div className="bd-profile-title-row" data-name-row>
+          <div className="bd-profile-title-content">
+            <strong data-bot-name>{name}</strong>
+            {cli ? <span className="mate-role bd-profile-cli-tag">{cli}</span> : null}
+            {props.meta ? <span className="bd-profile-meta bd-meta">{props.meta}</span> : null}
+          </div>
+          <button
+            type="button"
+            className="bd-name-edit"
+            data-action="edit-bot-name"
+            title={tr('botDefaults.renameTitle')}
+            aria-label={tr('botDefaults.renameTitle')}
+            onClick={() => setEditMode(true)}
+          >
+            {tr('botDefaults.renameAction')}
+          </button>
+        </div>
+      ) : (
+        <span className="bd-name-editor" data-name-editor>
+          <input
+            type="text"
+            className="bd-name-input"
+            data-input="botRename"
+            maxLength={64}
+            value={draft}
+            disabled={busy}
+            autoFocus
+            onChange={event => setDraft(event.currentTarget.value)}
+            onKeyDown={event => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                void submitRename();
+              } else if (event.key === 'Escape') {
+                setEditMode(false);
+              }
+            }}
+          />
+          <button type="button" className="primary" data-action="save-bot-name" disabled={busy} onClick={() => void submitRename()}>{tr('botDefaults.renameSave')}</button>
+          <button type="button" data-action="cancel-bot-name" disabled={busy} onClick={() => setEditMode(false)}>{tr('botDefaults.renameCancel')}</button>
+        </span>
+      )}
       <code>{bot.larkAppId}</code>
       <small className={statusClass(status, 'bd-name-status')} data-name-status>{status?.text ?? ''}</small>
       <button type="button" className="bd-feishu-login" data-action="feishu-login" hidden={!loginVisible} onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
@@ -1175,8 +1187,7 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         onChange={event => setRole(event.currentTarget.value)}
       />
       <div className="actions">
-        <button type="button" className="primary" data-action="save-role" disabled={!loaded || busy} onClick={() => void putRole(role, false)}>{tr('botDefaults.roleSave')}</button>
-        <button type="button" data-action="delete-role" disabled={!loaded || busy} onClick={() => void putRole('', true)}>{tr('botDefaults.roleDelete')}</button>
+        <button type="button" className="primary" data-action="save-role" disabled={!loaded || busy} onClick={() => void putRole(role, role.trim() === '')}>{tr('botDefaults.roleSave')}</button>
         <StatusSpan status={status} attr={{ 'data-role-status': '' }} />
       </div>
       <ProfileRoles appId={bot.larkAppId} />
@@ -1198,14 +1209,15 @@ function ProfileRoles(props: { appId: string }) {
         if (!active) return;
         if (!r.ok) throw new Error(body?.error ?? String(r.status));
         const profiles = Array.isArray(body.profiles) ? body.profiles : [];
+        const items = profiles
+          .filter((profile: any) => (profile.botEntries ?? []).some((entry: any) =>
+            entry?.larkAppId === props.appId && entry?.hasEntry,
+          ))
+          .map((profile: any) => ({ profileId: String(profile.profileId) }));
         setState({
           loaded: true,
           loading: false,
-          items: profiles
-            .filter((profile: any) => (profile.botEntries ?? []).some((entry: any) =>
-              entry?.larkAppId === props.appId && entry?.hasEntry,
-            ))
-            .map((profile: any) => ({ profileId: String(profile.profileId) })),
+          items,
         });
       } catch (e: any) {
         if (active) setState({ loaded: true, loading: false, error: caughtErrorText(e), items: [] });
@@ -1253,7 +1265,7 @@ function ProfileRoles(props: { appId: string }) {
           if (event.currentTarget.open) void loadDetail(item.profileId);
         }}
       >
-        <summary><code>{item.profileId}</code></summary>
+        <summary><span className="bd-profile-role-id">{item.profileId}</span></summary>
         <div className="bd-profile-role-content" data-profile-role-body={item.profileId}>
           {item.loading ? <LoadingState label={tr('common.loading')} compact /> : item.error ? (
             <p className="hint-warn-inline">{tr('botDefaults.profileRoleDetailLoadFailed', { error: item.error })}</p>
@@ -1308,50 +1320,52 @@ function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: Ca
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionCard')}</h3>
-      <ToggleRow
-        checked={disableStreaming}
-        disabled={busy === 'streaming'}
-        dataAction="toggle-disable-streaming"
-        title={tr('botDefaults.disableStreaming')}
-        help={tr('botDefaults.disableStreamingHelp')}
-        onChange={checked => {
-          setDisableStreaming(checked);
-          void savePatch({ disableStreamingCard: checked }, 'streaming');
-        }}
-      />
-      <ToggleRow
-        checked={silentReactions}
-        disabled={!disableStreaming || busy === 'silent'}
-        dataAction="toggle-silent-reactions"
-        title={tr('botDefaults.silentTurnReactions')}
-        help={tr('botDefaults.silentTurnReactionsHelp')}
-        onChange={checked => {
-          setSilentReactions(checked);
-          void savePatch({ silentTurnReactions: checked }, 'silent');
-        }}
-      />
-      <ToggleRow
-        checked={writableLink}
-        disabled={disableStreaming || busy === 'writable'}
-        dataAction="toggle-writable-link"
-        title={tr('botDefaults.writableLink')}
-        help={tr('botDefaults.writableLinkHelp')}
-        onChange={checked => {
-          setWritableLink(checked);
-          void savePatch({ writableTerminalLinkInCard: checked }, 'writable');
-        }}
-      />
-      <ToggleRow
-        checked={privateCard}
-        disabled={busy === 'private'}
-        dataAction="toggle-private-card"
-        title={tr('botDefaults.privateCard')}
-        help={tr('botDefaults.privateCardHelp')}
-        onChange={checked => {
-          setPrivateCard(checked);
-          void savePatch({ privateCard: checked }, 'private');
-        }}
-      />
+      <div className="bd-toggle-grid bd-card-behavior-grid">
+        <ToggleRow
+          checked={disableStreaming}
+          disabled={busy === 'streaming'}
+          dataAction="toggle-disable-streaming"
+          title={tr('botDefaults.disableStreaming')}
+          help={tr('botDefaults.disableStreamingHelp')}
+          onChange={checked => {
+            setDisableStreaming(checked);
+            void savePatch({ disableStreamingCard: checked }, 'streaming');
+          }}
+        />
+        <ToggleRow
+          checked={silentReactions}
+          disabled={!disableStreaming || busy === 'silent'}
+          dataAction="toggle-silent-reactions"
+          title={tr('botDefaults.silentTurnReactions')}
+          help={tr('botDefaults.silentTurnReactionsHelp')}
+          onChange={checked => {
+            setSilentReactions(checked);
+            void savePatch({ silentTurnReactions: checked }, 'silent');
+          }}
+        />
+        <ToggleRow
+          checked={writableLink}
+          disabled={disableStreaming || busy === 'writable'}
+          dataAction="toggle-writable-link"
+          title={tr('botDefaults.writableLink')}
+          help={tr('botDefaults.writableLinkHelp')}
+          onChange={checked => {
+            setWritableLink(checked);
+            void savePatch({ writableTerminalLinkInCard: checked }, 'writable');
+          }}
+        />
+        <ToggleRow
+          checked={privateCard}
+          disabled={busy === 'private'}
+          dataAction="toggle-private-card"
+          title={tr('botDefaults.privateCard')}
+          help={tr('botDefaults.privateCardHelp')}
+          onChange={checked => {
+            setPrivateCard(checked);
+            void savePatch({ privateCard: checked }, 'private');
+          }}
+        />
+      </div>
       <div className="actions">
         <small data-card-pref-moot className="hint-warn-inline" hidden={!disableStreaming}>{tr('botDefaults.writableLinkMoot')}</small>
         <StatusSpan status={status} attr={{ 'data-card-pref-status': '' }} />
@@ -1955,28 +1969,30 @@ function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionGrant')}</h3>
-      <ToggleRow
-        checked={autoCard}
-        disabled={busy === 'autoGrant'}
-        dataAction="toggle-auto-grant-card"
-        title={tr('botDefaults.autoGrantCard')}
-        help={tr('botDefaults.autoGrantCardHelp')}
-        onChange={checked => {
-          setAutoCard(checked);
-          void savePatch({ autoGrantRequestCards: checked }, 'autoGrant');
-        }}
-      />
-      <ToggleRow
-        checked={restrict}
-        disabled={busy === 'restrict'}
-        dataAction="toggle-restrict-grant"
-        title={tr('botDefaults.restrictGrant')}
-        help={tr('botDefaults.restrictGrantHelp')}
-        onChange={checked => {
-          setRestrict(checked);
-          void savePatch({ restrictGrantCommands: checked }, 'restrict');
-        }}
-      />
+      <div className="bd-toggle-grid bd-grant-toggle-grid">
+        <ToggleRow
+          checked={autoCard}
+          disabled={busy === 'autoGrant'}
+          dataAction="toggle-auto-grant-card"
+          title={tr('botDefaults.autoGrantCard')}
+          help={tr('botDefaults.autoGrantCardHelp')}
+          onChange={checked => {
+            setAutoCard(checked);
+            void savePatch({ autoGrantRequestCards: checked }, 'autoGrant');
+          }}
+        />
+        <ToggleRow
+          checked={restrict}
+          disabled={busy === 'restrict'}
+          dataAction="toggle-restrict-grant"
+          title={tr('botDefaults.restrictGrant')}
+          help={tr('botDefaults.restrictGrantHelp')}
+          onChange={checked => {
+            setRestrict(checked);
+            void savePatch({ restrictGrantCommands: checked }, 'restrict');
+          }}
+        />
+      </div>
       <div className="bd-row bd-quota">
         <label>
           <FieldTitle help={tr('botDefaults.quotaHelp')}>{tr('botDefaults.quotaDefault')}</FieldTitle>
@@ -1986,7 +2002,6 @@ function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       </div>
       <div className="actions">
         <button type="button" className="primary" data-action="save-quota" disabled={busy === 'quota'} onClick={saveQuota}>{tr('botDefaults.quotaSave')}</button>
-        <button type="button" data-action="off-quota" disabled={busy === 'quota'} onClick={() => { setQuotaInput(''); void savePatch({ messageQuotaDefaultLimit: null }, 'quota'); }}>{tr('botDefaults.quotaOff')}</button>
         <StatusSpan status={status} attr={{ 'data-grant-status': '' }} />
       </div>
     </section>

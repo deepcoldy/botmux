@@ -17,83 +17,6 @@ export function Html(props: { html: string; as?: 'span' | 'div' }): JSX.Element 
   return <Tag style={{ display: 'contents' }} dangerouslySetInnerHTML={{ __html: props.html }} />;
 }
 
-export function OverflowText(props: {
-  text: string;
-  className?: string;
-  durationMs?: number;
-  showPopover?: boolean;
-}): JSX.Element {
-  const ref = useRef<HTMLSpanElement | null>(null);
-  const [overflowing, setOverflowing] = useState(false);
-  const [open, setOpen] = useState(false);
-  const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
-  const durationMs = props.durationMs ?? 4200;
-
-  const measure = useCallback(() => {
-    const el = ref.current;
-    if (!el) return;
-    setOverflowing(el.scrollWidth > el.clientWidth + 1);
-  }, []);
-
-  useEffect(() => {
-    measure();
-    const el = ref.current;
-    if (!el || typeof ResizeObserver === 'undefined') return undefined;
-    const observer = new ResizeObserver(measure);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [measure, props.text]);
-
-  const show = useCallback(() => {
-    measure();
-    const el = ref.current;
-    if (!el || !overflowing || props.showPopover === false) return;
-    const rect = el.getBoundingClientRect();
-    setPosition({ left: rect.left + rect.width / 2, top: rect.bottom + 8 });
-    setOpen(true);
-  }, [measure, overflowing, props.showPopover]);
-
-  const hide = useCallback(() => setOpen(false), []);
-
-  useEffect(() => {
-    if (!open) return undefined;
-    const close = () => setOpen(false);
-    window.addEventListener('resize', close);
-    window.addEventListener('scroll', close, true);
-    return () => {
-      window.removeEventListener('resize', close);
-      window.removeEventListener('scroll', close, true);
-    };
-  }, [open]);
-
-  const popover = open && overflowing && position && typeof document !== 'undefined'
-    ? createPortal(
-      <span className="ui-overflow-pop" role="tooltip" style={{ left: position.left, top: position.top }}>
-        {props.text}
-      </span>,
-      document.body,
-    )
-    : null;
-
-  return (
-    <>
-      <span
-        ref={ref}
-        className={['ui-overflow-text', props.className].filter(Boolean).join(' ')}
-        data-overflow={overflowing ? 'true' : 'false'}
-        style={{ '--overflow-duration': `${durationMs}ms` } as CSSProperties}
-        onMouseEnter={show}
-        onMouseLeave={hide}
-        onFocus={show}
-        onBlur={hide}
-      >
-        <span>{props.text}</span>
-      </span>
-      {popover}
-    </>
-  );
-}
-
 export function LoadingState(props: {
   label: ReactNode;
   className?: string;
@@ -212,6 +135,121 @@ export function InfoTip(props: {
       onBlur={hide}
     >
       <span className="ui-info-mark" aria-hidden="true">?</span>
+      {popover}
+    </span>
+  );
+}
+
+export function OverflowText(props: {
+  text: string;
+  children?: ReactNode;
+  className?: string;
+  textClassName?: string;
+  popoverClassName?: string;
+  showPopover?: boolean;
+  durationMs?: number;
+}): JSX.Element {
+  const anchorRef = useRef<HTMLSpanElement | null>(null);
+  const [open, setOpen] = useState(false);
+  const [overflowing, setOverflowing] = useState(false);
+  const [position, setPosition] = useState<{ left: number; top: number; placement: 'top' | 'bottom' } | null>(null);
+
+  const measureOverflow = useCallback((): boolean => {
+    const anchor = anchorRef.current;
+    if (!anchor) return false;
+    const text = anchor.querySelector<HTMLElement>('.ui-overflow-scroll') ?? anchor;
+    const nextOverflowing = text.scrollWidth > anchor.clientWidth + 1;
+    setOverflowing(nextOverflowing);
+    if (!nextOverflowing) setOpen(false);
+    return nextOverflowing;
+  }, []);
+
+  const updatePosition = useCallback(() => {
+    const anchor = anchorRef.current;
+    if (!anchor || typeof window === 'undefined') return;
+    const rect = anchor.getBoundingClientRect();
+    const maxWidth = Math.min(460, Math.max(220, window.innerWidth - 48));
+    const minLeft = 24 + maxWidth / 2;
+    const maxLeft = window.innerWidth - 24 - maxWidth / 2;
+    const centered = rect.left + rect.width / 2;
+    const left = Math.min(Math.max(centered, minLeft), Math.max(minLeft, maxLeft));
+    const useBottom = rect.top < 84;
+    setPosition({
+      left,
+      top: useBottom ? rect.bottom + 8 : rect.top - 8,
+      placement: useBottom ? 'bottom' : 'top',
+    });
+  }, []);
+
+  const show = useCallback(() => {
+    if (!props.text.trim() || !measureOverflow()) return;
+    if (props.showPopover === false) {
+      setOpen(false);
+      return;
+    }
+    updatePosition();
+    setOpen(true);
+  }, [measureOverflow, props.showPopover, props.text, updatePosition]);
+
+  const hide = useCallback(() => setOpen(false), []);
+
+  useEffect(() => {
+    const anchor = anchorRef.current;
+    if (!anchor || typeof window === 'undefined') return undefined;
+    const raf = window.requestAnimationFrame(measureOverflow);
+    const resizeObserver = typeof ResizeObserver !== 'undefined'
+      ? new ResizeObserver(() => measureOverflow())
+      : null;
+    resizeObserver?.observe(anchor);
+    window.addEventListener('resize', measureOverflow);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      resizeObserver?.disconnect();
+      window.removeEventListener('resize', measureOverflow);
+    };
+  }, [measureOverflow, props.text]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
+  }, [open, updatePosition]);
+
+  const popover = props.showPopover !== false && open && position && typeof document !== 'undefined'
+    ? createPortal(
+      <span
+        className={[
+          'ui-info-pop',
+          'ui-info-pop-floating',
+          `ui-info-pop-${position.placement}`,
+          'ui-overflow-popover',
+          props.popoverClassName,
+        ].filter(Boolean).join(' ')}
+        role="tooltip"
+        style={{ left: position.left, top: position.top }}
+      >
+        {props.text}
+      </span>,
+      document.body,
+    )
+    : null;
+
+  return (
+    <span
+      ref={anchorRef}
+      className={['ui-overflow-text', overflowing ? 'is-overflowing' : '', props.className].filter(Boolean).join(' ')}
+      style={props.durationMs ? { '--ui-overflow-duration': `${props.durationMs}ms` } as CSSProperties : undefined}
+      onMouseEnter={show}
+      onMouseLeave={hide}
+    >
+      <span className={['ui-overflow-scroll', props.textClassName].filter(Boolean).join(' ')}>
+        {props.children ?? props.text}
+      </span>
       {popover}
     </span>
   );

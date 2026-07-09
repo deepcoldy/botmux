@@ -54,7 +54,7 @@ type Translator = ReturnType<typeof useT>;
 type DialogState =
   | { type: 'create'; roleProfiles: RoleProfileSummaryLike[] }
   | { type: 'add-bots'; chat: GroupChat }
-  | { type: 'save-profile'; chat: GroupChat; suggestedProfileId: string; entries: SaveProfileEntry[]; profiles: RoleProfileSummaryLike[] }
+  | { type: 'save-profile'; chat: GroupChat; suggestedProfileId: string }
   | { type: 'manage'; chat: GroupChat };
 
 type DialogErrorState = { title: string; reason: unknown };
@@ -240,7 +240,6 @@ function GroupListRow(props: {
   chat: GroupChat;
   bots: GroupBot[];
   roleContext: RoleProfileContext;
-  savingProfileChatId: string | null;
   tr: Translator;
   onAddBots(chat: GroupChat): void;
   onSaveProfile(chat: GroupChat): void;
@@ -255,27 +254,33 @@ function GroupListRow(props: {
       <OverviewListMain>
         <div className="groups-row-head">
           <b>{chat.name ?? chat.chatId}</b>
-          <span className="groups-row-count">{tr('groups.memberSummary', { count: inCount, total: props.bots.length })}</span>
-        </div>
-        <div className="groups-row-meta">
-          <code>{chat.chatId}</code>
-          {chat.ownerId ? <span>{tr('groups.owner')}: <code>{chat.ownerId}</code></span> : null}
+          <span className="groups-row-meta">
+            <span className="groups-row-tag"><code>{chat.chatId}</code></span>
+            {chat.ownerId ? (
+              <span className="groups-row-tag groups-row-owner-tag">
+                <span>{tr('groups.owner')}</span>
+                <code>{chat.ownerId}</code>
+              </span>
+            ) : null}
+          </span>
         </div>
         <GroupProfileStatus chat={chat} context={props.roleContext} tr={tr} />
-        <GroupBotCoverage chat={chat} bots={props.bots} tr={tr} />
       </OverviewListMain>
-      <OverviewListTail>
-        <button className="add-bots" type="button" onClick={() => props.onAddBots(chat)}>{tr('groups.addBots')}</button>
-        <button
-          className="save-profile"
-          type="button"
-          disabled={props.savingProfileChatId === chat.chatId}
-          onClick={() => props.onSaveProfile(chat)}
-        >
-          {props.savingProfileChatId === chat.chatId ? tr('groups.saveProfileSaving') : tr('groups.saveAsProfile')}
-        </button>
-        <button className="manage-chat" type="button" onClick={() => props.onManage(chat)}>{tr('groups.manage')}</button>
-      </OverviewListTail>
+      <span className="groups-row-count">{tr('groups.memberSummary', { count: inCount, total: props.bots.length })}</span>
+      <div className="groups-row-lower">
+        <GroupBotCoverage chat={chat} bots={props.bots} tr={tr} />
+        <OverviewListTail>
+          <button className="add-bots" type="button" onClick={() => props.onAddBots(chat)}>{tr('groups.addBots')}</button>
+          <button
+            className="save-profile"
+            type="button"
+            onClick={() => props.onSaveProfile(chat)}
+          >
+            {tr('groups.saveAsProfile')}
+          </button>
+          <button className="manage-chat" type="button" onClick={() => props.onManage(chat)}>{tr('groups.manage')}</button>
+        </OverviewListTail>
+      </div>
     </OverviewListItem>
   );
 }
@@ -491,7 +496,7 @@ function AddBotsDialog(props: {
   bots: GroupBot[];
   tr: Translator;
   onClose(): void;
-  onReloadGroups(): Promise<GroupsSnapshot>;
+  onReloadGroups(options?: { force?: boolean }): Promise<GroupsSnapshot>;
 }) {
   const { chat, tr } = props;
   const [submitting, setSubmitting] = useState(false);
@@ -530,7 +535,7 @@ function AddBotsDialog(props: {
       } else if (respBody.result) {
         const result = summarizeAddBotsResult(respBody.result);
         try {
-          await props.onReloadGroups();
+          await props.onReloadGroups({ force: true });
           setSummary({ result });
         } catch (err) {
           setSummary({ result, refreshError: `添加结果已返回，但刷新群组列表失败：${err}` });
@@ -546,7 +551,7 @@ function AddBotsDialog(props: {
   }
 
   return (
-    <article>
+    <article className="g-add-bots-dialog">
       <header><h3>{tr('groups.addBots')} · {chat.name ?? chat.chatId}</h3></header>
       <p>{tr('groups.createHelp')}</p>
       <form id="g-addform" onSubmit={ev => void submit(ev)}>
@@ -574,25 +579,27 @@ function AddBotsDialog(props: {
 function SaveProfileDialog(props: {
   chat: GroupChat;
   suggestedProfileId: string;
-  entries: SaveProfileEntry[];
-  profiles: RoleProfileSummaryLike[];
   tr: Translator;
   onClose(): void;
   onRefreshRoleContext(): Promise<void>;
   setTimer(fn: () => void, ms: number): number;
 }) {
   const { tr } = props;
+  const [entries, setEntries] = useState<SaveProfileEntry[]>([]);
+  const [profiles, setProfiles] = useState<RoleProfileSummaryLike[]>([]);
+  const [loadingSnapshot, setLoadingSnapshot] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const sortedProfiles = useMemo(
-    () => [...props.profiles].sort((a, b) => a.profileId.localeCompare(b.profileId)),
-    [props.profiles],
+    () => [...profiles].sort((a, b) => a.profileId.localeCompare(b.profileId)),
+    [profiles],
   );
   const hasExistingProfiles = sortedProfiles.length > 0;
-  const emptyCount = props.entries.filter(entry => entry.status === 'empty').length;
-  const failedCount = props.entries.filter(entry => entry.status === 'error').length;
-  const canSubmitSnapshot = props.entries.length > 0 && failedCount === 0;
+  const emptyCount = entries.filter(entry => entry.status === 'empty').length;
+  const failedCount = entries.filter(entry => entry.status === 'error').length;
+  const canSubmitSnapshot = !loadingSnapshot && !loadError && entries.length > 0 && failedCount === 0;
   const [selectedMode, setSelectedMode] = useState<'new' | 'overwrite'>('new');
   const [profileId, setProfileId] = useState(props.suggestedProfileId);
-  const [selectedExistingProfileId, setSelectedExistingProfileId] = useState(sortedProfiles[0]?.profileId ?? '');
+  const [selectedExistingProfileId, setSelectedExistingProfileId] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [status, setStatus] = useState<{ text: string; className?: 'ok' | 'error' } | null>(null);
 
@@ -600,6 +607,50 @@ function SaveProfileDialog(props: {
   const submitText = selectedMode === 'overwrite'
     ? tr('groups.saveProfileOverwriteSubmit')
     : tr('groups.saveProfileSubmit');
+  const snapshotSummary = loadError
+    ? loadError
+    : loadingSnapshot
+      ? tr('groups.saveProfilePreparing')
+      : failedCount
+        ? tr('groups.saveProfileFailedLoadSummary', { count: failedCount })
+        : entries.length
+          ? emptyCount
+            ? tr('groups.saveProfileEntrySummaryWithEmpty', { count: entries.length, emptyCount })
+            : tr('groups.saveProfileEntrySummary', { count: entries.length })
+          : tr('groups.saveProfileNoRoles');
+
+  useEffect(() => {
+    let alive = true;
+    setLoadingSnapshot(true);
+    setLoadError(null);
+    setStatus(null);
+    void (async () => {
+      try {
+        const [nextEntries, nextProfiles] = await Promise.all([
+          collectGroupProfileEntries(props.chat),
+          fetchRoleProfileSummaries().catch(() => [] as RoleProfileSummaryLike[]),
+        ]);
+        if (!alive) return;
+        const sortedNextProfiles = [...nextProfiles].sort((a, b) => a.profileId.localeCompare(b.profileId));
+        setEntries(nextEntries);
+        setProfiles(nextProfiles);
+        setSelectedExistingProfileId(cur =>
+          sortedNextProfiles.some(profile => profile.profileId === cur)
+            ? cur
+            : sortedNextProfiles[0]?.profileId ?? '',
+        );
+      } catch (err) {
+        if (!alive) return;
+        setEntries([]);
+        setProfiles([]);
+        setSelectedExistingProfileId('');
+        setLoadError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (alive) setLoadingSnapshot(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, [props.chat]);
 
   async function submit(ev: FormEvent<HTMLFormElement>): Promise<void> {
     ev.preventDefault();
@@ -612,7 +663,7 @@ function SaveProfileDialog(props: {
     setSubmitting(true);
     setStatus({ text: tr('groups.saveProfileSaving') });
     try {
-      const results = await Promise.all(props.entries.map(async entry => {
+      const results = await Promise.all(entries.map(async entry => {
         const r = await fetch(`/api/role-profiles/${encodeURIComponent(currentProfileId)}/${encodeURIComponent(entry.larkAppId)}`, {
           method: 'PUT',
           headers: { 'content-type': 'application/json' },
@@ -621,9 +672,9 @@ function SaveProfileDialog(props: {
         return r.ok;
       }));
       const saved = results.filter(Boolean).length;
-      if (saved !== props.entries.length) {
+      if (saved !== entries.length) {
         setStatus({
-          text: tr('groups.saveProfileFailed', { saved, total: props.entries.length }),
+          text: tr('groups.saveProfileFailed', { saved, total: entries.length }),
           className: 'error',
         });
         setSubmitting(false);
@@ -653,7 +704,7 @@ function SaveProfileDialog(props: {
         <h3>{tr('groups.saveProfileTitle')}</h3>
         <p>{tr('groups.saveProfileIntro', {
           name: props.chat.name ?? props.chat.chatId,
-          count: props.entries.length,
+          count: loadingSnapshot ? '-' : entries.length,
         })}</p>
       </header>
       <form id="g-save-profile-form" onSubmit={ev => void submit(ev)}>
@@ -663,11 +714,15 @@ function SaveProfileDialog(props: {
             <small>{tr('groups.saveProfileScopeHelp')}</small>
           </div>
           <div className="g-save-profile-stats">
-            <span>{tr('groups.saveProfileBotCount')} <strong>{props.entries.length}</strong></span>
+            <span>{tr('groups.saveProfileBotCount')} <strong>{loadingSnapshot ? '-' : entries.length}</strong></span>
             {failedCount ? <span className="warn">{tr('groups.saveProfileLoadFailed')} <strong>{failedCount}</strong></span> : null}
           </div>
           <div className="g-save-profile-entry-list">
-            {props.entries.length ? props.entries.map(entry => (
+            {loadingSnapshot ? (
+              <div className="g-save-profile-loading"><LoadingState label={tr('common.loading')} /></div>
+            ) : loadError ? (
+              <div className="g-save-profile-empty">{loadError}</div>
+            ) : entries.length ? entries.map(entry => (
               <div className={`g-save-profile-entry ${entry.status === 'error' ? 'error' : ''}`} key={entry.larkAppId}>
                 <div>
                   <strong>{entry.botName ?? entry.larkAppId}</strong>
@@ -753,13 +808,7 @@ function SaveProfileDialog(props: {
           </small>
         </div>
         <div className={`g-save-profile-summary ${canSubmitSnapshot ? '' : 'warn'}`}>
-          {failedCount
-            ? tr('groups.saveProfileFailedLoadSummary', { count: failedCount })
-            : props.entries.length
-              ? emptyCount
-                ? tr('groups.saveProfileEntrySummaryWithEmpty', { count: props.entries.length, emptyCount })
-                : tr('groups.saveProfileEntrySummary', { count: props.entries.length })
-              : tr('groups.saveProfileNoRoles')}
+          {snapshotSummary}
         </div>
         <div className={`g-save-profile-status ${status?.className ?? ''}`} data-save-profile-status>
           {status?.text ?? ''}
@@ -863,7 +912,7 @@ function ManageDialog(props: {
   chat: GroupChat;
   tr: Translator;
   onClose(): void;
-  onReloadGroups(): Promise<GroupsSnapshot>;
+  onReloadGroups(options?: { force?: boolean }): Promise<GroupsSnapshot>;
 }) {
   const { chat, tr } = props;
   const inChat = (chat.memberBots ?? []).filter(member => member.inChat);
@@ -901,7 +950,7 @@ function ManageDialog(props: {
         return `${x.larkAppId}: OK${note}`;
       }).join('\n');
       alert(lines || `Unexpected: ${JSON.stringify(respBody)}`);
-      await props.onReloadGroups();
+      await props.onReloadGroups({ force: true });
     } catch (err) {
       alert('Network error: ' + err);
     } finally {
@@ -932,7 +981,7 @@ function ManageDialog(props: {
             ? ''
             : failed === 0 ? `\n关闭了 ${ok} 个会话。` : `\n关闭了 ${ok} 个会话，${failed} 个会话关闭失败。`;
           alert(`已解散（由 ${member.botName ?? member.larkAppId} 执行）${closedNote}`);
-          await props.onReloadGroups();
+          await props.onReloadGroups({ force: true });
           props.onClose();
           return;
         }
@@ -945,10 +994,12 @@ function ManageDialog(props: {
   }
 
   return (
-    <article>
+    <article className="g-manage-dialog">
       <header><h3>{tr('groups.manageTitle', { name: chat.name ?? chat.chatId })}</h3></header>
-      <p><b>chatId:</b> <code>{chat.chatId}</code></p>
-      <p><b>{tr('groups.owner')}:</b> <code>{chat.ownerId ?? tr('common.unknown')}</code></p>
+      <div className="g-manage-meta">
+        <span><b>chatId</b><code>{chat.chatId}</code></span>
+        <span><b>{tr('groups.owner')}</b><code>{chat.ownerId ?? tr('common.unknown')}</code></span>
+      </div>
 
       <fieldset>
         <legend>{tr('groups.oncall')}</legend>
@@ -961,7 +1012,7 @@ function ManageDialog(props: {
             chat={chat}
             member={member}
             tr={tr}
-            onSaved={async () => { await props.onReloadGroups(); }}
+            onSaved={async () => { await props.onReloadGroups({ force: true }); }}
           />
         ))}
       </fieldset>
@@ -970,29 +1021,33 @@ function ManageDialog(props: {
         <legend>{tr('groups.leaveTitle')}</legend>
         {inChat.length === 0 ? (
           <p className="empty">没有机器人在群里</p>
-        ) : inChat.map(member => (
-          <label className="checkbox-row" key={member.larkAppId}>
-            <input
-              type="checkbox"
-              name="leave-bot"
-              value={member.larkAppId}
-              checked={leaveSelection.has(member.larkAppId)}
-              onChange={ev => toggleLeave(member.larkAppId, ev.currentTarget.checked)}
-            />
-            <span className="checkbox-row-main">
-              <strong>{member.botName ?? member.larkAppId}</strong>
-              {member.larkAppId === ownerAppId ? <small>· 群主</small> : null}
-            </span>
-          </label>
-        ))}
+        ) : (
+          <div className="g-leave-picker">
+            {inChat.map(member => (
+              <label className="checkbox-row" key={member.larkAppId}>
+                <input
+                  type="checkbox"
+                  name="leave-bot"
+                  value={member.larkAppId}
+                  checked={leaveSelection.has(member.larkAppId)}
+                  onChange={ev => toggleLeave(member.larkAppId, ev.currentTarget.checked)}
+                />
+                <span className="checkbox-row-main">
+                  <strong>{member.botName ?? member.larkAppId}</strong>
+                  {member.larkAppId === ownerAppId ? <small>· 群主</small> : null}
+                </span>
+              </label>
+            ))}
+          </div>
+        )}
       </fieldset>
 
+      <p className="g-manage-danger-hint">{tr('groups.dangerHint')}</p>
       <div className="actions">
         <button type="button" onClick={props.onClose}>{tr('sessions.dismiss')}</button>
         <button id="g-leave-btn" type="button" disabled={inChat.length === 0} onClick={() => void leaveSelected()}>{tr('groups.leaveSelected')}</button>
         <button id="g-disband-btn" type="button" className="contrast" disabled={inChat.length === 0} onClick={() => void disband()}>{tr('groups.disband')}</button>
       </div>
-      <p className="hint-warn"><small>{tr('groups.dangerHint')}</small></p>
     </article>
   );
 }
@@ -1003,7 +1058,7 @@ function DialogHost(props: {
   tr: Translator;
   onClose(): void;
   onCreated(resp: any, selectedIds: string[], name: string): void;
-  onReloadGroups(): Promise<GroupsSnapshot>;
+  onReloadGroups(options?: { force?: boolean }): Promise<GroupsSnapshot>;
   onRefreshRoleContext(): Promise<void>;
   setTimer(fn: () => void, ms: number): number;
 }) {
@@ -1015,7 +1070,7 @@ function DialogHost(props: {
     const onClose = () => props.onClose();
     dialog.addEventListener('close', onClose);
     return () => dialog.removeEventListener('close', onClose);
-  }, [props]);
+  }, [props.onClose]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -1051,8 +1106,6 @@ function DialogHost(props: {
       <SaveProfileDialog
         chat={props.dialog.chat}
         suggestedProfileId={props.dialog.suggestedProfileId}
-        entries={props.dialog.entries}
-        profiles={props.dialog.profiles}
         tr={props.tr}
         onClose={props.onClose}
         onRefreshRoleContext={props.onRefreshRoleContext}
@@ -1091,6 +1144,7 @@ function GroupsPage() {
   const snapshotRef = useRef<GroupsSnapshot>(emptyGroupsSnapshot);
   const timersRef = useRef<Set<number>>(new Set());
   const delayResolversRef = useRef<Map<number, () => void>>(new Map());
+  const roleContextRunRef = useRef(0);
   const [snapshot, setSnapshotState] = useState<GroupsSnapshot>(emptyGroupsSnapshot);
   const [roleContext, setRoleContext] = useState<RoleProfileContext>(() => emptyRoleContext());
   const [filters, setFilters] = useState<GroupFilters>({ q: '', missingOnly: false });
@@ -1098,7 +1152,6 @@ function GroupsPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [dialog, setDialog] = useState<DialogState | null>(null);
-  const [savingProfileChatId, setSavingProfileChatId] = useState<string | null>(null);
 
   const setSnapshot = useCallback((next: GroupsSnapshot | ((cur: GroupsSnapshot) => GroupsSnapshot)) => {
     setSnapshotState(cur => {
@@ -1128,18 +1181,19 @@ function GroupsPage() {
   }), []);
 
   const refreshRoleProfileContext = useCallback(async (source?: GroupsSnapshot): Promise<void> => {
+    const runId = ++roleContextRunRef.current;
     try {
       const context = await loadGroupRoleProfileContext(source ?? snapshotRef.current);
-      if (mountedRef.current) setRoleContext(context);
+      if (mountedRef.current && runId === roleContextRunRef.current) setRoleContext(context);
     } catch {
-      if (mountedRef.current) {
+      if (mountedRef.current && runId === roleContextRunRef.current) {
         setRoleContext({ ...emptyRoleContext(), loaded: true });
       }
     }
   }, []);
 
-  const reloadGroups = useCallback(async (): Promise<GroupsSnapshot> => {
-    const next = await fetchGroupsSnapshot();
+  const reloadGroups = useCallback(async (options?: { force?: boolean }): Promise<GroupsSnapshot> => {
+    const next = await fetchGroupsSnapshot({ force: options?.force });
     if (!mountedRef.current) return next;
     setSnapshot(next);
     setLoadError(null);
@@ -1153,7 +1207,7 @@ function GroupsPage() {
       await delay(ms);
       if (!mountedRef.current) return;
       let next: GroupsSnapshot;
-      try { next = await fetchGroupsSnapshot(); }
+      try { next = await fetchGroupsSnapshot({ force: true }); }
       catch { continue; }
       if (!mountedRef.current) return;
       const row = (next.chats ?? []).find(chat => chat.chatId === chatId);
@@ -1172,7 +1226,11 @@ function GroupsPage() {
       try {
         await reloadGroups();
       } catch (err) {
-        if (mountedRef.current) setLoadError(err instanceof Error ? err.message : String(err));
+        if (mountedRef.current) {
+          setSnapshot(emptyGroupsSnapshot);
+          setLoadError(err instanceof Error ? err.message : String(err));
+          void refreshRoleProfileContext(emptyGroupsSnapshot);
+        }
       } finally {
         if (mountedRef.current) setLoading(false);
       }
@@ -1180,6 +1238,7 @@ function GroupsPage() {
 
     return () => {
       mountedRef.current = false;
+      roleContextRunRef.current += 1;
       for (const id of timersRef.current) window.clearTimeout(id);
       timersRef.current.clear();
       for (const resolve of delayResolversRef.current.values()) resolve();
@@ -1195,7 +1254,7 @@ function GroupsPage() {
   async function refresh(): Promise<void> {
     setRefreshing(true);
     try {
-      await reloadGroups();
+      await reloadGroups({ force: true });
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1238,25 +1297,12 @@ function GroupsPage() {
     setDialog({ type: 'add-bots', chat });
   }
 
-  async function openSaveProfileDialog(chat: GroupChat): Promise<void> {
+  function openSaveProfileDialog(chat: GroupChat): void {
     const suggestedByName = suggestRoleProfileIdFromChat(chat.name ?? '');
     const suggestedProfileId = suggestedByName === 'profile'
       ? suggestRoleProfileIdFromChat(chat.chatId)
       : suggestedByName;
-    setSavingProfileChatId(chat.chatId);
-    try {
-      const [entries, profiles] = await Promise.all([
-        collectGroupProfileEntries(chat),
-        fetchRoleProfileSummaries(),
-      ]);
-      if (mountedRef.current) {
-        setDialog({ type: 'save-profile', chat, suggestedProfileId, entries, profiles });
-      }
-    } catch (err) {
-      alert('Network error: ' + err);
-    } finally {
-      if (mountedRef.current) setSavingProfileChatId(null);
-    }
+    setDialog({ type: 'save-profile', chat, suggestedProfileId });
   }
 
   return (
@@ -1273,14 +1319,20 @@ function GroupsPage() {
           name="q"
           placeholder={tr('groups.search')}
           value={filters.q}
-          onChange={ev => setFilters(cur => ({ ...cur, q: ev.currentTarget.value }))}
+          onChange={ev => {
+            const q = ev.currentTarget.value;
+            setFilters(cur => ({ ...cur, q }));
+          }}
         />
         <label className="filter-toggle">
           <input
             type="checkbox"
             name="missing"
             checked={filters.missingOnly}
-            onChange={ev => setFilters(cur => ({ ...cur, missingOnly: ev.currentTarget.checked }))}
+            onChange={ev => {
+              const missingOnly = ev.currentTarget.checked;
+              setFilters(cur => ({ ...cur, missingOnly }));
+            }}
           />
           <span className="filter-toggle-label">{tr('groups.missingOnly')}</span>
           <span className="filter-toggle-switch" aria-hidden="true" />
@@ -1307,11 +1359,10 @@ function GroupsPage() {
                     chat={chat}
                     bots={snapshot.bots}
                     roleContext={roleContext}
-                    savingProfileChatId={savingProfileChatId}
                     tr={tr}
                     key={chat.chatId}
                     onAddBots={openAddBotsDialog}
-                    onSaveProfile={chat => void openSaveProfileDialog(chat)}
+                    onSaveProfile={openSaveProfileDialog}
                     onManage={chat => setDialog({ type: 'manage', chat })}
                   />
                 ))}

@@ -1,4 +1,8 @@
 import {
+  fetchGroupsSnapshot,
+} from './groups-api.js';
+
+import {
   DASHBOARD_LOCALE_STORAGE_KEY,
   createDashboardTranslator,
   readStoredDashboardLocale,
@@ -291,9 +295,7 @@ hydrateAvatarCache(); // 模块加载即回灌，先于任何页面渲染
 export function loadNameMaps(): Promise<void> {
   nameMapsPromise ??= (async () => {
     try {
-      const r = await fetch('/api/groups');
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const data = await r.json();
+      const data = await fetchGroupsSnapshot();
       for (const b of data.bots ?? []) {
         if (b.larkAppId && b.botName && b.botName !== b.larkAppId) {
           botNameByAppId.set(b.larkAppId, String(b.botName));

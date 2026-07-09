@@ -32,9 +32,13 @@ const GROUPS: Group[] = [
 
 const ALL = GROUPS.flatMap(g => g.options);
 let open = false;
+let closeTimer: number | null = null;
+let hideTimer: number | null = null;
+const CLOSE_DELAY_MS = 70;
+const HIDE_DELAY_MS = 120;
 
 function iconSvg(name: string): string {
-  return `<svg class="tm-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON[name] ?? ''}</svg>`;
+  return `<svg class="tm-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON[name] ?? ''}</svg>`;
 }
 
 function esc(s: string): string {
@@ -74,15 +78,45 @@ export function initThemeMenu(): void {
   };
 
   const setOpen = (next: boolean) => {
+    if (closeTimer != null) {
+      window.clearTimeout(closeTimer);
+      closeTimer = null;
+    }
+    if (hideTimer != null) {
+      window.clearTimeout(hideTimer);
+      hideTimer = null;
+    }
     open = next;
-    pop.hidden = !open;
     btn.setAttribute('aria-expanded', String(open));
-    root.classList.toggle('open', open);
     document.body.classList.toggle('theme-menu-open', open);
-    if (open) positionPop();
+    if (open) {
+      pop.hidden = false;
+      positionPop();
+      window.requestAnimationFrame(() => root.classList.add('open'));
+    } else {
+      root.classList.remove('open');
+      hideTimer = window.setTimeout(() => {
+        hideTimer = null;
+        if (!open) pop.hidden = true;
+      }, HIDE_DELAY_MS);
+    }
   };
 
-  btn.addEventListener('click', e => { e.stopPropagation(); setOpen(!open); });
+  const openMenu = () => setOpen(true);
+  const scheduleClose = () => {
+    if (closeTimer != null) return;
+    closeTimer = window.setTimeout(() => setOpen(false), CLOSE_DELAY_MS);
+  };
+
+  root.addEventListener('pointerenter', openMenu);
+  root.addEventListener('pointerleave', scheduleClose);
+  pop.addEventListener('pointerenter', openMenu);
+  pop.addEventListener('pointerleave', scheduleClose);
+  btn.addEventListener('focus', openMenu);
+  root.addEventListener('focusout', e => {
+    const next = e.relatedTarget;
+    if (!(next instanceof Node) || !root.contains(next)) scheduleClose();
+  });
   pop.addEventListener('click', e => {
     const item = (e.target as HTMLElement).closest('.tm-item') as HTMLElement | null;
     if (!item) return;
@@ -91,6 +125,12 @@ export function initThemeMenu(): void {
   });
   document.addEventListener('click', e => {
     if (open && !root.contains(e.target as Node)) setOpen(false);
+  });
+  document.addEventListener('pointermove', e => {
+    if (!open) return;
+    const target = e.target;
+    if (target instanceof Node && root.contains(target)) return;
+    scheduleClose();
   });
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape' && open) setOpen(false);

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import {
@@ -11,6 +11,8 @@ import {
 
 type ScheduleRow = Record<string, any> & { id: string };
 type ScheduleAction = 'run' | 'pause' | 'resume' | 'delivery';
+type ActionFeedback = 'success' | 'error';
+const RUN_ACTION_MIN_PENDING_MS = 1000;
 
 export interface ScheduleFilters {
   q: string;
@@ -51,15 +53,24 @@ function repeatLabel(s: ScheduleRow): string {
   return `${s.repeat.completed}/${s.repeat.times ?? '∞'}`;
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => window.setTimeout(resolve, ms));
+}
+
 function ScheduleRowCard(props: {
   schedule: ScheduleRow;
   scheduleTimeZone?: string;
   pending: string | null;
+  feedback: Record<string, ActionFeedback>;
   tr: ReturnType<typeof useT>;
   onAction(id: string, op: ScheduleAction): void;
 }) {
   const { schedule: s, scheduleTimeZone, tr } = props;
   const kind = String(s.parsed?.kind ?? 'unknown');
+  const toggleOp: ScheduleAction = s.enabled ? 'pause' : 'resume';
+  const toggleKey = `${s.id}:${toggleOp}`;
+  const runKey = `${s.id}:run`;
+  const deliveryKey = `${s.id}:delivery`;
   return (
     <OverviewListItem kind="schedule" className="schedule-list-row" data-id={s.id}>
       <OverviewListMain>
@@ -87,29 +98,23 @@ function ScheduleRowCard(props: {
           <ActionButton
             op="run"
             label={tr('schedules.runNow')}
-            pending={props.pending === `${s.id}:run`}
+            pending={props.pending === runKey}
+            feedback={props.feedback[runKey] ?? null}
             onClick={() => props.onAction(s.id, 'run')}
           />
-          {s.enabled ? (
-            <ActionButton
-              op="pause"
-              label={tr('schedules.pause')}
-              pending={props.pending === `${s.id}:pause`}
-              onClick={() => props.onAction(s.id, 'pause')}
-            />
-          ) : (
-            <ActionButton
-              op="resume"
-              label={tr('schedules.resume')}
-              pending={props.pending === `${s.id}:resume`}
-              onClick={() => props.onAction(s.id, 'resume')}
-            />
-          )}
+          <ScheduleEnabledSwitch
+            checked={Boolean(s.enabled)}
+            pending={props.pending === toggleKey}
+            feedback={props.feedback[toggleKey] ?? null}
+            tr={tr}
+            onClick={() => props.onAction(s.id, toggleOp)}
+          />
           {s.deliver === 'local' ? null : (
             <ActionButton
               op="delivery"
               label={s.deliver === 'new-topic' ? tr('schedules.useOrigin') : tr('schedules.useNewTopic')}
-              pending={props.pending === `${s.id}:delivery`}
+              pending={props.pending === deliveryKey}
+              feedback={props.feedback[deliveryKey] ?? null}
               onClick={() => props.onAction(s.id, 'delivery')}
             />
           )}
@@ -127,24 +132,53 @@ function SchedulesPage() {
   }));
   const [filters, setFilters] = useState<ScheduleFilters>({ q: '', kind: '', enabledOnly: false });
   const [pending, setPending] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<Record<string, ActionFeedback>>({});
+  const feedbackTimers = useRef(new Map<string, number>());
 
   const rows = useMemo(
     () => filterSchedules(scheduleRows, filters),
     [scheduleRows, filters],
   );
 
+  useEffect(() => () => {
+    feedbackTimers.current.forEach(timer => window.clearTimeout(timer));
+    feedbackTimers.current.clear();
+  }, []);
+
+  function showFeedback(key: string, nextFeedback: ActionFeedback): void {
+    setFeedback(current => ({ ...current, [key]: nextFeedback }));
+    const previous = feedbackTimers.current.get(key);
+    if (previous) window.clearTimeout(previous);
+    const timer = window.setTimeout(() => {
+      setFeedback(current => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      feedbackTimers.current.delete(key);
+    }, nextFeedback === 'success' ? 1600 : 2200);
+    feedbackTimers.current.set(key, timer);
+  }
+
   async function runAction(id: string, op: ScheduleAction): Promise<void> {
     const key = `${id}:${op}`;
+    const startedAt = performance.now();
+    let nextFeedback: ActionFeedback = 'success';
     setPending(key);
     try {
       const r = await fetch(`/api/schedules/${encodeURIComponent(id)}/${op}`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) {
-        alert(`Failed: ${r.status} ${body?.error ?? ''}`.trim());
+        throw new Error(`Failed: ${r.status} ${body?.error ?? ''}`.trim());
       }
     } catch (err) {
-      alert('Network error: ' + err);
+      nextFeedback = 'error';
     } finally {
+      if (op === 'run') {
+        const remaining = RUN_ACTION_MIN_PENDING_MS - (performance.now() - startedAt);
+        if (remaining > 0) await delay(remaining);
+      }
+      showFeedback(key, nextFeedback);
       setPending(cur => cur === key ? null : cur);
     }
   }
@@ -163,7 +197,10 @@ function SchedulesPage() {
           name="q"
           placeholder={tr('schedules.search')}
           value={filters.q}
-          onChange={e => setFilters(f => ({ ...f, q: e.currentTarget.value }))}
+          onChange={event => {
+            const q = event.currentTarget.value;
+            setFilters(f => ({ ...f, q }));
+          }}
         />
         <DropdownMenu
           id="sched-kind-menu"
@@ -203,6 +240,7 @@ function SchedulesPage() {
                   schedule={s}
                   scheduleTimeZone={scheduleTimeZone}
                   pending={pending}
+                  feedback={feedback}
                   tr={tr}
                   onAction={(id, op) => void runAction(id, op)}
                 />
@@ -215,10 +253,65 @@ function SchedulesPage() {
   );
 }
 
-function ActionButton(props: { op: ScheduleAction; label: string; pending: boolean; onClick: () => void }) {
+function actionLabel(
+  op: ScheduleAction,
+  label: string,
+  pending: boolean,
+  feedback: ActionFeedback | null,
+  tr: ReturnType<typeof useT>,
+): string {
+  if (pending) return op === 'run' ? tr('schedules.running') : tr('schedules.saving');
+  if (feedback === 'success') return op === 'run' ? tr('schedules.runDone') : tr('schedules.saved');
+  if (feedback === 'error') return tr('schedules.failed');
+  return label;
+}
+
+function ActionButton(props: {
+  op: ScheduleAction;
+  label: string;
+  pending: boolean;
+  feedback: ActionFeedback | null;
+  onClick: () => void;
+}) {
+  const tr = useT();
+  const feedbackClass = props.feedback ? ` is-${props.feedback}` : '';
   return (
-    <button type="button" data-op={props.op} disabled={props.pending} onClick={props.onClick}>
-      {props.pending ? '...' : props.label}
+    <button
+      type="button"
+      className={`schedule-action-button${props.pending ? ' is-pending' : ''}${feedbackClass}`}
+      data-op={props.op}
+      disabled={props.pending}
+      onClick={props.onClick}
+    >
+      <span className="schedule-action-label">{actionLabel(props.op, props.label, props.pending, props.feedback, tr)}</span>
+    </button>
+  );
+}
+
+function ScheduleEnabledSwitch(props: {
+  checked: boolean;
+  pending: boolean;
+  feedback: ActionFeedback | null;
+  tr: ReturnType<typeof useT>;
+  onClick: () => void;
+}) {
+  const label = props.feedback === 'error'
+    ? props.tr('schedules.failed')
+    : props.checked
+      ? props.tr('schedules.enabled')
+      : props.tr('schedules.paused');
+  return (
+    <button
+      type="button"
+      className={`schedule-enabled-switch${props.checked ? ' is-on' : ''}${props.pending ? ' is-pending' : ''}${props.feedback ? ` is-${props.feedback}` : ''}`}
+      aria-pressed={props.checked}
+      disabled={props.pending}
+      onClick={props.onClick}
+    >
+      <span className="schedule-enabled-switch-label">{label}</span>
+      <span className="schedule-enabled-switch-track" aria-hidden="true">
+        <span />
+      </span>
     </button>
   );
 }

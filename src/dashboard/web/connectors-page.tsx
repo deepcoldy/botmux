@@ -239,8 +239,13 @@ function ConnectorsPage() {
     setForm(cur => ({ ...cur, ...patch }));
   }
 
-  function selectAllowChats(select: HTMLSelectElement): void {
-    patchForm({ allowChats: Array.from(select.selectedOptions).map(o => o.value).filter(Boolean) });
+  function toggleAllowChat(chatId: string): void {
+    setForm(cur => {
+      const next = cur.allowChats.includes(chatId)
+        ? cur.allowChats.filter(id => id !== chatId)
+        : [...cur.allowChats, chatId];
+      return { ...cur, allowChats: next };
+    });
   }
 
   async function createConnector(): Promise<void> {
@@ -465,9 +470,34 @@ function ConnectorsPage() {
               <FieldTitle help={tr('connectors.allowHint')}>
                 {tr('connectors.fAllow')}<span className="muted cn-optional">{tr('connectors.optional')}</span>
               </FieldTitle>
-                <select multiple size={4} value={form.allowChats} onChange={e => selectAllowChats(e.currentTarget)}>
-                  {groupsForBot.map(g => <option key={g.chatId} value={g.chatId}>{g.name || g.chatId}</option>)}
-                </select>
+              <div className="connector-allow-picker" role="group" aria-label={tr('connectors.fAllow')}>
+                <button
+                  type="button"
+                  className={`connector-allow-chip${form.allowChats.length === 0 ? ' selected' : ''}`}
+                  aria-pressed={form.allowChats.length === 0}
+                  onClick={() => patchForm({ allowChats: [] })}
+                >
+                  {tr('connectors.allowAll')}
+                </button>
+                {groupsForBot.map(group => {
+                  const label = group.name || group.chatId;
+                  const selected = form.allowChats.includes(group.chatId);
+                  return (
+                    <button
+                      type="button"
+                      className={`connector-allow-chip${selected ? ' selected' : ''}`}
+                      aria-pressed={selected}
+                      title={label}
+                      key={group.chatId}
+                      onClick={() => toggleAllowChat(group.chatId)}
+                    >
+                      <span className="connector-allow-dot" aria-hidden="true" />
+                      <span className="connector-allow-name">{label}</span>
+                    </button>
+                  );
+                })}
+                {!groupsForBot.length ? <span className="muted connector-allow-empty">{tr('connectors.noBotGroups')}</span> : null}
+              </div>
             </div>
           )}
 
@@ -630,35 +660,40 @@ function ConnectorList(props: {
         const destLabel = c.target.mode === 'fixed' && c.target.chatId ? tr('connectors.dest', { name: props.groupName(c.target.chatId) }) : '';
         const editing = props.editingId === c.id;
         const editMsg = props.editMsg?.id === c.id ? props.editMsg : null;
+        const copied = props.copiedId === c.id;
         return (
           <div key={c.id} className="card connector-item-card">
             <div className="connector-item-head">
-              <div className="connector-item-title">
-                <b>{c.name}</b>
-                <span className={c.enabled ? 'connector-status-pill ok' : 'connector-status-pill muted'}>{c.enabled ? tr('connectors.enabled') : tr('connectors.disabled')}</span>
+              <div className="connector-item-main">
+                <div className="connector-item-title">
+                  <b>{c.name}</b>
+                  <span className={c.enabled ? 'connector-status-pill ok' : 'connector-status-pill muted'}>{c.enabled ? tr('connectors.enabled') : tr('connectors.disabled')}</span>
+                </div>
+                <div className="connector-item-meta">
+                  <span>{bot?.botName || c.target.botId}</span>
+                  <span>{props.kindLabel(c.target.kind)}</span>
+                  <span>{props.modeLabel(c.target.mode)}</span>
+                  {destLabel ? <span>{destLabel}</span> : null}
+                  <span>{verifyBadge}</span>
+                </div>
               </div>
-              <div className="connector-item-meta">
-                <span>{bot?.botName || c.target.botId}</span>
-                <span>{props.kindLabel(c.target.kind)}</span>
-                <span>{props.modeLabel(c.target.mode)}</span>
-                {destLabel ? <span>{destLabel}</span> : null}
-                <span>{verifyBadge}</span>
-              </div>
-              <span className="connector-item-actions">
-                <button className="ghost" type="button" onClick={() => props.onEdit(c)}>{tr('connectors.btnEdit')}</button>
-                <button className="ghost" type="button" onClick={() => props.onToggle(c)}>{c.enabled ? tr('connectors.btnDisable') : tr('connectors.btnEnable')}</button>
-                <button className="ghost" type="button" onClick={() => props.onDelete(c)}>{tr('connectors.btnDel')}</button>
-              </span>
+              <button className={`ghost connector-copy-button${copied ? ' copied' : ''}`} type="button" onClick={() => props.onCopy(c)}>{copied ? tr('connectors.copied') : tr('connectors.copy')}</button>
             </div>
             <div className="connector-url-row">
               <span className="muted">{tr('connectors.webhookUrl')}</span>
               <code>{url}{isToken ? '/<token>' : ''}</code>
-              <button className="ghost" type="button" onClick={() => props.onCopy(c)}>{props.copiedId === c.id ? tr('connectors.copied') : tr('connectors.copy')}</button>
             </div>
             {isToken ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.tokenHint') }} /> : null}
             {c.target.mode === 'dynamic' ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.dynamicReqHint') }} /> : null}
             {c.promptEnvelope?.instruction ? <div className="muted connector-item-note">{tr('connectors.instructionPrefix')}{c.promptEnvelope.instruction}</div> : null}
             {!editing && editMsg ? <div className={editMsg.error ? 'err connector-item-note' : 'muted connector-item-note'}>{editMsg.text}</div> : null}
+            {!editing ? (
+              <div className="connector-item-actions">
+                <button className="ghost" type="button" onClick={() => props.onEdit(c)}>{tr('connectors.btnEdit')}</button>
+                <button className="ghost" type="button" onClick={() => props.onToggle(c)}>{c.enabled ? tr('connectors.btnDisable') : tr('connectors.btnEnable')}</button>
+                <button className="ghost" type="button" onClick={() => props.onDelete(c)}>{tr('connectors.btnDel')}</button>
+              </div>
+            ) : null}
             {editing ? (
               <div className="cn-edit-box">
                 <textarea

@@ -49,7 +49,6 @@ vi.mock('../src/core/worker-pool.js', () => ({
   forkAdoptWorker: vi.fn(),
   killStalePids: vi.fn(),
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
-  getActiveSessionsRegistry: vi.fn(() => undefined),
   restoreUsageLimitRuntimeState: vi.fn(),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => { map.set(k, ds); }),
   getActiveSessionsRegistry: vi.fn(() => null),

@@ -7,9 +7,10 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { LoadingState } from './dashboard-components.js';
+import { DropdownMenu, LoadingState } from './dashboard-components.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
+import { WorkflowVersionSwitch } from './workflow-version-switch.js';
 import {
   LEGACY_WORKFLOW_DETAIL_POLL_MS,
   LEGACY_WORKFLOW_POLL_MS,
@@ -120,16 +121,6 @@ function StatusBadge(props: { status: string }): JSX.Element {
   );
 }
 
-function WorkflowSubnav(): JSX.Element {
-  const tr = useT();
-  return (
-    <nav className="wf-subnav dashboard-toolbar">
-      <a href="#/legacy-workflow" className="active">{tr('workflow.subnav.runs')}</a>
-      <a href="#/workflows">{tr('workflow.subnav.v3')}</a>
-    </nav>
-  );
-}
-
 function useLegacyWorkflowRuns(status: string): {
   rows: RunRow[];
   lastErr: string | null;
@@ -197,6 +188,7 @@ function LegacyWorkflowListPage(): JSX.Element {
   const [status, setStatus] = useState('');
   const { rows, lastErr, lastLoadedAt } = useLegacyWorkflowRuns(status);
   const statusFilters = legacyWorkflowStatusFilters();
+  const statusFilterLabel = statusFilters.find(option => option.value === status)?.label ?? status;
 
   const filteredRows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -226,8 +218,10 @@ function LegacyWorkflowListPage(): JSX.Element {
           <p className="eyebrow">{tr('nav.workflows')}</p>
           <h1>{tr('nav.workflows')}</h1>
         </div>
+        <div className="page-heading-actions">
+          <WorkflowVersionSwitch active="legacy" />
+        </div>
       </div>
-      <WorkflowSubnav />
       <form className="filters dashboard-toolbar" onSubmit={(event) => event.preventDefault()}>
         <input
           type="search"
@@ -236,33 +230,39 @@ function LegacyWorkflowListPage(): JSX.Element {
           placeholder={tr('workflow.searchPlaceholder')}
           onChange={(event) => setQuery(event.currentTarget.value)}
         />
-        <select name="status" value={status} onChange={(event) => setStatus(event.currentTarget.value)}>
-          {statusFilters.map((option) => (
-            <option key={option.value || 'non-terminal'} value={option.value}>{option.label}</option>
-          ))}
-        </select>
+        <DropdownMenu
+          id="legacy-workflow-status"
+          className="legacy-workflow-status-menu"
+          ariaLabel={tr('workflow.table.status')}
+          label={statusFilterLabel}
+          value={status}
+          options={statusFilters}
+          onChange={setStatus}
+        />
         <span className={`toolbar-status${lastErr ? ' error' : ''}`}>{loadText}</span>
       </form>
-      <table className="data-table workflow-runs-table">
-        <thead>
-          <tr>
-            <th>{tr('workflow.table.run')}</th>
-            <th>{tr('workflow.table.workflow')}</th>
-            <th>{tr('workflow.table.status')}</th>
-            <th>{tr('workflow.table.lastSeq')}</th>
-            <th>{tr('workflow.table.dangling')}</th>
-            <th>{tr('workflow.table.updated')}</th>
-            <th>{tr('workflow.table.chatApp')}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {filteredRows.length > 0 ? filteredRows.map((row) => (
-            <RunListRow key={row.runId} row={row} />
-          )) : (
-            <tr><td colSpan={7} className="empty">{emptyText}</td></tr>
-          )}
-        </tbody>
-      </table>
+      <div className="workflow-runs-table-wrap">
+        <table className="data-table workflow-runs-table">
+          <thead>
+            <tr>
+              <th>{tr('workflow.table.run')}</th>
+              <th>{tr('workflow.table.workflow')}</th>
+              <th>{tr('workflow.table.status')}</th>
+              <th>{tr('workflow.table.lastSeq')}</th>
+              <th>{tr('workflow.table.dangling')}</th>
+              <th>{tr('workflow.table.updated')}</th>
+              <th>{tr('workflow.table.chatApp')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredRows.length > 0 ? filteredRows.map((row) => (
+              <RunListRow key={row.runId} row={row} />
+            )) : (
+              <tr><td colSpan={7} className="empty">{emptyText}</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
     </>
   );
 }
@@ -654,6 +654,7 @@ function LegacyWorkflowDetailPage(props: { runId: string; focusAttemptId?: strin
             {cancelLabel}
           </button>
           <a className="btn-link" href="#/legacy-workflow">{tr('workflow.detail.back')}</a>
+          <WorkflowVersionSwitch active="legacy" />
         </div>
       </div>
       {detailError ? <section className="hint-warn">{detailError}</section> : null}

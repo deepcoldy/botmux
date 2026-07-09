@@ -497,8 +497,16 @@ function KanbanCard(props: {
           </p>
         )}
       </div>
-      {desc ? <p className="kanban-card-desc" title={desc}>{desc}</p> : null}
-      {signal ? <div className="session-signal" title={signal}>{signal}</div> : null}
+      {desc || signal ? (
+        <div className="kanban-card-meta-row">
+          {desc ? (
+            <p className="kanban-card-desc" title={desc}>{desc}</p>
+          ) : (
+            <span className="kanban-card-desc kanban-card-desc-empty" aria-hidden="true" />
+          )}
+          {signal ? <span className="session-signal" title={signal}>{signal}</span> : null}
+        </div>
+      ) : null}
       <div className="kanban-card-foot">
         <span
           className="kanban-card-owner"

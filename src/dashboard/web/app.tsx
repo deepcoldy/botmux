@@ -69,6 +69,17 @@ const NAV_ITEMS: NavItem[] = [
       </>
     ),
   },
+  {
+    id: 'monitoring',
+    href: '#/monitoring',
+    labelKey: 'nav.monitoring',
+    icon: (
+      <>
+        <path d="M2 9.2h2.3l1.3-4.8 2.5 8.4 1.8-5.1h4.1" />
+        <path d="M2 2.5h12v11H2z" />
+      </>
+    ),
+  },
   { id: 'sessions', href: '#/sessions', labelKey: 'nav.sessions', icon: <path d="M2 3.5h12v7H6l-3 3v-3H2z" /> },
   { id: 'insights', href: '#/insights', labelKey: 'nav.insights', manage: true, icon: <><path d="M2 2v12h12M5 11V7M8.5 11V4.5M12 11V8.5" /></> },
   {
@@ -131,6 +142,12 @@ function labelOf(item: NavItem): string {
 
 function isActiveNav(item: NavItem, hash: string): boolean {
   const current = hash || '#/';
+  if (
+    item.id === 'workflows' &&
+    (current === '#/legacy-workflow' || current.startsWith('#/legacy-workflow?') || current.startsWith('#/legacy-workflow/'))
+  ) {
+    return true;
+  }
   return item.href === current || (
     item.href !== '#/' && (current.startsWith(`${item.href}?`) || current.startsWith(`${item.href}/`))
   );
@@ -178,7 +195,7 @@ function ThemeMenuSlot(): JSX.Element {
             viewBox="0 0 24 24"
             fill="none"
             stroke="currentColor"
-            strokeWidth="2"
+            strokeWidth="1.75"
             strokeLinecap="round"
             strokeLinejoin="round"
             aria-hidden="true"
@@ -397,8 +414,9 @@ function DashboardShell(): JSX.Element {
                 target="_blank"
                 rel="noopener noreferrer"
                 title={t('nav.docs')}
+                aria-label={t('nav.docs')}
               >
-                {icon(<><path d="M4 1.8h5.2L12.8 5.4v8.8H4z" /><path d="M9.2 1.8v3.6h3.6M6.2 8h4.4M6.2 10.5h4.4M6.2 13h2.4" /></>)}
+                {icon(<><rect x="2.2" y="2.2" width="11.6" height="11.6" rx="2" /><path d="M4.8 5.2h6.4M4.8 8h6.4M4.8 10.8h4" /></>)}
                 <span>{t('nav.docs')}</span>
               </a>
             </div>

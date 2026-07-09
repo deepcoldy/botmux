@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { LoadingState, SectionHeader } from './dashboard-components.js';
+import { LoadingState, OverflowText } from './dashboard-components.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 
@@ -88,6 +88,7 @@ function BoardItem(props: {
   onSelect(id: string): void;
 }) {
   const r = props.row;
+  const title = r.title || r.id;
   return (
     <a
       className={`wb-item${props.active ? ' active' : ''}`}
@@ -100,25 +101,30 @@ function BoardItem(props: {
     >
       <div className="wb-item-head">
         <div className="wb-item-main">
-          <strong>{r.title || r.id}</strong>
-          <span>{r.id}</span>
+          <strong>
+            <OverflowText text={title} textClassName="wb-title-scroll" />
+          </strong>
+          <span className="wb-id-text" title={r.id}>{r.id}</span>
         </div>
-        <span className="wb-scope">{r.scope}</span>
       </div>
-      <div className="wb-item-meta">
-        <span>{rel(r.updatedAt)}</span>
-        <span>·</span>
-        <span>log {r.logCount}</span>
+      <div className="wb-item-foot">
+        <div className="wb-item-meta">
+          <span>{rel(r.updatedAt)}</span>
+          <span>·</span>
+          <span>log {r.logCount}</span>
+        </div>
+        <span className="wb-scope" title={r.scope}>{r.scope}</span>
       </div>
     </a>
   );
 }
 
 function MetaCard(props: { label: string; value: string }) {
+  const value = props.value || '-';
   return (
-    <div className="wb-meta-card">
-      <div>{props.label}</div>
-      <strong>{props.value || '-'}</strong>
+    <div className="wb-meta-card" title={value}>
+      <span>{props.label}</span>
+      <strong>{value}</strong>
     </div>
   );
 }
@@ -133,13 +139,14 @@ function Detail(props: {
 
   const selectedRow = selected.row;
   const selectedChat = selectedRow?.chatId ? groupLabel(selectedRow.chatId, props.groupNames) : '未绑定群 / 本地白板';
+  const selectedTitle = selectedRow?.title || selected.id;
   return (
     <>
       <div className="wb-detail-head">
-        <div>
+        <div className="wb-detail-title">
           <p className="eyebrow">WHITEBOARD</p>
-          <h2>{selectedRow?.title || selected.id}</h2>
-          <div>{selected.id}</div>
+          <h2 title={selectedTitle}>{selectedTitle}</h2>
+          <code title={selected.id}>{selected.id}</code>
         </div>
         <button type="button" className="danger" data-delete-whiteboard onClick={props.onDelete}>删除白板</button>
       </div>
@@ -155,8 +162,8 @@ function Detail(props: {
       </details>
       <section className="wb-board-panel">
         <div className="wb-board-panel-head">
-          <strong>当前状态 board.md</strong>
-          <span>read / update</span>
+          <strong>board.md</strong>
+          <span>只读预览</span>
         </div>
         <pre>
           {selected.content || '（暂无内容）'}
@@ -282,48 +289,55 @@ function WhiteboardsPage() {
     }
   }
 
-  const heading = (
+  const disabledNotice = '白板能力当前关闭：不会自动创建/绑定白板，也不会注入到 agent prompt。历史白板仅在 dashboard 中只读可见，可在此清理。';
+  const heading = (showDisabledNotice = false) => (
     <div className="page-heading">
       <div>
         <p className="eyebrow">{tr('nav.whiteboards')}</p>
         <h1>{tr('nav.whiteboards')}</h1>
+        {showDisabledNotice ? (
+          <span className="wb-disabled-pill" title={disabledNotice} aria-label={disabledNotice}>
+            {disabledNotice}
+          </span>
+        ) : null}
       </div>
     </div>
   );
 
   if (error) {
-    return <section className="page whiteboards-page">{heading}<p className="hint-warn">加载白板失败：{error}</p></section>;
+    return <section className="page whiteboards-page">{heading()}<p className="hint-warn">加载白板失败：{error}</p></section>;
   }
 
   if (loading) {
-    return <section className="page whiteboards-page" data-whiteboards-host>{heading}<LoadingState label={tr('common.loading')} /></section>;
+    return <section className="page whiteboards-page" data-whiteboards-host>{heading()}<LoadingState label={tr('common.loading')} /></section>;
   }
 
   return (
     <section className="page whiteboards-page">
-      {heading}
-      {enabled ? null : <p className="hint-warn">白板能力当前关闭：不会自动创建/绑定白板，也不会注入到 agent prompt。历史白板仅在 dashboard 中只读可见，可在此清理。</p>}
+      {heading(!enabled)}
       <div className="wb-split">
         <section className="overview-block wb-list-block">
-          <SectionHeader title="群组 / 白板" count={rows.length} />
           <div className="wb-list-panel">
             {groups.length === 0 ? (
               <p className="empty wb-empty">暂无白板。打开能力后，每个群首次需要白板时才会创建默认白板。</p>
             ) : groups.map(g => (
               <details className="wb-group" open key={g.chatId}>
                 <summary>
-                  <span>{g.label}</span>
+                  <span className="wb-group-title">
+                    <OverflowText text={g.label} textClassName="wb-group-title-scroll" />
+                  </span>
                   <small>{g.rows.length}</small>
                 </summary>
-                {g.rows.map(r => (
-                  <BoardItem key={r.id} row={r} active={selected?.id === r.id} onSelect={id => void selectBoard(id)} />
-                ))}
+                <div className="wb-group-items">
+                  {g.rows.map(r => (
+                    <BoardItem key={r.id} row={r} active={selected?.id === r.id} onSelect={id => void selectBoard(id)} />
+                  ))}
+                </div>
               </details>
             ))}
           </div>
         </section>
         <section className="overview-block wb-detail-block">
-          <SectionHeader title="白板详情" />
           <div className="wb-detail-panel" id="whiteboard-detail">
             <Detail selected={selected} groupNames={groupNames} onDelete={() => { if (selected) setDeleteTarget(selected); }} />
           </div>

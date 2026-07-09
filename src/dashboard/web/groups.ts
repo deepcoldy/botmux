@@ -4,37 +4,28 @@ import type {
   RoleProfileEntryLike,
   RoleProfileSummaryLike,
 } from './role-profile-match.js';
+import {
+  emptyGroupsSnapshot,
+  fetchGroupsSnapshot,
+  type GroupBot,
+  type GroupChat,
+  type GroupFilters,
+  type GroupsSnapshot,
+} from './groups-api.js';
+
+export {
+  emptyGroupsSnapshot,
+  fetchGroupsSnapshot,
+};
+export type {
+  GroupBot,
+  GroupChat,
+  GroupFilters,
+  GroupsSnapshot,
+};
 
 const PROFILE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
-
-export interface GroupBot {
-  larkAppId: string;
-  botName?: string;
-}
-
-export interface GroupMemberBot extends GroupBot {
-  inChat: boolean;
-  error?: unknown;
-  oncallChat?: { workingDir?: string } | null;
-}
-
-export interface GroupChat {
-  chatId: string;
-  name?: string;
-  ownerId?: string | null;
-  avatar?: string;
-  memberBots: GroupMemberBot[];
-}
-
-export interface GroupsSnapshot {
-  chats: GroupChat[];
-  bots: GroupBot[];
-}
-
-export interface GroupFilters {
-  q: string;
-  missingOnly: boolean;
-}
+const GROUP_ROLE_CONTEXT_CONCURRENCY = 6;
 
 export interface RoleProfileContext {
   profiles: RoleProfileSummaryLike[];
@@ -69,10 +60,26 @@ export interface RoleProfileBootstrapStatus {
   text: string;
 }
 
-export const emptyGroupsSnapshot: GroupsSnapshot = { chats: [], bots: [] };
-
 export function roleKey(larkAppId: string, chatId: string): string {
   return `${larkAppId}\u0000${chatId}`;
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, limit), items.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await worker(items[index]);
+    }
+  }));
+  return results;
 }
 
 export function isValidProfileId(profileId: string): boolean {
@@ -89,15 +96,6 @@ export function suggestRoleProfileIdFromChat(value: string): string {
   return isValidProfileId(cleaned) ? cleaned : 'profile';
 }
 
-export async function fetchGroupsSnapshot(): Promise<GroupsSnapshot> {
-  const r = await fetch('/api/groups');
-  const body = await r.json().catch(() => ({}));
-  return {
-    chats: Array.isArray(body.chats) ? body.chats as GroupChat[] : [],
-    bots: Array.isArray(body.bots) ? body.bots as GroupBot[] : [],
-  };
-}
-
 export async function fetchRoleProfileSummaries(): Promise<RoleProfileSummaryLike[]> {
   const r = await fetch('/api/role-profiles');
   const body = await r.json().catch(() => ({}));
@@ -106,7 +104,7 @@ export async function fetchRoleProfileSummaries(): Promise<RoleProfileSummaryLik
 
 export async function loadGroupRoleProfileContext(snapshot: GroupsSnapshot): Promise<RoleProfileContext> {
   const nextProfiles = await fetchRoleProfileSummaries();
-  const detailPairs = await Promise.all(nextProfiles.map(async profile => {
+  const detailPairs = await mapWithConcurrency(nextProfiles, GROUP_ROLE_CONTEXT_CONCURRENCY, async profile => {
     try {
       const r = await fetch(`/api/role-profiles/${encodeURIComponent(profile.profileId)}`);
       const body = await r.json().catch(() => ({}));
@@ -114,31 +112,34 @@ export async function loadGroupRoleProfileContext(snapshot: GroupsSnapshot): Pro
     } catch {
       return [profile.profileId, [] as RoleProfileEntryLike[]] as const;
     }
-  }));
+  });
 
   const nextGroupRoles = new Map<string, EffectiveRoleValue>();
   const seenRoleKeys = new Set<string>();
-  await Promise.all((snapshot.chats ?? []).flatMap(chat =>
-    (chat.memberBots ?? [])
-      .filter(bot => bot?.inChat && bot?.larkAppId)
-      .map(async bot => {
-        const key = roleKey(bot.larkAppId, chat.chatId);
-        if (seenRoleKeys.has(key)) return;
-        seenRoleKeys.add(key);
-        try {
-          const r = await fetch(`/api/roles/${encodeURIComponent(bot.larkAppId)}/${encodeURIComponent(chat.chatId)}`);
-          const body = await r.json().catch(() => ({}));
-          const hasEffectiveRole = body?.hasEffectiveRole ?? body?.hasRole;
-          const effectiveContent = 'effectiveContent' in body ? body.effectiveContent : body.content;
-          nextGroupRoles.set(key, {
-            content: hasEffectiveRole ? String(effectiveContent ?? '') : null,
-            source: body?.effectiveSource ?? (body?.hasRole ? 'chat' : 'none'),
-          });
-        } catch {
-          nextGroupRoles.set(key, null);
-        }
-      }),
-  ));
+  const roleTargets: Array<{ chatId: string; larkAppId: string; key: string }> = [];
+  for (const chat of snapshot.chats ?? []) {
+    for (const bot of chat.memberBots ?? []) {
+      if (!bot?.inChat || !bot?.larkAppId) continue;
+      const key = roleKey(bot.larkAppId, chat.chatId);
+      if (seenRoleKeys.has(key)) continue;
+      seenRoleKeys.add(key);
+      roleTargets.push({ chatId: chat.chatId, larkAppId: bot.larkAppId, key });
+    }
+  }
+  await mapWithConcurrency(roleTargets, GROUP_ROLE_CONTEXT_CONCURRENCY, async target => {
+    try {
+      const r = await fetch(`/api/roles/${encodeURIComponent(target.larkAppId)}/${encodeURIComponent(target.chatId)}`);
+      const body = await r.json().catch(() => ({}));
+      const hasEffectiveRole = body?.hasEffectiveRole ?? body?.hasRole;
+      const effectiveContent = 'effectiveContent' in body ? body.effectiveContent : body.content;
+      nextGroupRoles.set(target.key, {
+        content: hasEffectiveRole ? String(effectiveContent ?? '') : null,
+        source: body?.effectiveSource ?? (body?.hasRole ? 'chat' : 'none'),
+      });
+    } catch {
+      nextGroupRoles.set(target.key, null);
+    }
+  });
 
   return {
     profiles: nextProfiles,
@@ -150,7 +151,7 @@ export async function loadGroupRoleProfileContext(snapshot: GroupsSnapshot): Pro
 
 export async function collectGroupProfileEntries(chat: GroupChat): Promise<SaveProfileEntry[]> {
   const inChat = (chat.memberBots ?? []).filter(bot => bot?.inChat && bot?.larkAppId);
-  return Promise.all(inChat.map(async bot => {
+  return mapWithConcurrency(inChat, GROUP_ROLE_CONTEXT_CONCURRENCY, async bot => {
     try {
       const r = await fetch(`/api/roles/${encodeURIComponent(bot.larkAppId)}/${encodeURIComponent(chat.chatId)}`);
       const body = await r.json().catch(() => ({}));
@@ -174,7 +175,7 @@ export async function collectGroupProfileEntries(chat: GroupChat): Promise<SaveP
         status: 'error' as const,
       };
     }
-  }));
+  });
 }
 
 export function availableBotsForPicker(
