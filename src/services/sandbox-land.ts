@@ -99,11 +99,6 @@ function isWhiteout(p: string): boolean {
  * opaque" (that would leak stale lower files); they fail-closed where it matters.
  */
 function readOpaqueXattr(p: string): 'y' | '' | null {
-  // overlayfs opaque xattrs are Linux-only. On non-Linux unit-test hosts a
-  // normal directory cannot be an overlay replacement marker, so treat it as
-  // non-opaque instead of making every directory fail closed.
-  if (process.platform !== 'linux') return '';
-
   // getfattr (attr package). --only-values prints just the value; ENOATTR → exit≠0.
   const gf = spawnSync('getfattr', ['-n', 'trusted.overlay.opaque', '--only-values', '-h', p], { encoding: 'utf8' });
   if (gf.error == null && typeof gf.status === 'number') {

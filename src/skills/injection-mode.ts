@@ -103,33 +103,14 @@ export function shouldInstallGlobalSkills(skillsDir: string): boolean {
  *    cursor/coco/traex/pi/oh-my-pi/mtr/genius — where global|prompt|off applies.
  *  - 'none': neither — the CLI has no skill mechanism (antigravity/aiden/hermes/
  *    mir/mira/codex-app), so there's nothing to configure.
- * Static so dashboard rendering never shells out to resolve CLI binaries.
+ * Capability-based (not a hardcoded id list) so claude-family forks like relay
+ * are classified correctly without per-fork upkeep.
  */
 export type SkillInjectionSupport = 'dynamic' | 'global' | 'none';
-
-const DYNAMIC_SKILL_CLI_IDS = new Set<CliId>(['claude-code', 'seed', 'relay']);
-const GLOBAL_SKILL_CLI_IDS = new Set<CliId>([
-  'codex',
-  'gemini',
-  'opencode',
-  'cursor',
-  'coco',
-  'traex',
-  'pi',
-  'oh-my-pi',
-  'mtr',
-  'genius',
-]);
-
 export function resolveSkillInjectionSupport(cliId: CliId, cliPathOverride?: string): SkillInjectionSupport {
-  // Dashboard rendering only needs the static delivery capability. Creating
-  // adapters here can resolve binaries via shell PATH probes (seed/relay/etc.),
-  // which is slow and unnecessary for a pure UI classification.
-  void cliPathOverride;
-  const normalized = cliId.toLowerCase() as CliId;
-  if (DYNAMIC_SKILL_CLI_IDS.has(normalized)) return 'dynamic';
-  if (GLOBAL_SKILL_CLI_IDS.has(normalized)) return 'global';
-  return 'none';
+  let ad;
+  try { ad = createCliAdapterSync(cliId, cliPathOverride); } catch { return 'none'; }
+  return ad.pluginDir ? 'dynamic' : ad.skillsDir ? 'global' : 'none';
 }
 
 // ─── Built-in skill catalog (prompt mode) ────────────────────────────────────

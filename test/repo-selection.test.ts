@@ -10,19 +10,6 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { resolveRepoSelection } from '../src/core/command-handler.js';
 
-function rmDirRetry(dir: string): void {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      rmSync(dir, { recursive: true, force: true });
-      return;
-    } catch (err: any) {
-      if (err?.code !== 'ENOTEMPTY' && err?.code !== 'EBUSY') throw err;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-    }
-  }
-  rmSync(dir, { recursive: true, force: true });
-}
-
 function gitInit(dir: string, branch = 'main'): void {
   execSync(`git init -q -b ${branch} "${dir}"`, { stdio: 'pipe' });
   execSync('git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init', {
@@ -43,7 +30,7 @@ describe('resolveRepoSelection', () => {
 
   afterEach(() => {
     process.chdir(prevCwd);
-    rmDirRetry(scanDir);
+    rmSync(scanDir, { recursive: true, force: true });
   });
 
   it('resolves a first-level project name to its repo + branch label', () => {
@@ -87,7 +74,7 @@ describe('resolveRepoSelection', () => {
       expect(r!.displayName).toBe('proj (feature/test)');
     } finally {
       execSync(`git worktree remove -f "${worktree}"`, { cwd: repo, stdio: 'pipe' });
-      rmDirRetry(worktreeRoot);
+      rmSync(worktreeRoot, { recursive: true, force: true });
     }
   });
 
@@ -133,7 +120,7 @@ describe('resolveRepoSelection', () => {
       expect(realpathSync(r!.path)).toBe(abs);
       expect(r!.displayName).toBe('dup (feature)');
     } finally {
-      rmDirRetry(elsewhere);
+      rmSync(elsewhere, { recursive: true, force: true });
     }
   });
 });

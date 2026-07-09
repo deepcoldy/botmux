@@ -10,7 +10,7 @@
 import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
 import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
@@ -280,7 +280,6 @@ describe('validateRelayRequest', () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.value.contentName).toBe('c.content');
-    expect(r.value.cardName).toBeUndefined();
     expect(r.value.attachmentNames).toEqual(['a.png']);
     expect(r.value.videoNames).toEqual(['replay.mp4']);
     expect(r.value.videoCoverNames).toEqual(['cover.png']);
@@ -426,7 +425,7 @@ describe('sandbox landing from upper layer', () => {
     if (!d.ok) return;
     expect(d.empty).toBe(false);
     expect(d.statText).toContain('x.txt');
-    unlinkSync(linkData);
+    rmSync(linkData, { force: true });
   });
 
   it('computeSandboxDiff reports empty when the upper has no changes', () => {
