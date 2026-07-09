@@ -260,6 +260,7 @@ type VcMeetingDaemonSession = {
   consumerSelectionTimer?: ReturnType<typeof setTimeout>;
   consumerSelectionApplying?: boolean;
   pendingOutputRequests: Partial<Record<VcMeetingOutputChannel, VcMeetingPendingOutputRequest>>;
+  outputSubmitPromises?: Partial<Record<VcMeetingOutputChannel, Promise<unknown>>>;
   consumerPendingItems: NormalizedVcMeetingItem[];
   consumerTranscriptRevisions: Record<string, number>;
   consumerLastInjectedAtMs?: number;
@@ -307,6 +308,9 @@ type VcMeetingConsumerInjectResult = {
 
 type VcMeetingOutputChannel = 'text' | 'voice';
 type VcMeetingOutputDecision = 'approve_voice' | 'send_text' | 'allow_text_and_send' | 'reject';
+type VcMeetingOutputSubmitResult =
+  | { ok: true; status: 'sent' | 'pending'; requestId?: string; merged?: boolean }
+  | { ok: false; error: string };
 
 type VcMeetingOutputTextSender = (
   session: VcMeetingDaemonSession,
@@ -3022,9 +3026,9 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
       (record.temporaryInstructionUnionIds ?? []).map(unionId => [unionId, true] as const),
     );
     scheduleVcMeetingListenerFlush(key, cfg);
+    scheduleVcMeetingRestoreImmediateTick(key, cfg);
     if (session.consumerMode === 'agent') {
       scheduleVcMeetingConsumerInjection(key, cfg);
-      scheduleVcMeetingRestoreImmediateTick(key, cfg);
     }
     if (session.consumerMode === 'pending') {
       const remaining = Math.max(0, (session.consumerSelectionExpiresAt ?? Date.now()) - Date.now());
@@ -4471,7 +4475,32 @@ async function submitVcMeetingOutputRequest(input: {
   content: string;
   reason?: string;
   fallbackText?: string;
-}): Promise<{ ok: true; status: 'sent' | 'pending'; requestId?: string; merged?: boolean } | { ok: false; error: string }> {
+}): Promise<VcMeetingOutputSubmitResult> {
+  const session = vcMeetingSessions.get(vcMeetingSessionKey(input.larkAppId, input.meetingId));
+  if (!session) return submitVcMeetingOutputRequestImpl(input);
+  session.outputSubmitPromises ??= {};
+  const prior = session.outputSubmitPromises[input.channel] ?? Promise.resolve();
+  const run = prior
+    .catch(() => undefined)
+    .then(() => submitVcMeetingOutputRequestImpl(input));
+  const tracked = run.catch(() => undefined);
+  session.outputSubmitPromises[input.channel] = tracked;
+  tracked.finally(() => {
+    if (session.outputSubmitPromises?.[input.channel] === tracked) {
+      delete session.outputSubmitPromises[input.channel];
+    }
+  });
+  return run;
+}
+
+async function submitVcMeetingOutputRequestImpl(input: {
+  larkAppId: string;
+  meetingId: string;
+  channel: VcMeetingOutputChannel;
+  content: string;
+  reason?: string;
+  fallbackText?: string;
+}): Promise<VcMeetingOutputSubmitResult> {
   const cfg = effectiveVcMeetingAgentConfig(input.larkAppId);
   const key = vcMeetingSessionKey(input.larkAppId, input.meetingId);
   const session = vcMeetingSessions.get(key);
@@ -4533,13 +4562,13 @@ async function submitVcMeetingOutputRequest(input: {
       return { ok: false, error: vcMeetingOutputOverflowMessage(input.channel) };
     }
     const mergedReasonParts = [...vcMeetingOutputReasonParts(prior), ...(input.reason ? [input.reason] : [])];
+    const nextNonce = randomVcMeetingNonce();
     const mergedReq: VcMeetingPendingOutputRequest = {
       ...prior,
-      nonce: randomVcMeetingNonce(),
+      nonce: nextNonce,
       content: mergedContent,
       contentParts: mergedContentParts,
       expiresAt: now + vcMeetingOutputReviewTimeoutMs(input.channel),
-      applying: false,
       timer: undefined,
     };
     if (mergedReasonParts.length > 0) {
@@ -4556,10 +4585,12 @@ async function submitVcMeetingOutputRequest(input: {
       delete mergedReq.fallbackText;
       delete mergedReq.fallbackTextParts;
     }
+    prior.nonce = nextNonce;
     clearVcMeetingOutputRequestTimer(prior);
     try {
       await patchVcMeetingOutputReviewCard(session, mergedReq, 'pending');
-      Object.assign(prior, mergedReq);
+      const { applying: _applying, timer: _timer, ...mergedReqState } = mergedReq;
+      Object.assign(prior, mergedReqState);
       session.pendingOutputRequests[input.channel] = prior;
       armVcMeetingOutputRequestTimer(key, prior);
       logger.info(`[vc-agent] output review merged meeting=${input.meetingId} channel=${input.channel} request=${prior.id} parts=${mergedContentParts.length}`);
