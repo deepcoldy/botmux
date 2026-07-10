@@ -3,6 +3,7 @@ import { IDLE_CLEANUP_HOUR_OPTIONS } from '../session-cleanup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { renderCliFilterGroup, SESSION_STATUS_OPTIONS, sessionStatusText, wireSessionsPage } from './sessions.js';
 import { useT } from './react-hooks.js';
+import { readStoredSessionsShowUnknownChats } from './preferences.js';
 
 function SortHeader(props: { sort: string; label: string }) {
   return <th data-sort={props.sort} data-label={props.label}>{props.label}</th>;
@@ -45,6 +46,7 @@ function SessionsPage() {
             <button type="button" data-view="board">{tr('sessions.viewBoard')}</button>
             <button type="button" data-view="table">{tr('sessions.viewTable')}</button>
           </div>
+          <button type="button" id="monitor-room-open" className="monitor-room-open">{tr('sessions.monitorRoom')}</button>
         </div>
       </div>
       <form id="filters" className="filters sessions-filters">
@@ -60,7 +62,17 @@ function SessionsPage() {
           <option value="yes">{tr('sessions.adoptYes')}</option>
           <option value="no">{tr('sessions.adoptNo')}</option>
         </select>
+        <select name="chat" aria-label={tr('sessions.location')}>
+          <option value="">{tr('sessions.chatAny')}</option>
+        </select>
         <span style={{ display: 'contents' }} dangerouslySetInnerHTML={{ __html: renderCliFilterGroup() }} />
+        <label className="filter-toggle">
+          <input
+            type="checkbox"
+            name="showUnknownChats"
+            defaultChecked={readStoredSessionsShowUnknownChats(typeof window === 'undefined' ? undefined : window.localStorage)}
+          /> <span>{tr('sessions.showUnknownChats')}</span>
+        </label>
         <label className="filter-toggle">
           <input type="checkbox" name="active" defaultChecked /> <span>{tr('sessions.activeOnly')}</span>
         </label>
@@ -85,6 +97,7 @@ function SessionsPage() {
       </div>
       <div id="bulk-bar" className="bulk-bar" hidden>
         <span id="bulk-count" />
+        <button type="button" id="bulk-monitor-room">{tr('sessions.addToMonitorRoom')}</button>
         <button type="button" id="bulk-lock">{tr('sessions.lockSelected')}</button>
         <button type="button" id="bulk-unlock">{tr('sessions.unlockSelected')}</button>
         <button type="button" id="bulk-close" className="contrast">{tr('sessions.closeSelected')}</button>
@@ -97,6 +110,7 @@ function SessionsPage() {
             <SortHeader sort="botName" label={tr('sessions.bot')} />
             <SortHeader sort="cliId" label={tr('sessions.cli')} />
             <SortHeader sort="status" label={tr('sessions.status')} />
+            <SortHeader sort="chat" label={tr('sessions.location')} />
             <SortHeader sort="tokenIn" label={tr('sessions.tokenIn')} />
             <SortHeader sort="tokenOut" label={tr('sessions.tokenOut')} />
             <SortHeader sort="title" label={tr('sessions.titleCol')} />

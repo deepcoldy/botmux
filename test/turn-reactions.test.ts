@@ -26,6 +26,16 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
   return { Client: FakeClient };
 });
 
+vi.mock('node-pty', () => ({
+  spawn: vi.fn(() => ({
+    onData: vi.fn(),
+    onExit: vi.fn(),
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+  })),
+}));
+
 vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/client.js');
   return { ...actual, addReaction: mocks.addReaction, removeReaction: mocks.removeReaction };
@@ -84,6 +94,16 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_b', 'GoGoGo');
     expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a', 'om_b']);
+  });
+
+  it('can use Get as the received reaction for substitute turns', async () => {
+    registerWith(true);
+    const ds = makeDs();
+
+    await noteTurnReceived(ds, 'om_sub', undefined, undefined, undefined, 'Get');
+
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_sub', 'Get');
+    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_sub']);
   });
 
   it('silentTurnReactions suppresses receipt reactions in card-off sessions', async () => {

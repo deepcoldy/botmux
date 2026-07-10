@@ -14,6 +14,7 @@ import { logger } from '../utils/logger.js';
 import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
+import { assertSafeAppId } from '../adapters/cli/read-isolation.js';
 import {
   resolveSkillInjectionModeForApp,
   builtinSkillEntries,
@@ -35,7 +36,7 @@ import {
 } from './session-create.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType } from '../adapters/backend/types.js';
-import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
+import type { LarkAttachment, LarkMention, ScheduledTask, SubstituteTrigger } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import { sessionKey, sessionAnchorId } from './types.js';
@@ -190,15 +191,32 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
 
 // ─── Attachment download ─────────────────────────────────────────────────────
 
-export function getAttachmentsDir(messageId: string): string {
-  return join(resolve(config.session.dataDir), 'attachments', messageId);
+export function getAttachmentsDir(larkAppId: string, messageId: string): string {
+  // Per-appId bucket (attachments/<appId>/<messageId>/): the read-isolation Seatbelt
+  // profile is static at CLI spawn time, so an isolated bot's own uploads can only be
+  // re-allowed by a spawn-time-known key — its appId (see buildV2CarveOuts). The
+  // attachments/ root stays wholesale-denied, covering every sibling's bucket AND the
+  // legacy per-messageId layout. assertSafeAppId keeps the segment traversal-safe —
+  // the same guarantee the carve-out path construction relies on.
+  return join(resolve(config.session.dataDir), 'attachments', assertSafeAppId(larkAppId), messageId);
 }
 
 export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[]): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
   if (resources.length === 0) return { attachments: [], needLogin: false };
 
   const attachments: LarkAttachment[] = [];
-  const dir = getAttachmentsDir(messageId);
+  // Resolve the per-appId bucket up front. assertSafeAppId (inside getAttachmentsDir)
+  // throws on a path-unsafe appId (only reachable via a hand-edited bots.json — real
+  // Feishu ids always pass). SOFT-fail rather than let it propagate: an invalid appId
+  // must not sink the whole message (event-dispatcher would drop the text too). Log and
+  // return no attachments, same shape as a download failure — the text still processes.
+  let dir: string;
+  try {
+    dir = getAttachmentsDir(larkAppId, messageId);
+  } catch (err: any) {
+    logger.warn(`[${larkAppId}] skipping attachment download — unusable appId as path segment: ${err.message}`);
+    return { attachments: [], needLogin: false };
+  }
   let needLogin = false;
 
   for (const res of resources) {
@@ -309,6 +327,26 @@ export function renderBufferedSenderBlock(sender: ResolvedSender | undefined, cl
   if (!tag) return '';
   const note = renderCursorSenderNote(cliId, true, locale);
   return note ? `${tag}\n${note}` : tag;
+}
+
+function renderSubstituteTrigger(trigger?: SubstituteTrigger): string {
+  if (!trigger) return '';
+  const attrs: string[] = [];
+  if (trigger.target.name) attrs.push(`name="${xmlEscape(trigger.target.name)}"`);
+  if (trigger.target.openId) attrs.push(`open_id="${xmlEscape(trigger.target.openId)}"`);
+  if (trigger.target.userId) attrs.push(`user_id="${xmlEscape(trigger.target.userId)}"`);
+  if (trigger.target.unionId) attrs.push(`union_id="${xmlEscape(trigger.target.unionId)}"`);
+  const disclosure = trigger.disclosure ?? 'prefix';
+  const instruction = disclosure === 'none'
+    ? 'This turn was triggered by a configured substitute target mention. Answer on behalf of that target when appropriate.'
+    : 'This turn was triggered by a configured substitute target mention. Answer on behalf of that target and clearly disclose that you are answering for them.';
+  return [
+    '<substitute_trigger>',
+    `  <target ${attrs.join(' ')} />`,
+    `  <disclosure>${xmlEscape(disclosure)}</disclosure>`,
+    `  <instruction>${xmlEscape(instruction)}</instruction>`,
+    '</substitute_trigger>',
+  ].join('\n');
 }
 
 export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: Locale): string {
@@ -423,7 +461,7 @@ export function buildNewTopicPrompt(
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
   sender?: ResolvedSender,
-  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string },
+  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger },
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
@@ -541,6 +579,9 @@ export function buildNewTopicPrompt(
   const senderBlock = renderSenderTag(sender);
   if (senderBlock) parts.push(senderBlock);
 
+  const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
+  if (substituteBlock) parts.push(substituteBlock);
+
   const senderNote = renderCursorSenderNote(cliId, !!senderBlock, locale);
   if (senderNote) parts.push(senderNote);
 
@@ -566,7 +607,7 @@ export function buildNewTopicPrompt(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger },
 ): string {
   const parts: string[] = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
@@ -594,6 +635,9 @@ export function buildFollowUpContent(
 
   const senderBlock = renderSenderTag(opts?.sender);
   if (senderBlock) parts.push(senderBlock);
+
+  const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
+  if (substituteBlock) parts.push(substituteBlock);
 
   const senderNote = renderCursorSenderNote(opts?.cliId, !!senderBlock, opts?.locale);
   if (senderNote) parts.push(senderNote);
@@ -1461,7 +1505,7 @@ export async function executeScheduledTask(
     task.deliver === 'new-topic' ? 'thread'
       : scope === 'chat' && anchor !== task.chatId ? 'thread'
         : scope;
-  const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`);
+  const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group');
   const now = Date.now();
   session.larkAppId = larkAppId;
   session.scope = runtimeScope;

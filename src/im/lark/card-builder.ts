@@ -255,10 +255,28 @@ function localCliLabel(cliName: string): string {
   return cliName.replace(/\s+(App|CLI)$/i, '');
 }
 
+/** 💻「打开 <CLI>」本机直开按钮暂时隐藏——打磨好前先不放出来。两个原因：
+ *  1) 实际只有 mac 桌面能用：生产 daemon 跑在 headless Linux 上没有 GUI，
+ *     localTerminalCapable() 恒 false，按钮根本不出现；只有在 mac 上跑 daemon 才看得到。
+ *  2) 点了会在本机 Terminal 里 `resume` 同一个 CLI 会话，把会话从 botmux worker/PTY
+ *     抢到本地，飞书这侧的对话就此断开、不再跟随——破坏了飞书对话的连续性。
+ *
+ *  优化方向（做到这些、不破坏飞书对话连续性后再放出来）：
+ *  - 本机直开走 tmux attach（附到 botmux 会话所在的那个 tmux/pane），而不是另起一个
+ *    `resume` 进程另开一份会话；
+ *  - 本机终端 ↔ 飞书双向同步：本地敲的输入、CLI 的输出，飞书侧要能同步跟随，两边共用
+ *    同一路 I/O，谁在哪敲都不断线。
+ *
+ *  重新启用：删掉下面这行 HIDE_OPEN_LOCAL_CLI_BUTTON 判断即可（按钮实现 + card-handler
+ *  的 open_local_terminal 处理都还在，未删）。
+ *  （标 boolean 而非字面量 true，免得 TS 把后面的 localTerminalCapable() 判成 unreachable。） */
+const HIDE_OPEN_LOCAL_CLI_BUTTON: boolean = true;
+
 /** Zero or one local-CLI open button — only on hosts that can actually pop a
  *  native terminal (macOS, or Linux with a GUI session); headless servers get
  *  no button instead of one that always toasts "unsupported". */
 function openLocalTerminalButtons(actionBase: Record<string, string>, cliName: string, locale?: Locale): any[] {
+  if (HIDE_OPEN_LOCAL_CLI_BUTTON) return [];
   if (!localTerminalCapable()) return [];
   return [{
     tag: 'button',

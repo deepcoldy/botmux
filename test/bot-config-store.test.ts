@@ -197,6 +197,66 @@ describe('bot-config store', () => {
     expect(invalid.silentTurnReactions).toBeUndefined();
   });
 
+  it('parses substituteMode, retaining a disabled config\'s targets', async () => {
+    const { registry } = await freshModules();
+    const [enabled, disabled, empty, emailOnly] = registry.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'sub-on',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        substituteMode: {
+          enabled: true,
+          disclosure: 'none',
+          targets: [
+            { userId: 'u_target', name: 'Target User' },
+            { openId: 'ou_target', email: 'target@example.com' },
+            { bogus: true },
+          ],
+        },
+      },
+      {
+        larkAppId: 'sub-disabled',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        substituteMode: { enabled: false, targets: [{ userId: 'u_target' }] },
+      },
+      {
+        larkAppId: 'sub-empty',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        substituteMode: { enabled: true, targets: [{ name: 'No ids' }] },
+      },
+      {
+        larkAppId: 'sub-email-only',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        // email is preserved on a target but never matched at runtime, so an
+        // email-only target set cannot enable the mode (would be silently dead).
+        substituteMode: { enabled: true, targets: [{ email: 'ghost@example.com', name: 'Email only' }] },
+      },
+    ]));
+
+    expect(enabled.substituteMode).toEqual({
+      enabled: true,
+      disclosure: 'none',
+      targets: [
+        { userId: 'u_target', name: 'Target User' },
+        { openId: 'ou_target', email: 'target@example.com' },
+      ],
+    });
+    // A disabled config keeps its target list so the dashboard toggle can flip
+    // back on without re-entering everyone; only the runtime trigger stays off.
+    expect(disabled.substituteMode).toEqual({
+      enabled: false,
+      disclosure: 'prefix',
+      targets: [{ userId: 'u_target' }],
+    });
+    // Enabled-but-unmatchable stays dropped: an ON state with no openId/userId/
+    // unionId target could never trigger (name-only and email-only are dead).
+    expect(empty.substituteMode).toBeUndefined();
+    expect(emailOnly.substituteMode).toBeUndefined();
+  });
+
   it('sets and unsets JSON skills policy through /config store', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('skills')!;

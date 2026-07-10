@@ -54,4 +54,24 @@ describe('downloadResources — needLogin gating', () => {
     expect(attachments).toHaveLength(1);
     expect(attachments[0]).toMatchObject({ type: 'image', name: 'k.jpg' });
   });
+
+  it('saves into the per-appId bucket (attachments/<appId>/<messageId>/) for the read-isolation carve-out', async () => {
+    // Read isolation wholesale-denies attachments/ and re-allows only
+    // attachments/<own appId>/ — the storage layout must match the carve-out key.
+    (downloadMessageResource as any).mockResolvedValue(undefined);
+    const { attachments } = await downloadResources('app', 'om_1', [img]);
+    expect(attachments[0].path).toMatch(/\/attachments\/app\/om_1\/k\.jpg$/);
+    expect((downloadMessageResource as any).mock.calls[0][4]).toMatch(/\/attachments\/app\/om_1\/k\.jpg$/);
+  });
+
+  it('soft-fails (no throw) on a path-unsafe appId — text still processes, no download attempted', async () => {
+    // A hand-edited bots.json could carry an appId with a path separator. getAttachmentsDir
+    // → assertSafeAppId throws; downloadResources must catch it and return empty rather than
+    // sink the whole message (event-dispatcher would drop the text too). Real cli_xxx ids pass.
+    (downloadMessageResource as any).mockResolvedValue(undefined);
+    const { attachments, needLogin } = await downloadResources('bad/app', 'om_1', [img]);
+    expect(attachments).toEqual([]);
+    expect(needLogin).toBe(false);
+    expect(downloadMessageResource as any).not.toHaveBeenCalled();
+  });
 });

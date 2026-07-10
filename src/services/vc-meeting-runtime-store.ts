@@ -21,6 +21,8 @@ export interface VcMeetingRuntimeSessionRecord {
   syncIntervalMs?: number;
   consumerSelectionExpiresAt?: number;
   consumerCardMessageId?: string;
+  temporaryInstructionOpenIds?: string[];
+  temporaryInstructionUnionIds?: string[];
   createdAt: number;
   updatedAt: number;
   expiresAt: number;
@@ -174,6 +176,12 @@ function normalizeRecord(value: unknown): VcMeetingRuntimeSessionRecord | undefi
     ...(typeof r.consumerCardMessageId === 'string' && r.consumerCardMessageId.trim()
       ? { consumerCardMessageId: r.consumerCardMessageId.trim() }
       : {}),
+    ...(Array.isArray(r.temporaryInstructionOpenIds)
+      ? { temporaryInstructionOpenIds: normalizeIdList(r.temporaryInstructionOpenIds) }
+      : {}),
+    ...(Array.isArray(r.temporaryInstructionUnionIds)
+      ? { temporaryInstructionUnionIds: normalizeIdList(r.temporaryInstructionUnionIds) }
+      : {}),
     createdAt,
     updatedAt,
     expiresAt,
@@ -199,6 +207,19 @@ function normalizeEndedTombstoneRecord(value: unknown): VcMeetingEndedTombstoneR
 
 function isOutputPolicy(value: unknown): value is VcMeetingOutputPolicy {
   return value === 'deny' || value === 'approval' || value === 'allow';
+}
+
+function normalizeIdList(value: unknown[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    const id = item.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
 }
 
 export function listVcMeetingRuntimeSessions(
@@ -308,6 +329,8 @@ export function recordVcMeetingRuntimeSession(
     syncIntervalMs?: number;
     consumerSelectionExpiresAt?: number;
     consumerCardMessageId?: string;
+    temporaryInstructionOpenIds?: string[];
+    temporaryInstructionUnionIds?: string[];
   },
   now = Date.now(),
 ): void {
@@ -333,6 +356,12 @@ export function recordVcMeetingRuntimeSession(
     ...(input.syncIntervalMs !== undefined ? { syncIntervalMs: input.syncIntervalMs } : {}),
     ...(input.consumerSelectionExpiresAt !== undefined ? { consumerSelectionExpiresAt: input.consumerSelectionExpiresAt } : {}),
     ...(input.consumerCardMessageId ? { consumerCardMessageId: input.consumerCardMessageId } : {}),
+    ...(input.temporaryInstructionOpenIds !== undefined
+      ? { temporaryInstructionOpenIds: normalizeIdList(input.temporaryInstructionOpenIds) }
+      : {}),
+    ...(input.temporaryInstructionUnionIds !== undefined
+      ? { temporaryInstructionUnionIds: normalizeIdList(input.temporaryInstructionUnionIds) }
+      : {}),
     createdAt: prior?.createdAt ?? now,
     updatedAt: now,
     expiresAt: now + DEFAULT_TTL_MS,

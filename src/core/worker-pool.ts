@@ -2485,11 +2485,17 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'final_output': {
         // Adopt-bridge: worker harvested the assistant turn from Claude Code's
-        // transcript JSONL and forwarded it to us. Dedup by lastUuid so a
-        // re-drain after a noisy idle doesn't re-send the same answer.
+        // transcript JSONL and forwarded it to us. Dedup with a session-scoped
+        // key so a re-drain can't re-send the same answer or cross-suppress
+        // another session.
         if (!msg.content || !msg.content.trim()) break;
-        if (msg.lastUuid && ds.lastBridgeEmittedUuid === msg.lastUuid) {
-          logger.debug(`[${t}] final_output deduped (uuid ${msg.lastUuid.substring(0, 8)})`);
+        if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
+        if (!msg.sessionId) {
+          logger.warn(`[${t}] final_output missing sessionId; accepting for compatibility (session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`);
+        }
+        const dedupeKey = finalOutputDedupeKey(ds, msg);
+        if (ds.lastBridgeEmittedUuid === dedupeKey) {
+          logger.debug(`[${t}] final_output deduped (key ${dedupeKey.substring(0, 48)})`);
           break;
         }
         // Worker pops the turn off its queue right after emit, so it will
@@ -2562,6 +2568,23 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 
+function finalOutputDedupeKey(ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): string {
+  return `${msg.sessionId ?? ds.session.sessionId}:${msg.lastUuid || msg.turnId}`;
+}
+
+function shouldDropMismatchedFinalOutput(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  t: string,
+): boolean {
+  if (!msg.sessionId || msg.sessionId === ds.session.sessionId) return false;
+  logger.error(
+    `[${t}] Dropped final_output with mismatched sessionId ` +
+    `(msg=${msg.sessionId}, session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+  );
+  return true;
+}
+
 /**
  * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
  * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
@@ -2616,7 +2639,7 @@ function deliverFinalOutput(
   const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
   if (waitPromise) {
     waitPromise.resolve(msg.content);
-    ds.lastBridgeEmittedUuid = msg.lastUuid;
+    ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Intercepted final_output for Wait Mode HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     return;
   }
@@ -2626,7 +2649,7 @@ function deliverFinalOutput(
     asyncResult.status = 'completed';
     asyncResult.content = msg.content;
     asyncResult.completedAt = Date.now();
-    ds.lastBridgeEmittedUuid = msg.lastUuid;
+    ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     return;
   }
@@ -2654,7 +2677,7 @@ function deliverFinalOutput(
           await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined);
         }
         ds.docCommentTurns?.delete(msg.turnId);
-        ds.lastBridgeEmittedUuid = msg.lastUuid;
+        ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
         return;
       }
@@ -2689,13 +2712,13 @@ function deliverFinalOutput(
       // place. message.patch is silent (no Feishu notification / unread), which
       // used to swallow the answer; a brand-new message always pings.
       await scopedReply(cardJson, 'interactive', msg.turnId);
-      ds.lastBridgeEmittedUuid = msg.lastUuid;
+      ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
     } catch (err: any) {
       if (err instanceof MessageWithdrawnError) {
         // Root message gone — no point retrying. Mark as emitted so any
         // duplicate IPC is correctly deduped, and tear the session down.
-        ds.lastBridgeEmittedUuid = msg.lastUuid;
+        ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.warn(`[${t}] Root message withdrawn while forwarding final_output, closing session`);
         cb.closeSession(ds);
         return;
@@ -2719,6 +2742,7 @@ function deliverFinalOutput(
 export const __testOnly_deliverFinalOutput = deliverFinalOutput;
 export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
 export const __testOnly_finishTurnReactions = finishTurnReactions;
+export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
