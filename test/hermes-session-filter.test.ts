@@ -20,7 +20,7 @@ describe('filterHermesEventsForBotmuxSession', () => {
       assistant('a-current', 'hermes-A', 'right final'),
     ], { botmuxSessionId: 'botmux-A' });
 
-    expect(result.newlyBoundSourceSessionId).toBe('hermes-A');
+    expect(result.newlyBoundSourceSessionIds).toEqual(['hermes-A']);
     expect(result.boundSourceSessionId).toBe('hermes-A');
     expect(result.events.map(e => e.uuid)).toEqual(['u-current', 'a-current']);
     expect(result.drops.map(d => [d.uuid, d.reason])).toEqual([
@@ -37,7 +37,7 @@ describe('filterHermesEventsForBotmuxSession', () => {
       assistant('a-missing', undefined, 'missing source'),
     ], { botmuxSessionId: 'botmux-A', boundSourceSessionId: 'hermes-A' });
 
-    expect(result.newlyBoundSourceSessionId).toBeUndefined();
+    expect(result.newlyBoundSourceSessionIds).toEqual([]);
     expect(result.boundSourceSessionId).toBe('hermes-A');
     expect(result.events.map(e => e.uuid)).toEqual(['a-current']);
     expect(result.drops.map(d => [d.uuid, d.reason])).toEqual([
@@ -54,12 +54,31 @@ describe('filterHermesEventsForBotmuxSession', () => {
       assistant('a-old-late', 'hermes-A', 'late old final'),
     ], { botmuxSessionId: 'botmux-A', boundSourceSessionId: 'hermes-A' });
 
-    expect(result.newlyBoundSourceSessionId).toBe('hermes-C');
+    expect(result.newlyBoundSourceSessionIds).toEqual(['hermes-C']);
     expect(result.boundSourceSessionId).toBe('hermes-C');
     expect(result.events.map(e => e.uuid)).toEqual(['a-old', 'u-new', 'a-new']);
     expect(result.drops.map(d => [d.uuid, d.reason, d.expectedSourceSessionId])).toEqual([
       ['a-old-late', 'foreign_source', 'hermes-C'],
     ]);
+  });
+
+  it('reports every source bound in one drain when starting unbound (clear rotation within a batch)', () => {
+    // The worker attaches unbound (fresh spawn / re-attach) and a single drain
+    // straddles a `/clear`: the first turn binds hermes-A, then the marker
+    // reappears under the rotated hermes-C. Both finals are kept, and BOTH
+    // sources are reported so the worker announces each to the daemon — the
+    // completed hermes-A turn must not be dropped once hermes-C is bound.
+    const result = filterHermesEventsForBotmuxSession([
+      user('u-A', 'hermes-A', '<session_id>botmux-A</session_id>\nfirst question'),
+      assistant('a-A', 'hermes-A', 'answer A'),
+      user('u-C', 'hermes-C', '<session_id>botmux-A</session_id>\nafter clear'),
+      assistant('a-C', 'hermes-C', 'answer C'),
+    ], { botmuxSessionId: 'botmux-A' });
+
+    expect(result.newlyBoundSourceSessionIds).toEqual(['hermes-A', 'hermes-C']);
+    expect(result.boundSourceSessionId).toBe('hermes-C');
+    expect(result.events.map(e => e.uuid)).toEqual(['u-A', 'a-A', 'u-C', 'a-C']);
+    expect(result.drops).toEqual([]);
   });
 
   it('isolates two botmux workers reading the same interleaved Hermes rows', () => {

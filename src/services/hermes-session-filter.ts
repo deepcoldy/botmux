@@ -11,7 +11,11 @@ export interface HermesSessionFilterDrop {
 export interface HermesSessionFilterResult {
   events: CodexBridgeEvent[];
   boundSourceSessionId?: string;
-  newlyBoundSourceSessionId?: string;
+  /** Every native source this call newly bound, in order. A single drain can
+   *  bind more than one source when the worker starts unbound and Hermes
+   *  `/clear`-rotates mid-batch; the worker must announce each to the daemon so
+   *  a completed turn from an earlier source is not dropped as unauthorized. */
+  newlyBoundSourceSessionIds: string[];
   drops: HermesSessionFilterDrop[];
 }
 
@@ -25,19 +29,25 @@ export function filterHermesEventsForBotmuxSession(
   opts: { botmuxSessionId: string; boundSourceSessionId?: string },
 ): HermesSessionFilterResult {
   let boundSourceSessionId = opts.boundSourceSessionId;
-  let newlyBoundSourceSessionId: string | undefined;
+  const newlyBoundSourceSessionIds: string[] = [];
   const marker = `<session_id>${opts.botmuxSessionId}</session_id>`;
   const kept: CodexBridgeEvent[] = [];
   const drops: HermesSessionFilterDrop[] = [];
 
+  const bindSource = (source: string): void => {
+    boundSourceSessionId = source;
+    if (!newlyBoundSourceSessionIds.includes(source)) newlyBoundSourceSessionIds.push(source);
+  };
+
   for (const ev of events) {
     const sourceSessionId = ev.sourceSessionId?.trim() || undefined;
-    const hasBotmuxMarker = ev.kind === 'user' && !!sourceSessionId && ev.text.includes(marker);
+    const markerSource = ev.kind === 'user' && sourceSessionId && ev.text.includes(marker)
+      ? sourceSessionId
+      : undefined;
 
     if (!boundSourceSessionId) {
-      if (hasBotmuxMarker) {
-        boundSourceSessionId = sourceSessionId;
-        newlyBoundSourceSessionId = sourceSessionId;
+      if (markerSource) {
+        bindSource(markerSource);
       } else {
         drops.push({
           uuid: ev.uuid,
@@ -47,9 +57,8 @@ export function filterHermesEventsForBotmuxSession(
         });
         continue;
       }
-    } else if (hasBotmuxMarker && sourceSessionId !== boundSourceSessionId) {
-      boundSourceSessionId = sourceSessionId;
-      newlyBoundSourceSessionId = sourceSessionId;
+    } else if (markerSource && markerSource !== boundSourceSessionId) {
+      bindSource(markerSource);
     }
 
     if (!sourceSessionId || sourceSessionId !== boundSourceSessionId) {
@@ -66,5 +75,5 @@ export function filterHermesEventsForBotmuxSession(
     kept.push(ev);
   }
 
-  return { events: kept, boundSourceSessionId, newlyBoundSourceSessionId, drops };
+  return { events: kept, boundSourceSessionId, newlyBoundSourceSessionIds, drops };
 }

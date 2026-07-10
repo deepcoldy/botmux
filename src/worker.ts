@@ -2056,11 +2056,15 @@ function hermesBridgeIngest(): void {
     botmuxSessionId: sessionId,
     boundSourceSessionId: hermesBridgeSourceSessionId,
   });
-  if (filtered.newlyBoundSourceSessionId) {
-    hermesBridgeSourceSessionId = filtered.newlyBoundSourceSessionId;
-    send({ type: 'bridge_source_session', bridge: 'hermes', sourceSessionId: filtered.newlyBoundSourceSessionId });
-    log(`Hermes bridge bound sourceSessionId=${filtered.newlyBoundSourceSessionId}`);
+  // Announce EVERY source bound this drain, not just the last. A single drain
+  // can bind multiple sources when the worker starts unbound and Hermes
+  // `/clear`-rotates mid-batch; the daemon accumulates them into its authorized
+  // set, so a completed turn from an earlier source is not dropped as foreign.
+  for (const boundSourceSessionId of filtered.newlyBoundSourceSessionIds) {
+    send({ type: 'bridge_source_session', bridge: 'hermes', sourceSessionId: boundSourceSessionId });
+    log(`Hermes bridge bound sourceSessionId=${boundSourceSessionId}`);
   }
+  hermesBridgeSourceSessionId = filtered.boundSourceSessionId;
   for (const drop of filtered.drops) {
     log(`Hermes bridge dropped ${drop.kind} ${drop.uuid} from sourceSessionId=${drop.sourceSessionId ?? '?'} expected=${drop.expectedSourceSessionId ?? hermesBridgeSourceSessionId ?? 'unbound'} reason=${drop.reason}`);
   }
