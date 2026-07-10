@@ -93,6 +93,8 @@ export function classifyTaskDisposition(task: ClassifiableTask, ctx: Disposition
       return { bucket: 'readyToVerify', reason: 'awaiting_verdict', next: '已有提交，等验收' };
     case 'accepted':
       return { bucket: 'completed', reason: 'accepted', next: '已验收' };
+    case 'cancelled':
+      return { bucket: 'quiet', reason: 'cancelled', next: '已取消' };
     case 'dispatched':
       return activeRisk() ?? { bucket: 'inProgress', reason: 'dispatched', next: '等执行者提交结果' };
     case 'rejected':
@@ -156,7 +158,7 @@ const RECENTLY_COMPLETED_LIMIT = 12;
 
 function taskLastActivity(t: GoalBoardTask): number | undefined {
   let last: number | undefined;
-  for (const ts of [t.dispatchedAt, t.latestReportedAt, t.latestVerdictAt, t.acceptedAt, t.rejectedAt]) {
+  for (const ts of [t.dispatchedAt, t.latestReportedAt, t.latestVerdictAt, t.acceptedAt, t.rejectedAt, t.cancelledAt]) {
     if (ts !== undefined && (last === undefined || ts > last)) last = ts;
   }
   return last;

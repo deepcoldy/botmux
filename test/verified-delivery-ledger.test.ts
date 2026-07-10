@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openLedger } from '../src/verified-delivery/ledger.js';
@@ -73,6 +73,60 @@ describe('verified-delivery ledger', () => {
     expect(t.reports.find((r) => r.reportId === 'r2')?.verdict).toBeUndefined();
   });
 
+  it('keeps a cancelled task terminal until an explicit re-dispatch', () => {
+    const led = openLedger({ baseDir });
+    led.append(draft({ type: 'TaskDispatched', taskId: 'task-cancel', idempotencyKey: 'dispatched:task-cancel', payload: { taskId: 'task-cancel' } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 'task-cancel', idempotencyKey: 'reported:c1', payload: { taskId: 'task-cancel', reportId: 'c1', summary: 'first', evidence: [{ kind: 'path', path: '/tmp/a' }] } }));
+    led.append(draft({ type: 'TaskCancelled', taskId: 'task-cancel', idempotencyKey: 'cancelled:task-cancel', payload: { taskId: 'task-cancel', reason: '超出目标范围', by: 'sup' } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 'task-cancel', idempotencyKey: 'reported:c2', payload: { taskId: 'task-cancel', reportId: 'c2', summary: 'late', evidence: [{ kind: 'path', path: '/tmp/b' }] } }));
+    led.append(draft({ type: 'TaskAccepted', taskId: 'task-cancel', idempotencyKey: 'accepted:task-cancel:c1', payload: { taskId: 'task-cancel', reportId: 'c1', checkedBy: 'late-sup' } }));
+    led.append(draft({ type: 'TaskRejected', taskId: 'task-cancel', idempotencyKey: 'rejected:task-cancel:c2', payload: { taskId: 'task-cancel', reportId: 'c2', reason: 'late-reject' } }));
+    led.append(draft({ type: 'TaskHelpRequested', actor: 'worker', taskId: 'task-cancel', idempotencyKey: 'help:task-cancel:late', payload: { taskId: 'task-cancel', blocker: 'late help' } }));
+
+    const cancelled = led.task('task-cancel')!;
+    expect(cancelled.status).toBe('cancelled');
+    expect(cancelled.latestReportId).toBe('c1');
+    expect(cancelled.cancellation).toEqual({ reason: '超出目标范围', by: 'sup' });
+    expect(cancelled.reports).toHaveLength(2);
+
+    led.append(draft({ type: 'TaskDispatched', taskId: 'task-cancel', idempotencyKey: 'dispatched:task-cancel:redo', payload: { taskId: 'task-cancel', brief: '恢复执行' } }));
+    const reopened = led.task('task-cancel')!;
+    expect(reopened.status).toBe('dispatched');
+    expect(reopened.latestReportId).toBeUndefined();
+    expect(reopened.cancellation).toBeUndefined();
+
+    led.append(draft({ type: 'TaskCancelled', taskId: 'task-cancel', idempotencyKey: 'cancelled:task-cancel:redo', payload: { taskId: 'task-cancel', reason: '第二轮也取消', by: 'sup' } }));
+    expect(led.task('task-cancel')).toMatchObject({ status: 'cancelled', cancellation: { reason: '第二轮也取消' } });
+  });
+
+  it('refuses cancelling an accepted or unknown task', () => {
+    const led = openLedger({ baseDir });
+    expect(() => led.append(draft({ type: 'TaskCancelled', taskId: 'missing', idempotencyKey: 'cancelled:missing', payload: { taskId: 'missing', reason: 'x' } })))
+      .toThrow(/requires an existing task/);
+
+    led.append(draft({ type: 'TaskDispatched', taskId: 'task-accepted', idempotencyKey: 'dispatched:task-accepted', payload: { taskId: 'task-accepted' } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 'task-accepted', idempotencyKey: 'reported:a1', payload: { taskId: 'task-accepted', reportId: 'a1', summary: 'done', evidence: [{ kind: 'path', path: '/tmp/a' }] } }));
+    led.append(draft({ type: 'TaskAccepted', taskId: 'task-accepted', idempotencyKey: 'accepted:task-accepted:a1', payload: { taskId: 'task-accepted', reportId: 'a1', checkedBy: 'sup' } }));
+    expect(() => led.append(draft({ type: 'TaskCancelled', taskId: 'task-accepted', idempotencyKey: 'cancelled:task-accepted', payload: { taskId: 'task-accepted', reason: 'too late' } })))
+      .toThrow(/accepted task cannot be cancelled/);
+  });
+
+  it('defensively ignores illegal cancellation events during historical replay', () => {
+    const rows = [
+      { type: 'TaskDispatched', actor: 'orchestrator', taskId: 'accepted-task', ts: TS, idempotencyKey: 'd:a', payload: { taskId: 'accepted-task' }, eventId: '1', seq: 1 },
+      { type: 'TaskReported', actor: 'worker', taskId: 'accepted-task', ts: TS + 1, idempotencyKey: 'r:a', payload: { taskId: 'accepted-task', reportId: 'ra', summary: 'done', evidence: [{ kind: 'path', path: '/tmp/a' }] }, eventId: '2', seq: 2 },
+      { type: 'TaskAccepted', actor: 'orchestrator', taskId: 'accepted-task', ts: TS + 2, idempotencyKey: 'a:a', payload: { taskId: 'accepted-task', reportId: 'ra' }, eventId: '3', seq: 3 },
+      { type: 'TaskCancelled', actor: 'orchestrator', taskId: 'accepted-task', ts: TS + 3, idempotencyKey: 'c:a', payload: { taskId: 'accepted-task', reason: 'illegal late cancel' }, eventId: '4', seq: 4 },
+      { type: 'TaskCancelled', actor: 'orchestrator', taskId: 'ghost-task', ts: TS + 4, idempotencyKey: 'c:ghost', payload: { taskId: 'ghost-task', reason: 'illegal orphan' }, eventId: '5', seq: 5 },
+    ];
+    writeFileSync(join(baseDir, 'ledger.ndjson'), rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+
+    const led = openLedger({ baseDir });
+    expect(led.task('accepted-task')).toMatchObject({ status: 'accepted' });
+    expect(led.task('accepted-task')?.cancellation).toBeUndefined();
+    expect(led.task('ghost-task')).toBeUndefined();
+  });
+
   it('a late verdict for a superseded report does not drag the new attempt back', () => {
     const led = openLedger({ baseDir });
     led.append(draft({ type: 'TaskDispatched', taskId: 'task-4', idempotencyKey: 'dispatched:task-4', payload: { taskId: 'task-4' } }));
@@ -111,6 +165,12 @@ describe('verified-delivery ledger', () => {
       idempotencyKey: 'dispatched:empty',
       payload: { taskId: '' },
     }))).toThrow(/taskId must be non-empty/);
+    expect(() => led.append(draft({
+      type: 'TaskCancelled',
+      taskId: 'task-cancel-empty',
+      idempotencyKey: 'cancelled:task-cancel-empty',
+      payload: { taskId: 'task-cancel-empty', reason: '   ' },
+    }))).toThrow(/TaskCancelled\.reason/);
   });
 
   it('refuses misaligned worker metadata and malformed acceptanceCriteria', () => {

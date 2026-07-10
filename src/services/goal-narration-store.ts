@@ -19,7 +19,7 @@ import { logger } from '../utils/logger.js';
 
 export interface GoalNarrationRecord {
   goalChatId: string;
-  /** Narration event type: human-decision | accepted | rejected | escalated | help. */
+  /** Narration event type, including delivery lifecycle and cleanup events. */
   type: string;
   taskId?: string;
   /** The rendered human-readable narration text (same as the chat card). */

@@ -7610,7 +7610,7 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
   查看任务:
     botmux delivery show --task <taskId>
   列出任务:
-    botmux delivery list [--goal <chatId>] [--status dispatched|reported|accepted|rejected|blocked|escalated] [--older-than 2h]
+    botmux delivery list [--goal <chatId>] [--status dispatched|reported|accepted|rejected|blocked|escalated|cancelled] [--older-than 2h]
   验收通过:
     botmux delivery accept --task <taskId> [--report <reportId>] \\
         [--checked-by <id>] [--note <text>] [--evidence-checked <ref>]... [--ran-command <cmd>]...
@@ -7621,6 +7621,8 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
     botmux delivery escalate --task <taskId> --reason <text> \\
         [--retry-brief <text>] [--by <id>] [--session-id <L2会话id>] [--no-notify-parent] \\
         [--options "a=方案A,b=方案B"] [--recommended a]
+  取消任务:
+    botmux delivery cancel --task <taskId> --reason <text> [--by <id>]
 
 说明:
   --report 省略时默认使用该任务 latestReportId。
@@ -7635,9 +7637,9 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
   if (sub === 'list') {
     const goal = argValue(rest, '--goal', '--chat-id');
     const status = argValue(rest, '--status');
-    const validStatuses = new Set<TaskStatus>(['dispatched', 'reported', 'accepted', 'rejected', 'blocked', 'escalated']);
+    const validStatuses = new Set<TaskStatus>(['dispatched', 'reported', 'accepted', 'rejected', 'blocked', 'escalated', 'cancelled']);
     if (status && !validStatuses.has(status as TaskStatus)) {
-      console.error('delivery list: --status 必须是 dispatched / reported / accepted / rejected / blocked / escalated');
+      console.error('delivery list: --status 必须是 dispatched / reported / accepted / rejected / blocked / escalated / cancelled');
       process.exit(1);
     }
     const taskStatus = status as TaskStatus | undefined;
@@ -7684,7 +7686,7 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
     return;
   }
 
-  if (sub !== 'accept' && sub !== 'reject' && sub !== 'escalate') {
+  if (sub !== 'accept' && sub !== 'reject' && sub !== 'escalate' && sub !== 'cancel') {
     console.error(`delivery: 未知子命令 ${sub}`);
     process.exit(1);
   }
@@ -7695,7 +7697,61 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
   const s = sid ? sessions.get(sid) : undefined;
   const checkedBy = argValue(rest, '--checked-by') ?? s?.larkAppId ?? s?.ownerOpenId ?? 'orchestrator';
 
+  if (sub === 'cancel') {
+    const reason = argValue(rest, '--reason')?.trim();
+    if (!reason) {
+      console.error('delivery cancel 需要 --reason <取消原因>');
+      process.exit(1);
+    }
+    if (task.status === 'accepted') {
+      console.error(`任务 ${taskId} 已验收，不能取消。`);
+      process.exit(1);
+    }
+    const by = argValue(rest, '--by')?.trim() || checkedBy;
+    const pendingReports = task.reports.filter((report) => !report.verdict).length;
+    const latestDispatch = [...ledger.read()].reverse().find((event) =>
+      event.taskId === taskId && event.type === 'TaskDispatched');
+    const result = ledger.append({
+      type: 'TaskCancelled',
+      actor: 'orchestrator',
+      taskId,
+      chatId: task.chatId,
+      ts: Date.now(),
+      // One cancellation per dispatch attempt: retries of this command dedupe,
+      // while an explicit re-dispatch can later be cancelled again.
+      idempotencyKey: `cancelled:${taskId}:${latestDispatch?.eventId ?? 'unknown'}`,
+      payload: { taskId, reason, by },
+    });
+    if (!result.deduped && s?.larkAppId) {
+      await emitDeliveryNarrationFromCli({
+        larkAppId: s.larkAppId,
+        goalChatId: task.chatId,
+        event: {
+          type: 'cancelled',
+          key: `narr:cancelled:${taskId}:${result.event.eventId}`,
+          taskId,
+          title: task.title,
+          reason,
+          by,
+          pendingReports: pendingReports || undefined,
+        },
+      });
+    }
+    console.log(JSON.stringify({
+      success: true,
+      taskId,
+      cancelled: true,
+      deduped: result.deduped,
+      pendingReports,
+    }, null, 2));
+    return;
+  }
+
   if (sub === 'escalate') {
+    if (task.status === 'cancelled') {
+      console.error(`任务 ${taskId} 已取消；如需继续，请先重新派发。`);
+      process.exit(1);
+    }
     const reason = argValue(rest, '--reason')?.trim();
     if (!reason) {
       console.error('delivery escalate 需要 --reason <为什么需要人拍>');
@@ -7780,6 +7836,11 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
       notifyError,
     }, null, 2));
     return;
+  }
+
+  if (task.status === 'cancelled') {
+    console.error(`任务 ${taskId} 已取消；如需继续，请先重新派发。`);
+    process.exit(1);
   }
 
   const reportId = argValue(rest, '--report') ?? task.latestReportId;

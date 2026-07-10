@@ -88,6 +88,15 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
       const existing = read();
       const dup = existing.find((e) => e.idempotencyKey === draft.idempotencyKey);
       if (dup) return { event: dup, deduped: true };
+      if (draft.type === 'TaskCancelled') {
+        const current = materialize(existing).get(draft.taskId);
+        if (!current) {
+          throw new Error('verified-delivery ledger invariant violation: TaskCancelled requires an existing task');
+        }
+        if (current.status === 'accepted') {
+          throw new Error('verified-delivery ledger invariant violation: accepted task cannot be cancelled');
+        }
+      }
       const seq = existing.length + 1;
       const event: LedgerEvent = { ...draft, eventId: String(seq), seq };
       appendFileSync(ledgerPath, JSON.stringify(event) + '\n');
@@ -120,22 +129,29 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
         t.requiredRepo = p.requiredRepo ?? t.requiredRepo;
         t.acceptanceHint = p.acceptanceHint ?? t.acceptanceHint;
         t.acceptanceCriteria = p.acceptanceCriteria ?? t.acceptanceCriteria;
-        // A (re)dispatch re-activates a fresh OR a help-blocked/escalated task —
+        // A (re)dispatch re-activates a fresh OR a help-blocked/escalated/
+        // cancelled task —
         // it's the supervisor's "go again" after addressing the blocker. It must
         // NOT clobber a reported/accepted/rejected task (late metadata dispatch).
-        if (t.reports.length === 0 || t.status === 'blocked' || t.status === 'escalated') t.status = 'dispatched';
+        if (t.reports.length === 0 || t.status === 'blocked' || t.status === 'escalated' || t.status === 'cancelled') {
+          if (t.status === 'cancelled') {
+            t.cancellation = undefined;
+            t.latestReportId = undefined;
+          }
+          t.status = 'dispatched';
+        }
       } else if (e.type === 'TaskReported') {
         const p = e.payload as import('./types.js').TaskReportedPayload;
         const t = ensure(e.taskId, e.chatId);
-        const alreadyAccepted = t.status === 'accepted';
+        const terminal = t.status === 'accepted' || t.status === 'cancelled';
         if (!findReport(t, p.reportId)) {
           t.reports.push({ reportId: p.reportId, workerOpenId: p.workerOpenId, evidence: p.evidence, summary: p.summary });
         }
-        // Accepted is terminal. A delayed retry may carry a different reportId
+        // Accepted/cancelled are terminal. A delayed retry may carry a different reportId
         // (for example after a network timeout), but it must not reopen a task
         // that the supervisor has already verified. Keep the event for audit;
         // rejected/blocked/escalated tasks can still recover via a new report.
-        if (!alreadyAccepted) {
+        if (!terminal) {
           t.latestReportId = p.reportId;
           t.status = 'reported';
         }
@@ -147,25 +163,34 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
         // Only the verdict on the CURRENT attempt moves the task. A late verdict
         // for a superseded report still records on that report, but must not drag
         // a fresh attempt back to a terminal state.
-        if (p.reportId === t.latestReportId) t.status = 'accepted';
+        if (t.status !== 'cancelled' && p.reportId === t.latestReportId) t.status = 'accepted';
       } else if (e.type === 'TaskRejected') {
         const p = e.payload as import('./types.js').TaskRejectedPayload;
         const t = ensure(e.taskId, e.chatId);
         const r = findReport(t, p.reportId);
         if (r) { r.verdict = 'rejected'; r.reason = p.reason; r.checkedBy = p.checkedBy; r.verdictVia = p.via ?? r.verdictVia; }
-        if (p.reportId === t.latestReportId) t.status = 'rejected';
+        if (t.status !== 'cancelled' && p.reportId === t.latestReportId) t.status = 'rejected';
       } else if (e.type === 'TaskHelpRequested') {
         const p = e.payload as import('./types.js').TaskHelpRequestedPayload;
         const t = ensure(e.taskId, e.chatId);
         t.help = { blocker: p.blocker, kind: p.kind, workerOpenId: p.workerOpenId };
         // A help request parks the task as 'blocked' awaiting the supervisor — but
         // never overrides a terminal verdict (a late help after accept is noise).
-        if (t.status !== 'accepted' && t.status !== 'rejected') t.status = 'blocked';
+        if (t.status !== 'accepted' && t.status !== 'rejected' && t.status !== 'cancelled') t.status = 'blocked';
       } else if (e.type === 'TaskEscalated') {
         const p = e.payload as import('./types.js').TaskEscalatedPayload;
         const t = ensure(e.taskId, e.chatId);
         t.escalation = { reason: p.reason, by: p.by, retryBrief: p.retryBrief };
-        if (t.status !== 'accepted' && t.status !== 'rejected') t.status = 'escalated';
+        if (t.status !== 'accepted' && t.status !== 'rejected' && t.status !== 'cancelled') t.status = 'escalated';
+      } else if (e.type === 'TaskCancelled') {
+        const p = e.payload as import('./types.js').TaskCancelledPayload;
+        // Defensive replay posture: an illegal historical cancel after accept is
+        // visible in the raw ledger but cannot create a phantom task or rewrite
+        // the accepted read-model.
+        const t = byTask.get(e.taskId);
+        if (!t || t.status === 'accepted') continue;
+        t.cancellation = { reason: p.reason, by: p.by };
+        t.status = 'cancelled';
       }
     }
     return byTask;

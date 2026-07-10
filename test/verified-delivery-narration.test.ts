@@ -44,6 +44,15 @@ describe('verified delivery narration', () => {
     const reassigned = buildGoalNarrationText({ type: 'reassigned', key: 'k5', taskId: 'task-9', deadWorker: 'traex-loopy' });
     expect(reassigned).toContain('🔄 已自动重派 · task-9');
     expect(reassigned).toContain('traex-loopy');
+
+    const cancelled = buildGoalNarrationText({
+      type: 'cancelled', key: 'k6', taskId: 'task-10', title: '临时诊断',
+      reason: '不属于正式目标', by: 'codex-loopy', pendingReports: 2,
+    });
+    expect(cancelled).toContain('⏹ 已取消 · task-10');
+    expect(cancelled).toContain('原因：不属于正式目标');
+    expect(cancelled).toContain('操作人：codex-loopy');
+    expect(cancelled).toContain('已有 2 份提交未验收');
   });
 
   it('dedupes by narration key', async () => {
