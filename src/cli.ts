@@ -5957,7 +5957,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const { findMissingAskEnv, parseAskOptions, parseAskTimeoutSeconds, AskArgsError } =
     await import('./core/ask-args.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
-  const { toLegacySelected } = await import('./core/ask-types.js');
+  const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
 
   const missing = findMissingAskEnv(process.env);
   if (missing) {
@@ -6027,7 +6027,17 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     };
     process.stdout.write(JSON.stringify(out) + '\n');
   } else if (result.kind === 'answered') {
-    // 非 JSON 模式：输出 selected key（单问单选），多选/多问输出空字符串
+    // 非 JSON 模式：输出 selected key（单问单选），多选/多问输出空字符串。
+    //
+    // 用户以文字作答时同样落到空字符串，与多选/多问的降级值无法区分，且 exit 0
+    // ——调用方会静默走进空分支。comment 可能含换行，塞进「一行一个 key」的
+    // stdout 契约并不安全，因此 stdout 保持不变，改由 stderr 指明答案去向。
+    if (isCustomReply(result)) {
+      console.error(
+        'botmux ask: 用户以文字作答，未点选任何选项；stdout 留空（stdout 只承载 option key）。' +
+          ' 用 `--json` 读 comment 字段取回原文。',
+      );
+    }
     process.stdout.write((selected ?? '') + '\n');
   }
 
