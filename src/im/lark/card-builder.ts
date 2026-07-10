@@ -235,7 +235,7 @@ function sidebarMultiUrl(url: string): Record<string, string> {
   };
 }
 
-function directMultiUrl(url: string): Record<string, string> {
+export function directMultiUrl(url: string): Record<string, string> {
   return {
     url,
     pc_url: url,

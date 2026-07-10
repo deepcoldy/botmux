@@ -340,13 +340,19 @@ function renderSubstituteTrigger(trigger?: SubstituteTrigger): string {
   const instruction = disclosure === 'none'
     ? 'This turn was triggered by a configured substitute target mention. Answer on behalf of that target when appropriate.'
     : 'This turn was triggered by a configured substitute target mention. Answer on behalf of that target and clearly disclose that you are answering for them.';
-  return [
+  const lines = [
     '<substitute_trigger>',
     `  <target ${attrs.join(' ')} />`,
     `  <disclosure>${xmlEscape(disclosure)}</disclosure>`,
     `  <instruction>${xmlEscape(instruction)}</instruction>`,
-    '</substitute_trigger>',
-  ].join('\n');
+  ];
+  if (trigger.interventionNotes?.length) {
+    lines.push('  <intervention_notes>');
+    for (const note of trigger.interventionNotes) lines.push(`    <note>${xmlEscape(note)}</note>`);
+    lines.push('  </intervention_notes>');
+  }
+  lines.push('</substitute_trigger>');
+  return lines.join('\n');
 }
 
 export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: Locale): string {

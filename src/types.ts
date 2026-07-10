@@ -217,6 +217,7 @@ export interface SubstituteTrigger {
     unionId?: string;
   };
   disclosure?: 'prefix' | 'none';
+  interventionNotes?: string[];
 }
 
 export interface LarkMessage {

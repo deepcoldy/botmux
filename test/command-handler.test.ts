@@ -1122,6 +1122,7 @@ describe('handleCommand', () => {
         '/revoke',
         '/introduce',
         '/reply-mode',
+        '/substitute',
         '/workflow',
         '/t',
         '/topic',
@@ -1129,6 +1130,7 @@ describe('handleCommand', () => {
       for (const cmd of fixedFeishuCommands) {
         expect(replyContent, `Expected /help to mention ${cmd}`).toContain(cmd);
       }
+      expect(replyContent).toContain('/substitute enter|intervene|exit <chat_id>');
     });
 
     it('should return help text when no session exists', async () => {
