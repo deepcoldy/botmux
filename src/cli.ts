@@ -4783,6 +4783,7 @@ function withCustomCardMentionFooter(
 // keeps using `buildImageCardElements` from there.
 import { buildImageCardElements, brandFooterSegment } from './im/lark/md-card.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
+import { renderBrandTemplate } from './im/lark/brand-template.js';
 import { resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
 import { resolveQuoteTarget, validateMentionDecision, parseAttentionFlag, attentionUsageError } from './services/send-policy.js';
@@ -5577,7 +5578,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       // default botmux, '' → suppressed, else custom). Same resolver/rule as
       // the daemon's card builders so both send paths render identically.
       const footerParts: string[] = [];
-      const brandSeg = brandFooterSegment(resolveBrandLabel(appId));
+      const brandSeg = brandFooterSegment(renderBrandTemplate(resolveBrandLabel(appId), s.workingDir));
       if (brandSeg) footerParts.push(brandSeg);
       // All real mentions land on one footer line: human addressee first, then
       // explicit @ targets (incl. handoff bots), then cc. Ids already inlined in
