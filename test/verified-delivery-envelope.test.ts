@@ -37,6 +37,17 @@ describe('delivery envelope parser', () => {
     ].join('\n'))).toBeNull();
   });
 
+  it('keeps a real report when its evidence mentions a dispatch block', () => {
+    const env = parseDeliveryEnvelope([
+      '[botmux-report v1]',
+      'taskId: task-9',
+      'summary: parser regression verified',
+      'evidence:',
+      '- inline: reproduced [botmux-dispatch v1] without misrouting',
+    ].join('\n'));
+    expect(env).toMatchObject({ kind: 'report', taskId: 'task-9' });
+  });
+
   it('detects unsupported envelope versions for loud diagnostics', () => {
     expect(detectUnsupportedDeliveryEnvelope('[botmux-report v2]\ntaskId: t')).toEqual({
       kind: 'report',
