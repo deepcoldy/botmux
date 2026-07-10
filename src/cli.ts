@@ -7421,8 +7421,11 @@ async function cmdReport(rest: string[]): Promise<void> {
   const { sendMessage, replyMessage } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
 
-  const reportContent = deliveryEnvelope ? `${content.trim()}\n\n${deliveryEnvelope}` : content;
-  const paras = buildReportContent({ orchOpenId: tgt.orchOpenId, content: reportContent });
+  const paras = buildReportContent({
+    orchOpenId: tgt.orchOpenId,
+    content,
+    deliveryEnvelope,
+  });
   const postJson = JSON.stringify({ zh_cn: { title: '', content: paras } });
 
   try {

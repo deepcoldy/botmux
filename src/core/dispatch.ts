@@ -170,10 +170,14 @@ export function buildRepoPrimeText(input: {
 export function buildReportContent(input: {
   orchOpenId: string;
   content: string;
+  deliveryEnvelope?: string;
 }): PostParagraph[] {
   const openId = input.orchOpenId.trim();
   if (!openId) throw new Error('report requires the orchestrator open_id');
-  const text = input.content.trim();
+  // A verified-delivery envelope is a whole-message protocol. It already
+  // carries the human summary, so prefixing `content` would move the header
+  // away from the first meaningful line and make cross-device ingestion skip it.
+  const text = (input.deliveryEnvelope ?? input.content).trim();
   if (!text) throw new Error('report requires content');
 
   const lines = text.split('\n');
