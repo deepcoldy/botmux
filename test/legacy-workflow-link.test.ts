@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { legacyWorkflowDetailHash } from '../src/dashboard/web/legacy-workflow-link.js';
 
-// Regression guard for the v3-detail → legacy fallback (v3.ts poll()): when an
+// Regression guard for the v3-detail → legacy fallback (v3-page.tsx polling): when an
 // old `#/workflows/<v2-run-id>` link lands on v3 detail and `/api/v3/runs/<id>`
 // 404s but the v2 snapshot exists, the page redirects to this hash. The
 // regression-prone bits are the id encoding and verbatim query preservation

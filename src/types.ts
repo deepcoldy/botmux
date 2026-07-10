@@ -45,6 +45,10 @@ export interface Session {
   webPort?: number;
   larkAppId?: string;
   ownerOpenId?: string;       // topic creator's open_id — for @mention in replies
+  /** Best-effort human-readable title for direct/p2p chats. Lark chat APIs
+   *  often return an empty chat name for p2p, so dashboard rows carry the
+   *  initiating user's display name here when we can resolve it. */
+  chatDisplayName?: string;
   /** open_id of whoever created this session (the first sender), app-scoped to
    *  this bot. UNLIKE ownerOpenId, this is set even for bot-started (foreign-bot)
    *  sessions and is NEVER overwritten by later activity — so it stably points at
@@ -200,7 +204,19 @@ export interface LarkMention {
   key: string;        // e.g. "@_user_1"
   name: string;       // display name
   openId?: string;    // open_id of the mentioned user/bot
+  userId?: string;    // user_id of the mentioned user, when Lark includes it
+  unionId?: string;   // stable user id across bot app namespaces when present
   idType?: string;     // e.g. "open_id" or "app_id" from Lark event payloads
+}
+
+export interface SubstituteTrigger {
+  target: {
+    name?: string;
+    openId?: string;
+    userId?: string;
+    unionId?: string;
+  };
+  disclosure?: 'prefix' | 'none';
 }
 
 export interface LarkMessage {

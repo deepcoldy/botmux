@@ -71,6 +71,90 @@ export function mentionOpenId(m: { id?: { open_id?: string; app_id?: string } | 
   return undefined;
 }
 
+export interface MentionIdentity {
+  key?: string;
+  name?: string;
+  openId?: string;
+  userId?: string;
+  unionId?: string;
+  appId?: string;
+  idType?: string;
+}
+
+/** Extract all stable ids Lark provides for @mentions, across WS and REST shapes. */
+export function mentionIdentity(m: {
+  key?: string;
+  name?: string;
+  id?: { open_id?: string; user_id?: string; union_id?: string; app_id?: string } | string | null;
+  id_type?: string;
+} | null | undefined): MentionIdentity {
+  const id = m?.id;
+  const out: MentionIdentity = {
+    key: m?.key,
+    name: m?.name,
+    idType: m?.id_type,
+  };
+  if (id && typeof id === 'object') {
+    out.openId = id.open_id || undefined;
+    out.userId = id.user_id || undefined;
+    out.unionId = id.union_id || undefined;
+    out.appId = id.app_id || undefined;
+    return out;
+  }
+  if (typeof id === 'string' && id) {
+    if (!m?.id_type || m.id_type === 'open_id') out.openId = id;
+    else if (m.id_type === 'user_id') out.userId = id;
+    else if (m.id_type === 'union_id') out.unionId = id;
+    else if (m.id_type === 'app_id') out.appId = id;
+  }
+  return out;
+}
+
+export function extractMentionIdentities(message: {
+  mentions?: Array<{
+    key?: string;
+    name?: string;
+    id?: { open_id?: string; user_id?: string; union_id?: string; app_id?: string } | string | null;
+    id_type?: string;
+  }>;
+  content?: string;
+} | null | undefined): MentionIdentity[] {
+  const out = (message?.mentions ?? []).map(mentionIdentity);
+  try {
+    const content = JSON.parse(message?.content ?? '{}');
+    const inner = content.zh_cn ?? content.en_us ?? content;
+    if (Array.isArray(inner?.content)) {
+      for (const paragraph of inner.content) {
+        if (!Array.isArray(paragraph)) continue;
+        for (const node of paragraph) {
+          if (node?.tag !== 'at') continue;
+          // In post/rich-text content Lark carries the mentionee's OPEN_ID in the
+          // at-node's `user_id` field (cf. isBotMentioned, which compares
+          // node.user_id against botOpenId), NOT a tenant user_id. Map it to
+          // openId only — mislabeling it as userId would both miss a userId-only
+          // target and pollute the userId leg with an open_id value.
+          out.push({
+            name: node.user_name,
+            openId: node.user_id,
+          });
+        }
+      }
+    }
+  } catch { /* ignore non-JSON content */ }
+  return out;
+}
+
+export function mentionUnionId(m: { id?: { union_id?: string } | string | null; id_type?: string } | null | undefined): string | undefined {
+  const id = m?.id;
+  if (id == null) return undefined;
+  if (typeof id === 'object') return id.union_id || undefined;
+  if (typeof id === 'string') {
+    if (m?.id_type !== 'union_id') return undefined;
+    return id || undefined;
+  }
+  return undefined;
+}
+
 /**
  * When the WebSocket event delivers message_type "nonsupport", call the REST API
  * to fetch the real message content and patch the event data in-place.
@@ -310,6 +394,8 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
           key: m.key,
           name: m.name,
           openId: mentionOpenId(m),
+          userId: mentionIdentity(m).userId,
+          unionId: mentionUnionId(m),
           idType: m.id_type,
         }))
       : undefined;

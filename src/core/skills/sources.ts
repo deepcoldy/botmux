@@ -1,9 +1,21 @@
 import { isAbsolute } from 'node:path';
 
 export interface ParsedSkillInstallSource {
-  kind: 'local' | 'git' | 'github';
+  kind: 'local' | 'git' | 'github' | 'agentbuddy';
   value: string;
   github?: { owner: string; repo: string; path?: string; ref?: string };
+  agentbuddy?: AgentbuddySource;
+}
+
+/** A skill (or collection) to fetch through the external `agentbuddy` CLI.
+ *  `collection` is mutually exclusive with `group`/`skill`. No registry host or
+ *  auth lives here — the daemon host's configured `agentbuddy` binary owns that,
+ *  so the public source never carries an internal domain. */
+export interface AgentbuddySource {
+  collection?: string;
+  group?: string;
+  skill?: string;
+  version?: string;
 }
 
 function parseMaybeUrl(raw: string): URL | null {
@@ -120,7 +132,57 @@ function parseGitHubBrowserUrl(raw: string): ParsedSkillInstallSource | null {
   };
 }
 
+// agentbuddy identifiers are passed as argv to the external CLI (via execFile,
+// never a shell), but we still reject anything that could be mistaken for a
+// flag (leading `-`), a path escape (`..`), or carry whitespace/control chars.
+const AGENTBUDDY_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const AGENTBUDDY_VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/;
+const AGENTBUDDY_GROUP_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+
+function assertSafeAgentbuddyToken(token: string, kind: string, re: RegExp = AGENTBUDDY_TOKEN_RE): void {
+  if (!token || token.includes('\0') || /\s/.test(token) || !re.test(token)) {
+    throw new Error(`invalid_agentbuddy_${kind}`);
+  }
+}
+
+function assertSafeAgentbuddyGroup(group: string): void {
+  assertSafeAgentbuddyToken(group, 'group', AGENTBUDDY_GROUP_RE);
+  if (group.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) {
+    throw new Error('invalid_agentbuddy_group');
+  }
+}
+
+/** Parse `agentbuddy:<group>/<skill>[@version]` or `agentbuddy:collection/<uid>`.
+ *  Tolerates the marketplace identifier's `skills:` prefix (e.g. a pasted
+ *  `agentbuddy:skills:example.com/team/mkt/my-skill`). */
+export function parseAgentbuddySource(raw: string): AgentbuddySource {
+  let rest = raw.slice('agentbuddy:'.length).trim().replace(/^skills:/, '');
+  if (!rest) throw new Error('invalid_agentbuddy_source');
+  if (rest.startsWith('collection/')) {
+    const uid = rest.slice('collection/'.length);
+    assertSafeAgentbuddyToken(uid, 'collection');
+    return { collection: uid };
+  }
+  let version: string | undefined;
+  const at = rest.lastIndexOf('@');
+  if (at > 0) {
+    version = rest.slice(at + 1);
+    rest = rest.slice(0, at);
+    assertSafeAgentbuddyToken(version, 'version', AGENTBUDDY_VERSION_RE);
+  }
+  const slash = rest.lastIndexOf('/');
+  if (slash <= 0 || slash === rest.length - 1) throw new Error('invalid_agentbuddy_source');
+  const group = rest.slice(0, slash);
+  const skill = rest.slice(slash + 1);
+  assertSafeAgentbuddyGroup(group);
+  assertSafeAgentbuddyToken(skill, 'skill');
+  return { group, skill, ...(version ? { version } : {}) };
+}
+
 export function parseSkillInstallSource(raw: string): ParsedSkillInstallSource {
+  if (raw.startsWith('agentbuddy:')) {
+    return { kind: 'agentbuddy', value: raw, agentbuddy: parseAgentbuddySource(raw) };
+  }
   if (raw.startsWith('github:')) {
     const rest = raw.slice('github:'.length);
     const parts = rest.split('/').filter(Boolean);

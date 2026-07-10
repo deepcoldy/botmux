@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { assertSafeGitRef, assertSafeGitSkillPath, parseSkillInstallSource, redactGitUrlCredentials } from '../src/core/skills/sources.js';
+import { assertSafeGitRef, assertSafeGitSkillPath, parseAgentbuddySource, parseSkillInstallSource, redactGitUrlCredentials } from '../src/core/skills/sources.js';
 
 describe('skill install sources', () => {
   it('rejects HTTPS git URLs with embedded credentials', () => {
@@ -82,6 +82,42 @@ describe('skill install sources', () => {
 
   it('rejects unsafe paths in GitHub browser URLs', () => {
     expect(() => parseSkillInstallSource('https://github.com/acme/skills/tree/main/skills/../deploy')).toThrow(/invalid_git_skill_path/);
+  });
+
+  it('parses agentbuddy single-skill sources with optional version', () => {
+    expect(parseSkillInstallSource('agentbuddy:example.com/team/marketplace/my-skill')).toMatchObject({
+      kind: 'agentbuddy',
+      agentbuddy: { group: 'example.com/team/marketplace', skill: 'my-skill' },
+    });
+    expect(parseAgentbuddySource('agentbuddy:example.com/team/marketplace/my-skill@1.0.363')).toEqual({
+      group: 'example.com/team/marketplace',
+      skill: 'my-skill',
+      version: '1.0.363',
+    });
+  });
+
+  it('tolerates the marketplace skills: identifier prefix', () => {
+    expect(parseAgentbuddySource('agentbuddy:skills:acme/team/mkt/deploy')).toEqual({
+      group: 'acme/team/mkt',
+      skill: 'deploy',
+    });
+  });
+
+  it('parses agentbuddy collection sources', () => {
+    expect(parseSkillInstallSource('agentbuddy:collection/col123abc')).toMatchObject({
+      kind: 'agentbuddy',
+      agentbuddy: { collection: 'col123abc' },
+    });
+  });
+
+  it('rejects agentbuddy identifiers that could be argv/flag/path injections', () => {
+    expect(() => parseAgentbuddySource('agentbuddy:')).toThrow(/invalid_agentbuddy_source/);
+    expect(() => parseAgentbuddySource('agentbuddy:noskill')).toThrow(/invalid_agentbuddy_source/);
+    expect(() => parseAgentbuddySource('agentbuddy:-flag/skill')).toThrow(/invalid_agentbuddy_group/);
+    expect(() => parseAgentbuddySource('agentbuddy:group/--skill')).toThrow(/invalid_agentbuddy_skill/);
+    expect(() => parseAgentbuddySource('agentbuddy:group/../escape/skill')).toThrow(/invalid_agentbuddy_group/);
+    expect(() => parseAgentbuddySource('agentbuddy:group/skill;rm -rf')).toThrow(/invalid_agentbuddy_skill/);
+    expect(() => parseAgentbuddySource('agentbuddy:collection/../etc')).toThrow(/invalid_agentbuddy_collection/);
   });
 
   it('rejects git refs that could be parsed as checkout options', () => {

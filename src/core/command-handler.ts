@@ -88,7 +88,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth']);
 
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
@@ -1402,6 +1402,7 @@ export async function handleCommand(
               () => sessionReply(rootId, closedCard, 'interactive'),
             );
 
+            const oldSession = ds!.session;
             const session = sessionStore.createSession(ds!.chatId, rootId, displayName, ds!.chatType);
             ds!.session = session;
             ds!.lastUserPrompt = undefined;
@@ -1409,6 +1410,10 @@ export async function handleCommand(
             ds!.workingDir = selectedPath;
             ds!.session.workingDir = selectedPath;
             ds!.session.larkAppId = ds!.larkAppId;
+            ds!.session.chatDisplayName = oldSession.chatDisplayName;
+            ds!.session.ownerOpenId = oldSession.ownerOpenId;
+            ds!.session.creatorOpenId = oldSession.creatorOpenId;
+            ds!.session.lastCallerOpenId = oldSession.lastCallerOpenId;
             sessionStore.updateSession(ds!.session);
             ds!.hasHistory = false;
             forkWorker(ds!, '', false);
@@ -2762,6 +2767,7 @@ export async function handleCommand(
           t('help.heading_grant', undefined, loc),
           t('help.grant', undefined, loc),
           t('help.revoke', undefined, loc),
+          t('help.vc_auth', undefined, loc),
           '',
           t('help.heading_config', undefined, loc),
           t('help.config_get', undefined, loc),

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { useT } from './react-hooks.js';
 
 interface GameStatus {
   state: 'absent' | 'downloading' | 'ready' | 'error';
@@ -18,6 +19,7 @@ function mb(n: number): string {
 }
 
 function OfficePage() {
+  const tr = useT();
   const [status, setStatus] = useState<GameStatus | null>(null);
   const [proxy, setProxy] = useState('');
   const [starting, setStarting] = useState(false);
@@ -92,18 +94,21 @@ function OfficePage() {
 
   if (status?.state === 'ready') {
     return (
-      <iframe
-        src="/game/index.html"
-        title="HD2D Office"
-        style={{ flex: 1, width: '100%', minHeight: 0, border: 'none', display: 'block', background: '#0b0d12' }}
-        allow="autoplay"
-      />
+      <div className="office-frame-shell">
+        <iframe
+          className="office-game-frame"
+          src="/game/index.html"
+          title="HD2D Office"
+          allow="autoplay"
+        />
+      </div>
     );
   }
 
   return (
     <OfficeLoader
       status={status ?? { state: 'absent', received: 0, total: FALLBACK_TOTAL }}
+      title={tr('nav.office')}
       proxy={proxy}
       starting={starting}
       onProxyChange={setProxy}
@@ -114,6 +119,7 @@ function OfficePage() {
 
 function OfficeLoader(props: {
   status: GameStatus;
+  title: string;
   proxy: string;
   starting: boolean;
   onProxyChange(value: string): void;
@@ -129,7 +135,7 @@ function OfficeLoader(props: {
 
   return (
     <div style={{ margin: 'auto', textAlign: 'center', maxWidth: 440, padding: 32, color: 'var(--fg,#e6e6e6)' }}>
-      <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>HD2D 办公室</div>
+      <h1 style={{ fontSize: 18, fontWeight: 600, lineHeight: 1.2, margin: '0 0 8px' }}>{props.title}</h1>
       <div style={{ fontSize: 13, opacity: 0.7, lineHeight: 1.7, marginBottom: 20 }}>
         把每个会话变成办公室里的一个机器人，实时映射屏幕状态。
         <br />
@@ -144,8 +150,8 @@ function OfficeLoader(props: {
       ) : null}
       {downloading ? (
         <>
-          <div style={{ background: 'rgba(127,127,127,.2)', borderRadius: 6, height: 10, overflow: 'hidden', marginBottom: 10 }}>
-            <div style={{ height: '100%', width: `${pct}%`, background: '#4a9eff', transition: 'width .3s' }} />
+          <div style={{ background: 'var(--surface-muted)', borderRadius: 'var(--radius-lg)', height: 10, overflow: 'hidden', marginBottom: 10 }}>
+            <div style={{ height: '100%', width: `${pct}%`, background: 'var(--accent)', transition: 'width .3s' }} />
           </div>
           <div style={{ fontSize: 12, opacity: 0.7 }}>下载中... {mb(props.status.received)} / {mb(total)} MB（{pct}%）</div>
         </>
@@ -153,21 +159,11 @@ function OfficeLoader(props: {
         <>
           <input
             id="hd2d-proxy"
+            className="office-proxy-input"
             type="text"
             value={props.proxy}
             onChange={e => props.onProxyChange(e.currentTarget.value)}
             placeholder="HTTP 代理（可选，如 http://127.0.0.1:7890）"
-            style={{
-              width: '100%',
-              boxSizing: 'border-box',
-              marginBottom: 12,
-              padding: '8px 10px',
-              borderRadius: 6,
-              border: '1px solid rgba(127,127,127,.4)',
-              background: 'transparent',
-              color: 'inherit',
-              fontSize: 12,
-            }}
           />
           <div style={{ fontSize: 11, opacity: 0.5, marginBottom: 14, textAlign: 'left' }}>
             连不上 GitHub 时填代理（仅用于下载本资源，会记住）。留空走直连/系统代理环境变量。
@@ -175,19 +171,9 @@ function OfficeLoader(props: {
           <button
             id="hd2d-load"
             type="button"
+            className="page-primary-action office-load-button"
             disabled={props.starting}
             onClick={props.onStart}
-            style={{
-              cursor: props.starting ? 'default' : 'pointer',
-              border: 'none',
-              borderRadius: 8,
-              padding: '10px 22px',
-              fontSize: 14,
-              fontWeight: 600,
-              background: '#4a9eff',
-              color: '#fff',
-              opacity: props.starting ? 0.7 : 1,
-            }}
           >
             {err ? '重试' : '加载办公室'}（约 {mb(total)} MB）
           </button>
@@ -203,13 +189,17 @@ export function renderOfficePage(root: HTMLElement): PageDisposer {
     padding: root.style.padding,
     flex: root.style.flex,
     minHeight: root.style.minHeight,
+    minWidth: root.style.minWidth,
     display: root.style.display,
+    overflow: root.style.overflow,
   };
   root.style.maxWidth = 'none';
   root.style.padding = '0';
   root.style.flex = '1 1 auto';
   root.style.minHeight = '0';
+  root.style.minWidth = '0';
   root.style.display = 'flex';
+  root.style.overflow = 'hidden';
 
   const dispose = mountReactPage(root, <OfficePage />);
   return () => {
@@ -218,6 +208,8 @@ export function renderOfficePage(root: HTMLElement): PageDisposer {
     root.style.padding = prev.padding;
     root.style.flex = prev.flex;
     root.style.minHeight = prev.minHeight;
+    root.style.minWidth = prev.minWidth;
     root.style.display = prev.display;
+    root.style.overflow = prev.overflow;
   };
 }

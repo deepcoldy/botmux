@@ -6,7 +6,7 @@ CLI 进入 botmux 会话时，自动获得 `~/.botmux/bin` 在 PATH 中，以及
 
 | 命令 / Skill | 作用 |
 |------|------|
-| `botmux send` | 向当前话题发消息（文本 / 图片 / 文件 / @mention） |
+| `botmux send` | 向当前话题发消息（文本 / 图片 / 文件 / interactive 卡片 JSON / @mention） |
 | `botmux history` | 读当前会话历史消息（话题群拉话题内，普通群拉整群） |
 | `botmux quoted <message_id>` | 读取被引用的那条消息（用户用引用 UI @ 机器人时） |
 | `botmux bots list` | 查当前群里的机器人及 open_id（供 `--mention`） |

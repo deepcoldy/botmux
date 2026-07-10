@@ -1,0 +1,67 @@
+name: Deploy docs to GitHub Pages
+
+# 把 docs-site（rspress）构建后发布到 deepcoldy.github.io 的 /botmux/ 子路径。
+# 只替换 gh-pages 分支的 botmux/ 子树，保留根跳转与同域其它路径。
+# 妙搭发布链路（docs-site/deploy.sh）保持不变，二者互不影响。
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'docs-site/**'
+      - '.github/workflows/docs-deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - run: npm install -g pnpm@9.5.0
+
+      - name: Build docs (base=/botmux/, 资源同源)
+        working-directory: docs-site
+        run: |
+          pnpm install --frozen-lockfile
+          BOTMUX_DOCS_BASE=/botmux/ BOTMUX_DOCS_ASSET_PREFIX=/botmux/ pnpm build
+
+      - name: Deploy /botmux/ to deepcoldy.github.io
+        env:
+          DEPLOY_KEY: ${{ secrets.PAGES_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_KEY:-}" ]; then
+            echo "::error::缺少 PAGES_DEPLOY_KEY secret，无法推送到 deepcoldy.github.io"
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes"
+          git clone --depth 1 --branch gh-pages git@github.com:deepcoldy/deepcoldy.github.io.git pages
+          rm -rf pages/botmux
+          cp -a docs-site/doc_build pages/botmux
+          cd pages
+          git config user.name "botmux-docs-bot"
+          git config user.email "docs-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "文档无变化，跳过发布。"
+            exit 0
+          fi
+          git commit -m "docs: 自动部署 /botmux/ (botmux@${GITHUB_SHA::7})"
+          git push origin gh-pages

@@ -33,9 +33,10 @@ let cardTestHome: string;
 beforeEach(() => {
   cardTestHome = mkdtempSync(join(tmpdir(), 'botmux-card-builder-'));
   vi.stubEnv('HOME', cardTestHome);
-  // The local-CLI button is gated on localTerminalCapable() (headless hosts
-  // hide it) — pin a GUI-looking env so the button assertions below are
-  // deterministic on headless CI runners.
+  // The local-CLI button is currently hard-hidden (HIDE_OPEN_LOCAL_CLI_BUTTON),
+  // so its assertions no longer depend on localTerminalCapable(). Keep pinning a
+  // GUI-looking env anyway so the button-present assertions stay deterministic
+  // once the button is re-enabled.
   vi.stubEnv('DISPLAY', ':0');
   mkdirSync(dirname(globalConfigPath()), { recursive: true });
 });
@@ -248,35 +249,17 @@ describe('buildSessionCard', () => {
       expect(linkBtn.value.session_id).toBe(SID);
     });
 
-    it('should include local terminal callback button', () => {
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex'));
-      const actions = findActions(card);
-      const localBtn = actions.find((a: any) => a.value?.action === 'open_local_terminal');
-      expect(localBtn).toBeDefined();
-      expect(localBtn.text.content).toContain('打开 Codex');
-      expect(localBtn.multi_url).toBeUndefined();
-      expect(localBtn.value.root_id).toBe(ROOT);
-      expect(localBtn.value.session_id).toBe(SID);
-    });
-
-    it('uses the same local open label for Codex App sessions', () => {
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex-app'));
-      const actions = findActions(card);
-      const localBtn = actions.find((a: any) => a.value?.action === 'open_local_terminal');
-      expect(localBtn.text.content).toContain('打开 Codex');
-      expect(localBtn.text.content).not.toContain('App');
-    });
-
-    // On macOS the host is always terminal-capable, so the hidden state is untestable there.
-    it.skipIf(process.platform === 'darwin')('hides the local terminal button on headless hosts', () => {
-      vi.stubEnv('DISPLAY', undefined);
-      vi.stubEnv('WAYLAND_DISPLAY', undefined);
-      vi.stubEnv('BOTMUX_TERMINAL', undefined);
-      vi.stubEnv('TERMINAL', undefined);
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));
-      const actions = findActions(card);
-      expect(actions.some((a: any) => a.value?.action === 'open_local_terminal')).toBe(false);
-      expect(actions).toHaveLength(3);
+    // 「💻 打开 <CLI>」本机直开按钮当前经 card-builder 的 HIDE_OPEN_LOCAL_CLI_BUTTON
+    // 硬隐藏（打磨好前不放出来——会破坏飞书对话连续性），在所有平台、所有 CLI 都不再渲染。
+    // 重新启用时把这条改回「按钮存在 + 标签『打开 Codex』、codex-app 去掉 App 后缀」，
+    // 并恢复 headless-host 隐藏用例（localTerminalCapable() 的单元覆盖仍在
+    // local-terminal-opener.test.ts）。
+    it('hides the local-CLI open button on every host while HIDE_OPEN_LOCAL_CLI_BUTTON is set', () => {
+      for (const cli of ['codex', 'codex-app', undefined] as const) {
+        const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli));
+        const actions = findActions(card);
+        expect(actions.some((a: any) => a.value?.action === 'open_local_terminal')).toBe(false);
+      }
     });
 
     it('should NOT include restart button', () => {
@@ -297,10 +280,11 @@ describe('buildSessionCard', () => {
       expect(closeBtn.value.session_id).toBe(SID);
     });
 
-    it('should have exactly 4 buttons (terminal, local terminal, get_write_link, close)', () => {
+    // local-terminal 按钮已隐藏（见上），故为 3：terminal + get_write_link + close
+    it('should have exactly 3 buttons (terminal, get_write_link, close)', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));
       const actions = findActions(card);
-      expect(actions).toHaveLength(4);
+      expect(actions).toHaveLength(3);
     });
   });
 
@@ -337,10 +321,11 @@ describe('buildSessionCard', () => {
       expect(closeBtn).toBeDefined();
     });
 
-    it('should have exactly 4 buttons (terminal, local terminal, restart, close)', () => {
+    // local-terminal 按钮已隐藏（见上），故为 3：terminal + restart + close
+    it('should have exactly 3 buttons (terminal, restart, close)', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, undefined, true));
       const actions = findActions(card);
-      expect(actions).toHaveLength(4);
+      expect(actions).toHaveLength(3);
     });
   });
 
@@ -632,10 +617,11 @@ describe('buildStreamingCard', () => {
       expect(closeBtn.type).toBe('danger');
     });
 
-    it('should have exactly 5 buttons (toggle, terminal, local terminal, get_write_link, close)', () => {
+    // local-terminal 按钮已隐藏（见上），故为 4：toggle + terminal + get_write_link + close
+    it('should have exactly 4 buttons (toggle, terminal, get_write_link, close)', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       const actions = findActions(card);
-      expect(actions).toHaveLength(5);
+      expect(actions).toHaveLength(4);
     });
   });
 
@@ -1288,11 +1274,12 @@ describe('buildPrivateSnapshotCard', () => {
       .flatMap((e: any) => e.actions ?? []);
   }
 
-  it('exposes open-terminal link, local-terminal callback, get_write_link, close — no patch-driven controls', () => {
+  it('exposes open-terminal link, get_write_link, close — no local-terminal (hidden), no patch-driven controls', () => {
     const card = build({ screen: 'hello' });
     const btns = allButtons(card);
     const actions = btns.map((b: any) => b.value?.action).filter(Boolean);
-    expect(actions.sort()).toEqual(['close', 'get_write_link', 'open_local_terminal']);
+    // open_local_terminal 按钮已隐藏（HIDE_OPEN_LOCAL_CLI_BUTTON），不再出现
+    expect(actions.sort()).toEqual(['close', 'get_write_link']);
     // open-terminal is a URL button (no callback action)
     const link = btns.find((b: any) => b.multi_url);
     expectDirectUrl(link.multi_url.url, 'https://t.example/ro');

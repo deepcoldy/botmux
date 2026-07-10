@@ -230,6 +230,28 @@ describe('decideDashboardAuth — public surface', () => {
     expect(d.kind).toBe('allow');
   });
 
+  it('GET /favicon.ico — browser root favicon probe allow without any token', () => {
+    const d = decideDashboardAuth({
+      method: 'GET',
+      pathname: '/favicon.ico',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('allow');
+  });
+
+  it('HEAD /favicon.ico — browser favicon metadata probe allow without any token', () => {
+    const d = decideDashboardAuth({
+      method: 'HEAD',
+      pathname: '/favicon.ico',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('allow');
+  });
+
   it('DELETE /api/whiteboards/:id without token → deny401', () => {
     const d = decideDashboardAuth({
       method: 'DELETE',

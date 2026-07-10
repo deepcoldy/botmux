@@ -1,6 +1,7 @@
 import {
   discoverGitSkillCandidatesAsync,
   discoverLocalSkillCandidates,
+  installAgentbuddySkillAsync,
   installGitSkillAsync,
   installLocalSkillsFromSource,
   installGitSkillsFromSourceAsync,
@@ -10,6 +11,7 @@ import {
   githubToGitUrl,
   parseSkillInstallSource,
 } from '../core/skills/sources.js';
+import type { AgentbuddySource } from '../core/skills/sources.js';
 import type { SkillPackage, SkillSource } from '../core/skills/types.js';
 import type { SkillSourceDiscovery } from '../services/skill-registry-store.js';
 
@@ -26,7 +28,8 @@ const AUTO_LINK_SKILL_ROOT_MARKERS = new Set([
 export type DashboardSkillInstallRequest =
   | { kind: 'local'; value: string; link: boolean; skillNames: string[]; all: boolean; fullDepth: boolean }
   | { kind: 'git'; url: string; path?: string; ref?: string; skillNames: string[]; all: boolean; fullDepth: boolean }
-  | { kind: 'github'; owner: string; repo: string; path?: string; ref?: string; skillNames: string[]; all: boolean; fullDepth: boolean };
+  | { kind: 'github'; owner: string; repo: string; path?: string; ref?: string; skillNames: string[]; all: boolean; fullDepth: boolean }
+  | { kind: 'agentbuddy'; agentbuddy: AgentbuddySource };
 
 export function shouldAutoLinkLocalSkillPath(rawPath: string): boolean {
   const normalized = rawPath.replace(/\\/g, '/');
@@ -71,6 +74,9 @@ export function parseDashboardSkillInstallRequest(body: Record<string, unknown>)
   const source = typeof body.source === 'string' ? body.source.trim() : '';
   if (!source) throw new Error('source_required');
   const parsedSource = parseSkillInstallSource(source);
+  if (parsedSource.kind === 'agentbuddy') {
+    return { kind: 'agentbuddy', agentbuddy: parsedSource.agentbuddy! };
+  }
   const skillNames = parseSkillNames(body);
   const all = body.all === true || skillNames.includes('*');
   const fullDepth = body.fullDepth === true;
@@ -99,6 +105,9 @@ export function parseDashboardSkillInstallRequest(body: Record<string, unknown>)
 }
 
 export async function discoverDashboardSkills(request: DashboardSkillInstallRequest): Promise<SkillSourceDiscovery> {
+  // agentbuddy resolves its own skill set — the UI installs it directly and
+  // never calls discover; guard defensively in case it ever does.
+  if (request.kind === 'agentbuddy') throw new Error('agentbuddy_discover_not_supported');
   if (request.kind === 'local') return discoverLocalSkillCandidates(request.value, { fullDepth: request.fullDepth });
   if (request.kind === 'git') {
     return discoverGitSkillCandidatesAsync({
@@ -117,6 +126,7 @@ export async function discoverDashboardSkills(request: DashboardSkillInstallRequ
 }
 
 export async function installDashboardSkill(request: DashboardSkillInstallRequest): Promise<SkillPackage[]> {
+  if (request.kind === 'agentbuddy') return installAgentbuddySkillAsync(request.agentbuddy);
   if (request.kind === 'local') return installLocalSkillsFromSource(request.value, {
     link: request.link,
     skillNames: request.skillNames,

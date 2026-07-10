@@ -62,6 +62,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     regularGroupMentionMode: (j?.regularGroupMentionMode === 'topic' || j?.regularGroupMentionMode === 'never' || j?.regularGroupMentionMode === 'ambient')
       ? j.regularGroupMentionMode
       : 'always',
+    substituteMode: j?.substituteMode && typeof j.substituteMode === 'object' ? j.substituteMode : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     messageQuotaDefaultLimit: typeof j?.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
@@ -70,6 +71,9 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',
     maxLiveWorkers: typeof j?.maxLiveWorkers === 'number' ? j.maxLiveWorkers : null,
+    logicalSessionCount: typeof j?.logicalSessionCount === 'number' ? j.logicalSessionCount : 0,
+    residentSessionCount: typeof j?.residentSessionCount === 'number' ? j.residentSessionCount : 0,
+    dormantSessionCount: typeof j?.dormantSessionCount === 'number' ? j.dormantSessionCount : 0,
     startupCommands: typeof j?.startupCommands === 'string' ? j.startupCommands : '',
     env: typeof j?.env === 'string' ? j.env : '',
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,

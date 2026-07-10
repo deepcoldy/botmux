@@ -65,7 +65,8 @@ import { logger } from './utils/logger.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
-import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
+import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-liveness.js';
+import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { npmGlobalUpdateCwd } from './core/maintenance.js';
@@ -2333,6 +2334,9 @@ interface SessionData {
   cliId?: string;
   lastCliInput?: string;
   adoptedFrom?: AdoptedFromData;
+  /** Deliberately suspended by the resident-session cap. No process/backing
+   * session is expected until the next message cold-resumes the CLI. */
+  suspendedColdResume?: boolean;
 }
 
 /**
@@ -2690,6 +2694,7 @@ function sessionStatusLabel(s: SessionData): string {
     if (pid) return isProcessAlive(pid) ? 'adopt' : 'stopped';
     return s.pid && isProcessAlive(s.pid) ? 'adopt' : 'idle';
   }
+  if (isColdResumeDormant(s) && !(s.pid && isProcessAlive(s.pid))) return 'dormant';
   return s.pid && isProcessAlive(s.pid) ? 'online' : s.pid ? 'stopped' : 'idle';
 }
 
@@ -3008,12 +3013,10 @@ async function cmdList(): Promise<void> {
 
     const hasPid = !!(s.pid && isProcessAlive(s.pid));
     const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
-    if (!hasPid && !hasTmux) {
-      const everReal = !!(s.cliId || s.lastCliInput || s.adoptedFrom);
-      (everReal ? pruned : prunedScratch).push(s);
-    } else {
-      live.push(s);
-    }
+    const disposition = sessionListDisposition(s, { hasPid, hasBackingSession: hasTmux });
+    if (disposition === 'prune_real') pruned.push(s);
+    else if (disposition === 'prune_scratch') prunedScratch.push(s);
+    else live.push(s);
   }
   const closeNow = (arr: SessionData[]) => {
     for (const s of arr) {
@@ -3636,6 +3639,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --files <path>                  附件（可重复）
        --videos <path>                 视频预览 MP4（可重复，需配套 --video-covers）
        --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
+       --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
+       --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
        --mention <open_id:name>        @提及（可重复）
        --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）
        --no-mention                    明确声明本条不@任何人
@@ -4399,6 +4404,32 @@ function argValues(args: string[], ...flags: string[]): string[] {
   return out;
 }
 
+function withCustomCardMentionFooter(
+  card: Record<string, unknown>,
+  mentionOpenIds: readonly string[],
+  sentToLabel: string,
+): { ok: true; card: Record<string, unknown> } | { ok: false; error: string } {
+  if (mentionOpenIds.length === 0) return { ok: true, card };
+  const cloned = JSON.parse(JSON.stringify(card)) as Record<string, unknown>;
+  const body = cloned.body as { elements?: unknown } | undefined;
+  if (!body || !Array.isArray(body.elements)) {
+    return {
+      ok: false,
+      error: '自定义卡片带 --mention/--mention-back 时必须是 schema 2.0 且包含 body.elements；或改用 --no-mention 并在卡片 JSON 内自行处理展示',
+    };
+  }
+  const deduped = [...new Set(mentionOpenIds.filter(Boolean))];
+  body.elements.push(
+    { tag: 'hr' },
+    {
+      tag: 'markdown',
+      text_size: 'notation_small_v2',
+      content: `<font color='grey'>${sentToLabel}${deduped.map(id => `<at id=${id}></at>`).join(' ')}</font>`,
+    },
+  );
+  return { ok: true, card: cloned };
+}
+
 // Card v2 body builder helpers — extracted to im/lark/md-card.ts so the
 // daemon's bridge fallback path can produce identical cards. cmdSend
 // keeps using `buildImageCardElements` from there.
@@ -4419,12 +4450,32 @@ import { resolveQuoteTarget, validateMentionDecision, parseAttentionFlag, attent
 async function relaySend(rest: string[], relayDir: string): Promise<void> {
   const sid = argValue(rest, '--session-id') ?? process.env.BOTMUX_SESSION_ID;
   if (!sid) { console.error('relay: 无法确定 session-id'); process.exit(1); }
+  const cardJsonArg = argValue(rest, '--card-json');
+  const cardFile = argValue(rest, '--card-file');
+  let cardContent = '';
+  if (cardJsonArg !== undefined && cardFile !== undefined) {
+    console.error('relay: --card-json 与 --card-file 不能同时使用');
+    process.exit(2);
+  }
+  if (cardJsonArg !== undefined) {
+    cardContent = cardJsonArg;
+  } else if (cardFile !== undefined) {
+    if (!existsSync(cardFile)) { console.error(`relay: 文件不存在: ${cardFile}`); process.exit(1); }
+    cardContent = readFileSync(cardFile, 'utf-8');
+  }
   // Resolve content with the same precedence as cmdSend (content-file > positional > stdin)
   const contentFile = argValue(rest, '--content-file');
   let content = '';
-  if (contentFile) {
+  if (cardJsonArg !== undefined || cardFile !== undefined) {
+    content = '';
+  } else if (contentFile) {
     content = existsSync(contentFile) ? readFileSync(contentFile, 'utf-8') : '';
   } else {
+    // NOTE: `--attention` is deliberately NOT excluded here. The relay flag
+    // allowlist (below) doesn't forward it, so sandbox `--attention` can't raise
+    // the dashboard hand anyway; excluding it would silently send the reason as a
+    // bare message instead of the original loud "no content" failure. Plumbing
+    // `--attention` through the relay is a separate change, out of this scope.
     const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice']);
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
@@ -4438,6 +4489,13 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
   const contentBase = `${id}.content`;
   const cfile = join(relayDir, contentBase);
   writeFileSync(cfile, content);
+  let cardBase: string | undefined;
+  let cardOutfile: string | undefined;
+  if (cardJsonArg !== undefined || cardFile !== undefined) {
+    cardBase = `${id}.card.json`;
+    cardOutfile = join(relayDir, cardBase);
+    writeFileSync(cardOutfile, cardContent);
+  }
 
   // Copy attachments into the outbox; carry only basenames.
   const copyOutboxAttachment = (p: string, out: string[]): void => {
@@ -4472,7 +4530,7 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
   }
   // 原子写：req.json 是 host watcher 的触发文件，rename 让它「完整出现」，
   // watcher 永远不会读到半截 JSON（tmp 后缀不匹配 .req.json 过滤）。
-  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, attachments, videos, videoCovers, flags }));
+  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, cardFile: cardBase, attachments, videos, videoCovers, flags }));
 
   const resPath = join(relayDir, `${id}.res.json`);
   const deadlineMs = Date.now() + 120_000;
@@ -4482,6 +4540,7 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
         const res = JSON.parse(readFileSync(resPath, 'utf-8')) as { code?: number; stdout?: string; stderr?: string };
         try { unlinkSync(resPath); } catch { /* */ }
         try { unlinkSync(cfile); } catch { /* */ }
+        if (cardOutfile) { try { unlinkSync(cardOutfile); } catch { /* */ } }
         if (res.stdout) process.stdout.write(res.stdout);
         if (res.stderr) process.stderr.write(res.stderr);
         process.exit(res.code ?? 0);
@@ -4553,10 +4612,29 @@ async function cmdSend(rest: string[]): Promise<void> {
       process.exit(2);
     }
   }
+  if (flagPresentButValueMissing(rest, '--card-file', true)) {
+    console.error('botmux send: --card-file 需要路径参数');
+    process.exit(2);
+  }
+  if (flagPresentButValueMissing(rest, '--card-json', true)) {
+    console.error('botmux send: --card-json 需要 JSON 字符串参数');
+    process.exit(2);
+  }
+  const cardJsonArg = argValue(rest, '--card-json');
+  const cardFile = argValue(rest, '--card-file');
+  const customCardRequested = cardJsonArg !== undefined || cardFile !== undefined;
+  if (cardJsonArg !== undefined && cardFile !== undefined) {
+    console.error('botmux send: --card-json 与 --card-file 不能同时使用');
+    process.exit(2);
+  }
   const images = argValues(rest, '--image', '--images');
   const files = argValues(rest, '--file', '--files');
   const videos = argValues(rest, '--video', '--videos');
   const videoCovers = argValues(rest, '--video-cover', '--video-covers');
+  if (customCardRequested && (images.length > 0 || files.length > 0 || videos.length > 0 || videoCovers.length > 0)) {
+    console.error('botmux send: --card-file/--card-json 暂不与 --images/--files/--videos 混用；请把素材先上传为飞书资源并写入卡片 JSON');
+    process.exit(2);
+  }
   const videoValidation = validateVideoAttachments(videos, videoCovers);
   if (!videoValidation.ok) {
     console.error(`botmux send: ${videoValidation.error}`);
@@ -4578,6 +4656,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
   const mentionArgs = argValues(rest, '--mention');  // "open_id:Display Name"
   const contentFile = argValue(rest, '--content-file');
+  if (customCardRequested && contentFile) {
+    console.error('botmux send: --card-file/--card-json 不能与 --content-file 混用');
+    process.exit(2);
+  }
   // 回复一律走交互卡片。`--card` / `--text` 是隐藏的旧脚本兼容 no-op：纯文本
   // post 路径已删除，只有卡片能承载「🔊 语音总结」按钮，且守护进程兜底也一直只发卡片。
   // Publish-mode flags: post a fresh top-level message in a chat instead of
@@ -4605,6 +4687,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // needs-you column for this session. Parsed specially (not argValue) so a bare
   // `--attention "我卡住了"` doesn't eat the message as the flag value.
   const attention = parseAttentionFlag(rest);
+  if (customCardRequested && asVoice) {
+    console.error('botmux send: --card-file/--card-json 不能与 --voice 混用');
+    process.exit(2);
+  }
 
   const ancestorCtx = findAncestorSessionContext();
   const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? null;
@@ -4621,7 +4707,22 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   // Read content from: --content-file > positional arg > stdin
   let content = '';
-  if (contentFile) {
+  let customCard: Record<string, unknown> | undefined;
+  if (customCardRequested) {
+    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention']);
+    if (unexpectedText.length > 0) {
+      console.error('botmux send: --card-file/--card-json 发送自定义卡片时不接受正文参数；卡片内容请写入 JSON');
+      process.exit(2);
+    }
+    let rawCard = cardJsonArg ?? '';
+    if (cardFile !== undefined) {
+      if (!existsSync(cardFile)) { console.error(`文件不存在: ${cardFile}`); process.exit(1); }
+      rawCard = readFileSync(cardFile, 'utf-8');
+    }
+    const normalizedCard = normalizeInteractiveCardInput(rawCard);
+    if (!normalizedCard.ok) { console.error(`botmux send: ${normalizedCard.error}`); process.exit(2); }
+    customCard = normalizedCard.card;
+  } else if (contentFile) {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
@@ -4632,9 +4733,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       content = await readStdin();
     }
   }
-  if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
+  if (!contentFile && !customCardRequested) rejectLikelyWindowsStdinMojibake(content);
 
-  if (!content.trim() && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
+  if (!customCard && !content.trim() && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
     console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file /tmp/msg.md --images /tmp/chart.png\n  botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "视频预览"');
     process.exit(1);
   }
@@ -4706,6 +4807,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // （之前 currentTurnId 取自 cliPidMarker，文档轮里取值不稳导致误判落到 @ 硬门）。
   const docTarget = s.currentDocCommentTarget;
   if (docTarget && !sendTopLevel && !overrideChatId && !sendInto) {
+    if (customCardRequested) {
+      console.error('botmux send: 文档评论回复不支持 --card-file/--card-json；请改用普通文本，或显式 --top-level/--chat-id 发到飞书群');
+      process.exit(2);
+    }
     const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
     try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
     const { replyToDocComment, chunkCommentText } = await import('./im/lark/doc-comment.js');
@@ -5031,6 +5136,21 @@ async function cmdSend(rest: string[]): Promise<void> {
           hasExplicitBotMention: explicitKnownBotMention,
           knownBotOpenIds,
         });
+    if (customCard) {
+      const mentionFooter = orderedFooterRecipients({
+        sendTo: footerAddressing.sendTo,
+        mentionIds: mentions.map(m => m.open_id),
+        cc: footerAddressing.cc,
+        inlinedIds: [],
+      });
+      const withFooter = withCustomCardMentionFooter(
+        customCard,
+        mentionFooter,
+        t('card.sent_to', undefined, localeForBot(appId)),
+      );
+      if (!withFooter.ok) { console.error(`botmux send: ${withFooter.error}`); process.exit(2); }
+      customCard = withFooter.card;
+    }
 
     // Capture sentAtMs BEFORE dispatch — the worker's bridge fallback gates
     // on `sentAtMs ∈ [turn.markTimeMs, nextTurn.markTimeMs)`. If we recorded
@@ -5042,20 +5162,24 @@ async function cmdSend(rest: string[]): Promise<void> {
     let messageId: string;
     let failedAttachments: { path: string; error: string }[] = [];
     let failedVideoAttachments: { path: string; coverPath: string; error: string }[] = [];
-    // Pure-video fast path: send the preview as a standalone media message.
-    // A send that also carries mentions is deliberately excluded (media messages
-    // can't embed `<at>`), so it falls through to the card branch which renders
-    // the @ on the footer and sends the video as a follow-up attachment — same
-    // shape as an attachment-only `--files … --mention …` send, whose card body
-    // is likewise empty. See shouldSendAsPureVideo.
-    const pureVideoSend = shouldSendAsPureVideo({
-      hasBodyText: !!text.trim(),
-      imageCount: imageKeys.length,
-      fileCount: files.length,
-      videoCount: videoAttachments.length,
-      mentionCount: mentions.length,
-    });
-    if (pureVideoSend) {
+    const pureVideoSend = customCard
+      ? false
+      : shouldSendAsPureVideo({
+          hasBodyText: !!text.trim(),
+          imageCount: imageKeys.length,
+          fileCount: files.length,
+          videoCount: videoAttachments.length,
+          mentionCount: mentions.length,
+        });
+    if (customCard) {
+      messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
+    } else if (pureVideoSend) {
+      // Pure-video fast path: send the preview as a standalone media message.
+      // A send that also carries mentions is deliberately excluded (media messages
+      // can't embed `<at>`), so it falls through to the card branch which renders
+      // the @ on the footer and sends the video as a follow-up attachment — same
+      // shape as an attachment-only `--files … --mention …` send, whose card body
+      // is likewise empty. See shouldSendAsPureVideo.
       // No card/text primary here, so the FIRST media message must carry the
       // quote chain itself (dispatchPrimary applies the chat-scope quoteTargetId
       // and updates primaryQuotedId). Otherwise a bare `--videos … --no-mention`

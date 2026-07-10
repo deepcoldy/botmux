@@ -148,7 +148,14 @@ export class TmuxBackend implements SessionBackend {
   /** Kill a named tmux session (no-op if it doesn't exist). */
   static killSession(name: string): void {
     try {
-      execSync(`tmux kill-session -t ${shellescape(name)}`, { stdio: 'ignore', env: tmuxEnv() });
+      // Runtime recovery calls this from many workers. Bound the command so a
+      // wedged shared server cannot pin every worker forever; restart jitter
+      // keeps the bounded attempts from landing simultaneously.
+      execFileSync('tmux', ['kill-session', '-t', name], {
+        stdio: 'ignore',
+        timeout: 3000,
+        env: tmuxEnv(),
+      });
     } catch { /* session doesn't exist */ }
   }
 

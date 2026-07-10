@@ -207,6 +207,11 @@ function voiceSummaryInstruction(locale?: Locale): string {
   return t('card.voice.summary_instruction', undefined, locale);
 }
 
+function isLiveWorkerIdleOrLimited(ds: DaemonSession): boolean {
+  if (!ds.worker || ds.worker.killed) return true;
+  return ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited';
+}
+
 function isLegacySelfHealAction(actionType?: string): boolean {
   return !!actionType && LEGACY_SELF_HEAL_ACTIONS.has(actionType);
 }
@@ -367,7 +372,7 @@ export async function commitRepoSelection(
           { name: selfBot.botName, openId: selfBot.botOpenId },
           locTarget,
           ds.pendingSender,
-          { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
+          { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger: ds.pendingSubstituteTrigger },
         )
       : '';
     const prompt = pendingRawInput ? '' : wrappedPrompt;
@@ -388,6 +393,7 @@ export async function commitRepoSelection(
     ds.pendingPrompt = undefined;
     ds.pendingAttachments = undefined;
     ds.pendingMentions = undefined;
+    ds.pendingSubstituteTrigger = undefined;
     ds.pendingSender = undefined;
     ds.pendingFollowUps = undefined;
     forkWorker(ds, prompt);
@@ -431,6 +437,7 @@ export async function commitRepoSelection(
       () => sessionReply(rootId, closedCard, 'interactive'),
     );
 
+    const oldSession = ds.session;
     const session = sessionStore.createSession(ds.chatId, rootId, dirLabel, ds.chatType);
     ds.session = session;
     ds.lastUserPrompt = undefined;
@@ -443,6 +450,10 @@ export async function commitRepoSelection(
     ds.workingDir = dirPath;
     ds.session.workingDir = dirPath;
     ds.session.larkAppId = ds.larkAppId;
+    ds.session.chatDisplayName = oldSession.chatDisplayName;
+    ds.session.ownerOpenId = oldSession.ownerOpenId;
+    ds.session.creatorOpenId = oldSession.creatorOpenId;
+    ds.session.lastCallerOpenId = oldSession.lastCallerOpenId;
     sessionStore.updateSession(ds.session);
     ds.hasHistory = false;
     // Re-persist the parked card under the NEW sessionId so a daemon crash
@@ -1298,9 +1309,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         logger.info(`[${tag(ds)}] voice_summary blocked for unauthorized user: ${operatorOpenId ?? '?'}`);
         return { toast: { type: 'warning', content: t('card.voice.toast_need_auth', undefined, locDs) } };
       }
+      // Dedupe read BEFORE the busy guard: a card whose voice is already being
+      // generated will have its worker back in `working`, so the busy guard would
+      // otherwise shadow the "already on the way" hint with a misleading
+      // "wait for idle" toast. Read first (correct message), guard second, and
+      // only `add` after the guard so a genuinely-busy first click still doesn't
+      // burn the dedupe key.
       const dedupeKey = cardMessageId ?? `${sessionAnchorId(ds)}::voice`;
       if (voicedCardIds.has(dedupeKey)) {
         return { toast: { type: 'info', content: t('card.voice.toast_already', undefined, locDs) } };
+      }
+      if (!isLiveWorkerIdleOrLimited(ds)) {
+        logger.info(`[${tag(ds)}] voice_summary blocked because worker is busy: ${ds.lastScreenStatus ?? 'unknown'}`);
+        return { toast: { type: 'warning', content: t('card.voice.toast_worker_busy', undefined, locDs) } };
       }
       voicedCardIds.add(dedupeKey);
       if (voicedCardIds.size > 5000) { voicedCardIds.clear(); voicedCardIds.add(dedupeKey); }
@@ -1579,6 +1600,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       } catch { /* fall through */ }
     }
 
+    // ⚠️ 生成「💻 打开 <CLI>」按钮的入口已在 card-builder 的 HIDE_OPEN_LOCAL_CLI_BUTTON
+    //    处暂时隐藏（会破坏飞书对话连续性，打磨好前不放出来）。此处理保留：一是兼容用户
+    //    点到隐藏前已发出的旧卡片，二是重新启用按钮时无需再改这里。
     if (actionType === 'open_local_terminal') {
       const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!ds) {
@@ -1906,7 +1930,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               { name: selfBot.botName, openId: selfBot.botOpenId },
               locDs,
               ds.pendingSender,
-              { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
+              { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger: ds.pendingSubstituteTrigger },
             )
           : '';
         const prompt = pendingRawInput ? '' : wrappedPrompt;
@@ -1920,6 +1944,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
         ds.pendingMentions = undefined;
+        ds.pendingSubstituteTrigger = undefined;
         ds.pendingSender = undefined;
         ds.pendingFollowUps = undefined;
         forkWorker(ds, prompt);
@@ -2172,7 +2197,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   // Handle repo select card (option-based dropdowns: plain switch, or
   // `repo_worktree` = create a worktree from the picked repo and open that).
-  const isWorktreeOpen = action?.value?.key === 'repo_worktree';
+  // Require an explicit, recognized key: botmux's own dropdowns always set
+  // `repo_switch` / `repo_worktree` (card-builder.ts). Treating a keyless
+  // `option + root_id` as a plain switch let a hand-crafted card drive the
+  // session's working dir to an arbitrary path — reject anything unrecognized.
+  const repoKey = action?.value?.key;
+  if (repoKey !== 'repo_switch' && repoKey !== 'repo_worktree') {
+    logger.warn(`Card action: unrecognized repo dropdown key ${repoKey ?? '(none)'} — ignoring`);
+    return;
+  }
+  const isWorktreeOpen = repoKey === 'repo_worktree';
   const selectedPath = option;
   const rootId = action?.value?.root_id;
   logger.info(`Card action: repo ${isWorktreeOpen ? 'worktree-open' : 'switch'} to ${selectedPath} (root_id: ${rootId})`);

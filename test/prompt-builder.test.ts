@@ -14,8 +14,22 @@ import { describe, it, expect, vi } from 'vitest';
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
 vi.mock('node:child_process', () => ({
+  execFile: vi.fn((_file: string, _args: string[], cb?: (...args: any[]) => void) => {
+    if (typeof cb === 'function') cb(null, '', '');
+    return {} as any;
+  }),
   execSync: vi.fn(() => ''),
   execFileSync: vi.fn(() => ''),
+}));
+
+vi.mock('node-pty', () => ({
+  spawn: vi.fn(() => ({
+    onData: vi.fn(),
+    onExit: vi.fn(),
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+  })),
 }));
 
 vi.mock('node:fs', async () => {
@@ -64,6 +78,7 @@ vi.mock('../src/services/whiteboard-store.js', () => ({
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
   killStalePids: vi.fn(),
+  getActiveSessionsRegistry: vi.fn(() => undefined),
   getCurrentCliVersion: vi.fn(() => '1.0.0'),
 }));
 
@@ -257,6 +272,25 @@ describe('buildFollowUpContent', () => {
     expect(content).toContain('<mentions>');
     expect(content).toContain('name="Bob"');
     expect(content).toContain('open_id="ou_bob"');
+  });
+
+  it('includes substitute trigger metadata in follow-up prompts', () => {
+    const content = buildFollowUpContent('hello', SESSION_ID, {
+      sender: { openId: 'ou_sender', type: 'user', name: 'Sender' },
+      mentions: [{ name: 'Alice', openId: 'ou_alice', userId: 'u_alice' }],
+      substituteTrigger: {
+        target: { name: 'Alice', openId: 'ou_alice', userId: 'u_alice' },
+        disclosure: 'prefix',
+      },
+    });
+
+    expect(content).toContain('<substitute_trigger>');
+    expect(content).toContain('name="Alice"');
+    expect(content).toContain('open_id="ou_alice"');
+    expect(content).toContain('user_id="u_alice"');
+    expect(content).toContain('<disclosure>prefix</disclosure>');
+    expect(content.indexOf('<sender ')).toBeLessThan(content.indexOf('<substitute_trigger>'));
+    expect(content.indexOf('<substitute_trigger>')).toBeLessThan(content.indexOf('<mentions>'));
   });
 
   it('places stable reminder before follow-up user content', () => {

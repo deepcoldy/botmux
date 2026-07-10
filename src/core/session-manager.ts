@@ -36,7 +36,7 @@ import {
 } from './session-create.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType } from '../adapters/backend/types.js';
-import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
+import type { LarkAttachment, LarkMention, ScheduledTask, SubstituteTrigger } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import { sessionKey, sessionAnchorId } from './types.js';
@@ -329,6 +329,26 @@ export function renderBufferedSenderBlock(sender: ResolvedSender | undefined, cl
   return note ? `${tag}\n${note}` : tag;
 }
 
+function renderSubstituteTrigger(trigger?: SubstituteTrigger): string {
+  if (!trigger) return '';
+  const attrs: string[] = [];
+  if (trigger.target.name) attrs.push(`name="${xmlEscape(trigger.target.name)}"`);
+  if (trigger.target.openId) attrs.push(`open_id="${xmlEscape(trigger.target.openId)}"`);
+  if (trigger.target.userId) attrs.push(`user_id="${xmlEscape(trigger.target.userId)}"`);
+  if (trigger.target.unionId) attrs.push(`union_id="${xmlEscape(trigger.target.unionId)}"`);
+  const disclosure = trigger.disclosure ?? 'prefix';
+  const instruction = disclosure === 'none'
+    ? 'This turn was triggered by a configured substitute target mention. Answer on behalf of that target when appropriate.'
+    : 'This turn was triggered by a configured substitute target mention. Answer on behalf of that target and clearly disclose that you are answering for them.';
+  return [
+    '<substitute_trigger>',
+    `  <target ${attrs.join(' ')} />`,
+    `  <disclosure>${xmlEscape(disclosure)}</disclosure>`,
+    `  <instruction>${xmlEscape(instruction)}</instruction>`,
+    '</substitute_trigger>',
+  ].join('\n');
+}
+
 export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: Locale): string {
   if (!attachments || attachments.length === 0) return '';
   let imgN = 0, fileN = 0;
@@ -441,7 +461,7 @@ export function buildNewTopicPrompt(
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
   sender?: ResolvedSender,
-  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string },
+  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger },
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
@@ -559,6 +579,9 @@ export function buildNewTopicPrompt(
   const senderBlock = renderSenderTag(sender);
   if (senderBlock) parts.push(senderBlock);
 
+  const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
+  if (substituteBlock) parts.push(substituteBlock);
+
   const senderNote = renderCursorSenderNote(cliId, !!senderBlock, locale);
   if (senderNote) parts.push(senderNote);
 
@@ -584,7 +607,7 @@ export function buildNewTopicPrompt(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger },
 ): string {
   const parts: string[] = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
@@ -612,6 +635,9 @@ export function buildFollowUpContent(
 
   const senderBlock = renderSenderTag(opts?.sender);
   if (senderBlock) parts.push(senderBlock);
+
+  const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
+  if (substituteBlock) parts.push(substituteBlock);
 
   const senderNote = renderCursorSenderNote(opts?.cliId, !!senderBlock, opts?.locale);
   if (senderNote) parts.push(senderNote);
@@ -1479,7 +1505,7 @@ export async function executeScheduledTask(
     task.deliver === 'new-topic' ? 'thread'
       : scope === 'chat' && anchor !== task.chatId ? 'thread'
         : scope;
-  const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`);
+  const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group');
   const now = Date.now();
   session.larkAppId = larkAppId;
   session.scope = runtimeScope;

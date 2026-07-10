@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   allExpectedInChat,
-  renderBotCheckboxes,
-  renderAddBotsResultSummary,
-  renderRoleProfileBootstrapSummary,
+  availableBotsForPicker,
+  roleProfileBootstrapStatus,
+  summarizeAddBotsResult,
   suggestRoleProfileIdFromChat,
 } from '../src/dashboard/web/groups.js';
 import { hasExplicitChatRole, summarizeGroupProfileMatches } from '../src/dashboard/web/role-profile-match.js';
@@ -48,9 +48,9 @@ describe('allExpectedInChat — refreshUntilSeen commit predicate', () => {
   });
 });
 
-describe('renderBotCheckboxes — shared bot picker ordering', () => {
-  it('renders in the provided dashboard bot order and filters excluded ids', () => {
-    const html = renderBotCheckboxes(
+describe('availableBotsForPicker — shared bot picker ordering', () => {
+  it('keeps the provided dashboard bot order and filters excluded ids', () => {
+    const bots = availableBotsForPicker(
       [
         { larkAppId: 'cli_b', botName: 'Beta' },
         { larkAppId: 'cli_a', botName: 'Alpha' },
@@ -59,61 +59,58 @@ describe('renderBotCheckboxes — shared bot picker ordering', () => {
       new Set(['cli_a']),
     );
 
-    expect(html).not.toContain('cli_a');
-    expect(html.indexOf('cli_b')).toBeGreaterThanOrEqual(0);
-    expect(html.indexOf('cli_c')).toBeGreaterThan(html.indexOf('cli_b'));
+    expect(bots.map(bot => bot.larkAppId)).toEqual(['cli_b', 'cli_c']);
   });
 });
 
-describe('renderRoleProfileBootstrapSummary — create-group profile feedback', () => {
-  it('renders a sent bootstrap message summary', () => {
-    const html = renderRoleProfileBootstrapSummary('collab-main', 'om_bootstrap', null);
+describe('roleProfileBootstrapStatus — create-group profile feedback', () => {
+  it('summarizes a sent bootstrap message', () => {
+    const status = roleProfileBootstrapStatus('collab-main', 'om_bootstrap', null);
 
-    expect(html).toContain('Profile：collab-main');
-    expect(html).toContain('bootstrap 消息已发送：om_bootstrap');
-    expect(html).toContain('hint-ok');
+    expect(status).toEqual({
+      kind: 'ok',
+      text: 'Profile：collab-main；bootstrap 消息已发送：om_bootstrap',
+    });
   });
 
-  it('renders failure details and escapes interpolated values', () => {
-    const html = renderRoleProfileBootstrapSummary(
+  it('summarizes failure details without dropping interpolated values', () => {
+    const status = roleProfileBootstrapStatus(
       '<profile>',
       null,
       '<script>alert(1)</script>',
     );
 
-    expect(html).not.toContain('<profile>');
-    expect(html).not.toContain('<script>');
-    expect(html).toContain('&lt;profile&gt;');
-    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
-    expect(html).toContain('hint-warn');
+    expect(status?.kind).toBe('warn');
+    expect(status?.text).toContain('<profile>');
+    expect(status?.text).toContain('<script>alert(1)</script>');
   });
 });
 
-describe('renderAddBotsResultSummary — add-bots inline feedback', () => {
+describe('summarizeAddBotsResult — add-bots inline feedback', () => {
   it('summarizes a clean add-bots result as success', () => {
-    const html = renderAddBotsResultSummary([
+    const summary = summarizeAddBotsResult([
       { id: 'cli_a', ok: true },
       { id: 'cli_b', ok: true },
     ]);
 
-    expect(html).toContain('hint-ok');
-    expect(html).toContain('成功 2/2');
-    expect(html).toContain('<code>cli_a</code>: OK');
-    expect(html).toContain('<code>cli_b</code>: OK');
+    expect(summary.okCount).toBe(2);
+    expect(summary.failed).toBe(0);
+    expect(summary.rows.map(row => row.id)).toEqual(['cli_a', 'cli_b']);
   });
 
-  it('summarizes partial failures and escapes ids/errors', () => {
-    const html = renderAddBotsResultSummary([
+  it('summarizes partial failures and keeps row details', () => {
+    const summary = summarizeAddBotsResult([
       { id: 'cli_ok', ok: true },
       { id: '<bad>', ok: false, error: '<script>alert(1)</script>' },
     ]);
 
-    expect(html).toContain('hint-warn');
-    expect(html).toContain('成功 1/2，失败 1');
-    expect(html).toContain('&lt;bad&gt;');
-    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
-    expect(html).not.toContain('<bad>');
-    expect(html).not.toContain('<script>');
+    expect(summary.okCount).toBe(1);
+    expect(summary.failed).toBe(1);
+    expect(summary.rows[1]).toMatchObject({
+      id: '<bad>',
+      ok: false,
+      error: '<script>alert(1)</script>',
+    });
   });
 });
 

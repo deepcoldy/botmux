@@ -255,10 +255,28 @@ function localCliLabel(cliName: string): string {
   return cliName.replace(/\s+(App|CLI)$/i, '');
 }
 
+/** 💻「打开 <CLI>」本机直开按钮暂时隐藏——打磨好前先不放出来。两个原因：
+ *  1) 实际只有 mac 桌面能用：生产 daemon 跑在 headless Linux 上没有 GUI，
+ *     localTerminalCapable() 恒 false，按钮根本不出现；只有在 mac 上跑 daemon 才看得到。
+ *  2) 点了会在本机 Terminal 里 `resume` 同一个 CLI 会话，把会话从 botmux worker/PTY
+ *     抢到本地，飞书这侧的对话就此断开、不再跟随——破坏了飞书对话的连续性。
+ *
+ *  优化方向（做到这些、不破坏飞书对话连续性后再放出来）：
+ *  - 本机直开走 tmux attach（附到 botmux 会话所在的那个 tmux/pane），而不是另起一个
+ *    `resume` 进程另开一份会话；
+ *  - 本机终端 ↔ 飞书双向同步：本地敲的输入、CLI 的输出，飞书侧要能同步跟随，两边共用
+ *    同一路 I/O，谁在哪敲都不断线。
+ *
+ *  重新启用：删掉下面这行 HIDE_OPEN_LOCAL_CLI_BUTTON 判断即可（按钮实现 + card-handler
+ *  的 open_local_terminal 处理都还在，未删）。
+ *  （标 boolean 而非字面量 true，免得 TS 把后面的 localTerminalCapable() 判成 unreachable。） */
+const HIDE_OPEN_LOCAL_CLI_BUTTON: boolean = true;
+
 /** Zero or one local-CLI open button — only on hosts that can actually pop a
  *  native terminal (macOS, or Linux with a GUI session); headless servers get
  *  no button instead of one that always toasts "unsupported". */
 function openLocalTerminalButtons(actionBase: Record<string, string>, cliName: string, locale?: Locale): any[] {
+  if (HIDE_OPEN_LOCAL_CLI_BUTTON) return [];
   if (!localTerminalCapable()) return [];
   return [{
     tag: 'button',
@@ -1247,11 +1265,13 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
 
 /** 授权成功后给被授权人的通知卡（独立消息）。支持一次通知多个被授权人；带额度时追加"（额度 N 条）"。
  *
- *  **真人 grantee 用 `<at>` 点名，bot grantee 只用纯文本名字**：卡片里的 `<at id=botOpenId>` 会被
- *  对方 bot 的 daemon 当成一次「被 @」消息，从而凭新授权/同伴 peer 关系在本群误拉起一个空会话
- *  （实测 bug：手动 /grant 后面没有 prompt，不该触发自动会话）。纯文本名字不产生 mention 事件，
- *  既保留「谁被授权」的可读信息，又不会唤醒对方 bot。传 string/string[]（无 isBot 信息）时按真人
- *  处理（@ 全部），保持旧调用方/单测兼容。 */
+ *  **bot grantee 有名字就用纯文本名字、拿不到名字才 `<at>` 兜底；真人 grantee 一律 `<at>` 点名**：
+ *  卡片里的 `<at id=botOpenId>` 会被对方 bot 的 daemon 当成一次「被 @」消息，凭新授权/同伴 peer
+ *  关系在本群拉起一个空会话（实测：手动 /grant 后没有 prompt → 空会话「等待输入」）。所以能拿到
+ *  bot 名字时优先用纯文本（不产生 mention、不唤醒对方）；只有名字缺失时才退回 `<at>`——此时飞书
+ *  能据 open_id 展示对方身份（远比裸 open_id 可读），代价是可能偶尔触发一次空会话（产品上可接受，
+ *  且名字缺失是少数边角情况）。真人被 `<at>` 不会自动开会话。传 string/string[]（无 isBot 信息）
+ *  时按真人处理（@ 全部），保持旧调用方/单测兼容。 */
 export function buildGrantNotifyCard(
   kind: 'chat' | 'global',
   target: string | string[] | Array<{ openId: string; name?: string; isBot?: boolean }>,
@@ -1261,9 +1281,9 @@ export function buildGrantNotifyCard(
   const entries = (Array.isArray(target) ? target : [target]).map(tt =>
     typeof tt === 'string' ? { openId: tt, name: undefined as string | undefined, isBot: false } : tt);
   const at = entries.map(e =>
-    e.isBot
-      ? (e.name && e.name.length > 0 ? e.name : e.openId)   // bot：纯文本名字，绝不 <at>（否则唤醒对方 bot）
-      : `<at id=${e.openId}></at>`,                          // 真人：@ 点名（真人被 @ 不会自动开会话）
+    e.isBot && e.name && e.name.length > 0
+      ? e.name                                              // bot 有名字：纯文本，不 <at>（不唤醒对方）
+      : `<at id=${e.openId}></at>`,                          // 真人 / bot 无名字：@ 点名（bot 无名字时靠飞书据 open_id 展示身份，代价=可能一次空会话）
   ).join(' ');
   let content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
   if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);

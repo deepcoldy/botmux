@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildConnectorInstructionUpdateBody } from '../src/dashboard/web/connectors.js';
+import { buildConnectorInstructionUpdateBody } from '../src/dashboard/web/connectors-page.js';
 
 describe('dashboard connector instruction editing', () => {
   it('updates only the prompt envelope and leaves secrets untouched', () => {

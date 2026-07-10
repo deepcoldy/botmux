@@ -1,5 +1,10 @@
+import React from 'react';
+import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it } from 'vitest';
-import { displayCliId, renderBotAgentSection } from '../src/dashboard/web/bot-defaults.js';
+import { displayCliId } from '../src/dashboard/web/bot-defaults.js';
+import { BotAgentSection } from '../src/dashboard/web/bot-defaults-page.js';
+
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 describe('bot defaults cli label', () => {
   it('prefers /api/bots cliId before session fallback', () => {
@@ -9,14 +14,26 @@ describe('bot defaults cli label', () => {
   });
 
   it('renders an editable CLI and model section from /api/bots values', () => {
-    const html = renderBotAgentSection(
-      { larkAppId: 'cli_traex', cliId: 'traex', model: 'glm-5.1' },
-      'codex',
-    );
-    expect(html).toContain('data-input="agentCliId"');
-    expect(html).toContain('<option value="traex" selected>');
-    expect(html).toContain('data-input="agentModel"');
-    expect(html).toContain('value="glm-5.1"');
-    expect(html).toContain('data-action="save-agent"');
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_traex', cliId: 'traex', model: 'glm-5.1' },
+        sessionFallback: 'codex',
+        cliState: {
+          options: [
+            { id: 'claude-code', label: 'Claude' },
+            { id: 'codex', label: 'Codex' },
+            { id: 'traex', label: 'traex' },
+          ],
+          ttadkModelDefault: 'glm-5.1',
+          ttadkModelSuggestions: [],
+        },
+        patchBot: () => undefined,
+      }));
+    });
+    const root = renderer.root;
+    expect(root.findByProps({ 'data-input': 'agentCliId' }).props.value).toBe('traex');
+    expect(root.findByProps({ 'data-input': 'agentModel' }).props.value).toBe('glm-5.1');
+    expect(root.findAllByProps({ 'data-action': 'save-agent' })).toHaveLength(1);
   });
 });

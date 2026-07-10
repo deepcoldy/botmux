@@ -47,6 +47,9 @@ export interface ResolvedDashboardSettingsView {
       vcMeetingAgentEnabled?: boolean;
       hasLarkCliProfile?: boolean;
     }>;
+    larkCliVersion?: string | null;
+    larkCliMeetsRequirement?: boolean;
+    larkCliMinVersion?: string;
   };
   maintenance: MaintenanceConfig;
   localDevInstall: boolean;
@@ -91,7 +94,7 @@ export interface SettingsWriteApplierDeps {
   /** Validate a global VC listener bot selection before mutating bot/global config. */
   validateVcMeetingListenerBotAppId?: (appId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
   /** Sync per-bot meeting-listener config after validation passes or when clearing the selection. */
-  syncVcMeetingListenerBotConfig?: (listenerBotAppId: string | null, previousListenerBotAppId?: string | null) => Promise<{ ok: true } | { ok: false; error: string }>;
+  syncVcMeetingListenerBotConfig?: (listenerBotAppId: string | null, previousListenerBotAppId?: string | null) => Promise<{ ok: true } | { ok: false; error: string; feishuLoginQr?: string }>;
 }
 
 /** Production deps wiring — call once per dashboard process. */
@@ -115,7 +118,7 @@ export function defaultSettingsWriteApplierDeps(
 
 export type ApplySettingsWriteResult =
   | { ok: true; settings: ResolvedDashboardSettingsView }
-  | { ok: false; error: ApplySettingsWriteError };
+  | { ok: false; error: ApplySettingsWriteError; feishuLoginQr?: string };
 
 /**
  * Discrete error codes — every one of these MUST match the strings the old
@@ -223,7 +226,7 @@ export async function applySettingsWrite(
       if (vc.listenerBotAppId === null || vc.listenerBotAppId === '') {
         if (deps.syncVcMeetingListenerBotConfig) {
           const synced = await deps.syncVcMeetingListenerBotConfig(null, currentVcMeetingAgent.listenerBotAppId ?? null);
-          if (!synced.ok) return { ok: false, error: synced.error };
+          if (!synced.ok) return { ok: false, error: synced.error, feishuLoginQr: (synced as any).feishuLoginQr };
         }
         delete next.listenerBotAppId;
       } else if (typeof vc.listenerBotAppId === 'string' && vc.listenerBotAppId.trim()) {
@@ -234,7 +237,7 @@ export async function applySettingsWrite(
         }
         if (deps.syncVcMeetingListenerBotConfig) {
           const synced = await deps.syncVcMeetingListenerBotConfig(listenerBotAppId, currentVcMeetingAgent.listenerBotAppId ?? null);
-          if (!synced.ok) return { ok: false, error: synced.error };
+          if (!synced.ok) return { ok: false, error: synced.error, feishuLoginQr: (synced as any).feishuLoginQr };
         }
         next.listenerBotAppId = listenerBotAppId;
       } else {

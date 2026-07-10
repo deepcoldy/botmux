@@ -29,7 +29,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
-import type { SessionBackend, SpawnOpts } from './types.js';
+import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
 import { tmuxEnv } from '../../setup/ensure-tmux.js';
 import { buildBotmuxEnvAssignments, resolveUserShell, SHELL_WRAPPER_SCRIPT, TmuxBackend } from './tmux-backend.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
@@ -82,6 +82,21 @@ export function composeSeedBody(
   return body + `\x1b[${cursor.y + 1};${cursor.x + 1}H`;
 }
 
+/**
+ * Spread lifecycle probes after a mass daemon restore. Workers are separate
+ * processes, so a process-local mutex cannot prevent them all from hitting the
+ * same default tmux server on the same millisecond. A stable target-derived
+ * offset keeps probes distributed without introducing test/runtime randomness.
+ */
+export function tmuxLifecycleInitialDelayMs(target: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < target.length; i += 1) {
+    hash ^= target.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return 1000 + ((hash >>> 0) % 750);
+}
+
 export class TmuxPipeBackend implements SessionBackend {
   /** Real tmux pane address (e.g. "0:2.0") or botmux session name (bmx-*). */
   private readonly paneTarget: string;
@@ -110,9 +125,10 @@ export class TmuxPipeBackend implements SessionBackend {
   private static readonly RECENT_OUTPUT_MAX = 4096;
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
   private lifecycleTimer: NodeJS.Timeout | null = null;
-  /** Debounce transient pane-probe failures so one flaky `tmux display-message`
-   *  (timeout / server hiccup under fd pressure) doesn't tear down an adopted
-   *  pane that's still alive. See recordPaneProbe. (pid-death stays decisive.) */
+  private lastUnknownProbeLogAt = 0;
+  /** Debounce authoritative pane-missing replies. Probe timeouts / EMFILE /
+   *  spawn failures are classified as unknown and never enter this destructive
+   *  counter. (Adopted CLI pid-death stays decisive.) */
   private readonly livenessGate = new LivenessGate(ADOPT_LIVENESS_MAX_FAILURES);
   private cols = 200;
   private rows = 50;
@@ -336,11 +352,11 @@ export class TmuxPipeBackend implements SessionBackend {
       // A kill()/handlePaneExit() may have flipped exited between the guard
       // and here; if so the teardown already happened.
       if (this.exited) return false;
-      const alive = this.isPaneAlive();
+      const paneProbe = this.probePaneAddressability(2000);
       process.stderr.write(
-        `[tmux-pipe-backend] ${op} failed (pane ${alive ? 'ALIVE' : 'GONE'}): ${err?.message ?? err}\n`,
+        `[tmux-pipe-backend] ${op} failed (pane ${paneProbe.state.toUpperCase()}): ${err?.message ?? err}\n`,
       );
-      if (!alive) {
+      if (paneProbe.state === 'missing') {
         // Diagnostic: the pane is gone, so capture-pane can't read the final
         // screen. Instead dump the tail tmux already replicated over the pipe
         // — the CLI's real last stdout/stderr before it exited, which often
@@ -469,7 +485,7 @@ export class TmuxPipeBackend implements SessionBackend {
   private startLifecycleWatcher(): void {
     this.stopLifecycleWatcher();
     this.livenessGate.reset();
-    this.lifecycleTimer = setInterval(() => {
+    const poll = () => {
       if (this.exited) return;
       // The watched CLI pid (adopt mode) is a pure process.kill(pid,0) syscall —
       // it can only report ESRCH (gone) or EPERM (alive), never a transient
@@ -482,42 +498,70 @@ export class TmuxPipeBackend implements SessionBackend {
         this.handlePaneExit();
         return;
       }
-      this.recordPaneProbe(this.isPaneAddressable(2000));
-    }, 1000);
+      this.recordPaneProbe(this.probePaneAddressability(2000));
+      if (!this.exited) this.lifecycleTimer = setTimeout(poll, 1000);
+    };
+    this.lifecycleTimer = setTimeout(poll, tmuxLifecycleInitialDelayMs(this.paneTarget));
   }
 
-  /** Is the pane still addressable in tmux? This `display-message` IS the flaky,
-   *  fd/server-dependent signal (command timeout / busy server under EMFILE) —
-   *  which is why recordPaneProbe debounces it. `timeoutMs` lets the final
-   *  confirm wait longer than the 1s poll so an overloaded server can still
-   *  answer before we declare a live pane dead. */
-  private isPaneAddressable(timeoutMs: number): boolean {
+  /**
+   * Tri-state pane probe. A clean tmux rejection is `missing`; timeout, signal,
+   * EMFILE/ENFILE and spawn failures are `unknown`, because the shared server
+   * never answered. Collapsing those into false caused every worker to destroy
+   * a live bmx-* session when the default server had a short outage.
+   */
+  private probePaneAddressability(timeoutMs: number): { state: SessionProbe; reason?: string } {
     try {
-      const paneId = execSync(
-        `tmux display-message -p -t ${shellescape(this.paneTarget)} '#{pane_id}'`,
+      const paneId = execFileSync(
+        'tmux', ['display-message', '-p', '-t', this.paneTarget, '#{pane_id}'],
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs, env: tmuxEnv() },
       ).trim();
-      return paneId.length > 0;
-    } catch {
-      return false;
+      return { state: paneId.length > 0 ? 'exists' : 'missing', reason: paneId.length > 0 ? undefined : 'empty pane id' };
+    } catch (err: any) {
+      if (err && typeof err.status === 'number' && !err.signal) {
+        const stderr = (err.stderr?.toString?.() ?? '').trim();
+        return { state: 'missing', reason: stderr || `tmux display-message exited ${err.status}` };
+      }
+      const detail = (err?.stderr?.toString?.() ?? '').trim()
+        || err?.code
+        || err?.signal
+        || err?.message
+        || 'tmux probe got no answer';
+      return { state: 'unknown', reason: String(detail) };
     }
   }
 
   /**
-   * Debounce the (flaky) pane-addressability probe. Tearing down on the FIRST
-   * failed probe produced the spurious "⏏ /adopt的 CLI 会话已断开" — a tmux command
-   * timeout / busy server (e.g. under EMFILE fd pressure) momentarily fails the
-   * probe while the pane is still alive and the CLI still receiving messages.
-   * Only after ADOPT_LIVENESS_MAX_FAILURES consecutive failures, AND a final
-   * lenient-timeout re-probe that still fails, do we detach. Any success resets.
+   * Debounce authoritative pane-missing replies. Tearing down on the FIRST
+   * failed probe used to produce spurious disconnects; worse, timeout/EMFILE
+   * were collapsed into the same boolean false and could accumulate to the
+   * threshold. Unknown results now keep the session attached and reset the
+   * destructive streak. Only consecutive `missing` replies plus a final
+   * `missing` confirmation detach the observer. Any success resets.
    * (pid-death is handled decisively in the watcher — see startLifecycleWatcher.)
    */
-  private recordPaneProbe(alive: boolean): void {
+  private recordPaneProbe(probe: { state: SessionProbe; reason?: string }): void {
     if (this.exited) return;
-    if (!this.livenessGate.record(alive)) {
-      if (!alive) {
+    if (probe.state === 'unknown') {
+      // Unknown is not evidence of death. Reset the destructive streak so a
+      // timeout cannot combine with later unrelated misses, and rate-limit the
+      // diagnostic because every managed worker polls this shared server.
+      this.livenessGate.reset();
+      const now = Date.now();
+      if (now - this.lastUnknownProbeLogAt >= 30_000) {
+        this.lastUnknownProbeLogAt = now;
         process.stderr.write(
-          `[tmux-pipe-backend] adopt pane probe failed (${this.livenessGate.consecutiveFailures}/${ADOPT_LIVENESS_MAX_FAILURES}); retrying before teardown\n`,
+          `[tmux-pipe-backend] tmux pane probe unavailable; keeping ${this.ownsSession ? 'managed' : 'adopted'} session attached (${probe.reason ?? 'unknown error'})\n`,
+        );
+      }
+      return;
+    }
+
+    const alive = probe.state === 'exists';
+    if (!this.livenessGate.record(alive)) {
+      if (probe.state === 'missing') {
+        process.stderr.write(
+          `[tmux-pipe-backend] ${this.ownsSession ? 'managed' : 'adopted'} pane missing (${this.livenessGate.consecutiveFailures}/${ADOPT_LIVENESS_MAX_FAILURES}); retrying before teardown\n`,
         );
       }
       return;
@@ -525,13 +569,16 @@ export class TmuxPipeBackend implements SessionBackend {
     // Threshold reached — one final authoritative probe with a more lenient
     // timeout so a transiently overloaded tmux server gets a fair chance to
     // answer before we detach a pane that's actually still alive.
-    if (this.isPaneAddressable(3000)) {
+    const confirm = this.probePaneAddressability(3000);
+    if (confirm.state !== 'missing') {
       this.livenessGate.reset();
-      process.stderr.write('[tmux-pipe-backend] adopt pane recovered on final check; staying attached\n');
+      process.stderr.write(
+        `[tmux-pipe-backend] pane ${confirm.state === 'exists' ? 'recovered' : 'probe remained unavailable'} on final check; staying attached${confirm.reason ? ` (${confirm.reason})` : ''}\n`,
+      );
       return;
     }
     process.stderr.write(
-      `[tmux-pipe-backend] adopted pane gone after ${ADOPT_LIVENESS_MAX_FAILURES} consecutive probe failures; detaching observer\n`,
+      `[tmux-pipe-backend] ${this.ownsSession ? 'managed' : 'adopted'} pane gone after ${ADOPT_LIVENESS_MAX_FAILURES} consecutive authoritative misses; detaching observer\n`,
     );
     this.handlePaneExit();
   }
@@ -720,16 +767,7 @@ export class TmuxPipeBackend implements SessionBackend {
    *  used by callers to detect "user closed the pane while we were piping". */
   isPaneAlive(): boolean {
     if (this.exited) return false;
-    try {
-      execSync(`tmux display-message -p -t ${shellescape(this.paneTarget)} ''`, {
-        stdio: 'ignore',
-        timeout: 2000,
-        env: tmuxEnv(),
-      });
-      return true;
-    } catch {
-      return false;
-    }
+    return this.probePaneAddressability(2000).state === 'exists';
   }
 
   /** Unknown pid → pane-only liveness. EPERM still means the process exists. */

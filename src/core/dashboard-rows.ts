@@ -12,6 +12,7 @@ import { getTerminalAdvertisedPort } from './terminal-url.js';
 import { getBotBrand } from '../bot-registry.js';
 import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
 import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
+import { getIdentity } from '../im/lark/identity-cache.js';
 
 export interface SessionRow {
   sessionId: string;
@@ -25,6 +26,8 @@ export interface SessionRow {
   closedAt?: number;
   workingDir?: string;
   chatId: string;
+  chatType?: 'group' | 'p2p';
+  chatDisplayName?: string;
   rootMessageId: string;
   threadId?: string;
   /** Conversation unit ('thread' = topic-anchored, 'chat' = plain chat scope).
@@ -66,6 +69,10 @@ export interface SessionRow {
   agentAttention?: { kind: string; reason: string; at: number };
   /** Native Agent CLI token usage for this session. Null means unavailable. */
   tokenUsage?: SessionTokenUsage | null;
+  /** Worker process PID, active rows only. Used by dashboard resource attribution. */
+  workerPid?: number;
+  /** Adopted external CLI PID, active rows only when the source backend exposed it. */
+  adoptCliPid?: number;
 }
 
 export function feishuChatLink(chatId: string, brand: Brand = 'feishu'): string {
@@ -99,6 +106,20 @@ function sessionTokenUsage(s: Session, workingDir?: string): SessionTokenUsage |
   });
 }
 
+function directChatDisplayName(s: Session, larkAppId?: string): string | undefined {
+  if (s.chatType !== 'p2p') return undefined;
+  const persisted = String(s.chatDisplayName ?? '').trim();
+  if (persisted) return persisted;
+  const appId = larkAppId ?? s.larkAppId;
+  if (!appId) return undefined;
+  for (const openId of [s.ownerOpenId, s.creatorOpenId, s.lastCallerOpenId]) {
+    if (!openId) continue;
+    const name = String(getIdentity(appId, openId)?.name ?? '').trim();
+    if (name) return name;
+  }
+  return undefined;
+}
+
 export function composeRowFromActive(ds: DaemonSession): SessionRow {
   return {
     sessionId: ds.session.sessionId,
@@ -107,13 +128,19 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     cliId: ds.session.cliId ?? 'unknown',
     // 待办池(queued)会话 CLI 没起，不该算「忙」——报 'idle' 免得 overview 的忙碌
     // 计数/小圆点把它当在跑。看板列由 deriveKanbanColumn 按手动 backlog 定，不受此影响。
-    // 重启后懒恢复的 active 会话没有 live worker / screen status：这是「休眠」而不是「启动中」。
-    status: ds.session.queued ? 'idle' : (ds.lastScreenStatus ?? (ds.worker ? 'starting' : 'dormant')),
+    // For every other session, process residency is authoritative: suspension
+    // clears ds.worker but intentionally preserves the logical active session.
+    // Never let a stale pre-suspend status make it look resident after hydrate.
+    status: ds.session.queued
+      ? 'idle'
+      : (!ds.worker || ds.worker.killed ? 'dormant' : (ds.lastScreenStatus ?? 'starting')),
     adopt: !!ds.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
     lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,
     workingDir: ds.workingDir,
     chatId: ds.chatId,
+    chatType: ds.chatType,
+    chatDisplayName: directChatDisplayName(ds.session, ds.larkAppId),
     rootMessageId: ds.session.rootMessageId,
     scope: ds.session.scope,
     title: ds.session.title,
@@ -138,6 +165,8 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
       ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
       : undefined,
     tokenUsage: sessionTokenUsage(ds.session, ds.workingDir),
+    ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
+    ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
   };
 }
 
@@ -154,6 +183,8 @@ export function composeRowFromClosed(s: Session): SessionRow {
     closedAt: s.closedAt ? Date.parse(s.closedAt) : undefined,
     workingDir: s.workingDir,
     chatId: s.chatId,
+    chatType: s.chatType,
+    chatDisplayName: directChatDisplayName(s, s.larkAppId),
     rootMessageId: s.rootMessageId,
     scope: s.scope,
     title: s.title,

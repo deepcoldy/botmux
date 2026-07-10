@@ -19,6 +19,7 @@ export interface VcMeetingRef {
 
 export interface VcMeetingActor {
   openId?: string;
+  unionId?: string;
   name?: string;
   userType?: number;
 }

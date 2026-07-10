@@ -104,3 +104,15 @@ describe('TmuxBackend.serverState', () => {
     expect(TmuxBackend.serverState()).toBe('unknown');
   });
 });
+
+describe('TmuxBackend.killSession', () => {
+  it('bounds teardown against a wedged shared server', () => {
+    mockedExecFileSync.mockImplementation((() => '') as any);
+    TmuxBackend.killSession(NAME);
+    expect(mockedExecFileSync).toHaveBeenCalledWith(
+      'tmux',
+      ['kill-session', '-t', NAME],
+      expect.objectContaining({ timeout: 3000 }),
+    );
+  });
+});
