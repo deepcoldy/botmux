@@ -204,6 +204,15 @@ describe('built-in botmux-orchestrate skill', () => {
     expect(skill!.content).toContain('缺少项目环境');
     expect(skill!.content).toContain('不弹仓库选择卡、不暂存任务');
   });
+
+  it('teaches the supervisor to cancel unneeded tasks and keep workers on the help path', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-orchestrate');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('delivery cancel --task');
+    expect(skill!.content).toContain('已验收（accepted）不能取消');
+    expect(skill!.content).toContain('不许它自我取消');
+    expect(skill!.content).toContain('help:missing_repo');
+  });
 });
 
 describe('built-in botmux-whiteboard skill', () => {
