@@ -48,6 +48,16 @@ export type GoalNarrationEvent =
       taskId: string;
       /** Display name (or id) of the worker confirmed dead, if known. */
       deadWorker?: string;
+    }
+  | {
+      type: 'cancelled';
+      key: string;
+      taskId: string;
+      title?: string;
+      reason: string;
+      by?: string;
+      /** Reports present without a verdict when cancellation happened. */
+      pendingReports?: number;
     };
 
 export interface EmitGoalNarrationInput {
@@ -130,6 +140,15 @@ export function buildGoalNarrationText(event: GoalNarrationEvent): string {
       `原执行者${event.deadWorker ? `（${cleanLine(event.deadWorker)}）` : ''}确认掉线，任务已重新派发`,
       '监管者继续盯，无需重复操作',
     ].join('\n');
+  }
+  if (event.type === 'cancelled') {
+    return [
+      `⏹ 已取消 · ${event.taskId}`,
+      cleanLine(event.title),
+      `原因：${cleanLine(event.reason, '未说明')}`,
+      event.by ? `操作人：${cleanLine(event.by)}` : undefined,
+      event.pendingReports ? `已有 ${event.pendingReports} 份提交未验收` : undefined,
+    ].filter(Boolean).join('\n');
   }
   return [
     `🆘 求助 · ${event.taskId}`,

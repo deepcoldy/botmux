@@ -171,6 +171,23 @@ describe('reconcileTaskByCriteria — verify → ledger events', () => {
     expect(led.read()).toHaveLength(after); // no new events
   });
 
+  it('cancelled → no-op even when its artifacts would pass', () => {
+    const led = openLedger({ baseDir });
+    const file = join(baseDir, 'cancelled.txt');
+    writeFileSync(file, 'PASS');
+    led.append(draft({
+      type: 'TaskDispatched', taskId: 't-cancelled', chatId: 'oc_g', idempotencyKey: 'd:cancelled',
+      payload: { taskId: 't-cancelled', acceptanceCriteria: { version: 1, artifacts: [{ path: file, checks: [{ type: 'exists' }] }] } },
+    }));
+    led.append(draft({ type: 'TaskCancelled', taskId: 't-cancelled', chatId: 'oc_g', idempotencyKey: 'c:cancelled', payload: { taskId: 't-cancelled', reason: '不再需要' } }));
+
+    const before = led.read().length;
+    const result = reconcileTaskByCriteria(led, 't-cancelled', { checkedBy: 'sup', now: TS });
+    expect(result).toEqual({ taskId: 't-cancelled', action: 'cancelled' });
+    expect(led.read()).toHaveLength(before);
+    expect(led.task('t-cancelled')?.status).toBe('cancelled');
+  });
+
   it('end-to-end with real files: worker reported + reconcile auto-accepts on real artifacts', () => {
     const led = openLedger({ baseDir });
     const dirReal = mkdtempSync(join(tmpdir(), 'vd-real-'));

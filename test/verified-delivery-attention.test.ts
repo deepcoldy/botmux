@@ -37,6 +37,10 @@ describe('classifyTaskDisposition — the shared pure rule', () => {
     expect(classifyTaskDisposition(task('accepted'))).toEqual({ bucket: 'completed', reason: 'accepted', next: '已验收' });
   });
 
+  it('cancelled → quiet (settled, but not presented as completed)', () => {
+    expect(classifyTaskDisposition(task('cancelled'))).toEqual({ bucket: 'quiet', reason: 'cancelled', next: '已取消' });
+  });
+
   it('dispatched → inProgress; rejected → inProgress (not terminal, retrying)', () => {
     expect(classifyTaskDisposition(task('dispatched'))).toMatchObject({ bucket: 'inProgress', reason: 'dispatched' });
     expect(classifyTaskDisposition(task('rejected'))).toMatchObject({ bucket: 'inProgress', reason: 'rejected_retrying' });
@@ -157,6 +161,24 @@ describe('buildGoalAttentionBoard — cross-goal rollup', () => {
     const b = buildGoalAttentionBoard({ baseDir });
     expect(b.systemRisk).toEqual([]);
     expect(b.inProgress.map((t) => t.taskId)).toEqual(['t-stuck']);
+  });
+
+  it('keeps cancelled tasks in per-goal history but out of every attention bucket', () => {
+    const led = openLedger({ baseDir });
+    led.append(draft({ type: 'TaskDispatched', taskId: 't-cancel', chatId: 'oc_g', idempotencyKey: 'd:cancel', ts: T(0), payload: { taskId: 't-cancel' } }));
+    led.append(draft({ type: 'TaskCancelled', taskId: 't-cancel', chatId: 'oc_g', idempotencyKey: 'c:cancel', ts: T(1), payload: { taskId: 't-cancel', reason: '诊断结束' } }));
+
+    const b = buildGoalAttentionBoard({ baseDir });
+    expect(b.perGoal[0].tasks[0]).toMatchObject({ taskId: 't-cancel', status: 'cancelled' });
+    expect([
+      ...b.needsHuman,
+      ...b.blocked,
+      ...b.systemRisk,
+      ...b.inProgress,
+      ...b.readyToVerify,
+      ...b.recentlyCompleted,
+    ].map((row) => row.taskId)).not.toContain('t-cancel');
+    expect(b.counts).toEqual({ needsHuman: 0, blocked: 0, systemRisk: 0, inProgress: 0, readyToVerify: 0, completed: 0 });
   });
 
   it('scopes to a single goal when chatId is given', () => {
