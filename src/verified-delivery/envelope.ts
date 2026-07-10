@@ -122,10 +122,24 @@ export function formatHelpEnvelope(input: {
 function stripLeadingMentions(line: string): string {
   let t = line.trim();
   for (;;) {
-    const next = t.replace(/^@\S+\s+/, '');
+    const next = t.replace(/^@\S+(?:\s+|$)/, '').trimStart();
     if (next === t) return t;
     t = next;
   }
+}
+
+/**
+ * Return the first meaningful line after trimming whitespace and Lark's
+ * leading @mention chrome. A delivery envelope is a whole-message protocol,
+ * not a fenced example embedded in ordinary task prose.
+ */
+function firstMeaningfulLine(text: string): { index: number; text: string } | undefined {
+  const lines = text.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index++) {
+    const line = stripLeadingMentions(lines[index]!);
+    if (line) return { index, text: line };
+  }
+  return undefined;
 }
 
 /** Split a "key: value" line. Returns undefined when there is no colon. */
@@ -164,16 +178,15 @@ export function parseDeliveryEnvelope(text: string | undefined): ParsedEnvelope 
   // Fast reject: the header marker must appear somewhere before we do real work.
   if (!text.includes('[botmux-report v1]') && !text.includes('[botmux-help v1]')) return null;
 
-  const rawLines = text.split('\n');
-  // Find the header line (tolerate leading @mentions / surrounding whitespace).
-  let start = -1;
-  let isHelp = false;
-  for (let i = 0; i < rawLines.length; i++) {
-    const line = stripLeadingMentions(rawLines[i]);
-    if (line === REPORT_ENVELOPE_HEADER) { start = i; isHelp = false; break; }
-    if (line === HELP_ENVELOPE_HEADER) { start = i; isHelp = true; break; }
-  }
-  if (start < 0) return null;
+  const rawLines = text.split(/\r?\n/);
+  // The header must be the first meaningful line. Dispatch prompts include
+  // report/help examples in their instructions; scanning every line would turn
+  // those examples into fake deliveries and prevent the dispatch from running.
+  const first = firstMeaningfulLine(text);
+  if (!first) return null;
+  const isHelp = first.text === HELP_ENVELOPE_HEADER;
+  if (!isHelp && first.text !== REPORT_ENVELOPE_HEADER) return null;
+  const start = first.index;
 
   const fields = new Map<string, string>();
   const evidence: EnvelopeEvidence[] = [];
@@ -214,7 +227,9 @@ export function parseDeliveryEnvelope(text: string | undefined): ParsedEnvelope 
 
 export function detectUnsupportedDeliveryEnvelope(text: string | undefined): UnsupportedDeliveryEnvelope | null {
   if (!text || !text.includes('[botmux-')) return null;
-  const m = text.match(/\[botmux-(report|help)\s+([^\]\s]+)\]/i);
+  const first = firstMeaningfulLine(text);
+  if (!first) return null;
+  const m = first.text.match(/^\[botmux-(report|help)\s+([^\]\s]+)\]$/i);
   if (!m) return null;
   const version = m[2].trim().toLowerCase();
   if (version === 'v1') return null;

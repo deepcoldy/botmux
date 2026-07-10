@@ -8,6 +8,35 @@ describe('delivery envelope parser', () => {
     expect(parseDeliveryEnvelope('随便聊一句，没有信封')).toBeNull();
   });
 
+  it('does not parse envelope examples embedded in task prose', () => {
+    expect(parseDeliveryEnvelope([
+      '请按以下格式提交：',
+      '[botmux-report v1]',
+      'taskId: task-9',
+      'summary: done',
+    ].join('\n'))).toBeNull();
+    expect(parseDeliveryEnvelope([
+      '卡住时发送：',
+      '[botmux-help v1]',
+      'taskId: task-9',
+      'kind: access',
+      'blocker: 缺少项目环境',
+    ].join('\n'))).toBeNull();
+  });
+
+  it('does not parse delivery examples inside a dispatch prompt', () => {
+    expect(parseDeliveryEnvelope([
+      '完成任务后发送：',
+      '[botmux-report v1]',
+      'taskId: task-9',
+      'summary: done',
+      '',
+      '[botmux-dispatch v1]',
+      'taskId: task-9',
+      'repo: github.com/example/project',
+    ].join('\n'))).toBeNull();
+  });
+
   it('detects unsupported envelope versions for loud diagnostics', () => {
     expect(detectUnsupportedDeliveryEnvelope('[botmux-report v2]\ntaskId: t')).toEqual({
       kind: 'report',
@@ -21,6 +50,7 @@ describe('delivery envelope parser', () => {
     });
     expect(detectUnsupportedDeliveryEnvelope('[botmux-report v1]\ntaskId: t')).toBeNull();
     expect(detectUnsupportedDeliveryEnvelope('普通聊天')).toBeNull();
+    expect(detectUnsupportedDeliveryEnvelope('示例：\n[botmux-report v2]\ntaskId: t')).toBeNull();
   });
 
   it('parses a report envelope with all evidence kinds', () => {
@@ -54,6 +84,17 @@ describe('delivery envelope parser', () => {
     ].join('\n'));
     expect(env?.kind).toBe('report');
     if (env?.kind === 'report') expect(env.taskId).toBe('t-1');
+  });
+
+  it('tolerates a mention-only line before the header', () => {
+    const env = parseDeliveryEnvelope([
+      '@claude-loopy',
+      '[botmux-help v1]',
+      'taskId: t-2',
+      'kind: access',
+      'blocker: 缺少项目环境',
+    ].join('\n'));
+    expect(env).toEqual({ kind: 'help', taskId: 't-2', helpKind: 'access', blocker: '缺少项目环境' });
   });
 
   it('omits reportId when absent (ingestion derives one)', () => {

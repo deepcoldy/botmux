@@ -15739,6 +15739,11 @@ async function maybeIngestDeliveryEnvelope(input: {
   larkAppId: string;
   chatId?: string;
 }): Promise<boolean> {
+  // A dispatch prompt may contain report/help examples for the worker. The
+  // trailing dispatch block is the authoritative outer protocol, so never let
+  // an embedded example be consumed as an inbound delivery envelope.
+  if (parseDispatchRepoRequirement(input.parsed.content)) return false;
+
   const envelope = parseDeliveryEnvelope(input.parsed.content);
   if (!envelope) {
     const unsupported = detectUnsupportedDeliveryEnvelope(input.parsed.content);
