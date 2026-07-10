@@ -20,6 +20,7 @@ const EVENT_TYPES = new Set<LedgerEventType>([
   'TaskRejected',
   'TaskHelpRequested',
   'TaskEscalated',
+  'TaskCancelled',
 ]);
 const ACTORS = new Set<LedgerActor>(['orchestrator', 'worker']);
 const HELP_KINDS = new Set<HelpKind>(['access', 'ambiguous', 'impossible', 'repeated_failure', 'other']);
@@ -177,6 +178,9 @@ export function validateLedgerEventDraft(draft: LedgerEventDraft): LedgerInvaria
       break;
     case 'TaskEscalated':
       if (!nonEmpty(payload.reason)) errors.push('TaskEscalated.reason must be non-empty');
+      break;
+    case 'TaskCancelled':
+      if (!nonEmpty(payload.reason)) errors.push('TaskCancelled.reason must be non-empty');
       break;
   }
 

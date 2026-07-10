@@ -78,8 +78,10 @@ export interface AcceptanceCriteria {
 
 /** The current materialized state of one task (read-model, derived from events).
  *  blocked = worker raised a help request, awaiting the supervisor.
- *  escalated = supervisor couldn't resolve, awaiting a human decision. */
-export type TaskStatus = 'dispatched' | 'reported' | 'accepted' | 'rejected' | 'blocked' | 'escalated';
+ *  escalated = supervisor couldn't resolve, awaiting a human decision.
+ *  cancelled = supervisor intentionally stopped the task; only an explicit
+ *  re-dispatch may reactivate it. */
+export type TaskStatus = 'dispatched' | 'reported' | 'accepted' | 'rejected' | 'blocked' | 'escalated' | 'cancelled';
 
 /** Why a worker is stuck (kept tiny + enum-like so the board/stats can group). */
 export type HelpKind = 'access' | 'ambiguous' | 'impossible' | 'repeated_failure' | 'other';
@@ -117,6 +119,12 @@ export interface TaskEscalationView {
   retryBrief?: string;        // context / what the human should decide
 }
 
+/** The latest intentional cancellation (supervisor/main controller decision). */
+export interface TaskCancellationView {
+  reason: string;
+  by?: string;
+}
+
 export interface TaskView {
   taskId: string;
   chatId?: string;
@@ -151,9 +159,11 @@ export interface TaskView {
   help?: TaskHelpView;
   /** Latest escalation (present once the supervisor has ever escalated). */
   escalation?: TaskEscalationView;
+  /** Present while the task is cancelled; cleared by an explicit re-dispatch. */
+  cancellation?: TaskCancellationView;
 }
 
-// ─── events (exactly four) ───────────────────────────────────────────────────
+// ─── events ──────────────────────────────────────────────────────────────────
 
 export interface TaskDispatchedPayload {
   taskId: string;
@@ -253,6 +263,14 @@ export interface TaskEscalatedPayload {
   retryBrief?: string;
 }
 
+/** Supervisor/main controller intentionally stops a task without pretending it
+ *  was delivered or rejected. Raw history remains in the append-only ledger. */
+export interface TaskCancelledPayload {
+  taskId: string;
+  reason: string;
+  by?: string;
+}
+
 /** Stable reject codes both halves share, so UI / stats can recognise them.
  *  Detail/instructions ride in retryBrief / expectedEvidence, not in the code. */
 export const REJECT_REASON = {
@@ -271,7 +289,8 @@ export type LedgerEventType =
   | 'TaskAccepted'
   | 'TaskRejected'
   | 'TaskHelpRequested'
-  | 'TaskEscalated';
+  | 'TaskEscalated'
+  | 'TaskCancelled';
 
 export type LedgerActor = 'orchestrator' | 'worker';
 
@@ -291,7 +310,8 @@ export interface LedgerEventDraft {
     | TaskAcceptedPayload
     | TaskRejectedPayload
     | TaskHelpRequestedPayload
-    | TaskEscalatedPayload;
+    | TaskEscalatedPayload
+    | TaskCancelledPayload;
 }
 
 /** A persisted ledger line. */

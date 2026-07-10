@@ -27,10 +27,29 @@ describe('buildGoalBoard — ledger projection', () => {
     const board = buildGoalBoard({ baseDir });
     expect(board.goals.map((g) => g.goalChatId).sort()).toEqual(['oc_g1', 'oc_g2']);
     const g1 = board.goals.find((g) => g.goalChatId === 'oc_g1')!;
-    expect(g1.counts).toEqual({ dispatched: 1, reported: 0, accepted: 1, rejected: 0, blocked: 0, escalated: 0, total: 2 });
+    expect(g1.counts).toEqual({ dispatched: 1, reported: 0, accepted: 1, rejected: 0, blocked: 0, escalated: 0, cancelled: 0, total: 2 });
     expect(g1.hasCharter).toBe(false); // no whiteboard created in this test
     // active task (dispatched) sorts before terminal (accepted)
     expect(g1.tasks.map((t) => t.taskId)).toEqual(['t-a', 't-b']);
+  });
+
+  it('projects cancellation reason, time and count without losing prior reports', () => {
+    const led = openLedger({ baseDir });
+    const T1 = 1_700_000_000_000, T2 = 1_700_000_030_000, T3 = 1_700_000_060_000;
+    led.append(draft({ type: 'TaskDispatched', taskId: 't-cancel', chatId: 'oc_g', idempotencyKey: 'd:cancel', ts: T1, payload: { taskId: 't-cancel', title: '临时诊断' } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 't-cancel', chatId: 'oc_g', idempotencyKey: 'r:cancel', ts: T2, payload: { taskId: 't-cancel', reportId: 'rc', summary: '诊断结果', evidence: [{ kind: 'path', path: '/tmp/diag' }] } }));
+    led.append(draft({ type: 'TaskCancelled', taskId: 't-cancel', chatId: 'oc_g', idempotencyKey: 'c:cancel', ts: T3, payload: { taskId: 't-cancel', reason: '不属于正式目标', by: 'sup' } }));
+
+    const goal = buildGoalBoard({ baseDir, chatId: 'oc_g' }).goals[0];
+    expect(goal.counts).toMatchObject({ cancelled: 1, total: 1 });
+    expect(goal.lastActivityAt).toBe(T3);
+    expect(goal.tasks[0]).toMatchObject({
+      taskId: 't-cancel',
+      status: 'cancelled',
+      cancelledAt: T3,
+      cancellation: { reason: '不属于正式目标', by: 'sup' },
+    });
+    expect(goal.tasks[0].attempts).toHaveLength(1);
   });
 
   it('prefers structured acceptanceCriteria, falls back to legacy hint', () => {

@@ -126,6 +126,29 @@ describe('verified-delivery CLI e2e（delivery 回路，零飞书）', () => {
     expect(show.json.task.escalation).toMatchObject({ reason: '需要人决定范围', by: 'l2-test', retryBrief: '请确认是否包含移动端' });
   });
 
+  it('`delivery cancel` 真跑（零 daemon）→ 任务终态取消且保留原因', () => {
+    seedDispatched('task-cancel', 'cancel me');
+    seedReported('task-cancel');
+    const out = delivery(['cancel', '--task', 'task-cancel', '--reason', '临时诊断已结束', '--by', 'l2-test']);
+    expect(out.status).toBe(0);
+    expect(out.json).toMatchObject({ taskId: 'task-cancel', cancelled: true, pendingReports: 1 });
+    const show = delivery(['show', '--task', 'task-cancel']);
+    expect(show.json.task.status).toBe('cancelled');
+    expect(show.json.task.cancellation).toEqual({ reason: '临时诊断已结束', by: 'l2-test' });
+    expect(delivery(['list', '--status', 'cancelled']).json.tasks.map((task: any) => task.taskId)).toContain('task-cancel');
+    expect(delivery(['accept', '--task', 'task-cancel']).raw).toContain('已取消');
+    expect(delivery(['escalate', '--task', 'task-cancel', '--reason', 'late', '--no-notify-parent']).raw).toContain('已取消');
+
+    openLedger({ baseDir: ledgerBase }).append({
+      type: 'TaskDispatched', actor: 'orchestrator', taskId: 'task-cancel', chatId: GOAL_CHAT,
+      ts: TS + 2000, idempotencyKey: 'reassign:task-cancel:second',
+      payload: { taskId: 'task-cancel', title: 'second attempt' },
+    });
+    const second = delivery(['cancel', '--task', 'task-cancel', '--reason', '第二轮也停止', '--by', 'l2-test']);
+    expect(second.json).toMatchObject({ taskId: 'task-cancel', cancelled: true, deduped: false });
+    expect(delivery(['show', '--task', 'task-cancel']).json.task.cancellation.reason).toBe('第二轮也停止');
+  });
+
   it('liveness：`list --status dispatched --older-than` 扫出卡住任务，新任务排除', () => {
     const now = Date.now();
     seedDispatched('task-stuck', 'stuck', now - 3 * 3600_000);  // 3h 前派出、一直没回报

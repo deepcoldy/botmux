@@ -162,6 +162,8 @@ export type ReconcileAction =
   | 'no-criteria'
   /** Already terminal-accepted; nothing to do. */
   | 'already-accepted'
+  /** Supervisor intentionally cancelled the task; never verify or revive it. */
+  | 'cancelled'
   /** Worker raised a help request (status=blocked) — NOT a failed delivery; the
    *  caller routes it to the supervisor to self-resolve/escalate, never reject. */
   | 'blocked'
@@ -220,6 +222,7 @@ function verifyTrailText(v: AcceptanceVerifyResult): string {
  * Decision table:
  *   no task ............................. unknown-task    (no write)
  *   status=accepted ..................... already-accepted (no write)
+ *   status=cancelled .................... cancelled       (no write)
  *   status=blocked/escalated ........... blocked/escalated (no write; → supervisor)
  *   no acceptanceCriteria ............... no-criteria     (no write; caller → LLM)
  *   pass + pending report .............. accept that report (auto-verify a real delivery)
@@ -231,6 +234,7 @@ export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, op
   const task = ledger.task(taskId);
   if (!task) return { taskId, action: 'unknown-task' };
   if (task.status === 'accepted') return { taskId, action: 'already-accepted' };
+  if (task.status === 'cancelled') return { taskId, action: 'cancelled' };
   // A help/escalation is not a delivery to verify — never run checks (and never
   // reject) on it. The watchdog routes blocked → supervisor, escalated → parked.
   if (task.status === 'blocked') return { taskId, action: 'blocked' };

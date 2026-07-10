@@ -27,7 +27,7 @@ import { readGoalNarrations, type GoalNarrationRecord } from '../services/goal-n
 import type {
   AcceptanceCriteria, Evidence, LedgerEvent, TaskStatus, TaskView,
   TaskReportedPayload, TaskAcceptedPayload, TaskRejectedPayload,
-  TaskHelpView, TaskEscalationView,
+  TaskHelpView, TaskEscalationView, TaskCancellationView,
 } from './types.js';
 
 /** A compact, display-safe descriptor of one piece of evidence (no blob inlined). */
@@ -83,6 +83,7 @@ export interface GoalBoardTask {
   latestVerdictAt?: number;
   acceptedAt?: number;
   rejectedAt?: number;
+  cancelledAt?: number;
 
   // ── verification trail of the latest report (the "is it really done" proof)─
   checkedBy?: string;
@@ -98,6 +99,8 @@ export interface GoalBoardTask {
   help?: TaskHelpView;
   /** Latest escalation (supervisor → human); present once escalated. */
   escalation?: TaskEscalationView;
+  /** Latest cancellation; present while status=cancelled. */
+  cancellation?: TaskCancellationView;
 }
 
 export interface GoalBoardGoal {
@@ -112,7 +115,7 @@ export interface GoalBoardGoal {
   charterContent?: string;
   /** Most recent delivery activity across this goal's tasks (unix ms). */
   lastActivityAt?: number;
-  counts: { dispatched: number; reported: number; accepted: number; rejected: number; blocked: number; escalated: number; total: number };
+  counts: { dispatched: number; reported: number; accepted: number; rejected: number; blocked: number; escalated: number; cancelled: number; total: number };
   tasks: GoalBoardTask[];
   /** Recent human-readable narration events (newest first) — the same clean
    *  stream the goal chat shows, incl. 「人类决策到达」(not a ledger fact). */
@@ -132,7 +135,7 @@ export function goalCharterId(goal: string): string {
 /** Order tasks within a goal: needs-attention (escalated→human, blocked→supervisor)
  *  first, then active (dispatched/reported), then terminal — by ledger order
  *  (which is dispatch order, since taskIds aren't time-sortable). */
-const STATUS_RANK: Record<TaskStatus, number> = { escalated: -2, blocked: -1, dispatched: 0, reported: 1, rejected: 2, accepted: 3 };
+const STATUS_RANK: Record<TaskStatus, number> = { escalated: -2, blocked: -1, dispatched: 0, reported: 1, rejected: 2, cancelled: 3, accepted: 4 };
 
 /** Per-task timing + per-report timing, derived from the raw event stream. */
 interface TaskTiming {
@@ -142,6 +145,7 @@ interface TaskTiming {
   acceptedByReport: Map<string, number>;
   rejectedByReport: Map<string, number>;
   reportTs: Map<string, number>;
+  cancelledAt?: number;
 }
 
 function collectTimings(events: LedgerEvent[]): Map<string, TaskTiming> {
@@ -170,6 +174,8 @@ function collectTimings(events: LedgerEvent[]): Map<string, TaskTiming> {
       const p = e.payload as TaskRejectedPayload;
       t.latestVerdictAt = e.ts;
       t.rejectedByReport.set(p.reportId, e.ts);
+    } else if (e.type === 'TaskCancelled') {
+      t.cancelledAt = e.ts;
     }
   }
   return byTask;
@@ -215,6 +221,7 @@ function toBoardTask(t: TaskView, timing: TaskTiming | undefined): GoalBoardTask
   if (latest?.verdictVia === 'reconcile') task.autoReconciled = true;
   if (t.help) task.help = t.help;
   if (t.escalation) task.escalation = t.escalation;
+  if (t.cancellation) task.cancellation = t.cancellation;
   if (latest?.checkedBy) task.checkedBy = latest.checkedBy;
   if (latest?.evidenceChecked?.length) task.evidenceChecked = latest.evidenceChecked;
   if (latest?.ranCommands?.length) task.ranCommands = latest.ranCommands;
@@ -224,6 +231,7 @@ function toBoardTask(t: TaskView, timing: TaskTiming | undefined): GoalBoardTask
     if (timing.dispatchedAt !== undefined) task.dispatchedAt = timing.dispatchedAt;
     if (timing.latestReportedAt !== undefined) task.latestReportedAt = timing.latestReportedAt;
     if (timing.latestVerdictAt !== undefined) task.latestVerdictAt = timing.latestVerdictAt;
+    if (t.status === 'cancelled' && timing.cancelledAt !== undefined) task.cancelledAt = timing.cancelledAt;
     if (t.latestReportId) {
       const a = timing.acceptedByReport.get(t.latestReportId);
       const r = timing.rejectedByReport.get(t.latestReportId);
@@ -258,7 +266,7 @@ export function buildGoalBoard(opts: { baseDir?: string; chatId?: string } = {})
       try { charterContent = readWhiteboard(meta.id, { allowDisabled: true, missingAsEmpty: true }); } catch { /* tolerate */ }
     }
 
-    const counts = { dispatched: 0, reported: 0, accepted: 0, rejected: 0, blocked: 0, escalated: 0, total: tasks.length };
+    const counts = { dispatched: 0, reported: 0, accepted: 0, rejected: 0, blocked: 0, escalated: 0, cancelled: 0, total: tasks.length };
     for (const t of tasks) counts[t.status] += 1;
 
     const boardTasks = tasks
@@ -267,7 +275,7 @@ export function buildGoalBoard(opts: { baseDir?: string; chatId?: string } = {})
 
     let lastActivityAt: number | undefined;
     for (const t of boardTasks) {
-      for (const ts of [t.dispatchedAt, t.latestReportedAt, t.latestVerdictAt]) {
+      for (const ts of [t.dispatchedAt, t.latestReportedAt, t.latestVerdictAt, t.cancelledAt]) {
         if (ts !== undefined && (lastActivityAt === undefined || ts > lastActivityAt)) lastActivityAt = ts;
       }
     }
