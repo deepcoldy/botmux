@@ -127,11 +127,18 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
       } else if (e.type === 'TaskReported') {
         const p = e.payload as import('./types.js').TaskReportedPayload;
         const t = ensure(e.taskId, e.chatId);
+        const alreadyAccepted = t.status === 'accepted';
         if (!findReport(t, p.reportId)) {
           t.reports.push({ reportId: p.reportId, workerOpenId: p.workerOpenId, evidence: p.evidence, summary: p.summary });
         }
-        t.latestReportId = p.reportId;
-        t.status = 'reported';
+        // Accepted is terminal. A delayed retry may carry a different reportId
+        // (for example after a network timeout), but it must not reopen a task
+        // that the supervisor has already verified. Keep the event for audit;
+        // rejected/blocked/escalated tasks can still recover via a new report.
+        if (!alreadyAccepted) {
+          t.latestReportId = p.reportId;
+          t.status = 'reported';
+        }
       } else if (e.type === 'TaskAccepted') {
         const p = e.payload as import('./types.js').TaskAcceptedPayload;
         const t = ensure(e.taskId, e.chatId);
