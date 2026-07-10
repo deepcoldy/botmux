@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="#设计理念">设计理念</a> · <a href="#核心优势">核心优势</a> · <a href="#5-分钟快速接入">快速接入</a> · <a href="https://deepcoldy.github.io/botmux/"><b>📖 文档</b></a>
+  <a href="#设计理念">设计理念</a> · <a href="#核心优势">核心优势</a> · <a href="#5-分钟快速接入">快速接入</a> · <a href="https://deepcoldy.github.io/botmux/"><b>📖 文档</b></a> · <a href="https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg"><b>✨ 效果展示</b></a>
 </p>
 
 <p align="center">
@@ -22,6 +22,8 @@
 ---
 
 **飞书 + AI 编程 CLI——私聊 / 群聊 / 话题，每个会话一个独立 CLI 进程，实时流式回传。** Daemon 监听飞书消息，为每个新会话自动启动独立 CLI 进程（Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot / Kimi Code），提供实时流式卡片和可交互 Web 终端。
+
+> ✨ **先看效果**：[**《5 分钟创建一个真正好用的飞书助理》**](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg) —— 飞书图文 + 视频演示：AI 消息提醒 / 多端同步跨端操作 / 多 Bot 协作 / 多话题并行编排 / 语音总结 + 飞书会议 / Oncall 与个人替身。
 
 > 📖 **完整文档**（命令 / 配置 / 最佳实践 / 排错）：**<https://deepcoldy.github.io/botmux/>** ——本 README 只讲为什么用它和怎么快速上手。
 
