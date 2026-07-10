@@ -175,6 +175,9 @@ function goalRow(g: BoardGoal, selected: boolean): string {
   // 进度条仍画灰段留痕，hover 注明数量。
   const denom = c.total - cancelled;
   const pct = denom ? Math.round((c.accepted / denom) * 100) : 0;
+  const progressTitle = denom
+    ? `${pct}% 已验收${cancelled ? ` · ${cancelled} 已取消` : ''}`
+    : `${cancelled} 个任务均已取消，无待验收任务`;
   const segs = (['accepted', 'reported', 'dispatched', 'blocked', 'escalated', 'rejected', 'cancelled'] as const)
     .map(k => (c[k] ?? 0) ? `<span class="gb-seg gb-seg-${k}" style="flex:${c[k]}"></span>` : '')
     .join('');
@@ -191,7 +194,7 @@ function goalRow(g: BoardGoal, selected: boolean): string {
       <span class="gb-goal-name" title="${name}">${name}</span>
       <span class="gb-goal-frac"${cancelled ? ` title="另有 ${cancelled} 已取消"` : ''}>${denom ? `${c.accepted}/${denom}` : '—'}</span>
     </div>
-    <div class="gb-bar" title="${pct}% 已验收${cancelled ? ` · ${cancelled} 已取消` : ''}">${segs || '<span class="gb-seg gb-seg-empty" style="flex:1"></span>'}</div>
+    <div class="gb-bar" title="${progressTitle}">${segs || '<span class="gb-seg gb-seg-empty" style="flex:1"></span>'}</div>
     <div class="gb-goal-foot">
       <span class="gb-badges">${badges || '<span class="gb-mini gb-mini-quiet">无在跑</span>'}</span>
       <span class="gb-goal-time">${g.lastActivityAt ? fmtTs(g.lastActivityAt) : (g.hasCharter ? '仅 charter' : '')}</span>
