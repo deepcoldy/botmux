@@ -13,6 +13,20 @@ export type CliOptionsState = {
   ttadkModelSuggestions: string[];
 };
 
+export type BotSubstituteTarget = {
+  openId?: string;
+  userId?: string;
+  unionId?: string;
+  email?: string;
+  name?: string;
+};
+
+export type BotSubstituteMode = {
+  enabled: boolean;
+  targets: BotSubstituteTarget[];
+  disclosure: 'prefix' | 'none';
+};
+
 export type BotDefaultsRow = {
   larkAppId: string;
   botName?: string;
@@ -35,6 +49,7 @@ export type BotDefaultsRow = {
   p2pMode?: string;
   regularGroupReplyMode?: string;
   regularGroupMentionMode?: string;
+  substituteMode?: BotSubstituteMode | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
   startupCommands?: string;

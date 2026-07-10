@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import {
@@ -116,6 +116,21 @@ type MonitoringPageProps = {
   poll?: boolean;
 };
 
+type ResourceDetail = {
+  title: string;
+  value: string;
+  detail: string;
+  chart?: {
+    values?: number[];
+    timestamps?: number[];
+    unit: 'pct' | 'bytes';
+    startLabel: string;
+    endLabel: string;
+    emptyLabel: string;
+  };
+  emptyText?: string;
+};
+
 function formatBytes(value: unknown): string {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return '-';
@@ -197,6 +212,11 @@ function historyStartLabel(timestamps: number[] | undefined, nowMs: number | und
   return tr('monitoring.chartDaysAgo', { value: Math.round(hours / 24) });
 }
 
+function lastFiniteValue(values: number[] | undefined): number | undefined {
+  const data = (values ?? []).filter(Number.isFinite);
+  return data.length ? data[data.length - 1] : undefined;
+}
+
 function Sparkline({
   values,
   timestamps,
@@ -204,6 +224,7 @@ function Sparkline({
   startLabel,
   endLabel,
   emptyLabel,
+  className,
 }: {
   values?: number[];
   timestamps?: number[];
@@ -211,6 +232,7 @@ function Sparkline({
   startLabel: string;
   endLabel: string;
   emptyLabel: string;
+  className?: string;
 }) {
   const data = (values ?? []).filter(Number.isFinite);
   const min = data.length ? Math.min(...data) : 0;
@@ -227,28 +249,146 @@ function Sparkline({
   const pointParts = points ? points.split(' ') : [];
   const lastPoint = pointParts.length ? pointParts[pointParts.length - 1].split(',').map(Number) : null;
   return (
-    <div className="resource-chart">
+    <div className={['resource-chart', className].filter(Boolean).join(' ')}>
       <div className="resource-chart-y" aria-hidden="true">
         <span>{data.length ? formatAxisValue(max, unit) : '-'}</span>
         <span>{data.length ? formatAxisValue(min, unit) : '-'}</span>
       </div>
       <div className="resource-chart-plot">
-        <svg className="resource-spark" viewBox="0 0 100 100" preserveAspectRatio="none" aria-label={data.length > 1 ? undefined : emptyLabel}>
-          <line x1="0" y1="12" x2="100" y2="12" className="resource-grid-line" />
-          <line x1="0" y1="50" x2="100" y2="50" className="resource-grid-line" />
-          <line x1="0" y1="88" x2="100" y2="88" className="resource-grid-line" />
-          {areaPoints ? <polygon className="resource-spark-area" points={areaPoints} /> : null}
-          {points ? <polyline points={points} /> : null}
-          {lastPoint && Number.isFinite(lastPoint[0]) && Number.isFinite(lastPoint[1])
-            ? <circle className="resource-spark-dot" cx={lastPoint[0]} cy={lastPoint[1]} r="2.3" />
-            : null}
-        </svg>
+        <div className="resource-spark-wrap">
+          <svg className="resource-spark" viewBox="0 0 100 100" preserveAspectRatio="none" aria-label={data.length > 1 ? undefined : emptyLabel}>
+            <line x1="0" y1="12" x2="100" y2="12" className="resource-grid-line" />
+            <line x1="0" y1="50" x2="100" y2="50" className="resource-grid-line" />
+            <line x1="0" y1="88" x2="100" y2="88" className="resource-grid-line" />
+            {areaPoints ? <polygon className="resource-spark-area" points={areaPoints} /> : null}
+            {points ? <polyline points={points} /> : null}
+          </svg>
+          {lastPoint && Number.isFinite(lastPoint[0]) && Number.isFinite(lastPoint[1]) ? (
+            <span
+              className="resource-spark-dot"
+              aria-hidden="true"
+              style={{ left: `${lastPoint[0]}%`, top: `${lastPoint[1]}%` }}
+            />
+          ) : null}
+        </div>
         <div className="resource-chart-x" aria-hidden="true">
           <span>{data.length > 1 ? startLabel : emptyLabel}</span>
           <span>{data.length > 1 ? endLabel : ''}</span>
         </div>
       </div>
     </div>
+  );
+}
+
+function ExpandableMetricCard(props: { label: string; onOpen(): void; children: ReactNode }) {
+  const shouldIgnore = (target: EventTarget | null): boolean => target instanceof Element && !!target.closest('.ui-info-tip');
+  return (
+    <section
+      className="metric-card"
+      data-resource-expandable=""
+      role="button"
+      tabIndex={0}
+      aria-label={props.label}
+      onClick={event => {
+        if (!shouldIgnore(event.target)) props.onOpen();
+      }}
+      onKeyDown={event => {
+        if (shouldIgnore(event.target) || (event.key !== 'Enter' && event.key !== ' ')) return;
+        event.preventDefault();
+        props.onOpen();
+      }}
+    >
+      {props.children}
+    </section>
+  );
+}
+
+function ExpandableTrendCell(props: { label: string; onOpen(): void; children: ReactNode }) {
+  return (
+    <article
+      className="resource-trend-cell"
+      data-resource-expandable=""
+      role="button"
+      tabIndex={0}
+      aria-label={props.label}
+      onClick={props.onOpen}
+      onKeyDown={event => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        props.onOpen();
+      }}
+    >
+      {props.children}
+    </article>
+  );
+}
+
+function ResourceDetailModal(props: { detail: ResourceDetail | null; onClose(): void }) {
+  const tr = useT();
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (props.detail) {
+      if (!dialog.open) {
+        try { dialog.showModal(); } catch { /* dialog already opening */ }
+      }
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [props.detail]);
+
+  useEffect(() => () => {
+    const dialog = dialogRef.current;
+    if (dialog?.open) dialog.close();
+  }, []);
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="resource-detail-modal"
+      onCancel={event => {
+        event.preventDefault();
+        props.onClose();
+      }}
+      onClose={props.onClose}
+      onClick={event => {
+        if (event.target === event.currentTarget) props.onClose();
+      }}
+    >
+      {props.detail ? (
+        <article className="resource-detail-modal-card">
+          <header className="resource-detail-modal-head">
+            <h3>{props.detail.title}</h3>
+            <button
+              type="button"
+              className="resource-detail-modal-close"
+              aria-label={tr('monitoring.modalClose')}
+              title={tr('monitoring.modalClose')}
+              onClick={props.onClose}
+            />
+          </header>
+          <div className="resource-detail-modal-body">
+            <section className="resource-detail-summary">
+              <strong>{props.detail.value}</strong>
+              <p>{props.detail.detail}</p>
+            </section>
+            {props.detail.chart ? (
+              <Sparkline
+                className="resource-detail-chart"
+                values={props.detail.chart.values}
+                timestamps={props.detail.chart.timestamps}
+                unit={props.detail.chart.unit}
+                startLabel={props.detail.chart.startLabel}
+                endLabel={props.detail.chart.endLabel}
+                emptyLabel={props.detail.chart.emptyLabel}
+              />
+            ) : <p className="resource-detail-empty">{props.detail.emptyText}</p>}
+          </div>
+        </article>
+      ) : null}
+    </dialog>
   );
 }
 
@@ -423,6 +563,7 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
   const [current, setCurrent] = useState<ResourceCurrent | null>(initialCurrent);
   const [history, setHistory] = useState<ResourceHistory | null>(initialHistory);
   const [sort, setSort] = useState<SortKey>('cpu');
+  const [resourceDetail, setResourceDetail] = useState<ResourceDetail | null>(null);
 
   useEffect(() => {
     if (!poll) return;
@@ -500,9 +641,64 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
             <SectionHeader title={tr('monitoring.resourcePressure')} />
             <section className="panel resource-pressure">
               <div className="resource-metrics runtime-pressure-grid">
-                <section className="metric-card"><span>{tr('monitoring.hostCpu')}</span><strong>{formatCpuPct(current?.host?.cpuPct, cpuReady)}</strong><small>load {Number(current?.host?.load1 ?? 0).toFixed(2)}</small></section>
-                <section className="metric-card"><span>{tr('monitoring.hostMemory')}</span><strong>{formatPct(current?.host?.memUsedPct)}</strong><small>{tr('monitoring.memoryOnly')}</small></section>
-                <section className="metric-card">
+                <ExpandableMetricCard
+                  label={tr('monitoring.hostCpu')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.hostCpu'),
+                    value: formatCpuPct(current?.host?.cpuPct, cpuReady),
+                    detail: `load ${Number(current?.host?.load1 ?? 0).toFixed(2)}`,
+                    chart: {
+                      values: history?.host?.cpuPct,
+                      timestamps: history?.host?.timestamps,
+                      unit: 'pct',
+                      startLabel: chartLabels.hostStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
+                  <span>{tr('monitoring.hostCpu')}</span>
+                  <strong>{formatCpuPct(current?.host?.cpuPct, cpuReady)}</strong>
+                  <small>load {Number(current?.host?.load1 ?? 0).toFixed(2)}</small>
+                </ExpandableMetricCard>
+                <ExpandableMetricCard
+                  label={tr('monitoring.hostMemory')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.hostMemory'),
+                    value: formatPct(current?.host?.memUsedPct),
+                    detail: tr('monitoring.memoryOnly'),
+                    chart: {
+                      values: history?.host?.memUsedPct,
+                      timestamps: history?.host?.timestamps,
+                      unit: 'pct',
+                      startLabel: chartLabels.hostStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
+                  <span>{tr('monitoring.hostMemory')}</span>
+                  <strong>{formatPct(current?.host?.memUsedPct)}</strong>
+                  <small>{tr('monitoring.memoryOnly')}</small>
+                </ExpandableMetricCard>
+                <ExpandableMetricCard
+                  label={tr('monitoring.botmuxRss')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.botmuxRss'),
+                    value: formatBytes(current?.botmux?.rssBytes),
+                    detail: current?.botmuxBreakdown
+                      ? `${tr('monitoring.botmuxSelf')} ${formatBytes((current.botmuxBreakdown.daemon.rssBytes ?? 0) + (current.botmuxBreakdown.worker.rssBytes ?? 0))}\n${tr('monitoring.botmuxCli')} ${formatBytes(current.botmuxBreakdown.cli.rssBytes)}`
+                      : formatCpuPct(current?.botmux?.cpuPct, cpuReady),
+                    chart: {
+                      values: history?.botmux?.rssBytes,
+                      timestamps: history?.botmux?.timestamps,
+                      unit: 'bytes',
+                      startLabel: chartLabels.botmuxStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
                   <div className="metric-label-with-help">
                     <span>{tr('monitoring.botmuxRss')}</span>
                     <InfoTip label={tr('monitoring.rssHelpLabel')}>{tr('monitoring.rssHelp')}</InfoTip>
@@ -519,8 +715,20 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
                       </small>
                     </>
                   )}
-                </section>
-                <section className="metric-card"><span>{tr('monitoring.trackedSessions')}</span><strong>{current?.rankings?.tracked?.length ?? 0}</strong><small>{tr('monitoring.currentSessions')} {(current?.sessions ?? []).length}</small></section>
+                </ExpandableMetricCard>
+                <ExpandableMetricCard
+                  label={tr('monitoring.trackedSessions')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.trackedSessions'),
+                    value: formatCount(current?.rankings?.tracked?.length),
+                    detail: `${tr('monitoring.currentSessions')} ${(current?.sessions ?? []).length}`,
+                    emptyText: tr('monitoring.trackedSessionHint'),
+                  })}
+                >
+                  <span>{tr('monitoring.trackedSessions')}</span>
+                  <strong>{current?.rankings?.tracked?.length ?? 0}</strong>
+                  <small>{tr('monitoring.currentSessions')} {(current?.sessions ?? []).length}</small>
+                </ExpandableMetricCard>
               </div>
             </section>
           </section>
@@ -529,22 +737,82 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
             <SectionHeader title={tr('monitoring.trends')} />
             <section className="panel resource-trends">
               <div className="resource-trend-grid">
-                <article className="resource-trend-cell">
+                <ExpandableTrendCell
+                  label={tr('monitoring.trendHostCpu')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.trendHostCpu'),
+                    value: formatPct(lastFiniteValue(history?.host?.cpuPct)),
+                    detail: `load ${Number(current?.host?.load1 ?? 0).toFixed(2)}`,
+                    chart: {
+                      values: history?.host?.cpuPct,
+                      timestamps: history?.host?.timestamps,
+                      unit: 'pct',
+                      startLabel: chartLabels.hostStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
                   <b>{tr('monitoring.trendHostCpu')}</b>
                   <Sparkline values={history?.host?.cpuPct} timestamps={history?.host?.timestamps} unit="pct" startLabel={chartLabels.hostStartLabel} endLabel={chartLabels.endLabel} emptyLabel={chartLabels.emptyLabel} />
-                </article>
-                <article className="resource-trend-cell">
+                </ExpandableTrendCell>
+                <ExpandableTrendCell
+                  label={tr('monitoring.trendHostMemory')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.trendHostMemory'),
+                    value: formatPct(lastFiniteValue(history?.host?.memUsedPct)),
+                    detail: tr('monitoring.memoryOnly'),
+                    chart: {
+                      values: history?.host?.memUsedPct,
+                      timestamps: history?.host?.timestamps,
+                      unit: 'pct',
+                      startLabel: chartLabels.hostStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
                   <b>{tr('monitoring.trendHostMemory')}</b>
                   <Sparkline values={history?.host?.memUsedPct} timestamps={history?.host?.timestamps} unit="pct" startLabel={chartLabels.hostStartLabel} endLabel={chartLabels.endLabel} emptyLabel={chartLabels.emptyLabel} />
-                </article>
-                <article className="resource-trend-cell">
+                </ExpandableTrendCell>
+                <ExpandableTrendCell
+                  label={tr('monitoring.trendBotmuxCpu')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.trendBotmuxCpu'),
+                    value: formatPct(lastFiniteValue(history?.botmux?.cpuPct)),
+                    detail: tr('monitoring.botRuntime'),
+                    chart: {
+                      values: history?.botmux?.cpuPct,
+                      timestamps: history?.botmux?.timestamps,
+                      unit: 'pct',
+                      startLabel: chartLabels.botmuxStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
                   <b>{tr('monitoring.trendBotmuxCpu')}</b>
                   <Sparkline values={history?.botmux?.cpuPct} timestamps={history?.botmux?.timestamps} unit="pct" startLabel={chartLabels.botmuxStartLabel} endLabel={chartLabels.endLabel} emptyLabel={chartLabels.emptyLabel} />
-                </article>
-                <article className="resource-trend-cell">
+                </ExpandableTrendCell>
+                <ExpandableTrendCell
+                  label={tr('monitoring.botmuxRss')}
+                  onOpen={() => setResourceDetail({
+                    title: tr('monitoring.botmuxRss'),
+                    value: formatBytes(lastFiniteValue(history?.botmux?.rssBytes)),
+                    detail: tr('monitoring.memoryOnly'),
+                    chart: {
+                      values: history?.botmux?.rssBytes,
+                      timestamps: history?.botmux?.timestamps,
+                      unit: 'bytes',
+                      startLabel: chartLabels.botmuxStartLabel,
+                      endLabel: chartLabels.endLabel,
+                      emptyLabel: chartLabels.emptyLabel,
+                    },
+                  })}
+                >
                   <b>{tr('monitoring.botmuxRss')}</b>
                   <Sparkline values={history?.botmux?.rssBytes} timestamps={history?.botmux?.timestamps} unit="bytes" startLabel={chartLabels.botmuxStartLabel} endLabel={chartLabels.endLabel} emptyLabel={chartLabels.emptyLabel} />
-                </article>
+                </ExpandableTrendCell>
               </div>
             </section>
           </section>
@@ -589,19 +857,39 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
             <SectionHeader title={tr('monitoring.trackedSessionTrends')} />
             <section className="panel">
               <div className="resource-trend-grid">
-                {(history?.sessions ?? []).map(session => (
-                  <article className="resource-trend-cell" key={session.sessionId}>
-                    <b>{session.botName} · {session.title || session.sessionId}</b>
-                    <Sparkline
-                      values={session.series?.rssBytes}
-                      timestamps={session.series?.timestamps}
-                      unit="bytes"
-                      startLabel={historyStartLabel(session.series?.timestamps, current?.sampledAt, tr)}
-                      endLabel={chartLabels.endLabel}
-                      emptyLabel={chartLabels.emptyLabel}
-                    />
-                  </article>
-                ))}
+                {(history?.sessions ?? []).map(session => {
+                  const title = `${session.botName} · ${session.title || session.sessionId}`;
+                  const startLabel = historyStartLabel(session.series?.timestamps, current?.sampledAt, tr);
+                  return (
+                    <ExpandableTrendCell
+                      key={session.sessionId}
+                      label={title}
+                      onOpen={() => setResourceDetail({
+                        title,
+                        value: formatBytes(lastFiniteValue(session.series?.rssBytes)),
+                        detail: session.sessionId,
+                        chart: {
+                          values: session.series?.rssBytes,
+                          timestamps: session.series?.timestamps,
+                          unit: 'bytes',
+                          startLabel,
+                          endLabel: chartLabels.endLabel,
+                          emptyLabel: chartLabels.emptyLabel,
+                        },
+                      })}
+                    >
+                      <b title={title}>{title}</b>
+                      <Sparkline
+                        values={session.series?.rssBytes}
+                        timestamps={session.series?.timestamps}
+                        unit="bytes"
+                        startLabel={startLabel}
+                        endLabel={chartLabels.endLabel}
+                        emptyLabel={chartLabels.emptyLabel}
+                      />
+                    </ExpandableTrendCell>
+                  );
+                })}
                 {!(history?.sessions ?? []).length ? <div className="empty">{tr('monitoring.noTrackedHistory')}</div> : null}
               </div>
             </section>
@@ -610,6 +898,7 @@ export function MonitoringPage({ initialCurrent = null, initialHistory = null, p
       ) : null}
         </>
       ) : null}
+      <ResourceDetailModal detail={resourceDetail} onClose={() => setResourceDetail(null)} />
     </section>
   );
 }

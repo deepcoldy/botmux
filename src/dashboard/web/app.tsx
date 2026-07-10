@@ -23,6 +23,7 @@ import {
 } from './route-lifecycle.js';
 import { buildBotCards, loadGroupsSnapshot } from './overview.js';
 import { BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT } from './bot-onboarding.js';
+import { InfoTip } from './dashboard-components.js';
 import { initFloatingScrollbars } from './floating-scrollbars.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
@@ -115,7 +116,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'skills', href: '#/skills', labelKey: 'nav.skills', manage: true, icon: <><path d="M3 2.5h10v3H3zM3 7h10v6.5H3z" /><path d="M5.4 9.2h5.2M5.4 11.2h3.8" /></> },
   { id: 'team', href: '#/team', labelKey: 'nav.team', manage: true, icon: <><circle cx="8" cy="8" r="6.2" /><path d="M1.8 8h12.4M8 1.8c-2 1.8-2 10.6 0 12.4 2-1.8 2-10.6 0-12.4z" /></> },
   { id: 'connectors', href: '#/connectors', labelKey: 'nav.connectors', manage: true, icon: <><path d="M5.5 6.5v-3a2.5 2.5 0 0 1 5 0v3" /><rect x="3.5" y="6.5" width="9" height="7" rx="2" /></> },
-  { id: 'settings', href: '#/settings', labelKey: 'nav.settings', icon: <><circle cx="8" cy="8" r="2.2" /><path d="M8 1.8v2M8 12.2v2M3.6 3.6L5 5M11 11l1.4 1.4M1.8 8h2M12.2 8h2M3.6 12.4L5 11M11 5l1.4-1.4" /></> },
+  { id: 'settings', href: '#/settings', labelKey: 'nav.settings', icon: <><path d="M8 1.75 9.35 2.05 10 3.28l1.38.3 1.04-.96.96.96-.96 1.04.3 1.38 1.23.65L14.25 8l-.3 1.35-1.23.65-.3 1.38.96 1.04-.96.96-1.04-.96-1.38.3-.65 1.23L8 14.25l-1.35-.3L6 12.72l-1.38-.3-1.04.96-.96-.96.96-1.04-.3-1.38-1.23-.65L1.75 8l.3-1.35 1.23-.65.3-1.38-.96-1.04.96-.96 1.04.96 1.38-.3.65-1.23z" /><circle cx="8" cy="8" r="2" /></> },
 ];
 
 let isAuthed = true;
@@ -452,10 +453,20 @@ function DashboardShell(): JSX.Element {
                   href={item.href}
                   data-route={item.id}
                   className={navClassName(item)}
-                  title={item.id === 'settings' && updateBehind && latestVersion ? t('update.navBadgeTitle', { version: `v${latestVersion}` }) : undefined}
                 >
                   {icon(item.icon)}
-                  <span>{labelOf(item)}</span>
+                  <span className="sidebar-nav-label">{labelOf(item)}</span>
+                  {item.id === 'settings' && updateBehind ? (
+                    <InfoTip
+                      className="nav-update-tip"
+                      label={t('update.navBadgeTitle', { version: latestVersion ? `v${latestVersion}` : '' })}
+                      trigger={<span className="nav-update-dot" aria-hidden="true" />}
+                      preventClick={false}
+                      focusable={false}
+                    >
+                      {t('update.navBadgeTitle', { version: latestVersion ? `v${latestVersion}` : '' })}
+                    </InfoTip>
+                  ) : null}
                 </a>
             ))}
             </nav>

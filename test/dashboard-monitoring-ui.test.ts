@@ -1,9 +1,11 @@
 import { readFileSync } from 'node:fs';
 import React from 'react';
-import TestRenderer, { type ReactTestInstance } from 'react-test-renderer';
+import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
 import { describe, expect, it } from 'vitest';
 
 import { MonitoringPage, SessionResourceTable } from '../src/dashboard/web/monitoring-page.js';
+
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 function makeSession(index: number) {
   return {
@@ -31,6 +33,21 @@ function textContent(node: ReactTestInstance): string {
   }).join('');
 }
 
+function resourcePills(node: ReactTestInstance): ReactTestInstance[] {
+  return node.findAll(child =>
+    child.type === 'span'
+    && typeof child.props.className === 'string'
+    && child.props.className.split(/\s+/).includes('resource-pill'));
+}
+
+function render(element: React.ReactElement): TestRenderer.ReactTestRenderer {
+  let renderer!: TestRenderer.ReactTestRenderer;
+  act(() => {
+    renderer = TestRenderer.create(element);
+  });
+  return renderer;
+}
+
 describe('dashboard monitoring session table', () => {
   it('declares runtime monitoring sections and status classes', () => {
     const page = readFileSync(new URL('../src/dashboard/web/monitoring-page.tsx', import.meta.url), 'utf8');
@@ -48,26 +65,23 @@ describe('dashboard monitoring session table', () => {
     expect(css).toContain(".runtime-status-pill");
   });
 
-  it('keeps all session rows in a ten-row scroll body under a fixed header', () => {
-    const renderer = TestRenderer.create(React.createElement(SessionResourceTable, {
+  it('keeps all session rows in a ten-row scroll list', () => {
+    const renderer = render(React.createElement(SessionResourceTable, {
       sessions: Array.from({ length: 12 }, (_, index) => makeSession(index + 1)),
     }));
     const root = renderer.root;
 
-    const table = root.findByProps({ className: 'resource-table resource-session-table' });
-    const header = table.findByProps({ className: 'resource-row resource-row-head' });
-    const scrollBody = table.findByProps({ className: 'resource-session-scroll', 'data-visible-rows': 10 });
-
-    expect(header.parent).toBe(table);
-    expect(scrollBody.parent).toBe(table);
-    const rows = scrollBody.findAll(node =>
-      typeof node.props.className === 'string' && node.props.className.startsWith('resource-row'));
+    const scrollList = root.findByProps({ className: 'overview-list resource-runtime-list resource-session-list' });
+    const rows = scrollList.findAll(node =>
+      node.type === 'li'
+      && typeof node.props.className === 'string'
+      && node.props.className.includes('resource-session-item'));
     expect(rows).toHaveLength(12);
-    expect(scrollBody.findAll(node => node.props.className === 'resource-row is-tracked')).toHaveLength(2);
+    expect(rows.filter(row => row.props.className.includes('is-tracked'))).toHaveLength(2);
   });
 
   it('keeps runtime health visible when resource sampling is unsupported', () => {
-    const renderer = TestRenderer.create(React.createElement(MonitoringPage, {
+    const renderer = render(React.createElement(MonitoringPage, {
       initialCurrent: {
         supported: false,
         reason: 'procfs_unavailable',
@@ -110,7 +124,7 @@ describe('dashboard monitoring session table', () => {
   });
 
   it('renders zero sample age as fresh data instead of missing data', () => {
-    const renderer = TestRenderer.create(React.createElement(MonitoringPage, {
+    const renderer = render(React.createElement(MonitoringPage, {
       initialCurrent: {
         supported: true,
         host: { cpuPct: 1, memUsedPct: 2, load1: 0.1 },
@@ -134,7 +148,7 @@ describe('dashboard monitoring session table', () => {
   });
 
   it('breaks the Botmux memory tile into self (daemon + worker) vs external CLI', () => {
-    const renderer = TestRenderer.create(React.createElement(MonitoringPage, {
+    const renderer = render(React.createElement(MonitoringPage, {
       initialCurrent: {
         supported: true,
         cpuReady: true,
@@ -172,7 +186,7 @@ describe('dashboard monitoring session table', () => {
   });
 
   it('renders missing runtime counts as unknown without hiding resource fallback counts', () => {
-    const renderer = TestRenderer.create(React.createElement(MonitoringPage, {
+    const renderer = render(React.createElement(MonitoringPage, {
       initialCurrent: {
         supported: true,
         host: { cpuPct: 12, memUsedPct: 34, load1: 0.5 },
@@ -197,17 +211,16 @@ describe('dashboard monitoring session table', () => {
     expect(healthText).not.toContain('0/0');
     expect(healthText).not.toContain('工作中 0');
 
-    const botTable = root.findByProps({ className: 'resource-table resource-bot-table' });
-    const botRow = botTable.findAllByProps({ className: 'resource-row' })
+    const botList = root.findByProps({ className: 'overview-list resource-runtime-list' });
+    const botRow = botList.findAllByProps({ className: 'overview-list-item resource-list-item resource-bot-item' })
       .find(row => textContent(row).includes('FallbackBot'));
     expect(botRow).toBeTruthy();
-    expect(textContent(botRow!.children[2] as ReactTestInstance)).toBe('4');
-    expect(textContent(botRow!.children[3] as ReactTestInstance)).toBe('-');
-    expect(textContent(botRow!.children[4] as ReactTestInstance)).toBe('-');
+    expect(textContent(botRow!.findByProps({ className: 'overview-list-main' }))).toContain('4');
+    expect(botRow!.findAllByProps({ className: 'resource-pill accent' })[0].findByType('b').children).toEqual(['-']);
   });
 
   it('renders current CPU as unavailable before a CPU delta baseline is ready', () => {
-    const renderer = TestRenderer.create(React.createElement(MonitoringPage, {
+    const renderer = render(React.createElement(MonitoringPage, {
       initialCurrent: {
         supported: true,
         cpuReady: false,
@@ -262,58 +275,55 @@ describe('dashboard monitoring session table', () => {
     // a memory tile is misleading; the Botmux CPU trend still lives in the sparklines).
     expect(textContent(pressureCards[2].findByType('strong'))).toBe('128 MiB');
 
-    const botTable = root.findByProps({ className: 'resource-table resource-bot-table' });
-    const botRow = botTable.findAllByProps({ className: 'resource-row' })
+    const botList = root.findByProps({ className: 'overview-list resource-runtime-list' });
+    const botRow = botList.findAllByProps({ className: 'overview-list-item resource-list-item resource-bot-item' })
       .find(row => textContent(row).includes('CpuPendingBot'));
-    expect(textContent(botRow!.children[5] as ReactTestInstance)).toBe('-');
-    expect(textContent(botRow!.children[6] as ReactTestInstance)).toBe('256 MiB');
+    const botPills = resourcePills(botRow!);
+    expect(textContent(botPills[3])).toContain('-');
+    expect(textContent(botPills[4])).toContain('256 MiB');
 
-    const sessionTable = root.findByProps({ className: 'resource-table resource-session-table' });
-    const sessionRow = sessionTable.findAllByProps({ className: 'resource-row' })
+    const sessionList = root.findByProps({ className: 'overview-list resource-runtime-list resource-session-list' });
+    const sessionRow = sessionList.findAllByProps({ className: 'overview-list-item resource-list-item resource-session-item' })
       .find(row => textContent(row).includes('CPU Pending'));
-    expect(textContent(sessionRow!.children[2] as ReactTestInstance)).toBe('-');
-    expect(textContent(sessionRow!.children[3] as ReactTestInstance)).toBe('64 MiB');
+    const sessionPills = resourcePills(sessionRow!);
+    expect(textContent(sessionPills[0])).toContain('-');
+    expect(textContent(sessionPills[1])).toContain('64 MiB');
   });
 
-  it('keeps overview resource strip aligned with runtime CPU readiness', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/overview-page.tsx', import.meta.url), 'utf8');
+  it('keeps monitoring resource values aligned with runtime CPU readiness', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/monitoring-page.tsx', import.meta.url), 'utf8');
 
     expect(page).toContain('cpuReady?: boolean');
     expect(page).toContain("tr('monitoring.runtimeTitle')");
-    expect(page).not.toContain("tr('monitoring.title')</span>");
-    expect(page).toContain("resources?.cpuReady === false ? '-'");
-    expect(page).toContain('resource-strip-metric');
-    expect(page).toContain('combinedHealth');
-    expect(page).not.toContain('hottestResource');
+    expect(page).toContain('currentCpuReady(current)');
+    expect(page).toContain('formatCpuPct(current?.host?.cpuPct, cpuReady)');
+    expect(page).toContain('formatCpuPct(session.current?.cpu1mPct ?? session.current?.cpuPct, cpuReady)');
 
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-    expect(css).toContain('.resource-strip:hover');
-    expect(css).toContain('.resource-health-dot.danger');
+    expect(css).toContain('.resource-page :where(.metric-card, .resource-unavailable-card):hover');
+    expect(css).toContain('.resource-pill.accent');
   });
 
   it('limits the session body height with CSS instead of dropping rows', () => {
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
 
-    expect(css).toContain('.resource-session-scroll');
-    expect(css).toMatch(/max-height:\s*calc\(var\(--resource-session-row-height\)\s*\*\s*10\)/);
+    expect(css).toContain('.resource-session-list');
+    expect(css).toMatch(/\.resource-session-list\s*\{[^}]*max-height:\s*calc\(58px\s*\*\s*10\s*\+\s*20px\)/s);
     expect(css).toMatch(/overflow-y:\s*auto/);
   });
 
   it('preserves line breaks in the RSS help tooltip', () => {
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
 
-    expect(css).toMatch(/\.metric-card \.resource-help-popover\s*\{[^}]*white-space:\s*pre-line/s);
+    expect(css).toMatch(/\.ui-info-pop\s*\{[^}]*white-space:\s*pre-line/s);
   });
 
   it('layers resource metric help popovers above following panels', () => {
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
 
     expect(css).toMatch(/\.resource-page\s*\{[^}]*isolation:\s*isolate/s);
-    expect(css).toMatch(/\.resource-metrics\s*\{[^}]*position:\s*relative[^}]*z-index:\s*30/s);
-    expect(css).toMatch(/\.resource-page > \.panel\s*\{[^}]*position:\s*relative[^}]*z-index:\s*10/s);
-    expect(css).toMatch(/\.resource-page > \.resource-pressure\s*\{[^}]*z-index:\s*30[^}]*overflow:\s*visible/s);
-    expect(css).toMatch(/\.metric-card \.resource-help-popover\s*\{[^}]*z-index:\s*40/s);
-    expect(css).toMatch(/\.resource-help-tip:hover \.resource-help-popover,\s*\.resource-help-tip:focus-within \.resource-help-popover\s*\{[^}]*pointer-events:\s*auto/s);
+    expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*position:\s*fixed[^}]*z-index:\s*2147483647/s);
+    expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*pointer-events:\s*none/s);
   });
 
   it('uses a compact unsupported resource sampling empty state', () => {

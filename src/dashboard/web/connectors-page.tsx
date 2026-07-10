@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { DropdownMenu, FieldTitle, LoadingState, SectionHeader, dropdownLabel } from './dashboard-components.js';
+import { CreateActionButton, DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { jget, jsend } from './dashboard-api.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
@@ -118,6 +118,7 @@ function ConnectorsPage() {
   const tr = useT();
   const mountedRef = useRef(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const createDialogRef = useRef<HTMLDialogElement | null>(null);
   const [bots, setBots] = useState<BotOpt[]>([]);
   const [groups, setGroups] = useState<GroupOpt[]>([]);
   const [connectors, setConnectors] = useState<Connector[]>([]);
@@ -126,6 +127,7 @@ function ConnectorsPage() {
   const [createMsg, setCreateMsg] = useState<{ text: string; error?: boolean } | null>(null);
   const [created, setCreated] = useState<CreatedConnector | null>(null);
   const [creating, setCreating] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editInstruction, setEditInstruction] = useState('');
   const [editMsg, setEditMsg] = useState<{ id: string; text: string; error?: boolean } | null>(null);
@@ -223,6 +225,23 @@ function ConnectorsPage() {
     }));
   }, [groupsForBot]);
 
+  useEffect(() => {
+    const dialog = createDialogRef.current;
+    if (!dialog) return;
+    if (createOpen) {
+      if (!dialog.open) {
+        try { dialog.showModal(); } catch { /* dialog already opening */ }
+      }
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [createOpen]);
+
+  useEffect(() => () => {
+    const dialog = createDialogRef.current;
+    if (dialog?.open) dialog.close();
+  }, []);
+
   function modeLabel(m: string): string {
     return m === 'fixed'
       ? tr('connectors.modeLabelFixed')
@@ -237,6 +256,19 @@ function ConnectorsPage() {
 
   function patchForm(patch: Partial<CreateForm>): void {
     setForm(cur => ({ ...cur, ...patch }));
+  }
+
+  function openCreateModal(): void {
+    setCreateMsg(null);
+    setCreated(null);
+    setCreateOpen(true);
+  }
+
+  function closeCreateModal(): void {
+    if (creating) return;
+    setCreateOpen(false);
+    setCreateMsg(null);
+    setCreated(null);
   }
 
   function toggleAllowChat(chatId: string): void {
@@ -385,12 +417,43 @@ function ConnectorsPage() {
           <p className="eyebrow">{tr('nav.connectors')}</p>
           <h1>{tr('nav.connectors')}</h1>
         </div>
+        <div className="page-heading-actions">
+          <CreateActionButton className="page-primary-action connector-create-trigger" onClick={openCreateModal}>
+            {tr('connectors.createTitle')}
+          </CreateActionButton>
+        </div>
       </div>
 
-      <section className="overview-block connector-section">
-        <SectionHeader title={tr('connectors.createTitle')} />
-        <div className="card connector-create-card">
-        <div className="cn-form">
+      <dialog
+        ref={createDialogRef}
+        className="connector-create-modal"
+        onCancel={event => {
+          event.preventDefault();
+          closeCreateModal();
+        }}
+        onClose={closeCreateModal}
+        onClick={event => {
+          if (event.target === event.currentTarget) closeCreateModal();
+        }}
+      >
+        <article className="connector-modal-card">
+          <header className="connector-modal-header">
+            <h3>{tr('connectors.createTitle')}</h3>
+            <button
+              type="button"
+              className="connector-modal-close"
+              aria-label={tr('connectors.close')}
+              title={tr('connectors.close')}
+              disabled={creating}
+              onClick={closeCreateModal}
+            >
+              <span aria-hidden="true">&times;</span>
+            </button>
+          </header>
+          <div className="connector-modal-body">
+          {created ? <CreatedPanel created={created} groupName={groupName} /> : (
+            <>
+            <div className="cn-form">
           <label className="cn-field" htmlFor="cn-name">
             <FieldTitle>{tr('connectors.fName')}</FieldTitle>
             <input id="cn-name" value={form.name} onChange={e => patchForm({ name: e.currentTarget.value })} placeholder={tr('connectors.fNamePh')} />
@@ -547,22 +610,29 @@ function ConnectorsPage() {
             <FieldTitle>{tr('connectors.fSecret')}</FieldTitle>
             <input id="cn-secret" value={form.secret} onChange={e => patchForm({ secret: e.currentTarget.value })} placeholder={tr('connectors.fSecretPh')} />
           </label>
-        </div>
-        <div className="connector-create-actions">
-          <button id="cn-create" type="button" className="page-primary-action" disabled={creating} onClick={() => void createConnector()}>{tr('connectors.btnCreate')}</button>
-          {createMsg ? <span className={createMsg.error ? 'err' : 'muted'} style={{ marginLeft: 10, fontSize: 13 }}>{createMsg.text}</span> : null}
-        </div>
-          {created ? <CreatedPanel created={created} groupName={groupName} /> : null}
-        </div>
-      </section>
+            </div>
+            {createMsg ? <p className={`connector-create-message${createMsg.error ? ' err' : ''}`}>{createMsg.text}</p> : null}
+            </>
+          )}
+          </div>
+          <footer className="connector-modal-actions">
+            <button type="button" disabled={creating} onClick={closeCreateModal}>
+              {tr('connectors.cancel')}
+            </button>
+            {created ? (
+              <button type="button" className="primary" onClick={closeCreateModal}>{tr('connectors.close')}</button>
+            ) : (
+              <button id="cn-create" type="button" className="primary" disabled={creating} onClick={() => void createConnector()}>
+                {tr('connectors.btnCreate')}
+              </button>
+            )}
+          </footer>
+        </article>
+      </dialog>
 
-      <section className="overview-block connector-section">
-        <SectionHeader
-          title={tr('connectors.listTitle')}
-          count={connectors.length ? tr('connectors.count', { count: connectors.length }) : undefined}
-        />
+      <section className="overview-block connector-section connector-list-section">
         <div className="card connector-list-card">
-        {loading ? <LoadingState label={tr('connectors.loading')} compact /> : (
+        {loading ? <LoadingState className="connector-list-loading" label={tr('connectors.loading')} compact /> : (
           <ConnectorList
             connectors={connectors}
             bots={bots}
@@ -648,7 +718,7 @@ function ConnectorList(props: {
   onDelete(connector: Connector): void;
 }) {
   const tr = useT();
-  if (!props.connectors.length) return <p className="muted">{tr('connectors.empty')}</p>;
+  if (!props.connectors.length) return <p className="muted connector-list-empty">{tr('connectors.empty')}</p>;
 
   return (
     <>

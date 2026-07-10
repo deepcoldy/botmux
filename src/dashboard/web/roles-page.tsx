@@ -7,7 +7,7 @@ import {
   type Dispatch,
   type SetStateAction,
 } from 'react';
-import { DropdownMenu, Html, LoadingState } from './dashboard-components.js';
+import { DropdownMenu, Html, LoadingState, RefreshIconButton } from './dashboard-components.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import {
@@ -490,7 +490,7 @@ function RolesPage(props: { tab: RolesTab }) {
         <div className="roles-tree-panel">
           <div className="roles-tree-header dashboard-toolbar">
             <input type="search" id="roles-search" placeholder={tr('roles.search')} value={groupsFilter} onChange={ev => setGroupsFilter(ev.target.value)} />
-            <button type="button" id="roles-refresh" onClick={() => void handleGroupRefresh()}>{tr('roles.refresh')}</button>
+            <RefreshIconButton id="roles-refresh" label={tr('roles.refresh')} onClick={() => void handleGroupRefresh()} />
           </div>
           <div id="roles-tree" className="roles-tree">
             {loadingTree ? <LoadingState label={tr('common.loading')} /> : (
@@ -597,7 +597,7 @@ function RolesPage(props: { tab: RolesTab }) {
           </div>
           <div className="roles-tree-header dashboard-toolbar">
             <input type="search" id="roles-profile-search" placeholder={tr('roles.profileSearch')} value={profileFilter} onChange={ev => setProfileFilter(ev.target.value)} />
-            <button type="button" id="roles-profile-refresh" onClick={() => void handleProfileRefresh()}>{tr('roles.refresh')}</button>
+            <RefreshIconButton id="roles-profile-refresh" label={tr('roles.refresh')} onClick={() => void handleProfileRefresh()} />
           </div>
           <div id="roles-profile-list" className="roles-tree">
             {profileListLoading ? <LoadingState label={tr('common.loading')} /> : (

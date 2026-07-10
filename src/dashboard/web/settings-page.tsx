@@ -21,6 +21,9 @@ interface DashboardSettings {
       vcMeetingAgentEnabled?: boolean;
       hasLarkCliProfile?: boolean;
     }>;
+    larkCliVersion?: string | null;
+    larkCliMeetsRequirement?: boolean;
+    larkCliMinVersion?: string;
   };
   repoPickerMode: 'all' | 'repos';
   maintenance: MaintenanceCfg;
@@ -61,6 +64,9 @@ function parseSettings(s: any): DashboardSettings {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: typeof s?.vcMeetingAgent?.listenerBotAppId === 'string' ? s.vcMeetingAgent.listenerBotAppId : null,
       listenerBotOptions: Array.isArray(s?.vcMeetingAgent?.listenerBotOptions) ? s.vcMeetingAgent.listenerBotOptions : [],
+      larkCliVersion: s?.vcMeetingAgent?.larkCliVersion === undefined ? undefined : (s.vcMeetingAgent.larkCliVersion ?? null),
+      larkCliMeetsRequirement: s?.vcMeetingAgent?.larkCliMeetsRequirement === true,
+      larkCliMinVersion: typeof s?.vcMeetingAgent?.larkCliMinVersion === 'string' ? s.vcMeetingAgent.larkCliMinVersion : undefined,
     },
     repoPickerMode: s?.repoPickerMode === 'repos' ? 'repos' : 'all',
     maintenance: (s?.maintenance && typeof s.maintenance === 'object') ? s.maintenance : {},
@@ -100,6 +106,7 @@ function SettingsPage() {
   const [bound, setBound] = useState(false);
   const [savingKey, setSavingKey] = useState<string | null>(null);
   const [settingsMsg, setSettingsMsg] = useState<StatusMessage>(null);
+  const [feishuLoginQr, setFeishuLoginQr] = useState<string | null>(null);
 
   const [upStatus, setUpStatus] = useState<UpdateStatus | null>(null);
   const [upStatusError, setUpStatusError] = useState<string | null>(null);
@@ -203,7 +210,11 @@ function SettingsPage() {
       });
       const body = await r.json().catch(() => ({}));
       if (!mountedRef.current) return;
-      if (!r.ok || body.ok === false) throw new Error(body?.error ?? `HTTP ${r.status}`);
+      if (!r.ok || body.ok === false) {
+        if (typeof body?.feishuLoginQr === 'string' && body.feishuLoginQr) setFeishuLoginQr(body.feishuLoginQr);
+        throw new Error(body?.error ?? `HTTP ${r.status}`);
+      }
+      setFeishuLoginQr(null);
       const saved = parseSettings(body.settings);
       setSettings(saved);
       store.setScheduleTimeZone(saved.effectiveScheduleTimeZone);
@@ -365,6 +376,8 @@ function SettingsPage() {
       savingKey={savingKey}
       message={settingsMsg}
       updateBlock={updateBlock}
+      feishuLoginQr={feishuLoginQr}
+      onCloseFeishuLoginQr={() => setFeishuLoginQr(null)}
       onSave={saveSettings}
     />
   ) : loadError ? (
@@ -393,6 +406,8 @@ function SettingsBody(props: {
   savingKey: string | null;
   message: StatusMessage;
   updateBlock: ReactNode;
+  feishuLoginQr: string | null;
+  onCloseFeishuLoginQr(): void;
   onSave(key: string, payload: unknown, optimistic: (settings: DashboardSettings) => DashboardSettings): Promise<void>;
 }) {
   const tr = useT();
@@ -542,6 +557,20 @@ function SettingsBody(props: {
               }}
             />
           </div>
+          <LarkCliStatus settings={settings.vcMeetingAgent} />
+          {props.feishuLoginQr ? (
+            <div className="settings-feishu-login">
+              <button
+                type="button"
+                className="settings-feishu-login-close"
+                aria-label={tr('settings.feishuLoginClose')}
+                title={tr('settings.feishuLoginClose')}
+                onClick={props.onCloseFeishuLoginQr}
+              />
+              <p>{tr('settings.feishuLoginRequired')}</p>
+              <img src={props.feishuLoginQr} alt={tr('settings.feishuLoginQrAlt')} />
+            </div>
+          ) : null}
         </SettingsBlock>
       </SettingsGroup>
       <SettingsGroup className="settings-group-ops">
@@ -604,6 +633,25 @@ function SettingsBody(props: {
       <div className="settings-status-row">
         <span className={`oncall-status ${props.message?.cls ?? ''}`} data-settings-status>{props.message?.text ?? ''}</span>
       </div>
+    </div>
+  );
+}
+
+function LarkCliStatus(props: { settings: DashboardSettings['vcMeetingAgent'] }) {
+  const tr = useT();
+  const version = props.settings.larkCliVersion;
+  const ready = typeof version === 'string' && props.settings.larkCliMeetsRequirement === true;
+  const text = ready
+    ? tr('settings.larkCliReady', { version })
+    : typeof version === 'string'
+      ? tr('settings.larkCliOutdated', { version, minimum: props.settings.larkCliMinVersion ?? '-' })
+      : tr('settings.larkCliMissing');
+
+  return (
+    <div className={`settings-lark-cli-status ${ready ? 'is-ready' : 'is-warning'}`}>
+      <span aria-hidden="true" />
+      <strong>{text}</strong>
+      {ready ? null : <code>npm i -g @larksuite/cli@latest</code>}
     </div>
   );
 }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { DropdownMenu, FieldTitle, Html, LoadingState, SectionHeader, dropdownLabel } from './dashboard-components.js';
+import { DropdownMenu, FieldTitle, Html, LoadingState, RefreshIconButton, SectionHeader, dropdownLabel } from './dashboard-components.js';
 import { botAvatarHtml } from './ui.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
@@ -327,7 +327,6 @@ function SkillsPage() {
   const mountedRef = useRef(true);
   const timersRef = useRef<Set<number>>(new Set());
   const discoveryDialogRef = useRef<HTMLDialogElement | null>(null);
-  const botGridRef = useRef<HTMLDivElement | null>(null);
 
   const [skills, setSkills] = useState<SkillRow[]>([]);
   const [nativeSkillGroups, setNativeSkillGroups] = useState<NativeSkillGroup[]>([]);
@@ -655,15 +654,6 @@ function SkillsPage() {
     }
   }
 
-  function scrollBots(dir: -1 | 1): void {
-    const grid = botGridRef.current;
-    const card = grid?.querySelector<HTMLElement>('.skills-bot-card');
-    if (!grid || !card) return;
-    const style = window.getComputedStyle(grid);
-    const gap = Number.parseFloat(style.columnGap || style.gap || '0') || 0;
-    grid.scrollBy({ left: dir * (card.getBoundingClientRect().width + gap), behavior: 'smooth' });
-  }
-
   async function updateSkill(name: string): Promise<void> {
     setSkillBusy(`${name}:update`);
     try {
@@ -744,7 +734,7 @@ function SkillsPage() {
         <span><small>{tr('skills.metricBots')}</small><strong>{configuredBotCount}/{bots.length}</strong></span>
         <span><small>{tr('skills.metricAttached')}</small><strong>{attachedSkillRefCount}</strong></span>
       </div>
-      <button type="button" id="skills-refresh" className="page-primary-action" disabled={loading} onClick={() => void refresh()}>{tr('skills.refresh')}</button>
+      <RefreshIconButton id="skills-refresh" label={tr('skills.refresh')} busy={loading} disabled={loading} onClick={() => void refresh()} />
     </div>
   );
 
@@ -821,16 +811,9 @@ function SkillsPage() {
             </section>
 
             <section className="skills-config-block">
-              <SectionHeader title={tr('skills.bots')} count={tr('skills.botCount', { count: bots.length })} hint={tr('skills.botsHelp')}>
-                {bots.length > 3 ? (
-                  <div className="skills-bot-rail-actions">
-                    <button type="button" className="skills-rail-button" data-action="scroll-bots" data-dir="-1" aria-label={tr('skills.scrollBotsPrev')} title={tr('skills.scrollBotsPrev')} onClick={() => scrollBots(-1)}>&lsaquo;</button>
-                    <button type="button" className="skills-rail-button" data-action="scroll-bots" data-dir="1" aria-label={tr('skills.scrollBotsNext')} title={tr('skills.scrollBotsNext')} onClick={() => scrollBots(1)}>&rsaquo;</button>
-                  </div>
-                ) : null}
-              </SectionHeader>
+              <SectionHeader title={tr('skills.bots')} count={tr('skills.botCount', { count: bots.length })} hint={tr('skills.botsHelp')} />
               <section className="bd-card skills-bots-panel skills-config-card">
-                <div className="skills-bot-grid" ref={botGridRef}>
+                <div className="skills-bot-grid">
                   {bots.map(bot => (
                     <BotPolicyCard
                       key={bot.larkAppId}

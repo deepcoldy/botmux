@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type HTMLAttributes, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ButtonHTMLAttributes,
+  type CSSProperties,
+  type HTMLAttributes,
+  type ReactNode,
+} from 'react';
 import { createPortal } from 'react-dom';
 
 export type DropdownOption<T extends string> = {
@@ -63,10 +72,62 @@ export function HeaderControls(props: { children: ReactNode }): JSX.Element {
   return <div className="sect-head-controls">{props.children}</div>;
 }
 
+type ActionButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
+  children: ReactNode;
+};
+
+function ActionGlyph(props: { kind: 'plus' | 'refresh' }): JSX.Element {
+  if (props.kind === 'plus') {
+    return (
+      <svg className="ui-action-icon" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M8 3.25v9.5M3.25 8h9.5" />
+      </svg>
+    );
+  }
+  return (
+    <svg className="ui-action-icon" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M13.1 6.55A5.35 5.35 0 1 0 13 10.1" />
+      <path d="M13.15 2.95v3.7H9.45" />
+    </svg>
+  );
+}
+
+export function CreateActionButton(props: ActionButtonProps): JSX.Element {
+  const { children, className, type = 'button', ...buttonProps } = props;
+  return (
+    <button {...buttonProps} type={type} className={['ui-create-action', className].filter(Boolean).join(' ')}>
+      <ActionGlyph kind="plus" />
+      <span className="ui-create-action-label">{children}</span>
+    </button>
+  );
+}
+
+export function RefreshIconButton(props: Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'children'> & {
+  label: string;
+  busy?: boolean;
+}): JSX.Element {
+  const { label, busy = false, className, type = 'button', ...buttonProps } = props;
+  return (
+    <button
+      {...buttonProps}
+      type={type}
+      className={['ui-refresh-button', busy ? 'is-loading' : '', className].filter(Boolean).join(' ')}
+      title={label}
+      aria-label={label}
+      aria-busy={busy || undefined}
+    >
+      <ActionGlyph kind="refresh" />
+    </button>
+  );
+}
+
 export function InfoTip(props: {
   children: ReactNode;
   label?: string;
   className?: string;
+  trigger?: ReactNode;
+  preventClick?: boolean;
+  focusable?: boolean;
 }): JSX.Element {
   const tipRef = useRef<HTMLSpanElement | null>(null);
   const [open, setOpen] = useState(false);
@@ -126,15 +187,15 @@ export function InfoTip(props: {
     <span
       ref={tipRef}
       className={['ui-info-tip', props.className].filter(Boolean).join(' ')}
-      tabIndex={0}
+      tabIndex={props.focusable === false ? undefined : 0}
       aria-label={props.label}
-      onClick={event => event.preventDefault()}
+      onClick={props.preventClick === false ? undefined : event => event.preventDefault()}
       onMouseEnter={show}
       onMouseLeave={hide}
       onFocus={show}
       onBlur={hide}
     >
-      <span className="ui-info-mark" aria-hidden="true">?</span>
+      {props.trigger ?? <span className="ui-info-mark" aria-hidden="true">?</span>}
       {popover}
     </span>
   );

@@ -269,11 +269,14 @@ function DagGraph(props: {
   onSelect: (nodeId: string) => void;
 }): JSX.Element {
   const layout = useMemo(() => props.view ? buildGraphLayout(props.view) : null, [props.view]);
+  const topologyKey = layout
+    ? `${layout.width}:${layout.height}:${layout.nodes.map(box => box.node.id).join('\u0000')}`
+    : '';
   const graphRef = useRef<HTMLDivElement | null>(null);
 
   useLayoutEffect(() => {
     const graph = graphRef.current;
-    if (!graph || !layout) return undefined;
+    if (!graph || !topologyKey) return undefined;
 
     let frame = 0;
     const centerGraph = () => {
@@ -296,7 +299,7 @@ function DagGraph(props: {
       if (frame) window.cancelAnimationFrame(frame);
       observer?.disconnect();
     };
-  }, [layout]);
+  }, [topologyKey]);
 
   return (
     <div id="v3-graph" className="v3r-graph" ref={graphRef}>

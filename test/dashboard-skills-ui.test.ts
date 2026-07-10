@@ -87,13 +87,16 @@ describe('dashboard skills install panel', () => {
   it('keeps advanced install fields visible beside the install action', () => {
     const renderer = renderInstallPanel();
     const root = renderer.root;
-    const actionRow = root.findByProps({ className: 'skills-install-action-row' });
+    const installGrid = root.findByProps({ className: 'skills-install-grid' });
+    const path = installGrid.findByProps({ 'data-install': 'path' });
+    const ref = installGrid.findByProps({ 'data-install': 'ref' });
+    const install = installGrid.findByProps({ 'data-action': 'install' });
 
-    expect(actionRow.findAllByProps({ 'data-skills-advanced': true })).toHaveLength(1);
-    expect(actionRow.findAllByProps({ className: 'skills-advanced-marker' })).toHaveLength(0);
-    expect(actionRow.findAllByProps({ 'data-install': 'path' })).toHaveLength(1);
-    expect(actionRow.findAllByProps({ 'data-install': 'ref' })).toHaveLength(1);
-    expect(actionRow.findAllByProps({ 'data-action': 'install' })).toHaveLength(1);
+    expect(installGrid.findAllByProps({ 'data-skills-advanced': true })).toHaveLength(0);
+    expect(installGrid.findAllByProps({ className: 'skills-advanced-marker' })).toHaveLength(0);
+    expect(path.parent?.parent).toBe(installGrid);
+    expect(ref.parent?.parent).toBe(installGrid);
+    expect(install.parent?.parent).toBe(installGrid);
   });
 
   it('keeps multi-skill install selection inside the install confirmation dialog', () => {

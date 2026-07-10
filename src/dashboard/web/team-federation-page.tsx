@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { DropdownMenu, SectionHeader, dropdownLabel } from './dashboard-components.js';
+import { CreateActionButton, DropdownMenu, SectionHeader, dropdownLabel } from './dashboard-components.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import {
@@ -283,7 +283,7 @@ function TeamHomePage() {
         <SectionHeader title={tr('team.localDeployTitle')} hint={tr('team.bindHint')} />
         <div className="card team-card team-identity-card">
           <p className="team-identity-row">
-            {tr('team.myIdentity')}<b id="tf-owner">{ownerLabel}</b>
+            <span className="team-identity-label">{tr('team.myIdentity')}</span><b id="tf-owner">{ownerLabel}</b>
             <button type="button" id="tf-autobind" className="page-primary-action" onClick={() => void handleAutoBind()}>{tr('team.bindBtn')}</button>
             <span id="tf-bind-out" className="team-bind-status" hidden={bindState.kind === 'hidden'}>
               <BindOutput state={bindState} tr={tr} onPick={unionId => void handleAutoBind(unionId)} />
@@ -765,7 +765,7 @@ function TeamManagePage() {
         </div>
         <form className="team-inline-form dashboard-toolbar" onSubmit={event => { event.preventDefault(); void handleCreateTeam(); }}>
           <input id="tm-newname" type="text" placeholder={tr('team.newTeamPh')} value={newName} onChange={ev => setNewName(ev.target.value)} />
-          <button type="button" id="tm-create" className="page-primary-action" onClick={() => void handleCreateTeam()}>{tr('team.createTeamBtn')}</button>
+          <CreateActionButton id="tm-create" className="page-primary-action" onClick={() => void handleCreateTeam()}>{tr('team.createTeamBtn')}</CreateActionButton>
           <span className="toolbar-status tm-cout"><ManageInlineStatus status={createStatus} tr={tr} /></span>
         </form>
         <div id="tm-list">

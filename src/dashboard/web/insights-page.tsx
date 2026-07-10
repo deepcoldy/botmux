@@ -14,7 +14,7 @@ import type {
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { botDisplayName, loadNameMaps, relTime, t } from './ui.js';
-import { DropdownMenu, LoadingState } from './dashboard-components.js';
+import { DropdownMenu, LoadingState, RefreshIconButton } from './dashboard-components.js';
 import {
   BAD_RESULTS,
   CONVO_ROLES,
@@ -1974,6 +1974,23 @@ function InsightsPage() {
             <div id="insight-status" className="insight-page-status">{statusText}</div>
           </div>
         </div>
+        <div className="page-heading-actions insight-heading-actions">
+          <button
+            type="button"
+            id="insight-palette-open"
+            className="insight-palette-trigger"
+            onClick={event => {
+              setPalette({
+                open: true,
+                q: '',
+                idx: 0,
+                anchor: paletteAnchorFromButton(event.currentTarget),
+              });
+            }}
+          >
+            {tr('insights.paletteOpen')}
+          </button>
+        </div>
       </div>
       <form id="insight-filters" className="filters dashboard-toolbar insights-filters" onSubmit={event => event.preventDefault()}>
         <input type="search" name="q" placeholder={tr('insights.search')} value={q} onChange={event => setQ(event.currentTarget.value)} />
@@ -2020,22 +2037,7 @@ function InsightsPage() {
         </label>
         <button type="button" id="insight-clear" className="ins-clear" onClick={clearFilters}>{tr('insights.clear')}</button>
         <div className="insight-head-acts">
-          <button
-            type="button"
-            id="insight-palette-open"
-            className="ins-clear"
-            onClick={event => {
-              setPalette({
-                open: true,
-                q: '',
-                idx: 0,
-                anchor: paletteAnchorFromButton(event.currentTarget),
-              });
-            }}
-          >
-            {tr('insights.paletteOpen')}
-          </button>
-          <button type="button" id="insight-refresh" className="primary" disabled={refreshing} onClick={() => void refresh()}>{tr('insights.refresh')}</button>
+          <RefreshIconButton id="insight-refresh" label={tr('insights.refresh')} busy={refreshing} disabled={refreshing} onClick={() => void refresh()} />
         </div>
       </form>
       <div className="insight-panel" role="tabpanel" data-tabpanel="overview" hidden={tab !== 'overview'}>

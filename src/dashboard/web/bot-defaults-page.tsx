@@ -11,11 +11,21 @@ import {
   modelSuggestionsForOption,
   selectedCliOption,
   type BotDefaultsRow,
+  type BotSubstituteMode,
+  type BotSubstituteTarget,
   type CliOptionsState,
 } from './bot-defaults.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
-import { DropdownMenu, Html, InfoTip as BaseInfoTip, LoadingState, dropdownLabel } from './dashboard-components.js';
+import {
+  CreateActionButton,
+  DropdownMenu,
+  Html,
+  InfoTip as BaseInfoTip,
+  LoadingState,
+  RefreshIconButton,
+  dropdownLabel,
+} from './dashboard-components.js';
 import { botAvatarHtml, loadNameMaps, ui } from './ui.js';
 
 type StatusMessage = { text: string; ok?: boolean } | null;
@@ -153,6 +163,30 @@ function nonNegativeInteger(raw: string, fallback: number): number | null {
   if (value === '') return fallback;
   if (!/^(0|[1-9]\d*)$/.test(value)) return null;
   return Number(value);
+}
+
+type SubstituteTargetIdField = 'email' | 'openId' | 'userId' | 'unionId';
+
+type SubstituteTargetResolution = {
+  input?: string;
+  ok?: boolean;
+  openId?: string;
+  name?: string;
+};
+
+type SubstituteTargetDraft = {
+  key: number;
+  idField: SubstituteTargetIdField;
+  idValue: string;
+  name: string;
+  persisted: BotSubstituteTarget;
+  originalIdField?: SubstituteTargetIdField;
+};
+
+const substituteTargetIdFields: SubstituteTargetIdField[] = ['email', 'openId', 'userId', 'unionId'];
+
+function substituteTargetIdField(target?: BotSubstituteTarget): SubstituteTargetIdField {
+  return substituteTargetIdFields.find(field => target?.[field]?.trim()) ?? 'email';
 }
 
 function brandStateLabel(brand: string | null, tr: ReturnType<typeof useT>): string {
@@ -297,10 +331,9 @@ function BotDefaultsPage() {
           <h1>{tr('botDefaults.title')}</h1>
         </div>
         <div className="page-heading-actions">
-          <button type="button" id="bd-refresh" disabled={refreshing} onClick={() => void reload()}>{tr('botDefaults.refresh')}</button>
+          <RefreshIconButton id="bd-refresh" label={tr('botDefaults.refresh')} busy={refreshing} disabled={refreshing} onClick={() => void reload()} />
           {ui.authed ? (
-            <button
-              type="button"
+            <CreateActionButton
               className="page-primary-action add-bot-btn"
               disabled={onboardingBusy}
               onClick={() => {
@@ -309,7 +342,7 @@ function BotDefaultsPage() {
               }}
             >
               {tr('botOnboarding.add')}
-            </button>
+            </CreateActionButton>
           ) : null}
         </div>
       </div>
@@ -431,10 +464,12 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
           <section className="bd-tile">
             <RuntimeEnvironmentSection bot={bot} patchBot={patchBot} />
           </section>
+          <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
         </div>
         <div className="bd-column">
           <section className="bd-tile">
             <SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
+            <SubstituteModeSection bot={bot} patchBot={patchBot} />
             <CrossBotSection bot={bot} putCardPref={putCardPref} />
             <SessionCapSection bot={bot} patchBot={patchBot} />
           </section>
@@ -443,7 +478,6 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
             <SummaryTriggerSection bot={bot} patchBot={patchBot} />
             <BrandSection bot={bot} patchBot={patchBot} />
           </section>
-          <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
           <section className="bd-tile"><RoleSection bot={bot} patchBot={patchBot} /></section>
         </div>
       </div>
@@ -1635,6 +1669,257 @@ function SessionModeSection(props: {
           />
         </label>
         <div className="actions"><StatusSpan status={docStatus} attr={{ 'data-doc-subscribe-mode-status': '' }} /></div>
+      </div>
+    </section>
+  );
+}
+
+function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const initial = props.bot.substituteMode ?? null;
+  const [enabled, setEnabled] = useState(initial?.enabled === true);
+  const [disclosure, setDisclosure] = useState<'prefix' | 'none'>(initial?.disclosure === 'none' ? 'none' : 'prefix');
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const targetSequence = useRef(0);
+  const skipModeSync = useRef(false);
+
+  function makeTargetDraft(target?: BotSubstituteTarget): SubstituteTargetDraft {
+    const idField = substituteTargetIdField(target);
+    return {
+      key: ++targetSequence.current,
+      idField,
+      idValue: target?.[idField] ?? '',
+      name: target?.name ?? '',
+      persisted: target ? { ...target } : {},
+      originalIdField: target ? idField : undefined,
+    };
+  }
+
+  const [targetRows, setTargetRows] = useState<SubstituteTargetDraft[]>(() => {
+    const targets = initial?.targets ?? [];
+    return targets.length ? targets.map(target => makeTargetDraft(target)) : [makeTargetDraft()];
+  });
+
+  useEffect(() => {
+    if (skipModeSync.current) {
+      skipModeSync.current = false;
+      return;
+    }
+    const next = props.bot.substituteMode ?? null;
+    setEnabled(next?.enabled === true);
+    setDisclosure(next?.disclosure === 'none' ? 'none' : 'prefix');
+    const targets = next?.targets ?? [];
+    setTargetRows(targets.length ? targets.map(target => makeTargetDraft(target)) : [makeTargetDraft()]);
+  }, [props.bot.larkAppId, props.bot.substituteMode]);
+
+  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; disclosure?: 'prefix' | 'none' }): Promise<void> {
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/substitute-mode`, body);
+      if (res.ok && res.body.ok) {
+        const next = res.body.substituteMode && typeof res.body.substituteMode === 'object'
+          ? res.body.substituteMode as BotSubstituteMode
+          : null;
+        const resolution: SubstituteTargetResolution[] = Array.isArray(res.body?.resolution)
+          ? res.body.resolution
+          : [];
+        const unresolved = resolution
+          .filter(entry => entry?.ok === false)
+          .map(entry => String(entry.input ?? '').trim())
+          .filter(Boolean);
+        setEnabled(next?.enabled === true);
+        setDisclosure(next?.disclosure === 'none' ? 'none' : 'prefix');
+        if (resolution.length) {
+          skipModeSync.current = true;
+          setTargetRows(rows => {
+            const pending = [...resolution];
+            return rows.map(row => {
+              const input = row.idValue.trim();
+              const index = pending.findIndex(entry => String(entry.input ?? '').trim() === input);
+              if (index < 0) return row;
+              const entry = pending.splice(index, 1)[0];
+              if (entry?.ok !== true) return row;
+              const persisted: BotSubstituteTarget = { ...row.persisted };
+              if (entry.openId) persisted.openId = entry.openId;
+              if (row.idField === 'email') persisted.email = input;
+              if (entry.name) persisted.name = entry.name;
+              return { ...row, name: entry.name ?? row.name, persisted };
+            });
+          });
+        } else {
+          const targets = next?.targets ?? [];
+          setTargetRows(targets.length ? targets.map(target => makeTargetDraft(target)) : [makeTargetDraft()]);
+        }
+        props.patchBot(props.bot.larkAppId, { substituteMode: next });
+        setStatus(unresolved.length
+          ? { text: `✗ ${tr('botDefaults.substituteTargetsInvalid')}: ${unresolved.join(', ')}` }
+          : { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        const unresolved = Array.isArray(res.body?.resolution)
+          ? res.body.resolution
+            .filter((entry: SubstituteTargetResolution) => entry?.ok === false)
+            .map((entry: SubstituteTargetResolution) => String(entry.input ?? '').trim())
+            .filter(Boolean)
+          : [];
+        setStatus({ text: unresolved.length
+          ? `✗ ${tr('botDefaults.substituteTargetsInvalid')}: ${unresolved.join(', ')}`
+          : `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function saveCurrent(): void {
+    const targets: BotSubstituteTarget[] = [];
+    let invalid = false;
+    for (const row of targetRows) {
+      const idValue = row.idValue.trim();
+      const name = row.name.trim();
+      if (!idValue) {
+        invalid ||= Boolean(name);
+        continue;
+      }
+
+      const target = { ...row.persisted };
+      if (row.originalIdField && row.originalIdField !== row.idField) delete target[row.originalIdField];
+      target[row.idField] = idValue;
+      if (name) target.name = name;
+      else delete target.name;
+      targets.push(target);
+    }
+
+    if (invalid || (enabled && targets.length === 0)) {
+      setStatus({ text: `✗ ${tr('botDefaults.substituteTargetsInvalid')}` });
+      return;
+    }
+    void save({ enabled, targets, disclosure });
+  }
+
+  const disclosureOptions: DropdownFieldOption<'prefix' | 'none'>[] = [
+    { value: 'prefix', label: tr('botDefaults.substituteDisclosurePrefix') },
+    { value: 'none', label: tr('botDefaults.substituteDisclosureNone') },
+  ];
+
+  return (
+    <section className="bd-section bd-substitute-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionSubstitute')}</h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-substitute-mode"
+        title={tr('botDefaults.substituteEnabled')}
+        help={tr('botDefaults.substituteHelp')}
+        onChange={setEnabled}
+      />
+      <div className="bd-row">
+        <label>
+          <FieldTitle>{tr('botDefaults.substituteDisclosure')}</FieldTitle>
+          <DropdownField<'prefix' | 'none'>
+            dataInput="substituteDisclosure"
+            ariaLabel={tr('botDefaults.substituteDisclosure')}
+            value={disclosure}
+            disabled={busy}
+            options={disclosureOptions}
+            onChange={value => setDisclosure(value)}
+          />
+        </label>
+      </div>
+      <div className="bd-row bd-substitute-targets">
+        <FieldTitle help={tr('botDefaults.substituteTargetsHelp')}>{tr('botDefaults.substituteTargets')}</FieldTitle>
+        <div className="bd-substitute-target-list" data-input="substituteTargets">
+          {targetRows.map((target, index) => (
+            <div className="bd-substitute-target-row" key={target.key}>
+              <DropdownField<SubstituteTargetIdField>
+                dataInput={`substituteTargetType-${target.key}`}
+                className="bd-substitute-target-type"
+                ariaLabel={`${tr('botDefaults.substituteTargetType')} ${index + 1}`}
+                value={target.idField}
+                disabled={busy}
+                options={substituteTargetIdFields.map(value => ({
+                  value,
+                  label: tr(`botDefaults.substituteTarget${value[0].toUpperCase()}${value.slice(1)}`),
+                }))}
+                onChange={idField => {
+                  setTargetRows(rows => rows.map(row => row.key === target.key
+                    ? { ...row, idField, idValue: row.persisted[idField] ?? '' }
+                    : row));
+                }}
+              />
+              <input
+                className="bd-substitute-target-id"
+                type="text"
+                data-input={`substituteTargetId-${target.key}`}
+                aria-label={`${tr('botDefaults.substituteTargetType')} ${index + 1}`}
+                placeholder={tr('botDefaults.substituteTargetIdPlaceholder')}
+                value={target.idValue}
+                disabled={busy}
+                onChange={event => {
+                  const idValue = event.currentTarget.value;
+                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, idValue } : row));
+                }}
+              />
+              <input
+                className="bd-substitute-target-name"
+                type="text"
+                data-input={`substituteTargetName-${target.key}`}
+                aria-label={`${tr('botDefaults.substituteTargetName')} ${index + 1}`}
+                placeholder={tr('botDefaults.substituteTargetNamePlaceholder')}
+                value={target.name}
+                disabled={busy}
+                onChange={event => {
+                  const name = event.currentTarget.value;
+                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, name } : row));
+                }}
+              />
+              <button
+                type="button"
+                className="bd-substitute-target-remove"
+                data-action="remove-substitute-target"
+                title={tr('botDefaults.substituteTargetRemove')}
+                aria-label={tr('botDefaults.substituteTargetRemove')}
+                disabled={busy}
+                onClick={() => {
+                  setTargetRows(rows => {
+                    const remaining = rows.filter(row => row.key !== target.key);
+                    return remaining.length ? remaining : [makeTargetDraft()];
+                  });
+                }}
+              >
+                <span aria-hidden="true">&times;</span>
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            className="bd-substitute-target-add"
+            data-action="add-substitute-target"
+            title={tr('botDefaults.substituteTargetAdd')}
+            aria-label={tr('botDefaults.substituteTargetAdd')}
+            disabled={busy}
+            onClick={() => setTargetRows(rows => [...rows, makeTargetDraft()])}
+          >
+            <span aria-hidden="true">+</span>
+          </button>
+        </div>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-substitute-mode" disabled={busy} onClick={saveCurrent}>
+          {tr('botDefaults.substituteSave')}
+        </button>
+        <button
+          type="button"
+          data-action="off-substitute-mode"
+          disabled={busy}
+          onClick={() => void save({ enabled: false, targets: [] })}
+        >
+          {tr('botDefaults.substituteOff')}
+        </button>
+        <StatusSpan status={status} attr={{ 'data-substitute-status': '' }} />
       </div>
     </section>
   );

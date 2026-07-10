@@ -59,7 +59,7 @@ import {
   type PickerBot,
 } from './sessions.js';
 import { addMonitorRoomSessionIds, monitorRoomUrl } from './monitor-room-store.js';
-import { DropdownMenu, LoadingState } from './dashboard-components.js';
+import { CreateActionButton, DropdownMenu, LoadingState } from './dashboard-components.js';
 import { store } from './store.js';
 import {
   attentionWaitSince,
@@ -640,7 +640,13 @@ function IdleCleanupBar(props: IdleCleanupBarProps): JSX.Element {
         disabled={props.busy}
         onClick={() => setOpen(value => !value)}
       >
-        {t('sessions.idleCleanupRun')}
+        <svg className="idle-cleanup-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3.5 6.5h17" />
+          <path d="M9 3.5h6" />
+          <path d="m6.5 6.5.9 13h9.2l.9-13" />
+          <path d="M10 10.5v5M14 10.5v5" />
+        </svg>
+        <span>{t('sessions.idleCleanupRun')}</span>
       </button>
       {open && typeof document !== 'undefined' ? createPortal((
         <div
@@ -2428,31 +2434,35 @@ function SessionsPage(): JSX.Element {
   return (
     <section className="page sessions-page">
       <div className="page-heading">
-        <div>
+        <div className="sessions-heading-main">
           <p className="eyebrow">{t('nav.sessions')}</p>
           <h1>{t('sessions.title')}</h1>
-        </div>
-        <div className="page-heading-actions sessions-page-actions">
           <div className="sessions-view-controls">
-            <span id="kanban-team-stats" className="kanban-team-stats" hidden={!(viewMode === 'kanban' && kanbanGroupBy === 'team' && kanbanTeamsLoaded)}>
-              {teamScopeText}
-            </span>
-            <DropdownMenu
-              id="kanban-team"
-              className="kanban-team-menu"
-              ariaLabel={t('sessions.kanban.groupTeam')}
-              hidden={!(viewMode === 'kanban' && kanbanGroupBy === 'team')}
-              disabled={kanbanTeamDisabled}
-              label={kanbanTeamLabel}
-              value={kanbanTeamValue}
-              options={kanbanTeamOptions}
-              onChange={next => {
-                if (!kanbanTeams.some(team => team.key === next)) return;
-                setKanbanTeamKey(next);
-                try { window.localStorage.setItem(KANBAN_TEAM_STORAGE_KEY, next); } catch { /* current page only */ }
-              }}
-            />
-            <div className="segmented kanban-groupby" id="kanban-groupby" role="group" aria-label={t('sessions.kanban.groupBy')} hidden={viewMode !== 'kanban'}>
+            <div className="segmented sessions-view-toggle" role="group" aria-label={t('sessions.viewMode')}>
+              {([
+                ['kanban', t('sessions.viewKanban')],
+                ['board', t('sessions.viewBoard')],
+                ['table', t('sessions.viewTable')],
+              ] as const).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  data-view={value}
+                  className={viewMode === value ? 'active' : undefined}
+                  aria-pressed={viewMode === value}
+                  onClick={() => setView(value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div
+              className={`segmented kanban-groupby${viewMode === 'kanban' ? ' is-visible' : ' is-collapsed'}`}
+              id="kanban-groupby"
+              role="group"
+              aria-label={t('sessions.kanban.groupBy')}
+              aria-hidden={viewMode !== 'kanban'}
+            >
               {([
                 ['flow', t('sessions.kanban.groupFlow')],
                 ['team', t('sessions.kanban.groupTeam')],
@@ -2473,37 +2483,38 @@ function SessionsPage(): JSX.Element {
                 </button>
               ))}
             </div>
-            <div className="segmented sessions-view-toggle" role="group" aria-label={t('sessions.viewMode')}>
-              {([
-                ['kanban', t('sessions.viewKanban')],
-                ['board', t('sessions.viewBoard')],
-                ['table', t('sessions.viewTable')],
-              ] as const).map(([value, label]) => (
-                <button
-                  key={value}
-                  type="button"
-                  data-view={value}
-                  className={viewMode === value ? 'active' : undefined}
-                  aria-pressed={viewMode === value}
-                  onClick={() => setView(value)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
+            <span id="kanban-team-stats" className="kanban-team-stats" hidden={!(viewMode === 'kanban' && kanbanGroupBy === 'team' && kanbanTeamsLoaded)}>
+              {teamScopeText}
+            </span>
+            <DropdownMenu
+              id="kanban-team"
+              className="kanban-team-menu"
+              ariaLabel={t('sessions.kanban.groupTeam')}
+              hidden={!(viewMode === 'kanban' && kanbanGroupBy === 'team')}
+              disabled={kanbanTeamDisabled}
+              label={kanbanTeamLabel}
+              value={kanbanTeamValue}
+              options={kanbanTeamOptions}
+              onChange={next => {
+                if (!kanbanTeams.some(team => team.key === next)) return;
+                setKanbanTeamKey(next);
+                try { window.localStorage.setItem(KANBAN_TEAM_STORAGE_KEY, next); } catch { /* current page only */ }
+              }}
+            />
           </div>
+        </div>
+        <div className="page-heading-actions sessions-page-actions">
           <button type="button" id="monitor-room-open" className="monitor-room-open" onClick={() => { window.location.href = monitorRoomUrl(); }}>
             {t('sessions.monitorRoom')}
           </button>
           {ui.authed ? (
-            <button
-              type="button"
+            <CreateActionButton
               className="page-primary-action create-session-btn"
               disabled={createLoading}
               onClick={() => void openCreateSession()}
             >
               {t('sessions.create.button')}
-            </button>
+            </CreateActionButton>
           ) : null}
         </div>
       </div>

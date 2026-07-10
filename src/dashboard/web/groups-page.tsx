@@ -12,12 +12,14 @@ import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
 import {
+  CreateActionButton,
   DropdownMenu,
   LoadingState,
   OverviewList,
   OverviewListItem,
   OverviewListMain,
   OverviewListTail,
+  RefreshIconButton,
 } from './dashboard-components.js';
 import {
   hasExplicitChatRole,
@@ -270,7 +272,7 @@ function GroupListRow(props: {
       <div className="groups-row-lower">
         <GroupBotCoverage chat={chat} bots={props.bots} tr={tr} />
         <OverviewListTail>
-          <button className="add-bots" type="button" onClick={() => props.onAddBots(chat)}>{tr('groups.addBots')}</button>
+          <CreateActionButton className="add-bots" onClick={() => props.onAddBots(chat)}>{tr('groups.addBots')}</CreateActionButton>
           <button
             className="save-profile"
             type="button"
@@ -1313,7 +1315,7 @@ function GroupsPage() {
           <h1>{tr('groups.title')}</h1>
         </div>
         <div className="page-heading-actions">
-          <button type="button" id="g-create" className="page-primary-action" onClick={() => void openCreateDialog()}>{tr('groups.create')}</button>
+          <CreateActionButton id="g-create" className="page-primary-action" onClick={() => void openCreateDialog()}>{tr('groups.create')}</CreateActionButton>
         </div>
       </div>
       <form id="g-filters" className="filters dashboard-toolbar groups-toolbar" onSubmit={ev => ev.preventDefault()}>
@@ -1344,7 +1346,7 @@ function GroupsPage() {
         <span className="groups-toolbar-count">
           {tr('groups.matrixTitle')} {loading ? '-/-' : `${rows.length}/${snapshot.chats.length}`}
         </span>
-        <button type="button" id="g-refresh" disabled={refreshing} onClick={() => void refresh()}>{tr('groups.refresh')}</button>
+        <RefreshIconButton id="g-refresh" label={tr('groups.refresh')} busy={refreshing} disabled={refreshing} onClick={() => void refresh()} />
       </form>
       {loadError ? <p className="hint-warn">加载群组失败：{loadError}</p> : null}
       <section className="overview-block groups-matrix-section">
