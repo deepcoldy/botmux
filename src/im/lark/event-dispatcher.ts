@@ -1015,7 +1015,9 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
       for (const paragraph of inner.content) {
         if (!Array.isArray(paragraph)) continue;
         for (const node of paragraph) {
-          if (node.tag === 'at' && node.user_id === botOpenId) return true;
+          // Bot-sent post messages may encode a bot target as app_id (`cli_`)
+          // even though the field is named user_id. Accept both identities.
+          if (node.tag === 'at' && (node.user_id === botOpenId || node.user_id === larkAppId)) return true;
         }
       }
     }
@@ -1047,7 +1049,7 @@ export function mentionsAnotherMember(larkAppId: string, message: any): boolean 
       if (oid === 'all') continue;     // @all → everyone incl. me
       return true;                     // a specific other member
     }
-    const appId = mentionAppId(m);
+    const appId = mentionAppId(m, larkAppId);
     if (appId) {
       if (appId === larkAppId) continue; // that's me, addressed by app_id
       if (appId === 'all') continue;
@@ -1065,7 +1067,7 @@ export function mentionsAnotherMember(larkAppId: string, message: any): boolean 
         for (const node of paragraph) {
           if (node.tag !== 'at') continue;
           const uid: string | undefined = node.user_id;
-          if (!uid || uid === botOpenId || uid === 'all') continue;
+          if (!uid || uid === botOpenId || uid === larkAppId || uid === 'all') continue;
           return true;
         }
       }
@@ -1129,7 +1131,7 @@ function mentionMatchesBot(m: any, larkAppId: string, botOpenId?: string): boole
   //   { id_type: "app_id", id: "cli_xxx" }
   // Treat that as an explicit mention of this daemon, but do not let app_id
   // flow through mentionOpenId(), which is persisted and used as an open_id.
-  const appId = mentionAppId(m);
+  const appId = mentionAppId(m, larkAppId);
   return Boolean(larkAppId && appId === larkAppId);
 }
 
@@ -1140,12 +1142,16 @@ function mentionIdType(m: any): string | undefined {
   return undefined;
 }
 
-function mentionAppId(m: any): string | undefined {
+function mentionAppId(m: any, larkAppId?: string): string | undefined {
   if (!m || typeof m !== 'object') return undefined;
   if (typeof m.appId === 'string') return m.appId;
   if (typeof m.app_id === 'string') return m.app_id;
   const idType = mentionIdType(m);
   if (idType === 'app_id' && typeof m.id === 'string') return m.id;
+  // Real bot-authored posts can expose a bare `cli_xxx` mention id without
+  // id_type. Prefix inference is safe here and avoids silently dropping the
+  // cross-bot event before the team trust gate can run.
+  if (!idType && typeof m.id === 'string' && (m.id === larkAppId || m.id.startsWith('cli_'))) return m.id;
   if (m.id && typeof m.id === 'object' && typeof m.id.app_id === 'string') return m.id.app_id;
   return undefined;
 }
