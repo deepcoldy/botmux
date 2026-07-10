@@ -52,6 +52,23 @@ export function sessionStatusText(status: unknown): string {
   return label === key ? raw : label;
 }
 
+export function sessionRuntimeCounts(rows: Iterable<any>): {
+  logical: number;
+  resident: number;
+  dormant: number;
+} {
+  let logical = 0;
+  let resident = 0;
+  let dormant = 0;
+  for (const row of rows) {
+    if (row?.status === 'closed') continue;
+    logical++;
+    if (typeof row?.workerPid === 'number') resident++;
+    if (row?.status === 'dormant') dormant++;
+  }
+  return { logical, resident, dormant };
+}
+
 export function repoBasename(workingDir: unknown): string {
   const value = String(workingDir ?? '').trim();
   if (!value) return '-';

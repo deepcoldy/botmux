@@ -149,10 +149,10 @@ export interface DaemonSession {
    *  Format is `${sessionId}:${lastUuid || turnId}` so different sessions can
    *  never suppress each other's final_output payloads. */
   lastBridgeEmittedUuid?: string;
-  /** Flag flipped to true once a `session.exited` dashboard event has been
-   *  published for this session. Both the dashboard-driven close path
-   *  (closeSession) and the worker-process exit handler may try to publish;
-   *  this guard prevents double-counting on the dashboard side. */
+  /** Flag flipped once this process lifecycle has already been reflected on the
+   *  dashboard. A real close publishes `session.exited`; a deliberate suspend
+   *  publishes `status=dormant`. The later child-process exit must not emit a
+   *  second, contradictory close event. Reset when a new process is forked. */
   exitEventEmitted?: boolean;
   /** Present when this session was created via /adopt (shared observation mode).
    *  Either tmuxTarget (tmux) OR zellijSession+zellijPaneId (zellij) is set. */

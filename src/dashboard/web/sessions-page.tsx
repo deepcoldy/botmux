@@ -51,6 +51,7 @@ import {
   restartConfirmMessage,
   sessionLocationText,
   sessionLocationTitle,
+  sessionRuntimeCounts,
   sessionSearchText,
   sessionStatusText,
   terminalHref,
@@ -1783,6 +1784,7 @@ function SessionsPage(): JSX.Element {
       .filter(s => !q || sessionSearchText(s).includes(q))
       .sort((a, b) => compareRows(a, b, sortKey, sortDir));
   }, [filters, revision, sortDir, sortKey, storeRows, viewMode]);
+  const runtimeCounts = useMemo(() => sessionRuntimeCounts(storeRows), [storeRows]);
 
   const rowsById = useMemo(() => new Map(storeRows.map(row => [row.sessionId, row])), [storeRows, revision]);
   const boardRows = useMemo(() => rows.filter(row => row.status !== 'closed'), [rows]);
@@ -2517,6 +2519,12 @@ function SessionsPage(): JSX.Element {
             </CreateActionButton>
           ) : null}
         </div>
+      </div>
+
+      <div className="session-runtime-stats" aria-live="polite">
+        <span><b>{runtimeCounts.logical}</b>{t('sessions.runtime.logical')}</span>
+        <span><b>{runtimeCounts.resident}</b>{t('sessions.runtime.resident')}</span>
+        <span><b>{runtimeCounts.dormant}</b>{t('sessions.runtime.dormant')}</span>
       </div>
 
       <SessionsFilters

@@ -8009,6 +8009,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     try { writeBotInfoFile(config.session.dataDir); } catch { /* best effort */ }
     return r;
   });
+  // One cap implementation shared by event-driven checks (process start / idle
+  // edge) and the 60s safety-net timer below. Each daemon owns exactly one
+  // bot's activeSessions map, so the configured limit is per bot.
+  const enforceLiveSessionCap = (source: 'session_change' | 'periodic'): void => {
+    const maxLiveWorkers = getBot(cfg.larkAppId).config.maxLiveWorkers;
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers });
+    if (suspended.length > 0) {
+      logger.info(
+        `[idle-worker-sweeper] suspended ${suspended.length} session(s) over per-bot cap `
+        + `${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS} source=${source}`,
+      );
+    }
+  };
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
@@ -8021,6 +8034,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       void closeSessionHelper(ds.session.sessionId).catch(() => { /* idempotent */ });
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
     },
+    enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
   });
   // Expose the activeSessions Map (owned by daemon) to worker-pool readers,
   // so dashboard IPC and other consumers can list/lookup live sessions.
@@ -8251,14 +8265,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
 
   const idleWorkerSweepTimer = setInterval(() => {
-    // Re-read the live per-bot cap each tick so a dashboard edit (which mutates
-    // bot.config in place via applyConfigField) takes effect within 60s without
-    // a restart. Unset → DEFAULT_MAX_LIVE_WORKERS; ≤0 → no cap.
-    const maxLiveWorkers = getBot(cfg.larkAppId).config.maxLiveWorkers;
-    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers });
-    if (suspended.length > 0) {
-      logger.info(`[idle-worker-sweeper] suspended ${suspended.length} session(s) over per-bot cap ${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS}`);
-    }
+    // Dashboard config edits need no restart; the timer also backstops any
+    // missed lifecycle edge. Normal new/resumed sessions enforce immediately.
+    enforceLiveSessionCap('periodic');
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
 

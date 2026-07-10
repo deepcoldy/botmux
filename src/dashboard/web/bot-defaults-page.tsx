@@ -1958,7 +1958,11 @@ function mentionMode(bot: BotDefaultsRow): string {
 function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const initial = typeof props.bot.maxLiveWorkers === 'number' ? props.bot.maxLiveWorkers : null;
+  const logical = Number.isFinite(props.bot.logicalSessionCount) ? Number(props.bot.logicalSessionCount) : 0;
+  const resident = Number.isFinite(props.bot.residentSessionCount) ? Number(props.bot.residentSessionCount) : 0;
+  const dormant = Number.isFinite(props.bot.dormantSessionCount) ? Number(props.bot.dormantSessionCount) : 0;
   const [cap, setCap] = useState<number | null>(initial);
+  const effectiveCap = cap ?? 30;
   const [input, setInput] = useState(initial == null ? '' : String(initial));
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
@@ -2008,6 +2012,12 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
           <input type="number" min={1} step={1} data-input="maxLiveWorkers" placeholder={tr('botDefaults.maxLiveWorkersPlaceholder')} value={input} disabled={busy} onChange={event => setInput(event.currentTarget.value)} />
         </label>
         <small data-session-cap-state>{sessionCapStateLabel(cap, tr)}</small>
+        <small className="bd-help bd-session-residency">{tr('botDefaults.maxLiveWorkersUsage', {
+          resident,
+          cap: effectiveCap,
+          dormant,
+          logical,
+        })}</small>
       </div>
       <div className="actions">
         <button type="button" className="primary" data-action="save-session-cap" disabled={busy} onClick={saveInput}>{tr('botDefaults.maxLiveWorkersSave')}</button>

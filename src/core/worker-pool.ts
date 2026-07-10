@@ -72,6 +72,9 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
   closeSession: (ds: DaemonSession) => void;
+  /** Re-check the per-bot resident-session cap after a process starts or an
+   * over-cap busy session becomes idle. Optional for unit-test callers. */
+  enforceLiveSessionCap?: () => void;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -1162,6 +1165,9 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
+  // Screen state describes the process we just stopped. Keeping it would make
+  // the dashboard hydrate this process-less logical session as idle/working.
+  ds.lastScreenStatus = undefined;
   ds.session.webPort = undefined;
   // The worker's suspend handler destroys the backing session + CLI (frees
   // memory), so there is no live CLI to reattach to: the next turn MUST
@@ -1179,8 +1185,15 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   if (!ds.exitEventEmitted) {
     ds.exitEventEmitted = true;
     dashboardEventBus.publish({
-      type: 'session.exited',
-      body: { sessionId: ds.session.sessionId, reason },
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: {
+          status: 'dormant',
+          webPort: null,
+          workerPid: null,
+        },
+      },
     });
   }
   logger.info(`[${tag(ds)}] Worker + CLI suspended (${reason}); session stays active, cold-resumes from transcript on next message`);
@@ -1855,6 +1868,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     type: 'session.spawned',
     body: { session: composeRowFromActive(ds) },
   });
+  cb.enforceLiveSessionCap?.();
   emitSessionLifecycleHook(ds, 'session.start', {
     reason: resume ? 'resume' : 'worker_spawn',
     pid: worker.pid ?? null,
@@ -2155,6 +2169,14 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
             void finishTurnReactions(ds);
+          }
+          // If every over-cap process was busy, the earlier check deliberately
+          // left them alone. Re-check on the first idle edge so capacity is
+          // reclaimed immediately instead of waiting for the 60s backstop.
+          if (ds.lastScreenStatus === 'idle' && cb.enforceLiveSessionCap) {
+            // Defer until this screen_update has finished using process state.
+            // The newly-idle session itself may be the oldest eviction target.
+            queueMicrotask(cb.enforceLiveSessionCap);
           }
         }
 
@@ -2941,6 +2963,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     type: 'session.spawned',
     body: { session: composeRowFromActive(ds) },
   });
+  cb.enforceLiveSessionCap?.();
   emitSessionLifecycleHook(ds, 'session.start', {
     reason: opts?.restoredFromMetadata ? 'adopt_restore' : 'adopt',
     pid: worker.pid ?? null,

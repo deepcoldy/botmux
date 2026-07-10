@@ -97,7 +97,7 @@ vi.mock('../src/core/dashboard-events.js', () => ({
 }));
 
 vi.mock('../src/core/dashboard-rows.js', () => ({
-  composeRowFromActive: vi.fn(),
+  composeRowFromActive: vi.fn(() => ({ tokenUsage: null })),
 }));
 
 vi.mock('../src/skills/installer.js', () => ({
@@ -203,6 +203,27 @@ describe('session.start lifecycle integration', () => {
       reason: 'worker_spawn',
       pid: 12345,
     }));
+  });
+
+  it('re-checks the resident-session cap after spawn and again on an idle edge', async () => {
+    const enforceLiveSessionCap = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 31,
+      closeSession: vi.fn(),
+      enforceLiveSessionCap,
+    });
+    const ds = makeDs();
+
+    forkWorker(ds, 'hello', false);
+    expect(enforceLiveSessionCap).toHaveBeenCalledTimes(1);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    worker.emit('message', { type: 'screen_update', content: '', status: 'idle' });
+    await Promise.resolve();
+    expect(enforceLiveSessionCap).toHaveBeenCalledTimes(2);
   });
 
   it('emits session.start after forkAdoptWorker spawns an adopt worker', () => {

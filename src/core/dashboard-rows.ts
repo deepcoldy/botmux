@@ -128,8 +128,12 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     cliId: ds.session.cliId ?? 'unknown',
     // 待办池(queued)会话 CLI 没起，不该算「忙」——报 'idle' 免得 overview 的忙碌
     // 计数/小圆点把它当在跑。看板列由 deriveKanbanColumn 按手动 backlog 定，不受此影响。
-    // 重启后懒恢复的 active 会话没有 live worker / screen status：这是「休眠」而不是「启动中」。
-    status: ds.session.queued ? 'idle' : (ds.lastScreenStatus ?? (ds.worker ? 'starting' : 'dormant')),
+    // For every other session, process residency is authoritative: suspension
+    // clears ds.worker but intentionally preserves the logical active session.
+    // Never let a stale pre-suspend status make it look resident after hydrate.
+    status: ds.session.queued
+      ? 'idle'
+      : (!ds.worker || ds.worker.killed ? 'dormant' : (ds.lastScreenStatus ?? 'starting')),
     adopt: !!ds.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
     lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,

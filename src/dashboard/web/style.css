@@ -10283,6 +10283,32 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
   gap: 8px;
 }
 
+.session-runtime-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -2px 0 12px;
+}
+
+.session-runtime-stats span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.session-runtime-stats b {
+  color: var(--fg);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
 .sessions-page .sessions-filters:has(.idle-cleanup-bar.is-open) {
   position: relative;
   z-index: 1400;
