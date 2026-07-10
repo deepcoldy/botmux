@@ -178,19 +178,29 @@ function cardObjectFromValue(value: unknown, label: string): { ok: true; card: R
   return { ok: true, card };
 }
 
-// Interactive INPUT controls that fire a card.action.trigger callback on
-// use. Custom cards are display-only, so these are rejected outright (an
-// agent-sent card can't service the callback anyway). `button` is NOT here —
-// an open_url button is a legit jump; a callback button is caught by its
-// `value` payload / `behaviors` below. `checker` is Feishu's documented
-// no-callback-by-default exception; a checker that opts into a callback is
-// still caught by its `type:'callback'` behavior.
+// Interactive INPUT controls that fire a card.action.trigger callback on use.
+// Custom cards are display-only, so these are rejected by tag even when they
+// carry no `value` payload (selecting/picking still fires a callback). `button`
+// is NOT here — it's special-cased below (open_url buttons are legit jumps).
+// `checker` is Feishu's documented no-callback-by-default exception; a checker
+// that opts into a callback is still caught by its `type:'callback'` behavior.
 const CALLBACK_CONTROL_TAGS = new Set([
   'select_static', 'multi_select_static',
   'select_person', 'multi_select_person',
+  'select_img', 'multi_select_img',
   'overflow', 'input',
   'date_picker', 'picker_time', 'picker_datetime',
 ]);
+
+// A button is display/jump ONLY when it opens a URL: v2 `behaviors` carrying an
+// `open_url`, or v1 non-empty `url`/`multi_url`. Everything else (a plain button,
+// or one carrying an own `value` callback payload) round-trips a callback.
+function isOpenUrlButton(el: Record<string, unknown>): boolean {
+  if (typeof el.url === 'string' && el.url.trim() !== '') return true;
+  if (el.multi_url !== undefined && el.multi_url !== null) return true;
+  return Array.isArray(el.behaviors)
+    && el.behaviors.some(b => isRecord(b) && b.type === 'open_url');
+}
 
 // Find any element that would produce a Lark card.action.trigger callback.
 // Custom cards are display + open_url only, so ALL callback-capable controls
@@ -218,23 +228,23 @@ function findDisallowedCardCallback(value: unknown, path = 'card'): string | nul
   if (value.action_type === 'form_submit' || value.action_type === 'form_reset') {
     return `${path}.action_type`;
   }
-  // Interactive input controls (dropdowns/pickers/inputs) — reject by tag even
-  // when they carry no `value` payload; selecting still fires a callback.
-  if (typeof value.tag === 'string' && CALLBACK_CONTROL_TAGS.has(value.tag)) {
-    return `${path}.tag(${value.tag})`;
+  if (typeof value.tag === 'string') {
+    // Interactive input controls (dropdowns/pickers/inputs/image-select) — reject
+    // by tag even without a `value` payload; interacting still fires a callback.
+    if (CALLBACK_CONTROL_TAGS.has(value.tag)) return `${path}.tag(${value.tag})`;
+    // A button is allowed only as an open_url jump with NO own `value` payload.
+    // `value` may be a plain string OR object (both round-trip a callback), so
+    // reject on presence, not shape. A plain button (no open_url) also fires a
+    // callback — reject. NOTE: only card ELEMENTS (nodes with a `tag`) are judged
+    // this way, so free-form chart_spec data like `{tag:'x', value:{…}}` isn't
+    // misread as a control.
+    if (value.tag === 'button') {
+      if ('value' in value && value.value !== undefined) return `${path}.value`;
+      if (!isOpenUrlButton(value)) return `${path}.tag(button)`;
+    }
   }
-  // Any card ELEMENT (a node with a `tag`) carrying a `value` PAYLOAD object is
-  // a callback control — a v1 callback button/select round-trips that `value`
-  // back on click. An open_url button has `url`/`multi_url` (or an open_url
-  // behavior), never an element `value`. Tag-gated so nested non-element
-  // `value` objects (e.g. a chart data point `{value:{…}}`) don't false-trip.
-  // This also subsumes the botmux reserved routing keys (action/key/root_id)
-  // that let a card reach a privileged host handler.
-  if (typeof value.tag === 'string' && isRecord(value.value)) {
-    return `${path}.value`;
-  }
-  // Belt: reserved botmux routing discriminators anywhere, even off a tagged
-  // element (e.g. round-tripped inside a behavior `value`).
+  // Belt: reserved botmux routing discriminators anywhere (defence in depth —
+  // e.g. a value round-tripped inside a behavior, or a tag we didn't enumerate).
   if (isRecord(value.value)) {
     for (const field of ['action', 'key', 'root_id'] as const) {
       if (typeof value.value[field] === 'string') return `${path}.value.${field}`;

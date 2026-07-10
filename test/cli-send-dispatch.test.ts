@@ -358,7 +358,28 @@ describe('normalizeInteractiveCardInput', () => {
     expect(bareSelect.ok).toBe(false);
   });
 
-  it('still accepts pure display cards: open_url buttons, images, columns, charts with nested value', () => {
+  it('rejects a button with a STRING callback value (action.value may be string, not just object)', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{ tag: 'action', actions: [{ tag: 'button', text: { tag: 'plain_text', content: 'x' }, value: 'opaque-callback' }] }],
+    }));
+    expect(res.ok).toBe(false);
+  });
+
+  it('rejects a plain button with no open_url (still fires a callback on click)', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{ tag: 'action', actions: [{ tag: 'button', text: { tag: 'plain_text', content: 'x' } }] }],
+    }));
+    expect(res.ok).toBe(false);
+  });
+
+  it('rejects select_img (interactive image-select component)', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{ tag: 'action', actions: [{ tag: 'select_img', options: [{ img_key: 'k', value: 'v' }] }] }],
+    }));
+    expect(res.ok).toBe(false);
+  });
+
+  it('still accepts pure display cards: open_url buttons, images, columns, charts with tagged/nested value data', () => {
     const display = normalizeInteractiveCardInput(JSON.stringify({
       schema: '2.0',
       header: { template: 'blue', title: { tag: 'plain_text', content: 'Status' } },
@@ -370,7 +391,9 @@ describe('normalizeInteractiveCardInput', () => {
             { tag: 'column', elements: [{ tag: 'markdown', content: 'CPU' }] },
             { tag: 'column', elements: [{ tag: 'markdown', content: '99%' }] },
           ] },
-          { tag: 'chart', chart_spec: { series: [{ value: { x: 1, y: 2 } }] } },
+          // chart_spec is free-form user data; a data point that happens to carry
+          // a `tag` + `value` object must NOT be misread as an interactive control.
+          { tag: 'chart', chart_spec: { series: [{ tag: 'prod', value: { x: 1, y: 2 } }] } },
           { tag: 'button', text: { tag: 'plain_text', content: 'open' }, behaviors: [{ type: 'open_url', default_url: 'https://x' }] },
           { tag: 'button', text: { tag: 'plain_text', content: 'jump' }, url: 'https://y' },
         ],
