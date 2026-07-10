@@ -58,6 +58,21 @@ describe('verified-delivery ledger', () => {
     expect(t.reports[0].verdict).toBe('rejected'); // attempt 1 keeps its verdict
   });
 
+  it('keeps an accepted task terminal when a delayed report arrives', () => {
+    const led = openLedger({ baseDir });
+    led.append(draft({ type: 'TaskDispatched', taskId: 'task-late', idempotencyKey: 'dispatched:task-late', payload: { taskId: 'task-late' } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 'task-late', idempotencyKey: 'reported:r1', payload: { taskId: 'task-late', reportId: 'r1', summary: 'done', evidence: [{ kind: 'path', path: '/tmp/a' }] } }));
+    led.append(draft({ type: 'TaskAccepted', taskId: 'task-late', idempotencyKey: 'accepted:task-late:r1', payload: { taskId: 'task-late', reportId: 'r1', checkedBy: 'sup' } }));
+    led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 'task-late', idempotencyKey: 'reported:r2', payload: { taskId: 'task-late', reportId: 'r2', summary: 'delayed retry', evidence: [{ kind: 'path', path: '/tmp/b' }] } }));
+
+    const t = led.task('task-late')!;
+    expect(t.status).toBe('accepted');
+    expect(t.latestReportId).toBe('r1');
+    expect(t.reports).toHaveLength(2);
+    expect(t.reports.find((r) => r.reportId === 'r1')?.verdict).toBe('accepted');
+    expect(t.reports.find((r) => r.reportId === 'r2')?.verdict).toBeUndefined();
+  });
+
   it('a late verdict for a superseded report does not drag the new attempt back', () => {
     const led = openLedger({ baseDir });
     led.append(draft({ type: 'TaskDispatched', taskId: 'task-4', idempotencyKey: 'dispatched:task-4', payload: { taskId: 'task-4' } }));
