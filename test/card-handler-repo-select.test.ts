@@ -279,6 +279,27 @@ describe('repo select card — plain switch', () => {
     expect(closedCard).toContain('gamma');
     expect(closedCard).not.toContain('beta');
   });
+
+  it('ignores a keyless dropdown (option + root_id, no repo_switch/repo_worktree key)', async () => {
+    // Security seal: a hand-crafted card (e.g. via `botmux send --card-json`) can
+    // supply a bare `option + value.root_id` with no recognized key. It must NOT
+    // fall through to a plain switch — otherwise it drives the session's working
+    // dir to an attacker-picked path. botmux's own cards always set the key.
+    const ds = makeDs(); // no pendingRepo
+    ds.session.workingDir = '/repos/gamma';
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction({
+      operator: { open_id: OWNER },
+      action: { option: '/etc', value: { root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    }, deps, APP_ID);
+
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(ds.workingDir).not.toBe('/etc');
+    expect(ds.session.workingDir).toBe('/repos/gamma');
+  });
 });
 
 describe('repo select card — worktree open', () => {

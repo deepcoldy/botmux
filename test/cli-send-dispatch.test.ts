@@ -281,6 +281,45 @@ describe('normalizeInteractiveCardInput', () => {
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.error).toContain('.value.key');
   });
+
+  it('rejects a keyless option dropdown carrying only value.root_id (plain repo-switch surface)', () => {
+    // The repo-select branch acts on a bare `option + value.root_id` with NO
+    // action/key — a plain switch to the picked path. A card carrying just
+    // root_id (no action, no key) must still be rejected, else it can drive a
+    // session's working dir to an arbitrary path once an operator picks.
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{
+        tag: 'action',
+        actions: [{
+          tag: 'select_static',
+          options: [{ text: { tag: 'plain_text', content: '/etc' }, value: '/etc' }],
+          value: { root_id: 'om_target' },
+        }],
+      }],
+    }));
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain('.value.root_id');
+  });
+
+  it('rejects v2 form_action (form submit also fires a card callback)', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      schema: '2.0',
+      body: {
+        elements: [{
+          tag: 'form',
+          name: 'f',
+          elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: 'submit' },
+            behaviors: [{ type: 'form_action', behavior: 'submit' }],
+          }],
+        }],
+      },
+    }));
+
+    expect(res.ok).toBe(false);
+  });
 });
 
 describe('sendVideoAttachments (best-effort media messages)', () => {

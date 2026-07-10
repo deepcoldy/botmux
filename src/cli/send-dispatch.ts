@@ -188,18 +188,25 @@ function findDisallowedCardCallback(value: unknown, path = 'card'): string | nul
   }
   if (!isRecord(value)) return null;
 
-  if (value.type === 'callback') return `${path}.type`;
-  // botmux routes card actions on TWO `value` discriminators, not just `action`:
+  // v2 behaviors that fire a server-side card.action.trigger callback:
+  //   - `callback`    — button/select/input callbacks
+  //   - `form_action` — form submit/reset (delivers form_value to the handler)
+  // open_url behaviors are display/jump only and stay allowed.
+  if (value.type === 'callback' || value.type === 'form_action') return `${path}.type`;
+  // botmux routes card actions off the element `value` payload via SEVERAL
+  // discriminators, not just `action`. A CLI-supplied card carrying ANY of them
+  // reaches those host-side handlers once a user clicks/selects:
   //   - `value.action` — buttons (close/restart/land/grant/voice_summary/…)
-  //   - `value.key`    — select_static dropdowns (adopt_select /
-  //                      adopt_resume_select / codex_app_thread_select /
-  //                      repo_worktree), see card-handler dropdown branches.
-  // A CLI-supplied card carrying EITHER would reach those host-side handlers
-  // once a user clicks/selects, so reject both — matching only `action` left the
-  // dropdown namespace open.
+  //   - `value.key`    — select_static dropdowns (adopt_select/adopt_resume_select/
+  //                      codex_app_thread_select/repo_switch/repo_worktree)
+  //   - `value.root_id`— the session anchor every dropdown/button needs to target
+  //                      a session; the repo-select branch acts on a bare
+  //                      `option + root_id` with NO action/key (plain repo switch
+  //                      to an arbitrary path), so root_id alone must be rejected.
   if (isRecord(value.value)) {
-    if (typeof value.value.action === 'string') return `${path}.value.action`;
-    if (typeof value.value.key === 'string') return `${path}.value.key`;
+    for (const field of ['action', 'key', 'root_id'] as const) {
+      if (typeof value.value[field] === 'string') return `${path}.value.${field}`;
+    }
   }
 
   for (const [key, child] of Object.entries(value)) {

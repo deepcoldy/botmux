@@ -4468,7 +4468,12 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
   } else if (contentFile) {
     content = existsSync(contentFile) ? readFileSync(contentFile, 'utf-8') : '';
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention']);
+    // NOTE: `--attention` is deliberately NOT excluded here. The relay flag
+    // allowlist (below) doesn't forward it, so sandbox `--attention` can't raise
+    // the dashboard hand anyway; excluding it would silently send the reason as a
+    // bare message instead of the original loud "no content" failure. Plumbing
+    // `--attention` through the relay is a separate change, out of this scope.
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice']);
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
   const id = randomBytes(8).toString('hex');
