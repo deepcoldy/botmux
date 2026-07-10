@@ -190,6 +190,18 @@ export function buildReportContent(input: {
   return paras;
 }
 
+/** Build the plain-text wire form used by verified-delivery reports. */
+export function buildReportText(input: {
+  orchOpenId: string;
+  content: string;
+}): string {
+  const openId = input.orchOpenId.trim();
+  if (!openId) throw new Error('report requires the orchestrator open_id');
+  const text = input.content.trim();
+  if (!text) throw new Error('report requires content');
+  return `<at user_id="${openId}"></at>\n${text}`;
+}
+
 /**
  * Footgun guard for the orchestrator→sub-bot direction. A dispatched sub-bot's
  * session lives **inside its sub-topic**, so @-mentioning it from the main chat

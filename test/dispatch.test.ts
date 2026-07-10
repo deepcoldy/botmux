@@ -19,6 +19,7 @@ import {
   buildDispatchMessages,
   buildRepoPrimeText,
   buildReportContent,
+  buildReportText,
   findSubBotTopic,
   eligibleAutoMentionAliases,
   offTopicSubBotTopic,
@@ -212,6 +213,20 @@ describe('buildReportContent', () => {
 
   it('throws on empty orchestrator open_id', () => {
     expect(() => buildReportContent({ orchOpenId: '  ', content: 'x' })).toThrow();
+  });
+});
+
+describe('buildReportText', () => {
+  it('puts the native mention before the whole-message envelope', () => {
+    expect(buildReportText({
+      orchOpenId: 'ou_orch',
+      content: '[botmux-report v1]\ntaskId: task-1',
+    })).toBe('<at user_id="ou_orch"></at>\n[botmux-report v1]\ntaskId: task-1');
+  });
+
+  it('rejects empty content or orchestrator ids', () => {
+    expect(() => buildReportText({ orchOpenId: '', content: 'x' })).toThrow();
+    expect(() => buildReportText({ orchOpenId: 'ou_orch', content: ' ' })).toThrow();
   });
 });
 
