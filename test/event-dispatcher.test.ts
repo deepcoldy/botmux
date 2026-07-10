@@ -611,6 +611,14 @@ describe('isBotMentioned', () => {
     expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(true);
   });
 
+  it('detects a bare bot app_id when Lark omits id_type', () => {
+    const message = {
+      mentions: [{ key: '@_bot', name: 'BotA', id: MY_APP_ID }],
+      content: JSON.stringify({ text: '@BotA hello' }),
+    };
+    expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(true);
+  });
+
   it('does not treat another app_id as this bot mention', () => {
     const message = {
       mentions: [{ key: '@_other', name: 'Other', id: 'app-other', id_type: 'app_id' }],
@@ -641,6 +649,13 @@ describe('isBotMentioned', () => {
     });
     const message = { content: postContent, mentions: [] };
     expect(isBotMentioned(MY_APP_ID, message, undefined)).toBe(true);
+  });
+
+  it('detects a bot app_id in post content at tags', () => {
+    const postContent = JSON.stringify({
+      zh_cn: { content: [[{ tag: 'at', user_id: MY_APP_ID }, { tag: 'text', text: ' help' }]] },
+    });
+    expect(isBotMentioned(MY_APP_ID, { content: postContent, mentions: [] }, undefined)).toBe(true);
   });
 
   it('returns false when bot is not mentioned', () => {
@@ -718,6 +733,13 @@ describe('mentionsAnotherMember (ambient redirect carve-out)', () => {
       content: JSON.stringify({ text: '@BotA hello' }),
     };
     expect(mentionsAnotherMember(MY_APP_ID, message)).toBe(false);
+  });
+
+  it('returns false when only THIS bot is @mentioned by app_id in post content', () => {
+    const postContent = JSON.stringify({
+      zh_cn: { content: [[{ tag: 'at', user_id: MY_APP_ID }]] },
+    });
+    expect(mentionsAnotherMember(MY_APP_ID, { content: postContent, mentions: [] })).toBe(false);
   });
 
   it('returns false when only THIS bot is @mentioned via string-form id (no false redirect)', () => {
@@ -917,6 +939,24 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
       anchor: 'root-thread-2',
+      scope: 'thread',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('routes a bot message when Lark emits a bare app_id mention', async () => {
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA check this' }),
+      rootId: 'root-thread-bare-app-id',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: MY_APP_ID }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      anchor: 'root-thread-bare-app-id',
       scope: 'thread',
       larkAppId: MY_APP_ID,
     }));

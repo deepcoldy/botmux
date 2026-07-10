@@ -66,6 +66,9 @@ export function mentionOpenId(m: { id?: { open_id?: string; app_id?: string } | 
   if (typeof id === 'object') return id.open_id || undefined;
   if (typeof id === 'string') {
     if (m?.id_type && m.id_type !== 'open_id') return undefined;
+    // Bot mentions may arrive as a bare app_id without id_type. The `cli_`
+    // prefix is unambiguous; do not persist it as an observer-scoped open_id.
+    if (!m?.id_type && id.startsWith('cli_')) return undefined;
     return id || undefined;
   }
   return undefined;
