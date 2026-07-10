@@ -17,6 +17,7 @@ botmux 通过适配器桥接不同 CLI，`bots.json` 里用 `cliId` 选择。一
 | `antigravity` | Antigravity（agy） | |
 | `hermes` | Hermes | |
 | `copilot` | GitHub Copilot（copilot） | ✅ |
+| `kiro-cli` | Kiro（kiro-cli） | |
 
 > 还有社区贡献的 MTR、ttadk、Mira 等接入方式。`model` 字段只对支持模型参数的适配器生效，其它会忽略。
 

@@ -67,6 +67,7 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   hermes: 'hermes',
   pi: 'pi',
   omp: 'oh-my-pi',
+  'kiro-cli': 'kiro-cli',
 };
 
 /** Interpreters and native launchers that may hide the CLI identity in argv.

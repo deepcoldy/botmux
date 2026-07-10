@@ -60,6 +60,7 @@ describe('dashboard sessions filters', () => {
     expect(CLI_FILTER_OPTIONS).toContain('codex-app');
     expect(CLI_FILTER_OPTIONS).toContain('mira');
     expect(CLI_FILTER_OPTIONS).toContain('pi');
+    expect(CLI_FILTER_OPTIONS).toContain('kiro-cli');
     expect(CLI_FILTER_OPTIONS).toContain('unknown');
     expect(new Set(CLI_FILTER_OPTIONS).size).toBe(CLI_FILTER_OPTIONS.length);
   });

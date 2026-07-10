@@ -42,13 +42,14 @@ import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
+import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import type { CliAdapter, CliId, PtyHandle } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'kiro-cli'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -83,7 +84,7 @@ describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
   // adapters (codex-app/mira) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi', 'kiro-cli'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -1165,6 +1166,7 @@ describe('systemHints', () => {
     ['hermes', () => createHermesAdapter('/bin/hermes')],
     ['pi', () => createPiAdapter('/bin/pi')],
     ['copilot', () => createCopilotAdapter('/bin/copilot')],
+    ['kiro-cli', () => createKiroCliAdapter('/bin/kiro-cli')],
   ];
 
   it.each(nonClaudeAdapters)('%s systemHints include botmux send routing guidance', (_name, factory) => {
@@ -1193,6 +1195,7 @@ describe('id property', () => {
     ['mira', () => createMiraAdapter()],
     ['pi', () => createPiAdapter('/bin/pi')],
     ['copilot', () => createCopilotAdapter('/bin/copilot')],
+    ['kiro-cli', () => createKiroCliAdapter('/bin/kiro-cli')],
   ];
 
   it.each(expected)('adapter id is "%s"', (expectedId, factory) => {
@@ -1255,6 +1258,10 @@ describe('altScreen property', () => {
 
   it('copilot uses alt screen (Ink TUI)', () => {
     expect(createCopilotAdapter('/bin/copilot').altScreen).toBe(true);
+  });
+
+  it('kiro-cli uses alt screen', () => {
+    expect(createKiroCliAdapter('/bin/kiro-cli').altScreen).toBe(true);
   });
 });
 
@@ -1410,6 +1417,28 @@ describe('kimi buildArgs', () => {
 
   it('surfaces curated model choices for setup', () => {
     expect(adapter.modelChoices).toContain('kimi-k2.5');
+  });
+});
+
+describe('kiro-cli buildArgs', () => {
+  const adapter = createKiroCliAdapter('/usr/bin/kiro-cli');
+
+  it('starts kiro-cli without unsupported default flags', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-kiro', resume: false });
+    expect(args).toEqual([]);
+  });
+
+  it('does not invent resume, model, or initial prompt flags', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-kiro',
+      resume: true,
+      resumeSessionId: 'kiro-native-session',
+      model: 'custom-model',
+      initialPrompt: 'hello kiro',
+    });
+    expect(args).toEqual([]);
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-kiro', cliSessionId: 'kiro-native-session' }))
+      .toBeNull();
   });
 });
 
