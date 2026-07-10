@@ -183,6 +183,29 @@ describe('buildReportContent', () => {
     expect(paras[1]).toEqual([{ tag: 'text', text: '产出在 /tmp/out' }]);
   });
 
+  it('keeps a delivery envelope at the first meaningful line', () => {
+    const envelope = [
+      '[botmux-report v1]',
+      'taskId: task-1',
+      'summary: 完成',
+      'evidence:',
+      '- inline: name=result PASS',
+    ].join('\n');
+    const paras = buildReportContent({
+      orchOpenId: 'ou_orch',
+      content: '远端项目命中并完成只读自检',
+      deliveryEnvelope: envelope,
+    });
+
+    expect(paras[0]).toEqual([
+      { tag: 'at', user_id: 'ou_orch' },
+      { tag: 'text', text: ' ' },
+      { tag: 'text', text: '[botmux-report v1]' },
+    ]);
+    expect(paras.flat().map((node) => node.tag === 'text' ? node.text : '').join('\n'))
+      .not.toContain('远端项目命中并完成只读自检');
+  });
+
   it('throws on empty content', () => {
     expect(() => buildReportContent({ orchOpenId: 'ou_orch', content: '   ' })).toThrow();
   });
