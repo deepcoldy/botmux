@@ -517,7 +517,7 @@ function SkillsPage() {
     };
   }
 
-  async function discoverInstallCandidates(): Promise<InstallSkillCandidate[]> {
+  async function discoverInstallCandidates(): Promise<{ skills: InstallSkillCandidate[]; directInstall: boolean }> {
     setInstallDiscovering(true);
     setInstallStatus({ text: tr('skills.scanning'), ok: true });
     try {
@@ -525,11 +525,12 @@ function SkillsPage() {
         method: 'POST',
         body: JSON.stringify(sourceRequestBody()),
       });
-      if (!mountedRef.current) return [];
+      if (!mountedRef.current) return { skills: [], directInstall: false };
+      const directInstall = body.discovery?.directInstall === true;
       const skills = Array.isArray(body.discovery?.skills) ? body.discovery.skills as InstallSkillCandidate[] : [];
       setInstallCandidates(skills);
       setSelectedInstallSkills(new Set(skills.map(skill => skill.name)));
-      return skills;
+      return { skills, directInstall };
     } finally {
       if (mountedRef.current) setInstallDiscovering(false);
     }
@@ -588,19 +589,18 @@ function SkillsPage() {
       setInstallStatus({ text: tr('skills.sourceRequired'), ok: false });
       return;
     }
-    // The 'agentbuddy:' source kind (see parseSkillInstallSource) resolves its
-    // own skill set, so skip the discover-then-select step and install directly.
-    // Prefix is matched inline here — the parser lives in a server-only module
-    // the browser bundle can't import.
-    if (installSource.trim().startsWith('agentbuddy:')) {
-      setInstallSelectionOpen(false);
-      await submitSkillInstall();
-      return;
-    }
     try {
       setInstallSelectionOpen(false);
-      const skills = await discoverInstallCandidates();
+      const { skills, directInstall } = await discoverInstallCandidates();
       if (!mountedRef.current) return;
+      // agentbuddy sources — a pasted `agentbuddy:<id>` OR a marketplace URL the
+      // backend recognized — resolve their own skill set, so install directly
+      // (no candidate selection). The server decides this so the client needn't
+      // know the identifier prefix or the configured marketplace hosts.
+      if (directInstall) {
+        await submitSkillInstall();
+        return;
+      }
       if (skills.length === 0) {
         setInstallStatus({ text: tr('skills.scanEmpty'), ok: false });
         return;

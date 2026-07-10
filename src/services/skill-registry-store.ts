@@ -27,6 +27,9 @@ export interface DiscoveredSkillCandidate {
 export interface SkillSourceDiscovery {
   commit?: string;
   skills: DiscoveredSkillCandidate[];
+  /** True when the source resolves its own skill set (agentbuddy) — the dashboard
+   *  installs it directly, skipping the discover-then-select step. */
+  directInstall?: boolean;
 }
 
 export interface SkillInstallSelection {
@@ -625,15 +628,18 @@ async function withAgentbuddyLock<T>(identifier: string, fn: () => Promise<T>): 
 }
 
 function agentbuddyInstallArgs(opts: AgentbuddySource): string[] {
-  // --copy: write real files (not symlinks into the user's agent dirs) so the
-  //         staging tree is self-contained to copy into the store.
-  // --strict: fail fast with "needs login" instead of blocking on an
-  //           interactive SSO prompt on a headless daemon host.
-  const common = ['--agent', 'claude-code', '--copy', '-y', '--strict'];
-  if (opts.collection) return ['skill', 'collection', 'add', opts.collection, ...common];
-  const args = ['skill', 'add', opts.group!, '--skill', opts.skill!];
+  const protocol = opts.protocol ?? 'skill';
+  // --copy (real files, not symlinks) + --strict (fail fast when not logged in)
+  // are skill-only — `plugin add` rejects them. --agent claude-code + -y apply
+  // to both and steer output into .claude/* so registerAgentbuddyStaging can
+  // capture any SKILL.md (a plugin only contributes its bundled skills).
+  const flags = protocol === 'skill'
+    ? ['--agent', 'claude-code', '--copy', '-y', '--strict']
+    : ['--agent', 'claude-code', '-y'];
+  if (opts.collection) return [protocol, 'collection', 'add', opts.collection, ...flags];
+  const args = [protocol, 'add', opts.group!, '--skill', opts.skill!];
   if (opts.version) args.push('--version', opts.version);
-  return [...args, ...common];
+  return [...args, ...flags];
 }
 
 function runAgentbuddyCli(args: string[], cwd: string, failCode: string): void {
@@ -707,9 +713,10 @@ function findSkillDirs(root: string): string[] {
 }
 
 function agentbuddyIdentifier(opts: AgentbuddySource): string {
+  const protocol = opts.protocol ?? 'skill';
   return opts.collection
-    ? `collection/${opts.collection}`
-    : `${opts.group}/${opts.skill}${opts.version ? `@${opts.version}` : ''}`;
+    ? `${protocol}/collection/${opts.collection}`
+    : `${protocol}/${opts.group}/${opts.skill}${opts.version ? `@${opts.version}` : ''}`;
 }
 
 /** Register the skill dir(s) agentbuddy wrote into the staging tree into the
@@ -749,9 +756,10 @@ function registerAgentbuddyStaging(
   for (const [name, dir] of byName) {
     // A collection member re-installs via its collection; a single skill via
     // its own group/skill/version — record whichever lets `update` re-run it.
+    const proto = opts.protocol ? { protocol: opts.protocol } : {};
     const source: SkillSource = opts.collection
-      ? { type: 'agentbuddy', identifier, collection: opts.collection, skill: name }
-      : { type: 'agentbuddy', identifier, group: opts.group, skill: opts.skill, ...(opts.version ? { version: opts.version } : {}) };
+      ? { type: 'agentbuddy', identifier, ...proto, collection: opts.collection, skill: name }
+      : { type: 'agentbuddy', identifier, ...proto, group: opts.group, skill: opts.skill, ...(opts.version ? { version: opts.version } : {}) };
     const rootDir = join(skillStoreDir(), name);
     rmSync(rootDir, { recursive: true, force: true });
     mkdirSync(dirname(rootDir), { recursive: true });
@@ -814,9 +822,10 @@ export async function installAgentbuddySkillAsync(opts: AgentbuddySource, requir
 }
 
 function agentbuddyReinstallOpts(source: Extract<SkillSource, { type: 'agentbuddy' }>): AgentbuddySource {
+  const proto = source.protocol ? { protocol: source.protocol } : {};
   return source.collection
-    ? { collection: source.collection }
-    : { group: source.group, skill: source.skill, version: source.version };
+    ? { ...proto, collection: source.collection }
+    : { ...proto, group: source.group, skill: source.skill, version: source.version };
 }
 
 export function removeInstalledSkill(name: string): { ok: true } | { ok: false; reason: string } {

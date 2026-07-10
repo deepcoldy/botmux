@@ -13859,7 +13859,11 @@ form.dashboard-toolbar > input[type="text"]:focus {
   bottom: auto;
   z-index: 2147483647;
   opacity: 1;
-  pointer-events: none;
+  /* Interactive: let the pointer reach the popover so its text is selectable /
+     copyable (JS keeps it open while hovered). */
+  pointer-events: auto;
+  user-select: text;
+  cursor: text;
   transform: translate(-50%, -100%);
 }
 

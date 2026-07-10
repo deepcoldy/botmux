@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { MAX_LOCAL_LINK_SOURCES, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, shouldAutoLinkLocalSkillPath } from '../src/dashboard/skill-install-request.js';
+import { MAX_LOCAL_LINK_SOURCES, discoverDashboardSkills, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, shouldAutoLinkLocalSkillPath } from '../src/dashboard/skill-install-request.js';
 
 describe('dashboard skill install request parsing', () => {
   it('rejects lightweight install errors before starting a job', () => {
@@ -72,15 +72,22 @@ describe('dashboard skill install request parsing', () => {
     });
   });
 
-  it('routes agentbuddy sources to the direct-install (no discover) path', () => {
-    expect(parseDashboardSkillInstallRequest({ source: 'agentbuddy:example.com/team/mkt/deploy@1.2.3' })).toEqual({
+  it('routes agentbuddy command sources to the direct-install (no discover) path', () => {
+    expect(parseDashboardSkillInstallRequest({ source: 'agentbuddy skill add example.com/team/mkt --skill deploy --version 1.2.3' })).toEqual({
       kind: 'agentbuddy',
-      agentbuddy: { group: 'example.com/team/mkt', skill: 'deploy', version: '1.2.3' },
+      agentbuddy: { protocol: 'skill', group: 'example.com/team/mkt', skill: 'deploy', version: '1.2.3' },
     });
-    expect(parseDashboardSkillInstallRequest({ source: 'agentbuddy:collection/col123abc' })).toEqual({
+    expect(parseDashboardSkillInstallRequest({ source: 'agentbuddy plugin collection add col123abc' })).toEqual({
       kind: 'agentbuddy',
-      agentbuddy: { collection: 'col123abc' },
+      agentbuddy: { protocol: 'plugin', collection: 'col123abc' },
     });
+  });
+
+  it('routes a pasted agentbuddy command to direct-install', async () => {
+    const request = parseDashboardSkillInstallRequest({ source: 'agentbuddy skill collection add abc123' });
+    expect(request).toEqual({ kind: 'agentbuddy', agentbuddy: { protocol: 'skill', collection: 'abc123' } });
+    // discover signals the UI to install directly (skip discover-then-select)
+    expect(await discoverDashboardSkills(request)).toEqual({ skills: [], directInstall: true });
   });
 
   it('sanitizes batch local-link sources: trims, drops blanks/non-strings, dedups', () => {

@@ -9,7 +9,7 @@ export type SkillSource =
   | { type: 'local-link'; path: string }
   | { type: 'git'; url: string; path: string; ref?: string; commit?: string }
   | { type: 'github'; owner: string; repo: string; path: string; ref?: string; commit?: string }
-  | { type: 'agentbuddy'; identifier: string; collection?: string; group?: string; skill?: string; version?: string };
+  | { type: 'agentbuddy'; identifier: string; protocol?: 'skill' | 'plugin'; collection?: string; group?: string; skill?: string; version?: string };
 
 export interface SkillPackage {
   id: string;

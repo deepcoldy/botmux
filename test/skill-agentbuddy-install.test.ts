@@ -113,7 +113,7 @@ describe('agentbuddy skill install', () => {
     expect(skill.description).toBe('v1.2.3');
     expect(skill.source).toEqual({
       type: 'agentbuddy',
-      identifier: 'example.com/team/mkt/deploy@1.2.3',
+      identifier: 'skill/example.com/team/mkt/deploy@1.2.3',
       group: 'example.com/team/mkt',
       skill: 'deploy',
       version: '1.2.3',
@@ -128,9 +128,22 @@ describe('agentbuddy skill install', () => {
     expect(pkgs.map((p) => p.name).sort()).toEqual(['col123abc-alpha', 'col123abc-beta']);
     expect(readSkillRegistry().skills['col123abc-alpha'].source).toEqual({
       type: 'agentbuddy',
-      identifier: 'collection/col123abc',
+      identifier: 'skill/collection/col123abc',
       collection: 'col123abc',
       skill: 'col123abc-alpha',
+    });
+  });
+
+  it('installs a plugin collection, capturing its bundled skills (protocol recorded)', () => {
+    const pkgs = installAgentbuddySkill({ protocol: 'plugin', collection: 'plug1' });
+
+    expect(pkgs.map((p) => p.name).sort()).toEqual(['plug1-alpha', 'plug1-beta']);
+    expect(readSkillRegistry().skills['plug1-alpha'].source).toEqual({
+      type: 'agentbuddy',
+      identifier: 'plugin/collection/plug1',
+      protocol: 'plugin',
+      collection: 'plug1',
+      skill: 'plug1-alpha',
     });
   });
 
