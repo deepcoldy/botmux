@@ -48,6 +48,7 @@ import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
@@ -330,6 +331,20 @@ describe('writeInput: multiline, tmux mode', () => {
     } finally {
       removeClaudeKeybindings();
     }
+  });
+
+  it('kiro-cli: sends multiline input with documented Ctrl+J soft newlines', async () => {
+    const adapter = createKiroCliAdapter('/bin/kiro-cli');
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, MULTILINE);
+
+    expect(pty.pasteText).not.toHaveBeenCalled();
+    expect(pty.sendText.mock.calls.map(c => c[0])).toEqual(['first line', 'Session ID: abc-123']);
+    expect(pty.sendSpecialKeys.mock.calls).toEqual([
+      ['C-j'],
+      ['C-j'],
+      ['Enter'],
+    ]);
   });
 
   it('claude-code: fails before typing when only unsupported Cmd+Enter can submit', async () => {

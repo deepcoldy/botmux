@@ -4,30 +4,53 @@ import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
 
+const TRUSTED_CORE_TOOLS = 'read,write,shell';
+
 export function createKiroCliAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'kiro-cli';
   let cachedBin: string | undefined;
   return {
     id: 'kiro-cli',
+    authPaths: ['~/.kiro'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs() {
-      // Kiro CLI flags are intentionally not inferred here. Start the native
-      // interactive command as-is; cliPathOverride still lets deployments wrap it.
-      return [];
+    buildArgs({ resume, resumeSessionId, initialPrompt, disableCliBypass }) {
+      const args = ['chat'];
+      if (!disableCliBypass) {
+        // Avoid --trust-all-tools: Kiro's terminal UI shows a risk-confirmation
+        // gate for that flag. Trust the documented core tools directly instead.
+        args.push(`--trust-tools=${TRUSTED_CORE_TOOLS}`);
+      }
+      if (resume && resumeSessionId) {
+        args.push('--resume-id', resumeSessionId);
+      }
+      if (initialPrompt) {
+        args.push(initialPrompt);
+      }
+      return args;
     },
 
-    buildResumeCommand() {
-      return null;
+    buildResumeCommand({ cliSessionId }) {
+      if (!cliSessionId) return null;
+      return `kiro-cli chat --resume-id ${cliSessionId}`;
     },
+
+    passesInitialPromptViaArgs: true,
 
     async writeInput(pty: PtyHandle, content: string) {
       if (pty.sendText && pty.sendSpecialKeys) {
-        pty.sendText(content);
+        const lines = content.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].length > 0) pty.sendText(lines[i]);
+          if (i < lines.length - 1) {
+            pty.sendSpecialKeys('C-j');
+            await delay(50);
+          }
+        }
         await delay(200);
         pty.sendSpecialKeys('Enter');
       } else {
-        pty.write(content);
+        pty.write(content.replace(/\n/g, '\x0a'));
         await delay(1000);
         pty.write('\r');
       }
@@ -37,6 +60,7 @@ export function createKiroCliAdapter(pathOverride?: string): CliAdapter {
     readyPattern: undefined,
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,
+    skillsDir: '~/.kiro/skills',
   };
 }
 

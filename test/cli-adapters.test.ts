@@ -1423,22 +1423,50 @@ describe('kimi buildArgs', () => {
 describe('kiro-cli buildArgs', () => {
   const adapter = createKiroCliAdapter('/usr/bin/kiro-cli');
 
-  it('starts kiro-cli without unsupported default flags', () => {
+  it('starts the documented chat command and pre-trusts core tools by default', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-kiro', resume: false });
-    expect(args).toEqual([]);
+    expect(args).toEqual(['chat', '--trust-tools=read,write,shell']);
   });
 
-  it('does not invent resume, model, or initial prompt flags', () => {
+  it('omits trust flags when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-kiro', resume: false, disableCliBypass: true });
+    expect(args).toEqual(['chat']);
+  });
+
+  it('passes the initial prompt as the documented chat positional input', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-kiro', resume: false, initialPrompt: 'hello kiro' });
+    expect(args).toEqual(['chat', '--trust-tools=read,write,shell', 'hello kiro']);
+    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+  });
+
+  it('resumes a specific Kiro session id when available', () => {
     const args = adapter.buildArgs({
       sessionId: 'sess-kiro',
       resume: true,
       resumeSessionId: 'kiro-native-session',
-      model: 'custom-model',
-      initialPrompt: 'hello kiro',
     });
-    expect(args).toEqual([]);
+    expect(args).toEqual(['chat', '--trust-tools=read,write,shell', '--resume-id', 'kiro-native-session']);
     expect(adapter.buildResumeCommand?.({ sessionId: 'sess-kiro', cliSessionId: 'kiro-native-session' }))
-      .toBeNull();
+      .toBe('kiro-cli chat --resume-id kiro-native-session');
+  });
+
+  it('does not use directory-latest resume without an explicit Kiro session id', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-kiro', resume: true });
+    expect(args).toEqual(['chat', '--trust-tools=read,write,shell']);
+    expect(args).not.toContain('--resume');
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-kiro' })).toBeNull();
+  });
+
+  it('ignores model because Kiro has no chat --model flag', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-kiro', resume: false, model: 'claude-opus-4.8' });
+    expect(args).toEqual(['chat', '--trust-tools=read,write,shell']);
+    expect(args).not.toContain('--model');
+    expect(args).not.toContain('claude-opus-4.8');
+  });
+
+  it('keeps Kiro auth, settings, skills, and SQLite sessions real in the sandbox', () => {
+    expect(adapter.authPaths).toEqual(['~/.kiro']);
+    expect(adapter.skillsDir).toBe('~/.kiro/skills');
   });
 });
 
