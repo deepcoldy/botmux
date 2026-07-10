@@ -80,6 +80,13 @@ const STATUS_LABEL: Record<string, string> = {
 const HELP_KIND_LABEL: Record<string, string> = {
   access: '缺权限', ambiguous: '需求歧义', impossible: '做不到', repeated_failure: '反复失败', other: '其它',
 };
+/** missing_repo rides on kind=access with a stable blocker prefix (attention.ts
+ *  uses the same sniff) — surface it as its own label wherever help kind shows. */
+function helpKindLabel(help?: { blocker: string; kind?: string }): string {
+  if (!help) return '求助';
+  if (help.kind === 'access' && help.blocker.trim().startsWith('缺少项目环境：')) return '缺项目环境';
+  return HELP_KIND_LABEL[help.kind ?? 'other'] ?? '求助';
+}
 
 // ── lifecycle stages ────────────────────────────────────────────────────────
 type StageState = 'done' | 'active' | 'fail' | 'pending';
@@ -182,7 +189,7 @@ function goalRow(g: BoardGoal, selected: boolean): string {
   return `<button class="gb-goal${selected ? ' sel' : ''}" data-goal="${escapeHtml(g.goalChatId)}">
     <div class="gb-goal-top">
       <span class="gb-goal-name" title="${name}">${name}</span>
-      <span class="gb-goal-frac"${cancelled ? ` title="另有 ${cancelled} 已取消"` : ''}>${c.accepted}/${denom}</span>
+      <span class="gb-goal-frac"${cancelled ? ` title="另有 ${cancelled} 已取消"` : ''}>${denom ? `${c.accepted}/${denom}` : '—'}</span>
     </div>
     <div class="gb-bar" title="${pct}% 已验收${cancelled ? ` · ${cancelled} 已取消` : ''}">${segs || '<span class="gb-seg gb-seg-empty" style="flex:1"></span>'}</div>
     <div class="gb-goal-foot">
@@ -213,7 +220,7 @@ function taskRow(t: BoardTask, selected: boolean): string {
         ? '<span class="gb-via gb-via-bridge" title="执行者未主动提交，监管者独立核验后代办提交并验收">🤝 监管者代办</span>'
         : '<span class="gb-via gb-via-agent" title="监管者自主核验后裁定">🧠 自主验收</span>';
   const helpTag = t.status === 'blocked' && t.help
-    ? `<span class="gb-via gb-via-blocked" title="${escapeHtml(t.help.blocker)}">🚧 ${escapeHtml(HELP_KIND_LABEL[t.help.kind ?? 'other'] ?? '求助')}</span>`
+    ? `<span class="gb-via gb-via-blocked" title="${escapeHtml(t.help.blocker)}">🚧 ${escapeHtml(helpKindLabel(t.help))}</span>`
     : t.status === 'escalated' && t.escalation
       ? `<span class="gb-via gb-via-escalated" title="${escapeHtml(t.escalation.reason)}">🙋 等人拍板</span>`
       : t.status === 'cancelled' && t.cancellation
@@ -307,7 +314,7 @@ function attemptsHtml(t: BoardTask): string {
 function helpHtml(t: BoardTask): string {
   const parts: string[] = [];
   if (t.help) {
-    const kind = t.help.kind ? `<span class="gb-help-kind">${escapeHtml(HELP_KIND_LABEL[t.help.kind] ?? t.help.kind)}</span> ` : '';
+    const kind = t.help.kind ? `<span class="gb-help-kind">${escapeHtml(helpKindLabel(t.help))}</span> ` : '';
     const who = t.help.workerOpenId ? ` <span class="gb-muted">— ${escapeHtml(botName(t.help.workerOpenId))}</span>` : '';
     parts.push(`<div class="gb-kv"><span>🚧 执行者求助</span><div>${kind}${escapeHtml(t.help.blocker)}${who}</div></div>`);
   }
@@ -453,7 +460,9 @@ function attnRow(t: AttnTask): string {
   const title = [t.disposition.next, t.title || t.taskId, displayGoalName(t.goalChatId, t.goalTitle)]
     .filter(Boolean)
     .join(' · ');
-  const canWake = !['needsHuman', 'completed'].includes(t.disposition.bucket);
+  // missing_repo 行已有三个对症处置按钮，泛用的「通知监管者」纯重复，藏掉。
+  const canWake = !['needsHuman', 'completed'].includes(t.disposition.bucket)
+    && t.disposition.reason !== 'help:missing_repo';
   const actionLabel = t.disposition.bucket === 'readyToVerify' ? '通知验收' : '通知监管者';
   const wake = canWake
     ? `<button type="button" class="attn-action attn-wake" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}">${actionLabel}</button>`
