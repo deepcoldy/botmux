@@ -189,8 +189,17 @@ function findDisallowedCardCallback(value: unknown, path = 'card'): string | nul
   if (!isRecord(value)) return null;
 
   if (value.type === 'callback') return `${path}.type`;
-  if (isRecord(value.value) && typeof value.value.action === 'string') {
-    return `${path}.value.action`;
+  // botmux routes card actions on TWO `value` discriminators, not just `action`:
+  //   - `value.action` — buttons (close/restart/land/grant/voice_summary/…)
+  //   - `value.key`    — select_static dropdowns (adopt_select /
+  //                      adopt_resume_select / codex_app_thread_select /
+  //                      repo_worktree), see card-handler dropdown branches.
+  // A CLI-supplied card carrying EITHER would reach those host-side handlers
+  // once a user clicks/selects, so reject both — matching only `action` left the
+  // dropdown namespace open.
+  if (isRecord(value.value)) {
+    if (typeof value.value.action === 'string') return `${path}.value.action`;
+    if (typeof value.value.key === 'string') return `${path}.value.key`;
   }
 
   for (const [key, child] of Object.entries(value)) {

@@ -260,6 +260,27 @@ describe('normalizeInteractiveCardInput', () => {
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.error).toContain('callback');
   });
+
+  it('rejects value.key dropdowns (adopt/worktree namespace, not just value.action)', () => {
+    // Replicates botmux's own select_static shape (card-builder.ts): the dropdown
+    // dispatch discriminator is `value.key`, not `value.action`. A hand-crafted
+    // card mimicking it must be rejected too, else it reaches the adopt/worktree
+    // handlers once an operator picks an option.
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      config: { wide_screen_mode: true },
+      elements: [{
+        tag: 'action',
+        actions: [{
+          tag: 'select_static',
+          options: [{ text: { tag: 'plain_text', content: 'x' }, value: 'om_target' }],
+          value: { key: 'adopt_select', root_id: 'om_target' },
+        }],
+      }],
+    }));
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain('.value.key');
+  });
 });
 
 describe('sendVideoAttachments (best-effort media messages)', () => {
