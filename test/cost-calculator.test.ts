@@ -489,7 +489,7 @@ describe('getSessionTokenUsage', () => {
     })).toEqual({
       in: 150,
       out: 30,
-      inputTokens: 150,
+      inputTokens: 90,
       outputTokens: 30,
       cacheReadTokens: 60,
       cacheCreateTokens: 0,
@@ -517,7 +517,7 @@ describe('getSessionTokenUsage', () => {
           info: {
             total_token_usage: {
               input_tokens: 52634,
-              cached_input_tokens: 0,
+              cached_input_tokens: 12000,
               output_tokens: 307,
             },
           },
@@ -532,14 +532,42 @@ describe('getSessionTokenUsage', () => {
     })).toEqual({
       in: 52634,
       out: 307,
-      inputTokens: 52634,
+      inputTokens: 40634,
       outputTokens: 307,
-      cacheReadTokens: 0,
+      cacheReadTokens: 12000,
       cacheCreateTokens: 0,
       turns: 0,
       model: 'openrouter-1',
     });
     expect(findTraexRolloutBySessionId).toHaveBeenCalledWith('traex-sid');
+  });
+
+  it('clamps Codex cache buckets to raw input before deriving uncached input', () => {
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue('codex-sid');
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/home/testuser/.codex/sessions/rollout-codex-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: {
+            input_tokens: 50,
+            cached_input_tokens: 45,
+            cache_creation_input_tokens: 20,
+            output_tokens: 7,
+          },
+        },
+      },
+    }));
+
+    const usage = getSessionTokenUsage({ cliId: 'codex', sessionId: 'botmux-sid' });
+    expect(usage).toMatchObject({
+      in: 50,
+      inputTokens: 0,
+      cacheReadTokens: 45,
+      cacheCreateTokens: 5,
+    });
+    expect(usage!.inputTokens + usage!.cacheReadTokens + usage!.cacheCreateTokens).toBe(usage!.in);
   });
 
   it('reports CoCo nested response_meta usage without counting agent_end duplicates', () => {
@@ -594,7 +622,7 @@ describe('getSessionTokenUsage', () => {
     });
   });
 
-  it('reports Aiden checkpoint usage_metadata without double-counting cache read', () => {
+  it('partitions Aiden raw input into bounded uncached/cache buckets while preserving dashboard in', () => {
     vi.mocked(findAidenLatestCheckpointBySessionId).mockReturnValue('/home/testuser/.aiden/checkpoints/ws/aiden-sid/latest-checkpoint.json');
     setupJsonl(JSON.stringify({
       checkpoint: {
@@ -611,7 +639,7 @@ describe('getSessionTokenUsage', () => {
                 input_tokens: 100,
                 output_tokens: 20,
                 total_tokens: 120,
-                input_token_details: { cache_read: 40 },
+                input_token_details: { cache_read: 40, cache_creation: 70 },
               },
             },
             {
@@ -620,7 +648,7 @@ describe('getSessionTokenUsage', () => {
                 input_tokens: 150,
                 output_tokens: 30,
                 total_tokens: 180,
-                input_token_details: { cache_read: 60 },
+                input_token_details: { cache_read: 60, cache_creation: 20 },
               },
             },
           ],
@@ -634,10 +662,10 @@ describe('getSessionTokenUsage', () => {
     })).toEqual({
       in: 250,
       out: 50,
-      inputTokens: 250,
+      inputTokens: 70,
       outputTokens: 50,
       cacheReadTokens: 100,
-      cacheCreateTokens: 0,
+      cacheCreateTokens: 80,
       turns: 2,
       model: 'aiden-model',
     });
@@ -709,7 +737,7 @@ describe('getSessionTokenUsage', () => {
     expect(getSessionTokenUsage({ cliId: 'codex', sessionId: 'botmux-sid' })).toEqual({
       in: 150,
       out: 30,
-      inputTokens: 150,
+      inputTokens: 90,
       outputTokens: 30,
       cacheReadTokens: 60,
       cacheCreateTokens: 0,

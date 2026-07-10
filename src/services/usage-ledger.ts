@@ -23,8 +23,12 @@ import { logger } from '../utils/logger.js';
 import { getSessionTokenUsage, type SessionTokenUsage } from '../core/cost-calculator.js';
 import type { DaemonSession } from '../core/types.js';
 
+export type InputTokenSemantics = 'includes_cache' | 'uncached';
+
 export interface UsageLedgerRecord {
-  v: 1;
+  v: 2;
+  /** `inputTokens` / `totalInputTokens` exclude both cache buckets. */
+  inputTokenSemantics: 'uncached';
   /** 'ownership' marks a zero-delta marker written at session spawn so
    *  consumers can exclude the session from native parsers BEFORE its first
    *  positive delta lands; absent for normal usage records. */
@@ -78,6 +82,9 @@ interface SessionBaseline {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreateTokens: number;
+  /** Missing on v1 state/ledger baselines. For Codex/TraeX/Aiden those legacy
+   *  baselines used includes_cache prompt input and must be migrated once. */
+  inputTokenSemantics?: InputTokenSemantics;
   recordedAt: string;
   /** Bumped on every baseline reset (shrink, explicit anchor) so identical
    *  totals transitions in different epochs get distinct recordIds. */
@@ -85,7 +92,7 @@ interface SessionBaseline {
 }
 
 interface LedgerState {
-  v: 1;
+  v: 2;
   sessions: { [sessionId: string]: SessionBaseline };
 }
 
@@ -108,6 +115,43 @@ function baselineMemoryKey(larkAppId: string | undefined, sessionId: string): st
 
 function finiteNum(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
+function inputTokenSemantics(v: unknown): InputTokenSemantics | undefined {
+  return v === 'includes_cache' || v === 'uncached' ? v : undefined;
+}
+
+/** Convert any persisted baseline into the producer's current mutually
+ *  exclusive accounting contract before comparing candidates or diffing.
+ *  v1 Codex/TraeX/Aiden baselines had no marker and stored raw includes_cache input;
+ *  other v1 producers already stored uncached input and remain unchanged. */
+function normalizeBaseline(
+  baseline: SessionBaseline | undefined | null,
+  cliId: string | undefined,
+): SessionBaseline | undefined {
+  if (!baseline) return undefined;
+  const semantics = inputTokenSemantics(baseline.inputTokenSemantics);
+  const semanticsPresent = Object.prototype.hasOwnProperty.call(baseline, 'inputTokenSemantics');
+  const includedCache = semantics === 'includes_cache'
+    || (!semanticsPresent && (cliId === 'codex' || cliId === 'traex' || cliId === 'aiden'));
+  if (!includedCache) {
+    return { ...baseline, inputTokenSemantics: 'uncached' };
+  }
+
+  // Mirror the native parser's bounded partitioning. Persisted legacy cache
+  // counters can be inconsistent; each bucket is capped by the remaining raw
+  // prompt total so the migrated buckets still sum exactly to that total.
+  const rawInputTokens = Math.max(0, baseline.inputTokens);
+  const cacheReadTokens = Math.min(rawInputTokens, Math.max(0, baseline.cacheReadTokens));
+  const afterCacheRead = rawInputTokens - cacheReadTokens;
+  const cacheCreateTokens = Math.min(afterCacheRead, Math.max(0, baseline.cacheCreateTokens));
+  return {
+    ...baseline,
+    inputTokens: afterCacheRead - cacheCreateTokens,
+    cacheReadTokens,
+    cacheCreateTokens,
+    inputTokenSemantics: 'uncached',
+  };
 }
 
 /** Reconstruct the newest baseline for a session from the ledger files
@@ -142,11 +186,13 @@ function baselineFromLedger(dir: string, sessionId: string): SessionBaseline | n
       } catch { /* skip malformed lines */ }
     }
     if (latest) {
+      const semanticsPresent = Object.prototype.hasOwnProperty.call(latest, 'inputTokenSemantics');
       return {
         inputTokens: finiteNum(latest.totalInputTokens),
         outputTokens: finiteNum(latest.totalOutputTokens),
         cacheReadTokens: finiteNum(latest.totalCacheReadTokens),
         cacheCreateTokens: finiteNum(latest.totalCacheCreateTokens),
+        ...(semanticsPresent ? { inputTokenSemantics: latest.inputTokenSemantics } : {}),
         recordedAt: typeof latest.ts === 'string' ? latest.ts : new Date(0).toISOString(),
         epoch: finiteNum(latest.epoch),
       };
@@ -173,15 +219,16 @@ function resolveBaseline(
   dir: string,
   larkAppId: string | undefined,
   sessionId: string,
+  cliId: string | undefined,
   stateBaseline: SessionBaseline | undefined,
 ): SessionBaseline | undefined {
   const key = baselineMemoryKey(larkAppId, sessionId);
   let remembered = sessionBaselineMemory.get(key);
   if (remembered === undefined) {
-    remembered = baselineFromLedger(dir, sessionId);
+    remembered = normalizeBaseline(baselineFromLedger(dir, sessionId), cliId) ?? null;
     sessionBaselineMemory.set(key, remembered);
   }
-  return newerBaseline(stateBaseline, remembered);
+  return newerBaseline(normalizeBaseline(stateBaseline, cliId), normalizeBaseline(remembered, cliId));
 }
 
 /** Baselines for sessions idle longer than this are pruned from state.json. */
@@ -203,10 +250,10 @@ function loadState(dir: string, larkAppId?: string): LedgerState {
   try {
     const parsed = JSON.parse(readFileSync(statePath(dir, larkAppId), 'utf8'));
     if (parsed && typeof parsed === 'object' && parsed.sessions && typeof parsed.sessions === 'object') {
-      return { v: 1, sessions: parsed.sessions };
+      return { v: 2, sessions: parsed.sessions };
     }
   } catch { /* first run or corrupt state — start fresh */ }
-  return { v: 1, sessions: {} };
+  return { v: 2, sessions: {} };
 }
 
 function saveState(dir: string, larkAppId: string | undefined, state: LedgerState, now: Date): void {
@@ -267,7 +314,7 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
     mkdirSync(dir, { recursive: true });
 
     const state = loadState(dir, args.larkAppId);
-    const prev = resolveBaseline(dir, args.larkAppId, args.sessionId, state.sessions[args.sessionId]);
+    const prev = resolveBaseline(dir, args.larkAppId, args.sessionId, args.cliId, state.sessions[args.sessionId]);
     const cur = args.usage;
     const prevEpoch = prev?.epoch ?? 0;
 
@@ -281,6 +328,7 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
       outputTokens: cur.outputTokens,
       cacheReadTokens: cur.cacheReadTokens,
       cacheCreateTokens: cur.cacheCreateTokens,
+      inputTokenSemantics: 'uncached',
       recordedAt: now.toISOString(),
       epoch: prevEpoch,
     };
@@ -300,7 +348,8 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
     }
 
     const record: UsageLedgerRecord = {
-      v: 1,
+      v: 2,
+      inputTokenSemantics: 'uncached',
       recordId: deterministicRecordId(args.sessionId, prevEpoch, prev, cur),
       ts: now.toISOString(),
       epoch: prevEpoch,
@@ -353,12 +402,13 @@ export function anchorSessionUsage(args: RecordSessionUsageArgs): void {
     mkdirSync(dir, { recursive: true });
 
     const state = loadState(dir, args.larkAppId);
-    const prev = resolveBaseline(dir, args.larkAppId, args.sessionId, state.sessions[args.sessionId]);
+    const prev = resolveBaseline(dir, args.larkAppId, args.sessionId, args.cliId, state.sessions[args.sessionId]);
     const baseline: SessionBaseline = {
       inputTokens: args.usage.inputTokens,
       outputTokens: args.usage.outputTokens,
       cacheReadTokens: args.usage.cacheReadTokens,
       cacheCreateTokens: args.usage.cacheCreateTokens,
+      inputTokenSemantics: 'uncached',
       recordedAt: now.toISOString(),
       // Anchors start a new epoch: transitions after a re-anchor must never
       // collide with recordIds from before it.
@@ -464,7 +514,8 @@ export function recordSessionOwnership(args: RecordSessionOwnershipArgs): UsageL
     mkdirSync(dir, { recursive: true });
 
     const record: UsageLedgerRecord = {
-      v: 1,
+      v: 2,
+      inputTokenSemantics: 'uncached',
       kind: 'ownership',
       recordId,
       ts: now.toISOString(),
@@ -530,7 +581,7 @@ export function reconcileUsageForDaemonSession(ds: DaemonSession, opts?: DaemonS
     if (!args.usage) return null;
     const dir = opts?.ledgerDir ?? defaultLedgerDir();
     const state = loadState(dir, args.larkAppId);
-    if (resolveBaseline(dir, args.larkAppId, args.sessionId, state.sessions[args.sessionId])) {
+    if (resolveBaseline(dir, args.larkAppId, args.sessionId, args.cliId, state.sessions[args.sessionId])) {
       return recordSessionUsage({ ...args, usage: args.usage, ...opts });
     }
     anchorSessionUsage({ ...args, usage: args.usage, ...opts });
