@@ -1285,7 +1285,7 @@ botmux dispatch --chat-id "<goalChatId>" --title "<subtask>" \\
 - **派活方向（你→让远端 bot 真接活）**：同平台团队 bot 走团队互信；如果没走平台团队，才需要对方给你 \`/grant\`（或把你放进 allowedUsers），否则你的 @ 派活可能被对方权限门挡掉。
 - **代码任务先声明项目，不传本机路径**：跨设备 \`dispatch\` 用 \`--needs-repo <git remote URL>\`（优先 canonical remote URL，别用你机器上的绝对路径）。接收端会在启动执行者前检查自己的本地目录：路径存在、是 git repo、origin 匹配才开工；检查通过后协议块会被剥掉，执行者只看到任务正文。
 - **远端缺项目时按求助处理**：接收端会直接发 \`kind=access\` 的“缺少项目环境”求助，不弹仓库选择卡、不暂存任务。你先查交付记录，再选择：把“准备项目环境（clone/setup）”作为一个可验收任务、换执行者，或升级给人；不要让 daemon 擅自判失败。
-- **它在 goal 群用「交付信封」交活 / 求助**（纯文本，daemon 自动摄取成 TaskReported / TaskHelpRequested）。⚠️ 必须**原始文本**，别用会渲染卡片的 \`botmux send\`。把下面格式**抄进给它的 brief**：
+- **它在 goal 群用「交付信封」交活 / 求助**（纯文本，daemon 自动摄取成 TaskReported / TaskHelpRequested）。⚠️ 必须**原始文本**，别用会渲染卡片的 \`botmux send\`；信封 header 必须是消息第一段（前面只允许 @ 监管者，不能加“已完成”等开场白）。把下面格式**抄进给它的 brief**：
   \`\`\`
   [botmux-report v1]
   taskId: <taskId>
