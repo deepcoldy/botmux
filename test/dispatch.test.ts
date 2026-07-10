@@ -26,7 +26,6 @@ import {
   resolveSendTarget,
 } from '../src/core/dispatch.js';
 import { parseDispatchRepoRequirement } from '../src/core/repo-requirement.js';
-import { parseEventMessage } from '../src/im/lark/message-parser.js';
 
 describe('parseDispatchBotSpec', () => {
   it('parses a bare open_id', () => {
@@ -111,28 +110,20 @@ describe('buildDispatchMessages', () => {
     expect(parsed?.content).toContain('完成任务');
     expect(parsed?.content).toContain('Alice：coder');
     expect(parsed?.content).not.toContain('[botmux-dispatch v1]');
+    expect(r.kickoffText).toContain('<at user_id="ou_a"></at>（coder）');
+    expect(r.kickoffText).toContain('完成任务');
   });
 
-  it('survives the real Lark post parser before receiver preflight', () => {
+  it('builds a plain-text kickoff that survives receiver preflight', () => {
     const r = buildDispatchMessages({
       title: 't',
       brief: '跨设备任务',
       bots,
       repoRequirement: { taskId: 'task-post-1', repo: 'git@git.example.com:team/repo.git' },
     });
-    const event = {
-      sender: { sender_id: { open_id: 'ou_supervisor', union_id: 'on_supervisor' }, sender_type: 'bot' },
-      message: {
-        message_id: 'om_dispatch',
-        message_type: 'post',
-        content: JSON.stringify({ zh_cn: { title: '', content: r.threadContent } }),
-        chat_id: 'oc_goal',
-        chat_type: 'group',
-        create_time: '1000',
-      },
-    };
-    const larkText = parseEventMessage(event).parsed.content;
-    expect(parseDispatchRepoRequirement(larkText)).toMatchObject({
+    expect(r.kickoffText).toContain('<at user_id="ou_a"></at>');
+    expect(r.kickoffText).toContain('<at user_id="ou_b"></at>');
+    expect(parseDispatchRepoRequirement(r.kickoffText)).toMatchObject({
       taskId: 'task-post-1',
       repo: 'git@git.example.com:team/repo.git',
       content: expect.stringContaining('跨设备任务'),

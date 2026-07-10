@@ -7165,12 +7165,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   } catch { /* best effort: workers without botUnionId fall back to open_id auth */ }
   const hasWorkerBotUnionIds = workerBotUnionIds.some(Boolean);
   const { sendMessage, replyMessage } = await import('./im/lark/client.js');
-  const briefJson = JSON.stringify({ zh_cn: { title: '', content: built.threadContent } });
-
   try {
     // --into: append into an existing thread (activate standby bots / coordinate).
     if (intoRoot) {
-      const kickoffId = await replyMessage(appId, intoRoot, briefJson, 'post', true);
+      const kickoffId = await replyMessage(appId, intoRoot, built.kickoffText, 'text', true);
       console.log(JSON.stringify({
         success: true, mode: 'into', threadRootId: intoRoot,
         kickoffMessageId: kickoffId, chatId: targetChatId, bots: built.mentionedOpenIds,
@@ -7248,12 +7246,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         : await sendMessage(appId, targetChatId, prime.text, 'text');
     }
 
-    // 3. Brief kickoff — default posts into the goal group; `--new-topic`
-    //    replies inside the seed thread. Skipped in --standby.
+    // 3. Brief kickoff — use plain text with native <at> tags. Cross-app bot
+    //    mentions in rich posts can degrade to an unresolved @_user_N at the
+    //    receiver and be silently dropped before repo preflight. The text path
+    //    is the same proven path as /repo prime. Skipped in --standby.
     if (!standby) {
       kickoffId = seedId
-        ? await replyMessage(appId, seedId, briefJson, 'post', true)
-        : await sendMessage(appId, targetChatId, briefJson, 'post');
+        ? await replyMessage(appId, seedId, built.kickoffText, 'text', true)
+        : await sendMessage(appId, targetChatId, built.kickoffText, 'text');
     }
 
     console.log(JSON.stringify({

@@ -34,6 +34,8 @@ export interface DispatchMessages {
   seedText: string;
   /** Lark 'post' content (paragraphs of nodes) for the threaded kickoff. */
   threadContent: PostParagraph[];
+  /** Plain-text kickoff with real <at> tags; cross-app bot delivery uses this. */
+  kickoffText: string;
   /** open_ids @-mentioned in the kickoff — the bots that will be triggered. */
   mentionedOpenIds: string[];
 }
@@ -109,9 +111,17 @@ export function buildDispatchMessages(input: {
     }
   }
 
+  // Bot-authored rich posts can arrive at the receiving app with an unresolved
+  // @_user_N placeholder and no usable mention identity. Plain text <at> tags
+  // take Lark's native mention path and reliably populate the receiver event.
+  const kickoffText = content.map(paragraph => paragraph.map((node) =>
+    node.tag === 'at' ? `<at user_id="${node.user_id}"></at>` : node.text,
+  ).join('')).join('\n');
+
   return {
     seedText,
     threadContent: content,
+    kickoffText,
     mentionedOpenIds: input.bots.map(b => b.openId),
   };
 }
