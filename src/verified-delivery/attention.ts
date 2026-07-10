@@ -88,6 +88,9 @@ export function classifyTaskDisposition(task: ClassifiableTask, ctx: Disposition
     case 'escalated':
       return { bucket: 'needsHuman', reason: 'escalated', next: '等人拍板' };
     case 'blocked':
+      if (task.help?.kind === 'access' && task.help.blocker.trim().startsWith('缺少项目环境：')) {
+        return { bucket: 'blocked', reason: 'help:missing_repo', next: '缺少项目环境，需准备或换执行者' };
+      }
       return { bucket: 'blocked', reason: task.help?.kind ? `help:${task.help.kind}` : 'help', next: '等监管澄清/重派' };
     case 'reported':
       return { bucket: 'readyToVerify', reason: 'awaiting_verdict', next: '已有提交，等验收' };
@@ -127,6 +130,8 @@ export interface AttentionTask {
   taskId: string;
   title?: string;
   workerNames?: string[];
+  /** Canonical repo requirement, when this task needs a project checkout. */
+  requiredRepo?: string;
   disposition: TaskDisposition;
   /** Risk provenance. Omitted in the pure board; IPC enrichment stamps it. */
   source?: 'ledger' | 'live';
@@ -182,6 +187,7 @@ function toAttentionTask(goal: GoalBoardGoal, t: GoalBoardTask, disposition: Tas
   if (goal.title) at.goalTitle = goal.title;
   if (t.title) at.title = t.title;
   if (t.workerNames?.length) at.workerNames = t.workerNames;
+  if (t.requiredRepo) at.requiredRepo = t.requiredRepo;
   const last = taskLastActivity(t);
   if (last !== undefined) at.lastActivityAt = last;
   const ev = recentEvidenceOf(t);

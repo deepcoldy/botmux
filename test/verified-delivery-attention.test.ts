@@ -29,6 +29,16 @@ describe('classifyTaskDisposition — the shared pure rule', () => {
     expect(classifyTaskDisposition(task('blocked')).bucket).toBe('blocked'); // help record absent → still blocked
   });
 
+  it('project-environment help gets a specific, actionable disposition', () => {
+    expect(classifyTaskDisposition(task('blocked', {
+      help: { blocker: '缺少项目环境：https://github.com/acme/repo.git', kind: 'access' },
+    }))).toEqual({
+      bucket: 'blocked',
+      reason: 'help:missing_repo',
+      next: '缺少项目环境，需准备或换执行者',
+    });
+  });
+
   it('reported → readyToVerify (ledger-only: status=reported, no verdict)', () => {
     expect(classifyTaskDisposition(task('reported'))).toEqual({ bucket: 'readyToVerify', reason: 'awaiting_verdict', next: '已有提交，等验收' });
   });
@@ -153,6 +163,18 @@ describe('buildGoalAttentionBoard — cross-goal rollup', () => {
     expect(b.systemRisk[0].disposition.reason).toBe('reassign_budget_exhausted');
     expect(b.inProgress.map((t) => t.taskId)).toEqual(['t-ok']); // unaffected task stays inProgress
     expect(b.counts).toMatchObject({ systemRisk: 1, inProgress: 1 });
+  });
+
+  it('carries the required repo onto a missing-project attention row', () => {
+    const led = openLedger({ baseDir });
+    led.append(draft({ type: 'TaskDispatched', taskId: 't-repo', chatId: 'oc_g', idempotencyKey: 'd:repo', ts: T(0), payload: { taskId: 't-repo', requiredRepo: 'https://github.com/acme/repo.git' } }));
+    led.append(draft({ type: 'TaskHelpRequested', actor: 'worker', taskId: 't-repo', chatId: 'oc_g', idempotencyKey: 'h:repo', ts: T(1), payload: { taskId: 't-repo', blocker: '缺少项目环境：https://github.com/acme/repo.git', kind: 'access' } }));
+
+    expect(buildGoalAttentionBoard({ baseDir }).blocked[0]).toMatchObject({
+      taskId: 't-repo',
+      requiredRepo: 'https://github.com/acme/repo.git',
+      disposition: { reason: 'help:missing_repo' },
+    });
   });
 
   it('without context, a bare ledger projection has no store-derived systemRisk', () => {
