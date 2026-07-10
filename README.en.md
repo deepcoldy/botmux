@@ -311,7 +311,7 @@ ISO timestamp (`2026-05-01T10:00`).
 When a CLI spawns inside a botmux session it automatically gets
 `~/.botmux/bin` on PATH plus a set of ready-to-use Skills:
 
-- `botmux send` — send a message to the current thread (text, images, files, @mention)
+- `botmux send` — send a message to the current thread (text, images, files, interactive card JSON, @mention)
 - `botmux history` — fetch session history (topic groups → in-thread, regular groups → whole chat)
 - `botmux quoted <message_id>` — when the user @ed the bot via Lark's quote-reply UI, fetch the quoted message on demand
 - `botmux bots list` — discover bots + their `open_id`s

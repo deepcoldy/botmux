@@ -4,6 +4,7 @@ import { validateSkillPackageDir } from './package.js';
 import {
   discoverGitSkillCandidates,
   discoverLocalSkillCandidates,
+  installAgentbuddySkill,
   installGitSkillsFromSource,
   installGitSkill,
   installLocalSkillsFromSource,
@@ -281,8 +282,13 @@ export function runSkillsAdminCommand(args: string[]): AdminCommandResult {
     }
     if (sub === 'install') {
       const source = args[1];
-      if (!source) return { code: 2, stdout: '', stderr: 'usage: botmux skills install <path|git|github> [--path <repo-path>] [--ref <ref>] [--skill <name>] [--all]\n' };
+      if (!source) return { code: 2, stdout: '', stderr: 'usage: botmux skills install <path|git|github|agentbuddy> [--path <repo-path>] [--ref <ref>] [--skill <name>] [--all]\n' };
       const parsed = parseSkillInstallSource(source);
+      if (parsed.kind === 'agentbuddy') {
+        const pkgs = installAgentbuddySkill(parsed.agentbuddy!);
+        if (pkgs.length === 0) return { code: 1, stdout: '', stderr: 'agentbuddy_no_skill_produced\n' };
+        return { code: 0, stdout: `installed ${pkgs.map((pkg) => pkg.name).join(', ')}\n`, stderr: '' };
+      }
       const selection = {
         skillNames: selectedSkillNames(args),
         all: hasFlag(args, '--all'),

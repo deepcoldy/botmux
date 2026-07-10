@@ -6,7 +6,7 @@ When a CLI enters a botmux session, it automatically gets `~/.botmux/bin` in its
 
 | Command / Skill | Purpose |
 |------|------|
-| `botmux send` | Send a message to the current topic (text / image / file / @mention) |
+| `botmux send` | Send a message to the current topic (text / image / file / interactive card JSON / @mention) |
 | `botmux history` | Read the current session's message history (topic groups pull within the topic; regular groups pull the whole group) |
 | `botmux quoted <message_id>` | Read the quoted message (when a user @-mentions the bot via the quote UI) |
 | `botmux bots list` | List the bots in the current group and their open_id (for `--mention`) |

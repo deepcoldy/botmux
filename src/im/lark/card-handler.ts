@@ -2197,7 +2197,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   // Handle repo select card (option-based dropdowns: plain switch, or
   // `repo_worktree` = create a worktree from the picked repo and open that).
-  const isWorktreeOpen = action?.value?.key === 'repo_worktree';
+  // Require an explicit, recognized key: botmux's own dropdowns always set
+  // `repo_switch` / `repo_worktree` (card-builder.ts). Treating a keyless
+  // `option + root_id` as a plain switch let a hand-crafted card drive the
+  // session's working dir to an arbitrary path — reject anything unrecognized.
+  const repoKey = action?.value?.key;
+  if (repoKey !== 'repo_switch' && repoKey !== 'repo_worktree') {
+    logger.warn(`Card action: unrecognized repo dropdown key ${repoKey ?? '(none)'} — ignoring`);
+    return;
+  }
+  const isWorktreeOpen = repoKey === 'repo_worktree';
   const selectedPath = option;
   const rootId = action?.value?.root_id;
   logger.info(`Card action: repo ${isWorktreeOpen ? 'worktree-open' : 'switch'} to ${selectedPath} (root_id: ${rootId})`);

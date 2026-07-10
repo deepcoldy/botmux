@@ -72,6 +72,17 @@ describe('dashboard skill install request parsing', () => {
     });
   });
 
+  it('routes agentbuddy sources to the direct-install (no discover) path', () => {
+    expect(parseDashboardSkillInstallRequest({ source: 'agentbuddy:example.com/team/mkt/deploy@1.2.3' })).toEqual({
+      kind: 'agentbuddy',
+      agentbuddy: { group: 'example.com/team/mkt', skill: 'deploy', version: '1.2.3' },
+    });
+    expect(parseDashboardSkillInstallRequest({ source: 'agentbuddy:collection/col123abc' })).toEqual({
+      kind: 'agentbuddy',
+      agentbuddy: { collection: 'col123abc' },
+    });
+  });
+
   it('sanitizes batch local-link sources: trims, drops blanks/non-strings, dedups', () => {
     expect(parseInstallLocalLinksSources({ sources: ['  /a/skills/x  ', '', '/a/skills/x', 42, null, '/b/skills/y'] }))
       .toEqual(['/a/skills/x', '/b/skills/y']);

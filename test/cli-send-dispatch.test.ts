@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   dispatchPrimaryMessage,
   findStdinAliasAttachment,
+  normalizeInteractiveCardInput,
   sendFileAttachments,
   sendVideoAttachments,
   shouldSendAsPureVideo,
@@ -201,6 +202,204 @@ describe('validateVideoAttachments', () => {
       ok: false,
       error: '不支持的视频封面格式: /tmp/a.svg（支持 .png/.jpg/.jpeg/.gif/.webp/.bmp）',
     });
+  });
+});
+
+describe('normalizeInteractiveCardInput', () => {
+  const card = {
+    schema: '2.0',
+    body: {
+      direction: 'vertical',
+      elements: [{ tag: 'markdown', content: 'hello' }],
+    },
+  };
+
+  it('accepts direct card JSON and serializes it for interactive send', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify(card));
+
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.card).toEqual(card);
+    expect(res.cardJson).toBe(JSON.stringify(card));
+  });
+
+  it('unwraps msg_type=interactive with card object or string content', () => {
+    const wrappedCard = normalizeInteractiveCardInput(JSON.stringify({
+      msg_type: 'interactive',
+      card,
+    }));
+    expect(wrappedCard.ok).toBe(true);
+    if (wrappedCard.ok) expect(wrappedCard.card).toEqual(card);
+
+    const wrappedContent = normalizeInteractiveCardInput(JSON.stringify({
+      msg_type: 'interactive',
+      content: JSON.stringify(card),
+    }));
+    expect(wrappedContent.ok).toBe(true);
+    if (wrappedContent.ok) expect(wrappedContent.card).toEqual(card);
+  });
+
+  it('rejects non-interactive wrappers, invalid JSON, and non-object cards', () => {
+    expect(normalizeInteractiveCardInput('{').ok).toBe(false);
+    expect(normalizeInteractiveCardInput(JSON.stringify({ msg_type: 'text', content: '{}' })).ok).toBe(false);
+    expect(normalizeInteractiveCardInput(JSON.stringify({ msg_type: 'interactive', content: '[]' })).ok).toBe(false);
+  });
+
+  it('rejects callback actions so custom cards cannot enter botmux action handlers', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      schema: '2.0',
+      body: {
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: 'close' },
+          behaviors: [{ type: 'callback', value: { action: 'close', root_id: 'om_root' } }],
+        }],
+      },
+    }));
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain('callback');
+  });
+
+  it('rejects value.key dropdowns (adopt/worktree namespace, not just value.action)', () => {
+    // Replicates botmux's own select_static shape (card-builder.ts): the dropdown
+    // dispatch discriminator is `value.key`, not `value.action`. A hand-crafted
+    // card mimicking it must be rejected too, else it reaches the adopt/worktree
+    // handlers once an operator picks an option.
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      config: { wide_screen_mode: true },
+      elements: [{
+        tag: 'action',
+        actions: [{
+          tag: 'select_static',
+          options: [{ text: { tag: 'plain_text', content: 'x' }, value: 'om_target' }],
+          value: { key: 'adopt_select', root_id: 'om_target' },
+        }],
+      }],
+    }));
+
+    // Rejected as an interactive control (select_static); the botmux `value.key`
+    // dispatch surface is a subset of that broader display-only rejection.
+    expect(res.ok).toBe(false);
+  });
+
+  it('rejects a keyless option dropdown carrying only value.root_id (plain repo-switch surface)', () => {
+    // The repo-select branch acts on a bare `option + value.root_id` with NO
+    // action/key — a plain switch to the picked path. A card carrying just
+    // root_id (no action, no key) must still be rejected, else it can drive a
+    // session's working dir to an arbitrary path once an operator picks.
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{
+        tag: 'action',
+        actions: [{
+          tag: 'select_static',
+          options: [{ text: { tag: 'plain_text', content: '/etc' }, value: '/etc' }],
+          value: { root_id: 'om_target' },
+        }],
+      }],
+    }));
+
+    // Rejected as an interactive control; the bare-root_id repo-switch surface is
+    // a subset of the display-only rejection (and the handler seal is the
+    // authoritative backstop — see card-handler-repo-select tests).
+    expect(res.ok).toBe(false);
+  });
+
+  it('rejects real form submit/reset buttons (they also fire a card callback)', () => {
+    // Feishu's real form-button fields, per settings-card.ts / card-builder.ts:
+    //   v2 → form_action_type: 'submit' | 'reset'
+    //   v1 → action_type: 'form_submit' | 'form_reset'
+    const v2Submit = normalizeInteractiveCardInput(JSON.stringify({
+      schema: '2.0',
+      body: {
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: 'submit' },
+          form_action_type: 'submit',
+        }],
+      },
+    }));
+    expect(v2Submit.ok).toBe(false);
+    if (!v2Submit.ok) expect(v2Submit.error).toContain('.form_action_type');
+
+    const v1Submit = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{
+        tag: 'action',
+        actions: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: 'submit' },
+          action_type: 'form_submit',
+        }],
+      }],
+    }));
+    expect(v1Submit.ok).toBe(false);
+    if (!v1Submit.ok) expect(v1Submit.error).toContain('.action_type');
+  });
+
+  it('rejects legacy callback controls even with a non-botmux value payload (display-only)', () => {
+    // Custom cards are display + open_url only. A v1 callback button / select
+    // carrying an arbitrary `value` (no botmux action/key/root_id) still fires
+    // card.action.trigger on click — reject it too, so the card can't ship inert
+    // interactive controls and the "display-only" promise holds.
+    const button = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{ tag: 'action', actions: [{ tag: 'button', text: { tag: 'plain_text', content: 'x' }, value: { foo: 'bar' } }] }],
+    }));
+    expect(button.ok).toBe(false);
+
+    const select = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{ tag: 'action', actions: [{ tag: 'select_static', options: [{ text: { tag: 'plain_text', content: 'o' }, value: 'o' }], value: { foo: 'bar' } }] }],
+    }));
+    expect(select.ok).toBe(false);
+
+    // Also a value-less interactive control (selection still fires a callback).
+    const bareSelect = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{ tag: 'action', actions: [{ tag: 'select_static', options: [{ text: { tag: 'plain_text', content: 'o' }, value: 'o' }] }] }],
+    }));
+    expect(bareSelect.ok).toBe(false);
+  });
+
+  it('rejects a button with a STRING callback value (action.value may be string, not just object)', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{ tag: 'action', actions: [{ tag: 'button', text: { tag: 'plain_text', content: 'x' }, value: 'opaque-callback' }] }],
+    }));
+    expect(res.ok).toBe(false);
+  });
+
+  it('rejects a plain button with no open_url (still fires a callback on click)', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{ tag: 'action', actions: [{ tag: 'button', text: { tag: 'plain_text', content: 'x' } }] }],
+    }));
+    expect(res.ok).toBe(false);
+  });
+
+  it('rejects select_img (interactive image-select component)', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{ tag: 'action', actions: [{ tag: 'select_img', options: [{ img_key: 'k', value: 'v' }] }] }],
+    }));
+    expect(res.ok).toBe(false);
+  });
+
+  it('still accepts pure display cards: open_url buttons, images, columns, charts with tagged/nested value data', () => {
+    const display = normalizeInteractiveCardInput(JSON.stringify({
+      schema: '2.0',
+      header: { template: 'blue', title: { tag: 'plain_text', content: 'Status' } },
+      body: {
+        elements: [
+          { tag: 'markdown', content: '**done**' },
+          { tag: 'img', img_key: 'img_x', alt: { tag: 'plain_text', content: '' } },
+          { tag: 'column_set', columns: [
+            { tag: 'column', elements: [{ tag: 'markdown', content: 'CPU' }] },
+            { tag: 'column', elements: [{ tag: 'markdown', content: '99%' }] },
+          ] },
+          // chart_spec is free-form user data; a data point that happens to carry
+          // a `tag` + `value` object must NOT be misread as an interactive control.
+          { tag: 'chart', chart_spec: { series: [{ tag: 'prod', value: { x: 1, y: 2 } }] } },
+          { tag: 'button', text: { tag: 'plain_text', content: 'open' }, behaviors: [{ type: 'open_url', default_url: 'https://x' }] },
+          { tag: 'button', text: { tag: 'plain_text', content: 'jump' }, url: 'https://y' },
+        ],
+      },
+    }));
+    expect(display.ok).toBe(true);
   });
 });
 

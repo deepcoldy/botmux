@@ -5548,6 +5548,45 @@ try{
   try{term.loadAddon(new CanvasAddon.CanvasAddon())}catch(_e2){}
 }
 fit.fit();
+// xterm parses writes asynchronously.  On a brand-new page the first tmux /
+// zellij frame (or relay history seed) can therefore finish after the browser
+// has initialised the viewport scrollbar, leaving that viewport at scrollTop=0
+// even though the buffer already contains newer rows.  Follow only the initial
+// write burst and explicitly settle at the bottom.  Any deliberate user scroll
+// cancels this so loading a busy session never fights the reader.
+var _initialFollow=true,_initialFollowT=0;
+function _cancelInitialFollow(){
+  if(!_initialFollow)return;
+  _initialFollow=false;clearTimeout(_initialFollowT);
+}
+function _settleInitialBottom(){
+  if(!_initialFollow)return;
+  try{term.scrollToBottom()}catch(_e){}
+  clearTimeout(_initialFollowT);
+  _initialFollowT=setTimeout(function(){
+    if(!_initialFollow)return;
+    try{term.scrollToBottom()}catch(_e){}
+    _initialFollow=false;
+  },500);
+}
+var _initialViewport=term.element&&term.element.querySelector('.xterm-viewport');
+var _initialTerminalRoot=document.getElementById('terminal');
+if(_initialTerminalRoot){
+  // Listen above xterm's own root: its wheel handler can stop propagation at
+  // the target, while this ancestor still sees capture-phase user intent.
+  _initialTerminalRoot.addEventListener('wheel',_cancelInitialFollow,{capture:true,passive:true});
+  _initialTerminalRoot.addEventListener('touchstart',_cancelInitialFollow,{capture:true,passive:true});
+}
+if(_initialViewport){
+  _initialViewport.addEventListener('pointerdown',function(e){
+    // A pointer press on the native scrollbar targets the viewport itself;
+    // presses on terminal cells target the screen/canvas and keep following.
+    if(e.target===_initialViewport)_cancelInitialFollow();
+  },{capture:true});
+}
+window.addEventListener('keydown',function(e){
+  if(e.key==='PageUp'||e.key==='PageDown'||e.key==='Home'||e.key==='End')_cancelInitialFollow();
+},{capture:true});
 // ── OSC 52 clipboard ──
 var _clipBuf='';
 function _doCopy(text){
@@ -5633,7 +5672,7 @@ window.addEventListener('resize',onViewportResize);
     // Intercept OSC 52 clipboard sequence from tmux (set-clipboard on)
     var m=data.match(/\\x1b\\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\\x07|\\x1b\\\\)/);
     if(m){try{_clipBuf=new TextDecoder().decode(Uint8Array.from(atob(m[1]),function(c){return c.charCodeAt(0)}));_doCopy(_clipBuf);_showCopied()}catch(ex){}}
-    term.write(data);
+    term.write(data,_settleInitialBottom);
   };
   ws.onclose=function(){ws_=null;el.textContent='disconnected';el.className='err';setTimeout(connect,2000)};
   ws.onerror=function(){ws.close()};

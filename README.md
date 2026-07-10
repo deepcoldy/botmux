@@ -176,7 +176,7 @@ BACKEND_TYPE=pty botmux start
 
 CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一组开箱即用的 Skill：
 
-- `botmux send` — 向当前话题发消息（支持文本、图片、文件、@mention）
+- `botmux send` — 向当前话题发消息（支持文本、图片、文件、interactive 卡片 JSON、@mention）
 - `botmux history` — 读取当前会话历史消息（话题/thread 会话拉话题内，普通群 chat-scope 会话拉整群）
 - `botmux quoted <message_id>` — 用户用引用 UI @ 机器人时，按需读取被引用的那条消息
 - `botmux bots list` — 查询当前群聊的机器人及 open_id

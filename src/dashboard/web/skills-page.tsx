@@ -203,6 +203,7 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
               <span className="skills-source-help">
                 <span><strong>{tr('skills.sourceHelpRemoteLabel')}</strong>{tr('skills.sourceHelpRemote')}</span>
                 <span><strong>{tr('skills.sourceHelpLocalLabel')}</strong>{tr('skills.sourceHelpLocal')}</span>
+                <span><strong>{tr('skills.sourceHelpAgentbuddyLabel')}</strong>{tr('skills.sourceHelpAgentbuddy')}</span>
               </span>
             )}
             helpLabel={tr('skills.source')}
@@ -533,6 +534,24 @@ function SkillsPage() {
     }
   }
 
+  // Translate the backend's terse install error codes into actionable messages.
+  // agentbuddy runs on the deploy host, so its failures (missing CLI, not logged
+  // in) need host-side guidance the operator can act on. Non-agentbuddy codes
+  // fall through unchanged.
+  function mapInstallError(raw: string): string {
+    const msg = raw || '';
+    if (msg.startsWith('agentbuddy_not_found')) return tr('skills.agentbuddyNotFound');
+    if (msg.startsWith('agentbuddy_command_failed')) {
+      return /login|credential|unauthor|not logged|401|403/i.test(msg)
+        ? tr('skills.agentbuddyNeedsLogin')
+        : tr('skills.agentbuddyCommandFailed');
+    }
+    if (msg.startsWith('agentbuddy_clear_telemetry_failed') || msg.startsWith('agentbuddy_telemetry_not_stripped')) return tr('skills.agentbuddyTelemetryFailed');
+    if (msg.startsWith('agentbuddy_no_skill_produced')) return tr('skills.agentbuddyNoSkill');
+    if (msg.startsWith('invalid_agentbuddy')) return tr('skills.agentbuddyInvalid');
+    return msg;
+  }
+
   async function submitSkillInstall(skillNames?: string[]): Promise<void> {
     setInstallBusy(true);
     try {
@@ -544,7 +563,7 @@ function SkillsPage() {
       await waitForSkillJob(body.job as SkillJob, setInstallStatus);
       if (mountedRef.current) clearInstallDiscovery();
     } catch (err: any) {
-      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
+      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, ok: false });
     } finally {
       if (mountedRef.current) setInstallBusy(false);
     }
@@ -568,6 +587,15 @@ function SkillsPage() {
       setInstallStatus({ text: tr('skills.sourceRequired'), ok: false });
       return;
     }
+    // The 'agentbuddy:' source kind (see parseSkillInstallSource) resolves its
+    // own skill set, so skip the discover-then-select step and install directly.
+    // Prefix is matched inline here — the parser lives in a server-only module
+    // the browser bundle can't import.
+    if (installSource.trim().startsWith('agentbuddy:')) {
+      setInstallSelectionOpen(false);
+      await submitSkillInstall();
+      return;
+    }
     try {
       setInstallSelectionOpen(false);
       const skills = await discoverInstallCandidates();
@@ -583,7 +611,7 @@ function SkillsPage() {
       setInstallStatus({ text: tr('skills.scanFound', { count: skills.length }), ok: true });
       setInstallSelectionOpen(true);
     } catch (err: any) {
-      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
+      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, ok: false });
     }
   }
 
@@ -614,7 +642,7 @@ function SkillsPage() {
       await refresh();
       if (mountedRef.current) setInstallStatus({ text: tr('skills.saved'), ok: true });
     } catch (err: any) {
-      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
+      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, ok: false });
     } finally {
       if (mountedRef.current) setDiscoveryBusy(false);
     }
@@ -631,7 +659,7 @@ function SkillsPage() {
       if (!mountedRef.current) return;
       setTrustProjectSkills(body.trustProjectSkills === 'all' ? 'all' : next);
     } catch (err: any) {
-      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${err?.message ?? err}`);
+      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
     } finally {
       if (mountedRef.current) setGlobalBusy(null);
     }
@@ -648,7 +676,7 @@ function SkillsPage() {
       if (!mountedRef.current) return;
       setDelivery(body.delivery === 'prompt' || body.delivery === 'native' ? body.delivery : next);
     } catch (err: any) {
-      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${err?.message ?? err}`);
+      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
     } finally {
       if (mountedRef.current) setGlobalBusy(null);
     }
@@ -661,7 +689,7 @@ function SkillsPage() {
       if (!mountedRef.current) return;
       await waitForSkillJob(body.job as SkillJob, setInstallStatus);
     } catch (err: any) {
-      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${err?.message ?? err}`);
+      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
     } finally {
       if (mountedRef.current) setSkillBusy(null);
     }
@@ -695,7 +723,7 @@ function SkillsPage() {
           return;
         }
       }
-      window.alert(`${tr('skills.failed')}: ${err?.message ?? err}`);
+      window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
     } finally {
       if (mountedRef.current) setSkillBusy(null);
     }
@@ -716,7 +744,7 @@ function SkillsPage() {
       if (mountedRef.current) {
         setBotStatuses(statuses => ({
           ...statuses,
-          [appId]: { text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false },
+          [appId]: { text: `${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, ok: false },
         }));
       }
     } finally {
