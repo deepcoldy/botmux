@@ -24,10 +24,12 @@ interface BoardTask {
   acceptanceCriteria?: AcceptanceCriteria; acceptanceHint?: string;
   latestVerdict?: 'accepted' | 'rejected'; rejectReason?: string; autoReconciled?: boolean;
   dispatchedAt?: number; latestReportedAt?: number; latestVerdictAt?: number; acceptedAt?: number; rejectedAt?: number;
+  cancelledAt?: number;
   checkedBy?: string; evidenceChecked?: string[]; ranCommands?: string[]; evidence?: BoardEvidence[];
   attempts: BoardAttempt[];
   help?: { blocker: string; kind?: string; workerOpenId?: string };
   escalation?: { reason: string; by?: string; retryBrief?: string };
+  cancellation?: { reason: string; by?: string };
 }
 interface BoardNarration { goalChatId: string; type: string; taskId?: string; text: string; ts: number }
 interface GoalNotificationRetryRecord {
@@ -38,7 +40,7 @@ interface GoalNotificationRetryRecord {
 interface BoardGoal {
   goalChatId: string; title?: string; hasCharter: boolean;
   charterUpdatedAt?: string; charterContent?: string; lastActivityAt?: number;
-  counts: { dispatched: number; reported: number; accepted: number; rejected: number; blocked: number; escalated: number; total: number };
+  counts: { dispatched: number; reported: number; accepted: number; rejected: number; blocked: number; escalated: number; cancelled?: number; total: number };
   tasks: BoardTask[];
   narrations?: BoardNarration[];
 }
@@ -59,7 +61,7 @@ interface AttnTask {
   // taskId is normally always set, but the wire format omits it for malformed
   // tasks (an escalation materialized without one) — keep it optional and guard.
   goalChatId: string; goalTitle?: string; taskId?: string; title?: string;
-  workerNames?: string[]; disposition: AttnDisposition; lastActivityAt?: number;
+  workerNames?: string[]; requiredRepo?: string; disposition: AttnDisposition; lastActivityAt?: number;
   recentEvidence?: AttnEvidence;
   // present only on live-probe systemRisk rows (IPC enrichment, not a ledger fact):
   source?: 'ledger' | 'live'; liveKind?: string; liveDetail?: string; sessionId?: string; larkAppId?: string;
@@ -73,7 +75,7 @@ interface AttentionBoard {
 
 const STATUS_LABEL: Record<string, string> = {
   dispatched: '待交付', reported: '已提交', accepted: '已验收', rejected: '已驳回',
-  blocked: '求助中', escalated: '已升级人工',
+  blocked: '求助中', escalated: '已升级人工', cancelled: '已取消',
 };
 const HELP_KIND_LABEL: Record<string, string> = {
   access: '缺权限', ambiguous: '需求歧义', impossible: '做不到', repeated_failure: '反复失败', other: '其它',
@@ -161,23 +163,28 @@ function rejectCount(t: BoardTask): number { return t.attempts.filter(a => a.ver
 // ── left rail: goals as operational summary rows ──────────────────────────────
 function goalRow(g: BoardGoal, selected: boolean): string {
   const c = g.counts;
-  const pct = c.total ? Math.round((c.accepted / c.total) * 100) : 0;
-  const segs = (['accepted', 'reported', 'dispatched', 'blocked', 'escalated', 'rejected'] as const)
-    .map(k => c[k] ? `<span class="gb-seg gb-seg-${k}" style="flex:${c[k]}"></span>` : '')
+  const cancelled = c.cancelled ?? 0;
+  // 取消的任务不算「要做的活」：分数与百分比的分母剔除 cancelled，
+  // 进度条仍画灰段留痕，hover 注明数量。
+  const denom = c.total - cancelled;
+  const pct = denom ? Math.round((c.accepted / denom) * 100) : 0;
+  const segs = (['accepted', 'reported', 'dispatched', 'blocked', 'escalated', 'rejected', 'cancelled'] as const)
+    .map(k => (c[k] ?? 0) ? `<span class="gb-seg gb-seg-${k}" style="flex:${c[k]}"></span>` : '')
     .join('');
   const badges = [
     c.escalated > 0 ? `<span class="gb-mini gb-mini-esc">${c.escalated} 待你拍</span>` : '',
     c.blocked > 0 ? `<span class="gb-mini gb-mini-blk">${c.blocked} 求助</span>` : '',
     c.dispatched + c.reported > 0 ? `<span class="gb-mini gb-mini-active">${c.dispatched + c.reported} 在跑</span>` : '',
     c.rejected > 0 ? `<span class="gb-mini gb-mini-rej">${c.rejected} 驳回</span>` : '',
+    cancelled > 0 ? `<span class="gb-mini gb-mini-quiet">${cancelled} 已取消</span>` : '',
   ].join('');
   const name = escapeHtml(goalName(g));
   return `<button class="gb-goal${selected ? ' sel' : ''}" data-goal="${escapeHtml(g.goalChatId)}">
     <div class="gb-goal-top">
       <span class="gb-goal-name" title="${name}">${name}</span>
-      <span class="gb-goal-frac">${c.accepted}/${c.total}</span>
+      <span class="gb-goal-frac"${cancelled ? ` title="另有 ${cancelled} 已取消"` : ''}>${c.accepted}/${denom}</span>
     </div>
-    <div class="gb-bar" title="${pct}% 已验收">${segs || '<span class="gb-seg gb-seg-empty" style="flex:1"></span>'}</div>
+    <div class="gb-bar" title="${pct}% 已验收${cancelled ? ` · ${cancelled} 已取消` : ''}">${segs || '<span class="gb-seg gb-seg-empty" style="flex:1"></span>'}</div>
     <div class="gb-goal-foot">
       <span class="gb-badges">${badges || '<span class="gb-mini gb-mini-quiet">无在跑</span>'}</span>
       <span class="gb-goal-time">${g.lastActivityAt ? fmtTs(g.lastActivityAt) : (g.hasCharter ? '仅 charter' : '')}</span>
@@ -209,7 +216,9 @@ function taskRow(t: BoardTask, selected: boolean): string {
     ? `<span class="gb-via gb-via-blocked" title="${escapeHtml(t.help.blocker)}">🚧 ${escapeHtml(HELP_KIND_LABEL[t.help.kind ?? 'other'] ?? '求助')}</span>`
     : t.status === 'escalated' && t.escalation
       ? `<span class="gb-via gb-via-escalated" title="${escapeHtml(t.escalation.reason)}">🙋 等人拍板</span>`
-      : '';
+      : t.status === 'cancelled' && t.cancellation
+        ? `<span class="gb-via gb-via-cancelled" title="${escapeHtml(t.cancellation.reason)}">⏹ ${escapeHtml(t.cancellation.reason.length > 18 ? t.cancellation.reason.slice(0, 18) + '…' : t.cancellation.reason)}</span>`
+        : '';
   const accTag = t.acceptanceCriteria ? '<span class="gb-acc-dot" title="结构化验收标准">◆</span>'
     : t.acceptanceHint ? '<span class="gb-acc-dot gb-acc-legacy" title="自由文本验收口径">◇</span>' : '';
   const primary = t.title
@@ -250,6 +259,7 @@ function timelineHtml(t: BoardTask): string {
   const steps: Array<[string, number | undefined]> = [
     ['派发', t.dispatchedAt], ['提交', t.latestReportedAt],
     [t.latestVerdict === 'rejected' ? '驳回' : '验收', t.latestVerdictAt],
+    ['取消', t.status === 'cancelled' ? t.cancelledAt : undefined],
   ];
   const dispatched = t.dispatchedAt;
   return `<div class="gb-timeline">${steps.filter(([, ts]) => ts !== undefined).map(([label, ts]) => {
@@ -315,6 +325,8 @@ function helpHtml(t: BoardTask): string {
  *  Shown for the states that actually need a human call (升级人工 / worker 求助);
  *  the ledger stays the truth — this only feeds L2 a decision, never writes a verdict. */
 function decisionHtml(t: BoardTask, goalChatId: string): string {
+  // 已取消是终态：没有待决策，不给决策框（曾升级过的任务 escalation view 仍在，须显式排除）。
+  if (t.status === 'cancelled') return '';
   if (!(t.escalation || t.status === 'blocked')) return '';
   const cue = t.escalation ? '这条已升级到你，拍个方向给监管者' : '执行者在求助，给监管者一个处置指示';
   return `<div class="gb-sec gb-sec-decide" data-goal="${escapeHtml(goalChatId)}" data-task="${escapeHtml(t.taskId)}">
@@ -386,6 +398,17 @@ function sealHtml(t: BoardTask): string {
     </div>
   </div>`;
 }
+/** Cancelled banner — terminal, quiet. Names the reason/actor/time and reminds
+ *  that only an explicit re-dispatch (same taskId) can reactivate the task. */
+function cancelHtml(t: BoardTask): string {
+  if (t.status !== 'cancelled' || !t.cancellation) return '';
+  const by = t.cancellation.by ? ` · 操作人 ${escapeHtml(botName(t.cancellation.by))}` : '';
+  const when = t.cancelledAt ? ` · ${fmtTs(t.cancelledAt)}` : '';
+  const pending = t.attempts.filter(a => !a.verdict).length;
+  return `<div class="gb-kv gb-cancelled-note"><span>⏹ 已取消</span><div>${escapeHtml(t.cancellation.reason)}${by}${when}${
+    pending ? `<div class="gb-att-reason">已有 ${pending} 份提交未验收，随任务取消</div>` : ''
+  }<div class="gb-muted">如需继续：用同一任务号重新派发即可重开</div></div></div>`;
+}
 function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
   if (!t) return '<div class="gb-detail-empty"><p>选择一个子任务<br>查看验收痕迹</p></div>';
   const heading = t.title?.trim() || '未命名任务';
@@ -399,7 +422,8 @@ function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
       return `<span class="gb-who">${escapeHtml(nm || botName(w))}</span>`;
     }).join('、')}</p>` : ''}
     ${sealHtml(t)}
-    ${(t.help || t.escalation) ? `<div class="gb-sec gb-sec-help"><h3>求助 / 升级</h3>${helpHtml(t)}</div>` : ''}
+    ${cancelHtml(t)}
+    ${(t.help || t.escalation) && t.status !== 'cancelled' ? `<div class="gb-sec gb-sec-help"><h3>求助 / 升级</h3>${helpHtml(t)}</div>` : ''}
     ${goalChatId ? decisionHtml(t, goalChatId) : ''}
     <div class="gb-sec"><h3>生命周期</h3>${timelineHtml(t)}</div>
     <div class="gb-sec"><h3>验收标准</h3>${acceptanceHtml(t)}</div>
@@ -417,7 +441,11 @@ function attnRow(t: AttnTask): string {
         ? `<span class="attn-src attn-src-live" title="${escapeHtml(t.liveDetail ?? '现场探测，可能瞬时')}">🔴 实时</span>`
         : '<span class="attn-src attn-src-ledger" title="交付记录/存储派生，稳态事实">📒 记录</span>')
     : '';
-  const sum = t.recentEvidence?.latestSummary;
+  const missingRepo = t.disposition.reason === 'help:missing_repo';
+  // 缺项目环境的行没有提交摘要可看——把「缺哪个项目」放进摘要槽，比 blocker 原文更省读。
+  const sum = missingRepo && t.requiredRepo
+    ? `缺少项目：${t.requiredRepo}`
+    : t.recentEvidence?.latestSummary;
   const ev = sum ? `<span class="attn-ev" title="${escapeHtml(sum)}">${escapeHtml(sum.length > 56 ? sum.slice(0, 56) + '…' : sum)}</span>` : '';
   const task = t.taskId
     ? `<span class="attn-task">${escapeHtml(t.title || shortId(t.taskId))}</span>`
@@ -434,10 +462,12 @@ function attnRow(t: AttnTask): string {
   // 由监管者查交付记录后执行真命令并留痕——dashboard 不直接写账、不直接派活。
   const panelActs: Array<[string, string]> = !t.taskId ? []
     : t.disposition.bucket === 'systemRisk' ? [['reassign-worker', '重派'], ['escalate-human', '升级给人']]
+    // 缺项目环境有明确处置分支：准备环境（走求助处理）/ 换有环境的执行者 / 升级给人
+    : missingRepo ? [['resolve-help', '准备环境'], ['switch-worker', '换执行者'], ['escalate-human', '升级给人']]
     : t.disposition.bucket === 'blocked' ? [['resolve-help', '处理求助'], ['escalate-human', '升级给人']]
     : [];
   const acts = panelActs.map(([act, label]) =>
-    `<button type="button" class="attn-action attn-panel-act" data-act="${act}" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}" data-reason="${escapeHtml(t.disposition.reason)}">${label}</button>`).join('');
+    `<button type="button" class="attn-action attn-panel-act" data-act="${act}" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}" data-reason="${escapeHtml(t.disposition.reason)}"${t.requiredRepo ? ` data-repo="${escapeHtml(t.requiredRepo)}"` : ''}>${label}</button>`).join('');
   const action = acts + wake;
   return `<div class="attn-row-wrap attn-${escapeHtml(t.disposition.bucket)}">
   <button type="button" class="attn-row" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}" title="${escapeHtml(title)}">
@@ -600,18 +630,28 @@ export function renderGoalsPage(root: HTMLElement): () => void {
     'escalate-human': { instruction: '请走正式「升级给人」流程（delivery escalate），附清楚背景；能预判方向就带上推荐选项。' },
     'resolve-help': { instruction: '请处理该执行者的求助：能定的直接给处置指示，不能定的再升级给人。' },
   };
+  // 缺项目环境（reason=help:missing_repo）时给更对症的指令；<repo> 由 data-repo 填充。
+  const MISSING_REPO_INSTRUCTION: Record<string, string> = {
+    'resolve-help': '执行者机器缺少项目 <repo>：请把「准备项目环境（clone/setup，可验收：目录存在且 origin 匹配）」作为任务派给它或指导它就地准备；环境就绪后用同一任务号重新派发原任务。',
+    'switch-worker': '执行者机器缺少项目 <repo>：请换一台已有该项目的执行者，用同一任务号重新派发，并在交付记录写清原因。',
+  };
   async function sendPanelAction(btn: HTMLButtonElement): Promise<void> {
     const goal = btn.dataset.goal ?? '';
     const task = btn.dataset.task ?? '';
     const act = btn.dataset.act ?? '';
     const meta = PANEL_ACT_META[act];
     if (!goal || !task || !meta) return;
+    const reason = btn.dataset.reason || '看板一键动作';
+    const override = reason === 'help:missing_repo' ? MISSING_REPO_INSTRUCTION[act] : undefined;
+    const instruction = override
+      ? override.replace('<repo>', btn.dataset.repo || '（见任务求助记录）')
+      : meta.instruction;
     const text = [
       '[panel-action v1]',
       `action: ${act}`,
       `taskId: ${task}`,
-      `reason: ${btn.dataset.reason || '看板一键动作'}`,
-      `instruction: ${meta.instruction}`,
+      `reason: ${reason}`,
+      `instruction: ${instruction}`,
     ].join('\n');
     const oldText = btn.textContent ?? '';
     btn.disabled = true;

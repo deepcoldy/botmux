@@ -8515,6 +8515,7 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .gb-seg-rejected { background: var(--danger); }
 .gb-seg-blocked { background: var(--warning); }
 .gb-seg-escalated { background: var(--warning); }
+.gb-seg-cancelled { background: var(--border-soft); opacity: .8; }
 .gb-seg-empty { background: var(--border-soft); }
 .gb-goal-foot { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
 .gb-badges { display: flex; gap: 5px; flex-wrap: wrap; }
@@ -8567,6 +8568,7 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .gb-pill-rejected { background: var(--danger-soft); color: var(--danger); }
 .gb-pill-blocked { background: var(--warning-soft); color: var(--warning); }
 .gb-pill-escalated { background: var(--warning); color: #fff; }
+.gb-pill-cancelled { background: var(--surface-muted); color: var(--faint); }
 .gb-reason { display: block; font-size: .68rem; color: var(--danger); margin-top: 2px; }
 /* verdict provenance: machine reconcile vs agent; + help/escalation rung */
 .gb-via { display: inline-flex; align-items: center; gap: 2px; font-size: .66rem; font-weight: 600; padding: 1px 6px; border-radius: 999px; margin-left: 6px; white-space: nowrap; letter-spacing: .01em; }
@@ -8575,6 +8577,11 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .gb-via-bridge { background: color-mix(in srgb, #8b5cf6 16%, transparent); color: #8b5cf6; border: 1px solid color-mix(in srgb, #8b5cf6 34%, transparent); }
 .gb-via-blocked { background: var(--warning-soft); color: var(--warning); border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent); }
 .gb-via-escalated { background: var(--warning); color: #fff; }
+.gb-via-cancelled { background: var(--surface-muted); color: var(--faint); border: 1px solid var(--border-soft); }
+/* cancelled rows read as archived: dimmed but still legible for the audit trail */
+.gb-trow:has(.gb-pill-cancelled) { opacity: .62; }
+.gb-cancelled-note { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: var(--radius); background: var(--surface-muted); color: var(--muted); }
+.gb-cancelled-note > span { font-weight: 700; color: var(--faint); }
 .gb-help-kind { font-weight: 700; color: var(--warning); }
 .gb-sec-help h3 { color: var(--warning); }
 
