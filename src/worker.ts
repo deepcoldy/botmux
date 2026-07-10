@@ -4692,6 +4692,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     disableCliBypass: cfg.disableCliBypass === true,
+    // A self-update inside the file sandbox changes only its ephemeral HOME
+    // overlay, so it cannot update the host CLI that the next restart launches.
+    disableStartupUpdateCheck: willFileSandbox,
     skillPluginDir: cfg.skillPluginDir,
     readIsolation: willReadIsolate,
   });

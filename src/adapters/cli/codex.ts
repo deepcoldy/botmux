@@ -145,7 +145,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, readIsolation }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, disableStartupUpdateCheck, readIsolation }) {
       // Read isolation for Codex is enforced by the worker's Seatbelt wrapper,
       // NOT by codex's own profile (codex 0.137 can't express a read blocklist).
       // So spawn args are unchanged — keep bypass so codex's own nested sandbox
@@ -156,6 +156,14 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         '-c',
         `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(sessionId)}`,
       ];
+      // A file-sandboxed npm global update only changes the session's ephemeral
+      // HOME overlay; the host Codex binary remains old after restart, while the
+      // persisted ~/.codex version marker can immediately offer the update again.
+      // Disable Codex's startup update check there and leave CLI updates
+      // to the host. Non-sandboxed launches keep Codex's normal update behavior.
+      if (disableStartupUpdateCheck) {
+        baseArgs.push('-c', 'check_for_update_on_startup=false');
+      }
       // Under read isolation the worker denies bots.json, so `botmux send` (a shell
       // subprocess) registers this bot from the worker-written cred FILE, keyed by
       // SESSION_DATA_DIR + BOTMUX_LARK_APP_ID. Codex does NOT forward its env to shell
@@ -284,7 +292,11 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    readyPattern: /›|\d+% left/,  // › for input box, or status bar pattern (e.g. "97% left")
+    // Codex's update picker also renders `› 1. Update now`; a bare /›/ treats
+    // that menu as the composer and lets botmux's queued first message select
+    // the update. Keep accepting the composer marker anywhere in a TUI redraw,
+    // but reject numbered menu choices.
+    readyPattern: /›(?!\s*\d+\.)|\d+% left/,
     defaultPassthroughCommands: ['/goal'],
     systemHints: BOTMUX_SHELL_HINTS,
     // Codex 0.134.0+ accepts a message while the current turn is still running:

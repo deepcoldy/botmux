@@ -359,6 +359,31 @@ describe('codex buildArgs', () => {
     ]);
   });
 
+  it('disables startup self-update when the runtime is managed outside Codex', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, disableStartupUpdateCheck: true });
+    const idx = args.indexOf('check_for_update_on_startup=false');
+    expect(idx).toBeGreaterThan(0);
+    expect(args[idx - 1]).toBe('-c');
+  });
+
+  it('keeps Codex update checks enabled for normal launches', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
+    expect(args).not.toContain('check_for_update_on_startup=false');
+  });
+
+  it('keeps the startup update override on resume before the Codex session id', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-4',
+      resume: true,
+      resumeSessionId: 'codex-session-id',
+      disableStartupUpdateCheck: true,
+    });
+    const configIdx = args.indexOf('check_for_update_on_startup=false');
+    expect(args[0]).toBe('resume');
+    expect(args[configIdx - 1]).toBe('-c');
+    expect(configIdx).toBeLessThan(args.indexOf('codex-session-id'));
+  });
+
   it('passes configured model with --model', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, model: 'gpt-5-codex' });
     const idx = args.indexOf('--model');
@@ -1163,7 +1188,11 @@ describe('readyPattern', () => {
     const adapter = createCodexAdapter('/bin/codex');
     expect(adapter.readyPattern).toBeDefined();
     expect(adapter.readyPattern!.test('›')).toBe(true);
+    expect(adapter.readyPattern!.test('redraw prefix › ask anything')).toBe(true);
+    expect(adapter.readyPattern!.test('\n  › ask anything')).toBe(true);
     expect(adapter.readyPattern!.test('97% left')).toBe(true);
+    expect(adapter.readyPattern!.test('› 1. Update now')).toBe(false);
+    expect(adapter.readyPattern!.test('\n  › 2. Skip')).toBe(false);
   });
 
   it('traex matches prompt and context indicators', () => {

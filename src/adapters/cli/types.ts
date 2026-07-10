@@ -94,6 +94,9 @@ export interface CliAdapter {
     model?: string;
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** When true, suppress startup update checks. The worker enables
+     *  this when a file sandbox makes changes to the CLI runtime ephemeral. */
+    disableStartupUpdateCheck?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */
     skillPluginDir?: string;
     /** True when this session runs under per-bot read isolation (the worker
