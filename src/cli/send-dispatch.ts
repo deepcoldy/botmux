@@ -188,11 +188,18 @@ function findDisallowedCardCallback(value: unknown, path = 'card'): string | nul
   }
   if (!isRecord(value)) return null;
 
-  // v2 behaviors that fire a server-side card.action.trigger callback:
-  //   - `callback`    — button/select/input callbacks
-  //   - `form_action` — form submit/reset (delivers form_value to the handler)
-  // open_url behaviors are display/jump only and stay allowed.
-  if (value.type === 'callback' || value.type === 'form_action') return `${path}.type`;
+  // v2 `behaviors:[{type:'callback'}]` fires a server-side card.action.trigger
+  // callback. open_url behaviors are display/jump only and stay allowed.
+  if (value.type === 'callback') return `${path}.type`;
+  // Form submit/reset buttons ALSO fire card.action.trigger (delivering
+  // form_value to the handler). Feishu marks them with real schema fields —
+  // v2 `form_action_type:'submit'|'reset'`, v1 `action_type:'form_submit'|
+  // 'form_reset'` (see settings-card.ts / card-builder.ts) — NOT a
+  // `type:'form_action'`. Reject those so a custom card stays display-only.
+  if (typeof value.form_action_type === 'string') return `${path}.form_action_type`;
+  if (value.action_type === 'form_submit' || value.action_type === 'form_reset') {
+    return `${path}.action_type`;
+  }
   // botmux routes card actions off the element `value` payload via SEVERAL
   // discriminators, not just `action`. A CLI-supplied card carrying ANY of them
   // reaches those host-side handlers once a user clicks/selects:

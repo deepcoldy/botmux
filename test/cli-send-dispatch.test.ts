@@ -302,23 +302,35 @@ describe('normalizeInteractiveCardInput', () => {
     if (!res.ok) expect(res.error).toContain('.value.root_id');
   });
 
-  it('rejects v2 form_action (form submit also fires a card callback)', () => {
-    const res = normalizeInteractiveCardInput(JSON.stringify({
+  it('rejects real form submit/reset buttons (they also fire a card callback)', () => {
+    // Feishu's real form-button fields, per settings-card.ts / card-builder.ts:
+    //   v2 → form_action_type: 'submit' | 'reset'
+    //   v1 → action_type: 'form_submit' | 'form_reset'
+    const v2Submit = normalizeInteractiveCardInput(JSON.stringify({
       schema: '2.0',
       body: {
         elements: [{
-          tag: 'form',
-          name: 'f',
-          elements: [{
-            tag: 'button',
-            text: { tag: 'plain_text', content: 'submit' },
-            behaviors: [{ type: 'form_action', behavior: 'submit' }],
-          }],
+          tag: 'button',
+          text: { tag: 'plain_text', content: 'submit' },
+          form_action_type: 'submit',
         }],
       },
     }));
+    expect(v2Submit.ok).toBe(false);
+    if (!v2Submit.ok) expect(v2Submit.error).toContain('.form_action_type');
 
-    expect(res.ok).toBe(false);
+    const v1Submit = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{
+        tag: 'action',
+        actions: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: 'submit' },
+          action_type: 'form_submit',
+        }],
+      }],
+    }));
+    expect(v1Submit.ok).toBe(false);
+    if (!v1Submit.ok) expect(v1Submit.error).toContain('.action_type');
   });
 });
 
