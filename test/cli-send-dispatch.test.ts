@@ -278,8 +278,9 @@ describe('normalizeInteractiveCardInput', () => {
       }],
     }));
 
+    // Rejected as an interactive control (select_static); the botmux `value.key`
+    // dispatch surface is a subset of that broader display-only rejection.
     expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.error).toContain('.value.key');
   });
 
   it('rejects a keyless option dropdown carrying only value.root_id (plain repo-switch surface)', () => {
@@ -298,8 +299,10 @@ describe('normalizeInteractiveCardInput', () => {
       }],
     }));
 
+    // Rejected as an interactive control; the bare-root_id repo-switch surface is
+    // a subset of the display-only rejection (and the handler seal is the
+    // authoritative backstop — see card-handler-repo-select tests).
     expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.error).toContain('.value.root_id');
   });
 
   it('rejects real form submit/reset buttons (they also fire a card callback)', () => {
@@ -331,6 +334,49 @@ describe('normalizeInteractiveCardInput', () => {
     }));
     expect(v1Submit.ok).toBe(false);
     if (!v1Submit.ok) expect(v1Submit.error).toContain('.action_type');
+  });
+
+  it('rejects legacy callback controls even with a non-botmux value payload (display-only)', () => {
+    // Custom cards are display + open_url only. A v1 callback button / select
+    // carrying an arbitrary `value` (no botmux action/key/root_id) still fires
+    // card.action.trigger on click — reject it too, so the card can't ship inert
+    // interactive controls and the "display-only" promise holds.
+    const button = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{ tag: 'action', actions: [{ tag: 'button', text: { tag: 'plain_text', content: 'x' }, value: { foo: 'bar' } }] }],
+    }));
+    expect(button.ok).toBe(false);
+
+    const select = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{ tag: 'action', actions: [{ tag: 'select_static', options: [{ text: { tag: 'plain_text', content: 'o' }, value: 'o' }], value: { foo: 'bar' } }] }],
+    }));
+    expect(select.ok).toBe(false);
+
+    // Also a value-less interactive control (selection still fires a callback).
+    const bareSelect = normalizeInteractiveCardInput(JSON.stringify({
+      elements: [{ tag: 'action', actions: [{ tag: 'select_static', options: [{ text: { tag: 'plain_text', content: 'o' }, value: 'o' }] }] }],
+    }));
+    expect(bareSelect.ok).toBe(false);
+  });
+
+  it('still accepts pure display cards: open_url buttons, images, columns, charts with nested value', () => {
+    const display = normalizeInteractiveCardInput(JSON.stringify({
+      schema: '2.0',
+      header: { template: 'blue', title: { tag: 'plain_text', content: 'Status' } },
+      body: {
+        elements: [
+          { tag: 'markdown', content: '**done**' },
+          { tag: 'img', img_key: 'img_x', alt: { tag: 'plain_text', content: '' } },
+          { tag: 'column_set', columns: [
+            { tag: 'column', elements: [{ tag: 'markdown', content: 'CPU' }] },
+            { tag: 'column', elements: [{ tag: 'markdown', content: '99%' }] },
+          ] },
+          { tag: 'chart', chart_spec: { series: [{ value: { x: 1, y: 2 } }] } },
+          { tag: 'button', text: { tag: 'plain_text', content: 'open' }, behaviors: [{ type: 'open_url', default_url: 'https://x' }] },
+          { tag: 'button', text: { tag: 'plain_text', content: 'jump' }, url: 'https://y' },
+        ],
+      },
+    }));
+    expect(display.ok).toBe(true);
   });
 });
 

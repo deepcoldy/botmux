@@ -178,6 +178,24 @@ function cardObjectFromValue(value: unknown, label: string): { ok: true; card: R
   return { ok: true, card };
 }
 
+// Interactive INPUT controls that fire a card.action.trigger callback on
+// use. Custom cards are display-only, so these are rejected outright (an
+// agent-sent card can't service the callback anyway). `button` is NOT here —
+// an open_url button is a legit jump; a callback button is caught by its
+// `value` payload / `behaviors` below. `checker` is Feishu's documented
+// no-callback-by-default exception; a checker that opts into a callback is
+// still caught by its `type:'callback'` behavior.
+const CALLBACK_CONTROL_TAGS = new Set([
+  'select_static', 'multi_select_static',
+  'select_person', 'multi_select_person',
+  'overflow', 'input',
+  'date_picker', 'picker_time', 'picker_datetime',
+]);
+
+// Find any element that would produce a Lark card.action.trigger callback.
+// Custom cards are display + open_url only, so ALL callback-capable controls
+// are rejected — not just the ones whose payload hits a botmux privileged
+// dispatch. Returns the offending JSON path, or null if the card is clean.
 function findDisallowedCardCallback(value: unknown, path = 'card'): string | null {
   if (Array.isArray(value)) {
     for (let i = 0; i < value.length; i++) {
@@ -200,16 +218,23 @@ function findDisallowedCardCallback(value: unknown, path = 'card'): string | nul
   if (value.action_type === 'form_submit' || value.action_type === 'form_reset') {
     return `${path}.action_type`;
   }
-  // botmux routes card actions off the element `value` payload via SEVERAL
-  // discriminators, not just `action`. A CLI-supplied card carrying ANY of them
-  // reaches those host-side handlers once a user clicks/selects:
-  //   - `value.action` — buttons (close/restart/land/grant/voice_summary/…)
-  //   - `value.key`    — select_static dropdowns (adopt_select/adopt_resume_select/
-  //                      codex_app_thread_select/repo_switch/repo_worktree)
-  //   - `value.root_id`— the session anchor every dropdown/button needs to target
-  //                      a session; the repo-select branch acts on a bare
-  //                      `option + root_id` with NO action/key (plain repo switch
-  //                      to an arbitrary path), so root_id alone must be rejected.
+  // Interactive input controls (dropdowns/pickers/inputs) — reject by tag even
+  // when they carry no `value` payload; selecting still fires a callback.
+  if (typeof value.tag === 'string' && CALLBACK_CONTROL_TAGS.has(value.tag)) {
+    return `${path}.tag(${value.tag})`;
+  }
+  // Any card ELEMENT (a node with a `tag`) carrying a `value` PAYLOAD object is
+  // a callback control — a v1 callback button/select round-trips that `value`
+  // back on click. An open_url button has `url`/`multi_url` (or an open_url
+  // behavior), never an element `value`. Tag-gated so nested non-element
+  // `value` objects (e.g. a chart data point `{value:{…}}`) don't false-trip.
+  // This also subsumes the botmux reserved routing keys (action/key/root_id)
+  // that let a card reach a privileged host handler.
+  if (typeof value.tag === 'string' && isRecord(value.value)) {
+    return `${path}.value`;
+  }
+  // Belt: reserved botmux routing discriminators anywhere, even off a tagged
+  // element (e.g. round-tripped inside a behavior `value`).
   if (isRecord(value.value)) {
     for (const field of ['action', 'key', 'root_id'] as const) {
       if (typeof value.value[field] === 'string') return `${path}.value.${field}`;
