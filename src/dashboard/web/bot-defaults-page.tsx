@@ -189,6 +189,31 @@ function substituteTargetIdField(target?: BotSubstituteTarget): SubstituteTarget
   return substituteTargetIdFields.find(field => target?.[field]?.trim()) ?? 'email';
 }
 
+/**
+ * Build the substitute target to PUT for one edited row. Returns null when the id value is
+ * blank. When the id value/field was edited, every carried-over resolved id is dropped so the
+ * server re-resolves the new value — otherwise `persisted` keeps a previously-resolved openId
+ * alongside the email and the server (which prefers openId) would substitute the stale person.
+ * An unchanged row keeps its resolved ids so the stable id is preserved.
+ */
+export function buildSubstituteTarget(
+  row: Pick<SubstituteTargetDraft, 'idField' | 'idValue' | 'name' | 'persisted' | 'originalIdField'>,
+): BotSubstituteTarget | null {
+  const idValue = row.idValue.trim();
+  if (!idValue) return null;
+  const target: BotSubstituteTarget = { ...row.persisted };
+  const idEdited = row.persisted[row.idField] !== idValue
+    || (row.originalIdField != null && row.originalIdField !== row.idField);
+  if (idEdited) {
+    for (const field of substituteTargetIdFields) delete target[field];
+  }
+  target[row.idField] = idValue;
+  const name = row.name.trim();
+  if (name) target.name = name;
+  else delete target.name;
+  return target;
+}
+
 function brandStateLabel(brand: string | null, tr: ReturnType<typeof useT>): string {
   if (brand == null) return tr('botDefaults.brandStateDefault');
   return brand.trim() === '' ? tr('botDefaults.brandStateOff') : tr('botDefaults.brandStateCustom');
@@ -1778,18 +1803,11 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
     const targets: BotSubstituteTarget[] = [];
     let invalid = false;
     for (const row of targetRows) {
-      const idValue = row.idValue.trim();
-      const name = row.name.trim();
-      if (!idValue) {
-        invalid ||= Boolean(name);
+      const target = buildSubstituteTarget(row);
+      if (!target) {
+        invalid ||= Boolean(row.name.trim());
         continue;
       }
-
-      const target = { ...row.persisted };
-      if (row.originalIdField && row.originalIdField !== row.idField) delete target[row.originalIdField];
-      target[row.idField] = idValue;
-      if (name) target.name = name;
-      else delete target.name;
       targets.push(target);
     }
 
