@@ -5,34 +5,67 @@ import type { CliAdapter, PtyHandle } from './types.js';
 import { delay } from '../../utils/timing.js';
 
 const OMP_INPUT_CHUNK_CHARS = 512;
+const OMP_INPUT_CHUNK_NEWLINES = 9;
 const OMP_INPUT_THROTTLE_MS = 20;
+const OMP_CLEAR_COOLDOWN_MS = 550;
+const BRACKETED_PASTE_START = '\x1b[200~';
+const BRACKETED_PASTE_END = '\x1b[201~';
 
-function chunkTextByCodePoint(text: string, maxChars: number): string[] {
+/** Match OMP's paste semantics before putting content on a key-event path. */
+function normalizeOmpInput(text: string): string {
+  return text
+    // Strip ANSI/VT sequences as whole units so removing ESC does not leave
+    // printable tails such as `[31m` in pasted terminal logs.
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b[ -/]*[@-~]/g, '')
+    .replace(/\r\n?/g, '\n')
+    .normalize('NFC')
+    .replace(/\t/g, '   ')
+    // Literal terminal input would interpret these as keys (Backspace, DEL,
+    // Escape, etc.). Newlines are preserved and delivered inside paste mode.
+    .replace(/[\x00-\x09\x0B-\x1F\x7F-\x9F]/g, '');
+}
+
+/** Keep every paste below OMP's `[Paste #N]` thresholds (>1000 chars or >10 lines). */
+function chunkOmpInput(text: string): string[] {
   const chunks: string[] = [];
   let current = '';
+  let newlines = 0;
   for (const ch of text) {
-    current += ch;
-    if (current.length >= maxChars) {
+    if (
+      current &&
+      (current.length + ch.length > OMP_INPUT_CHUNK_CHARS ||
+        (ch === '\n' && newlines >= OMP_INPUT_CHUNK_NEWLINES))
+    ) {
       chunks.push(current);
       current = '';
+      newlines = 0;
     }
+    current += ch;
+    if (ch === '\n') newlines++;
   }
   if (current) chunks.push(current);
   return chunks;
 }
 
-async function typeText(pty: PtyHandle, content: string): Promise<boolean> {
-  const chunks = chunkTextByCodePoint(content, OMP_INPUT_CHUNK_CHARS);
+function sendLiteral(pty: PtyHandle, text: string): boolean {
+  try {
+    if (pty.sendText) return pty.sendText(text) !== false;
+    pty.write(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function pasteTextInSafeChunks(pty: PtyHandle, content: string): Promise<boolean> {
+  const chunks = chunkOmpInput(content);
   for (const chunk of chunks) {
-    try {
-      if (pty.sendText) {
-        if (pty.sendText(chunk) === false) return false;
-      } else {
-        pty.write(chunk);
-      }
-    } catch {
-      return false;
-    }
+    // Emit the markers ourselves instead of relying on backend pasteText():
+    // tmux/zellij implement bracketed paste, while herdr's pasteText is only a
+    // literal write. One explicit wire format keeps every backend equivalent.
+    if (!sendLiteral(pty, `${BRACKETED_PASTE_START}${chunk}${BRACKETED_PASTE_END}`)) return false;
     await delay(OMP_INPUT_THROTTLE_MS);
   }
   return true;
@@ -57,6 +90,24 @@ function submitEnter(pty: PtyHandle, attempts = 3): boolean {
 /** Adapter for oh-my-pi coding agent's native TUI (`omp`). */
 export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'omp');
+  let composerDirty = false;
+  let lastClearAttemptAt = 0;
+
+  const clearComposer = async (pty: PtyHandle): Promise<boolean> => {
+    // OMP treats a second Ctrl+C within 500 ms as exit. Keep recovery clears
+    // outside that window even when consecutive terminal writes fail quickly.
+    const waitMs = OMP_CLEAR_COOLDOWN_MS - (Date.now() - lastClearAttemptAt);
+    if (waitMs > 0) await delay(waitMs);
+    lastClearAttemptAt = Date.now();
+    try {
+      if (pty.sendSpecialKeys) return pty.sendSpecialKeys('C-c') !== false;
+      pty.write('\x03');
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   return {
     id: 'oh-my-pi',
     authPaths: ['~/.omp/agent/auth.json'],
@@ -92,15 +143,40 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      // OMP collapses large bracketed pastes into a `[Paste #N]` placeholder.
-      // A programmatic Enter immediately after that placeholder can be ignored,
-      // leaving the message stranded until a human presses Enter. Type literal
-      // text instead: OMP preserves embedded newlines in the composer, and the
-      // final real Enter submits one user message. Chunking avoids tmux/PTY input
-      // buffer pressure on long botmux briefs.
-      const typed = await typeText(pty, content);
-      if (!typed) return { submitted: false };
-      if (!submitEnter(pty)) return { submitted: false };
+      const normalized = normalizeOmpInput(content);
+      if (!normalized) {
+        return {
+          submitted: false,
+          failureReason: 'OMP 输入清理控制字符后为空，未发送空消息。',
+        };
+      }
+
+      // A previous best-effort clear may itself have been dropped. Never append
+      // a new message to that unknown buffer: clear it successfully first.
+      if (composerDirty) {
+        if (!(await clearComposer(pty))) {
+          return {
+            submitted: false,
+            failureReason: 'OMP 输入框可能残留未完整消息，自动清理失败；请在终端按 Ctrl+C 清空后重试。',
+          };
+        }
+        composerDirty = false;
+      }
+
+      // OMP collapses a single large bracketed paste into `[Paste #N]`, whose
+      // immediately-following programmatic Enter can be ignored. Preserve paste
+      // sanitization (so tabs/newlines/control bytes are text, not key events),
+      // but split below both placeholder thresholds before the final real Enter.
+      const pasted = await pasteTextInSafeChunks(pty, normalized);
+      if (!pasted) {
+        composerDirty = !(await clearComposer(pty));
+        return { submitted: false };
+      }
+      if (!submitEnter(pty)) {
+        composerDirty = !(await clearComposer(pty));
+        return { submitted: false };
+      }
+      composerDirty = false;
       return { submitted: true };
     },
 
