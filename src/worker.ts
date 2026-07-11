@@ -41,6 +41,7 @@ import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
+import { resolveTerminalWriteAccess } from './core/terminal-access.js';
 import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
@@ -305,18 +306,12 @@ const writeToken = randomBytes(16).toString('hex');
  * `X-Botmux-Role` header. The central platform fronts `/s/*` and sets the role
  * (owner | teammate | guest) after authenticating the viewer, stripping any
  * client-supplied header; it reaches the worker via dashboard /s bridge →
- * terminal-proxy → here. When the header is present we trust it (platform-fronted
- * access): only `owner` may drive the terminal; everything else (teammate / guest
- * / anything else) is read-only. When the header is absent (local direct access,
- * no platform in front), fall back to the legacy write-token query param.
+ * terminal-proxy → here. A platform owner may drive the terminal directly. A
+ * matching private write-link token is an independent capability, including for
+ * a viewer who has not logged into the platform. Everyone else remains read-only.
  */
 function resolveTerminalWrite(req: IncomingMessage, tokenMatches: boolean): { hasWrite: boolean; platformReadonly: boolean } {
-  const role = req.headers['x-botmux-role'];
-  if (typeof role === 'string' && role) {
-    const hasWrite = role === 'owner';
-    return { hasWrite, platformReadonly: !hasWrite };
-  }
-  return { hasWrite: tokenMatches, platformReadonly: false };
+  return resolveTerminalWriteAccess(req.headers['x-botmux-role'], tokenMatches);
 }
 
 /** Lazily-written locked-mode zellij config for per-WS web-terminal attach

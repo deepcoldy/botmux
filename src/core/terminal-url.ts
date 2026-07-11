@@ -70,12 +70,16 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
   // subdomain (`https://m-<machineId>.<platformHost>/s/<sessionId>`). The platform
   // reverse-proxies that subdomain to this daemon's dashboard, which in turn
   // proxies `/s/*` to the local terminal proxy — so terminals are reachable
-  // centrally with no `:port`. Write access there is gated by the platform login
-  // (not a URL token), so we deliberately omit `?token=`. When 远程访问 is off the
-  // platform base is null and we fall through to the local URL behavior.
+  // centrally with no `:port`. Platform owner login grants write access, and an
+  // explicitly requested private write link keeps its worker token as an
+  // alternative capability. Public/read-only links never carry that token.
   if (proxyReady) {
     const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
-    if (platformBase) return `${platformBase}/s/${ds.session.sessionId}`;
+    if (platformBase) {
+      const base = `${platformBase}/s/${ds.session.sessionId}`;
+      if (opts.write && ds.workerToken) return `${base}?token=${ds.workerToken}`;
+      return base;
+    }
   }
   const base = proxyReady
     ? `http://${config.web.externalHost}:${getTerminalAdvertisedPort()}/s/${ds.session.sessionId}`
