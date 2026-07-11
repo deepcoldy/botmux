@@ -15,17 +15,17 @@
  * runMaintenanceTick is pure over its injected deps (unit tested); the rest is
  * production wiring.
  */
-import { execSync, spawn } from 'node:child_process';
+import { execSync, spawn, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { readGlobalConfig, type MaintenanceConfig } from '../global-config.js';
 import { evaluateDue } from './maintenance-schedule.js';
 import { anyDaemonBusy } from './daemon-heartbeat.js';
 import { writeRestartIntent, type RestartIntent } from '../services/restart-intent-store.js';
-import { isLocalDevInstall, botmuxVersion, botmuxCliEntry } from '../utils/install-info.js';
+import { isLocalDevInstall, botmuxVersion, botmuxCliEntry, botmuxInstallRoot } from '../utils/install-info.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 
 export interface MaintenanceState {
@@ -157,6 +157,37 @@ export function npmGlobalUpdateCwd(): string {
 }
 
 /**
+ * Build npm's argv for updating the same global prefix that contains the
+ * running botmux package. This matters for user-local installs such as
+ * `npm --prefix ~/.local`: plain `npm install -g` may otherwise update a
+ * different Node manager's prefix and leave the running daemon unchanged.
+ * Source checkouts and unknown layouts retain npm's normal global behavior.
+ */
+export function npmGlobalInstallArgs(
+  packageRoot: string = botmuxInstallRoot(),
+  spec = 'botmux@latest',
+): string[] {
+  const nodeModulesDir = dirname(packageRoot);
+  if (basename(nodeModulesDir) !== 'node_modules') return ['install', '-g', spec];
+  const nodeModulesParent = dirname(nodeModulesDir);
+  const prefix = basename(nodeModulesParent) === 'lib'
+    ? dirname(nodeModulesParent)
+    : nodeModulesParent;
+  return ['install', '-g', '--prefix', prefix, spec];
+}
+
+/** Run the prefix-aware update synchronously while preserving Windows npm.cmd handling. */
+export function installLatestBotmuxSync(packageRoot?: string): void {
+  const result = spawnSync('npm', npmGlobalInstallArgs(packageRoot), {
+    cwd: npmGlobalUpdateCwd(),
+    stdio: 'inherit',
+    shell: process.platform === 'win32',
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`npm install exited with ${result.status ?? result.signal ?? 'unknown status'}`);
+}
+
+/**
  * Cross-process lock target that serializes `npm install -g botmux@latest`
  * between the scheduled auto-update (this daemon process) and a
  * dashboard-triggered manual update (the separate `botmux-dashboard` process),
@@ -251,7 +282,7 @@ function productionDeps(): MaintenanceDeps {
       // timeout fast so the tick logs it and slips to the next day (the manual
       // update is already bumping to latest anyway).
       withFileLockSync(npmGlobalUpdateLockTarget(), () => {
-        execSync('npm install -g botmux@latest', { cwd: npmGlobalUpdateCwd(), stdio: 'inherit' });
+        installLatestBotmuxSync();
       }, { maxWaitMs: 500 });
     },
     writeIntent: (intent) => writeRestartIntent(intent),

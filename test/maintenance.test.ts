@@ -8,6 +8,7 @@ import {
   writeMaintenanceStateTo,
   buildRestartLauncher,
   maintenanceRestartLogPath,
+  npmGlobalInstallArgs,
   npmGlobalUpdateCwd,
   type MaintenanceDeps,
   type MaintenanceState,
@@ -176,6 +177,18 @@ describe('npmGlobalUpdateCwd', () => {
   it('runs npm global updates from HOME instead of inheriting the process cwd', () => {
     vi.stubEnv('HOME', '/home/bot');
     expect(npmGlobalUpdateCwd()).toBe('/home/bot');
+  });
+});
+
+describe('npmGlobalInstallArgs', () => {
+  it('updates the prefix that contains a POSIX npm-global install', () => {
+    expect(npmGlobalInstallArgs('/home/bot/.local/lib/node_modules/botmux')).toEqual([
+      'install', '-g', '--prefix', '/home/bot/.local', 'botmux@latest',
+    ]);
+  });
+
+  it('keeps npm defaults for a source checkout or unknown layout', () => {
+    expect(npmGlobalInstallArgs('/work/botmux')).toEqual(['install', '-g', 'botmux@latest']);
   });
 });
 
