@@ -274,7 +274,7 @@ import { notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js
 import { emitGoalNarration } from './verified-delivery/narration.js';
 import { openLedger } from './verified-delivery/ledger.js';
 import { detectUnsupportedDeliveryEnvelope, formatHelpEnvelope, parseDeliveryEnvelope, type EnvelopeEvidence } from './verified-delivery/envelope.js';
-import { formatDispatchRepoRequirement, inspectLocalRepo, parseDispatchRepoRequirement, resolveRepoRequirement } from './core/repo-requirement.js';
+import { formatDispatchRepoRequirement, inspectLocalRepoAsync, parseDispatchRepoRequirement, resolveRepoRequirement } from './core/repo-requirement.js';
 import {
   DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
   injectGoalSupervisorTurn,
@@ -15622,6 +15622,8 @@ interface DispatchRepoPreflightDeps {
   scanDirs?: string[];
   dataDir?: string;
   sendAccessHelp?: typeof sendDispatchRepoAccessHelp;
+  resolveRequirement?: typeof resolveRepoRequirement;
+  inspectRepo?: typeof inspectLocalRepoAsync;
 }
 
 async function sendDispatchRepoAccessHelp(input: {
@@ -15673,7 +15675,7 @@ async function preflightDispatchRepo(input: {
     return { handled: false };
   }
 
-  const resolution = resolveRepoRequirement({
+  const resolution = await (deps.resolveRequirement ?? resolveRepoRequirement)({
     requirement: requirement.repo,
     scanDirs: deps.scanDirs ?? getBotProjectScanDirs(input.larkAppId),
     dataDir: deps.dataDir ?? config.session.dataDir,
@@ -15688,6 +15690,7 @@ async function preflightDispatchRepo(input: {
         supervisorOpenId: input.parsed.senderId,
         taskId: requirement.taskId,
         repo: requirement.repo,
+        detail: resolution.detail,
       });
     } catch (err) {
       logger.error(`[dispatch-repo] failed to send access help task=${requirement.taskId}: ${err instanceof Error ? err.message : String(err)}`);
@@ -15700,7 +15703,7 @@ async function preflightDispatchRepo(input: {
   }
 
   if (input.existingSession) {
-    const current = inspectLocalRepo(getSessionWorkingDir(input.existingSession));
+    const current = await (deps.inspectRepo ?? inspectLocalRepoAsync)(getSessionWorkingDir(input.existingSession));
     if (!current.ok || current.remoteIdentity !== resolution.remoteIdentity) {
       try {
         await (deps.sendAccessHelp ?? sendDispatchRepoAccessHelp)({
