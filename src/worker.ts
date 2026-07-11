@@ -327,8 +327,9 @@ const DASHBOARD_TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
  * `X-Botmux-Role` header is trusted only when this machine is bound to a central
  * platform AND the request actually came through the platform proxy (proven by a
  * matching `botmux_dashboard_token` cookie — a secret a direct caller lacks).
- * Otherwise write falls back to the `?token=` gate. See
- * ./core/terminal-write-auth for the full rationale.
+ * A matching private write-link `?token=` remains an independent capability,
+ * including when the platform sees the viewer as guest. See
+ * ./core/terminal-write-auth for the full rationale and precedence.
  *
  * Both the binding and the token are read PER REQUEST, never snapshotted:
  * `botmux bind`/unbind and dashboard token rotation are hot-reloaded without

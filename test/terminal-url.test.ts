@@ -1,6 +1,22 @@
 // test/terminal-url.test.ts
-import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { config } from '../src/config.js';
+
+vi.mock('../src/global-config.js', () => ({
+  isRemoteAccessEnabled: vi.fn(() => false),
+}));
+
+// Keep publicReverseProxyBaseUrl real: the BOTMUX_PUBLIC_URL suite below drives
+// it through process.env. Only the platform machine URL is isolated from the
+// developer machine's live platform binding.
+vi.mock('../src/platform/binding.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/platform/binding.js')>();
+  return { ...actual, platformMachineBaseUrl: vi.fn(() => null) };
+});
+
+import { isRemoteAccessEnabled } from '../src/global-config.js';
+import { platformMachineBaseUrl } from '../src/platform/binding.js';
+
 import {
   setTerminalProxyPort,
   setTerminalExternalPort,
@@ -25,7 +41,11 @@ afterAll(() => {
 });
 
 describe('buildTerminalUrl', () => {
-  beforeEach(() => setTerminalProxyPort(8801));
+  beforeEach(() => {
+    vi.mocked(isRemoteAccessEnabled).mockReturnValue(false);
+    vi.mocked(platformMachineBaseUrl).mockReturnValue(null);
+    setTerminalProxyPort(8801);
+  });
 
   it('builds a read-only sub-path URL on the proxy port', () => {
     expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8801/s/sess-123`);
@@ -46,6 +66,30 @@ describe('buildTerminalUrl', () => {
   it('reflects an updated proxy port', () => {
     setTerminalProxyPort(8899);
     expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8899/s/sess-123`);
+  });
+});
+
+describe('buildTerminalUrl — platform remote access', () => {
+  beforeEach(() => {
+    setTerminalProxyPort(8801);
+    vi.mocked(isRemoteAccessEnabled).mockReturnValue(true);
+    vi.mocked(platformMachineBaseUrl).mockReturnValue('https://m-machine.botmux.example');
+  });
+
+  afterEach(() => {
+    vi.mocked(isRemoteAccessEnabled).mockReturnValue(false);
+    vi.mocked(platformMachineBaseUrl).mockReturnValue(null);
+    resetTerminalProxy();
+  });
+
+  it('keeps public platform links read-only', () => {
+    expect(buildTerminalUrl(ds)).toBe('https://m-machine.botmux.example/s/sess-123');
+  });
+
+  it('preserves the private write token on platform links', () => {
+    expect(buildTerminalUrl(ds, { write: true })).toBe(
+      'https://m-machine.botmux.example/s/sess-123?token=wtok',
+    );
   });
 });
 

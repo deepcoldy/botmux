@@ -70,14 +70,19 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
   // subdomain (`https://m-<machineId>.<platformHost>/s/<sessionId>`). The platform
   // reverse-proxies that subdomain to this daemon's dashboard, which in turn
   // proxies `/s/*` to the local terminal proxy — so terminals are reachable
-  // centrally with no `:port`. Write access there is gated by the platform login
-  // (not a URL token), so we deliberately omit `?token=`. When 远程访问 is off the
-  // platform base is null and we fall through — first to a self-hosted reverse
-  // proxy base (`BOTMUX_PUBLIC_URL`, same front-door `/s/<id>` form but token-
-  // bearing since there's no platform SSO), then to the local proxy/worker port.
+  // centrally with no `:port`. Platform owner login grants write access, and an
+  // explicitly requested private write link keeps its worker token as an
+  // alternative capability. Public/read-only links never carry that token. When
+  // 远程访问 is off the platform base is null and we fall through — first to a
+  // self-hosted reverse proxy base (`BOTMUX_PUBLIC_URL`, same front-door
+  // `/s/<id>` form), then to the local proxy/worker port.
   if (proxyReady) {
     const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
-    if (platformBase) return `${platformBase}/s/${ds.session.sessionId}`;
+    if (platformBase) {
+      const base = `${platformBase}/s/${ds.session.sessionId}`;
+      if (opts.write && ds.workerToken) return `${base}?token=${ds.workerToken}`;
+      return base;
+    }
     // 自建反代（BOTMUX_PUBLIC_URL）：走 dashboard 前门 `/s/<id>`，无 per-bot 端口、
     // 对所有 bot 通。这里没有平台 SSO 兜底，故写链接必须像本地分支一样保留 token，
     // 否则终端会裸暴露在对外域名上。
