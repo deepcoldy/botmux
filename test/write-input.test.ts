@@ -115,24 +115,33 @@ function removeClaudeKeybindings(): void {
   try { rmSync(CLAUDE_KEYBINDINGS_PATH); } catch { /* absent */ }
 }
 
-function makeTmuxPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string }) {
+function makeTmuxPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string; isReattach?: boolean }) {
   const confirmCodexSubmit = opts?.confirmCodexSubmit ?? true;
   let submittedText = '';
   return {
     write: vi.fn(),
     sendText: vi.fn((text: string) => { submittedText = text; }),
     sendSpecialKeys: vi.fn((key: string) => {
+      if (key === 'C-u') {
+        submittedText = '';
+        return;
+      }
       if (confirmCodexSubmit && key === 'Enter') appendCodexHistory(submittedText, opts?.codexSessionId);
     }),
     pasteText: vi.fn((text: string) => { submittedText = text; }),
+    isReattach: opts?.isReattach ?? false,
   } satisfies PtyHandle;
 }
 
-function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string }) {
+function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string; isReattach?: boolean }) {
   const confirmCodexSubmit = opts?.confirmCodexSubmit ?? true;
   let submittedText = '';
   return {
     write: vi.fn((data: string) => {
+      if (data === '\x15') {
+        submittedText = '';
+        return;
+      }
       if (data === '\r') {
         if (confirmCodexSubmit) appendCodexHistory(submittedText, opts?.codexSessionId);
         return;
@@ -144,6 +153,7 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
       }
       submittedText += data;
     }),
+    isReattach: opts?.isReattach ?? false,
   } satisfies PtyHandle;
 }
 
@@ -978,7 +988,7 @@ describe('genius writeInput submission confirmation', () => {
 
     expect(result).toMatchObject({ submitted: false });
     expect((result as any).recheck()).toBe(false);
-    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(4);
+    expect((pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter')).toHaveLength(4);
   });
 });
 
@@ -1101,7 +1111,7 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
     const result = await adapter.writeInput(pty, MULTILINE);
 
-    expect(result).toBeUndefined();
+    expect(result).toEqual({ submitted: true });
     expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
     expect(pty.sendText).not.toHaveBeenCalled();
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
@@ -1193,7 +1203,64 @@ describe('codex writeInput submission confirmation', () => {
     expect((result as any).recheck()).toEqual({ submitted: true, cliSessionId: 'late-codex-thread' });
     expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
     expect(pty.sendText).not.toHaveBeenCalled();
-    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(4);
+    expect((pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter')).toHaveLength(8);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('C-u');
+  });
+
+  it('re-drives a failed submit by clearing the composer and repasting once', async () => {
+    resetCodexHistory();
+    let submittedText = '';
+    let enterCount = 0;
+    const pty: PtyHandle & { isReattach: boolean } = {
+      write: vi.fn((data: string) => {
+        if (data === '\x15') {
+          submittedText = '';
+          return;
+        }
+        submittedText += data;
+      }),
+      sendText: vi.fn((text: string) => { submittedText = text; }),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key === 'C-u') {
+          submittedText = '';
+          return;
+        }
+        if (key !== 'Enter') return;
+        enterCount++;
+        if (enterCount <= 4) return;
+        appendCodexHistory(submittedText, 'retry-thread');
+      }),
+      pasteText: vi.fn((text: string) => { submittedText = text; }),
+      isReattach: false,
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: 'retry-thread' });
+    expect(pty.pasteText).toHaveBeenCalledTimes(2);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('C-u');
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('waits longer before the first Enter when the tmux pane is reattached', async () => {
+    resetCodexHistory();
+    vi.useFakeTimers();
+    try {
+      const pty = makeTmuxPty({ codexSessionId: 'reattach-thread', isReattach: true });
+      const adapter = createCodexAdapter('/bin/codex');
+      const promise = adapter.writeInput(pty, MULTILINE);
+
+      await vi.advanceTimersByTimeAsync(39);
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('Enter');
+
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await expect(promise).resolves.toEqual({ submitted: true, cliSessionId: 'reattach-thread' });
+      expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
