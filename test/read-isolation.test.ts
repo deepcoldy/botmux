@@ -7,11 +7,22 @@ import {
   buildV2DenyPaths,
   buildV2DenyRegexes,
   buildV2CarveOuts,
+  buildWriteSandboxRules,
   sendCredFilePath,
   assertSafeAppId,
   normalizeIsolationPath,
   type V2IsolationContext,
+  type WriteSandboxContext,
 } from '../src/adapters/cli/read-isolation.js';
+
+const ws = (o: Partial<WriteSandboxContext> = {}): WriteSandboxContext => ({
+  homeDir: '/Users/bot',
+  botmuxHome: '/Users/bot/.botmux',
+  sessionDataDir: '/Users/bot/.botmux/data',
+  workingDir: '/Users/bot/projects/app',
+  currentAppId: 'cli_self',
+  ...o,
+});
 
 const v2 = (o: Partial<V2IsolationContext> = {}): V2IsolationContext => ({
   homeDir: '/Users/bot',
@@ -313,6 +324,64 @@ describe('evaluateReadIsolationGate (fail-closed, single decision point)', () =>
     const r = evaluateReadIsolationGate({ ...ok, sessionDataDirSet: false });
     expect(r.enabled).toBe(false);
     expect(r.failClosedReason).toMatch(/SESSION_DATA_DIR/);
+  });
+});
+
+describe('macOS write-sandbox (buildWriteSandboxRules)', () => {
+  it('allows the project + CLI scratch/cache, protects home & other bots', () => {
+    const r = buildWriteSandboxRules(ws());
+    // the project persists writes (the whole point)
+    expect(r.allowWritePaths).toContain('/Users/bot/projects/app');
+    // own BOT_HOME (where read-iso redirects CLI data when co-enabled)
+    expect(r.allowWritePaths).toContain('/Users/bot/.botmux/bots/cli_self');
+    // CLI data + ephemeral scratch the CLI/tools need
+    expect(r.allowWritePaths).toContain('/Users/bot/.claude');
+    expect(r.allowWritePaths).toContain('/Users/bot/.codex');
+    expect(r.allowWritePaths).toContain('/private/var/folders');
+    expect(r.allowWritePaths).toContain('/dev');
+    // NOT writable: home dotfiles at large are protected by the profile's deny-all
+    // baseline (they simply never appear in the allow-list)
+    expect(r.allowWritePaths).not.toContain('/Users/bot');
+    expect(r.allowWritePaths).not.toContain('/Users/bot/.ssh');
+  });
+
+  it('re-denies crown jewels so a broad project/home cannot reach them', () => {
+    const r = buildWriteSandboxRules(ws());
+    expect(r.denyWritePaths).toContain('/Users/bot/.ssh');
+    expect(r.denyWritePaths).toContain('/Users/bot/.aws');
+    expect(r.denyWritePaths).toContain('/Users/bot/.botmux/bots.json'); // can't tamper other bots' creds
+    expect(r.denyWritePaths).toContain('/Users/bot/.botmux/.dashboard-secret');
+  });
+
+  it('folds extraWritePaths (custom TMPDIR / worktrees) and drops unsafe ones', () => {
+    const r = buildWriteSandboxRules(ws({ extraWritePaths: ['/custom/tmp', 'relative/x', '/a/../b'] }));
+    expect(r.allowWritePaths).toContain('/custom/tmp');
+    expect(r.allowWritePaths).not.toContain('relative/x');   // normalizeIsolationPath drops it
+    expect(r.allowWritePaths.some(p => p.includes('..'))).toBe(false);
+  });
+
+  it('buildSeatbeltProfile emits deny-all-writes + allow-list + final crown-jewel denies, in order', () => {
+    const prof = buildSeatbeltProfile([], [], [], [], [], {
+      allowWritePaths: ['/Users/bot/projects/app'],
+      denyWritePaths: ['/Users/bot/.ssh'],
+    });
+    expect(prof).toContain('(deny file-write* (subpath "/"))');
+    expect(prof).toContain('(allow file-write* (subpath "/Users/bot/projects/app"))');
+    expect(prof).toContain('(deny file-write* (subpath "/Users/bot/.ssh"))');
+    // ORDER matters (Seatbelt last-match wins): deny-all < allow project < final deny ssh
+    const iDenyAll = prof.indexOf('(deny file-write* (subpath "/"))');
+    const iAllow = prof.indexOf('(allow file-write* (subpath "/Users/bot/projects/app"))');
+    const iDenySsh = prof.indexOf('(deny file-write* (subpath "/Users/bot/.ssh"))');
+    expect(iDenyAll).toBeLessThan(iAllow);
+    expect(iAllow).toBeLessThan(iDenySsh);
+    // reads untouched — no file-read denies when only write-sandbox is passed
+    expect(prof).not.toContain('(deny file-read*');
+  });
+
+  it('omitting the write param leaves a read-only profile with NO write rules', () => {
+    const prof = buildSeatbeltProfile(['/Users/bot/.ssh']);
+    expect(prof).toContain('(deny file-read* (subpath "/Users/bot/.ssh"))');
+    expect(prof).not.toContain('file-write*');
   });
 });
 

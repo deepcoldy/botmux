@@ -271,6 +271,84 @@ export function buildV2CarveOuts(ctx: V2IsolationContext): {
   };
 }
 
+// ─── Mac file-sandbox: WRITE isolation (the Seatbelt twin of Linux bwrap) ─────
+
+export interface WriteSandboxContext {
+  /** The bot user's home directory. */
+  homeDir: string;
+  /** BOTMUX_HOME root (e.g. `~/.botmux`). */
+  botmuxHome: string;
+  /** botmux session data root (SESSION_DATA_DIR, e.g. `~/.botmux/data`). */
+  sessionDataDir: string;
+  /** The session's project working dir — writes here PERSIST (the point of the sandbox). */
+  workingDir: string;
+  /** This bot's Feishu app id (keys its own BOT_HOME carve-out). */
+  currentAppId: string;
+  /** Extra writable roots the worker resolves at spawn time (realpath'd TMPDIR,
+   *  extra worktrees, admin-configured writable paths). */
+  extraWritePaths?: string[];
+}
+
+/**
+ * Write-isolation rules for the macOS file sandbox — the FUNCTIONAL twin of the
+ * Linux bwrap overlay (which lets the agent read the whole real FS but confines
+ * WRITES). Seatbelt has no copy-on-write overlay, so we approximate the same
+ * guarantee with a deny-all-writes + allow-list: the agent can write its project
+ * and the ephemeral scratch/cache the CLI needs, but CANNOT tamper the rest of
+ * your real disk (home dotfiles, other projects, other bots' data, system dirs).
+ * Reads stay wide open (like Linux) — this is orthogonal to read isolation, which
+ * layers its own read-deny set into the SAME profile when also enabled.
+ *
+ * `allowWritePaths` re-open the writable zones AFTER the profile's `(deny
+ * file-write* (subpath "/"))`; `denyWritePaths` are crown jewels re-denied AFTER
+ * the allows (Seatbelt last-match), so they stay protected even if the project or
+ * an allowed zone nests them. The allow-list is intentionally generous toward
+ * CLI scratch/cache — the exact set is empirically tuned on real macOS (a missing
+ * cache path makes the CLI fail, an over-broad one weakens the sandbox). Pure: the
+ * worker realpath's every path (symlink-safe) before emitting.
+ */
+export function buildWriteSandboxRules(ctx: WriteSandboxContext): {
+  allowWritePaths: string[];
+  denyWritePaths: string[];
+} {
+  const h = ctx.homeDir.replace(/\/+$/, '');
+  const bh = ctx.botmuxHome.replace(/\/+$/, '');
+  const wd = ctx.workingDir.replace(/\/+$/, '');
+  const keep = (arr: string[]) =>
+    dedupe(arr.map(normalizeIsolationPath).filter((p): p is string => !!p));
+  return {
+    allowWritePaths: keep([
+      // The project — writes here PERSIST (no overlay/landing step; direct like a
+      // non-sandboxed run would, only nothing OUTSIDE the allow-list can be touched).
+      wd,
+      // Own BOT_HOME — where read isolation redirects the CLI's data when co-enabled;
+      // harmless to allow when write-sandbox is standalone (dir just won't exist).
+      botHomePath(bh, ctx.currentAppId),
+      // CLI data dirs (write-sandbox standalone leaves them at the real path).
+      `${h}/.claude`, `${h}/.claude.json`, `${h}/.codex`,
+      // Ephemeral scratch / caches every CLI + spawned tool (git, npm, node) needs.
+      `${h}/Library/Caches`,
+      `${h}/Library/Application Support`,
+      `${h}/.cache`,
+      `${h}/.npm`,
+      '/private/var/folders',   // macOS per-user TMPDIR / DARWIN_USER_TEMP_DIR root
+      '/private/tmp', '/tmp', '/var/tmp',
+      '/dev',                   // ptys, /dev/null, /dev/tty — required to run at all
+      ...(ctx.extraWritePaths ?? []),
+    ]),
+    denyWritePaths: keep([
+      // Crown jewels — re-denied AFTER the allows so a semi-trusted operator can't
+      // plant an ssh key or tamper another bot's creds even if the project/home
+      // nests these. (Most already fall under deny-by-default; this is the guard for
+      // a broad workingDir and defence-in-depth.)
+      `${h}/.ssh`, `${h}/.aws`, `${h}/.gnupg`,
+      `${bh}/bots.json`,
+      `${bh}/feishu-session.json`,
+      `${bh}/.dashboard-secret`, `${bh}/.dashboard-token`,
+    ]),
+  };
+}
+
 /**
  * Decide whether read isolation is enabled for a session, or fail-closed.
  * Pure: the caller resolves the impure inputs. This is the SINGLE decision
@@ -324,6 +402,10 @@ export function buildSeatbeltProfile(
   finalDenyPaths: string[] = [],
   traverseDirs: string[] = [],
   denyRegexes: string[] = [],
+  /** When set, layer the macOS file-sandbox WRITE isolation (Linux-bwrap twin) into
+   *  the SAME profile: deny all writes, re-allow the writable zones, then final-deny
+   *  the crown jewels. Reads are unaffected. Omit for read-isolation-only sessions. */
+  writeSandbox?: { allowWritePaths: string[]; denyWritePaths: string[] },
 ): string {
   const esc = (p: string) => p.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   // Regex literals (#"…") pass backslashes RAW to the regex engine — do NOT
@@ -347,6 +429,15 @@ export function buildSeatbeltProfile(
   // FINAL denies win over the carve-outs — admin `readDenyExtraPaths` must hold even
   // for a path that falls under the bot's own re-allowed BOT_HOME.
   for (const p of finalDenyPaths) lines.push(`(deny file-read* (subpath "${esc(p)}"))`);
+  // ── Write isolation (macOS file sandbox): deny ALL writes, re-allow the writable
+  // zones, then re-deny the crown jewels. Ordered AFTER the read rules but they are
+  // an independent operation class (file-write* vs file-read*), so they never
+  // interact with the read allow/deny above. Emitted only when write-sandbox is on.
+  if (writeSandbox) {
+    lines.push('(deny file-write* (subpath "/"))');
+    for (const p of writeSandbox.allowWritePaths) lines.push(`(allow file-write* (subpath "${esc(p)}"))`);
+    for (const p of writeSandbox.denyWritePaths) lines.push(`(deny file-write* (subpath "${esc(p)}"))`);
+  }
   return lines.join('\n') + '\n';
 }
 
