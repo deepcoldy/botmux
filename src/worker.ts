@@ -40,6 +40,8 @@ import { mergeQueuedCliInput, type PendingCliInput } from './utils/pending-input
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { resolveTerminalWriteForRequest } from './core/terminal-write-auth.js';
+import { readPlatformBinding } from './platform/binding.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
 import {
   shouldRunQuietRotation,
@@ -304,22 +306,20 @@ const clientPtys = new Map<WebSocket, pty.IPty>();
 const writeToken = randomBytes(16).toString('hex');
 
 /**
- * Resolve terminal write permission for one request, honoring a platform-injected
- * `X-Botmux-Role` header. The central platform fronts `/s/*` and sets the role
- * (owner | teammate | guest) after authenticating the viewer, stripping any
- * client-supplied header; it reaches the worker via dashboard /s bridge →
- * terminal-proxy → here. When the header is present we trust it (platform-fronted
- * access): only `owner` may drive the terminal; everything else (teammate / guest
- * / anything else) is read-only. When the header is absent (local direct access,
- * no platform in front), fall back to the legacy write-token query param.
+ * Resolve terminal write permission for one request. Trust of the
+ * platform-injected `X-Botmux-Role` header is gated on this machine's platform
+ * binding: a self-hosted (unbound) deployment has no boundary stripping that
+ * header, so it must never be trusted — otherwise a client forging
+ * `X-Botmux-Role: owner` bypasses the `?token=` gate (= unauthenticated terminal
+ * write = RCE). See ./core/terminal-write-auth for the full rationale.
+ *
+ * The binding is read PER REQUEST, never snapshotted: `botmux bind`/unbind
+ * rewrites platform.json and the dashboard hot-reloads the tunnel without
+ * restarting this worker, so a cached value would go stale (trusting forged
+ * headers after an unbind / denying platform writes after a bind).
  */
-function resolveTerminalWrite(req: IncomingMessage, tokenMatches: boolean): { hasWrite: boolean; platformReadonly: boolean } {
-  const role = req.headers['x-botmux-role'];
-  if (typeof role === 'string' && role) {
-    const hasWrite = role === 'owner';
-    return { hasWrite, platformReadonly: !hasWrite };
-  }
-  return { hasWrite: tokenMatches, platformReadonly: false };
+function resolveTerminalWriteForReq(req: IncomingMessage, tokenMatches: boolean): { hasWrite: boolean; platformReadonly: boolean } {
+  return resolveTerminalWriteForRequest(req.headers, tokenMatches, () => readPlatformBinding() !== null);
 }
 
 /** Lazily-written locked-mode zellij config for per-WS web-terminal attach
@@ -5236,7 +5236,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         return;
       }
       const tokenMatches = url.searchParams.get('token') === writeToken;
-      const { hasWrite, platformReadonly } = resolveTerminalWrite(req, tokenMatches);
+      const { hasWrite, platformReadonly } = resolveTerminalWriteForReq(req, tokenMatches);
       const loginHdr = req.headers['x-botmux-login-url'];
       const loginUrl = typeof loginHdr === 'string' && /^https?:\/\/[^"'<>\s]+$/.test(loginHdr) ? loginHdr : '';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -5257,7 +5257,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         return;
       }
       const tokenMatches = url.searchParams.get('token') === writeToken;
-      const { hasWrite } = resolveTerminalWrite(req, tokenMatches);
+      const { hasWrite } = resolveTerminalWriteForReq(req, tokenMatches);
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
 

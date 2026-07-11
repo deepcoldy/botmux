@@ -8,19 +8,22 @@ vi.mock('../src/global-config.js', () => ({
 }));
 vi.mock('../src/platform/binding.js', () => ({
   platformMachineBaseUrl: vi.fn(() => null),
+  publicReverseProxyBaseUrl: vi.fn(() => null),
 }));
 
 import { buildDashboardUrl, buildDashboardUrls } from '../src/core/dashboard-url.js';
 import { isRemoteAccessEnabled } from '../src/global-config.js';
-import { platformMachineBaseUrl } from '../src/platform/binding.js';
+import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../src/platform/binding.js';
 
 const setRemote = (on: boolean) => vi.mocked(isRemoteAccessEnabled).mockReturnValue(on);
 const setPlatform = (base: string | null) => vi.mocked(platformMachineBaseUrl).mockReturnValue(base);
+const setPublic = (base: string | null) => vi.mocked(publicReverseProxyBaseUrl).mockReturnValue(base);
 
 describe('buildDashboardUrl', () => {
   beforeEach(() => {
     setRemote(false);
     setPlatform(null);
+    setPublic(null);
   });
 
   it('builds a local host:port URL with token when remote access is off', () => {
@@ -64,12 +67,29 @@ describe('buildDashboardUrl', () => {
       'https://m-deadbeef.botmux.example/',
     );
   });
+
+  it('routes through BOTMUX_PUBLIC_URL when set and no platform (self-hosted nginx)', () => {
+    setPublic('https://botmux.example.com');
+    expect(buildDashboardUrl({ host: '1.2.3.4', port: 7891, token: 'abc' })).toBe(
+      'https://botmux.example.com/?t=abc',
+    );
+  });
+
+  it('lets the platform subdomain win over BOTMUX_PUBLIC_URL when both apply', () => {
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    setPublic('https://botmux.example.com');
+    expect(buildDashboardUrl({ host: '1.2.3.4', port: 7891, token: 'abc' })).toBe(
+      'https://m-deadbeef.botmux.example/?t=abc',
+    );
+  });
 });
 
 describe('buildDashboardUrls', () => {
   beforeEach(() => {
     setRemote(false);
     setPlatform(null);
+    setPublic(null);
   });
 
   it('local-only: no localUrl fallback when the primary is already local', () => {
@@ -103,6 +123,14 @@ describe('buildDashboardUrls', () => {
     expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891 })).toEqual({
       url: 'https://m-deadbeef.botmux.example/',
       localUrl: 'http://1.2.3.4:7891/',
+    });
+  });
+
+  it('BOTMUX_PUBLIC_URL: public primary + local ip:port fallback (same token)', () => {
+    setPublic('https://botmux.example.com');
+    expect(buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' })).toEqual({
+      url: 'https://botmux.example.com/?t=abc',
+      localUrl: 'http://1.2.3.4:7891/?t=abc',
     });
   });
 });
