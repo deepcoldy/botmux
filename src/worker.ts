@@ -40,6 +40,9 @@ import { mergeQueuedCliInput, type PendingCliInput } from './utils/pending-input
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { resolveTerminalWriteForRequest } from './core/terminal-write-auth.js';
+import { readPlatformBinding } from './platform/binding.js';
+import { loadPersistedToken } from './dashboard/auth.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
 import {
   shouldRunQuietRotation,
@@ -303,23 +306,31 @@ const authedClients = new WeakSet<WebSocket>();
 const clientPtys = new Map<WebSocket, pty.IPty>();
 const writeToken = randomBytes(16).toString('hex');
 
+// Active dashboard token, persisted by the dashboard process at this stable
+// path (mirrors dashboard.ts TOKEN_PATH). The platform proxy injects it as the
+// `botmux_dashboard_token` cookie on every request it fronts, so its presence
+// proves a request traversed the platform's authenticated front door.
+const DASHBOARD_TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
+
 /**
- * Resolve terminal write permission for one request, honoring a platform-injected
- * `X-Botmux-Role` header. The central platform fronts `/s/*` and sets the role
- * (owner | teammate | guest) after authenticating the viewer, stripping any
- * client-supplied header; it reaches the worker via dashboard /s bridge →
- * terminal-proxy → here. When the header is present we trust it (platform-fronted
- * access): only `owner` may drive the terminal; everything else (teammate / guest
- * / anything else) is read-only. When the header is absent (local direct access,
- * no platform in front), fall back to the legacy write-token query param.
+ * Resolve terminal write permission for one request. The platform-injected
+ * `X-Botmux-Role` header is trusted only when this machine is bound to a central
+ * platform AND the request actually came through the platform proxy (proven by a
+ * matching `botmux_dashboard_token` cookie — a secret a direct caller lacks).
+ * Otherwise write falls back to the `?token=` gate. See
+ * ./core/terminal-write-auth for the full rationale.
+ *
+ * Both the binding and the token are read PER REQUEST, never snapshotted:
+ * `botmux bind`/unbind and dashboard token rotation are hot-reloaded without
+ * restarting this worker, so a cached value would go stale.
  */
-function resolveTerminalWrite(req: IncomingMessage, tokenMatches: boolean): { hasWrite: boolean; platformReadonly: boolean } {
-  const role = req.headers['x-botmux-role'];
-  if (typeof role === 'string' && role) {
-    const hasWrite = role === 'owner';
-    return { hasWrite, platformReadonly: !hasWrite };
-  }
-  return { hasWrite: tokenMatches, platformReadonly: false };
+function resolveTerminalWriteForReq(req: IncomingMessage, tokenMatches: boolean): { hasWrite: boolean; platformReadonly: boolean } {
+  return resolveTerminalWriteForRequest(
+    req.headers,
+    tokenMatches,
+    () => readPlatformBinding() !== null,
+    () => loadPersistedToken(DASHBOARD_TOKEN_PATH),
+  );
 }
 
 /** Lazily-written locked-mode zellij config for per-WS web-terminal attach
@@ -5245,7 +5256,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         return;
       }
       const tokenMatches = url.searchParams.get('token') === writeToken;
-      const { hasWrite, platformReadonly } = resolveTerminalWrite(req, tokenMatches);
+      const { hasWrite, platformReadonly } = resolveTerminalWriteForReq(req, tokenMatches);
       const loginHdr = req.headers['x-botmux-login-url'];
       const loginUrl = typeof loginHdr === 'string' && /^https?:\/\/[^"'<>\s]+$/.test(loginHdr) ? loginHdr : '';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -5266,7 +5277,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         return;
       }
       const tokenMatches = url.searchParams.get('token') === writeToken;
-      const { hasWrite } = resolveTerminalWrite(req, tokenMatches);
+      const { hasWrite } = resolveTerminalWriteForReq(req, tokenMatches);
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
 

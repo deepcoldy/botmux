@@ -1,0 +1,95 @@
+// Terminal write-permission gate.
+//
+// The web terminal grants write access one of two ways:
+//
+//  1. Platform-injected role — when a central platform fronts `/s`, it
+//     authenticates the viewer and injects `X-Botmux-Role` (owner | teammate |
+//     guest), first stripping any client-supplied copy. Only `owner` may write.
+//
+//  2. Legacy write token — the `?token=<workerToken>` query param.
+//
+// The role header is trustworthy ONLY on a request that actually came through
+// the platform's authenticated reverse proxy. The dashboard `/s` bridge and the
+// terminal-proxy replay request headers verbatim, and the front door binds all
+// interfaces, so `X-Botmux-Role` alone is client-forgeable — a direct caller
+// could send `X-Botmux-Role: owner` and bypass the `?token=` gate. We therefore
+// honor the role header only when BOTH hold:
+//
+//   • this machine is bound to a central platform (`platformBound`), and
+//   • the request carries the platform-injected dashboard-token cookie
+//     (`platformProxied`) — the platform's proxy drops any client Cookie and
+//     injects this machine's real `botmux_dashboard_token`, a secret a direct
+//     caller doesn't have. Its presence proves the request traversed the
+//     platform's authenticated front door.
+//
+// Otherwise the role header is ignored and write falls back to `?token=`.
+
+import { timingSafeEqual } from 'node:crypto';
+
+export interface TerminalWriteInput {
+  /** Value of the `X-Botmux-Role` request header (normalized to a single string, or undefined). */
+  role: string | undefined;
+  /** Whether the request's `?token=` matched the worker's write token. */
+  tokenMatches: boolean;
+  /** Whether this machine is bound to a central platform (a trusted boundary fronts `/s`). */
+  platformBound: boolean;
+  /** Whether the request carried a valid platform-injected dashboard-token cookie,
+   *  i.e. it genuinely traversed the platform's authenticated reverse proxy. */
+  platformProxied: boolean;
+}
+
+export function resolveTerminalWrite(
+  { role, tokenMatches, platformBound, platformProxied }: TerminalWriteInput,
+): { hasWrite: boolean; platformReadonly: boolean } {
+  if (platformBound && platformProxied && typeof role === 'string' && role) {
+    const hasWrite = role === 'owner';
+    return { hasWrite, platformReadonly: !hasWrite };
+  }
+  return { hasWrite: tokenMatches, platformReadonly: false };
+}
+
+/** Constant-time equality (avoids leaking the dashboard token through compare timing). */
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+/** Extract the `botmux_dashboard_token` value from a request Cookie header. */
+export function readDashboardCookie(cookieHeader: string | string[] | undefined): string | null {
+  const raw = Array.isArray(cookieHeader) ? cookieHeader.join('; ') : cookieHeader;
+  if (!raw) return null;
+  for (const part of raw.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    if (part.slice(0, eq).trim() === 'botmux_dashboard_token') return part.slice(eq + 1).trim() || null;
+  }
+  return null;
+}
+
+/**
+ * Resolve terminal write for one request: extract the `X-Botmux-Role` header
+ * (a duplicated/array header is treated as absent), verify the request came
+ * through the platform proxy (dashboard-token cookie matches this machine's
+ * active token), and gate the role's trust on the machine's platform binding.
+ *
+ * Both `isPlatformBound` and `getDashboardToken` are thunks evaluated on EVERY
+ * call — never snapshotted. `botmux bind`/unbind and `botmux dashboard` (token
+ * rotation) rewrite state that the dashboard hot-reloads WITHOUT restarting live
+ * workers; a cached value would go stale — keep trusting a request after an
+ * unbind / token rotation, or deny legitimate platform writes after a bind.
+ */
+export function resolveTerminalWriteForRequest(
+  headers: Record<string, string | string[] | undefined>,
+  tokenMatches: boolean,
+  isPlatformBound: () => boolean,
+  getDashboardToken: () => string | null,
+): { hasWrite: boolean; platformReadonly: boolean } {
+  const rawRole = headers['x-botmux-role'];
+  const role = typeof rawRole === 'string' ? rawRole : undefined;
+  const cookieToken = readDashboardCookie(headers['cookie']);
+  const activeToken = getDashboardToken();
+  const platformProxied = !!activeToken && !!cookieToken && safeEqual(cookieToken, activeToken);
+  return resolveTerminalWrite({ role, tokenMatches, platformBound: isPlatformBound(), platformProxied });
+}
