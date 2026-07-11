@@ -28,7 +28,7 @@ describe('resolveGlobalInstallPlan', () => {
 
   it('targets pnpm global-dir and returns the stable package symlink for a runtime realpath', () => {
     const plan = resolveGlobalInstallPlan(
-      '/home/bot/.local/share/pnpm/global/5/node_modules/.pnpm/botmux@3.2.1/node_modules/botmux',
+      '/home/bot/.local/share/pnpm/global/5/.pnpm/botmux@3.2.1/node_modules/botmux',
       'linux',
     );
     expect(plan).toEqual({
@@ -37,6 +37,13 @@ describe('resolveGlobalInstallPlan', () => {
       args: ['add', '-g', '--global-dir', '/home/bot/.local/share/pnpm/global', 'botmux@latest'],
       activePackageRoot: '/home/bot/.local/share/pnpm/global/5/node_modules/botmux',
     });
+  });
+
+  it('recognises the real pnpm global virtual-store path shape', () => {
+    expect(detectGlobalInstallManager(
+      '/home/bot/.local/share/pnpm/global/5/.pnpm/botmux@3.2.1/node_modules/botmux',
+      'linux',
+    )).toBe('pnpm');
   });
 
   it('recognises a preserved standard pnpm global symlink', () => {
@@ -48,7 +55,7 @@ describe('resolveGlobalInstallPlan', () => {
 
   it('handles a Windows pnpm virtual-store path', () => {
     const plan = resolveGlobalInstallPlan(
-      String.raw`D:\pnpm\global\5\node_modules\.pnpm\botmux@3.2.1\node_modules\botmux`,
+      String.raw`D:\pnpm\global\5\.pnpm\botmux@3.2.1\node_modules\botmux`,
       'win32',
     );
     expect(plan.manager).toBe('pnpm');

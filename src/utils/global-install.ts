@@ -46,7 +46,7 @@ export function detectGlobalInstallManager(
 
   // Node normally resolves pnpm's stable symlink to this versioned virtual-store
   // path. Match it before the generic node_modules layouts below.
-  if (root.includes('/node_modules/.pnpm/')) return 'pnpm';
+  if (root.includes('/.pnpm/')) return 'pnpm';
 
   // Known unsupported managers must never fall through to npm, especially on
   // Windows where all three can end in <prefix>/node_modules/botmux.
@@ -91,7 +91,7 @@ export function resolveGlobalInstallPlan(
 
   if (manager === 'pnpm') {
     const root = normalized(packageRoot);
-    const marker = '/node_modules/.pnpm/';
+    const marker = '/.pnpm/';
     const markerIndex = root.toLowerCase().indexOf(marker);
     const globalInstallDir = markerIndex >= 0
       ? root.slice(0, markerIndex)
