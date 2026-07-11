@@ -188,6 +188,37 @@ function makeActivePersistentSession(rootMessageId: string) {
 }
 
 describe('restoreActiveSessions — persistent-backend zombie-close decision', () => {
+  it('does not attach or mutate an active row owned by another platform instance', async () => {
+    const foreign = makeActivePersistentSession('om_foreign');
+    foreign.larkAppId = 'app_other';
+    sessionStore.updateSession(foreign);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(map.size).toBe(0);
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(foreign.sessionId)?.status).toBe('active');
+  });
+
+  it('does not attach or mutate an explicitly foreign-platform active row', async () => {
+    const foreign = makeActivePersistentSession('om_discord') as any;
+    foreign.platform = 'discord';
+    foreign.instanceId = 'discord-bot';
+    sessionStore.updateSession(foreign);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(map.size).toBe(0);
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(foreign.sessionId)?.status).toBe('active');
+  });
+
   it('"missing" → closes the zombie (Map eviction + store closed), does not fork', async () => {
     probe.result = 'missing';
     const s = makeActivePersistentSession('om_missing');

@@ -145,6 +145,8 @@ describe('runHook', () => {
     const adoptRoute = {
       sessionId: 's-adopt',
       chatId: 'c-adopt',
+      platform: 'lark',
+      instanceId: 'a-adopt',
       larkAppId: 'a-adopt',
       rootMessageId: 'om_x',
     };

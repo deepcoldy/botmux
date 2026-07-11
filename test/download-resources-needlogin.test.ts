@@ -25,6 +25,7 @@ vi.mock('../src/im/lark/client.js', () => {
 
 import { downloadMessageResource, UserTokenMissingError } from '../src/im/lark/client.js';
 import { downloadResources } from '../src/core/session-manager.js';
+import { createPlatformCapabilities } from '../src/im/platform.js';
 
 const img = { type: 'image' as const, key: 'k', name: 'k.jpg' };
 
@@ -53,6 +54,30 @@ describe('downloadResources — needLogin gating', () => {
     expect(needLogin).toBe(false);
     expect(attachments).toHaveLength(1);
     expect(attachments[0]).toMatchObject({ type: 'image', name: 'k.jpg' });
+  });
+
+  it('uses the injected platform attachments port without calling the legacy client', async () => {
+    const downloadAttachment = vi.fn(async (resource: any, destinationPath: string) => ({
+      type: resource.type, name: resource.name, path: destinationPath,
+    }));
+    const runtime = {
+      instance: { platform: 'lark', instanceId: 'app' },
+      capabilities: createPlatformCapabilities({ attachments: true }),
+      attachments: { downloadAttachment },
+      start: vi.fn(), stop: vi.fn(),
+    } as any;
+
+    const result = await downloadResources('app', 'om_1', [img], runtime);
+
+    expect(result.attachments).toHaveLength(1);
+    expect(downloadAttachment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceMessage: { instance: runtime.instance, messageId: 'om_1' },
+        resourceId: 'k', type: 'image', name: 'k.jpg',
+      }),
+      expect.stringMatching(/\/attachments\/app\/om_1\/k\.jpg$/),
+    );
+    expect(downloadMessageResource).not.toHaveBeenCalled();
   });
 
   it('saves into the per-appId bucket (attachments/<appId>/<messageId>/) for the read-isolation carve-out', async () => {

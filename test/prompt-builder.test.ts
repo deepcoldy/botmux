@@ -87,6 +87,20 @@ vi.mock('../src/core/worker-pool.js', () => ({
 import { buildNewTopicPrompt, buildFollowUpContent, buildReforkPrompt, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
 import type { DaemonSession } from '../src/core/types.js';
 
+function senderFixture(id: string, type: 'user' | 'bot', name?: string) {
+  return { id, openId: id, type, name };
+}
+
+function mentionFixture(name: string, id: string, extra: Record<string, string> = {}) {
+  return {
+    token: extra.key ?? `@${id}`,
+    name,
+    identity: { id },
+    openId: id,
+    ...extra,
+  };
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 describe('buildNewTopicPrompt', () => {
@@ -187,11 +201,19 @@ describe('buildNewTopicPrompt', () => {
       'claude-code',
       undefined,
       undefined,
-      [{ name: 'Alice', openId: 'ou_alice' }],
+      [mentionFixture('Alice', 'ou_alice')],
     );
     expect(prompt).toContain('<mentions>');
     expect(prompt).toContain('name="Alice"');
     expect(prompt).toContain('open_id="ou_alice"');
+  });
+
+  it('does not mislabel a non-open_id mention identity as open_id', () => {
+    const content = buildFollowUpContent('hello', SESSION_ID, {
+      mentions: [{ token: '@_user', name: 'Alice', identity: { id: 'user-1', idType: 'user_id' } }],
+    });
+    expect(content).toContain('name="Alice"');
+    expect(content).not.toContain('open_id="user-1"');
   });
 
   it('puts stable routing and bot identity before the first user message for non-injecting CLIs', () => {
@@ -219,12 +241,12 @@ describe('buildNewTopicPrompt', () => {
       'codex',
       undefined,
       undefined,
-      [{ name: 'Alice', openId: 'ou_alice' }],
+      [mentionFixture('Alice', 'ou_alice')],
       undefined,
       undefined,
       { name: 'Codex Bot', openId: 'ou_bot' },
       undefined,
-      { openId: 'ou_sender', type: 'user', name: 'Sender' },
+      senderFixture('ou_sender', 'user', 'Sender'),
     );
 
     expect(prompt.indexOf('<sender ')).toBeGreaterThan(prompt.indexOf('<user_message>'));
@@ -267,7 +289,7 @@ describe('buildFollowUpContent', () => {
   });
 
   it('should include mention metadata in <mentions>', () => {
-    const mentions = [{ name: 'Bob', openId: 'ou_bob' }];
+    const mentions = [mentionFixture('Bob', 'ou_bob')];
     const content = buildFollowUpContent('hello', SESSION_ID, { mentions });
     expect(content).toContain('<mentions>');
     expect(content).toContain('name="Bob"');
@@ -276,8 +298,8 @@ describe('buildFollowUpContent', () => {
 
   it('includes substitute trigger metadata in follow-up prompts', () => {
     const content = buildFollowUpContent('hello', SESSION_ID, {
-      sender: { openId: 'ou_sender', type: 'user', name: 'Sender' },
-      mentions: [{ name: 'Alice', openId: 'ou_alice', userId: 'u_alice' }],
+      sender: senderFixture('ou_sender', 'user', 'Sender'),
+      mentions: [mentionFixture('Alice', 'ou_alice', { userId: 'u_alice' })],
       substituteTrigger: {
         target: { name: 'Alice', openId: 'ou_alice', userId: 'u_alice' },
         disclosure: 'prefix',
@@ -296,8 +318,8 @@ describe('buildFollowUpContent', () => {
   it('places stable reminder before follow-up user content', () => {
     const content = buildFollowUpContent('hello', SESSION_ID, {
       cliId: 'codex',
-      sender: { openId: 'ou_sender', type: 'user', name: 'Sender' },
-      mentions: [{ name: 'Bob', openId: 'ou_bob' }],
+      sender: senderFixture('ou_sender', 'user', 'Sender'),
+      mentions: [mentionFixture('Bob', 'ou_bob')],
     });
 
     expect(content.indexOf('<session_id>')).toBeLessThan(content.indexOf('<botmux_reminder>'));
@@ -330,7 +352,7 @@ describe('buildFollowUpContent', () => {
   });
 
   it('should omit <session_id> but keep mentions in adopt mode', () => {
-    const mentions = [{ name: 'Charlie', openId: 'ou_charlie' }];
+    const mentions = [mentionFixture('Charlie', 'ou_charlie')];
     const content = buildFollowUpContent('hello', SESSION_ID, {
       isAdoptMode: true,
       mentions,
@@ -363,7 +385,7 @@ describe('buildFollowUpContent', () => {
   it('injects <sender_note> for cursor follow-ups carrying a sender', () => {
     const content = buildFollowUpContent('hi', SESSION_ID, {
       cliId: 'cursor',
-      sender: { openId: 'ou_gp', type: 'user', name: '高鹏' },
+      sender: senderFixture('ou_gp', 'user', '高鹏'),
     });
     // The note must sit right after the <sender> tag so the model reads them together.
     expect(content).toContain('<sender type="user" open_id="ou_gp" name="高鹏" />');
@@ -375,7 +397,7 @@ describe('buildFollowUpContent', () => {
   it('does NOT inject <sender_note> for non-cursor CLIs even with a sender', () => {
     const content = buildFollowUpContent('hi', SESSION_ID, {
       cliId: 'codex',
-      sender: { openId: 'ou_gp', type: 'user', name: '高鹏' },
+      sender: senderFixture('ou_gp', 'user', '高鹏'),
     });
     expect(content).toContain('<sender '); // sender tag still present
     expect(content).not.toContain('<sender_note>');
@@ -464,7 +486,7 @@ describe('buildReforkPrompt', () => {
     const out = buildReforkPrompt(ds, '看图', {
       cliId: 'codex',
       attachments: [{ type: 'image', path: '/tmp/x.jpg', name: 'x.jpg' }],
-      mentions: [{ key: '@_user_1', name: 'Alice', openId: 'ou_alice' }],
+      mentions: [mentionFixture('Alice', 'ou_alice', { key: '@_user_1' })],
     });
     expect(out).toContain('path="/tmp/x.jpg"');
     expect(out).toContain('name="Alice"');
@@ -489,36 +511,32 @@ describe('buildReforkPrompt', () => {
 // ─── renderSenderTag — <sender> attribute rendering / XML escape ────────────
 
 describe('renderSenderTag', () => {
-  it('returns empty string when sender is undefined or has no openId', () => {
+  it('returns empty string when sender is undefined or has no platform id', () => {
     expect(renderSenderTag()).toBe('');
-    expect(renderSenderTag({ openId: '', type: 'user' })).toBe('');
+    expect(renderSenderTag(senderFixture('', 'user'))).toBe('');
   });
 
   it('emits open_id and type even when name is missing', () => {
-    const out = renderSenderTag({ openId: 'ou_xyz', type: 'user' });
+    const out = renderSenderTag(senderFixture('ou_xyz', 'user'));
     expect(out).toBe('<sender type="user" open_id="ou_xyz" />');
     expect(out).not.toContain('name=');
   });
 
   it('includes name attribute when present', () => {
-    const out = renderSenderTag({ openId: 'ou_a', type: 'user', name: '张三' });
+    const out = renderSenderTag(senderFixture('ou_a', 'user', '张三'));
     expect(out).toContain('type="user"');
     expect(out).toContain('open_id="ou_a"');
     expect(out).toContain('name="张三"');
   });
 
   it('preserves bot type for foreign botmux peers', () => {
-    const out = renderSenderTag({ openId: 'ou_b', type: 'bot', name: 'CoCo' });
+    const out = renderSenderTag(senderFixture('ou_b', 'bot', 'CoCo'));
     expect(out).toContain('type="bot"');
     expect(out).toContain('name="CoCo"');
   });
 
   it('XML-escapes name and open_id so quotes/angle brackets can\'t break the tag', () => {
-    const out = renderSenderTag({
-      openId: 'ou_"weird"',
-      type: 'user',
-      name: '<Alice & "Bob"\'s pal>',
-    });
+    const out = renderSenderTag(senderFixture('ou_"weird"', 'user', '<Alice & "Bob"\'s pal>'));
     // Each special char must round-trip via entity references so the attribute
     // string stays well-formed for downstream prompt parsers.
     expect(out).toContain('name="&lt;Alice &amp; &quot;Bob&quot;&apos;s pal&gt;"');
@@ -561,7 +579,7 @@ describe('renderCursorSenderNote', () => {
 // else a folded-in ou_xxx:name reaches cursor unguarded.
 
 describe('renderBufferedSenderBlock', () => {
-  const SENDER = { openId: 'ou_bob', type: 'user', name: 'Bob' } as const;
+  const SENDER = senderFixture('ou_bob', 'user', 'Bob');
 
   it('pairs the <sender> tag with an adjacent <sender_note> for cursor', () => {
     const out = renderBufferedSenderBlock(SENDER, 'cursor');
@@ -587,7 +605,7 @@ describe('renderBufferedSenderBlock', () => {
 
   it('returns empty when there is no resolvable sender', () => {
     expect(renderBufferedSenderBlock(undefined, 'cursor')).toBe('');
-    expect(renderBufferedSenderBlock({ openId: '', type: 'user' }, 'cursor')).toBe('');
+    expect(renderBufferedSenderBlock(senderFixture('', 'user'), 'cursor')).toBe('');
   });
 });
 
@@ -600,13 +618,13 @@ describe('renderBufferedSenderBlock', () => {
 
 describe('buildNewTopicPrompt cursor buffered multi-user follow-up', () => {
   it('keeps the foreign sender note adjacent inside the folded <user_message>', () => {
-    const buffered = `${renderBufferedSenderBlock({ openId: 'ou_bob', type: 'user', name: 'Bob' }, 'cursor')}\nBob 的补充`;
+    const buffered = `${renderBufferedSenderBlock(senderFixture('ou_bob', 'user', 'Bob'), 'cursor')}\nBob 的补充`;
     const prompt = buildNewTopicPrompt(
       '主消息（Alice）', 'sid', 'cursor',
       undefined, undefined, undefined, undefined,
       [buffered],
       undefined, undefined,
-      { openId: 'ou_alice', type: 'user', name: 'Alice' },
+      senderFixture('ou_alice', 'user', 'Alice'),
     );
     const body = prompt.match(/<user_message>\n([\s\S]*?)\n<\/user_message>/)![1];
     expect(body).toContain('open_id="ou_bob"');
@@ -616,13 +634,13 @@ describe('buildNewTopicPrompt cursor buffered multi-user follow-up', () => {
   });
 
   it('omits the buffered note for a codex session (bare foreign tag only)', () => {
-    const buffered = `${renderBufferedSenderBlock({ openId: 'ou_bob', type: 'user', name: 'Bob' }, 'codex')}\nBob 的补充`;
+    const buffered = `${renderBufferedSenderBlock(senderFixture('ou_bob', 'user', 'Bob'), 'codex')}\nBob 的补充`;
     const prompt = buildNewTopicPrompt(
       '主消息（Alice）', 'sid', 'codex',
       undefined, undefined, undefined, undefined,
       [buffered],
       undefined, undefined,
-      { openId: 'ou_alice', type: 'user', name: 'Alice' },
+      senderFixture('ou_alice', 'user', 'Alice'),
     );
     const body = prompt.match(/<user_message>\n([\s\S]*?)\n<\/user_message>/)![1];
     expect(body).toContain('open_id="ou_bob"');
@@ -637,7 +655,7 @@ describe('buildNewTopicPrompt cursor <sender_note>', () => {
     const prompt = buildNewTopicPrompt(
       'hello', 'sid', 'cursor',
       undefined, undefined, undefined, undefined, undefined, undefined, undefined,
-      { openId: 'ou_gp', type: 'user', name: '高鹏' },
+      senderFixture('ou_gp', 'user', '高鹏'),
     );
     expect(prompt).toContain('<sender_note>');
     expect(prompt.indexOf('<sender_note>')).toBeGreaterThan(prompt.indexOf('<sender '));
@@ -647,7 +665,7 @@ describe('buildNewTopicPrompt cursor <sender_note>', () => {
     const prompt = buildNewTopicPrompt(
       'hello', 'sid', 'codex',
       undefined, undefined, undefined, undefined, undefined, undefined, undefined,
-      { openId: 'ou_gp', type: 'user', name: '高鹏' },
+      senderFixture('ou_gp', 'user', '高鹏'),
     );
     expect(prompt).toContain('<sender ');
     expect(prompt).not.toContain('<sender_note>');
@@ -668,8 +686,8 @@ describe('buildNewTopicPrompt with multi-user follow-ups', () => {
     // Builder now merges them all into the single opening <user_message> body
     // rather than separate <follow_up_message> wrappers.
     const followUps = [
-      `${renderSenderTag({ openId: 'ou_alice', type: 'user', name: 'Alice' })}\nAlice 的补充约束 1`,
-      `${renderSenderTag({ openId: 'ou_bob', type: 'user', name: 'Bob' })}\nBob 的补充约束 2`,
+      `${renderSenderTag(senderFixture('ou_alice', 'user', 'Alice'))}\nAlice 的补充约束 1`,
+      `${renderSenderTag(senderFixture('ou_bob', 'user', 'Bob'))}\nBob 的补充约束 2`,
     ];
 
     const prompt = buildNewTopicPrompt(
@@ -683,7 +701,7 @@ describe('buildNewTopicPrompt with multi-user follow-ups', () => {
       followUps,
       undefined,
       undefined,
-      { openId: 'ou_alice', type: 'user', name: 'Alice' },
+      senderFixture('ou_alice', 'user', 'Alice'),
     );
 
     // No separate follow-up blocks — everything folds into the opening turn.

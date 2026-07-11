@@ -55,12 +55,19 @@ import { prepareSkillDelivery } from './skills/delivery.js';
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
-import { sessionKey, sessionAnchorId, isDocNativeSession, type DaemonSession } from './types.js';
+import { sessionKey, sessionAnchorId, isDocNativeSession, syncPlatformSessionContext, type DaemonSession } from './types.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin } from './botmux-wrapper.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
+import {
+  requirePlatformCapability,
+  requireSamePlatformInstance,
+  samePlatform,
+  type PlatformInstanceIdentity,
+} from '../im/platform.js';
+import { requirePlatformPort, type PlatformRuntime } from '../im/ports.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -80,6 +87,9 @@ export interface WorkerPoolCallbacks {
   /** Re-check the per-bot resident-session cap after a process starts or an
    * over-cap busy session becomes idle. Optional for unit-test callers. */
   enforceLiveSessionCap?: () => void;
+  /** Platform runtime injected by the daemon composition root. Unit tests and
+   * legacy standalone helpers may omit it and retain the mature Lark seam. */
+  platformRuntime?: PlatformRuntime;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -94,6 +104,68 @@ export function initWorkerPool(cb: WorkerPoolCallbacks): void {
 function requireCallbacks(): WorkerPoolCallbacks {
   if (!callbacks) throw new Error('WorkerPool not initialised — call initWorkerPool() first');
   return callbacks;
+}
+
+function platformRuntimeForSession(ds: DaemonSession): PlatformRuntime | undefined {
+  const runtime = callbacks?.platformRuntime;
+  if (!runtime) return undefined;
+  requireSamePlatformInstance(runtime.instance, ds.platform.instance);
+  return runtime;
+}
+
+async function updateSessionCard(
+  ds: DaemonSession,
+  messageId: string,
+  cardJson: string,
+  streamUpdate: boolean = false,
+): Promise<void> {
+  const runtime = platformRuntimeForSession(ds);
+  if (!runtime) return updateMessage(ds.larkAppId, messageId, cardJson);
+  if (streamUpdate) requirePlatformCapability(runtime, 'streamUpdates');
+  await requirePlatformPort(runtime, 'cards').updateCard(
+    { instance: ds.platform.instance, messageId },
+    { payload: cardJson },
+  );
+}
+
+async function sendSessionDirectMessage(
+  ds: DaemonSession,
+  recipientId: string,
+  content: string,
+  contentType: string,
+): Promise<string> {
+  const runtime = platformRuntimeForSession(ds);
+  if (!runtime) return sendUserMessage(ds.larkAppId, recipientId, content, contentType);
+  if (contentType === 'interactive') requirePlatformCapability(runtime, 'cards');
+  const ref = await requirePlatformPort(runtime, 'directMessages')
+    .sendDirectMessage(recipientId, content, { contentType });
+  return ref.messageId;
+}
+
+async function addSessionReaction(
+  ds: DaemonSession,
+  messageId: string,
+  emoji: string,
+): Promise<string> {
+  const runtime = platformRuntimeForSession(ds);
+  if (!runtime) return addReaction(ds.larkAppId, messageId, emoji);
+  return requirePlatformPort(runtime, 'reactions').addReaction(
+    { instance: ds.platform.instance, messageId },
+    emoji,
+  );
+}
+
+async function removeSessionReaction(
+  ds: DaemonSession,
+  messageId: string,
+  reactionId: string,
+): Promise<void> {
+  const runtime = platformRuntimeForSession(ds);
+  if (!runtime) return removeReaction(ds.larkAppId, messageId, reactionId);
+  await requirePlatformPort(runtime, 'reactions').removeReaction(
+    { instance: ds.platform.instance, messageId },
+    reactionId,
+  );
 }
 
 // ─── Active session registry (daemon-owned, accessor for IPC) ───────────────
@@ -744,7 +816,7 @@ export async function deliverWriteLinkCard(
     }
   }
   try {
-    await sendUserMessage(ds.larkAppId, operatorOpenId, cardJson, 'interactive');
+    await sendSessionDirectMessage(ds, operatorOpenId, cardJson, 'interactive');
     logger.info(`[${tag(ds)}] write link delivered via DM to ${who}…`);
     return 'dm';
   } catch (err) {
@@ -927,7 +999,7 @@ function flushCardPatch(ds: DaemonSession): void {
   ds.pendingCardJson = undefined;
   ds.pendingCardId = undefined;
   ds.cardPatchInFlight = true;
-  updateMessage(ds.larkAppId, cardId, json)
+  updateSessionCard(ds, cardId, json, true)
     .catch(err => {
       if (err instanceof MessageWithdrawnError) {
         // Only clear streamCardId when the withdrawn message is still the
@@ -1321,11 +1393,11 @@ export async function closeSession(
   }
 
   // Persistence path — load → mark closed → save (delegated to sessionStore).
-  const stored = sessionStore.getSession(sessionId);
+  const stored = sessionStore.getLocalSession(sessionId);
   const wasOpen = !!stored && stored.status !== 'closed';
   if (wasOpen) {
     sessionStore.closeSession(sessionId);
-    const after = sessionStore.getSession(sessionId);
+    const after = sessionStore.getLocalSession(sessionId);
     dashboardEventBus.publish({
       type: 'session.update',
       body: {
@@ -1444,6 +1516,9 @@ export async function transferSession(
    */
   targetScope: 'thread' | 'chat',
   opts?: {
+    /** Platform identity of the target conversation. Cross-platform relay is
+     * rejected before cards, workers, persistence, or dashboard state change. */
+    targetInstance?: PlatformInstanceIdentity;
     /** @internal Override for tests — the real implementation forks a child
      *  process and tries to attach to tmux, neither of which is appropriate
      *  in a unit test environment. Defaults to module-level forkWorker. */
@@ -1459,6 +1534,15 @@ export async function transferSession(
   }
   const ds = findActiveBySessionId(sessionId);
   if (!ds) return { ok: false, error: 'session_not_active' };
+  const sourceInstance: PlatformInstanceIdentity = ds.platform?.instance
+    ?? { platform: 'lark', instanceId: ds.larkAppId };
+  // Lark-only callers may omit targetInstance for compatibility. Omission is
+  // therefore a Lark target, not an implicit copy of the source platform.
+  const targetInstance = opts?.targetInstance
+    ?? { platform: 'lark', instanceId: ds.larkAppId };
+  if (!samePlatform(sourceInstance, targetInstance)) {
+    return { ok: false, error: 'unsupported_cross_platform' };
+  }
   // Anchor-based identity. A thread-scope session in the SAME chat (different
   // root) is a legitimate cross-topic move, so we refuse only when the target
   // anchor equals the source anchor (relaying a session onto itself). Replaces
@@ -1558,7 +1642,7 @@ export async function transferSession(
         ds.currentImageKey,
         localeForBot(ds.larkAppId),
       );
-      await updateMessage(ds.larkAppId, ds.streamCardId, frozenJson);
+      await updateSessionCard(ds, ds.streamCardId, frozenJson);
     } catch (err) {
       logger.warn(`[${tagPrefix}] freeze source-chat card failed: ${err instanceof Error ? err.message : err}`);
     }
@@ -1595,6 +1679,7 @@ export async function transferSession(
   ds.streamCardId = undefined;
   ds.streamCardNonce = undefined;
   ds.currentImageKey = undefined;
+  syncPlatformSessionContext(ds);
 
   sessionStore.updateSession(ds.session);
 
@@ -2024,7 +2109,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               writableTerminalLinkFor(ds),
               localCliReadyAtBuild,
             );
-            await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
+            await updateSessionCard(ds, restoredCardId, streamCardJson, true);
             // Worker IPC handlers may run while the direct restore PATCH is in
             // flight. Re-queue readiness after it completes so an older
             // not-ready payload can never overwrite the cli_session_id PATCH.
@@ -2150,7 +2235,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
                 true,
               );
               try {
-                await updateMessage(ds.larkAppId, fallbackCardId, readyCardJson);
+                await updateSessionCard(ds, fallbackCardId, readyCardJson);
               } catch (patchErr) {
                 logger.debug(`[${t}] Failed to add local CLI button to fallback card: ${patchErr}`);
               }
@@ -2467,7 +2552,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         logger.info(`[${t}] TUI prompt resolved${msg.selectedText ? `: ${msg.selectedText}` : ''}`);
         if (ds.tuiPromptCardId) {
           const resolvedCard = buildTuiPromptResolvedCard(msg.selectedText ?? tr('card.action.tui_done', undefined, loc), loc);
-          updateMessage(ds.larkAppId, ds.tuiPromptCardId, resolvedCard).catch(err =>
+          updateSessionCard(ds, ds.tuiPromptCardId, resolvedCard).catch(err =>
             logger.debug(`[${t}] Failed to update TUI prompt card: ${err}`),
           );
           ds.tuiPromptCardId = undefined;
@@ -2812,14 +2897,14 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   for (const ack of list) {
     if (ack.reactionId) {
       try {
-        await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);
+        await removeSessionReaction(ds, ack.messageId, ack.reactionId);
       } catch (err: any) {
         logger.debug(`[reaction] failed to remove received reaction ${ack.reactionId}: ${err?.message ?? err}`);
       }
     }
     if (silent) continue;
     try {
-      await addReaction(ds.larkAppId, ack.messageId, doneEmoji);
+      await addSessionReaction(ds, ack.messageId, doneEmoji);
     } catch (err: any) {
       logger.debug(`[reaction] failed to add done reaction to ${ack.messageId}: ${err?.message ?? err}`);
     }

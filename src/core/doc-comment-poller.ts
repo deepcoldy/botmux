@@ -1,4 +1,18 @@
-import type { DocComment } from '../im/lark/doc-comment.js';
+/** Platform-neutral minimum shape consumed by the cursor logic. The Lark
+ * adapter's normalized document comments satisfy this structurally without
+ * coupling the core poller back to that adapter. */
+export interface DocCommentPollInput {
+  commentId: string;
+  quote?: string;
+  isWhole?: boolean;
+  replies: Array<{
+    replyId: string;
+    userId?: string;
+    text: string;
+    mentions: string[];
+    createdAt?: number;
+  }>;
+}
 
 export interface DocCommentPollCursor {
   createdAt: number;
@@ -30,7 +44,7 @@ export function compareDocCommentPollCursor(a: DocCommentPollCursor, b: DocComme
   return compareReplyIds(a.replyId, b.replyId);
 }
 
-export function flattenDocCommentReplies(comments: DocComment[]): PolledDocReply[] {
+export function flattenDocCommentReplies(comments: DocCommentPollInput[]): PolledDocReply[] {
   return comments.flatMap(comment => comment.replies.map((reply, index) => ({
     commentId: comment.commentId,
     replyId: reply.replyId,
@@ -48,12 +62,12 @@ export function flattenDocCommentReplies(comments: DocComment[]): PolledDocReply
     .sort(compareDocCommentPollCursor);
 }
 
-export function latestDocCommentPollCursor(comments: DocComment[]): DocCommentPollCursor | undefined {
+export function latestDocCommentPollCursor(comments: DocCommentPollInput[]): DocCommentPollCursor | undefined {
   return flattenDocCommentReplies(comments).at(-1);
 }
 
 export function docCommentRepliesAfterCursor(
-  comments: DocComment[],
+  comments: DocCommentPollInput[],
   cursor: DocCommentPollCursor,
 ): PolledDocReply[] {
   return flattenDocCommentReplies(comments).filter(reply => compareDocCommentPollCursor(reply, cursor) > 0);

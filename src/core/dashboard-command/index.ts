@@ -62,7 +62,7 @@ export async function handleDashboardCommand(
   // Every admin-gated response goes to the invoking admin's DM. The
   // topic receives only a short confirmation, sharing the `/card` idiom
   // (cmd.config.card_dmd: "configuration card sent to your DM").
-  const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
+  const sendUserMessage = testDeps.sendUserMessage ?? deps.sendDirectMessage ?? defaultSendUserMessage;
   const reply = async (text: string, msgType: 'text' | 'interactive' = 'text'): Promise<void> => {
     if (!larkAppId) {
       await deps.sessionReply(rootId, text, msgType === 'interactive' ? 'interactive' : undefined, larkAppId);

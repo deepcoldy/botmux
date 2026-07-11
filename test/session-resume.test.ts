@@ -162,6 +162,13 @@ describe('resumeSession', () => {
       if (!r.ok) expect(r.error).toBe('not_found');
     });
 
+    it('does not resume a session owned by another platform instance', async () => {
+      const foreign = makeClosedSession({ larkAppId: 'app_other' });
+      const r = await resumeSession(foreign.sessionId, new Map());
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toBe('not_found');
+    });
+
     it('returns not_closed when the session is still active', async () => {
       const s = sessionStore.createSession('oc_chat', 'om_root', 'active topic');
       const r = await resumeSession(s.sessionId, new Map());

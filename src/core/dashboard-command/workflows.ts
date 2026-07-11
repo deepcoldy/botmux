@@ -70,7 +70,7 @@ export async function handleDashboardWorkflows(
     nowMs,
   );
 
-  const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;
+  const sendUserMessage = testDeps.sendUserMessage ?? deps.sendDirectMessage ?? defaultSendUserMessage;
   try {
     await sendUserMessage(larkAppId, adminOpenId, cardJson, 'interactive');
     await deps.sessionReply(

@@ -1,5 +1,13 @@
 import type { ChildProcess } from 'node:child_process';
-import type { Session, DaemonToWorker, LarkAttachment, LarkMention, DisplayMode, StreamStatus } from '../types.js';
+import type { Session, DaemonToWorker, DisplayMode, StreamStatus } from '../types.js';
+import type {
+  PlatformAttachment,
+  PlatformConversationRef,
+  PlatformInstanceIdentity,
+  PlatformInstanceRef,
+  PlatformMention,
+  PlatformSender,
+} from '../im/platform.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
@@ -23,25 +31,22 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
   return fc.expanded ? 'screenshot' : 'hidden';
 }
 
-/** Core session state — IM-agnostic.
- *  IM-specific rendering state (ImRenderState) is stored separately
- *  in the ImAdapter implementation (e.g. Map<string, ImRenderState>
- *  inside LarkImAdapter), NOT on this type. */
-export interface DaemonSession {
+/** Platform-neutral identity/routing state kept only in memory.
+ *
+ * It deliberately lives beside (not inside) the persisted `Session`: deriving
+ * this context for a legacy row must never rewrite that row with a new schema.
+ */
+export interface PlatformSessionContext {
+  instance: PlatformInstanceRef;
+  conversation: PlatformConversationRef;
+}
+
+/** Runtime state shared by every platform session. */
+export interface DaemonSessionState {
   session: Session;
   worker: ChildProcess | null;   // fork'd worker process
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
-  larkAppId: string;
-  chatId: string;
-  chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
-  /** Routing scope:
-   *   'thread' → routing key = session.rootMessageId, replies use reply_in_thread=true
-   *   'chat'   → routing key = chatId, replies are plain chat messages
-   *  Must be set explicitly at session creation (no implicit default — every
-   *  caller decides based on event context). Restored sessions without a
-   *  persisted scope fall back to 'thread' in the restore path. */
-  scope: 'thread' | 'chat';
   spawnedAt: number;
   cliVersion: string;
   lastMessageAt: number;
@@ -65,13 +70,13 @@ export interface DaemonSession {
    *  the next turn instead of being dropped. In-memory only, like
    *  pendingRawInput. */
   pendingFollowUpInput?: { userPrompt: string; cliInput: string };
-  pendingAttachments?: LarkAttachment[];
-  pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
+  pendingAttachments?: PlatformAttachment[];
+  pendingMentions?: PlatformMention[];    // mentions from initial message, used when building prompt after repo selection
   pendingSubstituteTrigger?: import('../types.js').SubstituteTrigger;
   /** Sender (open_id + type + resolved name) of the initial message — stashed
    *  so the deferred spawn after repo-selection still injects a <sender> tag
    *  matching the original caller, not the user who clicked the card. */
-  pendingSender?: import('../im/lark/identity-cache.js').ResolvedSender;
+  pendingSender?: PlatformSender;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
   ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
@@ -189,14 +194,77 @@ export interface DaemonSession {
   };
 }
 
+/** Current Lark compatibility context.
+ *
+ * The generic `platform` context is authoritative for isolation. Legacy fields
+ * remain during the strangler migration because worker/card/session persistence
+ * protocols still use them and must keep their wire/disk shape unchanged.
+ */
+export interface LarkSessionContext {
+  platform: PlatformSessionContext;
+  larkAppId: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  /** Routing scope:
+   *   'thread' → routing key = session.rootMessageId, replies use reply_in_thread=true
+   *   'chat'   → routing key = chatId, replies are plain chat messages
+   *  Must be set explicitly at session creation. Restored legacy sessions fall
+   *  back to 'thread' in the restore path. */
+  scope: 'thread' | 'chat';
+}
+
+export type DaemonSession = DaemonSessionState & LarkSessionContext;
+
+export function createPlatformSessionContext(
+  instance: PlatformInstanceRef,
+  chatId: string,
+  chatType: 'group' | 'p2p',
+  scope: 'thread' | 'chat',
+  rootMessageId: string,
+): PlatformSessionContext {
+  const anchorId = scope === 'chat' ? chatId : rootMessageId;
+  return {
+    instance,
+    conversation: {
+      instance,
+      chatId,
+      conversationType: chatType === 'p2p' ? 'direct' : 'group',
+      scope,
+      anchorId,
+      ...(scope === 'thread' ? { threadRootId: rootMessageId } : {}),
+    },
+  };
+}
+
+/** Refresh the in-memory generic view after a legacy routing-field rewrite. */
+export function syncPlatformSessionContext(ds: DaemonSession): void {
+  const instance = ds.platform?.instance
+    ?? { platform: 'lark' as const, instanceId: ds.larkAppId };
+  ds.platform = createPlatformSessionContext(
+    instance,
+    ds.chatId,
+    ds.chatType,
+    ds.scope,
+    ds.session.rootMessageId,
+  );
+}
+
 /** Composite key for activeSessions — allows multiple bots to have independent
  *  sessions anchored on the same id. The first arg is the **routing anchor**:
  *  - thread-scope → rootMessageId
  *  - chat-scope   → chatId
  *  Lark message ids start with `om_` and chat ids with `oc_`, so collisions
  *  between the two address spaces are not possible. */
-export function sessionKey(anchorId: string, larkAppId: string): string {
-  return `${anchorId}::${larkAppId}`;
+export function platformSessionKey(anchorId: string, instance: PlatformInstanceIdentity): string {
+  // Zero-migration contract: Lark retains the byte-for-byte legacy key.
+  if (instance.platform === 'lark') return `${anchorId}::${instance.instanceId}`;
+  return `platform:${JSON.stringify([instance.platform, instance.instanceId, anchorId])}`;
+}
+
+export function sessionKey(anchorId: string, instance: string | PlatformInstanceIdentity): string {
+  return typeof instance === 'string'
+    ? platformSessionKey(anchorId, { platform: 'lark', instanceId: instance })
+    : platformSessionKey(anchorId, instance);
 }
 
 /** Resolve the routing anchor for an active session — chatId for chat-scope

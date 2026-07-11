@@ -206,8 +206,8 @@ describe('buildFollowUpContent role injection', () => {
     const prompt = buildFollowUpContent('follow up', 'sess-follow', {
       larkAppId: 'app1',
       chatId: 'oc_follow',
-      sender: { openId: 'ou_sender', type: 'user', name: 'Sender' },
-      mentions: [{ name: 'Reviewer', openId: 'ou_reviewer' }],
+      sender: { id: 'ou_sender', type: 'user', name: 'Sender' },
+      mentions: [{ token: '@_reviewer', name: 'Reviewer', identity: { id: 'ou_reviewer' } }],
     });
 
     expect(prompt).toContain('<role context="group" chat_id="oc_follow">');

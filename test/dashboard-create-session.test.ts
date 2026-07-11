@@ -32,6 +32,9 @@ vi.mock('../src/services/session-store.js', () => ({
 }));
 
 vi.mock('../src/services/message-queue.js', () => ({ ensureQueue: vi.fn() }));
+vi.mock('../src/services/project-scanner.js', () => ({
+  scanMultipleProjects: vi.fn(() => []),
+}));
 
 const sendMessageMock = vi.fn(async () => 'om_banner_123');
 vi.mock('../src/im/lark/client.js', () => ({
@@ -88,9 +91,17 @@ vi.mock('../src/services/whiteboard-store.js', () => ({
   ensureDefaultWhiteboard: vi.fn(),
 }));
 
-import { spawnDashboardSession, activateQueuedSession } from '../src/core/session-manager.js';
+import {
+  spawnDashboardSession,
+  activateQueuedSession,
+  setSessionManagerPlatformRuntime,
+} from '../src/core/session-manager.js';
 import { sessionKey } from '../src/core/types.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { getBot } from '../src/bot-registry.js';
+import { scanMultipleProjects } from '../src/services/project-scanner.js';
+import { createPlatformCapabilities } from '../src/im/platform.js';
+import type { PlatformRuntime } from '../src/im/ports.js';
 
 const APP = 'cli_app_test';
 const CHAT = 'oc_newgroup';
@@ -101,6 +112,13 @@ beforeEach(() => {
   forkWorkerMock.mockClear();
   sendMessageMock.mockClear();
   (dashboardEventBus.publish as any).mockClear();
+  setSessionManagerPlatformRuntime(undefined);
+  vi.mocked(getBot).mockReturnValue({
+    config: { cliId: 'claude-code', cliPathOverride: undefined, defaultWorkingDir: '/tmp' },
+    botName: 'TestBot',
+    botOpenId: 'ou_bot',
+  } as any);
+  vi.mocked(scanMultipleProjects).mockReturnValue([]);
 });
 
 describe('spawnDashboardSession — backlog (待办池) parks without starting the CLI', () => {
@@ -173,6 +191,64 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
     const [, prompt] = forkWorkerMock.mock.calls[0];
     expect(prompt).toContain('<botmux_lead_dispatch>');
     expect(prompt).toContain('Sub1');
+  });
+
+  it('routes an interactive repo picker through the injected cards port', async () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: {
+        cliId: 'claude-code',
+        cliPathOverride: undefined,
+        workingDir: '/tmp',
+      },
+      botName: 'TestBot',
+      botOpenId: 'ou_bot',
+    } as any);
+    vi.mocked(scanMultipleProjects).mockReturnValue([
+      { name: 'project-a', path: '/tmp/project-a', type: 'repo', branch: 'main' },
+    ]);
+
+    const instance = { platform: 'lark' as const, instanceId: APP };
+    const sendCard = vi.fn(async (conversation) => ({
+      instance,
+      messageId: 'om_repo_card',
+      conversation,
+    }));
+    const runtime = {
+      instance,
+      capabilities: createPlatformCapabilities({ cards: true }),
+      cards: {
+        sendCard,
+        replyCard: vi.fn(),
+        updateCard: vi.fn(),
+      },
+      start: vi.fn(async () => {}),
+      stop: vi.fn(async () => {}),
+    } satisfies PlatformRuntime;
+    setSessionManagerPlatformRuntime(runtime);
+
+    const active = new Map<string, DaemonSession>();
+    await spawnDashboardSession(active, undefined, {
+      larkAppId: APP,
+      chatId: CHAT,
+      content: '先选仓库',
+      column: 'in_progress',
+      role: 'solo',
+    });
+
+    expect(sendCard).toHaveBeenCalledWith(
+      expect.objectContaining({
+        instance,
+        chatId: CHAT,
+        scope: 'chat',
+        anchorId: CHAT,
+      }),
+      { payload: expect.any(String) },
+    );
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.repoCardMessageId).toBe('om_repo_card');
   });
 });
 

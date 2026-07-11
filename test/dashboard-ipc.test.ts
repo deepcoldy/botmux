@@ -4,7 +4,7 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setPlatformRuntime, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
 import * as oncallStore from '../src/services/oncall-store.js';
@@ -82,6 +82,7 @@ afterEach(async () => {
   // Reset module-level larkAppId between tests so groups endpoints don't
   // leak state across describes.
   setLarkAppId('');
+  setPlatformRuntime(undefined);
   __testOnly_resetBotRegistry();
   setIpcAuthSecret(null);
 });
@@ -185,6 +186,54 @@ describe('POST /api/sessions/:sessionId/lock', () => {
 
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({ ok: false, error: 'bad_locked' });
+  });
+
+  it('does not read, close, locate, or copy a sibling instance session on wrong-daemon requests', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-instance-lock-'));
+    const prevConfigDataDir = config.session.dataDir;
+    const seen: any[] = [];
+    const off = dashboardEventBus.subscribe(event => seen.push(event));
+    const foreign = {
+      sessionId: 'session-b', chatId: 'oc_b', rootMessageId: 'om_b', title: 'foreign',
+      status: 'active', createdAt: new Date().toISOString(), larkAppId: 'app_b', ownerOpenId: 'ou_b',
+    };
+    try {
+      config.session.dataDir = dataDir;
+      writeFileSync(join(dataDir, 'sessions-app_b.json'), JSON.stringify({ [foreign.sessionId]: foreign }));
+      sessionStore.init('app_a');
+      setLarkAppId('app_a');
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${foreign.sessionId}/lock`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ locked: true }),
+      });
+
+      expect(res.status).toBe(404);
+      expect(sessionStore.getLocalSession(foreign.sessionId)).toBeUndefined();
+
+      const closeRes = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${foreign.sessionId}/close`, {
+        method: 'POST',
+      });
+      expect(closeRes.status).toBe(200);
+      expect(await closeRes.json()).toEqual({ ok: true, alreadyClosed: true });
+
+      const locateRes = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${foreign.sessionId}/locate`, {
+        method: 'POST',
+      });
+      expect(locateRes.status).toBe(404);
+      expect(await locateRes.json()).toEqual({ ok: false, error: 'session_not_found' });
+
+      expect(seen.some(event => event.body?.sessionId === foreign.sessionId)).toBe(false);
+      expect(JSON.parse(readFileSync(join(dataDir, 'sessions-app_b.json'), 'utf8'))[foreign.sessionId])
+        .toEqual(foreign);
+    } finally {
+      off();
+      sessionStore.init();
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });
 
