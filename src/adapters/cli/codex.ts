@@ -21,6 +21,12 @@ interface HistoryMatch {
   cliSessionId?: string;
 }
 
+interface CodexSubmitResult {
+  submitted: boolean;
+  cliSessionId?: string;
+  recheck?: () => { submitted: boolean; cliSessionId?: string } | false;
+}
+
 function readCliSessionId(parsed: unknown): string | undefined {
   return parsed && typeof parsed === 'object' && typeof (parsed as any).session_id === 'string'
     ? (parsed as any).session_id
@@ -115,6 +121,79 @@ function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | u
     return undefined;
   }
   return undefined;
+}
+
+function isReattachPty(pty: PtyHandle): boolean {
+  return Boolean((pty as any).isReattach);
+}
+
+function clearCodexComposer(pty: PtyHandle): boolean {
+  try {
+    if (pty.sendSpecialKeys) pty.sendSpecialKeys('C-u');
+    else pty.write('\x15');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function submitCodexPrompt(
+  pty: PtyHandle,
+  content: string,
+  historyPath: string,
+  baseByte: number,
+  settleMs: number,
+): Promise<CodexSubmitResult> {
+  try {
+    if (pty.pasteText) {
+      // tmux mode: load-buffer + paste-buffer -d -p. The `-p` flag emits
+      // bracketed-paste markers when the pane has them on (Codex default);
+      // `-d` deletes the buffer after so it doesn't accumulate.
+      pty.pasteText(content);
+    } else {
+      // Non-tmux fallback (raw PTY): wrap the markers ourselves.
+      pty.write('\x1b[200~' + content + '\x1b[201~');
+    }
+  } catch {
+    return { submitted: false };
+  }
+
+  await delay(settleMs);
+  const trySendEnter = (): boolean => {
+    try {
+      if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
+      else pty.write('\r');
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (!trySendEnter()) return { submitted: false };
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const match = await waitForHistoryAppend(historyPath, baseByte, content, 800);
+    if (match.found) {
+      return match.cliSessionId
+        ? { submitted: true, cliSessionId: match.cliSessionId }
+        : { submitted: true };
+    }
+    if (!trySendEnter()) return { submitted: false };
+  }
+
+  const match = await waitForHistoryAppend(historyPath, baseByte, content, 800);
+  if (match.found) {
+    return match.cliSessionId
+      ? { submitted: true, cliSessionId: match.cliSessionId }
+      : { submitted: true };
+  }
+
+  const recheck = () => {
+    const late = matchHistoryDelta(historyPath, baseByte, content);
+    return late.found
+      ? { submitted: true, cliSessionId: late.cliSessionId }
+      : false;
+  };
+  return { submitted: false, recheck };
 }
 
 export function createCodexAdapter(pathOverride?: string): CliAdapter {
@@ -216,67 +295,27 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // bracketed paste lands the whole multi-line message in the composer
       // un-submitted, with the process staying alive and \t absorbed cleanly.
       //
-      // The history.jsonl verification loop below is unchanged: it polls for
-      // the submitted prefix and, if it never appears, surfaces the failure
-      // via the worker's deferred recheck + Lark warning rather than silently
-      // dropping the message.
-      const trySendEnter = (): boolean => {
-        try {
-          if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
-          else pty.write('\r');
-          return true;
-        } catch {
-          // tmux session is gone (CLI exited mid-write) — bail out cleanly
-          // rather than crashing the worker on an unhandled execFileSync error.
-          return false;
-        }
-      };
-
+      // The history.jsonl verification loop below still polls for the
+      // submitted prefix; on a hard miss it now clears the composer and
+      // re-drives the submit once before handing the worker a deferred recheck.
       const historyPath = codexHistoryPath();
       const baseByte = currentFileSize(historyPath);
+      const reattach = isReattachPty(pty);
+      const initialSettleMs = reattach ? 800 : 200;
+      const firstAttempt = await submitCodexPrompt(pty, content, historyPath, baseByte, initialSettleMs);
+      if (firstAttempt.submitted) return firstAttempt;
 
-      try {
-        if (pty.pasteText) {
-          // tmux mode: load-buffer + paste-buffer -d -p. The `-p` flag emits
-          // bracketed-paste markers when the pane has them on (Codex default);
-          // `-d` deletes the buffer after so it doesn't accumulate.
-          pty.pasteText(content);
-        } else {
-          // Non-tmux fallback (raw PTY): wrap the markers ourselves.
-          pty.write('\x1b[200~' + content + '\x1b[201~');
-        }
-      } catch {
-        return { submitted: false };
-      }
-      await delay(200);
-      if (!trySendEnter()) return { submitted: false };
+      if (!clearCodexComposer(pty)) return firstAttempt;
 
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const match = await waitForHistoryAppend(historyPath, baseByte, content, 800);
-        if (match.found) {
-          return match.cliSessionId
-            ? { submitted: true, cliSessionId: match.cliSessionId }
-            : undefined;
-        }
-        if (!trySendEnter()) return { submitted: false };
-      }
-      const match = await waitForHistoryAppend(historyPath, baseByte, content, 800);
-      if (match.found) {
-        return match.cliSessionId
-          ? { submitted: true, cliSessionId: match.cliSessionId }
-          : undefined;
-      }
+      const retrySettleMs = reattach ? 800 : 400;
+      const secondAttempt = await submitCodexPrompt(pty, content, historyPath, baseByte, retrySettleMs);
+      if (secondAttempt.submitted) return secondAttempt;
+
       // In-band budget exhausted. Hand the worker a recheck closure: a
       // slow-startup Codex (or one whose first turn is delayed by a heavy
       // initial prompt) may still append our marker after the retries gave
       // up, and the worker re-scans on a delay before warning the user.
-      const recheck = () => {
-        const late = matchHistoryDelta(historyPath, baseByte, content);
-        return late.found
-          ? { submitted: true, cliSessionId: late.cliSessionId }
-          : false;
-      };
-      return { submitted: false, recheck };
+      return secondAttempt;
     },
 
     completionPattern: undefined,

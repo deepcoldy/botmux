@@ -3365,9 +3365,11 @@ function scheduleSubmitFailureNotify(
   transcriptLabel: string,
   bridgeTurnId?: string,
   failureReason?: string,
+  turnId = currentBotmuxTurnId,
   turnSeq = usageLimitTracker.currentTurn(),
 ): void {
   const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
+  const notifyTurnId = turnId;
   const dropBridgeMark = (): void => {
     if (!bridgeTurnId) return;
     const dropped = bridgeQueue.dropPendingTurn(bridgeTurnId);
@@ -3387,7 +3389,7 @@ function scheduleSubmitFailureNotify(
     log(`writeInput: submit impossible — notifying user immediately. reason="${reason}" preview="${preview}"`);
     send({
       type: 'user_notify',
-      turnId: currentBotmuxTurnId,
+      turnId: notifyTurnId,
       message: t('worker.submit_impossible', { cliName: cliName(), reason, preview }),
     });
     return;
@@ -3443,7 +3445,7 @@ function scheduleSubmitFailureNotify(
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
     send({
       type: 'user_notify',
-      turnId: currentBotmuxTurnId,
+      turnId: notifyTurnId,
       message: t('worker.submit_unconfirmed', { cliName: cliName(), secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000), transcriptLabel, preview }),
     });
   }, SUBMIT_DEFERRED_RECHECK_MS);
@@ -3639,7 +3641,7 @@ async function flushPending(): Promise<void> {
         // nulled `backend` and told the user the CLI exited) — nothing more to
         // do. Otherwise surface it as a submit failure so the message isn't
         // silently lost.
-        if (backend) scheduleSubmitFailureNotify(msg, undefined, '会话 JSONL', bridgeTurnId, undefined, turnSeq);
+        if (backend) scheduleSubmitFailureNotify(msg, undefined, '会话 JSONL', bridgeTurnId, undefined, currentBotmuxTurnId, turnSeq);
         break;
       }
       // Persist any sessionId the adapter observed via authoritative sources
@@ -3657,7 +3659,7 @@ async function flushPending(): Promise<void> {
       // nulled backend) the user already got a "CLI exited" notice; don't also
       // nag that the submit wasn't confirmed.
       if (result && result.submitted === false && backend) {
-        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId, result.failureReason, turnSeq);
+        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId, result.failureReason, currentBotmuxTurnId, turnSeq);
       }
       // All structured bridges now drain every pending message in one flush:
       // Claude's BridgeTurnQueue handles `attachment(queued_command)` events
@@ -6024,7 +6026,7 @@ process.on('message', async (raw: unknown) => {
                 codexBridgeNotifyCliSessionId(result.cliSessionId);
               }
               if (result && result.submitted === false) {
-                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history', undefined, result.failureReason, turnSeq);
+                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history', undefined, result.failureReason, currentBotmuxTurnId, turnSeq);
               }
             } catch (err: any) {
               log(`Codex adopt writeInput error: ${err.message}`);
