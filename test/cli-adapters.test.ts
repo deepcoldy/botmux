@@ -745,7 +745,9 @@ describe('oh-my-pi buildArgs', () => {
     expect(args[idx + 1]).toBe('/repo/root');
   });
 
-  it('submits pasted tmux input with LF instead of symbolic Enter', async () => {
+  const ompPaste = (text: string) => `\x1b[200~${text}\x1b[201~`;
+
+  it('pastes tmux input below OMP placeholder thresholds and submits with Enter', async () => {
     const events: string[] = [];
     const pty = {
       write(data: string) { events.push(`write:${JSON.stringify(data)}`); },
@@ -754,15 +756,16 @@ describe('oh-my-pi buildArgs', () => {
       onExit() {},
       kill() {},
       pasteText(text: string) { events.push(`paste:${text}`); },
+      sendText(text: string) { events.push(`text:${text}`); },
       sendSpecialKeys(...keys: string[]) { events.push(`keys:${keys.join(',')}`); },
     } satisfies PtyHandle;
 
     await adapter.writeInput(pty, 'review this');
 
-    expect(events).toEqual(['paste:review this', 'write:"\\n"']);
+    expect(events).toEqual([`text:${ompPaste('review this')}`, 'keys:Enter']);
   });
 
-  it('submits raw PTY input with bracketed paste and LF', async () => {
+  it('uses the same explicit bracketed-paste wire format on raw PTY', async () => {
     const events: string[] = [];
     const pty = {
       write(data: string) { events.push(data); },
@@ -774,7 +777,123 @@ describe('oh-my-pi buildArgs', () => {
 
     await adapter.writeInput(pty, 'review this');
 
-    expect(events).toEqual(['\x1b[200~review this\x1b[201~', '\n']);
+    expect(events).toEqual([ompPaste('review this'), '\r']);
+  });
+
+  it('chunks long and many-line input below both OMP placeholder thresholds', async () => {
+    const pasted: string[] = [];
+    const keys: string[] = [];
+    const pty = {
+      write() {},
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      pasteText() { throw new Error('adapter must use one consistent explicit wire format'); },
+      sendText(text: string) { pasted.push(text); },
+      sendSpecialKeys(...sent: string[]) { keys.push(...sent); },
+    } satisfies PtyHandle;
+
+    const content = Array.from({ length: 25 }, (_, i) => `${i}: ${'x'.repeat(60)}`).join('\n');
+    await adapter.writeInput(pty, content);
+
+    const payloads = pasted.map(text => text.slice('\x1b[200~'.length, -'\x1b[201~'.length));
+    expect(payloads.join('')).toBe(content);
+    expect(payloads.length).toBeGreaterThan(2);
+    expect(payloads.every(text => text.length <= 512)).toBe(true);
+    expect(payloads.every(text => (text.match(/\n/g) ?? []).length <= 9)).toBe(true);
+    expect(keys).toEqual(['Enter']);
+  });
+
+  it('normalizes paste text so terminal control bytes cannot become OMP key events', async () => {
+    const events: string[] = [];
+    const pty = {
+      write() {},
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      sendText(text: string) { events.push(text); },
+      sendSpecialKeys(...keys: string[]) { events.push(`keys:${keys.join(',')}`); },
+    } satisfies PtyHandle;
+
+    await adapter.writeInput(pty, 'a\tb\r\nc\x7fd\x1b[31mred\x1b[0m e\u0301');
+
+    expect(events).toEqual([ompPaste('a   b\ncdred é'), 'keys:Enter']);
+  });
+
+  it('clears the OMP composer when a later paste chunk is dropped', async () => {
+    const events: string[] = [];
+    let textCall = 0;
+    const pty = {
+      write(data: string) { events.push(`write:${data}`); },
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      sendText(text: string) { events.push(`text:${text.length}`); return ++textCall !== 2; },
+      sendSpecialKeys(...keys: string[]) { events.push(`keys:${keys.join(',')}`); },
+    } satisfies PtyHandle;
+
+    await expect(adapter.writeInput(pty, 'x'.repeat(1200))).resolves.toEqual({ submitted: false });
+
+    expect(events).toEqual(['text:524', 'text:524', 'keys:C-c']);
+  });
+
+  it('clears the OMP composer when Enter retries are all dropped', async () => {
+    const events: string[] = [];
+    const pty = {
+      write(data: string) { events.push(`write:${data}`); },
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      sendText(text: string) { events.push(`text:${text}`); },
+      sendSpecialKeys(...keys: string[]) {
+        events.push(`keys:${keys.join(',')}`);
+        return keys[0] === 'C-c';
+      },
+    } satisfies PtyHandle;
+
+    await expect(adapter.writeInput(pty, 'review this')).resolves.toEqual({ submitted: false });
+
+    expect(events).toEqual([
+      `text:${ompPaste('review this')}`,
+      'keys:Enter',
+      'keys:Enter',
+      'keys:Enter',
+      'keys:C-c',
+    ]);
+  });
+
+  it('blocks new text behind an uncleared partial composer and retries cleanup first', async () => {
+    const isolatedAdapter = createOhMyPiAdapter('/usr/bin/omp');
+    const events: string[] = [];
+    let cleanupAttempts = 0;
+    const pty = {
+      write() {},
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      sendText(text: string) { events.push(`text:${text}`); return false; },
+      sendSpecialKeys(...keys: string[]) {
+        events.push(`keys:${keys.join(',')}`);
+        if (keys[0] === 'C-c') return ++cleanupAttempts > 1;
+        return true;
+      },
+    } satisfies PtyHandle;
+
+    await expect(isolatedAdapter.writeInput(pty, 'first')).resolves.toEqual({ submitted: false });
+    await expect(isolatedAdapter.writeInput(pty, 'second')).resolves.toEqual({ submitted: false });
+
+    expect(events).toEqual([
+      `text:${ompPaste('first')}`,
+      'keys:C-c',
+      'keys:C-c',
+      `text:${ompPaste('second')}`,
+      'keys:C-c',
+    ]);
   });
 
   it('skillsDir points to ~/.omp/agent/skills', () => {
