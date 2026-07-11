@@ -42,6 +42,7 @@ import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } f
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { resolveTerminalWriteForRequest } from './core/terminal-write-auth.js';
 import { readPlatformBinding } from './platform/binding.js';
+import { loadPersistedToken } from './dashboard/auth.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
 import {
   shouldRunQuietRotation,
@@ -305,21 +306,31 @@ const authedClients = new WeakSet<WebSocket>();
 const clientPtys = new Map<WebSocket, pty.IPty>();
 const writeToken = randomBytes(16).toString('hex');
 
+// Active dashboard token, persisted by the dashboard process at this stable
+// path (mirrors dashboard.ts TOKEN_PATH). The platform proxy injects it as the
+// `botmux_dashboard_token` cookie on every request it fronts, so its presence
+// proves a request traversed the platform's authenticated front door.
+const DASHBOARD_TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
+
 /**
- * Resolve terminal write permission for one request. Trust of the
- * platform-injected `X-Botmux-Role` header is gated on this machine's platform
- * binding: a self-hosted (unbound) deployment has no boundary stripping that
- * header, so it must never be trusted — otherwise a client forging
- * `X-Botmux-Role: owner` bypasses the `?token=` gate (= unauthenticated terminal
- * write = RCE). See ./core/terminal-write-auth for the full rationale.
+ * Resolve terminal write permission for one request. The platform-injected
+ * `X-Botmux-Role` header is trusted only when this machine is bound to a central
+ * platform AND the request actually came through the platform proxy (proven by a
+ * matching `botmux_dashboard_token` cookie — a secret a direct caller lacks).
+ * Otherwise write falls back to the `?token=` gate. See
+ * ./core/terminal-write-auth for the full rationale.
  *
- * The binding is read PER REQUEST, never snapshotted: `botmux bind`/unbind
- * rewrites platform.json and the dashboard hot-reloads the tunnel without
- * restarting this worker, so a cached value would go stale (trusting forged
- * headers after an unbind / denying platform writes after a bind).
+ * Both the binding and the token are read PER REQUEST, never snapshotted:
+ * `botmux bind`/unbind and dashboard token rotation are hot-reloaded without
+ * restarting this worker, so a cached value would go stale.
  */
 function resolveTerminalWriteForReq(req: IncomingMessage, tokenMatches: boolean): { hasWrite: boolean; platformReadonly: boolean } {
-  return resolveTerminalWriteForRequest(req.headers, tokenMatches, () => readPlatformBinding() !== null);
+  return resolveTerminalWriteForRequest(
+    req.headers,
+    tokenMatches,
+    () => readPlatformBinding() !== null,
+    () => loadPersistedToken(DASHBOARD_TOKEN_PATH),
+  );
 }
 
 /** Lazily-written locked-mode zellij config for per-WS web-terminal attach

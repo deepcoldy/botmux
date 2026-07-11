@@ -1,110 +1,151 @@
 // test/terminal-write-auth.test.ts
 //
-// Security regression guard for the terminal write-permission gate.
+// Guard for the terminal write-permission gate.
 //
-// The `X-Botmux-Role` header is only trustworthy when a central platform fronts
-// `/s` and authoritatively injects it (after stripping any client copy). A
-// self-hosted deployment (NOT bound to a platform) has no such boundary, so a
-// client can forge `X-Botmux-Role: owner` and bypass the `?token=` gate =
-// unauthenticated terminal write = RCE. The gate must therefore honor the role
-// header ONLY when this machine is platform-bound.
+// The `X-Botmux-Role` header is only trustworthy on a request that genuinely
+// traversed the platform's authenticated reverse proxy. That proxy drops any
+// client Cookie and injects this machine's real `botmux_dashboard_token`; the
+// dashboard `/s` bridge / terminal-proxy then replay headers verbatim. A direct
+// caller (front door binds all interfaces) can forge `X-Botmux-Role: owner` but
+// cannot supply the secret dashboard token. The gate therefore honors the role
+// header only when the machine is platform-bound AND the request carries the
+// matching dashboard-token cookie; otherwise write falls back to `?token=`.
 import { describe, it, expect } from 'vitest';
-import { resolveTerminalWrite, resolveTerminalWriteForRequest } from '../src/core/terminal-write-auth.js';
+import {
+  resolveTerminalWrite,
+  resolveTerminalWriteForRequest,
+  readDashboardCookie,
+} from '../src/core/terminal-write-auth.js';
 
-describe('resolveTerminalWrite', () => {
-  describe('self-hosted (not platform-bound): role header must NOT be trusted', () => {
-    it('ignores a forged owner role with no token → no write (the RCE fix)', () => {
-      expect(resolveTerminalWrite({ role: 'owner', tokenMatches: false, platformBound: false }))
+const TOK = 'dash-secret-token';
+
+describe('resolveTerminalWrite (pure gate)', () => {
+  describe('role header ignored unless BOTH platform-bound AND platform-proxied', () => {
+    it('bound but not proxied: forged owner ignored → token fallback (no write)', () => {
+      expect(resolveTerminalWrite({ role: 'owner', tokenMatches: false, platformBound: true, platformProxied: false }))
         .toEqual({ hasWrite: false, platformReadonly: false });
     });
 
-    it('still grants write via a matching ?token= even with a forged role present', () => {
-      expect(resolveTerminalWrite({ role: 'owner', tokenMatches: true, platformBound: false }))
-        .toEqual({ hasWrite: true, platformReadonly: false });
-    });
-
-    it('grants write via matching token when no role header is present', () => {
-      expect(resolveTerminalWrite({ role: undefined, tokenMatches: true, platformBound: false }))
-        .toEqual({ hasWrite: true, platformReadonly: false });
-    });
-
-    it('denies write when neither role trust nor token applies', () => {
-      expect(resolveTerminalWrite({ role: undefined, tokenMatches: false, platformBound: false }))
+    it('proxied but not bound: role ignored → token fallback (defense in depth)', () => {
+      expect(resolveTerminalWrite({ role: 'owner', tokenMatches: false, platformBound: false, platformProxied: true }))
         .toEqual({ hasWrite: false, platformReadonly: false });
+    });
+
+    it('neither: forged owner ignored → token fallback', () => {
+      expect(resolveTerminalWrite({ role: 'owner', tokenMatches: false, platformBound: false, platformProxied: false }))
+        .toEqual({ hasWrite: false, platformReadonly: false });
+    });
+
+    it('bound but not proxied: a matching ?token= still grants write', () => {
+      expect(resolveTerminalWrite({ role: 'owner', tokenMatches: true, platformBound: true, platformProxied: false }))
+        .toEqual({ hasWrite: true, platformReadonly: false });
     });
   });
 
-  describe('platform-bound: trust the platform-injected role', () => {
+  describe('platform-bound AND platform-proxied: trust the injected role', () => {
     it('grants write for role owner (token irrelevant)', () => {
-      expect(resolveTerminalWrite({ role: 'owner', tokenMatches: false, platformBound: true }))
+      expect(resolveTerminalWrite({ role: 'owner', tokenMatches: false, platformBound: true, platformProxied: true }))
         .toEqual({ hasWrite: true, platformReadonly: false });
     });
 
     it('forces read-only for a non-owner role (guest), overriding a matching token', () => {
-      expect(resolveTerminalWrite({ role: 'guest', tokenMatches: true, platformBound: true }))
+      expect(resolveTerminalWrite({ role: 'guest', tokenMatches: true, platformBound: true, platformProxied: true }))
         .toEqual({ hasWrite: false, platformReadonly: true });
     });
 
     it('forces read-only for role teammate', () => {
-      expect(resolveTerminalWrite({ role: 'teammate', tokenMatches: false, platformBound: true }))
+      expect(resolveTerminalWrite({ role: 'teammate', tokenMatches: false, platformBound: true, platformProxied: true }))
         .toEqual({ hasWrite: false, platformReadonly: true });
     });
 
-    it('falls back to token when no role header is present (local direct hit on a bound box)', () => {
-      expect(resolveTerminalWrite({ role: undefined, tokenMatches: true, platformBound: true }))
+    it('no role header present → token fallback (local direct hit on a bound box)', () => {
+      expect(resolveTerminalWrite({ role: undefined, tokenMatches: true, platformBound: true, platformProxied: true }))
         .toEqual({ hasWrite: true, platformReadonly: false });
-      expect(resolveTerminalWrite({ role: '', tokenMatches: false, platformBound: true }))
+      expect(resolveTerminalWrite({ role: '', tokenMatches: false, platformBound: true, platformProxied: true }))
         .toEqual({ hasWrite: false, platformReadonly: false });
     });
+  });
+});
+
+describe('readDashboardCookie', () => {
+  it('extracts the token from a Cookie header among others', () => {
+    expect(readDashboardCookie('a=1; botmux_dashboard_token=xyz; b=2')).toBe('xyz');
+  });
+  it('joins an array Cookie header', () => {
+    expect(readDashboardCookie(['a=1', 'botmux_dashboard_token=xyz'])).toBe('xyz');
+  });
+  it('returns null when absent / empty / undefined', () => {
+    expect(readDashboardCookie('a=1; b=2')).toBeNull();
+    expect(readDashboardCookie('botmux_dashboard_token=')).toBeNull();
+    expect(readDashboardCookie(undefined)).toBeNull();
   });
 });
 
 describe('resolveTerminalWriteForRequest', () => {
   const bound = () => true;
   const unbound = () => false;
+  const token = () => TOK;
+  const noToken = () => null;
+  const cookie = (v: string) => ({ cookie: `botmux_dashboard_token=${v}` });
 
-  it('extracts a string role header and honors it when bound', () => {
-    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner' }, false, bound))
+  it('honors owner when bound AND the cookie matches the active dashboard token', () => {
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie(TOK) }, false, bound, token))
       .toEqual({ hasWrite: true, platformReadonly: false });
   });
 
-  it('ignores a forged role when unbound → token fallback (the RCE fix)', () => {
-    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner' }, false, unbound))
+  it('ignores a forged owner when the dashboard cookie is MISSING → token fallback (the fix)', () => {
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner' }, false, bound, token))
+      .toEqual({ hasWrite: false, platformReadonly: false });
+  });
+
+  it('ignores a forged owner when the cookie value is WRONG → token fallback (the fix)', () => {
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie('attacker-guess') }, false, bound, token))
+      .toEqual({ hasWrite: false, platformReadonly: false });
+  });
+
+  it('ignores the role when the machine has no active dashboard token', () => {
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie(TOK) }, false, bound, noToken))
+      .toEqual({ hasWrite: false, platformReadonly: false });
+  });
+
+  it('ignores the role when unbound even with a matching cookie', () => {
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie(TOK) }, false, unbound, token))
       .toEqual({ hasWrite: false, platformReadonly: false });
   });
 
   it('treats a duplicated (array) role header as absent → token fallback', () => {
-    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': ['owner', 'guest'] }, false, bound))
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': ['owner', 'guest'], ...cookie(TOK) }, false, bound, token))
       .toEqual({ hasWrite: false, platformReadonly: false });
-    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': ['owner', 'guest'] }, true, bound))
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': ['owner', 'guest'], ...cookie(TOK) }, true, bound, token))
       .toEqual({ hasWrite: true, platformReadonly: false });
   });
 
   it('falls back to token when no role header is present', () => {
-    expect(resolveTerminalWriteForRequest({}, true, bound))
+    expect(resolveTerminalWriteForRequest({ ...cookie(TOK) }, true, bound, token))
       .toEqual({ hasWrite: true, platformReadonly: false });
   });
 
-  // Regression guard for the codex finding: binding must be evaluated per request,
-  // not snapshotted. `botmux bind`/unbind hot-reloads binding without restarting
-  // live workers — a snapshot would keep trusting forged headers after an unbind.
-  it('evaluates the binding check on every call (not cached)', () => {
+  // Both thunks must be evaluated per request, never snapshotted: bind/unbind and
+  // dashboard token rotation are hot-reloaded without restarting live workers.
+  it('evaluates binding + token on every call (not cached)', () => {
     let boundNow = false;
+    let activeTok: string | null = TOK;
     const isBound = () => boundNow;
-    const forgedNoToken = { 'x-botmux-role': 'owner' };
+    const getTok = () => activeTok;
+    const req = { 'x-botmux-role': 'owner', ...cookie(TOK) };
 
-    // Unbound: forged owner is ignored.
-    expect(resolveTerminalWriteForRequest(forgedNoToken, false, isBound))
+    // Unbound: forged owner ignored.
+    expect(resolveTerminalWriteForRequest(req, false, isBound, getTok))
       .toEqual({ hasWrite: false, platformReadonly: false });
 
-    // Machine gets bound — the very next request must reflect it.
+    // Bound + cookie matches active token → trusted next request.
     boundNow = true;
-    expect(resolveTerminalWriteForRequest(forgedNoToken, false, isBound))
+    expect(resolveTerminalWriteForRequest(req, false, isBound, getTok))
       .toEqual({ hasWrite: true, platformReadonly: false });
 
-    // And after an unbind, trust must drop again (no stale RCE window).
-    boundNow = false;
-    expect(resolveTerminalWriteForRequest(forgedNoToken, false, isBound))
+    // Token rotates → the old cookie no longer matches → trust drops immediately.
+    activeTok = 'rotated-token';
+    expect(resolveTerminalWriteForRequest(req, false, isBound, getTok))
       .toEqual({ hasWrite: false, platformReadonly: false });
   });
 });
