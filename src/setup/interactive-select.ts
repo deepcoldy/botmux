@@ -71,12 +71,16 @@ export function interactiveSelect(opts: {
   title: string;
   items: ReadonlyArray<SelectItem>;
   footer?: string;
+  /** Initially highlighted item (used by setup defaults/editors). */
+  initialIndex?: number;
 }): Promise<number | null> {
   const { items } = opts;
   if (!input.isTTY || !output.isTTY || items.length === 0) return Promise.resolve(null);
 
   let query = '';
-  let cursor = 0;
+  let cursor = Number.isInteger(opts.initialIndex) && opts.initialIndex! >= 0 && opts.initialIndex! < items.length
+    ? opts.initialIndex!
+    : 0;
   let top = 0;
   let filtered: number[] = items.map((_, i) => i);
 
@@ -242,21 +246,45 @@ export async function pickCliSelection(
 
   // ── TTY：级联 ──
   // 顶层循环：选中带二级菜单的项后进子菜单，子菜单取消则退回顶层。
+  const currentPath = cliSelectionCursorPath(opts.currentKey);
   for (;;) {
     const topItems: SelectItem[] = CLI_SELECT_TREE.map((g) => ({
       label: g.label,
       hint: g.children ? '' : g.option?.key,
       submenu: !!g.children,
     }));
-    const ti = await interactiveSelect({ title, items: topItems, footer: '选 Aiden 进入子菜单（× Claude / × Codex）' });
+    const ti = await interactiveSelect({
+      title,
+      items: topItems,
+      footer: '带 ▸ 的项目进入子菜单',
+      initialIndex: currentPath.topIndex,
+    });
     if (ti === null) return null;
     const group = CLI_SELECT_TREE[ti];
     if (group.option) return group.option.key;
     if (group.children) {
       const subItems: SelectItem[] = group.children.map((c) => ({ label: c.label, hint: c.wrapperCli ?? c.key }));
-      const si = await interactiveSelect({ title: `${title} › ${group.label}`, items: subItems, footer: 'Esc 返回上一级' });
+      const si = await interactiveSelect({
+        title: `${title} › ${group.label}`,
+        items: subItems,
+        footer: 'Esc 返回上一级',
+        initialIndex: ti === currentPath.topIndex ? currentPath.childIndex : undefined,
+      });
       if (si === null) continue; // 退回顶层
       return group.children[si].key;
     }
   }
+}
+
+/** Resolve a selection key to its top-level and optional child cursor. */
+export function cliSelectionCursorPath(currentKey?: string): { topIndex: number; childIndex?: number } {
+  if (currentKey) {
+    for (let topIndex = 0; topIndex < CLI_SELECT_TREE.length; topIndex++) {
+      const group = CLI_SELECT_TREE[topIndex]!;
+      if (group.option?.key === currentKey) return { topIndex };
+      const childIndex = group.children?.findIndex(child => child.key === currentKey) ?? -1;
+      if (childIndex >= 0) return { topIndex, childIndex };
+    }
+  }
+  return { topIndex: 0 };
 }

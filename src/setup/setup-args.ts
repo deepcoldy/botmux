@@ -57,6 +57,42 @@ export function isScriptedSetupInvocation(argv: string[]): boolean {
   return !first.startsWith('-');
 }
 
+export interface InteractiveSetupOptions {
+  /** CLI selection key preselected by the interactive setup wizard. */
+  defaultCli?: string;
+}
+
+/**
+ * Parse flags accepted by the interactive `botmux setup` path. Keeping this
+ * separate from the scripted subcommand parser lets bootstrap installers pick
+ * a sensible CLI without depending on TUI key presses or answer ordering.
+ */
+export function parseInteractiveSetupOptions(argv: string[]): InteractiveSetupOptions {
+  let defaultCli: string | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i]!;
+    if (token === '--open-platform-auto' || token === '--no-open-platform-auto') continue;
+    if (token === '--default-cli') {
+      const value = argv[i + 1];
+      if (!value || value.startsWith('--')) throw new Error('--default-cli 缺少取值');
+      defaultCli = value;
+      i++;
+      continue;
+    }
+    if (token.startsWith('--default-cli=')) {
+      defaultCli = token.slice('--default-cli='.length);
+      if (!defaultCli) throw new Error('--default-cli 缺少取值');
+      continue;
+    }
+    throw new Error(`交互式 setup 不支持参数 ${token}`);
+  }
+  if (defaultCli !== undefined) {
+    // Validate the key now so the wizard fails before the first QR scan.
+    resolveCliSelection(defaultCli);
+  }
+  return defaultCli ? { defaultCli } : {};
+}
+
 const BOT_FIELD_FLAGS: Record<string, keyof SetupBotFlags> = {
   '--name': 'name',
   '--app-id': 'appId',

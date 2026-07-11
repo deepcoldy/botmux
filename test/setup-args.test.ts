@@ -4,6 +4,7 @@ import {
   editInputFromFlags,
   isScriptedSetupInvocation,
   maskAppSecret,
+  parseInteractiveSetupOptions,
   parseSetupCommand,
 } from '../src/setup/setup-args.js';
 import { applyBotConfigEdits } from '../src/setup/bot-config-editor.js';
@@ -19,10 +20,26 @@ describe('isScriptedSetupInvocation', () => {
     expect(isScriptedSetupInvocation([])).toBe(false);
     expect(isScriptedSetupInvocation(['--no-open-platform-auto'])).toBe(false);
     expect(isScriptedSetupInvocation(['--open-platform-auto'])).toBe(false);
+    expect(isScriptedSetupInvocation(['--default-cli', 'traex'])).toBe(false);
   });
 
   it('routes unknown bare words to the scripted parser instead of hanging the TUI', () => {
     expect(isScriptedSetupInvocation(['frobnicate'])).toBe(true);
+  });
+});
+
+describe('parseInteractiveSetupOptions', () => {
+  it('parses and validates a default CLI without changing open-platform flags', () => {
+    expect(parseInteractiveSetupOptions(['--default-cli', 'traex', '--open-platform-auto']))
+      .toEqual({ defaultCli: 'traex' });
+    expect(parseInteractiveSetupOptions(['--no-open-platform-auto', '--default-cli=codex']))
+      .toEqual({ defaultCli: 'codex' });
+  });
+
+  it('rejects missing, unknown, or invalid values before setup scans', () => {
+    expect(() => parseInteractiveSetupOptions(['--default-cli'])).toThrow(/缺少取值/);
+    expect(() => parseInteractiveSetupOptions(['--default-cli=nope'])).toThrow(/未知 CLI/);
+    expect(() => parseInteractiveSetupOptions(['--wat'])).toThrow(/不支持参数/);
   });
 });
 

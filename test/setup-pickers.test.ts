@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { computeViewportTop, pickChoice, truncateToWidth } from '../src/setup/interactive-select.js';
+import { cliSelectionCursorPath, computeViewportTop, pickChoice, truncateToWidth } from '../src/setup/interactive-select.js';
 import {
   listOpenPlatformApps,
   fetchOpenPlatformAppSecret,
@@ -57,6 +57,18 @@ describe('computeViewportTop (长列表视口滚动)', () => {
   it('scrolls up when the cursor wraps back above the window', () => {
     expect(computeViewportTop(0, 30, 40, 10)).toBe(0);   // 底部 wrap 回顶部
     expect(computeViewportTop(29, 30, 40, 10)).toBe(29);
+  });
+});
+
+describe('cliSelectionCursorPath', () => {
+  it('preselects nested and top-level CLI choices', () => {
+    const trae = cliSelectionCursorPath('traex');
+    expect(trae.topIndex).toBeGreaterThan(0);
+    expect(trae.childIndex).toBe(1);
+
+    const claude = cliSelectionCursorPath('claude-code');
+    expect(claude).toEqual({ topIndex: 0 });
+    expect(cliSelectionCursorPath('not-a-cli')).toEqual({ topIndex: 0 });
   });
 });
 
