@@ -106,6 +106,9 @@ import {
 import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 
+const sessionReplyMock = vi.fn(async () => 'om_reply');
+const userNotifyReplyMock = vi.fn(async () => 'om_notify');
+
 function makeFakeWorker() {
   const worker = new EventEmitter() as any;
   worker.killed = false;
@@ -222,7 +225,8 @@ describe('session lifecycle hook helper', () => {
 describe('worker-pool lifecycle hook integration', () => {
   beforeEach(() => {
     initWorkerPool({
-      sessionReply: vi.fn(async () => 'om_reply'),
+      sessionReply: sessionReplyMock,
+      userNotifyReply: userNotifyReplyMock,
       getSessionWorkingDir: () => '/repo',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
@@ -284,6 +288,27 @@ describe('worker-pool lifecycle hook integration', () => {
       reason: 'user_notify',
       message: 'Need manual input',
     }));
+  });
+
+  it('mentions the sender and replies under the exact failed input message', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'user_notify',
+      message: 'Submit was not confirmed',
+      turnId: 'om_failed_input',
+      mentionOpenId: 'ou_sender123',
+    });
+    await flush();
+
+    expect(userNotifyReplyMock).toHaveBeenCalledWith(
+      'om_failed_input',
+      '<at user_id="ou_sender123"></at> Submit was not confirmed',
+      'app_test',
+    );
+    expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
   it('emits session.exit from worker process exit', () => {

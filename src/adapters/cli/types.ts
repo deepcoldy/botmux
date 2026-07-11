@@ -8,8 +8,14 @@ export interface PtyHandle {
   /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
    *  Returns `false` on a dropped write (see sendText). */
   sendSpecialKeys?(...keys: string[]): void | boolean;
-  /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it). */
-  pasteText?(text: string): void;
+  /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it).
+   *  Returns `false` when a backend can prove the paste was dropped. */
+  pasteText?(text: string): void | boolean;
+  /** True when this handle re-attached to a persistent pane after daemon restart. */
+  readonly isReattach?: boolean;
+  /** Current visible pane snapshot. Reattach-sensitive adapters may use this
+   *  to prove a paste reached the real composer before pressing Enter. */
+  captureViewport?(): string;
   /** Absolute path to Claude Code's session JSONL; set by worker for claude-code adapter.
    *  Used by writeInput to verify a paste+Enter actually committed (new user-content
    *  line appended) and retry Enter if not — rather than trusting fixed sleep timing. */

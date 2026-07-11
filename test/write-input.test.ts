@@ -1242,6 +1242,29 @@ describe('codex writeInput submission confirmation', () => {
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 
+  it('does not repaste when the first submit appears during the recovery gap', async () => {
+    resetCodexHistory();
+    let submittedText = '';
+    const pty: PtyHandle = {
+      write: vi.fn(),
+      pasteText: vi.fn((text: string) => { submittedText = text; }),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'C-u') return;
+        // Model Codex accepting an earlier Enter while history.jsonl becomes
+        // observable only after the first attempt exhausted its poll budget.
+        appendCodexHistory(submittedText, 'late-first-thread');
+        submittedText = '';
+      }),
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: 'late-first-thread' });
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('C-u');
+    expect((pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter')).toHaveLength(4);
+  });
+
   it('waits longer before the first Enter when the tmux pane is reattached', async () => {
     resetCodexHistory();
     vi.useFakeTimers();
@@ -1261,6 +1284,40 @@ describe('codex writeInput submission confirmation', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('waits for reattached composer evidence before pressing Enter', async () => {
+    resetCodexHistory();
+    let submittedText = '';
+    let composerVisible = false;
+    let captures = 0;
+    const pty: PtyHandle & { isReattach: boolean; captureViewport(): string } = {
+      write: vi.fn(),
+      pasteText: vi.fn((text: string) => { submittedText = text; }),
+      captureViewport: vi.fn(() => {
+        captures++;
+        if (captures >= 4) composerVisible = true;
+        return composerVisible ? `› ${submittedText}` : '›';
+      }),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key === 'C-u') {
+          submittedText = '';
+          composerVisible = false;
+          return;
+        }
+        if (key === 'Enter' && composerVisible) {
+          appendCodexHistory(submittedText, 'composer-ready-thread');
+        }
+      }),
+      isReattach: true,
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: 'composer-ready-thread' });
+    expect(pty.captureViewport).toHaveBeenCalled();
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 });
 

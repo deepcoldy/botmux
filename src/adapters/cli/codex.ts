@@ -6,6 +6,7 @@ import type { CliAdapter, PtyHandle } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
+import { stripAnsiForLog } from '../../utils/crash-log.js';
 
 /** Global submit log — Codex appends one JSON line here on every successful
  *  user submit across all sessions. Far better than the per-session rollout
@@ -124,17 +125,69 @@ function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | u
 }
 
 function isReattachPty(pty: PtyHandle): boolean {
-  return Boolean((pty as any).isReattach);
+  return pty.isReattach === true;
 }
 
 function clearCodexComposer(pty: PtyHandle): boolean {
   try {
-    if (pty.sendSpecialKeys) pty.sendSpecialKeys('C-u');
+    if (pty.sendSpecialKeys) {
+      if (pty.sendSpecialKeys('C-u') === false) return false;
+    }
     else pty.write('\x15');
     return true;
   } catch {
     return false;
   }
+}
+
+function normaliseComposerText(text: string): string {
+  return stripAnsiForLog(text).replace(/\s+/g, ' ').trim();
+}
+
+function screenShowsCodexPaste(screen: string, content: string): boolean {
+  const actual = normaliseComposerText(screen);
+  const expected = normaliseComposerText(content);
+  if (!actual || !expected) return false;
+  const visibleTail = expected.length > 80 ? expected.slice(-80) : expected;
+  return actual.includes(visibleTail)
+    || /\bpasted\s+content\b[^\r\n]{0,40}\b(?:chars?|lines?)\b/i.test(actual);
+}
+
+async function waitForCodexComposerPaste(
+  pty: PtyHandle,
+  content: string,
+  beforePasteScreen: string,
+  timeoutMs: number,
+): Promise<'confirmed' | 'unavailable' | 'missing'> {
+  if (!pty.captureViewport) return 'unavailable';
+  const deadline = Date.now() + scaleMs(timeoutMs);
+  let capturedNonEmptyScreen = false;
+  do {
+    try {
+      const screen = pty.captureViewport();
+      if (screen.trim()) capturedNonEmptyScreen = true;
+      if (normaliseComposerText(screen) !== normaliseComposerText(beforePasteScreen)
+        && screenShowsCodexPaste(screen, content)) return 'confirmed';
+    } catch {
+      // A transient capture failure should not turn into a blind Enter. Keep
+      // polling; if every capture fails we use the legacy settle delay below.
+    }
+    await delay(100);
+  } while (Date.now() < deadline);
+  return capturedNonEmptyScreen ? 'missing' : 'unavailable';
+}
+
+function codexHistoryRecheck(
+  historyPath: string,
+  baseByte: number,
+  content: string,
+): CodexSubmitResult['recheck'] {
+  return () => {
+    const late = matchHistoryDelta(historyPath, baseByte, content);
+    return late.found
+      ? { submitted: true, cliSessionId: late.cliSessionId }
+      : false;
+  };
 }
 
 async function submitCodexPrompt(
@@ -143,13 +196,18 @@ async function submitCodexPrompt(
   historyPath: string,
   baseByte: number,
   settleMs: number,
+  requireComposerEvidence: boolean,
 ): Promise<CodexSubmitResult> {
+  let beforePasteScreen = '';
+  if (requireComposerEvidence && pty.captureViewport) {
+    try { beforePasteScreen = pty.captureViewport(); } catch { /* fallback handled below */ }
+  }
   try {
     if (pty.pasteText) {
       // tmux mode: load-buffer + paste-buffer -d -p. The `-p` flag emits
       // bracketed-paste markers when the pane has them on (Codex default);
       // `-d` deletes the buffer after so it doesn't accumulate.
-      pty.pasteText(content);
+      if (pty.pasteText(content) === false) return { submitted: false };
     } else {
       // Non-tmux fallback (raw PTY): wrap the markers ourselves.
       pty.write('\x1b[200~' + content + '\x1b[201~');
@@ -158,10 +216,20 @@ async function submitCodexPrompt(
     return { submitted: false };
   }
 
-  await delay(settleMs);
+  if (requireComposerEvidence) {
+    const composer = await waitForCodexComposerPaste(pty, content, beforePasteScreen, 2_400);
+    if (composer === 'missing') {
+      return { submitted: false, recheck: codexHistoryRecheck(historyPath, baseByte, content) };
+    }
+    if (composer === 'unavailable') await delay(settleMs);
+  } else {
+    await delay(settleMs);
+  }
   const trySendEnter = (): boolean => {
     try {
-      if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
+      if (pty.sendSpecialKeys) {
+        if (pty.sendSpecialKeys('Enter') === false) return false;
+      }
       else pty.write('\r');
       return true;
     } catch {
@@ -187,13 +255,7 @@ async function submitCodexPrompt(
       : { submitted: true };
   }
 
-  const recheck = () => {
-    const late = matchHistoryDelta(historyPath, baseByte, content);
-    return late.found
-      ? { submitted: true, cliSessionId: late.cliSessionId }
-      : false;
-  };
-  return { submitted: false, recheck };
+  return { submitted: false, recheck: codexHistoryRecheck(historyPath, baseByte, content) };
 }
 
 export function createCodexAdapter(pathOverride?: string): CliAdapter {
@@ -302,13 +364,21 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const baseByte = currentFileSize(historyPath);
       const reattach = isReattachPty(pty);
       const initialSettleMs = reattach ? 800 : 200;
-      const firstAttempt = await submitCodexPrompt(pty, content, historyPath, baseByte, initialSettleMs);
+      const firstAttempt = await submitCodexPrompt(pty, content, historyPath, baseByte, initialSettleMs, reattach);
       if (firstAttempt.submitted) return firstAttempt;
 
       if (!clearCodexComposer(pty)) return firstAttempt;
+      await delay(150);
+
+      // The last Enter may have committed even though history.jsonl missed the
+      // first attempt's in-band budget. Recheck after the clear/settle gap and
+      // before repasting: otherwise a late history append would prove the first
+      // submit landed only after we had already driven the same prompt twice.
+      const lateFirstSubmit = firstAttempt.recheck?.();
+      if (lateFirstSubmit && lateFirstSubmit.submitted) return lateFirstSubmit;
 
       const retrySettleMs = reattach ? 800 : 400;
-      const secondAttempt = await submitCodexPrompt(pty, content, historyPath, baseByte, retrySettleMs);
+      const secondAttempt = await submitCodexPrompt(pty, content, historyPath, baseByte, retrySettleMs, reattach);
       if (secondAttempt.submitted) return secondAttempt;
 
       // In-band budget exhausted. Hand the worker a recheck closure: a

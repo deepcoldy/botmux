@@ -554,6 +554,7 @@ const inflightInputs = new InflightInputTracker();
  *  start work before their history/transcript submit marker is observable. */
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
+let currentBotmuxTurnSenderOpenId: string | undefined;
 function readProcStarttime(pid: number): string | undefined {
   try {
     const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
@@ -3366,6 +3367,7 @@ function scheduleSubmitFailureNotify(
   bridgeTurnId?: string,
   failureReason?: string,
   turnId = currentBotmuxTurnId,
+  mentionOpenId = currentBotmuxTurnSenderOpenId,
   turnSeq = usageLimitTracker.currentTurn(),
 ): void {
   const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
@@ -3390,6 +3392,7 @@ function scheduleSubmitFailureNotify(
     send({
       type: 'user_notify',
       turnId: notifyTurnId,
+      mentionOpenId,
       message: t('worker.submit_impossible', { cliName: cliName(), reason, preview }),
     });
     return;
@@ -3446,6 +3449,7 @@ function scheduleSubmitFailureNotify(
     send({
       type: 'user_notify',
       turnId: notifyTurnId,
+      mentionOpenId,
       message: t('worker.submit_unconfirmed', { cliName: cliName(), secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000), transcriptLabel, preview }),
     });
   }, SUBMIT_DEFERRED_RECHECK_MS);
@@ -3603,7 +3607,10 @@ async function flushPending(): Promise<void> {
       // If the CLI exits first, onExit stashes these for re-queue on respawn.
       inflightInputs.onWrite(item);
       const msg = item.content;
-      currentBotmuxTurnId = item.turnId;
+      const submitTurnId = item.turnId;
+      const submitSenderOpenId = item.senderOpenId;
+      currentBotmuxTurnId = submitTurnId;
+      currentBotmuxTurnSenderOpenId = submitSenderOpenId;
       writeCliPidMarker();
       const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       // Bridge fallback: mark immediately before writeInput. Doing it here
@@ -3641,7 +3648,7 @@ async function flushPending(): Promise<void> {
         // nulled `backend` and told the user the CLI exited) — nothing more to
         // do. Otherwise surface it as a submit failure so the message isn't
         // silently lost.
-        if (backend) scheduleSubmitFailureNotify(msg, undefined, '会话 JSONL', bridgeTurnId, undefined, currentBotmuxTurnId, turnSeq);
+        if (backend) scheduleSubmitFailureNotify(msg, undefined, '会话 JSONL', bridgeTurnId, undefined, submitTurnId, submitSenderOpenId, turnSeq);
         break;
       }
       // Persist any sessionId the adapter observed via authoritative sources
@@ -3659,7 +3666,7 @@ async function flushPending(): Promise<void> {
       // nulled backend) the user already got a "CLI exited" notice; don't also
       // nag that the submit wasn't confirmed.
       if (result && result.submitted === false && backend) {
-        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId, result.failureReason, currentBotmuxTurnId, turnSeq);
+        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId, result.failureReason, submitTurnId, submitSenderOpenId, turnSeq);
       }
       // All structured bridges now drain every pending message in one flush:
       // Claude's BridgeTurnQueue handles `attachment(queued_command)` events
@@ -3675,9 +3682,9 @@ async function flushPending(): Promise<void> {
   }
 }
 
-function sendToPty(content: string, turnId?: string): void {
+function sendToPty(content: string, turnId?: string, senderOpenId?: string): void {
   if (!backend || !cliAdapter) return;
-  const next = { content, turnId };
+  const next = { content, turnId, senderOpenId };
   const shouldMergeQueued = !isFlushing && !shouldWriteNow({
     isPromptReady,
     isFlushing,
@@ -5901,8 +5908,9 @@ process.on('message', async (raw: unknown) => {
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}, render=${renderCols}x${renderRows}${msg.adoptMode ? ' (adopt-pane)' : ''}`);
 
       try {
+        currentBotmuxTurnId = msg.turnId;
+        currentBotmuxTurnSenderOpenId = msg.turnSenderOpenId;
         if (msg.turnId) {
-          currentBotmuxTurnId = msg.turnId;
           writeCliPidMarker();
         }
         let port = 0;
@@ -5947,7 +5955,7 @@ process.on('message', async (raw: unknown) => {
           codexBridgeMarkPendingTurn(msg.prompt, msg.turnId);
         }
         if (msg.prompt && (!cliAdapter?.passesInitialPromptViaArgs || deferInitialPrompt)) {
-          pendingMessages.push({ content: msg.prompt, turnId: msg.turnId });
+          pendingMessages.push({ content: msg.prompt, turnId: msg.turnId, senderOpenId: msg.turnSenderOpenId });
         }
 
         send({ type: 'ready', port, token: writeToken, turnId: currentBotmuxTurnId });
@@ -5965,7 +5973,10 @@ process.on('message', async (raw: unknown) => {
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       const content = msg.content;
-      currentBotmuxTurnId = msg.turnId;
+      const submitTurnId = msg.turnId;
+      const submitSenderOpenId = msg.senderOpenId;
+      currentBotmuxTurnId = submitTurnId;
+      currentBotmuxTurnSenderOpenId = submitSenderOpenId;
       writeCliPidMarker();
       if (!backend && crashDiagnosticStopped && lastInitConfig && !lastInitConfig.adoptMode) {
         log('Message received after crash-loop stop; retrying CLI start');
@@ -6026,7 +6037,7 @@ process.on('message', async (raw: unknown) => {
                 codexBridgeNotifyCliSessionId(result.cliSessionId);
               }
               if (result && result.submitted === false) {
-                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history', undefined, result.failureReason, currentBotmuxTurnId, turnSeq);
+                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history', undefined, result.failureReason, submitTurnId, submitSenderOpenId, turnSeq);
               }
             } catch (err: any) {
               log(`Codex adopt writeInput error: ${err.message}`);
@@ -6055,7 +6066,7 @@ process.on('message', async (raw: unknown) => {
         // arrival. Marking now would race with a still-running previous
         // turn whose `botmux send` could sneak its sentAtMs past this
         // turn's markTimeMs and falsely suppress its fallback.
-        sendToPty(content, msg.turnId);
+        sendToPty(content, msg.turnId, msg.senderOpenId);
       }
       break;
     }

@@ -16,4 +16,20 @@ describe('mergeQueuedCliInput', () => {
 
     expect(pending).toEqual([{ content: 'first\n\nsecond', turnId: 't2' }]);
   });
+
+  it('keeps the latest turn sender with merged input for failure notifications', () => {
+    const pending = [{ content: 'first', turnId: 't1', senderOpenId: 'ou_first' }];
+
+    expect(mergeQueuedCliInput(pending, {
+      content: 'second',
+      turnId: 't2',
+      senderOpenId: 'ou_second',
+    })).toBe(true);
+
+    expect(pending).toEqual([{
+      content: 'first\n\nsecond',
+      turnId: 't2',
+      senderOpenId: 'ou_second',
+    }]);
+  });
 });
