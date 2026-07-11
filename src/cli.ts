@@ -5755,12 +5755,39 @@ async function cmdReport(rest: string[]): Promise<void> {
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
 
-  // Verified delivery: when this report names a task (`--task`), record a
-  // TaskReported on the ledger with evidence BEFORE waking the orchestrator —
-  // the ledger is the durable truth, the wake below is just the trigger.
-  // Backward-compatible: no --task ⇒ legacy free-form report-back, unchanged.
+  // Resolve the destination before writing a verified report. A session that
+  // was not created by dispatch has nowhere valid to deliver the envelope;
+  // failing here prevents a misleading local TaskReported event from being
+  // appended before the command reports an error.
+  const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
+  let reg: Record<string, any> = {};
+  try { if (existsSync(regPath)) reg = JSON.parse(readFileSync(regPath, 'utf-8')); } catch { /* */ }
+  const entry = s.rootMessageId ? reg[s.rootMessageId] : undefined;
+  const tgt = resolveReportTarget({
+    registryEntry: entry,
+    sessionChatId: s.chatId,
+    creatorOpenId: s.creatorOpenId,
+    ownerOpenId: s.ownerOpenId,
+    quoteTargetSenderOpenId: s.quoteTargetSenderOpenId,
+  });
+  if (!tgt.orchOpenId || !tgt.orchChatId) {
+    console.error(
+      '找不到主编排坐标：本会话没记录派活者（creatorOpenId/ownerOpenId 都空）或缺 chatId——大概不是被 botmux dispatch 派活的会话。\n' +
+      '未写入交付记录。若确需回报，请改用 `botmux send` 或显式 @ 对应的人/ bot。');
+    process.exit(1);
+  }
+
+  // Verified delivery: build the durable event and machine envelope together,
+  // but append only after Lark accepts the send. This prevents an explicit
+  // send failure from leaving a misleading local-only TaskReported event.
+  // The same reportId makes an ambiguous send retry safe: remote ingestion and
+  // the local append both dedupe it. No --task keeps legacy report-back intact.
   const taskId = argValue(rest, '--task');
-  let reportedLedger: { reportId: string; deduped: boolean } | undefined;
+  let pendingLedger: {
+    handle: ReturnType<typeof openLedger>;
+    draft: ReturnType<typeof buildReport>['draft'];
+    reportId: string;
+  } | undefined;
   let deliveryEnvelope: string | undefined;
   if (taskId) {
     const artifacts = argValues(rest, '--artifact');
@@ -5783,8 +5810,7 @@ async function cmdReport(rest: string[]): Promise<void> {
         artifacts,
         inline,
       }, led);
-      const res = led.append(draft);
-      reportedLedger = { reportId, deduped: res.deduped };
+      pendingLedger = { handle: led, draft, reportId };
       const envelopeEvidence: EnvelopeEvidence[] = [
         ...artifacts.map((path): EnvelopeEvidence => ({ kind: 'path', path })),
         ...inline.map((it): EnvelopeEvidence => ({ kind: 'inline', name: it.name, text: it.content })),
@@ -5799,30 +5825,6 @@ async function cmdReport(rest: string[]): Promise<void> {
       console.error(`ledger 写入失败: ${err.message}`);
       process.exit(1);
     }
-  }
-
-  // Resolve where the report goes + who to @. Same-machine: the dispatch registry
-  // (keyed by this sub-bot's thread root) carries the orchestrator's exact coords.
-  // CROSS-MACHINE: the orchestrator is on another machine, so its registry isn't
-  // on THIS one — resolveReportTarget falls back to this sub-bot's own session
-  // (report top-level into its chat, @ the dispatcher via creatorOpenId). See
-  // resolveReportTarget / Session.creatorOpenId.
-  const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
-  let reg: Record<string, any> = {};
-  try { if (existsSync(regPath)) reg = JSON.parse(readFileSync(regPath, 'utf-8')); } catch { /* */ }
-  const entry = s.rootMessageId ? reg[s.rootMessageId] : undefined;
-  const tgt = resolveReportTarget({
-    registryEntry: entry,
-    sessionChatId: s.chatId,
-    creatorOpenId: s.creatorOpenId,
-    ownerOpenId: s.ownerOpenId,
-    quoteTargetSenderOpenId: s.quoteTargetSenderOpenId,
-  });
-  if (!tgt.orchOpenId || !tgt.orchChatId) {
-    console.error(
-      '找不到主编排坐标：本会话没记录派活者（creatorOpenId/ownerOpenId 都空）或缺 chatId——大概不是被 botmux dispatch 派活的会话。\n' +
-      '若确需回报，请改用 `botmux send` 或显式 @ 对应的人/ bot。');
-    process.exit(1);
   }
 
   const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
@@ -5840,8 +5842,8 @@ async function cmdReport(rest: string[]): Promise<void> {
     ? buildReportText({ orchOpenId: tgt.orchOpenId, content: deliveryEnvelope })
     : undefined;
 
+  let msgId: string;
   try {
-    let msgId: string;
     if (tgt.orchScope === 'chat' || !tgt.orchRoot) {
       // Orchestrator at chat scope, or cross-machine fallback → send top-level
       // into the chat (the sub-topic's chat = the orchestrator's chat).
@@ -5862,18 +5864,51 @@ async function cmdReport(rest: string[]): Promise<void> {
         true,
       );
     }
-    console.log(JSON.stringify({
-      success: true,
-      reportedTo: tgt.orchRoot || tgt.orchChatId,
-      orchestrator: tgt.orchOpenId,
-      viaRegistry: !!entry,
-      messageId: msgId,
-      ...(reportedLedger ? { task: taskId, reportId: reportedLedger.reportId, ledgerDeduped: reportedLedger.deduped } : {}),
-    }));
   } catch (err: any) {
-    console.error(`report 失败: ${err.message}`);
+    if (pendingLedger) {
+      console.error(JSON.stringify({
+        success: false,
+        delivered: false,
+        localRecorded: false,
+        retryable: true,
+        task: taskId,
+        reportId: pendingLedger.reportId,
+        error: err.message,
+      }));
+    } else {
+      console.error(`report 失败: ${err.message}`);
+    }
     process.exit(1);
   }
+
+  let reportedLedger: { reportId: string; deduped: boolean } | undefined;
+  if (pendingLedger) {
+    try {
+      const res = pendingLedger.handle.append(pendingLedger.draft);
+      reportedLedger = { reportId: pendingLedger.reportId, deduped: res.deduped };
+    } catch (err: any) {
+      console.error(JSON.stringify({
+        success: false,
+        delivered: true,
+        localRecorded: false,
+        retryable: true,
+        messageId: msgId,
+        task: taskId,
+        reportId: pendingLedger.reportId,
+        error: err.message,
+      }));
+      process.exit(1);
+    }
+  }
+
+  console.log(JSON.stringify({
+    success: true,
+    reportedTo: tgt.orchRoot || tgt.orchChatId,
+    orchestrator: tgt.orchOpenId,
+    viaRegistry: !!entry,
+    messageId: msgId,
+    ...(reportedLedger ? { task: taskId, reportId: reportedLedger.reportId, ledgerDeduped: reportedLedger.deduped } : {}),
+  }));
 }
 
 // ─── Verified delivery help (worker hand-raise) ─────────────────────────────

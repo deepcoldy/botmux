@@ -407,6 +407,11 @@ describe('dispatch repo preflight', () => {
     const scanRoot = tempDir('empty-project-root');
     const dataDir = tempDir('repo-data');
     const sendAccessHelp = vi.fn(async () => {});
+    const resolveRequirement = vi.fn(async () => ({
+      ok: false as const,
+      reason: 'not_found' as const,
+      detail: '项目扫描达到上限；请先在该设备选择一次项目完成登记',
+    }));
     const parsed = {
       messageId: 'om_dispatch',
       msgType: 'post',
@@ -435,13 +440,20 @@ describe('dispatch repo preflight', () => {
       scanDirs: [scanRoot],
       dataDir,
       sendAccessHelp,
+      resolveRequirement,
     });
 
     expect(result).toEqual({ handled: true });
+    expect(resolveRequirement).toHaveBeenCalledWith(expect.objectContaining({
+      requirement: 'https://github.com/acme/missing.git',
+      scanDirs: [scanRoot],
+      dataDir,
+    }));
     expect(sendAccessHelp).toHaveBeenCalledWith(expect.objectContaining({
       taskId: 'task-missing-repo',
       repo: 'https://github.com/acme/missing.git',
       supervisorOpenId: 'ou_supervisor',
+      detail: '项目扫描达到上限；请先在该设备选择一次项目完成登记',
     }));
     expect(sessionStore.listSessions()).toHaveLength(0);
   });
