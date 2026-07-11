@@ -1,4 +1,4 @@
-export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij';
+export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'riff';
 
 /**
  * Tri-state result of probing whether a named backing session exists.

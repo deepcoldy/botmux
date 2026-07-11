@@ -1812,6 +1812,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     // stale pane surviving a daemon restart (different id → kill + cold-spawn).
     daemonBootId: DAEMON_BOOT_ID,
     backendType: botCfg.backendType ?? config.daemon.backendType,
+    backendConfig: botCfg.riff,
     prompt,
     resume,
     cliSessionId: ds.session.cliSessionId,

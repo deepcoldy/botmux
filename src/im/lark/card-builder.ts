@@ -199,6 +199,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'copilot': 'Copilot',
   'oh-my-pi': 'Oh My Pi',
   'kimi': 'Kimi',
+  'riff': 'Riff',
 };
 
 export function getCliDisplayName(cliId: CliId): string {

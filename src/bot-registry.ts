@@ -3,6 +3,7 @@ import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { BackendType } from './adapters/backend/types.js';
+import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
@@ -549,6 +550,12 @@ export interface BotConfig {
    *  credential set. Only meaningful when `readIsolation` is true. */
   readDenyExtraPaths?: string[];
   backendType?: BackendType;
+  /**
+   * Configuration for the riff backend (agent-services platform). Required
+   * when `backendType` is `'riff'`. Contains base URL, template ID, agent/model
+   * selection, and auth settings for riff's HTTP API.
+   */
+  riff?: RiffBackendConfig;
   /**
    * Max simultaneously-LIVE sessions for this bot. When the bot's live session
    * count exceeds this, the idle-worker sweeper suspends its longest-idle,
