@@ -206,8 +206,11 @@ export class RiffBackend implements SessionBackend {
     const url = `${this.config.baseUrl}/api/task-execute`;
 
     // riff task-execute body: origin at top level, prompt inside config.userPrompt
-    const config: Record<string, unknown> = { userPrompt: prompt };
-    if (this.config.agent) config.agent = this.config.agent;
+    // agent 可选值: aiden (默认), aiden-claude, codex, opencode
+    const config: Record<string, unknown> = {
+      userPrompt: prompt,
+      agent: this.config.agent ?? 'aiden',
+    };
     if (this.config.model) config.model = this.config.model;
     if (this.config.sandboxCluster) config.sandboxCluster = this.config.sandboxCluster;
     if (this.config.defaultRepo) {
