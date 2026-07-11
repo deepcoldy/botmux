@@ -103,9 +103,9 @@ export interface GlobalSkillConfig {
 }
 
 export interface MaintenanceConfig {
-  /** At `time` (once/day) run `npm install -g botmux@latest` to install the
+  /** At `time` (once/day) update the owning npm/pnpm global install to the
    *  latest version — download/install only, never restarts on its own.
-   *  npm-global installs only (disabled for local-dev). */
+   *  Disabled for local-dev and unsupported install layouts. */
   autoUpdate?: MaintenanceTask;
   /** When enabled (and autoUpdate is on), restart right after a successful
    *  auto-update that installed a newer version, to apply it. No schedule of

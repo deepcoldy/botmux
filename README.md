@@ -223,7 +223,10 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 
 ```bash
 npm install -g botmux
+# 或：pnpm add -g botmux
 ```
+
+botmux 的手动/定时更新会识别当前全局安装归属，并继续使用同一个 npm 或 pnpm 安装位置；无法安全识别的安装方式不会自动回退到 npm。
 
 > 要求 **Node.js ≥ 22**，且本地已装好并登录至少一种 AI 编程 CLI（`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` 等在 PATH 中）。推荐顺手装 **tmux**（装了自动启用会话常驻）。
 

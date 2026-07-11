@@ -4,7 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { isLocalDevInstallAt, isLocalDevInstall, botmuxVersion } from '../src/utils/install-info.js';
+import {
+  isLocalDevInstallAt,
+  isLocalDevInstall,
+  botmuxVersion,
+  botmuxVersionAt,
+  botmuxCliEntryAt,
+} from '../src/utils/install-info.js';
 
 describe('isLocalDevInstallAt', () => {
   let dir: string;
@@ -44,5 +50,16 @@ describe('botmuxVersion', () => {
     const root = fileURLToPath(new URL('..', import.meta.url));
     const expected = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8')).version;
     expect(botmuxVersion()).toBe(expected);
+  });
+
+  it('can read a stable package root selected by the updater', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-version-at-'));
+    try {
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '9.8.7' }));
+      expect(botmuxVersionAt(root)).toBe('9.8.7');
+      expect(botmuxCliEntryAt(root)).toBe(join(root, 'dist', 'cli.js'));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

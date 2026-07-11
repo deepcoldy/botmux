@@ -69,7 +69,12 @@ import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
-import { npmGlobalUpdateCwd } from './core/maintenance.js';
+import { installLatestBotmuxSync } from './core/maintenance.js';
+import {
+  formatGlobalInstallCommand,
+  resolveGlobalInstallPlan,
+  UnsupportedGlobalInstallError,
+} from './utils/global-install.js';
 import { loadDashboardSecret } from './dashboard/auth.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
@@ -2183,12 +2188,17 @@ function cmdStatus(): void {
 }
 
 function cmdUpgrade(): void {
-  console.log('🔄 升级中...');
   try {
-    execSync('npm install -g botmux@latest', { cwd: npmGlobalUpdateCwd(), stdio: 'inherit' });
+    const plan = resolveGlobalInstallPlan();
+    console.log(`🔄 升级中：${formatGlobalInstallCommand(plan)}`);
+    installLatestBotmuxSync(plan);
     console.log('\n✅ 升级完成。运行 botmux restart 以应用更新。');
-  } catch {
-    console.error('❌ 升级失败，请手动运行: npm install -g botmux@latest');
+  } catch (error) {
+    if (error instanceof UnsupportedGlobalInstallError) {
+      console.error(`❌ 无法安全识别当前安装方式（${error.manager}），请使用原包管理器手动更新 botmux。`);
+    } else {
+      console.error(`❌ 升级失败：${error instanceof Error ? error.message : error}`);
+    }
     process.exit(1);
   }
 }
