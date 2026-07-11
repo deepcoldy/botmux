@@ -1,7 +1,17 @@
 import { readdirSync, readFileSync, watch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
+import {
+  normalizePlatformDescriptor,
+  platformDescriptorKey,
+  type DescriptorCapabilities,
+  type DescriptorPlatformRef,
+} from '../im/platform-descriptor.js';
 
 export interface DaemonInfo {
+  platform: string;
+  instanceId: string;
+  capabilities?: DescriptorCapabilities;
+  /** Legacy compatibility identity. Prefer platform + instanceId. */
   larkAppId: string;
   botName: string;
   /** CLI adapter id from bots.json, e.g. codex / claude-code / traex. */
@@ -29,6 +39,50 @@ export type RegistryListener = (online: DaemonInfo[]) => void;
 
 export interface DaemonRegistryOptions {
   refreshIntervalMs?: number;
+}
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function integer(value: unknown): value is number {
+  return finiteNumber(value) && Number.isInteger(value);
+}
+
+function validPort(value: unknown): value is number {
+  return integer(value) && value > 0 && value <= 65_535;
+}
+
+function normalizeDaemonInfo(raw: unknown): DaemonInfo | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  const identity = normalizePlatformDescriptor(record);
+  if (!identity) return null;
+  if (typeof record.botName !== 'string' || !record.botName.trim()) return null;
+  if (!integer(record.botIndex) || !validPort(record.ipcPort) || !integer(record.pid)) return null;
+  if (!finiteNumber(record.startedAt) || !finiteNumber(record.lastHeartbeat)) return null;
+
+  let resolvedAllowedUsers: string[] | undefined;
+  if (record.resolvedAllowedUsers !== undefined) {
+    if (!Array.isArray(record.resolvedAllowedUsers)
+      || !record.resolvedAllowedUsers.every((entry) => typeof entry === 'string')) return null;
+    resolvedAllowedUsers = [...record.resolvedAllowedUsers];
+  }
+
+  return {
+    ...identity,
+    botName: record.botName.trim(),
+    ...(typeof record.cliId === 'string' && record.cliId.trim() ? { cliId: record.cliId.trim() } : {}),
+    ...(typeof record.botAvatarUrl === 'string' && record.botAvatarUrl.trim()
+      ? { botAvatarUrl: record.botAvatarUrl.trim() }
+      : {}),
+    botIndex: record.botIndex,
+    ipcPort: record.ipcPort,
+    pid: record.pid,
+    startedAt: record.startedAt,
+    lastHeartbeat: record.lastHeartbeat,
+    ...(resolvedAllowedUsers === undefined ? {} : { resolvedAllowedUsers }),
+  };
 }
 
 /**
@@ -70,12 +124,29 @@ export class DaemonRegistry {
   }
 
   list(): DaemonInfo[] {
+    // Preserve the legacy dashboard contract: every existing consumer routes
+    // through larkAppId and invokes Lark-only RPCs. Generic callers must opt in
+    // to listAll()/getByRef() until those wire contracts become platform-aware.
+    return this.listAll().filter(d => d.platform === 'lark');
+  }
+
+  listAll(): DaemonInfo[] {
     const now = Date.now();
     return [...this.items.values()].filter(d => now - d.lastHeartbeat <= STALE_MS);
   }
 
   getByAppId(id: string): DaemonInfo | undefined {
-    const d = this.items.get(id);
+    const d = [...this.items.values()].find(item => item.platform === 'lark' && item.larkAppId === id);
+    if (!d) return undefined;
+    return Date.now() - d.lastHeartbeat > STALE_MS ? undefined : d;
+  }
+
+  /** Look up a daemon by the complete platform-neutral instance identity. */
+  getByRef(ref: DescriptorPlatformRef): DaemonInfo | undefined {
+    const platform = typeof ref?.platform === 'string' ? ref.platform.trim() : '';
+    const instanceId = typeof ref?.instanceId === 'string' ? ref.instanceId.trim() : '';
+    if (!platform || !instanceId) return undefined;
+    const d = this.items.get(platformDescriptorKey({ platform, instanceId }));
     if (!d) return undefined;
     return Date.now() - d.lastHeartbeat > STALE_MS ? undefined : d;
   }
@@ -92,8 +163,9 @@ export class DaemonRegistry {
     for (const n of names) {
       if (!n.endsWith('.json')) continue;
       try {
-        const d = JSON.parse(readFileSync(join(this.dir, n), 'utf8')) as DaemonInfo;
-        next.set(d.larkAppId, d);
+        const d = normalizeDaemonInfo(JSON.parse(readFileSync(join(this.dir, n), 'utf8')));
+        if (!d) continue;
+        next.set(platformDescriptorKey(d), d);
       } catch {
         // Skip malformed / partially-written files
       }

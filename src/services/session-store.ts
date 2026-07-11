@@ -5,10 +5,38 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import type { Session } from '../types.js';
+import {
+  derivePlatformInstanceIdentity,
+  samePlatformInstance,
+  type PlatformInstanceIdentity,
+  type PlatformInstanceRef,
+} from '../im/platform.js';
 
 let sessions: Map<string, Session> = new Map();
 let loaded = false;
 let currentAppId: string | undefined;
+let currentInstance: PlatformInstanceRef | undefined;
+
+export class SessionInstanceMismatchError extends Error {
+  readonly code = 'session_instance_mismatch';
+
+  constructor(readonly sessionId: string) {
+    super(`Session ${sessionId} is not owned by the current platform instance`);
+    this.name = 'SessionInstanceMismatchError';
+  }
+}
+
+function currentInstanceOwns(session: Session): boolean {
+  if (!currentInstance) return true;
+  const owner = derivePlatformInstanceIdentity(session, currentInstance.instanceId);
+  return !!owner && samePlatformInstance(owner, currentInstance);
+}
+
+function assertCurrentInstanceOwns(session: Session): void {
+  if (!currentInstanceOwns(session)) {
+    throw new SessionInstanceMismatchError(session.sessionId);
+  }
+}
 
 // Legacy fields from the removed「处理中」placeholder-card PATCH delivery. They
 // no longer exist on Session and nothing reads them, but sessions persisted
@@ -24,8 +52,14 @@ export function stripLegacyPendingCardFields(session: Record<string, unknown>): 
  * When appId is set, sessions are stored in `sessions-{appId}.json`.
  * When unset, uses the legacy `sessions.json`.
  */
-export function init(appId?: string): void {
-  currentAppId = appId;
+export function init(appId?: string | PlatformInstanceRef): void {
+  if (typeof appId === 'object' && appId.platform !== 'lark') {
+    throw new Error(`Session store does not support platform ${appId.platform}`);
+  }
+  currentAppId = typeof appId === 'string' ? appId : appId?.instanceId;
+  currentInstance = currentAppId
+    ? { platform: 'lark', instanceId: currentAppId }
+    : undefined;
   loaded = false;
   sessions = new Map();
 }
@@ -135,6 +169,32 @@ export function getSession(sessionId: string): Session | undefined {
   return sessions.get(sessionId) ?? findInOtherFiles(sessionId);
 }
 
+/** Current store file and current runtime instance only; never scans siblings
+ * or returns an explicitly foreign/corrupt row from this instance's file. */
+export function getLocalSession(sessionId: string): Session | undefined {
+  load();
+  const session = sessions.get(sessionId);
+  return session && currentInstanceOwns(session) ? session : undefined;
+}
+
+/** Mutation-safe lookup scoped to one runtime instance.
+ *
+ * Unlike `getSession()` this never scans sibling session files. Agent-facing
+ * read commands retain the broad lookup above, while resume/restore paths can
+ * no longer accidentally mutate a session owned by another daemon instance.
+ */
+export function getSessionForInstance(
+  sessionId: string,
+  instance: PlatformInstanceIdentity,
+): Session | undefined {
+  load();
+  if (currentInstance && !samePlatformInstance(currentInstance, instance)) return undefined;
+  const session = sessions.get(sessionId);
+  if (!session) return undefined;
+  const owner = derivePlatformInstanceIdentity(session, currentInstance?.instanceId ?? instance.instanceId);
+  return owner && samePlatformInstance(owner, instance) ? session : undefined;
+}
+
 /**
  * Search all session files for a session not found in the current file.
  *
@@ -164,6 +224,7 @@ export function closeSession(sessionId: string): void {
   load();
   const session = sessions.get(sessionId);
   if (session) {
+    assertCurrentInstanceOwns(session);
     session.status = 'closed';
     session.closedAt = new Date().toISOString();
     save();
@@ -176,6 +237,7 @@ export function updateSessionPid(sessionId: string, pid: number | null): void {
   load();
   const session = sessions.get(sessionId);
   if (session) {
+    assertCurrentInstanceOwns(session);
     session.pid = pid ?? undefined;
     save();
   }
@@ -183,13 +245,14 @@ export function updateSessionPid(sessionId: string, pid: number | null): void {
 
 export function updateSession(session: Session): void {
   load();
+  assertCurrentInstanceOwns(session);
   sessions.set(session.sessionId, session);
   save();
 }
 
 export function listSessions(): Session[] {
   load();
-  return [...sessions.values()];
+  return [...sessions.values()].filter(currentInstanceOwns);
 }
 
 /**
@@ -278,7 +341,11 @@ function findActiveSessionsMatching(predicate: (s: Session) => boolean): Session
   load();
   const matches: Session[] = [];
   for (const s of sessions.values()) {
-    if (predicate(s) && s.status === 'active') matches.push(s);
+    const owner = derivePlatformInstanceIdentity(s, currentInstance?.instanceId);
+    // These APIs currently power Lark A2A inheritance. Future-platform rows
+    // may coexist on disk but must not leak into the Lark peer graph.
+    if (owner && owner.platform !== 'lark') continue;
+    if (predicate(s) && s.status === 'active') matches.push(owner ? projectSessionIdentity(s, owner) : s);
   }
   const dataDir = config.session.dataDir;
   const currentFp = getFilePath();
@@ -290,10 +357,28 @@ function findActiveSessionsMatching(predicate: (s: Session) => boolean): Session
       try {
         const data: Record<string, Session> = JSON.parse(readFileSync(fp, 'utf-8'));
         for (const s of Object.values(data)) {
-          if (predicate(s) && s.status === 'active') matches.push(s);
+          const owner = derivePlatformInstanceIdentity(s, instanceIdFromSessionFile(file));
+          if (owner && owner.platform !== 'lark') continue;
+          if (predicate(s) && s.status === 'active') matches.push(owner ? projectSessionIdentity(s, owner) : s);
         }
       } catch { continue; }
     }
   } catch { /* ignore */ }
   return matches;
+}
+
+/** Attach read-only source identity without changing JSON serialization. */
+function projectSessionIdentity(session: Session, owner: PlatformInstanceIdentity): Session {
+  if (derivePlatformInstanceIdentity(session)) return session;
+  const projected = { ...session };
+  Object.defineProperties(projected, {
+    platform: { value: owner.platform, enumerable: false },
+    instanceId: { value: owner.instanceId, enumerable: false },
+  });
+  return projected;
+}
+
+function instanceIdFromSessionFile(file: string): string | undefined {
+  const match = /^sessions-(.+)\.json$/.exec(file);
+  return match?.[1];
 }

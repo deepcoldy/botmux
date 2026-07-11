@@ -45,6 +45,8 @@ import {
   init,
   createSession,
   getSession,
+  getLocalSession,
+  getSessionForInstance,
   listSessions,
   closeSession,
   updateSession,
@@ -74,6 +76,17 @@ afterEach(() => {
 // ─── init() ───────────────────────────────────────────────────────────────
 
 describe('init()', () => {
+  it('accepts a platform instance while preserving the legacy Lark filename', () => {
+    init({ platform: 'lark', instanceId: 'app-ref' });
+    createSession('chat1', 'root1', 'Test');
+    expect(existsSync(join(tempDir, 'sessions-app-ref.json'))).toBe(true);
+  });
+
+  it('fails explicitly when asked to open an unsupported platform store', () => {
+    expect(() => init({ platform: 'discord', instanceId: 'bot' } as any))
+      .toThrow('Session store does not support platform discord');
+  });
+
   it('should create the data directory on first operation if it does not exist', () => {
     const subDir = join(tempDir, 'nested', 'data');
     tempDir = subDir;
@@ -114,6 +127,77 @@ describe('init()', () => {
     // for a different appId context, it starts fresh
     init('different-app');
     expect(listSessions()).toHaveLength(0);
+  });
+});
+
+describe('platform instance compatibility', () => {
+  it('derives legacy rows in memory without rewriting their schema or bytes', () => {
+    mkdirSync(tempDir, { recursive: true });
+    const fp = join(tempDir, 'sessions-app-legacy.json');
+    const raw = JSON.stringify({
+      s1: {
+        sessionId: 's1', chatId: 'oc_legacy', rootMessageId: 'om_legacy', title: 'Legacy',
+        status: 'closed', createdAt: '2026-01-01T00:00:00.000Z', larkAppId: 'app-legacy',
+      },
+    });
+    writeFileSync(fp, raw);
+
+    init({ platform: 'lark', instanceId: 'app-legacy' });
+    expect(getSessionForInstance('s1', { platform: 'lark', instanceId: 'app-legacy' })?.title).toBe('Legacy');
+    expect(readFileSync(fp, 'utf8')).toBe(raw);
+    expect(JSON.parse(readFileSync(fp, 'utf8')).s1).not.toHaveProperty('platform');
+    expect(JSON.parse(readFileSync(fp, 'utf8')).s1).not.toHaveProperty('instanceId');
+  });
+
+  it('refuses mutation-scoped lookup from a different platform instance', () => {
+    init({ platform: 'lark', instanceId: 'app-a' });
+    const session = createSession('chat1', 'root1', 'Owned');
+    session.larkAppId = 'app-a';
+    updateSession(session);
+
+    expect(getSessionForInstance(session.sessionId, { platform: 'lark', instanceId: 'app-b' })).toBeUndefined();
+    expect(getSessionForInstance(session.sessionId, { platform: 'discord', instanceId: 'app-a' })).toBeUndefined();
+  });
+
+  it('rejects updateSession for a record owned by another instance', () => {
+    init({ platform: 'lark', instanceId: 'app-a' });
+    const foreign = {
+      sessionId: 'foreign', chatId: 'oc', rootMessageId: 'om', title: 'Foreign',
+      status: 'active', createdAt: '2026-01-01T00:00:00.000Z', larkAppId: 'app-b',
+    } as any;
+
+    expect(() => updateSession(foreign)).toThrowError(expect.objectContaining({
+      code: 'session_instance_mismatch', sessionId: 'foreign',
+    }));
+    expect(listSessions()).toEqual([]);
+  });
+
+  it('filters and never rewrites an explicitly foreign row in the current instance file', () => {
+    mkdirSync(tempDir, { recursive: true });
+    const fp = join(tempDir, 'sessions-app-a.json');
+    const raw = JSON.stringify({
+      foreign: {
+        sessionId: 'foreign', chatId: 'oc', rootMessageId: 'om', title: 'Foreign',
+        status: 'active', createdAt: '2026-01-01T00:00:00.000Z',
+        platform: 'lark', instanceId: 'app-b', larkAppId: 'app-b', pid: 123,
+      },
+    });
+    writeFileSync(fp, raw);
+    init({ platform: 'lark', instanceId: 'app-a' });
+
+    // Broad agent-facing lookup remains read-only, while daemon-local views
+    // refuse to treat the corrupt row as app-a state.
+    expect(getSession('foreign')?.title).toBe('Foreign');
+    expect(getLocalSession('foreign')).toBeUndefined();
+    expect(listSessions()).toEqual([]);
+    expect(() => closeSession('foreign')).toThrowError(expect.objectContaining({
+      code: 'session_instance_mismatch', sessionId: 'foreign',
+    }));
+    expect(() => updateSessionPid('foreign', 456)).toThrowError(expect.objectContaining({
+      code: 'session_instance_mismatch', sessionId: 'foreign',
+    }));
+    expect(readFileSync(fp, 'utf8')).toBe(raw);
+    expect(mockDeleteFrozenCards).not.toHaveBeenCalled();
   });
 });
 
@@ -427,6 +511,20 @@ describe('Multi-bot isolation', () => {
 // ─── findActiveSessionsByRoot() — cross-bot lookup ───────────────────────
 
 describe('findActiveSessionsByRoot()', () => {
+  it('excludes future-platform rows from the current Lark A2A peer scan', () => {
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(tempDir, 'sessions-discord.json'), JSON.stringify({
+      discord: {
+        sessionId: 'discord', chatId: 'same-chat', rootMessageId: 'root-x', title: 'Other platform',
+        status: 'active', createdAt: '2026-01-01T00:00:00.000Z',
+        platform: 'discord', instanceId: 'workspace-bot', workingDir: '/tmp/discord',
+      },
+    }));
+
+    init({ platform: 'lark', instanceId: 'app-A' });
+    expect(findActiveSessionsByRoot('root-x')).toEqual([]);
+  });
+
   it('finds active sessions across per-bot files for the same rootMessageId', () => {
     // Bot A pins workdir for thread root-x
     init('app-A');
@@ -448,6 +546,26 @@ describe('findActiveSessionsByRoot()', () => {
     expect(found.map(s => s.sessionId).sort()).toEqual([sA.sessionId, sB.sessionId].sort());
     expect(found.find(s => s.sessionId === sA.sessionId)?.workingDir).toBe('/repo/foo');
     expect(found.find(s => s.sessionId === sB.sessionId)?.workingDir).toBe('/repo/bar');
+  });
+
+  it('projects a legacy row owner from its source filename without rewriting JSON', () => {
+    mkdirSync(tempDir, { recursive: true });
+    const fp = join(tempDir, 'sessions-app-legacy.json');
+    const raw = JSON.stringify({
+      legacy: {
+        sessionId: 'legacy', chatId: 'chat1', rootMessageId: 'root-x', title: 'Legacy',
+        status: 'active', createdAt: '2026-01-01T00:00:00.000Z', workingDir: '/repo/legacy',
+      },
+    });
+    writeFileSync(fp, raw);
+    init('app-current');
+
+    const [found] = findActiveSessionsByRoot('root-x') as any[];
+
+    expect(found.platform).toBe('lark');
+    expect(found.instanceId).toBe('app-legacy');
+    expect(Object.keys(found)).not.toContain('instanceId');
+    expect(readFileSync(fp, 'utf8')).toBe(raw);
   });
 
   it('skips closed sessions', () => {

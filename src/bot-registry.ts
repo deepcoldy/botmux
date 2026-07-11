@@ -14,6 +14,7 @@ import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
+import type { PlatformInstanceRef } from './im/platform.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
 export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
@@ -878,6 +879,8 @@ export interface BotConfig {
 
 export interface BotState {
   config: BotConfig;
+  /** Derived runtime identity; never written back to bots.json. */
+  platformInstance: PlatformInstanceRef;
   client: Lark.Client;
   botOpenId?: string;
   botName?: string;       // Lark app display name (from /bot/v3/info)
@@ -990,12 +993,18 @@ export function registerBot(cfg: BotConfig): BotState {
   });
   const state: BotState = {
     config: cfg,
+    platformInstance: platformInstanceForBotConfig(cfg),
     client,
     resolvedAllowedUsers: [...(cfg.allowedUsers ?? [])],
     rawAllowedUserResolution: new Map(),
   };
   bots.set(cfg.larkAppId, state);
   return state;
+}
+
+/** Derive the platform identity without changing the legacy BotConfig shape. */
+export function platformInstanceForBotConfig(cfg: Pick<BotConfig, 'larkAppId'>): PlatformInstanceRef {
+  return { platform: 'lark', instanceId: cfg.larkAppId };
 }
 
 export function getBot(larkAppId: string): BotState {

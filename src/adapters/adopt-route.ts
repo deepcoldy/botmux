@@ -12,6 +12,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { normalizePlatformDescriptor } from '../im/platform-descriptor.js';
 
 // ── 类型 ───────────────────────────────────────────────────────────────────────
 
@@ -19,6 +20,8 @@ import { readFileSync } from 'node:fs';
 export interface AdoptRoute {
   sessionId: string;
   chatId: string;
+  platform: string;
+  instanceId: string;
   larkAppId: string;
   rootMessageId: string;
 }
@@ -130,9 +133,13 @@ export async function queryAdoptSession(
     ) {
       return null;
     }
+    const identity = normalizePlatformDescriptor(b);
+    if (!identity || identity.platform !== 'lark') return null;
     return {
       sessionId: b.sessionId,
       chatId: b.chatId,
+      platform: identity.platform,
+      instanceId: identity.instanceId,
       larkAppId: b.larkAppId,
       rootMessageId: b.rootMessageId,
     };
