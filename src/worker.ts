@@ -54,7 +54,8 @@ import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
-import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
+import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
+import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
 import { drainPiTranscript, findPiTranscriptByPid, findPiTranscriptBySessionId } from './services/pi-transcript.js';
 import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
@@ -732,6 +733,8 @@ let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
+let hermesBridgeDbPath: string | undefined;
+let hermesBridgeSourceSessionId: string | undefined;
 let mtrBridgeSource: MtrTranscriptSource | undefined;
 let mtrBridgeOffset = 0;
 let mtrBridgeBaselineDone = false;
@@ -1920,12 +1923,16 @@ function codexBridgeIsCursor(): boolean {
   return lastInitConfig?.cliId === 'cursor';
 }
 
+function currentHermesBridgeDbPath(): string {
+  return hermesBridgeDbPath ?? resolveHermesStateDbPath();
+}
+
 function structuredBridgeIngestPath(path: string, offset: number) {
   if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
   if (codexBridgeIsCursor()) return drainCursorTranscript(path, offset);
   if (structuredBridgeIsPi()) return drainPiTranscript(path, offset);
   if (structuredBridgeIsHermes()) {
-    const result = drainHermesStateDb(offset);
+    const result = drainHermesStateDb(offset, currentHermesBridgeDbPath());
     return { events: result.events, newOffset: result.newOffset, pendingTail: '' };
   }
   return drainCocoEvents(path, offset);
@@ -2059,19 +2066,37 @@ function codexBridgeStartTimer(): void {
 }
 
 function hermesBridgeAttach(mode: 'baseline-existing' | 'fresh-empty'): void {
-  hermesBridgeOffset = currentHermesStateOffset();
+  const dbPath = currentHermesBridgeDbPath();
+  hermesBridgeOffset = currentHermesStateOffset(dbPath);
   hermesBridgeBaselineDone = true;
-  log(`Hermes bridge ${mode}: state.db offset=${hermesBridgeOffset}`);
+  hermesBridgeSourceSessionId = undefined;
+  log(`Hermes bridge ${mode}: ${dbPath} offset=${hermesBridgeOffset}`);
   codexBridgeStartTimer();
 }
 
 function hermesBridgeIngest(): void {
   if (!hermesBridgeBaselineDone) return;
-  const result = drainHermesStateDb(hermesBridgeOffset);
+  const result = drainHermesStateDb(hermesBridgeOffset, currentHermesBridgeDbPath());
   hermesBridgeOffset = result.newOffset;
-  if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(result.events);
-  if (result.events.some(e => e.kind === 'assistant_final')) {
+  const filtered = filterHermesEventsForBotmuxSession(result.events, {
+    botmuxSessionId: sessionId,
+    boundSourceSessionId: hermesBridgeSourceSessionId,
+  });
+  // Announce EVERY source bound this drain, not just the last. A single drain
+  // can bind multiple sources when the worker starts unbound and Hermes
+  // `/clear`-rotates mid-batch; the daemon accumulates them into its authorized
+  // set, so a completed turn from an earlier source is not dropped as foreign.
+  for (const boundSourceSessionId of filtered.newlyBoundSourceSessionIds) {
+    send({ type: 'bridge_source_session', bridge: 'hermes', sourceSessionId: boundSourceSessionId });
+    log(`Hermes bridge bound sourceSessionId=${boundSourceSessionId}`);
+  }
+  hermesBridgeSourceSessionId = filtered.boundSourceSessionId;
+  for (const drop of filtered.drops) {
+    log(`Hermes bridge dropped ${drop.kind} ${drop.uuid} from sourceSessionId=${drop.sourceSessionId ?? '?'} expected=${drop.expectedSourceSessionId ?? hermesBridgeSourceSessionId ?? 'unbound'} reason=${drop.reason}`);
+  }
+  if (filtered.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
+  codexBridgeQueue.ingest(filtered.events);
+  if (filtered.events.some(e => e.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
   }
 }
@@ -2333,6 +2358,7 @@ function emitReadyCodexTurns(): void {
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
     if (!turn.finalText) continue;
+    const sourceHermesSessionId = structuredBridgeIsHermes() ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: turn.finalText }, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
@@ -2347,6 +2373,7 @@ function emitReadyCodexTurns(): void {
       if (!fields) continue;
       send({
         type: 'final_output',
+        ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
         content: fields.content,
         lastUuid: turn.turnId,
         turnId: turn.turnId,
@@ -2355,7 +2382,13 @@ function emitReadyCodexTurns(): void {
       });
       continue;
     }
-    send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: turn.turnId });
+    send({
+      type: 'final_output',
+      ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
+      content: turn.finalText,
+      lastUuid: turn.turnId,
+      turnId: turn.turnId,
+    });
   }
 }
 
@@ -2374,6 +2407,7 @@ function stopCodexBridge(): void {
   codexBridgeBaselineDone = false;
   hermesBridgeOffset = 0;
   hermesBridgeBaselineDone = false;
+  hermesBridgeSourceSessionId = undefined;
   mtrBridgeSource = undefined;
   mtrBridgeOffset = 0;
   mtrBridgeBaselineDone = false;
@@ -4605,6 +4639,13 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
   const perBotInjectKeys = Object.keys(perBotInjectEnv);
   if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
+  const hermesUsesBotmuxSessionProfile = basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session';
+  hermesBridgeDbPath = cfg.cliId === 'hermes'
+    ? resolveHermesStateDbPath(
+      { ...childEnv, ...perBotInjectEnv },
+      { botmuxSessionProfile: hermesUsesBotmuxSessionProfile },
+    )
+    : undefined;
 
   // ── File sandbox (oncall): wrap the CLI in bwrap so it can only touch a
   // per-session project copy + de-identified config. The agent's `botmux send`

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { DropdownMenu, FieldTitle, Html, LoadingState, RefreshIconButton, SectionHeader, dropdownLabel } from './dashboard-components.js';
+import { createPortal } from 'react-dom';
+import { FieldTitle, Html, LoadingState, RefreshIconButton, SectionHeader } from './dashboard-components.js';
 import { botAvatarHtml } from './ui.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
@@ -729,17 +730,24 @@ function SkillsPage() {
     }
   }
 
-  async function updateBotSkill(appId: string, action: 'attach' | 'detach', name: string): Promise<void> {
-    const busyKey = `${appId}:${action}:${name}`;
+  async function setBotSkills(appId: string, names: string[]): Promise<void> {
+    const busyKey = `${appId}:set`;
     setBotBusy(busyKey);
     setBotStatuses(statuses => ({ ...statuses, [appId]: null }));
     try {
       const body = await jsonRequest(`/api/bots/${encodeURIComponent(appId)}/skills`, {
         method: 'PUT',
-        body: JSON.stringify({ action, name }),
+        body: JSON.stringify({
+          action: 'set',
+          policy: names.length > 0 ? { include: names.map(name => `skill:${name}`) } : null,
+        }),
       });
       if (!mountedRef.current) return;
       setBots(rows => rows.map(bot => bot.larkAppId === appId ? { ...bot, skills: body.skills ?? null } : bot));
+      setBotStatuses(statuses => ({
+        ...statuses,
+        [appId]: { text: tr('skills.policySaved'), ok: true },
+      }));
     } catch (err: any) {
       if (mountedRef.current) {
         setBotStatuses(statuses => ({
@@ -747,6 +755,7 @@ function SkillsPage() {
           [appId]: { text: `${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, ok: false },
         }));
       }
+      throw err;
     } finally {
       if (mountedRef.current) setBotBusy(null);
     }
@@ -850,7 +859,7 @@ function SkillsPage() {
                       skills={skills}
                       status={botStatuses[bot.larkAppId] ?? null}
                       busyKey={botBusy}
-                      onUpdate={updateBotSkill}
+                      onSave={setBotSkills}
                     />
                   ))}
                 </div>
@@ -1048,28 +1057,227 @@ function SkillsPage() {
   );
 }
 
+function sameSkillSelection(left: Set<string>, right: string[]): boolean {
+  return left.size === right.length && right.every(name => left.has(name));
+}
+
+export function SkillMultiPicker(props: {
+  botId: string;
+  names: string[];
+  installedNames: Set<string>;
+  skills: SkillRow[];
+  busy: boolean;
+  onSave(names: string[]): Promise<void>;
+}): JSX.Element {
+  const tr = useT();
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [draft, setDraft] = useState<Set<string>>(() => new Set(props.names));
+  const [position, setPosition] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const currentNamesKey = props.names.join('\n');
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const options = useMemo(() => {
+    const byName = new Map(props.skills.map(skill => [skill.name, skill]));
+    for (const name of props.names) {
+      if (!byName.has(name)) byName.set(name, { name });
+    }
+    return [...byName.values()].sort((left, right) => left.name.localeCompare(right.name));
+  }, [props.names, props.skills]);
+  const filteredOptions = useMemo(() => {
+    if (!normalizedQuery) return options;
+    return options.filter(skill => `${skill.name} ${skill.description || ''}`.toLocaleLowerCase().includes(normalizedQuery));
+  }, [normalizedQuery, options]);
+  const dirty = !sameSkillSelection(draft, props.names);
+
+  const updatePosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    if (!trigger || typeof window === 'undefined') return;
+    const rect = trigger.getBoundingClientRect();
+    const edge = 12;
+    const gap = 7;
+    const width = Math.min(370, Math.max(260, window.innerWidth - edge * 2));
+    const left = Math.min(Math.max(edge, rect.left), Math.max(edge, window.innerWidth - width - edge));
+    const spaceAbove = Math.max(0, rect.top - gap - edge);
+    const spaceBelow = Math.max(0, window.innerHeight - rect.bottom - gap - edge);
+    const placeAbove = spaceAbove > spaceBelow;
+    const available = placeAbove ? spaceAbove : spaceBelow;
+    const desired = 118 + Math.min(options.length, 5) * 42;
+    const height = Math.max(180, Math.min(desired, available));
+    setPosition({
+      left,
+      top: placeAbove ? Math.max(edge, rect.top - gap - height) : rect.bottom + gap,
+      width,
+      height,
+    });
+  }, [options.length]);
+
+  useEffect(() => {
+    if (!open) setDraft(new Set(props.names));
+  }, [currentNamesKey, open]);
+
+  useEffect(() => {
+    if (!open || typeof document === 'undefined') return undefined;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (rootRef.current?.contains(event.target as Node) || popoverRef.current?.contains(event.target as Node)) return;
+      setOpen(false);
+      setQuery('');
+      setDraft(new Set(props.names));
+    };
+    document.addEventListener('pointerdown', closeOnOutsideClick);
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    updatePosition();
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsideClick);
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
+  }, [currentNamesKey, open, updatePosition]);
+
+  function openPicker(): void {
+    setDraft(new Set(props.names));
+    setQuery('');
+    updatePosition();
+    setOpen(true);
+  }
+
+  function cancel(): void {
+    setDraft(new Set(props.names));
+    setQuery('');
+    setOpen(false);
+  }
+
+  function toggle(name: string): void {
+    setDraft(current => {
+      const next = new Set(current);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  }
+
+  async function save(): Promise<void> {
+    const names = [...draft].sort((left, right) => left.localeCompare(right));
+    try {
+      await props.onSave(names);
+      setQuery('');
+      setOpen(false);
+    } catch {
+      // The card-level status message explains the failure; keep the draft open for retry.
+    }
+  }
+
+  const triggerLabel = props.names.length === 0
+    ? tr('skills.pickerPlaceholder')
+    : props.names.length === 1
+      ? props.names[0]
+      : tr('skills.pickerSelectedCount', { count: props.names.length });
+
+  const popover = open ? (
+    <div
+      ref={popoverRef}
+      className="skills-multi-picker-popover"
+      style={position ? { left: position.left, top: position.top, width: position.width, height: position.height } : undefined}
+    >
+      <div className="skills-multi-picker-head">
+        <label className="skills-multi-picker-search">
+          <span className="skills-multi-picker-search-icon" aria-hidden="true" />
+          <input
+            type="search"
+            data-action="search-skills"
+            autoFocus
+            autoComplete="off"
+            value={query}
+            placeholder={tr('skills.pickerSearchPlaceholder')}
+            onChange={event => setQuery(event.currentTarget.value)}
+            onKeyDown={event => {
+              if (event.key === 'Escape') {
+                event.preventDefault();
+                cancel();
+              }
+            }}
+          />
+        </label>
+        <div className="skills-multi-picker-meta">
+          <span>{tr('skills.pickerSelectionMeta', { selected: draft.size, total: options.length })}</span>
+          {draft.size > 0 ? (
+            <button type="button" className="skills-multi-picker-clear" data-action="clear-skill-selection" onClick={() => setDraft(new Set())}>
+              {tr('skills.pickerClear')}
+            </button>
+          ) : null}
+        </div>
+      </div>
+      <div className="skills-multi-picker-options" role="listbox" aria-label={tr('skills.priority')} aria-multiselectable="true">
+        {filteredOptions.map(skill => {
+          const selected = draft.has(skill.name);
+          const dangling = !props.installedNames.has(skill.name);
+          return (
+            <button
+              type="button"
+              className={`skills-multi-picker-option${selected ? ' selected' : ''}${dangling ? ' dangling' : ''}`}
+              role="option"
+              aria-selected={selected}
+              data-skill-name={skill.name}
+              key={skill.name}
+              onClick={() => toggle(skill.name)}
+            >
+              <span className="skills-multi-picker-check" aria-hidden="true" />
+              <span className="skills-multi-picker-option-copy">
+                <span><b>{skill.name}</b>{dangling ? <em>{tr('skills.dangling')}</em> : null}</span>
+                {skill.description ? <small>{skill.description}</small> : null}
+              </span>
+            </button>
+          );
+        })}
+        {filteredOptions.length === 0 ? <p className="skills-multi-picker-empty">{tr('skills.pickerNoResults')}</p> : null}
+      </div>
+      <footer className="skills-multi-picker-actions">
+        <button type="button" className="ghost" data-action="cancel-skill-selection" disabled={props.busy} onClick={cancel}>{tr('skills.cancel')}</button>
+        <button type="button" className="primary" data-action="save-skill-selection" disabled={!dirty || props.busy} onClick={() => void save()}>
+          {props.busy ? tr('skills.saving') : tr('skills.saveSelection')}
+        </button>
+      </footer>
+    </div>
+  ) : null;
+
+  return (
+    <div ref={rootRef} className={`skills-multi-picker${open ? ' open' : ''}`} data-skill-picker={props.botId}>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="skills-multi-picker-trigger"
+        data-action="open-skill-picker"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        disabled={props.busy}
+        onClick={() => open ? cancel() : openPicker()}
+      >
+        <span className="skills-multi-picker-trigger-copy">
+          <b>{triggerLabel}</b>
+          <small>{tr('skills.pickerTriggerHint')}</small>
+        </span>
+        <span className="skills-multi-picker-chevron" aria-hidden="true" />
+      </button>
+      {popover && typeof document !== 'undefined' ? createPortal(popover, document.body) : popover}
+    </div>
+  );
+}
+
 export function BotPolicyCard(props: {
   bot: BotRow;
   installedNames: Set<string>;
   skills: SkillRow[];
   status: StatusMessage;
   busyKey: string | null;
-  onUpdate(appId: string, action: 'attach' | 'detach', name: string): Promise<void>;
+  onSave(appId: string, names: string[]): Promise<void>;
 }) {
   const tr = useT();
-  const { bot, installedNames, skills, status, busyKey, onUpdate } = props;
+  const { bot, installedNames, skills, status, busyKey, onSave } = props;
   const label = bot.botName ?? bot.larkAppId;
   const names = priorityNames(bot.skills);
-  const attached = new Set(names);
-  const attachOptions = skills.filter(skill => !attached.has(skill.name));
-  const attachMenuOptions = attachOptions.map(skill => ({ value: skill.name, label: skill.name }));
-  const [selected, setSelected] = useState(attachOptions[0]?.name ?? '');
-
-  useEffect(() => {
-    if (!selected || !attachOptions.some(skill => skill.name === selected)) {
-      setSelected(attachOptions[0]?.name ?? '');
-    }
-  }, [attachOptions, selected]);
 
   if (bot.error) {
     return (
@@ -1091,55 +1299,19 @@ export function BotPolicyCard(props: {
           <strong>{label}</strong>
           <span className="skills-count-pill">{tr('skills.skillCount', { count: names.length })}</span>
         </div>
-        <code>{bot.larkAppId}</code>
       </header>
       <section className="skills-policy-panel">
         <div className="skills-priority-head">
           <h3 className="skills-priority-title">{tr('skills.priority')}</h3>
         </div>
-        {names.length === 0 ? <p className="bd-section-note">{tr('skills.noPriority')}</p> : (
-          <div className="skills-chip-list">
-            {names.map(name => {
-              const dangling = !installedNames.has(name);
-              return (
-                <span className={`skills-priority-row${dangling ? ' skills-priority-dangling' : ''}`} title={dangling ? tr('skills.dangling') : ''} key={name}>
-                  <span className="skills-priority-name">{name}{dangling ? <small>{tr('skills.dangling')}</small> : null}</span>
-                  <button
-                    type="button"
-                    className="skills-priority-remove"
-                    data-action="detach-skill"
-                    data-name={name}
-                    aria-label={tr('skills.detachNamed', { skill: name })}
-                    disabled={busyKey === `${bot.larkAppId}:detach:${name}`}
-                    onClick={() => void onUpdate(bot.larkAppId, 'detach', name)}
-                  >&times;</button>
-                </span>
-              );
-            })}
-          </div>
-        )}
-        <div className="skills-attach-row">
-          {attachOptions.length === 0 ? <button type="button" disabled>{tr('skills.attach')}</button> : (
-            <>
-              <DropdownMenu
-                className="skills-attach-menu"
-                ariaLabel={tr('skills.attach')}
-                value={selected}
-                label={dropdownLabel(attachMenuOptions, selected)}
-                options={attachMenuOptions}
-                onChange={setSelected}
-              />
-              <button
-                type="button"
-                data-action="attach-skill"
-                disabled={!selected || busyKey === `${bot.larkAppId}:attach:${selected}`}
-                onClick={() => selected && void onUpdate(bot.larkAppId, 'attach', selected)}
-              >
-                {tr('skills.attach')}
-              </button>
-            </>
-          )}
-        </div>
+        <SkillMultiPicker
+          botId={bot.larkAppId}
+          names={names}
+          installedNames={installedNames}
+          skills={skills}
+          busy={busyKey === `${bot.larkAppId}:set`}
+          onSave={next => onSave(bot.larkAppId, next)}
+        />
       </section>
       <span className={statusClass(status)} data-bot-status>{status?.text ?? ''}</span>
     </article>

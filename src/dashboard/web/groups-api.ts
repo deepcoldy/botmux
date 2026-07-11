@@ -6,6 +6,7 @@ export interface GroupBot {
 
 export interface GroupMemberBot extends GroupBot {
   inChat: boolean;
+  hasRole?: boolean;
   error?: unknown;
   oncallChat?: { workingDir?: string } | null;
 }

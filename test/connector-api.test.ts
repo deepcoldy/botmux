@@ -61,6 +61,7 @@ describe('connector-api write routes', () => {
     expect(created.secret).toMatch(/^[A-Za-z0-9_-]+$/);
     expect(created.connector.verify.secretRef).toMatch(/^whsec_/);
     expect(created.connector.verify.signatureHeader).toBe('x-botmux-signature');
+    expect(created.connector.loggingPolicy).toMatchObject({ storePayload: true, storeHeaders: true, retentionDays: 14 });
 
     const list = await json(await fetch(`${baseUrl}/api/connectors`));
     expect(list.connectors).toHaveLength(1);
@@ -178,6 +179,42 @@ describe('connector-api write routes', () => {
     expect(created.connector.lifecycleExtractors).toEqual({ dedupKey: '$.alert.id' });
   });
 
+  it('updates the complete webhook configuration and drops fields that do not belong to the new mode', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Workflow room',
+        target: { mode: 'fixed', kind: 'workflow', botId: 'app1', chatId: 'oc_old', workflowId: 'wf_old' },
+        lifecycleExtractors: { dedupKey: '$.alert.id' },
+      }),
+    }));
+
+    const updated = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Dynamic turn',
+        target: { mode: 'dynamic', kind: 'turn', botId: 'app2', allowChats: ['oc_a', 'oc_b'] },
+        promptEnvelope: { sourceName: 'Dynamic turn', instruction: 'summarize' },
+        verify: { type: 'hmac-sha256' },
+        loggingPolicy: { storePayload: false, storeHeaders: true, retentionDays: 14 },
+        lifecycleExtractors: null,
+      }),
+    }));
+
+    expect(updated.connector).toMatchObject({
+      name: 'Dynamic turn',
+      target: { mode: 'dynamic', kind: 'turn', botId: 'app2', allowChats: ['oc_a', 'oc_b'] },
+      promptEnvelope: { sourceName: 'Dynamic turn', instruction: 'summarize' },
+      verify: { type: 'hmac-sha256' },
+      loggingPolicy: { storePayload: false },
+      lifecycleExtractors: null,
+    });
+    expect(updated.connector.target.chatId).toBeUndefined();
+    expect(updated.connector.target.workflowId).toBeUndefined();
+  });
+
   it('manages standalone webhook secrets as metadata-only reads', async () => {
     const created = await json(await fetch(`${baseUrl}/api/webhook-secrets`, {
       method: 'POST',
@@ -212,8 +249,8 @@ describe('connector-api write routes', () => {
       }),
     }));
     const id = created.connector.id;
-    appendTriggerLog({ triggerId: 'old', connectorId: id, action: 'queued', status: 'ok', createdAt: '2026-05-20T00:00:00.000Z' }, dataDir);
-    appendTriggerLog({ triggerId: 'rate', connectorId: id, action: 'failed', status: 'error', errorCode: 'rate_limited', createdAt: '2026-05-24T00:01:00.000Z' }, dataDir);
+    appendTriggerLog({ triggerId: 'old', connectorId: id, action: 'queued', status: 'ok', createdAt: '2026-05-20T00:00:00.000Z', response: { httpStatus: 200, durationMs: 10 } }, dataDir);
+    appendTriggerLog({ triggerId: 'rate', connectorId: id, action: 'failed', status: 'error', errorCode: 'rate_limited', createdAt: '2026-05-24T00:01:00.000Z', response: { httpStatus: 429, durationMs: 30 } }, dataDir);
     appendTriggerLog({ triggerId: 'sig', connectorId: 'missing', action: 'failed', status: 'error', errorCode: 'invalid_signature', createdAt: '2026-05-24T00:02:00.000Z' }, dataDir);
 
     const filtered = await json(await fetch(`${baseUrl}/api/trigger-logs?status=error&errorCode=rate_limited`));
@@ -228,6 +265,11 @@ describe('connector-api write routes', () => {
       lastErrorCode: 'rate_limited',
     });
     expect(stats.stats.find((s: any) => s.connectorId === 'missing')).toMatchObject({ total: 1, error: 1 });
+
+    const summary = await json(await fetch(`${baseUrl}/api/trigger-logs/summary?connectorId=${encodeURIComponent(id)}`));
+    expect(summary.summary).toMatchObject({ total: 2, ok: 1, error: 1, successRate: 50, avgDurationMs: 20, p95DurationMs: 30 });
+    const page = await json(await fetch(`${baseUrl}/api/trigger-logs?connectorId=${encodeURIComponent(id)}&limit=1&offset=1`));
+    expect(page).toMatchObject({ total: 2, limit: 1, offset: 1, hasMore: false, logs: [{ triggerId: 'old' }] });
 
     const pruned = await json(await fetch(`${baseUrl}/api/trigger-logs/prune`, {
       method: 'POST',

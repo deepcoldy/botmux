@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
@@ -7,7 +8,7 @@ import { BotPolicyCard, SkillsInstallPanel } from '../src/dashboard/web/skills-p
 
 describe('dashboard skills React hook safety', () => {
   it('keeps hook order stable when the same bot card flips between error and normal states', () => {
-    const onUpdate = vi.fn();
+    const onSave = vi.fn();
     const normalBot = { larkAppId: 'app-a', botName: 'Codex Bot', skills: { include: ['skill:deploy'] } };
     const errorBot = { larkAppId: 'app-a', botName: 'Codex Bot', error: 'daemon offline', skills: null };
     const skills = [{ name: 'deploy' }, { name: 'review' }];
@@ -21,7 +22,7 @@ describe('dashboard skills React hook safety', () => {
           skills,
           status: null,
           busyKey: null,
-          onUpdate,
+          onSave,
         }));
       });
       act(() => {
@@ -31,7 +32,7 @@ describe('dashboard skills React hook safety', () => {
           skills,
           status: null,
           busyKey: null,
-          onUpdate,
+          onSave,
         }));
       });
       act(() => {
@@ -41,12 +42,55 @@ describe('dashboard skills React hook safety', () => {
           skills,
           status: null,
           busyKey: null,
-          onUpdate,
+          onSave,
         }));
       });
     }).not.toThrow();
 
     expect(renderer.toJSON()).toMatchObject({ props: { 'data-appid': 'app-a' } });
+  });
+
+  it('uses one compact searchable multi-select and saves the complete priority selection', async () => {
+    const onSave = vi.fn(async () => undefined);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotPolicyCard, {
+        bot: { larkAppId: 'app-a', botName: 'Codex Bot', skills: { include: ['skill:deploy'] } },
+        installedNames: new Set(['deploy', 'review', 'release']),
+        skills: [
+          { name: 'deploy', description: 'Deploy services' },
+          { name: 'release', description: 'Publish releases' },
+          { name: 'review', description: 'Review code' },
+        ],
+        status: null,
+        busyKey: null,
+        onSave,
+      }));
+    });
+
+    const root = renderer.root;
+    expect(root.findAllByProps({ className: 'skills-chip-list' })).toHaveLength(0);
+    expect(root.findAllByType('code')).toHaveLength(0);
+    act(() => root.findByProps({ 'data-action': 'open-skill-picker' }).props.onClick());
+    expect(root.findAllByProps({ role: 'option' })).toHaveLength(3);
+
+    act(() => root.findByProps({ 'data-action': 'search-skills' }).props.onChange({ currentTarget: { value: 'review' } }));
+    const filtered = root.findAllByProps({ role: 'option' });
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].props['data-skill-name']).toBe('review');
+    act(() => filtered[0].props.onClick());
+
+    await act(async () => root.findByProps({ 'data-action': 'save-skill-selection' }).props.onClick());
+    expect(onSave).toHaveBeenCalledWith('app-a', ['deploy', 'review']);
+  });
+
+  it('constrains every bot card child to the card grid column', () => {
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    expect(css).toMatch(/\.skills-bot-card\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s);
+    expect(css).toMatch(/\.skills-policy-panel\s*\{[^}]*min-width:\s*0/s);
+    expect(css).toMatch(/\.skills-bot-head\s*\{[^}]*min-width:\s*0/s);
+    expect(css).toMatch(/\.skills-multi-picker\s*\{[^}]*min-width:\s*0/s);
   });
 });
 

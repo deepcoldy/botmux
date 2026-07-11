@@ -1212,26 +1212,49 @@ ipcRoute('DELETE', '/api/oncall/:chatId', async (_req, res, p) => {
 });
 
 // ─── Role management (dashboard) ───────────────────────────────────────────
+// POST   /api/roles/batch   body: {chatIds: string[]} → role snapshots
 // GET    /api/roles/:chatId  → { chatId, content, byteLength, injectMode, effectiveContent, effectiveSource }
 // PUT    /api/roles/:chatId  body: {content?, injectMode?} → write role file and/or injection mode
 // DELETE /api/roles/:chatId  → remove role file (and injection-mode sidecar)
 
-ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
-  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
-  const content = resolveRoleFile(cachedLarkAppId, p.chatId);
-  const effective = resolveRole(cachedLarkAppId, p.chatId);
-  jsonRes(res, 200, {
-    chatId: p.chatId,
+const MAX_ROLE_BATCH_CHAT_IDS = 1_000;
+
+function dashboardRolePayload(larkAppId: string, chatId: string): Record<string, unknown> {
+  const content = resolveRoleFile(larkAppId, chatId);
+  const effective = resolveRole(larkAppId, chatId);
+  return {
+    chatId,
     content,
     byteLength: content ? Buffer.byteLength(content, 'utf-8') : 0,
     hasRole: content !== null,
-    injectMode: readRoleInjectMode(cachedLarkAppId, p.chatId),
+    injectMode: readRoleInjectMode(larkAppId, chatId),
     effectiveContent: effective.content,
     effectiveSource: effective.source,
     effectiveByteLength: effective.content ? Buffer.byteLength(effective.content, 'utf-8') : 0,
     hasEffectiveRole: effective.content !== null,
-  });
+  };
+}
+
+ipcRoute('POST', '/api/roles/batch', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { chatIds?: unknown };
+  try { body = await readJsonBody<{ chatIds?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!Array.isArray(body.chatIds)) return jsonRes(res, 400, { ok: false, error: 'chat_ids_required' });
+  if (body.chatIds.length > MAX_ROLE_BATCH_CHAT_IDS) {
+    return jsonRes(res, 400, { ok: false, error: 'too_many_chat_ids' });
+  }
+  if (body.chatIds.some(chatId => typeof chatId !== 'string' || !isValidRoleChatId(chatId))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  }
+  const chatIds = [...new Set(body.chatIds as string[])];
+  jsonRes(res, 200, { roles: chatIds.map(chatId => dashboardRolePayload(cachedLarkAppId!, chatId)) });
+});
+
+ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  jsonRes(res, 200, dashboardRolePayload(cachedLarkAppId, p.chatId));
 });
 
 ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
@@ -1410,6 +1433,17 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const m = getBot(cachedLarkAppId).config.maxLiveWorkers;
     if (typeof m === 'number' && Number.isInteger(m) && m > 0) maxLiveWorkers = m;
   } catch { /* default unlimited */ }
+  let logicalSessionCount = 0;
+  let residentSessionCount = 0;
+  let dormantSessionCount = 0;
+  const registry = getActiveSessionsRegistry();
+  if (registry) {
+    logicalSessionCount = registry.size;
+    for (const ds of registry.values()) {
+      if (ds.worker && !ds.worker.killed) residentSessionCount++;
+      else if (!ds.session.queued) dormantSessionCount++;
+    }
+  }
   // startupCommands → newline-joined for the dashboard textarea (one per line).
   let startupCommands = '';
   try {
@@ -1480,6 +1514,9 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     // value when this bot has no explicit override (prompt/global/off).
     skillInjectionDefault: globalBuiltinSkillInjectionDefault(),
     maxLiveWorkers,
+    logicalSessionCount,
+    residentSessionCount,
+    dormantSessionCount,
     startupCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,

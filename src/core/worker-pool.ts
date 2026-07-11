@@ -72,6 +72,9 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
   closeSession: (ds: DaemonSession) => void;
+  /** Re-check the per-bot resident-session cap after a process starts or an
+   * over-cap busy session becomes idle. Optional for unit-test callers. */
+  enforceLiveSessionCap?: () => void;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -1163,6 +1166,9 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
+  // Screen state describes the process we just stopped. Keeping it would make
+  // the dashboard hydrate this process-less logical session as idle/working.
+  ds.lastScreenStatus = undefined;
   ds.session.webPort = undefined;
   // The worker's suspend handler destroys the backing session + CLI (frees
   // memory), so there is no live CLI to reattach to: the next turn MUST
@@ -1180,8 +1186,15 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   if (!ds.exitEventEmitted) {
     ds.exitEventEmitted = true;
     dashboardEventBus.publish({
-      type: 'session.exited',
-      body: { sessionId: ds.session.sessionId, reason },
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: {
+          status: 'dormant',
+          webPort: null,
+          workerPid: null,
+        },
+      },
     });
   }
   logger.info(`[${tag(ds)}] Worker + CLI suspended (${reason}); session stays active, cold-resumes from transcript on next message`);
@@ -1856,6 +1869,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     type: 'session.spawned',
     body: { session: composeRowFromActive(ds) },
   });
+  cb.enforceLiveSessionCap?.();
   emitSessionLifecycleHook(ds, 'session.start', {
     reason: resume ? 'resume' : 'worker_spawn',
     pid: worker.pid ?? null,
@@ -1874,6 +1888,12 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
 function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
   const cb = requireCallbacks();
   const t = tag(ds);
+  // Source authorization belongs to one worker lifetime. A replacement worker
+  // must announce its own Hermes sources before any stamped final_output is
+  // trusted; `/clear` rebinds within the same lifetime accumulate afterwards.
+  if (ds.session.cliId === 'hermes' && ds.worker !== worker) {
+    ds.hermesBridgeSourceSessionIds = undefined;
+  }
   // Worker messages without a turn of their own (first streaming card, crash
   // notices) anchor to the session's current reply-target turn so a shared
   // fold-back topic keeps them in-thread instead of leaking top-level.
@@ -2156,6 +2176,14 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
             void finishTurnReactions(ds);
+          }
+          // If every over-cap process was busy, the earlier check deliberately
+          // left them alone. Re-check on the first idle edge so capacity is
+          // reclaimed immediately instead of waiting for the 60s backstop.
+          if (ds.lastScreenStatus === 'idle' && cb.enforceLiveSessionCap) {
+            // Defer until this screen_update has finished using process state.
+            // The newly-idle session itself may be the oldest eviction target.
+            queueMicrotask(cb.enforceLiveSessionCap);
           }
         }
 
@@ -2470,6 +2498,23 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         break;
       }
 
+      case 'bridge_source_session': {
+        if (msg.bridge !== 'hermes') break;
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored Hermes source binding from stale worker: ${msg.sourceSessionId}`);
+          break;
+        }
+        const sourceSessionIds = ds.hermesBridgeSourceSessionIds ??= new Set<string>();
+        if (sourceSessionIds.has(msg.sourceSessionId)) break;
+        if (sourceSessionIds.size === 0) {
+          logger.info(`[${t}] Hermes bridge sourceSessionId bound: ${msg.sourceSessionId}`);
+        } else {
+          logger.info(`[${t}] Hermes bridge sourceSessionId added after rebind: ${msg.sourceSessionId}`);
+        }
+        sourceSessionIds.add(msg.sourceSessionId);
+        break;
+      }
+
       case 'user_notify': {
         logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
@@ -2491,6 +2536,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // another session.
         if (!msg.content || !msg.content.trim()) break;
         if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
+        if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
         if (!msg.sessionId) {
           logger.warn(`[${t}] final_output missing sessionId; accepting for compatibility (session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`);
         }
@@ -2582,6 +2628,31 @@ function shouldDropMismatchedFinalOutput(
   logger.error(
     `[${t}] Dropped final_output with mismatched sessionId ` +
     `(msg=${msg.sessionId}, session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+  );
+  return true;
+}
+
+function shouldDropMismatchedHermesFinalOutput(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  t: string,
+): boolean {
+  if (ds.session.cliId !== 'hermes') return false;
+  const sourceSessionIds = ds.hermesBridgeSourceSessionIds;
+  const hasBoundSource = !!sourceSessionIds && sourceSessionIds.size > 0;
+  if (!msg.sourceHermesSessionId) {
+    if (!hasBoundSource) return false;
+    logger.error(
+      `[${t}] Dropped Hermes final_output without sourceHermesSessionId ` +
+      `(expected one of ${sourceSessionIds!.size} bound sources, session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+    );
+    return true;
+  }
+  if (sourceSessionIds?.has(msg.sourceHermesSessionId)) return false;
+  logger.error(
+    `[${t}] Dropped Hermes final_output with mismatched sourceHermesSessionId ` +
+    `(msg=${msg.sourceHermesSessionId}, expected one of ${sourceSessionIds?.size ?? 0} bound sources, ` +
+    `session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
   );
   return true;
 }
@@ -2942,6 +3013,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     type: 'session.spawned',
     body: { session: composeRowFromActive(ds) },
   });
+  cb.enforceLiveSessionCap?.();
   emitSessionLifecycleHook(ds, 'session.start', {
     reason: opts?.restoredFromMetadata ? 'adopt_restore' : 'adopt',
     pid: worker.pid ?? null,

@@ -2,7 +2,11 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import { validateTriggerRequest } from '../services/trigger-types.js';
-import { appendTriggerLog } from '../services/trigger-log-store.js';
+import {
+  appendTriggerLog,
+  type TriggerLogRequest,
+  type TriggerLogTarget,
+} from '../services/trigger-log-store.js';
 import { jsonRes } from './workflow-api.js';
 
 const MAX_TRIGGER_BODY_BYTES = 512 * 1024;
@@ -31,6 +35,14 @@ export type TriggerApiDeps = {
   proxyToDaemon: (larkAppId: string, daemonPath: string, init: RequestInit) => Promise<Response>;
 };
 
+export type TriggerDispatchLogContext = {
+  createdAt?: string;
+  startedAtMs?: number;
+  requestId?: string;
+  request?: TriggerLogRequest;
+  target?: TriggerLogTarget;
+};
+
 export async function queryTriggerResult(
   botId: string,
   sessionId: string,
@@ -38,9 +50,22 @@ export async function queryTriggerResult(
   triggerId?: string,
 ): Promise<{ status: number; body: TriggerResponse }> {
   const suffix = triggerId ? `?triggerId=${encodeURIComponent(triggerId)}` : '';
-  const upstream = await deps.proxyToDaemon(botId, `/api/sessions/${encodeURIComponent(sessionId)}/trigger-result${suffix}`, {
-    method: 'GET',
-  });
+  let upstream: Response;
+  try {
+    upstream = await deps.proxyToDaemon(botId, `/api/sessions/${encodeURIComponent(sessionId)}/trigger-result${suffix}`, {
+      method: 'GET',
+    });
+  } catch (error: any) {
+    return {
+      status: 502,
+      body: {
+        ok: false,
+        triggerId: triggerId ?? newTriggerId(),
+        errorCode: 'daemon_offline',
+        error: error?.message ?? 'target daemon is unavailable',
+      },
+    };
+  }
   const text = await upstream.text();
   let parsed: TriggerResponse;
   try {
@@ -59,6 +84,7 @@ export async function queryTriggerResult(
 export async function dispatchTriggerRequest(
   body: TriggerRequest,
   deps: TriggerApiDeps,
+  logContext?: TriggerDispatchLogContext,
 ): Promise<{ status: number; body: TriggerResponse }> {
   // Both turn and workflow are proxied by botId to the owning daemon's
   // /api/trigger; the daemon IPC handler dispatches turn vs workflow.
@@ -70,11 +96,21 @@ export async function dispatchTriggerRequest(
     };
   }
 
-  const upstream = await deps.proxyToDaemon(botId, '/api/trigger', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  let upstream: Response;
+  try {
+    upstream = await deps.proxyToDaemon(botId, '/api/trigger', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (error: any) {
+    upstream = new Response(JSON.stringify({
+      ok: false,
+      triggerId: newTriggerId(),
+      errorCode: 'daemon_offline',
+      error: error?.message ?? 'target daemon is unavailable',
+    }), { status: 502, headers: { 'content-type': 'application/json' } });
+  }
   const text = await upstream.text();
   let parsed: TriggerResponse;
   try {
@@ -91,10 +127,23 @@ export async function dispatchTriggerRequest(
   appendTriggerLog({
     triggerId: parsed.triggerId ?? newTriggerId(),
     connectorId: body.source.connectorId,
+    requestId: logContext?.requestId ?? body.source.requestId,
     action: parsed.ok ? (parsed.action ?? 'delivered') : 'failed',
     status: parsed.ok ? 'ok' : 'error',
     error: parsed.error,
     errorCode: parsed.errorCode,
+    ...(logContext?.request ? { request: logContext.request } : {}),
+    ...(logContext?.target ? { target: logContext.target } : {}),
+    ...(logContext?.startedAtMs !== undefined ? {
+      response: {
+        httpStatus: upstream.status,
+        durationMs: Math.max(0, Date.now() - logContext.startedAtMs),
+        ...(parsed.target?.sessionId ? { sessionId: parsed.target.sessionId } : {}),
+        ...(parsed.target?.workflowRunId ? { workflowRunId: parsed.target.workflowRunId } : {}),
+        ...(parsed.target?.chatId ? { chatId: parsed.target.chatId } : {}),
+      },
+    } : {}),
+    ...(logContext?.createdAt ? { createdAt: logContext.createdAt } : {}),
   });
 
   return { status: upstream.status, body: parsed };

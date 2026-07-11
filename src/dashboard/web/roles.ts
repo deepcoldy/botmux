@@ -2,6 +2,7 @@ import type {
   EffectiveRoleValue,
   RoleProfileEntryLike,
 } from './role-profile-match.js';
+import { effectiveRoleKey, loadEffectiveRoleMap } from './role-batch.js';
 
 export interface BotInfo {
   larkAppId: string;
@@ -90,7 +91,7 @@ export function hashChatId(hash = location.hash): string | null {
 }
 
 export function roleKey(larkAppId: string, chatId: string): string {
-  return `${larkAppId}\u0000${chatId}`;
+  return effectiveRoleKey(larkAppId, chatId);
 }
 
 export function byteLength(s: string): number {
@@ -229,28 +230,18 @@ export async function loadRoleProfileContext(groups: GroupInfo[], profiles: Role
     }
   }));
 
-  const nextEffectiveRoles = new Map<string, EffectiveRoleValue>();
   const seen = new Set<string>();
-  await Promise.all(groups.flatMap(group =>
-    group.memberBots
-      .filter(bot => bot.inChat)
-      .map(async bot => {
-        const key = roleKey(bot.larkAppId, group.chatId);
-        if (seen.has(key)) return;
-        seen.add(key);
-        try {
-          const role = await loadRole(bot.larkAppId, group.chatId);
-          const hasEffectiveRole = role.hasEffectiveRole ?? role.hasRole;
-          const effectiveContent = 'effectiveContent' in role ? role.effectiveContent : role.content;
-          nextEffectiveRoles.set(key, {
-            content: hasEffectiveRole ? String(effectiveContent ?? '') : null,
-            source: role.effectiveSource ?? (role.hasRole ? 'chat' : 'none'),
-          });
-        } catch {
-          nextEffectiveRoles.set(key, null);
-        }
-      }),
-  ));
+  const roleTargets: Array<{ larkAppId: string; chatId: string }> = [];
+  for (const group of groups) {
+    for (const bot of group.memberBots) {
+      if (!bot.inChat || !bot.hasRole) continue;
+      const key = roleKey(bot.larkAppId, group.chatId);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      roleTargets.push({ larkAppId: bot.larkAppId, chatId: group.chatId });
+    }
+  }
+  const nextEffectiveRoles = await loadEffectiveRoleMap(roleTargets);
 
   return {
     entriesByProfile: new Map(detailPairs),

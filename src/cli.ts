@@ -65,6 +65,7 @@ import { logger } from './utils/logger.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
+import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-liveness.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
@@ -2333,6 +2334,9 @@ interface SessionData {
   cliId?: string;
   lastCliInput?: string;
   adoptedFrom?: AdoptedFromData;
+  /** Deliberately suspended by the resident-session cap. No process/backing
+   * session is expected until the next message cold-resumes the CLI. */
+  suspendedColdResume?: boolean;
 }
 
 /**
@@ -2690,6 +2694,7 @@ function sessionStatusLabel(s: SessionData): string {
     if (pid) return isProcessAlive(pid) ? 'adopt' : 'stopped';
     return s.pid && isProcessAlive(s.pid) ? 'adopt' : 'idle';
   }
+  if (isColdResumeDormant(s) && !(s.pid && isProcessAlive(s.pid))) return 'dormant';
   return s.pid && isProcessAlive(s.pid) ? 'online' : s.pid ? 'stopped' : 'idle';
 }
 
@@ -3008,12 +3013,10 @@ async function cmdList(): Promise<void> {
 
     const hasPid = !!(s.pid && isProcessAlive(s.pid));
     const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
-    if (!hasPid && !hasTmux) {
-      const everReal = !!(s.cliId || s.lastCliInput || s.adoptedFrom);
-      (everReal ? pruned : prunedScratch).push(s);
-    } else {
-      live.push(s);
-    }
+    const disposition = sessionListDisposition(s, { hasPid, hasBackingSession: hasTmux });
+    if (disposition === 'prune_real') pruned.push(s);
+    else if (disposition === 'prune_scratch') prunedScratch.push(s);
+    else live.push(s);
   }
   const closeNow = (arr: SessionData[]) => {
     for (const s of arr) {

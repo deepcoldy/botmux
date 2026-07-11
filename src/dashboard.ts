@@ -103,6 +103,7 @@ import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncM
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
+import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
@@ -2369,9 +2370,20 @@ const server = createServer(async (req, res) => {
     }
 
     // ─── Roles (proxy to daemon) ────────────────────────────────────────────
+    // POST   /api/roles/batch → collapse role reads to one request per daemon
     // GET    /api/roles/:larkAppId/:chatId → read role file
     // PUT    /api/roles/:larkAppId/:chatId → write role file
     // DELETE /api/roles/:larkAppId/:chatId → delete role file
+
+    if (req.method === 'POST' && url.pathname === '/api/roles/batch') {
+      let body: unknown;
+      try { body = await readJsonBody(req); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const parsed = parseRoleBatchTargets(body);
+      if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error });
+      const result = await aggregateRoleBatch(parsed.targets, proxyToDaemon);
+      return jsonRes(res, 200, result);
+    }
 
     let mRole: RegExpMatchArray | null;
     if ((mRole = url.pathname.match(/^\/api\/roles\/([^/]+)\/([^/]+)$/))) {

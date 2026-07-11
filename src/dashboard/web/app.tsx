@@ -155,6 +155,9 @@ function isActiveNav(item: NavItem, hash: string): boolean {
   ) {
     return true;
   }
+  if (item.id === 'connectors' && (current === '#/webhook-logs' || current.startsWith('#/webhook-logs?') || current.startsWith('#/webhook-logs/'))) {
+    return true;
+  }
   return item.href === current || (
     item.href !== '#/' && (current.startsWith(`${item.href}?`) || current.startsWith(`${item.href}/`))
   );

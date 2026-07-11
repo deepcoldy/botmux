@@ -12,6 +12,7 @@ import {
   type GroupFilters,
   type GroupsSnapshot,
 } from './groups-api.js';
+import { effectiveRoleKey, loadEffectiveRoleMap } from './role-batch.js';
 
 export {
   emptyGroupsSnapshot,
@@ -26,12 +27,22 @@ export type {
 
 const PROFILE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const GROUP_ROLE_CONTEXT_CONCURRENCY = 6;
+export const GROUPS_PAGE_SIZE = 30;
 
 export interface RoleProfileContext {
   profiles: RoleProfileSummaryLike[];
   entriesById: Map<string, RoleProfileEntryLike[]>;
   groupRoleContentByBot: Map<string, EffectiveRoleValue>;
   loaded: boolean;
+}
+
+export interface GroupPageWindow<T> {
+  rows: T[];
+  page: number;
+  totalPages: number;
+  from: number;
+  to: number;
+  total: number;
 }
 
 export type SaveProfileEntryStatus = 'chat' | 'team' | 'empty' | 'error';
@@ -61,7 +72,30 @@ export interface RoleProfileBootstrapStatus {
 }
 
 export function roleKey(larkAppId: string, chatId: string): string {
-  return `${larkAppId}\u0000${chatId}`;
+  return effectiveRoleKey(larkAppId, chatId);
+}
+
+/** Keep the expensive group coverage matrix bounded to one client-side page. */
+export function paginateGroupRows<T>(
+  rows: T[],
+  requestedPage: number,
+  pageSize = GROUPS_PAGE_SIZE,
+): GroupPageWindow<T> {
+  const safePageSize = Number.isFinite(pageSize) ? Math.max(1, Math.floor(pageSize)) : GROUPS_PAGE_SIZE;
+  const total = rows.length;
+  const totalPages = Math.max(1, Math.ceil(total / safePageSize));
+  const normalizedPage = Number.isFinite(requestedPage) ? Math.floor(requestedPage) : 1;
+  const page = Math.min(totalPages, Math.max(1, normalizedPage));
+  const start = (page - 1) * safePageSize;
+  const to = Math.min(total, start + safePageSize);
+  return {
+    rows: rows.slice(start, to),
+    page,
+    totalPages,
+    from: total === 0 ? 0 : start + 1,
+    to,
+    total,
+  };
 }
 
 async function mapWithConcurrency<T, R>(
@@ -114,32 +148,21 @@ export async function loadGroupRoleProfileContext(snapshot: GroupsSnapshot): Pro
     }
   });
 
-  const nextGroupRoles = new Map<string, EffectiveRoleValue>();
   const seenRoleKeys = new Set<string>();
-  const roleTargets: Array<{ chatId: string; larkAppId: string; key: string }> = [];
+  const roleTargets: Array<{ chatId: string; larkAppId: string }> = [];
   for (const chat of snapshot.chats ?? []) {
     for (const bot of chat.memberBots ?? []) {
-      if (!bot?.inChat || !bot?.larkAppId) continue;
+      // Profile matching intentionally considers explicit chat roles only.
+      // /api/groups already tells us whether one exists, so skip every
+      // unconfigured membership instead of reading its effective team role.
+      if (!bot?.inChat || !bot?.hasRole || !bot?.larkAppId) continue;
       const key = roleKey(bot.larkAppId, chat.chatId);
       if (seenRoleKeys.has(key)) continue;
       seenRoleKeys.add(key);
-      roleTargets.push({ chatId: chat.chatId, larkAppId: bot.larkAppId, key });
+      roleTargets.push({ chatId: chat.chatId, larkAppId: bot.larkAppId });
     }
   }
-  await mapWithConcurrency(roleTargets, GROUP_ROLE_CONTEXT_CONCURRENCY, async target => {
-    try {
-      const r = await fetch(`/api/roles/${encodeURIComponent(target.larkAppId)}/${encodeURIComponent(target.chatId)}`);
-      const body = await r.json().catch(() => ({}));
-      const hasEffectiveRole = body?.hasEffectiveRole ?? body?.hasRole;
-      const effectiveContent = 'effectiveContent' in body ? body.effectiveContent : body.content;
-      nextGroupRoles.set(target.key, {
-        content: hasEffectiveRole ? String(effectiveContent ?? '') : null,
-        source: body?.effectiveSource ?? (body?.hasRole ? 'chat' : 'none'),
-      });
-    } catch {
-      nextGroupRoles.set(target.key, null);
-    }
-  });
+  const nextGroupRoles = await loadEffectiveRoleMap(roleTargets);
 
   return {
     profiles: nextProfiles,

@@ -13,7 +13,7 @@ import * as workerPool from '../src/core/worker-pool.js';
 import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
-import { writeTeamRoleFile } from '../src/core/role-resolver.js';
+import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -1106,6 +1106,57 @@ describe('POST /api/groups/create', () => {
 });
 
 describe('role profile IPC routes', () => {
+  it('returns multiple role snapshots in one daemon request', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-role-batch-'));
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    try {
+      process.env.SESSION_DATA_DIR = dataDir;
+      config.session.dataDir = dataDir;
+      setLarkAppId('cli_profile');
+      writeRoleFile('cli_profile', 'oc_explicit', '# Explicit role');
+      writeTeamRoleFile('cli_profile', '# Team fallback');
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const batch = await fetch(`${base}/api/roles/batch`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatIds: ['oc_explicit', 'oc_fallback', 'oc_explicit'] }),
+      });
+      expect(batch.status).toBe(200);
+      expect((await batch.json()).roles).toMatchObject([
+        {
+          chatId: 'oc_explicit',
+          content: '# Explicit role',
+          hasRole: true,
+          effectiveContent: '# Explicit role',
+          effectiveSource: 'chat',
+        },
+        {
+          chatId: 'oc_fallback',
+          content: null,
+          hasRole: false,
+          effectiveContent: '# Team fallback',
+          effectiveSource: 'team',
+        },
+      ]);
+
+      const invalid = await fetch(`${base}/api/roles/batch`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatIds: ['../escape'] }),
+      });
+      expect(invalid.status).toBe(400);
+      expect((await invalid.json()).error).toBe('invalid_chat_id');
+    } finally {
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('returns effective team role metadata for dashboard save-as-profile flows', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-role-effective-'));
     const prevDataDir = process.env.SESSION_DATA_DIR;

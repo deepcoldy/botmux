@@ -54,6 +54,9 @@ export type BotDefaultsRow = {
   substituteMode?: BotSubstituteMode | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
+  logicalSessionCount?: number;
+  residentSessionCount?: number;
+  dormantSessionCount?: number;
   startupCommands?: string;
   launchShell?: string;
   env?: string;

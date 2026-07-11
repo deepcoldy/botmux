@@ -36,6 +36,24 @@ describe('dashboard bot payload helpers', () => {
     });
   });
 
+  it('passes through resident/dormant/logical session counts for the bot card', () => {
+    const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, {
+      logicalSessionCount: 83,
+      residentSessionCount: 29,
+      dormantSessionCount: 54,
+    })).toMatchObject({
+      logicalSessionCount: 83,
+      residentSessionCount: 29,
+      dormantSessionCount: 54,
+    });
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({
+      logicalSessionCount: 0,
+      residentSessionCount: 0,
+      dormantSessionCount: 0,
+    });
+  });
+
   it('derives agentSelectionKey from cliId + wrapperCli so the 修改CLI dropdown highlights wrapper gateways', () => {
     // 裸 CLI：选择键 = cliId。
     expect(botDefaultsPayload(

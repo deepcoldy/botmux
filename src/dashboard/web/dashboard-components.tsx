@@ -361,6 +361,7 @@ type DropdownMenuProps<T extends string> = {
   ariaLabel?: string;
   disabled?: boolean;
   hidden?: boolean;
+  style?: CSSProperties;
   label: ReactNode;
   value: T;
   options: DropdownOption<T>[];
@@ -406,7 +407,7 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): JSX
   const className = ['sect-sort-menu', props.disabled ? 'is-disabled' : '', props.className].filter(Boolean).join(' ');
 
   return (
-    <details id={props.id} className={className} ref={detailsRef} hidden={props.hidden}>
+    <details id={props.id} className={className} ref={detailsRef} hidden={props.hidden} style={props.style}>
       <summary
         aria-label={props.ariaLabel}
         aria-disabled={props.disabled ? true : undefined}
