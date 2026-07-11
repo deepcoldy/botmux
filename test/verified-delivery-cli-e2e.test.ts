@@ -8,7 +8,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openLedger } from '../src/verified-delivery/ledger.js';
@@ -65,6 +65,61 @@ function seedReported(taskId: string, ts = TS + 1000): void {
 }
 
 describe('verified-delivery CLI e2e（delivery 回路，零飞书）', () => {
+  it('`report` 缺少监管者坐标时先失败且不写入交付记录', () => {
+    const sessionId = 'session-without-report-target';
+    writeFileSync(join(dataDir, 'sessions-cli_test.json'), JSON.stringify({
+      [sessionId]: {
+        sessionId,
+        chatId: 'oc_test',
+        rootMessageId: 'oc_test',
+        title: 'not dispatched',
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        larkAppId: 'cli_test',
+      },
+    }));
+
+    const out = cli('report', [
+      '--session-id', sessionId,
+      '--task', 'task-no-route',
+      'should not persist',
+      '--artifact-text', 'evidence=PASS',
+    ]);
+
+    expect(out.status).toBe(1);
+    expect(out.raw).toContain('未写入交付记录');
+    expect(existsSync(join(ledgerBase, 'ledger.ndjson'))).toBe(false);
+  });
+
+  it('`report` 发送失败时不留下本地半成功记录', () => {
+    const sessionId = 'session-with-unreachable-target';
+    writeFileSync(join(dataDir, 'sessions-cli_missing_app.json'), JSON.stringify({
+      [sessionId]: {
+        sessionId,
+        chatId: 'oc_test',
+        rootMessageId: 'oc_test',
+        title: 'dispatched elsewhere',
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        larkAppId: 'cli_missing_app',
+        creatorOpenId: 'ou_supervisor',
+      },
+    }));
+
+    const out = cli('report', [
+      '--session-id', sessionId,
+      '--task', 'task-send-fails',
+      'should remain retryable',
+      '--artifact-text', 'evidence=PASS',
+    ]);
+
+    expect(out.status).toBe(1);
+    expect(out.raw).toContain('"delivered":false');
+    expect(out.raw).toContain('"localRecorded":false');
+    expect(out.raw).toContain('"retryable":true');
+    expect(existsSync(join(ledgerBase, 'ledger.ndjson'))).toBe(false);
+  });
+
   it('dispatched → `list --goal` 按 goal 群查到任务，status=dispatched', () => {
     seedDispatched('task-a', 'Goal A 子任务1');
     const out = delivery(['list', '--goal', GOAL_CHAT]);

@@ -59,12 +59,12 @@ describe('dispatch repo requirement wire format', () => {
 });
 
 describe('receiver-side repository preflight', () => {
-  it('accepts a matching repo on the local machine', () => {
+  it('accepts a matching repo on the local machine', async () => {
     const root = tempRoot('repo-local');
     const dataDir = tempRoot('repo-local-data');
     const path = makeRepo(root, 'project', 'git@github.com:acme/project.git');
 
-    const result = resolveRepoRequirement({
+    const result = await resolveRepoRequirement({
       requirement: 'https://github.com/acme/project.git',
       scanDirs: [root],
       dataDir,
@@ -77,14 +77,14 @@ describe('receiver-side repository preflight', () => {
     })]);
   });
 
-  it('resolves the same project to a different path on a remote machine', () => {
+  it('resolves the same project to a different path on a remote machine', async () => {
     const senderRoot = tempRoot('repo-sender');
     const receiverRoot = tempRoot('repo-receiver');
     const dataDir = tempRoot('repo-receiver-data');
     makeRepo(senderRoot, 'sender-checkout', 'https://git.example.com/team/project.git');
     const receiverPath = makeRepo(receiverRoot, 'different-local-name', 'git@git.example.com:team/project.git');
 
-    const result = resolveRepoRequirement({
+    const result = await resolveRepoRequirement({
       requirement: 'https://git.example.com/team/project',
       scanDirs: [receiverRoot],
       dataDir,
@@ -93,7 +93,46 @@ describe('receiver-side repository preflight', () => {
     expect(result).toMatchObject({ ok: true, path: receiverPath, matchedBy: 'remote' });
   });
 
-  it('prefers an explicitly configured linked worktree over the main checkout', () => {
+  it('simulates cross-device lookup asynchronously without sharing local paths', async () => {
+    const senderRoot = tempRoot('repo-async-sender');
+    const receiverRoot = tempRoot('repo-async-receiver');
+    const dataDir = tempRoot('repo-async-data');
+    makeRepo(senderRoot, 'sender-checkout', 'https://git.example.com/team/async-project.git');
+    const receiverPath = makeRepo(receiverRoot, 'receiver-checkout', 'git@git.example.com:team/async-project.git');
+
+    const pending = resolveRepoRequirement({
+      requirement: 'https://git.example.com/team/async-project',
+      scanDirs: [receiverRoot],
+      dataDir,
+    });
+
+    expect(pending).toBeInstanceOf(Promise);
+    await expect(pending).resolves.toMatchObject({
+      ok: true,
+      path: receiverPath,
+      matchedBy: 'remote',
+      source: 'scan',
+    });
+  });
+
+  it('bounds asynchronous discovery instead of scanning an unlimited tree', async () => {
+    const root = tempRoot('repo-async-bounded');
+    const dataDir = tempRoot('repo-async-bounded-data');
+    makeRepo(root, 'child/project', 'https://github.com/acme/bounded.git');
+
+    await expect(resolveRepoRequirement({
+      requirement: 'https://github.com/acme/bounded.git',
+      scanDirs: [root],
+      dataDir,
+      limits: { maxDirectories: 1 },
+    })).resolves.toMatchObject({
+      ok: false,
+      reason: 'not_found',
+      detail: expect.stringContaining('项目扫描达到上限'),
+    });
+  });
+
+  it('prefers an explicitly configured linked worktree over the main checkout', async () => {
     const root = tempRoot('repo-worktree-main');
     const worktreeRoot = tempRoot('repo-worktree-feature');
     const dataDir = tempRoot('repo-worktree-data');
@@ -106,7 +145,7 @@ describe('receiver-side repository preflight', () => {
     const worktreePath = join(worktreeRoot, 'project-feature');
     git(mainPath, 'worktree', 'add', '-b', 'feature', worktreePath);
 
-    const result = resolveRepoRequirement({
+    const result = await resolveRepoRequirement({
       requirement: 'git@github.com:acme/worktree.git',
       scanDirs: [worktreePath],
       dataDir,
@@ -115,57 +154,57 @@ describe('receiver-side repository preflight', () => {
     expect(result).toMatchObject({ ok: true, path: worktreePath, source: 'scan' });
   });
 
-  it('fails cleanly when the receiver does not have the project', () => {
+  it('fails cleanly when the receiver does not have the project', async () => {
     const root = tempRoot('repo-missing');
     const dataDir = tempRoot('repo-missing-data');
 
-    expect(resolveRepoRequirement({
+    await expect(resolveRepoRequirement({
       requirement: 'https://github.com/acme/missing.git',
       scanDirs: [root],
       dataDir,
-    })).toEqual({ ok: false, reason: 'not_found' });
+    })).resolves.toEqual({ ok: false, reason: 'not_found' });
   });
 
-  it('re-checks a stored path and rejects it after the directory is deleted', () => {
+  it('re-checks a stored path and rejects it after the directory is deleted', async () => {
     const root = tempRoot('repo-stale');
     const dataDir = tempRoot('repo-stale-data');
     const path = makeRepo(root, 'project', 'https://github.com/acme/stale.git');
     expect(rememberRepoCapability(path, ['stale-project'], dataDir)).toBeDefined();
     rmSync(path, { recursive: true, force: true });
 
-    expect(resolveRepoRequirement({
+    await expect(resolveRepoRequirement({
       requirement: 'https://github.com/acme/stale.git',
       scanDirs: [root],
       dataDir,
-    })).toMatchObject({ ok: false, reason: 'stale_path', stalePath: path });
+    })).resolves.toMatchObject({ ok: false, reason: 'stale_path', stalePath: path });
   });
 
-  it('rejects a stored path whose origin changed after registration', () => {
+  it('rejects a stored path whose origin changed after registration', async () => {
     const root = tempRoot('repo-remote-changed');
     const dataDir = tempRoot('repo-remote-changed-data');
     const path = makeRepo(root, 'project', 'https://github.com/acme/original.git');
     expect(rememberRepoCapability(path, [], dataDir)).toBeDefined();
     git(path, 'remote', 'set-url', 'origin', 'https://github.com/acme/other.git');
 
-    expect(resolveRepoRequirement({
+    await expect(resolveRepoRequirement({
       requirement: 'https://github.com/acme/original.git',
       scanDirs: [root],
       dataDir,
-    })).toMatchObject({ ok: false, reason: 'remote_mismatch', stalePath: path });
+    })).resolves.toMatchObject({ ok: false, reason: 'remote_mismatch', stalePath: path });
   });
 
-  it('keeps a stored alias bound to the remote it originally identified', () => {
+  it('keeps a stored alias bound to the remote it originally identified', async () => {
     const root = tempRoot('repo-alias-changed');
     const dataDir = tempRoot('repo-alias-changed-data');
     const path = makeRepo(root, 'project', 'https://github.com/acme/original.git');
     expect(rememberRepoCapability(path, ['project-alias'], dataDir)).toBeDefined();
     git(path, 'remote', 'set-url', 'origin', 'https://github.com/acme/other.git');
 
-    expect(resolveRepoRequirement({
+    await expect(resolveRepoRequirement({
       requirement: 'project-alias',
       scanDirs: [root],
       dataDir,
-    })).toMatchObject({ ok: false, reason: 'remote_mismatch', stalePath: path });
+    })).resolves.toMatchObject({ ok: false, reason: 'remote_mismatch', stalePath: path });
   });
 
   it('only records real git repos with a usable origin', () => {

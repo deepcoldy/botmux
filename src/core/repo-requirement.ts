@@ -7,11 +7,11 @@
  * can become stale; this module deliberately re-checks the directory, git
  * metadata, and remote URL at the point of use.
  */
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { readdir, stat as statAsync } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { config } from '../config.js';
-import { scanMultipleProjects } from '../services/project-scanner.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
 export const DISPATCH_REPO_HEADER = '[botmux-dispatch v1]';
@@ -174,6 +174,18 @@ function runGit(path: string, args: string[]): string | null {
   }
 }
 
+function runGitAsync(path: string, args: string[], timeoutMs: number): Promise<string | null> {
+  return new Promise((resolveResult) => {
+    execFile('git', ['-C', path, ...args], {
+      encoding: 'utf-8',
+      timeout: timeoutMs,
+      windowsHide: true,
+    }, (error, stdout) => {
+      resolveResult(error ? null : stdout.trim());
+    });
+  });
+}
+
 /** Re-check a candidate at the point of dispatch; persisted entries are hints. */
 export function inspectLocalRepo(path: string): RepoInspection {
   const candidate = resolve(path);
@@ -194,6 +206,26 @@ export function inspectLocalRepo(path: string): RepoInspection {
   // Persist/display only the credential-free canonical identity. A git remote
   // can legally contain an embedded token; it must never leak into the store,
   // ledger, logs, or group protocol block.
+  return { ok: true, path: resolve(topLevel), remoteUrl: remoteIdentity, remoteIdentity };
+}
+
+/** Async equivalent used on the daemon message path so git cannot stall other sessions. */
+export async function inspectLocalRepoAsync(path: string, gitTimeoutMs: number = 1_500): Promise<RepoInspection> {
+  const candidate = resolve(path);
+  try {
+    if (!(await statAsync(candidate)).isDirectory()) {
+      return { ok: false, reason: 'stale_path', detail: '路径不是目录' };
+    }
+  } catch {
+    return { ok: false, reason: 'stale_path', detail: '路径不存在' };
+  }
+
+  const topLevel = await runGitAsync(candidate, ['rev-parse', '--show-toplevel'], gitTimeoutMs);
+  if (!topLevel) return { ok: false, reason: 'not_git', detail: '不是 Git 仓库' };
+  const remoteUrl = await runGitAsync(topLevel, ['remote', 'get-url', 'origin'], gitTimeoutMs);
+  if (!remoteUrl) return { ok: false, reason: 'missing_remote', detail: '没有配置 origin 地址' };
+  const remoteIdentity = normalizeRepoRemote(remoteUrl);
+  if (!remoteIdentity) return { ok: false, reason: 'missing_remote', detail: '无法识别 origin 地址' };
   return { ok: true, path: resolve(topLevel), remoteUrl: remoteIdentity, remoteIdentity };
 }
 
@@ -228,15 +260,12 @@ function writeStore(dataDir: string, file: RepoCapabilityFile): void {
   atomicWriteFileSync(storePath(dataDir), JSON.stringify(file, null, 2) + '\n');
 }
 
-/** Remember a repo selected locally. Invalid/non-git paths are never recorded. */
-export function rememberRepoCapability(
-  path: string,
+function rememberInspectedRepoCapability(
+  inspected: InspectedRepo,
   aliases: string[] = [],
   dataDir: string = config.session.dataDir,
   now: number = Date.now(),
-): RepoCapabilityEntry | undefined {
-  const inspected = inspectLocalRepo(path);
-  if (!inspected.ok) return undefined;
+): RepoCapabilityEntry {
   const file = readStore(dataDir);
   const normalizedAliases = [...new Set([
     basename(inspected.path),
@@ -266,6 +295,18 @@ export function rememberRepoCapability(
   return entry;
 }
 
+/** Remember a repo selected locally. Invalid/non-git paths are never recorded. */
+export function rememberRepoCapability(
+  path: string,
+  aliases: string[] = [],
+  dataDir: string = config.session.dataDir,
+  now: number = Date.now(),
+): RepoCapabilityEntry | undefined {
+  const inspected = inspectLocalRepo(path);
+  if (!inspected.ok) return undefined;
+  return rememberInspectedRepoCapability(inspected, aliases, dataDir, now);
+}
+
 export function listRepoCapabilities(dataDir: string = config.session.dataDir): RepoCapabilityEntry[] {
   return readStore(dataDir).repos;
 }
@@ -280,27 +321,117 @@ function requirementMatch(
   return alias && entry.aliases.includes(alias) ? 'alias' : null;
 }
 
-/**
- * Resolve a repo requirement against persisted hints and live project scans.
- * Every matching stored entry is re-inspected before use, so deleted paths and
- * changed remotes fail closed instead of launching in the wrong project.
- */
-export function resolveRepoRequirement(input: {
+export interface RepoRequirementResolveLimits {
+  maxDepth?: number;
+  maxDirectories?: number;
+  maxCandidates?: number;
+  timeoutMs?: number;
+  gitTimeoutMs?: number;
+  inspectConcurrency?: number;
+}
+
+interface ResolvedRepoRequirementInput {
   requirement: string;
   scanDirs: string[];
   dataDir?: string;
-}): RepoRequirementResolution {
+  limits?: RepoRequirementResolveLimits;
+}
+
+const DEFAULT_ASYNC_RESOLVE_LIMITS = {
+  maxDepth: 3,
+  maxDirectories: 2_000,
+  maxCandidates: 64,
+  timeoutMs: 5_000,
+  gitTimeoutMs: 1_500,
+  inspectConcurrency: 8,
+} as const;
+
+const REPO_SCAN_SKIP_DIRS = new Set(['node_modules', 'vendor', 'dist']);
+
+async function discoverRepoCandidates(
+  roots: string[],
+  limits: Required<RepoRequirementResolveLimits>,
+  deadline: number,
+): Promise<{ paths: string[]; truncated: boolean }> {
+  const queue = roots.map((path) => ({ path, depth: 0 }));
+  const seen = new Set<string>();
+  const paths: string[] = [];
+  let directories = 0;
+  let truncated = false;
+
+  while (queue.length > 0) {
+    if (Date.now() >= deadline || directories >= limits.maxDirectories || paths.length >= limits.maxCandidates) {
+      truncated = true;
+      break;
+    }
+    const next = queue.shift()!;
+    const dir = resolve(next.path);
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    directories += 1;
+
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    if (entries.some((entry) => entry.name === '.git')) {
+      paths.push(dir);
+      continue;
+    }
+    if (next.depth >= limits.maxDepth) continue;
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (
+        !entry.isDirectory() ||
+        entry.name.startsWith('.') ||
+        REPO_SCAN_SKIP_DIRS.has(entry.name)
+      ) continue;
+      queue.push({ path: join(dir, entry.name), depth: next.depth + 1 });
+    }
+  }
+
+  return { paths, truncated };
+}
+
+function asyncResolveLimits(input?: RepoRequirementResolveLimits): Required<RepoRequirementResolveLimits> {
+  return {
+    maxDepth: Math.max(0, input?.maxDepth ?? DEFAULT_ASYNC_RESOLVE_LIMITS.maxDepth),
+    maxDirectories: Math.max(1, input?.maxDirectories ?? DEFAULT_ASYNC_RESOLVE_LIMITS.maxDirectories),
+    maxCandidates: Math.max(1, input?.maxCandidates ?? DEFAULT_ASYNC_RESOLVE_LIMITS.maxCandidates),
+    timeoutMs: Math.max(100, input?.timeoutMs ?? DEFAULT_ASYNC_RESOLVE_LIMITS.timeoutMs),
+    gitTimeoutMs: Math.max(100, input?.gitTimeoutMs ?? DEFAULT_ASYNC_RESOLVE_LIMITS.gitTimeoutMs),
+    inspectConcurrency: Math.max(1, input?.inspectConcurrency ?? DEFAULT_ASYNC_RESOLVE_LIMITS.inspectConcurrency),
+  };
+}
+
+function boundedGitTimeout(deadline: number, configuredMs: number): number {
+  const remaining = Math.max(100, deadline - Date.now());
+  // One inspection performs two git commands in sequence.
+  return Math.max(100, Math.min(configuredMs, Math.floor(remaining / 2)));
+}
+
+/**
+ * Daemon-safe resolver. Filesystem traversal and git subprocesses are async,
+ * bounded, and concurrent, so one large project root cannot freeze every
+ * session owned by the receiving bot.
+ */
+export async function resolveRepoRequirement(input: ResolvedRepoRequirementInput): Promise<RepoRequirementResolution> {
   const requirement = input.requirement.trim();
   const dataDir = input.dataDir ?? config.session.dataDir;
   const wantedRemote = normalizeRepoRemote(requirement);
+  const limits = asyncResolveLimits(input.limits);
+  const deadline = Date.now() + limits.timeoutMs;
   let staleMatch: RepoRequirementResolution | undefined;
   let storedAliasRemote: string | undefined;
 
   for (const entry of readStore(dataDir).repos) {
+    if (Date.now() >= deadline) break;
     const matchedBy = requirementMatch(requirement, entry);
     if (!matchedBy) continue;
     if (matchedBy === 'alias') storedAliasRemote ??= entry.remoteIdentity;
-    const inspected = inspectLocalRepo(entry.path);
+    const inspected = await inspectLocalRepoAsync(entry.path, boundedGitTimeout(deadline, limits.gitTimeoutMs));
     if (!inspected.ok) {
       staleMatch = { ok: false, reason: inspected.reason, detail: inspected.detail, stalePath: entry.path };
       continue;
@@ -315,17 +446,16 @@ export function resolveRepoRequirement(input: {
       };
       continue;
     }
-    rememberRepoCapability(inspected.path, entry.aliases, dataDir);
+    rememberInspectedRepoCapability(inspected, entry.aliases, dataDir);
     return { ...inspected, matchedBy, source: 'store' };
   }
 
   const scanDirs = [...new Set(input.scanDirs.map((dir) => resolve(dir)).filter((dir) => existsSync(dir)))];
-  // A configured root may itself be a linked worktree. Prefer that exact
-  // checkout before the recursive scanner expands the repository and sorts the
-  // main worktree first; otherwise a bot pinned to a feature worktree would be
-  // silently moved back to the main checkout merely because both share origin.
+  // A configured root may itself be a linked worktree. Check that exact path
+  // first so a recursive scan cannot silently move the task to its main checkout.
   for (const scanDir of scanDirs) {
-    const inspected = inspectLocalRepo(scanDir);
+    if (Date.now() >= deadline) break;
+    const inspected = await inspectLocalRepoAsync(scanDir, boundedGitTimeout(deadline, limits.gitTimeoutMs));
     if (!inspected.ok) continue;
     const aliases = [basename(scanDir).toLowerCase(), basename(inspected.path).toLowerCase()];
     const matchedBy = wantedRemote
@@ -335,25 +465,38 @@ export function resolveRepoRequirement(input: {
         ? 'alias'
         : null);
     if (!matchedBy) continue;
-    rememberRepoCapability(inspected.path, aliases, dataDir);
+    rememberInspectedRepoCapability(inspected, aliases, dataDir);
     return { ...inspected, matchedBy, source: 'scan' };
   }
 
-  const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, { includeWorktrees: true }) : [];
-  for (const project of projects) {
-    const inspected = inspectLocalRepo(project.path);
-    if (!inspected.ok) continue;
-    const aliases = [project.name.toLowerCase(), basename(inspected.path).toLowerCase()];
-    const matchedBy = wantedRemote
-      ? (inspected.remoteIdentity === wantedRemote ? 'remote' : null)
-      : (aliases.includes(requirement.toLowerCase()) &&
-          (!storedAliasRemote || inspected.remoteIdentity === storedAliasRemote)
-        ? 'alias'
-        : null);
-    if (!matchedBy) continue;
-    rememberRepoCapability(inspected.path, aliases, dataDir);
-    return { ...inspected, matchedBy, source: 'scan' };
+  const discovered = await discoverRepoCandidates(scanDirs, limits, deadline);
+  const rootSet = new Set(scanDirs);
+  const candidates = discovered.paths.filter((path) => !rootSet.has(resolve(path)));
+  for (let offset = 0; offset < candidates.length && Date.now() < deadline; offset += limits.inspectConcurrency) {
+    const batch = candidates.slice(offset, offset + limits.inspectConcurrency);
+    const timeoutMs = boundedGitTimeout(deadline, limits.gitTimeoutMs);
+    const inspectedBatch = await Promise.all(batch.map((path) => inspectLocalRepoAsync(path, timeoutMs)));
+    for (let i = 0; i < inspectedBatch.length; i++) {
+      const inspected = inspectedBatch[i]!;
+      if (!inspected.ok) continue;
+      const candidate = batch[i]!;
+      const aliases = [basename(candidate).toLowerCase(), basename(inspected.path).toLowerCase()];
+      const matchedBy = wantedRemote
+        ? (inspected.remoteIdentity === wantedRemote ? 'remote' : null)
+        : (aliases.includes(requirement.toLowerCase()) &&
+            (!storedAliasRemote || inspected.remoteIdentity === storedAliasRemote)
+          ? 'alias'
+          : null);
+      if (!matchedBy) continue;
+      rememberInspectedRepoCapability(inspected, aliases, dataDir);
+      return { ...inspected, matchedBy, source: 'scan' };
+    }
   }
 
-  return staleMatch ?? { ok: false, reason: 'not_found' };
+  const timedOut = Date.now() >= deadline;
+  return staleMatch ?? {
+    ok: false,
+    reason: 'not_found',
+    ...((discovered.truncated || timedOut) ? { detail: '项目扫描达到上限；请先在该设备选择一次项目完成登记' } : {}),
+  };
 }
