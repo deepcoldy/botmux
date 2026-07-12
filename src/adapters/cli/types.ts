@@ -146,7 +146,11 @@ export interface CliAdapter {
    *  slow-path submits (cold-start, slow UserPromptSubmit hooks, busy disk)
    *  that landed *after* the in-band retry budget exhausted are recognised
    *  and the user_notify warning is suppressed. The closure must be cheap
-   *  and idempotent — worker may invoke it multiple times. */
+   *  and idempotent — worker may invoke it multiple times. An adapter may also
+   *  attach a `recover` closure for a delayed, evidence-gated submit retry.
+   *  Recovery must not duplicate the user content: for example, an adapter may
+   *  press Enter only when it can still prove the original text is sitting in
+   *  the composer, but must not blindly paste the same prompt again. */
   writeInput(
     pty: PtyHandle,
     content: string,
@@ -158,6 +162,7 @@ export interface CliAdapter {
      *  terminal keybinding). Worker surfaces this immediately. */
     failureReason?: string;
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
+    recover?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;
 
   /** Optional: absolute path (with ~ expansion handled by caller) to the CLI's

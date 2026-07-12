@@ -26,6 +26,7 @@ interface CodexSubmitResult {
   submitted: boolean;
   cliSessionId?: string;
   recheck?: () => { submitted: boolean; cliSessionId?: string } | false;
+  recover?: () => Promise<{ submitted: boolean; cliSessionId?: string } | false>;
 }
 
 function readCliSessionId(parsed: unknown): string | undefined {
@@ -128,24 +129,19 @@ function isReattachPty(pty: PtyHandle): boolean {
   return pty.isReattach === true;
 }
 
-function clearCodexComposer(pty: PtyHandle): boolean {
-  try {
-    if (pty.sendSpecialKeys) {
-      if (pty.sendSpecialKeys('C-u') === false) return false;
-    }
-    else pty.write('\x15');
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function normaliseComposerText(text: string): string {
   return stripAnsiForLog(text).replace(/\s+/g, ' ').trim();
 }
 
 function screenShowsCodexPaste(screen: string, content: string): boolean {
-  const actual = normaliseComposerText(screen);
+  const stripped = stripAnsiForLog(screen);
+  // capture-pane contains the whole viewport, including earlier user prompts.
+  // Only inspect the latest Codex composer (the last line beginning with ›),
+  // otherwise old transcript text can masquerade as a still-pending paste.
+  const lineStart = stripped.lastIndexOf('\n›');
+  const composerStart = lineStart >= 0 ? lineStart + 1 : stripped.startsWith('›') ? 0 : -1;
+  if (composerStart < 0) return false;
+  const actual = normaliseComposerText(stripped.slice(composerStart));
   const expected = normaliseComposerText(content);
   if (!actual || !expected) return false;
   const visibleTail = expected.length > 80 ? expected.slice(-80) : expected;
@@ -188,6 +184,47 @@ function codexHistoryRecheck(
       ? { submitted: true, cliSessionId: late.cliSessionId }
       : false;
   };
+}
+
+async function recoverCodexSubmit(
+  pty: PtyHandle,
+  content: string,
+  historyPath: string,
+  baseByte: number,
+): Promise<{ submitted: boolean; cliSessionId?: string } | false> {
+  // History is authoritative. Check it again immediately before touching the
+  // terminal so a slow first submit can never be followed by another action.
+  const late = matchHistoryDelta(historyPath, baseByte, content);
+  if (late.found) {
+    return late.cliSessionId
+      ? { submitted: true, cliSessionId: late.cliSessionId }
+      : { submitted: true };
+  }
+
+  // Never paste the prompt again: identical history rows cannot tell which
+  // attempt they confirm, so a delayed first append could falsely bless a
+  // second paste and leave it queued as a duplicate. The only safe recovery is
+  // one Enter when the original text is visibly still in Codex's composer.
+  if (!pty.captureViewport) return false;
+  let screen: string;
+  try { screen = pty.captureViewport(); } catch { return false; }
+  if (!screenShowsCodexPaste(screen, content)) return false;
+
+  try {
+    if (pty.sendSpecialKeys) {
+      if (pty.sendSpecialKeys('Enter') === false) return false;
+    } else {
+      pty.write('\r');
+    }
+  } catch {
+    return false;
+  }
+
+  const recovered = await waitForHistoryAppend(historyPath, baseByte, content, 3_200);
+  if (!recovered.found) return false;
+  return recovered.cliSessionId
+    ? { submitted: true, cliSessionId: recovered.cliSessionId }
+    : { submitted: true };
 }
 
 async function submitCodexPrompt(
@@ -357,9 +394,11 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // bracketed paste lands the whole multi-line message in the composer
       // un-submitted, with the process staying alive and \t absorbed cleanly.
       //
-      // The history.jsonl verification loop below still polls for the
-      // submitted prefix; on a hard miss it now clears the composer and
-      // re-drives the submit once before handing the worker a deferred recheck.
+      // The history.jsonl verification loop below still polls for the exact
+      // submitted text. On a hard miss it hands the worker a deferred recheck
+      // plus an evidence-gated Enter recovery; it never pastes the same prompt
+      // twice because a slow first history append makes attempt attribution
+      // fundamentally ambiguous.
       const historyPath = codexHistoryPath();
       const baseByte = currentFileSize(historyPath);
       const reattach = isReattachPty(pty);
@@ -367,25 +406,11 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const firstAttempt = await submitCodexPrompt(pty, content, historyPath, baseByte, initialSettleMs, reattach);
       if (firstAttempt.submitted) return firstAttempt;
 
-      if (!clearCodexComposer(pty)) return firstAttempt;
-      await delay(150);
-
-      // The last Enter may have committed even though history.jsonl missed the
-      // first attempt's in-band budget. Recheck after the clear/settle gap and
-      // before repasting: otherwise a late history append would prove the first
-      // submit landed only after we had already driven the same prompt twice.
-      const lateFirstSubmit = firstAttempt.recheck?.();
-      if (lateFirstSubmit && lateFirstSubmit.submitted) return lateFirstSubmit;
-
-      const retrySettleMs = reattach ? 800 : 400;
-      const secondAttempt = await submitCodexPrompt(pty, content, historyPath, baseByte, retrySettleMs, reattach);
-      if (secondAttempt.submitted) return secondAttempt;
-
-      // In-band budget exhausted. Hand the worker a recheck closure: a
-      // slow-startup Codex (or one whose first turn is delayed by a heavy
-      // initial prompt) may still append our marker after the retries gave
-      // up, and the worker re-scans on a delay before warning the user.
-      return secondAttempt;
+      if (!firstAttempt.recheck) return firstAttempt;
+      return {
+        ...firstAttempt,
+        recover: () => recoverCodexSubmit(pty, content, historyPath, baseByte),
+      };
     },
 
     completionPattern: undefined,

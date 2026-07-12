@@ -3362,7 +3362,9 @@ const SUBMIT_DEFERRED_RECHECK_MS = 20_000;
 /** Worker-side handler for `submitted: false`. Defers the user-facing
  *  warning and runs the adapter-supplied `recheck` closure first; if the
  *  message has shown up in the transcript by then (slow path, hook delay),
- *  suppresses the warning entirely. Adapters without a recheck still fall
+ *  suppresses the warning entirely. When the message is still stuck and the
+ *  adapter supplies an evidence-gated `recover`, the worker tries that once
+ *  before warning. Adapters without a recheck still fall
  *  through to the warning after the same delay so the UX is uniform.
  *
  *  `bridgeTurnId` is the BridgeTurnQueue mark created right before the
@@ -3374,6 +3376,7 @@ const SUBMIT_DEFERRED_RECHECK_MS = 20_000;
 function scheduleSubmitFailureNotify(
   msg: string,
   recheck: (() => SubmitRecheckResult | Promise<SubmitRecheckResult>) | undefined,
+  recover: (() => SubmitRecheckResult | Promise<SubmitRecheckResult>) | undefined,
   transcriptLabel: string,
   bridgeTurnId?: string,
   failureReason?: string,
@@ -3427,11 +3430,35 @@ function scheduleSubmitFailureNotify(
       }
     }
 
-    const action = decideSubmitConfirmationAction({
+    let action = decideSubmitConfirmationAction({
       recheckSubmitted,
       usageLimitDetected: usageLimitTracker.detectedThisTurn(turnSeq),
       activityEvidence: submitActivityEvidenceSince(activityBaselineMs),
     });
+
+    // Recovery is deliberately last and narrow: only a conclusively stuck
+    // submit reaches this branch. Codex uses it to press Enter once when the
+    // original prompt is visibly still in the composer; it never re-pastes.
+    if (action.kind === 'notify-stuck' && recover) {
+      try {
+        const recoverResult = await recover();
+        const recovered = typeof recoverResult === 'boolean'
+          ? recoverResult
+          : recoverResult.submitted === true;
+        if (recovered) {
+          cliSessionId = typeof recoverResult === 'object' && recoverResult && typeof recoverResult.cliSessionId === 'string'
+            ? recoverResult.cliSessionId
+            : cliSessionId;
+          action = decideSubmitConfirmationAction({
+            recheckSubmitted: true,
+            usageLimitDetected: false,
+          });
+          log(`Deferred evidence-gated recovery confirmed submit in ${transcriptLabel}. preview="${preview}"`);
+        }
+      } catch (err: any) {
+        log(`Deferred recovery threw (${err?.message ?? err}); falling through to warning.`);
+      }
+    }
 
     switch (action.kind) {
       case 'suppress-confirmed':
@@ -3659,7 +3686,7 @@ async function flushPending(): Promise<void> {
         // nulled `backend` and told the user the CLI exited) — nothing more to
         // do. Otherwise surface it as a submit failure so the message isn't
         // silently lost.
-        if (backend) scheduleSubmitFailureNotify(msg, undefined, '会话 JSONL', bridgeTurnId, undefined, submitTurnId, submitSenderOpenId, turnSeq);
+        if (backend) scheduleSubmitFailureNotify(msg, undefined, undefined, '会话 JSONL', bridgeTurnId, undefined, submitTurnId, submitSenderOpenId, turnSeq);
         break;
       }
       // Persist any sessionId the adapter observed via authoritative sources
@@ -3677,7 +3704,7 @@ async function flushPending(): Promise<void> {
       // nulled backend) the user already got a "CLI exited" notice; don't also
       // nag that the submit wasn't confirmed.
       if (result && result.submitted === false && backend) {
-        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId, result.failureReason, submitTurnId, submitSenderOpenId, turnSeq);
+        scheduleSubmitFailureNotify(msg, result.recheck, result.recover, '会话 JSONL', bridgeTurnId, result.failureReason, submitTurnId, submitSenderOpenId, turnSeq);
       }
       // All structured bridges now drain every pending message in one flush:
       // Claude's BridgeTurnQueue handles `attachment(queued_command)` events
@@ -6048,7 +6075,7 @@ process.on('message', async (raw: unknown) => {
                 codexBridgeNotifyCliSessionId(result.cliSessionId);
               }
               if (result && result.submitted === false) {
-                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history', undefined, result.failureReason, submitTurnId, submitSenderOpenId, turnSeq);
+                scheduleSubmitFailureNotify(content, result.recheck, result.recover, 'Codex history', undefined, result.failureReason, submitTurnId, submitSenderOpenId, turnSeq);
               }
             } catch (err: any) {
               log(`Codex adopt writeInput error: ${err.message}`);
