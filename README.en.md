@@ -40,7 +40,7 @@
 
 ### Design Philosophy
 
-Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Cursor, Gemini, OpenCode, Antigravity, GitHub Copilot, Kimi Code) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
+Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Cursor, Gemini, OpenCode, Antigravity, GitHub Copilot, Kimi Code, Grok Build) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
 
 ### Key Advantages
 
@@ -52,7 +52,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | CLI Capabilities | Full runtime (hooks, memory, plan mode, skills, `/` commands) | SDK API subset, missing features must be reimplemented |
 | CLI Upgrades | Zero-adaptation automatic benefit | Must track SDK version changes |
 | Memory / Context | Reuses CLI's built-in memory system, improves as the CLI evolves | Must build custom memory system, duplicating CLI-native capabilities |
-| Multi-CLI Support | 8 CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot / Kimi Code) | Tied to a single SDK, cannot switch CLIs |
+| Multi-CLI Support | Many CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot / Kimi Code / Grok Build, …) | Tied to a single SDK, cannot switch CLIs |
 | Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
 | Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
 | Multi-Topic Collaboration | A lead bot auto-splits the task, opens multiple topics, and dispatches several bots to work in parallel (coder + reviewer), with a Lark task list as the shared progress board | Usually manual one-by-one assignment, no unified progress board |
@@ -64,7 +64,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 ## Prerequisites
 
 - **Node.js** >= 22
-- **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `genius`, `opencode`, `hermes`, `seed` (Seed CLI, a Claude Code fork), `relay` (Relay CLI, the new release of Seed), `pi`, `omp` (oh-my-pi, a Pi fork), `copilot` (GitHub Copilot CLI), `traex` (TRAE CLI), `mircli` (Mir CLI), `agy` (Antigravity), or `kimi` (Kimi Code) in PATH)
+- **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `genius`, `opencode`, `hermes`, `seed` (Seed CLI, a Claude Code fork), `relay` (Relay CLI, the new release of Seed), `pi`, `omp` (oh-my-pi, a Pi fork), `copilot` (GitHub Copilot CLI), `traex` (TRAE CLI), `mircli` (Mir CLI), `agy` (Antigravity), `kimi` (Kimi Code), or `grok` (Grok Build) in PATH)
   - **CoCo requires `0.120.32+`**: type-ahead (sending a new message while a turn is still running, parked in CoCo's own message queue) relies on 0.120.32+ behavior; earlier versions may drop or serialize input while busy — upgrade before use
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
 - **CJK fonts** (only needed for screenshot rendering of Chinese text / emoji):
