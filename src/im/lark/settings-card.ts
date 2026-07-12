@@ -54,6 +54,7 @@ const TIME_REGEX = /^([01]\d|2[0-3]):[0-5]\d$/;
 const TOGGLE_FIELDS: ReadonlySet<string> = new Set([
   'publicReadOnly',
   'openTerminalInFeishu',
+  'enableLocalCliOpen',
   'autoUpdate',
   'autoRestart',
 ]);
@@ -396,7 +397,7 @@ export function buildPatchFromAction(
         return { ok: false, error: 'invalid_value' };
       }
       const next = raw === 'true';
-      if (field === 'publicReadOnly' || field === 'openTerminalInFeishu') {
+      if (field === 'publicReadOnly' || field === 'openTerminalInFeishu' || field === 'enableLocalCliOpen') {
         return { ok: true, value: { [field]: next } };
       }
       return { ok: true, value: { maintenance: { [field]: { enabled: next } } } };

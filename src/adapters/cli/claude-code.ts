@@ -447,6 +447,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
   let cachedBin: string | undefined;
   return {
     id: variant.id,
+    mcpGateway: {
+      configPath: variant.stateJsonPath,
+      format: 'claude-json',
+    },
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     supportsTypeAhead: true,
     // Isolation = worker-side whole-process Seatbelt wrapper. Claude's built-in

@@ -14,6 +14,31 @@ import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
+import * as substituteModeStore from '../services/substitute-mode-store.js';
+import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
+
+/** Whether read isolation can actually be ENFORCED for this bot right now — the
+ *  SAME gate the worker fail-closes on (adapter support + no wrapperCli + macOS).
+ *  The dashboard uses it to disable the toggle and to reject persisting an
+ *  unenforceable flag, so flipping it on can never brick the bot's next session
+ *  (the worker would otherwise refuse to start). Turning it OFF is always allowed. */
+function readIsolationEnforceableFor(cfg: { cliId?: string; cliPathOverride?: string; wrapperCli?: string }): boolean {
+  let adapterSupports = false;
+  try {
+    adapterSupports = createCliAdapterSync(cfg.cliId as never, cfg.cliPathOverride).supportsReadIsolation === true;
+  } catch { /* CLI missing / unknown adapter → treat as unenforceable */ }
+  return evaluateReadIsolationGate({
+    configured: true,
+    adapterSupports,
+    wrapperCliSet: !!cfg.wrapperCli,
+    platform: process.platform,
+    sessionDataDirSet: true,
+  }).enabled;
+}
+function readIsolationEnforceable(larkAppId: string): boolean {
+  try { return readIsolationEnforceableFor(getBot(larkAppId).config); } catch { return false; }
+}
 import * as observedBotsStore from '../services/observed-bots-store.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
@@ -34,9 +59,9 @@ import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, getUserProfile } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
-import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
@@ -65,6 +90,7 @@ import {
   withGoalAttentionLiveRisks,
 } from './goal-attention.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
+import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
 
 // Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
 // deps). Until set, workflow-targeted triggers report not-implemented.
@@ -489,14 +515,42 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
       [...new Set(messages.filter(m => m.senderType === 'user' && m.senderId).map(m => m.senderId))]
         .map(async id => { senders.set(id, await getUserProfile(appId, id)); }),
     );
+    // Bot sender ids are scoped to the observing app. Reuse the chat-member
+    // resolver (cross-ref + observed bot roster) instead of assuming every
+    // non-user message came from the bot that owns this dashboard session.
+    const botMembers: ChatBotMember[] = await listChatBotMembers(appId, session.chatId).catch(() => [] as ChatBotMember[]);
+    let botInfos: HistoryBotInfo[] = [];
+    try {
+      const parsed = JSON.parse(readFileSync(join(config.session.dataDir, 'bots-info.json'), 'utf8'));
+      if (Array.isArray(parsed)) botInfos = parsed;
+    } catch { /* missing/corrupt cache degrades to name/open_id placeholders */ }
+    // listChatBotMembers can be temporarily unavailable during startup. Always
+    // retain a local self-bot fallback so its own messages still have identity.
+    try {
+      const self = getBot(appId);
+      if (self.botOpenId && !botMembers.some(member => member.openId === self.botOpenId)) {
+        const selfName = self.botName || appId;
+        botMembers.push({
+          openId: self.botOpenId,
+          displayName: selfName,
+          name: selfName,
+          larkAppId: appId,
+          source: 'configured',
+          mentionable: true,
+          mentionSource: 'self',
+          hasTeamRole: false,
+        });
+      }
+      if (!botInfos.some(info => info.larkAppId === appId)) {
+        botInfos.push({ larkAppId: appId, botOpenId: self.botOpenId, botName: self.botName, botAvatarUrl: self.botAvatarUrl });
+      }
+    } catch { /* session record may outlive a removed bot config */ }
+
     jsonRes(res, 200, {
       ok: true,
       scope: session.scope ?? 'thread',
       ownerOpenId: session.ownerOpenId,
-      messages: messages.map(m => {
-        const p = m.senderType === 'user' ? senders.get(m.senderId) : null;
-        return p ? { ...m, senderName: p.name, senderAvatar: p.avatarUrl } : m;
-      }),
+      messages: enrichHistorySenders(messages, senders, botMembers, botInfos),
     });
   } catch (err: any) {
     jsonRes(res, 502, { ok: false, error: String(err?.message ?? err) });
@@ -1285,26 +1339,49 @@ ipcRoute('DELETE', '/api/oncall/:chatId', async (_req, res, p) => {
 });
 
 // ─── Role management (dashboard) ───────────────────────────────────────────
+// POST   /api/roles/batch   body: {chatIds: string[]} → role snapshots
 // GET    /api/roles/:chatId  → { chatId, content, byteLength, injectMode, effectiveContent, effectiveSource }
 // PUT    /api/roles/:chatId  body: {content?, injectMode?} → write role file and/or injection mode
 // DELETE /api/roles/:chatId  → remove role file (and injection-mode sidecar)
 
-ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
-  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
-  const content = resolveRoleFile(cachedLarkAppId, p.chatId);
-  const effective = resolveRole(cachedLarkAppId, p.chatId);
-  jsonRes(res, 200, {
-    chatId: p.chatId,
+const MAX_ROLE_BATCH_CHAT_IDS = 1_000;
+
+function dashboardRolePayload(larkAppId: string, chatId: string): Record<string, unknown> {
+  const content = resolveRoleFile(larkAppId, chatId);
+  const effective = resolveRole(larkAppId, chatId);
+  return {
+    chatId,
     content,
     byteLength: content ? Buffer.byteLength(content, 'utf-8') : 0,
     hasRole: content !== null,
-    injectMode: readRoleInjectMode(cachedLarkAppId, p.chatId),
+    injectMode: readRoleInjectMode(larkAppId, chatId),
     effectiveContent: effective.content,
     effectiveSource: effective.source,
     effectiveByteLength: effective.content ? Buffer.byteLength(effective.content, 'utf-8') : 0,
     hasEffectiveRole: effective.content !== null,
-  });
+  };
+}
+
+ipcRoute('POST', '/api/roles/batch', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { chatIds?: unknown };
+  try { body = await readJsonBody<{ chatIds?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!Array.isArray(body.chatIds)) return jsonRes(res, 400, { ok: false, error: 'chat_ids_required' });
+  if (body.chatIds.length > MAX_ROLE_BATCH_CHAT_IDS) {
+    return jsonRes(res, 400, { ok: false, error: 'too_many_chat_ids' });
+  }
+  if (body.chatIds.some(chatId => typeof chatId !== 'string' || !isValidRoleChatId(chatId))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  }
+  const chatIds = [...new Set(body.chatIds as string[])];
+  jsonRes(res, 200, { roles: chatIds.map(chatId => dashboardRolePayload(cachedLarkAppId!, chatId)) });
+});
+
+ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  jsonRes(res, 200, dashboardRolePayload(cachedLarkAppId, p.chatId));
 });
 
 ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
@@ -1483,6 +1560,17 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const m = getBot(cachedLarkAppId).config.maxLiveWorkers;
     if (typeof m === 'number' && Number.isInteger(m) && m > 0) maxLiveWorkers = m;
   } catch { /* default unlimited */ }
+  let logicalSessionCount = 0;
+  let residentSessionCount = 0;
+  let dormantSessionCount = 0;
+  const registry = getActiveSessionsRegistry();
+  if (registry) {
+    logicalSessionCount = registry.size;
+    for (const ds of registry.values()) {
+      if (ds.worker && !ds.worker.killed) residentSessionCount++;
+      else if (!ds.session.queued) dormantSessionCount++;
+    }
+  }
   // startupCommands → newline-joined for the dashboard textarea (one per line).
   let startupCommands = '';
   try {
@@ -1531,6 +1619,10 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
+    readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
+    // Full enforceability (adapter support + no wrapperCli + macOS) — the UI
+    // disables the toggle wherever the worker would fail-close on it.
+    readIsolationSupported: readIsolationEnforceable(cachedLarkAppId),
     disableStreamingCard: cardPrefs.disableStreamingCard,
     silentTurnReactions: cardPrefs.silentTurnReactions,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
@@ -1541,6 +1633,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
     regularGroupReplyMode: cardPrefs.regularGroupReplyMode,
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
+    substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
@@ -1552,6 +1645,9 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     // value when this bot has no explicit override (prompt/global/off).
     skillInjectionDefault: globalBuiltinSkillInjectionDefault(),
     maxLiveWorkers,
+    logicalSessionCount,
+    residentSessionCount,
+    dormantSessionCount,
     startupCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
@@ -1603,6 +1699,29 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   const r = await cardPrefsStore.updateBotCardPrefs(cachedLarkAppId, patch);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, ...r.prefs });
+});
+
+ipcRoute('PUT', '/api/bot-substitute-mode', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const rec = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+  // Resolve the submitted email / union_id entries into runtime-matchable
+  // open_ids (+ fresh display names) using this bot's own credentials before
+  // persisting; unresolvable entries are dropped but reported back for the UI.
+  const { targets, resolution } = await substituteModeStore.resolveSubstituteTargets(
+    cachedLarkAppId,
+    rec.targets,
+    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfile },
+  );
+  const r = await substituteModeStore.updateBotSubstituteMode(cachedLarkAppId, {
+    enabled: rec.enabled === true,
+    targets,
+    disclosure: rec.disclosure === 'none' ? 'none' : 'prefix',
+  });
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason, resolution });
+  jsonRes(res, 200, { ok: true, substituteMode: r.substituteMode, resolution });
 });
 
 // Per-bot explicit `/summary` history range. Body `{ limit, sinceHours }`.
@@ -1739,12 +1858,22 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   }
   const model = typeof body.model === 'string' ? body.model.trim() : '';
 
+  // If the new CLI/wrapper can no longer enforce a currently-on read isolation,
+  // auto-clear the flag here so the next session doesn't fail-close on it. (The
+  // read-isolation toggle validates at enable time; changing the agent afterwards
+  // is the other way a bot could end up configured-but-unenforceable.)
+  let readIsolationCleared = false;
   const r = await rmwBotEntry(cachedLarkAppId, (entry) => {
     entry.cliId = selected.cliId;
     if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
     else delete entry.wrapperCli;
     if (model) entry.model = model;
     else delete entry.model;
+    if (entry.readIsolation === true &&
+        !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: entry.cliPathOverride, wrapperCli: selected.wrapperCli })) {
+      delete entry.readIsolation;
+      readIsolationCleared = true;
+    }
     return { write: true, result: null };
   });
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
@@ -1754,6 +1883,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
   else bot.config.wrapperCli = undefined;
   bot.config.model = model || undefined;
+  if (readIsolationCleared) bot.config.readIsolation = false;
 
   // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
   // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
@@ -1767,6 +1897,12 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     model: model || null,
     selectionKey,
     closedMismatchedSessions,
+    // Report the (possibly auto-cleared) read-isolation state + whether the new
+    // agent can still enforce it, so the dashboard updates its toggle immediately
+    // instead of showing a stale enabled/supported state until a full refetch.
+    readIsolation: bot.config.readIsolation === true,
+    readIsolationSupported: readIsolationEnforceableFor(bot.config),
+    readIsolationCleared,
   });
 });
 
@@ -1971,6 +2107,33 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
+});
+
+// Per-bot read-isolation toggle. Body `{ enabled: boolean }`. When on, this bot's
+// CLI sessions run under macOS Seatbelt read-deny (siblings' creds/sessions/content
+// unreadable). The macOS counterpart of the file sandbox above.
+ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { enabled?: unknown };
+  try { body = await readJsonBody<{ enabled?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const enable = body.enabled === true;
+  // The worker FAIL-CLOSES (refuses to start the session) for a configured
+  // readIsolation that can't be enforced: non-darwin, an adapter without
+  // supportsReadIsolation, or a wrapperCli gateway. Reject enabling it in exactly
+  // those cases so the toggle can never brick the bot's next session. (Turning it
+  // OFF is always allowed — recovers a flag that became unenforceable.)
+  if (enable && !readIsolationEnforceable(cachedLarkAppId)) {
+    return jsonRes(res, 400, { ok: false, error: 'read_isolation_unenforceable' });
+  }
+  const r = await sandboxStore.updateBotReadIsolation(cachedLarkAppId, enable);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  // Read isolation only takes effect at COLD spawn (provisionIsolatedBotHome +
+  // Seatbelt wrapper run then). Suspend this bot's active sessions so the next
+  // message cold-restarts under the new state — otherwise close+resume would keep
+  // running the old, un-provisioned state and the toggle would silently no-op.
+  const suspendedSessions = await suspendActiveSessionsForBot(cachedLarkAppId);
+  jsonRes(res, 200, { ok: true, readIsolation: r.readIsolation, suspendedSessions });
 });
 
 // 实时切换 UI 语言（locale），无需重启 daemon。`botmux lang` / Dashboard 语言开关

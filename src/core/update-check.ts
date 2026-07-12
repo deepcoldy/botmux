@@ -102,8 +102,8 @@ export interface FetchOpts {
 }
 
 /**
- * The npm `latest` dist-tag version — the authoritative target of
- * `npm install -g botmux@latest`. null on any failure (offline, non-200,
+ * The npm registry's `latest` dist-tag version — the authoritative target for
+ * both npm and pnpm updates. null on any failure (offline, non-200,
  * malformed body, or a version string we can't parse).
  */
 export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | null> {

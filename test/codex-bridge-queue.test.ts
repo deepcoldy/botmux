@@ -403,7 +403,9 @@ describe('CodexBridgeQueue', () => {
     expect(q.drainEmittable()).toEqual([]);
 
     q.ingest([{ uuid: 'a1', timestampMs: 130, kind: 'assistant_final', text: 'right session reply', sourceSessionId: 'h1' }]);
-    expect(q.drainEmittable()[0].finalText).toBe('right session reply');
+    const ready = q.drainEmittable()[0];
+    expect(ready.finalText).toBe('right session reply');
+    expect(ready.sourceSessionId).toBe('h1');
   });
 
   it('clearPending wipes queue state', () => {

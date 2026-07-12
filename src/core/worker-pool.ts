@@ -2,7 +2,7 @@
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
  */
-import { fork, execSync, type ChildProcess, type ForkOptions } from 'node:child_process';
+import { execSync, fork, type ChildProcess, type ForkOptions } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
@@ -33,7 +33,7 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { isSuspendableBackendType, getSessionPersistentBackendType, persistentSessionName, killPersistentSession } from './persistent-backend.js';
-import { getBot, getAllBots, resolveBrandLabel } from '../bot-registry.js';
+import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -48,14 +48,18 @@ import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.js';
 import { prepareSessionSkillPrompt } from './skills/session-runtime.js';
 import { prepareSkillDelivery } from './skills/delivery.js';
+import { resolveEffectivePluginIds } from './plugins/effective.js';
+import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin } from './botmux-wrapper.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -74,6 +78,9 @@ export interface WorkerPoolCallbacks {
   closeSession: (ds: DaemonSession) => void;
   /** Turn boundary signal used by goal watchdog to inspect unreported tasks. */
   onSessionIdleOrExit?: (ds: DaemonSession, reason: 'idle' | 'limited' | 'exit') => void;
+  /** Re-check the per-bot resident-session cap after a process starts or an
+   * over-cap busy session becomes idle. Optional for unit-test callers. */
+  enforceLiveSessionCap?: () => void;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -193,6 +200,51 @@ export function writableTerminalLinkFor(ds: DaemonSession): string | undefined {
   } catch { return undefined; }
   if (!ds.workerPort || !ds.workerToken) return undefined;
   return buildTerminalUrl(ds, { write: true });
+}
+
+function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
+  if (!isLocalCliOpenEnabled() || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+    ds.pendingLocalCliButtonRefresh = undefined;
+    return;
+  }
+  if (ds.streamCardId === CARD_POSTING_SENTINEL) {
+    ds.pendingLocalCliButtonRefresh = true;
+    return;
+  }
+  if (!ds.streamCardId || !ds.workerPort) return;
+  ds.pendingLocalCliButtonRefresh = undefined;
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const status = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    buildTerminalUrl(ds),
+    ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId),
+    ds.lastScreenContent ?? '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    ds.currentImageKey,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    status === 'limited' ? ds.usageLimit : undefined,
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+  );
+  scheduleCardPatch(ds, cardJson);
+}
+
+function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
+  if (!ds.pendingLocalCliButtonRefresh) return;
+  ds.pendingLocalCliButtonRefresh = undefined;
+  scheduleLocalCliOpenReadinessPatch(ds);
+}
+
+function clearPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
+  ds.pendingLocalCliButtonRefresh = undefined;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -332,6 +384,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     localeForBot(ds.larkAppId),
     ds.usageLimit,
     writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -518,6 +571,7 @@ export async function postFreshStreamingCard(
     localeForBot(ds.larkAppId),
     cardUsageLimit(ds),
     writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
@@ -529,12 +583,14 @@ export async function postFreshStreamingCard(
     ds.streamCardPending = false;
     persistStreamCardState(ds);
     recallFrozenCards(ds);
+    flushPendingLocalCliOpenReadinessPatch(ds);
     logger.info(`[${tag(ds)}] Posted streaming card via /card`);
     return true;
   } catch (err) {
     ds.streamCardId = prevCardId;
     ds.streamCardNonce = prevNonce;
     ds.streamCardPending = prevPending;
+    flushPendingLocalCliOpenReadinessPatch(ds);
     logger.warn(`[${tag(ds)}] /card POST failed: ${err}`);
     return false;
   }
@@ -671,6 +727,7 @@ function buildWritableTerminalCard(ds: DaemonSession): string | null {
     true,             // showManageButtons — write-link card includes restart & close
     !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
     localeForBot(ds.larkAppId),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
   );
 }
 
@@ -905,117 +962,16 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   skillsInstalledCliIds.add(cliId);
 }
 
-// ─── Legacy MCP config cleanup ──────────────────────────────────────────────
-//
-// botmux used to register itself as an MCP server in each CLI's config so the
-// CLI could call send_to_thread / get_thread_messages / list_bots.  Those
-// tools have since been migrated to `botmux` subcommands + Skills.  The old
-// MCP entry is now dead — if we leave it, the CLI will try to spawn a
-// non-existent server on startup and users see scary errors.
-//
-// For each CLI, best-effort remove any `botmux` entry from its MCP config.
-// Runs once per CLI per daemon lifecycle, same lifecycle as ensureCliSkills.
-
-/** Track which CLI adapters have had legacy MCP config cleaned this daemon lifecycle */
-const legacyMcpCleanedCliIds = new Set<string>();
-
-/** Remove a key from a JSON config file at the given dotted path. Best-effort. */
-function removeJsonKey(configPath: string, pathSegments: string[], keyToRemove: string): boolean {
-  try {
-    if (!existsSync(configPath)) return false;
-    const raw = readFileSync(configPath, 'utf-8');
-    const data = JSON.parse(raw);
-    let node: any = data;
-    for (const seg of pathSegments) {
-      if (!node || typeof node !== 'object' || !(seg in node)) return false;
-      node = node[seg];
-    }
-    if (!node || typeof node !== 'object' || !(keyToRemove in node)) return false;
-    delete node[keyToRemove];
-    // 原子写：这里改的是外部 CLI 自己的热配置文件（如 ~/.claude.json），
-    // 裸写半截会弄坏 CLI 的状态。
-    atomicWriteFileSync(configPath, JSON.stringify(data, null, 2));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Try running `<cli> mcp remove botmux`. Returns true if the command ran. */
-function tryCliMcpRemove(binName: string): boolean {
-  try {
-    execSync(`${binName} mcp remove botmux`, { stdio: 'ignore', timeout: 10_000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Remove legacy `botmux` MCP server registration from the given CLI's config.
- * Idempotent — runs once per CLI per daemon lifecycle.  Best-effort: any
- * failure is swallowed; we never want to block worker startup.
- */
-export function cleanupLegacyMcpConfig(cliId: CliId): void {
-  if (legacyMcpCleanedCliIds.has(cliId)) return;
-  legacyMcpCleanedCliIds.add(cliId);
-
-  try {
-    const home = homedir();
-    switch (cliId) {
-      case 'claude-code': {
-        // ~/.claude.json → { mcpServers: { botmux } }
-        if (removeJsonKey(join(home, '.claude.json'), ['mcpServers'], 'botmux')) {
-          logger.info(`[legacy-mcp] Removed botmux entry from ~/.claude.json`);
-        }
-        break;
-      }
-      case 'aiden': {
-        // ~/.aiden/.mcp.json or cwd/.mcp.json → { mcpServers: { botmux } }
-        for (const p of [join(home, '.aiden', '.mcp.json'), join(process.cwd(), '.mcp.json')]) {
-          if (removeJsonKey(p, ['mcpServers'], 'botmux')) {
-            logger.info(`[legacy-mcp] Removed botmux entry from ${p}`);
-          }
-        }
-        break;
-      }
-      case 'opencode':
-      case 'mtr': {
-        // ~/.config/opencode/{opencode,mtr}.json → { mcp: { botmux } } or { mcpServers: { botmux } }
-        const file = cliId === 'mtr' ? 'mtr.json' : 'opencode.json';
-        const p = join(home, '.config', 'opencode', file);
-        const removed =
-          removeJsonKey(p, ['mcp'], 'botmux') ||
-          removeJsonKey(p, ['mcpServers'], 'botmux') ||
-          removeJsonKey(p, ['mcp', 'servers'], 'botmux');
-        if (removed) logger.info(`[legacy-mcp] Removed botmux entry from ${p}`);
-        break;
-      }
-      case 'coco':
-      case 'codex':
-      case 'gemini': {
-        // These CLIs managed MCP via their own subcommand.  Skip silently if
-        // the binary isn't on PATH — nothing to clean then.
-        if (tryCliMcpRemove(cliId)) {
-          logger.info(`[legacy-mcp] Ran \`${cliId} mcp remove botmux\``);
-        }
-        break;
-      }
-    }
-  } catch (err) {
-    logger.debug(`[legacy-mcp] Cleanup for ${cliId} failed (ignored): ${err}`);
-  }
-}
-
 /**
  * Ensure per-CLI environment is set up for this daemon lifecycle: install
- * built-in skills and clean up any legacy MCP server registration.
+ * built-in skills and the single stable Botmux MCP Gateway entry.
  * Both steps are idempotent and best-effort.
  */
 export function ensureCliEnv(cliId: CliId, cliPathOverride?: string): void {
   cleanupGlobalBotmuxSkillsOnce();
   ensureCliSkills(cliId, cliPathOverride);
-  cleanupLegacyMcpConfig(cliId);
+  const report = ensureGatewayEntry(createCliAdapterSync(cliId, cliPathOverride));
+  if (report.warning) logger.warn(`[mcp-gateway] ${cliId}: ${report.warning}`);
 }
 
 /** The user's global skills dir that botmux must NOT pollute (Claude now injects
@@ -1164,6 +1120,9 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
+  // Screen state describes the process we just stopped. Keeping it would make
+  // the dashboard hydrate this process-less logical session as idle/working.
+  ds.lastScreenStatus = undefined;
   ds.session.webPort = undefined;
   // The worker's suspend handler destroys the backing session + CLI (frees
   // memory), so there is no live CLI to reattach to: the next turn MUST
@@ -1181,8 +1140,15 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   if (!ds.exitEventEmitted) {
     ds.exitEventEmitted = true;
     dashboardEventBus.publish({
-      type: 'session.exited',
-      body: { sessionId: ds.session.sessionId, reason },
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: {
+          status: 'dormant',
+          webPort: null,
+          workerPid: null,
+        },
+      },
     });
   }
   logger.info(`[${tag(ds)}] Worker + CLI suspended (${reason}); session stays active, cold-resumes from transcript on next message`);
@@ -1692,33 +1658,6 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
   const familyAdapter = createCliAdapterSync(agentCfg.cliId, agentCfg.cliPathOverride);
   if (familyAdapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, familyAdapter.claudeStateJsonPath);
 
-  let skillPluginDir: string | undefined;
-  let skillReadonlyRoots: string[] | undefined;
-  if (!resume && prompt.trim().length > 0) {
-    const preparedSkills = prepareSessionSkillPrompt({
-      sessionId: ds.session.sessionId,
-      cliId: agentCfg.cliId,
-      workingDir: cwd,
-      prompt,
-      botPolicy: botCfg.skills,
-    });
-    prompt = preparedSkills.prompt;
-    const delivery = prepareSkillDelivery(familyAdapter, preparedSkills.manifest, preparedSkills.manifest?.delivery ?? 'auto');
-    skillPluginDir = delivery.pluginDir;
-    skillReadonlyRoots = delivery.readonlyRoots.length ? delivery.readonlyRoots : undefined;
-    for (const diagnostic of delivery.diagnostics) logger.warn(`[${t}] skill delivery: ${diagnostic}`);
-    if (delivery.fatal) {
-      const reason = delivery.diagnostics.join(', ') || 'unknown';
-      const message = tr('worker.skill_delivery_failed', { reason }, botLocale(botCfg));
-      logger.warn(`[${t}] Skill delivery blocked session start: ${reason}`);
-      void cb.sessionReply(sessionAnchorId(ds), message, undefined, ds.larkAppId, fallbackTurnId(ds, undefined))
-        .catch((err) => logger.warn(`[${t}] Failed to notify skill delivery error: ${err?.message ?? err}`));
-      void closeSession(ds.session.sessionId)
-        .catch((err) => logger.warn(`[${t}] Failed to close skill delivery error session: ${err?.message ?? err}`));
-      return;
-    }
-  }
-
   // Prepend ~/.botmux/bin to PATH so CLIs can call `botmux send` etc.
   // The wrapper script there is written by the daemon at startup.
   const botmuxBinDir = join(homedir(), '.botmux', 'bin');
@@ -1813,8 +1752,8 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
     turnId: initTurnId ?? ds.currentReplyTarget?.turnId,
-    skillPluginDir,
-    skillReadonlyRoots,
+    pluginBindings: botCfg.plugins,
+    skillPolicy: botCfg.skills,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
@@ -1857,6 +1796,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     type: 'session.spawned',
     body: { session: composeRowFromActive(ds) },
   });
+  cb.enforceLiveSessionCap?.();
   emitSessionLifecycleHook(ds, 'session.start', {
     reason: resume ? 'resume' : 'worker_spawn',
     pid: worker.pid ?? null,
@@ -1875,6 +1815,12 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
 function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
   const cb = requireCallbacks();
   const t = tag(ds);
+  // Source authorization belongs to one worker lifetime. A replacement worker
+  // must announce its own Hermes sources before any stamped final_output is
+  // trusted; `/clear` rebinds within the same lifetime accumulate afterwards.
+  if (ds.session.cliId === 'hermes' && ds.worker !== worker) {
+    ds.hermesBridgeSourceSessionIds = undefined;
+  }
   // Worker messages without a turn of their own (first streaming card, crash
   // notices) anchor to the session's current reply-target turn so a shared
   // fold-back topic keeps them in-thread instead of leaking top-level.
@@ -1953,6 +1899,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             // and post-daemon-restart paths still see lastScreenStatus
             // undefined and fall back to 'starting' (unchanged behavior).
             const initStatus = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
+            const localCliReadyAtBuild = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
             const streamCardJson = buildStreamingCard(
               ds.session.sessionId,
               sessionAnchorId(ds),
@@ -1969,8 +1916,15 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               loc,
               initStatus === 'limited' ? ds.usageLimit : undefined,
               writableTerminalLinkFor(ds),
+              localCliReadyAtBuild,
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
+            // Worker IPC handlers may run while the direct restore PATCH is in
+            // flight. Re-queue readiness after it completes so an older
+            // not-ready payload can never overwrite the cli_session_id PATCH.
+            if (!localCliReadyAtBuild && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
+              scheduleLocalCliOpenReadinessPatch(ds);
+            }
             persistStreamCardState(ds);
             // Re-sync worker's display mode (it starts fresh in 'hidden')
             if (ds.worker && ds.displayMode && ds.displayMode !== 'hidden') {
@@ -2021,6 +1975,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             loc,
             initStatus === 'limited' ? ds.usageLimit : undefined,
             writableTerminalLinkFor(ds),
+            isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           );
           ds.streamCardId = await scopedReply(streamCardJson, 'interactive', msg.turnId);
           // This card IS the current turn's live card — clear the new-turn flag
@@ -2041,6 +1996,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           // Done after `streamCardId` is committed so we never delete the old
           // card without a successor visible to the user.
           recallFrozenCards(ds);
+          flushPendingLocalCliOpenReadinessPatch(ds);
         } catch (err) {
           if (err instanceof MessageWithdrawnError) {
             logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -2051,9 +2007,11 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           logger.warn(`[${t}] Failed to send streaming card, falling back to static card: ${err}`);
           // Clear sentinel so screen_updates can create a streaming card later
           ds.streamCardId = undefined;
+          clearPendingLocalCliOpenReadinessPatch(ds);
           persistStreamCardState(ds);
           // Fallback: send static session card
           try {
+            const localCliReadyAtBuild = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
             const cardJson = buildSessionCard(
               ds.session.sessionId,
               sessionAnchorId(ds),
@@ -2063,8 +2021,28 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               undefined,
               !!ds.adoptedFrom,
               loc,
+              localCliReadyAtBuild,
             );
-            await scopedReply(cardJson, 'interactive', msg.turnId);
+            const fallbackCardId = await scopedReply(cardJson, 'interactive', msg.turnId);
+            if (!localCliReadyAtBuild && isLocalCliOpenEnabled()
+              && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
+              const readyCardJson = buildSessionCard(
+                ds.session.sessionId,
+                sessionAnchorId(ds),
+                readOnlyUrl,
+                ds.session.title || getCliDisplayName(effectiveCliId),
+                effectiveCliId,
+                undefined,
+                !!ds.adoptedFrom,
+                loc,
+                true,
+              );
+              try {
+                await updateMessage(ds.larkAppId, fallbackCardId, readyCardJson);
+              } catch (patchErr) {
+                logger.debug(`[${t}] Failed to add local CLI button to fallback card: ${patchErr}`);
+              }
+            }
           } catch (fallbackErr) {
             if (fallbackErr instanceof MessageWithdrawnError) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -2114,12 +2092,18 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
       }
 
       case 'cli_session_id': {
+        const wasLocalCliOpenReady = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
         ds.session.cliSessionId = msg.cliSessionId;
+        if (ds.adoptedFrom) ds.adoptedFrom.sessionId = msg.cliSessionId;
+        if (ds.session.adoptedFrom) ds.session.adoptedFrom.sessionId = msg.cliSessionId;
         sessionStore.updateSession(ds.session);
         // Usage ledger: publish ownership the moment the CLI-native session id
         // is known, so consumers exclude this session from native parsers
         // before its first positive-delta record exists.
         recordOwnershipForDaemonSession(ds);
+        if (!wasLocalCliOpenReady && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
+          scheduleLocalCliOpenReadinessPatch(ds);
+        }
         break;
       }
 
@@ -2158,6 +2142,14 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             recordUsageForDaemonSession(ds);
             void finishTurnReactions(ds);
             callbacks?.onSessionIdleOrExit?.(ds, ds.lastScreenStatus === 'limited' ? 'limited' : 'idle');
+          }
+          // If every over-cap process was busy, the earlier check deliberately
+          // left them alone. Re-check on the first idle edge so capacity is
+          // reclaimed immediately instead of waiting for the 60s backstop.
+          if (ds.lastScreenStatus === 'idle' && cb.enforceLiveSessionCap) {
+            // Defer until this screen_update has finished using process state.
+            // The newly-idle session itself may be the oldest eviction target.
+            queueMicrotask(cb.enforceLiveSessionCap);
           }
         }
 
@@ -2201,6 +2193,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             loc,
             cardUsageLimit(ds),
             writableTerminalLinkFor(ds),
+            isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -2216,6 +2209,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               // every long session would leak old streaming cards into the
               // thread.
               recallFrozenCards(ds);
+              flushPendingLocalCliOpenReadinessPatch(ds);
             })
             .catch(err => {
               if (err instanceof MessageWithdrawnError) {
@@ -2226,6 +2220,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               }
               logger.debug(`[${t}] Failed to create streaming card: ${err}`);
               ds.streamCardId = undefined;
+              clearPendingLocalCliOpenReadinessPatch(ds);
               persistStreamCardState(ds);
             });
         } else {
@@ -2249,6 +2244,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             loc,
             cardUsageLimit(ds),
             writableTerminalLinkFor(ds),
+            isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           );
           scheduleCardPatch(ds, cardJson);
         }
@@ -2289,6 +2285,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           loc,
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -2378,6 +2375,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               ds.lastScreenContent ?? '', 'idle', effectiveCliId,
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
               isAdopt, showTakeover, loc, undefined, writableTerminalLinkFor(ds),
+              isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -2416,6 +2414,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               ds.lastScreenContent ?? '', 'idle', effectiveCliId,
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
               isAdopt, showTakeover, loc, undefined, writableTerminalLinkFor(ds),
+              isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -2472,6 +2471,23 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         break;
       }
 
+      case 'bridge_source_session': {
+        if (msg.bridge !== 'hermes') break;
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored Hermes source binding from stale worker: ${msg.sourceSessionId}`);
+          break;
+        }
+        const sourceSessionIds = ds.hermesBridgeSourceSessionIds ??= new Set<string>();
+        if (sourceSessionIds.has(msg.sourceSessionId)) break;
+        if (sourceSessionIds.size === 0) {
+          logger.info(`[${t}] Hermes bridge sourceSessionId bound: ${msg.sourceSessionId}`);
+        } else {
+          logger.info(`[${t}] Hermes bridge sourceSessionId added after rebind: ${msg.sourceSessionId}`);
+        }
+        sourceSessionIds.add(msg.sourceSessionId);
+        break;
+      }
+
       case 'user_notify': {
         logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
@@ -2493,6 +2509,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // another session.
         if (!msg.content || !msg.content.trim()) break;
         if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
+        if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
         if (!msg.sessionId) {
           logger.warn(`[${t}] final_output missing sessionId; accepting for compatibility (session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`);
         }
@@ -2585,6 +2602,31 @@ function shouldDropMismatchedFinalOutput(
   logger.error(
     `[${t}] Dropped final_output with mismatched sessionId ` +
     `(msg=${msg.sessionId}, session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+  );
+  return true;
+}
+
+function shouldDropMismatchedHermesFinalOutput(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  t: string,
+): boolean {
+  if (ds.session.cliId !== 'hermes') return false;
+  const sourceSessionIds = ds.hermesBridgeSourceSessionIds;
+  const hasBoundSource = !!sourceSessionIds && sourceSessionIds.size > 0;
+  if (!msg.sourceHermesSessionId) {
+    if (!hasBoundSource) return false;
+    logger.error(
+      `[${t}] Dropped Hermes final_output without sourceHermesSessionId ` +
+      `(expected one of ${sourceSessionIds!.size} bound sources, session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
+    );
+    return true;
+  }
+  if (sourceSessionIds?.has(msg.sourceHermesSessionId)) return false;
+  logger.error(
+    `[${t}] Dropped Hermes final_output with mismatched sourceHermesSessionId ` +
+    `(msg=${msg.sourceHermesSessionId}, expected one of ${sourceSessionIds?.size ?? 0} bound sources, ` +
+    `session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
   );
   return true;
 }
@@ -2857,7 +2899,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   // open store.db fd (chatId), or from cliSessionId (= chatId) when discovery
   // captured it — so adopt must forward the pid + cwd like the other
   // transcript-backed CLIs.
-  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'traex' || adoptedCliId === 'coco' || adoptedCliId === 'mtr' || adoptedCliId === 'cursor';
+  const isStructuredBridge = isStructuredBridgeAdoptCli(adoptedCliId);
   const adoptBackendType = adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
 
   const initMsg: DaemonToWorker = {
@@ -2945,6 +2987,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     type: 'session.spawned',
     body: { session: composeRowFromActive(ds) },
   });
+  cb.enforceLiveSessionCap?.();
   emitSessionLifecycleHook(ds, 'session.start', {
     reason: opts?.restoredFromMetadata ? 'adopt_restore' : 'adopt',
     pid: worker.pid ?? null,

@@ -38,6 +38,7 @@ export function detachSkillPolicy(current: BotSkillPolicy | undefined, name: str
 function describeSource(skill: SkillPackage): string {
   if (skill.source.type === 'github') return `github:${skill.source.owner}/${skill.source.repo}/${skill.source.path}`;
   if (skill.source.type === 'git') return `${skill.source.url}#${skill.source.path}`;
+  if (skill.source.type === 'agentbuddy') return `agentbuddy:${skill.source.identifier}`;
   return skill.source.type;
 }
 
@@ -84,7 +85,7 @@ export async function runSkillsImCommand(larkAppId: string, content: string): Pr
 
   if (sub === 'attach') {
     const skill = readSkillRegistry().skills[name!];
-    if (!skill) return { ok: false, message: `未安装 skill：${name}\n先在部署机器上运行：botmux skills install <path|github>` };
+    if (!skill) return { ok: false, message: `未安装 skill：${name}\n先在部署机器上运行：botmux skills install <path|git|github|agentbuddy>` };
     const bot = getBot(larkAppId);
     const result = await writeSkillPolicy(larkAppId, attachSkillPolicy(bot.config.skills, skill.name));
     if (!result.ok) return result;

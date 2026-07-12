@@ -8,29 +8,50 @@
  */
 import type { RunNodeView } from '../../workflows/v3/ops-projection.js';
 
+export type NodeTerminalRenderKind = 'live' | 'replay' | 'empty';
+
+export interface NodeTerminalRender {
+  kind: NodeTerminalRenderKind;
+  signature: string;
+  html: string;
+}
+
+/** Signature of a node's terminal-relevant inputs. React keeps the iframe DOM
+ *  mounted across polling ticks unless this value, prefixed by node id, changes. */
+export function nodeTerminalSignature(node: RunNodeView): string {
+  const wt = node.webTerminal;
+  return `${wt?.status ?? '-'}|${wt?.sessionId ?? '-'}|${wt?.webPort ?? '-'}|${node.hasPtyLog ? '1' : '0'}`;
+}
+
 export function renderNodeTerminal(container: HTMLElement, runId: string, node: RunNodeView): void {
   container.setAttribute('data-run-id', runId);
   container.setAttribute('data-node-id', node.id);
+  container.innerHTML = buildNodeTerminalRender(runId, node).html;
+}
+
+export function buildNodeTerminalRender(
+  runId: string,
+  node: RunNodeView,
+  options: { host?: string } = {},
+): NodeTerminalRender {
+  const signature = nodeTerminalSignature(node);
 
   const wt = node.webTerminal;
   if (wt?.status === 'live' && wt.webPort && wt.webPort > 0) {
-    renderLiveTerminal(container, wt.webPort);
-    return;
+    return { kind: 'live', signature, html: liveTerminalHtml(wt.webPort, wt.sessionId, options.host) };
   }
 
   if (node.hasPtyLog) {
-    renderReplayTerminal(container, runId, node.id, wt?.status === 'closed');
-    return;
+    return { kind: 'replay', signature, html: replayTerminalHtml(runId, node.id, wt?.status === 'closed') };
   }
 
-  renderEmpty(container, wt?.status === 'live'
-    ? '终端正在启动，稍后刷新'
-    : '暂无终端记录');
+  const message = wt?.status === 'live' ? '终端正在启动，稍后刷新' : '暂无终端记录';
+  return { kind: 'empty', signature, html: emptyTerminalHtml(message) };
 }
 
-function renderLiveTerminal(container: HTMLElement, webPort: number): void {
-  const url = liveTerminalUrl(webPort);
-  container.innerHTML = `<div class="v3-terminal-panel">
+function liveTerminalHtml(webPort: number, sessionId: string, host?: string): string {
+  const url = liveTerminalUrl(webPort, host, sessionId);
+  return `<div class="v3-terminal-panel">
     <div class="v3-terminal-head">
       <span class="v3-terminal-dot live"></span>
       <span>实时终端（只读）</span>
@@ -41,10 +62,10 @@ function renderLiveTerminal(container: HTMLElement, webPort: number): void {
   </div>`;
 }
 
-function renderReplayTerminal(container: HTMLElement, runId: string, nodeId: string, closed: boolean): void {
+function replayTerminalHtml(runId: string, nodeId: string, closed: boolean): string {
   const endpoint = `/api/v3/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(nodeId)}/pty-log`;
-  const srcdoc = replaySrcdoc(endpoint, `${runId} / ${nodeId}`);
-  container.innerHTML = `<div class="v3-terminal-panel">
+  const srcdoc = buildReplayTerminalSrcdoc(endpoint, `${runId} / ${nodeId}`);
+  return `<div class="v3-terminal-panel">
     <div class="v3-terminal-head">
       <span class="v3-terminal-dot ${closed ? 'closed' : 'replay'}"></span>
       <span>${closed ? '终端回放' : '终端记录'}</span>
@@ -55,16 +76,22 @@ function renderReplayTerminal(container: HTMLElement, runId: string, nodeId: str
   </div>`;
 }
 
-function renderEmpty(container: HTMLElement, message: string): void {
-  container.innerHTML = `<div class="v3-terminal-empty muted">${escapeHtml(message)}</div>`;
+function emptyTerminalHtml(message: string): string {
+  return `<div class="v3-terminal-empty muted">${escapeHtml(message)}</div>`;
 }
 
-function liveTerminalUrl(webPort: number): string {
-  const host = window.location.hostname || '127.0.0.1';
-  return `http://${host}:${webPort}/`;
+export function liveTerminalUrl(webPort: number, host?: string, sessionId?: string): string {
+  if (sessionId && typeof window !== 'undefined' && window.location.protocol === 'https:') {
+    return `${window.location.origin}/s/${encodeURIComponent(sessionId)}`;
+  }
+  return `http://${host ?? browserHost()}:${webPort}/`;
 }
 
-function replaySrcdoc(endpoint: string, title: string): string {
+function browserHost(): string {
+  return typeof window === 'undefined' ? '127.0.0.1' : window.location.hostname || '127.0.0.1';
+}
+
+export function buildReplayTerminalSrcdoc(endpoint: string, title: string): string {
   const endpointJson = JSON.stringify(endpoint);
   const titleText = escapeHtml(title);
   return `<!doctype html>

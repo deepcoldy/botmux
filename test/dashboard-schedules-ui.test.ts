@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { filterSchedules, fmtScheduleDate } from '../src/dashboard/web/schedules.js';
+import { filterSchedules, fmtScheduleDate } from '../src/dashboard/web/schedules-page.js';
 
 describe('dashboard schedules React page helpers', () => {
   it('filters by kind, enabled state, and text query', () => {

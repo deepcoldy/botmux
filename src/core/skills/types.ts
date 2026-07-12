@@ -2,13 +2,15 @@ import type { CliId } from '../../adapters/cli/types.js';
 
 export type SkillSource =
   | { type: 'bundled'; packageName: string }
+  | { type: 'plugin'; pluginId: string; root: string }
   | { type: 'user'; root: string }
   | { type: 'project'; root: string }
   | { type: 'admin'; root: string }
   | { type: 'local-copy'; originalPath: string }
   | { type: 'local-link'; path: string }
   | { type: 'git'; url: string; path: string; ref?: string; commit?: string }
-  | { type: 'github'; owner: string; repo: string; path: string; ref?: string; commit?: string };
+  | { type: 'github'; owner: string; repo: string; path: string; ref?: string; commit?: string }
+  | { type: 'agentbuddy'; identifier: string; protocol?: 'skill' | 'plugin'; collection?: string; group?: string; skill?: string; version?: string };
 
 export interface SkillPackage {
   id: string;

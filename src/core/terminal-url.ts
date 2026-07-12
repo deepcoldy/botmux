@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { platformMachineBaseUrl } from '../platform/binding.js';
+import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
 
 /**
@@ -73,12 +73,23 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
   // centrally with no `:port`. Platform owner login grants write access, and an
   // explicitly requested private write link keeps its worker token as an
   // alternative capability. Public/read-only links never carry that token.
+  // When 远程访问 is off the platform base is null and we fall through — first
+  // to a self-hosted reverse proxy base (`BOTMUX_PUBLIC_URL`, same front-door
+  // `/s/<id>` form), then to the local proxy/worker port.
   if (proxyReady) {
     const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
     if (platformBase) {
       const base = `${platformBase}/s/${ds.session.sessionId}`;
       if (opts.write && ds.workerToken) return `${base}?token=${ds.workerToken}`;
       return base;
+    }
+    // 自建反代（BOTMUX_PUBLIC_URL）：走 dashboard 前门 `/s/<id>`，无 per-bot 端口、
+    // 对所有 bot 通。这里没有平台 SSO 兜底，故写链接必须像本地分支一样保留 token，
+    // 否则终端会裸暴露在对外域名上。
+    const publicBase = publicReverseProxyBaseUrl();
+    if (publicBase) {
+      const url = `${publicBase}/s/${ds.session.sessionId}`;
+      return opts.write && ds.workerToken ? `${url}?token=${ds.workerToken}` : url;
     }
   }
   const base = proxyReady

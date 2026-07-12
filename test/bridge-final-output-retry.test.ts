@@ -127,6 +127,12 @@ function makeDs(): DaemonSession {
   };
 }
 
+function makeHermesDs(): DaemonSession {
+  const ds = makeDs();
+  ds.session.cliId = 'hermes';
+  return ds;
+}
+
 function finalOutputMsg(): Extract<WorkerToDaemon, { type: 'final_output' }> {
   return { type: 'final_output', content: 'final answer', lastUuid: 'uuid-1', turnId: 'turn-1' };
 }
@@ -200,7 +206,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       closeSession: vi.fn(),
     });
 
-    const ds = makeDs();
+    const ds = makeHermesDs();
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     (ds.worker as any).emit('message', {
@@ -212,6 +218,237 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).not.toHaveBeenCalled();
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+  });
+
+  it('records Hermes source binding and allows matching sourceHermesSessionId', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeHermesDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'bridge_source_session',
+      bridge: 'hermes',
+      sourceSessionId: 'hermes-A',
+    });
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+      sourceHermesSessionId: 'hermes-A',
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(ds.hermesBridgeSourceSessionIds).toEqual(new Set(['hermes-A']));
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('resets Hermes source authorization for a replacement worker and ignores stale bindings', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeHermesDs();
+    const oldWorker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, oldWorker);
+    oldWorker.emit('message', {
+      type: 'bridge_source_session',
+      bridge: 'hermes',
+      sourceSessionId: 'hermes-A',
+    });
+    expect(ds.hermesBridgeSourceSessionIds).toEqual(new Set(['hermes-A']));
+
+    const replacementWorker = new EventEmitter() as any;
+    replacementWorker.killed = false;
+    replacementWorker.send = vi.fn();
+    replacementWorker.kill = vi.fn();
+    replacementWorker.pid = 100000;
+    __testOnly_setupWorkerHandlers(ds, replacementWorker);
+    ds.worker = replacementWorker;
+
+    expect(ds.hermesBridgeSourceSessionIds).toBeUndefined();
+
+    replacementWorker.emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+      sourceHermesSessionId: 'hermes-A',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    oldWorker.emit('message', {
+      type: 'bridge_source_session',
+      bridge: 'hermes',
+      sourceSessionId: 'hermes-A-late',
+    });
+    expect(ds.hermesBridgeSourceSessionIds).toBeUndefined();
+
+    replacementWorker.emit('message', {
+      type: 'bridge_source_session',
+      bridge: 'hermes',
+      sourceSessionId: 'hermes-C',
+    });
+    expect(ds.hermesBridgeSourceSessionIds).toEqual(new Set(['hermes-C']));
+  });
+
+  it('keeps old and rebound Hermes sources valid when one drain emits both turns', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeHermesDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    // The worker was already bound to A. During one later drain it discovers
+    // C's marker and sends that rebind before emitReadyCodexTurns forwards the
+    // completed A turn followed by C's turn.
+    (ds.worker as any).emit('message', {
+      type: 'bridge_source_session',
+      bridge: 'hermes',
+      sourceSessionId: 'hermes-A',
+    });
+    (ds.worker as any).emit('message', {
+      type: 'bridge_source_session',
+      bridge: 'hermes',
+      sourceSessionId: 'hermes-C',
+    });
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+      sourceHermesSessionId: 'hermes-A',
+      content: 'answer from A',
+      lastUuid: 'uuid-A',
+      turnId: 'turn-A',
+    });
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+      sourceHermesSessionId: 'hermes-C',
+      content: 'answer from C',
+      lastUuid: 'uuid-C',
+      turnId: 'turn-C',
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(ds.hermesBridgeSourceSessionIds).toEqual(new Set(['hermes-A', 'hermes-C']));
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[0][1]).toContain('answer from A');
+    expect(sessionReply.mock.calls[1][1]).toContain('answer from C');
+    expect(sessionReply.mock.calls.map(call => call[4])).toEqual(['turn-A', 'turn-C']);
+  });
+
+  it('drops Hermes final_output whose sourceHermesSessionId does not match the bound source', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeHermesDs();
+    ds.hermesBridgeSourceSessionIds = new Set(['hermes-A']);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+      sourceHermesSessionId: 'hermes-B',
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+  });
+
+  it('drops Hermes final_output with sourceHermesSessionId before daemon has a binding', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeHermesDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+      sourceHermesSessionId: 'hermes-A',
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+  });
+
+  it('drops Hermes final_output without sourceHermesSessionId after a source is bound', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeHermesDs();
+    ds.hermesBridgeSourceSessionIds = new Set(['hermes-A']);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+  });
+
+  it('does not apply the Hermes source guard after the session switches to another CLI', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    ds.hermesBridgeSourceSessionIds = new Set(['hermes-A']);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
   it('does not address daemon final-output footers to a known bot owner', async () => {

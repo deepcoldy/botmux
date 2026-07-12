@@ -158,4 +158,11 @@ describe('dispatchTriggerRequest', () => {
     expect(res.body.errorCode).toBe('target_required');
     expect(proxyToDaemon).not.toHaveBeenCalled();
   });
+
+  it('turns an unreachable daemon into a reviewable 502 response', async () => {
+    const proxyToDaemon = vi.fn(async () => { throw new Error('connect ECONNREFUSED'); });
+    const res = await dispatchTriggerRequest(workflowReq('app1'), { proxyToDaemon });
+    expect(res.status).toBe(502);
+    expect(res.body).toMatchObject({ ok: false, errorCode: 'daemon_offline', error: 'connect ECONNREFUSED' });
+  });
 });

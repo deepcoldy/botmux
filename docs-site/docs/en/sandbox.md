@@ -109,7 +109,7 @@ to add `--unshare-net` and run the CLI without host network access. This is a bl
 3. **Network is open by default**: set `sandboxNetwork: false` only for bots that can tolerate losing network / proxy access.
 4. **Build artifacts join the changeset**: if the bot runs `pnpm build` / compiles inside the sandbox, the artifacts (e.g. `dist/`) also show up in the `/land` changeset. **Read the diff** before landing — don't `apply` build output over your real repo.
 5. **The bot is unaware**: it sees the merged overlay view and believes it edited real files; the isolation is fully transparent to it.
-6. **`botmux send` still works**: inside the sandbox, `botmux send` relays messages / images / files normally via the daemon (app credentials never enter the sandbox env).
+6. **`botmux send` still works**: inside the sandbox, `botmux send` relays messages / images / files / custom card JSON normally via the daemon (app credentials never enter the sandbox env).
 
 ## Pairs with On-Call
 

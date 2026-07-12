@@ -71,7 +71,10 @@ describe('attention signals', () => {
   it('composeRowFromActive marks restored workerless active sessions as dormant', () => {
     expect(composeRowFromActive(makeDs()).status).toBe('dormant');
     expect(composeRowFromActive(makeDs({ worker: {} as any })).status).toBe('starting');
-    expect(composeRowFromActive(makeDs({ lastScreenStatus: 'idle' })).status).toBe('idle');
+    // Stale screen state belongs to the process that was suspended. Without a
+    // live process the logical session is dormant; with one it remains idle.
+    expect(composeRowFromActive(makeDs({ lastScreenStatus: 'idle' })).status).toBe('dormant');
+    expect(composeRowFromActive(makeDs({ worker: {} as any, lastScreenStatus: 'idle' })).status).toBe('idle');
 
     const queued = makeDs();
     queued.session.queued = true;

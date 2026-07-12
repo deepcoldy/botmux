@@ -6,9 +6,9 @@
  *   botmux setup          — interactive first-time configuration
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
  *   botmux setup list|add|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
- *   botmux start          — start daemon (pm2)
- *   botmux stop           — stop daemon
- *   botmux restart [--include-pm2] — restart daemon (optionally restart PM2 God too)
+ *   botmux start          — start daemon and auto plugin services
+ *   botmux stop [--with-plugin] — stop daemon (optionally stop auto plugin services)
+ *   botmux restart [--include-pm2] [--with-plugin] — restart daemon, then ensure auto plugin services
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
  *   botmux upgrade        — upgrade to latest version
@@ -20,7 +20,7 @@
  *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -60,6 +60,7 @@ import {
   type BotConfigEditInput,
 } from './setup/bot-config-editor.js';
 import { resolveCliSelection, selectionKeyForBot } from './setup/cli-selection.js';
+import { resolveSetupAppName } from './setup/app-name.js';
 import {
   buildBotFromAddFlags,
   editInputFromFlags,
@@ -76,10 +77,16 @@ import { logger } from './utils/logger.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
-import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
+import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-liveness.js';
+import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
-import { npmGlobalUpdateCwd } from './core/maintenance.js';
+import { installLatestBotmuxSync } from './core/maintenance.js';
+import {
+  formatGlobalInstallCommand,
+  resolveGlobalInstallPlan,
+  UnsupportedGlobalInstallError,
+} from './utils/global-install.js';
 import { loadDashboardSecret } from './dashboard/auth.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
@@ -96,8 +103,8 @@ import {
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import { type Brand, chatAppLink, larkHosts, normalizeBrand, sdkDomain } from './im/lark/lark-hosts.js';
+import { mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
 import type { GoalDecisionOption } from './services/goal-decision-options.js';
-import { mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
 import {
   createWhiteboard,
   ensureDefaultWhiteboard,
@@ -110,6 +117,13 @@ import {
 import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
 import { writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 import { stripLegacyPendingCardFields } from './services/session-store.js';
+import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
+import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
+import {
+  assertPluginBindingTransition,
+  describePluginDependencyError,
+  enabledPluginDependents,
+} from './core/plugins/dependencies.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -270,6 +284,21 @@ function pm2Capture(args: string[], home: string = PM2_HOME, timeoutMs = 10_000)
   return typeof r.stdout === 'string' ? r.stdout : '';
 }
 
+function parsePm2JlistOutput(output: string): any[] {
+  try {
+    const parsed = JSON.parse(output);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    for (let start = output.lastIndexOf('['); start >= 0; start = output.lastIndexOf('[', start - 1)) {
+      try {
+        const parsed = JSON.parse(output.slice(start).trim());
+        if (Array.isArray(parsed)) return parsed;
+      } catch { /* try an earlier '['; pm2 may prefix stdout with [PM2] logs */ }
+    }
+    throw new Error('pm2_jlist_json_not_found');
+  }
+}
+
 function loadBotsJson(): any[] {
   if (existsSync(BOTS_JSON_FILE)) {
     try {
@@ -313,6 +342,15 @@ function ensureUniqueBotProcessNames(bots: any[]): void {
     console.error(`❌ ${err?.message ?? String(err)}`);
     console.error('   请修改 bots.json 中的 name，确保进程名唯一。');
     process.exit(1);
+  }
+  const pluginPrefix = `${PM2_NAME}-plugin-`;
+  for (let i = 0; i < bots.length; i++) {
+    const name = botProcessName(bots[i], i, PM2_NAME);
+    if (name.startsWith(pluginPrefix)) {
+      console.error(`❌ bot 进程名 ${name} 使用了插件 service 保留前缀 ${pluginPrefix}`);
+      console.error('   请修改 bots.json 中的 name，避免以 plugin- 开头。');
+      process.exit(1);
+    }
   }
 }
 
@@ -500,9 +538,8 @@ function printCopyHint(filePath: string): void {
 }
 
 function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
-  // PersonalAgent 应用扫码建出来时已默认订阅 im.message.receive_v1 +
-  // card.action.trigger, 并开通 bot 能力, 主线只剩两步: 申请权限 + 重定向
-  // URL (按需). README "Step 8 收不到消息时" 段提供 fallback 自查链接.
+  // 同时覆盖 Web 企业自建应用与 SDK PersonalAgent fallback：后者的 bot / 事件
+  // 步骤通常已完成，但重复核对无害；前者在自动化中途失败时必须补齐这些步骤。
   const home = `${larkHosts(brand).openApi}/app/${appId}`;
   let scopesJsonPath = '';
   try {
@@ -512,9 +549,17 @@ function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
     console.log(`\n⚠️  写权限 JSON 失败 (${(err as Error).message}), 请手动从仓库源码 src/setup/lark-scopes.json 拷.`);
   }
 
-  console.log('\n剩余两步在开放平台完成:\n');
+  console.log('\n请在开放平台核对并补齐以下配置:\n');
 
-  console.log('  1. 申请权限 (一次性导入完整 JSON 提交审批)');
+  console.log('  1. 开启「应用功能 → 机器人」能力');
+  console.log(`     配置链接: ${home}/capability/bot`);
+  console.log('');
+
+  console.log('  2. 事件与回调切到「使用长连接接收事件」，并订阅 im.message.receive_v1 / card.action.trigger');
+  console.log(`     配置链接: ${home}/dev-config/event-sub`);
+  console.log('');
+
+  console.log('  3. 申请权限 (一次性导入完整 JSON 提交审批)');
   console.log(`     申请链接: ${home}/auth → 进入「权限管理」→「批量导入/导出权限」→ 粘贴 → 提交`);
   if (scopesJsonPath) {
     console.log(`     权限 JSON: ${scopesJsonPath}`);
@@ -522,50 +567,66 @@ function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
   }
   console.log('');
 
-  console.log('  2. 添加重定向 URL (用于 botmux 内 `/login` 拿用户 UAT 获取卡片消息)');
+  console.log('  4. 添加重定向 URL (用于 botmux 内 `/login` 拿用户 UAT 获取卡片消息)');
   console.log(`     申请链接: ${home}/safe → 进入「安全设置」→「重定向 URL」`);
   console.log('     填入: http://127.0.0.1:9768/callback');
   console.log('     不需要 `/login` 拿卡片消息的话, 这一步可以跳过.\n');
+
+  console.log('  5. 在「版本管理与发布」创建版本并提交发布');
+  console.log(`     配置链接: ${home}/version`);
+  console.log('');
 
   console.log('  完成后 `botmux start` (或 `botmux restart`)，启动检查不会卡住，');
   console.log('  缺权限只 WARN，去开放平台补齐后 daemon 自动恢复。\n');
 }
 
-async function finishOpenPlatformSetup(appId: string, brand: 'feishu' | 'lark'): Promise<void> {
+async function finishOpenPlatformSetup(
+  appId: string,
+  brand: 'feishu' | 'lark',
+  options: { reuseOnly?: boolean; quiet?: boolean } = {},
+): Promise<void> {
+  const say = (...args: unknown[]) => { if (!options.quiet) console.log(...args); };
   const { parseSetupOpenPlatformAutoFlag, automateOpenPlatformSetup } = await import('./setup/open-platform-automation.js');
   if (!parseSetupOpenPlatformAutoFlag(process.argv.slice(3))) {
-    console.log('\n已跳过开放平台自动配置 (--no-open-platform-auto)。');
-    printRemainingSteps(appId, brand);
+    say('\n已跳过开放平台自动配置 (--no-open-platform-auto)。');
+    if (!options.quiet) printRemainingSteps(appId, brand);
     return;
   }
 
-  console.log('\n── 开放平台自动配置 ──\n');
-  console.log('将使用 botmux 内置 Feishu Web QR 登录获取/复用 Web session，自动导入权限、配置 redirect URL 并创建/发布版本。');
-  console.log('如失败会自动回退到手动步骤提示，不影响已写入的 botmux 配置。\n');
+  say('\n── 开放平台自动配置 ──\n');
+  say(options.reuseOnly
+    ? '将复用创建应用时的 Feishu Web session，自动导入权限、配置 redirect URL 并创建/发布版本；本路径不会再显示二维码。'
+    : '将获取或复用 Feishu Web session，自动导入权限、配置 redirect URL 并创建/发布版本。');
+  say('如失败会自动回退到手动步骤提示，不影响已写入的 botmux 配置。\n');
 
-  const result = await automateOpenPlatformSetup({ appId, brand });
+  const result = await automateOpenPlatformSetup({
+    appId,
+    brand,
+    disableQrLogin: options.reuseOnly,
+    disableBytedcliFallback: options.reuseOnly,
+  });
   if (result.ok) {
-    console.log('✅ 开放平台自动配置完成');
-    console.log(`   Session 来源: ${result.sessionSource}`);
+    say('✅ 开放平台自动配置完成');
+    say(`   Session 来源: ${result.sessionSource}`);
     const skipped = result.skippedScopeCount ?? 0;
-    console.log(`   已导入权限数: ${result.scopeCount}${skipped > 0 ? `（另有 ${skipped} 项当前租户目录中没有，已跳过）` : ''}`);
+    say(`   已导入权限数: ${result.scopeCount}${skipped > 0 ? `（另有 ${skipped} 项当前租户目录中没有，已跳过）` : ''}`);
     if (result.scopeWarning) {
-      console.log(`   ⚠️ 权限注册未全部成功（部分租户对个别权限有限制）：${result.scopeWarning}`);
-      console.log('      可稍后到开放平台「权限管理」手动补齐缺失权限。');
+      say(`   ⚠️ 权限注册未全部成功（部分租户对个别权限有限制）：${result.scopeWarning}`);
+      say('      可稍后到开放平台「权限管理」手动补齐缺失权限。');
     } else if (result.scopeCount === 0) {
-      console.log('   ⚠️ 本次没有成功导入任何权限，请到开放平台「权限管理」手动导入 ~/.botmux/lark-scopes.json。');
+      say('   ⚠️ 本次没有成功导入任何权限，请到开放平台「权限管理」手动导入 ~/.botmux/lark-scopes.json。');
     }
-    console.log(`   已配置 redirect URL: http://127.0.0.1:9768/callback`);
-    if (result.versionId) console.log(`   已提交发布版本: ${result.versionId}`);
-    else console.log('   已创建版本；未从响应中解析到 versionId，请到开放平台确认是否需要手动发布。');
-    console.log('');
+    say(`   已配置 redirect URL: http://127.0.0.1:9768/callback`);
+    if (result.versionId) say(`   已提交发布版本: ${result.versionId}`);
+    else say('   已创建版本；未从响应中解析到 versionId，请到开放平台确认是否需要手动发布。');
+    say('');
     return;
   }
 
-  console.log(`⚠️  开放平台自动配置失败 (${result.reason}): ${result.message}`);
-  if (result.sessionFile) console.log(`   botmux session 文件: ${result.sessionFile}`);
-  console.log('   请按下面的手动步骤继续完成开放平台配置。');
-  printRemainingSteps(appId, brand);
+  say(`⚠️  开放平台自动配置失败 (${result.reason}): ${result.message}`);
+  if (result.sessionFile) say(`   botmux session 文件: ${result.sessionFile}`);
+  say('   请按下面的手动步骤继续完成开放平台配置。');
+  if (!options.quiet) printRemainingSteps(appId, brand);
 }
 
 /**
@@ -660,7 +721,7 @@ async function pickExistingAppCredentials(
  * - 任何失败都返回结构化对象, 不抛 (调用方根据 ok=false 回退)
  */
 async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promise<
-  | { ok: true; appId: string; appSecret: string; brand: Brand; userOpenId?: string }
+  | { ok: true; appId: string; appSecret: string; brand: Brand; userOpenId?: string; webSessionReady?: boolean }
   | { ok: false; reason: 'cancelled' }
 > {
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
@@ -669,7 +730,7 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
     const method = await pickChoice(rl, {
       title: '飞书应用来源',
       items: [
-        { label: '扫码创建新应用（推荐）', hint: '飞书 App 扫码，自动创建并拿到 AppID/Secret' },
+        { label: '一次扫码创建新应用（推荐）', hint: '飞书 Web 登录后自动命名、创建应用、取凭证并完成开放平台配置' },
         { label: '选择已有应用', hint: '飞书 Web 登录列出你创建过的应用，自动取 AppID/Secret（仅飞书租户）' },
         { label: '手动输入 AppID/Secret', hint: '已在开放平台创建好应用' },
       ],
@@ -679,7 +740,102 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
     if (method === null) return { ok: false, reason: 'cancelled' };
 
     if (method === 0) {
-      // 动态导入避免冷启动加载 SDK
+      const suggestedName = resolveSetupAppName(undefined, loadBotsJson().length);
+      const appName = (await ask(rl, `机器人名称 [${suggestedName}]: `)).trim() || suggestedName;
+      const {
+        createFeishuOpenPlatformApp,
+        inspectCachedFeishuOpenPlatformSession,
+        readStoredCookiesFromSessionFile,
+        botmuxFeishuSessionFilePath,
+      } = await import('./setup/open-platform-automation.js');
+      const inspected = await inspectCachedFeishuOpenPlatformSession();
+      let sessionMode: 'reuse' | 'qr' = 'qr';
+      let expectedIdentity: { userId: string; tenantId: string } | undefined;
+      if (inspected.ok) {
+        const accountChoice = await pickChoice(rl, {
+          title: `确认飞书账号：${inspected.identity.userName} · ${inspected.identity.tenantName}`,
+          items: [
+            { label: '确认并免扫码添加', hint: inspected.identity.email || '复用本机有效登录态' },
+            { label: '更换账号', hint: '重新扫码并覆盖本机登录态' },
+          ],
+          defaultIndex: 0,
+          footer: 'Esc 返回「飞书应用来源」',
+        });
+        if (accountChoice === null) continue;
+        sessionMode = accountChoice === 0 ? 'reuse' : 'qr';
+        if (sessionMode === 'reuse') {
+          expectedIdentity = {
+            userId: inspected.identity.userId,
+            tenantId: inspected.identity.tenantId,
+          };
+        }
+      } else if ((readStoredCookiesFromSessionFile(botmuxFeishuSessionFilePath())?.length ?? 0) > 0) {
+        const relogin = await pickChoice(rl, {
+          title: '上次飞书登录态已失效或无法确认账号',
+          items: [
+            { label: '重新扫码', hint: '确认后生成新二维码并覆盖旧登录态' },
+          ],
+          defaultIndex: 0,
+          footer: 'Esc 返回「飞书应用来源」',
+        });
+        if (relogin === null) continue;
+      }
+      console.log(sessionMode === 'reuse'
+        ? '\n正在复用已确认的飞书账号创建应用（无需扫码）…'
+        : '\n正在准备安全登录，请确认要创建应用的飞书账号与企业…');
+      const webResult = await createFeishuOpenPlatformApp({
+        name: appName,
+        ...(sessionMode === 'reuse'
+          ? { disableQrLogin: true, expectedIdentity }
+          : { forceQrLogin: true }),
+        disableBytedcliFallback: true,
+        onSessionReady: ({ identity, source }) => {
+          process.stderr.write(`已确认飞书账号：${identity.userName} · ${identity.tenantName}${source === 'botmux_cache' ? '（免扫码）' : ''}\n`);
+        },
+        onQrCode: info => {
+          process.stderr.write('\n请用飞书 App 扫码登录，botmux 将代你创建应用并完成配置：\n\n');
+          process.stderr.write(`${info.qrText}\n`);
+        },
+        onStatus: message => { process.stderr.write(`${message}\n`); },
+      });
+      if (webResult.ok) {
+        console.log('\n✅ 应用创建成功（登录态已缓存，后续添加可免扫码）');
+        console.log(`   应用名称: ${appName}`);
+        console.log(`   App ID: ${webResult.appId}`);
+        console.log('   租户类型: 飞书 (feishu.cn)');
+        return {
+          ok: true,
+          appId: webResult.appId,
+          appSecret: webResult.appSecret,
+          brand: 'feishu',
+          webSessionReady: true,
+        };
+      }
+
+      console.log(`\n⚠️  Web 自动创建失败 (${webResult.reason}): ${webResult.message}`);
+      if (webResult.appId) {
+        console.log(`   应用 ${webResult.appId} 已经创建，为避免重复建应用，不自动回退。`);
+        console.log('   请返回后选择「选择已有应用」重新读取凭证。\n');
+        if (interactive) continue;
+        return { ok: false, reason: 'cancelled' };
+      }
+
+      const compatibility = await pickChoice(rl, {
+        title: '是否使用兼容模式？',
+        items: [
+          { label: '使用兼容模式', hint: '官方 SDK device flow；可能需要额外扫码，应用名称由平台决定' },
+          { label: '返回应用来源', hint: '保留当前配置输入，不会创建新应用' },
+        ],
+        defaultIndex: 1,
+        footer: '兼容模式不会应用刚才填写的自定义名称',
+      });
+      if (compatibility !== 0) {
+        if (interactive) continue;
+        return { ok: false, reason: 'cancelled' };
+      }
+      console.log('   已明确选择 SDK 兼容模式；应用名称由平台决定。\n');
+
+      // Web console 不可用 / Lark 国际版时保留官方 SDK device flow 作为稳定回退。
       const { tryRegisterApp } = await import('./setup/register-app.js');
       const result = await tryRegisterApp();
       if (result.ok) {
@@ -700,7 +856,7 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
           userOpenId: result.userOpenId,
         };
       }
-      console.log(`\n⚠️  扫码失败 (${result.error}): ${result.message}`);
+      console.log(`\n⚠️  SDK 扫码失败 (${result.error}): ${result.message}`);
       if (result.error === 'aborted') {
         // 用户主动取消整个 setup, 不再问手动 fallback
         return { ok: false, reason: 'cancelled' };
@@ -923,7 +1079,17 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
 
   if (!ensureBotWorkingDirsExist(bot, '仓库扫描根目录')) return null;
 
-  return normalizeBotConfig(bot);
+  const normalized = normalizeBotConfig(bot);
+  if (creds.webSessionReady) {
+    Object.defineProperty(normalized, SETUP_WEB_SESSION_READY, { value: true, enumerable: false });
+  }
+  return normalized;
+}
+
+const SETUP_WEB_SESSION_READY = Symbol('setup-web-session-ready');
+
+function hasSetupWebSession(bot: Record<string, any>): boolean {
+  return Boolean((bot as any)[SETUP_WEB_SESSION_READY]);
 }
 
 function formatOptionalValue(v: unknown): string {
@@ -1161,7 +1327,7 @@ async function writeSingleBotConfig(): Promise<boolean> {
 
   writeBotsJsonAtomic([bot]);
   console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
-  await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot));
+  await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), { reuseOnly: hasSetupWebSession(bot) });
   console.log(`下一步:`);
   console.log(`  1. botmux start              启动 daemon`);
   console.log(`  2. botmux autostart enable   注册开机自启（推荐：${process.platform === 'darwin' ? 'mac launchd' : process.platform === 'linux' ? 'linux user systemd' : process.platform === 'win32' ? 'Windows Task Scheduler' : '当前平台暂不支持'}，无需 sudo）`);
@@ -1171,8 +1337,8 @@ async function writeSingleBotConfig(): Promise<boolean> {
 // ─── Scripted (non-TUI) setup ────────────────────────────────────────────────
 
 /** 脚本化 setup 统一失败出口：--json 输出结构化错误到 stdout，退出码 1。 */
-function failSetupScripted(json: boolean, message: string): void {
-  if (json) console.log(JSON.stringify({ ok: false, error: message }));
+function failSetupScripted(json: boolean, message: string, details: Record<string, unknown> = {}): void {
+  if (json) console.log(JSON.stringify({ ok: false, error: message, ...details }));
   else console.error(`❌ ${message}`);
   process.exitCode = 1;
 }
@@ -1243,23 +1409,140 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
   }
 
   if (cmd.action === 'add') {
-    let bot: Record<string, any>;
-    try {
-      bot = buildBotFromAddFlags(cmd.flags);
-    } catch (err: any) {
-      failSetupScripted(cmd.json, err?.message ?? String(err));
-      return;
-    }
-
     // 单机器人 .env 老配置：与 TUI「添加新机器人」一致，先迁移进 bots.json 再追加。
     let existing = bots;
     let migratedEnv = false;
+    let createdAppId: string | undefined;
+    let createdAppName: string | undefined;
     if (!existsSync(BOTS_JSON_FILE) && existsSync(ENV_FILE)) {
       const legacy = parseDotEnvToBotConfig();
       if (legacy.larkAppId && legacy.larkAppSecret) {
         existing = [legacy];
         migratedEnv = true;
       }
+    }
+
+    // --create-app 会产生真实开放平台应用；先用占位凭证完成纯本地字段、owner、
+    // CLI 与目录预检，避免参数错误发生在扫码建应用之后而留下孤儿应用。
+    if (cmd.createApp) {
+      let preflight: Record<string, any>;
+      try {
+        preflight = buildBotFromAddFlags({
+          ...cmd.flags,
+          appId: 'cli_preflight',
+          appSecret: 'preflight-only',
+        });
+      } catch (err: any) {
+        failSetupScripted(cmd.json, err?.message ?? String(err));
+        return;
+      }
+      const preflightBadDirs = invalidBotDirs(preflight);
+      if (preflightBadDirs.length > 0) {
+        failSetupScripted(cmd.json, `目录不存在或不是目录: ${preflightBadDirs.join(', ')}。请先创建，未创建应用。`);
+        return;
+      }
+
+      const appName = resolveSetupAppName(cmd.flags.appName, existing.length);
+      const requestedBrand = normalizeBrand(cmd.flags.brand);
+      let credentials:
+        | { ok: true; appId: string; appSecret: string; brand: Brand }
+        | { ok: false; message: string; appId?: string };
+      let appliedAppName = false;
+
+      if ((requestedBrand === 'lark' || cmd.compatibilityMode) && cmd.flags.appName?.trim()) {
+        failSetupScripted(cmd.json, 'Lark / SDK 兼容模式不支持 --app-name；请移除该参数，应用名称将由平台决定。');
+        return;
+      }
+      if (requestedBrand === 'lark' && cmd.switchAccount) {
+        failSetupScripted(cmd.json, '--switch-account 仅适用于 Feishu Web 创建路径，不适用于 Lark SDK 兼容模式。');
+        return;
+      }
+
+      if (requestedBrand === 'lark' || cmd.compatibilityMode) {
+        if (!cmd.json) console.log('⚠️  正在使用 SDK 兼容模式，可能需要额外扫码；应用名称由平台决定。');
+        const { tryRegisterApp } = await import('./setup/register-app.js');
+        const registered = await tryRegisterApp();
+        credentials = registered.ok
+          ? registered
+          : { ok: false, message: `SDK 扫码失败 (${registered.error}): ${registered.message}` };
+      } else {
+        const {
+          createFeishuOpenPlatformApp,
+          inspectCachedFeishuOpenPlatformSession,
+          readStoredCookiesFromSessionFile,
+          botmuxFeishuSessionFilePath,
+        } = await import('./setup/open-platform-automation.js');
+        const inspected = cmd.switchAccount ? null : await inspectCachedFeishuOpenPlatformSession();
+        const hadCachedSession = (readStoredCookiesFromSessionFile(botmuxFeishuSessionFilePath())?.length ?? 0) > 0;
+        if (!cmd.switchAccount && inspected && !inspected.ok && (cmd.json || hadCachedSession)) {
+          credentials = {
+            ok: false,
+            message: cmd.json && !hadCachedSession
+              ? '没有可复用的飞书登录态；--json 模式不会弹出二维码。请显式加 --switch-account 扫码登录。'
+              : `飞书登录态已失效或无法确认账号 (${inspected.reason})；未静默弹出二维码。请显式加 --switch-account 重新扫码。`,
+          };
+        } else {
+          const sessionOptions = inspected?.ok
+            ? {
+                disableQrLogin: true as const,
+                expectedIdentity: {
+                  userId: inspected.identity.userId,
+                  tenantId: inspected.identity.tenantId,
+                },
+              }
+            : { forceQrLogin: true as const };
+          const created = await createFeishuOpenPlatformApp({
+            name: appName,
+            ...sessionOptions,
+            disableBytedcliFallback: true,
+            onSessionReady: ({ identity, source }) => {
+              process.stderr.write(`已确认飞书账号：${identity.userName} · ${identity.tenantName}${source === 'botmux_cache' ? '（免扫码）' : ''}\n`);
+            },
+          });
+          if (created.ok) {
+            credentials = created;
+            appliedAppName = true;
+          } else if (created.appId) {
+            credentials = {
+              ok: false,
+              appId: created.appId,
+              message: `应用已创建但后续步骤失败 (${created.reason}): ${created.message}`,
+            };
+          } else {
+            credentials = {
+              ok: false,
+              message: `一次扫码创建失败 (${created.reason}): ${created.message}。可重试，或显式加 --compatibility-mode 使用可能需要额外扫码的兼容模式。`,
+            };
+          }
+        }
+      }
+
+      if (!credentials.ok) {
+        const continueCommand = credentials.appId
+          ? `botmux setup add --app-id ${credentials.appId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> --open-platform-auto`
+          : undefined;
+        failSetupScripted(cmd.json,
+          `${credentials.message}${credentials.appId ? `；已创建 AppID ${credentials.appId}，请从开放平台读取 App Secret 后运行 ${continueCommand} 继续，未重复创建。` : ''}`,
+          credentials.appId ? { partial: true, appId: credentials.appId, appName, continueCommand } : {},
+        );
+        return;
+      }
+      cmd.flags.appId = credentials.appId;
+      cmd.flags.appSecret = credentials.appSecret;
+      cmd.flags.brand = credentials.brand;
+      createdAppId = credentials.appId;
+      createdAppName = appliedAppName ? appName : undefined;
+      if (!cmd.json) {
+        console.log(`✅ 已创建${credentials.brand === 'lark' ? ' Lark' : '飞书'}应用${appliedAppName ? ` ${appName}` : ''} (${credentials.appId})，继续校验并写入 bot 配置。`);
+      }
+    }
+
+    let bot: Record<string, any>;
+    try {
+      bot = buildBotFromAddFlags(cmd.flags);
+    } catch (err: any) {
+      failSetupScripted(cmd.json, err?.message ?? String(err));
+      return;
     }
 
     if (existing.some(b => b?.larkAppId === bot.larkAppId)) {
@@ -1276,16 +1559,48 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
     const { validateCredentials } = await import('./setup/verify-permissions.js');
     const v = await validateCredentials(bot.larkAppId, bot.larkAppSecret, botBrand(bot));
     if (!v.ok) {
-      failSetupScripted(cmd.json, `凭证校验失败 (${v.error}): ${v.message}`);
+      const continueCommand = createdAppId
+        ? `botmux setup add --app-id ${createdAppId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> --open-platform-auto`
+        : undefined;
+      failSetupScripted(
+        cmd.json,
+        `凭证校验失败 (${v.error}): ${v.message}${createdAppId ? `；应用 ${createdAppId} 已创建，未重复创建。请运行 ${continueCommand} 继续。` : ''}`,
+        createdAppId ? { partial: true, appId: createdAppId, ...(createdAppName ? { appName: createdAppName } : {}), continueCommand } : {},
+      );
       return;
     }
 
-    writeBotsJsonAtomic([...existing, bot]);
-    if (migratedEnv) renameSync(ENV_FILE, ENV_FILE + '.bak');
+    try {
+      writeBotsJsonAtomic([...existing, bot]);
+    } catch (err) {
+      const continueCommand = createdAppId
+        ? `botmux setup add --app-id ${createdAppId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> --open-platform-auto`
+        : undefined;
+      failSetupScripted(
+        cmd.json,
+        `写入 bot 配置失败: ${err instanceof Error ? err.message : String(err)}${createdAppId ? `；应用 ${createdAppId} 已创建，未重复创建。请运行 ${continueCommand} 继续。` : ''}`,
+        createdAppId ? { partial: true, appId: createdAppId, ...(createdAppName ? { appName: createdAppName } : {}), continueCommand } : {},
+      );
+      return;
+    }
+    if (migratedEnv) {
+      try {
+        renameSync(ENV_FILE, ENV_FILE + '.bak');
+      } catch (err) {
+        // bots.json is already durable and takes precedence over legacy .env.
+        // Do not report a partial app failure that would encourage a duplicate;
+        // leave the old file in place and surface a cleanup warning only.
+        if (!cmd.json) console.error(`⚠️  bots.json 已写入，但旧 .env 备份失败: ${err instanceof Error ? err.message : String(err)}`);
+        migratedEnv = false;
+      }
+    }
 
-    // 开放平台自动配置（权限导入/发版）需要扫码，脚本化模式默认跳过、显式 opt-in。
+    // 已有凭证模式默认跳过；--create-app 默认开启并复用刚才的 Web session。
     if (cmd.openPlatformAuto) {
-      await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot));
+      await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), {
+        reuseOnly: cmd.createApp && !cmd.compatibilityMode && botBrand(bot) === 'feishu',
+        quiet: cmd.json,
+      });
     }
 
     const index = existing.length;
@@ -1297,6 +1612,8 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
         ok: true,
         action: 'add',
         bot: botJsonView(bot, index),
+        appId: bot.larkAppId,
+        ...(cmd.createApp && botBrand(bot) === 'feishu' && !cmd.compatibilityMode ? { appName: resolveSetupAppName(cmd.flags.appName, index) } : {}),
         botsFile: BOTS_JSON_FILE,
         envMigrated: migratedEnv || undefined,
         openPlatform: cmd.openPlatformAuto ? 'attempted' : 'skipped',
@@ -1482,7 +1799,7 @@ async function cmdSetup(): Promise<void> {
       console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
       writeBotsJsonAtomic([newBot]);
       console.log(`✅ 配置已写入: ${BOTS_JSON_FILE}`);
-      await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot));
+      await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
       console.log(`下一步: botmux restart\n`);
       return;
     }
@@ -1591,7 +1908,7 @@ async function cmdSetup(): Promise<void> {
     writeBotsJsonAtomic([...bots, newBot]);
     console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length + 1} 个`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
-    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot));
+    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
     printAddBotLiveHint(newBot.larkAppId);
     return;
     }
@@ -1648,7 +1965,7 @@ async function cmdSetup(): Promise<void> {
     console.log(`\n✅ 已迁移到多机器人配置`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     console.log(`   旧配置已备份: ${ENV_FILE}.bak`);
-    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot));
+    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
     printAddBotLiveHint(newBot.larkAppId);
 
   } else {
@@ -1770,6 +2087,7 @@ async function cmdStart(): Promise<void> {
   cleanupLegacyPm2();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
+  await reconcilePluginServicesForCli(undefined, { autoOnly: true });
   const bots = loadBotsJson();
   const count = bots.length || 1;
   console.log(`\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
@@ -1810,12 +2128,16 @@ function sleepSyncMs(ms: number): void {
 }
 
 /** Delete all pm2 processes matching botmux / botmux-* under the given PM2_HOME. */
+function isBotmuxCoreProcessName(name: string): boolean {
+  return name === PM2_NAME || (name.startsWith(`${PM2_NAME}-`) && !name.startsWith(`${PM2_NAME}-plugin-`));
+}
+
 function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
   let entries: Array<{ name: string; pid: number; online: boolean }>;
   try {
-    const apps = JSON.parse(pm2Capture(['jlist'], home)) as any[];
+    const apps = parsePm2JlistOutput(pm2Capture(['jlist'], home));
     entries = (Array.isArray(apps) ? apps : [])
-      .filter(a => a && (a.name === PM2_NAME || String(a.name).startsWith(`${PM2_NAME}-`)))
+      .filter(a => a && isBotmuxCoreProcessName(String(a.name)))
       .map(a => ({ name: String(a.name), pid: Number(a.pid) || 0, online: a?.pm2_env?.status === 'online' }));
   } catch (e) {
     console.error(`[restart] pm2 jlist failed (pm2 not running or no apps?): ${e instanceof Error ? e.message : e}`);
@@ -1911,21 +2233,23 @@ function cleanupLegacyPm2(): boolean {
   return true;
 }
 
-function cmdStop(): void {
+async function cmdStop(): Promise<void> {
+  const includePluginServices = process.argv.includes('--with-plugin');
   killDuplicatePm2GodDaemons();
   cleanupLegacyPm2();
   let stopped = false;
   try {
     const output = pm2Capture(['jlist']);
-    const apps = JSON.parse(output) as any[];
+    const apps = parsePm2JlistOutput(output);
     for (const app of apps) {
-      if (app.name === PM2_NAME || app.name.startsWith(`${PM2_NAME}-`)) {
+      if (isBotmuxCoreProcessName(String(app.name))) {
         try { runPm2(['stop', app.name]); stopped = true; } catch { /* */ }
       }
     }
   } catch { /* */ }
   // Wipe abandoned dashboard-daemon descriptors left behind by stopped daemons.
   cleanupStaleDaemonDescriptors();
+  if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
   if (!stopped) console.log('daemon 未在运行。');
 }
 
@@ -1937,6 +2261,7 @@ async function cmdRestart(): Promise<void> {
   }
   ensureConfigDir();
   const includePm2 = process.argv.includes('--include-pm2');
+  const includePluginServices = process.argv.includes('--with-plugin');
   // Drop a restart-intent breadcrumb so the fresh daemon knows this was an
   // intentional restart and DMs the owner a summary. `IfAbsent` preserves a
   // richer breadcrumb (update / auto-restart) already written by the
@@ -1953,12 +2278,17 @@ async function cmdRestart(): Promise<void> {
   cleanupLegacyPm2();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
+  if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
   if (includePm2) {
     killPm2GodDaemon();
   }
   // Wipe abandoned dashboard-daemon descriptors left behind by killed daemons.
   cleanupStaleDaemonDescriptors();
   runPm2(['start', cfg]);
+  // Default restart preserves running plugin services, then ensures every auto
+  // service is online. --with-plugin changes only the pre-restart side above:
+  // it explicitly stops auto services first, so this ensure becomes a restart.
+  await reconcilePluginServicesForCli(undefined, { autoOnly: true });
   if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
     console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
   }
@@ -1971,7 +2301,7 @@ async function cmdRestart(): Promise<void> {
  */
 function listBotmuxPm2Apps(): Array<{ name: string; online: boolean }> {
   try {
-    const apps = JSON.parse(pm2Capture(['jlist'])) as any[];
+    const apps = parsePm2JlistOutput(pm2Capture(['jlist']));
     return (Array.isArray(apps) ? apps : [])
       .filter(a => a && (a.name === PM2_NAME || String(a.name).startsWith(`${PM2_NAME}-`)))
       .map(a => ({ name: String(a.name), online: a?.pm2_env?.status === 'online' }));
@@ -2137,7 +2467,7 @@ function warnIfLegacyBotmuxAlive(): void {
   try { process.kill(legacyPid, 0); } catch { return; }
   try {
     const output = pm2Capture(['jlist'], legacyHome);
-    const apps = JSON.parse(output) as any[];
+    const apps = parsePm2JlistOutput(output);
     const hasBotmux = apps.some(a => a.name === PM2_NAME || a.name.startsWith(`${PM2_NAME}-`));
     if (hasBotmux) {
       console.warn('⚠️  检测到旧版 PM2_HOME (~/.pm2) 下仍有 botmux 进程,运行 `botmux restart` 完成迁移。\n');
@@ -2194,12 +2524,17 @@ function cmdStatus(): void {
 }
 
 function cmdUpgrade(): void {
-  console.log('🔄 升级中...');
   try {
-    execSync('npm install -g botmux@latest', { cwd: npmGlobalUpdateCwd(), stdio: 'inherit' });
+    const plan = resolveGlobalInstallPlan();
+    console.log(`🔄 升级中：${formatGlobalInstallCommand(plan)}`);
+    installLatestBotmuxSync(plan);
     console.log('\n✅ 升级完成。运行 botmux restart 以应用更新。');
-  } catch {
-    console.error('❌ 升级失败，请手动运行: npm install -g botmux@latest');
+  } catch (error) {
+    if (error instanceof UnsupportedGlobalInstallError) {
+      console.error(`❌ 无法安全识别当前安装方式（${error.manager}），请使用原包管理器手动更新 botmux。`);
+    } else {
+      console.error(`❌ 升级失败：${error instanceof Error ? error.message : error}`);
+    }
     process.exit(1);
   }
 }
@@ -2353,6 +2688,9 @@ interface SessionData {
   cliId?: string;
   lastCliInput?: string;
   adoptedFrom?: AdoptedFromData;
+  /** Deliberately suspended by the resident-session cap. No process/backing
+   * session is expected until the next message cold-resumes the CLI. */
+  suspendedColdResume?: boolean;
 }
 
 /**
@@ -2710,6 +3048,7 @@ function sessionStatusLabel(s: SessionData): string {
     if (pid) return isProcessAlive(pid) ? 'adopt' : 'stopped';
     return s.pid && isProcessAlive(s.pid) ? 'adopt' : 'idle';
   }
+  if (isColdResumeDormant(s) && !(s.pid && isProcessAlive(s.pid))) return 'dormant';
   return s.pid && isProcessAlive(s.pid) ? 'online' : s.pid ? 'stopped' : 'idle';
 }
 
@@ -3028,12 +3367,10 @@ async function cmdList(): Promise<void> {
 
     const hasPid = !!(s.pid && isProcessAlive(s.pid));
     const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
-    if (!hasPid && !hasTmux) {
-      const everReal = !!(s.cliId || s.lastCliInput || s.adoptedFrom);
-      (everReal ? pruned : prunedScratch).push(s);
-    } else {
-      live.push(s);
-    }
+    const disposition = sessionListDisposition(s, { hasPid, hasBackingSession: hasTmux });
+    if (disposition === 'prune_real') pruned.push(s);
+    else if (disposition === 'prune_scratch') prunedScratch.push(s);
+    else live.push(s);
   }
   const closeNow = (arr: SessionData[]) => {
     for (const s of arr) {
@@ -3639,9 +3976,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 命令:
   setup       交互式配置（首次使用 / 添加机器人）
               默认使用 botmux 内置 Feishu Web QR 登录尝试自动导入权限/redirect/发布版本；可加 --no-open-platform-auto 跳过
-  start       启动 daemon
-  stop        停止 daemon
-  restart     重启 daemon（自动恢复活跃会话；--include-pm2 同时重启 PM2 God）
+  start       启动 daemon，并启动 mode=auto 的插件 service
+  stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=auto 的插件 service）
+  restart     重启 daemon（默认不停止插件 service，core 启动后确保 mode=auto 正在运行；--with-plugin 显式先停再启动 auto service；--include-pm2 同时重启 PM2 God）
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
   upgrade     升级到最新版本
@@ -3672,6 +4009,19 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        voice disable   关闭语音功能（移除配置）
   vc-agent tat-gate|poll
                        飞书会议智能体 P0：校验 TAT 会中事件读取、轮询会议事件并触发 workflow
+  plugin              管理 botmux 插件
+       plugin init <id>
+                       基于官方模板创建 botmux 插件仓库
+       plugin install <npm-package|local-dir>
+                       安装并校验 botmux 插件；不执行插件代码、不启动 service
+       plugin enable <id>
+                       启用插件给指定 bot 或全局默认；不影响 host service
+       plugin disable <id>
+                       禁用插件引用；不影响 host service
+       插件 CLI 命令使用一级命令形式：botmux <command> [args...]
+                       只从全局 enabled 插件中查找
+       plugin service status|start|stop [id|--all]
+                       查看/管理插件 host service
   whiteboard status|enable|disable
                        本地项目白板（默认关闭；enable 只打开能力，不创建白板）
        current --create / list / read / update / write --yes
@@ -3691,6 +4041,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --files <path>                  附件（可重复）
        --videos <path>                 视频预览 MP4（可重复，需配套 --video-covers）
        --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
+       --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
+       --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
        --mention <open_id:name>        @提及（可重复）
        --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）
        --no-mention                    明确声明本条不@任何人
@@ -4486,6 +4838,32 @@ function parseGoalDecisionOptionsOrExit(args: string[], context: string): GoalDe
   }));
 }
 
+function withCustomCardMentionFooter(
+  card: Record<string, unknown>,
+  mentionOpenIds: readonly string[],
+  sentToLabel: string,
+): { ok: true; card: Record<string, unknown> } | { ok: false; error: string } {
+  if (mentionOpenIds.length === 0) return { ok: true, card };
+  const cloned = JSON.parse(JSON.stringify(card)) as Record<string, unknown>;
+  const body = cloned.body as { elements?: unknown } | undefined;
+  if (!body || !Array.isArray(body.elements)) {
+    return {
+      ok: false,
+      error: '自定义卡片带 --mention/--mention-back 时必须是 schema 2.0 且包含 body.elements；或改用 --no-mention 并在卡片 JSON 内自行处理展示',
+    };
+  }
+  const deduped = [...new Set(mentionOpenIds.filter(Boolean))];
+  body.elements.push(
+    { tag: 'hr' },
+    {
+      tag: 'markdown',
+      text_size: 'notation_small_v2',
+      content: `<font color='grey'>${sentToLabel}${deduped.map(id => `<at id=${id}></at>`).join(' ')}</font>`,
+    },
+  );
+  return { ok: true, card: cloned };
+}
+
 // Card v2 body builder helpers — extracted to im/lark/md-card.ts so the
 // daemon's bridge fallback path can produce identical cards. cmdSend
 // keeps using `buildImageCardElements` from there.
@@ -4511,12 +4889,32 @@ import { resolveQuoteTarget, validateMentionDecision, parseAttentionFlag, attent
 async function relaySend(rest: string[], relayDir: string): Promise<void> {
   const sid = argValue(rest, '--session-id') ?? process.env.BOTMUX_SESSION_ID;
   if (!sid) { console.error('relay: 无法确定 session-id'); process.exit(1); }
+  const cardJsonArg = argValue(rest, '--card-json');
+  const cardFile = argValue(rest, '--card-file');
+  let cardContent = '';
+  if (cardJsonArg !== undefined && cardFile !== undefined) {
+    console.error('relay: --card-json 与 --card-file 不能同时使用');
+    process.exit(2);
+  }
+  if (cardJsonArg !== undefined) {
+    cardContent = cardJsonArg;
+  } else if (cardFile !== undefined) {
+    if (!existsSync(cardFile)) { console.error(`relay: 文件不存在: ${cardFile}`); process.exit(1); }
+    cardContent = readFileSync(cardFile, 'utf-8');
+  }
   // Resolve content with the same precedence as cmdSend (content-file > positional > stdin)
   const contentFile = argValue(rest, '--content-file');
   let content = '';
-  if (contentFile) {
+  if (cardJsonArg !== undefined || cardFile !== undefined) {
+    content = '';
+  } else if (contentFile) {
     content = existsSync(contentFile) ? readFileSync(contentFile, 'utf-8') : '';
   } else {
+    // NOTE: `--attention` is deliberately NOT excluded here. The relay flag
+    // allowlist (below) doesn't forward it, so sandbox `--attention` can't raise
+    // the dashboard hand anyway; excluding it would silently send the reason as a
+    // bare message instead of the original loud "no content" failure. Plumbing
+    // `--attention` through the relay is a separate change, out of this scope.
     const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice']);
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
@@ -4530,6 +4928,13 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
   const contentBase = `${id}.content`;
   const cfile = join(relayDir, contentBase);
   writeFileSync(cfile, content);
+  let cardBase: string | undefined;
+  let cardOutfile: string | undefined;
+  if (cardJsonArg !== undefined || cardFile !== undefined) {
+    cardBase = `${id}.card.json`;
+    cardOutfile = join(relayDir, cardBase);
+    writeFileSync(cardOutfile, cardContent);
+  }
 
   // Copy attachments into the outbox; carry only basenames.
   const copyOutboxAttachment = (p: string, out: string[]): void => {
@@ -4564,7 +4969,7 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
   }
   // 原子写：req.json 是 host watcher 的触发文件，rename 让它「完整出现」，
   // watcher 永远不会读到半截 JSON（tmp 后缀不匹配 .req.json 过滤）。
-  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, attachments, videos, videoCovers, flags }));
+  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, cardFile: cardBase, attachments, videos, videoCovers, flags }));
 
   const resPath = join(relayDir, `${id}.res.json`);
   const deadlineMs = Date.now() + 120_000;
@@ -4574,6 +4979,7 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
         const res = JSON.parse(readFileSync(resPath, 'utf-8')) as { code?: number; stdout?: string; stderr?: string };
         try { unlinkSync(resPath); } catch { /* */ }
         try { unlinkSync(cfile); } catch { /* */ }
+        if (cardOutfile) { try { unlinkSync(cardOutfile); } catch { /* */ } }
         if (res.stdout) process.stdout.write(res.stdout);
         if (res.stderr) process.stderr.write(res.stderr);
         process.exit(res.code ?? 0);
@@ -4645,10 +5051,29 @@ async function cmdSend(rest: string[]): Promise<void> {
       process.exit(2);
     }
   }
+  if (flagPresentButValueMissing(rest, '--card-file', true)) {
+    console.error('botmux send: --card-file 需要路径参数');
+    process.exit(2);
+  }
+  if (flagPresentButValueMissing(rest, '--card-json', true)) {
+    console.error('botmux send: --card-json 需要 JSON 字符串参数');
+    process.exit(2);
+  }
+  const cardJsonArg = argValue(rest, '--card-json');
+  const cardFile = argValue(rest, '--card-file');
+  const customCardRequested = cardJsonArg !== undefined || cardFile !== undefined;
+  if (cardJsonArg !== undefined && cardFile !== undefined) {
+    console.error('botmux send: --card-json 与 --card-file 不能同时使用');
+    process.exit(2);
+  }
   const images = argValues(rest, '--image', '--images');
   const files = argValues(rest, '--file', '--files');
   const videos = argValues(rest, '--video', '--videos');
   const videoCovers = argValues(rest, '--video-cover', '--video-covers');
+  if (customCardRequested && (images.length > 0 || files.length > 0 || videos.length > 0 || videoCovers.length > 0)) {
+    console.error('botmux send: --card-file/--card-json 暂不与 --images/--files/--videos 混用；请把素材先上传为飞书资源并写入卡片 JSON');
+    process.exit(2);
+  }
   const videoValidation = validateVideoAttachments(videos, videoCovers);
   if (!videoValidation.ok) {
     console.error(`botmux send: ${videoValidation.error}`);
@@ -4670,6 +5095,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
   const mentionArgs = argValues(rest, '--mention');  // "open_id:Display Name"
   const contentFile = argValue(rest, '--content-file');
+  if (customCardRequested && contentFile) {
+    console.error('botmux send: --card-file/--card-json 不能与 --content-file 混用');
+    process.exit(2);
+  }
   // 回复一律走交互卡片。`--card` / `--text` 是隐藏的旧脚本兼容 no-op：纯文本
   // post 路径已删除，只有卡片能承载「🔊 语音总结」按钮，且守护进程兜底也一直只发卡片。
   // Publish-mode flags: post a fresh top-level message in a chat instead of
@@ -4697,6 +5126,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // needs-you column for this session. Parsed specially (not argValue) so a bare
   // `--attention "我卡住了"` doesn't eat the message as the flag value.
   const attention = parseAttentionFlag(rest);
+  if (customCardRequested && asVoice) {
+    console.error('botmux send: --card-file/--card-json 不能与 --voice 混用');
+    process.exit(2);
+  }
 
   const ancestorCtx = findAncestorSessionContext();
   const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? null;
@@ -4713,7 +5146,22 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   // Read content from: --content-file > positional arg > stdin
   let content = '';
-  if (contentFile) {
+  let customCard: Record<string, unknown> | undefined;
+  if (customCardRequested) {
+    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention']);
+    if (unexpectedText.length > 0) {
+      console.error('botmux send: --card-file/--card-json 发送自定义卡片时不接受正文参数；卡片内容请写入 JSON');
+      process.exit(2);
+    }
+    let rawCard = cardJsonArg ?? '';
+    if (cardFile !== undefined) {
+      if (!existsSync(cardFile)) { console.error(`文件不存在: ${cardFile}`); process.exit(1); }
+      rawCard = readFileSync(cardFile, 'utf-8');
+    }
+    const normalizedCard = normalizeInteractiveCardInput(rawCard);
+    if (!normalizedCard.ok) { console.error(`botmux send: ${normalizedCard.error}`); process.exit(2); }
+    customCard = normalizedCard.card;
+  } else if (contentFile) {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
@@ -4724,9 +5172,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       content = await readStdin();
     }
   }
-  if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
+  if (!contentFile && !customCardRequested) rejectLikelyWindowsStdinMojibake(content);
 
-  if (!content.trim() && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
+  if (!customCard && !content.trim() && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
     console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file /tmp/msg.md --images /tmp/chart.png\n  botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "视频预览"');
     process.exit(1);
   }
@@ -4798,6 +5246,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // （之前 currentTurnId 取自 cliPidMarker，文档轮里取值不稳导致误判落到 @ 硬门）。
   const docTarget = s.currentDocCommentTarget;
   if (docTarget && !sendTopLevel && !overrideChatId && !sendInto) {
+    if (customCardRequested) {
+      console.error('botmux send: 文档评论回复不支持 --card-file/--card-json；请改用普通文本，或显式 --top-level/--chat-id 发到飞书群');
+      process.exit(2);
+    }
     const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
     try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
     const { replyToDocComment, chunkCommentText } = await import('./im/lark/doc-comment.js');
@@ -5123,6 +5575,21 @@ async function cmdSend(rest: string[]): Promise<void> {
           hasExplicitBotMention: explicitKnownBotMention,
           knownBotOpenIds,
         });
+    if (customCard) {
+      const mentionFooter = orderedFooterRecipients({
+        sendTo: footerAddressing.sendTo,
+        mentionIds: mentions.map(m => m.open_id),
+        cc: footerAddressing.cc,
+        inlinedIds: [],
+      });
+      const withFooter = withCustomCardMentionFooter(
+        customCard,
+        mentionFooter,
+        t('card.sent_to', undefined, localeForBot(appId)),
+      );
+      if (!withFooter.ok) { console.error(`botmux send: ${withFooter.error}`); process.exit(2); }
+      customCard = withFooter.card;
+    }
 
     // Capture sentAtMs BEFORE dispatch — the worker's bridge fallback gates
     // on `sentAtMs ∈ [turn.markTimeMs, nextTurn.markTimeMs)`. If we recorded
@@ -5134,20 +5601,24 @@ async function cmdSend(rest: string[]): Promise<void> {
     let messageId: string;
     let failedAttachments: { path: string; error: string }[] = [];
     let failedVideoAttachments: { path: string; coverPath: string; error: string }[] = [];
-    // Pure-video fast path: send the preview as a standalone media message.
-    // A send that also carries mentions is deliberately excluded (media messages
-    // can't embed `<at>`), so it falls through to the card branch which renders
-    // the @ on the footer and sends the video as a follow-up attachment — same
-    // shape as an attachment-only `--files … --mention …` send, whose card body
-    // is likewise empty. See shouldSendAsPureVideo.
-    const pureVideoSend = shouldSendAsPureVideo({
-      hasBodyText: !!text.trim(),
-      imageCount: imageKeys.length,
-      fileCount: files.length,
-      videoCount: videoAttachments.length,
-      mentionCount: mentions.length,
-    });
-    if (pureVideoSend) {
+    const pureVideoSend = customCard
+      ? false
+      : shouldSendAsPureVideo({
+          hasBodyText: !!text.trim(),
+          imageCount: imageKeys.length,
+          fileCount: files.length,
+          videoCount: videoAttachments.length,
+          mentionCount: mentions.length,
+        });
+    if (customCard) {
+      messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
+    } else if (pureVideoSend) {
+      // Pure-video fast path: send the preview as a standalone media message.
+      // A send that also carries mentions is deliberately excluded (media messages
+      // can't embed `<at>`), so it falls through to the card branch which renders
+      // the @ on the footer and sends the video as a follow-up attachment — same
+      // shape as an attachment-only `--files … --mention …` send, whose card body
+      // is likewise empty. See shouldSendAsPureVideo.
       // No card/text primary here, so the FIRST media message must carry the
       // quote chain itself (dispatchPrimary applies the chat-scope quoteTargetId
       // and updates primaryQuotedId). Otherwise a bare `--videos … --no-mention`
@@ -6969,7 +7440,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const { findMissingAskEnv, parseAskOptions, parseAskTimeoutSeconds, AskArgsError } =
     await import('./core/ask-args.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
-  const { toLegacySelected } = await import('./core/ask-types.js');
+  const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
 
   const missing = findMissingAskEnv(process.env);
   if (missing) {
@@ -7039,7 +7510,17 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     };
     process.stdout.write(JSON.stringify(out) + '\n');
   } else if (result.kind === 'answered') {
-    // 非 JSON 模式：输出 selected key（单问单选），多选/多问输出空字符串
+    // 非 JSON 模式：输出 selected key（单问单选），多选/多问输出空字符串。
+    //
+    // 用户以文字作答时同样落到空字符串，与多选/多问的降级值无法区分，且 exit 0
+    // ——调用方会静默走进空分支。comment 可能含换行，塞进「一行一个 key」的
+    // stdout 契约并不安全，因此 stdout 保持不变，改由 stderr 指明答案去向。
+    if (isCustomReply(result)) {
+      console.error(
+        'botmux ask: 用户以文字作答，未点选任何选项；stdout 留空（stdout 只承载 option key）。' +
+          ' 用 `--json` 读 comment 字段取回原文。',
+      );
+    }
     process.stdout.write((selected ?? '') + '\n');
   }
 
@@ -7745,6 +8226,416 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
   }
 }
 
+function formatPluginServiceReports(reports: Array<{ pluginId: string; action: string; status?: string; mode?: string; openUrl?: string; warning?: string }>): string {
+  if (reports.length === 0) return '无插件 host service。';
+  return reports.map(r => {
+    const status = r.status ? r.action === 'stopped' ? ` (was ${r.status})` : ` (${r.status})` : '';
+    const mode = r.mode ? ` mode=${r.mode}` : '';
+    const openUrl = r.openUrl ? ` url=${r.openUrl}` : '';
+    const warning = r.warning ? ` ⚠ ${r.warning}` : '';
+    return `- ${r.pluginId}: ${r.action}${status}${mode}${openUrl}${warning}`;
+  }).join('\n');
+}
+
+async function reconcilePluginServicesForCli(
+  pluginIds?: string[],
+  options: { autoOnly?: boolean } = {},
+): Promise<void> {
+  const { startPluginServices } = await import('./core/plugins/service-manager.js');
+  const reports = await startPluginServices(pluginIds, options);
+  if (reports.length > 0) {
+    console.log('\n插件 host service:');
+    console.log(formatPluginServiceReports(reports));
+  }
+}
+
+async function stopPluginServicesForCli(
+  pluginIds?: string[],
+  options: { autoOnly?: boolean } = {},
+): Promise<void> {
+  const { stopPluginServices } = await import('./core/plugins/service-manager.js');
+  const reports = await stopPluginServices(pluginIds, options);
+  if (reports.length > 0) {
+    console.log('\n插件 host service:');
+    console.log(formatPluginServiceReports(reports));
+  }
+}
+
+function requirePluginId(raw: string | undefined): string {
+  const id = raw?.trim();
+  if (!id || !isValidPluginId(id)) {
+    console.error('❌ 插件 id 非法。要求: 小写字母开头，只能包含小写字母/数字/._-，长度 1-64。');
+    process.exit(1);
+  }
+  return id;
+}
+
+function findArgValue(args: string[], flag: string): string | undefined {
+  const idx = args.indexOf(flag);
+  return idx >= 0 ? args[idx + 1] : undefined;
+}
+
+function addPluginId(list: unknown, pluginId: string): string[] {
+  const current = normalizePluginIdList(list) ?? [];
+  return current.includes(pluginId) ? current : [...current, pluginId];
+}
+
+function removePluginId(list: unknown, pluginId: string): string[] {
+  return (normalizePluginIdList(list) ?? []).filter(id => id !== pluginId);
+}
+
+function updateGlobalPluginBinding(pluginId: string, enable: boolean): void {
+  const current = readGlobalConfig().plugins ?? [];
+  const next = enable ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+  mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
+}
+
+function failPluginDependency(error: unknown): never {
+  const message = describePluginDependencyError(error);
+  if (!message) throw error;
+  console.error(`❌ ${message}`);
+  process.exit(1);
+}
+
+function assertPluginBindingTransitionForCli(pluginId: string, enable: boolean, enabledPluginIds: readonly string[]): void {
+  try {
+    assertPluginBindingTransition(pluginId, enable, enabledPluginIds, readPluginRegistryCached());
+  } catch (error) {
+    failPluginDependency(error);
+  }
+}
+
+function updateBotPluginBinding(
+  pluginId: string,
+  botSelector: string,
+  enable: boolean,
+  beforeWrite?: () => void,
+): number {
+  const bots = loadBotsJson();
+  if (bots.length === 0) {
+    console.error('❌ 未找到 bots.json 或没有 bot 配置。');
+    process.exit(1);
+  }
+  const indexes = botSelector === 'all'
+    ? bots.map((_, index) => index)
+    : (() => {
+        const idx = parseBotSelection(botSelector, bots);
+        if (idx === undefined) {
+          console.error(`❌ 找不到 bot: ${botSelector}`);
+          process.exit(1);
+        }
+        return [idx];
+      })();
+  const machineDefaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+  if (machineDefaults.includes(pluginId)) {
+    console.error(`❌ 插件 ${pluginId} 已全局启用；请先关闭全局启用，再按 Bot 配置。`);
+    process.exit(1);
+  }
+  for (const idx of indexes) {
+    const current = Object.prototype.hasOwnProperty.call(bots[idx], 'plugins') ? bots[idx].plugins : undefined;
+    const effective = resolveEffectivePluginIds(
+      { plugins: normalizePluginIdList(current) ?? [] },
+      { plugins: machineDefaults },
+    );
+    assertPluginBindingTransitionForCli(pluginId, enable, effective);
+  }
+  beforeWrite?.();
+  for (const idx of indexes) {
+    const current = Object.prototype.hasOwnProperty.call(bots[idx], 'plugins') ? bots[idx].plugins : undefined;
+    const next = updateBotPluginOverride(current, pluginId, enable);
+    if (next.length > 0) bots[idx].plugins = next;
+    else delete bots[idx].plugins;
+  }
+  writeBotsAtomic(BOTS_JSON_FILE, bots);
+  return indexes.length;
+}
+
+function removePluginBindingsEverywhere(pluginId: string): void {
+  updateGlobalPluginBinding(pluginId, false);
+  const bots = loadBotsJson();
+  let changed = false;
+  for (const bot of bots) {
+    if (!Object.prototype.hasOwnProperty.call(bot, 'plugins')) continue;
+    const next = removePluginId(bot.plugins, pluginId);
+    const before = normalizePluginIdList(bot.plugins) ?? [];
+    if (before.length !== next.length) changed = true;
+    if (next.length > 0) bot.plugins = next;
+    else delete bot.plugins;
+  }
+  if (changed) writeBotsAtomic(BOTS_JSON_FILE, bots);
+  const pinnedPlugins = normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? [];
+  if (pinnedPlugins.includes(pluginId)) {
+    mergeDashboardConfig({ pinnedPlugins: pinnedPlugins.filter(id => id !== pluginId) });
+  }
+}
+
+async function removePluginSkillRegistryEntries(pluginId: string): Promise<void> {
+  const { readSkillRegistry, removeInstalledSkill } = await import('./services/skill-registry-store.js');
+  const { pluginRuntimeDir, pluginHome, resolvePluginPath } = await import('./core/plugins/paths.js');
+  const { getInstalledPlugin } = await import('./services/plugin-registry-store.js');
+  const roots = new Set<string>([pluginHome(pluginId)]);
+  const record = getInstalledPlugin(pluginId);
+  const skillEntries = record?.contributions?.skills ?? (record?.manifest as any)?.skills ?? [];
+  for (const entry of skillEntries) {
+    try {
+      const skillDir = resolvePluginPath(pluginRuntimeDir(pluginId), entry.path, 'skill_path');
+      roots.add(skillDir);
+      if (existsSync(skillDir)) roots.add(realpathSync(skillDir));
+    } catch {
+      /* best effort cleanup */
+    }
+  }
+  const isWithinPluginSkill = (value: string | undefined): boolean => {
+    if (!value) return false;
+    const candidates = [value];
+    try { if (existsSync(value)) candidates.push(realpathSync(value)); } catch { /* ignore */ }
+    return candidates.some(candidate => [...roots].some(root => candidate === root || candidate.startsWith(`${root}/`)));
+  };
+  const registry = readSkillRegistry();
+  for (const skill of Object.values(registry.skills)) {
+    const sourcePath = skill.source.type === 'local-link' ? skill.source.path : undefined;
+    if (isWithinPluginSkill(skill.rootDir) || isWithinPluginSkill(sourcePath)) {
+      removeInstalledSkill(skill.name);
+    }
+  }
+}
+
+function assertPluginInstalled(pluginId: string): void {
+  const { plugins } = readPluginRegistryCached();
+  if (!plugins[pluginId]) {
+    console.error(`❌ 插件未安装: ${pluginId}`);
+    console.error(`   先运行: botmux plugin install ${pluginId}`);
+    process.exit(1);
+  }
+}
+
+let pluginRegistryCache: import('./core/plugins/types.js').PluginRegistryFile | null = null;
+function readPluginRegistryCached(): import('./core/plugins/types.js').PluginRegistryFile {
+  if (pluginRegistryCache) return pluginRegistryCache;
+  // Synchronous top-level dynamic import is not available; this function is
+  // only used after cmdPlugin has loaded the registry into the cache.
+  throw new Error('plugin_registry_cache_not_loaded');
+}
+
+async function loadPluginRegistryForCommand(): Promise<import('./core/plugins/types.js').PluginRegistryFile> {
+  const { readPluginRegistry } = await import('./services/plugin-registry-store.js');
+  pluginRegistryCache = readPluginRegistry();
+  return pluginRegistryCache;
+}
+
+function printPluginUsage(): void {
+  console.log(`用法:
+  botmux plugin list
+  botmux plugin init <plugin-id|botmux-plugin-id|@botmux-ai/plugin-id>
+  botmux plugin install <npm-package|local-dir> [--link]
+  botmux plugin uninstall <plugin-id> [--force]
+  botmux plugin enable <plugin-id> [--bot <name|index|all>]
+  botmux plugin disable <plugin-id> [--bot <name|index|all>]
+  botmux <plugin-command> [args...]
+  botmux plugin service status
+  botmux plugin service start [plugin-id|--all]
+  botmux plugin service stop [plugin-id|--all]
+  botmux plugin service restart [plugin-id|--all]
+`);
+}
+
+async function cmdPlugin(args: string[]): Promise<void> {
+  const sub = (args[0] ?? 'list').toLowerCase();
+  if (sub === 'help' || sub === '--help' || sub === '-h') {
+    printPluginUsage();
+    return;
+  }
+
+  if (sub === 'install') {
+    const spec = args[1];
+    if (!spec) { printPluginUsage(); process.exit(1); }
+    const { installPlugin } = await import('./core/plugins/install.js');
+    const { resolveOfficialPluginPackageSpec } = await import('./core/plugins/init.js');
+    const resolvedSpec = resolveOfficialPluginPackageSpec(spec);
+    const result = installPlugin(resolvedSpec, { link: args.includes('--link') });
+    const enabledPlugins = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+    if (enabledPlugins.includes(result.record.id)) {
+      const { materializePlugin } = await import('./core/plugins/materializer.js');
+      materializePlugin(result.record.id);
+    }
+    console.log(`✅ 已安装插件 ${result.record.id} (${result.record.packageName}@${result.record.version})`);
+    return;
+  }
+
+  if (sub === 'init') {
+    const rawName = args[1];
+    if (!rawName) { printPluginUsage(); process.exit(1); }
+    const { initPlugin } = await import('./core/plugins/init.js');
+    try {
+      const result = initPlugin(rawName);
+      console.log(`✅ 已创建插件: ${result.displayName}`);
+      console.log(`   目录: ${result.targetDir}`);
+      console.log(`   npm 包名: ${result.packageName}`);
+      console.log(`   插件 id: ${result.pluginId}`);
+      console.log(`   默认命令: botmux ${result.commandPrefix}hello`);
+      console.log('');
+      console.log('下一步:');
+      console.log(`   cd ${result.repoName}`);
+      console.log('   botmux plugin install . --link');
+      console.log(`   botmux plugin enable ${result.pluginId}`);
+      console.log(`   botmux ${result.commandPrefix}hello`);
+    } catch (err: any) {
+      console.error(`❌ 创建插件失败: ${err?.message ?? String(err)}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  const registry = await loadPluginRegistryForCommand();
+
+  if (sub === 'list' || sub === 'ls') {
+    const plugins = Object.values(registry.plugins).sort((a, b) => a.id.localeCompare(b.id));
+    if (plugins.length === 0) {
+      console.log('暂无已安装插件。');
+      return;
+    }
+    const globalPlugins = new Set(readGlobalConfig().plugins ?? []);
+    for (const plugin of plugins) {
+      const flags = [
+        globalPlugins.has(plugin.id) ? 'enabled' : '',
+      ].filter(Boolean).join(' ');
+      console.log(`${plugin.id}\t${plugin.packageName}@${plugin.version}${flags ? `\t${flags}` : ''}`);
+    }
+    return;
+  }
+
+  if (sub === 'enable' || sub === 'disable') {
+    const pluginId = requirePluginId(args[1]);
+    assertPluginInstalled(pluginId);
+    const enable = sub === 'enable';
+    if (args.includes('--global')) {
+      console.error('❌ 机器默认是默认作用域，不需要 --global。');
+      console.error(`   用法: botmux plugin ${sub} ${pluginId} [--bot <name|index|all>]`);
+      process.exit(1);
+    }
+    const botSelector = findArgValue(args, '--bot');
+    if (args.includes('--bot') && !botSelector) {
+      console.error('❌ --bot 后需要 bot 名称、序号或 all。');
+      process.exit(1);
+    }
+    const { materializePlugin, dematerializePlugin } = await import('./core/plugins/materializer.js');
+    if (enable) {
+      if (botSelector) {
+        updateBotPluginBinding(pluginId, botSelector, true, () => materializePlugin(pluginId));
+      } else {
+        const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+        assertPluginBindingTransitionForCli(pluginId, true, current);
+        materializePlugin(pluginId);
+        updateGlobalPluginBinding(pluginId, true);
+      }
+    } else {
+      if (botSelector) {
+        updateBotPluginBinding(pluginId, botSelector, false);
+      } else {
+        const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+        assertPluginBindingTransitionForCli(pluginId, false, current);
+        updateGlobalPluginBinding(pluginId, false);
+      }
+      const stillReferenced = (normalizePluginIdList(readGlobalConfig().plugins) ?? []).includes(pluginId)
+        || loadBotsJson().some(bot => (normalizePluginIdList(bot.plugins) ?? []).includes(pluginId));
+      if (!stillReferenced) dematerializePlugin(pluginId);
+    }
+    console.log(`✅ 已${enable ? '启用' : '禁用'}${botSelector ? ` Bot(${botSelector})` : '机器默认'}插件: ${pluginId}`);
+    return;
+  }
+
+  if (sub === 'uninstall' || sub === 'remove' || sub === 'rm') {
+    const pluginId = requirePluginId(args[1]);
+    assertPluginInstalled(pluginId);
+    const enabledEverywhere = new Set(normalizePluginIdList(readGlobalConfig().plugins) ?? []);
+    for (const bot of loadBotsJson()) {
+      for (const id of normalizePluginIdList(bot.plugins) ?? []) enabledEverywhere.add(id);
+    }
+    const dependents = enabledPluginDependents(pluginId, [...enabledEverywhere], registry);
+    if (dependents.length > 0) {
+      console.error(`❌ 不能卸载 ${pluginId}，以下已启用插件依赖它: ${dependents.join(', ')}`);
+      console.error('   请先在对应作用域显式禁用这些插件。');
+      process.exit(1);
+    }
+    const { dematerializePlugin } = await import('./core/plugins/materializer.js');
+    const { deletePluginServices } = await import('./core/plugins/service-manager.js');
+    dematerializePlugin(pluginId);
+    await deletePluginServices([pluginId]);
+    await removePluginSkillRegistryEntries(pluginId);
+    const { removeInstalledPlugin } = await import('./services/plugin-registry-store.js');
+    const { pluginHome } = await import('./core/plugins/paths.js');
+    removeInstalledPlugin(pluginId);
+    removePluginBindingsEverywhere(pluginId);
+    rmSync(pluginHome(pluginId), { recursive: true, force: true });
+    console.log(`✅ 已卸载插件: ${pluginId}`);
+    return;
+  }
+
+  if (sub === 'service' || sub === 'services') {
+    const action = (args[1] ?? 'status').toLowerCase();
+    const rawId = args[2];
+    const pluginIds = !rawId || rawId === '--all' ? undefined : [requirePluginId(rawId)];
+    if (action === 'status' || action === 'list') {
+      const { listPluginServiceStatus } = await import('./core/plugins/service-manager.js');
+      console.log(formatPluginServiceReports(await listPluginServiceStatus()));
+      return;
+    }
+    if (action === 'start') {
+      await reconcilePluginServicesForCli(pluginIds);
+      return;
+    }
+    if (action === 'stop') {
+      await stopPluginServicesForCli(pluginIds);
+      return;
+    }
+    if (action === 'restart') {
+      await stopPluginServicesForCli(pluginIds);
+      await reconcilePluginServicesForCli(pluginIds);
+      return;
+    }
+    printPluginUsage();
+    process.exit(1);
+  }
+
+  printPluginUsage();
+  process.exit(1);
+}
+
+async function runPluginCommandByName(rawCommand: string, commandArgs: string[]): Promise<boolean> {
+  const sessionId = process.env.BOTMUX_SESSION_ID?.trim();
+  const { readSessionPluginManifest } = await import('./core/plugins/session-manifest.js');
+  const pluginIds = sessionId
+    ? readSessionPluginManifest(sessionId)?.pluginIds ?? []
+    : normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+  if (pluginIds.length === 0) return false;
+  const { collectPluginCliCommands } = await import('./core/plugins/runtime.js');
+  const commands = await collectPluginCliCommands(pluginIds);
+  const matches = commands.filter(command => command.name === rawCommand);
+  if (matches.length === 0) return false;
+  if (matches.length > 1) {
+    console.error(`❌ 插件 CLI 命令冲突: ${rawCommand}`);
+    console.error(`   冲突插件: ${matches.map(command => command.pluginId).join(', ')}`);
+    console.error('   请禁用其中一个插件，或让插件作者改用唯一 command 名称。');
+    process.exit(1);
+  }
+  const command = matches[0];
+  const registry = await loadPluginRegistryForCommand();
+  const record = registry.plugins[command.pluginId];
+  const { pluginRuntimeDir } = await import('./core/plugins/paths.js');
+  const result = await command.run({
+    runtime: 'cli',
+    pluginId: command.pluginId,
+    pluginDir: pluginRuntimeDir(command.pluginId),
+    packageName: record?.packageName ?? command.pluginId,
+    version: record?.version ?? '0.0.0',
+    manifest: record?.manifest ?? { schemaVersion: 1, id: command.pluginId },
+    args: commandArgs,
+  });
+  if (typeof result === 'string') console.log(result);
+  if (typeof result === 'number') process.exitCode = result;
+  return true;
+}
+
 switch (command) {
   case '--version':
   case '-v':      console.log(getVersion()); break;
@@ -7758,7 +8649,7 @@ switch (command) {
   }
   case 'start':   await cmdStart(); break;
   case 'start-bot': await cmdStartBot(process.argv.slice(3)); break;
-  case 'stop':    cmdStop(); break;
+  case 'stop':    await cmdStop(); break;
   case 'restart': await cmdRestart(); break;
   case 'logs':    cmdLogs(); break;
   case 'status':  cmdStatus(); break;
@@ -7801,6 +8692,17 @@ switch (command) {
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);
     process.exitCode = result.code;
+    break;
+  }
+  case 'mcp': {
+    const sub = process.argv[3] ?? '';
+    if (sub !== 'serve') {
+      console.error('用法: botmux mcp serve');
+      process.exitCode = 2;
+      break;
+    }
+    const { runMcpGateway } = await import('./core/plugins/mcp/gateway.js');
+    await runMcpGateway();
     break;
   }
   case 'hook': {
@@ -7863,6 +8765,8 @@ switch (command) {
     await cmdVcAgent(process.argv[3] ?? '', process.argv.slice(4));
     break;
   }
+  case 'plugin':
+  case 'plugins':  await cmdPlugin(process.argv.slice(3)); break;
   case 'whiteboard':
   case 'wb':       await cmdWhiteboard(process.argv[3] ?? 'status', process.argv.slice(4)); break;
   case 'thread':   {
@@ -7887,5 +8791,7 @@ switch (command) {
     else { console.error(`用法: botmux autostart <enable|disable|status>`); process.exit(1); }
     break;
   }
-  default:        showHelp(); break;
+  default:
+    if (!await runPluginCommandByName(command, process.argv.slice(3))) showHelp();
+    break;
 }

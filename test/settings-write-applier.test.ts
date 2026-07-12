@@ -18,6 +18,8 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
   const settingsView: ResolvedDashboardSettingsView = {
     publicReadOnly: false,
     openTerminalInFeishu: false,
+    enableLocalCliOpen: false,
+    localCliOpenMode: 'attach',
     chatBotDiscovery: true,
     vcMeetingAgent: { enabled: true },
     maintenance: {},
@@ -42,6 +44,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
       return { ok: true, patch: body as MaintenanceConfig } as const;
     }),
     isLocalDevInstall: vi.fn(() => false),
+    isAutoUpdateSupportedInstall: vi.fn(() => true),
     resolveDashboardSettings: vi.fn(() => settingsView),
     isLocale: ((v: unknown): v is 'zh' | 'en' => v === 'zh' || v === 'en'),
     syncVcMeetingListenerBotConfig: vi.fn(async () => ({ ok: true as const })),
@@ -65,6 +68,20 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ openTerminalInFeishu: true }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ openTerminalInFeishu: true });
+  });
+
+  it('writes enableLocalCliOpen toggle', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ enableLocalCliOpen: true }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ enableLocalCliOpen: true });
+  });
+
+  it('writes localCliOpenMode enum', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ localCliOpenMode: 'resume' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ localCliOpenMode: 'resume' });
   });
 
   it('writes chatBotDiscovery toggle (off) through the dashboard segment', async () => {
@@ -164,6 +181,23 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.error).toBe('invalid_openTerminalInFeishu');
   });
 
+  it('rejects non-boolean enableLocalCliOpen → invalid_enableLocalCliOpen', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ enableLocalCliOpen: 'yes' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('invalid_enableLocalCliOpen');
+  });
+
+  it('rejects invalid localCliOpenMode enum → invalid_localCliOpenMode', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ localCliOpenMode: 'tmux' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('invalid_localCliOpenMode');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
   it('rejects non-object whiteboard → invalid_whiteboard', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ whiteboard: 'on' }, deps);
@@ -242,6 +276,17 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
     expect(r.error).toBe('local_dev_no_autoupdate');
+    expect(deps.mergeMaintenanceConfig).not.toHaveBeenCalled();
+  });
+
+  it('refuses enabling autoUpdate for an unsupported global install', async () => {
+    const deps = makeDeps({ isAutoUpdateSupportedInstall: vi.fn(() => false) });
+    const r = await applySettingsWrite({
+      maintenance: { autoUpdate: { enabled: true } },
+    }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('unsupported_install_no_autoupdate');
     expect(deps.mergeMaintenanceConfig).not.toHaveBeenCalled();
   });
 

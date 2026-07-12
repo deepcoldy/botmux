@@ -1,13 +1,16 @@
 # botmux 文档站
 
-botmux 的中文功能文档站，基于 [**rspress**](https://rspress.dev/) 构建，发布在**飞书妙搭（Miaoda）**上。
+botmux 功能文档站（中 / 英），基于 [**rspress**](https://rspress.dev/) 构建。两处发布：
 
-- 线上地址：由维护者通过 `BOTMUX_DOCS_APP_ID` 对应的妙搭应用发布；公开仓库不记录内部应用地址。
+- **主站**：GitHub Pages —— <https://deepcoldy.github.io/botmux/>。push 到 master 且改动 `docs-site/**` 时，由 `.github/workflows/docs-deploy.yml` 自动构建并发布到 `deepcoldy.github.io` 的 `gh-pages` 分支 `/botmux/` 子路径（同域根路径 `/` 跳转到 `/botmux/`；只替换 `botmux/` 子树，不影响同域其它路径）。
+- **国内镜像**：飞书妙搭（Miaoda），手动 `./deploy.sh` 发布；公开仓库不记录内部应用地址。
 - 源码：本目录（`docs/` 下的 Markdown + `rspress.config.ts`）
 
-## 形态与托管（重要）
+## 形态与托管（妙搭镜像专属，重要）
 
-飞书妙搭只服务 **HTML 页面**，**不服务本地打包出来的 JS/CSS 资源文件**（请求会回退到 index.html）。所以这里采用「**HTML 壳发妙搭 + 资源走外链 CDN**」的方案：
+> GitHub Pages 原生服务 JS/CSS 静态资源，没有下面这套限制——Actions 直接把 `doc_build/`（HTML + `static/`）整份发上去即可，`assetPrefix` 用 `BOTMUX_DOCS_ASSET_PREFIX=/botmux/` 指到同源子路径。下面这套「资源走 CDN」的绕法只针对妙搭。
+
+飞书妙搭只服务 **HTML 页面**，**不服务本地打包出来的 JS/CSS 资源文件**（请求会回退到 index.html）。所以妙搭那份采用「**HTML 壳发妙搭 + 资源走外链 CDN**」的方案：
 
 - `rspress build` 产出多页静态站（`doc_build/`：每个路由一个 `.html` + `static/` 里的 JS/CSS/分包/搜索索引）。
 - **`static/` 整个推到 GitHub 的一个 git tag**（`docs-assets-vN`），用 [jsDelivr](https://www.jsdelivr.com/) 当 CDN 服务它；`rspress.config.ts` 里的 `assetPrefix` 指向这个 jsDelivr 前缀。
@@ -36,7 +39,20 @@ pnpm dev          # 本地热更新预览（assetPrefix 在本地不影响，直
   ```
   视频建议先压一下（`ffmpeg -crf 30 -movflags +faststart`），`preload="metadata"` 让它点开才加载。
 
-## 发布
+## 发布到 GitHub Pages（主站，自动）
+
+日常改文档**不用手动发**：push 到 master、改动落在 `docs-site/**` 时，`.github/workflows/docs-deploy.yml` 会自动：
+
+```
+BOTMUX_DOCS_BASE=/botmux/ BOTMUX_DOCS_ASSET_PREFIX=/botmux/ pnpm build
+→ 只替换 deepcoldy.github.io gh-pages 分支的 botmux/ 子树（保留根跳转与同域其它路径）
+```
+
+- 想手动触发一次：仓库 Actions 页跑 `Deploy docs to GitHub Pages`（`workflow_dispatch`）。
+- 鉴权靠仓库 secret `PAGES_DEPLOY_KEY`（对 `deepcoldy.github.io` 有写权限的 deploy key 私钥）。
+- 本地手动复现同样的产物：`cd docs-site && BOTMUX_DOCS_BASE=/botmux/ BOTMUX_DOCS_ASSET_PREFIX=/botmux/ pnpm build`，产物在 `doc_build/`。
+
+## 发布到妙搭（国内镜像，手动）
 
 ```bash
 cd docs-site

@@ -17,9 +17,13 @@ vi.mock('../src/global-config.js', () => ({
   isRemoteAccessEnabled: vi.fn(() => false),
 }));
 
-vi.mock('../src/platform/binding.js', () => ({
-  platformMachineBaseUrl: vi.fn(() => null),
-}));
+vi.mock('../src/platform/binding.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/platform/binding.js')>();
+  return {
+    ...actual,
+    platformMachineBaseUrl: vi.fn(() => null),
+  };
+});
 
 const deleteMessageMock = vi.fn(async (_appId: string, _messageId: string) => {});
 const updateMessageMock = vi.fn(async (_appId: string, _messageId: string, _json: string) => {});
@@ -349,6 +353,7 @@ describe('restoreUsageLimitRuntimeState', () => {
       'zh',
       ds.usageLimit,
       undefined,
+      false,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });

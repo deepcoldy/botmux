@@ -16,8 +16,15 @@ import {
 } from '../services/webhook-key.js';
 import { platformMachineBaseUrl } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
-import { listTriggerLogs, pruneTriggerLogs, summarizeTriggerLogs, type TriggerLogStats } from '../services/trigger-log-store.js';
-import type { TriggerErrorCode } from '../services/trigger-types.js';
+import {
+  pruneTriggerLogs,
+  queryTriggerLogs,
+  summarizeTriggerLogOverview,
+  summarizeTriggerLogs,
+  type TriggerLogListOptions,
+  type TriggerLogStats,
+} from '../services/trigger-log-store.js';
+import type { TriggerAction, TriggerErrorCode } from '../services/trigger-types.js';
 import { jsonRes } from './workflow-api.js';
 
 const DEFAULT_VERIFY_HEADERS = {
@@ -66,6 +73,25 @@ function logStatus(v: string | null): 'ok' | 'error' | undefined {
   return v === 'ok' || v === 'error' ? v : undefined;
 }
 
+function logAction(v: string | null): TriggerAction | 'failed' | undefined {
+  return v && ['queued', 'delivered', 'dry_run', 'ignored', 'completed', 'failed'].includes(v)
+    ? v as TriggerAction | 'failed'
+    : undefined;
+}
+
+function triggerLogFilters(url: URL): TriggerLogListOptions {
+  const errorCode = url.searchParams.get('errorCode') as TriggerErrorCode | null;
+  return {
+    connectorId: url.searchParams.get('connectorId') ?? undefined,
+    status: logStatus(url.searchParams.get('status')),
+    errorCode: errorCode ?? undefined,
+    method: url.searchParams.get('method') ?? undefined,
+    action: logAction(url.searchParams.get('action')),
+    query: url.searchParams.get('q') ?? undefined,
+    since: url.searchParams.get('since') ?? undefined,
+  };
+}
+
 function emptyStats(connectorId: string): TriggerLogStats {
   return { connectorId, total: 0, ok: 0, error: 0, actions: {}, errorCodes: {} };
 }
@@ -103,14 +129,20 @@ function normalizeConnectorInput(
   const botIds = hasOwn(target, 'botIds')
     ? Array.from(new Set(stringList(target.botIds).map(x => x.trim()).filter(Boolean)))
     : prior?.target.botIds;
-  const chatId = typeof target.chatId === 'string' && target.chatId.trim() ? target.chatId.trim() : prior?.target.chatId;
+  const chatId = targetMode === 'fixed'
+    ? (typeof target.chatId === 'string' && target.chatId.trim() ? target.chatId.trim() : prior?.target.chatId)
+    : undefined;
   if (targetMode === 'fixed' && !chatId) return { ok: false, error: 'fixed_chat_required' };
-  const workflowId = typeof target.workflowId === 'string' && target.workflowId.trim() ? target.workflowId.trim() : prior?.target.workflowId;
+  const workflowId = targetKind === 'workflow'
+    ? (typeof target.workflowId === 'string' && target.workflowId.trim() ? target.workflowId.trim() : prior?.target.workflowId)
+    : undefined;
   if (targetKind === 'workflow' && !workflowId) return { ok: false, error: 'workflow_id_required' };
   // Dedup is now OPTIONAL for new-group (null = a fresh group per event).
-  const lifecycleExtractors = c.lifecycleExtractors === undefined
-    ? (prior?.lifecycleExtractors ?? null)
-    : normalizeLifecycleExtractors(c.lifecycleExtractors);
+  const lifecycleExtractors = targetMode === 'new-group'
+    ? (c.lifecycleExtractors === undefined
+      ? (prior?.lifecycleExtractors ?? null)
+      : normalizeLifecycleExtractors(c.lifecycleExtractors))
+    : null;
 
   const secretRef =
     opts.secretRef ||
@@ -148,7 +180,9 @@ function normalizeConnectorInput(
       botId,
       ...(botIds && botIds.length > 0 ? { botIds: botIds.includes(botId) ? botIds : [botId, ...botIds] } : {}),
       ...(chatId ? { chatId } : {}),
-      ...(hasOwn(target, 'allowChats') ? { allowChats: stringList(target.allowChats) } : prior?.target.allowChats ? { allowChats: prior.target.allowChats } : {}),
+      ...(targetMode === 'dynamic'
+        ? { allowChats: hasOwn(target, 'allowChats') ? stringList(target.allowChats) : (prior?.target.allowChats ?? []) }
+        : {}),
       ...(workflowId ? { workflowId } : {}),
     },
     promptEnvelope: {
@@ -167,7 +201,7 @@ function normalizeConnectorInput(
         : prior?.promptEnvelope.instruction ? { instruction: prior.promptEnvelope.instruction } : {}),
     },
     loggingPolicy: {
-      storePayload: bool(loggingPolicy.storePayload, prior?.loggingPolicy.storePayload ?? false),
+      storePayload: bool(loggingPolicy.storePayload, prior?.loggingPolicy.storePayload ?? true),
       storeHeaders: bool(loggingPolicy.storeHeaders, prior?.loggingPolicy.storeHeaders ?? true),
       retentionDays: positiveInt(loggingPolicy.retentionDays, prior?.loggingPolicy.retentionDays ?? 14, 1, 365),
     },
@@ -366,13 +400,15 @@ export async function handleConnectorApi(
     return true;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/trigger-logs/summary') {
+    jsonRes(res, 200, { summary: summarizeTriggerLogOverview(triggerLogFilters(url)) });
+    return true;
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/trigger-logs') {
     const limit = Number(url.searchParams.get('limit') ?? '100');
-    const connectorId = url.searchParams.get('connectorId') ?? undefined;
-    const status = logStatus(url.searchParams.get('status'));
-    const errorCode = url.searchParams.get('errorCode') as TriggerErrorCode | null;
-    const since = url.searchParams.get('since') ?? undefined;
-    jsonRes(res, 200, { logs: listTriggerLogs({ limit, connectorId, status, errorCode: errorCode ?? undefined, since }) });
+    const offset = Number(url.searchParams.get('offset') ?? '0');
+    jsonRes(res, 200, queryTriggerLogs({ ...triggerLogFilters(url), limit, offset }));
     return true;
   }
 

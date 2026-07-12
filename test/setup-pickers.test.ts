@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { computeViewportTop, pickChoice, truncateToWidth } from '../src/setup/interactive-select.js';
 import {
+  createOpenPlatformAppWithClient,
   listOpenPlatformApps,
   fetchOpenPlatformAppSecret,
   type OpenPlatformApiClient,
@@ -82,6 +83,10 @@ function stubClient(responses: unknown[] | ((path: string, body: unknown) => unk
       calls.push({ path, body });
       return queue ? queue.shift() : (responses as (p: string, b: unknown) => unknown)(path, body);
     },
+    async postForm(path: string, body: FormData) {
+      calls.push({ path, body });
+      return queue ? queue.shift() : (responses as (p: string, b: unknown) => unknown)(path, body);
+    },
   };
 }
 
@@ -140,5 +145,54 @@ describe('fetchOpenPlatformAppSecret', () => {
   it('throws when the response has no secret field', async () => {
     const client = stubClient([{ code: 0, data: {} }]);
     await expect(fetchOpenPlatformAppSecret(client, 'cli_a')).rejects.toThrow(/secret/);
+  });
+});
+
+describe('createOpenPlatformAppWithClient', () => {
+  it('uploads the botmux icon, creates a named self-built app, then reads its secret', async () => {
+    const client = stubClient([
+      { code: 0, data: { url: 'https://cdn.example/botmux.png' } },
+      { code: 0, data: { ClientID: 'cli_new' } },
+      { code: 0 },
+      { code: 0 },
+      { code: 0, data: { secret: 'new-secret' } },
+    ]);
+
+    await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-2' })).resolves.toEqual({
+      appId: 'cli_new',
+      appSecret: 'new-secret',
+    });
+
+    expect(client.calls.map(call => call.path)).toEqual([
+      '/developers/v1/app/upload/image',
+      '/developers/v1/app/create',
+      '/developers/v1/robot/switch/cli_new',
+      '/developers/v1/event/switch/cli_new',
+      '/developers/v1/secret/cli_new',
+    ]);
+    const upload = client.calls[0].body as FormData;
+    expect(upload.get('uploadType')).toBe('4');
+    expect(upload.get('isIsv')).toBe('false');
+    expect(upload.get('scale')).toBe(JSON.stringify({ width: 512, height: 512 }));
+    expect(client.calls[1].body).toMatchObject({
+      appSceneType: 0,
+      name: 'botmux-2',
+      avatar: 'https://cdn.example/botmux.png',
+      primaryLang: 'zh_cn',
+    });
+    expect(client.calls[2].body).toEqual({ clientId: 'cli_new', enable: true });
+    expect(client.calls[3].body).toEqual({ clientId: 'cli_new', eventMode: 4 });
+  });
+
+  it('retains the created app id in the error when secret reading fails', async () => {
+    const client = stubClient([
+      { code: 0, data: { url: 'https://cdn.example/botmux.png' } },
+      { code: 0, data: { ClientID: 'cli_orphan_guard' } },
+      { code: 0 },
+      { code: 0 },
+      { code: 0, data: {} },
+    ]);
+    await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-3' }))
+      .rejects.toThrow(/cli_orphan_guard.*AppSecret/);
   });
 });

@@ -46,6 +46,10 @@ const RESERVED_ENV_KEYS = new Set<string>([
   'CLAUDECODE',
   'CLAUDE_CONFIG_DIR',
   'CODEX_HOME',
+  // Grok data root: daemon installs hooks/skills and drains transcripts under
+  // the process-level GROK_HOME. A per-bot inject would only reach the child
+  // CLI and split-brain path resolution (see grok-paths header).
+  'GROK_HOME',
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
   'CJADK_INTERACTIVE',
 ]);

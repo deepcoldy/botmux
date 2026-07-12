@@ -20,7 +20,7 @@
  * /tmp/tmux-UID/default"), because `tmux -V` would pass but every subsequent
  * tmux command would fail. Functional probe + soft fallback fixes both.
  */
-import { execSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
@@ -31,11 +31,10 @@ export interface TmuxResult {
   /** True iff we ran an installer (vs. tmux was already present). */
   freshInstall: boolean;
   /**
-   * Whether the `tmux` binary is on PATH at all, INDEPENDENT of whether it can
-   * start a server. Lets the start-gate (PR#289 Option A) distinguish "tmux
-   * genuinely absent" (deterministic → safe to hard-fail daemon startup) from
-   * "binary present but the functional probe flaked" (must degrade gracefully
-   * via the per-session gate, never block startup — see
+   * False only when the version probe authoritatively returns ENOENT. True also
+   * covers timeout/EMFILE/EACCES, where presence cannot be disproved and startup
+   * must not hard-fail with a misleading PATH diagnosis. Lets the start-gate
+   * distinguish "tmux genuinely absent" from "probe got no answer" (see
    * shouldHardFailStartupForMissingTmux). Set on every return.
    */
   binaryPresent?: boolean;
@@ -47,17 +46,53 @@ export interface TmuxResult {
   manualCommand?: string;
 }
 
-function probeTmuxVersion(): string | undefined {
+type TmuxVersionProbe =
+  | { ok: true; version: string }
+  | { ok: false; reason: string; binaryPresent: boolean; retryable: boolean };
+
+export type TmuxFunctionalProbe =
+  | { ok: true; version: string }
+  | { ok: false; reason: string; binaryPresent: boolean; retryable: boolean; version?: string };
+
+function childFailureReason(command: string, failure: any, timeoutMs: number): string {
+  const nested = failure?.error;
+  const code = failure?.code ?? nested?.code;
+  const signal = failure?.signal ?? nested?.signal;
+  const stderr = (failure?.stderr?.toString?.() ?? nested?.stderr?.toString?.() ?? '').trim();
+
+  if (code === 'ENOENT') return `${command} 启动失败：找不到 tmux 可执行文件（ENOENT）`;
+  if (code === 'EACCES') return `${command} 启动失败：tmux 不可执行（EACCES）`;
+  if (code === 'EMFILE' || code === 'ENFILE') return `${command} 启动失败：文件描述符耗尽（${code}）`;
+  if (code === 'ETIMEDOUT' || signal || failure?.killed || nested?.killed) {
+    const detail = signal ? `，signal=${signal}` : '';
+    return `${command} 探测超时（${timeoutMs}ms${detail}）`;
+  }
+  if (stderr) return `${command} 失败：${stderr}`;
+  if (typeof failure?.status === 'number') return `${command} 失败（exit ${failure.status}）`;
+  const message = nested?.message ?? failure?.message;
+  return `${command} 启动/探测失败${message ? `：${message}` : ''}`;
+}
+
+function probeTmuxVersion(): TmuxVersionProbe {
   try {
-    const out = execSync('tmux -V', {
+    const out = execFileSync('tmux', ['-V'], {
       encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 3000,
       env: tmuxEnv(),
     });
-    return out.trim();
-  } catch {
-    return undefined;
+    return { ok: true, version: out.trim() };
+  } catch (err: any) {
+    const code = err?.code;
+    return {
+      ok: false,
+      reason: childFailureReason('tmux -V', err, 3000),
+      // Only ENOENT proves absence. Timeout/EMFILE/EACCES must not be turned
+      // into the old, misleading "not on PATH" diagnosis or a startup hard
+      // gate; they prove only that this particular probe got no answer.
+      binaryPresent: code !== 'ENOENT',
+      retryable: code !== 'ENOENT' && code !== 'EACCES',
+    };
   }
 }
 
@@ -140,9 +175,10 @@ function cleanupTmuxProbeSocket(sockName: string, env: NodeJS.ProcessEnv = proce
  * reason can surface in the bootstrap warning without spilling onto the
  * user's terminal.
  */
-export function probeTmuxFunctional(): { ok: true; version: string } | { ok: false; reason: string } {
-  const version = probeTmuxVersion();
-  if (!version) return { ok: false, reason: 'tmux 二进制不在 PATH 上' };
+export function probeTmuxFunctional(): TmuxFunctionalProbe {
+  const versionProbe = probeTmuxVersion();
+  if (!versionProbe.ok) return versionProbe;
+  const version = versionProbe.version;
   const sockName = `bmx-probe-${process.pid}-${Date.now()}`;
   // env: tmuxEnv() — without this, if the daemon inherited TMUX from a tmux
   // session that has since died, this probe would target the dead server
@@ -156,8 +192,13 @@ export function probeTmuxFunctional(): { ok: true; version: string } | { ok: fal
   if (run.status !== 0) {
     spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
     cleanupTmuxProbeSocket(sockName);
-    const stderr = (run.stderr?.toString() ?? '').trim();
-    return { ok: false, reason: stderr || `tmux new-session 失败 (exit ${run.status})` };
+    return {
+      ok: false,
+      reason: childFailureReason('tmux new-session', run, 5000),
+      binaryPresent: true,
+      retryable: (run.error as NodeJS.ErrnoException | undefined)?.code !== 'EACCES',
+      version,
+    };
   }
   // Tear down the probe server and remove the socket file. Some platforms leave
   // bmx-probe-* sockets behind after the server exits; thousands of stale
@@ -165,6 +206,35 @@ export function probeTmuxFunctional(): { ok: true; version: string } | { ok: fal
   spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
   cleanupTmuxProbeSocket(sockName);
   return { ok: true, version };
+}
+
+/**
+ * Worker-side gate probe with a short exponential backoff. A daemon restart can
+ * wake many worker processes at once; if the host is briefly under fd/process
+ * pressure, one failed spawn must not immediately become a user-facing hard
+ * gate. The retries stay local to the worker and callers should still stagger
+ * their restart path so all workers do not retry in lockstep.
+ */
+export function probeTmuxFunctionalWithRetry(opts: { attempts?: number; baseDelayMs?: number } = {}): TmuxFunctionalProbe {
+  const attempts = Math.max(1, Math.floor(opts.attempts ?? 3));
+  const baseDelayMs = Math.max(0, Math.floor(opts.baseDelayMs ?? 150));
+  let result = probeTmuxFunctional();
+  let completed = 1;
+
+  while (!result.ok && result.retryable && completed < attempts) {
+    const backoff = baseDelayMs * (2 ** (completed - 1));
+    const jitter = baseDelayMs > 0 ? Math.floor(Math.random() * baseDelayMs) : 0;
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, backoff + jitter);
+    } catch { /* SharedArrayBuffer unavailable: retry immediately */ }
+    result = probeTmuxFunctional();
+    completed += 1;
+  }
+
+  if (!result.ok && completed > 1) {
+    return { ...result, reason: `${result.reason}（已退避重试 ${completed - 1} 次）` };
+  }
+  return result;
 }
 
 /** Wrap a system command with the appropriate sudo prefix for the current
@@ -242,16 +312,18 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
     return { installed: true, version: initialProbe.version, freshInstall: false, binaryPresent: true };
   }
 
-  // If the binary exists but the server can't start, no amount of
-  // `apt-get install tmux` will help — surface the underlying reason and
-  // let the caller fall back to PTY backend.
-  const versionPresent = probeTmuxVersion();
-  if (versionPresent) {
+  // Only an authoritative ENOENT should enter the installer path. A timeout,
+  // EMFILE or permission failure is not evidence that PATH is missing; surface
+  // the real probe reason and let the per-session gate retry later.
+  if (initialProbe.binaryPresent) {
     return {
       installed: false,
       freshInstall: false,
       binaryPresent: true,
-      reason: `${versionPresent} 已安装但启动 server 失败：${initialProbe.reason}`,
+      version: initialProbe.version,
+      reason: initialProbe.version
+        ? `${initialProbe.version} 已安装但启动 server 失败：${initialProbe.reason}`
+        : initialProbe.reason,
       manualCommand: '排查 ~/.tmux.conf / /tmp 权限 / libevent 依赖后再试',
     };
   }
@@ -295,13 +367,14 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
   if (!platform.hasTty && !platform.isRoot && !platform.passwordlessSudo && platform.os === 'linux') {
     reasonLines.push('提示：当前不是交互式 TTY 且 sudo 需要密码，systemd/pm2 自启下无法弹密码 — 先在 shell 跑一次 `botmux start`，或配置 NOPASSWD sudoers。');
   }
+  const finalVersionProbe = probeTmuxVersion();
   return {
     installed: false,
     freshInstall: false,
     // An install attempt may have landed the binary even though the server
     // probe still fails — re-check PATH so the start-gate doesn't treat a
     // present-but-broken tmux as "genuinely absent".
-    binaryPresent: !!probeTmuxVersion(),
+    binaryPresent: finalVersionProbe.ok || finalVersionProbe.binaryPresent,
     reason: reasonLines.join('\n'),
     manualCommand: manual,
   };

@@ -59,7 +59,6 @@ import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStr
 import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
-import { openLocalTerminalForSession } from '../../core/local-terminal-opener.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
@@ -73,6 +72,14 @@ import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch } from '../../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
+import {
+  isLocalCliOpenCapable,
+  isLocalCliOpenConfigured,
+  isLocalCliOpenReady,
+  localCliOpenMode,
+  openLocalCliInIterm,
+  preflightLocalCliOpen,
+} from '../../services/local-cli-opener.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -211,6 +218,11 @@ const voicedCardIds = new Set<string>();
 // the bot's locale so an English-mode bot gets the English instruction.
 function voiceSummaryInstruction(locale?: Locale): string {
   return t('card.voice.summary_instruction', undefined, locale);
+}
+
+function isLiveWorkerIdleOrLimited(ds: DaemonSession): boolean {
+  if (!ds.worker || ds.worker.killed) return true;
+  return ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited';
 }
 
 function isLegacySelfHealAction(actionType?: string): boolean {
@@ -475,7 +487,7 @@ export async function commitRepoSelection(
           { name: selfBot.botName, openId: selfBot.botOpenId },
           locTarget,
           ds.pendingSender,
-          { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
+          { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger: ds.pendingSubstituteTrigger },
         )
       : '';
     const prompt = pendingRawInput ? '' : wrappedPrompt;
@@ -496,6 +508,7 @@ export async function commitRepoSelection(
     ds.pendingPrompt = undefined;
     ds.pendingAttachments = undefined;
     ds.pendingMentions = undefined;
+    ds.pendingSubstituteTrigger = undefined;
     ds.pendingSender = undefined;
     ds.pendingFollowUps = undefined;
     forkWorker(ds, prompt);
@@ -539,6 +552,7 @@ export async function commitRepoSelection(
       () => sessionReply(rootId, closedCard, 'interactive'),
     );
 
+    const oldSession = ds.session;
     const session = sessionStore.createSession(ds.chatId, rootId, dirLabel, ds.chatType);
     ds.session = session;
     ds.lastUserPrompt = undefined;
@@ -551,6 +565,10 @@ export async function commitRepoSelection(
     ds.workingDir = dirPath;
     ds.session.workingDir = dirPath;
     ds.session.larkAppId = ds.larkAppId;
+    ds.session.chatDisplayName = oldSession.chatDisplayName;
+    ds.session.ownerOpenId = oldSession.ownerOpenId;
+    ds.session.creatorOpenId = oldSession.creatorOpenId;
+    ds.session.lastCallerOpenId = oldSession.lastCallerOpenId;
     sessionStore.updateSession(ds.session);
     ds.hasHistory = false;
     // Re-persist the parked card under the NEW sessionId so a daemon crash
@@ -1314,7 +1332,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return await handleV3LoopGrantAction(value as unknown as V3LoopGrantActionValue, operatorOpenId, deps.v3LoopGrantDeps);
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'goal_cleanup_confirm', 'goal_cleanup_skip'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'goal_cleanup_confirm', 'goal_cleanup_skip'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -1349,10 +1367,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // get_write_link 显式破例：其余敏感动作沿用「静默 block（仅日志）」的既有设计
         // （test/card-handler-repo-select.test.ts 把这点 pin 住了），但「获取操作链接」是
         // 用户主动点的取权动作，静默会让人以为按钮坏了——给一条明确的「无操作权限」toast。
-        if (value.action === 'get_write_link' || value.action === 'open_local_terminal') {
+        if (value.action === 'get_write_link' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
           const key = value.action === 'open_local_terminal'
             ? 'card.action.local_terminal_no_permission'
-            : 'card.action.write_link_no_permission';
+            : value.action === 'open_local_cli'
+              ? 'card.action.local_cli_no_permission'
+              : 'card.action.write_link_no_permission';
           return { toast: { type: 'warning', content: t(key, undefined, localeForBot(effectiveAppId)) } };
         }
         return;
@@ -1369,10 +1389,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (hasAllowlist && (!operatorOpenId || !allowedUsers.includes(operatorOpenId))) {
         logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
         // 与上面 non-operator 分支同理：仅 get_write_link 破例给 toast，其余保持静默。
-        if (value.action === 'get_write_link' || value.action === 'open_local_terminal') {
+        if (value.action === 'get_write_link' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
           const key = value.action === 'open_local_terminal'
             ? 'card.action.local_terminal_no_permission'
-            : 'card.action.write_link_no_permission';
+            : value.action === 'open_local_cli'
+              ? 'card.action.local_cli_no_permission'
+              : 'card.action.write_link_no_permission';
           return { toast: { type: 'warning', content: t(key, undefined, localeForBot(larkAppId)) } };
         }
         return;
@@ -1477,7 +1499,89 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, actionType)
       : activeSessions.get(rootId);
 
-    if (ds && !validateCardCliBinding(ds, value)) return;
+    const launchLocalCli = (target: DaemonSession, locDs: Locale) => {
+      const cliId = sessionCliId(target);
+      const mode = localCliOpenMode();
+      const preflight = preflightLocalCliOpen(target, { cliId, mode });
+      if (!preflight.ok) {
+        logger.warn(`[${tag(target)}] Rejected ${actionType} preflight: ${preflight.error}: ${preflight.message}`);
+        if (preflight.error === 'missing_resume_id') {
+          return { toast: { type: 'warning', content: t('card.action.local_cli_not_ready', undefined, locDs) } };
+        }
+        if (preflight.error === 'unsupported_cli' || preflight.error === 'unsupported_backend' || preflight.error === 'missing_attach_target') {
+          return { toast: { type: 'warning', content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(cliId) }, locDs) } };
+        }
+        return { toast: { type: 'error', content: t('card.action.local_cli_failed', { reason: preflight.message }, locDs) } };
+      }
+      const reportFailure = (reason: string) => {
+        if (value.visibility === 'private') {
+          logger.warn(`[${tag(target)}] ${actionType} failed for private card; suppressing public fallback: ${reason}`);
+          return;
+        }
+        void sessionReply(rootId, t('card.action.local_cli_failed', { reason }, locDs))
+          .catch((err) => logger.warn(`[${tag(target)}] ${actionType} failure reply failed: ${err instanceof Error ? err.message : String(err)}`));
+      };
+      void openLocalCliInIterm(target, { cliId, mode })
+        .then((result) => {
+          if (!result.ok) {
+            logger.warn(`[${tag(target)}] ${actionType} failed: ${result.error}: ${result.message}`);
+            reportFailure(result.message);
+            return;
+          }
+          logger.info(`[${tag(target)}] ${actionType} launched local terminal for ${cliId} (${mode})`);
+        })
+        .catch((err) => {
+          const reason = err instanceof Error ? err.message : String(err);
+          logger.warn(`[${tag(target)}] ${actionType} crashed: ${reason}`);
+          reportFailure(reason);
+        });
+      return {
+        toast: {
+          type: 'success',
+          content: t('card.action.local_cli_opened', { cliName: getCliDisplayName(cliId) }, locDs),
+        },
+      };
+    };
+
+    const guardLocalCliOpen = (target: DaemonSession, locDs: Locale) => {
+      if (!isLocalCliOpenConfigured()) {
+        logger.info(`[${tag(target)}] Rejected ${actionType}: native CLI opening is disabled`);
+        return { toast: { type: 'warning', content: t('card.action.local_cli_disabled', undefined, locDs) } };
+      }
+      if (!isLocalCliOpenCapable()) {
+        logger.info(`[${tag(target)}] Rejected ${actionType}: daemon host cannot open the native CLI`);
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(sessionCliId(target)) }, locDs),
+          },
+        };
+      }
+    };
+
+    if (ds && actionType === 'open_local_cli') {
+      const actualCliId = sessionCliId(ds);
+      const locDs = localeForBot(ds.larkAppId);
+      if (!value?.cli_id) {
+        return { toast: { type: 'error', content: t('card.action.local_cli_missing_cli_id', undefined, locDs) } };
+      }
+      if (value.cli_id !== actualCliId) {
+        logger.warn(
+          `[${tag(ds)}] Rejected open_local_cli from mismatched CLI card: expected=${value.cli_id} actual=${actualCliId}`,
+        );
+        return { toast: { type: 'error', content: t('card.action.local_cli_cli_mismatch', undefined, locDs) } };
+      }
+    } else if (ds && !validateCardCliBinding(ds, value)) return;
+
+    if (actionType === 'open_local_cli') {
+      const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
+      }
+      const blocked = guardLocalCliOpen(ds, locDs);
+      if (blocked) return blocked;
+      return launchLocalCli(ds, locDs);
+    }
 
     // 🔊 语音总结 — no permission gate (任意人可点). Inject a condense-and-speak
     // instruction into the session; the model emits the voice via
@@ -1492,9 +1596,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         logger.info(`[${tag(ds)}] voice_summary blocked for unauthorized user: ${operatorOpenId ?? '?'}`);
         return { toast: { type: 'warning', content: t('card.voice.toast_need_auth', undefined, locDs) } };
       }
+      // Dedupe read BEFORE the busy guard: a card whose voice is already being
+      // generated will have its worker back in `working`, so the busy guard would
+      // otherwise shadow the "already on the way" hint with a misleading
+      // "wait for idle" toast. Read first (correct message), guard second, and
+      // only `add` after the guard so a genuinely-busy first click still doesn't
+      // burn the dedupe key.
       const dedupeKey = cardMessageId ?? `${sessionAnchorId(ds)}::voice`;
       if (voicedCardIds.has(dedupeKey)) {
         return { toast: { type: 'info', content: t('card.voice.toast_already', undefined, locDs) } };
+      }
+      if (!isLiveWorkerIdleOrLimited(ds)) {
+        logger.info(`[${tag(ds)}] voice_summary blocked because worker is busy: ${ds.lastScreenStatus ?? 'unknown'}`);
+        return { toast: { type: 'warning', content: t('card.voice.toast_worker_busy', undefined, locDs) } };
       }
       voicedCardIds.add(dedupeKey);
       if (voicedCardIds.size > 5000) { voicedCardIds.clear(); voicedCardIds.add(dedupeKey); }
@@ -1652,6 +1766,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           locDs,
           undefined,
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: sessionCliId(ds) }),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -1773,24 +1888,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       } catch { /* fall through */ }
     }
 
+    // Compatibility path for cards emitted before open_local_cli was introduced.
+    // The opt-in/capability guard still applies so old cards cannot bypass the
+    // default-off continuity protection. Clicks read the current mode: attach
+    // mode uses exact backend attach with no fallback; resume mode uses the same
+    // precise resume preflight and also fails closed when unsupported.
     if (actionType === 'open_local_terminal') {
       const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!ds) {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
       }
-      const result = openLocalTerminalForSession(ds);
-      if (result.ok) {
-        logger.info(`[${tag(ds)}] Local terminal open requested via card (${result.launcher}, ${result.backend})`);
-        return { toast: { type: 'success', content: t('card.action.local_terminal_opened', { cliName: getCliDisplayName(sessionCliId(ds)) }, locDs) } };
-      }
-      logger.warn(`[${tag(ds)}] Local terminal open failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}`);
-      if (result.error === 'cli_unavailable') {
-        return { toast: { type: 'warning', content: t('card.action.local_cli_missing', { cliName: getCliDisplayName(sessionCliId(ds)), executable: result.executable ?? sessionCliId(ds) }, locDs) } };
-      }
-      if (result.error === 'resume_unavailable' || result.error === 'unsupported_platform' || result.error === 'launcher_unavailable') {
-        return { toast: { type: 'warning', content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(sessionCliId(ds)) }, locDs) } };
-      }
-      return { toast: { type: 'error', content: t('card.action.local_terminal_failed', { reason: result.detail ?? result.error }, locDs) } };
+      const blocked = guardLocalCliOpen(ds, locDs);
+      if (blocked) return blocked;
+      return launchLocalCli(ds, locDs);
     }
 
     if (actionType === 'get_write_link' && ds && operatorOpenId) {
@@ -1808,6 +1918,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           true, // showManageButtons — write-link card includes restart & close
           !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
           locDs,
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         // 普通群发「仅自己可见」私密卡，话题群 / 单聊自动回退私聊 DM（两条通道都私密，
         // 不泄露写入 token）。fire-and-forget，保持卡片回调快速返回。
@@ -1875,6 +1986,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               localeForBot(ds.larkAppId),
               cardUsageLimit(ds),
               writableTerminalLinkFor(ds),
+              isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -1917,6 +2029,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -1957,6 +2070,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -2022,6 +2136,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -2062,6 +2177,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
@@ -2100,7 +2216,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               { name: selfBot.botName, openId: selfBot.botOpenId },
               locDs,
               ds.pendingSender,
-              { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
+              { larkAppId: ds.larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger: ds.pendingSubstituteTrigger },
             )
           : '';
         const prompt = pendingRawInput ? '' : wrappedPrompt;
@@ -2114,6 +2230,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
         ds.pendingMentions = undefined;
+        ds.pendingSubstituteTrigger = undefined;
         ds.pendingSender = undefined;
         ds.pendingFollowUps = undefined;
         forkWorker(ds, prompt);
@@ -2366,7 +2483,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   // Handle repo select card (option-based dropdowns: plain switch, or
   // `repo_worktree` = create a worktree from the picked repo and open that).
-  const isWorktreeOpen = action?.value?.key === 'repo_worktree';
+  // Require an explicit, recognized key: botmux's own dropdowns always set
+  // `repo_switch` / `repo_worktree` (card-builder.ts). Treating a keyless
+  // `option + root_id` as a plain switch let a hand-crafted card drive the
+  // session's working dir to an arbitrary path — reject anything unrecognized.
+  const repoKey = action?.value?.key;
+  if (repoKey !== 'repo_switch' && repoKey !== 'repo_worktree') {
+    logger.warn(`Card action: unrecognized repo dropdown key ${repoKey ?? '(none)'} — ignoring`);
+    return;
+  }
+  const isWorktreeOpen = repoKey === 'repo_worktree';
   const selectedPath = option;
   const rootId = action?.value?.root_id;
   logger.info(`Card action: repo ${isWorktreeOpen ? 'worktree-open' : 'switch'} to ${selectedPath} (root_id: ${rootId})`);

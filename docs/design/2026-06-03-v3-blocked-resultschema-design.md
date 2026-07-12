@@ -154,7 +154,7 @@ classifyTerminal(errorClass, opts?: {retryable?: boolean}) → 'blocked' | 'fail
 
 - `ops-projection.ts` `RunNodeView.status` += `'blocked'`；`RunView.runStatus` += `'blocked'`。投影把 `nodeBlocked`/`runBlocked` 映出来（materialize 已产出，projection 跟随）。
 - `v3-runs-api.ts` 无形态改动（只多个枚举值）。
-- 前端 `v3.ts`：blocked 节点独立配色（建议**琥珀/橙**，区别于 failed 红 / done 绿 / running 蓝）；节点面板显示 errorClass + message + 一句「可 `workflow resume` 重跑」。
+- 前端 `v3-page.tsx` / `v3-components.tsx`：blocked 节点独立配色（建议**琥珀/橙**，区别于 failed 红 / done 绿 / running 蓝）；节点面板显示 errorClass + message + 一句「可 `workflow resume` 重跑」。
 - **安全不变量沿用**：投影 JSON 仍不含绝对路径/token（codex 之前钉的，blocked 不引入新字段泄漏）。
 
 ---
@@ -211,7 +211,7 @@ classifyTerminal(errorClass, opts?: {retryable?: boolean}) → 'blocked' | 'fail
 | `dag.ts` | V3Node.resultSchema?；validateDag 校验 resultSchema 子集 + **大小上限** | claude |
 | `cli-run.ts` | **:256 加 blocked 分支**（打印「可 resume 重跑」） | claude |
 | `ops-projection.ts` | RunNodeView/RunView 状态+blocked | claude |
-| `v3.ts`(前端) | blocked 配色 + 面板提示（errorCode/message + 「可 resume」） | claude |
+| `v3-page.tsx` / `v3-components.tsx`(前端) | blocked 配色 + 面板提示（errorCode/message + 「可 resume」） | claude |
 | resume 入口（host/cli `workflow resume`） | 对 blocked 节点 append nodeRetryRequested | claude |
 | `manifest.ts` | **不动** | — |
 | `ephemeral-pool.ts` | **不动**（result.json 走 manifest files[]，pool 无感） | — |

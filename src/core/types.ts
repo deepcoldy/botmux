@@ -67,6 +67,7 @@ export interface DaemonSession {
   pendingFollowUpInput?: { userPrompt: string; cliInput: string };
   pendingAttachments?: LarkAttachment[];
   pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
+  pendingSubstituteTrigger?: import('../types.js').SubstituteTrigger;
   /** Sender (open_id + type + resolved name) of the initial message — stashed
    *  so the deferred spawn after repo-selection still injects a <sender> tag
    *  matching the original caller, not the user who clicked the card. */
@@ -76,6 +77,7 @@ export interface DaemonSession {
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
   streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
+  pendingLocalCliButtonRefresh?: boolean; // true when cli_session_id arrived while the streaming card POST was in flight
   /** Set on sessions restored after a daemon restart: suppresses the automatic
    *  card post/patch from the recovery re-fork so a restart stays silent in the
    *  group (the owner gets a private DM summary instead). Cleared on the first
@@ -148,10 +150,16 @@ export interface DaemonSession {
    *  Format is `${sessionId}:${lastUuid || turnId}` so different sessions can
    *  never suppress each other's final_output payloads. */
   lastBridgeEmittedUuid?: string;
-  /** Flag flipped to true once a `session.exited` dashboard event has been
-   *  published for this session. Both the dashboard-driven close path
-   *  (closeSession) and the worker-process exit handler may try to publish;
-   *  this guard prevents double-counting on the dashboard side. */
+  /** Native Hermes messages.session_id values bound by this worker after
+   *  seeing botmux-injected `<session_id>...` markers in Hermes state.db.
+   *  Hermes `/clear` can rebind to a new native session while a completed
+   *  turn from the previous source is still queued for emission, so the
+   *  daemon keeps every source announced by the current worker. */
+  hermesBridgeSourceSessionIds?: Set<string>;
+  /** Flag flipped once this process lifecycle has already been reflected on the
+   *  dashboard. A real close publishes `session.exited`; a deliberate suspend
+   *  publishes `status=dormant`. The later child-process exit must not emit a
+   *  second, contradictory close event. Reset when a new process is forked. */
   exitEventEmitted?: boolean;
   /** Present when this session was created via /adopt (shared observation mode).
    *  Either tmuxTarget (tmux) OR zellijSession+zellijPaneId (zellij) is set. */

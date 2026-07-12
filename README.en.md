@@ -15,14 +15,14 @@
   <a href="#design-philosophy">Design</a> &middot;
   <a href="#key-advantages">Advantages</a> &middot;
   <a href="#5-minute-setup">Quick Start</a> &middot;
-  <a href="https://github.com/deepcoldy/botmux/tree/master/docs-site/docs/en"><b>📖 Docs</b></a>
+  <a href="https://deepcoldy.github.io/botmux/en/"><b>📖 Docs</b></a>
 </p>
 
 [中文](README.md) | English
 
 **Plug any AI coding CLI into Feishu/Lark — every DM, group or topic gets its own CLI session, with live-streaming cards, a web terminal, and zero glue code.**
 
-> 📖 **Full docs** (commands / config / best practices / troubleshooting): **<https://github.com/deepcoldy/botmux/tree/master/docs-site/docs/en>** — this README only covers why and how to get started fast.
+> 📖 **Full docs** (commands / config / best practices / troubleshooting): **<https://deepcoldy.github.io/botmux/en/>** — this README only covers why and how to get started fast.
 
 | Lark Streaming Cards | Web Terminal | tmux Session Management | Multi-Bot Collaboration |
 |:-:|:-:|:-:|:-:|
@@ -40,7 +40,7 @@
 
 ### Design Philosophy
 
-Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Cursor, Gemini, OpenCode, Antigravity, GitHub Copilot, Kimi Code) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
+Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Cursor, Gemini, OpenCode, Antigravity, GitHub Copilot, Kimi Code, Grok Build, Kiro) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
 
 ### Key Advantages
 
@@ -52,7 +52,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | CLI Capabilities | Full runtime (hooks, memory, plan mode, skills, `/` commands) | SDK API subset, missing features must be reimplemented |
 | CLI Upgrades | Zero-adaptation automatic benefit | Must track SDK version changes |
 | Memory / Context | Reuses CLI's built-in memory system, improves as the CLI evolves | Must build custom memory system, duplicating CLI-native capabilities |
-| Multi-CLI Support | 8 CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot / Kimi Code) | Tied to a single SDK, cannot switch CLIs |
+| Multi-CLI Support | Many CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot / Kimi Code / Grok Build / Kiro, …) | Tied to a single SDK, cannot switch CLIs |
 | Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
 | Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
 | Multi-Topic Collaboration | A lead bot auto-splits the task, opens multiple topics, and dispatches several bots to work in parallel (coder + reviewer), with a Lark task list as the shared progress board | Usually manual one-by-one assignment, no unified progress board |
@@ -64,7 +64,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 ## Prerequisites
 
 - **Node.js** >= 22
-- **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `genius`, `opencode`, `hermes`, `seed` (Seed CLI, a Claude Code fork), `relay` (Relay CLI, the new release of Seed), `pi`, `omp` (oh-my-pi, a Pi fork), `copilot` (GitHub Copilot CLI), `traex` (TRAE CLI), `mircli` (Mir CLI), `agy` (Antigravity), or `kimi` (Kimi Code) in PATH)
+- **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `genius`, `opencode`, `hermes`, `seed` (Seed CLI, a Claude Code fork), `relay` (Relay CLI, the new release of Seed), `pi`, `omp` (oh-my-pi, a Pi fork), `copilot` (GitHub Copilot CLI), `traex` (TRAE CLI), `mircli` (Mir CLI), `agy` (Antigravity), `kimi` (Kimi Code), `grok` (Grok Build), or `kiro-cli` (Kiro) in PATH)
   - **CoCo requires `0.120.32+`**: type-ahead (sending a new message while a turn is still running, parked in CoCo's own message queue) relies on 0.120.32+ behavior; earlier versions may drop or serialize input while busy — upgrade before use
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
 - **CJK fonts** (only needed for screenshot rendering of Chinese text / emoji):
@@ -74,15 +74,18 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 
 ## 5-Minute Setup
 
-> 💡 **TL;DR**: `npm i -g botmux` → `botmux setup` and **scan two QR codes** to get a working bot → `botmux start`. The 1st scan creates the app and saves the AppID/AppSecret (event subscriptions + bot capability pre-configured); the 2nd scan lets botmux's built-in Feishu Web login **import permissions, configure the redirect URL, and create + submit a publish version automatically**. The entire Open Platform config (create app / permissions / redirect / publish) is handled by setup; pass `--no-open-platform-auto` to skip the second auto-config step and use the manual steps folded at the end.
+> 💡 **TL;DR**: `npm i -g botmux` → `botmux setup`; for Feishu tenants, **one QR scan** creates a working bot → `botmux start`. The same Web session names the app (`botmux-N` by default, customizable), creates it, reads AppID/AppSecret, imports permissions, configures the redirect URL, and creates + submits a publish version. Pass `--no-open-platform-auto` to skip permission/publish automation after app creation.
 
 ### 1. Install botmux
 
 ```bash
 npm install -g botmux
+# or: pnpm add -g botmux
 ```
 
-> Requires **Node.js ≥ 22**, with at least one AI coding CLI installed and authenticated (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` / `kimi` on your PATH). Installing **tmux** too is recommended (enables session persistence automatically).
+Manual and scheduled updates keep using the npm or pnpm global location that owns the running botmux install. Unknown install layouts are never silently updated with npm.
+
+> Requires **Node.js ≥ 22**, with at least one AI coding CLI installed and authenticated (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` / `kimi` / `grok` / `kiro-cli` on your PATH). Installing **tmux** too is recommended (enables session persistence automatically).
 
 ### 2. Create the App & Configure (`botmux setup`)
 
@@ -90,7 +93,7 @@ Run `botmux setup` — every choice is an interactive picker (↑/↓ to move, t
 
 1. **Action**: a fresh install goes straight into the create flow; with an existing config, first pick "add / reconfigure / edit / remove bot".
 2. **App source** — pick one of three:
-   - **Scan to create a new app (recommended)**: scan with the Lark mobile app and a PersonalAgent app is created with AppID/AppSecret persisted automatically, **with event subscriptions + bot capability pre-configured** — no manual browser navigation. Uses the official `@larksuiteoapi/node-sdk` device flow.
+   - **One-scan app creation (recommended)**: enter a bot name or leave it blank for `botmux-0`, `botmux-1`, etc. After Feishu Web QR login, botmux uploads its default icon, creates a custom app, reads AppID/AppSecret, then reuses that session for permissions and publishing. If Web creation is unavailable or the account is on Lark international, the user can explicitly choose the official `@larksuiteoapi/node-sdk` compatibility mode; it may require an additional scan and the platform chooses the app name.
    - **Pick an existing app**: reuse (or QR-login to get) a Feishu web session, list the apps you previously created on the Open Platform, and have the **AppID/AppSecret fetched automatically** — no digging through the console when re-configuring on a new machine (Feishu tenants only).
    - **Enter AppID/Secret manually** — see "Create the app manually" folded below.
 3. **Pick the CLI**: choose the CLI to bridge (searchable — type `cla` to filter Claude).
@@ -98,9 +101,9 @@ Run `botmux setup` — every choice is an interactive picker (↑/↓ to move, t
    - **Fixed default dir (recommended)**: new topics start straight in the given directory with **no card** (persisted as `defaultWorkingDir`; change later via `/config` or `botmux setup edit`). Pick this if you want the bot to just work in one directory.
    - **Repo-select card**: each new topic pops a card listing scanned git repos to choose from — good when you hop between repos. The follow-up question asks for the **repo scan root(s)** — usually the **parent directory** of your git projects (e.g. `~/projects`, comma-separated for multiple); the card scans **downward** for git repos (up to 3 levels). Avoid `~` (too many folders to traverse).
 
-Then comes the **2nd scan**: botmux's built-in Feishu Web login automatically imports permissions, configures the `http://127.0.0.1:9768/callback` redirect URL, and creates + submits a publish version. On failure it falls back and prints the manual steps (folded below) without affecting the config already written; importing only part of the permissions still counts as success — add the rest later on the Open Platform.
+After app creation, setup reuses the same Web session to import permissions, configure `http://127.0.0.1:9768/callback`, and create + submit a publish version, so the Feishu primary path **has no second QR code**. Another scan is possible only after the user explicitly selects SDK compatibility mode. Automation failures still print the manual steps without affecting the saved bot config.
 
-> ✅ **Both Feishu (feishu.cn) and Lark international (larksuite.com) tenants are supported.** Scan-to-create auto-detects the tenant brand (China / international) and remembers it — no manual choice needed; the manual paste path asks once. Each bot connects to its own brand's domain, so one machine can run Feishu and Lark bots side by side, with login credentials isolated per app.
+> ✅ **Both Feishu (feishu.cn) and Lark international (larksuite.com) tenants are supported.** Feishu uses the one-scan Web flow; explicitly selected SDK compatibility mode auto-detects and remembers Lark international tenants. The manual paste path asks once. Each bot connects to its own brand's domain, so one machine can run Feishu and Lark bots side by side, with login credentials isolated per app.
 
 At the end, setup validates credentials with a `tenant_access_token` call (only writing `bots.json` on success) and writes the full scope JSON to `~/.botmux/lark-scopes.json` for reference.
 
@@ -109,6 +112,11 @@ At the end, setup validates credentials with a `tenant_access_token` call (only 
 
 ```bash
 botmux setup list --json                     # list bots (secret masked)
+botmux setup add --create-app \
+  --app-name "Engineering Assistant" \
+  --allowed-users alice@example.com          # first use scans once; later valid sessions skip it
+botmux setup add --create-app --switch-account \
+  --allowed-users alice@example.com          # explicitly rescan and replace the local session
 botmux setup add \
   --app-id cli_xxx --app-secret xxx \
   --allowed-users alice@example.com \
@@ -120,7 +128,8 @@ botmux setup help                            # full flag reference
 ```
 
 - `--working-dir` is the repo-select card's scan root; `--default-working-dir` is the fixed default dir (new topics start there directly, no card) — the same two modes as the TUI question.
-- `--json` prints machine-readable results (with `ok` / `error`); Open Platform auto-config is skipped by default — opt in with `--open-platform-auto` (requires QR scan).
+- `--create-app` reuses a valid session and reports the confirmed account/tenant on stderr; the first use scans once. `--switch-account` explicitly rescans and replaces the local session. `--json` never opens an unexpected QR when no valid cache exists unless `--switch-account` is passed. On success it returns the frozen `appName` and `appId`; a post-creation failure returns `partial`, `appId`, and an `--open-platform-auto` recovery command without creating another app.
+- Existing-credential mode skips Open Platform automation unless `--open-platform-auto` is passed. `--compatibility-mode` must be selected explicitly, may need another scan, and does not support `--app-name`.
 - If you previously scripted setup by piping numbered answers into the TUI, migrate to these subcommands: whenever the question sequence changes (this release adds the working-dir mode question), piped answers silently shift.
 
 </details>
@@ -150,7 +159,7 @@ botmux autostart enable
 ```
 
 <details>
-<summary><b>Manual Open Platform config: create app / permissions / redirect / publish (fallback)</b> —— handled automatically by botmux setup during the 2nd scan; expand only if auto-config failed or you want to verify manually</summary>
+<summary><b>Manual Open Platform config: create app / permissions / redirect / publish (fallback)</b> —— handled automatically by botmux setup with the same login session; expand only if auto-config failed or you want to verify manually</summary>
 
 <br>
 
@@ -188,7 +197,7 @@ base64 -w0 < ~/.botmux/lark-scopes.json | awk 'BEGIN{printf "\033]52;c;"}{printf
 
 <br>
 
-PersonalAgent apps come with event subscription + bot capability configured by default, so normally you don't touch this. If the bot **receives no messages at all** (not even DMs) after following the steps above, verify these two:
+botmux enables the bot capability, long-connection event mode, and baseline event subscriptions automatically, so normally you don't touch this. If the bot **receives no messages at all** (not even DMs) after following the steps above, verify these two:
 
 - **Event subscription**: Open Platform → your app → Events & Callbacks → should subscribe to `im.message.receive_v1` + `card.action.trigger` (subscribed by default; add manually if missing). The delivery method must be "Receive events via long connection" (WebSocket), with the botmux daemon running.
 - **Bot capability**: Open Platform → your app → Features → Bot should be enabled (on by default); name/avatar are editable.
@@ -223,7 +232,7 @@ On mobile/tablet, a floating shortcut toolbar provides Esc, Ctrl+C, Tab, arrow k
 
 ### Multi-Bot Collaboration
 
-Run multiple Lark bots on a single machine, each mapped to a different CLI. In the same group chat, messages are routed via @mention — each bot gets its own isolated CLI process. With a single bot in the group, it responds automatically without @. In a regular (non-topic) group, `@<bot1> @<bot2> /t xxx` spawns one independent thread per mentioned bot anchored at the same message. Send `@<bot1> @<bot2> /introduce` once so they register each other's open_id; afterwards each bot can explicitly @-mention the others from within its own session (commands: [📖 Docs · Slash Commands](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/slash-commands.md)).
+Run multiple Lark bots on a single machine, each mapped to a different CLI. In the same group chat, messages are routed via @mention — each bot gets its own isolated CLI process. With a single bot in the group, it responds automatically without @. In a regular (non-topic) group, `@<bot1> @<bot2> /t xxx` spawns one independent thread per mentioned bot anchored at the same message. Send `@<bot1> @<bot2> /introduce` once so they register each other's open_id; afterwards each bot can explicitly @-mention the others from within its own session (commands: [📖 Docs · Slash Commands](https://deepcoldy.github.io/botmux/en/slash-commands)).
 
 ### Multi-Topic Collaboration
 
@@ -311,7 +320,7 @@ ISO timestamp (`2026-05-01T10:00`).
 When a CLI spawns inside a botmux session it automatically gets
 `~/.botmux/bin` on PATH plus a set of ready-to-use Skills:
 
-- `botmux send` — send a message to the current thread (text, images, files, @mention)
+- `botmux send` — send a message to the current thread (text, images, files, interactive card JSON, @mention)
 - `botmux history` — fetch session history (topic groups → in-thread, regular groups → whole chat)
 - `botmux quoted <message_id>` — when the user @ed the bot via Lark's quote-reply UI, fetch the quoted message on demand
 - `botmux bots list` — discover bots + their `open_id`s
@@ -330,6 +339,7 @@ Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support 
 > `botmux dashboard` issues a one-time-token URL — manage every daemon/bot from the browser.
 
 - One-click locate back to the Feishu thread / open Web Terminal / multi-select batch close
+- Add a bot with the same one-scan Feishu flow: optional stable name, AI CLI and working-directory choices, fail-closed administrator confirmation, and an explicit compatibility fallback
 - Create a new group with auto owner-transfer + @-mention notification
 - Disband or leave a chat (associated sessions auto-closed)
 - **Session Insights** (owner-only, read-only): parse each session's transcript to view action spans / work timeline / context curve / failure aggregates + diagnostic suggestions; send `/insight` in chat for the current session's summary card
@@ -387,16 +397,16 @@ Notes:
 
 The full reference — commands, config, best practices, troubleshooting — lives in the docs site; not duplicated here —
 
-### 👉 https://github.com/deepcoldy/botmux/tree/master/docs-site/docs/en
+### 👉 https://deepcoldy.github.io/botmux/en/
 
 | Topic | Docs |
 |-------|------|
-| Slash commands / CLI commands / agent-facing subcommands | [Commands](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/slash-commands.md) |
-| `bots.json` fields / env vars / file locations | [Configuration](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/bots-json.md) |
-| Multi-CLI adapters (incl. wrapper / gateway integration) | [Adapters](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/adapters.md) |
-| Scenario-based best practices (Oncall / alerting-ops / solo dev / team) | [Best Practices](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/best-practices.md) |
-| Common pitfalls / FAQ | [Pitfalls](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/pitfalls.md) · [FAQ](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/faq.md) |
-| Features: scheduled tasks / Oncall / Dashboard / multi-bot / session relay | [Schedule](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/schedule.md) · [Oncall](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/oncall.md) · [Dashboard](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/dashboard.md) · [Multi-bot](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/multi-bot.mdx) · [Relay](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/relay.md) |
+| Slash commands / CLI commands / agent-facing subcommands | [Commands](https://deepcoldy.github.io/botmux/en/slash-commands) |
+| `bots.json` fields / env vars / file locations | [Configuration](https://deepcoldy.github.io/botmux/en/bots-json) |
+| Multi-CLI adapters (incl. wrapper / gateway integration) | [Adapters](https://deepcoldy.github.io/botmux/en/adapters) |
+| Scenario-based best practices (Oncall / alerting-ops / solo dev / team) | [Best Practices](https://deepcoldy.github.io/botmux/en/best-practices) |
+| Common pitfalls / FAQ | [Pitfalls](https://deepcoldy.github.io/botmux/en/pitfalls) · [FAQ](https://deepcoldy.github.io/botmux/en/faq) |
+| Features: scheduled tasks / Oncall / Dashboard / multi-bot / session relay | [Schedule](https://deepcoldy.github.io/botmux/en/schedule) · [Oncall](https://deepcoldy.github.io/botmux/en/oncall) · [Dashboard](https://deepcoldy.github.io/botmux/en/dashboard) · [Multi-bot](https://deepcoldy.github.io/botmux/en/multi-bot) · [Relay](https://deepcoldy.github.io/botmux/en/relay) |
 
 ## Contributing
 

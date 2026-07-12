@@ -25,6 +25,7 @@ import {
 } from '../global-config.js';
 import { isLocale } from '../i18n/types.js';
 import { isLocalDevInstall } from '../utils/install-info.js';
+import { isAutoUpdateSupportedInstall } from '../utils/global-install.js';
 import { isValidTimeZone } from '../utils/timezone.js';
 
 /**
@@ -36,6 +37,8 @@ import { isValidTimeZone } from '../utils/timezone.js';
 export interface ResolvedDashboardSettingsView {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  enableLocalCliOpen: boolean;
+  localCliOpenMode: 'attach' | 'resume';
   chatBotDiscovery: boolean;
   vcMeetingAgent: {
     enabled: boolean;
@@ -53,6 +56,7 @@ export interface ResolvedDashboardSettingsView {
   };
   maintenance: MaintenanceConfig;
   localDevInstall: boolean;
+  autoUpdateSupported?: boolean;
   remoteAccess?: boolean;
   /** Configured schedule-task timezone override (IANA), or null/absent when
    *  unset ⇒ the scheduler follows `hostTimeZone`. */
@@ -72,7 +76,7 @@ export type ParseMaintenanceResult =
 export interface SettingsWriteApplierDeps {
   /** Snapshot of `~/.botmux/config.json`. Used to look up the persisted autoUpdate state when the incoming patch doesn't change it. */
   readGlobalConfig: () => GlobalConfig;
-  /** Atomic write of dashboard-level fields (publicReadOnly / openTerminalInFeishu). */
+  /** Atomic write of dashboard-level fields. */
   mergeDashboardConfig: (patch: DashboardGlobalConfig) => DashboardGlobalConfig;
   /** Atomic write of global-level fields (repoPickerMode / scheduleTimeZone / …).
    *  Mirrors the real `mergeGlobalConfig`: a `null` value deletes that key. */
@@ -85,6 +89,8 @@ export interface SettingsWriteApplierDeps {
   parseMaintenancePatch: (body: unknown) => ParseMaintenanceResult;
   /** True iff the current install is a source-checkout (auto-update unavailable). */
   isLocalDevInstall: () => boolean;
+  /** True iff the current global install is owned by a supported updater. */
+  isAutoUpdateSupportedInstall: () => boolean;
   /** Returns the post-merge view the response body echoes back to the caller. */
   resolveDashboardSettings: () => ResolvedDashboardSettingsView;
   /** Validate locale string. */
@@ -110,6 +116,7 @@ export function defaultSettingsWriteApplierDeps(
     setGlobalLocale,
     parseMaintenancePatch,
     isLocalDevInstall,
+    isAutoUpdateSupportedInstall,
     resolveDashboardSettings,
     isLocale,
     reloadLocaleOnAllDaemons,
@@ -128,6 +135,8 @@ export type ApplySettingsWriteResult =
 export type ApplySettingsWriteError =
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
+  | 'invalid_enableLocalCliOpen'
+  | 'invalid_localCliOpenMode'
   | 'invalid_chatBotDiscovery'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
@@ -140,6 +149,7 @@ export type ApplySettingsWriteError =
   | 'invalid_lang'
   | 'invalid_maintenance' // ← never returned literally; surfaces parseMaintenancePatch's reason instead
   | 'local_dev_no_autoupdate'
+  | 'unsupported_install_no_autoupdate'
   | 'autoupdate_required'
   | 'empty_patch'
   | string;          // catch-all: parseMaintenancePatch error strings
@@ -149,7 +159,7 @@ export type ApplySettingsWriteError =
  * snapshot, or an error code string on validation failure.
  *
  * Behaviour mirrors `dashboard.ts:460-498` exactly:
- *   - Validates `publicReadOnly` / `openTerminalInFeishu` are booleans.
+ *   - Validates dashboard toggles are booleans.
  *   - Validates `repoPickerMode` is 'all' | 'repos'.
  *   - Validates `lang` is a valid locale or null.
  *   - Defers maintenance validation to `parseMaintenancePatch` (returns its error verbatim).
@@ -177,6 +187,18 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_openTerminalInFeishu' };
     }
     patch.openTerminalInFeishu = obj.openTerminalInFeishu;
+  }
+  if ('enableLocalCliOpen' in obj) {
+    if (typeof obj.enableLocalCliOpen !== 'boolean') {
+      return { ok: false, error: 'invalid_enableLocalCliOpen' };
+    }
+    patch.enableLocalCliOpen = obj.enableLocalCliOpen;
+  }
+  if ('localCliOpenMode' in obj) {
+    if (obj.localCliOpenMode !== 'attach' && obj.localCliOpenMode !== 'resume') {
+      return { ok: false, error: 'invalid_localCliOpenMode' };
+    }
+    patch.localCliOpenMode = obj.localCliOpenMode;
   }
   if ('chatBotDiscovery' in obj) {
     if (typeof obj.chatBotDiscovery !== 'boolean') {
@@ -281,9 +303,12 @@ export async function applySettingsWrite(
   if ('maintenance' in obj) {
     const r = deps.parseMaintenancePatch(obj.maintenance);
     if (!r.ok) return { ok: false, error: r.error };
-    // Auto-update is npm-global only; refuse enabling it on a source checkout.
+    // Auto-update is global-package only; refuse enabling it on a source checkout.
     if (r.patch.autoUpdate?.enabled && deps.isLocalDevInstall()) {
       return { ok: false, error: 'local_dev_no_autoupdate' };
+    }
+    if (r.patch.autoUpdate?.enabled && !deps.isAutoUpdateSupportedInstall()) {
+      return { ok: false, error: 'unsupported_install_no_autoupdate' };
     }
     // Auto-restart only applies an auto-update — it's meaningless without it.
     if (r.patch.autoRestart?.enabled) {

@@ -9,6 +9,7 @@ import type {
 export interface SkillPolicyInput {
   registrySkills: SkillPackage[];
   projectSkills: SkillPackage[];
+  pluginSkills?: SkillPackage[];
   globalProjectSkills?: 'off' | 'trusted' | 'all';
   globalDelivery?: 'auto' | 'prompt' | 'native';
   botPolicy: BotSkillPolicy | undefined;
@@ -38,7 +39,8 @@ function appendMatches(out: ResolvedSkill[], skills: SkillPackage[], selector: S
 
 export function resolveSkillPolicy(input: SkillPolicyInput): SkillPolicyResult {
   const policy = input.botPolicy;
-  if (!policy) {
+  const pluginSkills = input.pluginSkills ?? [];
+  if (!policy && pluginSkills.length === 0) {
     return { enabled: false, mode: 'priority', delivery: 'auto', prioritySkills: [], diagnostics: [] };
   }
 
@@ -57,9 +59,12 @@ export function resolveSkillPolicy(input: SkillPolicyInput): SkillPolicyResult {
   }
 
   const raw: ResolvedSkill[] = [];
-  for (const selector of policy.include ?? []) {
-    if (!selector.startsWith('skill:')) continue;
-    appendMatches(raw, candidates, selector, 'bot:include');
+  for (const selector of policy?.include ?? []) {
+    if (selector.startsWith('skill:')) appendMatches(raw, candidates, selector, 'bot:include');
+  }
+  for (const skill of pluginSkills) {
+    const reason = skill.source.type === 'plugin' ? `plugin:${skill.source.pluginId}` : 'plugin';
+    raw.push({ ...skill, priorityReason: reason });
   }
 
   const seen = new Set<string>();

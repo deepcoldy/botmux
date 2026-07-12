@@ -27,6 +27,9 @@ import {
   buildV2DenyPaths,
   buildV2DenyRegexes,
   buildV2CarveOuts,
+  buildCliExecutableReadCarveOuts,
+  buildWriteSandboxRules,
+  buildLinuxReadIsolationMasks,
   type V2IsolationContext,
 } from './adapters/cli/read-isolation.js';
 import { killPersistentSession, type PersistentBackendType } from './core/persistent-backend.js';
@@ -40,8 +43,14 @@ import { mergeQueuedCliInput, type PendingCliInput } from './utils/pending-input
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
+import { loadBotConfigs, type BotConfig } from './bot-registry.js';
+import { readGlobalConfig } from './global-config.js';
+import { resolveTerminalWriteForRequest } from './core/terminal-write-auth.js';
+import { readPlatformBinding } from './platform/binding.js';
+import { loadPersistedToken } from './dashboard/auth.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
-import { resolveTerminalWriteAccess } from './core/terminal-access.js';
 import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
@@ -52,14 +61,26 @@ import {
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from './services/codex-transcript.js';
+import { codexSessionIdFromRolloutPath, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
-import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
+import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
+import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
-import { drainPiTranscript, findPiTranscriptByPid, findPiTranscriptBySessionId } from './services/pi-transcript.js';
+import { drainPiTranscript } from './services/pi-transcript.js';
+import {
+  drainGrokUpdates,
+  grokSessionIdFromPath,
+} from './services/grok-transcript.js';
+import { resolveFileBridgePath } from './services/file-bridge-path.js';
+import {
+  isStructuredBridgeAdoptIdleCli,
+  isStructuredBridgeAdoptInputCli,
+  isStructuredBridgeFallbackActive,
+} from './services/structured-bridge-clis.js';
 import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
+import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
@@ -97,7 +118,8 @@ import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.
 import { selectSessionBackend, decideBackendGate, backendGateUserMessage } from './adapters/backend/session-backend-selector.js';
 import { prepareSandbox, attachSandboxOutbox, startOutboxWatcher, sandboxEnabled, sandboxedClaudeDataDir } from './adapters/backend/sandbox.js';
 import type { BackendType, SessionBackend } from './adapters/backend/types.js';
-import { tmuxEnv, probeTmuxFunctional } from './setup/ensure-tmux.js';
+import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
+import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
@@ -132,10 +154,52 @@ let sandboxTeardownDone = false;                     // guards the exit-time bes
  *  (non-forced) config, so healthy restarts (e.g. user `/restart`) are
  *  unaffected. */
 let consecutiveInWorkerRestarts = 0;
+let tmuxRestartTimer: NodeJS.Timeout | null = null;
 /** Guard: user_notify for "resume → fresh fallback" is sent once per worker
  *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
  *  of the same warning. */
 let resumeFallbackNotified = false;
+/** Skill catalog to attach to the first user turn after a prompt-less CLI restart. */
+let deferredPluginSkillCatalog: string | null = null;
+
+function refreshCliPluginGeneration(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  adapter: CliAdapter,
+): void {
+  let bot: Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills'> = {
+    larkAppId: cfg.larkAppId,
+    plugins: cfg.pluginBindings,
+    skills: cfg.skillPolicy,
+  };
+  try {
+    bot = loadBotConfigs().find(candidate => candidate.larkAppId === cfg.larkAppId) ?? bot;
+  } catch (err) {
+    log(`Plugin generation: using init-time Bot config because bots.json could not be read: ${err instanceof Error ? err.message : err}`);
+  }
+
+  const generation = prepareCliPluginGeneration({
+    sessionId: cfg.sessionId,
+    bot,
+    global: readGlobalConfig(),
+    dataDir: config.session.dataDir,
+    cliId: cfg.cliId as CliId,
+    adapter,
+    workingDir: cfg.workingDir,
+    prompt: cfg.prompt,
+    replacesPriorGeneration: cfg.resume === true,
+  });
+  for (const diagnostic of generation.diagnostics) log(`Plugin generation: ${diagnostic}`);
+  if (generation.fatal) {
+    const reason = generation.diagnostics.join(', ') || 'unknown';
+    send({ type: 'user_notify', message: t('worker.skill_delivery_failed', { reason }) });
+    throw new Error(`Skill delivery blocked CLI generation: ${reason}`);
+  }
+  cfg.prompt = generation.prompt;
+  cfg.skillPluginDir = generation.skillPluginDir;
+  cfg.skillReadonlyRoots = generation.skillReadonlyRoots;
+  deferredPluginSkillCatalog = generation.deferredSkillCatalog ?? null;
+  log(`Plugin generation refreshed: ${generation.pluginManifest.pluginIds.join(', ') || '(none)'}`);
+}
 
 /** v2 read isolation — provision a bot's PER-BOT config dir under its BOT_HOME so the
  *  CLI (redirected there via CLAUDE_CONFIG_DIR/CODEX_HOME) starts fully set up despite
@@ -301,17 +365,33 @@ const authedClients = new WeakSet<WebSocket>();
 const clientPtys = new Map<WebSocket, pty.IPty>();
 const writeToken = randomBytes(16).toString('hex');
 
+// Active dashboard token, persisted by the dashboard process at this stable
+// path (mirrors dashboard.ts TOKEN_PATH). The platform proxy injects it as the
+// `botmux_dashboard_token` cookie on every request it fronts, so its presence
+// proves a request traversed the platform's authenticated front door.
+const DASHBOARD_TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
+
 /**
- * Resolve terminal write permission for one request, honoring a platform-injected
- * `X-Botmux-Role` header. The central platform fronts `/s/*` and sets the role
- * (owner | teammate | guest) after authenticating the viewer, stripping any
- * client-supplied header; it reaches the worker via dashboard /s bridge →
- * terminal-proxy → here. A platform owner may drive the terminal directly. A
- * matching private write-link token is an independent capability, including for
- * a viewer who has not logged into the platform. Everyone else remains read-only.
+ * Resolve terminal write permission for one request. The platform-injected
+ * `X-Botmux-Role` header is trusted only when this machine is bound to a central
+ * platform AND the request actually came through the platform proxy (proven by a
+ * matching `botmux_dashboard_token` cookie — a secret a direct caller lacks).
+ * A matching private write-link `?token=` is an independent capability that
+ * grants write regardless of platform role (an explicitly issued write link
+ * must work for a viewer the platform sees as guest). See
+ * ./core/terminal-write-auth for the full rationale.
+ *
+ * Both the binding and the token are read PER REQUEST, never snapshotted:
+ * `botmux bind`/unbind and dashboard token rotation are hot-reloaded without
+ * restarting this worker, so a cached value would go stale.
  */
-function resolveTerminalWrite(req: IncomingMessage, tokenMatches: boolean): { hasWrite: boolean; platformReadonly: boolean } {
-  return resolveTerminalWriteAccess(req.headers['x-botmux-role'], tokenMatches);
+function resolveTerminalWriteForReq(req: IncomingMessage, tokenMatches: boolean): { hasWrite: boolean; platformReadonly: boolean } {
+  return resolveTerminalWriteForRequest(
+    req.headers,
+    tokenMatches,
+    () => readPlatformBinding() !== null,
+    () => loadPersistedToken(DASHBOARD_TOKEN_PATH),
+  );
 }
 
 /** Lazily-written locked-mode zellij config for per-WS web-terminal attach
@@ -330,7 +410,7 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -546,11 +626,29 @@ const inflightInputs = new InflightInputTracker();
  *  start work before their history/transcript submit marker is observable. */
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
+function readProcStarttime(pid: number): string | undefined {
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const closeParen = raw.lastIndexOf(')');
+    if (closeParen < 0) return undefined;
+    const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
+    return fields[19] || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function writeCliPidMarker(): void {
   if (!cliPidMarker || !sessionId) return;
   try {
     // 原子写：daemon 侧（killStalePids 等）随时读这个 marker JSON。
-    atomicWriteFileSync(cliPidMarker, JSON.stringify({ sessionId, turnId: currentBotmuxTurnId ?? null }));
+    const markerPid = Number(basename(cliPidMarker));
+    const procStart = Number.isInteger(markerPid) && markerPid > 0 ? readProcStarttime(markerPid) : undefined;
+    atomicWriteFileSync(cliPidMarker, JSON.stringify({
+      sessionId,
+      turnId: currentBotmuxTurnId ?? null,
+      ...(procStart ? { procStart } : {}),
+    }));
   } catch (err: any) {
     log(`Failed to update CLI PID marker: ${err?.message ?? err}`);
   }
@@ -707,6 +805,8 @@ let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
+let hermesBridgeDbPath: string | undefined;
+let hermesBridgeSourceSessionId: string | undefined;
 let mtrBridgeSource: MtrTranscriptSource | undefined;
 let mtrBridgeOffset = 0;
 let mtrBridgeBaselineDone = false;
@@ -1861,16 +1961,10 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 // shared with the Claude path.
 
 function codexBridgeFallbackActive(): boolean {
-  // True for transcript-backed CLIs whose final output can be harvested
-  // when the model forgets to call `botmux send`.
-  const id = lastInitConfig?.cliId;
-  if (id === 'codex' || id === 'traex' || id === 'coco' || id === 'hermes' || id === 'mtr' || id === 'pi') return true;
-  // Cursor only harvests its transcript in adopt mode: a botmux-spawned
-  // cursor session carries the botmux skill and replies via `botmux send`,
-  // and we never resolve a transcript path for it — so leave that flow
-  // (screen capture + botmux send) untouched and scope the bridge to adopt.
-  if (id === 'cursor') return lastInitConfig?.adoptMode === true;
-  return false;
+  // Transcript-backed CLIs whose final output can be harvested when the
+  // model forgets to call `botmux send`. Cursor is adopt-only — see
+  // services/structured-bridge-clis.ts (single source of the allowlist).
+  return isStructuredBridgeFallbackActive(lastInitConfig?.cliId, lastInitConfig?.adoptMode === true);
 }
 
 // Both Codex and TRAE share the same rollout JSONL layout (response_item
@@ -1891,16 +1985,25 @@ function structuredBridgeIsPi(): boolean {
   return lastInitConfig?.cliId === 'pi';
 }
 
+function structuredBridgeIsGrok(): boolean {
+  return lastInitConfig?.cliId === 'grok';
+}
+
 function codexBridgeIsCursor(): boolean {
   return lastInitConfig?.cliId === 'cursor';
+}
+
+function currentHermesBridgeDbPath(): string {
+  return hermesBridgeDbPath ?? resolveHermesStateDbPath();
 }
 
 function structuredBridgeIngestPath(path: string, offset: number) {
   if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
   if (codexBridgeIsCursor()) return drainCursorTranscript(path, offset);
   if (structuredBridgeIsPi()) return drainPiTranscript(path, offset);
+  if (structuredBridgeIsGrok()) return drainGrokUpdates(path, offset);
   if (structuredBridgeIsHermes()) {
-    const result = drainHermesStateDb(offset);
+    const result = drainHermesStateDb(offset, currentHermesBridgeDbPath());
     return { events: result.events, newOffset: result.newOffset, pendingTail: '' };
   }
   return drainCocoEvents(path, offset);
@@ -1972,55 +2075,23 @@ function codexBridgeStartTimer(): void {
         return;
       }
       if (!codexBridgeRolloutPath) {
-        // Two discovery paths, in order: cliSessionId (known via writeInput
-        // result for non-adopt or daemon-side probe for adopt) → exact
-        // file by name; PID (adopt only) → walk /proc/<pid>/fd. Adopt
-        // attaches via split-live (history absorbed, live ingested);
-        // non-adopt uses fresh-empty (queue's markTimeMs - 5s lower bound
-        // gates historical fingerprint matches without needing a split).
-        // Discovery primitives differ per CLI: codex walks ~/.codex/sessions
-        // by sid suffix; CoCo's events.jsonl path is deterministic from
-        // sid, so the lookup is just a path computation + existence check.
-        const isCoco = lastInitConfig?.cliId === 'coco';
-        const isTraex = lastInitConfig?.cliId === 'traex';
-        const isPi = lastInitConfig?.cliId === 'pi';
-        let path: string | undefined;
-        if (codexBridgePendingSessionId) {
-          if (isCoco) {
-            path = cocoEventsPathForSession(codexBridgePendingSessionId);
-            if (path && !existsSync(path)) path = undefined;
-          } else if (isPi) {
-            path = findPiTranscriptBySessionId(codexBridgePendingSessionId, lastInitConfig?.workingDir);
-          } else if (isTraex) {
-            path = findTraexRolloutBySessionId(codexBridgePendingSessionId);
-          } else {
-            path = findCodexRolloutBySessionId(codexBridgePendingSessionId);
-          }
-        }
-        if (!path && codexAdoptPendingPid) {
-          if (isCoco) {
-            const probed = findCocoSessionByPid(codexAdoptPendingPid);
-            if (probed && existsSync(probed.eventsPath)) path = probed.eventsPath;
-          } else if (isPi) {
-            const probed = findPiTranscriptByPid(codexAdoptPendingPid);
-            if (probed) path = probed.path;
-          } else if (isTraex) {
-            const probed = findTraexRolloutByPid(codexAdoptPendingPid);
-            if (probed) path = probed.path;
-          } else {
-            const probed = findCodexRolloutByPid(codexAdoptPendingPid);
-            if (probed) path = probed.path;
-          }
-        }
+        // Late-attach: cliSessionId (writeInput / daemon probe) then adopt
+        // pid. Path lookup is centralized in resolveFileBridgePath so
+        // adding a file-backed CLI does not grow this if-tree.
+        // Adopt → split-live; non-adopt → fresh-empty (queue markTimeMs
+        // lower bound handles history without a split).
+        const path = resolveFileBridgePath(lastInitConfig?.cliId, {
+          sessionId: codexBridgePendingSessionId,
+          cwd: lastInitConfig?.workingDir,
+          pid: codexAdoptPendingPid,
+        });
         if (path) {
+          if (codexAdoptPendingPid && (lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex')) {
+            const discoveredSessionId = codexSessionIdFromRolloutPath(path);
+            if (discoveredSessionId) persistCliSessionId(discoveredSessionId);
+          }
           codexBridgePendingSessionId = undefined;
           codexAdoptPendingPid = undefined;
-          // Adopt mode: split-live partitions drained events by
-          // codexAdoptStartMs so anything the user did AFTER adopt but
-          // BEFORE we found the rollout still emits (history is absorbed,
-          // live is ingested). Non-adopt: fresh-empty as before — queue's
-          // markTimeMs - 5s lower bound is enough since there's no
-          // local-turn synthesis on that path.
           const mode = lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty';
           codexBridgeAttach(path, mode);
         }
@@ -2034,19 +2105,37 @@ function codexBridgeStartTimer(): void {
 }
 
 function hermesBridgeAttach(mode: 'baseline-existing' | 'fresh-empty'): void {
-  hermesBridgeOffset = currentHermesStateOffset();
+  const dbPath = currentHermesBridgeDbPath();
+  hermesBridgeOffset = currentHermesStateOffset(dbPath);
   hermesBridgeBaselineDone = true;
-  log(`Hermes bridge ${mode}: state.db offset=${hermesBridgeOffset}`);
+  hermesBridgeSourceSessionId = undefined;
+  log(`Hermes bridge ${mode}: ${dbPath} offset=${hermesBridgeOffset}`);
   codexBridgeStartTimer();
 }
 
 function hermesBridgeIngest(): void {
   if (!hermesBridgeBaselineDone) return;
-  const result = drainHermesStateDb(hermesBridgeOffset);
+  const result = drainHermesStateDb(hermesBridgeOffset, currentHermesBridgeDbPath());
   hermesBridgeOffset = result.newOffset;
-  if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  codexBridgeQueue.ingest(result.events);
-  if (result.events.some(e => e.kind === 'assistant_final')) {
+  const filtered = filterHermesEventsForBotmuxSession(result.events, {
+    botmuxSessionId: sessionId,
+    boundSourceSessionId: hermesBridgeSourceSessionId,
+  });
+  // Announce EVERY source bound this drain, not just the last. A single drain
+  // can bind multiple sources when the worker starts unbound and Hermes
+  // `/clear`-rotates mid-batch; the daemon accumulates them into its authorized
+  // set, so a completed turn from an earlier source is not dropped as foreign.
+  for (const boundSourceSessionId of filtered.newlyBoundSourceSessionIds) {
+    send({ type: 'bridge_source_session', bridge: 'hermes', sourceSessionId: boundSourceSessionId });
+    log(`Hermes bridge bound sourceSessionId=${boundSourceSessionId}`);
+  }
+  hermesBridgeSourceSessionId = filtered.boundSourceSessionId;
+  for (const drop of filtered.drops) {
+    log(`Hermes bridge dropped ${drop.kind} ${drop.uuid} from sourceSessionId=${drop.sourceSessionId ?? '?'} expected=${drop.expectedSourceSessionId ?? hermesBridgeSourceSessionId ?? 'unbound'} reason=${drop.reason}`);
+  }
+  if (filtered.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
+  codexBridgeQueue.ingest(filtered.events);
+  if (filtered.events.some(e => e.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
   }
 }
@@ -2198,11 +2287,55 @@ function cursorBridgeAttach(path: string, mode: CursorAttachMode = 'baseline-exi
   codexBridgeAttach(path, mode === 'baseline-existing' ? 'baseline-existing-skip-tail' : mode);
 }
 
+/** Drop the current file-backed bridge attachment (watcher + path cursor).
+ *  Does NOT clear the pending-turn queue — mid-rotation submits still need
+ *  fingerprint matching against the next attach. */
+function codexBridgeDetachFile(): void {
+  if (codexBridgeWatcher) {
+    try { codexBridgeWatcher.close(); } catch { /* ignore */ }
+    codexBridgeWatcher = null;
+  }
+  codexBridgeRolloutPath = undefined;
+  codexBridgeOffset = 0;
+  codexBridgePendingTail = '';
+  codexBridgeBaselineDone = false;
+}
+
 /** Called from flushPending after writeInput first returns a cliSessionId.
  *  Tries to locate the rollout file immediately; if it's not on disk yet,
  *  remembers the sid so the 1s poller can keep retrying. */
 function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
-  if (!codexBridgeFallbackActive() || codexBridgeRolloutPath) return;
+  if (!codexBridgeFallbackActive()) return;
+  if (codexBridgeRolloutPath) {
+    // Already attached — first-attach-wins for most CLIs. Exception: grok's
+    // `/new` / `/clear` / `/resume` rotate to a NEW session directory at the
+    // SAME pid, and writeInput's prompt_history verify reports the new
+    // session id on the very next submit. Without a re-attach the bridge
+    // stays wedged on the old updates.jsonl and the reply fallback / idle
+    // signal go dark for the rest of the session.
+    if (structuredBridgeIsGrok()) {
+      const currentSid = grokSessionIdFromPath(codexBridgeRolloutPath);
+      if (currentSid && currentSid.toLowerCase() === cliSessionId.toLowerCase()) return;
+      const next = resolveFileBridgePath('grok', {
+        sessionId: cliSessionId,
+        cwd: lastInitConfig?.workingDir,
+      });
+      if (next && next !== codexBridgeRolloutPath) {
+        log(`Grok session rotated ${currentSid ?? '?'} → ${cliSessionId}; re-attaching bridge to ${next}`);
+        codexBridgeDetachFile();
+        codexBridgePendingSessionId = undefined;
+        codexBridgeAttach(next, 'fresh-empty');
+      } else if (!next) {
+        // New session id reported but updates.jsonl not on disk yet —
+        // detach the retired session and arm the poller for late-attach.
+        log(`Grok session rotated ${currentSid ?? '?'} → ${cliSessionId}; waiting for updates.jsonl`);
+        codexBridgeDetachFile();
+        codexBridgePendingSessionId = cliSessionId;
+        codexBridgeStartTimer();
+      }
+    }
+    return;
+  }
   if (structuredBridgeIsMtr()) {
     const source = findMtrSessionById(cliSessionId);
     if (source) {
@@ -2217,7 +2350,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   if (codexBridgeIsCursor()) {
     // Cursor's cliSessionId is the chatId — the same UUID naming the
     // agent-transcript JSONL, so it resolves the path directly.
-    const cursorPath = findCursorTranscriptByChatId(cliSessionId);
+    const cursorPath = resolveFileBridgePath('cursor', { sessionId: cliSessionId });
     if (cursorPath) {
       codexBridgePendingSessionId = undefined;
       cursorBridgeAttach(cursorPath, cursorLateAttachMode(cursorPath));
@@ -2227,11 +2360,10 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     }
     return;
   }
-  const path = lastInitConfig?.cliId === 'traex'
-    ? findTraexRolloutBySessionId(cliSessionId)
-    : lastInitConfig?.cliId === 'pi'
-      ? findPiTranscriptBySessionId(cliSessionId, lastInitConfig?.workingDir)
-      : findCodexRolloutBySessionId(cliSessionId);
+  const path = resolveFileBridgePath(lastInitConfig?.cliId, {
+    sessionId: cliSessionId,
+    cwd: lastInitConfig?.workingDir,
+  });
   if (path) {
     codexBridgePendingSessionId = undefined;
     codexBridgeAttach(path, 'fresh-empty');
@@ -2308,6 +2440,7 @@ function emitReadyCodexTurns(): void {
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
     if (!turn.finalText) continue;
+    const sourceHermesSessionId = structuredBridgeIsHermes() ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: turn.finalText }, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
@@ -2322,6 +2455,7 @@ function emitReadyCodexTurns(): void {
       if (!fields) continue;
       send({
         type: 'final_output',
+        ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
         content: fields.content,
         lastUuid: turn.turnId,
         turnId: turn.turnId,
@@ -2330,7 +2464,13 @@ function emitReadyCodexTurns(): void {
       });
       continue;
     }
-    send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: turn.turnId });
+    send({
+      type: 'final_output',
+      ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
+      content: turn.finalText,
+      lastUuid: turn.turnId,
+      turnId: turn.turnId,
+    });
   }
 }
 
@@ -2349,6 +2489,7 @@ function stopCodexBridge(): void {
   codexBridgeBaselineDone = false;
   hermesBridgeOffset = 0;
   hermesBridgeBaselineDone = false;
+  hermesBridgeSourceSessionId = undefined;
   mtrBridgeSource = undefined;
   mtrBridgeOffset = 0;
   mtrBridgeBaselineDone = false;
@@ -3031,6 +3172,8 @@ let trustHandled = false;
 const CODEX_APP_OSC_PREFIX = '\x1b]777;botmux:';
 const APP_RUNNER_OSC_CLI_IDS = new Set(['codex-app', 'mira', 'mir']);
 let codexAppOscPending = '';
+let kiroSessionIdCaptureArmed = false;
+let kiroSessionIdCaptureBuffer = '';
 
 function decodeCodexAppPayload(payload: string): any | undefined {
   try {
@@ -3077,6 +3220,16 @@ function handleCodexAppMarker(body: string): void {
   }
 }
 
+function maybeCaptureKiroSessionId(data: string): void {
+  if (!kiroSessionIdCaptureArmed || lastInitConfig?.cliId !== 'kiro-cli') return;
+  kiroSessionIdCaptureBuffer = tailChars(kiroSessionIdCaptureBuffer + data, 4000);
+  const cliSessionId = extractKiroSessionIdFromOutput(kiroSessionIdCaptureBuffer);
+  if (!cliSessionId || cliSessionId === sessionId) return;
+  persistCliSessionId(cliSessionId);
+  kiroSessionIdCaptureArmed = false;
+  kiroSessionIdCaptureBuffer = '';
+}
+
 function splitCodexAppControl(data: string): string {
   if (!APP_RUNNER_OSC_CLI_IDS.has(lastInitConfig?.cliId ?? '') && codexAppOscPending.length === 0) return data;
   const input = codexAppOscPending + data;
@@ -3117,6 +3270,7 @@ function onPtyData(data: string): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
   lastPtyActivityAtMs = Date.now();
+  maybeCaptureKiroSessionId(data);
   captureWorkflowTranscript(data);
   renderer?.write(data);
 
@@ -3760,7 +3914,10 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
     if (cfg.cliSessionId) rolloutPath = findCodexRolloutBySessionId(cfg.cliSessionId);
     if (!rolloutPath && cfg.adoptCliPid) {
       const probed = findCodexRolloutByPid(cfg.adoptCliPid);
-      if (probed) rolloutPath = probed.path;
+      if (probed) {
+        rolloutPath = probed.path;
+        persistCliSessionId(probed.cliSessionId);
+      }
     }
     if (rolloutPath) {
       codexBridgeAttach(rolloutPath, 'split-live');
@@ -3779,7 +3936,10 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
     if (cfg.cliSessionId) rolloutPath = findTraexRolloutBySessionId(cfg.cliSessionId);
     if (!rolloutPath && cfg.adoptCliPid) {
       const probed = findTraexRolloutByPid(cfg.adoptCliPid);
-      if (probed) rolloutPath = probed.path;
+      if (probed) {
+        rolloutPath = probed.path;
+        persistCliSessionId(probed.cliSessionId);
+      }
     }
     if (rolloutPath) {
       codexBridgeAttach(rolloutPath, 'split-live');
@@ -3855,39 +4015,45 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
       codexAdoptPendingPid = cfg.adoptCliPid;
       codexBridgeStartTimer();
     }
-  } else if (cfg.cliId === 'pi') {
-    const adoptStartMs = Date.now();
-    codexAdoptStartMs = adoptStartMs;
-    codexBridgeQueue.setLocalTurns(true, adoptStartMs);
-    let path: string | undefined;
-    if (cfg.cliSessionId) path = findPiTranscriptBySessionId(cfg.cliSessionId, cfg.adoptCwd ?? cfg.workingDir);
-    if (!path && cfg.adoptCliPid) {
-      const probed = findPiTranscriptByPid(cfg.adoptCliPid);
-      if (probed) path = probed.path;
-    }
-    if (path) {
-      codexBridgeAttach(path, 'split-live');
-    } else {
-      if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
-      codexAdoptPendingPid = cfg.adoptCliPid;
-      codexBridgeStartTimer();
-    }
+  } else if (cfg.cliId === 'pi' || cfg.cliId === 'grok') {
+    // File-backed bridges share the same adopt attach skeleton (sid → pid →
+    // split-live | pending). Path lookup is resolveFileBridgePath; pi is
+    // intentionally folded here with grok so the two stay in lockstep.
+    setupAdoptFileBridge(cfg);
+  }
+}
+
+/** Adopt attach for file-backed structured bridges (pi/grok today; codex/
+ *  traex keep their own branches for rollout-specific probes). */
+function setupAdoptFileBridge(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  const adoptStartMs = Date.now();
+  codexAdoptStartMs = adoptStartMs;
+  codexBridgeQueue.setLocalTurns(true, adoptStartMs);
+  const path = resolveFileBridgePath(cfg.cliId, {
+    sessionId: cfg.cliSessionId,
+    cwd: cfg.adoptCwd ?? cfg.workingDir,
+    pid: cfg.adoptCliPid,
+  });
+  if (path) {
+    codexBridgeAttach(path, 'split-live');
+  } else {
+    if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
+    codexAdoptPendingPid = cfg.adoptCliPid;
+    codexBridgeStartTimer();
   }
 }
 
 function adoptIdleAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): CliAdapter {
   return cfg.bridgeJsonlPath
     ? createCliAdapterSync('claude-code', undefined)
-    : cfg.cliId === 'codex' || cfg.cliId === 'traex' || cfg.cliId === 'coco' || cfg.cliId === 'mtr' || cfg.cliId === 'pi'
-      ? createCliAdapterSync(cfg.cliId, undefined)
+    : isStructuredBridgeAdoptIdleCli(cfg.cliId)
+      ? createCliAdapterSync(cfg.cliId as CliId, undefined)
       : ({ completionPattern: undefined, readyPattern: undefined } as CliAdapter);
 }
 
 function setupAdoptInputAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
-  if (cfg.cliId === 'codex' || cfg.cliId === 'traex' || cfg.cliId === 'pi') {
-    cliAdapter = createCliAdapterSync(cfg.cliId, cfg.cliPathOverride);
-  } else if (cfg.cliId === 'mtr') {
-    cliAdapter = createCliAdapterSync('mtr', cfg.cliPathOverride);
+  if (isStructuredBridgeAdoptInputCli(cfg.cliId)) {
+    cliAdapter = createCliAdapterSync(cfg.cliId as CliId, cfg.cliPathOverride);
   }
 }
 
@@ -4017,8 +4183,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     });
     effectiveBackendType = 'herdr';
     backend = herdrBe;
+    // Same as tmux/zellij adopt: writeInput (grok preferSessionId via
+    // findGrokSessionByPid, claude pid-state) needs cliPid/cliCwd on the
+    // PtyHandle. spawn() overwrites cliCwd from opts.cwd — use adoptCwd when
+    // present so session discovery stays on the CLI's real working dir.
+    if (cfg.adoptCliPid) herdrBe.cliPid = cfg.adoptCliPid;
+    const herdrAdoptCwd = cfg.adoptCwd ?? cfg.workingDir;
+    herdrBe.cliCwd = herdrAdoptCwd;
     herdrBe.spawn('', [], {
-      cwd: cfg.workingDir,
+      cwd: herdrAdoptCwd,
       cols,
       rows,
       env: process.env as Record<string, string>,
@@ -4063,6 +4236,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       : new TmuxPipeBackend(cfg.adoptTmuxTarget!, { cliPid: cfg.adoptCliPid });
     effectiveBackendType = cfg.adoptZellijPaneId ? 'zellij' : 'tmux';
     backend = observeBe;
+    // writeInput (grok concurrent prompt_history binding, claude pid-state)
+    // reads these fields off the PtyHandle — constructor only stores
+    // watchCliPid for liveness, so surface them explicitly for adopt.
+    if (cfg.adoptCliPid) (observeBe as { cliPid?: number }).cliPid = cfg.adoptCliPid;
+    (observeBe as { cliCwd?: string }).cliCwd = cfg.adoptCwd ?? cfg.workingDir;
     observeBe.spawn('', [], {
       cwd: cfg.workingDir,
       cols,
@@ -4117,7 +4295,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     if (effectiveBackend === 'tmux') {
       hasExistingSession = TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId));
       if (!hasExistingSession) {
-        const probe = probeTmuxFunctional();
+        const probe = probeTmuxFunctionalWithRetry();
         available = probe.ok;
         if (!probe.ok) reason = probe.reason;
       }
@@ -4176,6 +4354,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // and the turn never relays (2026-06-10 incident). Redirect every jsonl/pid/
   // bridge gate below to the upper copy where the sandboxed CLI actually writes.
   const willFileSandbox =
+    process.platform === 'linux' &&          // bwrap overlay is Linux-only; macOS uses the Seatbelt write-sandbox below
     (cfg.sandbox === true || sandboxEnabled()) &&
     (effectiveBackendType === 'pty' || effectiveBackendType === 'tmux') &&
     !!process.env.SESSION_DATA_DIR;
@@ -4193,17 +4372,41 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // wrapper are applied at spawn time further down. This gate is the SINGLE
   // decision point: configured-but-unenforceable fail-closes HERE (never run a
   // session unisolated that asked for isolation).
+  // UNIFIED file sandbox: read isolation engages with the same toggle as write
+  // isolation. On darwin the legacy standalone `readIsolation` flag ALSO engages it
+  // (Seatbelt can read-deny without a write overlay). On Linux read isolation RIDES
+  // the bwrap sandbox (its masks go into the same bwrap plan), so it requires the
+  // sandbox to be on — hence the trigger is the sandbox toggle there, never the bare
+  // legacy flag (which would redirect the data dir but apply no masks → a hole).
+  const wantsFileSandbox = cfg.sandbox === true || sandboxEnabled();
+  // Legacy EXPLICIT read-isolation opt-in (macOS only — Linux read-iso rides the
+  // bwrap sandbox, so it's driven solely by the sandbox toggle there). Keeps
+  // FAIL-CLOSED semantics: you asked for read isolation → refuse to start without it.
+  const explicitLegacyReadIso = process.platform === 'darwin' && cfg.readIsolation === true;
   const readIsolationGate = evaluateReadIsolationGate({
-    configured: cfg.readIsolation === true,
+    configured: wantsFileSandbox || explicitLegacyReadIso,
     adapterSupports: cliAdapter.supportsReadIsolation === true,
     wrapperCliSet: !!cfg.wrapperCli,
     platform: process.platform,
     sessionDataDirSet: !!process.env.SESSION_DATA_DIR,
   });
-  if (readIsolationGate.failClosedReason) {
+  // Fail-closed ONLY for the explicit legacy flag. Under the UNIFIED sandbox toggle
+  // read isolation is BEST-EFFORT: a CLI/platform that can't enforce the read-deny
+  // (e.g. a non-supporting adapter) still runs WRITE-isolated — it just doesn't get
+  // the read masks. Never brick a sandboxed session just because read-iso is N/A.
+  if (readIsolationGate.failClosedReason && explicitLegacyReadIso) {
     throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: ${readIsolationGate.failClosedReason}`);
   }
   const willReadIsolate = readIsolationGate.enabled;
+  // macOS FILE SANDBOX — the Seatbelt WRITE-isolation twin of the Linux bwrap
+  // overlay. On darwin, `sandbox: true` (or the global sandboxEnabled()) confines
+  // WRITES via the same `sandbox-exec` wrapper as read isolation instead of bwrap
+  // (Linux-only). Reads stay open, matching the Linux "read-all / write-isolated"
+  // model; if read isolation is ALSO on, its read-deny set layers into the SAME
+  // profile. Like bwrap this is FAIL-SAFE: a requested sandbox that can't be
+  // established (unsandboxable backend, no SESSION_DATA_DIR) is a hard error at the
+  // spawn site below, never a silent unconfined run.
+  const willWriteSandbox = process.platform === 'darwin' && wantsFileSandbox;
   // Every bot — isolated OR not — gets its own BOT_HOME dir as a ready-made private-
   // storage slot. An isolated sibling denies this path regardless of whether the owner
   // is isolated (deny uses the full bots.json), so a non-isolated bot can drop private
@@ -4227,6 +4430,16 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // Provision the per-bot config dir (auth + onboarding/trust seed + hooks for claude;
     // auth/config copy for codex) so the CLI starts fully set up under the Seatbelt wrapper.
     provisionIsolatedBotHome(isolationBotHome, cfg.workingDir, isClaudeFam, cfg.cliId, cliAdapter.hookInstall, log);
+    if (cliAdapter.mcpGateway) {
+      const isolatedConfigPath = isClaudeFam
+        ? join(claudeDataDir!, '.claude.json')
+        : join(isolationBotHome, 'codex', 'config.toml');
+      const report = ensureGatewayEntry({
+        id: cliAdapter.id,
+        mcpGateway: { ...cliAdapter.mcpGateway, configPath: isolatedConfigPath },
+      });
+      if (report.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+    }
   }
   // Predict reattach vs fresh BEFORE the resume pre-flight. On a persistent
   // backend (tmux/herdr/zellij) a daemon restart finds the CLI process still
@@ -4254,7 +4467,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // so the probe below sees no pane and we cold-spawn fresh isolated. A pane from
   // this lifetime (suspend→resume) keeps its marker → reattaches normally (it is
   // still the isolated process). This lets isolated bots use tmux/zellij/herdr.
-  if (cfg.readIsolation === true && persistentSessionName && effectiveBackendType !== 'pty') {
+  if ((willReadIsolate || willWriteSandbox) && persistentSessionName && effectiveBackendType !== 'pty') {
     const paneLive = effectiveBackendType === 'tmux'
       ? TmuxBackend.hasSession(persistentSessionName)
       : effectiveBackendType === 'zellij'
@@ -4292,6 +4505,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         ? ZellijBackend.hasSession(persistentSessionName)
         : HerdrBackend.hasSession(persistentSessionName)
     : false;
+
+  // The plugin set is stable only for the lifetime of one real CLI process.
+  // A warm worker reattach keeps the existing Gateway and catalog untouched;
+  // every fresh/resumed CLI spawn atomically refreshes both from current Bot config.
+  if (!willReattachPersistent) refreshCliPluginGeneration(cfg, cliAdapter);
 
   // Re-arm the startup-commands one-shot ONLY for a genuinely fresh CLI process.
   // A reattach to a LIVE persistent pane (daemon-restart recovery) is the SAME
@@ -4403,6 +4621,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
   }) || (effectiveResume && cliAdapter.initialPromptArgsIgnoredOnResume === true);
+  kiroSessionIdCaptureArmed = cfg.cliId === 'kiro-cli' && !effectiveCliSessionId && !willReattachPersistent;
+  kiroSessionIdCaptureBuffer = '';
   // Per-bot local read isolation: assemble the Seatbelt profile context (the gate
   // already fail-closed above — reaching here with willReadIsolate means it is
   // enforceable). The worker is on the host (NOT sandboxed), so it holds the
@@ -4436,6 +4656,29 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     } catch (e) {
       log(`[read-isolation] WARN could not write send-cred file: ${(e as Error).message}`);
     }
+  }
+  // macOS write-sandbox rules (pure): the writable-zone allow-list + crown-jewel
+  // re-denies. Realpath'd + emitted into the Seatbelt profile at the spawn site.
+  let writeSandboxRules: {
+    allowWritePaths: string[];
+    allowWriteRegexes: string[];
+    denyWritePaths: string[];
+  } | undefined;
+  if (willWriteSandbox && process.env.SESSION_DATA_DIR) {
+    const sessionDataDir = process.env.SESSION_DATA_DIR;
+    // Regex rules cannot be realpath'd after construction, so build their home
+    // prefix from the canonical path up front (Seatbelt matches canonical paths).
+    const sandboxHome = (() => { try { return realpathSync(homedir()); } catch { return homedir(); } })();
+    writeSandboxRules = buildWriteSandboxRules({
+      homeDir: sandboxHome,
+      botmuxHome: dirname(sessionDataDir),
+      sessionDataDir,
+      workingDir: cfg.workingDir,
+      currentAppId: cfg.larkAppId,
+      // TMPDIR on macOS resolves under /private/var/folders (already allowed), but
+      // pass it explicitly so a customized TMPDIR is covered too.
+      extraWritePaths: process.env.TMPDIR ? [process.env.TMPDIR] : [],
+    });
   }
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
@@ -4580,6 +4823,13 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
   const perBotInjectKeys = Object.keys(perBotInjectEnv);
   if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
+  const hermesUsesBotmuxSessionProfile = basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session';
+  hermesBridgeDbPath = cfg.cliId === 'hermes'
+    ? resolveHermesStateDbPath(
+      { ...childEnv, ...perBotInjectEnv },
+      { botmuxSessionProfile: hermesUsesBotmuxSessionProfile },
+    )
+    : undefined;
 
   // ── File sandbox (oncall): wrap the CLI in bwrap so it can only touch a
   // per-session project copy + de-identified config. The agent's `botmux send`
@@ -4589,11 +4839,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   let spawnArgs = args;
   let spawnCwd = cfg.workingDir;
 
-  // Read isolation: wrap the whole CLI process in a macOS Seatbelt sandbox that
+  // Read isolation (macOS): wrap the whole CLI process in a Seatbelt sandbox that
   // denies reads of the sensitive paths (blocklist). The CLI bypasses its OWN
-  // sandbox (see adapter) so the outer wrapper is the sole enforcer. Non-darwin
-  // platforms already fail-closed at the gate above (Linux bwrap is a TODO).
-  if (readIsolationCtx) {
+  // sandbox (see adapter) so the outer wrapper is the sole enforcer. DARWIN ONLY —
+  // on Linux read isolation is enforced by bwrap masks fed into the overlay sandbox
+  // below (see readIsoLinuxMasks), NOT sandbox-exec (which doesn't exist there).
+  if (process.platform === 'darwin' && (readIsolationCtx || writeSandboxRules)) {
     // Seatbelt matches CANONICAL paths (it resolves symlinks), so realpath every
     // deny/allow before emitting the profile — otherwise a sensitive root reached
     // through a symlinked prefix (e.g. a symlinked home / SESSION_DATA_DIR) would
@@ -4602,43 +4853,60 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // The ROOT dirs are canonicalized FIRST (profileCtx) so the regex patterns —
     // which can't be realpath'd as a result — are built on canonical prefixes too.
     const canonical = (p: string) => { try { return realpathSync(p); } catch { return p; } };
-    // v2 HYBRID model: whole-deny ~/.claude|~/.codex (F1 fix — own CLI data is redirected
-    // into BOT_HOME, readable) + surgical-deny only the cross-bot-SENSITIVE parts of the
-    // otherwise-readable ~/.botmux + system creds. Per-bot dirs (bots/, .lark-cli-bots/)
-    // are denied WHOLESALE and per-bot session files by filename PATTERN, so a newly-
-    // added bot is covered without cold-restarting this one and nothing enumerates
-    // sibling app ids; the own slice is re-opened via carve-outs — allow subpaths + a
-    // file-read-metadata traverse shim so Codex can realpath() its CODEX_HOME through
-    // the denied parent. Admin readDenyExtraPaths become FINAL denies (win over the
-    // own-allow).
-    const profileCtx: V2IsolationContext = {
-      ...readIsolationCtx,
-      homeDir: canonical(readIsolationCtx.homeDir),
-      botmuxHome: canonical(readIsolationCtx.botmuxHome),
-      sessionDataDir: canonical(readIsolationCtx.sessionDataDir),
-    };
-    const denyPaths = buildV2DenyPaths(profileCtx).map(canonical);
-    const denyRegexes = buildV2DenyRegexes(profileCtx);
-    const carve = buildV2CarveOuts(profileCtx);
-    const allowPaths = carve.allowPaths.map(canonical);
-    const finalDenyPaths = carve.finalDenyPaths.map(canonical);
-    const traverseDirs = carve.traverseDirs.map(canonical);
+    // READ rules — only when read isolation is on. v2 HYBRID model: whole-deny
+    // ~/.claude|~/.codex (F1 fix — own CLI data is redirected into BOT_HOME,
+    // readable) + surgical-deny only the cross-bot-SENSITIVE parts of the otherwise-
+    // readable ~/.botmux + system creds; the own slice is re-opened via carve-outs.
+    // For a WRITE-sandbox-only session these stay empty → reads wide open (Linux parity).
+    let denyPaths: string[] = [], denyRegexes: string[] = [], allowPaths: string[] = [],
+        finalDenyPaths: string[] = [], traverseDirs: string[] = [];
+    if (readIsolationCtx) {
+      const profileCtx: V2IsolationContext = {
+        ...readIsolationCtx,
+        homeDir: canonical(readIsolationCtx.homeDir),
+        botmuxHome: canonical(readIsolationCtx.botmuxHome),
+        sessionDataDir: canonical(readIsolationCtx.sessionDataDir),
+      };
+      denyPaths = buildV2DenyPaths(profileCtx).map(canonical);
+      denyRegexes = buildV2DenyRegexes(profileCtx);
+      const carve = buildV2CarveOuts(profileCtx);
+      allowPaths = [
+        ...carve.allowPaths.map(canonical),
+        ...buildCliExecutableReadCarveOuts({
+          homeDir: profileCtx.homeDir,
+          cliId: cliAdapter.id,
+          resolvedBin: canonical(cliAdapter.resolvedBin),
+        }),
+      ];
+      finalDenyPaths = carve.finalDenyPaths.map(canonical);
+      traverseDirs = carve.traverseDirs.map(canonical);
+    }
+    // WRITE rules — the macOS file-sandbox (Linux-bwrap twin). Realpath the writable
+    // zones + crown-jewel re-denies for the same symlink-safety reason as reads.
+    const writeRules = writeSandboxRules
+      ? {
+          allowWritePaths: writeSandboxRules.allowWritePaths.map(canonical),
+          allowWriteRegexes: writeSandboxRules.allowWriteRegexes,
+          denyWritePaths: writeSandboxRules.denyWritePaths.map(canonical),
+        }
+      : undefined;
     if (!locateOnPath('sandbox-exec')) {
-      throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: sandbox-exec not found`);
+      throw new Error(`[file-sandbox] refusing to start session ${cfg.sessionId}: sandbox-exec not found`);
     }
     const profileDir = join(process.env.SESSION_DATA_DIR!, 'read-isolation');
     mkdirSync(profileDir, { recursive: true });
     const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
-    writeFileSync(profilePath, buildSeatbeltProfile(denyPaths, allowPaths, finalDenyPaths, traverseDirs, denyRegexes), { mode: 0o600 });
+    writeFileSync(profilePath, buildSeatbeltProfile(denyPaths, allowPaths, finalDenyPaths, traverseDirs, denyRegexes, writeRules), { mode: 0o600 });
     seatbeltProfilePath = profilePath;
     spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
     spawnBin = 'sandbox-exec';
-    log(`[read-isolation] wrapping ${cliAdapter.id} in Seatbelt: sandbox-exec -f ${profilePath}`);
+    log(`[file-sandbox] wrapping ${cliAdapter.id} in Seatbelt (read-isolation=${!!readIsolationCtx}, write-sandbox=${!!writeRules}): sandbox-exec -f ${profilePath}`);
   }
-  // [read-isolation] Fresh isolated spawn on a persistent backend: stamp the pane
-  // with this daemon's boot id so a later suspend→resume reattach can be trusted
-  // (see the stale-pane guard above). pty needs no marker (never reattached).
-  if (readIsolationCtx && persistentSessionName && !willReattachPersistent) {
+  // Fresh sandboxed spawn on a persistent backend: stamp the pane with this daemon's
+  // boot id so a later suspend→resume reattach can be trusted (see the stale-pane
+  // guard above). Applies to read-isolation AND write-sandbox panes (both carry the
+  // Seatbelt confinement on the live process). pty needs no marker (never reattached).
+  if ((readIsolationCtx || writeSandboxRules) && persistentSessionName && !willReattachPersistent) {
     try {
       const markerDir = join(process.env.SESSION_DATA_DIR!, 'read-isolation');
       mkdirSync(markerDir, { recursive: true });
@@ -4648,7 +4916,53 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // Sandbox wraps the spawned binary in bwrap. Works for pty (PtyBackend runs
   // bwrap directly) and tmux (the tmux pane's command becomes `bwrap … -- cli`);
   // env is carried via bwrap --setenv (see prepareSandbox), not the backend.
-  const sandboxOn = cfg.sandbox === true || sandboxEnabled();
+  // Linux ONLY — on macOS the same `sandbox: true` is enforced by the Seatbelt
+  // write-sandbox above (willWriteSandbox), so bwrap must not run here.
+  const sandboxOn = process.platform !== 'darwin' && (cfg.sandbox === true || sandboxEnabled());
+  // Linux read isolation: build the bwrap MASK set (the Seatbelt read-deny twin) and
+  // fold it into the SAME overlay sandbox plan below. Enumerate sibling bots from the
+  // FILESYSTEM (the worker runs unsandboxed on the host; bots.json may be denied) —
+  // spawn-time-static, so a bot added after this spawn is covered on its next cold
+  // start (the accepted Linux tradeoff vs the macOS regex). Only when read isolation
+  // is enforceable here (willReadIsolate ⇒ readIsolationCtx set) AND on Linux.
+  let readIsoLinuxMasks: { hidePaths: string[]; ownReadWritePaths: string[]; ownReadOnlyPaths: string[] } | undefined;
+  if (readIsolationCtx && process.platform === 'linux') {
+    const canon = (p: string) => { try { return realpathSync(p); } catch { return p; } };
+    // Canonicalize the root prefixes FIRST so every derived mask path is symlink-safe
+    // (bwrap masks resolve symlinks — a symlinked home/data root would else fail-open).
+    const ctxReal: V2IsolationContext = {
+      ...readIsolationCtx,
+      homeDir: canon(readIsolationCtx.homeDir),
+      botmuxHome: canon(readIsolationCtx.botmuxHome),
+      sessionDataDir: canon(readIsolationCtx.sessionDataDir),
+    };
+    const ids = new Set<string>();
+    const scan = (dir: string, pick: (name: string) => string | null) => {
+      try { for (const name of readdirSync(dir)) { const id = pick(name); if (id) ids.add(id); } } catch { /* dir absent → no siblings there */ }
+    };
+    scan(join(ctxReal.botmuxHome, 'bots'), n => n);                                    // sibling BOT_HOME dirs
+    scan(join(ctxReal.homeDir, '.lark-cli-bots'), n => n);                             // sibling lark configs
+    scan(ctxReal.sessionDataDir, n => { const m = /^sessions-(.+)\.json$/.exec(n); return m ? m[1] : null; });
+    ids.delete(cfg.larkAppId);                                                          // never mask own
+    let sidecars: string[] = [];
+    try { sidecars = readdirSync(ctxReal.botmuxHome).filter(n => n.startsWith('bots.json.')).map(n => join(ctxReal.botmuxHome, n)); } catch { /* */ }
+    const m = buildLinuxReadIsolationMasks({ ctx: ctxReal, siblingAppIds: [...ids], botsJsonSidecars: sidecars });
+    // Same execvp carve-out as macOS (Codex 342a3e1c): a standalone Codex whose
+    // binary lives UNDER the now-masked ~/.codex would fail execvp. Re-expose ONLY
+    // its executable package tree (read-only, after the masks) — auth/config/sessions
+    // stay masked. No-op for npm/system installs (binary not under ~/.codex) + non-codex.
+    const execCarveOuts = buildCliExecutableReadCarveOuts({
+      homeDir: ctxReal.homeDir,
+      cliId: cliAdapter.id,
+      resolvedBin: canon(cliAdapter.resolvedBin),
+    }).map(canon);
+    readIsoLinuxMasks = {
+      hidePaths: m.hidePaths.map(canon),
+      ownReadWritePaths: m.ownReadWritePaths.map(canon),
+      ownReadOnlyPaths: [...m.ownReadOnlyPaths.map(canon), ...execCarveOuts],
+    };
+    log(`[read-isolation] linux bwrap masks: ${m.hidePaths.length} hide, ${[...ids].length} siblings enumerated${execCarveOuts.length ? ', +codex-standalone exec carve' : ''}`);
+  }
   if (sandboxOn) {
     // FAIL-SAFE (not fail-open): when the sandbox is requested, a missing
     // precondition (no SESSION_DATA_DIR, or a backend we can't wrap) must be a
@@ -4698,10 +5012,13 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
           dataDir,
           cliBin: cliAdapter.resolvedBin,
           cliArgs: args,
-          hidePaths: cfg.sandboxHidePaths ?? [],
-          authPaths: cliAdapter.authPaths,
+          // Read-isolation masks (Linux) fold into the same plan: hide the cross-bot
+          // sensitive set, keep the own BOT_HOME real+writable (authPaths), and re-
+          // expose the own attachments bucket read-only after the masks (readonlyRoots).
+          hidePaths: [...(cfg.sandboxHidePaths ?? []), ...(readIsoLinuxMasks?.hidePaths ?? [])],
+          authPaths: [...(cliAdapter.authPaths ?? []), ...(readIsoLinuxMasks?.ownReadWritePaths ?? [])],
           extraExecPaths: cliAdapter.sandboxExtraExecPaths?.(),
-          readonlyRoots: cfg.skillReadonlyRoots ?? [],
+          readonlyRoots: [...(cfg.skillReadonlyRoots ?? []), ...(readIsoLinuxMasks?.ownReadOnlyPaths ?? [])],
           userReadonlyPaths: cfg.sandboxReadonlyPaths ?? [],
           net: cfg.sandboxNetwork !== false,
         });
@@ -4841,15 +5158,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   if (cliPid) startWrapperRealPidResolve(cliPid);
   if (cliPid) observeCursorCliSessionId(cliPid);
 
-  // Wire pid + cwd so the claude-code adapter's writeInput can read
-  // ~/.claude/sessions/<pid>.json — the spawn-time pid-state record. Its
-  // `sessionId` is set ONCE at process start (Claude Code 2.1.123); a
-  // `--resume` lookup will surface here, but in-pane `/clear` won't, so a
-  // 'matching sessionId' answer is "no spawn-time rotation observed", not
-  // "no rotation at all". The pinned claudeJsonlPath above is still the
-  // initial guess; the resolver corrects it on first write when Claude was
-  // started with `--resume`.
-  if (claudeDataDir && cliPid) {
+  // Wire pid + cwd so adapters' writeInput can bind submits to this process:
+  //   - claude-code: ~/.claude/sessions/<pid>.json
+  //   - grok: findGrokSessionByPid → preferSessionId against shared
+  //     prompt_history (concurrent same-cwd workers must not cross-claim)
+  // Claude's sessionId is set ONCE at process start (2.1.123); a `--resume`
+  // lookup will surface here, but in-pane `/clear` won't. The pinned
+  // claudeJsonlPath above is still the initial guess; the resolver corrects
+  // it on first write when Claude was started with `--resume`.
+  if (cliPid && (claudeDataDir || cfg.cliId === 'grok')) {
     (backend as TmuxBackend | PtyBackend | ZellijBackend).cliPid = cliPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend).cliCwd = cfg.workingDir;
   }
@@ -4878,7 +5195,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
             log(`Failed to write CLI PID marker (async): ${err.message}`);
           }
         }
-        if (claudeDataDir) {
+        if (claudeDataDir || cfg.cliId === 'grok') {
           (backend as TmuxBackend | PtyBackend | ZellijBackend).cliPid = pid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend).cliCwd = cfg.workingDir;
         }
@@ -4977,16 +5294,20 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     } else {
       codexBridgeStartTimer();
     }
-  } else if (cfg.cliId === 'pi') {
-    const piSessionId = effectiveCliSessionId ?? effectiveAdapterSessionId;
-    if (piSessionId) {
-      const transcriptPath = findPiTranscriptBySessionId(piSessionId, cfg.workingDir);
-      if (transcriptPath) {
-        codexBridgeAttach(transcriptPath, effectiveResume ? 'baseline-existing' : 'fresh-empty');
-      } else {
-        codexBridgePendingSessionId = piSessionId;
-        codexBridgeStartTimer();
-      }
+  } else if (cfg.cliId === 'pi' || cfg.cliId === 'grok') {
+    // File-backed: pin path when known (pi session id / grok --session-id
+    // UUID), else arm the poller. Grok collision-fallback (dir already
+    // exists → no --session-id → grok mints id) is recovered via writeInput
+    // → codexBridgeNotifyCliSessionId.
+    const sid = effectiveCliSessionId ?? effectiveAdapterSessionId;
+    const path = sid
+      ? resolveFileBridgePath(cfg.cliId, { sessionId: sid, cwd: cfg.workingDir })
+      : undefined;
+    if (path) {
+      codexBridgeAttach(path, effectiveResume ? 'baseline-existing' : 'fresh-empty');
+    } else if (sid) {
+      codexBridgePendingSessionId = sid;
+      codexBridgeStartTimer();
     } else {
       codexBridgeStartTimer();
     }
@@ -5170,7 +5491,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         return;
       }
       const tokenMatches = url.searchParams.get('token') === writeToken;
-      const { hasWrite, platformReadonly } = resolveTerminalWrite(req, tokenMatches);
+      const { hasWrite, platformReadonly } = resolveTerminalWriteForReq(req, tokenMatches);
       const loginHdr = req.headers['x-botmux-login-url'];
       const loginUrl = typeof loginHdr === 'string' && /^https?:\/\/[^"'<>\s]+$/.test(loginHdr) ? loginHdr : '';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -5191,7 +5512,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         return;
       }
       const tokenMatches = url.searchParams.get('token') === writeToken;
-      const { hasWrite } = resolveTerminalWrite(req, tokenMatches);
+      const { hasWrite } = resolveTerminalWriteForReq(req, tokenMatches);
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
 
@@ -5525,6 +5846,45 @@ try{
   try{term.loadAddon(new CanvasAddon.CanvasAddon())}catch(_e2){}
 }
 fit.fit();
+// xterm parses writes asynchronously.  On a brand-new page the first tmux /
+// zellij frame (or relay history seed) can therefore finish after the browser
+// has initialised the viewport scrollbar, leaving that viewport at scrollTop=0
+// even though the buffer already contains newer rows.  Follow only the initial
+// write burst and explicitly settle at the bottom.  Any deliberate user scroll
+// cancels this so loading a busy session never fights the reader.
+var _initialFollow=true,_initialFollowT=0;
+function _cancelInitialFollow(){
+  if(!_initialFollow)return;
+  _initialFollow=false;clearTimeout(_initialFollowT);
+}
+function _settleInitialBottom(){
+  if(!_initialFollow)return;
+  try{term.scrollToBottom()}catch(_e){}
+  clearTimeout(_initialFollowT);
+  _initialFollowT=setTimeout(function(){
+    if(!_initialFollow)return;
+    try{term.scrollToBottom()}catch(_e){}
+    _initialFollow=false;
+  },500);
+}
+var _initialViewport=term.element&&term.element.querySelector('.xterm-viewport');
+var _initialTerminalRoot=document.getElementById('terminal');
+if(_initialTerminalRoot){
+  // Listen above xterm's own root: its wheel handler can stop propagation at
+  // the target, while this ancestor still sees capture-phase user intent.
+  _initialTerminalRoot.addEventListener('wheel',_cancelInitialFollow,{capture:true,passive:true});
+  _initialTerminalRoot.addEventListener('touchstart',_cancelInitialFollow,{capture:true,passive:true});
+}
+if(_initialViewport){
+  _initialViewport.addEventListener('pointerdown',function(e){
+    // A pointer press on the native scrollbar targets the viewport itself;
+    // presses on terminal cells target the screen/canvas and keep following.
+    if(e.target===_initialViewport)_cancelInitialFollow();
+  },{capture:true});
+}
+window.addEventListener('keydown',function(e){
+  if(e.key==='PageUp'||e.key==='PageDown'||e.key==='Home'||e.key==='End')_cancelInitialFollow();
+},{capture:true});
 // ── OSC 52 clipboard ──
 var _clipBuf='';
 function _doCopy(text){
@@ -5610,7 +5970,7 @@ window.addEventListener('resize',onViewportResize);
     // Intercept OSC 52 clipboard sequence from tmux (set-clipboard on)
     var m=data.match(/\\x1b\\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\\x07|\\x1b\\\\)/);
     if(m){try{_clipBuf=new TextDecoder().decode(Uint8Array.from(atob(m[1]),function(c){return c.charCodeAt(0)}));_doCopy(_clipBuf);_showCopied()}catch(ex){}}
-    term.write(data);
+    term.write(data,_settleInitialBottom);
   };
   ws.onclose=function(){ws_=null;el.textContent='disconnected';el.className='err';setTimeout(connect,2000)};
   ws.onerror=function(){ws.close()};
@@ -5857,7 +6217,12 @@ process.on('message', async (raw: unknown) => {
       const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
-      const content = msg.content;
+      let content = msg.content;
+      if (deferredPluginSkillCatalog && !lastInitConfig?.adoptMode) {
+        content = `${content}\n\n${deferredPluginSkillCatalog}`;
+        deferredPluginSkillCatalog = null;
+        log('Attached refreshed plugin Skill catalog to the first turn of this CLI generation');
+      }
       currentBotmuxTurnId = msg.turnId;
       writeCliPidMarker();
       if (!backend && crashDiagnosticStopped && lastInitConfig && !lastInitConfig.adoptMode) {
@@ -5897,17 +6262,18 @@ process.on('message', async (raw: unknown) => {
           }
         }
         // Adopt mode write:
-        //   - codex routes through cliAdapter.writeInput so the adapter's
-        //     paste-detection delay + Enter-retry + history.jsonl verify
-        //     loop handles Codex TUI's "\n treated as Enter" submit
-        //     behaviour. Without it, Lark messages get stranded in the
-        //     input box (user-reported "卡在输入框中").
+        //   - Structured-bridge adopt-input CLIs (codex/traex/pi/grok/mtr)
+        //     route through cliAdapter.writeInput so paste+Enter-retry +
+        //     transcript/history verify (and grok's prompt_history →
+        //     cliSessionId re-attach after /new) all run. Hardcoding only
+        //     codex/traex left grok on raw sendText, so /new rotation never
+        //     re-attached the bridge.
         //   - everything else keeps the simple raw sendText+Enter — the
         //     claude-code adopt bridge has its own dual-write recovery
         //     path, and the other CLIs' adopt flows haven't surfaced
         //     this submit-detection issue.
         if (backend) {
-          if ((lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex') && cliAdapter) {
+          if (isStructuredBridgeAdoptInputCli(lastInitConfig?.cliId) && cliAdapter) {
             // writeInput is async but we're already inside an async
             // message handler. Errors are best-effort logged; the bridge
             // ingest path is unaffected because mark already happened
@@ -5919,10 +6285,10 @@ process.on('message', async (raw: unknown) => {
                 codexBridgeNotifyCliSessionId(result.cliSessionId);
               }
               if (result && result.submitted === false) {
-                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history', undefined, result.failureReason, turnSeq);
+                scheduleSubmitFailureNotify(content, result.recheck, 'submit history', undefined, result.failureReason, turnSeq);
               }
             } catch (err: any) {
-              log(`Codex adopt writeInput error: ${err.message}`);
+              log(`Adopt writeInput error (${lastInitConfig?.cliId}): ${err.message}`);
             }
           } else if ('sendText' in backend && 'sendSpecialKeys' in backend) {
             (backend as any).sendText(content);
@@ -6021,16 +6387,27 @@ process.on('message', async (raw: unknown) => {
       // process would never actually restart. destroySession() tears the session
       // down so the respawn starts a fresh CLI. (PTY has no destroySession, so
       // the ?. no-ops and killCli()'s kill() does the teardown.)
-      backend?.destroySession?.();
-      killCli();
-      awaitingFirstPrompt = true;
-      setTimeout(() => {
-        if (lastInitConfig) {
-          startScreenUpdates();
-          startScreenAnalyzer();
-          spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
-        }
-      }, 500);
+      const restart = () => {
+        tmuxRestartTimer = null;
+        backend?.destroySession?.();
+        killCli();
+        awaitingFirstPrompt = true;
+        setTimeout(() => {
+          if (lastInitConfig) {
+            startScreenUpdates();
+            startScreenAnalyzer();
+            spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
+          }
+        }, 500);
+      };
+      if (effectiveBackendType === 'tmux') {
+        const delayMs = tmuxRestartJitterMs(lastInitConfig?.sessionId ?? '', consecutiveInWorkerRestarts);
+        log(`Staggering tmux teardown/restart by ${delayMs}ms to avoid shared-server probe storms`);
+        if (tmuxRestartTimer) clearTimeout(tmuxRestartTimer);
+        tmuxRestartTimer = setTimeout(restart, delayMs);
+      } else {
+        restart();
+      }
       break;
     }
 
@@ -6157,6 +6534,10 @@ process.on('message', async (raw: unknown) => {
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  if (tmuxRestartTimer) {
+    clearTimeout(tmuxRestartTimer);
+    tmuxRestartTimer = null;
+  }
   for (const [, cp] of clientPtys) {
     try { cp.kill(); } catch { /* already dead */ }
   }
