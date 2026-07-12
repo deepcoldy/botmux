@@ -68,6 +68,9 @@ const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
 
 export interface WorkerPoolCallbacks {
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
+  /** Reply directly under the triggering Lark message. Used for submit-failure
+   *  alerts so they cannot drift to the topic root or a later turn. */
+  userNotifyReply?: (messageId: string, content: string, larkAppId: string) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
@@ -75,6 +78,12 @@ export interface WorkerPoolCallbacks {
   /** Re-check the per-bot resident-session cap after a process starts or an
    * over-cap busy session becomes idle. Optional for unit-test callers. */
   enforceLiveSessionCap?: () => void;
+}
+
+export function formatUserNotifyMessage(message: string, mentionOpenId?: string): string {
+  return mentionOpenId && /^ou_[A-Za-z0-9_-]+$/.test(mentionOpenId)
+    ? `<at user_id="${mentionOpenId}"></at> ${message}`
+    : message;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -1823,7 +1832,9 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
-    turnId: initTurnId ?? ds.currentReplyTarget?.turnId,
+    turnId: initTurnId ?? ds.currentReplyTarget?.turnId
+      ?? (ds.scope === 'thread' ? ds.session.rootMessageId : undefined),
+    turnSenderOpenId: ds.session.quoteTargetSenderIsBot ? undefined : ds.session.lastCallerOpenId,
     skillPluginDir,
     skillReadonlyRoots,
   };
@@ -2520,10 +2531,18 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           reason: 'user_notify',
           message: msg.message,
         });
+        const content = formatUserNotifyMessage(msg.message, msg.mentionOpenId);
         try {
-          await scopedReply(msg.message, 'text', msg.turnId);
+          if (msg.turnId?.startsWith('om_') && cb.userNotifyReply) {
+            await cb.userNotifyReply(msg.turnId, content, ds.larkAppId);
+          } else {
+            await scopedReply(content, 'text', msg.turnId);
+          }
         } catch (err: any) {
           logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err.message}`);
+          if (msg.turnId?.startsWith('om_') && cb.userNotifyReply) {
+            try { await scopedReply(content, 'text', msg.turnId); } catch { /* already logged */ }
+          }
         }
         break;
       }

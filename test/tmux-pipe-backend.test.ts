@@ -741,7 +741,7 @@ describe('TmuxPipeBackend send failure handling', () => {
     });
     mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
 
-    expect(() => be.pasteText('hello')).not.toThrow();
+    expect(be.pasteText('hello')).toBe(false);
     expect(exits).toEqual([[1, null]]);
   });
 });

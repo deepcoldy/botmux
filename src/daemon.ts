@@ -7694,7 +7694,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     beginNewTurn(ds, parsed.content);
     rememberLastCliInput(ds, promptContent, msgContent);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    ds.worker.send({ type: 'message', content: msgContent, turnId: parsed.messageId } as DaemonToWorker);
+    ds.worker.send({
+      type: 'message',
+      content: msgContent,
+      turnId: parsed.messageId,
+      senderOpenId: (!isForeignBot && !isBotSenderType) ? threadSenderOpenId : undefined,
+    } as DaemonToWorker);
   } else {
     // Worker not running — re-fork with resume. This is a NEW turn, so drop
     // any restored streaming-card reference; worker_ready will POST a fresh
@@ -8025,6 +8030,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
+    userNotifyReply: (messageId, content, larkAppId) => replyMessage(
+      larkAppId,
+      messageId,
+      content,
+      'text',
+      true,
+    ),
     getSessionWorkingDir,
     getActiveCount,
     closeSession(ds: DaemonSession) {

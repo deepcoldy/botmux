@@ -282,11 +282,11 @@ export class TmuxPipeBackend implements SessionBackend {
    * NB: TmuxPipeBackend is the only backend used at runtime (see
    * selectSessionBackend), so this is the path that actually matters.
    */
-  pasteText(text: string): void {
-    if (this.exited) return;
+  pasteText(text: string): boolean {
+    if (this.exited) return false;
     this.exitCopyModeIfNeeded();
     const bufferName = `botmux-${randomBytes(8).toString('hex')}`;
-    this.guardedSend('paste-buffer', () => {
+    return this.guardedSend('paste-buffer', () => {
       let loaded = false;
       try {
         execFileSync('tmux', ['load-buffer', '-b', bufferName, '-'], {

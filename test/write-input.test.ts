@@ -115,24 +115,33 @@ function removeClaudeKeybindings(): void {
   try { rmSync(CLAUDE_KEYBINDINGS_PATH); } catch { /* absent */ }
 }
 
-function makeTmuxPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string }) {
+function makeTmuxPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string; isReattach?: boolean }) {
   const confirmCodexSubmit = opts?.confirmCodexSubmit ?? true;
   let submittedText = '';
   return {
     write: vi.fn(),
     sendText: vi.fn((text: string) => { submittedText = text; }),
     sendSpecialKeys: vi.fn((key: string) => {
+      if (key === 'C-u') {
+        submittedText = '';
+        return;
+      }
       if (confirmCodexSubmit && key === 'Enter') appendCodexHistory(submittedText, opts?.codexSessionId);
     }),
     pasteText: vi.fn((text: string) => { submittedText = text; }),
+    isReattach: opts?.isReattach ?? false,
   } satisfies PtyHandle;
 }
 
-function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string }) {
+function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string; isReattach?: boolean }) {
   const confirmCodexSubmit = opts?.confirmCodexSubmit ?? true;
   let submittedText = '';
   return {
     write: vi.fn((data: string) => {
+      if (data === '\x15') {
+        submittedText = '';
+        return;
+      }
       if (data === '\r') {
         if (confirmCodexSubmit) appendCodexHistory(submittedText, opts?.codexSessionId);
         return;
@@ -144,6 +153,7 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
       }
       submittedText += data;
     }),
+    isReattach: opts?.isReattach ?? false,
   } satisfies PtyHandle;
 }
 
@@ -978,7 +988,7 @@ describe('genius writeInput submission confirmation', () => {
 
     expect(result).toMatchObject({ submitted: false });
     expect((result as any).recheck()).toBe(false);
-    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(4);
+    expect((pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter')).toHaveLength(4);
   });
 });
 
@@ -1101,7 +1111,7 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
     const result = await adapter.writeInput(pty, MULTILINE);
 
-    expect(result).toBeUndefined();
+    expect(result).toEqual({ submitted: true });
     expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
     expect(pty.sendText).not.toHaveBeenCalled();
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
@@ -1188,12 +1198,178 @@ describe('codex writeInput submission confirmation', () => {
     // (cold-start / heavy UserPromptSubmit hook) so they don't false-warn;
     // before any append it must report the submit still missing.
     expect(typeof (result as any)?.recheck).toBe('function');
+    expect(typeof (result as any)?.recover).toBe('function');
     expect((result as any).recheck()).toBe(false);
     appendCodexHistory(MULTILINE, 'late-codex-thread');
     expect((result as any).recheck()).toEqual({ submitted: true, cliSessionId: 'late-codex-thread' });
     expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
     expect(pty.sendText).not.toHaveBeenCalled();
-    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(4);
+    expect((pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter')).toHaveLength(4);
+    expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('C-u');
+  });
+
+  it('recovers a stuck composer by pressing Enter without repasting', async () => {
+    resetCodexHistory();
+    let submittedText = '';
+    let enterCount = 0;
+    const pty: PtyHandle & { isReattach: boolean; captureViewport(): string } = {
+      write: vi.fn(),
+      sendText: vi.fn((text: string) => { submittedText = text; }),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        enterCount++;
+        if (enterCount <= 4) return;
+        appendCodexHistory(submittedText, 'retry-thread');
+      }),
+      pasteText: vi.fn((text: string) => { submittedText = text; }),
+      captureViewport: vi.fn(() => `› ${submittedText}`),
+      isReattach: false,
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toMatchObject({ submitted: false });
+    await expect((result as any).recover()).resolves.toEqual({ submitted: true, cliSessionId: 'retry-thread' });
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('C-u');
+    expect((pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter')).toHaveLength(5);
+  });
+
+  it('does not touch the terminal when the first submit appears before deferred recovery', async () => {
+    resetCodexHistory();
+    let submittedText = '';
+    const pty: PtyHandle = {
+      write: vi.fn(),
+      pasteText: vi.fn((text: string) => { submittedText = text; }),
+      sendSpecialKeys: vi.fn(),
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+    // Model Codex accepting an earlier Enter while history.jsonl becomes
+    // observable only after the first attempt exhausted its poll budget.
+    appendCodexHistory(submittedText, 'late-first-thread');
+
+    await expect((result as any).recover()).resolves.toEqual({ submitted: true, cliSessionId: 'late-first-thread' });
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('C-u');
+    expect((pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter')).toHaveLength(4);
+  });
+
+  it('does not queue a duplicate when the first submit is accepted before history is visible', async () => {
+    resetCodexHistory();
+    let composer = '';
+    let processing = false;
+    const accepted: string[] = [];
+    const pty: PtyHandle = {
+      write: vi.fn(),
+      pasteText: vi.fn((text: string) => { composer = text; }),
+      // The old prompt remains visible in scrollback, but the latest composer
+      // is empty. Recovery must inspect the composer rather than matching the
+      // earlier transcript text and blindly pressing Enter.
+      captureViewport: vi.fn(() => processing
+        ? `${MULTILINE}\n\n› Implement {feature}\n\n  gpt-5 · 90% left`
+        : `› ${composer}`),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || !composer) return;
+        // Codex accepts the first prompt immediately but does not append its
+        // global history row until startup finishes. A second paste while it
+        // is processing becomes the identical "Queued follow-up input" seen
+        // in the real TUI screenshot.
+        accepted.push(composer);
+        composer = '';
+        processing = true;
+      }),
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(processing).toBe(true);
+    expect(result).toMatchObject({ submitted: false });
+    await expect((result as any).recover()).resolves.toBe(false);
+    expect(accepted).toEqual([MULTILINE]);
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    expect((pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter')).toHaveLength(4);
+  });
+
+  it('recovers a late reattach paste with one Enter and no second paste', async () => {
+    resetCodexHistory();
+    let composer = '';
+    let composerVisible = false;
+    const pty: PtyHandle & { isReattach: boolean; captureViewport(): string } = {
+      write: vi.fn(),
+      pasteText: vi.fn((text: string) => { composer = text; }),
+      captureViewport: vi.fn(() => composerVisible ? `› ${composer}` : '›'),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || !composerVisible) return;
+        appendCodexHistory(composer, 'late-reattach-thread');
+        composer = '';
+      }),
+      isReattach: true,
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toMatchObject({ submitted: false });
+    expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('Enter');
+    composerVisible = true;
+    await expect((result as any).recover()).resolves.toEqual({ submitted: true, cliSessionId: 'late-reattach-thread' });
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    expect((pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter')).toHaveLength(1);
+  });
+
+  it('waits longer before the first Enter when the tmux pane is reattached', async () => {
+    resetCodexHistory();
+    vi.useFakeTimers();
+    try {
+      const pty = makeTmuxPty({ codexSessionId: 'reattach-thread', isReattach: true });
+      const adapter = createCodexAdapter('/bin/codex');
+      const promise = adapter.writeInput(pty, MULTILINE);
+
+      await vi.advanceTimersByTimeAsync(39);
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('Enter');
+
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await expect(promise).resolves.toEqual({ submitted: true, cliSessionId: 'reattach-thread' });
+      expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('waits for reattached composer evidence before pressing Enter', async () => {
+    resetCodexHistory();
+    let submittedText = '';
+    let composerVisible = false;
+    let captures = 0;
+    const pty: PtyHandle & { isReattach: boolean; captureViewport(): string } = {
+      write: vi.fn(),
+      pasteText: vi.fn((text: string) => { submittedText = text; }),
+      captureViewport: vi.fn(() => {
+        captures++;
+        if (captures >= 4) composerVisible = true;
+        return composerVisible ? `› ${submittedText}` : '›';
+      }),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key === 'C-u') {
+          submittedText = '';
+          composerVisible = false;
+          return;
+        }
+        if (key === 'Enter' && composerVisible) {
+          appendCodexHistory(submittedText, 'composer-ready-thread');
+        }
+      }),
+      isReattach: true,
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: 'composer-ready-thread' });
+    expect(pty.captureViewport).toHaveBeenCalled();
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 });
 

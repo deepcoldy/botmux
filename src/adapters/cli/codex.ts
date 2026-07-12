@@ -6,6 +6,7 @@ import type { CliAdapter, PtyHandle } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
+import { stripAnsiForLog } from '../../utils/crash-log.js';
 
 /** Global submit log — Codex appends one JSON line here on every successful
  *  user submit across all sessions. Far better than the per-session rollout
@@ -19,6 +20,13 @@ function currentFileSize(path: string): number {
 interface HistoryMatch {
   found: boolean;
   cliSessionId?: string;
+}
+
+interface CodexSubmitResult {
+  submitted: boolean;
+  cliSessionId?: string;
+  recheck?: () => { submitted: boolean; cliSessionId?: string } | false;
+  recover?: () => Promise<{ submitted: boolean; cliSessionId?: string } | false>;
 }
 
 function readCliSessionId(parsed: unknown): string | undefined {
@@ -115,6 +123,176 @@ function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | u
     return undefined;
   }
   return undefined;
+}
+
+function isReattachPty(pty: PtyHandle): boolean {
+  return pty.isReattach === true;
+}
+
+function normaliseComposerText(text: string): string {
+  return stripAnsiForLog(text).replace(/\s+/g, ' ').trim();
+}
+
+function screenShowsCodexPaste(screen: string, content: string): boolean {
+  const stripped = stripAnsiForLog(screen);
+  // capture-pane contains the whole viewport, including earlier user prompts.
+  // Only inspect the latest Codex composer (the last line beginning with ›),
+  // otherwise old transcript text can masquerade as a still-pending paste.
+  const lineStart = stripped.lastIndexOf('\n›');
+  const composerStart = lineStart >= 0 ? lineStart + 1 : stripped.startsWith('›') ? 0 : -1;
+  if (composerStart < 0) return false;
+  const actual = normaliseComposerText(stripped.slice(composerStart));
+  const expected = normaliseComposerText(content);
+  if (!actual || !expected) return false;
+  const visibleTail = expected.length > 80 ? expected.slice(-80) : expected;
+  return actual.includes(visibleTail)
+    || /\bpasted\s+content\b[^\r\n]{0,40}\b(?:chars?|lines?)\b/i.test(actual);
+}
+
+async function waitForCodexComposerPaste(
+  pty: PtyHandle,
+  content: string,
+  beforePasteScreen: string,
+  timeoutMs: number,
+): Promise<'confirmed' | 'unavailable' | 'missing'> {
+  if (!pty.captureViewport) return 'unavailable';
+  const deadline = Date.now() + scaleMs(timeoutMs);
+  let capturedNonEmptyScreen = false;
+  do {
+    try {
+      const screen = pty.captureViewport();
+      if (screen.trim()) capturedNonEmptyScreen = true;
+      if (normaliseComposerText(screen) !== normaliseComposerText(beforePasteScreen)
+        && screenShowsCodexPaste(screen, content)) return 'confirmed';
+    } catch {
+      // A transient capture failure should not turn into a blind Enter. Keep
+      // polling; if every capture fails we use the legacy settle delay below.
+    }
+    await delay(100);
+  } while (Date.now() < deadline);
+  return capturedNonEmptyScreen ? 'missing' : 'unavailable';
+}
+
+function codexHistoryRecheck(
+  historyPath: string,
+  baseByte: number,
+  content: string,
+): CodexSubmitResult['recheck'] {
+  return () => {
+    const late = matchHistoryDelta(historyPath, baseByte, content);
+    return late.found
+      ? { submitted: true, cliSessionId: late.cliSessionId }
+      : false;
+  };
+}
+
+async function recoverCodexSubmit(
+  pty: PtyHandle,
+  content: string,
+  historyPath: string,
+  baseByte: number,
+): Promise<{ submitted: boolean; cliSessionId?: string } | false> {
+  // History is authoritative. Check it again immediately before touching the
+  // terminal so a slow first submit can never be followed by another action.
+  const late = matchHistoryDelta(historyPath, baseByte, content);
+  if (late.found) {
+    return late.cliSessionId
+      ? { submitted: true, cliSessionId: late.cliSessionId }
+      : { submitted: true };
+  }
+
+  // Never paste the prompt again: identical history rows cannot tell which
+  // attempt they confirm, so a delayed first append could falsely bless a
+  // second paste and leave it queued as a duplicate. The only safe recovery is
+  // one Enter when the original text is visibly still in Codex's composer.
+  if (!pty.captureViewport) return false;
+  let screen: string;
+  try { screen = pty.captureViewport(); } catch { return false; }
+  if (!screenShowsCodexPaste(screen, content)) return false;
+
+  try {
+    if (pty.sendSpecialKeys) {
+      if (pty.sendSpecialKeys('Enter') === false) return false;
+    } else {
+      pty.write('\r');
+    }
+  } catch {
+    return false;
+  }
+
+  const recovered = await waitForHistoryAppend(historyPath, baseByte, content, 3_200);
+  if (!recovered.found) return false;
+  return recovered.cliSessionId
+    ? { submitted: true, cliSessionId: recovered.cliSessionId }
+    : { submitted: true };
+}
+
+async function submitCodexPrompt(
+  pty: PtyHandle,
+  content: string,
+  historyPath: string,
+  baseByte: number,
+  settleMs: number,
+  requireComposerEvidence: boolean,
+): Promise<CodexSubmitResult> {
+  let beforePasteScreen = '';
+  if (requireComposerEvidence && pty.captureViewport) {
+    try { beforePasteScreen = pty.captureViewport(); } catch { /* fallback handled below */ }
+  }
+  try {
+    if (pty.pasteText) {
+      // tmux mode: load-buffer + paste-buffer -d -p. The `-p` flag emits
+      // bracketed-paste markers when the pane has them on (Codex default);
+      // `-d` deletes the buffer after so it doesn't accumulate.
+      if (pty.pasteText(content) === false) return { submitted: false };
+    } else {
+      // Non-tmux fallback (raw PTY): wrap the markers ourselves.
+      pty.write('\x1b[200~' + content + '\x1b[201~');
+    }
+  } catch {
+    return { submitted: false };
+  }
+
+  if (requireComposerEvidence) {
+    const composer = await waitForCodexComposerPaste(pty, content, beforePasteScreen, 2_400);
+    if (composer === 'missing') {
+      return { submitted: false, recheck: codexHistoryRecheck(historyPath, baseByte, content) };
+    }
+    if (composer === 'unavailable') await delay(settleMs);
+  } else {
+    await delay(settleMs);
+  }
+  const trySendEnter = (): boolean => {
+    try {
+      if (pty.sendSpecialKeys) {
+        if (pty.sendSpecialKeys('Enter') === false) return false;
+      }
+      else pty.write('\r');
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (!trySendEnter()) return { submitted: false };
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const match = await waitForHistoryAppend(historyPath, baseByte, content, 800);
+    if (match.found) {
+      return match.cliSessionId
+        ? { submitted: true, cliSessionId: match.cliSessionId }
+        : { submitted: true };
+    }
+    if (!trySendEnter()) return { submitted: false };
+  }
+
+  const match = await waitForHistoryAppend(historyPath, baseByte, content, 800);
+  if (match.found) {
+    return match.cliSessionId
+      ? { submitted: true, cliSessionId: match.cliSessionId }
+      : { submitted: true };
+  }
+
+  return { submitted: false, recheck: codexHistoryRecheck(historyPath, baseByte, content) };
 }
 
 export function createCodexAdapter(pathOverride?: string): CliAdapter {
@@ -216,67 +394,23 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // bracketed paste lands the whole multi-line message in the composer
       // un-submitted, with the process staying alive and \t absorbed cleanly.
       //
-      // The history.jsonl verification loop below is unchanged: it polls for
-      // the submitted prefix and, if it never appears, surfaces the failure
-      // via the worker's deferred recheck + Lark warning rather than silently
-      // dropping the message.
-      const trySendEnter = (): boolean => {
-        try {
-          if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
-          else pty.write('\r');
-          return true;
-        } catch {
-          // tmux session is gone (CLI exited mid-write) — bail out cleanly
-          // rather than crashing the worker on an unhandled execFileSync error.
-          return false;
-        }
-      };
-
+      // The history.jsonl verification loop below still polls for the exact
+      // submitted text. On a hard miss it hands the worker a deferred recheck
+      // plus an evidence-gated Enter recovery; it never pastes the same prompt
+      // twice because a slow first history append makes attempt attribution
+      // fundamentally ambiguous.
       const historyPath = codexHistoryPath();
       const baseByte = currentFileSize(historyPath);
+      const reattach = isReattachPty(pty);
+      const initialSettleMs = reattach ? 800 : 200;
+      const firstAttempt = await submitCodexPrompt(pty, content, historyPath, baseByte, initialSettleMs, reattach);
+      if (firstAttempt.submitted) return firstAttempt;
 
-      try {
-        if (pty.pasteText) {
-          // tmux mode: load-buffer + paste-buffer -d -p. The `-p` flag emits
-          // bracketed-paste markers when the pane has them on (Codex default);
-          // `-d` deletes the buffer after so it doesn't accumulate.
-          pty.pasteText(content);
-        } else {
-          // Non-tmux fallback (raw PTY): wrap the markers ourselves.
-          pty.write('\x1b[200~' + content + '\x1b[201~');
-        }
-      } catch {
-        return { submitted: false };
-      }
-      await delay(200);
-      if (!trySendEnter()) return { submitted: false };
-
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const match = await waitForHistoryAppend(historyPath, baseByte, content, 800);
-        if (match.found) {
-          return match.cliSessionId
-            ? { submitted: true, cliSessionId: match.cliSessionId }
-            : undefined;
-        }
-        if (!trySendEnter()) return { submitted: false };
-      }
-      const match = await waitForHistoryAppend(historyPath, baseByte, content, 800);
-      if (match.found) {
-        return match.cliSessionId
-          ? { submitted: true, cliSessionId: match.cliSessionId }
-          : undefined;
-      }
-      // In-band budget exhausted. Hand the worker a recheck closure: a
-      // slow-startup Codex (or one whose first turn is delayed by a heavy
-      // initial prompt) may still append our marker after the retries gave
-      // up, and the worker re-scans on a delay before warning the user.
-      const recheck = () => {
-        const late = matchHistoryDelta(historyPath, baseByte, content);
-        return late.found
-          ? { submitted: true, cliSessionId: late.cliSessionId }
-          : false;
+      if (!firstAttempt.recheck) return firstAttempt;
+      return {
+        ...firstAttempt,
+        recover: () => recoverCodexSubmit(pty, content, historyPath, baseByte),
       };
-      return { submitted: false, recheck };
     },
 
     completionPattern: undefined,
