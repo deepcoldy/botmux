@@ -275,16 +275,16 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.skills).toBeUndefined();
   });
 
-  it('sets/sanitizes/unsets per-bot env (JSON) and masks values in the apply result', async () => {
+  it('sets/round-trips legal per-bot env (JSON) and masks values in the apply result', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('env')!;
     expect(spec.kind).toBe('json');
     expect(spec.effect).toBe('next-session');
 
-    // sanitize: drop reserved key, keep provider creds, stringify primitives
+    // Legal provider/proxy keys only — stringify primitives, persist + mask.
     const coerced = store.coerceConfigValue(
       spec,
-      '{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ANTHROPIC_AUTH_TOKEN":"glm-key","BOTMUX_SESSION_ID":"hijack","TIMEOUT":30}',
+      '{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ANTHROPIC_AUTH_TOKEN":"glm-key","TIMEOUT":30}',
     );
     expect(coerced).toEqual({
       ok: true,
@@ -316,16 +316,41 @@ describe('bot-config store', () => {
       expect(r1.newText).toContain('ANTHROPIC_AUTH_TOKEN=••••');
     }
 
-    // a fully-invalid object (only reserved/garbage keys) is rejected
-    expect(store.coerceConfigValue(spec, '{"BOTMUX_X":"y","1BAD":"z"}')).toEqual({ ok: false, reason: 'invalid_json' });
     // non-object JSON rejected
     expect(store.coerceConfigValue(spec, '"a-string"')).toEqual({ ok: false, reason: 'invalid_json' });
     expect(store.coerceConfigValue(spec, '[1,2]')).toEqual({ ok: false, reason: 'invalid_json' });
+    // garbage-only object (no reserved keys, nothing valid after sanitize)
+    expect(store.coerceConfigValue(spec, '{"1BAD":"z"}')).toEqual({ ok: false, reason: 'invalid_json' });
 
     const r2 = await store.applyConfigField('app_default', spec, null);
     expect(r2.ok).toBe(true);
     expect(readConfig().env).toBeUndefined();
     expect(registry.getBot('app_default').config.env).toBeUndefined();
+  });
+
+  it('rejects reserved env keys (BOTMUX_*/GROK_HOME/CODEX_HOME) instead of silent drop', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('env')!;
+
+    // Any reserved key fails the whole write so users see the error (no
+    // split-brain from quietly accepting GROK_HOME while daemon paths stay default).
+    expect(store.coerceConfigValue(
+      spec,
+      '{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","BOTMUX_SESSION_ID":"hijack"}',
+    )).toEqual({ ok: false, reason: 'reserved_env' });
+
+    expect(store.coerceConfigValue(
+      spec,
+      '{"GROK_HOME":"/tmp/evil-grok","ANTHROPIC_AUTH_TOKEN":"x"}',
+    )).toEqual({ ok: false, reason: 'reserved_env' });
+
+    expect(store.coerceConfigValue(
+      spec,
+      '{"CODEX_HOME":"/tmp/evil-codex"}',
+    )).toEqual({ ok: false, reason: 'reserved_env' });
+
+    // Reserved-only object also fails as reserved_env (not invalid_json).
+    expect(store.coerceConfigValue(spec, '{"BOTMUX_X":"y"}')).toEqual({ ok: false, reason: 'reserved_env' });
   });
 
   it('boolean field writes true / deletes key on false (keeps bots.json tidy)', async () => {

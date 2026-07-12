@@ -4109,8 +4109,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     });
     effectiveBackendType = 'herdr';
     backend = herdrBe;
+    // Same as tmux/zellij adopt: writeInput (grok preferSessionId via
+    // findGrokSessionByPid, claude pid-state) needs cliPid/cliCwd on the
+    // PtyHandle. spawn() overwrites cliCwd from opts.cwd — use adoptCwd when
+    // present so session discovery stays on the CLI's real working dir.
+    if (cfg.adoptCliPid) herdrBe.cliPid = cfg.adoptCliPid;
+    const herdrAdoptCwd = cfg.adoptCwd ?? cfg.workingDir;
+    herdrBe.cliCwd = herdrAdoptCwd;
     herdrBe.spawn('', [], {
-      cwd: cfg.workingDir,
+      cwd: herdrAdoptCwd,
       cols,
       rows,
       env: process.env as Record<string, string>,
