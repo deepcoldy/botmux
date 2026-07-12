@@ -190,7 +190,14 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.trae/cli'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, remoteWsUrl, remoteThreadId }) {
+      // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
+      // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
+      // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
+      // shape, so this is identical to the codex adapter's branch.
+      if (remoteWsUrl && remoteThreadId) {
+        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', remoteThreadId];
+      }
       const baseArgs = [
         ...(!disableCliBypass ? [
           '--dangerously-bypass-approvals-and-sandbox',

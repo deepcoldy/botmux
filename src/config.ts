@@ -279,6 +279,11 @@ export const config = {
   // restart. The daemon's listChatBotMembers reads this per call.
   get chatBotDiscovery() { return resolveChatBotDiscoveryConfig(); },
   get herdrTraexPlugin() { return resolveHerdrTraexPluginConfig(); },
+  // Live getter (like chatBotDiscovery): re-reads the experimental global toggle
+  // so a Settings change enables/disables RPC input mode for new codex-family
+  // sessions without a daemon restart. Default OFF. The daemon ORs this with each
+  // bot's own `codexRpcInput` flag when building the worker init message.
+  get codexRpcInputDefault(): boolean { return readGlobalConfig().dashboard?.codexRpcInput === true; },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

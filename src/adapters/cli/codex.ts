@@ -145,13 +145,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, readIsolation, codexRemoteWsUrl, codexRemoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, readIsolation, remoteWsUrl, remoteThreadId }) {
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
       // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
       // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
       // path, no history.jsonl verify. --no-alt-screen keeps pane capture working.
-      if (codexRemoteWsUrl && codexRemoteThreadId) {
-        return ['--remote', codexRemoteWsUrl, 'resume', '--no-alt-screen', codexRemoteThreadId];
+      if (remoteWsUrl && remoteThreadId) {
+        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', remoteThreadId];
       }
       // Read isolation for Codex is enforced by the worker's Seatbelt wrapper,
       // NOT by codex's own profile (codex 0.137 can't express a read blocklist).

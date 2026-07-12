@@ -163,6 +163,13 @@ export interface DashboardGlobalConfig {
   pinnedPlugins?: string[];
   /** Opt-in TraeX herdr plugin bootstrap. Default OFF; source/ref are operator-supplied. */
   herdrTraexPlugin?: HerdrTraexPluginConfig;
+  /** Experimental: globally enable RPC input mode for RPC-capable codex-family
+   *  bots (codex / traex) — user input goes via the app-server JSON-RPC channel
+   *  instead of a tmux paste, bypassing codex's terminal paste-drop. Default OFF
+   *  (absent ⇒ off); flip on to enable fleet-wide. Read live by the daemon —
+   *  see config.ts `codexRpcInputDefault`. A per-bot `codexRpcInput: true` still
+   *  force-enables regardless of this global default. */
+  codexRpcInput?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -288,6 +295,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (pinnedPlugins) out.pinnedPlugins = pinnedPlugins;
   const herdrTraexPlugin = readHerdrTraexPlugin(d.herdrTraexPlugin);
   if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
+  if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

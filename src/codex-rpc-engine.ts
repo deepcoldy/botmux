@@ -49,8 +49,8 @@ function killGroup(pid: number, signal: NodeJS.Signals): void {
 }
 
 export interface CodexRpcEngineOpts {
-  /** Absolute path to the real `codex` binary. */
-  codexBin: string;
+  /** Absolute path to the codex-family CLI binary (codex / traex / …). */
+  cliBin: string;
   /** Working directory / agent root for the session. */
   cwd: string;
   /** Child env (must carry CODEX_HOME + proxy vars + BOTMUX_SESSION_ID). */
@@ -106,7 +106,7 @@ export class CodexRpcEngine {
   async start(): Promise<void> {
     this.reapStaleAppServer();
     this.port = await findFreePort();
-    this.child = spawn(this.opts.codexBin, ['app-server', '--listen', `ws://127.0.0.1:${this.port}`], {
+    this.child = spawn(this.opts.cliBin, ['app-server', '--listen', `ws://127.0.0.1:${this.port}`], {
       cwd: this.opts.cwd,
       env: this.opts.env,
       stdio: ['ignore', 'ignore', 'pipe'],

@@ -108,8 +108,8 @@ export interface CliAdapter {
      *  a client of an external app-server (`--remote <ws>`) and resumes the
      *  botmux-owned thread, so user input is delivered via JSON-RPC (turn/start)
      *  instead of a drop-prone tmux paste. Both are set together or neither. */
-    codexRemoteWsUrl?: string;
-    codexRemoteThreadId?: string;
+    remoteWsUrl?: string;
+    remoteThreadId?: string;
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).

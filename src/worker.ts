@@ -220,8 +220,12 @@ let intentionalRestartBackend: SessionBackend | null = null;
 // (turn/start) instead of a tmux paste, and the pane runs `codex --remote`
 // attached to this engine's thread. All three are set together or none.
 let codexRpcEngine: CodexRpcEngine | undefined;
-let codexRemoteWsUrl: string | undefined;
-let codexRemoteThreadId: string | undefined;
+let remoteWsUrl: string | undefined;
+let remoteThreadId: string | undefined;
+// CLIs that expose the codex-family `app-server --listen` + `--remote resume`
+// protocol the RPC engine drives. codex + traex are verified identical; coco
+// diverges (--resume flag) and needs its own verification before inclusion.
+const RPC_CAPABLE_CLIS = new Set(['codex', 'traex']);
 let cliPidMarker: string | null = null;  // path to .botmux-cli-pids/<pid>
 let seatbeltProfilePath: string | null = null;       // per-session Seatbelt .sb profile to rm at exit (external-wrapper read isolation)
 let sandboxStopWatcher: (() => void) | null = null;  // stop fn for the sandbox outbox watcher
@@ -5930,8 +5934,8 @@ async function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise
     // Set (as a pair) by the init handler when hybrid RPC input is engaged;
     // makes buildArgs launch `codex --remote <ws> resume <thread>` instead of
     // the normal paste-mode codex. Undefined for every other bot/CLI.
-    codexRemoteWsUrl,
-    codexRemoteThreadId,
+    remoteWsUrl,
+    remoteThreadId,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
@@ -6819,8 +6823,8 @@ async function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise
     if (codexRpcEngine) {
       try { codexRpcEngine.stop(); } catch { /* best effort */ }
       codexRpcEngine = undefined;
-      codexRemoteWsUrl = undefined;
-      codexRemoteThreadId = undefined;
+      remoteWsUrl = undefined;
+      remoteThreadId = undefined;
     }
     const logTail = recentTerminalLogTail();
     // Don't park a diagnostic shell here: most exits are immediately
@@ -8308,18 +8312,18 @@ process.on('message', async (raw: unknown) => {
         // any failure cleanly falls back to normal paste mode.
         const codexRpcResume = msg.resume === true && !!msg.cliSessionId;
         if (
-          msg.codexRpcInput === true && msg.cliId === 'codex' &&
+          msg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(msg.cliId) &&
           msg.adoptMode !== true && msg.readIsolation !== true && msg.sandbox !== true &&
           (!!msg.prompt || codexRpcResume)
         ) {
           try {
-            const codexBin = createCliAdapterSync('codex', msg.cliPathOverride).resolvedBin;
+            const cliBin = createCliAdapterSync(msg.cliId as any, msg.cliPathOverride).resolvedBin;
             const engineEnv: NodeJS.ProcessEnv = { ...redactChildEnv(process.env) };
             engineEnv.PATH = `${join(homedir(), '.botmux', 'bin')}:${engineEnv.PATH ?? ''}`;
             engineEnv.BOTMUX_SESSION_ID = msg.sessionId;
             engineEnv.BOTMUX_LARK_APP_ID = msg.larkAppId;
             const engine = new CodexRpcEngine({
-              codexBin, cwd: msg.workingDir, env: engineEnv, sessionId: msg.sessionId,
+              cliBin, cwd: msg.workingDir, env: engineEnv, sessionId: msg.sessionId,
               model: msg.model, log: (m: string) => log(m),
               onDead: () => {
                 // app-server died → the `codex --remote` pane is orphaned. Kill it
@@ -8338,15 +8342,15 @@ process.on('message', async (raw: unknown) => {
             if (msg.prompt) await engine.sendTurn(msg.prompt);
             persistCliSessionId(threadId);
             codexRpcEngine = engine;
-            codexRemoteWsUrl = engine.wsUrl;
-            codexRemoteThreadId = threadId;
+            remoteWsUrl = engine.wsUrl;
+            remoteThreadId = threadId;
             log(`Codex RPC input engaged (${codexRpcResume ? 'resume' : 'fresh'}): app-server ${engine.wsUrl} thread ${threadId}${msg.prompt ? ' (turn via JSON-RPC)' : ''}`);
           } catch (err: any) {
             log(`Codex RPC input failed to start (${err?.message ?? err}); falling back to paste mode`);
             try { codexRpcEngine?.stop(); } catch { /* best effort */ }
             codexRpcEngine = undefined;
-            codexRemoteWsUrl = undefined;
-            codexRemoteThreadId = undefined;
+            remoteWsUrl = undefined;
+            remoteThreadId = undefined;
           }
         }
         await spawnCli(msg);
