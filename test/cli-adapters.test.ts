@@ -1163,6 +1163,14 @@ describe('readyPattern', () => {
     expect(adapter.readyPattern!.test('97% left')).toBe(true);
   });
 
+  it('codex defers the first-prompt timeout until its readyPattern appears', () => {
+    // Codex can cold-start slower than the worker's 15s soft timeout; keep the
+    // first Lark message queued until the composer is visible.
+    const adapter = createCodexAdapter('/bin/codex');
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+    expect(adapter.supportsTypeAhead).toBe(true);
+  });
+
   it('traex matches prompt and context indicators', () => {
     const adapter = createTraexAdapter('/bin/traex');
     expect(adapter.readyPattern).toBeDefined();

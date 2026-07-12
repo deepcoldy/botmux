@@ -281,6 +281,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: /›|\d+% left/,  // › for input box, or status bar pattern (e.g. "97% left")
+    // Codex cold starts can exceed the worker's 15s soft first-prompt timeout.
+    // Wait for the real composer marker so the bare-shell guard does not treat
+    // a still-loading zsh wrapper as a failed launch.
+    deferFirstPromptTimeoutUntilReady: true,
     defaultPassthroughCommands: ['/goal'],
     systemHints: BOTMUX_SHELL_HINTS,
     // Codex 0.134.0+ accepts a message while the current turn is still running:
