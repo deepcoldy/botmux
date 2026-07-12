@@ -10,8 +10,10 @@
 // cannot supply the secret dashboard token. The gate therefore honors the role
 // header only when the machine is platform-bound AND the request carries the
 // matching dashboard-token cookie; otherwise write falls back to `?token=`.
-// A matching private write-link token is independently sufficient even when a
-// verified platform role identifies the viewer as guest or teammate.
+//
+// Independently of the role, a matching private write-link `?token=` is a
+// capability in its own right: the owner explicitly issued that link, so it
+// grants write even when the platform authenticated the viewer as guest.
 import { describe, it, expect } from 'vitest';
 import {
   resolveTerminalWrite,
@@ -50,12 +52,12 @@ describe('resolveTerminalWrite (pure gate)', () => {
         .toEqual({ hasWrite: true, platformReadonly: false });
     });
 
-    it('allows a valid private token for a platform guest', () => {
+    it('a matching private write-link token grants write even for role guest (capability)', () => {
       expect(resolveTerminalWrite({ role: 'guest', tokenMatches: true, platformBound: true, platformProxied: true }))
         .toEqual({ hasWrite: true, platformReadonly: false });
     });
 
-    it('forces read-only for a platform guest without a token', () => {
+    it('forces read-only for a non-owner role (guest) without a token', () => {
       expect(resolveTerminalWrite({ role: 'guest', tokenMatches: false, platformBound: true, platformProxied: true }))
         .toEqual({ hasWrite: false, platformReadonly: true });
     });

@@ -43,8 +43,10 @@ export interface TerminalWriteInput {
 export function resolveTerminalWrite(
   { role, tokenMatches, platformBound, platformProxied }: TerminalWriteInput,
 ): { hasWrite: boolean; platformReadonly: boolean } {
-  // The private URL is an explicit capability; platform role verification is a
-  // separate login-based path, not an extra factor that may revoke the token.
+  // A matching private write-link token is an independent capability: the owner
+  // explicitly issued that link, so it grants write even for a viewer the
+  // platform authenticated as guest/teammate. Without it, a verified platform
+  // role decides; a role header outside the verified-proxy path is ignored.
   if (tokenMatches) return { hasWrite: true, platformReadonly: false };
   if (platformBound && platformProxied && typeof role === 'string' && role) {
     const hasWrite = role === 'owner';

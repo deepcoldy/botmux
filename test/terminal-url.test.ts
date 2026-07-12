@@ -6,12 +6,15 @@ vi.mock('../src/global-config.js', () => ({
   isRemoteAccessEnabled: vi.fn(() => false),
 }));
 
-// Keep publicReverseProxyBaseUrl real: the BOTMUX_PUBLIC_URL suite below drives
-// it through process.env. Only the platform machine URL is isolated from the
-// developer machine's live platform binding.
+// Partial mock: platformMachineBaseUrl is stubbed (no real platform.json on the
+// test box should leak in), but publicReverseProxyBaseUrl stays REAL — the
+// BOTMUX_PUBLIC_URL suite below drives it through process.env per test.
 vi.mock('../src/platform/binding.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/platform/binding.js')>();
-  return { ...actual, platformMachineBaseUrl: vi.fn(() => null) };
+  return {
+    ...actual,
+    platformMachineBaseUrl: vi.fn(() => null),
+  };
 });
 
 import { isRemoteAccessEnabled } from '../src/global-config.js';

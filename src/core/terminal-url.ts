@@ -72,9 +72,9 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
   // proxies `/s/*` to the local terminal proxy — so terminals are reachable
   // centrally with no `:port`. Platform owner login grants write access, and an
   // explicitly requested private write link keeps its worker token as an
-  // alternative capability. Public/read-only links never carry that token. When
-  // 远程访问 is off the platform base is null and we fall through — first to a
-  // self-hosted reverse proxy base (`BOTMUX_PUBLIC_URL`, same front-door
+  // alternative capability. Public/read-only links never carry that token.
+  // When 远程访问 is off the platform base is null and we fall through — first
+  // to a self-hosted reverse proxy base (`BOTMUX_PUBLIC_URL`, same front-door
   // `/s/<id>` form), then to the local proxy/worker port.
   if (proxyReady) {
     const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
