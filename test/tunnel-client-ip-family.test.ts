@@ -11,20 +11,24 @@ const { FakeWebSocket } = vi.hoisted(() => {
     url: string;
     opts: { family?: number };
     private listeners = new Map<string, Array<(...a: unknown[]) => void>>();
+
     constructor(url: string, opts: { family?: number }) {
       this.url = url;
       this.opts = opts || {};
       FakeWebSocket.instances.push(this);
     }
+
     on(ev: string, fn: (...a: unknown[]) => void): this {
       const arr = this.listeners.get(ev) || [];
       arr.push(fn);
       this.listeners.set(ev, arr);
       return this;
     }
+
     emit(ev: string, ...args: unknown[]): void {
       for (const fn of [...(this.listeners.get(ev) || [])]) fn(...args);
     }
+
     send(): void {}
     close(): void {}
     terminate(): void {}
@@ -40,9 +44,11 @@ vi.mock('../src/platform/binding.js', () => ({
 
 import { startPlatformTunnelClient } from '../src/platform/tunnel-client.js';
 
-function makeOpts() {
+const CONTROL_DIAL_PARALLEL = 3;
+
+function makeOpts(ipFamily?: 4 | 6) {
   return {
-    binding: { platformUrl: 'https://platform.test', machineId: 'm-1', machineToken: 'tok' },
+    binding: { platformUrl: 'https://platform.test', machineId: 'm-1', machineToken: 'tok', ipFamily },
     getDashboardPort: () => 7891,
     getDashboardToken: () => 'dt',
     getVersion: () => '0.0.0-test',
@@ -55,29 +61,30 @@ describe('tunnel-client 不强制协议族', () => {
     vi.useFakeTimers();
     FakeWebSocket.instances.length = 0;
   });
+
   afterEach(() => {
     vi.useRealTimers();
   });
 
   it('控制连接不传 family，让 happy-eyeballs 自动选路', () => {
     const handle = startPlatformTunnelClient(makeOpts());
-    expect(FakeWebSocket.instances.length).toBeGreaterThan(0);
+    expect(FakeWebSocket.instances).toHaveLength(CONTROL_DIAL_PARALLEL);
     for (const inst of FakeWebSocket.instances) {
       expect(inst.opts.family).toBeUndefined();
     }
     handle.stop();
   });
 
-  it('重连时仍然不传 family', async () => {
+  it('建连期 close 会计为失败并重连，重连时仍然不传 family', async () => {
     const handle = startPlatformTunnelClient(makeOpts());
     const inst = FakeWebSocket.instances;
-    // 第一次拨号失败 → 触发重连
-    inst[0].emit('close');
-    await vi.advanceTimersByTimeAsync(2000);
-    // 第二次拨号也不传 family
-    expect(FakeWebSocket.instances.length).toBeGreaterThan(1);
-    for (const s of FakeWebSocket.instances) {
-      expect(s.opts.family).toBeUndefined();
+    for (const sock of inst.slice(0, CONTROL_DIAL_PARALLEL)) {
+      sock.emit('close');
+    }
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(inst).toHaveLength(CONTROL_DIAL_PARALLEL * 2);
+    for (const sock of inst) {
+      expect(sock.opts.family).toBeUndefined();
     }
     handle.stop();
   });
@@ -85,12 +92,10 @@ describe('tunnel-client 不强制协议族', () => {
   it('数据流也不传 family', async () => {
     const handle = startPlatformTunnelClient(makeOpts());
     const inst = FakeWebSocket.instances;
-    // 让控制连接握手成功
-    inst[0].readyState = FakeWebSocket.OPEN;
-    inst[0].emit('open');
-    // 平台下发 open-stream
-    inst[0].emit('message', JSON.stringify({ type: 'open-stream', streamId: 's-1' }));
-    const dataDials = FakeWebSocket.instances.slice(1);
+    inst[0]!.readyState = FakeWebSocket.OPEN;
+    inst[0]!.emit('open');
+    inst[0]!.emit('message', JSON.stringify({ type: 'open-stream', streamId: 's-1' }));
+    const dataDials = inst.slice(CONTROL_DIAL_PARALLEL);
     expect(dataDials.length).toBeGreaterThan(0);
     for (const d of dataDials) {
       expect(d.opts.family).toBeUndefined();
@@ -99,9 +104,7 @@ describe('tunnel-client 不强制协议族', () => {
   });
 
   it('绑定文件里有 ipFamily 也不影响（隧道忽略该字段）', () => {
-    const opts = makeOpts();
-    (opts.binding as Record<string, unknown>).ipFamily = 4;
-    const handle = startPlatformTunnelClient(opts);
+    const handle = startPlatformTunnelClient(makeOpts(4));
     for (const inst of FakeWebSocket.instances) {
       expect(inst.opts.family).toBeUndefined();
     }

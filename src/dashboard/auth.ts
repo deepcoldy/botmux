@@ -163,7 +163,7 @@ export function buildSetCookie(token: string): string {
  *                          none was presented.
  *
  * Public surfaces today (codex review v0.1.2 → canary.3):
- *   - `GET /` and `GET /assets/*`              — static SPA shell
+ *   - `GET/HEAD /`, `/assets/*`, root icons    — static SPA shell
  *   - `GET /api/workflows/*`                   — workflow read-only API,
  *                                                EXCEPT `…/terminal-log/raw`
  *                                                which serves full PTY byte
@@ -233,8 +233,15 @@ export function decideDashboardAuth(opts: {
     pathname.startsWith('/api/v3/') &&
     !pathname.endsWith('/pty-log');
   const isStaticShell =
-    method === 'GET' &&
-    (pathname === '/' || pathname.startsWith('/assets/') || pathname.startsWith('/game/'));
+    (method === 'GET' || method === 'HEAD') &&
+    (
+      pathname === '/' ||
+      pathname === '/favicon.ico' ||
+      pathname === '/favicon.png' ||
+      pathname === '/apple-touch-icon.png' ||
+      pathname.startsWith('/assets/') ||
+      pathname.startsWith('/game/')
+    );
 
   // Public read-only mode opens ONLY the allow-listed "watch work" reads
   // (PUBLIC_READ_PATHS) — fail-closed: a path not on the list stays token-gated

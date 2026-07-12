@@ -1,4 +1,4 @@
-import { platformMachineBaseUrl } from '../platform/binding.js';
+import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
 
 export interface DashboardUrls {
@@ -24,11 +24,12 @@ export interface DashboardUrls {
  * (`https://m-<machineId>.<platformHost>/?t=<token>`): the platform
  * reverse-proxies that subdomain to this host's local dashboard, which still
  * enforces the `?t=` token itself, so the link is reachable centrally with no
- * `:port`. In that case `localUrl` additionally carries the local
- * `http://<externalHost>:<port>/?t=<token>` form so callers can advertise a
- * direct fallback for when the platform is unreachable. When 远程访问 is off (or
- * the machine isn't bound) the primary `url` is already the local form and
- * `localUrl` is left undefined.
+ * `:port`. Failing that, if `BOTMUX_PUBLIC_URL` is set (self-hosted reverse
+ * proxy in front of the dashboard, e.g. nginx), the primary `url` uses that base
+ * — same no-`:port` form, token still enforced. In either remote case `localUrl`
+ * additionally carries the local `http://<externalHost>:<port>/?t=<token>` form
+ * so callers can advertise a direct fallback. When neither applies the primary
+ * `url` is already the local form and `localUrl` is left undefined.
  *
  * Mirrors buildTerminalUrl (terminal-url.ts) and publicWebhookUrl
  * (dashboard/connector-api.ts) so dashboard, terminal, and webhook links all
@@ -37,12 +38,14 @@ export interface DashboardUrls {
  */
 export function buildDashboardUrls(opts: { host: string; port: number | string; token?: string }): DashboardUrls {
   const localOrigin = `http://${opts.host}:${opts.port}`;
+  // 对外基址：中心平台优先（远程访问开 + 已绑定），否则自建反代基址 BOTMUX_PUBLIC_URL。
   const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
-  const primaryOrigin = platformBase ?? localOrigin;
+  const remoteBase = platformBase ?? publicReverseProxyBaseUrl();
+  const primaryOrigin = remoteBase ?? localOrigin;
   const suffix = opts.token ? `/?t=${opts.token}` : '/';
   return {
     url: `${primaryOrigin}${suffix}`,
-    localUrl: platformBase ? `${localOrigin}${suffix}` : undefined,
+    localUrl: remoteBase ? `${localOrigin}${suffix}` : undefined,
   };
 }
 

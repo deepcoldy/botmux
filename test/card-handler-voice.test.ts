@@ -1,5 +1,5 @@
 /**
- * card-handler 🔊 语音总结 动作：注入会话精简指令 + 请耐心等待 toast + 只生成一次去重。
+ * card-handler 🔊 语音总结 动作：空闲时注入会话精简指令；执行中只提示，不打断当前回合。
  * Run: pnpm vitest run test/card-handler-voice.test.ts
  */
 import { mkdtempSync, writeFileSync } from 'node:fs';
@@ -14,7 +14,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 const deps = { activeSessions: new Map(), sessionReply: vi.fn(async () => 'mid'), lastRepoScan: new Map() } as any;
 
-function fakeSession(workerSend: ReturnType<typeof vi.fn>, killed = false): any {
+function fakeSession(workerSend: ReturnType<typeof vi.fn>, killed = false, lastScreenStatus = 'idle'): any {
   return {
     larkAppId: 'h1',
     chatId: 'oc_1',
@@ -22,6 +22,7 @@ function fakeSession(workerSend: ReturnType<typeof vi.fn>, killed = false): any 
     scope: 'thread',
     hasHistory: true,
     worker: { send: workerSend, killed },
+    lastScreenStatus,
     session: { sessionId: 'sess1', cliId: 'claude-code' },
   };
 }
@@ -80,6 +81,43 @@ describe('card-handler voice_summary', () => {
     expect(r1?.toast?.type).toBe('success');
     expect(r2?.toast?.type).toBe('info'); // already-on-the-way
     expect(send).toHaveBeenCalledTimes(1); // only the first click injected
+  });
+
+  it('does not inject when the worker is mid-turn, and does not consume the dedupe key', async () => {
+    const { types, handler } = await fresh();
+    const send = vi.fn();
+    const ds = fakeSession(send, false, 'working');
+    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
+
+    const busy = await handler.handleCardAction(voiceAction('om_card1'), deps, 'h1');
+    expect(busy?.toast?.type).toBe('warning');
+    expect(busy?.toast?.content).toContain('执行中');
+    expect(send).not.toHaveBeenCalled();
+
+    ds.lastScreenStatus = 'idle';
+    const idle = await handler.handleCardAction(voiceAction('om_card1'), deps, 'h1');
+    expect(idle?.toast?.type).toBe('success');
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('a re-click while the voice is still generating (worker back to working) says "already", not "busy"', async () => {
+    const { types, handler } = await fresh();
+    const send = vi.fn();
+    const ds = fakeSession(send, false, 'idle');
+    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
+
+    const first = await handler.handleCardAction(voiceAction('om_card1'), deps, 'h1');
+    expect(first?.toast?.type).toBe('success'); // triggered
+    expect(send).toHaveBeenCalledTimes(1);
+
+    // Injecting the voice instruction flips the worker back to working; a second
+    // click on the same card must surface the dedupe "already on the way" hint,
+    // not the busy toast (dedupe read is ordered before the busy guard).
+    ds.lastScreenStatus = 'working';
+    const second = await handler.handleCardAction(voiceAction('om_card1'), deps, 'h1');
+    expect(second?.toast?.type).toBe('info');
+    expect(second?.toast?.content).toContain('已经在生成语音');
+    expect(send).toHaveBeenCalledTimes(1); // no re-inject
   });
 
   it('session offline → warning toast, no injection', async () => {

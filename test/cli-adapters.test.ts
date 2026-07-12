@@ -3,10 +3,11 @@
  *
  * Run:  pnpm vitest run test/cli-adapters.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { mkdirSync, rmSync, appendFileSync } from 'node:fs';
 import { codexHome } from '../src/services/codex-paths.js';
 
 // ---------------------------------------------------------------------------
@@ -42,13 +43,14 @@ import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
+import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import type { CliAdapter, CliId, PtyHandle } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -83,7 +85,7 @@ describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
   // adapters (codex-app/mira) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi', 'grok'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -745,7 +747,9 @@ describe('oh-my-pi buildArgs', () => {
     expect(args[idx + 1]).toBe('/repo/root');
   });
 
-  it('submits pasted tmux input with LF instead of symbolic Enter', async () => {
+  const ompPaste = (text: string) => `\x1b[200~${text}\x1b[201~`;
+
+  it('pastes tmux input below OMP placeholder thresholds and submits with Enter', async () => {
     const events: string[] = [];
     const pty = {
       write(data: string) { events.push(`write:${JSON.stringify(data)}`); },
@@ -754,15 +758,16 @@ describe('oh-my-pi buildArgs', () => {
       onExit() {},
       kill() {},
       pasteText(text: string) { events.push(`paste:${text}`); },
+      sendText(text: string) { events.push(`text:${text}`); },
       sendSpecialKeys(...keys: string[]) { events.push(`keys:${keys.join(',')}`); },
     } satisfies PtyHandle;
 
     await adapter.writeInput(pty, 'review this');
 
-    expect(events).toEqual(['paste:review this', 'write:"\\n"']);
+    expect(events).toEqual([`text:${ompPaste('review this')}`, 'keys:Enter']);
   });
 
-  it('submits raw PTY input with bracketed paste and LF', async () => {
+  it('uses the same explicit bracketed-paste wire format on raw PTY', async () => {
     const events: string[] = [];
     const pty = {
       write(data: string) { events.push(data); },
@@ -774,7 +779,123 @@ describe('oh-my-pi buildArgs', () => {
 
     await adapter.writeInput(pty, 'review this');
 
-    expect(events).toEqual(['\x1b[200~review this\x1b[201~', '\n']);
+    expect(events).toEqual([ompPaste('review this'), '\r']);
+  });
+
+  it('chunks long and many-line input below both OMP placeholder thresholds', async () => {
+    const pasted: string[] = [];
+    const keys: string[] = [];
+    const pty = {
+      write() {},
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      pasteText() { throw new Error('adapter must use one consistent explicit wire format'); },
+      sendText(text: string) { pasted.push(text); },
+      sendSpecialKeys(...sent: string[]) { keys.push(...sent); },
+    } satisfies PtyHandle;
+
+    const content = Array.from({ length: 25 }, (_, i) => `${i}: ${'x'.repeat(60)}`).join('\n');
+    await adapter.writeInput(pty, content);
+
+    const payloads = pasted.map(text => text.slice('\x1b[200~'.length, -'\x1b[201~'.length));
+    expect(payloads.join('')).toBe(content);
+    expect(payloads.length).toBeGreaterThan(2);
+    expect(payloads.every(text => text.length <= 512)).toBe(true);
+    expect(payloads.every(text => (text.match(/\n/g) ?? []).length <= 9)).toBe(true);
+    expect(keys).toEqual(['Enter']);
+  });
+
+  it('normalizes paste text so terminal control bytes cannot become OMP key events', async () => {
+    const events: string[] = [];
+    const pty = {
+      write() {},
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      sendText(text: string) { events.push(text); },
+      sendSpecialKeys(...keys: string[]) { events.push(`keys:${keys.join(',')}`); },
+    } satisfies PtyHandle;
+
+    await adapter.writeInput(pty, 'a\tb\r\nc\x7fd\x1b[31mred\x1b[0m e\u0301');
+
+    expect(events).toEqual([ompPaste('a   b\ncdred é'), 'keys:Enter']);
+  });
+
+  it('clears the OMP composer when a later paste chunk is dropped', async () => {
+    const events: string[] = [];
+    let textCall = 0;
+    const pty = {
+      write(data: string) { events.push(`write:${data}`); },
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      sendText(text: string) { events.push(`text:${text.length}`); return ++textCall !== 2; },
+      sendSpecialKeys(...keys: string[]) { events.push(`keys:${keys.join(',')}`); },
+    } satisfies PtyHandle;
+
+    await expect(adapter.writeInput(pty, 'x'.repeat(1200))).resolves.toEqual({ submitted: false });
+
+    expect(events).toEqual(['text:524', 'text:524', 'keys:C-c']);
+  });
+
+  it('clears the OMP composer when Enter retries are all dropped', async () => {
+    const events: string[] = [];
+    const pty = {
+      write(data: string) { events.push(`write:${data}`); },
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      sendText(text: string) { events.push(`text:${text}`); },
+      sendSpecialKeys(...keys: string[]) {
+        events.push(`keys:${keys.join(',')}`);
+        return keys[0] === 'C-c';
+      },
+    } satisfies PtyHandle;
+
+    await expect(adapter.writeInput(pty, 'review this')).resolves.toEqual({ submitted: false });
+
+    expect(events).toEqual([
+      `text:${ompPaste('review this')}`,
+      'keys:Enter',
+      'keys:Enter',
+      'keys:Enter',
+      'keys:C-c',
+    ]);
+  });
+
+  it('blocks new text behind an uncleared partial composer and retries cleanup first', async () => {
+    const isolatedAdapter = createOhMyPiAdapter('/usr/bin/omp');
+    const events: string[] = [];
+    let cleanupAttempts = 0;
+    const pty = {
+      write() {},
+      resize() {},
+      onData() {},
+      onExit() {},
+      kill() {},
+      sendText(text: string) { events.push(`text:${text}`); return false; },
+      sendSpecialKeys(...keys: string[]) {
+        events.push(`keys:${keys.join(',')}`);
+        if (keys[0] === 'C-c') return ++cleanupAttempts > 1;
+        return true;
+      },
+    } satisfies PtyHandle;
+
+    await expect(isolatedAdapter.writeInput(pty, 'first')).resolves.toEqual({ submitted: false });
+    await expect(isolatedAdapter.writeInput(pty, 'second')).resolves.toEqual({ submitted: false });
+
+    expect(events).toEqual([
+      `text:${ompPaste('first')}`,
+      'keys:C-c',
+      'keys:C-c',
+      `text:${ompPaste('second')}`,
+      'keys:C-c',
+    ]);
   });
 
   it('skillsDir points to ~/.omp/agent/skills', () => {
@@ -1366,6 +1487,267 @@ describe('buildResumeCommand', () => {
     expect(a.buildResumeCommand?.({ sessionId: 'bm-kimi' })).toBeNull();
   });
 
+  it('grok emits `grok --resume <id>` preferring cliSessionId, falling back to sessionId', () => {
+    const a = createGrokAdapter('/usr/bin/grok');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-grok', cliSessionId: 'grok-sess-1' }))
+      .toBe('grok --resume grok-sess-1');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-grok' }))
+      .toBe('grok --resume bm-grok');
+  });
+
+});
+
+describe('grok buildArgs', () => {
+  const adapter = createGrokAdapter('/usr/bin/grok');
+  const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const GROK_TEST_HOME = join(tmpdir(), `botmux-grok-adapter-test-${process.pid}`);
+
+  beforeEach(() => {
+    process.env.GROK_HOME = GROK_TEST_HOME;
+    rmSync(GROK_TEST_HOME, { recursive: true, force: true });
+    mkdirSync(GROK_TEST_HOME, { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(GROK_TEST_HOME, { recursive: true, force: true });
+    delete process.env.GROK_HOME;
+    delete process.env.BOTMUX_TIME_SCALE;
+  });
+
+  it('new session pins --session-id and --always-approve by default', () => {
+    const args = adapter.buildArgs({ sessionId: sid, resume: false });
+    expect(args).toContain('--always-approve');
+    expect(args).toContain('--no-plan');
+    expect(args).toContain('--session-id');
+    expect(args[args.indexOf('--session-id') + 1]).toBe(sid);
+    expect(args).not.toContain('--resume');
+  });
+
+  it('injects botmux guidance via --rules (Claude --append-system-prompt equivalent)', () => {
+    expect(adapter.injectsSessionContext).toBe(true);
+    expect(adapter.systemHints).toEqual([]);
+    const args = adapter.buildArgs({
+      sessionId: sid,
+      resume: false,
+      botName: 'grok-loopy',
+      botOpenId: 'ou_test',
+      locale: 'zh',
+    });
+    const idx = args.indexOf('--rules');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const rules = args[idx + 1];
+    expect(rules).toContain('<botmux_routing>');
+    expect(rules).toContain('botmux send');
+    expect(rules).toContain('<identity>');
+    expect(rules).toContain('grok-loopy');
+    // Prefer append over full override — override would drop Grok's agent prompt.
+    expect(args).not.toContain('--system-prompt-override');
+    expect(args).not.toContain('--system-prompt');
+  });
+
+  it('omits --session-id when the session dir already exists (grok exits 1 on id reuse)', () => {
+    // The worker's tier-2 crash-restart fallback re-spawns FRESH with the
+    // same botmux UUID; grok refuses a reused --session-id, so the adapter
+    // must drop the flag instead of spawn-looping.
+    mkdirSync(join(GROK_TEST_HOME, 'sessions', encodeURIComponent('/tmp/proj'), sid), { recursive: true });
+    const args = adapter.buildArgs({ sessionId: sid, resume: false, workingDir: '/tmp/proj' });
+    expect(args).not.toContain('--session-id');
+    expect(args).toContain('--always-approve');
+  });
+
+  it('passes --model when configured', () => {
+    const args = adapter.buildArgs({ sessionId: sid, resume: false, model: 'grok-4.5' });
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('grok-4.5');
+  });
+
+  it('omits --always-approve when disableCliBypass is true but still disables plan mode', () => {
+    const args = adapter.buildArgs({ sessionId: sid, resume: false, disableCliBypass: true });
+    expect(args).not.toContain('--always-approve');
+    expect(args).toContain('--no-plan');
+  });
+
+  it('passes initialPrompt as a positional arg', () => {
+    const args = adapter.buildArgs({ sessionId: sid, resume: false, initialPrompt: 'hello grok' });
+    expect(args[args.length - 1]).toBe('hello grok');
+    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+  });
+
+  it('resumes with --resume using resumeSessionId when available', () => {
+    const args = adapter.buildArgs({
+      sessionId: sid,
+      resume: true,
+      resumeSessionId: '019f55e6-10a3-7f31-bc07-2fb370ae8239',
+    });
+    expect(args).toContain('--resume');
+    expect(args[args.indexOf('--resume') + 1]).toBe('019f55e6-10a3-7f31-bc07-2fb370ae8239');
+    expect(args).not.toContain('--session-id');
+    expect(args).not.toContain('--continue');
+  });
+
+  it('resumes with botmux sessionId when no resumeSessionId is stored', () => {
+    const args = adapter.buildArgs({ sessionId: sid, resume: true });
+    expect(args).toContain('--resume');
+    expect(args[args.indexOf('--resume') + 1]).toBe(sid);
+  });
+
+  it('carves out GROK_HOME (directory-level: SQLite under sessions/) and resolves skills/hooks under it', () => {
+    expect(adapter.authPaths).toEqual([GROK_TEST_HOME]);
+    expect(adapter.skillsDir).toBe(join(GROK_TEST_HOME, 'skills'));
+    expect(adapter.hookInstall?.configPath).toBe(join(GROK_TEST_HOME, 'hooks', 'botmux-session-ready.json'));
+  });
+
+  it('surfaces curated model choices for setup', () => {
+    expect(adapter.modelChoices).toContain('grok-4.5');
+  });
+
+  it('enables type-ahead, ready-hook gate, and grok-hooks SessionStart install', () => {
+    expect(adapter.supportsTypeAhead).toBe(true);
+    expect(adapter.injectsReadyHook).toBe(true);
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+    expect(adapter.readyPattern?.test('│ ❯')).toBe(true);
+    expect(adapter.hookInstall?.format).toBe('grok-hooks');
+    expect(adapter.hookInstall?.sessionStartCommand).toMatch(/session-ready/);
+  });
+
+  it('busyPattern matches the real 0.2.93 busy UI (model + tool phases), not the idle bar', () => {
+    const busy = adapter.busyPattern!;
+    expect(busy.test('⠧ Waiting for response… 0.3s')).toBe(true);
+    expect(busy.test('Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+x:shortcuts')).toBe(true);
+    expect(busy.test('Shift+Tab:mode  │  Ctrl+x:shortcuts')).toBe(false);
+  });
+
+  it('does not claim Claude-style pluginDir (TUI rejects --plugin-dir)', () => {
+    expect(adapter.pluginDir).toBeUndefined();
+  });
+
+  it('writeInput verifies against prompt_history.jsonl (submit-time log) and captures the session id', async () => {
+    process.env.BOTMUX_TIME_SCALE = '0.01';
+    const cwd = '/tmp/proj';
+    const historyDir = join(GROK_TEST_HOME, 'sessions', encodeURIComponent(cwd));
+    mkdirSync(historyDir, { recursive: true });
+    const historyPath = join(historyDir, 'prompt_history.jsonl');
+    const grokMintedSid = '019f55e6-10a3-7f31-bc07-2fb370ae8239';
+
+    const events: string[] = [];
+    const pty = {
+      write() {},
+      cliCwd: cwd,
+      sendText(text: string) { events.push(`text:${text}`); },
+      sendSpecialKeys(...keys: string[]) {
+        events.push(`keys:${keys.join(',')}`);
+        // Grok appends the submit to the bucket-level prompt_history at
+        // submit time (even while a turn is running).
+        appendFileSync(historyPath, JSON.stringify({
+          timestamp: '2026-07-12T10:00:00Z', session_id: grokMintedSid, prompt: 'line1\nline2', is_bash: false,
+        }) + '\n');
+      },
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, 'line1\nline2');
+    expect(result).toEqual({ submitted: true, cliSessionId: grokMintedSid });
+    expect(events).toEqual(['text:line1\nline2', 'keys:Enter']);
+  });
+
+  it('writeInput retries only Enter (does not re-paste full text)', async () => {
+    process.env.BOTMUX_TIME_SCALE = '0.01';
+    const cwd = '/tmp/proj';
+    const historyDir = join(GROK_TEST_HOME, 'sessions', encodeURIComponent(cwd));
+    mkdirSync(historyDir, { recursive: true });
+    const historyPath = join(historyDir, 'prompt_history.jsonl');
+    const grokMintedSid = '019f55e6-10a3-7f31-bc07-2fb370ae8239';
+
+    const events: string[] = [];
+    let enterCount = 0;
+    const pty = {
+      write() {},
+      cliCwd: cwd,
+      sendText(text: string) { events.push(`text:${text}`); },
+      sendSpecialKeys(...keys: string[]) {
+        events.push(`keys:${keys.join(',')}`);
+        enterCount++;
+        // First Enter is swallowed (slow history); second lands the submit.
+        if (enterCount >= 2) {
+          appendFileSync(historyPath, JSON.stringify({
+            timestamp: '2026-07-12T10:00:00Z', session_id: grokMintedSid, prompt: 'once only', is_bash: false,
+          }) + '\n');
+        }
+      },
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, 'once only');
+    expect(result).toEqual({ submitted: true, cliSessionId: grokMintedSid });
+    // Text pasted exactly once; Enter retried.
+    expect(events.filter((e) => e.startsWith('text:'))).toEqual(['text:once only']);
+    expect(events.filter((e) => e === 'keys:Enter').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('writeInput treats sendText/sendSpecialKeys false as definite failure (adopt pipe path)', async () => {
+    process.env.BOTMUX_TIME_SCALE = '0.01';
+    const cwd = '/tmp/proj';
+    mkdirSync(join(GROK_TEST_HOME, 'sessions', encodeURIComponent(cwd)), { recursive: true });
+    const pty = {
+      write() {},
+      cliCwd: cwd,
+      // TmuxPipeBackend returns false when the pane write is dropped (no throw).
+      sendText(): boolean { return false; },
+      sendSpecialKeys(): boolean { return false; },
+    } satisfies PtyHandle;
+    const result = await adapter.writeInput(pty, 'dropped write');
+    expect(result).toEqual({ submitted: false });
+  });
+
+  it('writeInput treats false from Enter (after successful paste) as failure', async () => {
+    process.env.BOTMUX_TIME_SCALE = '0.01';
+    const cwd = '/tmp/proj';
+    mkdirSync(join(GROK_TEST_HOME, 'sessions', encodeURIComponent(cwd)), { recursive: true });
+    const pty = {
+      write() {},
+      cliCwd: cwd,
+      sendText(): boolean { return true; },
+      sendSpecialKeys(): boolean { return false; },
+    } satisfies PtyHandle;
+    const result = await adapter.writeInput(pty, 'paste ok enter dropped');
+    expect(result).toEqual({ submitted: false });
+  });
+
+  it('writeInput hands back a recheck closure when the submit never lands in-band', async () => {
+    process.env.BOTMUX_TIME_SCALE = '0.01';
+    const cwd = '/tmp/proj';
+    const historyDir = join(GROK_TEST_HOME, 'sessions', encodeURIComponent(cwd));
+    mkdirSync(historyDir, { recursive: true });
+    const historyPath = join(historyDir, 'prompt_history.jsonl');
+
+    const pty = {
+      write() {},
+      cliCwd: cwd,
+      sendText() {},
+      sendSpecialKeys() {},
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, 'never lands');
+    expect(result).toMatchObject({ submitted: false });
+    const recheck = (result as { recheck?: () => unknown }).recheck!;
+    expect(recheck()).toBe(false);
+    // Late append (slow submit) — the deferred recheck must pick it up.
+    appendFileSync(historyPath, JSON.stringify({
+      timestamp: '2026-07-12T10:00:01Z', session_id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', prompt: 'never lands', is_bash: false,
+    }) + '\n');
+    expect(recheck()).toEqual({ submitted: true, cliSessionId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' });
+  });
+
+  it('writeInput fails closed without cliCwd (no cross-bucket history scan)', async () => {
+    process.env.BOTMUX_TIME_SCALE = '0.01';
+    const sent: string[] = [];
+    const pty = {
+      write() {},
+      sendText(t: string) { sent.push(t); },
+      sendSpecialKeys() {},
+    } satisfies PtyHandle;
+    const result = await adapter.writeInput(pty, 'orphan prompt');
+    expect(result).toEqual({ submitted: false });
+    expect(sent).toEqual(['orphan prompt']);
+  });
 });
 
 describe('kimi buildArgs', () => {

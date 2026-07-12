@@ -50,6 +50,16 @@ describe('settings-card-model · composeSections', () => {
     expect(autoUpdate.time?.state.reasonKey).toBe('settings.autoUpdate.disabled.localDev');
   });
 
+  it('grays out autoUpdate for an unsupported global install with a specific reason', () => {
+    const dto = composeSections(makeSettings({ autoUpdateSupported: false }));
+    const maintenance = dto.sections[2];
+    const autoUpdate = maintenance.toggles[0];
+    expect(autoUpdate.state.enabled).toBe(false);
+    expect(autoUpdate.time?.state.enabled).toBe(false);
+    expect(maintenance.hintKey).toBe('settings.autoUpdateUnsupportedInstall');
+    expect(autoUpdate.state.reasonKey).toBe('settings.autoUpdate.disabled.unsupportedInstall');
+  });
+
   it('grays out autoRestart whenever autoUpdate.enabled !== true (covers undefined, false, and true), with autoUpdate-dependency reason', () => {
     const cases: Array<{ enabled?: boolean; expectAutoRestartEnabled: boolean; expectReason: string | undefined }> = [
       { enabled: undefined, expectAutoRestartEnabled: false, expectReason: 'settings.autoRestart.disabled.needsAutoUpdate' },
@@ -85,9 +95,10 @@ describe('settings-card-model · helpers', () => {
     expect(shouldDisableAutoRestart(makeSettings({ maintenance: { autoUpdate: { enabled: true } } }))).toBe(false);
   });
 
-  it('shouldDisableAutoUpdate returns true iff localDevInstall === true (independent of other fields)', () => {
+  it('shouldDisableAutoUpdate covers local-dev and unsupported global installs', () => {
     expect(shouldDisableAutoUpdate(makeSettings({ localDevInstall: true }))).toBe(true);
     expect(shouldDisableAutoUpdate(makeSettings({ localDevInstall: false }))).toBe(false);
+    expect(shouldDisableAutoUpdate(makeSettings({ autoUpdateSupported: false }))).toBe(true);
     expect(shouldDisableAutoUpdate(makeSettings({
       localDevInstall: true,
       publicReadOnly: true,

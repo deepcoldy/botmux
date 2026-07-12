@@ -15,14 +15,14 @@
   <a href="#design-philosophy">Design</a> &middot;
   <a href="#key-advantages">Advantages</a> &middot;
   <a href="#5-minute-setup">Quick Start</a> &middot;
-  <a href="https://github.com/deepcoldy/botmux/tree/master/docs-site/docs/en"><b>📖 Docs</b></a>
+  <a href="https://deepcoldy.github.io/botmux/en/"><b>📖 Docs</b></a>
 </p>
 
 [中文](README.md) | English
 
 **Plug any AI coding CLI into Feishu/Lark — every DM, group or topic gets its own CLI session, with live-streaming cards, a web terminal, and zero glue code.**
 
-> 📖 **Full docs** (commands / config / best practices / troubleshooting): **<https://github.com/deepcoldy/botmux/tree/master/docs-site/docs/en>** — this README only covers why and how to get started fast.
+> 📖 **Full docs** (commands / config / best practices / troubleshooting): **<https://deepcoldy.github.io/botmux/en/>** — this README only covers why and how to get started fast.
 
 | Lark Streaming Cards | Web Terminal | tmux Session Management | Multi-Bot Collaboration |
 |:-:|:-:|:-:|:-:|
@@ -40,7 +40,7 @@
 
 ### Design Philosophy
 
-Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Cursor, Gemini, OpenCode, Antigravity, GitHub Copilot, Kimi Code) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
+Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Cursor, Gemini, OpenCode, Antigravity, GitHub Copilot, Kimi Code, Grok Build) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
 
 ### Key Advantages
 
@@ -52,7 +52,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | CLI Capabilities | Full runtime (hooks, memory, plan mode, skills, `/` commands) | SDK API subset, missing features must be reimplemented |
 | CLI Upgrades | Zero-adaptation automatic benefit | Must track SDK version changes |
 | Memory / Context | Reuses CLI's built-in memory system, improves as the CLI evolves | Must build custom memory system, duplicating CLI-native capabilities |
-| Multi-CLI Support | 8 CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot / Kimi Code) | Tied to a single SDK, cannot switch CLIs |
+| Multi-CLI Support | Many CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot / Kimi Code / Grok Build, …) | Tied to a single SDK, cannot switch CLIs |
 | Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
 | Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
 | Multi-Topic Collaboration | A lead bot auto-splits the task, opens multiple topics, and dispatches several bots to work in parallel (coder + reviewer), with a Lark task list as the shared progress board | Usually manual one-by-one assignment, no unified progress board |
@@ -64,7 +64,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 ## Prerequisites
 
 - **Node.js** >= 22
-- **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `genius`, `opencode`, `hermes`, `seed` (Seed CLI, a Claude Code fork), `relay` (Relay CLI, the new release of Seed), `pi`, `omp` (oh-my-pi, a Pi fork), `copilot` (GitHub Copilot CLI), `traex` (TRAE CLI), `mircli` (Mir CLI), `agy` (Antigravity), or `kimi` (Kimi Code) in PATH)
+- **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `genius`, `opencode`, `hermes`, `seed` (Seed CLI, a Claude Code fork), `relay` (Relay CLI, the new release of Seed), `pi`, `omp` (oh-my-pi, a Pi fork), `copilot` (GitHub Copilot CLI), `traex` (TRAE CLI), `mircli` (Mir CLI), `agy` (Antigravity), `kimi` (Kimi Code), or `grok` (Grok Build) in PATH)
   - **CoCo requires `0.120.32+`**: type-ahead (sending a new message while a turn is still running, parked in CoCo's own message queue) relies on 0.120.32+ behavior; earlier versions may drop or serialize input while busy — upgrade before use
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
 - **CJK fonts** (only needed for screenshot rendering of Chinese text / emoji):
@@ -80,7 +80,10 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 
 ```bash
 npm install -g botmux
+# or: pnpm add -g botmux
 ```
+
+Manual and scheduled updates keep using the npm or pnpm global location that owns the running botmux install. Unknown install layouts are never silently updated with npm.
 
 > Requires **Node.js ≥ 22**, with at least one AI coding CLI installed and authenticated (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` / `kimi` on your PATH). Installing **tmux** too is recommended (enables session persistence automatically).
 
@@ -223,7 +226,7 @@ On mobile/tablet, a floating shortcut toolbar provides Esc, Ctrl+C, Tab, arrow k
 
 ### Multi-Bot Collaboration
 
-Run multiple Lark bots on a single machine, each mapped to a different CLI. In the same group chat, messages are routed via @mention — each bot gets its own isolated CLI process. With a single bot in the group, it responds automatically without @. In a regular (non-topic) group, `@<bot1> @<bot2> /t xxx` spawns one independent thread per mentioned bot anchored at the same message. Send `@<bot1> @<bot2> /introduce` once so they register each other's open_id; afterwards each bot can explicitly @-mention the others from within its own session (commands: [📖 Docs · Slash Commands](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/slash-commands.md)).
+Run multiple Lark bots on a single machine, each mapped to a different CLI. In the same group chat, messages are routed via @mention — each bot gets its own isolated CLI process. With a single bot in the group, it responds automatically without @. In a regular (non-topic) group, `@<bot1> @<bot2> /t xxx` spawns one independent thread per mentioned bot anchored at the same message. Send `@<bot1> @<bot2> /introduce` once so they register each other's open_id; afterwards each bot can explicitly @-mention the others from within its own session (commands: [📖 Docs · Slash Commands](https://deepcoldy.github.io/botmux/en/slash-commands)).
 
 ### Multi-Topic Collaboration
 
@@ -311,7 +314,7 @@ ISO timestamp (`2026-05-01T10:00`).
 When a CLI spawns inside a botmux session it automatically gets
 `~/.botmux/bin` on PATH plus a set of ready-to-use Skills:
 
-- `botmux send` — send a message to the current thread (text, images, files, @mention)
+- `botmux send` — send a message to the current thread (text, images, files, interactive card JSON, @mention)
 - `botmux history` — fetch session history (topic groups → in-thread, regular groups → whole chat)
 - `botmux quoted <message_id>` — when the user @ed the bot via Lark's quote-reply UI, fetch the quoted message on demand
 - `botmux bots list` — discover bots + their `open_id`s
@@ -387,16 +390,16 @@ Notes:
 
 The full reference — commands, config, best practices, troubleshooting — lives in the docs site; not duplicated here —
 
-### 👉 https://github.com/deepcoldy/botmux/tree/master/docs-site/docs/en
+### 👉 https://deepcoldy.github.io/botmux/en/
 
 | Topic | Docs |
 |-------|------|
-| Slash commands / CLI commands / agent-facing subcommands | [Commands](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/slash-commands.md) |
-| `bots.json` fields / env vars / file locations | [Configuration](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/bots-json.md) |
-| Multi-CLI adapters (incl. wrapper / gateway integration) | [Adapters](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/adapters.md) |
-| Scenario-based best practices (Oncall / alerting-ops / solo dev / team) | [Best Practices](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/best-practices.md) |
-| Common pitfalls / FAQ | [Pitfalls](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/pitfalls.md) · [FAQ](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/faq.md) |
-| Features: scheduled tasks / Oncall / Dashboard / multi-bot / session relay | [Schedule](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/schedule.md) · [Oncall](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/oncall.md) · [Dashboard](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/dashboard.md) · [Multi-bot](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/multi-bot.mdx) · [Relay](https://github.com/deepcoldy/botmux/blob/master/docs-site/docs/en/relay.md) |
+| Slash commands / CLI commands / agent-facing subcommands | [Commands](https://deepcoldy.github.io/botmux/en/slash-commands) |
+| `bots.json` fields / env vars / file locations | [Configuration](https://deepcoldy.github.io/botmux/en/bots-json) |
+| Multi-CLI adapters (incl. wrapper / gateway integration) | [Adapters](https://deepcoldy.github.io/botmux/en/adapters) |
+| Scenario-based best practices (Oncall / alerting-ops / solo dev / team) | [Best Practices](https://deepcoldy.github.io/botmux/en/best-practices) |
+| Common pitfalls / FAQ | [Pitfalls](https://deepcoldy.github.io/botmux/en/pitfalls) · [FAQ](https://deepcoldy.github.io/botmux/en/faq) |
+| Features: scheduled tasks / Oncall / Dashboard / multi-bot / session relay | [Schedule](https://deepcoldy.github.io/botmux/en/schedule) · [Oncall](https://deepcoldy.github.io/botmux/en/oncall) · [Dashboard](https://deepcoldy.github.io/botmux/en/dashboard) · [Multi-bot](https://deepcoldy.github.io/botmux/en/multi-bot) · [Relay](https://deepcoldy.github.io/botmux/en/relay) |
 
 ## Contributing
 

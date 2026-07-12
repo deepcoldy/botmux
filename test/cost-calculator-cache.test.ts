@@ -41,10 +41,13 @@ function claudeLine(id: string | null, input: number, output: number): string {
   });
 }
 
-function codexCountLine(input: number, output: number): string {
+function codexCountLine(input: number, output: number, cacheRead = 0): string {
   return JSON.stringify({
     type: 'event_msg',
-    payload: { type: 'token_count', info: { total_token_usage: { input_tokens: input, output_tokens: output } } },
+    payload: {
+      type: 'token_count',
+      info: { total_token_usage: { input_tokens: input, output_tokens: output, cached_input_tokens: cacheRead } },
+    },
   });
 }
 
@@ -177,13 +180,23 @@ describe('readSessionTokenUsageFile caching', () => {
 
   it('keeps codex cumulative semantics across incremental reads', () => {
     const p = join(dir, 'rollout.jsonl');
-    writeFileSync(p, `${codexCountLine(100, 20)}\n`);
-    expect(readSessionTokenUsageFile(p, 'codex')).toMatchObject({ in: 100, out: 20 });
+    writeFileSync(p, `${codexCountLine(100, 20, 40)}\n`);
+    expect(readSessionTokenUsageFile(p, 'codex')).toMatchObject({
+      in: 100,
+      inputTokens: 60,
+      cacheReadTokens: 40,
+      out: 20,
+    });
 
     now += 20_000;
-    appendFileSync(p, `${codexCountLine(150, 30)}\n`);
+    appendFileSync(p, `${codexCountLine(150, 30, 60)}\n`);
     // Latest cumulative snapshot wins — not 100+150.
-    expect(readSessionTokenUsageFile(p, 'codex')).toMatchObject({ in: 150, out: 30 });
+    expect(readSessionTokenUsageFile(p, 'codex')).toMatchObject({
+      in: 150,
+      inputTokens: 90,
+      cacheReadTokens: 60,
+      out: 30,
+    });
   });
 
   it('skips oversized transcripts instead of scanning them from byte zero', () => {

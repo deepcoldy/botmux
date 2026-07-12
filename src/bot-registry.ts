@@ -11,6 +11,7 @@ import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
 export type BotHandler = 'goal-panel';
@@ -357,6 +358,26 @@ export interface BotDefaultOncall {
   enabled: boolean;
   workingDir: string;
   since: number;
+}
+
+export interface SubstituteTarget {
+  /** App-scoped open_id. Directly comparable with Lark mention payloads. */
+  openId?: string;
+  /** Tenant user_id. Preferred for hand-authored config when available. */
+  userId?: string;
+  /** Tenant-stable union_id. Used when Lark includes it in mention payloads. */
+  unionId?: string;
+  /** Reserved for a later resolver pass; v1 preserves it but does not match on it. */
+  email?: string;
+  /** Human-readable label for prompt disclosure. */
+  name?: string;
+}
+
+export interface SubstituteModeConfig {
+  enabled: boolean;
+  targets: SubstituteTarget[];
+  /** prefix = disclose "I will answer on behalf of X"; none = no extra disclosure instruction. */
+  disclosure?: 'prefix' | 'none';
 }
 
 export interface VcMeetingAgentConfig {
@@ -815,6 +836,13 @@ export interface BotConfig {
    * is the mode's defining behavior, not affected by this policy).
    */
   regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
+  /**
+   * Regular-group substitute trigger. When enabled, an @mention of one of the
+   * configured people is treated as an address to this bot when the sender can
+   * talk to the bot. Matching currently uses mention open_id / user_id / union_id;
+   * email is preserved for future resolution but is not matched directly.
+   */
+  substituteMode?: SubstituteModeConfig;
   /**
    * 飞书文档订阅入口（/subscribe-lark-doc）新订阅的默认评论触发范围：
    *   • 'mention-only'（或 undefined）— 仅评论里 @bot 才触发（默认，防噪声）
@@ -1293,6 +1321,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         .filter((x: any): x is string => typeof x === 'string');
     }
 
+    // Shared normalizer (with substitute-mode-store): keeps a disabled config's
+    // target list so the dashboard toggle can flip without re-entering everyone;
+    // only an enabled-but-unmatchable config collapses to undefined.
+    const substituteMode: SubstituteModeConfig | undefined = normalizeSubstituteMode(entry.substituteMode);
+
     // chatReplyModes：只保留每群显式设置，非法值丢弃。四态 chat｜chat-topic｜
     // new-topic｜shared 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目
     // 以保持 bots.json 干净（见 chat-reply-mode-store.setChatReplyMode）。
@@ -1509,6 +1542,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         || entry.regularGroupMentionMode === 'ambient'
         ? entry.regularGroupMentionMode
         : undefined,
+      substituteMode,
       // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
       // undefined 让 bots.json 保持干净。
       docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : undefined,

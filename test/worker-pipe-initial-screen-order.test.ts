@@ -184,4 +184,18 @@ describe('worker pipe initial screen ordering', () => {
     expect(guard).toContain("send({ type: 'user_notify'");
     expect(guard).not.toContain("effectiveBackend = 'pty'");
   });
+
+  it('wires adoptCliPid/cliCwd on herdr adopt (parity with tmux/zellij for grok writeInput)', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    // Herdr early-return adopt block must surface adoptCliPid + adoptCwd so
+    // grok's preferSessionId (findGrokSessionByPid) works under herdr adopt.
+    const herdrStart = source.indexOf("cfg.adoptSource === 'herdr'");
+    const herdrEnd = source.indexOf("log(`Adopt mode (herdr):", herdrStart);
+    expect(herdrStart).toBeGreaterThan(-1);
+    expect(herdrEnd).toBeGreaterThan(herdrStart);
+    const herdrBlock = source.slice(herdrStart, herdrEnd);
+    expect(herdrBlock).toContain('herdrBe.cliPid = cfg.adoptCliPid');
+    expect(herdrBlock).toContain('cfg.adoptCwd ?? cfg.workingDir');
+    expect(herdrBlock).toContain('herdrBe.cliCwd');
+  });
 });

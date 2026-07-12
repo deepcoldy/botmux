@@ -1,6 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { CreateActionButton, DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
+import { jget, jsend } from './dashboard-api.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
+import { WebhookLogsContent } from './webhook-logs-page.js';
 
 interface Connector {
   id: string;
@@ -16,6 +19,8 @@ interface Connector {
     workflowId?: string;
   };
   promptEnvelope: { sourceName: string; instruction?: string };
+  loggingPolicy?: { storePayload: boolean; storeHeaders: boolean; retentionDays: number };
+  lifecycleExtractors?: { dedupKey: string } | null;
 }
 
 interface BotOpt {
@@ -39,10 +44,12 @@ interface CreateForm {
   manualChat: boolean;
   manualChatId: string;
   allowChats: string[];
+  deduplicate: boolean;
   dedup: string;
   instruction: string;
   verify: 'token' | 'hmac-sha256';
   secret: string;
+  storePayload: boolean;
 }
 
 interface CreatedConnector {
@@ -56,6 +63,12 @@ interface CreatedConnector {
   exampleChat: string;
 }
 
+type ConnectorsTab = 'webhooks' | 'logs';
+
+export function replaceConnectorById<T extends { id: string }>(connectors: T[], updated: T): T[] {
+  return connectors.map(connector => connector.id === updated.id ? updated : connector);
+}
+
 const emptyForm: CreateForm = {
   name: '',
   botId: '',
@@ -66,25 +79,13 @@ const emptyForm: CreateForm = {
   manualChat: false,
   manualChatId: '',
   allowChats: [],
+  deduplicate: false,
   dedup: '',
   instruction: '',
   verify: 'token',
   secret: '',
+  storePayload: true,
 };
-
-async function jget(u: string): Promise<{ status: number; body: any }> {
-  const r = await fetch(u);
-  return { status: r.status, body: await r.json().catch(() => ({} as any)) };
-}
-
-async function jsend(method: string, u: string, b?: unknown): Promise<{ status: number; body: any }> {
-  const r = await fetch(u, {
-    method,
-    headers: { 'content-type': 'application/json' },
-    body: b ? JSON.stringify(b) : undefined,
-  });
-  return { status: r.status, body: await r.json().catch(() => ({} as any)) };
-}
 
 export function buildConnectorInstructionUpdateBody(
   connector: { name: string; promptEnvelope?: { sourceName?: string } },
@@ -102,14 +103,186 @@ function webhookUrl(id: string): string {
   return `${location.origin}/webhook/${encodeURIComponent(id)}`;
 }
 
+function ConnectorDropdown<T extends string>(props: {
+  id: string;
+  label: string;
+  value: T;
+  options: Array<{ value: T; label: ReactNode }>;
+  onChange(value: T): void;
+}): JSX.Element {
+  return (
+    <DropdownMenu
+      id={props.id}
+      className="connector-form-menu"
+      ariaLabel={props.label}
+      value={props.value}
+      label={dropdownLabel(props.options, props.value)}
+      options={props.options}
+      onChange={props.onChange}
+    />
+  );
+}
+
+function SearchableGroupPicker(props: {
+  id: string;
+  label: string;
+  groups: GroupOpt[];
+  value: string | string[];
+  multiple?: boolean;
+  allLabel?: string;
+  placeholder: string;
+  searchPlaceholder: string;
+  emptyLabel: string;
+  selectedCountLabel(count: number): string;
+  onChange(value: string | string[]): void;
+}): JSX.Element {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const values = Array.isArray(props.value) ? props.value : (props.value ? [props.value] : []);
+  const valueSet = useMemo(() => new Set(values), [values]);
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const filteredGroups = useMemo(() => {
+    if (!normalizedQuery) return props.groups;
+    return props.groups.filter(group => `${group.name} ${group.chatId}`.toLocaleLowerCase().includes(normalizedQuery));
+  }, [normalizedQuery, props.groups]);
+  const selectedLabel = props.multiple
+    ? (values.length === 0 ? props.allLabel || props.placeholder : props.selectedCountLabel(values.length))
+    : (props.groups.find(group => group.chatId === values[0])?.name || values[0] || props.placeholder);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener('pointerdown', closeOnOutsideClick);
+    return () => document.removeEventListener('pointerdown', closeOnOutsideClick);
+  }, [open]);
+
+  function select(chatId: string): void {
+    if (!props.multiple) {
+      props.onChange(chatId);
+      setOpen(false);
+      setQuery('');
+      return;
+    }
+    props.onChange(valueSet.has(chatId) ? values.filter(id => id !== chatId) : [...values, chatId]);
+  }
+
+  return (
+    <div ref={rootRef} className={`connector-group-picker${open ? ' open' : ''}`}>
+      <button
+        id={props.id}
+        type="button"
+        className="connector-group-picker-trigger"
+        aria-label={props.label}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen(current => !current)}
+      >
+        <span className={values.length || (props.multiple && props.allLabel) ? '' : 'muted'}>{selectedLabel}</span>
+        <span className="connector-group-picker-chevron" aria-hidden="true" />
+      </button>
+      {open ? (
+        <div className="connector-group-picker-popover">
+          <label className="connector-group-search" htmlFor={`${props.id}-search`}>
+            <span className="connector-group-search-icon" aria-hidden="true" />
+            <input
+              id={`${props.id}-search`}
+              type="search"
+              autoComplete="off"
+              autoFocus
+              value={query}
+              placeholder={props.searchPlaceholder}
+              onChange={event => setQuery(event.currentTarget.value)}
+              onKeyDown={event => {
+                if (event.key === 'Escape') {
+                  event.preventDefault();
+                  setOpen(false);
+                }
+              }}
+            />
+          </label>
+          <div className="connector-group-options" role="listbox" aria-label={props.label} aria-multiselectable={props.multiple || undefined}>
+            {props.multiple && props.allLabel && !normalizedQuery ? (
+              <button
+                type="button"
+                className={`connector-group-option connector-group-option-all${values.length === 0 ? ' selected' : ''}`}
+                role="option"
+                aria-selected={values.length === 0}
+                onClick={() => props.onChange([])}
+              >
+                <span className="connector-group-check" aria-hidden="true" />
+                <span><b>{props.allLabel}</b><small>{props.placeholder}</small></span>
+              </button>
+            ) : null}
+            {filteredGroups.map(group => {
+              const selected = valueSet.has(group.chatId);
+              return (
+                <button
+                  type="button"
+                  className={`connector-group-option${selected ? ' selected' : ''}`}
+                  role="option"
+                  aria-selected={selected}
+                  key={group.chatId}
+                  onClick={() => select(group.chatId)}
+                >
+                  <span className="connector-group-check" aria-hidden="true" />
+                  <span><b>{group.name || group.chatId}</b>{group.name ? <small>{group.chatId}</small> : null}</span>
+                </button>
+              );
+            })}
+            {!filteredGroups.length ? <p className="connector-group-empty">{props.emptyLabel}</p> : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function botGroups(groups: GroupOpt[], botId: string): GroupOpt[] {
   return groups.filter(g => g.bots.includes(botId));
 }
 
-function ConnectorsPage() {
+function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm {
+  const chatId = connector.target.chatId || '';
+  const knownChat = chatId && botGroups(groups, connector.target.botId).some(group => group.chatId === chatId);
+  return {
+    name: connector.name,
+    botId: connector.target.botId,
+    kind: connector.target.kind,
+    workflowId: connector.target.workflowId || '',
+    mode: connector.target.mode,
+    chatId: knownChat ? chatId : '',
+    manualChat: Boolean(chatId && !knownChat),
+    manualChatId: knownChat ? '' : chatId,
+    allowChats: connector.target.allowChats || [],
+    deduplicate: Boolean(connector.lifecycleExtractors?.dedupKey),
+    dedup: connector.lifecycleExtractors?.dedupKey || '',
+    instruction: connector.promptEnvelope?.instruction || '',
+    verify: connector.verify?.type || 'token',
+    secret: '',
+    storePayload: connector.loggingPolicy?.storePayload !== false,
+  };
+}
+
+function ConnectorsSubNav(props: { active: ConnectorsTab }): JSX.Element {
+  const tr = useT();
+  const isWebhooks = props.active === 'webhooks';
+  const isLogs = props.active === 'logs';
+  return (
+    <nav className="connectors-subnav-slot connectors-subnav insight-tabs" role="tablist" aria-label={tr('nav.connectors')}>
+      <a href="#/connectors" className={`itab${isWebhooks ? ' on' : ''}`} role="tab" aria-selected={isWebhooks}>{tr('connectors.tabWebhooks')}</a>
+      <a href="#/connectors/logs" className={`itab${isLogs ? ' on' : ''}`} role="tab" aria-selected={isLogs}>{tr('connectors.tabLogs')}</a>
+    </nav>
+  );
+}
+
+function ConnectorsPage(props: { tab: ConnectorsTab }) {
   const tr = useT();
   const mountedRef = useRef(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const createDialogRef = useRef<HTMLDialogElement | null>(null);
   const [bots, setBots] = useState<BotOpt[]>([]);
   const [groups, setGroups] = useState<GroupOpt[]>([]);
   const [connectors, setConnectors] = useState<Connector[]>([]);
@@ -118,12 +291,31 @@ function ConnectorsPage() {
   const [createMsg, setCreateMsg] = useState<{ text: string; error?: boolean } | null>(null);
   const [created, setCreated] = useState<CreatedConnector | null>(null);
   const [creating, setCreating] = useState(false);
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editInstruction, setEditInstruction] = useState('');
+  const [createOpen, setCreateOpen] = useState(false);
+  const [editingConnector, setEditingConnector] = useState<Connector | null>(null);
   const [editMsg, setEditMsg] = useState<{ id: string; text: string; error?: boolean } | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const groupsForBot = useMemo(() => botGroups(groups, form.botId), [groups, form.botId]);
+  const botOptions = useMemo(
+    () => bots.length
+      ? bots.map(bot => ({ value: bot.larkAppId, label: bot.botName }))
+      : [{ value: '', label: tr('connectors.noOnlineBots') }],
+    [bots, tr],
+  );
+  const kindOptions = useMemo(() => [
+    { value: 'turn' as const, label: tr('connectors.kindTurn') },
+    { value: 'workflow' as const, label: tr('connectors.kindWorkflow') },
+  ], [tr]);
+  const modeOptions = useMemo(() => [
+    { value: 'dynamic' as const, label: tr('connectors.modeDynamic') },
+    { value: 'fixed' as const, label: tr('connectors.modeFixed') },
+    { value: 'new-group' as const, label: tr('connectors.modeNewGroup') },
+  ], [tr]);
+  const verifyOptions = useMemo(() => [
+    { value: 'token' as const, label: tr('connectors.verifyToken') },
+    { value: 'hmac-sha256' as const, label: tr('connectors.verifyHmac') },
+  ], [tr]);
 
   const groupName = useCallback((chatId: string): string => {
     const g = groups.find(x => x.chatId === chatId);
@@ -190,6 +382,25 @@ function ConnectorsPage() {
     }));
   }, [groupsForBot]);
 
+  useEffect(() => {
+    const dialog = createDialogRef.current;
+    if (!dialog) return;
+    if (createOpen) {
+      if (!dialog.open) {
+        try { dialog.showModal(); } catch { /* dialog already opening */ }
+      }
+      const body = dialog.querySelector<HTMLElement>('.connector-modal-body');
+      if (body) body.scrollTop = 0;
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [createOpen]);
+
+  useEffect(() => () => {
+    const dialog = createDialogRef.current;
+    if (dialog?.open) dialog.close();
+  }, []);
+
   function modeLabel(m: string): string {
     return m === 'fixed'
       ? tr('connectors.modeLabelFixed')
@@ -206,11 +417,39 @@ function ConnectorsPage() {
     setForm(cur => ({ ...cur, ...patch }));
   }
 
-  function selectAllowChats(select: HTMLSelectElement): void {
-    patchForm({ allowChats: Array.from(select.selectedOptions).map(o => o.value).filter(Boolean) });
+  function openCreateModal(): void {
+    setCreateMsg(null);
+    setCreated(null);
+    setEditingConnector(null);
+    setForm(cur => {
+      const botId = cur.botId || bots[0]?.larkAppId || '';
+      return {
+        ...emptyForm,
+        botId,
+        chatId: botGroups(groups, botId)[0]?.chatId || '',
+      };
+    });
+    setCreateOpen(true);
   }
 
-  async function createConnector(): Promise<void> {
+  function openEditModal(connector: Connector): void {
+    setCreateMsg(null);
+    setCreated(null);
+    setEditMsg(null);
+    setEditingConnector(connector);
+    setForm(formFromConnector(connector, groups));
+    setCreateOpen(true);
+  }
+
+  function closeCreateModal(): void {
+    if (creating) return;
+    setCreateOpen(false);
+    setCreateMsg(null);
+    setCreated(null);
+    setEditingConnector(null);
+  }
+
+  async function submitConnector(): Promise<void> {
     setCreateMsg(null);
     setCreated(null);
     const name = form.name.trim();
@@ -220,13 +459,12 @@ function ConnectorsPage() {
 
     const body: any = {
       name,
-      enabled: true,
+      enabled: editingConnector?.enabled ?? true,
       target: { kind: form.kind, mode: form.mode, botId },
-      promptEnvelope: { sourceName: name },
+      promptEnvelope: { sourceName: name, instruction: form.instruction.trim() },
       verify: { type: form.verify },
+      loggingPolicy: { storePayload: form.storePayload, storeHeaders: true, retentionDays: 14 },
     };
-    const instruction = form.instruction.trim();
-    if (instruction) body.promptEnvelope.instruction = instruction;
     if (form.kind === 'workflow') {
       if (!form.workflowId.trim()) { setCreateMsg({ text: tr('connectors.errWf'), error: true }); return; }
       body.target.workflowId = form.workflowId.trim();
@@ -235,21 +473,36 @@ function ConnectorsPage() {
       const chatId = form.manualChat ? form.manualChatId.trim() : form.chatId;
       if (!chatId) { setCreateMsg({ text: tr('connectors.errChat'), error: true }); return; }
       body.target.chatId = chatId;
-    } else if (form.allowChats.length) {
+    } else if (form.mode === 'dynamic') {
       body.target.allowChats = form.allowChats;
     }
     if (form.mode === 'new-group') {
       const dedup = form.dedup.trim();
-      body.lifecycleExtractors = dedup ? { dedupKey: dedup } : null;
+      if (form.deduplicate && !dedup) { setCreateMsg({ text: tr('connectors.errDedup'), error: true }); return; }
+      body.lifecycleExtractors = form.deduplicate ? { dedupKey: dedup } : null;
+    } else {
+      body.lifecycleExtractors = null;
     }
     if (form.secret.trim()) body.secret = form.secret.trim();
 
     setCreating(true);
-    setCreateMsg({ text: tr('connectors.creating') });
+    setCreateMsg({ text: tr(editingConnector ? 'connectors.saving' : 'connectors.creating') });
     try {
-      const r = await jsend('POST', '/api/connectors', body);
+      const r = await jsend(
+        editingConnector ? 'PUT' : 'POST',
+        editingConnector ? `/api/connectors/${encodeURIComponent(editingConnector.id)}` : '/api/connectors',
+        body,
+      );
       if (!mountedRef.current) return;
-      if (r.status === 201 && r.body?.ok) {
+      if ((r.status === 201 || r.status === 200) && r.body?.ok) {
+        if (editingConnector) {
+          const editedId = editingConnector.id;
+          setConnectors(current => replaceConnectorById(current, r.body.connector as Connector));
+          setEditMsg({ id: editedId, text: tr('connectors.updated') });
+          setCreateOpen(false);
+          setEditingConnector(null);
+          return;
+        }
         const url = r.body.webhookUrl || webhookUrl(r.body.connector.id);
         const isToken = (r.body.connector?.verify?.type ?? 'token') === 'token';
         const isDynamic = form.mode === 'dynamic';
@@ -274,6 +527,7 @@ function ConnectorsPage() {
           secret: '',
           instruction: '',
           allowChats: [],
+          storePayload: true,
         }));
         await load();
       } else {
@@ -285,17 +539,31 @@ function ConnectorsPage() {
     }
   }
 
-  async function saveInstruction(connector: Connector): Promise<void> {
-    setEditMsg({ id: connector.id, text: tr('connectors.saving') });
-    const r = await jsend(
-      'PUT',
-      `/api/connectors/${encodeURIComponent(connector.id)}`,
-      buildConnectorInstructionUpdateBody(connector, editInstruction),
-    );
+  async function toggleConnector(connector: Connector): Promise<void> {
+    setEditMsg({ id: connector.id, text: tr(connector.enabled ? 'connectors.disabling' : 'connectors.enabling') });
+    const r = await jsend('PATCH', `/api/connectors/${encodeURIComponent(connector.id)}`, { enabled: !connector.enabled });
     if (!mountedRef.current) return;
     if (r.status === 200 && r.body?.ok) {
-      setEditingId(null);
-      setEditInstruction('');
+      setEditMsg(null);
+      await load();
+    } else {
+      const e = r.body?.error || r.status;
+      setEditMsg({ id: connector.id, text: tr('connectors.toggleFailed', { error: String(e) }), error: true });
+    }
+  }
+
+  async function togglePayloadLogging(connector: Connector): Promise<void> {
+    const current = connector.loggingPolicy?.storePayload !== false;
+    setEditMsg({ id: connector.id, text: tr('connectors.saving') });
+    const r = await jsend('PUT', `/api/connectors/${encodeURIComponent(connector.id)}`, {
+      loggingPolicy: {
+        storePayload: !current,
+        storeHeaders: connector.loggingPolicy?.storeHeaders !== false,
+        retentionDays: connector.loggingPolicy?.retentionDays ?? 14,
+      },
+    });
+    if (!mountedRef.current) return;
+    if (r.status === 200 && r.body?.ok) {
       setEditMsg(null);
       await load();
     } else {
@@ -304,17 +572,18 @@ function ConnectorsPage() {
     }
   }
 
-  async function toggleConnector(connector: Connector): Promise<void> {
-    await jsend('PATCH', `/api/connectors/${encodeURIComponent(connector.id)}`, { enabled: !connector.enabled });
-    if (!mountedRef.current) return;
-    await load();
-  }
-
   async function deleteConnector(connector: Connector): Promise<void> {
     if (!confirm(tr('connectors.delConfirm'))) return;
-    await jsend('DELETE', `/api/connectors/${encodeURIComponent(connector.id)}`);
+    setEditMsg({ id: connector.id, text: tr('connectors.deleting') });
+    const r = await jsend('DELETE', `/api/connectors/${encodeURIComponent(connector.id)}`);
     if (!mountedRef.current) return;
-    await load();
+    if (r.status === 200 && r.body?.ok) {
+      setEditMsg(null);
+      await load();
+    } else {
+      const e = r.body?.error || r.status;
+      setEditMsg({ id: connector.id, text: tr('connectors.deleteFailed', { error: String(e) }), error: true });
+    }
   }
 
   function copyConnectorUrl(connector: Connector): void {
@@ -327,155 +596,282 @@ function ConnectorsPage() {
   }
 
   return (
-    <section className="page">
+    <section className="page connectors-page">
       <div className="page-heading">
         <div>
-          <p className="eyebrow">Webhook</p>
-          <h1>Webhook</h1>
-          <p>{tr('connectors.lede')}</p>
+          <p className="eyebrow">{tr('nav.connectors')}</p>
+          <h1>{tr('nav.connectors')}</h1>
+        </div>
+        <div className="page-heading-actions">
+          {props.tab === 'webhooks' ? (
+            <CreateActionButton className="page-primary-action connector-create-trigger" onClick={openCreateModal}>
+              {tr('connectors.createTitle')}
+            </CreateActionButton>
+          ) : (
+            <a className="button page-primary-action" href="#/connectors">{tr('webhookLogs.manage')}</a>
+          )}
         </div>
       </div>
 
-      <div className="card" style={{ marginBottom: 16 }}>
-        <h2 style={{ marginTop: 0 }}>{tr('connectors.createTitle')}</h2>
-        <div className="cn-form" style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: '10px 14px', alignItems: 'center', maxWidth: 680 }}>
-          <label htmlFor="cn-name">{tr('connectors.fName')}</label>
-          <input id="cn-name" value={form.name} onChange={e => patchForm({ name: e.currentTarget.value })} placeholder={tr('connectors.fNamePh')} />
+      <ConnectorsSubNav active={props.tab} />
 
-          <label htmlFor="cn-bot">{tr('connectors.fBot')}</label>
-          <select id="cn-bot" value={form.botId} onChange={e => patchForm({ botId: e.currentTarget.value })}>
-            {bots.length ? bots.map(b => <option key={b.larkAppId} value={b.larkAppId}>{b.botName}</option>) : <option value="">{tr('connectors.noOnlineBots')}</option>}
-          </select>
+      {props.tab === 'webhooks' ? (
+        <>
+          <dialog
+            ref={createDialogRef}
+            className="connector-create-modal"
+            onCancel={event => {
+              event.preventDefault();
+              closeCreateModal();
+            }}
+            onClose={closeCreateModal}
+            onClick={event => {
+              if (event.target === event.currentTarget) closeCreateModal();
+            }}
+          >
+            <article className="connector-modal-card">
+              <header className="connector-modal-header">
+                <h3>{tr(editingConnector ? 'connectors.editTitle' : 'connectors.createTitle')}</h3>
+                <button
+                  type="button"
+                  className="connector-modal-close"
+                  aria-label={tr('connectors.close')}
+                  title={tr('connectors.close')}
+                  disabled={creating}
+                  onClick={closeCreateModal}
+                >
+                  <span aria-hidden="true">&times;</span>
+                </button>
+              </header>
+              <div className="connector-modal-body">
+              {created ? <CreatedPanel created={created} groupName={groupName} /> : (
+                <>
+                <div className="cn-form">
+          <label className="cn-field" htmlFor="cn-name">
+            <FieldTitle>{tr('connectors.fName')}</FieldTitle>
+            <input id="cn-name" value={form.name} onChange={e => patchForm({ name: e.currentTarget.value })} placeholder={tr('connectors.fNamePh')} />
+          </label>
 
-          <label htmlFor="cn-kind">{tr('connectors.fKind')}</label>
-          <select id="cn-kind" value={form.kind} onChange={e => patchForm({ kind: e.currentTarget.value as CreateForm['kind'] })}>
-            <option value="turn">{tr('connectors.kindTurn')}</option>
-            <option value="workflow">{tr('connectors.kindWorkflow')}</option>
-          </select>
+          <div className="cn-field">
+            <FieldTitle>{tr('connectors.fBot')}</FieldTitle>
+            <ConnectorDropdown
+              id="cn-bot"
+              label={tr('connectors.fBot')}
+              value={form.botId}
+              options={botOptions}
+              onChange={botId => patchForm({ botId })}
+            />
+          </div>
+
+          <div className="cn-field">
+            <FieldTitle>{tr('connectors.fKind')}</FieldTitle>
+            <ConnectorDropdown
+              id="cn-kind"
+              label={tr('connectors.fKind')}
+              value={form.kind}
+              options={kindOptions}
+              onChange={kind => patchForm({ kind })}
+            />
+          </div>
 
           {form.kind === 'workflow' ? (
-            <>
-              <label htmlFor="cn-wf">{tr('connectors.fWf')}</label>
+            <label className="cn-field" htmlFor="cn-wf">
+              <FieldTitle>{tr('connectors.fWf')}</FieldTitle>
               <input id="cn-wf" value={form.workflowId} onChange={e => patchForm({ workflowId: e.currentTarget.value })} placeholder="workflowId" />
-            </>
+            </label>
           ) : null}
 
-          <label htmlFor="cn-mode">{tr('connectors.fMode')}</label>
-          <select id="cn-mode" value={form.mode} onChange={e => patchForm({ mode: e.currentTarget.value as CreateForm['mode'] })}>
-            <option value="dynamic">{tr('connectors.modeDynamic')}</option>
-            <option value="fixed">{tr('connectors.modeFixed')}</option>
-            <option value="new-group">{tr('connectors.modeNewGroup')}</option>
-          </select>
+          <div className="cn-field">
+            <FieldTitle>{tr('connectors.fMode')}</FieldTitle>
+            <ConnectorDropdown
+              id="cn-mode"
+              label={tr('connectors.fMode')}
+              value={form.mode}
+              options={modeOptions}
+              onChange={mode => patchForm({ mode })}
+            />
+          </div>
 
           {form.mode === 'fixed' ? (
-            <>
-              <label>{tr('connectors.fFixedChat')}</label>
-              <div>
+            <div className="cn-field cn-field-wide">
+              <FieldTitle>{tr('connectors.fFixedChat')}</FieldTitle>
+              <div className="connector-chat-control">
                 {form.manualChat ? (
                   <input
                     id="cn-chat"
                     value={form.manualChatId}
                     onChange={e => patchForm({ manualChatId: e.currentTarget.value })}
                     placeholder={tr('connectors.fChatManualPh')}
-                    style={{ width: '100%', boxSizing: 'border-box', marginTop: 6 }}
                   />
                 ) : (
-                  <select id="cn-chat-sel" value={form.chatId} onChange={e => patchForm({ chatId: e.currentTarget.value })} style={{ width: '100%', boxSizing: 'border-box' }}>
-                    {groupsForBot.length ? groupsForBot.map(g => <option key={g.chatId} value={g.chatId}>{g.name || g.chatId}</option>) : <option value="">{tr('connectors.noBotGroups')}</option>}
-                  </select>
+                  <SearchableGroupPicker
+                    id="cn-chat-sel"
+                    label={tr('connectors.fFixedChat')}
+                    groups={groupsForBot}
+                    value={form.chatId}
+                    placeholder={tr('connectors.groupPickerPlaceholder')}
+                    searchPlaceholder={tr('connectors.groupSearchPlaceholder')}
+                    emptyLabel={tr('connectors.groupNoMatches')}
+                    selectedCountLabel={count => tr('connectors.groupSelectedCount', { count })}
+                    onChange={chatId => patchForm({ chatId: chatId as string })}
+                  />
                 )}
-                <a
-                  href="#"
-                  onClick={e => { e.preventDefault(); patchForm({ manualChat: !form.manualChat }); }}
-                  style={{ fontSize: 12, display: 'inline-block', marginTop: 4 }}
+                <button
+                  type="button"
+                  className="ghost connector-inline-link"
+                  onClick={() => patchForm({ manualChat: !form.manualChat })}
                 >
                   {form.manualChat ? tr('connectors.chatListLink') : tr('connectors.chatManualLink')}
-                </a>
+                </button>
               </div>
-            </>
-          ) : (
-            <>
-              <label>{tr('connectors.fAllow')}<span className="muted" style={{ fontWeight: 400 }}>{tr('connectors.optional')}</span></label>
-              <div>
-                <select multiple size={4} value={form.allowChats} onChange={e => selectAllowChats(e.currentTarget)} style={{ width: '100%', boxSizing: 'border-box' }}>
-                  {groupsForBot.map(g => <option key={g.chatId} value={g.chatId}>{g.name || g.chatId}</option>)}
-                </select>
-                <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>{tr('connectors.allowHint')}</div>
-              </div>
-            </>
-          )}
+            </div>
+          ) : form.mode === 'dynamic' ? (
+            <div className="cn-field cn-field-wide">
+              <FieldTitle help={tr('connectors.allowHint')}>
+                {tr('connectors.fAllow')}<span className="muted cn-optional">{tr('connectors.optional')}</span>
+              </FieldTitle>
+              <SearchableGroupPicker
+                id="cn-allow-chats"
+                label={tr('connectors.fAllow')}
+                groups={groupsForBot}
+                value={form.allowChats}
+                multiple
+                allLabel={tr('connectors.allowAll')}
+                placeholder={tr('connectors.allowAllHint')}
+                searchPlaceholder={tr('connectors.groupSearchPlaceholder')}
+                emptyLabel={tr('connectors.groupNoMatches')}
+                selectedCountLabel={count => tr('connectors.groupSelectedCount', { count })}
+                onChange={allowChats => patchForm({ allowChats: allowChats as string[] })}
+              />
+            </div>
+          ) : null}
 
           {form.mode === 'dynamic' ? (
-            <div style={{ gridColumn: '1 / -1' }}>
+            <div className="cn-field-wide">
               <div
-                className="muted"
-                style={{ fontSize: 12, lineHeight: 1.7, background: 'var(--bg-soft,#f6f7f9)', padding: '8px 10px', borderRadius: 6 }}
+                className="muted connector-form-hint"
                 dangerouslySetInnerHTML={{ __html: tr('connectors.dynamicHint') }}
               />
             </div>
           ) : null}
 
           {form.mode === 'new-group' ? (
-            <>
-              <label htmlFor="cn-dedup">{tr('connectors.fDedup')}<span className="muted" style={{ fontWeight: 400 }}>{tr('connectors.optional')}</span></label>
-              <div>
-                <input id="cn-dedup" value={form.dedup} onChange={e => patchForm({ dedup: e.currentTarget.value })} placeholder={tr('connectors.fDedupPh')} style={{ width: '100%', boxSizing: 'border-box' }} />
-                <div className="muted" style={{ fontSize: 12, marginTop: 4 }} dangerouslySetInnerHTML={{ __html: tr('connectors.dedupHint') }} />
+            <div className="cn-field cn-field-wide connector-new-group-config">
+              <FieldTitle>{tr('connectors.newGroupStrategy')}</FieldTitle>
+              <div className="connector-strategy-options" role="radiogroup" aria-label={tr('connectors.newGroupStrategy')}>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={!form.deduplicate}
+                  className={`connector-strategy-option${!form.deduplicate ? ' selected' : ''}`}
+                  onClick={() => patchForm({ deduplicate: false })}
+                >
+                  <span className="connector-strategy-radio" aria-hidden="true" />
+                  <span><b>{tr('connectors.newGroupFresh')}</b><small>{tr('connectors.newGroupFreshHint')}</small></span>
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={form.deduplicate}
+                  className={`connector-strategy-option${form.deduplicate ? ' selected' : ''}`}
+                  onClick={() => patchForm({ deduplicate: true })}
+                >
+                  <span className="connector-strategy-radio" aria-hidden="true" />
+                  <span><b>{tr('connectors.newGroupReuse')}</b><small>{tr('connectors.newGroupReuseHint')}</small></span>
+                </button>
               </div>
-            </>
+              {form.deduplicate ? (
+                <label className="connector-dedup-field" htmlFor="cn-dedup">
+                  <FieldTitle help={<span dangerouslySetInnerHTML={{ __html: tr('connectors.dedupHint') }} />}>
+                    {tr('connectors.fDedup')}
+                  </FieldTitle>
+                  <input id="cn-dedup" value={form.dedup} onChange={e => patchForm({ dedup: e.currentTarget.value })} placeholder={tr('connectors.fDedupPh')} />
+                </label>
+              ) : null}
+              <p className="connector-new-group-note">{tr('connectors.newGroupNotice')}</p>
+            </div>
           ) : null}
 
-          <label htmlFor="cn-instruction" style={{ alignSelf: 'start' }}>{tr('connectors.fInstruction')}<span className="muted" style={{ fontWeight: 400 }}>{tr('connectors.optional')}</span></label>
-          <textarea
-            id="cn-instruction"
-            rows={3}
-            value={form.instruction}
-            onChange={e => patchForm({ instruction: e.currentTarget.value })}
-            placeholder={tr('connectors.fInstructionPh')}
-            style={{ width: '100%', boxSizing: 'border-box', fontFamily: 'inherit', fontSize: 13 }}
-          />
+          <label className="cn-field cn-field-wide" htmlFor="cn-instruction">
+            <FieldTitle help={tr('connectors.fInstructionPh')}>
+              {tr('connectors.fInstruction')}<span className="muted cn-optional">{tr('connectors.optional')}</span>
+            </FieldTitle>
+            <textarea
+              id="cn-instruction"
+              rows={3}
+              value={form.instruction}
+              onChange={e => patchForm({ instruction: e.currentTarget.value })}
+              placeholder={tr('connectors.fInstructionPh')}
+            />
+          </label>
 
-          <label htmlFor="cn-verify">{tr('connectors.fVerify')}</label>
-          <select id="cn-verify" value={form.verify} onChange={e => patchForm({ verify: e.currentTarget.value as CreateForm['verify'] })}>
-            <option value="token">{tr('connectors.verifyToken')}</option>
-            <option value="hmac-sha256">{tr('connectors.verifyHmac')}</option>
-          </select>
+          <label className="connector-log-policy cn-field-wide" htmlFor="cn-store-payload">
+            <input id="cn-store-payload" type="checkbox" checked={form.storePayload} onChange={e => patchForm({ storePayload: e.currentTarget.checked })} />
+            <span>
+              <strong>{tr('connectors.storePayload')}</strong>
+              <small>{tr('connectors.storePayloadHint')}</small>
+            </span>
+          </label>
 
-          <label htmlFor="cn-secret">{tr('connectors.fSecret')}</label>
-          <input id="cn-secret" value={form.secret} onChange={e => patchForm({ secret: e.currentTarget.value })} placeholder={tr('connectors.fSecretPh')} />
-        </div>
-        <div style={{ marginTop: 14 }}>
-          <button id="cn-create" type="button" className="primary" disabled={creating} onClick={() => void createConnector()}>{tr('connectors.btnCreate')}</button>
-          {createMsg ? <span className={createMsg.error ? 'err' : 'muted'} style={{ marginLeft: 10, fontSize: 13 }}>{createMsg.text}</span> : null}
-        </div>
-        {created ? <CreatedPanel created={created} groupName={groupName} /> : null}
-      </div>
+          <div className="cn-field">
+            <FieldTitle>{tr('connectors.fVerify')}</FieldTitle>
+            <ConnectorDropdown
+              id="cn-verify"
+              label={tr('connectors.fVerify')}
+              value={form.verify}
+              options={verifyOptions}
+              onChange={verify => patchForm({ verify })}
+            />
+          </div>
 
-      <div className="card">
-        <h2 style={{ marginTop: 0 }}>
-          {tr('connectors.listTitle')} <span className="muted" style={{ fontSize: 13 }}>{connectors.length ? tr('connectors.count', { count: connectors.length }) : ''}</span>
-        </h2>
-        {loading ? <div>{tr('connectors.loading')}</div> : (
-          <ConnectorList
-            connectors={connectors}
-            bots={bots}
-            copiedId={copiedId}
-            editingId={editingId}
-            editInstruction={editInstruction}
-            editMsg={editMsg}
-            groupName={groupName}
-            modeLabel={modeLabel}
-            kindLabel={kindLabel}
-            onCopy={copyConnectorUrl}
-            onEdit={connector => { setEditingId(connector.id); setEditInstruction(connector.promptEnvelope?.instruction || ''); setEditMsg(null); }}
-            onCancelEdit={() => { setEditingId(null); setEditInstruction(''); setEditMsg(null); }}
-            onEditInstruction={setEditInstruction}
-            onSaveInstruction={connector => void saveInstruction(connector)}
-            onToggle={connector => void toggleConnector(connector)}
-            onDelete={connector => void deleteConnector(connector)}
-          />
-        )}
-      </div>
+          <label className="cn-field" htmlFor="cn-secret">
+            <FieldTitle>{tr('connectors.fSecret')}</FieldTitle>
+            <input id="cn-secret" value={form.secret} onChange={e => patchForm({ secret: e.currentTarget.value })} placeholder={tr(editingConnector ? 'connectors.fSecretEditPh' : 'connectors.fSecretPh')} />
+          </label>
+            </div>
+            {createMsg ? <p className={`connector-create-message${createMsg.error ? ' err' : ''}`}>{createMsg.text}</p> : null}
+            </>
+          )}
+              </div>
+              <footer className="connector-modal-actions">
+                <button type="button" disabled={creating} onClick={closeCreateModal}>
+                  {tr('connectors.cancel')}
+                </button>
+                {created ? (
+                  <button type="button" className="primary" onClick={closeCreateModal}>{tr('connectors.close')}</button>
+                ) : (
+                  <button id="cn-create" type="button" className="primary" disabled={creating} onClick={() => void submitConnector()}>
+                    {tr(editingConnector ? 'connectors.btnSave' : 'connectors.btnCreate')}
+                  </button>
+                )}
+              </footer>
+            </article>
+          </dialog>
+
+          <section className="overview-block connector-section connector-list-section">
+            <div className="card connector-list-card">
+            {loading ? <LoadingState className="connector-list-loading" label={tr('connectors.loading')} compact /> : (
+              <ConnectorList
+                connectors={connectors}
+                bots={bots}
+                copiedId={copiedId}
+                editMsg={editMsg}
+                groupName={groupName}
+                modeLabel={modeLabel}
+                kindLabel={kindLabel}
+                onCopy={copyConnectorUrl}
+                onEdit={openEditModal}
+                onToggle={connector => void toggleConnector(connector)}
+                onTogglePayloadLogging={connector => void togglePayloadLogging(connector)}
+                onDelete={connector => void deleteConnector(connector)}
+              />
+              )}
+            </div>
+          </section>
+        </>
+      ) : (
+        <WebhookLogsContent embedded />
+      )}
     </section>
   );
 }
@@ -487,34 +883,34 @@ function CreatedPanel(props: { created: CreatedConnector; groupName(chatId: stri
   const dynamicGroupName = c.exampleChat !== '<chatId>' ? `（${props.groupName(c.exampleChat)}）` : '';
 
   return (
-    <div style={{ marginTop: 12 }}>
-      <div className="card" style={{ padding: '12px 14px', background: 'var(--bg-soft,#f6f7f9)' }}>
-        <p className="ok" style={{ margin: '0 0 6px' }}>
+    <div className="connector-created-wrap">
+      <div className="card connector-created-card">
+        <p className="connector-created-title ok">
           {tr('connectors.createdPrefix', { name: c.name })}
           {c.mode === 'fixed' && c.chatId ? (
-            <span className="muted" style={{ fontWeight: 400, fontSize: 13 }}> · {tr('connectors.createdDest', { name: props.groupName(c.chatId) })}</span>
+            <span className="muted"> · {tr('connectors.createdDest', { name: props.groupName(c.chatId) })}</span>
           ) : null}
         </p>
-        <p style={{ margin: '4px 0', fontSize: 13 }}><span className="muted">{tr('connectors.webhookUrl')}</span><code style={{ wordBreak: 'break-all' }}>{c.url}</code></p>
+        <p className="connector-created-line"><span className="muted">{tr('connectors.webhookUrl')}</span><code>{c.url}</code></p>
         {c.secret ? (
-          <p style={{ margin: '4px 0', fontSize: 13 }}>
+          <p className="connector-created-line">
             <span className="muted">{c.isToken ? tr('connectors.tokenLabel') : tr('connectors.signLabel')}{tr('connectors.secretOnce')}</span><code>{c.secret}</code>
           </p>
         ) : null}
         {c.isToken && c.isDynamic ? (
           <>
-            <p className="muted" style={{ fontSize: 12, margin: '6px 0 0' }}>{tr('connectors.usageDynamicLede', { gn: dynamicGroupName })}</p>
-            <pre style={{ margin: '6px 0 0', fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}><code>{`curl -X POST '${callUrl}' -H 'content-type: application/json' -d '{}'`}</code></pre>
-            <p className="muted" style={{ fontSize: 12, margin: '6px 0 0' }} dangerouslySetInnerHTML={{ __html: tr('connectors.usageDynamicNote') }} />
+            <p className="muted connector-created-help">{tr('connectors.usageDynamicLede', { gn: dynamicGroupName })}</p>
+            <pre><code>{`curl -X POST '${callUrl}' -H 'content-type: application/json' -d '{}'`}</code></pre>
+            <p className="muted connector-created-help" dangerouslySetInnerHTML={{ __html: tr('connectors.usageDynamicNote') }} />
           </>
         ) : c.isToken ? (
           <>
-            <p className="muted" style={{ fontSize: 12, margin: '6px 0 0' }}>{tr('connectors.usageTokenLede')}</p>
-            <pre style={{ margin: '6px 0 0', fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}><code>{`curl -X POST '${callUrl}' -H 'content-type: application/json' -d '{}'`}</code></pre>
-            <p className="muted" style={{ fontSize: 12, margin: '6px 0 0' }} dangerouslySetInnerHTML={{ __html: tr('connectors.usageTokenNote') }} />
+            <p className="muted connector-created-help">{tr('connectors.usageTokenLede')}</p>
+            <pre><code>{`curl -X POST '${callUrl}' -H 'content-type: application/json' -d '{}'`}</code></pre>
+            <p className="muted connector-created-help" dangerouslySetInnerHTML={{ __html: tr('connectors.usageTokenNote') }} />
           </>
         ) : (
-          <p className="muted" style={{ fontSize: 12, margin: '6px 0 0' }} dangerouslySetInnerHTML={{ __html: tr('connectors.usageHmac') + (c.isDynamic ? tr('connectors.usageHmacDynamic') : '') }} />
+          <p className="muted connector-created-help" dangerouslySetInnerHTML={{ __html: tr('connectors.usageHmac') + (c.isDynamic ? tr('connectors.usageHmacDynamic') : '') }} />
         )}
       </div>
     </div>
@@ -525,22 +921,18 @@ function ConnectorList(props: {
   connectors: Connector[];
   bots: BotOpt[];
   copiedId: string | null;
-  editingId: string | null;
-  editInstruction: string;
   editMsg: { id: string; text: string; error?: boolean } | null;
   groupName(chatId: string): string;
   modeLabel(mode: string): string;
   kindLabel(kind: string): string;
   onCopy(connector: Connector): void;
   onEdit(connector: Connector): void;
-  onCancelEdit(): void;
-  onEditInstruction(value: string): void;
-  onSaveInstruction(connector: Connector): void;
   onToggle(connector: Connector): void;
+  onTogglePayloadLogging(connector: Connector): void;
   onDelete(connector: Connector): void;
 }) {
   const tr = useT();
-  if (!props.connectors.length) return <p className="muted">{tr('connectors.empty')}</p>;
+  if (!props.connectors.length) return <p className="muted connector-list-empty">{tr('connectors.empty')}</p>;
 
   return (
     <>
@@ -549,48 +941,42 @@ function ConnectorList(props: {
         const url = webhookUrl(c.id);
         const isToken = (c.verify?.type ?? 'token') === 'token';
         const verifyBadge = isToken ? tr('connectors.badgeToken') : tr('connectors.badgeSign');
-        const destLabel = c.target.mode === 'fixed' && c.target.chatId
-          ? ` · ${tr('connectors.dest', { name: props.groupName(c.target.chatId) })}`
-          : '';
-        const editing = props.editingId === c.id;
+        const destLabel = c.target.mode === 'fixed' && c.target.chatId ? tr('connectors.dest', { name: props.groupName(c.target.chatId) }) : '';
         const editMsg = props.editMsg?.id === c.id ? props.editMsg : null;
+        const copied = props.copiedId === c.id;
         return (
-          <div key={c.id} className="card" style={{ margin: '0 0 10px', padding: '12px 14px', background: 'var(--bg-soft,#f6f7f9)' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-              <b style={{ fontSize: 15 }}>{c.name}</b>
-              <span className={c.enabled ? 'ok' : 'muted'} style={{ fontSize: 12 }}>{c.enabled ? tr('connectors.enabled') : tr('connectors.disabled')}</span>
-              <span className="muted" style={{ fontSize: 12 }}>· {bot?.botName || c.target.botId} · {props.kindLabel(c.target.kind)} · {props.modeLabel(c.target.mode)}{destLabel} · {verifyBadge}</span>
-              <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
-                <button className="ghost" type="button" style={{ fontSize: 12 }} onClick={() => props.onEdit(c)}>{tr('connectors.btnEdit')}</button>
-                <button className="ghost" type="button" style={{ fontSize: 12 }} onClick={() => props.onToggle(c)}>{c.enabled ? tr('connectors.btnDisable') : tr('connectors.btnEnable')}</button>
-                <button className="ghost" type="button" style={{ fontSize: 12 }} onClick={() => props.onDelete(c)}>{tr('connectors.btnDel')}</button>
-              </span>
-            </div>
-            <div style={{ marginTop: 6, fontSize: 13, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-              <span className="muted">{tr('connectors.webhookUrl')}</span>
-              <code style={{ fontSize: 12, wordBreak: 'break-all' }}>{url}{isToken ? '/<token>' : ''}</code>
-              <button className="ghost" type="button" style={{ fontSize: 12 }} onClick={() => props.onCopy(c)}>{props.copiedId === c.id ? tr('connectors.copied') : tr('connectors.copy')}</button>
-            </div>
-            {isToken ? <div className="muted" style={{ fontSize: 12, marginTop: 4 }} dangerouslySetInnerHTML={{ __html: tr('connectors.tokenHint') }} /> : null}
-            {c.target.mode === 'dynamic' ? <div className="muted" style={{ fontSize: 12, marginTop: 4 }} dangerouslySetInnerHTML={{ __html: tr('connectors.dynamicReqHint') }} /> : null}
-            {c.promptEnvelope?.instruction ? <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>{tr('connectors.instructionPrefix')}{c.promptEnvelope.instruction}</div> : null}
-            {editing ? (
-              <div className="cn-edit-box" style={{ marginTop: 8 }}>
-                <textarea
-                  className="cn-edit-instruction"
-                  rows={3}
-                  value={props.editInstruction}
-                  onChange={e => props.onEditInstruction(e.currentTarget.value)}
-                  style={{ width: '100%', boxSizing: 'border-box', fontFamily: 'inherit', fontSize: 13 }}
-                  placeholder={tr('connectors.fInstructionPh')}
-                />
-                <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                  <button className="primary" type="button" style={{ fontSize: 12 }} onClick={() => props.onSaveInstruction(c)}>{tr('connectors.btnSave')}</button>
-                  <button className="ghost" type="button" style={{ fontSize: 12 }} onClick={props.onCancelEdit}>{tr('connectors.btnCancel')}</button>
-                  {editMsg ? <span className={editMsg.error ? 'err' : 'muted'} style={{ fontSize: 12 }}>{editMsg.text}</span> : null}
+          <div key={c.id} className="card connector-item-card">
+            <div className="connector-item-head">
+              <div className="connector-item-main">
+                <div className="connector-item-title">
+                  <b>{c.name}</b>
+                  <span className={c.enabled ? 'connector-status-pill ok' : 'connector-status-pill muted'}>{c.enabled ? tr('connectors.enabled') : tr('connectors.disabled')}</span>
+                </div>
+                <div className="connector-item-meta">
+                  <span>{bot?.botName || c.target.botId}</span>
+                  <span>{props.kindLabel(c.target.kind)}</span>
+                  <span>{props.modeLabel(c.target.mode)}</span>
+                  {destLabel ? <span>{destLabel}</span> : null}
+                  <span>{verifyBadge}</span>
+                  <span>{c.loggingPolicy?.storePayload !== false ? tr('connectors.payloadLogged', { days: c.loggingPolicy?.retentionDays ?? 14 }) : tr('connectors.metadataOnly')}</span>
                 </div>
               </div>
-            ) : null}
+              <button className={`ghost connector-copy-button${copied ? ' copied' : ''}`} type="button" onClick={() => props.onCopy(c)}>{copied ? tr('connectors.copied') : tr('connectors.copy')}</button>
+            </div>
+            <div className="connector-url-row">
+              <span className="muted">{tr('connectors.webhookUrl')}</span>
+              <code>{url}{isToken ? '/<token>' : ''}</code>
+            </div>
+            {isToken ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.tokenHint') }} /> : null}
+            {c.target.mode === 'dynamic' ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.dynamicReqHint') }} /> : null}
+            {c.promptEnvelope?.instruction ? <div className="muted connector-item-note">{tr('connectors.instructionPrefix')}{c.promptEnvelope.instruction}</div> : null}
+            {editMsg ? <div className={editMsg.error ? 'err connector-item-note' : 'muted connector-item-note'}>{editMsg.text}</div> : null}
+            <div className="connector-item-actions">
+              <button className="ghost" type="button" onClick={() => props.onEdit(c)}>{tr('connectors.btnEdit')}</button>
+              <button className="ghost" type="button" onClick={() => props.onTogglePayloadLogging(c)}>{c.loggingPolicy?.storePayload !== false ? tr('connectors.btnDisablePayloadLog') : tr('connectors.btnEnablePayloadLog')}</button>
+              <button className="ghost" type="button" onClick={() => props.onToggle(c)}>{c.enabled ? tr('connectors.btnDisable') : tr('connectors.btnEnable')}</button>
+              <button className="ghost" type="button" onClick={() => props.onDelete(c)}>{tr('connectors.btnDel')}</button>
+            </div>
           </div>
         );
       })}
@@ -599,5 +985,9 @@ function ConnectorList(props: {
 }
 
 export function renderConnectorsPage(root: HTMLElement): PageDisposer {
-  return mountReactPage(root, <ConnectorsPage />);
+  return mountReactPage(root, <ConnectorsPage tab="webhooks" />);
+}
+
+export function renderConnectorsLogsPage(root: HTMLElement): PageDisposer {
+  return mountReactPage(root, <ConnectorsPage tab="logs" />);
 }

@@ -5,13 +5,13 @@ import {
   DEFAULT_BOARD_ORDER,
   normalizeBoardOrder,
   normalizeSessionsViewMode,
-  normalizeSidebarMode,
   normalizeSkin,
   normalizeThemeMode,
   readStoredSessionsViewMode,
-  readStoredSidebarMode,
+  readStoredSessionsShowUnknownChats,
   readStoredSkin,
   resolveThemeMode,
+  writeStoredSessionsShowUnknownChats,
 } from '../src/dashboard/web/preferences.js';
 
 describe('dashboard locale preferences', () => {
@@ -49,7 +49,9 @@ describe('dashboard skin preferences', () => {
   it('normalizes skin ids', () => {
     expect(normalizeSkin('default')).toBe('default');
     expect(normalizeSkin('cyber')).toBe('cyber');
+    expect(normalizeSkin('fallout')).toBe('fallout');
     expect(normalizeSkin('2077')).toBeNull();
+    expect(normalizeSkin('genshin')).toBeNull();
     expect(normalizeSkin(undefined)).toBeNull();
   });
 
@@ -60,6 +62,7 @@ describe('dashboard skin preferences', () => {
     expect(readStoredSkin(make(null))).toBe('default');
     expect(readStoredSkin(make('nope'))).toBe('default');
     expect(readStoredSkin(make('cyber'))).toBe('cyber');
+    expect(readStoredSkin(make('fallout'))).toBe('fallout');
   });
 });
 
@@ -82,21 +85,28 @@ describe('sessions view mode preference', () => {
   });
 });
 
-describe('sidebar mode preference', () => {
-  it('accepts expanded/collapsed and rejects junk', () => {
-    expect(normalizeSidebarMode('expanded')).toBe('expanded');
-    expect(normalizeSidebarMode('collapsed')).toBe('collapsed');
-    expect(normalizeSidebarMode('hidden')).toBeNull();
-    expect(normalizeSidebarMode(undefined)).toBeNull();
-  });
-
-  it('falls back to expanded for missing/invalid storage', () => {
+describe('sessions unknown chat preference', () => {
+  it('is enabled by default and disabled only by the explicit 0 value', () => {
     const make = (value: string | null): Storage =>
       ({ getItem: () => value }) as unknown as Storage;
-    expect(readStoredSidebarMode(undefined)).toBe('expanded');
-    expect(readStoredSidebarMode(make(null))).toBe('expanded');
-    expect(readStoredSidebarMode(make('nope'))).toBe('expanded');
-    expect(readStoredSidebarMode(make('collapsed'))).toBe('collapsed');
+
+    expect(readStoredSessionsShowUnknownChats(undefined)).toBe(true);
+    expect(readStoredSessionsShowUnknownChats(make(null))).toBe(true);
+    expect(readStoredSessionsShowUnknownChats(make('0'))).toBe(false);
+    expect(readStoredSessionsShowUnknownChats(make('1'))).toBe(true);
+  });
+
+  it('persists the toggle as a localStorage boolean flag', () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    } as unknown as Storage;
+
+    writeStoredSessionsShowUnknownChats(storage, true);
+    expect(readStoredSessionsShowUnknownChats(storage)).toBe(true);
+    writeStoredSessionsShowUnknownChats(storage, false);
+    expect(readStoredSessionsShowUnknownChats(storage)).toBe(false);
   });
 });
 

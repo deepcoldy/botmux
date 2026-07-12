@@ -180,12 +180,11 @@ export interface CliAdapter {
     /** 待写入的配置文件路径（~ 由 installer 展开）。 */
     readonly configPath: string;
     /** 写入格式：决定 installer 如何合并进既有配置。 */
-    readonly format: 'claude-settings' | 'opencode-plugin';
-    /** 可选（仅 claude-settings）：同时把 SessionStart「真就绪」hook 命令写进**全局**
-     *  settings.json。进程级 --settings 也带一份（见 buildArgs），二者幂等（worker 的
-     *  session_ready 处理对重复触发 no-op）。装全局是为了 wrapperCli=`aiden x claude`
-     *  这类会剥掉 --settings 的启动器——它们拿不到进程级 hook，只能靠全局这条拿就绪信号，
-     *  否则首条 prompt 会空等 45s 超时。命令缺 BOTMUX_* env 时静默 exit 0，不扰独立 claude。 */
+    readonly format: 'claude-settings' | 'opencode-plugin' | 'grok-hooks';
+    /** 可选：SessionStart「真就绪」hook 命令。
+     *  - claude-settings：写进全局 settings.json（兼进程级 --settings）
+     *  - grok-hooks：写进 `~/.grok/hooks/*.json` 的 SessionStart
+     *  命令缺 BOTMUX_* env 时静默 exit 0，不扰独立 CLI。 */
     readonly sessionStartCommand?: string;
   };
 
@@ -217,13 +216,15 @@ export interface CliAdapter {
    *  Examples: CoCo `⏵⏵` status bar, Codex `›` prompt indicator. */
   readonly readyPattern?: RegExp;
 
-  /** Claude-family CLIs only. When true, the adapter injects a `SessionStart`
-   *  hook at spawn (process-level `--settings`) that calls `botmux session-ready`
-   *  once the CLI's input box is genuinely rendered. The worker arms a ready-gate
-   *  on this flag and holds the FIRST prompt until the signal arrives (or a
-   *  fallback timeout), so a startup launcher's selector `❯` — which falsely
-   *  matches `readyPattern` — can't trip an early flush that the selector eats.
-   *  undefined/false → no gate (every other CLI behaves exactly as before). */
+  /** When true, the adapter injects a `SessionStart` hook that calls
+   *  `botmux session-ready` once the CLI's input box is genuinely rendered —
+   *  Claude-family via process-level `--settings`, Grok via its global
+   *  `hooks/*.json` (see `hookInstall.format: 'grok-hooks'`). The worker arms
+   *  a ready-gate on this flag and holds the FIRST prompt until the signal
+   *  arrives (or a fallback timeout), so a startup launcher's selector `❯` —
+   *  which falsely matches `readyPattern` — can't trip an early flush that
+   *  the selector eats. undefined/false → no gate (every other CLI behaves
+   *  exactly as before). */
   readonly injectsReadyHook?: boolean;
 
   /** CLI-specific system hints injected into the initial prompt.
@@ -231,8 +232,9 @@ export interface CliAdapter {
   readonly systemHints: string[];
 
   /** When true, the adapter injects Lark session context (instructions +
-   *  session ID) via CLI flags (e.g. --append-system-prompt).  The session
-   *  manager skips appending "Session ID: ..." to every user message. */
+   *  session ID) via CLI flags (Claude/genius: --append-system-prompt;
+   *  Grok: --rules).  The session manager skips the inline <botmux_routing>
+   *  / <identity> / <session_id> envelope on user messages. */
   readonly injectsSessionContext?: boolean;
 
   /** When true, the CLI accepts input while busy (type-ahead). Worker writes
@@ -380,4 +382,4 @@ export interface CliAdapter {
   readonly defaultPassthroughCommands?: readonly string[];
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'kimi';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'kimi' | 'grok';

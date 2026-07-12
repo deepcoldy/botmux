@@ -3,7 +3,7 @@
  * capability into a 3-section card DTO (access / cards / maintenance).
  *
  * Zero IO. Type-only imports. The input shape mirrors
- * `src/dashboard/web/settings.ts:6-11` but is redeclared locally so the model
+ * `src/dashboard/web/settings-page.tsx` but is redeclared locally so the model
  * does not pull in browser-side jsdom assets.
  */
 
@@ -27,6 +27,8 @@ export interface DashboardSettingsInput {
   openTerminalInFeishu: boolean;
   maintenance: MaintenanceCfgInput;
   localDevInstall: boolean;
+  /** Defaults to supported when absent for older dashboard payloads. */
+  autoUpdateSupported?: boolean;
 }
 
 /** Optional viewer context — `canWrite=false` greys every toggle and surfaces a top-level hint. */
@@ -74,9 +76,9 @@ export interface SettingsCardDTO {
   readOnlyHintKey?: string;
 }
 
-/** Auto-update is unavailable when running from a local-dev install (cannot self-update). */
+/** Auto-update requires a published install owned by a supported package manager. */
 export function shouldDisableAutoUpdate(settings: DashboardSettingsInput): boolean {
-  return settings.localDevInstall === true;
+  return settings.localDevInstall === true || settings.autoUpdateSupported === false;
 }
 
 /** Auto-restart depends on auto-update being explicitly enabled. */
@@ -135,7 +137,11 @@ export function composeSections(
 
   // Per-toggle disabled reasons stay specific so the card can tell users what
   // dependency must change before a control becomes writable.
-  const autoUpdateReasonKey = autoUpdateBlocked ? 'settings.autoUpdate.disabled.localDev' : undefined;
+  const autoUpdateReasonKey = settings.localDevInstall
+    ? 'settings.autoUpdate.disabled.localDev'
+    : settings.autoUpdateSupported === false
+      ? 'settings.autoUpdate.disabled.unsupportedInstall'
+      : undefined;
   const autoRestartReasonKey = autoRestartBlocked ? 'settings.autoRestart.disabled.needsAutoUpdate' : undefined;
 
   const maintenanceSection: SettingsSectionDTO = {
@@ -161,7 +167,11 @@ export function composeSections(
         state: { enabled: autoRestartEnabledUi, reasonKey: autoRestartReasonKey },
       },
     ],
-    hintKey: autoUpdateBlocked ? 'settings.autoUpdateLocalDev' : undefined,
+    hintKey: settings.localDevInstall
+      ? 'settings.autoUpdateLocalDev'
+      : settings.autoUpdateSupported === false
+        ? 'settings.autoUpdateUnsupportedInstall'
+        : undefined,
   };
 
   return {

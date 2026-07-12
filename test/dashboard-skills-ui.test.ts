@@ -1,11 +1,14 @@
+import { readFileSync } from 'node:fs';
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { BotPolicyCard, SkillsInstallPanel } from '../src/dashboard/web/skills-page.js';
 
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
 describe('dashboard skills React hook safety', () => {
   it('keeps hook order stable when the same bot card flips between error and normal states', () => {
-    const onUpdate = vi.fn();
+    const onSave = vi.fn();
     const normalBot = { larkAppId: 'app-a', botName: 'Codex Bot', skills: { include: ['skill:deploy'] } };
     const errorBot = { larkAppId: 'app-a', botName: 'Codex Bot', error: 'daemon offline', skills: null };
     const skills = [{ name: 'deploy' }, { name: 'review' }];
@@ -19,7 +22,7 @@ describe('dashboard skills React hook safety', () => {
           skills,
           status: null,
           busyKey: null,
-          onUpdate,
+          onSave,
         }));
       });
       act(() => {
@@ -29,7 +32,7 @@ describe('dashboard skills React hook safety', () => {
           skills,
           status: null,
           busyKey: null,
-          onUpdate,
+          onSave,
         }));
       });
       act(() => {
@@ -39,29 +42,81 @@ describe('dashboard skills React hook safety', () => {
           skills,
           status: null,
           busyKey: null,
-          onUpdate,
+          onSave,
         }));
       });
     }).not.toThrow();
 
     expect(renderer.toJSON()).toMatchObject({ props: { 'data-appid': 'app-a' } });
   });
+
+  it('uses one compact searchable multi-select and saves the complete priority selection', async () => {
+    const onSave = vi.fn(async () => undefined);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotPolicyCard, {
+        bot: { larkAppId: 'app-a', botName: 'Codex Bot', skills: { include: ['skill:deploy'] } },
+        installedNames: new Set(['deploy', 'review', 'release']),
+        skills: [
+          { name: 'deploy', description: 'Deploy services' },
+          { name: 'release', description: 'Publish releases' },
+          { name: 'review', description: 'Review code' },
+        ],
+        status: null,
+        busyKey: null,
+        onSave,
+      }));
+    });
+
+    const root = renderer.root;
+    expect(root.findAllByProps({ className: 'skills-chip-list' })).toHaveLength(0);
+    expect(root.findAllByType('code')).toHaveLength(0);
+    act(() => root.findByProps({ 'data-action': 'open-skill-picker' }).props.onClick());
+    expect(root.findAllByProps({ role: 'option' })).toHaveLength(3);
+
+    act(() => root.findByProps({ 'data-action': 'search-skills' }).props.onChange({ currentTarget: { value: 'review' } }));
+    const filtered = root.findAllByProps({ role: 'option' });
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].props['data-skill-name']).toBe('review');
+    act(() => filtered[0].props.onClick());
+
+    await act(async () => root.findByProps({ 'data-action': 'save-skill-selection' }).props.onClick());
+    expect(onSave).toHaveBeenCalledWith('app-a', ['deploy', 'review']);
+  });
+
+  it('constrains every bot card child to the card grid column', () => {
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    expect(css).toMatch(/\.skills-bot-card\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s);
+    expect(css).toMatch(/\.skills-policy-panel\s*\{[^}]*min-width:\s*0/s);
+    expect(css).toMatch(/\.skills-bot-head\s*\{[^}]*min-width:\s*0/s);
+    expect(css).toMatch(/\.skills-multi-picker\s*\{[^}]*min-width:\s*0/s);
+  });
 });
 
 describe('dashboard skills install panel', () => {
+  function renderInstallPanel(props: Partial<React.ComponentProps<typeof SkillsInstallPanel>> = {}): TestRenderer.ReactTestRenderer {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(SkillsInstallPanel, {
+        installSource: '',
+        installPath: '',
+        installRef: '',
+        installStatus: null,
+        installBusy: false,
+        onInstallSourceChange: vi.fn(),
+        onInstallPathChange: vi.fn(),
+        onInstallRefChange: vi.fn(),
+        onInstall: vi.fn(),
+        onOpenNativeDiscovery: vi.fn(),
+        ...props,
+      }));
+    });
+    return renderer;
+  }
+
   it('separates remote source scanning from local native skill discovery', () => {
-    const renderer = TestRenderer.create(React.createElement(SkillsInstallPanel, {
-      installSource: '',
-      installPath: '',
-      installRef: '',
-      installStatus: null,
-      installBusy: false,
-      onInstallSourceChange: vi.fn(),
-      onInstallPathChange: vi.fn(),
-      onInstallRefChange: vi.fn(),
-      onInstall: vi.fn(),
-      onOpenNativeDiscovery: vi.fn(),
-    }));
+    const renderer = renderInstallPanel();
     const root = renderer.root;
 
     const sourceControl = root.findByProps({ className: 'skills-source-control' });
@@ -69,53 +124,39 @@ describe('dashboard skills install panel', () => {
     expect(root.findAllByProps({ 'data-action': 'scan-source-skills' })).toHaveLength(0);
     expect(root.findAllByProps({ 'data-action': 'open-native-skill-discovery' })).toHaveLength(1);
     expect(root.findAllByProps({ 'data-action': 'install' })).toHaveLength(1);
-    expect(root.findByProps({ 'data-skills-advanced': true }).props.open).toBe(false);
+    expect(root.findAllByProps({ 'data-install': 'path' })).toHaveLength(1);
+    expect(root.findAllByProps({ 'data-install': 'ref' })).toHaveLength(1);
   });
 
-  it('places install action beside the advanced options toggle', () => {
-    const renderer = TestRenderer.create(React.createElement(SkillsInstallPanel, {
-      installSource: '',
-      installPath: '',
-      installRef: '',
-      installStatus: null,
-      installBusy: false,
-      onInstallSourceChange: vi.fn(),
-      onInstallPathChange: vi.fn(),
-      onInstallRefChange: vi.fn(),
-      onInstall: vi.fn(),
-      onOpenNativeDiscovery: vi.fn(),
-    }));
+  it('keeps advanced install fields visible beside the install action', () => {
+    const renderer = renderInstallPanel();
     const root = renderer.root;
-    const actionRow = root.findByProps({ className: 'skills-install-action-row' });
+    const installGrid = root.findByProps({ className: 'skills-install-grid' });
+    const path = installGrid.findByProps({ 'data-install': 'path' });
+    const ref = installGrid.findByProps({ 'data-install': 'ref' });
+    const install = installGrid.findByProps({ 'data-action': 'install' });
 
-    expect(actionRow.findAllByProps({ 'data-skills-advanced': true })).toHaveLength(1);
-    expect(actionRow.findAllByProps({ className: 'skills-advanced-marker' })).toHaveLength(1);
-    expect(actionRow.findAllByProps({ 'data-action': 'install' })).toHaveLength(1);
+    expect(installGrid.findAllByProps({ 'data-skills-advanced': true })).toHaveLength(0);
+    expect(installGrid.findAllByProps({ className: 'skills-advanced-marker' })).toHaveLength(0);
+    expect(path.parent?.parent).toBe(installGrid);
+    expect(ref.parent?.parent).toBe(installGrid);
+    expect(install.parent?.parent).toBe(installGrid);
   });
 
   it('keeps multi-skill install selection inside the install confirmation dialog', () => {
-    const renderer = TestRenderer.create(React.createElement(SkillsInstallPanel, {
+    const renderer = renderInstallPanel({
       installSource: 'https://github.com/acme/skills',
-      installPath: '',
-      installRef: '',
-      installStatus: null,
-      installBusy: false,
       installSelectionOpen: true,
       installCandidates: [
         { name: 'deploy', path: 'skills/deploy', description: 'Deploy services' },
         { name: 'review', path: 'skills/review', description: 'Review code' },
       ],
       selectedInstallSkills: new Set(['deploy', 'review']),
-      onInstallSourceChange: vi.fn(),
-      onInstallPathChange: vi.fn(),
-      onInstallRefChange: vi.fn(),
       onToggleInstallSkill: vi.fn(),
       onSelectAllInstallSkills: vi.fn(),
       onConfirmInstallSelection: vi.fn(),
       onCloseInstallSelection: vi.fn(),
-      onInstall: vi.fn(),
-      onOpenNativeDiscovery: vi.fn(),
-    }));
+    });
     const root = renderer.root;
 
     expect(root.findAllByProps({ 'data-action': 'scan-source-skills' })).toHaveLength(0);

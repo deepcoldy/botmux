@@ -87,7 +87,8 @@ describe('recordSessionUsage', () => {
     });
 
     expect(rec).toMatchObject({
-      v: 1,
+      v: 2,
+      inputTokenSemantics: 'uncached',
       larkAppId: 'cli_app',
       sessionId: 'sess-1',
       cliId: 'claude-code',
@@ -261,6 +262,287 @@ describe('recordSessionUsage', () => {
     const rec = recordSessionUsage({ ...baseArgs({ larkAppId: 'cli_a' }), ledgerDir: dir, usage: cumulative(150, 12) });
     expect(rec).toMatchObject({ inputTokens: 50, outputTokens: 2 });
   });
+
+  it('migrates a legacy Codex includes_cache state baseline without treating the first v2 snapshot as shrink', () => {
+    writeFileSync(join(dir, 'state-cli_app.json'), JSON.stringify({
+      v: 1,
+      sessions: {
+        'sess-1': {
+          inputTokens: 150,
+          outputTokens: 30,
+          cacheReadTokens: 60,
+          cacheCreateTokens: 0,
+          recordedAt: '2026-06-10T11:00:00.000Z',
+          epoch: 0,
+        },
+      },
+    }));
+
+    expect(recordSessionUsage({
+      ...baseArgs({ cliId: 'codex' }),
+      ledgerDir: dir,
+      usage: cumulative(90, 30, 60),
+    })).toBeNull();
+
+    const rec = recordSessionUsage({
+      ...baseArgs({ cliId: 'codex', now: new Date('2026-06-10T12:05:00Z') }),
+      ledgerDir: dir,
+      usage: cumulative(120, 40, 80),
+    });
+    expect(rec).toMatchObject({
+      v: 2,
+      inputTokenSemantics: 'uncached',
+      epoch: 0,
+      inputTokens: 30,
+      outputTokens: 10,
+      cacheReadTokens: 20,
+    });
+  });
+
+  it('migrates a legacy TraeX includes_cache ledger baseline before crash recovery diffing', () => {
+    writeFileSync(join(dir, 'usage-2026-06-10.jsonl'), JSON.stringify({
+      v: 1,
+      recordId: 'legacy-traex-record',
+      ts: '2026-06-10T11:00:00.000Z',
+      epoch: 0,
+      sessionId: 'sess-1',
+      cliId: 'traex',
+      totalInputTokens: 150,
+      totalOutputTokens: 30,
+      totalCacheReadTokens: 60,
+      totalCacheCreateTokens: 0,
+    }) + '\n');
+
+    const rec = recordSessionUsage({
+      ...baseArgs({ cliId: 'traex' }),
+      ledgerDir: dir,
+      usage: cumulative(120, 40, 80),
+    });
+    expect(rec).toMatchObject({
+      epoch: 0,
+      inputTokens: 30,
+      outputTokens: 10,
+      cacheReadTokens: 20,
+    });
+  });
+
+  it('migrates a legacy Aiden includes_cache state baseline without treating the first v2 snapshot as shrink', () => {
+    writeFileSync(join(dir, 'state-cli_app.json'), JSON.stringify({
+      v: 1,
+      sessions: {
+        'sess-1': {
+          inputTokens: 150,
+          outputTokens: 30,
+          cacheReadTokens: 60,
+          cacheCreateTokens: 0,
+          recordedAt: '2026-06-10T11:00:00.000Z',
+          epoch: 0,
+        },
+      },
+    }));
+
+    expect(recordSessionUsage({
+      ...baseArgs({ cliId: 'aiden' }),
+      ledgerDir: dir,
+      usage: cumulative(90, 30, 60),
+    })).toBeNull();
+
+    const rec = recordSessionUsage({
+      ...baseArgs({ cliId: 'aiden', now: new Date('2026-06-10T12:05:00Z') }),
+      ledgerDir: dir,
+      usage: cumulative(120, 40, 80),
+    });
+    expect(rec).toMatchObject({
+      v: 2,
+      inputTokenSemantics: 'uncached',
+      epoch: 0,
+      inputTokens: 30,
+      outputTokens: 10,
+      cacheReadTokens: 20,
+    });
+  });
+
+  it('migrates a legacy Aiden includes_cache ledger baseline before crash recovery diffing', () => {
+    writeFileSync(join(dir, 'usage-2026-06-10.jsonl'), JSON.stringify({
+      v: 1,
+      recordId: 'legacy-aiden-record',
+      ts: '2026-06-10T11:00:00.000Z',
+      epoch: 0,
+      sessionId: 'sess-1',
+      cliId: 'aiden',
+      totalInputTokens: 150,
+      totalOutputTokens: 30,
+      totalCacheReadTokens: 60,
+      totalCacheCreateTokens: 0,
+    }) + '\n');
+
+    const rec = recordSessionUsage({
+      ...baseArgs({ cliId: 'aiden' }),
+      ledgerDir: dir,
+      usage: cumulative(120, 40, 80),
+    });
+    expect(rec).toMatchObject({
+      epoch: 0,
+      inputTokens: 30,
+      outputTokens: 10,
+      cacheReadTokens: 20,
+    });
+  });
+
+  it('does not subtract cache twice from explicitly uncached Codex or Aiden baselines', () => {
+    for (const cliId of ['codex', 'aiden']) {
+      const sessionId = `sess-${cliId}`;
+      writeFileSync(join(dir, 'state-cli_app.json'), JSON.stringify({
+        v: 2,
+        sessions: {
+          [sessionId]: {
+            inputTokens: 90,
+            outputTokens: 30,
+            cacheReadTokens: 60,
+            cacheCreateTokens: 0,
+            inputTokenSemantics: 'uncached',
+            recordedAt: '2026-06-10T11:00:00.000Z',
+            epoch: 0,
+          },
+        },
+      }));
+
+      const rec = recordSessionUsage({
+        ...baseArgs({ cliId, sessionId }),
+        ledgerDir: dir,
+        usage: cumulative(120, 40, 80),
+      });
+      expect(rec).toMatchObject({ inputTokens: 30, outputTokens: 10, cacheReadTokens: 20 });
+    }
+  });
+
+  it.each(['state', 'ledger'])('does not apply legacy cache subtraction to an unknown explicit semantics in %s', (source) => {
+    const baseline = {
+      inputTokens: 90,
+      outputTokens: 30,
+      cacheReadTokens: 60,
+      cacheCreateTokens: 0,
+      inputTokenSemantics: 'future_contract',
+      recordedAt: '2026-06-10T11:00:00.000Z',
+      epoch: 0,
+    };
+    if (source === 'state') {
+      writeFileSync(join(dir, 'state-cli_app.json'), JSON.stringify({
+        v: 2,
+        sessions: { 'sess-1': baseline },
+      }));
+    } else {
+      writeFileSync(join(dir, 'usage-2026-06-10.jsonl'), JSON.stringify({
+        v: 2,
+        recordId: 'unknown-semantics-record',
+        ts: baseline.recordedAt,
+        sessionId: 'sess-1',
+        cliId: 'codex',
+        totalInputTokens: baseline.inputTokens,
+        totalOutputTokens: baseline.outputTokens,
+        totalCacheReadTokens: baseline.cacheReadTokens,
+        totalCacheCreateTokens: baseline.cacheCreateTokens,
+        inputTokenSemantics: baseline.inputTokenSemantics,
+        epoch: baseline.epoch,
+      }) + '\n');
+    }
+
+    const rec = recordSessionUsage({
+      ...baseArgs({ cliId: 'codex' }),
+      ledgerDir: dir,
+      usage: cumulative(120, 40, 80),
+    });
+    expect(rec).toMatchObject({
+      inputTokens: 30,
+      outputTokens: 10,
+      cacheReadTokens: 20,
+    });
+  });
+
+  it('normalizes an explicit includes_cache baseline even without a Codex CLI hint', () => {
+    writeFileSync(join(dir, 'state-cli_app.json'), JSON.stringify({
+      v: 2,
+      sessions: {
+        'sess-1': {
+          inputTokens: 50,
+          outputTokens: 10,
+          cacheReadTokens: 45,
+          cacheCreateTokens: 20,
+          inputTokenSemantics: 'includes_cache',
+          recordedAt: '2026-06-10T11:00:00.000Z',
+          epoch: 0,
+        },
+      },
+    }));
+
+    const rec = recordSessionUsage({
+      ...baseArgs({ cliId: 'claude-code' }),
+      ledgerDir: dir,
+      usage: cumulative(10, 20, 50, 5),
+    });
+    expect(rec).toMatchObject({
+      inputTokens: 10,
+      outputTokens: 10,
+      cacheReadTokens: 5,
+      cacheCreateTokens: 0,
+    });
+  });
+
+  it('keeps legacy Claude baselines unchanged because their input was already uncached', () => {
+    writeFileSync(join(dir, 'state-cli_app.json'), JSON.stringify({
+      v: 1,
+      sessions: {
+        'sess-1': {
+          inputTokens: 100,
+          outputTokens: 10,
+          cacheReadTokens: 20,
+          cacheCreateTokens: 5,
+          recordedAt: '2026-06-10T11:00:00.000Z',
+          epoch: 0,
+        },
+      },
+    }));
+
+    const rec = recordSessionUsage({
+      ...baseArgs({ cliId: 'claude-code' }),
+      ledgerDir: dir,
+      usage: cumulative(130, 20, 30, 7),
+    });
+    expect(rec).toMatchObject({ inputTokens: 30, outputTokens: 10, cacheReadTokens: 10, cacheCreateTokens: 2 });
+  });
+
+  it('recovers from a v2 uncached ledger record without replaying the same transition', () => {
+    const legacyState = JSON.stringify({
+      v: 1,
+      sessions: {
+        'sess-1': {
+          inputTokens: 150,
+          outputTokens: 30,
+          cacheReadTokens: 60,
+          cacheCreateTokens: 0,
+          recordedAt: '2026-06-10T11:00:00.000Z',
+          epoch: 0,
+        },
+      },
+    });
+    const stateFile = join(dir, 'state-cli_app.json');
+    writeFileSync(stateFile, legacyState);
+
+    const usage = cumulative(120, 40, 80);
+    const first = recordSessionUsage({ ...baseArgs({ cliId: 'codex' }), ledgerDir: dir, usage });
+    expect(first).not.toBeNull();
+
+    // Simulate append success followed by a lost state advance and process crash.
+    writeFileSync(stateFile, legacyState);
+    __resetUsageLedgerMemoryForTest();
+    expect(recordSessionUsage({
+      ...baseArgs({ cliId: 'codex', now: new Date('2026-06-10T12:05:00Z') }),
+      ledgerDir: dir,
+      usage,
+    })).toBeNull();
+    expect(ledgerLines(dir)).toHaveLength(1);
+    expect(ledgerLines(dir)[0].recordId).toBe(first!.recordId);
+  });
 });
 
 describe('anchorSessionUsage', () => {
@@ -402,7 +684,8 @@ describe('ownership records', () => {
     });
 
     expect(rec).toMatchObject({
-      v: 1,
+      v: 2,
+      inputTokenSemantics: 'uncached',
       kind: 'ownership',
       sessionId: 'sess-1',
       cliSessionId: 'cli-sess-1',

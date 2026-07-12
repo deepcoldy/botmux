@@ -18,11 +18,22 @@ const SHIM = '/root/.botmux/bin/botmux';
 const SHIM_BODY = '#!/bin/sh\nexec node "/root/iserver/botmux/dist/cli.js" "$@"\n';
 const NPM_BIN = '/root/.local/share/fnm/node-versions/v22/installation/bin/botmux';
 const NPM_CLI = '/root/.local/share/fnm/node-versions/v22/installation/lib/node_modules/botmux/dist/cli.js';
+const PNPM_BIN = '/root/.local/share/pnpm/botmux';
+const PNPM_CLI = '/root/.local/share/pnpm/global/5/node_modules/.pnpm/botmux@3.2.1/node_modules/botmux/dist/cli.js';
+const YARN_BIN = '/root/.yarn/bin/botmux';
+const YARN_CLI = '/root/.config/yarn/global/node_modules/botmux/dist/cli.js';
+const BUN_BIN = '/root/.bun/bin/botmux';
+const BUN_CLI = '/root/.bun/install/global/node_modules/botmux/dist/cli.js';
 
 function deps(over: Partial<InstallProbeDeps> = {}): InstallProbeDeps {
   return {
     readFile: (p) => (p === SHIM ? SHIM_BODY : null),       // npm bin reads as the real (large) cli.js → null here
-    realpath: (p) => (p === NPM_BIN ? NPM_CLI : p),
+    realpath: (p) => ({
+      [NPM_BIN]: NPM_CLI,
+      [PNPM_BIN]: PNPM_CLI,
+      [YARN_BIN]: YARN_CLI,
+      [BUN_BIN]: BUN_CLI,
+    })[p] ?? p,
     isSourceCheckout: (root) => root === '/root/iserver/botmux',
     ...over,
   };
@@ -33,6 +44,16 @@ describe('analyzeInstalls', () => {
     const out = analyzeInstalls([NPM_BIN], deps());
     expect(out.multiple).toBe(false);
     expect(out.entries).toEqual([{ binPath: NPM_BIN, root: '/root/.local/share/fnm/node-versions/v22/installation/lib/node_modules/botmux', kind: 'npm-global' }]);
+  });
+
+  it.each([
+    [PNPM_BIN, 'pnpm-global'],
+    [YARN_BIN, 'yarn-global'],
+    [BUN_BIN, 'bun-global'],
+  ] as const)('classifies %s by its owning global layout', (bin, kind) => {
+    const out = analyzeInstalls([bin], deps());
+    expect(out.multiple).toBe(false);
+    expect(out.entries[0].kind).toBe(kind);
   });
 
   it('shim resolves to its source-checkout target', () => {

@@ -1,4 +1,4 @@
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -9,6 +9,7 @@ import { loadSkillPackage } from '../core/skills/package.js';
 import { skillRegistryPath, skillSourcesDir, skillStoreDir } from '../core/skills/registry-paths.js';
 import type { SkillPackage, SkillSource } from '../core/skills/types.js';
 import { assertAllowedGitProtocol, assertNoGitUrlCredentials, assertSafeGitRef, assertSafeGitSkillPath, githubToGitUrl, redactGitUrlCredentials } from '../core/skills/sources.js';
+import type { AgentbuddySource } from '../core/skills/sources.js';
 
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 const execFileAsync = promisify(execFile);
@@ -26,6 +27,9 @@ export interface DiscoveredSkillCandidate {
 export interface SkillSourceDiscovery {
   commit?: string;
   skills: DiscoveredSkillCandidate[];
+  /** True when the source resolves its own skill set (agentbuddy) — the dashboard
+   *  installs it directly, skipping the discover-then-select step. */
+  directInstall?: boolean;
 }
 
 export interface SkillInstallSelection {
@@ -550,6 +554,280 @@ export async function installGitSkillsFromSourceAsync(opts: {
   return installed;
 }
 
+// --- agentbuddy (external CLI) skill source ---------------------------------
+//
+// Delegates fetch + SSO auth + versioning to the operator-configured `agentbuddy`
+// binary (BOTMUX_AGENTBUDDY_CMD, default `agentbuddy`), captures the SKILL.md
+// dir(s) it writes into a throwaway staging project, and copies them into
+// botmux's own store. The registry host and login cache live entirely in the
+// agentbuddy binary + the daemon host's npmrc/login state, so no internal
+// registry domain ever enters botmux's (publicly-published) source.
+
+const DEFAULT_AGENTBUDDY_TIMEOUT_MS = 180_000;
+
+function agentbuddyCommand(): { bin: string; prefixArgs: string[] } {
+  const raw = (process.env.BOTMUX_AGENTBUDDY_CMD ?? 'agentbuddy').trim();
+  const parts = raw.split(/\s+/).filter(Boolean);
+  return parts.length > 0 ? { bin: parts[0], prefixArgs: parts.slice(1) } : { bin: 'agentbuddy', prefixArgs: [] };
+}
+
+function agentbuddyTimeoutMs(): number {
+  const raw = Number(process.env.BOTMUX_AGENTBUDDY_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_AGENTBUDDY_TIMEOUT_MS;
+}
+
+const agentbuddyLocks = new Map<string, Promise<void>>();
+
+/** Lock target for an identifier — the shared staging dir path; withFileLock
+ *  appends `.lock`, so the lock file is a sibling of (not inside) the staging
+ *  dir the install rmSyncs. Mirrors gitSourceLockTarget. */
+function agentbuddyLockTarget(identifier: string): string {
+  const dir = join(skillSourcesDir(), 'agentbuddy');
+  mkdirSync(dir, { recursive: true });
+  return join(dir, sourceId(identifier));
+}
+
+function agentbuddyLockWaitMs(): number {
+  return Math.max(agentbuddyTimeoutMs() * 5, 60_000);
+}
+
+/** Serialize install/update of the SAME agentbuddy identifier — like the git
+ *  path's withGitSourceLock. Two concurrent tasks for one identifier (two
+ *  dashboard tabs, or CLI + dashboard) otherwise rmSync each other's shared
+ *  staging dir mid-run (both agentbuddy children fail with uv_cwd/ENOENT). The
+ *  cross-process file lock covers separate processes; wait budget ≥ a full run. */
+function withAgentbuddyLockSync<T>(identifier: string, fn: () => T): T {
+  // A blocking sync file-lock acquire cannot coexist with an in-process ASYNC
+  // holder of the same identifier: withFileLock is non-reentrant, and the sync
+  // acquire freezes the event loop so the async holder never reaches its release
+  // — a guaranteed deadlock until the (long) lock timeout. The sync API is the
+  // one-shot CLI path; if an async op is in flight in THIS process, fast-fail
+  // instead of dead-waiting. (Cross-process sync↔async is fine: the file lock
+  // serializes those, and blocking a one-shot CLI's own loop is harmless.)
+  if (agentbuddyLocks.has(sourceId(identifier))) throw new Error('agentbuddy_busy');
+  return withFileLockSync(agentbuddyLockTarget(identifier), fn, { maxWaitMs: agentbuddyLockWaitMs() });
+}
+
+/** Async twin: an in-process promise chain orders same-process async callers
+ *  (withFileLock is not reentrant), then the cross-process file lock. */
+async function withAgentbuddyLock<T>(identifier: string, fn: () => Promise<T>): Promise<T> {
+  const key = sourceId(identifier);
+  const previous = agentbuddyLocks.get(key) ?? Promise.resolve();
+  const waitForPrevious = previous.catch(() => undefined);
+  let release!: () => void;
+  const current = new Promise<void>(resolve => { release = resolve; });
+  const tail = waitForPrevious.then(() => current);
+  agentbuddyLocks.set(key, tail);
+  await waitForPrevious;
+  try {
+    return await withFileLock(agentbuddyLockTarget(identifier), fn, { maxWaitMs: agentbuddyLockWaitMs() });
+  } finally {
+    release();
+    if (agentbuddyLocks.get(key) === tail) agentbuddyLocks.delete(key);
+  }
+}
+
+function agentbuddyInstallArgs(opts: AgentbuddySource): string[] {
+  const protocol = opts.protocol ?? 'skill';
+  // --copy (real files, not symlinks) + --strict (fail fast when not logged in)
+  // are skill-only — `plugin add` rejects them. --agent claude-code + -y apply
+  // to both and steer output into .claude/* so registerAgentbuddyStaging can
+  // capture any SKILL.md (a plugin only contributes its bundled skills).
+  const flags = protocol === 'skill'
+    ? ['--agent', 'claude-code', '--copy', '-y', '--strict']
+    : ['--agent', 'claude-code', '-y'];
+  if (opts.collection) return [protocol, 'collection', 'add', opts.collection, ...flags];
+  const args = [protocol, 'add', opts.group!, '--skill', opts.skill!];
+  if (opts.version) args.push('--version', opts.version);
+  return [...args, ...flags];
+}
+
+function runAgentbuddyCli(args: string[], cwd: string, failCode: string): void {
+  const { bin, prefixArgs } = agentbuddyCommand();
+  try {
+    execFileSync(bin, [...prefixArgs, ...args], {
+      cwd,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: agentbuddyTimeoutMs(),
+    });
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') throw new Error('agentbuddy_not_found');
+    const stderr = Buffer.isBuffer(err?.stderr) ? err.stderr.toString('utf-8').trim() : String(err?.stderr ?? '').trim();
+    const stdout = Buffer.isBuffer(err?.stdout) ? err.stdout.toString('utf-8').trim() : String(err?.stdout ?? '').trim();
+    throw new Error(`${failCode}: ${stderr || stdout || err?.message || String(err)}`);
+  }
+}
+
+function agentbuddyKeepTelemetry(): boolean {
+  const v = (process.env.BOTMUX_AGENTBUDDY_KEEP_TELEMETRY ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+/** Strip the usage-telemetry the marketplace bakes into published skills (a
+ *  `<!-- @telemetry -->` block in SKILL.md plus `spans/*.sh` and
+ *  `.agentbuddy`/`.ai-extension` dirs) via agentbuddy's own built-in scrubber,
+ *  so botmux-delivered skills don't phone home from bridged sessions. Runs over
+ *  the staging tree before it's copied into the store. Fail-closed: a scrub
+ *  error aborts the install rather than silently shipping telemetry (opt out
+ *  with BOTMUX_AGENTBUDDY_KEEP_TELEMETRY=1). */
+function clearAgentbuddyTelemetry(stagingDir: string): void {
+  runAgentbuddyCli(['clear-embedded-telemetry', stagingDir], stagingDir, 'agentbuddy_clear_telemetry_failed');
+}
+
+const TELEMETRY_ARTIFACT_DIRS = ['spans', '.agentbuddy', '.ai-extension'];
+
+/** Fail-closed post-scrub check on a produced skill dir. `clear-embedded-telemetry`
+ *  exiting 0 is not proof it stripped anything — a stale/behaviour-drifted
+ *  agentbuddy (or a scrub that missed) could leave telemetry behind. Reject the
+ *  skill if any known telemetry artifact survives, before it enters the store. */
+function assertTelemetryStripped(skillDir: string): void {
+  for (const artifact of TELEMETRY_ARTIFACT_DIRS) {
+    if (existsSync(join(skillDir, artifact))) throw new Error(`agentbuddy_telemetry_not_stripped: ${artifact}`);
+  }
+  const skillMd = join(skillDir, 'SKILL.md');
+  if (existsSync(skillMd) && readFileSync(skillMd, 'utf-8').includes('@telemetry')) {
+    throw new Error('agentbuddy_telemetry_not_stripped: SKILL.md');
+  }
+}
+
+/** Depth-first scan for skill roots (dirs containing SKILL.md). Stops
+ *  descending once a SKILL.md is found so a skill's own resource files can't be
+ *  mistaken for nested skills. Skips node_modules / VCS dirs. */
+function findSkillDirs(root: string): string[] {
+  const found: string[] = [];
+  const walk = (dir: string): void => {
+    let entries: string[];
+    try { entries = readdirSync(dir); } catch { return; }
+    if (entries.includes('SKILL.md')) { found.push(dir); return; }
+    for (const entry of entries) {
+      if (entry === 'node_modules' || entry.startsWith('.git')) continue;
+      const child = join(dir, entry);
+      let isDir = false;
+      try { isDir = statSync(child).isDirectory(); } catch { continue; }
+      if (isDir) walk(child);
+    }
+  };
+  walk(root);
+  return found;
+}
+
+function agentbuddyIdentifier(opts: AgentbuddySource): string {
+  const protocol = opts.protocol ?? 'skill';
+  return opts.collection
+    ? `${protocol}/collection/${opts.collection}`
+    : `${protocol}/${opts.group}/${opts.skill}${opts.version ? `@${opts.version}` : ''}`;
+}
+
+/** Register the skill dir(s) agentbuddy wrote into the staging tree into the
+ *  botmux store. Shared by the sync (CLI) and async (dashboard job) install
+ *  paths so they stay behaviourally identical.
+ *
+ *  `requireSkillName` (set by update): if that skill is not among the produced
+ *  set (renamed upstream, or dropped from its collection), abort with
+ *  `agentbuddy_update_failed` BEFORE touching the store/registry — so a failed
+ *  update never leaves the old entry stale while writing unrelated products.
+ *  `verifyTelemetryStripped`: fail-closed telemetry post-check per skill. Both
+ *  checks run before any store copy / registry write. */
+function registerAgentbuddyStaging(
+  opts: AgentbuddySource,
+  identifier: string,
+  staging: string,
+  register: { requireSkillName?: string; verifyTelemetryStripped: boolean },
+): SkillPackage[] {
+  const dirs = findSkillDirs(staging);
+  if (dirs.length === 0) throw new Error('agentbuddy_no_skill_produced');
+  // Resolve names first (dedup: the same skill can mirror under multiple agent
+  // dirs) so requireSkillName / telemetry checks can reject before any write.
+  const byName = new Map<string, string>();
+  for (const dir of dirs) {
+    const provisional = loadSkillPackage(dir, { source: { type: 'agentbuddy', identifier } });
+    if (!byName.has(provisional.name)) byName.set(provisional.name, dir);
+  }
+  if (register.requireSkillName && !byName.has(register.requireSkillName)) {
+    throw new Error('agentbuddy_update_failed');
+  }
+  if (register.verifyTelemetryStripped) {
+    for (const dir of byName.values()) assertTelemetryStripped(dir);
+  }
+  const now = new Date().toISOString();
+  const registry = readSkillRegistry();
+  const installed: SkillPackage[] = [];
+  for (const [name, dir] of byName) {
+    // A collection member re-installs via its collection; a single skill via
+    // its own group/skill/version — record whichever lets `update` re-run it.
+    const proto = opts.protocol ? { protocol: opts.protocol } : {};
+    const source: SkillSource = opts.collection
+      ? { type: 'agentbuddy', identifier, ...proto, collection: opts.collection, skill: name }
+      : { type: 'agentbuddy', identifier, ...proto, group: opts.group, skill: opts.skill, ...(opts.version ? { version: opts.version } : {}) };
+    const rootDir = join(skillStoreDir(), name);
+    rmSync(rootDir, { recursive: true, force: true });
+    mkdirSync(dirname(rootDir), { recursive: true });
+    cpSync(dir, rootDir, { recursive: true });
+    const pkg = loadSkillPackage(rootDir, { source, id: name });
+    registry.skills[pkg.name] = { ...pkg, installedAt: now, updatedAt: now };
+    installed.push(registry.skills[pkg.name]);
+  }
+  writeSkillRegistry(registry);
+  return installed;
+}
+
+async function runAgentbuddyCliAsync(args: string[], cwd: string, failCode: string): Promise<void> {
+  const { bin, prefixArgs } = agentbuddyCommand();
+  try {
+    await execFileAsync(bin, [...prefixArgs, ...args], { cwd, encoding: 'utf-8', timeout: agentbuddyTimeoutMs() });
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') throw new Error('agentbuddy_not_found');
+    const stderr = Buffer.isBuffer(err?.stderr) ? err.stderr.toString('utf-8').trim() : String(err?.stderr ?? '').trim();
+    const stdout = Buffer.isBuffer(err?.stdout) ? err.stdout.toString('utf-8').trim() : String(err?.stdout ?? '').trim();
+    throw new Error(`${failCode}: ${stderr || stdout || err?.message || String(err)}`);
+  }
+}
+
+export function installAgentbuddySkill(opts: AgentbuddySource, requireSkillName?: string): SkillPackage[] {
+  const identifier = agentbuddyIdentifier(opts);
+  return withAgentbuddyLockSync(identifier, () => {
+    const staging = join(skillSourcesDir(), 'agentbuddy', sourceId(identifier));
+    rmSync(staging, { recursive: true, force: true });
+    mkdirSync(staging, { recursive: true });
+    try {
+      runAgentbuddyCli(agentbuddyInstallArgs(opts), staging, 'agentbuddy_command_failed');
+      const verifyTelemetryStripped = !agentbuddyKeepTelemetry();
+      if (verifyTelemetryStripped) clearAgentbuddyTelemetry(staging);
+      return registerAgentbuddyStaging(opts, identifier, staging, { requireSkillName, verifyTelemetryStripped });
+    } finally {
+      rmSync(staging, { recursive: true, force: true });
+    }
+  });
+}
+
+/** Async twin of installAgentbuddySkill for the dashboard install job — same
+ *  behaviour, but awaits the (minutes-long, network-bound) agentbuddy calls off
+ *  the daemon event loop instead of blocking it with execFileSync. */
+export async function installAgentbuddySkillAsync(opts: AgentbuddySource, requireSkillName?: string): Promise<SkillPackage[]> {
+  const identifier = agentbuddyIdentifier(opts);
+  return withAgentbuddyLock(identifier, async () => {
+    const staging = join(skillSourcesDir(), 'agentbuddy', sourceId(identifier));
+    rmSync(staging, { recursive: true, force: true });
+    mkdirSync(staging, { recursive: true });
+    try {
+      await runAgentbuddyCliAsync(agentbuddyInstallArgs(opts), staging, 'agentbuddy_command_failed');
+      const verifyTelemetryStripped = !agentbuddyKeepTelemetry();
+      if (verifyTelemetryStripped) await runAgentbuddyCliAsync(['clear-embedded-telemetry', staging], staging, 'agentbuddy_clear_telemetry_failed');
+      return registerAgentbuddyStaging(opts, identifier, staging, { requireSkillName, verifyTelemetryStripped });
+    } finally {
+      rmSync(staging, { recursive: true, force: true });
+    }
+  });
+}
+
+function agentbuddyReinstallOpts(source: Extract<SkillSource, { type: 'agentbuddy' }>): AgentbuddySource {
+  const proto = source.protocol ? { protocol: source.protocol } : {};
+  return source.collection
+    ? { ...proto, collection: source.collection }
+    : { ...proto, group: source.group, skill: source.skill, version: source.version };
+}
+
 export function removeInstalledSkill(name: string): { ok: true } | { ok: false; reason: string } {
   const registry = readSkillRegistry();
   const pkg = registry.skills[name];
@@ -592,6 +870,16 @@ export function updateInstalledSkill(name: string): { ok: true; skill: SkillPack
       }),
     };
   }
+  if (source.type === 'agentbuddy') {
+    try {
+      const pkgs = installAgentbuddySkill(agentbuddyReinstallOpts(source), name);
+      const match = pkgs.find((pkg) => pkg.name === name);
+      return match ? { ok: true, skill: match } : { ok: false, reason: 'agentbuddy_update_failed' };
+    } catch (err: any) {
+      if (err?.message === 'agentbuddy_update_failed') return { ok: false, reason: 'agentbuddy_update_failed' };
+      throw err;
+    }
+  }
   return { ok: false, reason: `unsupported_source:${source.type}` };
 }
 
@@ -614,6 +902,16 @@ export async function updateInstalledSkillAsync(name: string): Promise<{ ok: tru
         sourceOverride: source,
       }),
     };
+  }
+  if (source.type === 'agentbuddy') {
+    try {
+      const pkgs = await installAgentbuddySkillAsync(agentbuddyReinstallOpts(source), name);
+      const match = pkgs.find((pkg) => pkg.name === name);
+      return match ? { ok: true, skill: match } : { ok: false, reason: 'agentbuddy_update_failed' };
+    } catch (err: any) {
+      if (err?.message === 'agentbuddy_update_failed') return { ok: false, reason: 'agentbuddy_update_failed' };
+      throw err;
+    }
   }
   return { ok: false, reason: `unsupported_source:${source.type}` };
 }

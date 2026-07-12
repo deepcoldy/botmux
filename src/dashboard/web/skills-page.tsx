@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { botAvatarHtml, loadingHtml } from './ui.js';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
+import { FieldTitle, Html, LoadingState, RefreshIconButton, SectionHeader } from './dashboard-components.js';
+import { botAvatarHtml } from './ui.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 
@@ -52,11 +54,6 @@ type DeliveryMode = 'auto' | 'prompt' | 'native';
 type ProjectTrustMode = 'off' | 'all';
 
 const INSTALLED_SKILLS_ROWS_PER_PAGE = 2;
-
-function Html(props: { html: string; as?: 'span' | 'div' }) {
-  const Tag = props.as ?? 'span';
-  return <Tag style={{ display: 'contents' }} dangerouslySetInnerHTML={{ __html: props.html }} />;
-}
 
 function nativeLibraryLabel(path: string | undefined, tr: ReturnType<typeof useT>): string | null {
   const p = String(path ?? '').replace(/\\/g, '/');
@@ -122,7 +119,37 @@ function statusClass(status: StatusMessage): string {
   return `oncall-status${status ? ` ${status.ok ? 'hint-ok' : 'hint-warn-inline'}` : ''}`;
 }
 
+function SkillSegmented<T extends string>(props: {
+  value: T;
+  options: Array<{ value: T; label: ReactNode; help?: ReactNode }>;
+  disabled?: boolean;
+  onChange(value: T): void;
+}): JSX.Element {
+  const current = props.options.find(option => option.value === props.value);
+  return (
+    <div className="skills-segmented-control">
+      <div className="segmented skills-segmented" role="group">
+        {props.options.map(option => (
+          <button
+            key={option.value}
+            type="button"
+            className={props.value === option.value ? 'active' : ''}
+            aria-pressed={props.value === option.value ? 'true' : 'false'}
+            title={typeof option.help === 'string' ? option.help : undefined}
+            disabled={props.disabled}
+            onClick={() => props.onChange(option.value)}
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+      {current?.help ? <span className="skills-setting-hint">{current.help}</span> : null}
+    </div>
+  );
+}
+
 interface SkillsInstallPanelProps {
+  showTitle?: boolean;
   installSource: string;
   installPath: string;
   installRef: string;
@@ -163,15 +190,27 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
 
   return (
     <article className="bd-card skills-install-panel">
-      <div className="skills-install-title">
-        <h3 className="bd-section-title">{tr('skills.install')}</h3>
-        <span className="skills-help-tip">
-          <button type="button" className="skills-help-button" aria-label={tr('skills.installInfoLabel')}>?</button>
-          <span className="skills-help-popover" role="tooltip">{tr('skills.installInfo')}</span>
-        </span>
-      </div>
+      {props.showTitle === false ? null : <div className="skills-install-title">
+        <h3 className="bd-section-title">
+          <FieldTitle help={tr('skills.installInfo')} helpLabel={tr('skills.installInfoLabel')}>
+            {tr('skills.install')}
+          </FieldTitle>
+        </h3>
+      </div>}
       <div className="skills-install-grid">
-        <label className="skills-source-label"><span>{tr('skills.source')}</span>
+        <label className="skills-source-label">
+          <FieldTitle
+            help={(
+              <span className="skills-source-help">
+                <span><strong>{tr('skills.sourceHelpRemoteLabel')}</strong>{tr('skills.sourceHelpRemote')}</span>
+                <span><strong>{tr('skills.sourceHelpLocalLabel')}</strong>{tr('skills.sourceHelpLocal')}</span>
+                <span><strong>{tr('skills.sourceHelpAgentbuddyLabel')}</strong>{tr('skills.sourceHelpAgentbuddy')}</span>
+              </span>
+            )}
+            helpLabel={tr('skills.source')}
+          >
+            {tr('skills.source')}
+          </FieldTitle>
           <div className="skills-source-control">
             <input
               type="text"
@@ -183,56 +222,46 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
             />
           </div>
         </label>
-        <div className="bd-section-note skills-install-note">
-          <span><strong>{tr('skills.sourceHelpRemoteLabel')}</strong>{tr('skills.sourceHelpRemote')}</span>
-          <span><strong>{tr('skills.sourceHelpLocalLabel')}</strong>{tr('skills.sourceHelpLocal')}</span>
+        <label className="skills-install-field-wide skills-install-path-field"><span>{tr('skills.path')}</span>
+          <input
+            type="text"
+            data-install="path"
+            placeholder={tr('skills.pathPlaceholder')}
+            value={props.installPath}
+            onChange={e => props.onInstallPathChange(e.currentTarget.value)}
+          />
+        </label>
+        <label className="skills-install-field-wide skills-install-ref-field"><span>{tr('skills.ref')}</span>
+          <input
+            type="text"
+            data-install="ref"
+            placeholder={tr('skills.refPlaceholder')}
+            value={props.installRef}
+            onChange={e => props.onInstallRefChange(e.currentTarget.value)}
+          />
+        </label>
+        <div className="skills-install-actions">
+          <button type="button" data-action="install" disabled={busy} onClick={() => props.onInstall()}>
+            {props.installDiscovering ? tr('skills.scanning') : props.installBusy ? tr('skills.jobRunning') : tr('skills.installSubmit')}
+          </button>
         </div>
-        <div className="skills-install-action-row">
-          <details className="skills-advanced-options" data-skills-advanced={true} open={false}>
-            <summary>
-              <span className="skills-advanced-marker" aria-hidden="true" />
-              <span>{tr('skills.advanced')}</span>
-            </summary>
-            <div className="skills-advanced-fields">
-              <label className="skills-install-field-wide"><span>{tr('skills.path')}</span>
-                <input
-                  type="text"
-                  data-install="path"
-                  placeholder={tr('skills.pathPlaceholder')}
-                  value={props.installPath}
-                  onChange={e => props.onInstallPathChange(e.currentTarget.value)}
-                />
-              </label>
-              <label className="skills-install-field-wide"><span>{tr('skills.ref')}</span>
-                <input
-                  type="text"
-                  data-install="ref"
-                  placeholder={tr('skills.refPlaceholder')}
-                  value={props.installRef}
-                  onChange={e => props.onInstallRefChange(e.currentTarget.value)}
-                />
-              </label>
+        <div className="skills-install-bottom-row">
+          <div className="skills-local-discovery-panel">
+            <div>
+              <strong>{tr('skills.localDiscoverTitle')}</strong>
+              <span>{tr('skills.localDiscoverHelp')}</span>
             </div>
-          </details>
-          <div className="skills-install-actions">
-            <button type="button" className="primary" data-action="install" disabled={busy} onClick={() => props.onInstall()}>
-              {props.installDiscovering ? tr('skills.scanning') : props.installBusy ? tr('skills.jobRunning') : tr('skills.installSubmit')}
+            <button type="button" data-action="open-native-skill-discovery" onClick={() => props.onOpenNativeDiscovery()}>
+              {tr('skills.localDiscover')}
             </button>
           </div>
         </div>
-        <div className="skills-local-discovery-panel">
-          <div>
-            <strong>{tr('skills.localDiscoverTitle')}</strong>
-            <span>{tr('skills.localDiscoverHelp')}</span>
-          </div>
-          <button type="button" data-action="open-native-skill-discovery" onClick={() => props.onOpenNativeDiscovery()}>
-            {tr('skills.localDiscover')}
-          </button>
+      </div>
+      {props.installStatus ? (
+        <div className="actions skills-install-status-row">
+          <span className={statusClass(props.installStatus)} data-skills-status>{props.installStatus.text}</span>
         </div>
-      </div>
-      <div className="actions">
-        <span className={statusClass(props.installStatus)} data-skills-status>{props.installStatus?.text ?? ''}</span>
-      </div>
+      ) : null}
       <dialog
         className="skills-discovery-dialog skills-install-selection-dialog"
         data-install-selection-dialog
@@ -300,7 +329,6 @@ function SkillsPage() {
   const mountedRef = useRef(true);
   const timersRef = useRef<Set<number>>(new Set());
   const discoveryDialogRef = useRef<HTMLDialogElement | null>(null);
-  const botGridRef = useRef<HTMLDivElement | null>(null);
 
   const [skills, setSkills] = useState<SkillRow[]>([]);
   const [nativeSkillGroups, setNativeSkillGroups] = useState<NativeSkillGroup[]>([]);
@@ -489,7 +517,7 @@ function SkillsPage() {
     };
   }
 
-  async function discoverInstallCandidates(): Promise<InstallSkillCandidate[]> {
+  async function discoverInstallCandidates(): Promise<{ skills: InstallSkillCandidate[]; directInstall: boolean }> {
     setInstallDiscovering(true);
     setInstallStatus({ text: tr('skills.scanning'), ok: true });
     try {
@@ -497,14 +525,33 @@ function SkillsPage() {
         method: 'POST',
         body: JSON.stringify(sourceRequestBody()),
       });
-      if (!mountedRef.current) return [];
+      if (!mountedRef.current) return { skills: [], directInstall: false };
+      const directInstall = body.discovery?.directInstall === true;
       const skills = Array.isArray(body.discovery?.skills) ? body.discovery.skills as InstallSkillCandidate[] : [];
       setInstallCandidates(skills);
       setSelectedInstallSkills(new Set(skills.map(skill => skill.name)));
-      return skills;
+      return { skills, directInstall };
     } finally {
       if (mountedRef.current) setInstallDiscovering(false);
     }
+  }
+
+  // Translate the backend's terse install error codes into actionable messages.
+  // agentbuddy runs on the deploy host, so its failures (missing CLI, not logged
+  // in) need host-side guidance the operator can act on. Non-agentbuddy codes
+  // fall through unchanged.
+  function mapInstallError(raw: string): string {
+    const msg = raw || '';
+    if (msg.startsWith('agentbuddy_not_found')) return tr('skills.agentbuddyNotFound');
+    if (msg.startsWith('agentbuddy_command_failed')) {
+      return /login|credential|unauthor|not logged|401|403/i.test(msg)
+        ? tr('skills.agentbuddyNeedsLogin')
+        : tr('skills.agentbuddyCommandFailed');
+    }
+    if (msg.startsWith('agentbuddy_clear_telemetry_failed') || msg.startsWith('agentbuddy_telemetry_not_stripped')) return tr('skills.agentbuddyTelemetryFailed');
+    if (msg.startsWith('agentbuddy_no_skill_produced')) return tr('skills.agentbuddyNoSkill');
+    if (msg.startsWith('invalid_agentbuddy')) return tr('skills.agentbuddyInvalid');
+    return msg;
   }
 
   async function submitSkillInstall(skillNames?: string[]): Promise<void> {
@@ -518,7 +565,7 @@ function SkillsPage() {
       await waitForSkillJob(body.job as SkillJob, setInstallStatus);
       if (mountedRef.current) clearInstallDiscovery();
     } catch (err: any) {
-      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
+      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, ok: false });
     } finally {
       if (mountedRef.current) setInstallBusy(false);
     }
@@ -544,8 +591,16 @@ function SkillsPage() {
     }
     try {
       setInstallSelectionOpen(false);
-      const skills = await discoverInstallCandidates();
+      const { skills, directInstall } = await discoverInstallCandidates();
       if (!mountedRef.current) return;
+      // agentbuddy sources — a pasted `agentbuddy:<id>` OR a marketplace URL the
+      // backend recognized — resolve their own skill set, so install directly
+      // (no candidate selection). The server decides this so the client needn't
+      // know the identifier prefix or the configured marketplace hosts.
+      if (directInstall) {
+        await submitSkillInstall();
+        return;
+      }
       if (skills.length === 0) {
         setInstallStatus({ text: tr('skills.scanEmpty'), ok: false });
         return;
@@ -557,7 +612,7 @@ function SkillsPage() {
       setInstallStatus({ text: tr('skills.scanFound', { count: skills.length }), ok: true });
       setInstallSelectionOpen(true);
     } catch (err: any) {
-      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
+      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, ok: false });
     }
   }
 
@@ -588,7 +643,7 @@ function SkillsPage() {
       await refresh();
       if (mountedRef.current) setInstallStatus({ text: tr('skills.saved'), ok: true });
     } catch (err: any) {
-      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
+      if (mountedRef.current) setInstallStatus({ text: `${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, ok: false });
     } finally {
       if (mountedRef.current) setDiscoveryBusy(false);
     }
@@ -605,7 +660,7 @@ function SkillsPage() {
       if (!mountedRef.current) return;
       setTrustProjectSkills(body.trustProjectSkills === 'all' ? 'all' : next);
     } catch (err: any) {
-      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${err?.message ?? err}`);
+      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
     } finally {
       if (mountedRef.current) setGlobalBusy(null);
     }
@@ -622,19 +677,10 @@ function SkillsPage() {
       if (!mountedRef.current) return;
       setDelivery(body.delivery === 'prompt' || body.delivery === 'native' ? body.delivery : next);
     } catch (err: any) {
-      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${err?.message ?? err}`);
+      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
     } finally {
       if (mountedRef.current) setGlobalBusy(null);
     }
-  }
-
-  function scrollBots(dir: -1 | 1): void {
-    const grid = botGridRef.current;
-    const card = grid?.querySelector<HTMLElement>('.skills-bot-card');
-    if (!grid || !card) return;
-    const style = window.getComputedStyle(grid);
-    const gap = Number.parseFloat(style.columnGap || style.gap || '0') || 0;
-    grid.scrollBy({ left: dir * (card.getBoundingClientRect().width + gap), behavior: 'smooth' });
   }
 
   async function updateSkill(name: string): Promise<void> {
@@ -644,7 +690,7 @@ function SkillsPage() {
       if (!mountedRef.current) return;
       await waitForSkillJob(body.job as SkillJob, setInstallStatus);
     } catch (err: any) {
-      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${err?.message ?? err}`);
+      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
     } finally {
       if (mountedRef.current) setSkillBusy(null);
     }
@@ -678,30 +724,38 @@ function SkillsPage() {
           return;
         }
       }
-      window.alert(`${tr('skills.failed')}: ${err?.message ?? err}`);
+      window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
     } finally {
       if (mountedRef.current) setSkillBusy(null);
     }
   }
 
-  async function updateBotSkill(appId: string, action: 'attach' | 'detach', name: string): Promise<void> {
-    const busyKey = `${appId}:${action}:${name}`;
+  async function setBotSkills(appId: string, names: string[]): Promise<void> {
+    const busyKey = `${appId}:set`;
     setBotBusy(busyKey);
     setBotStatuses(statuses => ({ ...statuses, [appId]: null }));
     try {
       const body = await jsonRequest(`/api/bots/${encodeURIComponent(appId)}/skills`, {
         method: 'PUT',
-        body: JSON.stringify({ action, name }),
+        body: JSON.stringify({
+          action: 'set',
+          policy: names.length > 0 ? { include: names.map(name => `skill:${name}`) } : null,
+        }),
       });
       if (!mountedRef.current) return;
       setBots(rows => rows.map(bot => bot.larkAppId === appId ? { ...bot, skills: body.skills ?? null } : bot));
+      setBotStatuses(statuses => ({
+        ...statuses,
+        [appId]: { text: tr('skills.policySaved'), ok: true },
+      }));
     } catch (err: any) {
       if (mountedRef.current) {
         setBotStatuses(statuses => ({
           ...statuses,
-          [appId]: { text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false },
+          [appId]: { text: `${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, ok: false },
         }));
       }
+      throw err;
     } finally {
       if (mountedRef.current) setBotBusy(null);
     }
@@ -710,170 +764,140 @@ function SkillsPage() {
   const configuredBotCount = bots.filter(bot => policyConfigured(bot.skills)).length;
   const attachedSkillRefCount = bots.reduce((sum, bot) => sum + policyReferenceCount(bot.skills), 0);
 
-  const body = loading
-    ? <Html html={loadingHtml()} as="div" />
-    : loadError
-      ? <p className="hint-warn">{loadError}</p>
-      : (
-        <div className="skills-page-grid">
-          <aside className="skills-side-rail">
-            <article className="bd-card skills-defaults-panel">
-              <h3 className="bd-section-title">{tr('skills.globalDefaults')}</h3>
-              <div className="skills-control-block">
-                <span className="skills-control-label">{tr('skills.globalProject')}</span>
-                <div className="skills-choice-group skills-choice-group-compact skills-project-group">
-                  {([
-                    ['off', tr('skills.globalProjectOff'), tr('skills.globalProjectOffHelp')],
-                    ['all', tr('skills.globalProjectAll'), tr('skills.globalProjectAllHelp')],
-                  ] as const).map(([value, label, help]) => (
-                    <button
-                      key={value}
-                      type="button"
-                      className={`skills-choice${trustProjectSkills === value ? ' selected' : ''}`}
-                      data-global-project-value={value}
-                      aria-pressed={trustProjectSkills === value ? 'true' : 'false'}
-                      disabled={globalBusy === 'project'}
-                      onClick={() => void updateGlobalProject(value)}
-                    >
-                      <strong>{label}</strong><small>{help}</small>
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="skills-control-block">
-                <span className="skills-control-label">{tr('skills.globalDelivery')}</span>
-                <div className="skills-choice-group skills-delivery-group">
-                  {([
-                    ['auto', tr('skills.deliveryAuto'), tr('skills.deliveryAutoHelp')],
-                    ['prompt', tr('skills.deliveryPrompt'), tr('skills.deliveryPromptHelp')],
-                    ['native', tr('skills.deliveryNative'), tr('skills.deliveryNativeHelp')],
-                  ] as const).map(([value, label, help]) => (
-                    <button
-                      key={value}
-                      type="button"
-                      className={`skills-choice${delivery === value ? ' selected' : ''}`}
-                      data-global-delivery-value={value}
-                      aria-pressed={delivery === value ? 'true' : 'false'}
-                      disabled={globalBusy === 'delivery'}
-                      onClick={() => void updateGlobalDelivery(value)}
-                    >
-                      <strong>{label}</strong><small>{help}</small>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </article>
+  const headingActions = (
+    <div className="page-heading-actions skills-heading-actions">
+      <div className="skills-metric-strip">
+        <span><small>{tr('skills.metricInstalled')}</small><strong>{skills.length}</strong></span>
+        <span><small>{tr('skills.metricBots')}</small><strong>{configuredBotCount}/{bots.length}</strong></span>
+        <span><small>{tr('skills.metricAttached')}</small><strong>{attachedSkillRefCount}</strong></span>
+      </div>
+      <RefreshIconButton id="skills-refresh" label={tr('skills.refresh')} busy={loading} disabled={loading} onClick={() => void refresh()} />
+    </div>
+  );
 
-            <SkillsInstallPanel
-              installSource={installSource}
-              installPath={installPath}
-              installRef={installRef}
-              installStatus={installStatus}
-              installBusy={installBusy}
-              installDiscovering={installDiscovering}
-              installSelectionOpen={installSelectionOpen}
-              installCandidates={installCandidates}
-              selectedInstallSkills={selectedInstallSkills}
-              onInstallSourceChange={(value) => {
-                setInstallSource(value);
-                clearInstallDiscovery();
-              }}
-              onInstallPathChange={(value) => {
-                setInstallPath(value);
-                clearInstallDiscovery();
-              }}
-              onInstallRefChange={(value) => {
-                setInstallRef(value);
-                clearInstallDiscovery();
-              }}
-              onToggleInstallSkill={toggleInstallCandidate}
-              onSelectAllInstallSkills={selectAllInstallCandidates}
-              onConfirmInstallSelection={() => void confirmInstallSelection()}
-              onCloseInstallSelection={() => setInstallSelectionOpen(false)}
-              onInstall={() => void installSkill()}
-              onOpenNativeDiscovery={() => setDiscoveryOpen(true)}
-            />
-          </aside>
-
-          <section className="skills-main-panel">
-            <section className="skills-overview">
-              <div className="skills-overview-copy">
-                <h2>{tr('skills.overviewTitle')}</h2>
-                <p>{tr('skills.overviewBody')}</p>
-              </div>
-              <div className="skills-metric-strip">
-                <span><small>{tr('skills.metricInstalled')}</small><strong>{skills.length}</strong></span>
-                <span><small>{tr('skills.metricBots')}</small><strong>{configuredBotCount}/{bots.length}</strong></span>
-                <span><small>{tr('skills.metricAttached')}</small><strong>{attachedSkillRefCount}</strong></span>
-              </div>
-            </section>
-
-            <section className="skills-bots-panel">
-              <div className="skills-section-head skills-section-head-row">
-                <div>
-                  <h2>{tr('skills.bots')}</h2>
-                  <p>{tr('skills.botsHelp')}</p>
-                </div>
-                {bots.length > 3 ? (
-                  <div className="skills-bot-rail-actions">
-                    <button type="button" className="skills-rail-button" data-action="scroll-bots" data-dir="-1" aria-label={tr('skills.scrollBotsPrev')} title={tr('skills.scrollBotsPrev')} onClick={() => scrollBots(-1)}>&lsaquo;</button>
-                    <span className="skills-count-pill">{tr('skills.botCount', { count: bots.length })}</span>
-                    <button type="button" className="skills-rail-button" data-action="scroll-bots" data-dir="1" aria-label={tr('skills.scrollBotsNext')} title={tr('skills.scrollBotsNext')} onClick={() => scrollBots(1)}>&rsaquo;</button>
-                  </div>
-                ) : <span className="skills-count-pill">{tr('skills.botCount', { count: bots.length })}</span>}
-              </div>
-              <div className="skills-bot-grid" ref={botGridRef}>
-                {bots.map(bot => (
-                  <BotPolicyCard
-                    key={bot.larkAppId}
-                    bot={bot}
-                    installedNames={installedNames}
-                    skills={skills}
-                    status={botStatuses[bot.larkAppId] ?? null}
-                    busyKey={botBusy}
-                    onUpdate={updateBotSkill}
+  const body = (
+    <div className="skills-page-stack">
+      {loading ? <LoadingState label={tr('common.loading')} /> : loadError ? <p className="hint-warn">{loadError}</p> : (
+        <>
+          <div className="skills-config-row">
+            <section className="skills-config-block">
+              <SectionHeader title={tr('skills.globalDefaults')} />
+              <article className="bd-card skills-defaults-panel skills-config-card">
+                <div className="skills-control-block">
+                  <span className="skills-control-label">{tr('skills.globalProject')}</span>
+                  <SkillSegmented
+                    value={trustProjectSkills}
+                    disabled={globalBusy === 'project'}
+                    options={[
+                      { value: 'off', label: tr('skills.globalProjectOff'), help: tr('skills.globalProjectOffHelp') },
+                      { value: 'all', label: tr('skills.globalProjectAll'), help: tr('skills.globalProjectAllHelp') },
+                    ]}
+                    onChange={value => void updateGlobalProject(value)}
                   />
-                ))}
-              </div>
+                </div>
+                <div className="skills-control-block">
+                  <span className="skills-control-label">{tr('skills.globalDelivery')}</span>
+                  <SkillSegmented
+                    value={delivery}
+                    disabled={globalBusy === 'delivery'}
+                    options={[
+                      { value: 'auto', label: tr('skills.deliveryAuto'), help: tr('skills.deliveryAutoHelp') },
+                      { value: 'prompt', label: tr('skills.deliveryPrompt'), help: tr('skills.deliveryPromptHelp') },
+                      { value: 'native', label: tr('skills.deliveryNative'), help: tr('skills.deliveryNativeHelp') },
+                    ]}
+                    onChange={value => void updateGlobalDelivery(value)}
+                  />
+                </div>
+              </article>
             </section>
 
-            <section className="bd-card skills-installed-panel">
-              <div className="skills-section-head skills-section-head-row">
-                <div>
-                  <h2>{tr('skills.installed')}</h2>
-                  <p>{tr('skills.installedHelp')}</p>
+            <section className="skills-config-block">
+              <SectionHeader
+                title={<FieldTitle help={tr('skills.installInfo')} helpLabel={tr('skills.installInfoLabel')}>{tr('skills.install')}</FieldTitle>}
+              />
+              <SkillsInstallPanel
+                showTitle={false}
+                installSource={installSource}
+                installPath={installPath}
+                installRef={installRef}
+                installStatus={installStatus}
+                installBusy={installBusy}
+                installDiscovering={installDiscovering}
+                installSelectionOpen={installSelectionOpen}
+                installCandidates={installCandidates}
+                selectedInstallSkills={selectedInstallSkills}
+                onInstallSourceChange={(value) => {
+                  setInstallSource(value);
+                  clearInstallDiscovery();
+                }}
+                onInstallPathChange={(value) => {
+                  setInstallPath(value);
+                  clearInstallDiscovery();
+                }}
+                onInstallRefChange={(value) => {
+                  setInstallRef(value);
+                  clearInstallDiscovery();
+                }}
+                onToggleInstallSkill={toggleInstallCandidate}
+                onSelectAllInstallSkills={selectAllInstallCandidates}
+                onConfirmInstallSelection={() => void confirmInstallSelection()}
+                onCloseInstallSelection={() => setInstallSelectionOpen(false)}
+                onInstall={() => void installSkill()}
+                onOpenNativeDiscovery={() => setDiscoveryOpen(true)}
+              />
+            </section>
+
+            <section className="skills-config-block">
+              <SectionHeader title={tr('skills.bots')} count={tr('skills.botCount', { count: bots.length })} hint={tr('skills.botsHelp')} />
+              <section className="bd-card skills-bots-panel skills-config-card">
+                <div className="skills-bot-grid">
+                  {bots.map(bot => (
+                    <BotPolicyCard
+                      key={bot.larkAppId}
+                      bot={bot}
+                      installedNames={installedNames}
+                      skills={skills}
+                      status={botStatuses[bot.larkAppId] ?? null}
+                      busyKey={botBusy}
+                      onSave={setBotSkills}
+                    />
+                  ))}
                 </div>
-                {installedPageCount <= 1 ? (
-                  <span className="skills-count-pill">{tr('skills.skillCount', { count: skills.length })}</span>
-                ) : (
-                  <div className="skills-installed-toolbar">
-                    <span className="skills-count-pill">{tr('skills.skillCount', { count: skills.length })}</span>
-                    <div className="skills-pager">
-                      <button
-                        type="button"
-                        className="skills-pager-button"
-                        data-action="page-installed-skills"
-                        data-dir="-1"
-                        aria-label={tr('skills.prevPage')}
-                        title={tr('skills.prevPage')}
-                        disabled={installedSkillsPage === 0}
-                        onClick={() => setInstalledSkillsPage(page => Math.max(0, page - 1))}
-                      >&lsaquo;</button>
-                      <span>{tr('skills.pageStatus', { page: installedSkillsPage + 1, pages: installedPageCount })}</span>
-                      <button
-                        type="button"
-                        className="skills-pager-button"
-                        data-action="page-installed-skills"
-                        data-dir="1"
-                        aria-label={tr('skills.nextPage')}
-                        title={tr('skills.nextPage')}
-                        disabled={installedSkillsPage >= installedPageCount - 1}
-                        onClick={() => setInstalledSkillsPage(page => Math.min(installedPageCount - 1, page + 1))}
-                      >&rsaquo;</button>
-                    </div>
+              </section>
+            </section>
+          </div>
+
+          <section className="skills-installed-block">
+            <SectionHeader title={tr('skills.installed')} count={tr('skills.skillCount', { count: skills.length })} hint={tr('skills.installedHelp')}>
+              {installedPageCount > 1 ? (
+                <div className="skills-installed-toolbar">
+                  <div className="skills-pager">
+                    <button
+                      type="button"
+                      className="skills-pager-button"
+                      data-action="page-installed-skills"
+                      data-dir="-1"
+                      aria-label={tr('skills.prevPage')}
+                      title={tr('skills.prevPage')}
+                      disabled={installedSkillsPage === 0}
+                      onClick={() => setInstalledSkillsPage(page => Math.max(0, page - 1))}
+                    >&lsaquo;</button>
+                    <span>{tr('skills.pageStatus', { page: installedSkillsPage + 1, pages: installedPageCount })}</span>
+                    <button
+                      type="button"
+                      className="skills-pager-button"
+                      data-action="page-installed-skills"
+                      data-dir="1"
+                      aria-label={tr('skills.nextPage')}
+                      title={tr('skills.nextPage')}
+                      disabled={installedSkillsPage >= installedPageCount - 1}
+                      onClick={() => setInstalledSkillsPage(page => Math.min(installedPageCount - 1, page + 1))}
+                    >&rsaquo;</button>
                   </div>
-                )}
-              </div>
+                </div>
+              ) : null}
+            </SectionHeader>
+            <section className="bd-card skills-installed-panel">
               {skills.length === 0 ? <p className="empty">{tr('skills.empty')}</p> : (
                 <div className="skills-list">
                   {visibleSkills.map(skill => (
@@ -898,77 +922,97 @@ function SkillsPage() {
             </section>
           </section>
 
-          <dialog className="skills-discovery-dialog" id="skills-discovery-dialog" ref={discoveryDialogRef} onClose={() => setDiscoveryOpen(false)}>
+          <dialog
+            className="skills-discovery-dialog"
+            id="skills-discovery-dialog"
+            ref={discoveryDialogRef}
+            onClose={() => setDiscoveryOpen(false)}
+            onClick={event => {
+              if (event.target === event.currentTarget) setDiscoveryOpen(false);
+            }}
+          >
             <article>
               <header>
                 <h3>{tr('skills.discoverTitle')}</h3>
                 <p>{tr('skills.discoverHelp')}</p>
+                <button
+                  type="button"
+                  className="skills-discovery-close"
+                  data-action="close-discovery"
+                  aria-label={tr('skills.discoverClose')}
+                  title={tr('skills.discoverClose')}
+                  onClick={() => setDiscoveryOpen(false)}
+                />
               </header>
               <div className="skills-discovery-body">
                 {!activeDiscoveryGroup ? <p className="empty">{tr('skills.discoverEmpty')}</p> : (
                   <>
-                    <div className="skills-discovery-tabs" role="tablist" aria-label={tr('skills.discoverTitle')}>
-                      {nativeSkillGroups.map(group => {
+                    <div className="skills-discovery-layout">
+                      <div className="skills-discovery-tabs" role="tablist" aria-label={tr('skills.discoverTitle')}>
+                        {nativeSkillGroups.map(group => {
+                          const key = discoveryGroupKey(group);
+                          const selected = key === activeKey;
+                          return (
+                            <button
+                              key={key}
+                              type="button"
+                              role="tab"
+                              data-discovery-tab={key}
+                              className={selected ? 'selected' : ''}
+                              aria-selected={selected ? 'true' : 'false'}
+                              onClick={() => setActiveDiscoveryKey(key)}
+                            >
+                              <strong>{group.label ?? group.cliId}</strong>
+                              <small>{tr('skills.skillCount', { count: group.skills.length })}</small>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="skills-discovery-main">
+                        <div className="skills-discovery-path"><code>{activeDiscoveryGroup.rootDir}</code></div>
+                        {nativeSkillGroups.map(group => {
                         const key = discoveryGroupKey(group);
                         const selected = key === activeKey;
                         return (
-                          <button
-                            key={key}
-                            type="button"
-                            role="tab"
-                            data-discovery-tab={key}
-                            className={selected ? 'selected' : ''}
-                            aria-selected={selected ? 'true' : 'false'}
-                            onClick={() => setActiveDiscoveryKey(key)}
-                          >
-                            <strong>{group.label ?? group.cliId}</strong>
-                            <small>{tr('skills.skillCount', { count: group.skills.length })}</small>
-                          </button>
+                          <section className="skills-discovery-group" data-discovery-panel={key} hidden={!selected} key={key}>
+                            {group.skills.length === 0 ? <p className="empty">{tr('skills.discoverGroupEmpty')}</p> : (
+                              <div className="skills-discovery-list">
+                                {group.skills.map(skill => {
+                                  const already = installedNames.has(skill.name);
+                                  const path = skill.rootDir ?? skill.source?.root ?? '';
+                                  return (
+                                    <label className={`skills-discovery-row${already ? ' installed' : ''}`} key={`${skill.name}:${path}`}>
+                                      <input
+                                        type="checkbox"
+                                        data-discovered-skill
+                                        value={path}
+                                        disabled={already}
+                                        checked={!already && selectedDiscovered.has(path)}
+                                        onChange={e => {
+                                          const checked = e.currentTarget.checked;
+                                          setSelectedDiscovered(prev => {
+                                            const next = new Set(prev);
+                                            if (checked) next.add(path);
+                                            else next.delete(path);
+                                            return next;
+                                          });
+                                        }}
+                                      />
+                                      <span>
+                                        <strong>{skill.name}</strong>
+                                        {skill.description ? <small>{skill.description}</small> : null}
+                                      </span>
+                                      {already ? <em>{tr('skills.discoverRegistered')}</em> : null}
+                                    </label>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </section>
                         );
                       })}
+                      </div>
                     </div>
-                    <div className="skills-discovery-path"><code>{activeDiscoveryGroup.rootDir}</code></div>
-                    {nativeSkillGroups.map(group => {
-                      const key = discoveryGroupKey(group);
-                      const selected = key === activeKey;
-                      return (
-                        <section className="skills-discovery-group" data-discovery-panel={key} hidden={!selected} key={key}>
-                          {group.skills.length === 0 ? <p className="empty">{tr('skills.discoverGroupEmpty')}</p> : (
-                            <div className="skills-discovery-list">
-                              {group.skills.map(skill => {
-                                const already = installedNames.has(skill.name);
-                                const path = skill.rootDir ?? skill.source?.root ?? '';
-                                return (
-                                  <label className={`skills-discovery-row${already ? ' installed' : ''}`} key={`${skill.name}:${path}`}>
-                                    <input
-                                      type="checkbox"
-                                      data-discovered-skill
-                                      value={path}
-                                      disabled={already}
-                                      checked={!already && selectedDiscovered.has(path)}
-                                      onChange={e => {
-                                        const checked = e.currentTarget.checked;
-                                        setSelectedDiscovered(prev => {
-                                          const next = new Set(prev);
-                                          if (checked) next.add(path);
-                                          else next.delete(path);
-                                          return next;
-                                        });
-                                      }}
-                                    />
-                                    <span>
-                                      <strong>{skill.name}</strong>
-                                      {skill.description ? <small>{skill.description}</small> : null}
-                                    </span>
-                                    {already ? <em>{tr('skills.discoverRegistered')}</em> : null}
-                                  </label>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </section>
-                      );
-                    })}
                   </>
                 )}
               </div>
@@ -991,25 +1035,234 @@ function SkillsPage() {
                 <button type="button" className="primary" data-action="register-discovered-skills" disabled={discoveryBusy} onClick={() => void registerDiscoveredSkills()}>
                   {tr('skills.discoverRegister')}
                 </button>
-                <button type="button" data-action="close-discovery" onClick={() => setDiscoveryOpen(false)}>{tr('skills.discoverClose')}</button>
               </footer>
             </article>
           </dialog>
-        </div>
-      );
+        </>
+      )}
+    </div>
+  );
 
   return (
-    <section className="page">
+    <section className="page skills-page">
       <div className="page-heading">
         <div>
           <p className="eyebrow">{tr('nav.skills')}</p>
           <h1>{tr('skills.title')}</h1>
-          <p>{tr('skills.subtitle')}</p>
         </div>
-        <button type="button" id="skills-refresh" disabled={loading} onClick={() => void refresh()}>{tr('skills.refresh')}</button>
+        {headingActions}
       </div>
       <div id="skills-body">{body}</div>
     </section>
+  );
+}
+
+function sameSkillSelection(left: Set<string>, right: string[]): boolean {
+  return left.size === right.length && right.every(name => left.has(name));
+}
+
+export function SkillMultiPicker(props: {
+  botId: string;
+  names: string[];
+  installedNames: Set<string>;
+  skills: SkillRow[];
+  busy: boolean;
+  onSave(names: string[]): Promise<void>;
+}): JSX.Element {
+  const tr = useT();
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [draft, setDraft] = useState<Set<string>>(() => new Set(props.names));
+  const [position, setPosition] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const currentNamesKey = props.names.join('\n');
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const options = useMemo(() => {
+    const byName = new Map(props.skills.map(skill => [skill.name, skill]));
+    for (const name of props.names) {
+      if (!byName.has(name)) byName.set(name, { name });
+    }
+    return [...byName.values()].sort((left, right) => left.name.localeCompare(right.name));
+  }, [props.names, props.skills]);
+  const filteredOptions = useMemo(() => {
+    if (!normalizedQuery) return options;
+    return options.filter(skill => `${skill.name} ${skill.description || ''}`.toLocaleLowerCase().includes(normalizedQuery));
+  }, [normalizedQuery, options]);
+  const dirty = !sameSkillSelection(draft, props.names);
+
+  const updatePosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    if (!trigger || typeof window === 'undefined') return;
+    const rect = trigger.getBoundingClientRect();
+    const edge = 12;
+    const gap = 7;
+    const width = Math.min(370, Math.max(260, window.innerWidth - edge * 2));
+    const left = Math.min(Math.max(edge, rect.left), Math.max(edge, window.innerWidth - width - edge));
+    const spaceAbove = Math.max(0, rect.top - gap - edge);
+    const spaceBelow = Math.max(0, window.innerHeight - rect.bottom - gap - edge);
+    const placeAbove = spaceAbove > spaceBelow;
+    const available = placeAbove ? spaceAbove : spaceBelow;
+    const desired = 118 + Math.min(options.length, 5) * 42;
+    const height = Math.max(180, Math.min(desired, available));
+    setPosition({
+      left,
+      top: placeAbove ? Math.max(edge, rect.top - gap - height) : rect.bottom + gap,
+      width,
+      height,
+    });
+  }, [options.length]);
+
+  useEffect(() => {
+    if (!open) setDraft(new Set(props.names));
+  }, [currentNamesKey, open]);
+
+  useEffect(() => {
+    if (!open || typeof document === 'undefined') return undefined;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (rootRef.current?.contains(event.target as Node) || popoverRef.current?.contains(event.target as Node)) return;
+      setOpen(false);
+      setQuery('');
+      setDraft(new Set(props.names));
+    };
+    document.addEventListener('pointerdown', closeOnOutsideClick);
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    updatePosition();
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsideClick);
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
+  }, [currentNamesKey, open, updatePosition]);
+
+  function openPicker(): void {
+    setDraft(new Set(props.names));
+    setQuery('');
+    updatePosition();
+    setOpen(true);
+  }
+
+  function cancel(): void {
+    setDraft(new Set(props.names));
+    setQuery('');
+    setOpen(false);
+  }
+
+  function toggle(name: string): void {
+    setDraft(current => {
+      const next = new Set(current);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  }
+
+  async function save(): Promise<void> {
+    const names = [...draft].sort((left, right) => left.localeCompare(right));
+    try {
+      await props.onSave(names);
+      setQuery('');
+      setOpen(false);
+    } catch {
+      // The card-level status message explains the failure; keep the draft open for retry.
+    }
+  }
+
+  const triggerLabel = props.names.length === 0
+    ? tr('skills.pickerPlaceholder')
+    : props.names.length === 1
+      ? props.names[0]
+      : tr('skills.pickerSelectedCount', { count: props.names.length });
+
+  const popover = open ? (
+    <div
+      ref={popoverRef}
+      className="skills-multi-picker-popover"
+      style={position ? { left: position.left, top: position.top, width: position.width, height: position.height } : undefined}
+    >
+      <div className="skills-multi-picker-head">
+        <label className="skills-multi-picker-search">
+          <span className="skills-multi-picker-search-icon" aria-hidden="true" />
+          <input
+            type="search"
+            data-action="search-skills"
+            autoFocus
+            autoComplete="off"
+            value={query}
+            placeholder={tr('skills.pickerSearchPlaceholder')}
+            onChange={event => setQuery(event.currentTarget.value)}
+            onKeyDown={event => {
+              if (event.key === 'Escape') {
+                event.preventDefault();
+                cancel();
+              }
+            }}
+          />
+        </label>
+        <div className="skills-multi-picker-meta">
+          <span>{tr('skills.pickerSelectionMeta', { selected: draft.size, total: options.length })}</span>
+          {draft.size > 0 ? (
+            <button type="button" className="skills-multi-picker-clear" data-action="clear-skill-selection" onClick={() => setDraft(new Set())}>
+              {tr('skills.pickerClear')}
+            </button>
+          ) : null}
+        </div>
+      </div>
+      <div className="skills-multi-picker-options" role="listbox" aria-label={tr('skills.priority')} aria-multiselectable="true">
+        {filteredOptions.map(skill => {
+          const selected = draft.has(skill.name);
+          const dangling = !props.installedNames.has(skill.name);
+          return (
+            <button
+              type="button"
+              className={`skills-multi-picker-option${selected ? ' selected' : ''}${dangling ? ' dangling' : ''}`}
+              role="option"
+              aria-selected={selected}
+              data-skill-name={skill.name}
+              key={skill.name}
+              onClick={() => toggle(skill.name)}
+            >
+              <span className="skills-multi-picker-check" aria-hidden="true" />
+              <span className="skills-multi-picker-option-copy">
+                <span><b>{skill.name}</b>{dangling ? <em>{tr('skills.dangling')}</em> : null}</span>
+                {skill.description ? <small>{skill.description}</small> : null}
+              </span>
+            </button>
+          );
+        })}
+        {filteredOptions.length === 0 ? <p className="skills-multi-picker-empty">{tr('skills.pickerNoResults')}</p> : null}
+      </div>
+      <footer className="skills-multi-picker-actions">
+        <button type="button" className="ghost" data-action="cancel-skill-selection" disabled={props.busy} onClick={cancel}>{tr('skills.cancel')}</button>
+        <button type="button" className="primary" data-action="save-skill-selection" disabled={!dirty || props.busy} onClick={() => void save()}>
+          {props.busy ? tr('skills.saving') : tr('skills.saveSelection')}
+        </button>
+      </footer>
+    </div>
+  ) : null;
+
+  return (
+    <div ref={rootRef} className={`skills-multi-picker${open ? ' open' : ''}`} data-skill-picker={props.botId}>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="skills-multi-picker-trigger"
+        data-action="open-skill-picker"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        disabled={props.busy}
+        onClick={() => open ? cancel() : openPicker()}
+      >
+        <span className="skills-multi-picker-trigger-copy">
+          <b>{triggerLabel}</b>
+          <small>{tr('skills.pickerTriggerHint')}</small>
+        </span>
+        <span className="skills-multi-picker-chevron" aria-hidden="true" />
+      </button>
+      {popover && typeof document !== 'undefined' ? createPortal(popover, document.body) : popover}
+    </div>
   );
 }
 
@@ -1019,21 +1272,12 @@ export function BotPolicyCard(props: {
   skills: SkillRow[];
   status: StatusMessage;
   busyKey: string | null;
-  onUpdate(appId: string, action: 'attach' | 'detach', name: string): Promise<void>;
+  onSave(appId: string, names: string[]): Promise<void>;
 }) {
   const tr = useT();
-  const { bot, installedNames, skills, status, busyKey, onUpdate } = props;
+  const { bot, installedNames, skills, status, busyKey, onSave } = props;
   const label = bot.botName ?? bot.larkAppId;
   const names = priorityNames(bot.skills);
-  const attached = new Set(names);
-  const attachOptions = skills.filter(skill => !attached.has(skill.name));
-  const [selected, setSelected] = useState(attachOptions[0]?.name ?? '');
-
-  useEffect(() => {
-    if (!selected || !attachOptions.some(skill => skill.name === selected)) {
-      setSelected(attachOptions[0]?.name ?? '');
-    }
-  }, [attachOptions, selected]);
 
   if (bot.error) {
     return (
@@ -1051,49 +1295,23 @@ export function BotPolicyCard(props: {
     <article className="bd-card skills-bot-card" data-appid={bot.larkAppId}>
       <header className="skills-bot-head">
         <Html html={botAvatarHtml({ name: label, larkAppId: bot.larkAppId, size: 'sm', dot: 'ok' })} />
-        <div><strong>{label}</strong><code>{bot.larkAppId}</code></div>
-        <span className="skills-count-pill">{tr('skills.skillCount', { count: names.length })}</span>
-      </header>
-      <section className="bd-section">
-        <h3 className="bd-section-title">{tr('skills.priority')}</h3>
-        {names.length === 0 ? <p className="bd-section-note">{tr('skills.noPriority')}</p> : (
-          <div className="skills-chip-list">
-            {names.map(name => {
-              const dangling = !installedNames.has(name);
-              return (
-                <span className={`skills-priority-row${dangling ? ' skills-priority-dangling' : ''}`} title={dangling ? tr('skills.dangling') : ''} key={name}>
-                  <span className="skills-priority-name">{name}{dangling ? <small>{tr('skills.dangling')}</small> : null}</span>
-                  <button
-                    type="button"
-                    className="skills-priority-remove"
-                    data-action="detach-skill"
-                    data-name={name}
-                    aria-label={tr('skills.detachNamed', { skill: name })}
-                    disabled={busyKey === `${bot.larkAppId}:detach:${name}`}
-                    onClick={() => void onUpdate(bot.larkAppId, 'detach', name)}
-                  >&times;</button>
-                </span>
-              );
-            })}
-          </div>
-        )}
-        <div className="actions skills-attach-row">
-          {attachOptions.length === 0 ? <button type="button" disabled>{tr('skills.attach')}</button> : (
-            <>
-              <select data-attach-picker value={selected} onChange={e => setSelected(e.currentTarget.value)}>
-                {attachOptions.map(skill => <option value={skill.name} key={skill.name}>{skill.name}</option>)}
-              </select>
-              <button
-                type="button"
-                data-action="attach-skill"
-                disabled={!selected || busyKey === `${bot.larkAppId}:attach:${selected}`}
-                onClick={() => selected && void onUpdate(bot.larkAppId, 'attach', selected)}
-              >
-                {tr('skills.attach')}
-              </button>
-            </>
-          )}
+        <div className="skills-bot-title-line">
+          <strong>{label}</strong>
+          <span className="skills-count-pill">{tr('skills.skillCount', { count: names.length })}</span>
         </div>
+      </header>
+      <section className="skills-policy-panel">
+        <div className="skills-priority-head">
+          <h3 className="skills-priority-title">{tr('skills.priority')}</h3>
+        </div>
+        <SkillMultiPicker
+          botId={bot.larkAppId}
+          names={names}
+          installedNames={installedNames}
+          skills={skills}
+          busy={busyKey === `${bot.larkAppId}:set`}
+          onSave={next => onSave(bot.larkAppId, next)}
+        />
       </section>
       <span className={statusClass(status)} data-bot-status>{status?.text ?? ''}</span>
     </article>

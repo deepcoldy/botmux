@@ -172,7 +172,9 @@ export default defineConfig({
   search: { codeBlocks: true },
   markdown: { link: { checkDeadLinks: true } },
   builderConfig: {
-    output: { assetPrefix: "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v28/" },
+    // 默认（妙搭发布）：static 走 jsDelivr CDN。GitHub Pages 发布时用 BOTMUX_DOCS_ASSET_PREFIX
+    // 覆盖成同源子路径（Pages 原生服务 static，无需 CDN）。
+    output: { assetPrefix: process.env.BOTMUX_DOCS_ASSET_PREFIX || "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v28/" },
   },
   themeConfig: {
     editLink: {
