@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
-import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
 import { delay, scaleMs } from '../../utils/timing.js';
@@ -18,6 +18,8 @@ import {
   grokSessionExists,
   matchGrokPromptAppend,
 } from '../../services/grok-transcript.js';
+import { builtinSkillBlockForInjectsSessionContext } from '../../skills/injection-mode.js';
+import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 
 /**
  * Adapter for xAI Grok Build TUI (`grok`).
@@ -65,10 +67,23 @@ import {
  *  Ready gate: global `$GROK_HOME/hooks/botmux-session-ready.json`
  *  SessionStart → `botmux session-ready` (`injectsReadyHook`).
  *
+ *  ## Session context / system prompt
+ *  Grok's append flag is `--rules` (docs: alias of Claude's
+ *  `--append-system-prompt`). Full replace is `--system-prompt-override` —
+ *  too aggressive for botmux (would drop Grok's default agent prompt). We
+ *  set `injectsSessionContext` and push `buildBotmuxSystemPromptText` via
+ *  `--rules`, same contract as Claude's `--append-system-prompt` path
+ *  (session-manager then omits inline <botmux_routing>/<identity>/<session_id>).
+ *
  *  ## Skills
- *  Interactive TUI does **not** accept `--plugin-dir` (agent-only flag).
- *  Built-ins use global `$GROK_HOME/skills` with the same global|prompt|off
- *  modes as Codex — not Claude-style per-session plugin injection.
+ *  Interactive TUI does **not** accept `--plugin-dir` (agent-only / headless).
+ *  Built-ins use global `$GROK_HOME/skills` with global|prompt|off modes.
+ *  With injectsSessionContext, prompt/off catalogs ride on `--rules`
+ *  (genius pattern) rather than the per-message envelope.
+ *
+ *  ## Plan mode
+ *  Claude disallows EnterPlanMode/ExitPlanMode for Feishu UX (blocking
+ *  approval). Grok's TUI equivalent is `--no-plan`.
  *
  *  ## Sandbox
  *  `authPaths: [$GROK_HOME]` (directory) — grok keeps SQLite DBs there
@@ -91,16 +106,33 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
 
     supportsTypeAhead: true,
     injectsReadyHook: true,
+    injectsSessionContext: true,
     // Hold soft first-prompt timeout until SessionStart ready signal or the
     // composer's readyPattern — cold-start TUI can accept (and drop) stdin
     // before the real composer exists.
     deferFirstPromptTimeoutUntilReady: true,
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, initialPrompt, disableCliBypass }) {
+    buildArgs({
+      sessionId,
+      resume,
+      resumeSessionId,
+      workingDir,
+      model,
+      initialPrompt,
+      disableCliBypass,
+      botName,
+      botOpenId,
+      locale,
+      larkAppId,
+    }) {
       const args: string[] = [];
       if (!disableCliBypass) {
+        // Claude: --dangerously-skip-permissions. Grok: --always-approve (YOLO).
         args.push('--always-approve');
       }
+      // Align Claude's EnterPlanMode/ExitPlanMode deny — Feishu can't drive
+      // the plan-approval TUI cleanly. `--no-plan` is a top-level TUI flag.
+      args.push('--no-plan');
       if (model && model.trim()) {
         args.push('--model', model.trim());
       }
@@ -118,8 +150,24 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
         args.push('--session-id', sessionId);
       }
 
+      // Claude: --append-system-prompt. Grok: --rules (append; docs alias).
+      // Do NOT use --system-prompt-override — that replaces Grok's agent prompt.
+      args.push(
+        '--rules',
+        buildBotmuxSystemPromptText({
+          locale,
+          botName,
+          botOpenId,
+          builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(larkAppId, locale, {
+            asksViaHook: false,
+            whiteboardEnabled: whiteboardEnabled(),
+          }),
+        }),
+      );
+
       // Positional initial prompt — processed after TUI startup (works for
-      // fresh AND resume spawns, verified on 0.2.93).
+      // fresh AND resume spawns, verified on 0.2.93). With injectsSessionContext
+      // this is the user's first turn only (no inline routing envelope).
       if (initialPrompt) args.push(initialPrompt);
       return args;
     },
@@ -231,7 +279,8 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     // through model AND tool phases (idle bar shows Shift+Tab:mode /
     // Ctrl+x:shortcuts only).
     busyPattern: /Waiting for response|Ctrl\+c:\s*cancel/i,
-    systemHints: BOTMUX_SHELL_HINTS,
+    // Routing/identity ride on --rules (injectsSessionContext); no inline hints.
+    systemHints: [],
     altScreen: true,
     // Global skill root under $GROK_HOME (TUI has no --plugin-dir); layout is
     // `skills/<name>/SKILL.md`, same operational model as Codex.

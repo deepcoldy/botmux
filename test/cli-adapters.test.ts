@@ -1516,9 +1516,32 @@ describe('grok buildArgs', () => {
   it('new session pins --session-id and --always-approve by default', () => {
     const args = adapter.buildArgs({ sessionId: sid, resume: false });
     expect(args).toContain('--always-approve');
+    expect(args).toContain('--no-plan');
     expect(args).toContain('--session-id');
     expect(args[args.indexOf('--session-id') + 1]).toBe(sid);
     expect(args).not.toContain('--resume');
+  });
+
+  it('injects botmux guidance via --rules (Claude --append-system-prompt equivalent)', () => {
+    expect(adapter.injectsSessionContext).toBe(true);
+    expect(adapter.systemHints).toEqual([]);
+    const args = adapter.buildArgs({
+      sessionId: sid,
+      resume: false,
+      botName: 'grok-loopy',
+      botOpenId: 'ou_test',
+      locale: 'zh',
+    });
+    const idx = args.indexOf('--rules');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const rules = args[idx + 1];
+    expect(rules).toContain('<botmux_routing>');
+    expect(rules).toContain('botmux send');
+    expect(rules).toContain('<identity>');
+    expect(rules).toContain('grok-loopy');
+    // Prefer append over full override — override would drop Grok's agent prompt.
+    expect(args).not.toContain('--system-prompt-override');
+    expect(args).not.toContain('--system-prompt');
   });
 
   it('omits --session-id when the session dir already exists (grok exits 1 on id reuse)', () => {
@@ -1538,9 +1561,10 @@ describe('grok buildArgs', () => {
     expect(args[idx + 1]).toBe('grok-4.5');
   });
 
-  it('omits --always-approve when disableCliBypass is true', () => {
+  it('omits --always-approve when disableCliBypass is true but still disables plan mode', () => {
     const args = adapter.buildArgs({ sessionId: sid, resume: false, disableCliBypass: true });
     expect(args).not.toContain('--always-approve');
+    expect(args).toContain('--no-plan');
   });
 
   it('passes initialPrompt as a positional arg', () => {

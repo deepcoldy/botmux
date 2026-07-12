@@ -1,9 +1,13 @@
 /**
- * Shared botmux routing hints injected into non-Claude CLIs' initial prompt.
+ * Shared botmux routing hints injected into non-injectsSessionContext CLIs'
+ * initial prompt.
  *
- * Claude Code has its own `--append-system-prompt` text baked into
- * `claude-code.ts`; this constant is only consumed by CLIs that don't expose
- * a system-prompt flag (coco / codex / gemini / opencode / aiden / mtr / hermes).
+ * CLIs that expose a system-prompt append flag set `injectsSessionContext` and
+ * push `buildBotmuxSystemPromptText` via that flag instead:
+ *   - Claude Code / genius: `--append-system-prompt`
+ *   - Grok: `--rules` (docs: Claude's append alias)
+ * This constant is only for CLIs without such a flag (coco / codex / gemini /
+ * opencode / aiden / mtr / hermes / …).
  *
  * Each array element becomes one line inside the `<botmux_routing>` XML block
  * rendered by `buildNewTopicPrompt` in `session-manager.ts`.

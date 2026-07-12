@@ -232,8 +232,9 @@ export interface CliAdapter {
   readonly systemHints: string[];
 
   /** When true, the adapter injects Lark session context (instructions +
-   *  session ID) via CLI flags (e.g. --append-system-prompt).  The session
-   *  manager skips appending "Session ID: ..." to every user message. */
+   *  session ID) via CLI flags (Claude/genius: --append-system-prompt;
+   *  Grok: --rules).  The session manager skips the inline <botmux_routing>
+   *  / <identity> / <session_id> envelope on user messages. */
   readonly injectsSessionContext?: boolean;
 
   /** When true, the CLI accepts input while busy (type-ahead). Worker writes
