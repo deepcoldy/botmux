@@ -98,10 +98,8 @@ export function findGrokSummaryBySessionId(sessionId: string, cwd?: string): str
 export function grokSessionExists(sessionId: string, cwd?: string): boolean | undefined {
   if (!sessionId) return false;
   try {
-    if (findGrokSummaryBySessionId(sessionId, cwd)) return true;
-    const root = grokSessionsRoot();
-    if (!existsSync(root)) return false;
-    return false;
+    // findGrokSummaryBySessionId already prefers cwd then scans every bucket.
+    return !!findGrokSummaryBySessionId(sessionId, cwd);
   } catch {
     return undefined;
   }
@@ -243,6 +241,14 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
   const lastNl = text.lastIndexOf('\n');
   const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
   const pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
+
+  // Pure partial-line window (writer mid-flush, no '\n' yet): never advance.
+  // ''.split('\n') yields [''] — treating that as a bare newline would push
+  // offset by 1 and desync the next poll so the finished line fails JSON.parse
+  // and is silently dropped (codex drainCodexRollout keeps newOffset = start).
+  if (!completeText) {
+    return { events: [], newOffset: start, pendingTail };
+  }
 
   const events: GrokBridgeEvent[] = [];
   let agentParts: string[] = [];

@@ -1649,6 +1649,39 @@ describe('grok buildArgs', () => {
     expect(events).toEqual(['text:line1\nline2', 'keys:Enter']);
   });
 
+  it('writeInput retries only Enter (does not re-paste full text)', async () => {
+    process.env.BOTMUX_TIME_SCALE = '0.01';
+    const cwd = '/tmp/proj';
+    const historyDir = join(GROK_TEST_HOME, 'sessions', encodeURIComponent(cwd));
+    mkdirSync(historyDir, { recursive: true });
+    const historyPath = join(historyDir, 'prompt_history.jsonl');
+    const grokMintedSid = '019f55e6-10a3-7f31-bc07-2fb370ae8239';
+
+    const events: string[] = [];
+    let enterCount = 0;
+    const pty = {
+      write() {},
+      cliCwd: cwd,
+      sendText(text: string) { events.push(`text:${text}`); },
+      sendSpecialKeys(...keys: string[]) {
+        events.push(`keys:${keys.join(',')}`);
+        enterCount++;
+        // First Enter is swallowed (slow history); second lands the submit.
+        if (enterCount >= 2) {
+          appendFileSync(historyPath, JSON.stringify({
+            timestamp: '2026-07-12T10:00:00Z', session_id: grokMintedSid, prompt: 'once only', is_bash: false,
+          }) + '\n');
+        }
+      },
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, 'once only');
+    expect(result).toEqual({ submitted: true, cliSessionId: grokMintedSid });
+    // Text pasted exactly once; Enter retried.
+    expect(events.filter((e) => e.startsWith('text:'))).toEqual(['text:once only']);
+    expect(events.filter((e) => e === 'keys:Enter').length).toBeGreaterThanOrEqual(2);
+  });
+
   it('writeInput hands back a recheck closure when the submit never lands in-band', async () => {
     process.env.BOTMUX_TIME_SCALE = '0.01';
     const cwd = '/tmp/proj';

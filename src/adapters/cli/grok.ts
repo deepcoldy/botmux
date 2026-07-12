@@ -215,19 +215,33 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       const historyPath = grokPromptHistoryPath(cwd);
       const baseByte = grokFileSize(historyPath);
 
-      const trySend = async (): Promise<void> => {
-        if (pty.sendText && pty.sendSpecialKeys) {
-          pty.sendText(content);
-          await delay(scaleMs(200));
-          pty.sendSpecialKeys('Enter');
-        } else {
-          pty.write(content);
-          await delay(scaleMs(1000));
-          pty.write('\r');
+      // Paste text once; retries only re-send Enter (codex/coco parity).
+      // Re-pasting the full body on retry double-submits when the first Enter
+      // actually landed but prompt_history was slow, or doubles composer text
+      // when Enter was dropped but the paste stuck.
+      const trySendEnter = (): boolean => {
+        try {
+          if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
+          else pty.write('\r');
+          return true;
+        } catch {
+          // tmux session gone mid-write — bail cleanly.
+          return false;
         }
       };
 
-      await trySend();
+      try {
+        if (pty.sendText && pty.sendSpecialKeys) {
+          pty.sendText(content);
+          await delay(scaleMs(200));
+        } else {
+          pty.write(content);
+          await delay(scaleMs(1000));
+        }
+      } catch {
+        return { submitted: false };
+      }
+      if (!trySendEnter()) return { submitted: false };
 
       // First submit in a fresh bucket creates the file after our snapshot —
       // re-stat base as 0 when the path appears mid-poll.
@@ -249,7 +263,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
           await delay(scaleMs(100));
         }
         if (Date.now() >= deadline) break;
-        await trySend(); // retry Enter
+        if (!trySendEnter()) return { submitted: false };
       }
 
       const late = probe();

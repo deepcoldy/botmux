@@ -214,6 +214,27 @@ describe('drainGrokUpdates', () => {
     const r2 = drainGrokUpdates(path, r1.newOffset);
     expect(r2.events.filter((e) => e.kind === 'assistant_final').map((e) => e.text)).toEqual(['done']);
   });
+
+  it('does not advance offset on a pure partial-line window (no trailing \\n yet)', () => {
+    // Grok mid-flush of a long JSONL line: poll sees bytes but no newline.
+    // Advancing by 1 would desync the next poll and drop the finished event.
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const dir = join(ROOT, 'sessions', encodeURIComponent('/tmp/proj'), sid);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, 'updates.jsonl');
+    const half = JSON.stringify(userChunk(sid, 'hello world', 'e1')).slice(0, 40);
+    writeFileSync(path, half); // no trailing \n
+    const r1 = drainGrokUpdates(path, 0);
+    expect(r1.events).toHaveLength(0);
+    expect(r1.newOffset).toBe(0);
+    expect(r1.pendingTail).toBe(half);
+
+    // Finish the line; next drain from the same offset must see the full event.
+    writeFileSync(path, JSON.stringify(userChunk(sid, 'hello world', 'e1')) + '\n');
+    const r2 = drainGrokUpdates(path, r1.newOffset);
+    expect(r2.events).toHaveLength(1);
+    expect(r2.events[0]).toMatchObject({ kind: 'user', text: 'hello world' });
+  });
 });
 
 describe('matchGrokPromptAppend', () => {
