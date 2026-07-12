@@ -2624,15 +2624,6 @@ button.primary {
   z-index: 1302;
 }
 
-.kanban-team-menu.is-disabled > summary,
-.kanban-team-menu.is-disabled > summary:hover {
-  border-color: var(--border-soft);
-  background: var(--surface);
-  color: var(--muted);
-  cursor: default;
-  opacity: 0.72;
-}
-
 /* 团队筛选范围统计：让"筛掉了什么"可见 */
 .kanban-team-stats {
   color: var(--muted);
@@ -3963,7 +3954,7 @@ td code,
 }
 
 .form-row span,
-.bd-body .bd-row span {
+.bd-body .bd-row label > span {
   display: block;
   margin-bottom: 5px;
   color: var(--muted);
@@ -7220,6 +7211,14 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);
+}
+.sect-sort-menu.is-disabled > summary,
+.sect-sort-menu.is-disabled > summary:hover {
+  border-color: var(--border-soft);
+  background: var(--surface-muted);
+  color: var(--faint);
+  cursor: not-allowed;
+  opacity: 0.62;
 }
 .sect-sort-menu[open] > summary::after {
   transform: translateY(-50%) rotate(180deg);

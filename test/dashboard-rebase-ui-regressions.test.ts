@@ -43,4 +43,19 @@ describe('dashboard master feature integration', () => {
     expect(page).toContain('}, [topologyKey]);');
     expect(page).not.toContain('}, [layout]);');
   });
+
+  it('keeps bot save statuses semantic and shared dropdowns visibly disabled', () => {
+    const css = dashboardSource('style.css');
+
+    // Nested status spans must keep their success/warning color instead of inheriting
+    // the muted field-label rule used by direct label children.
+    expect(css).toContain('.bd-body .bd-row label > span');
+    expect(css).not.toContain('.bd-body .bd-row span {');
+
+    // DropdownMenu is shared by Bots, Roles, Settings, and Sessions. Its disabled
+    // appearance belongs to the shared selector rather than a page-specific override.
+    expect(css).toContain('.sect-sort-menu.is-disabled > summary,');
+    expect(css).toMatch(/\.sect-sort-menu\.is-disabled > summary:hover \{[\s\S]*?cursor: not-allowed;[\s\S]*?opacity: 0\.62;/);
+    expect(css).not.toContain('.kanban-team-menu.is-disabled > summary');
+  });
 });
