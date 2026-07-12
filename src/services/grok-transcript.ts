@@ -32,7 +32,9 @@ import { join } from 'node:path';
 import type { CodexBridgeEvent, CodexDrainResult } from './codex-transcript.js';
 import {
   encodeGrokCwd, grokSessionsRoot, grokUpdatesPath, grokSummaryPath,
+  resolveGrokCwdBucketDir,
 } from './grok-paths.js';
+import { isBotmuxInjectedPrompt } from './resumable-session-discovery.js';
 import type { ResumableSession } from '../adapters/cli/types.js';
 
 const IS_LINUX = platform() === 'linux';
@@ -113,7 +115,7 @@ export function grokSessionExists(sessionId: string, cwd?: string): boolean | un
 export function grokSessionDirExists(sessionId: string, cwd?: string): boolean {
   if (!sessionId || !SESSION_UUID_RE.test(sessionId)) return false;
   try {
-    if (cwd && existsSync(join(grokSessionsRoot(), encodeGrokCwd(cwd), sessionId))) return true;
+    if (cwd && existsSync(join(resolveGrokCwdBucketDir(cwd), sessionId))) return true;
     const root = grokSessionsRoot();
     if (!existsSync(root)) return false;
     for (const name of readdirSync(root)) {
@@ -373,11 +375,19 @@ function normaliseNewlines(text: string): string {
  * written AT SUBMIT TIME even while a turn is running (verified 0.2.93), so
  * this confirms busy-turn type-ahead submits that updates.jsonl (dequeue-time
  * user events) cannot. Returns the owning session id when found.
+ *
+ * Concurrent safety: the file is cwd-bucket shared. Two workers in the same
+ * repo can append identical prompt text under different session_ids. Callers
+ * MUST pass `preferSessionId` (from {@link findGrokSessionByPid} of their
+ * CLI pid) so we never claim another worker's line. Without a prefer id we
+ * only accept a match when all matching lines agree on a single session_id
+ * (or have no id); ambiguous multi-sid hits fail closed.
  */
 export function matchGrokPromptAppend(
   path: string,
   fromByte: number,
   expectedText: string,
+  opts?: { preferSessionId?: string },
 ): { found: boolean; cliSessionId?: string } {
   if (!expectedText || !existsSync(path)) return { found: false };
   let size: number;
@@ -392,6 +402,7 @@ export function matchGrokPromptAppend(
   } catch { return { found: false }; }
   const expected = normaliseNewlines(expectedText);
   const expectedTrimmed = expected.trim();
+  const matches: Array<{ cliSessionId?: string }> = [];
   for (const line of buf.toString('utf8').split('\n')) {
     if (!line) continue;
     let obj: any;
@@ -404,23 +415,36 @@ export function matchGrokPromptAppend(
       const sid = typeof obj.session_id === 'string' && SESSION_UUID_RE.test(obj.session_id)
         ? obj.session_id
         : undefined;
-      return { found: true, cliSessionId: sid };
+      matches.push({ cliSessionId: sid });
     }
   }
-  return { found: false };
+  if (matches.length === 0) return { found: false };
+
+  const prefer = opts?.preferSessionId?.trim();
+  if (prefer) {
+    const hit = matches.find((m) => m.cliSessionId === prefer);
+    if (hit) return { found: true, cliSessionId: hit.cliSessionId };
+    // Preferred sid not among matches yet (slow append / other worker's lines
+    // only) — keep polling; never fall through to another sid.
+    return { found: false };
+  }
+
+  // No process binding: only safe when every match agrees on the same sid
+  // (or none). Multiple distinct sids ⇒ concurrent workers — fail closed.
+  const sids = new Set(
+    matches.map((m) => m.cliSessionId).filter((s): s is string => !!s),
+  );
+  if (sids.size > 1) return { found: false };
+  if (sids.size === 1) {
+    const only = [...sids][0]!;
+    return { found: true, cliSessionId: only };
+  }
+  // Matched text but no session_id fields — confirm submit without rotation.
+  return { found: true };
 }
 
-/** botmux injection markers — hide botmux-spawned sessions from /adopt import. */
-const BOTMUX_INJECTION_PATTERNS: readonly RegExp[] = [
-  /<user_message>[\s\S]*<\/user_message>/,
-  /<botmux_routing>[\s\S]*<\/botmux_routing>/,
-  /<sender\s+type=/,
-  /用户发送了：/,
-  /\[来自 .+ 的 @mention\]/,
-];
-
 function looksLikeBotmuxPrompt(text: string): boolean {
-  return BOTMUX_INJECTION_PATTERNS.some((re) => re.test(text));
+  return isBotmuxInjectedPrompt(text);
 }
 
 /** Head-read cap for /adopt discovery: real updates.jsonl files run to

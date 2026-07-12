@@ -13,6 +13,7 @@ import {
 } from '../../services/grok-paths.js';
 import {
   discoverGrokSessions,
+  findGrokSessionByPid,
   grokFileSize,
   grokSessionDirExists,
   grokSessionExists,
@@ -198,12 +199,16 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       // would risk cross-session false matches + persist wrong cliSessionId).
       // Production always sets cliCwd (spawn + adopt); missing cwd → fail
       // closed and let the structured bridge recover.
+      //
+      // Concurrent workers share the cwd bucket's prompt_history. Bind each
+      // match to THIS process's active Grok session via cliPid → open fds
+      // (re-probed every poll so /new|/clear|/resume rotation is picked up).
       const cwd = pty.cliCwd;
       if (!cwd) {
         if (pty.sendText && pty.sendSpecialKeys) {
-          pty.sendText(content);
+          if (pty.sendText(content) === false) return { submitted: false };
           await delay(scaleMs(200));
-          pty.sendSpecialKeys('Enter');
+          if (pty.sendSpecialKeys('Enter') === false) return { submitted: false };
         } else {
           pty.write(content);
           await delay(scaleMs(1000));
@@ -219,10 +224,14 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       // Re-pasting the full body on retry double-submits when the first Enter
       // actually landed but prompt_history was slow, or doubles composer text
       // when Enter was dropped but the paste stuck.
+      // TmuxPipeBackend (adopt) returns false on failed writes instead of
+      // throwing — treat false as definite failure.
       const trySendEnter = (): boolean => {
         try {
-          if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
-          else pty.write('\r');
+          if (pty.sendSpecialKeys) {
+            return pty.sendSpecialKeys('Enter') !== false;
+          }
+          pty.write('\r');
           return true;
         } catch {
           // tmux session gone mid-write — bail cleanly.
@@ -232,7 +241,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
 
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
-          pty.sendText(content);
+          if (pty.sendText(content) === false) return { submitted: false };
           await delay(scaleMs(200));
         } else {
           pty.write(content);
@@ -244,10 +253,14 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       if (!trySendEnter()) return { submitted: false };
 
       // First submit in a fresh bucket creates the file after our snapshot —
-      // re-stat base as 0 when the path appears mid-poll.
+      // re-stat base as 0 when the path appears mid-poll. Re-resolve prefer
+      // sid each probe so a mid-wait /new rotation still binds correctly.
       const probe = (): { found: boolean; cliSessionId?: string } => {
         const base = existsSync(historyPath) ? baseByte : 0;
-        return matchGrokPromptAppend(historyPath, base, content);
+        const preferSessionId = pty.cliPid
+          ? findGrokSessionByPid(pty.cliPid)?.sessionId
+          : undefined;
+        return matchGrokPromptAppend(historyPath, base, content, { preferSessionId });
       };
 
       const deadline = Date.now() + scaleMs(4_000);

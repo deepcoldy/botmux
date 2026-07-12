@@ -2,7 +2,7 @@
  * Unit tests for Grok updates.jsonl drain + session discovery helpers.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, writeFileSync, appendFileSync, rmSync, statSync } from 'node:fs';
+import { mkdirSync, writeFileSync, appendFileSync, rmSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -12,6 +12,11 @@ import {
   grokSessionDirExists,
   grokSessionIdFromPath,
 } from '../src/services/grok-transcript.js';
+import {
+  encodeGrokCwd,
+  grokPromptHistoryPath,
+  resolveGrokCwdBucketDir,
+} from '../src/services/grok-paths.js';
 
 const ROOT = join(tmpdir(), `botmux-grok-test-${process.pid}`);
 
@@ -278,6 +283,77 @@ describe('matchGrokPromptAppend', () => {
     expect(matchGrokPromptAppend(path, 0, 'first line\r\nsecond line').found).toBe(true);
     expect(matchGrokPromptAppend(path, 0, 'unrelated').found).toBe(false);
   });
+
+  it('does not cross-claim when two sessions append the same prompt (preferSessionId)', () => {
+    const sidA = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const sidB = 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writePromptHistory('/tmp/shared-proj', []);
+    const prompt = '继续';
+    // Worker A and B both submit the same text into the shared cwd bucket.
+    appendFileSync(path, JSON.stringify(promptHistoryLine(sidA, prompt)) + '\n');
+    appendFileSync(path, JSON.stringify(promptHistoryLine(sidB, prompt)) + '\n');
+
+    // Without binding: ambiguous → fail closed (never hand B's sid to A).
+    expect(matchGrokPromptAppend(path, 0, prompt).found).toBe(false);
+
+    // With prefer: each worker claims only its own line.
+    expect(matchGrokPromptAppend(path, 0, prompt, { preferSessionId: sidA }))
+      .toEqual({ found: true, cliSessionId: sidA });
+    expect(matchGrokPromptAppend(path, 0, prompt, { preferSessionId: sidB }))
+      .toEqual({ found: true, cliSessionId: sidB });
+
+    // Prefer a sid that has not appended yet → not found (keep polling).
+    expect(matchGrokPromptAppend(path, 0, prompt, {
+      preferSessionId: 'cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+    }).found).toBe(false);
+  });
+});
+
+describe('resolveGrokCwdBucketDir / hashed buckets', () => {
+  beforeEach(() => {
+    process.env.GROK_HOME = ROOT;
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(ROOT, { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(ROOT, { recursive: true, force: true });
+    delete process.env.GROK_HOME;
+  });
+
+  it('prefers the normal encoded bucket when present', () => {
+    const cwd = '/tmp/short-proj';
+    const encoded = encodeGrokCwd(cwd);
+    mkdirSync(join(ROOT, 'sessions', encoded), { recursive: true });
+    expect(resolveGrokCwdBucketDir(cwd)).toBe(join(ROOT, 'sessions', encoded));
+  });
+
+  it('locates a hashed bucket via .cwd when encoded name would exceed 255 bytes', () => {
+    // CJK path: percent-encoding balloons past 255 bytes easily.
+    const cwd = '/tmp/' + '测'.repeat(90);
+    expect(Buffer.byteLength(encodeGrokCwd(cwd), 'utf8')).toBeGreaterThan(255);
+
+    const hashBucket = 'ce-shi-a1b2c3d4'; // fake slug+hash; only .cwd content matters
+    const bucketDir = join(ROOT, 'sessions', hashBucket);
+    mkdirSync(bucketDir, { recursive: true });
+    writeFileSync(join(bucketDir, '.cwd'), cwd + '\n');
+    writeFileSync(join(bucketDir, 'prompt_history.jsonl'), '');
+
+    expect(resolveGrokCwdBucketDir(cwd)).toBe(bucketDir);
+    // prompt_history must resolve through the hashed bucket — not the
+    // non-existent encoded path that would ENAMETOOLONG / miss the file.
+    expect(grokPromptHistoryPath(cwd)).toBe(join(bucketDir, 'prompt_history.jsonl'));
+    expect(existsSync(grokPromptHistoryPath(cwd))).toBe(true);
+  });
+
+  it('does not bind a hashed bucket whose .cwd points at a different path', () => {
+    const cwd = '/tmp/' + '路'.repeat(90);
+    const other = '/tmp/other-long-' + '径'.repeat(80);
+    const hashBucket = 'other-hash-ffff';
+    mkdirSync(join(ROOT, 'sessions', hashBucket), { recursive: true });
+    writeFileSync(join(ROOT, 'sessions', hashBucket, '.cwd'), other);
+    // No matching bucket → fall back to preferred encoded path (may not exist).
+    expect(resolveGrokCwdBucketDir(cwd)).toBe(join(ROOT, 'sessions', encodeGrokCwd(cwd)));
+  });
 });
 
 describe('grokSessionDirExists / grokSessionIdFromPath', () => {
@@ -335,5 +411,24 @@ describe('discoverGrokSessions', () => {
     expect(out.map((s) => s.cliSessionId)).toContain(external);
     expect(out.map((s) => s.cliSessionId)).not.toContain(botmux);
     expect(out.find((s) => s.cliSessionId === external)?.cwd).toBe('/tmp/a');
+  });
+
+  it('keeps external prompts that merely discuss botmux tags (structural filter only)', async () => {
+    const discuss = '33333333-3333-4333-8333-333333333333';
+    // Real botmux envelope: whole turn IS the structural wrapper.
+    const botmuxReal = '44444444-4444-4444-8444-444444444444';
+    writeUpdates(discuss, '/tmp/c', [
+      userChunk(discuss, 'explain why <user_message>…</user_message> and <botmux_routing> appear in the transcript', 'e1'),
+    ]);
+    writeUpdates(botmuxReal, '/tmp/d', [
+      userChunk(
+        botmuxReal,
+        '<user_message>\nplease review\n</user_message>\n\n<sender type="user" open_id="ou_0123456789abcdef0123456789abcdef" />',
+        'e1',
+      ),
+    ]);
+    const out = await discoverGrokSessions(10);
+    expect(out.map((s) => s.cliSessionId)).toContain(discuss);
+    expect(out.map((s) => s.cliSessionId)).not.toContain(botmuxReal);
   });
 });

@@ -1682,6 +1682,35 @@ describe('grok buildArgs', () => {
     expect(events.filter((e) => e === 'keys:Enter').length).toBeGreaterThanOrEqual(2);
   });
 
+  it('writeInput treats sendText/sendSpecialKeys false as definite failure (adopt pipe path)', async () => {
+    process.env.BOTMUX_TIME_SCALE = '0.01';
+    const cwd = '/tmp/proj';
+    mkdirSync(join(GROK_TEST_HOME, 'sessions', encodeURIComponent(cwd)), { recursive: true });
+    const pty = {
+      write() {},
+      cliCwd: cwd,
+      // TmuxPipeBackend returns false when the pane write is dropped (no throw).
+      sendText(): boolean { return false; },
+      sendSpecialKeys(): boolean { return false; },
+    } satisfies PtyHandle;
+    const result = await adapter.writeInput(pty, 'dropped write');
+    expect(result).toEqual({ submitted: false });
+  });
+
+  it('writeInput treats false from Enter (after successful paste) as failure', async () => {
+    process.env.BOTMUX_TIME_SCALE = '0.01';
+    const cwd = '/tmp/proj';
+    mkdirSync(join(GROK_TEST_HOME, 'sessions', encodeURIComponent(cwd)), { recursive: true });
+    const pty = {
+      write() {},
+      cliCwd: cwd,
+      sendText(): boolean { return true; },
+      sendSpecialKeys(): boolean { return false; },
+    } satisfies PtyHandle;
+    const result = await adapter.writeInput(pty, 'paste ok enter dropped');
+    expect(result).toEqual({ submitted: false });
+  });
+
   it('writeInput hands back a recheck closure when the submit never lands in-band', async () => {
     process.env.BOTMUX_TIME_SCALE = '0.01';
     const cwd = '/tmp/proj';

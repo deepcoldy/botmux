@@ -19,7 +19,7 @@ import { statSync } from 'node:fs';
 import { logger } from '../utils/logger.js';
 import { parseCustomPassthroughInput } from '../core/passthrough-commands.js';
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
-import { sanitizePerBotEnv } from '../core/per-bot-env.js';
+import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.js';
 
 /**
  * 生效时机：
@@ -263,7 +263,7 @@ export async function setBotAllowedUsers(
 
 export type CoerceResult =
   | { ok: true; value: unknown }
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'empty' | 'too_long' };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' };
 
 /**
  * 把一个**原始**字段值（来自卡片下拉/输入或别处）按字段 kind 解析校验成可落盘的
@@ -309,10 +309,15 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
           return policy ? { ok: true, value: policy } : { ok: false, reason: 'invalid_json' };
         }
         if (spec.configKey === 'env') {
-          // Must be a JSON object; sanitize to valid env keys + primitive values
-          // (botmux-reserved keys dropped). Nothing valid left → reject (empty
-          // text is handled as "clear" by the caller before reaching coerce).
+          // Must be a JSON object; sanitize to valid env keys + primitive values.
+          // Reserved keys (CODEX_HOME / GROK_HOME / BOTMUX_* / …) are rejected
+          // visibly — silent drop would hide split-brain configs (CLI gets a
+          // custom home via injectEnv while daemon paths stay on default).
+          // Empty text is handled as "clear" by the caller before coerce.
           if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'invalid_json' };
+          const reserved = Object.keys(parsed as Record<string, unknown>)
+            .filter((k) => isReservedPerBotEnvKey(k));
+          if (reserved.length > 0) return { ok: false, reason: 'reserved_env' };
           const sanitized = sanitizePerBotEnv(parsed);
           return Object.keys(sanitized).length ? { ok: true, value: sanitized } : { ok: false, reason: 'invalid_json' };
         }

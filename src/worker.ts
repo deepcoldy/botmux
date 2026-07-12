@@ -4155,6 +4155,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       : new TmuxPipeBackend(cfg.adoptTmuxTarget!, { cliPid: cfg.adoptCliPid });
     effectiveBackendType = cfg.adoptZellijPaneId ? 'zellij' : 'tmux';
     backend = observeBe;
+    // writeInput (grok concurrent prompt_history binding, claude pid-state)
+    // reads these fields off the PtyHandle — constructor only stores
+    // watchCliPid for liveness, so surface them explicitly for adopt.
+    if (cfg.adoptCliPid) (observeBe as { cliPid?: number }).cliPid = cfg.adoptCliPid;
+    (observeBe as { cliCwd?: string }).cliCwd = cfg.adoptCwd ?? cfg.workingDir;
     observeBe.spawn('', [], {
       cwd: cfg.workingDir,
       cols,
@@ -4940,15 +4945,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   if (cliPid) startWrapperRealPidResolve(cliPid);
   if (cliPid) observeCursorCliSessionId(cliPid);
 
-  // Wire pid + cwd so the claude-code adapter's writeInput can read
-  // ~/.claude/sessions/<pid>.json — the spawn-time pid-state record. Its
-  // `sessionId` is set ONCE at process start (Claude Code 2.1.123); a
-  // `--resume` lookup will surface here, but in-pane `/clear` won't, so a
-  // 'matching sessionId' answer is "no spawn-time rotation observed", not
-  // "no rotation at all". The pinned claudeJsonlPath above is still the
-  // initial guess; the resolver corrects it on first write when Claude was
-  // started with `--resume`.
-  if (claudeDataDir && cliPid) {
+  // Wire pid + cwd so adapters' writeInput can bind submits to this process:
+  //   - claude-code: ~/.claude/sessions/<pid>.json
+  //   - grok: findGrokSessionByPid → preferSessionId against shared
+  //     prompt_history (concurrent same-cwd workers must not cross-claim)
+  // Claude's sessionId is set ONCE at process start (2.1.123); a `--resume`
+  // lookup will surface here, but in-pane `/clear` won't. The pinned
+  // claudeJsonlPath above is still the initial guess; the resolver corrects
+  // it on first write when Claude was started with `--resume`.
+  if (cliPid && (claudeDataDir || cfg.cliId === 'grok')) {
     (backend as TmuxBackend | PtyBackend | ZellijBackend).cliPid = cliPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend).cliCwd = cfg.workingDir;
   }
@@ -4977,7 +4982,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
             log(`Failed to write CLI PID marker (async): ${err.message}`);
           }
         }
-        if (claudeDataDir) {
+        if (claudeDataDir || cfg.cliId === 'grok') {
           (backend as TmuxBackend | PtyBackend | ZellijBackend).cliPid = pid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend).cliCwd = cfg.workingDir;
         }
@@ -6039,17 +6044,18 @@ process.on('message', async (raw: unknown) => {
           }
         }
         // Adopt mode write:
-        //   - codex routes through cliAdapter.writeInput so the adapter's
-        //     paste-detection delay + Enter-retry + history.jsonl verify
-        //     loop handles Codex TUI's "\n treated as Enter" submit
-        //     behaviour. Without it, Lark messages get stranded in the
-        //     input box (user-reported "卡在输入框中").
+        //   - Structured-bridge adopt-input CLIs (codex/traex/pi/grok/mtr)
+        //     route through cliAdapter.writeInput so paste+Enter-retry +
+        //     transcript/history verify (and grok's prompt_history →
+        //     cliSessionId re-attach after /new) all run. Hardcoding only
+        //     codex/traex left grok on raw sendText, so /new rotation never
+        //     re-attached the bridge.
         //   - everything else keeps the simple raw sendText+Enter — the
         //     claude-code adopt bridge has its own dual-write recovery
         //     path, and the other CLIs' adopt flows haven't surfaced
         //     this submit-detection issue.
         if (backend) {
-          if ((lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex') && cliAdapter) {
+          if (isStructuredBridgeAdoptInputCli(lastInitConfig?.cliId) && cliAdapter) {
             // writeInput is async but we're already inside an async
             // message handler. Errors are best-effort logged; the bridge
             // ingest path is unaffected because mark already happened
@@ -6061,10 +6067,10 @@ process.on('message', async (raw: unknown) => {
                 codexBridgeNotifyCliSessionId(result.cliSessionId);
               }
               if (result && result.submitted === false) {
-                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history', undefined, result.failureReason, turnSeq);
+                scheduleSubmitFailureNotify(content, result.recheck, 'submit history', undefined, result.failureReason, turnSeq);
               }
             } catch (err: any) {
-              log(`Codex adopt writeInput error: ${err.message}`);
+              log(`Adopt writeInput error (${lastInitConfig?.cliId}): ${err.message}`);
             }
           } else if ('sendText' in backend && 'sendSpecialKeys' in backend) {
             (backend as any).sendText(content);
