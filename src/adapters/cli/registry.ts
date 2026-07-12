@@ -25,6 +25,7 @@ import { createPiAdapter } from './pi.js';
 import { createCopilotAdapter } from './copilot.js';
 import { createOhMyPiAdapter } from './oh-my-pi.js';
 import { createKimiAdapter } from './kimi.js';
+import { createGrokAdapter } from './grok.js';
 
 /** Resolve a command name to its absolute path via shell `which`.
  *  Tries login shell first (-lc), then interactive shell (-ic) for tools
@@ -100,7 +101,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter, createGrokAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -126,6 +127,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'copilot': return createCopilotAdapter(pathOverride);
     case 'oh-my-pi': return createOhMyPiAdapter(pathOverride);
     case 'kimi': return createKimiAdapter(pathOverride);
+    case 'grok': return createGrokAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }

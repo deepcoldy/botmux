@@ -67,6 +67,10 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   hermes: 'hermes',
   pi: 'pi',
   omp: 'oh-my-pi',
+  // Grok Build 的可执行就叫 `grok`（原生二进制，comm = basename），映射后
+  // live `/adopt` 才能按 comm 发现正在运行的 Grok pane 并进 worker 的
+  // grok adopt 分支（transcript bridge / by-pid 绑定都依赖这个入口）。
+  grok: 'grok',
 };
 
 /** Interpreters and native launchers that may hide the CLI identity in argv.

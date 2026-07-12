@@ -60,7 +60,17 @@ import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from 
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
-import { drainPiTranscript, findPiTranscriptByPid, findPiTranscriptBySessionId } from './services/pi-transcript.js';
+import { drainPiTranscript } from './services/pi-transcript.js';
+import {
+  drainGrokUpdates,
+  grokSessionIdFromPath,
+} from './services/grok-transcript.js';
+import { resolveFileBridgePath } from './services/file-bridge-path.js';
+import {
+  isStructuredBridgeAdoptIdleCli,
+  isStructuredBridgeAdoptInputCli,
+  isStructuredBridgeFallbackActive,
+} from './services/structured-bridge-clis.js';
 import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
@@ -349,7 +359,7 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi', grok: 'Grok Build' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -1900,16 +1910,10 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 // shared with the Claude path.
 
 function codexBridgeFallbackActive(): boolean {
-  // True for transcript-backed CLIs whose final output can be harvested
-  // when the model forgets to call `botmux send`.
-  const id = lastInitConfig?.cliId;
-  if (id === 'codex' || id === 'traex' || id === 'coco' || id === 'hermes' || id === 'mtr' || id === 'pi') return true;
-  // Cursor only harvests its transcript in adopt mode: a botmux-spawned
-  // cursor session carries the botmux skill and replies via `botmux send`,
-  // and we never resolve a transcript path for it — so leave that flow
-  // (screen capture + botmux send) untouched and scope the bridge to adopt.
-  if (id === 'cursor') return lastInitConfig?.adoptMode === true;
-  return false;
+  // Transcript-backed CLIs whose final output can be harvested when the
+  // model forgets to call `botmux send`. Cursor is adopt-only — see
+  // services/structured-bridge-clis.ts (single source of the allowlist).
+  return isStructuredBridgeFallbackActive(lastInitConfig?.cliId, lastInitConfig?.adoptMode === true);
 }
 
 // Both Codex and TRAE share the same rollout JSONL layout (response_item
@@ -1930,6 +1934,10 @@ function structuredBridgeIsPi(): boolean {
   return lastInitConfig?.cliId === 'pi';
 }
 
+function structuredBridgeIsGrok(): boolean {
+  return lastInitConfig?.cliId === 'grok';
+}
+
 function codexBridgeIsCursor(): boolean {
   return lastInitConfig?.cliId === 'cursor';
 }
@@ -1942,6 +1950,7 @@ function structuredBridgeIngestPath(path: string, offset: number) {
   if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
   if (codexBridgeIsCursor()) return drainCursorTranscript(path, offset);
   if (structuredBridgeIsPi()) return drainPiTranscript(path, offset);
+  if (structuredBridgeIsGrok()) return drainGrokUpdates(path, offset);
   if (structuredBridgeIsHermes()) {
     const result = drainHermesStateDb(offset, currentHermesBridgeDbPath());
     return { events: result.events, newOffset: result.newOffset, pendingTail: '' };
@@ -2015,55 +2024,19 @@ function codexBridgeStartTimer(): void {
         return;
       }
       if (!codexBridgeRolloutPath) {
-        // Two discovery paths, in order: cliSessionId (known via writeInput
-        // result for non-adopt or daemon-side probe for adopt) → exact
-        // file by name; PID (adopt only) → walk /proc/<pid>/fd. Adopt
-        // attaches via split-live (history absorbed, live ingested);
-        // non-adopt uses fresh-empty (queue's markTimeMs - 5s lower bound
-        // gates historical fingerprint matches without needing a split).
-        // Discovery primitives differ per CLI: codex walks ~/.codex/sessions
-        // by sid suffix; CoCo's events.jsonl path is deterministic from
-        // sid, so the lookup is just a path computation + existence check.
-        const isCoco = lastInitConfig?.cliId === 'coco';
-        const isTraex = lastInitConfig?.cliId === 'traex';
-        const isPi = lastInitConfig?.cliId === 'pi';
-        let path: string | undefined;
-        if (codexBridgePendingSessionId) {
-          if (isCoco) {
-            path = cocoEventsPathForSession(codexBridgePendingSessionId);
-            if (path && !existsSync(path)) path = undefined;
-          } else if (isPi) {
-            path = findPiTranscriptBySessionId(codexBridgePendingSessionId, lastInitConfig?.workingDir);
-          } else if (isTraex) {
-            path = findTraexRolloutBySessionId(codexBridgePendingSessionId);
-          } else {
-            path = findCodexRolloutBySessionId(codexBridgePendingSessionId);
-          }
-        }
-        if (!path && codexAdoptPendingPid) {
-          if (isCoco) {
-            const probed = findCocoSessionByPid(codexAdoptPendingPid);
-            if (probed && existsSync(probed.eventsPath)) path = probed.eventsPath;
-          } else if (isPi) {
-            const probed = findPiTranscriptByPid(codexAdoptPendingPid);
-            if (probed) path = probed.path;
-          } else if (isTraex) {
-            const probed = findTraexRolloutByPid(codexAdoptPendingPid);
-            if (probed) path = probed.path;
-          } else {
-            const probed = findCodexRolloutByPid(codexAdoptPendingPid);
-            if (probed) path = probed.path;
-          }
-        }
+        // Late-attach: cliSessionId (writeInput / daemon probe) then adopt
+        // pid. Path lookup is centralized in resolveFileBridgePath so
+        // adding a file-backed CLI does not grow this if-tree.
+        // Adopt → split-live; non-adopt → fresh-empty (queue markTimeMs
+        // lower bound handles history without a split).
+        const path = resolveFileBridgePath(lastInitConfig?.cliId, {
+          sessionId: codexBridgePendingSessionId,
+          cwd: lastInitConfig?.workingDir,
+          pid: codexAdoptPendingPid,
+        });
         if (path) {
           codexBridgePendingSessionId = undefined;
           codexAdoptPendingPid = undefined;
-          // Adopt mode: split-live partitions drained events by
-          // codexAdoptStartMs so anything the user did AFTER adopt but
-          // BEFORE we found the rollout still emits (history is absorbed,
-          // live is ingested). Non-adopt: fresh-empty as before — queue's
-          // markTimeMs - 5s lower bound is enough since there's no
-          // local-turn synthesis on that path.
           const mode = lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty';
           codexBridgeAttach(path, mode);
         }
@@ -2259,11 +2232,55 @@ function cursorBridgeAttach(path: string, mode: CursorAttachMode = 'baseline-exi
   codexBridgeAttach(path, mode === 'baseline-existing' ? 'baseline-existing-skip-tail' : mode);
 }
 
+/** Drop the current file-backed bridge attachment (watcher + path cursor).
+ *  Does NOT clear the pending-turn queue — mid-rotation submits still need
+ *  fingerprint matching against the next attach. */
+function codexBridgeDetachFile(): void {
+  if (codexBridgeWatcher) {
+    try { codexBridgeWatcher.close(); } catch { /* ignore */ }
+    codexBridgeWatcher = null;
+  }
+  codexBridgeRolloutPath = undefined;
+  codexBridgeOffset = 0;
+  codexBridgePendingTail = '';
+  codexBridgeBaselineDone = false;
+}
+
 /** Called from flushPending after writeInput first returns a cliSessionId.
  *  Tries to locate the rollout file immediately; if it's not on disk yet,
  *  remembers the sid so the 1s poller can keep retrying. */
 function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
-  if (!codexBridgeFallbackActive() || codexBridgeRolloutPath) return;
+  if (!codexBridgeFallbackActive()) return;
+  if (codexBridgeRolloutPath) {
+    // Already attached — first-attach-wins for most CLIs. Exception: grok's
+    // `/new` / `/clear` / `/resume` rotate to a NEW session directory at the
+    // SAME pid, and writeInput's prompt_history verify reports the new
+    // session id on the very next submit. Without a re-attach the bridge
+    // stays wedged on the old updates.jsonl and the reply fallback / idle
+    // signal go dark for the rest of the session.
+    if (structuredBridgeIsGrok()) {
+      const currentSid = grokSessionIdFromPath(codexBridgeRolloutPath);
+      if (currentSid && currentSid.toLowerCase() === cliSessionId.toLowerCase()) return;
+      const next = resolveFileBridgePath('grok', {
+        sessionId: cliSessionId,
+        cwd: lastInitConfig?.workingDir,
+      });
+      if (next && next !== codexBridgeRolloutPath) {
+        log(`Grok session rotated ${currentSid ?? '?'} → ${cliSessionId}; re-attaching bridge to ${next}`);
+        codexBridgeDetachFile();
+        codexBridgePendingSessionId = undefined;
+        codexBridgeAttach(next, 'fresh-empty');
+      } else if (!next) {
+        // New session id reported but updates.jsonl not on disk yet —
+        // detach the retired session and arm the poller for late-attach.
+        log(`Grok session rotated ${currentSid ?? '?'} → ${cliSessionId}; waiting for updates.jsonl`);
+        codexBridgeDetachFile();
+        codexBridgePendingSessionId = cliSessionId;
+        codexBridgeStartTimer();
+      }
+    }
+    return;
+  }
   if (structuredBridgeIsMtr()) {
     const source = findMtrSessionById(cliSessionId);
     if (source) {
@@ -2278,7 +2295,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   if (codexBridgeIsCursor()) {
     // Cursor's cliSessionId is the chatId — the same UUID naming the
     // agent-transcript JSONL, so it resolves the path directly.
-    const cursorPath = findCursorTranscriptByChatId(cliSessionId);
+    const cursorPath = resolveFileBridgePath('cursor', { sessionId: cliSessionId });
     if (cursorPath) {
       codexBridgePendingSessionId = undefined;
       cursorBridgeAttach(cursorPath, cursorLateAttachMode(cursorPath));
@@ -2288,11 +2305,10 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     }
     return;
   }
-  const path = lastInitConfig?.cliId === 'traex'
-    ? findTraexRolloutBySessionId(cliSessionId)
-    : lastInitConfig?.cliId === 'pi'
-      ? findPiTranscriptBySessionId(cliSessionId, lastInitConfig?.workingDir)
-      : findCodexRolloutBySessionId(cliSessionId);
+  const path = resolveFileBridgePath(lastInitConfig?.cliId, {
+    sessionId: cliSessionId,
+    cwd: lastInitConfig?.workingDir,
+  });
   if (path) {
     codexBridgePendingSessionId = undefined;
     codexBridgeAttach(path, 'fresh-empty');
@@ -3925,39 +3941,45 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
       codexAdoptPendingPid = cfg.adoptCliPid;
       codexBridgeStartTimer();
     }
-  } else if (cfg.cliId === 'pi') {
-    const adoptStartMs = Date.now();
-    codexAdoptStartMs = adoptStartMs;
-    codexBridgeQueue.setLocalTurns(true, adoptStartMs);
-    let path: string | undefined;
-    if (cfg.cliSessionId) path = findPiTranscriptBySessionId(cfg.cliSessionId, cfg.adoptCwd ?? cfg.workingDir);
-    if (!path && cfg.adoptCliPid) {
-      const probed = findPiTranscriptByPid(cfg.adoptCliPid);
-      if (probed) path = probed.path;
-    }
-    if (path) {
-      codexBridgeAttach(path, 'split-live');
-    } else {
-      if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
-      codexAdoptPendingPid = cfg.adoptCliPid;
-      codexBridgeStartTimer();
-    }
+  } else if (cfg.cliId === 'pi' || cfg.cliId === 'grok') {
+    // File-backed bridges share the same adopt attach skeleton (sid → pid →
+    // split-live | pending). Path lookup is resolveFileBridgePath; pi is
+    // intentionally folded here with grok so the two stay in lockstep.
+    setupAdoptFileBridge(cfg);
+  }
+}
+
+/** Adopt attach for file-backed structured bridges (pi/grok today; codex/
+ *  traex keep their own branches for rollout-specific probes). */
+function setupAdoptFileBridge(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  const adoptStartMs = Date.now();
+  codexAdoptStartMs = adoptStartMs;
+  codexBridgeQueue.setLocalTurns(true, adoptStartMs);
+  const path = resolveFileBridgePath(cfg.cliId, {
+    sessionId: cfg.cliSessionId,
+    cwd: cfg.adoptCwd ?? cfg.workingDir,
+    pid: cfg.adoptCliPid,
+  });
+  if (path) {
+    codexBridgeAttach(path, 'split-live');
+  } else {
+    if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
+    codexAdoptPendingPid = cfg.adoptCliPid;
+    codexBridgeStartTimer();
   }
 }
 
 function adoptIdleAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): CliAdapter {
   return cfg.bridgeJsonlPath
     ? createCliAdapterSync('claude-code', undefined)
-    : cfg.cliId === 'codex' || cfg.cliId === 'traex' || cfg.cliId === 'coco' || cfg.cliId === 'mtr' || cfg.cliId === 'pi'
-      ? createCliAdapterSync(cfg.cliId, undefined)
+    : isStructuredBridgeAdoptIdleCli(cfg.cliId)
+      ? createCliAdapterSync(cfg.cliId as CliId, undefined)
       : ({ completionPattern: undefined, readyPattern: undefined } as CliAdapter);
 }
 
 function setupAdoptInputAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
-  if (cfg.cliId === 'codex' || cfg.cliId === 'traex' || cfg.cliId === 'pi') {
-    cliAdapter = createCliAdapterSync(cfg.cliId, cfg.cliPathOverride);
-  } else if (cfg.cliId === 'mtr') {
-    cliAdapter = createCliAdapterSync('mtr', cfg.cliPathOverride);
+  if (isStructuredBridgeAdoptInputCli(cfg.cliId)) {
+    cliAdapter = createCliAdapterSync(cfg.cliId as CliId, cfg.cliPathOverride);
   }
 }
 
@@ -5054,16 +5076,20 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     } else {
       codexBridgeStartTimer();
     }
-  } else if (cfg.cliId === 'pi') {
-    const piSessionId = effectiveCliSessionId ?? effectiveAdapterSessionId;
-    if (piSessionId) {
-      const transcriptPath = findPiTranscriptBySessionId(piSessionId, cfg.workingDir);
-      if (transcriptPath) {
-        codexBridgeAttach(transcriptPath, effectiveResume ? 'baseline-existing' : 'fresh-empty');
-      } else {
-        codexBridgePendingSessionId = piSessionId;
-        codexBridgeStartTimer();
-      }
+  } else if (cfg.cliId === 'pi' || cfg.cliId === 'grok') {
+    // File-backed: pin path when known (pi session id / grok --session-id
+    // UUID), else arm the poller. Grok collision-fallback (dir already
+    // exists → no --session-id → grok mints id) is recovered via writeInput
+    // → codexBridgeNotifyCliSessionId.
+    const sid = effectiveCliSessionId ?? effectiveAdapterSessionId;
+    const path = sid
+      ? resolveFileBridgePath(cfg.cliId, { sessionId: sid, cwd: cfg.workingDir })
+      : undefined;
+    if (path) {
+      codexBridgeAttach(path, effectiveResume ? 'baseline-existing' : 'fresh-empty');
+    } else if (sid) {
+      codexBridgePendingSessionId = sid;
+      codexBridgeStartTimer();
     } else {
       codexBridgeStartTimer();
     }

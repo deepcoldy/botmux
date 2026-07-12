@@ -48,6 +48,7 @@ import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.js';
 import { prepareSessionSkillPrompt } from './skills/session-runtime.js';
 import { prepareSkillDelivery } from './skills/delivery.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
@@ -2924,7 +2925,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   // open store.db fd (chatId), or from cliSessionId (= chatId) when discovery
   // captured it — so adopt must forward the pid + cwd like the other
   // transcript-backed CLIs.
-  const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'traex' || adoptedCliId === 'coco' || adoptedCliId === 'mtr' || adoptedCliId === 'cursor';
+  const isStructuredBridge = isStructuredBridgeAdoptCli(adoptedCliId);
   const adoptBackendType = adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
 
   const initMsg: DaemonToWorker = {
