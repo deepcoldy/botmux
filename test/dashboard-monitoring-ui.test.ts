@@ -323,7 +323,8 @@ describe('dashboard monitoring session table', () => {
 
     expect(css).toMatch(/\.resource-page\s*\{[^}]*isolation:\s*isolate/s);
     expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*position:\s*fixed[^}]*z-index:\s*2147483647/s);
-    expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*pointer-events:\s*none/s);
+    expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*pointer-events:\s*auto/s);
+    expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*user-select:\s*text/s);
   });
 
   it('uses a compact unsupported resource sampling empty state', () => {
