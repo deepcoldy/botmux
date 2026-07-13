@@ -117,6 +117,7 @@ import {
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, loadBotConfigs, readBotSkillPolicy } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
+import { updateSessionTitle } from './session-title.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, Session } from '../types.js';
 import type { DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
@@ -664,13 +665,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/rename', async (req, res, params) => 
   if (!title) return jsonRes(res, 400, { ok: false, error: 'bad_title' });
   const session = findSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  session.title = title;
-  sessionStore.updateSession(session);
-  dashboardEventBus.publish({
-    type: 'session.update',
-    body: { sessionId: params.sessionId, patch: { title } },
-  });
-  jsonRes(res, 200, { ok: true, title });
+  const updated = updateSessionTitle(session, title);
+  if (!updated.ok) return jsonRes(res, 400, { ok: false, error: updated.error });
+  jsonRes(res, 200, updated);
 });
 
 // 会话锁定：保护被锁定会话不被 dashboard「清理空闲」批量关闭。锁定是会话元数据，

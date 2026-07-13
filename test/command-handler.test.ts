@@ -537,7 +537,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/title', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/insight', '/dashboard', '/vc-auth'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -564,9 +564,9 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 29 = the prior 28 commands + /watch-comment. /subscribe-lark-doc remains
-    // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(29);
+    // 30 = the prior 28 commands + /watch-comment + /title. /subscribe-lark-doc
+    // remains as its original per-file API subscription command rather than an alias.
+    expect(DAEMON_COMMANDS.size).toBe(30);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -1290,6 +1290,7 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('/restart');
       expect(replyContent).toContain('/cd');
       expect(replyContent).toContain('/repo');
+      expect(replyContent).toContain('/title');
       expect(replyContent).toContain('/status');
       expect(replyContent).toContain('/help');
       expect(replyContent).toContain('/schedule');
@@ -1455,6 +1456,46 @@ describe('handleCommand', () => {
 
       expect(killWorker).toHaveBeenCalledWith(ds);
       expect(ds.workingDir).toBe('/data00/home/wanghao.muchen/ai-workspace/marketing_insight');
+    });
+  });
+
+  // ─── /title ──────────────────────────────────────────────────────────────
+
+  describe('/title', () => {
+    it('shows usage when no title is provided', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/title', ROOT_ID, makeLarkMessage('/title'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('/title');
+      expect(replyContent).toContain('新的会话标题');
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('reports when there is no active session', async () => {
+      const deps = makeDeps();
+
+      await handleCommand('/title', ROOT_ID, makeLarkMessage('/title Better label'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('没有活跃的会话');
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('updates the session title without restarting the worker', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/title', ROOT_ID, makeLarkMessage('/title  ZMX 后端集成推进  '), deps, LARK_APP_ID);
+
+      expect(ds.session.title).toBe('ZMX 后端集成推进');
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('会话标题已更新');
+      expect(replyContent).toContain('ZMX 后端集成推进');
     });
   });
 

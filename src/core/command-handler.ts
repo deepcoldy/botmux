@@ -70,6 +70,7 @@ import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
+import { updateSessionTitle } from './session-title.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -1274,6 +1275,26 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.cd.switched', { path: resolvedPath }, loc));
         }
         logger.info(`[${logTag}] Working directory changed to ${resolvedPath} by /cd command${validation.created ? ' (auto-created)' : ''}`);
+        break;
+      }
+
+      case '/title': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        const rawTitle = message.content.replace(/^\/title\s*/i, '').trim();
+        if (!rawTitle) {
+          await sessionReply(rootId, t('cmd.title.usage', undefined, loc));
+          break;
+        }
+        const updated = updateSessionTitle(ds.session, rawTitle);
+        if (!updated.ok) {
+          await sessionReply(rootId, t('cmd.title.usage', undefined, loc));
+          break;
+        }
+        await sessionReply(rootId, t('cmd.title.updated', { title: updated.title }, loc));
+        logger.info(`[${logTag}] Session title changed by /title: ${updated.title}`);
         break;
       }
 
@@ -2868,6 +2889,7 @@ export async function handleCommand(
           t('help.repo_n', undefined, loc),
           t('help.repo_path', undefined, loc),
           t('help.repo_wt', undefined, loc),
+          t('help.title', undefined, loc),
           t('help.status', undefined, loc),
           t('help.card', undefined, loc),
           t('help.term', undefined, loc),
