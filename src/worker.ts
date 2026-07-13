@@ -4101,6 +4101,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     setupAdoptIdleDetection(cfg, 'herdr');
 
     backend.onData(onPtyData);
+    backend.onAccessUrl?.((url) => {
+      send({ type: 'riff_access_url', accessUrl: url });
+    });
     backend.onExit((code, signal) => {
       log(`Adopted herdr stream ended (code: ${code}, signal: ${signal})`);
       backend = null;
@@ -4151,6 +4154,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     setupAdoptInputAdapter(cfg);
 
     backend.onData(onPtyData);
+    backend.onAccessUrl?.((url) => {
+      send({ type: 'riff_access_url', accessUrl: url });
+    });
     backend.onExit((code, signal) => {
       log(`Adopted pipe-pane stream ended (code: ${code}, signal: ${signal})`);
       backend = null;
@@ -5117,6 +5123,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   });
 
   backend.onData(onPtyData);
+  backend.onAccessUrl?.((url) => {
+    send({ type: 'riff_access_url', accessUrl: url });
+  });
   backend.onExit((code, signal) => {
     log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
     const logTail = recentTerminalLogTail();

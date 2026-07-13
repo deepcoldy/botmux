@@ -53,6 +53,7 @@ export class RiffBackend implements SessionBackend {
   private sessionId: string;
   private dataCb: ((data: string) => void) | null = null;
   private exitCb: ((code: number | null, signal: string | null) => void) | null = null;
+  private accessUrlCb: ((url: string) => void) | null = null;
   private outputBuffer = '';
   private currentTaskId: string | null = null;
   private currentAccessUrl: string | null = null;
@@ -65,6 +66,12 @@ export class RiffBackend implements SessionBackend {
   constructor(config: RiffBackendConfig, sessionId: string) {
     this.config = config;
     this.sessionId = sessionId;
+  }
+
+  /** Called when the riff sandbox accessUrl becomes available or changes. */
+  onAccessUrl(cb: (url: string) => void): void {
+    this.accessUrlCb = cb;
+    if (this.currentAccessUrl) cb(this.currentAccessUrl);
   }
 
   /** Resolve JWT dynamically — re-reads env/keychain each call so auto-refresh works. */
@@ -289,6 +296,7 @@ export class RiffBackend implements SessionBackend {
     // Capture accessUrl from response if available
     if (result.data.accessUrl) {
       this.currentAccessUrl = result.data.accessUrl;
+      this.accessUrlCb?.(result.data.accessUrl);
     }
 
     // If queued, inject a status line
@@ -416,6 +424,7 @@ export class RiffBackend implements SessionBackend {
           const accessUrl = data['accessUrl'] as string | undefined;
           if (accessUrl) {
             this.currentAccessUrl = accessUrl;
+            this.accessUrlCb?.(accessUrl);
             if (this.config.injectStatusLines !== false) {
               const line = `\n[riff] Sandbox: ${accessUrl}\n`;
               this.outputBuffer += line;

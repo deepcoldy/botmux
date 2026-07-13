@@ -1410,6 +1410,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
+      riff: entry.riff && typeof entry.riff === 'object' ? entry.riff : undefined,
       // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).
       maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0

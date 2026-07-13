@@ -22,6 +22,9 @@ interface TerminalUrlSession {
   session: { sessionId: string; webPort?: number | null };
   workerPort: number | null;
   workerToken: string | null;
+  /** Riff AIO Sandbox web terminal link — when present, buildTerminalUrl
+   *  returns this directly instead of building a local/proxy URL. */
+  riffAccessUrl?: string;
 }
 
 let proxyPort = 0;
@@ -65,6 +68,9 @@ export function resetTerminalProxy(): void {
 }
 
 export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean } = {}): string {
+  // Riff backend: the "Web终端" opens the riff AIO Sandbox link directly,
+  // bypassing the local terminal proxy / port forwarding entirely.
+  if (ds.riffAccessUrl) return ds.riffAccessUrl;
   // When 远程访问 is enabled AND this daemon is bound to the central platform AND
   // the local terminal proxy is up, route terminal links through the machine
   // subdomain (`https://m-<machineId>.<platformHost>/s/<sessionId>`). The platform

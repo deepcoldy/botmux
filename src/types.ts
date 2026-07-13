@@ -390,4 +390,5 @@ export type WorkerToDaemon =
       kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
       userText?: string;
     }
-  | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string };
+  | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
+  | { type: 'riff_access_url'; accessUrl: string; directAccessUrl?: string };

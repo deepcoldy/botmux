@@ -512,12 +512,14 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
 
 function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
+  const isRiff = props.bot.backendType === 'riff' || props.bot.cliId === 'riff';
   return (
     <section className="bd-section bd-runtime-env">
       <h3 className="bd-section-title">{tr('botDefaults.sectionRuntimeEnv')}</h3>
       <StartupCommandsSection bot={props.bot} patchBot={props.patchBot} />
       <LaunchShellSection bot={props.bot} patchBot={props.patchBot} />
       <EnvSection bot={props.bot} patchBot={props.patchBot} />
+      {isRiff && <RiffSection bot={props.bot} patchBot={props.patchBot} />}
     </section>
   );
 }
@@ -2164,6 +2166,120 @@ function EnvSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       <div className="actions">
         <button type="button" className="primary" data-action="save-env" disabled={busy} onClick={() => void save()}>{tr('botDefaults.envSave')}</button>
         <StatusSpan status={status} attr={{ 'data-env-status': '' }} />
+      </div>
+    </div>
+  );
+}
+
+function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const riff = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
+  const [baseUrl, setBaseUrl] = useState(typeof riff.baseUrl === 'string' ? riff.baseUrl : '');
+  const [agent, setAgent] = useState(typeof riff.agent === 'string' ? riff.agent : '');
+  const [model, setModel] = useState(typeof riff.model === 'string' ? riff.model : '');
+  const [jwtEnv, setJwtEnv] = useState(typeof riff.jwtEnv === 'string' ? riff.jwtEnv : '');
+  const [sandboxCluster, setSandboxCluster] = useState(typeof riff.sandboxCluster === 'string' ? riff.sandboxCluster : '');
+  const [defaultRepo, setDefaultRepo] = useState(typeof riff.defaultRepo === 'string' ? riff.defaultRepo : '');
+  const [defaultBranch, setDefaultBranch] = useState(typeof riff.defaultBranch === 'string' ? riff.defaultBranch : '');
+  const [injectStatusLines, setInjectStatusLines] = useState(riff.injectStatusLines === true);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const r = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
+    setBaseUrl(typeof r.baseUrl === 'string' ? r.baseUrl : '');
+    setAgent(typeof r.agent === 'string' ? r.agent : '');
+    setModel(typeof r.model === 'string' ? r.model : '');
+    setJwtEnv(typeof r.jwtEnv === 'string' ? r.jwtEnv : '');
+    setSandboxCluster(typeof r.sandboxCluster === 'string' ? r.sandboxCluster : '');
+    setDefaultRepo(typeof r.defaultRepo === 'string' ? r.defaultRepo : '');
+    setDefaultBranch(typeof r.defaultBranch === 'string' ? r.defaultBranch : '');
+    setInjectStatusLines(r.injectStatusLines === true);
+  }, [props.bot.riff]);
+
+  async function save(): Promise<void> {
+    setStatus(null);
+    setBusy(true);
+    try {
+      const config: Record<string, unknown> = {};
+      if (baseUrl.trim()) config.baseUrl = baseUrl.trim();
+      if (agent.trim()) config.agent = agent.trim();
+      if (model.trim()) config.model = model.trim();
+      if (jwtEnv.trim()) config.jwtEnv = jwtEnv.trim();
+      if (sandboxCluster.trim()) config.sandboxCluster = sandboxCluster.trim();
+      if (defaultRepo.trim()) config.defaultRepo = defaultRepo.trim();
+      if (defaultBranch.trim()) config.defaultBranch = defaultBranch.trim();
+      if (injectStatusLines) config.injectStatusLines = true;
+      const json = Object.keys(config).length ? JSON.stringify(config) : '';
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/riff`, { riff: json });
+      if (res.ok && res.body.ok) {
+        const next = typeof res.body.riff === 'string' && res.body.riff ? JSON.parse(res.body.riff) : null;
+        props.patchBot(props.bot.larkAppId, { riff: next });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="bd-subsection">
+      <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.riffHelp')}>{tr('botDefaults.sectionRiff')}</FieldTitle></h4>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffBaseUrl')}</span>
+          <input type="text" data-input="riff-base-url" placeholder={tr('botDefaults.riffBaseUrlPlaceholder')} value={baseUrl} disabled={busy} onChange={e => setBaseUrl(e.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffAgent')}</span>
+          <input type="text" data-input="riff-agent" placeholder={tr('botDefaults.riffAgentPlaceholder')} value={agent} disabled={busy} onChange={e => setAgent(e.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffModel')}</span>
+          <input type="text" data-input="riff-model" placeholder={tr('botDefaults.riffModelPlaceholder')} value={model} disabled={busy} onChange={e => setModel(e.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffJwtEnv')}</span>
+          <input type="text" data-input="riff-jwt-env" placeholder={tr('botDefaults.riffJwtEnvPlaceholder')} value={jwtEnv} disabled={busy} onChange={e => setJwtEnv(e.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffSandboxCluster')}</span>
+          <input type="text" data-input="riff-sandbox-cluster" placeholder={tr('botDefaults.riffSandboxClusterPlaceholder')} value={sandboxCluster} disabled={busy} onChange={e => setSandboxCluster(e.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffDefaultRepo')}</span>
+          <input type="text" data-input="riff-default-repo" placeholder={tr('botDefaults.riffDefaultRepoPlaceholder')} value={defaultRepo} disabled={busy} onChange={e => setDefaultRepo(e.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffDefaultBranch')}</span>
+          <input type="text" data-input="riff-default-branch" placeholder={tr('botDefaults.riffDefaultBranchPlaceholder')} value={defaultBranch} disabled={busy} onChange={e => setDefaultBranch(e.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffInjectStatusLines')}</span>
+          <input type="checkbox" data-input="riff-inject-status-lines" checked={injectStatusLines} disabled={busy} onChange={e => setInjectStatusLines(e.currentTarget.checked)} />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-riff" disabled={busy} onClick={() => void save()}>{tr('botDefaults.riffSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-riff-status': '' }} />
       </div>
     </div>
   );

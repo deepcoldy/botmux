@@ -653,6 +653,11 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
   if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  // Riff backend: the sandbox URL is the writable link — no local worker needed.
+  if (ds.riffAccessUrl) {
+    jsonRes(res, 200, { ok: true, url: ds.riffAccessUrl });
+    return;
+  }
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port || !ds.workerToken) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
   jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds, { write: true }) });
@@ -1520,6 +1525,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     startupCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
+    backendType: getBot(cachedLarkAppId).config.backendType ?? 'pty',
+    riff: getBot(cachedLarkAppId).config.riff ?? null,
     summaryRange: summaryRangeFromBotConfig(getBot(cachedLarkAppId).config),
     skills: getBot(cachedLarkAppId).config.skills ?? null,
   });
@@ -1733,6 +1740,11 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     else delete entry.wrapperCli;
     if (model) entry.model = model;
     else delete entry.model;
+    // cliId=riff → backendType 自动设为 riff（否则 spawn 走 pty 后端找不到本地二进制）。
+    // 其它 CLI 不主动改 backendType，保留用户可能的手动配置。
+    if (selected.cliId === 'riff') {
+      entry.backendType = 'riff';
+    }
     return { write: true, result: null };
   });
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
@@ -1742,6 +1754,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
   else bot.config.wrapperCli = undefined;
   bot.config.model = model || undefined;
+  if (selected.cliId === 'riff') {
+    bot.config.backendType = 'riff';
+  }
 
   // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
   // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
@@ -1873,6 +1888,32 @@ ipcRoute('PUT', '/api/bot-env', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, env: value ? JSON.stringify(value, null, 2) : '' });
+});
+
+// Per-bot riff 后端配置。Body `{ riff: string }`（原始 JSON 文本，如
+// `{"baseUrl":"https://...","agent":"aiden","model":"...","injectStatusLines":true}`）：
+// 空白 → 清除；否则按 json kind 解析后落盘。走 applyConfigField（与 /botconfig
+// 同一写盘 + 内存热更新路径），next-session 生效。仅 backendType=riff 时使用。
+ipcRoute('PUT', '/api/bot-riff', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { riff?: unknown };
+  try { body = await readJsonBody<{ riff?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('riff');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.riff === 'string' ? body.riff : '';
+  let value: Record<string, unknown> | null;
+  if (!raw.trim()) {
+    value = null;  // 清除
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as Record<string, unknown>;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, riff: value ? JSON.stringify(value, null, 2) : '' });
 });
 
 // Per-bot 最大同时活跃会话数 maxLiveWorkers。Body `{ maxLiveWorkers: number | null }`:

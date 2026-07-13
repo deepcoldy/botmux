@@ -192,6 +192,8 @@ export function writableTerminalLinkFor(ds: DaemonSession): string | undefined {
   try {
     if (getBot(ds.larkAppId).config.writableTerminalLinkInCard !== true) return undefined;
   } catch { return undefined; }
+  // Riff backend: the sandbox URL is the writable link — no local worker needed.
+  if (ds.riffAccessUrl) return ds.riffAccessUrl;
   if (!ds.workerPort || !ds.workerToken) return undefined;
   return buildTerminalUrl(ds, { write: true });
 }
@@ -311,7 +313,7 @@ export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefine
 function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
   if (ds.lastScreenStatus !== 'limited') return;
   const port = ds.workerPort ?? ds.session.webPort;
-  if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !port) return;
+  if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || (!port && !ds.riffAccessUrl)) return;
 
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
@@ -485,7 +487,7 @@ export async function postFreshStreamingCard(
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>,
 ): Promise<boolean> {
   const port = ds.workerPort ?? ds.session.webPort;
-  if (!port) return false;
+  if (!port && !ds.riffAccessUrl) return false;
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
   const readUrl = buildTerminalUrl(ds);
@@ -569,7 +571,7 @@ export async function postPrivateSnapshotCard(
   audience: string[],
 ): Promise<{ sent: number; total: number; notReady: boolean }> {
   const port = ds.workerPort ?? ds.session.webPort;
-  if (!port) return { sent: 0, total: audience.length, notReady: true };
+  if (!port && !ds.riffAccessUrl) return { sent: 0, total: audience.length, notReady: true };
 
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
@@ -659,6 +661,21 @@ export interface WriteLinkOwnerDelivery {
  * ({@link deliverWritableTerminalCardTo}, behind the `/term` slash command).
  */
 function buildWritableTerminalCard(ds: DaemonSession): string | null {
+  // Riff backend: the sandbox URL is the writable link — no local worker/token needed.
+  if (ds.riffAccessUrl) {
+    const botCfg = getBot(ds.larkAppId).config;
+    const effectiveCliId = sessionCliId(ds, botCfg);
+    return buildSessionCard(
+      ds.session.sessionId,
+      sessionAnchorId(ds),
+      ds.riffAccessUrl,
+      ds.session.title || getCliDisplayName(effectiveCliId),
+      effectiveCliId,
+      true,
+      !!ds.adoptedFrom,
+      localeForBot(ds.larkAppId),
+    );
+  }
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port || !ds.workerToken) return null;
   const botCfg = getBot(ds.larkAppId).config;
@@ -2143,7 +2160,13 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
       }
 
       case 'screen_update': {
-        if (!ds.workerPort) break;
+        // Riff: the accessUrl may arrive from the SSE init event after the
+        // first screen_update, so allow riff bots to proceed even before it
+        // lands — the card gets the URL on the next patch once it does.
+        if (!ds.workerPort && !ds.riffAccessUrl) {
+          const isRiff = getBot(ds.larkAppId)?.config.backendType === 'riff';
+          if (!isRiff) break;
+        }
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
@@ -2296,7 +2319,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         });
         persistStreamCardState(ds);
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
-        if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) break;
+        if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || (!ds.workerPort && !ds.riffAccessUrl)) break;
         const readUrl = buildTerminalUrl(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
@@ -2396,7 +2419,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         if (ds.adoptedFrom) {
           logger.info(`[${t}] Adopted session ended`);
           // Freeze the streaming card
-          if (ds.streamCardId && ds.workerPort) {
+          if (ds.streamCardId && (ds.workerPort || ds.riffAccessUrl)) {
             const readUrl = buildTerminalUrl(ds);
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             const frozenCard = buildStreamingCard(
@@ -2434,7 +2457,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           logger.warn(`[${t}] ${getCliDisplayName(effectiveCliId)} crashed ${rc.count} times in 1 min, not auto-restarting`);
           const keepDiagnosticWorker = !!msg.canParkDiagnostic && !!ds.worker && !ds.worker.killed;
           // Freeze the last streaming card so it doesn't stay at "working" forever
-          if (ds.streamCardId && ds.workerPort) {
+          if (ds.streamCardId && (ds.workerPort || ds.riffAccessUrl)) {
             const readUrl = buildTerminalUrl(ds);
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             const frozenCard = buildStreamingCard(
@@ -2495,6 +2518,16 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'error': {
         logger.error(`[${t}] Worker error: ${msg.message}`);
+        break;
+      }
+
+      case 'riff_access_url': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored riff_access_url from stale worker: ${msg.accessUrl}`);
+          break;
+        }
+        ds.riffAccessUrl = msg.accessUrl;
+        logger.info(`[${t}] Riff sandbox access URL updated: ${msg.accessUrl}`);
         break;
       }
 

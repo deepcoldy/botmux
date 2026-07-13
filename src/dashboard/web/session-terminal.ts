@@ -9,6 +9,8 @@ function currentLocation(): SessionTerminalLocation | null {
 }
 
 export function sessionTerminalHref(s: any, loc: SessionTerminalLocation | null = currentLocation()): string | null {
+  // Riff backend: the "Web终端" opens the riff AIO Sandbox link directly.
+  if (s?.riffAccessUrl) return s.riffAccessUrl;
   if (!s?.webPort || !loc) return null;
   // On the central HTTPS machine domain, terminals must go through the same
   // origin `/s/<session>` reverse proxy. Exposing a raw port would produce a

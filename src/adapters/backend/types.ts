@@ -55,6 +55,14 @@ export interface SessionBackend {
   captureCurrentScreen?(): string;
   captureViewport?(): string;
   getPaneSize?(): { cols: number; rows: number } | null;
+  /**
+   * Remote sandbox access URL — backends that run on a remote sandbox (e.g.
+   * riff) expose a web terminal link instead of a local PTY. The worker
+   * forwards this to the daemon so the dashboard "Web终端" button opens the
+   * sandbox directly. Optional — local backends (pty/tmux/herdr/zellij)
+   * never implement it.
+   */
+  onAccessUrl?(cb: (url: string) => void): void;
 }
 
 /**

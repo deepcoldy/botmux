@@ -1620,7 +1620,7 @@ export async function handleCommand(
         if (ds) {
           const alive = ds.worker && !ds.worker.killed;
           const idle = formatUptime(Date.now() - ds.lastMessageAt);
-          const termUrl = ds.workerPort ? buildTerminalUrl(ds) : '-';
+          const termUrl = ds.workerPort || ds.riffAccessUrl ? buildTerminalUrl(ds) : '-';
           const lines = [
             `Session: ${ds.session.sessionId}`,
             `Status: ${alive ? t('cmd.status.running', undefined, loc) : t('cmd.status.waiting', undefined, loc)}`,

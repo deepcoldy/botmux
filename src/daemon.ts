@@ -1048,7 +1048,6 @@ function streamingCardDisabledFor(ds: DaemonSession): boolean {
   try {
     const cfg = getBot(ds.larkAppId).config;
     return cfg.disableStreamingCard === true
-      || cfg.backendType === 'riff'
       || (!!ds.chatId && !!cfg.noCardChats?.includes(ds.chatId));
   } catch { return false; }
 }
@@ -1441,6 +1440,8 @@ function refreshCliVersion(cliId: CliId, cliPathOverride?: string): boolean {
 
   try {
     const adapter = createCliAdapterSync(cliId, cliPathOverride);
+    // Remote backends (riff) have no local binary to version-check — skip.
+    if (!adapter.resolvedBin && !adapter.versionCommand) return false;
     const versionCommand = adapter.versionCommand?.() ?? { bin: adapter.resolvedBin, args: ['--version'] };
     const raw = execFileSync(versionCommand.bin, versionCommand.args, {
       encoding: 'utf-8',
@@ -2241,7 +2242,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   ds.streamingCardForced = undefined;
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
-  if (ds.streamCardId && ds.workerPort) {
+  if (ds.streamCardId && (ds.workerPort || ds.riffAccessUrl)) {
     const readUrl = buildTerminalUrl(ds);
     const dsBotCfg = getBot(ds.larkAppId).config;
     const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);

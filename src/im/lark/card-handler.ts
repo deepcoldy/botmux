@@ -1461,7 +1461,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       persistStreamCardState(ds);
 
       let cardJson: string | undefined;
-      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && ds.workerPort) {
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && (ds.workerPort || ds.riffAccessUrl)) {
         const readUrl = buildTerminalUrl(ds);
         cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -1627,7 +1627,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const botCfg = getBot(ds.larkAppId).config;
       const effectiveCliId = sessionCliId(ds);
       const locDs = localeForBot(ds.larkAppId);
-      if (ds.workerPort && ds.workerToken) {
+      if (ds.riffAccessUrl || (ds.workerPort && ds.workerToken)) {
         const writeUrl = buildTerminalUrl(ds, { write: true });
         const cardJson = buildSessionCard(
           ds.session.sessionId,
@@ -1686,7 +1686,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           if (ds.worker) {
             ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
           }
-          if (cardMessageId && ds.workerPort) {
+          if (cardMessageId && (ds.workerPort || ds.riffAccessUrl)) {
             const readUrl = buildTerminalUrl(ds);
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             const cardJson = buildStreamingCard(
@@ -1729,7 +1729,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
         }
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = ds.workerPort ? buildTerminalUrl(ds) : '';
+        const readUrl = ds.workerPort || ds.riffAccessUrl ? buildTerminalUrl(ds) : '';
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -1768,7 +1768,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (ds.worker) {
         ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
       }
-      if (ds.streamCardId && ds.workerPort) {
+      if (ds.streamCardId && (ds.workerPort || ds.riffAccessUrl)) {
         const readUrl = buildTerminalUrl(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
@@ -1831,7 +1831,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // Return the current card JSON so Feishu doesn't revert the displayed
       // image to the originally-POSTed initial frame while waiting for the
       // fresh screenshot PATCH (~1s).
-      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && ds.workerPort) {
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && (ds.workerPort || ds.riffAccessUrl)) {
         const botCfg = getBot(ds.larkAppId).config;
         const effectiveCliId = sessionCliId(ds);
         const readUrl = buildTerminalUrl(ds);
@@ -1871,7 +1871,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         ds.worker.send({ type: 'term_action', key } as DaemonToWorker);
         logger.info(`[${tag(ds)}] term_action: ${key}`);
       }
-      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && ds.workerPort) {
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && (ds.workerPort || ds.riffAccessUrl)) {
         const botCfg = getBot(ds.larkAppId).config;
         const effectiveCliId = sessionCliId(ds);
         const readUrl = buildTerminalUrl(ds);
