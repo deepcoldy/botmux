@@ -22,7 +22,6 @@ import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMemberChat } from '../../services/platform-team-store.js';
 import { recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { getDocSubscription, putDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
-import { putPendingApproval, getPendingApproval } from '../../services/doc-pending-approvals-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL } from './doc-comment.js';
 import {
   BOTMUX_REQUIRED_SCOPES,
@@ -1715,68 +1714,30 @@ async function processCommentEvent(
     return;
   }
 
-  // 1) 查订阅表；未订阅的文档需要 owner 授权后才自动订阅
+  // 1) 查订阅表；未订阅的文档 @bot 时自动创建 mention-only 订阅（任何人都可以
+  //    通过在文档里 @bot 触发 bot 回复，不需要 owner 预先订阅。/watch-comment 命令
+  //    管理持久订阅才需要 owner 权限）。
   let sub = getDocSubscription(config.session.dataDir, larkAppId, fileToken);
   if (!sub) {
     const operatorOpenId = parsed.operatorOpenId;
-    const ownerOpenId = getOwnerOpenId(larkAppId);
-    const isOwner = operatorOpenId && (operatorOpenId === ownerOpenId);
-
-    if (isOwner) {
-      // Owner 直接 @ → 自动订阅（mention-only 模式）
-      const botCfg = getBot(larkAppId).config;
-      const mappedDir = botCfg.docRepoMap?.[fileToken];
-      const autoSub: DocSubscription = {
-        fileToken,
-        fileType: parsed.fileType || 'docx',
-        sessionAnchor: `doc:${fileToken}`,
-        sessionId: undefined,
-        scope: 'chat',
-        chatId: `doc:${fileToken}`,
-        commentTriggerMode: 'mention-only',
-        managedBy: 'watch-comment',
-        ownerOpenId: operatorOpenId,
-        workingDir: mappedDir,
-        createdAt: Date.now(),
-      };
-      putDocSubscription(config.session.dataDir, larkAppId, autoSub);
-      sub = autoSub;
-      logger.info(`[doc-comment] auto-subscribed file=${fileToken.slice(0, 12)} by owner (mention-only${mappedDir ? `, wd=${mappedDir}` : ''}, anchor=doc:${fileToken.slice(0, 12)})`);
-    } else {
-      // 非 owner @ → 记录待授权，通知 owner 审批
-      const existingPending = getPendingApproval(config.session.dataDir, larkAppId, fileToken);
-      if (!existingPending) {
-        putPendingApproval(config.session.dataDir, larkAppId, {
-          fileToken,
-          fileType: parsed.fileType || 'docx',
-          requesterOpenId: operatorOpenId || 'unknown',
-          requestedAt: Date.now(),
-        });
-        // 通知 owner
-        if (ownerOpenId) {
-          const loc = localeForBot(larkAppId);
-          const requesterName = operatorOpenId ? operatorOpenId.slice(0, 12) : '?';
-          const approveCmd = `/watch-comment approve ${fileToken}`;
-          const denyCmd = `/watch-comment deny ${fileToken}`;
-          const notifyText = [
-            t('daemon.doc_approval_request_title', undefined, loc),
-            '',
-            t('daemon.doc_approval_request_body', { requester: requesterName }, loc),
-            t('daemon.doc_approval_request_token', { token: fileToken.slice(0, 12) }, loc),
-            '',
-            `✅ ${t('daemon.doc_approval_approve', undefined, loc)}：${approveCmd}`,
-            `❌ ${t('daemon.doc_approval_deny', undefined, loc)}：${denyCmd}`,
-          ].join('\n');
-          sendUserMessage(larkAppId, ownerOpenId, notifyText).catch((e) => {
-            logger.warn(`[doc-comment] failed to notify owner about pending approval: ${e instanceof Error ? e.message : e}`);
-          });
-        }
-        logger.info(`[doc-comment] non-owner @ on unsubscribed doc=${fileToken.slice(0, 12)} requester=${operatorOpenId?.slice(0, 12)} → pending approval`);
-      } else {
-        logger.info(`[doc-comment] non-owner @ on unsubscribed doc=${fileToken.slice(0, 12)} → already pending approval`);
-      }
-      return; // 不处理这条评论，等 owner 授权
-    }
+    const botCfg = getBot(larkAppId).config;
+    const mappedDir = botCfg.docRepoMap?.[fileToken];
+    const autoSub: DocSubscription = {
+      fileToken,
+      fileType: parsed.fileType || 'docx',
+      sessionAnchor: `doc:${fileToken}`,
+      sessionId: undefined,
+      scope: 'chat',
+      chatId: `doc:${fileToken}`,
+      commentTriggerMode: 'mention-only',
+      managedBy: 'watch-comment',
+      ownerOpenId: operatorOpenId || getOwnerOpenId(larkAppId),
+      workingDir: mappedDir,
+      createdAt: Date.now(),
+    };
+    putDocSubscription(config.session.dataDir, larkAppId, autoSub);
+    sub = autoSub;
+    logger.info(`[doc-comment] auto-subscribed file=${fileToken.slice(0, 12)} by @mention (mention-only${mappedDir ? `, wd=${mappedDir}` : ''}, anchor=doc:${fileToken.slice(0, 12)}, requester=${operatorOpenId?.slice(0, 12) || '?'})`);
   }
 
   // 关掉 open_id 启动竞态：probeBotOpenId 在启动时 fire-and-forget，若评论事件
