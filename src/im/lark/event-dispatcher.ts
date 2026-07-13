@@ -1320,7 +1320,7 @@ export interface EventHandlers {
   onChatModeConverted?: (chatId: string, larkAppId: string) => void;
   /** 文档评论入口（/watch-comment / /subscribe-lark-doc）：一条命中文档绑定的评论被喂进
    *  会话。daemon 负责定位会话、投递给 worker、记录该轮回评论的落点。 */
-  handleDocComment?: (ctx: DocCommentContext) => Promise<void>;
+  handleDocComment?: (ctx: DocCommentContext) => Promise<boolean>;
   /** VC bot meeting push events (`vc.bot.meeting_*_v1`). ACK-safe; daemon owns meeting session state. */
   handleVcMeetingPush?: (ctx: VcMeetingPushContext) => Promise<void>;
   /** Best-effort hook before a human inbound turn reaches the CLI session. Used

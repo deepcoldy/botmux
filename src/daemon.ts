@@ -7920,15 +7920,14 @@ async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx
  * MVP 边界：仅投递给 activeSessions 里仍在的会话（含 idle 挂起、worker=null —
  * 走 resume 重 fork）；已 /close 的会话其订阅在关闭时已退订，这里查不到 ds 即跳过。
  */
-async function handleDocComment(ctx: DocCommentContext): Promise<void> {
+async function handleDocComment(ctx: DocCommentContext): Promise<boolean> {
   const { larkAppId, sub, commentId, text } = ctx;
   const turnId = ctx.replyId || commentId;
   const claimKey = `${larkAppId}:${sub.fileToken}:${turnId}`;
   if (handledDocCommentTurns.has(claimKey)) {
     logger.info(`[doc-comment] duplicate turn skipped file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}`);
-    return;
+    return true; // 已处理过，算成功（让 poller 推进游标）
   }
-  handledDocCommentTurns.set(claimKey, Date.now());
   const loc = localeForBot(larkAppId);
 
   let ds: DaemonSession | undefined | null = activeSessions.get(sessionKey(sub.sessionAnchor, larkAppId));
@@ -7937,10 +7936,13 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
     logger.info(`[doc-comment] no active session for anchor=${sub.sessionAnchor.slice(0, 12)}; auto-creating for file=${sub.fileToken.slice(0, 12)}`);
     ds = await autoCreateDocSession(sub, larkAppId, ctx);
     if (!ds) {
-      logger.info(`[doc-comment] auto-create session failed for file=${sub.fileToken.slice(0, 12)}; dropping comment ${commentId.slice(0, 12)}`);
-      return;
+      // auto-create 失败：不设 claim（允许后续重试），返回 false 让 poller 不推进游标
+      logger.warn(`[doc-comment] auto-create session failed for file=${sub.fileToken.slice(0, 12)}; will retry comment ${commentId.slice(0, 12)}`);
+      return false;
     }
   }
+  // ds 确认有效后才设 claim——auto-create 失败时不占坑，允许重试。
+  handledDocCommentTurns.set(claimKey, Date.now());
 
   // 给用户的回复加 "Typing" reaction，让评论者知道 bot 正在处理。
   const userReplyId = ctx.replyId;
@@ -8035,6 +8037,7 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
     sessionStore.updateSession(ds.session);
     forkWorker(ds, wrappedPrompt, { resume: ds.hasHistory, turnId });
   }
+  return true;
 }
 
 /** 同一条评论可能同时被长连接通知和 --all 轮询看到；daemon 内统一去重。 */
@@ -8089,9 +8092,10 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
             || isBotAuthoredReply(reply.replyId)
             || hasBotSentinel(reply.text);
           const text = reply.text.replaceAll(BOT_REPLY_SENTINEL, '').trim();
+          let processed = true;
           if (!isSelfReply && text) {
             logger.info(`[doc-comment-poll] dispatch file=${current.fileToken.slice(0, 12)} comment=${reply.commentId.slice(0, 12)} reply=${reply.replyId.slice(0, 12)}`);
-            await handleDocComment({
+            processed = await handleDocComment({
               larkAppId,
               sub: stillWatching,
               commentId: reply.commentId,
@@ -8106,7 +8110,11 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
               authorOpenId: reply.authorOpenId,
             });
           }
-          setDocCommentPollCursor(config.session.dataDir, larkAppId, current.fileToken, reply);
+          if (processed) {
+            setDocCommentPollCursor(config.session.dataDir, larkAppId, current.fileToken, reply);
+          } else {
+            logger.warn(`[doc-comment-poll] cursor NOT advanced for reply=${reply.replyId.slice(0, 12)} (handleDocComment returned false, will retry next poll)`);
+          }
         }
       } catch (err) {
         logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${err instanceof Error ? err.message : String(err)}`);
