@@ -4141,7 +4141,7 @@ td code,
   background: var(--surface);
 }
 
-.plugin-enable-row {
+.plugin-enable-list .plugin-enable-row {
   min-height: 56px;
   margin: 0;
   padding: 11px 24px;

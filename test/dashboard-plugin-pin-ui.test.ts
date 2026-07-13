@@ -32,7 +32,7 @@ describe('dashboard plugin pin UI', () => {
     expect(pluginPage).not.toContain('配置范围');
     expect(css).toContain('.plugin-enable-panel');
     expect(css).toContain('.plugin-enable-row-global');
-    expect(css).toMatch(/\.plugin-enable-row\s*\{[^}]*padding:\s*11px 24px/s);
+    expect(css).toMatch(/\.plugin-enable-list \.plugin-enable-row\s*\{[^}]*padding:\s*11px 24px/s);
     expect(dashboard).toContain('onlineByAppId.get(bot.larkAppId)?.botName');
   });
 
