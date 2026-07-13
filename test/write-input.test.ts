@@ -363,6 +363,22 @@ describe('writeInput: multiline, tmux mode', () => {
     ]);
   });
 
+  it('kiro-cli: asks for /session-id once in raw PTY fallback', async () => {
+    const adapter = createKiroCliAdapter('/bin/kiro-cli');
+    const pty = makeRawPty();
+
+    await adapter.writeInput(pty, 'first');
+    await adapter.writeInput(pty, 'second');
+
+    expect(pty.write.mock.calls.map(c => c[0])).toEqual([
+      '/session-id\r',
+      'first',
+      '\r',
+      'second',
+      '\r',
+    ]);
+  });
+
   it('claude-code: fails before typing when only unsupported Cmd+Enter can submit', async () => {
     const adapter = createClaudeCodeAdapter('/bin/claude');
     writeClaudeKeybindings({

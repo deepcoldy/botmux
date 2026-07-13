@@ -7,6 +7,19 @@ import { delay } from '../../utils/timing.js';
 const TRUSTED_CORE_TOOLS = 'read,write,shell';
 const sessionIdRequestedPtys = new WeakSet<PtyHandle>();
 
+async function requestSessionIdOnce(pty: PtyHandle): Promise<void> {
+  if (sessionIdRequestedPtys.has(pty)) return;
+  sessionIdRequestedPtys.add(pty);
+  if (pty.sendText && pty.sendSpecialKeys) {
+    pty.sendText('/session-id');
+    await delay(200);
+    pty.sendSpecialKeys('Enter');
+  } else {
+    pty.write('/session-id\r');
+  }
+  await delay(200);
+}
+
 export function createKiroCliAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'kiro-cli';
   let cachedBin: string | undefined;
@@ -34,14 +47,8 @@ export function createKiroCliAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
+      await requestSessionIdOnce(pty);
       if (pty.sendText && pty.sendSpecialKeys) {
-        if (!sessionIdRequestedPtys.has(pty)) {
-          sessionIdRequestedPtys.add(pty);
-          pty.sendText('/session-id');
-          await delay(200);
-          pty.sendSpecialKeys('Enter');
-          await delay(200);
-        }
         const lines = content.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].length > 0) pty.sendText(lines[i]);
