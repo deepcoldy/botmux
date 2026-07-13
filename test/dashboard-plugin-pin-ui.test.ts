@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 const app = readFileSync(new URL('../src/dashboard/web/app.tsx', import.meta.url), 'utf-8');
 const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf-8');
-const pluginPage = readFileSync(new URL('../src/dashboard/web/plugin-page.ts', import.meta.url), 'utf-8');
+const pluginPage = readFileSync(new URL('../src/dashboard/web/plugin-page.tsx', import.meta.url), 'utf-8');
 const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf-8');
 
 describe('dashboard plugin pin UI', () => {
@@ -24,21 +24,35 @@ describe('dashboard plugin pin UI', () => {
   });
 
   it('shows global and per-Bot enable settings inside every plugin card', () => {
-    expect(pluginPage).toContain("'全局启用'");
+    expect(pluginPage).toContain('label="全局启用"');
     expect(pluginPage).toContain('plugin-enable-list');
     expect(pluginPage).toContain('bots.map(bot =>');
-    expect(pluginPage).toContain("const scope = input.dataset.pluginToggle ?? 'global'");
+    expect(pluginPage).toContain('onChange={event => props.onToggle(props.scope, event.currentTarget.checked)}');
     expect(pluginPage).not.toContain('data-plugin-scope');
     expect(pluginPage).not.toContain('配置范围');
     expect(css).toContain('.plugin-enable-panel');
     expect(css).toContain('.plugin-enable-row-global');
     expect(css).toMatch(/\.plugin-enable-list \.plugin-enable-row\s*\{[^}]*padding:\s*11px 24px/s);
     expect(dashboard).toContain('onlineByAppId.get(bot.larkAppId)?.botName');
+    expect(pluginPage).toContain('`当前${enabledState}，跟随全局设置`');
+    expect(pluginPage).toContain('`当前${enabledState}，由该 Bot 独立设置`');
+  });
+
+  it('uses React state to update plugin cards without rebuilding the page DOM', () => {
+    expect(pluginPage).toContain('function PluginManagementPage(');
+    expect(pluginPage).toContain('useState<PluginManagementPayload | null>');
+    expect(pluginPage).toContain('setPayload(next);');
+    expect(pluginPage).toContain('key={plugin.id}');
+    expect(pluginPage).toContain('function PluginCard(');
+    expect(pluginPage).toContain('const [activeTab, setActiveTab] = useState(');
+    expect(pluginPage).toContain('data-plugin-summary-enabled');
+    expect(pluginPage).not.toContain('innerHTML');
+    expect(pluginPage).not.toContain('dangerouslySetInnerHTML');
   });
 
   it('keeps dependency and mutation failures on the page in a modal', () => {
     expect(pluginPage).toContain('data-plugin-feedback-dialog');
-    expect(pluginPage).toContain('showPluginFeedback(');
+    expect(pluginPage).toContain('setFeedback({');
     expect(pluginPage).toContain("enabled ? '无法启用插件' : '无法禁用插件'");
     expect(pluginPage).not.toContain('插件设置保存失败：');
     expect(css).toContain('.plugin-feedback-dialog::backdrop');
