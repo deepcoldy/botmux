@@ -1177,11 +1177,12 @@ async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
   const pinnedSet = new Set(normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? []);
   let botConfigs: BotConfig[] = [];
   try { botConfigs = loadBotConfigs(); } catch { /* setup can render before bots.json exists */ }
+  const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
   const bots = botConfigs.map((bot, index) => {
     const exact = bot.plugins !== undefined;
     return {
       id: bot.larkAppId,
-      name: bot.displayName || bot.name || `Bot ${index + 1}`,
+      name: bot.displayName || onlineByAppId.get(bot.larkAppId)?.botName || bot.name || `Bot ${index + 1}`,
       source: exact ? 'bot' : 'machine-default',
       plugins: resolveEffectivePluginIds(bot, { plugins: globalPlugins }),
     };

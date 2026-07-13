@@ -4144,7 +4144,7 @@ td code,
 .plugin-enable-row {
   min-height: 56px;
   margin: 0;
-  padding: 9px 18px 9px 12px;
+  padding: 11px 24px;
   align-items: center;
   gap: 12px;
 }
@@ -4209,7 +4209,7 @@ td code,
 }
 
 .plugin-enable-empty {
-  padding: 13px 12px;
+  padding: 13px 24px;
   color: var(--muted);
   font-size: 12px;
 }

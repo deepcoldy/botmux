@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 const app = readFileSync(new URL('../src/dashboard/web/app.tsx', import.meta.url), 'utf-8');
+const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf-8');
 const pluginPage = readFileSync(new URL('../src/dashboard/web/plugin-page.ts', import.meta.url), 'utf-8');
 const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf-8');
 
@@ -31,6 +32,8 @@ describe('dashboard plugin pin UI', () => {
     expect(pluginPage).not.toContain('配置范围');
     expect(css).toContain('.plugin-enable-panel');
     expect(css).toContain('.plugin-enable-row-global');
+    expect(css).toMatch(/\.plugin-enable-row\s*\{[^}]*padding:\s*11px 24px/s);
+    expect(dashboard).toContain('onlineByAppId.get(bot.larkAppId)?.botName');
   });
 
   it('keeps dependency and mutation failures on the page in a modal', () => {
