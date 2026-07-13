@@ -1,8 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { initPlugin, normalizePluginInitName, resolveOfficialPluginPackageSpec } from '../src/core/plugins/init.js';
+import {
+  DEFAULT_PLUGIN_TEMPLATE_PACKAGE,
+  initPlugin,
+  normalizePluginInitName,
+  resolveOfficialPluginPackageSpec,
+} from '../src/core/plugins/init.js';
 import { upsertInstalledPlugin } from '../src/services/plugin-registry-store.js';
 
 function writeJson(path: string, value: unknown): void {
@@ -20,6 +26,11 @@ function createTemplateFixture(root: string): string {
   mkdirSync(join(project, 'src', 'service'), { recursive: true });
   mkdirSync(join(project, 'skills', '{{pluginId}}'), { recursive: true });
   mkdirSync(join(project, 'assets'), { recursive: true });
+  writeJson(join(template, 'package.json'), {
+    name: '@botmux-ai/plugin-test-template',
+    version: '0.0.0',
+    files: ['template.json', 'template/'],
+  });
   writeJson(join(template, 'template.json'), {
     package: {
       version: '0.1.0',
@@ -59,6 +70,18 @@ function createTemplateFixture(root: string): string {
   return template;
 }
 
+function packTemplateFixture(template: string, destination: string): string {
+  mkdirSync(destination, { recursive: true });
+  const result = JSON.parse(execFileSync('npm', [
+    'pack',
+    '--ignore-scripts',
+    '--json',
+    '--pack-destination',
+    destination,
+  ], { cwd: template, encoding: 'utf-8' }));
+  return join(destination, result[0].filename);
+}
+
 describe('plugin init', () => {
   let home: string;
   let workspace: string;
@@ -89,6 +112,10 @@ describe('plugin init', () => {
     expect(() => normalizePluginInitName('Bad Plugin')).toThrow(/invalid_plugin_init_id/);
   });
 
+  it('uses the official npm template package by default', () => {
+    expect(DEFAULT_PLUGIN_TEMPLATE_PACKAGE).toBe('@botmux-ai/plugin-template');
+  });
+
   it('resolves short install specs to the official npm package scope', () => {
     expect(resolveOfficialPluginPackageSpec('agent-chrome')).toBe('@botmux-ai/plugin-agent-chrome');
     expect(resolveOfficialPluginPackageSpec('@botmux-ai/plugin-agent-chrome')).toBe('@botmux-ai/plugin-agent-chrome');
@@ -113,6 +140,44 @@ describe('plugin init', () => {
     expect(existsSync(join(result.targetDir, 'skills', 'agent-chrome', 'SKILL.md'))).toBe(true);
     expect(readFileSync(join(result.targetDir, 'src', 'mcp', 'index.js'), 'utf-8')).toContain('./mcp/server.js');
     expect(readFileSync(join(result.targetDir, 'assets', 'logo.bin'))).toEqual(Buffer.from([0x00, 0xff, 0xfe, 0x80, 0x41, 0x42]));
+  });
+
+  it('creates a plugin repository from an npm template tarball without running its lifecycle scripts', () => {
+    const template = createTemplateFixture(workspace);
+    const lifecycleMarker = join(workspace, 'template-lifecycle-ran');
+    const pkg = JSON.parse(readFileSync(join(template, 'package.json'), 'utf-8'));
+    pkg.scripts = {
+      preinstall: `node -e "require('node:fs').writeFileSync(${JSON.stringify(lifecycleMarker)}, 'ran')"`,
+    };
+    writeJson(join(template, 'package.json'), pkg);
+    const tarball = packTemplateFixture(template, join(workspace, 'packed'));
+
+    const result = initPlugin('npm-template-test', {
+      cwd: workspace,
+      templateSource: tarball,
+      skipSelfTest: true,
+    });
+
+    expect(result.templateSource).toBe(tarball);
+    expect(existsSync(join(result.targetDir, 'package.json'))).toBe(true);
+    expect(existsSync(lifecycleMarker)).toBe(false);
+  });
+
+  it('rejects an npm package that does not contain a generation template', () => {
+    const invalidPackage = join(workspace, 'not-a-template');
+    mkdirSync(invalidPackage, { recursive: true });
+    writeJson(join(invalidPackage, 'package.json'), {
+      name: '@botmux-ai/not-a-template',
+      version: '0.0.0',
+    });
+    const tarball = packTemplateFixture(invalidPackage, join(workspace, 'invalid-packed'));
+
+    expect(() => initPlugin('invalid-template-test', {
+      cwd: workspace,
+      templateSource: tarball,
+      skipSelfTest: true,
+    })).toThrow(/plugin_template_expected_one_package_found_0/);
+    expect(existsSync(join(workspace, 'botmux-plugin-invalid-template-test'))).toBe(false);
   });
 
   it('refuses to overwrite an existing target directory', () => {

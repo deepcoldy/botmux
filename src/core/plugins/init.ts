@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { assertValidPluginId, isValidPluginId } from './ids.js';
 import { readPluginRegistry } from '../../services/plugin-registry-store.js';
 
-export const DEFAULT_PLUGIN_TEMPLATE_REPO = 'https://github.com/botmux-ai/botmux-plugin-template.git';
+export const DEFAULT_PLUGIN_TEMPLATE_PACKAGE = '@botmux-ai/plugin-template';
 export const OFFICIAL_PLUGIN_SCOPE = '@botmux-ai';
 export const OFFICIAL_PLUGIN_PACKAGE_PREFIX = `${OFFICIAL_PLUGIN_SCOPE}/plugin-`;
 export const OFFICIAL_PLUGIN_REPO_PREFIX = 'botmux-plugin-';
@@ -72,33 +72,87 @@ export function normalizePluginInitName(raw: string): Pick<PluginInitResult, 'pl
   return { pluginId, packageName, repoName, displayName, commandPrefix: `${pluginId}:` };
 }
 
-function isLocalTemplateSource(source: string): boolean {
-  if (source.startsWith('file:')) return true;
-  if (source.startsWith('.') || source.startsWith('~') || isAbsolute(source)) return true;
-  return existsSync(resolve(source));
+function looksLikeLocalTemplateSource(source: string): boolean {
+  return source.startsWith('file:') || source.startsWith('.') || source.startsWith('~') || isAbsolute(source);
 }
 
 function resolveLocalTemplateSource(source: string, cwd: string): string {
-  if (source.startsWith('file:')) return fileURLToPath(source);
+  if (source.startsWith('file://')) return fileURLToPath(source);
+  if (source.startsWith('file:')) return resolve(cwd, source.slice('file:'.length));
   if (source.startsWith('~/')) return resolve(process.env.HOME ?? '', source.slice(2));
   return isAbsolute(source) ? source : resolve(cwd, source);
 }
 
-function copyTemplateSource(source: string, targetDir: string, cwd: string): void {
-  if (isLocalTemplateSource(source)) {
-    const sourceDir = resolveLocalTemplateSource(source, cwd);
-    if (!existsSync(sourceDir) || !statSync(sourceDir).isDirectory()) throw new Error(`plugin_template_not_found:${source}`);
-    cpSync(sourceDir, targetDir, {
-      recursive: true,
-      filter: src => basename(src) !== '.git' && basename(src) !== 'node_modules',
+function copyTemplateDirectory(sourceDir: string, targetDir: string): void {
+  cpSync(sourceDir, targetDir, {
+    recursive: true,
+    filter: src => basename(src) !== '.git' && basename(src) !== 'node_modules',
+  });
+}
+
+function topLevelPackageDirs(installRoot: string): string[] {
+  const nodeModules = join(installRoot, 'node_modules');
+  if (!existsSync(nodeModules)) throw new Error('plugin_template_install_missing_node_modules');
+  const packages: string[] = [];
+  for (const entry of readdirSync(nodeModules)) {
+    if (entry.startsWith('.')) continue;
+    const entryDir = join(nodeModules, entry);
+    if (entry.startsWith('@')) {
+      for (const scopedEntry of readdirSync(entryDir)) packages.push(join(entryDir, scopedEntry));
+    } else {
+      packages.push(entryDir);
+    }
+  }
+  return packages;
+}
+
+function findInstalledTemplatePackage(installRoot: string): string {
+  const candidates = topLevelPackageDirs(installRoot).filter(packageDir => (
+    existsSync(join(packageDir, 'template.json'))
+      && existsSync(join(packageDir, 'template'))
+      && statSync(join(packageDir, 'template')).isDirectory()
+  ));
+  if (candidates.length !== 1) throw new Error(`plugin_template_expected_one_package_found_${candidates.length}`);
+  return candidates[0];
+}
+
+function installTemplatePackage(source: string, targetDir: string, installRoot: string): void {
+  mkdirSync(installRoot, { recursive: true });
+  writeFileSync(join(installRoot, 'package.json'), JSON.stringify({ private: true }, null, 2) + '\n');
+  try {
+    execFileSync('npm', [
+      'install',
+      '--ignore-scripts',
+      '--omit=dev',
+      '--omit=peer',
+      '--no-save',
+      '--no-package-lock',
+      '--prefix',
+      installRoot,
+      source,
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, npm_config_audit: 'false', npm_config_fund: 'false' },
+      timeout: 120_000,
     });
+  } catch (error) {
+    const wrapped = new Error(`plugin_template_install_failed:${source}`);
+    (wrapped as Error & { cause?: unknown }).cause = error;
+    throw wrapped;
+  }
+  copyTemplateDirectory(findInstalledTemplatePackage(installRoot), targetDir);
+}
+
+function copyTemplateSource(source: string, targetDir: string, cwd: string, installRoot: string): void {
+  const localPath = resolveLocalTemplateSource(source, cwd);
+  if (existsSync(localPath) && statSync(localPath).isDirectory()) {
+    copyTemplateDirectory(localPath, targetDir);
     return;
   }
-  execFileSync('git', ['clone', '--depth', '1', source, targetDir], {
-    cwd,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 120_000,
-  });
+  if (looksLikeLocalTemplateSource(source) && !existsSync(localPath)) {
+    throw new Error(`plugin_template_not_found:${source}`);
+  }
+  installTemplatePackage(source, targetDir, installRoot);
 }
 
 type PluginTemplateVariables = Record<'pluginId' | 'packageName' | 'repoName' | 'displayName' | 'commandPrefix' | 'envPrefix', string>;
@@ -266,12 +320,13 @@ export function initPlugin(rawName: string, options: PluginInitOptions = {}): Pl
   if (readPluginRegistry().plugins[normalized.pluginId]) throw new Error(`plugin_init_id_already_installed:${normalized.pluginId}`);
   const targetDir = join(cwd, normalized.repoName);
   if (existsSync(targetDir)) throw new Error(`plugin_init_target_exists:${targetDir}`);
-  const templateSource = options.templateSource || process.env.BOTMUX_PLUGIN_TEMPLATE_SOURCE || DEFAULT_PLUGIN_TEMPLATE_REPO;
+  const templateSource = options.templateSource || process.env.BOTMUX_PLUGIN_TEMPLATE_SOURCE || DEFAULT_PLUGIN_TEMPLATE_PACKAGE;
   const tmpRoot = mkdtempSync(join(tmpdir(), 'botmux-plugin-init-'));
   const tmpTemplate = join(tmpRoot, 'template');
+  const tmpTemplateInstall = join(tmpRoot, 'template-install');
   const tmpGenerated = join(tmpRoot, 'generated');
   try {
-    copyTemplateSource(templateSource, tmpTemplate, cwd);
+    copyTemplateSource(templateSource, tmpTemplate, cwd, tmpTemplateInstall);
     generatePluginProject(tmpTemplate, tmpGenerated, normalized);
     if (!options.skipSelfTest) runSelfTest(tmpGenerated);
     cpSync(tmpGenerated, targetDir, { recursive: true });
