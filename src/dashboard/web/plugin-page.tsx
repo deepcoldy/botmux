@@ -616,9 +616,7 @@ function PluginEnableSettings(props: {
               plugin={plugin}
               scope={bot.id}
               label={bot.name}
-              hint={inherited
-                ? `当前${enabledState}，跟随全局设置`
-                : `当前${enabledState}，由该 Bot 独立设置`}
+              hint={`当前${enabledState}`}
               sourceLabel={inherited ? '继承全局' : '独立设置'}
               checked={checked}
               busy={props.busy}

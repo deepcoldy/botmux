@@ -34,8 +34,9 @@ describe('dashboard plugin pin UI', () => {
     expect(css).toContain('.plugin-enable-row-global');
     expect(css).toMatch(/\.plugin-enable-list \.plugin-enable-row\s*\{[^}]*padding:\s*11px 24px/s);
     expect(dashboard).toContain('onlineByAppId.get(bot.larkAppId)?.botName');
-    expect(pluginPage).toContain('`当前${enabledState}，跟随全局设置`');
-    expect(pluginPage).toContain('`当前${enabledState}，由该 Bot 独立设置`');
+    expect(pluginPage).toContain('hint={`当前${enabledState}`}');
+    expect(pluginPage).not.toContain('`当前${enabledState}，跟随全局设置`');
+    expect(pluginPage).not.toContain('`当前${enabledState}，由该 Bot 独立设置`');
   });
 
   it('uses React state to update plugin cards without rebuilding the page DOM', () => {
