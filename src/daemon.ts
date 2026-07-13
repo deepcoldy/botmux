@@ -144,7 +144,7 @@ import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentRea
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentPrompt, buildDocWatchWarmupPrompt } from './core/doc-comment-prompt.js';
-import { docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
+import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
 import { markSessionActivity, announcePendingRepoSession, publishAttentionPatch, clearAgentAttention } from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
@@ -8090,19 +8090,24 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
           createdAt: current.pollCursorAt,
           replyId: current.pollCursorReplyId,
         });
-        for (const reply of fresh) {
-          const stillWatching = getDocSubscription(config.session.dataDir, larkAppId, current.fileToken);
-          if (!stillWatching || stillWatching.managedBy !== 'watch-comment' || stillWatching.commentTriggerMode !== 'all') break;
-
-          const selfBotOpenId = getBot(larkAppId).botOpenId;
-          const isSelfReply = (selfBotOpenId && reply.authorOpenId === selfBotOpenId)
-            || isBotAuthoredReply(reply.replyId)
-            || hasBotSentinel(reply.text);
-          const text = reply.text.replaceAll(BOT_REPLY_SENTINEL, '').trim();
-          let processed = true;
-          if (!isSelfReply && text) {
+        // Advance the cursor strictly in order, stopping at the first failed
+        // delivery — otherwise a later success would move the cursor past an
+        // un-delivered earlier reply and drop it for good (see advanceDocCommentCursor).
+        await advanceDocCommentCursor(
+          fresh,
+          async (reply) => {
+            const stillWatching = getDocSubscription(config.session.dataDir, larkAppId, current.fileToken);
+            if (!stillWatching || stillWatching.managedBy !== 'watch-comment' || stillWatching.commentTriggerMode !== 'all') {
+              return false; // watch removed mid-loop → stop without advancing
+            }
+            const selfBotOpenId = getBot(larkAppId).botOpenId;
+            const isSelfReply = (selfBotOpenId && reply.authorOpenId === selfBotOpenId)
+              || isBotAuthoredReply(reply.replyId)
+              || hasBotSentinel(reply.text);
+            const text = reply.text.replaceAll(BOT_REPLY_SENTINEL, '').trim();
+            if (isSelfReply || !text) return true; // safely skip; advance past it
             logger.info(`[doc-comment-poll] dispatch file=${current.fileToken.slice(0, 12)} comment=${reply.commentId.slice(0, 12)} reply=${reply.replyId.slice(0, 12)}`);
-            processed = await handleDocComment({
+            const ok = await handleDocComment({
               larkAppId,
               sub: stillWatching,
               commentId: reply.commentId,
@@ -8116,13 +8121,13 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
               isWhole: reply.isWhole,
               authorOpenId: reply.authorOpenId,
             });
-          }
-          if (processed) {
-            setDocCommentPollCursor(config.session.dataDir, larkAppId, current.fileToken, reply);
-          } else {
-            logger.warn(`[doc-comment-poll] cursor NOT advanced for reply=${reply.replyId.slice(0, 12)} (handleDocComment returned false, will retry next poll)`);
-          }
-        }
+            if (!ok) {
+              logger.warn(`[doc-comment-poll] cursor NOT advanced for reply=${reply.replyId.slice(0, 12)} (handleDocComment returned false; stopping this round, will retry next poll)`);
+            }
+            return ok;
+          },
+          (reply) => { setDocCommentPollCursor(config.session.dataDir, larkAppId, current.fileToken, reply); },
+        );
       } catch (err) {
         logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${err instanceof Error ? err.message : String(err)}`);
       }

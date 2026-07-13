@@ -58,3 +58,28 @@ export function docCommentRepliesAfterCursor(
 ): PolledDocReply[] {
   return flattenDocCommentReplies(comments).filter(reply => compareDocCommentPollCursor(reply, cursor) > 0);
 }
+
+/**
+ * Walk `fresh` replies in ascending cursor order, delivering each and advancing
+ * the persisted cursor **only** for a delivered reply. Stops at the first
+ * `deliver` that returns false so a later success can never move the cursor past
+ * an un-delivered earlier reply — that would drop it permanently, since the next
+ * poll only fetches replies strictly after the cursor. The stopped reply is
+ * retried from the same spot on the next poll (ordering is preserved).
+ *
+ * `deliver` returns true when the reply was handled (dispatched, or safely
+ * skipped e.g. self-authored/empty so the cursor should move past it), and false
+ * to stop the round without advancing (delivery failed, or the watch was removed
+ * mid-loop). `commit` persists the cursor to the just-delivered reply.
+ */
+export async function advanceDocCommentCursor(
+  fresh: PolledDocReply[],
+  deliver: (reply: PolledDocReply) => Promise<boolean>,
+  commit: (reply: PolledDocReply) => void | Promise<void>,
+): Promise<void> {
+  for (const reply of fresh) {
+    const delivered = await deliver(reply);
+    if (!delivered) return; // stop; retry from this reply on the next poll
+    await commit(reply);
+  }
+}
