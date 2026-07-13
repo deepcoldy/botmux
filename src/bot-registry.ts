@@ -621,8 +621,8 @@ export interface BotConfig {
    * 性质不变。可由 /grant 卡片「全局」按钮写入，也可在 bots.json 手配 open_id。
    */
   globalGrants?: string[];
-  /** Plugin ids enabled for this bot. Runtime effective set is
-   *  global config `plugins` union this list. */
+  /** Exact plugin ids enabled for this bot. Missing inherits the machine
+   *  default; an explicit list (including []) replaces it. */
   plugins?: string[];
   /**
    * 消息额度机制（默认关闭）。`defaultLimit` 的"是否配置"本身就是开关：
@@ -1356,7 +1356,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
 
     const skills = readBotSkillPolicy(entry.skills);
-    const plugins = normalizePluginIdList(entry.plugins);
+    // Presence is semantic for plugins: [] is an exact "none" override, while
+    // an absent field inherits the machine defaults.
+    const plugins = Array.isArray(entry.plugins)
+      ? normalizePluginIdList(entry.plugins) ?? []
+      : undefined;
     const summaryRange = normalizeSummaryRange(entry.summaryRange ?? entry.summary);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);

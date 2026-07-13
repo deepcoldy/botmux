@@ -84,7 +84,8 @@ describe('listenWithProbe', () => {
       log: m => logs.push(m),
     });
     expect(verified[0]).toBe(start);   // it really bound `start` before rejecting
-    expect(bound).toBe(start + 1);     // then released it and stepped up
+    expect(bound).toBeGreaterThan(start); // then released it and stepped up to the next usable port
+    expect(verified.at(-1)).toBe(bound);
     expect(logs.join('\n')).toContain(`${start}`);
   });
 

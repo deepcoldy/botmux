@@ -1,21 +1,19 @@
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parsePluginPackageManifest } from './manifest.js';
+import { scanPluginContributions } from './convention-scanner.js';
 import {
   ensurePluginHome,
-  pluginCurrentDir,
   pluginHome,
+  pluginRuntimeDir,
   pluginsHome,
   pluginSettingsPath,
   pluginConfigPath,
-  pluginVersionDir,
-  resolvePluginPath,
 } from './paths.js';
 import type { InstalledPluginRecord, PluginPackageManifest, PluginSettingsFile } from './types.js';
 import { upsertInstalledPlugin } from '../../services/plugin-registry-store.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
-import { installLocalSkillLinks } from '../../services/skill-registry-store.js';
 
 export interface InstallPluginOptions {
   source?: 'auto' | 'npm' | 'local';
@@ -24,7 +22,7 @@ export interface InstallPluginOptions {
 
 export interface InstallPluginResult {
   record: InstalledPluginRecord;
-  packageDir: string;
+  runtimeDir: string;
 }
 
 function readPackageManifest(packageDir: string): PluginPackageManifest {
@@ -44,12 +42,6 @@ function ensurePluginStateFiles(pluginId: string): void {
   }
 }
 
-function replaceCurrentSymlink(pluginId: string, targetDir: string): void {
-  const current = pluginCurrentDir(pluginId);
-  rmSync(current, { recursive: true, force: true });
-  symlinkSync(targetDir, current, 'dir');
-}
-
 function isLocalSpec(spec: string): boolean {
   return spec.startsWith('.') || spec.startsWith('~') || isAbsolute(spec) || existsSync(resolve(spec));
 }
@@ -59,54 +51,76 @@ function resolveLocalSpec(spec: string): string {
   return resolve(spec);
 }
 
-function copyLocalPackage(sourceDir: string, targetDir: string): void {
-  rmSync(targetDir, { recursive: true, force: true });
-  mkdirSync(dirname(targetDir), { recursive: true });
-  cpSync(sourceDir, targetDir, {
-    recursive: true,
-    filter: (src) => {
-      const base = basename(src);
-      return base !== 'node_modules' && base !== '.git';
-    },
-  });
+function requireRuntimeDir(packageDir: string): string {
+  const runtimeDir = join(packageDir, 'dist');
+  if (!existsSync(runtimeDir)) throw new Error(`plugin_dist_not_found:${packageDir}`);
+  if (!statSync(runtimeDir).isDirectory()) throw new Error(`plugin_dist_not_directory:${packageDir}`);
+  return runtimeDir;
 }
 
-function makeRecord(pkg: PluginPackageManifest, source: InstalledPluginRecord['source']): InstalledPluginRecord {
+function copyRuntime(sourceDir: string, targetDir: string): void {
+  rmSync(targetDir, { recursive: true, force: true });
+  mkdirSync(dirname(targetDir), { recursive: true });
+  cpSync(sourceDir, targetDir, { recursive: true });
+}
+
+function replacePluginRuntime(pluginId: string, stagedDir: string): string {
+  const targetDir = pluginRuntimeDir(pluginId);
+  const backupDir = join(pluginHome(pluginId), `.dist-previous-${process.pid}-${Date.now()}`);
+  rmSync(backupDir, { recursive: true, force: true });
+  if (existsSync(targetDir)) renameSync(targetDir, backupDir);
+  try {
+    renameSync(stagedDir, targetDir);
+  } catch (err) {
+    if (existsSync(backupDir)) renameSync(backupDir, targetDir);
+    throw err;
+  }
+  rmSync(backupDir, { recursive: true, force: true });
+  return targetDir;
+}
+
+function stageRuntime(pluginId: string, sourceDir: string, link: boolean): string {
+  mkdirSync(pluginsHome(), { recursive: true });
+  const stagedDir = join(pluginsHome(), `.${pluginId}-dist-next-${process.pid}-${Date.now()}`);
+  rmSync(stagedDir, { recursive: true, force: true });
+  if (link) {
+    symlinkSync(sourceDir, stagedDir, 'dir');
+  } else {
+    copyRuntime(sourceDir, stagedDir);
+  }
+  return stagedDir;
+}
+
+function makeRecord(pkg: PluginPackageManifest, source: InstalledPluginRecord['source'], runtimeDir: string): InstalledPluginRecord {
   const now = new Date().toISOString();
+  const contributions = scanPluginContributions(runtimeDir, pkg.botmux);
   return {
     id: pkg.botmux.id,
     packageName: pkg.name,
     version: pkg.version,
     source,
     manifest: pkg.botmux,
+    ...(contributions ? { contributions } : {}),
     installedAt: now,
     updatedAt: now,
   };
 }
 
-function registerStaticPluginSkills(pkg: PluginPackageManifest, packageDir: string): void {
-  const dirs = (pkg.botmux.skills ?? [])
-    .map(entry => resolvePluginPath(packageDir, entry.path, 'skill_path'))
-    .filter(dir => existsSync(dir));
-  if (dirs.length > 0) installLocalSkillLinks(dirs);
-}
-
 export function installLocalPlugin(spec: string, opts: InstallPluginOptions = {}): InstallPluginResult {
   const sourceDir = resolveLocalSpec(spec);
   const pkg = readPackageManifest(sourceDir);
-  ensurePluginStateFiles(pkg.botmux.id);
-  const targetDir = join(pluginVersionDir(pkg.botmux.id, pkg.version), 'package');
-  if (opts.link) {
-    mkdirSync(dirname(targetDir), { recursive: true });
-    rmSync(targetDir, { recursive: true, force: true });
-    symlinkSync(sourceDir, targetDir, 'dir');
-  } else {
-    copyLocalPackage(sourceDir, targetDir);
+  const sourceRuntimeDir = requireRuntimeDir(sourceDir);
+  const stagedRecord = makeRecord(pkg, { type: 'local', spec: sourceDir }, sourceRuntimeDir);
+  const stagedDir = stageRuntime(pkg.botmux.id, sourceRuntimeDir, opts.link === true);
+  let runtimeDir: string;
+  try {
+    ensurePluginStateFiles(pkg.botmux.id);
+    runtimeDir = replacePluginRuntime(pkg.botmux.id, stagedDir);
+  } finally {
+    rmSync(stagedDir, { recursive: true, force: true });
   }
-  replaceCurrentSymlink(pkg.botmux.id, targetDir);
-  const record = upsertInstalledPlugin(makeRecord(pkg, { type: 'local', spec: sourceDir }));
-  registerStaticPluginSkills(pkg, targetDir);
-  return { record, packageDir: targetDir };
+  const record = upsertInstalledPlugin(stagedRecord);
+  return { record, runtimeDir };
 }
 
 function findBotmuxPackageUnderNodeModules(root: string): string {
@@ -140,23 +154,25 @@ export function installNpmPlugin(spec: string): InstallPluginResult {
   rmSync(tmpRoot, { recursive: true, force: true });
   mkdirSync(tmpRoot, { recursive: true });
   try {
-    execFileSync('npm', ['install', '--omit=dev', '--prefix', tmpRoot, spec], {
+    execFileSync('npm', ['install', '--omit=dev', '--omit=peer', '--prefix', tmpRoot, spec], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, npm_config_audit: 'false', npm_config_fund: 'false' },
       timeout: 120_000,
     });
     const tmpPackageDir = findBotmuxPackageUnderNodeModules(tmpRoot);
     const pkg = readPackageManifest(tmpPackageDir);
-    ensurePluginStateFiles(pkg.botmux.id);
-    const finalRoot = pluginVersionDir(pkg.botmux.id, pkg.version);
-    rmSync(finalRoot, { recursive: true, force: true });
-    mkdirSync(dirname(finalRoot), { recursive: true });
-    cpSync(tmpRoot, finalRoot, { recursive: true });
-    const packageDir = join(finalRoot, 'node_modules', pkg.name);
-    replaceCurrentSymlink(pkg.botmux.id, packageDir);
-    const record = upsertInstalledPlugin(makeRecord(pkg, { type: 'npm', spec }));
-    registerStaticPluginSkills(pkg, packageDir);
-    return { record, packageDir };
+    const tmpRuntimeDir = requireRuntimeDir(tmpPackageDir);
+    const stagedRecord = makeRecord(pkg, { type: 'npm', spec }, tmpRuntimeDir);
+    const stagedDir = stageRuntime(pkg.botmux.id, tmpRuntimeDir, false);
+    let runtimeDir: string;
+    try {
+      ensurePluginStateFiles(pkg.botmux.id);
+      runtimeDir = replacePluginRuntime(pkg.botmux.id, stagedDir);
+    } finally {
+      rmSync(stagedDir, { recursive: true, force: true });
+    }
+    const record = upsertInstalledPlugin(stagedRecord);
+    return { record, runtimeDir };
   } finally {
     rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -168,6 +184,6 @@ export function installPlugin(spec: string, opts: InstallPluginOptions = {}): In
   return installNpmPlugin(spec);
 }
 
-export function installedPluginPackageDir(pluginId: string): string {
-  return pluginCurrentDir(pluginId);
+export function installedPluginRuntimeDir(pluginId: string): string {
+  return pluginRuntimeDir(pluginId);
 }

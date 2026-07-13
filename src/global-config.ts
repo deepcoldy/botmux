@@ -68,8 +68,8 @@ export interface GlobalConfig {
   /** Machine-wide user skill registry policy. Skill package storage itself lives under
    *  ~/.botmux/skills and is managed by services/skill-registry-store.ts. */
   skills?: GlobalSkillConfig;
-  /** Machine-wide default plugin ids enabled for every bot. Per-bot plugins in
-   *  bots.json are unioned with this list at session/runtime resolution time. */
+  /** Machine-wide default plugin ids. A bot with no `plugins` field inherits
+   *  this list; a bot with an explicit list (including []) replaces it. */
   plugins?: string[];
   /** 远程访问. When true (and this machine is bound to the central platform),
    *  session web-terminal links, Feishu card terminal buttons, and connector
@@ -139,6 +139,9 @@ export interface DashboardGlobalConfig {
    *  ON (absent ⇒ enabled); set false to disable from the dashboard. Read live
    *  by the daemon — see config.ts `resolveChatBotDiscoveryConfig`. */
   chatBotDiscovery?: boolean;
+  /** Installed plugin Dashboard pages pinned into the main sidebar. This is a
+   *  machine-wide display preference and does not enable the plugin for a Bot. */
+  pinnedPlugins?: string[];
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -236,6 +239,8 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (typeof d.publicReadOnly === 'boolean') out.publicReadOnly = d.publicReadOnly;
   if (typeof d.openTerminalInFeishu === 'boolean') out.openTerminalInFeishu = d.openTerminalInFeishu;
   if (typeof d.chatBotDiscovery === 'boolean') out.chatBotDiscovery = d.chatBotDiscovery;
+  const pinnedPlugins = normalizePluginIdList(d.pinnedPlugins);
+  if (pinnedPlugins) out.pinnedPlugins = pinnedPlugins;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

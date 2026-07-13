@@ -5,12 +5,11 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { readPluginRegistry } from '../../services/plugin-registry-store.js';
 import {
   pluginConfigPath,
-  pluginCurrentDir,
+  pluginRuntimeDir,
   pluginSettingsPath,
   resolvePluginPath,
 } from './paths.js';
-import { resolveStaticPluginMcpServers, type ResolvedPluginMcpServer, type ResolvePluginMcpInput } from './mcp.js';
-import type { BotmuxPluginManifest, InstalledPluginRecord, PluginHook, PluginRuntime } from './types.js';
+import type { BotmuxPluginManifest, InstalledPluginRecord, PluginRuntime } from './types.js';
 
 export interface PluginApplyContext {
   runtime: PluginRuntime;
@@ -21,19 +20,20 @@ export interface PluginApplyContext {
   manifest: BotmuxPluginManifest;
 }
 
-export interface PluginServiceRuntimeInfo {
-  status?: string;
-  pid?: number;
+export interface PluginServiceDefinition {
+  mode?: 'manual' | 'auto';
   port?: number;
-  openUrl?: string;
-  healthUrl?: string;
-  [key: string]: unknown;
-}
-
-export interface PluginServiceController {
-  start?(ctx: PluginApplyContext, previousState?: PluginServiceRuntimeInfo): PluginServiceRuntimeInfo | Promise<PluginServiceRuntimeInfo>;
-  stop?(ctx: PluginApplyContext, previousState?: PluginServiceRuntimeInfo): void | PluginServiceRuntimeInfo | Promise<void | PluginServiceRuntimeInfo>;
-  status?(ctx: PluginApplyContext, previousState?: PluginServiceRuntimeInfo): PluginServiceRuntimeInfo | Promise<PluginServiceRuntimeInfo>;
+  pm2: {
+    script: string;
+    cwd?: string;
+    args?: string[];
+    env?: Record<string, string>;
+    autorestart?: boolean;
+  };
+  urls?(ctx: { host: string; env: Record<string, string>; port?: number }): {
+    openUrl?: string;
+    healthUrl?: string;
+  };
 }
 
 export interface PluginConfigApi {
@@ -45,6 +45,7 @@ export interface PluginConfigApi {
 
 export interface PluginCommandContext extends PluginApplyContext {
   args: string[];
+  api?: Record<string, unknown>;
 }
 
 export interface PluginCliCommand {
@@ -56,24 +57,6 @@ export interface PluginCliCommand {
 export interface RegisteredPluginCommand extends PluginCliCommand {
   pluginId: string;
 }
-
-type DynamicMcpServer = {
-  name: string;
-  transport?: 'stdio';
-  command: string[];
-  env?: Record<string, string>;
-};
-
-type WorkerMcpTap = {
-  pluginId: string;
-  name: string;
-  handler(ctx: {
-    botId: string;
-    sessionId: string;
-    pluginIds: readonly string[];
-    addMcpServer(name: string, server: Omit<DynamicMcpServer, 'name'>): void;
-  }): void | Promise<void>;
-};
 
 function readJsonObject(path: string): Record<string, unknown> {
   if (!existsSync(path)) return {};
@@ -133,77 +116,46 @@ function createConfigApi(pluginId: string): PluginConfigApi {
   };
 }
 
-function hasRuntimeHook(record: InstalledPluginRecord, runtime: Extract<PluginHook, PluginRuntime>): boolean {
-  if (!record.manifest.main) return false;
-  const hooks = record.manifest.hooks;
-  return !hooks || hooks.includes(runtime);
-}
-
 function orderedPluginRecords(pluginIds?: readonly string[]): InstalledPluginRecord[] {
   const registry = readPluginRegistry();
   const selected = pluginIds?.length ? [...pluginIds] : Object.keys(registry.plugins);
-  const visiting = new Set<string>();
-  const visited = new Set<string>();
   const out: InstalledPluginRecord[] = [];
-
-  const visit = (id: string, chain: string[]) => {
+  const seen = new Set<string>();
+  for (const id of selected) {
+    if (seen.has(id)) continue;
     const record = registry.plugins[id];
     if (!record) throw new Error(`plugin_not_installed:${id}`);
-    if (visited.has(id)) return;
-    if (visiting.has(id)) throw new Error(`plugin_dependency_cycle:${[...chain, id].join('>')}`);
-    visiting.add(id);
-    for (const dep of Object.keys(record.manifest.dependencies?.plugins ?? {})) visit(dep, [...chain, id]);
-    visiting.delete(id);
-    visited.add(id);
+    seen.add(id);
     out.push(record);
-  };
-
-  for (const id of selected) visit(id, []);
+  }
   return out;
 }
 
-async function importPluginApply(record: InstalledPluginRecord): Promise<((api: any, ctx: PluginApplyContext) => unknown) | undefined> {
-  if (!record.manifest.main) return undefined;
-  const pluginDir = pluginCurrentDir(record.id);
-  const entry = resolvePluginPath(pluginDir, record.manifest.main, 'main');
-  if (!existsSync(entry)) throw new Error(`plugin_main_not_found:${record.id}:${record.manifest.main}`);
-  const mod = await import(pathToFileURL(entry).href);
-  const exported = mod.default ?? mod;
-  if (typeof exported === 'function') return exported;
-  if (exported && typeof exported.apply === 'function') return exported.apply.bind(exported);
-  throw new Error(`plugin_apply_not_found:${record.id}`);
-}
-
-export async function loadPluginServiceController(record: InstalledPluginRecord): Promise<PluginServiceController | undefined> {
+export async function loadPluginServiceDefinition(record: InstalledPluginRecord): Promise<PluginServiceDefinition | undefined> {
   if (!record.manifest.service) return undefined;
-  if (!record.manifest.main) throw new Error(`plugin_service_missing_main:${record.id}`);
-  const pluginDir = pluginCurrentDir(record.id);
-  const entry = resolvePluginPath(pluginDir, record.manifest.main, 'main');
-  if (!existsSync(entry)) throw new Error(`plugin_main_not_found:${record.id}:${record.manifest.main}`);
+  const pluginDir = pluginRuntimeDir(record.id);
+  const entrypoint = record.contributions?.service?.entry;
+  if (!entrypoint) throw new Error(`plugin_service_entry_not_found:${record.id}`);
+  const entry = resolvePluginPath(pluginDir, entrypoint, 'service_entry');
+  if (!existsSync(entry)) throw new Error(`plugin_service_entry_not_found:${record.id}:${entrypoint}`);
   const mod = await import(pathToFileURL(entry).href);
   const exported = mod.default ?? mod;
-  const applyService = typeof mod.applyService === 'function'
-    ? mod.applyService
-    : exported && typeof exported.applyService === 'function'
-      ? exported.applyService.bind(exported)
-      : undefined;
-  const controller = applyService
-    ? await applyService(baseApi(record, 'service'), baseContext(record, 'service'))
-    : exported && typeof exported.service === 'object'
-      ? exported.service
-      : undefined;
-  if (!controller || typeof controller !== 'object') throw new Error(`plugin_service_controller_not_found:${record.id}`);
-  if (typeof controller.start !== 'function' && typeof controller.stop !== 'function' && typeof controller.status !== 'function') {
-    throw new Error(`plugin_service_controller_empty:${record.id}`);
-  }
-  return controller as PluginServiceController;
+  const definition = typeof exported === 'function'
+    ? await exported(baseApi(record, 'service'), baseContext(record, 'service'))
+    : exported;
+  if (!definition || typeof definition !== 'object') throw new Error(`plugin_service_definition_not_found:${record.id}`);
+  const service = definition as PluginServiceDefinition;
+  if (!service.pm2 || typeof service.pm2 !== 'object') throw new Error(`plugin_service_pm2_missing:${record.id}`);
+  if (typeof service.pm2.script !== 'string' || !service.pm2.script.trim()) throw new Error(`plugin_service_pm2_script_missing:${record.id}`);
+  if (service.mode && service.mode !== record.manifest.service.mode) throw new Error(`plugin_service_mode_mismatch:${record.id}`);
+  return service;
 }
 
 function baseContext(record: InstalledPluginRecord, runtime: PluginRuntime): PluginApplyContext {
   return {
     runtime,
     pluginId: record.id,
-    pluginDir: pluginCurrentDir(record.id),
+    pluginDir: pluginRuntimeDir(record.id),
     packageName: record.packageName,
     version: record.version,
     manifest: record.manifest,
@@ -211,7 +163,7 @@ function baseContext(record: InstalledPluginRecord, runtime: PluginRuntime): Plu
 }
 
 function baseApi(record: InstalledPluginRecord, runtime: PluginRuntime): Record<string, unknown> {
-  const pluginDir = pluginCurrentDir(record.id);
+  const pluginDir = pluginRuntimeDir(record.id);
   return {
     runtime,
     logger: console,
@@ -224,87 +176,27 @@ function baseApi(record: InstalledPluginRecord, runtime: PluginRuntime): Record<
 export async function collectPluginCliCommands(pluginIds?: readonly string[]): Promise<RegisteredPluginCommand[]> {
   const commands: RegisteredPluginCommand[] = [];
   for (const record of orderedPluginRecords(pluginIds)) {
-    if (!hasRuntimeHook(record, 'cli')) continue;
-    const apply = await importPluginApply(record);
-    if (!apply) continue;
-    const api = {
-      ...baseApi(record, 'cli'),
-      cli: {
-        registerCommand(command: PluginCliCommand): () => void {
-          if (!command?.name || !/^[a-z][a-z0-9._:-]{0,63}$/.test(command.name)) {
-            throw new Error(`invalid_plugin_cli_command:${record.id}`);
-          }
-          const registered: RegisteredPluginCommand = { ...command, pluginId: record.id };
-          commands.push(registered);
-          return () => {
-            const idx = commands.indexOf(registered);
-            if (idx >= 0) commands.splice(idx, 1);
-          };
+    const contribution = record.contributions?.cli;
+    if (!contribution) continue;
+    for (const command of contribution.commands) {
+      commands.push({
+        pluginId: record.id,
+        name: command.name,
+        ...(command.description ? { description: command.description } : {}),
+        async run(ctx: PluginCommandContext) {
+          const entry = resolvePluginPath(pluginRuntimeDir(record.id), contribution.entry, 'cli_entry');
+          if (!existsSync(entry)) throw new Error(`plugin_cli_entry_not_found:${record.id}`);
+          const mod = await import(pathToFileURL(entry).href);
+          const exported = mod.default ?? mod;
+          const handler = exported?.[command.name];
+          const api = baseApi(record, 'cli');
+          const handlerCtx = { ...ctx, api };
+          if (typeof handler === 'function') return handler(handlerCtx, api);
+          if (handler && typeof handler.run === 'function') return handler.run(handlerCtx, api);
+          throw new Error(`plugin_cli_handler_not_found:${record.id}:${command.name}`);
         },
-      },
-    };
-    await apply(api, baseContext(record, 'cli'));
+      });
+    }
   }
   return commands;
-}
-
-export async function resolvePluginMcpServers(input: ResolvePluginMcpInput): Promise<ResolvedPluginMcpServer[]> {
-  const records = orderedPluginRecords(input.pluginIds);
-  const expandedInput = { ...input, pluginIds: records.map(record => record.id) };
-  const out = resolveStaticPluginMcpServers(expandedInput);
-  const seen = new Map<string, string>();
-  for (const server of out) seen.set(server.name, server.pluginId);
-
-  const taps: WorkerMcpTap[] = [];
-  for (const record of records) {
-    if (!hasRuntimeHook(record, 'worker')) continue;
-    const apply = await importPluginApply(record);
-    if (!apply) continue;
-    const api = {
-      ...baseApi(record, 'worker'),
-      worker: {
-        configureMcp: {
-          tap(name: string, handler: WorkerMcpTap['handler']): () => void {
-            if (!name || typeof handler !== 'function') throw new Error(`invalid_plugin_mcp_tap:${record.id}`);
-            const tap: WorkerMcpTap = { pluginId: record.id, name, handler };
-            taps.push(tap);
-            return () => {
-              const idx = taps.indexOf(tap);
-              if (idx >= 0) taps.splice(idx, 1);
-            };
-          },
-        },
-      },
-    };
-    await apply(api, baseContext(record, 'worker'));
-  }
-
-  for (const tap of taps) {
-    const addMcpServer = (name: string, server: Omit<DynamicMcpServer, 'name'>) => {
-      if (!name || seen.has(name)) {
-        const previous = seen.get(name);
-        throw new Error(`plugin_mcp_name_conflict:${name}:${previous ?? 'dynamic'}:${tap.pluginId}`);
-      }
-      if (!Array.isArray(server.command) || server.command.length === 0) {
-        throw new Error(`plugin_dynamic_mcp_missing_command:${tap.pluginId}:${name}`);
-      }
-      seen.set(name, tap.pluginId);
-      out.push({
-        pluginId: tap.pluginId,
-        name,
-        transport: server.transport ?? 'stdio',
-        command: server.command,
-        ...(server.env ? { env: server.env } : {}),
-        cwd: pluginCurrentDir(tap.pluginId),
-      });
-    };
-    await tap.handler({
-      botId: input.botId,
-      sessionId: input.sessionId,
-      pluginIds: input.pluginIds,
-      addMcpServer,
-    });
-  }
-
-  return out;
 }

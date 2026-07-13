@@ -1,6 +1,5 @@
-export type PluginRuntime = 'cli' | 'daemon' | 'worker' | 'dashboard' | 'service';
-export type PluginHook = Exclude<PluginRuntime, 'service'> | 'adapters';
-export type PluginServiceMode = 'manual' | 'lifecycle';
+export type PluginRuntime = 'cli' | 'service';
+export type PluginServiceMode = 'manual' | 'auto';
 
 export interface PluginDashboardEntry {
   id: string;
@@ -9,34 +8,64 @@ export interface PluginDashboardEntry {
 }
 
 export interface PluginSkillEntry {
+  name?: string;
   path: string;
 }
 
-export interface PluginMcpServer {
+export interface PluginStdioMcpServer {
   name: string;
-  transport?: 'stdio';
+  transport: 'stdio';
   command: string[];
   env?: Record<string, string>;
 }
 
+export interface PluginStreamableHttpMcpServer {
+  name: string;
+  transport: 'streamable-http';
+  url: string;
+  headers?: Record<string, string>;
+}
+
+export type PluginMcpServer = PluginStdioMcpServer | PluginStreamableHttpMcpServer;
+
 export interface PluginServiceConfig {
   mode: PluginServiceMode;
+}
+
+export interface PluginRuntimeEntrypoint {
+  entry: string;
+}
+
+export interface PluginCliCommandIndexEntry {
+  name: string;
+  description?: string;
+}
+
+export interface PluginCliContribution extends PluginRuntimeEntrypoint {
+  commandsPath: string;
+  commands: PluginCliCommandIndexEntry[];
+}
+
+export interface PluginServiceContribution extends PluginRuntimeEntrypoint {
+  mode: PluginServiceMode;
+}
+
+export interface PluginContributions {
+  skills?: PluginSkillEntry[];
+  dashboard?: PluginDashboardEntry[];
+  mcp?: PluginMcpServer;
+  cli?: PluginCliContribution;
+  service?: PluginServiceContribution;
 }
 
 export interface BotmuxPluginManifest {
   schemaVersion: 1;
   id: string;
   displayName?: string;
-  main?: string;
-  hooks?: PluginHook[];
-  capabilities?: string[];
   dependencies?: {
-    plugins?: Record<string, string>;
+    plugins?: string[];
   };
-  skills?: PluginSkillEntry[];
-  dashboard?: PluginDashboardEntry[];
   service?: PluginServiceConfig;
-  mcp?: PluginMcpServer[];
 }
 
 export interface PluginPackageManifest {
@@ -44,7 +73,6 @@ export interface PluginPackageManifest {
   version: string;
   type?: string;
   keywords?: string[];
-  peerDependencies?: Record<string, string>;
   botmux: BotmuxPluginManifest;
 }
 
@@ -58,6 +86,7 @@ export interface InstalledPluginRecord {
     spec: string;
   };
   manifest: BotmuxPluginManifest;
+  contributions?: PluginContributions;
   installedAt: string;
   updatedAt: string;
 }
@@ -76,8 +105,8 @@ export interface PluginSettingsFile {
 export interface PluginServiceState {
   pluginId: string;
   version?: string;
-  currentDir?: string;
-  currentRealpath?: string;
+  runtimeDir?: string;
+  runtimeRealpath?: string;
   updatedAt: string;
   status?: string;
   pid?: number;
@@ -85,4 +114,15 @@ export interface PluginServiceState {
   openUrl?: string;
   healthUrl?: string;
   [key: string]: unknown;
+}
+
+export interface PluginMaterializedFile {
+  schemaVersion: 1;
+  pluginId: string;
+  updatedAt: string;
+  skills?: Array<{ name: string; path: string }>;
+  mcp?: Array<{ cliId: string; name: string; path: string }>;
+  cli?: Array<{ name: string }>;
+  dashboard?: Array<{ id: string; entry: string }>;
+  service?: Array<{ name: string }>;
 }

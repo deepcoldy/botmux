@@ -6,9 +6,9 @@
  *   botmux setup          — interactive first-time configuration
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
  *   botmux setup list|add|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
- *   botmux start          — start daemon and lifecycle plugin services
- *   botmux stop [--with-plugin] — stop daemon (optionally stop lifecycle plugin services)
- *   botmux restart [--include-pm2] [--with-plugin] — restart daemon (optionally restart PM2 God / lifecycle plugin services)
+ *   botmux start          — start daemon and auto plugin services
+ *   botmux stop [--with-plugin] — stop daemon (optionally stop auto plugin services)
+ *   botmux restart [--include-pm2] [--with-plugin] — restart daemon, then ensure auto plugin services
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
  *   botmux upgrade        — upgrade to latest version
@@ -91,7 +91,7 @@ import {
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import { type Brand, chatAppLink, larkHosts, normalizeBrand, sdkDomain } from './im/lark/lark-hosts.js';
-import { mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
+import { mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
 import {
   createWhiteboard,
   ensureDefaultWhiteboard,
@@ -105,6 +105,12 @@ import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js
 import { writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 import { stripLegacyPendingCardFields } from './services/session-store.js';
 import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
+import { updateBotPluginOverride } from './core/plugins/effective.js';
+import {
+  assertPluginBindingTransition,
+  describePluginDependencyError,
+  enabledPluginDependents,
+} from './core/plugins/dependencies.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -263,6 +269,21 @@ function pm2Capture(args: string[], home: string = PM2_HOME, timeoutMs = 10_000)
     throw new Error(`pm2 ${args.join(' ')} failed: ${detail}`);
   }
   return typeof r.stdout === 'string' ? r.stdout : '';
+}
+
+function parsePm2JlistOutput(output: string): any[] {
+  try {
+    const parsed = JSON.parse(output);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    for (let start = output.lastIndexOf('['); start >= 0; start = output.lastIndexOf('[', start - 1)) {
+      try {
+        const parsed = JSON.parse(output.slice(start).trim());
+        if (Array.isArray(parsed)) return parsed;
+      } catch { /* try an earlier '['; pm2 may prefix stdout with [PM2] logs */ }
+    }
+    throw new Error('pm2_jlist_json_not_found');
+  }
 }
 
 function loadBotsJson(): any[] {
@@ -1774,7 +1795,7 @@ async function cmdStart(): Promise<void> {
   cleanupLegacyPm2();
   const cfg = ecosystemConfig();
   runPm2(['start', cfg]);
-  await reconcilePluginServicesForCli(undefined, { lifecycleOnly: true });
+  await reconcilePluginServicesForCli(undefined, { autoOnly: true });
   const bots = loadBotsJson();
   const count = bots.length || 1;
   console.log(`\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
@@ -1822,7 +1843,7 @@ function isBotmuxCoreProcessName(name: string): boolean {
 function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
   let entries: Array<{ name: string; pid: number; online: boolean }>;
   try {
-    const apps = JSON.parse(pm2Capture(['jlist'], home)) as any[];
+    const apps = parsePm2JlistOutput(pm2Capture(['jlist'], home));
     entries = (Array.isArray(apps) ? apps : [])
       .filter(a => a && isBotmuxCoreProcessName(String(a.name)))
       .map(a => ({ name: String(a.name), pid: Number(a.pid) || 0, online: a?.pm2_env?.status === 'online' }));
@@ -1927,7 +1948,7 @@ async function cmdStop(): Promise<void> {
   let stopped = false;
   try {
     const output = pm2Capture(['jlist']);
-    const apps = JSON.parse(output) as any[];
+    const apps = parsePm2JlistOutput(output);
     for (const app of apps) {
       if (isBotmuxCoreProcessName(String(app.name))) {
         try { runPm2(['stop', app.name]); stopped = true; } catch { /* */ }
@@ -1936,7 +1957,7 @@ async function cmdStop(): Promise<void> {
   } catch { /* */ }
   // Wipe abandoned dashboard-daemon descriptors left behind by stopped daemons.
   cleanupStaleDaemonDescriptors();
-  if (includePluginServices) await stopPluginServicesForCli(undefined, { lifecycleOnly: true });
+  if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
   if (!stopped) console.log('daemon 未在运行。');
 }
 
@@ -1965,14 +1986,17 @@ async function cmdRestart(): Promise<void> {
   cleanupLegacyPm2();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
-  if (includePluginServices) await stopPluginServicesForCli(undefined, { lifecycleOnly: true });
+  if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
   if (includePm2) {
     killPm2GodDaemon();
   }
   // Wipe abandoned dashboard-daemon descriptors left behind by killed daemons.
   cleanupStaleDaemonDescriptors();
   runPm2(['start', cfg]);
-  if (includePluginServices) await reconcilePluginServicesForCli(undefined, { lifecycleOnly: true });
+  // Default restart preserves running plugin services, then ensures every auto
+  // service is online. --with-plugin changes only the pre-restart side above:
+  // it explicitly stops auto services first, so this ensure becomes a restart.
+  await reconcilePluginServicesForCli(undefined, { autoOnly: true });
   if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
     console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
   }
@@ -1985,7 +2009,7 @@ async function cmdRestart(): Promise<void> {
  */
 function listBotmuxPm2Apps(): Array<{ name: string; online: boolean }> {
   try {
-    const apps = JSON.parse(pm2Capture(['jlist'])) as any[];
+    const apps = parsePm2JlistOutput(pm2Capture(['jlist']));
     return (Array.isArray(apps) ? apps : [])
       .filter(a => a && (a.name === PM2_NAME || String(a.name).startsWith(`${PM2_NAME}-`)))
       .map(a => ({ name: String(a.name), online: a?.pm2_env?.status === 'online' }));
@@ -2151,7 +2175,7 @@ function warnIfLegacyBotmuxAlive(): void {
   try { process.kill(legacyPid, 0); } catch { return; }
   try {
     const output = pm2Capture(['jlist'], legacyHome);
-    const apps = JSON.parse(output) as any[];
+    const apps = parsePm2JlistOutput(output);
     const hasBotmux = apps.some(a => a.name === PM2_NAME || a.name.startsWith(`${PM2_NAME}-`));
     if (hasBotmux) {
       console.warn('⚠️  检测到旧版 PM2_HOME (~/.pm2) 下仍有 botmux 进程,运行 `botmux restart` 完成迁移。\n');
@@ -3618,9 +3642,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 命令:
   setup       交互式配置（首次使用 / 添加机器人）
               默认使用 botmux 内置 Feishu Web QR 登录尝试自动导入权限/redirect/发布版本；可加 --no-open-platform-auto 跳过
-  start       启动 daemon，并启动 mode=lifecycle 的插件 service
-  stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=lifecycle 的插件 service）
-  restart     重启 daemon（默认不重启插件 service；--with-plugin 显式重启 mode=lifecycle 的插件 service；--include-pm2 同时重启 PM2 God）
+  start       启动 daemon，并启动 mode=auto 的插件 service
+  stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=auto 的插件 service）
+  restart     重启 daemon（默认不停止插件 service，core 启动后确保 mode=auto 正在运行；--with-plugin 显式先停再启动 auto service；--include-pm2 同时重启 PM2 God）
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
   upgrade     升级到最新版本
@@ -3652,14 +3676,16 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   vc-agent tat-gate|poll
                        飞书会议智能体 P0：校验 TAT 会中事件读取、轮询会议事件并触发 workflow
   plugin              管理 botmux 插件
+       plugin init <id>
+                       基于官方模板创建 botmux 插件仓库
        plugin install <npm-package|local-dir>
                        安装并校验 botmux 插件；不执行插件代码、不启动 service
-       plugin enable <id> --bot <bot|all> / --global
+       plugin enable <id>
                        启用插件给指定 bot 或全局默认；不影响 host service
-       plugin disable <id> --bot <bot|all> / --global
+       plugin disable <id>
                        禁用插件引用；不影响 host service
-       plugin run <command> [args...] [--plugin <id>]
-                       执行插件注册的 CLI 命令
+       插件 CLI 命令使用一级命令形式：botmux <command> [args...]
+                       只从全局 enabled 插件中查找
        plugin service status|start|stop [id|--all]
                        查看/管理插件 host service
   whiteboard status|enable|disable
@@ -6797,7 +6823,7 @@ function formatPluginServiceReports(reports: Array<{ pluginId: string; action: s
 
 async function reconcilePluginServicesForCli(
   pluginIds?: string[],
-  options: { lifecycleOnly?: boolean } = {},
+  options: { autoOnly?: boolean } = {},
 ): Promise<void> {
   const { startPluginServices } = await import('./core/plugins/service-manager.js');
   const reports = await startPluginServices(pluginIds, options);
@@ -6809,7 +6835,7 @@ async function reconcilePluginServicesForCli(
 
 async function stopPluginServicesForCli(
   pluginIds?: string[],
-  options: { lifecycleOnly?: boolean } = {},
+  options: { autoOnly?: boolean } = {},
 ): Promise<void> {
   const { stopPluginServices } = await import('./core/plugins/service-manager.js');
   const reports = await stopPluginServices(pluginIds, options);
@@ -6848,7 +6874,27 @@ function updateGlobalPluginBinding(pluginId: string, enable: boolean): void {
   mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
 }
 
-function updateBotPluginBinding(pluginId: string, botSelector: string, enable: boolean): number {
+function failPluginDependency(error: unknown): never {
+  const message = describePluginDependencyError(error);
+  if (!message) throw error;
+  console.error(`❌ ${message}`);
+  process.exit(1);
+}
+
+function assertPluginBindingTransitionForCli(pluginId: string, enable: boolean, enabledPluginIds: readonly string[]): void {
+  try {
+    assertPluginBindingTransition(pluginId, enable, enabledPluginIds, readPluginRegistryCached());
+  } catch (error) {
+    failPluginDependency(error);
+  }
+}
+
+function updateBotPluginBinding(
+  pluginId: string,
+  botSelector: string,
+  enable: boolean,
+  beforeWrite?: () => void,
+): number {
   const bots = loadBotsJson();
   if (bots.length === 0) {
     console.error('❌ 未找到 bots.json 或没有 bot 配置。');
@@ -6864,10 +6910,19 @@ function updateBotPluginBinding(pluginId: string, botSelector: string, enable: b
         }
         return [idx];
       })();
+  const machineDefaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
   for (const idx of indexes) {
-    const next = enable ? addPluginId(bots[idx].plugins, pluginId) : removePluginId(bots[idx].plugins, pluginId);
-    if (next.length > 0) bots[idx].plugins = next;
-    else delete bots[idx].plugins;
+    const current = Object.prototype.hasOwnProperty.call(bots[idx], 'plugins') ? bots[idx].plugins : undefined;
+    const effective = normalizePluginIdList(current === undefined ? machineDefaults : current) ?? [];
+    assertPluginBindingTransitionForCli(pluginId, enable, effective);
+  }
+  beforeWrite?.();
+  for (const idx of indexes) {
+    const current = Object.prototype.hasOwnProperty.call(bots[idx], 'plugins') ? bots[idx].plugins : undefined;
+    const next = updateBotPluginOverride(current, machineDefaults, pluginId, enable);
+    // [] is an intentional exact override. Deleting the field would make the
+    // bot inherit machine defaults and could re-enable the plugin.
+    bots[idx].plugins = next;
   }
   writeBotsAtomic(BOTS_JSON_FILE, bots);
   return indexes.length;
@@ -6878,24 +6933,29 @@ function removePluginBindingsEverywhere(pluginId: string): void {
   const bots = loadBotsJson();
   let changed = false;
   for (const bot of bots) {
+    if (!Object.prototype.hasOwnProperty.call(bot, 'plugins')) continue;
     const next = removePluginId(bot.plugins, pluginId);
     const before = normalizePluginIdList(bot.plugins) ?? [];
     if (before.length !== next.length) changed = true;
-    if (next.length > 0) bot.plugins = next;
-    else delete bot.plugins;
+    bot.plugins = next;
   }
   if (changed) writeBotsAtomic(BOTS_JSON_FILE, bots);
+  const pinnedPlugins = normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? [];
+  if (pinnedPlugins.includes(pluginId)) {
+    mergeDashboardConfig({ pinnedPlugins: pinnedPlugins.filter(id => id !== pluginId) });
+  }
 }
 
 async function removePluginSkillRegistryEntries(pluginId: string): Promise<void> {
   const { readSkillRegistry, removeInstalledSkill } = await import('./services/skill-registry-store.js');
-  const { pluginCurrentDir, pluginHome, resolvePluginPath } = await import('./core/plugins/paths.js');
+  const { pluginRuntimeDir, pluginHome, resolvePluginPath } = await import('./core/plugins/paths.js');
   const { getInstalledPlugin } = await import('./services/plugin-registry-store.js');
   const roots = new Set<string>([pluginHome(pluginId)]);
   const record = getInstalledPlugin(pluginId);
-  for (const entry of record?.manifest.skills ?? []) {
+  const skillEntries = record?.contributions?.skills ?? (record?.manifest as any)?.skills ?? [];
+  for (const entry of skillEntries) {
     try {
-      const skillDir = resolvePluginPath(pluginCurrentDir(pluginId), entry.path, 'skill_path');
+      const skillDir = resolvePluginPath(pluginRuntimeDir(pluginId), entry.path, 'skill_path');
       roots.add(skillDir);
       if (existsSync(skillDir)) roots.add(realpathSync(skillDir));
     } catch {
@@ -6943,31 +7003,17 @@ async function loadPluginRegistryForCommand(): Promise<import('./core/plugins/ty
 function printPluginUsage(): void {
   console.log(`用法:
   botmux plugin list
+  botmux plugin init <plugin-id|botmux-plugin-id|@botmux-ai/plugin-id>
   botmux plugin install <npm-package|local-dir> [--link]
   botmux plugin uninstall <plugin-id> [--force]
-  botmux plugin enable <plugin-id> --bot <bot-index|name|appId|all>
-  botmux plugin enable <plugin-id> --global
-  botmux plugin disable <plugin-id> --bot <bot-index|name|appId|all>
-  botmux plugin disable <plugin-id> --global
-  botmux plugin run <command> [args...] [--plugin <plugin-id>]
+  botmux plugin enable <plugin-id> [--bot <name|index|all>]
+  botmux plugin disable <plugin-id> [--bot <name|index|all>]
+  botmux <plugin-command> [args...]
   botmux plugin service status
   botmux plugin service start [plugin-id|--all]
   botmux plugin service stop [plugin-id|--all]
+  botmux plugin service restart [plugin-id|--all]
 `);
-}
-
-function stripPluginRunFlags(args: string[]): { pluginId?: string; args: string[] } {
-  const out: string[] = [];
-  let pluginId: string | undefined;
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--plugin') {
-      pluginId = requirePluginId(args[i + 1]);
-      i++;
-      continue;
-    }
-    out.push(args[i]);
-  }
-  return { pluginId, args: out };
 }
 
 async function cmdPlugin(args: string[]): Promise<void> {
@@ -6981,8 +7027,39 @@ async function cmdPlugin(args: string[]): Promise<void> {
     const spec = args[1];
     if (!spec) { printPluginUsage(); process.exit(1); }
     const { installPlugin } = await import('./core/plugins/install.js');
-    const result = installPlugin(spec, { link: args.includes('--link') });
+    const { resolveOfficialPluginPackageSpec } = await import('./core/plugins/init.js');
+    const resolvedSpec = resolveOfficialPluginPackageSpec(spec);
+    const result = installPlugin(resolvedSpec, { link: args.includes('--link') });
+    const enabledPlugins = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+    if (enabledPlugins.includes(result.record.id)) {
+      const { materializePlugin } = await import('./core/plugins/materializer.js');
+      materializePlugin(result.record.id);
+    }
     console.log(`✅ 已安装插件 ${result.record.id} (${result.record.packageName}@${result.record.version})`);
+    return;
+  }
+
+  if (sub === 'init') {
+    const rawName = args[1];
+    if (!rawName) { printPluginUsage(); process.exit(1); }
+    const { initPlugin } = await import('./core/plugins/init.js');
+    try {
+      const result = initPlugin(rawName);
+      console.log(`✅ 已创建插件: ${result.displayName}`);
+      console.log(`   目录: ${result.targetDir}`);
+      console.log(`   npm 包名: ${result.packageName}`);
+      console.log(`   插件 id: ${result.pluginId}`);
+      console.log(`   默认命令: botmux ${result.commandPrefix}hello`);
+      console.log('');
+      console.log('下一步:');
+      console.log(`   cd ${result.repoName}`);
+      console.log('   botmux plugin install . --link');
+      console.log(`   botmux plugin enable ${result.pluginId}`);
+      console.log(`   botmux ${result.commandPrefix}hello`);
+    } catch (err: any) {
+      console.error(`❌ 创建插件失败: ${err?.message ?? String(err)}`);
+      process.exit(1);
+    }
     return;
   }
 
@@ -6995,15 +7072,9 @@ async function cmdPlugin(args: string[]): Promise<void> {
       return;
     }
     const globalPlugins = new Set(readGlobalConfig().plugins ?? []);
-    const bots = loadBotsJson();
     for (const plugin of plugins) {
-      const enabledBots = bots
-        .map((bot, index) => ({ label: botProcessName(bot, index), enabled: (normalizePluginIdList(bot.plugins) ?? []).includes(plugin.id) }))
-        .filter(item => item.enabled)
-        .map(item => item.label);
       const flags = [
-        globalPlugins.has(plugin.id) ? 'global' : '',
-        enabledBots.length > 0 ? `bots=${enabledBots.join(',')}` : '',
+        globalPlugins.has(plugin.id) ? 'enabled' : '',
       ].filter(Boolean).join(' ');
       console.log(`${plugin.id}\t${plugin.packageName}@${plugin.version}${flags ? `\t${flags}` : ''}`);
     }
@@ -7015,68 +7086,58 @@ async function cmdPlugin(args: string[]): Promise<void> {
     assertPluginInstalled(pluginId);
     const enable = sub === 'enable';
     if (args.includes('--global')) {
-      updateGlobalPluginBinding(pluginId, enable);
-      console.log(`✅ 已${enable ? '启用' : '禁用'}全局默认插件: ${pluginId}`);
-      return;
+      console.error('❌ 机器默认是默认作用域，不需要 --global。');
+      console.error(`   用法: botmux plugin ${sub} ${pluginId} [--bot <name|index|all>]`);
+      process.exit(1);
     }
     const botSelector = findArgValue(args, '--bot');
-    if (!botSelector) {
-      console.error(`❌ ${sub} 需要指定 --bot <bot-index|name|appId|all>，或使用 --global。`);
+    if (args.includes('--bot') && !botSelector) {
+      console.error('❌ --bot 后需要 bot 名称、序号或 all。');
       process.exit(1);
     }
-    const count = updateBotPluginBinding(pluginId, botSelector, enable);
-    console.log(`✅ 已为 ${count} 个 bot ${enable ? '启用' : '禁用'}插件: ${pluginId}`);
-    return;
-  }
-
-  if (sub === 'run' || sub === 'exec') {
-    const rawCommand = args[1];
-    if (!rawCommand) { printPluginUsage(); process.exit(1); }
-    const { pluginId, args: commandArgs } = stripPluginRunFlags(args.slice(2));
-    if (pluginId) assertPluginInstalled(pluginId);
-    const { collectPluginCliCommands } = await import('./core/plugins/runtime.js');
-    const commands = await collectPluginCliCommands(pluginId ? [pluginId] : undefined);
-    const matches = commands.filter(command => command.name === rawCommand);
-    if (matches.length === 0) {
-      console.error(`❌ 找不到插件 CLI 命令: ${rawCommand}`);
-      const available = commands.map(command => `${command.name} (${command.pluginId})`).sort();
-      if (available.length > 0) console.error(`   可用命令: ${available.join(', ')}`);
-      process.exit(1);
+    const { materializePlugin, dematerializePlugin } = await import('./core/plugins/materializer.js');
+    if (enable) {
+      if (botSelector) {
+        updateBotPluginBinding(pluginId, botSelector, true, () => materializePlugin(pluginId));
+      } else {
+        const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+        assertPluginBindingTransitionForCli(pluginId, true, current);
+        materializePlugin(pluginId);
+        updateGlobalPluginBinding(pluginId, true);
+      }
+    } else {
+      if (botSelector) {
+        updateBotPluginBinding(pluginId, botSelector, false);
+      } else {
+        const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+        assertPluginBindingTransitionForCli(pluginId, false, current);
+        updateGlobalPluginBinding(pluginId, false);
+      }
+      const stillReferenced = (normalizePluginIdList(readGlobalConfig().plugins) ?? []).includes(pluginId)
+        || loadBotsJson().some(bot => (normalizePluginIdList(bot.plugins) ?? []).includes(pluginId));
+      if (!stillReferenced) dematerializePlugin(pluginId);
     }
-    if (matches.length > 1 && !pluginId) {
-      console.error(`❌ 插件 CLI 命令冲突: ${rawCommand}`);
-      console.error(`   使用 --plugin 指定: ${matches.map(command => command.pluginId).join(', ')}`);
-      process.exit(1);
-    }
-    const command = matches[0];
-    const record = registry.plugins[command.pluginId];
-    const { pluginCurrentDir } = await import('./core/plugins/paths.js');
-    const result = await command.run({
-      runtime: 'cli',
-      pluginId: command.pluginId,
-      pluginDir: pluginCurrentDir(command.pluginId),
-      packageName: record?.packageName ?? command.pluginId,
-      version: record?.version ?? '0.0.0',
-      manifest: record?.manifest ?? { schemaVersion: 1, id: command.pluginId },
-      args: commandArgs,
-    });
-    if (typeof result === 'string') console.log(result);
-    if (typeof result === 'number') process.exitCode = result;
+    console.log(`✅ 已${enable ? '启用' : '禁用'}${botSelector ? ` Bot(${botSelector})` : '机器默认'}插件: ${pluginId}`);
     return;
   }
 
   if (sub === 'uninstall' || sub === 'remove' || sub === 'rm') {
     const pluginId = requirePluginId(args[1]);
     assertPluginInstalled(pluginId);
-    const dependents = Object.values(registry.plugins)
-      .filter(plugin => plugin.id !== pluginId && plugin.manifest.dependencies?.plugins?.[pluginId])
-      .map(plugin => plugin.id);
-    if (dependents.length > 0 && !args.includes('--force')) {
-      console.error(`❌ 不能卸载 ${pluginId}，仍被这些插件依赖: ${dependents.join(', ')}`);
-      console.error('   如确认要破坏依赖关系，使用 --force。');
+    const enabledEverywhere = new Set(normalizePluginIdList(readGlobalConfig().plugins) ?? []);
+    for (const bot of loadBotsJson()) {
+      for (const id of normalizePluginIdList(bot.plugins) ?? []) enabledEverywhere.add(id);
+    }
+    const dependents = enabledPluginDependents(pluginId, [...enabledEverywhere], registry);
+    if (dependents.length > 0) {
+      console.error(`❌ 不能卸载 ${pluginId}，以下已启用插件依赖它: ${dependents.join(', ')}`);
+      console.error('   请先在对应作用域显式禁用这些插件。');
       process.exit(1);
     }
-    await stopPluginServicesForCli([pluginId]);
+    const { dematerializePlugin } = await import('./core/plugins/materializer.js');
+    const { deletePluginServices } = await import('./core/plugins/service-manager.js');
+    dematerializePlugin(pluginId);
+    await deletePluginServices([pluginId]);
     await removePluginSkillRegistryEntries(pluginId);
     const { removeInstalledPlugin } = await import('./services/plugin-registry-store.js');
     const { pluginHome } = await import('./core/plugins/paths.js');
@@ -7104,12 +7165,52 @@ async function cmdPlugin(args: string[]): Promise<void> {
       await stopPluginServicesForCli(pluginIds);
       return;
     }
+    if (action === 'restart') {
+      await stopPluginServicesForCli(pluginIds);
+      await reconcilePluginServicesForCli(pluginIds);
+      return;
+    }
     printPluginUsage();
     process.exit(1);
   }
 
   printPluginUsage();
   process.exit(1);
+}
+
+async function runPluginCommandByName(rawCommand: string, commandArgs: string[]): Promise<boolean> {
+  const sessionId = process.env.BOTMUX_SESSION_ID?.trim();
+  const { readSessionPluginManifest } = await import('./core/plugins/session-manifest.js');
+  const pluginIds = sessionId
+    ? readSessionPluginManifest(sessionId)?.pluginIds ?? []
+    : normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+  if (pluginIds.length === 0) return false;
+  const { collectPluginCliCommands } = await import('./core/plugins/runtime.js');
+  const commands = await collectPluginCliCommands(pluginIds);
+  const matches = commands.filter(command => command.name === rawCommand);
+  if (matches.length === 0) return false;
+  if (matches.length > 1) {
+    console.error(`❌ 插件 CLI 命令冲突: ${rawCommand}`);
+    console.error(`   冲突插件: ${matches.map(command => command.pluginId).join(', ')}`);
+    console.error('   请禁用其中一个插件，或让插件作者改用唯一 command 名称。');
+    process.exit(1);
+  }
+  const command = matches[0];
+  const registry = await loadPluginRegistryForCommand();
+  const record = registry.plugins[command.pluginId];
+  const { pluginRuntimeDir } = await import('./core/plugins/paths.js');
+  const result = await command.run({
+    runtime: 'cli',
+    pluginId: command.pluginId,
+    pluginDir: pluginRuntimeDir(command.pluginId),
+    packageName: record?.packageName ?? command.pluginId,
+    version: record?.version ?? '0.0.0',
+    manifest: record?.manifest ?? { schemaVersion: 1, id: command.pluginId },
+    args: commandArgs,
+  });
+  if (typeof result === 'string') console.log(result);
+  if (typeof result === 'number') process.exitCode = result;
+  return true;
 }
 
 switch (command) {
@@ -7168,6 +7269,17 @@ switch (command) {
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);
     process.exitCode = result.code;
+    break;
+  }
+  case 'mcp': {
+    const sub = process.argv[3] ?? '';
+    if (sub !== 'serve') {
+      console.error('用法: botmux mcp serve');
+      process.exitCode = 2;
+      break;
+    }
+    const { runMcpGateway } = await import('./core/plugins/mcp/gateway.js');
+    await runMcpGateway();
     break;
   }
   case 'hook': {
@@ -7253,5 +7365,7 @@ switch (command) {
     else { console.error(`用法: botmux autostart <enable|disable|status>`); process.exit(1); }
     break;
   }
-  default:        showHelp(); break;
+  default:
+    if (!await runPluginCommandByName(command, process.argv.slice(3))) showHelp();
+    break;
 }

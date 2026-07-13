@@ -36,7 +36,7 @@ export const dashboardRoutes: DashboardRoute[] = [
     rerenderOnUiChange: false,
     load: async () => {
       const mod = await import('./plugin-page.js');
-      return root => { void mod.renderPluginPage(root); };
+      return root => mod.renderPluginPage(root);
     },
   },
   pageRoute('legacy-workflow', '#/legacy-workflow', () => import('./legacy-workflow-page.js'), 'renderLegacyWorkflowPage'),

@@ -25,6 +25,7 @@ import { buildBotCards, loadGroupsSnapshot } from './overview.js';
 import { BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT } from './bot-onboarding.js';
 import { InfoTip } from './dashboard-components.js';
 import { initFloatingScrollbars } from './floating-scrollbars.js';
+import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -42,7 +43,16 @@ type NavItem = {
   labelKey?: string;
   label?: string;
   manage?: boolean;
+  plugin?: boolean;
   icon: ReactNode;
+};
+
+type PluginDashboardNavEntry = {
+  pluginId: string;
+  id: string;
+  route: string;
+  displayName?: string;
+  pinned?: boolean;
 };
 
 const MANAGE_ROUTES = [
@@ -121,6 +131,8 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'settings', href: '#/settings', labelKey: 'nav.settings', icon: <><path d="M8 1.75 9.35 2.05 10 3.28l1.38.3 1.04-.96.96.96-.96 1.04.3 1.38 1.23.65L14.25 8l-.3 1.35-1.23.65-.3 1.38.96 1.04-.96.96-1.04-.96-1.38.3-.65 1.23L8 14.25l-1.35-.3L6 12.72l-1.38-.3-1.04.96-.96-.96.96-1.04-.3-1.38-1.23-.65L1.75 8l.3-1.35 1.23-.65.3-1.38-.96-1.04.96-.96 1.04.96 1.38-.3.65-1.23z" /><circle cx="8" cy="8" r="2" /></> },
 ];
 
+let pinnedPluginNavItems: NavItem[] = [];
+
 let isAuthed = true;
 let publicReadOnly = false;
 let activeHash = location.hash || '#/';
@@ -145,6 +157,11 @@ function labelOf(item: NavItem): string {
 
 function isActiveNav(item: NavItem, hash: string): boolean {
   const current = hash || '#/';
+  if (item.id === 'plugins' && pinnedPluginNavItems.some(plugin => (
+    plugin.href === current || current.startsWith(`${plugin.href}?`) || current.startsWith(`${plugin.href}/`)
+  ))) {
+    return false;
+  }
   if (
     item.id === 'workflows' &&
     (current === '#/legacy-workflow' || current.startsWith('#/legacy-workflow?') || current.startsWith('#/legacy-workflow/'))
@@ -163,6 +180,17 @@ function isActiveNav(item: NavItem, hash: string): boolean {
   return item.href === current || (
     item.href !== '#/' && (current.startsWith(`${item.href}?`) || current.startsWith(`${item.href}/`))
   );
+}
+
+function sidebarNavItems(): NavItem[] {
+  if (pinnedPluginNavItems.length === 0) return NAV_ITEMS;
+  const pluginIndex = NAV_ITEMS.findIndex(item => item.id === 'plugins');
+  if (pluginIndex < 0) return [...NAV_ITEMS, ...pinnedPluginNavItems];
+  return [
+    ...NAV_ITEMS.slice(0, pluginIndex + 1),
+    ...pinnedPluginNavItems,
+    ...NAV_ITEMS.slice(pluginIndex + 1),
+  ];
 }
 
 function navClassName(item: NavItem): string | undefined {
@@ -452,12 +480,13 @@ function DashboardShell(): JSX.Element {
         <div className="chrome-body">
           <aside className="sidebar">
             <nav className="sidebar-nav" aria-label="Dashboard">
-              {NAV_ITEMS.filter(item => isAuthed || !item.manage).map(item => (
+              {sidebarNavItems().filter(item => isAuthed || !item.manage).map(item => (
                 <a
                   key={item.id}
                   href={item.href}
                   data-route={item.id}
-                  className={navClassName(item)}
+                  className={[navClassName(item), item.plugin ? 'sidebar-plugin-item' : ''].filter(Boolean).join(' ') || undefined}
+                  title={item.plugin ? labelOf(item) : undefined}
                 >
                   {icon(item.icon)}
                   <span className="sidebar-nav-label">{labelOf(item)}</span>
@@ -550,6 +579,28 @@ async function loadAuthState(): Promise<void> {
       if (serverLocale) ui.setLocale(serverLocale);
     }
   } catch { /* keep defaults */ }
+}
+
+async function loadPinnedPluginNavItems(): Promise<void> {
+  try {
+    const response = await fetch('/api/plugins/dashboard');
+    if (!response.ok) return;
+    const body = await response.json();
+    const entries = (Array.isArray(body?.plugins) ? body.plugins : []) as PluginDashboardNavEntry[];
+    pinnedPluginNavItems = entries
+      .filter(entry => entry.pinned === true && typeof entry.route === 'string')
+      .map(entry => ({
+        id: `plugin:${entry.pluginId}:${entry.id}`,
+        href: entry.route,
+        label: entry.displayName || entry.pluginId,
+        manage: true,
+        plugin: true,
+        icon: <><path d="M5.2 2.2h5.6v3.1l1.7 1.7-1.4 1.4-1-1v6.4H5.9V7.4l-1 1L3.5 7l1.7-1.7z" /><path d="M8 13.8v1" /></>,
+      }));
+    renderShell();
+  } catch {
+    // The core navigation remains usable when plugin metadata is unavailable.
+  }
 }
 
 async function persistLocale(locale: DashboardLocale): Promise<void> {
@@ -674,6 +725,8 @@ void (async () => {
 
   await loadAuthState();
   renderShell();
+  window.addEventListener(PLUGIN_PINS_CHANGED_EVENT, () => { void loadPinnedPluginNavItems(); });
+  void loadPinnedPluginNavItems();
   void checkUpdateBadge();
   initOwnerAvatar();
   try {

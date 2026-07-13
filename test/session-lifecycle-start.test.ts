@@ -7,11 +7,6 @@ const { emitHookEventMock, forkMock, execSyncMock } = vi.hoisted(() => ({
   execSyncMock: vi.fn(),
 }));
 
-const { prepareSessionSkillPromptMock, prepareSkillDeliveryMock } = vi.hoisted(() => ({
-  prepareSessionSkillPromptMock: vi.fn((opts: any) => ({ prompt: opts.prompt, manifest: null })),
-  prepareSkillDeliveryMock: vi.fn(() => ({ prompt: false, readonlyRoots: [], diagnostics: [] })),
-}));
-
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
   return {
@@ -52,12 +47,23 @@ vi.mock('../src/bot-registry.js', () => ({
       cliId: 'codex',
       wrapperCli: 'ttadk codex',
       model: 'glm-5.1',
+      plugins: ['demo'],
+      skills: { include: ['skill:deploy'] },
     },
     resolvedAllowedUsers: [],
     botOpenId: 'ou_bot',
     botName: 'TestBot',
   })),
   getAllBots: vi.fn(() => []),
+  loadBotConfigs: vi.fn(() => [{
+    larkAppId: 'app_test',
+    larkAppSecret: 'secret',
+    cliId: 'codex',
+    wrapperCli: 'ttadk codex',
+    model: 'glm-5.1',
+    plugins: ['demo'],
+    skills: { include: ['skill:deploy'] },
+  }]),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -82,14 +88,6 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 vi.mock('../src/core/session-manager.js', () => ({
   ensureSessionWhiteboard: vi.fn(),
   persistStreamCardState: vi.fn(),
-}));
-
-vi.mock('../src/core/skills/session-runtime.js', () => ({
-  prepareSessionSkillPrompt: (...args: unknown[]) => prepareSessionSkillPromptMock(...args),
-}));
-
-vi.mock('../src/core/skills/delivery.js', () => ({
-  prepareSkillDelivery: (...args: unknown[]) => prepareSkillDeliveryMock(...args),
 }));
 
 vi.mock('../src/core/dashboard-events.js', () => ({
@@ -184,8 +182,6 @@ beforeEach(() => {
   vi.clearAllMocks();
   __testOnly_resetSessionLifecycleHooks();
   forkMock.mockImplementation(() => makeFakeWorker());
-  prepareSessionSkillPromptMock.mockImplementation((opts: any) => ({ prompt: opts.prompt, manifest: null }));
-  prepareSkillDeliveryMock.mockReturnValue({ prompt: false, readonlyRoots: [], diagnostics: [] });
   initWorkerPool({
     sessionReply: vi.fn(async () => 'om_reply'),
     getSessionWorkingDir: () => '/repo',
@@ -245,44 +241,15 @@ describe('session.start lifecycle integration', () => {
     }));
   });
 
-  it('reports fatal skill delivery config instead of forking a worker', async () => {
-    const sessionReply = vi.fn(async () => 'om_reply');
-    initWorkerPool({
-      sessionReply,
-      getSessionWorkingDir: () => '/repo',
-      getActiveCount: () => 1,
-      closeSession: vi.fn(),
-    });
-    prepareSessionSkillPromptMock.mockReturnValue({
-      prompt: 'hello',
-      manifest: {
-        sessionId: 'sid-start-test',
-        cliId: 'codex',
-        workingDir: '/repo',
-        policyMode: 'priority',
-        prioritySkills: [{ name: 'deploy' }],
-        diagnostics: [],
-        generatedAt: '2026-06-14T00:00:00.000Z',
-      },
-    });
-    prepareSkillDeliveryMock.mockReturnValue({
-      prompt: false,
-      readonlyRoots: [],
-      diagnostics: ['native_skill_delivery_not_supported'],
-      fatal: true,
-    });
-
+  it('passes plugin bindings and Skill policy to the worker for CLI-generation refresh', () => {
     forkWorker(makeDs(), 'hello', false);
-    await Promise.resolve();
 
-    expect(forkMock).not.toHaveBeenCalled();
-    expect(sessionReply).toHaveBeenCalledWith(
-      'om_root',
-      expect.stringContaining('native_skill_delivery_not_supported'),
-      undefined,
-      'app_test',
-      undefined,
-    );
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      pluginBindings: ['demo'],
+      skillPolicy: { include: ['skill:deploy'] },
+    }));
   });
 });
 

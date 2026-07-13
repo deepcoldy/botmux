@@ -1,17 +1,18 @@
-import { existsSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { dirname, isAbsolute, resolve } from 'node:path';
 import { config } from '../../config.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock } from '../../utils/file-lock.js';
 import { readPluginRegistry } from '../../services/plugin-registry-store.js';
-import { pluginCurrentDir, pluginServiceStatePath, pluginsHome } from './paths.js';
-import { loadPluginServiceController, type PluginServiceRuntimeInfo } from './runtime.js';
-import type { InstalledPluginRecord, PluginServiceState } from './types.js';
+import { pluginHome, pluginRuntimeDir, pluginServiceStatePath, pluginsHome } from './paths.js';
+import { loadPluginServiceDefinition, type PluginServiceDefinition } from './runtime.js';
+import { capturePluginPm2, pluginPm2AppName, runPluginPm2 } from './pm2.js';
+import type { InstalledPluginRecord, PluginServiceMode, PluginServiceState } from './types.js';
 
 export interface PluginServiceReport {
   pluginId: string;
-  action: 'started' | 'already-running' | 'stopped' | 'not-running' | 'failed' | 'status';
-  mode?: 'manual' | 'lifecycle';
+  action: 'started' | 'already-running' | 'stopped' | 'not-running' | 'failed' | 'status' | 'deleted';
+  mode?: PluginServiceMode;
   status?: string;
   pid?: number;
   port?: number;
@@ -20,18 +21,65 @@ export interface PluginServiceReport {
   warning?: string;
 }
 
-function serviceLockTarget(): string {
-  mkdirSync(pluginsHome(), { recursive: true });
-  return join(pluginsHome(), 'service-manager');
+interface Pm2AppInfo {
+  name: string;
+  pid?: number;
+  status?: string;
+  pm2Env?: Record<string, unknown>;
 }
 
-function processCwdRealpath(pid: number | undefined): string | undefined {
-  if (!pid || process.platform !== 'linux') return undefined;
+function serviceLockTarget(): string {
+  mkdirSync(pluginsHome(), { recursive: true });
+  return `${pluginsHome()}/service-manager`;
+}
+
+function definitionEnv(record: InstalledPluginRecord, definition: PluginServiceDefinition): Record<string, string> {
+  return {
+    ...(definition.pm2.env ?? {}),
+    BOTMUX_PLUGIN_ID: record.id,
+    BOTMUX_PLUGIN_DIR: pluginRuntimeDir(record.id),
+    BOTMUX_PLUGIN_HOME: pluginHome(record.id),
+  };
+}
+
+function definitionCwd(record: InstalledPluginRecord, definition: PluginServiceDefinition): string {
+  const cwd = definition.pm2.cwd || pluginRuntimeDir(record.id);
+  return isAbsolute(cwd) ? cwd : resolve(pluginRuntimeDir(record.id), cwd);
+}
+
+function definitionScript(record: InstalledPluginRecord, definition: PluginServiceDefinition): string {
+  const script = definition.pm2.script;
+  return isAbsolute(script) ? script : resolve(definitionCwd(record, definition), script);
+}
+
+function parsePm2JlistOutput(output: string): any[] {
   try {
-    return realpathSync(readlinkSync(`/proc/${pid}/cwd`));
+    const parsed = JSON.parse(output);
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
-    return undefined;
+    for (let start = output.lastIndexOf('['); start >= 0; start = output.lastIndexOf('[', start - 1)) {
+      try {
+        const parsed = JSON.parse(output.slice(start).trim());
+        if (Array.isArray(parsed)) return parsed;
+      } catch { /* try an earlier '['; pm2 may prefix stdout with [PM2] logs */ }
+    }
+    throw new Error('pm2_jlist_json_not_found');
   }
+}
+
+function readPm2Apps(): Pm2AppInfo[] {
+  const raw = capturePluginPm2(['jlist'], { timeoutMs: 10_000 });
+  const parsed = parsePm2JlistOutput(raw);
+  return (Array.isArray(parsed) ? parsed : []).map(app => ({
+    name: String(app?.name ?? ''),
+    pid: typeof app?.pid === 'number' && app.pid > 0 ? app.pid : undefined,
+    status: typeof app?.pm2_env?.status === 'string' ? app.pm2_env.status : undefined,
+    pm2Env: app?.pm2_env && typeof app.pm2_env === 'object' ? app.pm2_env : undefined,
+  })).filter(app => app.name);
+}
+
+function findPm2App(name: string): Pm2AppInfo | undefined {
+  return readPm2Apps().find(app => app.name === name);
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -49,14 +97,15 @@ function rewriteLoopbackServiceUrl(rawUrl: string | undefined): string | undefin
   }
 }
 
-function publicServiceInfo(info: PluginServiceRuntimeInfo | undefined): PluginServiceRuntimeInfo {
-  const out: PluginServiceRuntimeInfo = { ...(info ?? {}) };
-  if (typeof out.openUrl === 'string') out.openUrl = rewriteLoopbackServiceUrl(out.openUrl);
-  if (typeof out.healthUrl === 'string') out.healthUrl = rewriteLoopbackServiceUrl(out.healthUrl);
-  if (!out.openUrl && typeof out.port === 'number') {
-    out.openUrl = `http://${config.dashboard.externalHost}:${out.port}/`;
-  }
-  return out;
+function serviceUrls(record: InstalledPluginRecord, definition: PluginServiceDefinition): Pick<PluginServiceState, 'port' | 'openUrl' | 'healthUrl'> {
+  const env = definitionEnv(record, definition);
+  const port = definition.port ?? (env.PORT ? Number(env.PORT) : undefined);
+  const urls = definition.urls?.({ host: config.dashboard.externalHost, env, ...(Number.isFinite(port) ? { port } : {}) }) ?? {};
+  return {
+    ...(Number.isFinite(port) ? { port } : {}),
+    ...(urls.openUrl ? { openUrl: rewriteLoopbackServiceUrl(urls.openUrl) } : Number.isFinite(port) ? { openUrl: `http://${config.dashboard.externalHost}:${port}/` } : {}),
+    ...(urls.healthUrl ? { healthUrl: rewriteLoopbackServiceUrl(urls.healthUrl) } : {}),
+  };
 }
 
 function readServiceState(pluginId: string): PluginServiceState | undefined {
@@ -72,16 +121,19 @@ function readServiceState(pluginId: string): PluginServiceState | undefined {
   }
 }
 
-function writeServiceState(record: InstalledPluginRecord, info: PluginServiceRuntimeInfo): PluginServiceState {
-  const currentDir = pluginCurrentDir(record.id);
-  const currentRealpath = existsSync(currentDir) ? realpathSync(currentDir) : undefined;
+function writeServiceState(record: InstalledPluginRecord, definition: PluginServiceDefinition, app: Pm2AppInfo | undefined): PluginServiceState {
+  const runtimeDir = pluginRuntimeDir(record.id);
+  const runtimeRealpath = existsSync(runtimeDir) ? realpathSync(runtimeDir) : undefined;
   const state: PluginServiceState = {
-    ...publicServiceInfo(info),
     pluginId: record.id,
     version: record.version,
-    currentDir,
-    ...(currentRealpath ? { currentRealpath } : {}),
+    runtimeDir,
+    ...(runtimeRealpath ? { runtimeRealpath } : {}),
     updatedAt: new Date().toISOString(),
+    status: app?.status ?? 'stopped',
+    ...(typeof app?.pid === 'number' ? { pid: app.pid } : {}),
+    ...serviceUrls(record, definition),
+    pm2Name: pluginPm2AppName(record.id),
   };
   const file = pluginServiceStatePath(record.id);
   mkdirSync(dirname(file), { recursive: true });
@@ -93,104 +145,81 @@ function deleteServiceState(pluginId: string): void {
   rmSync(pluginServiceStatePath(pluginId), { force: true });
 }
 
-function selectedRecords(pluginIds?: readonly string[], lifecycleOnly = false): InstalledPluginRecord[] {
+function selectedRecords(pluginIds?: readonly string[], autoOnly = false): InstalledPluginRecord[] {
   const registry = readPluginRegistry();
   const selected = pluginIds ? new Set(pluginIds) : undefined;
   return Object.values(registry.plugins)
     .filter(record => !selected || selected.has(record.id))
     .filter(record => !!record.manifest.service)
-    .filter(record => !lifecycleOnly || record.manifest.service?.mode === 'lifecycle')
+    .filter(record => !autoOnly || record.manifest.service?.mode === 'auto')
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
-function reportFromInfo(
+function reportFromState(
   record: InstalledPluginRecord,
   action: PluginServiceReport['action'],
-  info?: PluginServiceRuntimeInfo,
+  state?: PluginServiceState,
   warning?: string,
 ): PluginServiceReport {
-  const publicInfo = publicServiceInfo(info);
-  const status = typeof publicInfo.status === 'string'
-    ? publicInfo.status
-    : action === 'started' || action === 'already-running'
-      ? 'online'
-      : action === 'stopped' || action === 'not-running'
-        ? 'stopped'
-        : undefined;
   return {
     pluginId: record.id,
     action,
     mode: record.manifest.service?.mode,
-    ...(status ? { status } : {}),
-    ...(typeof publicInfo.pid === 'number' ? { pid: publicInfo.pid } : {}),
-    ...(typeof publicInfo.port === 'number' ? { port: publicInfo.port } : {}),
-    ...(typeof publicInfo.openUrl === 'string' ? { openUrl: publicInfo.openUrl } : {}),
-    ...(typeof publicInfo.healthUrl === 'string' ? { healthUrl: publicInfo.healthUrl } : {}),
+    ...(state?.status ? { status: state.status } : {}),
+    ...(typeof state?.pid === 'number' ? { pid: state.pid } : {}),
+    ...(typeof state?.port === 'number' ? { port: state.port } : {}),
+    ...(typeof state?.openUrl === 'string' ? { openUrl: state.openUrl } : {}),
+    ...(typeof state?.healthUrl === 'string' ? { healthUrl: state.healthUrl } : {}),
     ...(warning ? { warning } : {}),
   };
 }
 
-async function readControllerStatus(record: InstalledPluginRecord, previousState?: PluginServiceRuntimeInfo): Promise<PluginServiceRuntimeInfo | undefined> {
-  const controller = await loadPluginServiceController(record);
-  if (controller?.status) return publicServiceInfo(await controller.status({ runtime: 'service', pluginId: record.id, pluginDir: pluginCurrentDir(record.id), packageName: record.packageName, version: record.version, manifest: record.manifest }, previousState));
-  return previousState ? publicServiceInfo(previousState) : undefined;
-}
-
-function currentStateLooksAlive(state: PluginServiceRuntimeInfo | undefined): boolean {
-  if (!state) return false;
-  if (state.status === 'online' || state.status === 'running') return true;
-  if (typeof state.pid !== 'number') return false;
-  try {
-    process.kill(state.pid, 0);
-  } catch {
-    return false;
+function startPm2(record: InstalledPluginRecord, definition: PluginServiceDefinition): void {
+  const name = pluginPm2AppName(record.id);
+  const env = definitionEnv(record, definition);
+  const existing = findPm2App(name);
+  if (existing) {
+    if (existing.status === 'online') return;
+    runPluginPm2(['start', name, '--update-env'], { inherit: false, env, timeoutMs: 30_000 });
+    return;
   }
-  const currentDir = typeof state.currentRealpath === 'string' ? state.currentRealpath : undefined;
-  return !currentDir || processCwdRealpath(state.pid) === currentDir;
-}
-
-async function waitForControllerOnline(
-  controller: NonNullable<Awaited<ReturnType<typeof loadPluginServiceController>>>,
-  record: InstalledPluginRecord,
-  initial: PluginServiceRuntimeInfo,
-): Promise<PluginServiceRuntimeInfo> {
-  if (!controller.status) return initial;
-  let latest = initial;
-  const ctx = { runtime: 'service' as const, pluginId: record.id, pluginDir: pluginCurrentDir(record.id), packageName: record.packageName, version: record.version, manifest: record.manifest };
-  const deadline = Date.now() + 5_000;
-  do {
-    await new Promise(resolve => setTimeout(resolve, 250));
-    latest = publicServiceInfo(await controller.status(ctx, latest));
-  } while (!currentStateLooksAlive(latest) && Date.now() < deadline);
-  return latest;
+  const args = [
+    'start',
+    definitionScript(record, definition),
+    '--name',
+    name,
+    '--cwd',
+    definitionCwd(record, definition),
+    '--time',
+    '--update-env',
+  ];
+  if (definition.pm2.autorestart === false) args.push('--no-autorestart');
+  if (definition.pm2.args?.length) args.push('--', ...definition.pm2.args);
+  runPluginPm2(args, { inherit: false, env, timeoutMs: 30_000 });
 }
 
 export async function startPluginServices(
   pluginIds?: readonly string[],
-  options: { lifecycleOnly?: boolean } = {},
+  options: { autoOnly?: boolean } = {},
 ): Promise<PluginServiceReport[]> {
   return withFileLock(serviceLockTarget(), async () => {
     const reports: PluginServiceReport[] = [];
-    for (const record of selectedRecords(pluginIds, options.lifecycleOnly === true)) {
-      const previous = readServiceState(record.id);
+    for (const record of selectedRecords(pluginIds, options.autoOnly === true)) {
       try {
-        const controller = await loadPluginServiceController(record);
-        if (!controller?.start) {
-          reports.push(reportFromInfo(record, 'failed', previous, 'service controller has no start()'));
+        const definition = await loadPluginServiceDefinition(record);
+        if (!definition) continue;
+        const before = findPm2App(pluginPm2AppName(record.id));
+        if (before?.status === 'online') {
+          const state = writeServiceState(record, definition, before);
+          reports.push(reportFromState(record, 'already-running', state));
           continue;
         }
-        const before = await readControllerStatus(record, previous);
-        if (currentStateLooksAlive(before)) {
-          writeServiceState(record, before ?? {});
-          reports.push(reportFromInfo(record, 'already-running', before));
-          continue;
-        }
-        const started = publicServiceInfo(await controller.start({ runtime: 'service', pluginId: record.id, pluginDir: pluginCurrentDir(record.id), packageName: record.packageName, version: record.version, manifest: record.manifest }, previous));
-        const finalInfo = await waitForControllerOnline(controller, record, { status: 'online', ...started });
-        const state = writeServiceState(record, finalInfo);
-        reports.push(reportFromInfo(record, 'started', state));
+        startPm2(record, definition);
+        const app = findPm2App(pluginPm2AppName(record.id));
+        const state = writeServiceState(record, definition, app);
+        reports.push(reportFromState(record, 'started', state));
       } catch (err: any) {
-        reports.push(reportFromInfo(record, 'failed', previous, err?.message ?? String(err)));
+        reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
       }
     }
     return reports;
@@ -199,24 +228,46 @@ export async function startPluginServices(
 
 export async function stopPluginServices(
   pluginIds?: readonly string[],
-  options: { lifecycleOnly?: boolean } = {},
+  options: { autoOnly?: boolean } = {},
 ): Promise<PluginServiceReport[]> {
   return withFileLock(serviceLockTarget(), async () => {
     const reports: PluginServiceReport[] = [];
-    for (const record of selectedRecords(pluginIds, options.lifecycleOnly === true)) {
-      const previous = readServiceState(record.id);
+    for (const record of selectedRecords(pluginIds, options.autoOnly === true)) {
       try {
-        const controller = await loadPluginServiceController(record);
-        const before = await readControllerStatus(record, previous);
-        if (!currentStateLooksAlive(before) && !previous) {
-          reports.push(reportFromInfo(record, 'not-running', before));
+        const definition = await loadPluginServiceDefinition(record);
+        if (!definition) continue;
+        const name = pluginPm2AppName(record.id);
+        const before = findPm2App(name);
+        if (!before || before.status === 'stopped') {
+          const state = writeServiceState(record, definition, before);
+          reports.push(reportFromState(record, 'not-running', state));
           continue;
         }
-        if (controller?.stop) await controller.stop({ runtime: 'service', pluginId: record.id, pluginDir: pluginCurrentDir(record.id), packageName: record.packageName, version: record.version, manifest: record.manifest }, previous ?? before);
-        deleteServiceState(record.id);
-        reports.push(reportFromInfo(record, 'stopped', before));
+        runPluginPm2(['stop', name], { inherit: false, timeoutMs: 30_000 });
+        const app = findPm2App(name);
+        const state = writeServiceState(record, definition, app);
+        reports.push(reportFromState(record, 'stopped', state));
       } catch (err: any) {
-        reports.push(reportFromInfo(record, 'failed', previous, err?.message ?? String(err)));
+        reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
+      }
+    }
+    return reports;
+  }, { maxWaitMs: 30_000 });
+}
+
+export async function deletePluginServices(pluginIds?: readonly string[]): Promise<PluginServiceReport[]> {
+  return withFileLock(serviceLockTarget(), async () => {
+    const reports: PluginServiceReport[] = [];
+    for (const record of selectedRecords(pluginIds)) {
+      try {
+        const definition = await loadPluginServiceDefinition(record);
+        if (!definition) continue;
+        const name = pluginPm2AppName(record.id);
+        if (findPm2App(name)) runPluginPm2(['delete', name], { inherit: false, timeoutMs: 30_000 });
+        deleteServiceState(record.id);
+        reports.push(reportFromState(record, 'deleted', undefined));
+      } catch (err: any) {
+        reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
       }
     }
     return reports;
@@ -226,12 +277,14 @@ export async function stopPluginServices(
 export async function listPluginServiceStatus(): Promise<PluginServiceReport[]> {
   const reports: PluginServiceReport[] = [];
   for (const record of selectedRecords()) {
-    const previous = readServiceState(record.id);
     try {
-      const info = await readControllerStatus(record, previous);
-      reports.push(reportFromInfo(record, 'status', { ...info, status: currentStateLooksAlive(info) ? 'online' : 'stopped' }));
+      const definition = await loadPluginServiceDefinition(record);
+      if (!definition) continue;
+      const app = findPm2App(pluginPm2AppName(record.id));
+      const state = writeServiceState(record, definition, app);
+      reports.push(reportFromState(record, 'status', state));
     } catch (err: any) {
-      reports.push(reportFromInfo(record, 'failed', previous, err?.message ?? String(err)));
+      reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
     }
   }
   return reports;

@@ -328,6 +328,11 @@ export function parseBotSelection(
   const byAppId = bots.findIndex(b => b.larkAppId === raw);
   if (byAppId >= 0) return byAppId;
 
+  const byConfiguredName = bots.findIndex(b => (
+    typeof b.name === 'string' && normalizeBotProcessName(b.name) === raw
+  ));
+  if (byConfiguredName >= 0) return byConfiguredName;
+
   const byProcessName = bots.findIndex((b, i) => botProcessName(b, i) === raw);
   return byProcessName >= 0 ? byProcessName : undefined;
 }

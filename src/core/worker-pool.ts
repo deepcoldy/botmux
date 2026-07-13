@@ -2,7 +2,7 @@
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
  */
-import { fork, execSync, type ChildProcess, type ForkOptions } from 'node:child_process';
+import { execSync, fork, type ChildProcess, type ForkOptions } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
@@ -33,7 +33,7 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { isSuspendableBackendType, getSessionPersistentBackendType, persistentSessionName, killPersistentSession } from './persistent-backend.js';
-import { getBot, getAllBots, resolveBrandLabel } from '../bot-registry.js';
+import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -52,6 +52,7 @@ import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.j
 import { prepareSessionSkillPrompt } from './skills/session-runtime.js';
 import { prepareSkillDelivery } from './skills/delivery.js';
 import { resolveEffectivePluginIds } from './plugins/effective.js';
+import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
@@ -908,117 +909,16 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   skillsInstalledCliIds.add(cliId);
 }
 
-// ─── Legacy MCP config cleanup ──────────────────────────────────────────────
-//
-// botmux used to register itself as an MCP server in each CLI's config so the
-// CLI could call send_to_thread / get_thread_messages / list_bots.  Those
-// tools have since been migrated to `botmux` subcommands + Skills.  The old
-// MCP entry is now dead — if we leave it, the CLI will try to spawn a
-// non-existent server on startup and users see scary errors.
-//
-// For each CLI, best-effort remove any `botmux` entry from its MCP config.
-// Runs once per CLI per daemon lifecycle, same lifecycle as ensureCliSkills.
-
-/** Track which CLI adapters have had legacy MCP config cleaned this daemon lifecycle */
-const legacyMcpCleanedCliIds = new Set<string>();
-
-/** Remove a key from a JSON config file at the given dotted path. Best-effort. */
-function removeJsonKey(configPath: string, pathSegments: string[], keyToRemove: string): boolean {
-  try {
-    if (!existsSync(configPath)) return false;
-    const raw = readFileSync(configPath, 'utf-8');
-    const data = JSON.parse(raw);
-    let node: any = data;
-    for (const seg of pathSegments) {
-      if (!node || typeof node !== 'object' || !(seg in node)) return false;
-      node = node[seg];
-    }
-    if (!node || typeof node !== 'object' || !(keyToRemove in node)) return false;
-    delete node[keyToRemove];
-    // 原子写：这里改的是外部 CLI 自己的热配置文件（如 ~/.claude.json），
-    // 裸写半截会弄坏 CLI 的状态。
-    atomicWriteFileSync(configPath, JSON.stringify(data, null, 2));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Try running `<cli> mcp remove botmux`. Returns true if the command ran. */
-function tryCliMcpRemove(binName: string): boolean {
-  try {
-    execSync(`${binName} mcp remove botmux`, { stdio: 'ignore', timeout: 10_000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Remove legacy `botmux` MCP server registration from the given CLI's config.
- * Idempotent — runs once per CLI per daemon lifecycle.  Best-effort: any
- * failure is swallowed; we never want to block worker startup.
- */
-export function cleanupLegacyMcpConfig(cliId: CliId): void {
-  if (legacyMcpCleanedCliIds.has(cliId)) return;
-  legacyMcpCleanedCliIds.add(cliId);
-
-  try {
-    const home = homedir();
-    switch (cliId) {
-      case 'claude-code': {
-        // ~/.claude.json → { mcpServers: { botmux } }
-        if (removeJsonKey(join(home, '.claude.json'), ['mcpServers'], 'botmux')) {
-          logger.info(`[legacy-mcp] Removed botmux entry from ~/.claude.json`);
-        }
-        break;
-      }
-      case 'aiden': {
-        // ~/.aiden/.mcp.json or cwd/.mcp.json → { mcpServers: { botmux } }
-        for (const p of [join(home, '.aiden', '.mcp.json'), join(process.cwd(), '.mcp.json')]) {
-          if (removeJsonKey(p, ['mcpServers'], 'botmux')) {
-            logger.info(`[legacy-mcp] Removed botmux entry from ${p}`);
-          }
-        }
-        break;
-      }
-      case 'opencode':
-      case 'mtr': {
-        // ~/.config/opencode/{opencode,mtr}.json → { mcp: { botmux } } or { mcpServers: { botmux } }
-        const file = cliId === 'mtr' ? 'mtr.json' : 'opencode.json';
-        const p = join(home, '.config', 'opencode', file);
-        const removed =
-          removeJsonKey(p, ['mcp'], 'botmux') ||
-          removeJsonKey(p, ['mcpServers'], 'botmux') ||
-          removeJsonKey(p, ['mcp', 'servers'], 'botmux');
-        if (removed) logger.info(`[legacy-mcp] Removed botmux entry from ${p}`);
-        break;
-      }
-      case 'coco':
-      case 'codex':
-      case 'gemini': {
-        // These CLIs managed MCP via their own subcommand.  Skip silently if
-        // the binary isn't on PATH — nothing to clean then.
-        if (tryCliMcpRemove(cliId)) {
-          logger.info(`[legacy-mcp] Ran \`${cliId} mcp remove botmux\``);
-        }
-        break;
-      }
-    }
-  } catch (err) {
-    logger.debug(`[legacy-mcp] Cleanup for ${cliId} failed (ignored): ${err}`);
-  }
-}
-
 /**
  * Ensure per-CLI environment is set up for this daemon lifecycle: install
- * built-in skills and clean up any legacy MCP server registration.
+ * built-in skills and the single stable Botmux MCP Gateway entry.
  * Both steps are idempotent and best-effort.
  */
 export function ensureCliEnv(cliId: CliId, cliPathOverride?: string): void {
   cleanupGlobalBotmuxSkillsOnce();
   ensureCliSkills(cliId, cliPathOverride);
-  cleanupLegacyMcpConfig(cliId);
+  const report = ensureGatewayEntry(createCliAdapterSync(cliId, cliPathOverride));
+  if (report.warning) logger.warn(`[mcp-gateway] ${cliId}: ${report.warning}`);
 }
 
 /** The user's global skills dir that botmux must NOT pollute (Claude now injects
@@ -1705,33 +1605,6 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
   const familyAdapter = createCliAdapterSync(agentCfg.cliId, agentCfg.cliPathOverride);
   if (familyAdapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, familyAdapter.claudeStateJsonPath);
 
-  let skillPluginDir: string | undefined;
-  let skillReadonlyRoots: string[] | undefined;
-  if (!resume && prompt.trim().length > 0) {
-    const preparedSkills = prepareSessionSkillPrompt({
-      sessionId: ds.session.sessionId,
-      cliId: agentCfg.cliId,
-      workingDir: cwd,
-      prompt,
-      botPolicy: botCfg.skills,
-    });
-    prompt = preparedSkills.prompt;
-    const delivery = prepareSkillDelivery(familyAdapter, preparedSkills.manifest, preparedSkills.manifest?.delivery ?? 'auto');
-    skillPluginDir = delivery.pluginDir;
-    skillReadonlyRoots = delivery.readonlyRoots.length ? delivery.readonlyRoots : undefined;
-    for (const diagnostic of delivery.diagnostics) logger.warn(`[${t}] skill delivery: ${diagnostic}`);
-    if (delivery.fatal) {
-      const reason = delivery.diagnostics.join(', ') || 'unknown';
-      const message = tr('worker.skill_delivery_failed', { reason }, botLocale(botCfg));
-      logger.warn(`[${t}] Skill delivery blocked session start: ${reason}`);
-      void cb.sessionReply(sessionAnchorId(ds), message, undefined, ds.larkAppId, fallbackTurnId(ds, undefined))
-        .catch((err) => logger.warn(`[${t}] Failed to notify skill delivery error: ${err?.message ?? err}`));
-      void closeSession(ds.session.sessionId)
-        .catch((err) => logger.warn(`[${t}] Failed to close skill delivery error session: ${err?.message ?? err}`));
-      return;
-    }
-  }
-
   // Prepend ~/.botmux/bin to PATH so CLIs can call `botmux send` etc.
   // The wrapper script there is written by the daemon at startup.
   const botmuxBinDir = join(homedir(), '.botmux', 'bin');
@@ -1776,8 +1649,6 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
       logWorkerStderr(t, line.trim());
     }
   });
-
-  const pluginIds = resolveEffectivePluginIds(botCfg, readGlobalConfig());
 
   // Send init config — use per-bot settings
   const initMsg: DaemonToWorker = {
@@ -1828,9 +1699,8 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
     turnId: initTurnId ?? ds.currentReplyTarget?.turnId,
-    skillPluginDir,
-    skillReadonlyRoots,
-    pluginIds,
+    pluginBindings: botCfg.plugins,
+    skillPolicy: botCfg.skills,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;

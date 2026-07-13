@@ -40,6 +40,10 @@ import { mergeQueuedCliInput, type PendingCliInput } from './utils/pending-input
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
+import { loadBotConfigs, type BotConfig } from './bot-registry.js';
+import { readGlobalConfig } from './global-config.js';
 import { resolveTerminalWriteForRequest } from './core/terminal-write-auth.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { loadPersistedToken } from './dashboard/auth.js';
@@ -122,8 +126,6 @@ import { detectCliUsageLimit, usageLimitStateKey, type CliUsageLimitState } from
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { redactChildEnv } from './utils/child-env.js';
 import { decideSubmitConfirmationAction, type SubmitActivityEvidence } from './services/submit-confirmation.js';
-import { resolvePluginMcpServers } from './core/plugins/runtime.js';
-import { writePluginMcpConfig } from './core/plugins/mcp.js';
 import { config, resolveChatBotDiscoveryConfig } from './config.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
@@ -153,6 +155,47 @@ let tmuxRestartTimer: NodeJS.Timeout | null = null;
  *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
  *  of the same warning. */
 let resumeFallbackNotified = false;
+/** Skill catalog to attach to the first user turn after a prompt-less CLI restart. */
+let deferredPluginSkillCatalog: string | null = null;
+
+function refreshCliPluginGeneration(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  adapter: CliAdapter,
+): void {
+  let bot: Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills'> = {
+    larkAppId: cfg.larkAppId,
+    plugins: cfg.pluginBindings,
+    skills: cfg.skillPolicy,
+  };
+  try {
+    bot = loadBotConfigs().find(candidate => candidate.larkAppId === cfg.larkAppId) ?? bot;
+  } catch (err) {
+    log(`Plugin generation: using init-time Bot config because bots.json could not be read: ${err instanceof Error ? err.message : err}`);
+  }
+
+  const generation = prepareCliPluginGeneration({
+    sessionId: cfg.sessionId,
+    bot,
+    global: readGlobalConfig(),
+    dataDir: config.session.dataDir,
+    cliId: cfg.cliId as CliId,
+    adapter,
+    workingDir: cfg.workingDir,
+    prompt: cfg.prompt,
+    replacesPriorGeneration: cfg.resume === true,
+  });
+  for (const diagnostic of generation.diagnostics) log(`Plugin generation: ${diagnostic}`);
+  if (generation.fatal) {
+    const reason = generation.diagnostics.join(', ') || 'unknown';
+    send({ type: 'user_notify', message: t('worker.skill_delivery_failed', { reason }) });
+    throw new Error(`Skill delivery blocked CLI generation: ${reason}`);
+  }
+  cfg.prompt = generation.prompt;
+  cfg.skillPluginDir = generation.skillPluginDir;
+  cfg.skillReadonlyRoots = generation.skillReadonlyRoots;
+  deferredPluginSkillCatalog = generation.deferredSkillCatalog ?? null;
+  log(`Plugin generation refreshed: ${generation.pluginManifest.pluginIds.join(', ') || '(none)'}`);
+}
 
 /** v2 read isolation — provision a bot's PER-BOT config dir under its BOT_HOME so the
  *  CLI (redirected there via CLAUDE_CONFIG_DIR/CODEX_HOME) starts fully set up despite
@@ -4333,6 +4376,16 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // Provision the per-bot config dir (auth + onboarding/trust seed + hooks for claude;
     // auth/config copy for codex) so the CLI starts fully set up under the Seatbelt wrapper.
     provisionIsolatedBotHome(isolationBotHome, cfg.workingDir, isClaudeFam, cfg.cliId, cliAdapter.hookInstall, log);
+    if (cliAdapter.mcpGateway) {
+      const isolatedConfigPath = isClaudeFam
+        ? join(claudeDataDir!, '.claude.json')
+        : join(isolationBotHome, 'codex', 'config.toml');
+      const report = ensureGatewayEntry({
+        id: cliAdapter.id,
+        mcpGateway: { ...cliAdapter.mcpGateway, configPath: isolatedConfigPath },
+      });
+      if (report.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+    }
   }
   // Predict reattach vs fresh BEFORE the resume pre-flight. On a persistent
   // backend (tmux/herdr/zellij) a daemon restart finds the CLI process still
@@ -4398,6 +4451,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         ? ZellijBackend.hasSession(persistentSessionName)
         : HerdrBackend.hasSession(persistentSessionName)
     : false;
+
+  // The plugin set is stable only for the lifetime of one real CLI process.
+  // A warm worker reattach keeps the existing Gateway and catalog untouched;
+  // every fresh/resumed CLI spawn atomically refreshes both from current Bot config.
+  if (!willReattachPersistent) refreshCliPluginGeneration(cfg, cliAdapter);
 
   // Re-arm the startup-commands one-shot ONLY for a genuinely fresh CLI process.
   // A reattach to a LIVE persistent pane (daemon-restart recovery) is the SAME
@@ -4675,12 +4733,6 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   if (isolationBotHome) {
     if (claudeDataDir) childEnv.CLAUDE_CONFIG_DIR = claudeDataDir; // = <BOT_HOME>/claude
     else childEnv.CODEX_HOME = join(isolationBotHome, 'codex');
-  }
-
-  if (cfg.pluginMcpServers?.length) {
-    const mcpConfigPath = writePluginMcpConfig(cfg.sessionId, cfg.pluginMcpServers);
-    childEnv.BOTMUX_PLUGIN_MCP_SERVERS = JSON.stringify(cfg.pluginMcpServers);
-    if (mcpConfigPath) childEnv.BOTMUX_PLUGIN_MCP_CONFIG = mcpConfigPath;
   }
 
   // Per-bot env (bots.json `env`): extra vars for THIS bot's CLI only — e.g.
@@ -5956,16 +6008,6 @@ process.on('message', async (raw: unknown) => {
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}, render=${renderCols}x${renderRows}${msg.adoptMode ? ' (adopt-pane)' : ''}`);
 
       try {
-        if (msg.pluginIds?.length) {
-          msg.pluginMcpServers = await resolvePluginMcpServers({
-            pluginIds: msg.pluginIds,
-            botId: msg.larkAppId,
-            sessionId: msg.sessionId,
-          });
-          if (msg.pluginMcpServers.length > 0) {
-            log(`Loaded ${msg.pluginMcpServers.length} plugin MCP server(s) from ${msg.pluginIds.join(',')}`);
-          }
-        }
         if (msg.turnId) {
           currentBotmuxTurnId = msg.turnId;
           writeCliPidMarker();
@@ -6029,7 +6071,12 @@ process.on('message', async (raw: unknown) => {
       const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
-      const content = msg.content;
+      let content = msg.content;
+      if (deferredPluginSkillCatalog && !lastInitConfig?.adoptMode) {
+        content = `${content}\n\n${deferredPluginSkillCatalog}`;
+        deferredPluginSkillCatalog = null;
+        log('Attached refreshed plugin Skill catalog to the first turn of this CLI generation');
+      }
       currentBotmuxTurnId = msg.turnId;
       writeCliPidMarker();
       if (!backend && crashDiagnosticStopped && lastInitConfig && !lastInitConfig.adoptMode) {

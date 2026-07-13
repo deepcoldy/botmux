@@ -44,6 +44,16 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard).toEqual({ chatBotDiscovery: false });
   });
 
+  it('reads pinned plugin dashboards as a sanitized machine-wide preference', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { pinnedPlugins: ['demo-addon', 'bad/id', 'demo-addon', 'agent-chrome'] },
+    }));
+
+    expect(readGlobalConfig().dashboard?.pinnedPlugins).toEqual(['demo-addon', 'agent-chrome']);
+    mergeDashboardConfig({ pinnedPlugins: ['agent-chrome'] });
+    expect(readGlobalConfig().dashboard?.pinnedPlugins).toEqual(['agent-chrome']);
+  });
+
   it('reads repoPickerMode as a top-level global enum', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       repoPickerMode: 'repos',

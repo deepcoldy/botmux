@@ -17,6 +17,29 @@ describe('session skill manifest resolution', () => {
     expect(manifest).toBeNull();
   });
 
+  it('builds a manifest for enabled plugin skills without a bot policy', () => {
+    const manifest = resolveSessionSkillManifest({
+      sessionId: 'plugin-session',
+      cliId: 'codex',
+      workingDir: '/repo',
+      botPolicy: undefined,
+      pluginSkills: [{
+        id: 'plugin:demo:browser',
+        name: 'browser',
+        tags: [],
+        rootDir: '/plugins/demo/skills/browser',
+        entrypoint: 'SKILL.md',
+        source: { type: 'plugin', pluginId: 'demo', root: '/plugins/demo' },
+      }],
+      registrySkills: [],
+      projectSkills: [],
+      now: () => '2026-06-14T00:00:00.000Z',
+    });
+
+    expect(manifest?.prioritySkills.map((skill) => skill.name)).toEqual(['browser']);
+    expect(manifest?.prioritySkills[0].source).toEqual({ type: 'plugin', pluginId: 'demo', root: '/plugins/demo' });
+  });
+
   it('builds a manifest when policy selects skills', () => {
     const manifest = resolveSessionSkillManifest({
       sessionId: 's1',

@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
-import { existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { assertValidPluginId } from './ids.js';
 
 export function botmuxHome(): string {
@@ -19,16 +19,8 @@ export function pluginHome(pluginId: string): string {
   return join(pluginsHome(), assertValidPluginId(pluginId));
 }
 
-export function pluginVersionsDir(pluginId: string): string {
-  return join(pluginHome(pluginId), 'versions');
-}
-
-export function pluginVersionDir(pluginId: string, version: string): string {
-  return join(pluginVersionsDir(pluginId), version);
-}
-
-export function pluginCurrentDir(pluginId: string): string {
-  return join(pluginHome(pluginId), 'current');
+export function pluginRuntimeDir(pluginId: string): string {
+  return join(pluginHome(pluginId), 'dist');
 }
 
 export function pluginConfigPath(pluginId: string): string {
@@ -41,6 +33,10 @@ export function pluginSettingsPath(pluginId: string): string {
 
 export function pluginServiceStatePath(pluginId: string): string {
   return join(pluginHome(pluginId), 'service.json');
+}
+
+export function pluginMaterializedPath(pluginId: string): string {
+  return join(pluginHome(pluginId), 'materialized.json');
 }
 
 export function ensurePluginHome(pluginId: string): string {
@@ -65,7 +61,7 @@ export function assertSafePluginRelativePath(path: string, field = 'path'): stri
 
 export function resolvePluginPath(rootDir: string, relativePath: string, field = 'path'): string {
   const safe = assertSafePluginRelativePath(relativePath, field);
-  const root = existsSync(rootDir) ? realpathSync(rootDir) : resolve(rootDir);
+  const root = resolve(rootDir);
   const target = resolve(root, safe);
   const rel = relative(root, target);
   if (!rel || rel.startsWith('..') || isAbsolute(rel)) throw new Error(`plugin_${field}_escapes_root`);

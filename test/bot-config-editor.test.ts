@@ -84,6 +84,7 @@ describe('parseBotSelection', () => {
 
   it('selects by custom process name', () => {
     expect(parseBotSelection('botmux-claude-main', bots)).toBe(0);
+    expect(parseBotSelection('claude-main', bots)).toBe(0);
   });
 
   it('selects by app id', () => {
