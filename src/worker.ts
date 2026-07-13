@@ -60,6 +60,7 @@ import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirecto
 import { drainPiTranscript, findPiTranscriptByPid, findPiTranscriptBySessionId } from './services/pi-transcript.js';
 import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
+import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
@@ -3090,6 +3091,8 @@ let trustHandled = false;
 const CODEX_APP_OSC_PREFIX = '\x1b]777;botmux:';
 const APP_RUNNER_OSC_CLI_IDS = new Set(['codex-app', 'mira', 'mir']);
 let codexAppOscPending = '';
+let kiroSessionIdCaptureArmed = false;
+let kiroSessionIdCaptureBuffer = '';
 
 function decodeCodexAppPayload(payload: string): any | undefined {
   try {
@@ -3136,6 +3139,16 @@ function handleCodexAppMarker(body: string): void {
   }
 }
 
+function maybeCaptureKiroSessionId(data: string): void {
+  if (!kiroSessionIdCaptureArmed || lastInitConfig?.cliId !== 'kiro-cli') return;
+  kiroSessionIdCaptureBuffer = tailChars(kiroSessionIdCaptureBuffer + data, 4000);
+  const cliSessionId = extractKiroSessionIdFromOutput(kiroSessionIdCaptureBuffer);
+  if (!cliSessionId || cliSessionId === sessionId) return;
+  persistCliSessionId(cliSessionId);
+  kiroSessionIdCaptureArmed = false;
+  kiroSessionIdCaptureBuffer = '';
+}
+
 function splitCodexAppControl(data: string): string {
   if (!APP_RUNNER_OSC_CLI_IDS.has(lastInitConfig?.cliId ?? '') && codexAppOscPending.length === 0) return data;
   const input = codexAppOscPending + data;
@@ -3176,6 +3189,7 @@ function onPtyData(data: string): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
   lastPtyActivityAtMs = Date.now();
+  maybeCaptureKiroSessionId(data);
   captureWorkflowTranscript(data);
   renderer?.write(data);
 
@@ -4462,6 +4476,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
   }) || (effectiveResume && cliAdapter.initialPromptArgsIgnoredOnResume === true);
+  kiroSessionIdCaptureArmed = cfg.cliId === 'kiro-cli' && !effectiveCliSessionId && !willReattachPersistent;
+  kiroSessionIdCaptureBuffer = '';
   // Per-bot local read isolation: assemble the Seatbelt profile context (the gate
   // already fail-closed above — reaching here with willReadIsolate means it is
   // enforceable). The worker is on the host (NOT sandboxed), so it holds the

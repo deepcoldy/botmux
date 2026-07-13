@@ -339,10 +339,26 @@ describe('writeInput: multiline, tmux mode', () => {
     await adapter.writeInput(pty, MULTILINE);
 
     expect(pty.pasteText).not.toHaveBeenCalled();
-    expect(pty.sendText.mock.calls.map(c => c[0])).toEqual(['first line', 'Session ID: abc-123']);
+    expect(pty.sendText.mock.calls.map(c => c[0])).toEqual(['/session-id', 'first line', 'Session ID: abc-123']);
     expect(pty.sendSpecialKeys.mock.calls).toEqual([
+      ['Enter'],
       ['C-j'],
       ['C-j'],
+      ['Enter'],
+    ]);
+  });
+
+  it('kiro-cli: asks for /session-id only once per PTY', async () => {
+    const adapter = createKiroCliAdapter('/bin/kiro-cli');
+    const pty = makeTmuxPty();
+
+    await adapter.writeInput(pty, 'first');
+    await adapter.writeInput(pty, 'second');
+
+    expect(pty.sendText.mock.calls.map(c => c[0])).toEqual(['/session-id', 'first', 'second']);
+    expect(pty.sendSpecialKeys.mock.calls).toEqual([
+      ['Enter'],
+      ['Enter'],
       ['Enter'],
     ]);
   });

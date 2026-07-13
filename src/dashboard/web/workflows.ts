@@ -201,7 +201,7 @@ export const LEGACY_WORKFLOW_POLL_MS = 5000;
 export const LEGACY_WORKFLOW_DETAIL_POLL_MS = 2000;
 export const LEGACY_WORKFLOW_TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'cancelled']);
 
-const RESUME_REQUIRES_CLI_SESSION_ID = new Set<string>(['antigravity', 'codex-app', 'cursor', 'mira']);
+const RESUME_REQUIRES_CLI_SESSION_ID = new Set<string>(['antigravity', 'codex-app', 'cursor', 'kiro-cli', 'mira']);
 const RESUME_USES_SESSION_ID = new Set<string>([
   'aiden',
   'coco',

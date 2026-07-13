@@ -5,6 +5,7 @@ import type { CliAdapter, PtyHandle } from './types.js';
 import { delay } from '../../utils/timing.js';
 
 const TRUSTED_CORE_TOOLS = 'read,write,shell';
+const sessionIdRequestedPtys = new WeakSet<PtyHandle>();
 
 export function createKiroCliAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'kiro-cli';
@@ -14,7 +15,7 @@ export function createKiroCliAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.kiro'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ resume, resumeSessionId, initialPrompt, disableCliBypass }) {
+    buildArgs({ resume, resumeSessionId, disableCliBypass }) {
       const args = ['chat'];
       if (!disableCliBypass) {
         // Avoid --trust-all-tools: Kiro's terminal UI shows a risk-confirmation
@@ -24,9 +25,6 @@ export function createKiroCliAdapter(pathOverride?: string): CliAdapter {
       if (resume && resumeSessionId) {
         args.push('--resume-id', resumeSessionId);
       }
-      if (initialPrompt) {
-        args.push(initialPrompt);
-      }
       return args;
     },
 
@@ -35,10 +33,15 @@ export function createKiroCliAdapter(pathOverride?: string): CliAdapter {
       return `kiro-cli chat --resume-id ${cliSessionId}`;
     },
 
-    passesInitialPromptViaArgs: true,
-
     async writeInput(pty: PtyHandle, content: string) {
       if (pty.sendText && pty.sendSpecialKeys) {
+        if (!sessionIdRequestedPtys.has(pty)) {
+          sessionIdRequestedPtys.add(pty);
+          pty.sendText('/session-id');
+          await delay(200);
+          pty.sendSpecialKeys('Enter');
+          await delay(200);
+        }
         const lines = content.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].length > 0) pty.sendText(lines[i]);

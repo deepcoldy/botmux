@@ -1433,10 +1433,11 @@ describe('kiro-cli buildArgs', () => {
     expect(args).toEqual(['chat']);
   });
 
-  it('passes the initial prompt as the documented chat positional input', () => {
+  it('keeps the initial prompt on stdin so the adapter can capture /session-id first', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-kiro', resume: false, initialPrompt: 'hello kiro' });
-    expect(args).toEqual(['chat', '--trust-tools=read,write,shell', 'hello kiro']);
-    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    expect(args).toEqual(['chat', '--trust-tools=read,write,shell']);
+    expect(args).not.toContain('hello kiro');
+    expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
   });
 
   it('resumes a specific Kiro session id when available', () => {
