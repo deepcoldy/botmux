@@ -110,27 +110,35 @@ describe('plugin manifest and registry basics', () => {
     expect(pluginPm2AppName('demo-addon')).toBe('botmux-plugin-demo-addon');
   });
 
-  it('rejects deprecated manifest runtime hook and static contribution fields', () => {
-    expect(() => parsePluginPackageManifest({
-      name: '@botmux/plugin-bad',
+  it('ignores unconsumed manifest fields for forward compatibility', () => {
+    const pkg = parsePluginPackageManifest({
+      name: '@botmux/plugin-compatible',
       version: '0.1.0',
       keywords: ['botmux-plugin'],
       botmux: {
-        schemaVersion: 1,
-        id: 'bad-plugin',
+        schemaVersion: 999,
+        id: 'compatible-plugin',
+        displayName: 'Compatible Plugin',
         main: '../outside.js',
-      },
-    })).toThrow(/deprecated_botmux_main_field/);
-    expect(() => parsePluginPackageManifest({
-      name: '@botmux/plugin-bad',
-      version: '0.1.0',
-      keywords: ['botmux-plugin'],
-      botmux: {
-        schemaVersion: 1,
-        id: 'bad-plugin',
         hooks: ['worker'],
+        capabilities: ['network'],
+        skills: [{ path: './skills/demo' }],
+        mcp: [{ command: ['node', './mcp/index.js'] }],
+        dashboard: [{ entry: './dashboard/index.js' }],
+        services: { legacy: { mode: 'manual' } },
+        futureCapability: { enabled: true },
+        dependencies: { plugins: ['base'] },
+        service: { mode: 'auto' },
       },
-    })).toThrow(/deprecated_botmux_hooks_field/);
+    });
+
+    expect(pkg.botmux).toEqual({
+      schemaVersion: 1,
+      id: 'compatible-plugin',
+      displayName: 'Compatible Plugin',
+      dependencies: { plugins: ['base'] },
+      service: { mode: 'auto' },
+    });
   });
 
   it('requires package versions to use standard semver metadata', () => {

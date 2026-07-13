@@ -44,6 +44,7 @@ import { readSessionPluginManifest } from '../session-manifest.js';
 import type { PluginMcpServer } from '../types.js';
 
 const GATEWAY_VERSION = '1.0.0';
+const DOWNSTREAM_INITIALIZE_TIMEOUT_MS = 10_000;
 
 interface GatewayDescriptor {
   key: string;
@@ -325,7 +326,7 @@ export class PluginMcpGateway {
         this.resourceTemplateRoutes = [];
         await this.server.sendResourceListChanged();
       });
-      await client.connect(transport);
+      await client.connect(transport, { timeout: DOWNSTREAM_INITIALIZE_TIMEOUT_MS });
       const connection: GatewayConnection = {
         ...descriptor,
         client,

@@ -19,6 +19,7 @@ describe('plugin MCP Gateway', () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
   });
@@ -85,6 +86,7 @@ describe('plugin MCP Gateway', () => {
   });
 
   it('isolates a failed downstream server', async () => {
+    const connectSpy = vi.spyOn(Client.prototype, 'connect');
     installFixturePlugin('plugin-a', 'alpha');
     installFixturePlugin('plugin-fail', 'fail');
     const gateway = new PluginMcpGateway(['plugin-a', 'plugin-fail']);
@@ -92,6 +94,7 @@ describe('plugin MCP Gateway', () => {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
     expect((await client.listTools()).tools.map(tool => tool.name).sort()).toEqual(['alpha_unique', 'echo']);
+    expect(connectSpy).toHaveBeenCalledWith(expect.anything(), { timeout: 10_000 });
     await client.close();
     await gateway.close();
   });

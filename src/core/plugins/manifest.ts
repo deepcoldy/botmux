@@ -5,7 +5,6 @@ import type {
   PluginServiceConfig,
 } from './types.js';
 
-const DEPRECATED_MANIFEST_FIELDS = ['main', 'hooks', 'capabilities', 'skills', 'mcp', 'dashboard'] as const;
 const PACKAGE_VERSION_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 function asRecord(value: unknown, field: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`invalid_${field}`);
@@ -42,13 +41,9 @@ function readService(raw: unknown): PluginServiceConfig | undefined {
 
 export function parseBotmuxManifest(raw: unknown): BotmuxPluginManifest {
   const record = asRecord(raw, 'botmux_manifest');
-  for (const field of DEPRECATED_MANIFEST_FIELDS) {
-    if (record[field] !== undefined) throw new Error(`deprecated_botmux_${field}_field`);
-  }
   const id = assertValidPluginId(record.id, 'botmux_plugin_id');
   const displayName = optionalString(record.displayName);
   const dependencies = readDependencies(record.dependencies);
-  if (record.services !== undefined) throw new Error('deprecated_plugin_services_field');
   const service = readService(record.service);
   return {
     schemaVersion: 1,
