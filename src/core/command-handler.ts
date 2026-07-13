@@ -1917,9 +1917,11 @@ export async function handleCommand(
         }
 
         if (request.kind === 'list') {
+          // 命令已收归 owner-only，无 session 时直接列全部（不再按 ownerOpenId 过滤），
+          // 否则非 owner @bot 触发的 auto-sub 对 owner 不可见。
           const subs = (ds
             ? listDocSubscriptionsForSession(dataDir, larkAppId, sessionAnchorId(ds))
-            : listAllDocSubscriptions(dataDir, larkAppId).filter(s => s.ownerOpenId === message.senderId))
+            : listAllDocSubscriptions(dataDir, larkAppId))
             .filter(s => s.managedBy === 'watch-comment');
           if (!subs.length) { await sessionReply(rootId, t(ds ? 'cmd.watch.none' : 'cmd.watch.none_owned', undefined, loc)); break; }
           const lines = subs.map(s => {
@@ -1943,9 +1945,10 @@ export async function handleCommand(
             }
             break;
           }
+          // 命令已收归 owner-only，无 session 时直接列全部（不再按 ownerOpenId 过滤）。
           const subs = (ds
             ? listDocSubscriptionsForSession(dataDir, larkAppId, sessionAnchorId(ds))
-            : listAllDocSubscriptions(dataDir, larkAppId).filter(s => s.ownerOpenId === message.senderId))
+            : listAllDocSubscriptions(dataDir, larkAppId))
             .filter(s => s.managedBy === 'watch-comment');
           for (const s of subs) {
             removeDocSubscription(dataDir, larkAppId, s.fileToken);

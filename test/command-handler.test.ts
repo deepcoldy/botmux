@@ -1030,7 +1030,7 @@ describe('handleCommand', () => {
       );
     });
 
-    it('/watch-comment list without a session lists only the caller\'s doc-native watches', async () => {
+    it('/watch-comment list without a session lists all doc-native watches (owner-only command)', async () => {
       vi.mocked(listAllDocSubscriptions).mockReturnValue([
         {
           fileToken: 'doc-owned', fileType: 'docx', sessionAnchor: 'doc:doc-owned', scope: 'chat',
@@ -1047,28 +1047,36 @@ describe('handleCommand', () => {
 
       await handleCommand('/watch-comment', ROOT_ID, makeLarkMessage('/watch-comment list', { senderId: 'ou_owner' }), deps, LARK_APP_ID);
 
+      // 命令已收归 owner-only，owner 应看到全部订阅（含非 owner 触发的 auto-sub）
       const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] ?? '';
       expect(reply).toContain('doc-owned');
-      expect(reply).not.toContain('doc-other');
+      expect(reply).toContain('doc-other');
     });
 
-    it('/watch-comment off all without a session removes only local watch records', async () => {
+    it('/watch-comment off all without a session removes all watch records (owner-only command)', async () => {
       vi.mocked(listAllDocSubscriptions).mockReturnValue([
         {
           fileToken: 'doc-owned', fileType: 'docx', sessionAnchor: 'doc:doc-owned', scope: 'chat',
           chatId: 'doc:doc-owned', commentTriggerMode: 'mention-only', managedBy: 'watch-comment',
           ownerOpenId: 'ou_owner', createdAt: 1,
         },
+        {
+          fileToken: 'doc-other-user', fileType: 'docx', sessionAnchor: 'doc:doc-other-user', scope: 'chat',
+          chatId: 'doc:doc-other-user', commentTriggerMode: 'mention-only', managedBy: 'watch-comment',
+          ownerOpenId: 'ou_other', createdAt: 1,
+        },
       ]);
       const deps = makeDeps();
 
       await handleCommand('/watch-comment', ROOT_ID, makeLarkMessage('/watch-comment off all', { senderId: 'ou_owner' }), deps, LARK_APP_ID);
 
+      // owner off-all 应清除全部 watch 订阅（不再按 ownerOpenId 过滤）
       expect(removeDocSubscription).toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, 'doc-owned');
+      expect(removeDocSubscription).toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, 'doc-other-user');
       expect(unsubscribeDocFile).not.toHaveBeenCalled();
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
-        expect.stringContaining('你登记的 1 个'),
+        expect.stringContaining('2 个'),
         undefined,
         LARK_APP_ID,
         'msg_001',

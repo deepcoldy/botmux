@@ -7944,6 +7944,7 @@ async function handleDocComment(ctx: DocCommentContext): Promise<boolean> {
   // ds 确认有效后才设 claim——auto-create 失败时不占坑，允许重试。
   handledDocCommentTurns.set(claimKey, Date.now());
 
+  try {
   // 给用户的回复加 "Typing" reaction，让评论者知道 bot 正在处理。
   const userReplyId = ctx.replyId;
   let reactionId: string | undefined;
@@ -8038,6 +8039,12 @@ async function handleDocComment(ctx: DocCommentContext): Promise<boolean> {
     forkWorker(ds, wrappedPrompt, { resume: ds.hasHistory, turnId });
   }
   return true;
+  } catch (err) {
+    // 投递失败：清理 claim 允许重试，返回 false 让 poller 不推进游标。
+    handledDocCommentTurns.delete(claimKey);
+    logger.warn(`[doc-comment] delivery failed, claim released for retry file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)} err=${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
 }
 
 /** 同一条评论可能同时被长连接通知和 --all 轮询看到；daemon 内统一去重。 */
