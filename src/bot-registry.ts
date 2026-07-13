@@ -621,8 +621,7 @@ export interface BotConfig {
    * 性质不变。可由 /grant 卡片「全局」按钮写入，也可在 bots.json 手配 open_id。
    */
   globalGrants?: string[];
-  /** Exact plugin ids enabled for this bot. Missing inherits the machine
-   *  default; an explicit list (including []) replaces it. */
+  /** Additional plugin ids enabled only for this bot. */
   plugins?: string[];
   /**
    * 消息额度机制（默认关闭）。`defaultLimit` 的"是否配置"本身就是开关：

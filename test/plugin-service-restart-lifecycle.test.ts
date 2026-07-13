@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf-8');
-const pluginPage = readFileSync(new URL('../src/dashboard/web/plugin-page.ts', import.meta.url), 'utf-8');
+const pluginPage = readFileSync(new URL('../src/dashboard/web/plugin-page.tsx', import.meta.url), 'utf-8');
 
 function restartFunctionSource(): string {
   const start = cliSource.indexOf('async function cmdRestart()');

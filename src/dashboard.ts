@@ -1179,11 +1179,9 @@ async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
   try { botConfigs = loadBotConfigs(); } catch { /* setup can render before bots.json exists */ }
   const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
   const bots = botConfigs.map((bot, index) => {
-    const exact = bot.plugins !== undefined;
     return {
       id: bot.larkAppId,
       name: bot.displayName || onlineByAppId.get(bot.larkAppId)?.botName || bot.name || `Bot ${index + 1}`,
-      source: exact ? 'bot' : 'machine-default',
       plugins: resolveEffectivePluginIds(bot, { plugins: globalPlugins }),
     };
   });
@@ -1222,7 +1220,6 @@ async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
       pinnedToSidebar: pinnedSet.has(record.id) && dashboardEntriesForRecord(record).length > 0,
       enabledGlobal: globalSet.has(record.id),
       enabledByBot: Object.fromEntries(bots.map(bot => [bot.id, bot.plugins.includes(record.id)])),
-      botSource: Object.fromEntries(bots.map(bot => [bot.id, bot.source])),
       gatewayAdapters,
       mcpDiagnostics: gatewayDiagnostics.get(record.id) ?? [],
     }));
@@ -1247,10 +1244,15 @@ async function writeBotPluginBinding(pluginId: string, larkAppId: string, enable
     if (index < 0) return false;
     const entry = raw[index];
     const current = Object.prototype.hasOwnProperty.call(entry, 'plugins') ? entry.plugins : undefined;
-    const effective = normalizePluginIdList(current === undefined ? defaults : current) ?? [];
+    const effective = resolveEffectivePluginIds(
+      { plugins: normalizePluginIdList(current) ?? [] },
+      { plugins: defaults },
+    );
     assertPluginBindingTransition(pluginId, enabled, effective);
     if (enabled) materializePlugin(pluginId);
-    entry.plugins = updateBotPluginOverride(current, defaults, pluginId, enabled);
+    const next = updateBotPluginOverride(current, pluginId, enabled);
+    if (next.length > 0) entry.plugins = next;
+    else delete entry.plugins;
     await writeRawConfigAtomic(path, raw);
     return true;
   });
@@ -1316,6 +1318,12 @@ async function handlePluginManagementApi(
     try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
     const enabled = pluginEnabledPatch(body);
     if (enabled === null) return pluginJson(res, 400, { ok: false, error: 'invalid_enabled' });
+    if ((normalizePluginIdList(readGlobalConfig().plugins) ?? []).includes(pluginId)) {
+      return pluginJson(res, 409, {
+        ok: false,
+        error: `插件 ${pluginId} 已全局启用；请先关闭全局启用，再按 Bot 配置。`,
+      });
+    }
     try {
       if (!await writeBotPluginBinding(pluginId, larkAppId, enabled)) {
         return pluginJson(res, 404, { ok: false, error: 'bot_not_found' });

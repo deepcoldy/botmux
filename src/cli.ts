@@ -105,7 +105,7 @@ import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js
 import { writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 import { stripLegacyPendingCardFields } from './services/session-store.js';
 import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
-import { updateBotPluginOverride } from './core/plugins/effective.js';
+import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
 import {
   assertPluginBindingTransition,
   describePluginDependencyError,
@@ -6911,18 +6911,24 @@ function updateBotPluginBinding(
         return [idx];
       })();
   const machineDefaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+  if (machineDefaults.includes(pluginId)) {
+    console.error(`❌ 插件 ${pluginId} 已全局启用；请先关闭全局启用，再按 Bot 配置。`);
+    process.exit(1);
+  }
   for (const idx of indexes) {
     const current = Object.prototype.hasOwnProperty.call(bots[idx], 'plugins') ? bots[idx].plugins : undefined;
-    const effective = normalizePluginIdList(current === undefined ? machineDefaults : current) ?? [];
+    const effective = resolveEffectivePluginIds(
+      { plugins: normalizePluginIdList(current) ?? [] },
+      { plugins: machineDefaults },
+    );
     assertPluginBindingTransitionForCli(pluginId, enable, effective);
   }
   beforeWrite?.();
   for (const idx of indexes) {
     const current = Object.prototype.hasOwnProperty.call(bots[idx], 'plugins') ? bots[idx].plugins : undefined;
-    const next = updateBotPluginOverride(current, machineDefaults, pluginId, enable);
-    // [] is an intentional exact override. Deleting the field would make the
-    // bot inherit machine defaults and could re-enable the plugin.
-    bots[idx].plugins = next;
+    const next = updateBotPluginOverride(current, pluginId, enable);
+    if (next.length > 0) bots[idx].plugins = next;
+    else delete bots[idx].plugins;
   }
   writeBotsAtomic(BOTS_JSON_FILE, bots);
   return indexes.length;
@@ -6937,7 +6943,8 @@ function removePluginBindingsEverywhere(pluginId: string): void {
     const next = removePluginId(bot.plugins, pluginId);
     const before = normalizePluginIdList(bot.plugins) ?? [];
     if (before.length !== next.length) changed = true;
-    bot.plugins = next;
+    if (next.length > 0) bot.plugins = next;
+    else delete bot.plugins;
   }
   if (changed) writeBotsAtomic(BOTS_JSON_FILE, bots);
   const pinnedPlugins = normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? [];

@@ -66,7 +66,7 @@ describe('CLI plugin generation', () => {
     const refreshed = prepareCliPluginGeneration({
       sessionId: 'same-session',
       bot: { larkAppId: 'app-1', plugins: [] },
-      global: { plugins: ['demo'] },
+      global: { plugins: [] },
       dataDir,
       cliId: 'codex',
       adapter,

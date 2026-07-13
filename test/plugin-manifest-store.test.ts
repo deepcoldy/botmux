@@ -244,15 +244,15 @@ describe('plugin manifest and registry basics', () => {
     expect(() => resolvePluginPath(root, '../other')).toThrow(/escapes_root/);
   });
 
-  it('uses an exact bot override and only inherits defaults when the field is absent', () => {
+  it('combines global plugins with per-Bot additions', () => {
     expect(resolveEffectivePluginIds(
       { plugins: ['agent-chrome', 'gitlab'] },
       { plugins: ['gitlab', 'lint-bot'] },
-    )).toEqual(['agent-chrome', 'gitlab']);
+    )).toEqual(['gitlab', 'lint-bot', 'agent-chrome']);
     expect(resolveEffectivePluginIds({}, { plugins: ['gitlab', 'lint-bot'] })).toEqual(['gitlab', 'lint-bot']);
-    expect(resolveEffectivePluginIds({ plugins: [] }, { plugins: ['gitlab'] })).toEqual([]);
-    expect(updateBotPluginOverride(undefined, ['gitlab'], 'chrome', true)).toEqual(['gitlab', 'chrome']);
-    expect(updateBotPluginOverride(undefined, ['gitlab'], 'gitlab', false)).toEqual([]);
+    expect(resolveEffectivePluginIds({ plugins: [] }, { plugins: ['gitlab'] })).toEqual(['gitlab']);
+    expect(updateBotPluginOverride(undefined, 'chrome', true)).toEqual(['chrome']);
+    expect(updateBotPluginOverride(undefined, 'gitlab', false)).toEqual([]);
   });
 
   it('installs a local plugin directory into plugin scope without enabling it', () => {

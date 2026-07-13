@@ -95,7 +95,6 @@ interface ManagedPlugin {
   pinnedToSidebar?: boolean;
   enabledGlobal?: boolean;
   enabledByBot?: Record<string, boolean>;
-  botSource?: Record<string, 'bot' | 'machine-default'>;
   gatewayAdapters?: GatewayAdapterReport[];
   mcpDiagnostics?: GatewayServerDiagnostic[];
 }
@@ -103,7 +102,6 @@ interface ManagedPlugin {
 interface PluginBotScope {
   id: string;
   name: string;
-  source: 'bot' | 'machine-default';
   plugins: string[];
 }
 
@@ -538,10 +536,6 @@ function pluginEnabledInScope(plugin: ManagedPlugin, scope: string, pendingToggl
   const pending = pendingToggles.get(toggleKey(plugin.id, scope));
   if (pending !== undefined) return pending;
   if (scope === 'global') return plugin.enabledGlobal === true;
-  if (plugin.botSource?.[scope] === 'machine-default') {
-    const pendingGlobal = pendingToggles.get(toggleKey(plugin.id, 'global'));
-    if (pendingGlobal !== undefined) return pendingGlobal;
-  }
   return plugin.enabledByBot?.[scope] === true;
 }
 
@@ -550,18 +544,14 @@ function PluginEnableRow(props: {
   scope: string;
   label: string;
   hint: string;
-  sourceLabel: string;
   checked: boolean;
   busy: boolean;
   onToggle(scope: string, enabled: boolean): void;
 }): JSX.Element {
   return (
-    <label className={`toggle-row plugin-enable-row${props.scope === 'global' ? ' plugin-enable-row-global' : ''}`}>
+    <label className="toggle-row plugin-enable-row">
       <span className="plugin-enable-copy">
-        <span className="plugin-enable-label">
-          <strong>{props.label}</strong>
-          <span className="plugin-enable-source">{props.sourceLabel}</span>
-        </span>
+        <strong>{props.label}</strong>
         <small>{props.hint}</small>
       </span>
       <input
@@ -577,7 +567,36 @@ function PluginEnableRow(props: {
   );
 }
 
-function PluginEnableSettings(props: {
+function PluginGlobalSetting(props: {
+  plugin: ManagedPlugin;
+  bots: PluginBotScope[];
+  pendingToggles: PendingToggles;
+  busy: boolean;
+  onToggle(scope: string, enabled: boolean): void;
+}): JSX.Element {
+  const enabled = pluginEnabledInScope(props.plugin, 'global', props.pendingToggles);
+  return (
+    <label className="toggle-row plugin-global-setting">
+      <span className="plugin-global-setting-copy">
+        <strong>全局启用</strong>
+        <small>{enabled
+          ? `已对全部 ${props.bots.length} 个 Bot 启用`
+          : '关闭时可展开卡片，按 Bot 单独启用'}</small>
+      </span>
+      <input
+        type="checkbox"
+        data-plugin-toggle="global"
+        data-plugin-id={props.plugin.id}
+        checked={enabled}
+        disabled={props.busy}
+        onChange={event => props.onToggle('global', event.currentTarget.checked)}
+      />
+      <span className="switch" aria-hidden="true"></span>
+    </label>
+  );
+}
+
+function PluginBotSettings(props: {
   plugin: ManagedPlugin;
   bots: PluginBotScope[];
   pendingToggles: PendingToggles;
@@ -585,30 +604,18 @@ function PluginEnableSettings(props: {
   onToggle(scope: string, enabled: boolean): void;
 }): JSX.Element {
   const { plugin, bots, pendingToggles } = props;
-  const globalEnabled = pluginEnabledInScope(plugin, 'global', pendingToggles);
   const enabledBotCount = bots.filter(bot => pluginEnabledInScope(plugin, bot.id, pendingToggles)).length;
   return (
-    <section className="plugin-enable-panel" aria-label={`${plugin.displayName || plugin.id} 启用设置`}>
+    <section className="plugin-enable-panel" aria-label={`${plugin.displayName || plugin.id} 按 Bot 启用`}>
       <div className="plugin-enable-panel-head">
         <div>
-          <strong>启用设置</strong>
-          <small>全局默认与各 Bot 设置集中展示；修改后，新启动的 CLI 会话生效。</small>
+          <strong>按 Bot 启用</strong>
+          <small>全局关闭时，可为需要此插件的 Bot 单独开启；新启动的 CLI 会话生效。</small>
         </div>
         <span>{enabledBotCount}/{bots.length} 个 Bot 已启用</span>
       </div>
       <div className="plugin-enable-list">
-        <PluginEnableRow
-          plugin={plugin}
-          scope="global"
-          label="全局启用"
-          hint="未单独配置插件列表的 Bot 会继承此设置"
-          sourceLabel={globalEnabled ? '已启用' : '未启用'}
-          checked={globalEnabled}
-          busy={props.busy}
-          onToggle={props.onToggle}
-        />
         {bots.map(bot => {
-          const inherited = plugin.botSource?.[bot.id] === 'machine-default';
           const checked = pluginEnabledInScope(plugin, bot.id, pendingToggles);
           const enabledState = checked ? '已启用' : '未启用';
           return (
@@ -617,7 +624,6 @@ function PluginEnableSettings(props: {
               scope={bot.id}
               label={bot.name}
               hint={`当前${enabledState}`}
-              sourceLabel={inherited ? '继承全局' : '独立设置'}
               checked={checked}
               busy={props.busy}
               onToggle={props.onToggle}
@@ -628,6 +634,41 @@ function PluginEnableSettings(props: {
         {bots.length === 0 ? <div className="plugin-enable-empty">暂无已配置 Bot</div> : null}
       </div>
     </section>
+  );
+}
+
+function PluginCapabilitySummary(props: {
+  plugin: ManagedPlugin;
+  globalEnabled: boolean;
+  enabledBotCount: number;
+  botCount: number;
+}): JSX.Element {
+  const commands = props.plugin.contributions?.cli?.commands ?? [];
+  const capabilities = [
+    { label: 'Skills', count: props.plugin.skillsCount ?? 0 },
+    { label: 'MCP', count: props.plugin.mcpCount ?? 0 },
+    { label: '命令', count: commands.length },
+    { label: 'Dashboard', count: props.plugin.dashboard?.length ?? 0 },
+  ].filter(item => item.count > 0);
+  return (
+    <div className="plugin-card-summary">
+      <div className="plugin-capability-summary" aria-label="插件能力摘要">
+        {capabilities.map(item => (
+          <span className="plugin-capability-chip" key={item.label}><strong>{item.count}</strong>{item.label}</span>
+        ))}
+        {props.plugin.service ? (
+          <span className={`plugin-capability-chip ${serviceStatusClass(props.plugin.serviceReport)}`}>
+            Service {serviceDisplayLabel(props.plugin.serviceReport)}
+          </span>
+        ) : null}
+        {capabilities.length === 0 && !props.plugin.service ? <span className="plugin-muted">未声明扩展能力</span> : null}
+      </div>
+      <span className="plugin-scope-summary">
+        {props.globalEnabled
+          ? `全部 ${props.botCount} 个 Bot`
+          : `${props.enabledBotCount}/${props.botCount} 个 Bot 单独启用`}
+      </span>
+    </div>
   );
 }
 
@@ -678,19 +719,24 @@ function PluginCard(props: {
   onServiceAction(action: PluginServiceAction): void;
 }): JSX.Element {
   const { plugin } = props;
+  const [expanded, setExpanded] = useState(false);
   const title = plugin.displayName || plugin.id;
   const depIds = plugin.dependencies ?? [];
   const enabledGlobal = pluginEnabledInScope(plugin, 'global', props.pendingToggles);
+  const enabledBotCount = props.bots.filter(bot => pluginEnabledInScope(plugin, bot.id, props.pendingToggles)).length;
+  const enabledAnywhere = enabledGlobal || enabledBotCount > 0;
+  const globalTogglePending = props.pendingToggles.has(toggleKey(plugin.id, 'global'));
   const hasDashboard = (plugin.dashboard?.length ?? 0) > 0;
   const pinned = props.pendingPin ?? plugin.pinnedToSidebar === true;
+  const detailsId = `plugin-details-${plugin.id}`;
   return (
-    <article className="bd-card plugin-card" data-plugin-card={plugin.id}>
+    <article className={`bd-card plugin-card${expanded ? ' is-expanded' : ' is-collapsed'}`} data-plugin-card={plugin.id}>
       <header className="plugin-card-head">
         <div className="plugin-title-block">
           <div className="plugin-title-row">
             <h2>{title}</h2>
-            <span className={`plugin-status ${enabledGlobal ? 'plugin-status-ok' : 'plugin-status-idle'}`}>
-              {enabledGlobal ? '全局已启用' : '全局未启用'}
+            <span className={`plugin-status ${enabledAnywhere ? 'plugin-status-ok' : 'plugin-status-idle'}`}>
+              {enabledGlobal ? '全局已启用' : enabledBotCount > 0 ? `${enabledBotCount} 个 Bot 已启用` : '未启用'}
             </span>
           </div>
           <p>
@@ -699,34 +745,64 @@ function PluginCard(props: {
             {depIds.length > 0 ? <span>依赖 {depIds.join(', ')}</span> : null}
           </p>
         </div>
-        {hasDashboard ? (
-          <div className="plugin-card-controls">
-            <label className="toggle-row plugin-pin-toggle">
-              <input
-                type="checkbox"
-                data-plugin-pin={plugin.id}
-                checked={pinned}
-                disabled={props.busy}
-                onChange={event => props.onPin(event.currentTarget.checked)}
-              />
-              <span className="switch"></span>
-              <span className="toggle-tx">
-                <strong>Pin 到侧栏</strong>
-                <small>{pinned ? '已固定，可从主菜单快速打开' : '固定后可从主菜单快速打开'}</small>
-              </span>
-            </label>
-          </div>
-        ) : null}
+        <button
+          type="button"
+          className="btn-link plugin-expand-button"
+          data-plugin-expand={plugin.id}
+          aria-expanded={expanded}
+          aria-controls={detailsId}
+          onClick={() => setExpanded(current => !current)}
+        >
+          {expanded ? '收起详情' : '展开详情'}
+        </button>
       </header>
-      <PluginEnableSettings
+      <PluginGlobalSetting
         plugin={plugin}
         bots={props.bots}
         pendingToggles={props.pendingToggles}
         busy={props.busy}
         onToggle={props.onToggle}
       />
-      <PluginActionArea plugin={plugin} busy={props.busy} onServiceAction={props.onServiceAction} />
-      <div className="plugin-card-body"><PluginTabs plugin={plugin} /></div>
+      <PluginCapabilitySummary
+        plugin={plugin}
+        globalEnabled={enabledGlobal}
+        enabledBotCount={enabledBotCount}
+        botCount={props.bots.length}
+      />
+      {expanded ? (
+        <div className="plugin-card-expanded" id={detailsId}>
+          {!enabledGlobal && !globalTogglePending ? (
+            <PluginBotSettings
+              plugin={plugin}
+              bots={props.bots}
+              pendingToggles={props.pendingToggles}
+              busy={props.busy}
+              onToggle={props.onToggle}
+            />
+          ) : null}
+          {globalTogglePending ? <div className="plugin-settings-pending">正在更新全局设置...</div> : null}
+          {hasDashboard ? (
+            <div className="plugin-card-controls">
+              <label className="toggle-row plugin-pin-toggle">
+                <input
+                  type="checkbox"
+                  data-plugin-pin={plugin.id}
+                  checked={pinned}
+                  disabled={props.busy}
+                  onChange={event => props.onPin(event.currentTarget.checked)}
+                />
+                <span className="switch"></span>
+                <span className="toggle-tx">
+                  <strong>Pin 到侧栏</strong>
+                  <small>{pinned ? '已固定，可从主菜单快速打开' : '固定后可从主菜单快速打开'}</small>
+                </span>
+              </label>
+            </div>
+          ) : null}
+          <PluginActionArea plugin={plugin} busy={props.busy} onServiceAction={props.onServiceAction} />
+          <div className="plugin-card-body"><PluginTabs plugin={plugin} /></div>
+        </div>
+      ) : null}
     </article>
   );
 }
@@ -828,7 +904,7 @@ function PluginManagementPage(): JSX.Element {
       <div className="page-heading">
         <div>
           <h1>插件</h1>
-          <p>每张插件卡片直接展示全局与各 Bot 的启用设置。改动不会热插拔正在运行的 CLI；重启该 CLI 会话后，Skills 与 MCP 会一起刷新。</p>
+          <p>卡片默认展示启用范围与能力摘要；展开后可管理单个 Bot、Service 和详细能力。全局启用对所有 Bot 生效，改动在新启动的 CLI 会话中生效。</p>
         </div>
         <div className="plugin-heading-actions">
           <button type="button" className="btn-link" data-plugin-refresh disabled={refreshing} onClick={() => void load()}>

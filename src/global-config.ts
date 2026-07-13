@@ -68,8 +68,7 @@ export interface GlobalConfig {
   /** Machine-wide user skill registry policy. Skill package storage itself lives under
    *  ~/.botmux/skills and is managed by services/skill-registry-store.ts. */
   skills?: GlobalSkillConfig;
-  /** Machine-wide default plugin ids. A bot with no `plugins` field inherits
-   *  this list; a bot with an explicit list (including []) replaces it. */
+  /** Plugin ids enabled for every bot. Per-bot plugin ids are additive. */
   plugins?: string[];
   /** 远程访问. When true (and this machine is bound to the central platform),
    *  session web-terminal links, Feishu card terminal buttons, and connector

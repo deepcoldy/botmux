@@ -54,14 +54,14 @@ describe('plugin session manifest', () => {
     expect(sessionPluginManifestPath('session-1', dataDir)).toBe(join(dataDir, 'sessions', 'session-1', 'plugin-manifest.json'));
   });
 
-  it('preserves an explicit empty bot override', () => {
+  it('keeps global plugins active when a Bot has no additions', () => {
     const manifest = ensureSessionPluginManifest({
       sessionId: 'session-2',
       bot: { larkAppId: 'app-2', name: 'review', plugins: [] },
       global: { plugins: ['chrome'] },
       dataDir,
     });
-    expect(manifest).toMatchObject({ botId: 'review', source: 'bot', pluginIds: [] });
+    expect(manifest).toMatchObject({ botId: 'review', source: 'bot', pluginIds: ['chrome'] });
   });
 
   it('rejects traversal-like session ids', () => {
