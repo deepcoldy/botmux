@@ -4869,12 +4869,21 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     let sidecars: string[] = [];
     try { sidecars = readdirSync(ctxReal.botmuxHome).filter(n => n.startsWith('bots.json.')).map(n => join(ctxReal.botmuxHome, n)); } catch { /* */ }
     const m = buildLinuxReadIsolationMasks({ ctx: ctxReal, siblingAppIds: [...ids], botsJsonSidecars: sidecars });
+    // Same execvp carve-out as macOS (Codex 342a3e1c): a standalone Codex whose
+    // binary lives UNDER the now-masked ~/.codex would fail execvp. Re-expose ONLY
+    // its executable package tree (read-only, after the masks) — auth/config/sessions
+    // stay masked. No-op for npm/system installs (binary not under ~/.codex) + non-codex.
+    const execCarveOuts = buildCliExecutableReadCarveOuts({
+      homeDir: ctxReal.homeDir,
+      cliId: cliAdapter.id,
+      resolvedBin: canon(cliAdapter.resolvedBin),
+    }).map(canon);
     readIsoLinuxMasks = {
       hidePaths: m.hidePaths.map(canon),
       ownReadWritePaths: m.ownReadWritePaths.map(canon),
-      ownReadOnlyPaths: m.ownReadOnlyPaths.map(canon),
+      ownReadOnlyPaths: [...m.ownReadOnlyPaths.map(canon), ...execCarveOuts],
     };
-    log(`[read-isolation] linux bwrap masks: ${m.hidePaths.length} hide, ${[...ids].length} siblings enumerated`);
+    log(`[read-isolation] linux bwrap masks: ${m.hidePaths.length} hide, ${[...ids].length} siblings enumerated${execCarveOuts.length ? ', +codex-standalone exec carve' : ''}`);
   }
   if (sandboxOn) {
     // FAIL-SAFE (not fail-open): when the sandbox is requested, a missing
