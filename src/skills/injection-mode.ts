@@ -188,3 +188,35 @@ export function builtinSkillHelpPointer(locale?: Locale): string {
     : '除了 <botmux_routing> 里的命令，botmux 还有更多能力（ask / schedule / workflow 等），都是 shell 子命令——用 `botmux --help` 查全部，`botmux <子命令> --help` 查单个用法。';
   return `<botmux_builtin_skills>\n${inner}\n</botmux_builtin_skills>`;
 }
+
+/**
+ * Skill catalog / help block for `injectsSessionContext` CLIs that only have a
+ * global `skillsDir` (genius / grok). Session-manager omits the per-message
+ * skill envelope for these CLIs, so the catalog must ride on the system-prompt
+ * append flag (`--append-system-prompt` / `--rules`). Claude-family uses
+ * `--plugin-dir` instead and does not call this.
+ *
+ * Resolves per-bot / machine `skillInjection` mode:
+ *   - `prompt` → compact catalog (on-demand `botmux skill show`)
+ *   - `off`    → help pointer only
+ *   - `global` → empty (files already on disk via ensureCliSkills)
+ */
+export function builtinSkillBlockForInjectsSessionContext(
+  larkAppId: string | undefined,
+  locale: Locale | undefined,
+  opts: { asksViaHook?: boolean; whiteboardEnabled?: boolean } = {},
+): string {
+  const mode = resolveSkillInjectionModeForApp(larkAppId);
+  if (mode === 'prompt') {
+    return buildBuiltinSkillCatalogBlock(
+      builtinSkillEntries({
+        asksViaHook: opts.asksViaHook === true,
+        whiteboardEnabled: opts.whiteboardEnabled === true,
+        excludeRoutingCovered: true,
+      }),
+      locale,
+    );
+  }
+  if (mode === 'off') return builtinSkillHelpPointer(locale);
+  return '';
+}

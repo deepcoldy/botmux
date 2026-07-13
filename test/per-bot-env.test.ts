@@ -47,6 +47,8 @@ describe('sanitizePerBotEnv()', () => {
         LARK_APP_SECRET: 's',
         CLAUDECODE: '1',
         CLAUDE_CONFIG_DIR: '/tmp/evil',
+        CODEX_HOME: '/tmp/evil-codex',
+        GROK_HOME: '/tmp/evil-grok',
         CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: '1',
         CJADK_INTERACTIVE: '1',
         IS_SANDBOX: '1',
@@ -73,6 +75,7 @@ describe('isReservedPerBotEnvKey()', () => {
       'BOTMUX', 'BOTMUX_SESSION_ID', 'BOTMUX_ANYTHING',
       'LARK_APP_ID', 'LARK_APP_SECRET',
       'CLAUDECODE', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
+      'CODEX_HOME', 'GROK_HOME',
       'CJADK_INTERACTIVE', 'IS_SANDBOX', 'SESSION_DATA_DIR', '__OWNER_OPEN_ID',
     ]) {
       expect(isReservedPerBotEnvKey(k), k).toBe(true);

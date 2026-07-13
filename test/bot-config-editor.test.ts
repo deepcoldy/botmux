@@ -310,6 +310,7 @@ describe('resolveCliId', () => {
     expect(resolveCliId('16')).toBe('copilot');
     expect(resolveCliId('20')).toBe('kimi');
     expect(resolveCliId('21')).toBe('genius');
+    expect(resolveCliId('22')).toBe('grok');
   });
 
   it('passes through literal cliIds unchanged', () => {
@@ -321,6 +322,7 @@ describe('resolveCliId', () => {
     expect(resolveCliId('mira')).toBe('mira');
     expect(resolveCliId('pi')).toBe('pi');
     expect(resolveCliId('copilot')).toBe('copilot');
+    expect(resolveCliId('grok')).toBe('grok');
   });
 
   it('throws on typos so they do not leak into bots.json', () => {
