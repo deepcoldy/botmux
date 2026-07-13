@@ -18,6 +18,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import { normalizePluginIdList } from './core/plugins/ids.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -68,6 +69,8 @@ export interface GlobalConfig {
   /** Machine-wide user skill registry policy. Skill package storage itself lives under
    *  ~/.botmux/skills and is managed by services/skill-registry-store.ts. */
   skills?: GlobalSkillConfig;
+  /** Plugin ids enabled for every bot. Per-bot plugin ids are additive. */
+  plugins?: string[];
   /** 远程访问. When true (and this machine is bound to the central platform),
    *  session web-terminal links, Feishu card terminal buttons, and connector
    *  webhook URLs use the central-platform machine subdomain instead of local
@@ -147,6 +150,9 @@ export interface DashboardGlobalConfig {
    *  ON (absent ⇒ enabled); set false to disable from the dashboard. Read live
    *  by the daemon — see config.ts `resolveChatBotDiscoveryConfig`. */
   chatBotDiscovery?: boolean;
+  /** Installed plugin Dashboard pages pinned into the main sidebar. This is a
+   *  machine-wide display preference and does not enable the plugin for a Bot. */
+  pinnedPlugins?: string[];
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -251,6 +257,8 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   const localCliOpenMode = readLocalCliOpenMode(d.localCliOpenMode);
   if (localCliOpenMode) out.localCliOpenMode = localCliOpenMode;
   if (typeof d.chatBotDiscovery === 'boolean') out.chatBotDiscovery = d.chatBotDiscovery;
+  const pinnedPlugins = normalizePluginIdList(d.pinnedPlugins);
+  if (pinnedPlugins) out.pinnedPlugins = pinnedPlugins;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -349,6 +357,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   const skills = readGlobalSkills(raw.skills);
   if (skills) out.skills = skills;
+  const plugins = normalizePluginIdList(raw.plugins);
+  if (plugins) out.plugins = plugins;
   if (typeof raw.remoteAccess === 'boolean') out.remoteAccess = raw.remoteAccess;
   // Lenient: keep any non-empty string. IANA validity is enforced on write and
   // re-checked in scheduleTimeZone() (invalid ⇒ falls back to the host zone),

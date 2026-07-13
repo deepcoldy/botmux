@@ -14,6 +14,10 @@
     "README.en.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc && cp src/setup/lark-scopes.json dist/setup/ && pnpm dashboard:bundle && chmod +x dist/cli.js",
     "dashboard:bundle": "node scripts/build-dashboard.mjs",
@@ -43,6 +47,7 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.64.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@napi-rs/canvas": "^0.1.65",
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/headless": "^6.0.0",

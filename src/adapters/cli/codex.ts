@@ -125,6 +125,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'codex',
+    mcpGateway: {
+      configPath: '~/.codex/config.toml',
+      format: 'codex-toml',
+    },
     // codex 0.137's own filesystem profile can't express a read blocklist, so
     // isolation is enforced by the worker's whole-process macOS Seatbelt wrapper.
     // e2e verified: codex under `sandbox-exec -f <profile>` (with bypass) is

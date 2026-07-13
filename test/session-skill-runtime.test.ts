@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { prepareSessionSkillPrompt } from '../src/core/skills/session-runtime.js';
 import { readSessionSkillManifest } from '../src/core/skills/manifest-store.js';
 import { installLocalSkill } from '../src/services/skill-registry-store.js';
+import { loadSkillPackage } from '../src/core/skills/package.js';
+import { readSkillRegistry } from '../src/services/skill-registry-store.js';
 
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
@@ -62,5 +64,63 @@ describe('session skill runtime preparation', () => {
     expect(result.prompt).toContain('<botmux_skills mode="priority">');
     expect(result.prompt).toContain('botmux skill show deploy');
     expect(readSessionSkillManifest('s2')?.prioritySkills.map((s) => s.name)).toEqual(['deploy']);
+  });
+
+  it('injects plugin-owned skills without adding them to the user skill registry', () => {
+    const pluginRoot = join(src, 'plugin-demo');
+    const skillDir = join(pluginRoot, 'skills', 'browser');
+    write(join(skillDir, 'SKILL.md'), '---\nname: browser\ndescription: Browser tools\n---\n# Browser');
+    const pluginSkill = loadSkillPackage(skillDir, {
+      source: { type: 'plugin', pluginId: 'demo', root: pluginRoot },
+      id: 'plugin:demo:browser',
+    });
+
+    const result = prepareSessionSkillPrompt({
+      sessionId: 'plugin-session',
+      cliId: 'codex',
+      workingDir: '/repo',
+      prompt: 'hello',
+      botPolicy: undefined,
+      pluginSkills: [pluginSkill],
+    });
+
+    expect(result.prompt).toContain('botmux skill show browser');
+    expect(readSessionSkillManifest('plugin-session')?.prioritySkills[0].source).toEqual({
+      type: 'plugin',
+      pluginId: 'demo',
+      root: pluginRoot,
+    });
+    expect(readSkillRegistry().skills.browser).toBeUndefined();
+  });
+
+  it('refreshes a prompt-less CLI generation and removes stale session skills', () => {
+    const pluginRoot = join(src, 'plugin-refresh');
+    const skillDir = join(pluginRoot, 'skills', 'browser');
+    write(join(skillDir, 'SKILL.md'), '---\nname: browser\ndescription: Browser tools\n---\n# Browser');
+    const pluginSkill = loadSkillPackage(skillDir, {
+      source: { type: 'plugin', pluginId: 'demo', root: pluginRoot },
+      id: 'plugin:demo:browser',
+    });
+
+    const prepared = prepareSessionSkillPrompt({
+      sessionId: 'refresh-session',
+      cliId: 'codex',
+      workingDir: '/repo',
+      prompt: '',
+      botPolicy: undefined,
+      pluginSkills: [pluginSkill],
+    });
+    expect(prepared.prompt).toBe('');
+    expect(readSessionSkillManifest('refresh-session')?.prioritySkills.map(skill => skill.name)).toEqual(['browser']);
+
+    prepareSessionSkillPrompt({
+      sessionId: 'refresh-session',
+      cliId: 'codex',
+      workingDir: '/repo',
+      prompt: '',
+      botPolicy: undefined,
+      pluginSkills: [],
+    });
+    expect(readSessionSkillManifest('refresh-session')).toBeNull();
   });
 });

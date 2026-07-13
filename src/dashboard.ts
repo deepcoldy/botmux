@@ -3,7 +3,7 @@ import { createServer, get as httpGet, request as httpRequest, type IncomingMess
 import { createServer as createTcpServer, connect as netConnect } from 'node:net';
 import type { Duplex } from 'node:stream';
 import {
-  readFileSync, existsSync, mkdirSync, statSync, createReadStream,
+  readFileSync, existsSync, mkdirSync, readdirSync, statSync, createReadStream,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
@@ -42,7 +42,7 @@ import {
   TTADK_MODEL_SUGGESTIONS,
 } from './setup/cli-selection.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { invalidateGlobalConfigCache, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import { buildDashboardUrls, type DashboardUrls } from './core/dashboard-url.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
@@ -87,6 +87,7 @@ import {
 import { createDaemonInternalApi } from './dashboard/daemon-internal-api.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
+import { createCliAdapterSync } from './adapters/cli/registry.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
@@ -117,6 +118,15 @@ import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './s
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 import { larkHosts } from './im/lark/lark-hosts.js';
 import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
+import { readPluginRegistry } from './services/plugin-registry-store.js';
+import { pluginRuntimeDir, resolvePluginPath } from './core/plugins/paths.js';
+import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
+import { listPluginServiceStatus, startPluginServices, stopPluginServices } from './core/plugins/service-manager.js';
+import { materializePlugin } from './core/plugins/materializer.js';
+import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
+import { assertPluginBindingTransition, describePluginDependencyError } from './core/plugins/dependencies.js';
+import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import type { InstalledPluginRecord, PluginDashboardEntry } from './core/plugins/types.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -1052,6 +1062,301 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
   }
 }
 
+function dashboardEntriesForRecord(record: InstalledPluginRecord): PluginDashboardEntry[] {
+  return record.contributions?.dashboard ?? [];
+}
+
+function listDashboardPluginEntries(): Array<{ pluginId: string; id: string; route: string; entry: string; url: string; displayName?: string; pinned: boolean }> {
+  const pinned = new Set(normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? []);
+  const out: Array<{ pluginId: string; id: string; route: string; entry: string; url: string; displayName?: string; pinned: boolean }> = [];
+  for (const record of Object.values(readPluginRegistry().plugins)) {
+    const dashboardEntries = dashboardEntriesForRecord(record);
+    for (const entry of dashboardEntries) {
+      out.push({
+        pluginId: record.id,
+        id: entry.id,
+        route: entry.route,
+        entry: entry.entry,
+        url: `/plugins/${encodeURIComponent(record.id)}/${entry.entry}`,
+        pinned: pinned.has(record.id),
+        ...(record.manifest.displayName ? { displayName: record.manifest.displayName } : {}),
+      });
+    }
+  }
+  return out.sort((a, b) => a.pluginId.localeCompare(b.pluginId) || a.id.localeCompare(b.id));
+}
+
+function servePluginStatic(res: ServerResponse, pathname: string): boolean {
+  const match = pathname.match(/^\/plugins\/([^/]+)\/(.+)$/);
+  if (!match) return false;
+  const pluginId = decodeURIComponent(match[1]);
+  const relPath = decodeURIComponent(match[2]);
+  const record = readPluginRegistry().plugins[pluginId];
+  if (!record) return false;
+  const dashboardEntries = dashboardEntriesForRecord(record);
+  const allowed = dashboardEntries.some((entry) => {
+    const base = entry.entry.replace(/\/[^/]*$/, '/');
+    return relPath === entry.entry || relPath.startsWith(base);
+  });
+  if (!allowed) return false;
+  try {
+    return serveFileAbs(res, resolvePluginPath(pluginRuntimeDir(pluginId), relPath, 'dashboard_asset'));
+  } catch {
+    return false;
+  }
+}
+
+function addPluginId(list: unknown, pluginId: string): string[] {
+  const current = normalizePluginIdList(list) ?? [];
+  return current.includes(pluginId) ? current : [...current, pluginId];
+}
+
+function removePluginId(list: unknown, pluginId: string): string[] {
+  return (normalizePluginIdList(list) ?? []).filter(id => id !== pluginId);
+}
+
+function pluginEnabledPatch(body: unknown): boolean | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const enabled = (body as { enabled?: unknown }).enabled;
+  return typeof enabled === 'boolean' ? enabled : null;
+}
+
+function pluginPinnedPatch(body: unknown): boolean | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const pinned = (body as { pinned?: unknown }).pinned;
+  return typeof pinned === 'boolean' ? pinned : null;
+}
+
+function writeDashboardPluginPin(pluginId: string, pinned: boolean): void {
+  const current = normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? [];
+  const next = pinned ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+  mergeDashboardConfig({ pinnedPlugins: next });
+}
+
+function requireInstalledPlugin(pluginId: string): InstalledPluginRecord | null {
+  if (!isValidPluginId(pluginId)) return null;
+  return readPluginRegistry().plugins[pluginId] ?? null;
+}
+
+function cleanPluginListForInstalled(list: unknown, installed: Set<string>): string[] {
+  return (normalizePluginIdList(list) ?? []).filter(id => installed.has(id));
+}
+
+function latestGatewayDiagnostics(): Map<string, unknown[]> {
+  const root = join(config.session.dataDir, 'mcp-gateway');
+  const byPlugin = new Map<string, unknown[]>();
+  if (!existsSync(root)) return byPlugin;
+  let files: string[] = [];
+  try {
+    files = readdirSync(root)
+      .filter(file => file.endsWith('.json'))
+      .sort((a, b) => statSync(join(root, b)).mtimeMs - statSync(join(root, a)).mtimeMs)
+      .slice(0, 50);
+  } catch { return byPlugin; }
+  const seen = new Set<string>();
+  for (const file of files) {
+    try {
+      const parsed = JSON.parse(readFileSync(join(root, file), 'utf-8'));
+      for (const server of Array.isArray(parsed?.servers) ? parsed.servers : []) {
+        const pluginId = typeof server?.pluginId === 'string' ? server.pluginId : '';
+        const serverName = typeof server?.serverName === 'string' ? server.serverName : '';
+        if (!pluginId || !serverName) continue;
+        const key = `${pluginId}\0${serverName}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const bucket = byPlugin.get(pluginId) ?? [];
+        bucket.push({ ...server, sessionId: parsed.sessionId, generatedAt: parsed.generatedAt });
+        byPlugin.set(pluginId, bucket);
+      }
+    } catch { /* one corrupt diagnostic must not hide the plugin page */ }
+  }
+  return byPlugin;
+}
+
+async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
+  const registryFile = readPluginRegistry();
+  const installed = new Set(Object.keys(registryFile.plugins));
+  const globalPlugins = cleanPluginListForInstalled(readGlobalConfig().plugins, installed);
+  const globalSet = new Set(globalPlugins);
+  const pinnedSet = new Set(normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? []);
+  let botConfigs: BotConfig[] = [];
+  try { botConfigs = loadBotConfigs(); } catch { /* setup can render before bots.json exists */ }
+  const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
+  const bots = botConfigs.map((bot, index) => {
+    return {
+      id: bot.larkAppId,
+      name: bot.displayName || onlineByAppId.get(bot.larkAppId)?.botName || bot.name || `Bot ${index + 1}`,
+      plugins: resolveEffectivePluginIds(bot, { plugins: globalPlugins }),
+    };
+  });
+  const gatewayAdapters = [...new Map(botConfigs.map(bot => {
+    const adapter = createCliAdapterSync(bot.cliId, bot.cliPathOverride);
+    return [adapter.id, inspectGatewayEntry(adapter)] as const;
+  })).values()];
+  const gatewayDiagnostics = latestGatewayDiagnostics();
+  const serviceReports = await listPluginServiceStatus();
+  const serviceByPlugin = new Map<string, typeof serviceReports>();
+  for (const report of serviceReports) {
+    const bucket = serviceByPlugin.get(report.pluginId) ?? [];
+    bucket.push(report);
+    serviceByPlugin.set(report.pluginId, bucket);
+  }
+  const plugins = Object.values(registryFile.plugins)
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map(record => ({
+      id: record.id,
+      packageName: record.packageName,
+      version: record.version,
+      source: record.source,
+      installedAt: record.installedAt,
+      updatedAt: record.updatedAt,
+      displayName: record.manifest.displayName,
+      dependencies: record.manifest.dependencies?.plugins ?? [],
+      contributions: record.contributions ?? {},
+      skillsCount: record.contributions?.skills?.length ?? (record.manifest as any).skills?.length ?? 0,
+      mcpCount: record.contributions?.mcp ? 1 : 0,
+      dashboard: dashboardEntriesForRecord(record).map(entry => ({
+        ...entry,
+        url: `/plugins/${encodeURIComponent(record.id)}/${entry.entry}`,
+      })),
+      service: record.manifest.service,
+      serviceReport: serviceByPlugin.get(record.id)?.[0],
+      pinnedToSidebar: pinnedSet.has(record.id) && dashboardEntriesForRecord(record).length > 0,
+      enabledGlobal: globalSet.has(record.id),
+      enabledByBot: Object.fromEntries(bots.map(bot => [bot.id, bot.plugins.includes(record.id)])),
+      gatewayAdapters,
+      mcpDiagnostics: gatewayDiagnostics.get(record.id) ?? [],
+    }));
+  return { plugins, globalPlugins, bots, gatewayAdapters };
+}
+
+function writeGlobalPluginBinding(pluginId: string, enabled: boolean): void {
+  const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+  assertPluginBindingTransition(pluginId, enabled, current);
+  if (enabled) materializePlugin(pluginId);
+  const next = enabled ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+  mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
+}
+
+async function writeBotPluginBinding(pluginId: string, larkAppId: string, enabled: boolean): Promise<boolean> {
+  try { loadBotConfigs(); } catch { return false; }
+  const path = requireConfigPath();
+  const defaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+  return withFileLock(path, async () => {
+    const raw = await readRawConfig(path);
+    const index = findEntryIndex(raw, larkAppId);
+    if (index < 0) return false;
+    const entry = raw[index];
+    const current = Object.prototype.hasOwnProperty.call(entry, 'plugins') ? entry.plugins : undefined;
+    const effective = resolveEffectivePluginIds(
+      { plugins: normalizePluginIdList(current) ?? [] },
+      { plugins: defaults },
+    );
+    assertPluginBindingTransition(pluginId, enabled, effective);
+    if (enabled) materializePlugin(pluginId);
+    const next = updateBotPluginOverride(current, pluginId, enabled);
+    if (next.length > 0) entry.plugins = next;
+    else delete entry.plugins;
+    await writeRawConfigAtomic(path, raw);
+    return true;
+  });
+}
+
+function pluginJson(res: ServerResponse, status: number, body: unknown): true {
+  jsonRes(res, status, body);
+  return true;
+}
+
+async function handlePluginManagementApi(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+): Promise<boolean> {
+  if (req.method === 'GET' && url.pathname === '/api/plugins') {
+    return pluginJson(res, 200, await listDashboardPluginsPayload());
+  }
+
+  let match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/pin$/);
+  if (match) {
+    if (req.method !== 'PUT') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    const record = requireInstalledPlugin(pluginId);
+    if (!record) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    if (dashboardEntriesForRecord(record).length === 0) {
+      return pluginJson(res, 409, { ok: false, error: 'plugin_dashboard_not_found' });
+    }
+    let body: unknown;
+    try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
+    const pinned = pluginPinnedPatch(body);
+    if (pinned === null) return pluginJson(res, 400, { ok: false, error: 'invalid_pinned' });
+    writeDashboardPluginPin(pluginId, pinned);
+    return pluginJson(res, 200, { ok: true, ...(await listDashboardPluginsPayload()) });
+  }
+
+  match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/global$/);
+  if (match) {
+    if (req.method !== 'PUT') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    let body: unknown;
+    try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
+    const enabled = pluginEnabledPatch(body);
+    if (enabled === null) return pluginJson(res, 400, { ok: false, error: 'invalid_enabled' });
+    try {
+      writeGlobalPluginBinding(pluginId, enabled);
+    } catch (error) {
+      const message = describePluginDependencyError(error);
+      if (message) return pluginJson(res, 409, { ok: false, error: message });
+      throw error;
+    }
+    return pluginJson(res, 200, { ok: true, ...(await listDashboardPluginsPayload()) });
+  }
+
+  match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/bots\/([^/]+)$/);
+  if (match) {
+    if (req.method !== 'PUT') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    const larkAppId = decodeURIComponent(match[2]);
+    if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    let body: unknown;
+    try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
+    const enabled = pluginEnabledPatch(body);
+    if (enabled === null) return pluginJson(res, 400, { ok: false, error: 'invalid_enabled' });
+    if ((normalizePluginIdList(readGlobalConfig().plugins) ?? []).includes(pluginId)) {
+      return pluginJson(res, 409, {
+        ok: false,
+        error: `插件 ${pluginId} 已全局启用；请先关闭全局启用，再按 Bot 配置。`,
+      });
+    }
+    try {
+      if (!await writeBotPluginBinding(pluginId, larkAppId, enabled)) {
+        return pluginJson(res, 404, { ok: false, error: 'bot_not_found' });
+      }
+    } catch (error) {
+      const message = describePluginDependencyError(error);
+      if (message) return pluginJson(res, 409, { ok: false, error: message });
+      throw error;
+    }
+    return pluginJson(res, 200, { ok: true, ...(await listDashboardPluginsPayload()) });
+  }
+
+  match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/services\/(start|stop|restart)$/);
+  if (match) {
+    if (req.method !== 'POST') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    const action = match[2];
+    if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    const reports = action === 'start'
+      ? await startPluginServices([pluginId])
+      : action === 'restart'
+        ? [...await stopPluginServices([pluginId]), ...await startPluginServices([pluginId])]
+        : await stopPluginServices([pluginId]);
+    return pluginJson(res, 200, { ok: true, reports, ...(await listDashboardPluginsPayload()) });
+  }
+
+  return false;
+}
+
 // ─── HTTP routing ────────────────────────────────────────────────────────────
 
 function authedToken(req: IncomingMessage, url: URL): string | undefined {
@@ -1680,6 +1985,20 @@ const server = createServer(async (req, res) => {
       }, 500);
       req.on('close', () => clearInterval(timer));
       return;
+    }
+
+    if ((url.pathname === '/api/plugins' || url.pathname.startsWith('/api/plugins/'))
+      && await handlePluginManagementApi(req, res, url)) {
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/plugins/dashboard') {
+      return jsonRes(res, 200, { plugins: listDashboardPluginEntries() });
+    }
+
+    if (req.method === 'GET' && url.pathname.startsWith('/plugins/')) {
+      if (servePluginStatic(res, url.pathname)) return;
+      res.writeHead(404); res.end(); return;
     }
 
     // ─── Static frontend (index.html + /assets/* + /game/* + root icons) ───

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../../config.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
@@ -25,4 +25,8 @@ export function readSessionSkillManifest(sessionId: string): SessionSkillManifes
   } catch {
     return null;
   }
+}
+
+export function removeSessionSkillManifest(sessionId: string): void {
+  rmSync(manifestPath(sessionId), { force: true });
 }

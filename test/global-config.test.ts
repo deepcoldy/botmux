@@ -61,6 +61,16 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard).toEqual({ chatBotDiscovery: false });
   });
 
+  it('reads pinned plugin dashboards as a sanitized machine-wide preference', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { pinnedPlugins: ['demo-addon', 'bad/id', 'demo-addon', 'agent-chrome'] },
+    }));
+
+    expect(readGlobalConfig().dashboard?.pinnedPlugins).toEqual(['demo-addon', 'agent-chrome']);
+    mergeDashboardConfig({ pinnedPlugins: ['agent-chrome'] });
+    expect(readGlobalConfig().dashboard?.pinnedPlugins).toEqual(['agent-chrome']);
+  });
+
   it('reads repoPickerMode as a top-level global enum', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       repoPickerMode: 'repos',
@@ -104,6 +114,14 @@ describe('global dashboard config', () => {
     mergeGlobalConfig({ vcMeetingAgent: { enabled: true, listenerBotAppId: ' cli_listener ' } });
     expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: true, listenerBotAppId: 'cli_listener' });
     expect(globalVcMeetingAgentListenerBotAppId()).toBe('cli_listener');
+  });
+
+  it('reads global plugin defaults as a sanitized id list', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      plugins: ['agent-chrome', 'bad/id', 'agent-chrome', 'gitlab'],
+    }));
+
+    expect(readGlobalConfig().plugins).toEqual(['agent-chrome', 'gitlab']);
   });
 
   it('readGlobalConfig sees fresh values immediately after a merge (cache invalidation)', () => {
