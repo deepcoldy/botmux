@@ -158,6 +158,64 @@ describe('webhook route verification helpers', () => {
 });
 
 describe('webhook token mode', () => {
+  it('records one auditable, credential-redacted entry for successful and rejected calls', async () => {
+    await startWebhookServer();
+    const connector = await seedTokenConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({
+      ...connector,
+      loggingPolicy: { storePayload: true, storeHeaders: true, retentionDays: 14 },
+    });
+
+    const ok = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value?token=query-secret&chatId=oc_query`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer header-secret',
+        'x-api-key': 'api-secret',
+      },
+      body: JSON.stringify({ alert: 'disk-full', password: 'body-secret', nested: { accessToken: 'nested-secret' } }),
+    });
+    expect(ok.status).toBe(200);
+    const rejected = await fetch(`${baseUrl}/webhook/conn_token/wrong-token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ alert: 'still-recorded' }),
+    });
+    expect(rejected.status).toBe(401);
+
+    const { listTriggerLogs } = await import('../src/services/trigger-log-store.js');
+    const logs = listTriggerLogs({ limit: 10 }, dataDir);
+    expect(logs).toHaveLength(2);
+    expect(logs[0]).toMatchObject({
+      connectorId: 'conn_token',
+      status: 'error',
+      errorCode: 'invalid_signature',
+      request: {
+        method: 'POST',
+        path: '/webhook/conn_token/[REDACTED]',
+        payload: { alert: 'still-recorded' },
+      },
+      response: { httpStatus: 401 },
+    });
+    expect(logs[1]).toMatchObject({
+      connectorId: 'conn_token',
+      status: 'ok',
+      request: {
+        path: '/webhook/conn_token/[REDACTED]',
+        query: { token: '[REDACTED]', chatId: 'oc_query' },
+        headers: { authorization: '[REDACTED]', 'x-api-key': '[REDACTED]' },
+        payload: { alert: 'disk-full', password: '[REDACTED]', nested: { accessToken: '[REDACTED]' } },
+        payloadStored: true,
+      },
+      target: { kind: 'turn', mode: 'fixed', botId: 'app1', chatId: 'oc_fixed' },
+      response: { httpStatus: 200 },
+    });
+    expect(JSON.stringify(logs)).not.toContain('tok_plain_value');
+    expect(JSON.stringify(logs)).not.toContain('query-secret');
+    expect(JSON.stringify(logs)).not.toContain('body-secret');
+  });
+
   it('accepts the token embedded in the path and dispatches', async () => {
     await startWebhookServer();
     await seedTokenConnector();

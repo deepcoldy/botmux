@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -38,6 +39,7 @@ import {
   injectOptimisticChat,
   isValidProfileId,
   loadGroupRoleProfileContext,
+  paginateGroupRows,
   roleKey,
   roleProfileBootstrapStatus,
   summarizeAddBotsResult,
@@ -238,7 +240,7 @@ function GroupBotCoverage(props: { chat: GroupChat; bots: GroupBot[]; tr: Transl
   );
 }
 
-function GroupListRow(props: {
+const GroupListRow = memo(function GroupListRow(props: {
   chat: GroupChat;
   bots: GroupBot[];
   roleContext: RoleProfileContext;
@@ -285,7 +287,7 @@ function GroupListRow(props: {
       </div>
     </OverviewListItem>
   );
-}
+});
 
 function CreateDialog(props: {
   bots: GroupBot[];
@@ -1154,6 +1156,7 @@ function GroupsPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [dialog, setDialog] = useState<DialogState | null>(null);
+  const [page, setPage] = useState(1);
 
   const setSnapshot = useCallback((next: GroupsSnapshot | ((cur: GroupsSnapshot) => GroupsSnapshot)) => {
     setSnapshotState(cur => {
@@ -1252,6 +1255,14 @@ function GroupsPage() {
     () => filterGroupChats(snapshot.chats, filters),
     [snapshot.chats, filters],
   );
+  const pageWindow = useMemo(
+    () => paginateGroupRows(rows, page),
+    [rows, page],
+  );
+
+  useEffect(() => {
+    if (page !== pageWindow.page) setPage(pageWindow.page);
+  }, [page, pageWindow.page]);
 
   async function refresh(): Promise<void> {
     setRefreshing(true);
@@ -1289,7 +1300,7 @@ function GroupsPage() {
     void refreshUntilSeen(chatId, expectedBotIds).catch(() => { /* tolerate */ });
   }
 
-  function openAddBotsDialog(chat: GroupChat): void {
+  const openAddBotsDialog = useCallback((chat: GroupChat): void => {
     const inChatSet = new Set((chat.memberBots ?? []).filter(member => member.inChat).map(member => member.larkAppId));
     const missing = snapshotRef.current.bots.filter(bot => !inChatSet.has(bot.larkAppId));
     if (!missing.length) {
@@ -1297,14 +1308,24 @@ function GroupsPage() {
       return;
     }
     setDialog({ type: 'add-bots', chat });
-  }
+  }, []);
 
-  function openSaveProfileDialog(chat: GroupChat): void {
+  const openSaveProfileDialog = useCallback((chat: GroupChat): void => {
     const suggestedByName = suggestRoleProfileIdFromChat(chat.name ?? '');
     const suggestedProfileId = suggestedByName === 'profile'
       ? suggestRoleProfileIdFromChat(chat.chatId)
       : suggestedByName;
     setDialog({ type: 'save-profile', chat, suggestedProfileId });
+  }, []);
+
+  const openManageDialog = useCallback((chat: GroupChat): void => {
+    setDialog({ type: 'manage', chat });
+  }, []);
+
+  function goToPage(nextPage: number): void {
+    const list = document.getElementById('g-body');
+    if (list) list.scrollTop = 0;
+    setPage(nextPage);
   }
 
   return (
@@ -1326,6 +1347,7 @@ function GroupsPage() {
           value={filters.q}
           onChange={ev => {
             const q = ev.currentTarget.value;
+            setPage(1);
             setFilters(cur => ({ ...cur, q }));
           }}
         />
@@ -1336,6 +1358,7 @@ function GroupsPage() {
             checked={filters.missingOnly}
             onChange={ev => {
               const missingOnly = ev.currentTarget.checked;
+              setPage(1);
               setFilters(cur => ({ ...cur, missingOnly }));
             }}
           />
@@ -1358,7 +1381,7 @@ function GroupsPage() {
               <div className="empty groups-list-empty" id="g-body">{tr('groups.empty')}</div>
             ) : (
               <OverviewList id="g-body" className="groups-list">
-                {rows.map(chat => (
+                {pageWindow.rows.map(chat => (
                   <GroupListRow
                     chat={chat}
                     bots={snapshot.bots}
@@ -1367,11 +1390,36 @@ function GroupsPage() {
                     key={chat.chatId}
                     onAddBots={openAddBotsDialog}
                     onSaveProfile={openSaveProfileDialog}
-                    onManage={chat => setDialog({ type: 'manage', chat })}
+                    onManage={openManageDialog}
                   />
                 ))}
               </OverviewList>
             )}
+            {rows.length > 0 && pageWindow.totalPages > 1 ? (
+              <nav className="groups-pagination" aria-label={tr('groups.paginationLabel')}>
+                <span className="groups-pagination-status" aria-live="polite">
+                  {tr('groups.pageStatus', {
+                    page: pageWindow.page,
+                    pages: pageWindow.totalPages,
+                    from: pageWindow.from,
+                    to: pageWindow.to,
+                    total: pageWindow.total,
+                  })}
+                </span>
+                <div className="groups-pagination-actions">
+                  <button
+                    type="button"
+                    disabled={pageWindow.page <= 1}
+                    onClick={() => goToPage(pageWindow.page - 1)}
+                  >{tr('groups.prevPage')}</button>
+                  <button
+                    type="button"
+                    disabled={pageWindow.page >= pageWindow.totalPages}
+                    onClick={() => goToPage(pageWindow.page + 1)}
+                  >{tr('groups.nextPage')}</button>
+                </div>
+              </nav>
+            ) : null}
           </div>
         )}
       </section>

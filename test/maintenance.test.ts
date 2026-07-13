@@ -8,7 +8,7 @@ import {
   writeMaintenanceStateTo,
   buildRestartLauncher,
   maintenanceRestartLogPath,
-  npmGlobalUpdateCwd,
+  globalInstallUpdateCwd,
   type MaintenanceDeps,
   type MaintenanceState,
 } from '../src/core/maintenance.js';
@@ -171,11 +171,11 @@ describe('maintenanceRestartLogPath', () => {
   });
 });
 
-describe('npmGlobalUpdateCwd', () => {
+describe('globalInstallUpdateCwd', () => {
   afterEach(() => vi.unstubAllEnvs());
   it('runs npm global updates from HOME instead of inheriting the process cwd', () => {
     vi.stubEnv('HOME', '/home/bot');
-    expect(npmGlobalUpdateCwd()).toBe('/home/bot');
+    expect(globalInstallUpdateCwd()).toBe('/home/bot');
   });
 });
 

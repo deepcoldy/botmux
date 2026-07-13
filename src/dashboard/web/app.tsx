@@ -155,6 +155,9 @@ function isActiveNav(item: NavItem, hash: string): boolean {
   ) {
     return true;
   }
+  if (item.id === 'connectors' && (current === '#/webhook-logs' || current.startsWith('#/webhook-logs?') || current.startsWith('#/webhook-logs/'))) {
+    return true;
+  }
   return item.href === current || (
     item.href !== '#/' && (current.startsWith(`${item.href}?`) || current.startsWith(`${item.href}/`))
   );
@@ -540,6 +543,7 @@ async function loadAuthState(): Promise<void> {
       isAuthed = !!j.authed;
       ui.authed = isAuthed;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
+      ui.publicReadOnly = publicReadOnly;
       const serverLocale = normalizeDashboardLocale(j.lang);
       if (serverLocale) ui.setLocale(serverLocale);
     }

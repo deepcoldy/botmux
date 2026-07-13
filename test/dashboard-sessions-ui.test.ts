@@ -7,7 +7,9 @@ import {
   CLI_FILTER_OPTIONS,
   isUnknownChatSession,
   restartConfirmMessage,
+  historySenderKey,
   sessionLocationText,
+  shouldOpenWritableTerminal,
 } from '../src/dashboard/web/sessions.js';
 import { CliFilterGroup } from '../src/dashboard/web/sessions-page.js';
 
@@ -20,6 +22,7 @@ const kanbanCallbacks: SessionsKanbanCallbacks = {
     history: '<svg></svg>',
     lock: '<svg></svg>',
     restart: '<svg></svg>',
+    terminal: '<svg></svg>',
     unlock: '<svg></svg>',
   },
   lockActionLabel: row => (row.locked ? 'unlock' : 'lock'),
@@ -34,6 +37,8 @@ const kanbanCallbacks: SessionsKanbanCallbacks = {
   onRestart: () => {},
   onTeamScope: () => {},
   onToggleLock: () => {},
+  onToggleSelect: () => {},
+  selectedSessionIds: new Set<string>(),
 };
 
 function renderKanban(state: Partial<SessionsKanbanState>): string {
@@ -95,6 +100,19 @@ describe('dashboard sessions filters', () => {
     expect(isUnknownChatSession(row, () => 'SellerIM Agent 集中营')).toBe(false);
     expect(isUnknownChatSession(namedDirect)).toBe(false);
     expect(isUnknownChatSession({}, () => null)).toBe(false);
+  });
+
+  it('groups consecutive app/bot history records by sender identity', () => {
+    expect(historySenderKey({ senderType: 'app', senderId: 'ou_bot' }))
+      .toBe(historySenderKey({ senderType: 'bot', senderId: 'ou_bot' }));
+    expect(historySenderKey({ senderType: 'bot', senderId: 'ou_other' }))
+      .not.toBe(historySenderKey({ senderType: 'bot', senderId: 'ou_bot' }));
+  });
+
+  it('defaults terminal entry to writable unless public read-only sharing is enabled', () => {
+    expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: false })).toBe(true);
+    expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: true })).toBe(false);
+    expect(shouldOpenWritableTerminal({ authed: false, publicReadOnly: true })).toBe(false);
   });
 
   it('renders the CLI filter as a multi-select checkbox group, not a dropdown', () => {
@@ -163,8 +181,10 @@ describe('dashboard sessions kanban react view', () => {
       ],
     });
 
-    expect(html).toContain('class="kanban-cluster"');
+    expect(html).toContain('class="kanban-cluster collapsed"');
     expect(html).toContain('data-chat="oc_1"');
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).not.toContain('data-id="cluster-a"');
     expect((html.match(/data-id="closed-/g) ?? []).length).toBe(50);
     expect(html).toContain('还有 5 个未显示');
   });

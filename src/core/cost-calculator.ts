@@ -66,6 +66,34 @@ function pickNum(obj: any, keys: readonly string[]): number {
   return 0;
 }
 
+interface PartitionedInputTokens {
+  rawInputTokens: number;
+  inputTokens: number;
+  cacheReadTokens: number;
+  cacheCreateTokens: number;
+}
+
+/** Partition a provider's cache-inclusive input total into mutually exclusive
+ *  accounting buckets. Cache read consumes the raw total first, then cache
+ *  creation consumes only the remainder; malformed counters cannot make the
+ *  three buckets exceed the provider's raw input total. */
+function partitionInclusiveInputTokens(
+  rawInput: number,
+  reportedCacheRead: number,
+  reportedCacheCreate: number,
+): PartitionedInputTokens {
+  const rawInputTokens = Math.max(0, rawInput);
+  const cacheReadTokens = Math.min(rawInputTokens, Math.max(0, reportedCacheRead));
+  const afterCacheRead = rawInputTokens - cacheReadTokens;
+  const cacheCreateTokens = Math.min(afterCacheRead, Math.max(0, reportedCacheCreate));
+  return {
+    rawInputTokens,
+    inputTokens: afterCacheRead - cacheCreateTokens,
+    cacheReadTokens,
+    cacheCreateTokens,
+  };
+}
+
 function extractNativeUsage(entry: any): { usage: any; model?: string } | null {
   const candidates = [
     { usage: entry?.message?.usage, model: entry?.message?.model },
@@ -91,16 +119,23 @@ function extractCodexTokenCountUsage(entry: any): SessionTokenUsage | null {
   if (entry?.type !== 'event_msg' || entry?.payload?.type !== 'token_count') return null;
   const u = entry.payload?.info?.total_token_usage;
   if (!u || typeof u !== 'object') return null;
-  const inputTokens = pickNum(u, ['input_tokens', 'inputTokens']);
+  // Codex-compatible token_count snapshots define input_tokens as the whole
+  // prompt-side total: cached tokens are a subset, not an additional bucket.
+  // Keep the raw total in `in` for the dashboard, while the accounting fields
+  // are mutually exclusive so ledger consumers can safely sum them.
   const outputTokens = pickNum(u, ['output_tokens', 'outputTokens']);
-  const cacheReadTokens = pickNum(u, ['cached_input_tokens', 'cachedInputTokens']);
+  const { rawInputTokens, inputTokens, cacheReadTokens, cacheCreateTokens } = partitionInclusiveInputTokens(
+    pickNum(u, ['input_tokens', 'inputTokens']),
+    pickNum(u, ['cached_input_tokens', 'cachedInputTokens', 'cache_read_input_tokens', 'cacheReadInputTokens']),
+    pickNum(u, ['cache_creation_input_tokens', 'cacheCreationInputTokens', 'cache_write_input_tokens', 'cacheWriteInputTokens']),
+  );
   return {
-    in: inputTokens,
+    in: rawInputTokens,
     out: outputTokens,
     inputTokens,
     outputTokens,
     cacheReadTokens,
-    cacheCreateTokens: 0,
+    cacheCreateTokens,
     model: '',
     turns: 0,
   };
@@ -467,6 +502,7 @@ export function readSessionTokenUsageFile(path: string, kind: CachedUsageKind, o
 }
 
 function readTokenUsageFromAidenCheckpoint(path: string): SessionTokenUsage | null {
+  let rawInputTokens = 0;
   let inputTokens = 0;
   let outputTokens = 0;
   let cacheReadTokens = 0;
@@ -484,16 +520,20 @@ function readTokenUsageFromAidenCheckpoint(path: string): SessionTokenUsage | nu
       if (msg?.type === 'human' || msg?.type === 'tool') continue;
       const u = msg?.usage_metadata ?? msg?.usage;
       if (!u || typeof u !== 'object') continue;
-      const input = pickNum(u, ['input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens']);
+      const rawInput = pickNum(u, ['input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens']);
       const output = pickNum(u, ['output_tokens', 'outputTokens', 'completion_tokens', 'completionTokens']);
-      inputTokens += input;
-      outputTokens += output;
-      cacheReadTokens +=
+      const reportedCacheRead =
         pickNum(u?.input_token_details, ['cache_read', 'cached_tokens', 'cacheRead']) +
         pickNum(u?.input_tokens_details, ['cache_read', 'cached_tokens', 'cacheRead']);
-      cacheCreateTokens +=
+      const reportedCacheCreate =
         pickNum(u?.input_token_details, ['cache_creation', 'cache_write', 'cacheCreate']) +
         pickNum(u?.input_tokens_details, ['cache_creation', 'cache_write', 'cacheCreate']);
+      const partitioned = partitionInclusiveInputTokens(rawInput, reportedCacheRead, reportedCacheCreate);
+      rawInputTokens += partitioned.rawInputTokens;
+      inputTokens += partitioned.inputTokens;
+      outputTokens += output;
+      cacheReadTokens += partitioned.cacheReadTokens;
+      cacheCreateTokens += partitioned.cacheCreateTokens;
       if (!model && typeof msg?.response_metadata?.model_name === 'string') model = msg.response_metadata.model_name;
       turns++;
     }
@@ -504,7 +544,7 @@ function readTokenUsageFromAidenCheckpoint(path: string): SessionTokenUsage | nu
 
   if (turns === 0) return null;
   return {
-    in: inputTokens,
+    in: rawInputTokens,
     out: outputTokens,
     inputTokens,
     outputTokens,

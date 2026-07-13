@@ -12,6 +12,8 @@ export interface ParsedSkillInstallSource {
  *  auth lives here — the daemon host's configured `agentbuddy` binary owns that,
  *  so the public source never carries an internal domain. */
 export interface AgentbuddySource {
+  /** agentbuddy protocol — `skill` (default) or `plugin`. */
+  protocol?: 'skill' | 'plugin';
   collection?: string;
   group?: string;
   skill?: string;
@@ -152,37 +154,81 @@ function assertSafeAgentbuddyGroup(group: string): void {
   }
 }
 
-/** Parse `agentbuddy:<group>/<skill>[@version]` or `agentbuddy:collection/<uid>`.
- *  Tolerates the marketplace identifier's `skills:` prefix (e.g. a pasted
- *  `agentbuddy:skills:example.com/team/mkt/my-skill`). */
-export function parseAgentbuddySource(raw: string): AgentbuddySource {
-  let rest = raw.slice('agentbuddy:'.length).trim().replace(/^skills:/, '');
-  if (!rest) throw new Error('invalid_agentbuddy_source');
-  if (rest.startsWith('collection/')) {
-    const uid = rest.slice('collection/'.length);
-    assertSafeAgentbuddyToken(uid, 'collection');
-    return { collection: uid };
+/** Parse a pasted agentbuddy install command into an agentbuddy source.
+ *  Accepts the exact copy-command the marketplace shows, e.g.:
+ *    agentbuddy skill collection add <uid>
+ *    agentbuddy plugin collection add <uid>
+ *    agentbuddy skill add <group> --skill <name> [--version <v>]
+ *  and tolerates a leading `KEY=VALUE … npx [-y] agentbuddy@latest …` prefix
+ *  (the env + runner the site prepends). Only install subcommands (`add`,
+ *  `collection add`) of `skill`/`plugin` are accepted — other agentbuddy
+ *  subcommands (publish/remove/login/…) return null so a stray command can't
+ *  drive the CLI. Returns null for anything that isn't such a command. */
+export function parseAgentbuddyCommand(raw: string): AgentbuddySource | null {
+  const tokens = raw.trim().split(/\s+/).filter(Boolean);
+  const binIdx = tokens.findIndex((t) => t === 'agentbuddy' || t.startsWith('agentbuddy@'));
+  if (binIdx < 0) return null;
+  // Drop the user's own -y/--yes (install always adds its own); keep the rest
+  // positional so the structured shape below reads cleanly.
+  const rest = tokens.slice(binIdx + 1).filter((t) => t !== '-y' && t !== '--yes');
+  const protocol = rest[0];
+  if (protocol !== 'skill' && protocol !== 'plugin') return null;
+  // <protocol> collection add <uid>
+  if (rest[1] === 'collection' && rest[2] === 'add' && rest[3]) {
+    assertSafeAgentbuddyToken(rest[3], 'collection');
+    return { protocol, collection: rest[3] };
   }
-  let version: string | undefined;
-  const at = rest.lastIndexOf('@');
-  if (at > 0) {
-    version = rest.slice(at + 1);
-    rest = rest.slice(0, at);
-    assertSafeAgentbuddyToken(version, 'version', AGENTBUDDY_VERSION_RE);
+  // <protocol> add <group> --skill <name> [--version <v>]
+  if (rest[1] === 'add' && rest[2] && !rest[2].startsWith('-')) {
+    const group = rest[2];
+    const skillIdx = Math.max(rest.indexOf('--skill'), rest.indexOf('-s'));
+    const skill = skillIdx >= 0 ? rest[skillIdx + 1] : undefined;
+    if (!skill) return null;
+    const verIdx = Math.max(rest.indexOf('--version'), rest.indexOf('-v'));
+    const version = verIdx >= 0 ? rest[verIdx + 1] : undefined;
+    assertSafeAgentbuddyGroup(group);
+    assertSafeAgentbuddyToken(skill, 'skill');
+    if (version) assertSafeAgentbuddyToken(version, 'version', AGENTBUDDY_VERSION_RE);
+    return { protocol, group, skill, ...(version ? { version } : {}) };
   }
-  const slash = rest.lastIndexOf('/');
-  if (slash <= 0 || slash === rest.length - 1) throw new Error('invalid_agentbuddy_source');
-  const group = rest.slice(0, slash);
-  const skill = rest.slice(slash + 1);
-  assertSafeAgentbuddyGroup(group);
-  assertSafeAgentbuddyToken(skill, 'skill');
-  return { group, skill, ...(version ? { version } : {}) };
+  return null;
+}
+
+/** Recognize the open-source `skills` CLI (vercel-labs/skills) add command and
+ *  route its GitHub source into botmux's native GitHub/Git install — no extra
+ *  dependency, and public repos need no auth. Accepts:
+ *    skills add <owner/repo>              (also the `add-skill <owner/repo>` bin)
+ *    npx [-y] skills[@latest] add <owner/repo>
+ *  where <owner/repo> is a GitHub shorthand or a GitHub/Git URL. Returns null
+ *  for anything that isn't such a command. */
+export function parseSkillsInstallCommand(raw: string): ParsedSkillInstallSource | null {
+  const tokens = raw.trim().split(/\s+/).filter(Boolean);
+  const binIdx = tokens.findIndex((t) => t === 'skills' || t === 'add-skill' || t.startsWith('skills@'));
+  if (binIdx < 0) return null;
+  const bin = tokens[binIdx];
+  const rest = tokens.slice(binIdx + 1).filter((t) => t !== '-y' && t !== '--yes');
+  const source = rest[0] === 'add'
+    ? rest[1]
+    : (bin === 'add-skill' && rest[0] && !rest[0].startsWith('-') ? rest[0] : undefined);
+  if (!source) return null;
+  // Bare owner/repo[/path] → GitHub shorthand; explicit URLs pass through.
+  const hasScheme = source.includes('://') || /^[A-Za-z0-9._-]+@[^/]+:/.test(source);
+  const normalized = !hasScheme && /^[A-Za-z0-9][\w.-]*\/[\w./-]+$/.test(source) ? `github:${source}` : source;
+  try {
+    const parsed = parseSkillInstallSource(normalized);
+    return parsed.kind === 'github' || parsed.kind === 'git' ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 export function parseSkillInstallSource(raw: string): ParsedSkillInstallSource {
-  if (raw.startsWith('agentbuddy:')) {
-    return { kind: 'agentbuddy', value: raw, agentbuddy: parseAgentbuddySource(raw) };
+  const command = parseAgentbuddyCommand(raw);
+  if (command) {
+    return { kind: 'agentbuddy', value: raw, agentbuddy: command };
   }
+  const skillsCommand = parseSkillsInstallCommand(raw);
+  if (skillsCommand) return skillsCommand;
   if (raw.startsWith('github:')) {
     const rest = raw.slice('github:'.length);
     const parts = rest.split('/').filter(Boolean);

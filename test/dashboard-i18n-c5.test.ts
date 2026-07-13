@@ -265,11 +265,13 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.settings.maintenance.time_display',
   'card.dashboard.settings.footer.security',
   'settings.autoUpdate.disabled.localDev',
+  'settings.autoUpdate.disabled.unsupportedInstall',
   'settings.autoRestart.disabled.needsAutoUpdate',
 
   // ─── PR1 model DTO labelKey/hintKey/sectionTitle (consumed at card build) ─
   'settings.readOnlyVisitor',
   'settings.autoUpdateLocalDev',
+  'settings.autoUpdateUnsupportedInstall',
   'settings.sectionAccess',
   'settings.sectionCards',
   'settings.sectionMaintenance',

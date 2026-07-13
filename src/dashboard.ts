@@ -46,11 +46,19 @@ import { invalidateGlobalConfigCache, mergeGlobalConfig, readGlobalConfig, type 
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import { buildDashboardUrls, type DashboardUrls } from './core/dashboard-url.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
-import { isLocalDevInstall, botmuxVersion, botmuxCliEntry } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxInstallRoot } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
 import { fetchLatestVersion, fetchReleasesSince, isNewerVersion, type ChangelogResult } from './core/update-check.js';
 import { GITHUB_REPO } from './core/restart-report.js';
-import { spawnDetachedRestart, npmGlobalUpdateLockTarget, npmGlobalUpdateCwd } from './core/maintenance.js';
+import { spawnDetachedRestart, globalInstallUpdateLockTarget, globalInstallUpdateCwd } from './core/maintenance.js';
+import {
+  detectGlobalInstallManager,
+  formatGlobalInstallCommand,
+  resolveGlobalInstallPlan,
+  tryResolveGlobalInstallPlan,
+  UnsupportedGlobalInstallError,
+  type GlobalInstallPlan,
+} from './utils/global-install.js';
 import { writeRestartIntent } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
 import { spawn } from 'node:child_process';
@@ -103,6 +111,7 @@ import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncM
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
+import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
@@ -243,9 +252,9 @@ function spawnStartBotLive(appId: string): Promise<{ ok: boolean; message?: stri
         stdio: ['ignore', 'pipe', 'pipe'],
         env: process.env,
         // Run from HOME, not the dashboard's cwd (pm2 `cwd: PKG_ROOT`): a global
-        // npm update replaces that dir, so a still-running dashboard would spawn
-        // start-bot in a deleted directory (uv_cwd/ENOENT). See npmGlobalUpdateCwd.
-        cwd: npmGlobalUpdateCwd(),
+        // package update replaces that dir, so a still-running dashboard would spawn
+        // start-bot in a deleted directory (uv_cwd/ENOENT). See globalInstallUpdateCwd.
+        cwd: globalInstallUpdateCwd(),
       });
       const timer = setTimeout(() => {
         try { child.kill('SIGKILL'); } catch { /* already gone */ }
@@ -312,9 +321,10 @@ interface ResolvedDashboardSettings {
   repoPickerMode: RepoPickerMode;
   /** Auto-update / auto-restart schedule (off by default). */
   maintenance: MaintenanceConfig;
-  /** True when running from a source checkout — the Settings UI greys out the
-   *  auto-update toggle (npm-global only). */
+  /** True when running from a source checkout. */
   localDevInstall: boolean;
+  /** False for package layouts whose owning updater is not supported. */
+  autoUpdateSupported: boolean;
   /** Optional local project whiteboard. Disabled by default. */
   whiteboard: WhiteboardConfig;
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
@@ -697,6 +707,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     repoPickerMode: global.repoPickerMode ?? 'all',
     maintenance: global.maintenance ?? {},
     localDevInstall: isLocalDevInstall(),
+    autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || tryResolveGlobalInstallPlan() !== null,
     whiteboard: { enabled: global.whiteboard?.enabled === true },
     remoteAccess: global.remoteAccess === true,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
@@ -784,6 +795,10 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
  *  Cross-process serialization against the maintenance auto-update (a different
  *  process) is handled separately by the shared file lock in the run route. */
 let updateInFlight = false;
+// The dashboard process survives while pnpm swaps its versioned realpath. Keep
+// the successful plan (including its stable package root) so follow-up status,
+// update, and restart requests do not reuse the removed old runtime realpath.
+let lastSuccessfulUpdatePlan: GlobalInstallPlan | undefined;
 
 // Cache the upstream version/changelog lookups so the nav-badge check + the
 // Settings card don't hammer the npm registry / GitHub on every page load.
@@ -812,19 +827,19 @@ async function cachedChangelog(current: string, now = Date.now()): Promise<Chang
 }
 
 /**
- * Run `npm install -g botmux@latest` for the manual-update flow WITHOUT blocking
+ * Run the ownership-aware npm/pnpm update for the manual-update flow WITHOUT blocking
  * the event loop (async spawn, not execSync — the dashboard must keep serving
  * during the ~10-30s install). Resolves on exit 0; rejects with the tail of
  * stdout/stderr on a non-zero exit, spawn error, or 3-minute timeout. Args are
  * a fixed literal — no shell interpolation of untrusted input.
  */
-function runNpmInstallLatest(): Promise<void> {
+function runGlobalInstallLatest(plan: GlobalInstallPlan): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const child = spawn('npm', ['install', '-g', 'botmux@latest'], {
-      cwd: npmGlobalUpdateCwd(),
+    const child = spawn(plan.command, plan.args, {
+      cwd: globalInstallUpdateCwd(),
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32', // resolve npm.cmd on Windows
+      shell: process.platform === 'win32', // resolve npm.cmd / pnpm.cmd
     });
     let tail = '';
     const capture = (d: Buffer): void => { tail = (tail + d.toString()).slice(-2000); };
@@ -832,13 +847,13 @@ function runNpmInstallLatest(): Promise<void> {
     child.stderr?.on('data', capture);
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
-      reject(new Error('npm install timed out after 180s'));
+      reject(new Error(`${plan.manager} install timed out after 180s`));
     }, 180_000);
     child.on('error', (e) => { clearTimeout(timer); reject(e); });
     child.on('exit', (code) => {
       clearTimeout(timer);
       if (code === 0) resolve();
-      else reject(new Error(`npm exited ${code}: ${tail.trim().slice(-500)}`));
+      else reject(new Error(`${plan.manager} exited ${code}: ${tail.trim().slice(-500)}`));
     });
   });
 }
@@ -1846,12 +1861,15 @@ const server = createServer(async (req, res) => {
     }
 
     // ─── Version & manual update ─────────────────────────────────────────────
-    // `npm install -g` and a host restart are privileged: none of these paths
+    // Global package updates and a host restart are privileged: none of these paths
     // are on PUBLIC_READ_PATHS, so decideDashboardAuth already 401s an
     // unauthenticated caller (in both normal and public-read mode). The explicit
     // `authed` guards on the two mutations are defense-in-depth for host actions.
     if (req.method === 'GET' && url.pathname === '/api/update/status') {
       const current = resolveCurrentVersion();
+      const packageRoot = botmuxInstallRoot();
+      const installManager = detectGlobalInstallManager(packageRoot);
+      const installPlan = lastSuccessfulUpdatePlan ?? tryResolveGlobalInstallPlan(packageRoot);
       // Compare against the npm `latest` dist-tag (always stable; the update
       // button installs `@latest`). isNewerVersion uses semver precedence, so a
       // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
@@ -1862,6 +1880,9 @@ const server = createServer(async (req, res) => {
         latest,
         behind: !!latest && isNewerVersion(latest, current),
         localDevInstall: isLocalDevInstall(),
+        updateSupported: installPlan !== null,
+        updateManager: installPlan?.manager ?? installManager,
+        updateCommand: installPlan ? formatGlobalInstallCommand(installPlan) : null,
         node: checkNode(),
         installs: detectBotmuxInstalls(),
       });
@@ -1882,30 +1903,50 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/update/run') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'local_dev_no_update' });
+      let installPlan: GlobalInstallPlan;
+      try {
+        installPlan = lastSuccessfulUpdatePlan ?? resolveGlobalInstallPlan();
+      } catch (error) {
+        if (error instanceof UnsupportedGlobalInstallError) {
+          return jsonRes(res, 400, {
+            ok: false,
+            error: 'unsupported_install_method',
+            manager: error.manager,
+          });
+        }
+        throw error;
+      }
       const node = checkNode();
       if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
       updateInFlight = true;
-      const oldVersion = botmuxVersion();
+      const oldVersion = botmuxVersionAt(installPlan.activePackageRoot);
       // Acquire the shared cross-process lock so a scheduled maintenance
-      // auto-update (running in the bot-0 daemon) can't `npm install -g` at the
-      // same time. `acquired` distinguishes "lock held by maintenance" (409)
-      // from "npm itself failed" (500). Short wait: don't block the request on a
-      // full in-progress install — report busy fast.
+      // auto-update (running in the bot-0 daemon) can't update the same global
+      // install concurrently. `acquired` distinguishes "lock held by
+      // maintenance" (409) from "the package manager failed" (500). Short wait:
+      // don't block the request on a full in-progress install — report busy fast.
       let acquired = false;
       try {
-        await withFileLock(npmGlobalUpdateLockTarget(), async () => {
+        await withFileLock(globalInstallUpdateLockTarget(), async () => {
           acquired = true;
-          await runNpmInstallLatest();
+          await runGlobalInstallLatest(installPlan);
         }, { maxWaitMs: 2_000 });
       } catch (e) {
         if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
-        return jsonRes(res, 500, { ok: false, error: 'npm_failed', detail: e instanceof Error ? e.message : String(e) });
+        return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
       } finally {
         updateInFlight = false;
       }
-      const newVersion = botmuxVersion();
-      return jsonRes(res, 200, { ok: true, oldVersion, newVersion, changed: newVersion !== oldVersion });
+      const newVersion = botmuxVersionAt(installPlan.activePackageRoot);
+      lastSuccessfulUpdatePlan = installPlan;
+      return jsonRes(res, 200, {
+        ok: true,
+        oldVersion,
+        newVersion,
+        changed: newVersion !== oldVersion,
+        manager: installPlan.manager,
+      });
     }
 
     if (req.method === 'POST' && url.pathname === '/api/update/restart') {
@@ -1924,7 +1965,7 @@ const server = createServer(async (req, res) => {
           writeRestartIntent({ kind: 'update', oldVersion: upd.oldVersion, newVersion: upd.newVersion, at: new Date().toISOString() });
         } catch { /* breadcrumb is best-effort */ }
       }
-      spawnDetachedRestart('dashboard');
+      spawnDetachedRestart('dashboard', lastSuccessfulUpdatePlan?.activePackageRoot);
       return jsonRes(res, 200, { ok: true });
     }
 
@@ -2369,9 +2410,20 @@ const server = createServer(async (req, res) => {
     }
 
     // ─── Roles (proxy to daemon) ────────────────────────────────────────────
+    // POST   /api/roles/batch → collapse role reads to one request per daemon
     // GET    /api/roles/:larkAppId/:chatId → read role file
     // PUT    /api/roles/:larkAppId/:chatId → write role file
     // DELETE /api/roles/:larkAppId/:chatId → delete role file
+
+    if (req.method === 'POST' && url.pathname === '/api/roles/batch') {
+      let body: unknown;
+      try { body = await readJsonBody(req); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const parsed = parseRoleBatchTargets(body);
+      if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error });
+      const result = await aggregateRoleBatch(parsed.targets, proxyToDaemon);
+      return jsonRes(res, 200, result);
+    }
 
     let mRole: RegExpMatchArray | null;
     if ((mRole = url.pathname.match(/^\/api\/roles\/([^/]+)\/([^/]+)$/))) {

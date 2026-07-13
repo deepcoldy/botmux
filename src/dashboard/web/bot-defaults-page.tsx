@@ -872,7 +872,7 @@ export function BotAgentSection(props: {
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionAgent')}</h3>
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <span>{tr('botDefaults.agentCli')}</span>
           <DropdownField
             dataInput="agentCliId"
@@ -882,7 +882,7 @@ export function BotAgentSection(props: {
             options={cliOptions}
             onChange={updateCli}
           />
-        </label>
+        </div>
       </div>
       <div className="bd-row">
         <label>
@@ -903,7 +903,7 @@ export function BotAgentSection(props: {
       </div>
       {siSupport === 'dynamic' ? (
         <div className="bd-row">
-          <label>
+          <div className="bd-field">
             <FieldTitle help={tr('botDefaults.skillInjectionHelpDynamic')}>{tr('botDefaults.skillInjection')}</FieldTitle>
             <DropdownField
               dataInput="skillInjection"
@@ -913,11 +913,11 @@ export function BotAgentSection(props: {
               options={dynamicSkillOptions}
               onChange={() => undefined}
             />
-          </label>
+          </div>
         </div>
       ) : siSupport === 'global' ? (
         <div className="bd-row">
-          <label>
+          <div className="bd-field">
             <FieldTitle help={tr('botDefaults.skillInjectionHelp')}>{tr('botDefaults.skillInjection')}</FieldTitle>
             <DropdownField
               dataInput="skillInjection"
@@ -927,7 +927,7 @@ export function BotAgentSection(props: {
               options={skillOptions}
               onChange={next => void saveSkillInjection(next)}
             />
-          </label>
+          </div>
           <div className="actions">
             <StatusSpan status={skillStatus} attr={{ 'data-skill-injection-status': '' }} />
           </div>
@@ -1016,7 +1016,7 @@ function WorkingDirSection(props: {
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionWorkingDir')}</h3>
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <FieldTitle help={tr('botDefaults.workingDirModeHelp')}>{tr('botDefaults.workingDirMode')}</FieldTitle>
           <DropdownField
             dataInput="workingDirMode"
@@ -1026,7 +1026,7 @@ function WorkingDirSection(props: {
             options={modeOptions}
             onChange={next => setMode(next as 'off' | 'default' | 'oncall')}
           />
-        </label>
+        </div>
       </div>
       <div className="bd-row" data-wd-dir-row hidden={mode === 'off'}>
         <label>
@@ -1631,7 +1631,7 @@ function SessionModeSection(props: {
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionSessionMode')}</h3>
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <FieldTitle help={tr('botDefaults.p2pHelp')}>{tr('botDefaults.p2pMode')}</FieldTitle>
           <DropdownField
             dataInput="p2pMode"
@@ -1641,11 +1641,11 @@ function SessionModeSection(props: {
             options={p2pOptions}
             onChange={next => void saveP2p(next)}
           />
-        </label>
+        </div>
         <div className="actions"><StatusSpan status={p2pStatus} attr={{ 'data-p2p-status': '' }} /></div>
       </div>
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <FieldTitle help={tr('botDefaults.regularGroupModeHelp')}>{tr('botDefaults.regularGroupMode')}</FieldTitle>
           <DropdownField
             dataInput="regularGroupMode"
@@ -1658,11 +1658,11 @@ function SessionModeSection(props: {
               void saveCardMode('regular', { regularGroupReplyMode: next }, setRegularStatus);
             }}
           />
-        </label>
+        </div>
         <div className="actions"><StatusSpan status={regularStatus} attr={{ 'data-regular-group-status': '' }} /></div>
       </div>
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <FieldTitle help={tr('botDefaults.mentionModeHelp')}>{tr('botDefaults.mentionMode')}</FieldTitle>
           <DropdownField
             dataInput="regularGroupMentionMode"
@@ -1675,11 +1675,11 @@ function SessionModeSection(props: {
               void saveCardMode('mention', { regularGroupMentionMode: next }, setMentionStatus);
             }}
           />
-        </label>
+        </div>
         <div className="actions"><StatusSpan status={mentionStatus} attr={{ 'data-mention-mode-status': '' }} /></div>
       </div>
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <FieldTitle help={tr('botDefaults.docSubscribeModeHelp')}>{tr('botDefaults.docSubscribeMode')}</FieldTitle>
           <DropdownField
             dataInput="docSubscribeDefaultMode"
@@ -1692,7 +1692,7 @@ function SessionModeSection(props: {
               void saveCardMode('doc', { docSubscribeDefaultMode: next }, setDocStatus);
             }}
           />
-        </label>
+        </div>
         <div className="actions"><StatusSpan status={docStatus} attr={{ 'data-doc-subscribe-mode-status': '' }} /></div>
       </div>
     </section>
@@ -1835,7 +1835,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         onChange={setEnabled}
       />
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <FieldTitle>{tr('botDefaults.substituteDisclosure')}</FieldTitle>
           <DropdownField<'prefix' | 'none'>
             dataInput="substituteDisclosure"
@@ -1845,7 +1845,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
             options={disclosureOptions}
             onChange={value => setDisclosure(value)}
           />
-        </label>
+        </div>
       </div>
       <div className="bd-row bd-substitute-targets">
         <FieldTitle help={tr('botDefaults.substituteTargetsHelp')}>{tr('botDefaults.substituteTargets')}</FieldTitle>

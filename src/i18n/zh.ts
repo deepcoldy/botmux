@@ -988,8 +988,10 @@ export const messages: Record<string, string> = {
   'card.dashboard.settings.footer.security': '🔒 仅 Bot 管理员可见 · 私聊回复 · ACK 自动刷新',
   'settings.readOnlyVisitor': '只读访客模式，无法修改设置。',
   'settings.autoUpdateLocalDev': '本地源码安装不支持自动更新。',
+  'settings.autoUpdateUnsupportedInstall': '当前安装方式暂不支持自动更新（目前支持 npm / pnpm 全局安装）。',
   // 每个 toggle 自己的 disable 原因（更具体，PR3 UI 修订）
   'settings.autoUpdate.disabled.localDev': '⚠️ 源码安装下不支持自动更新（npm 全局安装后可用）',
+  'settings.autoUpdate.disabled.unsupportedInstall': '⚠️ 当前安装方式不支持自动更新（支持 npm / pnpm 全局安装）',
   'settings.autoRestart.disabled.needsAutoUpdate': '⚠️ 需先开启「每日自动更新」',
   'settings.sectionAccess': '访问控制',
   'settings.sectionCards': '卡片行为',

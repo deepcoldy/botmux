@@ -42,6 +42,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
       return { ok: true, patch: body as MaintenanceConfig } as const;
     }),
     isLocalDevInstall: vi.fn(() => false),
+    isAutoUpdateSupportedInstall: vi.fn(() => true),
     resolveDashboardSettings: vi.fn(() => settingsView),
     isLocale: ((v: unknown): v is 'zh' | 'en' => v === 'zh' || v === 'en'),
     syncVcMeetingListenerBotConfig: vi.fn(async () => ({ ok: true as const })),
@@ -242,6 +243,17 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
     expect(r.error).toBe('local_dev_no_autoupdate');
+    expect(deps.mergeMaintenanceConfig).not.toHaveBeenCalled();
+  });
+
+  it('refuses enabling autoUpdate for an unsupported global install', async () => {
+    const deps = makeDeps({ isAutoUpdateSupportedInstall: vi.fn(() => false) });
+    const r = await applySettingsWrite({
+      maintenance: { autoUpdate: { enabled: true } },
+    }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('unsupported_install_no_autoupdate');
     expect(deps.mergeMaintenanceConfig).not.toHaveBeenCalled();
   });
 

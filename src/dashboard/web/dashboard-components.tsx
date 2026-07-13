@@ -130,6 +130,7 @@ export function InfoTip(props: {
   focusable?: boolean;
 }): JSX.Element {
   const tipRef = useRef<HTMLSpanElement | null>(null);
+  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [open, setOpen] = useState(false);
   const [position, setPosition] = useState<{ left: number; top: number; placement: 'top' | 'bottom' } | null>(null);
 
@@ -151,13 +152,20 @@ export function InfoTip(props: {
   }, []);
 
   const show = useCallback(() => {
+    if (hideTimer.current) { clearTimeout(hideTimer.current); hideTimer.current = null; }
     updatePosition();
     setOpen(true);
   }, [updatePosition]);
 
+  // Delay the hide so the pointer can travel from the trigger to the
+  // body-portaled popover without it vanishing — required to select/copy the
+  // popover text. Hovering the popover itself cancels the pending hide (show).
   const hide = useCallback(() => {
-    setOpen(false);
+    if (hideTimer.current) clearTimeout(hideTimer.current);
+    hideTimer.current = setTimeout(() => setOpen(false), 160);
   }, []);
+
+  useEffect(() => () => { if (hideTimer.current) clearTimeout(hideTimer.current); }, []);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -176,6 +184,8 @@ export function InfoTip(props: {
         className={`ui-info-pop ui-info-pop-floating ui-info-pop-${position.placement}`}
         role="tooltip"
         style={{ left: position.left, top: position.top }}
+        onMouseEnter={show}
+        onMouseLeave={hide}
       >
         {props.children}
       </span>,
@@ -361,6 +371,7 @@ type DropdownMenuProps<T extends string> = {
   ariaLabel?: string;
   disabled?: boolean;
   hidden?: boolean;
+  style?: CSSProperties;
   label: ReactNode;
   value: T;
   options: DropdownOption<T>[];
@@ -406,7 +417,7 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): JSX
   const className = ['sect-sort-menu', props.disabled ? 'is-disabled' : '', props.className].filter(Boolean).join(' ');
 
   return (
-    <details id={props.id} className={className} ref={detailsRef} hidden={props.hidden}>
+    <details id={props.id} className={className} ref={detailsRef} hidden={props.hidden} style={props.style}>
       <summary
         aria-label={props.ariaLabel}
         aria-disabled={props.disabled ? true : undefined}

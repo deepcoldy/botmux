@@ -33,6 +33,11 @@ class DashboardUiState {
   // must not see a control whose endpoint they'd 401 on. Defaults true so a
   // transient probe failure never hides it from a real token holder.
   authed = true;
+  // Effective dashboard sharing policy. Session terminal affordances use this
+  // (rather than the current visitor's cookie alone) to choose their default:
+  // private dashboards open a writable terminal, explicitly public dashboards
+  // keep the shared entry read-only.
+  publicReadOnly = false;
   private listeners = new Set<UiListener>();
   private translate = createDashboardTranslator(this.locale);
   private mediaQuery: MediaQueryList | null = null;

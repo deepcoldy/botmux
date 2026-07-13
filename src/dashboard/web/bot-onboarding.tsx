@@ -318,7 +318,7 @@ function OnboardingForm(props: {
 
   return (
     <form id="onboarding-form" className="onboarding-form" onSubmit={props.onSubmit}>
-      <label className="onboarding-field">
+      <div className="onboarding-field">
         <span>{t('botOnboarding.cliLabel')}</span>
         <DropdownMenu
           id="ob-cli"
@@ -331,8 +331,8 @@ function OnboardingForm(props: {
             props.onFormChange(syncModelForCli(props.form, cliId, props.cliState));
           }}
         />
-      </label>
-      <label className="onboarding-field">
+      </div>
+      <div className="onboarding-field">
         <span>{t('botOnboarding.dirModeLabel')}</span>
         <DropdownMenu
           id="ob-dir-mode"
@@ -343,7 +343,7 @@ function OnboardingForm(props: {
           options={dirModeOptions}
           onChange={dirMode => props.onFormChange({ ...props.form, dirMode })}
         />
-      </label>
+      </div>
       <label className="onboarding-field">
         <span>{dirLabel}</span>
         <input

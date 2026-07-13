@@ -152,6 +152,15 @@ export function toLegacySelected(result: AskResult): string | null {
   return null;
 }
 
+/** 用户以文字作答（`submitCustomReply`）而非点选按钮：各问 `answers` 为空数组、
+ *  `comment` 携带原文。此时 `toLegacySelected` 返回 null，非 JSON 模式的 stdout
+ *  与"多选/多问"的降级空值无法区分——调用方据此在 stderr 提示答案去向。 */
+export function isCustomReply(result: AskResult): boolean {
+  if (result.kind !== 'answered') return false;
+  if (result.comment === null) return false;
+  return result.answers.every((keys) => keys.length === 0);
+}
+
 /** Card dispatcher contract. The im/lark side registers a dispatcher via
  *  `setCardDispatcher`; the broker is otherwise IM-agnostic. */
 export interface AskCardDispatcher {

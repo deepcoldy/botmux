@@ -6,7 +6,8 @@
  * At the scheduled local time (Asia/Shanghai, once/day) it:
  *  - checks the cross-daemon busy gate (anyDaemonBusy) — a session mid-CLI-turn
  *    anywhere defers the run to the next day (no retry);
- *  - auto-update (npm-global only): `npm install -g botmux@latest`, then restart
+ *  - auto-update (npm/pnpm global): update the package with its owning package
+ *    manager, then restart
  *    to apply iff the version actually changed;
  *  - auto-restart: just restart.
  * Before triggering a restart it drops a restart-intent breadcrumb so the fresh
@@ -15,7 +16,7 @@
  * runMaintenanceTick is pure over its injected deps (unit tested); the rest is
  * production wiring.
  */
-import { execSync, spawn } from 'node:child_process';
+import { execSync, spawn, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -25,7 +26,17 @@ import { readGlobalConfig, type MaintenanceConfig } from '../global-config.js';
 import { evaluateDue } from './maintenance-schedule.js';
 import { anyDaemonBusy } from './daemon-heartbeat.js';
 import { writeRestartIntent, type RestartIntent } from '../services/restart-intent-store.js';
-import { isLocalDevInstall, botmuxVersion, botmuxCliEntry } from '../utils/install-info.js';
+import {
+  isLocalDevInstall,
+  botmuxVersion,
+  botmuxVersionAt,
+  botmuxCliEntry,
+  botmuxCliEntryAt,
+} from '../utils/install-info.js';
+import {
+  resolveGlobalInstallPlan,
+  type GlobalInstallPlan,
+} from '../utils/global-install.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 
 export interface MaintenanceState {
@@ -42,7 +53,7 @@ export interface MaintenanceDeps {
   isLocalDev: () => boolean;
   /** Current on-disk botmux version (read fresh — changes after runUpdate). */
   currentVersion: () => string;
-  /** Runs `npm install -g botmux@latest` (download/install only). Throws on failure. */
+  /** Updates the owning npm/pnpm global install (download/install only). */
   runUpdate: () => void;
   writeIntent: (intent: RestartIntent) => void;
   /** Spawn a detached `botmux restart` (this process is then killed by pm2). */
@@ -74,7 +85,7 @@ export function runMaintenanceTick(deps: MaintenanceDeps): void {
   if (upd.decision !== 'due') return;
 
   if (deps.isLocalDev()) {
-    log('auto-update skipped: local-dev install (npm-global only)');
+    log('auto-update skipped: local-dev install (global package install only)');
     return;
   }
   if (deps.anyBusy()) {
@@ -146,24 +157,39 @@ export function maintenanceRestartLogPath(): string {
 
 /**
  * Stable cwd (HOME) for spawns that must not inherit a possibly-deleted cwd.
- * A global npm update replaces the botmux package dir, so any process whose cwd
+ * A global package update replaces the botmux package dir, so any process whose cwd
  * points there (notably the dashboard, started by pm2 with `cwd: PKG_ROOT`) is
- * left holding a deleted directory. Both the `npm install -g` child and the
+ * left holding a deleted directory. Both the package-manager child and the
  * detached restart driver spawned afterwards would then die at startup reading
  * cwd (`uv_cwd`/ENOENT). Pinning them to HOME sidesteps that entirely.
  */
-export function npmGlobalUpdateCwd(): string {
+export function globalInstallUpdateCwd(): string {
   return homedir();
 }
 
+/** Run the ownership-aware update synchronously. */
+export function installLatestBotmuxSync(plan: GlobalInstallPlan = resolveGlobalInstallPlan()): void {
+  const result = spawnSync(plan.command, plan.args, {
+    cwd: globalInstallUpdateCwd(),
+    stdio: 'inherit',
+    shell: process.platform === 'win32', // resolve npm.cmd / pnpm.cmd
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`${plan.manager} install exited with ${result.status ?? result.signal ?? 'unknown status'}`);
+  }
+}
+
 /**
- * Cross-process lock target that serializes `npm install -g botmux@latest`
+ * Cross-process lock target that serializes global botmux updates
  * between the scheduled auto-update (this daemon process) and a
  * dashboard-triggered manual update (the separate `botmux-dashboard` process),
- * so the two never write the global npm prefix concurrently. Both sides acquire
+ * so the two never write the active global install concurrently. Both sides acquire
  * `withFileLock(Sync)` on this path.
  */
-export function npmGlobalUpdateLockTarget(): string {
+export function globalInstallUpdateLockTarget(): string {
+  // Keep the historical filename so old/new daemon-dashboard processes still
+  // serialize correctly during a rolling upgrade.
   return join(config.session.dataDir, 'npm-global-update');
 }
 
@@ -205,7 +231,7 @@ function setsidAvailable(): boolean {
  *
  * @param reason short tag written to the log (e.g. 'auto-update', 'dashboard').
  */
-export function spawnDetachedRestart(reason: string): void {
+export function spawnDetachedRestart(reason: string, activePackageRoot?: string): void {
   const logFile = maintenanceRestartLogPath();
   let fd: number | undefined;
   try {
@@ -215,15 +241,16 @@ export function spawnDetachedRestart(reason: string): void {
   } catch {
     fd = undefined; // fall back to discarding output rather than failing the restart
   }
-  const { cmd, args } = buildRestartLauncher(process.execPath, botmuxCliEntry(), setsidAvailable());
+  const cliEntry = activePackageRoot ? botmuxCliEntryAt(activePackageRoot) : botmuxCliEntry();
+  const { cmd, args } = buildRestartLauncher(process.execPath, cliEntry, setsidAvailable());
   const child = spawn(cmd, args, {
     detached: true,
     stdio: fd !== undefined ? ['ignore', fd, fd] : 'ignore',
     env: process.env,
     // Run from HOME, not the caller's cwd: the dashboard (cwd: PKG_ROOT) triggers
-    // this right after a global npm update replaced that dir, so inheriting it
-    // would start the restart driver in a deleted directory. See npmGlobalUpdateCwd.
-    cwd: npmGlobalUpdateCwd(),
+    // this right after a global update replaced that dir, so inheriting it
+    // would start the restart driver in a deleted directory. See globalInstallUpdateCwd.
+    cwd: globalInstallUpdateCwd(),
   });
   // A detached child's 'error' (e.g. spawn ENOENT) would otherwise throw
   // unhandled and crash this process — log it instead.
@@ -235,6 +262,10 @@ export function spawnDetachedRestart(reason: string): void {
 }
 
 function productionDeps(): MaintenanceDeps {
+  // Kept after a successful resolve so post-pnpm-update version/restart lookups
+  // use the stable global node_modules/botmux symlink, not the removed
+  // .pnpm/botmux@old runtime realpath.
+  let installPlan: GlobalInstallPlan | undefined;
   return {
     now: () => Date.now(),
     readConfig: () => readGlobalConfig().maintenance,
@@ -242,20 +273,23 @@ function productionDeps(): MaintenanceDeps {
     writeState: (s) => writeMaintenanceStateTo(config.session.dataDir, s),
     anyBusy: () => anyDaemonBusy(),
     isLocalDev: () => isLocalDevInstall(),
-    currentVersion: () => botmuxVersion(),
+    currentVersion: () => installPlan
+      ? botmuxVersionAt(installPlan.activePackageRoot)
+      : botmuxVersion(),
     runUpdate: () => {
+      installPlan ??= resolveGlobalInstallPlan();
       // Hold the shared update lock for the whole install so a concurrent
-      // dashboard manual update can't run `npm install -g` at the same time.
+      // dashboard manual update can't mutate the same install at the same time.
       // Short wait: if the dashboard holds it (a manual update is mid-flight),
       // don't block the daemon thread waiting out a 30s install — throw a lock
       // timeout fast so the tick logs it and slips to the next day (the manual
       // update is already bumping to latest anyway).
-      withFileLockSync(npmGlobalUpdateLockTarget(), () => {
-        execSync('npm install -g botmux@latest', { cwd: npmGlobalUpdateCwd(), stdio: 'inherit' });
+      withFileLockSync(globalInstallUpdateLockTarget(), () => {
+        installLatestBotmuxSync(installPlan);
       }, { maxWaitMs: 500 });
     },
     writeIntent: (intent) => writeRestartIntent(intent),
-    triggerRestart: () => spawnDetachedRestart('auto-update'),
+    triggerRestart: () => spawnDetachedRestart('auto-update', installPlan?.activePackageRoot),
     log: (msg) => logger.info(`[maintenance] ${msg}`),
   };
 }

@@ -81,13 +81,20 @@ Git 安装/更新会给底层 Git 命令设置超时，默认 60 秒；需要更
 
 复用外部 `agentbuddy` CLI 从制品仓库安装 skill —— registry 地址与鉴权都在部署机的 `agentbuddy` 里，botmux 源码不硬编码任何仓库信息：
 
+直接粘贴 marketplace「复制安装命令」即可（dashboard 尤其方便，贴上即装、跳过 discover；CLI 里命令带空格要加引号）：
+
 ```bash
-botmux skills install agentbuddy:<group>/<skill>
-botmux skills install agentbuddy:<group>/<skill>@<version>
-botmux skills install agentbuddy:collection/<uid>
+botmux skills install "agentbuddy skill collection add <uid>"
+botmux skills install "agentbuddy plugin collection add <uid>"
+botmux skills install "agentbuddy skill add <group> --skill <name>"
 ```
 
-- 需要部署机装好 `agentbuddy` 并登录一次（`agentbuddy login`），凭证缓存后复用；未安装/未登录时返回 `agentbuddy_not_found` / `agentbuddy_command_failed`。
+- 兼容命令前面带的 `npm_config_registry="…" npx agentbuddy@latest …` 前缀（自动剥离）。botmux 用部署机自己配置的 agentbuddy 执行，**域名无关、无需额外配置**。
+- 仅接受 `skill` / `plugin` 的 `add` / `collection add` 安装类子命令，其它子命令（publish/remove/login 等）不受理。
+- plugin 命令也会执行，但收进 botmux 的是该 plugin **内含的 SKILL.md**（botmux 是 skill registry；plugin 不含 skill 则无内容可装）。
+- **开源 skills**（vercel-labs 的 `skills` CLI）：也认 `skills add owner/repo` / `npx skills add owner/repo` / `add-skill owner/repo` —— 直接走 botmux 现成的 **GitHub 安装**（无需部署机装 `skills` CLI，公开仓库免鉴权，与贴 GitHub 链接等价）。
+
+- 需要部署机装好 `agentbuddy` 并登录一次（`agentbuddy login`），凭证缓存后复用；未安装/未登录时返回 `agentbuddy_not_found` / `agentbuddy_command_failed`（dashboard 会提示去安装/登录）。
 - agentbuddy 自解析 skill 集合，安装/更新不走 discover-then-select；同一 identifier 的并发安装/更新会串行化，避免互相清空暂存目录。
 - botmux 在拷进 store 前用 agentbuddy 内置的 `clear-embedded-telemetry` 剥离制品内嵌的用量上报，并做 fail-closed 后置校验（残留即中断安装）；确需保留时设 `BOTMUX_AGENTBUDDY_KEEP_TELEMETRY=1`。
 

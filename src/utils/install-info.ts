@@ -1,7 +1,7 @@
 /**
  * Distinguishes a local source checkout (or git worktree) from a published
  * npm install. Used to disable auto-update for local-dev deployments — running
- * `npm install -g botmux@latest` against a daemon that runs from a git checkout
+ * a global package update against a daemon that runs from a git checkout
  * would not take effect and only risks confusion.
  *
  * npm publishes only `dist/` (+ a few root files; see package.json `files`),
@@ -28,20 +28,28 @@ export function isLocalDevInstall(): boolean {
 /** The running botmux version (from the install's package.json). For an
  *  npm-global install this is the real published version; in a source checkout
  *  it's the unbuilt '0.0.0' (CI injects the real version at publish). */
-export function botmuxVersion(): string {
+export function botmuxVersionAt(rootDir: string): string {
   try {
-    const pkg = JSON.parse(readFileSync(join(packageRoot(), 'package.json'), 'utf-8'));
+    const pkg = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf-8'));
     return typeof pkg.version === 'string' ? pkg.version : '0.0.0';
   } catch {
     return '0.0.0';
   }
 }
 
+export function botmuxVersion(): string {
+  return botmuxVersionAt(packageRoot());
+}
+
 /** Absolute path to this install's CLI entrypoint (`dist/cli.js`). The correct
  *  way to restart is `node <this>/dist/cli.js restart` — a raw `pm2 restart`
  *  would not pick up a changed install dir. */
+export function botmuxCliEntryAt(rootDir: string): string {
+  return join(rootDir, 'dist', 'cli.js');
+}
+
 export function botmuxCliEntry(): string {
-  return join(packageRoot(), 'dist', 'cli.js');
+  return botmuxCliEntryAt(packageRoot());
 }
 
 /** Absolute path to this install's root (the dir holding package.json). For a

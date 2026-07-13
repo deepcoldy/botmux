@@ -105,9 +105,10 @@ export function parseDashboardSkillInstallRequest(body: Record<string, unknown>)
 }
 
 export async function discoverDashboardSkills(request: DashboardSkillInstallRequest): Promise<SkillSourceDiscovery> {
-  // agentbuddy resolves its own skill set — the UI installs it directly and
-  // never calls discover; guard defensively in case it ever does.
-  if (request.kind === 'agentbuddy') throw new Error('agentbuddy_discover_not_supported');
+  // agentbuddy resolves its own skill set — tell the UI to install directly
+  // (works for pasted `agentbuddy:` identifiers AND marketplace URLs, which the
+  // client can't recognize on its own since the parser is server-only).
+  if (request.kind === 'agentbuddy') return { skills: [], directInstall: true };
   if (request.kind === 'local') return discoverLocalSkillCandidates(request.value, { fullDepth: request.fullDepth });
   if (request.kind === 'git') {
     return discoverGitSkillCandidatesAsync({

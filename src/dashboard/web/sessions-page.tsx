@@ -44,6 +44,7 @@ import {
   deriveSessionBoardColumn,
   fetchPickerBots,
   formatTokenCount,
+  historySenderKey,
   isUnknownChatSession,
   lockActionLabel,
   openWriteLink,
@@ -54,6 +55,7 @@ import {
   sessionRuntimeCounts,
   sessionSearchText,
   sessionStatusText,
+  shouldOpenWritableTerminal,
   terminalHref,
   tokenCount,
   type BoardColumnId,
@@ -192,32 +194,34 @@ function IconActionButton(props: {
 
 function TerminalControls(props: { row: any; url: string | null }): JSX.Element | null {
   if (!props.url) return null;
+  const readOnly = !shouldOpenWritableTerminal();
   return (
-    <span className={`term-pill${ui.authed ? '' : ' solo'}`}>
-      <a
-        className="term-btn term-open"
-        href={props.url}
-        target="_blank"
-        rel="noopener"
-        title={t('sessions.openTerminal')}
-        aria-label={t('sessions.openTerminal')}
-        onClick={event => event.stopPropagation()}
-        dangerouslySetInnerHTML={rawHtml(ICON.terminal)}
-      />
-      {ui.authed ? (
+    <span className={`term-pill${readOnly ? ' readonly' : ' writable'}`}>
+      {readOnly ? (
+        <a
+          className="term-btn term-open"
+          href={props.url}
+          target="_blank"
+          rel="noopener"
+          title={t('sessions.openTerminal')}
+          aria-label={t('sessions.openTerminal')}
+          onClick={event => event.stopPropagation()}
+          dangerouslySetInnerHTML={rawHtml(ICON.terminal)}
+        />
+      ) : (
         <button
           type="button"
           className="term-btn term-write"
           data-action="write-link"
-          title={t('sessions.writeLinkHint')}
-          aria-label={t('sessions.writeLink')}
+          title={t('sessions.openTerminal')}
+          aria-label={t('sessions.openTerminal')}
           onClick={(event) => {
             event.stopPropagation();
             void openWriteLink(props.row, event.currentTarget);
           }}
-          dangerouslySetInnerHTML={rawHtml(ICON.key)}
+          dangerouslySetInnerHTML={rawHtml(ICON.terminal)}
         />
-      ) : null}
+      )}
     </span>
   );
 }
@@ -1015,22 +1019,23 @@ function BoardView(props: {
   );
 }
 
-function HistoryBubble(props: { row: any; message: any; ownerOpenId?: string }): JSX.Element {
+function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: boolean }): JSX.Element {
   const m = props.message;
-  const mine = m.senderType === 'user';
-  const name = mine
+  const human = m.senderType === 'user';
+  const botSender = m.senderType === 'app' || m.senderType === 'bot';
+  const name = human
     ? (m.senderName || (props.ownerOpenId && m.senderId === props.ownerOpenId ? t('sessions.history.owner') : t('sessions.history.user')))
-    : botDisplayName(props.row);
+    : (m.senderName || String(m.senderId ?? '').slice(0, 16) || t(botSender ? 'sessions.history.bot' : 'sessions.history.system'));
   const content = String(m.content ?? '').trim() || `[${m.msgType ?? 'message'}]`;
   return (
-    <div className={`history-msg${mine ? ' mine' : ''}`}>
-      {mine ? (
+    <div className={`history-msg${props.groupStart ? ' group-start' : ' continuation'}`}>
+      {props.groupStart ? (human ? (
         m.senderAvatar ? (
           <img className="history-avatar-img" src={String(m.senderAvatar)} alt="" decoding="async" referrerPolicy="no-referrer" />
         ) : <span className="history-avatar-user" aria-hidden="true">{String(name).slice(0, 1)}</span>
-      ) : <span dangerouslySetInnerHTML={rawHtml(botAvatarHtml({ name: botDisplayName(props.row), larkAppId: props.row.larkAppId, size: 'sm' }))} />}
+      ) : <span className="history-avatar-bot" dangerouslySetInnerHTML={rawHtml(botAvatarHtml({ name, larkAppId: m.senderBotAppId, avatarUrl: m.senderAvatar, size: 'sm' }))} />) : <span className="history-avatar-spacer" aria-hidden="true" />}
       <div className="history-msg-main">
-        <div className="history-msg-meta"><span>{name}</span><time>{historyTime(m.createTime)}</time></div>
+        {props.groupStart ? <div className="history-msg-meta"><span>{name}</span><time>{historyTime(m.createTime)}</time></div> : null}
         <div className="history-bubble">{content}</div>
       </div>
     </div>
@@ -1082,8 +1087,13 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
             ) : null}
             {!props.state.loading && !props.state.error && props.state.messages.length > 0 ? (
               <div className="history-list">
-                {props.state.messages.map((message, index) => (
-                  <HistoryBubble key={message.messageId ?? index} row={row} message={message} ownerOpenId={props.state?.ownerOpenId} />
+                {props.state.messages.map((message, index, messages) => (
+                  <HistoryBubble
+                    key={message.messageId ?? index}
+                    message={message}
+                    ownerOpenId={props.state?.ownerOpenId}
+                    groupStart={index === 0 || historySenderKey(messages[index - 1]) !== historySenderKey(message)}
+                  />
                 ))}
               </div>
             ) : null}
@@ -2226,7 +2236,7 @@ function SessionsPage(): JSX.Element {
     setTermState({ sessionId: row.sessionId, url: readonlyUrl, loading: true });
     void (async () => {
       let url = readonlyUrl;
-      if (ui.authed) {
+      if (shouldOpenWritableTerminal()) {
         try {
           const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/write-link`);
           const body = await r.json().catch(() => ({}));
@@ -2636,6 +2646,7 @@ function SessionsPage(): JSX.Element {
                 history: ICON.history,
                 lock: ICON.lock,
                 restart: ICON.restart,
+                terminal: ICON.terminal,
                 unlock: ICON.unlock,
               }}
               lockActionLabel={lockActionLabel}
@@ -2650,6 +2661,13 @@ function SessionsPage(): JSX.Element {
               onRestart={(row, button) => { const s = store.sessions.get(String(row.sessionId)); if (s) void restartSession(s, button); }}
               onTeamScope={scope => setTeamScopeText(scope ? t('sessions.kanban.teamScope', { chats: scope.chats, sessions: scope.sessions }) : '')}
               onToggleLock={(row, button) => { const s = store.sessions.get(String(row.sessionId)); if (s) void setSessionLocked(s, !s.locked, button); }}
+              onToggleSelect={row => setSelected(prev => {
+                const id = String(row.sessionId);
+                const next = new Set(prev);
+                if (next.has(id)) next.delete(id); else next.add(id);
+                return next;
+              })}
+              selectedSessionIds={selected}
             />
           ) : null}
         </div>

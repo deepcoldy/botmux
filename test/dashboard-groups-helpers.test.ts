@@ -1,12 +1,18 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import {
   allExpectedInChat,
   availableBotsForPicker,
+  loadGroupRoleProfileContext,
+  paginateGroupRows,
   roleProfileBootstrapStatus,
   summarizeAddBotsResult,
   suggestRoleProfileIdFromChat,
 } from '../src/dashboard/web/groups.js';
 import { hasExplicitChatRole, summarizeGroupProfileMatches } from '../src/dashboard/web/role-profile-match.js';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('allExpectedInChat — refreshUntilSeen commit predicate', () => {
   it('empty expected set → true (degenerate case, nothing to wait for)', () => {
@@ -60,6 +66,30 @@ describe('availableBotsForPicker — shared bot picker ordering', () => {
     );
 
     expect(bots.map(bot => bot.larkAppId)).toEqual(['cli_b', 'cli_c']);
+  });
+});
+
+describe('paginateGroupRows — bounded dashboard DOM', () => {
+  const rows = Array.from({ length: 65 }, (_, index) => `group-${index + 1}`);
+
+  it('renders at most the default 30 heavy group rows per page', () => {
+    const window = paginateGroupRows(rows, 1);
+    expect(window.rows).toHaveLength(30);
+    expect(window.rows[0]).toBe('group-1');
+    expect(window.rows[29]).toBe('group-30');
+    expect(window).toMatchObject({ page: 1, totalPages: 3, from: 1, to: 30, total: 65 });
+  });
+
+  it('clamps stale pages after filtering and reports the final partial range', () => {
+    const window = paginateGroupRows(rows, 99);
+    expect(window.rows).toEqual(['group-61', 'group-62', 'group-63', 'group-64', 'group-65']);
+    expect(window).toMatchObject({ page: 3, totalPages: 3, from: 61, to: 65, total: 65 });
+  });
+
+  it('returns a stable empty window', () => {
+    expect(paginateGroupRows([], 4)).toEqual({
+      rows: [], page: 1, totalPages: 1, from: 0, to: 0, total: 0,
+    });
   });
 });
 
@@ -207,5 +237,67 @@ describe('suggestRoleProfileIdFromChat — prompt default', () => {
 
   it('falls back to a safe id when the group name has no valid ascii token', () => {
     expect(suggestRoleProfileIdFromChat('项目群')).toBe('profile');
+  });
+});
+
+describe('loadGroupRoleProfileContext — bounded role requests', () => {
+  it('loads explicit chat roles in one batch and skips unconfigured memberships', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/role-profiles') {
+        return { ok: true, status: 200, json: async () => ({ profiles: [{ profileId: 'main' }] }) } as Response;
+      }
+      if (url === '/api/role-profiles/main') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ entries: [{ profileId: 'main', larkAppId: 'botA', content: 'role A' }] }),
+        } as Response;
+      }
+      if (url === '/api/roles/batch') {
+        expect(init?.method).toBe('POST');
+        expect(JSON.parse(String(init?.body))).toEqual({
+          targets: [{ larkAppId: 'botA', chatId: 'oc_team' }],
+        });
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            roles: [{
+              larkAppId: 'botA',
+              chatId: 'oc_team',
+              content: 'role A',
+              hasRole: true,
+              effectiveContent: 'role A',
+              effectiveSource: 'chat',
+              hasEffectiveRole: true,
+            }],
+          }),
+        } as Response;
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const context = await loadGroupRoleProfileContext({
+      bots: [],
+      chats: [{
+        chatId: 'oc_team',
+        memberBots: [
+          { larkAppId: 'botA', inChat: true, hasRole: true },
+          { larkAppId: 'botB', inChat: true, hasRole: false },
+          { larkAppId: 'botC', inChat: false, hasRole: true },
+        ],
+      }],
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.map(call => String(call[0])).filter(url => url.startsWith('/api/roles/')))
+      .toEqual(['/api/roles/batch']);
+    expect(context.groupRoleContentByBot.get('botA\u0000oc_team')).toEqual({
+      content: 'role A',
+      source: 'chat',
+    });
+    expect(context.groupRoleContentByBot.has('botB\u0000oc_team')).toBe(false);
   });
 });

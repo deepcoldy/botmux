@@ -74,6 +74,20 @@ export function platformMachineBaseUrl(): string | null {
   }
 }
 
+/**
+ * 自建反代对外基址（`BOTMUX_PUBLIC_URL`）：没接中心平台、但自己用 nginx 等反代把
+ * dashboard 暴露到单一公网/内网域名时，设成 `http://botmux.example.com`
+ * （scheme + host[:port]，尾部斜杠会被去掉）。设了之后 dashboard / 卡片终端链接改吐
+ * `<基址>/…`、`<基址>/s/<sessionId>`，走 dashboard 前门、无需 per-bot 端口。未设返回
+ * null → 调用方回退本地 `host:port`。它与 {@link platformMachineBaseUrl} 是「中心平台
+ * vs 自建反代」两条对外基址来源；优先级由调用方定（平台 > 本函数 > 本地）。
+ */
+export function publicReverseProxyBaseUrl(): string | null {
+  const raw = process.env.BOTMUX_PUBLIC_URL?.trim();
+  if (!raw) return null;
+  return raw.replace(/\/+$/, '');
+}
+
 /** 更新本机平台团队列表并落盘（读最新 binding 防覆盖其它字段）。返回更新后的列表。 */
 export function setPlatformTeams(teams: PlatformTeam[]): PlatformTeam[] {
   const b = readPlatformBinding();

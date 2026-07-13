@@ -310,7 +310,8 @@ describe('resolveCliId', () => {
     expect(resolveCliId('16')).toBe('copilot');
     expect(resolveCliId('20')).toBe('kimi');
     expect(resolveCliId('21')).toBe('genius');
-    expect(resolveCliId('22')).toBe('kiro-cli');
+    expect(resolveCliId('22')).toBe('grok');
+    expect(resolveCliId('23')).toBe('kiro-cli');
   });
 
   it('passes through literal cliIds unchanged', () => {
@@ -322,6 +323,7 @@ describe('resolveCliId', () => {
     expect(resolveCliId('mira')).toBe('mira');
     expect(resolveCliId('pi')).toBe('pi');
     expect(resolveCliId('copilot')).toBe('copilot');
+    expect(resolveCliId('grok')).toBe('grok');
     expect(resolveCliId('kiro-cli')).toBe('kiro-cli');
   });
 

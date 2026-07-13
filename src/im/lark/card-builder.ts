@@ -199,6 +199,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'copilot': 'Copilot',
   'oh-my-pi': 'Oh My Pi',
   'kimi': 'Kimi',
+  'grok': 'Grok Build',
   'kiro-cli': 'Kiro',
 };
 

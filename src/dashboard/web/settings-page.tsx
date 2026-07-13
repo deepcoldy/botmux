@@ -3,6 +3,7 @@ import { DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboa
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { store } from './store.js';
+import { ui } from './ui.js';
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -28,6 +29,7 @@ interface DashboardSettings {
   repoPickerMode: 'all' | 'repos';
   maintenance: MaintenanceCfg;
   localDevInstall: boolean;
+  autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
   remoteAccess: boolean;
   scheduleTimeZone: string;
@@ -41,13 +43,17 @@ const COMMON_TIMEZONES = [
   'America/Los_Angeles', 'America/New_York', 'America/Sao_Paulo', 'Australia/Sydney',
 ];
 
-interface InstallEntry { binPath: string; root: string; kind: 'npm-global' | 'source-checkout' | 'unknown' }
+type InstallKind = 'npm-global' | 'pnpm-global' | 'yarn-global' | 'bun-global' | 'source-checkout' | 'unknown';
+interface InstallEntry { binPath: string; root: string; kind: InstallKind }
 interface NodeCheck { version: string; major: number; required: number; ok: boolean }
 interface UpdateStatus {
   current: string;
   latest: string | null;
   behind: boolean;
   localDevInstall: boolean;
+  updateSupported: boolean;
+  updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'unknown';
+  updateCommand: string | null;
   node: NodeCheck;
   installs: { entries: InstallEntry[]; multiple: boolean };
 }
@@ -71,6 +77,7 @@ function parseSettings(s: any): DashboardSettings {
     repoPickerMode: s?.repoPickerMode === 'repos' ? 'repos' : 'all',
     maintenance: (s?.maintenance && typeof s.maintenance === 'object') ? s.maintenance : {},
     localDevInstall: s?.localDevInstall === true,
+    autoUpdateSupported: s?.autoUpdateSupported !== false,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
     remoteAccess: s?.remoteAccess === true,
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
@@ -91,6 +98,9 @@ function taskUi(m: MaintenanceCfg, key: 'autoUpdate' | 'autoRestart'): { enabled
 
 function installKindLabel(kind: string, tr: ReturnType<typeof useT>): string {
   if (kind === 'npm-global') return tr('update.kindNpm');
+  if (kind === 'pnpm-global') return tr('update.kindPnpm');
+  if (kind === 'yarn-global') return tr('update.kindYarn');
+  if (kind === 'bun-global') return tr('update.kindBun');
   if (kind === 'source-checkout') return tr('update.kindSource');
   return tr('update.kindUnknown');
 }
@@ -217,6 +227,7 @@ function SettingsPage() {
       setFeishuLoginQr(null);
       const saved = parseSettings(body.settings);
       setSettings(saved);
+      ui.publicReadOnly = saved.publicReadOnly;
       store.setScheduleTimeZone(saved.effectiveScheduleTimeZone);
       setSettingsMsg({ text: tr('settings.saved'), cls: 'hint-ok' });
     } catch (e) {
@@ -300,14 +311,20 @@ function SettingsPage() {
       window.alert(tr('update.nodeTooOldAlert', { version: s.node.version, required: s.node.required }));
       return;
     }
+    if (!s.updateSupported || !s.updateCommand) {
+      window.alert(tr('update.unsupportedInstall'));
+      return;
+    }
     if (s.installs.multiple) {
       const paths = s.installs.entries.map(e => `• ${e.binPath} (${installKindLabel(e.kind, tr)})`).join('\n');
       if (!window.confirm(tr('update.confirmMultiInstall', { paths }))) return;
     }
-    const confirmMsg = s.latest ? tr('update.confirmUpdate', { version: `v${s.latest}` }) : tr('update.confirmUpdateNoVer');
+    const confirmMsg = s.latest
+      ? tr('update.confirmUpdate', { version: `v${s.latest}`, command: s.updateCommand })
+      : tr('update.confirmUpdateNoVer', { command: s.updateCommand });
     if (!window.confirm(confirmMsg)) return;
     setUpBusy(true);
-    setUpMsg({ text: tr('update.updating') });
+    setUpMsg({ text: tr('update.updating', { command: s.updateCommand }) });
     try {
       const r = await fetch('/api/update/run', { method: 'POST' });
       const body = await r.json().catch(() => ({}));
@@ -414,7 +431,7 @@ function SettingsBody(props: {
   const { settings, canWrite, bound, savingKey } = props;
   const dis = !canWrite;
   const autoUpdate = taskUi(settings.maintenance, 'autoUpdate');
-  const autoUpdateDisabled = !canWrite || settings.localDevInstall;
+  const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
   const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'chatBotDiscovery' | 'remoteAccess', value: boolean) => {
@@ -576,7 +593,11 @@ function SettingsBody(props: {
       <SettingsGroup className="settings-group-ops">
         <SettingsBlock
           title={tr('settings.sectionMaintenance')}
-          titleExtra={settings.localDevInstall ? <span className="settings-title-note">{tr('settings.autoUpdateLocalDev')}</span> : null}
+          titleExtra={settings.localDevInstall
+            ? <span className="settings-title-note">{tr('settings.autoUpdateLocalDev')}</span>
+            : !settings.autoUpdateSupported
+              ? <span className="settings-title-note">{tr('settings.autoUpdateUnsupportedInstall')}</span>
+              : null}
         >
           <div className="settings-maintenance-grid">
             <div className="settings-maintenance-update">
@@ -780,7 +801,7 @@ function UpdateCard(props: {
     inner = <LoadingState label={tr('update.loading')} compact />;
   } else {
     const s = props.status;
-    const updateDisabled = s.localDevInstall || props.busy;
+    const updateDisabled = s.localDevInstall || !s.updateSupported || props.busy;
     inner = (
       <>
         <p className="update-version">
@@ -788,6 +809,7 @@ function UpdateCard(props: {
           <UpdateBadge status={s} />
         </p>
         {!s.node.ok ? <p className="hint-warn">{tr('update.nodeWarn', { version: s.node.version, required: s.node.required })}</p> : null}
+        {!s.localDevInstall && !s.updateSupported ? <p className="hint-warn">{tr('update.unsupportedInstall')}</p> : null}
         {s.installs.multiple ? <MultiInstallWarning entries={s.installs.entries} /> : null}
         <div className="update-actions">
           <button type="button" data-up="check" disabled={props.busy} onClick={props.onCheck}>{tr('update.btnCheck')}</button>
@@ -813,7 +835,11 @@ function UpdateCard(props: {
     <SettingsBlock
       className="settings-update-block"
       title={tr('update.section')}
-      titleExtra={props.status?.localDevInstall ? <span className="settings-title-note">{tr('update.localDev')}</span> : null}
+      titleExtra={props.status?.localDevInstall
+        ? <span className="settings-title-note">{tr('update.localDev')}</span>
+        : props.status && !props.status.updateSupported
+          ? <span className="settings-title-note">{tr('update.unsupportedInstall')}</span>
+          : null}
     >
       {inner}
     </SettingsBlock>

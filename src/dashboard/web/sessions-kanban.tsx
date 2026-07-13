@@ -47,6 +47,7 @@ export interface SessionsKanbanIcons {
   history: string;
   lock: string;
   restart: string;
+  terminal: string;
   unlock: string;
 }
 
@@ -82,6 +83,8 @@ export interface SessionsKanbanCallbacks {
   onRestart: (row: any, button: HTMLButtonElement) => void;
   onTeamScope: (scope: { chats: number; sessions: number } | null) => void;
   onToggleLock: (row: any, button: HTMLButtonElement) => void;
+  onToggleSelect: (row: any) => void;
+  selectedSessionIds: ReadonlySet<string>;
 }
 
 export type SessionsKanbanProps = SessionsKanbanState & SessionsKanbanCallbacks & {
@@ -407,8 +410,10 @@ function KanbanCard(props: {
   const status = String(row.status ?? 'unknown');
   const remote = typeof row.remoteDeployment === 'string' ? row.remoteDeployment : '';
   const isEditing = props.editingId === row.sessionId;
+  const selected = callbacks.selectedSessionIds.has(String(row.sessionId));
   const className = [
     'kanban-card',
+    selected ? 'selected' : '',
     remote ? 'kanban-card-remote' : '',
     row.locked ? 'locked' : '',
     props.dragId === row.sessionId ? 'dragging' : '',
@@ -422,6 +427,14 @@ function KanbanCard(props: {
         label={t('sessions.history.title')}
         onClick={() => callbacks.onHistory(row)}
       />
+      {row.webPort ? (
+        <CardActButton
+          action="terminal"
+          icon={callbacks.icons.terminal}
+          label={t('sessions.openTerminal')}
+          onClick={() => callbacks.onOpenTerminal(row)}
+        />
+      ) : null}
       {row.feishuChatLink ? (
         <a
           className="card-act kanban-card-act"
@@ -464,6 +477,7 @@ function KanbanCard(props: {
       data-id={row.sessionId}
       tabIndex={0}
       role="button"
+      aria-pressed={selected}
       draggable
       onClick={event => props.onCardClick(row, event)}
       onKeyDown={event => props.onCardKeyDown(row, event)}
@@ -532,6 +546,8 @@ function ClusterView(props: {
   columnId?: SessionKanbanColumn;
   dragCluster: { chatId: string; col: SessionKanbanColumn } | null;
   cardProps: Omit<Parameters<typeof KanbanCard>[0], 'row'>;
+  expanded: boolean;
+  onToggleExpanded: () => void;
   onDragStartCluster: (chatId: string, col: SessionKanbanColumn, event: DragEvent<HTMLElement>) => void;
 }): JSX.Element {
   const item = props.item;
@@ -539,20 +555,32 @@ function ClusterView(props: {
   const title = chatDisplayTitle(item.rows[0]) ?? item.chatId;
   const dragging = props.dragCluster?.chatId === item.chatId && props.dragCluster.col === props.columnId;
   return (
-    <div className={`kanban-cluster${dragging ? ' dragging' : ''}`} data-chat={item.chatId}>
+    <div className={`kanban-cluster${props.expanded ? ' expanded' : ' collapsed'}${dragging ? ' dragging' : ''}`} data-chat={item.chatId}>
       <header
         draggable
         title={`${title} · ${t('sessions.kanban.clusterDragHint')}`}
         onDragStart={event => {
           if (props.columnId) props.onDragStartCluster(item.chatId, props.columnId, event);
         }}
-        dangerouslySetInnerHTML={rawHtml(
-          `${chatAvatarHtml({ chatId: item.chatId, name: title, size: 'sm' })}`
-          + `<span class="kanban-cluster-name">${escapeHtml(title)}</span>`
-          + `<span class="kanban-cluster-count">${item.rows.length}</span>`,
-        )}
-      />
-      {item.rows.map(row => <KanbanCard key={row.sessionId} {...props.cardProps} row={row} />)}
+      >
+        <span className="kanban-cluster-avatar" dangerouslySetInnerHTML={rawHtml(chatAvatarHtml({ chatId: item.chatId, name: title, size: 'sm' }))} />
+        <span className="kanban-cluster-name">{title}</span>
+        <span className="kanban-cluster-count">{item.rows.length}</span>
+        <button
+          type="button"
+          className="kanban-cluster-toggle"
+          aria-expanded={props.expanded}
+          title={t(props.expanded ? 'sessions.kanban.clusterCollapse' : 'sessions.kanban.clusterExpand')}
+          aria-label={t(props.expanded ? 'sessions.kanban.clusterCollapse' : 'sessions.kanban.clusterExpand')}
+          onClick={(event) => {
+            event.stopPropagation();
+            props.onToggleExpanded();
+          }}
+        >
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m5.5 6.5 2.5 2.5 2.5-2.5" /></svg>
+        </button>
+      </header>
+      {props.expanded ? item.rows.map(row => <KanbanCard key={row.sessionId} {...props.cardProps} row={row} />) : null}
     </div>
   );
 }
@@ -563,6 +591,7 @@ export function SessionsKanbanView(props: SessionsKanbanProps): JSX.Element {
   const [drag, setDrag] = useState<{ kind: 'card'; id: string } | { kind: 'cluster'; chatId: string; col: SessionKanbanColumn } | null>(null);
   const [dragOverCol, setDragOverCol] = useState<SessionKanbanColumn | string | null>(null);
   const [dropBeforeId, setDropBeforeId] = useState<string | null>(null);
+  const [expandedClusters, setExpandedClusters] = useState<Set<string>>(() => new Set());
   const pendingPropsRef = useRef<SessionsKanbanProps | null>(null);
   const pendingScrollRef = useRef<Map<string, number> | null>(null);
   const openTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -636,6 +665,15 @@ export function SessionsKanbanView(props: SessionsKanbanProps): JSX.Element {
     setDropBeforeId(null);
   }, []);
 
+  const toggleExpandedCluster = useCallback((key: string) => {
+    setExpandedClusters(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
   const onBeginEdit = useCallback((row: any) => {
     cancelOpen();
     if (isRemoteRow(row)) return;
@@ -649,7 +687,7 @@ export function SessionsKanbanView(props: SessionsKanbanProps): JSX.Element {
     cancelOpen();
     openTimerRef.current = setTimeout(() => {
       openTimerRef.current = null;
-      display.onOpenTerminal(row);
+      display.onToggleSelect(row);
     }, 220);
   }, [cancelOpen, display]);
 
@@ -657,7 +695,7 @@ export function SessionsKanbanView(props: SessionsKanbanProps): JSX.Element {
     if (event.key !== 'Enter' && event.key !== ' ') return;
     if (event.target !== event.currentTarget || isRemoteRow(row)) return;
     event.preventDefault();
-    display.onOpenTerminal(row);
+    display.onToggleSelect(row);
   }, [display]);
 
   const onDragStartCard = useCallback((row: any, event: DragEvent<HTMLElement>) => {
@@ -770,6 +808,10 @@ export function SessionsKanbanView(props: SessionsKanbanProps): JSX.Element {
                   item={item}
                   dragCluster={drag?.kind === 'cluster' ? drag : null}
                   cardProps={cardProps}
+                  expanded={item.type === 'cluster' && expandedClusters.has(`bot:${column.key}:${item.chatId}`)}
+                  onToggleExpanded={() => {
+                    if (item.type === 'cluster') toggleExpandedCluster(`bot:${column.key}:${item.chatId}`);
+                  }}
                   onDragStartCluster={onDragStartCluster}
                 />
               ))}
@@ -805,6 +847,10 @@ export function SessionsKanbanView(props: SessionsKanbanProps): JSX.Element {
                   columnId={column.id}
                   dragCluster={drag?.kind === 'cluster' ? drag : null}
                   cardProps={cardProps}
+                  expanded={item.type === 'cluster' && expandedClusters.has(`${column.id}:${item.chatId}`)}
+                  onToggleExpanded={() => {
+                    if (item.type === 'cluster') toggleExpandedCluster(`${column.id}:${item.chatId}`);
+                  }}
                   onDragStartCluster={onDragStartCluster}
                 />
               ))
