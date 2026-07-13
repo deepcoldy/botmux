@@ -2514,11 +2514,12 @@ const server = createServer(async (req, res) => {
         // ttadk 模型默认值 + 候选 (单一事实源在 cli-selection), 供前端模型框使用.
         ttadkModelDefault: TTADK_DEFAULT_MODEL,
         ttadkModelSuggestions: TTADK_MODEL_SUGGESTIONS,
+        suggestedAppName: botOnboarding.suggestedAppName(),
       });
     }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
-      let parsed: { cliId?: unknown; workingDir?: unknown; dirMode?: unknown; model?: unknown };
+      let parsed: { appName?: unknown; registrationMode?: unknown; cliId?: unknown; workingDir?: unknown; dirMode?: unknown; model?: unknown };
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -2556,7 +2557,16 @@ const server = createServer(async (req, res) => {
       }
       const dirMode = dirModeRaw === 'fixed' ? 'fixed' as const : dirModeRaw === 'card' ? 'card' as const : undefined;
       const model = typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : undefined;
-      const job = botOnboarding.start({ cliId, wrapperCli, workingDir, dirMode, model });
+      const appName = typeof parsed.appName === 'string' && parsed.appName.trim() ? parsed.appName.trim() : undefined;
+      if (appName && Array.from(appName).length > 64) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_app_name', message: '应用名称不能超过 64 个字符' });
+      }
+      const registrationModeRaw = typeof parsed.registrationMode === 'string' ? parsed.registrationMode.trim() : '';
+      if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web 或 compat' });
+      }
+      const registrationMode = registrationModeRaw === 'compat' ? 'compat' as const : 'web' as const;
+      const job = botOnboarding.start({ appName, registrationMode, cliId, wrapperCli, workingDir, dirMode, model });
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
     }
     let mOwner: RegExpMatchArray | null;

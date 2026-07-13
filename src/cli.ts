@@ -49,6 +49,7 @@ import {
   type BotConfigEditInput,
 } from './setup/bot-config-editor.js';
 import { resolveCliSelection, selectionKeyForBot } from './setup/cli-selection.js';
+import { resolveSetupAppName } from './setup/app-name.js';
 import {
   buildBotFromAddFlags,
   editInputFromFlags,
@@ -525,9 +526,8 @@ function printCopyHint(filePath: string): void {
 }
 
 function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
-  // PersonalAgent 应用扫码建出来时已默认订阅 im.message.receive_v1 +
-  // card.action.trigger, 并开通 bot 能力, 主线只剩两步: 申请权限 + 重定向
-  // URL (按需). README "Step 8 收不到消息时" 段提供 fallback 自查链接.
+  // 同时覆盖 Web 企业自建应用与 SDK PersonalAgent fallback：后者的 bot / 事件
+  // 步骤通常已完成，但重复核对无害；前者在自动化中途失败时必须补齐这些步骤。
   const home = `${larkHosts(brand).openApi}/app/${appId}`;
   let scopesJsonPath = '';
   try {
@@ -537,9 +537,17 @@ function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
     console.log(`\n⚠️  写权限 JSON 失败 (${(err as Error).message}), 请手动从仓库源码 src/setup/lark-scopes.json 拷.`);
   }
 
-  console.log('\n剩余两步在开放平台完成:\n');
+  console.log('\n请在开放平台核对并补齐以下配置:\n');
 
-  console.log('  1. 申请权限 (一次性导入完整 JSON 提交审批)');
+  console.log('  1. 开启「应用功能 → 机器人」能力');
+  console.log(`     配置链接: ${home}/capability/bot`);
+  console.log('');
+
+  console.log('  2. 事件与回调切到「使用长连接接收事件」，并订阅 im.message.receive_v1 / card.action.trigger');
+  console.log(`     配置链接: ${home}/dev-config/event-sub`);
+  console.log('');
+
+  console.log('  3. 申请权限 (一次性导入完整 JSON 提交审批)');
   console.log(`     申请链接: ${home}/auth → 进入「权限管理」→「批量导入/导出权限」→ 粘贴 → 提交`);
   if (scopesJsonPath) {
     console.log(`     权限 JSON: ${scopesJsonPath}`);
@@ -547,50 +555,66 @@ function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
   }
   console.log('');
 
-  console.log('  2. 添加重定向 URL (用于 botmux 内 `/login` 拿用户 UAT 获取卡片消息)');
+  console.log('  4. 添加重定向 URL (用于 botmux 内 `/login` 拿用户 UAT 获取卡片消息)');
   console.log(`     申请链接: ${home}/safe → 进入「安全设置」→「重定向 URL」`);
   console.log('     填入: http://127.0.0.1:9768/callback');
   console.log('     不需要 `/login` 拿卡片消息的话, 这一步可以跳过.\n');
+
+  console.log('  5. 在「版本管理与发布」创建版本并提交发布');
+  console.log(`     配置链接: ${home}/version`);
+  console.log('');
 
   console.log('  完成后 `botmux start` (或 `botmux restart`)，启动检查不会卡住，');
   console.log('  缺权限只 WARN，去开放平台补齐后 daemon 自动恢复。\n');
 }
 
-async function finishOpenPlatformSetup(appId: string, brand: 'feishu' | 'lark'): Promise<void> {
+async function finishOpenPlatformSetup(
+  appId: string,
+  brand: 'feishu' | 'lark',
+  options: { reuseOnly?: boolean; quiet?: boolean } = {},
+): Promise<void> {
+  const say = (...args: unknown[]) => { if (!options.quiet) console.log(...args); };
   const { parseSetupOpenPlatformAutoFlag, automateOpenPlatformSetup } = await import('./setup/open-platform-automation.js');
   if (!parseSetupOpenPlatformAutoFlag(process.argv.slice(3))) {
-    console.log('\n已跳过开放平台自动配置 (--no-open-platform-auto)。');
-    printRemainingSteps(appId, brand);
+    say('\n已跳过开放平台自动配置 (--no-open-platform-auto)。');
+    if (!options.quiet) printRemainingSteps(appId, brand);
     return;
   }
 
-  console.log('\n── 开放平台自动配置 ──\n');
-  console.log('将使用 botmux 内置 Feishu Web QR 登录获取/复用 Web session，自动导入权限、配置 redirect URL 并创建/发布版本。');
-  console.log('如失败会自动回退到手动步骤提示，不影响已写入的 botmux 配置。\n');
+  say('\n── 开放平台自动配置 ──\n');
+  say(options.reuseOnly
+    ? '将复用创建应用时的 Feishu Web session，自动导入权限、配置 redirect URL 并创建/发布版本；本路径不会再显示二维码。'
+    : '将获取或复用 Feishu Web session，自动导入权限、配置 redirect URL 并创建/发布版本。');
+  say('如失败会自动回退到手动步骤提示，不影响已写入的 botmux 配置。\n');
 
-  const result = await automateOpenPlatformSetup({ appId, brand });
+  const result = await automateOpenPlatformSetup({
+    appId,
+    brand,
+    disableQrLogin: options.reuseOnly,
+    disableBytedcliFallback: options.reuseOnly,
+  });
   if (result.ok) {
-    console.log('✅ 开放平台自动配置完成');
-    console.log(`   Session 来源: ${result.sessionSource}`);
+    say('✅ 开放平台自动配置完成');
+    say(`   Session 来源: ${result.sessionSource}`);
     const skipped = result.skippedScopeCount ?? 0;
-    console.log(`   已导入权限数: ${result.scopeCount}${skipped > 0 ? `（另有 ${skipped} 项当前租户目录中没有，已跳过）` : ''}`);
+    say(`   已导入权限数: ${result.scopeCount}${skipped > 0 ? `（另有 ${skipped} 项当前租户目录中没有，已跳过）` : ''}`);
     if (result.scopeWarning) {
-      console.log(`   ⚠️ 权限注册未全部成功（部分租户对个别权限有限制）：${result.scopeWarning}`);
-      console.log('      可稍后到开放平台「权限管理」手动补齐缺失权限。');
+      say(`   ⚠️ 权限注册未全部成功（部分租户对个别权限有限制）：${result.scopeWarning}`);
+      say('      可稍后到开放平台「权限管理」手动补齐缺失权限。');
     } else if (result.scopeCount === 0) {
-      console.log('   ⚠️ 本次没有成功导入任何权限，请到开放平台「权限管理」手动导入 ~/.botmux/lark-scopes.json。');
+      say('   ⚠️ 本次没有成功导入任何权限，请到开放平台「权限管理」手动导入 ~/.botmux/lark-scopes.json。');
     }
-    console.log(`   已配置 redirect URL: http://127.0.0.1:9768/callback`);
-    if (result.versionId) console.log(`   已提交发布版本: ${result.versionId}`);
-    else console.log('   已创建版本；未从响应中解析到 versionId，请到开放平台确认是否需要手动发布。');
-    console.log('');
+    say(`   已配置 redirect URL: http://127.0.0.1:9768/callback`);
+    if (result.versionId) say(`   已提交发布版本: ${result.versionId}`);
+    else say('   已创建版本；未从响应中解析到 versionId，请到开放平台确认是否需要手动发布。');
+    say('');
     return;
   }
 
-  console.log(`⚠️  开放平台自动配置失败 (${result.reason}): ${result.message}`);
-  if (result.sessionFile) console.log(`   botmux session 文件: ${result.sessionFile}`);
-  console.log('   请按下面的手动步骤继续完成开放平台配置。');
-  printRemainingSteps(appId, brand);
+  say(`⚠️  开放平台自动配置失败 (${result.reason}): ${result.message}`);
+  if (result.sessionFile) say(`   botmux session 文件: ${result.sessionFile}`);
+  say('   请按下面的手动步骤继续完成开放平台配置。');
+  if (!options.quiet) printRemainingSteps(appId, brand);
 }
 
 /**
@@ -685,7 +709,7 @@ async function pickExistingAppCredentials(
  * - 任何失败都返回结构化对象, 不抛 (调用方根据 ok=false 回退)
  */
 async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promise<
-  | { ok: true; appId: string; appSecret: string; brand: Brand; userOpenId?: string }
+  | { ok: true; appId: string; appSecret: string; brand: Brand; userOpenId?: string; webSessionReady?: boolean }
   | { ok: false; reason: 'cancelled' }
 > {
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
@@ -694,7 +718,7 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
     const method = await pickChoice(rl, {
       title: '飞书应用来源',
       items: [
-        { label: '扫码创建新应用（推荐）', hint: '飞书 App 扫码，自动创建并拿到 AppID/Secret' },
+        { label: '一次扫码创建新应用（推荐）', hint: '飞书 Web 登录后自动命名、创建应用、取凭证并完成开放平台配置' },
         { label: '选择已有应用', hint: '飞书 Web 登录列出你创建过的应用，自动取 AppID/Secret（仅飞书租户）' },
         { label: '手动输入 AppID/Secret', hint: '已在开放平台创建好应用' },
       ],
@@ -704,7 +728,58 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
     if (method === null) return { ok: false, reason: 'cancelled' };
 
     if (method === 0) {
-      // 动态导入避免冷启动加载 SDK
+      const suggestedName = resolveSetupAppName(undefined, loadBotsJson().length);
+      const appName = (await ask(rl, `机器人名称 [${suggestedName}]: `)).trim() || suggestedName;
+      const { createFeishuOpenPlatformApp } = await import('./setup/open-platform-automation.js');
+      console.log('\n正在准备安全登录，请确认要创建应用的飞书账号与企业…');
+      const webResult = await createFeishuOpenPlatformApp({
+        name: appName,
+        forceQrLogin: true,
+        disableBytedcliFallback: true,
+        onQrCode: info => {
+          process.stderr.write('\n请用飞书 App 扫码登录，botmux 将代你创建应用并完成配置：\n\n');
+          process.stderr.write(`${info.qrText}\n`);
+        },
+        onStatus: message => { process.stderr.write(`${message}\n`); },
+      });
+      if (webResult.ok) {
+        console.log('\n✅ 应用创建成功（同一登录态将继续完成权限与发版，无需再次扫码）');
+        console.log(`   应用名称: ${appName}`);
+        console.log(`   App ID: ${webResult.appId}`);
+        console.log('   租户类型: 飞书 (feishu.cn)');
+        return {
+          ok: true,
+          appId: webResult.appId,
+          appSecret: webResult.appSecret,
+          brand: 'feishu',
+          webSessionReady: true,
+        };
+      }
+
+      console.log(`\n⚠️  Web 自动创建失败 (${webResult.reason}): ${webResult.message}`);
+      if (webResult.appId) {
+        console.log(`   应用 ${webResult.appId} 已经创建，为避免重复建应用，不自动回退。`);
+        console.log('   请返回后选择「选择已有应用」重新读取凭证。\n');
+        if (interactive) continue;
+        return { ok: false, reason: 'cancelled' };
+      }
+
+      const compatibility = await pickChoice(rl, {
+        title: '是否使用兼容模式？',
+        items: [
+          { label: '使用兼容模式', hint: '官方 SDK device flow；可能需要额外扫码，应用名称由平台决定' },
+          { label: '返回应用来源', hint: '保留当前配置输入，不会创建新应用' },
+        ],
+        defaultIndex: 1,
+        footer: '兼容模式不会应用刚才填写的自定义名称',
+      });
+      if (compatibility !== 0) {
+        if (interactive) continue;
+        return { ok: false, reason: 'cancelled' };
+      }
+      console.log('   已明确选择 SDK 兼容模式；应用名称由平台决定。\n');
+
+      // Web console 不可用 / Lark 国际版时保留官方 SDK device flow 作为稳定回退。
       const { tryRegisterApp } = await import('./setup/register-app.js');
       const result = await tryRegisterApp();
       if (result.ok) {
@@ -725,7 +800,7 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
           userOpenId: result.userOpenId,
         };
       }
-      console.log(`\n⚠️  扫码失败 (${result.error}): ${result.message}`);
+      console.log(`\n⚠️  SDK 扫码失败 (${result.error}): ${result.message}`);
       if (result.error === 'aborted') {
         // 用户主动取消整个 setup, 不再问手动 fallback
         return { ok: false, reason: 'cancelled' };
@@ -948,7 +1023,17 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
 
   if (!ensureBotWorkingDirsExist(bot, '仓库扫描根目录')) return null;
 
-  return normalizeBotConfig(bot);
+  const normalized = normalizeBotConfig(bot);
+  if (creds.webSessionReady) {
+    Object.defineProperty(normalized, SETUP_WEB_SESSION_READY, { value: true, enumerable: false });
+  }
+  return normalized;
+}
+
+const SETUP_WEB_SESSION_READY = Symbol('setup-web-session-ready');
+
+function hasSetupWebSession(bot: Record<string, any>): boolean {
+  return Boolean((bot as any)[SETUP_WEB_SESSION_READY]);
 }
 
 function formatOptionalValue(v: unknown): string {
@@ -1186,7 +1271,7 @@ async function writeSingleBotConfig(): Promise<boolean> {
 
   writeBotsJsonAtomic([bot]);
   console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
-  await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot));
+  await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), { reuseOnly: hasSetupWebSession(bot) });
   console.log(`下一步:`);
   console.log(`  1. botmux start              启动 daemon`);
   console.log(`  2. botmux autostart enable   注册开机自启（推荐：${process.platform === 'darwin' ? 'mac launchd' : process.platform === 'linux' ? 'linux user systemd' : process.platform === 'win32' ? 'Windows Task Scheduler' : '当前平台暂不支持'}，无需 sudo）`);
@@ -1196,8 +1281,8 @@ async function writeSingleBotConfig(): Promise<boolean> {
 // ─── Scripted (non-TUI) setup ────────────────────────────────────────────────
 
 /** 脚本化 setup 统一失败出口：--json 输出结构化错误到 stdout，退出码 1。 */
-function failSetupScripted(json: boolean, message: string): void {
-  if (json) console.log(JSON.stringify({ ok: false, error: message }));
+function failSetupScripted(json: boolean, message: string, details: Record<string, unknown> = {}): void {
+  if (json) console.log(JSON.stringify({ ok: false, error: message, ...details }));
   else console.error(`❌ ${message}`);
   process.exitCode = 1;
 }
@@ -1268,23 +1353,108 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
   }
 
   if (cmd.action === 'add') {
-    let bot: Record<string, any>;
-    try {
-      bot = buildBotFromAddFlags(cmd.flags);
-    } catch (err: any) {
-      failSetupScripted(cmd.json, err?.message ?? String(err));
-      return;
-    }
-
     // 单机器人 .env 老配置：与 TUI「添加新机器人」一致，先迁移进 bots.json 再追加。
     let existing = bots;
     let migratedEnv = false;
+    let createdAppId: string | undefined;
+    let createdAppName: string | undefined;
     if (!existsSync(BOTS_JSON_FILE) && existsSync(ENV_FILE)) {
       const legacy = parseDotEnvToBotConfig();
       if (legacy.larkAppId && legacy.larkAppSecret) {
         existing = [legacy];
         migratedEnv = true;
       }
+    }
+
+    // --create-app 会产生真实开放平台应用；先用占位凭证完成纯本地字段、owner、
+    // CLI 与目录预检，避免参数错误发生在扫码建应用之后而留下孤儿应用。
+    if (cmd.createApp) {
+      let preflight: Record<string, any>;
+      try {
+        preflight = buildBotFromAddFlags({
+          ...cmd.flags,
+          appId: 'cli_preflight',
+          appSecret: 'preflight-only',
+        });
+      } catch (err: any) {
+        failSetupScripted(cmd.json, err?.message ?? String(err));
+        return;
+      }
+      const preflightBadDirs = invalidBotDirs(preflight);
+      if (preflightBadDirs.length > 0) {
+        failSetupScripted(cmd.json, `目录不存在或不是目录: ${preflightBadDirs.join(', ')}。请先创建，未创建应用。`);
+        return;
+      }
+
+      const appName = resolveSetupAppName(cmd.flags.appName, existing.length);
+      const requestedBrand = normalizeBrand(cmd.flags.brand);
+      let credentials:
+        | { ok: true; appId: string; appSecret: string; brand: Brand }
+        | { ok: false; message: string; appId?: string };
+      let appliedAppName = false;
+
+      if ((requestedBrand === 'lark' || cmd.compatibilityMode) && cmd.flags.appName?.trim()) {
+        failSetupScripted(cmd.json, 'Lark / SDK 兼容模式不支持 --app-name；请移除该参数，应用名称将由平台决定。');
+        return;
+      }
+
+      if (requestedBrand === 'lark' || cmd.compatibilityMode) {
+        if (!cmd.json) console.log('⚠️  正在使用 SDK 兼容模式，可能需要额外扫码；应用名称由平台决定。');
+        const { tryRegisterApp } = await import('./setup/register-app.js');
+        const registered = await tryRegisterApp();
+        credentials = registered.ok
+          ? registered
+          : { ok: false, message: `SDK 扫码失败 (${registered.error}): ${registered.message}` };
+      } else {
+        const { createFeishuOpenPlatformApp } = await import('./setup/open-platform-automation.js');
+        const created = await createFeishuOpenPlatformApp({
+          name: appName,
+          forceQrLogin: true,
+          disableBytedcliFallback: true,
+        });
+        if (created.ok) {
+          credentials = created;
+          appliedAppName = true;
+        } else if (created.appId) {
+          credentials = {
+            ok: false,
+            appId: created.appId,
+            message: `应用已创建但后续步骤失败 (${created.reason}): ${created.message}`,
+          };
+        } else {
+          credentials = {
+            ok: false,
+            message: `一次扫码创建失败 (${created.reason}): ${created.message}。可重试，或显式加 --compatibility-mode 使用可能需要额外扫码的兼容模式。`,
+          };
+        }
+      }
+
+      if (!credentials.ok) {
+        const continueCommand = credentials.appId
+          ? `botmux setup add --app-id ${credentials.appId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL>`
+          : undefined;
+        failSetupScripted(cmd.json,
+          `${credentials.message}${credentials.appId ? `；已创建 AppID ${credentials.appId}，请从开放平台读取 App Secret 后运行 ${continueCommand} 继续，未重复创建。` : ''}`,
+          credentials.appId ? { partial: true, appId: credentials.appId, appName, continueCommand } : {},
+        );
+        return;
+      }
+      cmd.flags.appId = credentials.appId;
+      cmd.flags.appSecret = credentials.appSecret;
+      cmd.flags.brand = credentials.brand;
+      createdAppId = credentials.appId;
+      createdAppName = appliedAppName ? appName : undefined;
+      if (!cmd.json) {
+        console.log(`✅ 已创建${credentials.brand === 'lark' ? ' Lark' : '飞书'}应用${appliedAppName ? ` ${appName}` : ''} (${credentials.appId})，继续校验并写入 bot 配置。`);
+      }
+    }
+
+    let bot: Record<string, any>;
+    try {
+      bot = buildBotFromAddFlags(cmd.flags);
+    } catch (err: any) {
+      failSetupScripted(cmd.json, err?.message ?? String(err));
+      return;
     }
 
     if (existing.some(b => b?.larkAppId === bot.larkAppId)) {
@@ -1301,16 +1471,48 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
     const { validateCredentials } = await import('./setup/verify-permissions.js');
     const v = await validateCredentials(bot.larkAppId, bot.larkAppSecret, botBrand(bot));
     if (!v.ok) {
-      failSetupScripted(cmd.json, `凭证校验失败 (${v.error}): ${v.message}`);
+      const continueCommand = createdAppId
+        ? `botmux setup add --app-id ${createdAppId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL>`
+        : undefined;
+      failSetupScripted(
+        cmd.json,
+        `凭证校验失败 (${v.error}): ${v.message}${createdAppId ? `；应用 ${createdAppId} 已创建，未重复创建。请运行 ${continueCommand} 继续。` : ''}`,
+        createdAppId ? { partial: true, appId: createdAppId, ...(createdAppName ? { appName: createdAppName } : {}), continueCommand } : {},
+      );
       return;
     }
 
-    writeBotsJsonAtomic([...existing, bot]);
-    if (migratedEnv) renameSync(ENV_FILE, ENV_FILE + '.bak');
+    try {
+      writeBotsJsonAtomic([...existing, bot]);
+    } catch (err) {
+      const continueCommand = createdAppId
+        ? `botmux setup add --app-id ${createdAppId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL>`
+        : undefined;
+      failSetupScripted(
+        cmd.json,
+        `写入 bot 配置失败: ${err instanceof Error ? err.message : String(err)}${createdAppId ? `；应用 ${createdAppId} 已创建，未重复创建。请运行 ${continueCommand} 继续。` : ''}`,
+        createdAppId ? { partial: true, appId: createdAppId, ...(createdAppName ? { appName: createdAppName } : {}), continueCommand } : {},
+      );
+      return;
+    }
+    if (migratedEnv) {
+      try {
+        renameSync(ENV_FILE, ENV_FILE + '.bak');
+      } catch (err) {
+        // bots.json is already durable and takes precedence over legacy .env.
+        // Do not report a partial app failure that would encourage a duplicate;
+        // leave the old file in place and surface a cleanup warning only.
+        if (!cmd.json) console.error(`⚠️  bots.json 已写入，但旧 .env 备份失败: ${err instanceof Error ? err.message : String(err)}`);
+        migratedEnv = false;
+      }
+    }
 
-    // 开放平台自动配置（权限导入/发版）需要扫码，脚本化模式默认跳过、显式 opt-in。
+    // 已有凭证模式默认跳过；--create-app 默认开启并复用刚才的 Web session。
     if (cmd.openPlatformAuto) {
-      await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot));
+      await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), {
+        reuseOnly: cmd.createApp && !cmd.compatibilityMode && botBrand(bot) === 'feishu',
+        quiet: cmd.json,
+      });
     }
 
     const index = existing.length;
@@ -1322,6 +1524,8 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
         ok: true,
         action: 'add',
         bot: botJsonView(bot, index),
+        appId: bot.larkAppId,
+        ...(cmd.createApp && botBrand(bot) === 'feishu' && !cmd.compatibilityMode ? { appName: resolveSetupAppName(cmd.flags.appName, index) } : {}),
         botsFile: BOTS_JSON_FILE,
         envMigrated: migratedEnv || undefined,
         openPlatform: cmd.openPlatformAuto ? 'attempted' : 'skipped',
@@ -1507,7 +1711,7 @@ async function cmdSetup(): Promise<void> {
       console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
       writeBotsJsonAtomic([newBot]);
       console.log(`✅ 配置已写入: ${BOTS_JSON_FILE}`);
-      await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot));
+      await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
       console.log(`下一步: botmux restart\n`);
       return;
     }
@@ -1616,7 +1820,7 @@ async function cmdSetup(): Promise<void> {
     writeBotsJsonAtomic([...bots, newBot]);
     console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length + 1} 个`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
-    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot));
+    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
     printAddBotLiveHint(newBot.larkAppId);
     return;
     }
@@ -1673,7 +1877,7 @@ async function cmdSetup(): Promise<void> {
     console.log(`\n✅ 已迁移到多机器人配置`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     console.log(`   旧配置已备份: ${ENV_FILE}.bak`);
-    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot));
+    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
     printAddBotLiveHint(newBot.larkAppId);
 
   } else {

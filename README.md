@@ -191,6 +191,7 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 > 命令行 `botmux dashboard` 出一次性 token URL，浏览器里跨所有 daemon/机器人管控
 
 - 一键定位回飞书话题 / 跳 Web 终端 / 多选批量关闭会话
+- 添加机器人对齐 Feishu 单次扫码主路径：名称可选且全程冻结，支持 AI CLI / 工作目录选择、管理员 fail-closed 补填与显式兼容模式
 - 拉新群、自动转让群主、@ 提醒
 - 解散群聊、bot 退群（关联会话自动清理）
 - **会话洞察**（owner-only，只读）：解析各会话 transcript，看动作 span / 工作时序 / 上下文曲线 / 失败聚合 + 诊断建议；聊天里发 `/insight` 可取当前会话摘要卡
@@ -217,7 +218,7 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 
 ## 5 分钟快速接入
 
-> 💡 **TL;DR**：`npm i -g botmux` → `botmux setup`，**扫两次码**就能建好一个可用机器人 → `botmux start`。第 1 次扫码建应用、拿到 AppID/AppSecret（事件订阅 + bot 能力默认已配好）；第 2 次扫码让 botmux 内置的飞书 Web 登录**自动导入权限、配置重定向 URL、创建并提交发布版本**。整个开放平台配置（建应用 / 权限 / 重定向 / 发版）都已由 setup 默认完成；加 `--no-open-platform-auto` 可跳过第二次自动配置、改走文末折叠的手动步骤。
+> 💡 **TL;DR**：`npm i -g botmux` → `botmux setup`，飞书租户**扫一次码**就能建好一个可用机器人 → `botmux start`。这次扫码拿到的 Web 登录态会连续完成：按 `botmux-N`（可自定义）命名并创建应用、读取 AppID/AppSecret、导入权限、配置重定向 URL、创建并提交发布版本。整个开放平台配置都由 setup 默认完成；加 `--no-open-platform-auto` 可跳过应用创建后的权限/发版自动配置。
 
 ### 1. 安装 botmux
 
@@ -236,7 +237,7 @@ botmux 的手动/定时更新会识别当前全局安装归属，并继续使用
 
 1. **操作**：首次安装直接进入创建流程；已有配置时先选「添加新机器人 / 重新配置 / 编辑现有机器人 / 删除机器人」。
 2. **飞书应用来源**：三选一——
-   - **扫码创建新应用（推荐）**：飞书扫码后自动建出 PersonalAgent 应用并落盘 AppID/AppSecret，**事件订阅 + bot 能力默认已配好**，无需手动浏览器创建。底层走 `@larksuiteoapi/node-sdk` 官方 device flow。
+   - **一次扫码创建新应用（推荐）**：可填写机器人名称；留空自动使用 `botmux-0`、`botmux-1`……。飞书扫码拿到 Web 登录态后，botmux 自动上传默认图标、创建企业自建应用、读取 AppID/AppSecret，并复用同一登录态继续配置权限与发版。Web 自动创建不可用或使用 Lark 国际版时，可由用户明确选择 `@larksuiteoapi/node-sdk` 兼容模式；兼容模式可能需要额外扫码，且应用名称由平台决定。
    - **选择已有应用**：复用（或扫码获取）飞书 Web 登录态，列出你在开放平台创建过的应用，选中后**自动读取 AppID/AppSecret**——换机器重配、复用旧应用不用再去后台翻 Secret（仅飞书租户）。
    - **手动输入 AppID/Secret**：见文末折叠的「手动创建应用」。
 3. **选择 CLI**：选本次要接入的 CLI（可搜索，如输入 `cla` 过滤出 Claude）。
@@ -244,9 +245,9 @@ botmux 的手动/定时更新会识别当前全局安装归属，并继续使用
    - **固定默认目录（推荐）**：新话题直接在指定目录启动、**不弹卡片**（落 `defaultWorkingDir` 字段，之后可用 `/config` 或 `botmux setup edit` 修改）。想让机器人"直接进目录干活"选这个。
    - **仓库选择卡片**：新话题先弹卡片，从扫描到的 git 仓库里选一个再启动，适合经常在多个仓库间切换。下一问填**仓库扫描根目录**，通常是 git 项目的**父级目录**（如 `~/projects`，支持逗号分隔多个），卡片从该目录**向下**查找 git 仓库（最多 3 层）；尽量别填 `~`（要遍历太多文件夹）。
 
-接着进入**第 2 次扫码**：botmux 内置的飞书 Web 登录会自动导入权限、配置 `http://127.0.0.1:9768/callback` 重定向 URL、创建并提交发布版本。失败会自动回退并打印手动步骤（见文末折叠），不影响已写入的配置；权限只导入了一部分也算成功，缺的可事后到开放平台补。
+应用创建后会直接复用刚才的 Web 登录态，自动导入权限、配置 `http://127.0.0.1:9768/callback` 重定向 URL、创建并提交发布版本，Feishu 主路径**不会再弹第 2 个二维码**。只有用户明确选择 SDK 兼容模式时才可能要求补扫；自动配置失败会打印手动步骤（见文末折叠），不影响已写入的配置。
 
-> ✅ **飞书 (feishu.cn) 与 Lark 国际版 (larksuite.com) 均支持**。扫码创建时自动识别租户类型（国内 / 国际）并记住，无需手动选择；手动粘 AppID/Secret 时会让你选一次。每个机器人按所属版本独立连对应域名，同一台机器可同时跑飞书 + Lark 机器人，登录凭证按应用隔离、互不干扰。
+> ✅ **飞书 (feishu.cn) 与 Lark 国际版 (larksuite.com) 均支持**。飞书走单次 Web 扫码；用户明确选择 SDK 兼容模式后，会自动识别并记住 Lark 国际版租户。手动粘 AppID/Secret 时会让你选一次租户类型。每个机器人按所属版本独立连对应域名，同一台机器可同时跑飞书 + Lark 机器人，登录凭证按应用隔离、互不干扰。
 
 setup 末尾会用 `tenant_access_token` 校验凭证（通过才落盘 `bots.json`），并把完整权限 JSON 写到 `~/.botmux/lark-scopes.json` 备查。
 
@@ -255,6 +256,9 @@ setup 末尾会用 `tenant_access_token` 校验凭证（通过才落盘 `bots.js
 
 ```bash
 botmux setup list --json                     # 列出机器人（secret 脱敏）
+botmux setup add --create-app \
+  --app-name 研发助手 \
+  --allowed-users alice@example.com          # 一次扫码创建并添加；名称留空用 botmux-N
 botmux setup add \
   --app-id cli_xxx --app-secret xxx \
   --allowed-users alice@example.com \
@@ -266,7 +270,8 @@ botmux setup help                            # 完整 flag 列表
 ```
 
 - `--working-dir` 是仓库选择卡片的扫描根；`--default-working-dir` 是固定默认目录（新话题直接启动、不弹卡），对应 TUI 里工作目录模式的两个选项。
-- `--json` 输出机器可读结果（含 `ok` / `error`）；开放平台自动配置默认跳过，需要时显式加 `--open-platform-auto`（要扫码）。
+- `--create-app` 默认继续完成开放平台自动配置；`--json` 成功时返回冻结后的 `appName` 与 `appId`，应用已创建但后续失败时返回 `partial`、`appId` 和继续命令，不会重复建应用。
+- 已有凭证模式的开放平台自动配置默认跳过，需要时显式加 `--open-platform-auto`。`--compatibility-mode` 必须显式选择，可能需要额外扫码且不支持 `--app-name`。
 - 以前对交互问答「管道喂数字」的脚本请迁移到这些子命令：问答序列一变（本版本就新增了工作目录模式一问），喂数字会静默错位。
 
 </details>
@@ -296,7 +301,7 @@ botmux autostart enable
 ```
 
 <details>
-<summary><b>手动配置开放平台：建应用 / 权限 / 重定向 / 发版（备用）</b> —— 默认由 botmux setup 扫第二次码时自动完成，仅在自动配置失败、或想手动核对时展开</summary>
+<summary><b>手动配置开放平台：建应用 / 权限 / 重定向 / 发版（备用）</b> —— 默认由 botmux setup 使用同一次登录态自动完成，仅在自动配置失败、或想手动核对时展开</summary>
 
 <br>
 
@@ -334,7 +339,7 @@ base64 -w0 < ~/.botmux/lark-scopes.json | awk 'BEGIN{printf "\033]52;c;"}{printf
 
 <br>
 
-PersonalAgent 默认配好事件订阅 + bot 能力，正常情况下不用动。如果按上面步骤走完 bot **完全收不到任何消息**（连私聊都不回），分别确认这两项：
+botmux 会自动开启机器人能力、长连接事件模式并订阅基础事件，正常情况下不用动。如果按上面步骤走完 bot **完全收不到任何消息**（连私聊都不回），分别确认这两项：
 
 - **事件订阅**：开放平台 → 你的应用 → 事件与回调 → 应当订阅 `im.message.receive_v1` + `card.action.trigger`（默认已订阅，如缺失就手动添加）。订阅方式必须是「使用长连接接收事件」(WebSocket)，且 botmux daemon 已经在跑。
 - **机器人能力**：开放平台 → 你的应用 → 应用功能 → 机器人 应当已开通（默认开通），名字/头像可以改。

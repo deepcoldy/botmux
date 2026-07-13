@@ -6,13 +6,14 @@
 import { mkdtempSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   automateOpenPlatformSetup,
   botmuxFeishuSessionFilePath,
   buildFeishuQrPayload,
   buildSafeSettingPayload,
   buildScopeUpdatePayload,
+  createFeishuOpenPlatformApp,
   extractOpenPlatformCsrfToken,
   extractOpenPlatformScopeEntries,
   getCookieHeader,
@@ -164,6 +165,73 @@ describe('prepareFeishuWebSession', () => {
     }
   });
 
+  it('forces a fresh QR login for onboarding even when a valid cache exists', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-force-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    let initCount = 0;
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href.includes('/accounts/qrlogin/init')) {
+        initCount++;
+        return Response.json(
+          { code: 0, data: { step_info: { token: 'fresh-token' } } },
+          { headers: { 'x-flow-key': 'fresh-flow' } },
+        );
+      }
+      if (href.includes('/accounts/qrlogin/polling')) {
+        return Response.json({
+          code: 0,
+          data: { next_step: 'enter_app', step_info: { status: 1, cross_login_uri: 'https://accounts.feishu.cn/fresh-cross' } },
+        });
+      }
+      if (href === 'https://accounts.feishu.cn/fresh-cross') {
+        return new Response('', {
+          status: 302,
+          headers: {
+            location: 'https://ask.feishu.cn/',
+            'set-cookie': 'session=fresh-cookie; Domain=.feishu.cn; Path=/; Secure; HttpOnly',
+          },
+        });
+      }
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const result = await prepareFeishuWebSession({
+      sessionFilePath: sessionFile,
+      forceQrLogin: true,
+      fetchImpl,
+      pollIntervalMs: 0,
+      maxWaitMs: 1000,
+      onQrCode: () => {},
+    });
+
+    expect(result.ok && result.source).toBe('qr_login');
+    expect(initCount).toBe(1);
+    expect(readStoredCookiesFromSessionFile(sessionFile)?.find(c => c.name === 'session')?.value).toBe('fresh-cookie');
+  });
+
+  it('can require cache-only reuse so follow-up setup never displays a second QR', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-reuse-only-'));
+    const onQrCode = vi.fn();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('network must not be used without cached cookies');
+    }) as unknown as typeof fetch;
+
+    const result = await prepareFeishuWebSession({
+      sessionFilePath: join(dir, 'missing-session.json'),
+      disableQrLogin: true,
+      disableBytedcliFallback: true,
+      fetchImpl,
+      onQrCode,
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: 'invalid_session' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(onQrCode).not.toHaveBeenCalled();
+  });
+
   it('uses old bytedcli session file only as fallback after built-in QR login fails', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
     const sessionFile = join(dir, 'feishu-session.json');
@@ -185,6 +253,60 @@ describe('prepareFeishuWebSession', () => {
 
     expect(result.ok && result.source).toBe('bytedcli_fallback');
     expect(readStoredCookiesFromSessionFile(sessionFile)?.map(c => c.name)).toContain('session');
+  });
+});
+
+describe('createFeishuOpenPlatformApp', () => {
+  it('reuses one cached Web session to upload an icon, create/enable the bot, and read its secret', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-create-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const calls: Array<{ path: string; body: unknown }> = [];
+    let qrCount = 0;
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') {
+        return new Response('<script>window.csrfToken="csrf_create"</script>', { status: 200 });
+      }
+      const path = new URL(href).pathname;
+      calls.push({ path, body: init?.body });
+      if (path === '/developers/v1/app/upload/image') {
+        expect(init?.body).toBeInstanceOf(FormData);
+        return Response.json({ code: 0, data: { url: 'https://cdn.example/botmux.png' } });
+      }
+      if (path === '/developers/v1/app/create') {
+        expect(JSON.parse(String(init?.body))).toMatchObject({ name: 'botmux-4', appSceneType: 0 });
+        return Response.json({ code: 0, data: { ClientID: 'cli_created' } });
+      }
+      if (path === '/developers/v1/secret/cli_created') {
+        return Response.json({ code: 0, data: { secret: 'created-secret' } });
+      }
+      return Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await createFeishuOpenPlatformApp({
+      name: 'botmux-4',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      fetchImpl,
+      onQrCode: () => { qrCount += 1; },
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      appId: 'cli_created',
+      appSecret: 'created-secret',
+      sessionSource: 'botmux_cache',
+    });
+    expect(qrCount).toBe(0);
+    expect(calls.map(call => call.path)).toEqual([
+      '/developers/v1/app/upload/image',
+      '/developers/v1/app/create',
+      '/developers/v1/robot/switch/cli_created',
+      '/developers/v1/event/switch/cli_created',
+      '/developers/v1/secret/cli_created',
+    ]);
   });
 });
 
@@ -244,6 +366,8 @@ describe('automateOpenPlatformSetup', () => {
       '/app/cli_x/auth',
       '/developers/v1/scope/all/cli_x',
       '/developers/v1/scope/update/cli_x',
+      '/developers/v1/robot/switch/cli_x',
+      '/developers/v1/event/switch/cli_x',
       '/developers/v1/event/update/cli_x',
       '/developers/v1/safe_setting/update/cli_x',
       '/developers/v1/contact_range/cli_x',
@@ -309,6 +433,8 @@ describe('automateOpenPlatformSetup', () => {
       '/app/cli_x/auth',
       '/developers/v1/scope/all/cli_x',
       '/developers/v1/scope/update/cli_x',
+      '/developers/v1/robot/switch/cli_x',
+      '/developers/v1/event/switch/cli_x',
       '/developers/v1/event/update/cli_x',
       '/developers/v1/safe_setting/update/cli_x',
       '/developers/v1/contact_range/cli_x',

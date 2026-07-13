@@ -74,7 +74,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 
 ## 5-Minute Setup
 
-> 💡 **TL;DR**: `npm i -g botmux` → `botmux setup` and **scan two QR codes** to get a working bot → `botmux start`. The 1st scan creates the app and saves the AppID/AppSecret (event subscriptions + bot capability pre-configured); the 2nd scan lets botmux's built-in Feishu Web login **import permissions, configure the redirect URL, and create + submit a publish version automatically**. The entire Open Platform config (create app / permissions / redirect / publish) is handled by setup; pass `--no-open-platform-auto` to skip the second auto-config step and use the manual steps folded at the end.
+> 💡 **TL;DR**: `npm i -g botmux` → `botmux setup`; for Feishu tenants, **one QR scan** creates a working bot → `botmux start`. The same Web session names the app (`botmux-N` by default, customizable), creates it, reads AppID/AppSecret, imports permissions, configures the redirect URL, and creates + submits a publish version. Pass `--no-open-platform-auto` to skip permission/publish automation after app creation.
 
 ### 1. Install botmux
 
@@ -93,7 +93,7 @@ Run `botmux setup` — every choice is an interactive picker (↑/↓ to move, t
 
 1. **Action**: a fresh install goes straight into the create flow; with an existing config, first pick "add / reconfigure / edit / remove bot".
 2. **App source** — pick one of three:
-   - **Scan to create a new app (recommended)**: scan with the Lark mobile app and a PersonalAgent app is created with AppID/AppSecret persisted automatically, **with event subscriptions + bot capability pre-configured** — no manual browser navigation. Uses the official `@larksuiteoapi/node-sdk` device flow.
+   - **One-scan app creation (recommended)**: enter a bot name or leave it blank for `botmux-0`, `botmux-1`, etc. After Feishu Web QR login, botmux uploads its default icon, creates a custom app, reads AppID/AppSecret, then reuses that session for permissions and publishing. If Web creation is unavailable or the account is on Lark international, the user can explicitly choose the official `@larksuiteoapi/node-sdk` compatibility mode; it may require an additional scan and the platform chooses the app name.
    - **Pick an existing app**: reuse (or QR-login to get) a Feishu web session, list the apps you previously created on the Open Platform, and have the **AppID/AppSecret fetched automatically** — no digging through the console when re-configuring on a new machine (Feishu tenants only).
    - **Enter AppID/Secret manually** — see "Create the app manually" folded below.
 3. **Pick the CLI**: choose the CLI to bridge (searchable — type `cla` to filter Claude).
@@ -101,9 +101,9 @@ Run `botmux setup` — every choice is an interactive picker (↑/↓ to move, t
    - **Fixed default dir (recommended)**: new topics start straight in the given directory with **no card** (persisted as `defaultWorkingDir`; change later via `/config` or `botmux setup edit`). Pick this if you want the bot to just work in one directory.
    - **Repo-select card**: each new topic pops a card listing scanned git repos to choose from — good when you hop between repos. The follow-up question asks for the **repo scan root(s)** — usually the **parent directory** of your git projects (e.g. `~/projects`, comma-separated for multiple); the card scans **downward** for git repos (up to 3 levels). Avoid `~` (too many folders to traverse).
 
-Then comes the **2nd scan**: botmux's built-in Feishu Web login automatically imports permissions, configures the `http://127.0.0.1:9768/callback` redirect URL, and creates + submits a publish version. On failure it falls back and prints the manual steps (folded below) without affecting the config already written; importing only part of the permissions still counts as success — add the rest later on the Open Platform.
+After app creation, setup reuses the same Web session to import permissions, configure `http://127.0.0.1:9768/callback`, and create + submit a publish version, so the Feishu primary path **has no second QR code**. Another scan is possible only after the user explicitly selects SDK compatibility mode. Automation failures still print the manual steps without affecting the saved bot config.
 
-> ✅ **Both Feishu (feishu.cn) and Lark international (larksuite.com) tenants are supported.** Scan-to-create auto-detects the tenant brand (China / international) and remembers it — no manual choice needed; the manual paste path asks once. Each bot connects to its own brand's domain, so one machine can run Feishu and Lark bots side by side, with login credentials isolated per app.
+> ✅ **Both Feishu (feishu.cn) and Lark international (larksuite.com) tenants are supported.** Feishu uses the one-scan Web flow; explicitly selected SDK compatibility mode auto-detects and remembers Lark international tenants. The manual paste path asks once. Each bot connects to its own brand's domain, so one machine can run Feishu and Lark bots side by side, with login credentials isolated per app.
 
 At the end, setup validates credentials with a `tenant_access_token` call (only writing `bots.json` on success) and writes the full scope JSON to `~/.botmux/lark-scopes.json` for reference.
 
@@ -112,6 +112,9 @@ At the end, setup validates credentials with a `tenant_access_token` call (only 
 
 ```bash
 botmux setup list --json                     # list bots (secret masked)
+botmux setup add --create-app \
+  --app-name "Engineering Assistant" \
+  --allowed-users alice@example.com          # one scan; omit the name for botmux-N
 botmux setup add \
   --app-id cli_xxx --app-secret xxx \
   --allowed-users alice@example.com \
@@ -123,7 +126,8 @@ botmux setup help                            # full flag reference
 ```
 
 - `--working-dir` is the repo-select card's scan root; `--default-working-dir` is the fixed default dir (new topics start there directly, no card) — the same two modes as the TUI question.
-- `--json` prints machine-readable results (with `ok` / `error`); Open Platform auto-config is skipped by default — opt in with `--open-platform-auto` (requires QR scan).
+- `--create-app` continues through Open Platform configuration by default. On success `--json` returns the frozen `appName` and `appId`; a post-creation failure returns `partial`, `appId`, and a recovery command without creating another app.
+- Existing-credential mode skips Open Platform automation unless `--open-platform-auto` is passed. `--compatibility-mode` must be selected explicitly, may need another scan, and does not support `--app-name`.
 - If you previously scripted setup by piping numbered answers into the TUI, migrate to these subcommands: whenever the question sequence changes (this release adds the working-dir mode question), piped answers silently shift.
 
 </details>
@@ -153,7 +157,7 @@ botmux autostart enable
 ```
 
 <details>
-<summary><b>Manual Open Platform config: create app / permissions / redirect / publish (fallback)</b> —— handled automatically by botmux setup during the 2nd scan; expand only if auto-config failed or you want to verify manually</summary>
+<summary><b>Manual Open Platform config: create app / permissions / redirect / publish (fallback)</b> —— handled automatically by botmux setup with the same login session; expand only if auto-config failed or you want to verify manually</summary>
 
 <br>
 
@@ -191,7 +195,7 @@ base64 -w0 < ~/.botmux/lark-scopes.json | awk 'BEGIN{printf "\033]52;c;"}{printf
 
 <br>
 
-PersonalAgent apps come with event subscription + bot capability configured by default, so normally you don't touch this. If the bot **receives no messages at all** (not even DMs) after following the steps above, verify these two:
+botmux enables the bot capability, long-connection event mode, and baseline event subscriptions automatically, so normally you don't touch this. If the bot **receives no messages at all** (not even DMs) after following the steps above, verify these two:
 
 - **Event subscription**: Open Platform → your app → Events & Callbacks → should subscribe to `im.message.receive_v1` + `card.action.trigger` (subscribed by default; add manually if missing). The delivery method must be "Receive events via long connection" (WebSocket), with the botmux daemon running.
 - **Bot capability**: Open Platform → your app → Features → Bot should be enabled (on by default); name/avatar are editable.
@@ -333,6 +337,7 @@ Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support 
 > `botmux dashboard` issues a one-time-token URL — manage every daemon/bot from the browser.
 
 - One-click locate back to the Feishu thread / open Web Terminal / multi-select batch close
+- Add a bot with the same one-scan Feishu flow: optional stable name, AI CLI and working-directory choices, fail-closed administrator confirmation, and an explicit compatibility fallback
 - Create a new group with auto owner-transfer + @-mention notification
 - Disband or leave a chat (associated sessions auto-closed)
 - **Session Insights** (owner-only, read-only): parse each session's transcript to view action spans / work timeline / context curve / failure aggregates + diagnostic suggestions; send `/insight` in chat for the current session's summary card
