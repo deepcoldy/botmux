@@ -54,6 +54,15 @@ export interface StoredCookie {
   sameSite?: string;
 }
 
+/** 当前开放平台 Web session 对应的人与企业。创建前用它防止复用错租户。 */
+export interface FeishuWebSessionIdentity {
+  userId: string;
+  userName: string;
+  email?: string;
+  tenantId: string;
+  tenantName: string;
+}
+
 export interface ScopeManifest {
   scopes?: {
     tenant?: string[];
@@ -163,6 +172,20 @@ export interface FeishuWebSessionOptions {
   onStatus?: (message: string) => void | Promise<void>;
 }
 
+export type FeishuOpenPlatformSessionInspectionResult =
+  | {
+      ok: true;
+      source: FeishuWebSessionSource;
+      identity: FeishuWebSessionIdentity;
+      sessionFile: string;
+    }
+  | {
+      ok: false;
+      reason: FeishuWebSessionFailureReason | 'missing_csrf' | 'identity_unavailable' | 'network';
+      message: string;
+      sessionFile?: string;
+    };
+
 
 export function parseSetupOpenPlatformAutoFlag(argv: string[]): boolean {
   let enabled = true;
@@ -246,6 +269,34 @@ export function extractOpenPlatformCsrfToken(html: string): string | null {
     html.match(/\bwindow\.csrfToken\s*=\s*(['"])([^'"]+)\1/) ??
     html.match(/\bcsrfToken\s*:\s*(['"])([^'"]+)\1/);
   return match?.[2] ?? null;
+}
+
+/**
+ * 开发者后台把当前登录人写入 `window.user = {...}`。只提取创建前需要展示和
+ * 比对的稳定字段，不把头像、功能开关等整段页面状态带进 Dashboard API。
+ */
+export function extractOpenPlatformSessionIdentity(html: string): FeishuWebSessionIdentity | null {
+  const marker = /\bwindow\.user\s*=\s*/g;
+  const match = marker.exec(html);
+  if (!match) return null;
+  const start = match.index + match[0].length;
+  const json = extractBalancedJsonObject(html, start);
+  if (!json) return null;
+  let user: Record<string, unknown>;
+  try {
+    user = asRecord(JSON.parse(json));
+  } catch {
+    return null;
+  }
+  const userId = pickString(user, ['id', 'userId', 'user_id']);
+  const userName = pickString(user, ['name', 'userName', 'user_name'])
+    ?? pickString(asRecord(user.displayName), ['value']);
+  const tenantId = pickString(user, ['tenantId', 'tenant_id']);
+  const tenantName = pickString(asRecord(user.tenantDisplayName), ['value'])
+    ?? pickString(user, ['tenantName', 'tenant_name']);
+  if (!userId || !userName || !tenantId || !tenantName) return null;
+  const email = pickString(user, ['email']);
+  return { userId, userName, ...(email ? { email } : {}), tenantId, tenantName };
 }
 
 export function extractOpenPlatformScopeEntries(payload: unknown): OpenPlatformScopeEntry[] {
@@ -650,7 +701,7 @@ export interface OpenPlatformApiClient {
 }
 
 export type OpenPlatformClientResult =
-  | { ok: true; client: OpenPlatformApiClient }
+  | { ok: true; client: OpenPlatformApiClient; identity?: FeishuWebSessionIdentity }
   | { ok: false; reason: 'missing_csrf' | 'network'; message: string };
 
 /**
@@ -667,11 +718,13 @@ export async function createOpenPlatformApiClient(
   let csrfToken: string | null = null;
   let apiOrigin = 'https://open.feishu.cn';
   let referer = `${apiOrigin}/app`;
+  let identity: FeishuWebSessionIdentity | undefined;
   try {
     const page = await session.fetchTextWithUrl(fetcher, `${apiOrigin}/app`);
     apiOrigin = new URL(page.finalUrl).origin;
     referer = page.finalUrl;
     csrfToken = extractOpenPlatformCsrfToken(page.text);
+    identity = extractOpenPlatformSessionIdentity(page.text) ?? undefined;
   } catch (err) {
     return { ok: false, reason: 'network', message: `读取开放平台页面失败: ${safeErrorMessage(err)}` };
   }
@@ -715,7 +768,45 @@ export async function createOpenPlatformApiClient(
     request(path, body === undefined ? undefined : JSON.stringify(body), body === undefined ? undefined : 'application/json');
   const postForm = async (path: string, body: FormData): Promise<unknown> => request(path, body);
 
-  return { ok: true, client: { apiOrigin, postJson, postForm } };
+  return { ok: true, client: { apiOrigin, postJson, postForm }, identity };
+}
+
+/**
+ * 只检查现有缓存，不展示二维码。Dashboard 打开添加表单时调用；返回的账号/企业
+ * 会显示给用户，并在真正创建前再次比对，避免旧 cookie 把应用建到错误租户。
+ */
+export async function inspectCachedFeishuOpenPlatformSession(
+  options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
+): Promise<FeishuOpenPlatformSessionInspectionResult> {
+  const prepared = await prepareFeishuWebSession({
+    ...options,
+    disableQrLogin: true,
+    disableBytedcliFallback: true,
+  });
+  if (!prepared.ok) return prepared;
+  const clientResult = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl });
+  if (!clientResult.ok) {
+    return {
+      ok: false,
+      reason: clientResult.reason,
+      message: clientResult.message,
+      sessionFile: prepared.sessionFile,
+    };
+  }
+  if (!clientResult.identity) {
+    return {
+      ok: false,
+      reason: 'identity_unavailable',
+      message: '开放平台没有返回当前账号与企业信息；为避免创建到错误租户，未复用该登录态',
+      sessionFile: prepared.sessionFile,
+    };
+  }
+  return {
+    ok: true,
+    source: prepared.source,
+    identity: clientResult.identity,
+    sessionFile: prepared.sessionFile,
+  };
 }
 
 export type CreateFeishuOpenPlatformAppResult =
@@ -726,10 +817,17 @@ export type CreateFeishuOpenPlatformAppResult =
       brand: 'feishu';
       sessionFile: string;
       sessionSource: FeishuWebSessionSource;
+      sessionIdentity: FeishuWebSessionIdentity;
     }
   | {
       ok: false;
-      reason: FeishuWebSessionFailureReason | 'missing_csrf' | 'missing_icon' | 'api_error';
+      reason:
+        | FeishuWebSessionFailureReason
+        | 'missing_csrf'
+        | 'missing_icon'
+        | 'identity_unavailable'
+        | 'session_changed'
+        | 'api_error';
       message: string;
       /** 应用已经建成但读取 Secret 失败时返回，调用方不得再创建一个重复应用。 */
       appId?: string;
@@ -741,6 +839,13 @@ export interface CreateFeishuOpenPlatformAppOptions extends FeishuWebSessionOpti
   description?: string;
   /** 测试/定制图标；默认复用 botmux dashboard 的 512x512 favicon。 */
   iconFilePath?: string;
+  /** Dashboard 表单打开时显示过的缓存身份；创建前必须仍是同一人、同一企业。 */
+  expectedIdentity?: Pick<FeishuWebSessionIdentity, 'userId' | 'tenantId'>;
+  /** 已拿到并验证账号/企业、但尚未创建应用时触发。 */
+  onSessionReady?: (info: {
+    source: FeishuWebSessionSource;
+    identity: FeishuWebSessionIdentity;
+  }) => void | Promise<void>;
 }
 
 class CreatedOpenPlatformAppError extends Error {
@@ -840,8 +945,27 @@ export async function createFeishuOpenPlatformApp(
       sessionFile: prepared.sessionFile,
     };
   }
+  if (!clientResult.identity) {
+    return {
+      ok: false,
+      reason: 'identity_unavailable',
+      message: '开放平台没有返回当前账号与企业信息；为避免创建到错误租户，未创建应用',
+      sessionFile: prepared.sessionFile,
+    };
+  }
+  if (options.expectedIdentity
+    && (clientResult.identity.userId !== options.expectedIdentity.userId
+      || clientResult.identity.tenantId !== options.expectedIdentity.tenantId)) {
+    return {
+      ok: false,
+      reason: 'session_changed',
+      message: `当前登录账号或企业已变化（${clientResult.identity.userName} · ${clientResult.identity.tenantName}）；请重新确认后再创建`,
+      sessionFile: prepared.sessionFile,
+    };
+  }
 
   try {
+    await options.onSessionReady?.({ source: prepared.source, identity: clientResult.identity });
     const credentials = await createOpenPlatformAppWithClient(clientResult.client, options);
     return {
       ok: true,
@@ -849,6 +973,7 @@ export async function createFeishuOpenPlatformApp(
       brand: 'feishu',
       sessionFile: prepared.sessionFile,
       sessionSource: prepared.source,
+      sessionIdentity: clientResult.identity,
     };
   } catch (err) {
     const message = safeErrorMessage(err);
@@ -1233,6 +1358,32 @@ export function extractVersionId(payload: unknown): string | undefined {
   if (direct) return direct;
   const data = asRecord(asRecord(payload).data);
   return pickString(data, ['versionId', 'version_id', 'id']) ?? pickString(asRecord(data.appVersion), ['versionId', 'version_id', 'id']);
+}
+
+function extractBalancedJsonObject(input: string, start: number): string | null {
+  if (input[start] !== '{') return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < input.length; i += 1) {
+    const char = input[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{') depth += 1;
+    else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return input.slice(start, i + 1);
+    }
+  }
+  return null;
 }
 
 function pickString(record: Record<string, unknown>, keys: string[]): string | undefined {

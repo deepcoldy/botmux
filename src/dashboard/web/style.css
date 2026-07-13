@@ -21114,6 +21114,53 @@ dialog.onboarding-dialog .onboarding-form {
   width: 100%;
 }
 
+dialog.onboarding-dialog .onboarding-session {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 52px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border-soft));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+}
+
+dialog.onboarding-dialog .onboarding-session :where(p, strong, small) {
+  display: block;
+  margin: 0;
+}
+
+dialog.onboarding-dialog .onboarding-session strong {
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+dialog.onboarding-dialog .onboarding-session small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+dialog.onboarding-dialog button.onboarding-session-action {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 0 10px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--accent);
+  font-size: 11px;
+  box-shadow: none;
+}
+
+dialog.onboarding-dialog button.onboarding-session-action:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  color: var(--accent-strong);
+}
+
 dialog.onboarding-dialog .onboarding-field {
   width: 100%;
   min-width: 0;

@@ -7,8 +7,11 @@ import { resolveSetupAppName } from '../setup/app-name.js';
 import {
   automateOpenPlatformSetup,
   createFeishuOpenPlatformApp,
+  inspectCachedFeishuOpenPlatformSession,
   type CreateFeishuOpenPlatformAppOptions,
   type CreateFeishuOpenPlatformAppResult,
+  type FeishuOpenPlatformSessionInspectionResult,
+  type FeishuWebSessionIdentity,
   type OpenPlatformAutomationOptions,
   type OpenPlatformAutomationResult,
 } from '../setup/open-platform-automation.js';
@@ -92,6 +95,12 @@ export interface BotOnboardingInput {
   appName?: string;
   /** 默认 Feishu 单码主路径；compat 是用户明确确认过的 SDK 兼容模式。 */
   registrationMode?: 'web' | 'compat';
+  /**
+   * reuse: 使用表单已展示并确认的身份，缓存失效时不静默弹码；
+   * qr: 用户明确选择首次登录/更换账号，强制生成新二维码。
+   */
+  sessionMode?: 'reuse' | 'qr';
+  expectedIdentity?: Pick<FeishuWebSessionIdentity, 'userId' | 'tenantId'>;
   cliId?: CliId;
   /** 通用启动前缀（如 "aiden x claude"）；aiden×* 选项解析所得，普通 CLI 为空。 */
   wrapperCli?: string;
@@ -107,6 +116,7 @@ export interface BotOnboardingInput {
 
 type RegisterAppFn = (opts?: RegisterAppOptions) => Promise<RegisterAppResult>;
 type CreateAppFn = (opts: CreateFeishuOpenPlatformAppOptions) => Promise<CreateFeishuOpenPlatformAppResult>;
+type InspectSessionFn = () => Promise<FeishuOpenPlatformSessionInspectionResult>;
 type ValidateCredentialsFn = (
   appId: string,
   appSecret: string,
@@ -118,6 +128,7 @@ export interface BotOnboardingManagerOptions {
   botsJsonPath: string;
   /** 单次 Feishu Web 登录建应用主路径；测试可注入。 */
   createApp?: CreateAppFn;
+  inspectSession?: InspectSessionFn;
   /** SDK device flow fallback；显式只注入 registerApp 时保留旧测试路径。 */
   registerApp?: RegisterAppFn;
   validateCredentials?: ValidateCredentialsFn;
@@ -140,6 +151,10 @@ export interface BotOnboardingJob {
   id: string;
   done: Promise<void>;
 }
+
+export type BotOnboardingSessionStatus =
+  | { status: 'ready'; source: string; identity: FeishuWebSessionIdentity }
+  | { status: 'scan_required'; reason?: string };
 
 function svgEscape(value: string): string {
   return value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
@@ -178,6 +193,7 @@ export class BotOnboardingManager {
   // 也不放进 jobs 快照（那个会序列化给前端、会泄漏 secret）。owner 校验通过后才 append。
   private readonly pendingBots = new Map<string, Record<string, any>>();
   private readonly createApp?: CreateAppFn;
+  private readonly inspectSession: InspectSessionFn;
   private readonly registerApp: RegisterAppFn;
   private readonly validateCredentials: ValidateCredentialsFn;
   private readonly automateOpenPlatform: AutomateOpenPlatformFn;
@@ -189,6 +205,7 @@ export class BotOnboardingManager {
     // 生产默认走单次 Web session；旧单测/外部注入若只给 registerApp，则明确
     // 视为要求直接测 SDK 路径，避免批量改写既有测试缝。
     this.createApp = opts.createApp ?? (opts.registerApp ? undefined : createFeishuOpenPlatformApp);
+    this.inspectSession = opts.inspectSession ?? (() => inspectCachedFeishuOpenPlatformSession());
     this.registerApp = opts.registerApp ?? tryRegisterApp;
     this.validateCredentials = opts.validateCredentials ?? validateCredentials;
     this.automateOpenPlatform = opts.automateOpenPlatform ?? automateOpenPlatformSetup;
@@ -235,6 +252,13 @@ export class BotOnboardingManager {
     return resolveSetupAppName(undefined, readBotsJsonOrEmpty(this.opts.botsJsonPath).length);
   }
 
+  async sessionStatus(): Promise<BotOnboardingSessionStatus> {
+    const inspected = await this.inspectSession();
+    return inspected.ok
+      ? { status: 'ready', source: inspected.source, identity: inspected.identity }
+      : { status: 'scan_required', reason: inspected.reason };
+  }
+
   private patch(id: string, patch: Partial<BotOnboardingSnapshot>): void {
     const current = this.jobs.get(id);
     if (!current) return;
@@ -258,7 +282,9 @@ export class BotOnboardingManager {
     } else {
       const created = await this.createApp({
         name: appName,
-        forceQrLogin: true,
+        ...(input.sessionMode === 'reuse'
+          ? { disableQrLogin: true, expectedIdentity: input.expectedIdentity }
+          : { forceQrLogin: true }),
         disableBytedcliFallback: true,
         onQrCode: info => {
           this.patch(id, {
@@ -279,7 +305,7 @@ export class BotOnboardingManager {
           status: 'failed',
           appId: created.appId,
           error: created.reason,
-          message: `${created.message}；应用已经创建。为避免重复创建，本任务不会重试创建。可在开放平台读取 App Secret 后运行 botmux setup add --app-id ${created.appId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> 继续。`,
+          message: `${created.message}；应用已经创建。为避免重复创建，本任务不会重试创建。可在开放平台读取 App Secret 后运行 botmux setup add --app-id ${created.appId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> --open-platform-auto 继续。`,
         });
         return;
       } else {

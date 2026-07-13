@@ -59,6 +59,20 @@ type CliOptionsState = {
   ttadkModelDefault: string;
   ttadkModelSuggestions: string[];
   suggestedAppName: string;
+  webSession:
+    | { status: 'checking' }
+    | { status: 'scan_required'; reason?: string }
+    | {
+        status: 'ready';
+        source: string;
+        identity: {
+          userId: string;
+          userName: string;
+          email?: string;
+          tenantId: string;
+          tenantName: string;
+        };
+      };
 };
 
 type OnboardingFormState = {
@@ -82,6 +96,7 @@ function defaultCliOptionsState(): CliOptionsState {
     ttadkModelDefault: DEFAULT_TTADK_MODEL,
     ttadkModelSuggestions: [],
     suggestedAppName: 'botmux-0',
+    webSession: { status: 'checking' },
   };
 }
 
@@ -103,6 +118,13 @@ function shouldStopPolling(job: OnboardingJob): boolean {
   return job.status === 'completed' || job.status === 'failed' || job.status === 'needs_owner';
 }
 
+function isSessionFailure(error?: string): boolean {
+  return error === 'login_failed'
+    || error === 'invalid_session'
+    || error === 'identity_unavailable'
+    || error === 'session_changed';
+}
+
 function statusText(job: OnboardingJob): string {
   if (job.status === 'waiting_for_scan') {
     return job.registrationMode === 'compat'
@@ -121,7 +143,7 @@ function statusText(job: OnboardingJob): string {
   if (job.status === 'failed') {
     if (job.appId) return t('botOnboarding.partialFailureTitle');
     if (job.error === 'qr_expired') return t('botOnboarding.qrExpiredTitle');
-    if (job.error === 'login_failed' || job.error === 'invalid_session') return t('botOnboarding.authIncompleteTitle');
+    if (isSessionFailure(job.error)) return t('botOnboarding.authIncompleteTitle');
     return t('botOnboarding.createFailedTitle');
   }
   return t('botOnboarding.starting');
@@ -141,15 +163,34 @@ async function fetchCliOptions(): Promise<CliOptionsState> {
       const suggestedAppName = typeof body.suggestedAppName === 'string' && body.suggestedAppName.trim()
         ? body.suggestedAppName.trim()
         : 'botmux-0';
+      const identity = body?.webSession?.identity;
+      const webSession: CliOptionsState['webSession'] = body?.webSession?.status === 'ready'
+        && typeof identity?.userId === 'string'
+        && typeof identity?.userName === 'string'
+        && typeof identity?.tenantId === 'string'
+        && typeof identity?.tenantName === 'string'
+        ? {
+            status: 'ready',
+            source: typeof body.webSession.source === 'string' ? body.webSession.source : 'botmux_cache',
+            identity: {
+              userId: identity.userId,
+              userName: identity.userName,
+              ...(typeof identity.email === 'string' ? { email: identity.email } : {}),
+              tenantId: identity.tenantId,
+              tenantName: identity.tenantName,
+            },
+          }
+        : { status: 'scan_required', ...(typeof body?.webSession?.reason === 'string' ? { reason: body.webSession.reason } : {}) };
       return {
         options: body.options as CliOption[],
         ttadkModelDefault,
         ttadkModelSuggestions,
         suggestedAppName,
+        webSession,
       };
     }
   } catch { /* fall through to default */ }
-  return defaultCliOptionsState();
+  return { ...defaultCliOptionsState(), webSession: { status: 'scan_required' } };
 }
 
 function syncModelForCli(
@@ -325,7 +366,7 @@ function OnboardingJobView(props: {
               ? t('botOnboarding.partialFailureDescription')
               : job.error === 'qr_expired'
                 ? t('botOnboarding.qrExpiredDescription')
-                : job.error === 'login_failed' || job.error === 'invalid_session'
+                : isSessionFailure(job.error)
                   ? t('botOnboarding.authIncompleteDescription')
                   : t('botOnboarding.createFailedDescription')}
           </p>
@@ -339,7 +380,11 @@ function OnboardingJobView(props: {
               <>
                 <button type="button" onClick={() => props.onRetry('compat')}>{t('botOnboarding.compatibilityMode')}</button>
                 <button type="button" className="primary onboarding-submit" onClick={() => props.onRetry('web')}>
-                  {job.error === 'qr_expired' ? t('botOnboarding.generateQr') : job.error === 'login_failed' || job.error === 'invalid_session' ? t('botOnboarding.scanAgain') : t('botOnboarding.retry')}
+                  {job.error === 'qr_expired'
+                    ? t('botOnboarding.generateQr')
+                    : isSessionFailure(job.error)
+                      ? t('botOnboarding.scanAgain')
+                      : t('botOnboarding.retry')}
                 </button>
               </>
             ) : null}
@@ -356,9 +401,11 @@ function OnboardingJobView(props: {
 function OnboardingForm(props: {
   cliState: CliOptionsState;
   form: OnboardingFormState;
+  sessionMode: 'checking' | 'reuse' | 'qr';
   error?: string;
   submitting: boolean;
   onFormChange(form: OnboardingFormState): void;
+  onSessionModeChange(mode: 'reuse' | 'qr'): void;
   onSubmit(event: FormEvent<HTMLFormElement>): void;
   onClose(): void;
 }): JSX.Element {
@@ -383,6 +430,43 @@ function OnboardingForm(props: {
 
   return (
     <form id="onboarding-form" className="onboarding-form" onSubmit={props.onSubmit}>
+      <div className="onboarding-session" aria-live="polite">
+        {props.sessionMode === 'checking' ? (
+          <p>{t('botOnboarding.sessionChecking')}</p>
+        ) : props.cliState.webSession.status === 'ready' ? (
+          props.sessionMode === 'reuse' ? (
+            <>
+              <div>
+                <strong>{t('botOnboarding.sessionReady', {
+                  user: props.cliState.webSession.identity.userName,
+                  tenant: props.cliState.webSession.identity.tenantName,
+                })}</strong>
+                {props.cliState.webSession.identity.email
+                  ? <small>{props.cliState.webSession.identity.email}</small>
+                  : null}
+              </div>
+              <button type="button" className="onboarding-session-action" onClick={() => props.onSessionModeChange('qr')}>
+                {t('botOnboarding.switchAccount')}
+              </button>
+            </>
+          ) : (
+            <>
+              <div>
+                <strong>{t('botOnboarding.sessionSwitching')}</strong>
+                <small>{t('botOnboarding.sessionSwitchingHint')}</small>
+              </div>
+              <button type="button" className="onboarding-session-action" onClick={() => props.onSessionModeChange('reuse')}>
+                {t('botOnboarding.reuseCurrentAccount')}
+              </button>
+            </>
+          )
+        ) : (
+          <div>
+            <strong>{t('botOnboarding.sessionScanRequired')}</strong>
+            <small>{t('botOnboarding.sessionScanRequiredHint')}</small>
+          </div>
+        )}
+      </div>
       <label className="onboarding-field">
         <span>{t('botOnboarding.appNameLabel')}</span>
         <input
@@ -457,8 +541,12 @@ function OnboardingForm(props: {
       {props.error ? <p className="form-error">{props.error}</p> : null}
       <div className="actions onboarding-actions">
         <button type="button" id="ob-cancel" disabled={props.submitting} onClick={props.onClose}>{t('botOnboarding.cancel')}</button>
-        <button type="submit" className="primary onboarding-submit" disabled={props.submitting}>
-          {props.submitting ? t('botOnboarding.starting') : t('botOnboarding.startScan')}
+        <button type="submit" className="primary onboarding-submit" disabled={props.submitting || props.sessionMode === 'checking'}>
+          {props.submitting
+            ? t('botOnboarding.starting')
+            : props.sessionMode === 'reuse'
+              ? t('botOnboarding.confirmReuse')
+              : t('botOnboarding.startScan')}
         </button>
       </div>
     </form>
@@ -471,6 +559,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   const loadSeqRef = useRef(0);
   const [cliState, setCliState] = useState<CliOptionsState>(() => defaultCliOptionsState());
   const [form, setForm] = useState<OnboardingFormState>(() => defaultFormState());
+  const [sessionMode, setSessionMode] = useState<'checking' | 'reuse' | 'qr'>('checking');
   const [view, setView] = useState<ViewState>({ kind: 'form' });
   const [submitting, setSubmitting] = useState(false);
   const [ownerInput, setOwnerInput] = useState('');
@@ -521,6 +610,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     const initialCliState = defaultCliOptionsState();
     setCliState(initialCliState);
     setForm(defaultFormState());
+    setSessionMode('checking');
     setView({ kind: 'form' });
     setSubmitting(false);
     setOwnerInput('');
@@ -529,6 +619,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
       if (loadSeqRef.current !== seq) return;
       setCliState(next);
       setForm(current => normalizeFormForOptions(current, next));
+      setSessionMode(next.webSession.status === 'ready' ? 'reuse' : 'qr');
     });
   }, [stopPolling]);
 
@@ -553,17 +644,30 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
 
   useEffect(() => () => stopPolling(), [stopPolling]);
 
-  const startOnboarding = useCallback(async (registrationMode: 'web' | 'compat') => {
+  const startOnboarding = useCallback(async (
+    registrationMode: 'web' | 'compat',
+    sessionModeOverride?: 'reuse' | 'qr',
+  ) => {
     stopPolling();
     setSubmitting(true);
     setView({ kind: 'job', job: { id: '', status: 'starting' } });
     try {
+      const effectiveSessionMode = sessionModeOverride ?? (sessionMode === 'reuse' ? 'reuse' : 'qr');
+      const expectedIdentity = registrationMode === 'web'
+        && effectiveSessionMode === 'reuse'
+        && cliState.webSession.status === 'ready'
+        ? {
+            userId: cliState.webSession.identity.userId,
+            tenantId: cliState.webSession.identity.tenantId,
+          }
+        : undefined;
       const res = await fetch('/api/bot-onboarding/start', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           appName: registrationMode === 'web' ? form.appName.trim() || undefined : undefined,
           registrationMode,
+          ...(registrationMode === 'web' ? { sessionMode: effectiveSessionMode, expectedIdentity } : {}),
           cliId: form.cliId,
           workingDir: form.workingDir.trim(),
           dirMode: form.dirMode,
@@ -584,7 +688,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     } finally {
       setSubmitting(false);
     }
-  }, [applyJob, form, startPolling, stopPolling]);
+  }, [applyJob, cliState.webSession, form, sessionMode, startPolling, stopPolling]);
 
   const submitForm = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -596,8 +700,12 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
       const accepted = window.confirm(t('botOnboarding.compatibilityConfirm'));
       if (!accepted) return;
     }
-    void startOnboarding(registrationMode);
-  }, [startOnboarding]);
+    const requiresFreshLogin = registrationMode === 'web'
+      && view.kind === 'job'
+      && isSessionFailure(view.job.error);
+    if (requiresFreshLogin) setSessionMode('qr');
+    void startOnboarding(registrationMode, requiresFreshLogin ? 'qr' : undefined);
+  }, [startOnboarding, view]);
 
   const submitOwner = useCallback(async (job: OnboardingJob, ownerRaw: string, ownerIdRaw: string) => {
     const owner = [ownerRaw.trim(), ownerIdRaw.trim()].filter(Boolean).join(',');
@@ -628,9 +736,11 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
         <OnboardingForm
           cliState={cliState}
           form={form}
+          sessionMode={sessionMode}
           error={view.error}
           submitting={submitting}
           onFormChange={setForm}
+          onSessionModeChange={setSessionMode}
           onSubmit={submitForm}
           onClose={close}
         />
@@ -648,7 +758,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
         onClose={close}
       />
     );
-  }, [cliState, close, form, ownerIdInput, ownerInput, retry, submitForm, submitOwner, submitting, view]);
+  }, [cliState, close, form, ownerIdInput, ownerInput, retry, sessionMode, submitForm, submitOwner, submitting, view]);
 
   const canClose = view.kind === 'form' || (view.kind === 'job' && (view.job.status === 'completed' || view.job.status === 'failed'));
 

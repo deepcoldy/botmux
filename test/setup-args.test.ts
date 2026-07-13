@@ -98,6 +98,16 @@ describe('parseSetupCommand', () => {
     expect(() => parseSetupCommand(['add', '--create-app', '--compatibility-mode', '--app-name', 'Bot'])).toThrow(/不支持 --app-name/);
   });
 
+  it('parses explicit account switching only for the Feishu create-app path', () => {
+    expect(parseSetupCommand(['add', '--create-app', '--switch-account'])).toMatchObject({
+      action: 'add', createApp: true, switchAccount: true,
+    });
+    expect(() => parseSetupCommand(['add', '--switch-account'])).toThrow(/必须与 add --create-app/);
+    expect(() => parseSetupCommand(['add', '--create-app', '--compatibility-mode', '--switch-account'])).toThrow(/不适用于 SDK 兼容模式/);
+    expect(() => parseSetupCommand(['list', '--switch-account'])).toThrow(/仅适用于 add --create-app/);
+    expect(() => parseSetupCommand(['edit', 'botmux-0', '--switch-account'])).toThrow(/仅适用于 add --create-app/);
+  });
+
   it('rejects ambiguous create-app credential combinations and app-name without creation', () => {
     expect(() => parseSetupCommand(['add', '--create-app', '--app-id', 'cli_x'])).toThrow(/不能与 --app-id/);
     expect(() => parseSetupCommand(['add', '--app-name', 'Bot'])).toThrow(/必须与 add --create-app/);

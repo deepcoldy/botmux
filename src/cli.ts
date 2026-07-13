@@ -730,12 +730,56 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
     if (method === 0) {
       const suggestedName = resolveSetupAppName(undefined, loadBotsJson().length);
       const appName = (await ask(rl, `机器人名称 [${suggestedName}]: `)).trim() || suggestedName;
-      const { createFeishuOpenPlatformApp } = await import('./setup/open-platform-automation.js');
-      console.log('\n正在准备安全登录，请确认要创建应用的飞书账号与企业…');
+      const {
+        createFeishuOpenPlatformApp,
+        inspectCachedFeishuOpenPlatformSession,
+        readStoredCookiesFromSessionFile,
+        botmuxFeishuSessionFilePath,
+      } = await import('./setup/open-platform-automation.js');
+      const inspected = await inspectCachedFeishuOpenPlatformSession();
+      let sessionMode: 'reuse' | 'qr' = 'qr';
+      let expectedIdentity: { userId: string; tenantId: string } | undefined;
+      if (inspected.ok) {
+        const accountChoice = await pickChoice(rl, {
+          title: `确认飞书账号：${inspected.identity.userName} · ${inspected.identity.tenantName}`,
+          items: [
+            { label: '确认并免扫码添加', hint: inspected.identity.email || '复用本机有效登录态' },
+            { label: '更换账号', hint: '重新扫码并覆盖本机登录态' },
+          ],
+          defaultIndex: 0,
+          footer: 'Esc 返回「飞书应用来源」',
+        });
+        if (accountChoice === null) continue;
+        sessionMode = accountChoice === 0 ? 'reuse' : 'qr';
+        if (sessionMode === 'reuse') {
+          expectedIdentity = {
+            userId: inspected.identity.userId,
+            tenantId: inspected.identity.tenantId,
+          };
+        }
+      } else if ((readStoredCookiesFromSessionFile(botmuxFeishuSessionFilePath())?.length ?? 0) > 0) {
+        const relogin = await pickChoice(rl, {
+          title: '上次飞书登录态已失效或无法确认账号',
+          items: [
+            { label: '重新扫码', hint: '确认后生成新二维码并覆盖旧登录态' },
+          ],
+          defaultIndex: 0,
+          footer: 'Esc 返回「飞书应用来源」',
+        });
+        if (relogin === null) continue;
+      }
+      console.log(sessionMode === 'reuse'
+        ? '\n正在复用已确认的飞书账号创建应用（无需扫码）…'
+        : '\n正在准备安全登录，请确认要创建应用的飞书账号与企业…');
       const webResult = await createFeishuOpenPlatformApp({
         name: appName,
-        forceQrLogin: true,
+        ...(sessionMode === 'reuse'
+          ? { disableQrLogin: true, expectedIdentity }
+          : { forceQrLogin: true }),
         disableBytedcliFallback: true,
+        onSessionReady: ({ identity, source }) => {
+          process.stderr.write(`已确认飞书账号：${identity.userName} · ${identity.tenantName}${source === 'botmux_cache' ? '（免扫码）' : ''}\n`);
+        },
         onQrCode: info => {
           process.stderr.write('\n请用飞书 App 扫码登录，botmux 将代你创建应用并完成配置：\n\n');
           process.stderr.write(`${info.qrText}\n`);
@@ -743,7 +787,7 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
         onStatus: message => { process.stderr.write(`${message}\n`); },
       });
       if (webResult.ok) {
-        console.log('\n✅ 应用创建成功（同一登录态将继续完成权限与发版，无需再次扫码）');
+        console.log('\n✅ 应用创建成功（登录态已缓存，后续添加可免扫码）');
         console.log(`   应用名称: ${appName}`);
         console.log(`   App ID: ${webResult.appId}`);
         console.log('   租户类型: 飞书 (feishu.cn)');
@@ -1397,6 +1441,10 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
         failSetupScripted(cmd.json, 'Lark / SDK 兼容模式不支持 --app-name；请移除该参数，应用名称将由平台决定。');
         return;
       }
+      if (requestedBrand === 'lark' && cmd.switchAccount) {
+        failSetupScripted(cmd.json, '--switch-account 仅适用于 Feishu Web 创建路径，不适用于 Lark SDK 兼容模式。');
+        return;
+      }
 
       if (requestedBrand === 'lark' || cmd.compatibilityMode) {
         if (!cmd.json) console.log('⚠️  正在使用 SDK 兼容模式，可能需要额外扫码；应用名称由平台决定。');
@@ -1406,32 +1454,60 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
           ? registered
           : { ok: false, message: `SDK 扫码失败 (${registered.error}): ${registered.message}` };
       } else {
-        const { createFeishuOpenPlatformApp } = await import('./setup/open-platform-automation.js');
-        const created = await createFeishuOpenPlatformApp({
-          name: appName,
-          forceQrLogin: true,
-          disableBytedcliFallback: true,
-        });
-        if (created.ok) {
-          credentials = created;
-          appliedAppName = true;
-        } else if (created.appId) {
+        const {
+          createFeishuOpenPlatformApp,
+          inspectCachedFeishuOpenPlatformSession,
+          readStoredCookiesFromSessionFile,
+          botmuxFeishuSessionFilePath,
+        } = await import('./setup/open-platform-automation.js');
+        const inspected = cmd.switchAccount ? null : await inspectCachedFeishuOpenPlatformSession();
+        const hadCachedSession = (readStoredCookiesFromSessionFile(botmuxFeishuSessionFilePath())?.length ?? 0) > 0;
+        if (!cmd.switchAccount && inspected && !inspected.ok && (cmd.json || hadCachedSession)) {
           credentials = {
             ok: false,
-            appId: created.appId,
-            message: `应用已创建但后续步骤失败 (${created.reason}): ${created.message}`,
+            message: cmd.json && !hadCachedSession
+              ? '没有可复用的飞书登录态；--json 模式不会弹出二维码。请显式加 --switch-account 扫码登录。'
+              : `飞书登录态已失效或无法确认账号 (${inspected.reason})；未静默弹出二维码。请显式加 --switch-account 重新扫码。`,
           };
         } else {
-          credentials = {
-            ok: false,
-            message: `一次扫码创建失败 (${created.reason}): ${created.message}。可重试，或显式加 --compatibility-mode 使用可能需要额外扫码的兼容模式。`,
-          };
+          const sessionOptions = inspected?.ok
+            ? {
+                disableQrLogin: true as const,
+                expectedIdentity: {
+                  userId: inspected.identity.userId,
+                  tenantId: inspected.identity.tenantId,
+                },
+              }
+            : { forceQrLogin: true as const };
+          const created = await createFeishuOpenPlatformApp({
+            name: appName,
+            ...sessionOptions,
+            disableBytedcliFallback: true,
+            onSessionReady: ({ identity, source }) => {
+              process.stderr.write(`已确认飞书账号：${identity.userName} · ${identity.tenantName}${source === 'botmux_cache' ? '（免扫码）' : ''}\n`);
+            },
+          });
+          if (created.ok) {
+            credentials = created;
+            appliedAppName = true;
+          } else if (created.appId) {
+            credentials = {
+              ok: false,
+              appId: created.appId,
+              message: `应用已创建但后续步骤失败 (${created.reason}): ${created.message}`,
+            };
+          } else {
+            credentials = {
+              ok: false,
+              message: `一次扫码创建失败 (${created.reason}): ${created.message}。可重试，或显式加 --compatibility-mode 使用可能需要额外扫码的兼容模式。`,
+            };
+          }
         }
       }
 
       if (!credentials.ok) {
         const continueCommand = credentials.appId
-          ? `botmux setup add --app-id ${credentials.appId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL>`
+          ? `botmux setup add --app-id ${credentials.appId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> --open-platform-auto`
           : undefined;
         failSetupScripted(cmd.json,
           `${credentials.message}${credentials.appId ? `；已创建 AppID ${credentials.appId}，请从开放平台读取 App Secret 后运行 ${continueCommand} 继续，未重复创建。` : ''}`,
@@ -1472,7 +1548,7 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
     const v = await validateCredentials(bot.larkAppId, bot.larkAppSecret, botBrand(bot));
     if (!v.ok) {
       const continueCommand = createdAppId
-        ? `botmux setup add --app-id ${createdAppId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL>`
+        ? `botmux setup add --app-id ${createdAppId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> --open-platform-auto`
         : undefined;
       failSetupScripted(
         cmd.json,
@@ -1486,7 +1562,7 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
       writeBotsJsonAtomic([...existing, bot]);
     } catch (err) {
       const continueCommand = createdAppId
-        ? `botmux setup add --app-id ${createdAppId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL>`
+        ? `botmux setup add --app-id ${createdAppId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> --open-platform-auto`
         : undefined;
       failSetupScripted(
         cmd.json,

@@ -43,7 +43,7 @@ export interface SetupBotFlags {
 export type SetupCommand =
   | { action: 'help' }
   | { action: 'list'; json: boolean }
-  | { action: 'add'; json: boolean; createApp: boolean; compatibilityMode: boolean; openPlatformAuto: boolean; flags: SetupBotFlags }
+  | { action: 'add'; json: boolean; createApp: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; flags: SetupBotFlags }
   | { action: 'edit'; json: boolean; selector: string; flags: SetupBotFlags }
   | { action: 'remove'; json: boolean; selector: string; yes: boolean };
 
@@ -83,7 +83,8 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
       列出已配置机器人（--json 输出完整字段，secret 脱敏）。
 
   botmux setup add --create-app --allowed-users <owner> [--app-name <name>] [选项]
-      一次扫码创建飞书应用并添加机器人；--app-name 留空自动使用 botmux-N。
+      首次扫码创建飞书应用；后续有效登录态下确认账号/企业后免扫码添加。
+      --app-name 留空自动使用 botmux-N；更换账号用 --switch-account。
       默认继续完成权限、长连接事件、redirect 与发版；可用
       --no-open-platform-auto 跳过后半段自动配置。
 
@@ -126,6 +127,7 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --json                     输出机器可读 JSON（含 ok / error 字段）
   --create-app               add 时扫码创建应用，不再要求 --app-id/--app-secret
   --compatibility-mode       显式使用 SDK 兼容模式（可能需要额外扫码）
+  --switch-account           不复用缓存，重新扫码并覆盖本机飞书登录态
   --open-platform-auto       add 成功后执行开放平台自动配置（默认跳过；
                              --create-app 时默认开启）
   --no-open-platform-auto    跳过开放平台权限/发版自动配置
@@ -134,13 +136,14 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
 function parseBotFieldFlags(
   tokens: string[],
   opts: { allowFields: boolean; action: string },
-): { flags: SetupBotFlags; json: boolean; yes: boolean; createApp: boolean; compatibilityMode: boolean; openPlatformAuto: boolean; openPlatformAutoSpecified: boolean; positional: string[] } {
+): { flags: SetupBotFlags; json: boolean; yes: boolean; createApp: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; openPlatformAutoSpecified: boolean; positional: string[] } {
   const flags: SetupBotFlags = {};
   const positional: string[] = [];
   let json = false;
   let yes = false;
   let createApp = false;
   let compatibilityMode = false;
+  let switchAccount = false;
   let openPlatformAuto = false;
   let openPlatformAutoSpecified = false;
 
@@ -150,6 +153,7 @@ function parseBotFieldFlags(
     if (token === '--yes' || token === '-y') { yes = true; continue; }
     if (token === '--create-app') { createApp = true; continue; }
     if (token === '--compatibility-mode') { compatibilityMode = true; continue; }
+    if (token === '--switch-account') { switchAccount = true; continue; }
     if (token === '--open-platform-auto') { openPlatformAuto = true; openPlatformAutoSpecified = true; continue; }
     if (token === '--no-open-platform-auto') { openPlatformAuto = false; openPlatformAutoSpecified = true; continue; }
 
@@ -180,7 +184,7 @@ function parseBotFieldFlags(
     }
     positional.push(token);
   }
-  return { flags, json, yes, createApp, compatibilityMode, openPlatformAuto, openPlatformAutoSpecified, positional };
+  return { flags, json, yes, createApp, compatibilityMode, switchAccount, openPlatformAuto, openPlatformAutoSpecified, positional };
 }
 
 /** 解析 `botmux setup` 的脚本化子命令 argv。非法输入抛 Error（message 面向用户）。 */
@@ -189,13 +193,14 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
   if (action === 'help' || action === '--help' || action === '-h') return { action: 'help' };
 
   if (action === 'list') {
-    const { json, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'list' });
+    const { json, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'list' });
+    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app。');
     if (positional.length > 0) throw new Error(`list 不接受多余参数: ${positional.join(' ')}`);
     return { action: 'list', json };
   }
 
   if (action === 'add') {
-    const { flags, json, createApp, compatibilityMode, openPlatformAuto, openPlatformAutoSpecified, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'add' });
+    const { flags, json, createApp, compatibilityMode, switchAccount, openPlatformAuto, openPlatformAutoSpecified, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'add' });
     if (positional.length > 0) throw new Error(`add 不接受位置参数: ${positional.join(' ')}（字段一律用 --flag 形式）`);
     if (createApp && (flags.appId?.trim() || flags.appSecret?.trim())) {
       throw new Error('--create-app 不能与 --app-id/--app-secret 同时使用。');
@@ -206,6 +211,12 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
     if (compatibilityMode && !createApp) {
       throw new Error('--compatibility-mode 必须与 add --create-app 一起使用。');
     }
+    if (switchAccount && !createApp) {
+      throw new Error('--switch-account 必须与 add --create-app 一起使用。');
+    }
+    if (switchAccount && compatibilityMode) {
+      throw new Error('--switch-account 不适用于 SDK 兼容模式。');
+    }
     if (compatibilityMode && flags.appName?.trim()) {
       throw new Error('兼容模式不支持 --app-name；请移除该参数，应用名称将由平台决定。');
     }
@@ -214,20 +225,23 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
       json,
       createApp,
       compatibilityMode,
+      switchAccount,
       openPlatformAuto: openPlatformAutoSpecified ? openPlatformAuto : createApp,
       flags,
     };
   }
 
   if (action === 'edit') {
-    const { flags, json, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'edit' });
+    const { flags, json, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'edit' });
+    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app。');
     if (positional.length === 0) throw new Error('edit 需要指定机器人（进程名 botmux-N 或 AppID）。');
     if (positional.length > 1) throw new Error(`edit 只接受一个机器人标识: ${positional.join(' ')}`);
     return { action: 'edit', json, selector: positional[0], flags };
   }
 
   if (action === 'remove') {
-    const { json, yes, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'remove' });
+    const { json, yes, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'remove' });
+    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app。');
     if (positional.length === 0) throw new Error('remove 需要指定机器人（进程名 botmux-N 或 AppID）。');
     if (positional.length > 1) throw new Error(`remove 只接受一个机器人标识: ${positional.join(' ')}`);
     return { action: 'remove', json, selector: positional[0], yes };

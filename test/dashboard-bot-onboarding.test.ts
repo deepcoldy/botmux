@@ -97,7 +97,7 @@ describe('BotOnboardingManager', () => {
       renderQrDataUrl: (payload) => `data:image/svg+xml;base64,${Buffer.from(payload).toString('base64')}`,
     });
 
-    const job = manager.start({ appName: '研发助手' });
+    const job = manager.start({ appName: '研发助手', sessionMode: 'qr' });
     await Promise.resolve();
     expect(manager.get(job.id)).toMatchObject({
       status: 'waiting_for_scan',
@@ -112,11 +112,43 @@ describe('BotOnboardingManager', () => {
       brand: 'feishu',
       sessionFile: '/tmp/feishu-session.json',
       sessionSource: 'qr_login',
+      sessionIdentity: { userId: 'u_1', userName: 'Alice', tenantId: 't_1', tenantName: 'Example' },
     });
     await job.done;
 
     expect(registerApp).not.toHaveBeenCalled();
     expect(manager.get(job.id)).toMatchObject({ status: 'needs_owner', appId: 'cli_web', appName: '研发助手' });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reuses a UI-confirmed session without a QR and binds creation to that account and tenant', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-reuse-'));
+    const createApp = vi.fn(async (opts) => {
+      expect(opts.forceQrLogin).toBeUndefined();
+      expect(opts.disableQrLogin).toBe(true);
+      expect(opts.expectedIdentity).toEqual({ userId: 'u_1', tenantId: 't_1' });
+      return {
+        ok: false as const,
+        reason: 'api_error' as const,
+        message: 'stop after checking options',
+      };
+    });
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      createApp,
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+    });
+
+    const job = manager.start({
+      appName: '免扫机器人',
+      sessionMode: 'reuse',
+      expectedIdentity: { userId: 'u_1', tenantId: 't_1' },
+    });
+    await job.done;
+
+    expect(createApp).toHaveBeenCalledOnce();
+    expect(manager.get(job.id)).toMatchObject({ status: 'failed', appName: '免扫机器人' });
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -127,6 +159,36 @@ describe('BotOnboardingManager', () => {
     const manager = new BotOnboardingManager({ botsJsonPath, registerApp: async () => ({ ok: false, error: 'aborted', message: 'stop' }) });
     expect(manager.suggestedAppName()).toBe('botmux-2');
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reports the cached account and tenant for explicit pre-create confirmation', async () => {
+    const manager = new BotOnboardingManager({
+      botsJsonPath: '/tmp/botmux-session-status-bots.json',
+      inspectSession: async () => ({
+        ok: true,
+        source: 'botmux_cache',
+        sessionFile: '/tmp/feishu-session.json',
+        identity: {
+          userId: 'u_1',
+          userName: 'Alice',
+          email: 'alice@example.com',
+          tenantId: 't_1',
+          tenantName: 'Example',
+        },
+      }),
+    });
+
+    await expect(manager.sessionStatus()).resolves.toEqual({
+      status: 'ready',
+      source: 'botmux_cache',
+      identity: {
+        userId: 'u_1',
+        userName: 'Alice',
+        email: 'alice@example.com',
+        tenantId: 't_1',
+        tenantName: 'Example',
+      },
+    });
   });
 
   it('does not invoke the SDK fallback when Web creation already returned an app id', async () => {

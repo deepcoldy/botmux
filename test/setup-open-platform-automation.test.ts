@@ -15,6 +15,7 @@ import {
   buildScopeUpdatePayload,
   createFeishuOpenPlatformApp,
   extractOpenPlatformCsrfToken,
+  extractOpenPlatformSessionIdentity,
   extractOpenPlatformScopeEntries,
   getCookieHeader,
   mapFeishuQrPollingStatus,
@@ -39,6 +40,11 @@ function cookie(overrides: Partial<StoredCookie> = {}): StoredCookie {
     ...overrides,
   };
 }
+
+const openPlatformPage = (csrf = 'csrf_create') => `<script>
+window.csrfToken="${csrf}";
+window.user={"id":"u_1","name":"Alice","email":"alice@example.com","tenantId":"t_1","tenantName":"Example","tenantDisplayName":{"value":"Example"}};
+</script>`;
 
 describe('parseSetupOpenPlatformAutoFlag', () => {
   it('is enabled by default, supports explicit skip, and keeps --open-platform-auto compatible', () => {
@@ -83,6 +89,16 @@ describe('Open Platform payload helpers', () => {
 
   it('extracts window.csrfToken from page HTML', () => {
     expect(extractOpenPlatformCsrfToken('<script>window.csrfToken = "csrf_123"</script>')).toBe('csrf_123');
+  });
+
+  it('extracts the account and tenant identity shown before cached-session creation', () => {
+    expect(extractOpenPlatformSessionIdentity(openPlatformPage())).toEqual({
+      userId: 'u_1',
+      userName: 'Alice',
+      email: 'alice@example.com',
+      tenantId: 't_1',
+      tenantName: 'Example',
+    });
   });
 
   it('maps tenant/user scope names to Open Platform IDs and builds payloads', () => {
@@ -267,7 +283,7 @@ describe('createFeishuOpenPlatformApp', () => {
       const href = String(url);
       if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
       if (href === 'https://open.feishu.cn/app') {
-        return new Response('<script>window.csrfToken="csrf_create"</script>', { status: 200 });
+        return new Response(openPlatformPage(), { status: 200 });
       }
       const path = new URL(href).pathname;
       calls.push({ path, body: init?.body });
@@ -298,6 +314,7 @@ describe('createFeishuOpenPlatformApp', () => {
       appId: 'cli_created',
       appSecret: 'created-secret',
       sessionSource: 'botmux_cache',
+      sessionIdentity: { userId: 'u_1', tenantId: 't_1' },
     });
     expect(qrCount).toBe(0);
     expect(calls.map(call => call.path)).toEqual([
@@ -307,6 +324,32 @@ describe('createFeishuOpenPlatformApp', () => {
       '/developers/v1/event/switch/cli_created',
       '/developers/v1/secret/cli_created',
     ]);
+  });
+
+  it('stops before app/create when the account or tenant changed after the UI confirmation', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-identity-race-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const post = vi.fn();
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      post(href, init);
+      return Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await createFeishuOpenPlatformApp({
+      name: 'must-not-exist',
+      sessionFilePath: sessionFile,
+      disableQrLogin: true,
+      disableBytedcliFallback: true,
+      expectedIdentity: { userId: 'u_1', tenantId: 'another_tenant' },
+      fetchImpl,
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: 'session_changed' });
+    expect(post).not.toHaveBeenCalled();
   });
 });
 
