@@ -21,7 +21,7 @@ import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMemberChat } from '../../services/platform-team-store.js';
 import { recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
-import { getDocSubscription, putDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
+import { getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL } from './doc-comment.js';
 import {
   BOTMUX_REQUIRED_SCOPES,
@@ -1717,7 +1717,10 @@ async function processCommentEvent(
   // 1) 查订阅表；未订阅的文档 @bot 时自动创建 mention-only 订阅（任何人都可以
   //    通过在文档里 @bot 触发 bot 回复，不需要 owner 预先订阅。/watch-comment 命令
   //    管理持久订阅才需要 owner 权限）。
+  //    注意：auto-sub 先创建占位，但如果后续审计硬门失败会回滚（非 owner 触发
+  //    且通知 owner 失败时不允许留下订阅记录）。
   let sub = getDocSubscription(config.session.dataDir, larkAppId, fileToken);
+  let autoCreatedSub = false;
   if (!sub) {
     const operatorOpenId = parsed.operatorOpenId;
     const botCfg = getBot(larkAppId).config;
@@ -1737,6 +1740,7 @@ async function processCommentEvent(
     };
     putDocSubscription(config.session.dataDir, larkAppId, autoSub);
     sub = autoSub;
+    autoCreatedSub = true;
     logger.info(`[doc-comment] auto-subscribed file=${fileToken.slice(0, 12)} by @mention (mention-only${mappedDir ? `, wd=${mappedDir}` : ''}, anchor=doc:${fileToken.slice(0, 12)}, requester=${operatorOpenId?.slice(0, 12) || '?'})`);
   }
 
@@ -1776,14 +1780,22 @@ async function processCommentEvent(
   const text = trigger.text.trim();
   if (!text) return;
 
-  // 审计通知：非 owner @bot 触发时，私信通知 owner 以便审计。
-  // （owner 自己触发的不通知，避免自扰。）
+  // 审计硬门：非 owner @bot 触发时，必须成功通知 owner 才允许回复。
+  // 通知失败 = owner 无法感知 = 越权，直接拒绝响应并回滚 auto-sub。
+  // （owner 自己触发的不通知，直接放行。）
   const ownerOpenId = getOwnerOpenId(larkAppId);
   const requesterOpenId = parsed.operatorOpenId;
-  if (ownerOpenId && requesterOpenId && requesterOpenId !== ownerOpenId) {
+  const isOwnerTrigger = ownerOpenId && requesterOpenId && requesterOpenId === ownerOpenId;
+  if (!isOwnerTrigger) {
+    const rollbackAutoSub = () => { if (autoCreatedSub) removeDocSubscription(config.session.dataDir, larkAppId, fileToken); };
+    if (!ownerOpenId) {
+      logger.warn(`[doc-comment] non-owner @mention but no ownerOpenId configured — rejecting (audit gate) file=${fileToken.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'}`);
+      rollbackAutoSub();
+      return;
+    }
     try {
       const loc = localeForBot(larkAppId);
-      const requesterName = requesterOpenId.slice(0, 12);
+      const requesterName = requesterOpenId?.slice(0, 12) || '?';
       const notifyText = [
         t('daemon.doc_mention_notify_title', undefined, loc),
         '',
@@ -1792,10 +1804,12 @@ async function processCommentEvent(
         `📄 \`${fileToken}\``,
         `💬 ${text.slice(0, 200)}${text.length > 200 ? '…' : ''}`,
       ].join('\n');
-      sendUserMessage(larkAppId, ownerOpenId, notifyText).catch((e) => {
-        logger.warn(`[doc-comment] failed to notify owner about @mention: ${e instanceof Error ? e.message : e}`);
-      });
-    } catch { /* best-effort */ }
+      await sendUserMessage(larkAppId, ownerOpenId, notifyText);
+    } catch (e) {
+      logger.warn(`[doc-comment] non-owner @mention but owner notification failed — rejecting (audit gate) file=${fileToken.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'} err=${e instanceof Error ? e.message : String(e)}`);
+      rollbackAutoSub();
+      return;
+    }
   }
 
   logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
