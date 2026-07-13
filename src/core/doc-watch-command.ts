@@ -4,8 +4,6 @@ export type DocWatchCommand =
   | { kind: 'usage' }
   | { kind: 'list' }
   | { kind: 'off'; docRef?: string }
-  | { kind: 'pending' }
-  | { kind: 'approve' | 'deny'; token: string }
   | {
       kind: 'watch';
       docRef: string;
@@ -44,19 +42,11 @@ export function parseDocWatchCommand(content: string): DocWatchCommand {
   if (!arg) return { kind: 'usage' };
 
   if (/^(list|列表)$/i.test(arg)) return { kind: 'list' };
-  if (/^(pending|待审批)$/i.test(arg)) return { kind: 'pending' };
 
   const off = /^(off|stop|unwatch|退订)(?:\s+([\s\S]+))?$/i.exec(arg);
   if (off) {
     const docRef = (off[2] ?? '').trim();
     return { kind: 'off', ...(docRef && docRef.toLowerCase() !== 'all' ? { docRef } : {}) };
-  }
-
-  const approval = /^(approve|deny)(?:\s+([\s\S]+))?$/i.exec(arg);
-  if (approval) {
-    const token = (approval[2] ?? '').trim();
-    if (!token) return { kind: 'invalid', reason: 'missing_argument' };
-    return { kind: approval[1].toLowerCase() as 'approve' | 'deny', token };
   }
 
   return parseWatchSpec(arg);

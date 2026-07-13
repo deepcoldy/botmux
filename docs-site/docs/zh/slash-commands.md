@@ -102,7 +102,7 @@
 
 ## 📄 飞书文档评论入口
 
-`/watch-comment`：监听飞书文档评论、绑定 AI 会话并把回复发回评论串；支持 `<文档链接> [--dir <路径>] [--all|--mentions-only]`、`list/off`、`pending/approve/deny`。`/subscribe-lark-doc` 保留原有的飞书逐文件 API 订阅流程。详见 [飞书文档评论入口](/doc-comment)。
+`/watch-comment`：监听飞书文档评论、绑定 AI 会话并把回复发回评论串；支持 `<文档链接> [--dir <路径>] [--all|--mentions-only]` 与 `list/off`。`/subscribe-lark-doc` 保留原有的飞书逐文件 API 订阅流程。详见 [飞书文档评论入口](/doc-comment)。
 
 ## 🔧 Workflow（流程编排，实验性）
 

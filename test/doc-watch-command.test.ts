@@ -23,17 +23,15 @@ describe('parseDocWatchCommand', () => {
     });
   });
 
-  it('parses list, off, pending, approve, and deny', () => {
+  it('parses list and off (no approval subcommands — notify-not-approve model)', () => {
     expect(parseDocWatchCommand('/watch-comment list')).toEqual({ kind: 'list' });
     expect(parseDocWatchCommand('/watch-comment off')).toEqual({ kind: 'off' });
     expect(parseDocWatchCommand('/watch-comment off token123')).toEqual({ kind: 'off', docRef: 'token123' });
-    expect(parseDocWatchCommand('/watch-comment pending')).toEqual({ kind: 'pending' });
-    expect(parseDocWatchCommand('/watch-comment approve token123')).toEqual({ kind: 'approve', token: 'token123' });
-    expect(parseDocWatchCommand('/watch-comment deny token123')).toEqual({ kind: 'deny', token: 'token123' });
+    expect(parseDocWatchCommand('/watch-comment off all')).toEqual({ kind: 'off' });
   });
 
   it('rejects missing arguments and conflicting modes', () => {
-    expect(parseDocWatchCommand('/watch-comment approve')).toEqual({ kind: 'invalid', reason: 'missing_argument' });
+    expect(parseDocWatchCommand('/watch-comment --all')).toEqual({ kind: 'invalid', reason: 'missing_argument' });
     expect(parseDocWatchCommand('/watch-comment token123 --all --mentions-only')).toEqual({
       kind: 'invalid',
       reason: 'conflicting_modes',
@@ -46,7 +44,6 @@ describe('docWatchCommandNeedsSession', () => {
     expect(docWatchCommandNeedsSession('/watch-comment https://example.feishu.cn/docx/AbCdEf12345678901234 --all')).toBe(true);
     expect(docWatchCommandNeedsSession('/watch-comment list')).toBe(false);
     expect(docWatchCommandNeedsSession('/watch-comment off all')).toBe(false);
-    expect(docWatchCommandNeedsSession('/watch-comment pending')).toBe(false);
   });
 });
 

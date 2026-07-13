@@ -9,7 +9,7 @@
 最直接的入口是在文档评论里直接 `@机器人`：
 
 - bot owner 第一次 `@` 时，botmux 自动以 `mention-only` 模式接入文档，并创建一条以 `doc:<fileToken>` 为锚点的会话；
-- 非 owner 第一次 `@` 时，bot owner 会收到审批通知。批准后，请求者需要再 `@` 一次（首次评论不会自动重放）。
+- 非 owner 第一次 `@` 时，botmux 同样自动接入并**立即回复**，但**前提是**先成功私信 bot owner 一条审计通知（谁在哪个文档 @ 了 bot）；若该通知发送失败、或未配置 owner，则拒绝回复并回滚本次自动接入。这是「通知而非审批」模型：owner 始终被告知，但回复不会被挂起等待批准。owner 用 `/watch-comment off <文档链接>` 即可停止在某文档回复。
 
 如果希望把文档评论明确绑定到某条飞书话题，可直接在该话题内发送：
 
@@ -23,17 +23,14 @@
 
 ## `/watch-comment` 与 `/subscribe-lark-doc`
 
-- `/watch-comment` 是 botmux 的产品能力：监听评论、创建/绑定 AI 会话、把回复发回评论串，并管理自动接入审批。
-- `/subscribe-lark-doc` 保留原有语义：要求文档 scope 的 User Token，调用飞书逐文件 subscribe API，并把订阅绑定到当前会话。它不承载 Watch 模式和审批子命令。
+- `/watch-comment` 是 botmux 的产品能力：监听评论、创建/绑定 AI 会话、把回复发回评论串。其管理子命令（`list`/`off`）仅 owner 可用。
+- `/subscribe-lark-doc` 保留原有语义：要求文档 scope 的 User Token，调用飞书逐文件 subscribe API，并把订阅绑定到当前会话。它不承载 Watch 模式。
 
 | 命令 | 说明 |
 |------|------|
 | `/watch-comment <文档链接> [--dir <路径>] [--all|--mentions-only]` | 创建或绑定当前话题会话，立即启动 CLI、预读文档并进入评论待命 |
-| `/watch-comment list` | 有会话时查当前会话；无会话时查当前用户登记的文档 |
+| `/watch-comment list` | 有会话时查当前会话；无会话时查当前 bot 的全部文档监听 |
 | `/watch-comment off [文档链接|all]` | 停止监听一篇或当前范围的全部文档 |
-| `/watch-comment pending` | 查看未监听文档的待审批请求 |
-| `/watch-comment approve <token>` | bot owner 同意监听请求 |
-| `/watch-comment deny <token>` | bot owner 拒绝监听请求 |
 | `/subscribe-lark-doc <文档链接>` | 使用文档 User Token 调飞书 API 订阅文档 |
 | `/subscribe-lark-doc list` / `off` | 查看或取消当前会话的 API 订阅 |
 

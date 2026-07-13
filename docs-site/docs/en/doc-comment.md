@@ -9,7 +9,7 @@ Without leaving the doc you're working in, `@the bot` in a comment to ask a ques
 The shortest path is to mention the bot directly in a doc comment:
 
 - The first mention from the bot owner auto-connects the doc in `mention-only` mode and creates a session anchored at `doc:<fileToken>`.
-- A first mention from anyone else creates a pending request and notifies the bot owner. After approval, the requester must mention the bot again; the original comment is not replayed.
+- A first mention from anyone else auto-connects the doc the same way and replies immediately, but **only after** botmux successfully DMs the bot owner an audit notice (who mentioned the bot, in which doc). If that owner notification fails—or no owner is configured—the reply is refused and the auto-connect is rolled back. This is a notify-not-approve model: the owner is always informed, but the reply is not held for approval. To stop responding in a doc, the owner runs `/watch-comment off <doc link>`.
 
 To bind doc comments explicitly to a Feishu topic, send this inside that topic:
 
@@ -23,17 +23,14 @@ Only the zero-command path—first mentioning the bot in a previously unknown do
 
 ## `/watch-comment` vs `/subscribe-lark-doc`
 
-- `/watch-comment` is the botmux product capability: watch comments, create or bind an AI session, post replies back into the comment thread, and manage automatic-onboarding approvals.
-- `/subscribe-lark-doc` keeps its original behavior: require a doc-scoped User Token, call Feishu's per-file subscribe API, and bind the subscription to the current session. It does not own Watch modes or approval subcommands.
+- `/watch-comment` is the botmux product capability: watch comments, create or bind an AI session, and post replies back into the comment thread. Its management subcommands (`list`/`off`) are owner-only.
+- `/subscribe-lark-doc` keeps its original behavior: require a doc-scoped User Token, call Feishu's per-file subscribe API, and bind the subscription to the current session. It does not own Watch modes.
 
 | Command | Description |
 |---------|-------------|
 | `/watch-comment <doc link> [--dir <path>] [--all|--mentions-only]` | Create or bind the current topic session, start the CLI immediately, pre-read the doc, and wait for comments |
-| `/watch-comment list` | List the current session's watches, or the caller's registrations when no session exists |
+| `/watch-comment list` | List the current session's watches, or all of this bot's doc-comment watches when no session exists |
 | `/watch-comment off [doc link|all]` | Stop one watch or every watch in the current scope |
-| `/watch-comment pending` | List pending requests from unwatched docs |
-| `/watch-comment approve <token>` | Let the bot owner approve a watch request |
-| `/watch-comment deny <token>` | Let the bot owner deny a watch request |
 | `/subscribe-lark-doc <doc link>` | Use a doc-scoped User Token to call Feishu's subscribe API |
 | `/subscribe-lark-doc list` / `off` | List or remove the current session's API subscriptions |
 

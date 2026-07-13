@@ -338,12 +338,6 @@ vi.mock('../src/services/doc-subs-store.js', () => ({
   getDocSubscription: vi.fn(() => null),
 }));
 
-vi.mock('../src/services/doc-pending-approvals-store.js', () => ({
-  getPendingApproval: vi.fn(() => null),
-  removePendingApproval: vi.fn(),
-  listPendingApprovals: vi.fn(() => []),
-}));
-
 // The picker query helper now lives in services/relay-picker.ts — mock it so
 // the /relay picker tests can control the entry list directly without
 // patching activeSessions in lots of places.

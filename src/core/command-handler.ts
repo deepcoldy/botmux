@@ -39,7 +39,6 @@ import {
   putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription,
   type CommentTriggerMode, type DocSubscription,
 } from '../services/doc-subs-store.js';
-import { getPendingApproval, removePendingApproval, listPendingApprovals } from '../services/doc-pending-approvals-store.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import {
   CONFIG_FIELDS, findConfigField, settableFieldKeys, parseBooleanValue,
@@ -1849,70 +1848,12 @@ export async function handleCommand(
           break;
         }
 
-        // 设计：只有 bot owner 能管理文档订阅（watch / list / off / pending / approve / deny）。
-        // 非 owner 只能在已被订阅的文档里通过 @bot 评论触发回复，不能主动发起订阅。
+        // 设计：只有 bot owner 能管理文档评论监听（watch / list / off）。非 owner 无法
+        // 主动发起监听，只能在文档里 @bot 触发回复——那条路径会私信通知 owner 审计
+        // （notify-not-approve，见 event-dispatcher.processCommentEvent），不经这里。
         const ownerOpenId = getOwnerOpenId(larkAppId);
         if (!ownerOpenId || message.senderId !== ownerOpenId) {
           await sessionReply(rootId, t('cmd.watch.owner_only', undefined, loc));
-          break;
-        }
-
-        if (request.kind === 'pending') {
-          const pending = listPendingApprovals(dataDir, larkAppId);
-          if (!pending.length) {
-            await sessionReply(rootId, t('cmd.watch.pending_none', undefined, loc));
-            break;
-          }
-          const locale = loc === 'zh' ? 'zh-CN' : 'en-US';
-          const lines = pending.map(p => [
-            `• \`${p.fileToken}\``,
-            `  ${t('cmd.watch.pending_request', {
-              requester: p.requesterOpenId.slice(0, 12),
-              date: new Date(p.requestedAt).toLocaleString(locale),
-            }, loc)}`,
-            `  ✅ \`/watch-comment approve ${p.fileToken}\``,
-            `  ❌ \`/watch-comment deny ${p.fileToken}\``,
-          ].join('\n'));
-          await sessionReply(rootId, [t('cmd.watch.pending_title', undefined, loc), '', ...lines].join('\n'));
-          break;
-        }
-
-        if (request.kind === 'approve' || request.kind === 'deny') {
-          const pending = getPendingApproval(dataDir, larkAppId, request.token);
-          if (!pending) {
-            await sessionReply(rootId, t('cmd.watch.pending_not_found', { token: request.token.slice(0, 12) }, loc));
-            break;
-          }
-          if (request.kind === 'approve') {
-            const botCfg = getBot(larkAppId).config;
-            const mappedDir = botCfg.docRepoMap?.[pending.fileToken];
-            putDocSubscription(dataDir, larkAppId, {
-              fileToken: pending.fileToken,
-              fileType: pending.fileType,
-              sessionAnchor: `doc:${pending.fileToken}`,
-              sessionId: undefined,
-              scope: 'chat',
-              chatId: `doc:${pending.fileToken}`,
-              commentTriggerMode: 'mention-only',
-              managedBy: 'watch-comment',
-              ownerOpenId: pending.requesterOpenId,
-              workingDir: mappedDir,
-              createdAt: Date.now(),
-            });
-            removePendingApproval(dataDir, larkAppId, request.token);
-            let replyText = t('cmd.watch.approved', {
-              token: request.token.slice(0, 12),
-              requester: pending.requesterOpenId.slice(0, 12),
-            }, loc);
-            if (mappedDir) replyText += `\n📂 ${t('cmd.watch.working_dir', { dir: mappedDir }, loc)}`;
-            replyText += `\n\n${t('cmd.watch.approved_retry', undefined, loc)}`;
-            await sessionReply(rootId, replyText);
-            logger.info(`[doc-comment] owner approved watch doc=${request.token.slice(0, 12)} requester=${pending.requesterOpenId.slice(0, 12)}`);
-          } else {
-            removePendingApproval(dataDir, larkAppId, request.token);
-            await sessionReply(rootId, t('cmd.watch.denied', { token: request.token.slice(0, 12) }, loc));
-            logger.info(`[doc-comment] owner denied watch doc=${request.token.slice(0, 12)} requester=${pending.requesterOpenId.slice(0, 12)}`);
-          }
           break;
         }
 
