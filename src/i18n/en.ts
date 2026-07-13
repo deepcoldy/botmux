@@ -327,6 +327,8 @@ export const messages: Record<string, string> = {
   'daemon.doc_approval_request_token': 'Doc token: {token}…',
   'daemon.doc_approval_approve': 'Approve watch',
   'daemon.doc_approval_deny': 'Deny',
+  'daemon.doc_mention_notify_title': '📄 Doc @bot trigger notification',
+  'daemon.doc_mention_notify_body': 'User {requester} mentioned the bot in doc {token} and triggered a reply.',
   'daemon.doc_comment_reply_prefix': '↪ Reply to {author}: ',
   'cmd.adopt.already_adopted': 'This topic is already adopting {label} ({pane}).\nClick "Disconnect" on the card first, then run /adopt again (the original CLI is untouched).',
   'cmd.adopt.no_sessions': 'No adoptable CLI session found.',

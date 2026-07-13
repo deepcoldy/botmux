@@ -1776,6 +1776,28 @@ async function processCommentEvent(
   const text = trigger.text.trim();
   if (!text) return;
 
+  // 审计通知：非 owner @bot 触发时，私信通知 owner 以便审计。
+  // （owner 自己触发的不通知，避免自扰。）
+  const ownerOpenId = getOwnerOpenId(larkAppId);
+  const requesterOpenId = parsed.operatorOpenId;
+  if (ownerOpenId && requesterOpenId && requesterOpenId !== ownerOpenId) {
+    try {
+      const loc = localeForBot(larkAppId);
+      const requesterName = requesterOpenId.slice(0, 12);
+      const notifyText = [
+        t('daemon.doc_mention_notify_title', undefined, loc),
+        '',
+        t('daemon.doc_mention_notify_body', { requester: requesterName, token: fileToken.slice(0, 12) }, loc),
+        '',
+        `📄 \`${fileToken}\``,
+        `💬 ${text.slice(0, 200)}${text.length > 200 ? '…' : ''}`,
+      ].join('\n');
+      sendUserMessage(larkAppId, ownerOpenId, notifyText).catch((e) => {
+        logger.warn(`[doc-comment] failed to notify owner about @mention: ${e instanceof Error ? e.message : e}`);
+      });
+    } catch { /* best-effort */ }
+  }
+
   logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
   await handlers.handleDocComment({
     larkAppId,
