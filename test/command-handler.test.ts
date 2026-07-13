@@ -960,7 +960,7 @@ describe('handleCommand', () => {
       await handleCommand(
         '/watch-comment',
         ROOT_ID,
-        makeLarkMessage('/watch-comment https://example.feishu.cn/docx/AbCdEf12345678901234 --all'),
+        makeLarkMessage('/watch-comment https://example.feishu.cn/docx/AbCdEf12345678901234 --all', { senderId: 'ou_owner' }),
         deps,
         LARK_APP_ID,
       );
@@ -999,7 +999,7 @@ describe('handleCommand', () => {
       await handleCommand(
         '/watch-comment',
         ROOT_ID,
-        makeLarkMessage('/watch-comment https://example.feishu.cn/docx/AbCdEf12345678901234 --dir /work/repo'),
+        makeLarkMessage('/watch-comment https://example.feishu.cn/docx/AbCdEf12345678901234 --dir /work/repo', { senderId: 'ou_owner' }),
         deps,
         LARK_APP_ID,
       );
@@ -1035,7 +1035,7 @@ describe('handleCommand', () => {
         {
           fileToken: 'doc-owned', fileType: 'docx', sessionAnchor: 'doc:doc-owned', scope: 'chat',
           chatId: 'doc:doc-owned', commentTriggerMode: 'mention-only', managedBy: 'watch-comment',
-          ownerOpenId: 'ou_sender', createdAt: 1,
+          ownerOpenId: 'ou_owner', createdAt: 1,
         },
         {
           fileToken: 'doc-other', fileType: 'docx', sessionAnchor: 'doc:doc-other', scope: 'chat',
@@ -1045,7 +1045,7 @@ describe('handleCommand', () => {
       ]);
       const deps = makeDeps();
 
-      await handleCommand('/watch-comment', ROOT_ID, makeLarkMessage('/watch-comment list'), deps, LARK_APP_ID);
+      await handleCommand('/watch-comment', ROOT_ID, makeLarkMessage('/watch-comment list', { senderId: 'ou_owner' }), deps, LARK_APP_ID);
 
       const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] ?? '';
       expect(reply).toContain('doc-owned');
@@ -1057,12 +1057,12 @@ describe('handleCommand', () => {
         {
           fileToken: 'doc-owned', fileType: 'docx', sessionAnchor: 'doc:doc-owned', scope: 'chat',
           chatId: 'doc:doc-owned', commentTriggerMode: 'mention-only', managedBy: 'watch-comment',
-          ownerOpenId: 'ou_sender', createdAt: 1,
+          ownerOpenId: 'ou_owner', createdAt: 1,
         },
       ]);
       const deps = makeDeps();
 
-      await handleCommand('/watch-comment', ROOT_ID, makeLarkMessage('/watch-comment off all'), deps, LARK_APP_ID);
+      await handleCommand('/watch-comment', ROOT_ID, makeLarkMessage('/watch-comment off all', { senderId: 'ou_owner' }), deps, LARK_APP_ID);
 
       expect(removeDocSubscription).toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, 'doc-owned');
       expect(unsubscribeDocFile).not.toHaveBeenCalled();

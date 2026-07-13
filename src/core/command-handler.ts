@@ -1849,14 +1849,15 @@ export async function handleCommand(
           break;
         }
 
+        // 设计：只有 bot owner 能管理文档订阅（watch / list / off / pending / approve / deny）。
+        // 非 owner 只能在已被订阅的文档里通过 @bot 评论触发回复，不能主动发起订阅。
+        const ownerOpenId = getOwnerOpenId(larkAppId);
+        if (!ownerOpenId || message.senderId !== ownerOpenId) {
+          await sessionReply(rootId, t('cmd.watch.owner_only', undefined, loc));
+          break;
+        }
+
         if (request.kind === 'pending') {
-          // 权责统一：只有 bot owner 能查看待审批列表（和 approve/deny 权限一致），
-          // 避免泄露「谁在申请监听什么文档」的信息。
-          const ownerOpenId = getOwnerOpenId(larkAppId);
-          if (!ownerOpenId || message.senderId !== ownerOpenId) {
-            await sessionReply(rootId, t('cmd.watch.owner_only', undefined, loc));
-            break;
-          }
           const pending = listPendingApprovals(dataDir, larkAppId);
           if (!pending.length) {
             await sessionReply(rootId, t('cmd.watch.pending_none', undefined, loc));
@@ -1877,11 +1878,6 @@ export async function handleCommand(
         }
 
         if (request.kind === 'approve' || request.kind === 'deny') {
-          const ownerOpenId = getOwnerOpenId(larkAppId);
-          if (!ownerOpenId || message.senderId !== ownerOpenId) {
-            await sessionReply(rootId, t('cmd.watch.owner_only', undefined, loc));
-            break;
-          }
           const pending = getPendingApproval(dataDir, larkAppId, request.token);
           if (!pending) {
             await sessionReply(rootId, t('cmd.watch.pending_not_found', { token: request.token.slice(0, 12) }, loc));
