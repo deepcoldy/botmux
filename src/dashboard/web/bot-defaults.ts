@@ -5,6 +5,7 @@ export type CliOption = {
   label: string;
   gateway?: 'ttadk';
   acceptsModel?: boolean;
+  modelChoices?: string[];
 };
 
 export type CliOptionsState = {
@@ -118,7 +119,7 @@ export function selectedCliOption(options: CliOption[], key: string): CliOption 
 
 export function modelSuggestionsForOption(opt: CliOption | undefined, cliState: CliOptionsState): string[] {
   if (opt?.gateway === 'ttadk' && opt.acceptsModel !== false) return cliState.ttadkModelSuggestions;
-  return [];
+  return opt?.modelChoices ?? [];
 }
 
 export async function fetchBotDefaults(): Promise<LoadBotsResult> {
@@ -145,9 +146,17 @@ export async function fetchCliOptions(): Promise<CliOptionsState> {
     const r = await fetch('/api/cli-options');
     const body = await r.json().catch(() => ({}));
     if (!r.ok || !Array.isArray(body?.options)) return fallbackCliOptionsState;
-    const options = body.options.filter((o: any): o is CliOption =>
-      o && typeof o.id === 'string' && typeof o.label === 'string',
-    );
+    const options = body.options
+      .filter((o: any) => o && typeof o.id === 'string' && typeof o.label === 'string')
+      .map((o: any): CliOption => ({
+        id: o.id,
+        label: o.label,
+        gateway: o.gateway === 'ttadk' ? 'ttadk' : undefined,
+        acceptsModel: typeof o.acceptsModel === 'boolean' ? o.acceptsModel : undefined,
+        modelChoices: Array.isArray(o.modelChoices)
+          ? o.modelChoices.filter((m: unknown): m is string => typeof m === 'string')
+          : undefined,
+      }));
     const ttadkModelDefault = typeof body.ttadkModelDefault === 'string' && body.ttadkModelDefault.trim()
       ? body.ttadkModelDefault.trim()
       : fallbackCliOptionsState.ttadkModelDefault;

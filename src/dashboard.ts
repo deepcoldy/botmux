@@ -40,7 +40,9 @@ import {
   ttadkAcceptsModel,
   TTADK_DEFAULT_MODEL,
   TTADK_MODEL_SUGGESTIONS,
+  ttadkConfigModelChoices,
 } from './setup/cli-selection.js';
+import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { invalidateGlobalConfigCache, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
@@ -2141,6 +2143,8 @@ const server = createServer(async (req, res) => {
         options: CLI_SELECT_OPTIONS.map((o) => ({
           id: o.key,
           label: o.label,
+          modelChoices: ttadkConfigModelChoices(o.wrapperCli)
+            ?? [...(createCliAdapterSync(o.cliId).modelChoices ?? [])],
           // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
           ...(isTtadkWrapper(o.wrapperCli)
             ? { gateway: 'ttadk' as const, acceptsModel: ttadkAcceptsModel(o.wrapperCli) }

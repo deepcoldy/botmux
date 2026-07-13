@@ -123,6 +123,23 @@ describe('lazy binary resolution', () => {
     expect(probe).not.toHaveBeenCalled();
   });
 
+  it('coco falls back to traecli when the coco binary is absent', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const probe = vi.mocked(spawnSync);
+    probe.mockImplementation((cmd: any, args: any[]) => {
+      const script = String(args.at(-1));
+      if (script === 'which traecli') {
+        return { stdout: '/usr/local/bin/traecli\n', status: 0 } as any;
+      }
+      return { stdout: '', status: 0 } as any;
+    });
+
+    const adapter = createCliAdapterSync('coco');
+    expect(adapter.resolvedBin).toBe('/usr/local/bin/traecli');
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-coco' }))
+      .toBe('traecli --resume sess-coco');
+  });
+
 });
 
 // ---------------------------------------------------------------------------
