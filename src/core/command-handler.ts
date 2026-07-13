@@ -1850,6 +1850,13 @@ export async function handleCommand(
         }
 
         if (request.kind === 'pending') {
+          // 权责统一：只有 bot owner 能查看待审批列表（和 approve/deny 权限一致），
+          // 避免泄露「谁在申请监听什么文档」的信息。
+          const ownerOpenId = getOwnerOpenId(larkAppId);
+          if (!ownerOpenId || message.senderId !== ownerOpenId) {
+            await sessionReply(rootId, t('cmd.watch.owner_only', undefined, loc));
+            break;
+          }
           const pending = listPendingApprovals(dataDir, larkAppId);
           if (!pending.length) {
             await sessionReply(rootId, t('cmd.watch.pending_none', undefined, loc));
