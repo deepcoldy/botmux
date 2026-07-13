@@ -2230,13 +2230,9 @@ function getActiveCount(): number {
  * sees no visible response.
  */
 function beginNewTurn(ds: DaemonSession, title: string): void {
-  // 每开新轮先清掉上一轮可能残留的「回评论落点」并**落盘**——botmux send 子进程只
-  // 从磁盘读会话态判断"本轮是否文档评论轮"，所以磁盘必须权威：飞书轮清掉，文档轮
-  // 由随后的 handleDocComment 重新设值+落盘。只在确有残留时写盘，避免普通轮多余写。
-  if (ds.session.currentDocCommentTarget) {
-    ds.session.currentDocCommentTarget = undefined;
-    try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
-  }
+  // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
+  // 非文档轮的 BOTMUX_TURN_ID 不会命中 map，天然不会误投；旧 entry 由
+  // deliverFinalOutput / botmux send 成功路径清理。
   // `/card` summon is one-shot: it forces a live card only for the turn it ran
   // in. A new turn returns to the config default (noCardChats / disableStreamingCard).
   // Use `/card on` to persistently restore cards for the chat.
@@ -7766,9 +7762,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // any restored streaming-card reference; worker_ready will POST a fresh
     // card instead of PATCHing the previous turn's card in place.
     logger.info(`[${tag(ds)}] Worker not running, re-forking...`);
-    // 这是飞书消息轮（非文档评论轮）：清掉可能残留的回评论落点，避免本轮 botmux
-    // send 误投到上一次文档评论（本路径不走 beginNewTurn，故显式清盘）。
-    ds.session.currentDocCommentTarget = undefined;
+    // 飞书消息轮（非文档评论轮）：docCommentTargets 是 per-turn map，本轮 turnId
+    // 不会命中文档评论的 key，无需显式清盘。
     if (ds.usageLimitRetryTimer) {
       clearTimeout(ds.usageLimitRetryTimer);
       ds.usageLimitRetryTimer = undefined;
@@ -7903,7 +7898,8 @@ async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx
     turnId,
     replyId: ctx.replyId,
   };
-  ds.session.currentDocCommentTarget = docTarget;
+  (ds.session.docCommentTargets ??= {})[turnId] = docTarget;
+  try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
 
   activeSessions.set(sessionKey(virtualAnchor, larkAppId), ds);
 
@@ -7974,8 +7970,8 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
 
   // 记录本轮回评论的落点。两条路都要覆盖：
   //   • ds.docCommentTurns（内存，按 turnId）→ deliverFinalOutput「兜底」分流用
-  //   • session.currentDocCommentTarget（磁盘）→ `botmux send`「主回复」分流用
-  //     （botmux send 跑在独立子进程，只能从磁盘读会话态）
+  //   • session.docCommentTargets（磁盘，per-turn map）→ `botmux send`「主回复」分流用
+  //     （botmux send 跑在独立子进程，只能从磁盘读会话态；per-turn 避免并发评论串线）
   (ds.docCommentTurns ??= new Map()).set(turnId, {
     fileToken: sub.fileToken,
     fileType: sub.fileType,
@@ -8006,7 +8002,7 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
           whiteboardId: ds.session.whiteboardId,
         });
     beginNewTurn(ds, text);
-    ds.session.currentDocCommentTarget = docTarget; // beginNewTurn 刚清空，这里设本轮落点
+    (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
     rememberLastCliInput(ds, promptContent, msgContent);
     sessionStore.updateSession(ds.session); // 先落盘，botmux send 子进程才读得到落点
     await noteTurnReceived(ds, commentId, text, sender, turnId);
@@ -8033,11 +8029,11 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
       sender,
     });
-    ds.session.currentDocCommentTarget = docTarget;
+    (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
     rememberLastCliInput(ds, promptContent, wrappedPrompt);
     await noteTurnReceived(ds, commentId, text, sender, turnId);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedPrompt, ds.hasHistory);
+    forkWorker(ds, wrappedPrompt, { resume: ds.hasHistory, turnId });
   }
 }
 

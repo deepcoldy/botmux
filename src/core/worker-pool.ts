@@ -2710,6 +2710,11 @@ function deliverFinalOutput(
             docTurn.commentId, docTurn.replyId, docTurn.reactionId);
         }
         ds.docCommentTurns?.delete(msg.turnId);
+        // 同步清理磁盘上的 per-turn 落点，避免 session 文件堆积。
+        if (ds.session.docCommentTargets && ds.session.docCommentTargets[msg.turnId]) {
+          delete ds.session.docCommentTargets[msg.turnId];
+          try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
+        }
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
         return;
