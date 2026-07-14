@@ -12,6 +12,8 @@
     "ecosystem.config.cjs",
     "README.md",
     "README.en.md",
+    "docs/a2a-guide.md",
+    "scripts/a2a-dual-deploy-probe.mjs",
     "LICENSE"
   ],
   "publishConfig": {
