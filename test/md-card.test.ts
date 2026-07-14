@@ -7,6 +7,7 @@
  * rewrite plus baseline behaviors that must not regress.
  */
 import { describe, it, expect } from 'vitest';
+import { homedir } from 'node:os';
 import {
   buildCardBodyElements,
   buildImageCardElements,
@@ -15,6 +16,7 @@ import {
   brandFooterSegment,
   DEFAULT_BRAND_LABEL,
   hasMarkdown,
+  normalizeLocalHomeLinks,
 } from '../src/im/lark/md-card.js';
 
 function mdElements(out: any[]): Array<{ tag: 'markdown'; content: string }> {
@@ -189,6 +191,67 @@ describe('buildCardBodyElements', () => {
     const input = 'Use \\`\\`\\` for fences';
     const out = buildCardBodyElements(input);
     expect(mdElements(out)[0].content).toContain('\\`\\`\\`');
+  });
+});
+
+describe('normalizeLocalHomeLinks', () => {
+  const home = '/Users/alice';
+
+  it('restores the leading slash dropped from a current-home link', () => {
+    expect(normalizeLocalHomeLinks('[report](Users/alice/work/report.md)', home))
+      .toBe('[report](/Users/alice/work/report.md)');
+    expect(normalizeLocalHomeLinks('[report](users/alice/work/report.md)', home))
+      .toBe('[report](/Users/alice/work/report.md)');
+  });
+
+  it('supports an angle-bracket destination containing spaces', () => {
+    expect(normalizeLocalHomeLinks('[report](<Users/alice/My Project/report.md>)', home))
+      .toBe('[report](</Users/alice/My Project/report.md>)');
+  });
+
+  it('does not alter absolute, web, or unrelated relative links', () => {
+    const input = [
+      '[absolute](/Users/alice/work/a.md)',
+      '[web](https://example.test/Users/alice/a.md)',
+      '[relative](Users/guide.md)',
+      '[other user](Users/bob/a.md)',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home)).toBe(input);
+  });
+
+  it('does not rewrite examples inside inline or fenced code', () => {
+    const input = [
+      '`[inline](Users/alice/a.md)`',
+      '```markdown',
+      '[fenced](Users/alice/b.md)',
+      '```',
+      '[real](Users/alice/c.md)',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home)).toBe([
+      '`[inline](Users/alice/a.md)`',
+      '```markdown',
+      '[fenced](Users/alice/b.md)',
+      '```',
+      '[real](/Users/alice/c.md)',
+    ].join('\n'));
+  });
+
+  it('does not let an unmatched backtick suppress later link repair', () => {
+    const input = 'unmatched ` example\n[real](Users/alice/c.md)';
+    expect(normalizeLocalHomeLinks(input, home))
+      .toBe('unmatched ` example\n[real](/Users/alice/c.md)');
+  });
+
+  it('supports a Linux home directory', () => {
+    expect(normalizeLocalHomeLinks('[log](home/alice/run.log)', '/home/alice'))
+      .toBe('[log](/home/alice/run.log)');
+  });
+
+  it('is applied by the card rendering pipeline', () => {
+    const home = homedir().replace(/\/+$/, '');
+    const missingSlash = `${home.replace(/^\/+/, '')}/report.md`;
+    const content = mdElements(buildCardBodyElements(`[report](${missingSlash})`))[0].content;
+    expect(content).toBe(`[report](${home}/report.md)`);
   });
 });
 

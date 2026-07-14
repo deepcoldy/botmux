@@ -19,11 +19,82 @@
  * the outer block (CommonMark spec).
  */
 
+import { homedir } from 'node:os';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
 import { t, type Locale } from '../../i18n/index.js';
 
 const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Restore the leading slash when a model emits the current user's home path
+ * as a relative Markdown link destination. Codex file links are normally
+ * absolute (`/Users/alice/...` or `/home/alice/...`); without the slash,
+ * Feishu resolves the destination as a relative URL and cannot open it.
+ *
+ * The repair is intentionally narrow: it only matches the current host home
+ * prefix, only in ordinary Markdown links, and skips fenced and inline code.
+ * Web links, existing absolute paths, other users' homes, and general
+ * relative links are left unchanged.
+ */
+export function normalizeLocalHomeLinks(input: string, homeDir = homedir()): string {
+  const relativeHome = homeDir.replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!relativeHome || relativeHome === homeDir) return input;
+
+  const destination = new RegExp(
+    `(\\]\\(\\s*<?)${escapeRegExp(relativeHome)}(?=[/?#>\\s)])`,
+    'gi',
+  );
+  let fenceChar = '';
+  let fenceLength = 0;
+
+  const normalizeLine = (line: string): string => {
+    const runs = [...line.matchAll(/`+/g)];
+    let output = '';
+    let cursor = 0;
+    let runIndex = 0;
+
+    while (runIndex < runs.length) {
+      const opener = runs[runIndex];
+      const openerIndex = opener.index ?? 0;
+      const closerIndex = runs.findIndex((candidate, index) => (
+        index > runIndex && candidate[0].length === opener[0].length
+      ));
+
+      if (closerIndex === -1) break;
+      const closer = runs[closerIndex];
+      const closerOffset = closer.index ?? 0;
+      output += line.slice(cursor, openerIndex).replace(destination, `$1/${relativeHome}`);
+      output += line.slice(openerIndex, closerOffset + closer[0].length);
+      cursor = closerOffset + closer[0].length;
+      runIndex = closerIndex + 1;
+    }
+
+    return output + line.slice(cursor).replace(destination, `$1/${relativeHome}`);
+  };
+
+  return input.split('\n').map(line => {
+    const fence = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      const run = fence[1];
+      const char = run[0];
+      if (!fenceChar) {
+        fenceChar = char;
+        fenceLength = run.length;
+      } else if (char === fenceChar && run.length >= fenceLength && fence[2].trim() === '') {
+        fenceChar = '';
+        fenceLength = 0;
+      }
+      return line;
+    }
+    if (fenceChar) return line;
+    return normalizeLine(line);
+  }).join('\n');
+}
 
 /** Default footer brand when a bot has no custom `brandLabel` configured. */
 export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux)';
@@ -158,6 +229,7 @@ function unescapeFenceLines(input: string): string {
  */
 export function buildCardBodyElements(input: string): any[] {
   if (!input) return [];
+  input = normalizeLocalHomeLinks(input);
   // Pre-pass: a line that is nothing but 2+ images renders as a side-by-side
   // image row (column_set) instead of stacked full-width images. Everything
   // else flows through the markdown element builder unchanged. Fence-aware so
