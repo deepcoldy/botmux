@@ -59,6 +59,7 @@ import {
   UnsupportedGlobalInstallError,
   type GlobalInstallPlan,
 } from './utils/global-install.js';
+import { listCliRuntimeUpdateEntries } from './core/cli-runtime-update.js';
 import { writeRestartIntent } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
 import { spawn } from 'node:child_process';
@@ -2228,10 +2229,22 @@ const server = createServer(async (req, res) => {
       // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
       // 2.86.0) is NOT flagged behind — exactly the canary case we want.
       const latest = await cachedLatestVersion();
+      const cliUpdates = listCliRuntimeUpdateEntries(config.session.dataDir).map((entry) => ({
+        cliId: entry.cliId,
+        binPath: entry.binPath,
+        current: entry.current,
+        latest: entry.latest,
+        updateAvailable: entry.updateAvailable,
+        updateCommand: entry.updateCommand,
+        ...(entry.installTarget ? { installTarget: entry.installTarget } : {}),
+        lastCheckedAt: entry.lastCheckedAt,
+      }));
       return jsonRes(res, 200, {
         current,
         latest,
         behind: !!latest && isNewerVersion(latest, current),
+        cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
+        cliUpdates,
         localDevInstall: isLocalDevInstall(),
         updateSupported: installPlan !== null,
         updateManager: installPlan?.manager ?? installManager,

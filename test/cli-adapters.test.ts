@@ -343,6 +343,8 @@ describe('codex buildArgs', () => {
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
+      '-c',
+      'check_for_update_on_startup=false',
       '-C',
       '/repo/root',
     ]);
@@ -354,21 +356,18 @@ describe('codex buildArgs', () => {
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
+      '-c',
+      'check_for_update_on_startup=false',
       '-C',
       '/repo/root',
     ]);
   });
 
-  it('disables startup self-update when the runtime is managed outside Codex', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, disableStartupUpdateCheck: true });
+  it('always disables the startup update picker for botmux-managed launches', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
     const idx = args.indexOf('check_for_update_on_startup=false');
     expect(idx).toBeGreaterThan(0);
     expect(args[idx - 1]).toBe('-c');
-  });
-
-  it('keeps Codex update checks enabled for normal launches', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
-    expect(args).not.toContain('check_for_update_on_startup=false');
   });
 
   it('keeps the startup update override on resume before the Codex session id', () => {
@@ -376,7 +375,6 @@ describe('codex buildArgs', () => {
       sessionId: 'sess-4',
       resume: true,
       resumeSessionId: 'codex-session-id',
-      disableStartupUpdateCheck: true,
     });
     const configIdx = args.indexOf('check_for_update_on_startup=false');
     expect(args[0]).toBe('resume');

@@ -139,6 +139,7 @@ let activeHash = location.hash || '#/';
 let ownerAvatar: OwnerAvatar | null = null;
 let updateBehind = false;
 let latestVersion: string | null = null;
+let updateBadgeKind: 'botmux' | 'codex' | null = null;
 let routeRoot: HTMLElement | null = null;
 let appRoot: ReturnType<typeof createRoot> | null = null;
 
@@ -198,6 +199,13 @@ function navClassName(item: NavItem): string | undefined {
   if (isActiveNav(item, activeHash)) classes.push('active');
   if (item.id === 'settings' && updateBehind) classes.push('nav-has-update');
   return classes.length ? classes.join(' ') : undefined;
+}
+
+function updateBadgeTitle(): string {
+  const version = latestVersion ? `v${latestVersion}` : '';
+  return updateBadgeKind === 'codex'
+    ? t('update.navRuntimeBadgeTitle', { version })
+    : t('update.navBadgeTitle', { version });
 }
 
 function setRouteRoot(node: HTMLElement | null): void {
@@ -493,12 +501,12 @@ function DashboardShell(): JSX.Element {
                   {item.id === 'settings' && updateBehind ? (
                     <InfoTip
                       className="nav-update-tip"
-                      label={t('update.navBadgeTitle', { version: latestVersion ? `v${latestVersion}` : '' })}
+                      label={updateBadgeTitle()}
                       trigger={<span className="nav-update-dot" aria-hidden="true" />}
                       preventClick={false}
                       focusable={false}
                     >
-                      {t('update.navBadgeTitle', { version: latestVersion ? `v${latestVersion}` : '' })}
+                      {updateBadgeTitle()}
                     </InfoTip>
                   ) : null}
                 </a>
@@ -620,8 +628,22 @@ async function checkUpdateBadge(): Promise<void> {
     const r = await fetch('/api/update/status');
     if (!r.ok) return;
     const j = await r.json();
-    updateBehind = j.behind === true;
-    latestVersion = updateBehind && j.latest ? String(j.latest) : null;
+    const runtime = Array.isArray(j.cliUpdates)
+      ? j.cliUpdates.find((entry: any) => entry?.updateAvailable === true && entry?.latest)
+      : null;
+    if (j.behind === true && j.latest) {
+      updateBehind = true;
+      updateBadgeKind = 'botmux';
+      latestVersion = String(j.latest);
+    } else if (runtime) {
+      updateBehind = true;
+      updateBadgeKind = 'codex';
+      latestVersion = String(runtime.latest);
+    } else {
+      updateBehind = false;
+      updateBadgeKind = null;
+      latestVersion = null;
+    }
     renderShell();
   } catch { /* best-effort */ }
 }

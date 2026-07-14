@@ -55,10 +55,22 @@ const COMMON_TIMEZONES = [
 type InstallKind = 'npm-global' | 'pnpm-global' | 'yarn-global' | 'bun-global' | 'source-checkout' | 'unknown';
 interface InstallEntry { binPath: string; root: string; kind: InstallKind }
 interface NodeCheck { version: string; major: number; required: number; ok: boolean }
+interface CliRuntimeUpdateStatus {
+  cliId: 'codex';
+  binPath: string;
+  current: string | null;
+  latest: string | null;
+  updateAvailable: boolean;
+  updateCommand: string;
+  installTarget?: string;
+  lastCheckedAt: number;
+}
 interface UpdateStatus {
   current: string;
   latest: string | null;
   behind: boolean;
+  cliBehind: boolean;
+  cliUpdates: CliRuntimeUpdateStatus[];
   localDevInstall: boolean;
   updateSupported: boolean;
   updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'unknown';
@@ -1008,6 +1020,7 @@ function UpdateCard(props: {
           <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{tr('update.btnUpdate')}</button>
           <button type="button" data-up="restart" disabled={props.busy} onClick={props.onRestart}>{tr('update.btnRestart')}</button>
         </div>
+        {s.cliUpdates?.length ? <CliRuntimeUpdates entries={s.cliUpdates} /> : null}
         {props.changelogOpen ? (
           <ChangelogPanel
             changelog={props.changelog}
@@ -1032,6 +1045,38 @@ function UpdateCard(props: {
     >
       {inner}
     </SettingsBlock>
+  );
+}
+
+function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
+  const tr = useT();
+  return (
+    <div className="cli-runtime-updates">
+      <strong>{tr('update.runtimeTitle')}</strong>
+      <ul>
+        {props.entries.map(entry => (
+          <li key={`${entry.cliId}:${entry.binPath}`} className={entry.updateAvailable ? 'is-behind' : ''}>
+            <div className="cli-runtime-update-head">
+              <span>Codex</span>
+              {entry.updateAvailable && entry.latest ? (
+                <span className="update-badge update-badge-new">
+                  {tr('update.runtimeAvailable', { current: entry.current ?? '?', latest: entry.latest })}
+                </span>
+              ) : entry.latest ? (
+                <span className="update-badge update-badge-ok">{tr('update.upToDate')}</span>
+              ) : (
+                <span className="hint-warn-inline">{tr('update.checkUnavailable')}</span>
+              )}
+            </div>
+            <code>{entry.binPath}</code>
+            {entry.updateAvailable ? (
+              <small>{tr('update.runtimeCommand')}: <code>{entry.updateCommand}</code></small>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+      <p className="settings-help">{tr('update.runtimeHelp')}</p>
+    </div>
   );
 }
 

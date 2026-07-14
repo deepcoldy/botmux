@@ -1044,6 +1044,8 @@ describe('codex writeInput submission confirmation', () => {
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1063,6 +1065,8 @@ describe('codex writeInput submission confirmation', () => {
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1080,6 +1084,8 @@ describe('codex writeInput submission confirmation', () => {
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
       'new-codex-session',
     ]);
   });
@@ -1098,6 +1104,8 @@ describe('codex writeInput submission confirmation', () => {
         '--no-alt-screen',
         '-c',
         'shell_environment_policy.set.BOTMUX_SESSION_ID="custom-botmux-session"',
+        '-c',
+        'check_for_update_on_startup=false',
         'custom-codex-session',
       ]);
 
@@ -1121,6 +1129,8 @@ describe('codex writeInput submission confirmation', () => {
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
     ]);
   });
 
@@ -1137,6 +1147,8 @@ describe('codex writeInput submission confirmation', () => {
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
       '-C',
       '/repo/root',
     ]);

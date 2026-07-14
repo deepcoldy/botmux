@@ -19,6 +19,11 @@ import { buildDashboardUrls } from './core/dashboard-url.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
 import { botmuxWrapperFiles } from './core/botmux-wrapper.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
+import {
+  selectCodexRuntimeUpdateTargets,
+  startCliRuntimeUpdateMonitor,
+  stopCliRuntimeUpdateMonitor,
+} from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
@@ -1470,6 +1475,16 @@ function refreshCliVersion(cliId: CliId, cliPathOverride?: string): boolean {
     logger.warn(`Failed to get CLI version for ${cliId}: ${err.message}`);
     return false;
   }
+}
+
+/** Host Codex binaries configured across every bot process. The probe is
+ * read-only even for wrapper launchers; its notification names the exact path
+ * so the owner remains in control of any update. Codex App shares this binary. */
+function configuredCodexUpdateTargets() {
+  return selectCodexRuntimeUpdateTargets(
+    loadBotConfigs(),
+    (cliPathOverride) => createCliAdapterSync('codex', cliPathOverride).resolvedBin,
+  );
 }
 
 // ─── Helpers (local to daemon) ───────────────────────────────────────────────
@@ -8620,6 +8635,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // primary daemon (bot-0) — a restart is host-wide.
   if (idx === 0) {
     startMaintenance();
+    startCliRuntimeUpdateMonitor({
+      dataDir: config.session.dataDir,
+      primaryLarkAppId: cfg.larkAppId,
+      ownerOpenId: () => resolvePrimaryOwnerOpenId(cfg.larkAppId),
+      dashboardUrl: () => dashboardUrlForReport().url,
+      targets: configuredCodexUpdateTargets,
+      sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive').then(() => undefined),
+      log: (m) => logger.info(`[cli-update] ${m}`),
+    });
     // After an intentional restart, DM the owner a summary. Delayed a few
     // seconds so the dashboard process can publish its token first.
     setTimeout(() => {
@@ -8652,6 +8676,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.info(`Daemon shutting down... (active: ${getActiveCount()})`);
     scheduler.stopScheduler();
     stopMaintenance();
+    stopCliRuntimeUpdateMonitor();
     clearInterval(maintenanceHeartbeat);
     clearInterval(docCommentPollTimer);
     for (const watcher of workflowEventWatchers.values()) watcher.close();

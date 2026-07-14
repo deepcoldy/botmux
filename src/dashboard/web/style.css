@@ -5918,6 +5918,15 @@ dialog.onboarding-dialog::backdrop {
 .update-install-list { margin: 6px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.6; }
 .update-install-list code { font-size: 11px; }
 .update-install-list small { color: var(--muted); }
+.cli-runtime-updates { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-soft); }
+.cli-runtime-updates > strong { display: block; margin-bottom: 8px; font-size: 12px; color: var(--muted); }
+.cli-runtime-updates ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.cli-runtime-updates li { min-width: 0; padding: 8px 10px; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--surface-muted); }
+.cli-runtime-updates li.is-behind { border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft)); }
+.cli-runtime-update-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 5px; font-size: 13px; font-weight: 600; }
+.cli-runtime-updates li > code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--muted); }
+.cli-runtime-updates li > small { display: block; margin-top: 5px; color: var(--muted); }
+.cli-runtime-updates .settings-help { margin: 8px 0 0; }
 .update-changelog { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
 .update-release { border: 1px solid var(--border-soft); border-radius: var(--radius-lg); padding: 8px 12px; background: var(--surface-muted); }
 .update-release > summary { cursor: pointer; font-size: 13px; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }

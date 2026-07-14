@@ -295,6 +295,15 @@ describe('buildWrappedLaunch', () => {
     expect(out.args).not.toContain('-c');
   });
 
+  it('strips the startup-update override that aiden refuses to accept', () => {
+    const out = buildWrappedLaunch('aiden x codex', [
+      '-c',
+      'check_for_update_on_startup=false',
+      '--no-alt-screen',
+    ]);
+    expect(out.args).toEqual(['x', 'codex', '--no-alt-screen']);
+  });
+
   it('does not strip a user-supplied -c that is not a botmux override (aiden x codex)', () => {
     const out = buildWrappedLaunch('aiden x codex', ['-c', 'model_reasoning_effort="high"', '--model', 'm']);
     expect(out.args).toEqual(['x', 'codex', '-c', 'model_reasoning_effort="high"', '--model', 'm']);
@@ -325,6 +334,14 @@ describe('buildWrappedLaunch', () => {
     expect(out.args).toEqual(['codex', '-c', 'model_reasoning_effort="high"', '--no-alt-screen']);
   });
 
+  it('rewrites the startup-update override for cjadk codex', () => {
+    const out = buildWrappedLaunch('cjadk codex', [
+      '-c',
+      'check_for_update_on_startup=false',
+    ]);
+    expect(out.args).toEqual(['codex', '--config', 'check_for_update_on_startup=false']);
+  });
+
   it('keeps the codex -c override for the bare-passthrough ttadk codex gateway', () => {
     const out = buildWrappedLaunch('ttadk codex', [
       '-c',
@@ -332,6 +349,14 @@ describe('buildWrappedLaunch', () => {
     ]);
     expect(out.args).toContain('-c');
     expect(out.args).toContain('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
+  });
+
+  it('keeps the startup-update override for the bare-passthrough ttadk gateway', () => {
+    const out = buildWrappedLaunch('ttadk codex', [
+      '-c',
+      'check_for_update_on_startup=false',
+    ]);
+    expect(out.args).toContain('check_for_update_on_startup=false');
   });
 
   it('keeps --settings for cjadk claude (forwarded verbatim to real claude)', () => {
