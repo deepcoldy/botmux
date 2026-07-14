@@ -26,6 +26,13 @@ export interface ParsedDispatchRepoRequirement extends DispatchRepoRequirement {
   content: string;
 }
 
+export interface UnsupportedDispatchRepoRequirement {
+  version: string;
+  supportedVersion: 'v1';
+  taskId?: string;
+  repo?: string;
+}
+
 export interface RepoCapabilityEntry {
   path: string;
   remoteUrl: string;
@@ -113,6 +120,44 @@ export function parseDispatchRepoRequirement(text: string | undefined): ParsedDi
     taskId,
     repo,
     content: lines.slice(0, start).join('\n').trimEnd(),
+  };
+}
+
+/** Detect a newer trailing dispatch block so it fails loudly instead of being
+ * treated as ordinary chat and falling into the repository picker. */
+export function detectUnsupportedDispatchRepoRequirement(
+  text: string | undefined,
+): UnsupportedDispatchRepoRequirement | null {
+  if (!text?.includes('[botmux-dispatch ')) return null;
+  const lines = text.split(/\r?\n/);
+  let start = -1;
+  let version = '';
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const match = /^\[botmux-dispatch\s+(v[^\]\s]+)\]$/i.exec(lines[i]!.trim());
+    if (!match) continue;
+    start = i;
+    version = match[1].toLowerCase();
+    break;
+  }
+  if (start < 0 || version === 'v1') return null;
+
+  const fields = new Map<string, string>();
+  for (const raw of lines.slice(start + 1)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const field = /^([a-z][a-z0-9_-]*):\s*(.*)$/i.exec(line);
+    // An unsupported protocol is actionable only when it occupies the final
+    // machine-block paragraph. Prose or a closing code fence after the header
+    // means the task merely quoted an example and must remain ordinary input.
+    if (!field) return null;
+    fields.set(field[1]!.toLowerCase(), field[2]!.trim());
+  }
+  if (fields.size === 0) return null;
+  return {
+    version,
+    supportedVersion: 'v1',
+    taskId: fields.get('taskid')?.trim() || undefined,
+    repo: fields.get('repo')?.trim() || undefined,
   };
 }
 

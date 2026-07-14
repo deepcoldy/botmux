@@ -485,4 +485,43 @@ describe('dispatch repo preflight', () => {
     }));
     expect(sessionStore.listSessions()).toHaveLength(0);
   });
+
+  it('rejects an unsupported dispatch version with a structured help before repo scanning', async () => {
+    const { daemon } = await loadFreshModules();
+    const sendAccessHelp = vi.fn(async () => {});
+    const resolveRequirement = vi.fn();
+    const parsed = {
+      messageId: 'om_dispatch_v2',
+      msgType: 'text',
+      content: [
+        '执行跨设备任务',
+        '',
+        '[botmux-dispatch v2]',
+        'taskId: task-newer-protocol',
+        'repo: github.com/acme/project',
+      ].join('\n'),
+      senderId: 'ou_supervisor',
+      senderUnionId: 'on_supervisor',
+      senderType: 'bot',
+      chatId: 'oc_goal',
+      chatType: 'group',
+      mentions: [],
+    } as any;
+
+    const result = await daemon.__testOnly_preflightDispatchRepo({
+      parsed,
+      larkAppId: 'app-worker',
+      chatId: 'oc_goal',
+      scope: 'chat',
+      anchor: 'oc_goal',
+    }, { sendAccessHelp, resolveRequirement });
+
+    expect(result).toEqual({ handled: true });
+    expect(resolveRequirement).not.toHaveBeenCalled();
+    expect(sendAccessHelp).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task-newer-protocol',
+      repo: 'github.com/acme/project',
+      blocker: expect.stringContaining('收到 v2，当前仅支持 v1'),
+    }));
+  });
 });

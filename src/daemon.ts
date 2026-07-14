@@ -274,7 +274,7 @@ import { notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js
 import { emitGoalNarration } from './verified-delivery/narration.js';
 import { openLedger } from './verified-delivery/ledger.js';
 import { detectUnsupportedDeliveryEnvelope, formatHelpEnvelope, parseDeliveryEnvelope, type EnvelopeEvidence } from './verified-delivery/envelope.js';
-import { formatDispatchRepoRequirement, inspectLocalRepoAsync, parseDispatchRepoRequirement, resolveRepoRequirement } from './core/repo-requirement.js';
+import { detectUnsupportedDispatchRepoRequirement, formatDispatchRepoRequirement, inspectLocalRepoAsync, parseDispatchRepoRequirement, resolveRepoRequirement } from './core/repo-requirement.js';
 import {
   DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
   injectGoalSupervisorTurn,
@@ -15635,11 +15635,13 @@ async function sendDispatchRepoAccessHelp(input: {
   taskId: string;
   repo: string;
   detail?: string;
+  blocker?: string;
+  helpKind?: HelpKind;
 }): Promise<void> {
-  const blocker = `缺少项目环境：${input.repo}${input.detail ? `（${input.detail}）` : ''}`;
+  const blocker = input.blocker ?? `缺少项目环境：${input.repo}${input.detail ? `（${input.detail}）` : ''}`;
   const envelope = formatHelpEnvelope({
     taskId: input.taskId,
-    helpKind: 'access',
+    helpKind: input.helpKind ?? 'access',
     blocker,
   });
   const text = input.supervisorOpenId
@@ -15666,10 +15668,44 @@ async function preflightDispatchRepo(input: {
   anchor: string;
   existingSession?: DaemonSession;
 }, deps: DispatchRepoPreflightDeps = {}): Promise<DispatchRepoPreflightResult> {
+  const senderIsBot = input.parsed.senderType === 'app' || input.parsed.senderType === 'bot';
+  const unsupported = detectUnsupportedDispatchRepoRequirement(input.parsed.content);
+  if (unsupported) {
+    if (!senderIsBot) {
+      logger.warn(`[dispatch-repo] ignored non-bot unsupported version=${unsupported.version} msg=${input.parsed.messageId}`);
+      return { handled: false };
+    }
+    const blocker = `派活协议版本不兼容：收到 ${unsupported.version}，当前仅支持 ${unsupported.supportedVersion}。请升级执行者所在机器的 botmux 后重试。`;
+    try {
+      if (unsupported.taskId) {
+        await (deps.sendAccessHelp ?? sendDispatchRepoAccessHelp)({
+          larkAppId: input.larkAppId,
+          chatId: input.chatId,
+          scope: input.scope,
+          anchor: input.anchor,
+          supervisorOpenId: input.parsed.senderId,
+          taskId: unsupported.taskId,
+          repo: unsupported.repo ?? '(未识别)',
+          blocker,
+          helpKind: 'other',
+        });
+      } else {
+        const text = input.parsed.senderId
+          ? `<at user_id="${input.parsed.senderId}"></at>\n⚠️ ${blocker}`
+          : `⚠️ ${blocker}`;
+        if (input.scope === 'thread') await replyMessage(input.larkAppId, input.anchor, text, 'text', true);
+        else await sendMessage(input.larkAppId, input.chatId, text, 'text');
+      }
+    } catch (err) {
+      logger.error(`[dispatch-repo] failed to report unsupported version=${unsupported.version}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    logger.warn(`[dispatch-repo] unsupported version=${unsupported.version} supported=${unsupported.supportedVersion} task=${unsupported.taskId ?? ''} msg=${input.parsed.messageId}`);
+    return { handled: true };
+  }
+
   const requirement = parseDispatchRepoRequirement(input.parsed.content);
   if (!requirement) return { handled: false };
 
-  const senderIsBot = input.parsed.senderType === 'app' || input.parsed.senderType === 'bot';
   if (!senderIsBot) {
     logger.warn(`[dispatch-repo] ignored non-bot requirement task=${requirement.taskId} msg=${input.parsed.messageId}`);
     return { handled: false };
