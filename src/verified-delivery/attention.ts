@@ -29,6 +29,7 @@
  */
 import { buildGoalBoard, type GoalBoardGoal, type GoalBoardTask } from './goal-board.js';
 import type { TaskStatus, TaskHelpView } from './types.js';
+import { isMissingRepoBlocker } from '../core/repo-help.js';
 
 /** The attention buckets, needs-attention-first. `completed` is ONLY `accepted`
  *  (escalated/blocked/dead-letter never land here); `quiet` is a goal-level idea
@@ -88,7 +89,7 @@ export function classifyTaskDisposition(task: ClassifiableTask, ctx: Disposition
     case 'escalated':
       return { bucket: 'needsHuman', reason: 'escalated', next: '等人拍板' };
     case 'blocked':
-      if (task.help?.kind === 'access' && task.help.blocker.trim().startsWith('缺少项目环境：')) {
+      if (task.help?.kind === 'access' && isMissingRepoBlocker(task.help.blocker)) {
         return { bucket: 'blocked', reason: 'help:missing_repo', next: '缺少项目环境，需准备或换执行者' };
       }
       return { bucket: 'blocked', reason: task.help?.kind ? `help:${task.help.kind}` : 'help', next: '等监管澄清/重派' };

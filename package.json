@@ -39,6 +39,7 @@
     "test:gemini": "vitest run --project e2e test/gemini-input.e2e.ts",
     "test:agy": "vitest run --project e2e test/agy-input.e2e.ts",
     "bench:resource": "node --expose-gc --import tsx scripts/bench-resource.ts",
+    "probe:a2a-dual": "node scripts/a2a-dual-deploy-probe.mjs",
     "test:e2e-browser:setup": "tsx test/e2e-browser/setup-login.ts",
     "test:e2e-browser": "tsx scripts/run-e2e.ts",
     "report:dashboard": "tsx scripts/report-dashboard.ts",
