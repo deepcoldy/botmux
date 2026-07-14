@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
-import { PluginMcpGateway } from '../src/core/plugins/mcp/gateway.js';
+import { PluginMcpGateway, resolveGatewayEnvironment } from '../src/core/plugins/mcp/gateway.js';
 
 describe('plugin MCP Gateway', () => {
   let home: string;
@@ -95,6 +95,35 @@ describe('plugin MCP Gateway', () => {
     await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
     expect((await client.listTools()).tools.map(tool => tool.name).sort()).toEqual(['alpha_unique', 'echo']);
     expect(connectSpy).toHaveBeenCalledWith(expect.anything(), { timeout: 10_000 });
+    await client.close();
+    await gateway.close();
+  });
+
+  it('recovers the Botmux session from the CLI ancestor marker', () => {
+    const markerPid = 24680;
+    const markerDir = join(home, '.botmux', 'data', '.botmux-cli-pids');
+    mkdirSync(markerDir, { recursive: true });
+    writeFileSync(join(markerDir, String(markerPid)), JSON.stringify({ sessionId: 'session-from-marker' }));
+
+    const resolved = resolveGatewayEnvironment({ HOME: home }, markerPid);
+    expect(resolved.BOTMUX_SESSION_ID).toBe('session-from-marker');
+    expect(resolveGatewayEnvironment({ BOTMUX_SESSION_ID: 'session-from-env' }, markerPid).BOTMUX_SESSION_ID)
+      .toBe('session-from-env');
+  });
+
+  it('forwards the Botmux session to plugin MCP processes', async () => {
+    installFixturePlugin('plugin-a', 'alpha');
+    const gateway = new PluginMcpGateway(
+      ['plugin-a'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-downstream' },
+    );
+    const client = new Client({ name: 'gateway-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    const result = await client.callTool({ name: 'echo', arguments: {} });
+    expect((result.content[0] as any).text).toContain('session=session-downstream');
+
     await client.close();
     await gateway.close();
   });

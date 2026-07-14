@@ -38,6 +38,7 @@ import { config } from '../../../config.js';
 import { readGlobalConfig } from '../../../global-config.js';
 import { readPluginRegistry } from '../../../services/plugin-registry-store.js';
 import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
+import { resolveSessionContext } from '../../session-marker.js';
 import { normalizePluginIdList } from '../ids.js';
 import { pluginHome, pluginRuntimeDir, resolvePluginPath } from '../paths.js';
 import { readSessionPluginManifest } from '../session-manifest.js';
@@ -45,6 +46,15 @@ import type { PluginMcpServer } from '../types.js';
 
 const GATEWAY_VERSION = '1.0.0';
 const DOWNSTREAM_INITIALIZE_TIMEOUT_MS = 10_000;
+
+export function resolveGatewayEnvironment(
+  env: NodeJS.ProcessEnv = process.env,
+  startPid: number = process.ppid,
+): NodeJS.ProcessEnv {
+  if (env.BOTMUX_SESSION_ID?.trim()) return env;
+  const sessionId = resolveSessionContext(config.session.dataDir, undefined, startPid)?.sessionId.trim();
+  return sessionId ? { ...env, BOTMUX_SESSION_ID: sessionId } : env;
+}
 
 interface GatewayDescriptor {
   key: string;
@@ -194,6 +204,7 @@ function allocateName(
 
 export class PluginMcpGateway {
   readonly server: Server;
+  private readonly env: NodeJS.ProcessEnv;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
   private readonly diagnostics: McpGatewayDiagnostic[] = [];
@@ -204,9 +215,10 @@ export class PluginMcpGateway {
   private resourceRoutes = new Map<string, ResourceRoute>();
   private resourceTemplateRoutes: ResourceRoute[] = [];
 
-  constructor(pluginIds: string[] = gatewayPluginIds()) {
-    this.pluginIds = pluginIds;
-    this.descriptors = gatewayDescriptors(pluginIds);
+  constructor(pluginIds?: string[], env: NodeJS.ProcessEnv = process.env) {
+    this.env = env;
+    this.pluginIds = pluginIds ?? gatewayPluginIds(env);
+    this.descriptors = gatewayDescriptors(this.pluginIds);
     this.server = new Server(
       { name: 'botmux', version: GATEWAY_VERSION },
       {
@@ -243,7 +255,7 @@ export class PluginMcpGateway {
   private persistDiagnostics(): void {
     writeDiagnostics({
       schemaVersion: 1,
-      sessionId: process.env.BOTMUX_SESSION_ID?.trim() || undefined,
+      sessionId: this.env.BOTMUX_SESSION_ID?.trim() || undefined,
       pluginIds: this.pluginIds,
       generatedAt: new Date().toISOString(),
       servers: this.diagnostics,
@@ -280,7 +292,7 @@ export class PluginMcpGateway {
             BOTMUX_PLUGIN_ID: descriptor.pluginId,
             BOTMUX_PLUGIN_DIR: descriptor.pluginDir,
             BOTMUX_PLUGIN_HOME: pluginHome(descriptor.pluginId),
-            ...(process.env.BOTMUX_SESSION_ID ? { BOTMUX_SESSION_ID: process.env.BOTMUX_SESSION_ID } : {}),
+            ...(this.env.BOTMUX_SESSION_ID ? { BOTMUX_SESSION_ID: this.env.BOTMUX_SESSION_ID } : {}),
           },
           stderr: 'inherit',
         });
@@ -602,7 +614,7 @@ export class PluginMcpGateway {
 }
 
 export async function runMcpGateway(): Promise<void> {
-  const gateway = new PluginMcpGateway();
+  const gateway = new PluginMcpGateway(undefined, resolveGatewayEnvironment());
   const transport = new StdioServerTransport();
   const close = () => { void gateway.close(); };
   process.once('SIGINT', close);
