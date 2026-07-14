@@ -4,24 +4,36 @@ import { describe, expect, it } from 'vitest';
 
 const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 
-describe('web terminal touch scrolling', () => {
-  it('drives normal-buffer scroll explicitly instead of relying on WebView defaults', () => {
-    const start = workerSource.indexOf('// Single-finger touch scrolling:');
-    const end = workerSource.indexOf('</script>', start);
-    const touchBlock = workerSource.slice(start, end);
+function scriptBlock(startMarker: string): string {
+  const start = workerSource.indexOf(startMarker);
+  const end = workerSource.indexOf('</script>', start);
+  expect(start).toBeGreaterThan(-1);
+  return workerSource.slice(start, end);
+}
 
-    expect(start).toBeGreaterThan(-1);
+describe('web terminal touch scrolling', () => {
+  it('forces Herdr alternate-screen CLIs to remote-scroll after a snapshot-only refresh', () => {
+    expect(workerSource).toContain("effectiveBackendType === 'herdr' && cliAdapter?.altScreen === true");
+    expect(workerSource).toContain('var remoteScroll=${forceRemoteScroll};');
+
+    const wheelBlock = scriptBlock('// ── Wheel / touch scroll handling ──');
+    expect(wheelBlock).toContain("if(!remoteScroll&&term.buffer.active.type!=='alternate'){");
+    expect(wheelBlock.indexOf("if(!remoteScroll&&term.buffer.active.type!=='alternate'){"))
+      .toBeLessThan(wheelBlock.indexOf('_fwdScroll(px,_cellAt'));
+  });
+
+  it('drives normal-buffer scroll explicitly instead of relying on WebView defaults', () => {
+    const touchBlock = scriptBlock('// Single-finger touch scrolling:');
+
     expect(touchBlock).toContain("var _tViewport=document.querySelector('#terminal .xterm-viewport')");
-    expect(touchBlock).toContain("if(term.buffer.active.type!=='alternate'){");
+    expect(touchBlock).toContain("if(!remoteScroll&&term.buffer.active.type!=='alternate'){");
     expect(touchBlock).toContain('_tViewport.scrollTop-=y-_tLastY');
-    expect(touchBlock.indexOf("if(term.buffer.active.type!=='alternate'){"))
+    expect(touchBlock.indexOf("if(!remoteScroll&&term.buffer.active.type!=='alternate'){"))
       .toBeLessThan(touchBlock.indexOf('_fwdScroll(_tLastY-y'));
   });
 
   it('prevents xterm from double-driving handled single-touch moves', () => {
-    const start = workerSource.indexOf('// Single-finger touch scrolling:');
-    const end = workerSource.indexOf('</script>', start);
-    const touchBlock = workerSource.slice(start, end);
+    const touchBlock = scriptBlock('// Single-finger touch scrolling:');
 
     expect(touchBlock).toContain('e.preventDefault();e.stopPropagation();');
     expect(touchBlock).toContain("_tTerm.addEventListener('touchmove'");

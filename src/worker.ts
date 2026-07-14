@@ -5538,8 +5538,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       const { hasWrite, platformReadonly } = resolveTerminalWriteForReq(req, tokenMatches);
       const loginHdr = req.headers['x-botmux-login-url'];
       const loginUrl = typeof loginHdr === 'string' && /^https?:\/\/[^"'<>\s]+$/.test(loginHdr) ? loginHdr : '';
+      // Herdr snapshots contain screen cells but not terminal mode state. On a
+      // refreshed page an alt-screen CLI would otherwise look like an empty
+      // normal buffer until resize causes a redraw. Preserve that mode so
+      // scroll gestures continue to target the CLI's own transcript.
+      const forceRemoteScroll = effectiveBackendType === 'herdr' && cliAdapter?.altScreen === true;
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl));
+      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll));
     });
 
     wss = new WebSocketServer({ server: httpServer });
@@ -5806,7 +5811,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
   });
 }
 
-function getTerminalHtml(hasWrite: boolean, platformReadonly = false, loginUrl = ''): string {
+function getTerminalHtml(
+  hasWrite: boolean,
+  platformReadonly = false,
+  loginUrl = '',
+  forceRemoteScroll = false,
+): string {
   const label = sessionId.substring(0, 8);
   return `<!DOCTYPE html>
 <html>
@@ -5942,6 +5952,7 @@ var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
 if(isTouch){document.body.classList.add('touch');}
 var hasToken=${hasWrite};
 var platformReadonly=${platformReadonly};
+var remoteScroll=${forceRemoteScroll};
 if(!hasToken){
   if(platformReadonly){var _lb=document.getElementById('login-banner');_lb.classList.add('show');}
   else{var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
@@ -6169,7 +6180,7 @@ function _fwdScroll(px,coord){
 }
 if(!${isTmuxMode && !isPipeMode}){
   document.getElementById('terminal').addEventListener('wheel',function(e){
-    if(term.buffer.active.type!=='alternate'){
+    if(!remoteScroll&&term.buffer.active.type!=='alternate'){
       // Normal buffer: xterm scrolls its own scrollback natively. In read-only a
       // mouse-mode CLI could swallow the wheel, so drive scrollback directly.
       if(!hasToken){e.preventDefault();e.stopPropagation();term.scrollLines(e.deltaY>0?3:-3);}
@@ -6499,7 +6510,7 @@ if(!${isTmuxMode && !isPipeMode}){
     if(_tLastY===null||e.touches.length!==1)return;
     e.preventDefault();e.stopPropagation();
     var y=e.touches[0].clientY;
-    if(term.buffer.active.type!=='alternate'){
+    if(!remoteScroll&&term.buffer.active.type!=='alternate'){
       if(_tViewport)_tViewport.scrollTop-=y-_tLastY;
       else term.scrollLines(y>_tLastY?-1:1);
       _tLastY=y;return;
