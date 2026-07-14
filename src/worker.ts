@@ -4226,7 +4226,43 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     }
   }
   effectiveBackendType = effectiveBackend;
-  const selectedBackend = selectSessionBackend({ sessionId: cfg.sessionId, backendType: effectiveBackend, backendConfig: cfg.backendConfig });
+
+  // For riff (remote HTTP backend), merge botmux session context env + per-bot
+  // env into the riff backend config so the remote sandbox has everything the
+  // agent needs (e.g. `botmux send` routing). The sandbox installs botmux via
+  // setupCommands, so BOTMUX_* env vars are needed for the agent to use it.
+  // PTY/tmux backends inject these into the child process env directly; riff
+  // has no local process, so they go via config.env → the riff API's config.env.
+  let riffBackendConfig = cfg.backendConfig;
+  if (effectiveBackendType === 'riff') {
+    if (!cfg.backendConfig) {
+      throw new Error('riff backend requires backendConfig (baseUrl, etc.)');
+    }
+    const sessionEnv: Record<string, string> = {
+      BOTMUX_SESSION_ID: cfg.sessionId,
+      BOTMUX_CHAT_ID: cfg.chatId,
+      BOTMUX_LARK_APP_ID: cfg.larkAppId,
+      BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId,
+    };
+    if (cfg.turnId) sessionEnv.BOTMUX_TURN_ID = cfg.turnId;
+    // Lark credentials so `botmux send` works inside the riff sandbox without a
+    // local daemon or bots.json. The sandbox has no session data / bot config,
+    // so cmdSend falls back to these env vars to call the Lark API directly.
+    // Mirrors what the credential-file path does for PTY/tmux backends (see
+    // sendCredFilePath below), but via env since riff has no local filesystem
+    // to read the cred file from.
+    if (cfg.larkAppSecret) sessionEnv.BOTMUX_LARK_APP_SECRET = cfg.larkAppSecret;
+    if (cfg.brand) sessionEnv.BOTMUX_LARK_BRAND = cfg.brand;
+    const chatBotDiscovery = resolveChatBotDiscoveryConfig();
+    sessionEnv.BOTMUX_LARK_LIST_BOTS_API_ENABLED = chatBotDiscovery.listBotsApiEnabled ? 'true' : 'false';
+    sessionEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
+    // Per-bot env (bots.json `env`) takes precedence over session context;
+    // explicit riff config.env takes precedence over both.
+    const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...cfg.backendConfig.env };
+    riffBackendConfig = Object.assign({}, cfg.backendConfig, { env: mergedEnv });
+  }
+
+  const selectedBackend = selectSessionBackend({ sessionId: cfg.sessionId, backendType: effectiveBackend, backendConfig: riffBackendConfig });
   isTmuxMode = selectedBackend.isTmuxMode;
   isPipeMode = selectedBackend.isPipeMode;
   isZellijMode = selectedBackend.isZellijMode;
@@ -4574,8 +4610,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // fail repeatedly and surface only as a generic crash-loop ("X crashed N
     // times"), with no hint about WHY. Instead surface ONE clear, reproducible
     // message and stop — the user can fix PATH / install the CLI and retry.
+    //
+    // Remote backends (riff) have no local binary — they use an HTTP API. Skip
+    // the binary check for them: resolvedBin is '' by design, and the backend
+    // handles everything internally.
     const wantBin = cliAdapter.resolvedBin;
-    if (!locateOnPath(wantBin)) {
+    if (effectiveBackendType !== 'riff' && !locateOnPath(wantBin)) {
       log(`CLI binary not found: ${wantBin} (PATH=${process.env.PATH ?? ''})`);
       const probe = isAbsolute(wantBin) ? `ls -l ${wantBin}` : `which ${wantBin}`;
       send({
@@ -5105,22 +5145,27 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     readySignalTimer.unref?.();
   }
 
-  // Set up idle detection
-  idleDetector = new IdleDetector(cliAdapter);
-  idleDetector.onIdle(async () => {
-    log('Prompt detected (idle)');
-    // Bridge drain MUST run before markPromptReady() — the latter calls
-    // flushPending() which can immediately fire the next queued message
-    // (type-ahead adapters), shifting bridgeQueue's notion of "current
-    // turn" before we've had a chance to emit the previous one.
-    if (bridgeJsonlPath) {
-      try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
-    }
-    if (codexBridgeFallbackActive()) {
-      try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
-    }
-    markPromptReady();
-  });
+  // Set up idle detection. Riff (remote HTTP backend) has no PTY output and
+  // is marked ready immediately after spawn (see below), so the idle detector
+  // is unnecessary — and without a readyPattern it would fire on every
+  // quiescence, repeatedly triggering markPromptReady() and duplicate cards.
+  if (effectiveBackendType !== 'riff') {
+    idleDetector = new IdleDetector(cliAdapter);
+    idleDetector.onIdle(async () => {
+      log('Prompt detected (idle)');
+      // Bridge drain MUST run before markPromptReady() — the latter calls
+      // flushPending() which can immediately fire the next queued message
+      // (type-ahead adapters), shifting bridgeQueue's notion of "current
+      // turn" before we've had a chance to emit the previous one.
+      if (bridgeJsonlPath) {
+        try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
+      }
+      if (codexBridgeFallbackActive()) {
+        try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
+      }
+      markPromptReady();
+    });
+  }
 
   backend.onData(onPtyData);
   backend.onAccessUrl?.((url) => {
@@ -5196,6 +5241,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     if (cliAdapter?.supportsTypeAhead) flushPending();
   };
   setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_TIMEOUT_MS, false), FIRST_PROMPT_TIMEOUT_MS);
+
+  // Riff (and other remote HTTP backends) have no local boot process — the
+  // backend is ready immediately after spawn(). The idle detector never fires
+  // for them (no PTY output), and the first-prompt timeout only flushes for
+  // type-ahead adapters, so isPromptReady would otherwise stay false forever
+  // and the first message would never reach the riff API. Mark ready right away.
+  if (effectiveBackendType === 'riff') {
+    markPromptReady();
+  }
 }
 
 function killCli(): void {
@@ -5966,6 +6020,15 @@ process.on('message', async (raw: unknown) => {
         }
         if (msg.prompt && (!cliAdapter?.passesInitialPromptViaArgs || deferInitialPrompt)) {
           pendingMessages.push({ content: msg.prompt, turnId: msg.turnId });
+        }
+
+        // Riff (remote HTTP backends): spawnCli already marked the prompt ready
+        // (no local boot → isPromptReady=true immediately), but the initial prompt
+        // was queued AFTER spawnCli returned, so flushPending() ran on an empty
+        // queue. Flush now that the prompt is enqueued. isPromptReady is already
+        // true so the flush gates all pass.
+        if (effectiveBackendType === 'riff' && pendingMessages.length > 0) {
+          flushPending();
         }
 
         send({ type: 'ready', port, token: writeToken, turnId: currentBotmuxTurnId });

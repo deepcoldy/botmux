@@ -2,6 +2,43 @@ import { readFileSync } from 'node:fs';
 import type { SessionBackend, SpawnOpts } from './types.js';
 import { logger } from '../../utils/logger.js';
 
+/**
+ * Fallback system prompt injected into every riff task when no explicit
+ * `systemPrompt` is configured. Mirrors the `<botmux_routing>` block that
+ * codex/gemini/etc. get via buildBotmuxShellHints — the riff agent must use
+ * `botmux send` to reply (same as any other botmux-bridged CLI), not rely on
+ * passive output capture. botmux is installed in the sandbox via setupCommands.
+ */
+const DEFAULT_RIFF_SYSTEM_PROMPT = [
+  'You are running inside a botmux-bridged session: Feishu/Lark topic group ↔ riff agent sandbox.',
+  'The user reads on Lark and cannot see your terminal output.',
+  '',
+  'IMPORTANT: `botmux send` / `botmux history` / `botmux quoted` / `botmux bots` are SHELL commands (CLI programs installed in $PATH), NOT MCP tools. Run them via the Bash tool — do not look for them in the MCP tool list.',
+  '',
+  'To send a message to the user (the only way): run `botmux send "your message"` via Bash. Attach images with `--images /path`, files with `--files /path`.',
+  'Multi-line messages MUST use a heredoc — never `botmux send "line1\\nline2"`, since `\\n` may appear literally in Lark.',
+  "Correct multi-line example:\n  botmux send <<'EOF'\n  line 1\n  line 2\n  EOF",
+  '',
+  'Helpers: `botmux history` (read this session\'s history), `botmux quoted <message_id>` (fetch a quoted message), `botmux bots list` (list other bots in the group).',
+  '',
+  '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id:name>` (name a person/bot; REQUIRED to collaborate with another bot) / `--mention-back` (@ the sender of the message you are replying to) / `--no-mention` (none). Choose by value: substantive conclusion the other party should read/confirm/decide → --mention-back; pure record / low-priority / short ack → --no-mention; a contentless "got it" is better not sent.',
+  '',
+  'When to send: key conclusions, plans (wait for user approval before acting), final results, progress updates. A bare `print`/`echo` does NOT count as a reply.',
+  'Keep final answers concise. For images/files: write them to disk then send via `botmux send --images/--files`.',
+].join('\n');
+
+/**
+ * Mandatory setup commands run in the riff sandbox to ensure `botmux` is
+ * available. These are ALWAYS sent to the riff API via `config.setupCommands`
+ * (not via prompt injection) so the install is reliable and not dependent on
+ * the agent parsing a prompt. The riff sandbox has Node.js (it runs aiden),
+ * so npm install works. Any user-configured setupCommands are appended AFTER
+ * these mandatory commands.
+ */
+const MANDATORY_SETUP_COMMANDS = [
+  'which botmux >/dev/null 2>&1 || npm install -g botmux@canary 2>/dev/null',
+];
+
 export interface RiffBackendConfig {
   baseUrl: string;
   templateId?: string;
@@ -16,6 +53,30 @@ export interface RiffBackendConfig {
   defaultBranch?: string;
   injectStatusLines?: boolean;
   logLevel?: string;
+  /**
+   * Environment variables injected into the riff sandbox execution environment.
+   * Merged from: botmux session context vars (BOTMUX_SESSION_ID, …) → per-bot
+   * env (bots.json `env`) → explicit config.env (which takes precedence).
+   * The sandbox installs botmux via setupCommands, so BOTMUX_* vars are needed
+   * for the agent to use `botmux send`. Sent as `config.env` to the riff API.
+   */
+  env?: Record<string, string>;
+  /**
+   * System prompt injected into the riff task. Prepended to the userPrompt
+   * (riff API has no separate system-prompt field) so the agent knows it is
+   * running inside a botmux-bridged session. When unset, the built-in
+   * DEFAULT_RIFF_SYSTEM_PROMPT is used as a fallback.
+   */
+  systemPrompt?: string;
+  /**
+   * ADDITIONAL shell commands run in the riff sandbox before the agent starts
+   * working. botmux is ALWAYS installed via MANDATORY_SETUP_COMMANDS (not
+   * user-editable, sent to the riff API as config.setupCommands); these are
+   * extra commands the user wants to run after that (e.g. installing other
+   * dependencies). Sent to the riff API as `config.setupCommands` appended
+   * after the mandatory botmux install commands.
+   */
+  setupCommands?: string[];
 }
 
 interface RiffAttachment {
@@ -215,7 +276,7 @@ export class RiffBackend implements SessionBackend {
     // riff task-execute body: origin at top level, prompt inside config.userPrompt
     // agent 可选值: aiden (默认), aiden-claude, codex, opencode
     const config: Record<string, unknown> = {
-      userPrompt: prompt,
+      userPrompt: this.injectSystemPrompt(prompt),
       agent: this.config.agent ?? 'aiden',
     };
     if (this.config.model) config.model = this.config.model;
@@ -223,6 +284,17 @@ export class RiffBackend implements SessionBackend {
     if (this.config.defaultRepo) {
       config.repos = [{ repo: this.config.defaultRepo, branch: this.config.defaultBranch ?? 'main' }];
     }
+    // Inject env into the riff sandbox so the agent can use `botmux send` etc.
+    // Merged from: per-bot env (bots.json `env`) + botmux session context vars +
+    // any explicit config.env (which takes precedence).
+    const env = this.buildEnv();
+    if (Object.keys(env).length > 0) config.env = env;
+    // Always send setupCommands to the riff API: mandatory botmux install first
+    // (MANDATORY_SETUP_COMMANDS, not user-editable), then any user-configured
+    // additional commands. botmux is installed via the API's native
+    // setupCommands support — NOT via prompt injection — so it is reliable.
+    const setup = [...MANDATORY_SETUP_COMMANDS, ...(this.config.setupCommands ?? [])];
+    config.setupCommands = setup;
 
     const payload: Record<string, unknown> = {
       origin: 'botmux',
@@ -248,7 +320,7 @@ export class RiffBackend implements SessionBackend {
     const payload: Record<string, unknown> = {
       origin: 'botmux',
       parentTaskId: this.currentTaskId,
-      prompt,
+      prompt: this.injectSystemPrompt(prompt),
     };
 
     try {
@@ -258,6 +330,37 @@ export class RiffBackend implements SessionBackend {
     } catch (err) {
       this.emitError(`riff follow-up 失败: ${err}`);
     }
+  }
+
+  /**
+   * Prepend the configured system prompt to the user prompt.
+   * The riff API has no separate system-prompt field (only userPrompt), so we
+   * fold the system prompt into the prompt text. config.systemPrompt takes
+   * precedence over the built-in DEFAULT_RIFF_SYSTEM_PROMPT. The result is
+   * wrapped in a <system> block so the agent can distinguish it from the user
+   * message. NOTE: setup commands (botmux install) are NOT injected here —
+   * they are sent to the riff API via config.setupCommands for reliability.
+   */
+  private injectSystemPrompt(prompt: string): string {
+    const sys = this.config.systemPrompt?.trim() ?? DEFAULT_RIFF_SYSTEM_PROMPT;
+    if (!sys) return prompt;
+    return `<system>\n${sys}\n</system>\n\n${prompt}`;
+  }
+
+  /**
+   * Build the env object for the riff sandbox. Precedence (highest wins):
+   *   1. config.env (explicit per-bot riff config)
+   *   2. per-bot env from bots.json `env` (merged by the worker into config.env)
+   * Returns a clean Record with empty values dropped.
+   */
+  private buildEnv(): Record<string, string> {
+    const env: Record<string, string> = {};
+    if (this.config.env) {
+      for (const [k, v] of Object.entries(this.config.env)) {
+        if (v != null && v !== '') env[k] = String(v);
+      }
+    }
+    return env;
   }
 
   private async uploadAndCreate(

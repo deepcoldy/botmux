@@ -4591,6 +4591,59 @@ async function registerSelfFromCredFile(): Promise<void> {
   } as import('./bot-registry.js').BotConfig);
 }
 
+/**
+ * Detect if `botmux send` is running inside a riff (or other remote backend)
+ * sandbox where there is NO local daemon, no sessions.json, and no bots.json —
+ * only BOTMUX_* env vars injected by the daemon into the sandbox environment.
+ *
+ * In this mode the normal cmdSend flow breaks (loadSessions() finds nothing,
+ * registerSelfFromCredFile() has no cred file). Instead we construct a synthetic
+ * session + bot config from the env vars so cmdSend can deliver directly via
+ * the Lark API — exactly like the normal flow does, just without local state.
+ *
+ * Returns null when not in riff mode (env vars missing or local session data
+ * exists), so the normal flow takes over.
+ */
+function riffModeSession(): { session: SessionData; botConfig: import('./bot-registry.js').BotConfig } | null {
+  const appId = process.env.BOTMUX_LARK_APP_ID;
+  const appSecret = process.env.BOTMUX_LARK_APP_SECRET;
+  if (!appId || !appSecret) return null;
+
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  const chatId = process.env.BOTMUX_CHAT_ID;
+  if (!sessionId || !chatId) return null;
+
+  // If local session data exists, we're NOT in riff mode — let the normal flow
+  // handle it (a real daemon session takes precedence over env-only mode).
+  try {
+    if (loadSessions().size > 0) return null;
+  } catch { /* no data dir → riff mode */ }
+
+  const brand = process.env.BOTMUX_LARK_BRAND as 'feishu' | 'lark' | undefined;
+  const rootMessageId = process.env.BOTMUX_ROOT_MESSAGE_ID;
+
+  const botConfig = {
+    larkAppId: appId,
+    larkAppSecret: appSecret,
+    brand,
+    cliId: 'riff',
+    allowedUsers: [],
+  } as unknown as import('./bot-registry.js').BotConfig;
+
+  const session: SessionData = {
+    sessionId,
+    chatId,
+    rootMessageId: rootMessageId ?? '',
+    title: 'riff',
+    status: 'active',
+    createdAt: new Date().toISOString(),
+    larkAppId: appId,
+    scope: 'thread',
+  };
+
+  return { session, botConfig };
+}
+
 async function cmdSend(rest: string[]): Promise<void> {
   // Sandbox relay: a file-sandboxed session has no creds/bots.json, so route
   // the send through the daemon-side outbox instead of delivering directly.
@@ -4703,7 +4756,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 
   const ancestorCtx = findAncestorSessionContext();
-  const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? null;
+  const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? process.env.BOTMUX_SESSION_ID ?? null;
   if (!sid) {
     console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
     process.exit(1);
@@ -4711,7 +4764,22 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   const sessions = loadSessions();
   const currentTurnId = ancestorCtx?.turnId ?? process.env.BOTMUX_TURN_ID;
-  const s = sessions.get(sid);
+  let s = sessions.get(sid);
+
+  // Riff (remote backend) sandbox: no local daemon/sessions.json/bots.json.
+  // Fall back to env-var-only mode so `botmux send` works without a daemon.
+  // The daemon injects BOTMUX_LARK_APP_ID/SECRET/CHAT_ID/SESSION_ID into
+  // the sandbox env; riffModeSession() builds a synthetic session + bot from
+  // them and registers the bot so the Lark client works.
+  if (!s) {
+    const riff = riffModeSession();
+    if (riff) {
+      s = riff.session;
+      const { registerBot } = await import('./bot-registry.js');
+      try { registerBot(riff.botConfig); } catch { /* already registered */ }
+    }
+  }
+
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
 

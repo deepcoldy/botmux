@@ -2029,6 +2029,11 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // Send streaming card to group thread (read-only link, will be PATCHed with live output)
         // Set sentinel BEFORE await so concurrent screen_update messages
         // (which can arrive while the POST is in-flight) don't POST a duplicate card.
+        // Guard: a concurrent screen_update (e.g. riff's markPromptReady fires
+        // screen_update + ready in quick succession) may already have a card POST
+        // in-flight. In that case CARD_POSTING_SENTINEL is already set — don't
+        // POST a second card; the in-flight POST becomes this turn's card.
+        if (ds.streamCardId === CARD_POSTING_SENTINEL) break;
         ds.streamCardId = CARD_POSTING_SENTINEL;
         try {
           ds.streamCardNonce = randomBytes(4).toString('hex');
