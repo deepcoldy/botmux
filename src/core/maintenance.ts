@@ -1,7 +1,7 @@
 /**
- * Maintenance timer: scheduled auto-update / auto-restart. Runs only on the
- * primary daemon (bot-0) — restart is a host-wide operation (it takes down all
- * per-bot daemons), so exactly one process must own it.
+ * Maintenance timer: scheduled auto-update / auto-restart plus bounded log
+ * rotation. Runs only on the primary daemon (bot-0) because every daemon on the
+ * host shares the same PM2 process list and log directory.
  *
  * At the scheduled local time (Asia/Shanghai, once/day) it:
  *  - checks the cross-daemon busy gate (anyDaemonBusy) — a session mid-CLI-turn
@@ -13,8 +13,9 @@
  * Before triggering a restart it drops a restart-intent breadcrumb so the fresh
  * daemon knows to DM the owner (vs. staying silent on a crash-restart).
  *
- * runMaintenanceTick is pure over its injected deps (unit tested); the rest is
- * production wiring.
+ * Log rotation is independent of the update schedule and busy gate: it is safe
+ * during active sessions and must not starve on a busy host. runMaintenanceTick
+ * remains pure over its injected deps (unit tested); the rest is production wiring.
  */
 import { execSync, spawn, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from 'node:fs';
@@ -38,6 +39,7 @@ import {
   type GlobalInstallPlan,
 } from '../utils/global-install.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { rotateBotmuxLogs } from './log-rotation.js';
 
 export interface MaintenanceState {
   /** Local date the auto-update run was last handled (fired or skipped). */
@@ -295,12 +297,36 @@ function productionDeps(): MaintenanceDeps {
 }
 
 let timer: NodeJS.Timeout | undefined;
+let logRotationInFlight: Promise<void> | undefined;
+
+function triggerLogRotation(): void {
+  if (logRotationInFlight) return;
+  logRotationInFlight = rotateBotmuxLogs()
+    .then((result) => {
+      if (result.rotated.length > 0 || result.reloaded) {
+        logger.info(`[maintenance] log rotation: rotated=${result.rotated.length} copytruncate=${result.copyTruncated.length} reloaded=${result.reloaded}`);
+      }
+      for (const failure of result.errors) {
+        logger.warn(`[maintenance] log rotation failed path=${failure.path}: ${failure.message}`);
+      }
+    })
+    .catch((error) => {
+      logger.warn(`[maintenance] log rotation tick failed: ${error instanceof Error ? error.message : error}`);
+    })
+    .finally(() => {
+      logRotationInFlight = undefined;
+    });
+}
 
 /** Start the maintenance loop. Call only on the primary daemon (bot-0). */
 export function startMaintenance(): void {
   if (timer) return;
   const deps = productionDeps();
   const tick = () => {
+    // Log rotation is host-local, safe while workers are busy, and independent
+    // from the opt-in package update schedule. The in-flight guard prevents a
+    // slow PM2 reconnect from overlapping the next minute's run.
+    triggerLogRotation();
     try { runMaintenanceTick(deps); } catch (e) {
       logger.warn(`[maintenance] tick failed: ${e instanceof Error ? e.message : e}`);
     }
