@@ -38,6 +38,7 @@ import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './ser
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { shouldReleaseFirstPromptTimeout, shouldWriteNow } from './utils/input-gate.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
+import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 import { mergeQueuedCliInput, type PendingCliInput } from './utils/pending-input-queue.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
@@ -3165,6 +3166,42 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
 //               in a single PTY chunk)
 const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue/;
 let trustHandled = false;
+const codexUpdateDialogGuard = new CodexUpdateDialogGuard();
+
+/**
+ * Aiden refuses the Codex `-c check_for_update_on_startup=false` override.
+ * If that wrapper still exposes the startup update picker, move from its
+ * default "Update now" row to the non-upgrade row and submit it. Direct,
+ * cjadk and ttadk launches never need this path because they accept the
+ * config override. Adopted panes are user-owned and must not be driven.
+ */
+function dismissAidenCodexUpdateDialog(data: string): boolean {
+  if (
+    lastInitConfig?.cliId !== 'codex'
+    || lastInitConfig.adoptMode
+    || !lastInitConfig.wrapperCli
+    || parseWrapperCli(lastInitConfig.wrapperCli)[0] !== 'aiden'
+    || !awaitingFirstPrompt
+  ) {
+    return false;
+  }
+
+  const action = codexUpdateDialogGuard.inspect(data);
+  if (action === 'pass') return false;
+
+  // Cancel any ready match from an earlier partial menu redraw before it can
+  // flush the first queued Lark message into the picker.
+  idleDetector?.reset();
+  if (action === 'suppress') return true;
+
+  log('Codex startup update dialog detected behind Aiden, selecting the non-upgrade option...');
+  if (backend && 'sendSpecialKeys' in backend) {
+    (backend as any).sendSpecialKeys('Down', 'Enter');
+  } else {
+    backend?.write('\x1b[B\r');
+  }
+  return true;
+}
 
 // Codex App runner sends botmux control messages as OSC sequences so they do
 // not pollute the visible terminal. Strip them before xterm rendering and
@@ -3308,6 +3345,11 @@ function onPtyData(data: string): void {
       if (ws.readyState === WebSocket.OPEN) ws.send(data);
     }
   }
+
+  // Aiden strips the Codex config override because the launcher rejects it.
+  // Consume only the known startup update picker and choose its non-upgrade
+  // row; never let its selection marker reach the first-prompt idle detector.
+  if (dismissAidenCodexUpdateDialog(data)) return;
 
   // Trust dialog auto-accept
   if (!trustHandled) {
@@ -5475,6 +5517,7 @@ function killCli(): void {
   scrollback = '';
   altBufferActive = false;
   trustHandled = false;
+  codexUpdateDialogGuard.reset();
   codexAppOscPending = '';
 }
 

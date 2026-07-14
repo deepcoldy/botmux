@@ -59,6 +59,7 @@ import {
   UnsupportedGlobalInstallError,
   type GlobalInstallPlan,
 } from './utils/global-install.js';
+import { listCliRuntimeUpdateEntries } from './core/cli-runtime-update.js';
 import { writeRestartIntent } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
 import { spawn } from 'node:child_process';
@@ -124,6 +125,7 @@ import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
+import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 import { larkHosts } from './im/lark/lark-hosts.js';
 import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
@@ -321,6 +323,10 @@ interface ResolvedDashboardSettings {
   localCliOpenMode: 'attach' | 'resume';
   /** Experimental current-chat bot discovery via Lark `/members/bots`. Default ON. */
   chatBotDiscovery: boolean;
+  /** Machine-wide opt-in TraeX herdr plugin bootstrap. Default OFF.
+   *  `recommendedSource`/`recommendedRef` are a non-default, author-recommended
+   *  source the SPA can offer as a one-click fill; never persisted unless picked. */
+  herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
@@ -719,6 +725,13 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     enableLocalCliOpen: dashboard.enableLocalCliOpen === true,
     localCliOpenMode: dashboard.localCliOpenMode ?? 'attach',
     chatBotDiscovery: dashboard.chatBotDiscovery !== false, // default ON
+    herdrTraexPlugin: {
+      enabled: dashboard.herdrTraexPlugin?.enabled === true,
+      source: dashboard.herdrTraexPlugin?.source ?? '',
+      ref: dashboard.herdrTraexPlugin?.ref ?? '',
+      recommendedSource: TRAEX_RECOMMENDED_SOURCE,
+      recommendedRef: TRAEX_RECOMMENDED_REF,
+    },
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,
@@ -2213,7 +2226,18 @@ const server = createServer(async (req, res) => {
         if ('feishuLoginQr' in result && result.feishuLoginQr) body.feishuLoginQr = result.feishuLoginQr;
         return jsonRes(res, 400, body);
       }
-      return jsonRes(res, 200, { ok: true, settings: result.settings });
+      // Opt-in TraeX herdr plugin: when this write enabled it (with a spec),
+      // install right away instead of waiting for the next daemon restart, and
+      // echo the outcome back so the SPA can toast success/failure. No-op for
+      // any settings write that didn't touch herdrTraexPlugin (or left it off /
+      // spec-less). Runs in-daemon (herdr on PATH here); never throws.
+      const herdrTraexInstall = await maybeInstallTraexPluginOnSettingsChange(
+        typeof parsed === 'object' && parsed !== null && 'herdrTraexPlugin' in parsed,
+        result.settings.herdrTraexPlugin,
+      );
+      return jsonRes(res, 200, herdrTraexInstall
+        ? { ok: true, settings: result.settings, herdrTraexInstall }
+        : { ok: true, settings: result.settings });
     }
 
     // ─── Version & manual update ─────────────────────────────────────────────
@@ -2231,10 +2255,22 @@ const server = createServer(async (req, res) => {
       // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
       // 2.86.0) is NOT flagged behind — exactly the canary case we want.
       const latest = await cachedLatestVersion();
+      const cliUpdates = listCliRuntimeUpdateEntries(config.session.dataDir).map((entry) => ({
+        cliId: entry.cliId,
+        binPath: entry.binPath,
+        current: entry.current,
+        latest: entry.latest,
+        updateAvailable: entry.updateAvailable,
+        updateCommand: entry.updateCommand,
+        ...(entry.installTarget ? { installTarget: entry.installTarget } : {}),
+        lastCheckedAt: entry.lastCheckedAt,
+      }));
       return jsonRes(res, 200, {
         current,
         latest,
         behind: !!latest && isNewerVersion(latest, current),
+        cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
+        cliUpdates,
         localDevInstall: isLocalDevInstall(),
         updateSupported: installPlan !== null,
         updateManager: installPlan?.manager ?? installManager,
@@ -3415,6 +3451,24 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-read-isolation`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/backend-type — proxy to that bot's daemon. Body
+    // `{ backendType: 'pty'|'tmux'|'herdr'|'zellij'|'' }` ('' / 'auto' clears the override).
+    let mBotBackendType: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotBackendType = url.pathname.match(/^\/api\/bots\/([^/]+)\/backend-type$/))) {
+      const appId = decodeURIComponent(mBotBackendType[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-backend-type`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

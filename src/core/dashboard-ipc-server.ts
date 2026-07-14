@@ -13,6 +13,9 @@ import { createGroupWithBots } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
+import * as backendTypeStore from '../services/backend-type-store.js';
+import { ensureBackendAvailable } from '../services/backend-availability.js';
+import type { BackendType } from '../adapters/backend/types.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -1623,6 +1626,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     // Full enforceability (adapter support + no wrapperCli + macOS) — the UI
     // disables the toggle wherever the worker would fail-close on it.
     readIsolationSupported: readIsolationEnforceable(cachedLarkAppId),
+    backendType: backendTypeStore.getBotBackendType(cachedLarkAppId) ?? null,
     disableStreamingCard: cardPrefs.disableStreamingCard,
     silentTurnReactions: cardPrefs.silentTurnReactions,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
@@ -2134,6 +2138,36 @@ ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
   // running the old, un-provisioned state and the toggle would silently no-op.
   const suspendedSessions = await suspendActiveSessionsForBot(cachedLarkAppId);
   jsonRes(res, 200, { ok: true, readIsolation: r.readIsolation, suspendedSessions });
+});
+
+// Per-bot session backend override (pty | tmux | herdr | zellij), or clear it
+// ('' / 'auto' / null → follow the daemon default). next-session 生效：running
+// sessions keep their spawn-time backend (Session.backendType stamp), only new
+// spawns read the new value — so switching here can't strand live sessions.
+ipcRoute('PUT', '/api/bot-backend-type', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { backendType?: unknown };
+  try { body = await readJsonBody<{ backendType?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const raw = body.backendType;
+  let next: BackendType | null;
+  if (raw == null || raw === '' || raw === 'auto') next = null;
+  else if (backendTypeStore.isEditableBackendType(raw)) next = raw;
+  else return jsonRes(res, 400, { ok: false, error: 'invalid_backendType' });
+  const effectiveBackendType = next ?? config.daemon.backendType;
+  const availability = await ensureBackendAvailable(effectiveBackendType);
+  if (!availability.ok) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'backend_unavailable',
+      backendType: effectiveBackendType,
+      reason: availability.reason,
+      manualCommand: availability.manualCommand,
+    });
+  }
+  const r = await backendTypeStore.updateBotBackendType(cachedLarkAppId, next);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, backendType: r.backendType, effectiveBackendType, version: availability.version });
 });
 
 // 实时切换 UI 语言（locale），无需重启 daemon。`botmux lang` / Dashboard 语言开关

@@ -44,6 +44,7 @@ export type BotDefaultsRow = {
    *  this bot's sessions — true when the CLI (claude/codex) + platform (macOS/Linux)
    *  + no wrapper can enforce it. Drives the capability label under the toggle. */
   readIsolationSupported?: boolean;
+  backendType?: string | null;
   disableStreamingCard?: boolean;
   silentTurnReactions?: boolean;
   writableTerminalLinkInCard?: boolean;

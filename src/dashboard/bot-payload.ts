@@ -49,6 +49,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     sandbox: j?.sandbox === true,
     readIsolation: j?.readIsolation === true,
     readIsolationSupported: j?.readIsolationSupported === true,
+    backendType: typeof j?.backendType === 'string' ? j.backendType : null,
     disableStreamingCard: j?.disableStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,

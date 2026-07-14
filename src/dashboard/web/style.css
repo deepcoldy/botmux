@@ -5918,6 +5918,15 @@ dialog.onboarding-dialog::backdrop {
 .update-install-list { margin: 6px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.6; }
 .update-install-list code { font-size: 11px; }
 .update-install-list small { color: var(--muted); }
+.cli-runtime-updates { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-soft); }
+.cli-runtime-updates > strong { display: block; margin-bottom: 8px; font-size: 12px; color: var(--muted); }
+.cli-runtime-updates ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.cli-runtime-updates li { min-width: 0; padding: 8px 10px; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--surface-muted); }
+.cli-runtime-updates li.is-behind { border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft)); }
+.cli-runtime-update-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 5px; font-size: 13px; font-weight: 600; }
+.cli-runtime-updates li > code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--muted); }
+.cli-runtime-updates li > small { display: block; margin-top: 5px; color: var(--muted); }
+.cli-runtime-updates .settings-help { margin: 8px 0 0; }
 .update-changelog { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
 .update-release { border: 1px solid var(--border-soft); border-radius: var(--radius-lg); padding: 8px 12px; background: var(--surface-muted); }
 .update-release > summary { cursor: pointer; font-size: 13px; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
@@ -16929,6 +16938,49 @@ form.dashboard-toolbar > input[type="text"]:focus {
   appearance: none;
   -webkit-appearance: none;
 }
+
+.settings-page .settings-text-input {
+  box-sizing: border-box;
+  width: 100%;
+  height: var(--button-height);
+  padding: 0 var(--button-padding-x);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: normal;
+  outline: none;
+  appearance: none;
+  -webkit-appearance: none;
+}
+.settings-page .settings-text-input:disabled { opacity: 0.5; }
+
+.settings-page .settings-subfield {
+  display: grid;
+  gap: 8px;
+  padding: 8px 0 2px;
+  min-width: 0;
+}
+.settings-page .settings-subfield-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+  word-break: break-all;
+}
+.settings-page .settings-inline-link {
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  word-break: break-all;
+}
+.settings-page .settings-inline-link:disabled { opacity: 0.5; cursor: default; }
 
 .settings-page .settings-card .maint-time input[type="time"]:disabled {
   opacity: 1;

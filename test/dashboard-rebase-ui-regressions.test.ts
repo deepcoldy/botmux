@@ -42,6 +42,19 @@ describe('dashboard master feature integration', () => {
     expect(css).toContain('.settings-feishu-login');
   });
 
+  it('submits TraeX source/ref through one explicit path and reconciles lost PUT responses', () => {
+    const page = dashboardSource('settings-page.tsx');
+    const editor = page.slice(page.indexOf('function TraexPluginEditor'));
+
+    expect(editor).toContain("void props.onSave({ source: normalizedSource, ref: normalizedRef })");
+    expect(editor).not.toContain('onBlur=');
+    expect(editor).toContain('setSource(props.value.recommendedSource)');
+    expect(editor).toContain('setRef(props.value.recommendedRef)');
+    expect(page).toContain("await fetch('/api/settings')");
+    expect(page).toContain("tr('settings.saveReconciled')");
+    expect(page).not.toContain('herdrTraexPlugin.spec');
+  });
+
   it('does not recenter the v3 DAG for status-only poll updates', () => {
     const page = dashboardSource('v3-components.tsx');
 

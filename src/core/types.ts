@@ -141,11 +141,11 @@ export interface DaemonSession {
    *  rendered TUI menu detected by screen-analyzer) — this is deliberate,
    *  agent-initiated, and carries no rendered options. */
   agentAttention?: { kind: string; reason: string; at: number };
-  /** 文档评论入口（/subscribe-lark-doc）：本会话「来自文档评论的轮」的回复落点
+  /** 文档评论入口（/watch-comment / /subscribe-lark-doc）：本会话「来自文档评论的轮」的回复落点
    *  映射。key = turnId（= 触发评论的 reply_id/comment_id，随消息传给 worker 再
    *  随 final_output 传回）；value = 该回哪个文档的哪条评论。deliverFinalOutput
    *  命中后把正文发表为文档评论而非飞书卡片，并删除该项。仅内存（轮是瞬时的）。 */
-  docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string }>;
+  docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string; replyId?: string; reactionId?: string }>;
   /** Last scoped dedupe key emitted via the bridge final_output pipeline.
    *  Format is `${sessionId}:${lastUuid || turnId}` so different sessions can
    *  never suppress each other's final_output payloads. */
@@ -198,4 +198,11 @@ export function sessionKey(anchorId: string, larkAppId: string): string {
  *  storage and lookup time. */
 export function sessionAnchorId(ds: DaemonSession): string {
   return ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId;
+}
+
+/** A session whose only IM surface is a Feishu document comment thread.
+ * `doc:` is an internal virtual address, not a real Lark chat_id, so rich
+ * cards and other chat API calls must never target it. */
+export function isDocNativeSession(ds: Pick<DaemonSession, 'scope' | 'chatId'>): boolean {
+  return ds.scope === 'chat' && ds.chatId.startsWith('doc:');
 }

@@ -36,10 +36,25 @@ export interface DocSubscription {
   chatId: string;
   /** 评论触发范围。dashboard 可改。 */
   commentTriggerMode: CommentTriggerMode;
+  /**
+   * 记录由哪个用户命令族管理：
+   *   - subscribe-lark-doc：远端既有的逐文件 API 订阅流程
+   *   - watch-comment：评论监听 / 自动会话 / 审批流程
+   * 旧记录没有该字段，按 subscribe-lark-doc 兼容处理。
+   */
+  managedBy?: 'subscribe-lark-doc' | 'watch-comment';
   /** 文档标题快照（best-effort，用于卡片 / dashboard 展示）。 */
   docTitle?: string;
   /** 发起订阅的用户 open_id。 */
   ownerOpenId?: string;
+  /** 该文档绑定的本地仓库/目录。agent 在此目录下运行（auto-create session 时使用）。 */
+  workingDir?: string;
+  /** `/watch-comment --all` 应用身份轮询游标（飞书时间戳，秒）。 */
+  pollCursorAt?: number;
+  /** 同一秒内用 reply_id 打破平局，避免漏掉连续评论。 */
+  pollCursorReplyId?: string;
+  /** 首次成功读取已建立历史基线；false 时只建基线、不触发历史评论。 */
+  pollBaselineReady?: boolean;
   createdAt: number;
 }
 
@@ -129,6 +144,24 @@ export function setCommentTriggerMode(
   const sub = data[fileToken];
   if (!sub) return false;
   sub.commentTriggerMode = mode;
+  writeFile(dataDir, larkAppId, data);
+  return true;
+}
+
+/** 更新 `/watch-comment --all` 的持久化轮询游标。 */
+export function setDocCommentPollCursor(
+  dataDir: string,
+  larkAppId: string,
+  fileToken: string,
+  cursor: { createdAt: number; replyId: string } | undefined,
+  baselineReady = true,
+): boolean {
+  const data = readFile(dataDir, larkAppId);
+  const sub = data[fileToken];
+  if (!sub) return false;
+  sub.pollCursorAt = cursor?.createdAt;
+  sub.pollCursorReplyId = cursor?.replyId;
+  sub.pollBaselineReady = baselineReady;
   writeFile(dataDir, larkAppId, data);
   return true;
 }

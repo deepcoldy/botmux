@@ -59,6 +59,12 @@ export interface ChatBotDiscoveryConfig {
   listBotsApiTimeoutMs: number;
 }
 
+export interface HerdrTraexPluginRuntimeConfig {
+  enabled: boolean;
+  source: string;
+  ref: string;
+}
+
 /**
  * Current-chat bot discovery via Lark `/members/bots`.
  *
@@ -81,6 +87,30 @@ export function resolveChatBotDiscoveryConfig(env: NodeJS.ProcessEnv = process.e
     listBotsApiEnabled,
     listBotsApiTimeoutMs: Number(env.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS) || 3_000,
   };
+}
+
+/**
+ * TraeX ↔ herdr plugin bootstrap is a machine-wide opt-in because the plugin
+ * writes host-level `~/.trae` hooks. There is intentionally no default plugin
+ * source in botmux; operators provide a `source` (owner/repo[/subdir]) they trust
+ * plus an optional pinned `ref` (tag/branch/SHA) via dashboard Settings or env.
+ */
+export function resolveHerdrTraexPluginConfig(env: NodeJS.ProcessEnv = process.env): HerdrTraexPluginRuntimeConfig {
+  const envEnabled = env.BOTMUX_HERDR_TRAEX_PLUGIN_ENABLED;
+  const dashboardCfg = readGlobalConfig().dashboard?.herdrTraexPlugin;
+  const enabled = envEnabled != null && envEnabled !== ''
+    ? envEnabled.toLowerCase() === 'true'
+    : dashboardCfg?.enabled === true; // default OFF
+  // One-cycle compatibility for review deployments of the old `spec` schema.
+  // `owner/repo#ref` was never valid herdr argv; split it into the real fields.
+  const legacySpec = (env.BOTMUX_HERDR_TRAEX_PLUGIN_SPEC ?? '').trim();
+  const legacyHash = legacySpec.lastIndexOf('#');
+  const legacySource = legacyHash > 0 ? legacySpec.slice(0, legacyHash) : legacySpec;
+  const legacyRef = legacyHash > 0 ? legacySpec.slice(legacyHash + 1) : '';
+  const usesLegacySpec = env.BOTMUX_HERDR_TRAEX_PLUGIN_SOURCE == null && !!legacySource;
+  const source = (env.BOTMUX_HERDR_TRAEX_PLUGIN_SOURCE ?? (legacySource || dashboardCfg?.source) ?? '').trim();
+  const ref = (env.BOTMUX_HERDR_TRAEX_PLUGIN_REF ?? (usesLegacySpec ? legacyRef : dashboardCfg?.ref) ?? '').trim();
+  return { enabled, source, ref };
 }
 
 /** Machine-wide VC meeting listener kill-switch.
@@ -226,6 +256,7 @@ export const config = {
   // cached) on each access so a Settings change takes effect without a daemon
   // restart. The daemon's listChatBotMembers reads this per call.
   get chatBotDiscovery() { return resolveChatBotDiscoveryConfig(); },
+  get herdrTraexPlugin() { return resolveHerdrTraexPluginConfig(); },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

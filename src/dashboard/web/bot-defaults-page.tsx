@@ -144,7 +144,10 @@ async function sendJson(method: string, url: string, body?: unknown): Promise<Js
 }
 
 function responseErrorText(res: JsonResponse): string {
-  return String(res.body?.error ?? res.status);
+  const reason = typeof res.body?.reason === 'string' ? res.body.reason : '';
+  const manual = typeof res.body?.manualCommand === 'string' ? res.body.manualCommand : '';
+  if (reason && manual) return `${reason}（${manual}）`;
+  return String(reason || res.body?.error || res.status);
 }
 
 function caughtErrorText(e: any): string {
@@ -485,6 +488,7 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
             <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} />
             <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
             <SandboxSection bot={bot} patchBot={patchBot} />
+            <BackendTypeSection bot={bot} patchBot={patchBot} />
           </section>
           <section className="bd-tile">
             <RuntimeEnvironmentSection bot={bot} patchBot={patchBot} />
@@ -1175,6 +1179,70 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       </p>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-sandbox-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+const BACKEND_TYPE_OPTIONS: Array<{ value: string; labelKey: string }> = [
+  { value: '', labelKey: 'botDefaults.backendAuto' },
+  { value: 'tmux', labelKey: 'botDefaults.backendTmux' },
+  { value: 'herdr', labelKey: 'botDefaults.backendHerdr' },
+  { value: 'zellij', labelKey: 'botDefaults.backendZellij' },
+  { value: 'pty', labelKey: 'botDefaults.backendPty' },
+];
+
+function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const [value, setValue] = useState(typeof bot.backendType === 'string' ? bot.backendType : '');
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => setValue(typeof bot.backendType === 'string' ? bot.backendType : ''), [bot.backendType]);
+
+  const options = useMemo(() => BACKEND_TYPE_OPTIONS.map(o => ({ value: o.value, label: tr(o.labelKey) })), [tr]);
+
+  async function save(next: string): Promise<void> {
+    const prev = value;
+    setValue(next);
+    setStatus(null);
+    setBusy(true);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/backend-type`, { backendType: next });
+      if (res.ok && res.body.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.backendSaved')}`, ok: true });
+        patchBot(bot.larkAppId, { backendType: typeof res.body.backendType === 'string' ? res.body.backendType : null });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+        setValue(prev);  // revert optimistic selection
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+      setValue(prev);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionBackend')}</h3>
+      <div className="bd-row">
+        <div className="bd-field">
+          <FieldTitle help={tr('botDefaults.backendHelp')}>{tr('botDefaults.backendLabel')}</FieldTitle>
+          <DropdownField
+            dataInput="backendType"
+            ariaLabel={tr('botDefaults.backendLabel')}
+            value={value}
+            disabled={busy}
+            options={options}
+            onChange={next => void save(next)}
+          />
+        </div>
+        <div className="actions">
+          <StatusSpan status={status} attr={{ 'data-backend-status': '' }} />
+        </div>
       </div>
     </section>
   );

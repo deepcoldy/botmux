@@ -14,6 +14,13 @@ interface DashboardSettings {
   enableLocalCliOpen: boolean;
   localCliOpenMode: 'attach' | 'resume';
   chatBotDiscovery: boolean;
+  herdrTraexPlugin: {
+    enabled: boolean;
+    source: string;
+    ref: string;
+    recommendedSource: string;
+    recommendedRef: string;
+  };
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId: string | null;
@@ -48,10 +55,22 @@ const COMMON_TIMEZONES = [
 type InstallKind = 'npm-global' | 'pnpm-global' | 'yarn-global' | 'bun-global' | 'source-checkout' | 'unknown';
 interface InstallEntry { binPath: string; root: string; kind: InstallKind }
 interface NodeCheck { version: string; major: number; required: number; ok: boolean }
+interface CliRuntimeUpdateStatus {
+  cliId: 'codex';
+  binPath: string;
+  current: string | null;
+  latest: string | null;
+  updateAvailable: boolean;
+  updateCommand: string;
+  installTarget?: string;
+  lastCheckedAt: number;
+}
 interface UpdateStatus {
   current: string;
   latest: string | null;
   behind: boolean;
+  cliBehind: boolean;
+  cliUpdates: CliRuntimeUpdateStatus[];
   localDevInstall: boolean;
   updateSupported: boolean;
   updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'unknown';
@@ -63,6 +82,25 @@ interface ReleaseNote { version: string; name: string; body: string; url: string
 
 type StatusMessage = { text: string; cls?: string } | null;
 
+/** Map a `herdrTraexInstall` result (returned by PUT /api/settings when the
+ *  write triggered a live TraeX plugin install) to a settings status message. */
+function traexInstallMessage(install: any, tr: (k: string) => string): StatusMessage {
+  if (!install || typeof install !== 'object') return null;
+  if (install.failed) {
+    const step = install.failed.step === 'install'
+      ? tr('settings.herdrTraexInstallStepInstall')
+      : tr('settings.herdrTraexInstallStepAction');
+    return { text: `${tr('settings.herdrTraexInstallFailed')}（${step}）: ${install.failed.reason ?? ''}`, cls: 'hint-warn-inline' };
+  }
+  if (install.skippedReason === 'plugin_unsupported') {
+    const version = typeof install.herdrVersion === 'string' && install.herdrVersion ? ` (${install.herdrVersion})` : '';
+    return { text: `${tr('settings.herdrTraexUnsupported')}${version}`, cls: 'hint-warn-inline' };
+  }
+  if (install.installed || install.actionInvoked) return { text: tr('settings.herdrTraexInstalled'), cls: 'hint-ok' };
+  if (install.alreadyInstalled) return { text: tr('settings.herdrTraexAlreadyInstalled'), cls: 'hint-ok' };
+  return null;
+}
+
 function parseSettings(s: any): DashboardSettings {
   return {
     publicReadOnly: s?.publicReadOnly === true,
@@ -70,6 +108,13 @@ function parseSettings(s: any): DashboardSettings {
     enableLocalCliOpen: s?.enableLocalCliOpen === true,
     localCliOpenMode: s?.localCliOpenMode === 'resume' ? 'resume' : 'attach',
     chatBotDiscovery: s?.chatBotDiscovery !== false,
+    herdrTraexPlugin: {
+      enabled: s?.herdrTraexPlugin?.enabled === true,
+      source: typeof s?.herdrTraexPlugin?.source === 'string' ? s.herdrTraexPlugin.source : '',
+      ref: typeof s?.herdrTraexPlugin?.ref === 'string' ? s.herdrTraexPlugin.ref : '',
+      recommendedSource: typeof s?.herdrTraexPlugin?.recommendedSource === 'string' ? s.herdrTraexPlugin.recommendedSource : '',
+      recommendedRef: typeof s?.herdrTraexPlugin?.recommendedRef === 'string' ? s.herdrTraexPlugin.recommendedRef : '',
+    },
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: typeof s?.vcMeetingAgent?.listenerBotAppId === 'string' ? s.vcMeetingAgent.listenerBotAppId : null,
@@ -233,11 +278,36 @@ function SettingsPage() {
       setSettings(saved);
       ui.publicReadOnly = saved.publicReadOnly;
       store.setScheduleTimeZone(saved.effectiveScheduleTimeZone);
-      setSettingsMsg({ text: tr('settings.saved'), cls: 'hint-ok' });
+      // If this write triggered a live TraeX plugin install, surface its result
+      // instead of the generic "saved" toast.
+      const traexMsg = traexInstallMessage(body.herdrTraexInstall, tr);
+      setSettingsMsg(traexMsg ?? { text: tr('settings.saved'), cls: 'hint-ok' });
     } catch (e) {
       if (!mountedRef.current) return;
-      setSettings(before);
-      setSettingsMsg({ text: `${tr('settings.saveFailed')}: ${e instanceof Error ? e.message : String(e)}`, cls: 'hint-warn-inline' });
+      // The PUT may have committed before a proxy/browser timeout dropped its
+      // response (TraeX installation can legitimately take minutes). Re-read
+      // the server before deciding whether to roll back the optimistic state.
+      let reconciled = false;
+      try {
+        const confirmedResponse = await fetch('/api/settings');
+        const confirmedBody = await confirmedResponse.json().catch(() => ({}));
+        if (mountedRef.current && confirmedResponse.ok && confirmedBody?.settings) {
+          const confirmed = parseSettings(confirmedBody.settings);
+          setSettings(confirmed);
+          ui.publicReadOnly = confirmed.publicReadOnly;
+          store.setScheduleTimeZone(confirmed.effectiveScheduleTimeZone);
+          reconciled = true;
+        }
+      } catch { /* still offline: fall back to the pre-save snapshot */ }
+      if (!mountedRef.current) return;
+      if (!reconciled) setSettings(before);
+      const detail = e instanceof Error ? e.message : String(e);
+      setSettingsMsg({
+        text: reconciled
+          ? `${tr('settings.saveReconciled')}: ${detail}`
+          : `${tr('settings.saveFailed')}: ${detail}`,
+        cls: 'hint-warn-inline',
+      });
     } finally {
       if (mountedRef.current) setSavingKey(null);
     }
@@ -441,6 +511,13 @@ function SettingsBody(props: {
   const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
+  const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
+    return props.onSave(
+      'herdrTraexPlugin',
+      { herdrTraexPlugin: patch },
+      s => ({ ...s, herdrTraexPlugin: { ...s.herdrTraexPlugin, ...patch } }),
+    );
+  };
   const repoModeOptions = useMemo(() => [
     { value: 'all' as const, label: tr('settings.repoPickerModeAll') },
     { value: 'repos' as const, label: tr('settings.repoPickerModeRepos') },
@@ -527,6 +604,20 @@ function SettingsBody(props: {
             disabled={dis || savingKey === 'chatBotDiscovery'}
             onChange={value => saveBoolean('chatBotDiscovery', value)}
           />
+          <ToggleRow
+            title={tr('settings.herdrTraexPlugin')}
+            help={tr('settings.herdrTraexPluginHelp')}
+            checked={settings.herdrTraexPlugin.enabled}
+            disabled={dis || savingKey === 'herdrTraexPlugin'}
+            onChange={value => saveHerdrTraexPlugin({ enabled: value })}
+          />
+          {settings.herdrTraexPlugin.enabled ? (
+            <TraexPluginEditor
+              value={settings.herdrTraexPlugin}
+              disabled={dis || savingKey === 'herdrTraexPlugin'}
+              onSave={patch => saveHerdrTraexPlugin(patch)}
+            />
+          ) : null}
         </SettingsBlock>
         <SettingsBlock title={tr('settings.sectionWhiteboard')}>
           <ToggleRow
@@ -799,6 +890,87 @@ function ToggleRow(props: {
   );
 }
 
+function TraexPluginEditor(props: {
+  value: DashboardSettings['herdrTraexPlugin'];
+  disabled: boolean;
+  onSave(patch: { source: string; ref: string }): Promise<void>;
+}) {
+  const tr = useT();
+  const [source, setSource] = useState(props.value.source);
+  const [ref, setRef] = useState(props.value.ref);
+  useEffect(() => {
+    setSource(props.value.source);
+    setRef(props.value.ref);
+  }, [props.value.source, props.value.ref]);
+
+  const normalizedSource = source.trim();
+  const normalizedRef = ref.trim();
+  const dirty = normalizedSource !== props.value.source.trim() || normalizedRef !== props.value.ref.trim();
+  const submit = () => {
+    if (props.disabled || !dirty) return;
+    void props.onSave({ source: normalizedSource, ref: normalizedRef });
+  };
+
+  return (
+    <div className="settings-subfield">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.herdrTraexPluginSourceHelp')}>{tr('settings.herdrTraexPluginSource')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          value={source}
+          placeholder={tr('settings.herdrTraexPluginSourcePlaceholder')}
+          disabled={props.disabled}
+          onChange={event => setSource(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.herdrTraexPluginRefHelp')}>{tr('settings.herdrTraexPluginRef')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          value={ref}
+          placeholder={tr('settings.herdrTraexPluginRefPlaceholder')}
+          disabled={props.disabled}
+          onChange={event => setRef(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      {normalizedSource ? null : (
+        <p className="hint-warn-inline settings-subfield-hint">{tr('settings.herdrTraexPluginSourceRequired')}</p>
+      )}
+      {props.value.recommendedSource
+        && (normalizedSource !== props.value.recommendedSource || normalizedRef !== props.value.recommendedRef) ? (
+          <p className="settings-subfield-hint">
+            {tr('settings.herdrTraexPluginRecommended')}{' '}
+            <button
+              type="button"
+              className="settings-inline-link"
+              disabled={props.disabled}
+              onClick={() => {
+                setSource(props.value.recommendedSource);
+                setRef(props.value.recommendedRef);
+              }}
+            >
+              {props.value.recommendedSource}{props.value.recommendedRef ? ` @ ${props.value.recommendedRef}` : ''}
+            </button>
+          </p>
+        ) : null}
+      <div className="actions">
+        <button
+          type="button"
+          className="page-primary-action"
+          disabled={props.disabled || !dirty}
+          onClick={submit}
+        >
+          {tr('settings.herdrTraexPluginSave')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function UpdateCard(props: {
   canWrite: boolean;
   status: UpdateStatus | null;
@@ -848,6 +1020,7 @@ function UpdateCard(props: {
           <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{tr('update.btnUpdate')}</button>
           <button type="button" data-up="restart" disabled={props.busy} onClick={props.onRestart}>{tr('update.btnRestart')}</button>
         </div>
+        {s.cliUpdates?.length ? <CliRuntimeUpdates entries={s.cliUpdates} /> : null}
         {props.changelogOpen ? (
           <ChangelogPanel
             changelog={props.changelog}
@@ -872,6 +1045,38 @@ function UpdateCard(props: {
     >
       {inner}
     </SettingsBlock>
+  );
+}
+
+function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
+  const tr = useT();
+  return (
+    <div className="cli-runtime-updates">
+      <strong>{tr('update.runtimeTitle')}</strong>
+      <ul>
+        {props.entries.map(entry => (
+          <li key={`${entry.cliId}:${entry.binPath}`} className={entry.updateAvailable ? 'is-behind' : ''}>
+            <div className="cli-runtime-update-head">
+              <span>Codex</span>
+              {entry.updateAvailable && entry.latest ? (
+                <span className="update-badge update-badge-new">
+                  {tr('update.runtimeAvailable', { current: entry.current ?? '?', latest: entry.latest })}
+                </span>
+              ) : entry.latest ? (
+                <span className="update-badge update-badge-ok">{tr('update.upToDate')}</span>
+              ) : (
+                <span className="hint-warn-inline">{tr('update.checkUnavailable')}</span>
+              )}
+            </div>
+            <code>{entry.binPath}</code>
+            {entry.updateAvailable ? (
+              <small>{tr('update.runtimeCommand')}: <code>{entry.updateCommand}</code></small>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+      <p className="settings-help">{tr('update.runtimeHelp')}</p>
+    </div>
   );
 }
 

@@ -89,12 +89,14 @@ export interface Session {
    */
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
   /**
-   * 文档评论入口（/subscribe-lark-doc）：当本会话「当前这一轮」由飞书文档评论
+   * 文档评论入口（/watch-comment / /subscribe-lark-doc）：当本会话「当前这一轮」由飞书文档评论
    * 触发时，`botmux send` 的用户可见回复要回到该文档评论（而非飞书）。因 botmux
-   * send 跑在独立 CLI 子进程、只能从磁盘读会话态，故把当前轮的回评论落点持久化
-   * 在这里。每开新轮重置（beginNewTurn 清空；handleDocComment 设值）。
+   * send 跑在独立 CLI 子进程、只能从磁盘读会话态，故把每轮的回评论落点按 turnId
+   * 持久化在这里。per-turn map 避免并发评论串线（A 轮还在跑、B 轮到达不会覆盖 A 的
+   * 落点）。botmux send 用 `BOTMUX_TURN_ID` 取自己那轮的 target；turn 结束后由
+   * deliverFinalOutput / botmux send 成功路径清理对应 entry。
    */
-  currentDocCommentTarget?: { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string };
+  docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string }>;
   /** open_id of the quote-target message's sender — used by --mention-back. */
   quoteTargetSenderOpenId?: string;
   /** Whether the quote-target sender is a bot (vs a human) — drives the

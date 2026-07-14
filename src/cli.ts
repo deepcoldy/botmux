@@ -1225,6 +1225,7 @@ async function promptEditBotConfig(
 
   printInputHelp('会话后端 backendType', [
     '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着；herdr 支持托管持久会话；zellij 为实验后端（需 zellij >= 0.44）。',
+    '选择 traex + herdr 时，可在 Dashboard Settings 中开启 TraeX herdr plugin opt-in 并填写可信插件 spec；默认不会自动安装第三方插件。',
     '留空保留当前值；输入 - 回到自动检测；接受 pty / tmux / herdr / zellij。',
   ]);
   input.backendType = await ask(rl, `会话后端 backendType [${formatOptionalValue(bot.backendType)}]: `);
@@ -2676,8 +2677,8 @@ interface SessionData {
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
-  /** 文档评论入口当前轮回评论落点（见 Session.currentDocCommentTarget in types.ts）。 */
-  currentDocCommentTarget?: { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string };
+  /** 文档评论入口 per-turn 回复落点（见 Session.docCommentTargets in types.ts）。 */
+  docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string }>;
   quoteTargetSenderOpenId?: string;
   quoteTargetSenderIsBot?: boolean;
   whiteboardId?: string;
@@ -5246,14 +5247,13 @@ async function cmdSend(rest: string[]): Promise<void> {
     return;
   }
 
-  // ── 文档评论入口分流（/subscribe-lark-doc）──────────────────────────────────
-  // 本轮若由飞书文档评论触发（daemon 已把落点写进 session.currentDocCommentTarget），
+  // ── 文档评论入口分流（/watch-comment / /subscribe-lark-doc）─────────────────
+  // 本轮若由飞书文档评论触发（daemon 已把落点写进 session.docCommentTargets[turnId]），
   // 把用户可见回复发表为飞书文档评论，而非发回飞书会话。绕过 @ 硬门（评论不 @ 飞书
   // 用户）。显式改路由（--top-level / --chat-id / --into）时不分流，让模型仍能主动
-  // 「磁盘上有 currentDocCommentTarget」即权威信号=本轮是文档评论轮（beginNewTurn
-  // 在飞书轮已清盘）。故只看 docTarget 存在 + 无显式改路由，不再卡 turnId 相等
-  // （之前 currentTurnId 取自 cliPidMarker，文档轮里取值不稳导致误判落到 @ 硬门）。
-  const docTarget = s.currentDocCommentTarget;
+  // 用 BOTMUX_TURN_ID 从 per-turn map 取本轮落点；非文档轮的 turnId 不会命中 map，
+  // 天然不会误投。per-turn map 设计：并发评论之间互不覆盖，不会串线。
+  const docTarget = currentTurnId ? s.docCommentTargets?.[currentTurnId] : undefined;
   if (docTarget && !sendTopLevel && !overrideChatId && !sendInto) {
     if (customCardRequested) {
       console.error('botmux send: 文档评论回复不支持 --card-file/--card-json；请改用普通文本，或显式 --top-level/--chat-id 发到飞书群');
@@ -5261,7 +5261,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
     const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
     try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
-    const { replyToDocComment, chunkCommentText } = await import('./im/lark/doc-comment.js');
+    const { replyToDocComment, chunkCommentText, removeCommentReaction } = await import('./im/lark/doc-comment.js');
     const appId = s.larkAppId!;
     const loc = localeForBot(appId);
     try {
@@ -5279,12 +5279,23 @@ async function cmdSend(rest: string[]): Promise<void> {
       for (let i = 0; i < chunks.length; i++) {
         await replyToDocComment(appId, { fileToken: docTarget.fileToken, fileType: docTarget.fileType }, docTarget.commentId, chunks[i], i === 0 ? docMentionOpenId : undefined);
       }
+      // 清理 "Typing" reaction（bot 已回复完毕）。
+      if (docTarget.reactionId && docTarget.replyId) {
+        await removeCommentReaction(appId,
+          { fileToken: docTarget.fileToken, fileType: docTarget.fileType },
+          docTarget.commentId, docTarget.replyId, docTarget.reactionId);
+      }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
       try {
         const markerDir = join(resolveDataDir(), 'turn-sends');
         if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
         appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify({ sentAtMs: Date.now(), messageId: `doc:${docTarget.commentId}`, contentLength: content.length }) + '\n');
       } catch { /* best-effort：漏记只多一条兜底 */ }
+      // 清理已消费的 per-turn 落点，避免 session 文件无限堆积。
+      if (s.docCommentTargets && currentTurnId && s.docCommentTargets[currentTurnId]) {
+        delete s.docCommentTargets[currentTurnId];
+        try { saveSession(s); } catch { /* best-effort */ }
+      }
       console.error(`✓ 已回复文档评论 ${docTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
       console.log(JSON.stringify({ success: true, commentId: docTarget.commentId, sessionId: sid, kind: 'doc-comment', chunks: chunks.length }));
     } catch (e: any) {
