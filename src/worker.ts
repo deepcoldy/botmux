@@ -87,6 +87,7 @@ import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { listenWebTerminalWithFallback } from './utils/web-terminal-listen.js';
+import { HerdrWebTerminalBinding } from './utils/herdr-web-terminal-binding.js';
 import { TERMINAL_FAVICON_DATA_URI } from './utils/terminal-favicon.js';
 import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey, ScreenStatus } from './types.js';
 import { t, setDefaultLocale } from './i18n/index.js';
@@ -5717,10 +5718,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         });
       } else {
         // ── Shared relay (PtyBackend OR tmux pipe mode) ──
-        const herdrWebBackend = backend instanceof HerdrBackend && !lastInitConfig?.adoptMode
-          ? backend
-          : null;
-        const initialHerdrSize = herdrWebBackend?.acquireWebTerminal(ws);
+        const herdrWebBinding = new HerdrWebTerminalBinding(ws, () => (
+          backend instanceof HerdrBackend && !lastInitConfig?.adoptMode ? backend : null
+        ));
+        const initialHerdrSize = herdrWebBinding.sync().initialSize;
         if (initialHerdrSize) {
           ws.send(`\x1b]1989;follower;${initialHerdrSize.cols};${initialHerdrSize.rows}\x07`);
         }
@@ -5754,8 +5755,11 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           try {
             const msg = JSON.parse(String(raw));
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
+              const { backend: herdrWebBackend, initialSize, size } = herdrWebBinding.resize(msg.cols, msg.rows);
+              if (initialSize) {
+                ws.send(`\x1b]1989;follower;${initialSize.cols};${initialSize.rows}\x07`);
+              }
               if (herdrWebBackend) {
-                const size = herdrWebBackend.resizeWebTerminal(ws, msg.cols, msg.rows);
                 if (size) {
                   for (const client of wsClients) {
                     if (
@@ -5784,7 +5788,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
 
         ws.on('close', () => {
           wsClients.delete(ws);
-          const promoted = herdrWebBackend?.releaseWebTerminal(ws) as WebSocket | null | undefined;
+          const promoted = herdrWebBinding.release() as WebSocket | null;
           if (promoted?.readyState === WebSocket.OPEN) {
             promoted.send('\x1b]1989;owner\x07');
           }
