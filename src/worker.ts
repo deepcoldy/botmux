@@ -5804,7 +5804,7 @@ body{display:flex;flex-direction:column}
   backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}
 #toolbar{display:flex;flex-direction:column}
 .toolbar-motion-ghost{position:absolute!important;top:50%;right:0;pointer-events:none!important;
-  transform-origin:right center!important}
+  transform:translateY(-50%);transform-origin:right center!important}
 #toolbar-header{height:44px;display:flex;align-items:center;justify-content:space-between;gap:2px;min-width:0}
 #toolbar-title{min-width:0;overflow:hidden;color:#a9b1d6;
   font:600 11px/16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:-.2px;white-space:nowrap}
@@ -6285,8 +6285,8 @@ if(isTouch&&hasToken){
     _toolbarStateAnimations=[enter,leave];leave.onfinish=_finishToolbarStateMotion;
   }
   function _animateToolbarSettle(deltaScreen){
-    if(!tb.animate||_toolbarReducedMotion()||Math.abs(deltaScreen)<.5)return;
     _cancelToolbarStateMotion();
+    if(!tb.animate||_toolbarReducedMotion()||Math.abs(deltaScreen)<.5)return;
     var animation=tb.animate([
       {transform:'translateY('+deltaScreen+'px)'},{transform:'translateY(0)'}
     ],{duration:350,easing:'cubic-bezier(.22,1,.36,1)',fill:'both'});

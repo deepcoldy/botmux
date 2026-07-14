@@ -70,9 +70,11 @@ describe('web terminal touch shortcut toolbar', () => {
 
   it('drives interruptible state and projected-release motion inside the inverse-scale shell', () => {
     expect(workerSource).toContain("ghost.classList.remove('idle','dragging');ghost.classList.add('toolbar-motion-ghost')");
+    expect(workerSource).toContain('transform:translateY(-50%);transform-origin:right center!important');
     expect(workerSource).toContain("{opacity:0,transform:'scale(.94)'},{opacity:1,transform:'scale(1)'}");
     expect(workerSource).toContain("duration:350,easing:'cubic-bezier(.22,1,.36,1)'");
     expect(workerSource).toContain('_animateToolbarSettle((releaseCenter-landed.center)*v.scale)');
+    expect(workerSource.indexOf('_cancelToolbarStateMotion();\n    if(!tb.animate||_toolbarReducedMotion()||Math.abs(deltaScreen)<.5)return;')).toBeGreaterThan(-1);
     expect(workerSource).toContain(")))_pauseToolbarStateMotion();\n    else _cancelToolbarStateMotion()");
     expect(workerSource).toContain('if(reverse!==_toolbarMotionReversing)_toolbarStateAnimations[i].reverse()');
     expect(workerSource).toContain("window.matchMedia('(prefers-reduced-motion: reduce)').matches");
