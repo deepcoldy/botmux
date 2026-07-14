@@ -111,6 +111,28 @@ function submitPrefix(content: string): string {
   return content.slice(0, 40);
 }
 
+function resolveCocoCommand(rawBin: string): string {
+  const resolved = resolveCommand(rawBin);
+  // Newer CoCo/Trae installs may only expose the renamed `traecli` executable.
+  // Keep the historical `coco` default for old installs, but transparently
+  // fall back when the shell probe cannot find it. Explicit path/command
+  // overrides are respected as-is so tests and custom bot configs remain
+  // deterministic.
+  if (rawBin === 'coco' && resolved === 'coco') {
+    const traecli = resolveCommand('traecli');
+    if (traecli !== 'traecli') return traecli;
+  }
+  return resolved;
+}
+
+function shellCommandName(resolvedBin: string): string {
+  // User-facing resume hints should stay copy-pasteable across machines. When
+  // fallback selected a PATH-resolved traecli binary, print `traecli` rather
+  // than an absolute path from the daemon host; explicit overrides keep the
+  // historical command string.
+  return resolvedBin.includes('/') && resolvedBin.endsWith('/traecli') ? 'traecli' : 'coco';
+}
+
 export function createCocoAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
   // modelChoices and must not shell out (see resolveCommand); the binary path
@@ -125,7 +147,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     // the REAL ~/.cache/coco/sessions/<sid>/ path (see coco-transcript.ts) — on
     // the overlay the CLI's writes would be invisible to the daemon.
     authPaths: ['~/.trae/cli', '~/.cache/coco'],
-    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
+    get resolvedBin(): string { return (cachedBin ??= resolveCocoCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, model, disableCliBypass }) {
       const args: string[] = [];
@@ -145,7 +167,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     },
 
     buildResumeCommand({ sessionId }) {
-      return `coco --resume ${sessionId}`;
+      return `${shellCommandName(this.resolvedBin)} --resume ${sessionId}`;
     },
 
     async writeInput(pty: PtyHandle, content: string) {
