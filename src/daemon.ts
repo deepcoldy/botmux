@@ -81,7 +81,7 @@ import {
 } from './core/worker-pool.js';
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner, setBotRenamer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
@@ -6346,6 +6346,12 @@ async function resolvePinnedWorkingDir(ctx: {
 }
 
 export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
+// Production message routes (function declarations hoist, so the references
+// are valid here). Exposed for route-level regression tests — e.g. asserting
+// that `/title` in a fresh topic/thread does NOT pre-create a phantom session,
+// which unit tests calling handleCommand directly can never catch.
+export const __testOnly_handleNewTopic = (data: any, ctx: RoutingContext): Promise<void> => handleNewTopic(data, ctx);
+export const __testOnly_handleThreadReply = (data: any, ctx: RoutingContext): Promise<void> => handleThreadReply(data, ctx);
 
 /**
  * 该新会话是否要走「仅默认目录 + 自动建 worktree」：pinned dir 来自本 bot 自己的
@@ -6719,6 +6725,17 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         // slow Lark API work → no Feishu redelivery → no duplicate group.
         // See fireSessionlessCommandDetached.
         fireSessionlessCommandDetached(cmd, anchor, { ...parsed, content: commandContent, chatId }, larkAppId);
+        return;
+      }
+      // `/title` renames an EXISTING session; a brand-new topic has none. Route
+      // straight to handleCommand (its `!ds` branch replies no_active_session)
+      // so the pre-create block below doesn't spawn a worker:null phantom
+      // session just to rename it. Same phantom-session concern as the /card
+      // and /term special cases, but UNLIKE those (which carry their own
+      // permission gates inside their handlers) this branch MUST stay after
+      // the canOperate gate above — the /title handler itself has no gate.
+      if (EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
+        await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
         return;
       }
       // Same rootMessageId reasoning as below in the main spawn path:
@@ -7440,8 +7457,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // Without a session, handleCommand gets ds=undefined and `/repo` (and other
       // session commands) fall through to the repo-select card. Create the session
       // first, mirroring handleNewTopic's first-message `/repo` pendingRepo setup.
-      // Session-less commands (/group /g) don't need one.
-      if (!existingDs && threadChatId && !isSessionlessCommandInvocation(cmd, commandContent)) {
+      // Session-less commands (/group /g) don't need one; existing-session-only
+      // commands (/title) must NOT get one — a pre-created worker:null session
+      // would be a phantom conversation that only exists to be renamed. Let
+      // handleCommand's `!ds` branch reply no_active_session instead.
+      if (!existingDs && threadChatId && !isSessionlessCommandInvocation(cmd, commandContent)
+        && !EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
         const session = sessionStore.createSession(threadChatId, anchor, cmdContent.substring(0, 50), ctxChatType);
         const now = Date.now();
         if (ctxChatType === 'p2p') {

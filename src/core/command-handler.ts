@@ -92,6 +92,18 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  */
 export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment']);
 
+/**
+ * Daemon commands that operate on an ALREADY-EXISTING session and must never
+ * pre-create one. `/title` renames the current session — with no session there
+ * is nothing to rename, so the daemon routes must skip their generic
+ * "createSession + activeSessions.set(worker:null)" pre-create block and let
+ * handleCommand's `!ds` branch reply no_active_session. Without this, `/title`
+ * in a brand-new topic (or a thread with no session) would spawn a phantom
+ * worker:null session just to rename it, polluting the dashboard. (Same class
+ * of fix as the `/card` / `/term` special cases in daemon.ts.)
+ */
+export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/title']);
+
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
   try {
