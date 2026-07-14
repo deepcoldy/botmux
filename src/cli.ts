@@ -35,6 +35,12 @@ import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildR
 import { normalizeRepoRemote } from './core/repo-requirement.js';
 import { normalizeDispatchBotsForSender, resolveDispatchWorkerBotUnionIds, resolveDispatchWorkerMetas } from './core/dispatch-worker-meta.js';
 import {
+  A2A_CAPABILITY_DELIVERY_V1,
+  A2A_CAPABILITY_DISPATCH_REPO_V1,
+  evaluateDispatchReadiness,
+  type A2APeerCapability,
+} from './core/a2a-readiness.js';
+import {
   appendVerifiedDeliveryInstructions,
   buildDeliveryListRows,
   buildRejectRetryContent,
@@ -5853,6 +5859,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --acceptance-hint <t> 监管者打算如何验收，随任务简报和交付记录一起传给执行者
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
   --chat-id <id>        覆盖目标群（默认当前会话所在群）
+  --skip-readiness-check 跳过已确认的群成员/版本不兼容错误（仍打印诊断）
   --session-id <id>     指定来源会话（默认自动推断）`);
     return;
   }
@@ -5872,6 +5879,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const acceptanceHint = argValue(rest, '--acceptance-hint');
   const standby = rest.includes('--standby');
   const newTopic = rest.includes('--new-topic');
+  const skipReadinessCheck = rest.includes('--skip-readiness-check');
   const botSpecs = argValues(rest, '--bot');
 
   let brief = argValue(rest, '--brief') ?? '';
@@ -6012,15 +6020,32 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const workerCliIds = workerMetas.map((meta) => meta.cliId);
   const hasWorkerMeta = workerLarkAppIds.some(Boolean) || workerCliIds.some(Boolean);
   let workerBotUnionIds: string[] = [];
+  let platformTeamBots: Array<{
+    larkAppId: string;
+    cliId: string;
+    name: string;
+    botUnionId?: string;
+    botmuxVersion?: string;
+    a2aCapabilities?: string[];
+  }> = [];
+  let federationBots: typeof platformTeamBots = [];
   try {
     const { buildFederatedRoster } = await import('./services/federation-roster.js');
     const { listBotUnionIds } = await import('./services/observed-bot-union-ids-store.js');
     const { listPlatformTeams } = await import('./services/platform-team-store.js');
     const dataDir = resolveDataDir();
     const roster = buildFederatedRoster(dataDir);
+    federationBots = roster.bots.map((bot) => ({
+      larkAppId: bot.larkAppId,
+      cliId: bot.cliId,
+      name: bot.name,
+      botUnionId: bot.botUnionId,
+      botmuxVersion: bot.botmuxVersion,
+      a2aCapabilities: bot.a2aCapabilities,
+    }));
     const botConfigByAppId = new Map(botConfigs.map((cfg) => [cfg.larkAppId, cfg]));
     const botInfoByAppId = new Map(botInfoEntries.map((entry) => [entry.larkAppId, entry]));
-    const platformTeamBots = listPlatformTeams(dataDir).flatMap((team) =>
+    platformTeamBots = listPlatformTeams(dataDir).flatMap((team) =>
       team.bots.map((bot) => {
         const info = botInfoByAppId.get(bot.appId);
         const cfg = botConfigByAppId.get(bot.appId);
@@ -6030,6 +6055,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
           cliId,
           name: bot.name?.trim() || info?.botName?.trim() || cliId || bot.appId,
           botUnionId: bot.unionId,
+          botmuxVersion: bot.botmuxVersion,
+          a2aCapabilities: bot.a2aCapabilities,
         };
       }),
     );
@@ -6040,12 +6067,54 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       workerMetas,
       platformTeamBots,
       learnedBotUnionIdsByName: listBotUnionIds(dataDir),
-      federationBots: roster.bots,
+      federationBots,
       senderScopedBotOpenIds,
     });
   } catch { /* best effort: workers without botUnionId fall back to open_id auth */ }
   const hasWorkerBotUnionIds = workerBotUnionIds.some(Boolean);
-  const { sendMessage, replyMessage } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, probeChatBotMembership } = await import('./im/lark/client.js');
+
+  let membership;
+  try {
+    membership = await probeChatBotMembership(appId, targetChatId);
+  } catch (err: any) {
+    membership = { known: false as const, members: [] as [], reason: err?.message ?? String(err) };
+  }
+  const localAppIds = new Set(botConfigs.map((cfg) => cfg.larkAppId));
+  const peers: A2APeerCapability[] = [...platformTeamBots, ...federationBots].map((bot) => ({
+    larkAppId: bot.larkAppId,
+    unionId: bot.botUnionId,
+    name: bot.name,
+    cliId: bot.cliId,
+    botmuxVersion: bot.botmuxVersion,
+    a2aCapabilities: bot.a2aCapabilities,
+  }));
+  const requiredCapabilities = taskId ? [A2A_CAPABILITY_DELIVERY_V1] : [];
+  if (needsRepo) requiredCapabilities.push(A2A_CAPABILITY_DISPATCH_REPO_V1);
+  const readiness = evaluateDispatchReadiness({
+    workers: built.mentionedOpenIds.map((openId, index) => ({
+      openId,
+      name: workerNames[index] ?? openId,
+      larkAppId: workerLarkAppIds[index] || undefined,
+      cliId: workerCliIds[index] || undefined,
+      unionId: workerBotUnionIds[index] || undefined,
+      local: !!workerLarkAppIds[index] && localAppIds.has(workerLarkAppIds[index]),
+    })),
+    membership,
+    peers,
+    requiredCapabilities,
+  });
+  for (const issue of readiness.issues) {
+    const prefix = issue.severity === 'error' ? '❌' : '⚠️';
+    console.error(`${prefix} ${issue.detail}`);
+  }
+  if (!readiness.ok && !skipReadinessCheck) {
+    console.error('派活前检查未通过。请先把执行者加入目标群或升级对端；确认要绕过时使用 --skip-readiness-check。');
+    process.exit(1);
+  }
+  if (!readiness.ok && skipReadinessCheck) {
+    console.error('⚠️ 已按 --skip-readiness-check 继续派活；接收端仍会执行协议校验。');
+  }
   try {
     // --into: append into an existing thread (activate standby bots / coordinate).
     if (intoRoot) {
@@ -6053,6 +6122,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       console.log(JSON.stringify({
         success: true, mode: 'into', threadRootId: intoRoot,
         kickoffMessageId: kickoffId, chatId: targetChatId, bots: built.mentionedOpenIds,
+        readiness: { ok: readiness.ok, issues: readiness.issues },
       }));
       return;
     }
@@ -6150,6 +6220,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       requiredRepo: needsRepo ?? null,
       chatId: targetChatId,
       bots: built.mentionedOpenIds,
+      readiness: { ok: readiness.ok, issues: readiness.issues },
     }));
   } catch (err: any) {
     console.error(`dispatch 失败: ${err.message}`);

@@ -1246,6 +1246,10 @@ type ChatBotListApiResult =
   | { ok: true; items: ChatBotListApiItem[] }
   | { ok: false; reason: string; cacheable: boolean };
 
+export type ChatBotMembershipSnapshot =
+  | { known: true; members: Array<{ openId: string; name: string }> }
+  | { known: false; members: []; reason: string };
+
 function promiseWithTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return p;
   let timer: NodeJS.Timeout | undefined;
@@ -1264,24 +1268,59 @@ async function listChatBotsViaMembersBots(
 ): Promise<ChatBotListApiResult> {
   try {
     const c = getBotClient(larkAppId);
-    const res = await promiseWithTimeout(
-      larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/bots`),
-      timeoutMs,
-      'list chat bot members',
-    );
-    if (res?.code !== 0) return { ok: false, reason: `code=${res?.code ?? 'unknown'} msg=${res?.msg ?? ''}`, cacheable: false };
-    const rawItems = res?.data?.items;
-    if (!Array.isArray(rawItems)) return { ok: false, reason: 'invalid_items', cacheable: true };
-    const items = rawItems
-      .map((it: any) => ({
-        botId: String(it?.bot_id ?? '').trim(),
-        botName: String(it?.bot_name ?? '').trim(),
-      }))
-      .filter((it: ChatBotListApiItem) => it.botId && it.botName);
-    return { ok: true, items };
+    const items: ChatBotListApiItem[] = [];
+    let pageToken = '';
+    for (let page = 0; page < 100; page++) {
+      const res = await promiseWithTimeout(
+        larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/bots`, {
+          page_size: 100,
+          page_token: pageToken || undefined,
+        }),
+        timeoutMs,
+        'list chat bot members',
+      );
+      if (res?.code !== 0) return { ok: false, reason: `code=${res?.code ?? 'unknown'} msg=${res?.msg ?? ''}`, cacheable: false };
+      const rawItems = res?.data?.items;
+      if (!Array.isArray(rawItems)) return { ok: false, reason: 'invalid_items', cacheable: true };
+      items.push(...rawItems
+        .map((it: any) => ({
+          botId: String(it?.bot_id ?? '').trim(),
+          botName: String(it?.bot_name ?? '').trim(),
+        }))
+        // bot_id is the membership fact. A temporarily missing display name must
+        // not turn a real member into a hard "not in chat" false negative.
+        .filter((it: ChatBotListApiItem) => !!it.botId));
+
+      if (!res?.data?.has_more) return { ok: true, items };
+      const nextToken = String(res?.data?.page_token ?? '').trim();
+      if (!nextToken || nextToken === pageToken) {
+        return { ok: false, reason: 'invalid_pagination', cacheable: true };
+      }
+      pageToken = nextToken;
+    }
+    return { ok: false, reason: 'pagination_limit', cacheable: true };
   } catch (err: any) {
     return { ok: false, reason: err?.message ?? String(err), cacheable: true };
   }
+}
+
+/**
+ * Authoritative, observer-scoped membership probe for dispatch readiness.
+ * Unlike listChatBotMembers(), this does not silently fall back to learned or
+ * configured rows: callers must know whether absence is a real fact or merely
+ * an unavailable OpenAPI. Unknown is therefore explicit and must not block.
+ */
+export async function probeChatBotMembership(
+  larkAppId: string,
+  chatId: string,
+  timeoutMs: number = config.chatBotDiscovery.listBotsApiTimeoutMs,
+): Promise<ChatBotMembershipSnapshot> {
+  const result = await listChatBotsViaMembersBots(larkAppId, chatId, timeoutMs);
+  if (!result.ok) return { known: false, members: [], reason: result.reason };
+  return {
+    known: true,
+    members: result.items.map((item) => ({ openId: item.botId, name: item.botName })),
+  };
 }
 
 // `/members/bots` returns the observer-scoped mention handle (`bot_id`) and

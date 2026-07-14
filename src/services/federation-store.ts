@@ -25,6 +25,8 @@ export interface FederatedBot {
    *  the owner into the group by union_id (open_id is app-scoped, union_id not). */
   ownerUnionId?: string;
   ownerName?: string;
+  botmuxVersion?: string;
+  a2aCapabilities?: string[];
 }
 
 export interface FederatedDeployment {

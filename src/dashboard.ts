@@ -111,6 +111,7 @@ import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
+import { CURRENT_A2A_CAPABILITIES } from './core/a2a-readiness.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { buildGoalBoard } from './verified-delivery/goal-board.js';
 import { buildGoalAttentionBoardWithContext, withGoalAttentionLiveRisks } from './core/goal-attention.js';
@@ -3969,7 +3970,7 @@ function readBotmuxVersion(): string {
   }
 }
 /** 读本机 bots-info.json，转成上报给平台的 bot 概要（人→机器→bot + 拉群用）。 */
-function readPlatformBotsInfo(): PlatformBotInfo[] {
+function readPlatformBotsInfo(version: string = readBotmuxVersion()): PlatformBotInfo[] {
   try {
     const fp = join(config.session.dataDir, 'bots-info.json');
     if (!existsSync(fp)) return [];
@@ -4006,6 +4007,8 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
           // 自家消息回声学到的租户稳定 union_id（可能尚未学到 → undefined）。
           // 平台聚合团队 roster 用，见 bot-union-ids-store / platform-team-store。
           unionId: e.larkAppId ? getBotUnionId(config.session.dataDir, e.larkAppId) : undefined,
+          botmuxVersion: version,
+          a2aCapabilities: [...CURRENT_A2A_CAPABILITIES],
         };
       })
       .filter((b) => b.appId);
@@ -4024,7 +4027,8 @@ function startPlatformTunnelIfBound(): void {
       getDashboardPort: () => boundDashboardPort,
       getDashboardToken: () => activeToken,
       getVersion: () => version,
-      getBots: () => readPlatformBotsInfo(),
+      getA2ACapabilities: () => CURRENT_A2A_CAPABILITIES,
+      getBots: () => readPlatformBotsInfo(version),
       getTeamSyncRev: () => getPlatformTeamSyncRev(config.session.dataDir),
       onTeamSync: handlePlatformTeamSync,
       log: (msg, extra) => logger.info(`[platform-tunnel] ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`),

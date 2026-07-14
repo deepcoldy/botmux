@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  detectUnsupportedDispatchRepoRequirement,
   formatDispatchRepoRequirement,
   inspectLocalRepo,
   listRepoCapabilities,
@@ -55,6 +56,42 @@ describe('dispatch repo requirement wire format', () => {
     expect(normalizeRepoRemote('https://github.com/Acme/project.git')).toBe('github.com/Acme/project');
     expect(normalizeRepoRemote('ssh://git@github.com/Acme/project.git')).toBe('github.com/Acme/project');
     expect(normalizeRepoRemote('git@github.com:Acme/project.git')).toBe('github.com/Acme/project');
+  });
+
+  it('detects an unsupported trailing dispatch protocol without treating v1 as unsupported', () => {
+    expect(detectUnsupportedDispatchRepoRequirement([
+      '完成登录模块并自测',
+      '[botmux-dispatch v2]',
+      'taskId: task-repo-2',
+      'repo: github.com/acme/project',
+    ].join('\n'))).toEqual({
+      version: 'v2',
+      supportedVersion: 'v1',
+      taskId: 'task-repo-2',
+      repo: 'github.com/acme/project',
+    });
+    expect(detectUnsupportedDispatchRepoRequirement(formatDispatchRepoRequirement({
+      taskId: 'task-repo-1',
+      repo: 'github.com/acme/project',
+    }))).toBeNull();
+  });
+
+  it('does not treat a quoted unsupported protocol example as a real trailing machine block', () => {
+    expect(detectUnsupportedDispatchRepoRequirement([
+      '排查下面这段协议示例为何失败：',
+      '[botmux-dispatch v2]',
+      'taskId: example-task',
+      'repo: github.com/acme/example',
+      '这只是任务正文，不要执行。',
+    ].join('\n'))).toBeNull();
+    expect(detectUnsupportedDispatchRepoRequirement([
+      '排查下面的代码块：',
+      '```text',
+      '[botmux-dispatch v2]',
+      'taskId: example-task',
+      'repo: github.com/acme/example',
+      '```',
+    ].join('\n'))).toBeNull();
   });
 });
 
