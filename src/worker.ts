@@ -6149,6 +6149,15 @@ function _endScrollBurst(){
   clearTimeout(_scrollBurstT);_scrollBurstT=0;
   _scrollAccum=0;_scrollBurstTicks=0;_scrollBurstDir=0;
 }
+// Snapshot-backed remote TUIs can still accumulate useful local xterm history.
+// Consume it first; request another remote chunk only when the user pushes past
+// the local top/bottom boundary in that direction.
+function _canScrollLocal(px){
+  var b=term.buffer.active;
+  if(b.type==='alternate'||!px)return false;
+  if(!remoteScroll)return true;
+  return px<0?b.viewportY>0:b.viewportY<b.baseY;
+}
 // Map a viewport pixel (clientX/Y) to a 1-based terminal cell "col;row", clamped to
 // the grid. The forwarded SGR wheel event MUST carry the cell UNDER THE POINTER, the
 // way a physical terminal reports it: zone-routed alt-screen TUIs — OpenCode (Bubble
@@ -6190,15 +6199,15 @@ function _fwdScroll(px,coord){
 }
 if(!${isTmuxMode && !isPipeMode}){
   document.getElementById('terminal').addEventListener('wheel',function(e){
-    if(!remoteScroll&&term.buffer.active.type!=='alternate'){
+    // Normalise deltaMode to px: line→~16px, page→~one screen.
+    var px=e.deltaMode===1?e.deltaY*16:e.deltaMode===2?e.deltaY*term.rows*16:e.deltaY;
+    if(_canScrollLocal(px)){
       // Normal buffer: xterm scrolls its own scrollback natively. In read-only a
       // mouse-mode CLI could swallow the wheel, so drive scrollback directly.
-      if(!hasToken){e.preventDefault();e.stopPropagation();term.scrollLines(e.deltaY>0?3:-3);}
+      if(!hasToken){e.preventDefault();e.stopPropagation();term.scrollLines(px>0?3:-3);}
       return;
     }
     e.preventDefault();e.stopPropagation();
-    // Normalise deltaMode to px: line→~16px, page→~one screen.
-    var px=e.deltaMode===1?e.deltaY*16:e.deltaMode===2?e.deltaY*term.rows*16:e.deltaY;
     _fwdScroll(px,_cellAt(e.clientX,e.clientY)); // report the cell under the pointer
   },{capture:true,passive:false});
 }
@@ -6520,13 +6529,14 @@ if(!${isTmuxMode && !isPipeMode}){
     if(_tLastY===null||e.touches.length!==1)return;
     e.preventDefault();e.stopPropagation();
     var y=e.touches[0].clientY;
-    if(!remoteScroll&&term.buffer.active.type!=='alternate'){
+    var px=_tLastY-y;
+    if(_canScrollLocal(px)){
       if(_tViewport)_tViewport.scrollTop-=y-_tLastY;
       else term.scrollLines(y>_tLastY?-1:1);
       _tLastY=y;return;
     }
     // finger drags down (y grows) → px<0 → scroll up (history); report the touched cell
-    _fwdScroll(_tLastY-y,_cellAt(e.touches[0].clientX,y));
+    _fwdScroll(px,_cellAt(e.touches[0].clientX,y));
     _tLastY=y;
   },{capture:true,passive:false});
   _tTerm.addEventListener('touchend',function(){_tLastY=null;_endScrollBurst()},{capture:true,passive:true});

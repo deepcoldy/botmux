@@ -17,8 +17,8 @@ describe('web terminal touch scrolling', () => {
     expect(workerSource).toContain('var remoteScroll=${forceRemoteScroll};');
 
     const wheelBlock = scriptBlock('// ── Wheel / touch scroll handling ──');
-    expect(wheelBlock).toContain("if(!remoteScroll&&term.buffer.active.type!=='alternate'){");
-    expect(wheelBlock.indexOf("if(!remoteScroll&&term.buffer.active.type!=='alternate'){"))
+    expect(wheelBlock).toContain('if(_canScrollLocal(px)){');
+    expect(wheelBlock.indexOf('if(_canScrollLocal(px)){'))
       .toBeLessThan(wheelBlock.indexOf('_fwdScroll(px,_cellAt'));
   });
 
@@ -31,14 +31,25 @@ describe('web terminal touch scrolling', () => {
     expect(wheelBlock).toContain('if(_scrollBurstTicks>=_SCROLL_BURST_MAX)_scrollAccum=0');
   });
 
+  it('uses local scrollback before requesting another remote history chunk', () => {
+    const wheelBlock = scriptBlock('// ── Wheel / touch scroll handling ──');
+    const touchBlock = scriptBlock('// Single-finger touch scrolling:');
+
+    expect(wheelBlock).toContain('function _canScrollLocal(px){');
+    expect(wheelBlock).toContain("if(b.type==='alternate'||!px)return false");
+    expect(wheelBlock).toContain('return px<0?b.viewportY>0:b.viewportY<b.baseY');
+    expect(wheelBlock).toContain('if(_canScrollLocal(px)){');
+    expect(touchBlock).toContain('if(_canScrollLocal(px)){');
+  });
+
   it('drives normal-buffer scroll explicitly instead of relying on WebView defaults', () => {
     const touchBlock = scriptBlock('// Single-finger touch scrolling:');
 
     expect(touchBlock).toContain("var _tViewport=document.querySelector('#terminal .xterm-viewport')");
-    expect(touchBlock).toContain("if(!remoteScroll&&term.buffer.active.type!=='alternate'){");
+    expect(touchBlock).toContain('if(_canScrollLocal(px)){');
     expect(touchBlock).toContain('_tViewport.scrollTop-=y-_tLastY');
-    expect(touchBlock.indexOf("if(!remoteScroll&&term.buffer.active.type!=='alternate'){"))
-      .toBeLessThan(touchBlock.indexOf('_fwdScroll(_tLastY-y'));
+    expect(touchBlock.indexOf('if(_canScrollLocal(px)){'))
+      .toBeLessThan(touchBlock.indexOf('_fwdScroll(px'));
   });
 
   it('prevents xterm from double-driving handled single-touch moves', () => {
