@@ -35,7 +35,7 @@ import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { AskArgsError, parseAskOptions } from './core/ask-args.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, buildReportText, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
-import { normalizeRepoRemote } from './core/repo-requirement.js';
+import { inspectLocalRepo, normalizeRepoRemote } from './core/repo-requirement.js';
 import { normalizeDispatchBotsForSender, resolveDispatchWorkerBotUnionIds, resolveDispatchWorkerMetas } from './core/dispatch-worker-meta.js';
 import {
   A2A_CAPABILITY_DELIVERY_V1,
@@ -95,6 +95,7 @@ import { logger } from './utils/logger.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
+import { buildGoalStartBrief, buildGoalStartRetryCommand, resolveGoalStartInvitee, resolveGoalStartSelection, type GoalStartBot, type GoalStartTeam } from './cli/goal-start.js';
 import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-liveness.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
@@ -2870,6 +2871,7 @@ interface SessionData {
   webPort?: number;
   larkAppId?: string;
   ownerOpenId?: string;
+  ownerUnionId?: string;
   creatorOpenId?: string;
   lastCallerOpenId?: string;
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
@@ -4508,6 +4510,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   whiteboard status|enable|disable
                        本地项目白板（默认关闭；enable 只打开能力，不创建白板）
        current --create / list / read / update / write --yes
+  goal start           选择团队/执行者/项目，创建或复用真实群并启动监管者
   goal supervise       在 goal 群启动 L2 监管会话（daemon-native，不依赖自 @ 路由）
 
 定时任务（可在 CLI 会话内自动推断 chat）:
@@ -8068,11 +8071,362 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
   }));
 }
 
+interface GoalSuperviseCliRequest {
+  larkAppId: string;
+  chatId: string;
+  parentChatId: string;
+  parentRoot?: string;
+  title: string;
+  brief?: string;
+  workingDir?: string;
+  parentSessionId?: string;
+}
+
+async function requestGoalSupervisor(input: GoalSuperviseCliRequest): Promise<any> {
+  const daemon = findDaemon(input.larkAppId);
+  if (!daemon) throw new Error(`未找到在线监管者 daemon (larkAppId=${input.larkAppId})`);
+
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/supervise`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+  } catch (err: any) {
+    throw new Error(`无法连接监管者 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
+  }
+  let body: any = {};
+  try { body = await res.json(); } catch { /* */ }
+  if (!res.ok || !body?.ok) throw new Error(body?.error ?? res.statusText);
+  return body;
+}
+
+async function cmdGoalStart(rest: string[]): Promise<void> {
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const title = argValue(rest, '--title')?.trim() ?? '';
+  const workerRefs = argValues(rest, '--worker');
+  const teamRef = argValue(rest, '--team');
+  const supervisorRef = argValue(rest, '--supervisor');
+  const existingChatId = argValue(rest, '--chat-id')?.trim();
+  const groupName = argValue(rest, '--group-name', '--name')?.trim();
+  const projectArg = argValue(rest, '--project')?.trim();
+  const workingDirArg = argValue(rest, '--working-dir')?.trim();
+  const sessionIdArg = argValue(rest, '--session-id');
+  const briefFile = argValue(rest, '--brief-file');
+  const skipReadinessCheck = rest.includes('--skip-readiness-check');
+  let brief = argValue(rest, '--brief') ?? '';
+  if (briefFile) {
+    if (!existsSync(briefFile)) { console.error(`文件不存在: ${briefFile}`); process.exit(1); }
+    brief = readFileSync(briefFile, 'utf-8');
+  }
+  if (!title) { console.error('goal start 需要 --title <目标标题>'); process.exit(1); }
+  if (workerRefs.length === 0) { console.error('goal start 至少需要一个 --worker <执行者>'); process.exit(1); }
+
+  const sid = sessionIdArg ?? findAncestorSessionId();
+  if (!sid) {
+    console.error('无法推断主控会话。请在主控 CLI 会话里运行，或传 --session-id <id>。');
+    process.exit(1);
+  }
+  const parent = loadSessions().get(sid);
+  if (!parent?.larkAppId) {
+    console.error(`主控会话 ${sid} 不存在或缺少 larkAppId。`);
+    process.exit(1);
+  }
+  if (!parent.chatId) {
+    console.error(`主控会话 ${sid} 缺少 chatId。`);
+    process.exit(1);
+  }
+
+  const dataDir = resolveDataDir();
+  const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+  const fullConfigs = loadBotConfigs();
+  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
+  let botInfoEntries: BotInfoEntry[] = [];
+  try {
+    const path = join(dataDir, 'bots-info.json');
+    if (existsSync(path)) botInfoEntries = JSON.parse(readFileSync(path, 'utf-8'));
+  } catch { /* best effort */ }
+  const infoByAppId = new Map(botInfoEntries.map((entry) => [entry.larkAppId, entry]));
+  const localAppIds = new Set(fullConfigs.map((config) => config.larkAppId));
+  const localBots: GoalStartBot[] = fullConfigs.map((config) => ({
+    larkAppId: config.larkAppId,
+    cliId: config.cliId,
+    name: infoByAppId.get(config.larkAppId)?.botName?.trim() || config.cliId || config.larkAppId,
+    openId: infoByAppId.get(config.larkAppId)?.botOpenId?.trim() || undefined,
+    local: true,
+  }));
+
+  const { listPlatformTeams, isPlatformHallChat } = await import('./services/platform-team-store.js');
+  const teams: GoalStartTeam[] = listPlatformTeams(dataDir).map((team) => ({
+    teamId: team.teamId,
+    teamName: team.teamName,
+    memberUnionIds: team.memberUnionIds,
+    bots: team.bots.map((bot) => ({
+      larkAppId: bot.appId,
+      name: bot.name?.trim() || infoByAppId.get(bot.appId)?.botName?.trim() || bot.appId,
+      cliId: infoByAppId.get(bot.appId)?.cliId,
+      openId: infoByAppId.get(bot.appId)?.botOpenId?.trim() || undefined,
+      unionId: bot.unionId,
+      botmuxVersion: bot.botmuxVersion,
+      a2aCapabilities: bot.a2aCapabilities,
+      local: localAppIds.has(bot.appId),
+    })),
+  }));
+
+  const selectionResult = resolveGoalStartSelection({
+    parentLarkAppId: parent.larkAppId,
+    supervisorRef,
+    workerRefs,
+    teamRef,
+    localBots,
+    teams,
+  });
+  if (!selectionResult.ok) {
+    console.error(`goal start 配置无效：${selectionResult.error}`);
+    if (teams.length > 0) console.error(`可用平台团队：${teams.map((team) => `${team.teamName} (${team.teamId})`).join('；')}`);
+    console.error(`本机可选监管者：${localBots.map((bot) => `${bot.name} (${bot.larkAppId})`).join('；')}`);
+    process.exit(1);
+  }
+  const selection = selectionResult.value;
+  const hasRemoteWorker = selection.workers.some((worker) => !worker.local);
+  for (const warning of selectionResult.warnings) console.error(`⚠️ ${warning}`);
+  if (!findDaemon(selection.supervisor.larkAppId)) {
+    console.error(`监管者 ${selection.supervisor.name} 的 daemon 不在线。`);
+    process.exit(1);
+  }
+  const supervisorConfig = fullConfigs.find((config) => config.larkAppId === selection.supervisor.larkAppId);
+  if (!supervisorConfig) {
+    console.error(`监管者 ${selection.supervisor.name} 没有本机配置。`);
+    process.exit(1);
+  }
+  registerBot(supervisorConfig);
+
+  if (projectArg && workingDirArg) {
+    console.error('--project 和 --working-dir 不要同时传；--project 已能接受本地目录或 Git remote。');
+    process.exit(1);
+  }
+  let localWorkingDir: string | undefined;
+  let requiredRepo: string | undefined;
+  if (projectArg) {
+    const dir = validateWorkingDir(projectArg);
+    if (dir.ok) {
+      localWorkingDir = dir.resolvedPath;
+      const inspected = inspectLocalRepo(localWorkingDir);
+      if (inspected.ok) {
+        localWorkingDir = inspected.path;
+        requiredRepo = inspected.remoteIdentity;
+      } else if (hasRemoteWorker) {
+        console.error(`本地项目没有可供远端机器识别的 origin：${inspected.detail}。请配置 origin，或把 --project 改为 Git remote。`);
+        process.exit(1);
+      }
+    } else {
+      const remote = normalizeRepoRemote(projectArg);
+      if (!remote) {
+        console.error(`--project 既不是可用本地目录，也不是可识别的 Git remote：${projectArg}`);
+        process.exit(1);
+      }
+      requiredRepo = remote;
+    }
+  } else if (workingDirArg) {
+    const dir = validateWorkingDir(workingDirArg);
+    if (!dir.ok) { console.error(`--working-dir ${dir.error}`); process.exit(1); }
+    localWorkingDir = dir.resolvedPath;
+    const inspected = inspectLocalRepo(localWorkingDir);
+    if (inspected.ok) {
+      localWorkingDir = inspected.path;
+      requiredRepo = inspected.remoteIdentity;
+    } else if (hasRemoteWorker) {
+      console.error(`--working-dir 指向的项目没有可供远端机器识别的 origin：${inspected.detail}。请配置 origin，或改用 --project <Git remote>。`);
+      process.exit(1);
+    }
+  } else if (parent.workingDir) {
+    const dir = validateWorkingDir(parent.workingDir);
+    if (dir.ok) {
+      localWorkingDir = dir.resolvedPath;
+      const inspected = inspectLocalRepo(localWorkingDir);
+      if (inspected.ok) {
+        localWorkingDir = inspected.path;
+        requiredRepo = inspected.remoteIdentity;
+      }
+    }
+  }
+  const retryProject = projectArg ?? workingDirArg;
+  if (hasRemoteWorker && !requiredRepo && !projectArg && !workingDirArg) {
+    console.error('⚠️ 当前目标包含远端执行者，但没有项目仓库要求。如果这是代码任务，请传 --project <本地目录|Git remote>；非代码任务可继续。');
+  }
+
+  const effectiveBrief = buildGoalStartBrief({
+    brief,
+    teamName: selection.team?.teamName,
+    supervisorName: selection.supervisor.name,
+    workers: selection.workers.map((worker) => ({
+      name: worker.name,
+      larkAppId: worker.larkAppId,
+      local: worker.local,
+    })),
+    localWorkingDir,
+    requiredRepo,
+  });
+
+  let chatId = existingChatId;
+  let groupCreated = false;
+  let groupResult: any;
+  if (chatId && isPlatformHallChat(dataDir, chatId)) {
+    console.error('平台机器人大厅不能作为目标群。请新建目标群，或传另一个真实协作群的 --chat-id。');
+    process.exit(1);
+  }
+
+  if (chatId) {
+    const { probeChatBotMembership } = await import('./im/lark/client.js');
+    let membership;
+    try {
+      membership = await probeChatBotMembership(selection.supervisor.larkAppId, chatId);
+    } catch (err: any) {
+      membership = { known: false as const, members: [] as [], reason: err?.message ?? String(err) };
+    }
+    const readiness = evaluateDispatchReadiness({
+      workers: [selection.supervisor, ...selection.workers].map((bot) => ({
+        openId: bot.openId ?? bot.larkAppId,
+        name: bot.name,
+        larkAppId: bot.larkAppId,
+        cliId: bot.cliId,
+        unionId: bot.unionId,
+        local: bot.local,
+      })),
+      membership,
+      peers: selection.team?.bots,
+    });
+    for (const issue of readiness.issues) console.error(`${issue.severity === 'error' ? '❌' : '⚠️'} ${issue.detail}`);
+    if (!readiness.ok && !skipReadinessCheck) {
+      console.error('目标群成员不完整，未启动监管者。请先把缺少的机器人加入群；确认要绕过时使用 --skip-readiness-check。');
+      process.exit(1);
+    }
+    if (!readiness.ok && skipReadinessCheck) {
+      console.error('⚠️ 已按 --skip-readiness-check 继续启动；后续派活和接收端仍会独立校验。');
+    }
+  } else {
+    const { getDeploymentIdentity } = await import('./services/deployment-identity.js');
+    const invitee = resolveGoalStartInvitee({
+      lastCallerOpenId: parent.lastCallerOpenId,
+      ownerOpenId: parent.ownerOpenId,
+      ownerUnionId: parent.ownerUnionId,
+      deploymentOwnerUnionId: getDeploymentIdentity(dataDir).ownerUnionId,
+      callerIsBot: parent.quoteTargetSenderIsBot,
+    });
+    let callerOpenId = invitee.openId;
+    const callerUnionId = invitee.unionId;
+    if (!callerOpenId && !callerUnionId) {
+      const { resolveAllowedUsers } = await import('./im/lark/client.js');
+      try {
+        callerOpenId = (await resolveAllowedUsers(selection.supervisor.larkAppId, supervisorConfig.allowedUsers ?? []))[0];
+      } catch { /* handled by the identity check below */ }
+    }
+    if (!callerOpenId && !callerUnionId) {
+      console.error('无法识别目标发起人，未创建目标群。请从飞书主控会话重试，或先配置 deployment owner。');
+      process.exit(1);
+    }
+    const { createGroupWithBots } = await import('./services/group-creator.js');
+    try {
+      groupResult = await createGroupWithBots({
+        creatorLarkAppId: selection.supervisor.larkAppId,
+        larkAppIds: [selection.supervisor.larkAppId, ...selection.workers.map((worker) => worker.larkAppId)],
+        name: groupName || title,
+        userOpenIds: callerOpenId ? [callerOpenId] : [],
+        ownerUnionIds: callerUnionId ? [callerUnionId] : [],
+        transferOwnerTo: callerOpenId,
+        notifyOwnerOpenId: callerOpenId,
+      });
+    } catch (err: any) {
+      console.error(`目标群创建失败：${err?.message ?? err}`);
+      process.exit(1);
+    }
+    chatId = groupResult.chatId;
+    groupCreated = true;
+    const callerInvited = Boolean(
+      (callerOpenId && !groupResult.invalidUserIds.includes(callerOpenId))
+      || (callerUnionId && !groupResult.invalidOwnerUnionIds.includes(callerUnionId)),
+    );
+    if (groupResult.invalidBotIds.length > 0 || !callerInvited) {
+      const retryCommand = buildGoalStartRetryCommand({
+        chatId: chatId!, title, teamId: selection.team?.teamId, workers: selection.workers,
+        project: retryProject, brief, sessionId: sid, skipReadinessCheck,
+      });
+      if (groupResult.invalidBotIds.length > 0) {
+        console.error(`目标群已创建，但这些执行者未能入群：${groupResult.invalidBotIds.join(', ')}`);
+      }
+      if (!callerInvited) console.error('目标群已创建，但发起人未能入群。');
+      console.error(`群已保留，补齐成员后续跑：${retryCommand}`);
+      console.log(JSON.stringify({
+        success: false,
+        stage: 'group_members',
+        chatId,
+        shareLink: groupResult.shareLink,
+        invalidBotIds: groupResult.invalidBotIds,
+        invalidUserIds: groupResult.invalidUserIds,
+        invalidOwnerUnionIds: groupResult.invalidOwnerUnionIds,
+        retryCommand,
+      }, null, 2));
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  if (selection.team) {
+    const { recordTeamGroup } = await import('./services/team-groups-store.js');
+    recordTeamGroup(dataDir, selection.team.teamId, chatId!);
+  }
+
+  let supervised: any;
+  try {
+    supervised = await requestGoalSupervisor({
+      larkAppId: selection.supervisor.larkAppId,
+      chatId: chatId!,
+      parentChatId: parent.chatId,
+      parentRoot: parent.rootMessageId,
+      title,
+      brief: effectiveBrief,
+      workingDir: localWorkingDir,
+      parentSessionId: sid,
+    });
+  } catch (err: any) {
+    const retryCommand = buildGoalStartRetryCommand({
+      chatId: chatId!, title, teamId: selection.team?.teamId, workers: selection.workers,
+      project: retryProject, brief, sessionId: sid, skipReadinessCheck,
+    });
+    console.error(`${groupCreated ? '目标群已创建，但' : ''}监管者启动失败：${err?.message ?? err}`);
+    console.error(`群不会删除。修复后续跑：${retryCommand}`);
+    console.log(JSON.stringify({ success: false, stage: 'supervise', chatId, shareLink: groupResult?.shareLink, retryCommand }, null, 2));
+    process.exitCode = 1;
+    return;
+  }
+
+  const link = groupResult?.shareLink ?? chatAppLink(chatId!, botBrand(supervisorConfig));
+  console.error(`✅ 目标已启动：${title}`);
+  console.error(`✅ 目标群：${link}`);
+  console.error(`✅ 监管者：${selection.supervisor.name}；执行者：${selection.workers.map((worker) => worker.name).join('、')}`);
+  console.log(JSON.stringify({
+    success: true,
+    createdGroup: groupCreated,
+    chatId,
+    chatLink: link,
+    team: selection.team ? { id: selection.team.teamId, name: selection.team.teamName } : undefined,
+    supervisor: { name: selection.supervisor.name, larkAppId: selection.supervisor.larkAppId, sessionId: supervised.sessionId ?? supervised.supervisorSessionId },
+    workers: selection.workers.map((worker) => ({ name: worker.name, larkAppId: worker.larkAppId, local: worker.local })),
+    project: { workingDir: localWorkingDir, repo: requiredRepo },
+  }, null, 2));
+}
+
 async function cmdGoal(sub: string, rest: string[]): Promise<void> {
   if (!sub || sub === '--help' || sub === '-h' || rest.includes('--help') || rest.includes('-h')) {
     console.log(`botmux goal — goal 群监管会话工具
 
 用法:
+  botmux goal start --title <目标标题> --worker <执行者> [--worker ...] \\
+      [--team <平台团队名称|id>] [--supervisor <本机监管者>] \\
+      [--chat-id <已有目标群> | --group-name <新群名>] \\
+      [--project <本地目录|Git remote>] [--brief <text> | --brief-file <path>] \\
+      [--skip-readiness-check] [--session-id <主控会话id>]
   botmux goal supervise --chat-id <goal群chatId> --title <goal标题> \\
       [--parent-chat-id <主群chatId>] [--parent-root <主话题rootMessageId>] \\
       [--brief <text> | --brief-file <path>] [--working-dir <path>] [--session-id <L1会话id>]
@@ -8083,6 +8437,8 @@ async function cmdGoal(sub: string, rest: string[]): Promise<void> {
   botmux goal charter path --goal <goal群chatId>
 
 说明:
+  goal start 是推荐入口：解析平台团队和执行者，创建或核验真实目标群，并立即启动监管者。
+  当前监管者必须是主控会话所属的本机在线 bot；这是为了保证完成/求助能可靠回报主控。
   daemon-native 地在 goal 群起一个 chat-scope L2 supervisor 会话，绕开 Lark 自消息不会路由的限制。
   默认从当前 L1 会话推断 parent-chat-id / parent-root / working-dir / bot daemon。
   goal charter 复用 whiteboard 存储/CAS，但不受全局 whiteboard enable 开关控制，也不会自动注入任何会话。`);
@@ -8094,6 +8450,10 @@ async function cmdGoal(sub: string, rest: string[]): Promise<void> {
   }
   if (sub === 'notify-parent') {
     await cmdGoalNotifyParent(rest);
+    return;
+  }
+  if (sub === 'start') {
+    await cmdGoalStart(rest);
     return;
   }
   if (sub !== 'supervise') {
@@ -8140,39 +8500,22 @@ async function cmdGoal(sub: string, rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const daemon = findDaemon(larkAppId);
-  if (!daemon) {
-    console.error(`未找到在线 daemon (larkAppId=${larkAppId})。`);
-    process.exit(1);
-  }
-
-  let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/supervise`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        larkAppId,
-        chatId,
-        parentChatId,
-        parentRoot,
-        title: title.trim(),
-        brief,
-        workingDir,
-        parentSessionId: sid,
-      }),
+    const body = await requestGoalSupervisor({
+      larkAppId,
+      chatId,
+      parentChatId,
+      parentRoot,
+      title: title.trim(),
+      brief,
+      workingDir,
+      parentSessionId: sid ?? undefined,
     });
+    console.log(JSON.stringify({ success: true, ...body }, null, 2));
   } catch (err: any) {
-    console.error(`无法连接 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
+    console.error(`goal supervise 失败: ${err?.message ?? err}`);
     process.exit(1);
   }
-  let body: any = {};
-  try { body = await res.json(); } catch { /* */ }
-  if (!res.ok || !body?.ok) {
-    console.error(`goal supervise 失败: ${body?.error ?? res.statusText}`);
-    process.exit(1);
-  }
-  console.log(JSON.stringify({ success: true, ...body }, null, 2));
 }
 
 async function cmdGoalNotifyParent(rest: string[]): Promise<void> {

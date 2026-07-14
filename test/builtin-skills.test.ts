@@ -190,6 +190,19 @@ describe('built-in botmux-handoff skill', () => {
 });
 
 describe('built-in botmux-orchestrate skill', () => {
+  it('teaches the product entry that creates a real goal group and starts supervision', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-orchestrate');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('botmux goal start');
+    expect(skill!.content).toContain('--team');
+    expect(skill!.content).toContain('--project');
+    expect(skill!.content).toContain('--chat-id <goalChatId>');
+    expect(skill!.content).toContain('平台机器人大厅会被拒绝');
+    expect(skill!.content).toContain('当前 L1 会话所属的本机在线 bot');
+    expect(skill!.content).toContain('新目标群只邀请当前目标的发起人');
+    expect(skill!.content).toContain('本机项目没有 origin 时必须先报错');
+  });
+
   it('teaches L2 how to execute dashboard panel actions through the ledger workflow', () => {
     const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-orchestrate');
     expect(skill).toBeDefined();
