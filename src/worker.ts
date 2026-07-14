@@ -6482,29 +6482,34 @@ if(isTouch&&hasToken){
   _scheduleToolbarLayout();_wakeToolbar();
 }
 
-// Single-finger touch scrolling: normal-buffer CLIs use xterm's own Viewport
-// (handleTouchMove → scrollTop) natively. Alt-screen CLIs (Claude) have no xterm
-// scrollback, so native touch scroll does nothing — mirror the wheel fix and
-// forward the drag to the CLI as SGR wheel events so it scrolls its own
-// transcript. Only the alternate buffer is intercepted (capture + stopPropagation);
-// the normal buffer falls through to xterm untouched, so no double-drive of
-// scrollTop. overscroll-behavior:none (see <style>) kills the iOS rubber-band.
+// Single-finger touch scrolling: drive normal-buffer scrollback explicitly.
+// Some embedded WebViews do not perform xterm/browser native touch scrolling
+// when touch-action is restricted for pinch zoom. Handling in capture phase and
+// stopping propagation also prevents xterm from double-driving the viewport.
+// Alt-screen CLIs have no xterm scrollback, so forward the drag as SGR wheel
+// events and let the CLI scroll its own transcript.
 if(!${isTmuxMode && !isPipeMode}){
   var _tTerm=document.getElementById('terminal');
+  var _tViewport=document.querySelector('#terminal .xterm-viewport');
   var _tLastY=null;
   _tTerm.addEventListener('touchstart',function(e){
     if(e.touches.length===1)_tLastY=e.touches[0].clientY;
   },{capture:true,passive:true});
   _tTerm.addEventListener('touchmove',function(e){
-    // Normal buffer / multi-touch / no start → let xterm (or the browser) handle it.
-    if(term.buffer.active.type!=='alternate'||_tLastY===null||e.touches.length!==1)return;
+    if(_tLastY===null||e.touches.length!==1)return;
     e.preventDefault();e.stopPropagation();
     var y=e.touches[0].clientY;
+    if(term.buffer.active.type!=='alternate'){
+      if(_tViewport)_tViewport.scrollTop-=y-_tLastY;
+      else term.scrollLines(y>_tLastY?-1:1);
+      _tLastY=y;return;
+    }
     // finger drags down (y grows) → px<0 → scroll up (history); report the touched cell
     _fwdScroll(_tLastY-y,_cellAt(e.touches[0].clientX,y));
     _tLastY=y;
   },{capture:true,passive:false});
   _tTerm.addEventListener('touchend',function(){_tLastY=null;},{capture:true,passive:true});
+  _tTerm.addEventListener('touchcancel',function(){_tLastY=null;},{capture:true,passive:true});
 }
 </script>
 </body>
