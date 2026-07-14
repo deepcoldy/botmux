@@ -11,6 +11,7 @@
 // model. The "核验" stage lights amber while a report awaits verification — exactly
 // the gap the goal-watchdog fills, made visible.
 import { escapeHtml, relTime, loadNameMaps, botNameForOpenId, botNameForAppId, chatNameForId } from './ui.js';
+import { isMissingRepoBlocker } from '../../core/repo-help.js';
 
 interface AcceptanceCheck { type: 'exists' | 'contains'; text?: string }
 interface AcceptanceArtifact { path: string; kind?: string; checks: AcceptanceCheck[] }
@@ -84,7 +85,7 @@ const HELP_KIND_LABEL: Record<string, string> = {
  *  uses the same sniff) — surface it as its own label wherever help kind shows. */
 function helpKindLabel(help?: { blocker: string; kind?: string }): string {
   if (!help) return '求助';
-  if (help.kind === 'access' && help.blocker.trim().startsWith('缺少项目环境：')) return '缺项目环境';
+  if (help.kind === 'access' && isMissingRepoBlocker(help.blocker)) return '缺项目环境';
   return HELP_KIND_LABEL[help.kind ?? 'other'] ?? '求助';
 }
 

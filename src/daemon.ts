@@ -273,8 +273,10 @@ import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js';
 import { emitGoalNarration } from './verified-delivery/narration.js';
 import { openLedger } from './verified-delivery/ledger.js';
-import { detectUnsupportedDeliveryEnvelope, formatHelpEnvelope, parseDeliveryEnvelope, type EnvelopeEvidence } from './verified-delivery/envelope.js';
+import { detectUnsupportedDeliveryEnvelope, formatHelpEnvelope, parseDeliveryEnvelope } from './verified-delivery/envelope.js';
+import { ingestParsedDeliveryEnvelope } from './verified-delivery/envelope-ingest.js';
 import { detectUnsupportedDispatchRepoRequirement, formatDispatchRepoRequirement, inspectLocalRepoAsync, parseDispatchRepoRequirement, resolveRepoRequirement } from './core/repo-requirement.js';
+import { buildMissingRepoBlocker } from './core/repo-help.js';
 import {
   DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
   injectGoalSupervisorTurn,
@@ -285,7 +287,7 @@ import {
   type GoalWatchdogReassignResult,
   type GoalWatchdogResult,
 } from './core/goal-watchdog.js';
-import type { Evidence, HelpKind, TaskView } from './verified-delivery/types.js';
+import type { HelpKind, TaskView } from './verified-delivery/types.js';
 import {
   setCardDispatcher as setAskCardDispatcher,
   setCanTalkChecker as setAskCanTalkChecker,
@@ -15607,12 +15609,6 @@ function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
   return 'Bot';
 }
 
-function envelopeEvidenceToLedgerEvidence(ev: EnvelopeEvidence, ledger: ReturnType<typeof openLedger>): Evidence {
-  if (ev.kind === 'inline') return ledger.writeInlineEvidence(ev.text, ev.name);
-  if (ev.kind === 'path') return { kind: 'path', path: ev.path };
-  return { kind: 'url', url: ev.url };
-}
-
 interface DispatchRepoPreflightResult {
   handled: boolean;
   workingDir?: string;
@@ -15638,7 +15634,7 @@ async function sendDispatchRepoAccessHelp(input: {
   blocker?: string;
   helpKind?: HelpKind;
 }): Promise<void> {
-  const blocker = input.blocker ?? `缺少项目环境：${input.repo}${input.detail ? `（${input.detail}）` : ''}`;
+  const blocker = input.blocker ?? buildMissingRepoBlocker(input.repo, input.detail);
   const envelope = formatHelpEnvelope({
     taskId: input.taskId,
     helpKind: input.helpKind ?? 'access',
@@ -15803,65 +15799,34 @@ async function maybeIngestDeliveryEnvelope(input: {
     return true;
   }
 
-  const ledger = openLedger();
-  const task = ledger.task(envelope.taskId);
-  if (!task || task.chatId !== goalChatId) {
-    logger.warn(`[delivery-envelope] unknown/wrong-goal task=${envelope.taskId} goal=${goalChatId} msg=${input.parsed.messageId}`);
+  const result = ingestParsedDeliveryEnvelope({
+    envelope,
+    ledger: openLedger(),
+    goalChatId,
+    senderOpenId,
+    senderUnionId,
+    messageId: input.parsed.messageId,
+    now: Date.now(),
+  });
+  if (result.outcome === 'unknown_task') {
+    logger.warn(`[delivery-envelope] unknown/wrong-goal task=${result.taskId} goal=${goalChatId} msg=${input.parsed.messageId}`);
     return true;
   }
-  const allowedUnionIds = (task.workerBotUnionIds ?? []).map((id) => id?.trim()).filter(Boolean);
-  const allowedOpenIds = task.workerOpenIds ?? [];
-  const unionAuthorized = !!senderUnionId && allowedUnionIds.includes(senderUnionId);
-  const openIdAuthorized = allowedOpenIds.includes(senderOpenId);
-  if (!unionAuthorized && !openIdAuthorized) {
-    logger.warn(`[delivery-envelope] unauthorized senderOpenId=${senderOpenId} senderUnionId=${senderUnionId ?? ''} task=${envelope.taskId} goal=${goalChatId} msg=${input.parsed.messageId} allowedOpenIds=[${allowedOpenIds.join(',')}] allowedUnionIds=[${allowedUnionIds.join(',')}] app=${input.larkAppId}`);
+  if (result.outcome === 'unauthorized') {
+    logger.warn(`[delivery-envelope] unauthorized senderOpenId=${senderOpenId} senderUnionId=${senderUnionId ?? ''} task=${result.taskId} goal=${goalChatId} msg=${input.parsed.messageId} allowedOpenIds=[${result.allowedOpenIds.join(',')}] allowedUnionIds=[${result.allowedUnionIds.join(',')}] app=${input.larkAppId}`);
     return true;
   }
-
-  if (envelope.kind === 'report') {
-    if (envelope.evidence.length === 0) {
-      logger.warn(`[delivery-envelope] report without evidence ignored task=${envelope.taskId} msg=${input.parsed.messageId}`);
-      return true;
-    }
-    const reportId = envelope.reportId?.trim() || `msg:${input.parsed.messageId}`;
-    const evidence = envelope.evidence.map((ev) => envelopeEvidenceToLedgerEvidence(ev, ledger));
-    const appended = ledger.append({
-      type: 'TaskReported',
-      actor: 'worker',
-      taskId: envelope.taskId,
-      chatId: goalChatId,
-      ts: Date.now(),
-      idempotencyKey: envelope.reportId?.trim() ? `reported:${reportId}` : `reported:msg:${input.parsed.messageId}`,
-      payload: {
-        taskId: envelope.taskId,
-        reportId,
-        workerOpenId: senderOpenId,
-        evidence,
-        summary: envelope.summary,
-        source: { via: 'envelope', messageId: input.parsed.messageId, senderOpenId },
-      },
-    });
-    logger.info(`[delivery-envelope] report ingested task=${envelope.taskId} report=${reportId} deduped=${appended.deduped}`);
+  if (result.outcome === 'report_without_evidence') {
+    logger.warn(`[delivery-envelope] report without evidence ignored task=${result.taskId} msg=${input.parsed.messageId}`);
+    return true;
+  }
+  if (result.outcome === 'report') {
+    logger.info(`[delivery-envelope] report ingested task=${result.taskId} report=${result.reportId} deduped=${result.deduped}`);
   } else {
-    const appended = ledger.append({
-      type: 'TaskHelpRequested',
-      actor: 'worker',
-      taskId: envelope.taskId,
-      chatId: goalChatId,
-      ts: Date.now(),
-      idempotencyKey: `help:${envelope.taskId}:msg:${input.parsed.messageId}`,
-      payload: {
-        taskId: envelope.taskId,
-        workerOpenId: senderOpenId,
-        blocker: envelope.blocker,
-        kind: envelope.helpKind as HelpKind | undefined,
-        source: { via: 'envelope', messageId: input.parsed.messageId, senderOpenId },
-      },
-    });
-    logger.info(`[delivery-envelope] help ingested task=${envelope.taskId} deduped=${appended.deduped}`);
+    logger.info(`[delivery-envelope] help ingested task=${result.taskId} deduped=${result.deduped}`);
   }
 
-  void runGoalWatchdogForGoalOnThisDaemon(goalChatId, `delivery-envelope:${envelope.kind}:${envelope.taskId}`)
+  void runGoalWatchdogForGoalOnThisDaemon(goalChatId, `delivery-envelope:${result.outcome}:${result.taskId}`)
     .catch((err: any) => logger.warn(`[delivery-envelope] watchdog trigger failed goal=${goalChatId}: ${err?.message ?? err}`));
   return true;
 }
