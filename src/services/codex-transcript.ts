@@ -10,6 +10,9 @@
  *   - role=user             → the user's prompt text (input_text content)
  *   - role=assistant +
  *     phase=final_answer    → the model's final reply (output_text content)
+ *     (or NO phase field at all — TRAE's codex fork strips it, and some
+ *     codex builds emit phase-less finals; mid-turn commentary is always
+ *     explicitly phase=commentary, so "absent" safely means final)
  *
  * Why these and not `event_msg`:
  *   - `response_item` is the canonical transcript record; `event_msg` is a
@@ -327,7 +330,11 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
-    } else if (p.role === 'assistant' && p.phase === 'final_answer') {
+    } else if (p.role === 'assistant' && (p.phase === 'final_answer' || p.phase == null)) {
+      // phase absent ⇒ final: TRAE (codex fork) never writes the phase
+      // field, and pre-phase codex builds also omitted it on finals.
+      // Mid-turn status is always an explicit phase=commentary, so this
+      // widening cannot surface half-finished turns.
       const text = joinTextBlocks(p.content, 'output_text');
       if (!text) continue;
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text });
