@@ -44,6 +44,8 @@ import {
   type TeamGroupCreateResult,
   type TeamGroupOwnerTransferResult,
 } from './federated-group-core.js';
+import { CURRENT_A2A_CAPABILITIES } from '../core/a2a-readiness.js';
+import { resolveCurrentVersion } from '../utils/install-diagnostics.js';
 
 export interface OwnerCandidate { unionId: string; name: string }
 
@@ -171,6 +173,7 @@ function botConfigOrder(): string[] {
 /** This deployment's bots, in the shape the hub federates (bots.json order).
  *  Prefer the live daemon registry (authoritative) over bots-info.json. */
 function localBots(dataDir: string, live?: LiveBot[]): FederatedBot[] {
+  const version = resolveCurrentVersion();
   return buildTeamRoster(dataDir, undefined, undefined, live).bots.map(b => ({
     larkAppId: b.larkAppId,
     botName: b.name,
@@ -186,6 +189,8 @@ function localBots(dataDir: string, live?: LiveBot[]): FederatedBot[] {
     // until this deployment has observed the bot in an event; the hub then falls
     // back to open_id auth — see verified-delivery/types.ts workerBotUnionIds.
     botUnionId: getBotUnionIdByName(dataDir, b.name),
+    botmuxVersion: version,
+    a2aCapabilities: [...CURRENT_A2A_CAPABILITIES],
   }));
 }
 

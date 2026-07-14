@@ -21,6 +21,8 @@ export interface DispatchWorkerUnionBot {
   cliId: string;
   name: string;
   botUnionId?: string;
+  botmuxVersion?: string;
+  a2aCapabilities?: string[];
 }
 
 export function normalizeDispatchBotsForSender(input: {
