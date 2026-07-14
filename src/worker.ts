@@ -5791,17 +5791,60 @@ function getTerminalHtml(hasWrite: boolean, platformReadonly = false, loginUrl =
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%;background:#1a1b26;overflow:hidden;overscroll-behavior:none}
 body{display:flex;flex-direction:column}
-#toolbar{display:none;position:fixed;bottom:0;left:0;right:0;z-index:100;
-  padding:6px 8px calc(6px + env(safe-area-inset-bottom,0px));
-  background:rgba(21,22,30,0.92);border-top:1px solid #33467c;
-  gap:6px;align-items:center;justify-content:center;
-  backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
-#toolbar.show{display:flex}
-#toolbar button{background:#24283b;color:#a9b1d6;border:1px solid #33467c;
-  border-radius:6px;padding:8px 14px;font-size:14px;font-family:monospace;
-  white-space:nowrap;cursor:pointer;min-width:44px;min-height:36px;text-align:center;
+#safe-area-probe{position:fixed;visibility:hidden;pointer-events:none;
+  padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px)}
+#toolbar-shell{--toolbar-scale:1;display:none;position:fixed;z-index:100;
+  transform:scale(var(--toolbar-scale));transform-origin:right center}
+#toolbar-shell.show{display:block}
+#toolbar{width:110px;
+  padding:8px;background:rgba(21,22,30,0.88);border:0;
+  border-radius:14px;gap:6px;align-items:stretch;justify-content:center;
+  box-shadow:inset 0 0 0 1px rgba(122,162,247,0.34),0 10px 30px rgba(0,0,0,0.34);transform-origin:right center;
+  transition:opacity .12s ease,transform .28s cubic-bezier(.2,.8,.2,1),box-shadow .16s ease;
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}
+#toolbar{display:flex;flex-direction:column}
+.toolbar-motion-ghost{position:absolute!important;top:50%;right:0;pointer-events:none!important;
+  transform-origin:right center!important}
+#toolbar-header{height:44px;display:flex;align-items:center;justify-content:space-between;gap:2px;min-width:0}
+#toolbar-title{min-width:0;overflow:hidden;color:#a9b1d6;
+  font:600 11px/16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:-.2px;white-space:nowrap}
+#toolbar-actions{display:grid;grid-template-columns:repeat(2,44px);gap:6px}
+#toolbar button{background:#24283b;color:#c0caf5;border:1px solid #3b4d7a;
+  border-radius:10px;padding:0;font-size:14px;font-family:monospace;font-weight:600;
+  white-space:nowrap;cursor:pointer;width:44px;height:44px;min-width:44px;min-height:44px;text-align:center;
   touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
 #toolbar button:active{background:#7aa2f7;color:#1a1b26}
+#toolbar button.pressed{transform:scale(.96);background:#7aa2f7;color:#1a1b26}
+#toolbar button:focus-visible{outline:2px solid #7dcfff;outline-offset:2px}
+#toolbar button[data-k="ctrlc"]{color:#f29aa8}
+#toolbar-toggle{align-self:flex-end;display:grid;place-items:center;flex:0 0 44px;width:44px;min-width:44px!important;
+  padding:0!important;border:0!important;font-size:20px!important;background:transparent!important;box-shadow:none!important}
+#toolbar-collapse-icon{display:grid;place-items:center;width:32px;height:32px;border-radius:9px;
+  background:rgba(36,40,59,0.82);box-shadow:inset 0 0 0 1px rgba(122,162,247,0.22);
+  transition:background .12s ease,box-shadow .12s ease,color .12s ease}
+#toolbar-collapse-icon svg{display:block;width:12px;height:20px;overflow:visible}
+#toolbar-collapse-icon path{fill:none;stroke:currentColor;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}
+#toolbar-toggle:active #toolbar-collapse-icon,#toolbar-toggle.pressed #toolbar-collapse-icon{
+  color:#dce5ff;background:rgba(122,162,247,0.28);box-shadow:inset 0 0 0 1px rgba(125,207,255,0.36)}
+#toolbar-grip{display:none;width:24px;height:16px}
+#toolbar-grip svg{display:block;width:24px;height:16px;overflow:visible}
+#toolbar-grip rect,#toolbar-grip path{fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+#toolbar.compact{width:210px}
+#toolbar.compact #toolbar-actions{grid-template-columns:repeat(4,44px)}
+#toolbar.compact button[data-k="left"]{grid-column:1;grid-row:2}
+#toolbar.compact button[data-k="up"]{grid-column:2;grid-row:2}
+#toolbar.compact button[data-k="down"]{grid-column:3;grid-row:2}
+#toolbar.compact button[data-k="right"]{grid-column:4;grid-row:2}
+#toolbar.collapsed{width:48px;height:48px;padding:0;border-radius:50%;cursor:grab;transform-origin:right center;
+  transition:opacity .12s ease,transform .28s cubic-bezier(.2,.8,.2,1),box-shadow .16s ease}
+#toolbar.collapsed.dragging{cursor:grabbing;transition:none;box-shadow:0 14px 38px rgba(0,0,0,0.46)}
+#toolbar.collapsed #toolbar-header{height:48px}
+#toolbar.collapsed #toolbar-title,#toolbar.collapsed #toolbar-actions,#toolbar.collapsed #toolbar-collapse-icon{display:none}
+#toolbar.collapsed #toolbar-grip{display:grid;place-items:center}
+#toolbar.collapsed #toolbar-toggle{width:48px;height:48px;min-width:48px!important;border-radius:50%;
+  background:rgba(36,40,59,0.74)!important;touch-action:none}
+#toolbar.idle{opacity:.82}
+@media(prefers-reduced-motion:reduce){#toolbar,#toolbar.collapsed{transition:opacity .12s linear}}
 #terminal{flex:1;min-height:0}
 #terminal .xterm{height:100%}
 /* Real scroll container is xterm's own viewport — kill iOS rubber-band bounce
@@ -5836,15 +5879,27 @@ body.touch #terminal .xterm-screen *{
 <div id="terminal"></div>
 <div id="readonly-banner">只读模式 · 无写入权限</div>
 ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopener">owner 登录后可操作 →</a>` : '<div id="login-banner">owner 登录后可操作</div>'}
-<div id="toolbar">
-  <button data-k="esc">Esc</button>
-  <button data-k="ctrlc">^C</button>
-  <button data-k="tab">Tab</button>
-  <button data-k="up">\u2191</button>
-  <button data-k="down">\u2193</button>
-  <button data-k="left">\u2190</button>
-  <button data-k="right">\u2192</button>
-  <button data-k="enter">\u21B5</button>
+<div id="safe-area-probe" aria-hidden="true"></div>
+<div id="toolbar-shell">
+  <div id="toolbar" role="toolbar" aria-label="终端快捷键">
+    <div id="toolbar-header">
+      <span id="toolbar-title" aria-hidden="true">\u2328快捷键</span>
+      <button id="toolbar-toggle" type="button" aria-expanded="true" aria-controls="toolbar-actions" aria-label="收起快捷键">
+        <span id="toolbar-collapse-icon" aria-hidden="true"><svg viewBox="0 0 12 20" aria-hidden="true" focusable="false"><path d="M2 2l8 8-8 8"></path></svg></span>
+        <span id="toolbar-grip" aria-hidden="true"><svg viewBox="0 0 24 16" aria-hidden="true" focusable="false"><rect x="1" y="1" width="22" height="14" rx="2.5"></rect><path d="M4 5h1m3 0h1m3 0h1m3 0h1m3 0h1M4 9h1m3 0h1m3 0h1m3 0h1m3 0h1M5 12.5h14"></path></svg></span>
+      </button>
+    </div>
+    <div id="toolbar-actions">
+      <button type="button" data-k="esc">Esc</button>
+      <button type="button" data-k="ctrlc">\u2303C</button>
+      <button type="button" data-k="tab">Tab</button>
+      <button type="button" data-k="enter">\u21B5</button>
+      <button type="button" data-k="up">\u2191</button>
+      <button type="button" data-k="down">\u2193</button>
+      <button type="button" data-k="left">\u2190</button>
+      <button type="button" data-k="right">\u2192</button>
+    </div>
+  </div>
 </div>
 <div id="status" class="err">connecting...</div>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
@@ -6086,28 +6141,301 @@ if(!${isTmuxMode && !isPipeMode}){
 // ── Touch shortcut toolbar ──
 if(isTouch&&hasToken){
   var km={esc:'\\x1b',ctrlc:'\\x03',tab:'\\t',up:'\\x1b[A',down:'\\x1b[B',left:'\\x1b[D',right:'\\x1b[C',enter:'\\r'};
+  var tbShell=document.getElementById('toolbar-shell');
   var tb=document.getElementById('toolbar');
-  tb.classList.add('show');
-  var btns=tb.getElementsByTagName('button');
+  var tbToggle=document.getElementById('toolbar-toggle');
+  var tbSafeProbe=document.getElementById('safe-area-probe');
+  var _toolbarPositionKey='botmux:terminal-toolbar-position:v2';
+  var _toolbarUserCollapsed=false,_toolbarTemporaryCollapsed=false,_toolbarCollapsed=false;
+  var _toolbarGesture=null,_toolbarYRatio=.5,_toolbarOrientation='',_toolbarLastCenter=0;
+  var _toolbarLayoutFrame=0,_toolbarIdleTimer=0;
+  var _toolbarStateAnimations=[],_toolbarGhost=null,_toolbarSettleAnimation=null;
+  var _toolbarMotionFromCollapsed=false,_toolbarMotionReversing=false;
+
+  // Touch pages deliberately use a 1100px layout viewport so terminal TUIs keep
+  // useful column counts. Counter-scale an independent shell so its 44/48px
+  // controls stay 44/48 physical pixels through rotation and pinch zoom. The
+  // inner panel owns interaction animation, so it never overwrites this scale.
+  function _toolbarViewport(){
+    var vv=window.visualViewport;
+    return vv?{left:vv.offsetLeft,top:vv.offsetTop,width:vv.width,height:vv.height,scale:vv.scale||1}
+      :{left:0,top:0,width:window.innerWidth,height:window.innerHeight,scale:1};
+  }
+  function _toolbarSafeArea(){
+    var cs=getComputedStyle(tbSafeProbe);
+    return{top:parseFloat(cs.paddingTop)||0,right:parseFloat(cs.paddingRight)||0,
+      bottom:parseFloat(cs.paddingBottom)||0,left:parseFloat(cs.paddingLeft)||0};
+  }
+  function _clamp(n,min,max){return Math.min(max,Math.max(min,n));}
+  function _toolbarOrientationFor(v){return v.width>=v.height?'landscape':'portrait';}
+  function _readToolbarRatio(orientation){
+    try{var n=parseFloat(localStorage.getItem(_toolbarPositionKey+':'+orientation)||'');if(isFinite(n))return _clamp(n,0,1)}catch(_e){}
+    return .5;
+  }
+  function _writeToolbarRatio(orientation,ratio){
+    try{localStorage.setItem(_toolbarPositionKey+':'+orientation,String(_clamp(ratio,0,1)))}catch(_e){}
+  }
+  function _toolbarMetrics(collapsed,compact){
+    return collapsed?{width:48,height:48}:{width:compact?210:110,height:compact?160:260};
+  }
+  function _toolbarBounds(v,safe,metrics){
+    var edge=8/v.scale;
+    var topInset=Math.max(edge,safe.top),bottomInset=Math.max(edge,safe.bottom);
+    var min=v.top+topInset+metrics.height/(2*v.scale);
+    var max=v.top+v.height-bottomInset-metrics.height/(2*v.scale);
+    if(max<min){var middle=v.top+v.height/2;min=middle;max=middle;}
+    return{min:min,max:max,right:v.left+v.width-Math.max(edge,safe.right)};
+  }
+  function _rememberToolbarCenter(center,v,safe,persist){
+    // Ratios always describe the 48px handle's draggable range. Expanded
+    // panels reuse that target centre (then clamp only if their taller body
+    // cannot fit), so expanding grows leftward without a vertical jump.
+    var bounds=_toolbarBounds(v,safe,_toolbarMetrics(true,false));
+    _toolbarYRatio=bounds.max===bounds.min?.5:_clamp((center-bounds.min)/(bounds.max-bounds.min),0,1);
+    if(persist)_writeToolbarRatio(_toolbarOrientation,_toolbarYRatio);
+  }
+  function _placeToolbarCenter(center,v,safe,metrics,save){
+    var bounds=_toolbarBounds(v,safe,metrics);
+    center=_clamp(center,bounds.min,bounds.max);
+    tbShell.style.width=metrics.width+'px';tbShell.style.height=metrics.height+'px';
+    // The shell is laid out at unscaled dimensions, then inverse-scaled about
+    // its right/centre anchor. This keeps its visual right edge and centre fixed.
+    tbShell.style.left=(bounds.right-metrics.width)+'px';
+    tbShell.style.top=(center-metrics.height/2)+'px';
+    _toolbarLastCenter=center;
+    if(save)_rememberToolbarCenter(center,v,safe,true);
+    return{center:center,bounds:bounds};
+  }
+  function _toolbarReducedMotion(){return !!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);}
+  function _removeToolbarGhost(){
+    if(_toolbarGhost&&_toolbarGhost.parentNode)_toolbarGhost.parentNode.removeChild(_toolbarGhost);
+    _toolbarGhost=null;
+  }
+  function _cancelToolbarStateMotion(){
+    for(var i=0;i<_toolbarStateAnimations.length;i++){
+      try{_toolbarStateAnimations[i].onfinish=null;_toolbarStateAnimations[i].cancel()}catch(_e){}
+    }
+    _toolbarStateAnimations=[];_toolbarMotionReversing=false;_removeToolbarGhost();
+  }
+  function _pauseToolbarStateMotion(){
+    for(var i=0;i<_toolbarStateAnimations.length;i++){try{_toolbarStateAnimations[i].pause()}catch(_e){}}
+  }
+  function _resumeToolbarStateMotion(){
+    for(var i=0;i<_toolbarStateAnimations.length;i++){try{_toolbarStateAnimations[i].play()}catch(_e){}}
+  }
+  function _toolbarTranslateY(){
+    try{
+      var transform=getComputedStyle(tb).transform;
+      if(!transform||transform==='none')return 0;
+      if(window.DOMMatrixReadOnly)return new DOMMatrixReadOnly(transform).m42||0;
+      var values=transform.match(/^matrix\([^,]+,[^,]+,[^,]+,[^,]+,[^,]+,\s*([^)]+)\)$/);
+      return values?parseFloat(values[1])||0:0;
+    }catch(_e){return 0;}
+  }
+  function _cancelToolbarSettling(preserveSettling){
+    if(!_toolbarSettleAnimation)return;
+    var offsetScreen=preserveSettling?_toolbarTranslateY():0;
+    try{_toolbarSettleAnimation.cancel()}catch(_e){}
+    _toolbarSettleAnimation=null;
+    if(preserveSettling&&Math.abs(offsetScreen)>.01){
+      var v=_toolbarViewport();
+      _placeToolbarCenter(_toolbarLastCenter+offsetScreen/v.scale,v,_toolbarSafeArea(),_toolbarMetrics(_toolbarCollapsed,tb.classList.contains('compact')),false);
+    }
+  }
+  function _cancelToolbarMotion(preserveSettling){_cancelToolbarStateMotion();_cancelToolbarSettling(preserveSettling);}
+  function _makeToolbarGhost(){
+    var ghost=tb.cloneNode(true);
+    ghost.classList.remove('idle','dragging');ghost.classList.add('toolbar-motion-ghost');
+    ghost.setAttribute('aria-hidden','true');ghost.setAttribute('inert','');
+    var buttons=ghost.getElementsByTagName('button');
+    for(var i=0;i<buttons.length;i++)buttons[i].setAttribute('tabindex','-1');
+    tbShell.appendChild(ghost);_toolbarGhost=ghost;return ghost;
+  }
+  function _finishToolbarStateMotion(){
+    if(!_toolbarStateAnimations.length)return;
+    var reversed=_toolbarMotionReversing,fromCollapsed=_toolbarMotionFromCollapsed;
+    _cancelToolbarStateMotion();
+    if(reversed){
+      _setToolbarVisualState(fromCollapsed,false);
+      _toolbarUserCollapsed=fromCollapsed;
+      _layoutToolbarNow();
+    }
+  }
+  function _retargetToolbarStateMotion(collapsed){
+    if(!_toolbarStateAnimations.length)return false;
+    var reverse=collapsed===_toolbarMotionFromCollapsed;
+    for(var i=0;i<_toolbarStateAnimations.length;i++){
+      try{if(reverse!==_toolbarMotionReversing)_toolbarStateAnimations[i].reverse();else _toolbarStateAnimations[i].play()}catch(_e){}
+    }
+    _toolbarMotionReversing=reverse;
+    return true;
+  }
+  function _animateToolbarStateChange(ghost,fromCollapsed){
+    if(!ghost||!tb.animate){_removeToolbarGhost();return;}
+    var reduced=_toolbarReducedMotion(),duration=reduced?120:240;
+    var incoming=reduced?[{opacity:0},{opacity:1}]:[
+      {opacity:0,transform:'scale(.94)'},{opacity:1,transform:'scale(1)'}
+    ];
+    var outgoing=reduced?[{opacity:1},{opacity:0}]:[
+      {opacity:1,transform:'translateY(-50%) scale(1)'},{opacity:0,transform:'translateY(-50%) scale(.94)'}
+    ];
+    var options={duration:duration,easing:'cubic-bezier(.2,.8,.2,1)',fill:'both'};
+    var enter=tb.animate(incoming,options),leave=ghost.animate(outgoing,options);
+    _toolbarMotionFromCollapsed=fromCollapsed;_toolbarMotionReversing=false;
+    _toolbarStateAnimations=[enter,leave];leave.onfinish=_finishToolbarStateMotion;
+  }
+  function _animateToolbarSettle(deltaScreen){
+    if(!tb.animate||_toolbarReducedMotion()||Math.abs(deltaScreen)<.5)return;
+    _cancelToolbarStateMotion();
+    var animation=tb.animate([
+      {transform:'translateY('+deltaScreen+'px)'},{transform:'translateY(0)'}
+    ],{duration:350,easing:'cubic-bezier(.22,1,.36,1)',fill:'both'});
+    _toolbarSettleAnimation=animation;
+    animation.finished.then(function(){
+      if(_toolbarSettleAnimation===animation){_toolbarSettleAnimation=null;try{animation.cancel()}catch(_e){}}
+    }).catch(function(){});
+  }
+  function _setToolbarVisualState(collapsed,temporary){
+    _toolbarCollapsed=collapsed;_toolbarTemporaryCollapsed=temporary;
+    tb.classList.toggle('collapsed',collapsed);
+    tbToggle.setAttribute('aria-expanded',collapsed?'false':'true');
+    tbToggle.setAttribute('aria-label',temporary?'快捷键空间不足，收起键盘后自动展开':(collapsed?'展开快捷键':'收起快捷键'));
+  }
+  function _layoutToolbarNow(){
+    _toolbarLayoutFrame=0;if(_toolbarGesture)return;
+    var v=_toolbarViewport(),safe=_toolbarSafeArea();
+    tbShell.style.setProperty('--toolbar-scale',String(1/v.scale));
+    var orientation=_toolbarOrientationFor(v);
+    if(orientation!==_toolbarOrientation){_toolbarOrientation=orientation;_toolbarYRatio=_readToolbarRatio(orientation);}
+    var compact=v.height*v.scale<500;
+    tb.classList.toggle('compact',compact);
+    var expanded=_toolbarMetrics(false,compact);
+    var edge=8/v.scale;
+    var usable=(v.height-Math.max(edge,safe.top)-Math.max(edge,safe.bottom))*v.scale;
+    var temporary=!_toolbarUserCollapsed&&usable<expanded.height+24;
+    var collapsed=_toolbarUserCollapsed||temporary;
+    var previousCollapsed=_toolbarCollapsed;
+    var stateChanged=tbShell.classList.contains('show')&&collapsed!==previousCollapsed;
+    var ghost=null;
+    if(stateChanged){_cancelToolbarMotion(false);ghost=_makeToolbarGhost();}
+    _setToolbarVisualState(collapsed,temporary);
+    var metrics=_toolbarMetrics(collapsed,compact);
+    var handleBounds=_toolbarBounds(v,safe,_toolbarMetrics(true,false));
+    var targetCenter=handleBounds.min+_toolbarYRatio*(handleBounds.max-handleBounds.min);
+    _placeToolbarCenter(targetCenter,v,safe,metrics,false);
+    tbShell.classList.add('show');
+    if(stateChanged)_animateToolbarStateChange(ghost,previousCollapsed);
+  }
+  function _scheduleToolbarLayout(){
+    if(_toolbarLayoutFrame)return;
+    _toolbarLayoutFrame=requestAnimationFrame(_layoutToolbarNow);
+  }
+  function _wakeToolbar(){
+    tb.classList.remove('idle');clearTimeout(_toolbarIdleTimer);
+    _toolbarIdleTimer=setTimeout(function(){if(!_toolbarGesture)tb.classList.add('idle')},2200);
+  }
+  function _toggleToolbarUserState(){
+    if(_toolbarTemporaryCollapsed)return;
+    var desired=!_toolbarUserCollapsed;
+    if(_toolbarStateAnimations.length){_toolbarUserCollapsed=desired;_retargetToolbarStateMotion(desired);return;}
+    if(!_toolbarCollapsed){var v=_toolbarViewport();_rememberToolbarCenter(_toolbarLastCenter,v,_toolbarSafeArea(),true);}
+    _toolbarUserCollapsed=desired;_scheduleToolbarLayout();
+  }
+
+  var btns=document.querySelectorAll('#toolbar-actions button');
   for(var i=0;i<btns.length;i++){(function(btn){
-    function fire(e){e.preventDefault();e.stopPropagation();
+    var press=null;
+    function fire(){
       if(!ws_||ws_.readyState!==1)return;
       var k=km[btn.getAttribute('data-k')];
       if(k)ws_.send(JSON.stringify({type:'input',data:k}));
     }
-    btn.addEventListener('touchend',fire,{passive:false});
-    btn.addEventListener('click',fire);
+    btn.addEventListener('pointerdown',function(e){
+      if(e.button!==0)return;e.preventDefault();e.stopPropagation();_wakeToolbar();
+      press={id:e.pointerId,x:e.clientX,y:e.clientY,inside:true,moved:false};btn.classList.add('pressed');
+      try{btn.setPointerCapture(e.pointerId)}catch(_e){}
+    });
+    btn.addEventListener('pointermove',function(e){
+      if(!press||e.pointerId!==press.id)return;e.preventDefault();e.stopPropagation();
+      var v=_toolbarViewport(),r=btn.getBoundingClientRect(),pad=10/v.scale;
+      if(Math.hypot(e.clientX-press.x,e.clientY-press.y)*v.scale>=8)press.moved=true;
+      press.inside=e.clientX>=r.left-pad&&e.clientX<=r.right+pad&&e.clientY>=r.top-pad&&e.clientY<=r.bottom+pad;
+      btn.classList.toggle('pressed',press.inside&&!press.moved);
+    });
+    btn.addEventListener('pointerup',function(e){
+      if(!press||e.pointerId!==press.id)return;e.preventDefault();e.stopPropagation();
+      var p=press;press=null;btn.classList.remove('pressed');
+      try{btn.releasePointerCapture(e.pointerId)}catch(_e){}
+      var v=_toolbarViewport();
+      if(!p.moved&&p.inside&&Math.hypot(e.clientX-p.x,e.clientY-p.y)*v.scale<8)fire();
+    });
+    btn.addEventListener('pointercancel',function(){press=null;btn.classList.remove('pressed')});
+    btn.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();fire()}});
   })(btns[i]);}
-  // Keyboard avoidance: move toolbar above virtual keyboard
-  if(window.visualViewport){
-    function posToolbar(){
-      var vv=window.visualViewport;
-      var kb=window.innerHeight-vv.height-vv.offsetTop;
-      tb.style.bottom=Math.max(0,Math.round(kb))+'px';
+
+  // Only the collapsed handle is draggable. A movement threshold separates a
+  // deliberate drag from a tap-to-expand. X contributes to the threshold but
+  // never moves the handle away from the right edge, preserving terminal swipes.
+  tbToggle.addEventListener('pointerdown',function(e){
+    if(e.button!==0)return;e.preventDefault();e.stopPropagation();_wakeToolbar();
+    tbToggle.classList.add('pressed');
+    _toolbarGesture={id:e.pointerId,startX:e.clientX,startY:e.clientY,startCenter:_toolbarLastCenter,
+      moved:false,lastY:e.clientY,lastT:performance.now(),velocity:0};
+    try{tbToggle.setPointerCapture(e.pointerId)}catch(_e){}
+  });
+  tbToggle.addEventListener('pointermove',function(e){
+    if(!_toolbarGesture||e.pointerId!==_toolbarGesture.id)return;
+    e.preventDefault();e.stopPropagation();
+    var v=_toolbarViewport(),dx=e.clientX-_toolbarGesture.startX,dy=e.clientY-_toolbarGesture.startY;
+    if(!_toolbarGesture.moved&&Math.hypot(dx,dy)*v.scale>=8){
+      _toolbarGesture.moved=true;tbToggle.classList.remove('pressed');
+      if(_toolbarCollapsed)tb.classList.add('dragging');
     }
-    window.visualViewport.addEventListener('resize',posToolbar);
-    window.visualViewport.addEventListener('scroll',posToolbar);
+    if(_toolbarGesture.moved&&_toolbarCollapsed){
+      var now=performance.now(),dt=Math.max(1,now-_toolbarGesture.lastT);
+      _toolbarGesture.velocity=(e.clientY-_toolbarGesture.lastY)*v.scale/dt*1000;
+      _toolbarGesture.lastY=e.clientY;_toolbarGesture.lastT=now;
+      _placeToolbarCenter(_toolbarGesture.startCenter+dy,v,_toolbarSafeArea(),_toolbarMetrics(true,false),false);
+    }
+  });
+  function _finishToolbarGesture(e,cancelled){
+    if(!_toolbarGesture||e.pointerId!==_toolbarGesture.id)return;
+    e.preventDefault();e.stopPropagation();
+    var gesture=_toolbarGesture;_toolbarGesture=null;
+    tbToggle.classList.remove('pressed');tb.classList.remove('dragging');
+    try{tbToggle.releasePointerCapture(e.pointerId)}catch(_e){}
+    if(cancelled){_resumeToolbarStateMotion();_scheduleToolbarLayout();return;}
+    if(gesture.moved&&_toolbarCollapsed){
+      var v=_toolbarViewport();
+      var projected=_clamp(gesture.velocity*.10,-96,96)/v.scale;
+      var releaseCenter=_toolbarLastCenter;
+      var landed=_placeToolbarCenter(releaseCenter+projected,v,_toolbarSafeArea(),_toolbarMetrics(true,false),true);
+      _animateToolbarSettle((releaseCenter-landed.center)*v.scale);
+      return;
+    }
+    if(gesture.moved){_resumeToolbarStateMotion();return;}
+    _toggleToolbarUserState();
   }
+  tbToggle.addEventListener('pointerup',function(e){_finishToolbarGesture(e,false)});
+  tbToggle.addEventListener('pointercancel',function(e){_finishToolbarGesture(e,true)});
+  tbToggle.addEventListener('keydown',function(e){
+    if(e.key==='Enter'||e.key===' '){e.preventDefault();_toggleToolbarUserState()}
+  });
+  tb.addEventListener('pointerdown',function(e){
+    _cancelToolbarSettling(true);
+    if(_toolbarStateAnimations.length&&(e.target===tbToggle||tbToggle.contains(e.target)))_pauseToolbarStateMotion();
+    else _cancelToolbarStateMotion();
+    _wakeToolbar();
+  },{capture:true});
+
+  // Keep the panel centred in the visible area above the software keyboard;
+  // collapsed positions are re-clamped when the keyboard or orientation moves.
+  if(window.visualViewport){
+    window.visualViewport.addEventListener('resize',_scheduleToolbarLayout);
+    window.visualViewport.addEventListener('scroll',_scheduleToolbarLayout);
+  }
+  window.addEventListener('orientationchange',_scheduleToolbarLayout);
+  _scheduleToolbarLayout();_wakeToolbar();
 }
 
 // Single-finger touch scrolling: normal-buffer CLIs use xterm's own Viewport
