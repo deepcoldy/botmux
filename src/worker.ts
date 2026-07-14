@@ -6139,12 +6139,16 @@ window.addEventListener('resize',onViewportResize);
 // stopPropagation pre-empts xterm's own handler. Skipped for pure tmux/zellij
 // ATTACH (gate), where the attach client owns scrolling via copy-mode.
 //
-// Accumulate intended scroll DISTANCE (px) and emit one wheel tick per STEP px —
-// decoupled from how many wheel/touch events the browser fires per gesture
-// (high-res trackpads fire dozens), so a small gesture stays a small scroll and
-// doesn't compound into a whole screen. px<0 = scroll up (toward history). The
-// per-call cap stops a single huge delta (page tick / fling) from over-firing.
-var _scrollAccum=0;var _SCROLL_STEP=33;
+// Accumulate intended scroll DISTANCE (px) and emit one wheel tick per STEP px.
+// A high-resolution trackpad emits dozens of wheel events for one gesture, so
+// cap the whole continuous burst — not each browser event — then require an idle
+// gap (or direction reversal) before loading the next history chunk.
+var _scrollAccum=0,_scrollBurstTicks=0,_scrollBurstDir=0,_scrollBurstT=0;
+var _SCROLL_STEP=33;var _SCROLL_BURST_MAX=6;var _SCROLL_BURST_IDLE_MS=250;
+function _endScrollBurst(){
+  clearTimeout(_scrollBurstT);_scrollBurstT=0;
+  _scrollAccum=0;_scrollBurstTicks=0;_scrollBurstDir=0;
+}
 // Map a viewport pixel (clientX/Y) to a 1-based terminal cell "col;row", clamped to
 // the grid. The forwarded SGR wheel event MUST carry the cell UNDER THE POINTER, the
 // way a physical terminal reports it: zone-routed alt-screen TUIs — OpenCode (Bubble
@@ -6168,14 +6172,20 @@ function _cellAt(clientX,clientY){
   return col+';'+row;
 }
 function _fwdScroll(px,coord){
-  if(!ws_||ws_.readyState!==1)return;
+  if(!ws_||ws_.readyState!==1||!px)return;
   coord=coord||(((term.cols>>1)+1)+';'+((term.rows>>1)+1)); // never (1,1)
+  var dir=px<0?-1:1;
+  if(_scrollBurstDir&&dir!==_scrollBurstDir){_scrollAccum=0;_scrollBurstTicks=0;}
+  _scrollBurstDir=dir;
+  clearTimeout(_scrollBurstT);_scrollBurstT=setTimeout(_endScrollBurst,_SCROLL_BURST_IDLE_MS);
+  if(_scrollBurstTicks>=_SCROLL_BURST_MAX)return;
   _scrollAccum+=px;var data='',n=0;
-  while(Math.abs(_scrollAccum)>=_SCROLL_STEP&&n<6){
+  while(Math.abs(_scrollAccum)>=_SCROLL_STEP&&n<6&&_scrollBurstTicks<_SCROLL_BURST_MAX){
     var up=_scrollAccum<0; // px<0 → wheel-up (history)
     data+='\\x1b[<'+(up?64:65)+';'+coord+'M';
-    _scrollAccum+=up?_SCROLL_STEP:-_SCROLL_STEP;n++;
+    _scrollAccum+=up?_SCROLL_STEP:-_SCROLL_STEP;n++;_scrollBurstTicks++;
   }
+  if(_scrollBurstTicks>=_SCROLL_BURST_MAX)_scrollAccum=0;
   if(data)ws_.send(JSON.stringify({type:'input',data:data}));
 }
 if(!${isTmuxMode && !isPipeMode}){
@@ -6519,8 +6529,8 @@ if(!${isTmuxMode && !isPipeMode}){
     _fwdScroll(_tLastY-y,_cellAt(e.touches[0].clientX,y));
     _tLastY=y;
   },{capture:true,passive:false});
-  _tTerm.addEventListener('touchend',function(){_tLastY=null;},{capture:true,passive:true});
-  _tTerm.addEventListener('touchcancel',function(){_tLastY=null;},{capture:true,passive:true});
+  _tTerm.addEventListener('touchend',function(){_tLastY=null;_endScrollBurst()},{capture:true,passive:true});
+  _tTerm.addEventListener('touchcancel',function(){_tLastY=null;_endScrollBurst()},{capture:true,passive:true});
 }
 </script>
 </body>

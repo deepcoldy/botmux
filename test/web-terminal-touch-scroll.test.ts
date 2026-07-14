@@ -22,6 +22,15 @@ describe('web terminal touch scrolling', () => {
       .toBeLessThan(wheelBlock.indexOf('_fwdScroll(px,_cellAt'));
   });
 
+  it('bounds remote scroll ticks per gesture instead of per browser event', () => {
+    const wheelBlock = scriptBlock('// ── Wheel / touch scroll handling ──');
+
+    expect(wheelBlock).toContain('var _SCROLL_BURST_MAX=6');
+    expect(wheelBlock).toContain('_scrollBurstTicks<_SCROLL_BURST_MAX');
+    expect(wheelBlock).toContain('setTimeout(_endScrollBurst,_SCROLL_BURST_IDLE_MS)');
+    expect(wheelBlock).toContain('if(_scrollBurstTicks>=_SCROLL_BURST_MAX)_scrollAccum=0');
+  });
+
   it('drives normal-buffer scroll explicitly instead of relying on WebView defaults', () => {
     const touchBlock = scriptBlock('// Single-finger touch scrolling:');
 
@@ -38,5 +47,6 @@ describe('web terminal touch scrolling', () => {
     expect(touchBlock).toContain('e.preventDefault();e.stopPropagation();');
     expect(touchBlock).toContain("_tTerm.addEventListener('touchmove'");
     expect(touchBlock).toContain('{capture:true,passive:false}');
+    expect(touchBlock).toContain("_tTerm.addEventListener('touchend',function(){_tLastY=null;_endScrollBurst()}");
   });
 });
