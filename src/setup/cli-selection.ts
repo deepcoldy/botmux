@@ -62,7 +62,7 @@ const AIDEN_VARIANTS: ReadonlyArray<CliSelectOption> = [AIDEN_NATIVE, AIDEN_X_CL
 // ─── Mira 选项 ───────────────────────────────────────────────────────────────
 // Mira 有两种形态（都是原生 cliId，无 wrapperCli），合并成一个「Mira」二级菜单：
 //   - Mira App  → cliId `mira`：直连 Mira Web API（云端编排 + 远程沙盒，聊天/搜索）
-//   - Mir CLI   → cliId `mir` ：本地 `mircli -p --lean`（在用户机器上执行、操作工作区）
+//   - Mir CLI   → cliId `mir` ：本地 `mircli -p`（在用户机器上执行、操作工作区）
 const MIRA_APP: CliSelectOption = { key: 'mira', label: 'Mira App（Web API）', cliId: 'mira' };
 const MIRA_CLI: CliSelectOption = { key: 'mir', label: 'Mir CLI（本地 mircli）', cliId: 'mir' };
 
