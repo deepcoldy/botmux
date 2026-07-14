@@ -238,8 +238,8 @@ describe('card-handler grant actions', () => {
   });
 
   // 实测 bug：手动 /grant 一个 bot 后，通知卡若 <at> 对方 bot 会唤醒其 daemon 误拉空会话。
-  // 修复后通知卡对 bot grantee 只用纯文本名字（无 <at>），对真人仍 @。
-  it('通知卡：bot grantee 用纯文本名字（无 <at>），不唤醒对方 bot', async () => {
+  // 混合规则：能拿到 bot 名字就用纯文本名字（无 <at>，不唤醒对方），对真人仍 @。
+  it('通知卡：有名字的 bot grantee 用纯文本名字（无 <at>），不唤醒对方 bot', async () => {
     const { pending, handler } = await fresh();
     // 默认 isHumanMock=false → ou_bot2 判为 bot。
     const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_bot2']);
@@ -250,8 +250,24 @@ describe('card-handler grant actions', () => {
     await handler.handleCardAction(data, deps, 'h1');
     await flushBackground();
     const notify = replyMock.mock.calls.at(-1)![2] as string;
-    expect(notify).not.toContain('<at id=ou_bot2');   // bot 绝不被 <at>
+    expect(notify).not.toContain('<at id=ou_bot2');   // 有名字的 bot 不被 <at>
     expect(notify).toContain('Codex');                 // 纯文本名字保留可读信息
+  });
+
+  // 名字缺失（target_names 为空）才退回 @ 兜底：飞书据 open_id 展示身份（远比裸 open_id 可读），
+  // 代价=可能偶尔触发一次空会话（产品上可接受，边角情况）。
+  it('通知卡：拿不到名字的 bot grantee 用 @ 兜底（而非裸 open_id）', async () => {
+    const { pending, handler } = await fresh();
+    // isHumanMock=false → ou_bot2 判为 bot；target_names 缺失 → 名字取不到。
+    const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_bot2']);
+    const data: any = {
+      operator: { open_id: 'ou_owner' }, context: { open_message_id: 'om_card' },
+      action: { value: { action: 'grant_chat', target_open_ids: ['ou_bot2'], target_names: [], chat_id: 'oc_1', nonce } },
+    };
+    await handler.handleCardAction(data, deps, 'h1');
+    await flushBackground();
+    const notify = replyMock.mock.calls.at(-1)![2] as string;
+    expect(notify).toContain('<at id=ou_bot2></at>');  // 无名字 → @ 兜底
   });
 
   it('通知卡：真人 grantee 仍 @ 点名（真人被 @ 不会自动开会话）', async () => {

@@ -17,6 +17,7 @@ botmux bridges different CLIs through adapters, selected via `cliId` in `bots.js
 | `antigravity` | Antigravity (agy) | |
 | `hermes` | Hermes | |
 | `copilot` | GitHub Copilot (copilot) | ✅ |
+| `kiro-cli` | Kiro (kiro-cli) | |
 
 > There are also community-contributed integrations such as MTR, ttadk, and Mira. The `model` field only takes effect for adapters that support a model parameter; others ignore it.
 

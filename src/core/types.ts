@@ -67,6 +67,7 @@ export interface DaemonSession {
   pendingFollowUpInput?: { userPrompt: string; cliInput: string };
   pendingAttachments?: LarkAttachment[];
   pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
+  pendingSubstituteTrigger?: import('../types.js').SubstituteTrigger;
   /** Sender (open_id + type + resolved name) of the initial message — stashed
    *  so the deferred spawn after repo-selection still injects a <sender> tag
    *  matching the original caller, not the user who clicked the card. */
@@ -76,6 +77,7 @@ export interface DaemonSession {
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
   streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
+  pendingLocalCliButtonRefresh?: boolean; // true when cli_session_id arrived while the streaming card POST was in flight
   /** Set on sessions restored after a daemon restart: suppresses the automatic
    *  card post/patch from the recovery re-fork so a restart stays silent in the
    *  group (the owner gets a private DM summary instead). Cleared on the first
@@ -139,19 +141,25 @@ export interface DaemonSession {
    *  rendered TUI menu detected by screen-analyzer) — this is deliberate,
    *  agent-initiated, and carries no rendered options. */
   agentAttention?: { kind: string; reason: string; at: number };
-  /** 文档评论入口（/subscribe-lark-doc）：本会话「来自文档评论的轮」的回复落点
+  /** 文档评论入口（/watch-comment / /subscribe-lark-doc）：本会话「来自文档评论的轮」的回复落点
    *  映射。key = turnId（= 触发评论的 reply_id/comment_id，随消息传给 worker 再
    *  随 final_output 传回）；value = 该回哪个文档的哪条评论。deliverFinalOutput
    *  命中后把正文发表为文档评论而非飞书卡片，并删除该项。仅内存（轮是瞬时的）。 */
-  docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string }>;
+  docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string; replyId?: string; reactionId?: string }>;
   /** Last scoped dedupe key emitted via the bridge final_output pipeline.
    *  Format is `${sessionId}:${lastUuid || turnId}` so different sessions can
    *  never suppress each other's final_output payloads. */
   lastBridgeEmittedUuid?: string;
-  /** Flag flipped to true once a `session.exited` dashboard event has been
-   *  published for this session. Both the dashboard-driven close path
-   *  (closeSession) and the worker-process exit handler may try to publish;
-   *  this guard prevents double-counting on the dashboard side. */
+  /** Native Hermes messages.session_id values bound by this worker after
+   *  seeing botmux-injected `<session_id>...` markers in Hermes state.db.
+   *  Hermes `/clear` can rebind to a new native session while a completed
+   *  turn from the previous source is still queued for emission, so the
+   *  daemon keeps every source announced by the current worker. */
+  hermesBridgeSourceSessionIds?: Set<string>;
+  /** Flag flipped once this process lifecycle has already been reflected on the
+   *  dashboard. A real close publishes `session.exited`; a deliberate suspend
+   *  publishes `status=dormant`. The later child-process exit must not emit a
+   *  second, contradictory close event. Reset when a new process is forked. */
   exitEventEmitted?: boolean;
   /** Present when this session was created via /adopt (shared observation mode).
    *  Either tmuxTarget (tmux) OR zellijSession+zellijPaneId (zellij) is set. */
@@ -190,4 +198,11 @@ export function sessionKey(anchorId: string, larkAppId: string): string {
  *  storage and lookup time. */
 export function sessionAnchorId(ds: DaemonSession): string {
   return ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId;
+}
+
+/** A session whose only IM surface is a Feishu document comment thread.
+ * `doc:` is an internal virtual address, not a real Lark chat_id, so rich
+ * cards and other chat API calls must never target it. */
+export function isDocNativeSession(ds: Pick<DaemonSession, 'scope' | 'chatId'>): boolean {
+  return ds.scope === 'chat' && ds.chatId.startsWith('doc:');
 }

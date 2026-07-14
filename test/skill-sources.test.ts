@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { assertSafeGitRef, assertSafeGitSkillPath, parseSkillInstallSource, redactGitUrlCredentials } from '../src/core/skills/sources.js';
+import { assertSafeGitRef, assertSafeGitSkillPath, parseAgentbuddyCommand, parseSkillInstallSource, parseSkillsInstallCommand, redactGitUrlCredentials } from '../src/core/skills/sources.js';
 
 describe('skill install sources', () => {
   it('rejects HTTPS git URLs with embedded credentials', () => {
@@ -82,6 +82,74 @@ describe('skill install sources', () => {
 
   it('rejects unsafe paths in GitHub browser URLs', () => {
     expect(() => parseSkillInstallSource('https://github.com/acme/skills/tree/main/skills/../deploy')).toThrow(/invalid_git_skill_path/);
+  });
+
+  describe('agentbuddy install commands', () => {
+    it('parses pasted skill/plugin collection add commands', () => {
+      expect(parseSkillInstallSource('agentbuddy skill collection add iYrkTRRY')).toMatchObject({
+        kind: 'agentbuddy',
+        agentbuddy: { protocol: 'skill', collection: 'iYrkTRRY' },
+      });
+      expect(parseAgentbuddyCommand('agentbuddy plugin collection add iYrkTRRY')).toEqual({
+        protocol: 'plugin',
+        collection: 'iYrkTRRY',
+      });
+    });
+
+    it('strips a leading env / npx / agentbuddy@latest prefix', () => {
+      expect(parseAgentbuddyCommand('npm_config_registry="https://reg.example" npx -y agentbuddy@latest skill collection add abc123')).toEqual({
+        protocol: 'skill',
+        collection: 'abc123',
+      });
+    });
+
+    it('parses a single skill add command with --skill / --version', () => {
+      expect(parseAgentbuddyCommand('agentbuddy skill add acme/team/mkt --skill deploy --version 1.2.3')).toEqual({
+        protocol: 'skill',
+        group: 'acme/team/mkt',
+        skill: 'deploy',
+        version: '1.2.3',
+      });
+    });
+
+    it('rejects non-install and malformed commands', () => {
+      expect(parseAgentbuddyCommand('agentbuddy skill publish ./x')).toBeNull();
+      expect(parseAgentbuddyCommand('agentbuddy login')).toBeNull();
+      expect(parseAgentbuddyCommand('agentbuddy mcp collection add x')).toBeNull(); // unsupported protocol
+      expect(parseAgentbuddyCommand('agentbuddy skill add acme --skill')).toBeNull(); // missing skill name
+      expect(parseAgentbuddyCommand('just some text')).toBeNull();
+      expect(() => parseAgentbuddyCommand('agentbuddy skill collection add ../etc')).toThrow(/invalid_agentbuddy_collection/);
+    });
+  });
+
+  describe('open-source skills CLI commands', () => {
+    it('routes `skills add owner/repo` to the GitHub install', () => {
+      expect(parseSkillInstallSource('skills add vercel-labs/agent-browser')).toMatchObject({
+        kind: 'github',
+        github: { owner: 'vercel-labs', repo: 'agent-browser' },
+      });
+      expect(parseSkillsInstallCommand('npx -y skills@latest add vercel-labs/agent-skills')).toMatchObject({
+        kind: 'github',
+        github: { owner: 'vercel-labs', repo: 'agent-skills' },
+      });
+      expect(parseSkillsInstallCommand('add-skill vercel-labs/agent-skills')).toMatchObject({
+        kind: 'github',
+        github: { owner: 'vercel-labs', repo: 'agent-skills' },
+      });
+    });
+
+    it('passes GitHub / git URLs through', () => {
+      expect(parseSkillsInstallCommand('skills add https://github.com/acme/skills')).toMatchObject({
+        kind: 'github', github: { owner: 'acme', repo: 'skills' },
+      });
+      expect(parseSkillsInstallCommand('skills add git@github.com:acme/skills.git')).toMatchObject({ kind: 'git' });
+    });
+
+    it('ignores non-add / non-command inputs', () => {
+      expect(parseSkillsInstallCommand('skills list')).toBeNull();
+      expect(parseSkillsInstallCommand('skills add')).toBeNull();
+      expect(parseSkillsInstallCommand('just some text')).toBeNull();
+    });
   });
 
   it('rejects git refs that could be parsed as checkout options', () => {

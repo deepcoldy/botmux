@@ -202,6 +202,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
 }));
 
 vi.mock('../src/im/lark/client.js', () => ({
+  UserTokenMissingError: class UserTokenMissingError extends Error {},
   deleteMessage: vi.fn(),
   sendMessage: vi.fn(async () => 'card-msg-id'),
   listChatBotMembers: vi.fn(async () => []),
@@ -318,6 +319,23 @@ vi.mock('../src/core/command-discovery.js', () => ({
 vi.mock('../src/utils/user-token.js', () => ({
   generateAuthUrl: vi.fn(() => ({ authUrl: 'https://open.feishu.cn/auth/v1/test' })),
   getTokenStatus: vi.fn(() => 'User token: active'),
+  resolveUserToken: vi.fn(async () => null),
+  DOC_COMMENT_OAUTH_SCOPES: ['docs:document.comment:read'],
+}));
+
+vi.mock('../src/im/lark/doc-comment.js', () => ({
+  resolveDocFile: vi.fn(async () => ({ fileToken: 'doc_token_12345678901234567890', fileType: 'docx' })),
+  listDocComments: vi.fn(async () => []),
+  subscribeDocFile: vi.fn(async () => {}),
+  unsubscribeDocFile: vi.fn(async () => {}),
+}));
+
+vi.mock('../src/services/doc-subs-store.js', () => ({
+  putDocSubscription: vi.fn(() => ({})),
+  removeDocSubscription: vi.fn(),
+  listDocSubscriptionsForSession: vi.fn(() => []),
+  listAllDocSubscriptions: vi.fn(() => []),
+  getDocSubscription: vi.fn(() => null),
 }));
 
 // The picker query helper now lives in services/relay-picker.ts — mock it so
@@ -398,7 +416,9 @@ import { deleteMessage, sendMessage, listChatBotMembers } from '../src/im/lark/c
 import { buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { getAllBots, getBot } from '../src/bot-registry.js';
-import { generateAuthUrl, getTokenStatus } from '../src/utils/user-token.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
+import { resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
+import { putDocSubscription, removeDocSubscription, listAllDocSubscriptions, getDocSubscription } from '../src/services/doc-subs-store.js';
 import { bindOncall } from '../src/services/oncall-store.js';
 import { existsSync, statSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -490,6 +510,7 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
     sessionReply: vi.fn(async () => 'reply-msg-id'),
     getActiveCount: vi.fn(() => activeSessions.size),
     lastRepoScan: new Map(),
+    prewarmDocCommentSession: vi.fn(async () => {}),
   };
 }
 
@@ -516,7 +537,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/insight', '/dashboard', '/vc-auth'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -524,6 +545,12 @@ describe('DAEMON_COMMANDS set', () => {
 
   it('should no longer contain the removed /skip command (folded into bare /repo)', () => {
     expect(DAEMON_COMMANDS.has('/skip')).toBe(false);
+  });
+
+  it('keeps one /watch-comment command family instead of several /doc-* commands', () => {
+    for (const removed of ['/doc-watch', '/doc-unwatch', '/doc-pending', '/doc-approve', '/doc-deny']) {
+      expect(DAEMON_COMMANDS.has(removed), `${removed} should not remain a top-level slash command`).toBe(false);
+    }
   });
 
   it('should not contain passthrough or unknown commands', () => {
@@ -537,10 +564,9 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 28 = 21 original + /land (sandbox-landing) + /term (operable-terminal slash)
-    //      + /subscribe-lark-doc (Feishu doc comment entry) + /skills + /insight
-    //      + /dashboard (card control-panel command group) + /vc-auth (VC instruction source auth).
-    expect(DAEMON_COMMANDS.size).toBe(28);
+    // 29 = the prior 28 commands + /watch-comment. /subscribe-lark-doc remains
+    // as its original per-file API subscription command rather than an alias.
+    expect(DAEMON_COMMANDS.size).toBe(29);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -629,6 +655,11 @@ describe('SESSIONLESS_DAEMON_COMMANDS set', () => {
     for (const cmd of SESSIONLESS_DAEMON_COMMANDS) {
       expect(DAEMON_COMMANDS.has(cmd), `${cmd} must also be a daemon command`).toBe(true);
     }
+  });
+
+  it('keeps the whole /watch-comment family session-less', () => {
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/watch-comment')).toBe(true);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/subscribe-lark-doc')).toBe(false);
   });
 
   it('excludes conversation/state commands that need a session', () => {
@@ -860,9 +891,191 @@ describe('handleCommand', () => {
     vi.clearAllMocks();
     vi.mocked(getBot).mockImplementation(defaultGetBot as any);
     vi.mocked(listCodexAppThreads).mockResolvedValue([]);
+    vi.mocked(resolveUserToken).mockResolvedValue(null);
+    vi.mocked(resolveDocFile).mockResolvedValue({ fileToken: 'doc_token_12345678901234567890', fileType: 'docx' });
+    vi.mocked(getDocSubscription).mockReturnValue(null);
+    vi.mocked(putDocSubscription).mockReturnValue({});
     // clearAllMocks wipes the factory default — restore legacy (include
     // worktrees) so /repo scan tests aren't passed `undefined` options.
     vi.mocked(repoPickerScanOptions).mockReturnValue({ includeWorktrees: true });
+  });
+
+  describe('doc comment commands', () => {
+    it('/subscribe-lark-doc keeps the original doc-scoped OAuth requirement', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/subscribe-lark-doc',
+        ROOT_ID,
+        makeLarkMessage('/subscribe-lark-doc https://example.feishu.cn/docx/AbCdEf12345678901234'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(generateAuthUrl).toHaveBeenCalledWith(
+        LARK_APP_ID,
+        'secret-1',
+        'feishu',
+        DOC_COMMENT_OAUTH_SCOPES,
+      );
+      expect(subscribeDocFile).not.toHaveBeenCalled();
+      expect(putDocSubscription).not.toHaveBeenCalled();
+    });
+
+    it('/subscribe-lark-doc still calls the per-file API after doc OAuth', async () => {
+      vi.mocked(resolveUserToken).mockResolvedValue('uat-doc');
+      const ds = makeDaemonSession({ scope: 'thread' });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/subscribe-lark-doc',
+        ROOT_ID,
+        makeLarkMessage('/subscribe-lark-doc https://example.feishu.cn/docx/AbCdEf12345678901234'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(subscribeDocFile).toHaveBeenCalledWith(LARK_APP_ID, {
+        fileToken: 'doc_token_12345678901234567890',
+        fileType: 'docx',
+      });
+      expect(putDocSubscription).toHaveBeenCalledWith(
+        expect.any(String),
+        LARK_APP_ID,
+        expect.objectContaining({ managedBy: 'subscribe-lark-doc' }),
+      );
+    });
+
+    it('/watch-comment works without a User Token and records the comment watch', async () => {
+      const ds = makeDaemonSession({ scope: 'thread' });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/watch-comment',
+        ROOT_ID,
+        makeLarkMessage('/watch-comment https://example.feishu.cn/docx/AbCdEf12345678901234 --all', { senderId: 'ou_owner' }),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(generateAuthUrl).not.toHaveBeenCalled();
+      expect(resolveUserToken).not.toHaveBeenCalled();
+      expect(subscribeDocFile).not.toHaveBeenCalled();
+      expect(deps.prewarmDocCommentSession).toHaveBeenCalledWith(
+        ds,
+        expect.objectContaining({ fileToken: 'doc_token_12345678901234567890', commentTriggerMode: 'all' }),
+      );
+      expect(putDocSubscription).toHaveBeenCalledWith(
+        expect.any(String),
+        LARK_APP_ID,
+        expect.objectContaining({
+          fileToken: 'doc_token_12345678901234567890',
+          sessionAnchor: ROOT_ID,
+          sessionId: 'sess-001',
+          scope: 'thread',
+          commentTriggerMode: 'all',
+          managedBy: 'watch-comment',
+        }),
+      );
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('正在启动并预热 AI 会话'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('/watch-comment without a session stores a doc-native lazy binding only', async () => {
+      const deps = makeDeps();
+
+      await handleCommand(
+        '/watch-comment',
+        ROOT_ID,
+        makeLarkMessage('/watch-comment https://example.feishu.cn/docx/AbCdEf12345678901234 --dir /work/repo', { senderId: 'ou_owner' }),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(resolveUserToken).not.toHaveBeenCalled();
+      expect(subscribeDocFile).not.toHaveBeenCalled();
+      expect(putDocSubscription).toHaveBeenCalledWith(
+        expect.any(String),
+        LARK_APP_ID,
+        expect.objectContaining({
+          fileToken: 'doc_token_12345678901234567890',
+          sessionAnchor: 'doc:doc_token_12345678901234567890',
+          sessionId: undefined,
+          scope: 'chat',
+          chatId: 'doc:doc_token_12345678901234567890',
+          workingDir: '/work/repo',
+          managedBy: 'watch-comment',
+        }),
+      );
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('首条符合条件的评论到来时自动创建文档会话'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('/watch-comment list without a session lists all doc-native watches (owner-only command)', async () => {
+      vi.mocked(listAllDocSubscriptions).mockReturnValue([
+        {
+          fileToken: 'doc-owned', fileType: 'docx', sessionAnchor: 'doc:doc-owned', scope: 'chat',
+          chatId: 'doc:doc-owned', commentTriggerMode: 'mention-only', managedBy: 'watch-comment',
+          ownerOpenId: 'ou_owner', createdAt: 1,
+        },
+        {
+          fileToken: 'doc-other', fileType: 'docx', sessionAnchor: 'doc:doc-other', scope: 'chat',
+          chatId: 'doc:doc-other', commentTriggerMode: 'mention-only', managedBy: 'watch-comment',
+          ownerOpenId: 'ou_other', createdAt: 1,
+        },
+      ]);
+      const deps = makeDeps();
+
+      await handleCommand('/watch-comment', ROOT_ID, makeLarkMessage('/watch-comment list', { senderId: 'ou_owner' }), deps, LARK_APP_ID);
+
+      // 命令已收归 owner-only，owner 应看到全部订阅（含非 owner 触发的 auto-sub）
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] ?? '';
+      expect(reply).toContain('doc-owned');
+      expect(reply).toContain('doc-other');
+    });
+
+    it('/watch-comment off all without a session removes all watch records (owner-only command)', async () => {
+      vi.mocked(listAllDocSubscriptions).mockReturnValue([
+        {
+          fileToken: 'doc-owned', fileType: 'docx', sessionAnchor: 'doc:doc-owned', scope: 'chat',
+          chatId: 'doc:doc-owned', commentTriggerMode: 'mention-only', managedBy: 'watch-comment',
+          ownerOpenId: 'ou_owner', createdAt: 1,
+        },
+        {
+          fileToken: 'doc-other-user', fileType: 'docx', sessionAnchor: 'doc:doc-other-user', scope: 'chat',
+          chatId: 'doc:doc-other-user', commentTriggerMode: 'mention-only', managedBy: 'watch-comment',
+          ownerOpenId: 'ou_other', createdAt: 1,
+        },
+      ]);
+      const deps = makeDeps();
+
+      await handleCommand('/watch-comment', ROOT_ID, makeLarkMessage('/watch-comment off all', { senderId: 'ou_owner' }), deps, LARK_APP_ID);
+
+      // owner off-all 应清除全部 watch 订阅（不再按 ownerOpenId 过滤）
+      expect(removeDocSubscription).toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, 'doc-owned');
+      expect(removeDocSubscription).toHaveBeenCalledWith(expect.any(String), LARK_APP_ID, 'doc-other-user');
+      expect(unsubscribeDocFile).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('2 个'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
   });
 
   // ─── /close ─────────────────────────────────────────────────────────────

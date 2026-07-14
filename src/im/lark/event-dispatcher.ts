@@ -15,17 +15,18 @@ import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId } from './message-parser.js';
+import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, extractMentionIdentities, type MentionIdentity } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMemberChat } from '../../services/platform-team-store.js';
 import { recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
-import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
-import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed } from './doc-comment.js';
+import { getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
+import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL } from './doc-comment.js';
 import {
   BOTMUX_REQUIRED_SCOPES,
   DOC_FEATURE_SCOPES,
+  DOC_WATCH_SCOPES,
   DOC_COMMENT_EVENT,
   VC_MEETING_BOT_EVENTS,
   VC_MEETING_FEATURE_SCOPES,
@@ -33,9 +34,11 @@ import {
   buildEventSubDeepLink,
   buildScopeDeepLink,
 } from '../../setup/verify-permissions.js';
+import { automateOpenPlatformSetup } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
+import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
@@ -45,6 +48,7 @@ import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode } from '../../services/chat-reply-mode-store.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
+import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
 import {
   parseVcMeetingPushEvent,
   VC_BOT_MEETING_ACTIVITY_EVENT,
@@ -210,6 +214,93 @@ async function dmAdmin(larkAppId: string, adminOpenId: string, content: string, 
   }
 }
 
+/**
+ * Try to auto-fix missing scopes using the same Open Platform web-session
+ * automation that powers `botmux setup`. If ~/.botmux/feishu-session.json holds
+ * a valid cached session, this adds all botmux-required scopes and publishes
+ * a new app version — no user interaction needed.
+ *
+ * Returns `true` if scopes were successfully applied (caller should stop),
+ * `false` to fall through to the manual DM warning.
+ */
+async function tryAutoFixScopes(
+  larkAppId: string,
+  bot: BotState,
+  brand: Brand,
+  missingCritical: { name: string; desc: string }[],
+  missingOptional: { name: string; desc: string }[],
+): Promise<boolean> {
+  if (brand !== 'feishu') return false;
+
+  try {
+    logger.info(`[${larkAppId}] attempting auto-fix for ${missingCritical.length} missing scopes via Open Platform...`);
+    const result = await automateOpenPlatformSetup({
+      appId: bot.config.larkAppId,
+      brand,
+      maxWaitMs: 60_000,
+      onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
+      onQrCode: (info) => {
+        logger.warn(
+          `[${larkAppId}] auto-fix: cached Feishu web session expired, QR login needed. ` +
+          `Run \`botmux setup\` to refresh session, or manually apply scopes from deep links below. ` +
+          `QR text (first 80 chars): ${info.qrText.substring(0, 80)}...`,
+        );
+      },
+    });
+
+    if (result.ok) {
+      const scopeDetail = result.scopeCount > 0
+        ? `${result.scopeCount} 项权限已导入${result.skippedScopeCount > 0 ? `（${result.skippedScopeCount} 项跳过）` : ''}`
+        : '所有必需权限已在应用清单中';
+      logger.info(
+        `[${larkAppId}] auto-fix succeeded: ${scopeDetail}, ` +
+        `version ${result.versionId ?? 'n/a'} published, ` +
+        `${result.subscribedEventCount} events subscribed`,
+      );
+      // Notify admin that auto-fix worked — even if im:message was missing before,
+      // the newly published version should now have it.
+      const adminOpenId = getAdminOpenId(bot);
+      if (adminOpenId) {
+        const missingList = missingCritical.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n');
+        const optionalNote = missingOptional.length > 0
+          ? `\n\n另有 ${missingOptional.length} 项可选权限未开通：${missingOptional.map(s => s.name).join('、')}`
+          : '';
+        await dmAdmin(
+          larkAppId,
+          adminOpenId,
+          `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n${missingList}\n\n` +
+          `${scopeDetail}，新版本已发布。\n` +
+          `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。${optionalNote}`,
+          `auto-fixed ${missingCritical.length} scopes`,
+        );
+      }
+      return true;
+    }
+
+    // Auto-fix failed — log reason and fall through to manual DM.
+    const reasons: Record<string, string> = {
+      missing_session: '无可用的 Feishu Web session',
+      invalid_session: 'Web session 已失效',
+      login_failed: 'Web session 登录失败',
+      qr_expired: '需要扫码但二维码已过期',
+      timeout: '等待扫码超时',
+      unsupported_brand: '仅支持 feishu.cn 租户',
+      network: '网络错误',
+      missing_csrf: '开放平台页面未返回 CSRF token',
+      scope_mapping_failed: '权限映射失败',
+      api_error: '开放平台 API 错误',
+    };
+    logger.warn(
+      `[${larkAppId}] auto-fix not possible (${result.reason}: ${reasons[result.reason] ?? result.message}). ` +
+      `Falling back to manual deep-link DM.`,
+    );
+    return false;
+  } catch (err: any) {
+    logger.warn(`[${larkAppId}] auto-fix error: ${err?.message ?? err} — falling back to manual DM`);
+    return false;
+  }
+}
+
 export async function checkRequiredScopes(larkAppId: string): Promise<void> {
   const bot = getBot(larkAppId);
   const brand = normalizeBrand(bot.config.brand);
@@ -236,6 +327,14 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // scope 列表。这种"鸡生蛋"情况单独提示：让 admin 开通免审批的
     // self_manage 后下次重启就能自检了。
     if (infoData.code === 99991672) {
+      // Chicken-and-egg: app lacks self_manage so we can't even check what scopes
+      // are missing. Try the Open Platform web-session auto-fix to add ALL
+      // required scopes (including self_manage) in one shot.
+      if (brand === 'feishu') {
+        const fixed = await tryAutoFixScopes(larkAppId, bot, brand,
+          [{ name: SELF_MANAGE_SCOPE, desc: '应用自查 (免审批)' }], []);
+        if (fixed) return;
+      }
       const selfManageAuthUrl = buildScopeDeepLink(bot.config.larkAppId, SELF_MANAGE_SCOPE, brand);
       const targetAuthUrl = buildScopeDeepLink(bot.config.larkAppId, REQUIRED_BOT_AT_SCOPE, brand);
       logger.warn(
@@ -284,21 +383,33 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     try {
       const docSubs = listAllDocSubscriptions(config.session.dataDir, larkAppId);
       if (docSubs.length > 0) {
-        const missingDoc = DOC_FEATURE_SCOPES.filter(s => !grantedScopes.has(s.name));
+        const hasWatch = docSubs.some(s => s.managedBy === 'watch-comment');
+        // Historical records have no managedBy and belong to the legacy
+        // /subscribe-lark-doc flow, which still needs every OAuth/subscribe scope.
+        const hasApiSubscribe = docSubs.some(s => s.managedBy !== 'watch-comment');
+        const requiredDocScopes = [
+          ...(hasWatch ? DOC_WATCH_SCOPES : []),
+          ...(hasApiSubscribe ? DOC_FEATURE_SCOPES : []),
+        ].filter((scope, index, all) => all.findIndex(s => s.name === scope.name) === index);
+        const missingDoc = requiredDocScopes.filter(s => !grantedScopes.has(s.name));
+        const featureLabel = [
+          hasWatch ? '/watch-comment' : '',
+          hasApiSubscribe ? '/subscribe-lark-doc' : '',
+        ].filter(Boolean).join(' + ');
         if (missingDoc.length > 0) {
           const summary = missingDoc.map(s => `${s.name}(${s.desc})`).join('、');
-          logger.error(`[${larkAppId}] 文档评论入口已在用（${docSubs.length} 个订阅）但缺 ${missingDoc.length} 项文档权限：${summary}。评论将收不到/回不了，请到权限管理开通后 botmux restart。`);
+          logger.error(`[${larkAppId}] ${featureLabel} 已在用（${docSubs.length} 个绑定）但缺 ${missingDoc.length} 项文档权限：${summary}。评论将收不到/回不了，请到权限管理开通后 botmux restart。`);
           const adminDoc = getAdminOpenId(bot);
           if (adminDoc) {
             const lines = missingDoc.map((s, i) => `${i + 1}. **${s.desc}** (\`${s.name}\`)\n   ${buildScopeDeepLink(bot.config.larkAppId, s.name, brand)}`).join('\n\n');
             await dmAdmin(larkAppId, adminDoc,
-              `⚠️ 机器人 "${bot.botName ?? larkAppId}" 已订阅 ${docSubs.length} 个飞书文档（/subscribe-lark-doc），但缺少文档评论所需权限：\n\n${lines}\n\n` +
+              `⚠️ 机器人 "${bot.botName ?? larkAppId}" 已通过 ${featureLabel} 绑定 ${docSubs.length} 个飞书文档，但缺少对应权限：\n\n${lines}\n\n` +
               `另外请确认开发者后台「事件订阅」里已添加 **\`${DOC_COMMENT_EVENT}\`**（云文档新增评论）事件——该事件无法被自动检测，缺它则评论永远收不到。\n\n开通 + 订阅事件后执行 \`botmux restart\`。`,
               `missing doc-feature scopes: ${missingDoc.map(s => s.name).join(',')}`);
           }
         } else {
           // 权限齐了——事件订阅查不了，仅 info 记一条提醒（不 DM 免重启刷屏）。
-          logger.info(`[${larkAppId}] doc-comment 权限齐全（${docSubs.length} 订阅）；请确保后台已订阅事件 ${DOC_COMMENT_EVENT}（无法自动检测）`);
+          logger.info(`[${larkAppId}] ${featureLabel} 文档权限齐全（${docSubs.length} 绑定）；请确保后台已订阅事件 ${DOC_COMMENT_EVENT}（无法自动检测）`);
         }
       }
     } catch (err: any) {
@@ -359,6 +470,13 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       logger.info(`[${larkAppId}] all critical scopes granted (${BOTMUX_REQUIRED_SCOPES.filter(s => s.critical).length} checked)`);
       return;
     }
+
+    // Auto-fix: try the same Open Platform automation used by `botmux setup`.
+    // If a cached Feishu web session exists (~/.botmux/feishu-session.json), we can
+    // directly add missing scopes and publish a new version without user interaction.
+    // Falls through to manual DM warning if session is missing/expired.
+    const autoFixed = await tryAutoFixScopes(larkAppId, bot, brand, missingCritical, missingOptional);
+    if (autoFixed) return;
 
     // Log + DM consolidated message listing all missing critical scopes.
     const summaryLine = missingCritical.map(s => `${s.name} (${s.desc})`).join('、');
@@ -953,6 +1071,41 @@ export function mentionsAnotherMember(larkAppId: string, message: any): boolean 
   return false;
 }
 
+function substituteTargetMatchesMention(target: {
+  openId?: string;
+  userId?: string;
+  unionId?: string;
+}, mention: MentionIdentity): boolean {
+  return Boolean(
+    (target.openId && mention.openId === target.openId) ||
+    (target.userId && mention.userId === target.userId) ||
+    (target.unionId && mention.unionId === target.unionId),
+  );
+}
+
+export function resolveSubstituteTrigger(
+  larkAppId: string,
+  message: any,
+): import('../../types.js').SubstituteTrigger | undefined {
+  const cfg = getBot(larkAppId).config.substituteMode;
+  if (!cfg?.enabled || !cfg.targets?.length) return undefined;
+  const mentions = extractMentionIdentities(message);
+  for (const mention of mentions) {
+    const target = cfg.targets.find(t => substituteTargetMatchesMention(t, mention));
+    if (!target) continue;
+    return {
+      target: {
+        name: target.name ?? mention.name,
+        openId: target.openId ?? mention.openId,
+        userId: target.userId ?? mention.userId,
+        unionId: target.unionId ?? mention.unionId,
+      },
+      disclosure: cfg.disclosure ?? 'prefix',
+    };
+  }
+  return undefined;
+}
+
 function mentionMatchesBot(m: any, larkAppId: string, botOpenId?: string): boolean {
   const openId = mentionOpenId(m);
   if (botOpenId && openId === botOpenId) return true;
@@ -1240,6 +1393,8 @@ export interface RoutingContext {
   promptOverride?: string;
   /** Metadata for the summary command that produced promptOverride. */
   summaryCommand?: SummaryCommandRuntimeContext;
+  /** This turn was triggered by @mentioning a configured substitute person. */
+  substituteTrigger?: import('../../types.js').SubstituteTrigger;
   larkAppId: string;
 }
 
@@ -1265,9 +1420,9 @@ export interface EventHandlers {
    *  — which in a 话题群 wraps each top-level message in a fresh topic.
    *  Best-effort fire-and-forget; the dispatcher proceeds either way. */
   onChatModeConverted?: (chatId: string, larkAppId: string) => void;
-  /** 文档评论入口（/subscribe-lark-doc）：一条命中订阅的文档评论被喂进其绑定
+  /** 文档评论入口（/watch-comment / /subscribe-lark-doc）：一条命中文档绑定的评论被喂进
    *  会话。daemon 负责定位会话、投递给 worker、记录该轮回评论的落点。 */
-  handleDocComment?: (ctx: DocCommentContext) => Promise<void>;
+  handleDocComment?: (ctx: DocCommentContext) => Promise<boolean>;
   /** VC bot meeting push events (`vc.bot.meeting_*_v1`). ACK-safe; daemon owns meeting session state. */
   handleVcMeetingPush?: (ctx: VcMeetingPushContext) => Promise<void>;
   /** Best-effort hook before a human inbound turn reaches the CLI session. Used
@@ -1291,6 +1446,12 @@ export interface DocCommentContext {
   replyId?: string;
   /** 评论纯文本（喂给模型的用户消息）。 */
   text: string;
+  /** 局部评论选中的文档原文。 */
+  selectedText?: string;
+  /** 触发回复之前，该评论串已有的讨论。 */
+  priorReplies?: Array<{ authorOpenId?: string; text: string }>;
+  /** 是否为整篇文档的全文评论。 */
+  isWhole?: boolean;
   /** 评论发表者 open_id。 */
   authorOpenId?: string;
 }
@@ -1656,11 +1817,34 @@ async function processCommentEvent(
     return;
   }
 
-  // 1) 必须是已订阅的文档（per-文档订阅 → 主键命中才处理）
-  const sub = getDocSubscription(config.session.dataDir, larkAppId, fileToken);
+  // 1) 查订阅表；未订阅的文档 @bot 时自动创建 mention-only 订阅（任何人都可以
+  //    通过在文档里 @bot 触发 bot 回复，不需要 owner 预先订阅。/watch-comment 命令
+  //    管理持久订阅才需要 owner 权限）。
+  //    注意：auto-sub 先创建占位，但如果后续审计硬门失败会回滚（非 owner 触发
+  //    且通知 owner 失败时不允许留下订阅记录）。
+  let sub = getDocSubscription(config.session.dataDir, larkAppId, fileToken);
+  let autoCreatedSub = false;
   if (!sub) {
-    logger.info(`[doc-comment] event dropped: file_token=${fileToken.slice(0, 12)} 不在订阅表（已订阅的可 /subscribe-lark-doc list 查；注意 wiki 链接会解析成底层 obj_token）`);
-    return;
+    const operatorOpenId = parsed.operatorOpenId;
+    const botCfg = getBot(larkAppId).config;
+    const mappedDir = botCfg.docRepoMap?.[fileToken];
+    const autoSub: DocSubscription = {
+      fileToken,
+      fileType: parsed.fileType || 'docx',
+      sessionAnchor: `doc:${fileToken}`,
+      sessionId: undefined,
+      scope: 'chat',
+      chatId: `doc:${fileToken}`,
+      commentTriggerMode: 'mention-only',
+      managedBy: 'watch-comment',
+      ownerOpenId: operatorOpenId || getOwnerOpenId(larkAppId),
+      workingDir: mappedDir,
+      createdAt: Date.now(),
+    };
+    putDocSubscription(config.session.dataDir, larkAppId, autoSub);
+    sub = autoSub;
+    autoCreatedSub = true;
+    logger.info(`[doc-comment] auto-subscribed file=${fileToken.slice(0, 12)} by @mention (mention-only${mappedDir ? `, wd=${mappedDir}` : ''}, anchor=doc:${fileToken.slice(0, 12)}, requester=${operatorOpenId?.slice(0, 12) || '?'})`);
   }
 
   // 关掉 open_id 启动竞态：probeBotOpenId 在启动时 fire-and-forget，若评论事件
@@ -1679,6 +1863,7 @@ async function processCommentEvent(
   const trigger = parsed.replyId
     ? comment.replies.find(r => r.replyId === parsed.replyId) ?? comment.replies[comment.replies.length - 1]
     : comment.replies[comment.replies.length - 1];
+  const triggerIndex = Math.max(0, comment.replies.indexOf(trigger));
 
   // 3) 自触发过滤（防死循环）：bot 的回复可能以应用身份（作者=bot open_id）或回退
   //    用户身份（作者=授权用户，无法靠作者区分）发出。三重保险：①作者==本 bot
@@ -1698,6 +1883,38 @@ async function processCommentEvent(
   const text = trigger.text.trim();
   if (!text) return;
 
+  // 审计硬门：非 owner @bot 触发时，必须成功通知 owner 才允许回复。
+  // 通知失败 = owner 无法感知 = 越权，直接拒绝响应并回滚 auto-sub。
+  // （owner 自己触发的不通知，直接放行。）
+  const ownerOpenId = getOwnerOpenId(larkAppId);
+  const requesterOpenId = parsed.operatorOpenId;
+  const isOwnerTrigger = ownerOpenId && requesterOpenId && requesterOpenId === ownerOpenId;
+  if (!isOwnerTrigger) {
+    const rollbackAutoSub = () => { if (autoCreatedSub) removeDocSubscription(config.session.dataDir, larkAppId, fileToken); };
+    if (!ownerOpenId) {
+      logger.warn(`[doc-comment] non-owner @mention but no ownerOpenId configured — rejecting (audit gate) file=${fileToken.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'}`);
+      rollbackAutoSub();
+      return;
+    }
+    try {
+      const loc = localeForBot(larkAppId);
+      const requesterName = requesterOpenId?.slice(0, 12) || '?';
+      const notifyText = [
+        t('daemon.doc_mention_notify_title', undefined, loc),
+        '',
+        t('daemon.doc_mention_notify_body', { requester: requesterName, token: fileToken.slice(0, 12) }, loc),
+        '',
+        `📄 \`${fileToken}\``,
+        `💬 ${text.slice(0, 200)}${text.length > 200 ? '…' : ''}`,
+      ].join('\n');
+      await sendUserMessage(larkAppId, ownerOpenId, notifyText);
+    } catch (e) {
+      logger.warn(`[doc-comment] non-owner @mention but owner notification failed — rejecting (audit gate) file=${fileToken.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'} err=${e instanceof Error ? e.message : String(e)}`);
+      rollbackAutoSub();
+      return;
+    }
+  }
+
   logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
   await handlers.handleDocComment({
     larkAppId,
@@ -1705,6 +1922,12 @@ async function processCommentEvent(
     commentId,
     replyId: trigger.replyId || commentId,
     text,
+    selectedText: comment.quote,
+    priorReplies: comment.replies.slice(0, triggerIndex).map(reply => ({
+      authorOpenId: reply.userId,
+      text: reply.text.replaceAll(BOT_REPLY_SENTINEL, '').trim(),
+    })).filter(reply => reply.text.length > 0),
+    isWhole: comment.isWhole,
     authorOpenId: trigger.userId,
   });
 }
@@ -1734,9 +1957,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }
       }, 'bot-added event');
     },
-    // 文档评论入口（/subscribe-lark-doc）。飞书评论事件命名在 v1/v2 间有差异，
-    // 两个候选名都注册（同一处理器）——真机一锤定音后可删冗余。需在开发者后台
-    // 订阅对应事件。注意：评论事件是 per-文档 推送（订阅时按 file_token 注册）。
+    // 文档评论入口（/watch-comment / /subscribe-lark-doc）。notice 事件主要覆盖 @Bot
+    // 通知；旧逐文件订阅还可能收到 file 事件。`/watch-comment --all` 的普通评论由
+    // daemon 应用身份轮询补齐，不依赖逐文件 subscribe API。
     'drive.file.comment_add_v1': (data: any) => handleCommentEventAckSafe(data, larkAppId, handlers),
     'drive.notice.comment_add_v1': (data: any) => handleCommentEventAckSafe(data, larkAppId, handlers),
     [VC_BOT_MEETING_INVITED_EVENT]: (data: any) =>
@@ -1989,6 +2212,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           return;
         }
 
+        if (await tryHandleSubstituteCommand(larkAppId, message, senderOpenId)) {
+          return;
+        }
+
         // /grant、/revoke — 群内授权元命令。在路由/spawn 之前拦截（仅 owner，需明确 @ 本 bot），
         // 否则会被当成 prompt 喂给 CLI 会话。
         if (await tryHandleGrantCommand(larkAppId, message, senderOpenId)) {
@@ -2019,6 +2246,30 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         let routingSource = decision.source;
         let replyRootId: string | undefined;
         const explicitlyMentionedThisBot = isBotMentioned(larkAppId, message, senderOpenId);
+        // Cheap in-memory gate FIRST: skip the getChatMode roundtrip and the
+        // per-chat toggle disk read entirely for bots that never configured a
+        // substitute target (the overwhelming majority on the hot path).
+        let substituteTrigger = getBot(larkAppId).config.substituteMode?.enabled === true
+          && chatType === 'group'
+          && await getChatMode(larkAppId, chatId) === 'group'
+          && isSubstituteEnabledForChat(larkAppId, chatId)
+          ? resolveSubstituteTrigger(larkAppId, message)
+          : undefined;
+        if (substituteTrigger && !explicitlyMentionedThisBot) {
+          const rawText = extractMessageTextForRouting(message);
+          const stripped = rawText ? stripLeadingMentions(rawText.trim(), message?.mentions ?? []).trim() : '';
+          if (stripped.startsWith('/')) substituteTrigger = undefined;
+        }
+        if (substituteTrigger) {
+          routing.scope = 'chat';
+          routing.anchor = chatId;
+          routingSource = 'regular-group-chat';
+          if (message.root_id && message.thread_id) replyRootId = message.root_id;
+          logger.info(
+            `[substitute:${larkAppId}] mention target=${substituteTrigger.target.name ?? substituteTrigger.target.openId ?? substituteTrigger.target.userId ?? substituteTrigger.target.unionId ?? 'unknown'} ` +
+            `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)} → chat-scope`,
+          );
+        }
 
         // Shared-mode follow-up: a non-@ message inside a Lark thread can belong
         // to the regular group's chat-scope session when that root was registered
@@ -2090,7 +2341,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // /t / /topic in 普通群: flip routing to thread-scope so the bot's
         // first reply seeds a fresh Lark thread, even if a chat-scope session
         // is currently active in this chat.
-        const forceTopicApplied = maybeApplyForceTopicOverride(routing, message, messageId);
+        const forceTopicApplied = substituteTrigger ? false : maybeApplyForceTopicOverride(routing, message, messageId);
         if (forceTopicApplied) {
           logger.info(`[/t] Force-topic override: msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
         }
@@ -2212,6 +2463,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             && !!message.thread_id
             && await getChatMode(larkAppId, chatId) === 'topic';
           const relax = (!!replyRootId && isAllowed)
+            || (!!substituteTrigger && isAllowed)
             || (isAllowed && mentionMode === 'never')
             || (isAllowed && mentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message))
             || ownedTopicGroupFollowup
@@ -2271,6 +2523,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           summaryCommand: summaryCommandTriggered && summaryCommandMatch
             ? { name: 'summary-command', chatKind: summaryCommandMatch.chatKind }
             : undefined,
+          substituteTrigger,
         };
         if (explicitlyMentionedThisBot) {
           await handlers.beforeSessionTurn?.(data, ctx, { senderOpenId, explicitlyMentionedThisBot });

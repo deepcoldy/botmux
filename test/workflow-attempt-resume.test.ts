@@ -244,9 +244,9 @@ describe('AttemptResumeManager', () => {
     }
   });
 
-  it('requires native cliSessionId only for CLIs that cannot use botmux session id', async () => {
+  it.each(['cursor', 'kiro-cli'])('requires native cliSessionId for %s', async (cliId) => {
     const tmp = join(tmpdir(), `wf-resume-${Date.now()}-${Math.random()}`);
-    const ids = seedAttempt(tmp, { cliSessionId: null, cliId: 'cursor' });
+    const ids = seedAttempt(tmp, { cliSessionId: null, cliId });
     const { factory, spawns } = makeFactory();
     try {
       const manager = new AttemptResumeManager({
@@ -254,7 +254,7 @@ describe('AttemptResumeManager', () => {
         externalHost: 'dash.local',
         workerPath: '/worker.js',
         factory,
-        resolveBot: () => ({ ...bot, cliId: 'cursor' }),
+        resolveBot: () => ({ ...bot, cliId }),
       });
 
       const result = await manager.start(ids);

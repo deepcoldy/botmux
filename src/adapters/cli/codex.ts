@@ -125,6 +125,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'codex',
+    mcpGateway: {
+      configPath: '~/.codex/config.toml',
+      format: 'codex-toml',
+    },
     // codex 0.137's own filesystem profile can't express a read blocklist, so
     // isolation is enforced by the worker's whole-process macOS Seatbelt wrapper.
     // e2e verified: codex under `sandbox-exec -f <profile>` (with bypass) is
@@ -151,6 +155,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         '--no-alt-screen',
         '-c',
         `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(sessionId)}`,
+        // A botmux session cannot safely interact with Codex's startup update
+        // picker: the first queued Lark message can be consumed by the menu.
+        // Treat botmux as the runtime manager for every launch (sandboxed or
+        // not); the host-side daily monitor reports newer versions to the owner.
+        '-c',
+        'check_for_update_on_startup=false',
       ];
       // Under read isolation the worker denies bots.json, so `botmux send` (a shell
       // subprocess) registers this bot from the worker-written cred FILE, keyed by
@@ -280,7 +290,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    readyPattern: /›|\d+% left/,  // › for input box, or status bar pattern (e.g. "97% left")
+    // Codex's update picker also renders `› 1. Update now`; a bare /›/ treats
+    // that menu as the composer and lets botmux's queued first message select
+    // the update. Keep accepting the composer marker anywhere in a TUI redraw,
+    // but reject numbered menu choices. This remains necessary for wrappers
+    // such as Aiden that cannot forward the startup-update config override.
+    readyPattern: /›(?!\s*\d+\.)|\d+% left/,
     defaultPassthroughCommands: ['/goal'],
     systemHints: BOTMUX_SHELL_HINTS,
     // Codex 0.134.0+ accepts a message while the current turn is still running:

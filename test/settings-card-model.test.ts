@@ -13,6 +13,7 @@ function makeSettings(overrides: Partial<DashboardSettingsInput> = {}): Dashboar
   return {
     publicReadOnly: false,
     openTerminalInFeishu: false,
+    enableLocalCliOpen: false,
     maintenance: {},
     localDevInstall: false,
     ...overrides,
@@ -24,7 +25,7 @@ describe('settings-card-model · composeSections', () => {
     const dto = composeSections(makeSettings());
     expect(dto.sections.map(s => s.key)).toEqual(['access', 'cards', 'maintenance']);
     expect(dto.sections[0].toggles.map(t => t.key)).toEqual(['publicReadOnly']);
-    expect(dto.sections[1].toggles.map(t => t.key)).toEqual(['openTerminalInFeishu']);
+    expect(dto.sections[1].toggles.map(t => t.key)).toEqual(['openTerminalInFeishu', 'enableLocalCliOpen']);
     expect(dto.sections[2].toggles.map(t => t.key)).toEqual(['autoUpdate', 'autoRestart']);
   });
 
@@ -48,6 +49,16 @@ describe('settings-card-model · composeSections', () => {
     // PR3 UI revision: per-toggle reasonKey MUST cite local-dev specifically
     expect(autoUpdate.state.reasonKey).toBe('settings.autoUpdate.disabled.localDev');
     expect(autoUpdate.time?.state.reasonKey).toBe('settings.autoUpdate.disabled.localDev');
+  });
+
+  it('grays out autoUpdate for an unsupported global install with a specific reason', () => {
+    const dto = composeSections(makeSettings({ autoUpdateSupported: false }));
+    const maintenance = dto.sections[2];
+    const autoUpdate = maintenance.toggles[0];
+    expect(autoUpdate.state.enabled).toBe(false);
+    expect(autoUpdate.time?.state.enabled).toBe(false);
+    expect(maintenance.hintKey).toBe('settings.autoUpdateUnsupportedInstall');
+    expect(autoUpdate.state.reasonKey).toBe('settings.autoUpdate.disabled.unsupportedInstall');
   });
 
   it('grays out autoRestart whenever autoUpdate.enabled !== true (covers undefined, false, and true), with autoUpdate-dependency reason', () => {
@@ -85,9 +96,10 @@ describe('settings-card-model · helpers', () => {
     expect(shouldDisableAutoRestart(makeSettings({ maintenance: { autoUpdate: { enabled: true } } }))).toBe(false);
   });
 
-  it('shouldDisableAutoUpdate returns true iff localDevInstall === true (independent of other fields)', () => {
+  it('shouldDisableAutoUpdate covers local-dev and unsupported global installs', () => {
     expect(shouldDisableAutoUpdate(makeSettings({ localDevInstall: true }))).toBe(true);
     expect(shouldDisableAutoUpdate(makeSettings({ localDevInstall: false }))).toBe(false);
+    expect(shouldDisableAutoUpdate(makeSettings({ autoUpdateSupported: false }))).toBe(true);
     expect(shouldDisableAutoUpdate(makeSettings({
       localDevInstall: true,
       publicReadOnly: true,

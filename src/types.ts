@@ -1,4 +1,5 @@
 import type { BackendType } from './adapters/backend/types.js';
+import type { BotSkillPolicy } from './core/skills/types.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
 
 /** Runtime status the worker derives from screen content. */
@@ -45,6 +46,10 @@ export interface Session {
   webPort?: number;
   larkAppId?: string;
   ownerOpenId?: string;       // topic creator's open_id — for @mention in replies
+  /** Best-effort human-readable title for direct/p2p chats. Lark chat APIs
+   *  often return an empty chat name for p2p, so dashboard rows carry the
+   *  initiating user's display name here when we can resolve it. */
+  chatDisplayName?: string;
   /** open_id of whoever created this session (the first sender), app-scoped to
    *  this bot. UNLIKE ownerOpenId, this is set even for bot-started (foreign-bot)
    *  sessions and is NEVER overwritten by later activity — so it stably points at
@@ -84,12 +89,14 @@ export interface Session {
    */
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
   /**
-   * 文档评论入口（/subscribe-lark-doc）：当本会话「当前这一轮」由飞书文档评论
+   * 文档评论入口（/watch-comment / /subscribe-lark-doc）：当本会话「当前这一轮」由飞书文档评论
    * 触发时，`botmux send` 的用户可见回复要回到该文档评论（而非飞书）。因 botmux
-   * send 跑在独立 CLI 子进程、只能从磁盘读会话态，故把当前轮的回评论落点持久化
-   * 在这里。每开新轮重置（beginNewTurn 清空；handleDocComment 设值）。
+   * send 跑在独立 CLI 子进程、只能从磁盘读会话态，故把每轮的回评论落点按 turnId
+   * 持久化在这里。per-turn map 避免并发评论串线（A 轮还在跑、B 轮到达不会覆盖 A 的
+   * 落点）。botmux send 用 `BOTMUX_TURN_ID` 取自己那轮的 target；turn 结束后由
+   * deliverFinalOutput / botmux send 成功路径清理对应 entry。
    */
-  currentDocCommentTarget?: { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string };
+  docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string }>;
   /** open_id of the quote-target message's sender — used by --mention-back. */
   quoteTargetSenderOpenId?: string;
   /** Whether the quote-target sender is a bot (vs a human) — drives the
@@ -200,8 +207,19 @@ export interface LarkMention {
   key: string;        // e.g. "@_user_1"
   name: string;       // display name
   openId?: string;    // open_id of the mentioned user/bot
+  userId?: string;    // user_id of the mentioned user, when Lark includes it
   unionId?: string;   // stable user id across bot app namespaces when present
   idType?: string;     // e.g. "open_id" or "app_id" from Lark event payloads
+}
+
+export interface SubstituteTrigger {
+  target: {
+    name?: string;
+    openId?: string;
+    userId?: string;
+    unionId?: string;
+  };
+  disclosure?: 'prefix' | 'none';
 }
 
 export interface LarkMessage {
@@ -306,7 +324,7 @@ export type TermActionKey =
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
   | { type: 'message'; content: string; turnId?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -346,6 +364,7 @@ export type WorkerToDaemon =
   | { type: 'prompt_ready' }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string }
   | { type: 'error'; message: string }
+  | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string }
   | { type: 'tui_prompt_resolved'; selectedText?: string }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState }
@@ -356,6 +375,11 @@ export type WorkerToDaemon =
        *  routing the reply so a stale/wrongly-bound worker cannot post into
        *  another Lark thread. Optional for one release to accept older workers. */
       sessionId?: string;
+      /** Native Hermes messages.session_id that actually produced this
+       *  content. Daemon uses it as a second consistency check after the
+       *  worker-side Hermes state.db filter, catching stale/missing stamps
+       *  without making this field the sole source-binding mechanism. */
+      sourceHermesSessionId?: string;
       content: string;
       lastUuid: string;
       turnId: string;

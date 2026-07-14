@@ -6,30 +6,8 @@ import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
-import {
-  resolveSkillInjectionModeForApp,
-  builtinSkillEntries,
-  buildBuiltinSkillCatalogBlock,
-  builtinSkillHelpPointer,
-} from '../../skills/injection-mode.js';
+import { builtinSkillBlockForInjectsSessionContext } from '../../skills/injection-mode.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
-import type { Locale } from '../../i18n/index.js';
-
-/** Built-in skill catalog (prompt) / help pointer (off) for genius — an
- *  injectsSessionContext CLI with a global skillsDir, so it delivers the catalog
- *  via its system prompt rather than the inline <botmux_routing> block. Genius
- *  has no ask-hook, so the botmux-ask fallback skill is included in the catalog. */
-function geniusBuiltinSkillBlock(larkAppId?: string, locale?: Locale): string {
-  const mode = resolveSkillInjectionModeForApp(larkAppId);
-  if (mode === 'prompt') {
-    return buildBuiltinSkillCatalogBlock(
-      builtinSkillEntries({ asksViaHook: false, whiteboardEnabled: whiteboardEnabled(), excludeRoutingCovered: true }),
-      locale,
-    );
-  }
-  if (mode === 'off') return builtinSkillHelpPointer(locale);
-  return '';
-}
 
 const GENIUS_DATA_DIR = join(homedir(), '.genius');
 const GENIUS_SKILLS_DIR = join(GENIUS_DATA_DIR, 'skills');
@@ -152,8 +130,15 @@ export function createGeniusAdapter(pathOverride?: string): CliAdapter {
       // Genius injects session context via --append-system-prompt (no inline
       // <botmux_routing> from session-manager), so the built-in skill catalog
       // for `prompt` mode (or the help pointer for `off`) must ride along here.
+      // Catalog rides on system prompt (injectsSessionContext + global skillsDir).
       args.push('--append-system-prompt', buildBotmuxSystemPromptText({
-        locale, botName, botOpenId, builtinSkillBlock: geniusBuiltinSkillBlock(larkAppId, locale),
+        locale,
+        botName,
+        botOpenId,
+        builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(larkAppId, locale, {
+          asksViaHook: false,
+          whiteboardEnabled: whiteboardEnabled(),
+        }),
       }));
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       return args;

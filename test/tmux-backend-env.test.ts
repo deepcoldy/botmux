@@ -113,6 +113,20 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
+  it('forwards Hermes profile paths so the pane and transcript reader use the same state DB', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      HERMES_HOME: '/profiles/current',
+      HERMES_BOTMUX_SOURCE_HOME: '/profiles/source',
+      HERMES_BOTMUX_PROFILES_ROOT: '/profiles/root',
+      BOTMUX_HERMES_STATE_DB: '/unsupported/state.db',
+    });
+    expect(out).toContain('HERMES_HOME=/profiles/current');
+    expect(out).toContain('HERMES_BOTMUX_SOURCE_HOME=/profiles/source');
+    expect(out).toContain('HERMES_BOTMUX_PROFILES_ROOT=/profiles/root');
+    expect(out).not.toContain('BOTMUX_HERMES_STATE_DB=/unsupported/state.db');
+  });
+
   it('skips entries whose value is undefined (e.g. IS_SANDBOX outside root mode)', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',

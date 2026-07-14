@@ -19,6 +19,8 @@ import { CLI_SELECT_OPTIONS, resolveCliSelection } from './cli-selection.js';
 /** add / edit 共用的 bot 字段 flag（原始字符串，'-' 表示清空，语义同 TUI 编辑）。 */
 export interface SetupBotFlags {
   name?: string;
+  /** 仅 add --create-app：飞书开放平台应用名称；留空由执行层生成 botmux-N。 */
+  appName?: string;
   appId?: string;
   appSecret?: string;
   /** CLI 选择键：cliId 或网关键（aiden-x-claude / ttadk-x-codex …），见 CLI_SELECT_OPTIONS。 */
@@ -41,7 +43,7 @@ export interface SetupBotFlags {
 export type SetupCommand =
   | { action: 'help' }
   | { action: 'list'; json: boolean }
-  | { action: 'add'; json: boolean; openPlatformAuto: boolean; flags: SetupBotFlags }
+  | { action: 'add'; json: boolean; createApp: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; flags: SetupBotFlags }
   | { action: 'edit'; json: boolean; selector: string; flags: SetupBotFlags }
   | { action: 'remove'; json: boolean; selector: string; yes: boolean };
 
@@ -59,6 +61,7 @@ export function isScriptedSetupInvocation(argv: string[]): boolean {
 
 const BOT_FIELD_FLAGS: Record<string, keyof SetupBotFlags> = {
   '--name': 'name',
+  '--app-name': 'appName',
   '--app-id': 'appId',
   '--app-secret': 'appSecret',
   '--cli': 'cli',
@@ -79,10 +82,20 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   botmux setup list [--json]
       列出已配置机器人（--json 输出完整字段，secret 脱敏）。
 
+  botmux setup add --create-app --allowed-users <owner> [--app-name <name>] [选项]
+      首次扫码创建飞书应用；后续有效登录态下确认账号/企业后免扫码添加。
+      --app-name 留空自动使用 botmux-N；更换账号用 --switch-account。
+      默认继续完成权限、长连接事件、redirect 与发版；可用
+      --no-open-platform-auto 跳过后半段自动配置。
+
+  botmux setup add --create-app --compatibility-mode --allowed-users <owner> [选项]
+      显式使用官方 SDK 兼容模式，可能需要额外扫码。兼容模式不支持
+      --app-name，应用名称由平台决定。
+
   botmux setup add --app-id <cli_xxx> --app-secret <secret> --allowed-users <owner> [选项]
-      添加机器人。必填：--app-id / --app-secret / --allowed-users（至少一个
-      完整邮箱、union_id on_xxx 或 open_id ou_xxx 作为 owner）。
-      写盘前会用凭证换 tenant_access_token 校验，校验失败不写盘。
+      使用已有凭证添加机器人。必填：--app-id / --app-secret / --allowed-users。
+      两种 add 方式都要求至少一个完整邮箱、union_id on_xxx 或 open_id ou_xxx
+      作为 owner，写盘前会用凭证换 tenant_access_token 校验；失败不写盘。
 
   botmux setup edit <进程名|AppID> [字段选项...]
       按字段修改机器人（如 botmux setup edit botmux-0 --cli codex）。
@@ -93,6 +106,7 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
 
 字段选项（add / edit 通用；edit 中未给出的字段保持不变）：
   --name <n>                 botmux status 显示名（进程名后缀）
+  --app-name <n>             新建的飞书应用名称（仅 add --create-app）
   --app-id <cli_xxx>         飞书应用 App ID（edit 时改绑另一个应用）
   --app-secret <secret>      App Secret
   --cli <key>                CLI 适配器：cliId 或网关键（claude-code / codex /
@@ -101,6 +115,7 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --wrapper-cli <prefix>     通用启动前缀（如 "aiden x claude"），覆盖 --cli 推导值
   --model <m>                CLI 模型名
   --backend <b>              会话后端 pty | tmux | herdr | zellij
+                             traex + herdr 插件安装需在 Dashboard Settings 中显式开启并填写可信 source/ref
   --working-dir <dirs>       仓库选择卡片的扫描根目录（逗号分隔多个）
   --default-working-dir <d>  固定默认目录：新话题直接在此目录启动、不弹仓库
                              选择卡片；传 - 清空、回到弹卡模式
@@ -111,26 +126,37 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
 
 通用选项：
   --json                     输出机器可读 JSON（含 ok / error 字段）
+  --create-app               add 时扫码创建应用，不再要求 --app-id/--app-secret
+  --compatibility-mode       显式使用 SDK 兼容模式（可能需要额外扫码）
+  --switch-account           不复用缓存，重新扫码并覆盖本机飞书登录态
   --open-platform-auto       add 成功后执行开放平台自动配置（默认跳过；
-                             需要扫码，请在可交互终端使用）
+                             --create-app 时默认开启）
+  --no-open-platform-auto    跳过开放平台权限/发版自动配置
 `;
 
 function parseBotFieldFlags(
   tokens: string[],
   opts: { allowFields: boolean; action: string },
-): { flags: SetupBotFlags; json: boolean; yes: boolean; openPlatformAuto: boolean; positional: string[] } {
+): { flags: SetupBotFlags; json: boolean; yes: boolean; createApp: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; openPlatformAutoSpecified: boolean; positional: string[] } {
   const flags: SetupBotFlags = {};
   const positional: string[] = [];
   let json = false;
   let yes = false;
+  let createApp = false;
+  let compatibilityMode = false;
+  let switchAccount = false;
   let openPlatformAuto = false;
+  let openPlatformAutoSpecified = false;
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
     if (token === '--json') { json = true; continue; }
     if (token === '--yes' || token === '-y') { yes = true; continue; }
-    if (token === '--open-platform-auto') { openPlatformAuto = true; continue; }
-    if (token === '--no-open-platform-auto') { openPlatformAuto = false; continue; }
+    if (token === '--create-app') { createApp = true; continue; }
+    if (token === '--compatibility-mode') { compatibilityMode = true; continue; }
+    if (token === '--switch-account') { switchAccount = true; continue; }
+    if (token === '--open-platform-auto') { openPlatformAuto = true; openPlatformAutoSpecified = true; continue; }
+    if (token === '--no-open-platform-auto') { openPlatformAuto = false; openPlatformAutoSpecified = true; continue; }
 
     if (token.startsWith('--')) {
       const eq = token.indexOf('=');
@@ -159,7 +185,7 @@ function parseBotFieldFlags(
     }
     positional.push(token);
   }
-  return { flags, json, yes, openPlatformAuto, positional };
+  return { flags, json, yes, createApp, compatibilityMode, switchAccount, openPlatformAuto, openPlatformAutoSpecified, positional };
 }
 
 /** 解析 `botmux setup` 的脚本化子命令 argv。非法输入抛 Error（message 面向用户）。 */
@@ -168,26 +194,55 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
   if (action === 'help' || action === '--help' || action === '-h') return { action: 'help' };
 
   if (action === 'list') {
-    const { json, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'list' });
+    const { json, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'list' });
+    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app。');
     if (positional.length > 0) throw new Error(`list 不接受多余参数: ${positional.join(' ')}`);
     return { action: 'list', json };
   }
 
   if (action === 'add') {
-    const { flags, json, openPlatformAuto, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'add' });
+    const { flags, json, createApp, compatibilityMode, switchAccount, openPlatformAuto, openPlatformAutoSpecified, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'add' });
     if (positional.length > 0) throw new Error(`add 不接受位置参数: ${positional.join(' ')}（字段一律用 --flag 形式）`);
-    return { action: 'add', json, openPlatformAuto, flags };
+    if (createApp && (flags.appId?.trim() || flags.appSecret?.trim())) {
+      throw new Error('--create-app 不能与 --app-id/--app-secret 同时使用。');
+    }
+    if (!createApp && flags.appName !== undefined) {
+      throw new Error('--app-name 必须与 add --create-app 一起使用。');
+    }
+    if (compatibilityMode && !createApp) {
+      throw new Error('--compatibility-mode 必须与 add --create-app 一起使用。');
+    }
+    if (switchAccount && !createApp) {
+      throw new Error('--switch-account 必须与 add --create-app 一起使用。');
+    }
+    if (switchAccount && compatibilityMode) {
+      throw new Error('--switch-account 不适用于 SDK 兼容模式。');
+    }
+    if (compatibilityMode && flags.appName?.trim()) {
+      throw new Error('兼容模式不支持 --app-name；请移除该参数，应用名称将由平台决定。');
+    }
+    return {
+      action: 'add',
+      json,
+      createApp,
+      compatibilityMode,
+      switchAccount,
+      openPlatformAuto: openPlatformAutoSpecified ? openPlatformAuto : createApp,
+      flags,
+    };
   }
 
   if (action === 'edit') {
-    const { flags, json, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'edit' });
+    const { flags, json, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'edit' });
+    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app。');
     if (positional.length === 0) throw new Error('edit 需要指定机器人（进程名 botmux-N 或 AppID）。');
     if (positional.length > 1) throw new Error(`edit 只接受一个机器人标识: ${positional.join(' ')}`);
     return { action: 'edit', json, selector: positional[0], flags };
   }
 
   if (action === 'remove') {
-    const { json, yes, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'remove' });
+    const { json, yes, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'remove' });
+    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app。');
     if (positional.length === 0) throw new Error('remove 需要指定机器人（进程名 botmux-N 或 AppID）。');
     if (positional.length > 1) throw new Error(`remove 只接受一个机器人标识: ${positional.join(' ')}`);
     return { action: 'remove', json, selector: positional[0], yes };
@@ -250,6 +305,9 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
  * 选普通 CLI 会清掉旧 wrapperCli（与 TUI 一致），显式 --wrapper-cli 再覆盖。
  */
 export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
+  if (flags.appName !== undefined) {
+    throw new Error('--app-name 仅与 add --create-app 一起使用。');
+  }
   if (flags.brand !== undefined) {
     throw new Error('--brand 仅在 add 时可指定（brand 绑定租户域名，换租户请 remove 后重新 add）。');
   }

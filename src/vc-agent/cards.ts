@@ -487,6 +487,18 @@ export function buildVcMeetingOutputReviewCard(input: VcMeetingOutputReviewCardI
               nonce: input.nonce,
             },
           },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '本场自动语音' },
+            type: 'default',
+            value: {
+              action: 'vc_meeting_output_review',
+              decision: 'allow_voice_and_approve',
+              meeting_id: input.meeting.id,
+              request_id: input.requestId,
+              nonce: input.nonce,
+            },
+          },
           ...(textOutputAvailable ? [{
             tag: 'button',
             text: { tag: 'plain_text', content: '改发会中弹幕' },

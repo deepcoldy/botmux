@@ -10,6 +10,7 @@ import {
   parseCookie,
 } from '../src/dashboard/auth.js';
 import { handleWorkflowApi, jsonRes } from '../src/dashboard/workflow-api.js';
+import { dashboardRoutes } from '../src/dashboard/web/dashboard-routes.js';
 import { computeRevisionId, parseWorkflowDefinition } from '../src/workflows/definition.js';
 import { EventLog } from '../src/workflows/events/append.js';
 import { createRun } from '../src/workflows/run-init.js';
@@ -57,6 +58,10 @@ afterEach(async () => {
 });
 
 describe('dashboard route smoke auth boundary', () => {
+  it('registers the monitoring route', () => {
+    expect(dashboardRoutes.some(route => route.id === 'monitoring' && route.routePrefix === '#/monitoring')).toBe(true);
+  });
+
   it('allows workflow read-only APIs without cookie', async () => {
     const list = await fetch(`${baseUrl}/api/workflows/runs`);
     expect(list.status).toBe(200);

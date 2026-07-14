@@ -140,8 +140,14 @@ const BOTMUX_INJECTION_PATTERNS: readonly RegExp[] = [
   /用户发送了：\s*\n-{3,}[\s\S]*?\n-{3,}[\s\S]*?Session ID:\s*[0-9a-f]{8}-[0-9a-f]{4}-/i,
 ];
 
-function isBotmuxInjected(text: string): boolean {
+/** True when `text` is a botmux-generated user turn (structural envelope).
+ *  Shared by Claude/Codex/Grok adopt discovery so filters stay consistent. */
+export function isBotmuxInjectedPrompt(text: string): boolean {
   return BOTMUX_INJECTION_PATTERNS.some((re) => re.test(text));
+}
+
+function isBotmuxInjected(text: string): boolean {
+  return isBotmuxInjectedPrompt(text);
 }
 
 interface FileEntry { path: string; mtimeMs: number; }

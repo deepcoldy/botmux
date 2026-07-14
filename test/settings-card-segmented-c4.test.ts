@@ -27,6 +27,7 @@ function buildSettings(over: Record<string, unknown> = {}): any {
   return {
     publicReadOnly: false,
     openTerminalInFeishu: false,
+    enableLocalCliOpen: false,
     maintenance: {},
     localDevInstall: false,
     ...over,
@@ -84,6 +85,7 @@ function labelFragmentFor(field: string): string {
   switch (field) {
     case 'publicReadOnly': return '公开只读模式';
     case 'openTerminalInFeishu': return '飞书内打开 Web 终端';
+    case 'enableLocalCliOpen': return '启用本机 CLI 直开';
     case 'autoUpdate': return '每日自动更新';
     case 'autoRestart': return '更新后自动重启';
     default: throw new Error('unknown field');
@@ -130,6 +132,17 @@ describe('PR3 UI revision (codex C4) — segmented control schema', () => {
     expect(on.disabled).toBeUndefined();
     expect(on.value?.action).toBe(SETTINGS_ACTION_TOGGLE);
     expect(on.value?.field).toBe('openTerminalInFeishu');
+    expect(on.value?.next_value).toBe('true');
+  });
+
+  it('native CLI opening is rendered as an explicit default-off toggle', () => {
+    const card = renderCard(buildSettings({ enableLocalCliOpen: false }));
+    const { on, off } = getSegmentedRow(card, 'enableLocalCliOpen');
+
+    expect(off.type).toBe('primary');
+    expect(off.disabled).toBe(true);
+    expect(on.value?.action).toBe(SETTINGS_ACTION_TOGGLE);
+    expect(on.value?.field).toBe('enableLocalCliOpen');
     expect(on.value?.next_value).toBe('true');
   });
 

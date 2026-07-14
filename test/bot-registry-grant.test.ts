@@ -36,6 +36,15 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[0].globalGrants).toEqual(['ou_a', 'ou_b', 'ou_c']);
   });
 
+  it('parseBotConfigsFromText preserves per-bot plugin ids after sanitizing and deduping', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'plg1',
+      larkAppSecret: 's',
+      plugins: ['agent-chrome', 'bad/id', 'agent-chrome', 'gitlab'],
+    }]));
+    expect(cfgs[0].plugins).toEqual(['agent-chrome', 'gitlab']);
+  });
+
   it('parseBotConfigsFromText leaves globalGrants undefined when absent / all-invalid / non-array', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gg2', larkAppSecret: 's' }]))[0].globalGrants).toBeUndefined();
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gg3', larkAppSecret: 's', globalGrants: [1, 2, ''] }]))[0].globalGrants).toBeUndefined();

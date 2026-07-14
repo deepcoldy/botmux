@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { toLegacySelected, type AskQuestion, type AskResult } from '../src/core/ask-types.js';
+import { isCustomReply, toLegacySelected, type AskQuestion, type AskResult } from '../src/core/ask-types.js';
 
 describe('ask-types 多问多选模型', () => {
   it('toLegacySelected: 单问单选答案映射回旧 selected 字符串', () => {
@@ -31,5 +31,44 @@ describe('ask-types 多问多选模型', () => {
     };
     expect(custom.comment).toBe('我自己的答案');
     expect(toLegacySelected(custom)).toBeNull();
+  });
+
+  it('isCustomReply: 无选中项且 comment 非 null → 文字作答', () => {
+    const custom: AskResult = {
+      kind: 'answered', answers: [[]], by: 'ou_x', comment: '我发个多行消息试试\n这是第二行', timedOut: false,
+    };
+    expect(isCustomReply(custom)).toBe(true);
+  });
+
+  it('isCustomReply: 多问全部未选中同样成立', () => {
+    const custom: AskResult = {
+      kind: 'answered', answers: [[], []], by: 'ou_x', comment: '都不选', timedOut: false,
+    };
+    expect(isCustomReply(custom)).toBe(true);
+  });
+
+  it('isCustomReply: 按钮路径（有选中项，comment 为 null）→ false', () => {
+    const clicked: AskResult = {
+      kind: 'answered', answers: [['yes']], by: 'ou_x', comment: null, timedOut: false,
+    };
+    expect(isCustomReply(clicked)).toBe(false);
+  });
+
+  it('isCustomReply: 有选中项时即使带 comment 也不算文字作答', () => {
+    const mixed: AskResult = {
+      kind: 'answered', answers: [['yes']], by: 'ou_x', comment: '附注', timedOut: false,
+    };
+    expect(isCustomReply(mixed)).toBe(false);
+  });
+
+  it('isCustomReply: 非 answered 结果一律 false', () => {
+    const timedOut: AskResult = {
+      kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true,
+    };
+    const invalidated: AskResult = {
+      kind: 'invalidated', reason: 'daemon restart', selected: null, by: null, comment: null, timedOut: false,
+    };
+    expect(isCustomReply(timedOut)).toBe(false);
+    expect(isCustomReply(invalidated)).toBe(false);
   });
 });

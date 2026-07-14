@@ -19,6 +19,11 @@ import { buildDashboardUrls } from './core/dashboard-url.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
 import { botmuxWrapperFiles } from './core/botmux-wrapper.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
+import {
+  selectCodexRuntimeUpdateTargets,
+  startCliRuntimeUpdateMonitor,
+  stopCliRuntimeUpdateMonitor,
+} from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
@@ -54,7 +59,8 @@ import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
-import { RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
+import { isLocalCliOpenReady } from './services/local-cli-opener.js';
+import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
@@ -76,6 +82,7 @@ import {
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner, setBotRenamer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
@@ -138,11 +145,14 @@ import {
 import { EventLog as WorkflowEventLog } from './workflows/events/append.js';
 import { replay as replayWorkflow } from './workflows/events/replay.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext } from './im/lark/event-dispatcher.js';
-import { listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription } from './services/doc-subs-store.js';
-import { subscribeDocFile, unsubscribeDocFile } from './im/lark/doc-comment.js';
+import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
+import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
+import { buildDocCommentPrompt, buildDocWatchWarmupPrompt } from './core/doc-comment-prompt.js';
+import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
+import { shutdownBackendDisposition } from './core/persistent-backend.js';
 import { markSessionActivity, announcePendingRepoSession, publishAttentionPatch, clearAgentAttention } from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { WorkflowEventWatcher, handleWorkflowFanoutEvent } from './workflows/fanout.js';
@@ -307,7 +317,7 @@ type VcMeetingConsumerInjectResult = {
 };
 
 type VcMeetingOutputChannel = 'text' | 'voice';
-type VcMeetingOutputDecision = 'approve_voice' | 'send_text' | 'allow_text_and_send' | 'reject';
+type VcMeetingOutputDecision = 'approve_voice' | 'allow_voice_and_approve' | 'send_text' | 'allow_text_and_send' | 'reject';
 type VcMeetingOutputSubmitResult =
   | { ok: true; status: 'sent' | 'pending'; requestId?: string; merged?: boolean }
   | { ok: false; error: string };
@@ -874,6 +884,16 @@ function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): 
   const hit = diskSessions.find(s => s.status === 'active' && s.larkAppId === larkAppId && s.chatId === chatId && sessionHasReplyThreadAlias(s, rootId));
   return hit ? { chatId: hit.chatId, sessionId: hit.sessionId } : null;
 }
+
+function setDirectChatDisplayNameFromSender(
+  session: Session,
+  chatType: 'group' | 'p2p' | undefined,
+  sender?: { type?: 'user' | 'bot'; name?: string },
+): void {
+  if (chatType !== 'p2p' || sender?.type !== 'user') return;
+  const name = String(sender.name ?? '').trim();
+  if (name) session.chatDisplayName = name;
+}
 /**
  * Per-run state for active workflow loops.
  *
@@ -1069,7 +1089,14 @@ function readSessionFreshFromDisk(sessionId: string, larkAppId: string): import(
   return undefined;
 }
 
-export async function noteTurnReceived(ds: DaemonSession, triggerMessageId: string, _prompt?: string, _sender?: { name?: string }, _turnId?: string): Promise<void> {
+export async function noteTurnReceived(
+  ds: DaemonSession,
+  triggerMessageId: string,
+  _prompt?: string,
+  _sender?: { name?: string },
+  _turnId?: string,
+  receivedReactionEmoji?: string,
+): Promise<void> {
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
   // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu
   // notification / unread) — so card-off answers could land unseen. The
@@ -1098,7 +1125,7 @@ export async function noteTurnReceived(ds: DaemonSession, triggerMessageId: stri
   // so a registered entry is always in place before its own turn can go idle.
   let reactionId: string;
   try {
-    reactionId = await addReaction(ds.larkAppId, triggerMessageId, receivedReactionEmojiFor(ds));
+    reactionId = await addReaction(ds.larkAppId, triggerMessageId, receivedReactionEmoji ?? receivedReactionEmojiFor(ds));
   } catch (err) {
     logger.debug(`[reaction] received add failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
     return;
@@ -1448,6 +1475,16 @@ function refreshCliVersion(cliId: CliId, cliPathOverride?: string): boolean {
     logger.warn(`Failed to get CLI version for ${cliId}: ${err.message}`);
     return false;
   }
+}
+
+/** Host Codex binaries configured across every bot process. The probe is
+ * read-only even for wrapper launchers; its notification names the exact path
+ * so the owner remains in control of any update. Codex App shares this binary. */
+function configuredCodexUpdateTargets() {
+  return selectCodexRuntimeUpdateTargets(
+    loadBotConfigs(),
+    (cliPathOverride) => createCliAdapterSync('codex', cliPathOverride).resolvedBin,
+  );
 }
 
 // ─── Helpers (local to daemon) ───────────────────────────────────────────────
@@ -2210,13 +2247,9 @@ function getActiveCount(): number {
  * sees no visible response.
  */
 function beginNewTurn(ds: DaemonSession, title: string): void {
-  // 每开新轮先清掉上一轮可能残留的「回评论落点」并**落盘**——botmux send 子进程只
-  // 从磁盘读会话态判断"本轮是否文档评论轮"，所以磁盘必须权威：飞书轮清掉，文档轮
-  // 由随后的 handleDocComment 重新设值+落盘。只在确有残留时写盘，避免普通轮多余写。
-  if (ds.session.currentDocCommentTarget) {
-    ds.session.currentDocCommentTarget = undefined;
-    try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
-  }
+  // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
+  // 非文档轮的 BOTMUX_TURN_ID 不会命中 map，天然不会误投；旧 entry 由
+  // deliverFinalOutput / botmux send 成功路径清理。
   // `/card` summon is one-shot: it forces a live card only for the turn it ran
   // in. A new turn returns to the config default (noCardChats / disableStreamingCard).
   // Use `/card on` to persistently restore cards for the chat.
@@ -2234,6 +2267,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
       prevMode, ds.streamCardNonce, ds.currentImageKey,
       !!ds.adoptedFrom, false, localeForBot(ds.larkAppId), previousUsageLimit,
       writableTerminalLinkFor(ds),
+      isLocalCliOpenReady(ds, { cliId: dsBotCfg.cliId }),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -2260,12 +2294,75 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   persistStreamCardState(ds);
 }
 
+/**
+ * `/watch-comment <doc>` 是会话型操作：即使命令族的 list/off/pending 可以无会话
+ * 运行，真正开始监听时也要创建/复用当前话题 session 并立即预热 CLI。
+ */
+function isSessionlessCommandInvocation(cmd: string, content: string): boolean {
+  if (!SESSIONLESS_DAEMON_COMMANDS.has(cmd)) return false;
+  if (cmd !== '/watch-comment') return true;
+  return !docWatchCommandNeedsSession(content);
+}
+
+async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription): Promise<void> {
+  const bot = getBot(ds.larkAppId);
+  const botCfg = bot.config;
+  const loc = localeForBot(ds.larkAppId);
+  const promptContent = buildDocWatchWarmupPrompt({
+    fileToken: sub.fileToken,
+    fileType: sub.fileType,
+    brand: normalizeBrand(botCfg.brand),
+    locale: loc,
+  });
+  const title = `[Doc Watch] ${sub.fileToken.slice(0, 12)}`;
+  const turnId = `doc-watch-${Date.now()}-${sub.fileToken.slice(0, 8)}`;
+  const sender = sub.ownerOpenId ? await resolveSender(ds.larkAppId, sub.ownerOpenId, 'user') : undefined;
+
+  beginNewTurn(ds, title);
+  ds.lastMessageAt = Date.now();
+  ds.session.lastMessageAt = new Date(ds.lastMessageAt).toISOString();
+  if (sub.workingDir && (!ds.worker || ds.worker.killed)) {
+    ds.workingDir = sub.workingDir;
+    ds.session.workingDir = sub.workingDir;
+  }
+
+  if (ds.worker && !ds.worker.killed) {
+    ensureSessionWhiteboard(ds);
+    const msgContent = buildFollowUpContent(promptContent, ds.session.sessionId, {
+      isAdoptMode: false,
+      cliId: botCfg.cliId,
+      cliPathOverride: botCfg.cliPathOverride,
+      sender,
+      larkAppId: ds.larkAppId,
+      chatId: ds.session.chatId,
+      whiteboardId: ds.session.whiteboardId,
+    });
+    rememberLastCliInput(ds, promptContent, msgContent);
+    sessionStore.updateSession(ds.session);
+    ds.worker.send({ type: 'message', content: msgContent, turnId } as DaemonToWorker);
+    markSessionActivity(ds);
+  } else {
+    ensureSessionWhiteboard(ds);
+    const wrappedPrompt = buildReforkPrompt(ds, promptContent, {
+      cliId: botCfg.cliId,
+      cliPathOverride: botCfg.cliPathOverride,
+      selfMention: { name: bot.botName, openId: bot.botOpenId },
+      sender,
+    });
+    rememberLastCliInput(ds, promptContent, wrappedPrompt);
+    sessionStore.updateSession(ds.session);
+    forkWorker(ds, wrappedPrompt, ds.hasHistory);
+  }
+  logger.info(`[${tag(ds)}] doc-comment watch prewarm injected file=${sub.fileToken.slice(0, 12)}`);
+}
+
 // Dependencies passed to command-handler
 const commandDeps: CommandHandlerDeps = {
   activeSessions,
   sessionReply,
   getActiveCount,
   lastRepoScan,
+  prewarmDocCommentSession,
 };
 
 /**
@@ -2278,7 +2375,7 @@ const commandDeps: CommandHandlerDeps = {
  * the ack. `/group` runs several seconds of serial Lark API calls (create chat →
  * add bots → transfer owner → fetch share link → reply); awaiting that blocks the
  * ack past Feishu's redelivery window, so Feishu redelivers the same message_id.
- * Because these commands are session-less (SESSIONLESS_DAEMON_COMMANDS), no
+ * Because these invocations are session-less, no
  * session record exists to dedupe the redelivery against — so it builds a SECOND
  * group. (Observed: one `/g` created two identical groups, the duplicate ~19s
  * after the first.)
@@ -4514,6 +4611,26 @@ async function rejectVcMeetingOutputRequest(
   }
 }
 
+function enqueueVcMeetingOutputOperation<T>(
+  session: VcMeetingDaemonSession,
+  channel: VcMeetingOutputChannel,
+  operation: () => Promise<T>,
+): Promise<T> {
+  session.outputSubmitPromises ??= {};
+  const prior = session.outputSubmitPromises[channel] ?? Promise.resolve();
+  const run = prior
+    .catch(() => undefined)
+    .then(operation);
+  const tracked = run.catch(() => undefined);
+  session.outputSubmitPromises[channel] = tracked;
+  tracked.finally(() => {
+    if (session.outputSubmitPromises?.[channel] === tracked) {
+      delete session.outputSubmitPromises[channel];
+    }
+  });
+  return run;
+}
+
 async function submitVcMeetingOutputRequest(input: {
   larkAppId: string;
   meetingId: string;
@@ -4524,19 +4641,11 @@ async function submitVcMeetingOutputRequest(input: {
 }): Promise<VcMeetingOutputSubmitResult> {
   const session = vcMeetingSessions.get(vcMeetingSessionKey(input.larkAppId, input.meetingId));
   if (!session) return submitVcMeetingOutputRequestImpl(input);
-  session.outputSubmitPromises ??= {};
-  const prior = session.outputSubmitPromises[input.channel] ?? Promise.resolve();
-  const run = prior
-    .catch(() => undefined)
-    .then(() => submitVcMeetingOutputRequestImpl(input));
-  const tracked = run.catch(() => undefined);
-  session.outputSubmitPromises[input.channel] = tracked;
-  tracked.finally(() => {
-    if (session.outputSubmitPromises?.[input.channel] === tracked) {
-      delete session.outputSubmitPromises[input.channel];
-    }
-  });
-  return run;
+  return enqueueVcMeetingOutputOperation(
+    session,
+    input.channel,
+    () => submitVcMeetingOutputRequestImpl(input),
+  );
 }
 
 async function submitVcMeetingOutputRequestImpl(input: {
@@ -4746,17 +4855,24 @@ async function reviewVcMeetingOutputRequest(input: {
         : '你的会中弹幕输出请求已由授权人同意并发送。').catch(() => { /* best effort */ });
       return vcMeetingOutputReviewCardForRequest(session, req, 'sentText');
     }
-    if (input.decision === 'approve_voice') {
-      if (channel !== 'voice') throw new Error('approve_voice only applies to voice requests');
+    if (input.decision === 'approve_voice' || input.decision === 'allow_voice_and_approve') {
+      if (channel !== 'voice') throw new Error('voice approval only applies to voice requests');
+      const allowFutureVoice = input.decision === 'allow_voice_and_approve';
+      if (allowFutureVoice) {
+        setVcMeetingOutputPolicyForChannel(session, 'voice', 'allow');
+        persistVcMeetingRuntimeSession(session, cfg);
+      }
       keepApplying = true;
-      void (async () => {
+      const applyVoiceApproval = async () => {
         try {
           await speakVcMeetingOutput(session, cfg, req);
           if (session.pendingOutputRequests[channel]?.id === req.id) delete session.pendingOutputRequests[channel];
           await patchVcMeetingOutputReviewCard(session, req, 'sentVoice').catch((err) => {
             logger.warn(`[vc-agent] output review card patch failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
           });
-          void notifyVcMeetingConsumerAgent(session, '你的语音输出请求已由授权人同意并播报。').catch(() => { /* best effort */ });
+          void notifyVcMeetingConsumerAgent(session, allowFutureVoice
+            ? '你的语音输出请求已播报；本场会议后续语音输出将自动执行，无需逐条审批。'
+            : '你的语音输出请求已由授权人同意并播报。').catch(() => { /* best effort */ });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           logger.warn(`[vc-agent] approved voice output failed meeting=${input.meetingId} request=${input.requestId}: ${message}`);
@@ -4767,7 +4883,12 @@ async function reviewVcMeetingOutputRequest(input: {
         } finally {
           req.applying = false;
         }
-      })();
+      };
+      if (allowFutureVoice) {
+        void enqueueVcMeetingOutputOperation(session, channel, applyVoiceApproval);
+      } else {
+        void applyVoiceApproval();
+      }
       return vcMeetingOutputReviewCardForRequest(session, req, 'processing');
     }
     throw new Error('unknown output decision');
@@ -5672,6 +5793,7 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
     const decision = value.decision;
     if (
       decision !== 'approve_voice'
+      && decision !== 'allow_voice_and_approve'
       && decision !== 'send_text'
       && decision !== 'allow_text_and_send'
       && decision !== 'reject'
@@ -6313,9 +6435,13 @@ async function startInitialPassthroughSession(args: {
 
   const botCfg = getBot(larkAppId).config;
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
+  const directChatSender = chatType === 'p2p'
+    ? await resolveSender(larkAppId, senderOpenId, parsed.senderType)
+    : undefined;
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
   const session = sessionStore.createSession(chatId, rootIdForStore, commandContent.substring(0, 50), chatType);
   const now = Date.now();
+  setDirectChatDisplayNameFromSender(session, chatType, directChatSender);
   session.larkAppId = larkAppId;
   session.ownerOpenId = ownerOpenId;
   session.creatorOpenId = creatorOpenId;
@@ -6403,7 +6529,7 @@ async function startInitialPassthroughSession(args: {
 
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
-  const { chatId, messageId, chatType, larkAppId, replyRootId } = ctx;
+  const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger } = ctx;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
@@ -6445,7 +6571,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     )) {
       return;
     }
-    if (scope === 'chat') {
+    if (!substituteTrigger && scope === 'chat') {
       scope = 'thread';
       anchor = messageId;
     }
@@ -6586,7 +6712,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       // record for it would surface a phantom session in the dashboard. Run it
       // without a session; pass chatId on the message so the handler can reach
       // the chat roster (it normally reads it from the active session's ds).
-      if (SESSIONLESS_DAEMON_COMMANDS.has(cmd)) {
+      if (isSessionlessCommandInvocation(cmd, commandContent)) {
         // Fast-ACK: run detached so the WS event ack isn't blocked on /group's
         // slow Lark API work → no Feishu redelivery → no duplicate group.
         // See fireSessionlessCommandDetached.
@@ -6600,6 +6726,13 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       const cmdRootIdForStore = scope === 'thread' ? anchor : messageId;
       const session = sessionStore.createSession(chatId, cmdRootIdForStore, cmdContent.substring(0, 50), chatType);
       const now = Date.now();
+      if (chatType === 'p2p') {
+        setDirectChatDisplayNameFromSender(
+          session,
+          chatType,
+          await resolveSender(larkAppId, senderOpenId, parsed.senderType),
+        );
+      }
       session.larkAppId = larkAppId;
       session.ownerOpenId = senderOpenId;
       session.ownerUnionId = senderUnionId;
@@ -6674,6 +6807,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
 
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
 
+  // Pin the working dir via the layered oncall / inherit / default lookup
+  // (auto-binds a defaultOncall chat as a side effect). Shared with the
+  // first-message `/repo` command branch so both paths stay consistent.
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
+  // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
+  const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
+
   // Create session in pending-repo state — don't spawn CLI yet.
   // For thread-scope, rootMessageId == anchor (the thread root). Critical
   // because sessionAnchorId() uses rootMessageId for thread-scope, and the
@@ -6686,6 +6827,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
   const session = sessionStore.createSession(chatId, rootIdForStore, parsed.content.substring(0, 50), chatType);
   const now = Date.now();
+  setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
   session.larkAppId = larkAppId;
   session.ownerOpenId = senderOpenId;
   session.ownerUnionId = senderUnionId;
@@ -6703,13 +6845,6 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
 
-  // Pin the working dir via the layered oncall / inherit / default lookup
-  // (auto-binds a defaultOncall chat as a side effect). Shared with the
-  // first-message `/repo` command branch so both paths stay consistent.
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
-  // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
-  // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
-  const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -6727,6 +6862,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     pendingPrompt: promptContent,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
     pendingMentions: parsed.mentions,
+    pendingSubstituteTrigger: substituteTrigger,
     pendingSender: newTopicSender,
     ownerOpenId: senderOpenId,
     currentTurnTitle: content.substring(0, 50),
@@ -6754,9 +6890,9 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     const selfBot = getBot(larkAppId);
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId });
+    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger });
     rememberLastCliInput(ds, promptContent, prompt);
-    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId);
+    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     forkWorker(ds, prompt);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -6786,9 +6922,9 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ds.pendingRepo = false;
     const selfBot = getBot(larkAppId);
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId });
+    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger });
     rememberLastCliInput(ds, promptContent, prompt);
-    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId);
+    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
@@ -7038,7 +7174,7 @@ function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
 }
 
 async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> {
-  const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId } = ctx;
+  const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId, substituteTrigger } = ctx;
   await resolveNonsupportMessage(data, larkAppId);
   const { parsed, resources } = parseEventMessage(data);
 
@@ -7303,9 +7439,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // session commands) fall through to the repo-select card. Create the session
       // first, mirroring handleNewTopic's first-message `/repo` pendingRepo setup.
       // Session-less commands (/group /g) don't need one.
-      if (!existingDs && threadChatId && !SESSIONLESS_DAEMON_COMMANDS.has(cmd)) {
+      if (!existingDs && threadChatId && !isSessionlessCommandInvocation(cmd, commandContent)) {
         const session = sessionStore.createSession(threadChatId, anchor, cmdContent.substring(0, 50), ctxChatType);
         const now = Date.now();
+        if (ctxChatType === 'p2p') {
+          setDirectChatDisplayNameFromSender(
+            session,
+            ctxChatType,
+            await getThreadSender(),
+          );
+        }
         session.larkAppId = larkAppId;
         session.ownerOpenId = threadSenderOpenId;
         session.creatorOpenId = threadSenderOpenId;  // stable creator (= dispatch orchestrator for /repo prime) — see Session.creatorOpenId
@@ -7340,7 +7483,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // Pass mention-stripped content so /command argument parsing works.
       // chatId lets session-less handlers (e.g. /group) reach the chat roster.
       const cmdMessage = { ...parsed, content: commandContent, chatId: threadChatId };
-      if (SESSIONLESS_DAEMON_COMMANDS.has(cmd)) {
+      if (isSessionlessCommandInvocation(cmd, commandContent)) {
         // Fast-ACK for /group invoked mid-thread. See fireSessionlessCommandDetached.
         fireSessionlessCommandDetached(cmd, anchor, cmdMessage, larkAppId);
         return;
@@ -7535,6 +7678,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // injects it either into the immediate prompt or stashes it on
     // pendingSender for the deferred spawn.
     const autoCreateSender = await getThreadSender();
+    setDirectChatDisplayNameFromSender(session, autoCreateChatType, autoCreateSender);
     const newDs: DaemonSession = {
       session,
       worker: null,
@@ -7552,6 +7696,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       pendingPrompt: promptContent,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
+      pendingSubstituteTrigger: substituteTrigger,
       pendingSender: autoCreateSender,
       ownerOpenId,
       currentTurnTitle: parsed.content.substring(0, 50),
@@ -7578,9 +7723,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
       const selfBot = getBot(larkAppId);
       ensureSessionWhiteboard(newDs);
-      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId });
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger });
       rememberLastCliInput(newDs, promptContent, prompt);
-      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId);
+      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       forkWorker(newDs, prompt);
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
@@ -7610,9 +7755,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       newDs.pendingRepo = false;
       const selfBot = getBot(larkAppId);
       ensureSessionWhiteboard(newDs);
-      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId });
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger });
       rememberLastCliInput(newDs, promptContent, prompt);
-      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId);
+      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       forkWorker(newDs, prompt);
     }
 
@@ -7649,19 +7794,19 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           larkAppId,
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
+          substituteTrigger,
         });
     beginNewTurn(ds, parsed.content);
     rememberLastCliInput(ds, promptContent, msgContent);
-    await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId);
+    await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     ds.worker.send({ type: 'message', content: msgContent, turnId: parsed.messageId } as DaemonToWorker);
   } else {
     // Worker not running — re-fork with resume. This is a NEW turn, so drop
     // any restored streaming-card reference; worker_ready will POST a fresh
     // card instead of PATCHing the previous turn's card in place.
     logger.info(`[${tag(ds)}] Worker not running, re-forking...`);
-    // 这是飞书消息轮（非文档评论轮）：清掉可能残留的回评论落点，避免本轮 botmux
-    // send 误投到上一次文档评论（本路径不走 beginNewTurn，故显式清盘）。
-    ds.session.currentDocCommentTarget = undefined;
+    // 飞书消息轮（非文档评论轮）：docCommentTargets 是 per-turn map，本轮 turnId
+    // 不会命中文档评论的 key，无需显式清盘。
     if (ds.usageLimitRetryTimer) {
       clearTimeout(ds.usageLimitRetryTimer);
       ds.usageLimitRetryTimer = undefined;
@@ -7722,45 +7867,168 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 }
 
 /**
- * 文档评论入口（/subscribe-lark-doc）：一条命中订阅的文档评论喂进其绑定会话。
+ * 为文档评论自动创建 session（无活跃 IM session 时调用）。
+ *
+ * 用虚拟 anchor = `doc:{fileToken}` 作为 session key，workingDir 取自：
+ *   1) sub.workingDir（如果订阅时指定了）
+ *   2) bot 的 defaultWorkingDir / workingDir 配置
+ *   3) fallback 到 ~
+ *
+ * 创建后立即 fork worker 并把评论内容作为首轮输入。
+ * 返回创建好的 DaemonSession（已加入 activeSessions），失败返回 null。
+ */
+async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx: DocCommentContext): Promise<DaemonSession | null> {
+  const botCfg = getBot(larkAppId).config;
+
+  // 解析 workingDir：订阅时指定的 > bot 配置 defaultWorkingDir > bot 配置 workingDir > ~
+  const workingDir = sub.workingDir
+    ?? effectiveDefaultWorkingDir(botCfg)
+    ?? botCfg.workingDir
+    ?? '~';
+
+  const sender = ctx.authorOpenId ? await resolveSender(larkAppId, ctx.authorOpenId, 'user') : undefined;
+  const title = `[Doc] ${sub.fileToken.slice(0, 8)}: ${ctx.text.slice(0, 40)}`;
+
+  const virtualChatId = `doc:${sub.fileToken}`;
+  const virtualAnchor = sub.sessionAnchor;
+  const now = Date.now();
+
+  const session = sessionStore.createSession(virtualChatId, virtualAnchor, title, 'group');
+  session.larkAppId = larkAppId;
+  session.scope = 'chat';
+  session.lastMessageAt = new Date(now).toISOString();
+  session.workingDir = workingDir;
+  session.cliId = botCfg.cliId;
+  session.ownerOpenId = ctx.authorOpenId || sub.ownerOpenId;
+  sessionStore.updateSession(session);
+
+  const ds: DaemonSession = {
+    session,
+    worker: null,
+    workerPort: null,
+    workerToken: null,
+    larkAppId,
+    chatId: virtualChatId,
+    chatType: 'group',
+    scope: 'chat',
+    spawnedAt: now,
+    cliVersion: getCurrentCliVersion(),
+    lastMessageAt: now,
+    hasHistory: false,
+    workingDir,
+    ownerOpenId: ctx.authorOpenId || sub.ownerOpenId,
+    currentTurnTitle: ctx.text.substring(0, 50),
+  };
+
+  // 记录本轮回评论落点
+  const turnId = ctx.replyId || ctx.commentId;
+  (ds.docCommentTurns ??= new Map()).set(turnId, {
+    fileToken: sub.fileToken,
+    fileType: sub.fileType,
+    commentId: ctx.commentId,
+    replyToOpenId: ctx.authorOpenId,
+    replyToName: sender?.name,
+    replyId: ctx.replyId,
+    reactionId: undefined, // 由调用方在加 reaction 后回填
+  });
+
+  const docTarget = {
+    fileToken: sub.fileToken,
+    fileType: sub.fileType,
+    commentId: ctx.commentId,
+    replyToName: sender?.name,
+    replyToOpenId: ctx.authorOpenId,
+    turnId,
+    replyId: ctx.replyId,
+  };
+  (ds.session.docCommentTargets ??= {})[turnId] = docTarget;
+  try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
+
+  activeSessions.set(sessionKey(virtualAnchor, larkAppId), ds);
+
+  // 不在这里 forkWorker —— handleDocComment 会统一处理（它会检查 worker 状态、
+  // 加 reaction、设 docCommentTurns、然后 fork 或 send）。这里只建好 session 骨架。
+  logger.info(`[doc-comment] auto-created session for file=${sub.fileToken.slice(0, 12)} (wd=${workingDir}, cli=${botCfg.cliId})`);
+  return ds;
+}
+
+/**
+ * 文档评论入口（/watch-comment / /subscribe-lark-doc）：一条命中绑定的文档评论喂进会话。
  *
  * 与 handleThreadReply 同构但精简：会话由订阅锚点直接定位（无需路由决策），
- * 输入是评论纯文本（带「来自文档评论」前缀），并把本轮回评论的落点记进
+ * 输入是带文档链接、选中原文和评论串历史的结构化 prompt，并把本轮回评论的落点记进
  * ds.docCommentTurns —— deliverFinalOutput 据此把正文发表为文档评论。状态卡 /
  * 占位卡仍走会话起点（飞书），天然实现「卡片留飞书、正文进评论」的分流。
  *
  * MVP 边界：仅投递给 activeSessions 里仍在的会话（含 idle 挂起、worker=null —
  * 走 resume 重 fork）；已 /close 的会话其订阅在关闭时已退订，这里查不到 ds 即跳过。
  */
-async function handleDocComment(ctx: DocCommentContext): Promise<void> {
+async function handleDocComment(ctx: DocCommentContext): Promise<boolean> {
   const { larkAppId, sub, commentId, text } = ctx;
   const turnId = ctx.replyId || commentId;
+  const claimKey = `${larkAppId}:${sub.fileToken}:${turnId}`;
+  if (handledDocCommentTurns.has(claimKey)) {
+    logger.info(`[doc-comment] duplicate turn skipped file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}`);
+    return true; // 已处理过，算成功（让 poller 推进游标）
+  }
   const loc = localeForBot(larkAppId);
 
-  const ds = activeSessions.get(sessionKey(sub.sessionAnchor, larkAppId));
+  let ds: DaemonSession | undefined | null = activeSessions.get(sessionKey(sub.sessionAnchor, larkAppId));
   if (!ds) {
-    logger.info(`[doc-comment] no active session at anchor=${sub.sessionAnchor.slice(0, 12)} (app=${larkAppId}); dropping comment ${commentId.slice(0, 12)}`);
-    return;
+    // 无活跃 session → 自动为该文档创建一个（用虚拟 anchor = doc:{fileToken}）
+    logger.info(`[doc-comment] no active session for anchor=${sub.sessionAnchor.slice(0, 12)}; auto-creating for file=${sub.fileToken.slice(0, 12)}`);
+    ds = await autoCreateDocSession(sub, larkAppId, ctx);
+    if (!ds) {
+      // auto-create 失败：不设 claim（允许后续重试），返回 false 让 poller 不推进游标
+      logger.warn(`[doc-comment] auto-create session failed for file=${sub.fileToken.slice(0, 12)}; will retry comment ${commentId.slice(0, 12)}`);
+      return false;
+    }
+  }
+  // ds 确认有效后才设 claim——auto-create 失败时不占坑，允许重试。
+  handledDocCommentTurns.set(claimKey, Date.now());
+
+  try {
+  // 给用户的回复加 "Typing" reaction，让评论者知道 bot 正在处理。
+  const userReplyId = ctx.replyId;
+  let reactionId: string | undefined;
+  if (userReplyId) {
+    reactionId = await addCommentReaction(larkAppId,
+      { fileToken: sub.fileToken, fileType: sub.fileType },
+      commentId, userReplyId, 'Typing');
   }
 
   const sender = ctx.authorOpenId ? await resolveSender(larkAppId, ctx.authorOpenId, 'user') : undefined;
   const authorName = sender?.name || ctx.authorOpenId?.slice(0, 8) || '?';
-  const promptContent = `${tr('daemon.doc_comment_prefix', { author: authorName }, loc)}\n${text}`;
+  const dsBotCfg = getBot(ds.larkAppId).config;
+  const promptContent = buildDocCommentPrompt({
+    fileToken: sub.fileToken,
+    fileType: sub.fileType,
+    question: text,
+    author: authorName,
+    selectedText: ctx.selectedText,
+    priorReplies: ctx.priorReplies?.map(reply => ({
+      author: reply.authorOpenId?.slice(0, 12),
+      text: reply.text,
+    })),
+    brand: normalizeBrand(dsBotCfg.brand),
+    locale: loc,
+  });
 
   // 记录本轮回评论的落点。两条路都要覆盖：
   //   • ds.docCommentTurns（内存，按 turnId）→ deliverFinalOutput「兜底」分流用
-  //   • session.currentDocCommentTarget（磁盘）→ `botmux send`「主回复」分流用
-  //     （botmux send 跑在独立子进程，只能从磁盘读会话态）
+  //   • session.docCommentTargets（磁盘，per-turn map）→ `botmux send`「主回复」分流用
+  //     （botmux send 跑在独立子进程，只能从磁盘读会话态；per-turn 避免并发评论串线）
   (ds.docCommentTurns ??= new Map()).set(turnId, {
     fileToken: sub.fileToken,
     fileType: sub.fileType,
     commentId,
     replyToOpenId: ctx.authorOpenId,
     replyToName: sender?.name,
+    replyId: userReplyId,
+    reactionId,
   });
-  const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId };
+  const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId, replyId: userReplyId, reactionId };
 
-  const dsBotCfg = getBot(ds.larkAppId).config;
   const selfBot = getBot(ds.larkAppId);
 
   if (ds.worker && !ds.worker.killed) {
@@ -7780,7 +8048,7 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
           whiteboardId: ds.session.whiteboardId,
         });
     beginNewTurn(ds, text);
-    ds.session.currentDocCommentTarget = docTarget; // beginNewTurn 刚清空，这里设本轮落点
+    (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
     rememberLastCliInput(ds, promptContent, msgContent);
     sessionStore.updateSession(ds.session); // 先落盘，botmux send 子进程才读得到落点
     await noteTurnReceived(ds, commentId, text, sender, turnId);
@@ -7807,17 +8075,114 @@ async function handleDocComment(ctx: DocCommentContext): Promise<void> {
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
       sender,
     });
-    ds.session.currentDocCommentTarget = docTarget;
+    (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
     rememberLastCliInput(ds, promptContent, wrappedPrompt);
     await noteTurnReceived(ds, commentId, text, sender, turnId);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedPrompt, ds.hasHistory);
+    forkWorker(ds, wrappedPrompt, { resume: ds.hasHistory, turnId });
+  }
+  return true;
+  } catch (err) {
+    // 投递失败：清理 claim 允许重试，返回 false 让 poller 不推进游标。
+    handledDocCommentTurns.delete(claimKey);
+    logger.warn(`[doc-comment] delivery failed, claim released for retry file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)} err=${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+/** 同一条评论可能同时被长连接通知和 --all 轮询看到；daemon 内统一去重。 */
+const handledDocCommentTurns = new BoundedMap<string, number>(5_000);
+
+let docCommentPollRunning = false;
+
+/**
+ * `/watch-comment --all` 的应用身份增量轮询。
+ *
+ * 飞书的 drive.notice.comment_add_v1 只可靠覆盖通知对象（典型是 @Bot）；普通评论
+ * 不会推给应用。逐文档 subscribe API 又强制 User Token，所以 --all 使用应用身份
+ * 读取评论列表，持久化 reply 时间游标，补齐“不 @ 也回复”。
+ */
+async function pollWatchedDocComments(larkAppId: string): Promise<void> {
+  if (docCommentPollRunning) return;
+  docCommentPollRunning = true;
+  try {
+    const subs = listAllDocSubscriptions(config.session.dataDir, larkAppId)
+      .filter(sub => sub.managedBy === 'watch-comment' && sub.commentTriggerMode === 'all');
+    for (const snapshot of subs) {
+      try {
+        const comments = await listDocComments(larkAppId, {
+          fileToken: snapshot.fileToken,
+          fileType: snapshot.fileType,
+        });
+        const latest = latestDocCommentPollCursor(comments);
+        const current = getDocSubscription(config.session.dataDir, larkAppId, snapshot.fileToken);
+        if (!current || current.managedBy !== 'watch-comment' || current.commentTriggerMode !== 'all') continue;
+
+        if (!current.pollBaselineReady || current.pollCursorAt === undefined || current.pollCursorReplyId === undefined) {
+          setDocCommentPollCursor(
+            config.session.dataDir,
+            larkAppId,
+            current.fileToken,
+            latest ?? { createdAt: Math.floor(Date.now() / 1000), replyId: '' },
+          );
+          logger.info(`[doc-comment-poll] baseline file=${current.fileToken.slice(0, 12)} comments=${comments.length}`);
+          continue;
+        }
+
+        const fresh = docCommentRepliesAfterCursor(comments, {
+          createdAt: current.pollCursorAt,
+          replyId: current.pollCursorReplyId,
+        });
+        // Advance the cursor strictly in order, stopping at the first failed
+        // delivery — otherwise a later success would move the cursor past an
+        // un-delivered earlier reply and drop it for good (see advanceDocCommentCursor).
+        await advanceDocCommentCursor(
+          fresh,
+          async (reply) => {
+            const stillWatching = getDocSubscription(config.session.dataDir, larkAppId, current.fileToken);
+            if (!stillWatching || stillWatching.managedBy !== 'watch-comment' || stillWatching.commentTriggerMode !== 'all') {
+              return false; // watch removed mid-loop → stop without advancing
+            }
+            const selfBotOpenId = getBot(larkAppId).botOpenId;
+            const isSelfReply = (selfBotOpenId && reply.authorOpenId === selfBotOpenId)
+              || isBotAuthoredReply(reply.replyId)
+              || hasBotSentinel(reply.text);
+            const text = reply.text.replaceAll(BOT_REPLY_SENTINEL, '').trim();
+            if (isSelfReply || !text) return true; // safely skip; advance past it
+            logger.info(`[doc-comment-poll] dispatch file=${current.fileToken.slice(0, 12)} comment=${reply.commentId.slice(0, 12)} reply=${reply.replyId.slice(0, 12)}`);
+            const ok = await handleDocComment({
+              larkAppId,
+              sub: stillWatching,
+              commentId: reply.commentId,
+              replyId: reply.replyId,
+              text,
+              selectedText: reply.selectedText,
+              priorReplies: reply.priorReplies.map(previous => ({
+                authorOpenId: previous.authorOpenId,
+                text: previous.text.replaceAll(BOT_REPLY_SENTINEL, '').trim(),
+              })).filter(previous => previous.text.length > 0),
+              isWhole: reply.isWhole,
+              authorOpenId: reply.authorOpenId,
+            });
+            if (!ok) {
+              logger.warn(`[doc-comment-poll] cursor NOT advanced for reply=${reply.replyId.slice(0, 12)} (handleDocComment returned false; stopping this round, will retry next poll)`);
+            }
+            return ok;
+          },
+          (reply) => { setDocCommentPollCursor(config.session.dataDir, larkAppId, current.fileToken, reply); },
+        );
+      } catch (err) {
+        logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  } finally {
+    docCommentPollRunning = false;
   }
 }
 
 /**
- * daemon 启动恢复文档订阅：飞书订阅可能在停机期间失效，给仍活跃的会话重新
- * 订阅；其会话没被恢复（已 /close 或丢失）的订阅则退订 + 清注册表。best-effort。
+ * daemon 启动恢复文档入口。/watch-comment 只依赖应用级评论事件，
+ * 保留本地绑定即可；旧 /subscribe-lark-doc 才重试飞书逐文件订阅 API。
  */
 async function restoreDocSubscriptions(_sessions: Map<string, DaemonSession>): Promise<void> {
   for (const bot of getAllBots()) {
@@ -7834,9 +8199,13 @@ async function restoreDocSubscriptions(_sessions: Map<string, DaemonSession>): P
       const stored = sub.sessionId ? sessionStore.getSession(sub.sessionId) : undefined;
       const definitelyClosed = sub.sessionId && (!stored || stored.status === 'closed');
       if (definitelyClosed) {
-        await unsubscribeDocFile(appId, file);
+        if (sub.managedBy !== 'watch-comment') await unsubscribeDocFile(appId, file);
         removeDocSubscription(config.session.dataDir, appId, sub.fileToken);
-        logger.info(`[doc-comment] restore: dropped subscription ${sub.fileToken.slice(0, 12)} (session ${sub.sessionId?.slice(0, 8)} closed)`);
+        logger.info(`[doc-comment] restore: dropped binding ${sub.fileToken.slice(0, 12)} (session ${sub.sessionId?.slice(0, 8)} closed)`);
+        continue;
+      }
+      if (sub.managedBy === 'watch-comment') {
+        logger.info(`[doc-comment] restore: kept event watch ${sub.fileToken.slice(0, 12)} (no per-file subscribe)`);
         continue;
       }
       try {
@@ -7968,6 +8337,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     try { writeBotInfoFile(config.session.dataDir); } catch { /* best effort */ }
     return r;
   });
+  // One cap implementation shared by event-driven checks (process start / idle
+  // edge) and the 60s safety-net timer below. Each daemon owns exactly one
+  // bot's activeSessions map, so the configured limit is per bot.
+  const enforceLiveSessionCap = (source: 'session_change' | 'periodic'): void => {
+    const maxLiveWorkers = getBot(cfg.larkAppId).config.maxLiveWorkers;
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers });
+    if (suspended.length > 0) {
+      logger.info(
+        `[idle-worker-sweeper] suspended ${suspended.length} session(s) over per-bot cap `
+        + `${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS} source=${source}`,
+      );
+    }
+  };
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
@@ -7980,6 +8362,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       void closeSessionHelper(ds.session.sessionId).catch(() => { /* idempotent */ });
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
     },
+    enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
   });
   // Expose the activeSessions Map (owned by daemon) to worker-pool readers,
   // so dashboard IPC and other consumers can list/lookup live sessions.
@@ -8199,6 +8582,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
   await restoreDocSubscriptions(activeSessions);
 
+  // `drive.notice.comment_add_v1` 只可靠推送 @Bot 通知；--all 通过应用身份轮询
+  // 评论列表补齐普通评论。先立即建/续基线，之后每 5 秒增量检查。
+  const docCommentPollTimer = setInterval(() => {
+    void pollWatchedDocComments(cfg.larkAppId);
+  }, 5_000);
+  docCommentPollTimer.unref?.();
+  void pollWatchedDocComments(cfg.larkAppId);
+
   // Sweep orphan sandbox overlays left by a previous run's crash/kill: any
   // <dataDir>/sandboxes/<sid> whose session is no longer active gets its
   // overlays unmounted and its dirs removed (plus the /var/tmp home scratch).
@@ -8210,14 +8601,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
 
   const idleWorkerSweepTimer = setInterval(() => {
-    // Re-read the live per-bot cap each tick so a dashboard edit (which mutates
-    // bot.config in place via applyConfigField) takes effect within 60s without
-    // a restart. Unset → DEFAULT_MAX_LIVE_WORKERS; ≤0 → no cap.
-    const maxLiveWorkers = getBot(cfg.larkAppId).config.maxLiveWorkers;
-    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers });
-    if (suspended.length > 0) {
-      logger.info(`[idle-worker-sweeper] suspended ${suspended.length} session(s) over per-bot cap ${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS}`);
-    }
+    // Dashboard config edits need no restart; the timer also backstops any
+    // missed lifecycle edge. Normal new/resumed sessions enforce immediately.
+    enforceLiveSessionCap('periodic');
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
 
@@ -8274,6 +8660,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // primary daemon (bot-0) — a restart is host-wide.
   if (idx === 0) {
     startMaintenance();
+    startCliRuntimeUpdateMonitor({
+      dataDir: config.session.dataDir,
+      primaryLarkAppId: cfg.larkAppId,
+      ownerOpenId: () => resolvePrimaryOwnerOpenId(cfg.larkAppId),
+      dashboardUrl: () => dashboardUrlForReport().url,
+      targets: configuredCodexUpdateTargets,
+      sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive').then(() => undefined),
+      log: (m) => logger.info(`[cli-update] ${m}`),
+    });
     // After an intentional restart, DM the owner a summary. Delayed a few
     // seconds so the dashboard process can publish its token first.
     setTimeout(() => {
@@ -8306,7 +8701,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.info(`Daemon shutting down... (active: ${getActiveCount()})`);
     scheduler.stopScheduler();
     stopMaintenance();
+    stopCliRuntimeUpdateMonitor();
     clearInterval(maintenanceHeartbeat);
+    clearInterval(docCommentPollTimer);
     for (const watcher of workflowEventWatchers.values()) watcher.close();
     workflowEventWatchers.clear();
     workflowRuns.clear();
@@ -8333,10 +8730,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           }));
           survivors.push(w);
         }
-        const backendType = ds.larkAppId
-          ? (getBot(ds.larkAppId).config.backendType ?? config.daemon.backendType)
-          : config.daemon.backendType;
-        if (backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij') {
+        // Branch by the session's FROZEN backend (stamped on Session.backendType
+        // at spawn), NOT the bot's live config — a dashboard backendType edit must
+        // not change how a running session is torn down, or we'd e.g. try to
+        // detach-preserve a "herdr" session whose real pane is tmux (freeze-once).
+        // undefined (frozen pty, or unresolvable legacy) → non-persistent → killWorker.
+        if (shutdownBackendDisposition(ds) === 'detach') {
           // Persistent backends (tmux / herdr / zellij): just kill the worker process —
           // the multiplexer session survives for re-attach. The worker's SIGTERM
           // handler calls backend.kill(), which only DETACHES. Going through
@@ -8385,6 +8784,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   process.on('exit', () => {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the

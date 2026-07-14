@@ -18,8 +18,10 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import { normalizePluginIdList } from './core/plugins/ids.js';
 
 export type RepoPickerMode = 'all' | 'repos';
+export type LocalCliOpenMode = 'attach' | 'resume';
 
 export interface WhiteboardConfig {
   /** Optional local project whiteboard. Off by default; enabling it must not create boards by itself. */
@@ -67,6 +69,8 @@ export interface GlobalConfig {
   /** Machine-wide user skill registry policy. Skill package storage itself lives under
    *  ~/.botmux/skills and is managed by services/skill-registry-store.ts. */
   skills?: GlobalSkillConfig;
+  /** Plugin ids enabled for every bot. Per-bot plugin ids are additive. */
+  plugins?: string[];
   /** 远程访问. When true (and this machine is bound to the central platform),
    *  session web-terminal links, Feishu card terminal buttons, and connector
    *  webhook URLs use the central-platform machine subdomain instead of local
@@ -103,9 +107,9 @@ export interface GlobalSkillConfig {
 }
 
 export interface MaintenanceConfig {
-  /** At `time` (once/day) run `npm install -g botmux@latest` to install the
+  /** At `time` (once/day) update the owning npm/pnpm global install to the
    *  latest version — download/install only, never restarts on its own.
-   *  npm-global installs only (disabled for local-dev). */
+   *  Disabled for local-dev and unsupported install layouts. */
   autoUpdate?: MaintenanceTask;
   /** When enabled (and autoUpdate is on), restart right after a successful
    *  auto-update that installed a newer version, to apply it. No schedule of
@@ -124,6 +128,14 @@ export interface MaintenanceToggle {
   enabled?: boolean;
 }
 
+export interface HerdrTraexPluginConfig {
+  enabled?: boolean;
+  /** herdr plugin source: `owner/repo[/subdir]` passed to `herdr plugin install`. */
+  source?: string;
+  /** Optional git ref (tag / branch / commit SHA) → `--ref`. Prefer a pinned SHA. */
+  ref?: string;
+}
+
 export interface DashboardGlobalConfig {
   /** When true, dashboard GET/HEAD pages and JSON APIs are public read-only;
    *  mutations still require the active dashboard token. */
@@ -131,10 +143,26 @@ export interface DashboardGlobalConfig {
   /** When true, terminal buttons on Feishu cards use Feishu's sidebar web_url
    *  wrapper. Default false opens the terminal URL directly. */
   openTerminalInFeishu?: boolean;
+  /** Opt in to native "Open <CLI>" buttons on supported desktop hosts.
+   *  Default false. When enabled, localCliOpenMode defaults to 'attach' so a
+   *  botmux-managed persistent backend attaches to the same I/O/history and
+   *  preserves Feishu continuity; 'resume' starts a separate CLI resume process
+   *  and may break that continuity. */
+  enableLocalCliOpen?: boolean;
+  /** How native "Open <CLI>" buttons launch on macOS. Missing defaults to
+   *  'attach': attach to the current managed/adopted backend session when an
+   *  exact attach target is available. 'resume' keeps the prior direct CLI
+   *  resume behavior for supported CLIs. */
+  localCliOpenMode?: LocalCliOpenMode;
   /** Experimental current-chat bot discovery via Lark `/members/bots`. Default
    *  ON (absent ⇒ enabled); set false to disable from the dashboard. Read live
    *  by the daemon — see config.ts `resolveChatBotDiscoveryConfig`. */
   chatBotDiscovery?: boolean;
+  /** Installed plugin Dashboard pages pinned into the main sidebar. This is a
+   *  machine-wide display preference and does not enable the plugin for a Bot. */
+  pinnedPlugins?: string[];
+  /** Opt-in TraeX herdr plugin bootstrap. Default OFF; source/ref are operator-supplied. */
+  herdrTraexPlugin?: HerdrTraexPluginConfig;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -225,13 +253,41 @@ function readRepoPickerMode(raw: unknown): RepoPickerMode | undefined {
   return raw === 'all' || raw === 'repos' ? raw : undefined;
 }
 
+function readLocalCliOpenMode(raw: unknown): LocalCliOpenMode | undefined {
+  return raw === 'attach' || raw === 'resume' ? raw : undefined;
+}
+
+function readHerdrTraexPlugin(raw: unknown): HerdrTraexPluginConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: HerdrTraexPluginConfig = {};
+  if (typeof r.enabled === 'boolean') out.enabled = r.enabled;
+  if (typeof r.source === 'string' && r.source.trim()) out.source = r.source.trim();
+  if (typeof r.ref === 'string' && r.ref.trim()) out.ref = r.ref.trim();
+  // Migrate the unmerged review schema in-memory without rewriting config.json.
+  if (!out.source && typeof r.spec === 'string' && r.spec.trim()) {
+    const legacy = r.spec.trim();
+    const hash = legacy.lastIndexOf('#');
+    out.source = hash > 0 ? legacy.slice(0, hash) : legacy;
+    if (!out.ref && hash > 0 && hash < legacy.length - 1) out.ref = legacy.slice(hash + 1);
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const d = raw as Record<string, unknown>;
   const out: DashboardGlobalConfig = {};
   if (typeof d.publicReadOnly === 'boolean') out.publicReadOnly = d.publicReadOnly;
   if (typeof d.openTerminalInFeishu === 'boolean') out.openTerminalInFeishu = d.openTerminalInFeishu;
+  if (typeof d.enableLocalCliOpen === 'boolean') out.enableLocalCliOpen = d.enableLocalCliOpen;
+  const localCliOpenMode = readLocalCliOpenMode(d.localCliOpenMode);
+  if (localCliOpenMode) out.localCliOpenMode = localCliOpenMode;
   if (typeof d.chatBotDiscovery === 'boolean') out.chatBotDiscovery = d.chatBotDiscovery;
+  const pinnedPlugins = normalizePluginIdList(d.pinnedPlugins);
+  if (pinnedPlugins) out.pinnedPlugins = pinnedPlugins;
+  const herdrTraexPlugin = readHerdrTraexPlugin(d.herdrTraexPlugin);
+  if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -330,6 +386,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   const skills = readGlobalSkills(raw.skills);
   if (skills) out.skills = skills;
+  const plugins = normalizePluginIdList(raw.plugins);
+  if (plugins) out.plugins = plugins;
   if (typeof raw.remoteAccess === 'boolean') out.remoteAccess = raw.remoteAccess;
   // Lenient: keep any non-empty string. IANA validity is enforced on write and
   // re-checked in scheduleTimeZone() (invalid ⇒ falls back to the host zone),

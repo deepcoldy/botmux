@@ -3151,6 +3151,149 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(JSON.parse(patchedMessages.at(-1)!.content).header.title.content).toBe('已同意语音发言');
   });
 
+  it('can approve one voice request and allow automatic voice for the rest of the meeting', async () => {
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        realtimeVoice: {
+          enabled: true,
+        },
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_output_voice_allow',
+      meeting: { id: 'm_output_voice_allow', meetingNo: '343434343', topic: 'Output voice auto approval' },
+      raw: { event: { meeting: { id: 'm_output_voice_allow', meeting_no: '343434343' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+    realtimeVoiceEvents.length = 0;
+
+    const submitted = await __vcMeetingAgentTest.submitOutput({
+      larkAppId: APP_ID,
+      meetingId: 'm_joined_343434343',
+      channel: 'voice',
+      content: '第一条语音需要审批。',
+    });
+    expect(submitted).toMatchObject({ ok: true, status: 'pending' });
+
+    const allowed = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: { value: lastInteractiveCardButton('本场自动语音') },
+    }, APP_ID);
+
+    expect(allowed.header.title.content).toBe('语音播报处理中');
+    await new Promise(resolve => setTimeout(resolve, 2));
+    expect(realtimeVoiceEvents).toContain('speak:第一条语音需要审批。');
+    expect(runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_343434343')?.voiceOutputPolicy).toBe('allow');
+
+    const second = await __vcMeetingAgentTest.submitOutput({
+      larkAppId: APP_ID,
+      meetingId: 'm_joined_343434343',
+      channel: 'voice',
+      content: '第二条语音自动播报。',
+    });
+
+    expect(second).toMatchObject({ ok: true, status: 'sent' });
+    expect(realtimeVoiceEvents).toContain('speak:第二条语音自动播报。');
+  });
+
+  it('serializes automatic voice behind the initial approved voice playback', async () => {
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        realtimeVoice: {
+          enabled: true,
+        },
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_output_voice_allow_serial',
+      meeting: { id: 'm_output_voice_allow_serial', meetingNo: '454545454', topic: 'Output voice auto approval serial' },
+      raw: { event: { meeting: { id: 'm_output_voice_allow_serial', meeting_no: '454545454' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+    realtimeVoiceEvents.length = 0;
+
+    const submitted = await __vcMeetingAgentTest.submitOutput({
+      larkAppId: APP_ID,
+      meetingId: 'm_joined_454545454',
+      channel: 'voice',
+      content: '第一条语音正在播报。',
+    });
+    expect(submitted).toMatchObject({ ok: true, status: 'pending' });
+
+    realtimeVoiceSpeakHolds.count = 1;
+    const allowed = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: { value: lastInteractiveCardButton('本场自动语音') },
+    }, APP_ID);
+    expect(allowed.header.title.content).toBe('语音播报处理中');
+
+    for (let i = 0; i < 20 && realtimeVoiceSpeakHolds.resolvers.length === 0; i += 1) {
+      await Promise.resolve();
+    }
+    expect(realtimeVoiceSpeakHolds.resolvers).toHaveLength(1);
+
+    let secondSettled = false;
+    const secondPromise = __vcMeetingAgentTest.submitOutput({
+      larkAppId: APP_ID,
+      meetingId: 'm_joined_454545454',
+      channel: 'voice',
+      content: '第二条语音等待串行播报。',
+    }).finally(() => {
+      secondSettled = true;
+    });
+
+    await Promise.resolve();
+    expect(secondSettled).toBe(false);
+    expect(realtimeVoiceEvents.filter(event => event.startsWith('speak:'))).toEqual([
+      'speak:第一条语音正在播报。',
+    ]);
+
+    realtimeVoiceSpeakHolds.resolvers.shift()?.();
+    const second = await secondPromise;
+
+    expect(second).toMatchObject({ ok: true, status: 'sent' });
+    expect(realtimeVoiceEvents.filter(event => event.startsWith('speak:'))).toEqual([
+      'speak:第一条语音正在播报。',
+      'speak:第二条语音等待串行播报。',
+    ]);
+  });
+
   it('merges a same-channel pending text output request into the existing review card', async () => {
     registerConsumerAgentBot();
     __vcMeetingAgentTest.setOutputTextSenderForTest(async (session, req) => {

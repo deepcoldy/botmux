@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { LoadingState, OverflowText } from './dashboard-components.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { useT } from './react-hooks.js';
 
 interface WhiteboardRow {
   id: string;
@@ -58,20 +60,6 @@ function groupedRows(rows: WhiteboardRow[], names: GroupNameMap): Array<{ chatId
     .sort((a, b) => a.label.localeCompare(b.label));
 }
 
-function itemStyle(active: boolean): React.CSSProperties {
-  return {
-    display: 'block',
-    textDecoration: 'none',
-    color: 'inherit',
-    border: `1px solid ${active ? 'rgba(14,165,233,.75)' : 'var(--border)'}`,
-    borderRadius: 14,
-    padding: '13px 14px',
-    margin: '10px 0 10px 18px',
-    background: active ? 'linear-gradient(135deg, rgba(14,165,233,.16), rgba(59,130,246,.08))' : 'var(--surface-raised)',
-    boxShadow: active ? '0 10px 24px rgba(14,165,233,.13)' : '0 4px 14px rgba(15,23,42,.04)',
-  };
-}
-
 function selectedIdFromHash(): string {
   return decodeURIComponent((location.hash.match(/^#\/whiteboards\/([^/]+)/)?.[1] ?? '').trim());
 }
@@ -100,38 +88,43 @@ function BoardItem(props: {
   onSelect(id: string): void;
 }) {
   const r = props.row;
+  const title = r.title || r.id;
   return (
     <a
       className={`wb-item${props.active ? ' active' : ''}`}
       data-whiteboard-id={r.id}
       href={`#/whiteboards/${encodeURIComponent(r.id)}`}
-      style={itemStyle(props.active)}
       onClick={ev => {
         ev.preventDefault();
         props.onSelect(r.id);
       }}
     >
-      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', justifyContent: 'space-between' }}>
-        <div style={{ minWidth: 0 }}>
-          <strong style={{ display: 'block', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.title || r.id}</strong>
-          <span style={{ display: 'inline-block', marginTop: 4, fontSize: 11, color: 'var(--muted)', fontFamily: 'ui-monospace,SFMono-Regular,Menlo,monospace' }}>{r.id}</span>
+      <div className="wb-item-head">
+        <div className="wb-item-main">
+          <strong>
+            <OverflowText text={title} textClassName="wb-title-scroll" />
+          </strong>
+          <span className="wb-id-text" title={r.id}>{r.id}</span>
         </div>
-        <span style={{ fontSize: 11, border: '1px solid var(--border)', borderRadius: 999, padding: '2px 7px', color: 'var(--muted)', whiteSpace: 'nowrap' }}>{r.scope}</span>
       </div>
-      <div style={{ marginTop: 9, display: 'flex', gap: 8, alignItems: 'center', color: 'var(--muted)', fontSize: 12 }}>
-        <span>{rel(r.updatedAt)}</span>
-        <span>·</span>
-        <span>log {r.logCount}</span>
+      <div className="wb-item-foot">
+        <div className="wb-item-meta">
+          <span>{rel(r.updatedAt)}</span>
+          <span>·</span>
+          <span>log {r.logCount}</span>
+        </div>
+        <span className="wb-scope" title={r.scope}>{r.scope}</span>
       </div>
     </a>
   );
 }
 
 function MetaCard(props: { label: string; value: string }) {
+  const value = props.value || '-';
   return (
-    <div style={{ border: '1px solid var(--border)', borderRadius: 12, padding: '10px 12px', background: 'var(--surface-raised)', minWidth: 0 }}>
-      <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 5 }}>{props.label}</div>
-      <div style={{ fontSize: 13, wordBreak: 'break-all' }}>{props.value || '-'}</div>
+    <div className="wb-meta-card" title={value}>
+      <span>{props.label}</span>
+      <strong>{value}</strong>
     </div>
   );
 }
@@ -146,32 +139,33 @@ function Detail(props: {
 
   const selectedRow = selected.row;
   const selectedChat = selectedRow?.chatId ? groupLabel(selectedRow.chatId, props.groupNames) : '未绑定群 / 本地白板';
+  const selectedTitle = selectedRow?.title || selected.id;
   return (
     <>
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-start', marginBottom: 16 }}>
-        <div style={{ minWidth: 0 }}>
-          <p className="eyebrow" style={{ margin: '0 0 6px' }}>WHITEBOARD</p>
-          <h2 style={{ margin: 0, fontSize: 22, lineHeight: 1.25 }}>{selectedRow?.title || selected.id}</h2>
-          <div style={{ marginTop: 8, color: 'var(--muted)', fontFamily: 'ui-monospace,SFMono-Regular,Menlo,monospace', fontSize: 12 }}>{selected.id}</div>
+      <div className="wb-detail-head">
+        <div className="wb-detail-title">
+          <p className="eyebrow">WHITEBOARD</p>
+          <h2 title={selectedTitle}>{selectedTitle}</h2>
+          <code title={selected.id}>{selected.id}</code>
         </div>
         <button type="button" className="danger" data-delete-whiteboard onClick={props.onDelete}>删除白板</button>
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2,minmax(0,1fr))', gap: 10, marginBottom: 18 }}>
+      <div className="wb-meta-grid">
         <MetaCard label="所属群" value={selectedChat} />
         <MetaCard label="范围" value={selectedRow?.scope ?? '-'} />
         <MetaCard label="最近更新" value={selectedRow?.updatedAt ? rel(selectedRow.updatedAt) : '-'} />
         <MetaCard label="来源目录" value={selectedRow?.workingDir ?? '-'} />
       </div>
-      <details style={{ marginBottom: 18, color: 'var(--muted)' }}>
-        <summary style={{ cursor: 'pointer' }}>管理信息 / 文件路径</summary>
-        <code style={{ display: 'block', marginTop: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{selectedRow?.path ?? ''}</code>
+      <details className="wb-admin-info">
+        <summary>管理信息 / 文件路径</summary>
+        <code>{selectedRow?.path ?? ''}</code>
       </details>
-      <section style={{ border: '1px solid var(--border)', borderRadius: 14, background: 'var(--surface-raised)', overflow: 'hidden' }}>
-        <div style={{ padding: '12px 14px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <strong>当前状态 board.md</strong>
-          <span style={{ color: 'var(--muted)', fontSize: 12 }}>read / update</span>
+      <section className="wb-board-panel">
+        <div className="wb-board-panel-head">
+          <strong>board.md</strong>
+          <span>只读预览</span>
         </div>
-        <pre style={{ whiteSpace: 'pre-wrap', maxHeight: '70vh', overflow: 'auto', margin: 0, padding: 16, lineHeight: 1.65, background: 'transparent' }}>
+        <pre>
           {selected.content || '（暂无内容）'}
         </pre>
       </section>
@@ -190,20 +184,19 @@ function DeleteModal(props: {
     <div
       className="wb-delete-backdrop"
       data-delete-modal
-      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.48)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000, padding: 20 }}
       onClick={ev => { if (ev.target === ev.currentTarget) props.onCancel(); }}
     >
-      <div role="dialog" aria-modal="true" aria-labelledby="wb-delete-title" style={{ width: 'min(520px,92vw)', background: 'var(--surface)', color: 'var(--fg)', border: '1px solid var(--border)', borderRadius: 16, boxShadow: '0 18px 60px rgba(0,0,0,.35)', padding: '22px 24px' }}>
-        <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start' }}>
-          <div aria-hidden="true" style={{ width: 36, height: 36, borderRadius: '50%', display: 'grid', placeItems: 'center', background: 'rgba(220,38,38,.14)', color: '#dc2626', fontWeight: 800 }}>!</div>
-          <div style={{ minWidth: 0, flex: 1 }}>
-            <h3 id="wb-delete-title" style={{ margin: '0 0 8px', fontSize: 18 }}>删除白板？</h3>
-            <p style={{ margin: 0, color: 'var(--muted)', lineHeight: 1.6 }}>
+      <div className="wb-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="wb-delete-title">
+        <div className="wb-delete-body">
+          <div className="wb-delete-mark" aria-hidden="true">!</div>
+          <div>
+            <h3 id="wb-delete-title">删除白板？</h3>
+            <p>
               将删除 <strong>{title}</strong>（<code>{props.selected.id}</code>）的 board、log、meta，并清理默认绑定和会话引用。此操作不可恢复。
             </p>
           </div>
         </div>
-        <div className="actions" style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 22 }}>
+        <div className="actions wb-delete-actions">
           <button type="button" data-delete-cancel onClick={props.onCancel} disabled={props.deleting}>取消</button>
           <button type="button" className="danger" data-delete-confirm onClick={props.onConfirm} disabled={props.deleting}>
             {props.deleting ? '删除中...' : '确认删除'}
@@ -215,6 +208,7 @@ function DeleteModal(props: {
 }
 
 function WhiteboardsPage() {
+  const tr = useT();
   const mountedRef = useRef(false);
   const selectionSeqRef = useRef(0);
   const [enabled, setEnabled] = useState(false);
@@ -295,45 +289,59 @@ function WhiteboardsPage() {
     }
   }
 
+  const disabledNotice = '白板能力当前关闭：不会自动创建/绑定白板，也不会注入到 agent prompt。历史白板仅在 dashboard 中只读可见，可在此清理。';
+  const heading = (showDisabledNotice = false) => (
+    <div className="page-heading">
+      <div>
+        <p className="eyebrow">{tr('nav.whiteboards')}</p>
+        <h1>{tr('nav.whiteboards')}</h1>
+        {showDisabledNotice ? (
+          <span className="wb-disabled-pill" title={disabledNotice} aria-label={disabledNotice}>
+            {disabledNotice}
+          </span>
+        ) : null}
+      </div>
+    </div>
+  );
+
   if (error) {
-    return <section className="page"><p className="hint-warn">加载白板失败：{error}</p></section>;
+    return <section className="page whiteboards-page">{heading()}<p className="hint-warn">加载白板失败：{error}</p></section>;
   }
 
   if (loading) {
-    return <div data-whiteboards-host><p className="empty">Loading whiteboards...</p></div>;
+    return <section className="page whiteboards-page" data-whiteboards-host>{heading()}<LoadingState label={tr('common.loading')} /></section>;
   }
 
   return (
-    <section className="page">
-      <div className="page-heading">
-        <div>
-          <p className="eyebrow">Whiteboards</p>
-          <h1>本地白板</h1>
-          <p>按群共享的本地最新状态白板。开关关闭时仅只读展示历史白板，不注入 prompt、不允许 agent CLI 读写。</p>
-        </div>
-        <span className={`pill ${enabled ? 'ok' : 'warn'}`}>{enabled ? 'Enabled' : 'Disabled'}</span>
-      </div>
-      {enabled ? null : <p className="hint-warn">白板能力当前关闭：不会自动创建/绑定白板，也不会注入到 agent prompt。历史白板仅在 dashboard 中只读可见，可在此清理。</p>}
-      <div className="wb-split" style={{ display: 'grid', gridTemplateColumns: 'minmax(300px,400px) minmax(0,1fr)', gap: 18, alignItems: 'start' }}>
-        <article className="bd-card settings-card" style={{ padding: 18 }}>
-          <h3 className="bd-section-title" style={{ marginBottom: 12 }}>群组 / 白板</h3>
-          {groups.length === 0 ? (
-            <p className="empty">暂无白板。打开能力后，每个群首次需要白板时才会创建默认白板。</p>
-          ) : groups.map(g => (
-            <details className="wb-group" open style={{ marginBottom: 14 }} key={g.chatId}>
-              <summary style={{ cursor: 'pointer', fontWeight: 700, margin: '12px 0 8px', display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
-                <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{g.label}</span>
-                <small style={{ border: '1px solid var(--border)', borderRadius: 999, padding: '1px 7px', color: 'var(--muted)' }}>{g.rows.length}</small>
-              </summary>
-              {g.rows.map(r => (
-                <BoardItem key={r.id} row={r} active={selected?.id === r.id} onSelect={id => void selectBoard(id)} />
-              ))}
-            </details>
-          ))}
-        </article>
-        <article className="bd-card settings-card" id="whiteboard-detail" style={{ padding: '20px 22px' }}>
-          <Detail selected={selected} groupNames={groupNames} onDelete={() => { if (selected) setDeleteTarget(selected); }} />
-        </article>
+    <section className="page whiteboards-page">
+      {heading(!enabled)}
+      <div className="wb-split">
+        <section className="overview-block wb-list-block">
+          <div className="wb-list-panel">
+            {groups.length === 0 ? (
+              <p className="empty wb-empty">暂无白板。打开能力后，每个群首次需要白板时才会创建默认白板。</p>
+            ) : groups.map(g => (
+              <details className="wb-group" open key={g.chatId}>
+                <summary>
+                  <span className="wb-group-title">
+                    <OverflowText text={g.label} textClassName="wb-group-title-scroll" />
+                  </span>
+                  <small>{g.rows.length}</small>
+                </summary>
+                <div className="wb-group-items">
+                  {g.rows.map(r => (
+                    <BoardItem key={r.id} row={r} active={selected?.id === r.id} onSelect={id => void selectBoard(id)} />
+                  ))}
+                </div>
+              </details>
+            ))}
+          </div>
+        </section>
+        <section className="overview-block wb-detail-block">
+          <div className="wb-detail-panel" id="whiteboard-detail">
+            <Detail selected={selected} groupNames={groupNames} onDelete={() => { if (selected) setDeleteTarget(selected); }} />
+          </div>
+        </section>
       </div>
       {deleteTarget ? (
         <DeleteModal

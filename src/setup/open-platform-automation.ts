@@ -1,15 +1,10 @@
 /**
- * Automates the Open Platform half of `botmux setup` after the PersonalAgent
- * app has been created by the Feishu SDK registerApp flow.
+ * Feishu Open Platform automation used by `botmux setup`.
  *
- * Follow-up for PR review: the current end-to-end setup can still ask for two
- * QR scans: one for SDK app creation and one for this Web session. These can be
- * collapsed in a later iteration by making the Feishu Web session the primary
- * path for app creation as well: Web QR login -> create/find app -> read
- * AppID/AppSecret -> write bots.json -> configure scopes/redirect/version.
- * With a cached ~/.botmux/feishu-session.json, that path can create another bot
- * with no QR scan at all. Keep the current SDK creation path as the stable
- * fallback until that flow is fully verified.
+ * The primary Feishu path now uses one reusable Web session for the whole flow:
+ * create app -> read AppID/AppSecret -> configure scopes/events/redirect ->
+ * create and publish a version. The official SDK registerApp device flow stays
+ * available as a fallback (notably for Lark international tenants).
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join, dirname } from 'node:path';
@@ -57,6 +52,15 @@ export interface StoredCookie {
   hostOnly: boolean;
   expiresAt?: number;
   sameSite?: string;
+}
+
+/** 当前开放平台 Web session 对应的人与企业。创建前用它防止复用错租户。 */
+export interface FeishuWebSessionIdentity {
+  userId: string;
+  userName: string;
+  email?: string;
+  tenantId: string;
+  tenantName: string;
 }
 
 export interface ScopeManifest {
@@ -119,6 +123,8 @@ export interface OpenPlatformAutomationOptions {
   sessionFilePath?: string;
   bytedcliFallbackSessionFilePath?: string;
   disableBytedcliFallback?: boolean;
+  /** Reuse a valid cache or fail instead of presenting another QR. */
+  disableQrLogin?: boolean;
   fetchImpl?: typeof fetch;
   scopeManifest?: ScopeManifest;
   pollIntervalMs?: number;
@@ -151,12 +157,34 @@ export interface FeishuWebSessionOptions {
   sessionFilePath?: string;
   bytedcliFallbackSessionFilePath?: string;
   disableBytedcliFallback?: boolean;
+  /**
+   * Ignore cached sessions and require a fresh QR login. Dashboard onboarding
+   * uses this so the user always sees which account is authorizing the new app;
+   * the resulting session is still cached for the remaining setup steps.
+   */
+  forceQrLogin?: boolean;
+  /** Reuse a valid cache or fail; never present another QR code. */
+  disableQrLogin?: boolean;
   fetchImpl?: typeof fetch;
   pollIntervalMs?: number;
   maxWaitMs?: number;
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
   onStatus?: (message: string) => void | Promise<void>;
 }
+
+export type FeishuOpenPlatformSessionInspectionResult =
+  | {
+      ok: true;
+      source: FeishuWebSessionSource;
+      identity: FeishuWebSessionIdentity;
+      sessionFile: string;
+    }
+  | {
+      ok: false;
+      reason: FeishuWebSessionFailureReason | 'missing_csrf' | 'identity_unavailable' | 'network';
+      message: string;
+      sessionFile?: string;
+    };
 
 
 export function parseSetupOpenPlatformAutoFlag(argv: string[]): boolean {
@@ -241,6 +269,34 @@ export function extractOpenPlatformCsrfToken(html: string): string | null {
     html.match(/\bwindow\.csrfToken\s*=\s*(['"])([^'"]+)\1/) ??
     html.match(/\bcsrfToken\s*:\s*(['"])([^'"]+)\1/);
   return match?.[2] ?? null;
+}
+
+/**
+ * 开发者后台把当前登录人写入 `window.user = {...}`。只提取创建前需要展示和
+ * 比对的稳定字段，不把头像、功能开关等整段页面状态带进 Dashboard API。
+ */
+export function extractOpenPlatformSessionIdentity(html: string): FeishuWebSessionIdentity | null {
+  const marker = /\bwindow\.user\s*=\s*/g;
+  const match = marker.exec(html);
+  if (!match) return null;
+  const start = match.index + match[0].length;
+  const json = extractBalancedJsonObject(html, start);
+  if (!json) return null;
+  let user: Record<string, unknown>;
+  try {
+    user = asRecord(JSON.parse(json));
+  } catch {
+    return null;
+  }
+  const userId = pickString(user, ['id', 'userId', 'user_id']);
+  const userName = pickString(user, ['name', 'userName', 'user_name'])
+    ?? pickString(asRecord(user.displayName), ['value']);
+  const tenantId = pickString(user, ['tenantId', 'tenant_id']);
+  const tenantName = pickString(asRecord(user.tenantDisplayName), ['value'])
+    ?? pickString(user, ['tenantName', 'tenant_name']);
+  if (!userId || !userName || !tenantId || !tenantName) return null;
+  const email = pickString(user, ['email']);
+  return { userId, userName, ...(email ? { email } : {}), tenantId, tenantName };
 }
 
 export function extractOpenPlatformScopeEntries(payload: unknown): OpenPlatformScopeEntry[] {
@@ -348,14 +404,25 @@ export async function prepareFeishuWebSession(
 ): Promise<FeishuWebSessionPrepareResult> {
   const fetcher = options.fetchImpl ?? fetch;
   const sessionFile = options.sessionFilePath ?? botmuxFeishuSessionFilePath();
-  const cached = readStoredCookiesFromSessionFile(sessionFile);
-  if (cached && cached.length > 0 && await validateFeishuWebSession(cached, fetcher)) {
+  if (!options.forceQrLogin) {
+    const cached = readStoredCookiesFromSessionFile(sessionFile);
+    if (cached && cached.length > 0 && await validateFeishuWebSession(cached, fetcher)) {
+      return {
+        ok: true,
+        sessionFile,
+        source: 'botmux_cache',
+        cookies: cached,
+        cookieCount: cached.length,
+      };
+    }
+  }
+
+  if (options.disableQrLogin) {
     return {
-      ok: true,
+      ok: false,
+      reason: 'invalid_session',
+      message: '没有可复用的 Feishu Web session；为避免意外出现第二个二维码，已停止自动登录',
       sessionFile,
-      source: 'botmux_cache',
-      cookies: cached,
-      cookieCount: cached.length,
     };
   }
 
@@ -375,7 +442,7 @@ export async function prepareFeishuWebSession(
   }
 
   const fallbackSessionFile = options.bytedcliFallbackSessionFilePath ?? bytedcliFeishuSessionFilePath();
-  if (!options.disableBytedcliFallback) {
+  if (!options.forceQrLogin && !options.disableBytedcliFallback) {
     const fallback = readStoredCookiesFromBytedcliSession(fallbackSessionFile);
     if (fallback && fallback.length > 0 && await validateFeishuWebSession(fallback, fetcher)) {
       writeStoredCookiesToSessionFile(sessionFile, fallback);
@@ -394,7 +461,7 @@ export async function prepareFeishuWebSession(
     reason: classifyFeishuLoginError(loginError),
     message: safeErrorMessage(loginError),
     sessionFile,
-    fallbackSessionFile: options.disableBytedcliFallback ? undefined : fallbackSessionFile,
+    fallbackSessionFile: options.disableBytedcliFallback || options.forceQrLogin ? undefined : fallbackSessionFile,
   };
 }
 
@@ -411,6 +478,7 @@ export async function automateOpenPlatformSetup(
     sessionFilePath: options.sessionFilePath,
     bytedcliFallbackSessionFilePath: options.bytedcliFallbackSessionFilePath,
     disableBytedcliFallback: options.disableBytedcliFallback,
+    disableQrLogin: options.disableQrLogin,
     fetchImpl: fetcher,
     pollIntervalMs: options.pollIntervalMs,
     maxWaitMs: options.maxWaitMs,
@@ -519,6 +587,21 @@ export async function automateOpenPlatformSetup(
     }
   }
 
+  // Web 创建的是普通企业自建应用（不是 SDK PersonalAgent），需要显式开启
+  // 机器人能力并把事件接收方式切到长连接。对已启用的 SDK/已有应用重复调用
+  // 是幂等的；这里设为致命步骤，因为缺任一项 daemon 都无法正常收消息。
+  try {
+    await postJson(`/developers/v1/robot/switch/${options.appId}`, { clientId: options.appId, enable: true });
+    await postJson(`/developers/v1/event/switch/${options.appId}`, { clientId: options.appId, eventMode: 4 });
+  } catch (err: any) {
+    return {
+      ok: false,
+      reason: 'api_error',
+      message: `启用机器人或长连接事件能力失败: ${safeErrorMessage(err)}`,
+      sessionFile,
+    };
+  }
+
   // Best-effort auto-subscribe VC meeting bot events. Non-fatal: if the endpoint
   // doesn't exist or fails, the user can still add them manually in the console.
   // We try multiple known internal API patterns since the console frontend
@@ -614,10 +697,11 @@ export interface OpenPlatformAppSummary {
 export interface OpenPlatformApiClient {
   apiOrigin: string;
   postJson(path: string, body?: unknown): Promise<unknown>;
+  postForm(path: string, body: FormData): Promise<unknown>;
 }
 
 export type OpenPlatformClientResult =
-  | { ok: true; client: OpenPlatformApiClient }
+  | { ok: true; client: OpenPlatformApiClient; identity?: FeishuWebSessionIdentity }
   | { ok: false; reason: 'missing_csrf' | 'network'; message: string };
 
 /**
@@ -634,11 +718,13 @@ export async function createOpenPlatformApiClient(
   let csrfToken: string | null = null;
   let apiOrigin = 'https://open.feishu.cn';
   let referer = `${apiOrigin}/app`;
+  let identity: FeishuWebSessionIdentity | undefined;
   try {
     const page = await session.fetchTextWithUrl(fetcher, `${apiOrigin}/app`);
     apiOrigin = new URL(page.finalUrl).origin;
     referer = page.finalUrl;
     csrfToken = extractOpenPlatformCsrfToken(page.text);
+    identity = extractOpenPlatformSessionIdentity(page.text) ?? undefined;
   } catch (err) {
     return { ok: false, reason: 'network', message: `读取开放平台页面失败: ${safeErrorMessage(err)}` };
   }
@@ -650,7 +736,7 @@ export async function createOpenPlatformApiClient(
     };
   }
 
-  const postJson = async (path: string, body?: unknown): Promise<unknown> => {
+  const request = async (path: string, body?: BodyInit, contentType?: string): Promise<unknown> => {
     const url = `${apiOrigin}${path}`;
     const response = await session.fetchRaw(fetcher, url, {
       method: 'POST',
@@ -659,9 +745,9 @@ export async function createOpenPlatformApiClient(
         origin: apiOrigin,
         referer,
         'x-csrf-token': csrfToken!,
-        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        ...(contentType ? { 'content-type': contentType } : {}),
       },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body,
     });
     let data: any;
     try {
@@ -678,7 +764,227 @@ export async function createOpenPlatformApiClient(
     return data;
   };
 
-  return { ok: true, client: { apiOrigin, postJson } };
+  const postJson = async (path: string, body?: unknown): Promise<unknown> =>
+    request(path, body === undefined ? undefined : JSON.stringify(body), body === undefined ? undefined : 'application/json');
+  const postForm = async (path: string, body: FormData): Promise<unknown> => request(path, body);
+
+  return { ok: true, client: { apiOrigin, postJson, postForm }, identity };
+}
+
+/**
+ * 只检查现有缓存，不展示二维码。Dashboard 打开添加表单时调用；返回的账号/企业
+ * 会显示给用户，并在真正创建前再次比对，避免旧 cookie 把应用建到错误租户。
+ */
+export async function inspectCachedFeishuOpenPlatformSession(
+  options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
+): Promise<FeishuOpenPlatformSessionInspectionResult> {
+  const prepared = await prepareFeishuWebSession({
+    ...options,
+    disableQrLogin: true,
+    disableBytedcliFallback: true,
+  });
+  if (!prepared.ok) return prepared;
+  const clientResult = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl });
+  if (!clientResult.ok) {
+    return {
+      ok: false,
+      reason: clientResult.reason,
+      message: clientResult.message,
+      sessionFile: prepared.sessionFile,
+    };
+  }
+  if (!clientResult.identity) {
+    return {
+      ok: false,
+      reason: 'identity_unavailable',
+      message: '开放平台没有返回当前账号与企业信息；为避免创建到错误租户，未复用该登录态',
+      sessionFile: prepared.sessionFile,
+    };
+  }
+  return {
+    ok: true,
+    source: prepared.source,
+    identity: clientResult.identity,
+    sessionFile: prepared.sessionFile,
+  };
+}
+
+export type CreateFeishuOpenPlatformAppResult =
+  | {
+      ok: true;
+      appId: string;
+      appSecret: string;
+      brand: 'feishu';
+      sessionFile: string;
+      sessionSource: FeishuWebSessionSource;
+      sessionIdentity: FeishuWebSessionIdentity;
+    }
+  | {
+      ok: false;
+      reason:
+        | FeishuWebSessionFailureReason
+        | 'missing_csrf'
+        | 'missing_icon'
+        | 'identity_unavailable'
+        | 'session_changed'
+        | 'api_error';
+      message: string;
+      /** 应用已经建成但读取 Secret 失败时返回，调用方不得再创建一个重复应用。 */
+      appId?: string;
+      sessionFile?: string;
+    };
+
+export interface CreateFeishuOpenPlatformAppOptions extends FeishuWebSessionOptions {
+  name: string;
+  description?: string;
+  /** 测试/定制图标；默认复用 botmux dashboard 的 512x512 favicon。 */
+  iconFilePath?: string;
+  /** Dashboard 表单打开时显示过的缓存身份；创建前必须仍是同一人、同一企业。 */
+  expectedIdentity?: Pick<FeishuWebSessionIdentity, 'userId' | 'tenantId'>;
+  /** 已拿到并验证账号/企业、但尚未创建应用时触发。 */
+  onSessionReady?: (info: {
+    source: FeishuWebSessionSource;
+    identity: FeishuWebSessionIdentity;
+  }) => void | Promise<void>;
+}
+
+class CreatedOpenPlatformAppError extends Error {
+  constructor(readonly appId: string, cause: unknown) {
+    super(`应用 ${appId} 已创建，但启用机器人能力或读取 AppSecret 失败: ${safeErrorMessage(cause)}`);
+  }
+}
+
+function defaultBotmuxAppIconPath(): string | undefined {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    // npm build: dist/setup/open-platform-automation.js -> dist/dashboard-web/favicon.png
+    join(here, '..', 'dashboard-web', 'favicon.png'),
+    // tsx / vitest: src/setup/open-platform-automation.ts -> src/dashboard/web/favicon.png
+    join(here, '..', 'dashboard', 'web', 'favicon.png'),
+  ];
+  return candidates.find(existsSync);
+}
+
+function pickPayloadString(payload: unknown, keys: string[]): string | undefined {
+  const record = asRecord(payload);
+  return pickString(record, keys) ?? pickString(asRecord(record.data), keys);
+}
+
+/**
+ * 用已经登录的开放平台 Web session 创建一个企业自建应用并读取凭证。
+ *
+ * 当前 console 前端（2026-07）同款链路：上传 512px botmux 图标 → app/create
+ * → 只读 secret 接口。所有 Secret 只存在返回值中，不打印、不写日志。
+ */
+export async function createOpenPlatformAppWithClient(
+  client: OpenPlatformApiClient,
+  options: { name: string; description?: string; iconFilePath?: string },
+): Promise<{ appId: string; appSecret: string }> {
+  const name = options.name.trim();
+  if (!name) throw new Error('应用名称不能为空');
+  const iconFile = options.iconFilePath ?? defaultBotmuxAppIconPath();
+  if (!iconFile || !existsSync(iconFile)) throw new Error('找不到 botmux 默认应用图标');
+
+  const icon = readFileSync(iconFile);
+  const form = new FormData();
+  form.append('file', new Blob([icon], { type: 'image/png' }), 'botmux.png');
+  form.append('uploadType', '4'); // Open Platform console enum: Icon
+  form.append('isIsv', 'false'); // 企业自建应用
+  form.append('scale', JSON.stringify({ width: 512, height: 512 }));
+  const uploaded = await client.postForm('/developers/v1/app/upload/image', form);
+  const avatar = pickPayloadString(uploaded, ['url']);
+  if (!avatar) throw new Error('开放平台上传图标后没有返回 url');
+
+  const description = options.description?.trim() || 'AI coding assistant powered by botmux';
+  const created = await client.postJson('/developers/v1/app/create', {
+    appSceneType: 0, // SelfBuild
+    name,
+    desc: description,
+    avatar,
+    i18n: { zh_cn: { name, description } },
+    primaryLang: 'zh_cn',
+  });
+  const appId = pickPayloadString(created, ['ClientID', 'clientID', 'clientId', 'appId']);
+  if (!appId?.startsWith('cli_')) throw new Error('开放平台创建应用后没有返回 ClientID');
+
+  try {
+    // 普通企业自建应用不像 SDK PersonalAgent 那样默认带 bot + 长连接事件能力。
+    // 这两步是“一扫即用”的必要条件，必须在返回凭证前完成。
+    await client.postJson(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true });
+    await client.postJson(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 }); // WebSocket
+    const appSecret = await fetchOpenPlatformAppSecret(client, appId);
+    return { appId, appSecret };
+  } catch (err) {
+    throw new CreatedOpenPlatformAppError(appId, err);
+  }
+}
+
+/**
+ * 单次飞书 Web 扫码完成应用创建。session 会写入 ~/.botmux，后续
+ * automateOpenPlatformSetup 会直接复用，因此权限/redirect/发版不再二次扫码。
+ */
+export async function createFeishuOpenPlatformApp(
+  options: CreateFeishuOpenPlatformAppOptions,
+): Promise<CreateFeishuOpenPlatformAppResult> {
+  const prepared = await prepareFeishuWebSession(options);
+  if (!prepared.ok) {
+    return {
+      ok: false,
+      reason: prepared.reason,
+      message: `获取 Feishu Web session 失败: ${prepared.message}`,
+      sessionFile: prepared.sessionFile,
+    };
+  }
+
+  const clientResult = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl });
+  if (!clientResult.ok) {
+    return {
+      ok: false,
+      reason: clientResult.reason,
+      message: clientResult.message,
+      sessionFile: prepared.sessionFile,
+    };
+  }
+  if (!clientResult.identity) {
+    return {
+      ok: false,
+      reason: 'identity_unavailable',
+      message: '开放平台没有返回当前账号与企业信息；为避免创建到错误租户，未创建应用',
+      sessionFile: prepared.sessionFile,
+    };
+  }
+  if (options.expectedIdentity
+    && (clientResult.identity.userId !== options.expectedIdentity.userId
+      || clientResult.identity.tenantId !== options.expectedIdentity.tenantId)) {
+    return {
+      ok: false,
+      reason: 'session_changed',
+      message: `当前登录账号或企业已变化（${clientResult.identity.userName} · ${clientResult.identity.tenantName}）；请重新确认后再创建`,
+      sessionFile: prepared.sessionFile,
+    };
+  }
+
+  try {
+    await options.onSessionReady?.({ source: prepared.source, identity: clientResult.identity });
+    const credentials = await createOpenPlatformAppWithClient(clientResult.client, options);
+    return {
+      ok: true,
+      ...credentials,
+      brand: 'feishu',
+      sessionFile: prepared.sessionFile,
+      sessionSource: prepared.source,
+      sessionIdentity: clientResult.identity,
+    };
+  } catch (err) {
+    const message = safeErrorMessage(err);
+    return {
+      ok: false,
+      reason: /默认应用图标/.test(message) ? 'missing_icon' : 'api_error',
+      message,
+      ...(err instanceof CreatedOpenPlatformAppError ? { appId: err.appId } : {}),
+      sessionFile: prepared.sessionFile,
+    };
+  }
 }
 
 /**
@@ -1052,6 +1358,32 @@ export function extractVersionId(payload: unknown): string | undefined {
   if (direct) return direct;
   const data = asRecord(asRecord(payload).data);
   return pickString(data, ['versionId', 'version_id', 'id']) ?? pickString(asRecord(data.appVersion), ['versionId', 'version_id', 'id']);
+}
+
+function extractBalancedJsonObject(input: string, start: number): string | null {
+  if (input[start] !== '{') return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < input.length; i += 1) {
+    const char = input[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{') depth += 1;
+    else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return input.slice(start, i + 1);
+    }
+  }
+  return null;
 }
 
 function pickString(record: Record<string, unknown>, keys: string[]): string | undefined {

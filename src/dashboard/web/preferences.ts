@@ -4,6 +4,7 @@ export type SessionsViewMode = 'kanban' | 'board' | 'table';
 
 export const THEME_STORAGE_KEY = 'botmux.dashboard.theme';
 export const SESSIONS_VIEW_STORAGE_KEY = 'botmux.dashboard.sessions.view';
+export const SESSIONS_SHOW_UNKNOWN_CHATS_STORAGE_KEY = 'botmux.dashboard.sessions.showUnknownChats';
 
 export function normalizeThemeMode(value: unknown): ThemeMode | null {
   return value === 'system' || value === 'light' || value === 'dark' ? value : null;
@@ -26,6 +27,15 @@ export function readStoredThemeMode(storage: Storage | undefined): ThemeMode {
 
 export function readStoredSessionsViewMode(storage: Storage | undefined): SessionsViewMode {
   return normalizeSessionsViewMode(storage?.getItem(SESSIONS_VIEW_STORAGE_KEY)) ?? 'board';
+}
+
+export function readStoredSessionsShowUnknownChats(storage: Storage | undefined): boolean {
+  try {
+    const raw = storage?.getItem(SESSIONS_SHOW_UNKNOWN_CHATS_STORAGE_KEY);
+    return raw == null ? true : raw === '1';
+  } catch {
+    return true;
+  }
 }
 
 // ── 看板列顺序（用户可拖拽/按钮自定义，从左到右）─────────────────────────────
@@ -67,6 +77,14 @@ export function writeStoredSessionsViewMode(storage: Storage | undefined, mode: 
   }
 }
 
+export function writeStoredSessionsShowUnknownChats(storage: Storage | undefined, show: boolean): void {
+  try {
+    storage?.setItem(SESSIONS_SHOW_UNKNOWN_CHATS_STORAGE_KEY, show ? '1' : '0');
+  } catch {
+    // localStorage 不可用时只在当前页生效
+  }
+}
+
 // ── 看板分组维度：工作流列 / 团队（筛选某团队的工作流）/ 机器人列 ─────────────
 export type KanbanGroupBy = 'flow' | 'team' | 'bot';
 
@@ -89,27 +107,6 @@ export function writeStoredKanbanGroupBy(storage: Storage | undefined, mode: Kan
   }
 }
 
-// ── 左侧菜单栏收起/展开 ───────────────────────────────────────────────────────
-export type SidebarMode = 'expanded' | 'collapsed';
-
-export const SIDEBAR_STORAGE_KEY = 'botmux.dashboard.sidebar';
-
-export function normalizeSidebarMode(value: unknown): SidebarMode | null {
-  return value === 'expanded' || value === 'collapsed' ? value : null;
-}
-
-export function readStoredSidebarMode(storage: Storage | undefined): SidebarMode {
-  return normalizeSidebarMode(storage?.getItem(SIDEBAR_STORAGE_KEY)) ?? 'expanded';
-}
-
-export function writeStoredSidebarMode(storage: Storage | undefined, mode: SidebarMode): void {
-  try {
-    storage?.setItem(SIDEBAR_STORAGE_KEY, mode);
-  } catch {
-    // localStorage 不可用时只在当前页生效
-  }
-}
-
 // ── Skin (visual identity, orthogonal to light/dark) ──────────────────────────
 // `default` = the regular botmux look (honours the light/dark theme mode).
 // Every other id is a self-contained palette distilled from the kaboo webui; each
@@ -118,24 +115,12 @@ export function writeStoredSidebarMode(storage: Storage | undefined, mode: Sideb
 export type SkinId =
   | 'default'
   | 'cyber'
-  | 'genshin'
-  | 'fallout'
-  | 'prts'
-  | 'bluearchive'
-  | 'zzz'
-  | 'dragonball'
-  | 'ikun';
+  | 'fallout';
 
 export const SKIN_IDS: readonly SkinId[] = [
   'default',
   'cyber',
-  'genshin',
   'fallout',
-  'prts',
-  'bluearchive',
-  'zzz',
-  'dragonball',
-  'ikun',
 ];
 
 export const SKIN_STORAGE_KEY = 'botmux.dashboard.skin';

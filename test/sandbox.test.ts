@@ -286,9 +286,23 @@ describe('validateRelayRequest', () => {
     expect(r.value.flags).toEqual(['--mention-back', '--mention', 'ou:X', '--voice']);
   });
 
+  it('accepts a custom card file as a plain outbox basename', () => {
+    const r = validateRelayRequest({
+      contentFile: 'c.content',
+      cardFile: 'card.json',
+      flags: ['--no-mention'],
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value.contentName).toBe('c.content');
+    expect(r.value.cardName).toBe('card.json');
+    expect(r.value.flags).toEqual(['--no-mention']);
+  });
+
   it('rejects the raw-hostArgs exploit (path-bearing flag not allowlisted)', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--content-file', '/root/.botmux/bots.json'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--files', '/root/.ssh/id_rsa'] }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--card-file', '/root/.botmux/card.json'] }).ok).toBe(false);
   });
 
   it('rejects a sandbox-supplied --session-id (cannot target another session)', () => {
@@ -303,6 +317,7 @@ describe('validateRelayRequest', () => {
   it('rejects non-basename content / attachment names (../ traversal)', () => {
     expect(validateRelayRequest({ contentFile: '../../etc/passwd' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', attachments: ['../secret'] }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', cardFile: '../card.json' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', videos: ['../secret.mp4'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', videoCovers: ['../cover.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'a/b' }).ok).toBe(false);
@@ -530,7 +545,12 @@ describe('sandbox landing from upper layer', () => {
     expect(readFileSync(join(target, 'b.txt'), 'utf8')).toBe('new b\n');
   });
 
-  it('a BRAND-NEW opaque dir is mkdir-only (does NOT rm -rf unrelated real files)', () => {
+  // Linux-only: this asserts overlay-landing (applySandboxDiff) behaviour, which
+  // only runs for the Linux bwrap sandbox — macOS uses a Seatbelt write-sandbox
+  // with no upper layer to land, so apply is never invoked there and its opaque-dir
+  // semantics (xattr-driven) don't hold off-Linux. The sibling landing tests are
+  // pure fs logic and stay cross-platform; only this apply-behaviour case is gated.
+  it.skipIf(process.platform !== 'linux')('a BRAND-NEW opaque dir is mkdir-only (does NOT rm -rf unrelated real files)', () => {
     // Regression #10: overlay marks BOTH new and replaced dirs opaque. apply must
     // only rm -rf an opaque dir that ALSO exists in the target; a purely-new dir
     // must not clobber concurrent real files that drifted under that path.

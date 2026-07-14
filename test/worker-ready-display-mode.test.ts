@@ -31,7 +31,10 @@ vi.mock('../src/im/lark/client.js', () => {
 });
 
 vi.mock('../src/im/lark/card-builder.js', () => ({
-  buildStreamingCard: vi.fn(() => '{"type":"streaming"}'),
+  buildStreamingCard: vi.fn((...args: any[]) => JSON.stringify({
+    type: 'streaming',
+    localCliReady: args[15] === true,
+  })),
   buildSessionCard: vi.fn(() => '{"type":"session"}'),
   buildTuiPromptCard: vi.fn(() => '{}'),
   buildTuiPromptResolvedCard: vi.fn(() => '{}'),
@@ -88,6 +91,18 @@ vi.mock('../src/adapters/cli/registry.js', () => ({
   createCliAdapterSync: vi.fn(),
 }));
 
+vi.mock('../src/services/local-cli-opener.js', () => ({
+  isLocalCliOpenEnabled: vi.fn(() => true),
+  isLocalCliOpenReady: vi.fn((ds: DaemonSession, opts?: { cliId?: string }) => {
+    if (!ds.adoptedFrom && !ds.session.adoptedFrom && (ds.session.backendType === 'tmux' || ds.session.backendType === 'herdr')) {
+      return true;
+    }
+    const cliId = opts?.cliId ?? ds.session.cliId;
+    if (cliId === 'oh-my-pi') return true;
+    return !!(ds.adoptedFrom?.sessionId ?? ds.session.adoptedFrom?.sessionId ?? ds.session.cliSessionId);
+  }),
+}));
+
 vi.mock('../src/adapters/cli/claude-code.js', () => ({
   claudeJsonlPathForSession: vi.fn(),
 }));
@@ -109,7 +124,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 // ─── Imports under test ────────────────────────────────────────────────────
 
-import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import { CARD_POSTING_SENTINEL, initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -165,15 +180,17 @@ function flush(): Promise<void> {
 
 describe('Worker ready: set_display_mode re-sync', () => {
   let sessionReplyMock: ReturnType<typeof vi.fn>;
+  let closeSessionMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     vi.clearAllMocks();
     sessionReplyMock = vi.fn(async () => 'om_new_card');
+    closeSessionMock = vi.fn();
     initWorkerPool({
       sessionReply: sessionReplyMock,
       getSessionWorkingDir: () => '/tmp',
       getActiveCount: () => 1,
-      closeSession: vi.fn(),
+      closeSession: closeSessionMock,
     });
   });
 
@@ -187,6 +204,28 @@ describe('Worker ready: set_display_mode re-sync', () => {
 
     expect(sessionReplyMock).toHaveBeenCalledTimes(1);
     expect(sessionReplyMock.mock.calls[0][4]).toBe('om_turn_ready');
+  });
+
+  it('doc-native session never posts a streaming card to the virtual doc: chat id', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'chat',
+      chatId: 'doc:doc_token_123',
+      session: {
+        ...makeDs().session,
+        chatId: 'doc:doc_token_123',
+        rootMessageId: 'doc:doc_token_123',
+      },
+      streamCardPending: true,
+      streamCardId: undefined,
+      worker: fakeWorker,
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_doc' });
+    await flush();
+
+    expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
   it('POST path sends set_display_mode when displayMode is screenshot', async () => {
@@ -259,6 +298,62 @@ describe('Worker ready: set_display_mode re-sync', () => {
     );
   });
 
+  it('re-applies readiness when cli_session_id races a restored-card PATCH', async () => {
+    let resolveRestorePatch!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveRestorePatch = resolve;
+    }));
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      streamCardPending: false,
+      streamCardId: 'om_existing_card',
+      workingDir: '/tmp',
+    });
+    ds.session.cliId = 'traex';
+    ds.session.cliSessionId = undefined;
+    ds.session.workingDir = '/tmp';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(updateMessageMock.mock.calls[0][2])).toMatchObject({ localCliReady: false });
+
+    fakeWorker.emit('message', { type: 'cli_session_id', cliSessionId: 'trae-native-ready' });
+    await flush();
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(updateMessageMock.mock.calls[1][2])).toMatchObject({ localCliReady: true });
+
+    resolveRestorePatch();
+    await flush();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(3);
+    expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2])).toMatchObject({ localCliReady: true });
+  });
+
+  it('does not require cli_session_id for mode-aware managed tmux local attach readiness', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      streamCardPending: false,
+      streamCardId: 'om_existing_card',
+      workingDir: '/tmp',
+    });
+    ds.session.cliId = 'gemini' as any;
+    ds.session.backendType = 'tmux';
+    ds.session.cliSessionId = undefined;
+    ds.session.workingDir = '/tmp';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(updateMessageMock.mock.calls[0][2])).toMatchObject({ localCliReady: true });
+  });
+
   // Regression: a re-fork that happens while streamCardPending is true (new turn
   // + worker had exited, e.g. resume) used to POST the "starting" card via the
   // ready path but leave streamCardPending=true. The next screen_update then took
@@ -284,6 +379,102 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(ds.streamCardId).toBe('om_new_card');
     // Flag cleared → a later screen_update will PATCH, not POST a 2nd card.
     expect(ds.streamCardPending).toBe(false);
+  });
+
+  it('patches the active card when cli_session_id makes local resume ready', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      workerPort: 9999,
+      streamCardId: 'om_existing_card',
+      workingDir: '/tmp',
+    });
+    ds.session.cliId = 'traex';
+    ds.session.cliSessionId = undefined;
+    ds.session.workingDir = '/tmp';
+    ds.adoptedFrom = { source: 'tmux', tmuxTarget: 'dev:1.2', cliId: 'traex', cwd: '/tmp' };
+    ds.session.adoptedFrom = { source: 'tmux', tmuxTarget: 'dev:1.2', cliId: 'traex', cwd: '/tmp' };
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'cli_session_id', cliSessionId: 'trae-native-ready' });
+    await flush();
+
+    expect(ds.session.cliSessionId).toBe('trae-native-ready');
+    expect(ds.adoptedFrom.sessionId).toBe('trae-native-ready');
+    expect(ds.session.adoptedFrom.sessionId).toBe('trae-native-ready');
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock.mock.calls[0][1]).toBe('om_existing_card');
+    expect(JSON.parse(updateMessageMock.mock.calls[0][2])).toMatchObject({ localCliReady: true });
+  });
+
+  it('defers the readiness patch until an in-flight card POST has a message id', async () => {
+    let resolveReply!: (messageId: string) => void;
+    sessionReplyMock.mockImplementationOnce(() => new Promise<string>((resolve) => {
+      resolveReply = resolve;
+    }));
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      streamCardPending: true,
+      streamCardId: undefined,
+      workingDir: '/tmp',
+    });
+    ds.session.cliId = 'traex';
+    ds.session.cliSessionId = undefined;
+    ds.session.workingDir = '/tmp';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+    expect(ds.streamCardId).toBe(CARD_POSTING_SENTINEL);
+
+    fakeWorker.emit('message', { type: 'cli_session_id', cliSessionId: 'trae-native-ready' });
+    await flush();
+    expect(ds.pendingLocalCliButtonRefresh).toBe(true);
+    expect(updateMessageMock).not.toHaveBeenCalled();
+
+    resolveReply('om_new_card');
+    await flush();
+    await flush();
+
+    expect(ds.streamCardId).toBe('om_new_card');
+    expect(ds.pendingLocalCliButtonRefresh).toBeUndefined();
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock.mock.calls[0][1]).toBe('om_new_card');
+    expect(JSON.parse(updateMessageMock.mock.calls[0][2])).toMatchObject({ localCliReady: true });
+  });
+
+  it('keeps a delivered fallback card/session alive when its readiness patch fails', async () => {
+    let resolveFallbackReply!: (messageId: string) => void;
+    sessionReplyMock
+      .mockRejectedValueOnce(new Error('streaming POST failed'))
+      .mockImplementationOnce(() => new Promise<string>((resolve) => {
+        resolveFallbackReply = resolve;
+      }));
+    updateMessageMock.mockRejectedValueOnce(new Error('fallback PATCH failed'));
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker, workingDir: '/tmp' });
+    ds.session.cliId = 'traex';
+    ds.session.cliSessionId = undefined;
+    ds.session.workingDir = '/tmp';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+    expect(sessionReplyMock).toHaveBeenCalledTimes(2);
+
+    fakeWorker.emit('message', { type: 'cli_session_id', cliSessionId: 'trae-native-ready' });
+    await flush();
+    resolveFallbackReply('om_fallback_card');
+    await flush();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      'app_test',
+      'om_fallback_card',
+      expect.any(String),
+    );
+    expect(closeSessionMock).not.toHaveBeenCalled();
   });
 
   it('prompt_ready sends a pending raw slash command once', async () => {

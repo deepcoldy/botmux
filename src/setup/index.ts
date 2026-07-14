@@ -156,12 +156,34 @@ export async function ensureDependencies(): Promise<DependenciesReport> {
 }
 
 function reportHerdrIntegrations(r: HerdrIntegrationResult): void {
-  if (r.attempted.length === 0 && r.unsupportedCliIds.length === 0) return;
+  // NB: gate on `!r.traexPlugin`, not `!r.traexPlugin?.attempted` — a skipped
+  // traex plugin (disabled / missing_source) has attempted=false but STILL needs
+  // its hint printed, otherwise a herdr+traex host with the toggle on but no
+  // source would silently no-op with no diagnostic when traex is the only herdr CLI.
+  if (r.attempted.length === 0 && r.unsupportedCliIds.length === 0 && !r.traexPlugin) return;
   if (r.installed.length > 0) console.log(`✓ herdr integrations 已安装: ${r.installed.join(' / ')}`);
   if (r.alreadyInstalled.length > 0) console.log(`✓ herdr integrations (existing): ${r.alreadyInstalled.join(' / ')}`);
+  if (r.traexPlugin) {
+    const tp = r.traexPlugin;
+    if (tp.skippedReason === 'disabled') {
+      console.warn('ℹ️  检测到 herdr + traex；TraeX herdr plugin 自动安装默认关闭，可在 Dashboard Settings 中开启并填写可信 plugin source。');
+    } else if (tp.skippedReason === 'missing_source') {
+      console.warn('⚠️  herdr TraeX plugin 已开启但未配置 plugin source；请在 Dashboard Settings 填写你信任的 source（owner/repo，建议钉 ref）。');
+    } else if (tp.skippedReason === 'plugin_unsupported') {
+      console.warn(`⚠️  当前 herdr${tp.herdrVersion ? ` ${tp.herdrVersion}` : ''} 不支持插件（需 ≥0.7.0）；请运行 \`herdr update\` 升级后重试。`);
+    } else if (tp.failed) {
+      console.warn(`⚠️  herdr TraeX plugin ${tp.failed.step === 'install' ? '安装' : '配置'}失败：${tp.failed.reason}`);
+      console.warn(`    手动尝试：${tp.failed.manualCommand}`);
+      console.warn('    说明：herdr + traex 不装该插件也能启动，但状态只能退回屏幕启发式检测。');
+    } else if (tp.installed || tp.actionInvoked) {
+      console.log(`✓ herdr TraeX plugin 已安装并写入 ~/.trae hooks: ${tp.source}`);
+    } else if (tp.alreadyInstalled) {
+      console.log(`✓ herdr TraeX plugin (existing)，已是最新: ${tp.source}`);
+    }
+  }
   for (const f of r.failed) {
     console.warn(`⚠️  herdr integration 安装失败: ${f.name} — ${f.reason}`);
-    console.warn(`    手动尝试：herdr integration install ${f.name}`);
+    console.warn(`    手动尝试：${f.manualCommand ?? `herdr integration install ${f.name}`}`);
   }
   if (r.unsupportedCliIds.length > 0) {
     console.warn(

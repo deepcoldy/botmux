@@ -6,7 +6,7 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, getOwnerOpenId } from '../bot-registry.js';
 import { repoPickerScanOptions } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -19,7 +19,7 @@ import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
-import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
@@ -32,11 +32,12 @@ import { discoverAdoptableSessions, validateAdoptTarget, adoptTargetKey, adoptTa
 import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
-import { resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
-import { UserTokenMissingError } from '../im/lark/client.js';
+import { listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
+import { parseDocWatchCommand } from './doc-watch-command.js';
+import { latestDocCommentPollCursor } from './doc-comment-poller.js';
 import {
-  putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession,
-  type CommentTriggerMode,
+  putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription,
+  type CommentTriggerMode, type DocSubscription,
 } from '../services/doc-subs-store.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import {
@@ -88,7 +89,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment']);
 
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
@@ -334,6 +335,8 @@ export interface CommandHandlerDeps {
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
+  /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
+  prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
 }
 
 // ─── Schedule command ────────────────────────────────────────────────────────
@@ -1402,6 +1405,7 @@ export async function handleCommand(
               () => sessionReply(rootId, closedCard, 'interactive'),
             );
 
+            const oldSession = ds!.session;
             const session = sessionStore.createSession(ds!.chatId, rootId, displayName, ds!.chatType);
             ds!.session = session;
             ds!.lastUserPrompt = undefined;
@@ -1409,6 +1413,10 @@ export async function handleCommand(
             ds!.workingDir = selectedPath;
             ds!.session.workingDir = selectedPath;
             ds!.session.larkAppId = ds!.larkAppId;
+            ds!.session.chatDisplayName = oldSession.chatDisplayName;
+            ds!.session.ownerOpenId = oldSession.ownerOpenId;
+            ds!.session.creatorOpenId = oldSession.creatorOpenId;
+            ds!.session.lastCallerOpenId = oldSession.lastCallerOpenId;
             sessionStore.updateSession(ds!.session);
             ds!.hasHistory = false;
             forkWorker(ds!, '', false);
@@ -1742,6 +1750,9 @@ export async function handleCommand(
       }
 
       case '/subscribe-lark-doc': {
+        // 保留 origin/master 的既有语义：显式获取文档 scope 的 User Token，调用
+        // 飞书逐文件 subscribe API，再把文档绑定到当前会话。新增的评论监听、自动
+        // 会话和审批能力走独立的 /watch-comment，不改变这个远端已有命令。
         if (!ds || !larkAppId) { await sessionReply(rootId, t('cmd.subdoc.no_session', undefined, loc)); break; }
         const arg = message.content.replace(/^\/subscribe-lark-doc\s*/i, '').trim();
         const anchor = sessionAnchorId(ds);
@@ -1750,7 +1761,8 @@ export async function handleCommand(
           t(m === 'all' ? 'cmd.subdoc.mode_all' : 'cmd.subdoc.mode_mention', undefined, loc);
 
         if (arg === 'list' || arg === '列表') {
-          const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor);
+          const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor)
+            .filter(s => s.managedBy !== 'watch-comment');
           if (!subs.length) { await sessionReply(rootId, t('cmd.subdoc.none', undefined, loc)); break; }
           const lines = subs.map(s => `• ${s.docTitle || s.fileToken}（${modeLabel(s.commentTriggerMode)}）`);
           await sessionReply(rootId, [t('cmd.subdoc.list_title', undefined, loc), ...lines].join('\n'));
@@ -1758,7 +1770,8 @@ export async function handleCommand(
         }
 
         if (arg === 'off' || arg === 'stop' || arg === '退订') {
-          const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor);
+          const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor)
+            .filter(s => s.managedBy !== 'watch-comment');
           for (const s of subs) {
             await unsubscribeDocFile(larkAppId, { fileToken: s.fileToken, fileType: s.fileType });
             removeDocSubscription(dataDir, larkAppId, s.fileToken);
@@ -1769,9 +1782,7 @@ export async function handleCommand(
 
         if (!arg) { await sessionReply(rootId, t('cmd.subdoc.usage', undefined, loc)); break; }
 
-        // 评论事件官方推荐用户身份订阅，tenant 订阅大概率收不到推送 → 需要带文档 scope
-        // 的 User Token。文档 scope 不在通用 /login 里（避免污染所有 bot 的登录），
-        // 这里按需生成带 DOC_COMMENT_OAUTH_SCOPES 的专用授权链接。
+        // 旧流程：文档 scope 不污染通用 /login；缺少时由本命令发专用 OAuth 链接。
         const subCfg = getBot(larkAppId).config;
         const replyDocLogin = async () => {
           const { authUrl } = generateAuthUrl(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand), DOC_COMMENT_OAUTH_SCOPES);
@@ -1800,6 +1811,7 @@ export async function handleCommand(
             scope: ds.scope,
             chatId: ds.chatId,
             commentTriggerMode: mode,
+            managedBy: 'subscribe-lark-doc',
             ownerOpenId: message.senderId,
             createdAt: Date.now(),
           });
@@ -1812,12 +1824,159 @@ export async function handleCommand(
           ));
           logger.info(`[${logTag}] /subscribe-lark-doc → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${rebound ? ' (rebound)' : ''}`);
         } catch (err) {
-          // token 缺失 / 失效 / 缺文档 scope（403）→ 给带文档 scope 的重新授权链接。
           if (err instanceof UserTokenMissingError) {
             await replyDocLogin();
           } else {
             await sessionReply(rootId, t('cmd.subdoc.failed', { err: err instanceof Error ? err.message : String(err) }, loc));
           }
+        }
+        break;
+      }
+
+      case '/watch-comment': {
+        if (!larkAppId) { await sessionReply(rootId, t('cmd.watch.no_session', undefined, loc)); break; }
+        const request = parseDocWatchCommand(message.content);
+        const dataDir = config.session.dataDir;
+        const modeLabel = (m: CommentTriggerMode) =>
+          t(m === 'all' ? 'cmd.subdoc.mode_all' : 'cmd.subdoc.mode_mention', undefined, loc);
+
+        if (request.kind === 'usage' || request.kind === 'invalid') {
+          const prefix = request.kind === 'invalid' && request.reason === 'conflicting_modes'
+            ? `${t('cmd.watch.conflicting_modes', undefined, loc)}\n\n`
+            : '';
+          await sessionReply(rootId, prefix + t('cmd.watch.usage', undefined, loc));
+          break;
+        }
+
+        // 设计：只有 bot owner 能管理文档评论监听（watch / list / off）。非 owner 无法
+        // 主动发起监听，只能在文档里 @bot 触发回复——那条路径会私信通知 owner 审计
+        // （notify-not-approve，见 event-dispatcher.processCommentEvent），不经这里。
+        const ownerOpenId = getOwnerOpenId(larkAppId);
+        if (!ownerOpenId || message.senderId !== ownerOpenId) {
+          await sessionReply(rootId, t('cmd.watch.owner_only', undefined, loc));
+          break;
+        }
+
+        if (request.kind === 'list') {
+          // 命令已收归 owner-only，无 session 时直接列全部（不再按 ownerOpenId 过滤），
+          // 否则非 owner @bot 触发的 auto-sub 对 owner 不可见。
+          const subs = (ds
+            ? listDocSubscriptionsForSession(dataDir, larkAppId, sessionAnchorId(ds))
+            : listAllDocSubscriptions(dataDir, larkAppId))
+            .filter(s => s.managedBy === 'watch-comment');
+          if (!subs.length) { await sessionReply(rootId, t(ds ? 'cmd.watch.none' : 'cmd.watch.none_owned', undefined, loc)); break; }
+          const lines = subs.map(s => {
+            const wd = s.workingDir ? ` 📂${s.workingDir}` : '';
+            return `• ${s.docTitle || s.fileToken}（${modeLabel(s.commentTriggerMode)}）${wd}`;
+          });
+          await sessionReply(rootId, [t(ds ? 'cmd.watch.list_title' : 'cmd.watch.list_title_owned', undefined, loc), ...lines].join('\n'));
+          break;
+        }
+
+        if (request.kind === 'off') {
+          if (request.docRef) {
+            try {
+              const file = await resolveDocFile(larkAppId, request.docRef);
+              const existing = getDocSubscription(dataDir, larkAppId, file.fileToken);
+              if (!existing || existing.managedBy !== 'watch-comment') { await sessionReply(rootId, t('cmd.watch.not_found', undefined, loc)); break; }
+              removeDocSubscription(dataDir, larkAppId, file.fileToken);
+              await sessionReply(rootId, t('cmd.watch.stopped_one', { title: file.fileToken.slice(0, 12) }, loc));
+            } catch (err) {
+              await sessionReply(rootId, t('cmd.watch.failed', { err: err instanceof Error ? err.message : String(err) }, loc));
+            }
+            break;
+          }
+          // 命令已收归 owner-only，无 session 时直接列全部（不再按 ownerOpenId 过滤）。
+          const subs = (ds
+            ? listDocSubscriptionsForSession(dataDir, larkAppId, sessionAnchorId(ds))
+            : listAllDocSubscriptions(dataDir, larkAppId))
+            .filter(s => s.managedBy === 'watch-comment');
+          for (const s of subs) {
+            removeDocSubscription(dataDir, larkAppId, s.fileToken);
+          }
+          await sessionReply(rootId, t(ds ? 'cmd.watch.stopped_all' : 'cmd.watch.stopped_owned', { count: subs.length }, loc));
+          break;
+        }
+
+        if (request.kind !== 'watch') {
+          await sessionReply(rootId, t('cmd.watch.usage', undefined, loc));
+          break;
+        }
+        let validatedDir: string | undefined;
+        if (request.workingDir) {
+          const v = validateWorkingDir(request.workingDir, loc);
+          if (!v.ok) { await sessionReply(rootId, v.error); break; }
+          validatedDir = v.resolvedPath;
+        }
+
+        const botCfg = getBot(larkAppId).config;
+        try {
+          const file = await resolveDocFile(larkAppId, request.docRef);
+          const existing = getDocSubscription(dataDir, larkAppId, file.fileToken);
+          const mode: CommentTriggerMode = request.requestedMode
+            ?? (botCfg.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
+          const anchor = ds ? sessionAnchorId(ds) : `doc:${file.fileToken}`;
+          const effectiveDir = validatedDir ?? existing?.workingDir ?? botCfg.docRepoMap?.[file.fileToken];
+          let pollCursorAt: number | undefined;
+          let pollCursorReplyId: string | undefined;
+          let pollBaselineReady: boolean | undefined;
+          if (mode === 'all') {
+            const canReuseBaseline = existing?.managedBy === 'watch-comment'
+              && existing.commentTriggerMode === 'all'
+              && existing.pollBaselineReady === true;
+            if (canReuseBaseline) {
+              pollCursorAt = existing.pollCursorAt;
+              pollCursorReplyId = existing.pollCursorReplyId;
+              pollBaselineReady = true;
+            } else {
+              try {
+                const latest = latestDocCommentPollCursor(await listDocComments(larkAppId, file));
+                pollCursorAt = latest?.createdAt ?? Math.floor(Date.now() / 1000);
+                pollCursorReplyId = latest?.replyId ?? '';
+                pollBaselineReady = true;
+              } catch (err) {
+                // 不让一次读取失败阻塞登记。poller 首次成功时只建立基线，不重放历史。
+                pollBaselineReady = false;
+                logger.warn(`[${logTag}] /watch-comment baseline failed for ${file.fileToken.slice(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            }
+          }
+          const subscription: DocSubscription = {
+            fileToken: file.fileToken,
+            fileType: file.fileType,
+            sessionAnchor: anchor,
+            sessionId: ds?.session.sessionId,
+            scope: ds?.scope ?? 'chat',
+            chatId: ds?.chatId ?? `doc:${file.fileToken}`,
+            commentTriggerMode: mode,
+            managedBy: 'watch-comment',
+            ownerOpenId: message.senderId,
+            workingDir: effectiveDir,
+            pollCursorAt,
+            pollCursorReplyId,
+            pollBaselineReady,
+            createdAt: existing?.createdAt ?? Date.now(),
+          };
+          const { previous } = putDocSubscription(dataDir, larkAppId, subscription);
+          const rebound = previous && previous.sessionAnchor !== anchor;
+          let replyText = t(!ds ? 'cmd.watch.started_lazy' : rebound ? 'cmd.watch.started_moved' : 'cmd.watch.started', {
+            title: file.fileToken.slice(0, 12),
+            mode: modeLabel(mode),
+          }, loc);
+          if (effectiveDir) replyText += `\n📂 ${t('cmd.watch.working_dir', { dir: effectiveDir }, loc)}`;
+          if (ds && deps.prewarmDocCommentSession) {
+            try {
+              await deps.prewarmDocCommentSession(ds, subscription);
+              replyText += `\n\n${t('cmd.watch.prewarming', undefined, loc)}`;
+            } catch (err) {
+              logger.warn(`[${logTag}] /watch-comment prewarm failed for ${file.fileToken.slice(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+              replyText += `\n\n${t('cmd.watch.prewarm_failed', undefined, loc)}`;
+            }
+          }
+          await sessionReply(rootId, replyText);
+          logger.info(`[${logTag}] /watch-comment → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${effectiveDir ? ` wd=${effectiveDir}` : ''}${rebound ? ' (rebound)' : ''}${ds ? '' : ' (doc-native lazy session)'}`);
+        } catch (err) {
+          await sessionReply(rootId, t('cmd.watch.failed', { err: err instanceof Error ? err.message : String(err) }, loc));
         }
         break;
       }
@@ -2713,6 +2872,7 @@ export async function handleCommand(
           t('help.insight', undefined, loc),
           t('help.land', undefined, loc),
           t('help.subscribe_doc', undefined, loc),
+          t('help.watch_comment', undefined, loc),
           t('help.summary', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),

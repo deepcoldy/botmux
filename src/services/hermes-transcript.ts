@@ -9,6 +9,7 @@
  * not call `botmux send`.
  */
 import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -24,6 +25,25 @@ interface HermesMessageRow {
   content: unknown;
   timestamp?: number;
   finish_reason?: string | null;
+}
+
+export function resolveHermesStateDbPath(
+  env: Record<string, string | undefined> = process.env,
+  opts: { botmuxSessionProfile?: boolean } = {},
+): string {
+  const explicitStateDb = env.BOTMUX_HERMES_STATE_DB?.trim();
+  if (explicitStateDb) return explicitStateDb;
+  if (opts.botmuxSessionProfile) {
+    const sessionId = env.BOTMUX_SESSION_ID?.trim();
+    if (sessionId) {
+      const sourceHome = env.HERMES_BOTMUX_SOURCE_HOME?.trim() || env.HERMES_HOME?.trim() || join(homedir(), '.hermes');
+      const profilesRoot = env.HERMES_BOTMUX_PROFILES_ROOT?.trim() || join(sourceHome, 'profiles');
+      const sessionHash = createHash('sha256').update(sessionId).digest('hex').slice(0, 16);
+      return join(profilesRoot, `botmux-${sessionHash}`, 'state.db');
+    }
+  }
+  const hermesHome = env.HERMES_HOME?.trim();
+  return hermesHome ? join(hermesHome, 'state.db') : HERMES_STATE_DB;
 }
 
 function decodeContent(content: unknown): string {
@@ -90,12 +110,13 @@ export function drainHermesStateDb(fromOffset: number, dbPath = HERMES_STATE_DB)
     if (typeof row.id === 'number' && row.id > newOffset) newOffset = row.id;
     const text = decodeContent(row.content).trim();
     if (!text) continue;
+    const sourceSessionId = row.session_id?.trim() || undefined;
     const timestampMs = typeof row.timestamp === 'number' ? row.timestamp * 1000 : Date.now();
     if (row.role === 'user') {
-      events.push({ uuid: `hermes:${row.id}`, timestampMs, kind: 'user', text, sourceSessionId: row.session_id, preserveMarkTimeMs: true });
+      events.push({ uuid: `hermes:${row.id}`, timestampMs, kind: 'user', text, sourceSessionId, preserveMarkTimeMs: true });
     } else if (row.role === 'assistant') {
       if (row.finish_reason !== 'stop') continue;
-      events.push({ uuid: `hermes:${row.id}`, timestampMs, kind: 'assistant_final', text, sourceSessionId: row.session_id });
+      events.push({ uuid: `hermes:${row.id}`, timestampMs, kind: 'assistant_final', text, sourceSessionId });
     }
   }
   return { events, newOffset };

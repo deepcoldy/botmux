@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { skillRegistryPath } from '../src/core/skills/registry-paths.js';
-import { installLocalSkill, installLocalSkillLinks, readSkillRegistry, removeInstalledSkill } from '../src/services/skill-registry-store.js';
+import { installLocalSkill, installLocalSkillLinks, readSkillRegistry, removeInstalledSkill, removeInstalledSkills } from '../src/services/skill-registry-store.js';
 
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
@@ -95,6 +95,32 @@ describe('skill registry store', () => {
     expect(result).toEqual({ ok: true });
     expect(readSkillRegistry().skills.cleanup).toBeUndefined();
     expect(() => readFileSync(join(pkg.rootDir, 'SKILL.md'), 'utf-8')).toThrow();
+  });
+
+  it('removes a batch with one registry mutation and preserves linked source directories', () => {
+    write(join(src, 'copy', 'SKILL.md'), '---\nname: copy\n---\n# Copy');
+    write(join(src, 'linked', 'SKILL.md'), '---\nname: linked\n---\n# Linked');
+    const copied = installLocalSkill(join(src, 'copy'), { link: false });
+    const linked = installLocalSkill(join(src, 'linked'), { link: true });
+
+    const result = removeInstalledSkills(['copy', 'linked', 'copy']);
+
+    expect(result).toEqual({ ok: true, removed: ['copy', 'linked'] });
+    expect(readSkillRegistry().skills).toEqual({});
+    expect(() => readFileSync(join(copied.rootDir, 'SKILL.md'), 'utf-8')).toThrow();
+    expect(readFileSync(join(linked.rootDir, 'SKILL.md'), 'utf-8')).toContain('name: linked');
+  });
+
+  it('keeps the whole batch when any requested skill is missing', () => {
+    write(join(src, 'keep', 'SKILL.md'), '---\nname: keep\n---\n# Keep');
+    installLocalSkill(join(src, 'keep'), { link: true });
+
+    expect(removeInstalledSkills(['keep', 'missing'])).toEqual({
+      ok: false,
+      reason: 'skill_not_installed',
+      missing: ['missing'],
+    });
+    expect(readSkillRegistry().skills.keep).toBeDefined();
   });
 
   it('rejects reinstalling a local copy from its own store target without deleting it', () => {

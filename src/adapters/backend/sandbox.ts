@@ -675,9 +675,10 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
 // watcher NEVER executes sandbox-supplied argv — it rebuilds the command from
 // these validated fields. This is the security boundary: a malicious agent can
 // write any outbox file, so everything here is treated as untrusted.
-//   { contentFile: <basename in outbox>, attachments: [<basename>...], videos: [<basename>...], videoCovers: [<basename>...], flags: [...] }
+//   { contentFile: <basename in outbox>, cardFile?: <basename in outbox>, attachments: [<basename>...], videos: [<basename>...], videoCovers: [<basename>...], flags: [...] }
 export interface RelayRequest {
   contentFile?: unknown;
+  cardFile?: unknown;
   attachments?: unknown;
   videos?: unknown;
   videoCovers?: unknown;
@@ -693,6 +694,7 @@ const RELAY_FLAGS_VAL = new Set(['--mention', '--quote']);
 
 export interface ValidatedRelay {
   contentName: string;
+  cardName?: string;
   attachmentNames: string[];
   videoNames: string[];
   videoCoverNames: string[];
@@ -702,7 +704,7 @@ export interface ValidatedRelay {
 /**
  * PURE validation of an outbox relay request (schema + flag allowlist only — no
  * filesystem access, so it's deterministically testable):
- *  - contentFile/attachments/videos/videoCovers must be plain basenames (no `/`, `\`, `..`).
+ *  - contentFile/cardFile/attachments/videos/videoCovers must be plain basenames (no `/`, `\`, `..`).
  *  - only allowlisted presentation flags pass; any other flag → reject (this
  *    rejects raw `--content-file`/`--session-id`/path flags etc.).
  * The TOCTOU-safe filesystem read is handled separately by materializeOutboxFile,
@@ -713,6 +715,12 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
     typeof n === 'string' && !!n && !n.includes('/') && !n.includes('\\') && !n.includes('..');
 
   if (!safeName(req.contentFile)) return { ok: false, error: 'contentFile must be a plain outbox basename' };
+  const cardName = req.cardFile === undefined
+    ? undefined
+    : safeName(req.cardFile)
+      ? req.cardFile
+      : null;
+  if (cardName === null) return { ok: false, error: 'cardFile must be a plain outbox basename' };
   const attachmentNames: string[] = [];
   for (const a of Array.isArray(req.attachments) ? req.attachments : []) {
     if (!safeName(a)) return { ok: false, error: 'attachment must be a plain outbox basename' };
@@ -745,7 +753,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
     }
     return { ok: false, error: `flag not allowed: ${f}` };
   }
-  return { ok: true, value: { contentName: req.contentFile, attachmentNames, videoNames, videoCoverNames, flags } };
+  return { ok: true, value: { contentName: req.contentFile, cardName, attachmentNames, videoNames, videoCoverNames, flags } };
 }
 
 /**
@@ -828,6 +836,15 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
         continue;
       }
       staged.push(contentDest);
+      let cardPath: string | undefined;
+      if (v.value.cardName) {
+        cardPath = join(staging, `${id}.card.json`);
+        if (!materializeOutboxFile(outbox, v.value.cardName, cardPath)) {
+          finish(id, reqPath, name, staged, 1, '', 'relay rejected: card not a regular file in outbox');
+          continue;
+        }
+        staged.push(cardPath);
+      }
       let attBad = false;
       const attPaths: string[] = [];
       v.value.attachmentNames.forEach((an, i) => {
@@ -858,7 +875,7 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
 
       const hostArgs = [
         ...v.value.flags,
-        '--content-file', contentDest,
+        ...(cardPath ? ['--card-file', cardPath] : ['--content-file', contentDest]),
         ...attPaths.flatMap(a => ['--files', a]),
         ...videoPaths.flatMap(a => ['--videos', a]),
         ...videoCoverPaths.flatMap(a => ['--video-covers', a]),

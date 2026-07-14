@@ -1,12 +1,18 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import {
   allExpectedInChat,
-  renderBotCheckboxes,
-  renderAddBotsResultSummary,
-  renderRoleProfileBootstrapSummary,
+  availableBotsForPicker,
+  loadGroupRoleProfileContext,
+  paginateGroupRows,
+  roleProfileBootstrapStatus,
+  summarizeAddBotsResult,
   suggestRoleProfileIdFromChat,
 } from '../src/dashboard/web/groups.js';
 import { hasExplicitChatRole, summarizeGroupProfileMatches } from '../src/dashboard/web/role-profile-match.js';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('allExpectedInChat — refreshUntilSeen commit predicate', () => {
   it('empty expected set → true (degenerate case, nothing to wait for)', () => {
@@ -48,9 +54,9 @@ describe('allExpectedInChat — refreshUntilSeen commit predicate', () => {
   });
 });
 
-describe('renderBotCheckboxes — shared bot picker ordering', () => {
-  it('renders in the provided dashboard bot order and filters excluded ids', () => {
-    const html = renderBotCheckboxes(
+describe('availableBotsForPicker — shared bot picker ordering', () => {
+  it('keeps the provided dashboard bot order and filters excluded ids', () => {
+    const bots = availableBotsForPicker(
       [
         { larkAppId: 'cli_b', botName: 'Beta' },
         { larkAppId: 'cli_a', botName: 'Alpha' },
@@ -59,61 +65,82 @@ describe('renderBotCheckboxes — shared bot picker ordering', () => {
       new Set(['cli_a']),
     );
 
-    expect(html).not.toContain('cli_a');
-    expect(html.indexOf('cli_b')).toBeGreaterThanOrEqual(0);
-    expect(html.indexOf('cli_c')).toBeGreaterThan(html.indexOf('cli_b'));
+    expect(bots.map(bot => bot.larkAppId)).toEqual(['cli_b', 'cli_c']);
   });
 });
 
-describe('renderRoleProfileBootstrapSummary — create-group profile feedback', () => {
-  it('renders a sent bootstrap message summary', () => {
-    const html = renderRoleProfileBootstrapSummary('collab-main', 'om_bootstrap', null);
+describe('paginateGroupRows — bounded dashboard DOM', () => {
+  const rows = Array.from({ length: 65 }, (_, index) => `group-${index + 1}`);
 
-    expect(html).toContain('Profile：collab-main');
-    expect(html).toContain('bootstrap 消息已发送：om_bootstrap');
-    expect(html).toContain('hint-ok');
+  it('renders at most the default 30 heavy group rows per page', () => {
+    const window = paginateGroupRows(rows, 1);
+    expect(window.rows).toHaveLength(30);
+    expect(window.rows[0]).toBe('group-1');
+    expect(window.rows[29]).toBe('group-30');
+    expect(window).toMatchObject({ page: 1, totalPages: 3, from: 1, to: 30, total: 65 });
   });
 
-  it('renders failure details and escapes interpolated values', () => {
-    const html = renderRoleProfileBootstrapSummary(
+  it('clamps stale pages after filtering and reports the final partial range', () => {
+    const window = paginateGroupRows(rows, 99);
+    expect(window.rows).toEqual(['group-61', 'group-62', 'group-63', 'group-64', 'group-65']);
+    expect(window).toMatchObject({ page: 3, totalPages: 3, from: 61, to: 65, total: 65 });
+  });
+
+  it('returns a stable empty window', () => {
+    expect(paginateGroupRows([], 4)).toEqual({
+      rows: [], page: 1, totalPages: 1, from: 0, to: 0, total: 0,
+    });
+  });
+});
+
+describe('roleProfileBootstrapStatus — create-group profile feedback', () => {
+  it('summarizes a sent bootstrap message', () => {
+    const status = roleProfileBootstrapStatus('collab-main', 'om_bootstrap', null);
+
+    expect(status).toEqual({
+      kind: 'ok',
+      text: 'Profile：collab-main；bootstrap 消息已发送：om_bootstrap',
+    });
+  });
+
+  it('summarizes failure details without dropping interpolated values', () => {
+    const status = roleProfileBootstrapStatus(
       '<profile>',
       null,
       '<script>alert(1)</script>',
     );
 
-    expect(html).not.toContain('<profile>');
-    expect(html).not.toContain('<script>');
-    expect(html).toContain('&lt;profile&gt;');
-    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
-    expect(html).toContain('hint-warn');
+    expect(status?.kind).toBe('warn');
+    expect(status?.text).toContain('<profile>');
+    expect(status?.text).toContain('<script>alert(1)</script>');
   });
 });
 
-describe('renderAddBotsResultSummary — add-bots inline feedback', () => {
+describe('summarizeAddBotsResult — add-bots inline feedback', () => {
   it('summarizes a clean add-bots result as success', () => {
-    const html = renderAddBotsResultSummary([
+    const summary = summarizeAddBotsResult([
       { id: 'cli_a', ok: true },
       { id: 'cli_b', ok: true },
     ]);
 
-    expect(html).toContain('hint-ok');
-    expect(html).toContain('成功 2/2');
-    expect(html).toContain('<code>cli_a</code>: OK');
-    expect(html).toContain('<code>cli_b</code>: OK');
+    expect(summary.okCount).toBe(2);
+    expect(summary.failed).toBe(0);
+    expect(summary.rows.map(row => row.id)).toEqual(['cli_a', 'cli_b']);
   });
 
-  it('summarizes partial failures and escapes ids/errors', () => {
-    const html = renderAddBotsResultSummary([
+  it('summarizes partial failures and keeps row details', () => {
+    const summary = summarizeAddBotsResult([
       { id: 'cli_ok', ok: true },
       { id: '<bad>', ok: false, error: '<script>alert(1)</script>' },
     ]);
 
-    expect(html).toContain('hint-warn');
-    expect(html).toContain('成功 1/2，失败 1');
-    expect(html).toContain('&lt;bad&gt;');
-    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
-    expect(html).not.toContain('<bad>');
-    expect(html).not.toContain('<script>');
+    expect(summary.okCount).toBe(1);
+    expect(summary.failed).toBe(1);
+    expect(summary.rows[1]).toMatchObject({
+      id: '<bad>',
+      ok: false,
+      error: '<script>alert(1)</script>',
+    });
   });
 });
 
@@ -210,5 +237,67 @@ describe('suggestRoleProfileIdFromChat — prompt default', () => {
 
   it('falls back to a safe id when the group name has no valid ascii token', () => {
     expect(suggestRoleProfileIdFromChat('项目群')).toBe('profile');
+  });
+});
+
+describe('loadGroupRoleProfileContext — bounded role requests', () => {
+  it('loads explicit chat roles in one batch and skips unconfigured memberships', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/role-profiles') {
+        return { ok: true, status: 200, json: async () => ({ profiles: [{ profileId: 'main' }] }) } as Response;
+      }
+      if (url === '/api/role-profiles/main') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ entries: [{ profileId: 'main', larkAppId: 'botA', content: 'role A' }] }),
+        } as Response;
+      }
+      if (url === '/api/roles/batch') {
+        expect(init?.method).toBe('POST');
+        expect(JSON.parse(String(init?.body))).toEqual({
+          targets: [{ larkAppId: 'botA', chatId: 'oc_team' }],
+        });
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            roles: [{
+              larkAppId: 'botA',
+              chatId: 'oc_team',
+              content: 'role A',
+              hasRole: true,
+              effectiveContent: 'role A',
+              effectiveSource: 'chat',
+              hasEffectiveRole: true,
+            }],
+          }),
+        } as Response;
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const context = await loadGroupRoleProfileContext({
+      bots: [],
+      chats: [{
+        chatId: 'oc_team',
+        memberBots: [
+          { larkAppId: 'botA', inChat: true, hasRole: true },
+          { larkAppId: 'botB', inChat: true, hasRole: false },
+          { larkAppId: 'botC', inChat: false, hasRole: true },
+        ],
+      }],
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.map(call => String(call[0])).filter(url => url.startsWith('/api/roles/')))
+      .toEqual(['/api/roles/batch']);
+    expect(context.groupRoleContentByBot.get('botA\u0000oc_team')).toEqual({
+      content: 'role A',
+      source: 'chat',
+    });
+    expect(context.groupRoleContentByBot.has('botB\u0000oc_team')).toBe(false);
   });
 });

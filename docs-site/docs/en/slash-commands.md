@@ -102,7 +102,7 @@ See [One-Click Session Group](/en/group) for details.
 
 ## 📄 Feishu Doc Comment Entry
 
-`/subscribe-lark-doc <doc link>`: subscribe a Feishu doc — its comments feed into this session and the bot replies back into the comment thread · `/subscribe-lark-doc list` to view subscriptions · `/subscribe-lark-doc off` to unsubscribe. See [Feishu Doc Comment Entry](/en/doc-comment) for details.
+`/watch-comment`: watch Feishu doc comments, bind them to an AI session, and post replies back into their threads; supports `<doc link> [--dir <path>] [--all|--mentions-only]` and `list/off`. `/subscribe-lark-doc` keeps the original per-file Feishu API subscription flow. See [Feishu Doc Comment Entry](/en/doc-comment) for details.
 
 ## 🔧 Workflow (orchestration, experimental)
 

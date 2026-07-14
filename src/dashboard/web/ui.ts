@@ -1,4 +1,8 @@
 import {
+  fetchGroupsSnapshot,
+} from './groups-api.js';
+
+import {
   DASHBOARD_LOCALE_STORAGE_KEY,
   createDashboardTranslator,
   readStoredDashboardLocale,
@@ -15,7 +19,6 @@ import {
   type SkinId,
 } from './preferences.js';
 import { applyCyberFx } from './cyber-fx.js';
-import { playSkinIntro } from './skin-intro.js';
 
 type UiListener = () => void;
 
@@ -24,12 +27,17 @@ class DashboardUiState {
   themeMode: ThemeMode = 'system';
   resolvedTheme: ResolvedTheme = 'light';
   skin: SkinId = 'default';
-  // Dashboard cookie-auth state, mirrored from /api/settings by app.ts's
+  // Dashboard cookie-auth state, mirrored from /api/settings by app.tsx's
   // loadAuthState(). Gates write-only affordances rendered per-row (e.g. the
   // writable-terminal "🔑" segment in the sessions board) — read-only visitors
   // must not see a control whose endpoint they'd 401 on. Defaults true so a
   // transient probe failure never hides it from a real token holder.
   authed = true;
+  // Effective dashboard sharing policy. Session terminal affordances use this
+  // (rather than the current visitor's cookie alone) to choose their default:
+  // private dashboards open a writable terminal, explicitly public dashboards
+  // keep the shared entry read-only.
+  publicReadOnly = false;
   private listeners = new Set<UiListener>();
   private translate = createDashboardTranslator(this.locale);
   private mediaQuery: MediaQueryList | null = null;
@@ -111,10 +119,6 @@ class DashboardUiState {
   private applySkin(animate = false): void {
     document.documentElement.dataset.skin = this.skin;
     applyCyberFx(this.skin === 'cyber', animate);
-    // 2077 plays its own boot loader; the other skins get a themed switch-in intro.
-    if (animate && this.skin !== 'cyber' && this.skin !== 'default') {
-      playSkinIntro(this.skin);
-    }
   }
 
   private applyLocale(): void {
@@ -126,13 +130,7 @@ class DashboardUiState {
 const SKIN_THEME: Record<SkinId, ResolvedTheme> = {
   default: 'light',
   cyber: 'dark',
-  genshin: 'light',
   fallout: 'dark',
-  prts: 'dark',
-  bluearchive: 'dark',
-  zzz: 'dark',
-  dragonball: 'light',
-  ikun: 'dark',
 };
 
 function navigatorLanguages(): readonly string[] {
@@ -302,9 +300,7 @@ hydrateAvatarCache(); // 模块加载即回灌，先于任何页面渲染
 export function loadNameMaps(): Promise<void> {
   nameMapsPromise ??= (async () => {
     try {
-      const r = await fetch('/api/groups');
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const data = await r.json();
+      const data = await fetchGroupsSnapshot();
       for (const b of data.bots ?? []) {
         if (b.larkAppId && b.botName && b.botName !== b.larkAppId) {
           botNameByAppId.set(b.larkAppId, String(b.botName));
@@ -341,8 +337,10 @@ export function botDisplayName(s: Record<string, any>): string {
   return String(s.botName ?? s.larkAppId ?? '-');
 }
 
-/** 会话所在群聊的标题；单聊或群列表里查不到时返回 null（由调用方回退）。 */
+/** 会话所在聊天的标题；p2p 优先使用后端行上的直聊显示名，群聊走 /api/groups 名字表。 */
 export function chatDisplayTitle(s: Record<string, any>): string | null {
+  const rowName = String(s.chatDisplayName ?? '').trim();
+  if (rowName) return rowName;
   return (s.chatId && chatNameById.get(s.chatId)) || null;
 }
 
@@ -352,11 +350,6 @@ export function stripMentionPrefix(title: unknown): string {
   const raw = String(title ?? '');
   const out = raw.replace(/^(?:@\S+\s*)+/, '').trim();
   return out || raw;
-}
-
-/** 全站统一的页面级 loading 占位（慢接口在途时先渲染这个，避免白屏假死）。 */
-export function loadingHtml(label?: string): string {
-  return `<div class="page-loading" role="status"><i class="page-loading-spin" aria-hidden="true"></i>${escapeHtml(label ?? t('common.loading'))}</div>`;
 }
 
 /** 会话当前是否卡在等人，以及等什么（全局 strip 和工作台共用同一判定）。 */

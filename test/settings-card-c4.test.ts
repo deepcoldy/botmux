@@ -65,6 +65,11 @@ describe('buildPatchFromAction — toggle', () => {
     expect(r).toEqual({ ok: true, value: { openTerminalInFeishu: false } });
   });
 
+  it('enableLocalCliOpen true → { enableLocalCliOpen: true }', () => {
+    const r = buildPatchFromAction(SETTINGS_ACTION_TOGGLE, { field: 'enableLocalCliOpen', next_value: 'true' }, {});
+    expect(r).toEqual({ ok: true, value: { enableLocalCliOpen: true } });
+  });
+
   it('autoUpdate true → { maintenance: { autoUpdate: { enabled: true } } }', () => {
     const r = buildPatchFromAction(SETTINGS_ACTION_TOGGLE, { field: 'autoUpdate', next_value: 'true' }, {});
     expect(r).toEqual({ ok: true, value: { maintenance: { autoUpdate: { enabled: true } } } });

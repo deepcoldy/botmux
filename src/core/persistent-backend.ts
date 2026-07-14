@@ -56,6 +56,35 @@ export function getSessionPersistentBackendType(ds: DaemonSession): PersistentBa
   return isSuspendableBackendType(backendType) ? backendType : undefined;
 }
 
+/**
+ * Freeze-once backend resolution for a forkWorker spawn. An already-running
+ * session keeps the backend stamped at its FIRST spawn (`sessionStamp`); only a
+ * brand-new session (no stamp) resolves from the bot's live config, then the
+ * daemon default. worker-pool's forkWorker calls this so a live dashboard
+ * backendType edit only affects NEW sessions and never re-derives a running
+ * session onto a different backend (which would strand its persistent pane).
+ */
+export function resolveSpawnBackendType(
+  sessionStamp: BackendType | undefined,
+  botType: BackendType | undefined,
+  defaultType: BackendType,
+): BackendType {
+  return sessionStamp ?? botType ?? defaultType;
+}
+
+/**
+ * How a session's worker is torn down at daemon shutdown, branched on the
+ * session's FROZEN backend (via getSessionPersistentBackendType), NOT live config:
+ *   'detach' — persistent backend (tmux/herdr/zellij): SIGTERM the worker only,
+ *              leaving the multiplexer session alive for re-attach.
+ *   'close'  — non-persistent (frozen pty, or unresolvable legacy): killWorker.
+ * Freezing here stops a live backendType edit from changing how a running session
+ * tears down — e.g. detach-preserving a "herdr" session whose real pane is tmux.
+ */
+export function shutdownBackendDisposition(ds: DaemonSession): 'detach' | 'close' {
+  return getSessionPersistentBackendType(ds) ? 'detach' : 'close';
+}
+
 /** Deterministic backing-session name (`bmx-<sid8>`, same rule across backends). */
 export function persistentSessionName(backendType: PersistentBackendType, sessionId: string): string {
   if (backendType === 'tmux') return TmuxBackend.sessionName(sessionId);

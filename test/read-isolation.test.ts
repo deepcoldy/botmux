@@ -7,11 +7,24 @@ import {
   buildV2DenyPaths,
   buildV2DenyRegexes,
   buildV2CarveOuts,
+  buildCliExecutableReadCarveOuts,
+  buildWriteSandboxRules,
+  buildLinuxReadIsolationMasks,
   sendCredFilePath,
   assertSafeAppId,
   normalizeIsolationPath,
   type V2IsolationContext,
+  type WriteSandboxContext,
 } from '../src/adapters/cli/read-isolation.js';
+
+const ws = (o: Partial<WriteSandboxContext> = {}): WriteSandboxContext => ({
+  homeDir: '/Users/bot',
+  botmuxHome: '/Users/bot/.botmux',
+  sessionDataDir: '/Users/bot/.botmux/data',
+  workingDir: '/Users/bot/projects/app',
+  currentAppId: 'cli_self',
+  ...o,
+});
 
 const v2 = (o: Partial<V2IsolationContext> = {}): V2IsolationContext => ({
   homeDir: '/Users/bot',
@@ -30,6 +43,26 @@ describe('normalizeIsolationPath (path hardening)', () => {
 
   it('strips trailing slashes', () => {
     expect(normalizeIsolationPath('/a/b/')).toBe('/a/b');
+  });
+});
+
+describe('buildCliExecutableReadCarveOuts', () => {
+  it('re-opens only the standalone Codex package tree when the canonical binary lives there', () => {
+    expect(buildCliExecutableReadCarveOuts({
+      homeDir: '/Users/bot',
+      cliId: 'codex',
+      resolvedBin: '/Users/bot/.codex/packages/standalone/releases/0.144.1/bin/codex',
+    })).toEqual(['/Users/bot/.codex/packages/standalone']);
+  });
+
+  it('does not broaden reads for system/npm Codex installs or other CLIs', () => {
+    expect(buildCliExecutableReadCarveOuts({
+      homeDir: '/Users/bot', cliId: 'codex', resolvedBin: '/opt/homebrew/bin/codex',
+    })).toEqual([]);
+    expect(buildCliExecutableReadCarveOuts({
+      homeDir: '/Users/bot', cliId: 'claude-code',
+      resolvedBin: '/Users/bot/.codex/packages/standalone/releases/x/bin/claude',
+    })).toEqual([]);
   });
 });
 
@@ -300,10 +333,12 @@ describe('evaluateReadIsolationGate (fail-closed, single decision point)', () =>
     expect(r.failClosedReason).toMatch(/wrapperCli/i);
   });
 
-  it('fail-closed on Linux (bwrap wrapper unimplemented) and other platforms', () => {
+  it('ENABLED on Linux (bwrap masks) as well as macOS; unsupported elsewhere', () => {
     const linux = evaluateReadIsolationGate({ ...ok, platform: 'linux' });
-    expect(linux.enabled).toBe(false);
-    expect(linux.failClosedReason).toMatch(/linux/i);
+    expect(linux.enabled).toBe(true);           // Linux read-iso now enforced via bwrap masks
+    expect(linux.failClosedReason).toBeUndefined();
+    const darwin = evaluateReadIsolationGate({ ...ok, platform: 'darwin' });
+    expect(darwin.enabled).toBe(true);
     const win = evaluateReadIsolationGate({ ...ok, platform: 'win32' });
     expect(win.enabled).toBe(false);
     expect(win.failClosedReason).toMatch(/unsupported/i);
@@ -313,6 +348,124 @@ describe('evaluateReadIsolationGate (fail-closed, single decision point)', () =>
     const r = evaluateReadIsolationGate({ ...ok, sessionDataDirSet: false });
     expect(r.enabled).toBe(false);
     expect(r.failClosedReason).toMatch(/SESSION_DATA_DIR/);
+  });
+});
+
+describe('macOS write-sandbox (buildWriteSandboxRules)', () => {
+  it('allows the project + CLI scratch/cache, protects home & other bots', () => {
+    const r = buildWriteSandboxRules(ws());
+    // the project persists writes (the whole point)
+    expect(r.allowWritePaths).toContain('/Users/bot/projects/app');
+    // own BOT_HOME (where read-iso redirects CLI data when co-enabled)
+    expect(r.allowWritePaths).toContain('/Users/bot/.botmux/bots/cli_self');
+    // CLI data + ephemeral scratch the CLI/tools need
+    expect(r.allowWritePaths).toContain('/Users/bot/.claude');
+    expect(r.allowWritePaths).toContain('/Users/bot/.codex');
+    expect(r.allowWritePaths).toContain('/Users/bot/.claude.lock');
+    expect(r.allowWritePaths).toContain('/Users/bot/.claude.json.lock');
+    expect(r.allowWritePaths).toContain('/Users/bot/.local/state/claude');
+    expect(r.allowWriteRegexes).toContain('^/Users/bot/\\.claude\\.json\\.tmp\\.[^/]+$');
+    expect(r.allowWritePaths).toContain('/private/var/folders');
+    expect(r.allowWritePaths).toContain('/dev');
+    // NOT writable: home dotfiles at large are protected by the profile's deny-all
+    // baseline (they simply never appear in the allow-list)
+    expect(r.allowWritePaths).not.toContain('/Users/bot');
+    expect(r.allowWritePaths).not.toContain('/Users/bot/.ssh');
+  });
+
+  it('re-denies crown jewels so a broad project/home cannot reach them', () => {
+    const r = buildWriteSandboxRules(ws());
+    expect(r.denyWritePaths).toContain('/Users/bot/.ssh');
+    expect(r.denyWritePaths).toContain('/Users/bot/.aws');
+    expect(r.denyWritePaths).toContain('/Users/bot/.botmux/bots.json'); // can't tamper other bots' creds
+    expect(r.denyWritePaths).toContain('/Users/bot/.botmux/.dashboard-secret');
+  });
+
+  it('folds extraWritePaths (custom TMPDIR / worktrees) and drops unsafe ones', () => {
+    const r = buildWriteSandboxRules(ws({ extraWritePaths: ['/custom/tmp', 'relative/x', '/a/../b'] }));
+    expect(r.allowWritePaths).toContain('/custom/tmp');
+    expect(r.allowWritePaths).not.toContain('relative/x');   // normalizeIsolationPath drops it
+    expect(r.allowWritePaths.some(p => p.includes('..'))).toBe(false);
+  });
+
+  it('buildSeatbeltProfile emits deny-all-writes + allow-list + final crown-jewel denies, in order', () => {
+    const prof = buildSeatbeltProfile([], [], [], [], [], {
+      allowWritePaths: ['/Users/bot/projects/app'],
+      allowWriteRegexes: ['^/Users/bot/\\.claude\\.json\\.tmp\\.[^/]+$'],
+      denyWritePaths: ['/Users/bot/.ssh'],
+    });
+    expect(prof).toContain('(deny file-write* (subpath "/"))');
+    expect(prof).toContain('(allow file-write* (subpath "/Users/bot/projects/app"))');
+    expect(prof).toContain('(allow file-write* (regex #"^/Users/bot/\\.claude\\.json\\.tmp\\.[^/]+$"))');
+    expect(prof).toContain('(deny file-write* (subpath "/Users/bot/.ssh"))');
+    // ORDER matters (Seatbelt last-match wins): deny-all < allow project < final deny ssh
+    const iDenyAll = prof.indexOf('(deny file-write* (subpath "/"))');
+    const iAllow = prof.indexOf('(allow file-write* (subpath "/Users/bot/projects/app"))');
+    const iDenySsh = prof.indexOf('(deny file-write* (subpath "/Users/bot/.ssh"))');
+    expect(iDenyAll).toBeLessThan(iAllow);
+    expect(iAllow).toBeLessThan(iDenySsh);
+    // reads untouched — no file-read denies when only write-sandbox is passed
+    expect(prof).not.toContain('(deny file-read*');
+  });
+
+  it('omitting the write param leaves a read-only profile with NO write rules', () => {
+    const prof = buildSeatbeltProfile(['/Users/bot/.ssh']);
+    expect(prof).toContain('(deny file-read* (subpath "/Users/bot/.ssh"))');
+    expect(prof).not.toContain('file-write*');
+  });
+});
+
+describe('Linux read isolation (buildLinuxReadIsolationMasks)', () => {
+  it('masks the shared cross-bot sensitive set + per-sibling paths; own BOT_HOME stays real+writable', () => {
+    const r = buildLinuxReadIsolationMasks({ ctx: v2(), siblingAppIds: ['cli_other1', 'cli_other2'] });
+    // shared sensitive (non-per-bot)
+    for (const p of ['/Users/bot/.claude', '/Users/bot/.codex', '/Users/bot/.ssh',
+      '/Users/bot/.botmux/bots.json', '/Users/bot/.botmux/feishu-session.json',
+      '/Users/bot/.botmux/.dashboard-secret', '/Users/bot/.botmux/data/frozen-cards',
+      '/Users/bot/.botmux/data/queues']) expect(r.hidePaths).toContain(p);
+    // per-sibling (enumerated — no regex on bwrap)
+    for (const p of ['/Users/bot/.botmux/bots/cli_other1', '/Users/bot/.lark-cli-bots/cli_other2',
+      '/Users/bot/.botmux/data/sessions-cli_other1.json', '/Users/bot/.botmux/data/identities-cli_other2.json',
+      '/Users/bot/.botmux/data/.send-cred-cli_other1']) expect(r.hidePaths).toContain(p);
+    // attachments/ masked WHOLESALE (covers legacy flat layout too); own bucket re-exposed RO
+    expect(r.hidePaths).toContain('/Users/bot/.botmux/data/attachments');
+    expect(r.ownReadOnlyPaths).toEqual(['/Users/bot/.botmux/data/attachments/cli_self']);
+    // OWN slice is NOT masked (readable via the overlay lower)
+    expect(r.hidePaths).not.toContain('/Users/bot/.botmux/bots/cli_self');
+    expect(r.hidePaths).not.toContain('/Users/bot/.botmux/data/sessions-cli_self.json');
+    expect(r.hidePaths).not.toContain('/Users/bot/.lark-cli-bots/cli_self');
+    // own identities/send-cred ARE masked (daemon-side only, no own carve-out — parity w/ macOS)
+    expect(r.hidePaths).toContain('/Users/bot/.botmux/data/identities-cli_self.json');
+    expect(r.hidePaths).toContain('/Users/bot/.botmux/data/.send-cred-cli_self');
+    // own BOT_HOME kept real+writable (persists redirected CLI data)
+    expect(r.ownReadWritePaths).toEqual(['/Users/bot/.botmux/bots/cli_self']);
+    // NOT masked: schedules.json + whiteboards (same owner decision as macOS)
+    expect(r.hidePaths).not.toContain('/Users/bot/.botmux/data/schedules.json');
+    expect(r.hidePaths).not.toContain('/Users/bot/.botmux/data/whiteboards');
+  });
+
+  it('PARITY: every non-per-bot path macOS denies is also masked on Linux', () => {
+    // Guard against the two platforms drifting: any shared-sensitive path added to
+    // buildV2DenyPaths must also appear in the Linux mask set. The per-bot WHOLESALE
+    // dirs (bots/, .lark-cli-bots/) are the only ones handled differently (enumerated
+    // per-sibling), so exclude just those two from the comparison.
+    const macDeny = buildV2DenyPaths(v2());
+    const linux = buildLinuxReadIsolationMasks({ ctx: v2(), siblingAppIds: [] }).hidePaths;
+    const wholesalePerBot = new Set(['/Users/bot/.botmux/bots', '/Users/bot/.lark-cli-bots']);
+    const shouldMatch = macDeny.filter(p => !wholesalePerBot.has(p));
+    for (const p of shouldMatch) expect(linux).toContain(p);
+  });
+
+  it('folds bots.json sidecars + skips unsafe sibling ids', () => {
+    const r = buildLinuxReadIsolationMasks({
+      ctx: v2(),
+      siblingAppIds: ['cli_ok', '../evil', 'bad/id'],
+      botsJsonSidecars: ['/Users/bot/.botmux/bots.json.bak', '/Users/bot/.botmux/bots.json.tmp'],
+    });
+    expect(r.hidePaths).toContain('/Users/bot/.botmux/bots.json.bak');
+    expect(r.hidePaths).toContain('/Users/bot/.botmux/bots/cli_ok');
+    // unsafe sibling ids are dropped, never concatenated into a mask path
+    expect(r.hidePaths.some(p => p.includes('evil') || p.includes('bad'))).toBe(false);
   });
 });
 
