@@ -360,9 +360,19 @@ describe('createFeishuOpenPlatformApp', () => {
         expect(init?.body).toBeInstanceOf(FormData);
         return Response.json({ code: 0, data: { url: 'https://cdn.example/botmux.png' } });
       }
-      if (path === '/developers/v1/app/create') {
-        expect(JSON.parse(String(init?.body))).toMatchObject({ name: 'botmux-4', appSceneType: 0 });
-        return Response.json({ code: 0, data: { ClientID: 'cli_created' } });
+      if (path === '/developers/v1/manifest/upsert_by_template') {
+        const body = JSON.parse(String(init?.body));
+        expect(body).toMatchObject({
+          appManifestTemplateID: 'developer_console',
+          createAppUserCustomField: {
+            i18n: { zh_cn: { name: 'botmux-4' } },
+            avatar: 'https://cdn.example/botmux.png',
+            primaryLang: 'zh_cn',
+          },
+        });
+        expect(typeof body.cid).toBe('string');
+        expect(body.cid.length).toBeGreaterThan(0);
+        return Response.json({ code: 0, data: { clientID: 'cli_created' } });
       }
       if (path === '/developers/v1/secret/cli_created') {
         return Response.json({ code: 0, data: { secret: 'created-secret' } });
@@ -388,10 +398,55 @@ describe('createFeishuOpenPlatformApp', () => {
     expect(qrCount).toBe(0);
     expect(calls.map(call => call.path)).toEqual([
       '/developers/v1/app/upload/image',
-      '/developers/v1/app/create',
+      '/developers/v1/manifest/upsert_by_template',
       '/developers/v1/robot/switch/cli_created',
       '/developers/v1/event/switch/cli_created',
       '/developers/v1/secret/cli_created',
+    ]);
+  });
+
+  it('falls back to plain app/create when the one-click template endpoint fails', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-fallback-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const calls: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      const path = new URL(href).pathname;
+      calls.push(path);
+      if (path === '/developers/v1/app/upload/image') {
+        return Response.json({ code: 0, data: { url: 'https://cdn.example/botmux.png' } });
+      }
+      if (path === '/developers/v1/manifest/upsert_by_template') {
+        return Response.json({ code: 1, msg: 'template not available for this tenant' });
+      }
+      if (path === '/developers/v1/app/create') {
+        expect(JSON.parse(String(init?.body))).toMatchObject({ name: 'botmux-5', appSceneType: 0 });
+        return Response.json({ code: 0, data: { ClientID: 'cli_fallback' } });
+      }
+      if (path === '/developers/v1/secret/cli_fallback') {
+        return Response.json({ code: 0, data: { secret: 'fallback-secret' } });
+      }
+      return Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await createFeishuOpenPlatformApp({
+      name: 'botmux-5',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      fetchImpl,
+    });
+
+    expect(result).toMatchObject({ ok: true, appId: 'cli_fallback', appSecret: 'fallback-secret' });
+    expect(calls).toEqual([
+      '/developers/v1/app/upload/image',
+      '/developers/v1/manifest/upsert_by_template',
+      '/developers/v1/app/create',
+      '/developers/v1/robot/switch/cli_fallback',
+      '/developers/v1/event/switch/cli_fallback',
+      '/developers/v1/secret/cli_fallback',
     ]);
   });
 

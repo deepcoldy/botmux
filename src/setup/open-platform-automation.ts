@@ -6,6 +6,7 @@
  * create and publish a version. The official SDK registerApp device flow stays
  * available as a fallback (notably for Lark international tenants).
  */
+import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -1114,11 +1115,41 @@ function pickPayloadString(payload: unknown, keys: string[]): string | undefined
   return pickString(record, keys) ?? pickString(asRecord(record.data), keys);
 }
 
+/** 「一键创建智能体」(backend_oneclick launcher) 使用的应用清单模板 ID。 */
+export const ONECLICK_APP_MANIFEST_TEMPLATE_ID = 'developer_console';
+
+/**
+ * Build the payload for `POST /developers/v1/manifest/upsert_by_template` —
+ * the console launcher's one-click agent creation endpoint (CDP 抓包确认)。
+ * 该模板建出的应用开箱自带 bot 能力、长连接事件/回调模式、基础事件订阅与
+ * card.action.trigger 回调,正是「正常申请默认带的权限」。
+ */
+export function buildManifestTemplateCreatePayload(
+  name: string,
+  description: string,
+  avatar: string,
+  cid: string,
+) {
+  return {
+    appManifestTemplateID: ONECLICK_APP_MANIFEST_TEMPLATE_ID,
+    createAppUserCustomField: {
+      i18n: { zh_cn: { name, description } },
+      avatar,
+      primaryLang: 'zh_cn',
+    },
+    cid,
+    HTTPHead: {},
+  };
+}
+
 /**
  * 用已经登录的开放平台 Web session 创建一个企业自建应用并读取凭证。
  *
- * 当前 console 前端（2026-07）同款链路：上传 512px botmux 图标 → app/create
- * → 只读 secret 接口。所有 Secret 只存在返回值中，不打印、不写日志。
+ * 首选 console launcher 的「一键创建智能体」模板接口
+ * (manifest/upsert_by_template):模板应用出生即带 bot 能力、长连接、基础
+ * 事件与卡片回调,新建 bot 不再依赖后续订阅补齐。模板 ID 属内部契约,失败
+ * 时自动回退旧 app/create(裸自建应用,事件/回调由 automateOpenPlatformSetup
+ * 增量补齐并 fail-closed 兜底)。所有 Secret 只存在返回值中,不打印、不写日志。
  */
 export async function createOpenPlatformAppWithClient(
   client: OpenPlatformApiClient,
@@ -1140,20 +1171,32 @@ export async function createOpenPlatformAppWithClient(
   if (!avatar) throw new Error('开放平台上传图标后没有返回 url');
 
   const description = options.description?.trim() || 'AI coding assistant powered by botmux';
-  const created = await client.postJson('/developers/v1/app/create', {
-    appSceneType: 0, // SelfBuild
-    name,
-    desc: description,
-    avatar,
-    i18n: { zh_cn: { name, description } },
-    primaryLang: 'zh_cn',
-  });
-  const appId = pickPayloadString(created, ['ClientID', 'clientID', 'clientId', 'appId']);
+  let appId: string | undefined;
+  try {
+    const created = await client.postJson(
+      '/developers/v1/manifest/upsert_by_template',
+      buildManifestTemplateCreatePayload(name, description, avatar, randomUUID()),
+    );
+    appId = pickPayloadString(created, ['ClientID', 'clientID', 'clientId', 'appId']);
+  } catch (err) {
+    console.warn(`一键智能体模板创建失败,回退普通自建应用: ${safeErrorMessage(err)}`);
+  }
+  if (!appId?.startsWith('cli_')) {
+    const created = await client.postJson('/developers/v1/app/create', {
+      appSceneType: 0, // SelfBuild
+      name,
+      desc: description,
+      avatar,
+      i18n: { zh_cn: { name, description } },
+      primaryLang: 'zh_cn',
+    });
+    appId = pickPayloadString(created, ['ClientID', 'clientID', 'clientId', 'appId']);
+  }
   if (!appId?.startsWith('cli_')) throw new Error('开放平台创建应用后没有返回 ClientID');
 
   try {
-    // 普通企业自建应用不像 SDK PersonalAgent 那样默认带 bot + 长连接事件能力。
-    // 这两步是“一扫即用”的必要条件，必须在返回凭证前完成。
+    // 模板应用出生已带 bot + 长连接(重复调用幂等);fallback 的裸自建应用
+    // 则必须显式开启——这两步是「一扫即用」的必要条件,在返回凭证前完成。
     await client.postJson(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true });
     await client.postJson(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 }); // WebSocket
     const appSecret = await fetchOpenPlatformAppSecret(client, appId);

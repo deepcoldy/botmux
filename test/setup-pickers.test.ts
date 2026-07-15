@@ -165,7 +165,7 @@ describe('createOpenPlatformAppWithClient', () => {
 
     expect(client.calls.map(call => call.path)).toEqual([
       '/developers/v1/app/upload/image',
-      '/developers/v1/app/create',
+      '/developers/v1/manifest/upsert_by_template',
       '/developers/v1/robot/switch/cli_new',
       '/developers/v1/event/switch/cli_new',
       '/developers/v1/secret/cli_new',
@@ -175,10 +175,12 @@ describe('createOpenPlatformAppWithClient', () => {
     expect(upload.get('isIsv')).toBe('false');
     expect(upload.get('scale')).toBe(JSON.stringify({ width: 512, height: 512 }));
     expect(client.calls[1].body).toMatchObject({
-      appSceneType: 0,
-      name: 'botmux-2',
-      avatar: 'https://cdn.example/botmux.png',
-      primaryLang: 'zh_cn',
+      appManifestTemplateID: 'developer_console',
+      createAppUserCustomField: {
+        i18n: { zh_cn: { name: 'botmux-2' } },
+        avatar: 'https://cdn.example/botmux.png',
+        primaryLang: 'zh_cn',
+      },
     });
     expect(client.calls[2].body).toEqual({ clientId: 'cli_new', enable: true });
     expect(client.calls[3].body).toEqual({ clientId: 'cli_new', eventMode: 4 });
