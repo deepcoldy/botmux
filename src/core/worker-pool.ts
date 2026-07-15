@@ -2555,6 +2555,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           recipientOpenId,
           brand: resolveBrandLabel(ds.larkAppId),
           locale: localeForBot(ds.larkAppId),
+          workingDir: ds.workingDir,
         });
         scopedReply(cardJson, 'interactive', msg.turnId).catch((err: any) => {
           logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
@@ -2769,8 +2770,15 @@ function deliverFinalOutput(
             recipientOpenId,
             brand: resolveBrandLabel(ds.larkAppId),
             locale: localeForBot(ds.larkAppId),
+            workingDir: ds.workingDir,
           })
-        : buildMarkdownCard(msg.content, recipientOpenId, resolveBrandLabel(ds.larkAppId), localeForBot(ds.larkAppId));
+        : buildMarkdownCard(
+            msg.content,
+            recipientOpenId,
+            resolveBrandLabel(ds.larkAppId),
+            localeForBot(ds.larkAppId),
+            ds.workingDir,
+          );
 
       // Always deliver the answer as a fresh message — never PATCH a card in
       // place. message.patch is silent (no Feishu notification / unread), which

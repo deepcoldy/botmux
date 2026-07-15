@@ -7,7 +7,9 @@
  * rewrite plus baseline behaviors that must not regress.
  */
 import { describe, it, expect } from 'vitest';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   buildCardBodyElements,
   buildImageCardElements,
@@ -297,6 +299,19 @@ describe('normalizeLocalHomeLinks', () => {
     const missingSlash = home.replace(/^\/+/, '');
     const content = mdElements(buildCardBodyElements(`[report](${missingSlash})`))[0].content;
     expect(content).toBe(`[report](${home})`);
+  });
+
+  it('uses the caller working directory when the card pipeline disambiguates a relative target', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'botmux-md-card-cwd-'));
+    const relativeHome = homedir().replace(/^\/+|\/+$/g, '');
+    mkdirSync(join(cwd, relativeHome), { recursive: true });
+    try {
+      const input = `[home](${relativeHome})`;
+      const content = mdElements(buildCardBodyElements(input, cwd))[0].content;
+      expect(content).toBe(input);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });
 

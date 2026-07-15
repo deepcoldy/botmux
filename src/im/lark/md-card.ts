@@ -251,9 +251,9 @@ function unescapeFenceLines(input: string): string {
  * All non-table blocks are merged into a single `markdown` element to keep
  * card element counts modest.
  */
-export function buildCardBodyElements(input: string): any[] {
+export function buildCardBodyElements(input: string, cwd = process.cwd()): any[] {
   if (!input) return [];
-  input = normalizeLocalHomeLinks(input);
+  input = normalizeLocalHomeLinks(input, homedir(), cwd);
   // Pre-pass: a line that is nothing but 2+ images renders as a side-by-side
   // image row (column_set) instead of stacked full-width images. Everything
   // else flows through the markdown element builder unchanged. Fence-aware so
@@ -522,8 +522,14 @@ export function hasMarkdown(text: string): boolean {
  * suppressed, else custom. When brand and recipient are both absent the whole
  * footer (HR included) is omitted.
  */
-export function buildMarkdownCard(md: string, recipientOpenId?: string, brand?: string, locale?: Locale): string {
-  const elements = md ? buildCardBodyElements(md) : [];
+export function buildMarkdownCard(
+  md: string,
+  recipientOpenId?: string,
+  brand?: string,
+  locale?: Locale,
+  workingDir?: string,
+): string {
+  const elements = md ? buildCardBodyElements(md, workingDir) : [];
   const footerParts: string[] = [];
   const brandSeg = brandFooterSegment(brand);
   if (brandSeg) footerParts.push(brandSeg);
@@ -576,8 +582,9 @@ export function buildContextualReplyCard(opts: {
   recipientOpenId?: string;
   brand?: string;
   locale?: Locale;
+  workingDir?: string;
 }): string {
-  const { title, userText, assistantText, assistantLabel, recipientOpenId, brand, locale } = opts;
+  const { title, userText, assistantText, assistantLabel, recipientOpenId, brand, locale, workingDir } = opts;
   const elements: any[] = [];
 
   elements.push({
@@ -601,7 +608,7 @@ export function buildContextualReplyCard(opts: {
   });
 
   const bodyElements = assistantText.trim()
-    ? buildCardBodyElements(assistantText)
+    ? buildCardBodyElements(assistantText, workingDir)
     : [{ tag: 'markdown', content: `*${t('common.empty_paren', undefined, locale)}*` }];
   for (const el of bodyElements) elements.push(el);
 
