@@ -61,10 +61,10 @@ function openPlatformSubscriptionMock(appId: string, opts: {
   callbackSwitchNoop?: boolean;
   /** event/update 中包含这些事件时整批被拒(逐个重试时对应单个失败)。 */
   rejectEventNames?: string[];
-  initial?: { appEvents?: string[]; userEvents?: string[]; callbacks?: string[]; callbackMode?: number };
+  initial?: { appEvents?: string[]; userEvents?: string[]; callbacks?: string[]; callbackMode?: number; eventMode?: number };
 } = {}) {
   const state = {
-    eventMode: 4,
+    eventMode: opts.initial?.eventMode ?? 4,
     appEvents: [...(opts.initial?.appEvents ?? [])],
     userEvents: [...(opts.initial?.userEvents ?? [])],
     callbackMode: opts.initial?.callbackMode ?? 1,
@@ -801,12 +801,51 @@ describe('automateOpenPlatformSetup', () => {
     }
   });
 
-  it('vcListenerEventGateError passes clean results and blocks zero-subscription or missing-VC results', () => {
-    expect(vcListenerEventGateError({ subscribedEventCount: 12, missingVcEvents: [] })).toBeNull();
+  it('fails closed and blocks the listener gate when event mode readback stays webhook despite full subscriptions', async () => {
+    // event/switch 返回成功(mock 默认 code 0)但回读 eventMode 仍是 1:
+    // 订阅名齐、count=12、missingVcEvents=[],唯一异常是接收方式。
+    const sub = openPlatformSubscriptionMock('cli_x', {
+      initial: {
+        eventMode: 1,
+        appEvents: [
+          'im.message.receive_v1',
+          'im.chat.member.bot.added_v1',
+          'im.chat.member.bot.deleted_v1',
+          'drive.file.comment_add_v1',
+          'drive.notice.comment_add_v1',
+          'im.message.reaction.created_v1',
+          'im.message.reaction.deleted_v1',
+          'vc.bot.meeting_invited_v1',
+          'vc.bot.meeting_activity_v1',
+          'vc.bot.meeting_ended_v1',
+        ],
+        userEvents: ['vc.meeting.participant_meeting_joined_v1'],
+        callbacks: ['card.action.trigger'],
+        callbackMode: 4,
+      },
+    });
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-evmode-', sub, calls);
+
+    expect(result).toMatchObject({ ok: false, reason: 'api_error' });
+    if (!result.ok) {
+      expect(result.message).toContain('事件接收模式');
+      expect(result.eventModeReady).toBe(false);
+      expect(result.missingVcEvents).toEqual([]);
+      // dashboard 非登录失败分支的 listener 门必须拦下(此前 count=12/missingVc=[] 会放行)
+      expect(vcListenerEventGateError(result)).toContain('长连接');
+    }
+    expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
+  });
+
+  it('vcListenerEventGateError passes clean results and blocks zero-subscription, missing-VC or mode-not-ready results', () => {
+    expect(vcListenerEventGateError({ subscribedEventCount: 12, missingVcEvents: [], eventModeReady: true })).toBeNull();
     expect(vcListenerEventGateError({ eventWarning: 'boom', subscribedEventCount: 0 })).toContain('事件订阅全部失败');
-    expect(vcListenerEventGateError({ subscribedEventCount: 8, missingVcEvents: ['vc.bot.meeting_ended_v1'] }))
+    expect(vcListenerEventGateError({ subscribedEventCount: 8, missingVcEvents: ['vc.bot.meeting_ended_v1'], eventModeReady: true }))
       .toContain('vc.bot.meeting_ended_v1');
-    // 走不到订阅阶段的早期失败(missingVcEvents undefined)保持原 best-effort 语义
+    expect(vcListenerEventGateError({ subscribedEventCount: 12, missingVcEvents: [], eventModeReady: false }))
+      .toContain('长连接');
+    // 走不到订阅阶段的早期失败(missingVcEvents/eventModeReady 均 undefined)保持原 best-effort 语义
     expect(vcListenerEventGateError({})).toBeNull();
   });
 });

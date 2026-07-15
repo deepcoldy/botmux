@@ -118,6 +118,8 @@ export type OpenPlatformAutomationResult =
       eventWarning?: string;
       /** 回读后仍缺失的 VC 会议事件。普通建 bot 不阻断,VC listener 保存前必须为空。 */
       missingVcEvents: string[];
+      /** 回读确认事件接收方式已是长连接(ok:true 时恒为 true,显式带回供门函数统一判定)。 */
+      eventModeReady: boolean;
       versionId?: string;
     }
   | {
@@ -141,6 +143,8 @@ export type OpenPlatformAutomationResult =
       eventWarning?: string;
       /** 回读后仍缺失的 VC 会议事件(走到订阅阶段才有)。 */
       missingVcEvents?: string[];
+      /** 事件接收方式是否回读确认为长连接(走到订阅阶段才有;早期失败为 undefined)。 */
+      eventModeReady?: boolean;
     };
 
 export interface OpenPlatformAutomationOptions {
@@ -832,8 +836,10 @@ export async function automateOpenPlatformSetup(
     ...missingCallbacks,
   ];
   // 长连接模式必须以回读为准:switch 接口返回成功≠生效,mode 不是 4 时
-  // daemon 走长连接同样收不到事件/回调。
-  if (eventState?.eventMode !== LONG_CONNECTION_EVENT_MODE) {
+  // daemon 走长连接同样收不到事件/回调。eventModeReady 显式带回结果——
+  // dashboard listener 门要靠它识别「订阅名齐但接收方式不对」的黑洞。
+  const eventModeReady = eventState?.eventMode === LONG_CONNECTION_EVENT_MODE;
+  if (!eventModeReady) {
     criticalIssues.push(`事件接收模式=${eventState?.eventMode ?? '未知'}(需长连接 ${LONG_CONNECTION_EVENT_MODE})`);
   }
   if (callbackState?.callbackMode !== LONG_CONNECTION_EVENT_MODE) {
@@ -848,6 +854,7 @@ export async function automateOpenPlatformSetup(
       subscribedEventCount,
       eventWarning,
       missingVcEvents,
+      eventModeReady,
     };
   }
 
@@ -873,6 +880,7 @@ export async function automateOpenPlatformSetup(
       subscribedEventCount,
       eventWarning,
       missingVcEvents,
+      eventModeReady,
       versionId,
     };
   } catch (err: any) {
@@ -884,6 +892,7 @@ export async function automateOpenPlatformSetup(
       subscribedEventCount,
       eventWarning,
       missingVcEvents,
+      eventModeReady,
     };
   }
 }
@@ -898,9 +907,15 @@ export function vcListenerEventGateError(result: {
   eventWarning?: string;
   subscribedEventCount?: number;
   missingVcEvents?: string[];
+  eventModeReady?: boolean;
 }): string | null {
   if (result.eventWarning && (result.subscribedEventCount ?? 0) === 0) {
     return `事件订阅全部失败(${result.eventWarning})`;
+  }
+  // 订阅名齐但接收方式不是长连接同样收不到——eventModeReady 显式 false 才阻断,
+  // undefined(走到订阅阶段前就失败)保持原 best-effort 语义。
+  if (result.eventModeReady === false) {
+    return `事件接收方式未确认为长连接${result.eventWarning ? `(${result.eventWarning})` : ''}`;
   }
   const missingVc = result.missingVcEvents ?? [];
   if (missingVc.length > 0) {
