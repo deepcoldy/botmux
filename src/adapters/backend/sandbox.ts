@@ -675,9 +675,10 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
 // watcher NEVER executes sandbox-supplied argv — it rebuilds the command from
 // these validated fields. This is the security boundary: a malicious agent can
 // write any outbox file, so everything here is treated as untrusted.
-//   { contentFile: <basename in outbox>, cardFile?: <basename in outbox>, attachments: [<basename>...], videos: [<basename>...], videoCovers: [<basename>...], flags: [...] }
+//   { contentFile: <basename>, preparedContentFile?: <basename>, cardFile?: <basename>, ... }
 export interface RelayRequest {
   contentFile?: unknown;
+  preparedContentFile?: unknown;
   cardFile?: unknown;
   attachments?: unknown;
   videos?: unknown;
@@ -694,6 +695,7 @@ const RELAY_FLAGS_VAL = new Set(['--mention', '--quote']);
 
 export interface ValidatedRelay {
   contentName: string;
+  preparedContentName?: string;
   cardName?: string;
   attachmentNames: string[];
   videoNames: string[];
@@ -704,7 +706,8 @@ export interface ValidatedRelay {
 /**
  * PURE validation of an outbox relay request (schema + flag allowlist only — no
  * filesystem access, so it's deterministically testable):
- *  - contentFile/cardFile/attachments/videos/videoCovers must be plain basenames (no `/`, `\`, `..`).
+ *  - contentFile/preparedContentFile/cardFile/attachments/videos/videoCovers
+ *    must be plain basenames (no `/`, `\`, `..`).
  *  - only allowlisted presentation flags pass; any other flag → reject (this
  *    rejects raw `--content-file`/`--session-id`/path flags etc.).
  * The TOCTOU-safe filesystem read is handled separately by materializeOutboxFile,
@@ -715,6 +718,14 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
     typeof n === 'string' && !!n && !n.includes('/') && !n.includes('\\') && !n.includes('..');
 
   if (!safeName(req.contentFile)) return { ok: false, error: 'contentFile must be a plain outbox basename' };
+  const preparedContentName = req.preparedContentFile === undefined
+    ? undefined
+    : safeName(req.preparedContentFile)
+      ? req.preparedContentFile
+      : null;
+  if (preparedContentName === null) {
+    return { ok: false, error: 'preparedContentFile must be a plain outbox basename' };
+  }
   const cardName = req.cardFile === undefined
     ? undefined
     : safeName(req.cardFile)
@@ -753,7 +764,15 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
     }
     return { ok: false, error: `flag not allowed: ${f}` };
   }
-  return { ok: true, value: { contentName: req.contentFile, cardName, attachmentNames, videoNames, videoCoverNames, flags } };
+  return { ok: true, value: {
+    contentName: req.contentFile,
+    preparedContentName,
+    cardName,
+    attachmentNames,
+    videoNames,
+    videoCoverNames,
+    flags,
+  } };
 }
 
 /**
@@ -796,10 +815,27 @@ export function materializeOutboxFile(outbox: string, name: string, dest: string
  * build's `send` OUTSIDE the sandbox (full creds) against the private copies,
  * with the session-id FORCED. This keeps every Lark credential out of the sandbox.
  */
+export function buildRelayHostEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  preparedContentFile?: string,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...baseEnv };
+  delete env.BOTMUX_SEND_RELAY;
+  delete env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
+  if (preparedContentFile) {
+    env.BOTMUX_CARD_LOCAL_LINK_MODE = 'disabled';
+    env.BOTMUX_CARD_PREPARED_CONTENT_FILE = preparedContentFile;
+  } else {
+    // A hand-written/incomplete relay request must never fall back to host
+    // filesystem probes. It may lose relative-path disambiguation, but cannot
+    // turn the worker into a host existence oracle.
+    env.BOTMUX_CARD_LOCAL_LINK_MODE = 'lexical';
+  }
+  return env;
+}
+
 export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, sessionId: string): () => void {
   const cli = distCliJs();
-  const env = { ...baseEnv };
-  delete env.BOTMUX_SEND_RELAY;
   const inFlight = new Set<string>();
   // Host-private staging — a sibling of the outbox, NOT bound into the sandbox.
   const staging = join(dirname(outbox), 'relay-staging');
@@ -836,6 +872,15 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
         continue;
       }
       staged.push(contentDest);
+      let preparedContentPath: string | undefined;
+      if (v.value.preparedContentName) {
+        preparedContentPath = join(staging, `${id}.card-content`);
+        if (!materializeOutboxFile(outbox, v.value.preparedContentName, preparedContentPath)) {
+          finish(id, reqPath, name, staged, 1, '', 'relay rejected: prepared content not a regular file in outbox');
+          continue;
+        }
+        staged.push(preparedContentPath);
+      }
       let cardPath: string | undefined;
       if (v.value.cardName) {
         cardPath = join(staging, `${id}.card.json`);
@@ -881,7 +926,9 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
         ...videoCoverPaths.flatMap(a => ['--video-covers', a]),
         '--session-id', sessionId,  // forced — sandbox cannot target another session
       ];
-      const child = spawn(process.execPath, [cli, 'send', ...hostArgs], { env });
+      const child = spawn(process.execPath, [cli, 'send', ...hostArgs], {
+        env: buildRelayHostEnv(baseEnv, preparedContentPath),
+      });
       let out = '', err = '';
       child.stdout.on('data', d => { out += d; });
       child.stderr.on('data', d => { err += d; });

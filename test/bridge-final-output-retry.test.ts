@@ -78,7 +78,8 @@ import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 // Build a fake worker child process whose IPC `message` event we can fire
@@ -561,6 +562,155 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
     const cardJson = sessionReply.mock.calls[0][1] as string;
     expect(cardJson).toContain('<at id=ou_human></at>');
+  });
+
+  it('uses probe-free lexical link repair for sandboxed bridge fallback output', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.session.sandbox = true;
+    const home = homedir().replace(/\/+$/, '');
+    const relativeHome = home.replace(/^\/+/, '');
+    const missing = `${relativeHome}/botmux-definitely-missing-${Date.now()}.md`;
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, {
+      ...finalOutputMsg(),
+      content: `[file](${missing})`,
+    }, 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    expect(cardJson).toContain(`[file](/${missing})`);
+  });
+
+  it('preserves a real home-shaped relative link in a non-isolated bridge fallback', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const cwd = mkdtempSync(join(tmpdir(), 'botmux-bridge-relative-'));
+    const relativeHome = homedir().replace(/^\/+|\/+$/g, '');
+    const relativeFile = `${relativeHome}/project/a.md`;
+    mkdirSync(join(cwd, relativeHome, 'project'), { recursive: true });
+    writeFileSync(join(cwd, relativeFile), 'relative');
+    try {
+      const ds = makeDs();
+      ds.workingDir = cwd;
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, {
+        ...finalOutputMsg(),
+        content: `[file](${relativeFile})`,
+      }, 'tag', 0);
+
+      await vi.advanceTimersByTimeAsync(10);
+
+      const cardJson = sessionReply.mock.calls[0][1] as string;
+      expect(cardJson).toContain(`[file](${relativeFile})`);
+      expect(cardJson).not.toContain(`[file](/${relativeFile})`);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('uses probe-free lexical link repair for read-isolated bridge fallback output', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.initConfig = { readIsolation: true } as any;
+    const home = homedir().replace(/\/+$/, '');
+    const relativeHome = home.replace(/^\/+/, '');
+    const missing = `${relativeHome}/botmux-definitely-missing-read-iso-${Date.now()}.md`;
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, {
+      ...finalOutputMsg(),
+      content: `[file](${missing})`,
+    }, 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    expect(cardJson).toContain(`[file](/${missing})`);
+  });
+
+  it('uses lexical link repair when sandboxing is forced globally', async () => {
+    const previous = process.env.BOTMUX_SANDBOX;
+    process.env.BOTMUX_SANDBOX = '1';
+    try {
+      const sessionReply = vi.fn(async () => 'om_reply');
+      initWorkerPool({
+        sessionReply,
+        getSessionWorkingDir: () => '/tmp',
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+      });
+
+      const ds = makeDs();
+      const home = homedir().replace(/\/+$/, '');
+      const relativeHome = home.replace(/^\/+/, '');
+      const missing = `${relativeHome}/botmux-definitely-missing-global-sandbox-${Date.now()}.md`;
+
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, {
+        ...finalOutputMsg(),
+        content: `[file](${missing})`,
+      }, 'tag', 0);
+
+      await vi.advanceTimersByTimeAsync(10);
+
+      const cardJson = sessionReply.mock.calls[0][1] as string;
+      expect(cardJson).toContain(`[file](/${missing})`);
+    } finally {
+      if (previous === undefined) delete process.env.BOTMUX_SANDBOX;
+      else process.env.BOTMUX_SANDBOX = previous;
+    }
+  });
+
+  it('uses probe-free lexical link repair for adopt preamble cards', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.session.sandbox = true;
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const home = homedir().replace(/\/+$/, '');
+    const relativeHome = home.replace(/^\/+/, '');
+    const missing = `${relativeHome}/botmux-definitely-missing-adopt-${Date.now()}.md`;
+
+    (ds.worker as any).emit('message', {
+      type: 'adopt_preamble',
+      userText: 'show file',
+      assistantText: `[file](${missing})`,
+      turnId: 'turn-adopt',
+    });
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    expect(cardJson).toContain(`[file](/${missing})`);
   });
 
   it('always delivers the answer as a fresh message (never PATCHes a card in place)', async () => {

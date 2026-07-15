@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
-import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { buildSandboxArgs, buildRelayHostEnv, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
 
@@ -269,9 +269,28 @@ describe('codex-app sandboxExtraExecPaths', () => {
 // blocker: only plain outbox basenames + allowlisted flags pass; raw argv /
 // path flags / sandbox-chosen session-id are rejected.
 describe('validateRelayRequest', () => {
+  it('forces host-relayed cards to use probe-free lexical link repair', () => {
+    expect(buildRelayHostEnv({
+      BOTMUX_SEND_RELAY: '/sandbox/outbox',
+      BOTMUX_CARD_LOCAL_LINK_MODE: 'filesystem',
+      KEEP_ME: 'yes',
+    })).toMatchObject({
+      BOTMUX_CARD_LOCAL_LINK_MODE: 'lexical',
+      KEEP_ME: 'yes',
+    });
+    expect(buildRelayHostEnv({ BOTMUX_SEND_RELAY: '/sandbox/outbox' }))
+      .not.toHaveProperty('BOTMUX_SEND_RELAY');
+
+    expect(buildRelayHostEnv({}, '/private/staging/prepared.md')).toMatchObject({
+      BOTMUX_CARD_LOCAL_LINK_MODE: 'disabled',
+      BOTMUX_CARD_PREPARED_CONTENT_FILE: '/private/staging/prepared.md',
+    });
+  });
+
   it('accepts plain basenames + allowlisted presentation flags', () => {
     const r = validateRelayRequest({
       contentFile: 'c.content',
+      preparedContentFile: 'c.card-content',
       attachments: ['a.png'],
       videos: ['replay.mp4'],
       videoCovers: ['cover.png'],
@@ -280,6 +299,7 @@ describe('validateRelayRequest', () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.value.contentName).toBe('c.content');
+    expect(r.value.preparedContentName).toBe('c.card-content');
     expect(r.value.attachmentNames).toEqual(['a.png']);
     expect(r.value.videoNames).toEqual(['replay.mp4']);
     expect(r.value.videoCoverNames).toEqual(['cover.png']);
@@ -316,6 +336,7 @@ describe('validateRelayRequest', () => {
 
   it('rejects non-basename content / attachment names (../ traversal)', () => {
     expect(validateRelayRequest({ contentFile: '../../etc/passwd' }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', preparedContentFile: '../prepared' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', attachments: ['../secret'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', cardFile: '../card.json' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', videos: ['../secret.mp4'] }).ok).toBe(false);

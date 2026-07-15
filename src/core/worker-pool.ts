@@ -27,11 +27,12 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
-import { buildMarkdownCard, buildContextualReplyCard } from '../im/lark/md-card.js';
+import { buildMarkdownCard, buildContextualReplyCard, type LocalHomeLinkMode } from '../im/lark/md-card.js';
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
+import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { isSuspendableBackendType, getSessionPersistentBackendType, resolveSpawnBackendType, persistentSessionName, killPersistentSession } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
 
@@ -39,6 +40,14 @@ import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-re
  *  isolated persistent panes so a suspend→resume reattach (same id) is
  *  distinguishable from a pane surviving a daemon restart (different id). */
 const DAEMON_BOOT_ID = randomUUID();
+
+function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
+  // The daemon is outside file/read isolation. Never use its host namespace
+  // to disambiguate isolated output; lexical repair performs no filesystem I/O.
+  return ds.session.sandbox === true || ds.initConfig?.readIsolation === true || sandboxEnabled()
+    ? 'lexical'
+    : 'filesystem';
+}
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
@@ -2556,6 +2565,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           brand: resolveBrandLabel(ds.larkAppId),
           locale: localeForBot(ds.larkAppId),
           workingDir: ds.workingDir,
+          localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
         });
         scopedReply(cardJson, 'interactive', msg.turnId).catch((err: any) => {
           logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
@@ -2759,6 +2769,7 @@ function deliverFinalOutput(
       // blockquote and only the assistant body goes through full markdown
       // rendering.
       const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+      const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: msg.kind === 'local-turn-headless'
@@ -2771,6 +2782,7 @@ function deliverFinalOutput(
             brand: resolveBrandLabel(ds.larkAppId),
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
+            localHomeLinkMode,
           })
         : buildMarkdownCard(
             msg.content,
@@ -2778,6 +2790,7 @@ function deliverFinalOutput(
             resolveBrandLabel(ds.larkAppId),
             localeForBot(ds.larkAppId),
             ds.workingDir,
+            localHomeLinkMode,
           );
 
       // Always deliver the answer as a fresh message — never PATCH a card in

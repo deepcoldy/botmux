@@ -4737,6 +4737,23 @@ function readStdin(): Promise<string> {
   });
 }
 
+/** Extract text from the legacy post-JSON shape some CLIs emit by accident. */
+function extractCardText(content: string): string {
+  try {
+    const parsed = JSON.parse(content);
+    const inner = parsed.zh_cn ?? parsed.en_us ?? parsed;
+    if (!Array.isArray(inner?.content)) return content;
+    const lines: string[] = [];
+    for (const para of inner.content) {
+      if (!Array.isArray(para)) continue;
+      lines.push(para.filter((node: any) => node.tag === 'text').map((node: any) => node.text).join(''));
+    }
+    return lines.join('\n').trim();
+  } catch {
+    return content;
+  }
+}
+
 // decodeStdinBytes lives in ./cli/stdin-encoding.ts (imported above) so it
 // can be unit-tested with an explicit platform argument.
 
@@ -4781,7 +4798,7 @@ function withCustomCardMentionFooter(
 // Card v2 body builder helpers — extracted to im/lark/md-card.ts so the
 // daemon's bridge fallback path can produce identical cards. cmdSend
 // keeps using `buildImageCardElements` from there.
-import { buildImageCardElements, brandFooterSegment } from './im/lark/md-card.js';
+import { buildImageCardElements, brandFooterSegment, prepareCardMarkdown, type LocalHomeLinkMode } from './im/lark/md-card.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
@@ -4827,6 +4844,9 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
     const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice']);
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
+  const preparedCardContent = cardJsonArg === undefined && cardFile === undefined && !rest.includes('--voice')
+    ? prepareCardMarkdown(extractCardText(content), process.cwd(), 'filesystem')
+    : undefined;
   const id = randomBytes(8).toString('hex');
   // Structured request: the daemon-side watcher rebuilds the argv from these
   // validated fields (it NEVER executes raw argv — see buildRelayHostArgs).
@@ -4837,6 +4857,13 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
   const contentBase = `${id}.content`;
   const cfile = join(relayDir, contentBase);
   writeFileSync(cfile, content);
+  let preparedContentBase: string | undefined;
+  let preparedContentOutfile: string | undefined;
+  if (preparedCardContent !== undefined) {
+    preparedContentBase = `${id}.card-content`;
+    preparedContentOutfile = join(relayDir, preparedContentBase);
+    writeFileSync(preparedContentOutfile, preparedCardContent);
+  }
   let cardBase: string | undefined;
   let cardOutfile: string | undefined;
   if (cardJsonArg !== undefined || cardFile !== undefined) {
@@ -4878,7 +4905,15 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
   }
   // 原子写：req.json 是 host watcher 的触发文件，rename 让它「完整出现」，
   // watcher 永远不会读到半截 JSON（tmp 后缀不匹配 .req.json 过滤）。
-  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, cardFile: cardBase, attachments, videos, videoCovers, flags }));
+  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({
+    contentFile: contentBase,
+    preparedContentFile: preparedContentBase,
+    cardFile: cardBase,
+    attachments,
+    videos,
+    videoCovers,
+    flags,
+  }));
 
   const resPath = join(relayDir, `${id}.res.json`);
   const deadlineMs = Date.now() + 120_000;
@@ -4888,6 +4923,7 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
         const res = JSON.parse(readFileSync(resPath, 'utf-8')) as { code?: number; stdout?: string; stderr?: string };
         try { unlinkSync(resPath); } catch { /* */ }
         try { unlinkSync(cfile); } catch { /* */ }
+        if (preparedContentOutfile) { try { unlinkSync(preparedContentOutfile); } catch { /* */ } }
         if (cardOutfile) { try { unlinkSync(cardOutfile); } catch { /* */ } }
         if (res.stdout) process.stdout.write(res.stdout);
         if (res.stderr) process.stderr.write(res.stderr);
@@ -5370,20 +5406,14 @@ async function cmdSend(rest: string[]): Promise<void> {
       imageKeys.push(...results);
     }
 
-    // Try to extract plain text if Claude accidentally sent post JSON as content
-    let text = content;
-    try {
-      const parsed = JSON.parse(text);
-      const inner = parsed.zh_cn ?? parsed.en_us ?? parsed;
-      if (Array.isArray(inner?.content)) {
-        const lines: string[] = [];
-        for (const para of inner.content) {
-          if (!Array.isArray(para)) continue;
-          lines.push(para.filter((n: any) => n.tag === 'text').map((n: any) => n.text).join(''));
-        }
-        text = lines.join('\n').trim();
-      }
-    } catch { /* not JSON, use as-is */ }
+    // A file-sandbox relay supplies a host-private copy normalized inside the
+    // sandbox namespace. Voice/doc-comment paths returned above and therefore
+    // continue using the untouched raw content.
+    let text = extractCardText(content);
+    const preparedContentFile = process.env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
+    if (preparedContentFile) {
+      try { text = readFileSync(preparedContentFile, 'utf-8'); } catch { /* fall back safely below */ }
+    }
 
     // Auto-detect @BotName in text and inject as mentions, using the sender
     // app's cross-ref file for per-app-scoped open_ids. Without this, a plain
@@ -5566,7 +5596,19 @@ async function cmdSend(rest: string[]): Promise<void> {
       // `![alt](img:N)` inlines a full-width image; a grouped `![](img:0,1[,2…])`
       // renders one row of images side by side (2/row, 3/row …); any image not
       // referenced by a placeholder is appended full-width at the end.
-      const elements = (md || imageKeys.length > 0) ? buildImageCardElements(md, imageKeys) : [];
+      // A normal sandbox relay supplies content already normalized inside its
+      // own namespace and disables host probing. An incomplete/manual relay
+      // falls back to probe-free lexical repair; direct sends use filesystem
+      // disambiguation in their own process namespace.
+      const configuredLinkMode = process.env.BOTMUX_CARD_LOCAL_LINK_MODE;
+      const localHomeLinkMode: LocalHomeLinkMode = configuredLinkMode === 'disabled'
+        ? 'disabled'
+        : configuredLinkMode === 'lexical'
+          ? 'lexical'
+          : 'filesystem';
+      const elements = (md || imageKeys.length > 0)
+        ? buildImageCardElements(md, imageKeys, process.cwd(), localHomeLinkMode)
+        : [];
 
       // Footer: de-emphasized markdown (v2 dropped the `note` tag). Use small
       // text size + grey font tag so it reads like a footnote below the hr.
