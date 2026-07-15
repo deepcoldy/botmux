@@ -93,6 +93,22 @@ export function reconcileRiffBackendType(
   return resolved;
 }
 
+/** Resolve the frozen/live/default backend precedence and then enforce the
+ * Riff CLI/backend pairing. Keep spawn-time callers on this single helper so
+ * worktree push decisions cannot drift from the backend forkWorker will use. */
+export function resolvePairedSpawnBackendType(
+  cliId: string,
+  sessionStamp: BackendType | undefined,
+  botType: BackendType | undefined,
+  defaultType: BackendType,
+): BackendType {
+  return reconcileRiffBackendType(
+    cliId,
+    resolveSpawnBackendType(sessionStamp, botType, defaultType),
+    defaultType,
+  );
+}
+
 /**
  * How a session's worker is torn down at daemon shutdown, branched on the
  * session's FROZEN backend (via getSessionPersistentBackendType), NOT live config:

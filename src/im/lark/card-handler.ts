@@ -65,6 +65,7 @@ import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
+import { resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
 import {
@@ -252,6 +253,21 @@ function sessionCliId(ds: DaemonSession) {
   return ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
 }
 
+/** Worktree selection always creates or starts a fresh session. Decide whether
+ * that next session will use Riff from the live bot pairing after applying the
+ * same invalid-pair reconciliation as forkWorker, rather than from the old
+ * session stamp or the raw backendType alone. */
+function nextSessionUsesRiffBackend(ds: DaemonSession): boolean {
+  const botCfg = getBot(ds.larkAppId).config;
+  const pendingSession = ds.pendingRepo === true;
+  return resolvePairedSpawnBackendType(
+    pendingSession ? sessionCliId(ds) : botCfg.cliId,
+    pendingSession ? ds.session.backendType : undefined,
+    botCfg.backendType,
+    config.daemon.backendType,
+  ) === 'riff';
+}
+
 function validateCardCliBinding(ds: DaemonSession, value?: Record<string, string>): boolean {
   const expected = value?.cli_id;
   if (!expected) return true;
@@ -339,9 +355,6 @@ export async function commitRepoSelection(
   opts?: { suppressConfirmReply?: boolean; riffRepoDirs?: string[] },
 ): Promise<void> {
   const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply } = ctx;
-  // riff 多仓 stamp：只有多仓 worktree 流显式传入（保留用户选择顺序，首仓=primary）；
-  // 其它选仓路径一律清除旧 stamp——workingDir 变了，旧的多仓组合不再成立。
-  ds.session.riffRepoDirs = opts?.riffRepoDirs;
   const locTarget = localeForBot(ds.larkAppId);
   // `/close` deletes the active-map entry without touching sessionId or
   // pendingRepo — identity against the map is the only tell that the session
@@ -354,6 +367,9 @@ export async function commitRepoSelection(
     // First spawn: pin the new cwd onto the CURRENT session before forking.
     ds.workingDir = dirPath;
     ds.session.workingDir = dirPath;
+    // riff 多仓 stamp：只有多仓 worktree 流显式传入（保留用户选择顺序，首仓=primary）；
+    // 其它选仓路径一律清除旧 stamp——workingDir 变了，旧的多仓组合不再成立。
+    ds.session.riffRepoDirs = opts?.riffRepoDirs;
     sessionStore.updateSession(ds.session);
     const selfBot = getBot(ds.larkAppId);
     const botCfg = selfBot.config;
@@ -486,6 +502,9 @@ export async function commitRepoSelection(
     ds.session.ownerOpenId = oldSession.ownerOpenId;
     ds.session.creatorOpenId = oldSession.creatorOpenId;
     ds.session.lastCallerOpenId = oldSession.lastCallerOpenId;
+    // Stamp the newly-created session, not the displaced session that was just
+    // closed. Plain/single-repo switches pass undefined and clear stale state.
+    ds.session.riffRepoDirs = opts?.riffRepoDirs;
     sessionStore.updateSession(ds.session);
     ds.hasHistory = false;
     // Re-persist the parked card under the NEW sessionId so a daemon crash
@@ -2489,7 +2508,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // riff：新建的 worktree 分支只存在于本地，远程沙箱克隆不到 → 先推送
         // 分支指针到远端，riff 任务才能钉住这个新分支。推送失败不阻塞（worker
         // 推导会按现状回退默认分支并在卡片注入告警），只提示用户。
-        if (getBot(targetDs.larkAppId).config.backendType === 'riff') {
+        if (nextSessionUsesRiffBackend(targetDs)) {
           for (const c of created) {
             try {
               await pushWorktreeBranch(c.result.path, c.result.branch);

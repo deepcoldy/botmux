@@ -18,7 +18,7 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({ config: { backendType: bot.backendType } })),
 }));
 
-import { getSessionPersistentBackendType, resolveSpawnBackendType, shutdownBackendDisposition } from '../src/core/persistent-backend.js';
+import { getSessionPersistentBackendType, resolvePairedSpawnBackendType, resolveSpawnBackendType, shutdownBackendDisposition } from '../src/core/persistent-backend.js';
 
 function ds(opts: { initBackend?: string; sessionBackend?: string }): any {
   return {
@@ -68,6 +68,18 @@ describe('resolveSpawnBackendType (forkWorker freeze-once)', () => {
   it('a brand-new session (no stamp) resolves from live bot config, then the daemon default', () => {
     expect(resolveSpawnBackendType(undefined, 'herdr', 'tmux')).toBe('herdr');
     expect(resolveSpawnBackendType(undefined, undefined, 'tmux')).toBe('tmux');
+  });
+});
+
+describe('resolvePairedSpawnBackendType (Riff pairing at every spawn decision)', () => {
+  it('falls back from a stale riff backend for non-Riff CLIs', () => {
+    expect(resolvePairedSpawnBackendType('codex-app', undefined, 'riff', 'tmux')).toBe('tmux');
+    expect(resolvePairedSpawnBackendType('codex-app', 'riff', undefined, 'pty')).toBe('pty');
+  });
+
+  it('forces the Riff backend for a Riff CLI even when config or a session stamp is local', () => {
+    expect(resolvePairedSpawnBackendType('riff', undefined, 'pty', 'tmux')).toBe('riff');
+    expect(resolvePairedSpawnBackendType('riff', 'tmux', undefined, 'pty')).toBe('riff');
   });
 });
 

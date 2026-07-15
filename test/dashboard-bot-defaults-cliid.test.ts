@@ -113,6 +113,36 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
 });
 
 describe('Codex App history switch', () => {
+  it('keeps the clean-history control visible when the nested Codex dependency is unavailable', () => {
+    let agentRenderer!: TestRenderer.ReactTestRenderer;
+    let displayRenderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      agentRenderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_codex_app_missing', cliId: 'codex-app', model: '' },
+        sessionFallback: 'codex-app',
+        cliState: {
+          options: [{
+            id: 'codex-app',
+            label: 'Codex App',
+            available: false,
+            command: 'codex',
+            availabilityReason: '找不到嵌套 codex',
+          }],
+          ttadkModelDefault: 'glm-5.1',
+          ttadkModelSuggestions: [],
+        },
+        patchBot: () => undefined,
+      }));
+      displayRenderer = TestRenderer.create(React.createElement(CodexAppDisplaySection, {
+        bot: { larkAppId: 'cli_codex_app_missing', cliId: 'codex-app' },
+        putCardPref: vi.fn(),
+      }));
+    });
+
+    expect(agentRenderer.root.findByProps({ className: 'hint-warn' }).children.join('')).toContain('codex');
+    expect(displayRenderer.root.findByProps({ 'data-action': 'toggle-codex-app-clean-input' }).props.checked).toBe(false);
+  });
+
   it('renders a real default-off Codex App history switch and persists the opt-in', async () => {
     const putCardPref = vi.fn(async () => ({
       ok: true,

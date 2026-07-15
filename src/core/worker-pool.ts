@@ -34,7 +34,7 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
-import { isSuspendableBackendType, getSessionPersistentBackendType, resolveSpawnBackendType, persistentSessionName, killPersistentSession, reconcileRiffBackendType } from './persistent-backend.js';
+import { isSuspendableBackendType, getSessionPersistentBackendType, persistentSessionName, killPersistentSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
@@ -1924,7 +1924,7 @@ export function forkWorker(ds: DaemonSession, promptInput: string | CliTurnPaylo
     // the real persistent pane (the stamp is written below; restore reads it via
     // getSessionPersistentBackendType). A brand-new session (no stamp) resolves
     // from live config, so a dashboard backend switch only affects NEW sessions.
-    backendType: reconcileRiffBackendType(agentCfg.cliId, resolveSpawnBackendType(ds.session.backendType, botCfg.backendType, config.daemon.backendType), config.daemon.backendType),
+    backendType: resolvePairedSpawnBackendType(agentCfg.cliId, ds.session.backendType, botCfg.backendType, config.daemon.backendType),
     backendConfig: botCfg.riff,
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,

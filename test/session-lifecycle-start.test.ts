@@ -233,6 +233,7 @@ describe('Codex App clean-input feature gate', () => {
     const init = vi.mocked(worker.send).mock.calls[0][0];
     expect(init.prompt).toBe(payload.content);
     expect(init.promptCodexAppInput).toEqual({ text: 'clean', clientUserMessageId: 'om_on' });
+    expect(init.turnId).toBe('om_on');
   });
 
   it('uses the session-frozen CLI and freezes each live turn at send time', () => {
@@ -268,6 +269,34 @@ describe('Codex App clean-input feature gate', () => {
     expect(worker.send).toHaveBeenCalledWith({
       type: 'message', content: payload.content, turnId: 'om_other',
     });
+  });
+
+  it('keeps Riff lineage fields while rejecting a Codex App sidecar on the Riff CLI', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({
+      cliId: 'riff',
+      backendType: 'riff',
+      riff: { baseUrl: 'https://riff.example' },
+      codexAppCleanInput: true,
+    }));
+    const ds = makeDs();
+    ds.session.riffParentTaskId = 'riff-parent-task';
+    ds.session.riffRepoDirs = ['/repo/primary', '/repo/secondary'];
+
+    forkWorker(ds, payload, { turnId: 'om_riff' });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({
+      type: 'init',
+      cliId: 'riff',
+      backendType: 'riff',
+      backendConfig: { baseUrl: 'https://riff.example' },
+      riffParentTaskId: 'riff-parent-task',
+      riffRepoDirs: ['/repo/primary', '/repo/secondary'],
+      prompt: payload.content,
+      turnId: 'om_riff',
+    }));
+    expect(init).not.toHaveProperty('promptCodexAppInput');
   });
 });
 
@@ -335,6 +364,87 @@ describe('session.start lifecycle integration', () => {
 });
 
 describe('worker startup failure delivery', () => {
+  it('keeps the clean init payload and reports a structured failure once to its exact originating turn', async () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+
+    forkWorker(ds, {
+      content: '<user_message>legacy</user_message>',
+      codexAppInput: { text: 'clean', clientUserMessageId: 'preserved-id' },
+    }, { turnId: 'turn-clean-start' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({
+      prompt: '<user_message>legacy</user_message>',
+      promptCodexAppInput: { text: 'clean', clientUserMessageId: 'preserved-id' },
+      turnId: 'turn-clean-start',
+    }));
+
+    worker.emit('message', { type: 'error', message: 'nested codex dependency missing', turnId: 'turn-clean-start' });
+    worker.emit('message', { type: 'error', message: 'duplicate error', turnId: 'turn-clean-start' });
+    worker.emit('exit', 1);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('nested codex dependency missing'),
+      'text',
+      'app_test',
+      'turn-clean-start',
+    );
+  });
+
+  it('keeps a live clean sidecar on one IPC and scopes crash-relaunch failure to that turn', async () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'opening', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    await Promise.resolve();
+    sessionReply.mockClear();
+
+    expect(sendWorkerInput(ds, {
+      content: '<user_message>legacy follow-up</user_message>',
+      codexAppInput: { text: 'clean follow-up' },
+    }, 'turn-live-clean')).toBe(true);
+    expect(worker.send).toHaveBeenLastCalledWith({
+      type: 'message',
+      content: '<user_message>legacy follow-up</user_message>',
+      codexAppInput: { text: 'clean follow-up', clientUserMessageId: 'turn-live-clean' },
+      turnId: 'turn-live-clean',
+    });
+
+    worker.emit('message', { type: 'error', message: 'CLI relaunch dependency disappeared', turnId: 'turn-live-clean' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('CLI relaunch dependency disappeared'),
+      'text',
+      'app_test',
+      'turn-live-clean',
+    );
+  });
+
   it('replies to the originating Lark turn on a structured init error and dedupes the exit fallback', async () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
     initWorkerPool({

@@ -1095,10 +1095,16 @@ export function resolveSubstituteTrigger(
     if (!target) continue;
     return {
       target: {
-        name: target.name ?? mention.name,
-        openId: target.openId ?? mention.openId,
-        userId: target.userId ?? mention.userId,
-        unionId: target.unionId ?? mention.unionId,
+        name: target.name,
+        openId: target.openId,
+        userId: target.userId,
+        unionId: target.unionId,
+      },
+      observedMention: {
+        name: mention.name,
+        openId: mention.openId,
+        userId: mention.userId,
+        unionId: mention.unionId,
       },
       disclosure: cfg.disclosure ?? 'prefix',
     };
@@ -2265,8 +2271,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           routing.anchor = chatId;
           routingSource = 'regular-group-chat';
           if (message.root_id && message.thread_id) replyRootId = message.root_id;
+          const configuredTargetId = substituteTrigger.target.openId
+            ?? substituteTrigger.target.userId
+            ?? substituteTrigger.target.unionId
+            ?? 'unknown';
+          const configuredTargetForLog = JSON.stringify(configuredTargetId.slice(0, 128));
           logger.info(
-            `[substitute:${larkAppId}] mention target=${substituteTrigger.target.name ?? substituteTrigger.target.openId ?? substituteTrigger.target.userId ?? substituteTrigger.target.unionId ?? 'unknown'} ` +
+            `[substitute:${larkAppId}] mention target=${configuredTargetForLog} ` +
             `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)} → chat-scope`,
           );
         }

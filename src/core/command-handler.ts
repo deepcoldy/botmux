@@ -12,8 +12,9 @@ import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
-import { createRepoWorktree } from '../services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
+import { resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
 import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
@@ -1400,6 +1401,7 @@ export async function handleCommand(
                   larkAppId,
                   chatId: ds!.chatId,
                   whiteboardId: ds!.session.whiteboardId,
+                  substituteTrigger: ds!.pendingSubstituteTrigger,
                   codexAppText: ds!.pendingCodexAppText,
                   codexAppApplicationContext: ds!.pendingCodexAppApplicationContext,
                   codexAppMessageContext: ds!.pendingCodexAppMessageContext,
@@ -1439,6 +1441,7 @@ export async function handleCommand(
                 larkAppId,
                 chatId: ds!.chatId,
                 whiteboardId: ds!.session.whiteboardId,
+                substituteTrigger: ds!.pendingSubstituteTrigger,
                 codexAppText: ds!.pendingCodexAppText,
                 codexAppApplicationContext: ds!.pendingCodexAppApplicationContext,
                 codexAppMessageContext: ds!.pendingCodexAppMessageContext,
@@ -1468,6 +1471,7 @@ export async function handleCommand(
           ds!.pendingCodexAppMessageContext = undefined;
           ds!.pendingAttachments = undefined;
           ds!.pendingMentions = undefined;
+          ds!.pendingSubstituteTrigger = undefined;
           ds!.pendingSender = undefined;
           ds!.pendingFollowUps = undefined;
           ds!.pendingCodexAppFollowUps = undefined;
@@ -1484,6 +1488,8 @@ export async function handleCommand(
             // First spawn: pin the new cwd onto the CURRENT session, then fork.
             ds!.workingDir = selectedPath;
             ds!.session.workingDir = selectedPath;
+            // A single repo selection supersedes any stale multi-Riff stamp.
+            ds!.session.riffRepoDirs = undefined;
             sessionStore.updateSession(ds!.session);
             await forkPendingCli(t('cmd.repo.selected_in_pending', { name: displayName }, loc));
           } else {
@@ -1606,6 +1612,22 @@ export async function handleCommand(
               logger.info(`[${logTag}] Worktree ${creation.path} created but session changed mid-flight — not switching`);
               await sessionReply(rootId, t('cmd.repo.worktree_created_not_switched', { path: creation.path, branch: creation.branch }, loc));
               break;
+            }
+            const botCfg = getBot(ds.larkAppId).config;
+            const effectiveBackend = resolvePairedSpawnBackendType(
+              wasPending ? (ds.session.cliId ?? botCfg.cliId) : botCfg.cliId,
+              wasPending ? ds.session.backendType : undefined,
+              botCfg.backendType,
+              config.daemon.backendType,
+            );
+            if (effectiveBackend === 'riff') {
+              try {
+                await pushWorktreeBranch(creation.path, creation.branch);
+              } catch (e) {
+                const errMsg = e instanceof Error ? e.message : String(e);
+                logger.warn(`[${logTag}] riff worktree branch push failed (${creation.branch}): ${errMsg}`);
+                await sessionReply(rootId, t('card.repo.riff_worktree_push_failed', { branch: creation.branch, error: errMsg }, loc));
+              }
             }
             await sessionReply(rootId, t('cmd.repo.worktree_created', {
               path: creation.path, branch: creation.branch, base: creation.baseRef,

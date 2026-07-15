@@ -229,13 +229,18 @@ export interface LarkMention {
   idType?: string;     // e.g. "open_id" or "app_id" from Lark event payloads
 }
 
+export interface SubstituteTriggerIdentity {
+  name?: string;
+  openId?: string;
+  userId?: string;
+  unionId?: string;
+}
+
 export interface SubstituteTrigger {
-  target: {
-    name?: string;
-    openId?: string;
-    userId?: string;
-    unionId?: string;
-  };
+  /** Canonical identity copied only from Botmux configuration. */
+  target: SubstituteTriggerIdentity;
+  /** Event-provided mention metadata. It is observation data, never policy. */
+  observedMention?: SubstituteTriggerIdentity;
   disclosure?: 'prefix' | 'none';
 }
 

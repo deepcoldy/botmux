@@ -40,7 +40,7 @@ vi.mock('node:os', async (importOriginal) => {
 vi.mock('../src/config.js', () => ({
   config: {
     web: { externalHost: 'localhost' },
-    daemon: { workingDir: '~' },
+    daemon: { workingDir: '~', backendType: 'pty', cliId: 'claude-code' },
     session: { dataDir: '/fake/data' },
   },
 }));
@@ -163,6 +163,7 @@ vi.mock('../src/services/project-scanner.js', () => ({
 
 vi.mock('../src/services/git-worktree.js', () => ({
   createRepoWorktree: vi.fn(),
+  pushWorktreeBranch: vi.fn(async () => {}),
 }));
 
 vi.mock('../src/services/worktree-slug-ai.js', () => ({
@@ -433,7 +434,7 @@ import { join } from 'node:path';
 import { codexHome } from '../src/services/codex-paths.js';
 import { scanMultipleProjects } from '../src/services/project-scanner.js';
 import { repoPickerScanOptions } from '../src/global-config.js';
-import { createRepoWorktree } from '../src/services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch } from '../src/services/git-worktree.js';
 import { discoverAdoptableSessions } from '../src/core/session-discovery.js';
 import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
 import { discoverSlashCommandsForAdapter } from '../src/core/command-discovery.js';
@@ -1702,6 +1703,53 @@ describe('handleCommand', () => {
       });
     });
 
+    it('does not push when an invalid codex-app + riff pair resolves to the local default', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string = LARK_APP_ID) => ({
+        botName: 'Codex App',
+        config: {
+          larkAppId: id,
+          larkAppSecret: 'secret-1',
+          cliId: 'codex-app',
+          backendType: 'riff',
+          workingDir: '~/projects',
+          workingDirs: ['~/projects'],
+        },
+      })) as any);
+      const ds = makeDaemonSession({ pendingRepo: false });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, SCAN as any);
+      vi.mocked(createRepoWorktree).mockResolvedValue(CREATION);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo wt 1'), deps, LARK_APP_ID);
+
+      expect(pushWorktreeBranch).not.toHaveBeenCalled();
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    });
+
+    it('pushes when a Riff CLI with a stale local backend resolves back to Riff', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string = LARK_APP_ID) => ({
+        botName: 'Riff',
+        config: {
+          larkAppId: id,
+          larkAppSecret: 'secret-1',
+          cliId: 'riff',
+          backendType: 'pty',
+          workingDir: '~/projects',
+          workingDirs: ['~/projects'],
+        },
+      })) as any);
+      const ds = makeDaemonSession({ pendingRepo: false });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, SCAN as any);
+      vi.mocked(createRepoWorktree).mockResolvedValue(CREATION);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo wt 1'), deps, LARK_APP_ID);
+
+      expect(pushWorktreeBranch).toHaveBeenCalledOnce();
+      expect(pushWorktreeBranch).toHaveBeenCalledWith(CREATION.path, CREATION.branch);
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    });
+
     it('holds the in-flight lock through the created-notice reply (post-git window)', async () => {
       const ds = makeDaemonSession({ pendingRepo: false });
       const deps = makeDeps(ds);
@@ -1857,6 +1905,42 @@ describe('handleCommand', () => {
       expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][11]).toMatchObject({ whiteboardId: 'wb_test' });
       expect(forkWorker).toHaveBeenCalledWith(ds, { content: 'WRAPPED:帮我看看这个 bug' });
       expect(ds.pendingRepo).toBe(false);
+    });
+
+    it('forwards the pending substitute trigger and complete Codex App sidecar', async () => {
+      mockCodexAppBot();
+      const substituteTrigger = {
+        target: { userId: 'u_configured' },
+        observedMention: { name: 'Observed Person', userId: 'u_configured' },
+        disclosure: 'prefix' as const,
+      };
+      const codexAppInput = {
+        text: '帮我看看这个 bug',
+        additionalContext: {
+          botmux_substitute_policy: { kind: 'application' as const, value: 'fixed policy' },
+          botmux_substitute_target: { kind: 'untrusted' as const, value: 'observed identity' },
+        },
+      };
+      vi.mocked(buildNewTopicCliInput).mockReturnValueOnce({ content: 'WRAPPED:clean', codexAppInput });
+      const ds = makeDaemonSession({
+        larkAppId: CODEX_APP_ID,
+        session: makeSession({ cliId: 'codex-app' }),
+        pendingRepo: true,
+        pendingPrompt: '帮我看看这个 bug',
+        pendingSubstituteTrigger: substituteTrigger,
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, CODEX_APP_ID);
+
+      expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![11]).toEqual(expect.objectContaining({
+        substituteTrigger,
+      }));
+      expect(forkWorker).toHaveBeenCalledWith(ds, {
+        content: 'WRAPPED:clean',
+        codexAppInput,
+      });
+      expect(ds.pendingSubstituteTrigger).toBeUndefined();
     });
 
     it('raw-input cold start boots idle and leaves pendingRawInput for prompt_ready', async () => {

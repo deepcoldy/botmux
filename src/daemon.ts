@@ -2328,6 +2328,9 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
   if (sub.workingDir && (!ds.worker || ds.worker.killed)) {
     ds.workingDir = sub.workingDir;
     ds.session.workingDir = sub.workingDir;
+    // An explicit doc-watch cwd replaces the previous repo selection. Keeping
+    // a multi-Riff stamp would make the cold refork ignore this new directory.
+    ds.session.riffRepoDirs = undefined;
   }
 
   if (ds.worker && !ds.worker.killed) {
@@ -7909,10 +7912,11 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
       sender: await getThreadSender(),
+      substituteTrigger,
       codexAppText: reforkCodexApp.text,
       codexAppMessageContext: reforkCodexApp.messageContext,
     });
-    await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId);
+    await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
     forkWorker(ds, wrappedInput, ds.hasHistory);

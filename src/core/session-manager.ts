@@ -370,23 +370,83 @@ export function renderBufferedSenderBlock(sender: ResolvedSender | undefined, cl
   return note ? `${tag}\n${note}` : tag;
 }
 
-function renderSubstituteTrigger(trigger?: SubstituteTrigger): string {
-  if (!trigger) return '';
-  const attrs: string[] = [];
-  if (trigger.target.name) attrs.push(`name="${xmlEscape(trigger.target.name)}"`);
-  if (trigger.target.openId) attrs.push(`open_id="${xmlEscape(trigger.target.openId)}"`);
-  if (trigger.target.userId) attrs.push(`user_id="${xmlEscape(trigger.target.userId)}"`);
-  if (trigger.target.unionId) attrs.push(`union_id="${xmlEscape(trigger.target.unionId)}"`);
-  const disclosure = trigger.disclosure ?? 'prefix';
-  const instruction = disclosure === 'none'
+function substituteInstruction(disclosure: NonNullable<SubstituteTrigger['disclosure']>): string {
+  return disclosure === 'none'
     ? 'This turn was triggered by a configured substitute target mention. Answer on behalf of that target when appropriate.'
     : 'This turn was triggered by a configured substitute target mention. Answer on behalf of that target and clearly disclose that you are answering for them.';
+}
+
+function renderSubstituteIdentity(
+  tag: 'target' | 'configured_target' | 'observed_mention',
+  identity: SubstituteTrigger['target'] | undefined,
+): string {
+  if (!identity) return '';
+  const attrs: string[] = [];
+  if (identity.name) attrs.push(`name="${xmlEscape(identity.name)}"`);
+  if (identity.openId) attrs.push(`open_id="${xmlEscape(identity.openId)}"`);
+  if (identity.userId) attrs.push(`user_id="${xmlEscape(identity.userId)}"`);
+  if (identity.unionId) attrs.push(`union_id="${xmlEscape(identity.unionId)}"`);
+  return attrs.length > 0 ? `<${tag} ${attrs.join(' ')} />` : `<${tag} />`;
+}
+
+/** Preserve the pre-clean-input legacy schema exactly: one effective target,
+ * with configured fields taking precedence and event fields only filling
+ * missing values. The structured Codex App sidecar keeps both sources below. */
+function renderLegacySubstituteTarget(trigger: SubstituteTrigger): string {
+  const observed = trigger.observedMention;
+  const target = {
+    name: trigger.target.name ?? observed?.name,
+    openId: trigger.target.openId ?? observed?.openId,
+    userId: trigger.target.userId ?? observed?.userId,
+    unionId: trigger.target.unionId ?? observed?.unionId,
+  };
+  const attrs: string[] = [];
+  if (target.name) attrs.push(`name="${xmlEscape(target.name)}"`);
+  if (target.openId) attrs.push(`open_id="${xmlEscape(target.openId)}"`);
+  if (target.userId) attrs.push(`user_id="${xmlEscape(target.userId)}"`);
+  if (target.unionId) attrs.push(`union_id="${xmlEscape(target.unionId)}"`);
+  return `<target ${attrs.join(' ')} />`;
+}
+
+/** Legacy prompt envelope. This whole string remains user-role input for the
+ * terminal CLIs; Codex App uses the two trust-separated renderers below. */
+function renderSubstituteTrigger(trigger?: SubstituteTrigger): string {
+  if (!trigger) return '';
+  const disclosure = trigger.disclosure ?? 'prefix';
   return [
     '<substitute_trigger>',
-    `  <target ${attrs.join(' ')} />`,
+    `  ${renderLegacySubstituteTarget(trigger)}`,
     `  <disclosure>${xmlEscape(disclosure)}</disclosure>`,
-    `  <instruction>${xmlEscape(instruction)}</instruction>`,
+    `  <instruction>${xmlEscape(substituteInstruction(disclosure))}</instruction>`,
     '</substitute_trigger>',
+  ].join('\n');
+}
+
+/** Botmux-owned policy only. No configured profile or event field may enter
+ * this block because Codex App promotes it to developer-role context. */
+function renderSubstitutePolicy(trigger?: SubstituteTrigger): string {
+  if (!trigger) return '';
+  const disclosure = trigger.disclosure ?? 'prefix';
+  return [
+    '<substitute_policy>',
+    '  <match>configured_target_mention</match>',
+    `  <disclosure>${disclosure}</disclosure>`,
+    `  <instruction>${substituteInstruction(disclosure)}</instruction>`,
+    '</substitute_policy>',
+  ].join('\n');
+}
+
+/** All identity metadata is untrusted, regardless of whether it came from a
+ * saved Lark profile or the current event. Keep the two sources distinct so a
+ * matching user_id cannot make conflicting observed IDs look canonical. */
+function renderSubstituteTarget(trigger?: SubstituteTrigger): string {
+  if (!trigger) return '';
+  const observedMention = renderSubstituteIdentity('observed_mention', trigger.observedMention);
+  return [
+    '<substitute_target>',
+    `  ${renderSubstituteIdentity('configured_target', trigger.target)}`,
+    ...(observedMention ? [`  ${observedMention}`] : []),
+    '</substitute_target>',
   ].join('\n');
 }
 
@@ -525,7 +585,8 @@ function buildCodexAppTurnInput(opts: {
   roleBlock?: string;
   whiteboardBlock?: string;
   senderBlock?: string;
-  substituteBlock?: string;
+  substitutePolicyBlock?: string;
+  substituteTargetBlock?: string;
   attachmentBlock?: string;
   mentionBlock?: string;
   availableBotsBlock?: string;
@@ -538,7 +599,8 @@ function buildCodexAppTurnInput(opts: {
   addCodexAppContext(additionalContext, 'botmux_role', opts.roleBlock ?? '', 'application');
   addCodexAppContext(additionalContext, 'botmux_whiteboard', opts.whiteboardBlock ?? '', 'application');
   addCodexAppContext(additionalContext, 'botmux_sender', opts.senderBlock ?? '', 'untrusted');
-  addCodexAppContext(additionalContext, 'botmux_substitute_trigger', opts.substituteBlock ?? '', 'application');
+  addCodexAppContext(additionalContext, 'botmux_substitute_policy', opts.substitutePolicyBlock ?? '', 'application');
+  addCodexAppContext(additionalContext, 'botmux_substitute_target', opts.substituteTargetBlock ?? '', 'untrusted');
   addCodexAppContext(additionalContext, 'botmux_attachments', opts.attachmentBlock ?? '', 'untrusted');
   addCodexAppContext(additionalContext, 'botmux_mentions', opts.mentionBlock ?? '', 'untrusted');
   addCodexAppContext(additionalContext, 'botmux_available_bots', opts.availableBotsBlock ?? '', 'untrusted');
@@ -708,7 +770,8 @@ export function buildNewTopicCliInput(
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const senderBlock = renderSenderTag(sender);
-  const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
+  const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
+  const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
   const attachmentBlock = formatAttachmentsHint(attachments, locale);
   const mentionBlock = renderMentionBlock(mentions);
   const availableBotsBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
@@ -719,7 +782,8 @@ export function buildNewTopicCliInput(
       roleBlock,
       whiteboardBlock,
       senderBlock,
-      substituteBlock,
+      substitutePolicyBlock,
+      substituteTargetBlock,
       attachmentBlock,
       mentionBlock,
       availableBotsBlock,
@@ -796,7 +860,8 @@ export function buildFollowUpCliInput(
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts.whiteboardId });
   const senderBlock = renderSenderTag(opts.sender);
-  const substituteBlock = renderSubstituteTrigger(opts.substituteTrigger);
+  const substitutePolicyBlock = renderSubstitutePolicy(opts.substituteTrigger);
+  const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
   const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale);
   const mentionBlock = renderMentionBlock(opts.mentions);
   return {
@@ -806,7 +871,8 @@ export function buildFollowUpCliInput(
       roleBlock,
       whiteboardBlock,
       senderBlock,
-      substituteBlock,
+      substitutePolicyBlock,
+      substituteTargetBlock,
       attachmentBlock,
       mentionBlock,
       applicationContextBlock: opts.codexAppApplicationContext,
@@ -966,6 +1032,7 @@ export function buildReforkCliInput(
     selfMention?: { name?: string | null; openId?: string | null };
     locale?: Locale;
     sender?: ResolvedSender;
+    substituteTrigger?: SubstituteTrigger;
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
@@ -993,6 +1060,7 @@ export function buildReforkCliInput(
     larkAppId: ds.larkAppId,
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
+    substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
     codexAppMessageContext: opts?.codexAppMessageContext,

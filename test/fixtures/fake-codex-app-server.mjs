@@ -103,4 +103,3 @@ process.stdin.on('data', chunk => {
     handle(JSON.parse(line));
   }
 });
-
