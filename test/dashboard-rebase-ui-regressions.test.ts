@@ -32,6 +32,8 @@ describe('dashboard master feature integration', () => {
     expect(page).toContain('<SubstituteModeSection bot={bot} patchBot={patchBot} />');
     expect(page).toContain('/substitute-mode`');
     expect(page).toContain('dataAction="toggle-substitute-mode"');
+    expect(page).toContain('dataAction="toggle-substitute-topic-groups"');
+    expect(page).toContain('dataAction="toggle-substitute-topic-active"');
     expect(page).toContain('data-input="substituteTargets"');
     expect(page).toContain('data-action="add-substitute-target"');
     expect(page).toContain('data-action="remove-substitute-target"');

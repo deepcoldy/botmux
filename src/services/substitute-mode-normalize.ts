@@ -44,5 +44,8 @@ export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | un
     enabled,
     targets,
     disclosure: rec.disclosure === 'none' ? 'none' : 'prefix',
+    // 话题群相关开关都是「显式 false 才关」——缺省（旧配置 / 旧客户端 PUT）落在开。
+    topicGroups: rec.topicGroups !== false,
+    topicActiveSessionTrigger: rec.topicActiveSessionTrigger !== false,
   };
 }

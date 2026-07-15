@@ -1887,6 +1887,9 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
   const initial = props.bot.substituteMode ?? null;
   const [enabled, setEnabled] = useState(initial?.enabled === true);
   const [disclosure, setDisclosure] = useState<'prefix' | 'none'>(initial?.disclosure === 'none' ? 'none' : 'prefix');
+  // 话题群相关开关缺省开：只有显式 false 才是关（与 normalize 语义一致）。
+  const [topicGroups, setTopicGroups] = useState(initial?.topicGroups !== false);
+  const [topicActiveSessionTrigger, setTopicActiveSessionTrigger] = useState(initial?.topicActiveSessionTrigger !== false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
   const targetSequence = useRef(0);
@@ -1917,11 +1920,13 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
     const next = props.bot.substituteMode ?? null;
     setEnabled(next?.enabled === true);
     setDisclosure(next?.disclosure === 'none' ? 'none' : 'prefix');
+    setTopicGroups(next?.topicGroups !== false);
+    setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
     const targets = next?.targets ?? [];
     setTargetRows(targets.length ? targets.map(target => makeTargetDraft(target)) : [makeTargetDraft()]);
   }, [props.bot.larkAppId, props.bot.substituteMode]);
 
-  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; disclosure?: 'prefix' | 'none' }): Promise<void> {
+  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; disclosure?: 'prefix' | 'none'; topicGroups?: boolean; topicActiveSessionTrigger?: boolean }): Promise<void> {
     setBusy(true);
     setStatus(null);
     try {
@@ -1939,6 +1944,8 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
           .filter(Boolean);
         setEnabled(next?.enabled === true);
         setDisclosure(next?.disclosure === 'none' ? 'none' : 'prefix');
+        setTopicGroups(next?.topicGroups !== false);
+        setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
         if (resolution.length) {
           skipModeSync.current = true;
           setTargetRows(rows => {
@@ -1998,7 +2005,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       setStatus({ text: `✗ ${tr('botDefaults.substituteTargetsInvalid')}` });
       return;
     }
-    void save({ enabled, targets, disclosure });
+    void save({ enabled, targets, disclosure, topicGroups, topicActiveSessionTrigger });
   }
 
   const disclosureOptions: DropdownFieldOption<'prefix' | 'none'>[] = [
@@ -2016,6 +2023,22 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         title={tr('botDefaults.substituteEnabled')}
         help={tr('botDefaults.substituteHelp')}
         onChange={setEnabled}
+      />
+      <ToggleRow
+        checked={topicGroups}
+        disabled={busy}
+        dataAction="toggle-substitute-topic-groups"
+        title={tr('botDefaults.substituteTopicGroups')}
+        help={tr('botDefaults.substituteTopicGroupsHelp')}
+        onChange={setTopicGroups}
+      />
+      <ToggleRow
+        checked={topicActiveSessionTrigger}
+        disabled={busy || !topicGroups}
+        dataAction="toggle-substitute-topic-active"
+        title={tr('botDefaults.substituteTopicActive')}
+        help={tr('botDefaults.substituteTopicActiveHelp')}
+        onChange={setTopicActiveSessionTrigger}
       />
       <div className="bd-row">
         <div className="bd-field">

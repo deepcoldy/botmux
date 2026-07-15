@@ -158,6 +158,10 @@ beforeEach(() => {
   mockListThreadMessages.mockReset().mockResolvedValue([]);
   mockGetMessageDetail.mockReset().mockResolvedValue({ items: [] });
   mockIsSubstituteEnabledForChat.mockReset().mockReturnValue(true);
+  // Generic tests should not accidentally enter the sole-user免@ path. Tests
+  // that exercise 1v1 behavior opt in explicitly, so execution order cannot
+  // leak one scenario's group shape into the next.
+  mockGetChatInfo.mockReset().mockResolvedValue({ userCount: 3, botCount: 1 });
 });
 
 type TestMention = {
@@ -191,6 +195,8 @@ function setupBotState(opts?: {
 	    enabled: boolean;
 	    targets: Array<{ openId?: string; userId?: string; unionId?: string; name?: string }>;
 	    disclosure?: 'prefix' | 'none';
+	    topicGroups?: boolean;
+	    topicActiveSessionTrigger?: boolean;
 	  };
 	}) {
   mockGetBot.mockReturnValue({
@@ -1692,6 +1698,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     // User message in a thread where bot owns session, sole bot in chat
     handlers.isSessionOwner.mockReturnValue(true);
     mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
 
     await capturedHandlers['im.message.receive_v1'](event);
     await flushEventWork();
@@ -2264,6 +2271,232 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       content: JSON.stringify({ text: '@Sub Person help with this' }),
       messageId: 'msg-substitute-off',
       chatId: 'chat-substitute-off',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('substituteMode: 话题群 @substitute in a topic without a session spawns the topic session (thread-scope, substituteTrigger rides)', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+        disclosure: 'prefix',
+      },
+    });
+    mockGetChatMode.mockResolvedValue('topic');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person help with this' }),
+      rootId: 'topic-root-sub-1',
+      threadId: 'topic-root-sub-1',
+      messageId: 'msg-substitute-topic-new',
+      chatId: 'chat-topic-sub-1',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'topic-root-sub-1',
+      larkAppId: MY_APP_ID,
+      substituteTrigger: expect.objectContaining({
+        target: expect.objectContaining({ openId: 'ou_sub' }),
+        disclosure: 'prefix',
+      }),
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('substituteMode: 话题群 @substitute in a topic WITH an active session injects the substitute turn (default on)', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+      },
+    });
+    mockGetChatMode.mockResolvedValue('topic');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'topic-root-sub-2');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person can you take a look' }),
+      rootId: 'topic-root-sub-2',
+      threadId: 'topic-root-sub-2',
+      messageId: 'msg-substitute-topic-active',
+      chatId: 'chat-topic-sub-2',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'topic-root-sub-2',
+      substituteTrigger: expect.objectContaining({
+        target: expect.objectContaining({ openId: 'ou_sub' }),
+      }),
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('substituteMode: 话题群 topicActiveSessionTrigger=false keeps the original back-off in owned topics', async () => {
+    // @了别人=转交别人：关掉「活跃话题也触发」后，替身触发不再抢会话，
+    // 消息落回 mentionsAnotherMember 让路 → 双 handler 都不该被调。
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+        topicActiveSessionTrigger: false,
+      },
+    });
+    mockGetChatMode.mockResolvedValue('topic');
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'topic-root-sub-3');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person can you take a look' }),
+      rootId: 'topic-root-sub-3',
+      threadId: 'topic-root-sub-3',
+      messageId: 'msg-substitute-topic-optout',
+      chatId: 'chat-topic-sub-3',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('substituteMode: topicActiveSessionTrigger=false also backs off under mentionMode=never', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'never',
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+        topicActiveSessionTrigger: false,
+      },
+    });
+    mockGetChatMode.mockResolvedValue('topic');
+    mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'topic-root-sub-never');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person can you take a look' }),
+      rootId: 'topic-root-sub-never',
+      threadId: 'topic-root-sub-never',
+      messageId: 'msg-substitute-topic-optout-never',
+      chatId: 'chat-topic-sub-never',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('substituteMode: 话题群 topicActiveSessionTrigger=false still triggers in topics WITHOUT a session', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+        topicActiveSessionTrigger: false,
+      },
+    });
+    mockGetChatMode.mockResolvedValue('topic');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person help with this' }),
+      rootId: 'topic-root-sub-4',
+      threadId: 'topic-root-sub-4',
+      messageId: 'msg-substitute-topic-nosession',
+      chatId: 'chat-topic-sub-4',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'topic-root-sub-4',
+      substituteTrigger: expect.objectContaining({
+        target: expect.objectContaining({ openId: 'ou_sub' }),
+      }),
+    }));
+  });
+
+  it('substituteMode: 话题群 topicGroups=false disables the topic-group trigger entirely', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+        topicGroups: false,
+      },
+    });
+    mockGetChatMode.mockResolvedValue('topic');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person help with this' }),
+      rootId: 'topic-root-sub-5',
+      threadId: 'topic-root-sub-5',
+      messageId: 'msg-substitute-topic-disabled',
+      chatId: 'chat-topic-sub-5',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('substituteMode: 话题群 per-chat /substitute off disables the topic trigger too', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+      },
+    });
+    mockIsSubstituteEnabledForChat.mockReturnValue(false);
+    mockGetChatMode.mockResolvedValue('topic');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person help with this' }),
+      rootId: 'topic-root-sub-6',
+      threadId: 'topic-root-sub-6',
+      messageId: 'msg-substitute-topic-chatoff',
+      chatId: 'chat-topic-sub-6',
       chatType: 'group',
       mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
     });

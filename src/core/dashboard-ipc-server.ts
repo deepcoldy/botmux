@@ -1870,6 +1870,9 @@ ipcRoute('PUT', '/api/bot-substitute-mode', async (req, res) => {
     enabled: rec.enabled === true,
     targets,
     disclosure: rec.disclosure === 'none' ? 'none' : 'prefix',
+    // 话题群开关：显式 false 才关（旧客户端不带字段 → normalize 缺省开）。
+    topicGroups: rec.topicGroups,
+    topicActiveSessionTrigger: rec.topicActiveSessionTrigger,
   });
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason, resolution });
   jsonRes(res, 200, { ok: true, substituteMode: r.substituteMode, resolution });

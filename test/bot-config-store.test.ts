@@ -254,6 +254,8 @@ describe('bot-config store', () => {
     expect(enabled.substituteMode).toEqual({
       enabled: true,
       disclosure: 'none',
+      topicGroups: true,
+      topicActiveSessionTrigger: true,
       targets: [
         { userId: 'u_target', name: 'Target User' },
         { openId: 'ou_target', email: 'target@example.com' },
@@ -264,6 +266,8 @@ describe('bot-config store', () => {
     expect(disabled.substituteMode).toEqual({
       enabled: false,
       disclosure: 'prefix',
+      topicGroups: true,
+      topicActiveSessionTrigger: true,
       targets: [{ userId: 'u_target' }],
     });
     // Enabled-but-unmatchable stays dropped: an ON state with no openId/userId/
