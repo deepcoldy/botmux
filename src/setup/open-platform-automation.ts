@@ -14,21 +14,42 @@ import qrcode from 'qrcode-terminal';
 import { VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 
 /**
- * All non-VC events that botmux dispatcher consumes. Must be included in every
- * event subscription update — the internal `/event/update` endpoint is
- * replacement-style, so omitting any of these would silently disable the
- * corresponding botmux capability (receiving messages, card actions, being
- * added to groups, doc comments, message reactions).
+ * All non-VC events (application identity) that the botmux dispatcher consumes.
+ * `card.action.trigger` is intentionally NOT here: the Open Platform treats it
+ * as a "callback" configured via `/developers/v1/callback/*`, see
+ * BOT_BASELINE_CALLBACKS.
  */
-export const BOT_BASELINE_EVENTS = [
+export const BOT_BASELINE_APP_EVENTS = [
   'im.message.receive_v1',
-  'card.action.trigger',
   'im.chat.member.bot.added_v1',
   'drive.file.comment_add_v1',
   'drive.notice.comment_add_v1',
   'im.message.reaction.created_v1',
   'im.message.reaction.deleted_v1',
 ] as const;
+
+/** 缺了它 daemon 完全收不到消息——回读确认失败时整个自动配置 fail-closed。 */
+export const BOT_CRITICAL_APP_EVENTS = ['im.message.receive_v1'] as const;
+
+/** 卡片交互回调。缺了它卡片按钮点击无响应,同样 fail-closed。 */
+export const BOT_BASELINE_CALLBACKS = ['card.action.trigger'] as const;
+
+/** 开放平台「使用长连接接收事件/回调」对应的 mode 值。 */
+export const LONG_CONNECTION_EVENT_MODE = 4;
+
+const VC_MEETING_EVENT_IDENTITY = {
+  'vc.bot.meeting_invited_v1': 'app',
+  'vc.bot.meeting_activity_v1': 'app',
+  'vc.bot.meeting_ended_v1': 'app',
+  'vc.meeting.participant_meeting_joined_v1': 'user',
+} as const satisfies Record<(typeof VC_MEETING_BOT_EVENTS)[number], 'app' | 'user'>;
+
+export const VC_MEETING_APP_EVENTS = VC_MEETING_BOT_EVENTS.filter(
+  eventName => VC_MEETING_EVENT_IDENTITY[eventName] === 'app',
+);
+export const VC_MEETING_USER_EVENTS = VC_MEETING_BOT_EVENTS.filter(
+  eventName => VC_MEETING_EVENT_IDENTITY[eventName] === 'user',
+);
 
 export const BOTMUX_REDIRECT_URL = 'http://127.0.0.1:9768/callback';
 const FEISHU_ACCOUNTS_ORIGIN = 'https://accounts.feishu.cn';
@@ -343,13 +364,101 @@ export function buildSafeSettingPayload(appId: string) {
   };
 }
 
-/** Build payload for subscribing events via the developer console internal API. */
-export function buildEventSubscriptionPayload(appId: string, events: string[]) {
+/**
+ * Build the incremental event-subscription payload used by the developer
+ * console (`updateEvent` in the console frontend bundle):
+ * `{clientId, operation:'add', events, appEvents, userEvents, eventMode}`。
+ * eventMode 必须回填读接口返回的当前值,事件按接收身份分桶(应用/用户)。
+ */
+export function buildEventSubscriptionPayload(
+  appId: string,
+  eventMode: number,
+  appEvents: string[],
+  userEvents: string[],
+  events: string[] = [],
+) {
   return {
     clientId: appId,
-    eventNames: events,
-    isDeveloperPanel: true,
+    operation: 'add',
+    events,
+    appEvents,
+    userEvents,
+    eventMode,
   };
+}
+
+/** 同款增量契约的回调版(console frontend `updateCallback`)。 */
+export function buildCallbackSubscriptionPayload(appId: string, callbackMode: number, callbacks: string[]) {
+  return {
+    clientId: appId,
+    operation: 'add',
+    callbacks,
+    callbackMode,
+  };
+}
+
+export interface OpenPlatformEventState {
+  eventMode?: number;
+  /** 所有已订阅事件(顶层 events + 应用/用户身份分组的并集)。 */
+  events: string[];
+  appEvents: string[];
+  userEvents: string[];
+}
+
+export interface OpenPlatformCallbackState {
+  callbackMode?: number;
+  callbacks: string[];
+}
+
+/** Extract the event mode and subscribed event ids from `/developers/v1/event/:clientId`. */
+export function extractOpenPlatformEventState(payload: unknown): OpenPlatformEventState {
+  const root = asRecord(payload);
+  const wrapped = asRecord(root.data);
+  const data = Object.keys(wrapped).length > 0 ? wrapped : root;
+  const appEvents = uniqueStrings([
+    ...extractEventIds(data.appEvents),
+    ...extractEventIdsFromDetails(data.appEventDetails),
+  ]);
+  const userEvents = uniqueStrings([
+    ...extractEventIds(data.userEvents),
+    ...extractEventIdsFromDetails(data.userEventDetails),
+  ]);
+  const genericEvents = uniqueStrings([
+    ...extractEventIds(data.events),
+    ...extractEventIdsFromDetails(data.eventDetails),
+  ]);
+  const eventMode = typeof data.eventMode === 'number' && Number.isFinite(data.eventMode)
+    ? data.eventMode
+    : undefined;
+  return {
+    eventMode,
+    events: uniqueStrings([...genericEvents, ...appEvents, ...userEvents]),
+    appEvents,
+    userEvents,
+  };
+}
+
+/** Extract the callback mode and subscribed callback ids from `/developers/v1/callback/:clientId`. */
+export function extractOpenPlatformCallbackState(payload: unknown): OpenPlatformCallbackState {
+  const root = asRecord(payload);
+  const wrapped = asRecord(root.data);
+  const data = Object.keys(wrapped).length > 0 ? wrapped : root;
+  const callbackMode = typeof data.callbackMode === 'number' && Number.isFinite(data.callbackMode)
+    ? data.callbackMode
+    : undefined;
+  return { callbackMode, callbacks: extractEventIds(data.callbacks) };
+}
+
+function extractEventIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return uniqueStrings(value
+    .map(item => typeof item === 'string' ? item : pickString(asRecord(item), ['id']))
+    .filter((item): item is string => Boolean(item)));
+}
+
+function extractEventIdsFromDetails(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return uniqueStrings(value.flatMap(group => extractEventIds(asRecord(group).items)));
 }
 
 export function buildAppVersionCreatePayload(appVersion: string, visibleMemberIds: string[] = []) {
@@ -602,47 +711,124 @@ export async function automateOpenPlatformSetup(
     };
   }
 
-  // Best-effort auto-subscribe VC meeting bot events. Non-fatal: if the endpoint
-  // doesn't exist or fails, the user can still add them manually in the console.
-  // We try multiple known internal API patterns since the console frontend
-  // endpoint varies by tenant/version.
-  // IMPORTANT: Always include BOT_BASELINE_EVENTS alongside VC events — the
-  // internal update endpoint is replacement-style, so sending only VC events
-  // would wipe im.message.receive_v1 / card.action.trigger and break messaging.
-  const allEvents = [...BOT_BASELINE_EVENTS, ...VC_MEETING_BOT_EVENTS];
-  let subscribedEventCount = 0;
-  let eventWarning: string | undefined;
-  const eventEndpoints = [
-    {
-      path: `/developers/v1/event/update/${options.appId}`,
-      body: buildEventSubscriptionPayload(options.appId, allEvents),
-    },
-    {
-      path: `/developers/v1/event/update/${options.appId}`,
-      body: {
-        clientId: options.appId,
-        eventNameList: allEvents,
-        isDeveloperPanel: true,
-      },
-    },
-    {
-      path: `/developers/v1/event_callback/update/${options.appId}`,
-      body: {
-        clientId: options.appId,
-        eventNames: allEvents,
-        isDeveloperPanel: true,
-      },
-    },
-  ];
-  for (const attempt of eventEndpoints) {
+  // 事件与回调都走 console 前端同款「增量」契约:先读现状 → operation:add 只补
+  // 缺失 → 回读确认。旧实现的 eventNames/eventNameList 参数和
+  // /event_callback/update 端点在开放平台并不存在,请求全部失败还被吞成
+  // warning——新建应用因此落地就没有任何事件订阅。核心项(im.message.receive_v1
+  // 事件 + card.action.trigger 回调)回读仍缺失时直接判失败:缺了它们 daemon
+  // 收不到消息/卡片点击,静默降级只会产出一个「建好了却不回话」的坏 bot。
+  const eventWarnings: string[] = [];
+  const readEventState = async () =>
+    extractOpenPlatformEventState(await postJson(`/developers/v1/event/${options.appId}`, { needEventDetail: true }));
+  const addEvents = async (appEvents: string[], userEvents: string[], eventMode: number) => {
+    await postJson(
+      `/developers/v1/event/update/${options.appId}`,
+      buildEventSubscriptionPayload(options.appId, eventMode, appEvents, userEvents),
+    );
+  };
+
+  let eventState: OpenPlatformEventState | undefined;
+  try {
+    eventState = await readEventState();
+  } catch (err: any) {
+    eventWarnings.push(`读取当前事件订阅失败: ${safeErrorMessage(err)}`);
+  }
+  const hasEvent = (name: string) => Boolean(eventState?.events.includes(name));
+  const wantedAppEvents = [...BOT_BASELINE_APP_EVENTS, ...VC_MEETING_APP_EVENTS];
+  const missingAppEvents = wantedAppEvents.filter(name => !hasEvent(name));
+  const missingUserEvents = VC_MEETING_USER_EVENTS.filter(name => !hasEvent(name));
+  if (missingAppEvents.length > 0 || missingUserEvents.length > 0) {
+    const eventMode = eventState?.eventMode ?? LONG_CONNECTION_EVENT_MODE;
     try {
-      await postJson(attempt.path, attempt.body);
-      subscribedEventCount = allEvents.length;
-      eventWarning = undefined;
-      break;
-    } catch (err: any) {
-      eventWarning = safeErrorMessage(err);
+      await addEvents(missingAppEvents, missingUserEvents, eventMode);
+    } catch {
+      // 部分租户个别事件依赖的权限不可授予会拒掉整批——逐个补,别让长尾事件拖垮核心事件
+      for (const name of missingAppEvents) {
+        try {
+          await addEvents([name], [], eventMode);
+        } catch (err: any) {
+          eventWarnings.push(`订阅事件 ${name} 失败: ${safeErrorMessage(err)}`);
+        }
+      }
+      for (const name of missingUserEvents) {
+        try {
+          await addEvents([], [name], eventMode);
+        } catch (err: any) {
+          eventWarnings.push(`订阅事件 ${name} 失败: ${safeErrorMessage(err)}`);
+        }
+      }
     }
+    try {
+      eventState = await readEventState();
+    } catch (err: any) {
+      eventWarnings.push(`回读事件订阅失败: ${safeErrorMessage(err)}`);
+    }
+  }
+  const missingBaselineEvents = BOT_BASELINE_APP_EVENTS.filter(name => !hasEvent(name));
+  if (missingBaselineEvents.length > 0) {
+    eventWarnings.push(`基础事件未确认订阅: ${missingBaselineEvents.join(', ')}`);
+  }
+
+  // 卡片回调(card.action.trigger)在开放平台是「回调」不是「事件」,配置走
+  // /developers/v1/callback/*;回调接收方式独立于事件,需要单独切到长连接。
+  const readCallbackState = async () =>
+    extractOpenPlatformCallbackState(await postJson(`/developers/v1/callback/${options.appId}`, {}));
+  let callbackState: OpenPlatformCallbackState | undefined;
+  try {
+    callbackState = await readCallbackState();
+  } catch (err: any) {
+    eventWarnings.push(`读取当前回调订阅失败: ${safeErrorMessage(err)}`);
+  }
+  if (callbackState && callbackState.callbackMode !== LONG_CONNECTION_EVENT_MODE) {
+    try {
+      await postJson(`/developers/v1/callback/switch/${options.appId}`, {
+        clientId: options.appId,
+        callbackMode: LONG_CONNECTION_EVENT_MODE,
+      });
+      callbackState = await readCallbackState();
+    } catch (err: any) {
+      eventWarnings.push(`切换回调长连接模式失败: ${safeErrorMessage(err)}`);
+    }
+  }
+  let missingCallbacks = BOT_BASELINE_CALLBACKS.filter(name => !callbackState?.callbacks.includes(name));
+  if (missingCallbacks.length > 0) {
+    try {
+      await postJson(
+        `/developers/v1/callback/update/${options.appId}`,
+        buildCallbackSubscriptionPayload(
+          options.appId,
+          callbackState?.callbackMode ?? LONG_CONNECTION_EVENT_MODE,
+          [...missingCallbacks],
+        ),
+      );
+    } catch (err: any) {
+      eventWarnings.push(`订阅卡片回调失败: ${safeErrorMessage(err)}`);
+    }
+    try {
+      callbackState = await readCallbackState();
+    } catch (err: any) {
+      eventWarnings.push(`回读回调订阅失败: ${safeErrorMessage(err)}`);
+    }
+    missingCallbacks = BOT_BASELINE_CALLBACKS.filter(name => !callbackState?.callbacks.includes(name));
+  }
+
+  const subscribedEventCount =
+    [...wantedAppEvents, ...VC_MEETING_USER_EVENTS].filter(name => hasEvent(name)).length
+    + BOT_BASELINE_CALLBACKS.filter(name => callbackState?.callbacks.includes(name)).length;
+  const eventWarning = eventWarnings.length > 0 ? eventWarnings.join('; ') : undefined;
+  const missingCritical = [
+    ...BOT_CRITICAL_APP_EVENTS.filter(name => !hasEvent(name)),
+    ...missingCallbacks,
+  ];
+  if (missingCritical.length > 0) {
+    return {
+      ok: false,
+      reason: 'api_error',
+      message: `核心事件/回调订阅未生效(${missingCritical.join(', ')}),机器人将收不到消息或卡片点击;请到开放平台「事件与回调」手动补齐后重试`,
+      sessionFile,
+      subscribedEventCount,
+      eventWarning,
+    };
   }
 
   try {
