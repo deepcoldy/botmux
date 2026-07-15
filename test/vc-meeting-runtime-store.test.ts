@@ -179,7 +179,7 @@ describe('vc meeting runtime store', () => {
       'cli_listener:m1': {
         schemaVersion: 1,
         larkAppId: 'cli_listener',
-        meeting: { id: 'm1', topic: 'Legacy meeting' },
+        meeting: { id: 'm1', meetingNo: 42, topic: 'Legacy meeting' },
         listenerChatId: 'oc_listener',
         consumerMode: 'agent',
         selectedAgentAppId: 'cli_agent',
@@ -686,8 +686,10 @@ describe('vc meeting runtime store', () => {
     }
   });
 
-  it('rejects invalid current v3 control fields before a sibling RMW can sanitize them', () => {
+  it('rejects invalid current v3 control and meeting fields before a sibling RMW can sanitize them', () => {
     const corruptions: Array<[string, (record: Record<string, any>) => void]> = [
+      ['meeting-number', record => { record.meeting.meetingNo = 42; }],
+      ['meeting-topic', record => { record.meeting.topic = { invalid: true }; }],
       ['consumer-mode', record => { record.consumerMode = 'agnt'; }],
       ['text-policy', record => { record.textOutputPolicy = 'yes'; }],
       ['voice-policy', record => { record.voiceOutputPolicy = false; }],
@@ -715,7 +717,7 @@ describe('vc meeting runtime store', () => {
       const quarantined = readdirSync(caseDir).find(file => file.startsWith(`${STORE_FILE}.corrupt.`));
       expect(quarantined, name).toBeDefined();
       const evidence = JSON.parse(readFileSync(join(caseDir, quarantined!), 'utf8')) as Record<string, unknown>;
-      expect(evidence, name).toHaveProperty('cli_a:m1');
+      expect(evidence, name).toEqual(malformed);
       expect(evidence, name).not.toHaveProperty('cli_b:m2');
     }
   });

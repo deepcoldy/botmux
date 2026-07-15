@@ -512,6 +512,14 @@ function hasValidCurrentOptionalFields(r: Record<string, unknown>): boolean {
   return true;
 }
 
+function hasValidCurrentMeetingFields(meeting: Record<string, unknown>): boolean {
+  for (const key of ['meetingNo', 'topic'] as const) {
+    if (hasOwnField(meeting, key)
+      && (typeof meeting[key] !== 'string' || !meeting[key].trim())) return false;
+  }
+  return true;
+}
+
 function normalizeRecord(value: unknown): VcMeetingRuntimeSessionRecord | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const r = value as Record<string, unknown>;
@@ -535,6 +543,7 @@ function normalizeRecord(value: unknown): VcMeetingRuntimeSessionRecord | undefi
     && (!isValidStoredTimestamp(r.createdAt)
       || !isValidStoredTimestamp(r.updatedAt)
       || !isValidStoredTimestamp(r.expiresAt)
+      || !hasValidCurrentMeetingFields(m)
       || !hasValidCurrentOptionalFields(r))) {
     return undefined;
   }
