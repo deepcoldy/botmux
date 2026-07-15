@@ -11,12 +11,27 @@ import {
 } from '../src/services/vc-meeting-send-policy.js';
 import {
   acceptVcMeetingDelivery,
+  abandonVcMeetingDeliveryStream,
   applyVcMeetingMemberProjection,
+  completeVcMeetingDelivery,
+  failVcMeetingDelivery,
   markVcMeetingDeliveryDispatched,
+  markVcMeetingDeliveryAmbiguous,
 } from '../src/services/vc-meeting-delivery-store.js';
+import type { VcMeetingImTurnOrigin } from '../src/types.js';
 
 let dir: string;
 const memberKey = { listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member', memberEpoch: 1 };
+const imOrigin: VcMeetingImTurnOrigin = {
+  ...memberKey,
+  agentAppId: 'agent',
+  ownerBootId: 'owner-boot',
+  ownerEpoch: 1,
+  membershipGeneration: 1,
+  sinkOwnerGeneration: 1,
+  receiverSessionId: 'receiver-session',
+  larkMessageId: 'om_current',
+};
 
 function seed(responseMode: 'silent' | 'listener_thread'): void {
   applyVcMeetingMemberProjection(dir, {
@@ -77,7 +92,78 @@ describe('evaluateVcMeetingManagedSend', () => {
     expect(evaluateVcMeetingManagedSend(dir, {
       receiverSessionId: 'receiver-session', receiverSession: true,
       turnId: 'delivery-key', dispatchAttempt: 1,
-    })).toEqual({ ok: true, kind: 'listener_thread' });
+    })).toEqual({
+      ok: true,
+      kind: 'listener_thread',
+      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting' },
+    });
+  });
+
+  it('allows a delayed final output only after successful completion', () => {
+    seed('listener_thread');
+    expect(completeVcMeetingDelivery(dir, {
+      ...memberKey,
+      deliveryKey: 'delivery-key',
+    }, {
+      workerGeneration: 1,
+      dispatchAttempt: 1,
+    })).toMatchObject({ ok: true, receipt: { status: 'completed' } });
+
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 1, allowTerminalReceipt: true,
+    })).toMatchObject({ ok: true, kind: 'listener_thread' });
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 1,
+    })).toMatchObject({ ok: false, errorCode: 'origin_mismatch' });
+  });
+
+  it('does not turn failed, ambiguous, or abandoned receipts into output authority', () => {
+    const transitions = [
+      {
+        status: 'failed_retryable',
+        apply: () => failVcMeetingDelivery(dir, {
+          ...memberKey,
+          deliveryKey: 'delivery-key',
+        }, { kind: 'retryable', workerGeneration: 1, dispatchAttempt: 1 }),
+      },
+      {
+        status: 'failed_terminal',
+        apply: () => failVcMeetingDelivery(dir, {
+          ...memberKey,
+          deliveryKey: 'delivery-key',
+        }, { kind: 'terminal', workerGeneration: 1, dispatchAttempt: 1 }),
+      },
+      {
+        status: 'ambiguous',
+        apply: () => markVcMeetingDeliveryAmbiguous(dir, {
+          ...memberKey,
+          deliveryKey: 'delivery-key',
+        }, { workerGeneration: 1, dispatchAttempt: 1 }),
+      },
+      {
+        status: 'abandoned',
+        apply: () => abandonVcMeetingDeliveryStream(dir, memberKey, { reason: 'operator' }),
+      },
+    ] as const;
+
+    for (const transition of transitions) {
+      const caseDir = mkdtempSync(join(tmpdir(), `vc-send-policy-${transition.status}-`));
+      const previousDir = dir;
+      dir = caseDir;
+      try {
+        seed('listener_thread');
+        expect(transition.apply()).toMatchObject({ ok: true });
+        expect(evaluateVcMeetingManagedSend(dir, {
+          receiverSessionId: 'receiver-session', receiverSession: true,
+          turnId: 'delivery-key', dispatchAttempt: 1, allowTerminalReceipt: true,
+        })).toMatchObject({ ok: false, errorCode: 'origin_mismatch' });
+      } finally {
+        dir = previousDir;
+        rmSync(caseDir, { recursive: true, force: true });
+      }
+    }
   });
 
   it('rejects stale attempts and missing detached receiver origins', () => {
@@ -92,13 +178,48 @@ describe('evaluateVcMeetingManagedSend', () => {
   });
 
   it('allows only the persisted current explicit IM turn without a dispatch attempt', () => {
+    seed('silent');
     expect(evaluateVcMeetingManagedSend(dir, {
       receiverSessionId: 'receiver-session', receiverSession: true,
-      turnId: 'om_current', currentImTurnId: 'om_current',
-    })).toEqual({ ok: true, kind: 'listener_thread' });
+      turnId: 'om_current', currentImTurnOrigin: imOrigin,
+    })).toEqual({
+      ok: true,
+      kind: 'listener_thread',
+      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting' },
+    });
     expect(evaluateVcMeetingManagedSend(dir, {
       receiverSessionId: 'receiver-session', receiverSession: true,
-      turnId: 'om_stale', currentImTurnId: 'om_current',
+      turnId: 'om_stale', currentImTurnOrigin: imOrigin,
+    })).toMatchObject({ ok: false, errorCode: 'origin_unproven' });
+  });
+
+  it('fences an explicit IM send after removal or ownership churn', () => {
+    seed('silent');
+    expect(applyVcMeetingMemberProjection(dir, {
+      ...memberKey,
+      ownerBootId: 'owner-boot', ownerEpoch: 1, agentAppId: 'agent', role: 'minutes',
+      membershipGeneration: 2, status: 'removed', responseMode: 'silent',
+      capabilities: ['listener.output.request', 'meeting.read'], ownedSinks: [],
+      sinkOwnerGeneration: 1, joinedAtIngestSeq: 0,
+      receiverSessionId: 'receiver-session', outputChatId: 'listener-chat',
+    })).toMatchObject({ ok: true });
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'om_current', currentImTurnOrigin: imOrigin,
+    })).toMatchObject({ ok: false, errorCode: 'origin_unproven' });
+
+    const epoch2 = { ...memberKey, memberEpoch: 2 };
+    expect(applyVcMeetingMemberProjection(dir, {
+      ...epoch2,
+      ownerBootId: 'owner-boot', ownerEpoch: 1, agentAppId: 'agent', role: 'minutes',
+      membershipGeneration: 3, status: 'active', responseMode: 'silent',
+      capabilities: ['listener.output.request', 'meeting.read'], ownedSinks: [],
+      sinkOwnerGeneration: 2, joinedAtIngestSeq: 0,
+      receiverSessionId: 'receiver-session', outputChatId: 'listener-chat',
+    })).toMatchObject({ ok: true });
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'om_current', currentImTurnOrigin: imOrigin,
     })).toMatchObject({ ok: false, errorCode: 'origin_unproven' });
   });
 
@@ -150,7 +271,11 @@ describe('evaluateVcMeetingManagedSend', () => {
     const liveOrigin = { capability: 'cap-current', turnId: 'delivery-key', dispatchAttempt: 1 };
     expect(evaluateVcMeetingManagedOriginClaim(dir, {
       receiverSessionId: 'receiver-session', liveOrigin, claimedCapability: 'cap-current',
-    })).toEqual({ ok: true, kind: 'listener_thread' });
+    })).toEqual({
+      ok: true,
+      kind: 'listener_thread',
+      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting' },
+    });
     expect(evaluateVcMeetingManagedOriginClaim(dir, {
       receiverSessionId: 'receiver-session', liveOrigin, claimedCapability: 'cap-old',
     })).toMatchObject({ ok: false, errorCode: 'origin_unproven' });
@@ -179,6 +304,7 @@ describe('evaluateVcMeetingManagedSend', () => {
         turnId: 'delivery-key',
         dispatchAttempt: 1,
         currentImTurnId: undefined,
+        currentImTurnOrigin: undefined,
       },
     });
     expect(verifyVcMeetingManagedOriginClaim({

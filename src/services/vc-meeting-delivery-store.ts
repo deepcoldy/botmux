@@ -122,6 +122,11 @@ export interface VcMeetingDeliveryReceiptRecord {
    * attempt loud (or the reverse). Older WIP records may omit this field;
    * readers fail closed to `silent`. */
   responseMode?: VcMeetingResponseMode;
+  /** Sink-owner authorization generation frozen when this logical delivery
+   * is first accepted. Projection updates must not let an old source turn
+   * inherit authority from a later owner generation. Older WIP receipts may
+   * omit this field; action creation fails closed for those records. */
+  sinkOwnerGeneration?: number;
   status: VcMeetingDeliveryReceiptStatus;
   /** 最近一次 dispatch 所在的 receiver boot；accept 时记录接收 boot。 */
   receiverBootId: string;
@@ -818,6 +823,7 @@ export function acceptVcMeetingDelivery(
       toSeq: input.toSeq,
       final: input.final === true,
       responseMode: input.responseMode,
+      sinkOwnerGeneration: projection.sinkOwnerGeneration,
       status: 'accepted',
       receiverBootId: input.receiverBootId,
       workerGeneration: 0,

@@ -118,4 +118,21 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
       APP, CHAT, '{"card":"A"}', 'interactive', 'vcp_reply_a', expect.anything(),
     );
   });
+
+  it('revalidates authority after a withdrawn quote before the plain fallback', async () => {
+    seedSharedSession({ rootMessageId: 'om_topic_b', turnId: 'turn-b', updatedAt: NOW });
+    mocks.replyMessage.mockRejectedValueOnce(new MessageWithdrawnError('om_human_a'));
+    const beforeQuoteFallback = vi.fn(async () => {
+      throw new Error('member removed while quote request was in flight');
+    });
+
+    await expect(sessionReply(CHAT, '{"card":"A"}', 'interactive', APP, 'turn-a', {
+      quoteMessageId: 'om_human_a',
+      uuid: 'vcp_reply_a',
+      beforeQuoteFallback,
+    })).rejects.toThrow('member removed while quote request was in flight');
+
+    expect(beforeQuoteFallback).toHaveBeenCalledTimes(1);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
 });

@@ -86,6 +86,7 @@ import {
   finishVcMeetingImReply,
   prepareVcMeetingImReply,
 } from '../services/vc-meeting-im-reply.js';
+import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-message-store.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
@@ -109,7 +110,11 @@ export interface WorkerPoolCallbacks {
     msgType?: string,
     larkAppId?: string,
     turnId?: string,
-    opts?: { uuid?: string; quoteMessageId?: string },
+    opts?: {
+      uuid?: string;
+      quoteMessageId?: string;
+      beforeQuoteFallback?: () => void | Promise<void>;
+    },
   ) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
@@ -2102,7 +2107,11 @@ function setupWorkerHandlers(
     content: string,
     msgType?: string,
     turnId?: string,
-    opts?: { uuid?: string; quoteMessageId?: string },
+    opts?: {
+      uuid?: string;
+      quoteMessageId?: string;
+      beforeQuoteFallback?: () => void | Promise<void>;
+    },
   ) => cb.sessionReply(
     sessionAnchorId(ds),
     content,
@@ -2127,7 +2136,7 @@ function setupWorkerHandlers(
       receiverSession: true,
       turnId,
       dispatchAttempt,
-      currentImTurnId: resolveVcMeetingImTurnOrigin(ds.session, turnId)?.larkMessageId,
+      currentImTurnOrigin: resolveVcMeetingImTurnOrigin(ds.session, turnId),
       allowTerminalReceipt: true,
     });
     return !decision.ok;
@@ -3198,7 +3207,11 @@ function deliverFinalOutput(
     content: string,
     msgType?: string,
     turnId?: string,
-    opts?: { uuid?: string; quoteMessageId?: string },
+    opts?: {
+      uuid?: string;
+      quoteMessageId?: string;
+      beforeQuoteFallback?: () => void | Promise<void>;
+    },
   ) => cb.sessionReply(
     sessionAnchorId(ds),
     content,
@@ -3257,6 +3270,47 @@ function deliverFinalOutput(
       const imOrigin = msg.dispatchAttempt === undefined
         ? resolveVcMeetingImTurnOrigin(ds.session, msg.turnId)
         : undefined;
+      const managedDecision = ds.session.vcMeetingReceiver
+        ? evaluateVcMeetingManagedSend(config.session.dataDir, {
+            receiverSessionId: ds.session.sessionId,
+            receiverSession: true,
+            turnId: msg.turnId,
+            dispatchAttempt: msg.dispatchAttempt,
+            currentImTurnOrigin: imOrigin,
+            allowTerminalReceipt: true,
+          })
+        : undefined;
+      if (managedDecision && !managedDecision.ok) {
+        ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+        logger.warn(
+          `[${t}] VC final_output lost current membership authority `
+          + `(${managedDecision.errorCode}) turn=${msg.turnId.substring(0, 8)}`,
+        );
+        return;
+      }
+      const revalidateManagedSend = (): void => {
+        if (!ds.session.vcMeetingReceiver) return;
+        const current = evaluateVcMeetingManagedSend(config.session.dataDir, {
+          receiverSessionId: ds.session.sessionId,
+          receiverSession: true,
+          turnId: msg.turnId,
+          dispatchAttempt: msg.dispatchAttempt,
+          currentImTurnOrigin: imOrigin,
+          allowTerminalReceipt: true,
+        });
+        if (!current.ok) {
+          throw new Error(
+            `VC final_output authority expired (${current.errorCode}): ${current.error}`,
+          );
+        }
+        if (current.kind !== 'listener_thread') {
+          throw new Error('VC final_output authority no longer targets the listener thread');
+        }
+      };
+      const listenerOutputOwner = managedDecision?.ok
+        && managedDecision.kind === 'listener_thread'
+        ? managedDecision.meetingOwner
+        : undefined;
       const recipientOpenId = imOrigin?.replyTargetSenderOpenId
         ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
@@ -3283,13 +3337,14 @@ function deliverFinalOutput(
             localHomeLinkMode,
           );
 
+      const proposedOutput = {
+        targetChatId: ds.chatId,
+        ...(imOrigin ? { quoteTargetId: imOrigin.larkMessageId } : {}),
+        msgType: 'interactive',
+        content: cardJson,
+      };
       const preparedImReply = imOrigin
-        ? prepareVcMeetingImReply(config.session.dataDir, imOrigin, {
-            targetChatId: ds.chatId,
-            quoteTargetId: imOrigin.larkMessageId,
-            msgType: 'interactive',
-            content: cardJson,
-          })
+        ? prepareVcMeetingImReply(config.session.dataDir, imOrigin, proposedOutput)
         : undefined;
       if (preparedImReply?.kind === 'conflict') {
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
@@ -3299,7 +3354,37 @@ function deliverFinalOutput(
         );
         return;
       }
+      const canonicalOutput = preparedImReply?.canonicalOutput ?? proposedOutput;
+      if (preparedImReply?.outputMismatch) {
+        logger.warn(
+          `[${t}] VC IM reply output_mismatch action=${preparedImReply.ref.actionId} `
+          + `turn=${msg.turnId}; reusing first canonical output`,
+        );
+      }
+      const recordPrimaryOutput = (messageId: string): void => {
+        if (!listenerOutputOwner) return;
+        try {
+          const recorded = recordVcMeetingListenerMessage(config.session.dataDir, {
+            ...listenerOutputOwner,
+            targetChatId: canonicalOutput.targetChatId,
+            messageId,
+          });
+          if (!recorded.ok) {
+            logger.warn(
+              `[${t}] VC listener-message index rejected message=${messageId} reason=${recorded.reason}`,
+            );
+          }
+        } catch (error) {
+          // Lark already accepted the primary message. Never enter the delivery
+          // retry loop solely because the auxiliary quote index failed.
+          logger.error(
+            `[${t}] VC listener-message index write failed after send: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      };
       if (preparedImReply?.kind === 'succeeded' && preparedImReply.messageId) {
+        recordPrimaryOutput(preparedImReply.messageId);
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(
           `[${t}] VC IM fallback replayed existing provider result `
@@ -3311,17 +3396,20 @@ function deliverFinalOutput(
       // Always deliver the answer as a fresh message — never PATCH a card in
       // place. message.patch is silent (no Feishu notification / unread), which
       // used to swallow the answer; a brand-new message always pings.
+      revalidateManagedSend();
       const messageId = await scopedReply(
-        cardJson,
-        'interactive',
+        canonicalOutput.content,
+        canonicalOutput.msgType,
         msg.turnId,
         preparedImReply
           ? {
               uuid: preparedImReply.providerKey,
-              quoteMessageId: imOrigin!.larkMessageId,
+              quoteMessageId: canonicalOutput.quoteTargetId,
+              beforeQuoteFallback: revalidateManagedSend,
             }
           : undefined,
       );
+      recordPrimaryOutput(messageId);
       if (preparedImReply?.kind === 'send' || preparedImReply?.kind === 'succeeded') {
         finishVcMeetingImReply(config.session.dataDir, preparedImReply.ref, messageId);
       }

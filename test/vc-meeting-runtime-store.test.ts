@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -551,12 +551,173 @@ describe('vc meeting runtime store', () => {
     }, 2_700)).toBeUndefined();
   });
 
-  it('warns and returns empty routes when the store json is corrupt', () => {
+  it('quarantines corrupt json and fails closed instead of reporting an empty store', () => {
     const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
     writeFileSync(join(dir, STORE_FILE), '{bad json', 'utf-8');
 
-    expect(listVcMeetingRuntimeSessions(dir, 'cli_a', 1_000)).toEqual([]);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('[vc-meeting-runtime-store] failed to read'));
+    expect(() => listVcMeetingRuntimeSessions(dir, 'cli_a', 1_000))
+      .toThrow(/runtime session store is corrupt/);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('corrupt runtime session store'));
+    expect(existsSync(join(dir, STORE_FILE))).toBe(false);
+    expect(readdirSync(dir).some(name => name.startsWith(`${STORE_FILE}.corrupt.`))).toBe(true);
+
+    expect(() => recordVcMeetingRuntimeSession(dir, {
+      larkAppId: 'cli_a',
+      meeting: { id: 'm1' },
+      listenerChatId: 'oc_a',
+    }, 2_000)).toThrow(/runtime session store has quarantined evidence/);
+  });
+
+  it('quarantines the whole runtime store when one entry is malformed and preserves sibling evidence', () => {
+    recordVcMeetingRuntimeSession(dir, {
+      larkAppId: 'cli_a', meeting: { id: 'm1' }, listenerChatId: 'oc_a',
+    }, 1_000);
+    recordVcMeetingRuntimeSession(dir, {
+      larkAppId: 'cli_b', meeting: { id: 'm2' }, listenerChatId: 'oc_b',
+    }, 2_000);
+    const fp = join(dir, STORE_FILE);
+    const malformed = JSON.parse(readFileSync(fp, 'utf8')) as Record<string, any>;
+    malformed['cli_a:m1'].listenerChatId = 42;
+    writeFileSync(fp, JSON.stringify(malformed), { mode: 0o600 });
+
+    expect(() => recordVcMeetingRuntimeSession(dir, {
+      larkAppId: 'cli_c', meeting: { id: 'm3' }, listenerChatId: 'oc_c',
+    }, 3_000)).toThrow(/runtime session store is corrupt/);
+    expect(existsSync(fp)).toBe(false);
+    const quarantined = readdirSync(dir).find(name => name.startsWith(`${STORE_FILE}.corrupt.`));
+    expect(quarantined).toBeDefined();
+    const evidence = JSON.parse(readFileSync(join(dir, quarantined!), 'utf8')) as Record<string, unknown>;
+    expect(evidence).toHaveProperty('cli_a:m1');
+    expect(evidence).toHaveProperty('cli_b:m2');
+    expect(evidence).not.toHaveProperty('cli_c:m3');
+  });
+
+  it('requires v2/v3 selectedAgents and preserves a corrupted multi-agent v3 store on RMW', () => {
+    recordVcMeetingRuntimeSession(dir, {
+      larkAppId: 'cli_a',
+      meeting: { id: 'm1' },
+      listenerChatId: 'oc_a',
+      consumerMode: 'agent',
+      selectedAgents: [{
+        profileId: 'minutes',
+        memberId: 'minutes_writer',
+        agentAppId: 'cli_minutes',
+        role: 'minutes_writer',
+        status: 'active',
+        responseMode: 'silent',
+        capabilities: ['meeting.read'],
+        ownedSinks: [],
+      }, {
+        profileId: 'actions',
+        memberId: 'actions_writer',
+        agentAppId: 'cli_actions',
+        role: 'actions_writer',
+        status: 'active',
+        responseMode: 'silent',
+        capabilities: ['meeting.read'],
+        ownedSinks: [],
+      }],
+    }, 1_000);
+    const fp = join(dir, STORE_FILE);
+    const malformed = JSON.parse(readFileSync(fp, 'utf8')) as Record<string, any>;
+    delete malformed['cli_a:m1'].selectedAgents;
+    writeFileSync(fp, JSON.stringify(malformed), { mode: 0o600 });
+
+    expect(() => recordVcMeetingRuntimeSession(dir, {
+      larkAppId: 'cli_b', meeting: { id: 'm2' }, listenerChatId: 'oc_b',
+    }, 2_000)).toThrow(/runtime session store is corrupt/);
+    expect(existsSync(fp)).toBe(false);
+    const quarantined = readdirSync(dir).find(name => name.startsWith(`${STORE_FILE}.corrupt.`));
+    expect(quarantined).toBeDefined();
+    const evidence = JSON.parse(readFileSync(join(dir, quarantined!), 'utf8')) as Record<string, any>;
+    expect(evidence['cli_a:m1']).not.toHaveProperty('selectedAgents');
+    expect(evidence).not.toHaveProperty('cli_b:m2');
+
+    const v2Dir = mkdtempSync(join(dir, 'v2-selection-'));
+    const v2Fp = join(v2Dir, STORE_FILE);
+    writeFileSync(v2Fp, JSON.stringify({
+      'cli_v2:m2': {
+        schemaVersion: 2,
+        larkAppId: 'cli_v2',
+        meeting: { id: 'm2' },
+        listenerChatId: 'oc_v2',
+        selectedAgentAppId: 'cli_legacy_alias',
+        createdAt: 1_000,
+        updatedAt: 1_000,
+        expiresAt: 100_000,
+      },
+    }), { mode: 0o600 });
+    expect(() => listVcMeetingRuntimeSessions(v2Dir, 'cli_v2', 2_000))
+      .toThrow(/runtime session store is corrupt/);
+    const v2Evidence = readdirSync(v2Dir).find(name => name.startsWith(`${STORE_FILE}.corrupt.`));
+    expect(v2Evidence).toBeDefined();
+    expect(JSON.parse(readFileSync(join(v2Dir, v2Evidence!), 'utf8'))['cli_v2:m2'])
+      .toHaveProperty('selectedAgentAppId', 'cli_legacy_alias');
+  });
+
+  it('requires all current v3 timestamps and never rewrites defaulted values over corrupt evidence', () => {
+    const corruptions: Array<[string, (record: Record<string, any>) => void]> = [
+      ['missing-created', record => { delete record.createdAt; }],
+      ['bad-created', record => { record.createdAt = 'bad'; }],
+      ['missing-updated', record => { delete record.updatedAt; }],
+      ['bad-updated', record => { record.updatedAt = -1; }],
+      ['missing-expires', record => { delete record.expiresAt; }],
+      ['bad-expires', record => { record.expiresAt = null; }],
+    ];
+
+    for (const [name, corrupt] of corruptions) {
+      const caseDir = mkdtempSync(join(dir, `${name}-`));
+      recordVcMeetingRuntimeSession(caseDir, {
+        larkAppId: 'cli_a', meeting: { id: 'm1' }, listenerChatId: 'oc_a',
+      }, 1_000);
+      const fp = join(caseDir, STORE_FILE);
+      const malformed = JSON.parse(readFileSync(fp, 'utf8')) as Record<string, any>;
+      corrupt(malformed['cli_a:m1']);
+      writeFileSync(fp, JSON.stringify(malformed), { mode: 0o600 });
+
+      expect(() => recordVcMeetingRuntimeSession(caseDir, {
+        larkAppId: 'cli_b', meeting: { id: 'm2' }, listenerChatId: 'oc_b',
+      }, 2_000), name).toThrow(/runtime session store is corrupt/);
+      const quarantined = readdirSync(caseDir).find(file => file.startsWith(`${STORE_FILE}.corrupt.`));
+      expect(quarantined, name).toBeDefined();
+      const evidence = JSON.parse(readFileSync(join(caseDir, quarantined!), 'utf8')) as Record<string, unknown>;
+      expect(evidence, name).toHaveProperty('cli_a:m1');
+      expect(evidence, name).not.toHaveProperty('cli_b:m2');
+    }
+  });
+
+  it('rejects invalid current v3 control fields before a sibling RMW can sanitize them', () => {
+    const corruptions: Array<[string, (record: Record<string, any>) => void]> = [
+      ['consumer-mode', record => { record.consumerMode = 'agnt'; }],
+      ['text-policy', record => { record.textOutputPolicy = 'yes'; }],
+      ['voice-policy', record => { record.voiceOutputPolicy = false; }],
+      ['close-phase', record => { record.consumerClosePhase = 'closed'; }],
+      ['finalization-deadline', record => { record.consumerFinalizationDeadlineAt = 'soon'; }],
+      ['resolution-deadline', record => { record.consumerCloseResolutionDeadlineAt = -1; }],
+      ['selection-deadline', record => { record.consumerSelectionExpiresAt = null; }],
+      ['instruction-open-ids', record => { record.temporaryInstructionOpenIds = ['ou_valid', 7]; }],
+      ['instruction-union-ids', record => { record.temporaryInstructionUnionIds = ['on_dup', 'on_dup']; }],
+    ];
+
+    for (const [name, corrupt] of corruptions) {
+      const caseDir = mkdtempSync(join(dir, `control-${name}-`));
+      recordVcMeetingRuntimeSession(caseDir, {
+        larkAppId: 'cli_a', meeting: { id: 'm1' }, listenerChatId: 'oc_a',
+      }, 1_000);
+      const fp = join(caseDir, STORE_FILE);
+      const malformed = JSON.parse(readFileSync(fp, 'utf8')) as Record<string, any>;
+      corrupt(malformed['cli_a:m1']);
+      writeFileSync(fp, JSON.stringify(malformed), { mode: 0o600 });
+
+      expect(() => recordVcMeetingRuntimeSession(caseDir, {
+        larkAppId: 'cli_b', meeting: { id: 'm2' }, listenerChatId: 'oc_b',
+      }, 2_000), name).toThrow(/runtime session store is corrupt/);
+      const quarantined = readdirSync(caseDir).find(file => file.startsWith(`${STORE_FILE}.corrupt.`));
+      expect(quarantined, name).toBeDefined();
+      const evidence = JSON.parse(readFileSync(join(caseDir, quarantined!), 'utf8')) as Record<string, unknown>;
+      expect(evidence, name).toHaveProperty('cli_a:m1');
+      expect(evidence, name).not.toHaveProperty('cli_b:m2');
+    }
   });
 
   it('creates no file for empty required fields', () => {
@@ -574,6 +735,59 @@ describe('vc meeting runtime store', () => {
 
     expect(hasVcMeetingEndedTombstone(dir, 'cli_a', 'm1', 1_200)).toBe(true);
     expect(hasVcMeetingEndedTombstone(dir, 'cli_a', 'm1', 1_600)).toBe(false);
+  });
+
+  it('quarantines a malformed shared tombstone store and prevents replacement', () => {
+    recordVcMeetingEndedTombstone(dir, { larkAppId: 'cli_a', meetingId: 'm1' }, 1_000);
+    recordVcMeetingEndedTombstone(dir, { larkAppId: 'cli_b', meetingId: 'm2' }, 1_100);
+    const fp = join(dir, TOMBSTONE_FILE);
+    const malformed = JSON.parse(readFileSync(fp, 'utf8')) as Record<string, any>;
+    malformed['cli_a:m1'].meetingId = '';
+    writeFileSync(fp, JSON.stringify(malformed), { mode: 0o600 });
+
+    expect(() => recordVcMeetingEndedTombstone(
+      dir,
+      { larkAppId: 'cli_c', meetingId: 'm3' },
+      1_200,
+    )).toThrow(/ended tombstone store is corrupt/);
+    expect(existsSync(fp)).toBe(false);
+    const quarantined = readdirSync(dir).find(name => name.startsWith(`${TOMBSTONE_FILE}.corrupt.`));
+    expect(quarantined).toBeDefined();
+    const evidence = JSON.parse(readFileSync(join(dir, quarantined!), 'utf8')) as Record<string, unknown>;
+    expect(evidence).toHaveProperty('cli_a:m1');
+    expect(evidence).toHaveProperty('cli_b:m2');
+    expect(evidence).not.toHaveProperty('cli_c:m3');
+    expect(() => hasVcMeetingEndedTombstone(dir, 'cli_b', 'm2', 1_300))
+      .toThrow(/ended tombstone store has quarantined evidence/);
+  });
+
+  it('requires current ended-tombstone timestamps and preserves malformed evidence', () => {
+    const corruptions: Array<[string, (record: Record<string, any>) => void]> = [
+      ['missing-ended', record => { delete record.endedAt; }],
+      ['bad-ended', record => { record.endedAt = 'bad'; }],
+      ['missing-expires', record => { delete record.expiresAt; }],
+      ['bad-expires', record => { record.expiresAt = -1; }],
+    ];
+
+    for (const [name, corrupt] of corruptions) {
+      const caseDir = mkdtempSync(join(dir, `tombstone-${name}-`));
+      recordVcMeetingEndedTombstone(caseDir, { larkAppId: 'cli_a', meetingId: 'm1' }, 1_000);
+      const fp = join(caseDir, TOMBSTONE_FILE);
+      const malformed = JSON.parse(readFileSync(fp, 'utf8')) as Record<string, any>;
+      corrupt(malformed['cli_a:m1']);
+      writeFileSync(fp, JSON.stringify(malformed), { mode: 0o600 });
+
+      expect(() => recordVcMeetingEndedTombstone(
+        caseDir,
+        { larkAppId: 'cli_b', meetingId: 'm2' },
+        2_000,
+      ), name).toThrow(/ended tombstone store is corrupt/);
+      const quarantined = readdirSync(caseDir).find(file => file.startsWith(`${TOMBSTONE_FILE}.corrupt.`));
+      expect(quarantined, name).toBeDefined();
+      const evidence = JSON.parse(readFileSync(join(caseDir, quarantined!), 'utf8')) as Record<string, unknown>;
+      expect(evidence, name).toHaveProperty('cli_a:m1');
+      expect(evidence, name).not.toHaveProperty('cli_b:m2');
+    }
   });
 
   it('preserves other daemon records across runtime and tombstone RMW operations', () => {

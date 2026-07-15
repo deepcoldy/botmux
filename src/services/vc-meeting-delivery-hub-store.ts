@@ -972,9 +972,13 @@ export function applyVcMeetingHubMemberProjection(
       && !isExactVcMeetingLegacyMemberIdentity(input)
       && (input.ownedSinks?.length ?? 0) > 0) {
       for (const [otherMemberId, otherState] of Object.entries(state.members)) {
+        // A higher epoch atomically supersedes this same logical member's old
+        // epoch. Requiring a separate remove first creates a crash window where
+        // restore cannot publish the successor at all. Other logical members
+        // still compete against the latest epoch and remain conflict-fenced.
+        if (otherMemberId === input.memberId) continue;
         const other = otherState.epochs[String(otherState.maxKnownEpoch)];
         if (!other || other.status === 'removed') continue;
-        if (otherMemberId === input.memberId && other.memberEpoch === input.memberEpoch) continue;
         const overlap = (input.ownedSinks ?? []).find(sink => other.ownedSinks?.includes(sink));
         if (overlap) {
           return {

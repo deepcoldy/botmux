@@ -346,6 +346,8 @@ import {
   requestVcMeetingManagedImAction,
   requestVcMeetingManagedAction,
   resolveVcMeetingManagedActionApproval,
+  type VcMeetingActionAuthorizationDecision,
+  type VcMeetingApprovalRevalidationContext,
   type VcMeetingApprovalPresentationPlan,
   type VcMeetingProviderExecutionPlan,
   type VcMeetingGenericApprovalPresentationPlan,
@@ -2326,7 +2328,11 @@ async function sessionReply(
   msgType: string = 'text',
   larkAppId?: string,
   turnId?: string,
-  opts?: { uuid?: string; quoteMessageId?: string },
+  opts?: {
+    uuid?: string;
+    quoteMessageId?: string;
+    beforeQuoteFallback?: () => void | Promise<void>;
+  },
 ): Promise<string> {
   let ds: DaemonSession | undefined;
   if (larkAppId) {
@@ -2373,6 +2379,7 @@ async function sessionReply(
         );
       } catch (err) {
         if (!(err instanceof MessageWithdrawnError)) throw err;
+        await opts.beforeQuoteFallback?.();
         logger.warn(
           `[routing] VC IM quote target withdrawn (${opts.quoteMessageId}); `
           + 'falling back to one stable-UUID chat message',
@@ -4046,7 +4053,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     );
     const decision = evaluateVcMeetingManagedOriginClaim(config.session.dataDir, {
       receiverSessionId: parsed.sessionId,
-      currentImTurnId: liveImOrigin?.larkMessageId,
+      currentImTurnOrigin: liveImOrigin,
       liveOrigin: askSession.managedTurnOrigin,
       claimedTurnId,
       claimedDispatchAttempt: claimedAttempt,
@@ -4385,7 +4392,7 @@ ipcRoute('POST', '/api/vc-meetings/action-request', async (req, res) => {
   );
   const verified = verifyVcMeetingManagedOriginClaim({
     receiverSessionId,
-    currentImTurnId: liveImOrigin?.larkMessageId,
+    currentImTurnOrigin: liveImOrigin,
     liveOrigin: ds.managedTurnOrigin,
     claimedCapability: typeof body.originCapability === 'string' ? body.originCapability : undefined,
     claimedTurnId: typeof body.originTurnId === 'string' ? body.originTurnId : undefined,
@@ -6754,7 +6761,7 @@ async function rejectVcMeetingOutputRequest(
           : { errorCode: `approval_card_${status}_without_provider_ack` }),
       });
     }
-    resolveVcMeetingManagedActionApproval(
+    await resolveVcMeetingManagedActionApproval(
       config.session.dataDir,
       managedRef,
       status === 'rejected' ? 'rejected' : 'expired',
@@ -6908,13 +6915,13 @@ async function presentVcMeetingManagedApproval(
   ok: false; error: string; action: VcMeetingActionRecord;
 }> {
   const listenerChatId = session.listenerChatId;
-  const terminalizeWithoutCard = (errorCode: string): void => {
+  const terminalizeWithoutCard = async (errorCode: string): Promise<void> => {
     finishVcMeetingManagedApprovalCard(config.session.dataDir, {
       ...vcMeetingManagedActionRef(action),
       status: 'failed',
       errorCode,
     });
-    resolveVcMeetingManagedActionApproval(
+    await resolveVcMeetingManagedActionApproval(
       config.session.dataDir,
       vcMeetingManagedActionRef(action),
       'expired',
@@ -6922,11 +6929,11 @@ async function presentVcMeetingManagedApproval(
     );
   };
   if (!listenerChatId) {
-    terminalizeWithoutCard('listener_chat_not_ready_before_card');
+    await terminalizeWithoutCard('listener_chat_not_ready_before_card');
     return { ok: false, error: 'listener chat is not ready', action };
   }
   if (session.pendingOutputRequests[plan.channel]) {
-    terminalizeWithoutCard('approval_channel_busy_before_card');
+    await terminalizeWithoutCard('approval_channel_busy_before_card');
     return { ok: false, error: `another ${plan.channel} approval is already pending`, action };
   }
   const req = vcMeetingManagedOutputRequest(action, plan, { approval: true, reason: plan.reason });
@@ -6987,6 +6994,72 @@ async function presentVcMeetingManagedApproval(
     logger.error(`[vc-action] approval card delivery ambiguous action=${action.actionId}: ${message}`);
     return { ok: true, status: 'pending', requestId: req.id, action };
   }
+}
+
+function revalidateVcMeetingManagedApproval(
+  { projection, sink, action }: VcMeetingApprovalRevalidationContext,
+): VcMeetingActionAuthorizationDecision {
+  if (sink !== 'meeting_text' && sink !== 'meeting_voice') {
+    return { kind: 'deny', reason: 'not_sink_owner' };
+  }
+  const current = vcMeetingSessions.get(
+    vcMeetingSessionKey(projection.listenerAppId, projection.meetingId),
+  );
+  if (!current) return { kind: 'deny', reason: 'listener_session_inactive' };
+  const close = getVcMeetingHubCloseState(config.session.dataDir, {
+    listenerAppId: projection.listenerAppId,
+    meetingId: projection.meetingId,
+  });
+  if (current.ended || current.consumerClosePhase || (close && close.phase !== 'active')) {
+    return { kind: 'deny', reason: 'meeting_phase_closed' };
+  }
+
+  const currentCfg = effectiveVcMeetingAgentConfig(projection.listenerAppId);
+  if (!currentCfg) return { kind: 'deny', reason: 'listener_session_inactive' };
+  if (current.consumerMode !== 'agent') return { kind: 'deny', reason: 'not_sink_owner' };
+  if (vcMeetingConsumerUsesProfiles(currentCfg)) {
+    const selected = current.selectedAgents.find(candidate =>
+      candidate.memberId === projection.memberId
+      && candidate.agentAppId === projection.agentAppId
+      && candidate.status === 'active');
+    if (!selected) return { kind: 'deny', reason: 'not_sink_owner' };
+    if (!(projection.capabilities ?? []).includes('meeting.output.request')) {
+      return { kind: 'deny', reason: 'capability_denied' };
+    }
+    if (!(projection.ownedSinks ?? []).includes(sink)) {
+      return { kind: 'deny', reason: 'not_sink_owner' };
+    }
+    const durable = vcMeetingLatestProfileMember(current, selected.memberId);
+    if (!durable
+      || durable.status !== 'active'
+      || durable.memberEpoch !== projection.memberEpoch
+      || durable.membershipGeneration !== projection.membershipGeneration
+      || durable.sinkOwnerGeneration !== projection.sinkOwnerGeneration) {
+      return { kind: 'deny', reason: 'not_sink_owner' };
+    }
+  } else if (current.selectedAgentAppId !== projection.agentAppId) {
+    return { kind: 'deny', reason: 'not_sink_owner' };
+  }
+
+  const channel = sink === 'meeting_voice' ? 'voice' : 'text';
+  if (channel === 'text' && !vcMeetingTextOutputAvailable()) {
+    return {
+      kind: 'deny',
+      reason: 'output_policy_denied',
+      detail: VC_MEETING_TEXT_OUTPUT_UNAVAILABLE,
+    };
+  }
+  const pending = current.pendingOutputRequests[channel];
+  if (!pending || pending.managedAction?.actionId !== action.actionId) {
+    return {
+      kind: 'deny',
+      reason: 'output_policy_denied',
+      detail: `the ${channel} approval is no longer current`,
+    };
+  }
+  const policy = vcMeetingOutputPolicyForChannel(current, channel);
+  if (policy === 'deny') return { kind: 'deny', reason: 'output_policy_denied' };
+  return policy === 'approval' ? { kind: 'approval' } : { kind: 'allow' };
 }
 
 async function submitVcMeetingManagedAction(input: {
@@ -7063,7 +7136,7 @@ async function submitVcMeetingManagedAction(input: {
           status: 'failed',
           errorCode: 'listener_session_inactive_before_card',
         });
-        resolveVcMeetingManagedActionApproval(
+        await resolveVcMeetingManagedActionApproval(
           config.session.dataDir,
           vcMeetingManagedActionRef(action),
           'expired',
@@ -7248,7 +7321,7 @@ async function submitVcMeetingManagedImAction(input: {
           status: 'failed',
           errorCode: 'listener_session_inactive_before_card',
         });
-        resolveVcMeetingManagedActionApproval(
+        await resolveVcMeetingManagedActionApproval(
           config.session.dataDir,
           vcMeetingManagedActionRef(action),
           'expired',
@@ -7297,6 +7370,12 @@ async function reconcileVcMeetingManagedActionsOnBoot(listenerAppId: string): Pr
     for (const action of recovered.terminalizedUnknown) {
       logger.error(
         `[vc-action] voice/provider result requires manual review after restart `
+        + `meeting=${action.meetingId} action=${action.actionId}`,
+      );
+    }
+    for (const action of recovered.terminalizedExpired) {
+      logger.warn(
+        `[vc-action] legacy approved action expired pending current-authority revalidation `
         + `meeting=${action.meetingId} action=${action.actionId}`,
       );
     }
@@ -7357,7 +7436,10 @@ async function reconcileVcMeetingManagedActionsOnBoot(listenerAppId: string): Pr
       }
     }
 
-    const expireRestoredApproval = (action: VcMeetingActionRecord, errorCode: string): void => {
+    const expireRestoredApproval = async (
+      action: VcMeetingActionRecord,
+      errorCode: string,
+    ): Promise<void> => {
       if (action.approvalCard?.status === 'attempting') {
         finishVcMeetingManagedApprovalCard(config.session.dataDir, {
           ...vcMeetingManagedActionRef(action),
@@ -7365,7 +7447,7 @@ async function reconcileVcMeetingManagedActionsOnBoot(listenerAppId: string): Pr
           errorCode: `${errorCode}_card_unknown`,
         });
       }
-      resolveVcMeetingManagedActionApproval(
+      await resolveVcMeetingManagedActionApproval(
         config.session.dataDir,
         vcMeetingManagedActionRef(action),
         'expired',
@@ -7381,13 +7463,13 @@ async function reconcileVcMeetingManagedActionsOnBoot(listenerAppId: string): Pr
       const originalApprovalCard = original.approvalCard;
       const session = vcMeetingSessions.get(vcMeetingSessionKey(scope.listenerAppId, scope.meetingId));
       if (!session || session.ended) {
-        expireRestoredApproval(original, 'listener_session_inactive_on_restore');
+        await expireRestoredApproval(original, 'listener_session_inactive_on_restore');
         continue;
       }
       const channel: VcMeetingOutputChannel = original.sink === 'meeting_voice' ? 'voice' : 'text';
       const canonical = original.canonicalInput as { content?: unknown; fallbackText?: unknown };
       if (typeof canonical.content !== 'string') {
-        expireRestoredApproval(original, 'invalid_approval_input_on_restore');
+        await expireRestoredApproval(original, 'invalid_approval_input_on_restore');
         continue;
       }
       const plan: VcMeetingApprovalPresentationPlan = {
@@ -7414,20 +7496,20 @@ async function reconcileVcMeetingManagedActionsOnBoot(listenerAppId: string): Pr
       if (!approvalCard) continue;
       const req = vcMeetingManagedOutputRequest(action, plan, { approval: true });
       if (Date.now() >= req.expiresAt) {
-        expireRestoredApproval(action, 'approval_expired_during_restart');
+        await expireRestoredApproval(action, 'approval_expired_during_restart');
         continue;
       }
       if (session.pendingOutputRequests[channel]
         && session.pendingOutputRequests[channel]?.managedAction?.actionId !== action.actionId) {
         logger.error(`[vc-action] approval restore collision meeting=${scope.meetingId} channel=${channel}`);
-        expireRestoredApproval(action, 'approval_restore_collision');
+        await expireRestoredApproval(action, 'approval_restore_collision');
         continue;
       }
       if (approvalCard.status === 'presented') {
         const cardMessageId = approvalCard.externalRefs?.cardMessageId;
         if (typeof cardMessageId !== 'string' || !cardMessageId) {
           logger.error(`[vc-action] presented approval lacks cardMessageId action=${action.actionId}`);
-          expireRestoredApproval(action, 'presented_approval_missing_message_id');
+          await expireRestoredApproval(action, 'presented_approval_missing_message_id');
           continue;
         }
         req.cardMessageId = cardMessageId;
@@ -7658,7 +7740,7 @@ async function reviewVcMeetingOutputRequest(input: {
       );
       return vcMeetingOutputReviewCardForRequest(session, req, 'rejected');
     }
-    const resolveManagedApproval = () => {
+    const resolveManagedApproval = async () => {
       if (!req.managedAction) return undefined;
       const managedRef = {
         listenerAppId: req.managedAction.listenerAppId,
@@ -7682,25 +7764,32 @@ async function reviewVcMeetingOutputRequest(input: {
         config.session.dataDir,
         managedRef,
         'approved',
-        { externalRefs: { operatorOpenId: input.operatorOpenId } },
+        {
+          externalRefs: { operatorOpenId: input.operatorOpenId },
+          revalidate: revalidateVcMeetingManagedApproval,
+        },
       );
     };
     if (input.decision === 'allow_text_and_send') {
       if (channel !== 'text') throw new Error('allow_text_and_send only applies to text requests');
-      setVcMeetingOutputPolicyForChannel(session, 'text', 'allow');
-      persistVcMeetingRuntimeSession(session, cfg);
-      const managed = resolveManagedApproval();
+      const managed = await resolveManagedApproval();
       if (managed) {
         if (managed.kind === 'conflict') throw new Error(`managed approval conflict: ${managed.reason}`);
         if (managed.kind !== 'execute') {
           if (managed.action.status !== 'succeeded') {
             throw new Error(`managed action is ${managed.action.status}, not executable`);
           }
-        } else {
-          const sent = await executeVcMeetingManagedProviderPlan(session, cfg, managed.action, managed.plan);
-          if (!sent.ok) throw new Error(sent.error);
         }
-      } else {
+      }
+      // Commit the future-output policy only after a managed approval has
+      // passed its current phase/member/owner fences. A stale approval card
+      // must not authorize whichever member owns the sink now.
+      setVcMeetingOutputPolicyForChannel(session, 'text', 'allow');
+      persistVcMeetingRuntimeSession(session, cfg);
+      if (managed?.kind === 'execute') {
+        const sent = await executeVcMeetingManagedProviderPlan(session, cfg, managed.action, managed.plan);
+        if (!sent.ok) throw new Error(sent.error);
+      } else if (!managed) {
         await sendVcMeetingOutputText(session, cfg, req);
       }
       delete session.pendingOutputRequests[channel];
@@ -7710,7 +7799,7 @@ async function reviewVcMeetingOutputRequest(input: {
       return vcMeetingOutputReviewCardForRequest(session, req, 'sentText');
     }
     if (input.decision === 'send_text') {
-      const managed = resolveManagedApproval();
+      const managed = await resolveManagedApproval();
       if (managed) {
         if (managed.kind === 'conflict') throw new Error(`managed approval conflict: ${managed.reason}`);
         if (managed.kind !== 'execute') {
@@ -7741,7 +7830,7 @@ async function reviewVcMeetingOutputRequest(input: {
     if (input.decision === 'approve_voice' || input.decision === 'allow_voice_and_approve') {
       if (channel !== 'voice') throw new Error('voice approval only applies to voice requests');
       const allowFutureVoice = input.decision === 'allow_voice_and_approve';
-      const managed = resolveManagedApproval();
+      const managed = await resolveManagedApproval();
       if (managed?.kind === 'conflict') throw new Error(`managed approval conflict: ${managed.reason}`);
       if (managed && managed.kind !== 'execute' && managed.action.status !== 'succeeded') {
         throw new Error(`managed action is ${managed.action.status}, not executable`);

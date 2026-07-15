@@ -199,6 +199,7 @@ export interface VcMeetingActionBootReconcileResult {
   providerAttempts: VcMeetingProviderReconcileRef[];
   approvalCards: VcMeetingApprovalCardReconcileRef[];
   terminalizedUnknown: VcMeetingActionRecord[];
+  terminalizedExpired: VcMeetingActionRecord[];
 }
 
 interface VcMeetingActionStateFile extends VcMeetingActionScope {
@@ -720,7 +721,9 @@ export function finishVcMeetingApprovalCard(
     if (record.status !== 'pendingApproval' || !card) return 'invalid_transition';
     if (['presented', 'failed', 'unknown'].includes(card.status)) {
       if (card.status !== finish.status) return 'existing';
-      const merged = mergeExternalRefs(card.externalRefs, refs);
+      // Preserve the first provider identifiers while still allowing a later
+      // lookup/recovery callback to fill previously absent audit fields.
+      const merged = mergeExternalRefs(refs, card.externalRefs);
       if (canonicalJson(merged ?? {}) === canonicalJson(card.externalRefs ?? {})) return 'existing';
       card.externalRefs = merged;
       card.updatedAt = now;
@@ -755,7 +758,13 @@ export function resolveVcMeetingActionApproval(
   }
   return transition(dataDir, ref, now, (record) => {
     if (record.status === decision || isVcMeetingActionTerminal(record.status)) return 'existing';
-    if (record.status !== 'pendingApproval') return 'invalid_transition';
+    // `approved` is only a legacy two-write crash residue. It may be expired
+    // after current-authority revalidation fails, but it must never be newly
+    // claimed without that revalidation.
+    if (record.status !== 'pendingApproval'
+      && !(record.status === 'approved' && decision !== 'approved')) {
+      return 'invalid_transition';
+    }
     record.status = decision;
     record.externalRefs = mergeExternalRefs(record.externalRefs, normalizedRefs);
     if (opts.errorCode) record.errorCode = opts.errorCode;
@@ -874,7 +883,9 @@ export function finishVcMeetingAction(
   return transition(dataDir, ref, now, (record) => {
     if (isVcMeetingActionTerminal(record.status)) {
       if (record.status !== finish.status) return 'existing';
-      const merged = mergeExternalRefs(record.externalRefs, normalizedRefs);
+      // A duplicate provider callback may add lookup evidence, but it must not
+      // rewrite the provider ids captured by the first terminal callback.
+      const merged = mergeExternalRefs(normalizedRefs, record.externalRefs);
       if (canonicalJson(merged ?? {}) === canonicalJson(record.externalRefs ?? {})) return 'existing';
       record.externalRefs = merged;
       return 'updated';
@@ -963,6 +974,7 @@ export function reconcileVcMeetingActionsOnBoot(
     providerAttempts: [],
     approvalCards: [],
     terminalizedUnknown: [],
+    terminalizedExpired: [],
   });
   if (!nonEmpty(scope.listenerAppId, scope.meetingId)) return empty();
   return mutateState<VcMeetingActionBootReconcileResult>(dataDir, scope, now, false, (state) => {
@@ -970,14 +982,19 @@ export function reconcileVcMeetingActionsOnBoot(
     const result = empty();
     let changed = false;
     for (const record of Object.values(state.actions)) {
-      // Heal the historical two-write approval crash window. New callers use
-      // approveAndClaimVcMeetingAction and never persist `approved` alone.
+      // A historical two-write approval crash residue has not been fenced
+      // against the current meeting/member/owner state. New callers use the
+      // atomic approve+claim path after revalidation and never persist this
+      // intermediate state. Expire the residue rather than executing it at
+      // boot with stale authority.
       if (record.status === 'approved') {
-        record.status = 'attempting';
-        record.attemptCount += 1;
-        record.attemptedAt = now;
+        record.status = 'expired';
+        record.errorCode = 'approval_revalidation_required_after_restart';
+        record.finishedAt = now;
         record.updatedAt = now;
+        result.terminalizedExpired.push(cloneRecord(record));
         changed = true;
+        continue;
       }
       if (record.status === 'attempting') {
         if (canReconcileVcMeetingActionProvider(record.sink)) {

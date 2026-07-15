@@ -86,8 +86,11 @@ import {
   acceptVcMeetingDelivery,
   applyVcMeetingMemberProjection,
   completeVcMeetingDelivery,
+  failVcMeetingDelivery,
   markVcMeetingDeliveryDispatched,
 } from '../src/services/vc-meeting-delivery-store.js';
+import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
+import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
 
 // Build a fake worker child process whose IPC `message` event we can fire
 // manually, then wire it through setupWorkerHandlers via forkAdoptWorker.
@@ -145,25 +148,33 @@ function finalOutputMsg(): Extract<WorkerToDaemon, { type: 'final_output' }> {
   return { type: 'final_output', content: 'final answer', lastUuid: 'uuid-1', turnId: 'turn-1' };
 }
 
-function seedSilentReceiverReceipt(): void {
+function seedReceiverReceipt(responseMode: 'silent' | 'listener_thread'): void {
   const memberKey = {
     listenerAppId: 'listener-app', meetingId: 'meeting-1', memberId: 'member-1', memberEpoch: 1,
   };
-  applyVcMeetingMemberProjection('/tmp/test-sessions', {
+  expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
     ...memberKey,
     ownerBootId: 'owner-boot', ownerEpoch: 1, agentAppId: 'app_test', role: 'minutes',
-    membershipGeneration: 1, status: 'active', responseMode: 'silent', joinedAtIngestSeq: 0,
+    membershipGeneration: 1, status: 'active', responseMode, joinedAtIngestSeq: 0,
+    capabilities: ['meeting.read', 'listener.output.request'], ownedSinks: [], sinkOwnerGeneration: 1,
     receiverSessionId: 'sid-final-out', outputChatId: 'oc_chat',
-  });
-  acceptVcMeetingDelivery('/tmp/test-sessions', {
+  })).toMatchObject({ ok: true });
+  expect(acceptVcMeetingDelivery('/tmp/test-sessions', {
     ...memberKey,
     ownerBootId: 'owner-boot', ownerEpoch: 1, membershipGeneration: 1,
     deliveryKey: 'delivery-stable-key', inputHash: 'input-hash', fromSeq: 1, toSeq: 1,
-    responseMode: 'silent', receiverBootId: 'receiver-boot',
-  });
-  markVcMeetingDeliveryDispatched('/tmp/test-sessions', {
+    responseMode, receiverBootId: 'receiver-boot',
+  })).toMatchObject({ kind: 'accepted' });
+  expect(markVcMeetingDeliveryDispatched('/tmp/test-sessions', {
     ...memberKey, deliveryKey: 'delivery-stable-key',
-  }, { receiverBootId: 'receiver-boot', workerGeneration: 1 });
+  }, { receiverBootId: 'receiver-boot', workerGeneration: 1 })).toMatchObject({
+    ok: true,
+    receipt: { status: 'dispatched' },
+  });
+}
+
+function seedSilentReceiverReceipt(): void {
+  seedReceiverReceipt('silent');
 }
 
 const SCOPED_DEDUPE_KEY = 'sid-final-out:uuid-1';
@@ -824,6 +835,25 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       receiverSessionId: ds.session.sessionId, larkMessageId: 'om_human_a',
       replyTargetSenderOpenId: 'ou_human_a',
     };
+    expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+      listenerAppId: origin.listenerAppId,
+      meetingId: origin.meetingId,
+      memberId: origin.memberId,
+      memberEpoch: origin.memberEpoch,
+      agentAppId: origin.agentAppId,
+      ownerBootId: origin.ownerBootId,
+      ownerEpoch: origin.ownerEpoch,
+      role: 'minutes',
+      membershipGeneration: origin.membershipGeneration,
+      status: 'active',
+      responseMode: 'silent',
+      capabilities: ['meeting.read'],
+      ownedSinks: [],
+      sinkOwnerGeneration: origin.sinkOwnerGeneration,
+      joinedAtIngestSeq: 0,
+      receiverSessionId: origin.receiverSessionId,
+      outputChatId: ds.chatId,
+    })).toMatchObject({ ok: true });
     ds.session.vcMeetingImTurnOrigins = { om_human_a: origin };
     const msg = {
       ...finalOutputMsg(),
@@ -841,6 +871,11 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       uuid: expect.stringMatching(/^vcp_[0-9a-f]+$/),
     });
     const providerUuid = sessionReply.mock.calls[0][5].uuid;
+    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+      listenerAppId: origin.listenerAppId,
+      meetingId: origin.meetingId,
+      targetChatId: ds.chatId,
+    })).toEqual(['om_vc_fallback']);
 
     // A daemon/worker replay sees the terminal ledger and performs no second
     // provider call. A changed replay is also suppressed: first output wins.
@@ -856,6 +891,150 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(providerUuid).toBeTruthy();
+  });
+
+  it('blocks the plain fallback when VC IM authority expires during a withdrawn quote request', async () => {
+    let plainFallbackCalls = 0;
+    const sessionReply = vi.fn(async (...args: any[]) => {
+      const opts = args[5] as {
+        beforeQuoteFallback?: () => void | Promise<void>;
+      } | undefined;
+      // Model the exact daemon sequence: the quote RPC was already in flight,
+      // then the member was removed before Lark answered "withdrawn".
+      expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+        listenerAppId: 'listener-app', meetingId: 'meeting-im-race',
+        memberId: 'member-im-race', memberEpoch: 1,
+        agentAppId: 'app_test', ownerBootId: 'owner-boot', ownerEpoch: 1,
+        role: 'minutes', membershipGeneration: 2, status: 'removed',
+        responseMode: 'silent', capabilities: ['meeting.read'], ownedSinks: [],
+        sinkOwnerGeneration: 1, joinedAtIngestSeq: 0,
+        receiverSessionId: 'sid-final-out', outputChatId: 'oc_chat',
+      })).toMatchObject({ ok: true });
+      await opts?.beforeQuoteFallback?.();
+      plainFallbackCalls += 1;
+      return 'om_forbidden_fallback';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-im-race',
+      memberId: 'member-im-race', memberEpoch: 1,
+    };
+    const origin = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-im-race',
+      memberId: 'member-im-race', memberEpoch: 1,
+      agentAppId: 'app_test', ownerBootId: 'owner-boot', ownerEpoch: 1,
+      membershipGeneration: 1, sinkOwnerGeneration: 1,
+      receiverSessionId: ds.session.sessionId, larkMessageId: 'om_human_race',
+    };
+    expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+      ...origin,
+      role: 'minutes', status: 'active', responseMode: 'silent',
+      capabilities: ['meeting.read'], ownedSinks: [], joinedAtIngestSeq: 0,
+      outputChatId: ds.chatId,
+    })).toMatchObject({ ok: true });
+    ds.session.vcMeetingImTurnOrigins = { om_human_race: origin };
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, {
+      ...finalOutputMsg(),
+      turnId: 'om_human_race',
+      lastUuid: 'bridge-race',
+    }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(plainFallbackCalls).toBe(0);
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    const actions = listVcMeetingActions('/tmp/test-sessions', {
+      listenerAppId: origin.listenerAppId,
+      meetingId: origin.meetingId,
+    });
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ status: 'attempting', attemptCount: 1 });
+    expect(actions[0]).not.toHaveProperty('externalRefs.messageId');
+  });
+
+  it('indexes a successful ordinary meeting-delivery fallback output', async () => {
+    const sessionReply = vi.fn(async () => 'om_meeting_fallback');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1',
+      memberId: 'member-1', memberEpoch: 1,
+    };
+    seedReceiverReceipt('listener_thread');
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, {
+      ...finalOutputMsg(),
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    }, 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      targetChatId: ds.chatId,
+    })).toEqual(['om_meeting_fallback']);
+  });
+
+  it('does not emit a delayed final output after the delivery failed terminally', async () => {
+    const sessionReply = vi.fn(async () => 'om_forbidden_output');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1',
+      memberId: 'member-1', memberEpoch: 1,
+    };
+    seedReceiverReceipt('listener_thread');
+    expect(failVcMeetingDelivery('/tmp/test-sessions', {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1',
+      memberId: 'member-1', memberEpoch: 1,
+      deliveryKey: 'delivery-stable-key',
+    }, {
+      kind: 'terminal',
+      workerGeneration: 1,
+      dispatchAttempt: 1,
+      errorCode: 'turn_cancelled',
+      pauseStream: true,
+    })).toMatchObject({ ok: true, receipt: { status: 'failed_terminal' } });
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, {
+      ...finalOutputMsg(),
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1', targetChatId: ds.chatId,
+    })).toEqual([]);
   });
 
   it('retries on transient failure and commits after success', async () => {

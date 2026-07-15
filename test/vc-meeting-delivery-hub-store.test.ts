@@ -328,6 +328,41 @@ describe('vc meeting delivery hub store', () => {
       });
     });
 
+    it('lets a new epoch supersede the same member sink owner without weakening cross-member conflicts', () => {
+      const sinkOwner = projection({
+        capabilities: ['meeting.output.request', 'meeting.read'],
+        ownedSinks: ['meeting_text'],
+      });
+      expect(applyVcMeetingHubMemberProjection(dir, sinkOwner)).toMatchObject({ ok: true });
+
+      const successor = projection({
+        memberEpoch: 2,
+        membershipGeneration: 2,
+        receiverSessionId: 'receiver-session-2',
+        capabilities: ['meeting.output.request', 'meeting.read'],
+        ownedSinks: ['meeting_text'],
+      });
+      expect(applyVcMeetingHubMemberProjection(dir, successor)).toMatchObject({
+        ok: true,
+        record: { memberId: MEMBER, memberEpoch: 2, ownedSinks: ['meeting_text'] },
+      });
+
+      const trueContender = projection({
+        memberId: 'actions',
+        agentAppId: 'cli_actions',
+        role: 'actions',
+        deliveryProfileHash: hash('profile:actions'),
+        receiverSessionId: 'receiver-actions',
+        capabilities: ['meeting.output.request', 'meeting.read'],
+        ownedSinks: ['meeting_text'],
+      });
+      expect(applyVcMeetingHubMemberProjection(dir, trueContender)).toMatchObject({
+        ok: false,
+        reason: 'sink_owner_conflict',
+        detail: `meeting_text is already owned by ${MEMBER}@2`,
+      });
+    });
+
     it('keeps a removed epoch dead and validates inputs strictly', () => {
       applyVcMeetingHubMemberProjection(dir, projection());
       applyVcMeetingHubMemberProjection(dir, projection({ membershipGeneration: 2, status: 'removed' }));

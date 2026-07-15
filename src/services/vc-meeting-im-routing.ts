@@ -9,6 +9,7 @@ import {
   getVcMeetingHubCloseState,
   getVcMeetingHubMember,
 } from './vc-meeting-delivery-hub-store.js';
+import { listVcMeetingListenerMessageIds } from './vc-meeting-listener-message-store.js';
 
 /**
  * Durable listener-chat -> receiver-session routing for explicit human IM turns.
@@ -59,9 +60,8 @@ export interface VcMeetingImRoutingCandidate {
   responseMode: 'silent' | 'listener_thread';
   /**
    * Durable listener messages that unambiguously belong to this meeting.
-   * Today the runtime store retains the consumer card id. Callers that own a
-   * richer listener-message index can additionally resolve a quote to
-   * `quotedMeetingId` before invoking the selector.
+   * This combines the runtime consumer card with the bounded primary-output
+   * ledger maintained by meeting receiver send paths.
    */
   knownListenerMessageIds: string[];
 }
@@ -217,6 +217,12 @@ export function listDurableVcMeetingImRoutingCandidates(
       if (!projection) continue;
       const sinkOwnerGeneration = projection.sinkOwnerGeneration;
       if (!Number.isSafeInteger(sinkOwnerGeneration) || (sinkOwnerGeneration ?? 0) < 1) continue;
+      const knownListenerMessageIds = new Set(listVcMeetingListenerMessageIds(dataDir, {
+        listenerAppId: record.larkAppId,
+        meetingId: record.meeting.id,
+        targetChatId: record.listenerChatId,
+      }));
+      if (record.consumerCardMessageId) knownListenerMessageIds.add(record.consumerCardMessageId);
       candidates.push({
         lifecycle: 'active',
         listenerAppId: record.larkAppId,
@@ -233,9 +239,7 @@ export function listDurableVcMeetingImRoutingCandidates(
         agentAppId: projection.agentAppId,
         receiverSessionId: projection.receiverSessionId,
         responseMode: projection.responseMode,
-        knownListenerMessageIds: record.consumerCardMessageId
-          ? [record.consumerCardMessageId]
-          : [],
+        knownListenerMessageIds: [...knownListenerMessageIds].sort(),
       });
     }
   }
@@ -318,6 +322,11 @@ export function listSealedVcMeetingImRoutingCandidates(
 
     const sinkOwnerGeneration = projection.sinkOwnerGeneration;
     if (!Number.isSafeInteger(sinkOwnerGeneration) || (sinkOwnerGeneration ?? 0) < 1) continue;
+    const knownListenerMessageIds = listVcMeetingListenerMessageIds(dataDir, {
+      listenerAppId: projection.listenerAppId,
+      meetingId: projection.meetingId,
+      targetChatId: listenerChatId,
+    }).sort();
     candidates.push({
       lifecycle: 'sealed',
       listenerAppId: projection.listenerAppId,
@@ -332,7 +341,7 @@ export function listSealedVcMeetingImRoutingCandidates(
       agentAppId: projection.agentAppId,
       receiverSessionId: projection.receiverSessionId,
       responseMode: projection.responseMode,
-      knownListenerMessageIds: [],
+      knownListenerMessageIds,
     });
   }
 

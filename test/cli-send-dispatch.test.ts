@@ -104,6 +104,31 @@ describe('dispatchPrimaryMessage hook context wiring', () => {
       baseOptions.hookContext,
     );
   });
+
+  it('awaits authority revalidation before a withdrawn quote falls back', async () => {
+    const replyMessage = vi.fn(async () => {
+      throw new MessageWithdrawnError('withdrawn');
+    });
+    const sendMessage = vi.fn(async () => 'om_send');
+    const beforeQuoteFallback = vi.fn(async () => {
+      throw new Error('membership authority expired');
+    });
+
+    await expect(dispatchPrimaryMessage(
+      { replyMessage, sendMessage },
+      {
+        ...baseOptions,
+        quoteTargetId: 'om_quote',
+        dispatch: vi.fn(async () => 'om_dispatch'),
+        beforeQuoteFallback,
+        content: 'answer',
+        msgType: 'text',
+      },
+    )).rejects.toThrow('membership authority expired');
+
+    expect(beforeQuoteFallback).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
 });
 
 describe('findStdinAliasAttachment (reject stdin-as-attachment up front)', () => {

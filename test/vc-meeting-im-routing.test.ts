@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -24,6 +24,11 @@ import {
   recordVcMeetingRuntimeSession,
   type VcMeetingRuntimeSelectedAgent,
 } from '../src/services/vc-meeting-runtime-store.js';
+import {
+  MAX_VC_MEETING_LISTENER_MESSAGES,
+  listVcMeetingListenerMessageIds,
+  recordVcMeetingListenerMessage,
+} from '../src/services/vc-meeting-listener-message-store.js';
 
 const LISTENER = 'listener-app';
 const CHAT = 'listener-chat';
@@ -214,6 +219,85 @@ describe('vc meeting IM routing', () => {
       });
     });
 
+    it('indexes ordinary meeting-owned outputs for quote disambiguation in the listener chat', () => {
+      persistRuntime('m1', { cardId: 'card-m1' });
+      persistRuntime('m2', { cardId: 'card-m2' });
+      expect(applyVcMeetingMemberProjection(dir, projection('m1'), 1_000)).toMatchObject({ ok: true });
+      expect(applyVcMeetingMemberProjection(dir, projection('m2'), 1_000)).toMatchObject({ ok: true });
+      expect(recordVcMeetingListenerMessage(dir, {
+        listenerAppId: LISTENER,
+        meetingId: 'm2',
+        targetChatId: CHAT,
+        messageId: 'om_m2_ordinary_output',
+      }, 1_100)).toMatchObject({ ok: true, kind: 'recorded' });
+      // A detoured output may be durable, but it cannot claim ownership in the
+      // listener chat used by this routing candidate.
+      expect(recordVcMeetingListenerMessage(dir, {
+        listenerAppId: LISTENER,
+        meetingId: 'm1',
+        targetChatId: 'different-chat',
+        messageId: 'om_m1_elsewhere',
+      }, 1_200)).toMatchObject({ ok: true });
+
+      const found = listDurableVcMeetingImRoutingCandidates(
+        dir,
+        { listenerChatId: CHAT, agentAppId: AGENT },
+        2_000,
+      );
+      expect(found.find(item => item.meetingId === 'm2')?.knownListenerMessageIds)
+        .toEqual(['card-m2', 'om_m2_ordinary_output']);
+      expect(found.find(item => item.meetingId === 'm1')?.knownListenerMessageIds)
+        .not.toContain('om_m1_elsewhere');
+      expect(selectVcMeetingImRoutingCandidate(found, {
+        quotedMessageId: 'om_m2_ordinary_output',
+      })).toMatchObject({
+        kind: 'receiver', selectedBy: 'quote', candidate: { meetingId: 'm2' },
+      });
+    });
+
+    it('keeps the listener-message index bounded, deduplicated, and ownership-stable', () => {
+      const owner = { listenerAppId: LISTENER, meetingId: 'm1', targetChatId: CHAT };
+      expect(recordVcMeetingListenerMessage(dir, { ...owner, messageId: 'om_same' }, 1))
+        .toMatchObject({ ok: true, kind: 'recorded' });
+      expect(recordVcMeetingListenerMessage(dir, { ...owner, messageId: 'om_same' }, 2))
+        .toMatchObject({ ok: true, kind: 'existing' });
+      expect(recordVcMeetingListenerMessage(dir, {
+        ...owner,
+        meetingId: 'm2',
+        messageId: 'om_same',
+      }, 3)).toEqual({ ok: false, reason: 'owner_conflict' });
+      for (let index = 0; index < MAX_VC_MEETING_LISTENER_MESSAGES + 2; index += 1) {
+        expect(recordVcMeetingListenerMessage(dir, {
+          ...owner,
+          messageId: `om_bounded_${index}`,
+        }, 10 + index)).toMatchObject({ ok: true });
+      }
+      const ids = listVcMeetingListenerMessageIds(dir, owner);
+      expect(ids).toHaveLength(MAX_VC_MEETING_LISTENER_MESSAGES);
+      expect(ids).not.toContain('om_same');
+      expect(ids).not.toContain('om_bounded_0');
+      expect(ids).toContain(`om_bounded_${MAX_VC_MEETING_LISTENER_MESSAGES + 1}`);
+    });
+
+    it('fails closed without overwriting a corrupt listener-message index', () => {
+      const owner = { listenerAppId: LISTENER, meetingId: 'm1', targetChatId: CHAT };
+      expect(recordVcMeetingListenerMessage(dir, { ...owner, messageId: 'om_first' }, 1))
+        .toMatchObject({ ok: true });
+      const file = join(
+        dir,
+        'vc-meeting-listener-messages',
+        `${LISTENER}__${CHAT}.json`,
+      );
+      writeFileSync(file, '{corrupt');
+      expect(() => listVcMeetingListenerMessageIds(dir, owner)).toThrow(/index is unreadable/);
+      expect(() => recordVcMeetingListenerMessage(
+        dir,
+        { ...owner, messageId: 'om_must_not_replace' },
+        2,
+      )).toThrow(/index is unreadable/);
+      expect(readFileSync(file, 'utf8')).toBe('{corrupt');
+    });
+
     it('excludes runtime-only, paused, mismatched-chat, and superseded memberships', () => {
       persistRuntime('runtime-only');
 
@@ -310,6 +394,12 @@ describe('vc meeting IM routing', () => {
       const meetingId = 'sealed';
       expect(applyVcMeetingMemberProjection(dir, projection(meetingId), 1_000))
         .toMatchObject({ ok: true });
+      expect(recordVcMeetingListenerMessage(dir, {
+        listenerAppId: LISTENER,
+        meetingId,
+        targetChatId: CHAT,
+        messageId: 'om_sealed_output',
+      }, 1_500)).toMatchObject({ ok: true });
       sealHubMeeting(dir, meetingId, 2_000);
       const binding = {
         listenerAppId: LISTENER,
@@ -329,6 +419,7 @@ describe('vc meeting IM routing', () => {
         lifecycle: 'sealed',
         meetingId,
         receiverSessionId: `receiver-${meetingId}`,
+        knownListenerMessageIds: ['om_sealed_output'],
       }]);
       expect(resolveDurableVcMeetingImRouting(dir, {
         listenerChatId: CHAT,

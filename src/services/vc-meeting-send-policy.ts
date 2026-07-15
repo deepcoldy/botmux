@@ -24,17 +24,23 @@ export interface VcMeetingManagedSendOrigin {
   turnId?: string;
   dispatchAttempt?: number;
   receiverSession: boolean;
-  /** Persisted current inbound Lark message id for an explicit human IM turn.
+  /** Persisted authority snapshot for the current explicit human IM turn.
    * This is the trusted no-dispatchAttempt origin; callers must not populate it
    * from the CLI's static spawn environment. */
-  currentImTurnId?: string;
+  currentImTurnOrigin?: VcMeetingImTurnOrigin;
   /** Worker UI may need to patch/freeze an already-created card after terminal;
    * new botmux send/ask effects must leave this false. */
   allowTerminalReceipt?: boolean;
 }
 
 export type VcMeetingManagedSendDecision =
-  | { ok: true; kind: 'ordinary' | 'listener_thread' }
+  | { ok: true; kind: 'ordinary' }
+  | {
+      ok: true;
+      kind: 'listener_thread';
+      /** Durable ownership used to index the successful primary Lark output. */
+      meetingOwner: { listenerAppId: string; meetingId: string };
+    }
   | { ok: false; errorCode: 'origin_unproven' | 'receipt_not_found' | 'origin_mismatch' | 'silent_delivery'; error: string };
 
 export interface VcMeetingLiveManagedOrigin {
@@ -51,6 +57,7 @@ export type VcMeetingManagedOriginVerification =
         turnId?: string;
         dispatchAttempt?: number;
         currentImTurnId?: string;
+        currentImTurnOrigin?: VcMeetingImTurnOrigin;
       };
     }
   | Extract<VcMeetingManagedSendDecision, { ok: false }>;
@@ -73,7 +80,7 @@ export function evaluateVcMeetingManagedOriginClaim(
   dataDir: string,
   input: {
     receiverSessionId: string;
-    currentImTurnId?: string;
+    currentImTurnOrigin?: VcMeetingImTurnOrigin;
     liveOrigin?: VcMeetingLiveManagedOrigin;
     claimedCapability?: string;
     claimedTurnId?: string;
@@ -99,7 +106,7 @@ export function evaluateVcMeetingManagedOriginClaim(
 export function verifyVcMeetingManagedOriginClaim(
   input: {
     receiverSessionId: string;
-    currentImTurnId?: string;
+    currentImTurnOrigin?: VcMeetingImTurnOrigin;
     liveOrigin?: VcMeetingLiveManagedOrigin;
     claimedCapability?: string;
     claimedTurnId?: string;
@@ -121,9 +128,36 @@ export function verifyVcMeetingManagedOriginClaim(
       receiverSessionId: input.receiverSessionId,
       turnId: live.turnId,
       dispatchAttempt: live.dispatchAttempt,
-      currentImTurnId: input.currentImTurnId,
+      currentImTurnId: input.currentImTurnOrigin?.larkMessageId,
+      currentImTurnOrigin: input.currentImTurnOrigin,
     },
   };
+}
+
+/** An IM turn snapshot is authority only while the exact member epoch and all
+ * ownership fences are still the current active projection. Explicit human
+ * turns ignore responseMode, but they never outlive pause/remove/reassignment
+ * or an owner-generation change. */
+export function isCurrentVcMeetingImTurnOrigin(
+  dataDir: string,
+  origin: VcMeetingImTurnOrigin | undefined,
+  expectedTargetChatId?: string,
+): origin is VcMeetingImTurnOrigin {
+  if (!origin) return false;
+  return listVcMeetingActiveProjectionsForReceiverSession(
+    dataDir,
+    origin.receiverSessionId,
+  ).some((projection) => projection.listenerAppId === origin.listenerAppId
+    && projection.meetingId === origin.meetingId
+    && projection.memberId === origin.memberId
+    && projection.memberEpoch === origin.memberEpoch
+    && projection.agentAppId === origin.agentAppId
+    && projection.receiverSessionId === origin.receiverSessionId
+    && projection.ownerBootId === origin.ownerBootId
+    && projection.ownerEpoch === origin.ownerEpoch
+    && projection.membershipGeneration === origin.membershipGeneration
+    && projection.sinkOwnerGeneration === origin.sinkOwnerGeneration
+    && (expectedTargetChatId === undefined || projection.outputChatId === expectedTargetChatId));
 }
 
 /** Resolve a managed output decision from the durable receipt, not mutable
@@ -135,8 +169,19 @@ export function evaluateVcMeetingManagedSend(
 ): VcMeetingManagedSendDecision {
   if (origin.dispatchAttempt === undefined) {
     if (origin.receiverSession) {
-      if (origin.turnId && origin.currentImTurnId === origin.turnId) {
-        return { ok: true, kind: 'listener_thread' };
+      const imOrigin = origin.currentImTurnOrigin;
+      if (origin.turnId
+        && imOrigin?.larkMessageId === origin.turnId
+        && imOrigin.receiverSessionId === origin.receiverSessionId
+        && isCurrentVcMeetingImTurnOrigin(dataDir, imOrigin)) {
+        return {
+          ok: true,
+          kind: 'listener_thread',
+          meetingOwner: {
+            listenerAppId: imOrigin.listenerAppId,
+            meetingId: imOrigin.meetingId,
+          },
+        };
       }
       return {
         ok: false,
@@ -157,8 +202,16 @@ export function evaluateVcMeetingManagedSend(
     || lookup.receipt.dispatchAttempt !== origin.dispatchAttempt) {
     return { ok: false, errorCode: 'origin_mismatch', error: 'send origin does not match the durable receipt attempt' };
   }
-  if (!origin.allowTerminalReceipt && lookup.receipt.status !== 'dispatched') {
-    return { ok: false, errorCode: 'origin_mismatch', error: 'durable delivery is no longer executing' };
+  const receiptMayEmit = lookup.receipt.status === 'dispatched'
+    || (origin.allowTerminalReceipt === true && lookup.receipt.status === 'completed');
+  if (!receiptMayEmit) {
+    return {
+      ok: false,
+      errorCode: 'origin_mismatch',
+      error: origin.allowTerminalReceipt
+        ? 'durable delivery did not complete successfully'
+        : 'durable delivery is no longer executing',
+    };
   }
   const activeProjection = listVcMeetingActiveProjectionsForReceiverSession(
     dataDir,
@@ -176,5 +229,12 @@ export function evaluateVcMeetingManagedSend(
   if ((lookup.receipt.responseMode ?? 'silent') === 'silent') {
     return { ok: false, errorCode: 'silent_delivery', error: 'managed output is disabled for this silent delivery' };
   }
-  return { ok: true, kind: 'listener_thread' };
+  return {
+    ok: true,
+    kind: 'listener_thread',
+    meetingOwner: {
+      listenerAppId: lookup.memberKey.listenerAppId,
+      meetingId: lookup.memberKey.meetingId,
+    },
+  };
 }

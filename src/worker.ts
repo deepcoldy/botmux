@@ -827,7 +827,7 @@ function authorizeManagedSend(
     receiverSession: !!session?.vcMeetingReceiver,
     turnId: capability.turnId,
     dispatchAttempt: capability.dispatchAttempt,
-    currentImTurnId: imOrigin?.larkMessageId,
+    currentImTurnOrigin: imOrigin,
   });
   return decision.ok
     ? {

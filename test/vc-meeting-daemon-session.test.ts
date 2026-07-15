@@ -8390,6 +8390,101 @@ describe('VC meeting daemon session lifecycle', () => {
     }
   });
 
+  it('keeps future text output approval-gated when a removed member clicks allow-and-send', async () => {
+    registerConsumerAgentBot();
+    __vcMeetingAgentTest.setOutputTextSenderForTest(async (session, req) => {
+      meetingTextOutputs.push({
+        meetingId: session.state.meeting.id,
+        text: req.content,
+        channel: 'text',
+      });
+    });
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Claude Loopy' }],
+        },
+      },
+    });
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_managed_allow_text_removed',
+      meeting: { id: 'm_managed_allow_text_removed', meetingNo: '565656566', topic: 'Stale allow text' },
+      raw: { event: { meeting: { id: 'm_managed_allow_text_removed', meeting_no: '565656566' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+    const meetingId = 'm_joined_565656566';
+    const deliveryKey = 'delivery_managed_allow_text_removed';
+    seedManagedDelivery(meetingId, deliveryKey);
+
+    const submitted = await __vcMeetingAgentTest.submitManagedOutput({
+      agentAppId: AGENT_APP_ID,
+      receiverSessionId: 'receiver_managed_1',
+      stableTurnId: deliveryKey,
+      dispatchAttempt: 1,
+      channel: 'text',
+      content: '失效成员不能开启后续自动弹幕。',
+    });
+    expect(submitted).toMatchObject({ status: 202, body: { ok: true, status: 'pending' } });
+    const pending = __vcMeetingAgentTest.pendingOutput(APP_ID, meetingId, 'text');
+    expect(pending?.managedAction).toMatchObject({ meetingId });
+    expect(runtimeStoreRecords.find(record => record.meeting.id === meetingId)?.textOutputPolicy)
+      .toBe('approval');
+
+    const projection = getVcMeetingMemberProjection(config.session.dataDir, {
+      listenerAppId: APP_ID,
+      meetingId,
+      memberId: 'member_generalist',
+      memberEpoch: 1,
+    });
+    expect(projection).toBeDefined();
+    expect(applyVcMeetingMemberProjection(config.session.dataDir, {
+      ...projection!,
+      membershipGeneration: projection!.membershipGeneration + 1,
+      status: 'removed',
+    })).toMatchObject({ ok: true, record: { status: 'removed' } });
+
+    const reviewed = await __vcMeetingAgentTest.reviewOutput({
+      larkAppId: APP_ID,
+      meetingId,
+      requestId: pending!.id,
+      nonce: pending!.nonce,
+      decision: 'allow_text_and_send',
+      operatorOpenId: TARGET_OPEN_ID,
+    });
+    expect(reviewed.header.title.content).toBe('输出请求处理失败');
+    expect(meetingTextOutputs).toHaveLength(0);
+    expect(listVcMeetingActions(config.session.dataDir, { listenerAppId: APP_ID, meetingId }))
+      .toEqual([expect.objectContaining({
+        status: 'expired',
+        attemptCount: 0,
+        errorCode: 'membership_removed',
+      })]);
+    expect(runtimeStoreRecords.find(record => record.meeting.id === meetingId)?.textOutputPolicy)
+      .toBe('approval');
+
+    // The in-memory policy must remain gated too, not merely the persisted
+    // runtime snapshot: a subsequent request should present another review.
+    const subsequent = await __vcMeetingAgentTest.submitOutput({
+      larkAppId: APP_ID,
+      meetingId,
+      channel: 'text',
+      content: '后续请求仍需审批。',
+    });
+    expect(subsequent).toMatchObject({ ok: true, status: 'pending' });
+    expect(meetingTextOutputs).toHaveLength(0);
+  });
+
   it('retries a transient managed text provider failure online with one stable provider key', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-vc-managed-retry-'));
     const previousDataDir = config.session.dataDir;

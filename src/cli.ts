@@ -110,11 +110,13 @@ import {
   evaluateVcMeetingManagedSend,
   isTrustedVcMeetingHostRelayParent,
   resolveVcMeetingImTurnOrigin,
+  type VcMeetingManagedSendOrigin,
 } from './services/vc-meeting-send-policy.js';
 import {
   finishVcMeetingImReply,
   prepareVcMeetingImReply,
 } from './services/vc-meeting-im-reply.js';
+import { recordVcMeetingListenerMessage } from './services/vc-meeting-listener-message-store.js';
 import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
 import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
 import {
@@ -5203,6 +5205,20 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
 
 async function cmdSend(rest: string[]): Promise<void> {
   const ancestorCtx = findAncestorSessionContext();
+  // Workflow subagents cannot own chat-facing effects: those belong to a
+  // hostExecutor so retries/resumes can reconcile them. Keep this gate ahead
+  // of both the sandbox relay and VC-origin store reads; neither path may turn
+  // a forbidden workflow send into an observable side effect.
+  if (process.env.BOTMUX_WORKFLOW === '1') {
+    const runId = process.env.BOTMUX_WORKFLOW_RUN_ID ?? '?';
+    const nodeId = process.env.BOTMUX_WORKFLOW_NODE_ID ?? '?';
+    console.error(
+      `botmux send refused inside workflow subagent (run=${runId} node=${nodeId}).\n` +
+      `Workflow subagents must return structured output via the WORKFLOW_OUTPUT marker;\n` +
+      `chat-facing side effects belong in a hostExecutor activity, not a subagent.`,
+    );
+    process.exit(2);
+  }
   // Managed output attribution must come from the live process-tree marker,
   // whose turn/attempt is refreshed by the worker. BOTMUX_TURN_ID is a
   // spawn-time fallback and can be stale in a detached child after a later
@@ -5251,45 +5267,48 @@ async function cmdSend(rest: string[]): Promise<void> {
     || ancestorCtx?.sessionId
     || sessionIdArg;
   let explicitVcMeetingImOrigin: ReturnType<typeof resolveVcMeetingImTurnOrigin>;
+  let vcMeetingListenerOutputOwner: { listenerAppId: string; meetingId: string } | undefined;
+  let vcMeetingManagedSendOrigin: VcMeetingManagedSendOrigin | undefined;
   if (originSessionId) {
     const originSession = sessionsForOrigin.get(originSessionId);
     const originTurnId = trustedRelayCtx?.turnId ?? liveMarkerCtx?.turnId;
     const imOrigin = resolveVcMeetingImTurnOrigin(originSession, originTurnId);
-    const decision = evaluateVcMeetingManagedSend(resolveDataDir(), {
+    const managedOrigin: VcMeetingManagedSendOrigin = {
       receiverSessionId: originSessionId,
       receiverSession: !!originSession?.vcMeetingReceiver,
       turnId: originTurnId,
       dispatchAttempt: trustedRelayCtx?.dispatchAttempt ?? liveMarkerCtx?.dispatchAttempt,
-      currentImTurnId: imOrigin?.larkMessageId,
-    });
+      currentImTurnOrigin: imOrigin,
+    };
+    const decision = evaluateVcMeetingManagedSend(resolveDataDir(), managedOrigin);
     if (!decision.ok) {
       console.error(
         `botmux send refused by VC managed-output policy (${decision.errorCode}): ${decision.error}`,
       );
       process.exit(2);
     }
+    if (decision.kind === 'listener_thread') {
+      vcMeetingListenerOutputOwner = decision.meetingOwner;
+      vcMeetingManagedSendOrigin = managedOrigin;
+    }
     if (decision.kind === 'listener_thread'
       && (trustedRelayCtx?.dispatchAttempt ?? liveMarkerCtx?.dispatchAttempt) === undefined) {
       explicitVcMeetingImOrigin = imOrigin;
     }
   }
-  // Sandbox relay: a file-sandboxed session has no creds/bots.json, so route
-  // the send through the daemon-side outbox instead of delivering directly.
-  // Safety gate: a CLI agent running inside a workflow subagent (Slice F)
-  // must not chat-post directly — chat-facing side effects are reserved
-  // for `hostExecutor` activities so they can be tracked via
-  // `effectAttempted` + reconciled across retries / resumes.  Refuse loud
-  // so the agent (and any human reviewing logs) sees the boundary.
-  if (process.env.BOTMUX_WORKFLOW === '1') {
-    const runId = process.env.BOTMUX_WORKFLOW_RUN_ID ?? '?';
-    const nodeId = process.env.BOTMUX_WORKFLOW_NODE_ID ?? '?';
-    console.error(
-      `botmux send refused inside workflow subagent (run=${runId} node=${nodeId}).\n` +
-      `Workflow subagents must return structured output via the WORKFLOW_OUTPUT marker;\n` +
-      `chat-facing side effects belong in a hostExecutor activity, not a subagent.`,
-    );
-    process.exit(2);
-  }
+  const revalidateVcMeetingManagedSend = (): void => {
+    if (!vcMeetingManagedSendOrigin) return;
+    const decision = evaluateVcMeetingManagedSend(resolveDataDir(), vcMeetingManagedSendOrigin);
+    if (!decision.ok) {
+      throw new Error(
+        `VC managed-output authority expired (${decision.errorCode}): ${decision.error}`,
+      );
+    }
+    if (decision.kind !== 'listener_thread') {
+      throw new Error('VC managed-output authority no longer targets the listener thread');
+    }
+    vcMeetingListenerOutputOwner = decision.meetingOwner;
+  };
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   // Read isolation: the sandboxed CLI is denied bots.json → register this bot
   // from its own worker-written cred file instead (see registerSelfFromCredFile).
@@ -5360,6 +5379,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   // another thread, etc.) instead of the session's own location. Wins over the
   // auto/scope default; `dispatch` opens topics, `send --into` posts into them.
   const sendInto = argValue(rest, '--into');
+  if (explicitVcMeetingImOrigin && sendInto) {
+    console.error(
+      'botmux send refused for a VC IM turn: --into cannot preserve the durable listener-thread reply identity',
+    );
+    process.exit(2);
+  }
   // --voice: synthesize the content into a Feishu voice bubble instead of a
   // text/card message. The content should be spoken-style prose (the 🔊 button
   // injects a condense-first instruction before the model calls this).
@@ -5684,10 +5709,14 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single
   // decision point. Used for file attachments (always plain in chat scope).
   const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: s.currentReplyTarget?.rootMessageId, replyTargetTurnId: s.currentReplyTarget?.turnId, currentTurnId });
-  const dispatch = (content: string, msgType: string, uuid?: string): Promise<string> =>
-    sendTarget.mode === 'plain'
+  const dispatch = (content: string, msgType: string, uuid?: string): Promise<string> => {
+    // This closure also carries attachments, so every Lark call re-checks the
+    // exact durable attempt/member instead of inheriting the early cmd gate.
+    revalidateVcMeetingManagedSend();
+    return sendTarget.mode === 'plain'
       ? sendMessage(appId, sendTarget.chatId, content, msgType, uuid, hookContext)
       : replyMessage(appId, sendTarget.rootMessageId, content, msgType, true, uuid, hookContext);
+  };
   const recordBridgeSendMarker = (sentAtMs: number, messageId: string, sentContent: string): void => {
     try {
       const markerDir = join(resolveDataDir(), 'turn-sends');
@@ -5710,21 +5739,55 @@ async function cmdSend(rest: string[]): Promise<void> {
   });
   let primaryQuotedId: string | null = null;
   let vcMeetingImReplyReplay = false;
+  const recordVcMeetingPrimaryOutput = (
+    messageId: string,
+    outputChatId: string,
+  ): void => {
+    if (!vcMeetingListenerOutputOwner || sendInto) return;
+    try {
+      const recorded = recordVcMeetingListenerMessage(resolveDataDir(), {
+        ...vcMeetingListenerOutputOwner,
+        targetChatId: outputChatId,
+        messageId,
+      });
+      if (!recorded.ok) {
+        console.error(`⚠️ VC 监听消息索引拒绝记录 ${messageId}（${recorded.reason}）`);
+      }
+    } catch (error) {
+      // The primary message already exists at Lark. Index failure must never
+      // turn a successful send into exit!=0 (which would invite a duplicate).
+      console.error(
+        `⚠️ 消息已发送，但 VC 监听消息索引写入失败：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
   const dispatchPrimary = async (content: string, msgType: string): Promise<string> => {
+    // `dispatchPrimaryMessage` may call replyMessage directly for a quote, so
+    // fence immediately before preparing/performing that primary effect too.
+    revalidateVcMeetingManagedSend();
+    const proposedOutput = {
+      targetChatId,
+      ...(quoteTargetId ? { quoteTargetId } : {}),
+      msgType,
+      content,
+    };
     const prepared = explicitVcMeetingImOrigin
-      ? prepareVcMeetingImReply(resolveDataDir(), explicitVcMeetingImOrigin, {
-          targetChatId,
-          ...(quoteTargetId ? { quoteTargetId } : {}),
-          msgType,
-          content,
-        })
+      ? prepareVcMeetingImReply(resolveDataDir(), explicitVcMeetingImOrigin, proposedOutput)
       : undefined;
     if (prepared?.kind === 'conflict') {
       throw new Error(`VC IM assistant reply refused (${prepared.reason}): ${prepared.detail}`);
     }
+    const canonicalOutput = prepared?.canonicalOutput ?? proposedOutput;
+    if (prepared?.outputMismatch) {
+      console.error(
+        `⚠️ VC IM reply output_mismatch action=${prepared.ref.actionId} `
+        + `turn=${explicitVcMeetingImOrigin!.larkMessageId}; reusing first canonical output`,
+      );
+    }
     if (prepared?.kind === 'succeeded' && prepared.messageId) {
       vcMeetingImReplyReplay = true;
-      primaryQuotedId = quoteTargetId ?? null;
+      primaryQuotedId = canonicalOutput.quoteTargetId ?? null;
+      recordVcMeetingPrimaryOutput(prepared.messageId, canonicalOutput.targetChatId);
       return prepared.messageId;
     }
     if (prepared?.kind === 'succeeded') {
@@ -5738,14 +5801,30 @@ async function cmdSend(rest: string[]): Promise<void> {
       { sendMessage, replyMessage },
       {
         appId,
-        targetChatId,
-        quoteTargetId,
-        content,
-        msgType,
+        targetChatId: canonicalOutput.targetChatId,
+        quoteTargetId: canonicalOutput.quoteTargetId,
+        content: canonicalOutput.content,
+        msgType: canonicalOutput.msgType,
         ...(prepared ? { uuid: prepared.providerKey } : {}),
         hookContext,
         MessageWithdrawnError,
-        dispatch,
+        // Explicit VC IM --into is rejected above, so an unquoted first send
+        // retains the normal chat-scope dispatch semantics. On a mismatch the
+        // frozen canonical target remains authoritative.
+        dispatch: prepared?.outputMismatch
+          ? (body, type, uuid) => {
+              revalidateVcMeetingManagedSend();
+              return sendMessage(
+                appId,
+                canonicalOutput.targetChatId,
+                body,
+                type,
+                uuid,
+                hookContext,
+              );
+            }
+          : dispatch,
+        beforeQuoteFallback: revalidateVcMeetingManagedSend,
         onQuoteWithdrawn: (id) => {
           console.error(`引用目标 ${id} 已撤回，改为普通发送`);
         },
@@ -5755,6 +5834,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (prepared?.kind === 'send' || prepared?.kind === 'succeeded') {
       finishVcMeetingImReply(resolveDataDir(), prepared.ref, result.messageId);
     }
+    recordVcMeetingPrimaryOutput(result.messageId, canonicalOutput.targetChatId);
     return result.messageId;
   };
 

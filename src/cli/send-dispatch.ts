@@ -371,6 +371,9 @@ export type DispatchPrimaryOptions = {
   uuid?: string;
   MessageWithdrawnError: new (...args: any[]) => Error;
   dispatch: (content: string, msgType: string, uuid?: string) => Promise<string>;
+  /** Revalidate any side-effect authority after an awaited quote failure and
+   * immediately before the fallback creates a top-level message. */
+  beforeQuoteFallback?: () => void | Promise<void>;
   onQuoteWithdrawn?: (messageId: string) => void;
 };
 
@@ -403,6 +406,7 @@ export async function dispatchPrimaryMessage(
     return { messageId, primaryQuotedId: opts.quoteTargetId };
   } catch (err: any) {
     if (err instanceof opts.MessageWithdrawnError) {
+      await opts.beforeQuoteFallback?.();
       opts.onQuoteWithdrawn?.(opts.quoteTargetId);
       return {
         messageId: await deps.sendMessage(

@@ -644,6 +644,11 @@ export function handleVcMeetingTurnTerminal(
           errorCode: terminal.errorCode ?? terminal.status,
           workerGeneration: context.workerGeneration,
           dispatchAttempt: terminal.dispatchAttempt,
+          // `cancelled` is an explicit terminal decision, not a transient
+          // execution fault. Fence the stream immediately so accepting the
+          // same envelope cannot spend the remaining automatic retry budget;
+          // an operator may still choose retry or abandon explicitly.
+          ...(terminal.status === 'cancelled' ? { pauseStream: true } : {}),
         });
   if (!transitioned.ok) return { handled: false, reason: transitioned.reason };
   const updated = findVcMeetingDeliveryByKey(deps.dataDir, terminal.turnId, {

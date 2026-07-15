@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
@@ -137,23 +137,66 @@ function ensureLockParent(fp: string): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function assertNoQuarantinedEvidence(fp: string, label: string): void {
+  const prefix = `${basename(fp)}.corrupt.`;
+  let quarantined = false;
+  try {
+    quarantined = readdirSync(dirname(fp)).some(name => name.startsWith(prefix));
+  } catch {
+    // A genuinely absent directory/store is initializable.
+  }
+  if (quarantined) {
+    throw new Error(`vc meeting ${label} store has quarantined evidence for ${fp}`);
+  }
+}
+
+function quarantineCorruptStore(fp: string, label: string, err: unknown): never {
+  const aside = `${fp}.corrupt.${Date.now()}.${process.pid}`;
+  try { renameSync(fp, aside); } catch { /* another process may already have quarantined it */ }
+  invalidateListenerAgentIndex();
+  logger.warn(
+    `[vc-meeting-runtime-store] corrupt ${label} store at ${fp}, moved aside to ${aside}: `
+    + `${err instanceof Error ? err.message : String(err)}`,
+  );
+  throw new Error(`vc meeting ${label} store is corrupt: ${aside}`);
+}
+
 function readStore(dataDir: string): Record<string, VcMeetingRuntimeSessionRecord> {
   const fp = filePath(dataDir);
-  if (!existsSync(fp)) return {};
+  if (!existsSync(fp)) {
+    assertNoQuarantinedEvidence(fp, 'runtime session');
+    return {};
+  }
   try {
-    const raw = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, unknown>;
-    const out: Record<string, VcMeetingRuntimeSessionRecord> = {};
+    const raw: unknown = JSON.parse(readFileSync(fp, 'utf-8'));
+    if (!isRecord(raw)) throw new Error('store root must be an object');
+    const out = Object.create(null) as Record<string, VcMeetingRuntimeSessionRecord>;
     for (const [key, value] of Object.entries(raw)) {
       const record = normalizeRecord(value);
-      if (record) out[key] = record;
+      if (!record) throw new Error(`invalid runtime session record at ${key}`);
+      if (key !== sessionKey(record.larkAppId, record.meeting.id)) {
+        throw new Error(`runtime session key mismatch at ${key}`);
+      }
+      out[key] = record;
     }
     return out;
   } catch (err) {
-    logger.warn(
-      `[vc-meeting-runtime-store] failed to read ${fp}: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    return quarantineCorruptStore(fp, 'runtime session', err);
+  }
+}
+
+function readStoreForAccess(dataDir: string): Record<string, VcMeetingRuntimeSessionRecord> {
+  const fp = filePath(dataDir);
+  if (!existsSync(fp)) {
+    assertNoQuarantinedEvidence(fp, 'runtime session');
     return {};
   }
+  ensureLockParent(fp);
+  return withFileLockSync(fp, () => readStore(dataDir));
 }
 
 function writeStore(dataDir: string, store: Record<string, VcMeetingRuntimeSessionRecord>): void {
@@ -168,21 +211,38 @@ function writeStore(dataDir: string, store: Record<string, VcMeetingRuntimeSessi
 
 function readEndedTombstoneStore(dataDir: string): Record<string, VcMeetingEndedTombstoneRecord> {
   const fp = endedTombstoneFilePath(dataDir);
-  if (!existsSync(fp)) return {};
+  if (!existsSync(fp)) {
+    assertNoQuarantinedEvidence(fp, 'ended tombstone');
+    return {};
+  }
   try {
-    const raw = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, unknown>;
-    const out: Record<string, VcMeetingEndedTombstoneRecord> = {};
+    const raw: unknown = JSON.parse(readFileSync(fp, 'utf-8'));
+    if (!isRecord(raw)) throw new Error('store root must be an object');
+    const out = Object.create(null) as Record<string, VcMeetingEndedTombstoneRecord>;
     for (const [key, value] of Object.entries(raw)) {
       const record = normalizeEndedTombstoneRecord(value);
-      if (record) out[key] = record;
+      if (!record) throw new Error(`invalid ended tombstone record at ${key}`);
+      if (key !== sessionKey(record.larkAppId, record.meetingId)) {
+        throw new Error(`ended tombstone key mismatch at ${key}`);
+      }
+      out[key] = record;
     }
     return out;
   } catch (err) {
-    logger.warn(
-      `[vc-meeting-runtime-store] failed to read ${fp}: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    return quarantineCorruptStore(fp, 'ended tombstone', err);
+  }
+}
+
+function readEndedTombstoneStoreForAccess(
+  dataDir: string,
+): Record<string, VcMeetingEndedTombstoneRecord> {
+  const fp = endedTombstoneFilePath(dataDir);
+  if (!existsSync(fp)) {
+    assertNoQuarantinedEvidence(fp, 'ended tombstone');
     return {};
   }
+  ensureLockParent(fp);
+  return withFileLockSync(fp, () => readEndedTombstoneStore(dataDir));
 }
 
 function writeEndedTombstoneStore(dataDir: string, store: Record<string, VcMeetingEndedTombstoneRecord>): void {
@@ -396,6 +456,62 @@ function singularSelectionAliases(
   };
 }
 
+function isValidStoredTimestamp(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function hasOwnField(record: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+function isCanonicalStoredIdList(value: unknown): value is string[] {
+  if (!Array.isArray(value)) return false;
+  const normalized = normalizeIdList(value);
+  return normalized.length === value.length
+    && normalized.every((id, index) => id === value[index]);
+}
+
+function hasValidCurrentOptionalFields(r: Record<string, unknown>): boolean {
+  if (hasOwnField(r, 'consumerMode')
+    && r.consumerMode !== 'pending'
+    && r.consumerMode !== 'listenOnly'
+    && r.consumerMode !== 'agent') return false;
+  if (hasOwnField(r, 'consumerClosePhase')
+    && r.consumerClosePhase !== 'data_closing'
+    && r.consumerClosePhase !== 'finalizing') return false;
+  if (hasOwnField(r, 'textOutputPolicy') && !isOutputPolicy(r.textOutputPolicy)) return false;
+  if (hasOwnField(r, 'voiceOutputPolicy') && !isOutputPolicy(r.voiceOutputPolicy)) return false;
+  for (const key of [
+    'consumerFinalizationDeadlineAt',
+    'consumerCloseResolutionDeadlineAt',
+    'consumerSelectionExpiresAt',
+    'listenerPresenceChangedAtMs',
+  ] as const) {
+    if (hasOwnField(r, key) && !isValidStoredTimestamp(r[key])) return false;
+  }
+  if (hasOwnField(r, 'syncIntervalMs')
+    && (typeof r.syncIntervalMs !== 'number'
+      || !Number.isFinite(r.syncIntervalMs)
+      || r.syncIntervalMs <= 0)) return false;
+  if (hasOwnField(r, 'listenerPresenceStale') && typeof r.listenerPresenceStale !== 'boolean') return false;
+  if (hasOwnField(r, 'listenerPresenceGeneration')
+    && (typeof r.listenerPresenceGeneration !== 'number'
+      || !Number.isInteger(r.listenerPresenceGeneration)
+      || r.listenerPresenceGeneration < 0)) return false;
+  for (const key of [
+    'attentionTargetOpenId',
+    'consumerCardMessageId',
+    'listenerRejoinNonce',
+    'listenerRejoinCardMessageId',
+  ] as const) {
+    if (hasOwnField(r, key) && (typeof r[key] !== 'string' || !r[key].trim())) return false;
+  }
+  for (const key of ['temporaryInstructionOpenIds', 'temporaryInstructionUnionIds'] as const) {
+    if (hasOwnField(r, key) && !isCanonicalStoredIdList(r[key])) return false;
+  }
+  return true;
+}
+
 function normalizeRecord(value: unknown): VcMeetingRuntimeSessionRecord | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const r = value as Record<string, unknown>;
@@ -405,15 +521,26 @@ function normalizeRecord(value: unknown): VcMeetingRuntimeSessionRecord | undefi
     && r.schemaVersion !== RUNTIME_SCHEMA_VERSION) {
     return undefined;
   }
+  // Records written before schemaVersion was introduced have the v1 shape.
+  // Only that legacy shape may recover selection from the singular aliases;
+  // v2/v3 selectedAgents is authoritative and therefore required.
+  const sourceSchemaVersion = r.schemaVersion ?? 1;
   const meeting = r.meeting;
   if (!meeting || typeof meeting !== 'object' || Array.isArray(meeting)) return undefined;
   const m = meeting as Record<string, unknown>;
   if (typeof r.larkAppId !== 'string' || !r.larkAppId.trim()) return undefined;
   if (typeof m.id !== 'string' || !m.id.trim()) return undefined;
   if (typeof r.listenerChatId !== 'string' || !r.listenerChatId.trim()) return undefined;
-  const createdAt = typeof r.createdAt === 'number' && Number.isFinite(r.createdAt) ? r.createdAt : Date.now();
-  const updatedAt = typeof r.updatedAt === 'number' && Number.isFinite(r.updatedAt) ? r.updatedAt : createdAt;
-  const expiresAt = typeof r.expiresAt === 'number' && Number.isFinite(r.expiresAt)
+  if (sourceSchemaVersion === RUNTIME_SCHEMA_VERSION
+    && (!isValidStoredTimestamp(r.createdAt)
+      || !isValidStoredTimestamp(r.updatedAt)
+      || !isValidStoredTimestamp(r.expiresAt)
+      || !hasValidCurrentOptionalFields(r))) {
+    return undefined;
+  }
+  const createdAt = isValidStoredTimestamp(r.createdAt) ? r.createdAt : Date.now();
+  const updatedAt = isValidStoredTimestamp(r.updatedAt) ? r.updatedAt : createdAt;
+  const expiresAt = isValidStoredTimestamp(r.expiresAt)
     ? r.expiresAt
     : updatedAt + DEFAULT_TTL_MS;
   let selectedAgents: VcMeetingRuntimeSelectedAgent[];
@@ -421,9 +548,11 @@ function normalizeRecord(value: unknown): VcMeetingRuntimeSessionRecord | undefi
     const normalized = normalizeSelectedAgents(r.selectedAgents);
     if (!normalized.ok) return undefined;
     selectedAgents = normalized.agents;
-  } else {
+  } else if (sourceSchemaVersion === 1) {
     const legacy = legacySelectedAgent(r);
     selectedAgents = legacy ? [legacy] : [];
+  } else {
+    return undefined;
   }
   const singularAliases = singularSelectionAliases(selectedAgents);
   return {
@@ -501,15 +630,12 @@ function normalizeEndedTombstoneRecord(value: unknown): VcMeetingEndedTombstoneR
   const r = value as Record<string, unknown>;
   if (typeof r.larkAppId !== 'string' || !r.larkAppId.trim()) return undefined;
   if (typeof r.meetingId !== 'string' || !r.meetingId.trim()) return undefined;
-  const endedAt = typeof r.endedAt === 'number' && Number.isFinite(r.endedAt) ? r.endedAt : Date.now();
-  const expiresAt = typeof r.expiresAt === 'number' && Number.isFinite(r.expiresAt)
-    ? r.expiresAt
-    : endedAt + DEFAULT_ENDED_TOMBSTONE_TTL_MS;
+  if (!isValidStoredTimestamp(r.endedAt) || !isValidStoredTimestamp(r.expiresAt)) return undefined;
   return {
     larkAppId: r.larkAppId.trim(),
     meetingId: r.meetingId.trim(),
-    endedAt,
-    expiresAt,
+    endedAt: r.endedAt,
+    expiresAt: r.expiresAt,
   };
 }
 
@@ -535,7 +661,7 @@ export function listVcMeetingRuntimeSessions(
   larkAppId: string,
   now = Date.now(),
 ): VcMeetingRuntimeSessionRecord[] {
-  const store = readStore(dataDir);
+  const store = readStoreForAccess(dataDir);
   const out: VcMeetingRuntimeSessionRecord[] = [];
   for (const record of Object.values(store)) {
     if (record.expiresAt <= now) continue;
@@ -578,6 +704,7 @@ export function listVcMeetingRuntimeSessionsByListenerAndAgent(
     stats = statSync(fp);
   } catch {
     invalidateListenerAgentIndex();
+    assertNoQuarantinedEvidence(fp, 'runtime session');
     return [];
   }
 
@@ -593,7 +720,7 @@ export function listVcMeetingRuntimeSessionsByListenerAndAgent(
   ) {
     byListenerAgent = cached.byListenerAgent;
   } else {
-    const store = readStore(dataDir);
+    const store = readStoreForAccess(dataDir);
     byListenerAgent = new Map<string, VcMeetingRuntimeSessionRecord[]>();
     for (const record of Object.values(store)) {
       if (record.consumerMode !== 'agent') continue;
@@ -679,12 +806,15 @@ export function recordVcMeetingRuntimeSession(
   },
   now = Date.now(),
 ): void {
-  if (!input.larkAppId.trim() || !input.meeting.id.trim() || !input.listenerChatId.trim()) return;
+  const larkAppId = input.larkAppId.trim();
+  const meetingId = input.meeting.id.trim();
+  const listenerChatId = input.listenerChatId.trim();
+  if (!larkAppId || !meetingId || !listenerChatId) return;
   const fp = filePath(dataDir);
   ensureLockParent(fp);
   withFileLockSync(fp, () => {
     const store = readStore(dataDir);
-    const key = sessionKey(input.larkAppId, input.meeting.id);
+    const key = sessionKey(larkAppId, meetingId);
     const prior = store[key];
     let selectedAgents: VcMeetingRuntimeSelectedAgent[];
     if (input.selectedAgents !== undefined) {
@@ -702,13 +832,13 @@ export function recordVcMeetingRuntimeSession(
     const singularAliases = singularSelectionAliases(selectedAgents);
     store[key] = {
       schemaVersion: RUNTIME_SCHEMA_VERSION,
-      larkAppId: input.larkAppId,
+      larkAppId,
       meeting: {
-        id: input.meeting.id,
+        id: meetingId,
         ...(input.meeting.meetingNo ? { meetingNo: input.meeting.meetingNo } : {}),
         ...(input.meeting.topic ? { topic: input.meeting.topic } : {}),
       },
-      listenerChatId: input.listenerChatId,
+      listenerChatId,
       ...(input.attentionTargetOpenId ? { attentionTargetOpenId: input.attentionTargetOpenId } : {}),
       ...(input.consumerMode ? { consumerMode: input.consumerMode } : {}),
       selectedAgents,
@@ -803,7 +933,7 @@ export function hasVcMeetingEndedTombstone(
   const normalizedMeetingId = meetingId.trim();
   if (!normalizedLarkAppId || !normalizedMeetingId) return false;
   const key = sessionKey(normalizedLarkAppId, normalizedMeetingId);
-  const store = readEndedTombstoneStore(dataDir);
+  const store = readEndedTombstoneStoreForAccess(dataDir);
   const record = store[key];
   if (!record) return false;
   if (record.expiresAt > now) return true;

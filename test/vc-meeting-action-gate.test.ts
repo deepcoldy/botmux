@@ -252,6 +252,29 @@ describe('vc meeting managed action gate', () => {
     expect(gate.authorize).not.toHaveBeenCalled();
   });
 
+  it('does not let a delivery inherit a later sink owner generation on its first action', async () => {
+    // The delivery was accepted under owner generation 1 in beforeEach. Its
+    // first action arrives only after ownership has churned to generation 3.
+    expect(applyVcMeetingMemberProjection(dir, projection({
+      membershipGeneration: 2,
+      sinkOwnerGeneration: 3,
+    }), 130)).toMatchObject({ ok: true });
+
+    const gate = deps();
+    expect(await requestVcMeetingManagedAction(request(), gate, 140)).toMatchObject({
+      status: 409,
+      body: {
+        errorCode: 'stale_owner_generation',
+        action: {
+          status: 'rejected',
+          ownerGeneration: 1,
+          errorCode: 'stale_owner_generation',
+        },
+      },
+    });
+    expect(gate.authorize).not.toHaveBeenCalled();
+  });
+
   it('does not let stale attempt N poison the action before live attempt N+1', async () => {
     expect(markVcMeetingDeliveryAmbiguous(dir, {
       listenerAppId: LISTENER,
@@ -431,17 +454,147 @@ describe('vc meeting managed action gate', () => {
       status: 'presented',
       externalRefs: { cardMessageId: 'om_approval' },
     }, 150)).toMatchObject({ kind: 'updated', record: { approvalCard: { status: 'presented' } } });
-    const approved = resolveVcMeetingManagedActionApproval(dir, {
+    const approved = await resolveVcMeetingManagedActionApproval(dir, {
       listenerAppId: LISTENER,
       meetingId: MEETING,
       actionId: action.actionId,
       inputHash: action.inputHash,
-    }, 'approved', { externalRefs: { operatorOpenId: 'ou_operator' } }, 160);
+    }, 'approved', {
+      externalRefs: { operatorOpenId: 'ou_operator' },
+      revalidate: async () => ({ kind: 'allow' }),
+    }, 160);
     expect(approved).toMatchObject({
       kind: 'execute',
       action: { status: 'attempting', attemptCount: 1 },
       plan: { providerKey: action.providerKey },
     });
+  });
+
+  it('expires a pending approval when the member is removed before the click', async () => {
+    const first = await requestVcMeetingManagedAction(request(), deps({ kind: 'approval' }), 140);
+    if (!first.body.ok || first.body.kind !== 'needsApproval') throw new Error('expected approval plan');
+    expect(applyVcMeetingMemberProjection(dir, projection({
+      membershipGeneration: 2,
+      status: 'removed',
+    }), 150)).toMatchObject({ ok: true });
+    const revalidate = vi.fn(async () => ({ kind: 'allow' as const }));
+
+    expect(await resolveVcMeetingManagedActionApproval(dir, {
+      listenerAppId: LISTENER,
+      meetingId: MEETING,
+      actionId: first.body.action.actionId,
+      inputHash: first.body.action.inputHash,
+    }, 'approved', { revalidate }, 160)).toMatchObject({
+      kind: 'resolved',
+      action: {
+        status: 'expired',
+        attemptCount: 0,
+        errorCode: 'membership_removed',
+      },
+    });
+    expect(revalidate).not.toHaveBeenCalled();
+  });
+
+  it('expires a pending approval when a newer member epoch supersedes it', async () => {
+    const first = await requestVcMeetingManagedAction(request(), deps({ kind: 'approval' }), 140);
+    if (!first.body.ok || first.body.kind !== 'needsApproval') throw new Error('expected approval plan');
+    expect(applyVcMeetingMemberProjection(dir, projection({
+      memberEpoch: 2,
+      membershipGeneration: 2,
+      receiverSessionId: 'receiver-session-2',
+    }), 150)).toMatchObject({ ok: true });
+    const revalidate = vi.fn(async () => ({ kind: 'allow' as const }));
+
+    expect(await resolveVcMeetingManagedActionApproval(dir, {
+      listenerAppId: LISTENER,
+      meetingId: MEETING,
+      actionId: first.body.action.actionId,
+      inputHash: first.body.action.inputHash,
+    }, 'approved', { revalidate }, 160)).toMatchObject({
+      kind: 'resolved',
+      action: {
+        status: 'expired',
+        attemptCount: 0,
+        errorCode: 'stale_member_epoch',
+      },
+    });
+    expect(revalidate).not.toHaveBeenCalled();
+  });
+
+  it('expires a pending approval when sink ownership changes before the click', async () => {
+    const first = await requestVcMeetingManagedAction(request(), deps({ kind: 'approval' }), 140);
+    if (!first.body.ok || first.body.kind !== 'needsApproval') throw new Error('expected approval plan');
+    expect(applyVcMeetingMemberProjection(dir, projection({
+      membershipGeneration: 2,
+      sinkOwnerGeneration: 2,
+    }), 150)).toMatchObject({ ok: true });
+    const revalidate = vi.fn(async () => ({ kind: 'allow' as const }));
+
+    expect(await resolveVcMeetingManagedActionApproval(dir, {
+      listenerAppId: LISTENER,
+      meetingId: MEETING,
+      actionId: first.body.action.actionId,
+      inputHash: first.body.action.inputHash,
+    }, 'approved', { revalidate }, 160)).toMatchObject({
+      kind: 'resolved',
+      action: {
+        status: 'expired',
+        attemptCount: 0,
+        errorCode: 'stale_owner_generation',
+      },
+    });
+    expect(revalidate).not.toHaveBeenCalled();
+  });
+
+  it('rechecks member fences after an asynchronous approval hook', async () => {
+    const first = await requestVcMeetingManagedAction(request(), deps({ kind: 'approval' }), 140);
+    if (!first.body.ok || first.body.kind !== 'needsApproval') throw new Error('expected approval plan');
+    const revalidate = vi.fn(async () => {
+      expect(applyVcMeetingMemberProjection(dir, projection({
+        membershipGeneration: 2,
+        sinkOwnerGeneration: 2,
+      }), 155)).toMatchObject({ ok: true });
+      return { kind: 'allow' as const };
+    });
+
+    expect(await resolveVcMeetingManagedActionApproval(dir, {
+      listenerAppId: LISTENER,
+      meetingId: MEETING,
+      actionId: first.body.action.actionId,
+      inputHash: first.body.action.inputHash,
+    }, 'approved', { revalidate }, 160)).toMatchObject({
+      kind: 'resolved',
+      action: {
+        status: 'expired',
+        attemptCount: 0,
+        errorCode: 'stale_owner_generation',
+      },
+    });
+    expect(revalidate).toHaveBeenCalledTimes(1);
+  });
+
+  it('revalidates the live meeting phase before claiming an approved action', async () => {
+    const first = await requestVcMeetingManagedAction(request(), deps({ kind: 'approval' }), 140);
+    if (!first.body.ok || first.body.kind !== 'needsApproval') throw new Error('expected approval plan');
+    const revalidate = vi.fn(async () => ({
+      kind: 'deny' as const,
+      reason: 'meeting_phase_closed' as const,
+    }));
+
+    expect(await resolveVcMeetingManagedActionApproval(dir, {
+      listenerAppId: LISTENER,
+      meetingId: MEETING,
+      actionId: first.body.action.actionId,
+      inputHash: first.body.action.inputHash,
+    }, 'approved', { revalidate }, 160)).toMatchObject({
+      kind: 'resolved',
+      action: {
+        status: 'expired',
+        attemptCount: 0,
+        errorCode: 'meeting_phase_closed',
+      },
+    });
+    expect(revalidate).toHaveBeenCalledTimes(1);
   });
 
   it('durably rejects a denied output policy and replays that terminal decision', async () => {

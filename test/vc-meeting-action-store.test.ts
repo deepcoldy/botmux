@@ -278,7 +278,10 @@ describe('vc meeting action store', () => {
     // Terminal card replay may enrich provider evidence without changing state.
     expect(finishVcMeetingApprovalCard(dir, ref(record), {
       status: 'presented',
-      externalRefs: { approvalCardId: 'card_1' },
+      externalRefs: {
+        approvalMessageId: 'om_late_duplicate_must_not_win',
+        approvalCardId: 'card_1',
+      },
     }, 124)).toMatchObject({
       kind: 'updated',
       record: {
@@ -388,7 +391,10 @@ describe('vc meeting action store', () => {
     });
     expect(finishVcMeetingAction(dir, ref(record), {
       status: 'succeeded',
-      externalRefs: { lookupEvidence: 'confirmed' },
+      externalRefs: {
+        providerMessageId: 'om_late_duplicate_must_not_win',
+        lookupEvidence: 'confirmed',
+      },
     }, 150)).toMatchObject({
       kind: 'updated',
       record: {
@@ -401,6 +407,29 @@ describe('vc meeting action store', () => {
         },
       },
     });
+  });
+
+  it('expires a legacy approved crash residue instead of executing it on boot', () => {
+    const record = expectRecord(beginVcMeetingAction(dir, action(), 100));
+    markVcMeetingActionPendingApproval(dir, ref(record), 110);
+    expect(resolveVcMeetingActionApproval(dir, ref(record), 'approved', {}, 120)).toMatchObject({
+      kind: 'updated',
+      record: { status: 'approved', attemptCount: 0 },
+    });
+
+    const reconciled = reconcileVcMeetingActionsOnBoot(
+      dir,
+      { listenerAppId: LISTENER, meetingId: MEETING },
+      130,
+    );
+    expect(reconciled.providerAttempts).toEqual([]);
+    expect(reconciled.terminalizedExpired).toMatchObject([{
+      actionId: record.actionId,
+      status: 'expired',
+      attemptCount: 0,
+      errorCode: 'approval_revalidation_required_after_restart',
+      finishedAt: 130,
+    }]);
   });
 
   it('guards transitions with the immutable input hash', () => {

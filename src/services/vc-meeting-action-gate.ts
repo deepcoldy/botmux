@@ -137,6 +137,23 @@ export interface VcMeetingImActionGateDeps {
   ) => VcMeetingActionAuthorizationDecision | Promise<VcMeetingActionAuthorizationDecision>;
 }
 
+export interface VcMeetingApprovalRevalidationContext {
+  projection: Readonly<VcMeetingMemberProjectionRecord>;
+  action: Readonly<VcMeetingActionRecord>;
+  sink: VcMeetingActionSink;
+}
+
+export interface VcMeetingApprovalResolutionOptions {
+  externalRefs?: Record<string, unknown>;
+  errorCode?: string;
+  /** Re-check live listener phase/session and sink policy immediately before
+   * an approved action is write-ahead claimed. Structural membership and
+   * owner fences are enforced by this module before this hook runs. */
+  revalidate?: (
+    context: VcMeetingApprovalRevalidationContext,
+  ) => VcMeetingActionAuthorizationDecision | Promise<VcMeetingActionAuthorizationDecision>;
+}
+
 export interface VcMeetingGenericProviderExecutionPlan {
   actionId: string;
   inputHash: string;
@@ -495,10 +512,6 @@ export async function requestVcMeetingManagedAction(
   if (historicalProjection.receiverSessionId !== request.receiverSessionId) {
     return errorResult(409, 'receiver_session_changed', 'membership receiver session no longer matches the delivery');
   }
-  if (!isPositiveSafeInteger(historicalProjection.sinkOwnerGeneration)) {
-    return errorResult(409, 'projection_policy_invalid', 'membership projection has no valid sink owner generation');
-  }
-
   const sink = request.channel === 'voice' ? 'meeting_voice' : 'meeting_text';
   const canonicalInput = {
     content: request.content,
@@ -506,28 +519,24 @@ export async function requestVcMeetingManagedAction(
       ? { fallbackText: request.fallbackText }
       : {}),
   };
-  const actionIdentity = {
-    listenerAppId: lookup.memberKey.listenerAppId,
-    meetingId: lookup.memberKey.meetingId,
-    memberId: lookup.memberKey.memberId,
-    memberEpoch: lookup.memberKey.memberEpoch,
-    agentAppId: deps.selfAgentAppId,
-    ownerGeneration: historicalProjection.sinkOwnerGeneration,
-    source: {
-      kind: 'delivery',
-      key: lookup.receipt.deliveryKey,
-      deliverySeq: lookup.receipt.toSeq,
-    },
-    sink,
-    actionSlot: 'primary',
-    canonicalInput,
+  const source = {
+    kind: 'delivery',
+    key: lookup.receipt.deliveryKey,
+    deliverySeq: lookup.receipt.toSeq,
   } as const;
 
   // Read an already-established lifecycle before *current* receipt/member
   // fencing. This preserves deterministic terminal/pending/attempting replay,
   // while a stale attempt that is first to arrive still cannot create and
   // poison the primary action identity.
-  const proposedActionId = deriveVcMeetingActionId(actionIdentity);
+  const proposedActionId = deriveVcMeetingActionId({
+    meetingId: lookup.memberKey.meetingId,
+    memberId: lookup.memberKey.memberId,
+    memberEpoch: lookup.memberKey.memberEpoch,
+    source,
+    sink,
+    actionSlot: 'primary',
+  });
   const proposedInputHash = computeInputHash(canonicalInput);
   const existing = findVcMeetingAction(deps.dataDir, {
     listenerAppId: lookup.memberKey.listenerAppId,
@@ -561,20 +570,45 @@ export async function requestVcMeetingManagedAction(
     return errorResult(409, 'stale_dispatch_attempt', 'action origin does not match the live delivery attempt');
   }
 
-  const begun = beginVcMeetingAction(deps.dataDir, actionIdentity, now);
-  if (begun.kind === 'conflict') {
-    if (begun.reason === 'input_mismatch') {
+  let record = existing;
+  let begunKind: 'created' | 'existing' = existing ? 'existing' : 'created';
+  if (!record) {
+    // This is the authorization snapshot carried by the source turn. Reading
+    // the mutable projection here would let a delivery accepted under owner
+    // generation N execute for the first time after ownership churned to N+2.
+    if (!isPositiveSafeInteger(lookup.receipt.sinkOwnerGeneration)) {
       return errorResult(
         409,
-        'action_input_mismatch',
-        'this delivery already has an action for the sink; treat it as handled and do not change content or slot',
-        begun.record,
+        'receipt_policy_snapshot_missing',
+        'delivery receipt has no valid sink owner generation snapshot',
       );
     }
-    return errorResult(400, `action_${begun.reason}`, begun.detail ?? 'action intent is invalid', begun.record);
+    const begun = beginVcMeetingAction(deps.dataDir, {
+      listenerAppId: lookup.memberKey.listenerAppId,
+      meetingId: lookup.memberKey.meetingId,
+      memberId: lookup.memberKey.memberId,
+      memberEpoch: lookup.memberKey.memberEpoch,
+      agentAppId: deps.selfAgentAppId,
+      ownerGeneration: lookup.receipt.sinkOwnerGeneration,
+      source,
+      sink,
+      actionSlot: 'primary',
+      canonicalInput,
+    }, now);
+    if (begun.kind === 'conflict') {
+      if (begun.reason === 'input_mismatch') {
+        return errorResult(
+          409,
+          'action_input_mismatch',
+          'this delivery already has an action for the sink; treat it as handled and do not change content or slot',
+          begun.record,
+        );
+      }
+      return errorResult(400, `action_${begun.reason}`, begun.detail ?? 'action intent is invalid', begun.record);
+    }
+    record = begun.record;
+    begunKind = begun.kind;
   }
-
-  let record = begun.record;
   if (record.agentAppId !== deps.selfAgentAppId) {
     return errorResult(409, 'wrong_agent', 'existing action belongs to another consumer agent');
   }
@@ -582,12 +616,20 @@ export async function requestVcMeetingManagedAction(
   // is safe to resume because all subsequent claims are store-atomic. Every
   // other status is an observable existing lifecycle result and is replayed
   // before current fencing.
-  if (begun.kind === 'existing' && record.status !== 'requested') return existingResult(record);
+  if (begunKind === 'existing' && record.status !== 'requested') return existingResult(record);
 
+  const recordBeforeFencing = record;
   const rejectFencing = (
     code: string,
     message: string,
-  ): VcMeetingActionGateResult => rejectNewAction(deps, record, 409, code, message, now);
+  ): VcMeetingActionGateResult => rejectNewAction(
+    deps,
+    recordBeforeFencing,
+    409,
+    code,
+    message,
+    now,
+  );
 
   const current = currentProjection(deps.dataDir, historicalProjection);
   if (current.maxEpoch !== lookup.memberKey.memberEpoch) {
@@ -963,18 +1005,149 @@ export type VcMeetingApprovalResolutionResult =
   | { kind: 'resolved' | 'existing'; action: VcMeetingActionRecord }
   | { kind: 'conflict'; reason: string; action?: VcMeetingActionRecord };
 
+function approvalResolutionFromTransition(
+  result: VcMeetingActionTransitionResult,
+): VcMeetingApprovalResolutionResult {
+  if (result.kind === 'conflict') {
+    return {
+      kind: 'conflict',
+      reason: result.reason,
+      ...(result.record ? { action: result.record } : {}),
+    };
+  }
+  return {
+    kind: result.kind === 'existing' ? 'existing' : 'resolved',
+    action: result.record,
+  };
+}
+
+function expireApprovalAfterFenceFailure(
+  dataDir: string,
+  ref: VcMeetingActionRef,
+  opts: VcMeetingApprovalResolutionOptions,
+  errorCode: string,
+  now: number,
+): VcMeetingApprovalResolutionResult {
+  return approvalResolutionFromTransition(resolveVcMeetingActionApproval(
+    dataDir,
+    ref,
+    'expired',
+    {
+      ...(opts.externalRefs ? { externalRefs: opts.externalRefs } : {}),
+      errorCode,
+    },
+    now,
+  ));
+}
+
+type ApprovalStructuralFenceResult =
+  | { ok: true; projection: VcMeetingMemberProjectionRecord }
+  | { ok: false; errorCode: string };
+
+function validateApprovalStructuralFence(
+  dataDir: string,
+  action: VcMeetingActionRecord,
+): ApprovalStructuralFenceResult {
+  const historicalProjection = getVcMeetingMemberProjection(dataDir, {
+    listenerAppId: action.listenerAppId,
+    meetingId: action.meetingId,
+    memberId: action.memberId,
+    memberEpoch: action.memberEpoch,
+  });
+  if (!historicalProjection) return { ok: false, errorCode: 'projection_not_found' };
+  const current = currentProjection(dataDir, historicalProjection);
+  if (current.maxEpoch !== action.memberEpoch) {
+    return { ok: false, errorCode: 'stale_member_epoch' };
+  }
+  if (!current.projection) return { ok: false, errorCode: 'projection_not_found' };
+  if (current.projection.status !== 'active') {
+    return { ok: false, errorCode: `membership_${current.projection.status}` };
+  }
+  if (current.projection.agentAppId !== action.agentAppId) {
+    return { ok: false, errorCode: 'wrong_agent' };
+  }
+  if (!isPositiveSafeInteger(current.projection.sinkOwnerGeneration)) {
+    return { ok: false, errorCode: 'projection_policy_invalid' };
+  }
+  if (current.projection.sinkOwnerGeneration !== action.ownerGeneration) {
+    return { ok: false, errorCode: 'stale_owner_generation' };
+  }
+  return { ok: true, projection: current.projection };
+}
+
 /**
  * Apply a human approval decision. Approval write and provider claim are both
  * durable before an execution plan is returned.
  */
-export function resolveVcMeetingManagedActionApproval(
+export async function resolveVcMeetingManagedActionApproval(
   dataDir: string,
   ref: VcMeetingActionRef,
   decision: 'approved' | 'rejected' | 'expired',
-  opts: { externalRefs?: Record<string, unknown>; errorCode?: string } = {},
+  opts: VcMeetingApprovalResolutionOptions = {},
   now = Date.now(),
-): VcMeetingApprovalResolutionResult {
+): Promise<VcMeetingApprovalResolutionResult> {
   if (decision === 'approved') {
+    const action = findVcMeetingAction(dataDir, {
+      listenerAppId: ref.listenerAppId,
+      meetingId: ref.meetingId,
+    }, ref.actionId);
+    if (!action) return { kind: 'conflict', reason: 'not_found' };
+    if (action.inputHash !== ref.inputHash) {
+      return { kind: 'conflict', reason: 'input_mismatch', action };
+    }
+    // Replays after the write-ahead claim or a terminal result disclose the
+    // established lifecycle without consulting mutable current authority.
+    if (action.status === 'attempting' || isVcMeetingActionTerminal(action.status)) {
+      return { kind: 'existing', action };
+    }
+    if (action.status !== 'pendingApproval' && action.status !== 'approved') {
+      return { kind: 'conflict', reason: 'invalid_transition', action };
+    }
+
+    const beforeAuthorization = validateApprovalStructuralFence(dataDir, action);
+    if (!beforeAuthorization.ok) {
+      return expireApprovalAfterFenceFailure(
+        dataDir,
+        ref,
+        opts,
+        beforeAuthorization.errorCode,
+        now,
+      );
+    }
+    if (!opts.revalidate) {
+      return { kind: 'conflict', reason: 'approval_revalidation_required', action };
+    }
+    let authorization: VcMeetingActionAuthorizationDecision;
+    try {
+      authorization = await opts.revalidate({
+        projection: beforeAuthorization.projection,
+        action,
+        sink: action.sink,
+      });
+    } catch {
+      return { kind: 'conflict', reason: 'authorization_unavailable', action };
+    }
+    if (!authorization || !['allow', 'approval', 'deny'].includes(authorization.kind)) {
+      return { kind: 'conflict', reason: 'authorization_invalid_result', action };
+    }
+    if (authorization.kind === 'deny') {
+      return expireApprovalAfterFenceFailure(dataDir, ref, opts, authorization.reason, now);
+    }
+
+    // The live phase hook may be asynchronous. Re-read cross-process member
+    // fences after it resolves so a concurrent remove/re-add or owner transfer
+    // cannot win the await window and then be followed by a stale claim.
+    const beforeClaim = validateApprovalStructuralFence(dataDir, action);
+    if (!beforeClaim.ok) {
+      return expireApprovalAfterFenceFailure(
+        dataDir,
+        ref,
+        opts,
+        beforeClaim.errorCode,
+        now,
+      );
+    }
+
     const claimed = approveAndClaimVcMeetingAction(dataDir, ref, {
       ...(opts.externalRefs ? { externalRefs: opts.externalRefs } : {}),
     }, now);
@@ -984,11 +1157,10 @@ export function resolveVcMeetingManagedActionApproval(
     if (claimed.kind === 'existing') return { kind: 'existing', action: claimed.record };
     return { kind: 'execute', action: claimed.record, plan: executionPlan(claimed.record) };
   }
-  const resolved = resolveVcMeetingActionApproval(dataDir, ref, decision, opts, now);
-  if (resolved.kind === 'conflict') {
-    return { kind: 'conflict', reason: resolved.reason, ...(resolved.record ? { action: resolved.record } : {}) };
-  }
-  return { kind: resolved.kind === 'existing' ? 'existing' : 'resolved', action: resolved.record };
+  return approvalResolutionFromTransition(resolveVcMeetingActionApproval(dataDir, ref, decision, {
+    ...(opts.externalRefs ? { externalRefs: opts.externalRefs } : {}),
+    ...(opts.errorCode ? { errorCode: opts.errorCode } : {}),
+  }, now));
 }
 
 /** Useful to callers deciding whether an existing result is final for display. */

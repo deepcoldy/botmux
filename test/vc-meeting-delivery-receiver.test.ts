@@ -672,6 +672,43 @@ describe('vc meeting delivery receiver', () => {
     });
   });
 
+  it('poisons an explicitly cancelled attempt without spending the remaining automatic retry budget', async () => {
+    const harness = receiverHarness(dir, { workerGeneration: 12 });
+    await registerActiveMember(harness);
+    const request = delivery();
+    const { deliveryKey } = deriveVcMeetingDeliveryIdentity(request);
+    await receiveVcMeetingDelivery(request, harness.deps);
+
+    expect(handleVcMeetingTurnTerminal({
+      type: 'turn_terminal',
+      sessionId: SESSION_ID,
+      turnId: deliveryKey,
+      dispatchAttempt: 1,
+      status: 'cancelled',
+    }, { workerGeneration: 12 }, harness.deps)).toMatchObject({
+      handled: true,
+      receipt: {
+        status: 'failed_terminal',
+        errorCode: 'cancelled',
+        dispatchAttempt: 1,
+        receiverCommittedThrough: 0,
+      },
+    });
+
+    expect(await receiveVcMeetingDelivery(structuredClone(request), harness.deps)).toMatchObject({
+      status: 409,
+      body: {
+        errorCode: 'stream_poisoned',
+        activeDeliveryKey: deliveryKey,
+        receiverCommittedThrough: 0,
+      },
+    });
+    expect(harness.dispatchTurn).toHaveBeenCalledTimes(1);
+    expect(getVcMeetingDeliveryStatus(deliveryKey, harness.deps)).toMatchObject({
+      body: { status: 'failed_terminal', errorCode: 'cancelled', dispatchAttempt: 1 },
+    });
+  });
+
   it('keeps the cursor unchanged when trigger dispatch fails and retries the same envelope', async () => {
     let calls = 0;
     const harness = receiverHarness(dir, {
