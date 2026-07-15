@@ -127,6 +127,12 @@ import { ScreenAnalyzer } from './utils/screen-analyzer.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
 import { chooseWebTerminalSeed } from './utils/web-terminal-seed.js';
+import {
+  mergeHerdrWebSnapshot,
+  renderHerdrWebHistory,
+  type HerdrWebHistoryState,
+  type HerdrWebScrollDirection,
+} from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
 import { detectCliUsageLimit, usageLimitStateKey, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
@@ -2591,6 +2597,8 @@ const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 
 const MAX_SCROLLBACK = 1_000_000; // chars (~1MB)
 let scrollback = '';
+let herdrWebHistory: HerdrWebHistoryState | null = null;
+let herdrWebScrollDirection: HerdrWebScrollDirection = null;
 const WORKFLOW_TRANSCRIPT_MAX = 2_000_000; // chars (~2MB)
 const WORKFLOW_OUTPUT_END_MARKER = '</WORKFLOW_OUTPUT>';
 const CRASH_DIAGNOSTIC_RAW_MAX = 200_000; // enough scrollback for the web terminal without huge temp files
@@ -2606,6 +2614,26 @@ let workflowFinalOutputSent = false;
 let altBufferActive = false;
 const ALT_ENTER_RE = /\x1b\[\?(1049|1047|47)h/g;
 const ALT_EXIT_RE = /\x1b\[\?(1049|1047|47)l/g;
+
+function usesHerdrSnapshotWebHistory(): boolean {
+  return backend instanceof HerdrBackend && cliAdapter?.altScreen === true;
+}
+
+function relayHerdrWebSnapshot(snapshot: string): void {
+  const merged = mergeHerdrWebSnapshot(
+    herdrWebHistory,
+    snapshot,
+    herdrWebScrollDirection,
+    MAX_SCROLLBACK,
+  );
+  herdrWebHistory = merged.state;
+  herdrWebScrollDirection = null;
+  scrollback = renderHerdrWebHistory(merged.state);
+  const payload = `\x1b]1989;history;${merged.addedLines}\x07${scrollback}`;
+  for (const ws of wsClients) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+  }
+}
 
 function recentTerminalLogTail(): string | undefined {
   const plain = stripAnsiForLog(tailChars(scrollback, CRASH_DIAGNOSTIC_RAW_MAX));
@@ -3316,7 +3344,7 @@ function onPtyData(data: string): void {
   // no relay needed. In non-tmux mode AND in pipe mode (adopt-bridge),
   // broadcast through the shared scrollback so all connected web clients
   // render the same byte stream.
-  if (!isTmuxMode || isPipeMode) {
+  if ((!isTmuxMode || isPipeMode) && !usesHerdrSnapshotWebHistory()) {
     // Track alt-buffer state so we can restore it in the scrollback prefix.
     // Scan for the *last* toggle in this chunk — that's the current state.
     let lastToggleIdx = -1;
@@ -4113,7 +4141,12 @@ function setupAdoptIdleDetection(cfg: Extract<DaemonToWorker, { type: 'init' }>,
 function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurrentScreen'>): void {
   try {
     const initial = be.captureCurrentScreen?.() ?? '';
-    if (initial.length > 0) onPtyData(initial);
+    if (initial.length > 0) {
+      onPtyData(initial);
+      if (be instanceof HerdrBackend && cliAdapter?.altScreen === true) {
+        relayHerdrWebSnapshot(initial);
+      }
+    }
   } catch (err: any) {
     log(`${source} captureCurrentScreen failed: ${err.message}`);
   }
@@ -5404,6 +5437,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   });
 
   backend.onData(onPtyData);
+  if (backend instanceof HerdrBackend && cliAdapter?.altScreen === true) {
+    backend.onSnapshot(relayHerdrWebSnapshot);
+  }
   backend.onExit((code, signal) => {
     log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
     const logTail = recentTerminalLogTail();
@@ -5516,6 +5552,8 @@ function killCli(): void {
   isPromptReady = false;
   pendingMessages.length = 0;
   scrollback = '';
+  herdrWebHistory = null;
+  herdrWebScrollDirection = null;
   altBufferActive = false;
   trustHandled = false;
   codexUpdateDialogGuard.reset();
@@ -5746,12 +5784,14 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           const sz = (backend as ObserveBackend).getPaneSize();
           if (sz && sz.cols > 0 && sz.rows > 0) ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
         }
-        const seed = chooseWebTerminalSeed({
-          canCapture: isPipeMode && isObserveBackend(backend),
-          capture: () => (backend as ObserveBackend).captureCurrentScreen(),
-          scrollback,
-          onError: log,
-        });
+        const seed = usesHerdrSnapshotWebHistory() && scrollback.length > 0
+          ? scrollback
+          : chooseWebTerminalSeed({
+            canCapture: isPipeMode && isObserveBackend(backend),
+            capture: () => (backend as ObserveBackend).captureCurrentScreen(),
+            scrollback,
+            onError: log,
+          });
         if (seed.length > 0) {
           ws.send(seed);
         }
@@ -5785,6 +5825,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 // viewers page back through an alt-screen TUI's history (Claude etc.,
                 // which has no local scrollback). Everything else is dropped.
                 if (!/^(\x1b\[<6[4-7];\d+;\d+M)+$/.test(msg.data)) return;
+              }
+              if (usesHerdrSnapshotWebHistory()) {
+                if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
+                else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
               }
               backend?.write(msg.data);
             }
@@ -6101,6 +6145,21 @@ window.addEventListener('resize',onViewportResize);
   ws.onopen=function(){el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize()};
   ws.onmessage=function(e){
     var data=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);
+    // Snapshot-aware Herdr history replaces the buffer instead of appending a
+    // mostly-overlapping full screen. Preserve the reader's anchor when older
+    // rows were prepended; otherwise preserve their current position/follow.
+    var _hh=data.match(/^\x1b\]1989;history;([0-9]+)\x07/);
+    if(_hh){
+      var _ha=+_hh[1],_hb=term.buffer.active,_hy=_hb.viewportY,_hBottom=_hy===_hb.baseY;
+      data=data.slice(_hh[0].length);_cancelInitialFollow();term.reset();term.clear();
+      data='\\x1b[2J\\x1b[H'+data;
+      term.write(data,function(){
+        if(_ha>0)term.scrollToLine(_hy+_ha);
+        else if(_hBottom)term.scrollToBottom();
+        else term.scrollToLine(_hy);
+      });
+      return;
+    }
     // Managed Herdr has one authoritative pane grid shared by every viewer.
     // Followers render at the owner's grid; a promoted owner re-fits to its
     // own viewport and reports the new size back to the worker.
@@ -6156,7 +6215,7 @@ function _canScrollLocal(px){
   var b=term.buffer.active;
   if(b.type==='alternate'||!px)return false;
   if(!remoteScroll)return true;
-  return px<0?b.viewportY>0:b.viewportY<b.baseY;
+  return px>0||b.viewportY>0;
 }
 // Map a viewport pixel (clientX/Y) to a 1-based terminal cell "col;row", clamped to
 // the grid. The forwarded SGR wheel event MUST carry the cell UNDER THE POINTER, the

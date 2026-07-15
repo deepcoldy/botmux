@@ -659,7 +659,9 @@ describe('HerdrBackend callbacks', () => {
     // the data stream emits only deltas.
     const be = new HerdrBackend(SESSION, { isReattach: true });
     const seen: string[] = [];
+    const snapshots: string[] = [];
     be.onData(d => seen.push(d));
+    be.onSnapshot(frame => snapshots.push(frame));
     be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
 
     // Reattach captures the current screen as baseline → no immediate emit.
@@ -668,10 +670,12 @@ describe('HerdrBackend callbacks', () => {
     paneText = 'hello world';
     vi.advanceTimersByTime(600); // > POLL_INTERVAL_MS (500ms)
     expect(seen).toEqual([' world']);
+    expect(snapshots).toEqual(['hello world']);
 
     paneText = 'hello world!';
     vi.advanceTimersByTime(600);
     expect(seen).toEqual([' world', '!']);
+    expect(snapshots).toEqual(['hello world', 'hello world!']);
 
     be.kill();
   });

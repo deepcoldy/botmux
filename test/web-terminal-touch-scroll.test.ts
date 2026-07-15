@@ -37,9 +37,17 @@ describe('web terminal touch scrolling', () => {
 
     expect(wheelBlock).toContain('function _canScrollLocal(px){');
     expect(wheelBlock).toContain("if(b.type==='alternate'||!px)return false");
-    expect(wheelBlock).toContain('return px<0?b.viewportY>0:b.viewportY<b.baseY');
+    expect(wheelBlock).toContain('return px>0||b.viewportY>0');
     expect(wheelBlock).toContain('if(_canScrollLocal(px)){');
     expect(touchBlock).toContain('if(_canScrollLocal(px)){');
+  });
+
+  it('replaces merged Herdr history and preserves the reader anchor', () => {
+    expect(workerSource).toContain('1989;history;${merged.addedLines}');
+    expect(workerSource).toContain("var _hh=data.match(/^\\x1b\\]1989;history;([0-9]+)\\x07/)");
+    expect(workerSource).toContain('data=data.slice(_hh[0].length);_cancelInitialFollow();term.reset();term.clear()');
+    expect(workerSource).toContain("data='\\\\x1b[2J\\\\x1b[H'+data");
+    expect(workerSource).toContain('if(_ha>0)term.scrollToLine(_hy+_ha)');
   });
 
   it('drives normal-buffer scroll explicitly instead of relying on WebView defaults', () => {

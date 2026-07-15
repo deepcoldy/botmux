@@ -119,6 +119,7 @@ export class HerdrBackend implements SessionBackend {
   private pollTimer: NodeJS.Timeout | null = null;
   private statusWaitProcesses: ChildProcess[] = [];
   private readonly dataCbs: Array<(d: string) => void> = [];
+  private readonly snapshotCbs: Array<(snapshot: string) => void> = [];
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
   private readonly agentName = 'botmux';
   private paneId: string | undefined;
@@ -341,6 +342,11 @@ export class HerdrBackend implements SessionBackend {
     this.dataCbs.push(cb);
   }
 
+  /** Full interpreted terminal frame for snapshot-aware web history merging. */
+  onSnapshot(cb: (snapshot: string) => void): void {
+    this.snapshotCbs.push(cb);
+  }
+
   onExit(cb: (code: number | null, signal: string | null) => void): void {
     this.exitCbs.push(cb);
   }
@@ -528,6 +534,9 @@ export class HerdrBackend implements SessionBackend {
     if (this.exited) return;
     const next = this.readRecentAnsi();
     if (!next || next === this.lastText) return;
+    for (const cb of this.snapshotCbs) {
+      try { cb(next); } catch { /* listener crash shouldn't kill polling */ }
+    }
     let delta = '';
     if (next.startsWith(this.lastText)) {
       delta = next.slice(this.lastText.length);
