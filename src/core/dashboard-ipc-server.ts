@@ -63,10 +63,10 @@ import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, resolveAllowedUsersWithMap, getMessageChatId, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
-import { parseSpawnRequest } from './session-create.js';
+import { parseSpawnRequest, validateInheritedTopicTarget } from './session-create.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { buildTerminalUrl } from './terminal-url.js';
@@ -426,10 +426,20 @@ ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
   const parsed = parseSpawnRequest(body);
   if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error });
+  if (parsed.value.topicPolicy === 'inherit') {
+    const rootTarget = await validateInheritedTopicTarget({
+      larkAppId: cachedLarkAppId,
+      chatId: parsed.value.chatId,
+      rootMessageId: parsed.value.rootMessageId!,
+      getMessageChatId,
+    });
+    if (!rootTarget.ok) return jsonRes(res, 400, { ok: false, error: rootTarget.error });
+  }
   const postBanner = !!(body as any).postBanner;
   const r = await spawnDashboardSession(activeSessions, undefined, {
     larkAppId: cachedLarkAppId,
     chatId: parsed.value.chatId,
+    rootMessageId: parsed.value.topicPolicy === 'inherit' ? parsed.value.rootMessageId : undefined,
     content: parsed.value.content,
     column: parsed.value.column,
     role: parsed.value.role,

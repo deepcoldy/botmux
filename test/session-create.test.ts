@@ -4,6 +4,7 @@ import {
   normalizeCreateColumn,
   deriveSessionTitleFromContent,
   parseSpawnRequest,
+  validateInheritedTopicTarget,
   composeSpawnUserContent,
   buildLeadDispatchPreamble,
   buildCollabNote,
@@ -53,6 +54,15 @@ describe('parseSpawnRequest', () => {
     }
   });
 
+  it('accepts topicPolicy=inherit with a rootMessageId', () => {
+    const r = parseSpawnRequest({ ...base, topicPolicy: 'inherit', rootMessageId: 'om_root_123' });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.topicPolicy).toBe('inherit');
+      expect(r.value.rootMessageId).toBe('om_root_123');
+    }
+  });
+
   it('rejects a non-oc_ chatId', () => {
     expect(parseSpawnRequest({ ...base, chatId: 'om_msg' })).toMatchObject({ ok: false, error: 'bad_chat_id' });
     expect(parseSpawnRequest({ ...base, chatId: '' })).toMatchObject({ ok: false, error: 'bad_chat_id' });
@@ -75,9 +85,37 @@ describe('parseSpawnRequest', () => {
     expect(parseSpawnRequest({ ...base, role: 'boss' })).toMatchObject({ ok: false, error: 'bad_role' });
   });
 
+  it('rejects malformed inherited-topic routing fields', () => {
+    expect(parseSpawnRequest({ ...base, topicPolicy: 'inherit' })).toMatchObject({ ok: false, error: 'root_message_id_required' });
+    expect(parseSpawnRequest({ ...base, topicPolicy: 'inherit', rootMessageId: 'oc_chat' })).toMatchObject({ ok: false, error: 'bad_root_message_id' });
+    expect(parseSpawnRequest({ ...base, topicPolicy: 'reuse', rootMessageId: 'om_root' })).toMatchObject({ ok: false, error: 'bad_topic_policy' });
+    expect(parseSpawnRequest({ ...base, rootMessageId: 'om_root' })).toMatchObject({ ok: false, error: 'topic_policy_required' });
+  });
+
   it('rejects a non-object body', () => {
     expect(parseSpawnRequest(null)).toMatchObject({ ok: false, error: 'bad_request' });
     expect(parseSpawnRequest('nope')).toMatchObject({ ok: false, error: 'bad_request' });
+  });
+});
+
+describe('validateInheritedTopicTarget', () => {
+  it('passes when the root message belongs to the requested chat', async () => {
+    const r = await validateInheritedTopicTarget({
+      larkAppId: 'cli_app',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      getMessageChatId: async () => 'oc_chat',
+    });
+    expect(r).toEqual({ ok: true, value: { chatId: 'oc_chat', rootMessageId: 'om_root' } });
+  });
+
+  it('fails closed when the root message is invisible or belongs to another chat', async () => {
+    await expect(validateInheritedTopicTarget({
+      larkAppId: 'cli_app', chatId: 'oc_chat', rootMessageId: 'om_root', getMessageChatId: async () => null,
+    })).resolves.toMatchObject({ ok: false, error: 'root_message_not_found' });
+    await expect(validateInheritedTopicTarget({
+      larkAppId: 'cli_app', chatId: 'oc_chat', rootMessageId: 'om_root', getMessageChatId: async () => 'oc_other',
+    })).resolves.toMatchObject({ ok: false, error: 'root_message_chat_mismatch' });
   });
 });
 

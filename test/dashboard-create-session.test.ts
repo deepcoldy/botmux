@@ -34,12 +34,13 @@ vi.mock('../src/services/session-store.js', () => ({
 vi.mock('../src/services/message-queue.js', () => ({ ensureQueue: vi.fn() }));
 
 const sendMessageMock = vi.fn(async () => 'om_banner_123');
+const replyMessageMock = vi.fn(async () => 'om_thread_banner_123');
 vi.mock('../src/im/lark/client.js', () => ({
   sendMessage: (...a: any[]) => sendMessageMock(...a),
+  replyMessage: (...a: any[]) => replyMessageMock(...a),
   downloadMessageResource: vi.fn(),
   listChatBotMembers: vi.fn(async () => []),
   getChatMode: vi.fn(),
-  replyMessage: vi.fn(),
   UserTokenMissingError: class extends Error {},
 }));
 
@@ -100,6 +101,7 @@ beforeEach(() => {
   sessionSeq = 0;
   forkWorkerMock.mockClear();
   sendMessageMock.mockClear();
+  replyMessageMock.mockClear();
   (dashboardEventBus.publish as any).mockClear();
 });
 
@@ -174,6 +176,25 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
     expect(prompt).toContain('<botmux_lead_dispatch>');
     expect(prompt).toContain('Sub1');
   });
+
+  it('can create a fresh session/CLI routed to an inherited topic root', async () => {
+    const active = new Map<string, DaemonSession>();
+    const rootMessageId = 'om_existing_topic';
+    const r = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, rootMessageId, content: '继续这个任务', column: 'in_progress', role: 'solo', postBanner: true,
+    });
+    expect(r.ok).toBe(true);
+    expect(active.get(sessionKey(CHAT, APP))).toBeUndefined();
+    const ds = active.get(sessionKey(rootMessageId, APP))!;
+    expect(ds).toBeTruthy();
+    expect(ds.scope).toBe('thread');
+    expect(ds.session.scope).toBe('thread');
+    expect(ds.session.chatId).toBe(CHAT);
+    expect(ds.session.rootMessageId).toBe(rootMessageId);
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    expect(replyMessageMock).toHaveBeenCalledWith(APP, rootMessageId, expect.stringContaining('继续这个任务'), 'text', true);
+    expect(sendMessageMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('spawnDashboardSession — guards', () => {
@@ -182,6 +203,37 @@ describe('spawnDashboardSession — guards', () => {
     await spawnDashboardSession(active, undefined, { larkAppId: APP, chatId: CHAT, content: 'a', column: 'backlog', role: 'solo' });
     const r2 = await spawnDashboardSession(active, undefined, { larkAppId: APP, chatId: CHAT, content: 'b', column: 'in_progress', role: 'solo' });
     expect(r2).toMatchObject({ ok: false, error: 'session_exists' });
+  });
+
+  it('guards collisions by inherited topic root rather than chatId', async () => {
+    const active = new Map<string, DaemonSession>();
+    await spawnDashboardSession(active, undefined, { larkAppId: APP, chatId: CHAT, rootMessageId: 'om_topic_a', content: 'a', column: 'backlog', role: 'solo' });
+    const sameTopic = await spawnDashboardSession(active, undefined, { larkAppId: APP, chatId: CHAT, rootMessageId: 'om_topic_a', content: 'b', column: 'in_progress', role: 'solo' });
+    expect(sameTopic).toMatchObject({ ok: false, error: 'session_exists' });
+    const otherTopic = await spawnDashboardSession(active, undefined, { larkAppId: APP, chatId: CHAT, rootMessageId: 'om_topic_b', content: 'c', column: 'backlog', role: 'solo' });
+    expect(otherTopic.ok).toBe(true);
+  });
+
+  it('treats pendingRepo inherited-topic sessions as collisions too', async () => {
+    const active = new Map<string, DaemonSession>();
+    const rootMessageId = 'om_topic_pending';
+    active.set(sessionKey(rootMessageId, APP), {
+      session: { sessionId: 'pending', chatId: CHAT, rootMessageId, title: 'pending', status: 'active', createdAt: new Date().toISOString(), scope: 'thread' } as Session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: APP,
+      chatId: CHAT,
+      chatType: 'group',
+      scope: 'thread',
+      spawnedAt: 0,
+      cliVersion: 'test',
+      lastMessageAt: 0,
+      hasHistory: false,
+      pendingRepo: true,
+    });
+    const r = await spawnDashboardSession(active, undefined, { larkAppId: APP, chatId: CHAT, rootMessageId, content: 'new', column: 'in_progress', role: 'solo' });
+    expect(r).toMatchObject({ ok: false, error: 'session_exists' });
   });
 });
 
