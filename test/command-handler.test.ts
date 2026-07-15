@@ -345,6 +345,20 @@ vi.mock('../src/services/doc-pending-approvals-store.js', () => ({
   listPendingApprovals: vi.fn(() => []),
 }));
 
+vi.mock('../src/services/vc-meeting-preparations-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/vc-meeting-preparations-store.js')>()),
+  findVcMeetingPreparationByChat: vi.fn(() => undefined),
+  getVcMeetingPreparation: vi.fn(() => undefined),
+  listVcMeetingPreparations: vi.fn(() => []),
+  putVcMeetingPreparation: vi.fn((_: string, input: any) => ({
+    ...input,
+    createdAt: 1,
+    updatedAt: 1,
+  })),
+  removeVcMeetingPreparation: vi.fn(() => undefined),
+  removeVcMeetingPreparationsByChat: vi.fn(() => 0),
+}));
+
 // The picker query helper now lives in services/relay-picker.ts — mock it so
 // the /relay picker tests can control the entry list directly without
 // patching activeSessions in lots of places.
@@ -427,6 +441,7 @@ import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SC
 import { resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
 import { putDocSubscription, removeDocSubscription, listAllDocSubscriptions, getDocSubscription } from '../src/services/doc-subs-store.js';
 import { bindOncall } from '../src/services/oncall-store.js';
+import { putVcMeetingPreparation } from '../src/services/vc-meeting-preparations-store.js';
 import { existsSync, statSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -544,7 +559,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/meeting', '/insight', '/dashboard', '/vc-auth'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -571,9 +586,9 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 29 = the prior 28 commands + /watch-comment. /subscribe-lark-doc remains
+    // 30 = the prior 29 commands + /meeting. /subscribe-lark-doc remains
     // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(29);
+    expect(DAEMON_COMMANDS.size).toBe(30);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -667,6 +682,7 @@ describe('SESSIONLESS_DAEMON_COMMANDS set', () => {
   it('keeps the whole /watch-comment family session-less', () => {
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/watch-comment')).toBe(true);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/subscribe-lark-doc')).toBe(false);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/meeting')).toBe(false);
   });
 
   it('excludes conversation/state commands that need a session', () => {
@@ -776,6 +792,68 @@ describe('/botconfig string field goes through coerceConfigValue (maxLen)', () =
       rmSync(dir, { recursive: true, force: true });
       vi.mocked(getBot).mockImplementation(defaultGetBot as any);
     }
+  });
+});
+
+describe('/meeting preparation command', () => {
+  it('binds a regular chat-scope Agent session to the normalized meeting number', async () => {
+    const ds = makeDaemonSession({
+      scope: 'chat',
+      session: makeSession({ scope: 'chat' }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand(
+      '/meeting',
+      ROOT_ID,
+      makeLarkMessage('/meeting prepare https://vc-my.larkoffice.com/j/688542737 --qa auto', { senderId: 'ou_owner' }),
+      deps,
+      LARK_APP_ID,
+    );
+
+    expect(putVcMeetingPreparation).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        larkAppId: LARK_APP_ID,
+        meetingNo: '688542737',
+        prepChatId: CHAT_ID,
+        agentAppId: LARK_APP_ID,
+        agentSessionId: 'sess-001',
+        qaMode: 'auto',
+      }),
+    );
+    expect(deps.sessionReply).toHaveBeenCalledWith(
+      ROOT_ID,
+      expect.stringMatching(/688542737[\s\S]*当前会话未绑定项目目录/),
+      undefined,
+      LARK_APP_ID,
+      'msg_001',
+    );
+  });
+
+  it('reports the project already bound to the preparation session', async () => {
+    const ds = makeDaemonSession({
+      scope: 'chat',
+      workingDir: '/work/ai-coding',
+      session: makeSession({ scope: 'chat', workingDir: '/work/ai-coding' }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand(
+      '/meeting',
+      ROOT_ID,
+      makeLarkMessage('/meeting prepare 688542737', { senderId: 'ou_owner' }),
+      deps,
+      LARK_APP_ID,
+    );
+
+    expect(deps.sessionReply).toHaveBeenCalledWith(
+      ROOT_ID,
+      expect.stringContaining('已复用当前会话绑定的项目：/work/ai-coding'),
+      undefined,
+      LARK_APP_ID,
+      'msg_001',
+    );
   });
 });
 
@@ -955,7 +1033,11 @@ describe('handleCommand', () => {
     });
 
     it('/watch-comment works without a User Token and records the comment watch', async () => {
-      const ds = makeDaemonSession({ scope: 'thread' });
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        workingDir: '/work/current-session',
+        session: makeSession({ workingDir: '/work/current-session' }),
+      });
       const deps = makeDeps(ds);
 
       await handleCommand(
@@ -982,12 +1064,60 @@ describe('handleCommand', () => {
           sessionId: 'sess-001',
           scope: 'thread',
           commentTriggerMode: 'all',
+          workingDir: '/work/current-session',
           managedBy: 'watch-comment',
         }),
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在启动并预热 AI 会话'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('工作目录：/work/current-session'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('/watch-comment without a bound project asks whether to bind one and defaults to document-only', async () => {
+      const ds = makeDaemonSession({ scope: 'chat', session: makeSession({ scope: 'chat' }) });
+      const deps = makeDeps(ds);
+      vi.mocked(getDocSubscription).mockReturnValueOnce({
+        fileToken: 'doc_token_12345678901234567890',
+        fileType: 'docx',
+        sessionAnchor: 'old-anchor',
+        scope: 'chat',
+        chatId: 'old-chat',
+        commentTriggerMode: 'all',
+        managedBy: 'watch-comment',
+        workingDir: '/work/old-binding',
+        pollBaselineReady: true,
+        pollCursorAt: 1,
+        pollCursorReplyId: 'reply-1',
+        createdAt: 1,
+      } as any);
+
+      await handleCommand(
+        '/watch-comment',
+        ROOT_ID,
+        makeLarkMessage('/watch-comment https://example.feishu.cn/docx/AbCdEf12345678901234 --all', { senderId: 'ou_owner' }),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(putDocSubscription).toHaveBeenCalledWith(
+        expect.any(String),
+        LARK_APP_ID,
+        expect.objectContaining({ workingDir: undefined }),
+      );
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('不操作则默认仅根据文档内容回答'),
         undefined,
         LARK_APP_ID,
         'msg_001',

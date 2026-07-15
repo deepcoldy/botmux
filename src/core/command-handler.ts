@@ -34,12 +34,21 @@ import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/cod
 import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
 import { listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
+import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
 import { latestDocCommentPollCursor } from './doc-comment-poller.js';
 import {
   putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription,
   type CommentTriggerMode, type DocSubscription,
 } from '../services/doc-subs-store.js';
 import { getPendingApproval, removePendingApproval, listPendingApprovals } from '../services/doc-pending-approvals-store.js';
+import {
+  findVcMeetingPreparationByChat,
+  getVcMeetingPreparation,
+  listVcMeetingPreparations,
+  putVcMeetingPreparation,
+  removeVcMeetingPreparation,
+  removeVcMeetingPreparationsByChat,
+} from '../services/vc-meeting-preparations-store.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import {
   CONFIG_FIELDS, findConfigField, settableFieldKeys, parseBooleanValue,
@@ -1982,7 +1991,12 @@ export async function handleCommand(
           const mode: CommentTriggerMode = request.requestedMode
             ?? (botCfg.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
           const anchor = ds ? sessionAnchorId(ds) : `doc:${file.fileToken}`;
-          const effectiveDir = validatedDir ?? existing?.workingDir ?? botCfg.docRepoMap?.[file.fileToken];
+          // Existing chat/thread sessions own their project binding. A watch
+          // without an explicit --dir inherits that binding; session-less
+          // document watches keep their own stored/mapped directory fallback.
+          const effectiveDir = ds
+            ? (validatedDir ?? ds.workingDir ?? ds.session.workingDir)
+            : (validatedDir ?? existing?.workingDir ?? botCfg.docRepoMap?.[file.fileToken]);
           let pollCursorAt: number | undefined;
           let pollCursorReplyId: string | undefined;
           let pollBaselineReady: boolean | undefined;
@@ -2030,6 +2044,7 @@ export async function handleCommand(
             mode: modeLabel(mode),
           }, loc);
           if (effectiveDir) replyText += `\n📂 ${t('cmd.watch.working_dir', { dir: effectiveDir }, loc)}`;
+          else replyText += `\n\n${t(ds ? 'cmd.watch.project_optional_session' : 'cmd.watch.project_optional_lazy', undefined, loc)}`;
           if (ds && deps.prewarmDocCommentSession) {
             try {
               await deps.prewarmDocCommentSession(ds, subscription);
@@ -2044,6 +2059,93 @@ export async function handleCommand(
         } catch (err) {
           await sessionReply(rootId, t('cmd.watch.failed', { err: err instanceof Error ? err.message : String(err) }, loc));
         }
+        break;
+      }
+
+      case '/meeting': {
+        if (!larkAppId) {
+          await sessionReply(rootId, t('cmd.meeting.no_session', undefined, loc));
+          break;
+        }
+        const ownerOpenId = getOwnerOpenId(larkAppId);
+        if (!ownerOpenId || message.senderId !== ownerOpenId) {
+          await sessionReply(rootId, t('cmd.meeting.owner_only', undefined, loc));
+          break;
+        }
+        const request = parseVcMeetingPrepareCommand(message.content);
+        const dataDir = config.session.dataDir;
+        if (request.kind === 'usage' || request.kind === 'invalid') {
+          const prefix = request.kind === 'invalid'
+            ? `${t('cmd.meeting.invalid', undefined, loc)}\n\n`
+            : '';
+          await sessionReply(rootId, prefix + t('cmd.meeting.usage', undefined, loc));
+          break;
+        }
+        if (request.kind === 'status') {
+          const requestedRecord = request.meetingNo
+            ? getVcMeetingPreparation(dataDir, larkAppId, request.meetingNo)
+            : undefined;
+          const records = request.meetingNo
+            ? (requestedRecord ? [requestedRecord] : [])
+            : listVcMeetingPreparations(dataDir, larkAppId);
+          if (records.length === 0) {
+            await sessionReply(rootId, t('cmd.meeting.none', undefined, loc));
+            break;
+          }
+          const lines = records.map(record => [
+            `• ${record.topic || record.meetingNo}`,
+            `  meetingNo: \`${record.meetingNo}\``,
+            `  chat: \`${record.prepChatId}\``,
+            `  agent: \`${record.agentAppId}\``,
+            `  Q&A: ${record.qaMode}`,
+          ].join('\n'));
+          await sessionReply(rootId, [t('cmd.meeting.status_title', undefined, loc), '', ...lines].join('\n'));
+          break;
+        }
+        if (request.kind === 'off') {
+          let count = 0;
+          if (request.all) {
+            for (const record of listVcMeetingPreparations(dataDir, larkAppId)) {
+              if (removeVcMeetingPreparation(dataDir, larkAppId, record.meetingNo)) count += 1;
+            }
+          } else if (request.meetingNo) {
+            count = removeVcMeetingPreparation(dataDir, larkAppId, request.meetingNo) ? 1 : 0;
+          } else if (ds) {
+            count = removeVcMeetingPreparationsByChat(dataDir, larkAppId, ds.chatId);
+          }
+          await sessionReply(rootId, count > 0
+            ? t('cmd.meeting.stopped', { count }, loc)
+            : t('cmd.meeting.none', undefined, loc));
+          break;
+        }
+        if (!ds || ds.chatType !== 'group' || ds.scope !== 'chat') {
+          await sessionReply(rootId, t('cmd.meeting.need_group_chat', undefined, loc));
+          break;
+        }
+        const existingInChat = findVcMeetingPreparationByChat(dataDir, larkAppId, ds.chatId);
+        const record = putVcMeetingPreparation(dataDir, {
+          larkAppId,
+          meetingNo: request.meetingNo,
+          ...(request.meetingLink ? { meetingLink: request.meetingLink } : {}),
+          prepChatId: ds.chatId,
+          agentAppId: larkAppId,
+          agentSessionId: ds.session.sessionId,
+          ownerOpenId: message.senderId,
+          qaMode: request.qaMode,
+        });
+        const replaced = existingInChat && existingInChat.meetingNo !== record.meetingNo
+          ? `\n${t('cmd.meeting.replaced', { meetingNo: existingInChat.meetingNo }, loc)}`
+          : '';
+        let preparedText = t('cmd.meeting.prepared', {
+          meetingNo: record.meetingNo,
+          qaMode: record.qaMode,
+        }, loc) + replaced;
+        const meetingProjectDir = ds.workingDir ?? ds.session.workingDir;
+        preparedText += meetingProjectDir
+          ? `\n\n${t('cmd.meeting.project_bound', { dir: meetingProjectDir }, loc)}`
+          : `\n\n${t('cmd.meeting.project_optional', undefined, loc)}`;
+        await sessionReply(rootId, preparedText);
+        logger.info(`[${logTag}] /meeting prepare meetingNo=${record.meetingNo} chat=${record.prepChatId} agent=${record.agentAppId} qa=${record.qaMode}`);
         break;
       }
 
@@ -2939,6 +3041,7 @@ export async function handleCommand(
           t('help.land', undefined, loc),
           t('help.subscribe_doc', undefined, loc),
           t('help.watch_comment', undefined, loc),
+          t('help.meeting', undefined, loc),
           t('help.summary', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),

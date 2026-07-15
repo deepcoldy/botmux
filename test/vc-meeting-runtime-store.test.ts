@@ -41,6 +41,10 @@ describe('vc meeting runtime store', () => {
       consumerCardMessageId: 'om_card_1',
       temporaryInstructionOpenIds: ['ou_temp_1', 'ou_temp_1', ' ', 'ou_temp_2'],
       temporaryInstructionUnionIds: ['on_temp_1', 'on_temp_1', ' ', 'on_temp_2'],
+      preparationMeetingNo: '123456789',
+      qaMode: 'auto',
+      qaAgentAppId: 'cli_qa_agent',
+      qaRecentOutputHashes: ['hash_a', 'hash_a', 'hash_b'],
     }, 1_000);
 
     expect(listVcMeetingRuntimeSessions(dir, 'cli_a', 1_500)).toEqual([{
@@ -56,6 +60,10 @@ describe('vc meeting runtime store', () => {
       consumerCardMessageId: 'om_card_1',
       temporaryInstructionOpenIds: ['ou_temp_1', 'ou_temp_2'],
       temporaryInstructionUnionIds: ['on_temp_1', 'on_temp_2'],
+      preparationMeetingNo: '123456789',
+      qaMode: 'auto',
+      qaAgentAppId: 'cli_qa_agent',
+      qaRecentOutputHashes: ['hash_a', 'hash_b'],
       createdAt: 1_000,
       updatedAt: 1_000,
       expiresAt: 86_401_000,
