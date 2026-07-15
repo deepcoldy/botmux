@@ -23,6 +23,13 @@ export type CreateSessionColumn = (typeof CREATE_SESSION_COLUMNS)[number];
 export type SpawnRole = 'solo' | 'lead' | 'collab';
 export const SPAWN_ROLES: readonly SpawnRole[] = ['solo', 'lead', 'collab'];
 
+/** Optional routing policy for /api/sessions/spawn.
+ *  - absent: keep the existing dashboard-created chat-scope session behavior.
+ *  - inherit: create a new botmux/CLI session but route all replies to an
+ *    existing Lark topic identified by rootMessageId. */
+export type SpawnTopicPolicy = 'inherit';
+export const SPAWN_TOPIC_POLICIES: readonly SpawnTopicPolicy[] = ['inherit'];
+
 const TITLE_MAX = 50;
 
 export interface Coworker {
@@ -45,6 +52,12 @@ export function normalizeCreateColumn(value: unknown): CreateSessionColumn | nul
 function normalizeSpawnRole(value: unknown): SpawnRole | null {
   return typeof value === 'string' && (SPAWN_ROLES as readonly string[]).includes(value)
     ? (value as SpawnRole)
+    : null;
+}
+
+function normalizeSpawnTopicPolicy(value: unknown): SpawnTopicPolicy | null {
+  return typeof value === 'string' && (SPAWN_TOPIC_POLICIES as readonly string[]).includes(value)
+    ? (value as SpawnTopicPolicy)
     : null;
 }
 
@@ -107,6 +120,8 @@ export interface SpawnRequest {
   column: CreateSessionColumn;
   role: SpawnRole;
   coworkers: Coworker[];
+  topicPolicy?: SpawnTopicPolicy;
+  rootMessageId?: string;
   ownerOpenId?: string;
   ownerUnionId?: string;
   title?: string;
@@ -144,6 +159,18 @@ export function parseSpawnRequest(body: unknown): ParseResult<SpawnRequest> {
   if (!column) return { ok: false, error: 'bad_column' };
   const role = normalizeSpawnRole(b.role);
   if (!role) return { ok: false, error: 'bad_role' };
+  const rawTopicPolicy = typeof b.topicPolicy === 'string' ? b.topicPolicy.trim() : '';
+  const rootMessageId = typeof b.rootMessageId === 'string' ? b.rootMessageId.trim() : '';
+  const topicPolicy = rawTopicPolicy ? normalizeSpawnTopicPolicy(rawTopicPolicy) : undefined;
+  if (rawTopicPolicy && !topicPolicy) return { ok: false, error: 'bad_topic_policy' };
+  if (topicPolicy === 'inherit') {
+    if (!rootMessageId) return { ok: false, error: 'root_message_id_required' };
+    if (!rootMessageId.startsWith('om_')) return { ok: false, error: 'bad_root_message_id' };
+  } else if (rootMessageId) {
+    // Avoid silently accepting a rootMessageId that would be ignored by the
+    // legacy/default path. Callers must opt in explicitly with topicPolicy.
+    return { ok: false, error: 'topic_policy_required' };
+  }
   const title = typeof b.title === 'string' && b.title.trim() ? b.title.trim().slice(0, 200) : undefined;
   return {
     ok: true,
@@ -153,9 +180,27 @@ export function parseSpawnRequest(body: unknown): ParseResult<SpawnRequest> {
       column,
       role,
       coworkers: parseCoworkers(b.coworkers),
+      ...(topicPolicy ? { topicPolicy } : {}),
+      ...(rootMessageId ? { rootMessageId } : {}),
       ownerOpenId: typeof b.ownerOpenId === 'string' && b.ownerOpenId.trim() ? b.ownerOpenId.trim() : undefined,
       ownerUnionId: typeof b.ownerUnionId === 'string' && b.ownerUnionId.trim() ? b.ownerUnionId.trim() : undefined,
       title,
     },
   };
+}
+
+export async function validateInheritedTopicTarget(args: {
+  larkAppId: string;
+  chatId: string;
+  rootMessageId: string;
+  getMessageChatId: (larkAppId: string, messageId: string) => Promise<string | null>;
+}): Promise<ParseResult<{ chatId: string; rootMessageId: string }>> {
+  const actualChatId = await args.getMessageChatId(args.larkAppId, args.rootMessageId);
+  if (!actualChatId) {
+    return { ok: false, error: 'root_message_not_found' };
+  }
+  if (actualChatId !== args.chatId) {
+    return { ok: false, error: 'root_message_chat_mismatch' };
+  }
+  return { ok: true, value: { chatId: args.chatId, rootMessageId: args.rootMessageId } };
 }

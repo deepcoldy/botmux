@@ -1605,6 +1605,13 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
   const larkAppId = ds.larkAppId;
   const bot = getBot(larkAppId);
   const locale = localeForBot(larkAppId);
+  const anchor = sessionAnchorId(ds);
+  const sendSpawnScopedMessage = async (content: string, msgType: 'text' | 'interactive' = 'text'): Promise<string> => {
+    const { replyMessage, sendMessage } = await import('../im/lark/client.js');
+    return ds.scope === 'thread'
+      ? replyMessage(larkAppId, anchor, content, msgType, true)
+      : sendMessage(larkAppId, ds.chatId, content, msgType);
+  };
 
   // 仅默认目录 + auto-worktree：ds.workingDir 命中本 bot 自己的默认目录（且非本群 oncall 绑定）时，
   // 走 pendingRepo 挂起 + 异步提交：把会话置 pendingRepo（入站路由 buffer 并发消息、不抢 fork），
@@ -1622,12 +1629,11 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
       // (The pending dashboard row is announced inside runAutoWorktreeCommit so all
       // three spawn callers get it from one place — no publish needed here.)
       const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
-      const { sendMessage } = await import('../im/lark/client.js');
       void runAutoWorktreeCommit({
-        ds, anchor: ds.chatId, larkAppId, baseDir,
+        ds, anchor, larkAppId, baseDir,
         title: ds.session.title, prompt: userContent,
         operatorOpenId: ds.session.ownerOpenId, activeSessions: registry,
-        notify: (m) => sendMessage(larkAppId, ds.chatId, m),
+        notify: (m) => sendSpawnScopedMessage(m),
       });
       logger.info(`[createSession] session ${ds.session.sessionId.substring(0, 8)} → pending, building worktree off ${baseDir}`);
       return;
@@ -1647,11 +1653,10 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
     const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
     if (projects.length > 0) {
       try {
-        const card = buildRepoSelectCard(projects, getSessionWorkingDir(ds), ds.chatId, locale, bot.config.worktreeMultiPicker);
-        const { sendMessage } = await import('../im/lark/client.js');
+        const card = buildRepoSelectCard(projects, getSessionWorkingDir(ds), anchor, locale, bot.config.worktreeMultiPicker);
         ds.pendingRepo = true;
         ds.pendingPrompt = userContent;
-        ds.repoCardMessageId = await sendMessage(larkAppId, ds.chatId, card, 'interactive');
+        ds.repoCardMessageId = await sendSpawnScopedMessage(card, 'interactive');
         announcePendingRepoSession(ds);
         // 弹卡片这条路不经 forkWorker，session.spawned 不会自动发——手动 upsert 一条，
         // 让 dashboard 显示这条「待选仓库」会话（in_progress 首次 spawn 走这里才会出现）。
@@ -1678,6 +1683,9 @@ export interface SpawnDashboardSessionArgs {
   larkAppId: string;
   /** 新建的飞书群（chat-scope 锚点）。 */
   chatId: string;
+  /** Optional existing topic root. When set, create a fresh session/CLI but
+   *  route all bot replies into this topic instead of the chat top level. */
+  rootMessageId?: string;
   /** 用户在弹框里写的原始任务内容。 */
   content: string;
   /** in_progress=立即开跑；backlog=入待办池（parked，不起 CLI）。 */
@@ -1695,7 +1703,9 @@ export interface SpawnDashboardSessionArgs {
   ownerUnionId?: string;
 }
 
-/** 在新建的飞书群里为某个 bot 拉起一条 chat-scope 会话（dashboard「创建会话」用）。
+/** 在飞书群里为某个 bot 拉起一条会话（dashboard「创建会话」/ API spawn 用）。
+ *  默认是 chat-scope；传入 rootMessageId 时创建 thread-scope：仍然是新的
+ *  botmux session + 新 CLI 进程，但回复锚到指定已有话题。
  *  column='in_progress' → 立即 forkWorker 把内容当首轮发给 CLI；
  *  column='backlog'     → 入待办池（parked：worker:null + session.queued + queuedPrompt），
  *                          等被激活（拖到进行中 / 点开始 / 群里来消息）再起 CLI。
@@ -1710,27 +1720,34 @@ export async function spawnDashboardSession(
   try { bot = getBot(larkAppId); } catch { return { ok: false, error: 'bot_not_found' }; }
   const locale = localeForBot(larkAppId);
 
-  // chat-scope：锚点就是 chatId。先挡掉「同群同 bot 已有真会话」的撞键（会被
-  // Map.set 覆盖而泄漏 worker）。queued 占位 / 纯 scratch 不算冲突。
-  const anchor = chatId;
+  const scope: 'thread' | 'chat' = args.rootMessageId ? 'thread' : 'chat';
+  // chat-scope：锚点是 chatId；thread-scope：锚点是 rootMessageId。先挡掉
+  //「同 anchor 同 bot 已有真会话」的撞键（会被 Map.set 覆盖而泄漏 worker）。
+  // queued / pendingRepo are real user-visible sessions and must not be
+  // overwritten; pure daemon-command scratches are allowed to be displaced.
+  const anchor = scope === 'thread' ? args.rootMessageId! : chatId;
   const existing = activeSessions.get(sessionKey(anchor, larkAppId));
-  if (existing && (existing.worker || existing.session.queued || isRelayableRealSession(existing))) {
+  if (existing && (existing.worker || existing.session.queued || existing.pendingRepo || isRelayableRealSession(existing))) {
     return { ok: false, error: 'session_exists' };
   }
 
   refreshCliVersion?.(bot.config.cliId, bot.config.cliPathOverride);
 
   // 可见任务横幅：只由 creator/lead 那次 spawn 发一条，给群成员交代这群是干嘛的。
-  // 纯文本、不 @ 任何 bot，不会误触发其它 bot。rootMessageId 存它仅为留痕（chat-scope
-  // 路由不看 rootMessageId）。失败不致命。横幅发完整内容——之前 slice(0,300) 会把超
-  // 300 字的任务在群里截断（用户看着像"内容丢了"，其实会话拿到的是全文，只是横幅被切）。
+  // 纯文本、不 @ 任何 bot，不会误触发其它 bot。thread-scope spawn 时横幅也回到
+  // 目标话题，避免任务生命周期消息散落到群顶层。失败不致命。横幅发完整内容——
+  // 之前 slice(0,300) 会把超 300 字的任务在群里截断（用户看着像"内容丢了"，
+  // 其实会话拿到的是全文，只是横幅被切）。
   let bannerMessageId: string | undefined;
   if (args.postBanner) {
     try {
-      const { sendMessage } = await import('../im/lark/client.js');
-      bannerMessageId = await sendMessage(larkAppId, chatId, t('cmd.createSession.banner', { content }, locale));
+      const { replyMessage, sendMessage } = await import('../im/lark/client.js');
+      const bannerText = t('cmd.createSession.banner', { content }, locale);
+      bannerMessageId = scope === 'thread'
+        ? await replyMessage(larkAppId, anchor, bannerText, 'text', true)
+        : await sendMessage(larkAppId, chatId, bannerText);
     } catch (err: any) {
-      logger.warn(`[createSession] banner send failed in ${chatId}: ${err?.message ?? err}`);
+      logger.warn(`[createSession] banner send failed in ${chatId}/${anchor}: ${err?.message ?? err}`);
     }
   }
 
@@ -1741,10 +1758,11 @@ export async function spawnDashboardSession(
   const userContent = composeSpawnUserContent({ content, role, coworkers: args.coworkers, locale });
 
   const resolvedTitle = args.title || deriveSessionTitleFromContent(content);
-  const session = sessionStore.createSession(chatId, bannerMessageId ?? chatId, resolvedTitle, 'group');
+  const rootIdForStore = scope === 'thread' ? anchor : (bannerMessageId ?? chatId);
+  const session = sessionStore.createSession(chatId, rootIdForStore, resolvedTitle, 'group');
   const now = Date.now();
   session.larkAppId = larkAppId;
-  session.scope = 'chat';
+  session.scope = scope;
   session.ownerOpenId = args.ownerOpenId ?? getOwnerOpenId(larkAppId);
   session.creatorOpenId = session.ownerOpenId;
   if (args.ownerUnionId) session.ownerUnionId = args.ownerUnionId;
@@ -1770,7 +1788,7 @@ export async function spawnDashboardSession(
     larkAppId,
     chatId,
     chatType: 'group',
-    scope: 'chat',
+    scope,
     spawnedAt: sessionCreatedAtMs(session),
     cliVersion: getCurrentCliVersion(),
     lastMessageAt: now,
