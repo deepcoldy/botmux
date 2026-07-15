@@ -116,6 +116,8 @@ export type OpenPlatformAutomationResult =
       scopeWarning?: string;
       subscribedEventCount: number;
       eventWarning?: string;
+      /** 回读后仍缺失的 VC 会议事件。普通建 bot 不阻断,VC listener 保存前必须为空。 */
+      missingVcEvents: string[];
       versionId?: string;
     }
   | {
@@ -137,6 +139,8 @@ export type OpenPlatformAutomationResult =
       subscribedEventCount?: number;
       /** Warning from event subscription attempt, if any. */
       eventWarning?: string;
+      /** 回读后仍缺失的 VC 会议事件(走到订阅阶段才有)。 */
+      missingVcEvents?: string[];
     };
 
 export interface OpenPlatformAutomationOptions {
@@ -769,6 +773,12 @@ export async function automateOpenPlatformSetup(
   if (missingBaselineEvents.length > 0) {
     eventWarnings.push(`基础事件未确认订阅: ${missingBaselineEvents.join(', ')}`);
   }
+  // VC 事件缺失不阻断普通建 bot,但要显式带回给 VC listener 保存门
+  // (vcListenerEventGateError)——只看总 count 无法区分「缺的是不是 VC」。
+  const missingVcEvents: string[] = VC_MEETING_BOT_EVENTS.filter(name => !hasEvent(name));
+  if (missingVcEvents.length > 0) {
+    eventWarnings.push(`VC 会议事件未确认订阅: ${missingVcEvents.join(', ')}`);
+  }
 
   // 卡片回调(card.action.trigger)在开放平台是「回调」不是「事件」,配置走
   // /developers/v1/callback/*;回调接收方式独立于事件,需要单独切到长连接。
@@ -817,18 +827,27 @@ export async function automateOpenPlatformSetup(
     [...wantedAppEvents, ...VC_MEETING_USER_EVENTS].filter(name => hasEvent(name)).length
     + BOT_BASELINE_CALLBACKS.filter(name => callbackState?.callbacks.includes(name)).length;
   const eventWarning = eventWarnings.length > 0 ? eventWarnings.join('; ') : undefined;
-  const missingCritical = [
+  const criticalIssues: string[] = [
     ...BOT_CRITICAL_APP_EVENTS.filter(name => !hasEvent(name)),
     ...missingCallbacks,
   ];
-  if (missingCritical.length > 0) {
+  // 长连接模式必须以回读为准:switch 接口返回成功≠生效,mode 不是 4 时
+  // daemon 走长连接同样收不到事件/回调。
+  if (eventState?.eventMode !== LONG_CONNECTION_EVENT_MODE) {
+    criticalIssues.push(`事件接收模式=${eventState?.eventMode ?? '未知'}(需长连接 ${LONG_CONNECTION_EVENT_MODE})`);
+  }
+  if (callbackState?.callbackMode !== LONG_CONNECTION_EVENT_MODE) {
+    criticalIssues.push(`回调接收模式=${callbackState?.callbackMode ?? '未知'}(需长连接 ${LONG_CONNECTION_EVENT_MODE})`);
+  }
+  if (criticalIssues.length > 0) {
     return {
       ok: false,
       reason: 'api_error',
-      message: `核心事件/回调订阅未生效(${missingCritical.join(', ')}),机器人将收不到消息或卡片点击;请到开放平台「事件与回调」手动补齐后重试`,
+      message: `核心事件/回调订阅未生效(${criticalIssues.join('; ')}),机器人将收不到消息或卡片点击;请到开放平台「事件与回调」手动补齐后重试`,
       sessionFile,
       subscribedEventCount,
       eventWarning,
+      missingVcEvents,
     };
   }
 
@@ -853,6 +872,7 @@ export async function automateOpenPlatformSetup(
       scopeWarning,
       subscribedEventCount,
       eventWarning,
+      missingVcEvents,
       versionId,
     };
   } catch (err: any) {
@@ -863,8 +883,30 @@ export async function automateOpenPlatformSetup(
       sessionFile,
       subscribedEventCount,
       eventWarning,
+      missingVcEvents,
     };
   }
+}
+
+/**
+ * dashboard 保存 VC 会议监听 bot 前的事件订阅门。普通建 bot 允许 VC 事件缺失
+ * (只记 warning),但 listener 缺 VC 事件=会议邀请黑洞,必须阻断保存。
+ * 只看 subscribedEventCount 总数无法区分「缺的是不是 VC」,所以要看
+ * missingVcEvents。返回错误描述;可保存时返回 null。
+ */
+export function vcListenerEventGateError(result: {
+  eventWarning?: string;
+  subscribedEventCount?: number;
+  missingVcEvents?: string[];
+}): string | null {
+  if (result.eventWarning && (result.subscribedEventCount ?? 0) === 0) {
+    return `事件订阅全部失败(${result.eventWarning})`;
+  }
+  const missingVc = result.missingVcEvents ?? [];
+  if (missingVc.length > 0) {
+    return `VC 会议事件未订阅成功(${missingVc.join(', ')})${result.eventWarning ? `;${result.eventWarning}` : ''}`;
+  }
+  return null;
 }
 
 // ─── 已有应用列表 / 凭证读取（setup「选择已有应用」路径）───────────────────────
