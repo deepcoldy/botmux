@@ -471,34 +471,25 @@ function extractEventIdsFromDetails(value: unknown): string[] {
   return uniqueStrings(value.flatMap(group => extractEventIds(asRecord(group).items)));
 }
 
+/**
+ * 应用版本创建 payload,与 console launcher「一键创建智能体」同款极简结构
+ * (CDP 抓包确认)。⚠️不要重新加回 applyReasonConfig / isAutoAudit:false ——
+ * 那会让版本进入人工审核、发布后应用停在「未上架/未启用」(tenantAppStatus=0),
+ * 事件配置进了草稿也无法在企业内生效。visibleSuggest.members 必须含创建者,
+ * 否则同样不会自动上架启用。
+ */
 export function buildAppVersionCreatePayload(appVersion: string, visibleMemberIds: string[] = []) {
   return {
     appVersion,
     mobileDefaultAbility: 'bot',
     pcDefaultAbility: 'bot',
-    changeLog: 'Init version',
+    changeLog: 'Initial bot release.',
     visibleSuggest: {
       departments: [],
       members: visibleMemberIds,
       groups: [],
       isAll: 0,
     },
-    applyReasonConfig: {
-      apiPrivilegeNeedReason: true,
-      contactPrivilegeNeedReason: true,
-      dataPrivilegeReasonMap: {},
-      visibleScopeNeedReason: true,
-      apiPrivilegeReasonMap: {},
-      contactPrivilegeReason: '',
-      isDataPrivilegeExpandMap: {},
-      visibleScopeReason: '',
-      dataPrivilegeNeedReason: true,
-      isAutoAudit: false,
-      isContactExpand: false,
-    },
-    b2cShareSuggest: false,
-    autoPublish: false,
-    remark: 'Personal AI assistant for self use',
     blackVisibleSuggest: {
       departments: [],
       members: [],
@@ -625,16 +616,21 @@ export async function automateOpenPlatformSetup(
   let csrfToken: string | null = null;
   let apiOrigin = defaultOrigin;
   let appHome = defaultAppHome;
+  // 创建者 userId——版本可见范围要把创建者填进 visibleSuggest.members,否则
+  // 应用发布后不会自动上架启用(tenantAppStatus 停在 0),bot 在企业内不可用。
+  let sessionUserId: string | undefined;
   try {
     const authPage = await session.fetchTextWithUrl(fetcher, `${defaultAppHome}/auth`);
     apiOrigin = new URL(authPage.finalUrl).origin;
     appHome = `${apiOrigin}/app/${options.appId}`;
     csrfToken = extractOpenPlatformCsrfToken(authPage.text);
+    sessionUserId = extractOpenPlatformSessionIdentity(authPage.text)?.userId;
     if (!csrfToken) {
       const homePage = await session.fetchTextWithUrl(fetcher, appHome);
       apiOrigin = new URL(homePage.finalUrl).origin;
       appHome = `${apiOrigin}/app/${options.appId}`;
       csrfToken = extractOpenPlatformCsrfToken(homePage.text);
+      sessionUserId ??= extractOpenPlatformSessionIdentity(homePage.text)?.userId;
     }
   } catch (err: any) {
     return { ok: false, reason: 'network', message: `读取开放平台页面失败: ${safeErrorMessage(err)}`, sessionFile };
@@ -862,7 +858,12 @@ export async function automateOpenPlatformSetup(
   try {
     await postJson(`/developers/v1/safe_setting/update/${options.appId}`, buildSafeSettingPayload(options.appId));
     const contactRange = await postJson(`/developers/v1/contact_range/${options.appId}`, {});
-    const visibleMemberIds = extractContactRangeMemberIds(contactRange);
+    // 可见范围必须包含创建者(launcher 同款):否则版本发布后不会自动上架启用。
+    // contact_range 的成员为辅,创建者 userId 兜底,去重。
+    const visibleMemberIds = uniqueStrings([
+      ...(sessionUserId ? [sessionUserId] : []),
+      ...extractContactRangeMemberIds(contactRange),
+    ]);
     const versionList = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
     const appVersion = nextAppVersion(versionList);
     const created = await postJson(`/developers/v1/app_version/create/${options.appId}`, buildAppVersionCreatePayload(appVersion, visibleMemberIds));
@@ -1169,7 +1170,7 @@ function isDefiniteTemplateRejection(err: unknown): boolean {
  */
 export async function createOpenPlatformAppWithClient(
   client: OpenPlatformApiClient,
-  options: { name: string; description?: string; iconFilePath?: string },
+  options: { name: string; description?: string; iconFilePath?: string; creatorUserId?: string },
 ): Promise<{ appId: string; appSecret: string }> {
   const name = options.name.trim();
   if (!name) throw new Error('应用名称不能为空');
@@ -1223,6 +1224,25 @@ export async function createOpenPlatformAppWithClient(
     // 则必须显式开启——这两步是「一扫即用」的必要条件,在返回凭证前完成。
     await client.postJson(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true });
     await client.postJson(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 }); // WebSocket
+
+    // 复刻 console launcher「一键创建智能体」的最后一步:立刻用极简版本发布一次,
+    // 让应用**上架启用**(tenantAppStatus 0→2)。这样返回的就是一个「已启用、可
+    // 收发消息」的应用——等价于旧 SDK registerApp 直接产出可用 PersonalAgent 的效果。
+    // 缺这一步,后续 automateOpenPlatformSetup 的改动+发版都无法让裸应用自动上架。
+    // 失败不致命:automateOpenPlatformSetup 结尾仍会再发一次版本兜底。
+    try {
+      const created = await client.postJson(
+        `/developers/v1/app_version/create/${appId}`,
+        buildAppVersionCreatePayload('1.0.0', options.creatorUserId ? [options.creatorUserId] : []),
+      );
+      const versionId = extractVersionId(created);
+      if (versionId) {
+        await client.postJson(`/developers/v1/publish/commit/${appId}/${versionId}`, { clientId: appId });
+      }
+    } catch (err) {
+      console.warn(`模板应用初次发布启用失败(automateOpenPlatformSetup 会再兜底): ${safeErrorMessage(err)}`);
+    }
+
     const appSecret = await fetchOpenPlatformAppSecret(client, appId);
     return { appId, appSecret };
   } catch (err) {
@@ -1277,7 +1297,10 @@ export async function createFeishuOpenPlatformApp(
 
   try {
     await options.onSessionReady?.({ source: prepared.source, identity: clientResult.identity });
-    const credentials = await createOpenPlatformAppWithClient(clientResult.client, options);
+    const credentials = await createOpenPlatformAppWithClient(clientResult.client, {
+      ...options,
+      creatorUserId: clientResult.identity.userId,
+    });
     return {
       ok: true,
       ...credentials,

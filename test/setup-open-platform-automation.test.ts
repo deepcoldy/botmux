@@ -374,6 +374,9 @@ describe('createFeishuOpenPlatformApp', () => {
         expect(body.cid.length).toBeGreaterThan(0);
         return Response.json({ code: 0, data: { clientID: 'cli_created' } });
       }
+      if (path === '/developers/v1/app_version/create/cli_created') {
+        return Response.json({ code: 0, data: { versionId: 'v-enable' } });
+      }
       if (path === '/developers/v1/secret/cli_created') {
         return Response.json({ code: 0, data: { secret: 'created-secret' } });
       }
@@ -396,13 +399,19 @@ describe('createFeishuOpenPlatformApp', () => {
       sessionIdentity: { userId: 'u_1', tenantId: 't_1' },
     });
     expect(qrCount).toBe(0);
+    // 创建后立刻发布一个极简版本让应用上架启用(对齐 launcher),再读 secret
     expect(calls.map(call => call.path)).toEqual([
       '/developers/v1/app/upload/image',
       '/developers/v1/manifest/upsert_by_template',
       '/developers/v1/robot/switch/cli_created',
       '/developers/v1/event/switch/cli_created',
+      '/developers/v1/app_version/create/cli_created',
+      '/developers/v1/publish/commit/cli_created/v-enable',
       '/developers/v1/secret/cli_created',
     ]);
+    // 版本可见成员含当前登录人(session identity userId),否则发布不自动上架
+    const versionCall = calls.find(c => c.path === '/developers/v1/app_version/create/cli_created');
+    expect(JSON.parse(String(versionCall?.body))).toMatchObject({ visibleSuggest: { members: ['u_1'] } });
   });
 
   it('falls back to plain app/create when the one-click template endpoint fails', async () => {
@@ -426,6 +435,9 @@ describe('createFeishuOpenPlatformApp', () => {
         expect(JSON.parse(String(init?.body))).toMatchObject({ name: 'botmux-5', appSceneType: 0 });
         return Response.json({ code: 0, data: { ClientID: 'cli_fallback' } });
       }
+      if (path === '/developers/v1/app_version/create/cli_fallback') {
+        return Response.json({ code: 0, data: { versionId: 'v-enable' } });
+      }
       if (path === '/developers/v1/secret/cli_fallback') {
         return Response.json({ code: 0, data: { secret: 'fallback-secret' } });
       }
@@ -446,6 +458,8 @@ describe('createFeishuOpenPlatformApp', () => {
       '/developers/v1/app/create',
       '/developers/v1/robot/switch/cli_fallback',
       '/developers/v1/event/switch/cli_fallback',
+      '/developers/v1/app_version/create/cli_fallback',
+      '/developers/v1/publish/commit/cli_fallback/v-enable',
       '/developers/v1/secret/cli_fallback',
     ]);
   });

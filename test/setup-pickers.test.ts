@@ -149,16 +149,18 @@ describe('fetchOpenPlatformAppSecret', () => {
 });
 
 describe('createOpenPlatformAppWithClient', () => {
-  it('uploads the botmux icon, creates a named self-built app, then reads its secret', async () => {
+  it('uploads the icon, creates via template, publishes an enabling version, then reads its secret', async () => {
     const client = stubClient([
-      { code: 0, data: { url: 'https://cdn.example/botmux.png' } },
-      { code: 0, data: { ClientID: 'cli_new' } },
-      { code: 0 },
-      { code: 0 },
-      { code: 0, data: { secret: 'new-secret' } },
+      { code: 0, data: { url: 'https://cdn.example/botmux.png' } }, // upload/image
+      { code: 0, data: { ClientID: 'cli_new' } },                  // upsert_by_template
+      { code: 0 },                                                 // robot/switch
+      { code: 0 },                                                 // event/switch
+      { code: 0, data: { versionId: 'v-init' } },                  // app_version/create（启用发布）
+      { code: 0 },                                                 // publish/commit
+      { code: 0, data: { secret: 'new-secret' } },                 // secret
     ]);
 
-    await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-2' })).resolves.toEqual({
+    await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-2', creatorUserId: 'u_creator' })).resolves.toEqual({
       appId: 'cli_new',
       appSecret: 'new-secret',
     });
@@ -168,6 +170,8 @@ describe('createOpenPlatformAppWithClient', () => {
       '/developers/v1/manifest/upsert_by_template',
       '/developers/v1/robot/switch/cli_new',
       '/developers/v1/event/switch/cli_new',
+      '/developers/v1/app_version/create/cli_new',
+      '/developers/v1/publish/commit/cli_new/v-init',
       '/developers/v1/secret/cli_new',
     ]);
     const upload = client.calls[0].body as FormData;
@@ -184,6 +188,37 @@ describe('createOpenPlatformAppWithClient', () => {
     });
     expect(client.calls[2].body).toEqual({ clientId: 'cli_new', enable: true });
     expect(client.calls[3].body).toEqual({ clientId: 'cli_new', eventMode: 4 });
+    // 启用发布用极简版本 payload,可见成员含创建者(否则发布后不自动上架启用)
+    expect(client.calls[4].body).toMatchObject({
+      appVersion: '1.0.0',
+      visibleSuggest: { members: ['u_creator'], isAll: 0 },
+      pcDefaultAbility: 'bot',
+      mobileDefaultAbility: 'bot',
+    });
+    expect(client.calls[4].body).not.toHaveProperty('applyReasonConfig');
+    expect(client.calls[5].body).toEqual({ clientId: 'cli_new' });
+  });
+
+  it('does not fail creation when the enabling publish errors (setup re-publishes as fallback)', async () => {
+    const client = stubClient([
+      { code: 0, data: { url: 'https://cdn.example/botmux.png' } },
+      { code: 0, data: { ClientID: 'cli_pub_soft' } },
+      { code: 0 },
+      { code: 0 },
+      { code: 1, msg: 'version create rejected' }, // 启用发布失败——不致命
+      { code: 0, data: { secret: 'soft-secret' } }, // secret 仍读到
+    ]);
+    await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-soft', creatorUserId: 'u_creator' }))
+      .resolves.toEqual({ appId: 'cli_pub_soft', appSecret: 'soft-secret' });
+    // 版本创建失败后不发 publish/commit,直接读 secret
+    expect(client.calls.map(c => c.path)).toEqual([
+      '/developers/v1/app/upload/image',
+      '/developers/v1/manifest/upsert_by_template',
+      '/developers/v1/robot/switch/cli_pub_soft',
+      '/developers/v1/event/switch/cli_pub_soft',
+      '/developers/v1/app_version/create/cli_pub_soft',
+      '/developers/v1/secret/cli_pub_soft',
+    ]);
   });
 
   it('retains the created app id in the error when secret reading fails', async () => {
@@ -192,9 +227,11 @@ describe('createOpenPlatformAppWithClient', () => {
       { code: 0, data: { ClientID: 'cli_orphan_guard' } },
       { code: 0 },
       { code: 0 },
-      { code: 0, data: {} },
+      { code: 0, data: { versionId: 'v-init' } },
+      { code: 0 },
+      { code: 0, data: {} }, // secret 缺失
     ]);
-    await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-3' }))
+    await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-3', creatorUserId: 'u_creator' }))
       .rejects.toThrow(/cli_orphan_guard.*AppSecret/);
   });
 });
