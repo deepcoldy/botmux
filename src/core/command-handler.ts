@@ -603,30 +603,63 @@ async function handleRoleCommand(
  *      defaultOncall.workingDir when Oncall 模式 is on)
  *   4) legacy bot.config.workingDir
  *   5) '~'
+ *
+ * Deliberate deltas vs `resolvePinnedWorkingDir` (do NOT "sync" them away):
+ *   - no sibling-inherit layer (findInheritablePeer) — a schedule needs a
+ *     deterministic dir at create time, not whatever peer session happens to
+ *     be open at that moment;
+ *   - extra layers 4/5 — a schedule has no interactive repo-select card to
+ *     fall back on, so it must always resolve to something;
+ *   - layers 2–4 validate the candidate dir and fall through when it is
+ *     stale (deleted/renamed): a dead path would otherwise be baked into
+ *     schedules.json (workingDir is not editable afterwards) and every fire
+ *     would silently spawn in $HOME.
  */
 function resolveScheduleWorkingDir(
   ds: DaemonSession | undefined,
   chatId: string,
   larkAppId: string | undefined,
 ): string {
-  // Layer 1: existing session dir already pinned.
+  // Layer 1: existing session dir already pinned. Trusted as-is — it is the
+  // dir the live session actually runs in (the spawn path never re-validates
+  // a pinned dir either).
   if (ds?.workingDir) return ds.workingDir;
 
   const appId = ds?.larkAppId ?? larkAppId;
-  const bot = appId ? getBot(appId) : getAllBots()[0];
+  // getBot() throws for unregistered ids — degrade to the '~' fallback
+  // instead of aborting the whole /schedule command.
+  let bot: ReturnType<typeof getBot> | undefined;
+  try {
+    bot = appId ? getBot(appId) : getAllBots()[0];
+  } catch {
+    bot = undefined;
+  }
   if (!bot) return '~';
+
+  // Candidates below are stored config paths that can go stale. Validate and
+  // fall through (returning the RAW form — keep `~`; expansion happens at
+  // fire time via getSessionWorkingDir), matching the other copies of this
+  // ladder (daemon resolveBotDefaultWorkingDir, trigger-session).
+  const usable = (dir: string, layer: string): boolean => {
+    const v = validateWorkingDir(dir);
+    if (v.ok) return true;
+    logger.warn(`[schedule] ${layer} workingDir "${dir}" invalid — falling through: ${v.error}`);
+    return false;
+  };
 
   // Layer 2: oncall binding for this chat (read-only — does NOT auto-bind).
   const oncallEntry = findOncallChat(bot.config.larkAppId, ds?.chatId ?? chatId);
-  if (oncallEntry?.workingDir) return oncallEntry.workingDir;
+  if (oncallEntry?.workingDir && usable(oncallEntry.workingDir, 'oncall-binding')) {
+    return oncallEntry.workingDir;
+  }
 
   // Layer 3: effective default working dir (defaultWorkingDir or
   // defaultOncall.workingDir). Read-only — never writes state.
   const effectiveDefault = effectiveDefaultWorkingDir(bot.config);
-  if (effectiveDefault) return effectiveDefault;
+  if (effectiveDefault && usable(effectiveDefault, 'effective-default')) return effectiveDefault;
 
   // Layer 4: legacy workingDir field.
-  if (bot.config.workingDir) return bot.config.workingDir;
+  if (bot.config.workingDir && usable(bot.config.workingDir, 'legacy')) return bot.config.workingDir;
 
   // Layer 5: home fallback.
   return '~';

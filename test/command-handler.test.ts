@@ -901,9 +901,15 @@ describe('handleCommand', () => {
     vi.mocked(resolveDocFile).mockResolvedValue({ fileToken: 'doc_token_12345678901234567890', fileType: 'docx' });
     vi.mocked(getDocSubscription).mockReturnValue(null);
     vi.mocked(putDocSubscription).mockReturnValue({});
-    // clearAllMocks wipes the factory default — restore legacy (include
-    // worktrees) so /repo scan tests aren't passed `undefined` options.
+    // NOTE: vi.clearAllMocks() only clears call history — it does NOT undo
+    // mockReturnValue/mockImplementation overrides set inside individual
+    // tests (verified on vitest 4; resetAllMocks is what restores factory
+    // impls). Every mock that tests override must therefore be restored to
+    // its default here, or the last override leaks into subsequent tests.
     vi.mocked(repoPickerScanOptions).mockReturnValue({ includeWorktrees: true });
+    vi.mocked(findOncallChat).mockReturnValue(undefined);
+    vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue(null);
+    vi.mocked(scheduler.extractDeliveryMode).mockImplementation((prompt: string) => ({ deliver: 'origin' as const, prompt }));
   });
 
   describe('doc comment commands', () => {
@@ -2180,6 +2186,44 @@ describe('handleCommand', () => {
       expect(callArgs.workingDir).toBe('~/oncall/bound-dir');
       // findOncallChat must be called with the bot's appId and the chatId.
       expect(findOncallChat).toHaveBeenCalledWith('app-1', CHAT_ID);
+    });
+
+    it('should fall through when defaultWorkingDir points at a missing directory', async () => {
+      // defaultWorkingDir is configured but the dir no longer exists on disk.
+      // The stale path must NOT be baked into the task (schedules.json is not
+      // editable afterwards) — resolution falls through to the legacy
+      // workingDir, which does exist.
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+        botName: 'Claude',
+        config: {
+          larkAppId: id,
+          larkAppSecret: 'secret-1',
+          cliId: 'claude-code' as const,
+          defaultWorkingDir: '~/gone-dir',
+          workingDir: '~/live-dir',
+        },
+      })) as any);
+      vi.mocked(existsSync).mockImplementation((p: any) => !String(p).includes('gone-dir'));
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 10 * * *', display: '每日 10:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-stale' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-27T10:00:00+08:00'));
+
+      const ds = makeDaemonSession({ workingDir: undefined });
+      const deps = makeDeps(ds);
+
+      try {
+        await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日10:00 生成日报'), deps, LARK_APP_ID);
+      } finally {
+        // restore the shared existsSync mock for subsequent tests
+        vi.mocked(existsSync).mockReturnValue(true);
+      }
+
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.workingDir).toBe('~/live-dir');
     });
   });
 
