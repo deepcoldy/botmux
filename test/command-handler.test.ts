@@ -910,6 +910,11 @@ describe('handleCommand', () => {
     vi.mocked(findOncallChat).mockReturnValue(undefined);
     vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue(null);
     vi.mocked(scheduler.extractDeliveryMode).mockImplementation((prompt: string) => ({ deliver: 'origin' as const, prompt }));
+    // Shared fs mocks: other describes set existsSync=false / throwing statSync
+    // without always restoring, and the schedule workingDir validation depends
+    // on them — pin the factory defaults so tests pass in any order (shuffle).
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(statSync).mockReturnValue({ isDirectory: () => true } as any);
   });
 
   describe('doc comment commands', () => {
@@ -2224,6 +2229,43 @@ describe('handleCommand', () => {
 
       const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
       expect(callArgs.workingDir).toBe('~/live-dir');
+    });
+
+    it('should fall through when the pinned session workingDir is stale', async () => {
+      // ds.workingDir can be stale too: restoreActiveSessions re-registers
+      // persisted sessions (worker:null) and idle suspend keeps ds around —
+      // no live process guarantees the dir still exists. A stale pinned dir
+      // must fall through to the bot's (valid) defaultWorkingDir.
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+        botName: 'Claude',
+        config: {
+          larkAppId: id,
+          larkAppSecret: 'secret-1',
+          cliId: 'claude-code' as const,
+          defaultWorkingDir: '~/repo/oncall',
+        },
+      })) as any);
+      vi.mocked(existsSync).mockImplementation((p: any) => !String(p).includes('gone-dir'));
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 10 * * *', display: '每日 10:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-stale-ds' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-27T10:00:00+08:00'));
+
+      const ds = makeDaemonSession({ workingDir: '~/gone-dir' });
+      const deps = makeDeps(ds);
+
+      try {
+        await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日10:00 生成日报'), deps, LARK_APP_ID);
+      } finally {
+        // restore the shared existsSync mock for subsequent tests
+        vi.mocked(existsSync).mockReturnValue(true);
+      }
+
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.workingDir).toBe('~/repo/oncall');
     });
   });
 

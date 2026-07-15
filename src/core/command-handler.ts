@@ -610,20 +610,31 @@ async function handleRoleCommand(
  *     be open at that moment;
  *   - extra layers 4/5 — a schedule has no interactive repo-select card to
  *     fall back on, so it must always resolve to something;
- *   - layers 2–4 validate the candidate dir and fall through when it is
+ *   - every layer validates the candidate dir and falls through when it is
  *     stale (deleted/renamed): a dead path would otherwise be baked into
  *     schedules.json (workingDir is not editable afterwards) and every fire
- *     would silently spawn in $HOME.
+ *     would silently spawn in $HOME. This includes layer 1 — a ds restored
+ *     by restoreActiveSessions (worker:null) or idle-suspended keeps a
+ *     workingDir no live process is running in, so it can be stale too.
  */
 function resolveScheduleWorkingDir(
   ds: DaemonSession | undefined,
   chatId: string,
   larkAppId: string | undefined,
 ): string {
-  // Layer 1: existing session dir already pinned. Trusted as-is — it is the
-  // dir the live session actually runs in (the spawn path never re-validates
-  // a pinned dir either).
-  if (ds?.workingDir) return ds.workingDir;
+  // Validate candidates and fall through (returning the RAW form — keep `~`;
+  // expansion happens at fire time via getSessionWorkingDir), matching the
+  // other copies of this ladder (daemon resolveBotDefaultWorkingDir,
+  // trigger-session).
+  const usable = (dir: string, layer: string): boolean => {
+    const v = validateWorkingDir(dir);
+    if (v.ok) return true;
+    logger.warn(`[schedule] ${layer} workingDir "${dir}" invalid — falling through: ${v.error}`);
+    return false;
+  };
+
+  // Layer 1: existing session dir already pinned.
+  if (ds?.workingDir && usable(ds.workingDir, 'session')) return ds.workingDir;
 
   const appId = ds?.larkAppId ?? larkAppId;
   // getBot() throws for unregistered ids — degrade to the '~' fallback
@@ -635,17 +646,6 @@ function resolveScheduleWorkingDir(
     bot = undefined;
   }
   if (!bot) return '~';
-
-  // Candidates below are stored config paths that can go stale. Validate and
-  // fall through (returning the RAW form — keep `~`; expansion happens at
-  // fire time via getSessionWorkingDir), matching the other copies of this
-  // ladder (daemon resolveBotDefaultWorkingDir, trigger-session).
-  const usable = (dir: string, layer: string): boolean => {
-    const v = validateWorkingDir(dir);
-    if (v.ok) return true;
-    logger.warn(`[schedule] ${layer} workingDir "${dir}" invalid — falling through: ${v.error}`);
-    return false;
-  };
 
   // Layer 2: oncall binding for this chat (read-only — does NOT auto-bind).
   const oncallEntry = findOncallChat(bot.config.larkAppId, ds?.chatId ?? chatId);
