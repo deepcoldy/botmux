@@ -24,6 +24,7 @@ import {
   prepareFeishuWebSession,
   readStoredCookiesFromSessionFile,
   type StoredCookie,
+  vcListenerEventGateError,
   writeStoredCookiesToSessionFile,
 } from '../src/setup/open-platform-automation.js';
 
@@ -45,6 +46,74 @@ const openPlatformPage = (csrf = 'csrf_create') => `<script>
 window.csrfToken="${csrf}";
 window.user={"id":"u_1","name":"Alice","email":"alice@example.com","tenantId":"t_1","tenantName":"Example","tenantDisplayName":{"value":"Example"}};
 </script>`;
+
+/**
+ * 有状态的事件/回调订阅 mock:read 返回当前订阅,operation:add 增量写入,
+ * 与开放平台 console 的增量契约同形。automateOpenPlatformSetup 现在会回读
+ * 确认核心事件/回调,mock 不落库就会 fail-closed。
+ */
+function openPlatformSubscriptionMock(appId: string, opts: {
+  failEventUpdate?: boolean;
+  failCallbackUpdate?: boolean;
+  /** callback/switch 直接报错。 */
+  failCallbackSwitch?: boolean;
+  /** callback/switch 返回成功但 mode 实际不变(回读兜底用例)。 */
+  callbackSwitchNoop?: boolean;
+  /** event/update 中包含这些事件时整批被拒(逐个重试时对应单个失败)。 */
+  rejectEventNames?: string[];
+  initial?: { appEvents?: string[]; userEvents?: string[]; callbacks?: string[]; callbackMode?: number; eventMode?: number };
+} = {}) {
+  const state = {
+    eventMode: opts.initial?.eventMode ?? 4,
+    appEvents: [...(opts.initial?.appEvents ?? [])],
+    userEvents: [...(opts.initial?.userEvents ?? [])],
+    callbackMode: opts.initial?.callbackMode ?? 1,
+    callbacks: [...(opts.initial?.callbacks ?? [])],
+  };
+  const updateBodies: Array<Record<string, unknown>> = [];
+  const handle = (href: string, init?: RequestInit): Response | null => {
+    if (href.endsWith(`/developers/v1/event/update/${appId}`)) {
+      const body = JSON.parse(String(init?.body));
+      updateBodies.push(body);
+      const requested: string[] = [...(body.appEvents ?? []), ...(body.userEvents ?? [])];
+      if (opts.failEventUpdate || requested.some(name => (opts.rejectEventNames ?? []).includes(name))) {
+        return Response.json({ code: 1, msg: 'event update rejected' });
+      }
+      state.appEvents.push(...(body.appEvents ?? []));
+      state.userEvents.push(...(body.userEvents ?? []));
+      return Response.json({ code: 0 });
+    }
+    if (href.endsWith(`/developers/v1/event/${appId}`)) {
+      return Response.json({
+        code: 0,
+        data: {
+          eventMode: state.eventMode,
+          events: [...state.appEvents, ...state.userEvents],
+          appEventDetails: [{ items: state.appEvents.map(id => ({ id })) }],
+          userEventDetails: [{ items: state.userEvents.map(id => ({ id })) }],
+        },
+      });
+    }
+    if (href.endsWith(`/developers/v1/callback/switch/${appId}`)) {
+      if (opts.failCallbackSwitch) return Response.json({ code: 1, msg: 'callback switch rejected' });
+      const body = JSON.parse(String(init?.body));
+      if (!opts.callbackSwitchNoop) state.callbackMode = body.callbackMode;
+      return Response.json({ code: 0 });
+    }
+    if (href.endsWith(`/developers/v1/callback/update/${appId}`)) {
+      const body = JSON.parse(String(init?.body));
+      updateBodies.push(body);
+      if (opts.failCallbackUpdate) return Response.json({ code: 1, msg: 'callback update rejected' });
+      state.callbacks.push(...(body.callbacks ?? []));
+      return Response.json({ code: 0 });
+    }
+    if (href.endsWith(`/developers/v1/callback/${appId}`)) {
+      return Response.json({ code: 0, data: { callbackMode: state.callbackMode, callbacks: [...state.callbacks] } });
+    }
+    return null;
+  };
+  return { state, updateBodies, handle };
+}
 
 describe('parseSetupOpenPlatformAutoFlag', () => {
   it('is enabled by default, supports explicit skip, and keeps --open-platform-auto compatible', () => {
@@ -375,6 +444,7 @@ describe('automateOpenPlatformSetup', () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
     const sessionFile = join(dir, 'feishu-session.json');
     writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock('cli_x');
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
       const href = String(url);
@@ -393,7 +463,7 @@ describe('automateOpenPlatformSetup', () => {
         });
       }
       if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
-      return Response.json({ code: 0 });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
     }) as typeof fetch;
 
     const result = await automateOpenPlatformSetup({
@@ -411,7 +481,14 @@ describe('automateOpenPlatformSetup', () => {
       '/developers/v1/scope/update/cli_x',
       '/developers/v1/robot/switch/cli_x',
       '/developers/v1/event/switch/cli_x',
+      '/developers/v1/event/cli_x',
       '/developers/v1/event/update/cli_x',
+      '/developers/v1/event/cli_x',
+      '/developers/v1/callback/cli_x',
+      '/developers/v1/callback/switch/cli_x',
+      '/developers/v1/callback/cli_x',
+      '/developers/v1/callback/update/cli_x',
+      '/developers/v1/callback/cli_x',
       '/developers/v1/safe_setting/update/cli_x',
       '/developers/v1/contact_range/cli_x',
       '/developers/v1/app_version/list/cli_x',
@@ -432,6 +509,7 @@ describe('automateOpenPlatformSetup', () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
     const sessionFile = join(dir, 'feishu-session.json');
     writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock('cli_x');
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
       const href = String(url);
@@ -461,7 +539,7 @@ describe('automateOpenPlatformSetup', () => {
         });
       }
       if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
-      return Response.json({ code: 0 });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
     }) as typeof fetch;
 
     const result = await automateOpenPlatformSetup({
@@ -478,7 +556,14 @@ describe('automateOpenPlatformSetup', () => {
       '/developers/v1/scope/update/cli_x',
       '/developers/v1/robot/switch/cli_x',
       '/developers/v1/event/switch/cli_x',
+      '/developers/v1/event/cli_x',
       '/developers/v1/event/update/cli_x',
+      '/developers/v1/event/cli_x',
+      '/developers/v1/callback/cli_x',
+      '/developers/v1/callback/switch/cli_x',
+      '/developers/v1/callback/cli_x',
+      '/developers/v1/callback/update/cli_x',
+      '/developers/v1/callback/cli_x',
       '/developers/v1/safe_setting/update/cli_x',
       '/developers/v1/contact_range/cli_x',
       '/developers/v1/app_version/list/cli_x',
@@ -497,8 +582,9 @@ describe('automateOpenPlatformSetup', () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
     const sessionFile = join(dir, 'feishu-session.json');
     writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock('cli_x');
     const calls: string[] = [];
-    const fetchImpl = (async (url: string | URL | Request) => {
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
       const href = String(url);
       calls.push(href);
       if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
@@ -508,7 +594,7 @@ describe('automateOpenPlatformSetup', () => {
       }
       if (href.includes('/scope/update/')) return Response.json({ code: 1, msg: 'scope not grantable for tenant' });
       if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
-      return Response.json({ code: 0 });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
     }) as typeof fetch;
 
     const result = await automateOpenPlatformSetup({
@@ -533,8 +619,9 @@ describe('automateOpenPlatformSetup', () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
     const sessionFile = join(dir, 'feishu-session.json');
     writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock('cli_x');
     const calls: string[] = [];
-    const fetchImpl = (async (url: string | URL | Request) => {
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
       const href = String(url);
       calls.push(href);
       if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
@@ -543,7 +630,7 @@ describe('automateOpenPlatformSetup', () => {
         return Response.json({ code: 0, data: { appScopeList: [], userScopeList: [] } });
       }
       if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
-      return Response.json({ code: 0 });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
     }) as typeof fetch;
 
     const result = await automateOpenPlatformSetup({
@@ -559,5 +646,206 @@ describe('automateOpenPlatformSetup', () => {
       expect(result.skippedScopeCount).toBe(3);
     }
     expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
+  });
+
+  function subscriptionFetchImpl(sub: ReturnType<typeof openPlatformSubscriptionMock>, calls: string[]) {
+    return (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      calls.push(href);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+      if (href.includes('/scope/all/')) {
+        return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
+      }
+      if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+  }
+
+  async function runSetupWithMock(sessionDirPrefix: string, sub: ReturnType<typeof openPlatformSubscriptionMock>, calls: string[]) {
+    const dir = mkdtempSync(join(tmpdir(), sessionDirPrefix));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    return automateOpenPlatformSetup({
+      appId: 'cli_x',
+      sessionFilePath: sessionFile,
+      fetchImpl: subscriptionFetchImpl(sub, calls),
+      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+    });
+  }
+
+  it('subscribes baseline app events incrementally and the card callback via /callback endpoints', async () => {
+    const sub = openPlatformSubscriptionMock('cli_x');
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-', sub, calls);
+
+    expect(result.ok).toBe(true);
+    const eventUpdate = sub.updateBodies.find(body => Array.isArray(body.appEvents));
+    expect(eventUpdate).toMatchObject({ clientId: 'cli_x', operation: 'add', eventMode: 4, events: [] });
+    expect(eventUpdate?.appEvents).toContain('im.message.receive_v1');
+    expect(eventUpdate?.appEvents).toContain('im.chat.member.bot.added_v1');
+    expect(eventUpdate?.appEvents).toContain('vc.bot.meeting_invited_v1');
+    expect(eventUpdate?.appEvents).not.toContain('card.action.trigger');
+    expect(eventUpdate?.userEvents).toEqual(['vc.meeting.participant_meeting_joined_v1']);
+    const callbackUpdate = sub.updateBodies.find(body => Array.isArray(body.callbacks));
+    expect(callbackUpdate).toMatchObject({ clientId: 'cli_x', operation: 'add', callbacks: ['card.action.trigger'], callbackMode: 4 });
+    // 回调接收方式初始是 webhook(1),必须先切长连接再订阅
+    expect(sub.state.callbackMode).toBe(4);
+    if (result.ok) {
+      expect(result.subscribedEventCount).toBeGreaterThanOrEqual(8);
+      expect(result.eventWarning).toBeUndefined();
+    }
+  });
+
+  it('is idempotent: already-subscribed apps get no event/callback update calls', async () => {
+    const sub = openPlatformSubscriptionMock('cli_x', {
+      initial: {
+        appEvents: [
+          'im.message.receive_v1',
+          'im.chat.member.bot.added_v1',
+          'im.chat.member.bot.deleted_v1',
+          'drive.file.comment_add_v1',
+          'drive.notice.comment_add_v1',
+          'im.message.reaction.created_v1',
+          'im.message.reaction.deleted_v1',
+          'vc.bot.meeting_invited_v1',
+          'vc.bot.meeting_activity_v1',
+          'vc.bot.meeting_ended_v1',
+        ],
+        userEvents: ['vc.meeting.participant_meeting_joined_v1'],
+        callbacks: ['card.action.trigger'],
+        callbackMode: 4,
+      },
+    });
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-idem-', sub, calls);
+
+    expect(result.ok).toBe(true);
+    expect(sub.updateBodies).toEqual([]);
+    expect(calls.some(u => u.includes('/callback/switch/'))).toBe(false);
+  });
+
+  it('fails closed when im.message.receive_v1 cannot be subscribed', async () => {
+    const sub = openPlatformSubscriptionMock('cli_x', { failEventUpdate: true });
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-fail-', sub, calls);
+
+    expect(result).toMatchObject({ ok: false, reason: 'api_error' });
+    if (!result.ok) {
+      expect(result.message).toContain('im.message.receive_v1');
+      expect(result.eventWarning).toBeTruthy();
+    }
+    // 批量失败后逐个重试过:baseline 7 + VC app 3 + VC user 1 = 批量 1 次 + 单个 11 次
+    expect(sub.updateBodies.filter(body => Array.isArray(body.appEvents)).length).toBe(12);
+    // 核心事件缺失时不再继续发版,避免发布一个收不到消息的版本
+    expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
+  });
+
+  it('fails closed when the card.action.trigger callback cannot be subscribed', async () => {
+    const sub = openPlatformSubscriptionMock('cli_x', { failCallbackUpdate: true });
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-cbfail-', sub, calls);
+
+    expect(result).toMatchObject({ ok: false, reason: 'api_error' });
+    if (!result.ok) expect(result.message).toContain('card.action.trigger');
+    expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
+  });
+
+  it('fails closed when the callback long-connection switch fails even with the callback already subscribed', async () => {
+    const sub = openPlatformSubscriptionMock('cli_x', {
+      failCallbackSwitch: true,
+      initial: { callbacks: ['card.action.trigger'], callbackMode: 1 },
+    });
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-swfail-', sub, calls);
+
+    expect(result).toMatchObject({ ok: false, reason: 'api_error' });
+    if (!result.ok) expect(result.message).toContain('回调接收模式');
+    expect(sub.state.callbackMode).toBe(1);
+    expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
+  });
+
+  it('fails closed when callback mode readback still shows webhook after a successful switch call', async () => {
+    const sub = openPlatformSubscriptionMock('cli_x', {
+      callbackSwitchNoop: true,
+      initial: { callbacks: ['card.action.trigger'], callbackMode: 1 },
+    });
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-swnoop-', sub, calls);
+
+    expect(result).toMatchObject({ ok: false, reason: 'api_error' });
+    if (!result.ok) expect(result.message).toContain('回调接收模式');
+    expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
+  });
+
+  it('keeps plain bot setup ok when only VC events fail, but reports missingVcEvents for the listener gate', async () => {
+    const vcEvents = [
+      'vc.bot.meeting_invited_v1',
+      'vc.bot.meeting_activity_v1',
+      'vc.bot.meeting_ended_v1',
+      'vc.meeting.participant_meeting_joined_v1',
+    ];
+    const sub = openPlatformSubscriptionMock('cli_x', { rejectEventNames: vcEvents });
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-vc-', sub, calls);
+
+    // 普通建 bot:baseline+回调齐 → 不阻断,照常发版
+    expect(result.ok).toBe(true);
+    expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    if (result.ok) {
+      expect(result.missingVcEvents).toEqual(vcEvents);
+      expect(result.subscribedEventCount).toBe(8); // 7 baseline 事件 + 1 回调
+      expect(result.eventWarning).toContain('VC 会议事件未确认订阅');
+      // VC listener 保存门必须拦下这种结果(dashboard 两条分支都走这个门)
+      expect(vcListenerEventGateError(result)).toContain('vc.bot.meeting_invited_v1');
+    }
+  });
+
+  it('fails closed and blocks the listener gate when event mode readback stays webhook despite full subscriptions', async () => {
+    // event/switch 返回成功(mock 默认 code 0)但回读 eventMode 仍是 1:
+    // 订阅名齐、count=12、missingVcEvents=[],唯一异常是接收方式。
+    const sub = openPlatformSubscriptionMock('cli_x', {
+      initial: {
+        eventMode: 1,
+        appEvents: [
+          'im.message.receive_v1',
+          'im.chat.member.bot.added_v1',
+          'im.chat.member.bot.deleted_v1',
+          'drive.file.comment_add_v1',
+          'drive.notice.comment_add_v1',
+          'im.message.reaction.created_v1',
+          'im.message.reaction.deleted_v1',
+          'vc.bot.meeting_invited_v1',
+          'vc.bot.meeting_activity_v1',
+          'vc.bot.meeting_ended_v1',
+        ],
+        userEvents: ['vc.meeting.participant_meeting_joined_v1'],
+        callbacks: ['card.action.trigger'],
+        callbackMode: 4,
+      },
+    });
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-evmode-', sub, calls);
+
+    expect(result).toMatchObject({ ok: false, reason: 'api_error' });
+    if (!result.ok) {
+      expect(result.message).toContain('事件接收模式');
+      expect(result.eventModeReady).toBe(false);
+      expect(result.missingVcEvents).toEqual([]);
+      // dashboard 非登录失败分支的 listener 门必须拦下(此前 count=12/missingVc=[] 会放行)
+      expect(vcListenerEventGateError(result)).toContain('长连接');
+    }
+    expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
+  });
+
+  it('vcListenerEventGateError passes clean results and blocks zero-subscription, missing-VC or mode-not-ready results', () => {
+    expect(vcListenerEventGateError({ subscribedEventCount: 12, missingVcEvents: [], eventModeReady: true })).toBeNull();
+    expect(vcListenerEventGateError({ eventWarning: 'boom', subscribedEventCount: 0 })).toContain('事件订阅全部失败');
+    expect(vcListenerEventGateError({ subscribedEventCount: 8, missingVcEvents: ['vc.bot.meeting_ended_v1'], eventModeReady: true }))
+      .toContain('vc.bot.meeting_ended_v1');
+    expect(vcListenerEventGateError({ subscribedEventCount: 12, missingVcEvents: [], eventModeReady: false }))
+      .toContain('长连接');
+    // 走不到订阅阶段的早期失败(missingVcEvents/eventModeReady 均 undefined)保持原 best-effort 语义
+    expect(vcListenerEventGateError({})).toBeNull();
   });
 });

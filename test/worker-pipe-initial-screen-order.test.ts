@@ -179,10 +179,15 @@ describe('worker pipe initial screen ordering', () => {
     expect(guard).toContain('TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId))');
     expect(guard.indexOf('TmuxBackend.hasSession')).toBeLessThan(guard.indexOf('probeTmuxFunctional'));
     // The decision is made by the pure gate helper, and a gate posts an
-    // actionable card + throws — it must NOT silently downgrade to pty.
+    // actionable error IPC + throws — it must NOT silently downgrade to pty.
+    // The daemon renders WorkerToDaemon.error to Lark, avoiding the old
+    // user_notify + error duplicate.
     expect(guard).toContain('decideBackendGate(');
-    expect(guard).toContain("send({ type: 'user_notify'");
+    expect(guard).toContain('throw new Error(backendGateUserMessage(');
     expect(guard).not.toContain("effectiveBackend = 'pty'");
+    expect(source).toContain('await sendAndFlush({');
+    expect(source).toContain('await sendFatalWorkerErrorAndExit(err, msg.turnId)');
+    expect(source).toContain('await sendFatalWorkerErrorAndExit(err);');
   });
 
   it('wires adoptCliPid/cliCwd on herdr adopt (parity with tmux/zellij for grok writeInput)', () => {

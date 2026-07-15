@@ -5,6 +5,9 @@ export type CliOption = {
   label: string;
   gateway?: 'ttadk';
   acceptsModel?: boolean;
+  available?: boolean;
+  command?: string;
+  availabilityReason?: string;
 };
 
 export type CliOptionsState = {
@@ -63,6 +66,7 @@ export type BotDefaultsRow = {
   startupCommands?: string;
   launchShell?: string;
   env?: string;
+  riff?: Record<string, unknown> | null;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
   autoStartOnNewTopic?: boolean;

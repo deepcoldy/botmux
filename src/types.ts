@@ -1,5 +1,6 @@
 import type { BackendType } from './adapters/backend/types.js';
 import type { BotSkillPolicy } from './core/skills/types.js';
+import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
 
 /** Runtime status the worker derives from screen content. */
@@ -44,6 +45,13 @@ export interface Session {
   pid?: number;
   workingDir?: string;
   webPort?: number;
+  /** riff：最近一个任务 id（follow-up 血缘锚点）。持久化后 daemon 重启的下一条
+   *  消息仍走 task-follow-up 延续沙箱与上下文，而非冷启新任务。 */
+  riffParentTaskId?: string;
+  /** riff 多仓 stamp：多仓 worktree 流按用户选择顺序创建的 worktree 目录列表。
+   *  仅该 stamp 存在时 riff 才做多仓推导（首仓=primary）；普通非 git 工作目录
+   *  绝不扫描子目录乱带仓库。任何其它选仓路径都会清除本 stamp。 */
+  riffRepoDirs?: string[];
   larkAppId?: string;
   ownerOpenId?: string;       // topic creator's open_id — for @mention in replies
   /** Best-effort human-readable title for direct/p2p chats. Lark chat APIs
@@ -324,7 +332,7 @@ export type TermActionKey =
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
   | { type: 'message'; content: string; turnId?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -363,7 +371,7 @@ export type WorkerToDaemon =
   | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean }
   | { type: 'prompt_ready' }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string }
-  | { type: 'error'; message: string }
+  | { type: 'error'; message: string; turnId?: string }
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string }
   | { type: 'tui_prompt_resolved'; selectedText?: string }
@@ -392,4 +400,6 @@ export type WorkerToDaemon =
       kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
       userText?: string;
     }
-  | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string };
+  | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
+  | { type: 'riff_access_url'; accessUrl: string; directAccessUrl?: string }
+  | { type: 'riff_task_id'; taskId: string | null };

@@ -22,6 +22,7 @@ import { fallbackTurnId } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
+import { hashUrlForLog, cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
@@ -33,7 +34,7 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
-import { isSuspendableBackendType, getSessionPersistentBackendType, resolveSpawnBackendType, persistentSessionName, killPersistentSession } from './persistent-backend.js';
+import { isSuspendableBackendType, getSessionPersistentBackendType, resolveSpawnBackendType, persistentSessionName, killPersistentSession, reconcileRiffBackendType } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
@@ -43,8 +44,15 @@ const DAEMON_BOOT_ID = randomUUID();
 
 function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
   // The daemon is outside file/read isolation. Never use its host namespace
-  // to disambiguate isolated output; lexical repair performs no filesystem I/O.
-  return ds.session.sandbox === true || ds.initConfig?.readIsolation === true || sandboxEnabled()
+  // to disambiguate isolated or remote output; lexical repair performs no
+  // filesystem I/O. initConfig.backendType is the backend frozen for the live
+  // worker after riff reconciliation; fall back to persisted session metadata
+  // while restoring sessions that do not yet have an initConfig.
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  return backendType === 'riff'
+    || ds.session.sandbox === true
+    || ds.initConfig?.readIsolation === true
+    || sandboxEnabled()
     ? 'lexical'
     : 'filesystem';
 }
@@ -71,6 +79,11 @@ import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
+
+type WorkerStartupState = {
+  ready: boolean;
+  failureNotified: boolean;
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -206,6 +219,8 @@ export function writableTerminalLinkFor(ds: DaemonSession): string | undefined {
   try {
     if (getBot(ds.larkAppId).config.writableTerminalLinkInCard !== true) return undefined;
   } catch { return undefined; }
+  // Riff backend: the sandbox URL is the writable link — no local worker needed.
+  if (ds.riffAccessUrl) return ds.riffAccessUrl;
   if (!ds.workerPort || !ds.workerToken) return undefined;
   return buildTerminalUrl(ds, { write: true });
 }
@@ -249,6 +264,56 @@ function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
   if (!ds.pendingLocalCliButtonRefresh) return;
   ds.pendingLocalCliButtonRefresh = undefined;
   scheduleLocalCliOpenReadinessPatch(ds);
+}
+
+/**
+ * PATCH the live streaming card with the freshest riff sandbox URL. Mirrors
+ * {@link scheduleLocalCliOpenReadinessPatch}: when the card POST is still
+ * in-flight (streamCardId === sentinel) the refresh is parked on
+ * `pendingRiffUrlCardRefresh` and flushed once the POST lands — the riff
+ * accessUrl typically arrives inside exactly that window (task-execute returns
+ * within ~1s of the initial card POST), and without the pending flag the
+ * in-card writable link would stay stale until the next status-edge PATCH.
+ */
+export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
+  if (streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+    ds.pendingRiffUrlCardRefresh = undefined;
+    return;
+  }
+  if (ds.streamCardId === CARD_POSTING_SENTINEL) {
+    ds.pendingRiffUrlCardRefresh = true;
+    return;
+  }
+  if (!ds.streamCardId || !ds.riffAccessUrl || !ds.workerPort) return;
+  ds.pendingRiffUrlCardRefresh = undefined;
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const status = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    buildTerminalUrl(ds),
+    ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId),
+    ds.lastScreenContent ?? '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    ds.currentImageKey,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    status === 'limited' ? ds.usageLimit : undefined,
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+  );
+  scheduleCardPatch(ds, cardJson);
+}
+
+function flushPendingRiffUrlPatch(ds: DaemonSession): void {
+  if (!ds.pendingRiffUrlCardRefresh) return;
+  ds.pendingRiffUrlCardRefresh = undefined;
+  scheduleRiffAccessUrlPatch(ds);
 }
 
 function clearPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
@@ -593,6 +658,7 @@ export async function postFreshStreamingCard(
     persistStreamCardState(ds);
     recallFrozenCards(ds);
     flushPendingLocalCliOpenReadinessPatch(ds);
+    flushPendingRiffUrlPatch(ds);
     logger.info(`[${tag(ds)}] Posted streaming card via /card`);
     return true;
   } catch (err) {
@@ -600,6 +666,7 @@ export async function postFreshStreamingCard(
     ds.streamCardNonce = prevNonce;
     ds.streamCardPending = prevPending;
     flushPendingLocalCliOpenReadinessPatch(ds);
+    flushPendingRiffUrlPatch(ds);
     logger.warn(`[${tag(ds)}] /card POST failed: ${err}`);
     return false;
   }
@@ -723,6 +790,21 @@ export interface WriteLinkOwnerDelivery {
  * ({@link deliverWritableTerminalCardTo}, behind the `/term` slash command).
  */
 function buildWritableTerminalCard(ds: DaemonSession): string | null {
+  // Riff backend: the sandbox URL is the writable link — no local worker/token needed.
+  if (ds.riffAccessUrl) {
+    const botCfg = getBot(ds.larkAppId).config;
+    const effectiveCliId = sessionCliId(ds, botCfg);
+    return buildSessionCard(
+      ds.session.sessionId,
+      sessionAnchorId(ds),
+      ds.riffAccessUrl,
+      ds.session.title || getCliDisplayName(effectiveCliId),
+      effectiveCliId,
+      true,
+      !!ds.adoptedFrom,
+      localeForBot(ds.larkAppId),
+    );
+  }
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port || !ds.workerToken) return null;
   const botCfg = getBot(ds.larkAppId).config;
@@ -1071,7 +1153,12 @@ export function killWorker(ds: DaemonSession): void {
     ds.worker.send({ type: 'close' } as DaemonToWorker);
   } catch { /* IPC already closed */ }
   const w = ds.worker;
-  armWorkerKillBackstop(w, tag(ds));
+  // riff：worker close 分支要有界 await 远端 task-cancel（destroySession 5s×2 重试，
+  // 外层 race 8s）。默认 2s SIGTERM backstop 会在取消发出前掐死进程，已关闭话题
+  // 的远端任务照跑——冻结为 riff 的会话放宽到 24s（层级：destroy 20s < worker 22s
+  // < SIGTERM 24s < SIGKILL 29s；正常路径 worker 自行 exit，不会等满）。
+  const closeFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
+  armWorkerKillBackstop(w, tag(ds), closeFrozenType === 'riff' ? 24_000 : WORKER_SIGTERM_BACKSTOP_MS);
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
@@ -1090,6 +1177,25 @@ export function killWorker(ds: DaemonSession): void {
 function destroyOrphanedBackingSession(ds: DaemonSession): void {
   if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
   reclaimParkedCrashDiagnostic(ds);
+  // riff：worker 已死时 /close 仍要取消持久化血缘指向的远端任务——否则已关闭
+  // 话题的远端 agent 继续拿着注入凭证发消息。fire-and-forget（内部有界+重试）。
+  const frozenType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (frozenType === 'riff') {
+    const taskId = ds.session.riffParentTaskId;
+    if (taskId) {
+      try {
+        const riffCfg = getBot(ds.larkAppId).config.riff;
+        if (riffCfg?.baseUrl) {
+          void cancelRiffTaskById(riffCfg, taskId).then((ok) => {
+            if (ok) logger.info(`[${tag(ds)}] killWorker: orphan riff task ${taskId} cancelled`);
+          });
+        }
+      } catch { /* bot deregistered — nothing to cancel with */ }
+      ds.session.riffParentTaskId = undefined;
+      sessionStore.updateSession(ds.session);
+    }
+    return;
+  }
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return;
   try {
@@ -1164,18 +1270,18 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   return true;
 }
 
-function armWorkerKillBackstop(w: ChildProcess, label: string): void {
+function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number = WORKER_SIGTERM_BACKSTOP_MS): void {
   const sigterm = setTimeout(() => {
     if (w.exitCode === null && w.signalCode === null) {
       try { w.kill('SIGTERM'); } catch { /* already gone */ }
     }
-  }, WORKER_SIGTERM_BACKSTOP_MS);
+  }, sigtermMs);
   const sigkill = setTimeout(() => {
     if (w.exitCode === null && w.signalCode === null) {
       logger.warn(`[${label}] worker did not exit after SIGTERM; escalating to SIGKILL`);
       try { w.kill('SIGKILL'); } catch { /* already gone */ }
     }
-  }, WORKER_SIGKILL_BACKSTOP_MS);
+  }, Math.max(WORKER_SIGKILL_BACKSTOP_MS, sigtermMs + 5000));
   sigterm.unref?.();
   sigkill.unref?.();
   w.once('exit', () => {
@@ -1690,11 +1796,29 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },
   } as WindowsForkOptions);
+  const startupState: WorkerStartupState = { ready: false, failureNotified: false };
 
   // A fork-level failure (spawn ENOENT, etc.) emits 'error'; without a handler
-  // the unhandled event crashes the daemon. Log and move on.
+  // the unhandled event crashes the daemon. It also happens before worker IPC
+  // exists, so this daemon-side branch must be the user-visible fallback.
   worker.on('error', (err) => {
-    logger.error(`[${t}] Worker fork error: ${(err as Error)?.message ?? err}`);
+    const reason = (err as Error)?.message ?? String(err);
+    logger.error(`[${t}] Worker fork error: ${reason}`);
+    if (startupState.failureNotified) return;
+    startupState.failureNotified = true;
+    const cliName = getCliDisplayName(agentCfg.cliId);
+    const message = tr('worker.start_failed', { cliName, reason }, botLocale(botCfg));
+    emitSessionLifecycleHook(ds, 'session.requires_attention', {
+      reason: 'worker_fork_error',
+      message: reason,
+    });
+    void cb.sessionReply(
+      sessionAnchorId(ds),
+      message,
+      'text',
+      ds.larkAppId,
+      fallbackTurnId(ds, initTurnId),
+    ).catch(replyErr => logger.error(`[${t}] Failed to deliver worker fork error to Lark: ${replyErr}`));
   });
 
   // Pipe worker stdout/stderr to daemon logger.
@@ -1757,7 +1881,10 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     // the real persistent pane (the stamp is written below; restore reads it via
     // getSessionPersistentBackendType). A brand-new session (no stamp) resolves
     // from live config, so a dashboard backend switch only affects NEW sessions.
-    backendType: resolveSpawnBackendType(ds.session.backendType, botCfg.backendType, config.daemon.backendType),
+    backendType: reconcileRiffBackendType(agentCfg.cliId, resolveSpawnBackendType(ds.session.backendType, botCfg.backendType, config.daemon.backendType), config.daemon.backendType),
+    backendConfig: botCfg.riff,
+    riffParentTaskId: ds.session.riffParentTaskId,
+    riffRepoDirs: ds.session.riffRepoDirs,
     prompt,
     resume,
     cliSessionId: ds.session.cliSessionId,
@@ -1798,7 +1925,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
   }
 
   // Use shared handler for IPC messages and exit
-  setupWorkerHandlers(ds, worker);
+  setupWorkerHandlers(ds, worker, startupState);
 
   ds.worker = worker;
   ds.spawnedAt = Date.now();
@@ -1830,7 +1957,11 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
 
 // ─── Shared worker IPC handler ──────────────────────────────────────────────
 
-function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
+function setupWorkerHandlers(
+  ds: DaemonSession,
+  worker: ChildProcess,
+  startupState: WorkerStartupState = { ready: false, failureNotified: false },
+): void {
   const cb = requireCallbacks();
   const t = tag(ds);
   // Source authorization belongs to one worker lifetime. A replacement worker
@@ -1847,6 +1978,21 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
+  const notifyStartupFailure = async (reason: string, turnId?: string): Promise<void> => {
+    if (startupState.failureNotified) return;
+    startupState.failureNotified = true;
+    const cliName = getCliDisplayName(sessionCliId(ds, botCfg));
+    const message = tr('worker.start_failed', { cliName, reason }, loc);
+    emitSessionLifecycleHook(ds, 'session.requires_attention', {
+      reason: 'worker_start_failed',
+      message: reason,
+    });
+    try {
+      await scopedReply(message, 'text', turnId);
+    } catch (err: any) {
+      logger.error(`[${t}] Failed to deliver worker startup failure to Lark: ${err?.message ?? err}`);
+    }
+  };
 
   // Adopt mode flags — computed once, used in all buildStreamingCard calls.
   // Bridge mode (the v3 default for /adopt) hides the legacy takeover button.
@@ -1857,6 +2003,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
       case 'ready': {
+        startupState.ready = true;
         ds.workerPort = msg.port;
         ds.workerToken = msg.token;
         // Persist port so it can be reused after daemon restart
@@ -1965,6 +2112,11 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // Send streaming card to group thread (read-only link, will be PATCHed with live output)
         // Set sentinel BEFORE await so concurrent screen_update messages
         // (which can arrive while the POST is in-flight) don't POST a duplicate card.
+        // Guard: a concurrent screen_update (e.g. riff's markPromptReady fires
+        // screen_update + ready in quick succession) may already have a card POST
+        // in-flight. In that case CARD_POSTING_SENTINEL is already set — don't
+        // POST a second card; the in-flight POST becomes this turn's card.
+        if (ds.streamCardId === CARD_POSTING_SENTINEL) break;
         ds.streamCardId = CARD_POSTING_SENTINEL;
         try {
           ds.streamCardNonce = randomBytes(4).toString('hex');
@@ -2015,6 +2167,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           // card without a successor visible to the user.
           recallFrozenCards(ds);
           flushPendingLocalCliOpenReadinessPatch(ds);
+          flushPendingRiffUrlPatch(ds);
         } catch (err) {
           if (err instanceof MessageWithdrawnError) {
             logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -2126,6 +2279,12 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
       }
 
       case 'screen_update': {
+        // Wait for `ready` (workerPort) before any card work — the read link
+        // is the LOCAL log terminal for every backend including riff
+        // (Web终端=日志页), so a port-less POST would render
+        // `http://host:undefined`. riff's early markPromptReady screen_update
+        // simply drops here; the `ready` handler posts the initial card with
+        // the real port, and riffAccessUrl rides the pending-patch flow.
         if (!ds.workerPort) break;
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
@@ -2227,6 +2386,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               // thread.
               recallFrozenCards(ds);
               flushPendingLocalCliOpenReadinessPatch(ds);
+          flushPendingRiffUrlPatch(ds);
             })
             .catch(err => {
               if (err instanceof MessageWithdrawnError) {
@@ -2384,7 +2544,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         if (ds.adoptedFrom) {
           logger.info(`[${t}] Adopted session ended`);
           // Freeze the streaming card
-          if (ds.streamCardId && ds.workerPort) {
+          if (ds.streamCardId && (ds.workerPort || ds.riffAccessUrl)) {
             const readUrl = buildTerminalUrl(ds);
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             const frozenCard = buildStreamingCard(
@@ -2422,7 +2582,9 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         if (rc.count > 3) {
           logger.warn(`[${t}] ${getCliDisplayName(effectiveCliId)} crashed ${rc.count} times in 1 min, not auto-restarting`);
           const keepDiagnosticWorker = !!msg.canParkDiagnostic && !!ds.worker && !ds.worker.killed;
-          // Freeze the last streaming card so it doesn't stay at "working" forever
+          // Freeze the last streaming card so it doesn't stay at "working" forever.
+          // 读链接严格要求 workerPort（riffAccessUrl 是写能力且 worker 退出后不清，
+          // 用它放行会构造 host:undefined 的坏读链接）。
           if (ds.streamCardId && ds.workerPort) {
             const readUrl = buildTerminalUrl(ds);
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
@@ -2485,6 +2647,49 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'error': {
         logger.error(`[${t}] Worker error: ${msg.message}`);
+        // `error` is a fatal launch-generation signal. It normally arrives
+        // during init, but can also follow a previously-ready worker whose CLI
+        // recovery/restart fails; that later failure must remain user-visible.
+        await notifyStartupFailure(msg.message, msg.turnId);
+        break;
+      }
+
+      case 'riff_access_url': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored riff_access_url from stale worker: ${msg.accessUrl}`);
+          break;
+        }
+        if (ds.riffAccessUrl === msg.accessUrl) break;
+        ds.riffAccessUrl = msg.accessUrl;
+        logger.info(`[${t}] Riff sandbox access URL updated (urlhash: ${hashUrlForLog(msg.accessUrl)})`);
+        // Dashboard: refresh the session row's Web 终端 link immediately.
+        dashboardEventBus.publish({
+          type: 'session.update',
+          body: { sessionId: ds.session.sessionId, patch: { riffAccessUrl: msg.accessUrl } },
+        });
+        // Refresh the live streaming card (writable/AIO link) — parks a pending
+        // flag when the card POST is still in-flight and flushes once it lands.
+        scheduleRiffAccessUrlPatch(ds);
+        break;
+      }
+
+      case 'riff_task_id': {
+        if (ds.worker !== worker) break;
+        if (msg.taskId === null) {
+          // follow-up 血缘断裂：清掉持久化锚点，否则 daemon 重启会复活已判坏的 parent。
+          if (ds.session.riffParentTaskId) {
+            ds.session.riffParentTaskId = undefined;
+            sessionStore.updateSession(ds.session);
+          }
+          break;
+        }
+        if (ds.session.riffParentTaskId === msg.taskId) break;
+        // Persist the follow-up lineage anchor: after a daemon restart the
+        // rebuilt RiffBackend resumes from this id (resumeParentTaskId) so the
+        // next message continues the riff conversation in the warm sandbox
+        // instead of cold-booting a context-less fresh task (4-5 min).
+        ds.session.riffParentTaskId = msg.taskId;
+        sessionStore.updateSession(ds.session);
         break;
       }
 
@@ -2577,6 +2782,14 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
   worker.on('exit', (code) => {
     logger.info(`[${t}] Worker process exited (code: ${code})`);
+    // Last-resort startup guard: syntax/import crashes and abrupt exits can
+    // happen before the worker sends either ready or a structured error.  Do
+    // not leave the originating Lark message unanswered. Intentional close /
+    // replacement kills are excluded to avoid noisy false alarms.
+    if (!startupState.ready && !startupState.failureNotified && !worker.killed && ds.session.status !== 'closed') {
+      const reason = tr('worker.start_exited_early', { code: code ?? 'null' }, loc);
+      void notifyStartupFailure(reason);
+    }
     // Only clear ds.worker if it's still THIS worker — during takeover,
     // the old worker's exit fires AFTER the new worker has been assigned.
     if (ds.worker === worker) {
@@ -2879,10 +3092,31 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },
   } as WindowsForkOptions);
+  const startupState: WorkerStartupState = { ready: false, failureNotified: false };
 
   // A fork-level failure emits 'error'; without a handler it crashes the daemon.
+  // Adopt has no worker IPC in this case either, so reply from the daemon just
+  // like the normal-session fork guard.
   worker.on('error', (err) => {
-    logger.error(`[${t}] Adopt worker fork error: ${(err as Error)?.message ?? err}`);
+    const reason = (err as Error)?.message ?? String(err);
+    logger.error(`[${t}] Adopt worker fork error: ${reason}`);
+    if (startupState.failureNotified) return;
+    startupState.failureNotified = true;
+    const message = tr('worker.start_failed', {
+      cliName: getCliDisplayName((adopted.cliId ?? 'claude-code') as CliId),
+      reason,
+    }, botLocale(botCfg));
+    emitSessionLifecycleHook(ds, 'session.requires_attention', {
+      reason: 'worker_fork_error',
+      message: reason,
+    });
+    void cb.sessionReply(
+      sessionAnchorId(ds),
+      message,
+      'text',
+      ds.larkAppId,
+      fallbackTurnId(ds, undefined),
+    ).catch(replyErr => logger.error(`[${t}] Failed to deliver adopt worker fork error to Lark: ${replyErr}`));
   });
 
   // Pipe worker stdout/stderr — both go through logger.info (→ daemon.log,
@@ -3006,7 +3240,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   }
 
   // Use shared handler
-  setupWorkerHandlers(ds, worker);
+  setupWorkerHandlers(ds, worker, startupState);
 
   ds.worker = worker;
   ds.spawnedAt = Date.now();

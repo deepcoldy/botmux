@@ -264,6 +264,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.no_git_repos': 'No git repositories found under {dirs}.',
   'cmd.repo.worktree_usage': 'Usage: `/repo wt <N|name|path> [new-branch]` — create a worktree off the repo\'s remote default branch and open it; without a branch, Botmux auto-names it from the topic title / first prompt when possible.',
   'cmd.repo.worktree_creating': '🌿 Creating a worktree for `{repo}` (includes a git fetch, may take a few seconds)…',
+  'card.repo.riff_worktree_push_failed': '⚠️ Failed to push branch `{branch}` to origin: {error}\nThe riff sandbox will use the default branch (push manually and retry).',
   'cmd.repo.worktree_created': '🌿 Worktree created: `{path}`\nBranch `{branch}`, based on `{base}`',
   'cmd.repo.worktree_failed': '❌ Worktree creation failed: {error}',
   'cmd.repo.worktree_in_progress': '⏳ A worktree is already being created — please wait…',
@@ -695,6 +696,8 @@ export const messages: Record<string, string> = {
   'worker.crash_loop_stopped': '⚠️ {cliName} crashed {count} times in 1 minute. Auto-restart disabled. Send a message to retry.',
   'worker.crash_diagnostic_terminal': 'The web terminal, where available, preserves the last startup output. Fix the issue, then send a new message to retry.',
   'worker.crash_recent_output': 'Recent terminal output:',
+  'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
+  'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': 'First create a Lark app at: https://open.feishu.cn/app',

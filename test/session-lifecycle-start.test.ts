@@ -253,6 +253,114 @@ describe('session.start lifecycle integration', () => {
   });
 });
 
+describe('worker startup failure delivery', () => {
+  it('replies to the originating Lark turn on a structured init error and dedupes the exit fallback', async () => {
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({
+      currentReplyTarget: { rootMessageId: 'om_root', turnId: 'turn-start', updatedAt: new Date().toISOString() },
+    });
+    forkWorker(ds, 'hello', { turnId: 'turn-start' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', { type: 'error', message: '找不到可执行文件「missing-agent」', turnId: 'turn-start' });
+    worker.emit('exit', 1);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('missing-agent'),
+      'text',
+      'app_test',
+      'turn-start',
+    );
+  });
+
+  it('posts a generic fallback when the worker exits before ready or structured error', async () => {
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('exit', 9);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('exit code: 9');
+  });
+
+  it('keeps a fatal CLI relaunch error user-visible after the worker was ready', async () => {
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    await Promise.resolve();
+    sessionReply.mockClear();
+    worker.emit('message', { type: 'error', message: 'CLI relaunch dependency disappeared' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('CLI relaunch dependency disappeared');
+  });
+
+  it('marks an adopt fork failure as requiring attention and replies once', async () => {
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({
+      adoptedFrom: {
+        tmuxTarget: 'bmx-deadbeef:0.0',
+        originalCliPid: 23456,
+        sessionId: 'codex-session',
+        cliId: 'codex',
+        cwd: '/repo',
+      },
+    });
+    forkAdoptWorker(ds);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('error', new Error('adopt fork ENOENT'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('adopt fork ENOENT');
+    expect(emitHookEventMock).toHaveBeenCalledWith('session.requires_attention', expect.objectContaining({
+      sessionId: 'sid-start-test',
+      reason: 'worker_fork_error',
+      message: 'adopt fork ENOENT',
+    }));
+  });
+});
+
 describe('forkWorker session agent config freeze', () => {
   it('freezes sandbox read and network policy on fresh sessions before spawning', () => {
     vi.mocked(getBot).mockReturnValueOnce({

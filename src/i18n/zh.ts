@@ -267,6 +267,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.no_git_repos': '在 {dirs} 下未找到 git 仓库。',
   'cmd.repo.worktree_usage': '用法：`/repo wt <编号|项目名|路径> [新分支名]` — 基于该仓库的远端默认分支新建 worktree 并打开；未指定分支时会优先根据话题标题/首条需求自动命名。',
   'cmd.repo.worktree_creating': '🌿 正在为 `{repo}` 创建 worktree（含 git fetch，可能需要几秒）…',
+  'card.repo.riff_worktree_push_failed': '⚠️ 分支 `{branch}` 推送远端失败：{error}\nRiff 沙箱将使用默认分支（可手动 push 后重试）',
   'cmd.repo.worktree_created': '🌿 worktree 已创建：`{path}`\n分支 `{branch}`，基于 `{base}`',
   'cmd.repo.worktree_failed': '❌ 创建 worktree 失败：{error}',
   'cmd.repo.worktree_in_progress': '⏳ 已有一个 worktree 正在创建，请稍候…',
@@ -698,6 +699,8 @@ export const messages: Record<string, string> = {
   'worker.crash_loop_stopped': '⚠️ {cliName} 在 1 分钟内崩溃 {count} 次，已停止自动重启。发消息可触发重新启动。',
   'worker.crash_diagnostic_terminal': 'Web 终端（若可用）保留了最后一次启动输出，可打开查看；修复问题后发新消息会重新启动。',
   'worker.crash_recent_output': '最近终端输出：',
+  'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
+  'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',

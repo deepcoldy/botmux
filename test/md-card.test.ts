@@ -347,6 +347,17 @@ describe('normalizeLocalHomeLinks', () => {
     )).toBe('[escape](Users/alice/..:123)');
   });
 
+  it('leaves prepared content untouched without filesystem probes when disabled', () => {
+    const input = '[report](Users/alice/work/report.md)';
+    expect(normalizeLocalHomeLinks(
+      input,
+      home,
+      '/tmp/project',
+      () => { throw new Error('filesystem probe must stay disabled'); },
+      'disabled',
+    )).toBe(input);
+  });
+
   it('never rewrites explicit dot-relative targets', () => {
     const input = [
       '[same dir](./Users/alice/report.md)',

@@ -27,6 +27,7 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '21': 'genius',
   '22': 'grok',
   '23': 'kiro-cli',
+  '24': 'riff',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -60,6 +61,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'kimi': 'Kimi',
   'grok': 'Grok Build',
   'kiro-cli': 'Kiro',
+  'riff': 'Riff',
 };
 
 /**
@@ -398,8 +400,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     if (backendType === '-') {
       delete out.backendType;
     } else if (backendType) {
-      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij') {
-        throw new Error(`backendType must be "pty", "tmux", "herdr", or "zellij": ${backendType}`);
+      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'riff') {
+        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", or "riff": ${backendType}`);
       }
       out.backendType = backendType;
     }

@@ -4856,6 +4856,7 @@ fieldset legend {
 .hint-warn-inline { color: var(--warning); }
 
 .bulk-bar {
+  --bulk-bar-bg: color-mix(in srgb, var(--warning) 10%, var(--bg));
   position: sticky;
   top: 78px;
   z-index: 10;
@@ -4863,7 +4864,7 @@ fieldset legend {
   align-items: center;
   gap: 8px;
   padding: 10px 12px;
-  background: color-mix(in srgb, var(--warning) 10%, var(--bg));
+  background: var(--bulk-bar-bg);
   border: 1px solid color-mix(in srgb, var(--warning) 28%, transparent);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
@@ -7294,9 +7295,7 @@ body.theme-menu-open .topbar-status-pop {
   transition: transform 140ms ease;
 }
 body:not(.theme-menu-open) .topbar-status-menu.topbar-status-auto-open .connection-status::after,
-body:not(.theme-menu-open) .topbar-status-menu:hover .connection-status::after,
-body:not(.theme-menu-open) .topbar-status-menu:has(.topbar-status-pop:hover) .connection-status::after,
-body:not(.theme-menu-open) .topbar-status-menu:focus-within .connection-status::after {
+body:not(.theme-menu-open) .topbar-status-menu.is-open .connection-status::after {
   transform: translateY(-35%) rotate(225deg);
 }
 .topbar-status-pop {
@@ -7322,13 +7321,25 @@ body:not(.theme-menu-open) .topbar-status-menu:focus-within .connection-status::
     transform 140ms ease;
 }
 body:not(.theme-menu-open) .topbar-status-menu.topbar-status-auto-open .topbar-status-pop,
-body:not(.theme-menu-open) .topbar-status-menu:hover .topbar-status-pop,
-body:not(.theme-menu-open) .topbar-status-menu:has(.topbar-status-pop:hover) .topbar-status-pop,
-body:not(.theme-menu-open) .topbar-status-menu:focus-within .topbar-status-pop {
+body:not(.theme-menu-open) .topbar-status-menu.is-open .topbar-status-pop {
   opacity: 1;
   pointer-events: auto;
   transform: translate(-50%, 0);
   animation: dashboard-popover-enter 0.35s ease both;
+}
+@media (hover: hover) {
+  body:not(.theme-menu-open) .topbar-status-menu:not(.suppress-hover):hover .connection-status::after,
+  body:not(.theme-menu-open) .topbar-status-menu:not(.suppress-hover):has(.topbar-status-pop:hover) .connection-status::after {
+    transform: translateY(-35%) rotate(225deg);
+  }
+
+  body:not(.theme-menu-open) .topbar-status-menu:not(.suppress-hover):hover .topbar-status-pop,
+  body:not(.theme-menu-open) .topbar-status-menu:not(.suppress-hover):has(.topbar-status-pop:hover) .topbar-status-pop {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translate(-50%, 0);
+    animation: dashboard-popover-enter 0.35s ease both;
+  }
 }
 .topbar-attention-notice {
   grid-column: 1 / -1;
@@ -22321,5 +22332,144 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 
   .skills-removing-label::before {
     animation: none;
+  }
+}
+
+/* Mobile dashboard shell ----------------------------------------------------
+   The desktop shell deliberately owns the viewport and delegates scrolling to
+   main/panel containers. Once the sidebar becomes a top tab rail, keep that
+   rail constrained to the viewport (otherwise its max-content width removes
+   the horizontal scroll range), and let tall control pages participate in the
+   main mobile scroll instead of being squeezed into desktop-sized grid rows. */
+@media (max-width: 980px) {
+  .chrome-body {
+    gap: 0;
+  }
+
+  .sidebar {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .sidebar-nav {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    overscroll-behavior-x: contain;
+    touch-action: pan-x;
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+@media (max-width: 720px) {
+  main:has(.sessions-page),
+  main:has(.groups-page) {
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  main:has(.sessions-page) .sessions-page {
+    height: auto;
+    min-height: 100%;
+    grid-template-rows: none;
+    overflow: visible;
+  }
+
+  main:has(.sessions-page) .sessions-page:not(:has(#bulk-bar:not([hidden]))) {
+    grid-template-rows: none;
+  }
+
+  main:has(.sessions-page) .sessions-heading-main,
+  main:has(.sessions-page) .sessions-view-controls {
+    width: 100%;
+    min-width: 0;
+  }
+
+  main:has(.sessions-page) .sessions-view-toggle {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  main:has(.sessions-page) .sessions-view-toggle button {
+    width: auto;
+    min-width: 0;
+    padding-right: 6px;
+    padding-left: 6px;
+    white-space: nowrap;
+  }
+
+  main:has(.sessions-page) .bulk-bar {
+    top: -16px;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: center;
+    box-shadow: 0 0 0 16px var(--bulk-bar-bg), var(--shadow);
+  }
+
+  main:has(.sessions-page) .bulk-bar[hidden] {
+    display: none;
+  }
+
+  main:has(.sessions-page) .bulk-bar #bulk-count {
+    grid-column: 1 / -1;
+    margin-right: 0;
+  }
+
+  main:has(.sessions-page) .bulk-bar button {
+    width: 100%;
+    min-width: 0;
+    padding-right: 8px;
+    padding-left: 8px;
+    white-space: nowrap;
+  }
+
+  main:has(.sessions-page) .sessions-view-stage,
+  main:has(.sessions-page) .sessions-view-stage[data-view="table"] {
+    min-height: 0;
+    overflow: visible;
+  }
+
+  main:has(.sessions-page) .sessions-board {
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+  }
+
+  main:has(.sessions-page) .session-board-column {
+    height: min(70dvh, 640px);
+    min-height: 320px;
+  }
+
+  main:has(.sessions-page) .sessions-kanban {
+    height: auto;
+    overflow: visible;
+  }
+
+  main:has(.sessions-page) .kanban-column {
+    height: min(70dvh, 640px);
+    min-height: 320px;
+  }
+
+  main:has(.groups-page) .groups-page {
+    height: auto;
+    min-height: 100%;
+    grid-template-rows: none;
+    overflow: visible;
+  }
+
+  main:has(.groups-page) .groups-page:has(> .hint-warn) {
+    grid-template-rows: none;
+  }
+
+  main:has(.groups-page) .groups-matrix-section {
+    height: min(70dvh, 640px);
+    min-height: 320px;
   }
 }

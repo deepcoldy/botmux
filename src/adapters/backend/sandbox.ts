@@ -356,6 +356,18 @@ export function sandboxedClaudeDataDir(sessionId: string, realDataDir: string): 
 const PROXY_ENV_KEYS = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'no_proxy', 'NO_PROXY', 'all_proxy', 'ALL_PROXY'] as const;
 
 /**
+ * Whether the LOCAL bwrap file sandbox applies to this spawn at all.
+ * - macOS enforces `sandbox: true` via the Seatbelt write-sandbox instead.
+ * - riff has NO local CLI process to wrap (execution happens in riff's own
+ *   remote sandbox); without this bypass the worker's fail-safe "backend not
+ *   sandboxable" hard error would brick every sandbox-enabled bot the moment
+ *   it switches to riff (the dashboard agent switch does not clear `sandbox`).
+ */
+export function localSandboxApplies(platform: NodeJS.Platform, backendType: string): boolean {
+  return platform !== 'darwin' && backendType !== 'riff';
+}
+
+/**
  * Build the sandboxed spawn for a CLI session, or return null when sandboxing
  * is off / unsupported / a required overlay mount fails (fail-safe = the worker
  * treats null as a hard error and does NOT silently run unsandboxed).
@@ -834,8 +846,13 @@ export function buildRelayHostEnv(
   return env;
 }
 
-export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, sessionId: string): () => void {
-  const cli = distCliJs();
+export function startOutboxWatcher(
+  outbox: string,
+  baseEnv: NodeJS.ProcessEnv,
+  sessionId: string,
+  opts: { cliPath?: string } = {},
+): () => void {
+  const cli = opts.cliPath ?? distCliJs();
   const inFlight = new Set<string>();
   // Host-private staging — a sibling of the outbox, NOT bound into the sandbox.
   const staging = join(dirname(outbox), 'relay-staging');

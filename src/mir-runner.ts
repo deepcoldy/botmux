@@ -5,7 +5,7 @@
  * Unlike the interactive PTY adapters, `mir` drives mircli through its
  * non-interactive Print Mode: each botmux turn spawns
  *
- *     mircli -p <content> --lean --output-format text --session-id <sid> -y \
+ *     mircli -p <content> --output-format text --session-id <sid> -y \
  *            --append-system-prompt <local-runtime-context>
  *
  * in the botmux workspace cwd, captures stdout, and ships it back to the daemon
@@ -52,7 +52,7 @@ const MARKER_PREFIX = '::botmux-mir:';
 // Backend Claude-harness builtin tools that route to the cloud sandbox; mircli's
 // own local tools are the lowercase equivalents. Optionally hard-disallow these
 // (MIRCLI_DISALLOW_BUILTIN=1) to push the model onto the local tools. Off by
-// default — the validated path relies on --lean + the local MCP bridge.
+// default — the validated path relies on the full tool_list + local MCP bridge.
 const BUILTIN_SANDBOX_TOOLS = ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'];
 
 function parseArgs(argv: string[]): Args {
@@ -149,9 +149,15 @@ function runtimeSystemPrompt(): string {
     'BotMux invokes you in a non-interactive message bridge. NEVER emit ```ask_user_call``` or ```ask_user_form_call``` fences for local path, permission, or environment issues.',
     'If the target path is not obvious, use the actual local runtime cwd above. Do not ask the user to choose a path when this cwd is provided.',
     'This BotMux session is not running in /home/mira/.session. Do not report /home/mira/.session as the working directory for this session.',
-    'Local filesystem, shell/bash, git, and BotMux CLI tools are available through the Mir CLI local tool bridge for this process.',
+    'Local filesystem, shell/bash, git, and BotMux CLI tools are available through the Mir CLI local tool bridge (mira_local_bash / mira_local_read_file / local_filesystem_* tools) for this process.',
     'When the user asks to create, read, list, edit, or inspect local files, run bash/shell commands, inspect git, or operate BotMux, you MUST call the local tools against the actual local cwd above.',
-    'Prefer local bash commands that operate from the current cwd with relative paths first; if an absolute physical cwd fails, retry the same operation from the current cwd and then with the local tool path alias before reporting failure.',
+    // The bridged local tools execute inside the user's miramcp bridge process,
+    // whose working directory is wherever the bridge was started — NOT this
+    // session's workspace. Relative paths therefore resolve against the wrong
+    // directory (observed live: `cat file.txt` returning empty in a workspace
+    // that clearly contained it).
+    `IMPORTANT: local tools execute in a separate bridge process whose working directory is NOT this session's cwd. NEVER rely on relative paths or an implied cwd. Prefix EVERY local bash command with \`cd ${paths.cwd} && \`, and pass absolute paths (under the actual local runtime cwd above) to every local file tool.`,
+    'If an absolute path under the actual cwd fails as outside allowed roots, retry the same operation with the local tool path alias above before reporting failure.',
     'Do not say the local MCP bridge is disconnected, that only a cloud sandbox is available, or that the operation is cancelled unless a concrete local tool invocation actually returned that error.',
     'If a local tool invocation fails, report the exact failed operation and error concisely, then stop or ask for the missing input.',
   );
@@ -206,7 +212,15 @@ class MircliClient {
         }
       }
       const args = splitEnvArgs(process.env.MIRCLI_EXTRA_ARGS);
-      if (boolEnv('MIRCLI_LEAN', true) && !args.includes('--lean') && !args.includes('--ultra')) {
+      // MIRCLI_LEAN defaults OFF: the Mira completion API only enables tools the
+      // client lists in config.tool_list (it accepts no client tool schemas), and
+      // `--lean` skips that injection entirely. Lean sessions therefore never get
+      // the LocalMcp package — mira_local_bash / local_filesystem_* via the user's
+      // miramcp bridge — leaving only the cloud-sandbox builtins, which mircli's
+      // local-only coding mode hard-blocks. Net effect: no usable local tools
+      // ("本地工具没有暴露"). Verified against mircli v2.10.0: full mode exposes
+      // mcp__proxy___<device>__mira_local_bash etc., lean mode exposes none.
+      if (boolEnv('MIRCLI_LEAN', false) && !args.includes('--lean') && !args.includes('--ultra')) {
         args.push('--lean');
       }
       args.push(

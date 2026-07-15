@@ -59,10 +59,18 @@ const probeLarkLogger = {
 let allBotClients: Array<{ appId: string; cliId: string; client: InstanceType<typeof Client> }> | null = null;
 function getAllBotClients() {
   if (!allBotClients) {
-    allBotClients = loadBotConfigs().map((cfg) => ({
+    let cfgs: Array<{ larkAppId: string; larkAppSecret: string; cliId: string; brand?: string }>;
+    try {
+      cfgs = loadBotConfigs();
+    } catch {
+      // riff sandbox：没有 bots.json，只有经 env 合成注册进 registry 的 bot——
+      // 降级用注册表里的配置，`botmux bots list` 等只读探测照常可用。
+      cfgs = getAllBots().map((b) => b.config);
+    }
+    allBotClients = cfgs.map((cfg) => ({
       appId: cfg.larkAppId,
       cliId: cfg.cliId,
-      client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, domain: sdkDomain(normalizeBrand(cfg.brand)), logger: probeLarkLogger }),
+      client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, domain: sdkDomain(normalizeBrand(cfg.brand as any)), logger: probeLarkLogger }),
     }));
   }
   return allBotClients;

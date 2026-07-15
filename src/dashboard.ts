@@ -41,6 +41,7 @@ import {
   TTADK_DEFAULT_MODEL,
   TTADK_MODEL_SUGGESTIONS,
 } from './setup/cli-selection.js';
+import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
@@ -115,7 +116,7 @@ import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
-import { automateOpenPlatformSetup } from './setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
@@ -576,13 +577,13 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
               };
             }
           }
-          // Event subscription is also critical: if all 3 event update endpoints
-          // failed (eventWarning set, subscribedEventCount === 0), the bot won't
-          // receive vc.bot.meeting_*_v1 push events → meeting invite black hole.
-          if (result.eventWarning && result.subscribedEventCount === 0) {
+          // Event subscription is also critical: listener 缺任一 VC 事件都收不到
+          // 会议邀请(missingVcEvents 判定,总 count 无法区分缺的是不是 VC)。
+          const eventGateError = vcListenerEventGateError(result);
+          if (eventGateError) {
             return {
               ok: false,
-              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: 事件订阅全部失败(${result.eventWarning})，bot 无法接收会议邀请事件。请到开放平台手动订阅 VC 会议事件后重试。`,
+              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。请到开放平台手动订阅 VC 会议事件后重试。`,
             };
           }
         } else {
@@ -624,13 +625,13 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
               };
             }
           }
-          // Also check event subscription status — if event update failed (all 3
-          // endpoints) before the downstream api_error hit, the bot still won't
-          // receive meeting invite events → listener black hole.
-          if (result.eventWarning && (result.subscribedEventCount ?? 0) === 0) {
+          // Also check event subscription status — automation 走到订阅阶段时
+          // missingVcEvents 会带回来;listener 缺任一 VC 事件都不能保存。
+          const eventGateError = vcListenerEventGateError(result);
+          if (eventGateError) {
             return {
               ok: false,
-              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: 事件订阅失败(${result.eventWarning})，bot 无法接收会议邀请事件。自动化配置失败(${reason})，请手动订阅 VC 会议事件后重试。`,
+              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。自动化配置失败(${reason})，请手动订阅 VC 会议事件后重试。`,
             };
           }
         }
@@ -2540,14 +2541,26 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/cli-options') {
       const webSession = await botOnboarding.sessionStatus();
       return jsonRes(res, 200, {
-        options: CLI_SELECT_OPTIONS.map((o) => ({
-          id: o.key,
-          label: o.label,
-          // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
-          ...(isTtadkWrapper(o.wrapperCli)
-            ? { gateway: 'ttadk' as const, acceptsModel: ttadkAcceptsModel(o.wrapperCli) }
-            : {}),
-        })),
+        options: CLI_SELECT_OPTIONS.map((o) => {
+          // Keep the all-options scan shell-free so opening the form remains
+          // instant even when most of the 20+ CLIs are absent. The selected
+          // option is checked again with shell/rc resolution on submit/save.
+          const availability = checkCliAvailability({
+            cliId: o.cliId,
+            wrapperCli: o.wrapperCli,
+          }, { shellFallback: false });
+          return {
+            id: o.key,
+            label: o.label,
+            available: availability.available,
+            command: availability.command,
+            availabilityReason: availability.reason,
+            // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
+            ...(isTtadkWrapper(o.wrapperCli)
+              ? { gateway: 'ttadk' as const, acceptsModel: ttadkAcceptsModel(o.wrapperCli) }
+              : {}),
+          };
+        }),
         // ttadk 模型默认值 + 候选 (单一事实源在 cli-selection), 供前端模型框使用.
         ttadkModelDefault: TTADK_DEFAULT_MODEL,
         ttadkModelSuggestions: TTADK_MODEL_SUGGESTIONS,
@@ -2577,7 +2590,7 @@ const server = createServer(async (req, res) => {
       }
       // CLI: 把下拉传来的选择键 (普通 cliId 或 aiden-x-claude/codex) 解析成
       // { cliId, wrapperCli }——空 → 默认 claude-code; 非法键 → 400.
-      let cliId: CliId | undefined;
+      let cliId: CliId;
       let wrapperCli: string | undefined;
       try {
         const key = typeof parsed.cliId === 'string' && parsed.cliId.trim() ? parsed.cliId.trim() : 'claude-code';
@@ -2586,6 +2599,15 @@ const server = createServer(async (req, res) => {
         wrapperCli = sel.wrapperCli;
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
+      }
+      const availability = checkCliAvailability({ cliId, wrapperCli });
+      if (!availability.available) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'cli_not_found',
+          command: availability.command,
+          message: `所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 dashboard 所在机器安装后重试。`,
+        });
       }
       // 工作目录: 留空 → '~'; 在 daemon 主机上校验目录确实存在 (对齐 setup 的
       // ensureBotWorkingDirsExist). 失败 fail-fast, 让用户在扫码前就改对.
@@ -3261,6 +3283,24 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-env`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/riff — proxy to that bot's daemon. Body
+    // `{ riff: string }` (raw JSON text; '' = clear).
+    let mBotRiff: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotRiff = url.pathname.match(/^\/api\/bots\/([^/]+)\/riff$/))) {
+      const appId = decodeURIComponent(mBotRiff[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-riff`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

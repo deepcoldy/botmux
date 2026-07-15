@@ -79,6 +79,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     dormantSessionCount: typeof j?.dormantSessionCount === 'number' ? j.dormantSessionCount : 0,
     startupCommands: typeof j?.startupCommands === 'string' ? j.startupCommands : '',
     env: typeof j?.env === 'string' ? j.env : '',
+    riff: j?.riff && typeof j.riff === 'object' ? j.riff : null,
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,
   };
 }

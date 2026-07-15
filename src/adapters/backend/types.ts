@@ -1,4 +1,4 @@
-export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij';
+export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'riff';
 
 /**
  * Tri-state result of probing whether a named backing session exists.
@@ -48,13 +48,35 @@ export interface SessionBackend {
   kill(): void;
   /** Permanently destroy the backing session (e.g. kill tmux session).
    *  Called only on explicit /close. Default: same as kill(). */
-  destroySession?(): void;
   getAttachInfo?(): { type: 'tmux'; sessionName: string } | null;
   /** PID of the CLI process running inside the backend. */
   getChildPid?(): number | null;
   captureCurrentScreen?(): string;
   captureViewport?(): string;
   getPaneSize?(): { cols: number; rows: number } | null;
+  /**
+   * Remote sandbox access URL — backends that run on a remote sandbox (e.g.
+   * riff) expose a web terminal link instead of a local PTY. The worker
+   * forwards this to the daemon so the dashboard "Web终端" button opens the
+   * sandbox directly. Optional — local backends (pty/tmux/herdr/zellij)
+   * never implement it.
+   */
+  onAccessUrl?(cb: (url: string) => void): void;
+  /**
+   * Remote-task turn boundary — backends that execute discrete remote tasks
+   * (riff) invoke this when the current task finishes or fails. The worker
+   * uses it to re-arm prompt-ready and flush queued follow-up messages: remote
+   * backends have no PTY output, so the idle detector never fires for them and
+   * nothing else would ever mark the session ready again after a write.
+   * Optional — local backends never implement it.
+   */
+  onTaskDone?(cb: () => void): void;
+  /** Remote-task id updates (riff) — the worker forwards these to the daemon
+   *  so the follow-up lineage survives daemon restarts. `null` clears the
+   *  persisted lineage (follow-up failed → next message starts fresh). */
+  onTaskId?(cb: (taskId: string | null) => void): void;
+  /** Async-capable teardown: riff awaits the remote task-cancel here. */
+  destroySession?(): void | Promise<void>;
 }
 
 /**

@@ -14,6 +14,7 @@ import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
+import { isValidRiffBaseUrl } from '../adapters/backend/riff-backend.js';
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
@@ -87,6 +88,7 @@ import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.
 import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
+import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
 
 // Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
@@ -709,6 +711,11 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
   if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  // Riff backend: the sandbox URL is the writable link — no local worker needed.
+  if (ds.riffAccessUrl) {
+    jsonRes(res, 200, { ok: true, url: ds.riffAccessUrl });
+    return;
+  }
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port || !ds.workerToken) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
   jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds, { write: true }) });
@@ -1581,6 +1588,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     startupCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
+    riff: redactRiffForClient(getBot(cachedLarkAppId).config.riff),
     summaryRange: summaryRangeFromBotConfig(getBot(cachedLarkAppId).config),
     skills: getBot(cachedLarkAppId).config.skills ?? null,
   });
@@ -1787,6 +1795,18 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
   }
   const model = typeof body.model === 'string' ? body.model.trim() : '';
+  const currentBotConfig = getBot(cachedLarkAppId).config;
+  const availability = checkCliAvailability({
+    cliId: selected.cliId,
+    wrapperCli: selected.wrapperCli,
+    cliPathOverride: currentBotConfig.cliPathOverride,
+  });
+  // Existing Bot edits remain saveable (operators may intentionally configure
+  // first and install second), but the response is explicit so Dashboard never
+  // claims a missing Agent was saved successfully without qualification.
+  const availabilityWarning = availability.available
+    ? undefined
+    : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
 
   // If the new CLI/wrapper can no longer enforce a currently-on read isolation,
   // auto-clear the flag here so the next session doesn't fail-close on it. (The
@@ -1804,6 +1824,15 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       delete entry.readIsolation;
       readIsolationCleared = true;
     }
+    // cliId=riff → backendType 自动设为 riff（否则 spawn 走 pty 后端找不到本地二进制）。
+    if (selected.cliId === 'riff') {
+      entry.backendType = 'riff';
+    } else if (entry.backendType === 'riff') {
+      // 从 riff 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
+      // 默认后端——否则新 CLI 会跑在 RiffBackend 上（PTY 分块输入被当成一串 riff
+      // 任务）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不会是 riff）。
+      delete entry.backendType;
+    }
     return { write: true, result: null };
   });
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
@@ -1814,6 +1843,11 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   else bot.config.wrapperCli = undefined;
   bot.config.model = model || undefined;
   if (readIsolationCleared) bot.config.readIsolation = false;
+  if (selected.cliId === 'riff') {
+    bot.config.backendType = 'riff';
+  } else if (bot.config.backendType === 'riff') {
+    bot.config.backendType = undefined;
+  }
 
   // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
   // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
@@ -1833,6 +1867,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     readIsolation: bot.config.readIsolation === true,
     readIsolationSupported: readIsolationEnforceableFor(bot.config),
     readIsolationCleared,
+    agentAvailable: availability.available,
+    availabilityWarning,
+    requiredCommand: availability.command,
   });
 });
 
@@ -1951,6 +1988,51 @@ ipcRoute('PUT', '/api/bot-env', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, env: value ? JSON.stringify(value, null, 2) : '' });
+});
+
+// Per-bot riff 后端配置。Body `{ riff: string }`（原始 JSON 文本，如
+// `{"baseUrl":"https://...","agent":"aiden","model":"...","injectStatusLines":true}`）：
+// 空白 → 清除；否则按 json kind 解析后落盘。走 applyConfigField（与 /botconfig
+// 同一写盘 + 内存热更新路径），next-session 生效。仅 backendType=riff 时使用。
+/** riff 配置里 dashboard 可编辑的字段——PUT /bot-riff 只覆盖这些，其余保留。 */
+const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'agent', 'model', 'jwtEnv', 'sandboxCluster', 'injectStatusLines', 'systemPrompt', 'setupCommands']);
+
+/** 发给浏览器前脱敏：明文 jwt / env（可能含各类密钥）绝不进 dashboard 响应。 */
+function redactRiffForClient(riff: unknown): Record<string, unknown> | null {
+  if (!riff || typeof riff !== 'object') return null;
+  const { jwt: _jwt, env: _env, ...safe } = riff as Record<string, unknown>;
+  return safe;
+}
+
+ipcRoute('PUT', '/api/bot-riff', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { riff?: unknown };
+  try { body = await readJsonBody<{ riff?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('riff');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.riff === 'string' ? body.riff : '';
+  let value: Record<string, unknown> | null;
+  if (!raw.trim()) {
+    value = null;  // 清除（显式清空整份 riff 配置，含隐藏字段）
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as Record<string, unknown>;
+    // 合并保存：dashboard 只回写 UI 展示的字段；接口支持但 UI 未展示的字段
+    // （templateId / jwt / env / logLevel / repos…）必须原样保留，否则用户只改
+    // 一个 model 就会静默删掉认证等隐藏配置。
+    const prev = (getBot(cachedLarkAppId).config.riff ?? {}) as Record<string, unknown>;
+    const preserved = Object.fromEntries(Object.entries(prev).filter(([k]) => !RIFF_UI_EDITABLE_KEYS.has(k)));
+    value = { ...preserved, ...value };
+    if (!isValidRiffBaseUrl(value.baseUrl)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_base_url' });
+    }
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, riff: value ? JSON.stringify(redactRiffForClient(value), null, 2) : '' });
 });
 
 // Per-bot 最大同时活跃会话数 maxLiveWorkers。Body `{ maxLiveWorkers: number | null }`:

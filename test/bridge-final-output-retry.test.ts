@@ -651,6 +651,39 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).toContain(`[file](/${missing})`);
   });
 
+  it.each([
+    ['persisted session backend', (ds: DaemonSession) => { ds.session.backendType = 'riff'; }],
+    ['reconciled live backend', (ds: DaemonSession) => {
+      ds.session.backendType = 'tmux';
+      ds.initConfig = { backendType: 'riff' } as any;
+    }],
+  ])('uses probe-free lexical link repair for Riff via %s', async (_source, configure) => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    configure(ds);
+    const home = homedir().replace(/\/+$/, '');
+    const relativeHome = home.replace(/^\/+/, '');
+    const missing = `${relativeHome}/botmux-definitely-missing-riff-${Date.now()}.md`;
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, {
+      ...finalOutputMsg(),
+      content: `[file](${missing})`,
+    }, 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    expect(cardJson).toContain(`[file](/${missing})`);
+  });
+
   it('uses lexical link repair when sandboxing is forced globally', async () => {
     const previous = process.env.BOTMUX_SANDBOX;
     process.env.BOTMUX_SANDBOX = '1';

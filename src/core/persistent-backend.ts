@@ -73,6 +73,27 @@ export function resolveSpawnBackendType(
 }
 
 /**
+ * Enforce the `cliId === 'riff' ⇔ backendType === 'riff'` pairing invariant at
+ * the ONE spawn chokepoint, so every config entry point (dashboard, `/config
+ * set cli|backendType`, `botmux setup`, hand-edited bots.json) converges:
+ *   - riff CLI on a local backend → force 'riff' (a pty/tmux spawn would fail
+ *     on the empty resolvedBin);
+ *   - non-riff CLI on the riff backend → fall back to the daemon default (the
+ *     CLI's PTY chunked writes would otherwise fan out into riff tasks).
+ * Manual pty/tmux/herdr/zellij overrides for non-riff CLIs pass through.
+ */
+export function reconcileRiffBackendType(
+  cliId: string,
+  resolved: BackendType,
+  defaultType: BackendType,
+): BackendType {
+  if (cliId === 'riff') return 'riff';
+  // defaultType 本身被误配成 riff 时兜底到确定可用的本地后端（pty 无外部依赖）。
+  if (resolved === 'riff') return defaultType !== 'riff' ? defaultType : 'pty';
+  return resolved;
+}
+
+/**
  * How a session's worker is torn down at daemon shutdown, branched on the
  * session's FROZEN backend (via getSessionPersistentBackendType), NOT live config:
  *   'detach' — persistent backend (tmux/herdr/zellij): SIGTERM the worker only,
@@ -82,6 +103,11 @@ export function resolveSpawnBackendType(
  * tears down — e.g. detach-preserving a "herdr" session whose real pane is tmux.
  */
 export function shutdownBackendDisposition(ds: DaemonSession): 'detach' | 'close' {
+  // riff：远端任务独立于本地进程存活。daemon shutdown 走 'close' 会经 worker 的
+  // destroySession() 取消远端任务——重启不该杀任务（血缘已持久化，重启后
+  // follow-up 续上，agent 的 botmux send 照常送达）。detach = 仅 SIGTERM worker。
+  const frozen = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (frozen === 'riff') return 'detach';
   return getSessionPersistentBackendType(ds) ? 'detach' : 'close';
 }
 

@@ -1450,6 +1450,8 @@ function refreshCliVersion(cliId: CliId, cliPathOverride?: string): boolean {
 
   try {
     const adapter = createCliAdapterSync(cliId, cliPathOverride);
+    // Remote backends (riff) have no local binary to version-check — skip.
+    if (!adapter.resolvedBin && !adapter.versionCommand) return false;
     const versionCommand = adapter.versionCommand?.() ?? { bin: adapter.resolvedBin, args: ['--version'] };
     const raw = execFileSync(versionCommand.bin, versionCommand.args, {
       encoding: 'utf-8',

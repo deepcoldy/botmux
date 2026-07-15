@@ -63,7 +63,7 @@ import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types
 import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch } from '../../services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
 import {
@@ -335,9 +335,12 @@ export async function commitRepoSelection(
   // The worktree flow already posted a precise "worktree 已创建：path 分支 …"
   // line before funnelling in here — suppress the redundant "已选择/已切换"
   // confirmation so the user sees a single message, not two.
-  opts?: { suppressConfirmReply?: boolean },
+  opts?: { suppressConfirmReply?: boolean; riffRepoDirs?: string[] },
 ): Promise<void> {
   const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply } = ctx;
+  // riff 多仓 stamp：只有多仓 worktree 流显式传入（保留用户选择顺序，首仓=primary）；
+  // 其它选仓路径一律清除旧 stamp——workingDir 变了，旧的多仓组合不再成立。
+  ds.session.riffRepoDirs = opts?.riffRepoDirs;
   const locTarget = localeForBot(ds.larkAppId);
   // `/close` deletes the active-map entry without touching sessionId or
   // pendingRepo — identity against the map is the only tell that the session
@@ -1713,7 +1716,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const botCfg = getBot(ds.larkAppId).config;
       const effectiveCliId = sessionCliId(ds);
       const locDs = localeForBot(ds.larkAppId);
-      if (ds.workerPort && ds.workerToken) {
+      if (ds.riffAccessUrl || (ds.workerPort && ds.workerToken)) {
         const writeUrl = buildTerminalUrl(ds, { write: true });
         const cardJson = buildSessionCard(
           ds.session.sessionId,
@@ -2429,6 +2432,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           return;
         }
         if (sessionChanged()) return notSwitched(creation, 'mid-flight');
+        // riff：新建的 worktree 分支只存在于本地，远程沙箱克隆不到 → 先推送
+        // 分支指针到远端，riff 任务才能钉住这个新分支。推送失败不阻塞（worker
+        // 推导会按现状回退默认分支并在卡片注入告警），只提示用户。
+        if (getBot(targetDs.larkAppId).config.backendType === 'riff') {
+          for (const c of created) {
+            try {
+              await pushWorktreeBranch(c.result.path, c.result.branch);
+            } catch (e) {
+              const errMsg = e instanceof Error ? e.message : String(e);
+              logger.warn(`[${tag(targetDs)}] riff worktree branch push failed (${c.result.branch}): ${errMsg}`);
+              await sessionReply(rootId, t('card.repo.riff_worktree_push_failed', { branch: c.result.branch, error: errMsg }, locTarget));
+            }
+          }
+        }
         await sessionReply(rootId, t('cmd.repo.worktree_created', {
           path: creation.path, branch: creation.branch, base: creation.baseRef,
         }, locTarget));
@@ -2439,7 +2456,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         try {
           // The "worktree 已创建：…" notice above already confirms the switch —
           // suppress commitRepoSelection's own "已选择/已切换" to avoid a dup.
-          await commitRepoSelection(commitCtx, creation.path, `${pathBasename(creation.path)} (${creation.branch})`, { suppressConfirmReply: true });
+          await commitRepoSelection(commitCtx, creation.path, `${pathBasename(creation.path)} (${creation.branch})`, {
+            suppressConfirmReply: true,
+            // 多仓：把按用户选择顺序创建的 worktree 目录 stamp 到 session，
+            // riff 按此显式列表（而非目录扫描）推导 repos，首仓为 primary。
+            riffRepoDirs: created.length > 1 ? created.map(c => c.result.path) : undefined,
+          });
         } catch (e) {
           // The worktree DOES exist at this point — only the switch failed.
           // Don't report it as a creation failure, or the user retries and
