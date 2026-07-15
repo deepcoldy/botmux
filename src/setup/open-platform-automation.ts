@@ -616,21 +616,16 @@ export async function automateOpenPlatformSetup(
   let csrfToken: string | null = null;
   let apiOrigin = defaultOrigin;
   let appHome = defaultAppHome;
-  // 创建者 userId——版本可见范围要把创建者填进 visibleSuggest.members,否则
-  // 应用发布后不会自动上架启用(tenantAppStatus 停在 0),bot 在企业内不可用。
-  let sessionUserId: string | undefined;
   try {
     const authPage = await session.fetchTextWithUrl(fetcher, `${defaultAppHome}/auth`);
     apiOrigin = new URL(authPage.finalUrl).origin;
     appHome = `${apiOrigin}/app/${options.appId}`;
     csrfToken = extractOpenPlatformCsrfToken(authPage.text);
-    sessionUserId = extractOpenPlatformSessionIdentity(authPage.text)?.userId;
     if (!csrfToken) {
       const homePage = await session.fetchTextWithUrl(fetcher, appHome);
       apiOrigin = new URL(homePage.finalUrl).origin;
       appHome = `${apiOrigin}/app/${options.appId}`;
       csrfToken = extractOpenPlatformCsrfToken(homePage.text);
-      sessionUserId ??= extractOpenPlatformSessionIdentity(homePage.text)?.userId;
     }
   } catch (err: any) {
     return { ok: false, reason: 'network', message: `读取开放平台页面失败: ${safeErrorMessage(err)}`, sessionFile };
@@ -858,12 +853,12 @@ export async function automateOpenPlatformSetup(
   try {
     await postJson(`/developers/v1/safe_setting/update/${options.appId}`, buildSafeSettingPayload(options.appId));
     const contactRange = await postJson(`/developers/v1/contact_range/${options.appId}`, {});
-    // 可见范围必须包含创建者(launcher 同款):否则版本发布后不会自动上架启用。
-    // contact_range 的成员为辅,创建者 userId 兜底,去重。
-    const visibleMemberIds = uniqueStrings([
-      ...(sessionUserId ? [sessionUserId] : []),
-      ...extractContactRangeMemberIds(contactRange),
-    ]);
+    // 镜像应用原有 contact range 作为版本可见范围——绝不注入「当前 Web session
+    // 操作者」:automateOpenPlatformSetup 也被 VC listener 保存 / 权限自愈 / 选择
+    // 已有应用等路径调用,那里操作者不一定是创建者/现有可见成员,注入会悄悄扩大
+    // 已有 bot 的可见范围。新建应用的「上架启用」由 createOpenPlatformAppWithClient
+    // 的首次发布(含创建者可见)完成,与本处无关。
+    const visibleMemberIds = extractContactRangeMemberIds(contactRange);
     const versionList = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
     const appVersion = nextAppVersion(versionList);
     const created = await postJson(`/developers/v1/app_version/create/${options.appId}`, buildAppVersionCreatePayload(appVersion, visibleMemberIds));
@@ -1170,10 +1165,14 @@ function isDefiniteTemplateRejection(err: unknown): boolean {
  */
 export async function createOpenPlatformAppWithClient(
   client: OpenPlatformApiClient,
-  options: { name: string; description?: string; iconFilePath?: string; creatorUserId?: string },
+  // creatorUserId 必填:首次「启用发布」的版本可见范围必须含创建者,否则发布后
+  // 应用不会自动上架启用。调用方(createFeishuOpenPlatformApp)已保证 session
+  // identity 可用才会走到这里。
+  options: { name: string; description?: string; iconFilePath?: string; creatorUserId: string },
 ): Promise<{ appId: string; appSecret: string }> {
   const name = options.name.trim();
   if (!name) throw new Error('应用名称不能为空');
+  if (!options.creatorUserId) throw new Error('创建应用缺少创建者 userId,无法完成上架启用');
   const iconFile = options.iconFilePath ?? defaultBotmuxAppIconPath();
   if (!iconFile || !existsSync(iconFile)) throw new Error('找不到 botmux 默认应用图标');
 
@@ -1228,20 +1227,19 @@ export async function createOpenPlatformAppWithClient(
     // 复刻 console launcher「一键创建智能体」的最后一步:立刻用极简版本发布一次,
     // 让应用**上架启用**(tenantAppStatus 0→2)。这样返回的就是一个「已启用、可
     // 收发消息」的应用——等价于旧 SDK registerApp 直接产出可用 PersonalAgent 的效果。
-    // 缺这一步,后续 automateOpenPlatformSetup 的改动+发版都无法让裸应用自动上架。
-    // 失败不致命:automateOpenPlatformSetup 结尾仍会再发一次版本兜底。
-    try {
-      const created = await client.postJson(
-        `/developers/v1/app_version/create/${appId}`,
-        buildAppVersionCreatePayload('1.0.0', options.creatorUserId ? [options.creatorUserId] : []),
-      );
-      const versionId = extractVersionId(created);
-      if (versionId) {
-        await client.postJson(`/developers/v1/publish/commit/${appId}/${versionId}`, { clientId: appId });
-      }
-    } catch (err) {
-      console.warn(`模板应用初次发布启用失败(automateOpenPlatformSetup 会再兜底): ${safeErrorMessage(err)}`);
+    // 这一步 fail-closed:拿到 versionId 后 commit 失败、或 code=0 却没 versionId
+    // (可能留下未发布草稿),都视为创建失败抛出(带 appId,由调用方兜底/提示),
+    // 不宣称「后续 setup 会软兜底」——setup 的 nextAppVersion 不复用未发布草稿,
+    // 版本号可能撞车导致二次发版继续失败,应用永远停在未启用。
+    const versionCreated = await client.postJson(
+      `/developers/v1/app_version/create/${appId}`,
+      buildAppVersionCreatePayload('1.0.0', [options.creatorUserId]),
+    );
+    const enableVersionId = extractVersionId(versionCreated);
+    if (!enableVersionId) {
+      throw new Error('上架启用版本创建返回成功但没有 versionId(可能已留下未发布草稿);请到开放平台确认后重试');
     }
+    await client.postJson(`/developers/v1/publish/commit/${appId}/${enableVersionId}`, { clientId: appId });
 
     const appSecret = await fetchOpenPlatformAppSecret(client, appId);
     return { appId, appSecret };
@@ -1664,17 +1662,22 @@ function mapScopeIds(scopeNames: string[], catalog: OpenPlatformScopeEntry[], bu
 export function nextAppVersion(payload: unknown): string {
   const data = asRecord(asRecord(payload).data);
   const versions = Array.isArray(data.versions) ? data.versions : [];
-  const published = versions
-    .map(item => asRecord(item))
-    .filter(item => item.versionStatus === 2)
-    .map(item => pickString(item, ['appVersion']))
-    .filter((version): version is string => Boolean(version));
-  if (published.length === 0) return '0.0.1';
-  const latest = published[0];
-  const parts = latest.split('.').map(part => Number.parseInt(part, 10));
-  if (parts.length < 3 || parts.some(part => !Number.isFinite(part))) return '0.0.1';
-  parts[parts.length - 1] += 1;
-  return parts.join('.');
+  // 取所有版本(含未发布草稿)里的最大三段号 +1——不能只看已发布版本:若存在
+  // 未发布草稿(如上架启用失败留下的 1.0.0),只看已发布会算出 0.0.1 撞车,导致
+  // 二次发版被平台以「版本号未递增」拒掉,应用永远停在未启用。
+  const triples = versions
+    .map(item => pickString(asRecord(item), ['appVersion']))
+    .filter((version): version is string => Boolean(version))
+    .map(version => version.split('.').map(part => Number.parseInt(part, 10)))
+    .filter(parts => parts.length === 3 && parts.every(part => Number.isFinite(part)));
+  if (triples.length === 0) return '0.0.1';
+  const max = triples.reduce((a, b) => {
+    for (let i = 0; i < 3; i++) {
+      if (b[i] !== a[i]) return b[i] > a[i] ? b : a;
+    }
+    return a;
+  });
+  return [max[0], max[1], max[2] + 1].join('.');
 }
 
 function extractContactRangeMemberIds(payload: unknown): string[] {
