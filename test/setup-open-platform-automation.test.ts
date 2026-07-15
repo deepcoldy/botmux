@@ -692,6 +692,7 @@ describe('automateOpenPlatformSetup', () => {
         appEvents: [
           'im.message.receive_v1',
           'im.chat.member.bot.added_v1',
+          'im.chat.member.bot.deleted_v1',
           'drive.file.comment_add_v1',
           'drive.notice.comment_add_v1',
           'im.message.reaction.created_v1',
@@ -723,8 +724,8 @@ describe('automateOpenPlatformSetup', () => {
       expect(result.message).toContain('im.message.receive_v1');
       expect(result.eventWarning).toBeTruthy();
     }
-    // 批量失败后逐个重试过:baseline 6 + VC app 3 + VC user 1 = 批量 1 次 + 单个 10 次
-    expect(sub.updateBodies.filter(body => Array.isArray(body.appEvents)).length).toBe(11);
+    // 批量失败后逐个重试过:baseline 7 + VC app 3 + VC user 1 = 批量 1 次 + 单个 11 次
+    expect(sub.updateBodies.filter(body => Array.isArray(body.appEvents)).length).toBe(12);
     // 核心事件缺失时不再继续发版,避免发布一个收不到消息的版本
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
   });

@@ -22,6 +22,7 @@ import { VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 export const BOT_BASELINE_APP_EVENTS = [
   'im.message.receive_v1',
   'im.chat.member.bot.added_v1',
+  'im.chat.member.bot.deleted_v1',
   'drive.file.comment_add_v1',
   'drive.notice.comment_add_v1',
   'im.message.reaction.created_v1',
