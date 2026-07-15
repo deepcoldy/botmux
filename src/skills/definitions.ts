@@ -139,6 +139,9 @@ botmux history --scope ambient --limit 20
 
 # 在 thread 内强制读取整个群聊最近消息（包含其他话题/卡片，噪音更大）
 botmux history --scope chat --limit 50
+
+# 附带每张卡片的原始结构化 JSON（告警卡等自动化解析场景；输出会变大）
+botmux history --with-card-json
 \`\`\`
 
 ## 输出
@@ -158,9 +161,13 @@ JSON 格式，字段：
     "excludeRootMessageId": "..."
   },
   "messages": [
-    { "messageId": "...", "senderId": "...", "senderType": "user|app", "msgType": "text|post|interactive", "content": "...", "createTime": "..." }
+    { "messageId": "...", "senderId": "...", "senderType": "user|app", "msgType": "text|post|interactive", "content": "...", "createTime": "...",
+      "resources": [{"type":"image","key":"img_v3_xxx","name":"img_v3_xxx.jpg"}],  // 仅含附件的消息有；key+name，不自动下载
+      "cardJson": { }              // 仅 --with-card-json 且 msgType=interactive 时有：原始卡片结构化 JSON
+    }
   ],
-  "total": 17
+  "total": 17,
+  "hint": "..."                    // 有附件/卡片时出现：提示用 botmux quoted 查看附件与卡片全文
 }
 \`\`\`
 
@@ -171,15 +178,16 @@ JSON 格式，字段：
 - \`scope=ambient\`：返回当前 thread 外的群聊上下文，默认排除当前 thread，并优先限制在 thread root 创建前，适合 \`/t\` 后补充群内讨论背景；仅在用户明确需要群聊背景时使用，并优先小 \`--limit\`
 - \`senderType="app"\` 表示机器人发的消息（包括 Claude Code / Codex / 其它 bot），\`"user"\` 表示用户
 - **合并转发**消息会自动展开：\`msgType\` 变为 \`merge_forward_expanded\`，\`content\` 是 \`<forwarded_messages>...</forwarded_messages>\` XML（含 \`<participants>\` 别名表 + 嵌套 \`<msg from="A">\` 节点），与 daemon 实时事件路径一致
+- **卡片消息**的 \`content\` 是可读文本渲染；图片只有 \`[图片 N]\` 占位符 + \`resources\` 里的 key，**不自动下载**。要看图片实际内容（如报警卡里的趋势图）或消息全文，对该条消息的 id 跑 \`botmux quoted <messageId>\`（任意消息 id 均可，附件会下载到本地）；要机器可读的原始卡片 JSON，用 \`--with-card-json\` 或 \`botmux quoted <messageId> --raw\`
 - 需要先把 JSON 读进来再做总结，不要直接把 JSON 扔给用户
 `;
 
 const QUOTED_SKILL = `---
 name: botmux-quoted
-description: 当 prompt 顶部出现 \`[用户引用了消息 用 botmux quoted om_xxx 查看]\` 提示时，用本技能按需读取被引用的那条消息内容。看到这种提示就该判断引用内容是否对当前任务必要，必要就调用，不必要就跳过。
+description: 当 prompt 顶部出现 \`[用户引用了消息 用 botmux quoted om_xxx 查看]\` 提示时，用本技能按需读取被引用的那条消息内容。看到这种提示就该判断引用内容是否对当前任务必要，必要就调用，不必要就跳过。也可对任意消息 id 使用（如从 botmux history 拿到的卡片/图片消息 id）：拉取消息全文、下载附件到本地、--raw 获取原始卡片 JSON。
 ---
 
-# botmux-quoted — 读取被引用的消息
+# botmux-quoted — 按消息 id 读取单条消息
 
 用户在飞书里使用"引用回复" UI @ 机器人时，daemon 会在喂给你的 prompt 头部加一行：
 
@@ -190,17 +198,23 @@ description: 当 prompt 顶部出现 \`[用户引用了消息 用 botmux quoted 
 
 看到这种提示，先判断引用内容是否对当前任务必要：必要就调用 \`botmux quoted om_xxx\` 拉取，不必要就忽略（不要无脑调用、污染上下文）。
 
+**不限于引用场景**：\`message_id\` 可以是任意你可见的消息 id——典型用法是从 \`botmux history\` 的输出里拿到某张卡片/图片消息的 \`messageId\`，再用本命令拉全文 + 把附件下载到本地（history 本身不下载附件）。
+
 ## 用法
 
 \`\`\`bash
 botmux quoted <message_id>
+
+# 附带原始内容：卡片消息输出 cardJson（结构化卡片 JSON，含精确字段值/按钮链接/图片 key），
+# 其它类型输出 rawContent（原始 body content）。适合告警卡等自动化解析场景。
+botmux quoted <message_id> --raw
 \`\`\`
 
-\`message_id\` 直接从提示行里复制即可。
+\`message_id\` 从提示行或 \`botmux history\` 输出里复制即可。
 
 ## 输出
 
-JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`resources\` 列表：
+JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`resources\` / \`attachments\` 列表：
 
 \`\`\`json
 {
@@ -210,16 +224,18 @@ JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`r
   "msgType": "text|post|interactive|image|file|merge_forward_expanded",
   "content": "...",
   "createTime": "1234567890000",
-  "resources": [{"type":"image","key":"img_v3_xxx","name":"img_v3_xxx.jpg"}]
+  "resources": [{"type":"image","key":"img_v3_xxx","name":"img_v3_xxx.jpg"}],
+  "attachments": [{"type":"image","path":"~/.botmux/data/attachments/<appId>/<messageId>/img_v3_xxx.jpg","name":"img_v3_xxx.jpg"}],
+  "cardJson": { }
 }
 \`\`\`
 
 ## 注意
 
-- 图片/文件渲染成 \`[图片 N]\` / \`[文件 N: name.pdf]\` 占位符（与 \`botmux history\` 一致），实际附件 key 在 \`resources\` 列表里
-- 卡片消息会被解析成可读文本
-- 合并转发消息会自动展开
-- 当前不支持自动下载附件本地化；要看图片实际内容，目前只能让用户单独转发或 \`botmux send\` 询问
+- 图片/文件渲染成 \`[图片 N]\` / \`[文件 N: name.pdf]\` 占位符（与 \`botmux history\` 一致），序号与 \`resources\`/\`attachments\` 顺序对应
+- **附件会自动下载到本地**，路径在 \`attachments\` 列表里，用读文件工具直接查看（如报警卡里的趋势图）
+- 卡片消息会被解析成可读文本；需要机器可读的结构化数据用 \`--raw\` 拿 \`cardJson\`
+- 合并转发消息会自动展开（内嵌子卡片只有文本渲染，\`--raw\` 不覆盖子消息）
 `;
 
 const SEND_SKILL = `---

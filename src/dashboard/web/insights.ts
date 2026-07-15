@@ -469,7 +469,7 @@ export function cleanPromptText(raw: string): string {
     .replace(/<mention\b[^>]*\/?>/g, ' ')
     .replace(/\[用户引用了消息[\s\S]*?\]/g, ' ')
     .replace(/\[来自[^\]]*@mention\]/g, ' ')
-    .replace(/\[(图片|文件)\s*\d+\][^\n]*/g, ' ');
+    .replace(/\[(图片|文件)\s*\d+[^\]\n]*\][^\n]*/g, ' ');
   return s
     .replace(/[ \t]+/g, ' ')
     .replace(/ *\n */g, '\n')
