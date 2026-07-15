@@ -26,6 +26,26 @@ describe('resolveSessionContext()', () => {
     expect(ctx).toEqual({ sessionId: 'marker-sid', turnId: 'turn-9' });
   });
 
+  it('parses a positive integer dispatchAttempt from the marker', () => {
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'marker-sid',
+      turnId: 'turn-9',
+      dispatchAttempt: 2,
+    }));
+    const ctx = resolveSessionContext(dir, 'env-sid', process.pid);
+    expect(ctx).toEqual({ sessionId: 'marker-sid', turnId: 'turn-9', dispatchAttempt: 2 });
+  });
+
+  it.each([0, -1, 1.5, '2', Number.MAX_SAFE_INTEGER + 1])(
+    'ignores an invalid marker dispatchAttempt (%s)',
+    (dispatchAttempt) => {
+      writeMarker(process.pid, JSON.stringify({ sessionId: 'marker-sid', dispatchAttempt }));
+      const ctx = resolveSessionContext(dir, 'env-sid', process.pid);
+      expect(ctx?.sessionId).toBe('marker-sid');
+      expect(ctx?.dispatchAttempt).toBeUndefined();
+    },
+  );
+
   it('falls back to BOTMUX_SESSION_ID when the marker walk finds nothing (detached/backgrounded)', () => {
     // No markers dir at all → ancestry walk returns null, the detached case.
     const ctx = resolveSessionContext(dir, 'env-sid', process.pid);

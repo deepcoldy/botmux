@@ -41,18 +41,25 @@ vi.mock('../src/services/message-queue.js', () => ({
 const mockForkWorker = vi.fn();
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: (...args: any[]) => mockForkWorker(...args),
-  sendWorkerInput: (ds: any, payload: any, turnId?: string) => {
+  sendWorkerInput: (ds: any, payload: any, turnId?: string, opts: any = {}) => {
     if (!ds.worker || ds.worker.killed) return false;
     ds.worker.send({
       type: 'message',
       content: typeof payload === 'string' ? payload : payload.content,
+      ...(typeof payload === 'object' && payload.codexAppInput
+        ? { codexAppInput: payload.codexAppInput }
+        : {}),
       ...(turnId ? { turnId } : {}),
+      ...(opts.dispatchAttempt !== undefined
+        ? { dispatchAttempt: opts.dispatchAttempt }
+        : {}),
     });
     return true;
   },
   getCurrentCliVersion: vi.fn(() => 'test-cli-version'),
 }));
 
+const mockRememberLastCliInput = vi.fn();
 const mockBuildFollowUpCliInput = vi.fn((prompt: string, _sessionId?: string, opts?: any) => ({
   content: `follow:${prompt}`,
   codexAppInput: opts?.cliId === 'codex-app' && opts?.codexAppText ? { text: opts.codexAppText } : undefined,
@@ -68,7 +75,7 @@ vi.mock('../src/core/session-manager.js', () => ({
   buildNewTopicCliInput: (...args: any[]) => mockBuildNewTopicCliInput(...args),
   ensureSessionWhiteboard: vi.fn(),
   getAvailableBots: vi.fn(async () => []),
-  rememberLastCliInput: vi.fn(),
+  rememberLastCliInput: (...args: any[]) => mockRememberLastCliInput(...args),
 }));
 
 const mockBotAutoWorktreeEnabled = vi.fn(() => false);
@@ -209,6 +216,53 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(opts.codexAppMessageContext).not.toContain('Summarize the alert for the operator.');
   });
 
+  it('uses an internal stable turn id without changing the public trigger schema', async () => {
+    const send = vi.fn();
+    const ds = existingDs({ worker: { killed: false, send } as any, workerGeneration: 7 });
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+    const beforeDispatch = vi.fn(() => ({ dispatchAttempt: 2 }));
+    const res = await triggerSessionTurn(
+      request(),
+      { larkAppId: APP, activeSessions },
+      { stableTurnId: 'vcd_stable_delivery_key', beforeDispatch, suppressFinalOutput: true },
+    );
+
+    expect(res).toMatchObject({ ok: true, triggerId: 'vcd_stable_delivery_key', action: 'delivered' });
+    expect(beforeDispatch).toHaveBeenCalledWith({ sessionId: ds.session.sessionId, workerGeneration: 7 });
+    expect(beforeDispatch.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]!);
+    expect(ds.suppressedFinalOutputTurns?.has('vcd_stable_delivery_key')).toBe(true);
+    expect(send).toHaveBeenCalledWith({
+      type: 'message',
+      content: expect.stringContaining('vcd_stable_delivery_key'),
+      turnId: 'vcd_stable_delivery_key',
+      dispatchAttempt: 2,
+    });
+  });
+
+  it('does not persist durable delivery input as the user resume prompt', async () => {
+    const send = vi.fn();
+    const ds = existingDs({ worker: { killed: false, send } as any, workerGeneration: 7 });
+    ds.session.lastUserPrompt = 'previous user prompt';
+    ds.session.lastCliInput = 'previous rendered input';
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+
+    const res = await triggerSessionTurn(
+      request(),
+      { larkAppId: APP, activeSessions },
+      {
+        stableTurnId: 'vcd_delivery_without_resume_history',
+        beforeDispatch: () => ({ dispatchAttempt: 1 }),
+        persistInputHistory: false,
+      },
+    );
+
+    expect(res).toMatchObject({ ok: true, action: 'delivered' });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(mockRememberLastCliInput).not.toHaveBeenCalled();
+    expect(ds.session.lastUserPrompt).toBe('previous user prompt');
+    expect(ds.session.lastCliInput).toBe('previous rendered input');
+  });
+
   it('reuses an existing root session whose worker is not running', async () => {
     const ds = existingDs();
     const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
@@ -280,6 +334,29 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockForkWorker).toHaveBeenCalledWith(
       activeSessions.get(sessionKey(ROOT, APP)),
       expect.objectContaining({ codexAppInput: { text: '外部事件触发' } }),
+    );
+  });
+
+  it('reforks an explicitly targeted dormant chat-scope session with the stable turn id', async () => {
+    const ds = existingDs({ scope: 'chat', workerGeneration: 3 });
+    ds.session.rootMessageId = CHAT;
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), ds]]);
+    const req = request({ sessionId: ds.session.sessionId, rootMessageId: undefined });
+    const beforeDispatch = vi.fn(() => ({ dispatchAttempt: 5 }));
+    const res = await triggerSessionTurn(
+      req,
+      { larkAppId: APP, activeSessions },
+      { stableTurnId: 'vcd_dormant_session_delivery', beforeDispatch },
+    );
+
+    expect(res).toMatchObject({ ok: true, triggerId: 'vcd_dormant_session_delivery', action: 'queued' });
+    expect(mockCreateSession).not.toHaveBeenCalled();
+    expect(beforeDispatch).toHaveBeenCalledWith({ sessionId: ds.session.sessionId, workerGeneration: 4 });
+    expect(beforeDispatch.mock.invocationCallOrder[0]).toBeLessThan(mockForkWorker.mock.invocationCallOrder[0]!);
+    expect(mockForkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ content: expect.stringContaining('follow:') }),
+      { resume: true, turnId: 'vcd_dormant_session_delivery', dispatchAttempt: 5 },
     );
   });
 

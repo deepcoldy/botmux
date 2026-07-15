@@ -5,6 +5,7 @@ import { execSync } from 'node:child_process';
 export interface AncestorSessionContext {
   sessionId: string;
   turnId?: string;
+  dispatchAttempt?: number;
 }
 
 export function parseSessionMarker(raw: string): AncestorSessionContext {
@@ -12,10 +13,15 @@ export function parseSessionMarker(raw: string): AncestorSessionContext {
   if (!text) return { sessionId: '' };
   if (text.startsWith('{')) {
     try {
-      const parsed = JSON.parse(text) as { sessionId?: unknown; turnId?: unknown };
+      const parsed = JSON.parse(text) as { sessionId?: unknown; turnId?: unknown; dispatchAttempt?: unknown };
       return {
         sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : '',
         turnId: typeof parsed.turnId === 'string' ? parsed.turnId : undefined,
+        dispatchAttempt: typeof parsed.dispatchAttempt === 'number'
+          && Number.isSafeInteger(parsed.dispatchAttempt)
+          && parsed.dispatchAttempt > 0
+          ? parsed.dispatchAttempt
+          : undefined,
       };
     } catch {
       return { sessionId: '' };

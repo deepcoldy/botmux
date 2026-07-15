@@ -37,6 +37,7 @@ vi.mock('../src/im/lark/client.js', async () => {
 import { registerBot } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
 import { __testOnly_sessionReply as sessionReply, __testOnly_activeSessions as activeSessions } from '../src/daemon.js';
+import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const APP = 'session_reply_anchor_app';
@@ -96,5 +97,25 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     await sessionReply(CHAT, 'hello', 'text', APP);
     expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
     expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('quotes the exact explicit VC IM turn with its stable UUID and keeps that UUID on withdrawn fallback', async () => {
+    seedSharedSession({ rootMessageId: 'om_topic_b', turnId: 'turn-b', updatedAt: NOW });
+    await sessionReply(CHAT, '{"card":"A"}', 'interactive', APP, 'turn-a', {
+      quoteMessageId: 'om_human_a',
+      uuid: 'vcp_reply_a',
+    });
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP, 'om_human_a', '{"card":"A"}', 'interactive', false, 'vcp_reply_a', expect.anything(),
+    );
+
+    mocks.replyMessage.mockRejectedValueOnce(new MessageWithdrawnError('om_human_a'));
+    await sessionReply(CHAT, '{"card":"A"}', 'interactive', APP, 'turn-a', {
+      quoteMessageId: 'om_human_a',
+      uuid: 'vcp_reply_a',
+    });
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      APP, CHAT, '{"card":"A"}', 'interactive', 'vcp_reply_a', expect.anything(),
+    );
   });
 });

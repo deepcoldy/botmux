@@ -1103,6 +1103,18 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
       error: `request target botId ${valid.request.target.botId} does not match daemon ${cachedLarkAppId}`,
     });
   }
+  if (valid.request.target.kind === 'turn' && valid.request.target.sessionId) {
+    const receiverTarget = [...activeSessions.values()].find(
+      (candidate) => candidate.session.sessionId === valid.request.target.sessionId,
+    );
+    if (receiverTarget?.session.vcMeetingReceiver) {
+      return jsonRes(res, 403, {
+        ok: false,
+        errorCode: 'managed_receiver_requires_delivery_endpoint',
+        error: 'dedicated meeting receiver sessions accept only fenced delivery or explicit IM routing',
+      });
+    }
+  }
   try {
     let result;
     if (valid.request.target.kind === 'workflow') {

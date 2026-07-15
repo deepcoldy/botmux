@@ -59,6 +59,7 @@ import {
   type VcMeetingPushEventType,
 } from '../../vc-agent/push-source.js';
 import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agent/types.js';
+import type { VcMeetingImTurnOrigin } from '../../types.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -1392,12 +1393,24 @@ export interface RoutingContext {
   scope: 'thread' | 'chat';
   /** Routing key. `chatId` for chat-scope, the thread root id for
    *  thread-scope (an existing rootMessageId, or this messageId when
-   *  it's the seed of a brand-new thread). */
+   *  it's the seed of a brand-new thread). A beforeSessionTurn hook may
+   *  replace it with a daemon-owned synthetic anchor for a dedicated receiver
+   *  session; the visible chatId/scope remain unchanged. */
   anchor: string;
   /** Chat-scope shared-topic reply target for this turn, if any. */
   replyRootId?: string;
   /** Command prompt that should be sent to the CLI instead of raw text. */
   promptOverride?: string;
+  /** Durable VC routing succeeded but the bounded pre-turn catch-up did not.
+   * Prompt builders must surface this instead of pretending context is fresh. */
+  vcMeetingContextMayLag?: boolean;
+  /** The receiver belongs to an ended meeting whose final delivery is sealed.
+   * Explicit human follow-ups still reuse that transcript, but meeting-side
+   * effects remain closed. */
+  vcMeetingContextLifecycle?: 'active' | 'sealed';
+  /** Daemon-derived authority snapshot for an explicit human IM turn routed
+   * into one dedicated meeting receiver. Never populated from message text. */
+  vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** Metadata for the summary command that produced promptOverride. */
   summaryCommand?: SummaryCommandRuntimeContext;
   /** This turn was triggered by @mentioning a configured substitute person. */
@@ -1439,7 +1452,7 @@ export interface EventHandlers {
     data: any,
     ctx: RoutingContext,
     meta: { senderOpenId?: string; explicitlyMentionedThisBot: boolean },
-  ) => Promise<void>;
+  ) => Promise<void | { anchorOverride?: string; block?: boolean }>;
 }
 
 /** 一条已通过订阅 + 触发范围 + 自触发过滤的文档评论，交给 daemon 投递。 */
@@ -2564,7 +2577,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           substituteTrigger,
         };
         if (explicitlyMentionedThisBot) {
-          await handlers.beforeSessionTurn?.(data, ctx, { senderOpenId, explicitlyMentionedThisBot });
+          const before = await handlers.beforeSessionTurn?.(data, ctx, { senderOpenId, explicitlyMentionedThisBot });
+          if (before?.block) return;
+          if (before?.anchorOverride) ctx.anchor = before.anchorOverride;
           ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
         }
         // Serialize per anchor so two messages to the same thread/chat are

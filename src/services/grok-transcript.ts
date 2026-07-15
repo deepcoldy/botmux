@@ -6,7 +6,7 @@
  * Bridge contract (same as Codex/CoCo/Pi): emit only
  *   - `user`            — real user prompt (`user_message_chunk`)
  *   - `assistant_final` — the LAST contiguous run of `agent_message_chunk`s
- *                         closed by `turn_completed`
+ *                         closed by `turn_completed` (possibly empty)
  *
  * "Last contiguous run": grok streams progress narration between tool calls
  * as agent_message_chunks too (most real turns carry 2–5 such groups). Codex
@@ -14,7 +14,10 @@
  * agent-message group followed by a non-message event (tool_call / thought /
  * hook) is **dropped immediately** (buffer cleared, offset advanced). Only a
  * group that reaches `turn_completed` without an intervening non-message
- * event is emitted. This also keeps the 1s poller from rewinding across
+ * event is emitted as visible text. The terminal event itself is emitted even
+ * when that text is empty: durable delivery completion is keyed to Grok's
+ * authoritative `turn_completed`, never to whether the model produced a
+ * user-visible closing paragraph. This also keeps the 1s poller from rewinding across
  * long tool stretches (hundreds of tool_call_update lines).
  *
  * Mid-turn thoughts / tool calls are ignored so the queue never closes a
@@ -28,7 +31,7 @@ import {
 } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { platform } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { CodexBridgeEvent, CodexDrainResult } from './codex-transcript.js';
 import {
   encodeGrokCwd, grokSessionsRoot, grokUpdatesPath, grokSummaryPath,
@@ -167,6 +170,18 @@ export function findGrokSessionByPid(
   pid: number,
 ): { sessionId: string; updatesPath: string } | undefined {
   if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  const hits: Array<{ sessionId: string; updatesPath: string }> = [];
+  const newestHit = () => {
+    let best: { hit: { sessionId: string; updatesPath: string }; mtimeMs: number } | undefined;
+    for (const hit of hits) {
+      let mtimeMs = 0;
+      try { mtimeMs = statSync(hit.updatesPath).mtimeMs; } catch {
+        try { mtimeMs = statSync(dirname(hit.updatesPath)).mtimeMs; } catch { /* keep zero */ }
+      }
+      if (!best || mtimeMs > best.mtimeMs) best = { hit, mtimeMs };
+    }
+    return best?.hit;
+  };
   if (IS_LINUX) {
     const fdDir = `/proc/${pid}/fd`;
     if (existsSync(fdDir)) {
@@ -177,9 +192,13 @@ export function findGrokSessionByPid(
         try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
         if (target.endsWith(' (deleted)')) continue;
         const hit = matchGrokSessionPath(target);
-        if (hit) return hit;
+        if (hit && !hits.some((seen) => seen.sessionId === hit.sessionId)) hits.push(hit);
       }
-      return undefined;
+      // During `/new` Grok can briefly retain descriptors for both session
+      // directories. Prefer the stream most recently appended instead of
+      // depending on /proc fd enumeration order (which could rotate the
+      // worker bridge backwards to the retired session).
+      return newestHit();
     }
   }
   let out: string;
@@ -194,9 +213,9 @@ export function findGrokSessionByPid(
   for (const line of out.split('\n')) {
     if (!line.startsWith('n/')) continue;
     const hit = matchGrokSessionPath(line.slice(1));
-    if (hit) return hit;
+    if (hit && !hits.some((seen) => seen.sessionId === hit.sessionId)) hits.push(hit);
   }
-  return undefined;
+  return newestHit();
 }
 
 function parseTimestampMs(obj: any, update: any): number {
@@ -216,13 +235,39 @@ function eventUuid(path: string, lineStart: number, update: any, obj: any): stri
   return `${path}:${lineStart}`;
 }
 
+/** Map Grok's authoritative turn boundary to the durable terminal contract.
+ * `end_turn` means the submitted turn finished, even when its visible final is
+ * empty (for example a tool-only turn). Explicit errors are retryable; an
+ * explicit cancellation is a retryable failure after the receiver fences the
+ * old attempt. Unknown reasons fail closed instead of being
+ * reported as a successful delivery. */
+function grokTerminalOutcome(stopReason: unknown): Pick<
+  GrokBridgeEvent,
+  'terminalStatus' | 'terminalErrorCode'
+> {
+  const raw = typeof stopReason === 'string' ? stopReason.trim().toLowerCase() : '';
+  if (raw === 'end_turn') return { terminalStatus: 'completed' };
+  if (raw === 'cancelled' || raw === 'canceled') {
+    return { terminalStatus: 'failed', terminalErrorCode: 'grok_turn_cancelled' };
+  }
+  if (raw === 'error') {
+    return { terminalStatus: 'failed', terminalErrorCode: 'grok_turn_error' };
+  }
+  const normalized = raw.replace(/[^a-z0-9_.-]+/g, '_').slice(0, 80) || 'missing';
+  return {
+    terminalStatus: 'failed',
+    terminalErrorCode: `grok_stop_reason:${normalized}`,
+  };
+}
+
 /**
  * Increment-read updates.jsonl. Agent chunks of the CURRENT contiguous group
  * are buffered. A non-message event (tool_call / thought / hook) while a
  * group is buffered **drops that group immediately** and advances the offset
  * (narration cannot become the final answer — codex final_answer parity).
- * The next agent chunk starts a fresh group; `turn_completed` emits only
- * whatever group is still buffered. If the file ends mid-group, newOffset
+ * The next agent chunk starts a fresh group; `turn_completed` always emits a
+ * terminal `assistant_final` event, with whatever group is still buffered as
+ * its (possibly empty) text. If the file ends mid-group, newOffset
  * rewinds to the group's first chunk so the next poll re-reads it (queue
  * dedups by uuid).
  */
@@ -318,20 +363,22 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
     }
 
     if (su === 'turn_completed') {
-      // Emit only a still-buffered (post-tool) group. Narration groups were
-      // already dropped on the tool_call/thought that followed them.
+      // Visible fallback text comes only from a still-buffered (post-tool)
+      // group. Narration groups were already dropped on the tool_call/thought
+      // that followed them. The terminal boundary itself is NOT conditional on
+      // text: an empty/error/cancelled turn must still release (or fail) an
+      // exact durable delivery attempt.
       const finalText = agentParts.join('').trim();
       agentParts = [];
       openTurnStartOffset = null;
-      if (finalText) {
-        events.push({
-          uuid,
-          timestampMs,
-          kind: 'assistant_final',
-          text: finalText,
-          sourceSessionId: sessionId ?? openTurnSessionId,
-        });
-      }
+      events.push({
+        uuid,
+        timestampMs,
+        kind: 'assistant_final',
+        text: finalText,
+        sourceSessionId: sessionId ?? openTurnSessionId,
+        ...grokTerminalOutcome(update.stop_reason ?? update.stopReason),
+      });
       openTurnSessionId = undefined;
       lastFullyConsumedOffset = cursor;
       continue;

@@ -55,6 +55,50 @@ describe('CodexBridgeQueue', () => {
     expect(ready[0].finalText).toBe('reply text');
   });
 
+  it('carries an explicit transcript terminal outcome with an empty final', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'durable prompt', 100, 7);
+    q.ingest([
+      userEv('durable prompt'),
+      {
+        ...asstEv(''),
+        terminalStatus: 'failed',
+        terminalErrorCode: 'grok_turn_error',
+      },
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({
+        turnId: 't1',
+        dispatchAttempt: 7,
+        finalText: '',
+        terminalStatus: 'failed',
+        terminalErrorCode: 'grok_turn_error',
+      }),
+    ]);
+  });
+
+  it('drops only the retired dispatch attempt before the same turnId is replayed', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('same-turn', 'durable prompt', 100, 1);
+    q.mark('same-turn', 'durable prompt', 200, 2);
+
+    expect(q.dropPendingTurn('same-turn', 1)).toEqual(
+      expect.objectContaining({ turnId: 'same-turn', dispatchAttempt: 1 }),
+    );
+    expect(q.peek()).toEqual([
+      expect.objectContaining({ turnId: 'same-turn', dispatchAttempt: 2 }),
+    ]);
+
+    q.ingest([userEv('durable prompt'), asstEv('replayed answer')]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({
+        turnId: 'same-turn',
+        dispatchAttempt: 2,
+        finalText: 'replayed answer',
+      }),
+    ]);
+  });
+
   it('user event with no fingerprint match is ignored (history / local input)', () => {
     const q = new CodexBridgeQueue();
     q.mark('t1', 'lark message', 100);
@@ -278,6 +322,16 @@ describe('CodexBridgeQueue', () => {
     expect(q.drainEmittable()).toEqual([]);
     expect(q.peek()[0].started).toBe(true);
     expect(q.peek()[0].finalText).toBeUndefined();
+  });
+
+  it('treats an empty assistant_final as a terminal boundary and preserves the attempt', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('delivery-key', 'a query', 100, 4);
+    q.ingest([userEv('a query'), asstEv('')]);
+
+    expect(q.drainEmittable()).toMatchObject([
+      { turnId: 'delivery-key', dispatchAttempt: 4, finalText: '' },
+    ]);
   });
 
   it('peek exposes pending markTimeMs for the gate computation', () => {

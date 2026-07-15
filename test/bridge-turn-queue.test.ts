@@ -147,6 +147,17 @@ describe('BridgeTurnQueue', () => {
     expect(ready[0].assistantUuids).toEqual(['a1']);
   });
 
+  it('releases an empty turn only when the caller supplies a reliable terminal boundary', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('delivery-key', undefined, 100, undefined, 3);
+    q.ingest([user('u-empty')]);
+
+    expect(q.drainEmittable()).toEqual([]);
+    expect(q.drainEmittable({ terminalBoundary: true })).toMatchObject([
+      { turnId: 'delivery-key', dispatchAttempt: 3, assistantUuids: [] },
+    ]);
+  });
+
   it('tool-result user events do not break collection for the current turn', () => {
     const q = new BridgeTurnQueue();
     q.mark('t1');

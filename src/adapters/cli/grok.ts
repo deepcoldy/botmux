@@ -47,12 +47,14 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *    `initialPromptArgsIgnoredOnResume`.
  *
  *  ## Type-ahead
- *  Grok's interactive TUI parks mid-turn Enter as a follow-up queue
- *  (docs: "queues a follow-up for later — it does not inject into the
- *  current turn"). That matches CoCo-style park (interleaved transcript),
- *  not Codex active-turn steer. `supportsTypeAhead: true` so the worker
- *  writes while busy; attribution uses the updates.jsonl bridge +
- *  CodexBridgeQueue (HOL-block-drop remains safe if a merge ever appears).
+ *  Grok's interactive TUI accepts mid-turn Enter as a follow-up. Although its
+ *  UI describes this as queued, 0.2.99 transcripts can contain multiple
+ *  `user_message_chunk`s before one `turn_completed` (active-turn merge).
+ *  `supportsTypeAhead: true` remains useful for ordinary IM turns and
+ *  CodexBridgeQueue's HOL-block-drop attributes the one merged final to the
+ *  newest matching turn. Durable deliveries are explicitly excluded from
+ *  type-ahead on both sides by the worker's queue policy, so an exact receipt
+ *  can never be merged away.
  *  Multi-line input via tmux `send-keys -l` is safe: grok treats a literal
  *  `\n` as a soft newline inside the composer, NOT as submit (verified —
  *  no bracketed paste needed, unlike codex).
@@ -106,6 +108,12 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     supportsTypeAhead: true,
+    // updates.jsonl provides a session-scoped, explicit `turn_completed`
+    // boundary. The bridge preserves empty finals and maps error/cancelled
+    // stop reasons, so meeting delivery never relies on prompt-looking screen
+    // idle. Crash/submit failures are reconciled by the worker's exact-attempt
+    // terminal path.
+    reliableTurnTerminal: true,
     injectsReadyHook: true,
     injectsSessionContext: true,
     // Hold soft first-prompt timeout until SessionStart ready signal or the

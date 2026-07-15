@@ -53,6 +53,30 @@ describe('dispatchPrimaryMessage hook context wiring', () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  it('passes a stable provider uuid through the primary quote path', async () => {
+    const replyMessage = vi.fn(async () => 'om_reply');
+    await dispatchPrimaryMessage(
+      { replyMessage, sendMessage: vi.fn(async () => 'om_send') },
+      {
+        ...baseOptions,
+        quoteTargetId: 'om_quote',
+        uuid: 'vcp_stable_reply',
+        dispatch: vi.fn(async () => 'om_dispatch'),
+        content: '{"schema":"2.0"}',
+        msgType: 'interactive',
+      },
+    );
+    expect(replyMessage).toHaveBeenCalledWith(
+      'cli_app',
+      'om_quote',
+      '{"schema":"2.0"}',
+      'interactive',
+      false,
+      'vcp_stable_reply',
+      baseOptions.hookContext,
+    );
+  });
+
   it('passes hookContext when withdrawn quote falls back to plain send', async () => {
     const replyMessage = vi.fn(async () => {
       throw new MessageWithdrawnError('withdrawn');

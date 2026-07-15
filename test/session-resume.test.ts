@@ -310,6 +310,39 @@ describe('resumeSession', () => {
   });
 
   describe('success path', () => {
+    it('restores dedicated VC receivers without collapsing them into the ordinary chat slot', async () => {
+      const make = (title: string, receiver?: { meetingId: string; memberId: string }) => {
+        const s = sessionStore.createSession('oc_listener', 'oc_listener', title, 'group');
+        s.larkAppId = 'app_test';
+        s.scope = 'chat';
+        s.cliId = 'claude-code';
+        s.workingDir = '/tmp/proj';
+        if (receiver) {
+          s.vcMeetingReceiver = {
+            listenerAppId: 'listener_app',
+            meetingId: receiver.meetingId,
+            memberId: receiver.memberId,
+            memberEpoch: 1,
+          };
+        }
+        sessionStore.updateSession(s);
+        return s;
+      };
+      const ordinary = make('ordinary chat');
+      const meetingA = make('meeting A', { meetingId: 'meeting-a', memberId: 'member-a' });
+      const meetingB = make('meeting B', { meetingId: 'meeting-b', memberId: 'member-b' });
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      expect(map.get(sessionKey('oc_listener', 'app_test'))?.session.sessionId).toBe(ordinary.sessionId);
+      expect(map.get(sessionKey(`vc-receiver:${meetingA.sessionId}`, 'app_test'))?.session.sessionId)
+        .toBe(meetingA.sessionId);
+      expect(map.get(sessionKey(`vc-receiver:${meetingB.sessionId}`, 'app_test'))?.session.sessionId)
+        .toBe(meetingB.sessionId);
+      expect(map.size).toBe(3);
+    });
+
     it('restores usage-limit runtime state for active sessions after daemon restart', async () => {
       const s = sessionStore.createSession('oc_chat_limit', 'om_limit', 'Limited topic');
       s.larkAppId = 'app_test';

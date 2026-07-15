@@ -351,6 +351,22 @@ export function sandboxedClaudeDataDir(sessionId: string, realDataDir: string): 
   return join(VARTMP_ROOT, sessionId, 'home-upper', rel);
 }
 
+/** Credential roots that must never be readable inside the file sandbox.
+ * Relay mode is the only credentialed send path; otherwise an agent could
+ * unset BOTMUX_SEND_RELAY and execute an absolute botmux binary against the
+ * real bots.json/send-cred files exposed by the HOME overlay lowerdir. */
+export function sandboxCredentialHidePaths(home: string): string[] {
+  // Mask the entire botmux state root. Exact-file masks are insufficient:
+  // setup/update creates timestamped bots.json backups, including ones created
+  // after a long-lived sandbox starts. Trusted skill roots and the per-session
+  // outbox are explicitly re-bound after privacy masks by buildSandboxArgs.
+  return [
+    join(home, '.botmux'),
+    join(home, '.lark-cli'),
+    join(home, '.lark-cli-bots'),
+  ].sort();
+}
+
 /** Proxy env vars forwarded into the sandbox so the CLI reaches the API even on
  *  the tmux backend (which otherwise only forwards a fixed whitelist). */
 const PROXY_ENV_KEYS = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'no_proxy', 'NO_PROXY', 'all_proxy', 'ALL_PROXY'] as const;
@@ -465,14 +481,19 @@ export function prepareSandbox(opts: {
   writeFileSync(shim, `#!/bin/sh\nexec node ${JSON.stringify(distCliJs())} "$@"\n`);
   chmodSync(shim, 0o755);
 
-  // Per-bot privacy masks: existing dirs → tmpfs blank; everything else → empty
-  // read-only placeholder file. No defaults (caller passes hidePaths explicitly).
+  // Credential masks are mandatory; per-bot privacy masks extend them.
+  // Existing dirs → tmpfs blank; everything else → empty read-only placeholder.
   // `~` resolves like the docs' examples (`~/.ssh`) — an unexpanded tilde would
   // fail existsSync and mask a literal `~/...` path, leaving the real one readable.
   const hideDirs: string[] = [];
   const hideFiles: { path: string; empty: string }[] = [];
   let emptyIdx = 0;
-  for (const raw of opts.hidePaths ?? []) {
+  const customBotsConfig = process.env.BOTS_CONFIG?.trim();
+  const credentialPaths = [
+    ...sandboxCredentialHidePaths(home),
+    ...(customBotsConfig ? [resolve(customBotsConfig)] : []),
+  ];
+  for (const raw of [...credentialPaths, ...(opts.hidePaths ?? [])]) {
     if (!raw || typeof raw !== 'string') continue;
     const p = expandTilde(raw, home);
     let isDir = false;
@@ -534,6 +555,11 @@ export function prepareSandbox(opts: {
     BOTMUX_SEND_RELAY: outbox,                       // routes `botmux send` to the daemon outbox watcher
     PATH: `/run/sbxbin:${process.env.PATH ?? ''}`,   // /run/sbxbin first so `botmux` = the relay shim
   };
+  // Never inherit a custom credential config path into the sandbox. Its host
+  // path is masked above as defense in depth, while unsetenv prevents an
+  // absolute botmux/lark client from being pointed at it explicitly.
+  args.push('--unsetenv', 'BOTS_CONFIG');
+  args.push('--unsetenv', 'BOTMUX_HOST_RELAY_AUTHORIZED');
   // Forward proxy vars so the CLI reaches the API on the tmux backend too.
   for (const k of PROXY_ENV_KEYS) {
     const v = process.env[k];
@@ -696,6 +722,9 @@ export interface RelayRequest {
   videos?: unknown;
   videoCovers?: unknown;
   flags?: unknown;
+  originTurnId?: unknown;
+  originDispatchAttempt?: unknown;
+  originCapability?: unknown;
 }
 // Presentation-only flags the sandbox may pass through. Path-bearing flags
 // (--content-file/--file(s)/--image(s)/--video(s)), routing flags
@@ -713,6 +742,9 @@ export interface ValidatedRelay {
   videoNames: string[];
   videoCoverNames: string[];
   flags: string[];
+  originTurnId?: string;
+  originDispatchAttempt?: number;
+  originCapability?: string;
 }
 
 /**
@@ -776,15 +808,45 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
     }
     return { ok: false, error: `flag not allowed: ${f}` };
   }
-  return { ok: true, value: {
-    contentName: req.contentFile,
-    preparedContentName,
-    cardName,
-    attachmentNames,
-    videoNames,
-    videoCoverNames,
-    flags,
-  } };
+  const originTurnId = req.originTurnId === undefined
+    ? undefined
+    : typeof req.originTurnId === 'string' && req.originTurnId.trim() && req.originTurnId.length <= 256
+      ? req.originTurnId
+      : null;
+  if (originTurnId === null) return { ok: false, error: 'originTurnId must be a non-empty bounded string' };
+  const originDispatchAttempt = req.originDispatchAttempt === undefined
+    ? undefined
+    : typeof req.originDispatchAttempt === 'number'
+      && Number.isSafeInteger(req.originDispatchAttempt)
+      && req.originDispatchAttempt > 0
+      ? req.originDispatchAttempt
+      : null;
+  if (originDispatchAttempt === null) return { ok: false, error: 'originDispatchAttempt must be a positive safe integer' };
+  if (originDispatchAttempt !== undefined && originTurnId === undefined) {
+    return { ok: false, error: 'originDispatchAttempt requires originTurnId' };
+  }
+  const originCapability = req.originCapability === undefined
+    ? undefined
+    : typeof req.originCapability === 'string'
+      && /^[a-f0-9]{32,128}$/i.test(req.originCapability)
+      ? req.originCapability
+      : null;
+  if (originCapability === null) return { ok: false, error: 'originCapability must be a bounded hex token' };
+  return {
+    ok: true,
+    value: {
+      contentName: req.contentFile,
+      preparedContentName,
+      cardName,
+      attachmentNames,
+      videoNames,
+      videoCoverNames,
+      flags,
+      ...(originTurnId !== undefined ? { originTurnId } : {}),
+      ...(originDispatchAttempt !== undefined ? { originDispatchAttempt } : {}),
+      ...(originCapability !== undefined ? { originCapability } : {}),
+    },
+  };
 }
 
 /**
@@ -850,9 +912,15 @@ export function startOutboxWatcher(
   outbox: string,
   baseEnv: NodeJS.ProcessEnv,
   sessionId: string,
-  opts: { cliPath?: string } = {},
+  opts: {
+    authorize?: (claim: { capability?: string }) =>
+      | { ok: true; origin: { turnId?: string; dispatchAttempt?: number } }
+      | { ok: false; error: string };
+    cliPath?: string;
+  } = {},
 ): () => void {
   const cli = opts.cliPath ?? distCliJs();
+  const authorize = opts.authorize;
   const inFlight = new Set<string>();
   // Host-private staging — a sibling of the outbox, NOT bound into the sandbox.
   const staging = join(dirname(outbox), 'relay-staging');
@@ -880,6 +948,11 @@ export function startOutboxWatcher(
 
       const v = validateRelayRequest(req);
       if (!v.ok) { finish(id, reqPath, name, staged, 1, '', `relay rejected: ${v.error}`); continue; }
+      const authorization = authorize?.({ capability: v.value.originCapability });
+      if (authorization && !authorization.ok) {
+        finish(id, reqPath, name, staged, 2, '', `relay rejected: ${authorization.error}`);
+        continue;
+      }
 
       try { mkdirSync(staging, { recursive: true }); } catch { /* */ }
       // Materialize content (TOCTOU-safe) into the private staging dir.
@@ -943,9 +1016,25 @@ export function startOutboxWatcher(
         ...videoCoverPaths.flatMap(a => ['--video-covers', a]),
         '--session-id', sessionId,  // forced — sandbox cannot target another session
       ];
-      const child = spawn(process.execPath, [cli, 'send', ...hostArgs], {
-        env: buildRelayHostEnv(baseEnv, preparedContentPath),
-      });
+      const trustedOrigin = authorization?.ok
+        ? authorization.origin
+        : { turnId: v.value.originTurnId, dispatchAttempt: v.value.originDispatchAttempt };
+      const requestEnv: NodeJS.ProcessEnv = {
+        ...buildRelayHostEnv(baseEnv, preparedContentPath),
+        BOTMUX_SESSION_ID: sessionId,
+      };
+      // This marker exists only on the watcher-spawned host re-exec. The
+      // sandbox child has it explicitly unset above. cmdSend still validates
+      // the exact receipt/IM origin carried in the trusted env below.
+      requestEnv.BOTMUX_HOST_RELAY_AUTHORIZED = '1';
+      if (trustedOrigin.turnId !== undefined) requestEnv.BOTMUX_TURN_ID = trustedOrigin.turnId;
+      else delete requestEnv.BOTMUX_TURN_ID;
+      if (trustedOrigin.dispatchAttempt !== undefined) {
+        requestEnv.BOTMUX_DISPATCH_ATTEMPT = String(trustedOrigin.dispatchAttempt);
+      } else {
+        delete requestEnv.BOTMUX_DISPATCH_ATTEMPT;
+      }
+      const child = spawn(process.execPath, [cli, 'send', ...hostArgs], { env: requestEnv });
       let out = '', err = '';
       child.stdout.on('data', d => { out += d; });
       child.stderr.on('data', d => { err += d; });

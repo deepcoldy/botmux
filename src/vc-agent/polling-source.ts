@@ -43,6 +43,9 @@ function compareSemver(a: string, b: string): number {
 
 export interface LarkCliRunOptions {
   profile?: string;
+  /** Bound synchronous lark-cli execution so daemon restore cannot hang the
+   * event loop forever when the child process or network stalls. */
+  timeoutMs?: number;
 }
 
 export interface FetchMeetingEventsOptions extends LarkCliRunOptions {
@@ -79,11 +82,24 @@ function parseCliJson(stdout: string): unknown {
   }
 }
 
-export function runLarkCliJson(args: string[]): unknown {
+export function runLarkCliJson(args: string[], opts: { timeoutMs?: number } = {}): unknown {
+  const timeoutMs = typeof opts.timeoutMs === 'number'
+    && Number.isFinite(opts.timeoutMs)
+    && opts.timeoutMs > 0
+    ? Math.floor(opts.timeoutMs)
+    : undefined;
   const result = spawnSync('lark-cli', args, {
     encoding: 'utf-8',
     maxBuffer: 10 * 1024 * 1024,
+    ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
   });
+  if (result.error) {
+    const code = (result.error as NodeJS.ErrnoException).code;
+    if (code === 'ETIMEDOUT') {
+      throw new Error(`lark-cli ${args.join(' ')} timed out after ${timeoutMs}ms`);
+    }
+    throw new Error(`lark-cli ${args.join(' ')} failed to start: ${result.error.message}`);
+  }
   if (result.status !== 0) {
     const stderr = result.stderr?.trim();
     const stdout = result.stdout?.trim();
@@ -169,7 +185,7 @@ export function joinMeetingAsBot(opts: JoinMeetingOptions): { meetingId: string;
     '--format',
     'json',
   ], opts.profile);
-  const raw = runLarkCliJson(args);
+  const raw = runLarkCliJson(args, { timeoutMs: opts.timeoutMs });
   assertLarkCliJsonOk(raw, 'meeting join');
   const meetingId = extractMeetingIdFromJoin(raw);
   if (!meetingId) throw new Error('meeting join succeeded but response did not contain meeting.id');
@@ -197,7 +213,7 @@ export function fetchMeetingEventsAsBot(opts: FetchMeetingEventsOptions): { raw:
     '--format',
     'json',
   ], opts.profile);
-  const raw = runLarkCliJson(args);
+  const raw = runLarkCliJson(args, { timeoutMs: opts.timeoutMs });
   assertLarkCliJsonOk(raw, 'meeting events fetch');
   return { raw, batch: normalizeVcMeetingEvents(raw, { meetingId: opts.meetingId, source: 'polling' }) };
 }
@@ -222,7 +238,7 @@ export function sendMeetingTextMessageAsBot(opts: SendMeetingMessageOptions): { 
     '--format',
     'json',
   ], opts.profile);
-  const raw = runLarkCliJson(args);
+  const raw = runLarkCliJson(args, { timeoutMs: opts.timeoutMs });
   assertLarkCliJsonOk(raw, 'meeting text message send');
   return { raw };
 }

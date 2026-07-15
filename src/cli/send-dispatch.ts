@@ -367,8 +367,10 @@ export type DispatchPrimaryOptions = {
   content: string;
   msgType: string;
   hookContext: Record<string, unknown>;
+  /** Stable provider idempotency key for a crash-replayed primary effect. */
+  uuid?: string;
   MessageWithdrawnError: new (...args: any[]) => Error;
-  dispatch: (content: string, msgType: string) => Promise<string>;
+  dispatch: (content: string, msgType: string, uuid?: string) => Promise<string>;
   onQuoteWithdrawn?: (messageId: string) => void;
 };
 
@@ -383,7 +385,7 @@ export async function dispatchPrimaryMessage(
 ): Promise<DispatchPrimaryResult> {
   if (!opts.quoteTargetId) {
     return {
-      messageId: await opts.dispatch(opts.content, opts.msgType),
+      messageId: await opts.dispatch(opts.content, opts.msgType, opts.uuid),
       primaryQuotedId: null,
     };
   }
@@ -395,7 +397,7 @@ export async function dispatchPrimaryMessage(
       opts.content,
       opts.msgType,
       false,
-      undefined,
+      opts.uuid,
       opts.hookContext,
     );
     return { messageId, primaryQuotedId: opts.quoteTargetId };
@@ -408,7 +410,7 @@ export async function dispatchPrimaryMessage(
           opts.targetChatId,
           opts.content,
           opts.msgType,
-          undefined,
+          opts.uuid,
           opts.hookContext,
         ),
         primaryQuotedId: null,

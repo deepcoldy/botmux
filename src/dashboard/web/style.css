@@ -22053,6 +22053,176 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   }
 }
 
+/* ─── 会议角色预设编辑面（settings 页 VC 区块） ─────────────────────────── */
+.vc-profiles-section {
+  grid-column: 1 / -1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+}
+.vc-profile-card {
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.vc-profile-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(220px, 100%), 1fr));
+  gap: 10px;
+}
+.vc-profile-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+.vc-profile-field > span {
+  opacity: 0.75;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.vc-profile-field-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+/* 帮助气泡正文：i18n 文案用 \n 分段，按行呈现 */
+.vc-profile-help {
+  white-space: pre-line;
+}
+.vc-profiles-freeze {
+  margin: 0;
+  font-size: 12px;
+  opacity: 0.7;
+}
+.vc-profile-field input[type='text'],
+.vc-profile-field textarea {
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.35));
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+}
+/* 字段内下拉占满列宽，触发文字不再被全局 92px 截断 */
+.vc-profile-field .sect-sort-menu {
+  width: 100%;
+}
+.vc-profile-field .sect-sort-value {
+  max-width: none;
+  flex: 1;
+}
+/* Agent 下拉弹层：加宽 + 限高滚动，容纳「名字 · CLI + 告警」两行选项 */
+.vc-profile-agent-menu > .sect-sort-pop {
+  min-width: min(300px, 84vw);
+  max-width: 340px;
+  max-height: min(320px, 60vh);
+  overflow-y: auto;
+}
+.vc-profile-agent-menu .sect-sort-pop button {
+  padding-top: 7px;
+  padding-bottom: 7px;
+  line-height: 1.4;
+  white-space: normal;
+}
+.vc-agent-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.vc-agent-option-name {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  overflow-wrap: anywhere;
+}
+.vc-agent-option-cli {
+  font-style: normal;
+  font-size: 10.5px;
+  font-weight: 600;
+  opacity: 0.62;
+}
+.vc-agent-option-warn {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--warning);
+}
+.vc-profile-instructions textarea {
+  resize: vertical;
+  min-height: 72px;
+}
+.vc-profile-count {
+  font-style: normal;
+  opacity: 0.6;
+}
+.vc-profile-activity {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+}
+.vc-profile-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.vc-profile-hint {
+  font-style: normal;
+  font-size: 11px;
+  opacity: 0.6;
+}
+.vc-profile-err {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--danger, #d4483b);
+}
+.vc-profiles-link:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.vc-profiles-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  color: var(--accent, #4a7dff);
+  cursor: pointer;
+  align-self: flex-start;
+}
+.vc-profile-remove {
+  color: var(--danger, #d4483b);
+}
+.vc-profiles-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.vc-profiles-save {
+  font: inherit;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--accent, #4a7dff);
+  background: var(--accent, #4a7dff);
+  color: #fff;
+  cursor: pointer;
+}
+.vc-profiles-save:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* Installed Skills library: search stays lightweight; selection affordances
    appear only after the explicit Select action. Mutations update cards in place. */
 .skills-installed-header-actions {

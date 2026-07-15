@@ -41,7 +41,7 @@ import type { CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput,
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
-import { sessionKey, sessionAnchorId } from './types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
@@ -1263,7 +1263,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // resolving to the same chat-scope key — e.g. a leaked scratch +
       // relayed real session from a prior buggy run), close the loser
       // rather than silently overwriting it.
-      await setActiveSessionSafe(activeSessions, sessionKey(anchor, larkAppId), ds);
+      await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
       announceSessionRow(ds);
       forkAdoptWorker(ds, { restoredFromMetadata: true });
       logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adoptTargetLabel(adopted)}, scope: ${scope})`);
@@ -1303,7 +1303,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       };
       const anchor = sessionAnchorId(ds);
       messageQueue.ensureQueue(anchor);
-      await setActiveSessionSafe(activeSessions, sessionKey(anchor, larkAppId), ds);
+      await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
       // 重启后把待办池卡片重新广播给 dashboard，否则会从看板消失（#277 同款修复，
       // 我这条 queued 分支提前 continue 绕过了下面的 announceSessionRow，要自己补）。
       announceSessionRow(ds);
@@ -1352,7 +1352,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     messageQueue.ensureQueue(anchor);
     if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
     // Same-key collision guard — see adopt-branch comment above.
-    await setActiveSessionSafe(activeSessions, sessionKey(anchor, larkAppId), ds);
+    await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
     announceSessionRow(ds);
 
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);

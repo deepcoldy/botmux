@@ -4,6 +4,7 @@ import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } f
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -26,9 +27,25 @@ import {
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
-import { addReaction, getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { addReaction, getChatMode, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
-import { loadBotConfigs, registerBot, getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, effectiveBotDisplayName, type BotConfig, type BotState, type OncallChat, type VcMeetingAgentConfig, type VcMeetingConsumerAgentConfig } from './bot-registry.js';
+import {
+  loadBotConfigs,
+  registerBot,
+  getBot,
+  getAllBots,
+  getOwnerOpenId,
+  findOncallChat,
+  effectiveDefaultWorkingDir,
+  effectiveBotDisplayName,
+  resolveVcMeetingConsumerProfiles,
+  type BotConfig,
+  type BotState,
+  type OncallChat,
+  type VcMeetingAgentConfig,
+  type VcMeetingConsumerAgentConfig,
+  type VcMeetingConsumerProfileConfig,
+} from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { renameBotOnOpenPlatform } from './services/open-platform-rename.js';
 import * as sessionStore from './services/session-store.js';
@@ -45,7 +62,7 @@ import { logger } from './utils/logger.js';
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
-import type { Session } from './types.js';
+import type { Session, VcMeetingImTurnOrigin } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
@@ -53,7 +70,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
-import { sessionKey, sessionAnchorId } from './core/types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId } from './core/types.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -80,6 +97,8 @@ import {
   ensureCliEnv,
   sweepGlobalBotmuxSkills,
   writableTerminalLinkFor,
+  findActiveBySessionId,
+  getDaemonBootId,
 } from './core/worker-pool.js';
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner, setBotRenamer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
@@ -115,7 +134,17 @@ import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './co
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, fallbackTurnId, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
+import { TmuxBackend } from './adapters/backend/tmux-backend.js';
+import { HerdrBackend } from './adapters/backend/herdr-backend.js';
+import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
+import {
+  getSessionPersistentBackendType,
+  killPersistentSession,
+  persistentSessionName,
+  probePersistentSession,
+  type PersistentBackendType,
+} from './core/persistent-backend.js';
 import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import type { CardActionData, CardHandlerDeps } from './im/lark/card-handler.js';
 import {
@@ -140,6 +169,10 @@ import { readRunChatBinding as readV3RunChatBinding, defaultBaseDir as v3Default
 /** This daemon process's bot larkAppId (set in startDaemon).  Used to scope v3
  *  humanGate cold-attach + start to runs this bot owns (codex blocker #1). */
 let selfV3LarkAppId: string | undefined;
+/** Generic daemon identity used by internal receiver endpoints. Unlike the
+ *  VC listener switch, every agent daemon may receive a fenced membership. */
+let selfDaemonLarkAppId: string | undefined;
+let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import {
   buildWorkflowStartingCard,
   buildWorkflowProgressCard,
@@ -205,8 +238,18 @@ import {
   ingestNormalizedVcMeetingItems,
   markVcTranscriptItemsFlushed,
 } from './vc-agent/meeting-state.js';
-import { joinMeetingAsBot, sendMeetingTextMessageAsBot } from './vc-agent/polling-source.js';
-import { buildVcMeetingConfirmCard, buildVcMeetingConsumerCard, buildVcMeetingOutputReviewCard } from './vc-agent/cards.js';
+import {
+  fetchMeetingEventsAsBot,
+  joinMeetingAsBot,
+  sendMeetingTextMessageAsBot,
+} from './vc-agent/polling-source.js';
+import {
+  buildVcMeetingConfirmCard,
+  buildVcMeetingConsumerCard,
+  buildVcMeetingConsumerRecoveryCard,
+  buildVcMeetingListenerRejoinCard,
+  buildVcMeetingOutputReviewCard,
+} from './vc-agent/cards.js';
 import {
   connectRealtimeVoiceTransport,
   createProtoRealtimeVoiceProtocol,
@@ -217,16 +260,19 @@ import { createGroupWithBots } from './services/group-creator.js';
 import { addBotToChat, isInChat } from './services/groups-store.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
 import {
-  findVcMeetingRuntimeSessionByListenerAndAgent,
   hasVcMeetingEndedTombstone,
+  listVcMeetingRuntimeSessionsByListenerAndAgent,
   listVcMeetingRuntimeSessions,
   pruneExpiredVcMeetingRuntimeSessions,
   recordVcMeetingEndedTombstone,
   recordVcMeetingRuntimeSession,
   removeVcMeetingRuntimeSession,
   type VcMeetingOutputPolicy,
+  type VcMeetingRuntimeSelectedAgent,
   type VcMeetingRuntimeSessionRecord,
 } from './services/vc-meeting-runtime-store.js';
+import { computeVcMeetingConsumerProfileHash } from './services/vc-meeting-profile-instructions.js';
+import { bootstrapVcMeetingDefaultConsumerProfile } from './services/vc-meeting-consumer-profile-bootstrap.js';
 import type {
   NormalizedVcChatItem,
   NormalizedVcMeetingItem,
@@ -237,11 +283,734 @@ import type {
   VcMeetingSessionState,
 } from './vc-agent/types.js';
 import type { TriggerRequest, TriggerResponse } from './services/trigger-types.js';
+import {
+  abandonPoisonedVcMeetingDelivery,
+  getVcMeetingDeliveryStatus,
+  handleVcMeetingTurnTerminal,
+  handleVcMeetingWorkerGenerationExit,
+  receiveVcMeetingDelivery,
+  registerVcMeetingMember,
+  retryPoisonedVcMeetingDelivery,
+  type VcMeetingDeliveryReceiverDeps,
+  type VcMeetingReceiverSessionBinding,
+} from './services/vc-meeting-delivery-receiver.js';
+import {
+  abandonVcMeetingDeliveryStream,
+  applyVcMeetingMemberProjection,
+  expireVcMeetingDeliveryLeases,
+  findVcMeetingDeliveryByKey,
+  getVcMeetingMemberProjection,
+  listVcMeetingMemberProjections,
+  reconcileVcMeetingDeliveriesOnBoot,
+  type VcMeetingAmbiguousReceiptRef,
+} from './services/vc-meeting-delivery-store.js';
+import {
+  validateVcMeetingDeliveryRequest,
+  type VcMeetingMemberProjectionRequest,
+  type VcMeetingDeliveryRequest,
+  type VcMeetingDeliveryGap,
+} from './services/vc-meeting-delivery-protocol.js';
+import {
+  buildVcMeetingDeliveryEntries,
+  renderVcMeetingDeliveryItem,
+  sealVcMeetingDeliveryRequest,
+  VC_MEETING_DELIVERY_INSTRUCTION_VERSION,
+  type VcMeetingCanonicalFeedItem,
+} from './services/vc-meeting-delivery-feed.js';
+import {
+  applyVcMeetingHubMemberProjection,
+  freezeVcMeetingHubDeliveryAssignment,
+  getVcMeetingHubCloseState,
+  getVcMeetingHubDeliveryAssignment,
+  getVcMeetingHubMember,
+  listVcMeetingHubMembers,
+  observeVcMeetingHubReceiverReceipt,
+  updateVcMeetingHubCloseState,
+  type VcMeetingHubFrozenAssignment,
+  type VcMeetingHubMemberRecord,
+  type VcMeetingHubReceiverStatus,
+} from './services/vc-meeting-delivery-hub-store.js';
+import {
+  getVcMeetingFeedMetadataState,
+  ingestVcMeetingFeedMetadata,
+} from './services/vc-meeting-feed-metadata-store.js';
+import { VcMeetingTerminalReconciler } from './services/vc-meeting-terminal-reconciler.js';
+import {
+  evaluateVcMeetingManagedOriginClaim,
+  resolveVcMeetingImTurnOrigin,
+  verifyVcMeetingManagedOriginClaim,
+} from './services/vc-meeting-send-policy.js';
+import {
+  finishVcMeetingManagedActionProvider,
+  finishVcMeetingManagedApprovalCard,
+  requestVcMeetingManagedImAction,
+  requestVcMeetingManagedAction,
+  resolveVcMeetingManagedActionApproval,
+  type VcMeetingApprovalPresentationPlan,
+  type VcMeetingProviderExecutionPlan,
+  type VcMeetingGenericApprovalPresentationPlan,
+  type VcMeetingGenericProviderExecutionPlan,
+} from './services/vc-meeting-action-gate.js';
+import {
+  claimVcMeetingApprovalCardAttempt,
+  findVcMeetingAction,
+  listVcMeetingActionScopes,
+  listVcMeetingActions,
+  reconcileVcMeetingActionsOnBoot,
+  type VcMeetingActionRecord,
+  type VcMeetingActionRef,
+} from './services/vc-meeting-action-store.js';
+import {
+  authorizeVcMeetingDaemonControlRequest,
+  ensureVcMeetingDaemonAuthToken,
+  withVcMeetingDaemonAuthHeader,
+} from './services/vc-meeting-daemon-auth.js';
+import {
+  resolveDurableVcMeetingImRouting,
+  runBoundedVcMeetingImCatchUp,
+  type VcMeetingImRoutingCandidate,
+  type VcMeetingSealedReceiverSessionBinding,
+} from './services/vc-meeting-im-routing.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
 const activeSessions = new Map<string, DaemonSession>();
 const workflowEventWatchers = new Map<string, WorkflowEventWatcher>();
+const VC_MEETING_DELIVERY_LEASE_MS = 15 * 60_000;
+const VC_MEETING_DELIVERY_LEASE_SCAN_MS = 60_000;
+const VC_MEETING_RUNTIME_EXPIRY_ACK_TIMEOUT_MS = 3_000;
+const VC_MEETING_RUNTIME_EXPIRY_TEARDOWN_MS = 8_000;
+const VC_MEETING_RUNTIME_EXPIRY_REPROBE_MS = 5_000;
+const VC_MEETING_PERSISTENT_BACKENDS = ['tmux', 'herdr', 'zellij'] as const;
+
+type VcMeetingDeliveryScope = {
+  receiverSessionId: string;
+  listenerAppId: string;
+  meetingId: string;
+  memberId: string;
+  memberEpoch: number;
+};
+
+function vcMeetingDeliveryStreamKey(scope: Omit<VcMeetingDeliveryScope, 'receiverSessionId'>): string {
+  return [scope.listenerAppId, scope.meetingId, scope.memberId, scope.memberEpoch].join('\u0000');
+}
+
+function vcMeetingDeliveryScopeFromRef(ref: VcMeetingAmbiguousReceiptRef): VcMeetingDeliveryScope {
+  return {
+    receiverSessionId: ref.receiverSessionId,
+    listenerAppId: ref.listenerAppId,
+    meetingId: ref.meetingId,
+    memberId: ref.memberId,
+    memberEpoch: ref.memberEpoch,
+  };
+}
+
+function vcMeetingDeliveryRequestMatchesScope(
+  request: VcMeetingDeliveryRequest,
+  scope: VcMeetingDeliveryScope,
+): boolean {
+  return request.target.sessionId === scope.receiverSessionId
+    || vcMeetingDeliveryStreamKey({
+      listenerAppId: request.meeting.listenerAppId,
+      meetingId: request.meeting.meetingId,
+      memberId: request.member.memberId,
+      memberEpoch: request.member.epoch,
+    }) === vcMeetingDeliveryStreamKey(scope);
+}
+
+let vcMeetingReceiverRecoveryReady = false;
+let vcMeetingReceiverRecoverySchedulingComplete = false;
+const vcMeetingReceiverRecoveryPending = new Set<string>();
+const vcMeetingReceiverRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const vcMeetingReceiverRecoveryScopes = new Map<string, VcMeetingDeliveryScope>();
+// Once the 10s ACK timeout fires, recovery has committed to kill + orphan
+// teardown. A delayed receiver_reset_ready from the old worker generation may
+// no longer cancel phase 2 or make the receiver ready early.
+const vcMeetingReceiverRecoveryEscalating = new Set<string>();
+
+function vcMeetingReceiverRecoveryKey(sessionId: string, turnId: string, dispatchAttempt: number): string {
+  return `${sessionId}\u0000${turnId}\u0000${dispatchAttempt}`;
+}
+
+function refreshVcMeetingReceiverRecoveryReady(): void {
+  vcMeetingReceiverRecoveryReady = vcMeetingReceiverRecoverySchedulingComplete
+    && vcMeetingReceiverRecoveryPending.size === 0;
+}
+
+function clearVcMeetingReceiverRecoveryPending(key: string): void {
+  vcMeetingReceiverRecoveryPending.delete(key);
+  vcMeetingReceiverRecoveryEscalating.delete(key);
+  vcMeetingReceiverRecoveryScopes.delete(key);
+  const timer = vcMeetingReceiverRecoveryTimers.get(key);
+  if (timer) clearTimeout(timer);
+  vcMeetingReceiverRecoveryTimers.delete(key);
+  refreshVcMeetingReceiverRecoveryReady();
+}
+
+function addVcMeetingReceiverRecoveryPending(
+  key: string,
+  scope: VcMeetingDeliveryScope,
+): void {
+  vcMeetingReceiverRecoveryPending.add(key);
+  vcMeetingReceiverRecoveryScopes.set(key, scope);
+  refreshVcMeetingReceiverRecoveryReady();
+}
+
+function isVcMeetingBootRecoveryBlocked(request: VcMeetingDeliveryRequest): boolean {
+  // The brief pre-enumeration interval is the only global barrier. Once boot
+  // has enumerated stale receipts, one broken receiver must not stall unrelated
+  // meeting members handled by the same daemon.
+  if (!vcMeetingReceiverRecoverySchedulingComplete) return true;
+  for (const key of vcMeetingReceiverRecoveryPending) {
+    const scope = vcMeetingReceiverRecoveryScopes.get(key);
+    if (scope && vcMeetingDeliveryRequestMatchesScope(request, scope)) return true;
+  }
+  return false;
+}
+
+function vcMeetingPersistentBackendAvailable(backendType: PersistentBackendType): boolean {
+  if (backendType === 'tmux') return TmuxBackend.isAvailable();
+  if (backendType === 'herdr') return HerdrBackend.isAvailable();
+  return ZellijBackend.isAvailable();
+}
+
+let testOnlyVcMeetingBootBackingMissing:
+  | ((sessionId: string, destroy: boolean) => boolean)
+  | undefined;
+
+function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boolean {
+  if (testOnlyVcMeetingBootBackingMissing) {
+    return testOnlyVcMeetingBootBackingMissing(sessionId, destroy);
+  }
+  const ds = findActiveBySessionId(sessionId);
+  if (destroy && ds) {
+    try { killWorker(ds); }
+    catch (err) {
+      logger.warn(`[vc-delivery] boot recovery worker teardown failed session=${sessionId}: ${err}`);
+    }
+  }
+  const liveBackend = ds ? getSessionPersistentBackendType(ds) : undefined;
+  const persistedBackend = liveBackend ?? sessionStore.getSession(sessionId)?.backendType;
+  if (persistedBackend === 'pty') return true;
+  const backendTypes: readonly PersistentBackendType[] =
+    persistedBackend === 'tmux' || persistedBackend === 'herdr' || persistedBackend === 'zellij'
+      ? [persistedBackend]
+      : VC_MEETING_PERSISTENT_BACKENDS.filter(vcMeetingPersistentBackendAvailable);
+  let allMissing = true;
+  for (const backendType of backendTypes) {
+    const name = persistentSessionName(backendType, sessionId);
+    if (destroy) {
+      try { killPersistentSession(backendType, name); }
+      catch (err) {
+        logger.warn(
+          `[vc-delivery] boot recovery backing kill failed backend=${backendType} `
+          + `session=${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    let probe: 'exists' | 'missing' | 'unknown' = 'unknown';
+    try { probe = probePersistentSession(backendType, name); }
+    catch { probe = 'unknown'; }
+    if (probe !== 'missing') {
+      allMissing = false;
+      logger.error(
+        `[vc-delivery] boot recovery backing ${probe}; receiver remains gated `
+        + `backend=${backendType} session=${sessionId}`,
+      );
+    }
+  }
+  return allMissing;
+}
+
+function scheduleVcMeetingBootRecoveryProbe(
+  key: string,
+  sessionId: string,
+  delayMs: number,
+): void {
+  const timer = setTimeout(() => {
+    if (!vcMeetingReceiverRecoveryPending.has(key)) return;
+    vcMeetingReceiverRecoveryTimers.delete(key);
+    if (vcMeetingBootBackingMissing(sessionId, true)) {
+      logger.error(`[vc-delivery] boot receiver force-fenced session=${sessionId}`);
+      clearVcMeetingReceiverRecoveryPending(key);
+      return;
+    }
+    logger.error(`[vc-delivery] boot receiver teardown unproven; reprobe scheduled session=${sessionId}`);
+    scheduleVcMeetingBootRecoveryProbe(key, sessionId, VC_MEETING_RUNTIME_EXPIRY_REPROBE_MS);
+  }, delayMs);
+  timer.unref?.();
+  vcMeetingReceiverRecoveryTimers.set(key, timer);
+}
+
+function escalateVcMeetingBootRecovery(key: string, sessionId: string): void {
+  if (!vcMeetingReceiverRecoveryPending.has(key)) return;
+  const previous = vcMeetingReceiverRecoveryTimers.get(key);
+  if (previous) clearTimeout(previous);
+  vcMeetingReceiverRecoveryTimers.delete(key);
+  vcMeetingReceiverRecoveryEscalating.add(key);
+  const ds = findActiveBySessionId(sessionId);
+  if (ds) killWorker(ds);
+  // Wait past killWorker's 7s SIGKILL backstop, then direct-kill and probe the
+  // persisted exact backend. exists/unknown stays scoped-gated and reprobes.
+  scheduleVcMeetingBootRecoveryProbe(
+    key,
+    sessionId,
+    VC_MEETING_RUNTIME_EXPIRY_TEARDOWN_MS,
+  );
+}
+
+function acknowledgeVcMeetingReceiverRecovery(key: string): boolean {
+  if (!vcMeetingReceiverRecoveryPending.has(key)) return false;
+  if (vcMeetingReceiverRecoveryEscalating.has(key)) {
+    logger.warn('[vc-delivery] ignored late boot receiver reset ACK after teardown escalation');
+    return false;
+  }
+  const sessionId = vcMeetingReceiverRecoveryScopes.get(key)?.receiverSessionId;
+  if (!sessionId) return false;
+  if (vcMeetingBootBackingMissing(sessionId, false)) {
+    clearVcMeetingReceiverRecoveryPending(key);
+    return true;
+  }
+  logger.error(`[vc-delivery] boot receiver ACK lacked backing teardown proof session=${sessionId}`);
+  escalateVcMeetingBootRecovery(key, sessionId);
+  return false;
+}
+
+function armVcMeetingReceiverRecoveryTimeout(key: string, sessionId: string): void {
+  const timer = setTimeout(() => {
+    if (!vcMeetingReceiverRecoveryPending.has(key)) return;
+    vcMeetingReceiverRecoveryTimers.delete(key);
+    logger.error(`[vc-delivery] boot receiver reset ACK timed out; escalating session=${sessionId}`);
+    escalateVcMeetingBootRecovery(key, sessionId);
+  }, 10_000);
+  timer.unref?.();
+  vcMeetingReceiverRecoveryTimers.set(key, timer);
+}
+
+export const __testOnly_vcMeetingReceiverRecovery = {
+  start(
+    sessionId: string,
+    turnId: string,
+    dispatchAttempt: number,
+    scope: Partial<Omit<VcMeetingDeliveryScope, 'receiverSessionId'>> = {},
+  ): string {
+    const key = vcMeetingReceiverRecoveryKey(sessionId, turnId, dispatchAttempt);
+    addVcMeetingReceiverRecoveryPending(key, {
+      receiverSessionId: sessionId,
+      listenerAppId: scope.listenerAppId ?? 'listener_test',
+      meetingId: scope.meetingId ?? 'meeting_test',
+      memberId: scope.memberId ?? 'member_test',
+      memberEpoch: scope.memberEpoch ?? 1,
+    });
+    armVcMeetingReceiverRecoveryTimeout(key, sessionId);
+    return key;
+  },
+  acknowledge(sessionId: string, turnId: string, dispatchAttempt: number): void {
+    acknowledgeVcMeetingReceiverRecovery(
+      vcMeetingReceiverRecoveryKey(sessionId, turnId, dispatchAttempt),
+    );
+  },
+  finishScheduling(): void {
+    vcMeetingReceiverRecoverySchedulingComplete = true;
+    refreshVcMeetingReceiverRecoveryReady();
+  },
+  snapshot(key: string): { ready: boolean; pending: boolean; timerArmed: boolean } {
+    return {
+      ready: vcMeetingReceiverRecoveryReady,
+      pending: vcMeetingReceiverRecoveryPending.has(key),
+      timerArmed: vcMeetingReceiverRecoveryTimers.has(key),
+    };
+  },
+  isBlocked(request: VcMeetingDeliveryRequest): boolean {
+    return isVcMeetingBootRecoveryBlocked(request);
+  },
+  setBackingMissingProbe(probe: (sessionId: string, destroy: boolean) => boolean): void {
+    testOnlyVcMeetingBootBackingMissing = probe;
+  },
+  reset(): void {
+    for (const timer of vcMeetingReceiverRecoveryTimers.values()) clearTimeout(timer);
+    vcMeetingReceiverRecoveryTimers.clear();
+    vcMeetingReceiverRecoveryPending.clear();
+    vcMeetingReceiverRecoveryEscalating.clear();
+    vcMeetingReceiverRecoveryScopes.clear();
+    vcMeetingReceiverRecoveryReady = false;
+    vcMeetingReceiverRecoverySchedulingComplete = false;
+    testOnlyVcMeetingBootBackingMissing = undefined;
+  },
+};
+
+type VcMeetingRuntimeLeaseFencePhase = 'awaiting_ack' | 'escalating' | 'blocked';
+type VcMeetingRuntimePersistentScope = PersistentBackendType | 'none' | 'unknown';
+type VcMeetingRuntimeLeaseFence = VcMeetingAmbiguousReceiptRef & {
+  agentAppId: string;
+  streamKey: string;
+  phase: VcMeetingRuntimeLeaseFencePhase;
+  expectedWorkerGeneration?: number;
+  probeAttempts: number;
+  timer?: ReturnType<typeof setTimeout>;
+};
+
+type VcMeetingRuntimeLeaseRecoveryDeps = {
+  findSession: (sessionId: string) => DaemonSession | undefined;
+  sendExpiry: (
+    ds: DaemonSession,
+    message: Extract<DaemonToWorker, { type: 'expire_durable_turn' }>,
+  ) => void;
+  killWorker: (ds: DaemonSession) => void;
+  resolvePersistentScope: (ds: DaemonSession) => VcMeetingRuntimePersistentScope;
+  resolveMissingPersistentScope: (sessionId: string) => VcMeetingRuntimePersistentScope;
+  backendAvailable: (backendType: PersistentBackendType) => boolean;
+  killPersistent: (backendType: PersistentBackendType, sessionName: string) => void;
+  probePersistent: (backendType: PersistentBackendType, sessionName: string) => 'exists' | 'missing' | 'unknown';
+  warn: (message: string) => void;
+  error: (message: string) => void;
+};
+
+function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecoveryDeps) {
+  // At most one unresolved fence per member stream. Replacing attempt N with
+  // N+1 drops N's exact index/timer, so an old ACK can never release the new
+  // generation and repeated failures do not grow a process-global set.
+  const fencesByStream = new Map<string, VcMeetingRuntimeLeaseFence>();
+
+  const isCurrent = (fence: VcMeetingRuntimeLeaseFence): boolean =>
+    fencesByStream.get(fence.streamKey) === fence;
+
+  const clearTimer = (fence: VcMeetingRuntimeLeaseFence): void => {
+    if (fence.timer) clearTimeout(fence.timer);
+    delete fence.timer;
+  };
+
+  const clearFence = (fence: VcMeetingRuntimeLeaseFence): void => {
+    if (!isCurrent(fence)) return;
+    clearTimer(fence);
+    fencesByStream.delete(fence.streamKey);
+  };
+
+  const sessionMatchesFence = (ds: DaemonSession, fence: VcMeetingRuntimeLeaseFence): boolean => {
+    const receiver = ds.session.vcMeetingReceiver;
+    return ds.session.sessionId === fence.receiverSessionId
+      && ds.larkAppId === fence.agentAppId
+      && receiver?.listenerAppId === fence.listenerAppId
+      && receiver.meetingId === fence.meetingId
+      && receiver.memberId === fence.memberId
+      && receiver.memberEpoch === fence.memberEpoch;
+  };
+
+  let scheduleReprobe: (fence: VcMeetingRuntimeLeaseFence, reason: string) => void;
+
+  const teardownAndProbe = (
+    fence: VcMeetingRuntimeLeaseFence,
+    reason: string,
+  ): boolean => {
+    if (!isCurrent(fence)) return false;
+    clearTimer(fence);
+    const ds = deps.findSession(fence.receiverSessionId);
+    if (ds && !sessionMatchesFence(ds, fence)) {
+      deps.error(
+        `[vc-delivery] runtime lease fence identity conflict; remains gated `
+        + `session=${fence.receiverSessionId} attempt=${fence.dispatchAttempt}`,
+      );
+      scheduleReprobe(fence, 'identity conflict');
+      return false;
+    }
+
+    if (ds) {
+      try { deps.killWorker(ds); }
+      catch (err) {
+        deps.error(
+          `[vc-delivery] runtime lease worker teardown failed session=${fence.receiverSessionId}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    const persistentScope = ds
+      ? deps.resolvePersistentScope(ds)
+      : deps.resolveMissingPersistentScope(fence.receiverSessionId);
+    const backendTypes: readonly PersistentBackendType[] = persistentScope === 'none'
+      ? []
+      : persistentScope === 'unknown'
+        // An unavailable client binary cannot own/reach a live mux session on
+        // this host. Excluding it avoids permanent unknown fences on machines
+        // that only install one of the three supported backends.
+        ? VC_MEETING_PERSISTENT_BACKENDS.filter(deps.backendAvailable)
+        : [persistentScope];
+    let allMissing = true;
+    for (const backendType of backendTypes) {
+      const name = persistentSessionName(backendType, fence.receiverSessionId);
+      try { deps.killPersistent(backendType, name); }
+      catch (err) {
+        deps.warn(
+          `[vc-delivery] runtime lease backing kill failed backend=${backendType} `
+          + `session=${fence.receiverSessionId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      let probe: 'exists' | 'missing' | 'unknown' = 'unknown';
+      try { probe = deps.probePersistent(backendType, name); }
+      catch { probe = 'unknown'; }
+      if (probe !== 'missing') {
+        allMissing = false;
+        deps.error(
+          `[vc-delivery] runtime lease backing ${probe}; delivery remains gated `
+          + `backend=${backendType} session=${fence.receiverSessionId} `
+          + `attempt=${fence.dispatchAttempt}`,
+        );
+      }
+    }
+
+    // PTY has no surviving backing process once its worker has crossed the
+    // SIGKILL backstop. Persistent backends unlock only after every applicable
+    // deterministic name probes authoritatively missing.
+    if (allMissing) {
+      clearFence(fence);
+      deps.warn(
+        `[vc-delivery] runtime lease fence cleared after ${reason} `
+        + `session=${fence.receiverSessionId} attempt=${fence.dispatchAttempt}`,
+      );
+      return true;
+    }
+    scheduleReprobe(fence, reason);
+    return false;
+  };
+
+  scheduleReprobe = (fence, reason): void => {
+    if (!isCurrent(fence)) return;
+    clearTimer(fence);
+    fence.phase = 'blocked';
+    const delayMs = Math.min(
+      VC_MEETING_RUNTIME_EXPIRY_REPROBE_MS * (2 ** Math.min(fence.probeAttempts, 4)),
+      60_000,
+    );
+    fence.probeAttempts++;
+    fence.timer = setTimeout(() => {
+      if (!isCurrent(fence) || fence.phase !== 'blocked') return;
+      fence.phase = 'escalating';
+      teardownAndProbe(fence, `${reason} reprobe`);
+    }, delayMs);
+    fence.timer.unref?.();
+  };
+
+  const beginEscalation = (fence: VcMeetingRuntimeLeaseFence, reason: string): void => {
+    if (!isCurrent(fence)) return;
+    clearTimer(fence);
+    fence.phase = 'escalating';
+    const ds = deps.findSession(fence.receiverSessionId);
+    if (!ds || !sessionMatchesFence(ds, fence) || !ds.worker || ds.worker.killed) {
+      teardownAndProbe(fence, reason);
+      return;
+    }
+    try { deps.killWorker(ds); }
+    catch (err) {
+      deps.error(
+        `[vc-delivery] runtime lease escalation failed to kill worker `
+        + `session=${fence.receiverSessionId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    // killWorker's live path has a 7s SIGKILL backstop. Only after that window
+    // do we directly kill + probe the deterministic owned pane.
+    fence.timer = setTimeout(() => {
+      if (!isCurrent(fence) || fence.phase !== 'escalating') return;
+      teardownAndProbe(fence, 'timeout teardown');
+    }, VC_MEETING_RUNTIME_EXPIRY_TEARDOWN_MS);
+    fence.timer.unref?.();
+  };
+
+  const arm = (ref: VcMeetingAmbiguousReceiptRef, agentAppId: string): void => {
+    const scope = vcMeetingDeliveryScopeFromRef(ref);
+    const streamKey = vcMeetingDeliveryStreamKey(scope);
+    const existing = fencesByStream.get(streamKey);
+    if (existing
+      && existing.receiverSessionId === ref.receiverSessionId
+      && existing.deliveryKey === ref.deliveryKey
+      && existing.dispatchAttempt === ref.dispatchAttempt) {
+      return;
+    }
+    if (existing) {
+      clearTimer(existing);
+      deps.warn(
+        `[vc-delivery] superseding runtime lease fence attempt=${existing.dispatchAttempt} `
+        + `with attempt=${ref.dispatchAttempt} session=${ref.receiverSessionId}`,
+      );
+    }
+    const fence: VcMeetingRuntimeLeaseFence = {
+      ...ref,
+      agentAppId,
+      streamKey,
+      phase: 'awaiting_ack',
+      probeAttempts: 0,
+    };
+    fencesByStream.set(streamKey, fence);
+
+    const ds = deps.findSession(ref.receiverSessionId);
+    if (!ds || !sessionMatchesFence(ds, fence) || !ds.worker || ds.worker.killed) {
+      fence.phase = 'escalating';
+      teardownAndProbe(fence, !ds ? 'missing-session teardown' : 'workerless teardown');
+      return;
+    }
+    if ((ds.workerGeneration ?? 0) !== ref.workerGeneration) {
+      deps.error(
+        `[vc-delivery] runtime lease worker generation mismatch; escalating `
+        + `session=${ref.receiverSessionId} receipt=${ref.workerGeneration} `
+        + `live=${ds.workerGeneration ?? 0}`,
+      );
+      beginEscalation(fence, 'worker generation mismatch');
+      return;
+    }
+
+    fence.expectedWorkerGeneration = ref.workerGeneration;
+    try {
+      deps.sendExpiry(ds, {
+        type: 'expire_durable_turn',
+        turnId: ref.deliveryKey,
+        dispatchAttempt: ref.dispatchAttempt,
+      });
+    } catch (err) {
+      deps.error(
+        `[vc-delivery] failed to send runtime lease fence `
+        + `session=${ref.receiverSessionId} attempt=${ref.dispatchAttempt}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      beginEscalation(fence, 'send failure');
+      return;
+    }
+    fence.timer = setTimeout(() => {
+      if (!isCurrent(fence) || fence.phase !== 'awaiting_ack') return;
+      deps.error(
+        `[vc-delivery] runtime lease ACK timed out; escalating `
+        + `session=${ref.receiverSessionId} attempt=${ref.dispatchAttempt}`,
+      );
+      beginEscalation(fence, 'ACK timeout');
+    }, VC_MEETING_RUNTIME_EXPIRY_ACK_TIMEOUT_MS);
+    fence.timer.unref?.();
+  };
+
+  const acknowledge = (context: {
+    sessionId: string;
+    turnId: string;
+    dispatchAttempt: number;
+    workerGeneration: number;
+    disposition: 'queued_removed' | 'cli_fenced';
+  }): boolean => {
+    const fence = [...fencesByStream.values()].find(candidate =>
+      candidate.receiverSessionId === context.sessionId
+      && candidate.deliveryKey === context.turnId
+      && candidate.dispatchAttempt === context.dispatchAttempt);
+    if (!fence) return false;
+    if (fence.phase !== 'awaiting_ack') {
+      deps.warn(
+        `[vc-delivery] ignored late runtime lease ACK after escalation `
+        + `session=${context.sessionId} attempt=${context.dispatchAttempt}`,
+      );
+      return false;
+    }
+    if (fence.expectedWorkerGeneration !== context.workerGeneration) {
+      deps.warn(
+        `[vc-delivery] ignored runtime lease ACK from stale worker generation `
+        + `session=${context.sessionId} attempt=${context.dispatchAttempt}`,
+      );
+      return false;
+    }
+    if (context.disposition === 'queued_removed') {
+      clearFence(fence);
+      return true;
+    }
+
+    // destroySession()/kill() implementations intentionally swallow several
+    // mux errors. Treat the worker's cli_fenced ACK as a prompt to verify the
+    // persisted exact backend, not as authoritative teardown proof itself.
+    const ds = deps.findSession(fence.receiverSessionId);
+    if (!ds || !sessionMatchesFence(ds, fence)) {
+      beginEscalation(fence, 'ACK session missing or changed');
+      return false;
+    }
+    const persistentScope = deps.resolvePersistentScope(ds);
+    if (persistentScope === 'none') {
+      clearFence(fence);
+      return true;
+    }
+    if (persistentScope === 'unknown') {
+      beginEscalation(fence, 'ACK backend unknown');
+      return false;
+    }
+    let probe: 'exists' | 'missing' | 'unknown' = 'unknown';
+    try {
+      probe = deps.probePersistent(
+        persistentScope,
+        persistentSessionName(persistentScope, fence.receiverSessionId),
+      );
+    } catch { probe = 'unknown'; }
+    if (probe === 'missing') {
+      clearFence(fence);
+      return true;
+    }
+    deps.error(
+      `[vc-delivery] runtime lease ACK lacked backing teardown proof (${probe}); escalating `
+      + `session=${fence.receiverSessionId} attempt=${fence.dispatchAttempt}`,
+    );
+    beginEscalation(fence, `ACK backing ${probe}`);
+    return false;
+  };
+
+  return {
+    arm,
+    acknowledge,
+    isBlocked(request: VcMeetingDeliveryRequest): boolean {
+      for (const fence of fencesByStream.values()) {
+        if (vcMeetingDeliveryRequestMatchesScope(request, fence)) return true;
+      }
+      return false;
+    },
+    snapshot(): Array<{
+      receiverSessionId: string;
+      deliveryKey: string;
+      dispatchAttempt: number;
+      phase: VcMeetingRuntimeLeaseFencePhase;
+      timerArmed: boolean;
+    }> {
+      return [...fencesByStream.values()].map(fence => ({
+        receiverSessionId: fence.receiverSessionId,
+        deliveryKey: fence.deliveryKey,
+        dispatchAttempt: fence.dispatchAttempt,
+        phase: fence.phase,
+        timerArmed: !!fence.timer,
+      }));
+    },
+    reset(): void {
+      for (const fence of fencesByStream.values()) clearTimer(fence);
+      fencesByStream.clear();
+    },
+  };
+}
+
+export const __testOnly_createVcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery;
+
+const vcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery({
+  findSession: findActiveBySessionId,
+  sendExpiry(ds, message) {
+    if (!ds.worker || ds.worker.killed) throw new Error('receiver worker is not live');
+    ds.worker.send(message);
+  },
+  killWorker,
+  resolvePersistentScope(ds) {
+    const backendType = getSessionPersistentBackendType(ds);
+    if (backendType) return backendType;
+    const explicit = ds.initConfig?.backendType ?? ds.session.backendType;
+    return explicit === 'pty' ? 'none' : 'unknown';
+  },
+  resolveMissingPersistentScope(sessionId) {
+    const persisted = sessionStore.getSession(sessionId);
+    const backendType = persisted?.backendType;
+    if (backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij') {
+      return backendType;
+    }
+    return backendType === 'pty' ? 'none' : 'unknown';
+  },
+  backendAvailable: vcMeetingPersistentBackendAvailable,
+  killPersistent: killPersistentSession,
+  probePersistent: probePersistentSession,
+  warn: message => logger.warn(message),
+  error: message => logger.error(message),
+});
 
 type VcMeetingDaemonSession = {
   larkAppId: string;
@@ -251,6 +1020,15 @@ type VcMeetingDaemonSession = {
   ended: boolean;
   joined: boolean;
   monitoringStarted: boolean;
+  /** True after this listener bot's own participant_left event. Generic
+   * activity must not infer presence again; only an explicit own join or a
+   * successful forced join clears the fence. */
+  listenerPresenceStale?: boolean;
+  listenerPresenceChangedAtMs?: number;
+  listenerPresenceGeneration?: number;
+  listenerRejoinNonce?: string;
+  listenerRejoinCardMessageId?: string;
+  listenerRejoinApplying?: boolean;
   listenerChatId?: string;
   pendingItems: NormalizedVcMeetingItem[];
   flushTimer?: ReturnType<typeof setInterval>;
@@ -263,6 +1041,15 @@ type VcMeetingDaemonSession = {
   consumerMode?: 'pending' | 'listenOnly' | 'agent';
   selectedAgentAppId?: string;
   selectedAgentLabel?: string;
+  /** MA-P1 committed profile selection. Singular aliases above remain only
+   * for the legacy path and are derived on persistence when this has one row. */
+  selectedAgents: VcMeetingRuntimeSelectedAgent[];
+  /** undefined = no staged profile edit; [] = explicitly staged listen-only. */
+  consumerPendingProfileIds?: string[];
+  consumerMemberStates: Record<string, VcMeetingConsumerMemberVolatileState>;
+  /** A restored profile meeting must move every current projection to the
+   * current daemon boot as one barrier before any member mutates or delivers. */
+  consumerProfileOwnerBootReady?: boolean;
   consumerPaused?: boolean;
   textOutputPolicy: VcMeetingOutputPolicy;
   voiceOutputPolicy: VcMeetingOutputPolicy;
@@ -272,9 +1059,44 @@ type VcMeetingDaemonSession = {
   consumerCardMessageId?: string;
   consumerSelectionTimer?: ReturnType<typeof setTimeout>;
   consumerSelectionApplying?: boolean;
+  consumerSelectionPromise?: Promise<void>;
+  consumerClosingRequested?: boolean;
   pendingOutputRequests: Partial<Record<VcMeetingOutputChannel, VcMeetingPendingOutputRequest>>;
   outputSubmitPromises?: Partial<Record<VcMeetingOutputChannel, Promise<unknown>>>;
-  consumerPendingItems: NormalizedVcMeetingItem[];
+  /** Canonical listener feed entries waiting for the selected member. Each
+   *  item receives one ingestSeq before any per-member filtering/deliverySeq. */
+  consumerPendingItems: VcMeetingCanonicalFeedItem[];
+  /** Exact semantic envelope retained while the receiver owns the stream
+   *  head. The metadata-only hub store is authoritative across restarts. */
+  consumerFrozenDelivery?: {
+    request: VcMeetingDeliveryRequest;
+    deliveryKey: string;
+    inputHash: string;
+  };
+  consumerOverflowNotified?: boolean;
+  consumerMembershipPausePromise?: Promise<void>;
+  consumerRecoveryCardRequired?: boolean;
+  consumerRecoveryCardPromise?: Promise<void>;
+  consumerProfileRecoveryCardSent?: boolean;
+  /** Active-session restore can be blocked by an unrecoverable frozen body.
+   * This card is a listener-authorized exit: retry catch-up, or retire the old
+   * epoch and resume the same agent from-now. */
+  consumerActiveRecoveryNonce?: string;
+  consumerActiveRecoveryCardMessageId?: string;
+  consumerActiveRecoveryCardRequired?: boolean;
+  consumerActiveRecoveryCardPromise?: Promise<void>;
+  consumerActiveRecoveryApplying?: boolean;
+  consumerRestoreSelectionCardRequired?: boolean;
+  consumerRestoreSelectionCardPromise?: Promise<void>;
+  consumerClosePhase?: 'data_closing' | 'finalizing';
+  consumerFinalizationDeadlineAt?: number;
+  consumerCloseResolutionDeadlineAt?: number;
+  /** Closing sessions restored after daemon restart must rehydrate raw bodies
+   * from the bounded VC event source before a frozen hash-only envelope can be
+   * replayed exactly. */
+  consumerRestoreCatchUpRequired?: boolean;
+  consumerRecoveryGapNotified?: boolean;
+  consumerRecoveryGap?: VcMeetingDeliveryGap;
   consumerTranscriptRevisions: Record<string, number>;
   consumerLastInjectedAtMs?: number;
   consumerFullInstructionSent?: boolean;
@@ -290,6 +1112,26 @@ type VcMeetingDaemonSession = {
   actorOpenIdsByUnionId: Record<string, string>;
   temporaryInstructionOpenIds: Record<string, true>;
   temporaryInstructionUnionIds: Record<string, true>;
+};
+
+type VcMeetingConsumerMemberVolatileState = {
+  frozenDelivery?: {
+    request: VcMeetingDeliveryRequest;
+    deliveryKey: string;
+    inputHash: string;
+  };
+  injectPromise?: Promise<VcMeetingConsumerInjectResult>;
+  lastInjectedAtMs?: number;
+  fullInstructionSent?: boolean;
+  overflowNotified?: boolean;
+  restoreBlocked?: boolean;
+  /** Member-scoped terminal replacement for bodies that remained unassigned
+   * through the close recovery horizon. Once frozen, the durable assignment
+   * itself carries this gap across later restarts. */
+  recoveryGap?: VcMeetingDeliveryGap;
+  activeRecoveryNonce?: string;
+  activeRecoveryCardMessageId?: string;
+  activeRecoveryApplying?: boolean;
 };
 
 type VcMeetingPendingInvite = {
@@ -346,12 +1188,53 @@ type VcMeetingPendingOutputRequest = {
   cardMessageId?: string;
   applying?: boolean;
   timer?: ReturnType<typeof setTimeout>;
+  /** Present only for the durable MA-P0 action-gate path. */
+  managedAction?: {
+    listenerAppId: string;
+    meetingId: string;
+    actionId: string;
+    inputHash: string;
+    providerKey: string;
+  };
 };
 
 let vcMeetingOutputTextSenderForTest: VcMeetingOutputTextSender | undefined;
 let vcMeetingTextOutputAvailableForTest: boolean | undefined;
 
 const vcMeetingSessions = new Map<string, VcMeetingDaemonSession>();
+const VC_MEETING_CONSUMER_CLOSE_RETRY_MS = 5_000;
+const VC_MEETING_CONSUMER_CLOSE_HORIZON_MS = 15 * 60_000;
+const VC_MEETING_CONSUMER_CLOSE_SLOW_RETRY_MS = 60_000;
+const VC_MEETING_RESTORE_CATCH_UP_TIMEOUT_MS = 30_000;
+const VC_MEETING_CONSUMER_RECOVERY_RESOLUTION_GRACE_MS = 60_000;
+let vcMeetingConsumerCloseTimingOverrideForTest: {
+  retryMs: number;
+  horizonMs: number;
+  slowRetryMs: number;
+  resolutionGraceMs?: number;
+} | undefined;
+function vcMeetingConsumerCloseRetryMs(timedOut = false): number {
+  const override = vcMeetingConsumerCloseTimingOverrideForTest;
+  return timedOut
+    ? override?.slowRetryMs ?? VC_MEETING_CONSUMER_CLOSE_SLOW_RETRY_MS
+    : override?.retryMs ?? VC_MEETING_CONSUMER_CLOSE_RETRY_MS;
+}
+function vcMeetingConsumerCloseHorizonMs(): number {
+  return vcMeetingConsumerCloseTimingOverrideForTest?.horizonMs
+    ?? VC_MEETING_CONSUMER_CLOSE_HORIZON_MS;
+}
+function vcMeetingConsumerRecoveryResolutionGraceMs(): number {
+  return vcMeetingConsumerCloseTimingOverrideForTest?.resolutionGraceMs
+    ?? VC_MEETING_CONSUMER_RECOVERY_RESOLUTION_GRACE_MS;
+}
+const vcMeetingClosingConsumerSessions = new Map<string, {
+  session: VcMeetingDaemonSession;
+  cfg: VcMeetingAgentConfig;
+  deadlineAt: number;
+  timedOut?: boolean;
+  resolutionDeadlineAt?: number;
+  timer?: ReturnType<typeof setTimeout>;
+}>();
 let vcMeetingAgentGlobalEnabledOverrideForTest: boolean | undefined;
 let vcMeetingAgentGlobalListenerBotAppIdOverrideForTest: string | undefined | null;
 
@@ -382,6 +1265,8 @@ const DEFAULT_VC_MEETING_TIME_ZONE = 'Asia/Shanghai';
 const DEFAULT_VC_MEETING_CONSUMER_SELECTION_TIMEOUT_MS = 20_000;
 const DEFAULT_VC_MEETING_CONSUMER_INJECT_INTERVAL_MS = 30_000;
 const DEFAULT_VC_MEETING_CONSUMER_MIN_BATCH_CHARS = 400;
+const VC_MEETING_CONSUMER_DELIVERY_MAX_ITEMS = 100;
+const VC_MEETING_CONSUMER_DELIVERY_MAX_RENDERED_CHARS = 20_000;
 // By default, keep the selected agent as fresh as the listener group: one new
 // stable meeting item on a tick is enough to inject. Deployments that need
 // lower token burn can raise meetingConsumer.minBatchItems/minBatchChars.
@@ -394,7 +1279,28 @@ const VC_MEETING_END_MESSAGE_RETRY_DELAYS_MS = [1_000, 3_000, 8_000] as const;
 const DEFAULT_VC_REALTIME_TEST_SPEAK_CLOSE_GRACE_MS = 3_000;
 const VC_MEETING_LISTENER_MESSAGE_MAX_CHARS = 3_200;
 const VC_MEETING_PENDING_ITEM_LIMIT = 50_000;
+const VC_MEETING_SINGLE_CONSUMER_MEMBER_ID = 'meeting_assistant';
+const VC_MEETING_SINGLE_CONSUMER_ROLE = 'meeting_assistant';
+const VC_MEETING_SINGLE_CONSUMER_PROFILE_HASH = `sha256:${createHash('sha256')
+  .update(JSON.stringify({ role: VC_MEETING_SINGLE_CONSUMER_ROLE, filter: 'all' }), 'utf8')
+  .digest('hex')}`;
+const VC_MEETING_SINGLE_CONSUMER_OWNER_EPOCH = 1;
+let vcMeetingConsumerPendingItemLimitOverrideForTest: number | undefined;
+let vcMeetingConsumerDeliveryCapsOverrideForTest: {
+  maxItems: number;
+  maxRenderedChars: number;
+} | undefined;
+let vcMeetingAllowCrossAppLocalReceiverForTest = false;
+
+function vcMeetingConsumerUsesLocalReceiver(agentAppId: string): boolean {
+  return agentAppId === selfDaemonLarkAppId
+    || (vcMeetingAllowCrossAppLocalReceiverForTest && !!vcMeetingLocalBotConfig(agentAppId));
+}
 const VC_MEETING_OUTPUT_MAX_CONTENT_CHARS = 200;
+// Lark message UUID idempotency is documented/implemented as a one-hour
+// window. Leave five minutes of clock/network margin; after this boundary an
+// ambiguous text effect becomes manual `unknown`, never a blind retry.
+const VC_MEETING_TEXT_PROVIDER_DEDUP_SAFE_MS = 55 * 60_000;
 const VC_MEETING_SESSION_LIMIT = 2_000;
 const VC_MEETING_SESSION_IDLE_TTL_MS = 24 * 60 * 60 * 1000;
 const VC_MEETING_SYNC_INTERVAL_OPTIONS_MS = [15_000, 30_000, 60_000, 90_000] as const;
@@ -563,7 +1469,8 @@ function setVcMeetingOutputPolicyForChannel(
 }
 
 function vcMeetingConsumerDefaultMode(cfg: VcMeetingAgentConfig): 'listenOnly' | 'agent' {
-  return cfg.meetingConsumer?.defaultMode ?? 'listenOnly';
+  const mode = cfg.meetingConsumer?.defaultMode;
+  return mode === 'agent' || mode === 'agents' ? 'agent' : 'listenOnly';
 }
 
 function vcMeetingConsumerEnabled(cfg: VcMeetingAgentConfig): boolean {
@@ -603,6 +1510,25 @@ function vcMeetingConsumerBotHasConfiguredWorkingDir(cfg: BotConfig): boolean {
     || effectiveDefaultWorkingDir(cfg)
     || (cfg.oncallChats && cfg.oncallChats.length > 0)
   );
+}
+
+/**
+ * Consumer 卡片按钮上的 bot 展示名。只走真实展示名解析链：本 daemon 注册的
+ * bot 用 displayName > 飞书探测名 botName > appId；跨 daemon 读在线 descriptor
+ * 的 botName；离线 bot 只认显式 displayName。绝不回退 config.name（PM2 进程
+ * 名后缀）或 cliId（CLI 类型），避免按钮把 CLI 类型冒充 bot 名。
+ */
+function vcMeetingConsumerBotDisplayLabel(larkAppId: string): string {
+  try {
+    return effectiveBotDisplayName(getBot(larkAppId));
+  } catch {
+    // not registered on this daemon
+  }
+  const daemon = findOnlineDaemon(larkAppId);
+  if (daemon?.botName) return daemon.botName;
+  const cfg = vcMeetingConfiguredBotConfig(larkAppId);
+  if (cfg?.displayName?.trim()) return cfg.displayName.trim();
+  return larkAppId;
 }
 
 function vcMeetingConsumerConfiguredBotLabel(larkAppId: string, cfg?: BotConfig): string {
@@ -679,6 +1605,148 @@ function assertVcMeetingConsumerAgentWorkingDir(candidate: VcMeetingConsumerAgen
   }
 }
 
+function resolveVcMeetingReceiverSession(sessionId: string): VcMeetingReceiverSessionBinding | undefined {
+  // Tests and early startup can create a receiver before worker-pool's shared
+  // registry pointer is installed. The daemon-owned map is authoritative here;
+  // retain the pool lookup as a compatibility fallback.
+  const ds = [...activeSessions.values()].find(candidate =>
+    candidate.session.sessionId === sessionId) ?? findActiveBySessionId(sessionId);
+  if (!ds) return undefined;
+  try {
+    const bot = getBot(ds.larkAppId);
+    const cliId = (ds.session.cliId as CliId | undefined) ?? bot.config.cliId;
+    const adapter = createCliAdapterSync(cliId, bot.config.cliPathOverride);
+    return {
+      sessionId: ds.session.sessionId,
+      chatId: ds.chatId,
+      agentAppId: ds.larkAppId,
+      reliableTurnTerminal: adapter.reliableTurnTerminal === true,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+async function ensureVcMeetingReceiverSession(
+  request: Parameters<VcMeetingDeliveryReceiverDeps['ensureMemberSession']>[0],
+  existingSessionId?: string,
+  receiverAppId?: string,
+): Promise<VcMeetingReceiverSessionBinding> {
+  const selfAppId = receiverAppId ?? selfDaemonLarkAppId;
+  if (!selfAppId || request.member.agentAppId !== selfAppId) {
+    throw new Error('receiver daemon identity is not ready or does not match member agent');
+  }
+  if (existingSessionId) {
+    const existing = resolveVcMeetingReceiverSession(existingSessionId);
+    if (!existing) throw new Error(`registered receiver session is not active: ${existingSessionId}`);
+    const ds = [...activeSessions.values()].find(candidate =>
+      candidate.session.sessionId === existingSessionId) ?? findActiveBySessionId(existingSessionId);
+    const identity = ds?.session.vcMeetingReceiver;
+    if (!identity
+      || identity.listenerAppId !== request.meeting.listenerAppId
+      || identity.meetingId !== request.meeting.meetingId
+      || identity.memberId !== request.member.memberId
+      || identity.memberEpoch !== request.member.epoch) {
+      throw new Error('registered receiver session is not dedicated to this meeting member epoch');
+    }
+    return existing;
+  }
+
+  // A receiver session is a dedicated conversation. It deliberately shares
+  // the listener chat only as an output route; its activeSessions key is based
+  // on sessionId (activeSessionKey), so an ordinary chat-scope session or a
+  // second meeting/member cannot collapse into the same CLI transcript.
+  const chatId = request.outputRoute.chatId;
+  const matching = [...activeSessions.values()].find((candidate) => {
+    const identity = candidate.session.vcMeetingReceiver;
+    return candidate.larkAppId === selfAppId
+      && identity?.listenerAppId === request.meeting.listenerAppId
+      && identity.meetingId === request.meeting.meetingId
+      && identity.memberId === request.member.memberId
+      && identity.memberEpoch === request.member.epoch;
+  });
+  if (matching) {
+    const binding = resolveVcMeetingReceiverSession(matching.session.sessionId);
+    if (!binding) throw new Error('existing dedicated receiver session has an unsupported CLI adapter');
+    return binding;
+  }
+
+  const bot = getBot(selfAppId);
+  const rawWorkingDir = findOncallChat(selfAppId, chatId)?.workingDir
+    ?? effectiveDefaultWorkingDir(bot.config)
+    ?? bot.config.workingDir
+    ?? '~';
+  const workingDir = validateWorkingDir(rawWorkingDir, localeForBot(selfAppId));
+  if (!workingDir.ok) throw new Error(workingDir.error);
+
+  const session = sessionStore.createSession(
+    chatId,
+    chatId,
+    `[Meeting] ${request.meeting.meetingId}`.slice(0, 50),
+    'group',
+  );
+  const now = Date.now();
+  session.larkAppId = selfAppId;
+  session.scope = 'chat';
+  session.vcMeetingReceiver = {
+    listenerAppId: request.meeting.listenerAppId,
+    meetingId: request.meeting.meetingId,
+    memberId: request.member.memberId,
+    memberEpoch: request.member.epoch,
+  };
+  session.lastMessageAt = new Date(now).toISOString();
+  session.workingDir = workingDir.resolvedPath;
+  session.cliId = bot.config.cliId;
+  sessionStore.updateSession(session);
+
+  const ds: DaemonSession = {
+    session,
+    worker: null,
+    workerPort: null,
+    workerToken: null,
+    larkAppId: selfAppId,
+    chatId,
+    chatType: 'group',
+    scope: 'chat',
+    spawnedAt: Date.parse(session.createdAt) || now,
+    cliVersion: getCurrentCliVersion(),
+    lastMessageAt: now,
+    hasHistory: false,
+    workingDir: workingDir.resolvedPath,
+  };
+  activeSessions.set(activeSessionKey(ds), ds);
+  const binding = resolveVcMeetingReceiverSession(session.sessionId);
+  if (!binding) throw new Error('created receiver session has an unsupported CLI adapter');
+  return binding;
+}
+
+function vcMeetingDeliveryReceiverDeps(receiverAppId?: string): VcMeetingDeliveryReceiverDeps {
+  const selfAppId = receiverAppId ?? selfDaemonLarkAppId;
+  if (!selfAppId) throw new Error('receiver daemon identity is not ready');
+  return {
+    dataDir: config.session.dataDir,
+    selfAppId,
+    receiverBootId: getDaemonBootId(),
+    ensureMemberSession: (request, existingSessionId) =>
+      ensureVcMeetingReceiverSession(request, existingSessionId, selfAppId),
+    resolveSession: resolveVcMeetingReceiverSession,
+    dispatchTurn: (request, context) => {
+      const target = findActiveBySessionId(request.target.sessionId ?? '');
+      if (target) target.vcMeetingImTurnOrigin = undefined;
+      return triggerSessionTurn(
+        request,
+        { larkAppId: selfAppId, activeSessions },
+        {
+          stableTurnId: context.stableTurnId,
+          beforeDispatch: context.beforeDispatch,
+          suppressFinalOutput: context.suppressFinalOutput,
+          persistInputHistory: false,
+        },
+      );
+    },
+  };
+}
+
 async function fetchVcMeetingDaemonJson(
   larkAppId: string,
   path: string,
@@ -697,8 +1765,14 @@ async function fetchVcMeetingDaemonJson(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   if (typeof timer.unref === 'function') timer.unref();
   try {
+    const authenticatedHeaders = withVcMeetingDaemonAuthHeader(
+      config.session.dataDir,
+      larkAppId,
+      init.headers,
+    );
     const upstream = await fetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, {
       ...init,
+      headers: authenticatedHeaders,
       signal: init.signal ?? controller.signal,
     });
     const text = await upstream.text();
@@ -724,11 +1798,27 @@ async function fetchVcMeetingDaemonJson(
   }
 }
 
+/** Guard only VC daemon-to-daemon control routes. Agent-facing managed action
+ * requests deliberately use live receiver-origin/capability authorization. */
+function guardVcMeetingDaemonControlRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+): boolean {
+  const auth = authorizeVcMeetingDaemonControlRequest(
+    config.session.dataDir,
+    selfDaemonLarkAppId ?? '',
+    req.headers,
+  );
+  if (auth.ok) return true;
+  jsonRes(res, auth.status, auth.body);
+  return false;
+}
+
 async function triggerVcMeetingConsumerTurn(
   req: TriggerRequest,
   agentAppId: string,
 ): Promise<TriggerResponse> {
-  if (vcMeetingLocalBotConfig(agentAppId)) {
+  if (vcMeetingConsumerUsesLocalReceiver(agentAppId)) {
     return triggerSessionTurn(req, {
       larkAppId: agentAppId,
       activeSessions,
@@ -748,61 +1838,155 @@ async function triggerVcMeetingConsumerTurn(
 }
 
 async function requestVcMeetingConsumerCatchUp(
-  record: VcMeetingRuntimeSessionRecord,
-  agentAppId: string,
+  candidate: VcMeetingImRoutingCandidate,
+  signal?: AbortSignal,
 ): Promise<VcMeetingConsumerInjectResult> {
-  const meetingId = record.meeting.id;
-  if (!record.larkAppId || !meetingId || record.selectedAgentAppId !== agentAppId) {
-    return { ok: true, injected: 0 };
-  }
-  const localCfg = vcMeetingLocalBotConfig(record.larkAppId)
-    ? effectiveVcMeetingAgentConfig(record.larkAppId)
+  const localCfg = candidate.listenerAppId === selfDaemonLarkAppId
+    ? effectiveVcMeetingAgentConfig(candidate.listenerAppId)
     : undefined;
   if (localCfg) {
     return injectVcMeetingConsumerSession(
-      vcMeetingSessionKey(record.larkAppId, meetingId),
+      vcMeetingSessionKey(candidate.listenerAppId, candidate.meetingId),
       localCfg,
       { force: true },
     );
   }
-  const { body } = await fetchVcMeetingDaemonJson(record.larkAppId, '/api/vc-meetings/consumer-catch-up', {
+  const { body } = await fetchVcMeetingDaemonJson(candidate.listenerAppId, '/api/vc-meetings/consumer-catch-up', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      larkAppId: record.larkAppId,
-      meetingId,
-      listenerChatId: record.listenerChatId,
-      agentAppId,
+      larkAppId: candidate.listenerAppId,
+      meetingId: candidate.meetingId,
+      listenerChatId: candidate.listenerChatId,
+      agentAppId: candidate.agentAppId,
     }),
+    ...(signal ? { signal } : {}),
   }, { timeoutMs: 8_000 });
   if (body && typeof body === 'object' && 'ok' in body) return body as VcMeetingConsumerInjectResult;
   return { ok: false, injected: 0, error: 'invalid catch-up response from meeting daemon' };
 }
 
-async function maybeCatchUpVcMeetingConsumerBeforeTurn(ctx: RoutingContext): Promise<void> {
-  if (ctx.chatType !== 'group' || ctx.scope !== 'chat') return;
-  const record = findVcMeetingRuntimeSessionByListenerAndAgent(config.session.dataDir, {
-    listenerChatId: ctx.chatId,
-    selectedAgentAppId: ctx.larkAppId,
-  });
-  if (!record) return;
-  const result = await requestVcMeetingConsumerCatchUp(record, ctx.larkAppId);
-  if (result.ok) {
-    if (result.injected > 0) {
-      logger.info(`[vc-agent] consumer catch-up injected meeting=${record.meeting.id} agent=${ctx.larkAppId} items=${result.injected}`);
-    }
-    return;
+const MAX_VC_MEETING_IM_TURN_ORIGINS = 256;
+
+function rememberVcMeetingImTurnOrigin(
+  session: Session,
+  origin: VcMeetingImTurnOrigin,
+): void {
+  if (origin.receiverSessionId !== session.sessionId || !origin.larkMessageId) return;
+  const origins = session.vcMeetingImTurnOrigins ??= {};
+  // Delete/reinsert exact redeliveries so insertion order remains the pruning
+  // order. 256 entries comfortably exceeds the normal worker queue while a
+  // pathological flood still fails old turns closed instead of growing state
+  // without bound.
+  delete origins[origin.larkMessageId];
+  origins[origin.larkMessageId] = structuredClone(origin);
+  const keys = Object.keys(origins);
+  for (let index = 0; index < keys.length - MAX_VC_MEETING_IM_TURN_ORIGINS; index += 1) {
+    delete origins[keys[index]!];
   }
-  logger.warn(
-    `[vc-agent] consumer catch-up failed meeting=${record.meeting.id} agent=${ctx.larkAppId}: ${result.error ?? 'unknown'}`,
+}
+
+async function maybeCatchUpVcMeetingConsumerBeforeTurn(
+  data: any,
+  ctx: RoutingContext,
+): Promise<void | { anchorOverride?: string; block?: boolean }> {
+  if (ctx.chatType !== 'group' || ctx.scope !== 'chat') return;
+  const parsed = parseEventMessage(data).parsed;
+  const sealedReceiverSessions: VcMeetingSealedReceiverSessionBinding[] = sessionStore.listSessions()
+    .filter(session => session.status === 'active'
+      && session.larkAppId === ctx.larkAppId
+      && session.chatId === ctx.chatId
+      && !!session.vcMeetingReceiver)
+    .map(session => ({
+      listenerAppId: session.vcMeetingReceiver!.listenerAppId,
+      listenerChatId: session.chatId,
+      meetingId: session.vcMeetingReceiver!.meetingId,
+      memberId: session.vcMeetingReceiver!.memberId,
+      memberEpoch: session.vcMeetingReceiver!.memberEpoch,
+      agentAppId: ctx.larkAppId,
+      receiverSessionId: session.sessionId,
+    }));
+  const route = resolveDurableVcMeetingImRouting(config.session.dataDir, {
+    listenerChatId: ctx.chatId,
+    agentAppId: ctx.larkAppId,
+    sealedReceiverSessions,
+    disambiguation: {
+      ...(parsed.parentId ? { quotedMessageId: parsed.parentId } : {}),
+      ...(parsed.content ? { messageText: stripLeadingMentions(parsed.content, parsed.mentions) } : {}),
+    },
+  });
+  if (route.kind === 'ordinary') return;
+  if (route.kind === 'ambiguous') {
+    const meetings = route.candidates
+      .map(candidate => `${candidate.topic ?? candidate.meetingId}（${candidate.meetingNo ?? candidate.meetingId}）`)
+      .join('\n- ');
+    await sessionReply(
+      ctx.chatId,
+      JSON.stringify({
+        config: { wide_screen_mode: true },
+        header: { template: 'orange', title: { tag: 'plain_text', content: '请选择会议上下文' } },
+        elements: [{
+          tag: 'markdown',
+          content: `当前群关联了多场会议上下文，本次没有静默选择：\n- ${meetings}\n\n请引用对应会议卡片，或在问题中带上会议 ID / 会议号后重试。`,
+        }],
+      }),
+      'interactive',
+      ctx.larkAppId,
+    );
+    return { block: true };
+  }
+  const caughtUp = await runBoundedVcMeetingImCatchUp(
+    route,
+    async (candidate, { signal }) => requestVcMeetingConsumerCatchUp(candidate, signal),
+    8_000,
   );
+  if (caughtUp.kind !== 'receiver') return;
+  // The daemon-owned map is authoritative during early startup/tests before
+  // worker-pool's shared registry pointer is installed. This mirrors receiver
+  // registration and also avoids opening a normal chat session during that
+  // narrow restore window.
+  const activeReceiver = [...activeSessions.values()].find(candidate =>
+    candidate.session.sessionId === caughtUp.candidate.receiverSessionId)
+    ?? findActiveBySessionId(caughtUp.candidate.receiverSessionId);
+  if (!activeReceiver) {
+    await sessionReply(
+      ctx.chatId,
+      '对应会议会话当前未完成恢复，请稍后重试；本次没有新建或误用普通群会话。',
+      'text',
+      ctx.larkAppId,
+    );
+    return { block: true };
+  }
+  ctx.vcMeetingContextMayLag = caughtUp.meetingContextMayLag;
+  ctx.vcMeetingContextLifecycle = caughtUp.candidate.lifecycle;
+  ctx.vcMeetingImTurnOrigin = {
+    listenerAppId: caughtUp.candidate.listenerAppId,
+    meetingId: caughtUp.candidate.meetingId,
+    memberId: caughtUp.candidate.memberId,
+    memberEpoch: caughtUp.candidate.memberEpoch,
+    agentAppId: caughtUp.candidate.agentAppId,
+    ownerBootId: caughtUp.candidate.ownerBootId,
+    ownerEpoch: caughtUp.candidate.ownerEpoch,
+    membershipGeneration: caughtUp.candidate.membershipGeneration,
+    sinkOwnerGeneration: caughtUp.candidate.sinkOwnerGeneration,
+    receiverSessionId: caughtUp.candidate.receiverSessionId,
+    larkMessageId: ctx.messageId,
+    ...(parsed.senderId ? { replyTargetSenderOpenId: parsed.senderId } : {}),
+  };
+  if (caughtUp.meetingContextMayLag) {
+    logger.warn(
+      `[vc-agent] IM follow-up routed with possibly stale context meeting=${caughtUp.candidate.meetingId} `
+      + `agent=${ctx.larkAppId} status=${caughtUp.catchUpStatus} error=${caughtUp.catchUpError ?? '-'}`,
+    );
+  }
+  return { anchorOverride: `vc-receiver:${caughtUp.candidate.receiverSessionId}` };
 }
 
 async function pinVcMeetingConsumerChatReplyMode(
   larkAppId: string,
   chatId: string,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-  if (vcMeetingLocalBotConfig(larkAppId)) {
+  if (vcMeetingConsumerUsesLocalReceiver(larkAppId)) {
     const mode = await setChatReplyMode(larkAppId, chatId, 'chat');
     return mode.ok ? { ok: true } : { ok: false, reason: mode.reason };
   }
@@ -826,7 +2010,7 @@ async function isVcMeetingConsumerAgentInChat(
   larkAppId: string,
   chatId: string,
 ): Promise<boolean> {
-  if (vcMeetingLocalBotConfig(larkAppId)) return isInChat(larkAppId, chatId);
+  if (vcMeetingConsumerUsesLocalReceiver(larkAppId)) return isInChat(larkAppId, chatId);
   const { body } = await fetchVcMeetingDaemonJson(
     larkAppId,
     `/api/groups/${encodeURIComponent(chatId)}/membership`,
@@ -1136,7 +2320,14 @@ export async function noteTurnReceived(
   (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
 }
 
-async function sessionReply(anchor: string, content: string, msgType: string = 'text', larkAppId?: string, turnId?: string): Promise<string> {
+async function sessionReply(
+  anchor: string,
+  content: string,
+  msgType: string = 'text',
+  larkAppId?: string,
+  turnId?: string,
+  opts?: { uuid?: string; quoteMessageId?: string },
+): Promise<string> {
   let ds: DaemonSession | undefined;
   if (larkAppId) {
     ds = activeSessions.get(sessionKey(anchor, larkAppId));
@@ -1169,6 +2360,26 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
   // to know we should sendMessage, not reply_in_thread to a non-message-id.
   if (ds?.scope === 'chat' || anchor.startsWith('oc_')) {
     const chatId = ds?.chatId ?? anchor;
+    if (opts?.quoteMessageId) {
+      try {
+        return await replyMessage(
+          appId,
+          opts.quoteMessageId,
+          content,
+          msgType,
+          false,
+          opts.uuid,
+          hookContext,
+        );
+      } catch (err) {
+        if (!(err instanceof MessageWithdrawnError)) throw err;
+        logger.warn(
+          `[routing] VC IM quote target withdrawn (${opts.quoteMessageId}); `
+          + 'falling back to one stable-UUID chat message',
+        );
+        return sendMessage(appId, chatId, content, msgType, opts.uuid, hookContext);
+      }
+    }
     if (ds?.scope === 'chat') {
       const fresh = readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId);
       if (fresh) syncReplyTargetState(ds, fresh);
@@ -2818,6 +4029,40 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   const parsed = parseAskBody(raw);
   if ('error' in parsed) return jsonRes(res, 400, { ok: false, error: parsed.error });
 
+  const askSession = findActiveBySessionId(parsed.sessionId);
+  if (askSession?.session.vcMeetingReceiver) {
+    const body = raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? raw as Record<string, unknown>
+      : {};
+    const claimedTurnId = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
+    const claimedAttempt = typeof body.originDispatchAttempt === 'number'
+      && Number.isSafeInteger(body.originDispatchAttempt)
+      && body.originDispatchAttempt > 0
+      ? body.originDispatchAttempt
+      : undefined;
+    const liveImOrigin = resolveVcMeetingImTurnOrigin(
+      askSession.session,
+      askSession.managedTurnOrigin?.turnId,
+    );
+    const decision = evaluateVcMeetingManagedOriginClaim(config.session.dataDir, {
+      receiverSessionId: parsed.sessionId,
+      currentImTurnId: liveImOrigin?.larkMessageId,
+      liveOrigin: askSession.managedTurnOrigin,
+      claimedTurnId,
+      claimedDispatchAttempt: claimedAttempt,
+      claimedCapability: typeof body.originCapability === 'string'
+        ? body.originCapability
+        : undefined,
+    });
+    if (!decision.ok) {
+      return jsonRes(res, 403, {
+        ok: false,
+        error: decision.errorCode,
+        detail: decision.error,
+      });
+    }
+  }
+
   // 谁能答复 = 谁能在该 chat 跟 bot 说话（canTalk）。鉴权在 broker 点击时按注入的
   // canTalkChecker 判定（见下方 setAskCanTalkChecker），daemon 这里不再预解析 approver。
   const result = await registerAskBroker({
@@ -2983,6 +4228,344 @@ ipcRoute('GET', '/api/adopt-session/:pid', (_req, res, params) => {
   return jsonRes(res, 404, { ok: false, error: 'no_adopt_session' });
 });
 
+for (const path of ['/api/vc-meetings/members/register', '/api/vc-meetings/members/update']) {
+  ipcRoute('POST', path, async (req, res) => {
+    if (!guardVcMeetingDaemonControlRoute(req, res)) return;
+    let body: unknown;
+    try {
+      body = await readJsonBody(req);
+    } catch {
+      return jsonRes(res, 400, { ok: false, errorCode: 'bad_json', error: 'invalid JSON body' });
+    }
+    try {
+      const result = await registerVcMeetingMember(body, vcMeetingDeliveryReceiverDeps());
+      return jsonRes(res, result.status, result.body);
+    } catch (err) {
+      return jsonRes(res, 503, {
+        ok: false,
+        errorCode: 'receiver_unavailable',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+}
+
+ipcRoute('POST', '/api/vc-meetings/deliver', async (req, res) => {
+  if (!guardVcMeetingDaemonControlRoute(req, res)) return;
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, errorCode: 'bad_json', error: 'invalid JSON body' });
+  }
+  const parsedDelivery = validateVcMeetingDeliveryRequest(body);
+  if (parsedDelivery.ok
+    && (isVcMeetingBootRecoveryBlocked(parsedDelivery.request)
+      || vcMeetingRuntimeLeaseRecovery.isBlocked(parsedDelivery.request))) {
+    return jsonRes(res, 503, {
+      ok: false,
+      errorCode: 'receiver_recovery_in_progress',
+      error: 'this receiver session is fencing an ambiguous turn; retry later',
+    });
+  }
+  try {
+    const result = await receiveVcMeetingDelivery(body, vcMeetingDeliveryReceiverDeps());
+    const resultBody = result.body && typeof result.body === 'object'
+      ? result.body as Record<string, unknown>
+      : undefined;
+    if (resultBody?.status === 'failed_terminal'
+      && resultBody.errorCode === 'retry_budget_exhausted') {
+      logger.error(
+        `[vc-delivery] poison batch paused: delivery=${String(resultBody.deliveryKey ?? '?')} `
+        + `session=${String(resultBody.receiverSessionId ?? '?')} attempt=${String(resultBody.dispatchAttempt ?? '?')}; `
+        + 'operator must retry or abandon the stream',
+      );
+    }
+    return jsonRes(res, result.status, result.body);
+  } catch (err) {
+    return jsonRes(res, 500, {
+      ok: false,
+      errorCode: 'receiver_failed',
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+ipcRoute('GET', '/api/vc-meetings/deliveries/:deliveryKey', (req, res, params) => {
+  if (!guardVcMeetingDaemonControlRoute(req, res)) return;
+  try {
+    const result = getVcMeetingDeliveryStatus(params.deliveryKey?.trim() ?? '', vcMeetingDeliveryReceiverDeps());
+    return jsonRes(res, result.status, result.body);
+  } catch (err) {
+    return jsonRes(res, 503, {
+      ok: false,
+      errorCode: 'receiver_unavailable',
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+ipcRoute('POST', '/api/vc-meetings/deliveries/:deliveryKey/retry', (req, res, params) => {
+  if (!guardVcMeetingDaemonControlRoute(req, res)) return;
+  try {
+    const deliveryKey = params.deliveryKey?.trim() ?? '';
+    if (!deliveryKey) return jsonRes(res, 400, { ok: false, errorCode: 'bad_delivery_key' });
+    const result = retryPoisonedVcMeetingDelivery(deliveryKey, vcMeetingDeliveryReceiverDeps());
+    if (result.status === 200) {
+      logger.warn(`[vc-delivery] operator retry authorized: delivery=${deliveryKey}`);
+    }
+    return jsonRes(res, result.status, result.body);
+  } catch (err) {
+    return jsonRes(res, 503, {
+      ok: false,
+      errorCode: 'receiver_unavailable',
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+ipcRoute('POST', '/api/vc-meetings/deliveries/:deliveryKey/abandon', async (req, res, params) => {
+  if (!guardVcMeetingDaemonControlRoute(req, res)) return;
+  try {
+    const deliveryKey = params.deliveryKey?.trim() ?? '';
+    if (!deliveryKey) return jsonRes(res, 400, { ok: false, errorCode: 'bad_delivery_key' });
+    let reason: string | undefined;
+    try {
+      const body = await readJsonBody<Record<string, unknown>>(req);
+      reason = typeof body.reason === 'string' ? body.reason.trim().slice(0, 500) : undefined;
+    } catch {
+      // Empty body is valid; malformed non-empty input receives the same safe
+      // default because abandon identity is carried by the route key.
+    }
+    const result = abandonPoisonedVcMeetingDelivery(
+      deliveryKey,
+      reason,
+      vcMeetingDeliveryReceiverDeps(),
+    );
+    if (result.status === 200) {
+      logger.error(`[vc-delivery] poison stream abandoned: delivery=${deliveryKey} reason=${reason ?? 'operator_abandon'}`);
+    }
+    return jsonRes(res, result.status, result.body);
+  } catch (err) {
+    return jsonRes(res, 503, {
+      ok: false,
+      errorCode: 'receiver_unavailable',
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+// Agent-facing entry point. It never trusts caller-supplied agent/meeting
+// identity: the current worker capability/marker proves the live receiver turn,
+// then the durable receipt supplies the authoritative hub and membership.
+ipcRoute('POST', '/api/vc-meetings/action-request', async (req, res) => {
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody<Record<string, unknown>>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, errorCode: 'bad_json', error: 'invalid JSON body' });
+  }
+  const receiverSessionId = typeof body.receiverSessionId === 'string' ? body.receiverSessionId.trim() : '';
+  const ds = receiverSessionId ? findActiveBySessionId(receiverSessionId) : undefined;
+  if (!ds?.session.vcMeetingReceiver) {
+    return jsonRes(res, 409, {
+      ok: false,
+      errorCode: 'not_receiver_session',
+      error: 'managed action origin is not a dedicated meeting receiver session',
+    });
+  }
+  const claimedAttempt = typeof body.originDispatchAttempt === 'number'
+    && Number.isSafeInteger(body.originDispatchAttempt)
+    && body.originDispatchAttempt > 0
+    ? body.originDispatchAttempt
+    : undefined;
+  const liveImOrigin = resolveVcMeetingImTurnOrigin(
+    ds.session,
+    ds.managedTurnOrigin?.turnId,
+  );
+  const verified = verifyVcMeetingManagedOriginClaim({
+    receiverSessionId,
+    currentImTurnId: liveImOrigin?.larkMessageId,
+    liveOrigin: ds.managedTurnOrigin,
+    claimedCapability: typeof body.originCapability === 'string' ? body.originCapability : undefined,
+    claimedTurnId: typeof body.originTurnId === 'string' ? body.originTurnId : undefined,
+    claimedDispatchAttempt: claimedAttempt,
+  });
+  if (!verified.ok) return jsonRes(res, 403, verified);
+  const channel = body.channel === 'text' || body.channel === 'voice' ? body.channel : undefined;
+  const content = sanitizeVcMeetingOutputContent(body.content, 'content');
+  const reason = sanitizeVcMeetingOutputContent(body.reason, 'reason');
+  const fallbackText = sanitizeVcMeetingOutputContent(body.fallbackText, 'fallbackText');
+  if (!channel || !content) {
+    return jsonRes(res, 400, { ok: false, errorCode: 'bad_request', error: 'channel/content are required' });
+  }
+  const expectedListenerAppId = typeof body.expectedListenerAppId === 'string'
+    ? body.expectedListenerAppId.trim()
+    : '';
+  const expectedMeetingId = typeof body.expectedMeetingId === 'string' ? body.expectedMeetingId.trim() : '';
+  if (verified.origin.dispatchAttempt === undefined) {
+    const imOrigin = resolveVcMeetingImTurnOrigin(ds.session, verified.origin.turnId);
+    if (!verified.origin.turnId
+      || verified.origin.currentImTurnId !== verified.origin.turnId
+      || !imOrigin
+      || imOrigin.receiverSessionId !== receiverSessionId
+      || imOrigin.larkMessageId !== verified.origin.turnId) {
+      return jsonRes(res, 409, {
+        ok: false,
+        errorCode: 'im_turn_origin_mismatch',
+        error: 'explicit IM action is not bound to the current routed Lark message',
+      });
+    }
+    if ((expectedListenerAppId && expectedListenerAppId !== imOrigin.listenerAppId)
+      || (expectedMeetingId && expectedMeetingId !== imOrigin.meetingId)) {
+      return jsonRes(res, 409, {
+        ok: false,
+        errorCode: 'meeting_identity_mismatch',
+        error: 'requested meeting does not match the routed IM turn',
+      });
+    }
+    const upstream = await fetchVcMeetingDaemonJson(
+      imOrigin.listenerAppId,
+      '/api/vc-meetings/managed-action',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          sourceKind: 'im_turn',
+          origin: imOrigin,
+          channel,
+          content,
+          ...(reason ? { reason } : {}),
+          ...(fallbackText ? { fallbackText } : {}),
+        }),
+      },
+    );
+    return jsonRes(res, upstream.status, upstream.body);
+  }
+  if (!verified.origin.turnId) {
+    return jsonRes(res, 409, {
+      ok: false,
+      errorCode: 'delivery_origin_mismatch',
+      error: 'durable delivery action has no stable turn id',
+    });
+  }
+  const lookup = findVcMeetingDeliveryByKey(config.session.dataDir, verified.origin.turnId, {
+    receiverSessionId,
+  });
+  if (!lookup) {
+    return jsonRes(res, 409, { ok: false, errorCode: 'receipt_not_found', error: 'delivery receipt not found' });
+  }
+  const identity = ds.session.vcMeetingReceiver;
+  if (identity.listenerAppId !== lookup.memberKey.listenerAppId
+    || identity.meetingId !== lookup.memberKey.meetingId
+    || identity.memberId !== lookup.memberKey.memberId
+    || identity.memberEpoch !== lookup.memberKey.memberEpoch) {
+    return jsonRes(res, 409, {
+      ok: false,
+      errorCode: 'receiver_identity_mismatch',
+      error: 'active receiver identity does not match the durable receipt',
+    });
+  }
+  if ((expectedListenerAppId && expectedListenerAppId !== lookup.memberKey.listenerAppId)
+    || (expectedMeetingId && expectedMeetingId !== lookup.memberKey.meetingId)) {
+    return jsonRes(res, 409, {
+      ok: false,
+      errorCode: 'meeting_identity_mismatch',
+      error: 'requested meeting does not match the current durable delivery',
+    });
+  }
+  const upstream = await fetchVcMeetingDaemonJson(
+    lookup.memberKey.listenerAppId,
+    '/api/vc-meetings/managed-action',
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        agentAppId: ds.larkAppId,
+        receiverSessionId,
+        stableTurnId: verified.origin.turnId,
+        dispatchAttempt: verified.origin.dispatchAttempt,
+        channel,
+        content,
+        ...(reason ? { reason } : {}),
+        ...(fallbackText ? { fallbackText } : {}),
+      }),
+    },
+  );
+  return jsonRes(res, upstream.status, upstream.body);
+});
+
+// Hub-only endpoint. The receiver daemon has already bound the agent request to
+// a live durable origin; target-scoped daemon auth prevents a sandboxed CLI
+// from forging this trusted hop directly.
+ipcRoute('POST', '/api/vc-meetings/managed-action', async (req, res) => {
+  if (!guardVcMeetingDaemonControlRoute(req, res)) return;
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody<Record<string, unknown>>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, errorCode: 'bad_json', error: 'invalid JSON body' });
+  }
+  if (body.sourceKind === 'im_turn') {
+    const origin = body.origin && typeof body.origin === 'object' && !Array.isArray(body.origin)
+      ? body.origin as NonNullable<DaemonSession['vcMeetingImTurnOrigin']>
+      : undefined;
+    const channel = body.channel === 'text' || body.channel === 'voice' ? body.channel : undefined;
+    const content = sanitizeVcMeetingOutputContent(body.content, 'content');
+    const reason = sanitizeVcMeetingOutputContent(body.reason, 'reason');
+    const fallbackText = sanitizeVcMeetingOutputContent(body.fallbackText, 'fallbackText');
+    if (!origin || origin.listenerAppId !== selfDaemonLarkAppId || !channel || !content) {
+      return jsonRes(res, 400, {
+        ok: false,
+        errorCode: 'bad_request',
+        error: 'managed IM action fields are invalid or routed to the wrong listener daemon',
+      });
+    }
+    const result = await submitVcMeetingManagedImAction({
+      origin,
+      channel,
+      content,
+      ...(reason ? { reason } : {}),
+      ...(fallbackText ? { fallbackText } : {}),
+    });
+    return jsonRes(res, result.status, result.body);
+  }
+  const agentAppId = typeof body.agentAppId === 'string' ? body.agentAppId.trim() : '';
+  const receiverSessionId = typeof body.receiverSessionId === 'string' ? body.receiverSessionId.trim() : '';
+  const stableTurnId = typeof body.stableTurnId === 'string' ? body.stableTurnId.trim() : '';
+  const dispatchAttempt = typeof body.dispatchAttempt === 'number'
+    && Number.isSafeInteger(body.dispatchAttempt)
+    && body.dispatchAttempt > 0
+    ? body.dispatchAttempt
+    : undefined;
+  const channel = body.channel === 'text' || body.channel === 'voice' ? body.channel : undefined;
+  const content = sanitizeVcMeetingOutputContent(body.content, 'content');
+  const reason = sanitizeVcMeetingOutputContent(body.reason, 'reason');
+  const fallbackText = sanitizeVcMeetingOutputContent(body.fallbackText, 'fallbackText');
+  if (!agentAppId || !receiverSessionId || !stableTurnId || dispatchAttempt === undefined || !channel || !content) {
+    return jsonRes(res, 400, { ok: false, errorCode: 'bad_request', error: 'managed action fields are invalid' });
+  }
+  const lookup = findVcMeetingDeliveryByKey(config.session.dataDir, stableTurnId, { receiverSessionId });
+  if (!lookup || lookup.memberKey.listenerAppId !== selfDaemonLarkAppId) {
+    return jsonRes(res, 409, {
+      ok: false,
+      errorCode: 'wrong_listener_daemon',
+      error: 'action receipt does not belong to this listener daemon',
+    });
+  }
+  const result = await submitVcMeetingManagedAction({
+    agentAppId,
+    receiverSessionId,
+    stableTurnId,
+    dispatchAttempt,
+    channel,
+    content,
+    ...(reason ? { reason } : {}),
+    ...(fallbackText ? { fallbackText } : {}),
+  });
+  return jsonRes(res, result.status, result.body);
+});
+
 ipcRoute('POST', '/api/vc-meetings/output-request', async (req, res) => {
   try {
     const body = await readJsonBody<Record<string, unknown>>(req);
@@ -2994,6 +4577,16 @@ ipcRoute('POST', '/api/vc-meetings/output-request', async (req, res) => {
     const fallbackText = sanitizeVcMeetingOutputContent(body.fallbackText, 'fallbackText');
     if (!larkAppId || !meetingId || !channel || !content) {
       return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+    }
+    if (listVcMeetingMemberProjections(config.session.dataDir, {
+      listenerAppId: larkAppId,
+      meetingId,
+    }).length > 0) {
+      return jsonRes(res, 409, {
+        ok: false,
+        errorCode: 'managed_action_required',
+        error: 'this meeting uses durable receiver actions; submit through the receiver daemon',
+      });
     }
     const result = await submitVcMeetingOutputRequest({
       larkAppId,
@@ -3010,6 +4603,7 @@ ipcRoute('POST', '/api/vc-meetings/output-request', async (req, res) => {
 });
 
 ipcRoute('POST', '/api/vc-meetings/consumer-catch-up', async (req, res) => {
+  if (!guardVcMeetingDaemonControlRoute(req, res)) return;
   try {
     const body = await readJsonBody<Record<string, unknown>>(req);
     const larkAppId = typeof body.larkAppId === 'string' ? body.larkAppId.trim() : '';
@@ -3023,7 +4617,10 @@ ipcRoute('POST', '/api/vc-meetings/consumer-catch-up', async (req, res) => {
     if (!cfg) return jsonRes(res, 404, { ok: false, error: 'vc_meeting_agent_disabled' });
     const session = vcMeetingSessions.get(vcMeetingSessionKey(larkAppId, meetingId));
     if (!session) return jsonRes(res, 404, { ok: false, error: 'meeting_session_not_found' });
-    if (session.listenerChatId !== listenerChatId || session.selectedAgentAppId !== agentAppId) {
+    const ownsActiveMember = session.selectedAgentAppId === agentAppId
+      || session.selectedAgents.some(selected =>
+        selected.agentAppId === agentAppId && selected.status === 'active');
+    if (session.listenerChatId !== listenerChatId || !ownsActiveMember) {
       return jsonRes(res, 409, { ok: false, error: 'meeting_consumer_mismatch' });
     }
     const result = await injectVcMeetingConsumerSession(
@@ -3058,7 +4655,7 @@ function configuredVcMeetingListenerChatId(cfg: VcMeetingAgentConfig): string | 
 
 function persistVcMeetingRuntimeSession(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): void {
   const listenerChatId = session.listenerChatId ?? configuredVcMeetingListenerChatId(cfg);
-  if (session.ended) return;
+  if (session.ended && !session.consumerClosePhase) return;
   if (!listenerChatId || !session.state.meeting.id) return;
   recordVcMeetingRuntimeSession(config.session.dataDir, {
     larkAppId: session.larkAppId,
@@ -3070,14 +4667,36 @@ function persistVcMeetingRuntimeSession(session: VcMeetingDaemonSession, cfg: Vc
     listenerChatId,
     attentionTargetOpenId: session.state.attentionTargetOpenId,
     ...(session.consumerMode ? { consumerMode: session.consumerMode } : {}),
-    ...(session.selectedAgentAppId ? { selectedAgentAppId: session.selectedAgentAppId } : {}),
-    ...(session.selectedAgentLabel ? { selectedAgentLabel: session.selectedAgentLabel } : {}),
-    ...(session.consumerPaused !== undefined ? { consumerPaused: session.consumerPaused } : {}),
+    ...(vcMeetingSessionUsesProfileMembers(session, cfg)
+      ? { selectedAgents: session.selectedAgents }
+      : {
+        ...(session.selectedAgentAppId ? { selectedAgentAppId: session.selectedAgentAppId } : {}),
+        ...(session.selectedAgentLabel ? { selectedAgentLabel: session.selectedAgentLabel } : {}),
+        ...(session.consumerPaused !== undefined ? { consumerPaused: session.consumerPaused } : {}),
+      }),
+    ...(session.consumerClosePhase ? { consumerClosePhase: session.consumerClosePhase } : {}),
+    ...(session.consumerFinalizationDeadlineAt !== undefined
+      ? { consumerFinalizationDeadlineAt: session.consumerFinalizationDeadlineAt }
+      : {}),
+    ...(session.consumerCloseResolutionDeadlineAt !== undefined
+      ? { consumerCloseResolutionDeadlineAt: session.consumerCloseResolutionDeadlineAt }
+      : {}),
     textOutputPolicy: session.textOutputPolicy,
     voiceOutputPolicy: session.voiceOutputPolicy,
     ...(session.syncIntervalMs !== undefined ? { syncIntervalMs: session.syncIntervalMs } : {}),
     ...(session.consumerSelectionExpiresAt !== undefined ? { consumerSelectionExpiresAt: session.consumerSelectionExpiresAt } : {}),
     ...(session.consumerCardMessageId ? { consumerCardMessageId: session.consumerCardMessageId } : {}),
+    ...(session.listenerPresenceStale ? { listenerPresenceStale: true } : {}),
+    ...(session.listenerPresenceChangedAtMs !== undefined
+      ? { listenerPresenceChangedAtMs: session.listenerPresenceChangedAtMs }
+      : {}),
+    ...(session.listenerPresenceGeneration !== undefined
+      ? { listenerPresenceGeneration: session.listenerPresenceGeneration }
+      : {}),
+    ...(session.listenerRejoinNonce ? { listenerRejoinNonce: session.listenerRejoinNonce } : {}),
+    ...(session.listenerRejoinCardMessageId
+      ? { listenerRejoinCardMessageId: session.listenerRejoinCardMessageId }
+      : {}),
     temporaryInstructionOpenIds: Object.keys(session.temporaryInstructionOpenIds),
     temporaryInstructionUnionIds: Object.keys(session.temporaryInstructionUnionIds),
   });
@@ -3096,7 +4715,18 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
   pruneExpiredVcMeetingRuntimeSessions(config.session.dataDir);
   for (const record of listVcMeetingRuntimeSessions(config.session.dataDir, larkAppId)) {
     const key = vcMeetingSessionKey(larkAppId, record.meeting.id);
-    if (hasRecentVcMeetingEndedTombstone(key)) {
+    const hubClose = getVcMeetingHubCloseState(config.session.dataDir, {
+      listenerAppId: larkAppId,
+      meetingId: record.meeting.id,
+    });
+    const hasDurableClose = record.consumerClosePhase !== undefined
+      || hubClose?.phase === 'data_closing'
+      || hubClose?.phase === 'finalizing';
+    if (hubClose?.phase === 'closed') {
+      removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
+      continue;
+    }
+    if (hasRecentVcMeetingEndedTombstone(key) && !hasDurableClose) {
       removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
       continue;
     }
@@ -3108,15 +4738,21 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
         topic: record.meeting.topic,
       },
       cfg,
-      { joined: true, listenerChatId: record.listenerChatId },
+      { joined: record.listenerPresenceStale !== true, listenerChatId: record.listenerChatId },
     );
     if (!session) continue;
-    session.joined = true;
+    session.joined = record.listenerPresenceStale !== true;
     session.monitoringStarted = true;
+    session.listenerPresenceStale = record.listenerPresenceStale === true;
+    session.listenerPresenceChangedAtMs = record.listenerPresenceChangedAtMs;
+    session.listenerPresenceGeneration = record.listenerPresenceGeneration;
+    session.listenerRejoinNonce = record.listenerRejoinNonce;
+    session.listenerRejoinCardMessageId = record.listenerRejoinCardMessageId;
     session.listenerChatId = record.listenerChatId;
     session.state.notificationChatId = record.listenerChatId;
     if (record.attentionTargetOpenId) session.state.attentionTargetOpenId = record.attentionTargetOpenId;
     session.consumerMode = record.consumerMode;
+    session.selectedAgents = record.selectedAgents ?? [];
     session.selectedAgentAppId = record.selectedAgentAppId;
     session.selectedAgentLabel = record.selectedAgentLabel;
     session.consumerPaused = record.consumerPaused;
@@ -3132,14 +4768,199 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     session.temporaryInstructionUnionIds = Object.fromEntries(
       (record.temporaryInstructionUnionIds ?? []).map(unionId => [unionId, true] as const),
     );
+    const selectedAgentsBeforeReconcile = JSON.stringify(session.selectedAgents);
+    const restoredProfileMemberships = session.consumerMode === 'agent'
+      && session.selectedAgents.length > 0
+      ? reconcileVcMeetingRestoredProfileMemberships(session, cfg)
+      : { activations: [], pauses: [] };
+    const profileSelectionReconciled = selectedAgentsBeforeReconcile !== JSON.stringify(session.selectedAgents);
+    if (session.consumerMode === 'agent' && session.selectedAgents.length > 0) {
+      session.consumerProfileOwnerBootReady = refreshVcMeetingProfileOwnerBoot(session);
+    }
+    if (hasDurableClose) {
+      if (session.consumerMode !== 'agent' || !vcMeetingSessionHasConsumerMembers(session, cfg)) {
+        logger.error(
+          `[vc-agent] invalid durable close record removed meeting=${record.meeting.id}: no selected agent`,
+        );
+        vcMeetingSessions.delete(key);
+        removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
+        continue;
+      }
+      const deadlineAt = record.consumerFinalizationDeadlineAt
+        ?? hubClose?.finalizationDeadlineAt
+        ?? Date.now() + vcMeetingConsumerCloseHorizonMs();
+      session.ended = true;
+      session.consumerClosePhase = hubClose?.phase === 'finalizing'
+        ? 'finalizing'
+        : record.consumerClosePhase ?? 'data_closing';
+      session.consumerFinalizationDeadlineAt = deadlineAt;
+      session.consumerCloseResolutionDeadlineAt = record.consumerCloseResolutionDeadlineAt
+        ?? (Date.now() >= deadlineAt
+          ? deadlineAt + vcMeetingConsumerRecoveryResolutionGraceMs()
+          : undefined);
+      session.consumerRestoreCatchUpRequired = true;
+      vcMeetingSessions.delete(key);
+      vcMeetingClosingConsumerSessions.set(key, {
+        session,
+        cfg,
+        deadlineAt,
+        ...(Date.now() >= deadlineAt ? { timedOut: true } : {}),
+        ...(session.consumerCloseResolutionDeadlineAt !== undefined
+          ? { resolutionDeadlineAt: session.consumerCloseResolutionDeadlineAt }
+          : {}),
+      });
+      session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
+      if (session.consumerPaused) {
+        session.consumerOverflowNotified = true;
+        session.consumerRecoveryCardRequired = true;
+        if (!session.consumerRestoreCatchUpRequired) {
+          void ensureVcMeetingConsumerOverflowRecoveryCard(
+            session,
+            cfg,
+            VC_MEETING_PENDING_ITEM_LIMIT,
+          ).catch((err) => {
+            logger.warn(
+              `[vc-agent] restored closing recovery card failed meeting=${record.meeting.id}: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+        }
+      }
+      if (session.selectedAgents.length > 0
+        && session.selectedAgents.some(selected => selected.status === 'paused')) {
+        void ensureVcMeetingProfileRecoveryCard(
+          session,
+          cfg,
+          '会议结束收口期间仍有暂停的 profile；确认后会按各自 cursor 继续并提交 final。',
+        ).catch((err) => {
+          logger.warn(
+            `[vc-agent] restored closing profile recovery card failed meeting=${record.meeting.id}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
+      persistVcMeetingRuntimeSession(session, cfg);
+      if (restoredProfileMemberships.pauses.length > 0) {
+        void resumeVcMeetingRestoredProfileMemberships(
+          key,
+          session,
+          cfg,
+          [],
+          restoredProfileMemberships.pauses,
+        ).catch((err) => {
+          logger.warn(
+            `[vc-agent] restored closing profile pause failed meeting=${record.meeting.id}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
+      scheduleVcMeetingConsumerClosePump(key);
+      logger.info(
+        `[vc-agent] restored durable consumer close meeting=${record.meeting.id} `
+        + `phase=${session.consumerClosePhase} catchUp=${session.consumerRestoreCatchUpRequired ? 'pending' : 'ready'}`,
+      );
+      continue;
+    }
+    if (profileSelectionReconciled) persistVcMeetingRuntimeSession(session, cfg);
+    if (session.consumerMode === 'agent'
+      && session.selectedAgents.length > 0
+      && session.selectedAgents.some(selected => selected.status === 'active'
+        || selected.status === 'paused'
+        || selected.status === 'activating')) {
+      session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
+      if (session.consumerRestoreCatchUpRequired) {
+        logger.warn(
+          `[vc-agent] restored profile fan-out is waiting for body catch-up meeting=${session.state.meeting.id}`,
+        );
+      }
+      if (session.selectedAgents.some(selected => selected.status === 'paused')) {
+        void ensureVcMeetingProfileRecoveryCard(session, cfg).catch((err) => {
+          logger.warn(
+            `[vc-agent] restored profile recovery card failed meeting=${session.state.meeting.id}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
+    } else if (session.consumerMode === 'agent' && session.selectedAgentAppId) {
+      const restoredMember = vcMeetingLatestSingleConsumerMember(session);
+      // An active runtime with a removed latest epoch is the durable marker
+      // left after an operator authorized from-now but the new receiver
+      // registration had not completed before restart. Do not resurrect or
+      // rehydrate the abandoned prefix; the regular pump will create a fresh
+      // epoch at the current ingest high-water.
+      session.consumerRestoreCatchUpRequired = restoredMember?.status === 'removed'
+        ? false
+        : !catchUpVcMeetingConsumerForRestore(session, cfg);
+      if (session.consumerRestoreCatchUpRequired) {
+        session.consumerActiveRecoveryCardRequired = true;
+        void ensureVcMeetingConsumerActiveRecoveryCard(session).catch((err) => {
+          logger.warn(
+            `[vc-agent] restored active recovery card failed meeting=${session.state.meeting.id}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
+      if (session.consumerPaused) {
+        session.consumerOverflowNotified = true;
+        session.consumerRecoveryCardRequired = true;
+        if (!session.consumerRestoreCatchUpRequired) {
+          void ensureVcMeetingConsumerOverflowRecoveryCard(
+            session,
+            cfg,
+            VC_MEETING_PENDING_ITEM_LIMIT,
+          ).catch((err) => {
+            logger.warn(
+              `[vc-agent] restored overflow recovery card failed meeting=${session.state.meeting.id}: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+        }
+      }
+    } else if (session.consumerMode === 'pending') {
+      session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
+      session.consumerSelectionNonce = undefined;
+      session.consumerSelectionExpiresAt = undefined;
+      session.consumerRestoreSelectionCardRequired = true;
+    }
     scheduleVcMeetingListenerFlush(key, cfg);
     scheduleVcMeetingRestoreImmediateTick(key, cfg);
     if (session.consumerMode === 'agent') {
       scheduleVcMeetingConsumerInjection(key, cfg);
     }
+    if (restoredProfileMemberships.activations.length > 0
+      || restoredProfileMemberships.pauses.length > 0) {
+      void resumeVcMeetingRestoredProfileMemberships(
+        key,
+        session,
+        cfg,
+        restoredProfileMemberships.activations,
+        restoredProfileMemberships.pauses,
+      ).catch((err) => {
+        logger.warn(
+          `[vc-agent] restored profile membership reconciliation failed meeting=${record.meeting.id}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
     if (session.consumerMode === 'pending') {
-      const remaining = Math.max(0, (session.consumerSelectionExpiresAt ?? Date.now()) - Date.now());
-      armVcMeetingConsumerSelectionTimer(key, cfg, remaining);
+      // The old nonce intentionally was not durable. Replace the stale card
+      // with a freshly signed one after rehydrating the pre-selection backlog.
+      if (!session.consumerRestoreCatchUpRequired) {
+        void ensureVcMeetingRestoredSelectionCard(key, session, cfg).catch((err) => {
+          logger.warn(
+            `[vc-agent] restored consumer selection card failed meeting=${record.meeting.id}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
+    }
+    if (session.listenerPresenceStale && !session.listenerRejoinCardMessageId) {
+      void sendVcMeetingListenerRejoinCard(session, cfg).catch((err) => {
+        logger.warn(
+          `[vc-agent] restored listener rejoin card failed meeting=${record.meeting.id}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
     }
     logger.info(`[vc-agent] restored runtime session meeting=${record.meeting.id} chat=${record.listenerChatId} bot=${larkAppId}`);
   }
@@ -3225,13 +5046,107 @@ function queueVcMeetingPendingItems(session: VcMeetingDaemonSession, items: Norm
 function queueVcMeetingConsumerPendingItems(
   session: VcMeetingDaemonSession,
   cfg: VcMeetingAgentConfig,
-  items: NormalizedVcMeetingItem[],
+  items: VcMeetingCanonicalFeedItem[],
 ): void {
-  if (!vcMeetingConsumerEnabled(cfg) || session.consumerMode === 'listenOnly' || items.length === 0) return;
-  session.consumerPendingItems.push(...items);
-  if (session.consumerPendingItems.length > VC_MEETING_PENDING_ITEM_LIMIT) {
-    session.consumerPendingItems.splice(0, session.consumerPendingItems.length - VC_MEETING_PENDING_ITEM_LIMIT);
+  if (!vcMeetingConsumerEnabled(cfg)
+    || session.consumerMode === 'listenOnly'
+    || items.length === 0) return;
+  const limit = vcMeetingConsumerPendingItemLimitOverrideForTest ?? VC_MEETING_PENDING_ITEM_LIMIT;
+  if (vcMeetingSessionUsesProfileMembers(session, cfg)) {
+    // Feed metadata has already advanced to the incoming semantic revision.
+    // Drop obsolete, non-frozen transcript bodies before measuring debt so
+    // rapid r1→rN ASR updates do not pause a member for versions it can never
+    // receive. Exact frozen versions remain pinned by the helper.
+    pruneSupersededVcMeetingConsumerTranscripts(session);
+    const prospective = [...session.consumerPendingItems, ...items];
+    let pausedAny = false;
+    for (const selected of session.selectedAgents) {
+      if (selected.status !== 'active') continue;
+      const member = vcMeetingLatestProfileMember(session, selected.memberId);
+      if (!member || member.status !== 'active') continue;
+      const unacked = prospective.filter(feed =>
+        feed.ingestSeq > member.joinedAtIngestSeq
+        && vcMeetingMemberAcceptsFeed(member, feed)
+        && !vcMeetingMemberAckedFeed(member, feed)).length;
+      if (unacked <= limit) continue;
+      selected.status = 'paused';
+      pausedAny = true;
+      selected.activationError = `待处理事件 ${unacked} 条，超过上限 ${limit}`;
+      const state = session.consumerMemberStates[selected.memberId] ??= {};
+      persistVcMeetingRuntimeSession(session, cfg);
+      void pauseVcMeetingProfileMembership(session, selected).catch((err) => {
+        logger.error(
+          `[vc-agent] failed to persist profile overflow pause meeting=${session.state.meeting.id} `
+          + `profile=${selected.profileId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+      if (!state.overflowNotified && session.listenerChatId) {
+        state.overflowNotified = true;
+        void sendMessage(
+          session.larkAppId,
+          session.listenerChatId,
+          `会议 agent profile ${selected.label ?? selected.profileId} 已单独暂停：待处理事件超过 ${limit} 条；其它 agent 会继续运行，正文暂不删除。`,
+          'text',
+          `vc_${session.state.meeting.id.slice(-12)}_overflow_${selected.memberId}`,
+        ).catch((err) => logger.warn(
+          `[vc-agent] profile overflow notice failed meeting=${session.state.meeting.id} `
+          + `profile=${selected.profileId}: ${err instanceof Error ? err.message : String(err)}`,
+        ));
+      }
+    }
+    session.consumerPendingItems.push(...items);
+    if (pausedAny) {
+      void ensureVcMeetingProfileRecoveryCard(session, cfg).catch((err) => {
+        logger.error(
+          `[vc-agent] profile overflow recovery card failed meeting=${session.state.meeting.id}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+    return;
   }
+  if (session.consumerPendingItems.length + items.length > limit) {
+    // Never silently discard the oldest meeting context. Stop the consumer
+    // stream before accepting a non-contiguous suffix and make the gap visible
+    // in the listener group; an operator can reselect/recover from a canonical
+    // meeting source instead of receiving a plausible but incomplete summary.
+    session.consumerPaused = true;
+    persistVcMeetingRuntimeSession(session, cfg);
+    if (!session.consumerMembershipPausePromise) {
+      const pause = pauseVcMeetingSingleConsumerMembership(session).catch((err) => {
+        logger.error(
+          `[vc-agent] failed to persist overflow pause meeting=${session.state.meeting.id}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+      session.consumerMembershipPausePromise = pause;
+      void pause.finally(() => {
+        if (session.consumerMembershipPausePromise === pause) {
+          session.consumerMembershipPausePromise = undefined;
+        }
+      });
+    }
+    logger.error(
+      `[vc-agent] consumer feed paused on overflow meeting=${session.state.meeting.id} `
+      + `pending=${session.consumerPendingItems.length} incoming=${items.length} limit=${limit}`,
+    );
+    if (!session.consumerOverflowNotified) {
+      session.consumerOverflowNotified = true;
+      session.consumerRecoveryCardRequired = true;
+      void ensureVcMeetingConsumerOverflowRecoveryCard(session, cfg, limit).catch((err) => {
+        logger.error(
+          `[vc-agent] consumer overflow recovery card failed meeting=${session.state.meeting.id}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  }
+  // The limit is a dispatch/backpressure boundary, not a deletion policy.
+  // Retain the breaching batch and all later canonical bodies while paused so
+  // an operator reselect can resume without an unmarked delivery hole. This is
+  // intentionally fail-memory (with loud logs) rather than silently corrupting
+  // the meeting stream; restart recovery rehydrates from the metadata journal.
+  session.consumerPendingItems.push(...items);
 }
 
 function getOrCreateVcMeetingDaemonSession(
@@ -3265,6 +5180,8 @@ function getOrCreateVcMeetingDaemonSession(
       voiceOutputPolicy: defaultVcMeetingVoiceOutputPolicy(cfg),
       pendingOutputRequests: {},
       consumerPendingItems: [],
+      selectedAgents: [],
+      consumerMemberStates: {},
       consumerTranscriptRevisions: {},
       actorNamesByOpenId: {},
       actorNamesByUnionId: {},
@@ -3288,6 +5205,9 @@ function getOrCreateVcMeetingDaemonSession(
     session.textOutputPolicy ??= defaultVcMeetingTextOutputPolicy();
     session.voiceOutputPolicy ??= defaultVcMeetingVoiceOutputPolicy(cfg);
     session.pendingOutputRequests ??= {};
+    session.consumerPendingItems ??= [];
+    session.selectedAgents ??= [];
+    session.consumerMemberStates ??= {};
     session.actorNamesByOpenId ??= {};
     session.actorNamesByUnionId ??= {};
     session.actorUnionIdsByOpenId ??= {};
@@ -3727,6 +5647,59 @@ type VcMeetingConsumerSelection =
   | { mode: 'agent'; agentAppId: string }
   | { mode: 'default' };
 
+function vcMeetingConsumerUsesProfiles(cfg: VcMeetingAgentConfig): boolean {
+  return cfg.meetingConsumer?.consumerProfiles !== undefined;
+}
+
+function vcMeetingConsumerProfileResolution(
+  cfg: VcMeetingAgentConfig,
+  selectedProfileIds?: readonly string[],
+) {
+  const resolution = resolveVcMeetingConsumerProfiles(
+    cfg.meetingConsumer ?? {},
+    selectedProfileIds,
+  );
+  if (!resolution.ok || resolution.source !== 'profiles') {
+    const detail = resolution.ok
+      ? 'meeting consumer is not configured for profiles'
+      : resolution.errors.join('; ');
+    throw new Error(detail);
+  }
+  return resolution;
+}
+
+function vcMeetingConsumerDefaultProfileIds(cfg: VcMeetingAgentConfig): string[] {
+  if (!vcMeetingConsumerUsesProfiles(cfg)) return [];
+  const resolution = vcMeetingConsumerProfileResolution(cfg);
+  return resolution.selectedProfiles.map(profile => profile.id);
+}
+
+function vcMeetingCanonicalProfileFilter(
+  profile: Pick<VcMeetingConsumerProfileConfig, 'filter'>,
+): VcMeetingConsumerProfileConfig['filter'] | undefined {
+  const activityTypes = profile.filter?.activityTypes;
+  if (!activityTypes?.length) return undefined;
+  return { activityTypes: [...new Set(activityTypes)].sort() };
+}
+
+function vcMeetingCanonicalProfileCapabilities(profile: VcMeetingConsumerProfileConfig): string[] {
+  return [...new Set(profile.capabilities)].sort();
+}
+
+function vcMeetingCanonicalProfileOwnedSinks(profile: VcMeetingConsumerProfileConfig) {
+  return [...new Set(profile.ownedSinks ?? [])].sort();
+}
+
+function vcMeetingConsumerProfileHash(profile: VcMeetingConsumerProfileConfig): string {
+  return computeVcMeetingConsumerProfileHash({
+    role: profile.role,
+    ...(profile.instructions ? { instructions: profile.instructions } : {}),
+    ...(vcMeetingCanonicalProfileFilter(profile)
+      ? { filter: vcMeetingCanonicalProfileFilter(profile) }
+      : {}),
+  });
+}
+
 function vcMeetingConsumerCardCandidates(
   cfg: VcMeetingAgentConfig,
 ): VcMeetingConsumerAgentConfig[] {
@@ -3761,6 +5734,48 @@ function vcMeetingConsumerCardForSession(
   cfg: VcMeetingAgentConfig,
   opts: { error?: string } = {},
 ): any {
+  if (vcMeetingSessionUsesProfileMembers(session, cfg)) {
+    const resolution = vcMeetingConsumerProfileResolutionForSession(session, cfg);
+    const runtimeByProfile = new Map(
+      session.selectedAgents.map(selected => [selected.profileId, selected] as const),
+    );
+    const profilesById = new Map(
+      resolution.profiles.map(profile => [profile.id, profile] as const),
+    );
+    // Selected rows are immutable member-epoch snapshots. Keep them visible
+    // even when the preset was edited or removed while the meeting was live;
+    // unselected catalog rows continue to reflect current config.
+    for (const selected of session.selectedAgents) {
+      profilesById.set(selected.profileId, vcMeetingProfileFromRuntimeAgent(selected));
+    }
+    const defaultConsumerIds = resolution.selectedProfiles.map(profile => profile.id);
+    return JSON.parse(buildVcMeetingConsumerCard({
+      selectionMode: 'profiles',
+      status,
+      meeting: session.state.meeting,
+      nonce: session.consumerSelectionNonce ?? '',
+      profiles: [...profilesById.values()].map((profile) => {
+        const selected = runtimeByProfile.get(profile.id);
+        return {
+          ...profile,
+          agentLabel: vcMeetingConsumerBotDisplayLabel(profile.agentAppId),
+          ...(selected ? { activationStatus: selected.status === 'paused' ? 'failed' : selected.status } : {}),
+          ...(selected?.activationError ? { activationError: selected.activationError } : {}),
+        };
+      }),
+      defaultMode: cfg.meetingConsumer?.defaultMode === 'agents' ? 'agents' : 'listenOnly',
+      defaultConsumerIds,
+      selectedProfileIds: session.selectedAgents
+        .filter(selected => selected.status === 'active' || selected.status === 'activating')
+        .map(selected => selected.profileId),
+      ...(session.consumerPendingProfileIds !== undefined
+        ? { stagedSelectedProfileIds: [...session.consumerPendingProfileIds] }
+        : {}),
+      syncIntervalMs: vcMeetingSessionFlushIntervalMs(session, cfg),
+      ...(session.consumerPendingIntervalMs ? { stagedIntervalMs: session.consumerPendingIntervalMs } : {}),
+      ...(opts.error ? { error: opts.error } : {}),
+    }));
+  }
   const defaultSelection = vcMeetingResolveDefaultConsumerSelection(cfg);
   return JSON.parse(buildVcMeetingConsumerCard({
     status,
@@ -3786,6 +5801,83 @@ function vcMeetingConsumerCardForSession(
     ...(session.consumerPendingIntervalMs ? { stagedIntervalMs: session.consumerPendingIntervalMs } : {}),
     ...(opts.error ? { error: opts.error } : {}),
   }));
+}
+
+async function ensureVcMeetingProfileRecoveryCard(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  detail = '一个或多个 profile 因积压暂停；确认当前选择可按各自未提交 cursor 恢复。',
+): Promise<void> {
+  const paused = session.selectedAgents.filter(selected => selected.status === 'paused');
+  if (paused.length === 0 || !session.listenerChatId || session.consumerProfileRecoveryCardSent) return;
+  session.consumerProfileRecoveryCardSent = true;
+  session.consumerSelectionNonce = randomVcMeetingNonce();
+  session.consumerSelectionExpiresAt = undefined;
+  session.consumerPendingProfileIds = session.selectedAgents
+    .filter(selected => selected.status === 'active' || selected.status === 'paused')
+    .map(selected => selected.profileId);
+  const nonce = session.consumerSelectionNonce;
+  try {
+    session.consumerCardMessageId = await sendMessage(
+      session.larkAppId,
+      session.listenerChatId,
+      JSON.stringify(vcMeetingConsumerCardForSession('pending', session, cfg, { error: detail })),
+      'interactive',
+      `vc_${session.state.meeting.id.slice(-12)}_profile_recovery_${nonce.slice(0, 12)}`,
+    );
+    persistVcMeetingRuntimeSession(session, cfg);
+  } catch (err) {
+    session.consumerProfileRecoveryCardSent = false;
+    throw err;
+  }
+}
+
+async function resumeVcMeetingPausedProfiles(
+  key: string,
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const settleMembershipMutation = beginVcMeetingMembershipMutationBarrier(session);
+  try {
+  const listenerChatId = session.listenerChatId ?? configuredVcMeetingListenerChatId(cfg);
+  if (!listenerChatId) return { ok: false, error: 'listener chat is not ready' };
+  const paused = session.selectedAgents.filter(selected => selected.status === 'paused');
+  const settled = await Promise.allSettled(paused.map(async (selected) => {
+    const profile = vcMeetingProfileFromRuntimeAgent(selected);
+    await ensureVcMeetingProfileMember(session, profile, listenerChatId, {
+      ...(selected.deliveryProfileHash
+        ? { deliveryProfileHash: selected.deliveryProfileHash }
+        : {}),
+    });
+    return vcMeetingRuntimeAgentForProfile(profile, 'active', {
+      ...(selected.deliveryProfileHash
+        ? { deliveryProfileHash: selected.deliveryProfileHash }
+        : {}),
+    });
+  }));
+  const updates = new Map<string, VcMeetingRuntimeSelectedAgent>();
+  const errors: string[] = [];
+  settled.forEach((result, index) => {
+    const selected = paused[index]!;
+    if (result.status === 'fulfilled') updates.set(selected.profileId, result.value);
+    else errors.push(`${selected.profileId}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
+  });
+  session.selectedAgents = session.selectedAgents.map(selected => updates.get(selected.profileId) ?? selected);
+  session.consumerProfileRecoveryCardSent = errors.length > 0;
+  session.consumerSelectionNonce = errors.length > 0 ? session.consumerSelectionNonce : undefined;
+  session.consumerPendingProfileIds = errors.length > 0 ? session.consumerPendingProfileIds : undefined;
+  session.consumerProfileOwnerBootReady = refreshVcMeetingProfileOwnerBoot(session);
+  persistVcMeetingRuntimeSession(session, cfg);
+  if (updates.size > 0) {
+    scheduleVcMeetingConsumerInjection(key, cfg);
+    void injectVcMeetingConsumerSession(key, cfg, { force: true, final: session.ended }).catch((err) => {
+      logger.warn(`[vc-agent] resumed profile inject failed ${key}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+  return errors.length === 0 ? { ok: true } : { ok: false, error: errors.join('; ') };
+  } finally {
+    settleMembershipMutation();
+  }
 }
 
 function clearVcMeetingConsumerSelectionTimer(session: VcMeetingDaemonSession): void {
@@ -3823,7 +5915,39 @@ function rescheduleVcMeetingTimers(key: string, session: VcMeetingDaemonSession,
   if (session.consumerMode === 'agent') scheduleVcMeetingConsumerInjection(key, cfg);
 }
 
-type VcMeetingConsumerSelectionApplyOptions = { claimed?: boolean };
+type VcMeetingConsumerSelectionApplyOptions = {
+  claimed?: boolean;
+  /** Only the authenticated recovery-card path may resume the same legacy
+   * member after `meeting_ended`; ordinary ended selections stay fenced. */
+  allowClosingRecovery?: boolean;
+};
+
+/** Publish a membership mutation before its first await. Meeting close uses
+ * this promise as a barrier so it cannot snapshot an old epoch and then leave
+ * a newly-created receiver member orphaned after `meeting_ended`.
+ *
+ * Membership mutations are serialized by `consumerSelectionApplying`; the
+ * promise is kept separate because the close pump also needs an awaitable
+ * durable-boundary signal while recovery cards are allowed on ended meetings.
+ */
+function beginVcMeetingMembershipMutationBarrier(
+  session: VcMeetingDaemonSession,
+): () => void {
+  let settle!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  session.consumerSelectionPromise = promise;
+  let settled = false;
+  return () => {
+    if (settled) return;
+    settled = true;
+    settle();
+    if (session.consumerSelectionPromise === promise) {
+      session.consumerSelectionPromise = undefined;
+    }
+  };
+}
 
 async function applyVcMeetingConsumerSelectionInBackground(
   key: string,
@@ -4319,10 +6443,10 @@ async function replyVcMeetingTemporaryAuthListenerHint(
   }
 ): Promise<boolean> {
   if (!input.chatId) return false;
-  const record = findVcMeetingRuntimeSessionByListenerAndAgent(config.session.dataDir, {
+  const record = listVcMeetingRuntimeSessionsByListenerAndAgent(config.session.dataDir, {
     listenerChatId: input.chatId,
-    selectedAgentAppId: input.larkAppId,
-  });
+    agentAppId: input.larkAppId,
+  })[0];
   if (!record) return false;
   const listenerBot = resolveVcMeetingListenerBotLabel(record.larkAppId);
   await sessionReply(
@@ -4395,6 +6519,7 @@ function armVcMeetingOutputRequestTimer(
   req: VcMeetingPendingOutputRequest,
 ): void {
   clearVcMeetingOutputRequestTimer(req);
+  const remainingMs = Math.max(0, req.expiresAt - Date.now());
   req.timer = setTimeout(() => {
     const current = vcMeetingSessions.get(key);
     const pending = current?.pendingOutputRequests[req.channel];
@@ -4405,7 +6530,7 @@ function armVcMeetingOutputRequestTimer(
       'expired',
       `你的 ${req.channel === 'voice' ? '语音' : '会中弹幕'} 输出请求已超时并被自动拒绝。`,
     );
-  }, vcMeetingOutputReviewTimeoutMs(req.channel));
+  }, remainingMs);
   if (typeof req.timer.unref === 'function') req.timer.unref();
 }
 
@@ -4414,8 +6539,8 @@ async function expireVcMeetingOutputRequestsOnClose(session: VcMeetingDaemonSess
   for (const req of pending) {
     clearVcMeetingOutputRequestTimer(req);
     if (req.applying) continue;
-    await patchVcMeetingOutputReviewCard(session, req, 'expired').catch((err) => {
-      logger.warn(`[vc-agent] output review card close patch failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
+    await rejectVcMeetingOutputRequest(session, req, 'expired').catch((err) => {
+      logger.warn(`[vc-agent] output review close expiry failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
     });
   }
   session.pendingOutputRequests = {};
@@ -4608,17 +6733,371 @@ async function rejectVcMeetingOutputRequest(
   notifyMessage?: string,
 ): Promise<void> {
   clearVcMeetingOutputRequestTimer(req);
+  if (req.managedAction) {
+    const managedRef = {
+      listenerAppId: req.managedAction.listenerAppId,
+      meetingId: req.managedAction.meetingId,
+      actionId: req.managedAction.actionId,
+      inputHash: req.managedAction.inputHash,
+    };
+    const current = findVcMeetingAction(
+      config.session.dataDir,
+      { listenerAppId: managedRef.listenerAppId, meetingId: managedRef.meetingId },
+      managedRef.actionId,
+    );
+    if (current?.approvalCard?.status === 'attempting') {
+      finishVcMeetingManagedApprovalCard(config.session.dataDir, {
+        ...managedRef,
+        status: status === 'rejected' ? 'presented' : 'unknown',
+        ...(status === 'rejected'
+          ? { externalRefs: { operatorInteractionProvedPresentation: true } }
+          : { errorCode: `approval_card_${status}_without_provider_ack` }),
+      });
+    }
+    resolveVcMeetingManagedActionApproval(
+      config.session.dataDir,
+      managedRef,
+      status === 'rejected' ? 'rejected' : 'expired',
+      { errorCode: `approval_${status}` },
+    );
+  }
   if (session.pendingOutputRequests[req.channel]?.id === req.id) {
     delete session.pendingOutputRequests[req.channel];
   }
   await patchVcMeetingOutputReviewCard(session, req, status).catch((err) => {
     logger.warn(`[vc-agent] output review card patch failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
   });
-  if (notifyMessage) {
+  if (notifyMessage && !req.managedAction) {
     void notifyVcMeetingConsumerAgent(session, notifyMessage).catch((err) => {
       logger.warn(`[vc-agent] output result notify failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
     });
   }
+}
+
+function vcMeetingManagedActionRef(action: VcMeetingActionRecord): VcMeetingActionRef {
+  return {
+    listenerAppId: action.listenerAppId,
+    meetingId: action.meetingId,
+    actionId: action.actionId,
+    inputHash: action.inputHash,
+  };
+}
+
+function vcMeetingManagedOutputRequest(
+  action: VcMeetingActionRecord,
+  plan: VcMeetingProviderExecutionPlan | VcMeetingApprovalPresentationPlan,
+  opts: { approval?: boolean; reason?: string } = {},
+): VcMeetingPendingOutputRequest {
+  const now = Date.now();
+  const approvalCreatedAt = opts.approval
+    ? (action.approvalCard?.createdAt ?? action.updatedAt)
+    : now;
+  return {
+    // Approval callbacks identify the logical action; the actual meeting-text
+    // provider call below replaces id with the stable providerKey.
+    id: action.actionId,
+    channel: plan.channel,
+    nonce: opts.approval ? plan.providerKey : randomVcMeetingNonce(),
+    agentAppId: action.agentAppId,
+    content: plan.content,
+    contentParts: [plan.content],
+    ...(opts.reason ? { reason: opts.reason, reasonParts: [opts.reason] } : {}),
+    ...(plan.fallbackText
+      ? { fallbackText: plan.fallbackText, fallbackTextParts: [plan.fallbackText] }
+      : {}),
+    createdAt: approvalCreatedAt,
+    expiresAt: approvalCreatedAt + vcMeetingOutputReviewTimeoutMs(plan.channel),
+    managedAction: {
+      listenerAppId: action.listenerAppId,
+      meetingId: action.meetingId,
+      actionId: action.actionId,
+      inputHash: action.inputHash,
+      providerKey: action.providerKey,
+    },
+  };
+}
+
+async function executeVcMeetingManagedProviderPlan(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  action: VcMeetingActionRecord,
+  plan: VcMeetingProviderExecutionPlan,
+  opts: { forceText?: boolean } = {},
+): Promise<{ ok: true; status: 'sent'; action: VcMeetingActionRecord } | {
+  ok: false; status: 'failed' | 'unknown' | 'attempting'; error: string; action: VcMeetingActionRecord;
+}> {
+  const req = vcMeetingManagedOutputRequest(action, plan);
+  req.id = plan.providerKey;
+  const deliverAsText = opts.forceText === true || plan.channel === 'text';
+  try {
+    if (deliverAsText) {
+      let lastError: unknown;
+      // Same provider UUID on every attempt: transient transport failure can
+      // heal online without waiting for daemon restart, while an ACK-lost first
+      // send remains idempotent at Lark.
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          await sendVcMeetingOutputText(session, cfg, req);
+          lastError = undefined;
+          break;
+        } catch (err) {
+          lastError = err;
+          if (attempt < 3) logger.warn(`[vc-action] text provider retry ${attempt}/3 action=${action.actionId}`);
+        }
+      }
+      if (lastError) throw lastError;
+    } else {
+      await speakVcMeetingOutput(session, cfg, req);
+    }
+    const finished = finishVcMeetingManagedActionProvider(config.session.dataDir, {
+      ...vcMeetingManagedActionRef(action),
+      status: 'succeeded',
+      externalRefs: {
+        providerKey: plan.providerKey,
+        deliveredAs: deliverAsText ? 'meeting_text' : 'meeting_voice',
+      },
+    });
+    if (finished.kind === 'conflict' || finished.record.status !== 'succeeded') {
+      return {
+        ok: false,
+        status: 'unknown',
+        error: finished.kind === 'conflict'
+          ? `provider result ledger conflict: ${finished.reason}`
+          : `provider result already terminal as ${finished.record.status}`,
+        action: finished.kind === 'conflict' ? action : finished.record,
+      };
+    }
+    return { ok: true, status: 'sent', action: finished.record };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!deliverAsText) {
+      const finished = finishVcMeetingManagedActionProvider(config.session.dataDir, {
+        ...vcMeetingManagedActionRef(action),
+        status: 'unknown',
+        errorCode: 'voice_provider_result_unknown',
+        externalRefs: { providerKey: plan.providerKey, error: message },
+      });
+      if (finished.kind !== 'conflict' && finished.record.status === 'succeeded') {
+        return { ok: true, status: 'sent', action: finished.record };
+      }
+      return { ok: false, status: 'unknown', error: message, action: finished.kind === 'conflict' ? action : finished.record };
+    }
+    // Three same-UUID attempts all failed in this live process. Terminalize as
+    // unknown/manual instead of leaving a request wedged until restart or
+    // risking an unbounded retry beyond the provider's idempotency window.
+    const finished = finishVcMeetingManagedActionProvider(config.session.dataDir, {
+      ...vcMeetingManagedActionRef(action),
+      status: 'unknown',
+      errorCode: 'text_provider_retry_exhausted',
+      externalRefs: { providerKey: plan.providerKey, error: message },
+    });
+    return {
+      ok: false,
+      status: 'unknown',
+      error: message,
+      action: finished.kind === 'conflict' ? action : finished.record,
+    };
+  }
+}
+
+async function presentVcMeetingManagedApproval(
+  session: VcMeetingDaemonSession,
+  action: VcMeetingActionRecord,
+  plan: VcMeetingApprovalPresentationPlan,
+): Promise<{ ok: true; status: 'pending'; requestId: string; action: VcMeetingActionRecord } | {
+  ok: false; error: string; action: VcMeetingActionRecord;
+}> {
+  const listenerChatId = session.listenerChatId;
+  const terminalizeWithoutCard = (errorCode: string): void => {
+    finishVcMeetingManagedApprovalCard(config.session.dataDir, {
+      ...vcMeetingManagedActionRef(action),
+      status: 'failed',
+      errorCode,
+    });
+    resolveVcMeetingManagedActionApproval(
+      config.session.dataDir,
+      vcMeetingManagedActionRef(action),
+      'expired',
+      { errorCode },
+    );
+  };
+  if (!listenerChatId) {
+    terminalizeWithoutCard('listener_chat_not_ready_before_card');
+    return { ok: false, error: 'listener chat is not ready', action };
+  }
+  if (session.pendingOutputRequests[plan.channel]) {
+    terminalizeWithoutCard('approval_channel_busy_before_card');
+    return { ok: false, error: `another ${plan.channel} approval is already pending`, action };
+  }
+  const req = vcMeetingManagedOutputRequest(action, plan, { approval: true, reason: plan.reason });
+  const cardJson = JSON.stringify(vcMeetingOutputReviewCardForRequest(session, req, 'pending'));
+  try {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        req.cardMessageId = await sendMessage(
+          session.larkAppId,
+          listenerChatId,
+          cardJson,
+          'interactive',
+          plan.providerKey,
+        );
+        lastError = undefined;
+        break;
+      } catch (err) {
+        lastError = err;
+        if (attempt < 3) logger.warn(`[vc-action] approval card retry ${attempt}/3 action=${action.actionId}`);
+      }
+    }
+    if (lastError || !req.cardMessageId) throw lastError ?? new Error('approval card provider returned no message id');
+    const cardFinished = finishVcMeetingManagedApprovalCard(config.session.dataDir, {
+      ...vcMeetingManagedActionRef(action),
+      status: 'presented',
+      externalRefs: {
+        cardMessageId: req.cardMessageId,
+        providerKey: plan.providerKey,
+        nonce: req.nonce,
+        expiresAt: req.expiresAt,
+        channel: req.channel,
+      },
+    });
+    if (cardFinished.kind === 'conflict'
+      || cardFinished.record.approvalCard?.status !== 'presented') {
+      return {
+        ok: false,
+        error: cardFinished.kind === 'conflict'
+          ? `approval card ledger conflict: ${cardFinished.reason}`
+          : `approval card already terminal as ${cardFinished.record.approvalCard?.status ?? 'missing'}`,
+        action: cardFinished.kind === 'conflict' ? action : cardFinished.record,
+      };
+    }
+    session.pendingOutputRequests[plan.channel] = req;
+    armVcMeetingOutputRequestTimer(vcMeetingSessionKey(session.larkAppId, session.state.meeting.id), req);
+    return { ok: true, status: 'pending', requestId: req.id, action: cardFinished.record };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // A network error may be ACK-lost after Lark created the card. Keep the
+    // write-ahead card attempt non-terminal so startup reconciliation retries
+    // the same stable UUID instead of expiring a possibly visible card. Also
+    // retain a deterministic pending callback record now: if the card *was*
+    // created but its ACK was lost, its buttons remain actionable; otherwise
+    // the normal expiry timer terminalizes the action.
+    session.pendingOutputRequests[plan.channel] = req;
+    armVcMeetingOutputRequestTimer(vcMeetingSessionKey(session.larkAppId, session.state.meeting.id), req);
+    logger.error(`[vc-action] approval card delivery ambiguous action=${action.actionId}: ${message}`);
+    return { ok: true, status: 'pending', requestId: req.id, action };
+  }
+}
+
+async function submitVcMeetingManagedAction(input: {
+  agentAppId: string;
+  receiverSessionId: string;
+  stableTurnId: string;
+  dispatchAttempt: number;
+  channel: VcMeetingOutputChannel;
+  content: string;
+  reason?: string;
+  fallbackText?: string;
+}): Promise<{ status: number; body: unknown }> {
+  const lookup = findVcMeetingDeliveryByKey(config.session.dataDir, input.stableTurnId, {
+    receiverSessionId: input.receiverSessionId,
+  });
+  const session = lookup
+    ? vcMeetingSessions.get(vcMeetingSessionKey(lookup.memberKey.listenerAppId, lookup.memberKey.meetingId))
+    : undefined;
+  const execute = async (): Promise<{ status: number; body: unknown }> => {
+    const result = await requestVcMeetingManagedAction(input, {
+      dataDir: config.session.dataDir,
+      selfAgentAppId: input.agentAppId,
+      authorize: ({ projection, sink, action }) => {
+        const current = vcMeetingSessions.get(vcMeetingSessionKey(projection.listenerAppId, projection.meetingId));
+        if (!current) return { kind: 'deny', reason: 'listener_session_inactive' };
+        if (current.ended) return { kind: 'deny', reason: 'meeting_phase_closed' };
+        const currentCfg = effectiveVcMeetingAgentConfig(projection.listenerAppId);
+        if (current.consumerMode !== 'agent') return { kind: 'deny', reason: 'not_sink_owner' };
+        if (currentCfg && vcMeetingConsumerUsesProfiles(currentCfg)) {
+          const selected = current.selectedAgents.find(candidate =>
+            candidate.memberId === projection.memberId
+            && candidate.agentAppId === projection.agentAppId
+            && candidate.status === 'active');
+          if (!selected) return { kind: 'deny', reason: 'not_sink_owner' };
+          if (!(projection.capabilities ?? []).includes('meeting.output.request')) {
+            return { kind: 'deny', reason: 'capability_denied' };
+          }
+          if (!(projection.ownedSinks ?? []).includes(sink)) {
+            return { kind: 'deny', reason: 'not_sink_owner' };
+          }
+          const durable = vcMeetingLatestProfileMember(current, selected.memberId);
+          if (!durable
+            || durable.status !== 'active'
+            || durable.memberEpoch !== projection.memberEpoch
+            || durable.membershipGeneration !== projection.membershipGeneration
+            || durable.sinkOwnerGeneration !== projection.sinkOwnerGeneration) {
+            return { kind: 'deny', reason: 'not_sink_owner' };
+          }
+        } else if (current.selectedAgentAppId !== projection.agentAppId) {
+          return { kind: 'deny', reason: 'not_sink_owner' };
+        }
+        const channel = sink === 'meeting_voice' ? 'voice' : 'text';
+        if (channel === 'text' && !vcMeetingTextOutputAvailable()) {
+          return { kind: 'deny', reason: 'output_policy_denied', detail: VC_MEETING_TEXT_OUTPUT_UNAVAILABLE };
+        }
+        const pending = current.pendingOutputRequests[channel];
+        if (pending && pending.managedAction?.actionId !== action.actionId) {
+          return { kind: 'deny', reason: 'output_policy_denied', detail: `another ${channel} approval is pending` };
+        }
+        const policy = vcMeetingOutputPolicyForChannel(current, channel);
+        if (policy === 'deny') return { kind: 'deny', reason: 'output_policy_denied' };
+        return policy === 'approval' ? { kind: 'approval' } : { kind: 'allow' };
+      },
+    });
+    if (!result.body.ok) return { status: result.status, body: result.body };
+    if (result.body.kind === 'existing') return { status: result.status, body: result.body };
+    const action = result.body.action;
+    const current = vcMeetingSessions.get(vcMeetingSessionKey(action.listenerAppId, action.meetingId));
+    const cfg = effectiveVcMeetingAgentConfig(action.listenerAppId);
+    if (!current || !cfg || current.ended) {
+      if (result.body.kind === 'needsApproval') {
+        finishVcMeetingManagedApprovalCard(config.session.dataDir, {
+          ...vcMeetingManagedActionRef(action),
+          status: 'failed',
+          errorCode: 'listener_session_inactive_before_card',
+        });
+        resolveVcMeetingManagedActionApproval(
+          config.session.dataDir,
+          vcMeetingManagedActionRef(action),
+          'expired',
+          { errorCode: 'listener_session_inactive_before_card' },
+        );
+      } else {
+        finishVcMeetingManagedActionProvider(config.session.dataDir, {
+          ...vcMeetingManagedActionRef(action),
+          status: 'failed',
+          errorCode: 'listener_session_inactive_before_provider',
+        });
+      }
+      return { status: 409, body: { ok: false, errorCode: 'listener_session_inactive' } };
+    }
+    if (result.body.kind === 'needsApproval') {
+      const pending = await presentVcMeetingManagedApproval(current, action, result.body.plan);
+      return { status: pending.ok ? 202 : 503, body: pending };
+    }
+    const sent = await executeVcMeetingManagedProviderPlan(current, cfg, action, result.body.plan);
+    return { status: sent.ok ? 200 : 503, body: sent };
+  };
+
+  if (!session) return execute();
+  session.outputSubmitPromises ??= {};
+  const prior = session.outputSubmitPromises[input.channel] ?? Promise.resolve();
+  const run = prior.catch(() => undefined).then(execute);
+  const tracked = run.catch(() => undefined);
+  session.outputSubmitPromises[input.channel] = tracked;
+  tracked.finally(() => {
+    if (session.outputSubmitPromises?.[input.channel] === tracked) {
+      delete session.outputSubmitPromises[input.channel];
+    }
+  });
+  return run;
 }
 
 function enqueueVcMeetingOutputOperation<T>(
@@ -4639,6 +7118,331 @@ function enqueueVcMeetingOutputOperation<T>(
     }
   });
   return run;
+}
+
+function vcMeetingOutputPlanFromGeneric(
+  plan: VcMeetingGenericProviderExecutionPlan,
+): VcMeetingProviderExecutionPlan | undefined {
+  if (plan.sink !== 'meeting_text' && plan.sink !== 'meeting_voice') return undefined;
+  const content = typeof plan.canonicalInput.content === 'string'
+    ? plan.canonicalInput.content
+    : undefined;
+  const fallbackText = typeof plan.canonicalInput.fallbackText === 'string'
+    ? plan.canonicalInput.fallbackText
+    : undefined;
+  if (!content) return undefined;
+  return {
+    actionId: plan.actionId,
+    inputHash: plan.inputHash,
+    providerKey: plan.providerKey,
+    channel: plan.sink === 'meeting_voice' ? 'voice' : 'text',
+    sink: plan.sink,
+    content,
+    ...(fallbackText ? { fallbackText } : {}),
+    ambiguousRecovery: plan.ambiguousRecovery,
+  };
+}
+
+function vcMeetingApprovalPlanFromGeneric(
+  plan: VcMeetingGenericApprovalPresentationPlan,
+): VcMeetingApprovalPresentationPlan | undefined {
+  if (plan.sink !== 'meeting_text' && plan.sink !== 'meeting_voice') return undefined;
+  const content = typeof plan.canonicalInput.content === 'string'
+    ? plan.canonicalInput.content
+    : undefined;
+  const fallbackText = typeof plan.canonicalInput.fallbackText === 'string'
+    ? plan.canonicalInput.fallbackText
+    : undefined;
+  if (!content) return undefined;
+  return {
+    actionId: plan.actionId,
+    inputHash: plan.inputHash,
+    providerKey: plan.providerKey,
+    channel: plan.sink === 'meeting_voice' ? 'voice' : 'text',
+    content,
+    ...(fallbackText ? { fallbackText } : {}),
+    ...(plan.reason ? { reason: plan.reason } : {}),
+  };
+}
+
+async function submitVcMeetingManagedImAction(input: {
+  origin: NonNullable<DaemonSession['vcMeetingImTurnOrigin']>;
+  channel: VcMeetingOutputChannel;
+  content: string;
+  reason?: string;
+  fallbackText?: string;
+}): Promise<{ status: number; body: unknown }> {
+  const session = vcMeetingSessions.get(
+    vcMeetingSessionKey(input.origin.listenerAppId, input.origin.meetingId),
+  );
+  const execute = async (): Promise<{ status: number; body: unknown }> => {
+    const sink = input.channel === 'voice' ? 'meeting_voice' : 'meeting_text';
+    const result = await requestVcMeetingManagedImAction({
+      origin: input.origin,
+      sink,
+      canonicalInput: {
+        content: input.content,
+        ...(input.fallbackText ? { fallbackText: input.fallbackText } : {}),
+      },
+      ...(input.reason ? { reason: input.reason } : {}),
+    }, {
+      dataDir: config.session.dataDir,
+      selfAgentAppId: input.origin.agentAppId,
+      authorize: ({ projection, sink: requestedSink, action }) => {
+        if (requestedSink !== 'meeting_text' && requestedSink !== 'meeting_voice') {
+          return { kind: 'deny', reason: 'not_sink_owner' };
+        }
+        const current = vcMeetingSessions.get(
+          vcMeetingSessionKey(projection.listenerAppId, projection.meetingId),
+        );
+        if (!current) return { kind: 'deny', reason: 'listener_session_inactive' };
+        if (current.ended) return { kind: 'deny', reason: 'meeting_phase_closed' };
+        const currentCfg = effectiveVcMeetingAgentConfig(projection.listenerAppId);
+        if (current.consumerMode !== 'agent') return { kind: 'deny', reason: 'not_sink_owner' };
+        if (currentCfg && vcMeetingConsumerUsesProfiles(currentCfg)) {
+          const selected = current.selectedAgents.find(candidate =>
+            candidate.memberId === projection.memberId
+            && candidate.agentAppId === projection.agentAppId
+            && candidate.status === 'active');
+          if (!selected) return { kind: 'deny', reason: 'not_sink_owner' };
+          if (!(projection.capabilities ?? []).includes('meeting.output.request')) {
+            return { kind: 'deny', reason: 'capability_denied' };
+          }
+          if (!(projection.ownedSinks ?? []).includes(requestedSink)) {
+            return { kind: 'deny', reason: 'not_sink_owner' };
+          }
+          const durable = vcMeetingLatestProfileMember(current, selected.memberId);
+          if (!durable
+            || durable.status !== 'active'
+            || durable.memberEpoch !== projection.memberEpoch
+            || durable.membershipGeneration !== projection.membershipGeneration
+            || durable.sinkOwnerGeneration !== projection.sinkOwnerGeneration) {
+            return { kind: 'deny', reason: 'not_sink_owner' };
+          }
+        } else if (current.selectedAgentAppId !== projection.agentAppId) {
+          return { kind: 'deny', reason: 'not_sink_owner' };
+        }
+        const channel = requestedSink === 'meeting_voice' ? 'voice' : 'text';
+        if (channel === 'text' && !vcMeetingTextOutputAvailable()) {
+          return { kind: 'deny', reason: 'output_policy_denied', detail: VC_MEETING_TEXT_OUTPUT_UNAVAILABLE };
+        }
+        const pending = current.pendingOutputRequests[channel];
+        if (pending && pending.managedAction?.actionId !== action.actionId) {
+          return { kind: 'deny', reason: 'output_policy_denied', detail: `another ${channel} approval is pending` };
+        }
+        const policy = vcMeetingOutputPolicyForChannel(current, channel);
+        if (policy === 'deny') return { kind: 'deny', reason: 'output_policy_denied' };
+        return policy === 'approval' ? { kind: 'approval' } : { kind: 'allow' };
+      },
+    });
+    if (!result.body.ok || result.body.kind === 'existing') {
+      return { status: result.status, body: result.body };
+    }
+    const action = result.body.action;
+    const current = vcMeetingSessions.get(vcMeetingSessionKey(action.listenerAppId, action.meetingId));
+    const cfg = effectiveVcMeetingAgentConfig(action.listenerAppId);
+    if (!current || !cfg || current.ended) {
+      if (result.body.kind === 'needsApproval') {
+        finishVcMeetingManagedApprovalCard(config.session.dataDir, {
+          ...vcMeetingManagedActionRef(action),
+          status: 'failed',
+          errorCode: 'listener_session_inactive_before_card',
+        });
+        resolveVcMeetingManagedActionApproval(
+          config.session.dataDir,
+          vcMeetingManagedActionRef(action),
+          'expired',
+          { errorCode: 'listener_session_inactive_before_card' },
+        );
+      } else {
+        finishVcMeetingManagedActionProvider(config.session.dataDir, {
+          ...vcMeetingManagedActionRef(action),
+          status: 'failed',
+          errorCode: 'listener_session_inactive_before_provider',
+        });
+      }
+      return { status: 409, body: { ok: false, errorCode: 'listener_session_inactive' } };
+    }
+    if (result.body.kind === 'needsApproval') {
+      const plan = vcMeetingApprovalPlanFromGeneric(result.body.plan);
+      if (!plan) return { status: 422, body: { ok: false, errorCode: 'unsupported_managed_sink' } };
+      const pending = await presentVcMeetingManagedApproval(current, action, plan);
+      return { status: pending.ok ? 202 : 503, body: pending };
+    }
+    const plan = vcMeetingOutputPlanFromGeneric(result.body.plan);
+    if (!plan) return { status: 422, body: { ok: false, errorCode: 'unsupported_managed_sink' } };
+    const sent = await executeVcMeetingManagedProviderPlan(current, cfg, action, plan);
+    return { status: sent.ok ? 200 : 503, body: sent };
+  };
+
+  if (!session) return execute();
+  session.outputSubmitPromises ??= {};
+  const prior = session.outputSubmitPromises[input.channel] ?? Promise.resolve();
+  const run = prior.catch(() => undefined).then(execute);
+  const tracked = run.catch(() => undefined);
+  session.outputSubmitPromises[input.channel] = tracked;
+  tracked.finally(() => {
+    if (session.outputSubmitPromises?.[input.channel] === tracked) {
+      delete session.outputSubmitPromises[input.channel];
+    }
+  });
+  return run;
+}
+
+async function reconcileVcMeetingManagedActionsOnBoot(listenerAppId: string): Promise<void> {
+  const scopes = listVcMeetingActionScopes(config.session.dataDir)
+    .filter((scope) => scope.listenerAppId === listenerAppId);
+  for (const scope of scopes) {
+    const recovered = reconcileVcMeetingActionsOnBoot(config.session.dataDir, scope);
+    for (const action of recovered.terminalizedUnknown) {
+      logger.error(
+        `[vc-action] voice/provider result requires manual review after restart `
+        + `meeting=${action.meetingId} action=${action.actionId}`,
+      );
+    }
+
+    // Stable-key providers are safe to retry after an ambiguous restart.
+    for (const ref of recovered.providerAttempts) {
+      const action = findVcMeetingAction(config.session.dataDir, scope, ref.actionId);
+      if (!action || action.inputHash !== ref.inputHash || action.sink !== 'meeting_text') continue;
+      if (!action.attemptedAt
+        || Date.now() - action.attemptedAt > VC_MEETING_TEXT_PROVIDER_DEDUP_SAFE_MS) {
+        finishVcMeetingManagedActionProvider(config.session.dataDir, {
+          ...vcMeetingManagedActionRef(action),
+          status: 'unknown',
+          errorCode: 'provider_idempotency_window_expired',
+          externalRefs: { providerKey: action.providerKey },
+        });
+        logger.error(
+          `[vc-action] text provider idempotency window expired; manual review required `
+          + `meeting=${scope.meetingId} action=${action.actionId}`,
+        );
+        continue;
+      }
+      const session = vcMeetingSessions.get(vcMeetingSessionKey(scope.listenerAppId, scope.meetingId));
+      const cfg = effectiveVcMeetingAgentConfig(scope.listenerAppId);
+      if (!session || !cfg || session.ended) {
+        finishVcMeetingManagedActionProvider(config.session.dataDir, {
+          ...vcMeetingManagedActionRef(action),
+          status: 'unknown',
+          errorCode: 'listener_session_inactive_during_reconcile',
+          externalRefs: { providerKey: action.providerKey },
+        });
+        continue;
+      }
+      const canonical = action.canonicalInput as { content?: unknown; fallbackText?: unknown };
+      if (typeof canonical.content !== 'string') {
+        finishVcMeetingManagedActionProvider(config.session.dataDir, {
+          ...vcMeetingManagedActionRef(action),
+          status: 'unknown',
+          errorCode: 'invalid_canonical_input_during_reconcile',
+        });
+        continue;
+      }
+      const plan: VcMeetingProviderExecutionPlan = {
+        actionId: action.actionId,
+        inputHash: action.inputHash,
+        providerKey: action.providerKey,
+        channel: 'text',
+        sink: 'meeting_text',
+        content: canonical.content,
+        ambiguousRecovery: 'lookup_or_idempotent_retry',
+      };
+      const result = await executeVcMeetingManagedProviderPlan(session, cfg, action, plan);
+      if (!result.ok) {
+        logger.error(
+          `[vc-action] text provider reconcile still ambiguous meeting=${scope.meetingId} `
+          + `action=${action.actionId}: ${result.error}`,
+        );
+      }
+    }
+
+    const expireRestoredApproval = (action: VcMeetingActionRecord, errorCode: string): void => {
+      if (action.approvalCard?.status === 'attempting') {
+        finishVcMeetingManagedApprovalCard(config.session.dataDir, {
+          ...vcMeetingManagedActionRef(action),
+          status: 'unknown',
+          errorCode: `${errorCode}_card_unknown`,
+        });
+      }
+      resolveVcMeetingManagedActionApproval(
+        config.session.dataDir,
+        vcMeetingManagedActionRef(action),
+        'expired',
+        { errorCode },
+      );
+    };
+
+    // Rebuild pending approval runtime state. The nonce and expiry are derived
+    // from durable action/card identity, so a crash after card presentation but
+    // before the in-memory map write does not orphan an unclickable card.
+    for (const original of listVcMeetingActions(config.session.dataDir, scope)) {
+      if (original.status !== 'pendingApproval' || !original.approvalCard) continue;
+      const originalApprovalCard = original.approvalCard;
+      const session = vcMeetingSessions.get(vcMeetingSessionKey(scope.listenerAppId, scope.meetingId));
+      if (!session || session.ended) {
+        expireRestoredApproval(original, 'listener_session_inactive_on_restore');
+        continue;
+      }
+      const channel: VcMeetingOutputChannel = original.sink === 'meeting_voice' ? 'voice' : 'text';
+      const canonical = original.canonicalInput as { content?: unknown; fallbackText?: unknown };
+      if (typeof canonical.content !== 'string') {
+        expireRestoredApproval(original, 'invalid_approval_input_on_restore');
+        continue;
+      }
+      const plan: VcMeetingApprovalPresentationPlan = {
+        actionId: original.actionId,
+        inputHash: original.inputHash,
+        providerKey: originalApprovalCard.providerKey,
+        channel,
+        content: canonical.content,
+        ...(typeof canonical.fallbackText === 'string' ? { fallbackText: canonical.fallbackText } : {}),
+      };
+      let action = original;
+      if (originalApprovalCard.status === 'requested') {
+        const claimed = claimVcMeetingApprovalCardAttempt(
+          config.session.dataDir,
+          vcMeetingManagedActionRef(action),
+        );
+        if (claimed.kind === 'conflict') {
+          logger.error(`[vc-action] approval restore claim failed action=${action.actionId}: ${claimed.reason}`);
+          continue;
+        }
+        action = claimed.record;
+      }
+      const approvalCard = action.approvalCard;
+      if (!approvalCard) continue;
+      const req = vcMeetingManagedOutputRequest(action, plan, { approval: true });
+      if (Date.now() >= req.expiresAt) {
+        expireRestoredApproval(action, 'approval_expired_during_restart');
+        continue;
+      }
+      if (session.pendingOutputRequests[channel]
+        && session.pendingOutputRequests[channel]?.managedAction?.actionId !== action.actionId) {
+        logger.error(`[vc-action] approval restore collision meeting=${scope.meetingId} channel=${channel}`);
+        expireRestoredApproval(action, 'approval_restore_collision');
+        continue;
+      }
+      if (approvalCard.status === 'presented') {
+        const cardMessageId = approvalCard.externalRefs?.cardMessageId;
+        if (typeof cardMessageId !== 'string' || !cardMessageId) {
+          logger.error(`[vc-action] presented approval lacks cardMessageId action=${action.actionId}`);
+          expireRestoredApproval(action, 'presented_approval_missing_message_id');
+          continue;
+        }
+        req.cardMessageId = cardMessageId;
+        session.pendingOutputRequests[channel] = req;
+        armVcMeetingOutputRequestTimer(vcMeetingSessionKey(session.larkAppId, session.state.meeting.id), req);
+        continue;
+      }
+      if (approvalCard.status === 'attempting') {
+        const presented = await presentVcMeetingManagedApproval(session, action, plan);
+        if (!presented.ok) {
+          logger.error(`[vc-action] approval card reconcile failed action=${action.actionId}: ${presented.error}`);
+        }
+      }
+    }
+  }
 }
 
 async function submitVcMeetingOutputRequest(input: {
@@ -4844,30 +7648,104 @@ async function reviewVcMeetingOutputRequest(input: {
   try {
     clearVcMeetingOutputRequestTimer(req);
     if (input.decision === 'reject') {
-      delete session.pendingOutputRequests[channel];
-      void notifyVcMeetingConsumerAgent(session, `你的 ${channel === 'voice' ? '语音' : '会中弹幕'} 输出请求已被授权人拒绝。`).catch(() => { /* best effort */ });
+      await rejectVcMeetingOutputRequest(
+        session,
+        req,
+        'rejected',
+        req.managedAction
+          ? undefined
+          : `你的 ${channel === 'voice' ? '语音' : '会中弹幕'} 输出请求已被授权人拒绝。`,
+      );
       return vcMeetingOutputReviewCardForRequest(session, req, 'rejected');
     }
+    const resolveManagedApproval = () => {
+      if (!req.managedAction) return undefined;
+      const managedRef = {
+        listenerAppId: req.managedAction.listenerAppId,
+        meetingId: req.managedAction.meetingId,
+        actionId: req.managedAction.actionId,
+        inputHash: req.managedAction.inputHash,
+      };
+      const current = findVcMeetingAction(
+        config.session.dataDir,
+        { listenerAppId: managedRef.listenerAppId, meetingId: managedRef.meetingId },
+        managedRef.actionId,
+      );
+      if (current?.approvalCard?.status === 'attempting') {
+        finishVcMeetingManagedApprovalCard(config.session.dataDir, {
+          ...managedRef,
+          status: 'presented',
+          externalRefs: { operatorInteractionProvedPresentation: true },
+        });
+      }
+      return resolveVcMeetingManagedActionApproval(
+        config.session.dataDir,
+        managedRef,
+        'approved',
+        { externalRefs: { operatorOpenId: input.operatorOpenId } },
+      );
+    };
     if (input.decision === 'allow_text_and_send') {
       if (channel !== 'text') throw new Error('allow_text_and_send only applies to text requests');
       setVcMeetingOutputPolicyForChannel(session, 'text', 'allow');
       persistVcMeetingRuntimeSession(session, cfg);
-      await sendVcMeetingOutputText(session, cfg, req);
+      const managed = resolveManagedApproval();
+      if (managed) {
+        if (managed.kind === 'conflict') throw new Error(`managed approval conflict: ${managed.reason}`);
+        if (managed.kind !== 'execute') {
+          if (managed.action.status !== 'succeeded') {
+            throw new Error(`managed action is ${managed.action.status}, not executable`);
+          }
+        } else {
+          const sent = await executeVcMeetingManagedProviderPlan(session, cfg, managed.action, managed.plan);
+          if (!sent.ok) throw new Error(sent.error);
+        }
+      } else {
+        await sendVcMeetingOutputText(session, cfg, req);
+      }
       delete session.pendingOutputRequests[channel];
-      void notifyVcMeetingConsumerAgent(session, '你的会中弹幕输出请求已发送；本场会议后续会中弹幕输出将自动发送，无需逐条审批。').catch(() => { /* best effort */ });
+      if (!req.managedAction) {
+        void notifyVcMeetingConsumerAgent(session, '你的会中弹幕输出请求已发送；本场会议后续会中弹幕输出将自动发送，无需逐条审批。').catch(() => { /* best effort */ });
+      }
       return vcMeetingOutputReviewCardForRequest(session, req, 'sentText');
     }
     if (input.decision === 'send_text') {
-      await sendVcMeetingOutputText(session, cfg, req);
+      const managed = resolveManagedApproval();
+      if (managed) {
+        if (managed.kind === 'conflict') throw new Error(`managed approval conflict: ${managed.reason}`);
+        if (managed.kind !== 'execute') {
+          if (managed.action.status !== 'succeeded') {
+            throw new Error(`managed action is ${managed.action.status}, not executable`);
+          }
+        } else {
+          const sent = await executeVcMeetingManagedProviderPlan(
+            session,
+            cfg,
+            managed.action,
+            managed.plan,
+            { forceText: true },
+          );
+          if (!sent.ok) throw new Error(sent.error);
+        }
+      } else {
+        await sendVcMeetingOutputText(session, cfg, req);
+      }
       delete session.pendingOutputRequests[channel];
-      void notifyVcMeetingConsumerAgent(session, channel === 'voice'
-        ? '你的语音输出请求已被授权人改为会中弹幕发送。'
-        : '你的会中弹幕输出请求已由授权人同意并发送。').catch(() => { /* best effort */ });
+      if (!req.managedAction) {
+        void notifyVcMeetingConsumerAgent(session, channel === 'voice'
+          ? '你的语音输出请求已被授权人改为会中弹幕发送。'
+          : '你的会中弹幕输出请求已由授权人同意并发送。').catch(() => { /* best effort */ });
+      }
       return vcMeetingOutputReviewCardForRequest(session, req, 'sentText');
     }
     if (input.decision === 'approve_voice' || input.decision === 'allow_voice_and_approve') {
       if (channel !== 'voice') throw new Error('voice approval only applies to voice requests');
       const allowFutureVoice = input.decision === 'allow_voice_and_approve';
+      const managed = resolveManagedApproval();
+      if (managed?.kind === 'conflict') throw new Error(`managed approval conflict: ${managed.reason}`);
+      if (managed && managed.kind !== 'execute' && managed.action.status !== 'succeeded') {
+        throw new Error(`managed action is ${managed.action.status}, not executable`);
+      }
       if (allowFutureVoice) {
         setVcMeetingOutputPolicyForChannel(session, 'voice', 'allow');
         persistVcMeetingRuntimeSession(session, cfg);
@@ -4875,14 +7753,21 @@ async function reviewVcMeetingOutputRequest(input: {
       keepApplying = true;
       const applyVoiceApproval = async () => {
         try {
-          await speakVcMeetingOutput(session, cfg, req);
+          if (managed?.kind === 'execute') {
+            const sent = await executeVcMeetingManagedProviderPlan(session, cfg, managed.action, managed.plan);
+            if (!sent.ok) throw new Error(sent.error);
+          } else if (!managed) {
+            await speakVcMeetingOutput(session, cfg, req);
+          }
           if (session.pendingOutputRequests[channel]?.id === req.id) delete session.pendingOutputRequests[channel];
           await patchVcMeetingOutputReviewCard(session, req, 'sentVoice').catch((err) => {
             logger.warn(`[vc-agent] output review card patch failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
           });
-          void notifyVcMeetingConsumerAgent(session, allowFutureVoice
-            ? '你的语音输出请求已播报；本场会议后续语音输出将自动执行，无需逐条审批。'
-            : '你的语音输出请求已由授权人同意并播报。').catch(() => { /* best effort */ });
+          if (!req.managedAction) {
+            void notifyVcMeetingConsumerAgent(session, allowFutureVoice
+              ? '你的语音输出请求已播报；本场会议后续语音输出将自动执行，无需逐条审批。'
+              : '你的语音输出请求已由授权人同意并播报。').catch(() => { /* best effort */ });
+          }
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           logger.warn(`[vc-agent] approved voice output failed meeting=${input.meetingId} request=${input.requestId}: ${message}`);
@@ -5024,6 +7909,24 @@ function shouldInjectVcMeetingConsumerBatch(
   return nowMs - session.consumerLastInjectedAtMs >= vcMeetingConsumerMaxInjectIntervalMs(cfg);
 }
 
+function shouldInjectVcMeetingConsumerBatchForMember(
+  state: VcMeetingConsumerMemberVolatileState,
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  items: NormalizedVcMeetingItem[],
+  lines: string[],
+  opts: { final?: boolean; nowMs?: number } = {},
+): boolean {
+  if (opts.final) return true;
+  if (items.length === 0 || lines.length === 0) return false;
+  if (vcMeetingConsumerHasFastSignal(session, cfg, items)) return true;
+  if (items.length >= vcMeetingConsumerMinBatchItems(cfg)) return true;
+  if (vcMeetingConsumerBatchTextChars(items) >= vcMeetingConsumerMinBatchChars(cfg)) return true;
+  const nowMs = opts.nowMs ?? Date.now();
+  state.lastInjectedAtMs ??= nowMs;
+  return nowMs - state.lastInjectedAtMs >= vcMeetingConsumerMaxInjectIntervalMs(cfg);
+}
+
 function vcMeetingConsumerActorTrustLabel(
   isInstructionSource: VcMeetingInstructionSourceMatcher,
   actor: Pick<VcMeetingActor, 'openId' | 'unionId' | 'name'> | undefined,
@@ -5148,60 +8051,1944 @@ function buildVcMeetingConsumerInstruction(opts: {
   return lines.join('\n');
 }
 
-function buildVcMeetingConsumerTriggerRequest(input: {
-  session: VcMeetingDaemonSession;
-  cfg: VcMeetingAgentConfig;
-  agentAppId: string;
-  listenerChatId: string;
-  items: NormalizedVcMeetingItem[];
-  lines: string[];
-  final?: boolean;
-}): TriggerRequest {
-  const meeting = input.session.state.meeting;
-  const requestId = `vc_${meeting.id.slice(-12)}_${Date.now().toString(36)}`;
+function vcMeetingResponseRecord(body: unknown): Record<string, unknown> | undefined {
+  return body && typeof body === 'object' && !Array.isArray(body)
+    ? body as Record<string, unknown>
+    : undefined;
+}
+
+async function postVcMeetingMemberProjection(
+  agentAppId: string,
+  request: VcMeetingMemberProjectionRequest,
+): Promise<{ status: number; body: unknown }> {
+  if (vcMeetingConsumerUsesLocalReceiver(agentAppId)) {
+    const result = await registerVcMeetingMember(request, vcMeetingDeliveryReceiverDeps(agentAppId));
+    return { status: result.status, body: result.body };
+  }
+  return fetchVcMeetingDaemonJson(agentAppId, '/api/vc-meetings/members/register', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+}
+
+async function postVcMeetingDelivery(
+  agentAppId: string,
+  request: VcMeetingDeliveryRequest,
+): Promise<{ status: number; body: unknown }> {
+  if (vcMeetingConsumerUsesLocalReceiver(agentAppId)) {
+    if (agentAppId === selfDaemonLarkAppId
+      && (isVcMeetingBootRecoveryBlocked(request)
+        || vcMeetingRuntimeLeaseRecovery.isBlocked(request))) {
+      return {
+        status: 503,
+        body: {
+          ok: false,
+          errorCode: 'receiver_recovery_in_progress',
+          error: 'this receiver session is fencing an ambiguous turn; retry later',
+        },
+      };
+    }
+    const result = await receiveVcMeetingDelivery(request, vcMeetingDeliveryReceiverDeps(agentAppId));
+    return { status: result.status, body: result.body };
+  }
+  return fetchVcMeetingDaemonJson(agentAppId, '/api/vc-meetings/deliver', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+}
+
+function vcMeetingLatestSingleConsumerMember(
+  session: VcMeetingDaemonSession,
+): VcMeetingHubMemberRecord | undefined {
+  return listVcMeetingHubMembers(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+  })
+    .filter(member => member.memberId === VC_MEETING_SINGLE_CONSUMER_MEMBER_ID)
+    .sort((a, b) => b.memberEpoch - a.memberEpoch || b.membershipGeneration - a.membershipGeneration)[0];
+}
+
+function vcMeetingLatestProfileMember(
+  session: VcMeetingDaemonSession,
+  memberId: string,
+): VcMeetingHubMemberRecord | undefined {
+  return listVcMeetingHubMembers(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+  })
+    .filter(member => member.memberId === memberId)
+    .sort((a, b) => b.memberEpoch - a.memberEpoch || b.membershipGeneration - a.membershipGeneration)[0];
+}
+
+function vcMeetingRuntimeAgentForProfile(
+  profile: VcMeetingConsumerProfileConfig,
+  status: VcMeetingRuntimeSelectedAgent['status'],
+  opts: { activationError?: string; deliveryProfileHash?: string } = {},
+): VcMeetingRuntimeSelectedAgent {
+  const filter = vcMeetingCanonicalProfileFilter(profile);
   return {
-    source: {
-      type: 'vc_meeting',
-      connectorId: 'vc-meeting-consumer',
-      requestId,
-      receivedAt: new Date().toISOString(),
-    },
-    target: {
-      kind: 'turn',
-      botId: input.agentAppId,
-      chatId: input.listenerChatId,
-    },
-    envelope: {
-      format: 'botmux.vc-meeting.consumer.v1',
-      sourceName: 'VC Meeting',
-      trusted: false,
-      headers: {
-        larkAppId: input.session.larkAppId,
-        meetingId: meeting.id,
-        final: input.final === true,
-      },
-      payload: {
-        meeting,
-        final: input.final === true,
-        // 结构化 items 不再随 envelope 注入：rawText 的人读行已含 LLM 需要的
-        // 全部信息（时间、说话人、信任标注、文本），双份只会放大 paste 体积。
-        itemCount: input.items.length,
-      },
-      rawText: input.lines.join('\n'),
-    },
-    instruction: buildVcMeetingConsumerInstruction({
-      larkAppId: input.session.larkAppId,
-      meetingId: meeting.id,
-      textPolicy: input.session.textOutputPolicy,
-      textOutputAvailable: vcMeetingTextOutputAvailable(),
-      voicePolicy: input.session.voiceOutputPolicy,
-      final: input.final,
-      brief: input.session.consumerFullInstructionSent === true,
-    }),
-    options: {
-      dedupKey: requestId,
-    },
+    profileId: profile.id,
+    memberId: profile.id,
+    agentAppId: profile.agentAppId,
+    ...(profile.label ? { label: profile.label } : {}),
+    role: profile.role,
+    ...(profile.instructions ? { instructions: profile.instructions } : {}),
+    status,
+    ...(opts.activationError ? { activationError: opts.activationError.slice(0, 500) } : {}),
+    ...(filter ? { filter } : {}),
+    responseMode: profile.responseMode,
+    capabilities: vcMeetingCanonicalProfileCapabilities(profile),
+    ownedSinks: vcMeetingCanonicalProfileOwnedSinks(profile),
+    deliveryProfileHash: opts.deliveryProfileHash ?? vcMeetingConsumerProfileHash(profile),
   };
+}
+
+/** Rehydrate the exact immutable profile snapshot selected for this member
+ * epoch. Current bots.json is only authoritative for a first join/re-add; an
+ * edit or deletion must not rewrite an in-flight meeting after restart. */
+function vcMeetingProfileFromRuntimeAgent(
+  selected: VcMeetingRuntimeSelectedAgent,
+): VcMeetingConsumerProfileConfig {
+  return {
+    id: selected.profileId,
+    agentAppId: selected.agentAppId,
+    ...(selected.label ? { label: selected.label } : {}),
+    role: selected.role,
+    ...(selected.instructions ? { instructions: selected.instructions } : {}),
+    ...(selected.filter ? { filter: selected.filter } : {}),
+    responseMode: selected.responseMode,
+    capabilities: [...selected.capabilities],
+    ...(selected.ownedSinks.length > 0 ? { ownedSinks: [...selected.ownedSinks] } : {}),
+  };
+}
+
+function vcMeetingSessionUsesProfileMembers(
+  session: Pick<VcMeetingDaemonSession, 'selectedAgents'>,
+  cfg?: VcMeetingAgentConfig,
+): boolean {
+  return session.selectedAgents.length > 0 || (!!cfg && vcMeetingConsumerUsesProfiles(cfg));
+}
+
+function vcMeetingConsumerProfileResolutionForSession(
+  session: Pick<VcMeetingDaemonSession, 'selectedAgents'>,
+  cfg: VcMeetingAgentConfig,
+  selectedProfileIds?: readonly string[],
+) {
+  if (session.selectedAgents.length === 0) {
+    return vcMeetingConsumerProfileResolution(cfg, selectedProfileIds);
+  }
+  const profilesById = new Map(
+    (cfg.meetingConsumer?.consumerProfiles ?? []).map(profile => [profile.id, profile] as const),
+  );
+  for (const selected of session.selectedAgents) {
+    profilesById.set(selected.profileId, vcMeetingProfileFromRuntimeAgent(selected));
+  }
+  const defaultConsumerIds = (cfg.meetingConsumer?.defaultConsumerIds ?? [])
+    .filter(id => profilesById.has(id));
+  const resolution = resolveVcMeetingConsumerProfiles({
+    enabled: cfg.meetingConsumer?.enabled,
+    defaultMode: cfg.meetingConsumer?.defaultMode === 'agents' && defaultConsumerIds.length > 0
+      ? 'agents'
+      : 'listenOnly',
+    defaultConsumerIds,
+    consumerProfiles: [...profilesById.values()],
+  }, selectedProfileIds);
+  if (!resolution.ok || resolution.source !== 'profiles') {
+    throw new Error(resolution.ok
+      ? 'meeting consumer is not configured for profiles'
+      : resolution.errors.join('; '));
+  }
+  return resolution;
+}
+
+async function ensureVcMeetingProfileMember(
+  session: VcMeetingDaemonSession,
+  profile: VcMeetingConsumerProfileConfig,
+  listenerChatId: string,
+  opts: { deliveryProfileHash?: string } = {},
+): Promise<VcMeetingHubMemberRecord> {
+  const memberId = profile.id;
+  // Existing member epochs carry their content-addressed identity in runtime
+  // state. Preserve that exact value across restore/status transitions instead
+  // of recomputing it with the current binary's hash implementation; this
+  // keeps future hash-format upgrades from silently churning a live epoch.
+  const profileHash = opts.deliveryProfileHash ?? vcMeetingConsumerProfileHash(profile);
+  const instructions = profile.instructions;
+  const canonicalFilter = vcMeetingCanonicalProfileFilter(profile);
+  const canonicalCapabilities = vcMeetingCanonicalProfileCapabilities(profile);
+  const canonicalOwnedSinks = vcMeetingCanonicalProfileOwnedSinks(profile);
+  const allMeetingMembers = listVcMeetingHubMembers(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+  });
+  const all = allMeetingMembers.filter(member => member.memberId === memberId);
+  const allReceiverProjections = listVcMeetingMemberProjections(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+  });
+  const receiverPrior = allReceiverProjections
+    .filter(member => member.memberId === memberId)
+    .sort((a, b) => b.memberEpoch - a.memberEpoch || b.membershipGeneration - a.membershipGeneration)[0];
+  const prior = vcMeetingLatestProfileMember(session, memberId);
+  const sameStreamSemantics = !!prior
+    && prior.agentAppId === profile.agentAppId
+    && prior.role === profile.role
+    && prior.instructions === instructions
+    && prior.outputChatId === listenerChatId
+    && prior.deliveryProfileHash === profileHash
+    && JSON.stringify(prior.filter ?? {}) === JSON.stringify(canonicalFilter ?? {});
+  const sameOwnedSinks = !!prior
+    && JSON.stringify(prior.ownedSinks) === JSON.stringify(canonicalOwnedSinks);
+  const samePolicy = sameStreamSemantics
+    && prior.responseMode === profile.responseMode
+    && JSON.stringify(prior.capabilities) === JSON.stringify(canonicalCapabilities)
+    && sameOwnedSinks;
+  // Receiver registration commits before the hub projection. A crash in that
+  // window leaves the receiver owning the epoch/session while the hub has no
+  // record for it. Treat that exact active projection as the pending commit:
+  // recomputing joinedAtIngestSeq from a later feed watermark would submit
+  // different content under the already-used generation and be fenced as a
+  // projection_conflict forever.
+  const orphanedReceiver = receiverPrior
+    && receiverPrior.status === 'active'
+    && !all.some(member => member.memberEpoch === receiverPrior.memberEpoch)
+    && receiverPrior.agentAppId === profile.agentAppId
+    && receiverPrior.role === profile.role
+    && receiverPrior.instructions === instructions
+    && receiverPrior.outputChatId === listenerChatId
+    && receiverPrior.responseMode === profile.responseMode
+    && JSON.stringify(receiverPrior.filter ?? {}) === JSON.stringify(canonicalFilter ?? {})
+    && JSON.stringify(receiverPrior.capabilities) === JSON.stringify(canonicalCapabilities)
+    && JSON.stringify(receiverPrior.ownedSinks) === JSON.stringify(canonicalOwnedSinks)
+    ? receiverPrior
+    : undefined;
+  const reuseEpoch = sameStreamSemantics && prior.status !== 'removed';
+  const receiverMemberProjections = allReceiverProjections.filter(member => member.memberId === memberId);
+  const maxEpoch = [...all, ...receiverMemberProjections]
+    .reduce((max, member) => Math.max(max, member.memberEpoch), 0);
+  const maxGeneration = [...all, ...receiverMemberProjections]
+    .reduce((max, member) => Math.max(max, member.membershipGeneration), 0);
+  const maxSinkOwnerGeneration = [...allMeetingMembers, ...allReceiverProjections].reduce(
+    (max, member) => Math.max(max, member.sinkOwnerGeneration ?? 0),
+    0,
+  );
+  const memberEpoch = orphanedReceiver?.memberEpoch
+    ?? (reuseEpoch ? prior.memberEpoch : maxEpoch + 1);
+  const membershipGeneration = orphanedReceiver?.membershipGeneration
+    ?? (reuseEpoch
+      ? (prior.status === 'active' && samePolicy ? prior.membershipGeneration : maxGeneration + 1)
+      : maxGeneration + 1);
+  // Every new profile epoch starts from the canonical ingest high-water. A
+  // first join and a re-add have the same from-now semantics; replaying the
+  // pre-membership journal would recreate effects under a fresh epoch.
+  const joinedAtIngestSeq = orphanedReceiver?.joinedAtIngestSeq
+    ?? (reuseEpoch
+      ? prior.joinedAtIngestSeq
+      : getVcMeetingFeedMetadataState(config.session.dataDir, {
+        listenerAppId: session.larkAppId,
+        meetingId: session.state.meeting.id,
+      }).nextIngestSeq - 1);
+  const sinkOwnerGeneration = orphanedReceiver?.sinkOwnerGeneration
+    ?? (reuseEpoch && sameOwnedSinks
+      ? prior.sinkOwnerGeneration
+      : maxSinkOwnerGeneration + 1);
+  const ownerBootId = getDaemonBootId();
+  const projectionFilter = orphanedReceiver?.filter ?? canonicalFilter;
+  const projectionCapabilities = orphanedReceiver?.capabilities ?? canonicalCapabilities;
+  const projectionOwnedSinks = orphanedReceiver?.ownedSinks ?? canonicalOwnedSinks;
+  const policy = {
+    ...(projectionFilter ? { filter: projectionFilter } : {}),
+    capabilities: projectionCapabilities,
+    ownedSinks: projectionOwnedSinks,
+    sinkOwnerGeneration,
+  };
+  const projection: VcMeetingMemberProjectionRequest = {
+    schemaVersion: 1,
+    meeting: {
+      listenerAppId: session.larkAppId,
+      meetingId: session.state.meeting.id,
+      ownerBootId,
+      ownerEpoch: VC_MEETING_SINGLE_CONSUMER_OWNER_EPOCH,
+    },
+    member: {
+      memberId,
+      agentAppId: orphanedReceiver?.agentAppId ?? profile.agentAppId,
+      role: orphanedReceiver?.role ?? profile.role,
+      ...((orphanedReceiver?.instructions ?? instructions)
+        ? { instructions: orphanedReceiver?.instructions ?? instructions }
+        : {}),
+      epoch: memberEpoch,
+      membershipGeneration,
+      status: 'active',
+      joinedAtIngestSeq,
+      responseMode: orphanedReceiver?.responseMode ?? profile.responseMode,
+      ...policy,
+    },
+    outputRoute: { chatId: orphanedReceiver?.outputChatId ?? listenerChatId },
+  };
+  const receiver = await postVcMeetingMemberProjection(profile.agentAppId, projection);
+  const body = vcMeetingResponseRecord(receiver.body);
+  if (receiver.status < 200 || receiver.status >= 300 || body?.ok !== true) {
+    const code = typeof body?.errorCode === 'string' ? body.errorCode : `http_${receiver.status}`;
+    const detail = typeof body?.error === 'string' ? body.error : 'receiver rejected membership';
+    throw new Error(`meeting receiver registration failed (${code}): ${detail}`);
+  }
+  const receiverSessionId = typeof body.receiverSessionId === 'string'
+    ? body.receiverSessionId.trim()
+    : '';
+  if (!receiverSessionId) throw new Error('meeting receiver registration returned no receiverSessionId');
+  if (orphanedReceiver && receiverSessionId !== orphanedReceiver.receiverSessionId) {
+    throw new Error('meeting receiver registration changed the orphaned epoch session binding');
+  }
+  const applied = applyVcMeetingHubMemberProjection(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+    ownerBootId,
+    ownerEpoch: VC_MEETING_SINGLE_CONSUMER_OWNER_EPOCH,
+    memberId,
+    memberEpoch,
+    agentAppId: orphanedReceiver?.agentAppId ?? profile.agentAppId,
+    role: orphanedReceiver?.role ?? profile.role,
+    ...((orphanedReceiver?.instructions ?? instructions)
+      ? { instructions: orphanedReceiver?.instructions ?? instructions }
+      : {}),
+    deliveryProfileHash: profileHash,
+    membershipGeneration,
+    status: 'active',
+    responseMode: orphanedReceiver?.responseMode ?? profile.responseMode,
+    ...policy,
+    joinedAtIngestSeq,
+    receiverSessionId,
+    outputChatId: orphanedReceiver?.outputChatId ?? listenerChatId,
+  });
+  if (!applied.ok) {
+    throw new Error(`meeting hub membership projection rejected: ${applied.reason}${applied.detail ? ` (${applied.detail})` : ''}`);
+  }
+  return applied.record;
+}
+
+async function ensureVcMeetingSingleConsumerMember(
+  session: VcMeetingDaemonSession,
+  agentAppId: string,
+  listenerChatId: string,
+): Promise<VcMeetingHubMemberRecord> {
+  const prior = vcMeetingLatestSingleConsumerMember(session);
+  const all = listVcMeetingHubMembers(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+  }).filter(member => member.memberId === VC_MEETING_SINGLE_CONSUMER_MEMBER_ID);
+  const maxEpoch = all.reduce((max, member) => Math.max(max, member.memberEpoch), 0);
+  const maxGeneration = all.reduce((max, member) => Math.max(max, member.membershipGeneration), 0);
+  const reuseEpoch = !!prior
+    && prior.agentAppId === agentAppId
+    && prior.outputChatId === listenerChatId
+    && prior.status !== 'removed';
+  const memberEpoch = reuseEpoch ? prior.memberEpoch : maxEpoch + 1;
+  const membershipGeneration = reuseEpoch
+    ? (prior.status === 'active' ? prior.membershipGeneration : maxGeneration + 1)
+    : maxGeneration + 1;
+  // The first legacy member may consume context buffered before selection.
+  // Every later epoch (agent switch/re-add) is from-now so a new role owner
+  // cannot replay old meeting input and recreate already-applied effects.
+  const joinedAtIngestSeq = reuseEpoch
+    ? prior.joinedAtIngestSeq
+    : prior
+      ? getVcMeetingFeedMetadataState(config.session.dataDir, {
+          listenerAppId: session.larkAppId,
+          meetingId: session.state.meeting.id,
+        }).nextIngestSeq - 1
+      : 0;
+  const ownerBootId = getDaemonBootId();
+  const projection: VcMeetingMemberProjectionRequest = {
+    schemaVersion: 1,
+    meeting: {
+      listenerAppId: session.larkAppId,
+      meetingId: session.state.meeting.id,
+      ownerBootId,
+      ownerEpoch: VC_MEETING_SINGLE_CONSUMER_OWNER_EPOCH,
+    },
+    member: {
+      memberId: VC_MEETING_SINGLE_CONSUMER_MEMBER_ID,
+      agentAppId,
+      role: VC_MEETING_SINGLE_CONSUMER_ROLE,
+      epoch: memberEpoch,
+      membershipGeneration,
+      status: 'active',
+      joinedAtIngestSeq,
+      responseMode: 'listener_thread',
+    },
+    outputRoute: { chatId: listenerChatId },
+  };
+  const receiver = await postVcMeetingMemberProjection(agentAppId, projection);
+  const body = vcMeetingResponseRecord(receiver.body);
+  if (receiver.status < 200 || receiver.status >= 300 || body?.ok !== true) {
+    const code = typeof body?.errorCode === 'string' ? body.errorCode : `http_${receiver.status}`;
+    const detail = typeof body?.error === 'string' ? body.error : 'receiver rejected membership';
+    throw new Error(`meeting receiver registration failed (${code}): ${detail}`);
+  }
+  const receiverSessionId = typeof body.receiverSessionId === 'string'
+    ? body.receiverSessionId.trim()
+    : '';
+  if (!receiverSessionId) throw new Error('meeting receiver registration returned no receiverSessionId');
+  const applied = applyVcMeetingHubMemberProjection(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+    ownerBootId,
+    ownerEpoch: VC_MEETING_SINGLE_CONSUMER_OWNER_EPOCH,
+    memberId: VC_MEETING_SINGLE_CONSUMER_MEMBER_ID,
+    memberEpoch,
+    agentAppId,
+    role: VC_MEETING_SINGLE_CONSUMER_ROLE,
+    deliveryProfileHash: VC_MEETING_SINGLE_CONSUMER_PROFILE_HASH,
+    membershipGeneration,
+    status: 'active',
+    responseMode: 'listener_thread',
+    joinedAtIngestSeq: projection.member.joinedAtIngestSeq,
+    receiverSessionId,
+    outputChatId: listenerChatId,
+  });
+  if (!applied.ok) {
+    throw new Error(`meeting hub membership projection rejected: ${applied.reason}${applied.detail ? ` (${applied.detail})` : ''}`);
+  }
+  return applied.record;
+}
+
+async function pauseVcMeetingSingleConsumerMembership(
+  session: VcMeetingDaemonSession,
+): Promise<void> {
+  const prior = vcMeetingLatestSingleConsumerMember(session);
+  if (!prior || prior.status !== 'active') return;
+  const ownerBootId = getDaemonBootId();
+  const membershipGeneration = prior.membershipGeneration + 1;
+  const applied = applyVcMeetingHubMemberProjection(config.session.dataDir, {
+    listenerAppId: prior.listenerAppId,
+    meetingId: prior.meetingId,
+    memberId: prior.memberId,
+    memberEpoch: prior.memberEpoch,
+    ownerBootId,
+    ownerEpoch: prior.ownerEpoch,
+    agentAppId: prior.agentAppId,
+    role: prior.role,
+    ...(prior.instructions ? { instructions: prior.instructions } : {}),
+    deliveryProfileHash: prior.deliveryProfileHash,
+    membershipGeneration,
+    status: 'paused',
+    responseMode: prior.responseMode,
+    joinedAtIngestSeq: prior.joinedAtIngestSeq,
+    receiverSessionId: prior.receiverSessionId,
+    outputChatId: prior.outputChatId,
+  });
+  if (!applied.ok) throw new Error(`hub pause rejected: ${applied.reason}`);
+  const receiver = await postVcMeetingMemberProjection(prior.agentAppId, {
+    schemaVersion: 1,
+    meeting: {
+      listenerAppId: prior.listenerAppId,
+      meetingId: prior.meetingId,
+      ownerBootId,
+      ownerEpoch: prior.ownerEpoch,
+    },
+    member: {
+      memberId: prior.memberId,
+      agentAppId: prior.agentAppId,
+      role: prior.role,
+      ...(prior.instructions ? { instructions: prior.instructions } : {}),
+      epoch: prior.memberEpoch,
+      membershipGeneration,
+      status: 'paused',
+      joinedAtIngestSeq: prior.joinedAtIngestSeq,
+      responseMode: prior.responseMode,
+    },
+    outputRoute: { chatId: prior.outputChatId },
+  });
+  const body = vcMeetingResponseRecord(receiver.body);
+  if (receiver.status < 200 || receiver.status >= 300 || body?.ok !== true) {
+    throw new Error(`receiver pause rejected: ${String(body?.errorCode ?? receiver.status)}`);
+  }
+}
+
+async function pauseVcMeetingProfileMembership(
+  session: VcMeetingDaemonSession,
+  selected: VcMeetingRuntimeSelectedAgent,
+): Promise<void> {
+  const prior = vcMeetingLatestProfileMember(session, selected.memberId);
+  if (!prior || prior.status === 'removed') return;
+  const memberKey = {
+    listenerAppId: prior.listenerAppId,
+    meetingId: prior.meetingId,
+    memberId: prior.memberId,
+    memberEpoch: prior.memberEpoch,
+  };
+  const receiverPrior = getVcMeetingMemberProjection(config.session.dataDir, memberKey);
+  const ownerBootId = getDaemonBootId();
+  const maxGeneration = Math.max(
+    prior.membershipGeneration,
+    receiverPrior?.membershipGeneration ?? 0,
+  );
+  const maxGenerationStillActive = [prior, receiverPrior]
+    .some(record => record?.membershipGeneration === maxGeneration && record.status === 'active');
+  // A crash can happen after the runtime pause intent, after only the hub
+  // projection, or after both projections. Reuse a paused high-water when one
+  // side already committed it; otherwise advance once so an active projection
+  // at the high-water cannot conflict with the desired paused state.
+  const membershipGeneration = maxGenerationStillActive
+    ? maxGeneration + 1
+    : maxGeneration;
+  const policy = {
+    ...(prior.filter ? { filter: prior.filter } : {}),
+    capabilities: prior.capabilities,
+    ownedSinks: prior.ownedSinks,
+    sinkOwnerGeneration: prior.sinkOwnerGeneration,
+  };
+  const applied = applyVcMeetingHubMemberProjection(config.session.dataDir, {
+    ...memberKey,
+    ownerBootId,
+    ownerEpoch: prior.ownerEpoch,
+    agentAppId: prior.agentAppId,
+    role: prior.role,
+    ...(prior.instructions ? { instructions: prior.instructions } : {}),
+    deliveryProfileHash: prior.deliveryProfileHash,
+    membershipGeneration,
+    status: 'paused',
+    responseMode: prior.responseMode,
+    ...policy,
+    joinedAtIngestSeq: prior.joinedAtIngestSeq,
+    receiverSessionId: prior.receiverSessionId,
+    outputChatId: prior.outputChatId,
+  });
+  if (!applied.ok) throw new Error(`hub profile pause rejected: ${applied.reason}`);
+  const receiver = await postVcMeetingMemberProjection(prior.agentAppId, {
+    schemaVersion: 1,
+    meeting: {
+      listenerAppId: prior.listenerAppId,
+      meetingId: prior.meetingId,
+      ownerBootId,
+      ownerEpoch: prior.ownerEpoch,
+    },
+    member: {
+      memberId: prior.memberId,
+      agentAppId: prior.agentAppId,
+      role: prior.role,
+      ...(prior.instructions ? { instructions: prior.instructions } : {}),
+      epoch: prior.memberEpoch,
+      membershipGeneration,
+      status: 'paused',
+      joinedAtIngestSeq: prior.joinedAtIngestSeq,
+      responseMode: prior.responseMode,
+      ...policy,
+    },
+    outputRoute: { chatId: prior.outputChatId },
+  });
+  const body = vcMeetingResponseRecord(receiver.body);
+  if (receiver.status < 200 || receiver.status >= 300 || body?.ok !== true) {
+    throw new Error(`receiver profile pause rejected: ${String(body?.errorCode ?? receiver.status)}`);
+  }
+}
+
+function retireVcMeetingSingleConsumerForRecovery(
+  session: VcMeetingDaemonSession,
+  reason: string,
+): boolean {
+  const member = vcMeetingLatestSingleConsumerMember(session);
+  if (!member) return false;
+  const memberKey = {
+    listenerAppId: member.listenerAppId,
+    meetingId: member.meetingId,
+    memberId: member.memberId,
+    memberEpoch: member.memberEpoch,
+  };
+  const receiverProjection = getVcMeetingMemberProjection(config.session.dataDir, memberKey);
+  abandonVcMeetingDeliveryStream(config.session.dataDir, memberKey, { reason });
+  const membershipGeneration = Math.max(
+    member.membershipGeneration,
+    receiverProjection?.membershipGeneration ?? 0,
+  ) + 1;
+  const ownerBootId = getDaemonBootId();
+  const receiverRemoved = applyVcMeetingMemberProjection(config.session.dataDir, {
+    ...memberKey,
+    ownerBootId,
+    ownerEpoch: member.ownerEpoch,
+    agentAppId: member.agentAppId,
+    role: member.role,
+    ...(member.instructions ? { instructions: member.instructions } : {}),
+    membershipGeneration,
+    status: 'removed',
+    responseMode: member.responseMode,
+    joinedAtIngestSeq: member.joinedAtIngestSeq,
+    receiverSessionId: member.receiverSessionId,
+    outputChatId: member.outputChatId,
+  });
+  if (!receiverRemoved.ok && receiverRemoved.reason !== 'epoch_removed') {
+    logger.error(
+      `[vc-agent] receiver recovery retirement rejected meeting=${member.meetingId}: ${receiverRemoved.reason}`,
+    );
+    return false;
+  }
+  const hubRemoved = applyVcMeetingHubMemberProjection(config.session.dataDir, {
+    ...memberKey,
+    ownerBootId,
+    ownerEpoch: member.ownerEpoch,
+    agentAppId: member.agentAppId,
+    role: member.role,
+    ...(member.instructions ? { instructions: member.instructions } : {}),
+    deliveryProfileHash: member.deliveryProfileHash,
+    membershipGeneration,
+    status: 'removed',
+    responseMode: member.responseMode,
+    joinedAtIngestSeq: member.joinedAtIngestSeq,
+    receiverSessionId: member.receiverSessionId,
+    outputChatId: member.outputChatId,
+  });
+  if (!hubRemoved.ok && hubRemoved.reason !== 'epoch_removed') {
+    logger.error(
+      `[vc-agent] hub recovery retirement rejected meeting=${member.meetingId}: ${hubRemoved.reason}`,
+    );
+    return false;
+  }
+  logger.error(
+    `[vc-agent] retired unresolved consumer epoch meeting=${member.meetingId} `
+    + `memberEpoch=${member.memberEpoch} reason=${reason}`,
+  );
+  return true;
+}
+
+function retireVcMeetingProfileMemberForRecovery(
+  member: VcMeetingHubMemberRecord,
+  reason: string,
+): boolean {
+  if (member.status === 'removed' || member.finalAckedAt !== undefined) return true;
+  const memberKey = {
+    listenerAppId: member.listenerAppId,
+    meetingId: member.meetingId,
+    memberId: member.memberId,
+    memberEpoch: member.memberEpoch,
+  };
+  const receiverProjection = getVcMeetingMemberProjection(config.session.dataDir, memberKey);
+  abandonVcMeetingDeliveryStream(config.session.dataDir, memberKey, { reason });
+  const membershipGeneration = Math.max(
+    member.membershipGeneration,
+    receiverProjection?.membershipGeneration ?? 0,
+  ) + 1;
+  const ownerBootId = getDaemonBootId();
+  const policy = {
+    ...(member.filter ? { filter: member.filter } : {}),
+    capabilities: member.capabilities,
+    ownedSinks: member.ownedSinks,
+    sinkOwnerGeneration: member.sinkOwnerGeneration,
+  };
+  const receiverRemoved = applyVcMeetingMemberProjection(config.session.dataDir, {
+    ...memberKey,
+    ownerBootId,
+    ownerEpoch: member.ownerEpoch,
+    agentAppId: member.agentAppId,
+    role: member.role,
+    ...(member.instructions ? { instructions: member.instructions } : {}),
+    membershipGeneration,
+    status: 'removed',
+    responseMode: member.responseMode,
+    ...policy,
+    joinedAtIngestSeq: member.joinedAtIngestSeq,
+    receiverSessionId: member.receiverSessionId,
+    outputChatId: member.outputChatId,
+  });
+  if (!receiverRemoved.ok && receiverRemoved.reason !== 'epoch_removed') {
+    logger.error(
+      `[vc-agent] receiver profile retirement rejected meeting=${member.meetingId} `
+      + `member=${member.memberId}: ${receiverRemoved.reason}`,
+    );
+    return false;
+  }
+  const hubRemoved = applyVcMeetingHubMemberProjection(config.session.dataDir, {
+    ...memberKey,
+    ownerBootId,
+    ownerEpoch: member.ownerEpoch,
+    agentAppId: member.agentAppId,
+    role: member.role,
+    ...(member.instructions ? { instructions: member.instructions } : {}),
+    deliveryProfileHash: member.deliveryProfileHash,
+    membershipGeneration,
+    status: 'removed',
+    responseMode: member.responseMode,
+    ...policy,
+    joinedAtIngestSeq: member.joinedAtIngestSeq,
+    receiverSessionId: member.receiverSessionId,
+    outputChatId: member.outputChatId,
+  });
+  if (!hubRemoved.ok && hubRemoved.reason !== 'epoch_removed') {
+    logger.error(
+      `[vc-agent] hub profile retirement rejected meeting=${member.meetingId} `
+      + `member=${member.memberId}: ${hubRemoved.reason}`,
+    );
+    return false;
+  }
+  logger.error(
+    `[vc-agent] retired unresolved profile consumer meeting=${member.meetingId} `
+    + `member=${member.memberId} memberEpoch=${member.memberEpoch} reason=${reason}`,
+  );
+  return true;
+}
+
+async function resumeVcMeetingSingleConsumerFromNow(
+  key: string,
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+): Promise<{ ok: true; oldMemberEpoch: number; gap?: VcMeetingDeliveryGap } | { ok: false; error: string }> {
+  const prior = vcMeetingLatestSingleConsumerMember(session);
+  const agentAppId = session.selectedAgentAppId;
+  const listenerChatId = session.listenerChatId ?? configuredVcMeetingListenerChatId(cfg);
+  if (!prior || !agentAppId || !listenerChatId) {
+    return { ok: false, error: '当前会议没有可恢复的 agent member' };
+  }
+  const gap = vcMeetingRecoveryGapForMissingBodies(session) ?? { reason: 'operator_skip' as const };
+  const reason = `active_recovery_operator_from_now:${prior.inFlight?.deliveryKey ?? 'unassigned'}`;
+  if (!retireVcMeetingSingleConsumerForRecovery(session, reason)) {
+    return { ok: false, error: '旧 member epoch 隔离失败，请稍后重试' };
+  }
+
+  // The authorization means all feed versions observed up to this point are
+  // intentionally outside the new epoch. Drop only that prefix; events that
+  // arrive while the remote receiver is being registered retain larger seqs.
+  const skipThrough = getVcMeetingFeedMetadataState(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+  }).nextIngestSeq - 1;
+  session.consumerPendingItems = session.consumerPendingItems.filter(item => item.ingestSeq > skipThrough);
+  for (const entry of Object.values(session.state.dedup.transcriptBySentenceId)) {
+    session.consumerTranscriptRevisions[entry.sentenceId] = entry.revision;
+  }
+  session.consumerFrozenDelivery = undefined;
+  session.consumerRecoveryGap = undefined;
+  session.consumerRestoreCatchUpRequired = false;
+  session.consumerPaused = false;
+  session.consumerOverflowNotified = false;
+  session.consumerRecoveryCardRequired = false;
+  session.consumerFullInstructionSent = undefined;
+  persistVcMeetingRuntimeSession(session, cfg);
+
+  try {
+    const next = await ensureVcMeetingSingleConsumerMember(session, agentAppId, listenerChatId);
+    session.consumerPendingItems = session.consumerPendingItems.filter(
+      item => item.ingestSeq > next.joinedAtIngestSeq,
+    );
+    persistVcMeetingRuntimeSession(session, cfg);
+    await sendVcMeetingRecoveryTerminalNotice(session, {
+      kind: 'active_epoch_skipped',
+      memberId: prior.memberId,
+      memberEpoch: prior.memberEpoch,
+      reason,
+      gap,
+    });
+    scheduleVcMeetingConsumerInjection(key, cfg);
+    void injectVcMeetingConsumerSession(key, cfg, { force: true }).catch((err) => {
+      logger.warn(
+        `[vc-agent] from-now initial inject failed ${key}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+    return { ok: true, oldMemberEpoch: prior.memberEpoch, gap };
+  } catch (err) {
+    // Old epoch retirement is irreversible and durable. Keep the selected
+    // agent/session active so the normal pump (or a repeated card action) can
+    // finish registering the new from-now epoch when the receiver returns.
+    scheduleVcMeetingConsumerInjection(key, cfg);
+    return {
+      ok: false,
+      error: `旧流已隔离，新 epoch 激活待重试：${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+function reconcileVcMeetingFrozenCompletionWithoutBody(session: VcMeetingDaemonSession): boolean {
+  const member = vcMeetingLatestSingleConsumerMember(session);
+  const assignment = member?.inFlight;
+  if (!member || !assignment) return false;
+  const lookup = findVcMeetingDeliveryByKey(config.session.dataDir, assignment.deliveryKey, {
+    receiverSessionId: member.receiverSessionId,
+  });
+  if (lookup?.receipt.status !== 'completed'
+    || lookup.receiverCommittedThrough < assignment.toSeq) return false;
+  const observed = observeVcMeetingHubReceiverReceipt(config.session.dataDir, {
+    listenerAppId: member.listenerAppId,
+    meetingId: member.meetingId,
+    memberId: member.memberId,
+    memberEpoch: member.memberEpoch,
+    ownerBootId: member.ownerBootId,
+    ownerEpoch: member.ownerEpoch,
+    deliveryKey: assignment.deliveryKey,
+    inputHash: assignment.inputHash,
+    fromSeq: assignment.fromSeq,
+    toSeq: assignment.toSeq,
+    status: 'completed',
+    receiverCommittedThrough: lookup.receiverCommittedThrough,
+  });
+  if (!observed.ok) return false;
+  clearAckedVcMeetingConsumerItems(session, assignment);
+  return true;
+}
+
+function vcMeetingDeliveryAuthorizedActorIds(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+): string[] {
+  const ids = new Set([
+    ...vcMeetingInstructionSourceOpenIds(session, cfg),
+    ...vcMeetingInstructionSourceUnionIds(session, cfg),
+  ]);
+  for (const [openId, unionId] of Object.entries(session.actorUnionIdsByOpenId ?? {})) {
+    if (ids.has(openId) || ids.has(unionId)) {
+      if (openId.trim()) ids.add(openId.trim());
+      if (unionId.trim()) ids.add(unionId.trim());
+    }
+  }
+  for (const [unionId, openId] of Object.entries(session.actorOpenIdsByUnionId ?? {})) {
+    if (ids.has(openId) || ids.has(unionId)) {
+      if (openId.trim()) ids.add(openId.trim());
+      if (unionId.trim()) ids.add(unionId.trim());
+    }
+  }
+  return [...ids].sort();
+}
+
+function vcMeetingCanonicalFeedIdentity(feed: VcMeetingCanonicalFeedItem): {
+  itemVersionKey: string;
+  contentHash: string;
+} {
+  if (!feed.itemVersionKey || !feed.contentHash) {
+    throw new Error(`meeting canonical feed identity is missing for ingestSeq ${feed.ingestSeq}`);
+  }
+  return { itemVersionKey: feed.itemVersionKey, contentHash: feed.contentHash };
+}
+
+function vcMeetingFrozenRequiredVersions(member: VcMeetingHubMemberRecord | undefined): Set<string> {
+  return new Set((member?.inFlight?.entries ?? [])
+    .filter(entry => entry.kind === 'item')
+    .map(entry => `${entry.itemVersionKey}\u0000${entry.contentHash}`));
+}
+
+function vcMeetingCurrentProfileMembers(session: VcMeetingDaemonSession): VcMeetingHubMemberRecord[] {
+  const selectedIds = new Set(
+    session.selectedAgents
+      // A crash may leave runtime state at "activating" after the receiver and
+      // hub projections have already committed. Include it while reconciling;
+      // the durable projection below remains the authority for participation.
+      .filter(selected => selected.status === 'active'
+        || selected.status === 'paused'
+        || selected.status === 'activating')
+      .map(selected => selected.memberId),
+  );
+  const latest = new Map<string, VcMeetingHubMemberRecord>();
+  for (const member of listVcMeetingHubMembers(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+  })) {
+    if (!selectedIds.has(member.memberId)) continue;
+    const prior = latest.get(member.memberId);
+    if (!prior
+      || member.memberEpoch > prior.memberEpoch
+      || (member.memberEpoch === prior.memberEpoch
+        && member.membershipGeneration > prior.membershipGeneration)) {
+      latest.set(member.memberId, member);
+    }
+  }
+  return [...latest.values()].filter(member => member.status === 'active' || member.status === 'paused');
+}
+
+function vcMeetingProfileMemberSemanticsMatchRuntime(
+  member: VcMeetingHubMemberRecord,
+  selected: VcMeetingRuntimeSelectedAgent,
+  listenerChatId: string,
+): boolean {
+  return member.agentAppId === selected.agentAppId
+    && member.role === selected.role
+    && member.instructions === selected.instructions
+    && member.outputChatId === listenerChatId
+    && member.deliveryProfileHash === selected.deliveryProfileHash
+    && member.responseMode === selected.responseMode
+    && JSON.stringify(member.filter ?? {}) === JSON.stringify(selected.filter ?? {})
+    && JSON.stringify(member.capabilities) === JSON.stringify(selected.capabilities)
+    && JSON.stringify(member.ownedSinks) === JSON.stringify(selected.ownedSinks);
+}
+
+/** Move all durable profile projections to the current daemon boot before
+ * allowing any individual member to advance. ownerBootId is meeting-global;
+ * refreshing only one member would retire the boot still carried by siblings. */
+function refreshVcMeetingProfileOwnerBoot(session: VcMeetingDaemonSession): boolean {
+  const members = vcMeetingCurrentProfileMembers(session);
+  if (members.length === 0) {
+    session.consumerProfileOwnerBootReady = true;
+    return true;
+  }
+  const ownerBootId = getDaemonBootId();
+  try {
+    // Receiver projections first: keep the hub fenced on the old boot until
+    // every target store is ready to accept same-key frozen recovery.
+    for (const member of members) {
+      const policy = {
+        ...(member.filter ? { filter: member.filter } : {}),
+        capabilities: member.capabilities,
+        ownedSinks: member.ownedSinks,
+        sinkOwnerGeneration: member.sinkOwnerGeneration,
+      };
+      const applied = applyVcMeetingMemberProjection(config.session.dataDir, {
+        listenerAppId: member.listenerAppId,
+        meetingId: member.meetingId,
+        memberId: member.memberId,
+        memberEpoch: member.memberEpoch,
+        ownerBootId,
+        ownerEpoch: member.ownerEpoch,
+        agentAppId: member.agentAppId,
+        role: member.role,
+        ...(member.instructions ? { instructions: member.instructions } : {}),
+        membershipGeneration: member.membershipGeneration,
+        status: member.status,
+        responseMode: member.responseMode,
+        ...policy,
+        joinedAtIngestSeq: member.joinedAtIngestSeq,
+        receiverSessionId: member.receiverSessionId,
+        outputChatId: member.outputChatId,
+      });
+      if (!applied.ok) throw new Error(`receiver ${member.memberId}: ${applied.reason}`);
+    }
+    for (const member of members) {
+      const policy = {
+        ...(member.filter ? { filter: member.filter } : {}),
+        capabilities: member.capabilities,
+        ownedSinks: member.ownedSinks,
+        sinkOwnerGeneration: member.sinkOwnerGeneration,
+      };
+      const applied = applyVcMeetingHubMemberProjection(config.session.dataDir, {
+        listenerAppId: member.listenerAppId,
+        meetingId: member.meetingId,
+        memberId: member.memberId,
+        memberEpoch: member.memberEpoch,
+        ownerBootId,
+        ownerEpoch: member.ownerEpoch,
+        agentAppId: member.agentAppId,
+        role: member.role,
+        ...(member.instructions ? { instructions: member.instructions } : {}),
+        deliveryProfileHash: member.deliveryProfileHash,
+        membershipGeneration: member.membershipGeneration,
+        status: member.status,
+        responseMode: member.responseMode,
+        ...policy,
+        joinedAtIngestSeq: member.joinedAtIngestSeq,
+        receiverSessionId: member.receiverSessionId,
+        outputChatId: member.outputChatId,
+      });
+      if (!applied.ok) throw new Error(`hub ${member.memberId}: ${applied.reason}`);
+    }
+    session.consumerProfileOwnerBootReady = true;
+    return true;
+  } catch (err) {
+    session.consumerProfileOwnerBootReady = false;
+    logger.error(
+      `[vc-agent] profile owner-boot takeover failed meeting=${session.state.meeting.id}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
+function vcMeetingMemberAcceptsFeed(
+  member: VcMeetingHubMemberRecord,
+  feed: VcMeetingCanonicalFeedItem,
+): boolean {
+  const activityTypes = member.filter?.activityTypes;
+  return !activityTypes || activityTypes.length === 0 || activityTypes.includes(feed.item.type);
+}
+
+function vcMeetingMemberAckedFeed(
+  member: VcMeetingHubMemberRecord,
+  feed: VcMeetingCanonicalFeedItem,
+): boolean {
+  const identity = vcMeetingCanonicalFeedIdentity(feed);
+  return member.ackedItemVersions.some(acked =>
+    acked.ingestSeq === feed.ingestSeq
+    && acked.itemVersionKey === identity.itemVersionKey
+    && acked.contentHash === identity.contentHash);
+}
+
+function gcVcMeetingProfileConsumerBodies(session: VcMeetingDaemonSession): number {
+  const selectedReaders = session.selectedAgents.filter(selected =>
+    selected.status === 'active'
+    || selected.status === 'paused'
+    || selected.status === 'activating');
+  const members = vcMeetingCurrentProfileMembers(session);
+  // The runtime selection is published as `activating` before the receiver
+  // registration and hub projection finish. During that window the durable
+  // member list is only a prefix of the intended reader set: using it for GC
+  // can delete a feed accepted only by the member whose projection is still
+  // in flight. Treat an activating or otherwise missing/mismatched reader as
+  // an incomplete snapshot and retain the shared bodies until the selection
+  // settles to active/failed. Empty is likewise not an authoritative
+  // "no readers" decision before the selection card is confirmed.
+  if (selectedReaders.length === 0
+    || selectedReaders.some(selected => selected.status === 'activating')
+    || members.length !== selectedReaders.length) return 0;
+  const membersById = new Map(members.map(member => [member.memberId, member] as const));
+  if (selectedReaders.some((selected) => {
+    const member = membersById.get(selected.memberId);
+    return !member
+      || member.agentAppId !== selected.agentAppId
+      || member.role !== selected.role
+      || JSON.stringify(member.filter ?? {}) !== JSON.stringify(selected.filter ?? {})
+      || (selected.deliveryProfileHash !== undefined
+        && member.deliveryProfileHash !== selected.deliveryProfileHash);
+  })) return 0;
+  let removed = 0;
+  session.consumerPendingItems = session.consumerPendingItems.filter((feed) => {
+    const required = members.filter(member =>
+      feed.ingestSeq > member.joinedAtIngestSeq
+      && vcMeetingMemberAcceptsFeed(member, feed));
+    if (required.some(member => !vcMeetingMemberAckedFeed(member, feed))) return true;
+    if (feed.item.type === 'transcript_received' && feed.item.revision !== undefined) {
+      session.consumerTranscriptRevisions[feed.item.sentenceId] = Math.max(
+        session.consumerTranscriptRevisions[feed.item.sentenceId] ?? 0,
+        feed.item.revision,
+      );
+    }
+    removed += 1;
+    return false;
+  });
+  return removed;
+}
+
+function materializeVcMeetingStableConsumerTranscripts(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  opts: { final?: boolean },
+): void {
+  const stable = collectVcMeetingConsumerTranscriptItems(session, {
+    final: opts.final,
+    stabilizeMs: cfg.stabilizeMs ?? DEFAULT_VC_MEETING_STABILIZE_MS,
+  });
+  if (stable.length === 0) return;
+  const feed = ingestVcMeetingFeedMetadata(
+    config.session.dataDir,
+    { listenerAppId: session.larkAppId, meetingId: session.state.meeting.id },
+    stable,
+  );
+  if (feed.conflicts.length > 0) {
+    throw new Error(`meeting feed identity conflict for ${feed.conflicts.length} stable transcript(s)`);
+  }
+  if (vcMeetingSessionUsesProfileMembers(session, cfg)) {
+    const frozenRequired = new Set(
+      vcMeetingCurrentProfileMembers(session)
+        .flatMap(member => [...vcMeetingFrozenRequiredVersions(member)]),
+    );
+    const existingVersions = new Set(session.consumerPendingItems.map((candidate) => {
+      const identity = vcMeetingCanonicalFeedIdentity(candidate);
+      return `${identity.itemVersionKey}\u0000${identity.contentHash}`;
+    }));
+    const additions: VcMeetingCanonicalFeedItem[] = [];
+    for (const outcome of feed.outcomes) {
+      const metadata = outcome.metadata ?? outcome.existing;
+      if (!metadata || outcome.disposition === 'identity_conflict') continue;
+      const identity = `${metadata.itemVersionKey}\u0000${metadata.contentHash}`;
+      if (outcome.disposition === 'stale_revision' && !frozenRequired.has(identity)) continue;
+      if (existingVersions.has(identity)) continue;
+      existingVersions.add(identity);
+      additions.push({
+        ingestSeq: metadata.ingestSeq,
+        itemVersionKey: metadata.itemVersionKey,
+        contentHash: metadata.contentHash,
+        item: outcome.item,
+      });
+    }
+    queueVcMeetingConsumerPendingItems(session, cfg, additions);
+    gcVcMeetingProfileConsumerBodies(session);
+    return;
+  }
+  const member = vcMeetingLatestSingleConsumerMember(session);
+  const frozenRequired = vcMeetingFrozenRequiredVersions(member);
+  const ackedVersions = new Map(
+    (member?.ackedItemVersions ?? []).map(item => [item.itemVersionKey, item.contentHash] as const),
+  );
+  const existingVersions = new Set(session.consumerPendingItems.map((candidate) => {
+    const identity = vcMeetingCanonicalFeedIdentity(candidate);
+    return `${identity.itemVersionKey}\u0000${identity.contentHash}`;
+  }));
+  const additions: VcMeetingCanonicalFeedItem[] = [];
+  for (const outcome of feed.outcomes) {
+    const metadata = outcome.metadata ?? outcome.existing;
+    if (!metadata || outcome.disposition === 'identity_conflict') continue;
+    const identity = `${metadata.itemVersionKey}\u0000${metadata.contentHash}`;
+    if (outcome.disposition === 'stale_revision' && !frozenRequired.has(identity)) continue;
+    const ackedHash = ackedVersions.get(metadata.itemVersionKey);
+    if (ackedHash === metadata.contentHash) continue;
+    if (ackedHash !== undefined && ackedHash !== metadata.contentHash) {
+      throw new Error(`meeting feed ACK identity conflict for ${metadata.itemVersionKey}`);
+    }
+    if (existingVersions.has(identity)) continue;
+    existingVersions.add(identity);
+    additions.push({
+      ingestSeq: metadata.ingestSeq,
+      itemVersionKey: metadata.itemVersionKey,
+      contentHash: metadata.contentHash,
+      item: outcome.item,
+    });
+  }
+  queueVcMeetingConsumerPendingItems(session, cfg, additions);
+}
+
+/** Apply a normalized meeting batch to both the listener projection and the
+ * durable canonical consumer feed. Push ingestion and restart polling must
+ * share this exact path so feed identities never depend on transport. */
+function ingestVcMeetingNormalizedItems(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  items: NormalizedVcMeetingItem[],
+  opts: { queueListener?: boolean } = {},
+): ReturnType<typeof ingestNormalizedVcMeetingItems> {
+  beginVcIngestionPass(session.state);
+  rememberVcMeetingActorNames(session, items);
+  const ingest = ingestNormalizedVcMeetingItems(session.state, items);
+  if (opts.queueListener !== false) queueVcMeetingPendingItems(session, ingest.acceptedItems);
+  if (!vcMeetingConsumerEnabled(cfg) || session.consumerMode === 'listenOnly') return ingest;
+
+  const transcriptVersions = ingest.changedTranscripts.map(entry =>
+    vcMeetingConsumerTranscriptItem(session.state, entry));
+  const feed = ingestVcMeetingFeedMetadata(
+    config.session.dataDir,
+    { listenerAppId: session.larkAppId, meetingId: session.state.meeting.id },
+    [...ingest.acceptedItems, ...transcriptVersions],
+  );
+  if (feed.conflicts.length > 0) {
+    session.consumerPaused = true;
+    persistVcMeetingRuntimeSession(session, cfg);
+    logger.error(
+      `[vc-agent] consumer feed identity conflict meeting=${session.state.meeting.id} `
+      + `count=${feed.conflicts.length}; delivery paused`,
+    );
+  }
+  if (vcMeetingSessionUsesProfileMembers(session, cfg)) {
+    const frozenRequired = new Set(
+      vcMeetingCurrentProfileMembers(session)
+        .flatMap(member => [...vcMeetingFrozenRequiredVersions(member)]),
+    );
+    const pendingVersions = new Set(session.consumerPendingItems.map((candidate) => {
+      const identity = vcMeetingCanonicalFeedIdentity(candidate);
+      return `${identity.itemVersionKey}\u0000${identity.contentHash}`;
+    }));
+    const feedAdditions: VcMeetingCanonicalFeedItem[] = [];
+    for (const outcome of feed.outcomes) {
+      const metadata = outcome.metadata ?? outcome.existing;
+      if (!metadata || outcome.disposition === 'identity_conflict') continue;
+      const identity = `${metadata.itemVersionKey}\u0000${metadata.contentHash}`;
+      if (outcome.disposition === 'stale_revision' && !frozenRequired.has(identity)) continue;
+      if (pendingVersions.has(identity)) continue;
+      pendingVersions.add(identity);
+      feedAdditions.push({
+        ingestSeq: metadata.ingestSeq,
+        itemVersionKey: metadata.itemVersionKey,
+        contentHash: metadata.contentHash,
+        item: outcome.item,
+      });
+    }
+    queueVcMeetingConsumerPendingItems(session, cfg, feedAdditions);
+    gcVcMeetingProfileConsumerBodies(session);
+    return ingest;
+  }
+  const hubMember = vcMeetingLatestSingleConsumerMember(session);
+  const frozenRequired = vcMeetingFrozenRequiredVersions(hubMember);
+  const ackedVersions = new Map(
+    (hubMember?.ackedItemVersions ?? []).map(item => [item.itemVersionKey, item.contentHash] as const),
+  );
+  const pendingVersions = new Set(session.consumerPendingItems.map((candidate) => {
+    const identity = vcMeetingCanonicalFeedIdentity(candidate);
+    return `${identity.itemVersionKey}\u0000${identity.contentHash}`;
+  }));
+  const feedAdditions: VcMeetingCanonicalFeedItem[] = [];
+  for (const outcome of feed.outcomes) {
+    const metadata = outcome.metadata ?? outcome.existing;
+    if (!metadata || outcome.disposition === 'identity_conflict') continue;
+    const identity = `${metadata.itemVersionKey}\u0000${metadata.contentHash}`;
+    if (outcome.disposition === 'stale_revision' && !frozenRequired.has(identity)) continue;
+    const ackedHash = ackedVersions.get(metadata.itemVersionKey);
+    if (ackedHash === metadata.contentHash) continue;
+    if (ackedHash !== undefined) {
+      session.consumerPaused = true;
+      logger.error(`[vc-agent] ACK identity conflict meeting=${session.state.meeting.id} item=${metadata.itemVersionKey}`);
+      continue;
+    }
+    if (pendingVersions.has(identity)) continue;
+    pendingVersions.add(identity);
+    feedAdditions.push({
+      ingestSeq: metadata.ingestSeq,
+      itemVersionKey: metadata.itemVersionKey,
+      contentHash: metadata.contentHash,
+      item: outcome.item,
+    });
+  }
+  queueVcMeetingConsumerPendingItems(session, cfg, feedAdditions);
+  return ingest;
+}
+
+function vcMeetingProfileRestoreBodiesAvailable(
+  session: VcMeetingDaemonSession,
+  member: VcMeetingHubMemberRecord,
+): boolean {
+  const pendingVersions = new Set(session.consumerPendingItems.map((candidate) => {
+    const identity = vcMeetingCanonicalFeedIdentity(candidate);
+    return `${candidate.ingestSeq}\u0000${identity.itemVersionKey}\u0000${identity.contentHash}`;
+  }));
+  const frozenReady = (member.inFlight?.entries ?? []).every(entry =>
+    entry.kind !== 'item'
+    || pendingVersions.has(`${entry.ingestSeq}\u0000${entry.itemVersionKey}\u0000${entry.contentHash}`));
+  if (!frozenReady) return false;
+  // A closing member may commit its recovered frozen prefix before a later
+  // missing journal entry is converted to that member's terminal resolution.
+  if (session.ended && member.inFlight) return true;
+  if (member.inFlight?.entries.some(entry => entry.kind === 'gap')) return true;
+  const feedState = getVcMeetingFeedMetadataState(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+  });
+  const acked = new Map(
+    member.ackedItemVersions.map(item => [item.itemVersionKey, item.contentHash] as const),
+  );
+  return Object.values(feedState.latestByItemKey).every((latest) => {
+    if (latest.ingestSeq <= member.joinedAtIngestSeq) return true;
+    const activityTypes = member.filter?.activityTypes;
+    const metadata = feedState.items[latest.itemVersionKey];
+    if (activityTypes?.length && metadata && !activityTypes.includes(metadata.itemType)) return true;
+    const ackedHash = acked.get(latest.itemVersionKey);
+    if (ackedHash === latest.contentHash) return true;
+    if (ackedHash !== undefined) return false;
+    return pendingVersions.has(
+      `${latest.ingestSeq}\u0000${latest.itemVersionKey}\u0000${latest.contentHash}`,
+    );
+  });
+}
+
+function vcMeetingRestoreBodiesAvailable(session: VcMeetingDaemonSession): boolean {
+  if (session.selectedAgents.length > 0) {
+    const members = vcMeetingCurrentProfileMembers(session);
+    return members.length > 0
+      && members.every(member => vcMeetingProfileRestoreBodiesAvailable(session, member));
+  }
+  const member = vcMeetingLatestSingleConsumerMember(session);
+  const assignment = member?.inFlight;
+  const pendingVersions = new Set(session.consumerPendingItems.map((candidate) => {
+    const identity = vcMeetingCanonicalFeedIdentity(candidate);
+    return `${candidate.ingestSeq}\u0000${identity.itemVersionKey}\u0000${identity.contentHash}`;
+  }));
+  const frozenReady = (assignment?.entries ?? []).every((entry) => {
+    if (entry.kind !== 'item') return true;
+    return pendingVersions.has(`${entry.ingestSeq}\u0000${entry.itemVersionKey}\u0000${entry.contentHash}`);
+  });
+  if (!frozenReady) return false;
+
+  // During durable close, an already-frozen prefix can be replayed and ACKed
+  // even when a later journal entry remains unavailable. Once that prefix is
+  // committed, the close pump deterministically recomputes the missing range
+  // and seals it as a gap instead of holding recovered bodies forever.
+  if (session.ended && assignment) return true;
+
+  // A frozen recovery-gap envelope is itself the durable replacement for the
+  // unavailable journal bodies.  Requiring those bodies again after a crash
+  // would make the exact same gap/final request impossible to replay.
+  if (assignment?.entries.some(entry => entry.kind === 'gap')) return true;
+
+  // A scalar "no frozen assignment" is not enough to declare recovery ready:
+  // the feed journal may contain current semantic versions that were ingested
+  // before the crash but had not yet been frozen for this member.
+  const feedState = getVcMeetingFeedMetadataState(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+  });
+  const acked = new Map(
+    (member?.ackedItemVersions ?? []).map(item => [item.itemVersionKey, item.contentHash] as const),
+  );
+  return Object.values(feedState.latestByItemKey).every((latest) => {
+    if (latest.ingestSeq <= (member?.joinedAtIngestSeq ?? 0)) return true;
+    const ackedHash = acked.get(latest.itemVersionKey);
+    if (ackedHash === latest.contentHash) return true;
+    if (ackedHash !== undefined) return false;
+    return pendingVersions.has(
+      `${latest.ingestSeq}\u0000${latest.itemVersionKey}\u0000${latest.contentHash}`,
+    );
+  });
+}
+
+function vcMeetingMissingRequiredFeedMetadata(session: VcMeetingDaemonSession) {
+  const feedState = getVcMeetingFeedMetadataState(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+  });
+  const pending = new Set(session.consumerPendingItems.map((candidate) => {
+    const identity = vcMeetingCanonicalFeedIdentity(candidate);
+    return `${candidate.ingestSeq}\u0000${identity.itemVersionKey}\u0000${identity.contentHash}`;
+  }));
+  if (session.selectedAgents.length > 0) {
+    const missingByVersion = new Map<string, (typeof feedState.items)[string]>();
+    for (const member of vcMeetingCurrentProfileMembers(session)) {
+      const acked = new Map(
+        member.ackedItemVersions.map(item => [item.itemVersionKey, item.contentHash] as const),
+      );
+      for (const latest of Object.values(feedState.latestByItemKey)) {
+        if (latest.ingestSeq <= member.joinedAtIngestSeq) continue;
+        const activityTypes = member.filter?.activityTypes;
+        const metadata = feedState.items[latest.itemVersionKey];
+        if (activityTypes?.length && metadata && !activityTypes.includes(metadata.itemType)) continue;
+        if (acked.get(latest.itemVersionKey) === latest.contentHash) continue;
+        if (pending.has(`${latest.ingestSeq}\u0000${latest.itemVersionKey}\u0000${latest.contentHash}`)) continue;
+        if (metadata) missingByVersion.set(latest.itemVersionKey, metadata);
+      }
+    }
+    return [...missingByVersion.values()].sort((a, b) => a.ingestSeq - b.ingestSeq);
+  }
+  const member = vcMeetingLatestSingleConsumerMember(session);
+  const acked = new Map(
+    (member?.ackedItemVersions ?? []).map(item => [item.itemVersionKey, item.contentHash] as const),
+  );
+  return Object.values(feedState.latestByItemKey)
+    .filter((latest) => {
+      if (latest.ingestSeq <= (member?.joinedAtIngestSeq ?? 0)) return false;
+      if (acked.get(latest.itemVersionKey) === latest.contentHash) return false;
+      return !pending.has(`${latest.ingestSeq}\u0000${latest.itemVersionKey}\u0000${latest.contentHash}`);
+    })
+    .map(latest => feedState.items[latest.itemVersionKey]!)
+    .sort((a, b) => a.ingestSeq - b.ingestSeq);
+}
+
+function vcMeetingRecoveryGapForMissingBodies(session: VcMeetingDaemonSession): VcMeetingDeliveryGap | undefined {
+  const missing = vcMeetingMissingRequiredFeedMetadata(session);
+  if (missing.length === 0) return undefined;
+  const occurred = missing
+    .map(item => item.occurredAtMs)
+    .filter((value): value is number => value !== undefined && Number.isFinite(value));
+  return {
+    reason: 'poll_unavailable',
+    missingItemVersionKey: missing[0]!.itemVersionKey,
+    originalContentHash: missing[0]!.contentHash,
+    ...(occurred.length > 0 ? {
+      occurredFromMs: Math.min(...occurred),
+      occurredToMs: Math.max(...occurred),
+    } : {}),
+  };
+}
+
+function notifyVcMeetingRecoveryGap(
+  session: VcMeetingDaemonSession,
+  detail: string,
+): void {
+  if (session.consumerRecoveryGapNotified) return;
+  session.consumerRecoveryGapNotified = true;
+  const listenerChatId = session.listenerChatId;
+  if (listenerChatId) {
+    void sendMessage(
+      session.larkAppId,
+      listenerChatId,
+      `会议 agent 恢复存在同步缺口，正在保留原投递并持续重试；不会用不完整内容生成最终结果。${detail ? `（${detail}）` : ''}`,
+      'text',
+      `vc_${session.state.meeting.id.slice(-12)}_recovery_gap`,
+    ).catch((err) => {
+      logger.warn(
+        `[vc-agent] recovery gap notice failed meeting=${session.state.meeting.id}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
+}
+
+function vcMeetingRecoveryGapRangeText(gap: VcMeetingDeliveryGap | undefined): string {
+  if (!gap) return '范围未知';
+  const from = gap.occurredFromMs !== undefined
+    ? new Date(gap.occurredFromMs).toISOString()
+    : undefined;
+  const to = gap.occurredToMs !== undefined
+    ? new Date(gap.occurredToMs).toISOString()
+    : undefined;
+  if (from || to) return `${from ?? '?'} ～ ${to ?? from ?? '?'}`;
+  return gap.missingItemVersionKey ?? '范围未知';
+}
+
+async function sendVcMeetingRecoveryTerminalNotice(
+  session: VcMeetingDaemonSession,
+  input: {
+    kind: 'gap_committed' | 'epoch_retired' | 'active_epoch_skipped';
+    memberId: string;
+    memberEpoch: number;
+    reason: string;
+    gap?: VcMeetingDeliveryGap;
+  },
+): Promise<void> {
+  const listenerChatId = session.listenerChatId;
+  if (!listenerChatId) return;
+  const detail = input.kind === 'gap_committed'
+    ? `会议 agent 已用显式同步缺口完成收口；最终总结可能不完整。缺口：${vcMeetingRecoveryGapRangeText(input.gap)}`
+    : input.kind === 'active_epoch_skipped'
+      ? `会议 agent 已隔离无法恢复的旧投递流，并从当前时点继续。member=${input.memberId}，旧 member epoch=${input.memberEpoch}；缺口：${vcMeetingRecoveryGapRangeText(input.gap)}`
+      : `会议 agent 投递流在恢复截止时间内未确认，已隔离旧流并结束本次处理；最终总结可能不完整。member=${input.memberId}，member epoch=${input.memberEpoch}`;
+  const uuidKind = input.kind === 'gap_committed' ? 'gap' : input.kind === 'active_epoch_skipped' ? 'skip' : 'retired';
+  const memberKeyHash = createHash('sha256').update(input.memberId, 'utf8').digest('hex').slice(0, 10);
+  await sendMessage(
+    session.larkAppId,
+    listenerChatId,
+    `${detail}\n原因：${input.reason}`,
+    'text',
+    `vc_${session.state.meeting.id.slice(-12)}_${uuidKind}_${memberKeyHash}_${input.memberEpoch}`,
+  );
+}
+
+/** Rehydrate meeting bodies without persisting them. The feed journal supplies
+ * authoritative identities; polling only supplies content needed to prove and
+ * rebuild the already-frozen envelope. */
+function catchUpVcMeetingConsumerForRestore(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+): boolean {
+  if (!cfg.larkCliProfile) {
+    notifyVcMeetingRecoveryGap(session, '缺少 larkCliProfile');
+    return false;
+  }
+  try {
+    const profileMembers = session.selectedAgents.length > 0
+      ? vcMeetingCurrentProfileMembers(session)
+      : [];
+    const member = profileMembers.length === 0 ? vcMeetingLatestSingleConsumerMember(session) : undefined;
+    const feedState = getVcMeetingFeedMetadataState(config.session.dataDir, {
+      listenerAppId: session.larkAppId,
+      meetingId: session.state.meeting.id,
+    });
+    const frozenVersionKeys = new Set(
+      (profileMembers.length > 0 ? profileMembers : member ? [member] : [])
+        .flatMap(current => (current.inFlight?.entries ?? [])
+          .filter(entry => entry.kind === 'item' && !!entry.itemVersionKey)
+          .map(entry => entry.itemVersionKey!)),
+    );
+    const candidates = Object.values(feedState.items).filter((metadata) => {
+      if (frozenVersionKeys.has(metadata.itemVersionKey)) return true;
+      if (profileMembers.length > 0) {
+        return profileMembers.some((current) => {
+          if (metadata.ingestSeq <= current.joinedAtIngestSeq) return false;
+          const activityTypes = current.filter?.activityTypes;
+          if (activityTypes?.length && !activityTypes.includes(metadata.itemType)) return false;
+          return !current.ackedItemVersions.some(acked =>
+            acked.itemVersionKey === metadata.itemVersionKey
+            && acked.contentHash === metadata.contentHash);
+        });
+      }
+      return metadata.ingestSeq > (member?.joinedAtIngestSeq ?? 0)
+        && !(member?.ackedItemVersions ?? []).some(acked =>
+          acked.itemVersionKey === metadata.itemVersionKey
+          && acked.contentHash === metadata.contentHash);
+    });
+    const oldest = candidates.reduce<number | undefined>((min, metadata) => {
+      const timestamp = metadata.occurredAtMs ?? metadata.firstSeenAt;
+      return min === undefined ? timestamp : Math.min(min, timestamp);
+    }, undefined);
+    const startMs = Math.max(0, (oldest ?? Date.now() - 30 * 60_000) - 60_000);
+    const polled = fetchMeetingEventsAsBot({
+      meetingId: session.state.meeting.id,
+      profile: cfg.larkCliProfile,
+      start: new Date(startMs).toISOString(),
+      pageAll: true,
+      timeoutMs: VC_MEETING_RESTORE_CATCH_UP_TIMEOUT_MS,
+    });
+    if (polled.batch.meeting.id) {
+      session.state.meeting = {
+        ...session.state.meeting,
+        ...polled.batch.meeting,
+        id: session.state.meeting.id,
+      };
+    }
+    if (polled.batch.items.length > 0) {
+      ingestVcMeetingNormalizedItems(session, cfg, polled.batch.items, { queueListener: false });
+    }
+    materializeVcMeetingStableConsumerTranscripts(session, cfg, { final: true });
+    pruneSupersededVcMeetingConsumerTranscripts(session);
+    const ready = vcMeetingRestoreBodiesAvailable(session);
+    if (!ready) notifyVcMeetingRecoveryGap(session, '事件源未返回待投递版本所需正文');
+    return ready;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    notifyVcMeetingRecoveryGap(session, '事件回补暂不可用');
+    logger.warn(`[vc-agent] restore catch-up failed meeting=${session.state.meeting.id}: ${message}`);
+    return false;
+  }
+}
+
+function vcMeetingRenderedTextHash(rawText: string): string {
+  return `sha256:${createHash('sha256').update(rawText, 'utf8').digest('hex')}`;
+}
+
+function vcMeetingRecoveryGapRawText(gap: VcMeetingDeliveryGap): string {
+  return `会议事件正文恢复失败，已记录同步缺口（${gap.reason}；${gap.missingItemVersionKey ?? 'unknown'}）。`;
+}
+
+function vcMeetingAssignmentEntryMatches(
+  entry: VcMeetingDeliveryRequest['entries'][number],
+  frozen: VcMeetingHubFrozenAssignment['entries'][number],
+): boolean {
+  return entry.deliverySeq === frozen.deliverySeq
+    && entry.ingestSeq === frozen.ingestSeq
+    && entry.itemVersionKey === frozen.itemVersionKey
+    && entry.contentHash === frozen.contentHash
+    && entry.kind === frozen.kind
+    && entry.controlKey === frozen.controlKey
+    && JSON.stringify(entry.gap) === JSON.stringify(frozen.gap)
+    && vcMeetingRenderedTextHash(entry.rawText) === frozen.renderedTextHash;
+}
+
+function rebuildVcMeetingFrozenDelivery(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  member: VcMeetingHubMemberRecord,
+  assignment: VcMeetingHubFrozenAssignment,
+): VcMeetingDaemonSession['consumerFrozenDelivery'] {
+  const itemFeeds: VcMeetingCanonicalFeedItem[] = [];
+  for (const ref of assignment.entries) {
+    if (ref.kind !== 'item') continue;
+    const feed = session.consumerPendingItems.find((candidate) => {
+      const identity = vcMeetingCanonicalFeedIdentity(candidate);
+      return candidate.ingestSeq === ref.ingestSeq
+        && identity.itemVersionKey === ref.itemVersionKey
+        && identity.contentHash === ref.contentHash;
+    });
+    if (!feed) {
+      throw new Error(`cannot rebuild frozen delivery ${assignment.deliveryKey}: missing ${ref.itemVersionKey ?? ref.ingestSeq}`);
+    }
+    itemFeeds.push(feed);
+  }
+  let entries = buildVcMeetingDeliveryEntries({
+    items: itemFeeds,
+    fromDeliverySeq: assignment.fromSeq,
+    render: assignment.renderContext,
+    final: assignment.final,
+  });
+  if (assignment.entries.some(entry => entry.kind === 'gap')) {
+    entries = assignment.entries.map((entry) => {
+      if (entry.kind === 'gap' && entry.gap) {
+        return {
+          deliverySeq: entry.deliverySeq,
+          kind: 'gap' as const,
+          gap: entry.gap,
+          rawText: vcMeetingRecoveryGapRawText(entry.gap),
+        };
+      }
+      if (entry.kind === 'final') {
+        return {
+          deliverySeq: entry.deliverySeq,
+          kind: 'final' as const,
+          rawText: '会议输入流已结束。',
+        };
+      }
+      throw new Error(`cannot rebuild frozen delivery ${assignment.deliveryKey}: unsupported mixed gap entry`);
+    });
+  }
+  if (entries.length !== assignment.entries.length
+    || entries.some((entry, index) => !vcMeetingAssignmentEntryMatches(entry, assignment.entries[index]!))) {
+    throw new Error(`cannot rebuild frozen delivery ${assignment.deliveryKey}: rendered metadata changed`);
+  }
+  const sealed = sealVcMeetingDeliveryRequest({
+    meeting: {
+      listenerAppId: session.larkAppId,
+      meetingId: session.state.meeting.id,
+      ownerBootId: assignment.ownerBootId,
+      ownerEpoch: assignment.ownerEpoch,
+    },
+    member: {
+      memberId: member.memberId,
+      agentAppId: member.agentAppId,
+      role: member.role,
+      epoch: member.memberEpoch,
+      membershipGeneration: assignment.membershipGeneration,
+    },
+    target: assignment.target,
+    entries,
+    instructionVersion: assignment.instructionVersion,
+    final: assignment.final,
+  });
+  if (sealed.deliveryKey !== assignment.deliveryKey || sealed.inputHash !== assignment.inputHash
+    || sealed.request.stream.batchId !== assignment.batchId) {
+    throw new Error(`cannot rebuild frozen delivery ${assignment.deliveryKey}: envelope identity changed`);
+  }
+  return sealed;
+}
+
+function clearAckedVcMeetingConsumerItems(
+  session: VcMeetingDaemonSession,
+  assignment: VcMeetingHubFrozenAssignment,
+): void {
+  const acknowledged = new Set(assignment.entries
+    .filter(entry => entry.kind === 'item')
+    .map(entry => `${entry.ingestSeq}\u0000${entry.itemVersionKey}\u0000${entry.contentHash}`));
+  session.consumerPendingItems = session.consumerPendingItems.filter((feed) => {
+    const version = vcMeetingCanonicalFeedIdentity(feed);
+    const identity = `${feed.ingestSeq}\u0000${version.itemVersionKey}\u0000${version.contentHash}`;
+    if (!acknowledged.has(identity)) return true;
+    if (feed.item.type === 'transcript_received' && feed.item.revision !== undefined) {
+      session.consumerTranscriptRevisions[feed.item.sentenceId] = Math.max(
+        session.consumerTranscriptRevisions[feed.item.sentenceId] ?? 0,
+        feed.item.revision,
+      );
+    }
+    return false;
+  });
+  if (assignment.entries.some(entry => entry.kind === 'gap')) {
+    session.consumerRecoveryGap = undefined;
+  }
+  session.consumerFrozenDelivery = undefined;
+  session.consumerFullInstructionSent = true;
+  session.consumerLastInjectedAtMs = Date.now();
+}
+
+function pruneSupersededVcMeetingConsumerTranscripts(session: VcMeetingDaemonSession): void {
+  const feedState = getVcMeetingFeedMetadataState(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+  });
+  const frozenRequired = session.selectedAgents.length > 0
+    ? new Set(vcMeetingCurrentProfileMembers(session).flatMap(member => [...vcMeetingFrozenRequiredVersions(member)]))
+    : vcMeetingFrozenRequiredVersions(vcMeetingLatestSingleConsumerMember(session));
+  let pruned = 0;
+  session.consumerPendingItems = session.consumerPendingItems.filter((feed) => {
+    if (feed.item.type !== 'transcript_received') return true;
+    const identity = vcMeetingCanonicalFeedIdentity(feed);
+    if (frozenRequired.has(`${identity.itemVersionKey}\u0000${identity.contentHash}`)) return true;
+    const latest = feedState.latestByItemKey[feed.item.itemKey];
+    if (!latest || latest.itemVersionKey === identity.itemVersionKey) return true;
+    pruned += 1;
+    return false;
+  });
+  if (pruned > 0) {
+    logger.info(
+      `[vc-agent] pruned ${pruned} superseded non-frozen transcript version(s) `
+      + `meeting=${session.state.meeting.id}`,
+    );
+  }
+}
+
+function freezeFreshVcMeetingDelivery(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  member: VcMeetingHubMemberRecord,
+  opts: { final?: boolean; force?: boolean },
+  memberState?: VcMeetingConsumerMemberVolatileState,
+): VcMeetingDaemonSession['consumerFrozenDelivery'] | undefined {
+  if (opts.final && member.finalAckedAt !== undefined) return undefined;
+  const stableTranscriptSentenceIds = new Set(
+    Object.values(session.state.dedup.transcriptBySentenceId)
+      .filter(entry => vcMeetingConsumerTranscriptStable(entry, {
+        now: new Date(),
+        stabilizeMs: opts.final ? 0 : (cfg.stabilizeMs ?? DEFAULT_VC_MEETING_STABILIZE_MS),
+      }))
+      .map(entry => entry.sentenceId),
+  );
+  const renderContext = {
+    timeZone: vcMeetingDisplayTimeZone(cfg),
+    authorizedActorIds: vcMeetingDeliveryAuthorizedActorIds(session, cfg),
+  };
+  const eligibleFeeds = session.consumerPendingItems
+    .filter(feed =>
+      feed.ingestSeq > member.joinedAtIngestSeq
+      && vcMeetingMemberAcceptsFeed(member, feed)
+      // Bodies are shared and remain pinned for slower siblings. A member that
+      // already committed a version must not see it again merely because
+      // another member still needs the same body.
+      && !vcMeetingMemberAckedFeed(member, feed)
+      && (feed.item.type !== 'transcript_received'
+        || stableTranscriptSentenceIds.has(feed.item.sentenceId)))
+    .sort((a, b) => a.ingestSeq - b.ingestSeq);
+  const caps = vcMeetingConsumerDeliveryCapsOverrideForTest ?? {
+    maxItems: VC_MEETING_CONSUMER_DELIVERY_MAX_ITEMS,
+    maxRenderedChars: VC_MEETING_CONSUMER_DELIVERY_MAX_RENDERED_CHARS,
+  };
+  const itemFeeds: VcMeetingCanonicalFeedItem[] = [];
+  let renderedChars = 0;
+  for (const feed of eligibleFeeds) {
+    const itemChars = renderVcMeetingDeliveryItem(feed.item, renderContext).length;
+    if (itemFeeds.length >= caps.maxItems
+      || (itemFeeds.length > 0 && renderedChars + itemChars > caps.maxRenderedChars)) break;
+    itemFeeds.push(feed);
+    renderedChars += itemChars;
+  }
+  const recoveryGap = memberState ? memberState.recoveryGap : session.consumerRecoveryGap;
+  const drainingRecoveredPrefix = recoveryGap !== undefined && itemFeeds.length > 0;
+  const batchFinal = opts.final === true
+    && (recoveryGap !== undefined
+      ? !drainingRecoveredPrefix
+      : itemFeeds.length === eligibleFeeds.length);
+  const itemValues = itemFeeds.map(feed => feed.item);
+  const lines = buildVcMeetingConsumerLines(session, cfg, itemValues, { final: batchFinal });
+  if (!opts.force && !opts.final
+    && !(memberState
+      ? shouldInjectVcMeetingConsumerBatchForMember(memberState, session, cfg, itemValues, lines, opts)
+      : shouldInjectVcMeetingConsumerBatch(session, cfg, itemValues, lines, opts))) return undefined;
+  const entries: VcMeetingDeliveryRequest['entries'] = recoveryGap && !drainingRecoveredPrefix
+    ? [{
+        deliverySeq: member.nextDeliverySeq,
+        kind: 'gap',
+        gap: recoveryGap,
+        rawText: vcMeetingRecoveryGapRawText(recoveryGap),
+      }, ...(batchFinal ? [{
+        deliverySeq: member.nextDeliverySeq + 1,
+        kind: 'final' as const,
+        rawText: '会议输入流已结束。',
+      }] : [])]
+    : buildVcMeetingDeliveryEntries({
+        items: itemFeeds,
+        fromDeliverySeq: member.nextDeliverySeq,
+        render: { ...renderContext },
+        final: batchFinal,
+      });
+  if (entries.length === 0) return undefined;
+  const sealed = sealVcMeetingDeliveryRequest({
+    meeting: {
+      listenerAppId: session.larkAppId,
+      meetingId: session.state.meeting.id,
+      ownerBootId: member.ownerBootId,
+      ownerEpoch: member.ownerEpoch,
+    },
+    member: {
+      memberId: member.memberId,
+      agentAppId: member.agentAppId,
+      role: member.role,
+      epoch: member.memberEpoch,
+      membershipGeneration: member.membershipGeneration,
+    },
+    target: { sessionId: member.receiverSessionId, chatId: member.outputChatId },
+    entries,
+    instructionVersion: VC_MEETING_DELIVERY_INSTRUCTION_VERSION,
+    final: batchFinal,
+  });
+  const frozen = freezeVcMeetingHubDeliveryAssignment(config.session.dataDir, {
+    listenerAppId: member.listenerAppId,
+    meetingId: member.meetingId,
+    memberId: member.memberId,
+    memberEpoch: member.memberEpoch,
+    ownerBootId: member.ownerBootId,
+    ownerEpoch: member.ownerEpoch,
+    membershipGeneration: member.membershipGeneration,
+    deliveryKey: sealed.deliveryKey,
+    inputHash: sealed.inputHash,
+    fromSeq: sealed.request.stream.fromSeq,
+    toSeq: sealed.request.stream.toSeq,
+    batchId: sealed.request.stream.batchId,
+    final: sealed.request.stream.final,
+    entries: sealed.request.entries.map(entry => ({
+      deliverySeq: entry.deliverySeq,
+      ...(entry.ingestSeq !== undefined ? { ingestSeq: entry.ingestSeq } : {}),
+      ...(entry.itemVersionKey ? { itemVersionKey: entry.itemVersionKey } : {}),
+      ...(entry.contentHash ? { contentHash: entry.contentHash } : {}),
+      kind: entry.kind,
+      ...(entry.controlKey ? { controlKey: entry.controlKey } : {}),
+      ...(entry.gap ? { gap: entry.gap } : {}),
+      renderedTextHash: vcMeetingRenderedTextHash(entry.rawText),
+    })),
+    renderContext: {
+      ...renderContext,
+    },
+    instructionVersion: sealed.request.instructionVersion,
+    target: sealed.request.target,
+  });
+  if (frozen.kind === 'conflict') {
+    throw new Error(`meeting delivery freeze rejected: ${frozen.reason}`);
+  }
+  if (frozen.kind === 'already_acked') return undefined;
+  return sealed;
+}
+
+function clearAckedVcMeetingProfileDelivery(
+  session: VcMeetingDaemonSession,
+  memberState: VcMeetingConsumerMemberVolatileState,
+  assignment: VcMeetingHubFrozenAssignment,
+): void {
+  memberState.frozenDelivery = undefined;
+  memberState.fullInstructionSent = true;
+  memberState.lastInjectedAtMs = Date.now();
+  gcVcMeetingProfileConsumerBodies(session);
+  if (assignment.entries.some(entry => entry.kind === 'gap')) {
+    memberState.recoveryGap = undefined;
+  }
+  pruneSupersededVcMeetingConsumerTranscripts(session);
+}
+
+async function injectVcMeetingProfileMember(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  selected: VcMeetingRuntimeSelectedAgent,
+  opts: { final?: boolean; force?: boolean },
+): Promise<VcMeetingConsumerInjectResult> {
+  const memberState = session.consumerMemberStates[selected.memberId] ??= {};
+  if (memberState.injectPromise) {
+    await memberState.injectPromise;
+    return injectVcMeetingProfileMember(session, cfg, selected, opts);
+  }
+  const work = (async (): Promise<VcMeetingConsumerInjectResult> => {
+    const member = vcMeetingLatestProfileMember(session, selected.memberId);
+    if (!member || member.status !== 'active') {
+      return {
+        ok: false,
+        injected: 0,
+        error: `profile ${selected.profileId} has no active durable membership`,
+      };
+    }
+    const memberKey = {
+      listenerAppId: member.listenerAppId,
+      meetingId: member.meetingId,
+      memberId: member.memberId,
+      memberEpoch: member.memberEpoch,
+    };
+    const durableAssignment = getVcMeetingHubDeliveryAssignment(config.session.dataDir, memberKey);
+    if (opts.final && !durableAssignment && member.finalAckedAt !== undefined) {
+      memberState.frozenDelivery = undefined;
+      return { ok: true, injected: 0 };
+    }
+    let sealed = memberState.frozenDelivery;
+    if (durableAssignment) {
+      if (!sealed || sealed.deliveryKey !== durableAssignment.deliveryKey
+        || sealed.inputHash !== durableAssignment.inputHash) {
+        sealed = rebuildVcMeetingFrozenDelivery(session, cfg, member, durableAssignment);
+      }
+    } else {
+      memberState.frozenDelivery = undefined;
+      pruneSupersededVcMeetingConsumerTranscripts(session);
+      sealed = freezeFreshVcMeetingDelivery(session, cfg, member, opts, memberState);
+    }
+    if (!sealed) return { ok: true, injected: 0 };
+    memberState.frozenDelivery = sealed;
+    const assignment = getVcMeetingHubDeliveryAssignment(config.session.dataDir, memberKey);
+    if (!assignment || assignment.deliveryKey !== sealed.deliveryKey) {
+      throw new Error(`profile ${selected.profileId} lost its frozen assignment before delivery`);
+    }
+    const delivered = await postVcMeetingDelivery(selected.agentAppId, sealed.request);
+    const body = vcMeetingResponseRecord(delivered.body);
+    if (delivered.status < 200 || delivered.status >= 300 || body?.ok !== true) {
+      const code = typeof body?.errorCode === 'string' ? body.errorCode : `http_${delivered.status}`;
+      const detail = typeof body?.error === 'string' ? body.error : 'receiver delivery failed';
+      throw new Error(`meeting delivery failed (${code}): ${detail}`);
+    }
+    const status = typeof body.status === 'string' ? body.status as VcMeetingHubReceiverStatus : undefined;
+    const receiverCommittedThrough = typeof body.receiverCommittedThrough === 'number'
+      && Number.isSafeInteger(body.receiverCommittedThrough)
+      && body.receiverCommittedThrough >= 0
+      ? body.receiverCommittedThrough
+      : undefined;
+    if (!status || receiverCommittedThrough === undefined) {
+      throw new Error('meeting receiver returned an invalid receipt');
+    }
+    const observed = observeVcMeetingHubReceiverReceipt(config.session.dataDir, {
+      ...memberKey,
+      ownerBootId: member.ownerBootId,
+      ownerEpoch: member.ownerEpoch,
+      deliveryKey: sealed.deliveryKey,
+      inputHash: sealed.inputHash,
+      fromSeq: sealed.request.stream.fromSeq,
+      toSeq: sealed.request.stream.toSeq,
+      status,
+      receiverCommittedThrough,
+    });
+    if (!observed.ok) throw new Error(`meeting receipt observation rejected: ${observed.reason}`);
+    const itemCount = assignment.entries.filter(entry => entry.kind === 'item').length;
+    if (observed.kind === 'acked' || observed.kind === 'already_acked') {
+      clearAckedVcMeetingProfileDelivery(session, memberState, assignment);
+      logger.info(
+        `[vc-agent] profile delivery committed meeting=${session.state.meeting.id} `
+        + `profile=${selected.profileId} delivery=${sealed.deliveryKey} items=${itemCount}`,
+      );
+      return { ok: true, injected: itemCount };
+    }
+    if (status === 'failed_retryable' || status === 'failed_terminal') {
+      throw new Error(`meeting receiver reported ${status}${typeof body.errorCode === 'string' ? `: ${body.errorCode}` : ''}`);
+    }
+    return { ok: true, injected: 0 };
+  })().catch((err): VcMeetingConsumerInjectResult => ({
+    ok: false,
+    injected: 0,
+    error: err instanceof Error ? err.message : String(err),
+  })).finally(() => {
+    memberState.injectPromise = undefined;
+  });
+  memberState.injectPromise = work;
+  return work;
+}
+
+async function injectVcMeetingProfileConsumers(
+  key: string,
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  opts: { final?: boolean; force?: boolean },
+): Promise<VcMeetingConsumerInjectResult> {
+  if (session.consumerMode === 'pending') {
+    if (session.consumerRestoreCatchUpRequired) {
+      session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
+    }
+    if (!session.consumerRestoreCatchUpRequired && session.consumerRestoreSelectionCardRequired) {
+      await ensureVcMeetingRestoredSelectionCard(key, session, cfg);
+    }
+    return session.consumerRestoreCatchUpRequired
+      ? { ok: false, injected: 0, error: 'meeting restore catch-up is incomplete; selection remains gated' }
+      : { ok: true, injected: 0 };
+  }
+  if (session.consumerMode !== 'agent') return { ok: true, injected: 0 };
+  const active = session.selectedAgents.filter(selected => selected.status === 'active');
+  if (active.length === 0) return { ok: true, injected: 0 };
+  if (session.consumerProfileOwnerBootReady === false
+    && !refreshVcMeetingProfileOwnerBoot(session)) {
+    return {
+      ok: false,
+      injected: 0,
+      error: 'meeting profile owner-boot takeover is incomplete',
+    };
+  }
+  if (session.consumerRestoreCatchUpRequired) {
+    // Polling/content rehydration is shared, but readiness is not: a missing
+    // body for B must never hold a recoverable A behind a session-wide gate.
+    catchUpVcMeetingConsumerForRestore(session, cfg);
+  }
+  materializeVcMeetingStableConsumerTranscripts(session, cfg, opts);
+  const ready: VcMeetingRuntimeSelectedAgent[] = [];
+  const blocked: string[] = [];
+  for (const selected of active) {
+    const member = vcMeetingLatestProfileMember(session, selected.memberId);
+    const memberState = session.consumerMemberStates[selected.memberId] ??= {};
+    const memberReady = !!member && (
+      vcMeetingProfileRestoreBodiesAvailable(session, member)
+      || (opts.final === true
+        && session.ended
+        && !member.inFlight
+        && memberState.recoveryGap !== undefined)
+    );
+    const wasBlocked = memberState.restoreBlocked === true;
+    memberState.restoreBlocked = !memberReady;
+    if (memberReady) {
+      ready.push(selected);
+      if (wasBlocked && member && memberState.activeRecoveryCardMessageId) {
+        void resolveVcMeetingProfileActiveRecoveryCard(
+          session,
+          selected,
+          member,
+          'recovered',
+        ).catch(() => undefined);
+      }
+    } else {
+      blocked.push(selected.profileId);
+      if (member) {
+        void ensureVcMeetingProfileActiveRecoveryCard(session, selected, member).catch((err) => {
+          logger.warn(
+            `[vc-agent] profile active recovery card failed meeting=${session.state.meeting.id} `
+            + `profile=${selected.profileId}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
+    }
+  }
+  session.consumerRestoreCatchUpRequired = blocked.length > 0;
+  const results = await Promise.all(ready.map(selected =>
+    injectVcMeetingProfileMember(session, cfg, selected, opts)));
+  const injected = results.reduce((sum, result) => sum + result.injected, 0);
+  const failures = results
+    .map((result, index) => result.ok ? undefined : `${ready[index]!.profileId}: ${result.error ?? 'unknown'}`)
+    .filter((value): value is string => !!value);
+  if (blocked.length > 0) {
+    failures.push(`restore blocked: ${blocked.join(', ')}`);
+  }
+  return failures.length > 0
+    ? { ok: false, injected, error: failures.join('; ') }
+    : { ok: true, injected };
 }
 
 async function injectVcMeetingConsumerSession(
@@ -5209,53 +9996,159 @@ async function injectVcMeetingConsumerSession(
   cfg: VcMeetingAgentConfig,
   opts: { final?: boolean; force?: boolean } = {},
 ): Promise<VcMeetingConsumerInjectResult> {
-  const session = vcMeetingSessions.get(key);
+  const session = vcMeetingSessions.get(key) ?? vcMeetingClosingConsumerSessions.get(key)?.session;
   if (!session) return { ok: true, injected: 0 };
+  if (vcMeetingSessionUsesProfileMembers(session, cfg)) {
+    return injectVcMeetingProfileConsumers(key, session, cfg, opts);
+  }
   if (session.consumerInjectPromise) {
-    if (!opts.final) return session.consumerInjectPromise;
     await session.consumerInjectPromise;
-    return injectVcMeetingConsumerSession(key, cfg, { final: true });
+    return injectVcMeetingConsumerSession(key, cfg, opts);
   }
   const work = (async (): Promise<VcMeetingConsumerInjectResult> => {
-    if (session.consumerMode !== 'agent' || !session.selectedAgentAppId || session.consumerPaused) {
+    if (session.consumerMode === 'pending') {
+      if (session.consumerRestoreCatchUpRequired) {
+        session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
+      }
+      if (!session.consumerRestoreCatchUpRequired && session.consumerRestoreSelectionCardRequired) {
+        await ensureVcMeetingRestoredSelectionCard(key, session, cfg);
+      }
+      return session.consumerRestoreCatchUpRequired
+        ? {
+            ok: false,
+            injected: 0,
+            error: 'meeting restore catch-up is incomplete; selection remains gated',
+          }
+        : { ok: true, injected: 0 };
+    }
+    if (session.consumerMode !== 'agent' || !session.selectedAgentAppId) {
+      return { ok: true, injected: 0 };
+    }
+    if (session.consumerRestoreCatchUpRequired) {
+      session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
+      if (session.consumerRestoreCatchUpRequired) {
+        session.consumerActiveRecoveryCardRequired = true;
+        await ensureVcMeetingConsumerActiveRecoveryCard(session).catch((err) => {
+          logger.warn(
+            `[vc-agent] active recovery card retry failed meeting=${session.state.meeting.id}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+        return {
+          ok: false,
+          injected: 0,
+          error: 'meeting restore catch-up is incomplete; frozen delivery retained for retry',
+        };
+      }
+      if (session.consumerActiveRecoveryNonce || session.consumerActiveRecoveryCardMessageId) {
+        await resolveVcMeetingConsumerActiveRecoveryCard(session, 'recovered').catch((err) => {
+          logger.warn(
+            `[vc-agent] active recovery card resolve failed meeting=${session.state.meeting.id}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+          clearVcMeetingConsumerActiveRecoveryState(session);
+        });
+      }
+    }
+    if (session.consumerPaused) {
+      if (session.consumerRecoveryCardRequired) {
+        await ensureVcMeetingConsumerOverflowRecoveryCard(
+          session,
+          cfg,
+          VC_MEETING_PENDING_ITEM_LIMIT,
+        ).catch((err) => {
+          logger.warn(
+            `[vc-agent] overflow recovery card retry failed meeting=${session.state.meeting.id}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
       return { ok: true, injected: 0 };
     }
     const listenerChatId = session.listenerChatId ?? configuredVcMeetingListenerChatId(cfg);
     if (!listenerChatId) return { ok: true, injected: 0 };
-    const stableTranscripts = collectVcMeetingConsumerTranscriptItems(session, {
-      final: opts.final,
-      stabilizeMs: cfg.stabilizeMs ?? DEFAULT_VC_MEETING_STABILIZE_MS,
-    });
-    const pendingSnapshot = [...session.consumerPendingItems];
-    const itemsToInject = [
-      ...pendingSnapshot,
-      ...stableTranscripts,
-    ];
-    const lines = buildVcMeetingConsumerLines(session, cfg, itemsToInject, { final: opts.final });
-    if (lines.length === 0) return { ok: true, injected: 0 };
-    if (!opts.force && !shouldInjectVcMeetingConsumerBatch(session, cfg, itemsToInject, lines, { final: opts.final })) {
+    materializeVcMeetingStableConsumerTranscripts(session, cfg, opts);
+    const member = await ensureVcMeetingSingleConsumerMember(
+      session,
+      session.selectedAgentAppId,
+      listenerChatId,
+    );
+    const memberKey = {
+      listenerAppId: member.listenerAppId,
+      meetingId: member.meetingId,
+      memberId: member.memberId,
+      memberEpoch: member.memberEpoch,
+    };
+    const durableMember = getVcMeetingHubMember(config.session.dataDir, memberKey);
+    if (!durableMember) throw new Error('meeting hub membership disappeared after registration');
+    const durableAssignment = getVcMeetingHubDeliveryAssignment(config.session.dataDir, memberKey);
+    if (opts.final && !durableAssignment && durableMember.finalAckedAt !== undefined) {
+      session.consumerFrozenDelivery = undefined;
       return { ok: true, injected: 0 };
     }
-    const req = buildVcMeetingConsumerTriggerRequest({
-      session,
-      cfg,
-      agentAppId: session.selectedAgentAppId,
-      listenerChatId,
-      items: itemsToInject,
-      lines,
-      final: opts.final,
+    let sealed = session.consumerFrozenDelivery;
+    if (durableAssignment) {
+      if (!sealed || sealed.deliveryKey !== durableAssignment.deliveryKey
+        || sealed.inputHash !== durableAssignment.inputHash) {
+        sealed = rebuildVcMeetingFrozenDelivery(session, cfg, durableMember, durableAssignment);
+      }
+    } else {
+      session.consumerFrozenDelivery = undefined;
+      pruneSupersededVcMeetingConsumerTranscripts(session);
+      sealed = freezeFreshVcMeetingDelivery(session, cfg, durableMember, opts);
+    }
+    if (!sealed) return { ok: true, injected: 0 };
+    session.consumerFrozenDelivery = sealed;
+    const assignment = getVcMeetingHubDeliveryAssignment(config.session.dataDir, memberKey);
+    if (!assignment || assignment.deliveryKey !== sealed.deliveryKey) {
+      throw new Error('meeting hub lost the frozen assignment before delivery');
+    }
+
+    const delivered = await postVcMeetingDelivery(session.selectedAgentAppId, sealed.request);
+    const body = vcMeetingResponseRecord(delivered.body);
+    if (delivered.status < 200 || delivered.status >= 300 || body?.ok !== true) {
+      const code = typeof body?.errorCode === 'string' ? body.errorCode : `http_${delivered.status}`;
+      const detail = typeof body?.error === 'string' ? body.error : 'receiver delivery failed';
+      throw new Error(`meeting delivery failed (${code}): ${detail}`);
+    }
+    const status = typeof body.status === 'string' ? body.status as VcMeetingHubReceiverStatus : undefined;
+    const receiverCommittedThrough = typeof body.receiverCommittedThrough === 'number'
+      && Number.isSafeInteger(body.receiverCommittedThrough)
+      && body.receiverCommittedThrough >= 0
+      ? body.receiverCommittedThrough
+      : undefined;
+    if (!status || receiverCommittedThrough === undefined) {
+      throw new Error('meeting receiver returned an invalid receipt');
+    }
+    const observed = observeVcMeetingHubReceiverReceipt(config.session.dataDir, {
+      ...memberKey,
+      ownerBootId: durableMember.ownerBootId,
+      ownerEpoch: durableMember.ownerEpoch,
+      deliveryKey: sealed.deliveryKey,
+      inputHash: sealed.inputHash,
+      fromSeq: sealed.request.stream.fromSeq,
+      toSeq: sealed.request.stream.toSeq,
+      status,
+      receiverCommittedThrough,
     });
-    const result = await triggerVcMeetingConsumerTurn(req, session.selectedAgentAppId);
-    if (!result.ok) throw new Error(result.error ?? result.errorCode ?? 'agent trigger failed');
-    const sentKeys = new Set(pendingSnapshot.map(item => item.itemKey));
-    session.consumerPendingItems = session.consumerPendingItems.filter(item => !sentKeys.has(item.itemKey));
-    markVcMeetingConsumerTranscriptItemsInjected(session, stableTranscripts);
-    // 只有 trigger 成功才算完整契约已送达；失败重试仍会带全量 instruction。
-    // 内存标志即可：daemon 重启后丢失只导致多发一次全量，无害。
-    session.consumerFullInstructionSent = true;
-    session.consumerLastInjectedAtMs = Date.now();
-    logger.info(`[vc-agent] consumer injected meeting=${session.state.meeting.id} agent=${session.selectedAgentAppId} items=${itemsToInject.length} action=${result.action ?? '?'}`);
-    return { ok: true, injected: itemsToInject.length };
+    if (!observed.ok) throw new Error(`meeting receipt observation rejected: ${observed.reason}`);
+    const itemCount = assignment.entries.filter(entry => entry.kind === 'item').length;
+    if (observed.kind === 'acked' || observed.kind === 'already_acked') {
+      clearAckedVcMeetingConsumerItems(session, assignment);
+      logger.info(
+        `[vc-agent] consumer delivery committed meeting=${session.state.meeting.id} `
+        + `agent=${session.selectedAgentAppId} delivery=${sealed.deliveryKey} items=${itemCount}`,
+      );
+      return { ok: true, injected: itemCount };
+    }
+    if (status === 'failed_retryable' || status === 'failed_terminal') {
+      throw new Error(`meeting receiver reported ${status}${typeof body.errorCode === 'string' ? `: ${body.errorCode}` : ''}`);
+    }
+    logger.info(
+      `[vc-agent] consumer delivery pending meeting=${session.state.meeting.id} `
+      + `agent=${session.selectedAgentAppId} delivery=${sealed.deliveryKey} status=${status}`,
+    );
+    return { ok: true, injected: 0 };
   })().catch((err): VcMeetingConsumerInjectResult => {
     const message = err instanceof Error ? err.message : String(err);
     logger.warn(`[vc-agent] consumer inject failed ${key}: ${message}`);
@@ -5317,13 +10210,410 @@ function commitVcMeetingConsumerListenOnly(
   session.consumerMode = 'listenOnly';
   session.selectedAgentAppId = undefined;
   session.selectedAgentLabel = undefined;
+  if (vcMeetingSessionUsesProfileMembers(session, cfg)) {
+    session.selectedAgents = [];
+    session.consumerMemberStates = {};
+  }
+  session.consumerPendingProfileIds = undefined;
   session.consumerPaused = false;
   session.consumerLastInjectedAtMs = undefined;
   session.consumerFullInstructionSent = undefined;
   session.consumerSelectionNonce = undefined;
   session.consumerSelectionExpiresAt = undefined;
-  session.consumerPendingItems = [];
   persistVcMeetingRuntimeSession(session, cfg);
+}
+
+async function removeVcMeetingProfileMember(
+  session: VcMeetingDaemonSession,
+  selected: VcMeetingRuntimeSelectedAgent,
+): Promise<void> {
+  const prior = vcMeetingLatestProfileMember(session, selected.memberId);
+  if (!prior || prior.status === 'removed') return;
+  const memberKey = {
+    listenerAppId: prior.listenerAppId,
+    meetingId: prior.meetingId,
+    memberId: prior.memberId,
+    memberEpoch: prior.memberEpoch,
+  };
+  // Deselect/re-add is a from-now epoch transition. Retire any accepted or
+  // ambiguous head before removing the projection so a late worker terminal
+  // cannot keep an orphaned stream/action origin alive.
+  abandonVcMeetingDeliveryStream(config.session.dataDir, memberKey, {
+    reason: 'profile_deselected',
+  });
+  const membershipGeneration = prior.membershipGeneration + 1;
+  const ownerBootId = getDaemonBootId();
+  const projection: VcMeetingMemberProjectionRequest = {
+    schemaVersion: 1,
+    meeting: {
+      listenerAppId: prior.listenerAppId,
+      meetingId: prior.meetingId,
+      ownerBootId,
+      ownerEpoch: prior.ownerEpoch,
+    },
+    member: {
+      memberId: prior.memberId,
+      agentAppId: prior.agentAppId,
+      role: prior.role,
+      ...(prior.instructions ? { instructions: prior.instructions } : {}),
+      epoch: prior.memberEpoch,
+      membershipGeneration,
+      status: 'removed',
+      joinedAtIngestSeq: prior.joinedAtIngestSeq,
+      responseMode: prior.responseMode,
+      ...(prior.filter ? { filter: prior.filter } : {}),
+      capabilities: prior.capabilities,
+      ownedSinks: prior.ownedSinks,
+      sinkOwnerGeneration: prior.sinkOwnerGeneration,
+    },
+    outputRoute: { chatId: prior.outputChatId },
+  };
+  const receiver = await postVcMeetingMemberProjection(prior.agentAppId, projection);
+  const body = vcMeetingResponseRecord(receiver.body);
+  if (receiver.status < 200 || receiver.status >= 300 || body?.ok !== true) {
+    throw new Error(`receiver removal rejected: ${String(body?.errorCode ?? receiver.status)}`);
+  }
+  const removed = applyVcMeetingHubMemberProjection(config.session.dataDir, {
+    listenerAppId: memberKey.listenerAppId,
+    meetingId: memberKey.meetingId,
+    ownerBootId,
+    ownerEpoch: prior.ownerEpoch,
+    memberId: prior.memberId,
+    memberEpoch: prior.memberEpoch,
+    agentAppId: prior.agentAppId,
+    role: prior.role,
+    ...(prior.instructions ? { instructions: prior.instructions } : {}),
+    deliveryProfileHash: prior.deliveryProfileHash,
+    membershipGeneration,
+    status: 'removed',
+    responseMode: prior.responseMode,
+    ...(prior.filter ? { filter: prior.filter } : {}),
+    capabilities: prior.capabilities,
+    ownedSinks: prior.ownedSinks,
+    sinkOwnerGeneration: prior.sinkOwnerGeneration,
+    joinedAtIngestSeq: prior.joinedAtIngestSeq,
+    receiverSessionId: prior.receiverSessionId,
+    outputChatId: prior.outputChatId,
+  });
+  if (!removed.ok && removed.reason !== 'epoch_removed') {
+    throw new Error(`hub removal rejected: ${removed.reason}`);
+  }
+}
+
+async function activateVcMeetingConsumerProfile(
+  session: VcMeetingDaemonSession,
+  profile: VcMeetingConsumerProfileConfig,
+  listenerChatId: string,
+  opts: { deliveryProfileHash?: string } = {},
+): Promise<VcMeetingRuntimeSelectedAgent> {
+  const candidate: VcMeetingConsumerAgentConfig = {
+    larkAppId: profile.agentAppId,
+    ...(profile.label ? { label: profile.label } : {}),
+  };
+  assertVcMeetingConsumerAgentWorkingDir(candidate, listenerChatId);
+  const alreadyInChat = await isVcMeetingConsumerAgentInChat(profile.agentAppId, listenerChatId);
+  if (!alreadyInChat) {
+    const added = await addBotToChat(session.larkAppId, listenerChatId, [profile.agentAppId]);
+    const failed = added.find(item => item.id === profile.agentAppId && !item.ok);
+    if (failed) {
+      const nowInChat = await isVcMeetingConsumerAgentInChat(profile.agentAppId, listenerChatId);
+      if (!nowInChat) throw new Error(`failed to add agent bot: ${failed.error ?? 'unknown'}`);
+    }
+  }
+  const mode = await pinVcMeetingConsumerChatReplyMode(profile.agentAppId, listenerChatId);
+  if (!mode.ok) throw new Error(`failed to pin agent chat-scope: ${mode.reason}`);
+  await ensureVcMeetingProfileMember(session, profile, listenerChatId, opts);
+  return vcMeetingRuntimeAgentForProfile(profile, 'active', opts);
+}
+
+function reconcileVcMeetingRestoredProfileMemberships(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+): {
+  activations: VcMeetingConsumerProfileConfig[];
+  pauses: VcMeetingRuntimeSelectedAgent[];
+} {
+  if (session.selectedAgents.length === 0) return { activations: [], pauses: [] };
+  const listenerChatId = session.listenerChatId ?? configuredVcMeetingListenerChatId(cfg);
+  if (!listenerChatId) return { activations: [], pauses: [] };
+  const unresolved: VcMeetingConsumerProfileConfig[] = [];
+  const pauses: VcMeetingRuntimeSelectedAgent[] = [];
+  session.selectedAgents = session.selectedAgents.map((selected) => {
+    const profile = vcMeetingProfileFromRuntimeAgent(selected);
+    const frozen = vcMeetingRuntimeAgentForProfile(profile, selected.status, {
+      ...(selected.activationError ? { activationError: selected.activationError } : {}),
+      ...(selected.deliveryProfileHash
+        ? { deliveryProfileHash: selected.deliveryProfileHash }
+        : {}),
+    });
+    const member = vcMeetingLatestProfileMember(session, selected.memberId);
+    if (member && vcMeetingProfileMemberSemanticsMatchRuntime(member, frozen, listenerChatId)) {
+      // Runtime paused is the durable operator/backpressure intent. It is
+      // persisted before the asynchronous hub+receiver projection, so an
+      // active member here may only mean the daemon crashed in that window;
+      // never turn it back into an active delivery reader during restore.
+      if (selected.status === 'paused' || member.status === 'paused') {
+        const paused = vcMeetingRuntimeAgentForProfile(profile, 'paused', {
+          activationError: selected.activationError ?? '该 profile 在重启前已暂停',
+          ...(selected.deliveryProfileHash
+            ? { deliveryProfileHash: selected.deliveryProfileHash }
+            : {}),
+        });
+        pauses.push(paused);
+        return paused;
+      }
+      if (member.status === 'active') {
+        return vcMeetingRuntimeAgentForProfile(profile, 'active', {
+          ...(selected.deliveryProfileHash
+            ? { deliveryProfileHash: selected.deliveryProfileHash }
+            : {}),
+        });
+      }
+    }
+    if (selected.status === 'activating' || selected.status === 'active') {
+      unresolved.push(profile);
+      return vcMeetingRuntimeAgentForProfile(profile, 'activating', {
+        ...(selected.deliveryProfileHash
+          ? { deliveryProfileHash: selected.deliveryProfileHash }
+          : {}),
+      });
+    }
+    return selected;
+  });
+  return { activations: unresolved, pauses };
+}
+
+async function resumeVcMeetingRestoredProfileMemberships(
+  key: string,
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  profiles: readonly VcMeetingConsumerProfileConfig[],
+  paused: readonly VcMeetingRuntimeSelectedAgent[],
+): Promise<void> {
+  const activations = session.ended ? [] : profiles;
+  if ((activations.length === 0 && paused.length === 0)
+    || session.consumerSelectionApplying) return;
+  if (activations.length > 0 && session.consumerClosingRequested) return;
+  const listenerChatId = session.listenerChatId ?? configuredVcMeetingListenerChatId(cfg);
+  if (!listenerChatId) return;
+  session.consumerSelectionApplying = true;
+  const settleMembershipMutation = beginVcMeetingMembershipMutationBarrier(session);
+  try {
+    const [settled, pausedSettled] = await Promise.all([
+      Promise.allSettled(
+        activations.map((profile) => {
+          const selected = session.selectedAgents.find(item => item.profileId === profile.id);
+          return activateVcMeetingConsumerProfile(session, profile, listenerChatId, {
+            ...(selected?.deliveryProfileHash
+              ? { deliveryProfileHash: selected.deliveryProfileHash }
+              : {}),
+          });
+        }),
+      ),
+      Promise.allSettled(
+        paused.map(selected => pauseVcMeetingProfileMembership(session, selected)),
+      ),
+    ]);
+    const updates = new Map<string, VcMeetingRuntimeSelectedAgent>();
+    settled.forEach((result, index) => {
+      const profile = activations[index]!;
+      if (result.status === 'fulfilled') updates.set(profile.id, result.value);
+      else {
+        const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        const selected = session.selectedAgents.find(item => item.profileId === profile.id);
+        updates.set(profile.id, vcMeetingRuntimeAgentForProfile(profile, 'failed', {
+          activationError: message,
+          ...(selected?.deliveryProfileHash
+            ? { deliveryProfileHash: selected.deliveryProfileHash }
+            : {}),
+        }));
+      }
+    });
+    pausedSettled.forEach((result, index) => {
+      if (result.status === 'fulfilled') return;
+      const selected = paused[index]!;
+      const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+      updates.set(selected.profileId, {
+        ...selected,
+        status: 'paused',
+        activationError: `暂停状态恢复未完成：${message}`.slice(0, 500),
+      });
+    });
+    session.selectedAgents = session.selectedAgents.map(selected => updates.get(selected.profileId) ?? selected);
+    const activeCount = session.selectedAgents.filter(selected => selected.status === 'active').length;
+    const pausedCount = session.selectedAgents.filter(selected => selected.status === 'paused').length;
+    session.consumerMode = activeCount > 0 || pausedCount > 0 ? 'agent' : 'listenOnly';
+    session.consumerProfileOwnerBootReady = refreshVcMeetingProfileOwnerBoot(session);
+    persistVcMeetingRuntimeSession(session, cfg);
+    if (activeCount > 0 && !session.ended) {
+      scheduleVcMeetingConsumerInjection(key, cfg);
+      void injectVcMeetingConsumerSession(key, cfg, { force: true }).catch((err) => {
+        logger.warn(
+          `[vc-agent] restored profile membership inject failed ${key}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+    if (pausedCount > 0) {
+      void ensureVcMeetingProfileRecoveryCard(session, cfg).catch(() => undefined);
+    }
+    if (activations.length > 0) {
+      await patchVcMeetingConsumerCard(
+        session,
+        cfg,
+        activeCount > 0 || pausedCount > 0 ? 'agent' : 'failed',
+        activeCount > 0 || pausedCount > 0
+          ? {}
+          : { error: '重启后未能恢复任何会议 agent profile' },
+      ).catch(() => undefined);
+    }
+  } finally {
+    settleMembershipMutation();
+    session.consumerSelectionApplying = false;
+  }
+}
+
+async function applyVcMeetingConsumerProfileSelection(
+  key: string,
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  selectedProfileIds?: readonly string[],
+  opts: VcMeetingConsumerSelectionApplyOptions = {},
+): Promise<{ ok: true; status: 'listenOnly' | 'agent'; error?: string } | { ok: false; error: string }> {
+  if (session.consumerClosingRequested || session.ended) {
+    if (opts.claimed) session.consumerSelectionApplying = false;
+    return { ok: false, error: 'meeting is closing; profile selection is no longer accepted' };
+  }
+  if (!opts.claimed) {
+    if (session.consumerSelectionApplying) {
+      return { ok: false, error: 'meeting consumer selection is already being applied' };
+    }
+    session.consumerSelectionApplying = true;
+  } else if (!session.consumerSelectionApplying) {
+    session.consumerSelectionApplying = true;
+  }
+  const settleMembershipMutation = beginVcMeetingMembershipMutationBarrier(session);
+  try {
+    clearVcMeetingConsumerSelectionTimer(session);
+    const resolution = vcMeetingConsumerProfileResolutionForSession(session, cfg, selectedProfileIds);
+    if (resolution.selectedProfiles.length === 0) {
+      const removalFailures: string[] = [];
+      for (const selected of session.selectedAgents) {
+        try {
+          await removeVcMeetingProfileMember(session, selected);
+        } catch (err) {
+          removalFailures.push(`${selected.profileId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      if (removalFailures.length > 0) {
+        return { ok: false, error: `profile removal failed: ${removalFailures.join('; ')}` };
+      }
+      commitVcMeetingConsumerListenOnly(session, cfg);
+      return { ok: true, status: 'listenOnly' };
+    }
+    const listenerChatId = session.listenerChatId ?? configuredVcMeetingListenerChatId(cfg);
+    if (!listenerChatId) throw new Error('listener chat is not ready');
+
+    const requestedIds = new Set(resolution.selectedProfiles.map(profile => profile.id));
+    const existingByProfileId = new Map(
+      session.selectedAgents.map(selected => [selected.profileId, selected] as const),
+    );
+    const requestedProfiles = resolution.selectedProfiles.map((profile) => {
+      const existing = existingByProfileId.get(profile.id);
+      return existing ? vcMeetingProfileFromRuntimeAgent(existing) : profile;
+    });
+    const retainedAfterRemovalFailure: VcMeetingRuntimeSelectedAgent[] = [];
+    const removalErrors: string[] = [];
+    for (const selected of session.selectedAgents) {
+      if (requestedIds.has(selected.profileId)) continue;
+      try {
+        await removeVcMeetingProfileMember(session, selected);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        retainedAfterRemovalFailure.push({ ...selected, activationError: `移除失败：${message}` });
+        removalErrors.push(`${selected.profileId}: ${message}`);
+      }
+    }
+
+    session.selectedAgents = [
+      ...retainedAfterRemovalFailure,
+      ...requestedProfiles.map((profile) => {
+        const existing = existingByProfileId.get(profile.id);
+        return vcMeetingRuntimeAgentForProfile(profile, 'activating', {
+          ...(existing?.deliveryProfileHash
+            ? { deliveryProfileHash: existing.deliveryProfileHash }
+            : {}),
+        });
+      }),
+    ];
+    session.consumerMode = 'agent';
+    session.selectedAgentAppId = undefined;
+    session.selectedAgentLabel = undefined;
+    session.consumerPaused = false;
+    persistVcMeetingRuntimeSession(session, cfg);
+
+    const settled = await Promise.allSettled(
+      requestedProfiles.map((profile) => {
+        const existing = existingByProfileId.get(profile.id);
+        return activateVcMeetingConsumerProfile(session, profile, listenerChatId, {
+          ...(existing?.deliveryProfileHash
+            ? { deliveryProfileHash: existing.deliveryProfileHash }
+            : {}),
+        });
+      }),
+    );
+    const activationErrors: string[] = [];
+    const activated = settled.map((result, index) => {
+      const profile = requestedProfiles[index]!;
+      if (result.status === 'fulfilled') return result.value;
+      const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+      activationErrors.push(`${profile.id}: ${message}`);
+      const existing = existingByProfileId.get(profile.id);
+      return vcMeetingRuntimeAgentForProfile(profile, 'failed', {
+        activationError: message,
+        ...(existing?.deliveryProfileHash
+          ? { deliveryProfileHash: existing.deliveryProfileHash }
+          : {}),
+      });
+    });
+    session.selectedAgents = [...retainedAfterRemovalFailure, ...activated];
+    const activeCount = session.selectedAgents.filter(selected => selected.status === 'active').length;
+    session.consumerMode = activeCount > 0 ? 'agent' : 'listenOnly';
+    session.consumerSelectionNonce = undefined;
+    session.consumerSelectionExpiresAt = undefined;
+    session.consumerPendingProfileIds = undefined;
+    session.consumerProfileRecoveryCardSent = false;
+    for (const selected of session.selectedAgents) {
+      if (selected.status === 'active') {
+        const state = session.consumerMemberStates[selected.memberId];
+        if (state) state.overflowNotified = false;
+      }
+    }
+    persistVcMeetingRuntimeSession(session, cfg);
+    if (activeCount > 0) {
+      scheduleVcMeetingConsumerInjection(key, cfg);
+      void injectVcMeetingConsumerSession(key, cfg, { force: true }).catch((err) => {
+        logger.warn(`[vc-agent] initial profile fan-out failed ${key}: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
+    const errors = [...removalErrors, ...activationErrors];
+    logger.info(
+      `[vc-agent] meeting consumer profiles applied meeting=${session.state.meeting.id} `
+      + `active=${activeCount} failed=${errors.length}`,
+    );
+    return {
+      ok: true,
+      status: activeCount > 0 ? 'agent' : 'listenOnly',
+      ...(errors.length > 0 ? { error: errors.join('; ') } : {}),
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    settleMembershipMutation();
+    session.consumerSelectionApplying = false;
+    session.consumerPendingProfileIds = undefined;
+    session.consumerPendingIntervalMs = undefined;
+  }
 }
 
 async function applyVcMeetingConsumerSelection(
@@ -5333,6 +10623,10 @@ async function applyVcMeetingConsumerSelection(
   selection: VcMeetingConsumerSelection,
   opts: VcMeetingConsumerSelectionApplyOptions = {},
 ): Promise<{ ok: true; status: 'listenOnly' | 'agent'; error?: string } | { ok: false; error: string }> {
+  if ((session.consumerClosingRequested || session.ended) && !opts.allowClosingRecovery) {
+    if (opts.claimed) session.consumerSelectionApplying = false;
+    return { ok: false, error: 'meeting is closing; consumer selection is no longer accepted' };
+  }
   if (!opts.claimed) {
     if (session.consumerSelectionApplying) {
       return { ok: false, error: 'meeting consumer selection is already being applied' };
@@ -5341,6 +10635,7 @@ async function applyVcMeetingConsumerSelection(
   } else if (!session.consumerSelectionApplying) {
     session.consumerSelectionApplying = true;
   }
+  const settleMembershipMutation = beginVcMeetingMembershipMutationBarrier(session);
   const resolved = vcMeetingResolveConsumerSelection(cfg, selection);
   try {
     clearVcMeetingConsumerSelectionTimer(session);
@@ -5368,11 +10663,24 @@ async function applyVcMeetingConsumerSelection(
     }
     const mode = await pinVcMeetingConsumerChatReplyMode(candidate.larkAppId, listenerChatId);
     if (!mode.ok) throw new Error(`failed to pin agent chat-scope: ${mode.reason}`);
+    // Selection is not committed until the target daemon proves that its CLI
+    // supports the reliable turn-terminal contract and creates/restores the
+    // dedicated receiver session. This gives unsupported adapters an explicit
+    // card error and preserves the existing safe listen-only fallback.
+    await session.consumerMembershipPausePromise;
+    const member = await ensureVcMeetingSingleConsumerMember(session, candidate.larkAppId, listenerChatId);
+    if (member.joinedAtIngestSeq > 0) {
+      session.consumerPendingItems = session.consumerPendingItems.filter(
+        item => item.ingestSeq > member.joinedAtIngestSeq,
+      );
+    }
 
     session.consumerMode = 'agent';
     session.selectedAgentAppId = candidate.larkAppId;
     session.selectedAgentLabel = vcMeetingConsumerCandidateLabel(candidate);
     session.consumerPaused = false;
+    session.consumerOverflowNotified = false;
+    session.consumerRecoveryCardRequired = false;
     session.consumerLastInjectedAtMs = Date.now();
     // 换 agent（或重选）后新会话没见过完整契约，下一次注入重新发全量。
     session.consumerFullInstructionSent = undefined;
@@ -5380,9 +10688,11 @@ async function applyVcMeetingConsumerSelection(
     session.consumerSelectionExpiresAt = undefined;
     persistVcMeetingRuntimeSession(session, cfg);
     scheduleVcMeetingConsumerInjection(key, cfg);
-    void injectVcMeetingConsumerSession(key, cfg).catch((err) => {
-      logger.warn(`[vc-agent] initial consumer inject failed ${key}: ${err instanceof Error ? err.message : String(err)}`);
-    });
+    if (session.consumerPendingItems.length > 0) {
+      void injectVcMeetingConsumerSession(key, cfg).catch((err) => {
+        logger.warn(`[vc-agent] initial consumer inject failed ${key}: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
     logger.info(`[vc-agent] meeting consumer agent selected meeting=${session.state.meeting.id} agent=${candidate.larkAppId} chat=${listenerChatId}`);
     return { ok: true, status: 'agent' };
   } catch (err) {
@@ -5397,6 +10707,7 @@ async function applyVcMeetingConsumerSelection(
       return { ok: false, error: `${message}; fallback listen-only failed: ${fallbackMessage}` };
     }
   } finally {
+    settleMembershipMutation();
     session.consumerSelectionApplying = false;
     // 暂存态随一次 apply 消费掉（成功或失败都结束选择流程）。
     session.consumerPendingChoice = undefined;
@@ -5423,6 +10734,40 @@ async function applyVcMeetingConsumerStagedState(
   return result;
 }
 
+async function applyVcMeetingConsumerProfileStagedState(
+  key: string,
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  fallbackProfileIds?: readonly string[],
+  opts: VcMeetingConsumerSelectionApplyOptions = {},
+): Promise<Awaited<ReturnType<typeof applyVcMeetingConsumerProfileSelection>>> {
+  // An omitted fallback means "use the configured defaults". Keep that
+  // resolution inside applyVcMeetingConsumerProfileSelection so automatic
+  // activation and card confirmation cross the exact same runtime conflict
+  // gate. Dashboard validation is only an early UX check: bots.json can still
+  // be edited by hand between card creation and activation.
+  const selectedProfileIds = session.consumerPendingProfileIds
+    ?? (fallbackProfileIds ? [...fallbackProfileIds] : undefined);
+  const stagedIntervalMs = session.consumerPendingIntervalMs;
+  if (stagedIntervalMs) session.syncIntervalMs = stagedIntervalMs;
+  let result = await applyVcMeetingConsumerProfileSelection(
+    key,
+    session,
+    cfg,
+    selectedProfileIds,
+    opts,
+  );
+  if (!result.ok && selectedProfileIds === undefined && session.consumerMode === 'pending') {
+    // A conflicting/invalid hand-edited default must never leave a pending
+    // timer retrying or partially activate a subset. Fail closed to
+    // listen-only while retaining the resolver error on the resulting card.
+    commitVcMeetingConsumerListenOnly(session, cfg);
+    result = { ok: true, status: 'listenOnly', error: result.error };
+  }
+  if (stagedIntervalMs) rescheduleVcMeetingTimers(key, session, cfg);
+  return result;
+}
+
 /** （重新）武装选择超时定时器；下拉暂存交互会重置它（同一 nonce，见
  *  extendVcMeetingConsumerSelectionTimeout），超时按暂存态收敛。 */
 function armVcMeetingConsumerSelectionTimer(key: string, cfg: VcMeetingAgentConfig, delayMs: number): void {
@@ -5433,7 +10778,13 @@ function armVcMeetingConsumerSelectionTimer(key: string, cfg: VcMeetingAgentConf
     const current = vcMeetingSessions.get(key);
     if (!current || current.consumerMode !== 'pending' || current.consumerSelectionApplying) return;
     void (async () => {
-      const result = await applyVcMeetingConsumerStagedState(key, current, cfg, { mode: 'default' });
+      const result = vcMeetingConsumerUsesProfiles(cfg)
+        ? await applyVcMeetingConsumerProfileStagedState(
+            key,
+            current,
+            cfg,
+          )
+        : await applyVcMeetingConsumerStagedState(key, current, cfg, { mode: 'default' });
       await patchVcMeetingConsumerCard(current, cfg, result.ok ? result.status : 'failed', result.error ? { error: result.error } : {})
         .catch((err) => logger.warn(`[vc-agent] meeting consumer timeout card patch failed ${key}: ${err instanceof Error ? err.message : String(err)}`));
     })();
@@ -5447,6 +10798,268 @@ function extendVcMeetingConsumerSelectionTimeout(key: string, session: VcMeeting
   armVcMeetingConsumerSelectionTimer(key, cfg, timeoutMs);
 }
 
+async function sendVcMeetingConsumerOverflowRecoveryCard(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  limit: number,
+): Promise<void> {
+  const listenerChatId = session.listenerChatId ?? configuredVcMeetingListenerChatId(cfg);
+  if (!listenerChatId || !session.selectedAgentAppId) return;
+  const timeoutMs = vcMeetingConsumerSelectionTimeoutMs(cfg);
+  clearVcMeetingConsumerSelectionTimer(session);
+  if (!session.consumerSelectionNonce
+    || session.consumerSelectionExpiresAt === undefined
+    || session.consumerSelectionExpiresAt <= Date.now()) {
+    session.consumerSelectionNonce = randomVcMeetingNonce();
+    session.consumerSelectionExpiresAt = Date.now() + timeoutMs;
+  }
+  session.consumerPendingChoice = {
+    mode: 'agent',
+    agentAppId: session.selectedAgentAppId,
+  };
+  persistVcMeetingRuntimeSession(session, cfg);
+  await sendMessage(
+    session.larkAppId,
+    listenerChatId,
+    `会议 agent 输入已暂停：待处理事件超过 ${limit} 条，为避免静默丢失或乱序，正文已保留但不会继续投递。请检查 agent 状态后在下方确认恢复。`,
+    'text',
+    `vc_${session.state.meeting.id.slice(-12)}_consumer_overflow`,
+  );
+  session.consumerCardMessageId = await sendMessage(
+    session.larkAppId,
+    listenerChatId,
+    JSON.stringify(vcMeetingConsumerCardForSession('pending', session, cfg, {
+      error: '输入积压已触发保护；确认后将按原 member epoch 从未提交 cursor 继续，不重放已确认内容。',
+    })),
+    'interactive',
+    `vc_${session.state.meeting.id.slice(-12)}_consumer_resume_${session.consumerSelectionNonce.slice(0, 12)}`,
+  );
+  persistVcMeetingRuntimeSession(session, cfg);
+  // A recovery card timing out must not change the current paused membership.
+  session.consumerSelectionTimer = setTimeout(() => {
+    if (!session.consumerPaused || session.consumerSelectionApplying) return;
+    session.consumerSelectionNonce = undefined;
+    session.consumerSelectionExpiresAt = undefined;
+    session.consumerPendingChoice = undefined;
+    // Keep the stream paused, but allow the next meeting item (or scheduled
+    // paused-session retry) to sign a fresh recovery card. Expiry must never
+    // consume the only operator exit from backpressure.
+    session.consumerOverflowNotified = false;
+    session.consumerRecoveryCardRequired = true;
+    persistVcMeetingRuntimeSession(session, cfg);
+    void patchVcMeetingConsumerCard(session, cfg, 'expired').catch(() => { /* best effort */ });
+  }, timeoutMs);
+  if (typeof session.consumerSelectionTimer.unref === 'function') session.consumerSelectionTimer.unref();
+}
+
+function ensureVcMeetingConsumerOverflowRecoveryCard(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  limit: number,
+): Promise<void> {
+  if (!session.consumerRecoveryCardRequired) {
+    return session.consumerRecoveryCardPromise ?? Promise.resolve();
+  }
+  if (session.consumerRecoveryCardPromise) return session.consumerRecoveryCardPromise;
+  const work = sendVcMeetingConsumerOverflowRecoveryCard(session, cfg, limit)
+    .then(() => {
+      session.consumerRecoveryCardRequired = false;
+    })
+    .finally(() => {
+      if (session.consumerRecoveryCardPromise === work) {
+        session.consumerRecoveryCardPromise = undefined;
+      }
+    });
+  session.consumerRecoveryCardPromise = work;
+  return work;
+}
+
+function vcMeetingActiveRecoveryCardForSession(
+  session: VcMeetingDaemonSession,
+  status: 'pending' | 'recovered' | 'abandoned' | 'failed',
+  opts: { error?: string } = {},
+): any {
+  const member = vcMeetingLatestSingleConsumerMember(session);
+  const gap = vcMeetingRecoveryGapForMissingBodies(session);
+  return JSON.parse(buildVcMeetingConsumerRecoveryCard({
+    status,
+    meeting: session.state.meeting,
+    nonce: session.consumerActiveRecoveryNonce ?? '',
+    memberEpoch: member?.memberEpoch ?? 0,
+    ...(gap?.missingItemVersionKey
+      ? { missingItemVersionKey: gap.missingItemVersionKey }
+      : {}),
+    ...(opts.error ? { error: opts.error } : {}),
+  }));
+}
+
+async function sendVcMeetingConsumerActiveRecoveryCard(
+  session: VcMeetingDaemonSession,
+): Promise<void> {
+  const listenerChatId = session.listenerChatId;
+  if (!listenerChatId || !session.selectedAgentAppId || session.ended) return;
+  if (!session.consumerActiveRecoveryNonce) {
+    session.consumerActiveRecoveryNonce = randomVcMeetingNonce();
+  }
+  session.consumerActiveRecoveryCardMessageId = await sendMessage(
+    session.larkAppId,
+    listenerChatId,
+    JSON.stringify(vcMeetingActiveRecoveryCardForSession(session, 'pending')),
+    'interactive',
+    `vc_${session.state.meeting.id.slice(-12)}_consumer_recovery_${session.consumerActiveRecoveryNonce.slice(0, 12)}`,
+  );
+}
+
+function ensureVcMeetingConsumerActiveRecoveryCard(
+  session: VcMeetingDaemonSession,
+): Promise<void> {
+  if (!session.consumerActiveRecoveryCardRequired) {
+    return session.consumerActiveRecoveryCardPromise ?? Promise.resolve();
+  }
+  if (session.consumerActiveRecoveryCardPromise) return session.consumerActiveRecoveryCardPromise;
+  const work = sendVcMeetingConsumerActiveRecoveryCard(session)
+    .then(() => {
+      session.consumerActiveRecoveryCardRequired = false;
+    })
+    .finally(() => {
+      if (session.consumerActiveRecoveryCardPromise === work) {
+        session.consumerActiveRecoveryCardPromise = undefined;
+      }
+    });
+  session.consumerActiveRecoveryCardPromise = work;
+  return work;
+}
+
+function clearVcMeetingConsumerActiveRecoveryState(session: VcMeetingDaemonSession): void {
+  session.consumerActiveRecoveryNonce = undefined;
+  session.consumerActiveRecoveryCardMessageId = undefined;
+  session.consumerActiveRecoveryCardRequired = false;
+  session.consumerActiveRecoveryCardPromise = undefined;
+  session.consumerActiveRecoveryApplying = false;
+}
+
+async function resolveVcMeetingConsumerActiveRecoveryCard(
+  session: VcMeetingDaemonSession,
+  status: 'recovered' | 'abandoned',
+): Promise<void> {
+  const messageId = session.consumerActiveRecoveryCardMessageId;
+  const card = JSON.stringify(vcMeetingActiveRecoveryCardForSession(session, status));
+  if (messageId) await updateMessage(session.larkAppId, messageId, card);
+  clearVcMeetingConsumerActiveRecoveryState(session);
+}
+
+function vcMeetingProfileActiveRecoveryCard(
+  session: VcMeetingDaemonSession,
+  selected: VcMeetingRuntimeSelectedAgent,
+  member: VcMeetingHubMemberRecord,
+  status: 'pending' | 'recovered' | 'abandoned' | 'failed',
+  opts: { error?: string } = {},
+): any {
+  const state = session.consumerMemberStates[selected.memberId] ??= {};
+  const gap = vcMeetingRecoveryGapForProfileMember(session, member);
+  return JSON.parse(buildVcMeetingConsumerRecoveryCard({
+    status,
+    meeting: session.state.meeting,
+    nonce: state.activeRecoveryNonce ?? '',
+    memberEpoch: member.memberEpoch,
+    memberId: member.memberId,
+    memberLabel: selected.label ?? selected.profileId,
+    ...(gap?.missingItemVersionKey ? { missingItemVersionKey: gap.missingItemVersionKey } : {}),
+    ...(opts.error ? { error: opts.error } : {}),
+  }));
+}
+
+async function ensureVcMeetingProfileActiveRecoveryCard(
+  session: VcMeetingDaemonSession,
+  selected: VcMeetingRuntimeSelectedAgent,
+  member: VcMeetingHubMemberRecord,
+): Promise<void> {
+  const listenerChatId = session.listenerChatId;
+  if (!listenerChatId) return;
+  const state = session.consumerMemberStates[selected.memberId] ??= {};
+  if (state.activeRecoveryCardMessageId) return;
+  state.activeRecoveryNonce ??= randomVcMeetingNonce();
+  const memberToken = createHash('sha256').update(member.memberId, 'utf8').digest('hex').slice(0, 12);
+  state.activeRecoveryCardMessageId = await sendMessage(
+    session.larkAppId,
+    listenerChatId,
+    JSON.stringify(vcMeetingProfileActiveRecoveryCard(session, selected, member, 'pending')),
+    'interactive',
+    `vc_${session.state.meeting.id.slice(-12)}_consumer_recovery_${memberToken}_${state.activeRecoveryNonce.slice(0, 8)}`,
+  );
+}
+
+async function resolveVcMeetingProfileActiveRecoveryCard(
+  session: VcMeetingDaemonSession,
+  selected: VcMeetingRuntimeSelectedAgent,
+  member: VcMeetingHubMemberRecord,
+  status: 'recovered' | 'abandoned',
+): Promise<void> {
+  const state = session.consumerMemberStates[selected.memberId] ??= {};
+  if (state.activeRecoveryCardMessageId) {
+    await updateMessage(
+      session.larkAppId,
+      state.activeRecoveryCardMessageId,
+      JSON.stringify(vcMeetingProfileActiveRecoveryCard(session, selected, member, status)),
+    );
+  }
+  state.activeRecoveryNonce = undefined;
+  state.activeRecoveryCardMessageId = undefined;
+  state.activeRecoveryApplying = false;
+  state.restoreBlocked = false;
+}
+
+async function resumeVcMeetingProfileFromNow(
+  key: string,
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  selected: VcMeetingRuntimeSelectedAgent,
+): Promise<{ ok: true; oldMember: VcMeetingHubMemberRecord } | { ok: false; error: string }> {
+  if (session.consumerSelectionApplying || session.consumerSelectionPromise) {
+    return { ok: false, error: '会议 agent membership 正在变更，请稍后重试' };
+  }
+  const prior = vcMeetingLatestProfileMember(session, selected.memberId);
+  const listenerChatId = session.listenerChatId ?? configuredVcMeetingListenerChatId(cfg);
+  const profile = vcMeetingProfileFromRuntimeAgent(selected);
+  if (!prior || !listenerChatId) {
+    return { ok: false, error: '当前 profile 没有可恢复的 durable member' };
+  }
+  session.consumerSelectionApplying = true;
+  const settleMembershipMutation = beginVcMeetingMembershipMutationBarrier(session);
+  try {
+    await removeVcMeetingProfileMember(session, selected);
+    const active = await activateVcMeetingConsumerProfile(session, profile, listenerChatId, {
+      ...(selected.deliveryProfileHash
+        ? { deliveryProfileHash: selected.deliveryProfileHash }
+        : {}),
+    });
+    session.selectedAgents = session.selectedAgents.map(current =>
+      current.profileId === selected.profileId ? active : current);
+    session.consumerMemberStates[selected.memberId] = {};
+    session.consumerRestoreCatchUpRequired = session.selectedAgents
+      .filter(current => current.status === 'active')
+      .some((current) => {
+        const member = vcMeetingLatestProfileMember(session, current.memberId);
+        return !member || !vcMeetingProfileRestoreBodiesAvailable(session, member);
+      });
+    persistVcMeetingRuntimeSession(session, cfg);
+    scheduleVcMeetingConsumerInjection(key, cfg);
+    void injectVcMeetingConsumerSession(key, cfg, { force: true, final: session.ended }).catch(() => undefined);
+    return { ok: true, oldMember: prior };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    session.selectedAgents = session.selectedAgents.map(current =>
+      current.profileId === selected.profileId
+        ? { ...current, status: 'failed', activationError: message }
+        : current);
+    persistVcMeetingRuntimeSession(session, cfg);
+    return { ok: false, error: message };
+  } finally {
+    settleMembershipMutation();
+    session.consumerSelectionApplying = false;
+  }
+}
+
 async function sendVcMeetingConsumerSelectionCard(
   key: string,
   session: VcMeetingDaemonSession,
@@ -5457,8 +11070,26 @@ async function sendVcMeetingConsumerSelectionCard(
   const listenerChatId = session.listenerChatId ?? configuredVcMeetingListenerChatId(cfg);
   if (!listenerChatId) return;
 
-  const candidates = vcMeetingConsumerCandidates(cfg);
-  if (candidates.length === 0) {
+  const profileMode = vcMeetingConsumerUsesProfiles(cfg);
+  const candidates = profileMode ? [] : vcMeetingConsumerCandidates(cfg);
+  let profiles: readonly VcMeetingConsumerProfileConfig[] = [];
+  if (profileMode) {
+    try {
+      // Resolve the configured default selection before exposing or arming the
+      // selection card. This is the daemon-side last line of defence for a
+      // hand-edited config; never rely on Dashboard PUT validation alone.
+      profiles = vcMeetingConsumerProfileResolution(cfg).profiles;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      commitVcMeetingConsumerListenOnly(session, cfg);
+      logger.error(
+        `[vc-agent] invalid meeting consumer profile defaults; fail closed to listen-only `
+        + `meeting=${session.state.meeting.id}: ${message}`,
+      );
+      return;
+    }
+  }
+  if ((!profileMode && candidates.length === 0) || (profileMode && profiles.length === 0)) {
     commitVcMeetingConsumerListenOnly(session, cfg);
     return;
   }
@@ -5468,16 +11099,7 @@ async function sendVcMeetingConsumerSelectionCard(
   session.consumerSelectionNonce = randomVcMeetingNonce();
   session.consumerSelectionExpiresAt = Date.now() + timeoutMs;
   persistVcMeetingRuntimeSession(session, cfg);
-  const defaultSelection = vcMeetingResolveDefaultConsumerSelection(cfg);
-  const cardJson = buildVcMeetingConsumerCard({
-    status: 'pending',
-    meeting: session.state.meeting,
-    nonce: session.consumerSelectionNonce,
-    candidates: vcMeetingConsumerCardCandidates(cfg),
-    defaultMode: defaultSelection.mode,
-    syncIntervalMs: vcMeetingSessionFlushIntervalMs(session, cfg),
-    ...(defaultSelection.mode === 'agent' ? { defaultAgentAppId: defaultSelection.agentAppId } : {}),
-  });
+  const cardJson = JSON.stringify(vcMeetingConsumerCardForSession('pending', session, cfg));
   let messageId: string;
   try {
     messageId = await sendMessage(
@@ -5485,7 +11107,7 @@ async function sendVcMeetingConsumerSelectionCard(
       listenerChatId,
       cardJson,
       'interactive',
-      `vc_${session.state.meeting.id.slice(-12)}_consumer`,
+      `vc_${session.state.meeting.id.slice(-12)}_consumer_${session.consumerSelectionNonce.slice(0, 12)}`,
     );
   } catch (err) {
     commitVcMeetingConsumerListenOnly(session, cfg);
@@ -5498,15 +11120,172 @@ async function sendVcMeetingConsumerSelectionCard(
   logger.info(`[vc-agent] meeting consumer selection card sent meeting=${session.state.meeting.id} chat=${listenerChatId} timeoutMs=${timeoutMs}`);
 }
 
+function ensureVcMeetingRestoredSelectionCard(
+  key: string,
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+): Promise<void> {
+  if (!session.consumerRestoreSelectionCardRequired) {
+    return session.consumerRestoreSelectionCardPromise ?? Promise.resolve();
+  }
+  if (session.consumerRestoreSelectionCardPromise) return session.consumerRestoreSelectionCardPromise;
+  const work = sendVcMeetingConsumerSelectionCard(key, session, cfg)
+    .then(() => {
+      session.consumerRestoreSelectionCardRequired = false;
+    })
+    .finally(() => {
+      if (session.consumerRestoreSelectionCardPromise === work) {
+        session.consumerRestoreSelectionCardPromise = undefined;
+      }
+    });
+  session.consumerRestoreSelectionCardPromise = work;
+  return work;
+}
+
+function vcMeetingListenerRejoinCardForSession(
+  session: VcMeetingDaemonSession,
+  status: Parameters<typeof buildVcMeetingListenerRejoinCard>[0]['status'],
+  opts: { nonce?: string; error?: string } = {},
+): any {
+  return JSON.parse(buildVcMeetingListenerRejoinCard({
+    status,
+    meeting: session.state.meeting,
+    nonce: opts.nonce ?? session.listenerRejoinNonce ?? '',
+    ...(opts.error ? { error: opts.error } : {}),
+  }));
+}
+
+async function resolveVcMeetingListenerRejoinCard(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  status: 'rejoined' | 'expired',
+): Promise<any> {
+  const card = vcMeetingListenerRejoinCardForSession(session, status);
+  const cardMessageId = session.listenerRejoinCardMessageId;
+  session.listenerRejoinNonce = undefined;
+  session.listenerRejoinCardMessageId = undefined;
+  // Retire the capability before patching the UI. A daemon restart between
+  // these operations must make the old card inert, never re-run BotJoinMeeting.
+  persistVcMeetingRuntimeSession(session, cfg);
+  if (cardMessageId) {
+    await updateMessage(session.larkAppId, cardMessageId, JSON.stringify(card)).catch((err) => {
+      logger.warn(
+        `[vc-agent] listener rejoin card patch failed meeting=${session.state.meeting.id}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
+  return card;
+}
+
+async function sendVcMeetingListenerRejoinCard(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+): Promise<void> {
+  const listenerChatId = session.listenerChatId;
+  if (!listenerChatId || session.listenerRejoinCardMessageId) return;
+  const nonce = session.listenerRejoinNonce ?? randomVcMeetingNonce();
+  session.listenerRejoinNonce = nonce;
+  // Write the capability before publishing it so an already-delivered card
+  // remains actionable after a daemon crash/restart.
+  persistVcMeetingRuntimeSession(session, cfg);
+  try {
+    session.listenerRejoinCardMessageId = await sendMessage(
+      session.larkAppId,
+      listenerChatId,
+      buildVcMeetingListenerRejoinCard({
+        status: 'pending',
+        meeting: session.state.meeting,
+        nonce,
+      }),
+      'interactive',
+      `vc_${session.state.meeting.id.slice(-12)}_listener_rejoin_${nonce.slice(0, 12)}`,
+    );
+    persistVcMeetingRuntimeSession(session, cfg);
+    logger.warn(
+      `[vc-agent] listener bot removed; rejoin confirmation sent meeting=${session.state.meeting.id} `
+      + `chat=${listenerChatId}`,
+    );
+  } catch (err) {
+    logger.warn(
+      `[vc-agent] listener rejoin card send failed meeting=${session.state.meeting.id}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+async function markVcMeetingListenerPresenceStale(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  occurredAtMs?: number,
+): Promise<void> {
+  if (occurredAtMs !== undefined
+    && session.listenerPresenceChangedAtMs !== undefined
+    && occurredAtMs <= session.listenerPresenceChangedAtMs) {
+    return;
+  }
+  const wasStale = session.listenerPresenceStale === true;
+  session.listenerPresenceGeneration = (session.listenerPresenceGeneration ?? 0) + 1;
+  session.listenerPresenceChangedAtMs = occurredAtMs ?? Date.now();
+  session.listenerPresenceStale = true;
+  session.joined = false;
+  // Keep the monitoring ownership alive. listenerPresenceStale is the
+  // explicit fence; clearing monitoringStarted would incorrectly route a
+  // later generic participant event through the initial confirmation flow.
+  session.monitoringStarted = true;
+  persistVcMeetingRuntimeSession(session, cfg);
+  const voice = session.realtimeVoice;
+  session.realtimeVoice = undefined;
+  if (voice) {
+    await voice.stop('listener-removed').catch((err) => {
+      logger.warn(
+        `[vc-agent] realtime voice stop after listener removal failed meeting=${session.state.meeting.id}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
+  if (!wasStale || !session.listenerRejoinCardMessageId) {
+    await sendVcMeetingListenerRejoinCard(session, cfg);
+  }
+}
+
+async function restoreVcMeetingMonitoringAfterObservedJoin(
+  key: string,
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  occurredAtMs?: number,
+): Promise<void> {
+  if (occurredAtMs !== undefined
+    && session.listenerPresenceChangedAtMs !== undefined
+    && occurredAtMs < session.listenerPresenceChangedAtMs) {
+    return;
+  }
+  session.listenerPresenceGeneration = (session.listenerPresenceGeneration ?? 0) + 1;
+  session.listenerPresenceChangedAtMs = occurredAtMs ?? Date.now();
+  session.listenerPresenceStale = false;
+  session.joined = true;
+  session.monitoringStarted = true;
+  persistVcMeetingRuntimeSession(session, cfg);
+  scheduleVcMeetingListenerFlush(key, cfg);
+  void maybeStartVcMeetingRealtimeVoice(session.larkAppId, session, cfg);
+  await resolveVcMeetingListenerRejoinCard(session, cfg, 'rejoined');
+  logger.info(`[vc-agent] listener monitoring restored from own join event meeting=${session.state.meeting.id}`);
+}
+
 async function startVcMeetingMonitoring(input: {
   larkAppId: string;
   key: string;
   session: VcMeetingDaemonSession;
   cfg: VcMeetingAgentConfig;
   targetOpenId?: string;
-  source: 'manual-invite' | 'confirm-card';
+  source: 'manual-invite' | 'confirm-card' | 'rejoin-card';
+  forceJoin?: boolean;
 }): Promise<VcMeetingStartResult> {
-  if (input.session.monitoringStarted && input.session.listenerChatId) {
+  if (!input.forceJoin
+    && input.session.monitoringStarted
+    && input.session.joined
+    && !input.session.listenerPresenceStale
+    && input.session.listenerChatId) {
     return {
       ok: true,
       meeting: input.session.state.meeting,
@@ -5520,12 +11299,13 @@ async function startVcMeetingMonitoring(input: {
     let currentKey = input.key;
     const session = input.session;
     let meeting = session.state.meeting;
+    const presenceGenerationAtStart = session.listenerPresenceGeneration ?? 0;
     try {
       if (session.ended || hasRecentVcMeetingEndedTombstone(currentKey)) {
         throw new Error('meeting already ended');
       }
 
-      if (!session.joined) {
+      if (input.forceJoin || !session.joined || session.listenerPresenceStale) {
         if (!input.cfg.larkCliProfile) {
           throw new Error('缺少 vcMeetingAgent.larkCliProfile，拒绝使用 lark-cli 默认 profile 入会');
         }
@@ -5533,8 +11313,12 @@ async function startVcMeetingMonitoring(input: {
           throw new Error('会议事件没有 meeting_no，无法执行 BotJoinMeeting');
         }
         const joined = joinMeetingAsBot({ meetingNumber: meeting.meetingNo, profile: input.cfg.larkCliProfile });
-        session.joined = true;
         if (joined.meetingId && joined.meetingId !== meeting.id) {
+          if (input.forceJoin || session.listenerPresenceStale) {
+            throw new Error(
+              `rejoin meeting id mismatch expected=${meeting.id} joined=${joined.meetingId}`,
+            );
+          }
           const nextKey = vcMeetingSessionKey(input.larkAppId, joined.meetingId);
           if (hasRecentVcMeetingEndedTombstone(nextKey)) {
             throw new Error(`joined meeting ${joined.meetingId} is already ended`);
@@ -5546,6 +11330,7 @@ async function startVcMeetingMonitoring(input: {
           vcMeetingSessions.set(nextKey, session);
           currentKey = nextKey;
         }
+        session.joined = true;
         logger.info(`[vc-agent] ${input.source} joined meeting=${meeting.id} meetingNo=${meeting.meetingNo} profile=${input.cfg.larkCliProfile}`);
       } else {
         logger.info(`[vc-agent] ${input.source} accepted for already joined meeting=${meeting.id}`);
@@ -5567,6 +11352,17 @@ async function startVcMeetingMonitoring(input: {
       if (session.ended || hasRecentVcMeetingEndedTombstone(currentKey)) {
         throw new Error('meeting ended while monitoring was starting');
       }
+      if (session.listenerPresenceStale
+        && (session.listenerPresenceGeneration ?? 0) !== presenceGenerationAtStart) {
+        // The listener may have been removed while the initial start was still
+        // creating its listener chat. The leave handler could not publish a
+        // recovery card before that chat existed, so close the race here.
+        if (!session.listenerRejoinCardMessageId) {
+          await sendVcMeetingListenerRejoinCard(session, input.cfg);
+        }
+        throw new Error('listener was removed again while rejoining');
+      }
+      session.listenerPresenceStale = false;
       session.monitoringStarted = true;
       persistVcMeetingRuntimeSession(session, input.cfg);
       scheduleVcMeetingListenerFlush(currentKey, input.cfg);
@@ -5583,6 +11379,7 @@ async function startVcMeetingMonitoring(input: {
       await sendVcMeetingConsumerSelectionCard(currentKey, session, input.cfg).catch((err) => {
         logger.warn(`[vc-agent] meeting consumer selection card failed meeting=${meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
       });
+      await resolveVcMeetingListenerRejoinCard(session, input.cfg, 'rejoined');
       return { ok: true, meeting, listenerChatId, key: currentKey };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -5669,15 +11466,576 @@ function scheduleVcMeetingListenerFlush(
   if (typeof session.flushTimer.unref === 'function') session.flushTimer.unref();
 }
 
+function vcMeetingConsumerFinalAcked(
+  session: VcMeetingDaemonSession,
+  cfg?: VcMeetingAgentConfig,
+): boolean {
+  if ((cfg && vcMeetingConsumerUsesProfiles(cfg)) || session.selectedAgents.length > 0) {
+    const members = vcMeetingSelectedProfileCloseMembers(session);
+    return members.length > 0 && members.every(({ member }) =>
+      member?.status === 'removed' || member?.finalAckedAt !== undefined);
+  }
+  if (!session.selectedAgentAppId) return true;
+  const member = vcMeetingLatestSingleConsumerMember(session);
+  return !!member
+    && member.agentAppId === session.selectedAgentAppId
+    && member.finalAckedAt !== undefined;
+}
+
+function vcMeetingSessionHasConsumerMembers(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+): boolean {
+  return vcMeetingSessionUsesProfileMembers(session, cfg)
+    ? session.selectedAgents.some(selected => selected.status === 'active' || selected.status === 'paused')
+    : !!session.selectedAgentAppId;
+}
+
+function vcMeetingSelectedProfileCloseMembers(
+  session: VcMeetingDaemonSession,
+): Array<{ memberId: string; member?: VcMeetingHubMemberRecord }> {
+  const seen = new Set<string>();
+  return session.selectedAgents
+    .filter(selected => selected.status === 'active'
+      || selected.status === 'paused'
+      || selected.status === 'activating')
+    .filter((selected) => {
+      if (seen.has(selected.memberId)) return false;
+      seen.add(selected.memberId);
+      return true;
+    })
+    .map(selected => ({
+      memberId: selected.memberId,
+      member: vcMeetingLatestProfileMember(session, selected.memberId),
+    }));
+}
+
+function vcMeetingProfileCloseAuditMember(
+  session: VcMeetingDaemonSession,
+): VcMeetingHubMemberRecord | undefined {
+  return vcMeetingSelectedProfileCloseMembers(session)
+    .map(candidate => candidate.member)
+    .filter((member): member is VcMeetingHubMemberRecord => !!member)
+    .sort((a, b) =>
+      Number(b.ownerBootId === getDaemonBootId()) - Number(a.ownerBootId === getDaemonBootId())
+      || b.ownerEpoch - a.ownerEpoch
+      || b.updatedAt - a.updatedAt)[0];
+}
+
+function vcMeetingRecoveryGapForProfileMember(
+  session: VcMeetingDaemonSession,
+  member: VcMeetingHubMemberRecord,
+): VcMeetingDeliveryGap | undefined {
+  const feedState = getVcMeetingFeedMetadataState(config.session.dataDir, {
+    listenerAppId: session.larkAppId,
+    meetingId: session.state.meeting.id,
+  });
+  const pending = new Set(session.consumerPendingItems.map((candidate) => {
+    const identity = vcMeetingCanonicalFeedIdentity(candidate);
+    return `${candidate.ingestSeq}\u0000${identity.itemVersionKey}\u0000${identity.contentHash}`;
+  }));
+  const acked = new Map(
+    member.ackedItemVersions.map(item => [item.itemVersionKey, item.contentHash] as const),
+  );
+  const missing = new Map<string, (typeof feedState.items)[string]>();
+  const addMissing = (itemVersionKey: string, ingestSeq: number, contentHash: string): void => {
+    if (pending.has(`${ingestSeq}\u0000${itemVersionKey}\u0000${contentHash}`)) return;
+    const metadata = feedState.items[itemVersionKey];
+    if (metadata?.contentHash === contentHash) missing.set(itemVersionKey, metadata);
+  };
+  for (const entry of member.inFlight?.entries ?? []) {
+    if (entry.kind !== 'item'
+      || entry.ingestSeq === undefined
+      || !entry.itemVersionKey
+      || !entry.contentHash) continue;
+    addMissing(entry.itemVersionKey, entry.ingestSeq, entry.contentHash);
+  }
+  for (const latest of Object.values(feedState.latestByItemKey)) {
+    if (latest.ingestSeq <= member.joinedAtIngestSeq) continue;
+    const metadata = feedState.items[latest.itemVersionKey];
+    if (!metadata) continue;
+    if (member.filter?.activityTypes?.length
+      && !member.filter.activityTypes.includes(metadata.itemType)) continue;
+    if (acked.get(latest.itemVersionKey) === latest.contentHash) continue;
+    addMissing(latest.itemVersionKey, latest.ingestSeq, latest.contentHash);
+  }
+  const ordered = [...missing.values()].sort((a, b) => a.ingestSeq - b.ingestSeq);
+  if (ordered.length === 0) return undefined;
+  const occurred = ordered
+    .map(item => item.occurredAtMs)
+    .filter((value): value is number => value !== undefined && Number.isFinite(value));
+  return {
+    reason: 'poll_unavailable',
+    missingItemVersionKey: ordered[0]!.itemVersionKey,
+    originalContentHash: ordered[0]!.contentHash,
+    ...(occurred.length > 0 ? {
+      occurredFromMs: Math.min(...occurred),
+      occurredToMs: Math.max(...occurred),
+    } : {}),
+  };
+}
+
+/** After the normal close retry horizon, replace only an active member's
+ * still-unassigned missing bodies with that member's own gap. A frozen stream
+ * is deliberately excluded: without receiver never-accept proof its input
+ * hash cannot be rewritten safely and it must follow the retirement path. */
+function stageVcMeetingProfileRecoveryGapsForClose(session: VcMeetingDaemonSession): number {
+  let staged = 0;
+  for (const { memberId, member } of vcMeetingSelectedProfileCloseMembers(session)) {
+    if (!member
+      || member.status !== 'active'
+      || member.finalAckedAt !== undefined
+      || member.inFlight
+      || vcMeetingProfileRestoreBodiesAvailable(session, member)) continue;
+    const memberState = session.consumerMemberStates[memberId] ??= {};
+    if (memberState.recoveryGap) continue;
+    memberState.recoveryGap = vcMeetingRecoveryGapForProfileMember(session, member)
+      ?? { reason: 'poll_unavailable' };
+    staged += 1;
+    logger.error(
+      `[vc-agent] sealing member-scoped recovery gap meeting=${session.state.meeting.id} `
+      + `member=${memberId}`,
+    );
+  }
+  return staged;
+}
+
+function reconcileVcMeetingProfileFrozenCompletionWithoutBody(
+  session: VcMeetingDaemonSession,
+  member: VcMeetingHubMemberRecord,
+): boolean {
+  const assignment = member.inFlight;
+  if (!assignment) return false;
+  const lookup = findVcMeetingDeliveryByKey(config.session.dataDir, assignment.deliveryKey, {
+    receiverSessionId: member.receiverSessionId,
+  });
+  if (lookup?.receipt.status !== 'completed'
+    || lookup.receiverCommittedThrough < assignment.toSeq) return false;
+  const observed = observeVcMeetingHubReceiverReceipt(config.session.dataDir, {
+    listenerAppId: member.listenerAppId,
+    meetingId: member.meetingId,
+    memberId: member.memberId,
+    memberEpoch: member.memberEpoch,
+    ownerBootId: member.ownerBootId,
+    ownerEpoch: member.ownerEpoch,
+    deliveryKey: assignment.deliveryKey,
+    inputHash: assignment.inputHash,
+    fromSeq: assignment.fromSeq,
+    toSeq: assignment.toSeq,
+    status: 'completed',
+    receiverCommittedThrough: lookup.receiverCommittedThrough,
+  });
+  if (!observed.ok) return false;
+  const memberState = session.consumerMemberStates[member.memberId] ??= {};
+  clearAckedVcMeetingProfileDelivery(session, memberState, assignment);
+  return true;
+}
+
+function finishVcMeetingConsumerCloseAudit(
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+  phase: 'data_closing' | 'finalizing' | 'closed',
+  reason: string,
+  deadlineAt?: number,
+): boolean {
+  const member = vcMeetingSessionUsesProfileMembers(session, cfg)
+    ? vcMeetingProfileCloseAuditMember(session)
+    : vcMeetingLatestSingleConsumerMember(session);
+  if (!member) return false;
+  try {
+    const result = updateVcMeetingHubCloseState(config.session.dataDir, {
+      listenerAppId: session.larkAppId,
+      meetingId: session.state.meeting.id,
+      ownerBootId: member.ownerBootId,
+      ownerEpoch: member.ownerEpoch,
+      phase,
+      ...(deadlineAt !== undefined ? { finalizationDeadlineAt: deadlineAt } : {}),
+      reason,
+    });
+    if (!result.ok) {
+      logger.error(
+        `[vc-agent] consumer close audit rejected meeting=${session.state.meeting.id} `
+        + `phase=${phase} reason=${result.reason}`,
+      );
+      return false;
+    }
+    if (phase === 'closed') {
+      session.consumerClosePhase = undefined;
+      session.consumerFinalizationDeadlineAt = undefined;
+      session.consumerCloseResolutionDeadlineAt = undefined;
+      removeVcMeetingRuntimeSession(
+        config.session.dataDir,
+        session.larkAppId,
+        session.state.meeting.id,
+      );
+    } else {
+      session.consumerClosePhase = phase;
+      session.consumerFinalizationDeadlineAt = deadlineAt;
+      persistVcMeetingRuntimeSession(session, cfg);
+    }
+    return true;
+  } catch (err) {
+    logger.error(
+      `[vc-agent] consumer close audit persistence failed meeting=${session.state.meeting.id} `
+      + `phase=${phase}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
+async function closeRetiredVcMeetingConsumerRecovery(
+  key: string,
+  closing: { session: VcMeetingDaemonSession; cfg: VcMeetingAgentConfig; deadlineAt: number },
+  reason: string,
+): Promise<boolean> {
+  const member = vcMeetingLatestSingleConsumerMember(closing.session);
+  if (!member) return false;
+  const gap = vcMeetingRecoveryGapForMissingBodies(closing.session);
+  if (!retireVcMeetingSingleConsumerForRecovery(closing.session, reason)) return false;
+  if (!finishVcMeetingConsumerCloseAudit(
+    closing.session,
+    closing.cfg,
+    'finalizing',
+    reason,
+    closing.deadlineAt,
+  )) return false;
+  if (!finishVcMeetingConsumerCloseAudit(
+    closing.session,
+    closing.cfg,
+    'closed',
+    reason,
+    closing.deadlineAt,
+  )) return false;
+  await sendVcMeetingRecoveryTerminalNotice(closing.session, {
+    kind: 'epoch_retired',
+    memberId: member.memberId,
+    memberEpoch: member.memberEpoch,
+    reason,
+    ...(gap ? { gap } : {}),
+  }).catch((err) => {
+    logger.warn(
+      `[vc-agent] terminal retirement notice failed meeting=${closing.session.state.meeting.id}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  });
+  vcMeetingClosingConsumerSessions.delete(key);
+  return true;
+}
+
+async function pumpVcMeetingProfileConsumerClose(
+  key: string,
+  closing: { session: VcMeetingDaemonSession; cfg: VcMeetingAgentConfig; deadlineAt: number; resolutionDeadlineAt?: number },
+): Promise<boolean> {
+  // Recovery-card mutations intentionally remain available after the listener
+  // session ends. Never finalize against a membership snapshot that is being
+  // replaced; the next pump will observe the new durable epoch.
+  if (closing.session.consumerSelectionPromise) return false;
+  if (closing.session.consumerRestoreCatchUpRequired) {
+    // Rehydration is shared, but finalization decisions below are member-scoped:
+    // one unavailable profile must not prevent a recoverable sibling from ACKing.
+    catchUpVcMeetingConsumerForRestore(closing.session, closing.cfg);
+  }
+
+  // Snapshot a frozen gap before completion reconciliation clears inFlight.
+  // A receiver may have committed between pumps; the next pump must still
+  // emit the deterministic member-scoped terminal notice.
+  const gapByMember = new Map<string, VcMeetingDeliveryGap>();
+  for (const { memberId, member } of vcMeetingSelectedProfileCloseMembers(closing.session)) {
+    const gap = member?.inFlight?.entries.find(entry => entry.kind === 'gap')?.gap
+      ?? closing.session.consumerMemberStates[memberId]?.recoveryGap;
+    if (gap) gapByMember.set(memberId, gap);
+  }
+  for (const { member } of vcMeetingSelectedProfileCloseMembers(closing.session)) {
+    if (member?.inFlight) reconcileVcMeetingProfileFrozenCompletionWithoutBody(closing.session, member);
+  }
+  if (Date.now() >= closing.deadlineAt) {
+    stageVcMeetingProfileRecoveryGapsForClose(closing.session);
+  }
+  const before = vcMeetingSelectedProfileCloseMembers(closing.session);
+  for (const { memberId, member } of before) {
+    if (!member || member.status === 'removed' || member.finalAckedAt !== undefined) continue;
+    const frozenGap = member.inFlight?.entries.find(entry => entry.kind === 'gap')?.gap;
+    const gap = frozenGap
+      ?? closing.session.consumerMemberStates[memberId]?.recoveryGap
+      ?? vcMeetingRecoveryGapForProfileMember(closing.session, member);
+    if (gap) gapByMember.set(memberId, gap);
+  }
+
+  if (!finishVcMeetingConsumerCloseAudit(
+    closing.session,
+    closing.cfg,
+    'finalizing',
+    'profile_consumers_finalizing',
+    closing.deadlineAt,
+  )) return false;
+
+  await injectVcMeetingConsumerSession(key, closing.cfg, { final: true, force: true });
+  if (closing.session.consumerSelectionPromise) return false;
+  const afterAttempt = vcMeetingSelectedProfileCloseMembers(closing.session);
+  for (const { memberId, member } of afterAttempt) {
+    const gap = gapByMember.get(memberId);
+    if (!gap || !member || member.finalAckedAt === undefined) continue;
+    await sendVcMeetingRecoveryTerminalNotice(closing.session, {
+      kind: 'gap_committed',
+      memberId,
+      memberEpoch: member.memberEpoch,
+      reason: gap.reason,
+      gap,
+    }).catch((err) => {
+      logger.warn(
+        `[vc-agent] terminal profile gap notice failed meeting=${closing.session.state.meeting.id} `
+        + `member=${memberId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+    if (closing.session.consumerSelectionPromise) return false;
+  }
+
+  if (closing.session.consumerSelectionPromise) return false;
+  if (vcMeetingConsumerFinalAcked(closing.session, closing.cfg)) {
+    const closed = finishVcMeetingConsumerCloseAudit(
+      closing.session,
+      closing.cfg,
+      'closed',
+      'profile_consumers_resolved',
+      closing.deadlineAt,
+    );
+    if (closed) {
+      vcMeetingClosingConsumerSessions.delete(key);
+      logger.info(`[vc-agent] profile consumer finalization resolved meeting=${closing.session.state.meeting.id}`);
+      return true;
+    }
+  }
+
+  if (closing.resolutionDeadlineAt === undefined || Date.now() < closing.resolutionDeadlineAt) {
+    return false;
+  }
+
+  const unresolved = vcMeetingSelectedProfileCloseMembers(closing.session)
+    .map(candidate => candidate.member)
+    .filter((member): member is VcMeetingHubMemberRecord =>
+      !!member && member.status !== 'removed' && member.finalAckedAt === undefined);
+  for (const member of unresolved) {
+    if (closing.session.consumerSelectionPromise) return false;
+    const gap = gapByMember.get(member.memberId)
+      ?? closing.session.consumerMemberStates[member.memberId]?.recoveryGap
+      ?? vcMeetingRecoveryGapForProfileMember(closing.session, member);
+    const reason = `consumer_recovery_abandoned:${member.inFlight?.deliveryKey ?? member.memberId}`;
+    if (!retireVcMeetingProfileMemberForRecovery(member, reason)) return false;
+    await sendVcMeetingRecoveryTerminalNotice(closing.session, {
+      kind: 'epoch_retired',
+      memberId: member.memberId,
+      memberEpoch: member.memberEpoch,
+      reason,
+      ...(gap ? { gap } : {}),
+    }).catch((err) => {
+      logger.warn(
+        `[vc-agent] terminal profile retirement notice failed meeting=${closing.session.state.meeting.id} `
+        + `member=${member.memberId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+    if (closing.session.consumerSelectionPromise) return false;
+  }
+
+  if (closing.session.consumerSelectionPromise) return false;
+  if (!vcMeetingConsumerFinalAcked(closing.session, closing.cfg)) return false;
+  const closed = finishVcMeetingConsumerCloseAudit(
+    closing.session,
+    closing.cfg,
+    'closed',
+    'profile_consumers_partially_retired',
+    closing.deadlineAt,
+  );
+  if (!closed) return false;
+  vcMeetingClosingConsumerSessions.delete(key);
+  logger.info(`[vc-agent] profile consumer close retired unresolved members meeting=${closing.session.state.meeting.id}`);
+  return true;
+}
+
+function scheduleVcMeetingConsumerClosePump(key: string): void {
+  const closing = vcMeetingClosingConsumerSessions.get(key);
+  if (!closing || closing.timer) return;
+  closing.timer = setTimeout(() => {
+    const current = vcMeetingClosingConsumerSessions.get(key);
+    if (!current) return;
+    current.timer = undefined;
+    void (async () => {
+      if (current.session.consumerSelectionApplying || current.session.consumerSelectionPromise) {
+        scheduleVcMeetingConsumerClosePump(key);
+        return;
+      }
+      if (Date.now() >= current.deadlineAt && current.resolutionDeadlineAt === undefined) {
+        current.resolutionDeadlineAt = current.deadlineAt
+          + vcMeetingConsumerRecoveryResolutionGraceMs();
+        current.session.consumerCloseResolutionDeadlineAt = current.resolutionDeadlineAt;
+        persistVcMeetingRuntimeSession(current.session, current.cfg);
+      }
+      if (Date.now() >= current.deadlineAt && !current.timedOut) {
+        current.timedOut = true;
+        finishVcMeetingConsumerCloseAudit(
+          current.session,
+          current.cfg,
+          'finalizing',
+          'consumer_finalization_timeout_reconciling',
+          current.deadlineAt,
+        );
+        logger.error(
+          `[vc-agent] consumer finalization timed out meeting=${current.session.state.meeting.id}; `
+          + 'continuing slow durable reconciliation',
+        );
+      }
+      if (vcMeetingConsumerUsesProfiles(current.cfg)) {
+        if (await pumpVcMeetingProfileConsumerClose(key, current)) return;
+        scheduleVcMeetingConsumerClosePump(key);
+        return;
+      }
+      if (current.session.consumerRestoreCatchUpRequired) {
+        current.session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(
+          current.session,
+          current.cfg,
+        );
+        if (current.session.consumerRestoreCatchUpRequired) {
+          if (!current.timedOut) {
+            scheduleVcMeetingConsumerClosePump(key);
+            return;
+          }
+          const member = vcMeetingLatestSingleConsumerMember(current.session);
+          if (member?.inFlight) {
+            if (reconcileVcMeetingFrozenCompletionWithoutBody(current.session)) {
+              current.session.consumerRestoreCatchUpRequired = false;
+            } else {
+              if (current.resolutionDeadlineAt === undefined
+                || Date.now() < current.resolutionDeadlineAt) {
+                scheduleVcMeetingConsumerClosePump(key);
+                return;
+              }
+              const reason = `consumer_recovery_abandoned:${member.inFlight.deliveryKey}`;
+              if (await closeRetiredVcMeetingConsumerRecovery(key, current, reason)) return;
+              scheduleVcMeetingConsumerClosePump(key);
+              return;
+            }
+          } else {
+            current.session.consumerRecoveryGap = vcMeetingRecoveryGapForMissingBodies(current.session)
+              ?? { reason: 'poll_unavailable' };
+            current.session.consumerRestoreCatchUpRequired = false;
+            current.session.consumerPaused = false;
+            current.session.consumerRecoveryCardRequired = false;
+            logger.error(
+              `[vc-agent] sealing recovery gap meeting=${current.session.state.meeting.id}; `
+              + `resolutionDeadlineAt=${current.resolutionDeadlineAt}`,
+            );
+          }
+        }
+      }
+      const before = vcMeetingLatestSingleConsumerMember(current.session);
+      const recoveryGapBeforeAttempt = current.session.consumerRecoveryGap
+        ?? before?.inFlight?.entries.find(entry => entry.kind === 'gap')?.gap;
+      if (!before?.inFlight || before.inFlight.final) {
+        finishVcMeetingConsumerCloseAudit(
+          current.session,
+          current.cfg,
+          'finalizing',
+          'consumer_finalizing',
+          current.deadlineAt,
+        );
+      }
+      const result = await injectVcMeetingConsumerSession(key, current.cfg, { final: true, force: true });
+      if (result.ok && vcMeetingConsumerFinalAcked(current.session, current.cfg)) {
+        if (recoveryGapBeforeAttempt) {
+          await sendVcMeetingRecoveryTerminalNotice(current.session, {
+            kind: 'gap_committed',
+            memberId: before?.memberId ?? VC_MEETING_SINGLE_CONSUMER_MEMBER_ID,
+            memberEpoch: before?.memberEpoch ?? 0,
+            reason: recoveryGapBeforeAttempt.reason,
+            gap: recoveryGapBeforeAttempt,
+          }).catch((err) => {
+            logger.warn(
+              `[vc-agent] terminal gap notice failed meeting=${current.session.state.meeting.id}: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+        }
+        const closed = finishVcMeetingConsumerCloseAudit(
+          current.session,
+          current.cfg,
+          'closed',
+          'consumer_final_acked',
+          current.deadlineAt,
+        );
+        if (closed) {
+          vcMeetingClosingConsumerSessions.delete(key);
+          logger.info(`[vc-agent] consumer final marker committed meeting=${current.session.state.meeting.id}`);
+          return;
+        }
+      }
+      if (current.resolutionDeadlineAt !== undefined && Date.now() >= current.resolutionDeadlineAt) {
+        const member = vcMeetingLatestSingleConsumerMember(current.session);
+        const reason = `consumer_gap_resolution_abandoned:${member?.inFlight?.deliveryKey ?? 'unavailable'}`;
+        if (await closeRetiredVcMeetingConsumerRecovery(key, current, reason)) return;
+      }
+      scheduleVcMeetingConsumerClosePump(key);
+    })().catch((err) => {
+      logger.warn(
+        `[vc-agent] consumer close pump failed ${key}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      scheduleVcMeetingConsumerClosePump(key);
+    });
+  }, vcMeetingConsumerCloseRetryMs(closing.timedOut));
+  if (typeof closing.timer.unref === 'function') closing.timer.unref();
+}
+
+function beginVcMeetingDaemonCloseIntent(
+  key: string,
+  session: VcMeetingDaemonSession,
+  cfg: VcMeetingAgentConfig,
+): number {
+  const finalizationDeadlineAt = Date.now() + vcMeetingConsumerCloseHorizonMs();
+  session.ended = true;
+  session.consumerCloseResolutionDeadlineAt = undefined;
+  session.temporaryInstructionOpenIds = {};
+  session.temporaryInstructionUnionIds = {};
+  if (session.consumerMode === 'agent' && vcMeetingSessionHasConsumerMembers(session, cfg)) {
+    // Write the recoverable close intent before the ended tombstone. A crash
+    // after the tombstone but before listener/output draining must restore into
+    // the close pump instead of treating the active runtime record as stale.
+    session.consumerClosePhase = 'data_closing';
+    session.consumerFinalizationDeadlineAt = finalizationDeadlineAt;
+    persistVcMeetingRuntimeSession(session, cfg);
+    finishVcMeetingConsumerCloseAudit(
+      session,
+      cfg,
+      'data_closing',
+      'meeting_ended',
+      finalizationDeadlineAt,
+    );
+  }
+  markVcMeetingEnded(key);
+  return finalizationDeadlineAt;
+}
+
 async function closeVcMeetingDaemonSession(key: string, cfg: VcMeetingAgentConfig): Promise<void> {
   const session = vcMeetingSessions.get(key);
   if (!session) return;
   if (session.ended) return;
-  session.ended = true;
-  session.temporaryInstructionOpenIds = {};
-  session.temporaryInstructionUnionIds = {};
-  markVcMeetingEnded(key);
-  removeVcMeetingRuntimeSession(config.session.dataDir, session.larkAppId, session.state.meeting.id);
+  // Meeting end is a barrier against profile activation. Wait for the one
+  // already-authorized selection to settle, then snapshot every membership it
+  // created into the durable close. New selections fail once this flag is set.
+  session.consumerClosingRequested = true;
+  if (session.consumerSelectionPromise) {
+    await session.consumerSelectionPromise.catch(() => undefined);
+  }
+  if (session.ended) return;
+  const finalizationDeadlineAt = beginVcMeetingDaemonCloseIntent(key, session, cfg);
+  // Establish the durable close barrier before retiring the rejoin capability.
+  // A crash in between must restore into close reconciliation, never back into
+  // an active listener-recovery flow for a meeting that already ended.
+  if (session.listenerRejoinNonce || session.listenerRejoinCardMessageId) {
+    await resolveVcMeetingListenerRejoinCard(session, cfg, 'expired').catch((err) => {
+      logger.warn(
+        `[vc-agent] listener rejoin card expiry failed meeting=${session.state.meeting.id}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
   if (session.flushTimer) {
     clearInterval(session.flushTimer);
     session.flushTimer = undefined;
@@ -5689,8 +12047,38 @@ async function closeVcMeetingDaemonSession(key: string, cfg: VcMeetingAgentConfi
   await expireVcMeetingOutputRequestsOnClose(session);
   if (session.flushPromise) await session.flushPromise;
   if (session.consumerInjectPromise) await session.consumerInjectPromise;
+  await Promise.allSettled(
+    Object.values(session.consumerMemberStates)
+      .map(state => state.injectPromise)
+      .filter((promise): promise is Promise<VcMeetingConsumerInjectResult> => !!promise),
+  );
   const finalFlush = await flushVcMeetingListenerSession(key, cfg, { final: true });
-  const finalConsumerInject = await injectVcMeetingConsumerSession(key, cfg, { final: true });
+  const finalConsumerAttempt = await injectVcMeetingConsumerSession(key, cfg, { final: true, force: true });
+  const finalConsumerCommitted = session.consumerMode !== 'agent'
+    || !vcMeetingSessionHasConsumerMembers(session, cfg)
+    || vcMeetingConsumerFinalAcked(session, cfg);
+  const finalConsumerInject: VcMeetingConsumerInjectResult = finalConsumerCommitted
+    ? finalConsumerAttempt
+    : {
+        ok: false,
+        injected: 0,
+        error: finalConsumerAttempt.ok
+          ? 'durable receiver accepted work but final cursor is still pending; background finalization continues'
+          : finalConsumerAttempt.error,
+      };
+  const finalDeliveryDispatched = vcMeetingSessionUsesProfileMembers(session, cfg)
+    ? vcMeetingSelectedProfileCloseMembers(session)
+      .some(({ member }) => member?.inFlight?.final === true)
+    : vcMeetingLatestSingleConsumerMember(session)?.inFlight?.final === true;
+  if (!finalConsumerCommitted && finalDeliveryDispatched) {
+    finishVcMeetingConsumerCloseAudit(
+      session,
+      cfg,
+      'finalizing',
+      'consumer_final_dispatched',
+      finalizationDeadlineAt,
+    );
+  }
   await session.realtimeVoice?.stop('meeting-ended').catch((err) => {
     logger.warn(`[vc-agent] realtime voice stop failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
   });
@@ -5710,7 +12098,50 @@ async function closeVcMeetingDaemonSession(key: string, cfg: VcMeetingAgentConfi
     });
   }
   vcMeetingSessions.delete(key);
-  logger.info(`[vc-agent] session closed ${key}`);
+  if (!finalConsumerCommitted && session.consumerMode === 'agent'
+    && vcMeetingSessionHasConsumerMembers(session, cfg)) {
+    vcMeetingClosingConsumerSessions.set(key, {
+      session,
+      cfg,
+      deadlineAt: finalizationDeadlineAt,
+    });
+    scheduleVcMeetingConsumerClosePump(key);
+    logger.warn(`[vc-agent] session listener closed; consumer finalization pending ${key}`);
+  } else {
+    if (session.consumerMode === 'agent' && vcMeetingSessionHasConsumerMembers(session, cfg)) {
+      const finalizingPersisted = finishVcMeetingConsumerCloseAudit(
+        session,
+        cfg,
+        'finalizing',
+        'consumer_final_acked',
+        finalizationDeadlineAt,
+      );
+      const closedPersisted = finalizingPersisted && finishVcMeetingConsumerCloseAudit(
+        session,
+        cfg,
+        'closed',
+        'consumer_final_acked',
+        finalizationDeadlineAt,
+      );
+      if (!closedPersisted) {
+        vcMeetingClosingConsumerSessions.set(key, {
+          session,
+          cfg,
+          deadlineAt: finalizationDeadlineAt,
+        });
+        scheduleVcMeetingConsumerClosePump(key);
+        logger.warn(`[vc-agent] session close audit pending durable retry ${key}`);
+        return;
+      }
+    } else {
+      removeVcMeetingRuntimeSession(
+        config.session.dataDir,
+        session.larkAppId,
+        session.state.meeting.id,
+      );
+    }
+    logger.info(`[vc-agent] session closed ${key}`);
+  }
 }
 
 async function sendVcMeetingConfirmCard(
@@ -5791,6 +12222,25 @@ function vcMeetingCardForPending(
   }));
 }
 
+function vcMeetingConsumerCardSession(key: string): {
+  session?: VcMeetingDaemonSession;
+  closingRecovery: boolean;
+} {
+  const active = vcMeetingSessions.get(key);
+  if (active) return { session: active, closingRecovery: false };
+  const closing = vcMeetingClosingConsumerSessions.get(key)?.session;
+  const profilePaused = closing?.selectedAgents.some(selected => selected.status === 'paused') === true;
+  const profileRecovery = closing
+    ? Object.values(closing.consumerMemberStates).some(state => state.restoreBlocked)
+    : false;
+  if (closing?.ended
+    && (closing.consumerPaused || profilePaused || profileRecovery)
+    && closing.consumerClosePhase) {
+    return { session: closing, closingRecovery: true };
+  }
+  return { session: undefined, closingRecovery: false };
+}
+
 async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string): Promise<any> {
   const value = data.action?.value ?? {};
   const action = value.action;
@@ -5820,11 +12270,249 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
     });
   }
 
-  if (action === 'vc_meeting_consumer_stage' || action === 'vc_meeting_consumer_interval') {
+  if (action === 'vc_meeting_listener_rejoin') {
     const cfg = effectiveVcMeetingAgentConfig(larkAppId);
     const key = vcMeetingSessionKey(larkAppId, meetingId);
     const session = vcMeetingSessions.get(key);
-    if (!cfg || !session || session.ended) {
+    const listenerAppId = vcMeetingAgentGlobalListenerAppId();
+    if (!cfg
+      || !session
+      || session.ended
+      || hasRecentVcMeetingEndedTombstone(key)
+      || !vcMeetingAgentGlobalEnabled()
+      || (listenerAppId && listenerAppId !== larkAppId)) {
+      return { toast: { type: 'warning', content: '会议监听恢复上下文已失效' } };
+    }
+    if (!isVcMeetingOutputAllowedOperator(session, cfg, data.operator?.open_id)) {
+      return { toast: { type: 'error', content: '只有本场会议授权人可以重新加入会议' } };
+    }
+    if (session.listenerRejoinApplying) {
+      return { toast: { type: 'info', content: '正在重新加入会议' } };
+    }
+    if (!session.listenerPresenceStale
+      || !session.listenerRejoinNonce
+      || session.listenerRejoinNonce !== value.nonce) {
+      return vcMeetingListenerRejoinCardForSession(session, 'expired', {
+        nonce: typeof value.nonce === 'string' ? value.nonce : '',
+      });
+    }
+
+    const nonce = session.listenerRejoinNonce;
+    session.listenerRejoinApplying = true;
+    try {
+      const result = await startVcMeetingMonitoring({
+        larkAppId,
+        key,
+        session,
+        cfg,
+        targetOpenId: vcMeetingTargetOpenId(larkAppId, cfg),
+        source: 'rejoin-card',
+        forceJoin: true,
+      });
+      if (!result.ok) {
+        return vcMeetingListenerRejoinCardForSession(session, 'failed', {
+          nonce,
+          error: result.error,
+        });
+      }
+      return vcMeetingListenerRejoinCardForSession(session, 'rejoined', { nonce });
+    } finally {
+      session.listenerRejoinApplying = false;
+    }
+  }
+
+  if (action === 'vc_meeting_consumer_recovery') {
+    const cfg = effectiveVcMeetingAgentConfig(larkAppId);
+    const key = vcMeetingSessionKey(larkAppId, meetingId);
+    const memberId = typeof value.member_id === 'string' ? value.member_id.trim() : '';
+    const cardSession = vcMeetingConsumerCardSession(key);
+    const session = memberId ? cardSession.session : vcMeetingSessions.get(key);
+    if (!cfg || !session || session.consumerMode !== 'agent'
+      || (session.ended && !(memberId && cardSession.closingRecovery))) {
+      return { toast: { type: 'warning', content: '会议 agent 恢复上下文已失效' } };
+    }
+    if (!isVcMeetingConsumerSelectionAllowedOperator(session, cfg, data.operator?.open_id)) {
+      return { toast: { type: 'error', content: '只有本场会议授权人可以处理恢复缺口' } };
+    }
+    if (memberId) {
+      const selected = session.selectedAgents.find(candidate => candidate.memberId === memberId);
+      const member = selected ? vcMeetingLatestProfileMember(session, memberId) : undefined;
+      const memberState = selected ? session.consumerMemberStates[memberId] ??= {} : undefined;
+      if (!selected || !member || !memberState) {
+        return { toast: { type: 'warning', content: '该 profile 恢复上下文已失效' } };
+      }
+      if (!memberState.activeRecoveryNonce || memberState.activeRecoveryNonce !== value.nonce) {
+        return { toast: { type: 'warning', content: '恢复卡片已过期，请使用最新卡片' } };
+      }
+      if (memberState.activeRecoveryApplying) {
+        return { toast: { type: 'info', content: '该 profile 的恢复操作正在处理中' } };
+      }
+      if (value.decision !== 'retry' && value.decision !== 'abandon_from_now') {
+        return { toast: { type: 'error', content: '恢复操作参数无效' } };
+      }
+      memberState.activeRecoveryApplying = true;
+      try {
+        if (value.decision === 'retry') {
+          catchUpVcMeetingConsumerForRestore(session, cfg);
+          const current = vcMeetingLatestProfileMember(session, memberId) ?? member;
+          if (!vcMeetingProfileRestoreBodiesAvailable(session, current)) {
+            return vcMeetingProfileActiveRecoveryCard(session, selected, current, 'pending', {
+              error: '事件源仍无法补齐该 profile 所需正文；可稍后重试或明确从当前时点继续。',
+            });
+          }
+          const card = vcMeetingProfileActiveRecoveryCard(session, selected, current, 'recovered');
+          await resolveVcMeetingProfileActiveRecoveryCard(
+            session,
+            selected,
+            current,
+            'recovered',
+          ).catch(() => undefined);
+          session.consumerRestoreCatchUpRequired = session.selectedAgents
+            .filter(candidate => candidate.status === 'active')
+            .some((candidate) => {
+              const candidateMember = vcMeetingLatestProfileMember(session, candidate.memberId);
+              return !candidateMember || !vcMeetingProfileRestoreBodiesAvailable(session, candidateMember);
+            });
+          persistVcMeetingRuntimeSession(session, cfg);
+          void injectVcMeetingConsumerSession(key, cfg, { force: true, final: session.ended }).catch(() => undefined);
+          return card;
+        }
+
+        const card = vcMeetingProfileActiveRecoveryCard(session, selected, member, 'abandoned');
+        const cardMessageId = memberState.activeRecoveryCardMessageId;
+        const gap = vcMeetingRecoveryGapForProfileMember(session, member)
+          ?? { reason: 'operator_skip' as const };
+        const resumed = await resumeVcMeetingProfileFromNow(key, session, cfg, selected);
+        if (!resumed.ok) {
+          return vcMeetingProfileActiveRecoveryCard(session, selected, member, 'pending', {
+            error: resumed.error,
+          });
+        }
+        if (cardMessageId) {
+          await updateMessage(session.larkAppId, cardMessageId, JSON.stringify(card)).catch(() => undefined);
+        }
+        await sendVcMeetingRecoveryTerminalNotice(session, {
+          kind: 'active_epoch_skipped',
+          memberId: member.memberId,
+          memberEpoch: member.memberEpoch,
+          reason: `active_recovery_operator_from_now:${member.inFlight?.deliveryKey ?? member.memberId}`,
+          gap,
+        }).catch(() => undefined);
+        return card;
+      } finally {
+        const currentState = session.consumerMemberStates[memberId];
+        if (currentState) currentState.activeRecoveryApplying = false;
+      }
+    }
+    if (!session.consumerActiveRecoveryNonce
+      || session.consumerActiveRecoveryNonce !== value.nonce) {
+      return { toast: { type: 'warning', content: '恢复卡片已过期，请使用最新卡片' } };
+    }
+    if (session.consumerActiveRecoveryApplying) {
+      return { toast: { type: 'info', content: '恢复操作正在处理中' } };
+    }
+    if (value.decision !== 'retry' && value.decision !== 'abandon_from_now') {
+      return { toast: { type: 'error', content: '恢复操作参数无效' } };
+    }
+    session.consumerActiveRecoveryApplying = true;
+    try {
+      if (value.decision === 'retry') {
+        const recovered = catchUpVcMeetingConsumerForRestore(session, cfg);
+        session.consumerRestoreCatchUpRequired = !recovered;
+        if (!recovered) {
+          return vcMeetingActiveRecoveryCardForSession(session, 'pending', {
+            error: '事件源仍无法补齐缺失正文；可稍后再次尝试，或明确选择从当前时点继续。',
+          });
+        }
+        const card = vcMeetingActiveRecoveryCardForSession(session, 'recovered');
+        clearVcMeetingConsumerActiveRecoveryState(session);
+        persistVcMeetingRuntimeSession(session, cfg);
+        void injectVcMeetingConsumerSession(key, cfg, { force: true }).catch((err) => {
+          logger.warn(
+            `[vc-agent] recovery retry inject failed ${key}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+        return card;
+      }
+
+      const resumed = await resumeVcMeetingSingleConsumerFromNow(key, session, cfg);
+      if (!resumed.ok) {
+        return vcMeetingActiveRecoveryCardForSession(session, 'pending', { error: resumed.error });
+      }
+      const card = vcMeetingActiveRecoveryCardForSession(session, 'abandoned');
+      clearVcMeetingConsumerActiveRecoveryState(session);
+      return card;
+    } finally {
+      session.consumerActiveRecoveryApplying = false;
+    }
+  }
+
+  if (action === 'vc_meeting_consumer_profile_toggle'
+    || action === 'vc_meeting_consumer_profile_clear'
+    || action === 'vc_meeting_consumer_profile_default') {
+    const cfg = effectiveVcMeetingAgentConfig(larkAppId);
+    const key = vcMeetingSessionKey(larkAppId, meetingId);
+    const { session, closingRecovery } = vcMeetingConsumerCardSession(key);
+    if (!cfg || !session || session.ended || closingRecovery) {
+      return { toast: { type: 'warning', content: '会议监听已结束或不存在' } };
+    }
+    if (!vcMeetingSessionUsesProfileMembers(session, cfg)) {
+      return { toast: { type: 'error', content: '当前会议未启用多 profile 配置' } };
+    }
+    if (!isVcMeetingConsumerSelectionAllowedOperator(session, cfg, data.operator?.open_id)) {
+      return { toast: { type: 'error', content: '只有本场会议授权人可以配置会议 agent' } };
+    }
+    if (session.consumerSelectionApplying) {
+      return { toast: { type: 'info', content: '会议 agent 选择正在处理中' } };
+    }
+    if (!session.consumerSelectionNonce || session.consumerSelectionNonce !== value.nonce) {
+      return vcMeetingConsumerCardForSession('expired', session, cfg);
+    }
+    if (session.consumerSelectionExpiresAt !== undefined && Date.now() >= session.consumerSelectionExpiresAt) {
+      return vcMeetingConsumerCardForSession('expired', session, cfg);
+    }
+    let staged = session.consumerPendingProfileIds
+      ? [...session.consumerPendingProfileIds]
+      : session.selectedAgents
+        .filter(selected => selected.status === 'active' || selected.status === 'activating')
+        .map(selected => selected.profileId);
+    if (action === 'vc_meeting_consumer_profile_clear') {
+      staged = [];
+    } else if (action === 'vc_meeting_consumer_profile_default') {
+      staged = vcMeetingConsumerDefaultProfileIds(cfg);
+    } else {
+      const profileId = typeof value.profile_id === 'string' ? value.profile_id.trim() : '';
+      const resolution = vcMeetingConsumerProfileResolutionForSession(session, cfg);
+      if (!profileId || !resolution.profiles.some(profile => profile.id === profileId)) {
+        return { toast: { type: 'error', content: 'profile 参数无效' } };
+      }
+      const selected = new Set(staged);
+      if (value.operation === 'deselect') selected.delete(profileId);
+      else selected.add(profileId);
+      staged = resolution.profiles
+        .filter(profile => selected.has(profile.id))
+        .map(profile => profile.id);
+    }
+    try {
+      vcMeetingConsumerProfileResolutionForSession(session, cfg, staged);
+    } catch (err) {
+      return {
+        toast: {
+          type: 'error',
+          content: `选择冲突：${err instanceof Error ? err.message : String(err)}`,
+        },
+      };
+    }
+    session.consumerPendingProfileIds = staged;
+    extendVcMeetingConsumerSelectionTimeout(key, session, cfg);
+    return vcMeetingConsumerCardForSession('pending', session, cfg);
+  }
+
+  if (action === 'vc_meeting_consumer_stage' || action === 'vc_meeting_consumer_interval') {
+    const cfg = effectiveVcMeetingAgentConfig(larkAppId);
+    const key = vcMeetingSessionKey(larkAppId, meetingId);
+    const { session, closingRecovery } = vcMeetingConsumerCardSession(key);
+    if (!cfg || !session || (session.ended && !closingRecovery)) {
       return { toast: { type: 'warning', content: '会议监听已结束或不存在' } };
     }
     if (!isVcMeetingConsumerSelectionAllowedOperator(session, cfg, data.operator?.open_id)) {
@@ -5837,11 +12525,15 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
       return vcMeetingConsumerCardForSession('expired', session, cfg);
     }
     if (session.consumerSelectionExpiresAt !== undefined && Date.now() >= session.consumerSelectionExpiresAt) {
+      if (closingRecovery) return vcMeetingConsumerCardForSession('expired', session, cfg);
       const result = await applyVcMeetingConsumerStagedState(key, session, cfg, { mode: 'default' });
       return vcMeetingConsumerCardForSession(result.ok ? result.status : 'failed', session, cfg, result.error ? { error: result.error } : {});
     }
     // 下拉/按钮只暂存不提交：点"确认"才生效。旧卡片的 interval action 也按暂存处理。
     const stageKind = action === 'vc_meeting_consumer_interval' ? 'interval' : value.stage_kind;
+    if (closingRecovery && stageKind !== 'agent') {
+      return { toast: { type: 'error', content: '会议已结束，只能恢复当前 agent 完成积压与 final' } };
+    }
     if (stageKind === 'interval') {
       const intervalMs = normalizeVcMeetingSyncIntervalMs(data.action?.option ?? value.sync_interval_ms);
       if (!intervalMs) {
@@ -5855,6 +12547,9 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
       if (!agentAppId) {
         return { toast: { type: 'error', content: 'agent 参数无效' } };
       }
+      if (closingRecovery && agentAppId !== session.selectedAgentAppId) {
+        return { toast: { type: 'error', content: '会议已结束，不能切换 agent；只能恢复原 agent' } };
+      }
       session.consumerPendingChoice = { mode: 'agent', agentAppId };
     } else if (stageKind === 'listenOnly') {
       session.consumerPendingChoice = { mode: 'listenOnly' };
@@ -5862,7 +12557,7 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
       return { toast: { type: 'error', content: '选择参数无效' } };
     }
     // 用户在操作：重置超时（保留同一 nonce），超时到点按暂存态收敛。
-    extendVcMeetingConsumerSelectionTimeout(key, session, cfg);
+    if (!closingRecovery) extendVcMeetingConsumerSelectionTimeout(key, session, cfg);
     logger.info(`[vc-agent] meeting consumer staged meeting=${meetingId} kind=${stageKind}`);
     return { toast: { type: 'success', content: '已暂存，点击确认后生效' } };
   }
@@ -5870,8 +12565,8 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
   if (action === 'vc_meeting_consumer_confirm') {
     const cfg = effectiveVcMeetingAgentConfig(larkAppId);
     const key = vcMeetingSessionKey(larkAppId, meetingId);
-    const session = vcMeetingSessions.get(key);
-    if (!cfg || !session || session.ended) {
+    const { session, closingRecovery } = vcMeetingConsumerCardSession(key);
+    if (!cfg || !session || (session.ended && !closingRecovery)) {
       return { toast: { type: 'warning', content: '会议监听已结束或不存在' } };
     }
     if (!isVcMeetingConsumerSelectionAllowedOperator(session, cfg, data.operator?.open_id)) {
@@ -5890,13 +12585,54 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
     if (customInterval.intervalMs !== undefined) {
       session.consumerPendingIntervalMs = customInterval.intervalMs;
     }
+    if (vcMeetingSessionUsesProfileMembers(session, cfg)) {
+      if (closingRecovery) {
+        session.consumerSelectionApplying = true;
+        try {
+          const resumed = await resumeVcMeetingPausedProfiles(key, session, cfg);
+          return vcMeetingConsumerCardForSession(
+            resumed.ok ? 'agent' : 'failed',
+            session,
+            cfg,
+            resumed.ok ? {} : { error: resumed.error },
+          );
+        } finally {
+          session.consumerSelectionApplying = false;
+        }
+      }
+      return applyVcMeetingConsumerSelectionInBackground(
+        key,
+        session,
+        cfg,
+        () => applyVcMeetingConsumerProfileStagedState(
+          key,
+          session,
+          cfg,
+          undefined,
+          { claimed: true },
+        ),
+        { cardMessageId: data.context?.open_message_id ?? data.open_message_id },
+      );
+    }
     const selection = session.consumerPendingChoice ?? { mode: 'default' as const };
+    const resolvedSelection = vcMeetingResolveConsumerSelection(cfg, selection);
+    if (closingRecovery
+      && (resolvedSelection.mode !== 'agent'
+        || resolvedSelection.agentAppId !== session.selectedAgentAppId)) {
+      return { toast: { type: 'error', content: '会议已结束，只能恢复原 agent 完成积压与 final' } };
+    }
     if (vcMeetingConsumerSelectionUsesAgent(cfg, selection)) {
       return applyVcMeetingConsumerSelectionInBackground(
         key,
         session,
         cfg,
-        () => applyVcMeetingConsumerStagedState(key, session, cfg, { mode: 'default' }, { claimed: true }),
+        () => applyVcMeetingConsumerStagedState(
+          key,
+          session,
+          cfg,
+          { mode: 'default' },
+          { claimed: true, allowClosingRecovery: true },
+        ),
         { cardMessageId: data.context?.open_message_id ?? data.open_message_id },
       );
     }
@@ -6087,10 +12823,10 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
 
   if (ctx.kind === 'meeting_ended') {
     const key = vcMeetingSessionKey(ctx.larkAppId, ctx.meeting.id);
-    markVcMeetingEnded(key);
     deleteVcMeetingPendingInvite(key);
-    removeVcMeetingRuntimeSession(config.session.dataDir, ctx.larkAppId, ctx.meeting.id);
     if (!vcMeetingSessions.has(key)) {
+      markVcMeetingEnded(key);
+      removeVcMeetingRuntimeSession(config.session.dataDir, ctx.larkAppId, ctx.meeting.id);
       logger.info(`[vc-agent] ended recorded for untracked meeting=${ctx.meeting.id} bot=${ctx.larkAppId}`);
       return;
     }
@@ -6126,19 +12862,32 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
 
   const session = getOrCreateVcMeetingDaemonSession(ctx.larkAppId, ctx.meeting, cfg);
   if (!session) return;
-  session.joined = true;
+  // Ordinary meeting activity proves the meeting is alive, not that this
+  // listener bot is still present. Once fenced by our own participant_left,
+  // only our exact participant_joined (or an authorized forced join) clears it.
+  if (!session.listenerPresenceStale) session.joined = true;
 
-  beginVcIngestionPass(session.state);
   const batch = normalizeVcMeetingEvents(ctx.raw, { meetingId: ctx.meeting.id, source: 'push' });
   if (batch.items.length === 0) {
     logger.warn(`[vc-agent] activity push normalized to 0 items; check meeting_actitivty_items schema eventId=${ctx.eventId ?? '?'} raw=${rawExcerptForLog(ctx.raw)}`);
     return;
   }
   session.state.meeting = { ...session.state.meeting, ...batch.meeting, ...ctx.meeting, id: ctx.meeting.id };
-  rememberVcMeetingActorNames(session, batch.items);
-  const ingest = ingestNormalizedVcMeetingItems(session.state, batch.items);
-  queueVcMeetingPendingItems(session, ingest.acceptedItems);
-  queueVcMeetingConsumerPendingItems(session, cfg, ingest.acceptedItems);
+  const ingest = ingestVcMeetingNormalizedItems(session, cfg, batch.items);
+  const listenerBotOpenId = getBot(ctx.larkAppId)?.botOpenId?.trim();
+  if (listenerBotOpenId) {
+    for (const item of ingest.acceptedItems) {
+      if ((item.type !== 'participant_left' && item.type !== 'participant_joined')
+        || item.participant.openId?.trim() !== listenerBotOpenId) continue;
+      if (item.type === 'participant_left') {
+        await markVcMeetingListenerPresenceStale(session, cfg, item.occurredAtMs);
+      } else if (session.listenerPresenceStale) {
+        await restoreVcMeetingMonitoringAfterObservedJoin(key, session, cfg, item.occurredAtMs);
+      } else {
+        session.joined = true;
+      }
+    }
+  }
   const consumerFastSignal = session.consumerMode === 'agent'
     && vcMeetingConsumerHasImmediateFastSignal(session, cfg, ingest.acceptedItems);
   if (session.listenerChatId && session.pendingItems.length > 0) {
@@ -6163,6 +12912,23 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
 export const __vcMeetingAgentTest = {
   handlePush: handleVcMeetingPush,
   handleCardAction: handleVcMeetingCardAction,
+  receiverSessionSnapshot: (sessionId: string) => {
+    const ds = [...activeSessions.values()].find(candidate =>
+      candidate.session.sessionId === sessionId);
+    if (!ds) return undefined;
+    return {
+      sessionId: ds.session.sessionId,
+      larkAppId: ds.larkAppId,
+      chatId: ds.chatId,
+      rootMessageId: ds.session.rootMessageId,
+      scope: ds.scope,
+      vcMeetingReceiver: ds.session.vcMeetingReceiver
+        ? structuredClone(ds.session.vcMeetingReceiver)
+        : undefined,
+      activeKey: activeSessionKey(ds),
+      ordinaryChatKey: sessionKey(ds.chatId, ds.larkAppId),
+    };
+  },
   sessionCount: () => vcMeetingSessions.size,
   hasSession: (larkAppId: string, meetingId: string) =>
     vcMeetingSessions.has(vcMeetingSessionKey(larkAppId, meetingId)),
@@ -6180,6 +12946,15 @@ export const __vcMeetingAgentTest = {
   },
   catchUpConsumerBeforeTurn: (larkAppId: string, listenerChatId: string) =>
     maybeCatchUpVcMeetingConsumerBeforeTurn({
+      message: {
+        message_id: 'om_test_catch_up',
+        chat_id: listenerChatId,
+        chat_type: 'group',
+        message_type: 'text',
+        content: '{"text":"@agent follow-up"}',
+      },
+      sender: { sender_id: { open_id: 'ou_test_sender' }, sender_type: 'user' },
+    }, {
       larkAppId,
       chatId: listenerChatId,
       chatType: 'group',
@@ -6187,6 +12962,31 @@ export const __vcMeetingAgentTest = {
       scope: 'chat',
       anchor: listenerChatId,
     }),
+  routeConsumerBeforeTurnForTest: async (
+    larkAppId: string,
+    listenerChatId: string,
+    content = '@agent follow-up',
+  ) => {
+    const ctx: RoutingContext = {
+      larkAppId,
+      chatId: listenerChatId,
+      chatType: 'group',
+      messageId: 'om_test_route_consumer',
+      scope: 'chat',
+      anchor: listenerChatId,
+    };
+    const result = await maybeCatchUpVcMeetingConsumerBeforeTurn({
+      message: {
+        message_id: ctx.messageId,
+        chat_id: listenerChatId,
+        chat_type: 'group',
+        message_type: 'text',
+        content: JSON.stringify({ text: content }),
+      },
+      sender: { sender_id: { open_id: 'ou_test_sender' }, sender_type: 'user' },
+    }, ctx);
+    return { result, ctx };
+  },
   handleTemporaryAuthCommand: (input: {
     larkAppId: string;
     chatId: string;
@@ -6212,11 +13012,59 @@ export const __vcMeetingAgentTest = {
     reason?: string;
     fallbackText?: string;
   }) => submitVcMeetingOutputRequest(input),
+  submitManagedOutput: (input: {
+    agentAppId: string;
+    receiverSessionId: string;
+    stableTurnId: string;
+    dispatchAttempt: number;
+    channel: VcMeetingOutputChannel;
+    content: string;
+    reason?: string;
+    fallbackText?: string;
+  }) => submitVcMeetingManagedAction(input),
+  submitManagedImOutput: (input: {
+    origin: NonNullable<DaemonSession['vcMeetingImTurnOrigin']>;
+    channel: VcMeetingOutputChannel;
+    content: string;
+    reason?: string;
+    fallbackText?: string;
+  }) => submitVcMeetingManagedImAction(input),
+  reviewOutput: (input: {
+    larkAppId: string;
+    meetingId: string;
+    requestId: string;
+    nonce: string;
+    decision: VcMeetingOutputDecision;
+    operatorOpenId?: string;
+  }) => reviewVcMeetingOutputRequest(input),
+  reconcileManagedActions: (listenerAppId: string) => reconcileVcMeetingManagedActionsOnBoot(listenerAppId),
+  pendingOutput: (larkAppId: string, meetingId: string, channel: VcMeetingOutputChannel) => {
+    const req = vcMeetingSessions.get(vcMeetingSessionKey(larkAppId, meetingId))?.pendingOutputRequests[channel];
+    if (!req) return undefined;
+    const { timer: _timer, ...snapshot } = req;
+    return structuredClone(snapshot);
+  },
+  dropPendingOutputForTest: (larkAppId: string, meetingId: string, channel: VcMeetingOutputChannel) => {
+    const session = vcMeetingSessions.get(vcMeetingSessionKey(larkAppId, meetingId));
+    const req = session?.pendingOutputRequests[channel];
+    if (!session || !req) return;
+    clearVcMeetingOutputRequestTimer(req);
+    delete session.pendingOutputRequests[channel];
+  },
   setOutputTextSenderForTest: (sender?: VcMeetingOutputTextSender) => {
     vcMeetingOutputTextSenderForTest = sender;
   },
   setOutputTextAvailableForTest: (available?: boolean) => {
     vcMeetingTextOutputAvailableForTest = available;
+  },
+  setOutputPolicyForTest: (
+    larkAppId: string,
+    meetingId: string,
+    channel: VcMeetingOutputChannel,
+    policy: VcMeetingOutputPolicy,
+  ) => {
+    const session = vcMeetingSessions.get(vcMeetingSessionKey(larkAppId, meetingId));
+    if (session) setVcMeetingOutputPolicyForChannel(session, channel, policy);
   },
   setGlobalVcMeetingAgentEnabledForTest: (enabled?: boolean) => {
     vcMeetingAgentGlobalEnabledOverrideForTest = enabled;
@@ -6224,8 +13072,45 @@ export const __vcMeetingAgentTest = {
   setGlobalVcMeetingListenerBotAppIdForTest: (appId?: string | null) => {
     vcMeetingAgentGlobalListenerBotAppIdOverrideForTest = appId;
   },
+  setCrossAppLocalReceiverForTest: (enabled: boolean) => {
+    vcMeetingAllowCrossAppLocalReceiverForTest = enabled;
+  },
+  setSelfDaemonLarkAppIdForTest: (larkAppId?: string) => {
+    selfDaemonLarkAppId = larkAppId;
+  },
+  setConsumerPendingItemLimitForTest: (limit?: number) => {
+    vcMeetingConsumerPendingItemLimitOverrideForTest = limit;
+  },
+  setConsumerDeliveryCapsForTest: (caps?: { maxItems: number; maxRenderedChars: number }) => {
+    vcMeetingConsumerDeliveryCapsOverrideForTest = caps;
+  },
+  setConsumerCloseTimingForTest: (timing?: {
+    retryMs: number;
+    horizonMs: number;
+    slowRetryMs: number;
+    resolutionGraceMs?: number;
+  }) => {
+    vcMeetingConsumerCloseTimingOverrideForTest = timing;
+  },
   consumerPendingCount: (larkAppId: string, meetingId: string) =>
     vcMeetingSessions.get(vcMeetingSessionKey(larkAppId, meetingId))?.consumerPendingItems.length ?? 0,
+  closingConsumerCount: () => vcMeetingClosingConsumerSessions.size,
+  closingConsumerFrozenRequest: (larkAppId: string, meetingId: string) =>
+    vcMeetingClosingConsumerSessions
+      .get(vcMeetingSessionKey(larkAppId, meetingId))
+      ?.session.consumerFrozenDelivery?.request,
+  consumerFrozenRequest: (larkAppId: string, meetingId: string) => {
+    const key = vcMeetingSessionKey(larkAppId, meetingId);
+    return (vcMeetingSessions.get(key) ?? vcMeetingClosingConsumerSessions.get(key)?.session)
+      ?.consumerFrozenDelivery?.request;
+  },
+  beginCloseIntentForTest: (larkAppId: string, meetingId: string) => {
+    const key = vcMeetingSessionKey(larkAppId, meetingId);
+    const session = vcMeetingSessions.get(key);
+    const cfg = effectiveVcMeetingAgentConfig(larkAppId);
+    if (!session || !cfg) return undefined;
+    return beginVcMeetingDaemonCloseIntent(key, session, cfg);
+  },
   restoreRuntimeSessions: (larkAppId: string) => {
     const cfg = effectiveVcMeetingAgentConfig(larkAppId);
     if (cfg) restoreVcMeetingRuntimeSessionsForBot(larkAppId, cfg);
@@ -6240,10 +13125,19 @@ export const __vcMeetingAgentTest = {
       void session.realtimeVoice?.stop('daemon-shutdown').catch(() => { /* ignore */ });
     }
     vcMeetingSessions.clear();
+    for (const closing of vcMeetingClosingConsumerSessions.values()) {
+      if (closing.timer) clearTimeout(closing.timer);
+    }
+    vcMeetingClosingConsumerSessions.clear();
     vcMeetingOutputTextSenderForTest = undefined;
     vcMeetingTextOutputAvailableForTest = undefined;
     vcMeetingAgentGlobalEnabledOverrideForTest = undefined;
     vcMeetingAgentGlobalListenerBotAppIdOverrideForTest = undefined;
+    vcMeetingAllowCrossAppLocalReceiverForTest = false;
+    selfDaemonLarkAppId = undefined;
+    vcMeetingConsumerPendingItemLimitOverrideForTest = undefined;
+    vcMeetingConsumerDeliveryCapsOverrideForTest = undefined;
+    vcMeetingConsumerCloseTimingOverrideForTest = undefined;
     vcMeetingEndedTombstones.clear();
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
   },
@@ -6543,6 +13437,26 @@ async function startInitialPassthroughSession(args: {
   logger.info(`[${tag(ds)}] No projects to select, queued initial raw passthrough ${commandContent.substring(0, 40)}`);
 }
 
+function vcMeetingApplicationContext(ctx: RoutingContext): string {
+  return (ctx.vcMeetingContextLifecycle === 'sealed'
+    ? '[会议上下文状态] 本轮正在复用一场已结束会议的专属会话；这是会后追问。可以基于既有会议上下文回答，但不得声称会议仍在进行，也不要尝试会中文本或语音动作。\n'
+    : '')
+    + (ctx.vcMeetingContextMayLag
+      ? '[会议上下文状态] 本轮已路由到对应会议会话，但会前回补未在时限内成功；会议上下文可能滞后。回答时请显式说明这一点，不要把缺失内容当作已同步。\n'
+      : '');
+}
+
+function mergeVcMeetingApplicationContext(
+  existing: string | undefined,
+  incoming: string,
+): string | undefined {
+  const lines = [...(existing ?? '').split('\n'), ...incoming.split('\n')]
+    .map(line => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return undefined;
+  return `${[...new Set(lines)].join('\n')}\n`;
+}
+
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger } = ctx;
@@ -6826,7 +13740,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // worker will see; promptContent wraps it for prompt-building paths but
   // leaves `content` untouched for title / log substring uses.
   const codexAppMessageContext = buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId));
-  const promptContent = codexAppMessageContext + content;
+  const codexAppApplicationContext = vcMeetingApplicationContext(ctx);
+  const promptContent = codexAppMessageContext + codexAppApplicationContext + content;
 
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a
@@ -6889,6 +13804,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     pendingRepo: !pinnedWorkingDir || autoWt,
     pendingPrompt: promptContent,
     pendingCodexAppText: content,
+    pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
     pendingMentions: parsed.mentions,
@@ -6920,7 +13836,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     const selfBot = getBot(larkAppId);
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: content, codexAppMessageContext });
+    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: content, codexAppApplicationContext, codexAppMessageContext });
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, prompt);
     forkWorker(ds, prompt);
@@ -6952,7 +13868,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ds.pendingRepo = false;
     const selfBot = getBot(larkAppId);
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: content, codexAppMessageContext });
+    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: content, codexAppApplicationContext, codexAppMessageContext });
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, prompt);
     forkWorker(ds, prompt);
@@ -7251,8 +14167,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // `let` (not const): the v3 grill gate below may replace this with a
   // skill-trigger prompt when the user sends `/workflow [new] <目标>` mid-thread.
   const initialCodexAppMessageContext = buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix;
-  const initialPromptContent = initialCodexAppMessageContext + parsed.content;
+  const initialCodexAppApplicationContext = vcMeetingApplicationContext(ctx);
+  const initialPromptContent = initialCodexAppMessageContext
+    + initialCodexAppApplicationContext
+    + parsed.content;
   let promptContent = initialPromptContent;
+  let rewrittenCodexAppMessageContext: string | undefined;
   const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
   emitHookEvent('thread.reply', {
     larkAppId,
@@ -7364,7 +14284,14 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       await sessionReply(anchor, WORKFLOW_USAGE, 'text', larkAppId);
       return;
     }
-    promptContent = buildWorkflowGrillPrompt(threadGrill.goal);
+    const workflowPrompt = buildWorkflowGrillPrompt(threadGrill.goal);
+    // Legacy/non-clean paths still need daemon-owned VC lifecycle context.
+    // Clean Codex App turns keep it in the trusted application lane while the
+    // generated workflow instruction remains hidden message context.
+    promptContent = initialCodexAppMessageContext
+      + initialCodexAppApplicationContext
+      + workflowPrompt;
+    rewrittenCodexAppMessageContext = initialCodexAppMessageContext + workflowPrompt;
     // fall through to normal forwarding with the rewritten promptContent
   } else {
     if (parseWorkflowCommand(cmdContent)) {
@@ -7593,9 +14520,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // keep the Lark-authored bytes visible and move the rewritten instruction
   // into hidden untrusted context. Simple quote/bot prefixes use only the
   // prefix as context, avoiding a duplicate copy of the user text.
-  const codexAppMessageContext = promptContent === initialPromptContent
-    ? initialCodexAppMessageContext
-    : promptContent;
+  const codexAppMessageContext = rewrittenCodexAppMessageContext
+    ?? initialCodexAppMessageContext;
+  const codexAppApplicationContext = initialCodexAppApplicationContext;
 
   // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
@@ -7619,6 +14546,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     ds.session.quoteTargetId = parsed.messageId;
     ds.session.quoteTargetSenderOpenId = callerOpenId;
     ds.session.quoteTargetSenderIsBot = isForeignBot;
+    if (ds.session.vcMeetingReceiver) {
+      ds.vcMeetingImTurnOrigin = ctx.vcMeetingImTurnOrigin;
+      if (ctx.vcMeetingImTurnOrigin) {
+        rememberVcMeetingImTurnOrigin(ds.session, ctx.vcMeetingImTurnOrigin);
+      }
+    }
     beginReplyTargetTurn(ds, replyRootId, parsed.messageId);
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
@@ -7672,6 +14605,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     ds.pendingCodexAppFollowUps.push(parsed.content);
     if (!ds.pendingCodexAppFollowUpContexts) ds.pendingCodexAppFollowUpContexts = [];
     ds.pendingCodexAppFollowUpContexts.push(codexAppFollowUpContextParts.join('\n\n'));
+    if (codexAppApplicationContext) {
+      ds.pendingCodexAppApplicationContext = mergeVcMeetingApplicationContext(
+        ds.pendingCodexAppApplicationContext,
+        codexAppApplicationContext,
+      );
+    }
     // Auto-worktree pending (worktreeCreating) has no repo card to point at — the
     // message IS buffered (folded on commit), so just say "hold on, building worktree"
     // instead of the misleading "pick a repo from the card above".
@@ -7758,6 +14697,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       pendingRepo: !pinnedWorkingDir || autoWt,
       pendingPrompt: promptContent,
       pendingCodexAppText: parsed.content,
+      pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
       pendingCodexAppMessageContext: codexAppMessageContext,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
@@ -7788,7 +14728,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
       const selfBot = getBot(larkAppId);
       ensureSessionWhiteboard(newDs);
-      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger, codexAppText: parsed.content, codexAppMessageContext });
+      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       rememberLastCliInput(newDs, promptContent, prompt);
       forkWorker(newDs, prompt);
@@ -7820,7 +14760,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       newDs.pendingRepo = false;
       const selfBot = getBot(larkAppId);
       ensureSessionWhiteboard(newDs);
-      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger, codexAppText: parsed.content, codexAppMessageContext });
+      const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       rememberLastCliInput(newDs, promptContent, prompt);
       forkWorker(newDs, prompt);
@@ -7862,6 +14802,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: parsed.content,
+          codexAppApplicationContext,
           codexAppMessageContext,
         });
     beginNewTurn(ds, parsed.content);
@@ -7937,6 +14878,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       sender: await getThreadSender(),
       substituteTrigger,
       codexAppText: reforkCodexApp.text,
+      codexAppApplicationContext,
       codexAppMessageContext: reforkCodexApp.messageContext,
     });
     const wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
@@ -7953,7 +14895,10 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedInput, ds.hasHistory);
+    forkWorker(ds, wrappedInput, {
+      resume: ds.hasHistory,
+      turnId: parsed.messageId,
+    });
   }
 }
 
@@ -8362,13 +15307,89 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   ensureCjkFontsInstalled();
 
   // Load the assigned bot (one daemon per bot)
-  const botConfigs = loadBotConfigs();
+  let botConfigs = loadBotConfigs();
   const idx = botIndex ?? 0;
   if (idx < 0 || idx >= botConfigs.length) {
     throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} bot(s) configured`);
   }
-  const cfg = botConfigs[idx];
+  let cfg = botConfigs[idx];
+  // One-time, lock-protected catalog bootstrap. This runs only after the
+  // complete bots.json has parsed successfully, and the helper re-reads the
+  // latest file under its lock before deciding. Explicit [] and legacy agent
+  // policy are durable opt-outs. Reload the selected config after a write so
+  // this daemon exposes the seeded selection card immediately on the same boot.
+  const profileBootstrap = await bootstrapVcMeetingDefaultConsumerProfile(cfg.larkAppId);
+  if (profileBootstrap.ok) {
+    const selectedAppId = cfg.larkAppId;
+    // Reload even when another concurrent daemon won the one-time write. Both
+    // processes may have loaded the old file before taking the config lock;
+    // the loser still needs the winner's catalog on this boot.
+    botConfigs = loadBotConfigs();
+    cfg = botConfigs.find(candidate => candidate.larkAppId === selectedAppId)
+      ?? botConfigs[idx];
+    if (profileBootstrap.seeded) {
+      logger.info(
+        `[vc-agent] seeded default meeting minutes profile listener=${selectedAppId} `
+        + `agent=${profileBootstrap.agentAppId}`,
+      );
+    }
+  } else if (!profileBootstrap.ok) {
+    logger.warn(
+      `[vc-agent] default consumer profile bootstrap skipped: ${profileBootstrap.reason}`
+      + `${profileBootstrap.error ? ` (${profileBootstrap.error})` : ''}`,
+    );
+  }
   registerBot(cfg);
+  selfDaemonLarkAppId = cfg.larkAppId;
+  // Establish the target-scoped daemon control credential before publishing
+  // the daemon descriptor or accepting IPC traffic. Corruption fails startup
+  // closed; silently rotating here could strand peers on mismatched tokens.
+  ensureVcMeetingDaemonAuthToken(config.session.dataDir, cfg.larkAppId);
+  vcMeetingReceiverRecoveryReady = false;
+  vcMeetingReceiverRecoverySchedulingComplete = false;
+  vcMeetingReceiverRecoveryPending.clear();
+  vcMeetingReceiverRecoveryEscalating.clear();
+  vcMeetingReceiverRecoveryScopes.clear();
+  for (const timer of vcMeetingReceiverRecoveryTimers.values()) clearTimeout(timer);
+  vcMeetingReceiverRecoveryTimers.clear();
+  vcMeetingRuntimeLeaseRecovery.reset();
+  vcMeetingTerminalReconciler?.stop();
+  vcMeetingTerminalReconciler = new VcMeetingTerminalReconciler({
+    settle: (terminal, context) => handleVcMeetingTurnTerminal(terminal, context, {
+      dataDir: config.session.dataDir,
+      selfAppId: cfg.larkAppId,
+    }),
+    // A worker emits each terminal once. Retry transient receipt-store errors
+    // for roughly two minutes; exhaustion explicitly reconciles the exact
+    // worker generation to ambiguous instead of leaving a dispatched head
+    // wedged forever. A daemon crash gets the same treatment on next boot.
+    maxAttempts: 20,
+    onFinalized(event) {
+      if (event.state === 'handled' || event.state === 'one_shot_failure') return;
+      if (event.state === 'retry_exhausted') {
+        const reconciled = handleVcMeetingWorkerGenerationExit({
+          sessionId: event.terminal.sessionId,
+          workerGeneration: event.context.workerGeneration,
+        }, {
+          dataDir: config.session.dataDir,
+          selfAppId: cfg.larkAppId,
+        });
+        if (reconciled.ambiguousDeliveryKeys.length > 0) {
+          logger.warn(
+            `[vc-delivery] terminal persistence exhausted; marked `
+            + `${reconciled.ambiguousDeliveryKeys.length} receipt(s) ambiguous`,
+          );
+        }
+      }
+      const detail = event.reason
+        ?? (event.error instanceof Error ? event.error.message : String(event.error ?? 'unknown'));
+      const message = `[vc-delivery] terminal reconcile ${event.state} `
+        + `turn=${event.terminal.turnId.slice(0, 12)} `
+        + `attempt=${event.terminal.dispatchAttempt ?? '?'} detail=${detail}`;
+      if (event.state === 'permanent_failure') logger.warn(message);
+      else logger.error(message);
+    },
+  });
   // 启动即为本 bot 的 CLI 预装环境（skills + askUserQuestion hook + 兜底 skill）。
   // 关键：adopt 路径会跳过 ensureCliSkills，若重启后第一次就是 adopt 一个外部
   // claude 会话，必须保证此时全局 ~/.claude/settings.json 已带 hook——否则"全局
@@ -8377,6 +15398,47 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   sessionStore.init(cfg.larkAppId);
   chatFirstSeenStore.init(cfg.larkAppId);
+  const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(
+    config.session.dataDir,
+    { receiverBootId: getDaemonBootId(), agentAppId: cfg.larkAppId },
+  );
+  if (ambiguousOnBoot.length > 0) {
+    logger.warn(`[vc-delivery] reconciled ${ambiguousOnBoot.length} stale dispatched receipt(s) as ambiguous`);
+  }
+  const vcMeetingDeliveryLeaseTimer = setInterval(() => {
+    try {
+      const expired = expireVcMeetingDeliveryLeases(config.session.dataDir, {
+        agentAppId: cfg.larkAppId,
+        leaseMs: VC_MEETING_DELIVERY_LEASE_MS,
+      });
+      for (const ref of expired) {
+        // Store transition and exact runtime gate happen in the same event-loop
+        // tick, before another /deliver handler can replay this stream. The
+        // gate remains closed until the worker ACKs queue removal/CLI teardown
+        // or deterministic backing-session probes prove the old pane missing.
+        const lookup = findVcMeetingDeliveryByKey(config.session.dataDir, ref.deliveryKey, {
+          receiverSessionId: ref.receiverSessionId,
+        });
+        if (!lookup || lookup.receipt.status !== 'ambiguous'
+          || lookup.receipt.dispatchAttempt !== ref.dispatchAttempt
+          || lookup.receipt.workerGeneration !== ref.workerGeneration) {
+          continue;
+        }
+        vcMeetingRuntimeLeaseRecovery.arm(ref, cfg.larkAppId);
+      }
+      if (expired.length > 0) {
+        logger.warn(
+          `[vc-delivery] lease watchdog marked ${expired.length} stuck receipt(s) ambiguous `
+          + `and opened exact recovery fences (lease=${VC_MEETING_DELIVERY_LEASE_MS}ms)`,
+        );
+      }
+    } catch (err) {
+      logger.error(
+        `[vc-delivery] lease watchdog scan failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }, VC_MEETING_DELIVERY_LEASE_SCAN_MS);
+  vcMeetingDeliveryLeaseTimer.unref?.();
   // Watch schedules.json for external writes (e.g. `botmux schedule add`
   // running in a separate node process) so dashboard event bus stays in sync.
   scheduleStore.startExternalWriteWatcher();
@@ -8393,6 +15455,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // process discovers running daemons by scanning ~/.botmux/data/dashboard-daemons/
   // and watching for mtime updates (heartbeat) / file removal (shutdown).
   const ipcPort = config.dashboard.ipcBasePort + idx;
+  // Worker/CLI descendants use this only to reach the current daemon's
+  // agent-facing, live-origin-gated endpoints. Internal control endpoints use
+  // a separate daemon-to-daemon credential and never trust this port marker.
+  process.env.BOTMUX_DAEMON_IPC_PORT = String(ipcPort);
   const desc: DaemonDescriptor = {
     larkAppId: cfg.larkAppId,
     botName: cfg.displayName ?? cfg.larkAppId,
@@ -8465,6 +15531,58 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
+    onTurnTerminal(ds, terminal, context) {
+      const enqueued = vcMeetingTerminalReconciler?.enqueue(terminal, context);
+      if (terminal.dispatchAttempt !== undefined && enqueued?.accepted) {
+        logger.info(
+          `[vc-delivery] terminal queued ${terminal.status} turn=${terminal.turnId.slice(0, 12)} `
+          + `session=${ds.session.sessionId.slice(0, 8)} attempt=${terminal.dispatchAttempt}`,
+        );
+      }
+    },
+    onCliExit(_ds, context) {
+      const result = handleVcMeetingWorkerGenerationExit(context, {
+        dataDir: config.session.dataDir,
+        selfAppId: cfg.larkAppId,
+      });
+      if (result.ambiguousDeliveryKeys.length > 0) {
+        logger.warn(
+          `[vc-delivery] CLI exit marked ${result.ambiguousDeliveryKeys.length} receipt(s) ambiguous `
+          + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}`,
+        );
+      }
+    },
+    onWorkerExit(_ds, context) {
+      const result = handleVcMeetingWorkerGenerationExit(context, {
+        dataDir: config.session.dataDir,
+        selfAppId: cfg.larkAppId,
+      });
+      // Node worker death does not prove a persistent tmux/herdr/zellij pane
+      // died with it. Arm the exact receipt fence synchronously with the
+      // dispatched→ambiguous transition so /deliver cannot replay while the
+      // old CLI may still be executing. recoveryRefs also includes an
+      // already-ambiguous exact head when onCliExit won the double-callback
+      // race, making this idempotent ordering-safe.
+      for (const ref of result.recoveryRefs) {
+        vcMeetingRuntimeLeaseRecovery.arm(ref, cfg.larkAppId);
+      }
+      if (result.ambiguousDeliveryKeys.length > 0) {
+        logger.warn(
+          `[vc-delivery] worker exit marked ${result.ambiguousDeliveryKeys.length} receipt(s) ambiguous `
+          + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}`,
+        );
+      }
+    },
+    onReceiverResetReady(_ds, context) {
+      acknowledgeVcMeetingReceiverRecovery(vcMeetingReceiverRecoveryKey(
+        context.sessionId,
+        context.turnId,
+        context.dispatchAttempt,
+      ));
+    },
+    onDurableExpiryReady(_ds, context) {
+      vcMeetingRuntimeLeaseRecovery.acknowledge(context);
+    },
   });
   // Expose the activeSessions Map (owned by daemon) to worker-pool readers,
   // so dashboard IPC and other consumers can list/lookup live sessions.
@@ -8491,6 +15609,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // the requested one. Republish the ACTUAL port into the descriptor before it
   // is written below — the dashboard reaches us via desc.ipcPort verbatim.
   desc.ipcPort = ipcHandle.port;
+  process.env.BOTMUX_DAEMON_IPC_PORT = String(ipcHandle.port);
   logger.info(`[dashboard-ipc] listening on 127.0.0.1:${ipcHandle.port} (bot ${idx})`);
 
   // Single reverse-proxy port that fronts every session's web terminal under
@@ -8637,7 +15756,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       handleBotAdded: (chatId, operatorOpenId, appId) => handleBotAdded(chatId, operatorOpenId, appId),
       handleDocComment: (ctx) => handleDocComment(ctx),
       handleVcMeetingPush: (ctx) => handleVcMeetingPush(ctx),
-      beforeSessionTurn: (_data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(ctx),
+      beforeSessionTurn: (data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(data, ctx),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
       resolveReplyThreadAlias: (rootId, chatId, appId) => findChatReplyAlias(rootId, chatId, appId),
       // Chat was converted 普通群 → 话题群 while we held a chat-scope session.
@@ -8668,6 +15787,77 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Restore active sessions from previous run
   await restoreActiveSessions(activeSessions);
+
+  try {
+    await reconcileVcMeetingManagedActionsOnBoot(cfg.larkAppId);
+  } catch (err) {
+    // Do not silently declare an ambiguous provider attempt complete. The
+    // ledger remains write-ahead attempting/pending and the error is visible
+    // for operator repair; unrelated meeting delivery recovery can continue.
+    logger.error(
+      `[vc-action] startup reconcile failed for ${cfg.larkAppId}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // A persistent tmux/herdr pane can outlive the daemon that dispatched the
+  // now-ambiguous attempt. The fresh worker has no trustworthy durable HOL
+  // state, so fence that old CLI before the hub is allowed to replay. Parent →
+  // worker IPC ordering guarantees this reset is observed before any later
+  // delivery message sent by an HTTP handler in this daemon turn.
+  for (const ref of ambiguousOnBoot) {
+    const recoveryKey = vcMeetingReceiverRecoveryKey(
+      ref.receiverSessionId,
+      ref.deliveryKey,
+      ref.dispatchAttempt,
+    );
+    const ds = findActiveBySessionId(ref.receiverSessionId);
+    const receiver = ds?.session.vcMeetingReceiver;
+    if (!ds) {
+      // Reuse the deterministic kill+tri-state probe path. A missing Session
+      // record has no authoritative backend type, so all possible owned names
+      // must prove missing; exists/unknown keeps only this receiver gated.
+      vcMeetingRuntimeLeaseRecovery.arm(ref, cfg.larkAppId);
+      continue;
+    }
+    if (ds.larkAppId !== cfg.larkAppId || !receiver
+      || receiver.listenerAppId !== ref.listenerAppId
+      || receiver.meetingId !== ref.meetingId
+      || receiver.memberId !== ref.memberId
+      || receiver.memberEpoch !== ref.memberEpoch) {
+      // Corrupt identity must not restart an unrelated session or silently
+      // un-gate delivery. Keep the daemon fail-closed for operator repair.
+      addVcMeetingReceiverRecoveryPending(recoveryKey, vcMeetingDeliveryScopeFromRef(ref));
+      logger.error(
+        `[vc-delivery] boot receiver identity conflict; delivery remains gated `
+        + `session=${ref.receiverSessionId}`,
+      );
+      continue;
+    }
+    if (!ds.worker || ds.worker.killed) {
+      // No Node worker can ACK. Deterministically kill + probe its owned pane;
+      // only an authoritative missing result releases this receiver stream.
+      vcMeetingRuntimeLeaseRecovery.arm(ref, cfg.larkAppId);
+      continue;
+    }
+    addVcMeetingReceiverRecoveryPending(recoveryKey, vcMeetingDeliveryScopeFromRef(ref));
+    armVcMeetingReceiverRecoveryTimeout(recoveryKey, ref.receiverSessionId);
+    try {
+      ds.worker.send({
+        type: 'reset_ambiguous_receiver',
+        turnId: ref.deliveryKey,
+        dispatchAttempt: ref.dispatchAttempt,
+      } as DaemonToWorker);
+    } catch (err) {
+      logger.error(
+        `[vc-delivery] failed to fence boot-ambiguous receiver `
+        + `session=${ref.receiverSessionId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      escalateVcMeetingBootRecovery(recoveryKey, ref.receiverSessionId);
+    }
+  }
+  vcMeetingReceiverRecoverySchedulingComplete = true;
+  refreshVcMeetingReceiverRecoveryReady();
 
   // Second global-skills sweep, AFTER restore has settled. The early
   // cleanupGlobalBotmuxSkillsOnce() pass (in the startup ensureCliEnv above)
@@ -8803,6 +15993,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.info(`Daemon shutting down... (active: ${getActiveCount()})`);
     scheduler.stopScheduler();
     stopMaintenance();
+    vcMeetingTerminalReconciler?.stop();
+    clearInterval(vcMeetingDeliveryLeaseTimer);
+    for (const timer of vcMeetingReceiverRecoveryTimers.values()) clearTimeout(timer);
+    vcMeetingReceiverRecoveryTimers.clear();
+    vcMeetingReceiverRecoveryPending.clear();
+    vcMeetingReceiverRecoveryEscalating.clear();
+    vcMeetingReceiverRecoveryScopes.clear();
+    vcMeetingRuntimeLeaseRecovery.reset();
+    vcMeetingReceiverRecoveryReady = false;
     stopCliRuntimeUpdateMonitor();
     clearInterval(maintenanceHeartbeat);
     clearInterval(docCommentPollTimer);
@@ -8811,6 +16010,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     workflowRuns.clear();
     for (const session of vcMeetingSessions.values()) cleanupVcMeetingDaemonSession(session, 'daemon-shutdown');
     vcMeetingSessions.clear();
+    for (const closing of vcMeetingClosingConsumerSessions.values()) {
+      if (closing.timer) clearTimeout(closing.timer);
+    }
+    vcMeetingClosingConsumerSessions.clear();
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);

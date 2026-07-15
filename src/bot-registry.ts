@@ -14,6 +14,21 @@ import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
+import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
+import type {
+  VcMeetingConsumerAgentConfig,
+  VcMeetingConsumerConfig,
+  VcMeetingConsumerManagedSink,
+  VcMeetingConsumerProfileConfig,
+} from './types.js';
+import type { VcMeetingActivityType } from './vc-agent/types.js';
+
+export type {
+  VcMeetingConsumerAgentConfig,
+  VcMeetingConsumerConfig,
+  VcMeetingConsumerManagedSink,
+  VcMeetingConsumerProfileConfig,
+} from './types.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
 export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
@@ -140,22 +155,392 @@ function normalizeVcMeetingConsumerConfig(raw: unknown): VcMeetingConsumerConfig
   const out: VcMeetingConsumerConfig = {};
   if (entry.enabled === true) out.enabled = true;
   if (entry.enabled === false) out.enabled = false;
-  if (entry.defaultMode === 'listenOnly' || entry.defaultMode === 'agent') out.defaultMode = entry.defaultMode;
-  const defaultAgentAppId = normalizeNonEmptyString(entry.defaultAgentAppId) ?? normalizeNonEmptyString(entry.defaultAgent);
   const selectionTimeoutMs = normalizePositiveInt(entry.selectionTimeoutMs);
   const injectIntervalMs = normalizePositiveInt(entry.injectIntervalMs);
   const minBatchChars = normalizePositiveInt(entry.minBatchChars);
   const minBatchItems = normalizePositiveInt(entry.minBatchItems);
   const maxInjectIntervalMs = normalizePositiveInt(entry.maxInjectIntervalMs);
-  const candidates = normalizeVcMeetingConsumerCandidates(entry.agentCandidates ?? entry.agents);
-  if (defaultAgentAppId) out.defaultAgentAppId = defaultAgentAppId;
   if (selectionTimeoutMs !== undefined) out.selectionTimeoutMs = selectionTimeoutMs;
   if (injectIntervalMs !== undefined) out.injectIntervalMs = injectIntervalMs;
   if (minBatchChars !== undefined) out.minBatchChars = minBatchChars;
   if (minBatchItems !== undefined) out.minBatchItems = minBatchItems;
   if (maxInjectIntervalMs !== undefined) out.maxInjectIntervalMs = maxInjectIntervalMs;
-  if (candidates.length > 0) out.agentCandidates = candidates;
+
+  if (Object.prototype.hasOwnProperty.call(entry, 'defaultProfileBootstrap')) {
+    const marker = entry.defaultProfileBootstrap;
+    const path = 'vcMeetingAgent.meetingConsumer.defaultProfileBootstrap';
+    if (!marker || typeof marker !== 'object' || Array.isArray(marker)) {
+      strictConfigError(path, 'must be an object');
+    }
+    const markerEntry = marker as Record<string, unknown>;
+    const allowedKeys = new Set(['generatorVersion', 'profileId', 'configHash']);
+    const unknownKeys = Object.keys(markerEntry).filter(key => !allowedKeys.has(key));
+    if (unknownKeys.length > 0) {
+      strictConfigError(path, `unknown field(s): ${unknownKeys.join(', ')}`);
+    }
+    const generatorVersion = normalizePositiveInt(markerEntry.generatorVersion);
+    const profileId = normalizeNonEmptyString(markerEntry.profileId);
+    const configHash = normalizeNonEmptyString(markerEntry.configHash);
+    if (generatorVersion === undefined) strictConfigError(`${path}.generatorVersion`, 'must be a positive integer');
+    if (!profileId) strictConfigError(`${path}.profileId`, 'must be a non-empty string');
+    if (!configHash || !/^sha256:[0-9a-f]{64}$/u.test(configHash)) {
+      strictConfigError(`${path}.configHash`, 'must be a sha256:<64 lowercase hex> value');
+    }
+    out.defaultProfileBootstrap = { generatorVersion, profileId, configHash };
+  }
+
+  if (Object.prototype.hasOwnProperty.call(entry, 'consumerProfiles')) {
+    out.consumerProfiles = normalizeVcMeetingConsumerProfiles(entry.consumerProfiles);
+    if (Object.prototype.hasOwnProperty.call(entry, 'defaultConsumerIds')) {
+      out.defaultConsumerIds = normalizeStrictStringList(
+        entry.defaultConsumerIds,
+        'vcMeetingAgent.meetingConsumer.defaultConsumerIds',
+      );
+    }
+    if (entry.defaultMode === 'listenOnly' || entry.defaultMode === 'agents') {
+      out.defaultMode = entry.defaultMode;
+    } else if (entry.defaultMode !== undefined && entry.defaultMode !== 'agent') {
+      throw new Error(
+        'vcMeetingAgent.meetingConsumer.defaultMode must be listenOnly or agents when consumerProfiles is present',
+      );
+    }
+
+    const legacyFields = [
+      'defaultAgentAppId',
+      'defaultAgent',
+      'agentCandidates',
+      'agents',
+      ...(entry.defaultMode === 'agent' ? ['defaultMode=agent'] : []),
+    ].filter((field) => field.includes('=') || Object.prototype.hasOwnProperty.call(entry, field));
+    if (legacyFields.length > 0) {
+      logger.warn(
+        `vcMeetingAgent.meetingConsumer.consumerProfiles is present; ignoring legacy fields: ${legacyFields.join(', ')}`,
+      );
+    }
+
+    const resolution = resolveVcMeetingConsumerProfiles(out);
+    if (!resolution.ok) throw new Error(resolution.errors.join('; '));
+  } else {
+    if (entry.defaultMode === 'listenOnly' || entry.defaultMode === 'agent') out.defaultMode = entry.defaultMode;
+    const defaultAgentAppId = normalizeNonEmptyString(entry.defaultAgentAppId)
+      ?? normalizeNonEmptyString(entry.defaultAgent);
+    const candidates = normalizeVcMeetingConsumerCandidates(entry.agentCandidates ?? entry.agents);
+    if (defaultAgentAppId) out.defaultAgentAppId = defaultAgentAppId;
+    if (candidates.length > 0) out.agentCandidates = candidates;
+  }
+  if (out.defaultProfileBootstrap && out.consumerProfiles === undefined) {
+    strictConfigError(
+      'vcMeetingAgent.meetingConsumer.defaultProfileBootstrap',
+      'requires consumerProfiles',
+    );
+  }
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+const VC_MEETING_CONSUMER_ACTIVITY_TYPES = [
+  'participant_joined',
+  'participant_left',
+  'chat_received',
+  'transcript_received',
+  'magic_share_started',
+  'magic_share_ended',
+] as const satisfies readonly VcMeetingActivityType[];
+
+const VC_MEETING_CONSUMER_MANAGED_SINKS = [
+  'meeting_text',
+  'meeting_voice',
+] as const satisfies readonly VcMeetingConsumerManagedSink[];
+
+const VC_MEETING_OUTPUT_CAPABILITY = 'meeting.output.request';
+const VC_MEETING_LISTENER_OUTPUT_CAPABILITY = 'listener.output.request';
+const VC_MEETING_CONSUMER_PROFILE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const VC_MEETING_CONSUMER_RESERVED_PROFILE_IDS = new Set([
+  '__proto__',
+  'prototype',
+  'constructor',
+]);
+
+function strictConfigError(path: string, message: string): never {
+  throw new Error(`${path}: ${message}`);
+}
+
+function validateVcMeetingConsumerProfileId(id: string, path: string): void {
+  if (VC_MEETING_CONSUMER_RESERVED_PROFILE_IDS.has(id)) {
+    strictConfigError(path, `${JSON.stringify(id)} is reserved`);
+  }
+  if (!VC_MEETING_CONSUMER_PROFILE_ID_RE.test(id)) {
+    strictConfigError(path, 'must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}');
+  }
+}
+
+function normalizeStrictStringList(raw: unknown, path: string): string[] {
+  if (!Array.isArray(raw)) strictConfigError(path, 'must be an array');
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (let index = 0; index < raw.length; index += 1) {
+    const value = normalizeNonEmptyString(raw[index]);
+    if (!value) strictConfigError(`${path}[${index}]`, 'must be a non-empty string');
+    if (seen.has(value)) strictConfigError(`${path}[${index}]`, `duplicates ${JSON.stringify(value)}`);
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+function normalizeVcMeetingConsumerProfileFilter(
+  raw: unknown,
+  path: string,
+): VcMeetingConsumerProfileConfig['filter'] | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    strictConfigError(path, 'must be an object');
+  }
+  const entry = raw as Record<string, unknown>;
+  const unknownKeys = Object.keys(entry).filter(key => key !== 'activityTypes');
+  if (unknownKeys.length > 0) {
+    strictConfigError(path, `unsupported filter field(s): ${unknownKeys.join(', ')}`);
+  }
+  if (entry.activityTypes === undefined) return undefined;
+  const activityTypes = normalizeStrictStringList(entry.activityTypes, `${path}.activityTypes`);
+  for (let index = 0; index < activityTypes.length; index += 1) {
+    if (!(VC_MEETING_CONSUMER_ACTIVITY_TYPES as readonly string[]).includes(activityTypes[index]!)) {
+      strictConfigError(
+        `${path}.activityTypes[${index}]`,
+        `unsupported activity type ${JSON.stringify(activityTypes[index])}`,
+      );
+    }
+  }
+  return activityTypes.length > 0
+    ? { activityTypes: activityTypes as VcMeetingActivityType[] }
+    : undefined;
+}
+
+function normalizeVcMeetingConsumerOwnedSinks(
+  raw: unknown,
+  path: string,
+  capabilities: readonly string[],
+): VcMeetingConsumerManagedSink[] | undefined {
+  if (raw === undefined) return undefined;
+  const sinks = normalizeStrictStringList(raw, path);
+  for (let index = 0; index < sinks.length; index += 1) {
+    const sink = sinks[index]!;
+    if (sink === 'listener_notice') {
+      strictConfigError(`${path}[${index}]`, 'listener_notice is reserved for the daemon system principal');
+    }
+    if (!(VC_MEETING_CONSUMER_MANAGED_SINKS as readonly string[]).includes(sink)) {
+      strictConfigError(`${path}[${index}]`, `unsupported owned sink ${JSON.stringify(sink)} in MA-P1 slice 1A`);
+    }
+    if (!capabilities.includes(VC_MEETING_OUTPUT_CAPABILITY)) {
+      strictConfigError(
+        `${path}[${index}]`,
+        `${sink} requires capability ${VC_MEETING_OUTPUT_CAPABILITY}`,
+      );
+    }
+  }
+  return sinks.length > 0 ? sinks as VcMeetingConsumerManagedSink[] : undefined;
+}
+
+function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProfileConfig[] {
+  const path = 'vcMeetingAgent.meetingConsumer.consumerProfiles';
+  if (!Array.isArray(raw)) strictConfigError(path, 'must be an array');
+  return raw.map((value, index) => {
+    const profilePath = `${path}[${index}]`;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      strictConfigError(profilePath, 'must be an object');
+    }
+    const entry = value as Record<string, unknown>;
+    const allowedKeys = new Set([
+      'id',
+      'agentAppId',
+      'label',
+      'role',
+      'instructions',
+      'filter',
+      'responseMode',
+      'capabilities',
+      'ownedSinks',
+    ]);
+    const unknownKeys = Object.keys(entry).filter(key => !allowedKeys.has(key));
+    if (unknownKeys.length > 0) {
+      strictConfigError(profilePath, `unknown field(s): ${unknownKeys.join(', ')}`);
+    }
+    const id = normalizeNonEmptyString(entry.id);
+    if (!id) strictConfigError(`${profilePath}.id`, 'must be a non-empty string');
+    validateVcMeetingConsumerProfileId(id, `${profilePath}.id`);
+    const agentAppId = normalizeNonEmptyString(entry.agentAppId);
+    if (!agentAppId) strictConfigError(`${profilePath}.agentAppId`, 'must be a non-empty string');
+    const role = normalizeNonEmptyString(entry.role);
+    if (!role) strictConfigError(`${profilePath}.role`, 'must be a non-empty string');
+    if (role.length > 256) strictConfigError(`${profilePath}.role`, 'must be at most 256 characters');
+    if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(role)) {
+      strictConfigError(`${profilePath}.role`, 'must be a single printable line');
+    }
+    if (role.toLowerCase().includes('botmux_role_instructions')) {
+      strictConfigError(`${profilePath}.role`, 'contains a reserved botmux instruction marker');
+    }
+    const normalizedInstructions = normalizeVcMeetingProfileInstructions(entry.instructions);
+    if (!normalizedInstructions.ok) {
+      strictConfigError(`${profilePath}.instructions`, normalizedInstructions.error);
+    }
+    if (entry.label !== undefined && !normalizeNonEmptyString(entry.label)) {
+      strictConfigError(`${profilePath}.label`, 'must be a non-empty string when present');
+    }
+    if (entry.responseMode !== 'silent' && entry.responseMode !== 'listener_thread') {
+      strictConfigError(`${profilePath}.responseMode`, 'must be silent or listener_thread');
+    }
+    const capabilities = normalizeStrictStringList(entry.capabilities, `${profilePath}.capabilities`);
+    const filter = normalizeVcMeetingConsumerProfileFilter(entry.filter, `${profilePath}.filter`);
+    const ownedSinks = normalizeVcMeetingConsumerOwnedSinks(
+      entry.ownedSinks,
+      `${profilePath}.ownedSinks`,
+      capabilities,
+    );
+    return {
+      id,
+      agentAppId,
+      ...(normalizeNonEmptyString(entry.label) ? { label: normalizeNonEmptyString(entry.label) } : {}),
+      role,
+      ...(normalizedInstructions.instructions
+        ? { instructions: normalizedInstructions.instructions }
+        : {}),
+      ...(filter ? { filter } : {}),
+      responseMode: entry.responseMode,
+      capabilities,
+      ...(ownedSinks ? { ownedSinks } : {}),
+    };
+  });
+}
+
+export type VcMeetingConsumerProfileResolution =
+  | {
+      ok: true;
+      source: 'legacy';
+      profiles: readonly [];
+      selectedProfiles: readonly [];
+    }
+  | {
+      ok: true;
+      source: 'profiles';
+      profiles: readonly VcMeetingConsumerProfileConfig[];
+      selectedProfiles: readonly VcMeetingConsumerProfileConfig[];
+    }
+  | {
+      ok: false;
+      source: 'legacy' | 'profiles';
+      errors: string[];
+    };
+
+/**
+ * Resolve and validate a profile-mode selection. The daemon can call this again
+ * for card selections; config parsing calls it for the default selection.
+ * Legacy configs deliberately return `source: legacy` without synthesizing
+ * profiles so the existing dynamic-candidate/single-select path stays intact.
+ */
+export function resolveVcMeetingConsumerProfiles(
+  config: VcMeetingConsumerConfig,
+  selectedConsumerIds?: readonly string[],
+): VcMeetingConsumerProfileResolution {
+  if (config.consumerProfiles === undefined) {
+    if (config.defaultMode === 'agents' || config.defaultConsumerIds !== undefined) {
+      return {
+        ok: false,
+        source: 'legacy',
+        errors: ['consumerProfiles is required for defaultMode=agents/defaultConsumerIds'],
+      };
+    }
+    return { ok: true, source: 'legacy', profiles: [], selectedProfiles: [] };
+  }
+
+  const errors: string[] = [];
+  const profiles = config.consumerProfiles;
+  const byId = new Map<string, VcMeetingConsumerProfileConfig>();
+  for (let index = 0; index < profiles.length; index += 1) {
+    const profile = profiles[index]!;
+    if (VC_MEETING_CONSUMER_RESERVED_PROFILE_IDS.has(profile.id)) {
+      errors.push(`consumerProfiles[${index}].id ${JSON.stringify(profile.id)} is reserved`);
+    } else if (!VC_MEETING_CONSUMER_PROFILE_ID_RE.test(profile.id)) {
+      errors.push(`consumerProfiles[${index}].id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}`);
+    }
+    if (byId.has(profile.id)) {
+      errors.push(`consumerProfiles[${index}].id duplicates ${JSON.stringify(profile.id)}`);
+    } else {
+      byId.set(profile.id, profile);
+    }
+    for (const sink of profile.ownedSinks ?? []) {
+      if (sink === ('listener_notice' as VcMeetingConsumerManagedSink)) {
+        errors.push(`consumerProfiles[${index}].ownedSinks: listener_notice is reserved`);
+      } else if (!(VC_MEETING_CONSUMER_MANAGED_SINKS as readonly string[]).includes(sink)) {
+        errors.push(`consumerProfiles[${index}].ownedSinks: unsupported sink ${JSON.stringify(sink)}`);
+      } else if (!profile.capabilities.includes(VC_MEETING_OUTPUT_CAPABILITY)) {
+        errors.push(`consumerProfiles[${index}].ownedSinks: ${sink} requires ${VC_MEETING_OUTPUT_CAPABILITY}`);
+      }
+    }
+    if (profile.responseMode === 'listener_thread'
+      && !profile.capabilities.includes(VC_MEETING_LISTENER_OUTPUT_CAPABILITY)) {
+      errors.push(
+        `consumerProfiles[${index}].responseMode: listener_thread requires ${VC_MEETING_LISTENER_OUTPUT_CAPABILITY}`,
+      );
+    }
+  }
+
+  for (const [index, id] of (config.defaultConsumerIds ?? []).entries()) {
+    if (!byId.has(id)) errors.push(`defaultConsumerIds[${index}] references unknown profile ${JSON.stringify(id)}`);
+  }
+  const selectedIds = [...(selectedConsumerIds ?? config.defaultConsumerIds ?? [])];
+  if (selectedConsumerIds === undefined && config.defaultMode === 'agents' && selectedIds.length === 0) {
+    errors.push('defaultMode=agents requires at least one defaultConsumerId');
+  }
+
+  const selectedProfiles: VcMeetingConsumerProfileConfig[] = [];
+  const seenIds = new Set<string>();
+  const selectedByAgent = new Map<string, string>();
+  const selectedBySink = new Map<VcMeetingConsumerManagedSink, string>();
+  let selectedListenerThreadProfile: string | undefined;
+  for (let index = 0; index < selectedIds.length; index += 1) {
+    const id = selectedIds[index]!;
+    if (seenIds.has(id)) {
+      errors.push(`selectedConsumerIds[${index}] duplicates ${JSON.stringify(id)}`);
+      continue;
+    }
+    seenIds.add(id);
+    const profile = byId.get(id);
+    if (!profile) {
+      errors.push(`selectedConsumerIds[${index}] references unknown profile ${JSON.stringify(id)}`);
+      continue;
+    }
+    selectedProfiles.push(profile);
+    const priorAgentProfile = selectedByAgent.get(profile.agentAppId);
+    if (priorAgentProfile) {
+      errors.push(
+        `selected profiles ${JSON.stringify(priorAgentProfile)} and ${JSON.stringify(profile.id)} share agentAppId ${JSON.stringify(profile.agentAppId)}`,
+      );
+    } else {
+      selectedByAgent.set(profile.agentAppId, profile.id);
+    }
+    for (const sink of profile.ownedSinks ?? []) {
+      const priorSinkProfile = selectedBySink.get(sink);
+      if (priorSinkProfile) {
+        errors.push(
+          `selected profiles ${JSON.stringify(priorSinkProfile)} and ${JSON.stringify(profile.id)} both own sink ${JSON.stringify(sink)}`,
+        );
+      } else {
+        selectedBySink.set(sink, profile.id);
+      }
+    }
+    if (profile.responseMode === 'listener_thread') {
+      if (selectedListenerThreadProfile) {
+        errors.push(
+          `selected profiles ${JSON.stringify(selectedListenerThreadProfile)} and ${JSON.stringify(profile.id)} both use responseMode "listener_thread"`,
+        );
+      } else {
+        selectedListenerThreadProfile = profile.id;
+      }
+    }
+  }
+
+  return errors.length > 0
+    ? { ok: false, source: 'profiles', errors }
+    : { ok: true, source: 'profiles', profiles, selectedProfiles };
 }
 
 function normalizeVcMeetingConsumerCandidates(raw: unknown): VcMeetingConsumerAgentConfig[] {
@@ -400,34 +785,6 @@ export interface VcMeetingAgentConfig {
   realtimeVoice?: VcMeetingRealtimeVoiceConfig;
   /** Optional listener-group consumer. Card choices are driven entirely by this bots.json block. */
   meetingConsumer?: VcMeetingConsumerConfig;
-}
-
-export interface VcMeetingConsumerAgentConfig {
-  /** Target bot app id to receive meeting chunks through daemon-side injection. */
-  larkAppId: string;
-  /** Human-readable card label. Falls back to bot registry name / app id. */
-  label?: string;
-}
-
-export interface VcMeetingConsumerConfig {
-  /** When false, listener groups only sync meeting messages and do not show the agent-selection card. */
-  enabled?: boolean;
-  /** Timeout/default behavior. Defaults to listenOnly. */
-  defaultMode?: 'listenOnly' | 'agent';
-  /** Used only when defaultMode is agent. Accepts defaultAgent as a legacy alias in bots.json. */
-  defaultAgentAppId?: string;
-  /** Card selection timeout. Defaults in daemon; should normally be < flushIntervalMs. */
-  selectionTimeoutMs?: number;
-  /** Agent injection cadence, independent from listener-group flush interval. */
-  injectIntervalMs?: number;
-  /** Minimum rendered meeting delta characters before injecting to the agent. Defaults in daemon. */
-  minBatchChars?: number;
-  /** Minimum meeting delta item count before injecting to the agent. Defaults in daemon. */
-  minBatchItems?: number;
-  /** Maximum time to hold a non-empty meeting delta before injecting to the agent. Defaults in daemon. */
-  maxInjectIntervalMs?: number;
-  /** Optional allowlist. Omitted or [] means all online configured bots with a usable working dir are shown; use enabled:false to disable. */
-  agentCandidates?: VcMeetingConsumerAgentConfig[];
 }
 
 export interface VcMeetingRealtimeVoiceConfig {

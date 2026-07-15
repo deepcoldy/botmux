@@ -275,6 +275,12 @@ export interface CliAdapter {
    *  correct for both shapes. */
   readonly supportsTypeAhead?: boolean;
 
+  /** The adapter exposes a transcript-backed end-of-turn boundary that the
+   *  worker can report independently of whether fallback output is visible.
+   *  Durable meeting delivery is fail-closed for adapters without this
+   *  capability; `queued` and `final_output` are not completion receipts. */
+  readonly reliableTurnTerminal?: boolean;
+
   /** True when this adapter supports running under per-bot read isolation (its
    *  data root is redirectable into BOT_HOME — CLAUDE_CONFIG_DIR / CODEX_HOME —
    *  and it runs correctly under the worker's whole-process Seatbelt wrapper,

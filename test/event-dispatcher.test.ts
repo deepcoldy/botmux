@@ -1753,6 +1753,95 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     }));
   });
 
+  it('routes an explicit @mention through the anchor returned by beforeSessionTurn', async () => {
+    let hookAnchor: string | undefined;
+    const beforeSessionTurn = vi.fn(async (_data: any, ctx: { anchor: string }) => {
+      hookAnchor = ctx.anchor;
+      return { anchorOverride: 'vc-receiver-session-1' };
+    });
+    handlers.beforeSessionTurn = beforeSessionTurn;
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'vc-receiver-session-1');
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA follow up on the meeting' }),
+      rootId: 'visible-topic-root',
+      messageId: 'msg-anchor-override',
+      chatId: 'chat-anchor-override',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(beforeSessionTurn).toHaveBeenCalledTimes(1);
+    expect(beforeSessionTurn.mock.calls[0]?.[0]).toBe(event);
+    expect(beforeSessionTurn.mock.calls[0]?.[2]).toEqual(expect.objectContaining({
+      senderOpenId: USER_OPEN_ID,
+      explicitlyMentionedThisBot: true,
+    }));
+    expect(hookAnchor).toBe('chat-anchor-override');
+    expect(handlers.isSessionOwner).toHaveBeenCalledWith('vc-receiver-session-1', MY_APP_ID);
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      anchor: 'vc-receiver-session-1',
+      scope: 'chat',
+      chatId: 'chat-anchor-override',
+      replyRootId: 'visible-topic-root',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('does not route an explicit @mention when beforeSessionTurn blocks it', async () => {
+    const beforeSessionTurn = vi.fn(async () => ({ block: true }));
+    handlers.beforeSessionTurn = beforeSessionTurn;
+    handlers.isSessionOwner.mockReturnValue(true);
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA choose a meeting first' }),
+      rootId: 'ambiguous-topic-root',
+      messageId: 'msg-before-session-block',
+      chatId: 'chat-before-session-block',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(beforeSessionTurn).toHaveBeenCalledTimes(1);
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('does not call beforeSessionTurn or alter routing for a non-@ message', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'never' });
+    mockGetChatMode.mockResolvedValue('group');
+    const beforeSessionTurn = vi.fn(async () => ({ anchorOverride: 'must-not-be-used' }));
+    handlers.beforeSessionTurn = beforeSessionTurn;
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'ordinary ambient turn' }),
+      messageId: 'msg-without-explicit-mention',
+      chatId: 'chat-without-explicit-mention',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(beforeSessionTurn).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      anchor: 'chat-without-explicit-mention',
+      scope: 'chat',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
   it('treats 普通群 root_id WITHOUT thread_id as chat-scope (Lark quote-bubble quirk)', async () => {
     // User typed a top-level message in 普通群; Lark UI attached root_id but
     // NOT thread_id (引用气泡 / 快速回复 bubble). decideRouting now keys on

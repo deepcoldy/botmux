@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
+import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { store } from './store.js';
@@ -695,6 +696,12 @@ function SettingsBody(props: {
             />
           </div>
           <LarkCliStatus settings={settings.vcMeetingAgent} />
+          <VcConsumerProfilesGate
+            enabled={settings.vcMeetingAgent.enabled}
+            canWrite={canWrite}
+            listenerBotAppId={settings.vcMeetingAgent.listenerBotAppId}
+            listenerBotOptions={settings.vcMeetingAgent.listenerBotOptions}
+          />
           {props.feishuLoginQr ? (
             <div className="settings-feishu-login">
               <button

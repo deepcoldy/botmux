@@ -47,6 +47,7 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_LARK_APP_ID',
   'BOTMUX_ROOT_MESSAGE_ID',
   'BOTMUX_TURN_ID',
+  'BOTMUX_DISPATCH_ATTEMPT',
   // Keep `botmux bots list` and ready-gated CLIs aligned with daemon config.
   'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
   'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',

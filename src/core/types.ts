@@ -1,5 +1,14 @@
 import type { ChildProcess } from 'node:child_process';
-import type { CodexAppTurnInput, Session, DaemonToWorker, LarkAttachment, LarkMention, DisplayMode, StreamStatus } from '../types.js';
+import type {
+  CodexAppTurnInput,
+  Session,
+  DaemonToWorker,
+  LarkAttachment,
+  LarkMention,
+  DisplayMode,
+  StreamStatus,
+  VcMeetingImTurnOrigin,
+} from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
@@ -32,6 +41,9 @@ export interface DaemonSession {
   worker: ChildProcess | null;   // fork'd worker process
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
+  /** Monotonic within one daemon boot. Captured by durable delivery receipts
+   *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
+  workerGeneration?: number;
   larkAppId: string;
   chatId: string;
   chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
@@ -150,6 +162,20 @@ export interface DaemonSession {
     content?: string;
   }>;
   latestAsyncTriggerId?: string;
+  /** Stable turn ids whose automatic transcript fallback is capture/discard.
+   *  turn_terminal clears the entry; bounded in trigger-session for crash
+   *  paths that never produce a terminal. */
+  suppressedFinalOutputTurns?: Map<string, number>;
+  /** Worker-issued live turn registry used to authorize daemon-mediated exits
+   * (ask/relay) that cannot trust a long-lived CLI's spawn-time env. */
+  managedTurnOrigin?: {
+    capability: string;
+    turnId?: string;
+    dispatchAttempt?: number;
+  };
+  /** Authority snapshot captured when an explicit Lark IM message was
+   * deterministically routed into this dedicated meeting receiver. */
+  vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
   /** Cached TUI prompt options — for dedup and for resolving after click */
@@ -222,6 +248,17 @@ export function sessionKey(anchorId: string, larkAppId: string): string {
  *  storage and lookup time. */
 export function sessionAnchorId(ds: DaemonSession): string {
   return ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId;
+}
+
+/** Storage key for the daemon-owned activeSessions map. A VC receiver is a
+ * dedicated conversation even though its visible output route is a chat, so
+ * key it by its immutable session id instead of collapsing it into the normal
+ * `(chatId, appId)` chat-scope slot. */
+export function activeSessionKey(ds: DaemonSession): string {
+  const anchor = ds.session.vcMeetingReceiver
+    ? `vc-receiver:${ds.session.sessionId}`
+    : sessionAnchorId(ds);
+  return sessionKey(anchor, ds.larkAppId);
 }
 
 /** A session whose only IM surface is a Feishu document comment thread.

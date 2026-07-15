@@ -425,11 +425,18 @@ export interface ClaudeFamilyVariant {
   readonly modelChoices?: readonly string[];
   /** Auth/login paths kept real+writable in the file sandbox (see CliAdapter.authPaths). */
   readonly authPaths?: readonly string[];
+  /** Opt in only after this concrete fork passes the terminal contract. */
+  readonly reliableTurnTerminal?: boolean;
 }
 
 export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
   return createClaudeFamilyAdapter({
     id: 'claude-code',
+    // Claude Code JSONL carries authoritative final boundaries: final
+    // assistant stop_reason (non-tool) and system/turn_duration. The worker
+    // refuses durable submits unless it has first installed an attributable
+    // bridge mark, and failure/exit paths share the same terminal deduper.
+    reliableTurnTerminal: true,
     authPaths: ['~/.claude/.credentials.json'],
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
@@ -453,6 +460,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     },
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     supportsTypeAhead: true,
+    reliableTurnTerminal: variant.reliableTurnTerminal,
     // Isolation = worker-side whole-process Seatbelt wrapper. Claude's built-in
     // --settings sandbox is NOT used: it only sandboxes Bash (main process
     // unsandboxed, and network Bash commands can ESCAPE it). Claude's own data

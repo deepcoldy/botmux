@@ -299,4 +299,35 @@ describe('worker-pool lifecycle hook integration', () => {
       code: 1,
     }));
   });
+
+  it('forwards exact durable_expiry_ready evidence with worker generation', async () => {
+    const onDurableExpiryReady = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onDurableExpiryReady,
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'durable_expiry_ready',
+      sessionId: 'sid-lifecycle-test',
+      turnId: 'delivery-1',
+      dispatchAttempt: 3,
+      disposition: 'queued_removed',
+    });
+    await flush();
+
+    expect(onDurableExpiryReady).toHaveBeenCalledWith(ds, {
+      sessionId: 'sid-lifecycle-test',
+      turnId: 'delivery-1',
+      dispatchAttempt: 3,
+      workerGeneration: 1,
+      disposition: 'queued_removed',
+    });
+  });
 });

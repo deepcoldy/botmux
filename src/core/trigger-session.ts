@@ -12,6 +12,7 @@ import { markSessionActivity } from './session-activity.js';
 import { forkWorker, getCurrentCliVersion, sendWorkerInput } from './worker-pool.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import * as messageQueue from '../services/message-queue.js';
+import type { CliTurnPayload } from '../types.js';
 import type { DaemonSession } from './types.js';
 import { sessionKey } from './types.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
@@ -19,6 +20,27 @@ import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.
 export interface TriggerSessionDeps {
   larkAppId: string;
   activeSessions: Map<string, DaemonSession>;
+}
+
+/** Daemon-internal dispatch controls. These deliberately do not live in the
+ * public TriggerRequest schema: an untrusted connector must not choose a turn
+ * identity that participates in durable delivery reconciliation. */
+export interface TriggerSessionInternalOptions {
+  stableTurnId?: string;
+  /** Synchronous write-ahead hook invoked immediately before worker IPC/fork.
+   *  Durable receivers use it to persist DISPATCHED with the exact worker
+   *  generation. Throwing aborts the dispatch. */
+  beforeDispatch?: (
+    context: { sessionId: string; workerGeneration: number },
+  ) => void | { dispatchAttempt: number };
+  /** Suppress daemon-rendered final_output while preserving turn_terminal.
+   *  Used by analysis-only meeting consumers; explicit user IM turns do not
+   *  set it. */
+  suppressFinalOutput?: boolean;
+  /** Meeting raw text is intentionally ephemeral receiver input. Keep it out
+   *  of botmux's persisted Session.lastUserPrompt/lastCliInput fields; receipt
+   *  recovery asks the hub to resend the frozen envelope instead. */
+  persistInputHistory?: boolean;
 }
 
 function triggerTitle(req: TriggerRequest): string {
@@ -230,8 +252,42 @@ function buildExistingSessionContent(
 export async function triggerSessionTurn(
   req: TriggerRequest,
   deps: TriggerSessionDeps,
+  internal?: TriggerSessionInternalOptions,
 ): Promise<TriggerResponse> {
-  const triggerId = `trg_${randomUUID()}`;
+  const stableTurnId = internal?.stableTurnId?.trim();
+  const triggerId = stableTurnId || `trg_${randomUUID()}`;
+  const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
+    if (!stableTurnId || !internal?.beforeDispatch) return undefined;
+    const workerGeneration = willFork
+      ? (target.workerGeneration ?? 0) + 1
+      : (target.workerGeneration ?? 1);
+    const prepared = internal.beforeDispatch({ sessionId: target.session.sessionId, workerGeneration });
+    if (!prepared) return undefined;
+    if (!Number.isSafeInteger(prepared.dispatchAttempt) || prepared.dispatchAttempt < 1) {
+      throw new Error('beforeDispatch returned an invalid dispatchAttempt');
+    }
+    return prepared.dispatchAttempt;
+  };
+  const armFinalOutputSuppression = (target: DaemonSession, dispatchAttempt: number | undefined): void => {
+    if (!stableTurnId || internal?.suppressFinalOutput !== true) return;
+    if (dispatchAttempt === undefined) {
+      throw new Error('silent durable dispatch requires a dispatchAttempt');
+    }
+    target.suppressedFinalOutputTurns ??= new Map();
+    target.suppressedFinalOutputTurns.set(stableTurnId, dispatchAttempt);
+    if (target.suppressedFinalOutputTurns.size > 256) {
+      const oldest = target.suppressedFinalOutputTurns.keys().next().value;
+      if (oldest !== undefined) target.suppressedFinalOutputTurns.delete(oldest);
+    }
+  };
+  const rememberInput = (
+    target: DaemonSession,
+    original: string,
+    rendered: string | CliTurnPayload,
+  ): void => {
+    if (internal?.persistInputHistory === false) return;
+    rememberLastCliInput(target, original, rendered);
+  };
   const larkAppId = deps.larkAppId;
   if (req.target.botId && req.target.botId !== larkAppId) {
     return { ok: false, errorCode: 'bot_not_found', error: 'request routed to the wrong daemon' };
@@ -307,7 +363,7 @@ export async function triggerSessionTurn(
       ds, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
     );
     markSessionActivity(ds);
-    rememberLastCliInput(ds, prompt, content);
+    rememberInput(ds, prompt, content);
 
     if (req.options?.waitForFinalOutput) {
       return waitForSessionFinalOutput(
@@ -322,13 +378,23 @@ export async function triggerSessionTurn(
           output: { content: text },
           message: 'delivered to existing session and completed',
         }),
-        () => { sendWorkerInput(ds!, content, triggerId); },
+        () => {
+          const dispatchAttempt = prepareStableDispatch(ds!, false);
+          armFinalOutputSuppression(ds!, dispatchAttempt);
+          sendWorkerInput(ds!, content, triggerId, {
+            ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+          });
+        },
       );
     }
 
     if (req.options?.asyncReturnSessionId) {
       beginAsyncTrigger(ds, triggerId);
-      sendWorkerInput(ds, content, triggerId);
+      const dispatchAttempt = prepareStableDispatch(ds, false);
+      armFinalOutputSuppression(ds, dispatchAttempt);
+      sendWorkerInput(ds, content, triggerId, {
+        ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      });
       return buildAsyncQueuedResponse(
         triggerId,
         ds.session.sessionId,
@@ -337,7 +403,11 @@ export async function triggerSessionTurn(
       );
     }
 
-    sendWorkerInput(ds, content);
+    const dispatchAttempt = prepareStableDispatch(ds, false);
+    armFinalOutputSuppression(ds, dispatchAttempt);
+    sendWorkerInput(ds, content, stableTurnId ? triggerId : undefined, {
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    });
     return {
       ok: true,
       triggerId,
@@ -347,12 +417,16 @@ export async function triggerSessionTurn(
     };
   }
 
-  if (ds && rootMessageId) {
+  // An explicit session target stays bound to that session even while its
+  // worker is dormant. The old rootMessageId-only condition accidentally fell
+  // through to createSession for chat-scope sessions, which is unsafe for a
+  // durable meeting receiver whose projection pins one receiverSessionId.
+  if (ds) {
     const content = buildExistingSessionContent(
       ds, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
     );
     markSessionActivity(ds);
-    rememberLastCliInput(ds, prompt, content);
+    rememberInput(ds, prompt, content);
 
     if (req.options?.waitForFinalOutput) {
       return waitForSessionFinalOutput(
@@ -367,13 +441,27 @@ export async function triggerSessionTurn(
           output: { content: text },
           message: 'delivered to existing session and completed',
         }),
-        () => forkWorker(ds!, content, { resume: ds!.hasHistory, turnId: triggerId }),
+        () => {
+          const dispatchAttempt = prepareStableDispatch(ds!, true);
+          armFinalOutputSuppression(ds!, dispatchAttempt);
+          forkWorker(ds!, content, {
+            resume: ds!.hasHistory,
+            turnId: triggerId,
+            ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+          });
+        },
       );
     }
 
     if (req.options?.asyncReturnSessionId) {
       beginAsyncTrigger(ds, triggerId);
-      forkWorker(ds, content, { resume: ds.hasHistory, turnId: triggerId });
+      const dispatchAttempt = prepareStableDispatch(ds, true);
+      armFinalOutputSuppression(ds, dispatchAttempt);
+      forkWorker(ds, content, {
+        resume: ds.hasHistory,
+        turnId: triggerId,
+        ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      });
       return buildAsyncQueuedResponse(
         triggerId,
         ds.session.sessionId,
@@ -382,7 +470,13 @@ export async function triggerSessionTurn(
       );
     }
 
-    forkWorker(ds, content, { resume: ds.hasHistory, turnId: triggerId });
+    const dispatchAttempt = prepareStableDispatch(ds, true);
+    armFinalOutputSuppression(ds, dispatchAttempt);
+    forkWorker(ds, content, {
+      resume: ds.hasHistory,
+      turnId: triggerId,
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    });
     return {
       ok: true,
       triggerId,
@@ -447,6 +541,7 @@ export async function triggerSessionTurn(
   const useAutoWt = !isHttpVirtualSession
     && !req.options?.waitForFinalOutput
     && !req.options?.asyncReturnSessionId
+    && !stableTurnId
     && wd.fromBotDefault
     && botAutoWorktreeEnabled(larkAppId);
   if (useAutoWt) {
@@ -501,7 +596,7 @@ export async function triggerSessionTurn(
   // so a concurrent inbound message can't observe this session worker-less and
   // race a duplicate re-fork — the set-and-fork atomicity the original path had.
   deps.activeSessions.set(sessionKey(anchor, larkAppId), newDs);
-  rememberLastCliInput(newDs, prompt, promptInput);
+  rememberInput(newDs, prompt, promptInput);
 
   if (req.options?.waitForFinalOutput) {
     return waitForSessionFinalOutput(
@@ -516,13 +611,23 @@ export async function triggerSessionTurn(
         output: { content: text },
         message: 'queued new session turn and completed',
       }),
-      () => forkWorker(newDs, promptInput, triggerId),
+      () => {
+        const dispatchAttempt = prepareStableDispatch(newDs, true);
+        armFinalOutputSuppression(newDs, dispatchAttempt);
+        forkWorker(newDs, promptInput, dispatchAttempt === undefined
+          ? triggerId
+          : { turnId: triggerId, dispatchAttempt });
+      },
     );
   }
 
   if (req.options?.asyncReturnSessionId) {
     beginAsyncTrigger(newDs, triggerId);
-    forkWorker(newDs, promptInput, triggerId);
+    const dispatchAttempt = prepareStableDispatch(newDs, true);
+    armFinalOutputSuppression(newDs, dispatchAttempt);
+    forkWorker(newDs, promptInput, dispatchAttempt === undefined
+      ? triggerId
+      : { turnId: triggerId, dispatchAttempt });
     return buildAsyncQueuedResponse(
       triggerId,
       session.sessionId,
@@ -531,7 +636,14 @@ export async function triggerSessionTurn(
     );
   }
 
-  forkWorker(newDs, promptInput);
+  if (stableTurnId) {
+    const dispatchAttempt = prepareStableDispatch(newDs, true);
+    armFinalOutputSuppression(newDs, dispatchAttempt);
+    forkWorker(newDs, promptInput, dispatchAttempt === undefined
+      ? triggerId
+      : { turnId: triggerId, dispatchAttempt });
+  }
+  else forkWorker(newDs, promptInput);
 
   return {
     ok: true,

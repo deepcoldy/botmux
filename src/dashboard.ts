@@ -101,13 +101,26 @@ import {
   updateInstalledSkillAsync,
 } from './services/skill-registry-store.js';
 import { redactGitUrlCredentials } from './core/skills/sources.js';
-import { getBot, loadBotConfigs, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
 import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
+import {
+  handleVcMeetingConsumerProfilesGet,
+  handleVcMeetingConsumerProfilesPut,
+  type VcMeetingConsumerProfilesApiDeps,
+} from './dashboard/vc-consumer-profiles-api.js';
+import {
+  buildVcMeetingConsumerBootstrapAgents,
+  seedVcMeetingDefaultConsumerProfile,
+} from './services/vc-meeting-consumer-profile-bootstrap.js';
+import {
+  readVcMeetingConsumerProfiles,
+  updateVcMeetingConsumerProfiles,
+} from './services/vc-meeting-consumer-profile-store.js';
 import { isValidRoleProfileId } from './services/role-profile-store.js';
 import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
@@ -412,6 +425,26 @@ function refreshLocalVcMeetingAgentConfig(appId: string): void {
   }
 }
 
+function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
+  return {
+    readSnapshot: readVcMeetingConsumerProfiles,
+    updateSnapshot: updateVcMeetingConsumerProfiles,
+    loadBotConfigs,
+    effectiveDefaultWorkingDir,
+    onlineBotName: appId => registry.getByAppId(appId)?.botName,
+    isOnline: appId => !!registry.getByAppId(appId),
+    adapterReliableTurnTerminal: (cliId, cliPathOverride) => {
+      if (!cliId) return false;
+      try {
+        return createCliAdapterSync(cliId as CliId, cliPathOverride).reliableTurnTerminal === true;
+      } catch {
+        return false;
+      }
+    },
+    reloadDaemons: reloadVcMeetingBotConfigOnDaemons,
+  };
+}
+
 async function reloadVcMeetingBotConfigOnDaemons(appIds: string[]): Promise<void> {
   const unique = [...new Set(appIds.filter(Boolean))];
   for (const appId of unique) refreshLocalVcMeetingAgentConfig(appId);
@@ -655,7 +688,8 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
         const entry = raw[idx] as Record<string, unknown>;
         const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
         let entryChanged = false;
-        if (next.enabled !== true) {
+        const firstEnable = next.enabled !== true;
+        if (firstEnable) {
           next.enabled = true;
           next.dashboardManagedListener = true;
           entryChanged = true;
@@ -665,17 +699,30 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
           entryChanged = true;
         }
         const mc = next.meetingConsumer;
-        if (!mc || typeof mc !== 'object' || Array.isArray(mc)) {
-          next.meetingConsumer = { enabled: true };
+        const mcRec = mc && typeof mc === 'object' && !Array.isArray(mc)
+          ? { ...(mc as Record<string, unknown>) }
+          : {};
+        // Selecting a global listener is the Dashboard's explicit opt-in to the
+        // complete meeting pipeline. It intentionally re-enables the listener's
+        // consumer surface; profile/default ownership is still preserved by the
+        // own-property gates in seedVcMeetingDefaultConsumerProfile below.
+        if (mcRec.enabled !== true) {
+          mcRec.enabled = true;
           entryChanged = true;
-        } else {
-          const mcRec = mc as Record<string, unknown>;
-          if (mcRec.enabled !== true) {
-            mcRec.enabled = true;
-            next.meetingConsumer = mcRec;
-            entryChanged = true;
-          }
         }
+        if (seedVcMeetingDefaultConsumerProfile(
+          mcRec,
+          nextAppId,
+          // Resolve against the latest locked bots.json snapshot, not a stale
+          // pre-lock load. This also makes fallback selection independent of
+          // the order in which bot entries happen to be stored.
+          buildVcMeetingConsumerBootstrapAgents(
+            parseBotConfigsFromText(JSON.stringify(raw)),
+          ),
+        )) {
+          entryChanged = true;
+        }
+        next.meetingConsumer = mcRec;
         if (entryChanged) {
           compactVcMeetingAgentEntry(entry, next);
           changed = true;
@@ -698,7 +745,13 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
         }
       }
 
-      if (changed) await writeRawConfigAtomic(path, raw);
+      if (changed) {
+        // Validate the complete post-mutation file before replacing bots.json.
+        // Keep this path symmetric with daemon bootstrap so a future generated
+        // default cannot make the Dashboard persist an invalid registry.
+        parseBotConfigsFromText(JSON.stringify(raw));
+        await writeRawConfigAtomic(path, raw);
+      }
     });
   } catch (err: any) {
     return { ok: false, error: `vcMeetingAgent_listenerBot_config_write_failed: ${err?.message ?? err}` };
@@ -2969,6 +3022,28 @@ const server = createServer(async (req, res) => {
     }
 
     // ─── Profiles (aggregate/proxy to daemon) ─────────────────────────────
+    // ─── 会议角色预设（私有 API：不在 PUBLIC_READ_PATHS，未认证已被 401） ───
+    if (url.pathname === '/api/vc-meeting/consumer-profiles') {
+      if (req.method === 'GET') {
+        const out = await handleVcMeetingConsumerProfilesGet(
+          url.searchParams.get('listenerBotAppId') ?? '',
+          vcMeetingConsumerProfilesApiDeps(),
+        );
+        return jsonRes(res, out.status, out.body);
+      }
+      if (req.method === 'PUT') {
+        let parsed: unknown;
+        try {
+          parsed = await readJsonBody(req);
+        } catch {
+          return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+        }
+        const out = await handleVcMeetingConsumerProfilesPut(parsed, vcMeetingConsumerProfilesApiDeps());
+        return jsonRes(res, out.status, out.body);
+      }
+      return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/role-profiles') {
       type RoleProfileAggregate = {
         profileId: string;

@@ -50,6 +50,27 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver()).toEqual([]);
   });
 
+  it('durable terminal clears the attempt before a later CLI exit can carry it over', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'meeting delivery', turnId: 'delivery-1', dispatchAttempt: 3 });
+
+    // worker emitTurnTerminal uses this same completion edge before releasing
+    // the durable arbiter back to the receiver-owned replay loop.
+    t.onTurnComplete();
+
+    expect(t.onCliExit()).toBe(0);
+    expect(t.takeCarryOver()).toEqual([]);
+  });
+
+  it('CLI exit leaves durable replay to the receiver while preserving ordinary carry-over', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'ordinary IM', turnId: 'im-1' });
+    t.onWrite({ content: 'meeting delivery', turnId: 'delivery-1', dispatchAttempt: 2 });
+
+    expect(t.onCliExit(item => item.dispatchAttempt === undefined)).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{ content: 'ordinary IM', turnId: 'im-1' }]);
+  });
+
   it('type-ahead: multiple writes before idle are all carried over in order', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('msg-1', 'a'));

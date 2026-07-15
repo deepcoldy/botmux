@@ -302,7 +302,10 @@ describe('runHook', () => {
       // --attention 是 send 的一个 flag，因此天然被同一道 gate 覆盖。
       const cmdSendIdx = src.indexOf('async function cmdSend(');
       expect(cmdSendIdx).toBeGreaterThanOrEqual(0);
-      const region = src.slice(cmdSendIdx, cmdSendIdx + 1500);
+      // cmdSend also performs live VC-origin verification before reaching the
+      // workflow gate; inspect a bounded function prefix without coupling this
+      // source-contract test to the exact size of that verification block.
+      const region = src.slice(cmdSendIdx, cmdSendIdx + 5000);
       expect(region).toContain("process.env.BOTMUX_WORKFLOW === '1'");
       expect(region).toContain('process.exit(2)');
     });

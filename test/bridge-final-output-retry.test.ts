@@ -43,6 +43,7 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
   getAllBots: vi.fn(() => []),
   getBotClient: vi.fn(),
+  getBotBrand: vi.fn(() => undefined),
   resolveBrandLabel: vi.fn(() => undefined),
 }));
 
@@ -81,6 +82,12 @@ import { EventEmitter } from 'node:events';
 import { homedir, tmpdir } from 'node:os';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import {
+  acceptVcMeetingDelivery,
+  applyVcMeetingMemberProjection,
+  completeVcMeetingDelivery,
+  markVcMeetingDeliveryDispatched,
+} from '../src/services/vc-meeting-delivery-store.js';
 
 // Build a fake worker child process whose IPC `message` event we can fire
 // manually, then wire it through setupWorkerHandlers via forkAdoptWorker.
@@ -136,6 +143,27 @@ function makeHermesDs(): DaemonSession {
 
 function finalOutputMsg(): Extract<WorkerToDaemon, { type: 'final_output' }> {
   return { type: 'final_output', content: 'final answer', lastUuid: 'uuid-1', turnId: 'turn-1' };
+}
+
+function seedSilentReceiverReceipt(): void {
+  const memberKey = {
+    listenerAppId: 'listener-app', meetingId: 'meeting-1', memberId: 'member-1', memberEpoch: 1,
+  };
+  applyVcMeetingMemberProjection('/tmp/test-sessions', {
+    ...memberKey,
+    ownerBootId: 'owner-boot', ownerEpoch: 1, agentAppId: 'app_test', role: 'minutes',
+    membershipGeneration: 1, status: 'active', responseMode: 'silent', joinedAtIngestSeq: 0,
+    receiverSessionId: 'sid-final-out', outputChatId: 'oc_chat',
+  });
+  acceptVcMeetingDelivery('/tmp/test-sessions', {
+    ...memberKey,
+    ownerBootId: 'owner-boot', ownerEpoch: 1, membershipGeneration: 1,
+    deliveryKey: 'delivery-stable-key', inputHash: 'input-hash', fromSeq: 1, toSeq: 1,
+    responseMode: 'silent', receiverBootId: 'receiver-boot',
+  });
+  markVcMeetingDeliveryDispatched('/tmp/test-sessions', {
+    ...memberKey, deliveryKey: 'delivery-stable-key',
+  }, { receiverBootId: 'receiver-boot', workerGeneration: 1 });
 }
 
 const SCOPED_DEDUPE_KEY = 'sid-final-out:uuid-1';
@@ -774,6 +802,62 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
+  it('locks explicit VC IM fallback output and replies to its exact Lark message with one UUID', async () => {
+    const sessionReply = vi.fn(async () => 'om_vc_fallback');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-im',
+      memberId: 'member-im', memberEpoch: 1,
+    };
+    const origin = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-im', memberId: 'member-im',
+      memberEpoch: 1, agentAppId: 'app_test', ownerBootId: 'owner-boot', ownerEpoch: 1,
+      membershipGeneration: 1, sinkOwnerGeneration: 1,
+      receiverSessionId: ds.session.sessionId, larkMessageId: 'om_human_a',
+      replyTargetSenderOpenId: 'ou_human_a',
+    };
+    ds.session.vcMeetingImTurnOrigins = { om_human_a: origin };
+    const msg = {
+      ...finalOutputMsg(),
+      turnId: 'om_human_a',
+      lastUuid: 'bridge-a',
+    };
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][4]).toBe('om_human_a');
+    expect(sessionReply.mock.calls[0][5]).toMatchObject({
+      quoteMessageId: 'om_human_a',
+      uuid: expect.stringMatching(/^vcp_[0-9a-f]+$/),
+    });
+    const providerUuid = sessionReply.mock.calls[0][5].uuid;
+
+    // A daemon/worker replay sees the terminal ledger and performs no second
+    // provider call. A changed replay is also suppressed: first output wins.
+    __testOnly_deliverFinalOutput(ds, { ...msg, lastUuid: 'bridge-replay' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+
+    __testOnly_deliverFinalOutput(ds, {
+      ...msg,
+      content: 'changed fallback answer',
+      lastUuid: 'bridge-changed',
+    }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(providerUuid).toBeTruthy();
+  });
+
   it('retries on transient failure and commits after success', async () => {
     const sessionReply = vi
       .fn()
@@ -881,5 +965,263 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(5000);
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+  });
+});
+
+describe('Worker turn_terminal routing', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('routes a matching terminal receipt independently of final_output', async () => {
+    const ds = makeDs();
+    const onTurnTerminal = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onTurnTerminal,
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    const terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }> = {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'delivery-stable-key',
+      status: 'completed',
+    };
+    (ds.worker as any).emit('message', terminal);
+    await Promise.resolve();
+
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(onTurnTerminal).toHaveBeenCalledWith(ds, terminal, { workerGeneration: 1 });
+  });
+
+  it('captures silent fallback output and keeps the bounded legacy marker after terminal', async () => {
+    const ds = makeDs();
+    ds.suppressedFinalOutputTurns = new Map([['delivery-stable-key', 1]]);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const onTurnTerminal = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onTurnTerminal,
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      content: 'analysis that must stay silent',
+      lastUuid: 'assistant-uuid',
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.suppressedFinalOutputTurns.has('delivery-stable-key')).toBe(true);
+
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+      status: 'completed',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+    await Promise.resolve();
+
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(ds.suppressedFinalOutputTurns.has('delivery-stable-key')).toBe(true);
+  });
+
+  it('keeps a newer silent retry armed when stale output and terminal arrive first', async () => {
+    const ds = makeDs();
+    ds.suppressedFinalOutputTurns = new Map([['delivery-stable-key', 2]]);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const onTurnTerminal = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onTurnTerminal,
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    const emitFinal = (dispatchAttempt: number, content: string) => {
+      (ds.worker as any).emit('message', {
+        type: 'final_output',
+        sessionId: ds.session.sessionId,
+        content,
+        lastUuid: `assistant-uuid-${dispatchAttempt}`,
+        turnId: 'delivery-stable-key',
+        dispatchAttempt,
+      } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    };
+    const emitTerminal = (dispatchAttempt: number) => {
+      (ds.worker as any).emit('message', {
+        type: 'turn_terminal',
+        sessionId: ds.session.sessionId,
+        turnId: 'delivery-stable-key',
+        dispatchAttempt,
+        status: 'completed',
+      } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+    };
+
+    emitFinal(1, 'stale attempt output must stay silent');
+    emitTerminal(1);
+    await Promise.resolve();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(ds.suppressedFinalOutputTurns.get('delivery-stable-key')).toBe(2);
+
+    emitFinal(2, 'current attempt output must stay silent');
+    emitTerminal(2);
+    await Promise.resolve();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(onTurnTerminal).toHaveBeenCalledTimes(2);
+    expect(ds.suppressedFinalOutputTurns.get('delivery-stable-key')).toBe(2);
+  });
+
+  it('suppresses streaming, TUI, and diagnostic Lark UI during a silent receiver attempt', async () => {
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      memberId: 'member-1',
+      memberEpoch: 1,
+    };
+    ds.suppressedFinalOutputTurns = new Map([['delivery-stable-key', 1]]);
+    seedSilentReceiverReceipt();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onTurnTerminal: (_ds, terminal) => {
+        completeVcMeetingDelivery('/tmp/test-sessions', {
+          listenerAppId: 'listener-app', meetingId: 'meeting-1', memberId: 'member-1', memberEpoch: 1,
+          deliveryKey: terminal.turnId,
+        }, { workerGeneration: 1, dispatchAttempt: terminal.dispatchAttempt });
+      },
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'ready', port: 4567, token: 'token', turnId: 'delivery-stable-key', dispatchAttempt: 1,
+    } satisfies Extract<WorkerToDaemon, { type: 'ready' }>);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update',
+      content: 'meeting transcript on screen',
+      status: 'working',
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    (ds.worker as any).emit('message', {
+      type: 'tui_prompt',
+      description: 'permission needed',
+      options: [{ text: 'allow', selected: false }],
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    } satisfies Extract<WorkerToDaemon, { type: 'tui_prompt' }>);
+    (ds.worker as any).emit('message', {
+      type: 'user_notify', message: 'submit failed', turnId: 'delivery-stable-key', dispatchAttempt: 1,
+    } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.workerPort).toBe(4567);
+    expect(ds.lastScreenStatus).toBe('working');
+
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'delivery-stable-key',
+      dispatchAttempt: 1, status: 'completed',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+    await Promise.resolve();
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'idle after terminal', status: 'idle',
+      turnId: 'delivery-stable-key', dispatchAttempt: 1,
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await Promise.resolve();
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('drops a terminal receipt from a stale or wrongly-bound worker', async () => {
+    const ds = makeDs();
+    const onTurnTerminal = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onTurnTerminal,
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal',
+      sessionId: 'sid-stale-worker',
+      turnId: 'delivery-stable-key',
+      status: 'completed',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+    await Promise.resolve();
+
+    expect(onTurnTerminal).not.toHaveBeenCalled();
+  });
+
+  it('reports the exact worker generation when the process exits', async () => {
+    const ds = makeDs();
+    const onWorkerExit = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit,
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('exit', 17, 'SIGTERM');
+    await Promise.resolve();
+
+    expect(onWorkerExit).toHaveBeenCalledWith(ds, {
+      sessionId: ds.session.sessionId,
+      workerGeneration: 1,
+      code: 17,
+      signal: 'SIGTERM',
+    });
+  });
+
+  it('reports a managed CLI exit even when the Node worker stays alive', async () => {
+    const ds = makeDs();
+    const onCliExit = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onCliExit,
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'claude_exit', code: 9, signal: 'SIGKILL',
+    } satisfies Extract<WorkerToDaemon, { type: 'claude_exit' }>);
+    await Promise.resolve();
+
+    expect(onCliExit).toHaveBeenCalledWith(ds, {
+      sessionId: ds.session.sessionId,
+      workerGeneration: 1,
+      code: 9,
+      signal: 'SIGKILL',
+    });
   });
 });

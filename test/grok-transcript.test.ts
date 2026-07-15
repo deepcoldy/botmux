@@ -2,13 +2,17 @@
  * Unit tests for Grok updates.jsonl drain + session discovery helpers.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, writeFileSync, appendFileSync, rmSync, statSync, existsSync } from 'node:fs';
+import {
+  mkdirSync, writeFileSync, appendFileSync, rmSync, statSync, existsSync,
+  openSync, closeSync, utimesSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   drainGrokUpdates,
   matchGrokPromptAppend,
   discoverGrokSessions,
+  findGrokSessionByPid,
   grokSessionDirExists,
   grokSessionIdFromPath,
 } from '../src/services/grok-transcript.js';
@@ -64,7 +68,7 @@ function agentChunk(sessionId: string, text: string, eventId: string, ts = 1_000
   };
 }
 
-function turnDone(sessionId: string, eventId: string, ts = 1_000_200) {
+function turnDone(sessionId: string, eventId: string, ts = 1_000_200, stopReason = 'end_turn') {
   return {
     timestamp: ts,
     method: 'session/update',
@@ -72,7 +76,7 @@ function turnDone(sessionId: string, eventId: string, ts = 1_000_200) {
       sessionId,
       update: {
         sessionUpdate: 'turn_completed',
-        stop_reason: 'end_turn',
+        stop_reason: stopReason,
         _meta: { eventId, agentTimestampMs: ts },
       },
     },
@@ -121,7 +125,9 @@ describe('drainGrokUpdates', () => {
     const r = drainGrokUpdates(path, 0);
     expect(r.events).toHaveLength(2);
     expect(r.events[0]).toMatchObject({ kind: 'user', text: 'hello world', sourceSessionId: sid });
-    expect(r.events[1]).toMatchObject({ kind: 'assistant_final', text: 'Hi there', sourceSessionId: sid });
+    expect(r.events[1]).toMatchObject({
+      kind: 'assistant_final', text: 'Hi there', sourceSessionId: sid, terminalStatus: 'completed',
+    });
   });
 
   it('rewinds offset when turn is still open (no turn_completed yet)', () => {
@@ -184,7 +190,7 @@ describe('drainGrokUpdates', () => {
     expect(finals[0]!.text).toBe('final');
   });
 
-  it('does not emit narration when turn_completed has no post-tool agent group', () => {
+  it('emits an empty completed terminal without leaking narration when no post-tool final exists', () => {
     const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
     const path = writeUpdates(sid, '/tmp/proj', [
       userChunk(sid, 'q', 'e1'),
@@ -196,8 +202,38 @@ describe('drainGrokUpdates', () => {
     ]);
     const r = drainGrokUpdates(path, 0);
     expect(r.events.filter((e) => e.kind === 'user')).toHaveLength(1);
-    // Prefer empty over posting mid-turn chatter as the Lark fallback.
-    expect(r.events.filter((e) => e.kind === 'assistant_final')).toHaveLength(0);
+    // Prefer empty over posting mid-turn chatter as the Lark fallback, but the
+    // authoritative boundary must still release an exact durable turn.
+    expect(r.events.filter((e) => e.kind === 'assistant_final')).toEqual([
+      expect.objectContaining({
+        kind: 'assistant_final', text: '', sourceSessionId: sid, terminalStatus: 'completed',
+      }),
+    ]);
+  });
+
+  it.each([
+    ['error', 'failed', 'grok_turn_error'],
+    ['cancelled', 'failed', 'grok_turn_cancelled'],
+    ['future reason', 'failed', 'grok_stop_reason:future_reason'],
+  ] as const)('maps %s turn_completed to %s even with an empty final', (reason, status, errorCode) => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'q', 'e1'),
+      turnDone(sid, 'e2', 1_000_200, reason),
+    ]);
+
+    const r = drainGrokUpdates(path, 0);
+
+    expect(r.events).toEqual([
+      expect.objectContaining({ kind: 'user', text: 'q', sourceSessionId: sid }),
+      expect.objectContaining({
+        kind: 'assistant_final',
+        text: '',
+        sourceSessionId: sid,
+        terminalStatus: status,
+        terminalErrorCode: errorCode,
+      }),
+    ]);
   });
 
   it('does not rewind across a long tool stretch after dropping narration', () => {
@@ -382,6 +418,40 @@ describe('grokSessionDirExists / grokSessionIdFromPath', () => {
     expect(grokSessionIdFromPath(p)).toBe(sid);
     expect(grokSessionIdFromPath(`/home/u/.grok/sessions/%2Ftmp/${sid}/updates.jsonl`)).toBe(sid);
     expect(grokSessionIdFromPath('/somewhere/else.jsonl')).toBeUndefined();
+  });
+});
+
+describe.skipIf(process.platform !== 'linux')('findGrokSessionByPid rotation', () => {
+  beforeEach(() => {
+    process.env.GROK_HOME = ROOT;
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(ROOT, { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(ROOT, { recursive: true, force: true });
+    delete process.env.GROK_HOME;
+  });
+
+  it('prefers the newest open updates stream when /new briefly retains both sessions', () => {
+    const oldSid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const newSid = 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const oldPath = writeUpdates(oldSid, '/tmp/proj', [userChunk(oldSid, 'old', 'e1')]);
+    const newPath = writeUpdates(newSid, '/tmp/proj', [userChunk(newSid, 'new', 'e2')]);
+    const oldTime = new Date('2026-01-01T00:00:00Z');
+    const newTime = new Date('2026-01-01T00:00:05Z');
+    utimesSync(oldPath, oldTime, oldTime);
+    utimesSync(newPath, newTime, newTime);
+    const oldFd = openSync(oldPath, 'r');
+    const newFd = openSync(newPath, 'r');
+    try {
+      expect(findGrokSessionByPid(process.pid)).toEqual({
+        sessionId: newSid,
+        updatesPath: newPath,
+      });
+    } finally {
+      closeSync(newFd);
+      closeSync(oldFd);
+    }
   });
 });
 
