@@ -16,6 +16,8 @@
  * Run:  pnpm vitest run test/herdr-backend.test.ts
  */
 import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { setImmediate as waitForImmediate } from 'node:timers/promises';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('node:child_process', () => ({
@@ -33,11 +35,19 @@ const mockedSpawn = vi.mocked(spawn);
 
 class FakeChild extends EventEmitter {
   killed = false;
+  stdout = new PassThrough();
   unref = vi.fn();
   kill = vi.fn(() => { this.killed = true; return true; });
 }
 
-function makeFakeChild(): FakeChild { return new FakeChild(); }
+const fakeChildren: FakeChild[] = [];
+
+function makeFakeChild(): FakeChild {
+  const child = new FakeChild();
+  fakeChildren.push(child);
+  return child;
+}
+
 
 function findCall(predicate: (args: string[]) => boolean): string[] | undefined {
   for (const call of mockedExecFileSync.mock.calls) {
@@ -84,6 +94,7 @@ const PANE_READ_REPLY = (text: string) => JSON.stringify({ result: { read: { tex
 beforeEach(() => {
   mockedExecFileSync.mockReset();
   mockedSpawn.mockReset();
+  fakeChildren.length = 0;
   // Default: every spawn (including the bg `wait agent-status` watcher) gets
   // a fake child whose lifecycle the test fully controls.
   mockedSpawn.mockImplementation((() => makeFakeChild()) as any);
@@ -496,6 +507,88 @@ describe('HerdrBackend message writing', () => {
 // ─── Callbacks: onData delta + onExit ──────────────────────────────────────
 
 describe('HerdrBackend callbacks', () => {
+  it('streams native terminal frames without pane polling or status waiters', async () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: 'w1:p1' } } }),
+      },
+    ]);
+
+    const backend = new HerdrBackend(SESSION);
+    const seen: string[] = [];
+    backend.onData(data => seen.push(data));
+    backend.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    const observerIndex = mockedSpawn.mock.calls.findIndex(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('session') && args.includes('observe'));
+    const observer = observerIndex >= 0 ? fakeChildren[observerIndex] : undefined;
+    try {
+      expect(observer).toBeDefined();
+      expect(mockedSpawn.mock.calls.some(([, args]) =>
+        Array.isArray(args) && args.includes('wait') && args.includes('agent-status'))).toBe(false);
+
+      const first = JSON.stringify({
+        type: 'terminal.frame', seq: 1, full: true, encoding: 'ansi', width: 80, height: 24,
+        bytes: Buffer.from('\x1b[31mfirst\x1b[0m').toString('base64'),
+      });
+      const second = JSON.stringify({
+        type: 'terminal.frame', seq: 2, full: false, encoding: 'ansi', width: 80, height: 24,
+        bytes: Buffer.from(' second').toString('base64'),
+      });
+
+      observer!.stdout.write(first.slice(0, 17));
+      observer!.stdout.write(`${first.slice(17)}\n${second}\n`);
+      await waitForImmediate();
+      expect(seen.join('')).toBe('\x1b[31mfirst\x1b[0m second');
+      expect(herdrCall('agent', 'read')).toBeUndefined();
+      backend.kill();
+      expect(observer!.killed).toBe(true);
+    } finally {
+      if (!observer?.killed) backend.kill();
+    }
+  });
+
+  it('reattach drops the initial full frame and emits ordered incremental frames once', async () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('w1:p1') },
+    ]);
+
+    const backend = new HerdrBackend(SESSION, { isReattach: true });
+    const seen: string[] = [];
+    backend.onData(data => seen.push(data));
+    backend.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    const observerIndex = mockedSpawn.mock.calls.findIndex(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('session') && args.includes('observe'));
+    const observer = observerIndex >= 0 ? fakeChildren[observerIndex] : undefined;
+    try {
+      expect(observer).toBeDefined();
+      expect(mockedSpawn.mock.calls.some(([, args]) =>
+        Array.isArray(args) && args.includes('wait') && args.includes('agent-status'))).toBe(false);
+      for (const frame of [
+        { seq: 1, full: true, text: 'seeded screen' },
+        { seq: 2, full: false, text: ' delta' },
+        { seq: 2, full: false, text: ' duplicate' },
+        { seq: 1, full: false, text: ' stale' },
+        { seq: 3, full: false, text: ' done' },
+      ]) {
+        observer!.stdout.write(`${JSON.stringify({
+          type: 'terminal.frame', seq: frame.seq, full: frame.full, encoding: 'ansi', width: 80, height: 24,
+          bytes: Buffer.from(frame.text).toString('base64'),
+        })}\n`);
+      }
+      await waitForImmediate();
+      expect(seen.join('')).toBe(' delta done');
+      expect(herdrCall('agent', 'read')).toBeUndefined();
+      backend.kill();
+      expect(observer!.killed).toBe(true);
+    } finally {
+      if (!observer?.killed) backend.kill();
+    }
+  });
   it('onData fires with the prefix-delta when pane recent output grows', () => {
     let paneText = 'hello';
     setHerdrResponses([
