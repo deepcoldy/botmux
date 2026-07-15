@@ -105,6 +105,7 @@ vi.mock('../src/services/substitute-chat-toggle-store.js', () => ({
 
 // Capture the registered event handlers from EventDispatcher.register()
 let capturedHandlers: Record<string, Function> = {};
+let capturedWsOptions: any[] = [];
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class MockEventDispatcher {
@@ -114,7 +115,11 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
     }
   }
   class MockWSClient {
+    constructor(options: any) {
+      capturedWsOptions.push(options);
+    }
     start = vi.fn(async () => {});
+    close = vi.fn();
     getConnectionStatus = vi.fn(() => ({ state: 'connected', reconnectAttempts: 0 }));
   }
   return {
@@ -127,7 +132,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, startLarkEventDispatcher, stopLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -147,6 +152,7 @@ const OTHER_BOT_APP_ID = 'app-bot-b';
 const USER_OPEN_ID = 'ou_user_123';
 
 beforeEach(() => {
+  capturedWsOptions = [];
   mockListChatMessages.mockReset().mockResolvedValue([]);
   mockListChatMessagesUntil.mockReset().mockResolvedValue([]);
   mockListThreadMessages.mockReset().mockResolvedValue([]);
@@ -4816,6 +4822,42 @@ describe('ensureBotOpenId — dedup', () => {
 });
 
 describe('startLarkEventDispatcher — 长连接死后自愈 (reconnect-exhausted recovery)', () => {
+  it('stop closes the socket and clears the private revive timer', async () => {
+    vi.useFakeTimers();
+    const ws = startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers()) as any;
+    ws.getConnectionStatus.mockReturnValue({ state: 'failed', reconnectAttempts: 9 });
+
+    stopLarkEventDispatcher(ws);
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(ws.close).toHaveBeenCalledTimes(1);
+    expect(ws.start).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
+  it('force-closes a connection that becomes ready or reconnects after stop', () => {
+    const ws = startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers()) as any;
+    const options = capturedWsOptions.at(-1);
+
+    stopLarkEventDispatcher(ws);
+    options.onReady();
+    options.onReconnected();
+
+    expect(ws.close).toHaveBeenNthCalledWith(1);
+    expect(ws.close).toHaveBeenNthCalledWith(2, { force: true });
+    expect(ws.close).toHaveBeenNthCalledWith(3, { force: true });
+  });
+
+  it('retries close after an initial stop failure while keeping timer teardown idempotent', () => {
+    const ws = startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers()) as any;
+    ws.close.mockImplementationOnce(() => { throw new Error('close failed'); });
+    ws.close.mockImplementationOnce(() => undefined);
+
+    expect(() => stopLarkEventDispatcher(ws)).toThrow('close failed');
+    expect(() => stopLarkEventDispatcher(ws)).not.toThrow();
+    expect(ws.close).toHaveBeenCalledTimes(2);
+  });
+
   it('SDK 重连耗尽 (state=failed) 时，定时探测并重新 start() 重建长连接', async () => {
     vi.useFakeTimers();
     const ws = startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers()) as any;

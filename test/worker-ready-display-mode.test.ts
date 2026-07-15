@@ -126,6 +126,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import { CARD_POSTING_SENTINEL, initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { createPlatformCapabilities } from '../src/im/platform.js';
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -152,6 +153,14 @@ function makeDs(overrides?: Partial<DaemonSession>): DaemonSession {
       updatedAt: Date.now(),
       pid: null,
       chatType: 'group',
+    },
+    platform: {
+      instance: { platform: 'lark', instanceId: 'app_test' },
+      conversation: {
+        instance: { platform: 'lark', instanceId: 'app_test' },
+        chatId: 'oc_chat', conversationType: 'group', scope: 'thread',
+        anchorId: 'om_root', threadRootId: 'om_root',
+      },
     },
     worker: makeFakeWorker(),
     workerPort: null,
@@ -352,6 +361,117 @@ describe('Worker ready: set_display_mode re-sync', () => {
 
     expect(updateMessageMock).toHaveBeenCalledTimes(1);
     expect(JSON.parse(updateMessageMock.mock.calls[0][2])).toMatchObject({ localCliReady: true });
+  });
+
+  it('PATCH path uses the injected platform cards port in production wiring', async () => {
+    const updateCard = vi.fn(async () => {});
+    const runtime = {
+      instance: { platform: 'lark', instanceId: 'app_test' },
+      capabilities: createPlatformCapabilities({ cards: true, streamUpdates: true }),
+      cards: { sendCard: vi.fn(), replyCard: vi.fn(), updateCard },
+      start: vi.fn(async () => {}), stop: vi.fn(async () => {}),
+    } as any;
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      platformRuntime: runtime,
+    });
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      streamCardPending: false,
+      streamCardId: 'om_runtime_card',
+      worker: fakeWorker,
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+
+    expect(updateCard).toHaveBeenCalledWith(
+      { instance: ds.platform.instance, messageId: 'om_runtime_card' },
+      { payload: '{"type":"streaming","localCliReady":false}' },
+    );
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not PATCH a live card when the runtime lacks stream updates', async () => {
+    const updateCard = vi.fn(async () => {});
+    const runtime = {
+      instance: { platform: 'lark', instanceId: 'app_test' },
+      capabilities: createPlatformCapabilities({ cards: true, streamUpdates: false }),
+      cards: { sendCard: vi.fn(), replyCard: vi.fn(), updateCard },
+      start: vi.fn(async () => {}), stop: vi.fn(async () => {}),
+    } as any;
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      platformRuntime: runtime,
+    });
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      streamCardPending: false,
+      streamCardId: 'om_runtime_card',
+      worker: fakeWorker,
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+
+    expect(updateCard).not.toHaveBeenCalled();
+    // The ready path treats an unavailable stream update like an expired card
+    // and falls back to a one-time card POST through the regular cards path.
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(ds.streamCardId).toBe('om_new_card');
+  });
+
+  it('updates fallback-card readiness through the injected platform cards port', async () => {
+    const updateCard = vi.fn(async () => {});
+    const runtime = {
+      instance: { platform: 'lark', instanceId: 'app_test' },
+      capabilities: createPlatformCapabilities({ cards: true, streamUpdates: false }),
+      cards: { sendCard: vi.fn(), replyCard: vi.fn(), updateCard },
+      start: vi.fn(async () => {}), stop: vi.fn(async () => {}),
+    } as any;
+    let ds!: DaemonSession;
+    sessionReplyMock
+      .mockRejectedValueOnce(new Error('streaming card unavailable'))
+      .mockImplementationOnce(async () => {
+        ds.session.cliSessionId = 'trae-native-ready';
+        return 'om_fallback_card';
+      });
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      platformRuntime: runtime,
+    });
+    const fakeWorker = makeFakeWorker();
+    ds = makeDs({
+      streamCardPending: true,
+      streamCardId: undefined,
+      worker: fakeWorker,
+      workingDir: '/tmp',
+    });
+    ds.session.cliId = 'traex';
+    ds.session.cliSessionId = undefined;
+    ds.session.workingDir = '/tmp';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+    await flush();
+
+    expect(updateCard).toHaveBeenCalledWith(
+      { instance: ds.platform.instance, messageId: 'om_fallback_card' },
+      { payload: '{"type":"session"}' },
+    );
+    expect(updateMessageMock).not.toHaveBeenCalled();
   });
 
   // Regression: a re-fork that happens while streamCardPending is true (new turn

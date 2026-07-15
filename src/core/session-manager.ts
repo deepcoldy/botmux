@@ -36,10 +36,18 @@ import {
 } from './session-create.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType } from '../adapters/backend/types.js';
-import type { LarkAttachment, LarkMention, ScheduledTask, SubstituteTrigger } from '../types.js';
+import type { ScheduledTask, Session, SubstituteTrigger } from '../types.js';
+import {
+  derivePlatformInstanceIdentity,
+  requireSamePlatformInstance,
+  samePlatformInstance,
+  type PlatformAttachment,
+  type PlatformMention,
+  type PlatformSender,
+} from '../im/platform.js';
+import { requirePlatformPort, type PlatformRuntime } from '../im/ports.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
-import type { ResolvedSender } from '../im/lark/identity-cache.js';
-import { sessionKey, sessionAnchorId } from './types.js';
+import { createPlatformSessionContext, sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
@@ -58,6 +66,91 @@ function sessionCreatedAtMs(session: { createdAt?: string }): number {
 
 function sessionLastMessageAtMs(session: { createdAt?: string; lastMessageAt?: string }): number {
   return session.lastMessageAt ? (Date.parse(session.lastMessageAt) || sessionCreatedAtMs(session)) : sessionCreatedAtMs(session);
+}
+
+function larkPlatformContext(
+  larkAppId: string,
+  chatId: string,
+  chatType: 'group' | 'p2p',
+  scope: 'thread' | 'chat',
+  rootMessageId: string,
+) {
+  return createPlatformSessionContext(
+    { platform: 'lark', instanceId: larkAppId },
+    chatId,
+    chatType,
+    scope,
+    rootMessageId,
+  );
+}
+
+let injectedPlatformRuntime: PlatformRuntime | undefined;
+
+/** Composition-root injection for scheduler/dashboard session paths. */
+export function setSessionManagerPlatformRuntime(runtime: PlatformRuntime | undefined): void {
+  injectedPlatformRuntime = runtime;
+}
+
+function runtimeForLarkApp(larkAppId: string): PlatformRuntime | undefined {
+  const runtime = injectedPlatformRuntime;
+  if (!runtime) return undefined;
+  requireSamePlatformInstance(runtime.instance, { platform: 'lark', instanceId: larkAppId });
+  return runtime;
+}
+
+async function platformSendMessage(
+  larkAppId: string,
+  chatId: string,
+  content: string,
+  msgType: string = 'text',
+): Promise<string> {
+  const runtime = runtimeForLarkApp(larkAppId);
+  if (!runtime) {
+    const { sendMessage } = await import('../im/lark/client.js');
+    return sendMessage(larkAppId, chatId, content, msgType);
+  }
+  const conversation = {
+    instance: runtime.instance,
+    chatId,
+    conversationType: 'group',
+    scope: 'chat',
+    anchorId: chatId,
+  } as const;
+  const ref = msgType === 'interactive'
+    ? await requirePlatformPort(runtime, 'cards').sendCard(conversation, { payload: content })
+    : await requirePlatformPort(runtime, 'messaging').sendMessage(
+      conversation,
+      content,
+      { contentType: msgType },
+    );
+  return ref.messageId;
+}
+
+async function platformReplyMessage(
+  larkAppId: string,
+  messageId: string,
+  content: string,
+  msgType: string = 'text',
+  replyInThread: boolean = false,
+): Promise<string> {
+  const runtime = runtimeForLarkApp(larkAppId);
+  if (!runtime) {
+    const { replyMessage } = await import('../im/lark/client.js');
+    return replyMessage(larkAppId, messageId, content, msgType, replyInThread);
+  }
+  const target = { instance: runtime.instance, messageId };
+  const ref = msgType === 'interactive'
+    ? await requirePlatformPort(runtime, 'cards').replyCard(
+      target,
+      { payload: content },
+      { inThread: replyInThread },
+    )
+    : await requirePlatformPort(runtime, 'messaging').replyMessage(
+      target,
+      content,
+      { contentType: msgType, inThread: replyInThread },
+    );
+  return ref.messageId;
 }
 
 function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageLimit']): boolean {
@@ -240,10 +333,15 @@ export function getAttachmentsDir(larkAppId: string, messageId: string): string 
   return join(resolve(config.session.dataDir), 'attachments', assertSafeAppId(larkAppId), messageId);
 }
 
-export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[]): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
+export async function downloadResources(
+  larkAppId: string,
+  messageId: string,
+  resources: MessageResource[],
+  runtime?: PlatformRuntime,
+): Promise<{ attachments: PlatformAttachment[]; needLogin: boolean }> {
   if (resources.length === 0) return { attachments: [], needLogin: false };
 
-  const attachments: LarkAttachment[] = [];
+  const attachments: PlatformAttachment[] = [];
   // Resolve the per-appId bucket up front. assertSafeAppId (inside getAttachmentsDir)
   // throws on a path-unsafe appId (only reachable via a hand-edited bots.json — real
   // Feishu ids always pass). SOFT-fail rather than let it propagate: an invalid appId
@@ -262,8 +360,21 @@ export async function downloadResources(larkAppId: string, messageId: string, re
     const savePath = join(dir, res.name);
     try {
       const resMessageId = res.messageId ?? messageId;
-      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath);
-      attachments.push({ type: res.type, path: savePath, name: res.name });
+      if (runtime) {
+        const attachment = await requirePlatformPort(runtime, 'attachments').downloadAttachment({
+          sourceMessage: {
+            instance: { platform: 'lark', instanceId: larkAppId },
+            messageId: resMessageId,
+          },
+          resourceId: res.key,
+          type: res.type,
+          name: res.name,
+        }, savePath);
+        attachments.push(attachment);
+      } else {
+        await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath);
+        attachments.push({ type: res.type, path: savePath, name: res.name });
+      }
     } catch (err: any) {
       // Per-failure log stays at info to aid retries.
       logger.info(`Failed to download ${res.type} ${res.key}: ${err.message}`);
@@ -323,15 +434,28 @@ function xmlEscape(s: string): string {
     .replace(/'/g, '&apos;');
 }
 
+/** Lark prompt compatibility: only the open_id namespace may populate fields
+ * literally named open_id. Other opaque identifiers remain usable by future
+ * platform logic but must not be mislabeled here. */
+function mentionOpenId(mention: PlatformMention): string | undefined {
+  const identity = mention.identity;
+  if (!identity) return undefined;
+  return identity.idType === undefined || identity.idType === 'open_id'
+    ? identity.id
+    : undefined;
+}
+
 /**
  * Render a `<sender>` tag for prompt injection. Caller resolves the sender
  * (open_id + type + optional name) via `resolveSender(...)` in identity-cache.
  * Returns empty string when no sender data is available so the prompt stays
  * clean for synthetic flows (scheduled tasks, no-op spawns).
  */
-export function renderSenderTag(sender?: ResolvedSender): string {
-  if (!sender || !sender.openId) return '';
-  const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.openId)}"`];
+export function renderSenderTag(sender?: PlatformSender): string {
+  if (!sender || !sender.id) return '';
+  // Keep the legacy prompt attribute name for Lark sessions; the in-memory
+  // sender model itself is platform-neutral and carries only an opaque id.
+  const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.id)}"`];
   if (sender.name) attrs.push(`name="${xmlEscape(sender.name)}"`);
   return `<sender ${attrs.join(' ')} />`;
 }
@@ -361,7 +485,7 @@ export function renderCursorSenderNote(cliId: CliId | undefined, hasSender: bool
  * may be absent entirely when pendingSender is undefined). Returns '' when
  * there is no sender to attribute.
  */
-export function renderBufferedSenderBlock(sender: ResolvedSender | undefined, cliId: CliId | undefined, locale?: Locale): string {
+export function renderBufferedSenderBlock(sender: PlatformSender | undefined, cliId: CliId | undefined, locale?: Locale): string {
   const tag = renderSenderTag(sender);
   if (!tag) return '';
   const note = renderCursorSenderNote(cliId, true, locale);
@@ -388,7 +512,7 @@ function renderSubstituteTrigger(trigger?: SubstituteTrigger): string {
   ].join('\n');
 }
 
-export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: Locale): string {
+export function formatAttachmentsHint(attachments?: PlatformAttachment[], locale?: Locale): string {
   if (!attachments || attachments.length === 0) return '';
   let imgN = 0, fileN = 0;
   const items = attachments.map(a => {
@@ -493,13 +617,13 @@ export function buildNewTopicPrompt(
   sessionId: string,
   cliId: CliId,
   cliPathOverride?: string,
-  attachments?: LarkAttachment[],
-  mentions?: LarkMention[],
+  attachments?: PlatformAttachment[],
+  mentions?: PlatformMention[],
   availableBots?: Array<{ name: string; displayName: string; openId: string }>,
   followUps?: string[],
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
-  sender?: ResolvedSender,
+  sender?: PlatformSender,
   opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger },
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
@@ -551,7 +675,8 @@ export function buildNewTopicPrompt(
   let mentionBlock = '';
   if (mentions && mentions.length > 0) {
     const items = mentions.map(m => {
-      const oid = m.openId ? ` open_id="${xmlEscape(m.openId)}"` : '';
+      const id = mentionOpenId(m);
+      const oid = id ? ` open_id="${xmlEscape(id)}"` : '';
       return `  <mention name="${xmlEscape(m.name)}"${oid} />`;
     });
     mentionBlock = `<mentions>\n${items.join('\n')}\n</mentions>`;
@@ -559,7 +684,7 @@ export function buildNewTopicPrompt(
 
   let botBlock = '';
   if (availableBots && availableBots.length > 0) {
-    const mentionedOpenIds = new Set(mentions?.map(m => m.openId).filter(Boolean));
+    const mentionedOpenIds = new Set(mentions?.map(mentionOpenId).filter(Boolean));
     const unmentionedBots = availableBots.filter(b => !mentionedOpenIds.has(b.openId));
     if (unmentionedBots.length > 0) {
       // ≤ threshold peers: inline the full roster with open_ids so any
@@ -646,7 +771,7 @@ export function buildNewTopicPrompt(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger },
+  opts?: { attachments?: PlatformAttachment[]; mentions?: PlatformMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: PlatformSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger },
 ): string {
   const parts: string[] = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
@@ -688,7 +813,8 @@ export function buildFollowUpContent(
 
   if (opts?.mentions && opts.mentions.length > 0) {
     const items = opts.mentions.map(m => {
-      const oid = m.openId ? ` open_id="${xmlEscape(m.openId)}"` : '';
+      const id = mentionOpenId(m);
+      const oid = id ? ` open_id="${xmlEscape(id)}"` : '';
       return `  <mention name="${xmlEscape(m.name)}"${oid} />`;
     });
     parts.push(`<mentions>\n${items.join('\n')}\n</mentions>`);
@@ -713,8 +839,8 @@ export function buildFollowUpContent(
 export function buildBridgeInputContent(
   content: string,
   opts?: {
-    attachments?: LarkAttachment[];
-    mentions?: LarkMention[];
+    attachments?: PlatformAttachment[];
+    mentions?: PlatformMention[];
     selfMention?: { name?: string | null; openId?: string | null };
     locale?: Locale;
   },
@@ -723,16 +849,17 @@ export function buildBridgeInputContent(
   const selfNames = new Set<string>();
   if (selfMention?.name) selfNames.add(selfMention.name);
   for (const m of opts?.mentions ?? []) {
-    if (selfMention?.openId && m.openId === selfMention.openId) selfNames.add(m.name);
+    if (selfMention?.openId && mentionOpenId(m) === selfMention.openId) selfNames.add(m.name);
     if (selfMention?.name && m.name === selfMention.name) selfNames.add(m.name);
   }
 
-  const isSelfMention = (m: LarkMention): boolean => {
+  const isSelfMention = (m: PlatformMention): boolean => {
     // openId is authoritative when both sides have it — avoids classifying
     // a different bot as self in the (theoretical) case where two bots in
     // the same chat share a display name.
-    if (selfMention?.openId && m.openId) {
-      return m.openId === selfMention.openId;
+    const openId = mentionOpenId(m);
+    if (selfMention?.openId && openId) {
+      return openId === selfMention.openId;
     }
     // At least one side is missing openId (cold-start window before
     // probeBotOpenId returns, or a mention without openId): fall back to
@@ -802,13 +929,13 @@ export function buildReforkPrompt(
   ds: DaemonSession,
   content: string,
   opts?: {
-    attachments?: LarkAttachment[];
-    mentions?: LarkMention[];
+    attachments?: PlatformAttachment[];
+    mentions?: PlatformMention[];
     cliId?: CliId;
     cliPathOverride?: string;
     selfMention?: { name?: string | null; openId?: string | null };
     locale?: Locale;
-    sender?: ResolvedSender;
+    sender?: PlatformSender;
   },
 ): string {
   const locale = opts?.locale ?? localeForBot(ds.larkAppId);
@@ -934,7 +1061,28 @@ export async function staggeredRecoveryFork(
 
 export async function restoreActiveSessions(activeSessions: Map<string, DaemonSession>): Promise<void> {
   const sessions = sessionStore.listSessions();
-  const active = sessions.filter(s => s.status === 'active');
+  const runtimeAppId = getAllBots()[0]?.config.larkAppId;
+  const runtimeInstance = runtimeAppId
+    ? { platform: 'lark', instanceId: runtimeAppId }
+    : undefined;
+  const isRuntimeOwned = (session: Session): boolean => {
+    if (!runtimeInstance) return true;
+    const owner = derivePlatformInstanceIdentity(session, runtimeAppId);
+    return !!owner && samePlatformInstance(owner, runtimeInstance);
+  };
+  const active = sessions.filter(s =>
+    s.status === 'active'
+    && isRuntimeOwned(s),
+  );
+  const foreignActive = sessions.filter(s =>
+    s.status === 'active' && runtimeInstance && !isRuntimeOwned(s),
+  );
+  if (foreignActive.length > 0) {
+    logger.warn(
+      `[platform-session] skipped ${foreignActive.length} active session(s) owned by another instance `
+      + `while restoring lark:${runtimeAppId}`,
+    );
+  }
 
   if (active.length === 0) {
     logger.info('No active sessions to restore');
@@ -967,9 +1115,10 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         continue;
       }
       // Original CLI still alive — re-register and fork adopt worker
-      const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
+      const larkAppId = derivePlatformInstanceIdentity(session, runtimeAppId)?.instanceId ?? runtimeAppId ?? '';
       const ds: DaemonSession = {
         session,
+        platform: larkPlatformContext(larkAppId, session.chatId, session.chatType ?? 'group', scope, session.rootMessageId),
         worker: null,
         workerPort: null,
         workerToken: null,
@@ -1025,9 +1174,10 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     // queued），绝不能走下面 hasHistory:true 的通用分支——否则下一条消息会 --resume 一个
     // 不存在的 CLI 会话。pendingPrompt 从持久化的 queuedPrompt 恢复，供激活时发首轮。
     if (session.queued) {
-      const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
+      const larkAppId = derivePlatformInstanceIdentity(session, runtimeAppId)?.instanceId ?? runtimeAppId ?? '';
       const ds: DaemonSession = {
         session,
+        platform: larkPlatformContext(larkAppId, session.chatId, session.chatType ?? 'group', scope, session.rootMessageId),
         worker: null,
         workerPort: null,
         workerToken: null,
@@ -1054,9 +1204,10 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       continue;
     }
 
-    const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
+    const larkAppId = derivePlatformInstanceIdentity(session, runtimeAppId)?.instanceId ?? runtimeAppId ?? '';
     const ds: DaemonSession = {
       session,
+      platform: larkPlatformContext(larkAppId, session.chatId, session.chatType ?? 'group', scope, session.rootMessageId),
       worker: null,
       workerPort: null,
       workerToken: null,
@@ -1257,7 +1408,10 @@ export async function resumeSession(
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession }
 | { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported'; activeSessionId?: string }> {
-  const session = sessionStore.getSession(sessionId);
+  const currentLarkAppId = getAllBots()[0]?.config.larkAppId ?? '';
+  const session = currentLarkAppId
+    ? sessionStore.getSessionForInstance(sessionId, { platform: 'lark', instanceId: currentLarkAppId })
+    : sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
 
@@ -1269,7 +1423,8 @@ export async function resumeSession(
   }
 
   const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
-  const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
+  const larkAppId = derivePlatformInstanceIdentity(session, currentLarkAppId)?.instanceId
+    ?? currentLarkAppId;
   const anchor = scope === 'thread' ? session.rootMessageId : session.chatId;
   const key = sessionKey(anchor, larkAppId);
 
@@ -1322,7 +1477,10 @@ export async function resumeSession(
   const conflicts = sessionStore.listSessions().filter(s =>
     s.sessionId !== sessionId
     && s.status === 'active'
-    && (s.larkAppId ?? '') === larkAppId
+    && samePlatformInstance(
+      derivePlatformInstanceIdentity(s, currentLarkAppId) ?? { platform: '', instanceId: '' },
+      { platform: 'lark', instanceId: larkAppId },
+    )
     && (s.scope === 'chat' ? 'chat' : 'thread') === scope
     && (scope === 'thread' ? s.rootMessageId === anchor : s.chatId === anchor),
   );
@@ -1344,6 +1502,7 @@ export async function resumeSession(
   const now = Date.now();
   const ds: DaemonSession = {
     session,
+    platform: larkPlatformContext(larkAppId, session.chatId, session.chatType ?? 'group', scope, session.rootMessageId),
     worker: null,
     workerPort: null,
     workerToken: null,
@@ -1399,7 +1558,9 @@ export async function executeScheduledTask(
     allBots[0];
   const larkAppId = bot.config.larkAppId;
 
-  const { getChatMode, sendMessage, replyMessage } = await import('../im/lark/client.js');
+  const { getChatMode } = await import('../im/lark/client.js');
+  const sendMessage = platformSendMessage;
+  const replyMessage = platformReplyMessage;
 
   // Scope resolution — explicit task.scope wins; otherwise fall back to legacy
   // semantics (rootMessageId present → thread, absent → chat). Restoring an
@@ -1554,6 +1715,13 @@ export async function executeScheduledTask(
 
   const ds: DaemonSession = {
     session,
+    platform: larkPlatformContext(
+      larkAppId,
+      task.chatId,
+      task.chatType === 'p2p' ? 'p2p' : 'group',
+      runtimeScope,
+      session.rootMessageId,
+    ),
     worker: null,
     workerPort: null,
     workerToken: null,
@@ -1622,12 +1790,11 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
       // (The pending dashboard row is announced inside runAutoWorktreeCommit so all
       // three spawn callers get it from one place — no publish needed here.)
       const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
-      const { sendMessage } = await import('../im/lark/client.js');
       void runAutoWorktreeCommit({
         ds, anchor: ds.chatId, larkAppId, baseDir,
         title: ds.session.title, prompt: userContent,
         operatorOpenId: ds.session.ownerOpenId, activeSessions: registry,
-        notify: (m) => sendMessage(larkAppId, ds.chatId, m),
+        notify: (m) => platformSendMessage(larkAppId, ds.chatId, m),
       });
       logger.info(`[createSession] session ${ds.session.sessionId.substring(0, 8)} → pending, building worktree off ${baseDir}`);
       return;
@@ -1648,10 +1815,9 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
     if (projects.length > 0) {
       try {
         const card = buildRepoSelectCard(projects, getSessionWorkingDir(ds), ds.chatId, locale, bot.config.worktreeMultiPicker);
-        const { sendMessage } = await import('../im/lark/client.js');
         ds.pendingRepo = true;
         ds.pendingPrompt = userContent;
-        ds.repoCardMessageId = await sendMessage(larkAppId, ds.chatId, card, 'interactive');
+        ds.repoCardMessageId = await platformSendMessage(larkAppId, ds.chatId, card, 'interactive');
         announcePendingRepoSession(ds);
         // 弹卡片这条路不经 forkWorker，session.spawned 不会自动发——手动 upsert 一条，
         // 让 dashboard 显示这条「待选仓库」会话（in_progress 首次 spawn 走这里才会出现）。
@@ -1727,8 +1893,7 @@ export async function spawnDashboardSession(
   let bannerMessageId: string | undefined;
   if (args.postBanner) {
     try {
-      const { sendMessage } = await import('../im/lark/client.js');
-      bannerMessageId = await sendMessage(larkAppId, chatId, t('cmd.createSession.banner', { content }, locale));
+      bannerMessageId = await platformSendMessage(larkAppId, chatId, t('cmd.createSession.banner', { content }, locale));
     } catch (err: any) {
       logger.warn(`[createSession] banner send failed in ${chatId}: ${err?.message ?? err}`);
     }
@@ -1764,6 +1929,7 @@ export async function spawnDashboardSession(
 
   const ds: DaemonSession = {
     session,
+    platform: larkPlatformContext(larkAppId, chatId, 'group', 'chat', session.rootMessageId),
     worker: null,
     workerPort: null,
     workerToken: null,

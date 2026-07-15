@@ -2976,6 +2976,9 @@ describe('handleCommand', () => {
       // the chatId (cosmetic — chat-scope routing doesn't use rootMessageId).
       expect(body.targetRootMessageId).toBe('oc_new_group');
       expect(body.requesterLarkAppId).toBe(LARK_APP_ID);
+      expect(body.requesterPlatform).toBe('lark');
+      expect(body.requesterInstanceId).toBe(LARK_APP_ID);
+      expect(body.targetPlatform).toBe('lark');
       expect(body.requestingUserOpenId).toBe('ou_sender');
 
       // Reply contains the new chat name and both bot statuses.

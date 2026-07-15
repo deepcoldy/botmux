@@ -13,8 +13,17 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
+import {
+  normalizePlatformDescriptor,
+  type DescriptorCapabilities,
+  type DescriptorPlatformRef,
+} from '../im/platform-descriptor.js';
 
 export interface OnlineDaemonInfo {
+  platform: string;
+  instanceId: string;
+  capabilities?: DescriptorCapabilities;
+  /** Legacy compatibility identity. Prefer platform + instanceId. */
   larkAppId: string;
   ipcPort: number;
   botName?: string;
@@ -29,8 +38,19 @@ function registryDir(): string {
   return join(config.session.dataDir, 'dashboard-daemons');
 }
 
+function validPort(value: unknown): value is number {
+  return typeof value === 'number'
+    && Number.isInteger(value)
+    && value > 0
+    && value <= 65_535;
+}
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
 /** List every daemon whose descriptor file is fresh (heartbeat within STALE_MS). */
-export function listOnlineDaemons(): OnlineDaemonInfo[] {
+export function listOnlinePlatformDaemons(): OnlineDaemonInfo[] {
   const dir = registryDir();
   if (!existsSync(dir)) return [];
   const now = Date.now();
@@ -41,23 +61,37 @@ export function listOnlineDaemons(): OnlineDaemonInfo[] {
     if (!f.endsWith('.json')) continue;
     try {
       const raw = readFileSync(join(dir, f), 'utf-8');
-      const d = JSON.parse(raw) as Partial<OnlineDaemonInfo>;
-      if (typeof d.ipcPort !== 'number' || typeof d.larkAppId !== 'string') continue;
-      if (now - (d.lastHeartbeat ?? 0) > STALE_MS) continue;
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const identity = normalizePlatformDescriptor(parsed);
+      if (!identity || !validPort(parsed.ipcPort) || !finiteNumber(parsed.lastHeartbeat)) continue;
+      if (now - parsed.lastHeartbeat > STALE_MS) continue;
       out.push({
-        larkAppId: d.larkAppId,
-        ipcPort: d.ipcPort,
-        ...(typeof d.botName === 'string' && d.botName.trim() ? { botName: d.botName.trim() } : {}),
-        ...(typeof d.cliId === 'string' && d.cliId.trim() ? { cliId: d.cliId.trim() } : {}),
-        pid: d.pid,
-        lastHeartbeat: d.lastHeartbeat,
+        ...identity,
+        ipcPort: parsed.ipcPort,
+        ...(typeof parsed.botName === 'string' && parsed.botName.trim() ? { botName: parsed.botName.trim() } : {}),
+        ...(typeof parsed.cliId === 'string' && parsed.cliId.trim() ? { cliId: parsed.cliId.trim() } : {}),
+        ...(finiteNumber(parsed.pid) ? { pid: parsed.pid } : {}),
+        lastHeartbeat: parsed.lastHeartbeat,
       });
     } catch { /* malformed — skip */ }
   }
   return out;
 }
 
+/** Legacy Lark-only view used by A2A/relay callers keyed by larkAppId. */
+export function listOnlineDaemons(): OnlineDaemonInfo[] {
+  return listOnlinePlatformDaemons().filter(d => d.platform === 'lark');
+}
+
 /** Find a specific online daemon by larkAppId. Returns null if offline / not found. */
 export function findOnlineDaemon(larkAppId: string): OnlineDaemonInfo | null {
-  return listOnlineDaemons().find(d => d.larkAppId === larkAppId) ?? null;
+  return listOnlineDaemons().find(d => d.platform === 'lark' && d.larkAppId === larkAppId) ?? null;
+}
+
+/** Find an online daemon by its complete platform-neutral instance identity. */
+export function findOnlineDaemonByRef(ref: DescriptorPlatformRef): OnlineDaemonInfo | null {
+  const platform = typeof ref?.platform === 'string' ? ref.platform.trim() : '';
+  const instanceId = typeof ref?.instanceId === 'string' ? ref.instanceId.trim() : '';
+  if (!platform || !instanceId) return null;
+  return listOnlinePlatformDaemons().find(d => d.platform === platform && d.instanceId === instanceId) ?? null;
 }

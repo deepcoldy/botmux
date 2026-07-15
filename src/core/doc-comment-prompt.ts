@@ -1,5 +1,8 @@
-import type { Brand } from '../im/lark/lark-hosts.js';
 import type { Locale } from '../i18n/index.js';
+
+/** Brand value needed only to select the public document host. Keep the core
+ * prompt builder independent from the concrete Lark adapter module. */
+export type DocCommentBrand = 'feishu' | 'lark';
 
 export interface DocCommentPromptInput {
   fileToken: string;
@@ -8,14 +11,14 @@ export interface DocCommentPromptInput {
   author: string;
   selectedText?: string;
   priorReplies?: Array<{ author?: string; text: string }>;
-  brand?: Brand;
+  brand?: DocCommentBrand;
   locale?: Locale;
 }
 
 export interface DocWatchWarmupPromptInput {
   fileToken: string;
   fileType: string;
-  brand?: Brand;
+  brand?: DocCommentBrand;
   locale?: Locale;
 }
 

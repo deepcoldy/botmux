@@ -337,6 +337,8 @@ export interface CommandHandlerDeps {
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
   /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
   prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
+  sendMessage?: typeof sendMessage;
+  sendDirectMessage?: typeof sendUserMessage;
 }
 
 // ─── Schedule command ────────────────────────────────────────────────────────
@@ -836,7 +838,7 @@ async function handleConfigCommand(
     // 在群/话题群里那会让 owner-only 的运营配置卡全员可见（按钮虽仍重验 admin 无法提权，
     // 但卡片本身就违背「始终私信」意图）。只回一句简短文字引导去单聊后重试。
     try {
-      await sendUserMessage(larkAppId, senderId, cardJson, 'interactive');
+      await (deps.sendDirectMessage ?? sendUserMessage)(larkAppId, senderId, cardJson, 'interactive');
     } catch {
       await reply(t('cmd.config.card_dm_failed', undefined, renderLoc));
     }
@@ -1195,7 +1197,12 @@ export async function handleCommand(
             const patchPath = join(config.session.dataDir, 'sandboxes', sid, patchName);
             writeFileSync(patchPath, d.patch);
             const fileKey = await uploadFile(larkAppId, patchPath);
-            await sendMessage(larkAppId, ds.session.chatId, JSON.stringify({ file_key: fileKey }), 'file');
+            await (deps.sendMessage ?? sendMessage)(
+              larkAppId,
+              ds.session.chatId,
+              JSON.stringify({ file_key: fileKey }),
+              'file',
+            );
             patchAttached = true;
           } catch (e) { logger.warn(`[${logTag}] /land patch attach failed: ${(e as Error).message}`); }
         }
@@ -2696,6 +2703,9 @@ export async function handleCommand(
                   targetChatId: newChatId,
                   targetRootMessageId: placeholderRootMessageId,
                   requesterLarkAppId: creatorAppId,
+                  requesterPlatform: 'lark',
+                  requesterInstanceId: creatorAppId,
+                  targetPlatform: 'lark',
                   requestingUserOpenId: senderOpenId,
                   // union_id is cross-app stable within a tenant — peer
                   // compares against its own session.ownerUnionId rather
@@ -2762,7 +2772,7 @@ export async function handleCommand(
           }, loc);
         }
         try {
-          const finalM1Id = await sendMessage(creatorAppId, newChatId, finalM1Text, 'text');
+          const finalM1Id = await (deps.sendMessage ?? sendMessage)(creatorAppId, newChatId, finalM1Text, 'text');
           // Patch the leader's session.rootMessageId to the real M1 id, but
           // only if the leader was actually transferred — for the empty-
           // leader / all_fresh path, ds was either closed or never moved,

@@ -62,6 +62,17 @@ import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agen
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
 
+// startLarkEventDispatcher historically returned only the SDK WSClient while
+// keeping its revive timer private.  PlatformRuntime.stop() needs to tear down
+// both pieces without changing that public return contract (many callers/tests
+// already hold the WSClient directly), so retain the timer out-of-band.
+interface DispatcherLifecycleState {
+  stopped: boolean;
+  reviveTimer?: NodeJS.Timeout;
+}
+
+const wsLifecycleStates = new WeakMap<Lark.WSClient, DispatcherLifecycleState>();
+
 function vcMeetingEventPayloadForLog(data: any): string {
   try {
     return JSON.stringify(data?.event ?? data);
@@ -2584,7 +2595,16 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
   }
 
   // Start WSClient
-  const wsClient = new Lark.WSClient({
+  const lifecycle: DispatcherLifecycleState = { stopped: false };
+  let wsClient!: Lark.WSClient;
+  const closeLateConnection = (): boolean => {
+    if (!lifecycle.stopped) return false;
+    // The SDK's initial/revive start can finish after stop(). Force-close the
+    // late socket before it can become a second live dispatcher generation.
+    wsClient.close({ force: true });
+    return true;
+  };
+  wsClient = new Lark.WSClient({
     appId: larkAppId,
     appSecret: larkAppSecret,
     // brand → 长连接域名。国际版租户必须连 larksuite.com，否则收不到任何事件。
@@ -2605,11 +2625,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     handshakeTimeoutMs: 15_000,
     // 重连过程打日志，便于事后从 `pnpm daemon:logs` 复盘（warn 默认看不到这些）。
     onReconnecting: () => logger.warn(`[ws] ${larkAppId} reconnecting…`),
-    onReconnected: () => logger.info(`[ws] ${larkAppId} reconnected`),
+    onReady: () => { closeLateConnection(); },
+    onReconnected: () => {
+      if (!closeLateConnection()) logger.info(`[ws] ${larkAppId} reconnected`);
+    },
     onError: (err) => logger.error(`[ws] ${larkAppId} terminal error: ${err.message}`),
   });
 
-  wsClient.start({ eventDispatcher });
+  void wsClient.start({ eventDispatcher })
+    .catch(err => logger.error(`[ws] ${larkAppId} WSClient start failed: ${err?.message ?? err}`));
   logger.info('Daemon WSClient started');
 
   // ② SDK 重连耗尽后停在 terminalError（getConnectionStatus().state === 'failed'）并
@@ -2618,15 +2642,40 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
   //    只在 'failed' 时介入，不打断 SDK 正在进行的 'reconnecting' / 'connecting'。
   let reviving = false;
   const reviveTimer = setInterval(() => {
+    if (lifecycle.stopped) return;
     if (reviving) return;
     if (wsClient.getConnectionStatus().state !== 'failed') return;
     reviving = true;
     logger.warn(`[ws] ${larkAppId} connection failed (reconnect exhausted), restarting WSClient`);
-    wsClient.start({ eventDispatcher })
+    void wsClient.start({ eventDispatcher })
       .catch(err => logger.error(`[ws] ${larkAppId} WSClient restart failed: ${err?.message ?? err}`))
       .finally(() => { reviving = false; });
   }, 60_000);
   reviveTimer.unref();
+  lifecycle.reviveTimer = reviveTimer;
+  wsLifecycleStates.set(wsClient, lifecycle);
 
   return wsClient;
+}
+
+/** Stop a dispatcher created by {@link startLarkEventDispatcher}.
+ *
+ * Kept separate from `startLarkEventDispatcher()` so its long-standing return
+ * type remains the SDK WSClient. Calling this more than once is safe: the timer
+ * entry is removed on the first call and the SDK close operation is idempotent
+ * for an already-idle client.
+ */
+export function stopLarkEventDispatcher(wsClient: Lark.WSClient): void {
+  const lifecycle = wsLifecycleStates.get(wsClient);
+  if (lifecycle) {
+    // Mark stopped before touching timer/socket so an already in-flight start
+    // observes the terminal generation in onReady/onReconnected.
+    const wasStopped = lifecycle.stopped;
+    lifecycle.stopped = true;
+    if (!wasStopped && lifecycle.reviveTimer) clearInterval(lifecycle.reviveTimer);
+    lifecycle.reviveTimer = undefined;
+  }
+  // Always retry the SDK's idempotent close. A prior close may have thrown
+  // after the lifecycle flag/timer were already updated.
+  wsClient.close();
 }

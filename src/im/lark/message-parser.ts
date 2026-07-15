@@ -390,14 +390,35 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
   // Extract structured mentions
   const mentions: LarkMention[] | undefined =
     message.mentions && message.mentions.length > 0
-      ? message.mentions.map(m => ({
-          key: m.key,
-          name: m.name,
-          openId: mentionOpenId(m),
-          userId: mentionIdentity(m).userId,
-          unionId: mentionUnionId(m),
-          idType: m.id_type,
-        }))
+      ? message.mentions.map(m => {
+          const openId = mentionOpenId(m);
+          const identity = mentionIdentity(m);
+          const stableId = mentionUnionId(m);
+          const mention = {
+            key: m.key,
+            name: m.name,
+            openId,
+            userId: identity.userId,
+            unionId: stableId,
+            idType: m.id_type,
+          } as LarkMention;
+          Object.defineProperties(mention, {
+            token: { value: m.key, enumerable: false },
+            identity: { value: (!openId && !identity.userId && !stableId) ? undefined : {
+              id: openId ?? identity.userId ?? stableId!,
+              secondaryId: identity.userId,
+              stableId,
+              idType: m.id_type ?? (openId
+                ? 'open_id'
+                : identity.userId
+                  ? 'user_id'
+                  : stableId
+                    ? 'union_id'
+                    : undefined),
+            }, enumerable: false },
+          });
+          return mention;
+        })
       : undefined;
 
   const parsed: LarkMessage = {

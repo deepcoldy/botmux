@@ -112,6 +112,7 @@ import {
   describePluginDependencyError,
   enabledPluginDependents,
 } from './core/plugins/dependencies.js';
+import { normalizePlatformDescriptor } from './im/platform-descriptor.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -3586,9 +3587,13 @@ function listOnlineDaemons(): Array<{ ipcPort: number; larkAppId: string; lastHe
     if (!f.endsWith('.json')) continue;
     try {
       const d = JSON.parse(readFileSync(join(regDir, f), 'utf-8'));
-      if (typeof d?.ipcPort !== 'number' || typeof d?.larkAppId !== 'string') continue;
+      const identity = normalizePlatformDescriptor(d);
+      // This private helper serves legacy Lark CLI RPCs. Future platform
+      // descriptors remain discoverable through the generic discovery module,
+      // but must never be routed through larkAppId-based commands here.
+      if (!identity || identity.platform !== 'lark' || typeof d?.ipcPort !== 'number') continue;
       if (now - (d.lastHeartbeat ?? 0) > STALE_MS) continue;
-      all.push({ ipcPort: d.ipcPort, larkAppId: d.larkAppId, lastHeartbeat: d.lastHeartbeat });
+      all.push({ ipcPort: d.ipcPort, larkAppId: identity.larkAppId, lastHeartbeat: d.lastHeartbeat });
     } catch { /* skip malformed */ }
   }
   return all;
@@ -6607,10 +6612,13 @@ export async function runHook(
       // 真非 botmux 会话 → passthrough 放行
       return { stdout: adapter.passthrough(payload) };
     }
+    if ((adopt.platform ?? 'lark') !== 'lark') {
+      return { stdout: adapter.passthrough(payload) };
+    }
     // adopt 命中 → 使用 adopt 路由信息
     routeSessionId = adopt.sessionId;
     routeChatId = adopt.chatId;
-    routeLarkAppId = adopt.larkAppId;
+    routeLarkAppId = adopt.instanceId ?? adopt.larkAppId;
     routeRoot = adopt.rootMessageId;
   }
 

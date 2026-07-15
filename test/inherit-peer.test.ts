@@ -24,7 +24,7 @@ vi.mock('../src/utils/logger.js', () => ({
 
 import { findInheritablePeer } from '../src/core/inherit-peer.js';
 
-function makePeer(overrides: Partial<{ sessionId: string; rootMessageId: string; chatId: string; scope: 'thread' | 'chat'; workingDir: string; larkAppId: string }>): any {
+function makePeer(overrides: Partial<{ sessionId: string; rootMessageId: string; chatId: string; scope: 'thread' | 'chat'; workingDir: string; larkAppId: string; platform: string; instanceId: string }>): any {
   return {
     sessionId: overrides.sessionId ?? 's-1',
     rootMessageId: overrides.rootMessageId ?? 'om_root',
@@ -32,6 +32,8 @@ function makePeer(overrides: Partial<{ sessionId: string; rootMessageId: string;
     scope: overrides.scope ?? 'thread',
     workingDir: overrides.workingDir,
     larkAppId: overrides.larkAppId ?? 'app-other',
+    ...(overrides.platform ? { platform: overrides.platform } : {}),
+    ...(overrides.instanceId ? { instanceId: overrides.instanceId } : {}),
   };
 }
 
@@ -68,6 +70,38 @@ describe('findInheritablePeer — layer 1 (cross-bot same-anchor)', () => {
       selfAppId: 'app-self',
     });
     expect(result).toEqual({ sessionId: 'peer-1', larkAppId: 'app-other', workingDir });
+  });
+
+  it('allows another Lark instance but rejects a peer from another platform', () => {
+    const workingDir = tempDir('repo-platform');
+    mockFindByRoot.mockReturnValue([
+      makePeer({ sessionId: 'discord-peer', workingDir, larkAppId: 'same', platform: 'discord', instanceId: 'same' }),
+      makePeer({ sessionId: 'lark-peer', workingDir, larkAppId: 'app-other', platform: 'lark', instanceId: 'app-other' }),
+    ]);
+
+    const result = findInheritablePeer({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      selfAppId: 'app-self',
+      selfInstance: { platform: 'lark', instanceId: 'app-self' },
+    });
+
+    expect(result).toEqual({ sessionId: 'lark-peer', larkAppId: 'app-other', workingDir });
+  });
+
+  it('fails closed when a peer has no derivable platform instance', () => {
+    const workingDir = tempDir('repo-unknown');
+    mockFindByRoot.mockReturnValue([{
+      sessionId: 'unknown-peer', rootMessageId: 'om_root', chatId: 'oc_chat',
+      scope: 'thread', workingDir,
+    }]);
+
+    expect(findInheritablePeer({
+      scope: 'thread', anchor: 'om_root', chatId: 'oc_chat', chatType: 'group',
+      selfAppId: 'app-self', selfInstance: { platform: 'lark', instanceId: 'app-self' },
+    })).toBeNull();
   });
 
   it('skips peer that belongs to the same bot (would be self-inherit)', () => {

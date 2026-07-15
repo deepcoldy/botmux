@@ -5,8 +5,8 @@
  * 全部依赖注入，不访问真实 /proc / ps / 网络。
  */
 
-import { describe, it, expect } from 'vitest';
-import { getAncestorPids, resolveAdoptRoute, type AdoptRoute } from '../src/adapters/adopt-route.js';
+import { describe, it, expect, vi } from 'vitest';
+import { getAncestorPids, queryAdoptSession, resolveAdoptRoute, type AdoptRoute } from '../src/adapters/adopt-route.js';
 
 // ── getAncestorPids ────────────────────────────────────────────────────────────
 
@@ -74,9 +74,60 @@ describe('getAncestorPids', () => {
 
 // ── resolveAdoptRoute ──────────────────────────────────────────────────────────
 
+describe('queryAdoptSession platform compatibility', () => {
+  it('derives generic Lark identity from a legacy daemon response', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        sessionId: 's1', chatId: 'oc1', larkAppId: 'cli_legacy', rootMessageId: 'om1',
+      }),
+    })) as any);
+    try {
+      await expect(queryAdoptSession(7950, 123)).resolves.toEqual({
+        sessionId: 's1', chatId: 'oc1', platform: 'lark', instanceId: 'cli_legacy',
+        larkAppId: 'cli_legacy', rootMessageId: 'om1',
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('refuses an adopt route from an unsupported platform', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        sessionId: 's1', chatId: 'channel1', platform: 'discord', instanceId: 'bot1',
+        larkAppId: 'compat', rootMessageId: 'thread1',
+      }),
+    })) as any);
+    try {
+      await expect(queryAdoptSession(7950, 123)).resolves.toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('refuses a split-brain Lark adopt route', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        sessionId: 's1', chatId: 'oc1', platform: 'lark', instanceId: 'cli_a',
+        larkAppId: 'cli_b', rootMessageId: 'om1',
+      }),
+    })) as any);
+    try {
+      await expect(queryAdoptSession(7950, 123)).resolves.toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 const MOCK_ROUTE: AdoptRoute = {
   sessionId: 's-adopt',
   chatId: 'oc_chat1',
+  platform: 'lark',
+  instanceId: 'cli_apptest',
   larkAppId: 'cli_apptest',
   rootMessageId: 'om_root1',
 };

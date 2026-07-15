@@ -157,6 +157,20 @@ describe('POST /api/sessions/migrate-to-chat', () => {
     expect(r.body.error).toBe('missing_field');
   });
 
+  it('rejects cross-platform requester or target before session lookup', async () => {
+    const requester = await postMigrate({
+      ...validBody(),
+      requesterPlatform: 'discord',
+      requesterInstanceId: 'cli_leader',
+    });
+    expect(requester.status).toBe(400);
+    expect(requester.body.error).toBe('unsupported_cross_platform');
+
+    const target = await postMigrate({ ...validBody(), targetPlatform: 'discord' });
+    expect(target.status).toBe(400);
+    expect(target.body.error).toBe('unsupported_cross_platform');
+  });
+
   it('403 when requesterLarkAppId is not a known bot', async () => {
     const ds = makeDs();
     registry.set(sessionKey('om_thread_root', 'cli_peer'), ds);

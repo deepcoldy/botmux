@@ -13,7 +13,7 @@ import { forkWorker, getCurrentCliVersion } from './worker-pool.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import * as messageQueue from '../services/message-queue.js';
 import type { DaemonSession } from './types.js';
-import { sessionKey } from './types.js';
+import { createPlatformSessionContext, sessionKey } from './types.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 
 export interface TriggerSessionDeps {
@@ -381,6 +381,13 @@ export async function triggerSessionTurn(
 
   const newDs: DaemonSession = {
     session,
+    platform: createPlatformSessionContext(
+      { platform: 'lark', instanceId: larkAppId },
+      chatId,
+      'group',
+      scope,
+      session.rootMessageId,
+    ),
     worker: null,
     workerPort: null,
     workerToken: null,

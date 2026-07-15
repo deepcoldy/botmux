@@ -8,6 +8,10 @@ import { describe, it, expect } from 'vitest';
 import { buildBridgeInputContent, buildFollowUpContent } from '../src/core/session-manager.js';
 import type { LarkAttachment, LarkMention } from '../src/types.js';
 
+function mention(key: string, name: string, openId: string): LarkMention {
+  return { key, token: key, name, openId, identity: { id: openId } };
+}
+
 describe('buildBridgeInputContent', () => {
   it('returns just the user content when no attachments / mentions', () => {
     expect(buildBridgeInputContent('hello world')).toBe('hello world');
@@ -26,7 +30,7 @@ describe('buildBridgeInputContent', () => {
 
   it('appends attachments and mentions as plain prose', () => {
     const att: LarkAttachment[] = [{ type: 'image', name: 'a.png', path: '/tmp/a.png' }];
-    const mentions: LarkMention[] = [{ key: '@_1', name: 'Codex', openId: 'ou_xxx' }];
+    const mentions: LarkMention[] = [mention('@_1', 'Codex', 'ou_xxx')];
     const out = buildBridgeInputContent('please review', { attachments: att, mentions });
     expect(out).toContain('please review');
     expect(out).toContain('a.png');
@@ -35,7 +39,7 @@ describe('buildBridgeInputContent', () => {
   });
 
   it('strips leading self mention and omits it from mention prose', () => {
-    const mentions: LarkMention[] = [{ key: '@_1', name: 'Codex', openId: 'ou_self' }];
+    const mentions: LarkMention[] = [mention('@_1', 'Codex', 'ou_self')];
     const out = buildBridgeInputContent('@Codex hello', {
       mentions,
       selfMention: { name: 'Codex', openId: 'ou_self' },
@@ -46,8 +50,8 @@ describe('buildBridgeInputContent', () => {
 
   it('keeps non-self mentions while filtering self mentions', () => {
     const mentions: LarkMention[] = [
-      { key: '@_1', name: 'Codex', openId: 'ou_self' },
-      { key: '@_2', name: 'Claude', openId: 'ou_other' },
+      mention('@_1', 'Codex', 'ou_self'),
+      mention('@_2', 'Claude', 'ou_other'),
     ];
     const out = buildBridgeInputContent('@Codex ask Claude', {
       mentions,
@@ -93,7 +97,7 @@ describe('buildBridgeInputContent', () => {
     // yet, but the inbound mention carries the openId — stripping should still
     // pick up the alias from the mentions list.
     const mentions: LarkMention[] = [
-      { key: '@_1', name: 'Codex 分身', openId: 'ou_self' },
+      mention('@_1', 'Codex 分身', 'ou_self'),
     ];
     const out = buildBridgeInputContent('@Codex 分身 hello', {
       mentions,
@@ -107,7 +111,7 @@ describe('buildBridgeInputContent', () => {
     // openId is authoritative — the other bot's mention must survive in
     // the [@提及] block.
     const mentions: LarkMention[] = [
-      { key: '@_1', name: 'Claude', openId: 'ou_other' },
+      mention('@_1', 'Claude', 'ou_other'),
     ];
     const out = buildBridgeInputContent('hi team', {
       mentions,
@@ -117,8 +121,19 @@ describe('buildBridgeInputContent', () => {
     expect(out).toContain('@Claude');
   });
 
+  it('falls back to name matching when a mention identity is not an open_id', () => {
+    const out = buildBridgeInputContent('@Claude hello', {
+      mentions: [{
+        key: '@_1', token: '@_1', name: 'Claude', openId: undefined,
+        identity: { id: 'user-1', idType: 'user_id' },
+      }],
+      selfMention: { name: 'Claude', openId: 'ou_self' },
+    });
+    expect(out).toBe('hello');
+  });
+
   it('does not crash when selfMention is omitted (regression: legacy callers)', () => {
-    const mentions: LarkMention[] = [{ key: '@_1', name: 'Codex', openId: 'ou_xxx' }];
+    const mentions: LarkMention[] = [mention('@_1', 'Codex', 'ou_xxx')];
     const out = buildBridgeInputContent('@Codex hello', { mentions });
     // Without selfMention we keep legacy behavior — leading @Codex stays,
     // mention block stays.

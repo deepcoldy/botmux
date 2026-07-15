@@ -24,6 +24,7 @@ import { getBotClient } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { larkGet } from './client.js';
+import type { PlatformSender } from '../platform.js';
 
 export type IdentityType = 'user' | 'bot' | 'app' | 'unknown';
 
@@ -255,7 +256,8 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-export interface ResolvedSender {
+export interface ResolvedSender extends PlatformSender {
+  /** Lark compatibility field; platform-neutral consumers use `id`. */
   openId: string;
   type: 'user' | 'bot';
   name?: string;
@@ -294,5 +296,10 @@ export async function resolveSender(
   if (!name && type === 'user') {
     name = await resolveName(larkAppId, openId);
   }
-  return { openId, type, name };
+  const sender = { openId, type, name } as ResolvedSender;
+  // Preserve the long-standing enumerable Lark return shape while exposing a
+  // neutral id to the core session model. Object.keys/JSON/deep-equality still
+  // see exactly {openId,type,name}.
+  Object.defineProperty(sender, 'id', { value: openId, enumerable: false });
+  return sender;
 }

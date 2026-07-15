@@ -15,7 +15,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../src/services/session-store.js', () => ({
   updateSession: vi.fn(),
-  getSession: vi.fn(),
+  getLocalSession: vi.fn(),
   closeSession: vi.fn(),
 }));
 
@@ -74,6 +74,13 @@ function makeDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
   };
   return {
     session,
+    platform: {
+      instance: { platform: 'lark', instanceId: 'cli_app_test' },
+      conversation: {
+        instance: { platform: 'lark', instanceId: 'cli_app_test' },
+        chatId: 'oc_source', conversationType: 'group', scope: 'thread', anchorId: 'om_source_root', threadId: 'om_source_root',
+      },
+    },
     worker: null,
     workerPort: null,
     workerToken: null,
@@ -105,7 +112,9 @@ describe('transferSession', () => {
     targetRootMessageId: string,
     targetChatType: 'group' | 'p2p' = 'group',
     targetScope: 'thread' | 'chat' = 'chat',
+    targetInstance?: { platform: string; instanceId: string },
   ) => transferSession(sessionId, targetChatId, targetRootMessageId, targetChatType, targetScope, {
+    targetInstance,
     forkWorkerImpl: forkWorkerSpy as any,
     killWorkerImpl: killWorkerSpy as any,
   });
@@ -162,6 +171,63 @@ describe('transferSession', () => {
     const r = await callTransfer('does-not-exist', 'oc_target', 'om_target_root');
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toBe('session_not_active');
+  });
+
+  it('rejects cross-platform relay before any visible or persistent side effect', async () => {
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const r = await callTransfer(
+      ds.session.sessionId,
+      'discord-channel',
+      'discord-thread',
+      'group',
+      'chat',
+      { platform: 'discord', instanceId: 'workspace-bot' },
+    );
+
+    expect(r).toEqual({ ok: false, error: 'unsupported_cross_platform' });
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(killWorkerSpy).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    expect(dashboardEventBus.publish).not.toHaveBeenCalled();
+    expect(ds.chatId).toBe('oc_source');
+    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(ds);
+  });
+
+  it('treats an omitted target identity as the legacy Lark target, not as the source platform', async () => {
+    const ds = makeDs({
+      platform: {
+        instance: { platform: 'discord', instanceId: 'workspace-bot' },
+        conversation: {
+          instance: { platform: 'discord', instanceId: 'workspace-bot' },
+          chatId: 'discord-source', conversationType: 'group', scope: 'thread',
+          anchorId: 'om_source_root',
+        },
+      } as any,
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    await expect(callTransfer(ds.session.sessionId, 'oc_target', 'om_target'))
+      .resolves.toEqual({ ok: false, error: 'unsupported_cross_platform' });
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+
+  it('allows a relay target represented by another instance on the same platform', async () => {
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const r = await callTransfer(
+      ds.session.sessionId,
+      'oc_target',
+      'om_target',
+      'group',
+      'chat',
+      { platform: 'lark', instanceId: 'another-app-view' },
+    );
+    expect(r.ok).toBe(true);
+    expect(ds.platform.instance).toEqual({ platform: 'lark', instanceId: 'cli_app_test' });
   });
 
   it('returns adopt_not_relayable when source session was attached via /adopt', async () => {
@@ -433,10 +499,10 @@ describe('transferSession', () => {
       scope: 'chat',
     });
     registry.set(sessionKey('oc_target', 'cli_app_test'), scratchDs);
-    // getSession is consulted by closeSession to decide whether to mark
+    // getLocalSession is consulted by closeSession to decide whether to mark
     // the store row closed — return a status='active' record so the store
     // close path fires.
-    vi.mocked(sessionStore.getSession).mockImplementation((sid: string) =>
+    vi.mocked(sessionStore.getLocalSession).mockImplementation((sid: string) =>
       sid === 'scratch-relay-cmd' ? ({ ...scratchDs.session, status: 'active' }) as any : undefined,
     );
 
@@ -607,7 +673,7 @@ describe('setActiveSessionSafe', () => {
     // status='active' as a ghost.
     const prevDs = makeSimpleDs('prev-sess');
     const newDs = makeSimpleDs('new-sess');
-    vi.mocked(sessionStore.getSession).mockImplementation((sid: string) =>
+    vi.mocked(sessionStore.getLocalSession).mockImplementation((sid: string) =>
       sid === 'prev-sess' ? ({ ...prevDs.session, status: 'active' }) as any : undefined,
     );
 

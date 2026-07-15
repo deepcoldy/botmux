@@ -61,6 +61,7 @@ describe('registerBot', () => {
     const cfg = makeCfg();
     const state = mod.registerBot(cfg);
     expect(state.config).toBe(cfg);
+    expect(state.platformInstance).toEqual({ platform: 'lark', instanceId: 'app_test_001' });
   });
 
   it('should create a Lark Client with appId and appSecret', () => {

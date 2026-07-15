@@ -839,6 +839,15 @@ describe('parseEventMessage: mention identity formats', () => {
       name: 'BotA',
       openId: 'ou_bot_a_open_id',
     });
+    expect(parsed.mentions?.[0].token).toBe('@_bot');
+    expect(parsed.mentions?.[0].identity).toEqual({
+      id: 'ou_bot_a_open_id',
+      secondaryId: undefined,
+      stableId: undefined,
+      idType: 'open_id',
+    });
+    // Neutral projections must not rewrite the legacy persisted/JSON shape.
+    expect(Object.keys(parsed.mentions?.[0] ?? {})).not.toContain('identity');
   });
 
   it('keeps string open_id mention ids as openId', () => {
@@ -867,5 +876,12 @@ describe('parseEventMessage: mention identity formats', () => {
       idType: 'app_id',
     });
     expect(parsed.mentions?.[0].openId).toBeUndefined();
+  });
+
+  it('marks a user_id fallback so the Lark runtime never caches it as open_id', () => {
+    const { parsed } = parseEventMessage(makeMentionEvent({
+      key: '@_user', name: 'User', id: { user_id: 'user-1' },
+    }));
+    expect(parsed.mentions?.[0].identity).toMatchObject({ id: 'user-1', idType: 'user_id' });
   });
 });

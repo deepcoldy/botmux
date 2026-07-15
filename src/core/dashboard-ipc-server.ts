@@ -63,7 +63,18 @@ import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import {
+  getChatMode,
+  replyMessage as replyLarkMessage,
+  sendMessage as sendLarkMessage,
+  resolveUnionIdFromOpenId,
+  listThreadMessages,
+  listChatMessages,
+  listChatBotMembers,
+  getUserProfile,
+  resolveAllowedUsersWithMap,
+  type ChatBotMember,
+} from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
@@ -89,6 +100,12 @@ import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
+import {
+  requireSamePlatformInstance,
+  samePlatform,
+  type PlatformInstanceIdentity,
+} from '../im/platform.js';
+import { requirePlatformPort, type PlatformRuntime } from '../im/ports.js';
 
 // Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
 // deps). Until set, workflow-targeted triggers report not-implemented.
@@ -217,6 +234,60 @@ export function setBotName(name: string): void { setRowsBotName(name); }
 // endpoints below which proxy calls into groups-store on this bot's behalf.
 let cachedLarkAppId = '';
 export function setLarkAppId(id: string): void { cachedLarkAppId = id; }
+let cachedPlatformRuntime: PlatformRuntime | undefined;
+export function setPlatformRuntime(runtime: PlatformRuntime | undefined): void {
+  cachedPlatformRuntime = runtime;
+}
+
+function runtimeForLarkApp(larkAppId: string): PlatformRuntime | undefined {
+  const runtime = cachedPlatformRuntime;
+  if (!runtime) return undefined;
+  requireSamePlatformInstance(runtime.instance, { platform: 'lark', instanceId: larkAppId });
+  return runtime;
+}
+
+async function sendMessage(
+  larkAppId: string,
+  chatId: string,
+  content: string,
+  msgType: string = 'text',
+  uuid?: string,
+  hookContext?: Record<string, unknown>,
+): Promise<string> {
+  const runtime = runtimeForLarkApp(larkAppId);
+  if (!runtime) return sendLarkMessage(larkAppId, chatId, content, msgType, uuid, hookContext);
+  const conversation = {
+    instance: runtime.instance,
+    chatId,
+    conversationType: 'group',
+    scope: 'chat',
+    anchorId: chatId,
+  } as const;
+  const options = { contentType: msgType, idempotencyKey: uuid, context: hookContext };
+  const ref = msgType === 'interactive'
+    ? await requirePlatformPort(runtime, 'cards').sendCard(conversation, { payload: content }, options)
+    : await requirePlatformPort(runtime, 'messaging').sendMessage(conversation, content, options);
+  return ref.messageId;
+}
+
+async function replyMessage(
+  larkAppId: string,
+  messageId: string,
+  content: string,
+  msgType: string = 'text',
+  replyInThread: boolean = false,
+  uuid?: string,
+  hookContext?: Record<string, unknown>,
+): Promise<string> {
+  const runtime = runtimeForLarkApp(larkAppId);
+  if (!runtime) return replyLarkMessage(larkAppId, messageId, content, msgType, replyInThread, uuid, hookContext);
+  const target = { instance: runtime.instance, messageId };
+  const options = { contentType: msgType, inThread: replyInThread, idempotencyKey: uuid, context: hookContext };
+  const ref = msgType === 'interactive'
+    ? await requirePlatformPort(runtime, 'cards').replyCard(target, { payload: content }, options)
+    : await requirePlatformPort(runtime, 'messaging').replyMessage(target, content, options);
+  return ref.messageId;
+}
 
 ipcRoute('GET', '/api/sessions', (_req, res) => {
   // Active first (live state), closed appended (historical)
@@ -325,7 +396,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', (_req, res, params) => {
 /** 解析 session（活跃优先，已关闭兜底）。活跃会话取 ds.session —— registry 与
  *  store 持有同一对象，改字段后 updateSession 即落盘。 */
 function findSessionRecord(sessionId: string): Session | undefined {
-  return findActiveBySessionId(sessionId)?.session ?? sessionStore.getSession(sessionId);
+  return findActiveBySessionId(sessionId)?.session
+    ?? (cachedLarkAppId
+      ? sessionStore.getSessionForInstance(sessionId, { platform: 'lark', instanceId: cachedLarkAppId })
+      : sessionStore.getLocalSession(sessionId));
 }
 
 function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string): TriggerResponse {
@@ -881,6 +955,9 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
     targetChatId?: string;
     targetRootMessageId?: string;
     requesterLarkAppId?: string;
+    requesterPlatform?: string;
+    requesterInstanceId?: string;
+    targetPlatform?: string;
     requestingUserOpenId?: string;
     requestingUserUnionId?: string;
   };
@@ -894,6 +971,22 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'missing_field' });
   }
 
+  const requesterInstance: PlatformInstanceIdentity = {
+    platform: body.requesterPlatform?.trim() || 'lark',
+    instanceId: body.requesterInstanceId?.trim() || requesterLarkAppId,
+  };
+  const receiverInstance: PlatformInstanceIdentity = {
+    platform: 'lark',
+    instanceId: cachedLarkAppId,
+  };
+  const targetPlatform = body.targetPlatform?.trim() || receiverInstance.platform;
+  // Cross-platform coordination is rejected before registry/session lookup or
+  // any transfer side effect. Legacy bodies omit these fields and derive Lark.
+  if (!samePlatform(requesterInstance, receiverInstance)
+    || !samePlatform(receiverInstance, { platform: targetPlatform })) {
+    return jsonRes(res, 400, { ok: false, error: 'unsupported_cross_platform' });
+  }
+
   // Requester must be a live botmux daemon — not a random localhost process
   // pretending to be one. We check the cross-process daemon registry
   // (~/.botmux/data/dashboard-daemons/<larkAppId>.json + heartbeat) rather
@@ -901,7 +994,13 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
   // daemon process, and a per-process `getAllBots()` only sees its OWN bot
   // (botmux is one-daemon-per-bot at boot, daemon.ts:2367). Using the
   // registry lets the peer recognise the leader bot.
-  const requesterKnown = listOnlineDaemons().some(d => d.larkAppId === requesterLarkAppId);
+  const requesterKnown = listOnlineDaemons().some(d => {
+    const platform = d.platform ?? 'lark';
+    const instanceId = d.instanceId ?? d.larkAppId;
+    return samePlatform({ platform }, requesterInstance)
+      && instanceId === requesterInstance.instanceId
+      && d.larkAppId === requesterLarkAppId;
+  });
   if (!requesterKnown) return jsonRes(res, 403, { ok: false, error: 'unknown_requester' });
 
   // Locate this daemon's own session at the given source anchor. We match
@@ -959,7 +1058,14 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
 
   // Target chat was built by the leader's /relay --create — by
   // construction a regular group, chat-scope (M1 is the audit anchor).
-  const result = await transferSession(ds.session.sessionId, targetChatId, targetRootMessageId, 'group', 'chat');
+  const result = await transferSession(
+    ds.session.sessionId,
+    targetChatId,
+    targetRootMessageId,
+    'group',
+    'chat',
+    { targetInstance: receiverInstance },
+  );
   if (!result.ok) {
     return jsonRes(res, 500, { ok: false, error: result.error });
   }
@@ -981,21 +1087,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
   // locate marker is a bare @-mention of the session's owner — no other text,
   // no AppLink redirect on the frontend. The notification on the user's
   // device is enough to navigate them back to the topic.
-  const ds = findActiveBySessionId(sid);
-  const closed = ds ? null : sessionStore.getSession(sid);
-  const ctx = ds
-    ? {
-        larkAppId: ds.larkAppId,
-        rootMessageId: ds.session.rootMessageId,
-        ownerOpenId: ds.session.ownerOpenId,
-      }
-    : closed
-      ? {
-          larkAppId: closed.larkAppId ?? '',
-          rootMessageId: closed.rootMessageId,
-          ownerOpenId: closed.ownerOpenId,
-        }
-      : null;
+  const session = findSessionRecord(sid);
+  const ctx = session ? {
+    larkAppId: session.larkAppId ?? cachedLarkAppId,
+    rootMessageId: session.rootMessageId,
+    ownerOpenId: session.ownerOpenId,
+  } : null;
   if (!ctx || !ctx.larkAppId) {
     return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
   }

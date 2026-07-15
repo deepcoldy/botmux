@@ -26,7 +26,16 @@ import {
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
-import { addReaction, getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import {
+  addReaction as addLarkReaction,
+  getChatMode,
+  listChatMemberOpenIds,
+  replyMessage as replyLarkMessage,
+  resolveAllowedUsersWithMap,
+  sendMessage as sendLarkMessage,
+  sendUserMessage as sendLarkUserMessage,
+  updateMessage as updateLarkMessage,
+} from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, effectiveBotDisplayName, type BotConfig, type BotState, type OncallChat, type VcMeetingAgentConfig, type VcMeetingConsumerAgentConfig } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
@@ -52,7 +61,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
-import { sessionKey, sessionAnchorId } from './core/types.js';
+import { createPlatformSessionContext, sessionKey, sessionAnchorId } from './core/types.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -79,7 +88,17 @@ import {
   sweepGlobalBotmuxSkills,
   writableTerminalLinkFor,
 } from './core/worker-pool.js';
-import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner, setBotRenamer } from './core/dashboard-ipc-server.js';
+import {
+  ipcRoute,
+  jsonRes,
+  readJsonBody,
+  setBotName,
+  setLarkAppId,
+  setPlatformRuntime,
+  startIpcServer,
+  setWorkflowRunner,
+  setBotRenamer,
+} from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
@@ -107,6 +126,7 @@ import {
   rememberLastCliInput,
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
+  setSessionManagerPlatformRuntime,
 } from './core/session-manager.js';
 import { triggerSessionTurn } from './core/trigger-session.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
@@ -115,6 +135,15 @@ import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import type { CardActionData, CardHandlerDeps } from './im/lark/card-handler.js';
+import { LarkPlatformInstanceMismatchError, LarkPlatformRuntime } from './im/lark/runtime.js';
+import { stopPlatformRuntimeWithRetry } from './im/runtime-lifecycle.js';
+import {
+  requirePlatformCapability,
+  samePlatformInstance,
+  type PlatformCapabilities,
+  type PlatformMention,
+  type PlatformSender,
+} from './im/platform.js';
 import {
   executeWorkflowCommand,
   parseWorkflowCommand,
@@ -144,10 +173,14 @@ import {
 } from './im/lark/workflow-progress-card.js';
 import { EventLog as WorkflowEventLog } from './workflows/events/append.js';
 import { replay as replayWorkflow } from './workflows/events/replay.js';
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, writeBotInfoFile, canOperate, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext } from './im/lark/event-dispatcher.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
-import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
+import {
+  learnFromMentions as learnFromLarkMentions,
+  resolveSender as resolveLarkSender,
+  flushIdentityCacheSync,
+} from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentPrompt, buildDocWatchWarmupPrompt } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
@@ -239,6 +272,165 @@ import type { TriggerRequest, TriggerResponse } from './services/trigger-types.j
 
 const activeSessions = new Map<string, DaemonSession>();
 const workflowEventWatchers = new Map<string, WorkflowEventWatcher>();
+let activePlatformRuntime: LarkPlatformRuntime | undefined;
+
+function larkPlatformContext(
+  larkAppId: string,
+  chatId: string,
+  chatType: 'group' | 'p2p',
+  scope: 'thread' | 'chat',
+  rootMessageId: string,
+) {
+  return createPlatformSessionContext(
+    { platform: 'lark', instanceId: larkAppId },
+    chatId,
+    chatType,
+    scope,
+    rootMessageId,
+  );
+}
+
+function runtimeForLarkApp(larkAppId: string): LarkPlatformRuntime | undefined {
+  const runtime = activePlatformRuntime;
+  if (!runtime) return undefined;
+  const received = { platform: 'lark' as const, instanceId: larkAppId };
+  if (!samePlatformInstance(runtime.instance, received)) {
+    throw new LarkPlatformInstanceMismatchError(runtime.instance, received);
+  }
+  return runtime;
+}
+
+async function sendMessage(
+  larkAppId: string,
+  chatId: string,
+  content: string,
+  msgType: string = 'text',
+  uuid?: string,
+  hookContext?: Record<string, unknown>,
+): Promise<string> {
+  return sendPlatformMessage(larkAppId, chatId, content, msgType, hookContext, 'group', uuid);
+}
+
+async function replyMessage(
+  larkAppId: string,
+  messageId: string,
+  content: string,
+  msgType: string = 'text',
+  replyInThread: boolean = false,
+  uuid?: string,
+  hookContext?: Record<string, unknown>,
+): Promise<string> {
+  const runtime = runtimeForLarkApp(larkAppId);
+  if (!runtime) return replyLarkMessage(larkAppId, messageId, content, msgType, replyInThread, uuid, hookContext);
+  const target = { instance: { platform: 'lark' as const, instanceId: larkAppId }, messageId };
+  const options = { contentType: msgType, inThread: replyInThread, idempotencyKey: uuid, context: hookContext };
+  const ref = msgType === 'interactive'
+    ? await runtime.cards.replyCard(target, { payload: content }, options)
+    : await runtime.messaging.replyMessage(target, content, options);
+  return ref.messageId;
+}
+
+async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
+  const runtime = runtimeForLarkApp(larkAppId);
+  if (!runtime) return addLarkReaction(larkAppId, messageId, emojiType);
+  return runtime.reactions.addReaction(
+    { instance: { platform: 'lark', instanceId: larkAppId }, messageId },
+    emojiType,
+  );
+}
+
+async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
+  const runtime = runtimeForLarkApp(larkAppId);
+  if (!runtime) return updateLarkMessage(larkAppId, messageId, cardJson);
+  await runtime.cards.updateCard(
+    { instance: { platform: 'lark', instanceId: larkAppId }, messageId },
+    { payload: cardJson },
+  );
+}
+
+async function sendUserMessage(
+  larkAppId: string,
+  openId: string,
+  content: string,
+  msgType: string = 'text',
+): Promise<string> {
+  const runtime = runtimeForLarkApp(larkAppId);
+  if (!runtime) return sendLarkUserMessage(larkAppId, openId, content, msgType);
+  if (msgType === 'interactive') requirePlatformCapability(runtime, 'cards');
+  const ref = await runtime.directMessages.sendDirectMessage(openId, content, { contentType: msgType });
+  return ref.messageId;
+}
+
+async function resolveSender(
+  larkAppId: string,
+  openId: string | undefined,
+  senderType: string | undefined,
+  hint?: { name?: string; type?: 'user' | 'bot' },
+): Promise<PlatformSender | undefined> {
+  const runtime = runtimeForLarkApp(larkAppId);
+  if (!runtime) return resolveLarkSender(larkAppId, openId, senderType, hint);
+  if (!openId) return undefined;
+  const type = hint?.type ?? (senderType === 'app' || senderType === 'bot' ? 'bot' : 'user');
+  return runtime.identity.resolveSender(openId, type, hint?.name ? { name: hint.name } : undefined);
+}
+
+function learnFromMentions(larkAppId: string, mentions?: readonly PlatformMention[]): void {
+  if (!mentions || mentions.length === 0) return;
+  const runtime = runtimeForLarkApp(larkAppId);
+  if (!runtime) {
+    learnFromLarkMentions(larkAppId, mentions as any);
+    return;
+  }
+  runtime.identity.learnMentions(mentions);
+}
+
+async function sendPlatformMessage(
+  larkAppId: string,
+  chatId: string,
+  content: string,
+  msgType: string,
+  hookContext?: Record<string, unknown>,
+  chatType: 'group' | 'p2p' = 'group',
+  uuid?: string,
+): Promise<string> {
+  const runtime = runtimeForLarkApp(larkAppId);
+  if (!runtime) return sendLarkMessage(larkAppId, chatId, content, msgType, uuid, hookContext);
+  const conversation = {
+    instance: { platform: 'lark', instanceId: larkAppId },
+    chatId,
+    conversationType: chatType === 'p2p' ? 'direct' : 'group',
+    scope: 'chat',
+    anchorId: chatId,
+  } as const;
+  const options = { contentType: msgType, idempotencyKey: uuid, context: hookContext };
+  const ref = msgType === 'interactive'
+    ? await runtime.cards.sendCard(conversation, { payload: content }, options)
+    : await runtime.messaging.sendMessage(conversation, content, options);
+  return ref.messageId;
+}
+
+async function platformReplyMessage(
+  larkAppId: string,
+  messageId: string,
+  content: string,
+  msgType: string,
+  replyInThread: boolean,
+  hookContext?: Record<string, unknown>,
+): Promise<string> {
+  const runtime = runtimeForLarkApp(larkAppId);
+  if (!runtime) return replyLarkMessage(larkAppId, messageId, content, msgType, replyInThread, undefined, hookContext);
+  return replyMessage(larkAppId, messageId, content, msgType, replyInThread, undefined, hookContext);
+}
+
+async function platformAddReaction(
+  larkAppId: string,
+  messageId: string,
+  emojiType: string,
+): Promise<string> {
+  const runtime = runtimeForLarkApp(larkAppId);
+  if (!runtime) return addLarkReaction(larkAppId, messageId, emojiType);
+  return addReaction(larkAppId, messageId, emojiType);
+}
 
 type VcMeetingDaemonSession = {
   larkAppId: string;
@@ -1125,7 +1317,7 @@ export async function noteTurnReceived(
   // so a registered entry is always in place before its own turn can go idle.
   let reactionId: string;
   try {
-    reactionId = await addReaction(ds.larkAppId, triggerMessageId, receivedReactionEmoji ?? receivedReactionEmojiFor(ds));
+    reactionId = await platformAddReaction(ds.larkAppId, triggerMessageId, receivedReactionEmoji ?? receivedReactionEmojiFor(ds));
   } catch (err) {
     logger.debug(`[reaction] received add failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
     return;
@@ -1181,20 +1373,20 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
       // (drives the real sessionReply) and test/reply-target-fallback.test.ts
       // (the resolveSessionReplyTarget × fallbackTurnId composition it relies on).
       const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds, turnId));
-      if (target.mode === 'thread') return replyMessage(appId, target.rootMessageId, content, msgType, true, undefined, hookContext);
+      if (target.mode === 'thread') return platformReplyMessage(appId, target.rootMessageId, content, msgType, true, hookContext);
       if (ds.session.rootMessageId) {
         const mode = await getChatMode(appId, chatId, { forceRefresh: true });
         if (mode === 'topic') {
           logger.warn(`[routing] Chat-scope session ${ds.session.sessionId.substring(0, 8)} is now topic-mode; replying in original thread ${ds.session.rootMessageId.substring(0, 12)}`);
-          return replyMessage(appId, ds.session.rootMessageId, content, msgType, true, undefined, hookContext);
+          return platformReplyMessage(appId, ds.session.rootMessageId, content, msgType, true, hookContext);
         }
       }
     }
-    return sendMessage(appId, chatId, content, msgType, undefined, hookContext);
+    return sendPlatformMessage(appId, chatId, content, msgType, hookContext, ds?.chatType);
   }
 
   // Thread-scope (or unknown / legacy): reply in thread.
-  return replyMessage(appId, anchor, content, msgType, true, undefined, hookContext);
+  return platformReplyMessage(appId, anchor, content, msgType, true, hookContext);
 }
 
 // Test seams: drive the real sessionReply (the chat-scope thread/top-level
@@ -1407,6 +1599,9 @@ function removePidFile(): void {
 const DAEMON_REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
 
 interface DaemonDescriptor {
+  platform: 'lark';
+  instanceId: string;
+  capabilities: PlatformCapabilities;
   larkAppId: string;
   botName: string;
   /** CLI adapter id from bots.json, used by dashboard roster before any sessions exist. */
@@ -2365,6 +2560,8 @@ const commandDeps: CommandHandlerDeps = {
   getActiveCount,
   lastRepoScan,
   prewarmDocCommentSession,
+  sendMessage,
+  sendDirectMessage: sendUserMessage,
 };
 
 /**
@@ -2967,6 +3164,8 @@ ipcRoute('GET', '/api/adopt-session/:pid', (_req, res, params) => {
       return jsonRes(res, 200, {
         sessionId: ds.session.sessionId,
         chatId: ds.chatId,
+        platform: ds.platform.instance.platform,
+        instanceId: ds.platform.instance.instanceId,
         larkAppId: ds.larkAppId,
         rootMessageId: sessionAnchorId(ds),
       });
@@ -6464,6 +6663,7 @@ async function startInitialPassthroughSession(args: {
   const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
   const ds: DaemonSession = {
     session,
+    platform: larkPlatformContext(larkAppId, chatId, chatType, scope, session.rootMessageId),
     worker: null,
     workerPort: null,
     workerToken: null,
@@ -6760,6 +6960,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       sessionStore.updateSession(session);
       activeSessions.set(sessionKey(anchor, larkAppId), {
         session,
+        platform: larkPlatformContext(larkAppId, chatId, chatType, scope, session.rootMessageId),
         worker: null,
         workerPort: null,
         workerToken: null,
@@ -6785,7 +6986,12 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   }
 
   // Download attachments
-  const { attachments, needLogin } = await downloadResources(larkAppId, messageId, resources);
+  const { attachments, needLogin } = await downloadResources(
+    larkAppId,
+    messageId,
+    resources,
+    runtimeForLarkApp(larkAppId),
+  );
   if (attachments.length > 0) {
     parsed.attachments = attachments;
   }
@@ -6849,6 +7055,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
 
   const ds: DaemonSession = {
     session,
+    platform: larkPlatformContext(larkAppId, chatId, chatType, scope, session.rootMessageId),
     worker: null,
     workerPort: null,
     workerToken: null,
@@ -7070,6 +7277,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
 
     const ds: DaemonSession = {
       session,
+      platform: larkPlatformContext(larkAppId, chatId, chatType, scope, session.rootMessageId),
       worker: null,
       workerPort: null,
       workerToken: null,
@@ -7245,7 +7453,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // anchor" all return early; routing them through resolveSender first would
   // tack the 800ms budget onto paths that never see the sender tag. Use the
   // helper below at every actual injection point.
-  let threadSenderCached: import('./im/lark/identity-cache.js').ResolvedSender | undefined;
+  let threadSenderCached: PlatformSender | undefined;
   let threadSenderResolved = false;
   const getThreadSender = async (): Promise<typeof threadSenderCached> => {
     if (threadSenderResolved) return threadSenderCached;
@@ -7467,6 +7675,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         sessionStore.updateSession(session);
         activeSessions.set(sessionKey(anchor, larkAppId), {
           session,
+          platform: larkPlatformContext(larkAppId, threadChatId, ctxChatType, scope, session.rootMessageId),
           worker: null,
           workerPort: null,
           workerToken: null,
@@ -7551,7 +7760,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 
   // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
-  const { attachments, needLogin } = await downloadResources(effectiveAppId, parsed.messageId, resources);
+  const { attachments, needLogin } = await downloadResources(
+    effectiveAppId,
+    parsed.messageId,
+    resources,
+    runtimeForLarkApp(effectiveAppId),
+  );
   if (attachments.length > 0) {
     parsed.attachments = attachments;
   }
@@ -7598,7 +7812,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // pure duplication. A differing sender still gets attributed so the CLI can
     // tell multi-user buffered messages apart after repo selection unlocks.
     const followUpSender = await getThreadSender();
-    if (followUpSender?.openId && followUpSender.openId !== ds.pendingSender?.openId) {
+    if (followUpSender?.id && followUpSender.id !== ds.pendingSender?.id) {
       // This buffer folds into the opening <user_message> after repo selection,
       // so pair the foreign sender tag with the cursor anti-echo note: without
       // the adjacent note a cursor session sees an inline ou_xxx:name with no
@@ -7683,6 +7897,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     setDirectChatDisplayNameFromSender(session, autoCreateChatType, autoCreateSender);
     const newDs: DaemonSession = {
       session,
+      platform: larkPlatformContext(larkAppId, autoCreateChatId, autoCreateChatType, scope, session.rootMessageId),
       worker: null,
       workerPort: null,
       workerToken: null,
@@ -7906,6 +8121,7 @@ async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx
 
   const ds: DaemonSession = {
     session,
+    platform: larkPlatformContext(larkAppId, virtualChatId, 'group', 'chat', virtualAnchor),
     worker: null,
     workerPort: null,
     workerToken: null,
@@ -8269,13 +8485,48 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   const cfg = botConfigs[idx];
   registerBot(cfg);
+  const platformRuntime: LarkPlatformRuntime = new LarkPlatformRuntime({
+    larkAppId: cfg.larkAppId,
+    larkAppSecret: cfg.larkAppSecret,
+    brand: cfg.brand,
+    eventHandlers: {
+      handleCardAction: (data, appId) => handleCardAction(data, cardDeps, appId),
+      handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
+      handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
+      handleBotAdded: (chatId, operatorOpenId, appId) => handleBotAdded(chatId, operatorOpenId, appId),
+      handleDocComment: (ctx) => handleDocComment(ctx),
+      handleVcMeetingPush: (ctx) => handleVcMeetingPush(ctx),
+      beforeSessionTurn: (_data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(ctx),
+      isSessionOwner: (anchor, appId) => appId === platformRuntime.instance.instanceId
+        && activeSessions.has(sessionKey(anchor, platformRuntime.instance)),
+      resolveReplyThreadAlias: (rootId, chatId, appId) => findChatReplyAlias(rootId, chatId, appId),
+      // Chat was converted 普通群 → 话题群 while we held a chat-scope session.
+      // Evict only this runtime instance's stale routing entry. The worker stays
+      // alive until the canonical /close path tears it down.
+      onChatModeConverted: (chatId, appId) => {
+        if (appId !== platformRuntime.instance.instanceId) return;
+        const key = sessionKey(chatId, platformRuntime.instance);
+        const evicted = activeSessions.delete(key);
+        logger.info(`[chat-mode-converted] ${chatId.substring(0, 12)} evicted=${evicted}; worker (if any) keeps running until /close`);
+      },
+    },
+  });
+  if (activePlatformRuntime) {
+    throw new Error(
+      `Platform runtime already bound: ${activePlatformRuntime.instance.platform}:`
+      + activePlatformRuntime.instance.instanceId,
+    );
+  }
+  activePlatformRuntime = platformRuntime;
+  setPlatformRuntime(platformRuntime);
+  setSessionManagerPlatformRuntime(platformRuntime);
   // 启动即为本 bot 的 CLI 预装环境（skills + askUserQuestion hook + 兜底 skill）。
   // 关键：adopt 路径会跳过 ensureCliSkills，若重启后第一次就是 adopt 一个外部
   // claude 会话，必须保证此时全局 ~/.claude/settings.json 已带 hook——否则"全局
   // hook 适配 adopt"不成立。这里幂等、best-effort，不阻塞启动。
   try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride); }
   catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
-  sessionStore.init(cfg.larkAppId);
+  sessionStore.init(platformRuntime.instance);
   chatFirstSeenStore.init(cfg.larkAppId);
   // Watch schedules.json for external writes (e.g. `botmux schedule add`
   // running in a separate node process) so dashboard event bus stays in sync.
@@ -8294,6 +8545,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // and watching for mtime updates (heartbeat) / file removal (shutdown).
   const ipcPort = config.dashboard.ipcBasePort + idx;
   const desc: DaemonDescriptor = {
+    platform: platformRuntime.instance.platform,
+    instanceId: platformRuntime.instance.instanceId,
+    capabilities: platformRuntime.capabilities,
     larkAppId: cfg.larkAppId,
     botName: cfg.displayName ?? cfg.larkAppId,
     cliId: cfg.cliId,
@@ -8365,6 +8619,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
+    platformRuntime,
   });
   // Expose the activeSessions Map (owned by daemon) to worker-pool readers,
   // so dashboard IPC and other consumers can list/lookup live sessions.
@@ -8529,31 +8784,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       );
     }
 
-    // Start event dispatcher for this bot
-    startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, {
-      handleCardAction: (data, appId) => handleCardAction(data, cardDeps, appId),
-      handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
-      handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
-      handleBotAdded: (chatId, operatorOpenId, appId) => handleBotAdded(chatId, operatorOpenId, appId),
-      handleDocComment: (ctx) => handleDocComment(ctx),
-      handleVcMeetingPush: (ctx) => handleVcMeetingPush(ctx),
-      beforeSessionTurn: (_data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(ctx),
-      isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
-      resolveReplyThreadAlias: (rootId, chatId, appId) => findChatReplyAlias(rootId, chatId, appId),
-      // Chat was converted 普通群 → 话题群 while we held a chat-scope session.
-      // Evict it from the routing map so subsequent inbound messages can land
-      // on a fresh thread-scope session (dispatcher already rerouted this turn
-      // to handleNewTopic). The worker is left running on purpose: the user may
-      // still have its web terminal open, and `/close` is the canonical cleanup
-      // path. Scheduler tasks tied to this session keep their `scope='chat'`
-      // semantics — that's an edge case worth following up on, not blocking
-      // the main fix.
-      onChatModeConverted: (chatId, appId) => {
-        const key = sessionKey(chatId, appId);
-        const evicted = activeSessions.delete(key);
-        logger.info(`[chat-mode-converted] ${chatId.substring(0, 12)} evicted=${evicted}; worker (if any) keeps running until /close`);
-      },
-    }, normalizeBrand(cfg.brand));
+    // Start the single platform runtime at the exact legacy dispatcher seam,
+    // after permissions/identity setup and without adding work to ACK paths.
+    await platformRuntime.start();
 
     const vcCfg = effectiveVcMeetingAgentConfig(cfg.larkAppId);
     if (vcCfg) restoreVcMeetingRuntimeSessionsForBot(cfg.larkAppId, vcCfg);
@@ -8701,6 +8934,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     shuttingDown = true;
     setSessionLifecycleShutdown(true);
     logger.info(`Daemon shutting down... (active: ${getActiveCount()})`);
+    let platformRuntimeStopped = await stopPlatformRuntimeWithRetry(
+      platformRuntime,
+      2,
+      (err, attempt, maxAttempts) => {
+        logger.warn(
+          `[platform-runtime] stop attempt ${attempt}/${maxAttempts} failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      },
+    );
+    if (platformRuntimeStopped && activePlatformRuntime === platformRuntime) {
+      activePlatformRuntime = undefined;
+      setPlatformRuntime(undefined);
+      setSessionManagerPlatformRuntime(undefined);
+    }
     scheduler.stopScheduler();
     stopMaintenance();
     stopCliRuntimeUpdateMonitor();
@@ -8775,6 +9023,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     flushIdentityCacheSync();
 
     removePidFile();
+    // If both early close attempts failed, keep the runtime wired while workers
+    // drain so any late event still uses the same instance boundary. Make one
+    // final close attempt immediately before exit, then clear process-local
+    // bindings regardless because no further work can be accepted.
+    if (!platformRuntimeStopped) {
+      platformRuntimeStopped = await stopPlatformRuntimeWithRetry(
+        platformRuntime,
+        1,
+        (err) => logger.warn(
+          `[platform-runtime] final stop attempt failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        ),
+      );
+    }
+    if (activePlatformRuntime === platformRuntime) {
+      activePlatformRuntime = undefined;
+      setPlatformRuntime(undefined);
+      setSessionManagerPlatformRuntime(undefined);
+    }
     process.exit(0);
   };
 

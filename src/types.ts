@@ -1,6 +1,7 @@
 import type { BackendType } from './adapters/backend/types.js';
 import type { BotSkillPolicy } from './core/skills/types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
+import type { PlatformAttachment, PlatformMention } from './im/platform.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
 
 /** Runtime status the worker derives from screen content. */
@@ -205,13 +206,11 @@ export interface Session {
   };
 }
 
-export interface LarkAttachment {
-  type: 'image' | 'file';
-  path: string;       // 本地文件绝对路径
-  name: string;       // 文件名
-}
+/** @deprecated Lark compatibility alias. Core code uses PlatformAttachment. */
+export interface LarkAttachment extends PlatformAttachment {}
 
-export interface LarkMention {
+/** Lark-native mention data plus its platform-neutral projection. */
+export interface LarkMention extends PlatformMention {
   key: string;        // e.g. "@_user_1"
   name: string;       // display name
   openId?: string;    // open_id of the mentioned user/bot
