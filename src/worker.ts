@@ -81,7 +81,7 @@ import {
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
-import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
@@ -4351,6 +4351,25 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   let effectiveResume = cfg.resume ?? false;
   let effectiveCliSessionId = cfg.cliSessionId;
   let effectiveAdapterSessionId = adapterSessionId;
+  // Claude-family transcripts are scoped by cwd. `/cd` keeps the same Botmux /
+  // CLI session id, so mirror the newest native transcript into the new cwd's
+  // project directory before the adapter probes or launches `--resume`.
+  // `claudeDataDir` is already the effective root here (global, per-bot read
+  // isolation root, or a preserved sandbox upper), so this never crosses bot
+  // isolation boundaries.
+  if (effectiveResume && !willReattachPersistent && claudeDataDir) {
+    const resumeSessionId = effectiveCliSessionId ?? effectiveAdapterSessionId;
+    try {
+      const synced = syncClaudeResumeTargetToCwd(resumeSessionId, cfg.workingDir, claudeDataDir);
+      if (synced.copied && synced.sourcePath) {
+        log(`Claude resume transcript synced for cwd change: ${synced.sourcePath} → ${synced.targetPath}`);
+      }
+    } catch (err) {
+      // Preserve the existing fail-safe: the adapter probe / two-tier fallback
+      // below still decides whether resume is possible.
+      log(`WARN Claude resume transcript sync failed: ${(err as Error).message}`);
+    }
+  }
   const tier2ForceFresh = effectiveResume && consecutiveInWorkerRestarts >= 2;
   let tier1ProbeFalse = false;
   if (effectiveResume && !tier2ForceFresh && !willReattachPersistent) {

@@ -24,7 +24,7 @@ import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
+import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -1262,7 +1262,14 @@ export async function handleCommand(
           break;
         }
         const resolvedPath = validation.resolvedPath;
-        killWorker(ds);
+        // Persistent backends can cold-resume without treating a cwd switch as
+        // a real session close. This also preserves a sandbox upper long enough
+        // for the next worker to relocate Claude's cwd-scoped transcript.
+        // Adopted sessions are observers of a user-owned CLI and keep the old
+        // detach/kill behavior; PTY falls back to killWorker, while its normal
+        // on-disk transcript remains available for the resume-sync preflight.
+        const suspended = !ds.adoptedFrom && suspendWorker(ds, 'working_dir_changed');
+        if (!suspended) killWorker(ds);
         ds.workingDir = targetPath;
         ds.session.workingDir = targetPath;
         sessionStore.updateSession(ds.session);

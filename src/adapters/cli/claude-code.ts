@@ -1,4 +1,4 @@
-import { existsSync, statSync, openSync, readSync, closeSync, readFileSync, readdirSync, readlinkSync, realpathSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, statSync, openSync, readSync, closeSync, readFileSync, readdirSync, readlinkSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { resolveCommand } from './registry.js';
@@ -48,6 +48,55 @@ export function claudeJsonlPathForSession(sessionId: string, cwd: string, dataDi
 export function claudeProjectDir(cwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string {
   const projectHash = realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
   return join(dataDir, 'projects', projectHash);
+}
+
+export interface ClaudeResumeTargetSyncResult {
+  targetPath: string;
+  sourcePath?: string;
+  copied: boolean;
+}
+
+/**
+ * Claude stores a session transcript under the hash of the cwd where that
+ * session last ran. Botmux's `/cd` deliberately keeps the logical session id,
+ * so a later `claude --resume <id>` from the new cwd would otherwise look in a
+ * different project directory and fail twice before falling back to a clean
+ * session.
+ *
+ * Before a cold resume, find the newest copy of this exact session id anywhere
+ * under the effective Claude data root and mirror it into the new cwd's project
+ * directory. Copies are retained in older project directories because they are
+ * useful native Claude history; choosing the newest candidate on every resume
+ * prevents a later `/cd` back to an earlier cwd from reviving a stale branch.
+ */
+export function syncClaudeResumeTargetToCwd(
+  sessionId: string,
+  cwd: string,
+  dataDir: string = DEFAULT_CLAUDE_DATA_DIR,
+): ClaudeResumeTargetSyncResult {
+  const targetPath = claudeJsonlPathForSession(sessionId, cwd, dataDir);
+  const projectsDir = join(dataDir, 'projects');
+  if (!existsSync(projectsDir)) return { targetPath, copied: false };
+
+  const candidates: Array<{ path: string; mtimeMs: number; size: number }> = [];
+  for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const path = join(projectsDir, entry.name, `${sessionId}.jsonl`);
+    if (!existsSync(path)) continue;
+    try {
+      const stat = statSync(path);
+      if (stat.isFile()) candidates.push({ path, mtimeMs: stat.mtimeMs, size: stat.size });
+    } catch { /* candidate disappeared while scanning */ }
+  }
+  if (candidates.length === 0) return { targetPath, copied: false };
+
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || b.size - a.size || a.path.localeCompare(b.path));
+  const newest = candidates[0];
+  if (newest.path === targetPath) return { targetPath, sourcePath: newest.path, copied: false };
+
+  mkdirSync(dirname(targetPath), { recursive: true });
+  copyFileSync(newest.path, targetPath);
+  return { targetPath, sourcePath: newest.path, copied: true };
 }
 
 /** botmux ships its built-in skills as a Claude Code plugin here and injects it

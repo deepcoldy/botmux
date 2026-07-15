@@ -12,10 +12,10 @@
  * Run:  pnpm vitest run test/claude-code-cwd.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, symlinkSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, symlinkSync, rmSync, realpathSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
-import { claudeJsonlPathForSession } from '../src/adapters/cli/claude-code.js';
+import { claudeJsonlPathForSession, syncClaudeResumeTargetToCwd } from '../src/adapters/cli/claude-code.js';
 
 const SID = '01234567-89ab-cdef-0123-456789abcdef';
 
@@ -67,5 +67,72 @@ describe('claudeJsonlPathForSession: symlink-aware cwd resolution', () => {
     const ghost = join(tmpRoot, 'never-existed');
     const got = claudeJsonlPathForSession(SID, ghost);
     expect(got).toBe(expectedProjectFor(ghost));
+  });
+});
+
+describe('syncClaudeResumeTargetToCwd', () => {
+  it('copies a cwd-scoped transcript into the new cwd before resume', () => {
+    const dataDir = join(tmpRoot, 'claude-data');
+    const oldCwd = join(tmpRoot, 'old-project');
+    const newCwd = join(tmpRoot, 'new-project');
+    mkdirSync(oldCwd);
+    mkdirSync(newCwd);
+    const source = claudeJsonlPathForSession(SID, oldCwd, dataDir);
+    mkdirSync(join(source, '..'), { recursive: true });
+    writeFileSync(source, '{"turn":"old-context"}\n');
+
+    const result = syncClaudeResumeTargetToCwd(SID, newCwd, dataDir);
+
+    expect(result).toEqual({
+      targetPath: claudeJsonlPathForSession(SID, newCwd, dataDir),
+      sourcePath: source,
+      copied: true,
+    });
+    expect(readFileSync(result.targetPath, 'utf8')).toBe('{"turn":"old-context"}\n');
+  });
+
+  it('refreshes a stale target from the newest cwd copy', () => {
+    const dataDir = join(tmpRoot, 'claude-data');
+    const oldCwd = join(tmpRoot, 'old-project');
+    const newCwd = join(tmpRoot, 'new-project');
+    mkdirSync(oldCwd);
+    mkdirSync(newCwd);
+    const source = claudeJsonlPathForSession(SID, oldCwd, dataDir);
+    const target = claudeJsonlPathForSession(SID, newCwd, dataDir);
+    mkdirSync(join(source, '..'), { recursive: true });
+    mkdirSync(join(target, '..'), { recursive: true });
+    writeFileSync(source, 'newest-context');
+    writeFileSync(target, 'stale-context');
+    const now = Date.now() / 1000;
+    utimesSync(target, now - 20, now - 20);
+    utimesSync(source, now, now);
+
+    const result = syncClaudeResumeTargetToCwd(SID, newCwd, dataDir);
+
+    expect(result.copied).toBe(true);
+    expect(result.sourcePath).toBe(source);
+    expect(readFileSync(target, 'utf8')).toBe('newest-context');
+  });
+
+  it('keeps the target untouched when it is already the newest copy', () => {
+    const dataDir = join(tmpRoot, 'claude-data');
+    const oldCwd = join(tmpRoot, 'old-project');
+    const newCwd = join(tmpRoot, 'new-project');
+    mkdirSync(oldCwd);
+    mkdirSync(newCwd);
+    const source = claudeJsonlPathForSession(SID, oldCwd, dataDir);
+    const target = claudeJsonlPathForSession(SID, newCwd, dataDir);
+    mkdirSync(join(source, '..'), { recursive: true });
+    mkdirSync(join(target, '..'), { recursive: true });
+    writeFileSync(source, 'stale-context');
+    writeFileSync(target, 'current-context');
+    const now = Date.now() / 1000;
+    utimesSync(source, now - 20, now - 20);
+    utimesSync(target, now, now);
+
+    const result = syncClaudeResumeTargetToCwd(SID, newCwd, dataDir);
+
+    expect(result).toEqual({ targetPath: target, sourcePath: target, copied: false });
+    expect(readFileSync(target, 'utf8')).toBe('current-context');
   });
 });

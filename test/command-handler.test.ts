@@ -240,6 +240,7 @@ vi.mock('../src/utils/logger.js', () => ({
 
 vi.mock('../src/core/worker-pool.js', () => ({
   killWorker: vi.fn(),
+  suspendWorker: vi.fn(() => false),
   forkWorker: vi.fn(),
   forkAdoptWorker: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.42'),
@@ -411,7 +412,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { killWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
+import { killWorker, suspendWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, ensureSessionWhiteboard, getAvailableBots } from '../src/core/session-manager.js';
@@ -1428,6 +1429,20 @@ describe('handleCommand', () => {
       expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('工作目录已切换');
+    });
+
+    it('should cold-suspend a persistent worker so cwd-scoped history can resume', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(suspendWorker).mockReturnValueOnce(true);
+
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /home/testuser/other-project'), deps, LARK_APP_ID);
+
+      expect(suspendWorker).toHaveBeenCalledWith(ds, 'working_dir_changed');
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe('/home/testuser/other-project');
     });
 
     it('should reject path that exists but is not a directory', async () => {
