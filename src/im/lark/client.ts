@@ -671,6 +671,10 @@ export async function getMessageDetail(
   const userCardContent = options.userCardContent ?? true;
   const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
     ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
+    // Opt into server-side sender names (sender_name / sender_i18n_names, for
+    // user AND bot senders); without it the server omits them. Matters here for
+    // merge_forward sub-messages, whose senders appear nowhere else.
+    with_sender_name: 'true',
   });
   if (res.code !== 0) {
     throw new Error(`Failed to get message: ${res.msg} (code: ${res.code})`);
@@ -1014,6 +1018,7 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
       container_id: threadId,
       page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
       sort_type: 'ByCreateTimeAsc',
+      with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
 
@@ -1052,6 +1057,7 @@ export async function listChatMessages(
       container_id: chatId,
       page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
       sort_type: 'ByCreateTimeDesc',
+      with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
 
@@ -1100,6 +1106,7 @@ export async function listChatMessagesUntil(
       container_id: chatId,
       page_size: pageSize,
       sort_type: 'ByCreateTimeDesc',
+      with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
 
@@ -1188,6 +1195,7 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
       container_id: chatId,
       page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
       sort_type: 'ByCreateTimeDesc',
+      with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
 

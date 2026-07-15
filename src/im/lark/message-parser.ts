@@ -419,11 +419,18 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
 export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
   const msgType = msg.msg_type ?? 'text';
   const rawContent = msg.body?.content ?? '';
+  // sender_name is only present when the fetch opted in via with_sender_name=true
+  // (all client.ts message read paths do). Covers bot senders too — the one case
+  // local rosters can't resolve for third-party bots.
+  const senderName = typeof msg.sender?.sender_name === 'string' && msg.sender.sender_name.trim()
+    ? msg.sender.sender_name.trim()
+    : undefined;
   return {
     messageId: msg.message_id ?? '',
     rootId: msg.root_id ?? msg.thread_id ?? '',
     senderId: msg.sender?.id ?? '',
     senderType: msg.sender?.sender_type ?? 'unknown',
+    ...(senderName ? { senderName } : {}),
     msgType,
     content: extractTextContent(msgType, normalizeApiMessageContent(msgType, rawContent), undefined, numberer),
     createTime: msg.create_time ?? '',

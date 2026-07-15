@@ -250,6 +250,10 @@ export interface LarkMessage {
    *  messages). */
   senderUnionId?: string;
   senderType: string;
+  /** Server-provided sender display name (works for user AND bot senders).
+   *  Only populated on API-fetched messages read with `with_sender_name=true`
+   *  (history/quoted paths); live receive_v1 events don't carry it. */
+  senderName?: string;
   msgType: string;
   content: string;
   createTime: string;

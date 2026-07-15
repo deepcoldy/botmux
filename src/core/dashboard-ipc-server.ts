@@ -481,6 +481,9 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
         messageId: parsed.messageId,
         senderId: parsed.senderId,
         senderType: parsed.senderType,
+        // 服务端返回的发送者名（with_sender_name=true，bot 也有）。enrich 阶段
+        // 本地花名册/contact 解析不到时兜底用它——第三方 bot 不再是一串 open_id。
+        ...(parsed.senderName ? { senderName: parsed.senderName } : {}),
         msgType: parsed.msgType,
         content: parsed.content,
         // Lark create_time 是毫秒 epoch 字符串——规范成数字，前端 new Date 直接用
