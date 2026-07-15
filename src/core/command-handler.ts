@@ -6,7 +6,7 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId, getOwnerOpenId } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import { repoPickerScanOptions } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -588,6 +588,50 @@ async function handleRoleCommand(
   await sessionReply(rootId, t('role.help', undefined, loc));
 }
 
+/**
+ * Resolve the workingDir for a newly created scheduled task, mirroring the
+ * layered lookup used by the normal new-session spawn path (see
+ * `resolvePinnedWorkingDir` in daemon.ts) but STRICTLY read-only: it never
+ * triggers the defaultOncall auto-bind side effect (which writes to bots.json).
+ * Creating a schedule must not mutate oncall binding state.
+ *
+ * Priority:
+ *   1) existing session workingDir (ds.workingDir — already pinned via /cd or
+ *      a previously-applied oncall bind)
+ *   2) this bot/chat oncall binding (read-only findOncallChat, no auto-bind)
+ *   3) this bot's effective default working dir (defaultWorkingDir, or
+ *      defaultOncall.workingDir when Oncall 模式 is on)
+ *   4) legacy bot.config.workingDir
+ *   5) '~'
+ */
+function resolveScheduleWorkingDir(
+  ds: DaemonSession | undefined,
+  chatId: string,
+  larkAppId: string | undefined,
+): string {
+  // Layer 1: existing session dir already pinned.
+  if (ds?.workingDir) return ds.workingDir;
+
+  const appId = ds?.larkAppId ?? larkAppId;
+  const bot = appId ? getBot(appId) : getAllBots()[0];
+  if (!bot) return '~';
+
+  // Layer 2: oncall binding for this chat (read-only — does NOT auto-bind).
+  const oncallEntry = findOncallChat(bot.config.larkAppId, ds?.chatId ?? chatId);
+  if (oncallEntry?.workingDir) return oncallEntry.workingDir;
+
+  // Layer 3: effective default working dir (defaultWorkingDir or
+  // defaultOncall.workingDir). Read-only — never writes state.
+  const effectiveDefault = effectiveDefaultWorkingDir(bot.config);
+  if (effectiveDefault) return effectiveDefault;
+
+  // Layer 4: legacy workingDir field.
+  if (bot.config.workingDir) return bot.config.workingDir;
+
+  // Layer 5: home fallback.
+  return '~';
+}
+
 async function handleScheduleCommand(
   args: string,
   rootId: string,
@@ -677,7 +721,7 @@ async function handleScheduleCommand(
   const parsed = scheduler.parseNaturalSchedule(trimmed);
   if (parsed) {
     const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
-    const workingDir = ds?.workingDir ?? (ds?.larkAppId ? getBot(ds.larkAppId).config.workingDir ?? '~' : getAllBots()[0]?.config.workingDir ?? '~');
+    const workingDir = resolveScheduleWorkingDir(ds, chatId, larkAppId);
     const taskScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
     // "新话题" keyword → every fire opens a brand-new topic in a fresh session.
     const { deliver, prompt: schedPrompt } = scheduler.extractDeliveryMode(parsed.prompt);

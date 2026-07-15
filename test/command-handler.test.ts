@@ -91,6 +91,11 @@ vi.mock('../src/bot-registry.js', () => ({
       workingDirs: ['~/projects'],
     },
   })),
+  findOncallChat: vi.fn(() => undefined),
+  effectiveDefaultWorkingDir: vi.fn((cfg: any) =>
+    cfg?.defaultWorkingDir
+    || (cfg?.defaultOncall?.enabled ? cfg?.defaultOncall?.workingDir : undefined)
+    || undefined),
   readBotSkillPolicy: vi.fn((raw: unknown) => {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
     const r = raw as Record<string, unknown>;
@@ -147,6 +152,7 @@ vi.mock('../src/core/scheduler.js', () => ({
   parseSchedule: vi.fn(),
   getNextRun: vi.fn(),
   addTask: vi.fn(),
+  extractDeliveryMode: vi.fn((prompt: string) => ({ deliver: 'origin' as const, prompt })),
 }));
 
 vi.mock('../src/services/project-scanner.js', () => ({
@@ -415,7 +421,7 @@ import * as scheduler from '../src/core/scheduler.js';
 import { deleteMessage, sendMessage, listChatBotMembers } from '../src/im/lark/client.js';
 import { buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
-import { getAllBots, getBot } from '../src/bot-registry.js';
+import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 import { resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
 import { putDocSubscription, removeDocSubscription, listAllDocSubscriptions, getDocSubscription } from '../src/services/doc-subs-store.js';
@@ -2026,6 +2032,154 @@ describe('handleCommand', () => {
 
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('无法解析定时任务');
+    });
+
+    it('should inherit defaultWorkingDir (not legacy workingDir) when creating a schedule', async () => {
+      // Bot only configures defaultWorkingDir; legacy workingDir is unset.
+      // The schedule task must pick up defaultWorkingDir, NOT fall back to ~.
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+        botName: 'Claude',
+        config: {
+          larkAppId: id,
+          larkAppSecret: 'secret-1',
+          cliId: 'claude-code' as const,
+          defaultWorkingDir: '~/repo/oncall',
+          // Intentionally NO workingDir field
+        },
+      })) as any);
+      vi.mocked(findOncallChat).mockReturnValue(undefined);
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '10 10 * * *', display: '每日 10:10' },
+        prompt: '新话题 生成值班日报',
+        name: '新话题 生成值班日报',
+      });
+      vi.mocked(scheduler.extractDeliveryMode).mockReturnValue({
+        deliver: 'new-topic',
+        prompt: '生成值班日报',
+      });
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-new' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-27T10:10:00+08:00'));
+
+      const ds = makeDaemonSession({ workingDir: undefined });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每个工作日10:10 新话题 生成值班日报'), deps, LARK_APP_ID);
+
+      expect(scheduler.addTask).toHaveBeenCalledTimes(1);
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      // workingDir must be the bot's defaultWorkingDir, NOT ~
+      expect(callArgs.workingDir).toBe('~/repo/oncall');
+      expect(callArgs.workingDir).not.toBe('~');
+    });
+
+    it('should inherit defaultOncall.workingDir when Oncall mode is enabled', async () => {
+      // Bot configures defaultOncall.workingDir with enabled=true; no
+      // defaultWorkingDir, no legacy workingDir. Schedule must pick it up.
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+        botName: 'Claude',
+        config: {
+          larkAppId: id,
+          larkAppSecret: 'secret-1',
+          cliId: 'claude-code' as const,
+          defaultOncall: { enabled: true, workingDir: '~/codebase/dcar_bpm/roles/oncall' },
+        },
+      })) as any);
+      vi.mocked(findOncallChat).mockReturnValue(undefined);
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '10 10 * * *', display: '每日 10:10' },
+        prompt: '新话题 生成值班日报',
+        name: '新话题 生成值班日报',
+      });
+      vi.mocked(scheduler.extractDeliveryMode).mockReturnValue({
+        deliver: 'new-topic',
+        prompt: '生成值班日报',
+      });
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-oncall' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-27T10:10:00+08:00'));
+
+      const ds = makeDaemonSession({ workingDir: undefined });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每个工作日10:10 新话题 生成值班日报'), deps, LARK_APP_ID);
+
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.workingDir).toBe('~/codebase/dcar_bpm/roles/oncall');
+      expect(callArgs.workingDir).not.toBe('~');
+    });
+
+    it('should prefer ds.workingDir over bot defaults when creating a schedule', async () => {
+      // Session already has a pinned workingDir (e.g. via /cd); it must win
+      // over the bot's defaultWorkingDir.
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+        botName: 'Claude',
+        config: {
+          larkAppId: id,
+          larkAppSecret: 'secret-1',
+          cliId: 'claude-code' as const,
+          defaultWorkingDir: '~/repo/oncall',
+        },
+      })) as any);
+      vi.mocked(findOncallChat).mockReturnValue(undefined);
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 10 * * *', display: '每日 10:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      vi.mocked(scheduler.extractDeliveryMode).mockReturnValue({
+        deliver: 'origin',
+        prompt: '生成日报',
+      });
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-ds' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-27T10:00:00+08:00'));
+
+      const ds = makeDaemonSession({ workingDir: '/home/user/custom-dir' });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日10:00 生成日报'), deps, LARK_APP_ID);
+
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.workingDir).toBe('/home/user/custom-dir');
+    });
+
+    it('should read oncall binding (read-only) without triggering auto-bind side effect', async () => {
+      // An oncall binding exists for this chat — it must be used as the
+      // workingDir. We verify findOncallChat is consulted (read-only) and
+      // the bot's defaultWorkingDir is NOT consulted.
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+        botName: 'Claude',
+        config: {
+          larkAppId: id,
+          larkAppSecret: 'secret-1',
+          cliId: 'claude-code' as const,
+          defaultWorkingDir: '~/repo/oncall',
+        },
+      })) as any);
+      vi.mocked(findOncallChat).mockReturnValue({
+        chatId: CHAT_ID,
+        workingDir: '~/oncall/bound-dir',
+      });
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 10 * * *', display: '每日 10:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      vi.mocked(scheduler.extractDeliveryMode).mockReturnValue({
+        deliver: 'origin',
+        prompt: '生成日报',
+      });
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-oncall-bind' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-27T10:00:00+08:00'));
+
+      const ds = makeDaemonSession({ workingDir: undefined });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日10:00 生成日报'), deps, LARK_APP_ID);
+
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      // Oncall binding wins over bot defaults.
+      expect(callArgs.workingDir).toBe('~/oncall/bound-dir');
+      // findOncallChat must be called with the bot's appId and the chatId.
+      expect(findOncallChat).toHaveBeenCalledWith('app-1', CHAT_ID);
     });
   });
 
