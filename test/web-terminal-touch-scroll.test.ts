@@ -12,6 +12,12 @@ function scriptBlock(startMarker: string): string {
 }
 
 describe('web terminal touch scrolling', () => {
+  it('uses snapshot replacement for every Herdr CLI, including normal-buffer Codex', () => {
+    expect(workerSource).toContain('return backend instanceof HerdrBackend;');
+    expect(workerSource).toContain('if (be instanceof HerdrBackend) {');
+    expect(workerSource).toContain('if (backend instanceof HerdrBackend) {\n    backend.onSnapshot(relayHerdrWebSnapshot);');
+  });
+
   it('forces Herdr alternate-screen CLIs to remote-scroll after a snapshot-only refresh', () => {
     expect(workerSource).toContain("effectiveBackendType === 'herdr' && cliAdapter?.altScreen === true");
     expect(workerSource).toContain('var remoteScroll=${forceRemoteScroll};');

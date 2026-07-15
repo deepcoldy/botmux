@@ -2616,7 +2616,7 @@ const ALT_ENTER_RE = /\x1b\[\?(1049|1047|47)h/g;
 const ALT_EXIT_RE = /\x1b\[\?(1049|1047|47)l/g;
 
 function usesHerdrSnapshotWebHistory(): boolean {
-  return backend instanceof HerdrBackend && cliAdapter?.altScreen === true;
+  return backend instanceof HerdrBackend;
 }
 
 function relayHerdrWebSnapshot(snapshot: string): void {
@@ -4143,7 +4143,7 @@ function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurr
     const initial = be.captureCurrentScreen?.() ?? '';
     if (initial.length > 0) {
       onPtyData(initial);
-      if (be instanceof HerdrBackend && cliAdapter?.altScreen === true) {
+      if (be instanceof HerdrBackend) {
         relayHerdrWebSnapshot(initial);
       }
     }
@@ -5437,7 +5437,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   });
 
   backend.onData(onPtyData);
-  if (backend instanceof HerdrBackend && cliAdapter?.altScreen === true) {
+  if (backend instanceof HerdrBackend) {
     backend.onSnapshot(relayHerdrWebSnapshot);
   }
   backend.onExit((code, signal) => {
