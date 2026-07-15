@@ -57,7 +57,7 @@ try {
   } else {
     atomicWriteFileSync(wrapper, content, 0o755);
     console.log(`✅ 全局 botmux → 本 checkout（${cliScript}）`);
-    console.log('   下一步 `botmux restart` 即从本 checkout 重启 daemon。');
+    console.log('   下一步 `pnpm daemon:restart` 即从本 checkout 重启 daemon（避免 PATH 中的旧全局 botmux 抢先）。');
   }
 } catch (err) {
   console.warn(`⚠️  写 botmux wrapper 失败：${err.message}`);
