@@ -95,9 +95,8 @@ beforeEach(() => {
   mockedExecFileSync.mockReset();
   mockedSpawn.mockReset();
   fakeChildren.length = 0;
-  // Default: every spawn (including the bg `wait agent-status` watcher) gets
-  // a fake child whose lifecycle the test fully controls.
-  mockedSpawn.mockImplementation((() => makeFakeChild()) as any);
+  // Every spawned process gets a fake child whose lifecycle the test controls.
+  mockedSpawn.mockImplementation(() => makeFakeChild());
 });
 
 afterEach(() => {
@@ -107,15 +106,17 @@ afterEach(() => {
 // ─── Backend connection surface ────────────────────────────────────────────
 
 describe('HerdrBackend connection surface', () => {
-  it('isAvailable() returns true when `herdr --version` succeeds', () => {
-    mockedExecFileSync.mockImplementation((() => 'herdr 1.0\n') as any);
+  it('isAvailable() requires Herdr 0.7.2 or newer', () => {
+    mockedExecFileSync.mockReturnValue('herdr 0.7.2\n');
     expect(HerdrBackend.isAvailable()).toBe(true);
+    mockedExecFileSync.mockReturnValue('herdr 0.7.1\n');
+    expect(HerdrBackend.isAvailable()).toBe(false);
     const versionCall = mockedExecFileSync.mock.calls.find(c => (c[1] as string[]).includes('--version'));
     expect(versionCall).toBeDefined();
   });
 
   it('isAvailable() returns false when herdr binary is missing', () => {
-    mockedExecFileSync.mockImplementation((() => { throw new Error('ENOENT'); }) as any);
+    mockedExecFileSync.mockImplementation(() => { throw new Error('ENOENT'); });
     expect(HerdrBackend.isAvailable()).toBe(false);
   });
 
@@ -589,224 +590,110 @@ describe('HerdrBackend callbacks', () => {
       if (!observer?.killed) backend.kill();
     }
   });
-  it('onData fires with the prefix-delta when pane recent output grows', () => {
-    let paneText = 'hello';
-    setHerdrResponses([
-      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
-      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
-      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
-      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY(paneText) },
-    ]);
-
-    vi.useFakeTimers();
-    // Use an isReattach backend so the baseline is captured at spawn
-    // (lastText = current pane content) — that mirrors the worker.ts
-    // reattach contract, where the initial screen is seeded separately and
-    // the data stream emits only deltas.
-    const be = new HerdrBackend(SESSION, { isReattach: true });
-    const seen: string[] = [];
-    be.onData(d => seen.push(d));
-    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
-
-    // Reattach captures the current screen as baseline → no immediate emit.
-    expect(seen).toEqual([]);
-
-    paneText = 'hello world';
-    vi.advanceTimersByTime(600); // > POLL_INTERVAL_MS (500ms)
-    expect(seen).toEqual([' world']);
-
-    paneText = 'hello world!';
-    vi.advanceTimersByTime(600);
-    expect(seen).toEqual([' world', '!']);
-
-    be.kill();
-  });
-
-  it('onData fresh-spawn baseline: lastText starts empty so listeners see initial output', () => {
-    // Counterpart to the reattach test: a fresh spawn keeps lastText='' so
-    // listeners attached *before* spawn don't miss output the agent emitted
-    // between agent-start and the first poll tick (the herdr-backend's
-    // missing-initial-output bug we hit in the e2e run).
-    let paneText = '';
-    setHerdrResponses([
-      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
-      { match: a => a.includes('agent') && a.includes('get'), reply: () => '' },
-      {
-        match: a => a.includes('agent') && a.includes('start'),
-        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: '1-1' } } }),
-      },
-      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
-      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY(paneText) },
-    ]);
-
-    vi.useFakeTimers();
-    const be = new HerdrBackend(SESSION);
-    const seen: string[] = [];
-    be.onData(d => seen.push(d));
-    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
-
-    paneText = 'HELLO_HERDR\n';
-    vi.advanceTimersByTime(600);
-    expect(seen.join('')).toBe('HELLO_HERDR\n');
-
-    be.kill();
-  });
-
-  it('onExit fires when the agent disappears from `agent list`', () => {
+  it('terminal.closed emits onExit when the observed agent disappeared', async () => {
     let agentAlive = true;
     setHerdrResponses([
       { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
-      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('w1:p1') },
       {
         match: a => a.includes('agent') && a.includes('list'),
-        reply: () => agentAlive
-          ? AGENT_LIST_REPLY('1-1')
-          : JSON.stringify({ result: { agents: [] } }),
+        reply: () => agentAlive ? AGENT_LIST_REPLY('w1:p1') : JSON.stringify({ result: { agents: [] } }),
       },
-      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
     ]);
 
-    vi.useFakeTimers();
-    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const backend = new HerdrBackend(SESSION, { isReattach: true });
     const exits: Array<[number | null, string | null]> = [];
-    be.onExit((code, signal) => exits.push([code, signal]));
-    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    backend.onExit((code, signal) => exits.push([code, signal]));
+    backend.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const observerIndex = mockedSpawn.mock.calls.findIndex(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
+    const observer = fakeChildren[observerIndex]!;
 
     agentAlive = false;
-    vi.advanceTimersByTime(600);
+    observer.stdout.write(`${JSON.stringify({ type: 'terminal.closed', reason: 'pane exited' })}\n`);
+    await waitForImmediate();
     expect(exits).toEqual([[0, null]]);
   });
 
-  it('onExit fires when the agent stays in list with running:false (v0.6.6 tombstone)', () => {
-    // herdr v0.6.6+ does NOT drop exited agents from `agent list` — they
-    // stick around with running:false / status:"exited". Without this
-    // detection the worker never sees the CLI exit → claude_exit never
-    // fires → session hangs (the bug deepcoldy reported in PR #81).
+  it('terminal.closed preserves an explicit agent exit code', async () => {
     let agentRunning = true;
     setHerdrResponses([
       { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
-      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('w1:p1') },
       {
         match: a => a.includes('agent') && a.includes('list'),
         reply: () => agentRunning
-          ? AGENT_LIST_REPLY('1-1')
-          : JSON.stringify({ result: { agents: [{ name: 'botmux', pane_id: '1-1', running: false, status: 'exited', exit_code: 7 }] } }),
+          ? AGENT_LIST_REPLY('w1:p1')
+          : JSON.stringify({ result: { agents: [{ name: 'botmux', pane_id: 'w1:p1', running: false, status: 'exited', exit_code: 7 }] } }),
       },
-      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
     ]);
 
-    vi.useFakeTimers();
-    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const backend = new HerdrBackend(SESSION, { isReattach: true });
     const exits: Array<[number | null, string | null]> = [];
-    be.onExit((code, signal) => exits.push([code, signal]));
-    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    backend.onExit((code, signal) => exits.push([code, signal]));
+    backend.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const observerIndex = mockedSpawn.mock.calls.findIndex(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
 
     agentRunning = false;
-    vi.advanceTimersByTime(600);
-    // exit_code surfaces from the tombstone row so callers can distinguish
-    // clean exits from crashes (mirrors the PTY backend's exit code path).
+    fakeChildren[observerIndex]!.stdout.write(`${JSON.stringify({ type: 'terminal.closed' })}\n`);
+    await waitForImmediate();
     expect(exits).toEqual([[7, null]]);
   });
 
-  it('status watcher: one wait child per settled status (done/blocked/idle), first exit wins', () => {
-    // Capture every fake `wait agent-status` child + its --status arg so the
-    // test can drive a specific watcher's exit and verify the cohort
-    // behaviour (first-to-fire reads, the rest get SIGTERM'd).
-    const waitChildren: Array<{ status: string; child: FakeChild }> = [];
-    mockedSpawn.mockImplementation(((_cmd: any, args: any) => {
-      const child = makeFakeChild();
-      const argv = args as string[];
-      if (argv.includes('wait') && argv.includes('agent-status')) {
-        const statusIdx = argv.indexOf('--status');
-        waitChildren.push({ status: argv[statusIdx + 1]!, child });
-      }
-      return child;
-    }) as any);
-
-    let paneText = 'baseline';
+  it('restarts a disconnected observer when the agent is still alive', () => {
+    vi.useFakeTimers();
     setHerdrResponses([
       { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
-      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
-      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
-      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY(paneText) },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('w1:p1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('w1:p1') },
     ]);
 
-    // Reattach so the baseline is captured at spawn — keeps the assertion
-    // focused on "watcher exit triggers delta", not on the initial screen.
-    const be = new HerdrBackend(SESSION, { isReattach: true });
-    const seen: string[] = [];
-    be.onData(d => seen.push(d));
-    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const backend = new HerdrBackend(SESSION, { isReattach: true });
+    backend.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const observersBefore = mockedSpawn.mock.calls.filter(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
+    const observerIndex = mockedSpawn.mock.calls.findIndex(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
+    const firstObserver = fakeChildren[observerIndex]!;
 
-    // Cohort = one watcher per settled status.
-    const cohort = waitChildren.slice();
-    expect(cohort.map(w => w.status).sort()).toEqual(['blocked', 'done', 'idle']);
-
-    // Simulate the agent transitioning to `done` mid-turn — that watcher wins.
-    paneText = 'baseline result';
-    const doneWatcher = cohort.find(w => w.status === 'done')!;
-    doneWatcher.child.emit('exit', 0, null);
-
-    // The win triggered a read+emit.
-    expect(seen).toEqual([' result']);
-
-    // The two losing siblings got killed and a fresh cohort got armed.
-    for (const w of cohort) {
-      if (w !== doneWatcher) expect(w.child.killed).toBe(true);
-    }
-    const nextCohort = waitChildren.slice(cohort.length);
-    expect(nextCohort.map(w => w.status).sort()).toEqual(['blocked', 'done', 'idle']);
-
-    be.kill();
-    // kill() tears down the live cohort.
-    for (const w of nextCohort) expect(w.child.killed).toBe(true);
+    firstObserver.emit('exit', 1, null);
+    expect(firstObserver.killed).toBe(true);
+    vi.advanceTimersByTime(500);
+    const observersAfter = mockedSpawn.mock.calls.filter(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
+    expect(observersAfter).toHaveLength(observersBefore.length + 1);
+    backend.kill();
   });
 
-  it('status watcher: instant non-zero exit on a vanished agent emits onExit and does NOT re-arm (storm guard)', () => {
-    // Regression for the re-arm storm: on herdr v0.6.6 a `herdr wait
-    // agent-status` against a dead pane returns code 1 IMMEDIATELY. The old
-    // code re-armed synchronously on any non-0 code → a tight spawn loop that
-    // starved the poll timer and the session hung. The fix: an instant
-    // non-zero return triggers a liveness check; a vanished agent (empty
-    // `agent list`) emits onExit instead of re-arming.
-    const waitChildren: Array<{ status: string; child: FakeChild }> = [];
-    mockedSpawn.mockImplementation(((_cmd: any, args: any) => {
-      const child = makeFakeChild();
-      const argv = args as string[];
-      if (argv.includes('wait') && argv.includes('agent-status')) {
-        const statusIdx = argv.indexOf('--status');
-        waitChildren.push({ status: argv[statusIdx + 1]!, child });
-      }
-      return child;
-    }) as any);
-
-    // Agent present at spawn, then GONE (empty list) once it has exited.
-    let agentGone = false;
+  it('resize replaces the observer and forwards its full rebaseline frame', async () => {
     setHerdrResponses([
       { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
-      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
-      { match: a => a.includes('agent') && a.includes('list'), reply: () => agentGone ? JSON.stringify({ result: { agents: [] } }) : AGENT_LIST_REPLY('1-1') },
-      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('x') },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('w1:p1') },
     ]);
 
-    const be = new HerdrBackend(SESSION, { isReattach: true });
-    const exits: Array<[number | null, string | null]> = [];
-    be.onExit((code, signal) => exits.push([code, signal]));
-    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const backend = new HerdrBackend(SESSION, { isReattach: true });
+    const seen: string[] = [];
+    backend.onData(data => seen.push(data));
+    backend.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const firstIndex = mockedSpawn.mock.calls.findIndex(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
+    const firstObserver = fakeChildren[firstIndex]!;
 
-    const cohort = waitChildren.slice();
-    expect(cohort.length).toBe(3);
-
-    // The agent has now exited; the next `wait` returns code 1 instantly.
-    agentGone = true;
-    cohort.find(w => w.status === 'done')!.child.emit('exit', 1, null);
-
-    // onExit fired (storm guard saw the empty agent list)...
-    expect(exits.length).toBe(1);
-    // ...and NO fresh cohort was armed synchronously (the bug spun new ones).
-    const nextCohort = waitChildren.slice(cohort.length);
-    expect(nextCohort.length).toBe(0);
-
-    be.kill();
+    backend.resize(120, 40);
+    expect(firstObserver.killed).toBe(true);
+    const observerCalls = mockedSpawn.mock.calls.filter(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
+    const resizedArgs = observerCalls.at(-1)?.[1];
+    expect(resizedArgs).toContain('120');
+    expect(resizedArgs).toContain('40');
+    const resizedObserver = fakeChildren.at(-1)!;
+    resizedObserver.stdout.write(`${JSON.stringify({
+      type: 'terminal.frame', seq: 1, full: true, encoding: 'ansi', width: 120, height: 40,
+      bytes: Buffer.from('resized baseline').toString('base64'),
+    })}\n`);
+    await waitForImmediate();
+    expect(seen).toEqual(['resized baseline']);
+    backend.kill();
   });
 });
