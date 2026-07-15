@@ -20,6 +20,8 @@
  */
 
 import { homedir } from 'node:os';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
 import { t, type Locale } from '../../i18n/index.js';
@@ -39,9 +41,16 @@ function escapeRegExp(value: string): string {
  * The repair is intentionally narrow: it only matches the current host home
  * prefix, only in ordinary Markdown links, and skips fenced and inline code.
  * Web links, existing absolute paths, other users' homes, and general
- * relative links are left unchanged.
+ * relative links are left unchanged. An ambiguous home-shaped target is only
+ * repaired when the absolute file exists and the same target does not exist
+ * relative to the current working directory.
  */
-export function normalizeLocalHomeLinks(input: string, homeDir = homedir()): string {
+export function normalizeLocalHomeLinks(
+  input: string,
+  homeDir = homedir(),
+  cwd = process.cwd(),
+  pathExists: (path: string) => boolean = existsSync,
+): string {
   const relativeHome = homeDir.replace(/^\/+/, '').replace(/\/+$/, '');
   if (!relativeHome || relativeHome === homeDir) return input;
 
@@ -53,6 +62,21 @@ export function normalizeLocalHomeLinks(input: string, homeDir = homedir()): str
   let fenceLength = 0;
 
   const normalizeLine = (line: string): string => {
+    const repairDestinations = (segment: string): string => segment.replace(
+      destination,
+      (match: string, prefix: string, offset: number, source: string) => {
+        const targetStart = offset + match.length;
+        const remainder = source.slice(targetStart);
+        const endOffset = prefix.endsWith('<') ? remainder.indexOf('>') : remainder.search(/[\s)]/);
+        const suffix = endOffset === -1 ? remainder : remainder.slice(0, endOffset);
+        const relativeTarget = `${relativeHome}${suffix}`.split(/[?#]/, 1)[0];
+        const absoluteTarget = resolve('/', relativeTarget);
+        const normalizedHome = resolve(homeDir);
+        if (absoluteTarget !== normalizedHome && !absoluteTarget.startsWith(`${normalizedHome}/`)) return match;
+        if (pathExists(resolve(cwd, relativeTarget))) return match;
+        return pathExists(absoluteTarget) ? `${prefix}/${relativeHome}` : match;
+      },
+    );
     const runs = [...line.matchAll(/`+/g)];
     let output = '';
     let cursor = 0;
@@ -68,13 +92,13 @@ export function normalizeLocalHomeLinks(input: string, homeDir = homedir()): str
       if (closerIndex === -1) break;
       const closer = runs[closerIndex];
       const closerOffset = closer.index ?? 0;
-      output += line.slice(cursor, openerIndex).replace(destination, `$1/${relativeHome}`);
+      output += repairDestinations(line.slice(cursor, openerIndex));
       output += line.slice(openerIndex, closerOffset + closer[0].length);
       cursor = closerOffset + closer[0].length;
       runIndex = closerIndex + 1;
     }
 
-    return output + line.slice(cursor).replace(destination, `$1/${relativeHome}`);
+    return output + repairDestinations(line.slice(cursor));
   };
 
   return input.split('\n').map(line => {

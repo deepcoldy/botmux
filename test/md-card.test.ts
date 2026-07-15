@@ -196,16 +196,17 @@ describe('buildCardBodyElements', () => {
 
 describe('normalizeLocalHomeLinks', () => {
   const home = '/Users/alice';
+  const absoluteHomeFileExists = (path: string) => path.startsWith('/Users/alice/');
 
   it('restores the leading slash dropped from a current-home link', () => {
-    expect(normalizeLocalHomeLinks('[report](Users/alice/work/report.md)', home))
+    expect(normalizeLocalHomeLinks('[report](Users/alice/work/report.md)', home, '/tmp/project', absoluteHomeFileExists))
       .toBe('[report](/Users/alice/work/report.md)');
-    expect(normalizeLocalHomeLinks('[report](users/alice/work/report.md)', home))
+    expect(normalizeLocalHomeLinks('[report](users/alice/work/report.md)', home, '/tmp/project', absoluteHomeFileExists))
       .toBe('[report](/Users/alice/work/report.md)');
   });
 
   it('supports an angle-bracket destination containing spaces', () => {
-    expect(normalizeLocalHomeLinks('[report](<Users/alice/My Project/report.md>)', home))
+    expect(normalizeLocalHomeLinks('[report](<Users/alice/My Project/report.md>)', home, '/tmp/project', absoluteHomeFileExists))
       .toBe('[report](</Users/alice/My Project/report.md>)');
   });
 
@@ -219,6 +220,45 @@ describe('normalizeLocalHomeLinks', () => {
     expect(normalizeLocalHomeLinks(input, home)).toBe(input);
   });
 
+  it('preserves a current-home-shaped target when it exists relative to cwd', () => {
+    const seen: string[] = [];
+    const input = '[report](Users/alice/work/report.md)';
+    const output = normalizeLocalHomeLinks(input, home, '/tmp/project', path => {
+      seen.push(path);
+      return path === '/tmp/project/Users/alice/work/report.md';
+    });
+
+    expect(output).toBe(input);
+    expect(seen).toEqual(['/tmp/project/Users/alice/work/report.md']);
+  });
+
+  it('repairs a current-home-shaped target when it does not exist relative to cwd', () => {
+    expect(normalizeLocalHomeLinks(
+      '[report](Users/alice/work/report.md)',
+      home,
+      '/tmp/project',
+      path => path === '/Users/alice/work/report.md',
+    )).toBe('[report](/Users/alice/work/report.md)');
+  });
+
+  it('does not guess when neither the relative nor absolute target exists', () => {
+    const input = '[report](Users/alice/work/missing.md)';
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', () => false)).toBe(input);
+  });
+
+  it('does not allow a home-shaped target to escape the home via dot segments', () => {
+    const input = '[passwd](Users/alice/../../../etc/passwd)';
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', () => true)).toBe(input);
+  });
+
+  it('never rewrites explicit dot-relative targets', () => {
+    const input = [
+      '[same dir](./Users/alice/report.md)',
+      '[parent dir](../Users/alice/report.md)',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', () => false)).toBe(input);
+  });
+
   it('does not rewrite examples inside inline or fenced code', () => {
     const input = [
       '`[inline](Users/alice/a.md)`',
@@ -227,7 +267,7 @@ describe('normalizeLocalHomeLinks', () => {
       '```',
       '[real](Users/alice/c.md)',
     ].join('\n');
-    expect(normalizeLocalHomeLinks(input, home)).toBe([
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
       '`[inline](Users/alice/a.md)`',
       '```markdown',
       '[fenced](Users/alice/b.md)',
@@ -238,20 +278,25 @@ describe('normalizeLocalHomeLinks', () => {
 
   it('does not let an unmatched backtick suppress later link repair', () => {
     const input = 'unmatched ` example\n[real](Users/alice/c.md)';
-    expect(normalizeLocalHomeLinks(input, home))
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists))
       .toBe('unmatched ` example\n[real](/Users/alice/c.md)');
   });
 
   it('supports a Linux home directory', () => {
-    expect(normalizeLocalHomeLinks('[log](home/alice/run.log)', '/home/alice'))
+    expect(normalizeLocalHomeLinks(
+      '[log](home/alice/run.log)',
+      '/home/alice',
+      '/tmp/project',
+      path => path === '/home/alice/run.log',
+    ))
       .toBe('[log](/home/alice/run.log)');
   });
 
   it('is applied by the card rendering pipeline', () => {
     const home = homedir().replace(/\/+$/, '');
-    const missingSlash = `${home.replace(/^\/+/, '')}/report.md`;
+    const missingSlash = home.replace(/^\/+/, '');
     const content = mdElements(buildCardBodyElements(`[report](${missingSlash})`))[0].content;
-    expect(content).toBe(`[report](${home}/report.md)`);
+    expect(content).toBe(`[report](${home})`);
   });
 });
 
