@@ -450,6 +450,75 @@ describe('createFeishuOpenPlatformApp', () => {
     ]);
   });
 
+  function outcomeUnknownFetchImpl(calls: string[], templateResponse: () => Response | Promise<Response>) {
+    return (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      const path = new URL(href).pathname;
+      calls.push(path);
+      if (path === '/developers/v1/app/upload/image') {
+        return Response.json({ code: 0, data: { url: 'https://cdn.example/botmux.png' } });
+      }
+      if (path === '/developers/v1/manifest/upsert_by_template') {
+        return templateResponse();
+      }
+      return Response.json({ code: 0 });
+    }) as typeof fetch;
+  }
+
+  it('fails closed without cross-endpoint fallback when the template succeeds without a ClientID', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-noid-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const calls: string[] = [];
+    const result = await createFeishuOpenPlatformApp({
+      name: 'botmux-6',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      // code=0 但响应缺 ClientID:应用可能已建成,禁止再走 app/create 重建
+      fetchImpl: outcomeUnknownFetchImpl(calls, () => Response.json({ code: 0, data: {} })),
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: 'api_error' });
+    if (!result.ok) expect(result.message).toContain('确认');
+    expect(calls.filter(p => p === '/developers/v1/app/create')).toEqual([]);
+  });
+
+  it('fails closed without cross-endpoint fallback on ambiguous transport errors from the template endpoint', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-transport-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const calls: string[] = [];
+    const result = await createFeishuOpenPlatformApp({
+      name: 'botmux-7',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      // 传输错误(如 ECONNRESET):服务端可能已 commit,结果未知,不得重建
+      fetchImpl: outcomeUnknownFetchImpl(calls, () => { throw new Error('socket hang up (ECONNRESET)'); }),
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: 'api_error' });
+    expect(calls.filter(p => p === '/developers/v1/app/create')).toEqual([]);
+  });
+
+  it('fails closed without cross-endpoint fallback on HTTP 5xx from the template endpoint', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-5xx-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const calls: string[] = [];
+    const result = await createFeishuOpenPlatformApp({
+      name: 'botmux-8',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      // 5xx:服务端内部错误,可能已部分落库,结果未知
+      fetchImpl: outcomeUnknownFetchImpl(calls, () => new Response('oops', { status: 502 })),
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: 'api_error' });
+    expect(calls.filter(p => p === '/developers/v1/app/create')).toEqual([]);
+  });
+
   it('stops before app/create when the account or tenant changed after the UI confirmation', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-identity-race-'));
     const sessionFile = join(dir, 'feishu-session.json');

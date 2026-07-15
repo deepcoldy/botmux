@@ -1143,13 +1143,29 @@ export function buildManifestTemplateCreatePayload(
 }
 
 /**
+ * 模板创建是否属于服务端「明确拒绝」——即可确定应用没有建出来,允许安全
+ * 回退 app/create。业务错误码(code!==0,服务端解析请求后拒绝)与 HTTP 404
+ * (端点不存在)算明确拒绝;传输错误(ECONNRESET/timeout,非
+ * OpenPlatformApiError)、HTTP 5xx、code=0 缺 ClientID 都属「结果未知」——
+ * 服务端可能已 commit,跨端点重建会产生孤儿 + 重复应用,必须 fail-closed。
+ */
+function isDefiniteTemplateRejection(err: unknown): boolean {
+  if (!(err instanceof OpenPlatformApiError)) return false;
+  const code = (asRecord(err.payload) as { code?: unknown }).code;
+  if (typeof code === 'number' && code !== 0) return true;
+  return /^HTTP 404\b/.test(err.message);
+}
+
+/**
  * 用已经登录的开放平台 Web session 创建一个企业自建应用并读取凭证。
  *
  * 首选 console launcher 的「一键创建智能体」模板接口
  * (manifest/upsert_by_template):模板应用出生即带 bot 能力、长连接、基础
- * 事件与卡片回调,新建 bot 不再依赖后续订阅补齐。模板 ID 属内部契约,失败
- * 时自动回退旧 app/create(裸自建应用,事件/回调由 automateOpenPlatformSetup
- * 增量补齐并 fail-closed 兜底)。所有 Secret 只存在返回值中,不打印、不写日志。
+ * 事件与卡片回调,新建 bot 不再依赖后续订阅补齐。模板 ID 属内部契约,被
+ * 服务端明确拒绝时自动回退旧 app/create(裸自建应用,事件/回调由
+ * automateOpenPlatformSetup 增量补齐并 fail-closed 兜底);创建结果未知时
+ * 不回退(见 isDefiniteTemplateRejection)。Secret 只存在返回值中,不打印、
+ * 不写日志。
  */
 export async function createOpenPlatformAppWithClient(
   client: OpenPlatformApiClient,
@@ -1177,11 +1193,19 @@ export async function createOpenPlatformAppWithClient(
       '/developers/v1/manifest/upsert_by_template',
       buildManifestTemplateCreatePayload(name, description, avatar, randomUUID()),
     );
-    appId = pickPayloadString(created, ['ClientID', 'clientID', 'clientId', 'appId']);
+    const templateAppId = pickPayloadString(created, ['ClientID', 'clientID', 'clientId', 'appId']);
+    if (!templateAppId?.startsWith('cli_')) {
+      // code=0 却没有 ClientID:应用可能已建成(响应结构变化),结果未知——
+      // 不能落入 fallback 再 create,让下面的 catch 按「非明确拒绝」抛出。
+      throw new Error('一键智能体模板创建返回成功但没有 ClientID(结果未知);请到开放平台确认是否已创建同名应用后重试');
+    }
+    appId = templateAppId;
   } catch (err) {
-    console.warn(`一键智能体模板创建失败,回退普通自建应用: ${safeErrorMessage(err)}`);
+    if (!isDefiniteTemplateRejection(err)) throw err;
+    console.warn(`一键智能体模板创建被拒,回退普通自建应用: ${safeErrorMessage(err)}`);
+    appId = undefined;
   }
-  if (!appId?.startsWith('cli_')) {
+  if (!appId) {
     const created = await client.postJson('/developers/v1/app/create', {
       appSceneType: 0, // SelfBuild
       name,
