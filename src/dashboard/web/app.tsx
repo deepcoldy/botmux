@@ -323,15 +323,70 @@ function closeThemeMenuFromStatus(): void {
 
 function TopbarStatusMenu(props: { summary: TopbarStatusSummary; autoOpen?: boolean }): JSX.Element {
   const { autoOpen = false, summary } = props;
+  const [open, setOpen] = useState(false);
+  const [autoDismissed, setAutoDismissed] = useState(false);
+  const [hoverSuppressed, setHoverSuppressed] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const autoVisible = autoOpen && !autoDismissed;
+  const visible = open || autoVisible;
+
+  useEffect(() => {
+    if (!autoOpen) setAutoDismissed(false);
+  }, [autoOpen]);
+
+  useEffect(() => {
+    if (!visible) return undefined;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && rootRef.current?.contains(target)) return;
+      setOpen(false);
+      setAutoDismissed(true);
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    return () => document.removeEventListener('pointerdown', closeOnOutsidePointer);
+  }, [visible]);
+
+  const toggle = () => {
+    closeThemeMenuFromStatus();
+    if (visible) {
+      setOpen(false);
+      setAutoDismissed(true);
+      setHoverSuppressed(true);
+      return;
+    }
+    setHoverSuppressed(false);
+    setOpen(true);
+  };
+
   return (
     <div
-      className={`topbar-status-menu${autoOpen ? ' topbar-status-auto-open' : ''}`}
+      ref={rootRef}
+      className={`topbar-status-menu${autoVisible ? ' topbar-status-auto-open' : ''}${open ? ' is-open' : ''}${hoverSuppressed ? ' suppress-hover' : ''}`}
       onPointerEnter={closeThemeMenuFromStatus}
+      onPointerLeave={() => setHoverSuppressed(false)}
       onFocusCapture={closeThemeMenuFromStatus}
+      onBlur={event => {
+        const next = event.relatedTarget;
+        if (!(next instanceof Node) || !event.currentTarget.contains(next)) setOpen(false);
+      }}
+      onKeyDown={event => {
+        if (event.key !== 'Escape') return;
+        setOpen(false);
+        setAutoDismissed(true);
+        setHoverSuppressed(true);
+        (event.currentTarget.querySelector('#status') as HTMLButtonElement | null)?.focus();
+      }}
     >
-      <span id="status" className="connection-status" aria-haspopup="true" aria-expanded={autoOpen}>
+      <button
+        type="button"
+        id="status"
+        className="connection-status"
+        aria-haspopup="true"
+        aria-expanded={visible}
+        onClick={toggle}
+      >
         {t('overview.sessionOverview')}
-      </span>
+      </button>
       <div className="topbar-status-pop">
         {summary.attentionNotice ? (
           <a className="topbar-attention-notice" href="#/sessions">
