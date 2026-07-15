@@ -693,8 +693,14 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
               if (k) textNodes.push(imgLabel(k));
             }
             else if (node.tag === 'button') {
+              // Same jump-URL policy as Format B: simple cards reach history
+              // via the Format A list view WITHOUT a resolve pass, so dropping
+              // the URL here would lose button links on that main path.
               const btnText = typeof node.text === 'string' ? node.text : node.text?.content;
-              if (btnText) buttons.push(`[${btnText}]`);
+              if (btnText) {
+                const url = buttonOpenUrl(node);
+                buttons.push(url ? `[${btnText}](${url})` : `[${btnText}]`);
+              }
             }
             else if (node.tag === 'input') {
               const ph = typeof node.placeholder === 'string' ? node.placeholder : node.placeholder?.content;
@@ -875,18 +881,31 @@ export async function resolveEventCard(data: RawEventData, larkAppId: string): P
   unwrapUserDsl(data);
 }
 
+/** First non-empty string among the candidates. Deliberately NOT `??` — Lark
+ *  payloads carry empty-string placeholders (e.g. multi_url: {url: '', pc_url:
+ *  'https://…'}) which nullish coalescing would return, swallowing the valid
+ *  platform URL behind it. */
+function firstNonEmptyString(...candidates: unknown[]): string | undefined {
+  for (const c of candidates) {
+    if (typeof c === 'string' && c) return c;
+  }
+  return undefined;
+}
+
 /** Resolve a card button's jump target across schema generations: v1 `url` /
- *  `multi_url.url`, v2 `behaviors: [{type:'open_url', default_url, pc_url}]`.
+ *  `multi_url`, v2 `behaviors: [{type:'open_url', default_url, pc_url, …}]`.
  *  Returns undefined for callback-only buttons (they have no followable URL). */
 function buttonOpenUrl(el: any): string | undefined {
-  if (typeof el.url === 'string' && el.url) return el.url;
-  const multi = el.multi_url?.url ?? el.multi_url?.pc_url;
-  if (typeof multi === 'string' && multi) return multi;
+  const direct = firstNonEmptyString(
+    el.url,
+    el.multi_url?.url, el.multi_url?.pc_url, el.multi_url?.android_url, el.multi_url?.ios_url,
+  );
+  if (direct) return direct;
   if (Array.isArray(el.behaviors)) {
     for (const b of el.behaviors) {
       if (b?.type !== 'open_url') continue;
-      const u = b.default_url ?? b.pc_url ?? b.url;
-      if (typeof u === 'string' && u) return u;
+      const u = firstNonEmptyString(b.default_url, b.pc_url, b.url, b.android_url, b.ios_url);
+      if (u) return u;
     }
   }
   return undefined;

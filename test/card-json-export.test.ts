@@ -18,6 +18,7 @@ import {
   createImgNumberer,
   resolveMergedCardContent,
 } from '../src/im/lark/message-parser.js';
+import { renderQuotedMessage } from '../src/cli/quoted-render.js';
 import { cleanPromptText } from '../src/dashboard/web/insights.js';
 import { BUILTIN_SKILLS } from '../src/skills/definitions.js';
 
@@ -102,6 +103,47 @@ describe('Format B button: jump URL is kept, callback buttons stay bare', () => 
     expect(result.content).toContain('[打开终端](https://t.example.com/x)');
     expect(result.content).toContain('[查看文档](https://doc.example.com/y)');
   });
+
+  it('empty-string URLs fall through to the next platform URL (not ??-swallowed)', () => {
+    const card = {
+      config: {},
+      elements: [
+        { tag: 'action', actions: [
+          { tag: 'button', text: { tag: 'plain_text', content: '多端' }, multi_url: { url: '', pc_url: 'https://pc.example/x' } },
+          { tag: 'button', text: { tag: 'plain_text', content: '行为' }, behaviors: [{ type: 'open_url', default_url: '', pc_url: 'https://pc.example/y' }] },
+          { tag: 'button', text: { tag: 'plain_text', content: '全空' }, multi_url: { url: '', pc_url: '' } },
+        ] },
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('[多端](https://pc.example/x)');
+    expect(result.content).toContain('[行为](https://pc.example/y)');
+    expect(result.content).toContain('[全空]');
+    expect(result.content).not.toContain('[全空](');
+  });
+});
+
+// ─── Format A button: url/multi_url on the message.list main path ─────────
+
+describe('Format A button: jump URL survives the un-resolved list view', () => {
+  it('v1 url / multi_url render as [text](url); bare buttons stay bare', () => {
+    // Simple cards (no upgrade fallback) reach `botmux history` straight from
+    // im.v1.message.list Format A without a resolve pass — the URL must
+    // survive HERE, not only in the Format B path.
+    const card = {
+      title: 'x',
+      elements: [[
+        { tag: 'button', text: '查看', url: 'https://example.com/report' },
+        { tag: 'button', text: '多端', multi_url: { url: '', pc_url: 'https://pc.example/z' } },
+        { tag: 'button', text: '回调', type: 'default' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('[查看](https://example.com/report)');
+    expect(result.content).toContain('[多端](https://pc.example/z)');
+    expect(result.content).toContain('[回调]');
+    expect(result.content).not.toContain('[回调](');
+  });
 });
 
 // ─── Format B: img alt carried into the placeholder ───────────────────────
@@ -164,6 +206,74 @@ describe('resolveMergedCardContent: returns resources aligned with [图片 N]', 
   it('returns null when both representations fail', async () => {
     vi.mocked(getMessageDetail).mockRejectedValue(new Error('boom'));
     expect(await resolveMergedCardContent('app', 'om_card')).toBeNull();
+  });
+});
+
+// ─── quoted pipeline: merge replaces content + resources wholesale ────────
+
+describe('renderQuotedMessage: interactive merge replaces content AND resources', () => {
+  // List/API view carries the upgrade-fallback shell: a phantom img + "请升级"
+  // text. The merge pass must drop that shell resource and renumber from 1.
+  const shellMsg = {
+    message_id: 'om_card',
+    msg_type: 'interactive',
+    create_time: '1000',
+    sender: { id: 'ou_bot', sender_type: 'app' },
+    body: { content: JSON.stringify({
+      title: 'alarm',
+      elements: [[{ tag: 'img', image_key: 'img_shell' }, { tag: 'text', text: '请升级至最新版本客户端，以查看内容' }]],
+    }) },
+  };
+  const noExpand = async () => ({ extraResources: [] });
+
+  it('numbered [图片 N] aligns with merged.resources; shell image is dropped; structured JSON surfaced', async () => {
+    const structured = JSON.stringify({
+      config: {},
+      elements: [
+        { tag: 'img', img_key: 'img_curve_a', alt: { tag: 'plain_text', content: '同比A' } },
+        { tag: 'img', img_key: 'img_curve_b', alt: { tag: 'plain_text', content: '同比B' } },
+      ],
+    });
+    const resolveStub = async (_app: string, _id: string, numberer: ReturnType<typeof createImgNumberer>) => {
+      // Mirror resolveMergedCardContent's ordering contract: resources first,
+      // then text reuses the numbers.
+      const resources = [
+        { type: 'image' as const, key: 'img_curve_a', name: 'img_curve_a.jpg' },
+        { type: 'image' as const, key: 'img_curve_b', name: 'img_curve_b.jpg' },
+      ];
+      for (const r of resources) numberer.assign(`image:${r.key}`);
+      const text = `[图片 ${numberer.assign('image:img_curve_a').num}: 同比A]\n[图片 ${numberer.assign('image:img_curve_b').num}: 同比B]`;
+      return { text, structuredContent: structured, resources };
+    };
+
+    const rendered = await renderQuotedMessage('app', shellMsg, noExpand, resolveStub);
+    expect(rendered.content).toBe('[图片 1: 同比A]\n[图片 2: 同比B]');
+    expect(rendered.resources).toEqual([
+      { type: 'image', key: 'img_curve_a', name: 'img_curve_a.jpg' },
+      { type: 'image', key: 'img_curve_b', name: 'img_curve_b.jpg' },
+    ]);
+    expect(rendered.resources.map(r => r.key)).not.toContain('img_shell');
+    expect(rendered.mergedStructuredContent).toBe(structured);
+  });
+
+  it('merge failure keeps the pre-merge render and resources (no structured JSON)', async () => {
+    const rendered = await renderQuotedMessage('app', shellMsg, noExpand, async () => null);
+    expect(rendered.resources).toEqual([{ type: 'image', key: 'img_shell', name: 'img_shell.jpg' }]);
+    expect(rendered.mergedStructuredContent).toBeUndefined();
+  });
+
+  it('end-to-end with the real resolver: numbering restarts at 1 aligned with resources', async () => {
+    const structuredB = JSON.stringify({
+      config: {},
+      elements: [{ tag: 'img', img_key: 'img_real', alt: { tag: 'plain_text', content: '曲线' } }],
+    });
+    vi.mocked(getMessageDetail).mockImplementation(async (_app: string, _id: string, opts?: { userCardContent?: boolean }) => ({
+      items: [{ body: { content: opts?.userCardContent === false ? shellMsg.body.content : structuredB } }],
+    }));
+    const rendered = await renderQuotedMessage('app', shellMsg, noExpand, resolveMergedCardContent);
+    expect(rendered.content).toContain('[图片 1: 曲线]');
+    expect(rendered.resources).toEqual([{ type: 'image', key: 'img_real', name: 'img_real.jpg' }]);
+    expect(rendered.mergedStructuredContent).toBe(structuredB);
   });
 });
 
