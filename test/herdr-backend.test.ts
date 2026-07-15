@@ -465,6 +465,24 @@ describe('HerdrBackend web terminal sizing', () => {
     expect(reopenedAttach.kill).toHaveBeenCalledOnce();
   });
 
+  it('tracks the real cursor from the managed web attach stream', async () => {
+    const attach = makeFakePty();
+    mockedPtySpawn.mockReturnValue(attach as any);
+    const be = spawnManagedBackend();
+    const viewer = {};
+    const cursors: Array<{ col: number; row: number }> = [];
+    be.onWebTerminalCursor(cursor => cursors.push(cursor));
+
+    be.acquireWebTerminal(viewer);
+    be.resizeWebTerminal(viewer, 80, 24);
+    attach.emitData('\x1b[5;7H');
+    attach.emitData('\x1b[8;9H');
+
+    await vi.waitFor(() => expect(cursors).toEqual([{ col: 8, row: 7 }]));
+    expect(be.getWebTerminalCursor()).toEqual({ col: 8, row: 7 });
+    be.kill();
+  });
+
   it('cleans an exited attach and retries on the owner next resize', () => {
     const first = makeFakePty();
     const second = makeFakePty();

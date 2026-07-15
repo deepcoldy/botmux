@@ -1,7 +1,10 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import * as pty from 'node-pty';
+import xtermHeadless from '@xterm/headless';
 import type { BackendType, SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { logger } from '../../utils/logger.js';
+
+const { Terminal } = xtermHeadless;
 
 export type PersistentBackendType = Exclude<BackendType, 'pty'>;
 
@@ -40,6 +43,11 @@ type JsonCommandResult = { ok: true; value: any | undefined } | { ok: false };
 export interface HerdrWebTerminalSize {
   cols: number;
   rows: number;
+}
+
+export interface HerdrWebTerminalCursor {
+  col: number;
+  row: number;
 }
 
 function tryJsonCommand(args: string[], opts?: { timeout?: number; input?: string; env?: NodeJS.ProcessEnv }): JsonCommandResult {
@@ -120,6 +128,7 @@ export class HerdrBackend implements SessionBackend {
   private statusWaitProcesses: ChildProcess[] = [];
   private readonly dataCbs: Array<(d: string) => void> = [];
   private readonly snapshotCbs: Array<(snapshot: string) => void> = [];
+  private readonly webCursorCbs: Array<(cursor: HerdrWebTerminalCursor) => void> = [];
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
   private readonly agentName = 'botmux';
   private paneId: string | undefined;
@@ -130,6 +139,9 @@ export class HerdrBackend implements SessionBackend {
   private rows = 50;
   private agentProbeFailures = 0;
   private webAttach: pty.IPty | null = null;
+  private webCursorTerminal: InstanceType<typeof Terminal> | null = null;
+  private webCursor: HerdrWebTerminalCursor | null = null;
+  private webCursorTimer: NodeJS.Timeout | null = null;
   private webOwner: object | null = null;
   private webSize: HerdrWebTerminalSize | null = null;
   private readonly webViewers = new Map<object, HerdrWebTerminalSize | null>();
@@ -309,6 +321,7 @@ export class HerdrBackend implements SessionBackend {
     if (this.webOwner !== viewer) return null;
 
     if (this.webAttach) {
+      this.webCursorTerminal?.resize(cols, rows);
       this.webAttach.resize(cols, rows);
     } else if (!this.startWebAttach(size)) {
       return null;
@@ -345,6 +358,15 @@ export class HerdrBackend implements SessionBackend {
   /** Full interpreted terminal frame for snapshot-aware web history merging. */
   onSnapshot(cb: (snapshot: string) => void): void {
     this.snapshotCbs.push(cb);
+  }
+
+  /** Cursor coordinates from the real managed attach stream (0-based). */
+  onWebTerminalCursor(cb: (cursor: HerdrWebTerminalCursor) => void): void {
+    this.webCursorCbs.push(cb);
+  }
+
+  getWebTerminalCursor(): HerdrWebTerminalCursor | null {
+    return this.webCursor;
   }
 
   onExit(cb: (code: number | null, signal: string | null) => void): void {
@@ -417,6 +439,12 @@ export class HerdrBackend implements SessionBackend {
 
   private startWebAttach(size: HerdrWebTerminalSize): boolean {
     const target = this.paneId ?? this.agentName;
+    const cursorTerminal = new Terminal({
+      cols: size.cols,
+      rows: size.rows,
+      scrollback: 0,
+      allowProposedApi: true,
+    });
     try {
       const attach = pty.spawn('herdr', [
         '--session', this.sessionName,
@@ -428,10 +456,33 @@ export class HerdrBackend implements SessionBackend {
         env: this.childEnv ?? {},
       });
       this.webAttach = attach;
-      attach.onData(() => { /* drain only; polling remains the single output source */ });
+      this.resetWebCursorTracking();
+      this.webCursorTerminal = cursorTerminal;
+      attach.onData(data => {
+        // The polling read API returns screen text but no cursor metadata. The
+        // managed attach stream is the authoritative source for cursor moves;
+        // render it headlessly and relay only the final coordinates.
+        cursorTerminal.write(data, () => {
+          if (this.webCursorTerminal !== cursorTerminal) return;
+          if (this.webCursorTimer) clearTimeout(this.webCursorTimer);
+          this.webCursorTimer = setTimeout(() => {
+            this.webCursorTimer = null;
+            if (this.webCursorTerminal !== cursorTerminal) return;
+            const buffer = cursorTerminal.buffer.active;
+            const cursor = { col: buffer.cursorX, row: buffer.cursorY };
+            if (this.webCursor?.col === cursor.col && this.webCursor?.row === cursor.row) return;
+            this.webCursor = cursor;
+            for (const cb of this.webCursorCbs) {
+              try { cb(cursor); } catch { /* listener crash shouldn't kill attach */ }
+            }
+          }, 10);
+          this.webCursorTimer.unref?.();
+        });
+      });
       attach.onExit(({ exitCode, signal }) => {
         if (this.webAttach !== attach) return;
         this.webAttach = null;
+        this.resetWebCursorTracking();
         logger.warn(
           `[herdr] web terminal attach exited session=${this.sessionName} target=${target} ` +
           `code=${exitCode} signal=${signal ?? 'null'}`,
@@ -439,6 +490,7 @@ export class HerdrBackend implements SessionBackend {
       });
       return true;
     } catch (err: any) {
+      cursorTerminal.dispose();
       logger.error(
         `[herdr] web terminal attach failed session=${this.sessionName} target=${target}: ` +
         `${err?.message ?? err}`,
@@ -453,9 +505,19 @@ export class HerdrBackend implements SessionBackend {
     this.webOwner = null;
     this.webSize = null;
     this.webViewers.clear();
+    this.resetWebCursorTracking();
     if (attach) {
       try { attach.kill(); } catch { /* already gone */ }
     }
+  }
+
+  private resetWebCursorTracking(): void {
+    if (this.webCursorTimer) clearTimeout(this.webCursorTimer);
+    this.webCursorTimer = null;
+    const cursorTerminal = this.webCursorTerminal;
+    this.webCursorTerminal = null;
+    this.webCursor = null;
+    cursorTerminal?.dispose();
   }
 
   private getAgent(): any | undefined {

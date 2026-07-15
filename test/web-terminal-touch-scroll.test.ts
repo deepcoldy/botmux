@@ -18,6 +18,12 @@ describe('web terminal touch scrolling', () => {
     expect(workerSource).toContain('if (backend instanceof HerdrBackend) {\n    backend.onSnapshot(relayHerdrWebSnapshot);');
   });
 
+  it('restores the real Herdr attach cursor after snapshot rendering', () => {
+    expect(workerSource).toContain('backend.onWebTerminalCursor(relayHerdrWebCursor);');
+    expect(workerSource).toContain('scrollback}${herdrWebCursorSequence()}');
+    expect(workerSource).toContain('ws.send(seed + herdrWebCursorSequence());');
+  });
+
   it('forces Herdr alternate-screen CLIs to remote-scroll after a snapshot-only refresh', () => {
     expect(workerSource).toContain("effectiveBackendType === 'herdr' && cliAdapter?.altScreen === true");
     expect(workerSource).toContain('var remoteScroll=${forceRemoteScroll};');

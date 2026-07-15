@@ -110,7 +110,7 @@ import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
-import { HerdrBackend } from './adapters/backend/herdr-backend.js';
+import { HerdrBackend, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
@@ -2599,6 +2599,7 @@ const MAX_SCROLLBACK = 1_000_000; // chars (~1MB)
 let scrollback = '';
 let herdrWebHistory: HerdrWebHistoryState | null = null;
 let herdrWebScrollDirection: HerdrWebScrollDirection = null;
+let herdrWebCursor: HerdrWebTerminalCursor | null = null;
 const WORKFLOW_TRANSCRIPT_MAX = 2_000_000; // chars (~2MB)
 const WORKFLOW_OUTPUT_END_MARKER = '</WORKFLOW_OUTPUT>';
 const CRASH_DIAGNOSTIC_RAW_MAX = 200_000; // enough scrollback for the web terminal without huge temp files
@@ -2619,6 +2620,18 @@ function usesHerdrSnapshotWebHistory(): boolean {
   return backend instanceof HerdrBackend;
 }
 
+function herdrWebCursorSequence(cursor = herdrWebCursor): string {
+  return cursor ? `\x1b[${cursor.row + 1};${cursor.col + 1}H` : '';
+}
+
+function relayHerdrWebCursor(cursor: HerdrWebTerminalCursor): void {
+  herdrWebCursor = cursor;
+  const sequence = herdrWebCursorSequence(cursor);
+  for (const ws of wsClients) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(sequence);
+  }
+}
+
 function relayHerdrWebSnapshot(snapshot: string): void {
   const merged = mergeHerdrWebSnapshot(
     herdrWebHistory,
@@ -2629,7 +2642,7 @@ function relayHerdrWebSnapshot(snapshot: string): void {
   herdrWebHistory = merged.state;
   herdrWebScrollDirection = null;
   scrollback = renderHerdrWebHistory(merged.state);
-  const payload = `\x1b]1989;history;${merged.addedLines}\x07${scrollback}`;
+  const payload = `\x1b]1989;history;${merged.addedLines}\x07${scrollback}${herdrWebCursorSequence()}`;
   for (const ws of wsClients) {
     if (ws.readyState === WebSocket.OPEN) ws.send(payload);
   }
@@ -5439,6 +5452,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   backend.onData(onPtyData);
   if (backend instanceof HerdrBackend) {
     backend.onSnapshot(relayHerdrWebSnapshot);
+    backend.onWebTerminalCursor(relayHerdrWebCursor);
   }
   backend.onExit((code, signal) => {
     log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
@@ -5554,6 +5568,7 @@ function killCli(): void {
   scrollback = '';
   herdrWebHistory = null;
   herdrWebScrollDirection = null;
+  herdrWebCursor = null;
   altBufferActive = false;
   trustHandled = false;
   codexUpdateDialogGuard.reset();
@@ -5793,7 +5808,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             onError: log,
           });
         if (seed.length > 0) {
-          ws.send(seed);
+          ws.send(seed + herdrWebCursorSequence());
         }
 
         ws.on('message', (raw) => {
