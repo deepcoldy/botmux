@@ -543,7 +543,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/insight', '/dashboard', '/vc-auth'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -570,9 +570,9 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 29 = the prior 28 commands + /watch-comment. /subscribe-lark-doc remains
-    // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(29);
+    // 30 = the prior 28 commands + /watch-comment + /rename. /subscribe-lark-doc
+    // remains as its original per-file API subscription command rather than an alias.
+    expect(DAEMON_COMMANDS.size).toBe(30);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -802,6 +802,12 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(PASSTHROUGH_COMMANDS.has('/goal')).toBe(false);
     expect(resolvePassthroughCommands('app-1').has('/goal')).toBe(true);
     expect(resolvePassthroughCommands('app-2').has('/goal')).toBe(true);
+  });
+
+  it('does not expose Codex interactive /title through the Lark channel', () => {
+    expect(PASSTHROUGH_COMMANDS.has('/title')).toBe(false);
+    expect(DAEMON_COMMANDS.has('/title')).toBe(false);
+    expect(resolvePassthroughCommands('app-2').has('/title')).toBe(false);
   });
 });
 
@@ -1307,6 +1313,7 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('/restart');
       expect(replyContent).toContain('/cd');
       expect(replyContent).toContain('/repo');
+      expect(replyContent).toContain('/rename');
       expect(replyContent).toContain('/status');
       expect(replyContent).toContain('/help');
       expect(replyContent).toContain('/schedule');
@@ -1472,6 +1479,64 @@ describe('handleCommand', () => {
 
       expect(killWorker).toHaveBeenCalledWith(ds);
       expect(ds.workingDir).toBe('/data00/home/wanghao.muchen/ai-workspace/marketing_insight');
+    });
+  });
+
+  // ─── /rename ─────────────────────────────────────────────────────────────
+
+  describe('/rename', () => {
+    it('shows usage when no title is provided', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('/rename');
+      expect(replyContent).toContain('新的会话标题');
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('reports when there is no active session', async () => {
+      const deps = makeDeps();
+
+      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename Better label'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('没有活跃的会话');
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('updates the session title without restarting the worker', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename  ZMX 后端集成推进  '), deps, LARK_APP_ID);
+
+      expect(ds.session.title).toBe('ZMX 后端集成推进');
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('会话标题已更新');
+      expect(replyContent).toContain('ZMX 后端集成推进');
+      expect(replyContent).toContain('Agent 当前未运行');
+    });
+
+    it('requests native rename from a live Codex worker without restarting it', async () => {
+      const send = vi.fn();
+      const ds = makeDaemonSession({
+        session: makeSession({ cliId: 'codex', cliPathOverride: '/bin/codex' }),
+        worker: { killed: false, connected: true, send } as any,
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename  Native 同步  '), deps, LARK_APP_ID);
+
+      expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'Native 同步' });
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.session.title).toBe('Native 同步');
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('已向 codex 发送原生改名请求');
     });
   });
 

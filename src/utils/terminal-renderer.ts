@@ -72,6 +72,9 @@ export function readViewportText(
 export class TerminalRenderer {
   private terminal: InstanceType<typeof Terminal>;
   private lastHash = '';
+  private pendingWrites = 0;
+  private writeDrainWaiters: Array<() => void> = [];
+  private disposed = false;
 
   constructor(cols: number, rows: number) {
     this.terminal = new Terminal({ cols, rows, allowProposedApi: true });
@@ -79,7 +82,27 @@ export class TerminalRenderer {
 
   /** Feed raw PTY data into the virtual terminal. */
   write(data: string): void {
-    this.terminal.write(data);
+    if (this.disposed) return;
+    this.pendingWrites += 1;
+    this.terminal.write(data, () => {
+      if (this.disposed) return;
+      this.pendingWrites = Math.max(0, this.pendingWrites - 1);
+      if (this.pendingWrites !== 0) return;
+      const waiters = this.writeDrainWaiters.splice(0);
+      for (const resolve of waiters) resolve();
+    });
+  }
+
+  /** xterm parses write() asynchronously. Safety-sensitive callers must not
+   * inspect the current cells until this is false. */
+  get hasPendingWrites(): boolean { return this.pendingWrites > 0; }
+
+  /** Resolve after every write currently queued in xterm has updated the
+   * buffer. Writes that arrive concurrently keep the drain closed until the
+   * queue is empty, so a caller never observes a half-parsed redraw. */
+  whenWritesParsed(): Promise<void> {
+    if (this.pendingWrites === 0 || this.disposed) return Promise.resolve();
+    return new Promise(resolve => { this.writeDrainWaiters.push(resolve); });
   }
 
   /** Reset the change-detection hash so the next snapshot registers as changed. */
@@ -104,6 +127,40 @@ export class TerminalRenderer {
     return this.readViewport(false);
   }
 
+  /** Current viewport with the one SGR attribute needed by native-composer
+   * proof preserved. Plain snapshots deliberately discard styling, but Codex
+   * distinguishes its empty randomized placeholder from user-entered draft
+   * text by rendering only the former dim. Reconstruct dim runs from xterm's
+   * authoritative current cells so pty-under-{tmux,zellij} and the direct PTY
+   * backend can recover safely after a partial raw-command write. */
+  promptProofSnapshot(): string {
+    const buffer = this.terminal.buffer.active;
+    const lines: string[] = [];
+    const startY = buffer.baseY;
+    const endY = startY + this.terminal.rows;
+
+    for (let y = startY; y < endY; y += 1) {
+      const line = buffer.getLine(y);
+      if (!line) continue;
+      let output = '';
+      let dim = false;
+      for (let x = 0; x < Math.min(line.length, this.terminal.cols); x += 1) {
+        const cell = line.getCell(x);
+        if (!cell || cell.getWidth() === 0) continue;
+        const cellDim = cell.isDim() !== 0;
+        if (cellDim !== dim) {
+          output += cellDim ? '\x1b[2m' : '\x1b[22m';
+          dim = cellDim;
+        }
+        output += cell.getChars() || ' ';
+      }
+      if (dim) output += '\x1b[22m';
+      lines.push(output);
+    }
+
+    return lines.join('\n');
+  }
+
   private readViewport(filter: boolean): string {
     return readViewportText(this.terminal, { filter });
   }
@@ -116,6 +173,10 @@ export class TerminalRenderer {
   get xterm(): InstanceType<typeof Terminal> { return this.terminal; }
 
   dispose(): void {
+    this.disposed = true;
+    this.pendingWrites = 0;
+    const waiters = this.writeDrainWaiters.splice(0);
+    for (const resolve of waiters) resolve();
     this.terminal.dispose();
   }
 }

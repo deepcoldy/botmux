@@ -6,9 +6,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // transiently disappears and comes back.
 const calls: string[][] = [];
 let listPanesResult: () => string = () => JSON.stringify([{ id: 2, is_plugin: false }]);
+let failAction: string | undefined;
 vi.mock('node:child_process', () => ({
   execFileSync: (bin: string, args: string[]) => {
     calls.push([bin, ...args]);
+    if (failAction && args[2] === 'action' && args[3] === failAction) throw new Error('action failed');
     if (args.includes('dump-screen')) return 'line one\nline two\nline three\n';
     if (args.includes('list-panes')) return listPanesResult();
     return '';
@@ -26,21 +28,22 @@ describe('ZellijObserveBackend input encoding', () => {
   let be: ZellijObserveBackend;
   beforeEach(() => {
     calls.length = 0;
+    failAction = undefined;
     be = new ZellijObserveBackend(S, P, { cliPid: 999 });
   });
 
   it('sendText → targeted write-chars on the pane', () => {
-    be.sendText('hello');
+    expect(be.sendText('hello')).toBe(true);
     expect(actionArgs('write-chars')).toEqual(['write-chars', '--pane-id', P, '--', 'hello']);
   });
 
   it('sendSpecialKeys(Enter) → action write with the CR byte (13)', () => {
-    be.sendSpecialKeys('Enter');
+    expect(be.sendSpecialKeys('Enter')).toBe(true);
     expect(actionArgs('write')).toEqual(['write', '--pane-id', P, '13']);
   });
 
   it('sendSpecialKeys(C-c) → action write with ETX byte (3)', () => {
-    be.sendSpecialKeys('C-c');
+    expect(be.sendSpecialKeys('C-c')).toBe(true);
     expect(actionArgs('write')).toEqual(['write', '--pane-id', P, '3']);
   });
 
@@ -57,6 +60,13 @@ describe('ZellijObserveBackend input encoding', () => {
 
   it('getChildPid returns the adopted cli pid', () => {
     expect(be.getChildPid()).toBe(999);
+  });
+
+  it('surfaces dropped text and Enter actions to the worker command latch', () => {
+    failAction = 'write-chars';
+    expect(be.sendText('/clear')).toBe(false);
+    failAction = 'write';
+    expect(be.sendSpecialKeys('Enter')).toBe(false);
   });
 
   it('resize is a no-op (never issues a zellij command — non-invasive)', () => {
@@ -80,6 +90,24 @@ describe('ZellijObserveBackend liveness debounce', () => {
   beforeEach(() => {
     calls.length = 0;
     listPanesResult = ALIVE;
+  });
+
+  it('baselines the initial viewport instead of replaying it as live output', () => {
+    vi.useFakeTimers();
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((() => true) as typeof process.kill);
+    try {
+      const be = new ZellijObserveBackend(S, P, { cliPid: 999 });
+      const frames: string[] = [];
+      be.onData(frame => frames.push(frame));
+      be.spawn('', [], opts());
+
+      vi.advanceTimersByTime(700);
+      expect(frames).toEqual([]);
+      be.kill();
+    } finally {
+      killSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it('does NOT detach on a single transient list-panes failure that recovers', () => {

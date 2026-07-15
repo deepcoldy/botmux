@@ -182,10 +182,10 @@ describe('attention signals', () => {
     const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
     const start = src.indexOf('async function handleThreadReply(');
     expect(start).toBeGreaterThanOrEqual(0);
-    // 16000：窗口需罩住函数头到最后一个拦截点 (findPendingAskByAnchor) 的全部
-    // 源码——passthrough 冷启动等合法插入会把后续 marker 往后推，窗口太紧会误报。
-    // 语义断言不变：clear 在所有拦截点之前。
-    const region = src.slice(start, start + 16000);
+    // 18000：窗口需罩住函数头到最后一个拦截点 (findPendingAskByAnchor) 的全部
+    // 源码——passthrough 冷启动、/rename 不预创建等合法插入会把后续 marker 往后
+    // 推，窗口太紧会误报。语义断言不变：clear 在所有拦截点之前。
+    const region = src.slice(start, start + 18000);
     const clearIdx = region.indexOf('clearAgentAttentionForHumanInbound();');
     expect(clearIdx).toBeGreaterThanOrEqual(0);
     for (const marker of [

@@ -12,6 +12,7 @@
 import { describe, it, expect } from 'vitest';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import { resolveRenderDimensions } from '../src/utils/render-dimensions.js';
+import { hasNativeSessionIdleComposer } from '../src/services/native-session-prompt-proof.js';
 
 // xterm-headless processes writes asynchronously through an internal
 // queue. Accessing the buffer immediately after .write() can show stale
@@ -98,5 +99,56 @@ describe('TerminalRenderer width matches source pane', () => {
     const firstRow = snap.split('\n')[0] ?? '';
     expect(firstRow).not.toContain(marker);
     r.dispose();
+  });
+});
+
+describe('TerminalRenderer prompt proof snapshot', () => {
+  it('preserves dim placeholder cells but leaves typed drafts non-dim', async () => {
+    const r = new TerminalRenderer(80, 5);
+    await writeAndFlush(r, '\x1b[1m›\x1b[0m \x1b[2mWrite tests for @filename\x1b[0m');
+    const placeholder = r.promptProofSnapshot();
+    expect(placeholder).toContain('› \x1b[2mWrite tests for @filename\x1b[22m');
+    expect(hasNativeSessionIdleComposer(placeholder, 'codex')).toBe(true);
+
+    await writeAndFlush(r, '\r\x1b[2K› typed draft');
+    const draft = r.promptProofSnapshot();
+    expect(draft).toContain('› typed draft');
+    expect(draft).not.toContain('\x1b[2mtyped draft');
+    expect(hasNativeSessionIdleComposer(draft, 'codex')).toBe(false);
+    r.dispose();
+  });
+
+  it('exposes async write parsing and resolves only after the proof cells are current', async () => {
+    const r = new TerminalRenderer(80, 5);
+    r.write('\x1b[1m›\x1b[0m \x1b[2mWrite tests for @filename\x1b[0m');
+    expect(r.hasPendingWrites).toBe(true);
+    expect(hasNativeSessionIdleComposer(r.promptProofSnapshot(), 'codex')).toBe(false);
+
+    await r.whenWritesParsed();
+    expect(r.hasPendingWrites).toBe(false);
+    expect(hasNativeSessionIdleComposer(r.promptProofSnapshot(), 'codex')).toBe(true);
+    r.dispose();
+  });
+
+  it('keeps the drain closed until multiple queued writes are all parsed', async () => {
+    const r = new TerminalRenderer(80, 5);
+    r.write('first');
+    r.write(' second');
+    expect(r.hasPendingWrites).toBe(true);
+
+    await r.whenWritesParsed();
+    expect(r.hasPendingWrites).toBe(false);
+    expect(r.rawSnapshot()).toContain('first second');
+    r.dispose();
+  });
+
+  it('resolves outstanding drain waiters when disposed', async () => {
+    const r = new TerminalRenderer(80, 5);
+    r.write('pending');
+    const drained = r.whenWritesParsed();
+    r.dispose();
+
+    await expect(drained).resolves.toBeUndefined();
+    expect(r.hasPendingWrites).toBe(false);
   });
 });

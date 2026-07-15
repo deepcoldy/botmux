@@ -18,10 +18,11 @@ export function normalizeKanbanPosition(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-/** 重命名标题：去首尾空白、压缩换行、限长；空串视为非法。 */
+/** 重命名标题：单行化、移除会被终端解释的 C0/DEL 控制字符、限长；
+ * 空串视为非法。标题会被送进原生 TUI 的 `/rename`，所以这里也是输入边界。 */
 export function normalizeSessionTitle(value: unknown): string | null {
   if (typeof value !== 'string') return null;
-  const title = value.replace(/\s*\n\s*/g, ' ').trim();
+  const title = value.replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (!title) return null;
   return title.slice(0, SESSION_TITLE_MAX);
 }

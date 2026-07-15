@@ -70,6 +70,8 @@ import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
+import { clearDesiredNativeSessionTitle, updateSessionTitle } from './session-title.js';
+import { requestAgentSessionRename } from './session-rename.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -90,6 +92,18 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * that pollutes the dashboard's session list. Handle them without a session.
  */
 export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment']);
+
+/**
+ * Daemon commands that operate on an ALREADY-EXISTING session and must never
+ * pre-create one. `/rename` renames the current session — with no session there
+ * is nothing to rename, so the daemon routes must skip their generic
+ * "createSession + activeSessions.set(worker:null)" pre-create block and let
+ * handleCommand's `!ds` branch reply no_active_session. Without this, `/rename`
+ * in a brand-new topic (or a thread with no session) would spawn a phantom
+ * worker:null session just to rename it, polluting the dashboard. (Same class
+ * of fix as the `/card` / `/term` special cases in daemon.ts.)
+ */
+export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename']);
 
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
@@ -1351,6 +1365,37 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.cd.switched', { path: resolvedPath }, loc));
         }
         logger.info(`[${logTag}] Working directory changed to ${resolvedPath} by /cd command${validation.created ? ' (auto-created)' : ''}`);
+        break;
+      }
+
+      case '/rename': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        const rawTitle = message.content.replace(/^\/rename\s*/i, '').trim();
+        if (!rawTitle) {
+          await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
+          break;
+        }
+        const updated = updateSessionTitle(ds.session, rawTitle);
+        if (!updated.ok) {
+          await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
+          break;
+        }
+        const agentSync = requestAgentSessionRename(ds, updated.title);
+        const cliName = getCliDisplayName(agentSync.cliId ?? ds.session.cliId ?? 'claude-code');
+        if (agentSync.status === 'requested') {
+          await sessionReply(rootId, t('cmd.rename.updated_requested', { title: updated.title, cliName }, loc));
+        } else if (agentSync.status === 'not_running') {
+          await sessionReply(rootId, t('cmd.rename.updated_not_running', { title: updated.title }, loc));
+        } else if (agentSync.status === 'unsupported') {
+          await sessionReply(rootId, t('cmd.rename.updated_unsupported', { title: updated.title, cliName }, loc));
+        } else {
+          await sessionReply(rootId, t('cmd.rename.updated_failed', { title: updated.title, cliName }, loc));
+          logger.warn(`[${logTag}] Native session rename request failed for ${cliName}: ${agentSync.error}`);
+        }
+        logger.info(`[${logTag}] Session renamed by /rename: ${updated.title} (agentSync=${agentSync.status})`);
         break;
       }
 
@@ -2945,6 +2990,7 @@ export async function handleCommand(
           t('help.repo_n', undefined, loc),
           t('help.repo_path', undefined, loc),
           t('help.repo_wt', undefined, loc),
+          t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
           t('help.card', undefined, loc),
           t('help.term', undefined, loc),
@@ -3095,6 +3141,7 @@ export async function startCodexAppThreadSession(
 
   ds.session.workingDir = thread.cwd;
   ds.session.title = `Codex App: ${title}`;
+  clearDesiredNativeSessionTitle(ds.session);
   ds.session.cliId = 'codex-app';
   ds.session.cliSessionId = thread.threadId;
   ds.session.adoptedFrom = undefined;
@@ -3129,6 +3176,7 @@ export async function startAdoptSession(
   ds.workingDir = target.cwd;
   ds.session.workingDir = target.cwd;
   ds.session.title = `Adopt: ${project}`;
+  clearDesiredNativeSessionTitle(ds.session);
   ds.adoptedFrom = {
     source: zellij ? 'zellij' : target.source,
     tmuxTarget: zellij ? undefined : target.tmuxTarget,
@@ -3207,6 +3255,7 @@ export async function startResumeImportSession(
   ds.session.workingDir = target.cwd;
   ds.session.cliSessionId = target.cliSessionId;
   ds.session.title = target.title || `Import: ${project}`;
+  clearDesiredNativeSessionTitle(ds.session);
   // Resume sandbox decision is left to forkWorker (resume=true → not sandboxed,
   // matching restore semantics). Mark history so the session is treated as a
   // resume, not a fresh spawn.

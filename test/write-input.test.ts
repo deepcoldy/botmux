@@ -930,6 +930,42 @@ describe('claude-code writeInput submission confirmation', () => {
     expect(pty.claudeJsonlPath).toBe(newPath);
   });
 
+  it('fingerprint rotation returns the matched JSONL id instead of stale spawn-time pid state', async () => {
+    const cwd = '/tmp/pid-resolver-stale-after-clear';
+    const spawnSessionId = '12121212-1212-4212-8212-121212121212';
+    const rotatedSessionId = '34343434-3434-4434-8434-343434343434';
+    const spawnPath = makeJsonlForSession('pid-resolver-stale-after-clear', spawnSessionId, cwd);
+    const rotatedPath = makeJsonlForSession('pid-resolver-stale-after-clear', rotatedSessionId, cwd);
+    // Claude 2.1.x keeps the process pid file pinned to the spawn-time id even
+    // after in-pane /clear. The exact submit fingerprint in the new JSONL is
+    // the authoritative identity for this write.
+    writeClaudePidFile(7654, { sessionId: spawnSessionId, cwd });
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    let submitted = false;
+    const pty: PtyHandle = {
+      claudeJsonlPath: spawnPath,
+      cliPid: 7654,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || submitted) return;
+        submitted = true;
+        appendFileSync(
+          rotatedPath,
+          JSON.stringify({ type: 'user', message: { role: 'user', content: 'submit after local clear' } }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'submit after local clear');
+
+    expect(result).toEqual({ submitted: true, cliSessionId: rotatedSessionId });
+    expect(pty.claudeJsonlPath).toBe(rotatedPath);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+  });
+
   it('returns a recheck closure that recognises a slow-path submit (e.g. UserPromptSubmit hook delay)', async () => {
     // Simulates Claude where the in-band 4×800ms confirm budget runs out
     // (Enter sent, jsonl still empty), then a slow UserPromptSubmit hook
@@ -952,7 +988,7 @@ describe('claude-code writeInput submission confirmation', () => {
 
     const result = await adapter.writeInput(pty, 'slow hook still running');
     expect(result).toMatchObject({ submitted: false });
-    const recheck = (result as any)?.recheck as () => boolean;
+    const recheck = (result as any)?.recheck as () => boolean | { submitted: boolean; cliSessionId?: string };
     expect(typeof recheck).toBe('function');
     expect(recheck()).toBe(false);  // Still nothing in the jsonl
 
@@ -961,7 +997,7 @@ describe('claude-code writeInput submission confirmation', () => {
       pinnedPath,
       JSON.stringify({ type: 'user', message: { role: 'user', content: 'slow hook still running' } }) + '\n',
     );
-    expect(recheck()).toBe(true);  // Now the worker suppresses the warning
+    expect(recheck()).toEqual({ submitted: true, cliSessionId: sessionId });  // Also surfaces the authoritative late-rotation id
   });
 });
 

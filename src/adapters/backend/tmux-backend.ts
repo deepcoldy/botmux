@@ -595,6 +595,9 @@ const BOTMUX_INJECTED_ENV_KEYS = [
   // real TUI input composer has rendered. It must reach tmux panes via the
   // per-pane env prefix; otherwise the ready-gate waits for fallback timeouts.
   'BOTMUX_READY_COMMAND',
+  // Per-spawn nonce paired with BOTMUX_READY_COMMAND. The worker rejects a
+  // delayed hook from a replaced pane unless this generation matches.
+  'BOTMUX_READY_GENERATION',
   // Hermes transcript/profile paths. The worker resolves the bridge state DB
   // from this same child env, so persistent panes must receive these overrides
   // too; otherwise the reader can watch one profile while Hermes writes another.

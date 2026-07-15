@@ -466,7 +466,7 @@ describe('HerdrBackend message writing', () => {
 
   it('write() / sendText() invoke `pane send-text` on the resolved pane id', () => {
     const be = spawnBackend('5-5');
-    be.sendText('飞书消息');
+    expect(be.sendText('飞书消息')).toBe(true);
 
     const call = herdrCall('pane', 'send-text', '5-5', '飞书消息');
     expect(call).toBeDefined();
@@ -476,7 +476,7 @@ describe('HerdrBackend message writing', () => {
 
   it('sendSpecialKeys() invokes `pane send-keys` with each key', () => {
     const be = spawnBackend('5-5');
-    be.sendSpecialKeys('Enter', 'C-c');
+    expect(be.sendSpecialKeys('Enter', 'C-c')).toBe(true);
 
     const call = herdrCall('pane', 'send-keys', '5-5', 'Enter', 'C-c');
     expect(call).toBeDefined();
@@ -487,9 +487,17 @@ describe('HerdrBackend message writing', () => {
     const be = spawnBackend('5-5');
     be.kill();
     mockedExecFileSync.mockClear();
-    be.sendText('after-exit');
+    expect(be.sendText('after-exit')).toBe(false);
     const call = herdrCall('pane', 'send-text');
     expect(call).toBeUndefined();
+  });
+
+  it('surfaces a failed herdr text/key command as false', () => {
+    const be = spawnBackend('5-5');
+    mockedExecFileSync.mockImplementation(() => { throw new Error('herdr unavailable'); });
+    expect(be.sendText('/clear')).toBe(false);
+    expect(be.sendSpecialKeys('Enter')).toBe(false);
+    be.kill();
   });
 });
 

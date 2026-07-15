@@ -1888,6 +1888,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     prompt,
     resume,
     cliSessionId: ds.session.cliSessionId,
+    desiredNativeSessionTitle: ds.session.desiredNativeSessionTitle,
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
@@ -2491,17 +2492,10 @@ function setupWorkerHandlers(
           })),
           multiSelect: msg.multiSelect,
         });
-        const prevTuiTurnTitle = ds.currentTurnTitle;
-        ds.currentTurnTitle = msg.description;  // store for card PATCH on toggle
-        if (prevTuiTurnTitle !== ds.currentTurnTitle) {
-          dashboardEventBus.publish({
-            type: 'session.update',
-            body: {
-              sessionId: ds.session.sessionId,
-              patch: { title: ds.currentTurnTitle },
-            },
-          });
-        }
+        // Card-only turn label. The dashboard's title is the canonical
+        // session.title; publishing this prompt description as `patch.title`
+        // would temporarily overwrite a user-issued /rename until refresh.
+        ds.currentTurnTitle = msg.description;
         try {
           const cardJson = buildTuiPromptCard(
             sessionAnchorId(ds),
@@ -3183,6 +3177,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     workingDir: adopted.cwd,
     cliId: adoptedCliId,
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
+    desiredNativeSessionTitle: ds.session.desiredNativeSessionTitle,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
     prompt: '',

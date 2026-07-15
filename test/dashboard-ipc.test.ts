@@ -119,6 +119,63 @@ describe('GET /api/sessions/:sessionId', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/rename', () => {
+  it('updates the canonical title and requests native sync from a live Codex worker', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-session-rename-'));
+    const prevDataDir = config.session.dataDir;
+    const events: any[] = [];
+    const off = dashboardEventBus.subscribe(event => events.push(event));
+    const send = vi.fn();
+    let findSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init();
+      const session = sessionStore.createSession('oc_rename', 'om_rename', 'Old title', 'group');
+      session.cliId = 'codex';
+      session.cliPathOverride = '/bin/codex';
+      session.backendType = 'tmux';
+      sessionStore.updateSession(session);
+
+      findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+        session,
+        worker: { killed: false, connected: true, send },
+        workerPort: 1234,
+        workerToken: 'token',
+        larkAppId: 'app',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: '1',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+      } as any);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/rename`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ title: '  New\tTitle\u001b  ' }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true, title: 'New Title', agentSync: 'requested' });
+      expect(sessionStore.getSession(session.sessionId)?.title).toBe('New Title');
+      expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'New Title' });
+      expect(events).toContainEqual({
+        type: 'session.update',
+        body: { sessionId: session.sessionId, patch: { title: 'New Title' } },
+      });
+    } finally {
+      findSpy?.mockRestore();
+      off();
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('POST /api/sessions/:sessionId/close', () => {
   it('returns 200 with ok=true even when session does not exist (idempotent)', async () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });

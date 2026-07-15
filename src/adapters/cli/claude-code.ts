@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
-import type { CliAdapter, CliId, PtyHandle } from './types.js';
+import type { CliAdapter, CliId, PtyHandle, SubmitRecheckResult } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
@@ -626,6 +626,19 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // `--resume`. In-pane `/clear` won't appear here — that's covered
       // by the fingerprint-based mid-flight rotation check below.
       let observedCliSessionId: string | undefined;
+      const observeSessionIdFromJsonlPath = (path: string): void => {
+        const filename = basename(path);
+        const cliSessionId = filename.endsWith('.jsonl') ? filename.slice(0, -'.jsonl'.length) : '';
+        if (SESSION_UUID_RE.test(cliSessionId)) observedCliSessionId = cliSessionId;
+      };
+      const applyFingerprintMatchedPath = (path: string): void => {
+        pty.claudeJsonlPath = path;
+        // Unlike the pid-state record, an exact fingerprint match is evidence
+        // for the session that accepted THIS submit. Prefer its filename id so
+        // an in-pane /clear cannot return the pid file's spawn-time id and roll
+        // Botmux persistence backward.
+        observeSessionIdFromJsonlPath(path);
+      };
       const applyResolved = (resolved: { path: string; cliSessionId: string }): boolean => {
         if (resolved.cliSessionId !== observedCliSessionId) observedCliSessionId = resolved.cliSessionId;
         if (resolved.path !== pty.claudeJsonlPath) {
@@ -752,7 +765,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
             includeQueueOperations: true,
           });
           if (matched) {
-            pty.claudeJsonlPath = matched;
+            applyFingerprintMatchedPath(matched);
             return true;
           }
         }
@@ -789,7 +802,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
           includeQueueOperations: true,
         });
         if (matched) {
-          pty.claudeJsonlPath = matched;
+          applyFingerprintMatchedPath(matched);
           return observedCliSessionId ? buildResult(true) : undefined;
         }
       }
@@ -803,7 +816,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // UserPromptSubmit / SessionStart hook (e.g. superpowers) defers Claude's
       // jsonl append by 5–15s. The worker calls recheck() after a delay, and
       // suppresses the user-facing warning when the line shows up by then.
-      const recheck = (): boolean => {
+      const recheck = (): SubmitRecheckResult => {
         if (!submitFingerprint) return false;
         // Latest pid → path; covers post-failure rotations (/clear, /resume).
         if (pty.cliPid && pty.cliCwd) {
@@ -812,7 +825,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         }
         const currentPath = pty.claudeJsonlPath;
         if (currentPath && jsonlContainsFingerprint(currentPath, submitFingerprint, { includeQueueOperations: true })) {
-          return true;
+          observeSessionIdFromJsonlPath(currentPath);
+          return observedCliSessionId
+            ? { submitted: true, cliSessionId: observedCliSessionId }
+            : true;
         }
         // Fan out to sibling jsonls in the project dir, then across every
         // sibling project dir under `~/.claude/projects/` (catches workingDir
@@ -825,7 +841,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
           minMtimeMs: submitSearchMinMtime,
           includeQueueOperations: true,
         });
-        return !!matched;
+        if (!matched) return false;
+        applyFingerprintMatchedPath(matched);
+        return observedCliSessionId
+          ? { submitted: true, cliSessionId: observedCliSessionId }
+          : true;
       };
       return { ...buildResult(false), recheck };
     },
@@ -837,6 +857,12 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // 收到信号前不投首条 prompt，绕开 cjadk 启动选择器吞首条消息的 bug。
     injectsReadyHook: true,
     defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal'] : undefined,
+    // Seed shares most of this adapter but has not been verified to expose the
+    // same native session-rename command. Keep the capability exact to Claude.
+    buildSessionRenameCommand: variant.id === 'claude-code'
+      ? (title) => `/rename ${title}`
+      : undefined,
+    nativeSessionRotationCommands: variant.id === 'claude-code' ? ['/clear'] : undefined,
     systemHints: [],
     altScreen: false,
     // Skills are injected per-session via --plugin-dir (see buildArgs), NOT

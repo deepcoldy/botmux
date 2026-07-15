@@ -372,6 +372,24 @@ describe('BridgeTurnQueue', () => {
     expect(ready[1].assistantUuids).toEqual(['a3']);
   });
 
+  it('backend-generation reset prevents a crash-before-user-event mark from duplicating its replay', () => {
+    const q = new BridgeTurnQueue();
+    const fingerprint = makeFingerprint('message retried after CLI crash');
+    q.mark('turn-1', fingerprint);
+
+    // CLI dies before the user event reaches JSONL. The worker clears this
+    // generation, requeues the in-flight input, then marks it once on respawn.
+    expect(q.clearPending().map(turn => turn.turnId)).toEqual(['turn-1']);
+    q.mark('turn-1', fingerprint);
+    q.ingest([
+      user('u-retry', 'message retried after CLI crash'),
+      assistant('a-retry', 'completed after respawn'),
+    ]);
+
+    expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['turn-1']);
+    expect(q.size()).toBe(0);
+  });
+
   describe('sourceJsonlPath stamping', () => {
     it('stamps the path provided at start-time onto the started turn', () => {
       const q = new BridgeTurnQueue();

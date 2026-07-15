@@ -81,7 +81,7 @@ import {
 } from './core/worker-pool.js';
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner, setBotRenamer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
@@ -2896,7 +2896,7 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
 // 选择器吞首条消息）。找不到会话 / worker 仍返回 200（best-effort）：worker 侧
 // 有超时兜底，信号丢失不致命，没必要让 hook 客户端报错。
 ipcRoute('POST', '/api/session-ready', async (req, res) => {
-  let raw: { sessionId?: unknown; source?: unknown };
+  let raw: { sessionId?: unknown; source?: unknown; generation?: unknown };
   try {
     raw = await readJsonBody(req);
   } catch {
@@ -2904,6 +2904,10 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
   }
   const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : '';
   if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_sessionId' });
+  const generation = typeof raw.generation === 'string' ? raw.generation : '';
+  if (!/^[0-9a-f]{32}$/.test(generation)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_generation' });
+  }
   const source = typeof raw.source === 'string' ? raw.source : undefined;
 
   let ds: DaemonSession | undefined;
@@ -2912,7 +2916,7 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
   }
   if (ds?.worker) {
     try {
-      ds.worker.send({ type: 'session_ready', source } as DaemonToWorker);
+      ds.worker.send({ type: 'session_ready', source, generation } as DaemonToWorker);
       logger.info(`[${sessionId.slice(0, 8)}] session-ready signal forwarded to worker (source=${source ?? '?'})`);
     } catch (err) {
       logger.warn(`session-ready forward failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -6346,6 +6350,12 @@ async function resolvePinnedWorkingDir(ctx: {
 }
 
 export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
+// Production message routes (function declarations hoist, so the references
+// are valid here). Exposed for route-level regression tests — e.g. asserting
+// that `/rename` in a fresh topic/thread does NOT pre-create a phantom session,
+// which unit tests calling handleCommand directly can never catch.
+export const __testOnly_handleNewTopic = (data: any, ctx: RoutingContext): Promise<void> => handleNewTopic(data, ctx);
+export const __testOnly_handleThreadReply = (data: any, ctx: RoutingContext): Promise<void> => handleThreadReply(data, ctx);
 
 /**
  * 该新会话是否要走「仅默认目录 + 自动建 worktree」：pinned dir 来自本 bot 自己的
@@ -6719,6 +6729,17 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         // slow Lark API work → no Feishu redelivery → no duplicate group.
         // See fireSessionlessCommandDetached.
         fireSessionlessCommandDetached(cmd, anchor, { ...parsed, content: commandContent, chatId }, larkAppId);
+        return;
+      }
+      // `/rename` renames an EXISTING session; a brand-new topic has none. Route
+      // straight to handleCommand (its `!ds` branch replies no_active_session)
+      // so the pre-create block below doesn't spawn a worker:null phantom
+      // session just to rename it. Same phantom-session concern as the /card
+      // and /term special cases, but UNLIKE those (which carry their own
+      // permission gates inside their handlers) this branch MUST stay after
+      // the canOperate gate above — the /rename handler itself has no gate.
+      if (EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
+        await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
         return;
       }
       // Same rootMessageId reasoning as below in the main spawn path:
@@ -7440,8 +7461,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // Without a session, handleCommand gets ds=undefined and `/repo` (and other
       // session commands) fall through to the repo-select card. Create the session
       // first, mirroring handleNewTopic's first-message `/repo` pendingRepo setup.
-      // Session-less commands (/group /g) don't need one.
-      if (!existingDs && threadChatId && !isSessionlessCommandInvocation(cmd, commandContent)) {
+      // Session-less commands (/group /g) don't need one; existing-session-only
+      // commands (/rename) must NOT get one — a pre-created worker:null session
+      // would be a phantom conversation that only exists to be renamed. Let
+      // handleCommand's `!ds` branch reply no_active_session instead.
+      if (!existingDs && threadChatId && !isSessionlessCommandInvocation(cmd, commandContent)
+        && !EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
         const session = sessionStore.createSession(threadChatId, anchor, cmdContent.substring(0, 50), ctxChatType);
         const now = Date.now();
         if (ctxChatType === 'p2p') {

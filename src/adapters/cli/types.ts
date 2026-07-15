@@ -389,6 +389,17 @@ export interface CliAdapter {
    *  are scoped to the current CLI so unsupported commands do not leak to other
    *  adapters. */
   readonly defaultPassthroughCommands?: readonly string[];
+
+  /** Build the CLI-native command that renames the current interactive session.
+   *  The title has already been normalized to one control-character-free line
+   *  by the daemon. Undefined means this adapter has no proven native rename
+   *  command and must never receive a best-guess slash command. */
+  buildSessionRenameCommand?(title: string): string;
+
+  /** Native slash commands proven to rotate this CLI onto a fresh session.
+   *  When Botmux forwards one after a successful native rename, the worker
+   *  re-applies its durable desired title on the new session's next prompt. */
+  readonly nativeSessionRotationCommands?: readonly string[];
 }
 
 export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'kimi' | 'grok' | 'kiro-cli' | 'riff';

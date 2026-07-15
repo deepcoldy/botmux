@@ -118,6 +118,8 @@ import {
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, loadBotConfigs, readBotSkillPolicy } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
+import { updateSessionTitle } from './session-title.js';
+import { requestAgentSessionRename } from './session-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, Session } from '../types.js';
 import type { DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
@@ -656,22 +658,23 @@ ipcRoute('GET', '/api/owner-profile', async (_req, res) => {
   jsonRes(res, 200, { ok: true, name: p?.name ?? me.ownerName ?? null, avatarUrl: p?.avatarUrl ?? null });
 });
 
-// 会话重命名：dashboard 看板卡片就地编辑标题。title 只是展示元数据（飞书话题
-// 标题不受影响），但全视图（看板/状态板/表格/抽屉）读同一字段，改一处全变。
+// 会话重命名：dashboard 看板卡片就地编辑 Botmux 的 canonical title；运行中的
+// Codex/Claude Code 再收到一条 best-effort 原生 /rename，同步其 resume picker。
+// 飞书话题标题不受影响。全视图（看板/状态板/表格/抽屉）读同一字段。
 ipcRoute('POST', '/api/sessions/:sessionId/rename', async (req, res, params) => {
   let body: { title?: unknown };
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   const title = normalizeSessionTitle(body.title);
   if (!title) return jsonRes(res, 400, { ok: false, error: 'bad_title' });
-  const session = findSessionRecord(params.sessionId);
+  const active = findActiveBySessionId(params.sessionId);
+  const session = active?.session ?? sessionStore.getSession(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  session.title = title;
-  sessionStore.updateSession(session);
-  dashboardEventBus.publish({
-    type: 'session.update',
-    body: { sessionId: params.sessionId, patch: { title } },
-  });
-  jsonRes(res, 200, { ok: true, title });
+  const updated = updateSessionTitle(session, title);
+  if (!updated.ok) return jsonRes(res, 400, { ok: false, error: updated.error });
+  const agentSync = active
+    ? requestAgentSessionRename(active, updated.title)
+    : { status: 'not_running' as const };
+  jsonRes(res, 200, { ...updated, agentSync: agentSync.status });
 });
 
 // 会话锁定：保护被锁定会话不被 dashboard「清理空闲」批量关闭。锁定是会话元数据，

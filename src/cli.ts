@@ -6852,7 +6852,8 @@ async function cmdHook(cliId: string): Promise<void> {
 // 自定义 launcher 启动选择器的 ❯ 误命中 readyPattern、把首条消息整条吞掉的 bug。
 //
 // 会话归属只靠 hook 子进程继承的 env（worker spawn 时设的 BOTMUX_SESSION_ID /
-// BOTMUX_LARK_APP_ID）。任何失败（env 缺失=adopt/非 botmux 会话、daemon 不可达）
+// BOTMUX_LARK_APP_ID / BOTMUX_READY_GENERATION）。任何失败（env 缺失=adopt/
+// 非 botmux 会话、daemon 不可达）
 // 都静默 exit 0：绝不挂死 CLI 启动；信号丢了 worker 有超时兜底。
 async function cmdSessionReady(): Promise<void> {
   // 排空 stdin：Claude 把 SessionStart payload 写到这里。我们只取 source 字段
@@ -6871,8 +6872,10 @@ async function cmdSessionReady(): Promise<void> {
 
   const sessionId = process.env.BOTMUX_SESSION_ID;
   const larkAppId = process.env.BOTMUX_LARK_APP_ID;
+  const generation = process.env.BOTMUX_READY_GENERATION;
   // env 缺失 → adopt / 非 botmux 会话；就绪门控对它们不适用，静默放行。
-  if (!sessionId || !larkAppId) process.exit(0);
+  // generation 是本次 CLI spawn 独有的 nonce；旧/伪造 hook 不得解锁新 gate。
+  if (!sessionId || !larkAppId || !generation || !/^[0-9a-f]{32}$/.test(generation)) process.exit(0);
 
   const daemon = findDaemon(larkAppId);
   if (daemon) {
@@ -6880,7 +6883,7 @@ async function cmdSessionReady(): Promise<void> {
       await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/session-ready`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId, source }),
+        body: JSON.stringify({ sessionId, source, generation }),
       });
     } catch { /* daemon 不可达 → 放弃，worker 走超时兜底 */ }
   }

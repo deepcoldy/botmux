@@ -52,6 +52,15 @@ import { resolveTerminalWriteForRequest } from './core/terminal-write-auth.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { loadPersistedToken } from './dashboard/auth.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
+import { NativeSessionRenameState } from './core/native-session-rename-state.js';
+import {
+  claudeTranscriptEndsAtPrompt,
+  codexTranscriptEndsAtPrompt,
+  hasNativeSessionBusyMarker,
+  hasNativeSessionIdleComposer,
+} from './services/native-session-prompt-proof.js';
+import { NativeSessionCommandProof } from './services/native-session-command-proof.js';
+import { assertCommandWriteIssued, commandWriteMayHavePartialInput } from './services/command-write-result.js';
 import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
@@ -144,6 +153,30 @@ import { hookCommandFor } from './adapters/hook-command.js';
 
 let cliAdapter: CliAdapter | null = null;
 let backend: SessionBackend | null = null;
+/** Monotonic ownership token for the currently attached/spawned backend.
+ * Async command writers capture it before their first await. A restart can
+ * replace `backend` while an old CoCo/startup text->Enter sequence is sleeping;
+ * the token prevents that old continuation from mutating the new CLI's gates. */
+let backendEpoch = 0;
+
+class StaleBackendEpochError extends Error {
+  constructor() {
+    super('backend epoch changed while writing command');
+    this.name = 'StaleBackendEpochError';
+  }
+}
+
+function backendEpochIsCurrent(expectedBackend: SessionBackend, expectedEpoch: number): boolean {
+  return backend === expectedBackend && backendEpoch === expectedEpoch;
+}
+
+function assertBackendEpochCurrent(expectedBackend: SessionBackend, expectedEpoch: number): void {
+  if (!backendEpochIsCurrent(expectedBackend, expectedEpoch)) throw new StaleBackendEpochError();
+}
+
+function isStaleBackendEpochError(error: unknown): error is StaleBackendEpochError {
+  return error instanceof StaleBackendEpochError;
+}
 let cliPidMarker: string | null = null;  // path to .botmux-cli-pids/<pid>
 let seatbeltProfilePath: string | null = null;       // per-session Seatbelt .sb profile to rm at exit (external-wrapper read isolation)
 let sandboxStopWatcher: (() => void) | null = null;  // stop fn for the sandbox outbox watcher
@@ -420,6 +453,9 @@ function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? '
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
+/** A readiness/input event that arrived during an active flush. Re-run once
+ * after releasing the mutex so an async adopt write cannot lose the wakeup. */
+let flushWakeRequested = false;
 /** Per-spawn one-shot: have this spawn's bot.startupCommands been typed in yet?
  *  Reset in spawnCli so a restart/resume (which re-spawns the CLI) re-applies
  *  them — needed because session-only settings like `/effort ultracode` are lost
@@ -444,6 +480,10 @@ let bareShellChecked = false;
  *  falsely matches readyPattern) can't eat the first message. Recreated + armed
  *  per spawn in spawnCli; disarmed on signal or fallback timeout. */
 let readyGate = new ReadyGate();
+/** Per-process-spawn nonce inherited by the CLI's SessionStart hook. A signal
+ * from an exited/replaced CLI must never release the replacement spawn's gate,
+ * including after the worker itself was restarted (when numeric epochs reset). */
+let readyHookGeneration: string | undefined;
 /** Fallback timer: if the SessionStart signal never arrives (hook injection
  *  failed / old CLI / launcher didn't pass --settings / adopt) release the gate
  *  and fall back to readyPattern + quiescence. */
@@ -483,6 +523,24 @@ let isSettlingFirstFlush = false;
  *  ready yet, or flushPending will be blocked by isSettlingFirstFlush and a
  *  later markPromptReady call would return early with the first prompt stranded. */
 let promptReadyDetectedDuringSettle = false;
+
+function clearReadyGateTimers(): void {
+  if (readySignalTimer) {
+    clearTimeout(readySignalTimer);
+    readySignalTimer = null;
+  }
+  if (readyFlushSettleTimer) {
+    clearTimeout(readyFlushSettleTimer);
+    readyFlushSettleTimer = null;
+  }
+  isSettlingFirstFlush = false;
+  promptReadyDetectedDuringSettle = false;
+}
+
+function invalidateReadyHookGeneration(): void {
+  clearReadyGateTimers();
+  readyHookGeneration = undefined;
+}
 
 /** Wait until the PTY has been quiet for READY_FLUSH_SETTLE_MS (Ink render
  *  drained), capped at READY_FLUSH_SETTLE_CAP_MS, then flush the held prompt.
@@ -539,7 +597,13 @@ const COCO_SLASH_TYPE_THROTTLE_MS = 40;
  *  the match before submit) → a separate Enter. Non-TUI backends fall back to a
  *  single write + CR. Shared by the `raw_input` IPC handler and runStartupCommands
  *  so both stay in lockstep. */
-async function sendRawCommandLine(be: NonNullable<typeof backend>, content: string): Promise<void> {
+async function sendRawCommandLine(
+  be: NonNullable<typeof backend>,
+  content: string,
+  expectedEpoch: number,
+  onBeforeSubmit?: () => void | Promise<void>,
+): Promise<void> {
+  assertBackendEpochCurrent(be, expectedEpoch);
   if ('sendText' in be && 'sendSpecialKeys' in be) {
     if (lastInitConfig?.cliId === 'coco') {
       // CoCo (Trae CLI, Ink TUI) detects "several bytes in one PTY read = paste",
@@ -556,17 +620,26 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
       // isn't typed as a literal newline that re-breaks command detection.
       const cmd = content.trim();
       const typed = cmd.includes(' ') ? cmd : `${cmd} `;
-      for (const ch of typed) {
-        (be as any).sendText(ch);
+      for (let i = 0; i < typed.length; i += 1) {
+        assertBackendEpochCurrent(be, expectedEpoch);
+        const ch = typed[i]!;
+        assertCommandWriteIssued((be as any).sendText(ch), 'command text', i > 0);
         await new Promise(r => setTimeout(r, COCO_SLASH_TYPE_THROTTLE_MS));
+        assertBackendEpochCurrent(be, expectedEpoch);
       }
       await new Promise(r => setTimeout(r, 200));
-      (be as any).sendSpecialKeys('Enter');
+      assertBackendEpochCurrent(be, expectedEpoch);
+      await onBeforeSubmit?.();
+      assertBackendEpochCurrent(be, expectedEpoch);
+      assertCommandWriteIssued((be as any).sendSpecialKeys('Enter'), 'command Enter', true);
       return;
     }
-    (be as any).sendText(content);
+    assertCommandWriteIssued((be as any).sendText(content), 'command text', false);
     await new Promise(r => setTimeout(r, 200));
-    (be as any).sendSpecialKeys('Enter');
+    assertBackendEpochCurrent(be, expectedEpoch);
+    await onBeforeSubmit?.();
+    assertBackendEpochCurrent(be, expectedEpoch);
+    assertCommandWriteIssued((be as any).sendSpecialKeys('Enter'), 'command Enter', true);
   } else {
     // PtyBackend has no sendText/sendSpecialKeys, so write the keystrokes
     // directly — but still beat between the text and the Enter. Writing
@@ -577,16 +650,72 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
     // 200ms beat.
     be.write(content);
     await new Promise(r => setTimeout(r, 200));
+    assertBackendEpochCurrent(be, expectedEpoch);
+    await onBeforeSubmit?.();
+    assertBackendEpochCurrent(be, expectedEpoch);
     be.write('\r');
+  }
+}
+
+/** Serialize only the literal command-line write window (text -> beat -> Enter).
+ * raw_input deliberately keeps its legacy "send while busy" behaviour; this
+ * narrow mutex merely prevents concurrent IPC handlers (or native /rename)
+ * from splicing keystrokes into one another. */
+let commandLineWriteTail: Promise<void> = Promise.resolve();
+let commandLineWritesPending = 0;
+interface SerializedCommandLineWriteOptions {
+  backendEpoch?: number;
+  onWriteStart?: () => void;
+  onBeforeSubmit?: () => void | Promise<void>;
+}
+async function sendRawCommandLineSerially(
+  be: NonNullable<typeof backend>,
+  content: string,
+  options: SerializedCommandLineWriteOptions = {},
+): Promise<void> {
+  const expectedEpoch = options.backendEpoch ?? backendEpoch;
+  const previous = commandLineWriteTail;
+  let release!: () => void;
+  commandLineWriteTail = new Promise<void>(resolve => { release = resolve; });
+  commandLineWritesPending += 1;
+  await previous;
+  const writeOutputGeneration = ptyOutputGeneration;
+  try {
+    assertBackendEpochCurrent(be, expectedEpoch);
+    options.onWriteStart?.();
+    await sendRawCommandLine(be, content, expectedEpoch, options.onBeforeSubmit);
+  } catch (err) {
+    if (!isStaleBackendEpochError(err) && backendEpochIsCurrent(be, expectedEpoch) && commandWriteMayHavePartialInput(err)) {
+      rawCommandWriteFailedAwaitingPrompt = true;
+      rawCommandFailureOutputGeneration = writeOutputGeneration;
+      isPromptReady = false;
+    }
+    throw err;
+  } finally {
+    const staleBackendReleased = !backendEpochIsCurrent(be, expectedEpoch);
+    commandLineWritesPending -= 1;
+    release();
+    // A replacement prompt can become ready while an old direct raw IPC still
+    // owns this mutex. Its flush sees commandLineWritesPending>0 and returns;
+    // the stale caller deliberately performs no global continuation work, so
+    // wake the new epoch exactly when the last old writer releases.
+    if (staleBackendReleased && commandLineWritesPending === 0) {
+      queueMicrotask(() => { void flushPending(); });
+    }
   }
 }
 
 /** Resolve once the PTY has been quiet for `quietMs`, or after `capMs` total.
  *  Spaces out startup commands so each is processed before the next is typed. */
-function awaitPtyQuiescence(quietMs: number, capMs: number): Promise<void> {
+function awaitPtyQuiescence(
+  quietMs: number,
+  capMs: number,
+  stillCurrent: () => boolean = () => true,
+): Promise<void> {
   return new Promise(resolve => {
     const startedAt = Date.now();
     const check = () => {
+      if (!stillCurrent()) { resolve(); return; }
       const now = Date.now();
       if (now - lastPtyOutputAtMs >= quietMs || now - startedAt >= capMs) { resolve(); return; }
       const wait = Math.min(quietMs - (now - lastPtyOutputAtMs), capMs - (now - startedAt));
@@ -602,41 +731,467 @@ function awaitPtyQuiescence(quietMs: number, capMs: number): Promise<void> {
  *  skipped, never blocking the first prompt. Skipped in adopt mode (we observe
  *  the user's existing session). Invoked once per spawn from flushPending under
  *  the isFlushing mutex, so no user message can interleave. */
-async function runStartupCommands(): Promise<void> {
+async function runStartupCommands(
+  targetBackend: NonNullable<typeof backend>,
+  expectedEpoch: number,
+): Promise<boolean> {
   const cmds = lastInitConfig?.startupCommands;
-  if (!cmds || cmds.length === 0) return;
-  if (lastInitConfig?.adoptMode) return;
-  if (!backend) return;
+  if (!cmds || cmds.length === 0) return false;
+  if (lastInitConfig?.adoptMode) return false;
+  if (!backendEpochIsCurrent(targetBackend, expectedEpoch)) return true;
   // riff：generic startupCommands 是 PTY 语义（sendRawCommandLine = write 文本 +
   // 200ms 后 write 回车），对 RiffBackend 每条会裂成两个远端任务并打乱血缘。
   // riff 的初始化命令走自己的 riff.setupCommands（沙箱内执行），这里必须跳过。
   if (effectiveBackendType === 'riff') {
     log(`Skipping ${cmds.length} generic startup command(s) — riff backend uses riff.setupCommands instead`);
-    return;
+    return false;
   }
   log(`Running ${cmds.length} startup command(s) before first prompt`);
   for (const cmd of cmds) {
-    if (!backend) break;
+    if (rawCommandWriteFailedAwaitingPrompt) break;
+    if (!backendEpochIsCurrent(targetBackend, expectedEpoch)) return true;
     try {
-      await sendRawCommandLine(backend, cmd);
-      await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
+      await sendRawCommandLineSerially(targetBackend, cmd, { backendEpoch: expectedEpoch });
+      await awaitPtyQuiescence(
+        STARTUP_CMD_QUIET_MS,
+        STARTUP_CMD_CAP_MS,
+        () => backendEpochIsCurrent(targetBackend, expectedEpoch),
+      );
+      if (!backendEpochIsCurrent(targetBackend, expectedEpoch)) return true;
+      if (rawCommandWriteFailedAwaitingPrompt) break;
       log(`Startup command sent: ${cmd}`);
     } catch (e: any) {
+      if (isStaleBackendEpochError(e)) return true;
       log(`Startup command failed (${cmd}): ${e?.message ?? e}`);
     }
   }
+  if (!backendEpochIsCurrent(targetBackend, expectedEpoch)) return true;
   // Commands consumed turns and reset idle; treat the first user prompt fresh.
   isPromptReady = false;
-  idleDetector?.reset();
+  // On a partial text→Enter failure, the command echo may already have armed
+  // the only idle callback that can prove the composer was later cleared.
+  // Preserve that cycle; resetting here would leave the failure latch stuck.
+  if (!rawCommandWriteFailedAwaitingPrompt) idleDetector?.reset();
+  return true;
 }
 
 const pendingMessages: PendingCliInput[] = [];
+/** Adopt-mode Lark messages held only while a native administrative command
+ * owns the observed pane. They must return through the adopt bridge-marking
+ * path, not the normal spawned-CLI queue. */
+const pendingAdoptMessages: PendingCliInput[] = [];
+let adoptInputWriteInProgress = false;
+/** Literal commands that arrived while native /rename owned the TUI. Normal
+ * raw_input commands are still delivered immediately (including while busy). */
+type RawInputMessage = Extract<DaemonToWorker, { type: 'raw_input' }>;
+const pendingRawInputs: RawInputMessage[] = [];
+/** A raw command write can fail after typing only a prefix. Until the CLI
+ * renders a prompt again, no later Botmux input may append to that composer. */
+let rawCommandWriteFailedAwaitingPrompt = false;
+/** PTY output generation captured immediately before the failed command starts
+ * writing. Renderer-backed proof must observe newer output, otherwise its old
+ * empty composer could be mistaken for recovery from a partial write. */
+let rawCommandFailureOutputGeneration = -1;
+/** Durable desired native title plus its one-shot delivery state. Keeping the
+ * desired title after a successful send lets `/clear` / `/new` and observed
+ * native session-id rotations re-apply it to the new resume entry. */
+const nativeSessionRename = new NativeSessionRenameState();
+const SESSION_RENAME_IDLE_TIMEOUT_MS = 5_000;
+const LIVE_ATTACH_COMMAND_PROBE_MS = 700;
+let sessionRenameIdleTimer: ReturnType<typeof setTimeout> | null = null;
+let sessionRenameWriteOutputGeneration = -1;
+let sessionRotationWriteOutputGeneration = -1;
+let nativePromptProofRetryArmed = false;
+/** Zellij observe stops emitting onData while a web attach is live. For command
+ * freshness in that window, prove an exact draft before Enter and an empty
+ * composer after it instead of waiting on a frozen PTY generation. */
+let nativeCommandCaptureProof: {
+  backend: SessionBackend;
+  backendEpoch: number;
+  proof: NativeSessionCommandProof;
+} | null = null;
+/** A changed session id is phase-A evidence, but an old empty viewport is not
+ * phase B. Wait for a later real idle signal (normal IdleDetector or the
+ * live-attach capture debounce) before releasing this independent rotation. */
+let sessionIdRotationAwaitingIdleSignal = false;
+let sessionIdRotationObservedOutputGeneration = -1;
+let sessionIdRotationProofBackend: SessionBackend | null = null;
+let sessionIdRotationProofBackendEpoch = -1;
+/** A pid/path observer can discover an id only after its prompt is already
+ * quiet. Two stable screen samples, separated by this settle, distinguish that
+ * late case from the dangerous window where the id changed just before the new
+ * session's first render replaces the old empty composer. The samples are
+ * additionally tied to PTY output no older than the identity path itself. */
+const SESSION_ID_LATE_PROMPT_SETTLE_MS = 1_000;
+let sessionIdLatePromptProofTimer: ReturnType<typeof setTimeout> | null = null;
+let liveAttachPromptProbeTimer: ReturnType<typeof setTimeout> | null = null;
+/** Monotonic changed-id observation version. Async producers capture this so a
+ * delayed result for native session A cannot overwrite a newer observed B. */
+let cliSessionIdObservationVersion = 0;
+
+function nativeRenameCliId(): 'claude-code' | 'codex' | null {
+  const cliId = lastInitConfig?.cliId;
+  return cliId === 'claude-code' || cliId === 'codex' ? cliId : null;
+}
+
+function beginNativeCommandCaptureProof(
+  targetBackend: SessionBackend,
+  expectedEpoch: number,
+  command: string,
+): void {
+  nativeCommandCaptureProof = targetBackend instanceof ZellijObserveBackend
+    ? { backend: targetBackend, backendEpoch: expectedEpoch, proof: new NativeSessionCommandProof(command) }
+    : null;
+}
+
+async function observeNativeCommandDraftBeforeSubmit(
+  targetBackend: SessionBackend,
+  expectedEpoch: number,
+): Promise<void> {
+  const state = nativeCommandCaptureProof;
+  const cliId = nativeRenameCliId();
+  if (!state || !cliId || state.backend !== targetBackend || state.backendEpoch !== expectedEpoch) return;
+  // Do not submit Enter until phase A is positively captured. Returning after
+  // a fixed number of misses creates an unrecoverable state if the command
+  // finishes before the post-submit probe ever sees its draft. Restart changes
+  // the epoch and aborts this loop; otherwise retry slowly after the initial
+  // short redraw window.
+  for (let attempt = 0; ; attempt += 1) {
+    assertBackendEpochCurrent(targetBackend, expectedEpoch);
+    try {
+      state.proof.observe(captureNativePromptProofScreen(targetBackend), cliId);
+    } catch (err: any) {
+      log(`Native command draft capture failed: ${err?.message ?? err}`);
+    }
+    if (state.proof.hasObservedDraft) return;
+    if (attempt === 2) {
+      log('Native command draft is not visible yet; holding Enter until the target composer is positively captured');
+    }
+    await new Promise(resolve => setTimeout(resolve, attempt < 2 ? 75 : LIVE_ATTACH_COMMAND_PROBE_MS));
+  }
+}
+
+function capturedNativeCommandCompletionIsProven(): boolean {
+  const state = nativeCommandCaptureProof;
+  const cliId = nativeRenameCliId();
+  if (!state || !cliId || !backendEpochIsCurrent(state.backend, state.backendEpoch)) return false;
+  try {
+    return state.proof.observe(captureNativePromptProofScreen(state.backend), cliId);
+  } catch (err: any) {
+    log(`Native command completion capture failed: ${err?.message ?? err}`);
+    return false;
+  }
+}
+
+function clearSessionIdRotationIdleProof(): void {
+  if (sessionIdLatePromptProofTimer) {
+    clearTimeout(sessionIdLatePromptProofTimer);
+    sessionIdLatePromptProofTimer = null;
+  }
+  sessionIdRotationAwaitingIdleSignal = false;
+  sessionIdRotationObservedOutputGeneration = -1;
+  sessionIdRotationProofBackend = null;
+  sessionIdRotationProofBackendEpoch = -1;
+}
+
+function scheduleStableActiveSessionIdPromptProof(
+  targetBackend: SessionBackend,
+  expectedEpoch: number,
+  expectedObservationVersion: number,
+  identityEvidenceAtMs: number,
+): void {
+  if (sessionIdLatePromptProofTimer) clearTimeout(sessionIdLatePromptProofTimer);
+  const armStableSample = (): void => {
+    if (
+      cliSessionIdObservationVersion !== expectedObservationVersion
+      || !backendEpochIsCurrent(targetBackend, expectedEpoch)
+      || !sessionIdRotationAwaitingIdleSignal
+      || sessionIdRotationProofBackend !== targetBackend
+      || sessionIdRotationProofBackendEpoch !== expectedEpoch
+    ) return;
+
+    // Renderer.write() parses asynchronously. If the id observer races the
+    // prompt chunk, the initial screen read is intentionally unsafe; retry
+    // after that exact renderer generation drains rather than depending on a
+    // second PTY chunk that may never arrive.
+    if (!targetBackend.captureViewport && !targetBackend.captureCurrentScreen && renderer?.hasPendingWrites) {
+      const expectedRenderer = renderer;
+      void expectedRenderer.whenWritesParsed().then(() => {
+        if (renderer === expectedRenderer) armStableSample();
+      });
+      return;
+    }
+
+    // A static old composer cannot prove the new identity. Require screen
+    // pixels produced no earlier than the pid/path-bound identity evidence.
+    if (
+      lastBackendPtyOutputAtMs < identityEvidenceAtMs
+      || commandLineWritesPending > 0
+      || !nativePromptScreenIsSafe()
+    ) return;
+
+    sessionIdLatePromptProofTimer = setTimeout(() => {
+      sessionIdLatePromptProofTimer = null;
+      if (
+        cliSessionIdObservationVersion !== expectedObservationVersion
+        || !backendEpochIsCurrent(targetBackend, expectedEpoch)
+        || !sessionIdRotationAwaitingIdleSignal
+        || sessionIdRotationProofBackend !== targetBackend
+        || sessionIdRotationProofBackendEpoch !== expectedEpoch
+        || lastBackendPtyOutputAtMs < identityEvidenceAtMs
+        || commandLineWritesPending > 0
+        || !nativePromptScreenIsSafe()
+      ) return;
+
+      clearSessionIdRotationIdleProof();
+      nativeSessionRename.noteFreshPrompt();
+      log(`Late native session-id observer retained a path-newer stable empty composer for ${SESSION_ID_LATE_PROMPT_SETTLE_MS}ms; releasing desired-title reapply`);
+      markPromptReady();
+    }, SESSION_ID_LATE_PROMPT_SETTLE_MS);
+    sessionIdLatePromptProofTimer.unref?.();
+  };
+
+  armStableSample();
+}
+
+function clearSessionAdminPromptWait(): void {
+  nativeSessionRename.noteFreshPrompt();
+  sessionRotationWriteOutputGeneration = -1;
+  nativeCommandCaptureProof = null;
+  clearSessionIdRotationIdleProof();
+}
+
+function clearLiveAttachPromptProbe(): void {
+  if (!liveAttachPromptProbeTimer) return;
+  clearTimeout(liveAttachPromptProbeTimer);
+  liveAttachPromptProbeTimer = null;
+}
+
+function clearSessionRenameInFlight(): void {
+  if (sessionRenameIdleTimer) {
+    clearTimeout(sessionRenameIdleTimer);
+    sessionRenameIdleTimer = null;
+  }
+  nativeSessionRename.settle();
+  sessionRenameWriteOutputGeneration = -1;
+}
+
+/** Fallback probe if a native rename/rotation does not emit the readyPattern
+ * needed by IdleDetector. The timeout may release the gate only after the same
+ * positive empty-composer proof as a normal idle signal; a slow MCP startup,
+ * selector, or partial text→Enter failure must never be failed open. */
+function armSessionRenameIdleTimeout(): void {
+  if (!nativeSessionRename.isInFlight && !nativeSessionRename.requiresFreshPrompt && !rawCommandWriteFailedAwaitingPrompt) return;
+  // An independent id observer does not own the composer. Its strict
+  // path/screen proof is scheduled separately; if that proof cannot establish
+  // causality, ordinary type-ahead input remains allowed and its next genuine
+  // idle releases the title. A periodic static timeout would only log forever.
+  if (sessionIdRotationAwaitingIdleSignal && !nativeSessionRename.isInFlight && !rawCommandWriteFailedAwaitingPrompt) return;
+  if (sessionRenameIdleTimer) clearTimeout(sessionRenameIdleTimer);
+  const delayMs = nativeCommandCaptureProof
+    ? LIVE_ATTACH_COMMAND_PROBE_MS
+    : SESSION_RENAME_IDLE_TIMEOUT_MS;
+  sessionRenameIdleTimer = setTimeout(() => {
+    sessionRenameIdleTimer = null;
+    if (!nativeSessionRename.isInFlight && !nativeSessionRename.requiresFreshPrompt && !rawCommandWriteFailedAwaitingPrompt) return;
+    if (!rawCommandFailurePromptIsSafe() || !nativeSessionAdminPromptIsSafe()) {
+      log(`Native session administration still lacks empty-prompt proof after ${delayMs}ms; keeping queued input blocked`);
+      armSessionRenameIdleTimeout();
+      return;
+    }
+    log(`Native session administration prompt proven by ${delayMs}ms fallback probe`);
+    markPromptReady();
+  }, delayMs);
+  sessionRenameIdleTimer.unref?.();
+}
+
+/** Deliver passthrough exactly as before: it may be injected while the CLI is
+ * busy (notably Codex /btw). Only the short keystroke sequence is serialized.
+ * Commands received while /rename owns the TUI are deferred by the IPC handler
+ * and come through this same function after the prompt returns. */
+function isNativeSessionRotationInput(msg: RawInputMessage): boolean {
+  return effectiveBackendType !== 'riff' && nativeSessionRename.isRotationCommand(
+    msg.content,
+    cliAdapter?.nativeSessionRotationCommands,
+  );
+}
+
+function rawInputNeedsNativePrompt(msg: RawInputMessage): boolean {
+  if (!isNativeSessionRotationInput(msg)) return false;
+  return nativeSessionRename.hasDesiredTitle || lastInitConfig?.adoptMode !== true;
+}
+
+async function deliverRawInput(
+  msg: RawInputMessage,
+  targetBackend: SessionBackend | null = backend,
+  expectedEpoch = backendEpoch,
+): Promise<void> {
+  if (!targetBackend || !backendEpochIsCurrent(targetBackend, expectedEpoch)) return;
+  renderer?.markNewTurn();
+  usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+  if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
+  // Any local/adopt write invalidates the one-shot transcript proof, including
+  // Zellij live-attach where the ObserveBackend poller is intentionally paused.
+  adoptStaticPromptProofEligible = false;
+  const isNativeRotation = isNativeSessionRotationInput(msg);
+  if (isNativeRotation) nativeSessionRename.beginRotationCommandWrite();
+
+  let sent = false;
+  let keepCaptureForPromptProof = false;
+  let writeOutputGeneration = ptyOutputGeneration;
+  try {
+    await sendRawCommandLineSerially(targetBackend, msg.content, {
+      backendEpoch: expectedEpoch,
+      onWriteStart: () => {
+        writeOutputGeneration = ptyOutputGeneration;
+        if (isNativeRotation && rawInputNeedsNativePrompt(msg)) {
+          beginNativeCommandCaptureProof(targetBackend, expectedEpoch, msg.content);
+        } else {
+          nativeCommandCaptureProof = null;
+        }
+      },
+      onBeforeSubmit: () => nativeCommandCaptureProof
+        ? observeNativeCommandDraftBeforeSubmit(targetBackend, expectedEpoch)
+        : undefined,
+    });
+    if (!backendEpochIsCurrent(targetBackend, expectedEpoch)) return;
+    sent = true;
+    isPromptReady = false;
+    idleDetector?.reset();
+    log(`Passthrough slash command: ${msg.content}`);
+    if (isNativeRotation && nativeSessionRename.commitRotationCommand()) {
+      keepCaptureForPromptProof = true;
+      sessionRotationWriteOutputGeneration = writeOutputGeneration;
+      armSessionRenameIdleTimeout();
+      log(`Native session rotation command sent; waiting for proven fresh prompt before desired title reapply: ${msg.content}`);
+    }
+    if (!keepCaptureForPromptProof) nativeCommandCaptureProof = null;
+  } catch (err: any) {
+    if (isStaleBackendEpochError(err) || !backendEpochIsCurrent(targetBackend, expectedEpoch)) return;
+    if (isNativeRotation) nativeSessionRename.cancelRotationCommandWrite();
+    if (rawCommandWriteFailedAwaitingPrompt) armSessionRenameIdleTimeout();
+    else nativeCommandCaptureProof = null;
+    log(`Passthrough slash command failed (${msg.content}): ${err?.message ?? err}`);
+  }
+
+  // Follow-up rides on the same IPC and is enqueued only after this command's
+  // Enter lands. sendToPty also observes commandLineWritesPending, so another
+  // raw command's text -> Enter window cannot be interrupted by the follow-up.
+  if (sent && msg.followUpContent) {
+    if (lastInitConfig?.adoptMode) {
+      pendingAdoptMessages.push({ content: msg.followUpContent });
+      log(`Enqueued adopted-pane follow-up after raw input (${msg.followUpContent.length} chars)`);
+    } else {
+      sendToPty(msg.followUpContent);
+      log(`Enqueued follow-up after raw input (${msg.followUpContent.length} chars)`);
+    }
+  }
+  // A pending /rename (or another ordinary raw command) may have been held by
+  // the command-write mutex. Drain only after a complete text→Enter delivery.
+  // On failure the command may be partially typed, so the next prompt/idle
+  // signal must prove it is safe before anything else reaches the composer.
+  if (sent || !rawCommandWriteFailedAwaitingPrompt) void flushPending();
+}
+
+/** Deliver one Lark message into an adopted pane while preserving the bridge
+ * attribution path. Unlike spawned sessions, adopted messages do not use the
+ * normal pendingMessages/writeInput loop. */
+async function deliverAdoptMessage(
+  input: PendingCliInput,
+  targetBackend: SessionBackend | null = backend,
+  expectedEpoch = backendEpoch,
+): Promise<void> {
+  if (!targetBackend || !backendEpochIsCurrent(targetBackend, expectedEpoch)) return;
+
+  renderer?.markNewTurn();
+  const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+  if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
+  const content = input.content;
+  currentBotmuxTurnId = input.turnId;
+  writeCliPidMarker();
+
+  // Capture the transcript baseline before writing so later assistant events
+  // are attributed to this Lark turn rather than prior local pane activity.
+  if (bridgeJsonlPath) {
+    try { bridgeIngest(); } catch { /* best effort */ }
+    bridgeMarkPendingTurn(content, input.turnId);
+  } else if (codexBridgeFallbackActive()) {
+    if (codexBridgeIsCursor()) {
+      codexBridgeMarkPendingTurn(content, input.turnId);
+      try { codexBridgeIngest(); } catch { /* best effort */ }
+    } else {
+      try { codexBridgeIngest(); } catch { /* best effort */ }
+      codexBridgeMarkPendingTurn(content, input.turnId);
+    }
+  }
+
+  // Invalidate readiness BEFORE the first async write. Otherwise a concurrent
+  // native rename can splice into writeInput's paste/submit/verification window,
+  // and a newly observed cliSessionId can mistake the old prompt for the new one.
+  adoptStaticPromptProofEligible = false;
+  isPromptReady = false;
+  idleDetector?.reset();
+  adoptInputWriteInProgress = true;
+  try {
+    if (isStructuredBridgeAdoptInputCli(lastInitConfig?.cliId) && cliAdapter) {
+      try {
+        const writeObservationVersion = cliSessionIdObservationVersion;
+        const result = await cliAdapter.writeInput(targetBackend as unknown as PtyHandle, content);
+        if (!backendEpochIsCurrent(targetBackend, expectedEpoch)) return;
+        if (result?.cliSessionId) {
+          const accepted = persistCliSessionId(result.cliSessionId, {
+            expectedBackend: targetBackend,
+            expectedBackendEpoch: expectedEpoch,
+            expectedObservationVersion: writeObservationVersion,
+          });
+          if (accepted) codexBridgeNotifyCliSessionId(result.cliSessionId);
+        }
+        if (result && result.submitted === false) {
+          scheduleSubmitFailureNotify(content, result.recheck, 'submit history', undefined, result.failureReason, turnSeq);
+        }
+      } catch (err: any) {
+        log(`Adopt writeInput error (${lastInitConfig?.cliId}): ${err.message}`);
+      }
+    } else if ('sendText' in targetBackend && 'sendSpecialKeys' in targetBackend) {
+      (targetBackend as any).sendText(content);
+      // Keep the same paste-burst guard used by raw slash commands.
+      await new Promise(r => setTimeout(r, 200));
+      if (!backendEpochIsCurrent(targetBackend, expectedEpoch)) return;
+      (targetBackend as any).sendSpecialKeys('Enter');
+    } else {
+      targetBackend.write(content + '\r');
+    }
+  } finally {
+    if (backendEpochIsCurrent(targetBackend, expectedEpoch)) {
+      adoptInputWriteInProgress = false;
+      void flushPending();
+    }
+  }
+}
 /** Inputs written to the CLI whose turn hasn't completed — re-queued across a
  *  CLI crash so a submit-time death can't silently eat user messages. */
 const inflightInputs = new InflightInputTracker();
 /** Alternate submit-confirmation signals. Some CLIs can consume PTY input and
  *  start work before their history/transcript submit marker is observable. */
 let lastPtyActivityAtMs = 0;
+/** Monotonic PTY-output proof. A late cliSessionId observer may reuse an
+ * already-established prompt only when no output has arrived since that exact
+ * prompt; otherwise it waits for the next IdleDetector callback. */
+let ptyOutputGeneration = 0;
+let promptReadyOutputGeneration = -1;
+/** Wall-clock timestamp of actual bytes from the current backend generation.
+ * Unlike lastPtyOutputAtMs this is never seeded for quiescence bookkeeping, so
+ * a late identity observer cannot mistake spawn time for real prompt output. */
+let lastBackendPtyOutputAtMs = 0;
+/** Initial static transcript/screen proof is a one-shot adopt escape hatch.
+ * Any live pane output permanently invalidates it for this attach generation;
+ * subsequent readiness must come from IdleDetector observing that live stream. */
+let adoptStaticPromptProofEligible = false;
+function hasCurrentNativeAdminPromptProof(): boolean {
+  if (!isPromptReady || promptReadyOutputGeneration !== ptyOutputGeneration) return false;
+  if (!cliAdapter?.buildSessionRenameCommand || effectiveBackendType === 'riff') return true;
+  return nativePromptScreenIsSafe();
+}
 let currentBotmuxTurnId: string | undefined;
 function readProcStarttime(pid: number): string | undefined {
   try {
@@ -995,6 +1550,43 @@ function bridgeRememberSessionIdForPath(path: string | undefined): void {
   bridgeKnownSessionIds.add(sid);
 }
 
+/** Latest filesystem evidence that a pid-bound transcript identity is active.
+ * An existing session can be resumed long after its birthtime, so creation time
+ * alone cannot bind current screen pixels to that identity. mtime/ctime move
+ * when the CLI activates or appends to the selected transcript. */
+function activeSessionIdentityEvidenceAtMs(path: string): number | undefined {
+  try {
+    const stat = statSync(path);
+    const evidence = Math.max(stat.birthtimeMs, stat.ctimeMs, stat.mtimeMs);
+    return Number.isFinite(evidence) && evidence > 0 ? evidence : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function activeSessionPromptProofForPath(path: string):
+  | { kind: 'active-screen'; identityEvidenceAtMs: number }
+  | undefined {
+  const identityEvidenceAtMs = activeSessionIdentityEvidenceAtMs(path);
+  return identityEvidenceAtMs === undefined
+    ? undefined
+    : { kind: 'active-screen', identityEvidenceAtMs };
+}
+
+/** A bridge path selected by pid/fd or an exact pending-turn fingerprint is
+ * bound to this worker's active Claude process. Persist its native identity;
+ * if the same pane is already at an empty prompt, that binding also makes the
+ * current screen an authoritative late-observer proof. */
+function persistActiveBridgeSessionId(path: string): void {
+  const cliSessionId = sessionIdFromJsonlPath(path);
+  if (!SESSION_ID_FILENAME_RE.test(cliSessionId)) return;
+  persistCliSessionId(cliSessionId, {
+    expectedBackend: backend,
+    expectedBackendEpoch: backendEpoch,
+    currentPromptProof: activeSessionPromptProofForPath(path),
+  });
+}
+
 /** Cheap per-tick probe: read /proc/<bridgeCliPid>/fd and add every jsonl
  *  the adopted Claude pid currently has open into the known-sid set. fd
  *  observation is intermittent (Claude opens-writes-closes per event), so
@@ -1028,7 +1620,7 @@ function scheduleHerdrAdoptBridgeQuietEmit(): void {
     if (!bridgeShouldEmitAfterTranscriptQuiet()) return;
     try {
       bridgeDrainAndMaybeEmit();
-      markPromptReady();
+      if (acceptSessionIdRotationIdleSignal('Claude transcript quiet')) markPromptReady();
       log('Bridge quiet emit attempted — herdr adopt mode');
     } catch (err: any) {
       log(`Bridge quiet emit error: ${err.message}`);
@@ -1130,6 +1722,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   log(`Bridge fingerprint switch split: ${history.length} historical events absorbed, ${live.length} live events ingested (cutoff=${cutoffMs})`);
   bridgeRememberSessionIdForPath(matched);
   bridgeMarkStalePidStateForAcceptedSid(sessionIdFromJsonlPath(matched));
+  persistActiveBridgeSessionId(matched);
   try {
     bridgeWatcher = fsWatch(matched, { persistent: false }, () => {
       try { performBridgeIngestAndScheduleQuietEmit(); } catch (err: any) { log(`Bridge ingest error: ${err.message}`); }
@@ -1397,6 +1990,7 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   if (live.length > 0) bridgeQueue.ingest(live, newPath);
   bridgeBaselineDone = true;
   log(`Bridge rotation split: ${history.length} historical events absorbed, ${live.length} live events ingested`);
+  persistActiveBridgeSessionId(newPath);
 
   try {
     bridgeWatcher = fsWatch(newPath, { persistent: false }, () => {
@@ -1567,6 +2161,7 @@ function maybeFollowSessionRotationViaPid(): PidFollowResult {
   bridgeOffset = 0;
   bridgePendingTail = '';
   bridgeBaselineDone = true;
+  persistActiveBridgeSessionId(resolved.path);
   try {
     bridgeWatcher = fsWatch(resolved.path, { persistent: false }, () => {
       try { performBridgeIngestAndScheduleQuietEmit(); } catch (err: any) { log(`Bridge ingest error: ${err.message}`); }
@@ -1692,6 +2287,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
         log(`Bridge transcript adjusted at start (pid resolver): ${bridgeJsonlPath} → ${resolved.path}`);
         bridgeJsonlPath = resolved.path;
         bridgeJsonlDir = dirname(resolved.path);
+        persistActiveBridgeSessionId(resolved.path);
       }
     }
   }
@@ -1726,6 +2322,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
         // open — record it as stale so the per-tick pid resolver doesn't
         // pull us back to the spawn-time jsonl on every poll.
         bridgeMarkStalePidStateForAcceptedSid(sessionIdFromJsonlPath(newest));
+        persistActiveBridgeSessionId(newest);
       }
     }
   }
@@ -1778,6 +2375,12 @@ function stopBridgeWatcher(): void {
   }
   bridgeCliPid = undefined;
   bridgeCliCwd = undefined;
+  bridgeJsonlPath = undefined;
+  bridgeJsonlDir = undefined;
+  bridgeDataDir = DEFAULT_CLAUDE_DATA_DIR;
+  bridgeOffset = 0;
+  bridgePendingTail = '';
+  bridgeBaselineDone = false;
   bridgeObservedCliSessionId = undefined;
   bridgeKnownSessionIds.clear();
   bridgeStalePidStateSessionId = undefined;
@@ -2100,7 +2703,11 @@ function codexBridgeStartTimer(): void {
         if (path) {
           if (codexAdoptPendingPid && (lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex')) {
             const discoveredSessionId = codexSessionIdFromRolloutPath(path);
-            if (discoveredSessionId) persistCliSessionId(discoveredSessionId);
+            if (discoveredSessionId) persistCliSessionId(discoveredSessionId, {
+              expectedBackend: backend,
+              expectedBackendEpoch: backendEpoch,
+              currentPromptProof: activeSessionPromptProofForPath(path),
+            });
           }
           codexBridgePendingSessionId = undefined;
           codexAdoptPendingPid = undefined;
@@ -2263,6 +2870,11 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
   // 在 macOS 上会卡死，永远收不到模型回复。Linux 上 poller 多 tick 也无害
   // （codexBridgeIngest 在 offset 未推进时是 no-op）。
   codexBridgeStartTimer();
+  // A Codex adopt can receive `/rename` before its rollout path is discoverable.
+  // If the pane has stayed completely static since attach, path discovery is
+  // the missing half of the transcript+composer proof; retry it now. The helper
+  // is a no-op for spawned sessions and for adopts that emitted any live byte.
+  maybeMarkAdoptPromptReadyFromTranscript('Codex bridge attach');
 }
 
 type CursorAttachMode = 'baseline-existing' | 'fresh-empty';
@@ -2510,6 +3122,19 @@ function stopCodexBridge(): void {
   codexBridgePendingSessionId = undefined;
   codexAdoptPendingPid = undefined;
   codexAdoptStartMs = undefined;
+}
+
+/** Backend generations must not share transcript attribution state. A prompt
+ * that died before its user event reached JSONL is re-queued by
+ * InflightInputTracker; retaining its old unstarted bridge mark would create a
+ * duplicate mark on respawn and poison head-of-line attribution forever. */
+function resetTranscriptBridgesForBackendGeneration(reason: string): void {
+  stopBridgeWatcher();
+  const droppedClaudeTurns = bridgeQueue.clearPending();
+  if (droppedClaudeTurns.length > 0) {
+    log(`Cleared ${droppedClaudeTurns.length} Claude bridge turn(s) for backend generation teardown (${reason})`);
+  }
+  stopCodexBridge();
 }
 
 /** When a rotation moves bridgeJsonlPath away from `oldPath`, queue turns
@@ -3323,6 +3948,20 @@ function splitCodexAppControl(data: string): string {
 function onPtyData(data: string): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
+  ptyOutputGeneration += 1;
+  // Timestamp at receipt, before renderer.write() begins its asynchronous
+  // parse. Late identity observers use this to bind the eventual parsed screen
+  // to PTY output from the same-or-newer filesystem identity generation.
+  lastPtyOutputAtMs = Date.now();
+  lastBackendPtyOutputAtMs = lastPtyOutputAtMs;
+  // Adopted panes also receive input outside Botmux. IdleDetector correctly
+  // re-arms itself on those live bytes, so invalidate the worker-level bit in
+  // lockstep; historical seed runs before the detector is installed and never
+  // reaches this branch with a true ready bit.
+  if (lastInitConfig?.adoptMode) {
+    adoptStaticPromptProofEligible = false;
+    if (isPromptReady) isPromptReady = false;
+  }
   lastPtyActivityAtMs = Date.now();
   maybeCaptureKiroSessionId(data);
   captureWorkflowTranscript(data);
@@ -3383,14 +4022,165 @@ function onPtyData(data: string): void {
     }
   }
 
-  // Track last PTY output time for the ready-gate quiescence settle (see
-  // settleThenFlush) and delegate idle detection to IdleDetector.
-  lastPtyOutputAtMs = Date.now();
+  // Delegate idle detection after every synchronous output guard has run.
   idleDetector?.feed(data);
 }
 
+/** Query the current keyboard target and positively identify an empty native
+ * composer. This live screen check is deliberately separate from generation:
+ * observe backends can expose authoritative pixels even when their onData poll
+ * is paused, while renderer-backed PTYs must first drain xterm's async parser. */
+function nativePromptScreenIsSafe(): boolean {
+  const cliId = lastInitConfig?.cliId;
+  if (cliId !== 'claude-code' && cliId !== 'codex') return true;
+  if (!backend) return false;
+  try {
+    // Renderer-backed managed Zellij/direct PTY additionally waits for xterm's
+    // asynchronous parser before reading its current cells.
+    if (!backend.captureViewport && !backend.captureCurrentScreen) {
+      if (!renderer || renderer.hasPendingWrites) return false;
+    }
+    const screen = captureNativePromptProofScreen(backend);
+    return !hasNativeSessionBusyMarker(screen) && hasNativeSessionIdleComposer(screen, cliId);
+  } catch (err: any) {
+    log(`Native command prompt proof failed: ${err?.message ?? err}`);
+    return false;
+  }
+}
+
+/** An IdleDetector callback after a failed raw text→Enter write is not enough:
+ * readyPattern can match a composer holding a partial draft. On ordinary
+ * onData-backed paths require output newer than the exact write baseline, then
+ * revalidate the live empty composer. Zellij live attach uses the separate
+ * two-phase command capture proof because its output generation is frozen. */
+function nativePromptProofIsSafeSince(outputGeneration: number): boolean {
+  const cliId = lastInitConfig?.cliId;
+  if (cliId !== 'claude-code' && cliId !== 'codex') return true;
+  if (ptyOutputGeneration <= outputGeneration) return false;
+  return nativePromptScreenIsSafe();
+}
+
+function rawCommandFailurePromptIsSafe(): boolean {
+  if (!rawCommandWriteFailedAwaitingPrompt) return true;
+  // When an observe/live-attach path armed exact two-phase capture, generation
+  // is not an alternate proof: accepting it would let unrelated chrome output
+  // bypass the required draft -> empty transition.
+  if (nativeCommandCaptureProof) return capturedNativeCommandCompletionIsProven();
+  return nativePromptProofIsSafeSince(rawCommandFailureOutputGeneration);
+}
+
+function nativeSessionAdminPromptIsSafe(): boolean {
+  const renameInFlight = nativeSessionRename.isInFlight;
+  const rotationPending = nativeSessionRename.requiresFreshPrompt;
+  if (!renameInFlight && !rotationPending) return true;
+  if (commandLineWritesPending > 0) return false;
+  if (sessionIdRotationAwaitingIdleSignal) return false;
+  if (nativeCommandCaptureProof) return capturedNativeCommandCompletionIsProven();
+  const proofGeneration = Math.max(
+    renameInFlight ? sessionRenameWriteOutputGeneration : -1,
+    rotationPending ? sessionRotationWriteOutputGeneration : -1,
+  );
+  return nativePromptProofIsSafeSince(proofGeneration);
+}
+
+/** A changed native id alone proves only phase A. Release its rotation gate
+ * exclusively from a real later idle source, and only after output newer than
+ * the id observation has reached a live empty composer. A timeout
+ * probe never calls this helper, so a slow redraw cannot reuse the old screen. */
+function acceptSessionIdRotationIdleSignal(source: string): boolean {
+  if (!sessionIdRotationAwaitingIdleSignal) return true;
+  if (
+    !sessionIdRotationProofBackend
+    || !backendEpochIsCurrent(sessionIdRotationProofBackend, sessionIdRotationProofBackendEpoch)
+    || commandLineWritesPending > 0
+    || ptyOutputGeneration <= sessionIdRotationObservedOutputGeneration
+    || !nativePromptScreenIsSafe()
+  ) {
+    log(`Ignoring ${source} idle for native session-id rotation — newer empty composer not proven`);
+    isPromptReady = false;
+    return false;
+  }
+  clearSessionIdRotationIdleProof();
+  nativeSessionRename.noteFreshPrompt();
+  log(`Native session-id rotation reached a fresh prompt (${source}); releasing desired-title reapply`);
+  return true;
+}
+
+/** ObserveBackend polling is paused while a browser owns a live Zellij attach,
+ * so its PTY stream is the only activity/idle source in that window. Debounce
+ * the stream, then re-read authoritative pane pixels before restoring ready. */
+function scheduleLiveAttachPromptProbe(
+  targetBackend: SessionBackend,
+  expectedEpoch: number,
+): void {
+  clearLiveAttachPromptProbe();
+  liveAttachPromptProbeTimer = setTimeout(() => {
+    liveAttachPromptProbeTimer = null;
+    if (!backendEpochIsCurrent(targetBackend, expectedEpoch)) return;
+    if (!nativePromptScreenIsSafe()) return;
+    if (!acceptSessionIdRotationIdleSignal('Zellij live-attach debounce')) return;
+    markPromptReady();
+  }, LIVE_ATTACH_COMMAND_PROBE_MS);
+  liveAttachPromptProbeTimer.unref?.();
+}
+
+/** Before an at-least-once restored title is typed, prove the current keyboard
+ * target too. IdleDetector can match old reattach history while the live pane
+ * is busy; viewport proof prevents the automatic rename entering that TUI. */
+function pendingNativeSessionRenamePromptIsSafe(): boolean {
+  if (!nativeSessionRename.hasPending) return true;
+  // Let flushPending discard a capability mismatch. Riff has no local TUI and
+  // would otherwise wait forever for an empty composer it cannot expose.
+  if (!cliAdapter?.buildSessionRenameCommand || effectiveBackendType === 'riff') return true;
+  return nativePromptScreenIsSafe();
+}
+
+function scheduleNativePromptProofAfterRendererDrain(): void {
+  if (
+    nativePromptProofRetryArmed
+    || !backend
+    || backend.captureViewport
+    || backend.captureCurrentScreen
+    || !renderer?.hasPendingWrites
+  ) return;
+  nativePromptProofRetryArmed = true;
+  const expectedBackend = backend;
+  const expectedRenderer = renderer;
+  void expectedRenderer.whenWritesParsed().then(() => {
+    nativePromptProofRetryArmed = false;
+    if (backend !== expectedBackend || renderer !== expectedRenderer) return;
+    if (
+      !rawCommandWriteFailedAwaitingPrompt
+      && !nativeSessionRename.isInFlight
+      && !nativeSessionRename.requiresFreshPrompt
+      && !nativeSessionRename.hasPending
+    ) return;
+    markPromptReady();
+  });
+}
+
 function markPromptReady(): void {
-  if (isPromptReady) return;  // guard against duplicate calls
+  if (
+    !rawCommandFailurePromptIsSafe()
+    || !nativeSessionAdminPromptIsSafe()
+    || !pendingNativeSessionRenamePromptIsSafe()
+  ) {
+    isPromptReady = false;
+    scheduleNativePromptProofAfterRendererDrain();
+    log('Ignoring native-command idle — a newer empty composer is not proven');
+    return;
+  }
+  rawCommandWriteFailedAwaitingPrompt = false;
+  rawCommandFailureOutputGeneration = -1;
+  if (isPromptReady) {
+    // Duplicate external-idle signals can be the proof that output observed
+    // since the prior prompt has now settled at a new prompt.
+    promptReadyOutputGeneration = ptyOutputGeneration;
+    clearSessionAdminPromptWait();
+    clearSessionRenameInFlight();
+    void flushPending();
+    return;
+  }
   stopBusyPatternIdleProbe();
   // Ready-gate: a startup selector's ❯ (cjadk et al.) falsely matches
   // readyPattern → the IdleDetector fires idle while the CLI is NOT actually at
@@ -3408,6 +4198,9 @@ function markPromptReady(): void {
     return;
   }
   isPromptReady = true;
+  promptReadyOutputGeneration = ptyOutputGeneration;
+  clearSessionAdminPromptWait();
+  clearSessionRenameInFlight();
   // CLI 实际启动成功（回到 prompt）：复位连续重启计数。
   // 任何能到这一步的 spawn 都算"成功"——后续即便再崩溃（不是 resume 目标不存在
   // 的问题），下一轮也该有新的 2 次重试预算，而不是被历史重启计数卡住。
@@ -3430,26 +4223,139 @@ function markPromptReady(): void {
   // make the CLI busy, so the idle state is transient and shouldn't appear
   // in the card.  This avoids a false "就绪" flash on daemon restart
   // (where the initial prompt is queued before the CLI becomes idle).
-  if (renderer && pendingMessages.length === 0 && !isFlushing) {
+  if (renderer && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && !nativeSessionRename.hasPending && !isFlushing) {
     const { content } = renderer.snapshot();
     send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle'), turnId: currentBotmuxTurnId });
   }
   flushPending();
 }
 
-function persistCliSessionId(cliSessionId: string): void {
-  if (!cliSessionId || !sessionId) return;
-  if (lastInitConfig) lastInitConfig.cliSessionId = cliSessionId;
-  send({ type: 'cli_session_id', cliSessionId });
-  try {
-    const session = sessionStore.getSession(sessionId);
-    if (!session || session.cliSessionId === cliSessionId) return;
-    session.cliSessionId = cliSessionId;
-    sessionStore.updateSession(session);
-    log(`Persisted CLI session id: ${cliSessionId}`);
-  } catch (err: any) {
-    log(`Failed to persist CLI session id: ${err.message}`);
+type CliSessionIdPersistenceOptions = {
+  expectedBackend?: SessionBackend | null;
+  expectedBackendEpoch?: number;
+  expectedObservationVersion?: number;
+  /** Authoritative proof that a prompt already visible at observation belongs
+   * to this id. `active-screen` is reserved for pid-bound adopt discovery and
+   * is accepted only after a second stable sample (never at observation time);
+   * `after-generation` is for an async submit result whose later prompt was
+   * proven after that operation began. */
+  currentPromptProof?:
+    | { kind: 'active-screen'; identityEvidenceAtMs: number }
+    | { kind: 'after-generation'; outputGeneration: number };
+};
+
+function persistCliSessionId(
+  cliSessionId: string,
+  opts: CliSessionIdPersistenceOptions = {},
+): boolean {
+  if (!cliSessionId || !sessionId) return false;
+  if (
+    opts.expectedBackend !== undefined
+    && (
+      !opts.expectedBackend
+      || opts.expectedBackendEpoch === undefined
+      || !backendEpochIsCurrent(opts.expectedBackend, opts.expectedBackendEpoch)
+    )
+  ) {
+    log(`Ignored stale CLI session id from prior backend generation: ${cliSessionId}`);
+    return false;
   }
+  if (
+    opts.expectedObservationVersion !== undefined
+    && opts.expectedObservationVersion !== cliSessionIdObservationVersion
+  ) {
+    // Another observer won the race while this async producer was pending.
+    // The same current id is an idempotent success (callers may still need to
+    // attach its bridge); any different id is stale/ambiguous and must not
+    // roll persisted identity backward.
+    if (lastInitConfig?.cliSessionId === cliSessionId) return true;
+    log(`Ignored out-of-order CLI session id ${cliSessionId} (observation version ${opts.expectedObservationVersion} != ${cliSessionIdObservationVersion})`);
+    return false;
+  }
+
+  // Only an adapter-declared raw /clear or /new owns an exact command proof.
+  // If an earlier *independent* id rotation is already waiting, a second id
+  // must replace that observer baseline (or use an explicit current proof)
+  // rather than being mistaken for confirmation of the old rotation.
+  const adapterRotationAlreadyWaitingForPrompt = nativeSessionRename.requiresFreshPrompt
+    && !sessionIdRotationAwaitingIdleSignal;
+  const hadCurrentPromptProof = hasCurrentNativeAdminPromptProof();
+  const activeScreenIdentityEvidenceAtMs = opts.currentPromptProof?.kind === 'active-screen'
+    ? opts.currentPromptProof.identityEvidenceAtMs
+    : undefined;
+  const authoritativeCurrentPrompt = opts.currentPromptProof?.kind === 'after-generation'
+    && hadCurrentPromptProof
+    && promptReadyOutputGeneration > opts.currentPromptProof.outputGeneration;
+  const observation = nativeSessionRename.observeCliSessionId(cliSessionId);
+  if (observation.kind === 'unchanged') return true;
+
+  cliSessionIdObservationVersion += 1;
+  if (lastInitConfig) lastInitConfig.cliSessionId = cliSessionId;
+  // Daemon is the sole writer of the persisted Session record. Writing the
+  // worker's independently cached full record here can race a concurrent
+  // /rename and erase desiredNativeSessionTitle (last-writer-wins JSON store).
+  send({ type: 'cli_session_id', cliSessionId });
+
+  if (!observation.queuedTitleReapply) return true;
+  log(`Native CLI session id ${observation.kind === 'baseline' ? 'established' : 'rotated'}; queued desired title reapply: ${cliSessionId}`);
+
+  // First discovery is a baseline, not proof of a rotation. The state may
+  // idempotently re-queue a restored desired title, but normal pending-title
+  // prompt gating is sufficient and must not invent a fresh-prompt wait.
+  if (observation.kind === 'baseline') {
+    maybeMarkAdoptPromptReadyFromTranscript('session-id baseline');
+    void flushPending();
+    return true;
+  }
+
+  // A /clear or /new command whose prompt proof is already active owns this
+  // early id signal. Keep its exact draft/generation baseline; never replace it
+  // with the observer's later generation.
+  if (adapterRotationAlreadyWaitingForPrompt) {
+    log(`Native CLI session id coalesced with adapter-declared rotation: ${cliSessionId}`);
+    armSessionRenameIdleTimeout();
+    return true;
+  }
+
+  // A deferred submit recheck can carry a prompt proven after its write
+  // baseline. Reuse that phase boundary instead of deadlocking on nonexistent
+  // future output.
+  if (authoritativeCurrentPrompt) {
+    clearSessionIdRotationIdleProof();
+    nativeSessionRename.noteFreshPrompt();
+    isPromptReady = true;
+    promptReadyOutputGeneration = ptyOutputGeneration;
+    log(`Native CLI session id arrived after its fresh prompt was already proven: ${cliSessionId}`);
+    void flushPending();
+    return true;
+  }
+
+  // Independent changed id is phase A only. Cancel any idle callback that was
+  // armed before this observation, then require post-observation output + a
+  // genuine later idle source + authoritative empty-composer pixels.
+  isPromptReady = false;
+  clearSessionIdRotationIdleProof();
+  sessionIdRotationAwaitingIdleSignal = true;
+  sessionIdRotationObservedOutputGeneration = ptyOutputGeneration;
+  sessionIdRotationProofBackend = backend;
+  sessionIdRotationProofBackendEpoch = backendEpoch;
+  idleDetector?.reset();
+  log('Waiting for post-observation activity and a fresh prompt before title reapply');
+  // Pid/path-bound observers can also arrive after the new prompt is already
+  // quiet. Never accept the observation-time pixels immediately: sample the
+  // same empty composer again after a settle window so an imminent first render
+  // has time to invalidate it. If it changes/busies, the normal output+idle
+  // proof above remains armed.
+  if (activeScreenIdentityEvidenceAtMs !== undefined && backend) {
+    scheduleStableActiveSessionIdPromptProof(
+      backend,
+      backendEpoch,
+      cliSessionIdObservationVersion,
+      activeScreenIdentityEvidenceAtMs,
+    );
+  }
+  armSessionRenameIdleTimeout();
+  return true;
 }
 
 function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
@@ -3547,13 +4453,25 @@ function scheduleSubmitFailureNotify(
     return;
   }
   const activityBaselineMs = Date.now();
+  const recheckBackend = backend;
+  const recheckBackendEpoch = backendEpoch;
+  const recheckObservationVersion = cliSessionIdObservationVersion;
+  const recheckOutputGeneration = ptyOutputGeneration;
   log(`writeInput: submit not confirmed after retries — deferred ${SUBMIT_DEFERRED_RECHECK_MS}ms recheck queued. preview="${preview}"`);
   setTimeout(async () => {
+    if (!recheckBackend || !backendEpochIsCurrent(recheckBackend, recheckBackendEpoch)) {
+      log(`Deferred recheck discarded after backend replacement. preview="${preview}"`);
+      return;
+    }
     let recheckSubmitted = false;
     let cliSessionId: string | undefined;
     if (recheck) {
       try {
         const recheckResult = await recheck();
+        if (!backendEpochIsCurrent(recheckBackend, recheckBackendEpoch)) {
+          log(`Deferred recheck result discarded after backend replacement. preview="${preview}"`);
+          return;
+        }
         recheckSubmitted = typeof recheckResult === 'boolean'
           ? recheckResult
           : recheckResult.submitted === true;
@@ -3574,8 +4492,16 @@ function scheduleSubmitFailureNotify(
     switch (action.kind) {
       case 'suppress-confirmed':
         if (cliSessionId) {
-          persistCliSessionId(cliSessionId);
-          if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
+          const accepted = persistCliSessionId(cliSessionId, {
+            expectedBackend: recheckBackend,
+            expectedBackendEpoch: recheckBackendEpoch,
+            expectedObservationVersion: recheckObservationVersion,
+            currentPromptProof: {
+              kind: 'after-generation',
+              outputGeneration: recheckOutputGeneration,
+            },
+          });
+          if (accepted && codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
         }
         log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
         return;
@@ -3670,9 +4596,30 @@ function detectBareShellLaunch(): boolean {
  * Messages pushed during a flush are picked up by the while loop.
  */
 async function flushPending(): Promise<void> {
-  if (isFlushing) return;  // while loop in active flush will pick up new messages
+  if (isFlushing) {
+    flushWakeRequested = true;
+    return;
+  }
   if (!backend || !cliAdapter) return;
-  if (pendingMessages.length === 0) return;  // nothing to flush — keep isPromptReady
+  const flushBackend = backend;
+  const flushAdapter = cliAdapter;
+  const flushBackendEpoch = backendEpoch;
+  if (pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && !nativeSessionRename.hasPending) return;  // nothing to flush — keep isPromptReady
+  // Capability mismatch is independent of TUI readiness or an inherited
+  // rotation gate. Riff has no local composer to prove, so discard before any
+  // native-session state can block the queue.
+  if (nativeSessionRename.hasPending && (!flushAdapter.buildSessionRenameCommand || effectiveBackendType === 'riff')) {
+    nativeSessionRename.discardUnsupported();
+    clearSessionAdminPromptWait();
+    clearSessionRenameInFlight();
+    log(`Ignoring native session rename — unsupported by ${cliName()}${effectiveBackendType === 'riff' ? ' on riff backend' : ''}`);
+    if (pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0) return;
+  }
+  if (adoptInputWriteInProgress) return;
+  if (rawCommandWriteFailedAwaitingPrompt) return;
+  if (nativeSessionRename.isInFlight) return;  // wait for /rename to finish before any user input
+  if (nativeSessionRename.blocksInput) return;  // rotation write/UI must reach its own prompt before type-ahead
+  if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
   if (bareShellLaunchBlocked) return;  // launch failed into a bare shell — don't type prompts into it
   // Ready-gate: hold the FIRST prompt until the SessionStart hook fires a true-
   // ready signal. A cjadk-style startup selector's ❯ falsely matches readyPattern
@@ -3714,8 +4661,26 @@ async function flushPending(): Promise<void> {
   // Codex on codex-cli 0.134.0.
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
-  const typeAheadAllowed = cliAdapter.supportsTypeAhead;
-  if (!isPromptReady && !typeAheadAllowed) return;
+  const typeAheadAllowed = flushAdapter.supportsTypeAhead;
+  // Native /rename is an administrative command, not a steer/queued model
+  // message. It must wait for a real prompt even on type-ahead CLIs. Normal
+  // pending messages can still drain while busy; the rename stays queued.
+  const nativeAdminPromptReady = hasCurrentNativeAdminPromptProof();
+  const sessionRenameReady = nativeAdminPromptReady && nativeSessionRename.hasPending;
+  const nextRawInput = pendingRawInputs[0];
+  // Ordinary passthroughs (notably repeated Codex `/btw`) retain legacy busy
+  // steering: a command queued only because another text→Enter write owned the
+  // mutex drains immediately afterwards. Only native-session rotations wait
+  // for prompt proof, and FIFO prevents later raw inputs from bypassing one.
+  const rawInputReady = !!nextRawInput && (
+    !rawInputNeedsNativePrompt(nextRawInput) || nativeAdminPromptReady
+  );
+  const adoptMessageReady = pendingAdoptMessages.length > 0
+    && (isPromptReady || typeAheadAllowed === true);
+  const supportedSessionRenameReady = sessionRenameReady;
+  if (pendingRawInputs.length > 0 && !rawInputReady) return;
+  if (!isPromptReady && pendingMessages.length === 0 && !adoptMessageReady && !rawInputReady) return;
+  if (!isPromptReady && !typeAheadAllowed && !rawInputReady) return;
 
   isFlushing = true;
   if (isPromptReady) {
@@ -3724,6 +4689,7 @@ async function flushPending(): Promise<void> {
   }
 
   try {
+    assertBackendEpochCurrent(flushBackend, flushBackendEpoch);
     // Launch-failure guard, run ONCE per spawn on the first flush, BEFORE startup
     // commands or any user prompt: if the pane leaf is a bare shell (the CLI never
     // launched — e.g. a user rcfile that `exec`-trampolines into another shell, or
@@ -3747,9 +4713,73 @@ async function flushPending(): Promise<void> {
     // isFlushing mutex so no Lark message can interleave between the commands.
     if (!hasRunStartupCommands) {
       hasRunStartupCommands = true;
-      await runStartupCommands();
+      const startupCommandsRan = await runStartupCommands(flushBackend, flushBackendEpoch);
+      if (!backendEpochIsCurrent(flushBackend, flushBackendEpoch)) return;
+      // startupCommands deliberately invalidate readiness. Do not reuse the
+      // prompt booleans computed before their async TUI work; wait for a fresh
+      // markPromptReady() before native rename or user input.
+      if (startupCommandsRan) return;
     }
-    while (pendingMessages.length > 0 && backend && cliAdapter) {
+    if (rawCommandWriteFailedAwaitingPrompt) return;
+    // Commands deferred behind a previous rename run before the latest pending
+    // rename. Some passthroughs (/clear, /new) can rotate the native session;
+    // applying the canonical title last keeps the resume-picker label aligned.
+    if (rawInputReady && pendingRawInputs.length > 0) {
+      const raw = pendingRawInputs.shift()!;
+      await deliverRawInput(raw, flushBackend, flushBackendEpoch);
+      return;
+    }
+    if (supportedSessionRenameReady) {
+      const title = nativeSessionRename.takeForSend();
+      if (title === null) return;
+      const buildRename = flushAdapter.buildSessionRenameCommand!;
+      const renameCommand = buildRename(title);
+      sessionRenameWriteOutputGeneration = ptyOutputGeneration;
+      try {
+        await sendRawCommandLineSerially(flushBackend, renameCommand, {
+          backendEpoch: flushBackendEpoch,
+          onWriteStart: () => {
+            sessionRenameWriteOutputGeneration = ptyOutputGeneration;
+            beginNativeCommandCaptureProof(flushBackend, flushBackendEpoch, renameCommand);
+          },
+          onBeforeSubmit: () => observeNativeCommandDraftBeforeSubmit(flushBackend, flushBackendEpoch),
+        });
+        if (!backendEpochIsCurrent(flushBackend, flushBackendEpoch)) return;
+        armSessionRenameIdleTimeout();
+        idleDetector?.reset();
+        log(`Native session rename command sent (${cliName()}): ${title}`);
+      } catch (err: any) {
+        if (isStaleBackendEpochError(err) || !backendEpochIsCurrent(flushBackend, flushBackendEpoch)) return;
+        // Local title persistence is authoritative; native sync is best-effort.
+        // Do not blindly replay a partially typed command after a backend error.
+        if (rawCommandWriteFailedAwaitingPrompt) {
+          // The write may have stopped after typing only part of the command.
+          // The timeout below is a proof probe, not fail-open.
+          armSessionRenameIdleTimeout();
+          log(`Native session rename command failed (${cliName()}): ${err?.message ?? err}; waiting for proven empty prompt`);
+        } else {
+          // An explicit backend `false` on the first text write proves that no
+          // command byte reached the composer. Restore the already-proven prompt
+          // instead of waiting for output that this no-op cannot produce.
+          clearSessionRenameInFlight();
+          nativeCommandCaptureProof = null;
+          isPromptReady = true;
+          promptReadyOutputGeneration = ptyOutputGeneration;
+          log(`Native session rename command was dropped before input (${cliName()}): ${err?.message ?? err}`);
+          void flushPending();
+        }
+      }
+      // Wait for the command to finish and the TUI to become idle again before
+      // sending queued user prompts; otherwise they can land in its picker.
+      return;
+    }
+    if (adoptMessageReady && pendingAdoptMessages.length > 0) {
+      const input = pendingAdoptMessages.shift()!;
+      await deliverAdoptMessage(input, flushBackend, flushBackendEpoch);
+      return;
+    }
+    while (pendingMessages.length > 0 && backendEpochIsCurrent(flushBackend, flushBackendEpoch)) {
+      if (rawCommandWriteFailedAwaitingPrompt) break;
       const item = pendingMessages.shift()!;
       // Track as in-flight until the CLI returns to idle (markPromptReady).
       // If the CLI exits first, onExit stashes these for re-queue on respawn.
@@ -3784,8 +4814,10 @@ async function flushPending(): Promise<void> {
       // escaping rejection would become an unhandledRejection and crash the
       // worker — exactly the failure mode this change is closing. Contain it.
       let result: Awaited<ReturnType<typeof cliAdapter.writeInput>> | undefined;
+      const writeObservationVersion = cliSessionIdObservationVersion;
       try {
-        result = await cliAdapter.writeInput(backend, msg);
+        result = await flushAdapter.writeInput(flushBackend, msg);
+        if (!backendEpochIsCurrent(flushBackend, flushBackendEpoch)) return;
         scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
       } catch (err: any) {
         log(`writeInput threw: ${err?.message ?? err}`);
@@ -3793,7 +4825,7 @@ async function flushPending(): Promise<void> {
         // nulled `backend` and told the user the CLI exited) — nothing more to
         // do. Otherwise surface it as a submit failure so the message isn't
         // silently lost.
-        if (backend) scheduleSubmitFailureNotify(msg, undefined, '会话 JSONL', bridgeTurnId, undefined, turnSeq);
+        if (backendEpochIsCurrent(flushBackend, flushBackendEpoch)) scheduleSubmitFailureNotify(msg, undefined, '会话 JSONL', bridgeTurnId, undefined, turnSeq);
         break;
       }
       // Persist any sessionId the adapter observed via authoritative sources
@@ -3801,11 +4833,15 @@ async function flushPending(): Promise<void> {
       // outcome — the rotation is real even when the current Enter didn't
       // land, and we want next-resume to use the right id.
       if (result?.cliSessionId) {
-        persistCliSessionId(result.cliSessionId);
+        const accepted = persistCliSessionId(result.cliSessionId, {
+          expectedBackend: flushBackend,
+          expectedBackendEpoch: flushBackendEpoch,
+          expectedObservationVersion: writeObservationVersion,
+        });
         // First successful Codex submit also reveals the rollout path.
         // Late-attach now so subsequent assistant_final events get
         // attributed to this turn.
-        if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
+        if (accepted && codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
       }
       // `&& backend`: if the CLI exited during this write (pane gone → onExit
       // nulled backend) the user already got a "CLI exited" notice; don't also
@@ -3824,13 +4860,19 @@ async function flushPending(): Promise<void> {
     }
   } finally {
     isFlushing = false;
+    if (!backendEpochIsCurrent(flushBackend, flushBackendEpoch)) {
+      flushWakeRequested = false;
+      void flushPending();
+    } else if (flushWakeRequested) {
+      flushWakeRequested = false;
+      void flushPending();
+    }
   }
 }
 
 function sendToPty(content: string, turnId?: string): void {
-  if (!backend || !cliAdapter) return;
   const next = { content, turnId };
-  const shouldMergeQueued = !isFlushing && !shouldWriteNow({
+  const shouldMergeQueued = !!cliAdapter && !isFlushing && !shouldWriteNow({
     isPromptReady,
     isFlushing,
     supportsTypeAhead: cliAdapter.supportsTypeAhead === true,
@@ -3841,6 +4883,13 @@ function sendToPty(content: string, turnId?: string): void {
     log(`Merged queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} ${awaitingFirstPrompt ? 'still booting' : 'is busy'}`);
   } else {
     pendingMessages.push(next);
+  }
+  // A CLI exit and its daemon-driven respawn are separated by teardown plus a
+  // deliberate 500ms delay. IPC remains live throughout; queue arrivals now so
+  // spawnCli can flush them instead of silently dropping the user's message.
+  if (!backend || !cliAdapter) {
+    if (!mergedQueued) log(`Queued message (${pendingMessages.length} pending) while CLI backend is restarting: "${content.substring(0, 80)}"`);
+    return;
   }
   // User-override semantics: a fresh Lark message while a TUI prompt is "active"
   // takes precedence over the AI-detected prompt. The screen analyzer can be
@@ -3865,7 +4914,7 @@ function sendToPty(content: string, turnId?: string): void {
   // type-ahead write is dropped (no input box yet) — markPromptReady()'s flush
   // delivers queued messages instead. See input-gate.ts; this fixes dispatch's
   // brief reaching Codex before its first idle and never landing.
-  if (shouldWriteNow({ isPromptReady, isFlushing, supportsTypeAhead: cliAdapter.supportsTypeAhead === true, awaitingFirstPrompt })) {
+  if (!nativeSessionRename.isInFlight && !nativeSessionRename.blocksInput && commandLineWritesPending === 0 && shouldWriteNow({ isPromptReady, isFlushing, supportsTypeAhead: cliAdapter.supportsTypeAhead === true, awaitingFirstPrompt })) {
     if (!mergedQueued) log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing
   } else {
@@ -3975,7 +5024,11 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
       const probed = findCodexRolloutByPid(cfg.adoptCliPid);
       if (probed) {
         rolloutPath = probed.path;
-        persistCliSessionId(probed.cliSessionId);
+        persistCliSessionId(probed.cliSessionId, {
+          expectedBackend: backend,
+          expectedBackendEpoch: backendEpoch,
+          currentPromptProof: activeSessionPromptProofForPath(probed.path),
+        });
       }
     }
     if (rolloutPath) {
@@ -3997,7 +5050,11 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
       const probed = findTraexRolloutByPid(cfg.adoptCliPid);
       if (probed) {
         rolloutPath = probed.path;
-        persistCliSessionId(probed.cliSessionId);
+        persistCliSessionId(probed.cliSessionId, {
+          expectedBackend: backend,
+          expectedBackendEpoch: backendEpoch,
+          currentPromptProof: activeSessionPromptProofForPath(probed.path),
+        });
       }
     }
     if (rolloutPath) {
@@ -4111,25 +5168,74 @@ function adoptIdleAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): CliAd
 }
 
 function setupAdoptInputAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
-  if (isStructuredBridgeAdoptInputCli(cfg.cliId)) {
-    cliAdapter = createCliAdapterSync(cfg.cliId as CliId, cfg.cliPathOverride);
-  }
+  // Adopt keeps legacy per-CLI delivery choices below, but the global adapter
+  // is still needed for queue gating and exact administrative capabilities.
+  // Merely installing it here does not switch non-structured CLIs to writeInput.
+  cliAdapter = createCliAdapterSync(cfg.cliId as CliId, cfg.cliPathOverride);
 }
 
 function setupAdoptIdleDetection(cfg: Extract<DaemonToWorker, { type: 'init' }>, label: string): void {
   idleDetector = new IdleDetector(adoptIdleAdapter(cfg));
+  const detectorBackend = backend;
+  const detectorEpoch = backendEpoch;
   idleDetector.onIdle(() => {
+    if (!detectorBackend || !backendEpochIsCurrent(detectorBackend, detectorEpoch)) return;
     log(`Prompt detected (idle) — ${label} adopt mode`);
     try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
     try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
-    markPromptReady();
+    if (acceptSessionIdRotationIdleSignal(`${label} adopt IdleDetector`)) markPromptReady();
   });
+}
+
+/** tmux/herdr adopt intentionally does not feed its captured history through
+ * IdleDetector, and zellij now baselines its first poll for the same reason.
+ * Recover immediate readiness only from the supported CLI's authoritative
+ * transcript end marker, with the current active-turn status line as a veto.
+ * Empty/new transcripts remain conservative and wait for real live output. */
+function maybeMarkAdoptPromptReadyFromTranscript(label: string): void {
+  if (lastInitConfig?.adoptMode !== true || !adoptStaticPromptProofEligible || isPromptReady || !backend) return;
+  if (nativeSessionRename.isInFlight || adoptInputWriteInProgress || commandLineWritesPending > 0 || isFlushing) return;
+  try {
+    const screen = captureBackendScreen(backend);
+    if (hasNativeSessionBusyMarker(screen)) {
+      log(`Static ${label} adopt prompt proof rejected by active-turn screen marker`);
+      return;
+    }
+    const cliId = lastInitConfig.cliId;
+    if (cliId !== 'claude-code' && cliId !== 'codex') return;
+    if (!hasNativeSessionIdleComposer(screen, cliId)) {
+      log(`Static ${label} adopt prompt proof rejected: empty native composer not visible`);
+      return;
+    }
+    let proven = false;
+    if (cliId === 'claude-code' && bridgeJsonlPath) {
+      proven = claudeTranscriptEndsAtPrompt(drainTranscript(bridgeJsonlPath, 0).events);
+    } else if (cliId === 'codex' && codexBridgeRolloutPath) {
+      proven = codexTranscriptEndsAtPrompt(drainCodexRollout(codexBridgeRolloutPath, 0).events);
+    }
+    if (!proven) return;
+    // Consume the proof before markPromptReady/flush can re-enter this helper.
+    // It must never be reused after a later local turn starts.
+    adoptStaticPromptProofEligible = false;
+    log(`Static ${label} adopt prompt proven by completed transcript and empty composer`);
+    markPromptReady();
+  } catch (err: any) {
+    log(`Static ${label} adopt prompt proof failed: ${err.message}`);
+  }
 }
 
 function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurrentScreen'>): void {
   try {
     const initial = be.captureCurrentScreen?.() ?? '';
-    if (initial.length > 0) onPtyData(initial);
+    if (initial.length > 0) {
+      const priorLiveOutputAtMs = lastBackendPtyOutputAtMs;
+      onPtyData(initial);
+      // A reattach seed is a snapshot of already-existing pixels, not proof
+      // they were rendered after a newly observed native identity. Preserve
+      // renderer/scrollback bookkeeping but never advance the strict
+      // active-screen causality watermark.
+      lastBackendPtyOutputAtMs = priorLiveOutputAtMs;
+    }
   } catch (err: any) {
     log(`${source} captureCurrentScreen failed: ${err.message}`);
   }
@@ -4137,6 +5243,20 @@ function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurr
 
 function captureBackendScreen(be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>): string {
   return be.captureViewport?.() ?? be.captureCurrentScreen?.() ?? '';
+}
+
+/** Observe backends own an authoritative out-of-band snapshot. Managed
+ * pty-under-tmux/zellij and direct PTY backends instead flow through the
+ * worker's xterm renderer, whose cell-level snapshot preserves Codex's dim
+ * empty-placeholder signal. Never fall back from an advertised backend
+ * capture to the renderer: an empty authoritative capture can mean the pane
+ * disappeared, while the renderer may still contain a stale idle prompt. */
+function captureNativePromptProofScreen(
+  be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>,
+): string {
+  if (be.captureViewport || be.captureCurrentScreen) return captureBackendScreen(be);
+  if (renderer?.hasPendingWrites) return '';
+  return renderer?.promptProofSnapshot() ?? '';
 }
 
 function busyProbeRegion(content: string): string {
@@ -4155,6 +5275,7 @@ function probeBusyPatternIdle(
     if (cliAdapter?.busyPattern) {
       if (cliAdapter.busyPattern.test(busyProbeRegion(content))) return false;
       log(`${source} idle probe: busy marker absent, marking prompt ready`);
+      if (!acceptSessionIdRotationIdleSignal(`${source} screen probe`)) return false;
       markPromptReady();
       return true;
     }
@@ -4210,14 +5331,34 @@ function scheduleBusyPatternIdleProbe(source: string): void {
 }
 
 function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  const spawnBackendEpoch = ++backendEpoch;
+  lastBackendPtyOutputAtMs = 0;
+  // A crash-loop retry can call spawnCli() directly without killCli(). Tear
+  // down every prior-generation observer before any new bridge is selected;
+  // otherwise first-attach-wins timers can keep following the exited CLI.
+  resetTranscriptBridgesForBackendGeneration('spawn');
+  invalidateReadyHookGeneration();
+  clearLiveAttachPromptProbe();
+  idleDetector?.dispose();
+  idleDetector = null;
+  adoptInputWriteInProgress = false;
+  nativeSessionRename.cancelRotationCommandWrite();
+  clearSessionAdminPromptWait();
+  clearSessionRenameInFlight();
+  rawCommandWriteFailedAwaitingPrompt = false;
+  rawCommandFailureOutputGeneration = -1;
+  nativePromptProofRetryArmed = false;
+  if (nativeSessionRename.queueDesiredForSpawn()) {
+    log('Queued durable native session title for CLI spawn');
+  }
+  adoptStaticPromptProofEligible = false;
   // (startupCommands one-shot is re-armed below, AFTER the reattach-vs-fresh
   // prediction — only a genuinely fresh CLI process replays them; see
   // willReattachPersistent.)
   // Re-deliver inputs that were in-flight when the previous CLI died (see
-  // backend.onExit). killCli() already wiped pendingMessages, so these go to
-  // the front; the normal flush paths (prompt detect / first-prompt timeout)
-  // deliver them once the fresh CLI is ready. Adopt mode observes a CLI we
-  // don't own — never replay into it.
+  // backend.onExit). They precede messages that arrived during the restart
+  // gap; the normal flush paths deliver the combined queue once the fresh CLI
+  // is ready. Adopt mode observes a CLI we don't own — never replay into it.
   if (!cfg.adoptMode) {
     const carry = inflightInputs.takeCarryOver();
     if (carry.length > 0) {
@@ -4256,23 +5397,40 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       env: process.env as Record<string, string>,
     });
 
+    // Renderer/web scrollback only: idle detection is installed afterwards so
+    // historical completion markers cannot false-idle a busy adopted pane.
     seedBackendScreen('herdr adopt', herdrBe);
 
     setupAdoptTranscriptBridges(cfg);
     setupAdoptInputAdapter(cfg);
     setupAdoptIdleDetection(cfg, 'herdr');
 
-    backend.onData(onPtyData);
-    backend.onAccessUrl?.((url) => {
+    adoptStaticPromptProofEligible = true;
+    herdrBe.onData(data => {
+      if (backendEpochIsCurrent(herdrBe, spawnBackendEpoch)) onPtyData(data);
+    });
+    (herdrBe as SessionBackend).onAccessUrl?.((url: string) => {
+      if (!backendEpochIsCurrent(herdrBe, spawnBackendEpoch)) return;
       send({ type: 'riff_access_url', accessUrl: url });
     });
-    backend.onExit((code, signal) => {
+    herdrBe.onExit((code, signal) => {
+      if (!backendEpochIsCurrent(herdrBe, spawnBackendEpoch)) return;
       log(`Adopted herdr stream ended (code: ${code}, signal: ${signal})`);
+      idleDetector?.dispose();
+      idleDetector = null;
+      if (sessionRenameIdleTimer) { clearTimeout(sessionRenameIdleTimer); sessionRenameIdleTimer = null; }
+      nativeCommandCaptureProof = null;
+      clearSessionIdRotationIdleProof();
+      clearLiveAttachPromptProbe();
+      invalidateReadyHookGeneration();
+      resetTranscriptBridgesForBackendGeneration('herdr adopt exit');
+      backendEpoch += 1;
       backend = null;
       isPromptReady = false;
-      stopBridgeWatcher();
       send({ type: 'claude_exit', code, signal });
     });
+
+    maybeMarkAdoptPromptReadyFromTranscript('herdr');
 
     awaitingFirstPrompt = false;
     renderer?.markNewTurn();
@@ -4310,9 +5468,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       env: process.env as Record<string, string>,
     });
 
-    // Seed the shared scrollback with the pane's current screen so any
-    // already-connected (or future) WS clients render meaningful content
-    // immediately, instead of waiting for the next observe tick.
+    // Seed renderer/scrollback before installing IdleDetector. captureCurrentScreen
+    // may include historical completion markers that are not current readiness.
     seedBackendScreen(`${effectiveBackendType} adopt`, observeBe);
 
     setupAdoptTranscriptBridges(cfg);
@@ -4320,17 +5477,32 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     setupAdoptIdleDetection(cfg, 'pipe');
     setupAdoptInputAdapter(cfg);
 
-    backend.onData(onPtyData);
-    backend.onAccessUrl?.((url) => {
+    adoptStaticPromptProofEligible = true;
+    observeBe.onData(data => {
+      if (backendEpochIsCurrent(observeBe, spawnBackendEpoch)) onPtyData(data);
+    });
+    observeBe.onAccessUrl?.((url) => {
+      if (!backendEpochIsCurrent(observeBe, spawnBackendEpoch)) return;
       send({ type: 'riff_access_url', accessUrl: url });
     });
-    backend.onExit((code, signal) => {
+    observeBe.onExit((code, signal) => {
+      if (!backendEpochIsCurrent(observeBe, spawnBackendEpoch)) return;
       log(`Adopted pipe-pane stream ended (code: ${code}, signal: ${signal})`);
+      idleDetector?.dispose();
+      idleDetector = null;
+      if (sessionRenameIdleTimer) { clearTimeout(sessionRenameIdleTimer); sessionRenameIdleTimer = null; }
+      nativeCommandCaptureProof = null;
+      clearSessionIdRotationIdleProof();
+      clearLiveAttachPromptProbe();
+      invalidateReadyHookGeneration();
+      resetTranscriptBridgesForBackendGeneration('observe adopt exit');
+      backendEpoch += 1;
       backend = null;
       isPromptReady = false;
-      stopBridgeWatcher();
       send({ type: 'claude_exit', code, signal });
     });
+
+    maybeMarkAdoptPromptReadyFromTranscript(effectiveBackendType);
 
     awaitingFirstPrompt = false;
     renderer?.markNewTurn();
@@ -4931,7 +6103,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   const chatBotDiscovery = resolveChatBotDiscoveryConfig();
   childEnv.BOTMUX_LARK_LIST_BOTS_API_ENABLED = chatBotDiscovery.listBotsApiEnabled ? 'true' : 'false';
   childEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
-  if (cliAdapter.injectsReadyHook) childEnv.BOTMUX_READY_COMMAND = sessionReadyHookCommand();
+  if (cliAdapter.injectsReadyHook) {
+    readyHookGeneration = randomBytes(16).toString('hex');
+    childEnv.BOTMUX_READY_COMMAND = sessionReadyHookCommand();
+    childEnv.BOTMUX_READY_GENERATION = readyHookGeneration;
+  }
   // Initial value only; long-lived panes get the latest turn via the JSON pid marker.
   if (cfg.turnId) childEnv.BOTMUX_TURN_ID = cfg.turnId;
   if (injectClaudeSandbox) childEnv.IS_SANDBOX = '1';
@@ -5471,10 +6647,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // SessionStart hook → arming would hold the first post-recovery message until
   // the timeout). Fallback: release after READY_SIGNAL_TIMEOUT_MS → readyPattern.
   readyGate = new ReadyGate();
-  if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
-  if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
-  isSettlingFirstFlush = false;
-  promptReadyDetectedDuringSettle = false;
+  clearReadyGateTimers();
   // Reset quiescence baseline so the settle measures silence from THIS spawn.
   lastPtyOutputAtMs = Date.now();
   if (shouldArmReadyGate({
@@ -5497,7 +6670,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // quiescence, repeatedly triggering markPromptReady() and duplicate cards.
   if (effectiveBackendType !== 'riff') {
     idleDetector = new IdleDetector(cliAdapter);
+    const detectorBackend = backend;
     idleDetector.onIdle(async () => {
+      if (!detectorBackend || !backendEpochIsCurrent(detectorBackend, spawnBackendEpoch)) return;
       log('Prompt detected (idle)');
       // Bridge drain MUST run before markPromptReady() — the latter calls
       // flushPending() which can immediately fire the next queued message
@@ -5509,28 +6684,48 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       if (codexBridgeFallbackActive()) {
         try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
       }
-      markPromptReady();
+      if (acceptSessionIdRotationIdleSignal('IdleDetector')) markPromptReady();
     });
   }
 
-  backend.onData(onPtyData);
-  backend.onAccessUrl?.((url) => {
+  const spawnedBackend = backend;
+  spawnedBackend.onData(data => {
+    if (backendEpochIsCurrent(spawnedBackend, spawnBackendEpoch)) onPtyData(data);
+  });
+  spawnedBackend.onAccessUrl?.((url) => {
+    if (!backendEpochIsCurrent(spawnedBackend, spawnBackendEpoch)) return;
     send({ type: 'riff_access_url', accessUrl: url });
   });
   // Remote-task turn boundary (riff): flushPending() marks the session busy on
   // every write and riff has no PTY output, so the idle detector never re-arms
   // prompt-ready — without this hook a follow-up arriving mid-task would sit
   // in pendingMessages forever once the task finishes.
-  backend.onTaskDone?.(() => {
+  spawnedBackend.onTaskDone?.(() => {
+    if (!backendEpochIsCurrent(spawnedBackend, spawnBackendEpoch)) return;
     log(`${cliName()} task finished — re-arming prompt-ready for queued follow-ups`);
     markPromptReady();
   });
   // riff：任务 id 变更同步给 daemon 持久化，daemon 重启后 follow-up 血缘不断。
-  backend.onTaskId?.((taskId) => {
+  spawnedBackend.onTaskId?.((taskId) => {
+    if (!backendEpochIsCurrent(spawnedBackend, spawnBackendEpoch)) return;
     send({ type: 'riff_task_id', taskId });
   });
-  backend.onExit((code, signal) => {
+  spawnedBackend.onExit((code, signal) => {
+    if (!backendEpochIsCurrent(spawnedBackend, spawnBackendEpoch)) return;
     log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
+    idleDetector?.dispose();
+    idleDetector = null;
+    stopReattachIdleProbe();
+    stopBusyPatternIdleProbe();
+    if (sessionRenameIdleTimer) {
+      clearTimeout(sessionRenameIdleTimer);
+      sessionRenameIdleTimer = null;
+    }
+    nativeCommandCaptureProof = null;
+    clearSessionIdRotationIdleProof();
+    clearLiveAttachPromptProbe();
+    invalidateReadyHookGeneration();
+    resetTranscriptBridgesForBackendGeneration('CLI exit');
     const logTail = recentTerminalLogTail();
     // Don't park a diagnostic shell here: most exits are immediately
     // auto-restarted by the daemon, so an inline park would just be torn down
@@ -5549,6 +6744,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     if (stashed > 0) {
       log(`CLI exited with ${stashed} in-flight message(s); will re-queue after restart`);
     }
+    backendEpoch += 1;
     backend = null;
     isPromptReady = false;
     send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic });
@@ -5611,16 +6807,18 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 }
 
 function killCli(): void {
+  // Invalidate every async continuation before killing the process. A long
+  // text->Enter sleep must not wake later and alter the replacement backend.
+  backendEpoch += 1;
   destroyCrashDiagnosticTerminal('killCli');
   idleDetector?.dispose();
   idleDetector = null;
   stopReattachIdleProbe();
   stopBusyPatternIdleProbe();
-  // Cancel any pending ready-gate fallback / settle timers; spawnCli re-arms on respawn.
-  if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
-  if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
-  isSettlingFirstFlush = false;
-  promptReadyDetectedDuringSettle = false;
+  clearLiveAttachPromptProbe();
+  // Cancel any pending ready-gate fallback / settle timers and reject late
+  // SessionStart signals; spawnCli installs a fresh generation on respawn.
+  invalidateReadyHookGeneration();
   stopScreenAnalyzer();
   stopScreenUpdates();
   backend?.kill();
@@ -5628,8 +6826,7 @@ function killCli(): void {
   // Tear down the bridge watcher (if any). spawnCli will rebuild it on
   // restart with the proper mode based on the new cfg. Leaving it running
   // would dangle a watcher pinned to a stale jsonl path.
-  stopBridgeWatcher();
-  stopCodexBridge();
+  resetTranscriptBridgesForBackendGeneration('killCli');
   // Clean up CLI PID marker
   if (cliPidMarker) {
     try { unlinkSync(cliPidMarker); } catch { /* already gone */ }
@@ -5648,7 +6845,14 @@ function killCli(): void {
     sandboxCleanup = null;
   }
   isPromptReady = false;
-  pendingMessages.length = 0;
+  clearSessionRenameInFlight();
+  // Keep queued-but-not-written messages across automatic restart. Explicit
+  // close/suspend exits this worker immediately, so retaining them here has no
+  // observable effect there; clearing them would lose IPC received during the
+  // daemon restart gap.
+  // pendingRawInputs contains only commands that were accepted but never typed
+  // because /rename owned the TUI. Preserve them across restart; unlike an
+  // in-flight raw command, replaying these cannot duplicate a side effect.
   scrollback = '';
   altBufferActive = false;
   trustHandled = false;
@@ -5797,7 +7001,9 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         // server repaint every attached client, which flickers this client's
         // chrome ~2×/s. Reference-counted across browser tabs by the backend.
         const observeBe = backend instanceof ZellijObserveBackend ? backend : null;
+        const observeBackendEpoch = backendEpoch;
         let attachStarted = false;
+        let liveAttachOutputBaselined = false;
 
         const startAttach = (cols: number, rows: number) => {
           if (cp) return;
@@ -5811,6 +7017,26 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           observeBe?.setLiveAttach(true);
           clientPtys.set(ws, cp);
           cp.onData((d: string) => {
+            // This stream bypasses ObserveBackend.onData while live attach has
+            // paused dump-screen polling. It must still invalidate the static
+            // transcript proof and advance freshness before any later
+            // administrative write.
+            adoptStaticPromptProofEligible = false;
+            if (!liveAttachOutputBaselined) {
+              // zellij attach replays the existing pane as its first frame. It
+              // is not post-observation activity and must never prove a changed
+              // session id merely because a browser tab was opened.
+              liveAttachOutputBaselined = true;
+            } else if (
+              sessionIdRotationAwaitingIdleSignal
+              && observeBe
+              && backendEpochIsCurrent(observeBe, observeBackendEpoch)
+            ) {
+              ptyOutputGeneration += 1;
+              lastPtyOutputAtMs = Date.now();
+              lastBackendPtyOutputAtMs = lastPtyOutputAtMs;
+              scheduleLiveAttachPromptProbe(observeBe, observeBackendEpoch);
+            }
             if (ws.readyState === WebSocket.OPEN) ws.send(d);
           });
           cp.onExit(() => {
@@ -5834,6 +7060,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 // Read-only: only let mouse events (scroll/select) through.
                 if (!/^\x1b\[([<M])/.test(msg.data)) return;
               }
+              adoptStaticPromptProofEligible = false;
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -6668,6 +7895,9 @@ process.on('message', async (raw: unknown) => {
     case 'init': {
       if (lastInitConfig) return;  // already initialized
       lastInitConfig = msg;
+      if (msg.cliSessionId) nativeSessionRename.observeCliSessionId(msg.cliSessionId);
+      cliSessionIdObservationVersion = msg.cliSessionId ? 1 : 0;
+      if (msg.desiredNativeSessionTitle) nativeSessionRename.restoreDesired(msg.desiredNativeSessionTitle);
       sessionId = msg.sessionId;
       if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
       // Pin this worker's i18n locale early so every t() call below resolves
@@ -6767,9 +7997,20 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'message': {
+      if (lastInitConfig?.adoptMode) {
+        const input = { content: msg.content, turnId: msg.turnId };
+        if (!backend || !cliAdapter || nativeSessionRename.isInFlight || nativeSessionRename.blocksInput || rawCommandWriteFailedAwaitingPrompt || adoptInputWriteInProgress || commandLineWritesPending > 0 || pendingRawInputs.length > 0 || isFlushing) {
+          pendingAdoptMessages.push(input);
+          log(`Deferred adopted-pane message until native administrative input settles: "${msg.content.substring(0, 80)}"`);
+          void flushPending();
+        } else {
+          await deliverAdoptMessage(input);
+        }
+        break;
+      }
       // Mark new turn baseline so the streaming card only shows this turn's content
       renderer?.markNewTurn();
-      const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+      usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       let content = msg.content;
@@ -6795,120 +8036,50 @@ process.on('message', async (raw: unknown) => {
           return;
         }
       }
-      if (lastInitConfig?.adoptMode) {
-        // Bridge mode: capture transcript baseline BEFORE writing to the pane,
-        // so any assistant uuids appended after this point are attributed to
-        // *this* Lark turn (not local user activity in the pane). Mark may
-        // return false (baseline not ready) — we still write to the pane;
-        // user just won't get a final_output for this message.
-        if (bridgeJsonlPath) {
-          try { bridgeIngest(); } catch { /* best effort */ }
-          bridgeMarkPendingTurn(content, msg.turnId);
-        } else if (codexBridgeFallbackActive()) {
-          // Codex adopt: same idea, different bridge. ingest first so any
-          // in-flight events from a local-typed prior turn close before
-          // this Lark turn's fingerprint window opens. Mark works even
-          // pre-attach (queue is path-agnostic).
-          if (codexBridgeIsCursor()) {
-            // Cursor may append the current Lark/user line to its transcript
-            // before this IPC message is handled. Mark first so that preexisting
-            // current-line can still fingerprint-match instead of being marked
-            // seen as an unmatched event.
-            codexBridgeMarkPendingTurn(content, msg.turnId);
-            try { codexBridgeIngest(); } catch { /* best effort */ }
-          } else {
-            try { codexBridgeIngest(); } catch { /* best effort */ }
-            codexBridgeMarkPendingTurn(content, msg.turnId);
-          }
-        }
-        // Adopt mode write:
-        //   - Structured-bridge adopt-input CLIs (codex/traex/pi/grok/mtr)
-        //     route through cliAdapter.writeInput so paste+Enter-retry +
-        //     transcript/history verify (and grok's prompt_history →
-        //     cliSessionId re-attach after /new) all run. Hardcoding only
-        //     codex/traex left grok on raw sendText, so /new rotation never
-        //     re-attached the bridge.
-        //   - everything else keeps the simple raw sendText+Enter — the
-        //     claude-code adopt bridge has its own dual-write recovery
-        //     path, and the other CLIs' adopt flows haven't surfaced
-        //     this submit-detection issue.
-        if (backend) {
-          if (isStructuredBridgeAdoptInputCli(lastInitConfig?.cliId) && cliAdapter) {
-            // writeInput is async but we're already inside an async
-            // message handler. Errors are best-effort logged; the bridge
-            // ingest path is unaffected because mark already happened
-            // above (codexBridgeMarkPendingTurn / bridgeMarkPendingTurn).
-            try {
-              const result = await cliAdapter.writeInput(backend as unknown as PtyHandle, content);
-              if (result?.cliSessionId) {
-                persistCliSessionId(result.cliSessionId);
-                codexBridgeNotifyCliSessionId(result.cliSessionId);
-              }
-              if (result && result.submitted === false) {
-                scheduleSubmitFailureNotify(content, result.recheck, 'submit history', undefined, result.failureReason, turnSeq);
-              }
-            } catch (err: any) {
-              log(`Adopt writeInput error (${lastInitConfig?.cliId}): ${err.message}`);
-            }
-          } else if ('sendText' in backend && 'sendSpecialKeys' in backend) {
-            (backend as any).sendText(content);
-            // Beat between text and Enter so the adopted CLI's input layer
-            // has time to register the typed chars before submit. Without
-            // this, Ink-based TUIs (CoCo, Claude Code) flag the rapid
-            // input+Enter as paste continuation and treat the trailing
-            // Enter as a soft-newline, leaving the message stranded in the
-            // input box. 200ms mirrors the per-adapter writeInput delay
-            // that fresh-spawn mode goes through and matches the slash-
-            // command (raw_input) fix.
-            await new Promise(r => setTimeout(r, 200));
-            (backend as any).sendSpecialKeys('Enter');
-          } else {
-            backend.write(content + '\r');
-          }
-          isPromptReady = false;
-          idleDetector?.reset();
-        }
-      } else {
-        // Non-adopt: enqueue only. Bridge mark is deferred to flushPending
-        // so markTimeMs anchors to the actual PTY-write moment, not IPC
-        // arrival. Marking now would race with a still-running previous
-        // turn whose `botmux send` could sneak its sentAtMs past this
-        // turn's markTimeMs and falsely suppress its fallback.
-        sendToPty(content, msg.turnId);
-      }
+      // Non-adopt: enqueue only. Bridge mark is deferred to flushPending so
+      // markTimeMs anchors to the actual PTY-write moment, not IPC arrival.
+      sendToPty(content, msg.turnId);
       break;
     }
 
     case 'raw_input': {
-      // Slash-command passthrough (e.g. /compact, /model, /usage). Write the
-      // literal string + Enter without bracketed paste — otherwise Claude Code
-      // treats `/…` as pasted prompt text and the slash-command parser never
-      // fires. Also skip adapter.writeInput() / pendingMessages queueing so
-      // the prompt wrapping (Session ID, mention hints) is not prepended.
-      renderer?.markNewTurn();
-      usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
-      if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
-      if (backend) {
-        // sendRawCommandLine: literal text → 200ms beat (so the CLI's slash-
-        // command picker registers the match before submit; without it Codex /
-        // other Ink TUIs fire Enter while the picker is still building, dismiss
-        // the match, and submit the literal `/clear` as a regular user prompt —
-        // visible to the user as "/clear + 换行" stuck in history; the 200ms
-        // mirrors the codex adapter's own writeInput paste-detection delay) →
-        // Enter. Shared with runStartupCommands so both stay in lockstep.
-        await sendRawCommandLine(backend, msg.content);
-        isPromptReady = false;
-        idleDetector?.reset();
-        log(`Passthrough slash command: ${msg.content}`);
-        // Follow-up rides on the SAME IPC (see DaemonToWorker.raw_input) so it
-        // cannot race the 200ms text→Enter window above. Enqueue only after the
-        // Enter landed: sendToPty queues it as the next turn (type-ahead /
-        // pendingMessages), exactly like a Lark message arriving while busy.
-        if (msg.followUpContent) {
-          sendToPty(msg.followUpContent);
-          log(`Enqueued follow-up after raw input (${msg.followUpContent.length} chars)`);
-        }
+      // Preserve legacy busy delivery (/btw and other steering commands). A
+      // proven native rotation is administrative, though: it must start from a
+      // real prompt, and no raw command may splice into another administrative
+      // or adopted-message write window.
+      const isNativeRotation = isNativeSessionRotationInput(msg);
+      if (isNativeRotation && nativeSessionRename.hasDesiredTitle) {
+        maybeMarkAdoptPromptReadyFromTranscript('rotation request');
       }
+      const nativeAdminPromptReady = hasCurrentNativeAdminPromptProof();
+      const rotationNeedsPrompt = rawInputNeedsNativePrompt(msg) && !nativeAdminPromptReady;
+      if (
+        !backend
+        || !cliAdapter
+        || nativeSessionRename.isInFlight
+        || nativeSessionRename.blocksInput
+        || rawCommandWriteFailedAwaitingPrompt
+        || adoptInputWriteInProgress
+        || commandLineWritesPending > 0
+        || pendingRawInputs.length > 0
+        || rotationNeedsPrompt
+      ) {
+        pendingRawInputs.push(msg);
+        log(`Deferred passthrough slash command until native administrative input settles: ${msg.content}`);
+      } else {
+        await deliverRawInput(msg);
+      }
+      break;
+    }
+
+    case 'rename_session': {
+      // IPC handlers are concurrent with async init, so queue first even when
+      // the adapter/backend has not finished initializing. flushPending will
+      // capability-check and deliver the latest title once a real prompt is idle.
+      nativeSessionRename.request(msg.title);
+      log(`Queued native session rename: ${msg.title}`);
+      maybeMarkAdoptPromptReadyFromTranscript('rename request');
+      void flushPending();
       break;
     }
 
@@ -6949,14 +8120,28 @@ process.on('message', async (raw: unknown) => {
       // the ?. no-ops and killCli()'s kill() does the teardown.)
       const restart = async () => {
         tmuxRestartTimer = null;
+        // Retire the current generation before destroySession(). Riff invokes
+        // onExit synchronously from destroy, and persistent backends may do the
+        // same; leaving the epoch current would emit a second claude_exit and
+        // schedule a duplicate respawn. Nulling backend also makes IPC arriving
+        // during teardown enter the durable pending queues.
+        const retiringBackend = backend;
+        if (retiringBackend) {
+          backendEpoch += 1;
+          backend = null;
+          isPromptReady = false;
+        }
         // riff：teardown=远端 task-cancel（异步）。必须等它完成再 spawn，否则
         // 旧任务与新任务并跑、双方都往话题里发消息。
-        const t = backend?.destroySession?.();
-        if (t && typeof (t as Promise<void>).then === 'function') {
-          try {
+        try {
+          const t = retiringBackend?.destroySession?.();
+          if (t && typeof (t as Promise<void>).then === 'function') {
             await Promise.race([t, new Promise((r) => setTimeout(r, 22_000))]);
-          } catch { /* logged inside destroySession */ }
-        }
+          }
+        } catch { /* logged inside destroySession */ }
+        // Idempotent for backends whose destroy already killed/detached; also
+        // closes the local handle when destroy failed or hit the outer timeout.
+        try { retiringBackend?.kill(); } catch { /* best effort */ }
         killCli();
         awaitingFirstPrompt = true;
         setTimeout(async () => {
@@ -7002,6 +8187,10 @@ process.on('message', async (raw: unknown) => {
       // daemon). The CLI's input box is genuinely rendered — release the
       // ready-gate and deliver any held first prompt. Idempotent: a later
       // duplicate (clear/compact source) is a no-op.
+      if (!msg.generation || msg.generation !== readyHookGeneration) {
+        log(`Ignored stale SessionStart ready signal (source=${msg.source ?? '?'})`);
+        break;
+      }
       log(`SessionStart ready signal received (source=${msg.source ?? '?'})`);
       // 先记下 gate 是否已被 45s fallback 释放：ReadyGate.receive() 是一次性
       // 语义，fallback 抢先后 releaseReadyGate 会整块跳过迟到的真信号。
@@ -7097,6 +8286,7 @@ process.on('message', async (raw: unknown) => {
         if (effectiveBackendType === 'riff') backend?.kill();
         else (backend?.destroySession ?? backend?.kill)?.call(backend);
       } catch { /* best-effort */ }
+      backendEpoch += 1;
       backend = null;
       isPromptReady = false;
       // Suspend INTENDS to resume later: preserve the sandbox overlay mount + the
@@ -7118,6 +8308,7 @@ process.on('message', async (raw: unknown) => {
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  clearLiveAttachPromptProbe();
   if (tmuxRestartTimer) {
     clearTimeout(tmuxRestartTimer);
     tmuxRestartTimer = null;

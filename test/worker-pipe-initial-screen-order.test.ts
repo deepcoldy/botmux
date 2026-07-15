@@ -17,7 +17,7 @@ describe('worker pipe initial screen ordering', () => {
 
   it('runs a busy-pattern idle probe after each submitted input', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const writeIdx = source.indexOf('result = await cliAdapter.writeInput(backend, msg);');
+    const writeIdx = source.indexOf('result = await flushAdapter.writeInput(flushBackend, msg);');
     const probeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);');
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
 
@@ -90,6 +90,84 @@ describe('worker pipe initial screen ordering', () => {
     // Timeout fallback must stay conservative: it opens the gate but does not
     // force prompt-ready for a CLI whose true ready signal never arrived.
     expect(timeoutReleaseIdx).toBeGreaterThan(-1);
+  });
+
+  it('accepts session-ready only from the active spawn generation', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const sessionReadyCase = source.indexOf("case 'session_ready'");
+    const caseEnd = source.indexOf("\n    case '", sessionReadyCase + 1);
+    const region = source.slice(sessionReadyCase, caseEnd);
+    const generationGuardIdx = region.indexOf('msg.generation !== readyHookGeneration');
+    const releaseIdx = region.indexOf("releaseReadyGate('SessionStart hook'");
+
+    expect(generationGuardIdx).toBeGreaterThan(-1);
+    expect(region).toContain('if (!msg.generation ||');
+    expect(generationGuardIdx).toBeLessThan(releaseIdx);
+    expect(region).toContain('Ignored stale SessionStart ready signal');
+  });
+
+  it('invalidates ready timers/nonces and transcript observers across backend generations', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const spawnStart = source.indexOf('function spawnCli(');
+    const firstAdopt = source.indexOf('// ── Adopt mode:', spawnStart);
+    const spawnPreamble = source.slice(spawnStart, firstAdopt);
+    const normalExitStart = source.indexOf('spawnedBackend.onExit(');
+    const normalExitEnd = source.indexOf('\n  });', normalExitStart);
+    const normalExit = source.slice(normalExitStart, normalExitEnd);
+    const killStart = source.indexOf('function killCli()');
+    const killEnd = source.indexOf('// ─── HTTP + WebSocket Server', killStart);
+    const kill = source.slice(killStart, killEnd);
+
+    expect(spawnPreamble).toContain("resetTranscriptBridgesForBackendGeneration('spawn');");
+    expect(spawnPreamble).toContain('invalidateReadyHookGeneration();');
+    expect(source).toContain("readyHookGeneration = randomBytes(16).toString('hex');");
+    expect(source).toContain('childEnv.BOTMUX_READY_GENERATION = readyHookGeneration;');
+    expect(normalExit).toContain('invalidateReadyHookGeneration();');
+    expect(normalExit).toContain("resetTranscriptBridgesForBackendGeneration('CLI exit');");
+    expect(kill).toContain('invalidateReadyHookGeneration();');
+    expect(kill).toContain("resetTranscriptBridgesForBackendGeneration('killCli');");
+    const bridgeResetStart = source.indexOf('function resetTranscriptBridgesForBackendGeneration');
+    const bridgeResetEnd = source.indexOf('\n}', bridgeResetStart);
+    const bridgeReset = source.slice(bridgeResetStart, bridgeResetEnd);
+    expect(bridgeReset).toContain('stopBridgeWatcher();');
+    expect(bridgeReset).toContain('bridgeQueue.clearPending();');
+    expect(bridgeReset).toContain('stopCodexBridge();');
+    const bridgeStopStart = source.indexOf('function stopBridgeWatcher()');
+    const bridgeStopEnd = source.indexOf('\n/**', bridgeStopStart);
+    const bridgeStop = source.slice(bridgeStopStart, bridgeStopEnd);
+    expect(bridgeStop).toContain('bridgeJsonlPath = undefined;');
+    expect(bridgeStop).toContain('bridgeOffset = 0;');
+    expect(bridgeStop).toContain("bridgePendingTail = '';");
+    expect(bridgeStop).toContain('bridgeBaselineDone = false;');
+    expect(source.match(/invalidateReadyHookGeneration\(\);/g)?.length ?? 0).toBeGreaterThanOrEqual(5);
+  });
+
+  it('preserves all IPC queues and suppresses synchronous exits across restart teardown', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const sendStart = source.indexOf('function sendToPty(');
+    const sendEnd = source.indexOf('// ─── Screen Update Timer', sendStart);
+    const sendToPty = source.slice(sendStart, sendEnd);
+    const killStart = source.indexOf('function killCli()');
+    const killEnd = source.indexOf('// ─── HTTP + WebSocket Server', killStart);
+    const kill = source.slice(killStart, killEnd);
+    const restartStart = source.indexOf("case 'restart':");
+    const restartEnd = source.indexOf("\n    case '", restartStart + 1);
+    const restart = source.slice(restartStart, restartEnd);
+    const messageStart = source.indexOf("case 'message':");
+    const messageEnd = source.indexOf("\n    case '", messageStart + 1);
+    const message = source.slice(messageStart, messageEnd);
+
+    expect(sendToPty.indexOf('pendingMessages.push(next)')).toBeLessThan(sendToPty.indexOf('if (!backend || !cliAdapter)'));
+    expect(kill).not.toContain('pendingMessages.length = 0');
+    expect(message).toContain('if (!backend || !cliAdapter || nativeSessionRename.isInFlight');
+    const captureIdx = restart.indexOf('const retiringBackend = backend;');
+    const epochIdx = restart.indexOf('backendEpoch += 1;', captureIdx);
+    const nullIdx = restart.indexOf('backend = null;', captureIdx);
+    const destroyIdx = restart.indexOf('retiringBackend?.destroySession?.()', captureIdx);
+    expect(captureIdx).toBeGreaterThanOrEqual(0);
+    expect(epochIdx).toBeGreaterThan(captureIdx);
+    expect(nullIdx).toBeGreaterThan(epochIdx);
+    expect(destroyIdx).toBeGreaterThan(nullIdx);
   });
 
   it('defers idle detected during ready-gate settle so the first prompt still flushes', () => {
