@@ -487,8 +487,11 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
           <section className="bd-tile">
             <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} />
             <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
-            <SandboxSection bot={bot} patchBot={patchBot} />
-            <BackendTypeSection bot={bot} patchBot={patchBot} />
+            {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
+            {bot.cliId !== 'riff' && <SandboxSection bot={bot} patchBot={patchBot} />}
+            {/* riff：backendType 与 CLI 选择 1:1 绑定（spawn 层强制配对），
+                手动切 pty/tmux 只会制造坏组合，隐藏该区块。 */}
+            {bot.cliId !== 'riff' && <BackendTypeSection bot={bot} patchBot={patchBot} />}
           </section>
           <section className="bd-tile">
             <RuntimeEnvironmentSection bot={bot} patchBot={patchBot} />
@@ -837,6 +840,34 @@ export function BotAgentSection(props: {
     }
   }
 
+  /**
+   * Persist the CLI selection as riff before saving riff config. Selecting
+   * riff in the dropdown hides the「保存 Agent」button (model/skill rows are
+   * replaced by RiffSection), so without this the cliId change would never
+   * reach PUT /agent — the bot would stay on its old CLI and backendType
+   * would never auto-flip to riff. Returns false when persisting failed.
+   */
+  async function persistRiffCliSelection(): Promise<boolean> {
+    if (bot.cliId === 'riff') return true; // already persisted
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, { cliId: 'riff', model: '' });
+      if (res.ok && res.body.ok) {
+        patchBot(bot.larkAppId, {
+          cliId: res.body.cliId,
+          wrapperCli: res.body.wrapperCli ?? null,
+          model: res.body.model ?? '',
+          agentSelectionKey: res.body.selectionKey ?? 'riff',
+        });
+        return true;
+      }
+      setAgentStatus({ text: `✗ ${responseErrorText(res)}` });
+      return false;
+    } catch (e: any) {
+      setAgentStatus({ text: `✗ ${caughtErrorText(e)}` });
+      return false;
+    }
+  }
+
   async function saveSkillInjection(next: string): Promise<void> {
     setSkillValue(next);
     setSkillStatus(null);
@@ -872,6 +903,8 @@ export function BotAgentSection(props: {
     { value: 'off', label: tr('botDefaults.skillInjectionOff') },
   ];
 
+  const isRiff = cliKey === 'riff';
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionAgent')}</h3>
@@ -888,24 +921,27 @@ export function BotAgentSection(props: {
           />
         </div>
       </div>
-      <div className="bd-row">
-        <label>
-          <FieldTitle help={tr('botDefaults.agentHelp')}>{tr('botDefaults.agentModel')}</FieldTitle>
-          <input
-            type="text"
-            data-input="agentModel"
-            list={`agent-model-suggestions-${bot.larkAppId}`}
-            placeholder={modelPlaceholder}
-            value={model}
-            disabled={agentBusy || modelDisabledByCli}
-            onChange={event => setModel(event.currentTarget.value)}
-          />
-          <datalist id={`agent-model-suggestions-${bot.larkAppId}`}>
-            {suggestions.map(item => <option value={item} key={item} />)}
-          </datalist>
-        </label>
-      </div>
-      {siSupport === 'dynamic' ? (
+      {!isRiff && (
+        <div className="bd-row">
+          <label>
+            <FieldTitle help={tr('botDefaults.agentHelp')}>{tr('botDefaults.agentModel')}</FieldTitle>
+            <input
+              type="text"
+              data-input="agentModel"
+              list={`agent-model-suggestions-${bot.larkAppId}`}
+              placeholder={modelPlaceholder}
+              value={model}
+              disabled={agentBusy || modelDisabledByCli}
+              onChange={event => setModel(event.currentTarget.value)}
+            />
+            <datalist id={`agent-model-suggestions-${bot.larkAppId}`}>
+              {suggestions.map(item => <option value={item} key={item} />)}
+            </datalist>
+          </label>
+        </div>
+      )}
+      {isRiff && <RiffSection bot={bot} patchBot={patchBot} persistCliSelection={persistRiffCliSelection} />}
+      {!isRiff && siSupport === 'dynamic' ? (
         <div className="bd-row">
           <div className="bd-field">
             <FieldTitle help={tr('botDefaults.skillInjectionHelpDynamic')}>{tr('botDefaults.skillInjection')}</FieldTitle>
@@ -919,7 +955,7 @@ export function BotAgentSection(props: {
             />
           </div>
         </div>
-      ) : siSupport === 'global' ? (
+      ) : !isRiff && siSupport === 'global' ? (
         <div className="bd-row">
           <div className="bd-field">
             <FieldTitle help={tr('botDefaults.skillInjectionHelp')}>{tr('botDefaults.skillInjection')}</FieldTitle>
@@ -937,10 +973,12 @@ export function BotAgentSection(props: {
           </div>
         </div>
       ) : null}
-      <div className="actions bd-section-actions">
-        <button type="button" className="primary" data-action="save-agent" disabled={agentBusy} onClick={() => void saveAgent()}>{tr('botDefaults.agentSave')}</button>
-        <StatusSpan status={agentStatus} attr={{ 'data-agent-status': '' }} />
-      </div>
+      {!isRiff && (
+        <div className="actions bd-section-actions">
+          <button type="button" className="primary" data-action="save-agent" disabled={agentBusy} onClick={() => void saveAgent()}>{tr('botDefaults.agentSave')}</button>
+          <StatusSpan status={agentStatus} attr={{ 'data-agent-status': '' }} />
+        </div>
+      )}
     </section>
   );
 }
@@ -2241,6 +2279,140 @@ function EnvSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       <div className="actions">
         <button type="button" className="primary" data-action="save-env" disabled={busy} onClick={() => void save()}>{tr('botDefaults.envSave')}</button>
         <StatusSpan status={status} attr={{ 'data-env-status': '' }} />
+      </div>
+    </div>
+  );
+}
+
+/** Agents supported by the riff runner (free text still allowed for new ones). */
+const RIFF_AGENT_SUGGESTIONS = ['aiden', 'aiden-claude', 'codex', 'opencode'];
+
+function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCliSelection?: () => Promise<boolean> }) {
+  const tr = useT();
+  const riff = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
+  const [baseUrl, setBaseUrl] = useState(typeof riff.baseUrl === 'string' ? riff.baseUrl : '');
+  const [agent, setAgent] = useState(typeof riff.agent === 'string' ? riff.agent : '');
+  const [model, setModel] = useState(typeof riff.model === 'string' ? riff.model : '');
+  const [jwtEnv, setJwtEnv] = useState(typeof riff.jwtEnv === 'string' ? riff.jwtEnv : '');
+  const [sandboxCluster, setSandboxCluster] = useState(typeof riff.sandboxCluster === 'string' ? riff.sandboxCluster : '');
+  const [injectStatusLines, setInjectStatusLines] = useState(riff.injectStatusLines !== false);
+  const [systemPrompt, setSystemPrompt] = useState(typeof riff.systemPrompt === 'string' ? riff.systemPrompt : '');
+  const [setupCommands, setSetupCommands] = useState(
+    Array.isArray(riff.setupCommands) ? riff.setupCommands.join('\n') : '',
+  );
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const r = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
+    setBaseUrl(typeof r.baseUrl === 'string' ? r.baseUrl : '');
+    setAgent(typeof r.agent === 'string' ? r.agent : '');
+    setModel(typeof r.model === 'string' ? r.model : '');
+    setJwtEnv(typeof r.jwtEnv === 'string' ? r.jwtEnv : '');
+    setSandboxCluster(typeof r.sandboxCluster === 'string' ? r.sandboxCluster : '');
+    setInjectStatusLines(r.injectStatusLines !== false);
+    setSystemPrompt(typeof r.systemPrompt === 'string' ? r.systemPrompt : '');
+    setSetupCommands(Array.isArray(r.setupCommands) ? r.setupCommands.join('\n') : '');
+  }, [props.bot.riff]);
+
+  async function save(): Promise<void> {
+    setStatus(null);
+    setBusy(true);
+    try {
+      const config: Record<string, unknown> = {};
+      if (baseUrl.trim()) config.baseUrl = baseUrl.trim();
+      if (agent.trim()) config.agent = agent.trim();
+      if (model.trim()) config.model = model.trim();
+      if (jwtEnv.trim()) config.jwtEnv = jwtEnv.trim();
+      if (sandboxCluster.trim()) config.sandboxCluster = sandboxCluster.trim();
+      // 显式持久化布尔——省略字段时后端按“开启”解释（!== false），
+      // 只存 true 会导致该开关永远关不掉。
+      config.injectStatusLines = injectStatusLines;
+      if (systemPrompt.trim()) config.systemPrompt = systemPrompt.trim();
+      if (setupCommands.trim()) {
+        config.setupCommands = setupCommands.split('\n').map(s => s.trim()).filter(Boolean);
+      }
+      const json = Object.keys(config).length ? JSON.stringify(config) : '';
+      // Save order matters: riff config FIRST, agent switch AFTER. PUT /agent
+      // flips cliId/backendType AND closes CLI-mismatched sessions immediately,
+      // so doing it first would leave a half-configured riff bot (and killed
+      // sessions) when the /riff write fails. A saved-but-unused riff config
+      // from the reverse failure mode is harmless.
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/riff`, { riff: json });
+      if (res.ok && res.body.ok) {
+        const next = typeof res.body.riff === 'string' && res.body.riff ? JSON.parse(res.body.riff) : null;
+        props.patchBot(props.bot.larkAppId, { riff: next });
+        if (props.persistCliSelection && !(await props.persistCliSelection())) {
+          setStatus({ text: `✗ ${tr('botDefaults.riffCliPersistFailed')}` });
+          return;
+        }
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="bd-subsection">
+      <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.riffHelp')}>{tr('botDefaults.sectionRiff')}</FieldTitle></h4>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffBaseUrl')}</span>
+          <input type="text" data-input="riff-base-url" placeholder={tr('botDefaults.riffBaseUrlPlaceholder')} value={baseUrl} disabled={busy} onChange={e => setBaseUrl(e.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span><FieldTitle help={tr('botDefaults.riffAgentHelp')}>{tr('botDefaults.riffAgent')}</FieldTitle></span>
+          <input type="text" data-input="riff-agent" list={`riff-agent-suggestions-${props.bot.larkAppId}`} placeholder={tr('botDefaults.riffAgentPlaceholder')} value={agent} disabled={busy} onChange={e => setAgent(e.currentTarget.value)} />
+          <datalist id={`riff-agent-suggestions-${props.bot.larkAppId}`}>
+            {RIFF_AGENT_SUGGESTIONS.map(item => <option value={item} key={item} />)}
+          </datalist>
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span><FieldTitle help={tr('botDefaults.riffModelHelp')}>{tr('botDefaults.riffModel')}</FieldTitle></span>
+          <input type="text" data-input="riff-model" placeholder={tr('botDefaults.riffModelPlaceholder')} value={model} disabled={busy} onChange={e => setModel(e.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span><FieldTitle help={tr('botDefaults.riffJwtEnvHelp')}>{tr('botDefaults.riffJwtEnv')}</FieldTitle></span>
+          <input type="text" data-input="riff-jwt-env" placeholder={tr('botDefaults.riffJwtEnvPlaceholder')} value={jwtEnv} disabled={busy} onChange={e => setJwtEnv(e.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffSandboxCluster')}</span>
+          <input type="text" data-input="riff-sandbox-cluster" placeholder={tr('botDefaults.riffSandboxClusterPlaceholder')} value={sandboxCluster} disabled={busy} onChange={e => setSandboxCluster(e.currentTarget.value)} />
+        </label>
+      </div>
+      <label className="toggle-row">
+        <input type="checkbox" data-input="riff-inject-status-lines" checked={injectStatusLines} disabled={busy} onChange={e => setInjectStatusLines(e.currentTarget.checked)} />
+        <span className="switch" aria-hidden="true" />
+        <span className="toggle-tx"><strong><FieldTitle help={tr('botDefaults.riffInjectStatusLinesHelp')}>{tr('botDefaults.riffInjectStatusLines')}</FieldTitle></strong></span>
+      </label>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffSystemPrompt')}</span>
+          <textarea data-input="riff-system-prompt" placeholder={tr('botDefaults.riffSystemPromptPlaceholder')} value={systemPrompt} disabled={busy} onChange={e => setSystemPrompt(e.currentTarget.value)} rows={4} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffSetupCommands')}</span>
+          <textarea data-input="riff-setup-commands" placeholder={tr('botDefaults.riffSetupCommandsPlaceholder')} value={setupCommands} disabled={busy} onChange={e => setSetupCommands(e.currentTarget.value)} rows={3} />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-riff" disabled={busy} onClick={() => void save()}>{tr('botDefaults.riffSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-riff-status': '' }} />
       </div>
     </div>
   );

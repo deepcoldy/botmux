@@ -118,7 +118,8 @@ import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.
 import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
 import { selectSessionBackend, decideBackendGate, backendGateUserMessage } from './adapters/backend/session-backend-selector.js';
-import { prepareSandbox, attachSandboxOutbox, startOutboxWatcher, sandboxEnabled, sandboxedClaudeDataDir } from './adapters/backend/sandbox.js';
+import { deriveRiffReposFromDirs, deriveRiffRepoFromWorkingDir, isValidRiffBaseUrl } from './adapters/backend/riff-backend.js';
+import { prepareSandbox, attachSandboxOutbox, startOutboxWatcher, sandboxEnabled, sandboxedClaudeDataDir, localSandboxApplies } from './adapters/backend/sandbox.js';
 import type { BackendType, SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
@@ -418,7 +419,7 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -610,6 +611,13 @@ async function runStartupCommands(): Promise<void> {
   if (!cmds || cmds.length === 0) return;
   if (lastInitConfig?.adoptMode) return;
   if (!backend) return;
+  // riff：generic startupCommands 是 PTY 语义（sendRawCommandLine = write 文本 +
+  // 200ms 后 write 回车），对 RiffBackend 每条会裂成两个远端任务并打乱血缘。
+  // riff 的初始化命令走自己的 riff.setupCommands（沙箱内执行），这里必须跳过。
+  if (effectiveBackendType === 'riff') {
+    log(`Skipping ${cmds.length} generic startup command(s) — riff backend uses riff.setupCommands instead`);
+    return;
+  }
   log(`Running ${cmds.length} startup command(s) before first prompt`);
   for (const cmd of cmds) {
     if (!backend) break;
@@ -2995,6 +3003,12 @@ function exitTmuxScrollMode(): void {
 }
 
 function handleTermAction(key: TermActionKey): void {
+  // riff：没有远端终端可驱动——把控制字符 write 进 RiffBackend 会变成一个内容为
+  // ANSI 序列的 follow-up 任务（^C 也不会 cancel 任务），必须整体拒绝。
+  if (effectiveBackendType === 'riff') {
+    log(`term_action '${key}' ignored — riff backend has no local terminal to drive`);
+    return;
+  }
   if (!backend) return;
   const isHalfPage = key === 'half_page_up' || key === 'half_page_down';
 
@@ -4293,6 +4307,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     setupAdoptIdleDetection(cfg, 'herdr');
 
     backend.onData(onPtyData);
+    backend.onAccessUrl?.((url) => {
+      send({ type: 'riff_access_url', accessUrl: url });
+    });
     backend.onExit((code, signal) => {
       log(`Adopted herdr stream ended (code: ${code}, signal: ${signal})`);
       backend = null;
@@ -4348,6 +4365,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     setupAdoptInputAdapter(cfg);
 
     backend.onData(onPtyData);
+    backend.onAccessUrl?.((url) => {
+      send({ type: 'riff_access_url', accessUrl: url });
+    });
     backend.onExit((code, signal) => {
       log(`Adopted pipe-pane stream ended (code: ${code}, signal: ${signal})`);
       backend = null;
@@ -4417,7 +4437,74 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     }
   }
   effectiveBackendType = effectiveBackend;
-  const selectedBackend = selectSessionBackend({ sessionId: cfg.sessionId, backendType: effectiveBackend });
+
+  // For riff (remote HTTP backend), merge botmux session context env + per-bot
+  // env into the riff backend config so the remote sandbox has everything the
+  // agent needs (e.g. `botmux send` routing). The sandbox installs botmux via
+  // setupCommands, so BOTMUX_* env vars are needed for the agent to use it.
+  // PTY/tmux backends inject these into the child process env directly; riff
+  // has no local process, so they go via config.env → the riff API's config.env.
+  let riffBackendConfig = cfg.backendConfig;
+  if (effectiveBackendType === 'riff') {
+    if (!cfg.backendConfig) {
+      throw new Error('riff backend requires backendConfig (baseUrl, etc.)');
+    }
+    // Fail fast on a missing/invalid baseUrl — every config entry point funnels
+    // through this spawn gate, and a late `fetch("undefined/api/…")` error is
+    // far harder to diagnose than an explicit spawn refusal.
+    if (!isValidRiffBaseUrl(cfg.backendConfig.baseUrl)) {
+      throw new Error(`riff baseUrl 未配置或非法（需 http(s) URL，当前: ${JSON.stringify(cfg.backendConfig.baseUrl ?? null)}）——请在 dashboard 的 Riff 配置中填写`);
+    }
+    const sessionEnv: Record<string, string> = {
+      BOTMUX_SESSION_ID: cfg.sessionId,
+      BOTMUX_CHAT_ID: cfg.chatId,
+      BOTMUX_LARK_APP_ID: cfg.larkAppId,
+    };
+    // Session scope for `botmux send` inside the sandbox. Thread sessions
+    // anchor on a real om_ message (reply_in_thread); chat-scope sessions use
+    // the chat id as anchor (sessionAnchorId), which is NOT a message id —
+    // passing it as BOTMUX_ROOT_MESSAGE_ID would break reply threading, so
+    // only forward real message ids and tell the sandbox the scope explicitly.
+    const rootIsMessage = cfg.rootMessageId?.startsWith('om_') === true;
+    sessionEnv.BOTMUX_SESSION_SCOPE = rootIsMessage ? 'thread' : 'chat';
+    if (rootIsMessage) sessionEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+    if (cfg.turnId) sessionEnv.BOTMUX_TURN_ID = cfg.turnId;
+    // Turn sender so `--mention-back` can resolve an @ target in the sandbox.
+    if (cfg.ownerOpenId) sessionEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;
+    // Lark credentials so `botmux send` works inside the riff sandbox without a
+    // local daemon or bots.json. The sandbox has no session data / bot config,
+    // so cmdSend falls back to these env vars to call the Lark API directly.
+    // Mirrors what the credential-file path does for PTY/tmux backends (see
+    // sendCredFilePath below), but via env since riff has no local filesystem
+    // to read the cred file from.
+    if (cfg.larkAppSecret) sessionEnv.BOTMUX_LARK_APP_SECRET = cfg.larkAppSecret;
+    if (cfg.brand) sessionEnv.BOTMUX_LARK_BRAND = cfg.brand;
+    const chatBotDiscovery = resolveChatBotDiscoveryConfig();
+    sessionEnv.BOTMUX_LARK_LIST_BOTS_API_ENABLED = chatBotDiscovery.listBotsApiEnabled ? 'true' : 'false';
+    sessionEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
+    // Per-bot env (bots.json `env`) takes precedence over session context;
+    // explicit riff config.env takes precedence over both.
+    const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...cfg.backendConfig.env };
+    riffBackendConfig = Object.assign({}, cfg.backendConfig, { env: mergedEnv, resumeParentTaskId: cfg.riffParentTaskId });
+    // 复用本地仓库+分支：多仓只认会话上的显式 stamp（仓库选择卡多选流按用户
+    // 顺序写入 cfg.riffRepoDirs，首仓=primary）；否则仅对 workingDir 本身做单仓
+    // 推导——绝不扫描任意非 git 目录的子目录（home/仓库集合目录会乱带仓库）。
+    if (!cfg.backendConfig.repos || cfg.backendConfig.repos.length === 0) {
+      const derived = cfg.riffRepoDirs && cfg.riffRepoDirs.length > 0
+        ? deriveRiffReposFromDirs(cfg.riffRepoDirs)
+        : (() => { const one = deriveRiffRepoFromWorkingDir(cfg.workingDir); return one ? { repos: [one.repo], warnings: one.warnings } : null; })();
+      if (derived) {
+        riffBackendConfig = Object.assign({}, riffBackendConfig, {
+          repos: derived.repos,
+          repoWarnings: derived.warnings,
+        });
+        const desc = derived.repos.map(r => `${r.repoName}${r.repoBranch ? `@${r.repoBranch}` : ' (default branch)'}`).join(', ');
+        log(`Riff local repo reuse: ${desc}${derived.warnings.length ? ` — ${derived.warnings.join('；')}` : ''}`);
+      }
+    }
+  }
+
+  const selectedBackend = selectSessionBackend({ sessionId: cfg.sessionId, backendType: effectiveBackend, backendConfig: riffBackendConfig });
   isTmuxMode = selectedBackend.isTmuxMode;
   isPipeMode = selectedBackend.isPipeMode;
   isZellijMode = selectedBackend.isZellijMode;
@@ -4467,11 +4554,20 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // the bwrap sandbox (its masks go into the same bwrap plan), so it requires the
   // sandbox to be on — hence the trigger is the sandbox toggle there, never the bare
   // legacy flag (which would redirect the data dir but apply no masks → a hole).
-  const wantsFileSandbox = cfg.sandbox === true || sandboxEnabled();
+  // riff runs in its own REMOTE sandbox with no local CLI process — every
+  // local isolation flavor (Linux bwrap, macOS Seatbelt write-sandbox, read
+  // isolation incl. the legacy fail-closed flag) is meaningless for it and
+  // must be bypassed on ALL platforms, or a sandbox/readIsolation-enabled bot
+  // bricks the moment it switches to riff.
+  const riffRemoteBackend = effectiveBackendType === 'riff';
+  if (riffRemoteBackend && (cfg.sandbox === true || cfg.readIsolation === true)) {
+    log('Sandbox/read-isolation flags set but backend is riff (remote sandbox, no local process) — local isolation bypassed');
+  }
+  const wantsFileSandbox = !riffRemoteBackend && (cfg.sandbox === true || sandboxEnabled());
   // Legacy EXPLICIT read-isolation opt-in (macOS only — Linux read-iso rides the
   // bwrap sandbox, so it's driven solely by the sandbox toggle there). Keeps
   // FAIL-CLOSED semantics: you asked for read isolation → refuse to start without it.
-  const explicitLegacyReadIso = process.platform === 'darwin' && cfg.readIsolation === true;
+  const explicitLegacyReadIso = process.platform === 'darwin' && cfg.readIsolation === true && !riffRemoteBackend;
   const readIsolationGate = evaluateReadIsolationGate({
     configured: wantsFileSandbox || explicitLegacyReadIso,
     adapterSupports: cliAdapter.supportsReadIsolation === true,
@@ -4830,8 +4926,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // fail repeatedly and surface only as a generic crash-loop ("X crashed N
     // times"), with no hint about WHY. Instead surface ONE clear, reproducible
     // message and stop — the user can fix PATH / install the CLI and retry.
+    //
+    // Remote backends (riff) have no local binary — they use an HTTP API. Skip
+    // the binary check for them: resolvedBin is '' by design, and the backend
+    // handles everything internally.
     const wantBin = cliAdapter.resolvedBin;
-    if (!locateOnPath(wantBin)) {
+    if (effectiveBackendType !== 'riff' && !locateOnPath(wantBin)) {
       log(`CLI binary not found: ${wantBin} (PATH=${process.env.PATH ?? ''})`);
       const probe = isAbsolute(wantBin) ? `ls -l ${wantBin}` : `which ${wantBin}`;
       send({
@@ -5007,7 +5107,17 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // env is carried via bwrap --setenv (see prepareSandbox), not the backend.
   // Linux ONLY — on macOS the same `sandbox: true` is enforced by the Seatbelt
   // write-sandbox above (willWriteSandbox), so bwrap must not run here.
-  const sandboxOn = process.platform !== 'darwin' && (cfg.sandbox === true || sandboxEnabled());
+  //
+  // riff bypass: there is NO local CLI process to wrap — execution happens in
+  // riff's own remote sandbox, and the fail-safe "backend not sandboxable"
+  // hard error below would otherwise brick every sandbox-enabled bot the
+  // moment it switches to riff (the dashboard agent switch clears only
+  // readIsolation, not `sandbox`). Bypassing is safe (nothing local runs);
+  // log it so the state is visible.
+  if (cfg.sandbox === true && effectiveBackendType === 'riff') {
+    log('Sandbox flag set but backend is riff (remote sandbox, no local process) — local file sandbox bypassed');
+  }
+  const sandboxOn = localSandboxApplies(process.platform, effectiveBackendType) && (cfg.sandbox === true || sandboxEnabled());
   // Linux read isolation: build the bwrap MASK set (the Seatbelt read-deny twin) and
   // fold it into the SAME overlay sandbox plan below. Enumerate sibling bots from the
   // FILESYSTEM (the worker runs unsandboxed on the host; bots.json may be denied) —
@@ -5432,24 +5542,44 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     readySignalTimer.unref?.();
   }
 
-  // Set up idle detection
-  idleDetector = new IdleDetector(cliAdapter);
-  idleDetector.onIdle(async () => {
-    log('Prompt detected (idle)');
-    // Bridge drain MUST run before markPromptReady() — the latter calls
-    // flushPending() which can immediately fire the next queued message
-    // (type-ahead adapters), shifting bridgeQueue's notion of "current
-    // turn" before we've had a chance to emit the previous one.
-    if (bridgeJsonlPath) {
-      try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
-    }
-    if (codexBridgeFallbackActive()) {
-      try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
-    }
-    markPromptReady();
-  });
+  // Set up idle detection. Riff (remote HTTP backend) has no PTY output and
+  // is marked ready immediately after spawn (see below), so the idle detector
+  // is unnecessary — and without a readyPattern it would fire on every
+  // quiescence, repeatedly triggering markPromptReady() and duplicate cards.
+  if (effectiveBackendType !== 'riff') {
+    idleDetector = new IdleDetector(cliAdapter);
+    idleDetector.onIdle(async () => {
+      log('Prompt detected (idle)');
+      // Bridge drain MUST run before markPromptReady() — the latter calls
+      // flushPending() which can immediately fire the next queued message
+      // (type-ahead adapters), shifting bridgeQueue's notion of "current
+      // turn" before we've had a chance to emit the previous one.
+      if (bridgeJsonlPath) {
+        try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
+      }
+      if (codexBridgeFallbackActive()) {
+        try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
+      }
+      markPromptReady();
+    });
+  }
 
   backend.onData(onPtyData);
+  backend.onAccessUrl?.((url) => {
+    send({ type: 'riff_access_url', accessUrl: url });
+  });
+  // Remote-task turn boundary (riff): flushPending() marks the session busy on
+  // every write and riff has no PTY output, so the idle detector never re-arms
+  // prompt-ready — without this hook a follow-up arriving mid-task would sit
+  // in pendingMessages forever once the task finishes.
+  backend.onTaskDone?.(() => {
+    log(`${cliName()} task finished — re-arming prompt-ready for queued follow-ups`);
+    markPromptReady();
+  });
+  // riff：任务 id 变更同步给 daemon 持久化，daemon 重启后 follow-up 血缘不断。
+  backend.onTaskId?.((taskId) => {
+    send({ type: 'riff_task_id', taskId });
+  });
   if (backend instanceof HerdrBackend) {
     backend.onSnapshot(relayHerdrWebSnapshot);
     backend.onWebTerminalCursor(relayHerdrWebCursor);
@@ -5524,6 +5654,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     if (cliAdapter?.supportsTypeAhead) flushPending();
   };
   setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_TIMEOUT_MS, false), FIRST_PROMPT_TIMEOUT_MS);
+
+  // Riff (and other remote HTTP backends) have no local boot process — the
+  // backend is ready immediately after spawn(). The idle detector never fires
+  // for them (no PTY output), and the first-prompt timeout only flushes for
+  // type-ahead adapters, so isPromptReady would otherwise stay false forever
+  // and the first message would never reach the riff API. Mark ready right away.
+  if (effectiveBackendType === 'riff') {
+    markPromptReady();
+  }
 }
 
 function killCli(): void {
@@ -6728,6 +6867,15 @@ process.on('message', async (raw: unknown) => {
           pendingMessages.push({ content: msg.prompt, turnId: msg.turnId });
         }
 
+        // Riff (remote HTTP backends): spawnCli already marked the prompt ready
+        // (no local boot → isPromptReady=true immediately), but the initial prompt
+        // was queued AFTER spawnCli returned, so flushPending() ran on an empty
+        // queue. Flush now that the prompt is enqueued. isPromptReady is already
+        // true so the flush gates all pass.
+        if (effectiveBackendType === 'riff' && pendingMessages.length > 0) {
+          flushPending();
+        }
+
         send({ type: 'ready', port, token: writeToken, turnId: currentBotmuxTurnId });
       } catch (err: any) {
         send({ type: 'error', message: `init failed: ${err.message}` });
@@ -6912,9 +7060,16 @@ process.on('message', async (raw: unknown) => {
       // process would never actually restart. destroySession() tears the session
       // down so the respawn starts a fresh CLI. (PTY has no destroySession, so
       // the ?. no-ops and killCli()'s kill() does the teardown.)
-      const restart = () => {
+      const restart = async () => {
         tmuxRestartTimer = null;
-        backend?.destroySession?.();
+        // riff：teardown=远端 task-cancel（异步）。必须等它完成再 spawn，否则
+        // 旧任务与新任务并跑、双方都往话题里发消息。
+        const t = backend?.destroySession?.();
+        if (t && typeof (t as Promise<void>).then === 'function') {
+          try {
+            await Promise.race([t, new Promise((r) => setTimeout(r, 22_000))]);
+          } catch { /* logged inside destroySession */ }
+        }
         killCli();
         awaitingFirstPrompt = true;
         setTimeout(() => {
@@ -7008,8 +7163,16 @@ process.on('message', async (raw: unknown) => {
     case 'close': {
       log('Close requested');
       stopScreenshotLoop();
-      // destroySession kills tmux session permanently; kill() only detaches
-      backend?.destroySession?.();
+      // destroySession kills tmux session permanently; kill() only detaches.
+      // riff 的 destroySession 是异步远端取消——必须有界 await：紧跟着的
+      // process.exit 会掐断未发出的 fetch，让已关闭话题的远端 agent 继续跑。
+      const closeTeardown = backend?.destroySession?.();
+      if (closeTeardown && typeof (closeTeardown as Promise<void>).then === 'function') {
+        try {
+          // 预算层级见 RiffBackend.destroySession（总 deadline 20s）——这里 22s 只作兜底。
+          await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]);
+        } catch { /* logged inside destroySession */ }
+      }
       killCli();
       // Bridge marker file outlives a single CLI process (we keep it across
       // restarts so a mid-flight send is still credited), but a real close
@@ -7037,7 +7200,12 @@ process.on('message', async (raw: unknown) => {
       // forkWorker(resume=true) → a fresh `new-session --resume <cliSessionId>`
       // that rebuilds context from the on-disk transcript (same path the daemon
       // uses to recover sessions after a reboot kills the tmux server).
-      try { (backend?.destroySession ?? backend?.kill)?.call(backend); } catch { /* best-effort */ }
+      try {
+        // riff：suspend 语义是「休眠待续」——绝不能 cancel 远端任务（血缘已持久化，
+        // 恢复时 follow-up 续上）；只断流 detach。
+        if (effectiveBackendType === 'riff') backend?.kill();
+        else (backend?.destroySession ?? backend?.kill)?.call(backend);
+      } catch { /* best-effort */ }
       backend = null;
       isPromptReady = false;
       // Suspend INTENDS to resume later: preserve the sandbox overlay mount + the

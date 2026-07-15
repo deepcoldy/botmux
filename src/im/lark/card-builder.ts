@@ -201,6 +201,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'kimi': 'Kimi',
   'grok': 'Grok Build',
   'kiro-cli': 'Kiro',
+  'riff': 'Riff',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
@@ -803,7 +804,9 @@ export function buildStreamingCard(
 
   // ── Quick-action keys (only when the screenshot is visible — in text mode
   //    there's no visible cursor/input, so these keys would fire blindly) ──
-  if (displayMode === 'screenshot') {
+  // riff：远端任务后端没有可驱动的终端，PTY 快捷键只会变成内容为控制字符的
+  // follow-up 任务（worker 侧也有同款拒绝守卫），整排隐藏。
+  if (displayMode === 'screenshot' && cliId !== 'riff') {
     const mkKey = (label: string, key: string) => ({
       tag: 'button',
       text: { tag: 'plain_text', content: label },

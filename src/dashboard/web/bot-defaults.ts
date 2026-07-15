@@ -63,6 +63,7 @@ export type BotDefaultsRow = {
   startupCommands?: string;
   launchShell?: string;
   env?: string;
+  riff?: Record<string, unknown> | null;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
   autoStartOnNewTopic?: boolean;

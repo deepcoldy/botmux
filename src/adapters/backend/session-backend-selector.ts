@@ -1,5 +1,6 @@
 import { HerdrBackend } from './herdr-backend.js';
 import { PtyBackend } from './pty-backend.js';
+import { RiffBackend, type RiffBackendConfig } from './riff-backend.js';
 import { TmuxBackend } from './tmux-backend.js';
 import { TmuxPipeBackend } from './tmux-pipe-backend.js';
 import { ZellijBackend } from './zellij-backend.js';
@@ -64,7 +65,19 @@ export interface SelectedSessionBackend {
   isZellijMode: boolean;
 }
 
-export function selectSessionBackend(opts: { sessionId: string; backendType: BackendType }): SelectedSessionBackend {
+export function selectSessionBackend(opts: { sessionId: string; backendType: BackendType; backendConfig?: RiffBackendConfig }): SelectedSessionBackend {
+  if (opts.backendType === 'riff') {
+    if (!opts.backendConfig) {
+      throw new Error('riff backend requires backendConfig (baseUrl, etc.)');
+    }
+    return {
+      backend: new RiffBackend(opts.backendConfig, opts.sessionId),
+      isTmuxMode: false,
+      isPipeMode: false,
+      isZellijMode: false,
+    };
+  }
+
   if (opts.backendType === 'zellij') {
     const sessionName = ZellijBackend.sessionName(opts.sessionId);
     const reattach = ZellijBackend.hasSession(sessionName);

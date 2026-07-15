@@ -4529,10 +4529,22 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
  *  failure so callers can stay focused on the happy path. */
 async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ sid: string; larkAppId: string; session: SessionData }> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
-  const sid = sessionIdArg ?? findAncestorSessionId();
+  const sid = sessionIdArg ?? findAncestorSessionId() ?? process.env.BOTMUX_SESSION_ID;
   if (!sid) {
     console.error('无法推断 session-id。请在 Lark 话题/群里的 CLI 会话中运行，或传 --session-id <id>。');
     process.exit(1);
+  }
+  // riff sandbox env-mode：与 cmdSend 同一权威规则（仅覆盖 env 注入的 sid）。
+  // 远端沙箱没有 sessions.json / bots.json，history/quoted/bots 走同一合成会话，
+  // 且跳过本地 bots 重载（沙箱残留的 stale bots.json 不得覆盖 env 凭证）。
+  {
+    const riff = riffModeSession({ evenWithLocalSessions: sid === process.env.BOTMUX_SESSION_ID });
+    if (riff && riff.session.sessionId === sid) {
+      const { registerBot } = await import('./bot-registry.js');
+      try { registerBot(riff.botConfig); } catch { /* already registered */ }
+      envPinnedRiffBot = riff.botConfig;
+      return { sid, larkAppId: riff.session.larkAppId!, session: riff.session };
+    }
   }
   const sessions = loadSessions();
   const s = sessions.get(sid);
@@ -4929,6 +4941,83 @@ async function registerSelfFromCredFile(): Promise<void> {
   } as import('./bot-registry.js').BotConfig);
 }
 
+/**
+ * Detect if `botmux send` is running inside a riff (or other remote backend)
+ * sandbox where there is NO local daemon, no sessions.json, and no bots.json —
+ * only BOTMUX_* env vars injected by the daemon into the sandbox environment.
+ *
+ * In this mode the normal cmdSend flow breaks (loadSessions() finds nothing,
+ * registerSelfFromCredFile() has no cred file). Instead we construct a synthetic
+ * session + bot config from the env vars so cmdSend can deliver directly via
+ * the Lark API — exactly like the normal flow does, just without local state.
+ *
+ * Returns null when not in riff mode (env vars missing or local session data
+ * exists), so the normal flow takes over.
+ */
+/** J（二审）：riff env 模式选定的 bot。cmdSend/history 等后续路径里的
+ *  `loadBotConfigs()` 重载会把沙箱残留的 stale bots.json（可能是同 appId 的旧
+ *  secret）覆盖到注册表上——每次本地重载后必须把 env bot 重新注册回去压轴。 */
+let envPinnedRiffBot: import('./bot-registry.js').BotConfig | null = null;
+
+function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { session: SessionData; botConfig: import('./bot-registry.js').BotConfig } | null {
+  const appId = process.env.BOTMUX_LARK_APP_ID;
+  const appSecret = process.env.BOTMUX_LARK_APP_SECRET;
+  if (!appId || !appSecret) return null;
+
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  const chatId = process.env.BOTMUX_CHAT_ID;
+  if (!sessionId || !chatId) return null;
+
+  // If local session data exists, we're normally NOT in riff mode — a real
+  // daemon session takes precedence over env-only mode. Exception: when the
+  // caller targets exactly the env-injected session id (evenWithLocalSessions),
+  // the env identity is authoritative — warm riff sandboxes can carry stale
+  // hand-crafted session files that must not shadow the daemon-injected creds.
+  // (On daemon hosts BOTMUX_LARK_APP_SECRET is never in process env — PTY
+  // sessions get credentials via worker cred files — so this path cannot
+  // hijack a genuine local session.)
+  if (!opts.evenWithLocalSessions) {
+    try {
+      if (loadSessions().size > 0) return null;
+    } catch { /* no data dir → riff mode */ }
+  }
+
+  const brand = process.env.BOTMUX_LARK_BRAND as 'feishu' | 'lark' | undefined;
+  // Only trust a real message id as the thread anchor — chat-scope sessions
+  // anchor on the chat id (oc_…), which must NOT be used as a reply target.
+  const rootEnv = process.env.BOTMUX_ROOT_MESSAGE_ID;
+  const rootMessageId = rootEnv?.startsWith('om_') ? rootEnv : '';
+  const scopeEnv = process.env.BOTMUX_SESSION_SCOPE;
+  const scope: 'thread' | 'chat' =
+    scopeEnv === 'chat' || scopeEnv === 'thread' ? scopeEnv : (rootMessageId ? 'thread' : 'chat');
+  const ownerOpenId = process.env.BOTMUX_OWNER_OPEN_ID;
+
+  const botConfig = {
+    larkAppId: appId,
+    larkAppSecret: appSecret,
+    brand,
+    cliId: 'riff',
+    allowedUsers: [],
+  } as unknown as import('./bot-registry.js').BotConfig;
+
+  const session: SessionData = {
+    sessionId,
+    chatId,
+    rootMessageId,
+    title: 'riff',
+    status: 'active',
+    createdAt: new Date().toISOString(),
+    larkAppId: appId,
+    scope,
+    ownerOpenId,
+    // 刻意不设 quoteTargetSenderOpenId：env 是任务创建时冻结的，follow-up 轮
+    // 换了触发人后 --mention-back 会错误 @ 最初 owner。riff routing 明确禁用
+    // mention-back（@ 硬门会拒绝并提示 agent 改用 --mention <本轮 sender>）。
+  };
+
+  return { session, botConfig };
+}
+
 async function cmdSend(rest: string[]): Promise<void> {
   // Sandbox relay: a file-sandboxed session has no creds/bots.json, so route
   // the send through the daemon-side outbox instead of delivering directly.
@@ -5041,7 +5130,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 
   const ancestorCtx = findAncestorSessionContext();
-  const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? null;
+  const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? process.env.BOTMUX_SESSION_ID ?? null;
   if (!sid) {
     console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
     process.exit(1);
@@ -5049,7 +5138,31 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   const sessions = loadSessions();
   const currentTurnId = ancestorCtx?.turnId ?? process.env.BOTMUX_TURN_ID;
-  const s = sessions.get(sid);
+  let s = sessions.get(sid);
+
+  // Riff (remote backend) sandbox: no local daemon/sessions.json/bots.json.
+  // Fall back to env-var-only mode so `botmux send` works without a daemon.
+  // The daemon injects BOTMUX_LARK_APP_ID/SECRET/CHAT_ID/SESSION_ID into
+  // the sandbox env; riffModeSession() builds a synthetic session + bot from
+  // them and registers the bot so the Lark client works.
+  //
+  // The env-injected identity is AUTHORITATIVE for its own session id: a warm
+  // riff sandbox may carry stale local session data (hand-crafted by an agent
+  // in an earlier task, or baked into the image) that would otherwise shadow
+  // the daemon-injected identity and deliver through the wrong bot.
+  {
+    const riff = riffModeSession({ evenWithLocalSessions: sid === process.env.BOTMUX_SESSION_ID });
+    // Strictly scoped to the env-injected session id: an explicit
+    // `--session-id <other>` in a sandbox must fail with "session not found",
+    // not silently deliver into the env session.
+    if (riff && riff.session.sessionId === sid) {
+      s = riff.session;
+      const { registerBot } = await import('./bot-registry.js');
+      try { registerBot(riff.botConfig); } catch { /* already registered */ }
+      envPinnedRiffBot = riff.botConfig;
+    }
+  }
+
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
 
@@ -5109,6 +5222,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!content.trim()) { console.error('--voice 需要要朗读的文字'); process.exit(1); }
     const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
     try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
     const { uploadFile, sendMessage, replyMessage } = await import('./im/lark/client.js');
     const { synthesizeVoiceOpus } = await import('./services/voice/index.js');
     const { rmSync } = await import('node:fs');
@@ -5160,6 +5274,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
     const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
     try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
     const { replyToDocComment, chunkCommentText, removeCommentReaction } = await import('./im/lark/doc-comment.js');
     const appId = s.larkAppId!;
     const loc = localeForBot(appId);
@@ -5250,6 +5365,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Register bots so Lark client works
   const { registerBot, loadBotConfigs, findOncallChatForAnyBot } = await import('./bot-registry.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
   const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
@@ -5849,6 +5965,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 
   const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
   const { sendMessage, replyMessage } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
   const briefJson = JSON.stringify({ zh_cn: { title: '', content: built.threadContent } });
@@ -6012,6 +6129,7 @@ async function cmdReport(rest: string[]): Promise<void> {
 
   const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
   const { sendMessage, replyMessage } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
 
@@ -6625,22 +6743,11 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
   }
 
   const sessionIdArg = argValue(rest, '--session-id');
-  const sid = sessionIdArg ?? findAncestorSessionId();
-  if (!sid) {
-    console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
-    process.exit(1);
-  }
+  // 与 history/quoted 同一前奏：本地会话解析 + riff sandbox env 合成会话兜底
+  //（远端沙箱无 sessions.json/bots.json 时 `botmux bots list` 照常可用）。
+  const { sid, larkAppId: resolvedAppId, session: s } = await resolveSessionAppId(sessionIdArg);
 
-  const sessions = loadSessions();
-  const s = sessions.get(sid);
-  if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
-  if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
-
-  // Register bots
-  const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
-  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
-
-  const appId = s.larkAppId!;
+  const appId = resolvedAppId;
   const dataDir = resolveDataDir();
   const botInfoPath = join(dataDir, 'bots-info.json');
 

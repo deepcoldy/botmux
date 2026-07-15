@@ -267,6 +267,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.no_git_repos': '在 {dirs} 下未找到 git 仓库。',
   'cmd.repo.worktree_usage': '用法：`/repo wt <编号|项目名|路径> [新分支名]` — 基于该仓库的远端默认分支新建 worktree 并打开；未指定分支时会优先根据话题标题/首条需求自动命名。',
   'cmd.repo.worktree_creating': '🌿 正在为 `{repo}` 创建 worktree（含 git fetch，可能需要几秒）…',
+  'card.repo.riff_worktree_push_failed': '⚠️ 分支 `{branch}` 推送远端失败：{error}\nRiff 沙箱将使用默认分支（可手动 push 后重试）',
   'cmd.repo.worktree_created': '🌿 worktree 已创建：`{path}`\n分支 `{branch}`，基于 `{base}`',
   'cmd.repo.worktree_failed': '❌ 创建 worktree 失败：{error}',
   'cmd.repo.worktree_in_progress': '⏳ 已有一个 worktree 正在创建，请稍候…',

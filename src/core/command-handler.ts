@@ -1264,6 +1264,9 @@ export async function handleCommand(
         killWorker(ds);
         ds.workingDir = targetPath;
         ds.session.workingDir = targetPath;
+        // cwd 变了，riff 多仓 stamp（选择卡多选时写入）随之失效——保留会让下次
+        // refork 仍按旧仓库组合推导、无视新目录。
+        ds.session.riffRepoDirs = undefined;
         sessionStore.updateSession(ds.session);
         if (validation.created) {
           await sessionReply(rootId, t('cmd.cd.created_switched', { path: resolvedPath }, loc));

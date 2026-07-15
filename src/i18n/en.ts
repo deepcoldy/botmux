@@ -264,6 +264,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.no_git_repos': 'No git repositories found under {dirs}.',
   'cmd.repo.worktree_usage': 'Usage: `/repo wt <N|name|path> [new-branch]` — create a worktree off the repo\'s remote default branch and open it; without a branch, Botmux auto-names it from the topic title / first prompt when possible.',
   'cmd.repo.worktree_creating': '🌿 Creating a worktree for `{repo}` (includes a git fetch, may take a few seconds)…',
+  'card.repo.riff_worktree_push_failed': '⚠️ Failed to push branch `{branch}` to origin: {error}\nThe riff sandbox will use the default branch (push manually and retry).',
   'cmd.repo.worktree_created': '🌿 Worktree created: `{path}`\nBranch `{branch}`, based on `{base}`',
   'cmd.repo.worktree_failed': '❌ Worktree creation failed: {error}',
   'cmd.repo.worktree_in_progress': '⏳ A worktree is already being created — please wait…',
