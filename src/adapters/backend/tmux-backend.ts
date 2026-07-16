@@ -10,15 +10,34 @@ import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
 
 /**
+ * Botmux-owned per-session variables must never leak from the shared tmux
+ * server's global environment into a new pane. Every fresh pane unsets them
+ * first, then `/usr/bin/env KEY=VAL ...` injects this session's current values.
+ */
+const BOTMUX_MANAGED_SESSION_ENV_KEYS = [
+  '__OWNER_OPEN_ID',
+  'BOTMUX_SESSION_ID',
+  'BOTMUX_CHAT_ID',
+  'BOTMUX_LARK_APP_ID',
+  'BOTMUX_ROOT_MESSAGE_ID',
+  'BOTMUX_TURN_ID',
+] as const;
+
+/**
  * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
  * new tmux pane inherits the tmux *server's* global environment, which the
  * (redacted) client env can't override — so if the server was ever started
  * with bare LARK_APP_* in scope (pre-upgrade botmux, or the user's own tmux),
- * those values reach the CLI despite redactChildEnv(). Unsetting them in the
- * wrapper shell removes them for this pane only, without touching the server
- * global env. Key names are fixed identifiers — no shell-escaping needed.
+ * those values reach the CLI despite redactChildEnv(). It can also inherit
+ * stale botmux session identity from another pane on the shared server (owner,
+ * session/chat/thread/turn ids). Unsetting them in the wrapper shell removes
+ * them for this pane only, without touching the server global env. Key names are
+ * fixed identifiers — no shell-escaping needed.
  */
-const REDACTED_ENV_UNSET_CLAUSE = `unset ${REDACTED_CHILD_ENV_KEYS.join(' ')}`;
+const REDACTED_ENV_UNSET_CLAUSE = `unset ${[
+  ...REDACTED_CHILD_ENV_KEYS,
+  ...BOTMUX_MANAGED_SESSION_ENV_KEYS,
+].join(' ')}`;
 
 /**
  * TmuxBackend — session backend using tmux for process persistence.

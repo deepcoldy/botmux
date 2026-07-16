@@ -553,6 +553,41 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
     },
   );
 
+  it.skipIf(!hasEnvBin)(
+    'clears stale botmux-managed session variables before injecting current pane values',
+    () => {
+      const result = spawnSync(
+        '/bin/sh',
+        ['-c', SCRIPT, '_',
+          tmpdir(),
+          'BOTMUX_SESSION_ID=fresh-session',
+          '/usr/bin/env',
+        ],
+        {
+          encoding: 'utf-8',
+          env: {
+            PATH: '/usr/bin:/bin',
+            __OWNER_OPEN_ID: 'stale-owner',
+            BOTMUX_SESSION_ID: 'stale-session',
+            BOTMUX_CHAT_ID: 'stale-chat',
+            BOTMUX_LARK_APP_ID: 'stale-app',
+            BOTMUX_ROOT_MESSAGE_ID: 'stale-root',
+            BOTMUX_TURN_ID: 'stale-turn',
+          },
+        },
+      );
+
+      expect(result.status).toBe(0);
+      const lines = result.stdout.split('\n');
+      expect(lines).toContain('BOTMUX_SESSION_ID=fresh-session');
+      expect(lines).not.toContain('__OWNER_OPEN_ID=stale-owner');
+      expect(lines).not.toContain('BOTMUX_CHAT_ID=stale-chat');
+      expect(lines).not.toContain('BOTMUX_LARK_APP_ID=stale-app');
+      expect(lines).not.toContain('BOTMUX_ROOT_MESSAGE_ID=stale-root');
+      expect(lines).not.toContain('BOTMUX_TURN_ID=stale-turn');
+    },
+  );
+
   const hasTmux = !spawnSync('tmux', ['-V']).error;
   it.skipIf(!hasEnvBin || !hasTmux)(
     'tmux child does NOT inherit bare LARK_APP_* from a server started with them in scope (Codex repro)',

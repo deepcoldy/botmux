@@ -1069,6 +1069,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       lastMessageAt: sessionLastMessageAtMs(session),
       hasHistory: true,  // restored sessions have prior CLI history
       workingDir: session.workingDir,
+      ownerOpenId: session.ownerOpenId,
       // Restore persisted streaming-card state — next screen_update will PATCH
       // the existing card instead of POSTing a fresh one. If the card was
       // withdrawn while we were down, the PATCH fails with MessageWithdrawnError

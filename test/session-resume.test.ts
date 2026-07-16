@@ -332,6 +332,22 @@ describe('resumeSession', () => {
       expect(restoreUsageLimitRuntimeState).toHaveBeenCalledWith(ds);
     });
 
+    it('restores ownerOpenId for active historical sessions after daemon restart', async () => {
+      const s = sessionStore.createSession('oc_chat_owner', 'om_owner', 'Owner topic');
+      s.larkAppId = 'app_test';
+      s.scope = 'thread';
+      s.workingDir = '/tmp/proj';
+      s.ownerOpenId = 'ou_owner_restore';
+      sessionStore.updateSession(s);
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      const ds = map.get(sessionKey('om_owner', 'app_test'));
+      expect(ds).toBeDefined();
+      expect(ds!.ownerOpenId).toBe('ou_owner_restore');
+    });
+
     it('flips status back to active, clears closedAt, and registers in the Map (thread-scope)', async () => {
       const closed = makeClosedSession({ rootMessageId: 'om_threadA' });
       (closed as any).lastUserPrompt = '继续修复限额后的任务';
