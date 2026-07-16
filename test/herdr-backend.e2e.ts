@@ -17,7 +17,7 @@
  */
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { rmSync } from 'node:fs';
+import { rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
@@ -26,6 +26,7 @@ import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 // Unique enough to never collide with anything the user has running.
 const TEST_SESSION = 'bmx-e2e7777';
 const TEST_TIMEOUT = 30_000;
+const REATTACH_SENTINEL = `/tmp/botmux-herdr-reattach-${process.pid}`;
 
 /**
  * Hard reset for a test session. `herdr session stop` is asynchronous and
@@ -59,10 +60,12 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, label = 'con
 describe('HerdrBackend (e2e)', () => {
   beforeEach(() => {
     hardResetSession(TEST_SESSION);
+    rmSync(REATTACH_SENTINEL, { force: true });
   });
 
   afterEach(() => {
     hardResetSession(TEST_SESSION);
+    rmSync(REATTACH_SENTINEL, { force: true });
   });
 
   it.skipIf(!HerdrBackend.isAvailable())('spawn captures output from a live herdr agent', async () => {
@@ -89,27 +92,29 @@ describe('HerdrBackend (e2e)', () => {
     const be1 = new HerdrBackend(TEST_SESSION);
     const renderer = new TerminalRenderer(80, 24);
     be1.onData(data => renderer.write(data));
-    be1.spawn('/bin/bash', ['-lc', 'echo PHASE1_MARKER; exec cat'], spawnOpts());
+    be1.spawn('/bin/bash', ['-lc', `echo PHASE1_MARKER; while [ ! -f ${REATTACH_SENTINEL} ]; do sleep 0.05; done; echo PHASE2_DELTA; sleep 30`], spawnOpts());
     await waitFor(() => renderer.rawSnapshot().includes('PHASE1_MARKER'), 10_000, 'PHASE1_MARKER');
     be1.kill();
     renderer.dispose();
     expect(HerdrBackend.hasSession(TEST_SESSION)).toBe(true);
 
-    // Phase 2: the observer full frame is the authoritative reattach baseline;
-    // subsequent writes must arrive as incremental frames without a seed race.
+    // Phase 2: worker first seeds the static screen, then the observer streams
+    // the next authoritative full redraw and subsequent increments.
     const be2 = new HerdrBackend(TEST_SESSION, { isReattach: true });
-    const out2: string[] = [];
-    be2.onData(data => out2.push(data));
+    const reattachRenderer = new TerminalRenderer(80, 24);
     be2.spawn('/bin/bash', ['-lc', 'echo SHOULD_NOT_RUN'], spawnOpts());
     expect(be2.isReattach).toBe(true);
-    await waitFor(() => out2.join('').includes('PHASE1_MARKER'), 10_000, 'reattach streamed full baseline');
+    reattachRenderer.write(be2.captureCurrentScreen());
+    await waitFor(() => reattachRenderer.rawSnapshot().includes('PHASE1_MARKER'), 5_000, 'reattach rendered seed');
+    be2.onData(data => reattachRenderer.write(data));
 
-    be2.write('PHASE2_DELTA');
-    be2.sendSpecialKeys('Enter');
-    await waitFor(() => out2.join('').includes('PHASE2_DELTA'), 10_000, 'reattach streamed PHASE2_DELTA');
-    expect(out2.join('')).not.toContain('SHOULD_NOT_RUN');
+    writeFileSync(REATTACH_SENTINEL, 'go');
+    await waitFor(() => be2.captureCurrentScreen().includes('PHASE2_DELTA'), 10_000, 'pane produced PHASE2_DELTA');
+    await waitFor(() => reattachRenderer.rawSnapshot().includes('PHASE2_DELTA'), 10_000, 'reattach rendered PHASE2_DELTA');
+    expect(reattachRenderer.rawSnapshot()).not.toContain('SHOULD_NOT_RUN');
 
     be2.destroySession();
+    reattachRenderer.dispose();
     await waitFor(() => !HerdrBackend.hasSession(TEST_SESSION), 10_000, 'session torn down');
   }, TEST_TIMEOUT);
 

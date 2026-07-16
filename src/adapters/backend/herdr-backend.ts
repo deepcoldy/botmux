@@ -112,7 +112,7 @@ export class HerdrBackend implements SessionBackend {
   private observerBuffer = '';
   private streamDecoder = new StringDecoder('utf8');
   private lastFrameSeq = 0;
-  private dropInitialFullFrame = false;
+  private pendingData = '';
   private readonly dataCbs: Array<(d: string) => void> = [];
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
   private readonly agentName = 'botmux';
@@ -256,7 +256,6 @@ export class HerdrBackend implements SessionBackend {
       }
     }
 
-    this.dropInitialFullFrame = this.isReattach || Boolean(this.opts.externalTarget);
     this.started = true;
     this.startObserver();
   }
@@ -287,12 +286,15 @@ export class HerdrBackend implements SessionBackend {
     this.rows = rows;
     if (!this.started || this.exited) return;
     this.stopObserver();
-    this.dropInitialFullFrame = false;
     this.startObserver();
   }
 
   onData(cb: (data: string) => void): void {
     this.dataCbs.push(cb);
+    if (!this.pendingData || this.exited) return;
+    const pending = this.pendingData;
+    this.pendingData = '';
+    try { cb(pending); } catch { /* listener crash must not kill the observer */ }
   }
 
   onExit(cb: (code: number | null, signal: string | null) => void): void {
@@ -461,13 +463,13 @@ export class HerdrBackend implements SessionBackend {
     const bytes = Buffer.from(message.bytes, 'base64');
     if (message.full) {
       this.streamDecoder = new StringDecoder('utf8');
-      if (this.dropInitialFullFrame) {
-        this.dropInitialFullFrame = false;
-        return;
-      }
     }
     const data = this.streamDecoder.write(bytes);
     if (!data) return;
+    if (this.dataCbs.length === 0) {
+      this.pendingData = message.full ? data : this.pendingData + data;
+      return;
+    }
     for (const cb of this.dataCbs) {
       try { cb(data); } catch { /* listener crash must not kill the observer */ }
     }
@@ -476,7 +478,6 @@ export class HerdrBackend implements SessionBackend {
   private handleObserverDisconnect(child: ChildProcess): void {
     if (this.observerProcess !== child || this.exited) return;
     this.observerProcess = null;
-    this.dropInitialFullFrame = false;
     try { child.kill('SIGTERM'); } catch { /* already gone */ }
 
     const agents = this.listAgents();
@@ -509,6 +510,7 @@ export class HerdrBackend implements SessionBackend {
     if (this.exited) return;
     this.exited = true;
     this.stopObserver();
+    this.pendingData = '';
     for (const cb of this.exitCbs) {
       try { cb(code, signal); } catch { /* listener crash must not kill teardown */ }
     }
