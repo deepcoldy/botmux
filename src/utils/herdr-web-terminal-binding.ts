@@ -26,6 +26,7 @@ export interface HerdrWebTerminalResizeResult extends HerdrWebTerminalBindingSta
  */
 export class HerdrWebTerminalBinding {
   private attachedBackend: HerdrWebTerminalBackend | null = null;
+  private lastSize: HerdrWebTerminalSize | null = null;
 
   constructor(
     private readonly viewer: object,
@@ -47,6 +48,7 @@ export class HerdrWebTerminalBinding {
   }
 
   resize(cols: number, rows: number): HerdrWebTerminalResizeResult {
+    this.lastSize = { cols, rows };
     const state = this.sync();
     return {
       ...state,
@@ -54,9 +56,25 @@ export class HerdrWebTerminalBinding {
     };
   }
 
+  /**
+   * Re-attaches an already-connected viewer after an in-worker backend
+   * replacement and re-applies the most recent browser grid. Unlike resize(),
+   * this path needs no new browser event: /restart keeps the WebSocket alive.
+   */
+  restore(): HerdrWebTerminalResizeResult {
+    const state = this.sync();
+    return {
+      ...state,
+      size: state.backend && this.lastSize
+        ? state.backend.resizeWebTerminal(this.viewer, this.lastSize.cols, this.lastSize.rows)
+        : null,
+    };
+  }
+
   release(): object | null {
     const attachedBackend = this.attachedBackend;
     this.attachedBackend = null;
+    this.lastSize = null;
     return attachedBackend?.releaseWebTerminal(this.viewer) ?? null;
   }
 }

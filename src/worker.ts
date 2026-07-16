@@ -424,6 +424,8 @@ const wsClients = new Set<WebSocket>();
 const authedClients = new WeakSet<WebSocket>();
 /** Per-WS-client tmux/zellij attach PTYs. */
 const clientPtys = new Map<WebSocket, pty.IPty>();
+/** Managed-Herdr viewers survive an in-worker /restart while backend changes. */
+const herdrWebBindings = new Map<WebSocket, HerdrWebTerminalBinding>();
 const writeToken = randomBytes(16).toString('hex');
 // Standalone/test fallback. Production replaces this after init with a stable
 // per-session HMAC derived from the host-only dashboard secret.
@@ -3147,6 +3149,48 @@ function relayHerdrWebSnapshot(snapshot: string): void {
   }
 }
 
+function applyHerdrWebBindingResult(
+  ws: WebSocket,
+  result: ReturnType<HerdrWebTerminalBinding['resize']>,
+): void {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  const { backend: herdrWebBackend, initialSize, size } = result;
+  if (initialSize) {
+    ws.send(`\x1b]1989;follower;${initialSize.cols};${initialSize.rows}\x07`);
+  }
+  if (!herdrWebBackend || !size) return;
+  for (const client of wsClients) {
+    if (
+      client.readyState === WebSocket.OPEN &&
+      !herdrWebBackend.isWebTerminalOwner(client)
+    ) {
+      client.send(`\x1b]1989;follower;${size.cols};${size.rows}\x07`);
+    }
+  }
+}
+
+/**
+ * /restart replaces a managed Herdr backend without closing browser sockets.
+ * Restore every viewer in connection order so the previous oldest surviving
+ * owner remains authoritative, then re-apply its last browser grid.
+ */
+function restoreHerdrWebBindings(): void {
+  if (!(backend instanceof HerdrBackend) || lastInitConfig?.adoptMode) return;
+  for (const [ws, binding] of herdrWebBindings) {
+    if (ws.readyState !== WebSocket.OPEN) {
+      binding.release();
+      herdrWebBindings.delete(ws);
+      continue;
+    }
+    applyHerdrWebBindingResult(ws, binding.restore());
+  }
+}
+
+function wireHerdrWebTerminalRelays(be: HerdrBackend): void {
+  be.onSnapshot(relayHerdrWebSnapshot);
+  be.onWebTerminalCursor(relayHerdrWebCursor);
+}
+
 function recentTerminalLogTail(): string | undefined {
   const plain = stripAnsiForLog(tailChars(scrollback, CRASH_DIAGNOSTIC_RAW_MAX));
   if (!plain) return undefined;
@@ -4981,6 +5025,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       env: process.env as Record<string, string>,
     });
 
+    wireHerdrWebTerminalRelays(herdrBe);
     seedBackendScreen('herdr adopt', herdrBe);
 
     setupAdoptTranscriptBridges(cfg);
@@ -6326,8 +6371,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     send({ type: 'riff_task_id', taskId });
   });
   if (backend instanceof HerdrBackend) {
-    backend.onSnapshot(relayHerdrWebSnapshot);
-    backend.onWebTerminalCursor(relayHerdrWebCursor);
+    wireHerdrWebTerminalRelays(backend);
+    restoreHerdrWebBindings();
   }
   backend.onExit((code, signal) => {
     const intentionalRestart = intentionalRestartBackend === observedBackend;
@@ -6843,6 +6888,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         const herdrWebBinding = new HerdrWebTerminalBinding(ws, () => (
           backend instanceof HerdrBackend && !lastInitConfig?.adoptMode ? backend : null
         ));
+        herdrWebBindings.set(ws, herdrWebBinding);
         const initialHerdrSize = herdrWebBinding.sync().initialSize;
         if (initialHerdrSize) {
           ws.send(`\x1b]1989;follower;${initialHerdrSize.cols};${initialHerdrSize.rows}\x07`);
@@ -6879,22 +6925,9 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           try {
             const msg = JSON.parse(String(raw));
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
-              const { backend: herdrWebBackend, initialSize, size } = herdrWebBinding.resize(msg.cols, msg.rows);
-              if (initialSize) {
-                ws.send(`\x1b]1989;follower;${initialSize.cols};${initialSize.rows}\x07`);
-              }
-              if (herdrWebBackend) {
-                if (size) {
-                  for (const client of wsClients) {
-                    if (
-                      client.readyState === WebSocket.OPEN &&
-                      !herdrWebBackend.isWebTerminalOwner(client)
-                    ) {
-                      client.send(`\x1b]1989;follower;${size.cols};${size.rows}\x07`);
-                    }
-                  }
-                }
-              } else {
+              const result = herdrWebBinding.resize(msg.cols, msg.rows);
+              applyHerdrWebBindingResult(ws, result);
+              if (!result.backend) {
                 backend?.resize(msg.cols, msg.rows);
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
@@ -6912,6 +6945,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
 
         ws.on('close', () => {
           wsClients.delete(ws);
+          herdrWebBindings.delete(ws);
           const promoted = herdrWebBinding.release() as WebSocket | null;
           if (promoted?.readyState === WebSocket.OPEN) {
             promoted.send('\x1b]1989;owner\x07');
@@ -8335,6 +8369,7 @@ function cleanup(): void {
   clientPtys.clear();
   for (const ws of wsClients) ws.close();
   wsClients.clear();
+  herdrWebBindings.clear();
   if (wss) { wss.close(); wss = null; }
   if (httpServer) { httpServer.close(); httpServer = null; }
   if (workflowPtyLogStream) {

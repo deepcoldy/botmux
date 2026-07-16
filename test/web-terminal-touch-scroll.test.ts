@@ -15,11 +15,16 @@ describe('web terminal touch scrolling', () => {
   it('uses snapshot replacement for every Herdr CLI, including normal-buffer Codex', () => {
     expect(workerSource).toContain('return backend instanceof HerdrBackend;');
     expect(workerSource).toContain('if (be instanceof HerdrBackend) {');
-    expect(workerSource).toContain('if (backend instanceof HerdrBackend) {\n    backend.onSnapshot(relayHerdrWebSnapshot);');
+    expect(workerSource).toContain('wireHerdrWebTerminalRelays(herdrBe);');
+    expect(workerSource).toContain(
+      'if (backend instanceof HerdrBackend) {\n'
+      + '    wireHerdrWebTerminalRelays(backend);\n'
+      + '    restoreHerdrWebBindings();',
+    );
   });
 
   it('restores the real Herdr attach cursor after snapshot rendering', () => {
-    expect(workerSource).toContain('backend.onWebTerminalCursor(relayHerdrWebCursor);');
+    expect(workerSource).toContain('be.onWebTerminalCursor(relayHerdrWebCursor);');
     expect(workerSource).toContain('scrollback}${herdrWebCursorSequence()}');
     expect(workerSource).toContain('ws.send(seed + herdrWebCursorSequence());');
   });

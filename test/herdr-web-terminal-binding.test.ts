@@ -38,6 +38,26 @@ describe('Herdr web terminal worker binding', () => {
     expect(first.releaseWebTerminal).toHaveBeenCalledTimes(1);
   });
 
+  it('restores the last browser grid after backend replacement without another resize event', () => {
+    const viewer = {};
+    const first = fakeBackend();
+    const restarted = fakeBackend();
+    let current: HerdrWebTerminalBackend | null = first;
+    const binding = new HerdrWebTerminalBinding(viewer, () => current);
+
+    binding.resize(120, 36);
+    current = restarted;
+
+    expect(binding.restore()).toEqual({
+      backend: restarted,
+      initialSize: null,
+      size: { cols: 120, rows: 36 },
+    });
+    expect(first.releaseWebTerminal).toHaveBeenCalledWith(viewer);
+    expect(restarted.acquireWebTerminal).toHaveBeenCalledWith(viewer);
+    expect(restarted.resizeWebTerminal).toHaveBeenCalledWith(viewer, 120, 36);
+  });
+
   it('pins a viewer to the new backend owner size when restart already has an owner', () => {
     const viewer = {};
     const first = fakeBackend();
