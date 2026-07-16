@@ -53,6 +53,7 @@ export interface V3BlockedCardInput {
   errorClass?: string;
   errorCode?: string;
   message?: string;
+  retryForbidden?: 'host-effect-uncertain';
   /** 省略则按 runId/nodeId/attemptId 推导（幂等校验用）。 */
   nonce?: string;
   webDetailUrl?: string;
@@ -89,7 +90,10 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
   if (answered) { title = `已回答：节点 ${input.nodeId}`; template = 'green'; }
   else if (ask) { title = `需要你拍板：节点 ${input.nodeId}`; template = 'blue'; }
   else if (retried) { title = `已重试：节点 ${input.nodeId}`; template = 'green'; }
-  else { title = `节点受阻：${input.nodeId}`; template = 'orange'; }
+  else if (input.retryForbidden === 'host-effect-uncertain') {
+    title = `外部效果待核实：${input.nodeId}`;
+    template = 'red';
+  } else { title = `节点受阻：${input.nodeId}`; template = 'orange'; }
 
   const attemptNNN = input.attemptId.slice(input.attemptId.lastIndexOf('/') + 1);
   const elements: Array<Record<string, unknown>> = [
@@ -194,10 +198,23 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
             (retried.by ? ` · by ${escapeMd(short(retried.by, 20))}` : ''),
         },
       });
+    } else if (input.retryForbidden === 'host-effect-uncertain') {
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content:
+            '⚠️ 该 attempt 可能已产生外部副作用。请先在目标系统对账；为避免重复发送/创建，不提供普通重试。' +
+            ` P0 暂不支持手工补写 provider 回执，对账后请用 \`/workflow cancel ${escapeMd(input.runId)}\` 收口并保留审计记录。`,
+        },
+      });
     } else {
       elements.push({
         tag: 'div',
-        text: { tag: 'lark_md', content: '处理掉阻塞原因（如完成鉴权）后点重试，会以新 attempt 重跑该节点。' },
+        text: {
+          tag: 'lark_md',
+          content: '处理掉阻塞原因（如完成鉴权）后点重试，会以新 attempt 重跑该节点；为避免旧 worker 与重试重叠，进入受阻状态时被中止的并行节点也会重新执行。',
+        },
       });
       elements.push({
         tag: 'action',
@@ -224,7 +241,7 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
     actions: [
       {
         tag: 'button',
-        text: { tag: 'plain_text', content: 'Web 详情' },
+        text: { tag: 'plain_text', content: 'Web 详情（需登录）' },
         type: 'default',
         multi_url: {
           url: webDetailUrl, pc_url: webDetailUrl, android_url: webDetailUrl, ios_url: webDetailUrl,

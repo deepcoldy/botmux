@@ -318,12 +318,15 @@ describe('dashboard monitoring session table', () => {
     expect(css).toMatch(/\.ui-info-pop\s*\{[^}]*white-space:\s*pre-line/s);
   });
 
-  it('layers resource metric help popovers above following panels', () => {
+  it('layers resource metric help popovers above following panels and keeps them interactive', () => {
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
 
     expect(css).toMatch(/\.resource-page\s*\{[^}]*isolation:\s*isolate/s);
     expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*position:\s*fixed[^}]*z-index:\s*2147483647/s);
-    expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*pointer-events:\s*none/s);
+    // Floating help is deliberately interactive so users can hover, select,
+    // and copy its text while it remains above following resource panels.
+    expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*pointer-events:\s*auto/s);
+    expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*user-select:\s*text/s);
   });
 
   it('uses a compact unsupported resource sampling empty state', () => {

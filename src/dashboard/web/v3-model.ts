@@ -39,7 +39,7 @@ const MINI = {
 } as const;
 
 export function isTerminalRunStatus(status: RunView['runStatus'] | undefined): boolean {
-  return status === 'succeeded' || status === 'failed';
+  return status === 'succeeded' || status === 'failed' || status === 'cancelled';
 }
 
 export function v3RunIdFromHash(hash = typeof location !== 'undefined' ? location.hash : ''): string | null {

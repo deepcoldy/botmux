@@ -1,320 +1,7 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { EventLog, type EventDraft } from '../src/workflows/events/append.js';
-import {
-  executeSideEffect,
-  type HostExecutorContext,
-  type SideEffectingExecutor,
-} from '../src/workflows/hostExecutors/index.js';
-import { deriveIdempotencyKey } from '../src/workflows/events/idempotency.js';
-
-// ─── Test fixtures ──────────────────────────────────────────────────────────
-
-const RUN_ID = 'run-host-exec-01';
-const SHA64 = 'a'.repeat(64);
-
-let baseDir: string;
-let log: EventLog;
-
-beforeEach(() => {
-  baseDir = mkdtempSync(join(tmpdir(), 'wf-host-exec-'));
-  log = new EventLog(RUN_ID, baseDir);
-});
-afterEach(() => {
-  rmSync(baseDir, { recursive: true, force: true });
-});
-
-function context(overrides: Partial<HostExecutorContext> = {}): HostExecutorContext {
-  return {
-    log,
-    runId: RUN_ID,
-    workflowId: 'wf-demo',
-    revisionId: 'rev-001',
-    nodeId: 'n1',
-    activityId: 'a1',
-    attemptId: 'at1',
-    ...overrides,
-  };
-}
-
-async function seedRun(): Promise<void> {
-  // Replay needs runCreated as the first event.  Any test reading events
-  // back must call this first; otherwise readAll is just the protocol
-  // events and replay() will reject.
-  await log.append({
-    runId: RUN_ID,
-    type: 'runCreated',
-    actor: 'scheduler',
-    payload: {
-      workflowId: 'wf-demo',
-      revisionId: 'rev-001',
-      inputRef: { outputHash: `sha256:${SHA64}`, outputBytes: 1, outputSchemaVersion: 1 },
-      initiator: 'tests',
-    },
-  } as EventDraft);
-}
-
-// ─── Mock executor: tracks invoke calls + can be configured to throw ────────
-
-function makeMockExecutor(opts: {
-  output?: unknown;
-  externalRefs?: Record<string, unknown>;
-  throws?: Error;
-  classifier?: SideEffectingExecutor<any, any>['classifyError'];
-} = {}): SideEffectingExecutor<{ x: string }, { y: string }> & {
-  calls: Array<{ input: { x: string }; idempotencyKey: string }>;
-} {
-  const calls: Array<{ input: { x: string }; idempotencyKey: string }> = [];
-  return {
-    provider: 'mock-provider',
-    idempotencyTtlMs: 60000,
-    canonicalInput(input) {
-      return { x: input.x };
-    },
-    async invoke(input, idempotencyKey) {
-      calls.push({ input, idempotencyKey });
-      if (opts.throws) throw opts.throws;
-      return {
-        output: (opts.output ?? { y: 'ok' }) as { y: string },
-        externalRefs: opts.externalRefs ?? { mockId: 'mock-123' },
-      };
-    },
-    classifyError: opts.classifier,
-    calls,
-  };
-}
-
-// ─── executeSideEffect — happy path ─────────────────────────────────────────
-
-describe('executeSideEffect — happy path event sequence', () => {
-  it('writes effectAttempted then activitySucceeded in order', async () => {
-    await seedRun();
-    const exec = makeMockExecutor();
-    const result = await executeSideEffect(context(), { x: 'hi' }, exec);
-
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect(result.output).toEqual({ y: 'ok' });
-    expect(result.externalRefs).toEqual({ mockId: 'mock-123' });
-
-    const events = await log.readAll();
-    expect(events.map((e) => e.type)).toEqual([
-      'runCreated',
-      'effectAttempted',
-      'activitySucceeded',
-    ]);
-
-    const effectAttempted = events[1] as any;
-    const succeeded = events[2] as any;
-    expect(effectAttempted.payload.activityId).toBe('a1');
-    expect(effectAttempted.payload.attemptId).toBe('at1');
-    expect(effectAttempted.payload.provider).toBe('mock-provider');
-    expect(effectAttempted.payload.idempotencyTtlMs).toBe(60000);
-    expect(succeeded.payload.activityId).toBe('a1');
-    expect(succeeded.payload.attemptId).toBe('at1');
-    expect(succeeded.payload.externalRefs).toEqual({ mockId: 'mock-123' });
-  });
-
-  it('forwards a deterministic idempotencyKey to executor.invoke', async () => {
-    await seedRun();
-    const exec = makeMockExecutor();
-    await executeSideEffect(context(), { x: 'hi' }, exec);
-    expect(exec.calls).toHaveLength(1);
-    expect(exec.calls[0].idempotencyKey).toBe(
-      deriveIdempotencyKey({
-        workflowId: 'wf-demo',
-        revisionId: 'rev-001',
-        runId: RUN_ID,
-        nodeId: 'n1',
-        attemptId: 'at1',
-      }),
-    );
-    expect(exec.calls[0].idempotencyKey.length).toBeLessThanOrEqual(50);
-  });
-
-  it('records canonical inputHash on effectAttempted', async () => {
-    await seedRun();
-    const exec = makeMockExecutor();
-    await executeSideEffect(context(), { x: 'frozen-input' }, exec);
-    const events = await log.readAll();
-    const effectAttempted = events[1] as any;
-    expect(effectAttempted.payload.inputHash).toMatch(/^sha256:[0-9a-f]{64}$/);
-  });
-
-  it('activitySucceeded carries an outputRef with hash of externalRefs', async () => {
-    await seedRun();
-    const exec = makeMockExecutor({ externalRefs: { messageId: 'om_abc' } });
-    await executeSideEffect(context(), { x: 'y' }, exec);
-    const events = await log.readAll();
-    const succeeded = events[2] as any;
-    expect(succeeded.payload.outputRef.outputHash).toMatch(/^sha256:[0-9a-f]{64}$/);
-    expect(succeeded.payload.outputRef.contentType).toBe('application/json');
-  });
-
-  it('outputRef points at a JSON blob containing {output, externalRefs}', async () => {
-    const { readFileSync } = await import('node:fs');
-    await seedRun();
-    const exec = makeMockExecutor({
-      output: { y: 'detail' },
-      externalRefs: { messageId: 'om_xyz' },
-    });
-    await executeSideEffect(context(), { x: 'y' }, exec);
-    const events = await log.readAll();
-    const succeeded = events[2] as any;
-    const outputPath = succeeded.payload.outputRef.outputPath;
-    expect(typeof outputPath).toBe('string');
-    const blob = JSON.parse(readFileSync(outputPath, 'utf-8'));
-    expect(blob).toEqual({
-      output: { y: 'detail' },
-      externalRefs: { messageId: 'om_xyz' },
-    });
-  });
-
-  it('outputRef.outputBytes matches the actual blob size', async () => {
-    const { statSync } = await import('node:fs');
-    await seedRun();
-    const exec = makeMockExecutor({ externalRefs: { id: 'abc' } });
-    await executeSideEffect(context(), { x: 'y' }, exec);
-    const events = await log.readAll();
-    const succeeded = events[2] as any;
-    expect(statSync(succeeded.payload.outputRef.outputPath).size).toBe(
-      succeeded.payload.outputRef.outputBytes,
-    );
-  });
-});
-
-// ─── executeSideEffect — failure paths ──────────────────────────────────────
-
-describe('executeSideEffect — failure paths', () => {
-  it('writes activityFailed with classifier output', async () => {
-    await seedRun();
-    const exec = makeMockExecutor({
-      throws: new Error('boom'),
-      classifier: () => ({
-        errorCode: 'NetworkError',
-        errorClass: 'retryable',
-        errorMessage: 'network down',
-      }),
-    });
-    const result = await executeSideEffect(context(), { x: 'y' }, exec);
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.error.errorCode).toBe('NetworkError');
-    expect(result.error.errorClass).toBe('retryable');
-
-    const events = await log.readAll();
-    expect(events.map((e) => e.type)).toEqual([
-      'runCreated',
-      'effectAttempted', // still written before invoke
-      'activityFailed',
-    ]);
-    const failed = events[2] as any;
-    expect(failed.payload.error.errorCode).toBe('NetworkError');
-    expect(failed.payload.error.errorClass).toBe('retryable');
-    expect(failed.payload.error.errorMessage).toBe('network down');
-  });
-
-  it('falls back to UnknownProviderError/manual when no classifier', async () => {
-    await seedRun();
-    const exec = makeMockExecutor({ throws: new Error('huh?') });
-    const result = await executeSideEffect(context(), { x: 'y' }, exec);
-    if (result.ok) throw new Error('expected failure');
-    expect(result.error.errorCode).toBe('UnknownProviderError');
-    expect(result.error.errorClass).toBe('manual');
-    expect(result.error.errorMessage).toBe('huh?');
-  });
-
-  it('falls back to UnknownProviderError/manual when classifier returns null', async () => {
-    await seedRun();
-    const exec = makeMockExecutor({
-      throws: new Error('weird'),
-      classifier: () => null,
-    });
-    const result = await executeSideEffect(context(), { x: 'y' }, exec);
-    if (result.ok) throw new Error('expected failure');
-    expect(result.error.errorCode).toBe('UnknownProviderError');
-    expect(result.error.errorClass).toBe('manual');
-  });
-
-  it('truncates long error messages to fit the envelope payload cap', async () => {
-    // Truncation budget is 2048 chars — schema allows 4096 but envelope
-    // payload cap is also 4096 bytes, so we leave headroom for the rest
-    // of the JSON envelope (activityId/attemptId/errorCode/etc).
-    await seedRun();
-    const longMsg = 'x'.repeat(5000);
-    const exec = makeMockExecutor({ throws: new Error(longMsg) });
-    const result = await executeSideEffect(context(), { x: 'y' }, exec);
-    if (result.ok) throw new Error('expected failure');
-    expect(result.error.errorMessage.length).toBeLessThanOrEqual(2048);
-    expect(result.error.errorMessage.endsWith('...')).toBe(true);
-  });
-
-  it('truncates classifier-returned long messages too', async () => {
-    await seedRun();
-    const longMsg = 'y'.repeat(5000);
-    const exec = makeMockExecutor({
-      throws: new Error('boom'),
-      classifier: () => ({
-        errorCode: 'NetworkError',
-        errorClass: 'retryable',
-        errorMessage: longMsg,
-      }),
-    });
-    const result = await executeSideEffect(context(), { x: 'y' }, exec);
-    if (result.ok) throw new Error('expected failure');
-    expect(result.error.errorMessage.length).toBeLessThanOrEqual(2048);
-  });
-
-  it('rejects non-plain-JSON output (Date) via activityFailed instead of silent coerce', async () => {
-    await seedRun();
-    const exec: SideEffectingExecutor<{ x: string }, any> = {
-      provider: 'mock-provider',
-      idempotencyTtlMs: 60000,
-      canonicalInput(input) {
-        return { x: input.x };
-      },
-      async invoke() {
-        return {
-          output: { when: new Date('2026-05-19T00:00:00Z') },
-          externalRefs: { mockId: 'm1' },
-        };
-      },
-    };
-    const result = await executeSideEffect(context(), { x: 'y' }, exec);
-    if (result.ok) throw new Error('expected failure');
-    expect(result.error.errorCode).toBe('UnknownProviderError');
-    expect(result.error.errorClass).toBe('manual');
-    expect(result.error.errorMessage).toMatch(/JSON-serializable.*Date/);
-    const events = await log.readAll();
-    expect(events.map((e) => e.type)).toEqual([
-      'runCreated',
-      'effectAttempted',
-      'activityFailed',
-    ]);
-  });
-
-  it('rejects non-plain-JSON externalRefs (Map) the same way', async () => {
-    await seedRun();
-    const exec: SideEffectingExecutor<{ x: string }, any> = {
-      provider: 'mock-provider',
-      idempotencyTtlMs: 60000,
-      canonicalInput(input) {
-        return { x: input.x };
-      },
-      async invoke() {
-        return {
-          output: { ok: true },
-          externalRefs: { tags: new Map([['k', 'v']]) } as any,
-        };
-      },
-    };
-    const result = await executeSideEffect(context(), { x: 'y' }, exec);
-    if (result.ok) throw new Error('expected failure');
-    expect(result.error.errorMessage).toMatch(/JSON-serializable.*Map/);
-  });
-});
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // ─── feishu-send + feishu-reply: canonicalInput shape ──────────────────────
 
@@ -502,7 +189,7 @@ describe('feishuReplyExecutor.canonicalInput', () => {
     const { feishuReplyExecutor } = await import(
       '../src/workflows/hostExecutors/feishu-reply.js'
     );
-    const { computeInputHash } = await import('../src/workflows/events/idempotency.js');
+    const { computeInputHash } = await import('../src/utils/canonical-input-hash.js');
     const a = computeInputHash(
       feishuReplyExecutor.canonicalInput({
         larkAppId: 'cli_x',
@@ -698,6 +385,7 @@ describe('botmuxScheduleExecutor invoke()', () => {
         prompt: 'do the thing',
         workingDir: '/wd',
         chatId: 'oc_x',
+        chatType: 'group',
       },
       idemKey,
     );
@@ -728,6 +416,7 @@ describe('botmuxScheduleExecutor invoke()', () => {
       prompt: 'do',
       workingDir: '/wd',
       chatId: 'oc_x',
+      chatType: 'group' as const,
     };
     const a = await botmuxScheduleExecutor.invoke(input, idemKey);
     const b = await botmuxScheduleExecutor.invoke(input, idemKey);
@@ -771,17 +460,16 @@ describe('botmuxScheduleExecutor invoke()', () => {
       '../src/workflows/hostExecutors/botmux-schedule.js'
     );
     const idemKey = 'wf_test_schedule_lookup';
-    await botmuxScheduleExecutor.invoke(
-      {
-        name: 'Lookup',
-        schedule: '0 9 * * *',
-        parsed: { kind: 'cron', expr: '0 9 * * *', display: '0 9 * * *' },
-        prompt: 'do',
-        workingDir: '/wd',
-        chatId: 'oc_x',
-      },
-      idemKey,
-    );
+    const input = {
+      name: 'Lookup',
+      schedule: '0 9 * * *',
+      parsed: { kind: 'cron' as const, expr: '0 9 * * *', display: '0 9 * * *' },
+      prompt: 'do',
+      workingDir: '/wd',
+      chatId: 'oc_x',
+      chatType: 'group' as const,
+    };
+    await botmuxScheduleExecutor.invoke(input, idemKey);
 
     await expect(botmuxScheduleReconciler.readOnlyLookup!(idemKey, undefined)).resolves.toMatchObject({
       found: true,
@@ -791,6 +479,52 @@ describe('botmuxScheduleExecutor invoke()', () => {
     await expect(botmuxScheduleReconciler.readOnlyLookup!('missing', undefined)).resolves.toMatchObject({
       found: false,
       evidence: { source: 'getTask', returned: 'undefined' },
+    });
+    await expect(botmuxScheduleReconciler.readOnlyLookup!(idemKey, input)).resolves.toMatchObject({
+      found: true,
+      externalRefs: { taskId: idemKey },
+    });
+    await expect(botmuxScheduleReconciler.readOnlyLookup!(idemKey, {
+      ...input,
+      prompt: 'different body',
+    })).rejects.toThrow(/IdempotencyConflict/);
+  });
+
+  it('freezes relative time once, rejects non-runnable shapes, and detects stale approval', async () => {
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { session: { get dataDir() { return tempDataDir; } } },
+    }));
+    vi.doMock('../src/utils/logger.js', () => ({
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+    const { botmuxScheduleExecutor, parseScheduleInput } = await import(
+      '../src/workflows/hostExecutors/botmux-schedule.js'
+    );
+    const base = {
+      name: 'Once',
+      prompt: 'do',
+      workingDir: '/wd',
+      chatId: 'oc_x',
+      chatType: 'group' as const,
+    };
+    const frozen = parseScheduleInput({ ...base, schedule: '30m' });
+    expect(frozen.parsed.kind).toBe('once');
+    const runAtMs = Date.parse(frozen.parsed.runAt!);
+    expect(parseScheduleInput(frozen).parsed).toEqual(frozen.parsed);
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(frozen, runAtMs - 1)).toEqual({ ok: true });
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(frozen, runAtMs + 120_001)).toMatchObject({
+      ok: false,
+      errorCode: 'HOST_SCHEDULE_APPROVAL_STALE',
+    });
+    expect(() => parseScheduleInput({ ...base, schedule: 'every 0m' }))
+      .toThrow(/positive integer/);
+    expect(() => parseScheduleInput({ ...base, schedule: '每0分钟' }))
+      .toThrow(/valid future occurrence/);
+    const past = parseScheduleInput({ ...base, schedule: '2020-01-01T00:00:00Z' });
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(past, Date.now())).toMatchObject({
+      ok: false,
+      errorCode: 'HOST_SCHEDULE_APPROVAL_STALE',
     });
   });
 });

@@ -11,6 +11,9 @@ import { resolvePluginSkillPackages } from './skills.js';
 export interface CliPluginGenerationResult {
   pluginManifest: SessionPluginManifest;
   prompt: string;
+  /** Catalog bytes appended to prompt (or deferred when prompt is empty).
+   * Structured transports use this copy as hidden application context. */
+  skillCatalog?: string;
   skillPluginDir?: string;
   skillReadonlyRoots?: string[];
   deferredSkillCatalog?: string;
@@ -73,6 +76,7 @@ export function prepareCliPluginGeneration(opts: {
   return {
     pluginManifest,
     prompt,
+    skillCatalog: catalog || undefined,
     skillPluginDir: delivery.pluginDir,
     skillReadonlyRoots: delivery.readonlyRoots.length > 0 ? delivery.readonlyRoots : undefined,
     deferredSkillCatalog: prompt.trim().length === 0 && catalog ? catalog : undefined,

@@ -77,6 +77,14 @@ describe('terminal proxy — HTTP', () => {
     expect(await res.text()).toBe('worker-saw:/?token=secret');
   });
 
+  it('preserves the independent read-only view capability through the proxy', async () => {
+    const workerPort = await startFakeWorker();
+    proxy = await startTerminalProxy({ port: 0, host: '127.0.0.1', resolvePort: () => workerPort });
+
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/s/sess1?viewToken=view-cap`);
+    expect(await res.text()).toBe('worker-saw:/?viewToken=view-cap');
+  });
+
   it('routes by sessionId via resolvePort', async () => {
     const workerPort = await startFakeWorker();
     const seen: string[] = [];
@@ -130,11 +138,11 @@ describe('terminal proxy — HTTP', () => {
 });
 
 describe('terminal proxy — WebSocket', () => {
-  it('proxies a WS upgrade to the worker with prefix stripped + token preserved', async () => {
+  it('proxies a WS upgrade to the worker with prefix stripped + view capability preserved', async () => {
     const workerPort = await startFakeWorker();
     proxy = await startTerminalProxy({ port: 0, host: '127.0.0.1', resolvePort: () => workerPort });
 
-    const ws = new WebSocket(`ws://127.0.0.1:${proxy.port}/s/sess1/?token=abc`);
+    const ws = new WebSocket(`ws://127.0.0.1:${proxy.port}/s/sess1/?viewToken=abc`);
     const messages: string[] = [];
     await new Promise<void>((resolve, reject) => {
       ws.on('open', () => ws.send('ping'));
@@ -147,7 +155,7 @@ describe('terminal proxy — WebSocket', () => {
     });
     ws.close();
 
-    expect(messages[0]).toBe('hello-path:/?token=abc');
+    expect(messages[0]).toBe('hello-path:/?viewToken=abc');
     expect(messages[1]).toBe('echo:ping');
   });
 

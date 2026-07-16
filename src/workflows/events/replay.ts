@@ -1,3 +1,9 @@
+/**
+ * Frozen v2 event projector retained only for migration/archive verification.
+ * It must remain byte-semantics compatible with historical events.ndjson, but
+ * it is no longer an execution or recovery entrypoint.
+ */
+
 import type {
   ActivityCanceledEvent,
   ActivityFailedEvent,
@@ -37,7 +43,7 @@ import type {
 } from './types.js';
 import type { WorkflowEvent } from './schema.js';
 import type { ErrorClass, ErrorPayload, OutputRef } from './payloads.js';
-import { workActivityId } from '../orchestrator.js';
+import { workActivityId } from '../migration/v2-read-only-ids.js';
 
 // ─── State shapes ───────────────────────────────────────────────────────────
 

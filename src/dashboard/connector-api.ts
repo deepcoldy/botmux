@@ -25,7 +25,7 @@ import {
   type TriggerLogStats,
 } from '../services/trigger-log-store.js';
 import type { TriggerAction, TriggerErrorCode } from '../services/trigger-types.js';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
 
 const DEFAULT_VERIFY_HEADERS = {
   signatureHeader: 'x-botmux-signature',
@@ -103,6 +103,24 @@ function normalizeLifecycleExtractors(v: unknown): ConnectorDefinition['lifecycl
   return { dedupKey: r.dedupKey.trim() };
 }
 
+function sameStringSet(left: string[] | undefined, right: string[] | undefined): boolean {
+  return JSON.stringify([...new Set(left ?? [])].sort())
+    === JSON.stringify([...new Set(right ?? [])].sort());
+}
+
+function sameConnectorTarget(
+  left: ConnectorDefinition['target'],
+  right: ConnectorDefinition['target'],
+): boolean {
+  return left.mode === right.mode
+    && left.kind === right.kind
+    && left.botId === right.botId
+    && left.chatId === right.chatId
+    && left.workflowId === right.workflowId
+    && sameStringSet(left.botIds, right.botIds)
+    && sameStringSet(left.allowChats, right.allowChats);
+}
+
 function normalizeConnectorInput(
   raw: unknown,
   opts: { id?: string; prior?: ConnectorDefinition | null; secretRef?: string },
@@ -110,6 +128,7 @@ function normalizeConnectorInput(
   const body = record(raw);
   const c = record(body.connector ?? body);
   const prior = opts.prior ?? null;
+  const targetProvided = hasOwn(c, 'target');
   const verify = record(c.verify ?? prior?.verify);
   const target = record(c.target ?? prior?.target);
   const promptEnvelope = record(c.promptEnvelope ?? prior?.promptEnvelope);
@@ -174,7 +193,7 @@ function normalizeConnectorInput(
         : prior?.verify.nonceHeader ?? DEFAULT_VERIFY_HEADERS.nonceHeader,
       toleranceSeconds: positiveInt(verify.toleranceSeconds, prior?.verify.toleranceSeconds ?? DEFAULT_VERIFY_HEADERS.toleranceSeconds, 30, 86_400),
     },
-    target: {
+    target: prior?.target.kind === 'workflow' && !targetProvided ? { ...prior.target } : {
       mode: targetMode as ConnectorDefinition['target']['mode'],
       kind: targetKind as ConnectorDefinition['target']['kind'],
       botId,
@@ -215,6 +234,21 @@ function normalizeConnectorInput(
     createdAt: prior?.createdAt ?? now,
     updatedAt: prior?.updatedAt ?? now,
   };
+
+  // Workflow targets belong to the retiring v2 engine. Keep existing assets
+  // maintainable during the migration window, but never create a new entry,
+  // convert a turn connector into one, or let an existing workflow connector
+  // drift to a different target. Non-target fields (name, prompt, secret,
+  // enabled state, logging policy, etc.) remain editable.
+  if (!prior && next.target.kind === 'workflow') {
+    return { ok: false, error: 'legacy_workflow_connector_creation_disabled' };
+  }
+  if (prior?.target.kind === 'turn' && next.target.kind === 'workflow') {
+    return { ok: false, error: 'legacy_workflow_connector_creation_disabled' };
+  }
+  if (prior?.target.kind === 'workflow' && !sameConnectorTarget(next.target, prior.target)) {
+    return { ok: false, error: 'legacy_workflow_connector_target_immutable' };
+  }
   return { ok: true, connector: next };
 }
 
@@ -338,6 +372,18 @@ export async function handleConnectorApi(
       }
       try {
         const body = await readJsonBody<any>(req);
+        // Validate the complete update before rotating the secret. In
+        // particular, a rejected legacy-workflow target mutation must not
+        // leave behind an otherwise successful credential side effect.
+        const preflight = normalizeConnectorInput({ ...body, id }, {
+          id,
+          prior,
+          secretRef: prior.verify.secretRef,
+        });
+        if (!preflight.ok) {
+          jsonRes(res, 400, { ok: false, error: preflight.error });
+          return true;
+        }
         let generatedSecret: string | undefined;
         let secretRef: string | undefined;
         let plaintextForUrl: string | undefined;

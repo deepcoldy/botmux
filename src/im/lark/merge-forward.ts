@@ -103,6 +103,11 @@ export async function buildForwardedTree(
         : msg.sender?.sender_type === 'user' ? 'user'
         : 'unknown';
       const senderOpenId = msg.sender?.id ?? '';
+      // Server-side name from with_sender_name=true on the parent fetch — the
+      // only name source for forwarded senders (they may not be in this chat).
+      const senderName = typeof msg.sender?.sender_name === 'string' && msg.sender.sender_name.trim()
+        ? msg.sender.sender_name.trim()
+        : undefined;
 
       // userCardContent:true above usually delivers the real card. Fallback
       // path (false) leaves the simplified shape; we still try user_dsl
@@ -123,10 +128,10 @@ export async function buildForwardedTree(
 
       if (msg.msg_type === 'merge_forward' && depth < maxDepth) {
         const inner = walk(msg.message_id, depth + 1);
-        nodes.push({ senderOpenId, senderType, children: inner });
+        nodes.push({ senderOpenId, senderType, ...(senderName ? { senderName } : {}), children: inner });
       } else {
         const sub = parseApiMessage(msg, numberer);
-        nodes.push({ senderOpenId, senderType, content: sub.content });
+        nodes.push({ senderOpenId, senderType, ...(senderName ? { senderName } : {}), content: sub.content });
       }
     }
     return nodes;

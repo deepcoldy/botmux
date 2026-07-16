@@ -15,6 +15,13 @@
 import { t, type Locale } from '../../i18n/index.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 
+/** Keep Workflow discoverable even when the full skill catalog is not injected. */
+function workflowDiscoveryHint(locale?: Locale): string {
+  return locale === 'en'
+    ? 'Workflow: use natural language or `/workflow` for a bounded multi-step DAG; a successful run can be saved and reused.'
+    : 'Workflow：有界的多步目标可用自然语言或 `/workflow` 自动拆成 DAG；成功后可保存复用。';
+}
+
 export function buildBotmuxShellHints(locale?: Locale): string[] {
   const hints = [
     t('ai.shell.intro', undefined, locale),
@@ -25,6 +32,7 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     t('ai.shell.helpers', undefined, locale),
     t('ai.shell.when_to_send', undefined, locale),
     t('ai.shell.mention_gate', undefined, locale),
+    workflowDiscoveryHint(locale),
   ];
   if (whiteboardEnabled()) {
     hints.push('出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；用户可见结论仍用 `botmux send`；不要写密钥/隐私；更新默认用中文。');
@@ -43,6 +51,7 @@ export const BOTMUX_SHELL_HINTS: string[] = [
   t('ai.shell.helpers'),
   t('ai.shell.when_to_send'),
   t('ai.shell.mention_gate'),
+  workflowDiscoveryHint(),
 ];
 
 /**
@@ -62,7 +71,7 @@ export function buildBotmuxSystemPromptText(opts: {
   botName?: string;
   botOpenId?: string;
   /** Optional built-in skill catalog / help pointer for injectsSessionContext
-   *  CLIs that have a global `skillsDir` (genius) running in `prompt` / `off`
+   *  CLIs that have a global `skillsDir` (genius/grok) running in `prompt` / `off`
    *  mode — appended after the routing/identity blocks. Claude Code delivers
    *  skills via --plugin-dir and passes nothing here. */
   builtinSkillBlock?: string;
@@ -114,6 +123,7 @@ export function buildBotmuxSystemPromptText(opts: {
     t('ai.routing.usage_videos', undefined, locale),
     t('ai.routing.usage_history', undefined, locale),
     t('ai.routing.usage_bots_list', undefined, locale),
+    workflowDiscoveryHint(locale),
     ...whiteboardRouting,
     '</botmux_routing>',
     ...identityBlock,

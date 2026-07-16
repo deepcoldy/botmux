@@ -46,6 +46,7 @@ const MAX_BUFFERED_UNMATCHED_EVENTS = 20;
 
 export interface CodexPendingTurn {
   turnId: string;
+  dispatchAttempt?: number;
   started: boolean;
   contentFingerprint?: string;
   /** Wall-clock millis when mark() was called. The emit gate uses this as
@@ -54,6 +55,10 @@ export interface CodexPendingTurn {
   markTimeMs?: number;
   /** Set once an assistant_final event closes this turn. */
   finalText?: string;
+  /** Explicit transcript terminal semantics. Undefined keeps the historical
+   *  assistant-final => completed behaviour. */
+  terminalStatus?: 'completed' | 'failed' | 'ambiguous';
+  terminalErrorCode?: string;
   /** Set when this turn was synthesised from a user_message that didn't
    *  match any pending Lark fingerprint. Adopt-only. The worker emit path
    *  formats these with both userText and finalText under a "终端本地对话"
@@ -98,9 +103,10 @@ export class CodexBridgeQueue {
    *  to start this turn. Pre-path-known marking is allowed: the worker can
    *  call this before late-attach has located the rollout file, and the
    *  ingest call after attach will still match correctly. */
-  mark(turnId: string, message: string, markTimeMs: number = Date.now()): void {
+  mark(turnId: string, message: string, markTimeMs: number = Date.now(), dispatchAttempt?: number): void {
     this.queue.push({
       turnId,
+      dispatchAttempt,
       started: false,
       contentFingerprint: makeFingerprint(message),
       markTimeMs,
@@ -116,6 +122,20 @@ export class CodexBridgeQueue {
     this.bufferedUnmatched = [];
     this.lastClosedAssistantFinalTimeMs = undefined;
     return dropped;
+  }
+
+  /** Remove one exact worker delivery attempt after a failed/ambiguous
+   *  terminal. A replay may reuse turnId with a higher dispatchAttempt; if
+   *  the retired mark stayed queued, its fingerprint would claim the replay's
+   *  transcript events and permanently head-of-line block the live attempt. */
+  dropPendingTurn(turnId: string, dispatchAttempt?: number): CodexPendingTurn | null {
+    const idx = this.queue.findIndex(turn =>
+      turn.turnId === turnId && turn.dispatchAttempt === dispatchAttempt,
+    );
+    if (idx < 0) return null;
+    const [dropped] = this.queue.splice(idx, 1);
+    if (this.collecting === dropped) this.collecting = null;
+    return dropped ?? null;
   }
 
   /** Process newly-appended events. Idempotent on uuid: events with seen
@@ -242,6 +262,8 @@ export class CodexBridgeQueue {
       if (this.collecting) {
         if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
         this.collecting.finalText = ev.text;
+        this.collecting.terminalStatus = ev.terminalStatus;
+        this.collecting.terminalErrorCode = ev.terminalErrorCode;
         this.lastClosedAssistantFinalTimeMs = ev.timestampMs;
         this.collecting = null;
       } else if (bufferUnmatched && !this.localTurnsEnabled) {
@@ -250,12 +272,13 @@ export class CodexBridgeQueue {
     }
   }
 
-  /** Pop FIFO any leading turn that is started AND has finalText. */
+  /** Pop FIFO any leading turn that is started AND observed assistant_final.
+   *  Empty final text still closes a durable turn. */
   drainEmittable(): CodexPendingTurn[] {
     const out: CodexPendingTurn[] = [];
     while (this.queue.length > 0) {
       const head = this.queue[0];
-      if (!head.started || !head.finalText) break;
+      if (!head.started || head.finalText === undefined) break;
       this.queue.shift();
       if (this.collecting === head) this.collecting = null;
       out.push(head);

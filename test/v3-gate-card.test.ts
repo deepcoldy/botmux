@@ -5,6 +5,7 @@ import {
   V3_GATE_APPROVE_ACTION,
   V3_GATE_REJECT_ACTION,
 } from '../src/im/lark/v3-gate-card.js';
+import { composeV3HostGatePrompt } from '../src/workflows/v3/host-bindings.js';
 
 function parse(card: string): any {
   return JSON.parse(card);
@@ -69,21 +70,80 @@ describe('v3-gate-card — buildV3GateCard', () => {
     expect(card.header.title.content).toContain('已拒绝');
   });
 
+  it('resolution 的 authored option 也只作为 plain_text 渲染', () => {
+    const selected = '<at id=all></at>';
+    const card = parse(buildV3GateCard({
+      ...base,
+      resolution: { kind: 'approved', selected },
+    }));
+    expect((card.elements as any[]).some(
+      (el) => el.text?.tag === 'plain_text' && String(el.text.content).includes(selected),
+    )).toBe(true);
+    expect((card.elements as any[]).some(
+      (el) => el.text?.tag === 'lark_md' && String(el.text.content).includes('<at id=all>'),
+    )).toBe(false);
+  });
+
   it('显式 nonce 透传到按钮 value', () => {
     const card = parse(buildV3GateCard({ ...base, nonce: 'custom-nonce' }));
     const approve = buttonValues(card).find((v) => v.action === V3_GATE_APPROVE_ACTION);
     expect(approve.nonce).toBe('custom-nonce');
   });
 
-  it('prompt 里的 markdown 特殊字符被转义（防破坏卡结构）', () => {
-    const card = parse(buildV3GateCard({ ...base, prompt: '危险 *bold* `code` [x]' }));
-    // 找审批内容那个 div 的 content（JSON.parse 后是含字面反斜杠的转义文本）
+  it('prompt 作为 plain_text 渲染，Lark tag 不会在审批前触发通知', () => {
+    const prompt = '危险 *bold* `code` [x] <at id=all></at>';
+    const card = parse(buildV3GateCard({ ...base, prompt }));
     const promptDiv = (card.elements as any[]).find(
-      (el) => el.tag === 'div' && typeof el.text?.content === 'string' && el.text.content.includes('审批内容'),
+      (el) => el.tag === 'div' && el.text?.tag === 'plain_text' && el.text.content === prompt,
     );
     expect(promptDiv).toBeTruthy();
-    expect(promptDiv.text.content).toContain('\\*bold\\*');
-    expect(promptDiv.text.content).toContain('\\`code\\`');
+    expect((card.elements as any[]).some(
+      (el) => el.text?.tag === 'lark_md' && String(el.text.content).includes('<at id=all>'),
+    )).toBe(false);
+  });
+
+  it('host 长 prompt 也独立完整展示冻结 hash，并单独截断预览', () => {
+    const inputHash = `sha256:${'a'.repeat(64)}`;
+    const card = parse(buildV3GateCard({
+      ...base,
+      prompt: composeV3HostGatePrompt('很长'.repeat(400), [
+        'Executor: feishu-send',
+        `Frozen input hash: ${inputHash}`,
+        '{"content":"hello"}',
+      ].join('\n')),
+      hostApproval: {
+        attemptId: 'send#001/attempts/001',
+        approvalDigest: `sha256:${'b'.repeat(64)}`,
+        inputHash,
+      },
+    }));
+    const rendered = JSON.stringify(card);
+    expect(rendered).toContain(inputHash);
+    expect(rendered).toContain('冻结输入 Hash（本次批准对象）');
+    expect(rendered).toContain('Executor: feishu-send');
+    expect(rendered).toContain('{\\"content\\":\\"hello\\"}');
+    expect(rendered).toContain('截断，完整见 Web 详情');
+  });
+
+  it('host 冻结预览作为 plain_text 渲染，不把上游 Lark tag 当卡片语法', () => {
+    const inputHash = `sha256:${'c'.repeat(64)}`;
+    const maliciousPreview = '{"content":"<at id=all></at> 批准前不可通知"}';
+    const card = parse(buildV3GateCard({
+      ...base,
+      prompt: composeV3HostGatePrompt('批准发送？', maliciousPreview),
+      hostApproval: {
+        attemptId: 'send#001/attempts/001',
+        approvalDigest: `sha256:${'d'.repeat(64)}`,
+        inputHash,
+      },
+    }));
+    const previewDiv = (card.elements as any[]).find(
+      (el) => el.text?.tag === 'plain_text' && String(el.text.content).includes(maliciousPreview),
+    );
+    expect(previewDiv).toBeTruthy();
+    expect((card.elements as any[]).some(
+      (el) => el.text?.tag === 'lark_md' && String(el.text.content).includes('<at id=all>'),
+    )).toBe(false);
   });
 
   it('v3GateCardNonce 稳定（同 run+wait 一致）', () => {

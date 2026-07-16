@@ -5,6 +5,7 @@ import {
   parseListPanesJson,
   joinPanes,
 } from '../src/core/zellij-session-discovery.js';
+import { alignmentPanes } from '../src/core/zellij-adopt-discovery.js';
 
 // Real `zellij action dump-layout` output (zellij 0.44.1): a default shell pane
 // where the user interactively typed `claude` (terminal_0) split vertically with
@@ -197,6 +198,39 @@ describe('parseListPanesJson', () => {
 
   it('returns [] for malformed json', () => {
     expect(parseListPanesJson('not json')).toEqual([]);
+  });
+
+  it('flags exited held panes (zellij run command finished)', () => {
+    const panes = parseListPanesJson(JSON.stringify([
+      { id: 0, is_plugin: false, exited: false },
+      { id: 3, is_plugin: false, exited: true, is_held: true, terminal_command: 'sleep 2' },
+    ]));
+    expect(panes.map(p => p.exited)).toEqual([false, true]);
+  });
+});
+
+// Real bug repro (zellij 0.44.1, verified live): the adopt alignment set must
+// contain exactly the terminal panes that have a live process behind them —
+// floating panes DO (their shell is a server child), exited held panes DON'T.
+// Getting either wrong flips the count guard and hides EVERY CLI in the session.
+describe('alignmentPanes', () => {
+  const LISTED = parseListPanesJson(JSON.stringify([
+    { id: 0, is_plugin: true, title: '(.) - zellij:link' },          // plugin → out
+    { id: 2, is_plugin: false, is_floating: true },                  // floating shell → IN
+    { id: 0, is_plugin: false, title: '✳ Claude Code' },             // tiled CLI → IN
+    { id: 3, is_plugin: false, exited: true, is_held: true },        // exited held → out
+    { id: 1, is_plugin: false },                                     // tiled shell → IN
+  ]));
+
+  it('keeps floating panes, drops exited/plugin panes, sorts by pane id', () => {
+    expect(alignmentPanes(LISTED).map(p => p.paneId))
+      .toEqual(['terminal_0', 'terminal_1', 'terminal_2']);
+  });
+
+  it('matches the live-process count 1:1 (the count-guard invariant)', () => {
+    // 3 live pane processes (t0 claude, t1 shell, t2 floating shell) — the
+    // old filter yielded 2 (floating dropped) or 3-with-exited, both refusing.
+    expect(alignmentPanes(LISTED)).toHaveLength(3);
   });
 });
 

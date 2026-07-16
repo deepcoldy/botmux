@@ -24,16 +24,19 @@ import {
   KANBAN_TEAM_STORAGE_KEY,
   normalizeSessionsViewMode,
   readStoredBoardOrder,
+  readStoredCreateKeepOpen,
   readStoredKanbanGroupBy,
   readStoredSessionsShowUnknownChats,
   readStoredSessionsViewMode,
   type KanbanGroupBy,
   type SessionsViewMode,
   writeStoredBoardOrder,
+  writeStoredCreateKeepOpen,
   writeStoredKanbanGroupBy,
   writeStoredSessionsShowUnknownChats,
   writeStoredSessionsViewMode,
 } from './preferences.js';
+import { OPEN_CREATE_SESSION_EVENT, consumePendingCreateSession } from './create-session-entry.js';
 import {
   BOARD_COLUMNS,
   CLI_FILTER_OPTIONS,
@@ -472,7 +475,10 @@ function SessionsFilters(props: {
         name="q"
         placeholder={t('sessions.search')}
         value={props.filters.q}
-        onChange={event => props.setFilters(prev => ({ ...prev, q: event.currentTarget.value }))}
+        onChange={event => {
+          const q = event.currentTarget.value;
+          props.setFilters(prev => ({ ...prev, q }));
+        }}
       />
       <DropdownMenu
         label={statusLabel}
@@ -523,7 +529,10 @@ function SessionsFilters(props: {
           type="checkbox"
           name="active"
           checked={props.filters.active}
-          onChange={event => props.setFilters(prev => ({ ...prev, active: event.currentTarget.checked }))}
+          onChange={event => {
+            const active = event.currentTarget.checked;
+            props.setFilters(prev => ({ ...prev, active }));
+          }}
         />
         <span className="filter-toggle-label">{t('sessions.activeOnly')}</span>
         <span className="filter-toggle-switch" aria-hidden="true" />
@@ -1516,6 +1525,9 @@ function CreateSessionDialog(props: {
   const [bindWorkingDir, setBindWorkingDir] = useState('');
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [botQuery, setBotQuery] = useState('');
+  const [keepOpen, setKeepOpen] = useState(() => readStoredCreateKeepOpen(windowStorage()));
+  const [keptSuccess, setKeptSuccess] = useState<any>(null);
 
   useEffect(() => {
     if (!state) return;
@@ -1528,6 +1540,8 @@ function CreateSessionDialog(props: {
     setBindWorkingDir('');
     setAdvancedOpen(false);
     setSubmitting(false);
+    setBotQuery('');
+    setKeptSuccess(null);
   }, [state]);
 
   if (!state) return null;
@@ -1566,6 +1580,11 @@ function CreateSessionDialog(props: {
   const checkedIds = [...selectedBots];
   const leadOptions = checkedIds;
   const nameOf = (id: string) => bots.find(bot => bot.larkAppId === id)?.botName ?? id;
+  const botQueryNorm = botQuery.trim().toLowerCase();
+  const visibleBots = botQueryNorm
+    ? bots.filter(bot =>
+      bot.botName.toLowerCase().includes(botQueryNorm) || bot.larkAppId.toLowerCase().includes(botQueryNorm))
+    : bots;
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const text = content.trim();
@@ -1574,6 +1593,7 @@ function CreateSessionDialog(props: {
     const leadLarkAppId = lead || checkedIds[0] || '';
     if (mode === 'lead' && (!leadLarkAppId || !checkedIds.includes(leadLarkAppId))) { alert(t('sessions.create.errLead')); return; }
     setSubmitting(true);
+    setKeptSuccess(null);
     try {
       const r = await fetch('/api/sessions/create', {
         method: 'POST',
@@ -1589,8 +1609,16 @@ function CreateSessionDialog(props: {
         }),
       });
       const body = await r.json().catch(() => null);
-      if (r.ok && body?.ok) props.onSuccess(body);
-      else if (r.status !== 401) alert(`${t('sessions.create.failed')}: ${body?.error ?? r.status}`);
+      if (r.ok && body?.ok) {
+        if (keepOpen) {
+          // 连续创建：不切成功页、不关弹窗，保留机器人勾选等配置，清空内容/群名继续下一条
+          setKeptSuccess(body);
+          setContent('');
+          setName('');
+        } else {
+          props.onSuccess(body);
+        }
+      } else if (r.status !== 401) alert(`${t('sessions.create.failed')}: ${body?.error ?? r.status}`);
     } catch (e) {
       alert(`${t('sessions.create.failed')}: ${e}`);
     } finally {
@@ -1609,28 +1637,42 @@ function CreateSessionDialog(props: {
         <fieldset className="cs-bots">
           <legend>{t('sessions.create.bots')}</legend>
           {bots.length ? (
-            <div className="cs-bot-list">
-              {bots.map(bot => (
-                <label key={bot.larkAppId} className="cs-bot">
-                  <input
-                    type="checkbox"
-                    name="bot"
-                    value={bot.larkAppId}
-                    checked={selectedBots.has(bot.larkAppId)}
-                    onChange={event => {
-                      const checked = event.currentTarget.checked;
-                      setSelectedBots(prev => {
-                        const next = new Set(prev);
-                        if (checked) next.add(bot.larkAppId);
-                        else next.delete(bot.larkAppId);
-                        if (!next.has(lead)) setLead(next.values().next().value ?? '');
-                        return next;
-                      });
-                    }}
-                  /> <span>{bot.botName}</span>
-                </label>
-              ))}
-            </div>
+            <>
+              <input
+                className="cs-bot-search"
+                type="search"
+                name="botSearch"
+                placeholder={t('sessions.create.botSearchPlaceholder')}
+                aria-label={t('sessions.create.botSearchPlaceholder')}
+                value={botQuery}
+                onChange={event => setBotQuery(event.currentTarget.value)}
+              />
+              {visibleBots.length ? (
+                <div className="cs-bot-list">
+                  {visibleBots.map(bot => (
+                    <label key={bot.larkAppId} className="cs-bot">
+                      <input
+                        type="checkbox"
+                        name="bot"
+                        value={bot.larkAppId}
+                        checked={selectedBots.has(bot.larkAppId)}
+                        onChange={event => {
+                          const checked = event.currentTarget.checked;
+                          setSelectedBots(prev => {
+                            const next = new Set(prev);
+                            if (checked) next.add(bot.larkAppId);
+                            else next.delete(bot.larkAppId);
+                            if (!next.has(lead)) setLead(next.values().next().value ?? '');
+                            return next;
+                          });
+                        }}
+                      /> <span>{bot.botName}</span>
+                    </label>
+                  ))}
+                </div>
+              ) : <p className="cs-empty">{t('sessions.create.noBotMatch')}</p>}
+              {checkedIds.length ? <small>{t('sessions.create.selectedCount', { n: String(checkedIds.length) })}</small> : null}
+            </>
           ) : <p className="cs-empty">{t('sessions.create.noBots')}</p>}
         </fieldset>
         <fieldset className="cs-mode">
@@ -1681,7 +1723,33 @@ function CreateSessionDialog(props: {
           </div>
           ) : null}
         </fieldset>
+        {keptSuccess ? (
+          <p className="cs-keep-success" role="status">
+            <span>
+              {keptSuccess.column === 'backlog' ? t('sessions.create.doneBacklog') : t('sessions.create.doneInProgress')}
+              {Array.isArray(keptSuccess.failed) && keptSuccess.failed.length > 0
+                ? ` · ${t('sessions.create.partialFail', { n: String(keptSuccess.failed.length) })}`
+                : ''}
+            </span>
+            {typeof keptSuccess.shareLink === 'string' && keptSuccess.shareLink
+              ? <a href={keptSuccess.shareLink} target="_blank" rel="noopener">{t('sessions.create.openChat')}</a>
+              : null}
+          </p>
+        ) : null}
         <div className="actions cs-actions">
+          <label className="cs-keep-open" title={t('sessions.create.keepOpenHelp')}>
+            <input
+              type="checkbox"
+              name="keepOpen"
+              checked={keepOpen}
+              onChange={event => {
+                const next = event.currentTarget.checked;
+                setKeepOpen(next);
+                writeStoredCreateKeepOpen(windowStorage(), next);
+              }}
+            />
+            <span>{t('sessions.create.keepOpen')}</span>
+          </label>
           <button type="button" id="cs-cancel" onClick={props.onClose}>{t('sessions.create.cancel')}</button>
           <button type="submit" className="cs-submit" disabled={submitting || bots.length === 0}>{submitting ? t('sessions.create.submitting') : t('sessions.create.submit')}</button>
         </div>
@@ -2442,6 +2510,18 @@ function SessionsPage(): JSX.Element {
       if (createRequestRef.current === requestId) setCreateLoading(false);
     }
   };
+
+  // 侧边菜单「创建会话」入口：已在本页时收事件直接打开；跨页跳转时消费挂载前的 pending
+  useEffect(() => {
+    const maybeOpenFromEntry = () => {
+      if (consumePendingCreateSession() && ui.authed) void openCreateSession();
+    };
+    maybeOpenFromEntry();
+    window.addEventListener(OPEN_CREATE_SESSION_EVENT, maybeOpenFromEntry);
+    return () => window.removeEventListener(OPEN_CREATE_SESSION_EVENT, maybeOpenFromEntry);
+    // openCreateSession 只碰稳定的 ref/setState，取首次渲染的闭包即可
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <section className="page sessions-page">

@@ -81,9 +81,10 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 ```bash
 npm install -g botmux
 # or: pnpm add -g botmux
+# or: bun add -g botmux
 ```
 
-Manual and scheduled updates keep using the npm or pnpm global location that owns the running botmux install. Unknown install layouts are never silently updated with npm.
+Manual and scheduled updates keep using the npm, pnpm, or Bun global location that owns the running botmux install. Unknown install layouts are never silently updated with npm.
 
 > Requires **Node.js ≥ 22**, with at least one AI coding CLI installed and authenticated (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` / `kimi` / `grok` / `kiro-cli` on your PATH). Installing **tmux** too is recommended (enables session persistence automatically).
 
@@ -232,7 +233,7 @@ On mobile/tablet, a floating shortcut toolbar provides Esc, Ctrl+C, Tab, arrow k
 
 ### Multi-Bot Collaboration
 
-Run multiple Lark bots on a single machine, each mapped to a different CLI. In the same group chat, messages are routed via @mention — each bot gets its own isolated CLI process. With a single bot in the group, it responds automatically without @. In a regular (non-topic) group, `@<bot1> @<bot2> /t xxx` spawns one independent thread per mentioned bot anchored at the same message. Send `@<bot1> @<bot2> /introduce` once so they register each other's open_id; afterwards each bot can explicitly @-mention the others from within its own session (commands: [📖 Docs · Slash Commands](https://deepcoldy.github.io/botmux/en/slash-commands)).
+Run multiple Lark bots on a single machine, each mapped to a different CLI. In the same group chat, messages are routed via @mention — each bot gets its own isolated CLI process. In a 1:1 group (you + one bot) it responds automatically without @; multi-person groups require @ by default (the per-bot "Group @ policy" can relax this inside owned topics or group-wide). In a regular (non-topic) group, `@<bot1> @<bot2> /t xxx` spawns one independent thread per mentioned bot anchored at the same message. Send `@<bot1> @<bot2> /introduce` once so they register each other's open_id; afterwards each bot can explicitly @-mention the others from within its own session (commands: [📖 Docs · Slash Commands](https://deepcoldy.github.io/botmux/en/slash-commands)).
 
 ### Multi-Topic Collaboration
 
@@ -325,6 +326,7 @@ When a CLI spawns inside a botmux session it automatically gets
 - `botmux quoted <message_id>` — when the user @ed the bot via Lark's quote-reply UI, fetch the quoted message on demand
 - `botmux bots list` — discover bots + their `open_id`s
 - `botmux schedule` — manage scheduled tasks
+- `botmux-workflow` — orchestrate bounded multi-step work with natural language or `/workflow`, then save successful runs for reuse
 
 These capabilities are wired via `--append-system-prompt` and Skill
 descriptions, so the agent picks them up automatically. Compared to
@@ -344,10 +346,9 @@ Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support 
 - Disband or leave a chat (associated sessions auto-closed)
 - **Session Insights** (owner-only, read-only): parse each session's transcript to view action spans / work timeline / context curve / failure aggregates + diagnostic suggestions; send `/insight` in chat for the current session's summary card
 - **Workflows console**:
-  - Run List (5 s poll) + Run Detail with summary, dangling-work red panel, node/activity table, event timeline, and a **parallel-execution timeline** (attempt-level), auto-stopping polling once the run reaches a terminal state
-  - **Cancel a run directly from the dashboard**; approve / reject `humanGate` with reviewer comments
-  - **Workflow Catalog**: lists every workflow under `~/.botmux/workflows/`, drills into schema / dependency graph, and triggers a new run from the UI (with params input)
-  - IM approval / cancel cards remain available; `botmux workflow` CLI subcommands also keep working
+  - v3 Run List and Run Detail show the DAG, node states, decisions, and attempt terminal logs, and stop polling at terminal state
+  - **Cancel v3 runs directly from the dashboard**; trusted Lark cards in the bound topic handle `humanGate`, retry, and grant decisions
+  - Create, run, save, and reuse workflows in Lark with natural language or `/workflow`; the v2 Dashboard/Catalog has been retired
 
 <img src="docs/dashboard.png" alt="botmux dashboard" width="800" />
 
@@ -364,6 +365,15 @@ Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support 
 5. Each reply creates a new streaming card for that turn; previous cards freeze at their last state
 6. Click "Get Write Link" on the card to receive a write-enabled terminal URL via DM
 7. The CLI replies in the thread via the `botmux send` command (wired through the `botmux-send` Skill)
+
+---
+
+### Multi-step Workflow (v3)
+
+- Say “research three competitors and write a report” or “chain A/B/C and run it automatically.” The bot lightly confirms Workflow intent, clarifies the goal, builds a bounded DAG, and executes it.
+- Use `/workflow <goal>` for an explicit start, and `/workflow list|show|cancel` to inspect or cancel runs.
+- Save a successful run with `/workflow save last weekly-report`, then reuse it with `/workflow run weekly-report region=sg`; only missing required parameters are requested.
+- The v2 runtime is retired. Legacy definitions and run history retain only offline `botmux template migrate-v3` / `archive-runs` migration and archive tooling.
 
 ---
 

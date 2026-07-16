@@ -14,20 +14,25 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function writeDesc(larkAppId: string, port: number, hbAgo = 0) {
+function writeDesc(larkAppId: string, port: number, hbAgo = 0, bootInstanceId?: string) {
   writeFileSync(join(dir, `${larkAppId}.json`), JSON.stringify({
     larkAppId, botName: larkAppId, botIndex: 0, ipcPort: port,
     pid: 1, startedAt: Date.now(), lastHeartbeat: Date.now() - hbAgo,
+    ...(bootInstanceId ? { bootInstanceId } : {}),
+    ...(bootInstanceId ? { workflowIpcProtocol: 'v1' } : {}),
   }));
 }
 
 describe('DaemonRegistry', () => {
   it('reads existing descriptors on start', async () => {
-    writeDesc('appA', 7892);
+    const bootInstanceId = 'B'.repeat(43);
+    writeDesc('appA', 7892, 0, bootInstanceId);
     const reg = new DaemonRegistry(dir);
     await reg.start();
     expect(reg.list().length).toBe(1);
     expect(reg.getByAppId('appA')?.ipcPort).toBe(7892);
+    expect(reg.getByAppId('appA')?.bootInstanceId).toBe(bootInstanceId);
+    expect(reg.getByAppId('appA')?.workflowIpcProtocol).toBe('v1');
     reg.stop();
   });
 

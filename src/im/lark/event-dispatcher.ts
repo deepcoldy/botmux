@@ -4,6 +4,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { ProxyAgent } from 'proxy-agent';
 import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
@@ -58,6 +59,7 @@ import {
   type VcMeetingPushEventType,
 } from '../../vc-agent/push-source.js';
 import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agent/types.js';
+import type { VcMeetingImTurnOrigin } from '../../types.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -1095,10 +1097,16 @@ export function resolveSubstituteTrigger(
     if (!target) continue;
     return {
       target: {
-        name: target.name ?? mention.name,
-        openId: target.openId ?? mention.openId,
-        userId: target.userId ?? mention.userId,
-        unionId: target.unionId ?? mention.unionId,
+        name: target.name,
+        openId: target.openId,
+        userId: target.userId,
+        unionId: target.unionId,
+      },
+      observedMention: {
+        name: mention.name,
+        openId: mention.openId,
+        userId: mention.userId,
+        unionId: mention.unionId,
       },
       disclosure: cfg.disclosure ?? 'prefix',
     };
@@ -1385,12 +1393,24 @@ export interface RoutingContext {
   scope: 'thread' | 'chat';
   /** Routing key. `chatId` for chat-scope, the thread root id for
    *  thread-scope (an existing rootMessageId, or this messageId when
-   *  it's the seed of a brand-new thread). */
+   *  it's the seed of a brand-new thread). A beforeSessionTurn hook may
+   *  replace it with a daemon-owned synthetic anchor for a dedicated receiver
+   *  session; the visible chatId/scope remain unchanged. */
   anchor: string;
   /** Chat-scope shared-topic reply target for this turn, if any. */
   replyRootId?: string;
   /** Command prompt that should be sent to the CLI instead of raw text. */
   promptOverride?: string;
+  /** Durable VC routing succeeded but the bounded pre-turn catch-up did not.
+   * Prompt builders must surface this instead of pretending context is fresh. */
+  vcMeetingContextMayLag?: boolean;
+  /** The receiver belongs to an ended meeting whose final delivery is sealed.
+   * Explicit human follow-ups still reuse that transcript, but meeting-side
+   * effects remain closed. */
+  vcMeetingContextLifecycle?: 'active' | 'sealed';
+  /** Daemon-derived authority snapshot for an explicit human IM turn routed
+   * into one dedicated meeting receiver. Never populated from message text. */
+  vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** Metadata for the summary command that produced promptOverride. */
   summaryCommand?: SummaryCommandRuntimeContext;
   /** This turn was triggered by @mentioning a configured substitute person. */
@@ -1432,7 +1452,7 @@ export interface EventHandlers {
     data: any,
     ctx: RoutingContext,
     meta: { senderOpenId?: string; explicitlyMentionedThisBot: boolean },
-  ) => Promise<void>;
+  ) => Promise<void | { anchorOverride?: string; block?: boolean }>;
 }
 
 /** 一条已通过订阅 + 触发范围 + 自触发过滤的文档评论，交给 daemon 投递。 */
@@ -1932,6 +1952,32 @@ async function processCommentEvent(
   });
 }
 
+const LARK_WS_PROXY_ENV_KEYS = [
+  'npm_config_https_proxy',
+  'NPM_CONFIG_HTTPS_PROXY',
+  'https_proxy',
+  'HTTPS_PROXY',
+  'npm_config_proxy',
+  'NPM_CONFIG_PROXY',
+  'all_proxy',
+  'ALL_PROXY',
+] as const;
+
+function createLarkWsAgent(): ProxyAgent | undefined {
+  const hasSecureProxy = LARK_WS_PROXY_ENV_KEYS.some(key => process.env[key]?.trim());
+  if (!hasSecureProxy) return undefined;
+
+  const agent = new ProxyAgent();
+  const resolveEnvProxy = agent.getProxyForUrl;
+  agent.getProxyForUrl = (url, req) => {
+    const target = new URL(url);
+    if (target.protocol === 'wss:') target.protocol = 'https:';
+    else if (target.protocol === 'ws:') target.protocol = 'http:';
+    return resolveEnvProxy(target.href, req);
+  };
+  return agent;
+}
+
 /**
  * Create and start the Lark WSClient with event dispatching.
  * Returns the WSClient instance for lifecycle management.
@@ -2265,8 +2311,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           routing.anchor = chatId;
           routingSource = 'regular-group-chat';
           if (message.root_id && message.thread_id) replyRootId = message.root_id;
+          const configuredTargetId = substituteTrigger.target.openId
+            ?? substituteTrigger.target.userId
+            ?? substituteTrigger.target.unionId
+            ?? 'unknown';
+          const configuredTargetForLog = JSON.stringify(configuredTargetId.slice(0, 128));
           logger.info(
-            `[substitute:${larkAppId}] mention target=${substituteTrigger.target.name ?? substituteTrigger.target.openId ?? substituteTrigger.target.userId ?? substituteTrigger.target.unionId ?? 'unknown'} ` +
+            `[substitute:${larkAppId}] mention target=${configuredTargetForLog} ` +
             `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)} → chat-scope`,
           );
         }
@@ -2445,28 +2496,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // permitted senders. (The shared fold-back's replyRootId is already
           // handled by the first clause.)
           const mentionMode = resolveGroupMentionMode(larkAppId);
-          // 话题群 owned-topic 免@续话 — single-bot groups only. In a multi-bot
-          // topic every co-resident bot owns a session on the same thread anchor,
-          // so relaxing here would make ALL of them answer a message that
-          // @mentioned only one (or none) of them; botCount > 1 keeps the
-          // "@ required" contract. `stats` is the cached group stats (fetched
-          // above when ownsSession; its 999/999 API-failure fallback also lands
-          // on the safe "require @" side). A message that @mentions another
-          // specific member is a redirect to someone else → back off, mirroring
-          // the ambient carve-out.
-          const ownedTopicGroupFollowup = !explicitlyMentionedThisBot
-            && isAllowed
-            && ownsSession
-            && !!stats && stats.botCount <= 1
-            && !mentionsAnotherMember(larkAppId, message)
-            && routing.scope === 'thread'
-            && !!message.thread_id
-            && await getChatMode(larkAppId, chatId) === 'topic';
+          // 话题群 owned-topic 免@续话不再无条件放行（#336 引入的默认行为回归：
+          // 多人群里旁人不 @ 也会触发 bot）。现在与普通群共用同一套「群聊 @ 策略」:
+          // 默认 'always' 在多人群里必须 @，想要话题内免@续话就把 mentionMode 配成
+          // 'topic'（下方条款已同时覆盖话题群 thread 与普通群 shared topic），
+          // 'never'/'ambient' 亦按各自语义生效。1人1bot 的 solo 群仍走末条放行。
           const relax = (!!replyRootId && isAllowed)
             || (!!substituteTrigger && isAllowed)
             || (isAllowed && mentionMode === 'never')
             || (isAllowed && mentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message))
-            || ownedTopicGroupFollowup
             || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsAnotherMember(larkAppId, message))
             || (ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
           if (!relax) {
@@ -2526,7 +2564,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           substituteTrigger,
         };
         if (explicitlyMentionedThisBot) {
-          await handlers.beforeSessionTurn?.(data, ctx, { senderOpenId, explicitlyMentionedThisBot });
+          const before = await handlers.beforeSessionTurn?.(data, ctx, { senderOpenId, explicitlyMentionedThisBot });
+          if (before?.block) return;
+          if (before?.anchorOverride) ctx.anchor = before.anchorOverride;
           ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
         }
         // Serialize per anchor so two messages to the same thread/chat are
@@ -2589,6 +2629,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     appSecret: larkAppSecret,
     // brand → 长连接域名。国际版租户必须连 larksuite.com，否则收不到任何事件。
     domain: sdkDomain(brand),
+    // `proxy-from-env` treats WSS_PROXY as distinct from HTTPS_PROXY, while
+    // Lark's preceding Axios bootstrap request uses HTTPS proxy semantics.
+    // The custom resolver keeps both phases aligned and still honors NO_PROXY.
+    agent: createLarkWsAgent(),
     // Default to warn — the SDK is chatty at info ("client ready", reconnect
     // heartbeats, etc.) and floods pm2 error.log when stderr is the only sink.
     // DEBUG=1 widens the level back to info for troubleshooting.

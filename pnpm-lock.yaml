@@ -38,6 +38,9 @@ importers:
       pm2:
         specifier: ^6.0.0
         version: 6.0.14
+      proxy-agent:
+        specifier: ^6.5.0
+        version: 6.5.0
       qrcode-terminal:
         specifier: ^0.12.0
         version: 0.12.0

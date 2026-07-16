@@ -84,6 +84,26 @@ describe('two-phase turn reactions', () => {
     expect(ds.pendingAckReactions ?? []).toEqual([]);
   });
 
+  it('dedicated VC receivers never add or finish progress reactions', async () => {
+    registerWith(true);
+    const ds = makeDs({
+      pendingAckReactions: [{ messageId: 'om_old', reactionId: 'rid_old' }],
+    });
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      memberId: 'member-1',
+      memberEpoch: 1,
+    };
+
+    await noteTurnReceived(ds, 'om_new');
+    await finishTurnReactions(ds);
+
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([]);
+  });
+
   it('reacts 冲! (GoGoGo) on each accepted message and dedups by message id', async () => {
     registerWith(true);
     const ds = makeDs();

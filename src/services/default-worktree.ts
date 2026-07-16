@@ -23,6 +23,8 @@
  * every CLI adapter and both PTY / Tmux backends.
  */
 import { getBot } from '../bot-registry.js';
+import { config } from '../config.js';
+import { resolvePairedSpawnBackendType } from '../core/persistent-backend.js';
 import { createRepoWorktree, isGitWorkTree, pushWorktreeBranch } from './git-worktree.js';
 import { worktreeSlugFromContextAI } from './worktree-slug-ai.js';
 import { t } from '../i18n/index.js';
@@ -93,7 +95,13 @@ export async function maybeCreateDefaultWorktree(
     logger.info(`[auto-worktree:${larkAppId}] ${baseDir} → ${creation.path} (branch ${creation.branch} from ${creation.baseRef})`);
     // riff：远程沙箱从 origin 克隆，本地新分支必须先推送才能被任务钉住。
     // 推送失败不阻塞（会话仍可用，riff 侧回退默认分支并在卡片注入告警）。
-    if (getBot(larkAppId).config.backendType === 'riff') {
+    const botCfg = getBot(larkAppId).config;
+    if (resolvePairedSpawnBackendType(
+      botCfg.cliId,
+      undefined,
+      botCfg.backendType,
+      config.daemon.backendType,
+    ) === 'riff') {
       try {
         await pushWorktreeBranch(creation.path, creation.branch);
       } catch (pe) {

@@ -109,7 +109,9 @@ export function sessionSearchText(s: any): string {
 export const terminalHref = sessionTerminalHref;
 
 export function shouldOpenWritableTerminal(state: { authed: boolean; publicReadOnly: boolean } = ui): boolean {
-  return state.authed && !state.publicReadOnly;
+  if (state.authed) return true;
+  if (state.publicReadOnly) return false;
+  return false;
 }
 
 // Cohesive icon set for the session-card action bar — stroke-based (CSS sets

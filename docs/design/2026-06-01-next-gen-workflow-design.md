@@ -1,5 +1,9 @@
 # 下一代 workflow：LLM-driven DAG + 文件系统 IPC（设计 brief）
 
+> **历史设计快照，已被 2026-07 的 Workflow v3 落地与 v2 退役方案取代。**
+> 下文关于 v0.2/v3 双 runtime 长期共存的建议不再是当前产品口径；v2 runtime
+> 已下线，只保留 `migrate-v3` / `archive-runs` 离线迁移与审计工具。
+
 - 日期：2026-06-01
 - 状态：**v2 — codex review 已合入，待用户 grill**
 - 工作模式：md-first（暂不上飞书文档，本机 md 做 codex review 载体）

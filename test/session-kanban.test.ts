@@ -45,6 +45,7 @@ describe('session-board normalizers', () => {
   it('trims, flattens newlines, and caps the title; rejects empty/non-string', () => {
     expect(normalizeSessionTitle('  修复登录 bug  ')).toBe('修复登录 bug');
     expect(normalizeSessionTitle('第一行\n  第二行')).toBe('第一行 第二行');
+    expect(normalizeSessionTitle('安全\r\n标题\t\u001b[31m\u0000\u009b')).toBe('安全 标题 [31m');
     expect(normalizeSessionTitle('a'.repeat(300))).toHaveLength(200);
     expect(normalizeSessionTitle('   ')).toBeNull();
     expect(normalizeSessionTitle('')).toBeNull();

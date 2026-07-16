@@ -22,7 +22,8 @@ import {
   loadAndRenderDashboardRoute,
 } from './route-lifecycle.js';
 import { buildBotCards, loadGroupsSnapshot } from './overview.js';
-import { BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT } from './bot-onboarding.js';
+import { BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT, openBotOnboarding } from './bot-onboarding.js';
+import { requestOpenCreateSession } from './create-session-entry.js';
 import { InfoTip } from './dashboard-components.js';
 import { initFloatingScrollbars } from './floating-scrollbars.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
@@ -162,12 +163,6 @@ function isActiveNav(item: NavItem, hash: string): boolean {
     plugin.href === current || current.startsWith(`${plugin.href}?`) || current.startsWith(`${plugin.href}/`)
   ))) {
     return false;
-  }
-  if (
-    item.id === 'workflows' &&
-    (current === '#/legacy-workflow' || current.startsWith('#/legacy-workflow?') || current.startsWith('#/legacy-workflow/'))
-  ) {
-    return true;
   }
   if (
     item.id === 'sessions' &&
@@ -323,15 +318,70 @@ function closeThemeMenuFromStatus(): void {
 
 function TopbarStatusMenu(props: { summary: TopbarStatusSummary; autoOpen?: boolean }): JSX.Element {
   const { autoOpen = false, summary } = props;
+  const [open, setOpen] = useState(false);
+  const [autoDismissed, setAutoDismissed] = useState(false);
+  const [hoverSuppressed, setHoverSuppressed] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const autoVisible = autoOpen && !autoDismissed;
+  const visible = open || autoVisible;
+
+  useEffect(() => {
+    if (!autoOpen) setAutoDismissed(false);
+  }, [autoOpen]);
+
+  useEffect(() => {
+    if (!visible) return undefined;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && rootRef.current?.contains(target)) return;
+      setOpen(false);
+      setAutoDismissed(true);
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    return () => document.removeEventListener('pointerdown', closeOnOutsidePointer);
+  }, [visible]);
+
+  const toggle = () => {
+    closeThemeMenuFromStatus();
+    if (visible) {
+      setOpen(false);
+      setAutoDismissed(true);
+      setHoverSuppressed(true);
+      return;
+    }
+    setHoverSuppressed(false);
+    setOpen(true);
+  };
+
   return (
     <div
-      className={`topbar-status-menu${autoOpen ? ' topbar-status-auto-open' : ''}`}
+      ref={rootRef}
+      className={`topbar-status-menu${autoVisible ? ' topbar-status-auto-open' : ''}${open ? ' is-open' : ''}${hoverSuppressed ? ' suppress-hover' : ''}`}
       onPointerEnter={closeThemeMenuFromStatus}
+      onPointerLeave={() => setHoverSuppressed(false)}
       onFocusCapture={closeThemeMenuFromStatus}
+      onBlur={event => {
+        const next = event.relatedTarget;
+        if (!(next instanceof Node) || !event.currentTarget.contains(next)) setOpen(false);
+      }}
+      onKeyDown={event => {
+        if (event.key !== 'Escape') return;
+        setOpen(false);
+        setAutoDismissed(true);
+        setHoverSuppressed(true);
+        (event.currentTarget.querySelector('#status') as HTMLButtonElement | null)?.focus();
+      }}
     >
-      <span id="status" className="connection-status" aria-haspopup="true" aria-expanded={autoOpen}>
+      <button
+        type="button"
+        id="status"
+        className="connection-status"
+        aria-haspopup="true"
+        aria-expanded={visible}
+        onClick={toggle}
+      >
         {t('overview.sessionOverview')}
-      </span>
+      </button>
       <div className="topbar-status-pop">
         {summary.attentionNotice ? (
           <a className="topbar-attention-notice" href="#/sessions">
@@ -487,6 +537,18 @@ function DashboardShell(): JSX.Element {
         </header>
         <div className="chrome-body">
           <aside className="sidebar">
+            {isAuthed ? (
+              <div className="sidebar-create-actions">
+                <button type="button" className="sidebar-create-btn" onClick={() => requestOpenCreateSession()}>
+                  {icon(<><path d="M2 3.5h12v7H6l-3 3v-3H2z" /><path d="M8 4.9v4.2M5.9 7h4.2" /></>)}
+                  <span className="sidebar-nav-label">{t('nav.createSession')}</span>
+                </button>
+                <button type="button" className="sidebar-create-btn" onClick={() => void openBotOnboarding()}>
+                  {icon(<><rect x="2.5" y="6" width="11" height="7.5" rx="2" /><circle cx="5.8" cy="9.75" r="1" /><circle cx="10.2" cy="9.75" r="1" /><path d="M8 6V3.8M6.3 1.9h3.4" /></>)}
+                  <span className="sidebar-nav-label">{t('nav.createBot')}</span>
+                </button>
+              </div>
+            ) : null}
             <nav className="sidebar-nav" aria-label="Dashboard">
               {sidebarNavItems().filter(item => isAuthed || !item.manage).map(item => (
                 <a
@@ -675,6 +737,9 @@ async function route(): Promise<void> {
   }
   if (hash.startsWith('#/v3')) {
     window.location.replace(`#/workflows${hash.slice('#/v3'.length)}`);
+    return;
+  } else if (hash.startsWith('#/legacy-workflow')) {
+    window.location.replace('#/workflows');
     return;
   } else if (/^#\/workflows(?:\/|-)catalog(?:[/?].*)?$/.test(hash)) {
     window.location.replace('#/workflows');

@@ -7,7 +7,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND } from '../src/workflows/v3/ephemeral-pool.js';
 import { GOAL_ENV, type RunNodeRequest } from '../src/workflows/v3/contract.js';
-import type { WorkerHandle, WorkerProcessFactory, WorkerSpawnOptions } from '../src/workflows/daemon-spawn.js';
+import type { WorkerHandle, WorkerProcessFactory, WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
+import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
 
 let dir: string;
 
@@ -33,6 +34,7 @@ describe('v3 ephemeral pool', () => {
 
     const promise = pool.runNode(req);
     await waitFor(() => factory.lastOpts !== undefined);
+    expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({ phase: 'active' });
     await worker.waitForInit();
     worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
     expect(worker.rawInputs).toEqual([]);
@@ -44,8 +46,11 @@ describe('v3 ephemeral pool', () => {
       lastUuid: 'u',
       turnId: 't',
     });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
 
     const result = await promise;
+    expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({ phase: 'closed' });
 
     expect(result).toMatchObject({
       status: 'ok',
@@ -145,10 +150,14 @@ describe('v3 ephemeral pool', () => {
       status: 'fail',
       manifestPath: join(req.attemptDir, 'manifest.json'),
     });
+    expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({
+      phase: 'closed_no_spawn',
+      reason: 'secret_missing',
+    });
     expect(factory.lastOpts).toBeUndefined();
   });
 
-  it('maps cancelSignal to SIGINT and resolves fail after worker exit', async () => {
+  it('maps cancelSignal to SIGINT and resolves cancelled after worker exit', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);
     const ac = new AbortController();
@@ -165,12 +174,113 @@ describe('v3 ephemeral pool', () => {
     worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
     worker.emitMessage({ type: 'prompt_ready' });
 
-    ac.abort();
+    ac.abort('user-requested');
     await new Promise((resolve) => setImmediate(resolve));
     expect(worker.kills).toContain('SIGINT');
     worker.emitExit(130);
 
-    await expect(promise).resolves.toMatchObject({ status: 'fail' });
+    await expect(promise).resolves.toMatchObject({
+      status: 'cancelled',
+      cancelReason: 'user-requested',
+    });
+  });
+
+  it('returns cancelled without resolving secrets or spawning when already aborted', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const ac = new AbortController();
+    ac.abort({ kind: 'run', cancelRequestId: 'cancel-pre-aborted' });
+    let secretResolutions = 0;
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      resolveLarkAppSecret: () => {
+        secretResolutions++;
+        return 'secret';
+      },
+    });
+
+    await expect(pool.runNode({ ...request(), cancelSignal: ac.signal })).resolves.toMatchObject({
+      status: 'cancelled',
+      cancelReason: { kind: 'run', cancelRequestId: 'cancel-pre-aborted' },
+    });
+    expect(readV3AttemptWorkerFence(request().attemptDir, request())).toMatchObject({
+      phase: 'closed_no_spawn',
+      reason: 'pre_aborted',
+    });
+    expect(secretResolutions).toBe(0);
+    expect(factory.lastOpts).toBeUndefined();
+  });
+
+  it('records spawn_threw without creating a child', async () => {
+    const req = request();
+    const pool = createEphemeralPool({
+      factory: {
+        spawn: () => { throw new Error('fork unavailable'); },
+      },
+      workerPath: '/tmp/worker.js',
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    await expect(pool.runNode(req)).rejects.toThrow('fork unavailable');
+    expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({
+      phase: 'closed_no_spawn',
+      reason: 'spawn_threw',
+    });
+  });
+
+  it('drains spawn error/bind failure to outer close without an unhandled error event', async () => {
+    const req = request();
+    const worker = new UnbindableWorker();
+    const pool = createEphemeralPool({
+      factory: { spawn: () => worker },
+      workerPath: '/tmp/worker.js',
+      cancelGraceMs: 10_000,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    let settled = false;
+    const promise = pool.runNode(req);
+    promise.then(() => { settled = true; }, () => { settled = true; });
+    await waitFor(() => worker.closeRequested);
+    expect(settled).toBe(false);
+    expect(() => worker.emit('error', new Error('spawn EAGAIN'))).not.toThrow();
+    expect(settled).toBe(false);
+    worker.emit('close', 1);
+    await expect(promise).rejects.toThrow(/process identity/);
+    expect(readV3AttemptWorkerFence(req.attemptDir, req)).toBeNull();
+  });
+
+  it('does not treat claude_exit as the cancellation fence before the outer worker exits', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const ac = new AbortController();
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      cancelGraceMs: 10_000,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode({ ...request(), cancelSignal: ac.signal });
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+
+    let settled = false;
+    promise.then(() => { settled = true; }, () => { settled = true; });
+    ac.abort('cancel-fence');
+    await new Promise((resolve) => setImmediate(resolve));
+    worker.emitMessage({ type: 'claude_exit', code: 130, signal: 'SIGINT' });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+
+    worker.emitExit(130);
+    await expect(promise).resolves.toMatchObject({
+      status: 'cancelled',
+      cancelReason: 'cancel-fence',
+    });
   });
 
   it('uses raw slash-command passthrough for native /goal', async () => {
@@ -195,6 +305,37 @@ describe('v3 ephemeral pool', () => {
     expect(worker.rawInputs[0]).toContain(`$${GOAL_ENV.MANIFEST_PATH}`);
     expect(worker.rawInputs[0]).not.toContain(GOAL_ENV.INPUTS_PATH);
     expect(worker.rawInputs[0]).not.toContain(GOAL_ENV.OUTPUT_DIR);
+    worker.emitExit(0);
+    await promise;
+  });
+
+  it.each(['traex', 'relay'] as const)('forwards %s through the same goal env + raw /goal path', async (cliId) => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const base = request();
+    const req: RunNodeRequest = {
+      ...base,
+      botSnapshot: { ...base.botSnapshot, cliId },
+    };
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+
+    expect(worker.init?.cliId).toBe(cliId);
+    expect(worker.init?.disableCliBypass).toBe(false);
+    expect(factory.lastOpts?.env[GOAL_ENV.V3_MARKER]).toBe('1');
+    expect(factory.lastOpts?.env[GOAL_ENV.MANIFEST_PATH]).toBe(req.env[GOAL_ENV.MANIFEST_PATH]);
+    expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
+    expect(worker.rawInputs[0]).toMatch(/^\/goal /);
+
     worker.emitExit(0);
     await promise;
   });
@@ -262,7 +403,7 @@ describe('v3 ephemeral pool', () => {
     expect(Buffer.byteLength(cmd, 'utf-8')).toBeLessThanOrEqual(180);
   });
 
-  it('resolves successfully when the manifest file appears without final_output or CLI exit', async () => {
+  it('claims success when the manifest appears but waits for the outer worker exit fence', async () => {
     const worker = new ScriptedWorker({ autoReadyAfterInit: true });
     const factory = factoryFor(worker);
     const req = request();
@@ -288,6 +429,9 @@ describe('v3 ephemeral pool', () => {
     expect(settled).toBe(false);
 
     await sleep(30);
+    expect(settled).toBe(false);
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
     await expect(promise).resolves.toMatchObject({
       status: 'ok',
       manifestPath: req.env[GOAL_ENV.MANIFEST_PATH],
@@ -324,6 +468,9 @@ describe('v3 ephemeral pool', () => {
     expect(settled).toBe(false);
 
     await sleep(30);
+    expect(settled).toBe(false);
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
     await expect(promise).resolves.toMatchObject({ status: 'ok' });
   });
 });
@@ -375,6 +522,7 @@ function factoryFor(worker: ScriptedWorker): WorkerProcessFactory & { lastOpts?:
 }
 
 class ScriptedWorker extends EventEmitter implements WorkerHandle {
+  readonly pid = process.pid;
   readonly kills: string[] = [];
   readonly rawInputs: string[] = [];
   readonly autoReadyAfterInit: boolean;
@@ -418,7 +566,20 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
 
   emitExit(code: number | null): void {
     this.emit('exit', code);
+    this.emit('close', code);
   }
+}
+
+class UnbindableWorker extends EventEmitter implements WorkerHandle {
+  // Valid integer shape, but deliberately not a live process identity.
+  readonly pid = 0x7fff_fffe;
+  closeRequested = false;
+
+  send(msg: unknown): void {
+    if ((msg as { type?: string })?.type === 'close') this.closeRequested = true;
+  }
+
+  kill(): void { /* test controls outer close explicitly */ }
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {

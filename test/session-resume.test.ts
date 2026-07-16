@@ -112,6 +112,8 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
 
 vi.mock('../src/core/session-discovery.js', () => ({
   validateAdoptTarget: vi.fn(() => true),
+  validateAdoptTargetState: vi.fn(() => 'alive'),
+  adoptTargetLabel: vi.fn(() => 'test-pane'),
 }));
 
 vi.mock('../src/core/session-activity.js', () => ({
@@ -120,7 +122,7 @@ vi.mock('../src/core/session-activity.js', () => ({
 }));
 
 import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
-import { restoreUsageLimitRuntimeState, closeSession } from '../src/core/worker-pool.js';
+import { restoreUsageLimitRuntimeState, closeSession, forkAdoptWorker } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -185,6 +187,41 @@ describe('resumeSession', () => {
       const r = await resumeSession(s.sessionId, new Map());
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
+    });
+
+    it('rejects manual resume for a closed dedicated VC receiver without mutating its state or routing map', async () => {
+      const receiver = makeClosedSession({
+        chatId: 'oc_listener',
+        rootMessageId: 'oc_listener',
+        scope: 'chat',
+      });
+      receiver.vcMeetingReceiver = {
+        listenerAppId: 'listener_app',
+        meetingId: 'meeting-42',
+        memberId: 'member-agent',
+        memberEpoch: 7,
+      };
+      sessionStore.updateSession(receiver);
+      sessionStore.closeSession(receiver.sessionId);
+      const map = new Map<string, DaemonSession>();
+      const ordinaryChatKey = sessionKey('oc_listener', 'app_test');
+      const ordinaryChat = {
+        session: { sessionId: 'ordinary-chat-session', cliId: 'claude-code' },
+        worker: {},
+        chatId: 'oc_listener',
+        scope: 'chat',
+        larkAppId: 'app_test',
+      } as unknown as DaemonSession;
+      map.set(ordinaryChatKey, ordinaryChat);
+      wp.registry = map;
+
+      const r = await resumeSession(receiver.sessionId, map);
+
+      expect(r).toEqual({ ok: false, error: 'vc_receiver_managed' });
+      expect(sessionStore.getSession(receiver.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(1);
+      expect(map.get(ordinaryChatKey)).toBe(ordinaryChat);
+      expect(closeSession).not.toHaveBeenCalled();
     });
 
     it('returns anchor_occupied when a REAL in-memory session owns the anchor', async () => {
@@ -308,6 +345,39 @@ describe('resumeSession', () => {
   });
 
   describe('success path', () => {
+    it('restores dedicated VC receivers without collapsing them into the ordinary chat slot', async () => {
+      const make = (title: string, receiver?: { meetingId: string; memberId: string }) => {
+        const s = sessionStore.createSession('oc_listener', 'oc_listener', title, 'group');
+        s.larkAppId = 'app_test';
+        s.scope = 'chat';
+        s.cliId = 'claude-code';
+        s.workingDir = '/tmp/proj';
+        if (receiver) {
+          s.vcMeetingReceiver = {
+            listenerAppId: 'listener_app',
+            meetingId: receiver.meetingId,
+            memberId: receiver.memberId,
+            memberEpoch: 1,
+          };
+        }
+        sessionStore.updateSession(s);
+        return s;
+      };
+      const ordinary = make('ordinary chat');
+      const meetingA = make('meeting A', { meetingId: 'meeting-a', memberId: 'member-a' });
+      const meetingB = make('meeting B', { meetingId: 'meeting-b', memberId: 'member-b' });
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      expect(map.get(sessionKey('oc_listener', 'app_test'))?.session.sessionId).toBe(ordinary.sessionId);
+      expect(map.get(sessionKey(`vc-receiver:${meetingA.sessionId}`, 'app_test'))?.session.sessionId)
+        .toBe(meetingA.sessionId);
+      expect(map.get(sessionKey(`vc-receiver:${meetingB.sessionId}`, 'app_test'))?.session.sessionId)
+        .toBe(meetingB.sessionId);
+      expect(map.size).toBe(3);
+    });
+
     it('restores usage-limit runtime state for active sessions after daemon restart', async () => {
       const s = sessionStore.createSession('oc_chat_limit', 'om_limit', 'Limited topic');
       s.larkAppId = 'app_test';
@@ -330,6 +400,78 @@ describe('resumeSession', () => {
       const ds = map.get(sessionKey('om_limit', 'app_test'));
       expect(ds).toBeDefined();
       expect(restoreUsageLimitRuntimeState).toHaveBeenCalledWith(ds);
+    });
+
+    it('restores ownerOpenId for a regular active session after daemon restart', async () => {
+      const s = sessionStore.createSession('oc_owner', 'om_owner', 'Owned topic');
+      s.larkAppId = 'app_test';
+      s.scope = 'thread';
+      s.cliId = 'claude-code';
+      s.workingDir = '/tmp/owned';
+      s.ownerOpenId = 'ou_persisted_owner';
+      sessionStore.updateSession(s);
+
+      const map = new Map<string, DaemonSession>();
+      await restoreActiveSessions(map);
+
+      expect(map.get(sessionKey('om_owner', 'app_test'))?.ownerOpenId).toBe('ou_persisted_owner');
+    });
+
+    it('restores ownerOpenId before re-forking an adopt session', async () => {
+      const s = sessionStore.createSession('oc_adopt_owner', 'om_adopt_owner', 'Adopt: test-pane');
+      s.larkAppId = 'app_test';
+      s.scope = 'thread';
+      s.cliId = 'claude-code';
+      s.ownerOpenId = 'ou_adopt_owner';
+      s.adoptedFrom = {
+        source: 'tmux',
+        tmuxTarget: 'test:0.0',
+        originalCliPid: 12345,
+        cliId: 'claude-code',
+        cwd: '/tmp/adopted',
+      };
+      sessionStore.updateSession(s);
+      vi.mocked(forkAdoptWorker).mockClear();
+
+      const map = new Map<string, DaemonSession>();
+      await restoreActiveSessions(map);
+
+      const restored = map.get(sessionKey('om_adopt_owner', 'app_test'));
+      expect(restored?.ownerOpenId).toBe('ou_adopt_owner');
+      expect(forkAdoptWorker).toHaveBeenCalledWith(
+        expect.objectContaining({ ownerOpenId: 'ou_adopt_owner' }),
+        { restoredFromMetadata: true },
+      );
+    });
+
+    it('restores the persisted clean sidecar for a long-running Codex App session', async () => {
+      const closed = makeClosedSession({
+        chatId: 'oc_codex_restore',
+        rootMessageId: 'om_codex_restore',
+        cliId: 'codex-app',
+      });
+      closed.lastUserPrompt = '第 27 轮继续分析';
+      closed.lastCliInput = '<user_message>第 27 轮继续分析</user_message>';
+      closed.lastCodexAppInput = {
+        text: '第 27 轮继续分析',
+        clientUserMessageId: 'om_round_27',
+        additionalContext: {
+          botmux_sender: { kind: 'untrusted', value: '<sender name="晓雪" />' },
+          botmux_role: { kind: 'application', value: '<role>reviewer</role>' },
+        },
+      };
+      sessionStore.updateSession(closed);
+      sessionStore.closeSession(closed.sessionId);
+
+      const map = new Map<string, DaemonSession>();
+      const result = await resumeSession(closed.sessionId, map);
+
+      expect(result.ok).toBe(true);
+      const restored = map.get(sessionKey('om_codex_restore', 'app_test'))!;
+      expect(restored.lastUserPrompt).toBe('第 27 轮继续分析');
+      expect(restored.lastCliInput).toContain('<user_message>');
+      expect(restored.lastCodexAppInput).toEqual(closed.lastCodexAppInput);
+      expect(restored.session.lastCodexAppInput).toEqual(closed.lastCodexAppInput);
     });
 
     it('flips status back to active, clears closedAt, and registers in the Map (thread-scope)', async () => {

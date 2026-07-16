@@ -42,6 +42,9 @@ export interface ListedPane {
   paneId: string;
   isPlugin: boolean;
   isFloating: boolean;
+  /** True for a held pane whose command already exited (`zellij run` finished,
+   *  pane shows "press enter to re-run") — it has NO live process behind it. */
+  exited: boolean;
   title?: string;
   terminalCommand?: string | null;
 }
@@ -199,6 +202,7 @@ export function parseListPanesJson(json: string): ListedPane[] {
     paneId: `terminal_${p.id}`,
     isPlugin: !!p.is_plugin,
     isFloating: !!p.is_floating,
+    exited: !!p.exited,
     title: typeof p.title === 'string' ? p.title : undefined,
     terminalCommand: p.terminal_command ?? null,
   }));

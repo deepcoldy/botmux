@@ -17,13 +17,9 @@ import {
   type V3BlockedActionValue,
   type V3AskAnswerActionValue,
 } from './v3-blocked-card.js';
-import { requestV3Retry, blockedInfoFor } from '../../workflows/v3/daemon-run.js';
+import { requestV3Retry, blockedInfoFor, readV3RunChatBinding } from '../../workflows/v3/daemon-run.js';
 import { readJournal } from '../../workflows/v3/journal.js';
-import {
-  readGrillState,
-  defaultBaseDir,
-  type RunChatBinding,
-} from '../../workflows/v3/grill-state.js';
+import { defaultBaseDir, type RunChatBinding } from '../../workflows/v3/grill-state.js';
 import { isValidRunId } from '../../workflows/v3/ops-projection.js';
 
 export function isV3BlockedAction(action: unknown): boolean {
@@ -70,8 +66,7 @@ export async function handleV3BlockedAction(
     return { toast: { type: 'warning', content: `这张卡已失效（nonce 不匹配）` } };
   }
   const runDir = join(baseDir, value.runId);
-  const grill = readGrillState(runDir);
-  const binding = grill?.chatBinding;
+  const binding = readV3RunChatBinding(runDir);
 
   if (deps.canResolve && !deps.canResolve(binding, operatorOpenId)) {
     return { toast: { type: 'warning', content: `你没有权限${verb}这个节点` } };
@@ -129,6 +124,7 @@ export async function handleV3BlockedAction(
           outcome.reason === 'missing' ? '该 run 不存在或已清理'
           : outcome.reason === 'stale-attempt' ? '该节点已进入新一轮 attempt，这张旧卡失效（看最新那张卡）'
           : outcome.reason === 'invalid-answer' ? '这个选项不属于当前问题，卡片已失效'
+          : outcome.reason === 'host-effect-uncertain' ? '该节点可能已产生外部副作用，禁止普通重试；请先完成 host effect 对账'
           : `该节点已不在受阻状态，${verb}卡失效`,
       },
     };

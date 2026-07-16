@@ -179,6 +179,92 @@ interface DriveCallOpts {
   /** true 时**优先 tenant（应用身份）**，失败再回退 user。用于发评论——这样 bot 的
    *  回复显示为机器人本身，而非授权用户。bot 对该文档无访问权时回退 user 身份保证落地。 */
   preferTenant?: boolean;
+  /** 订阅 API 专用：把 1069603 连同实际失败身份归一化为结构化异常。 */
+  classifySubscriptionPermission?: boolean;
+}
+
+const DOC_SUBSCRIPTION_PERMISSION_CODE = 1069603;
+
+/**
+ * User Token 有效但没有目标文档权限。它必须与 UserTokenMissingError 分开：
+ * 403 重新 OAuth 不会增加文档角色，但仍可回退 tenant（应用可能已被加为文档应用）。
+ */
+class UserTokenForbiddenError extends Error {
+  readonly httpStatus = 403;
+
+  constructor(
+    readonly larkCode?: number,
+    readonly larkMessage?: string,
+  ) {
+    super(`User Token 无权访问该文档（HTTP 403${larkCode !== undefined ? `, code: ${larkCode}` : ''}）。`);
+    this.name = 'UserTokenForbiddenError';
+  }
+}
+
+export type DocSubscriptionPermissionSource = 'user' | 'tenant' | 'both' | 'unknown';
+
+export interface DocSubscriptionPermissionDetails {
+  source: DocSubscriptionPermissionSource;
+  userLarkMessage?: string;
+  tenantLarkMessage?: string;
+  tenantHttpStatus?: number;
+}
+
+/**
+ * 飞书订阅接口返回 1069603。保留实际返回该业务码的身份，避免 tenant-only
+ * 失败被错误归因成“当前用户无权限”；只保留业务字段，不把可能含 token/header
+ * 的 AxiosError 挂进 cause。
+ */
+export class DocSubscriptionPermissionError extends Error {
+  readonly larkCode = DOC_SUBSCRIPTION_PERMISSION_CODE;
+
+  constructor(readonly details: DocSubscriptionPermissionDetails) {
+    super(`订阅文档被飞书拒绝（code: ${DOC_SUBSCRIPTION_PERMISSION_CODE}, source: ${details.source}）。`);
+    this.name = 'DocSubscriptionPermissionError';
+  }
+
+  get source(): DocSubscriptionPermissionSource {
+    return this.details.source;
+  }
+}
+
+function getLarkErrorCode(err: unknown): number | undefined {
+  if (err instanceof UserTokenForbiddenError) return err.larkCode;
+  const code = (err as any)?.response?.data?.code ?? (err as any)?.code;
+  return typeof code === 'number' ? code : undefined;
+}
+
+function getLarkErrorMessage(err: unknown): string | undefined {
+  if (err instanceof UserTokenForbiddenError) return err.larkMessage;
+  const msg = (err as any)?.response?.data?.msg ?? (err as any)?.msg;
+  return typeof msg === 'string' ? msg : undefined;
+}
+
+function subscriptionPermissionSource(
+  userForbidden: UserTokenForbiddenError | undefined,
+  tenantHasPermissionCode: boolean,
+): DocSubscriptionPermissionSource {
+  const userHasPermissionCode = userForbidden?.larkCode === DOC_SUBSCRIPTION_PERMISSION_CODE;
+  if (userHasPermissionCode && tenantHasPermissionCode) return 'both';
+  if (tenantHasPermissionCode) return 'tenant';
+  if (userHasPermissionCode) return 'user';
+  return 'unknown';
+}
+
+function subscriptionPermissionError(
+  userForbidden: UserTokenForbiddenError | undefined,
+  tenantErrorOrResponse?: unknown,
+  tenantHttpStatus?: number,
+): DocSubscriptionPermissionError {
+  const tenantHasPermissionCode = getLarkErrorCode(tenantErrorOrResponse) === DOC_SUBSCRIPTION_PERMISSION_CODE;
+  return new DocSubscriptionPermissionError({
+    source: subscriptionPermissionSource(userForbidden, tenantHasPermissionCode),
+    ...(userForbidden?.larkMessage ? { userLarkMessage: userForbidden.larkMessage } : {}),
+    ...(tenantHasPermissionCode && getLarkErrorMessage(tenantErrorOrResponse)
+      ? { tenantLarkMessage: getLarkErrorMessage(tenantErrorOrResponse) }
+      : {}),
+    ...(tenantHttpStatus !== undefined ? { tenantHttpStatus } : {}),
+  });
 }
 
 function buildQuery(params?: DriveCallOpts['params']): string {
@@ -231,16 +317,67 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   }
 
   // 默认：优先 user（有 token），401/403 回退 tenant。
+  let userForbidden: UserTokenForbiddenError | undefined;
   const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
   if (userToken) {
     try {
-      return await fetchWithUserToken(brand, userToken, opts);
+      const userResult = await fetchWithUserToken(brand, userToken, opts);
+      if (
+        opts.classifySubscriptionPermission
+        && userResult?.code === DOC_SUBSCRIPTION_PERMISSION_CODE
+      ) {
+        userForbidden = new UserTokenForbiddenError(
+          DOC_SUBSCRIPTION_PERMISSION_CODE,
+          typeof userResult?.msg === 'string' ? userResult.msg : undefined,
+        );
+      } else {
+        return userResult;
+      }
     } catch (err) {
-      if (!(err instanceof UserTokenMissingError)) throw err;
+      if (err instanceof UserTokenForbiddenError) {
+        userForbidden = err;
+      } else if (!(err instanceof UserTokenMissingError)) {
+        throw err;
+      }
       logger.debug(`[doc-comment] user token rejected (${opts.path}); falling back to tenant`);
     }
   }
-  return callTenant();
+
+  let tenantResult: any;
+  try {
+    tenantResult = await callTenant();
+  } catch (tenantError) {
+    const tenantStatus = (tenantError as any)?.response?.status ?? (tenantError as any)?.status;
+    if (
+      opts.classifySubscriptionPermission
+      && getLarkErrorCode(tenantError) === DOC_SUBSCRIPTION_PERMISSION_CODE
+    ) {
+      throw subscriptionPermissionError(userForbidden, tenantError, tenantStatus);
+    }
+    // 订阅 API 的 owner/manager 错误来自首选 user 身份时，不能让 tenant 的
+    // generic Axios 403（无飞书业务码）覆盖掉飞书业务码，否则上层只能看到
+    // “status code 403”。tenant 明确返回其他 HTTP 状态或业务码时必须保留，
+    // 避免把凭证、限流或服务故障误报成文档 owner/manager 权限不足。
+    if (
+      userForbidden?.larkCode === DOC_SUBSCRIPTION_PERMISSION_CODE
+      && tenantStatus === 403
+      && getLarkErrorCode(tenantError) === undefined
+    ) {
+      logger.debug(`[doc-comment] tenant fallback also failed (${opts.path}); preserving user code=${userForbidden.larkCode}`);
+      if (opts.classifySubscriptionPermission) {
+        throw subscriptionPermissionError(userForbidden, undefined, tenantStatus);
+      }
+      throw userForbidden;
+    }
+    throw tenantError;
+  }
+  if (
+    opts.classifySubscriptionPermission
+    && tenantResult?.code === DOC_SUBSCRIPTION_PERMISSION_CODE
+  ) {
+    throw subscriptionPermissionError(userForbidden, tenantResult);
+  }
+  return tenantResult;
 }
 
 async function fetchWithUserToken(brand: Brand, userToken: string, opts: DriveCallOpts): Promise<any> {
@@ -253,14 +390,17 @@ async function fetchWithUserToken(brand: Brand, userToken: string, opts: DriveCa
     },
     ...(opts.data !== undefined ? { body: JSON.stringify(opts.data) } : {}),
   });
+  const body = await res.json().catch(() => ({})) as any;
   if (res.status === 401) {
     throw new UserTokenMissingError('User Token 已失效（HTTP 401）。请在话题中 /login 重新授权。');
   }
   if (res.status === 403) {
     // token 有效但无权访问该文档 —— 视作可回退（也许 tenant 有权）
-    throw new UserTokenMissingError(`User Token 无权访问该文档（HTTP 403）。`);
+    throw new UserTokenForbiddenError(
+      typeof body?.code === 'number' ? body.code : undefined,
+      typeof body?.msg === 'string' ? body.msg : undefined,
+    );
   }
-  const body = await res.json().catch(() => ({})) as any;
   if (!res.ok) {
     throw new Error(`drive API ${opts.path} HTTP ${res.status}: ${body?.msg ?? ''}`);
   }
@@ -282,7 +422,14 @@ export async function subscribeDocFile(larkAppId: string, file: ResolvedDocFile)
     method: 'POST',
     path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/subscribe`,
     params: { file_type: file.fileType },
+    classifySubscriptionPermission: true,
   });
+  if (res?.code === DOC_SUBSCRIPTION_PERMISSION_CODE) {
+    throw new DocSubscriptionPermissionError({
+      source: 'unknown',
+      ...(typeof res?.msg === 'string' ? { tenantLarkMessage: res.msg } : {}),
+    });
+  }
   ensureOk(res, '订阅文档');
   logger.info(`[doc-comment] subscribed file=${file.fileToken.slice(0, 12)} type=${file.fileType}`);
 }

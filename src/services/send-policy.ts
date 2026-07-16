@@ -34,6 +34,101 @@ export function resolveQuoteTarget(args: QuoteTargetArgs): string | null {
   return target && target.trim() ? target.trim() : null;
 }
 
+export interface ManagedVcQuoteArgs {
+  managed: boolean;
+  durableDelivery: boolean;
+  explicitImMessageId?: string;
+  explicitQuote?: string;
+}
+
+/** A quote message id is a routing primitive: Lark's reply API derives the
+ * destination chat from that id, not from the separately supplied chat id.
+ * Managed deliveries therefore cannot choose one, while an explicit IM turn
+ * may quote only the exact Lark message frozen in its origin snapshot. */
+export function managedVcQuoteError(args: ManagedVcQuoteArgs): string | null {
+  if (!args.managed || !args.explicitQuote) return null;
+  if (args.durableDelivery || args.explicitQuote !== args.explicitImMessageId) {
+    return '--quote 必须是本轮精确路由的 IM 消息；durable delivery 不能指定引用目标。';
+  }
+  return null;
+}
+
+/** Managed VC output must stay within botmux-owned message shapes. Even though
+ * ordinary custom cards are scanned for known callback controls, treating an
+ * evolving third-party card schema as an exhaustive privilege boundary is not
+ * safe for meeting-derived (untrusted) model output. */
+export function managedVcCustomCardError(managed: boolean, customCardRequested: boolean): string | null {
+  if (!managed || !customCardRequested) return null;
+  return '--card-json/--card-file 不允许用于受管 VC 回复；请使用普通文本。';
+}
+
+export interface ManagedVcSendControlArgs {
+  managed: boolean;
+  sendTopLevel: boolean;
+  overrideChatId?: string;
+  sendInto?: string;
+  attentionRequested: boolean;
+  explicitMentionCount: number;
+  mentionBack: boolean;
+  noMention: boolean;
+}
+
+/** Freeze every managed reply to the listener-thread route and a no-mention
+ * addressing mode. Routing/mention/attention are independent side effects that
+ * are not represented by the primary VC action identity. */
+export function managedVcSendControlError(args: ManagedVcSendControlArgs): string | null {
+  if (!args.managed) return null;
+  if (args.sendTopLevel || args.overrideChatId || args.sendInto) {
+    return '--top-level/--chat-id/--into 不能改变受管 VC 的 listener-thread 路由。';
+  }
+  if (args.attentionRequested) {
+    return '--attention 不属于受管 VC 主消息 action。';
+  }
+  if (args.explicitMentionCount > 0 || args.mentionBack || !args.noMention) {
+    return '受管 VC 回复必须显式使用 --no-mention，不能使用 --mention/--mention-back。';
+  }
+  return null;
+}
+
+export interface ManagedVcSendPayloadArgs {
+  managed: boolean;
+  asVoice: boolean;
+  hasBodyText: boolean;
+  imageCount: number;
+  fileCount: number;
+  videoCount: number;
+  containsNativeAtTag: boolean;
+}
+
+/** A dedicated receiver may emit only one botmux-owned text card. Provider
+ * uploads (image/file/video/audio) happen before a Lark message UUID can be
+ * reconciled, so allowing them would give retries or repeated commands an
+ * unledgered resource-creation channel even when the visible message dedupes. */
+export function managedVcSendPayloadError(args: ManagedVcSendPayloadArgs): string | null {
+  if (!args.managed) return null;
+  if (args.asVoice || args.imageCount > 0 || args.fileCount > 0 || args.videoCount > 0) {
+    return '受管 VC 回复只允许普通文本；图片、文件、视频和语音上传没有可恢复的 action identity。';
+  }
+  if (args.containsNativeAtTag) {
+    return '受管 VC 文本不能包含原生 <at …> 标签。';
+  }
+  return null;
+}
+
+export function containsLarkAtTag(content: string): boolean {
+  return /<at(?:\s|>)/iu.test(content);
+}
+
+/** Render model-authored native Lark mention tags inert before placing the
+ * text in a botmux-owned card. Full-width angle brackets are intentional:
+ * unlike an HTML entity, they cannot be decoded and re-interpreted as a
+ * second-pass `<at>` control by the card renderer. */
+export function neutralizeLarkAtTags(content: string): string {
+  return content
+    .replace(/<at(?=\s|>)/giu, '＜at')
+    .replace(/<\/at\s*>/giu, match => `＜${match.slice(1, -1)}＞`);
+}
+
 export interface MentionDecisionArgs {
   /** config.send.requireMentionDecision */
   enabled: boolean;

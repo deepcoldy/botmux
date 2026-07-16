@@ -81,6 +81,7 @@ describe('bot-config store', () => {
     expect(keys).not.toContain('repoPickerMode');
     expect(keys).toContain('skills');
     expect(keys).toContain('silentTurnReactions');
+    expect(keys).toContain('codexAppCleanInput');
   });
 
   it('parseBooleanValue accepts on/off variants and rejects junk', async () => {
@@ -195,6 +196,20 @@ describe('bot-config store', () => {
     expect(on.silentTurnReactions).toBe(true);
     expect(off.silentTurnReactions).toBeUndefined();
     expect(invalid.silentTurnReactions).toBeUndefined();
+  });
+
+  it('parses codexAppCleanInput strictly and defaults it off', async () => {
+    const { registry } = await freshModules();
+    const [on, off, invalid, missing] = registry.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'clean-on', larkAppSecret: 's', cliId: 'codex-app', codexAppCleanInput: true },
+      { larkAppId: 'clean-off', larkAppSecret: 's', cliId: 'codex-app', codexAppCleanInput: false },
+      { larkAppId: 'clean-invalid', larkAppSecret: 's', cliId: 'codex-app', codexAppCleanInput: 'true' },
+      { larkAppId: 'clean-missing', larkAppSecret: 's', cliId: 'codex-app' },
+    ]));
+    expect(on.codexAppCleanInput).toBe(true);
+    expect(off.codexAppCleanInput).toBeUndefined();
+    expect(invalid.codexAppCleanInput).toBeUndefined();
+    expect(missing.codexAppCleanInput).toBeUndefined();
   });
 
   it('parses substituteMode, retaining a disabled config\'s targets', async () => {
@@ -364,6 +379,22 @@ describe('bot-config store', () => {
     await store.applyConfigField('app_default', spec, false);
     expect(readConfig().disableStreamingCard).toBeUndefined();
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
+  });
+
+  it('codexAppCleanInput is immediate, default-off, and deletes its key when disabled', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex-app' });
+    const spec = store.findConfigField('codexAppCleanInput')!;
+    expect(spec.effect).toBe('immediate');
+    expect(registry.getBot('app_default').config.codexAppCleanInput).toBeUndefined();
+
+    const enabled = await store.applyConfigField('app_default', spec, true);
+    expect(enabled).toMatchObject({ ok: true, oldText: 'off', newText: 'on', effect: 'immediate' });
+    expect(readConfig().codexAppCleanInput).toBe(true);
+    expect(registry.getBot('app_default').config.codexAppCleanInput).toBe(true);
+
+    await store.applyConfigField('app_default', spec, false);
+    expect(readConfig().codexAppCleanInput).toBeUndefined();
+    expect(registry.getBot('app_default').config.codexAppCleanInput).toBeUndefined();
   });
 
   it('silentTurnReactions writes true / deletes key on false (keeps bots.json tidy)', async () => {

@@ -37,6 +37,32 @@ describe('dashboard history sender enrichment', () => {
     expect(message).not.toHaveProperty('senderAvatar');
   });
 
+  it('keeps the server-provided senderName when local rosters cannot resolve the sender', () => {
+    const out = enrichHistorySenders(
+      [
+        // Third-party bot not in bots.json / observed roster — server name survives.
+        { messageId: 'm1', senderId: 'ou_foreign_bot', senderType: 'app', msgType: 'text', content: 'x', senderName: 'ForeignBot' },
+        // Human outside the app's visible range (contact lookup returned null).
+        { messageId: 'm2', senderId: 'ou_stranger', senderType: 'user', msgType: 'text', content: 'y', senderName: '张三' },
+      ],
+      new Map([['ou_stranger', null]]),
+      [],
+      [],
+    );
+    expect(out[0]).toMatchObject({ senderName: 'ForeignBot' });
+    expect(out[1]).toMatchObject({ senderName: '张三' });
+  });
+
+  it('prefers the locally-resolved name over the server-provided one', () => {
+    const [message] = enrichHistorySenders(
+      [{ messageId: 'm1', senderId: 'ou_bot', senderType: 'app', msgType: 'text', content: 'x', senderName: 'ServerName' }],
+      new Map(),
+      [{ openId: 'ou_bot', displayName: 'Local Display', larkAppId: 'cli_x' }],
+      [{ larkAppId: 'cli_x', botName: 'Local Display', botAvatarUrl: 'https://img/x' }],
+    );
+    expect(message).toMatchObject({ senderName: 'Local Display' });
+  });
+
   it('resolves app senders that Lark history identifies by stable cli app id', () => {
     const [message] = enrichHistorySenders(
       [{ messageId: 'm1', senderId: 'cli_peer', senderType: 'app', msgType: 'text', content: 'done' }],

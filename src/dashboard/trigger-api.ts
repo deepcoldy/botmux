@@ -7,7 +7,7 @@ import {
   type TriggerLogRequest,
   type TriggerLogTarget,
 } from '../services/trigger-log-store.js';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
 
 const MAX_TRIGGER_BODY_BYTES = 512 * 1024;
 

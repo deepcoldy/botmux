@@ -17,12 +17,16 @@ import { join } from 'node:path';
 /** Subset of Claude Code's JSONL event shape we care about. */
 export interface TranscriptEvent {
   type?: string;
+  subtype?: string;
   uuid?: string;
   sessionId?: string;
   timestamp?: string;
   message?: {
     role?: string;
     content?: unknown;
+    /** Claude's API stop reason. `tool_use` is an intra-turn pause; terminal
+     * reasons such as `end_turn` / `stop_sequence` close the logical turn. */
+    stop_reason?: string | null;
   };
   /** Present on `type:"attachment"` lines. The bridge attribution queue
    *  treats `attachment.type === "queued_command"` as a turn-start signal —
@@ -36,6 +40,28 @@ export interface TranscriptEvent {
     prompt?: unknown;
     commandMode?: string;
   };
+}
+
+/**
+ * Authoritative Claude Code end-of-turn markers observed in its JSONL:
+ *
+ * - the final non-sidechain assistant message carries a non-tool stop reason;
+ * - current Claude versions additionally append `system/turn_duration`.
+ *
+ * Both may be present for the same turn, so consumers must deduplicate by the
+ * durable turn identity. `tool_use` and `pause_turn` are explicitly excluded:
+ * Claude is waiting on a tool/continuation and has not returned to a new turn.
+ */
+export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
+  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
+  if (ev.type === 'system' && ev.subtype === 'turn_duration') return true;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return false;
+  const reason = ev.message?.stop_reason;
+  return typeof reason === 'string'
+    && reason.length > 0
+    && reason !== 'tool_use'
+    && reason !== 'pause_turn';
 }
 
 /** Extract the user-typed prompt text for a "turn start" event — works for

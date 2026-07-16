@@ -1,8 +1,8 @@
 import { z } from 'zod';
 
 import { sendMessage, MessageWithdrawnError } from '../../im/lark/client.js';
-import { PROVIDER_TTL_MS } from '../events/schema.js';
-import type { ProviderReconciler } from '../resume.js';
+import { PROVIDER_TTL_MS } from '../shared/provider-reconciler.js';
+import type { ProviderReconciler } from '../shared/provider-reconciler.js';
 import type {
   ExecutorErrorClassification,
   SideEffectingExecutor,

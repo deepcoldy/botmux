@@ -57,6 +57,25 @@ describe('expandMergeForward: flat tree', () => {
     expect(parsed.content).toContain('<msg from="A">again</msg>');
     expect(extraResources).toEqual([]);
   });
+
+  it('carries server-provided sender_name into participant name attrs', async () => {
+    getMessageDetailMock.mockResolvedValueOnce({
+      items: [
+        { message_id: 'om_a', upper_message_id: 'om_root', msg_type: 'text',
+          sender: { id: 'ou_alice', sender_type: 'user', sender_name: '爱丽丝' },
+          body: { content: JSON.stringify({ text: 'hi' }) } },
+        { message_id: 'om_b', upper_message_id: 'om_root', msg_type: 'text',
+          sender: { id: 'ou_bot', sender_type: 'app', sender_name: 'CoCo' },
+          body: { content: JSON.stringify({ text: 'beep' }) } },
+      ],
+    });
+
+    const parsed = fakeParsed();
+    await expandMergeForward('app_test', 'om_root', parsed);
+
+    expect(parsed.content).toContain('<p id="A" open_id="ou_alice" type="user" name="爱丽丝" />');
+    expect(parsed.content).toContain('<p id="B" open_id="ou_bot" type="app" name="CoCo" />');
+  });
 });
 
 describe('expandMergeForward: nested merge_forward', () => {

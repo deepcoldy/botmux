@@ -50,6 +50,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
     disableStreamingCard: j?.disableStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
+    codexAppCleanInput: j?.codexAppCleanInput === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
     botToBotSameDir: j?.botToBotSameDir !== false,

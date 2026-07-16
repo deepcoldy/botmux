@@ -21,8 +21,20 @@ export type ExpandMergeForwardFn = (
   numberer: ReturnType<typeof createImgNumberer>,
 ) => Promise<{ extraResources: MessageResource[] }>;
 
+/** Subset of resolveMergedCardContent used here (dependency-injected so tests
+ *  can stub it): resolves an interactive card to its merged text + structured
+ *  JSON + resources, numbering [图片 N] via the given numberer. */
+export type ResolveMergedCardFn = (
+  larkAppId: string,
+  messageId: string,
+  numberer: ReturnType<typeof createImgNumberer>,
+) => Promise<{ text: string; structuredContent: string; resources: MessageResource[] } | null>;
+
 export interface RenderedQuotedMessage extends LarkMessage {
   resources: MessageResource[];
+  /** Structured card JSON from the merge pass — set only for interactive
+   *  messages that were successfully re-resolved (`quoted --raw` → cardJson). */
+  mergedStructuredContent?: string;
 }
 
 /**
@@ -41,6 +53,7 @@ export async function renderQuotedMessage(
   larkAppId: string,
   rawMessage: any,
   expandMergeForward: ExpandMergeForwardFn,
+  resolveMergedCard?: ResolveMergedCardFn,
 ): Promise<RenderedQuotedMessage> {
   const numberer = createImgNumberer();
   // Order: extractResources first so top-level keys get their numbers, then
@@ -53,6 +66,21 @@ export async function renderQuotedMessage(
   if (parsed.msgType === 'merge_forward') {
     const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed, numberer);
     resources.push(...extraResources);
+  }
+  // Interactive cards: union both im.message.get representations so the quoted
+  // view matches history/live. Fresh numberer + FULL replacement (content AND
+  // resources): the merge re-renders the card from scratch, so [图片 N] must
+  // restart at 1 aligned with merged.resources — reusing the numberer above
+  // would leave merged text misnumbered, and keeping the pre-merge resources
+  // would let the list view's upgrade-fallback shell image linger. Attachment
+  // download (in cmdQuoted) runs on the replaced list.
+  if (parsed.msgType === 'interactive' && resolveMergedCard) {
+    const cardNumberer = createImgNumberer();
+    const merged = await resolveMergedCard(larkAppId, parsed.messageId, cardNumberer).catch(() => null);
+    if (merged) {
+      parsed.content = merged.text;
+      return { ...parsed, resources: merged.resources, mergedStructuredContent: merged.structuredContent };
+    }
   }
   return { ...parsed, resources };
 }

@@ -50,6 +50,7 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `lang` | The bot's UI language, `zh` / `en`; leave empty to fall back to the `BOTMUX_LANG` / `LANG` environment variable |
 | `customPassthroughCommands` | On top of the fixed passthrough allowlist and the current CLI adapter's default-allowed commands, additionally pass through slash commands to the underlying CLI, e.g. `["/export"]` (Claude Code / Codex default-allow `/goal`). Auto-normalized (a missing `/` is added, lowercased, only `[a-z0-9:_-]` kept, deduplicated); entries that would shadow a botmux daemon command (e.g. `/status`) are dropped and have no effect even if configured. Use `/list-slash-command` to view the full allowlist. See [Slash commands](/en/slash-commands) |
 | `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. Also editable in the dashboard ("Bot defaults → Environment variables") |
+| `codexAppCleanInput` | **Experimental**, and only effective for Botmux-managed sessions whose actual CLI is `codex-app`. When `true`, the visible / persisted text `UserMessage` contains only the user's original input while message-level Botmux context primarily moves to `additionalContext`. Defaults to off, takes effect on the next turn dispatch, and does not rewrite existing history. See details below |
 
 ### Run a bot on GLM / a third-party provider (per-bot env)
 
@@ -70,6 +71,33 @@ Run one bot on a GLM Coding Plan (or any Anthropic-compatible provider) while an
 - **Isolation**: env is injected per-session into the CLI process, consistently across backends (tmux / zellij inject it per-pane, never into the shared server env), so one bot's provider config can't leak into another's.
 - **Security**: values live in `bots.json` and the process environment in plaintext — not a secret vault; chat surfaces like `/config get` mask the values (the owner-authenticated dashboard editor shows real values).
 - Takes effect from the next **session**.
+
+### Clean Codex App input (experimental)
+
+`codexAppCleanInput` keeps user messages shown in Codex App clean while preserving the context Botmux needs when invoking the model. It defaults to `false` / `off`; when disabled, Botmux keeps the original combined-prompt behavior unchanged.
+
+An owner or `allowedUsers` member can hot-update it with `/botconfig`; no daemon restart is required:
+
+```text
+/botconfig set codexAppCleanInput on
+/botconfig set codexAppCleanInput off
+```
+
+You can also add it to the corresponding bot entry directly (manual `bots.json` edits still require the restart described at the end of this page):
+
+```json
+{
+  "cliId": "codex-app",
+  "codexAppCleanInput": true
+}
+```
+
+- The flag applies only to Botmux-managed sessions whose actual CLI is `codex-app`; other CLIs and externally bridged `/adopt` sessions are unaffected. A session-frozen CLI takes precedence over a later bot-default CLI change.
+- When enabled, user-authored turns use the original text as the Codex App text `UserMessage`; Botmux-authored synthetic turns such as external triggers and document prewarm use a short readable label. Message-level sender, mentions, attachment paths, quotes, role, whiteboard, Skills, and synthetic-turn instructions primarily move to hidden `additionalContext`. Readable absolute-path images are also sent as `localImage`; missing, relative, or unreadable images skip the native image item with a diagnostic while their attachment path remains in context.
+- A detectable Codex CLI `>= 0.135` enables clean text plus `additionalContext`; `>= 0.136` also attaches a separate `clientUserMessageId`. Older or unknown versions use the legacy combined prompt directly.
+- The runner retries the legacy prompt **once** only when app-server explicitly rejects `additionalContext` / `clientUserMessageId` before `turn/started`, then disables clean mode for that runner lifetime. Network, timeout, model, and generic turn errors are never auto-retried, avoiding duplicate work.
+- A `/botconfig` change is sampled at the **next dispatch to the Codex worker**. For ordinary live messages this is normally the next message; a first turn waiting on repo selection is sampled when the repo is committed. Already queued or running turns are not rewritten, and existing history is never backfilled.
+- `additionalContext` is omitted from the ordinary Codex App user-message bubble, but it may still be retained in raw rollout or diagnostic records. When enabled, Botmux also keeps the legacy prompt and structured sidecar for compatibility fallback and `retry_last_task`. This feature improves App presentation and ordinary history reading; it is **not** a privacy-erasure or security-redaction mechanism.
 
 ## Working directory
 

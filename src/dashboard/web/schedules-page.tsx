@@ -220,7 +220,10 @@ function SchedulesPage() {
             type="checkbox"
             name="enabled"
             checked={filters.enabledOnly}
-            onChange={e => setFilters(f => ({ ...f, enabledOnly: e.currentTarget.checked }))}
+            onChange={event => {
+              const enabledOnly = event.currentTarget.checked;
+              setFilters(f => ({ ...f, enabledOnly }));
+            }}
           />
           <span className="filter-toggle-label">{tr('schedules.enabledOnly')}</span>
           <span className="filter-toggle-switch" aria-hidden="true" />

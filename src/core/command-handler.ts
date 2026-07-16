@@ -6,14 +6,15 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId, getOwnerOpenId } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import { repoPickerScanOptions } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
-import { createRepoWorktree } from '../services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
+import { resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
 import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
@@ -32,7 +33,7 @@ import { discoverAdoptableSessions, validateAdoptTarget, adoptTargetKey, adoptTa
 import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
-import { listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
+import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
 import { latestDocCommentPollCursor } from './doc-comment-poller.js';
 import {
@@ -70,6 +71,9 @@ import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
+import { fetchDaemonIpc } from './daemon-ipc-auth.js';
+import { updateSessionTitle } from './session-title.js';
+import { requestAgentSessionRename } from './session-rename.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -90,6 +94,18 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * that pollutes the dashboard's session list. Handle them without a session.
  */
 export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment']);
+
+/**
+ * Daemon commands that operate on an ALREADY-EXISTING session and must never
+ * pre-create one. `/rename` renames the current session — with no session there
+ * is nothing to rename, so the daemon routes must skip their generic
+ * "createSession + activeSessions.set(worker:null)" pre-create block and let
+ * handleCommand's `!ds` branch reply no_active_session. Without this, `/rename`
+ * in a brand-new topic (or a thread with no session) would spawn a phantom
+ * worker:null session just to rename it, polluting the dashboard. (Same class
+ * of fix as the `/card` / `/term` special cases in daemon.ts.)
+ */
+export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename']);
 
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
@@ -588,6 +604,83 @@ async function handleRoleCommand(
   await sessionReply(rootId, t('role.help', undefined, loc));
 }
 
+/**
+ * Resolve the workingDir for a newly created scheduled task, mirroring the
+ * layered lookup used by the normal new-session spawn path (see
+ * `resolvePinnedWorkingDir` in daemon.ts) but STRICTLY read-only: it never
+ * triggers the defaultOncall auto-bind side effect (which writes to bots.json).
+ * Creating a schedule must not mutate oncall binding state.
+ *
+ * Priority:
+ *   1) existing session workingDir (ds.workingDir — already pinned via /cd or
+ *      a previously-applied oncall bind)
+ *   2) this bot/chat oncall binding (read-only findOncallChat, no auto-bind)
+ *   3) this bot's effective default working dir (defaultWorkingDir, or
+ *      defaultOncall.workingDir when Oncall 模式 is on)
+ *   4) legacy bot.config.workingDir
+ *   5) '~'
+ *
+ * Deliberate deltas vs `resolvePinnedWorkingDir` (do NOT "sync" them away):
+ *   - no sibling-inherit layer (findInheritablePeer) — a schedule needs a
+ *     deterministic dir at create time, not whatever peer session happens to
+ *     be open at that moment;
+ *   - extra layers 4/5 — a schedule has no interactive repo-select card to
+ *     fall back on, so it must always resolve to something;
+ *   - every layer validates the candidate dir and falls through when it is
+ *     stale (deleted/renamed): a dead path would otherwise be baked into
+ *     schedules.json (workingDir is not editable afterwards) and every fire
+ *     would silently spawn in $HOME. This includes layer 1 — a ds restored
+ *     by restoreActiveSessions (worker:null) or idle-suspended keeps a
+ *     workingDir no live process is running in, so it can be stale too.
+ */
+function resolveScheduleWorkingDir(
+  ds: DaemonSession | undefined,
+  chatId: string,
+  larkAppId: string | undefined,
+): string {
+  // Validate candidates and fall through (returning the RAW form — keep `~`;
+  // expansion happens at fire time via getSessionWorkingDir), matching the
+  // other copies of this ladder (daemon resolveBotDefaultWorkingDir,
+  // trigger-session).
+  const usable = (dir: string, layer: string): boolean => {
+    const v = validateWorkingDir(dir);
+    if (v.ok) return true;
+    logger.warn(`[schedule] ${layer} workingDir "${dir}" invalid — falling through: ${v.error}`);
+    return false;
+  };
+
+  // Layer 1: existing session dir already pinned.
+  if (ds?.workingDir && usable(ds.workingDir, 'session')) return ds.workingDir;
+
+  const appId = ds?.larkAppId ?? larkAppId;
+  // getBot() throws for unregistered ids — degrade to the '~' fallback
+  // instead of aborting the whole /schedule command.
+  let bot: ReturnType<typeof getBot> | undefined;
+  try {
+    bot = appId ? getBot(appId) : getAllBots()[0];
+  } catch {
+    bot = undefined;
+  }
+  if (!bot) return '~';
+
+  // Layer 2: oncall binding for this chat (read-only — does NOT auto-bind).
+  const oncallEntry = findOncallChat(bot.config.larkAppId, ds?.chatId ?? chatId);
+  if (oncallEntry?.workingDir && usable(oncallEntry.workingDir, 'oncall-binding')) {
+    return oncallEntry.workingDir;
+  }
+
+  // Layer 3: effective default working dir (defaultWorkingDir or
+  // defaultOncall.workingDir). Read-only — never writes state.
+  const effectiveDefault = effectiveDefaultWorkingDir(bot.config);
+  if (effectiveDefault && usable(effectiveDefault, 'effective-default')) return effectiveDefault;
+
+  // Layer 4: legacy workingDir field.
+  if (bot.config.workingDir && usable(bot.config.workingDir, 'legacy')) return bot.config.workingDir;
+
+  // Layer 5: home fallback.
+  return '~';
+}
+
 async function handleScheduleCommand(
   args: string,
   rootId: string,
@@ -677,7 +770,7 @@ async function handleScheduleCommand(
   const parsed = scheduler.parseNaturalSchedule(trimmed);
   if (parsed) {
     const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
-    const workingDir = ds?.workingDir ?? (ds?.larkAppId ? getBot(ds.larkAppId).config.workingDir ?? '~' : getAllBots()[0]?.config.workingDir ?? '~');
+    const workingDir = resolveScheduleWorkingDir(ds, chatId, larkAppId);
     const taskScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
     // "新话题" keyword → every fire opens a brand-new topic in a fresh session.
     const { deliver, prompt: schedPrompt } = scheduler.extractDeliveryMode(parsed.prompt);
@@ -1277,6 +1370,37 @@ export async function handleCommand(
         break;
       }
 
+      case '/rename': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        const rawTitle = message.content.replace(/^\/rename\s*/i, '').trim();
+        if (!rawTitle) {
+          await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
+          break;
+        }
+        const updated = updateSessionTitle(ds.session, rawTitle);
+        if (!updated.ok) {
+          await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
+          break;
+        }
+        const agentSync = requestAgentSessionRename(ds, updated.title);
+        const cliName = getCliDisplayName(agentSync.cliId ?? ds.session.cliId ?? 'claude-code');
+        if (agentSync.status === 'requested') {
+          await sessionReply(rootId, t('cmd.rename.updated_requested', { title: updated.title, cliName }, loc));
+        } else if (agentSync.status === 'not_running') {
+          await sessionReply(rootId, t('cmd.rename.updated_not_running', { title: updated.title }, loc));
+        } else if (agentSync.status === 'unsupported') {
+          await sessionReply(rootId, t('cmd.rename.updated_unsupported', { title: updated.title, cliName }, loc));
+        } else {
+          await sessionReply(rootId, t('cmd.rename.updated_failed', { title: updated.title, cliName }, loc));
+          logger.warn(`[${logTag}] Native session rename request failed for ${cliName}: ${agentSync.error}`);
+        }
+        logger.info(`[${logTag}] Session renamed by /rename: ${updated.title} (agentSync=${agentSync.status})`);
+        break;
+      }
+
       case '/repo': {
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
 
@@ -1305,13 +1429,13 @@ export async function handleCommand(
             // dropped: wrap them now (full prompt-building context lives here)
             // and stash for delivery right after the raw input on prompt_ready.
             if (hasBufferedInput) {
-              const { buildNewTopicPrompt, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
+              const { buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
               ensureSessionWhiteboard(ds!);
-              const followUpPrompt = buildNewTopicPrompt(
+              const followUpInput = buildNewTopicCliInput(
                 pendingPrompt,
                 ds!.session.sessionId,
-                botCfg.cliId,
-                botCfg.cliPathOverride,
+                ds!.session.cliId ?? botCfg.cliId,
+                ds!.session.cliPathOverride ?? botCfg.cliPathOverride,
                 ds!.pendingAttachments,
                 ds!.pendingMentions,
                 await getAvailableBots(ds!.larkAppId, ds!.chatId),
@@ -1319,23 +1443,39 @@ export async function handleCommand(
                 { name: selfBot.botName, openId: selfBot.botOpenId },
                 loc,
                 ds!.pendingSender,
-                { larkAppId, chatId: ds!.chatId, whiteboardId: ds!.session.whiteboardId },
+                {
+                  larkAppId,
+                  chatId: ds!.chatId,
+                  whiteboardId: ds!.session.whiteboardId,
+                  substituteTrigger: ds!.pendingSubstituteTrigger,
+                  codexAppText: ds!.pendingCodexAppText,
+                  codexAppApplicationContext: ds!.pendingCodexAppApplicationContext,
+                  codexAppMessageContext: ds!.pendingCodexAppMessageContext,
+                  codexAppFollowUps: ds!.pendingCodexAppFollowUps,
+                  codexAppFollowUpContexts: ds!.pendingCodexAppFollowUpContexts,
+                },
               );
               ds!.pendingFollowUpInput = {
-                userPrompt: pendingPrompt || (ds!.pendingFollowUps?.join('\n\n') ?? ''),
-                cliInput: followUpPrompt,
+                userPrompt: ds!.pendingCodexAppText !== undefined || ds!.pendingCodexAppFollowUps
+                  ? [ds!.pendingCodexAppText ?? '', ...(ds!.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
+                  : pendingPrompt || ds!.pendingFollowUps?.join('\n\n') || '',
+                cliInput: followUpInput.content,
+                ...((ds!.session.cliId ?? botCfg.cliId) === 'codex-app' && botCfg.codexAppCleanInput === true && followUpInput.codexAppInput
+                  ? { codexAppInput: followUpInput.codexAppInput }
+                  : {}),
+                codexAppInputGateFrozen: true,
               };
             }
             rememberLastCliInput(ds!, pendingRawInput, pendingRawInput);
             forkWorker(ds!, '', false);
           } else if (hasBufferedInput) {
-            const { buildNewTopicPrompt, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
+            const { buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
             ensureSessionWhiteboard(ds!);
-            const prompt = buildNewTopicPrompt(
+            const prompt = buildNewTopicCliInput(
               pendingPrompt,
               ds!.session.sessionId,
-              botCfg.cliId,
-              botCfg.cliPathOverride,
+              ds!.session.cliId ?? botCfg.cliId,
+              ds!.session.cliPathOverride ?? botCfg.cliPathOverride,
               ds!.pendingAttachments,
               ds!.pendingMentions,
               await getAvailableBots(ds!.larkAppId, ds!.chatId),
@@ -1343,7 +1483,17 @@ export async function handleCommand(
               { name: selfBot.botName, openId: selfBot.botOpenId },
               loc,
               ds!.pendingSender,
-              { larkAppId, chatId: ds!.chatId, whiteboardId: ds!.session.whiteboardId },
+              {
+                larkAppId,
+                chatId: ds!.chatId,
+                whiteboardId: ds!.session.whiteboardId,
+                substituteTrigger: ds!.pendingSubstituteTrigger,
+                codexAppText: ds!.pendingCodexAppText,
+                codexAppApplicationContext: ds!.pendingCodexAppApplicationContext,
+                codexAppMessageContext: ds!.pendingCodexAppMessageContext,
+                codexAppFollowUps: ds!.pendingCodexAppFollowUps,
+                codexAppFollowUpContexts: ds!.pendingCodexAppFollowUpContexts,
+              },
             );
             // Last-line defence: prompt prep awaited above — if anything
             // replaced OR closed the session in that window (`/close` deletes
@@ -1362,10 +1512,16 @@ export async function handleCommand(
             forkWorker(ds!, '', false);
           }
           ds!.pendingPrompt = undefined;
+          ds!.pendingCodexAppText = undefined;
+          ds!.pendingCodexAppApplicationContext = undefined;
+          ds!.pendingCodexAppMessageContext = undefined;
           ds!.pendingAttachments = undefined;
           ds!.pendingMentions = undefined;
+          ds!.pendingSubstituteTrigger = undefined;
           ds!.pendingSender = undefined;
           ds!.pendingFollowUps = undefined;
+          ds!.pendingCodexAppFollowUps = undefined;
+          ds!.pendingCodexAppFollowUpContexts = undefined;
           await sessionReply(rootId, replyText);
         };
 
@@ -1378,6 +1534,8 @@ export async function handleCommand(
             // First spawn: pin the new cwd onto the CURRENT session, then fork.
             ds!.workingDir = selectedPath;
             ds!.session.workingDir = selectedPath;
+            // A single repo selection supersedes any stale multi-Riff stamp.
+            ds!.session.riffRepoDirs = undefined;
             sessionStore.updateSession(ds!.session);
             await forkPendingCli(t('cmd.repo.selected_in_pending', { name: displayName }, loc));
           } else {
@@ -1500,6 +1658,22 @@ export async function handleCommand(
               logger.info(`[${logTag}] Worktree ${creation.path} created but session changed mid-flight — not switching`);
               await sessionReply(rootId, t('cmd.repo.worktree_created_not_switched', { path: creation.path, branch: creation.branch }, loc));
               break;
+            }
+            const botCfg = getBot(ds.larkAppId).config;
+            const effectiveBackend = resolvePairedSpawnBackendType(
+              wasPending ? (ds.session.cliId ?? botCfg.cliId) : botCfg.cliId,
+              wasPending ? ds.session.backendType : undefined,
+              botCfg.backendType,
+              config.daemon.backendType,
+            );
+            if (effectiveBackend === 'riff') {
+              try {
+                await pushWorktreeBranch(creation.path, creation.branch);
+              } catch (e) {
+                const errMsg = e instanceof Error ? e.message : String(e);
+                logger.warn(`[${logTag}] riff worktree branch push failed (${creation.branch}): ${errMsg}`);
+                await sessionReply(rootId, t('card.repo.riff_worktree_push_failed', { branch: creation.branch, error: errMsg }, loc));
+              }
             }
             await sessionReply(rootId, t('cmd.repo.worktree_created', {
               path: creation.path, branch: creation.branch, base: creation.baseRef,
@@ -1827,7 +2001,21 @@ export async function handleCommand(
           ));
           logger.info(`[${logTag}] /subscribe-lark-doc → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${rebound ? ' (rebound)' : ''}`);
         } catch (err) {
-          if (err instanceof UserTokenMissingError) {
+          // 1069603 重新 OAuth 无法修复；保留实际返回该业务码的身份，避免把
+          // tenant-only 失败误归因到当前用户。只有 token 缺失 / 失效才重新授权。
+          if (err instanceof DocSubscriptionPermissionError) {
+            const identity = err.source === 'user'
+              ? t('cmd.subdoc.permission_identity_user', undefined, loc)
+              : err.source === 'tenant'
+                ? t('cmd.subdoc.permission_identity_tenant', undefined, loc)
+                : err.source === 'both'
+                  ? t('cmd.subdoc.permission_identity_both', undefined, loc)
+                  : t('cmd.subdoc.permission_identity_unknown', undefined, loc);
+            await sessionReply(rootId, t('cmd.subdoc.manage_required', {
+              code: err.larkCode,
+              identity,
+            }, loc));
+          } else if (err instanceof UserTokenMissingError) {
             await replyDocLogin();
           } else {
             await sessionReply(rootId, t('cmd.subdoc.failed', { err: err instanceof Error ? err.message : String(err) }, loc));
@@ -2686,8 +2874,9 @@ export async function handleCommand(
           try {
             const ctrl = new AbortController();
             const tt = setTimeout(() => ctrl.abort(), 5000);
-            const res = await fetch(
-              `http://127.0.0.1:${daemon.ipcPort}/api/sessions/migrate-to-chat`,
+            const res = await fetchDaemonIpc(
+              daemon.ipcPort,
+              '/api/sessions/migrate-to-chat',
               {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
@@ -2868,6 +3057,7 @@ export async function handleCommand(
           t('help.repo_n', undefined, loc),
           t('help.repo_path', undefined, loc),
           t('help.repo_wt', undefined, loc),
+          t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
           t('help.card', undefined, loc),
           t('help.term', undefined, loc),

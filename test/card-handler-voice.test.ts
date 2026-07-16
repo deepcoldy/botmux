@@ -36,6 +36,13 @@ function voiceAction(openMsgId?: string): any {
   return data;
 }
 
+function retryAction(): any {
+  return {
+    operator: { open_id: 'ou_clicker' },
+    action: { value: { action: 'retry_last_task', root_id: 'om_root', session_id: 'sess1', lark_app_id: 'h1', chat_id: 'oc_1' } },
+  };
+}
+
 async function fresh() {
   vi.resetModules();
   const types = await import('../src/core/types.js');
@@ -140,5 +147,73 @@ describe('card-handler voice_summary', () => {
     const res = await handler.handleCardAction(voiceAction('om_card1'), deps, 'h1'); // operator = ou_clicker
     expect(res?.toast?.type).toBe('warning');
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it('keeps the voice button action clean in Codex App while hiding its instruction', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cardvoice-clean-'));
+    const cfg = join(dir, 'bots.json');
+    writeFileSync(cfg, JSON.stringify([{
+      larkAppId: 'h1',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      codexAppCleanInput: true,
+    }], null, 2));
+    process.env.BOTS_CONFIG = cfg;
+    const { types, handler } = await fresh();
+    const send = vi.fn();
+    const ds = fakeSession(send);
+    ds.session.cliId = 'codex-app';
+    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
+
+    await handler.handleCardAction(voiceAction('om_clean_voice'), deps, 'h1');
+
+    const msg = send.mock.calls[0][0];
+    expect(msg.codexAppInput.text).toBe('生成语音总结');
+    expect(msg.codexAppInput.text).not.toContain('botmux send --voice');
+    expect(Object.values(msg.codexAppInput.additionalContext).map((entry: any) => entry.value).join(''))
+      .toContain('botmux send --voice');
+  });
+});
+
+describe('card-handler retry_last_task', () => {
+  it('preserves the clean Codex App sidecar when retrying a completed turn', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cardretry-clean-'));
+    const cfg = join(dir, 'bots.json');
+    writeFileSync(cfg, JSON.stringify([{
+      larkAppId: 'h1',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      codexAppCleanInput: true,
+    }], null, 2));
+    process.env.BOTS_CONFIG = cfg;
+
+    const { types, handler } = await fresh();
+    const send = vi.fn();
+    const ds = fakeSession(send);
+    ds.session.cliId = 'codex-app';
+    ds.lastCliInput = '<user_message>clean retry</user_message>';
+    ds.lastCodexAppInput = {
+      text: 'clean retry',
+      additionalContext: {
+        botmux_sender: { kind: 'untrusted', value: 'sender metadata' },
+      },
+      clientUserMessageId: 'om_original',
+    };
+    ds.lastUserPrompt = 'clean retry';
+    ds.usageLimit = { retryReady: true, retryAtMs: 0, retryLabel: 'now' };
+    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
+
+    await handler.handleCardAction(retryAction(), deps, 'h1');
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0]).toMatchObject({
+      type: 'message',
+      content: '<user_message>clean retry</user_message>',
+      codexAppInput: {
+        text: 'clean retry',
+        additionalContext: ds.lastCodexAppInput.additionalContext,
+      },
+    });
+    expect(send.mock.calls[0][0].codexAppInput).not.toHaveProperty('clientUserMessageId');
   });
 });

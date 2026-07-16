@@ -5,6 +5,9 @@ export type CliOption = {
   label: string;
   gateway?: 'ttadk';
   acceptsModel?: boolean;
+  available?: boolean;
+  command?: string;
+  availabilityReason?: string;
 };
 
 export type CliOptionsState = {
@@ -47,6 +50,7 @@ export type BotDefaultsRow = {
   backendType?: string | null;
   disableStreamingCard?: boolean;
   silentTurnReactions?: boolean;
+  codexAppCleanInput?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
   botToBotSameDir?: boolean;

@@ -174,6 +174,11 @@ export class TmuxPipeBackend implements SessionBackend {
   /** spawn() sets up the pipe-pane subscription + fifo reader. In managed
    *  mode it first creates a detached bmx-* tmux session that runs the CLI. */
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
+    // Self-heal a server polluted by a pre-upgrade botmux before we touch it
+    // (once per daemon process; no-op on a server this build booted clean).
+    // TmuxPipeBackend is the live backend on this path, so the scrub must be
+    // triggered here — TmuxBackend is only used for its static helpers.
+    TmuxBackend.scrubServerGlobalEnvOnce();
     this.cols = opts.cols;
     this.rows = opts.rows;
 

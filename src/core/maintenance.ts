@@ -6,7 +6,7 @@
  * At the scheduled local time (Asia/Shanghai, once/day) it:
  *  - checks the cross-daemon busy gate (anyDaemonBusy) — a session mid-CLI-turn
  *    anywhere defers the run to the next day (no retry);
- *  - auto-update (npm/pnpm global): update the package with its owning package
+ *  - auto-update (npm/pnpm/Bun global): update the package with its owning package
  *    manager, then restart
  *    to apply iff the version actually changed;
  *  - auto-restart: just restart.
@@ -53,7 +53,7 @@ export interface MaintenanceDeps {
   isLocalDev: () => boolean;
   /** Current on-disk botmux version (read fresh — changes after runUpdate). */
   currentVersion: () => string;
-  /** Updates the owning npm/pnpm global install (download/install only). */
+  /** Updates the owning npm/pnpm/Bun global install (download/install only). */
   runUpdate: () => void;
   writeIntent: (intent: RestartIntent) => void;
   /** Spawn a detached `botmux restart` (this process is then killed by pm2). */
@@ -171,8 +171,9 @@ export function globalInstallUpdateCwd(): string {
 export function installLatestBotmuxSync(plan: GlobalInstallPlan = resolveGlobalInstallPlan()): void {
   const result = spawnSync(plan.command, plan.args, {
     cwd: globalInstallUpdateCwd(),
+    env: { ...process.env, ...plan.env },
     stdio: 'inherit',
-    shell: process.platform === 'win32', // resolve npm.cmd / pnpm.cmd
+    shell: process.platform === 'win32', // resolve npm.cmd / pnpm.cmd / bun.exe
   });
   if (result.error) throw result.error;
   if (result.status !== 0) {

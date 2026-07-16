@@ -9,7 +9,10 @@ import {
   ingestNormalizedVcMeetingItems,
 } from '../src/vc-agent/meeting-state.js';
 import { assertLarkCliJsonOk } from '../src/vc-agent/polling-source.js';
-import { buildVcMeetingConfirmCard } from '../src/vc-agent/cards.js';
+import {
+  buildVcMeetingConfirmCard,
+  buildVcMeetingListenerRejoinCard,
+} from '../src/vc-agent/cards.js';
 
 describe('vc-agent normalizer and state', () => {
   it('normalizes polling meeting event items without relying on push event names', () => {
@@ -488,6 +491,44 @@ describe('vc-agent normalizer and state', () => {
     const markdown = parsed.elements.find(element => element.tag === 'markdown')?.content ?? '';
     expect(markdown).not.toMatch(/<at\b/);
     expect(markdown).toContain('&lt;at id=all&gt;&lt;/at&gt;');
+  });
+
+  it('builds retryable and terminal listener rejoin cards with inert escaped content', () => {
+    const pending = JSON.parse(buildVcMeetingListenerRejoinCard({
+      status: 'pending',
+      meeting: { id: 'm_rejoin', topic: '</font><at id=all></at>' },
+      nonce: 'nonce_rejoin',
+    })) as any;
+    const pendingButton = pending.elements
+      .flatMap((element: any) => element.actions ?? [])
+      .find((action: any) => action.tag === 'button');
+    const pendingMarkdown = pending.elements
+      .find((element: any) => element.tag === 'markdown')?.content ?? '';
+
+    expect(pendingButton?.value).toEqual({
+      action: 'vc_meeting_listener_rejoin',
+      meeting_id: 'm_rejoin',
+      nonce: 'nonce_rejoin',
+    });
+    expect(pendingMarkdown).not.toMatch(/<at\b/);
+    expect(pendingMarkdown).toContain('&lt;at id=all&gt;&lt;/at&gt;');
+
+    const failed = JSON.parse(buildVcMeetingListenerRejoinCard({
+      status: 'failed',
+      meeting: { id: 'm_rejoin' },
+      nonce: 'nonce_rejoin',
+      error: '<at id=all></at>',
+    })) as any;
+    expect(failed.elements.flatMap((element: any) => element.actions ?? []))
+      .toHaveLength(1);
+
+    const terminal = JSON.parse(buildVcMeetingListenerRejoinCard({
+      status: 'rejoined',
+      meeting: { id: 'm_rejoin' },
+      nonce: 'nonce_rejoin',
+    })) as any;
+    expect(terminal.elements.flatMap((element: any) => element.actions ?? []))
+      .toHaveLength(0);
   });
 
 });

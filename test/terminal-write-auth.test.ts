@@ -16,12 +16,61 @@
 // grants write even when the platform authenticated the viewer as guest.
 import { describe, it, expect } from 'vitest';
 import {
+  deriveTerminalViewToken,
+  resolveTerminalAccess,
+  resolveTerminalAccessForRequest,
   resolveTerminalWrite,
   resolveTerminalWriteForRequest,
   readDashboardCookie,
+  safeTerminalTokenEqual,
 } from '../src/core/terminal-write-auth.js';
 
 const TOK = 'dash-secret-token';
+
+describe('terminal view capability', () => {
+  it('is stable for one session, domain-bound to the session, and secret-bound', () => {
+    const a = deriveTerminalViewToken('host-secret', 'session-a');
+    expect(a).toBe(deriveTerminalViewToken('host-secret', 'session-a'));
+    expect(a).not.toBe(deriveTerminalViewToken('host-secret', 'session-b'));
+    expect(a).not.toBe(deriveTerminalViewToken('other-secret', 'session-a'));
+  });
+
+  it('compares capabilities safely and rejects empty/wrong values', () => {
+    expect(safeTerminalTokenEqual('same', 'same')).toBe(true);
+    expect(safeTerminalTokenEqual('wrong', 'same')).toBe(false);
+    expect(safeTerminalTokenEqual(null, 'same')).toBe(false);
+  });
+
+  it('grants view but never write to a matching view capability', () => {
+    expect(resolveTerminalAccess({
+      role: undefined,
+      tokenMatches: false,
+      viewTokenMatches: true,
+      platformBound: false,
+      platformProxied: false,
+    })).toEqual({ hasRead: true, hasWrite: false, platformReadonly: false });
+  });
+
+  it('denies a localhost scanner with no capability or authenticated cookie', () => {
+    expect(resolveTerminalAccess({
+      role: undefined,
+      tokenMatches: false,
+      viewTokenMatches: false,
+      platformBound: false,
+      platformProxied: false,
+    })).toEqual({ hasRead: false, hasWrite: false, platformReadonly: false });
+  });
+
+  it('grants both read and write to the independent write capability', () => {
+    expect(resolveTerminalAccess({
+      role: undefined,
+      tokenMatches: true,
+      viewTokenMatches: false,
+      platformBound: false,
+      platformProxied: false,
+    })).toEqual({ hasRead: true, hasWrite: true, platformReadonly: false });
+  });
+});
 
 describe('resolveTerminalWrite (pure gate)', () => {
   describe('role header ignored unless BOTH platform-bound AND platform-proxied', () => {
@@ -156,5 +205,35 @@ describe('resolveTerminalWriteForRequest', () => {
     activeTok = 'rotated-token';
     expect(resolveTerminalWriteForRequest(req, false, isBound, getTok))
       .toEqual({ hasWrite: false, platformReadonly: false });
+  });
+});
+
+describe('resolveTerminalAccessForRequest', () => {
+  const bound = () => true;
+  const unbound = () => false;
+  const token = () => TOK;
+  const cookie = (v: string) => ({ cookie: `botmux_dashboard_token=${v}` });
+
+  it('denies direct no-token and forged-role requests', () => {
+    expect(resolveTerminalAccessForRequest({}, false, false, unbound, token).hasRead).toBe(false);
+    expect(resolveTerminalAccessForRequest({ 'x-botmux-role': 'owner' }, false, false, bound, token))
+      .toEqual({ hasRead: false, hasWrite: false, platformReadonly: false });
+  });
+
+  it('accepts the view capability as read-only', () => {
+    expect(resolveTerminalAccessForRequest({}, false, true, unbound, token))
+      .toEqual({ hasRead: true, hasWrite: false, platformReadonly: false });
+  });
+
+  it('lets an authenticated local dashboard cookie view without platform binding', () => {
+    expect(resolveTerminalAccessForRequest(cookie(TOK), false, false, unbound, token))
+      .toEqual({ hasRead: true, hasWrite: false, platformReadonly: false });
+  });
+
+  it('keeps authenticated platform guest read-only and owner writable', () => {
+    expect(resolveTerminalAccessForRequest({ 'x-botmux-role': 'guest', ...cookie(TOK) }, false, false, bound, token))
+      .toEqual({ hasRead: true, hasWrite: false, platformReadonly: true });
+    expect(resolveTerminalAccessForRequest({ 'x-botmux-role': 'owner', ...cookie(TOK) }, false, false, bound, token))
+      .toEqual({ hasRead: true, hasWrite: true, platformReadonly: false });
   });
 });

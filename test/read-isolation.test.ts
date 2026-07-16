@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   buildSeatbeltProfile,
   evaluateReadIsolationGate,
@@ -7,15 +8,18 @@ import {
   buildV2DenyPaths,
   buildV2DenyRegexes,
   buildV2CarveOuts,
+  buildReadIsolationProtectedWriteRules,
   buildCliExecutableReadCarveOuts,
   buildWriteSandboxRules,
   buildLinuxReadIsolationMasks,
   sendCredFilePath,
   assertSafeAppId,
   normalizeIsolationPath,
+  isolationPaneMarkerContent,
   type V2IsolationContext,
   type WriteSandboxContext,
 } from '../src/adapters/cli/read-isolation.js';
+import { managedOriginCapabilityPath } from '../src/core/managed-origin-capability.js';
 
 const ws = (o: Partial<WriteSandboxContext> = {}): WriteSandboxContext => ({
   homeDir: '/Users/bot',
@@ -31,6 +35,7 @@ const v2 = (o: Partial<V2IsolationContext> = {}): V2IsolationContext => ({
   botmuxHome: '/Users/bot/.botmux',
   sessionDataDir: '/Users/bot/.botmux/data',
   currentAppId: 'cli_self',
+  currentSessionId: 'session-self',
   ...o,
 });
 
@@ -99,6 +104,7 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(d).toContain('/Users/bot/.botmux/data/turn-sends');
     expect(d).toContain('/Users/bot/.botmux/data/queues');        // all bots' inbound message content
     expect(d).toContain('/Users/bot/.botmux/data/read-isolation'); // profiles enumerate sibling sessions
+    expect(d).toContain('/Users/bot/.botmux/data/.botmux-cli-pids'); // live cross-session tuples
     // schedules.json is a read-modify-write store — denying the read makes a
     // sandboxed `botmux schedule` load an empty map then overwrite the shared
     // file, wiping every bot's tasks. Deliberately NOT denied (accept the minor
@@ -119,6 +125,72 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(d).not.toContain('/Users/bot/.botmux/data/sessions-cli_self.json');
     expect(d).not.toContain('/Users/bot/.botmux/config.json');         // config readable
     expect(d).not.toContain('/Users/bot/.lark-cli-bots/cli_self');     // own lark readable
+  });
+
+  it('denies dashboard credentials at the fixed home and custom BOTMUX_HOME', () => {
+    const custom = v2({
+      botmuxHome: '/srv/botmux',
+      sessionDataDir: '/srv/botmux/data',
+    });
+    const deny = buildV2DenyPaths(custom);
+    for (const path of [
+      '/Users/bot/.botmux/.dashboard-secret',
+      '/Users/bot/.botmux/.dashboard-token',
+      '/srv/botmux/.dashboard-secret',
+      '/srv/botmux/.dashboard-token',
+      '/srv/botmux/data/.botmux-cli-pids',
+    ]) expect(deny).toContain(path);
+
+    const regexes = buildV2DenyRegexes(custom).map(pattern => new RegExp(pattern));
+    for (const path of [
+      '/Users/bot/.botmux/.dashboard-secret.123.tmp',
+      '/Users/bot/.botmux/.dashboard-token.repair.lock',
+      '/Users/bot/.botmux/.dashboard-secret.repair-seed',
+      '/srv/botmux/.dashboard-secret.456.tmp',
+      '/srv/botmux/.dashboard-token.repair.lock',
+      '/srv/botmux/.dashboard-secret.repair-seed',
+    ]) expect(regexes.some(regex => regex.test(path))).toBe(true);
+    expect(regexes.some(regex => regex.test('/Users/bot/.botmux/.dashboard-secretx'))).toBe(false);
+  });
+
+  it('uses the canonical fixed dashboard root for exact and sidecar rules', () => {
+    const ctx = v2({
+      defaultBotmuxHome: '/private/state/default-botmux',
+      botmuxHome: '/srv/botmux',
+      sessionDataDir: '/srv/botmux/data',
+    });
+    expect(buildV2DenyPaths(ctx)).toContain(
+      '/private/state/default-botmux/.dashboard-secret',
+    );
+    const regexes = buildV2DenyRegexes(ctx).map(pattern => new RegExp(pattern));
+    expect(regexes.some(regex => regex.test(
+      '/private/state/default-botmux/.dashboard-secret.repair-seed',
+    ))).toBe(true);
+    const protectedWrites = buildReadIsolationProtectedWriteRules(ctx);
+    expect(protectedWrites.denyWriteLiterals).toContain('/private/state/default-botmux');
+  });
+
+  it('protects both lexical root entries and canonical authority targets', () => {
+    const canonical = v2({
+      homeDir: '/private/home/bot',
+      defaultBotmuxHome: '/private/state/default-botmux',
+      botmuxHome: '/private/state/custom-botmux',
+      sessionDataDir: '/private/state/custom-botmux/data',
+    });
+    const rules = buildReadIsolationProtectedWriteRules(canonical, {
+      dashboardRoots: ['/Users/bot/.botmux', '/srv/botmux'],
+      sessionDataDirs: ['/srv/botmux/data'],
+    });
+    for (const root of [
+      '/private/state/default-botmux',
+      '/private/state/custom-botmux',
+      '/private/state/custom-botmux/data',
+      '/Users/bot/.botmux',
+      '/srv/botmux',
+      '/srv/botmux/data',
+    ]) expect(rules.denyWriteLiterals).toContain(root);
+    expect(rules.denyWritePaths).toContain('/Users/bot/.botmux/.dashboard-secret');
+    expect(rules.denyWritePaths).toContain('/srv/botmux/data/read-isolation');
   });
 
   it('denies per-bot session stores by filename PATTERN, re-allows only the own one', () => {
@@ -223,12 +295,14 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
       '/Users/bot/.lark-cli-bots/cli_self',
       '/Users/bot/.botmux/data/sessions-cli_self.json',
       '/Users/bot/.botmux/data/attachments/cli_self',
+      managedOriginCapabilityPath('/Users/bot/.botmux/data', 'session-self'),
     ]);
     // traverse shim on each wholesale-denied parent (stat/realpath, not listing)
     expect(carve.traverseDirs).toEqual([
       '/Users/bot/.botmux/bots',
       '/Users/bot/.lark-cli-bots',
       '/Users/bot/.botmux/data/attachments',
+      '/Users/bot/.botmux/data/read-isolation',
     ]);
     expect(carve.finalDenyPaths).toEqual([]);
     // an admin deny UNDER the own BOT_HOME must WIN over the carve-out → goes to finalDeny
@@ -295,6 +369,49 @@ describe('buildSeatbeltProfile (verified format)', () => {
       buildV2DenyPaths(v2()), carve.allowPaths, carve.finalDenyPaths, carve.traverseDirs);
     expect(prof.indexOf(`(deny file-read* (subpath "${extra}"))`))
       .toBeGreaterThan(prof.indexOf('(allow file-read* (subpath "/Users/bot/.botmux/bots/cli_self"))'));
+  });
+
+  it('carves only the current session capability and keeps its parent immutable', () => {
+    const ownCapability = managedOriginCapabilityPath(
+      '/Users/bot/.botmux/data',
+      'session-self',
+    );
+    const siblingCapability = managedOriginCapabilityPath(
+      '/Users/bot/.botmux/data',
+      'session-sibling',
+    );
+    const carve = buildV2CarveOuts(v2());
+    expect(carve.allowPaths).toContain(ownCapability);
+    expect(carve.allowPaths).not.toContain(siblingCapability);
+
+    const parent = '/Users/bot/.botmux/data/read-isolation';
+    const protectedWrites = buildReadIsolationProtectedWriteRules(v2());
+    const prof = buildSeatbeltProfile(
+      buildV2DenyPaths(v2()),
+      carve.allowPaths,
+      carve.finalDenyPaths,
+      carve.traverseDirs,
+      buildV2DenyRegexes(v2()),
+      undefined,
+      protectedWrites,
+    );
+    const readAllow = `(allow file-read* (subpath "${ownCapability}"))`;
+    const writeDeny = `(deny file-write* (subpath "${parent}"))`;
+    expect(prof).toContain(readAllow);
+    expect(prof).toContain(writeDeny);
+    expect(prof.indexOf(writeDeny)).toBeGreaterThan(prof.indexOf(readAllow));
+    expect(prof).toContain(
+      '(deny file-write* (subpath "/Users/bot/.botmux/.dashboard-secret"))',
+    );
+    expect(prof).toContain(
+      '(deny file-write* (regex #"^/Users/bot/\\.botmux/\\.dashboard-secret(?:\\.|$)"))',
+    );
+    expect(prof).toContain(
+      '(deny file-write* (literal "/Users/bot/.botmux"))',
+    );
+    expect(prof).toContain(
+      '(deny file-write* (literal "/Users/bot/.botmux/data"))',
+    );
   });
 
   it('no allowPaths → deny-only profile', () => {
@@ -456,6 +573,21 @@ describe('Linux read isolation (buildLinuxReadIsolationMasks)', () => {
     for (const p of shouldMatch) expect(linux).toContain(p);
   });
 
+  it('masks fixed-home and custom-root dashboard credentials on Linux', () => {
+    const ctx = v2({
+      botmuxHome: '/srv/botmux',
+      sessionDataDir: '/srv/botmux/data',
+    });
+    const masks = buildLinuxReadIsolationMasks({ ctx, siblingAppIds: [] }).hidePaths;
+    for (const path of [
+      '/Users/bot/.botmux/.dashboard-secret',
+      '/Users/bot/.botmux/.dashboard-token',
+      '/srv/botmux/.dashboard-secret',
+      '/srv/botmux/.dashboard-token',
+      '/srv/botmux/data/.botmux-cli-pids',
+    ]) expect(masks).toContain(path);
+  });
+
   it('folds bots.json sidecars + skips unsafe sibling ids', () => {
     const r = buildLinuxReadIsolationMasks({
       ctx: v2(),
@@ -470,15 +602,48 @@ describe('Linux read isolation (buildLinuxReadIsolationMasks)', () => {
 });
 
 describe('isolatedPaneReattachSafe', () => {
-  it('trusts any pane that carries an isolation marker', () => {
-    // Marker present → pane was spawned isolated → still confined across daemon
-    // restarts → safe warm reattach (preserves resume + tmux idle-suspend).
-    expect(isolatedPaneReattachSafe('boot-abc')).toBe(true);
-    expect(isolatedPaneReattachSafe('any-old-boot-id')).toBe(true);
+  it('trusts only panes stamped with the current isolation policy version', () => {
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent('boot-abc'))).toBe(true);
+    // Legacy unversioned or older-policy panes keep their old Seatbelt rules in
+    // memory and must be killed + cold-spawned after a security upgrade.
+    expect(isolatedPaneReattachSafe('boot-abc')).toBe(false);
+    expect(isolatedPaneReattachSafe(JSON.stringify({ version: 1, bootId: 'old' }))).toBe(false);
     // No / blank marker → pane was NOT spawned isolated → unsafe (kill + cold-spawn).
     expect(isolatedPaneReattachSafe(null)).toBe(false);
     expect(isolatedPaneReattachSafe(undefined)).toBe(false);
     expect(isolatedPaneReattachSafe('')).toBe(false);
     expect(isolatedPaneReattachSafe('   ')).toBe(false);
+  });
+});
+
+describe('worker capability carve-out ordering', () => {
+  const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+
+  it('replaces a planted capability symlink before canonicalizing allow paths', () => {
+    const publishAt = source.indexOf('publishSandboxRelayCapability({ failClosed: true })');
+    const canonicalizeAt = source.indexOf(
+      'carve.allowPaths.map(path => path === capabilityCarvePath ? path : canonical(path))',
+    );
+    expect(publishAt).toBeGreaterThanOrEqual(0);
+    expect(canonicalizeAt).toBeGreaterThan(publishAt);
+    expect(source).toContain('replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(');
+    expect(source).toContain('marker = readRegularHostFileNoFollow(');
+  });
+});
+
+describe('CLI protected capability wiring', () => {
+  const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+  const vcSource = readFileSync(new URL('../src/cli/vc-agent.ts', import.meta.url), 'utf8');
+
+  it('passes the session id when resolving protected turn snapshots', () => {
+    expect(cliSource).toContain(
+      'const liveMarkerCtx = resolveSessionContext(\n    resolveDataDir(),\n    process.env.BOTMUX_SESSION_ID,',
+    );
+    expect(cliSource).toContain(
+      'const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);',
+    );
+    expect(vcSource).toContain(
+      'const liveOrigin = resolveSessionContext(config.session.dataDir, receiverSessionId);',
+    );
   });
 });

@@ -39,7 +39,6 @@ export const dashboardRoutes: DashboardRoute[] = [
       return root => mod.renderPluginPage(root);
     },
   },
-  pageRoute('legacy-workflow', '#/legacy-workflow', () => import('./legacy-workflow-page.js'), 'renderLegacyWorkflowPage'),
   pageRoute('workflows', '#/workflows', () => import('./v3-page.js'), 'renderV3RunsPage'),
   pageRoute('groups', '#/groups', () => import('./groups-page.js'), 'renderGroupsPage'),
   pageRoute('settings', '#/settings', () => import('./settings-page.js'), 'renderSettingsPage'),

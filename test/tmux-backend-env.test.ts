@@ -553,6 +553,46 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
     },
   );
 
+  it.skipIf(!hasEnvBin)(
+    'wrapper clears every stale managed value before injecting this pane values',
+    () => {
+      const cwd = tmpdir();
+      const result = spawnSync(
+        '/bin/sh',
+        ['-c', SCRIPT, '_', cwd,
+          '__OWNER_OPEN_ID=ou_fresh',
+          'BOTMUX_SESSION_ID=fresh-session',
+          'BOTMUX_CHAT_ID=fresh-chat',
+          '/usr/bin/env',
+        ],
+        { encoding: 'utf-8', env: {
+          __OWNER_OPEN_ID: 'ou_stale',
+          BOTMUX_SESSION_ID: 'stale-session',
+          BOTMUX_CHAT_ID: 'stale-chat',
+          IS_SANDBOX: '1',
+          CLAUDE_CONFIG_DIR: '/stale/claude',
+          CODEX_HOME: '/stale/codex',
+          HERMES_HOME: '/stale/hermes',
+          HERMES_BOTMUX_SOURCE_HOME: '/stale/hermes-source',
+          HERMES_BOTMUX_PROFILES_ROOT: '/stale/hermes-profiles',
+          PATH: '/usr/bin:/bin',
+          HOME: '/tmp',
+        } },
+      );
+      expect(result.status).toBe(0);
+      const lines = result.stdout.split('\n');
+      expect(lines).toContain('__OWNER_OPEN_ID=ou_fresh');
+      expect(lines).toContain('BOTMUX_SESSION_ID=fresh-session');
+      expect(lines).toContain('BOTMUX_CHAT_ID=fresh-chat');
+      for (const key of [
+        'IS_SANDBOX', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'HERMES_HOME',
+        'HERMES_BOTMUX_SOURCE_HOME', 'HERMES_BOTMUX_PROFILES_ROOT',
+      ]) {
+        expect(lines.some(line => line.startsWith(`${key}=`)), key).toBe(false);
+      }
+    },
+  );
+
   const hasTmux = !spawnSync('tmux', ['-V']).error;
   it.skipIf(!hasEnvBin || !hasTmux)(
     'tmux child does NOT inherit bare LARK_APP_* from a server started with them in scope (Codex repro)',

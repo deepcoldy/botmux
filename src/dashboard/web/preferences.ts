@@ -85,6 +85,25 @@ export function writeStoredSessionsShowUnknownChats(storage: Storage | undefined
   }
 }
 
+// ── 创建会话弹窗「连续创建」开关（创建成功后不关闭弹窗）────────────────────────
+export const SESSIONS_CREATE_KEEP_OPEN_STORAGE_KEY = 'botmux.dashboard.sessions.createKeepOpen';
+
+export function readStoredCreateKeepOpen(storage: Storage | undefined): boolean {
+  try {
+    return storage?.getItem(SESSIONS_CREATE_KEEP_OPEN_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function writeStoredCreateKeepOpen(storage: Storage | undefined, keepOpen: boolean): void {
+  try {
+    storage?.setItem(SESSIONS_CREATE_KEEP_OPEN_STORAGE_KEY, keepOpen ? '1' : '0');
+  } catch {
+    // localStorage 不可用时只在当前页生效
+  }
+}
+
 // ── 看板分组维度：工作流列 / 团队（筛选某团队的工作流）/ 机器人列 ─────────────
 export type KanbanGroupBy = 'flow' | 'team' | 'bot';
 

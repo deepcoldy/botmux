@@ -4,6 +4,8 @@ import {
   createOpenPlatformAppWithClient,
   listOpenPlatformApps,
   fetchOpenPlatformAppSecret,
+  nextAppVersion,
+  OpenPlatformApiError,
   type OpenPlatformApiClient,
 } from '../src/setup/open-platform-automation.js';
 
@@ -76,16 +78,25 @@ describe('truncateToWidth', () => {
 function stubClient(responses: unknown[] | ((path: string, body: unknown) => unknown)): OpenPlatformApiClient & { calls: Array<{ path: string; body: unknown }> } {
   const calls: Array<{ path: string; body: unknown }> = [];
   const queue = Array.isArray(responses) ? [...responses] : null;
+  // 镜像真实 client:业务错误码(code!==0)会抛 OpenPlatformApiError,而不是把
+  // 错误响应当正常返回值——否则 catch 分支永远测不到。
+  const throwIfError = (resp: unknown) => {
+    const r = resp as { code?: unknown; msg?: unknown };
+    if (r && typeof r === 'object' && typeof r.code === 'number' && r.code !== 0) {
+      throw new OpenPlatformApiError(`code=${r.code} msg=${r.msg ?? ''}`, resp);
+    }
+    return resp;
+  };
   return {
     apiOrigin: 'https://open.feishu.cn',
     calls,
     async postJson(path: string, body?: unknown) {
       calls.push({ path, body });
-      return queue ? queue.shift() : (responses as (p: string, b: unknown) => unknown)(path, body);
+      return throwIfError(queue ? queue.shift() : (responses as (p: string, b: unknown) => unknown)(path, body));
     },
     async postForm(path: string, body: FormData) {
       calls.push({ path, body });
-      return queue ? queue.shift() : (responses as (p: string, b: unknown) => unknown)(path, body);
+      return throwIfError(queue ? queue.shift() : (responses as (p: string, b: unknown) => unknown)(path, body));
     },
   };
 }
@@ -149,25 +160,29 @@ describe('fetchOpenPlatformAppSecret', () => {
 });
 
 describe('createOpenPlatformAppWithClient', () => {
-  it('uploads the botmux icon, creates a named self-built app, then reads its secret', async () => {
+  it('uploads the icon, creates via template, publishes an enabling version, then reads its secret', async () => {
     const client = stubClient([
-      { code: 0, data: { url: 'https://cdn.example/botmux.png' } },
-      { code: 0, data: { ClientID: 'cli_new' } },
-      { code: 0 },
-      { code: 0 },
-      { code: 0, data: { secret: 'new-secret' } },
+      { code: 0, data: { url: 'https://cdn.example/botmux.png' } }, // upload/image
+      { code: 0, data: { ClientID: 'cli_new' } },                  // upsert_by_template
+      { code: 0 },                                                 // robot/switch
+      { code: 0 },                                                 // event/switch
+      { code: 0, data: { versionId: 'v-init' } },                  // app_version/create（启用发布）
+      { code: 0 },                                                 // publish/commit
+      { code: 0, data: { secret: 'new-secret' } },                 // secret
     ]);
 
-    await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-2' })).resolves.toEqual({
+    await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-2', creatorUserId: 'u_creator' })).resolves.toEqual({
       appId: 'cli_new',
       appSecret: 'new-secret',
     });
 
     expect(client.calls.map(call => call.path)).toEqual([
       '/developers/v1/app/upload/image',
-      '/developers/v1/app/create',
+      '/developers/v1/manifest/upsert_by_template',
       '/developers/v1/robot/switch/cli_new',
       '/developers/v1/event/switch/cli_new',
+      '/developers/v1/app_version/create/cli_new',
+      '/developers/v1/publish/commit/cli_new/v-init',
       '/developers/v1/secret/cli_new',
     ]);
     const upload = client.calls[0].body as FormData;
@@ -175,13 +190,61 @@ describe('createOpenPlatformAppWithClient', () => {
     expect(upload.get('isIsv')).toBe('false');
     expect(upload.get('scale')).toBe(JSON.stringify({ width: 512, height: 512 }));
     expect(client.calls[1].body).toMatchObject({
-      appSceneType: 0,
-      name: 'botmux-2',
-      avatar: 'https://cdn.example/botmux.png',
-      primaryLang: 'zh_cn',
+      appManifestTemplateID: 'developer_console',
+      createAppUserCustomField: {
+        i18n: { zh_cn: { name: 'botmux-2' } },
+        avatar: 'https://cdn.example/botmux.png',
+        primaryLang: 'zh_cn',
+      },
     });
     expect(client.calls[2].body).toEqual({ clientId: 'cli_new', enable: true });
     expect(client.calls[3].body).toEqual({ clientId: 'cli_new', eventMode: 4 });
+    // 启用发布用极简版本 payload,可见成员含创建者(否则发布后不自动上架启用)
+    expect(client.calls[4].body).toMatchObject({
+      appVersion: '1.0.0',
+      visibleSuggest: { members: ['u_creator'], isAll: 0 },
+      pcDefaultAbility: 'bot',
+      mobileDefaultAbility: 'bot',
+    });
+    expect(client.calls[4].body).not.toHaveProperty('applyReasonConfig');
+    expect(client.calls[5].body).toEqual({ clientId: 'cli_new' });
+  });
+
+  it('fails closed (with appId) when the enabling publish commit fails — no silent orphan', async () => {
+    const client = stubClient([
+      { code: 0, data: { url: 'https://cdn.example/botmux.png' } },
+      { code: 0, data: { ClientID: 'cli_commit_fail' } },
+      { code: 0 },
+      { code: 0 },
+      { code: 0, data: { versionId: 'v-init' } }, // 版本创建成功
+      { code: 1, msg: 'publish commit rejected' }, // commit 失败 → 抛
+    ]);
+    await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-cf', creatorUserId: 'u_creator' }))
+      .rejects.toMatchObject({ appId: 'cli_commit_fail' });
+    // 不再有 soft 兜底:走到 publish/commit 就抛,不读 secret
+    expect(client.calls.map(c => c.path)).toEqual([
+      '/developers/v1/app/upload/image',
+      '/developers/v1/manifest/upsert_by_template',
+      '/developers/v1/robot/switch/cli_commit_fail',
+      '/developers/v1/event/switch/cli_commit_fail',
+      '/developers/v1/app_version/create/cli_commit_fail',
+      '/developers/v1/publish/commit/cli_commit_fail/v-init',
+    ]);
+  });
+
+  it('fails closed (with appId) when the enabling version create returns no versionId (outcome unknown)', async () => {
+    const client = stubClient([
+      { code: 0, data: { url: 'https://cdn.example/botmux.png' } },
+      { code: 0, data: { ClientID: 'cli_noverid' } },
+      { code: 0 },
+      { code: 0 },
+      { code: 0, data: {} }, // code=0 但没 versionId → 可能留下未发布草稿
+    ]);
+    await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-nv', creatorUserId: 'u_creator' }))
+      .rejects.toMatchObject({ appId: 'cli_noverid' });
+    // 没 versionId → 不 commit、不读 secret
+    expect(client.calls.some(c => c.path.includes('/publish/commit/'))).toBe(false);
+    expect(client.calls.some(c => c.path.includes('/secret/'))).toBe(false);
   });
 
   it('retains the created app id in the error when secret reading fails', async () => {
@@ -190,9 +253,36 @@ describe('createOpenPlatformAppWithClient', () => {
       { code: 0, data: { ClientID: 'cli_orphan_guard' } },
       { code: 0 },
       { code: 0 },
-      { code: 0, data: {} },
+      { code: 0, data: { versionId: 'v-init' } },
+      { code: 0 },
+      { code: 0, data: {} }, // secret 缺失
     ]);
-    await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-3' }))
+    await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-3', creatorUserId: 'u_creator' }))
       .rejects.toThrow(/cli_orphan_guard.*AppSecret/);
+  });
+});
+
+describe('nextAppVersion', () => {
+  it('increments the patch of the highest PUBLISHED version', () => {
+    expect(nextAppVersion({ data: { versions: [
+      { appVersion: '1.0.0', versionStatus: 2 },
+      { appVersion: '1.0.1', versionStatus: 2 },
+    ] } })).toBe('1.0.2');
+  });
+
+  it('starts at 0.0.1 when there are no versions', () => {
+    expect(nextAppVersion({ data: { versions: [] } })).toBe('0.0.1');
+  });
+
+  it('accounts for UNPUBLISHED draft versions so the next number never collides', () => {
+    // 上架启用发布若留下未发布草稿 1.0.0(status 1),二次发版必须算 1.0.1 而非
+    // 0.0.1——否则平台按「版本号未递增」拒掉,应用永远停在未启用。
+    expect(nextAppVersion({ data: { versions: [
+      { appVersion: '1.0.0', versionStatus: 1 },
+    ] } })).toBe('1.0.1');
+    expect(nextAppVersion({ data: { versions: [
+      { appVersion: '2.3.4', versionStatus: 1 },
+      { appVersion: '1.0.0', versionStatus: 2 },
+    ] } })).toBe('2.3.5');
   });
 });

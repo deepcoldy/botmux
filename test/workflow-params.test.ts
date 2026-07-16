@@ -1,7 +1,7 @@
 /**
  * Tests for the shared `coerceWorkflowParams` module.
  *
- * Locks the IM (`/template run`) and CLI (`botmux workflow run`) input
+ * Locks the v3 Saved Workflow IM/CLI input
  * coercion contract: type / required / default / unknown-rejection rules,
  * plus the JSON-channel escape hatch for `object` / `array` params.
  */
@@ -12,7 +12,9 @@ import {
   coerceWorkflowParams,
   coerceWorkflowParamsFromStrings,
   ParamCoerceFailure,
-} from '../src/workflows/params.js';
+  validateWorkflowParamSchema,
+  type WorkflowParamSchemaOwner,
+} from '../src/workflows/shared/params.js';
 
 const DEF = parseWorkflowDefinition({
   workflowId: 'wf-params',
@@ -194,5 +196,131 @@ describe('coerceWorkflowParams — RawParamInput (CLI mixed channel)', () => {
       config: { mode: 'safe' },
       tags: ['a', 'b'],
     });
+  });
+});
+
+describe('engine-neutral param schema validation', () => {
+  it('keeps legacy v2 coercion compatible while strict validation is opt-in', () => {
+    const legacyOwner: WorkflowParamSchemaOwner = {
+      params: {
+        token: { type: 'string', format: 'secret', default: 'legacy-default' },
+        count: { type: 'number', default: 'legacy-string-default' },
+      },
+    };
+
+    expect(coerceWorkflowParams(legacyOwner, {})).toEqual({
+      token: 'legacy-default',
+      count: 'legacy-string-default',
+    });
+    expect(() => validateWorkflowParamSchema(legacyOwner)).toThrow();
+  });
+
+  it('accepts a plain schema owner without a v2 WorkflowDefinition', () => {
+    const owner: WorkflowParamSchemaOwner = {
+      params: {
+        city: { type: 'string', required: true },
+        days: { type: 'number', default: 3 },
+      },
+    };
+
+    expect(coerceWorkflowParamsFromStrings(owner, { city: '上海' })).toEqual({
+      city: '上海',
+      days: 3,
+    });
+  });
+
+  it.each([
+    ['string', 'x'],
+    ['number', 0],
+    ['boolean', false],
+    ['object', {}],
+    ['array', []],
+  ] as const)('accepts a %s default of the declared type', (type, value) => {
+    expect(() => validateWorkflowParamSchema({ params: { value: { type, default: value } } }))
+      .not.toThrow();
+  });
+
+  it.each([
+    ['string', 1],
+    ['number', '1'],
+    ['boolean', 0],
+    ['object', []],
+    ['array', {}],
+  ] as const)('rejects a %s param with a mismatched default', (type, value) => {
+    expect(() => validateWorkflowParamSchema({ params: { value: { type, default: value } } }))
+      .toThrow(/default 必须是/);
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'rejects a non-finite number default (%s)',
+    (value) => {
+      expect(() => validateWorkflowParamSchema({ params: { count: { type: 'number', default: value } } }))
+        .toThrow(/default 必须是 number/);
+    },
+  );
+
+  it.each(['bad.name', 'bad/name', 'has space', '__proto__', 'prototype', 'constructor'])(
+    'rejects unsafe parameter name %s',
+    (name) => {
+      const params = Object.create(null) as Record<string, { type: 'string' }>;
+      params[name] = { type: 'string' };
+      expect(() => validateWorkflowParamSchema({ params })).toThrow(/参数名 .* 非法/);
+    },
+  );
+
+  it('allows names that match the existing params.<segment> grammar', () => {
+    expect(() => validateWorkflowParamSchema({
+      params: {
+        city: { type: 'string' },
+        retry_count: { type: 'number' },
+        'dry-run': { type: 'boolean' },
+        '2026': { type: 'string' },
+      },
+    })).not.toThrow();
+  });
+
+  it('forbids defaults for sensitive declarations and recognized secret formats', () => {
+    try {
+      validateWorkflowParamSchema({
+        params: {
+          apiToken: { type: 'string', sensitive: true, default: 'embedded' },
+          password: { type: 'string', format: 'password', default: 'embedded' },
+        },
+      });
+      throw new Error('expected throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ParamCoerceFailure);
+      expect((err as ParamCoerceFailure).issues.map((issue) => issue.code))
+        .toEqual(['sensitive_default', 'sensitive_default']);
+    }
+  });
+
+  it('still accepts non-secret format metadata and runtime secret values', () => {
+    const owner: WorkflowParamSchemaOwner = {
+      params: {
+        date: { type: 'string', format: 'date', default: '2026-07-10' },
+        token: { type: 'string', format: 'secret', required: true },
+      },
+    };
+    expect(coerceWorkflowParamsFromStrings(owner, { token: 'runtime-only' })).toEqual({
+      date: '2026-07-10',
+      token: 'runtime-only',
+    });
+  });
+
+  it('reports a runtime-invalid declaration type instead of silently coercing it', () => {
+    const owner = {
+      params: { value: { type: 'integer' } },
+    } as unknown as WorkflowParamSchemaOwner;
+    try {
+      validateWorkflowParamSchema(owner);
+      throw new Error('expected throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ParamCoerceFailure);
+      expect((err as ParamCoerceFailure).issues[0]).toMatchObject({
+        name: 'value',
+        code: 'invalid_param_type',
+      });
+    }
   });
 });

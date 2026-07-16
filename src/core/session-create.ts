@@ -2,6 +2,7 @@
 // 协作提示的 prompt 组装、会话标题推导。与 DOM / Lark API / 进程管理解耦，便于
 // 单测。daemon 侧 /api/sessions/spawn 与 session-manager 的 spawn/activate 复用。
 import { t, type Locale } from '../i18n/index.js';
+import type { CliTurnPayload } from '../types.js';
 
 /** 协作模式：
  *  - 'all'  「一起开工」——每个被选 bot 各起一条会话、拿同一份内容。
@@ -81,6 +82,20 @@ export function buildCollabNote(coworkers: Coworker[], locale?: Locale): string 
   return `<botmux_collab>${t('cmd.createSession.collab_note', { peers: names }, locale)}</botmux_collab>`;
 }
 
+/** System-generated dashboard role context kept separate from the human task
+ * for Codex App clean-input materialization. Legacy CLIs still receive the
+ * concatenated string from composeSpawnUserContent(). */
+export function composeSpawnCodexAppContext(args: {
+  role: SpawnRole;
+  coworkers?: Coworker[];
+  locale?: Locale;
+}): string | undefined {
+  const coworkers = args.coworkers ?? [];
+  if (args.role === 'lead') return buildLeadDispatchPreamble(coworkers, args.locale);
+  if (args.role === 'collab') return buildCollabNote(coworkers, args.locale) || undefined;
+  return undefined;
+}
+
 /** 组装喂给 buildNewTopicPrompt 的「用户内容」——按角色在原始 content 前拼上
  *  lead 编排前言 / 协作提示。solo 原样返回。 */
 export function composeSpawnUserContent(args: {
@@ -89,16 +104,49 @@ export function composeSpawnUserContent(args: {
   coworkers?: Coworker[];
   locale?: Locale;
 }): string {
-  const { content, role, locale } = args;
-  const coworkers = args.coworkers ?? [];
-  if (role === 'lead') {
-    return `${buildLeadDispatchPreamble(coworkers, locale)}\n\n${content}`;
+  const context = composeSpawnCodexAppContext(args);
+  return context ? `${context}\n\n${args.content}` : args.content;
+}
+
+/** Merge a parked dashboard task with the first message that activates it.
+ * The legacy prompt combines queuedPrompt + current wrapped prompt elsewhere;
+ * this helper independently combines only raw user texts and metadata-only
+ * contexts so the visible Codex App turn neither drops nor duplicates the
+ * original dashboard task. */
+export function mergeQueuedCodexAppTurn(args: {
+  queued: boolean;
+  queuedText?: string;
+  queuedMessageContext?: string;
+  currentText: string;
+  currentMessageContext?: string;
+}): { text: string; messageContext?: string } {
+  if (!args.queued) {
+    return {
+      text: args.currentText,
+      ...(args.currentMessageContext ? { messageContext: args.currentMessageContext } : {}),
+    };
   }
-  if (role === 'collab') {
-    const note = buildCollabNote(coworkers, locale);
-    return note ? `${note}\n\n${content}` : content;
-  }
-  return content;
+  const text = [args.queuedText, args.currentText].filter(Boolean).join('\n\n') || args.currentText;
+  const messageContext = [args.queuedMessageContext, args.currentMessageContext].filter(Boolean).join('\n\n');
+  return { text, ...(messageContext ? { messageContext } : {}) };
+}
+
+/** Final compatibility gate for a queued dashboard task activated by a topic
+ * reply. Sessions parked before clean-input was introduced have queuedPrompt
+ * but no queuedCodexAppText. Their legacy content already contains both the
+ * queued task and the current reply, while the newly-built structured sidecar
+ * can only contain the current reply. Remove that incomplete sidecar so Codex
+ * App consumes the complete legacy prompt instead.
+ *
+ * A valid string field (including an explicitly stored empty string) identifies
+ * the new schema. Missing, null, or malformed persisted values fail closed to
+ * legacy content. Non-Codex payloads have no sidecar and remain unchanged. */
+export function applyQueuedCodexAppLegacyFallback(
+  payload: CliTurnPayload,
+  args: { queued: boolean; queuedText?: unknown },
+): CliTurnPayload {
+  if (!args.queued || typeof args.queuedText === 'string' || !payload.codexAppInput) return payload;
+  return { content: payload.content };
 }
 
 export interface SpawnRequest {

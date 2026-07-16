@@ -20,7 +20,6 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.owner_only',
   'card.dashboard.overview.not_implemented_yet',
   'card.dashboard.sessions.not_implemented_yet',
-  'card.dashboard.workflows.not_implemented_yet',
   'card.dashboard.groups.not_implemented_yet',
   'card.dashboard.schedules.not_implemented_yet',
   'card.dashboard.settings.not_implemented_yet',  // still referenced if C4 dispatch ever falls back
@@ -121,43 +120,6 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.schedules.delivery_failed',
   'card.dashboard.schedules.schedule_not_found',
 
-  // ─── workflows card (PR3 slice 1) ───────────────────────────────────
-  'card.dashboard.workflows.title',
-  'card.dashboard.workflows.count_summary',
-  'card.dashboard.workflows.empty',
-  'card.dashboard.workflows.refresh',
-  'card.dashboard.workflows.prev',
-  'card.dashboard.workflows.next',
-  'card.dashboard.workflows.jump_page',
-  'card.dashboard.workflows.progress_label',
-  'card.dashboard.workflows.started_label',
-  'card.dashboard.workflows.updated_label',
-  'card.dashboard.workflows.dm_sent',
-  'card.dashboard.workflows.dm_failed',
-  'card.dashboard.workflows.list_failed',
-
-  // ─── workflows card (PR3 slice 2a) — detail card + cancel action ────
-  'card.dashboard.workflows.row_detail',
-  'card.dashboard.workflows.detail.title',
-  'card.dashboard.workflows.detail.workflow_label',
-  'card.dashboard.workflows.detail.run_label',
-  'card.dashboard.workflows.detail.status_label',
-  'card.dashboard.workflows.detail.started_label',
-  'card.dashboard.workflows.detail.updated_label',
-  'card.dashboard.workflows.detail.finished_label',
-  'card.dashboard.workflows.detail.elapsed_label',
-  'card.dashboard.workflows.detail.progress_label',
-  'card.dashboard.workflows.detail.chat_label',
-  'card.dashboard.workflows.detail.nodes_header',
-  'card.dashboard.workflows.btn.cancel',
-  'card.dashboard.workflows.btn.back',
-  'card.dashboard.workflows.confirm.cancel.title',
-  'card.dashboard.workflows.confirm.cancel.text',
-  'card.dashboard.workflows.cancel.disabled.alreadyTerminal',
-  'card.dashboard.workflows.cancel.disabled.noOwner',
-  'card.dashboard.workflows.cancel_failed',
-  'card.dashboard.workflows.workflow_not_found',
-
   // ─── groups card (PR3 slice 1) ──────────────────────────────────────
   'card.dashboard.groups.title',
   'card.dashboard.groups.count_summary',
@@ -215,13 +177,11 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.overview.settings_section',
   'card.dashboard.overview.settings_summary',
   'card.dashboard.overview.groups_section',
-  'card.dashboard.overview.workflows_section',
   'card.dashboard.overview.refresh',
   'card.dashboard.overview.goto_sessions',
   'card.dashboard.overview.goto_schedules',
   'card.dashboard.overview.goto_settings',
   'card.dashboard.overview.goto_groups',
-  'card.dashboard.overview.goto_workflows',
   'card.dashboard.overview.back_button',
   'card.dashboard.overview.dm_sent',
   'card.dashboard.overview.dm_failed',
@@ -337,11 +297,6 @@ describe('PR3 dashboard i18n key symmetry', () => {
 });
 
 describe('PR3 zh dashboard copy sanity', () => {
-  it('overview workflow entry uses Chinese module labels', () => {
-    expect(zhMessages['card.dashboard.overview.workflows_section']).toBe('🌀 工作流');
-    expect(zhMessages['card.dashboard.overview.goto_workflows']).toBe('📂 工作流');
-  });
-
   it('zh dashboard dictionary does not expose English module names in UI labels', () => {
     const allowedEnglish = [
       // Product / permission terms kept as-is in the Chinese UI.

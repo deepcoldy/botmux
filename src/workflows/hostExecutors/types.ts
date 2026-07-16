@@ -1,35 +1,11 @@
-import type { EventLog } from '../events/append.js';
-import type { ErrorClass, ErrorCode } from '../events/payloads.js';
-
 /**
- * Runtime context handed to every hostExecutor invocation.  The caller
- * (workflow scheduler/worker) is responsible for already having written:
- *   - `attemptCreated` (with this `nodeId/activityId/attemptId`)
- *   - `leaseSigned`
- *   - `activityRunning`
- * before invoking the side-effect protocol.  This context only needs the
- * tuple required to derive `idempotencyKey` plus the event log handle so
- * the protocol can record its 3 events (`effectAttempted`,
- * `activitySucceeded`/`activityFailed`).
- */
-export type HostExecutorContext = {
-  log: EventLog;
-  runId: string;
-  workflowId: string;
-  revisionId: string;
-  nodeId: string;
-  activityId: string;
-  attemptId: string;
-};
-
-/**
- * Classified executor error.  Executors that can give precise error codes
- * (Feishu 230011 etc.) return a typed result; everything else falls back
- * to `UnknownProviderError` / `manual` (events doc v0.1.2 §3.3).
+ * Provider classification consumed by the v3 host runtime. This type is
+ * intentionally independent of the retired v2 event schema; v3 validates
+ * and bounds values before persisting them in its journal.
  */
 export type ExecutorErrorClassification = {
-  errorCode: ErrorCode;
-  errorClass: ErrorClass;
+  errorCode: string;
+  errorClass: 'retryable' | 'fatal' | 'userFault' | 'manual';
   /** Human-readable detail; truncated to 4KB upstream. */
   errorMessage: string;
 };
@@ -44,8 +20,8 @@ export interface SideEffectingExecutor<Input, Output> {
   readonly provider: string;
 
   /**
-   * Provider TTL.  Feeds `effectAttempted.idempotencyTtlMs` and the
-   * resume reconciler's TTL-vs-manual decision (events doc §4.3.1).
+   * Provider TTL used by durable recovery to choose safe re-submit vs manual
+   * reconciliation.
    */
   readonly idempotencyTtlMs: number;
 
@@ -57,6 +33,20 @@ export interface SideEffectingExecutor<Input, Output> {
    * `content`) so that retries can detect input drift.
    */
   canonicalInput(input: Input): unknown;
+
+  /**
+   * Pure, last-moment validation of a previously frozen/approved payload.
+   * This runs immediately before the durable provider intent is published.
+   * It must not mutate provider state. Time-sensitive inputs (notably a
+   * one-shot schedule) use it to force a fresh attempt + fresh approval when
+   * the approved payload is no longer executable.
+   */
+  validateBeforeIntent?(
+    input: Input,
+    nowMs: number,
+  ):
+    | { ok: true }
+    | { ok: false; errorCode: string; message: string };
 
   /**
    * Invoke the provider.  `idempotencyKey` is the runtime-derived

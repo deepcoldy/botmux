@@ -12,6 +12,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { fetchDaemonIpc } from '../core/daemon-ipc-auth.js';
 
 // ── 类型 ───────────────────────────────────────────────────────────────────────
 
@@ -114,8 +115,9 @@ export async function queryAdoptSession(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 2000);
   try {
-    const res = await fetch(
-      `http://127.0.0.1:${ipcPort}/api/adopt-session/${pid}`,
+    const res = await fetchDaemonIpc(
+      ipcPort,
+      `/api/adopt-session/${pid}`,
       { signal: controller.signal },
     );
     if (!res.ok) return null;

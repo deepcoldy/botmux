@@ -239,6 +239,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     ...bot,
     disableStreamingCard: body.disableStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
+    codexAppCleanInput: body.codexAppCleanInput,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
     botToBotSameDir: body.botToBotSameDir,
@@ -507,6 +508,7 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
           </section>
           <section className="bd-tile">
             <CardBehaviorSection bot={bot} putCardPref={putCardPref} />
+            <CodexAppDisplaySection bot={bot} putCardPref={putCardPref} />
             <SummaryTriggerSection bot={bot} patchBot={patchBot} />
             <BrandSection bot={bot} patchBot={patchBot} />
           </section>
@@ -823,7 +825,9 @@ export function BotAgentSection(props: {
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, { cliId: cliKey, model });
       if (res.ok && res.body.ok) {
-        setAgentStatus({ text: `✓ ${tr('botDefaults.agentSaved')}`, ok: true });
+        setAgentStatus(res.body.availabilityWarning
+          ? { text: `⚠️ ${res.body.availabilityWarning}` }
+          : { text: `✓ ${tr('botDefaults.agentSaved')}`, ok: true });
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
           wrapperCli: res.body.wrapperCli ?? null,
@@ -890,7 +894,9 @@ export function BotAgentSection(props: {
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const cliOptions = cliState.options.map(option => ({
     value: option.id,
-    label: `${option.label}（${option.id}）`,
+    label: option.available === false
+      ? tr('botDefaults.agentMissingOption', { label: option.label, command: option.command ?? option.id })
+      : `${option.label}（${option.id}）`,
   }));
   const dynamicSkillOptions = [
     { value: 'dynamic', label: tr('botDefaults.skillInjectionDynamic') },
@@ -919,6 +925,11 @@ export function BotAgentSection(props: {
             options={cliOptions}
             onChange={updateCli}
           />
+          {option?.available === false ? (
+            <small className="hint-warn">
+              {tr('botDefaults.agentMissingHint', { command: option.command ?? cliKey })}
+            </small>
+          ) : null}
         </div>
       </div>
       {!isRiff && (
@@ -1543,6 +1554,54 @@ function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: Ca
       <div className="actions">
         <small data-card-pref-moot className="hint-warn-inline" hidden={!disableStreaming}>{tr('botDefaults.writableLinkMoot')}</small>
         <StatusSpan status={status} attr={{ 'data-card-pref-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+  const tr = useT();
+  const [cleanInput, setCleanInput] = useState(props.bot.codexAppCleanInput === true);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => setCleanInput(props.bot.codexAppCleanInput === true), [props.bot.codexAppCleanInput]);
+
+  async function save(checked: boolean): Promise<void> {
+    const previous = cleanInput;
+    setCleanInput(checked);
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await props.putCardPref({ codexAppCleanInput: checked });
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setCleanInput(previous);
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setCleanInput(previous);
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section" data-codex-app-display>
+      <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAppDisplay')}</h3>
+      <ToggleRow
+        checked={cleanInput}
+        disabled={busy}
+        dataAction="toggle-codex-app-clean-input"
+        title={tr('botDefaults.codexAppCleanInput')}
+        help={tr('botDefaults.codexAppCleanInputHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <small className="bd-section-note">{tr('botDefaults.codexAppCleanInputCompat')}</small>
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-codex-app-clean-input-status': '' }} />
       </div>
     </section>
   );

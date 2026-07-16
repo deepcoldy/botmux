@@ -41,6 +41,21 @@ describe('parseApiMessage metadata', () => {
     });
     expect(result.rootId).toBe('omt_thread');
   });
+
+  it('surfaces server-provided sender_name (with_sender_name=true reads)', () => {
+    const msg = makeMsg('text', { text: 'hi' });
+    msg.sender = { id: 'ou_bot', sender_type: 'app', sender_name: 'Premium(Claude)' } as any;
+    const result = parseApiMessage(msg);
+    expect(result.senderName).toBe('Premium(Claude)');
+    expect(result.senderType).toBe('app');
+  });
+
+  it('omits senderName when the server supplies none or blank', () => {
+    expect(parseApiMessage(makeMsg('text', { text: 'hi' })).senderName).toBeUndefined();
+    const blank = makeMsg('text', { text: 'hi' });
+    blank.sender = { id: 'ou_x', sender_type: 'user', sender_name: '  ' } as any;
+    expect(parseApiMessage(blank).senderName).toBeUndefined();
+  });
 });
 
 // ─── Interactive card: Format A (Lark API simplified) ─────────────────────

@@ -3,20 +3,23 @@
  * build an update command that targets that same install.
  *
  * Detection is deliberately conservative: writing with the wrong package
- * manager can create a second, inactive botmux copy. npm and pnpm are
- * supported; known Yarn/Bun layouts are identified for diagnostics but are
- * rejected until their global-dir/bin-dir semantics are handled explicitly.
+ * manager can create a second, inactive botmux copy. npm, pnpm, and Bun are
+ * supported; known Yarn layouts are identified for diagnostics but rejected
+ * until their global-dir/bin-dir semantics are handled explicitly.
  */
 import { posix, win32 } from 'node:path';
 import { botmuxInstallRoot } from './install-info.js';
 
-export type GlobalInstallManager = 'npm' | 'pnpm';
-export type DetectedInstallManager = GlobalInstallManager | 'yarn' | 'bun' | 'unknown';
+export type GlobalInstallManager = 'npm' | 'pnpm' | 'bun';
+export type DetectedInstallManager = GlobalInstallManager | 'yarn' | 'unknown';
 
 export interface GlobalInstallPlan {
   manager: GlobalInstallManager;
   command: GlobalInstallManager;
   args: string[];
+  /** Package-manager-specific environment needed to keep the update in the
+   *  install location that owns the running botmux process. */
+  env?: Record<string, string>;
   /** Stable package root after the update. pnpm's runtime realpath is versioned,
    *  so this points at the global node_modules/botmux symlink instead. */
   activePackageRoot: string;
@@ -48,7 +51,7 @@ export function detectGlobalInstallManager(
   // path. Match it before the generic node_modules layouts below.
   if (root.includes('/.pnpm/')) return 'pnpm';
 
-  // Known unsupported managers must never fall through to npm, especially on
+  // Known non-npm managers must never fall through to npm, especially on
   // Windows where all three can end in <prefix>/node_modules/botmux.
   if (root.includes('/.bun/install/global/node_modules/botmux')
     || root.includes('/bun/install/global/node_modules/botmux')) return 'bun';
@@ -105,6 +108,25 @@ export function resolveGlobalInstallPlan(
       command: 'pnpm',
       args: ['add', '-g', '--global-dir', globalDir, spec],
       activePackageRoot: path.join(globalInstallDir, 'node_modules', 'botmux'),
+    };
+  }
+
+  if (manager === 'bun') {
+    // Bun supports explicit global package/bin locations through environment
+    // variables. Pin both to the layout that owns the running package so a
+    // different bunfig.toml or BUN_INSTALL value cannot create an inactive
+    // second install during an update.
+    const globalDir = path.dirname(path.dirname(packageRoot));
+    const bunRoot = path.dirname(path.dirname(globalDir));
+    return {
+      manager,
+      command: 'bun',
+      args: ['add', '-g', spec],
+      env: {
+        BUN_INSTALL_GLOBAL_DIR: globalDir,
+        BUN_INSTALL_BIN: path.join(bunRoot, 'bin'),
+      },
+      activePackageRoot: packageRoot,
     };
   }
 

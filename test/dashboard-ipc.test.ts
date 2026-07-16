@@ -4,9 +4,11 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
+import * as larkClient from '../src/im/lark/client.js';
 import * as oncallStore from '../src/services/oncall-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
@@ -24,6 +26,20 @@ function tokenAuthHeaders(secret = TEST_IPC_SECRET): Record<string, string> {
   const nonce = randomBytes(8).toString('hex');
   const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
   return { 'X-Botmux-Cli-Ts': ts, 'X-Botmux-Cli-Nonce': nonce, 'X-Botmux-Cli-Auth': sig };
+}
+
+function trustedHostHeaders(
+  method: string,
+  path: string,
+  port: number,
+  secret = TEST_IPC_SECRET,
+): Record<string, string> {
+  const auth = signCliAuth(secret, cliAuthBind(method, path, port));
+  return {
+    'X-Botmux-Cli-Ts': auth.ts,
+    'X-Botmux-Cli-Nonce': auth.nonce,
+    'X-Botmux-Cli-Auth': auth.sig,
+  };
 }
 
 function parseSseFrame(raw: string): { type: string; body: any } | null {
@@ -99,6 +115,105 @@ describe('dashboard IPC server', () => {
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/nope`);
     expect(res.status).toBe(404);
   });
+
+  it('denies sandbox-like loopback reads and mutations but accepts route-bound trusted-host calls', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    let mutations = 0;
+    const mutationPath = '/api/test-receiver-ipc-mutation';
+    ipcRoute('POST', mutationPath, (_req, res) => {
+      mutations += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const base = `http://127.0.0.1:${handle.port}`;
+
+    const leakedRead = await fetch(`${base}/api/sessions`);
+    expect(leakedRead.status).toBe(401);
+    expect(mutations).toBe(0);
+
+    const forgedMutation = await fetch(`${base}${mutationPath}`, { method: 'POST' });
+    expect(forgedMutation.status).toBe(401);
+    expect(mutations).toBe(0);
+
+    const trustedRead = await fetch(`${base}/api/sessions`, {
+      headers: trustedHostHeaders('GET', '/api/sessions', handle.port),
+    });
+    expect(trustedRead.status).toBe(200);
+
+    const trustedMutation = await fetch(`${base}${mutationPath}`, {
+      method: 'POST',
+      headers: trustedHostHeaders('POST', mutationPath, handle.port),
+    });
+    expect(trustedMutation.status).toBe(200);
+    expect(mutations).toBe(1);
+
+    const wrongRoute = await fetch(`${base}${mutationPath}`, {
+      method: 'POST',
+      headers: trustedHostHeaders('GET', '/api/sessions', handle.port),
+    });
+    expect(wrongRoute.status).toBe(401);
+    expect(mutations).toBe(1);
+
+    const rotatedSecret = 'test-ipc-secret-rotated-deadbeef';
+    setIpcAuthSecret(rotatedSecret);
+    const staleSecret = await fetch(`${base}/api/sessions`, {
+      headers: trustedHostHeaders('GET', '/api/sessions', handle.port),
+    });
+    expect(staleSecret.status).toBe(401);
+    const currentSecret = await fetch(`${base}/api/sessions`, {
+      headers: trustedHostHeaders('GET', '/api/sessions', handle.port, rotatedSecret),
+    });
+    expect(currentSecret.status).toBe(200);
+  });
+});
+
+describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
+  it('is default-off and persists explicit on/off changes immediately', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-codex-clean-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-codex-clean-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex-app',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.codexAppCleanInput).toBe(false);
+
+      const on = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codexAppCleanInput: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, codexAppCleanInput: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexAppCleanInput).toBe(true);
+
+      const off = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codexAppCleanInput: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, codexAppCleanInput: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexAppCleanInput).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('GET /api/sessions', () => {
@@ -116,6 +231,63 @@ describe('GET /api/sessions/:sessionId', () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/nonexistent-id`);
     expect(res.status).toBe(404);
+  });
+});
+
+describe('POST /api/sessions/:sessionId/rename', () => {
+  it('updates the canonical title and requests native sync from a live Codex worker', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-session-rename-'));
+    const prevDataDir = config.session.dataDir;
+    const events: any[] = [];
+    const off = dashboardEventBus.subscribe(event => events.push(event));
+    const send = vi.fn();
+    let findSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init();
+      const session = sessionStore.createSession('oc_rename', 'om_rename', 'Old title', 'group');
+      session.cliId = 'codex';
+      session.cliPathOverride = '/bin/codex';
+      session.backendType = 'tmux';
+      sessionStore.updateSession(session);
+
+      findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+        session,
+        worker: { killed: false, connected: true, send },
+        workerPort: 1234,
+        workerToken: 'token',
+        larkAppId: 'app',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: '1',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+      } as any);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/rename`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ title: '  New\tTitle\u001b  ' }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true, title: 'New Title', agentSync: 'requested' });
+      expect(sessionStore.getSession(session.sessionId)?.title).toBe('New Title');
+      expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'New Title' });
+      expect(events).toContainEqual({
+        type: 'session.update',
+        body: { sessionId: session.sessionId, patch: { title: 'New Title' } },
+      });
+    } finally {
+      findSpy?.mockRestore();
+      off();
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -362,6 +534,53 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
 });
 
 describe('POST /api/sessions/:sessionId/resume', () => {
+  it('rejects a managed VC receiver without reactivating or waking it', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-'));
+    const prevConfigDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init();
+      workerPool.setActiveSessionsRegistry(registry);
+
+      const session = sessionStore.createSession('oc_listener', 'oc_listener', '[Meeting] meeting-42', 'group');
+      session.larkAppId = '';
+      session.scope = 'chat';
+      session.cliId = 'codex' as any;
+      session.workingDir = process.cwd();
+      session.vcMeetingReceiver = {
+        listenerAppId: 'listener-app',
+        meetingId: 'meeting-42',
+        memberId: 'member-agent',
+        memberEpoch: 7,
+      };
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(
+        `http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume?wake=1`,
+        { method: 'POST' },
+      );
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        ok: false,
+        error: 'vc_receiver_managed',
+      });
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
+      expect(registry.size).toBe(0);
+      expect(forkSpy).not.toHaveBeenCalled();
+    } finally {
+      forkSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('wakes a resumed session immediately when wake=1 is set', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-'));
     const prevDataDir = process.env.SESSION_DATA_DIR;
@@ -1257,6 +1476,47 @@ describe('POST /api/groups/create', () => {
     bindSpy.mockRestore();
     addSpy.mockRestore();
     createSpy.mockRestore();
+  });
+});
+
+describe('POST /api/groups/transfer-owner', () => {
+  it('completes a deferred transfer by union_id and notifies the new owner', async () => {
+    setLarkAppId('test-app');
+    const transferSpy = vi.spyOn(groupsStore, 'transferChatOwner').mockResolvedValue({ ok: true });
+    const notifySpy = vi.spyOn(larkClient, 'sendMessage').mockResolvedValue('om_owner');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/transfer-owner`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chatId: 'oc_new', ownerUnionId: 'on_operator' }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      ok: true,
+      ownerTransferredTo: 'on_operator',
+      transferError: null,
+      notifyMessageId: 'om_owner',
+    });
+    expect(transferSpy).toHaveBeenCalledWith('test-app', 'oc_new', 'on_operator', 'union_id');
+    expect(notifySpy).toHaveBeenCalledWith(
+      'test-app', 'oc_new', '<at user_id="on_operator"></at>', 'text',
+    );
+    notifySpy.mockRestore();
+    transferSpy.mockRestore();
+  });
+
+  it('rejects malformed chat or union ids before calling Feishu', async () => {
+    setLarkAppId('test-app');
+    const transferSpy = vi.spyOn(groupsStore, 'transferChatOwner').mockResolvedValue({ ok: true });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/transfer-owner`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chatId: 'bad', ownerUnionId: 'ou_wrong_scope' }),
+    });
+    expect(res.status).toBe(400);
+    expect(transferSpy).not.toHaveBeenCalled();
+    transferSpy.mockRestore();
   });
 });
 

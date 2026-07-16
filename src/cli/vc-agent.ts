@@ -19,6 +19,9 @@ import { loadBotConfigs, registerBot } from '../bot-registry.js';
 import { config } from '../config.js';
 import { listVcMeetingRuntimeSessions } from '../services/vc-meeting-runtime-store.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
+import { resolveSessionContext } from '../core/session-marker.js';
+import { fetchDaemonIpc } from '../core/daemon-ipc-auth.js';
+import { readManagedOriginCapability } from '../core/managed-origin-capability.js';
 import type { NormalizedVcMeetingItem } from '../vc-agent/types.js';
 
 const VC_AGENT_SPEAK_MAX_TEXT_LENGTH = 200;
@@ -280,10 +283,62 @@ async function cmdRequestOutput(args: string[]): Promise<void> {
   if (fallbackText && fallbackText.length > VC_AGENT_SPEAK_MAX_TEXT_LENGTH) {
     throw new Error(`--fallback-text is too long; keep output within ${VC_AGENT_SPEAK_MAX_TEXT_LENGTH} characters`);
   }
+
+  // A dedicated meeting receiver must submit to its *own* daemon first. The
+  // daemon binds the rotating worker capability / live marker to the durable
+  // delivery attempt, then forwards a trusted request to the listener hub.
+  // Ordinary legacy sessions fall through to the old listener endpoint.
+  const receiverSessionId = process.env.BOTMUX_SESSION_ID;
+  const receiverAppId = process.env.BOTMUX_LARK_APP_ID;
+  const receiverPortRaw = Number(process.env.BOTMUX_DAEMON_IPC_PORT);
+  const liveOrigin = resolveSessionContext(config.session.dataDir, receiverSessionId);
+  const relayDir = process.env.BOTMUX_SEND_RELAY;
+  const originCapability = readManagedOriginCapability(
+    config.session.dataDir,
+    receiverSessionId,
+    relayDir,
+  )?.capability;
+  const discoveredReceiver = receiverAppId ? findOnlineDaemon(receiverAppId) : null;
+  const receiverPort = Number.isSafeInteger(receiverPortRaw) && receiverPortRaw > 0
+    ? receiverPortRaw
+    : discoveredReceiver?.ipcPort;
+  if (receiverSessionId && receiverAppId && receiverPort) {
+    const managedResponse = await fetch(`http://127.0.0.1:${receiverPort}/api/vc-meetings/action-request`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        receiverSessionId,
+        expectedListenerAppId: larkAppId,
+        expectedMeetingId: meetingId,
+        channel,
+        content,
+        ...(reason ? { reason } : {}),
+        ...(fallbackText ? { fallbackText } : {}),
+        ...(liveOrigin?.turnId ? { originTurnId: liveOrigin.turnId } : {}),
+        ...(liveOrigin?.dispatchAttempt !== undefined
+          ? { originDispatchAttempt: liveOrigin.dispatchAttempt }
+          : {}),
+        ...(originCapability ? { originCapability } : {}),
+      }),
+    });
+    const managedRaw = await managedResponse.text();
+    let managedBody: unknown = managedRaw;
+    try { managedBody = managedRaw ? JSON.parse(managedRaw) : {}; } catch { /* print raw */ }
+    const errorCode = managedBody && typeof managedBody === 'object'
+      && typeof (managedBody as { errorCode?: unknown }).errorCode === 'string'
+      ? (managedBody as { errorCode: string }).errorCode
+      : undefined;
+    if (managedResponse.status < 400 || errorCode !== 'not_receiver_session') {
+      console.log(typeof managedBody === 'string' ? managedBody : JSON.stringify(managedBody, null, 2));
+      if (managedResponse.status >= 400) process.exit(2);
+      return;
+    }
+  }
+
   ensureBotRegistryLoaded();
   const daemon = findOnlineDaemon(larkAppId);
   if (!daemon) throw new Error(`daemon offline for ${larkAppId}`);
-  const response = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/vc-meetings/output-request`, {
+  const response = await fetchDaemonIpc(daemon.ipcPort, '/api/vc-meetings/output-request', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({

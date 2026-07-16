@@ -107,7 +107,7 @@ export interface GlobalSkillConfig {
 }
 
 export interface MaintenanceConfig {
-  /** At `time` (once/day) update the owning npm/pnpm global install to the
+  /** At `time` (once/day) update the owning npm/pnpm/Bun global install to the
    *  latest version — download/install only, never restarts on its own.
    *  Disabled for local-dev and unsupported install layouts. */
   autoUpdate?: MaintenanceTask;

@@ -14,13 +14,9 @@ import {
   v3LoopGrantCardNonce,
   type V3LoopGrantActionValue,
 } from './v3-loop-grant-card.js';
-import { requestV3LoopGrant, loopExhaustedInfoFor } from '../../workflows/v3/daemon-run.js';
+import { requestV3LoopGrant, loopExhaustedInfoFor, readV3RunChatBinding } from '../../workflows/v3/daemon-run.js';
 import { readJournal } from '../../workflows/v3/journal.js';
-import {
-  readGrillState,
-  defaultBaseDir,
-  type RunChatBinding,
-} from '../../workflows/v3/grill-state.js';
+import { defaultBaseDir, type RunChatBinding } from '../../workflows/v3/grill-state.js';
 import { isValidRunId } from '../../workflows/v3/ops-projection.js';
 
 export function isV3LoopGrantAction(action: unknown): boolean {
@@ -62,8 +58,7 @@ export async function handleV3LoopGrantAction(
     return { toast: { type: 'warning', content: '追加卡已失效（nonce 不匹配）' } };
   }
   const runDir = join(baseDir, value.runId);
-  const grill = readGrillState(runDir);
-  const binding = grill?.chatBinding;
+  const binding = readV3RunChatBinding(runDir);
 
   if (deps.canResolve && !deps.canResolve(binding, operatorOpenId)) {
     return { toast: { type: 'warning', content: '你没有权限给这个 loop 追加轮数' } };

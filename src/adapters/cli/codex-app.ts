@@ -69,6 +69,13 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return writeRunnerInput(pty, '::botmux-codex-app:', content);
     },
 
+    async writeStructuredInput(pty, content, codexAppInput) {
+      // The legacy prompt remains in the control payload as a compatibility
+      // fallback. The runner uses the sidecar only on supported app-server
+      // versions and never reverse-parses the XML-ish legacy envelope.
+      return writeRunnerInput(pty, '::botmux-codex-app:', content, codexAppInput);
+    },
+
     completionPattern: undefined,
     readyPattern: /›/,
     systemHints: [],

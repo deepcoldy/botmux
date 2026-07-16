@@ -17,7 +17,7 @@ describe('worker pipe initial screen ordering', () => {
 
   it('runs a busy-pattern idle probe after each submitted input', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const writeIdx = source.indexOf('result = await cliAdapter.writeInput(backend, msg);');
+    const writeIdx = source.indexOf('result = item.codexAppInput && cliAdapter.writeStructuredInput');
     const probeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);');
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
 
@@ -179,10 +179,18 @@ describe('worker pipe initial screen ordering', () => {
     expect(guard).toContain('TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId))');
     expect(guard.indexOf('TmuxBackend.hasSession')).toBeLessThan(guard.indexOf('probeTmuxFunctional'));
     // The decision is made by the pure gate helper, and a gate posts an
-    // actionable card + throws — it must NOT silently downgrade to pty.
+    // actionable error IPC + throws — it must NOT silently downgrade to pty.
+    // The daemon renders WorkerToDaemon.error to Lark, avoiding the old
+    // user_notify + error duplicate.
     expect(guard).toContain('decideBackendGate(');
-    expect(guard).toContain("send({ type: 'user_notify'");
+    expect(guard).toContain('throw new Error(backendGateUserMessage(');
     expect(guard).not.toContain("effectiveBackend = 'pty'");
+    expect(source).toContain('await sendAndFlush({');
+    // The crash-loop relaunch carries the message's own durable attempt so a
+    // meeting delivery relaunch failure is attributed to the right receipt
+    // (not the stale currentBotmux* from a prior IM turn).
+    expect(source).toContain('await sendFatalWorkerErrorAndExit(err, msg.turnId, msg.dispatchAttempt)');
+    expect(source).toContain('await sendFatalWorkerErrorAndExit(err);');
   });
 
   it('wires adoptCliPid/cliCwd on herdr adopt (parity with tmux/zellij for grok writeInput)', () => {

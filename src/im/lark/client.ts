@@ -123,7 +123,22 @@ const listBotsApiFailures = new Map<string, { reason: string; expiresAt: number 
  * idempotencyKey here so retries don't re-send.  Existing callers omit
  * the param and get exactly the pre-Step-6 behavior.
  */
-export async function sendMessage(larkAppId: string, chatId: string, content: string, msgType: string = 'text', uuid?: string, hookContext?: Record<string, unknown>): Promise<string> {
+export interface OutboundMessageOptions {
+  /** The provider request is reconciling an already-attempted stable UUID.
+   * Lark deduplicates the message, but the local outbound hook is a separate
+   * side effect and must not be fired twice. */
+  suppressHook?: boolean;
+}
+
+export async function sendMessage(
+  larkAppId: string,
+  chatId: string,
+  content: string,
+  msgType: string = 'text',
+  uuid?: string,
+  hookContext?: Record<string, unknown>,
+  options?: OutboundMessageOptions,
+): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
@@ -153,15 +168,17 @@ export async function sendMessage(larkAppId: string, chatId: string, content: st
   const messageId = res.data?.message_id;
   if (!messageId) throw new Error('No message_id in response');
   logger.info(`Sent message ${messageId} to chat ${chatId}`);
-  emitHookEvent('outbound.send', {
-    ...hookContext,
-    larkAppId,
-    chatId,
-    messageId,
-    msgType,
-    uuid,
-    content,
-  });
+  if (!options?.suppressHook) {
+    emitHookEvent('outbound.send', {
+      ...hookContext,
+      larkAppId,
+      chatId,
+      messageId,
+      msgType,
+      uuid,
+      content,
+    });
+  }
   return messageId;
 }
 
@@ -172,7 +189,16 @@ export async function sendMessage(larkAppId: string, chatId: string, content: st
  * spike report §1.4 for the reply-specific test results, including the
  * cross-parent dedupe behavior that informs the inputHash design.
  */
-export async function replyMessage(larkAppId: string, messageId: string, content: string, msgType: string = 'text', replyInThread: boolean = false, uuid?: string, hookContext?: Record<string, unknown>): Promise<string> {
+export async function replyMessage(
+  larkAppId: string,
+  messageId: string,
+  content: string,
+  msgType: string = 'text',
+  replyInThread: boolean = false,
+  uuid?: string,
+  hookContext?: Record<string, unknown>,
+  options?: OutboundMessageOptions,
+): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
@@ -202,16 +228,18 @@ export async function replyMessage(larkAppId: string, messageId: string, content
   const replyId = res.data?.message_id;
   if (!replyId) throw new Error('No message_id in reply response');
   logger.info(`Replied ${replyId} to message ${messageId} [msgType=${msgType}, replyInThread=${replyInThread}]`);
-  emitHookEvent('outbound.reply', {
-    ...hookContext,
-    larkAppId,
-    messageId,
-    replyId,
-    msgType,
-    replyInThread,
-    uuid,
-    content,
-  });
+  if (!options?.suppressHook) {
+    emitHookEvent('outbound.reply', {
+      ...hookContext,
+      larkAppId,
+      messageId,
+      replyId,
+      msgType,
+      replyInThread,
+      uuid,
+      content,
+    });
+  }
   return replyId;
 }
 
@@ -671,6 +699,10 @@ export async function getMessageDetail(
   const userCardContent = options.userCardContent ?? true;
   const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
     ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
+    // Opt into server-side sender names (sender_name / sender_i18n_names, for
+    // user AND bot senders); without it the server omits them. Matters here for
+    // merge_forward sub-messages, whose senders appear nowhere else.
+    with_sender_name: 'true',
   });
   if (res.code !== 0) {
     throw new Error(`Failed to get message: ${res.msg} (code: ${res.code})`);
@@ -1014,6 +1046,7 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
       container_id: threadId,
       page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
       sort_type: 'ByCreateTimeAsc',
+      with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
 
@@ -1052,6 +1085,7 @@ export async function listChatMessages(
       container_id: chatId,
       page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
       sort_type: 'ByCreateTimeDesc',
+      with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
 
@@ -1100,6 +1134,7 @@ export async function listChatMessagesUntil(
       container_id: chatId,
       page_size: pageSize,
       sort_type: 'ByCreateTimeDesc',
+      with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
 
@@ -1188,6 +1223,7 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
       container_id: chatId,
       page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
       sort_type: 'ByCreateTimeDesc',
+      with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
 

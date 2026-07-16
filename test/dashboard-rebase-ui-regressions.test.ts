@@ -12,6 +12,18 @@ function labelsContainingCustomDropdown(source: string): string[] {
 }
 
 describe('dashboard master feature integration', () => {
+  it('keeps the default-off Codex App clean-history switch wired into Bot defaults', () => {
+    const page = dashboardSource('bot-defaults-page.tsx');
+    const types = dashboardSource('bot-defaults.ts');
+    const messages = dashboardSource('i18n.ts');
+
+    expect(types).toContain('codexAppCleanInput?: boolean');
+    expect(page).toContain('<CodexAppDisplaySection bot={bot} putCardPref={putCardPref} />');
+    expect(page).toContain('dataAction="toggle-codex-app-clean-input"');
+    expect(messages).toContain('默认关闭，保持原有兼容行为');
+    expect(messages).toContain('still reach the model, but move to hidden context');
+  });
+
   it('keeps substitute mode configurable from the React bot defaults page', () => {
     const page = dashboardSource('bot-defaults-page.tsx');
     const types = dashboardSource('bot-defaults.ts');

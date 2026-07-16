@@ -358,6 +358,7 @@ describe('handleFederationSpokeApi', () => {
     await handleFederationSpokeApi(makeReq('POST', '/api/team/federated-group', { name: 'g', larkAppIds: ['cli_local'] }), res, url('/api/team/federated-group'), { dataDir, createTeamGroup: createTeamGroup as any });
     expect(res.statusCode).toBe(200);
     expect(captured.ownerUnionIds).toContain('on_operator'); // operator pulled in
+    expect(captured.transferOwnerUnionId).toBe('on_operator'); // operator, not an arbitrary bot owner, receives ownership
     expect(json(res).missingOperatorIdentity).toBeFalsy();
   });
 
@@ -402,6 +403,7 @@ describe('handleFederationSpokeApi', () => {
     expect(json(res).chatId).toBe('oc_x');
     expect(captured.larkAppIds.sort()).toEqual(['cli_local', 'cli_remote']);
     expect(captured.ownerUnionIds.sort()).toEqual(['on_local', 'on_remote']); // both bots' owners pulled in
+    expect(captured.transferOwnerUnionId).toBeUndefined(); // deployment operator is unbound; do not pick a bot owner
     // unknown bot (not on aggregated roster) → 400, never delegated
     res = makeRes();
     await handleFederationSpokeApi(makeReq('POST', '/api/team/federated-group', { larkAppIds: ['cli_ghost'] }), res, url, { dataDir, createTeamGroup: createTeamGroup as any });

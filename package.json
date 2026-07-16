@@ -19,7 +19,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc && cp src/setup/lark-scopes.json dist/setup/ && pnpm dashboard:bundle && chmod +x dist/cli.js",
+    "build": "node scripts/clean-dist.mjs && tsc && cp src/setup/lark-scopes.json dist/setup/ && pnpm dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs",
     "dashboard:bundle": "node scripts/build-dashboard.mjs",
     "dashboard:watch": "node scripts/build-dashboard.mjs --watch",
     "daemon": "tsx src/index-daemon.ts",
@@ -56,6 +56,7 @@
     "markdown-it": "^14.1.1",
     "node-pty": "^1.1.0",
     "pm2": "^6.0.0",
+    "proxy-agent": "^6.5.0",
     "qrcode-terminal": "^0.12.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",

@@ -61,6 +61,7 @@ describe('CLI plugin generation', () => {
     });
     expect(first.pluginManifest.pluginIds).toEqual(['demo']);
     expect(first.prompt).toContain('botmux skill show browser');
+    expect(first.skillCatalog).toContain('botmux skill show browser');
     expect(readSessionSkillManifest('same-session')?.prioritySkills.map(skill => skill.name)).toEqual(['browser']);
 
     const refreshed = prepareCliPluginGeneration({
@@ -77,6 +78,7 @@ describe('CLI plugin generation', () => {
     });
     expect(refreshed.pluginManifest.pluginIds).toEqual([]);
     expect(refreshed.prompt).toContain('<botmux_skills_refresh>');
+    expect(refreshed.skillCatalog).toContain('<botmux_skills_refresh>');
     expect(refreshed.prompt).toContain('Skills not listed here are no longer available');
     expect(readSessionPluginManifest('same-session', dataDir)?.pluginIds).toEqual([]);
     expect(readSessionSkillManifest('same-session')).toBeNull();

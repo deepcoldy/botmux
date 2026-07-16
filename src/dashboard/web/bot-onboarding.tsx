@@ -52,6 +52,9 @@ type CliOption = {
   label: string;
   gateway?: 'ttadk';
   acceptsModel?: boolean;
+  available?: boolean;
+  command?: string;
+  availabilityReason?: string;
 };
 
 type CliOptionsState = {
@@ -108,6 +111,13 @@ function defaultFormState(): OnboardingFormState {
     workingDir: '~',
     model: '',
   };
+}
+
+export function isOnboardingSubmitDisabled(
+  submitting: boolean,
+  sessionMode: 'checking' | 'reuse' | 'qr',
+): boolean {
+  return submitting || sessionMode === 'checking';
 }
 
 function caughtErrorText(error: unknown): string {
@@ -421,7 +431,9 @@ function OnboardingForm(props: {
     : t('botOnboarding.dirPlaceholderFixed');
   const cliOptions = props.cliState.options.map(option => ({
     value: option.id,
-    label: option.label,
+    label: option.available === false
+      ? t('botOnboarding.cliMissingOption', { label: option.label, command: option.command ?? option.id })
+      : option.label,
   }));
   const dirModeOptions: Array<{ value: OnboardingFormState['dirMode']; label: string }> = [
     { value: 'fixed', label: t('botOnboarding.dirModeFixed') },
@@ -494,7 +506,11 @@ function OnboardingForm(props: {
             props.onFormChange(syncModelForCli(props.form, cliId, props.cliState));
           }}
         />
-        <small className="onboarding-field-hint">{props.form.cliId}</small>
+        {selectedCli?.available === false ? (
+          <small className="hint-warn">
+            {t('botOnboarding.cliMissingHint', { command: selectedCli.command ?? props.form.cliId })}
+          </small>
+        ) : <small className="onboarding-field-hint">{props.form.cliId}</small>}
       </div>
       <div className="onboarding-field">
         <span>{t('botOnboarding.dirModeLabel')}</span>
@@ -541,7 +557,15 @@ function OnboardingForm(props: {
       {props.error ? <p className="form-error">{props.error}</p> : null}
       <div className="actions onboarding-actions">
         <button type="button" id="ob-cancel" disabled={props.submitting} onClick={props.onClose}>{t('botOnboarding.cancel')}</button>
-        <button type="submit" className="primary onboarding-submit" disabled={props.submitting || props.sessionMode === 'checking'}>
+        <button
+          type="submit"
+          className="primary onboarding-submit"
+          // The option-list probe is intentionally PATH-only so opening the
+          // form never blocks the dashboard event loop on shell rc files. It is
+          // a useful warning, not an authoritative gate: submit runs the full
+          // shell-aware server check and returns cli_not_found when necessary.
+          disabled={isOnboardingSubmitDisabled(props.submitting, props.sessionMode)}
+        >
           {props.submitting
             ? t('botOnboarding.starting')
             : props.sessionMode === 'reuse'

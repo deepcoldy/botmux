@@ -297,6 +297,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // such as Aiden that cannot forward the startup-update config override.
     readyPattern: /›(?!\s*\d+\.)|\d+% left/,
     defaultPassthroughCommands: ['/goal'],
+    buildSessionRenameCommand: (title) => `/rename ${title}`,
     systemHints: BOTMUX_SHELL_HINTS,
     // Codex 0.134.0+ accepts a message while the current turn is still running:
     // it parks it ("Messages to be submitted after next tool call") via an
@@ -313,6 +314,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // time even for a parked message, so writeInput's verification confirms the
     // submit immediately and never spuriously reports a mid-turn send failure.
     supportsTypeAhead: true,
+    reliableTurnTerminal: true,
     altScreen: false,   // --no-alt-screen disables alternate screen
     // Codex has no per-session skill injection like Claude's `--plugin-dir`.
     // Verified empirically on codex 0.136.0 (via `codex debug prompt-input`,

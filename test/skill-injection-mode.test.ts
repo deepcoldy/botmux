@@ -14,6 +14,7 @@ import {
   builtinSkillContent,
   buildBuiltinSkillCatalogBlock,
   builtinSkillHelpPointer,
+  builtinSkillBlockForInjectsSessionContext,
   isSkillInjectionMode,
 } from '../src/skills/injection-mode.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
@@ -131,7 +132,7 @@ describe('resolveSkillInjectionSupport (dashboard control class)', () => {
       expect(resolveSkillInjectionSupport(id)).toBe('dynamic');
     }
     // global skills-dir CLIs → the global|prompt|off knob applies
-    for (const id of ['codex', 'gemini', 'opencode', 'cursor', 'coco', 'traex', 'pi', 'oh-my-pi', 'mtr', 'genius'] as const) {
+    for (const id of ['codex', 'gemini', 'opencode', 'cursor', 'coco', 'traex', 'pi', 'oh-my-pi', 'mtr', 'kiro-cli', 'genius', 'grok'] as const) {
       expect(resolveSkillInjectionSupport(id)).toBe('global');
     }
     // no skill mechanism → control hidden
@@ -160,9 +161,10 @@ describe('built-in skill catalog', () => {
     expect(names).toContain('botmux-whiteboard');
   });
 
-  it('excludeRoutingCovered drops the comms skills already in <botmux_routing>', () => {
+  it('excludeRoutingCovered keeps complex send discoverable but drops fully covered comms skills', () => {
     const names = builtinSkillEntries({ asksViaHook: false, excludeRoutingCovered: true }).map((e) => e.name);
-    for (const comms of ['botmux-send', 'botmux-history', 'botmux-quoted', 'botmux-bots']) {
+    expect(names).toContain('botmux-send');
+    for (const comms of ['botmux-history', 'botmux-quoted', 'botmux-bots']) {
       expect(names).not.toContain(comms);
     }
     // additional capabilities remain
@@ -179,6 +181,11 @@ describe('built-in skill catalog', () => {
     expect(block.trimEnd().endsWith('</botmux_builtin_skills>')).toBe(true);
     expect(block).toContain('botmux skill show <name>');
     expect(block).toContain('- botmux-send:');
+    expect(block).toContain('首次复杂飞书发送前读取');
+    expect(block).toContain('JSON.stringify');
+    expect(block).toContain('JSON 转义产生的 \\n 当字面量');
+    // The compact prompt description must not replace the full/native metadata.
+    expect(entries.find((e) => e.name === 'botmux-send')?.description).toContain('向飞书话题发送消息');
   });
 
   it('renders an empty block for no entries', () => {
@@ -217,14 +224,23 @@ describe('buildNewTopicPrompt built-in skill delivery (codex)', () => {
 
   const prompt = () => buildNewTopicPrompt('hi', 'sess-1', 'codex');
 
-  it('prompt mode (default) inlines the catalog with the additional skills only', () => {
+  it('prompt mode (default) inlines complex send discovery plus additional skills', () => {
     const p = prompt();
     expect(p).toContain('<botmux_builtin_skills>');
     expect(p).toContain('botmux skill show <name>');
-    expect(p).toContain('- botmux-schedule:');        // additional capability listed
-    expect(p).not.toContain('- botmux-send:');         // comms skill left to <botmux_routing>
+    expect(p).toContain('- botmux-schedule:');
+    expect(p).toContain('- botmux-send:');
+    expect(p).toContain('首次复杂飞书发送前读取');
     expect(p).not.toContain('- botmux-history:');
     expect(p).not.toContain('botmux --help');
+  });
+
+  it('prompt mode exposes the same compact send trigger on genius/grok system-prompt path', () => {
+    const block = builtinSkillBlockForInjectsSessionContext(undefined, 'en');
+    expect(block).toContain('- botmux-send:');
+    expect(block).toContain('Read once before the first complex Lark send');
+    expect(block).toContain('JSON.stringify');
+    expect(block).toContain('JSON-escaped \\n as literal text');
   });
 
   it('off mode wraps the help pointer in the same block, no skill list', () => {
@@ -233,6 +249,7 @@ describe('buildNewTopicPrompt built-in skill delivery (codex)', () => {
     expect(p).toContain('<botmux_builtin_skills>');    // XML-wrapped, not a bare line
     expect(p).toContain('botmux --help');
     expect(p).not.toContain('- botmux-schedule:');     // no catalog list in off mode
+    expect(p).not.toContain('- botmux-send:');
   });
 
   it('global mode injects neither catalog nor help pointer (native install handles it)', () => {
@@ -240,6 +257,7 @@ describe('buildNewTopicPrompt built-in skill delivery (codex)', () => {
     const p = prompt();
     expect(p).not.toContain('<botmux_builtin_skills>');
     expect(p).not.toContain('botmux --help');
+    expect(p).not.toContain('- botmux-send:');
   });
 });
 

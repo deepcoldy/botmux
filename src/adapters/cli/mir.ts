@@ -9,7 +9,7 @@ import { resolveCommand } from './registry.js';
  * Mir CLI (mircli) adapter — drives the local `mircli` in non-interactive Print
  * Mode through a small Node runner (src/mir-runner.ts), mirroring the `mira`
  * (Mira App / Web API) adapter's runner shape. See mir-runner.ts for why Print
- * Mode (`mircli -p --lean`) is used instead of driving the interactive TUI.
+ * Mode (`mircli -p`) is used instead of driving the interactive TUI.
  *
  * Distinct from the `mira` adapter:
  *   - `mira` → Mira Web API (cloud orchestration + remote sandbox; chat/search).

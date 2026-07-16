@@ -25,6 +25,10 @@ import { logger } from '../utils/logger.js';
 export interface BotCardPrefs {
   disableStreamingCard: boolean;
   silentTurnReactions: boolean;
+  /** Experimental Codex App presentation mode. Default false preserves the
+   * legacy full-prompt UserMessage; true moves Botmux metadata to hidden
+   * app-server context for newly dispatched turns. */
+  codexAppCleanInput: boolean;
   writableTerminalLinkInCard: boolean;
   privateCard: boolean;
   /** bot@bot 同目录拉起: when a bot is @-ed into a chat where a sibling bot is
@@ -52,6 +56,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     return {
       disableStreamingCard: c.disableStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
+      codexAppCleanInput: c.codexAppCleanInput === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
       botToBotSameDir: c.botToBotSameDir !== false,
@@ -67,6 +72,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     return {
       disableStreamingCard: false,
       silentTurnReactions: false,
+      codexAppCleanInput: false,
       writableTerminalLinkInCard: false,
       privateCard: false,
       botToBotSameDir: true,
@@ -135,6 +141,7 @@ export async function updateBotCardPrefs(
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
+    apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
     applyDefaultTrue(entry, 'botToBotSameDir', patch.botToBotSameDir);
@@ -149,6 +156,7 @@ export async function updateBotCardPrefs(
       result: {
         disableStreamingCard: entry.disableStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
+        codexAppCleanInput: entry.codexAppCleanInput === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
         botToBotSameDir: entry.botToBotSameDir !== false,
@@ -173,6 +181,9 @@ export async function updateBotCardPrefs(
   }
   if (patch.silentTurnReactions !== undefined) {
     bot.config.silentTurnReactions = patch.silentTurnReactions || undefined;
+  }
+  if (patch.codexAppCleanInput !== undefined) {
+    bot.config.codexAppCleanInput = patch.codexAppCleanInput || undefined;
   }
   if (patch.writableTerminalLinkInCard !== undefined) {
     bot.config.writableTerminalLinkInCard = patch.writableTerminalLinkInCard || undefined;
@@ -209,6 +220,7 @@ export async function updateBotCardPrefs(
   logger.info(
     `[card-prefs:${larkAppId}] disableStreamingCard=${r.result.disableStreamingCard} ` +
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
+    `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `regularGroupReplyMode=${r.result.regularGroupReplyMode} regularGroupMentionMode=${r.result.regularGroupMentionMode} ` +

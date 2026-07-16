@@ -37,7 +37,10 @@ const probe = vi.hoisted(() => ({ result: 'exists' as 'exists' | 'missing' | 'un
 // Default 'running' so a bare 'missing' is read as a solo zombie (server up).
 const server = vi.hoisted(() => ({ state: 'running' as 'running' | 'down' | 'unknown' }));
 // Mutable bot-side wrapperCli for the wrapper-axis mismatch tests.
-const bot = vi.hoisted(() => ({ wrapperCli: undefined as string | undefined }));
+const bot = vi.hoisted(() => ({
+  cliId: 'claude-code' as import('../src/adapters/cli/types.js').CliId,
+  wrapperCli: undefined as string | undefined,
+}));
 
 vi.mock('../src/config.js', () => ({
   config: {
@@ -97,13 +100,13 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
-    config: { larkAppId: 'app_test', cliId: 'claude-code', wrapperCli: bot.wrapperCli, workingDir: '~', workingDirs: ['~'] },
+    config: { larkAppId: 'app_test', cliId: bot.cliId, wrapperCli: bot.wrapperCli, workingDir: '~', workingDirs: ['~'] },
     botName: 'TestBot',
     botOpenId: 'ou_test',
     resolvedAllowedUsers: [],
   })),
   getAllBots: vi.fn(() => [{
-    config: { larkAppId: 'app_test', cliId: 'claude-code' },
+    config: { larkAppId: 'app_test', cliId: bot.cliId },
     botName: 'TestBot',
     botOpenId: 'ou_test',
     resolvedAllowedUsers: [],
@@ -162,6 +165,7 @@ beforeEach(() => {
   wp.registry = null;
   probe.result = 'exists';
   server.state = 'running';
+  bot.cliId = 'claude-code';
   bot.wrapperCli = undefined;
   vi.mocked(closeSession).mockClear();
   vi.mocked(forkWorker).mockClear();
@@ -176,7 +180,7 @@ function makeActivePersistentSession(rootMessageId: string) {
   const s = sessionStore.createSession('oc_chat1', rootMessageId, 'Topic', 'group');
   s.larkAppId = 'app_test';
   s.workingDir = '/tmp/proj';
-  s.cliId = 'claude-code';
+  s.cliId = bot.cliId;
   s.scope = 'thread';
   // Real tmux sessions now carry their backend stamped at spawn time
   // (Session.backendType); getSessionPersistentBackendType reads it back rather
@@ -397,6 +401,44 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).toHaveBeenCalled();
     expect(vi.mocked(forkWorker).mock.calls[0]![0].session.sessionId).toBe(s.sessionId);
     expect(map.get(sessionKey('om_exists', 'app_test'))).toBeDefined();
+  });
+
+  it('restores only the latest clean Codex App sidecar after a disk reload and re-attaches it', async () => {
+    probe.result = 'exists';
+    bot.cliId = 'codex-app';
+    const s = makeActivePersistentSession('om_codex_sidecar_restore');
+
+    for (let round = 1; round <= 20; round++) {
+      s.lastUserPrompt = `第 ${round} 轮用户原文`;
+      s.lastCliInput = `<user_message>第 ${round} 轮用户原文</user_message>`;
+      s.lastCodexAppInput = {
+        text: `第 ${round} 轮用户原文`,
+        clientUserMessageId: `om_round_${round}`,
+        additionalContext: {
+          botmux_sender: { kind: 'untrusted', value: `<sender round="${round}" />` },
+          botmux_role: { kind: 'application', value: '<role>经营助手</role>' },
+        },
+        localImages: [{ path: `/tmp/round-${round}.png`, detail: 'original' }],
+      };
+      sessionStore.updateSession(s);
+    }
+    const expected = structuredClone(s.lastCodexAppInput);
+
+    // Simulate a fresh daemon process: discard the in-memory store and reload
+    // the active session from sessions.json before restoring workers.
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    const restored = map.get(sessionKey('om_codex_sidecar_restore', 'app_test'))!;
+    expect(restored.lastCodexAppInput).toEqual(expected);
+    expect(restored.session.lastCodexAppInput).toEqual(expected);
+    expect(restored.lastUserPrompt).toBe('第 20 轮用户原文');
+    expect(restored.lastCliInput).toContain('第 20 轮用户原文');
+    expect(forkWorker).toHaveBeenCalledWith(restored, '', true);
+    expect(sessionStore.getSession(s.sessionId)?.lastCodexAppInput).toEqual(expected);
   });
 });
 

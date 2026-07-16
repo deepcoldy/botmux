@@ -156,19 +156,79 @@ describe('handleFederationApi', () => {
     writeBots([{ larkAppId: 'cli_a', botOpenId: null, botName: 'A', cliId: 'claude' }]); // our local bot
     addMembership(dataDir, { hubUrl: 'http://hub:7891', teamId: 'default', teamName: 'T', syncToken: 'st', deploymentId: 'dep_me', delegationToken: 'DTOK' });
     let calls = 0; let captured: any = null;
-    const createTeamGroup = vi.fn(async (args: any) => { calls++; captured = args; return { ok: true, chatId: 'oc_deleg', shareLink: 'https://x', invalidBotIds: [] }; });
+    const createTeamGroup = vi.fn(async (args: any) => {
+      calls++; captured = args;
+      return {
+        ok: true,
+        chatId: 'oc_deleg',
+        creator: 'cli_a',
+        shareLink: 'https://x',
+        invalidBotIds: [],
+        invalidOwnerUnionIds: ['on_1'],
+        ownerTransferredTo: null,
+        transferError: 'invitee_rejected',
+      };
+    });
     // valid token + involves our local bot cli_a → creates
     let res = makeRes();
-    await callWithGroup(makeReq('POST', '/api/federation/delegate-group', { name: 'g', larkAppIds: ['cli_a', 'cli_b'], ownerUnionIds: ['on_1'], requestId: 'req1' }, bearer('DTOK')), res, '/api/federation/delegate-group', createTeamGroup);
+    await callWithGroup(makeReq('POST', '/api/federation/delegate-group', { name: 'g', larkAppIds: ['cli_a', 'cli_b'], ownerUnionIds: ['on_1'], transferOwnerUnionId: 'on_1', requestId: 'req1' }, bearer('DTOK')), res, '/api/federation/delegate-group', createTeamGroup);
     expect(res.statusCode).toBe(200);
     expect(json(res).chatId).toBe('oc_deleg');
-    expect(captured).toMatchObject({ name: 'g', larkAppIds: ['cli_a', 'cli_b'], ownerUnionIds: ['on_1'] });
+    expect(captured).toMatchObject({ name: 'g', larkAppIds: ['cli_a', 'cli_b'], ownerUnionIds: ['on_1'], transferOwnerUnionId: 'on_1' });
     // replay same requestId → cached, createTeamGroup NOT called again (no dup group)
     res = makeRes();
     await callWithGroup(makeReq('POST', '/api/federation/delegate-group', { larkAppIds: ['cli_a'], requestId: 'req1' }, bearer('DTOK')), res, '/api/federation/delegate-group', createTeamGroup);
     expect(res.statusCode).toBe(200);
     expect(json(res).chatId).toBe('oc_deleg');
     expect(calls).toBe(1); // idempotent
+    // Once the hub has added on_1 through its own deployment, the same
+    // authenticated requestId unlocks exactly the cached creator/chat/target.
+    const transferTeamGroupOwner = vi.fn(async (args: any) => ({
+      ownerTransferredTo: args.transferOwnerUnionId,
+      transferError: null,
+      notifyMessageId: 'om_owner',
+      notifyError: null,
+    }));
+    // A caller cannot choose arbitrary transfer inputs or finalize a request
+    // that never minted a pending capability.
+    res = makeRes();
+    await handleFederationApi(
+      makeReq('POST', '/api/federation/delegate-transfer-owner', { requestId: 'not-pending' }, bearer('DTOK')),
+      res,
+      new URL('http://x/api/federation/delegate-transfer-owner'),
+      { dataDir, transferTeamGroupOwner },
+    );
+    expect(res.statusCode).toBe(409);
+    expect(json(res).error).toBe('owner_transfer_not_pending');
+    expect(transferTeamGroupOwner).not.toHaveBeenCalled();
+    res = makeRes();
+    await handleFederationApi(
+      makeReq('POST', '/api/federation/delegate-transfer-owner', { requestId: 'req1' }, bearer('DTOK')),
+      res,
+      new URL('http://x/api/federation/delegate-transfer-owner'),
+      { dataDir, transferTeamGroupOwner },
+    );
+    expect(res.statusCode).toBe(200);
+    expect(json(res)).toMatchObject({ ok: true, ownerTransferredTo: 'on_1', transferError: null });
+    expect(transferTeamGroupOwner).toHaveBeenCalledWith({
+      creatorLarkAppId: 'cli_a', chatId: 'oc_deleg', transferOwnerUnionId: 'on_1',
+    });
+    // Success is cached so a retry does not transfer or notify twice.
+    res = makeRes();
+    await handleFederationApi(
+      makeReq('POST', '/api/federation/delegate-transfer-owner', { requestId: 'req1' }, bearer('DTOK')),
+      res,
+      new URL('http://x/api/federation/delegate-transfer-owner'),
+      { dataDir, transferTeamGroupOwner },
+    );
+    expect(res.statusCode).toBe(200);
+    expect(transferTeamGroupOwner).toHaveBeenCalledTimes(1);
+    // transfer target must be one of the trusted owner invitees
+    res = makeRes();
+    await callWithGroup(makeReq('POST', '/api/federation/delegate-group', { larkAppIds: ['cli_a'], ownerUnionIds: ['on_1'], transferOwnerUnionId: 'on_other', requestId: 'bad-owner' }, bearer('DTOK')), res, '/api/federation/delegate-group', createTeamGroup);
+    expect(res.statusCode).toBe(400);
+    expect(json(res).error).toBe('invalid_transfer_owner_union_id');
+    expect(calls).toBe(1);
     // guardrail: no local bot in selection → 400 no_local_bot
     res = makeRes();
     await callWithGroup(makeReq('POST', '/api/federation/delegate-group', { larkAppIds: ['cli_remote_only'], requestId: 'r2' }, bearer('DTOK')), res, '/api/federation/delegate-group', createTeamGroup);
@@ -182,6 +242,49 @@ describe('handleFederationApi', () => {
     res = makeRes();
     await call(makeReq('POST', '/api/federation/delegate-group', { larkAppIds: ['cli_a'] }, bearer('DTOK')), res, '/api/federation/delegate-group');
     expect(res.statusCode).toBe(501);
+  });
+
+  it('delegate-transfer-owner: failed attempts stay retryable, then success is cached', async () => {
+    writeBots([{ larkAppId: 'cli_retry', botOpenId: null, botName: 'Retry', cliId: 'codex' }]);
+    addMembership(dataDir, { hubUrl: 'http://hub:7891', teamId: 'default', teamName: 'T', syncToken: 'st-retry', deploymentId: 'dep-retry', delegationToken: 'DTOK-RETRY' });
+    const createTeamGroup = vi.fn(async () => ({
+      ok: true,
+      chatId: 'oc_retry',
+      creator: 'cli_retry',
+      invalidBotIds: [],
+      invalidOwnerUnionIds: ['on_retry'],
+      ownerTransferredTo: null,
+      transferError: 'invitee_rejected',
+    }));
+    let res = makeRes();
+    await callWithGroup(
+      makeReq('POST', '/api/federation/delegate-group', {
+        larkAppIds: ['cli_retry'], ownerUnionIds: ['on_retry'],
+        transferOwnerUnionId: 'on_retry', requestId: 'retry-transfer',
+      }, bearer('DTOK-RETRY')),
+      res,
+      '/api/federation/delegate-group',
+      createTeamGroup,
+    );
+    expect(res.statusCode).toBe(200);
+
+    const transferTeamGroupOwner = vi.fn()
+      .mockResolvedValueOnce({ ownerTransferredTo: null, transferError: 'readback_mismatch', notifyMessageId: null, notifyError: null })
+      .mockResolvedValue({ ownerTransferredTo: 'on_retry', transferError: null, notifyMessageId: 'om_retry', notifyError: null });
+    const finish = async () => {
+      res = makeRes();
+      await handleFederationApi(
+        makeReq('POST', '/api/federation/delegate-transfer-owner', { requestId: 'retry-transfer' }, bearer('DTOK-RETRY')),
+        res,
+        new URL('http://x/api/federation/delegate-transfer-owner'),
+        { dataDir, transferTeamGroupOwner },
+      );
+      return json(res);
+    };
+    expect(await finish()).toMatchObject({ ownerTransferredTo: null, transferError: 'readback_mismatch' });
+    expect(await finish()).toMatchObject({ ownerTransferredTo: 'on_retry', transferError: null });
+    expect(await finish()).toMatchObject({ ownerTransferredTo: 'on_retry', transferError: null });
+    expect(transferTeamGroupOwner).toHaveBeenCalledTimes(2);
   });
 
   it('federation/group: spoke initiates; operator is hub-derived from syncToken; requestId required + idempotent', async () => {
@@ -201,6 +304,7 @@ describe('handleFederationApi', () => {
     expect(res.statusCode).toBe(200);
     expect(json(res).chatId).toBe('oc_g');
     expect(captured.ownerUnionIds).toContain('on_spoke'); // operator from syncToken, NOT request body
+    expect(captured.transferOwnerUnionId).toBe('on_spoke');
     // replay same requestId → idempotent (createTeamGroup not called again)
     res = makeRes();
     await callWithGroup(makeReq('POST', '/api/federation/group', { name: 'g', larkAppIds: ['cli_hub'], requestId: 'r1' }, bearer(syncToken)), res, '/api/federation/group', createTeamGroup);
@@ -330,16 +434,38 @@ describe('handleFederationApi', () => {
     expect(tried).toEqual(['cli_x', 'cli_y']);              // exhausted all candidates
   });
 
-  it('federation/group: no local creator → delegate-build to A, then delegate-add-owner to B for Bs owner', async () => {
+  it('federation/group: remote creator retries owner adds across deployments, then transfers ownership', async () => {
     registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_a', name: 'A', ownerUnionId: 'on_a', bots: [{ larkAppId: 'cli_a', botName: 'A1', cliId: 'codex', ownerUnionId: 'on_a' } as any], callbackUrl: 'http://a:7891', delegationToken: 'DTA' });
     registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_b', name: 'B', ownerUnionId: 'on_b', bots: [{ larkAppId: 'cli_b', botName: 'B1', cliId: 'codex', ownerUnionId: 'on_b' } as any], callbackUrl: 'http://b:7891', delegationToken: 'DTB' });
     const syncToken = (await import('../src/services/federation-store.js')).listFederatedDeployments(dataDir, DEFAULT_TEAM_ID).find(d => d.deploymentId === 'dep_a')!.syncToken;
     const createTeamGroup = vi.fn(async () => ({ ok: false, error: 'no_online_daemon' })); // hub has no local creator
-    let addOwnerCall: any = null;
+    let delegateGroupCall: any = null;
+    const addOwnerCalls: any[] = [];
+    let transferOwnerCall: any = null;
     const fetcher = vi.fn(async (u: any, init: any) => {
       const url = String(u);
-      if (url === 'http://a:7891/api/federation/delegate-group') return { ok: true, status: 200, json: async () => ({ ok: true, chatId: 'oc_g', invalidOwnerUnionIds: ['on_b'] }) } as any; // A built, couldn't add B's owner
-      if (url === 'http://b:7891/api/federation/delegate-add-owner') { addOwnerCall = JSON.parse(init.body); return { ok: true, status: 200, json: async () => ({ ok: true, invalidUserIds: [] }) } as any; }
+      if (url === 'http://a:7891/api/federation/delegate-group') {
+        delegateGroupCall = JSON.parse(init.body);
+        return { ok: true, status: 200, json: async () => ({
+          ok: true,
+          chatId: 'oc_g',
+          creator: 'cli_a',
+          invalidOwnerUnionIds: ['on_a', 'on_b'],
+          ownerTransferredTo: null,
+          transferError: 'invitee_rejected',
+        }) } as any;
+      }
+      if (url.endsWith('/api/federation/delegate-add-owner')) {
+        addOwnerCalls.push({ url, body: JSON.parse(init.body) });
+        return { ok: true, status: 200, json: async () => ({ ok: true, invalidUserIds: [] }) } as any;
+      }
+      if (url === 'http://a:7891/api/federation/delegate-transfer-owner') {
+        transferOwnerCall = JSON.parse(init.body);
+        return { ok: true, status: 200, json: async () => ({
+          ok: true, ownerTransferredTo: 'on_a', transferError: null,
+          notifyMessageId: 'om_owner', notifyError: null,
+        }) } as any;
+      }
       return { ok: true, status: 200, json: async () => ({}) } as any;
     });
     const res = makeRes();
@@ -347,8 +473,15 @@ describe('handleFederationApi', () => {
     expect(res.statusCode).toBe(200);
     expect(json(res).chatId).toBe('oc_g');
     expect(json(res).delegatedTo).toBe('A');
-    expect(json(res).invalidOwnerUnionIds).toEqual([]); // on_b added via B after delegate-build
-    expect(addOwnerCall).toMatchObject({ chatId: 'oc_g', viaLarkAppId: 'cli_b', ownerUnionIds: ['on_b'] });
+    expect(json(res).invalidOwnerUnionIds).toEqual([]); // on_a/on_b added by their own deployments
+    expect(json(res).ownerTransferredTo).toBe('on_a');
+    expect(json(res).transferError).toBeNull();
+    expect(delegateGroupCall.transferOwnerUnionId).toBe('on_a'); // operator identity survives hub→spoke delegation
+    expect(addOwnerCalls).toEqual(expect.arrayContaining([
+      expect.objectContaining({ url: 'http://a:7891/api/federation/delegate-add-owner', body: expect.objectContaining({ chatId: 'oc_g', viaLarkAppId: 'cli_a', ownerUnionIds: ['on_a'] }) }),
+      expect.objectContaining({ url: 'http://b:7891/api/federation/delegate-add-owner', body: expect.objectContaining({ chatId: 'oc_g', viaLarkAppId: 'cli_b', ownerUnionIds: ['on_b'] }) }),
+    ]));
+    expect(transferOwnerCall).toEqual({ requestId: 'g2' });
   });
 
   it('federation/group: a remote owner the creator cant add is delegated to its own deployment', async () => {
@@ -356,18 +489,39 @@ describe('handleFederationApi', () => {
     registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_spoke', name: 'Spoke', ownerUnionId: 'on_spoke', bots: [{ larkAppId: 'cli_sp', botName: 'SP', cliId: 'codex', ownerUnionId: 'on_spoke', ownerName: '博文' } as any], callbackUrl: 'http://spoke:7891', delegationToken: 'DT' });
     const syncToken = (await import('../src/services/federation-store.js')).listFederatedDeployments(dataDir, DEFAULT_TEAM_ID)[0].syncToken;
     // creator adds bots fine but can't add the remote owner on_spoke (Lark 232024)
-    const createTeamGroup = vi.fn(async () => ({ ok: true, chatId: 'oc_g', invalidBotIds: [], invalidOwnerUnionIds: ['on_spoke'] }));
+    const createTeamGroup = vi.fn(async () => ({
+      ok: true,
+      chatId: 'oc_g',
+      creator: 'cli_hub',
+      invalidBotIds: [],
+      invalidOwnerUnionIds: ['on_spoke'],
+      ownerTransferredTo: null,
+      transferError: 'invitee_rejected',
+    }));
+    const transferTeamGroupOwner = vi.fn(async () => ({
+      ownerTransferredTo: 'on_spoke',
+      transferError: null,
+      notifyMessageId: 'om_owner',
+      notifyError: null,
+    }));
     let delegated: any = null;
     const fetcher = vi.fn(async (u: any, init: any) => {
       if (String(u).endsWith('/api/federation/delegate-add-owner')) { delegated = JSON.parse(init.body); return { ok: true, status: 200, json: async () => ({ ok: true, invalidUserIds: [] }) } as any; }
       return { ok: true, status: 200, json: async () => ({}) } as any;
     });
     const res = makeRes();
-    await handleFederationApi(makeReq('POST', '/api/federation/group', { name: 'g', larkAppIds: ['cli_hub', 'cli_sp'], requestId: 'g1' }, bearer(syncToken)), res, new URL('http://x/api/federation/group'), { dataDir, createTeamGroup, fetcher: fetcher as any });
+    await handleFederationApi(makeReq('POST', '/api/federation/group', { name: 'g', larkAppIds: ['cli_hub', 'cli_sp'], requestId: 'g1' }, bearer(syncToken)), res, new URL('http://x/api/federation/group'), {
+      dataDir, createTeamGroup, transferTeamGroupOwner, fetcher: fetcher as any,
+    });
     expect(res.statusCode).toBe(200);
     expect(json(res).chatId).toBe('oc_g');
     expect(json(res).invalidOwnerUnionIds).toEqual([]); // on_spoke delegated to dep_spoke → resolved
+    expect(json(res).ownerTransferredTo).toBe('on_spoke');
+    expect(json(res).transferError).toBeNull();
     expect(delegated).toMatchObject({ chatId: 'oc_g', viaLarkAppId: 'cli_sp', ownerUnionIds: ['on_spoke'] });
+    expect(transferTeamGroupOwner).toHaveBeenCalledWith({
+      creatorLarkAppId: 'cli_hub', chatId: 'oc_g', transferOwnerUnionId: 'on_spoke',
+    });
   });
 
   it('federation/group: delegate-add-owner carries ALL of the deployments in-chat bots as viaCandidates (fallback)', async () => {

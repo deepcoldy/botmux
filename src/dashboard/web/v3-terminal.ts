@@ -58,7 +58,7 @@ function liveTerminalHtml(webPort: number, sessionId: string, host?: string): st
       <span class="muted">:${webPort}</span>
       <a class="btn-link" href="${escapeAttr(url)}" target="_blank" rel="noopener">新窗口打开</a>
     </div>
-    <iframe class="wf-terminal-frame v3-terminal-frame" src="${escapeAttr(url)}" title="v3 live terminal" loading="lazy"></iframe>
+    <iframe class="v3-terminal-frame" src="${escapeAttr(url)}" title="v3 live terminal" loading="lazy"></iframe>
   </div>`;
 }
 
@@ -72,7 +72,7 @@ function replayTerminalHtml(runId: string, nodeId: string, closed: boolean): str
       <span class="muted">PTY log</span>
       <a class="btn-link" href="${escapeAttr(endpoint)}" target="_blank" rel="noopener">下载/打开原始日志</a>
     </div>
-    <iframe class="wf-terminal-frame v3-terminal-frame" srcdoc="${escapeAttr(srcdoc)}" title="v3 terminal replay" loading="lazy"></iframe>
+    <iframe class="v3-terminal-frame" srcdoc="${escapeAttr(srcdoc)}" title="v3 terminal replay" loading="lazy"></iframe>
   </div>`;
 }
 

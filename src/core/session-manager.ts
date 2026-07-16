@@ -11,7 +11,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { assertSafeAppId } from '../adapters/cli/read-isolation.js';
@@ -28,6 +28,7 @@ import type { CliId } from '../adapters/cli/types.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import {
+  composeSpawnCodexAppContext,
   composeSpawnUserContent,
   deriveSessionTitleFromContent,
   type CreateSessionColumn,
@@ -36,10 +37,11 @@ import {
 } from './session-create.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType } from '../adapters/backend/types.js';
-import type { LarkAttachment, LarkMention, ScheduledTask, SubstituteTrigger } from '../types.js';
+import type { CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, SubstituteTrigger } from '../types.js';
+import { addCodexAppContext } from '../utils/codex-app-context.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
-import { sessionKey, sessionAnchorId } from './types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
@@ -368,23 +370,83 @@ export function renderBufferedSenderBlock(sender: ResolvedSender | undefined, cl
   return note ? `${tag}\n${note}` : tag;
 }
 
-function renderSubstituteTrigger(trigger?: SubstituteTrigger): string {
-  if (!trigger) return '';
-  const attrs: string[] = [];
-  if (trigger.target.name) attrs.push(`name="${xmlEscape(trigger.target.name)}"`);
-  if (trigger.target.openId) attrs.push(`open_id="${xmlEscape(trigger.target.openId)}"`);
-  if (trigger.target.userId) attrs.push(`user_id="${xmlEscape(trigger.target.userId)}"`);
-  if (trigger.target.unionId) attrs.push(`union_id="${xmlEscape(trigger.target.unionId)}"`);
-  const disclosure = trigger.disclosure ?? 'prefix';
-  const instruction = disclosure === 'none'
+function substituteInstruction(disclosure: NonNullable<SubstituteTrigger['disclosure']>): string {
+  return disclosure === 'none'
     ? 'This turn was triggered by a configured substitute target mention. Answer on behalf of that target when appropriate.'
     : 'This turn was triggered by a configured substitute target mention. Answer on behalf of that target and clearly disclose that you are answering for them.';
+}
+
+function renderSubstituteIdentity(
+  tag: 'target' | 'configured_target' | 'observed_mention',
+  identity: SubstituteTrigger['target'] | undefined,
+): string {
+  if (!identity) return '';
+  const attrs: string[] = [];
+  if (identity.name) attrs.push(`name="${xmlEscape(identity.name)}"`);
+  if (identity.openId) attrs.push(`open_id="${xmlEscape(identity.openId)}"`);
+  if (identity.userId) attrs.push(`user_id="${xmlEscape(identity.userId)}"`);
+  if (identity.unionId) attrs.push(`union_id="${xmlEscape(identity.unionId)}"`);
+  return attrs.length > 0 ? `<${tag} ${attrs.join(' ')} />` : `<${tag} />`;
+}
+
+/** Preserve the pre-clean-input legacy schema exactly: one effective target,
+ * with configured fields taking precedence and event fields only filling
+ * missing values. The structured Codex App sidecar keeps both sources below. */
+function renderLegacySubstituteTarget(trigger: SubstituteTrigger): string {
+  const observed = trigger.observedMention;
+  const target = {
+    name: trigger.target.name ?? observed?.name,
+    openId: trigger.target.openId ?? observed?.openId,
+    userId: trigger.target.userId ?? observed?.userId,
+    unionId: trigger.target.unionId ?? observed?.unionId,
+  };
+  const attrs: string[] = [];
+  if (target.name) attrs.push(`name="${xmlEscape(target.name)}"`);
+  if (target.openId) attrs.push(`open_id="${xmlEscape(target.openId)}"`);
+  if (target.userId) attrs.push(`user_id="${xmlEscape(target.userId)}"`);
+  if (target.unionId) attrs.push(`union_id="${xmlEscape(target.unionId)}"`);
+  return `<target ${attrs.join(' ')} />`;
+}
+
+/** Legacy prompt envelope. This whole string remains user-role input for the
+ * terminal CLIs; Codex App uses the two trust-separated renderers below. */
+function renderSubstituteTrigger(trigger?: SubstituteTrigger): string {
+  if (!trigger) return '';
+  const disclosure = trigger.disclosure ?? 'prefix';
   return [
     '<substitute_trigger>',
-    `  <target ${attrs.join(' ')} />`,
+    `  ${renderLegacySubstituteTarget(trigger)}`,
     `  <disclosure>${xmlEscape(disclosure)}</disclosure>`,
-    `  <instruction>${xmlEscape(instruction)}</instruction>`,
+    `  <instruction>${xmlEscape(substituteInstruction(disclosure))}</instruction>`,
     '</substitute_trigger>',
+  ].join('\n');
+}
+
+/** Botmux-owned policy only. No configured profile or event field may enter
+ * this block because Codex App promotes it to developer-role context. */
+function renderSubstitutePolicy(trigger?: SubstituteTrigger): string {
+  if (!trigger) return '';
+  const disclosure = trigger.disclosure ?? 'prefix';
+  return [
+    '<substitute_policy>',
+    '  <match>configured_target_mention</match>',
+    `  <disclosure>${disclosure}</disclosure>`,
+    `  <instruction>${substituteInstruction(disclosure)}</instruction>`,
+    '</substitute_policy>',
+  ].join('\n');
+}
+
+/** All identity metadata is untrusted, regardless of whether it came from a
+ * saved Lark profile or the current event. Keep the two sources distinct so a
+ * matching user_id cannot make conflicting observed IDs look canonical. */
+function renderSubstituteTarget(trigger?: SubstituteTrigger): string {
+  if (!trigger) return '';
+  const observedMention = renderSubstituteIdentity('observed_mention', trigger.observedMention);
+  return [
+    '<substitute_target>',
+    `  ${renderSubstituteIdentity('configured_target', trigger.target)}`,
+    ...(observedMention ? [`  ${observedMention}`] : []),
+    '</substitute_target>',
   ].join('\n');
 }
 
@@ -488,6 +550,72 @@ function hermesFollowupReminder(locale?: Locale): string {
  */
 const AVAILABLE_BOTS_INLINE_MAX = 3;
 
+function renderMentionBlock(mentions?: LarkMention[]): string {
+  if (!mentions || mentions.length === 0) return '';
+  const items = mentions.map(m => {
+    const oid = m.openId ? ` open_id="${xmlEscape(m.openId)}"` : '';
+    return `  <mention name="${xmlEscape(m.name)}"${oid} />`;
+  });
+  return `<mentions>\n${items.join('\n')}\n</mentions>`;
+}
+
+function renderAvailableBotsBlock(
+  availableBots: Array<{ name: string; displayName: string; openId: string }> | undefined,
+  mentions: LarkMention[] | undefined,
+  locale: Locale | undefined,
+): string {
+  if (!availableBots || availableBots.length === 0) return '';
+  const mentionedOpenIds = new Set(mentions?.map(m => m.openId).filter(Boolean));
+  const unmentionedBots = availableBots.filter(b => !mentionedOpenIds.has(b.openId));
+  if (unmentionedBots.length === 0) return '';
+  if (unmentionedBots.length <= AVAILABLE_BOTS_INLINE_MAX) {
+    const items = unmentionedBots.map(
+      b => `  <bot name="${xmlEscape(b.displayName)}" open_id="${xmlEscape(b.openId)}" />`,
+    );
+    return `<available_bots hint="${xmlEscape(t('ai.available_bots.hint', undefined, locale))}">\n${items.join('\n')}\n</available_bots>`;
+  }
+  const sep = (locale ?? getDefaultLocale()) === 'en' ? ', ' : '、';
+  const names = unmentionedBots.map(b => b.displayName).join(sep);
+  const line = t('ai.available_bots.collapsed_line', { count: unmentionedBots.length, names }, locale);
+  return `<available_bots hint="${xmlEscape(t('ai.available_bots.hint_collapsed', undefined, locale))}" count="${unmentionedBots.length}">\n${xmlEscape(line)}\n</available_bots>`;
+}
+
+function buildCodexAppTurnInput(opts: {
+  text: string;
+  roleBlock?: string;
+  whiteboardBlock?: string;
+  senderBlock?: string;
+  substitutePolicyBlock?: string;
+  substituteTargetBlock?: string;
+  attachmentBlock?: string;
+  mentionBlock?: string;
+  availableBotsBlock?: string;
+  applicationContextBlock?: string;
+  messageContextBlock?: string;
+  bufferedFollowUpsBlock?: string;
+  attachments?: LarkAttachment[];
+}): CodexAppTurnInput {
+  const additionalContext: Record<string, CodexAppAdditionalContextEntry> = {};
+  addCodexAppContext(additionalContext, 'botmux_role', opts.roleBlock ?? '', 'application');
+  addCodexAppContext(additionalContext, 'botmux_whiteboard', opts.whiteboardBlock ?? '', 'application');
+  addCodexAppContext(additionalContext, 'botmux_sender', opts.senderBlock ?? '', 'untrusted');
+  addCodexAppContext(additionalContext, 'botmux_substitute_policy', opts.substitutePolicyBlock ?? '', 'application');
+  addCodexAppContext(additionalContext, 'botmux_substitute_target', opts.substituteTargetBlock ?? '', 'untrusted');
+  addCodexAppContext(additionalContext, 'botmux_attachments', opts.attachmentBlock ?? '', 'untrusted');
+  addCodexAppContext(additionalContext, 'botmux_mentions', opts.mentionBlock ?? '', 'untrusted');
+  addCodexAppContext(additionalContext, 'botmux_available_bots', opts.availableBotsBlock ?? '', 'untrusted');
+  addCodexAppContext(additionalContext, 'botmux_application_context', opts.applicationContextBlock ?? '', 'application');
+  addCodexAppContext(additionalContext, 'botmux_message_context', opts.messageContextBlock ?? '', 'untrusted');
+  addCodexAppContext(additionalContext, 'botmux_buffered_followups', opts.bufferedFollowUpsBlock ?? '', 'untrusted');
+  return {
+    text: opts.text,
+    ...(Object.keys(additionalContext).length > 0 ? { additionalContext } : {}),
+    ...(opts.attachments?.some(a => a.type === 'image')
+      ? { localImages: opts.attachments.filter(a => a.type === 'image').map(a => ({ path: a.path, detail: 'original' as const })) }
+      : {}),
+  };
+}
+
 export function buildNewTopicPrompt(
   userMessage: string,
   sessionId: string,
@@ -524,8 +652,8 @@ export function buildNewTopicPrompt(
   if (!adapter.injectsSessionContext && adapter.skillsDir) {
     const mode = resolveSkillInjectionModeForApp(opts?.larkAppId);
     if (mode === 'prompt') {
-      // excludeRoutingCovered: send/history/quoted/bots live in <botmux_routing>
-      // already, so the catalog carries only the additional task capabilities.
+      // history/quoted/bots are fully covered by <botmux_routing>; send stays in
+      // the catalog as a compact trigger for complex delivery and safety rules.
       const entries = builtinSkillEntries({ asksViaHook: adapter.asksViaHook, whiteboardEnabled: whiteboardEnabled(), excludeRoutingCovered: true });
       skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
     } else if (mode === 'off') {
@@ -548,43 +676,8 @@ export function buildNewTopicPrompt(
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
 
-  let mentionBlock = '';
-  if (mentions && mentions.length > 0) {
-    const items = mentions.map(m => {
-      const oid = m.openId ? ` open_id="${xmlEscape(m.openId)}"` : '';
-      return `  <mention name="${xmlEscape(m.name)}"${oid} />`;
-    });
-    mentionBlock = `<mentions>\n${items.join('\n')}\n</mentions>`;
-  }
-
-  let botBlock = '';
-  if (availableBots && availableBots.length > 0) {
-    const mentionedOpenIds = new Set(mentions?.map(m => m.openId).filter(Boolean));
-    const unmentionedBots = availableBots.filter(b => !mentionedOpenIds.has(b.openId));
-    if (unmentionedBots.length > 0) {
-      // ≤ threshold peers: inline the full roster with open_ids so any
-      // cross-bot message (a question, collaboration, or full handoff) needs
-      // zero round-trip. Above it: collapse to a one-line pointer — names only
-      // for awareness, open_ids deferred to an on-demand `botmux bots list` —
-      // so a many-bot group doesn't pay a long open_id list on every solo
-      // topic. Either way this block is emitted once, on the first message.
-      if (unmentionedBots.length <= AVAILABLE_BOTS_INLINE_MAX) {
-        const items = unmentionedBots.map(
-          b => `  <bot name="${xmlEscape(b.displayName)}" open_id="${xmlEscape(b.openId)}" />`,
-        );
-        botBlock = `<available_bots hint="${xmlEscape(t('ai.available_bots.hint', undefined, locale))}">\n${items.join('\n')}\n</available_bots>`;
-      } else {
-        // Resolve the locale the same way t() does (explicit arg → process
-        // default) so the separator matches the rendered sentence's language —
-        // otherwise an undefined `locale` under an 'en' default would produce an
-        // English sentence joined with the Chinese enumeration comma.
-        const sep = (locale ?? getDefaultLocale()) === 'en' ? ', ' : '、';
-        const names = unmentionedBots.map(b => b.displayName).join(sep);
-        const line = t('ai.available_bots.collapsed_line', { count: unmentionedBots.length, names }, locale);
-        botBlock = `<available_bots hint="${xmlEscape(t('ai.available_bots.hint_collapsed', undefined, locale))}" count="${unmentionedBots.length}">\n${xmlEscape(line)}\n</available_bots>`;
-      }
-    }
-  }
+  const mentionBlock = renderMentionBlock(mentions);
+  const botBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
 
   // Messages the user sent while the repo-selection card was still pending are
   // buffered as followUps. Fold them into the single <user_message> body
@@ -638,6 +731,70 @@ export function buildNewTopicPrompt(
   return parts.join('\n\n');
 }
 
+/** Build the legacy opening prompt plus a Codex App structured sidecar. The
+ * sibling string API above stays unchanged for every existing caller. Pending-
+ * repo follow-ups currently arrive as already-enriched strings (and may contain
+ * sender tags), so that rare merged path deliberately falls back to legacy
+ * rather than guessing which bytes are user text. */
+export function buildNewTopicCliInput(
+  userMessage: string,
+  sessionId: string,
+  cliId: CliId,
+  cliPathOverride?: string,
+  attachments?: LarkAttachment[],
+  mentions?: LarkMention[],
+  availableBots?: Array<{ name: string; displayName: string; openId: string }>,
+  followUps?: string[],
+  botIdentity?: { name?: string; openId?: string },
+  locale?: Locale,
+  sender?: ResolvedSender,
+  opts?: {
+    larkAppId?: string;
+    chatId?: string;
+    whiteboardId?: string;
+    substituteTrigger?: SubstituteTrigger;
+    codexAppText?: string;
+    codexAppApplicationContext?: string;
+    codexAppMessageContext?: string;
+    codexAppFollowUps?: string[];
+    codexAppFollowUpContexts?: string[];
+  },
+): CliTurnPayload {
+  const content = buildNewTopicPrompt(
+    userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
+    availableBots, followUps, botIdentity, locale, sender, opts,
+  );
+  // Legacy pending buffers contain enriched strings. Only materialize those as
+  // clean input when the caller also preserved their matching raw texts.
+  if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) return { content };
+  const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
+  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
+  const senderBlock = renderSenderTag(sender);
+  const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
+  const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
+  const attachmentBlock = formatAttachmentsHint(attachments, locale);
+  const mentionBlock = renderMentionBlock(mentions);
+  const availableBotsBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
+  return {
+    content,
+    codexAppInput: buildCodexAppTurnInput({
+      text: [opts?.codexAppText ?? userMessage, ...(opts?.codexAppFollowUps ?? [])].join('\n\n'),
+      roleBlock,
+      whiteboardBlock,
+      senderBlock,
+      substitutePolicyBlock,
+      substituteTargetBlock,
+      attachmentBlock,
+      mentionBlock,
+      availableBotsBlock,
+      applicationContextBlock: opts?.codexAppApplicationContext,
+      messageContextBlock: opts?.codexAppMessageContext,
+      bufferedFollowUpsBlock: opts?.codexAppFollowUpContexts?.filter(Boolean).join('\n\n'),
+      attachments,
+    }),
+  };
+}
+
 /**
  * Build the content for a follow-up message (thread reply to an active session).
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
@@ -646,7 +803,7 @@ export function buildNewTopicPrompt(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
 ): string {
   const parts: string[] = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
@@ -686,15 +843,43 @@ export function buildFollowUpContent(
     : '';
   if (attachHint) parts.push(attachHint);
 
-  if (opts?.mentions && opts.mentions.length > 0) {
-    const items = opts.mentions.map(m => {
-      const oid = m.openId ? ` open_id="${xmlEscape(m.openId)}"` : '';
-      return `  <mention name="${xmlEscape(m.name)}"${oid} />`;
-    });
-    parts.push(`<mentions>\n${items.join('\n')}\n</mentions>`);
-  }
+  const mentionBlock = renderMentionBlock(opts?.mentions);
+  if (mentionBlock) parts.push(mentionBlock);
 
   return parts.join('\n\n');
+}
+
+/** Follow-up counterpart of buildNewTopicCliInput. */
+export function buildFollowUpCliInput(
+  content: string,
+  sessionId: string,
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+): CliTurnPayload {
+  const legacyContent = buildFollowUpContent(content, sessionId, opts);
+  if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) return { content: legacyContent };
+  const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
+  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts.whiteboardId });
+  const senderBlock = renderSenderTag(opts.sender);
+  const substitutePolicyBlock = renderSubstitutePolicy(opts.substituteTrigger);
+  const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
+  const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale);
+  const mentionBlock = renderMentionBlock(opts.mentions);
+  return {
+    content: legacyContent,
+    codexAppInput: buildCodexAppTurnInput({
+      text: opts.codexAppText ?? content,
+      roleBlock,
+      whiteboardBlock,
+      senderBlock,
+      substitutePolicyBlock,
+      substituteTargetBlock,
+      attachmentBlock,
+      mentionBlock,
+      applicationContextBlock: opts.codexAppApplicationContext,
+      messageContextBlock: opts.codexAppMessageContext,
+      attachments: opts.attachments,
+    }),
+  };
 }
 
 /**
@@ -834,6 +1019,54 @@ export function buildReforkPrompt(
   });
 }
 
+/** Structured refork variant. Adopted external CLIs intentionally remain on
+ * their existing raw bridge path and never receive a Codex App sidecar. */
+export function buildReforkCliInput(
+  ds: DaemonSession,
+  content: string,
+  opts?: {
+    attachments?: LarkAttachment[];
+    mentions?: LarkMention[];
+    cliId?: CliId;
+    cliPathOverride?: string;
+    selfMention?: { name?: string | null; openId?: string | null };
+    locale?: Locale;
+    sender?: ResolvedSender;
+    substituteTrigger?: SubstituteTrigger;
+    codexAppText?: string;
+    codexAppApplicationContext?: string;
+    codexAppMessageContext?: string;
+  },
+): CliTurnPayload {
+  const locale = opts?.locale ?? localeForBot(ds.larkAppId);
+  if (ds.adoptedFrom) {
+    return {
+      content: buildBridgeInputContent(content, {
+        attachments: opts?.attachments,
+        mentions: opts?.mentions,
+        selfMention: opts?.selfMention,
+        locale,
+      }),
+    };
+  }
+  return buildFollowUpCliInput(content, ds.session.sessionId, {
+    attachments: opts?.attachments,
+    mentions: opts?.mentions,
+    isAdoptMode: false,
+    cliId: opts?.cliId,
+    cliPathOverride: opts?.cliPathOverride,
+    locale,
+    sender: opts?.sender,
+    larkAppId: ds.larkAppId,
+    chatId: ds.session.chatId,
+    whiteboardId: ds.session.whiteboardId,
+    substituteTrigger: opts?.substituteTrigger,
+    codexAppText: opts?.codexAppText,
+    codexAppApplicationContext: opts?.codexAppApplicationContext,
+    codexAppMessageContext: opts?.codexAppMessageContext,
+  });
+}
+
 /**
  * Copy current streaming-card fields from `ds` into the persisted Session and save.
  * Lets the existing card be PATCHed on next screen_update after a daemon restart,
@@ -852,6 +1085,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
     sameUsageLimit(s.usageLimit, ds.usageLimit) &&
     s.lastUserPrompt === ds.lastUserPrompt &&
     s.lastCliInput === ds.lastCliInput &&
+    JSON.stringify(s.lastCodexAppInput ?? null) === JSON.stringify(ds.lastCodexAppInput ?? null) &&
     JSON.stringify(s.replyThreadAliases ?? {}) === JSON.stringify(ds.replyThreadAliases ?? {}) &&
     JSON.stringify(s.currentReplyTarget ?? null) === JSON.stringify(ds.currentReplyTarget ?? null)
   ) return;
@@ -863,6 +1097,8 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.usageLimit = ds.usageLimit;
   s.lastUserPrompt = ds.lastUserPrompt;
   s.lastCliInput = ds.lastCliInput;
+  if (ds.lastCodexAppInput) s.lastCodexAppInput = ds.lastCodexAppInput;
+  else delete s.lastCodexAppInput;
   s.replyThreadAliases = ds.replyThreadAliases;
   s.currentReplyTarget = ds.currentReplyTarget;
   // Clear legacy field so it doesn't drift
@@ -870,14 +1106,31 @@ export function persistStreamCardState(ds: DaemonSession): void {
   sessionStore.updateSession(s);
 }
 
-export function rememberLastCliInput(ds: DaemonSession, userPrompt: string, cliInput: string): void {
+export function rememberLastCliInput(
+  ds: DaemonSession,
+  userPrompt: string,
+  cliInput: string | CliTurnPayload,
+  opts?: { codexAppInputAccepted?: boolean },
+): void {
   // A real CLI input means the post-restart silence is over — let the normal
   // card flow resume for this and subsequent turns.
   ds.suppressRecoveryCard = undefined;
   ds.lastUserPrompt = userPrompt;
-  ds.lastCliInput = cliInput;
+  const normalized = typeof cliInput === 'string' ? { content: cliInput } : cliInput;
+  ds.lastCliInput = normalized.content;
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = ds.session.cliId ?? botCfg.cliId;
+  const keepCodexAppInput = opts?.codexAppInputAccepted ?? (
+    effectiveCliId === 'codex-app' &&
+    botCfg.codexAppCleanInput === true &&
+    !ds.adoptedFrom
+  );
+  if (keepCodexAppInput && normalized.codexAppInput) ds.lastCodexAppInput = normalized.codexAppInput;
+  else delete ds.lastCodexAppInput;
   ds.session.lastUserPrompt = userPrompt;
-  ds.session.lastCliInput = cliInput;
+  ds.session.lastCliInput = normalized.content;
+  if (keepCodexAppInput && normalized.codexAppInput) ds.session.lastCodexAppInput = normalized.codexAppInput;
+  else delete ds.session.lastCodexAppInput;
   ds.session.replyThreadAliases = ds.replyThreadAliases;
   ds.session.currentReplyTarget = ds.currentReplyTarget;
   sessionStore.updateSession(ds.session);
@@ -982,6 +1235,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         lastMessageAt: sessionLastMessageAtMs(session),
         hasHistory: false,
         workingDir: adopted.cwd,
+        ownerOpenId: session.ownerOpenId,
         adoptedFrom: adopted,
         streamCardId: session.streamCardId,
         streamCardNonce: session.streamCardNonce,
@@ -993,6 +1247,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         usageLimit: session.usageLimit,
         lastUserPrompt: session.lastUserPrompt,
         lastCliInput: session.lastCliInput,
+        lastCodexAppInput: session.lastCodexAppInput,
         replyThreadAliases: session.replyThreadAliases,
         currentReplyTarget: session.currentReplyTarget,
         // Restart stays silent for adopt sessions too: forkAdoptWorker shares
@@ -1008,7 +1263,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // resolving to the same chat-scope key — e.g. a leaked scratch +
       // relayed real session from a prior buggy run), close the loser
       // rather than silently overwriting it.
-      await setActiveSessionSafe(activeSessions, sessionKey(anchor, larkAppId), ds);
+      await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
       announceSessionRow(ds);
       forkAdoptWorker(ds, { restoredFromMetadata: true });
       logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adoptTargetLabel(adopted)}, scope: ${scope})`);
@@ -1042,11 +1297,13 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         workingDir: session.workingDir,
         ownerOpenId: session.ownerOpenId,
         pendingPrompt: session.queuedPrompt,
+        pendingCodexAppText: session.queuedCodexAppText,
+        pendingCodexAppMessageContext: session.queuedCodexAppMessageContext,
         currentTurnTitle: session.currentTurnTitle ?? session.title,
       };
       const anchor = sessionAnchorId(ds);
       messageQueue.ensureQueue(anchor);
-      await setActiveSessionSafe(activeSessions, sessionKey(anchor, larkAppId), ds);
+      await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
       // 重启后把待办池卡片重新广播给 dashboard，否则会从看板消失（#277 同款修复，
       // 我这条 queued 分支提前 continue 绕过了下面的 announceSessionRow，要自己补）。
       announceSessionRow(ds);
@@ -1069,6 +1326,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       lastMessageAt: sessionLastMessageAtMs(session),
       hasHistory: true,  // restored sessions have prior CLI history
       workingDir: session.workingDir,
+      ownerOpenId: session.ownerOpenId,
       // Restore persisted streaming-card state — next screen_update will PATCH
       // the existing card instead of POSTing a fresh one. If the card was
       // withdrawn while we were down, the PATCH fails with MessageWithdrawnError
@@ -1082,6 +1340,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       usageLimit: session.usageLimit,
       lastUserPrompt: session.lastUserPrompt,
       lastCliInput: session.lastCliInput,
+      lastCodexAppInput: session.lastCodexAppInput,
       replyThreadAliases: session.replyThreadAliases,
       currentReplyTarget: session.currentReplyTarget,
       // Restart stays silent in the group: the recovery re-fork won't post or
@@ -1093,7 +1352,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     messageQueue.ensureQueue(anchor);
     if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
     // Same-key collision guard — see adopt-branch comment above.
-    await setActiveSessionSafe(activeSessions, sessionKey(anchor, larkAppId), ds);
+    await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
     announceSessionRow(ds);
 
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);
@@ -1251,15 +1510,30 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
  *                          a fresh thread session); refuse rather than clobber
  *   - 'adopt_unsupported' — adopt sessions are torn down by /close and have
  *                          no resume semantics
+ *   - 'vc_receiver_managed' — dedicated meeting receivers are reconstructed
+ *                          through the meeting membership/hub lifecycle; a
+ *                          manual resume could resurrect a stale member epoch
  */
 export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported'; activeSessionId?: string }> {
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'vc_receiver_managed'; activeSessionId?: string }> {
   const session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
+
+  // A dedicated VC receiver is not an ordinary chat conversation. Its
+  // identity is fenced by (meeting, member, epoch) and its active-map slot is
+  // reconstructed by the meeting hub/membership lifecycle. Reactivating a
+  // closed receiver through the generic dashboard/card/CLI path would bypass
+  // that ownership check, potentially revive a stale epoch, and (before the
+  // dedicated-key fix) collapse it into the listener chat's ordinary slot.
+  // Keep it closed and let the authoritative meeting lifecycle create or
+  // recover the correct receiver binding.
+  if (session.vcMeetingReceiver) {
+    return { ok: false, error: 'vc_receiver_managed' };
+  }
 
   // Adopt sessions don't survive /close — the user's tmux pane and original
   // CLI pid have already moved on, and bringing the bridge back without a live
@@ -1365,6 +1639,7 @@ export async function resumeSession(
     usageLimit: session.usageLimit,
     lastUserPrompt: session.lastUserPrompt,
     lastCliInput: session.lastCliInput,
+    lastCodexAppInput: session.lastCodexAppInput,
     replyThreadAliases: session.replyThreadAliases,
     currentReplyTarget: session.currentReplyTarget,
   };
@@ -1394,9 +1669,15 @@ export async function executeScheduledTask(
     logger.debug('No bots configured, skipping scheduled task');
     return;
   }
-  const bot =
-    (task.larkAppId && allBots.find(b => b.config.larkAppId === task.larkAppId)) ||
-    allBots[0];
+  const bot = task.larkAppId
+    ? allBots.find(b => b.config.larkAppId === task.larkAppId)
+    : allBots[0];
+  if (!bot) {
+    throw new Error(
+      `Scheduled task ${task.id} is bound to unavailable bot ${task.larkAppId}; ` +
+      'refusing to deliver through a different bot',
+    );
+  }
   const larkAppId = bot.config.larkAppId;
 
   const { getChatMode, sendMessage, replyMessage } = await import('../im/lark/client.js');
@@ -1517,17 +1798,17 @@ export async function executeScheduledTask(
     markSessionActivity(existing);
     try {
       ensureSessionWhiteboard(existing);
-      const content = buildFollowUpContent(task.prompt, existing.session.sessionId, {
+      const input = buildFollowUpCliInput(task.prompt, existing.session.sessionId, {
         isAdoptMode: false,
-        cliId: bot.config.cliId,
-        cliPathOverride: bot.config.cliPathOverride,
+        cliId: existing.session.cliId ?? bot.config.cliId,
+        cliPathOverride: existing.session.cliPathOverride ?? bot.config.cliPathOverride,
         locale: localeForBot(larkAppId),
         larkAppId,
         chatId: task.chatId,
         whiteboardId: existing.session.whiteboardId,
       });
-      rememberLastCliInput(existing, task.prompt, content);
-      existing.worker.send({ type: 'message', content });
+      rememberLastCliInput(existing, task.prompt, input);
+      sendWorkerInput(existing, input);
       logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}`);
       return;
     } catch (err: any) {
@@ -1568,7 +1849,7 @@ export async function executeScheduledTask(
     workingDir: task.workingDir,
   };
   ensureSessionWhiteboard(ds);
-  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
+  const prompt = buildNewTopicCliInput(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
   activeSessions.set(sessionKey(anchor, larkAppId), ds);
   rememberLastCliInput(ds, task.prompt, prompt);
   forkWorker(ds, prompt);
@@ -1634,11 +1915,18 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
     }
   }
 
-  const buildPrompt = () => buildNewTopicPrompt(
+  const buildPrompt = () => buildNewTopicCliInput(
     userContent, ds.session.sessionId, bot.config.cliId, bot.config.cliPathOverride,
     undefined, undefined, undefined, undefined,
     { name: bot.botName, openId: bot.botOpenId }, locale, undefined,
-    { larkAppId, chatId: ds.chatId, whiteboardId: ds.session.whiteboardId },
+    {
+      larkAppId,
+      chatId: ds.chatId,
+      whiteboardId: ds.session.whiteboardId,
+      codexAppText: ds.pendingCodexAppText,
+      codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
+      codexAppMessageContext: ds.pendingCodexAppMessageContext,
+    },
   );
 
   if (!ds.workingDir) {
@@ -1672,6 +1960,9 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
   const prompt = buildPrompt();
   rememberLastCliInput(ds, userContent, prompt);
   forkWorker(ds, prompt);
+  ds.pendingCodexAppText = undefined;
+  ds.pendingCodexAppApplicationContext = undefined;
+  ds.pendingCodexAppMessageContext = undefined;
 }
 
 export interface SpawnDashboardSessionArgs {
@@ -1739,6 +2030,7 @@ export async function spawnDashboardSession(
   // 这份已包装内容，激活时直接喂给 buildNewTopicPrompt，保证待办池里起来的 lead
   // 也带编排上下文（coworkers 只有此刻可靠，激活时已无从重算）。
   const userContent = composeSpawnUserContent({ content, role, coworkers: args.coworkers, locale });
+  const codexAppMessageContext = composeSpawnCodexAppContext({ role, coworkers: args.coworkers, locale });
 
   const resolvedTitle = args.title || deriveSessionTitleFromContent(content);
   const session = sessionStore.createSession(chatId, bannerMessageId ?? chatId, resolvedTitle, 'group');
@@ -1752,6 +2044,8 @@ export async function spawnDashboardSession(
   if (column === 'backlog') {
     session.queued = true;
     session.queuedPrompt = userContent;
+    session.queuedCodexAppText = content;
+    session.queuedCodexAppMessageContext = codexAppMessageContext;
     session.kanbanColumn = 'backlog';
   }
 
@@ -1778,6 +2072,8 @@ export async function spawnDashboardSession(
     workingDir,
     ownerOpenId: session.ownerOpenId,
     currentTurnTitle: resolvedTitle,
+    pendingCodexAppText: content,
+    pendingCodexAppMessageContext: codexAppMessageContext,
   };
   activeSessions.set(sessionKey(anchor, larkAppId), ds);
 
@@ -1807,12 +2103,21 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     // 不该发生（queued 一定 worker:null），但保险：清标记即可。
     ds.session.queued = false;
     ds.session.queuedPrompt = undefined;
+    ds.session.queuedCodexAppText = undefined;
+    ds.session.queuedCodexAppMessageContext = undefined;
     sessionStore.updateSession(ds.session);
     return { ok: true };
   }
   const content = ds.session.queuedPrompt ?? ds.pendingPrompt ?? '';
+  // A parked dashboard task may have crossed a daemon restart. Restore the
+  // persisted clean-input sidecar before clearing the durable backlog fields;
+  // forkOrShowRepoCard will carry it through either immediate fork or /repo.
+  ds.pendingCodexAppText ??= ds.session.queuedCodexAppText;
+  ds.pendingCodexAppMessageContext ??= ds.session.queuedCodexAppMessageContext;
   ds.session.queued = false;
   ds.session.queuedPrompt = undefined;
+  ds.session.queuedCodexAppText = undefined;
+  ds.session.queuedCodexAppMessageContext = undefined;
   ds.pendingPrompt = undefined;
   // 激活即视为开始：从待办池挪到进行中，让卡片归位。
   if (ds.session.kanbanColumn === 'backlog') ds.session.kanbanColumn = 'in_progress';

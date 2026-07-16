@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
@@ -60,6 +61,15 @@ function renderKanban(state: Partial<SessionsKanbanState>): string {
 }
 
 describe('dashboard sessions filters', () => {
+  it('reads filter input values before entering React state updaters', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+
+    expect(page).toContain('const q = event.currentTarget.value;');
+    expect(page).toContain('const active = event.currentTarget.checked;');
+    expect(page).not.toContain('q: event.currentTarget.value');
+    expect(page).not.toContain('active: event.currentTarget.checked');
+  });
+
   it('derives CLI filter options from the shared CLI registry', () => {
     expect(CLI_FILTER_OPTIONS).toContain('codex');
     expect(CLI_FILTER_OPTIONS).toContain('codex-app');
@@ -109,10 +119,11 @@ describe('dashboard sessions filters', () => {
       .not.toBe(historySenderKey({ senderType: 'bot', senderId: 'ou_bot' }));
   });
 
-  it('defaults terminal entry to writable unless public read-only sharing is enabled', () => {
+  it('prioritizes dashboard auth over public read-only sharing', () => {
     expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: false })).toBe(true);
-    expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: true })).toBe(false);
+    expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: true })).toBe(true);
     expect(shouldOpenWritableTerminal({ authed: false, publicReadOnly: true })).toBe(false);
+    expect(shouldOpenWritableTerminal({ authed: false, publicReadOnly: false })).toBe(false);
   });
 
   it('renders the CLI filter as a multi-select checkbox group, not a dropdown', () => {

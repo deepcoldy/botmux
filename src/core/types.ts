@@ -1,5 +1,14 @@
 import type { ChildProcess } from 'node:child_process';
-import type { Session, DaemonToWorker, LarkAttachment, LarkMention, DisplayMode, StreamStatus } from '../types.js';
+import type {
+  CodexAppTurnInput,
+  Session,
+  DaemonToWorker,
+  LarkAttachment,
+  LarkMention,
+  DisplayMode,
+  StreamStatus,
+  VcMeetingImTurnOrigin,
+} from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
@@ -32,6 +41,12 @@ export interface DaemonSession {
   worker: ChildProcess | null;   // fork'd worker process
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
+  /** Independent read-only xterm capability. Optional for hydrated/legacy
+   * sessions; live workers publish it with their ready event. */
+  workerViewToken?: string | null;
+  /** Monotonic within one daemon boot. Captured by durable delivery receipts
+   *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
+  workerGeneration?: number;
   larkAppId: string;
   chatId: string;
   chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
@@ -52,6 +67,14 @@ export interface DaemonSession {
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
   worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
+  /** Clean Codex App text/context retained alongside pendingPrompt while repo
+   * selection delays the first turn. The legacy enriched prompt remains the
+   * compatibility source for every other CLI. */
+  pendingCodexAppText?: string;
+  /** Trusted, Botmux-authored instructions held out of the visible Codex App
+   * user message while the first turn waits for repo selection/worktree setup. */
+  pendingCodexAppApplicationContext?: string;
+  pendingCodexAppMessageContext?: string;
   /** One-shot CLI slash command to send literally after the worker reports
    *  prompt_ready. Used when a new topic starts with an adapter-default
    *  passthrough command such as `/goal`: the CLI must see raw `/...`, not a
@@ -64,7 +87,14 @@ export interface DaemonSession {
    *  after the raw input on prompt_ready, so the buffered messages queue as
    *  the next turn instead of being dropped. In-memory only, like
    *  pendingRawInput. */
-  pendingFollowUpInput?: { userPrompt: string; cliInput: string };
+  pendingFollowUpInput?: {
+    userPrompt: string;
+    cliInput: string;
+    codexAppInput?: CodexAppTurnInput;
+    /** The clean-input feature gate was evaluated when this follow-up was
+     * staged; prompt_ready must not re-read a later config value. */
+    codexAppInputGateFrozen?: true;
+  };
   pendingAttachments?: LarkAttachment[];
   pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
   pendingSubstituteTrigger?: import('../types.js').SubstituteTrigger;
@@ -73,6 +103,8 @@ export interface DaemonSession {
    *  matching the original caller, not the user who clicked the card. */
   pendingSender?: import('../im/lark/identity-cache.js').ResolvedSender;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
+  pendingCodexAppFollowUps?: string[]; // matching raw user texts for clean Codex App materialization
+  pendingCodexAppFollowUpContexts?: string[]; // matching metadata-only context; never duplicates the raw follow-up text
   ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
@@ -112,6 +144,7 @@ export interface DaemonSession {
   usageLimitRetryTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
   currentTurnTitle?: string;      // title for the current turn's streaming card
@@ -132,6 +165,20 @@ export interface DaemonSession {
     content?: string;
   }>;
   latestAsyncTriggerId?: string;
+  /** Stable turn ids whose automatic transcript fallback is capture/discard.
+   *  turn_terminal clears the entry; bounded in trigger-session for crash
+   *  paths that never produce a terminal. */
+  suppressedFinalOutputTurns?: Map<string, number>;
+  /** Worker-issued live turn registry used to authorize daemon-mediated exits
+   * (ask/relay) that cannot trust a long-lived CLI's spawn-time env. */
+  managedTurnOrigin?: {
+    capability: string;
+    turnId?: string;
+    dispatchAttempt?: number;
+  };
+  /** Authority snapshot captured when an explicit Lark IM message was
+   * deterministically routed into this dedicated meeting receiver. */
+  vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
   /** Cached TUI prompt options — for dedup and for resolving after click */
@@ -204,6 +251,17 @@ export function sessionKey(anchorId: string, larkAppId: string): string {
  *  storage and lookup time. */
 export function sessionAnchorId(ds: DaemonSession): string {
   return ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId;
+}
+
+/** Storage key for the daemon-owned activeSessions map. A VC receiver is a
+ * dedicated conversation even though its visible output route is a chat, so
+ * key it by its immutable session id instead of collapsing it into the normal
+ * `(chatId, appId)` chat-scope slot. */
+export function activeSessionKey(ds: DaemonSession): string {
+  const anchor = ds.session.vcMeetingReceiver
+    ? `vc-receiver:${ds.session.sessionId}`
+    : sessionAnchorId(ds);
+  return sessionKey(anchor, ds.larkAppId);
 }
 
 /** A session whose only IM surface is a Feishu document comment thread.

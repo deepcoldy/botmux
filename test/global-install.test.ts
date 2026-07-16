@@ -65,9 +65,35 @@ describe('resolveGlobalInstallPlan', () => {
     expect(plan.activePackageRoot).toBe(String.raw`D:\pnpm\global\5\node_modules\botmux`);
   });
 
+  it('pins Bun updates to the owning POSIX global package and bin directories', () => {
+    const root = '/home/bot/.bun/install/global/node_modules/botmux';
+    const plan = resolveGlobalInstallPlan(root, 'linux');
+    expect(plan).toEqual({
+      manager: 'bun',
+      command: 'bun',
+      args: ['add', '-g', 'botmux@latest'],
+      env: {
+        BUN_INSTALL_GLOBAL_DIR: '/home/bot/.bun/install/global',
+        BUN_INSTALL_BIN: '/home/bot/.bun/bin',
+      },
+      activePackageRoot: root,
+    });
+  });
+
+  it('pins Bun updates to the owning Windows global package and bin directories', () => {
+    const root = String.raw`D:\Users\bot\.bun\install\global\node_modules\botmux`;
+    const plan = resolveGlobalInstallPlan(root, 'win32');
+    expect(plan.manager).toBe('bun');
+    expect(plan.args).toEqual(['add', '-g', 'botmux@latest']);
+    expect(plan.env).toEqual({
+      BUN_INSTALL_GLOBAL_DIR: String.raw`D:\Users\bot\.bun\install\global`,
+      BUN_INSTALL_BIN: String.raw`D:\Users\bot\.bun\bin`,
+    });
+    expect(plan.activePackageRoot).toBe(root);
+  });
+
   it.each([
     ['/home/bot/.config/yarn/global/node_modules/botmux', 'yarn'],
-    ['/home/bot/.bun/install/global/node_modules/botmux', 'bun'],
     ['/opt/custom/node_modules/botmux', 'unknown'],
     ['/work/botmux', 'unknown'],
   ] as const)('rejects unsupported ownership for %s', (root, manager) => {

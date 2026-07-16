@@ -137,6 +137,13 @@ export interface SandboxPlan {
    *  (daemon-produced, e.g. skill plugin dirs) — bound AFTER the privacy masks so
    *  a broad hideDir can't break skill delivery. */
   readonlyRoots?: string[];
+  /** Daemon-generated private roots re-bound writable AFTER credential masks.
+   * Used for the current bot's isolated CLI home only; never accepts user
+   * config. */
+  trustedWritableRoots?: string[];
+  /** Crown-jewel masks emitted after trusted writable carve-outs. */
+  finalHideDirs?: string[];
+  finalHideFiles?: { path: string; empty: string }[];
   /** User-configured read-only inputs (per-bot sandboxReadonlyPaths). Bound BEFORE
    *  the privacy masks so hidePaths always win over them — an entry overlapping a
    *  masked path must never re-expose the real content. */
@@ -175,6 +182,13 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   // Per-bot privacy masks (opt-in, no defaults).
   for (const dir of plan.hideDirs) a.push('--tmpfs', dir);
   for (const f of plan.hideFiles) a.push('--ro-bind', f.empty, f.path);
+  // Re-open only daemon-derived private roots (for example this bot's own
+  // BOT_HOME) after their parent BOTMUX_HOME was blanked.
+  for (const root of plan.trustedWritableRoots ?? []) a.push('--bind', root, root);
+  // A private root can itself contain a credential that the sandbox must not
+  // recover (notably send-cred.json). Re-deny those after the carve-out.
+  for (const dir of plan.finalHideDirs ?? []) a.push('--tmpfs', dir);
+  for (const f of plan.finalHideFiles ?? []) a.push('--ro-bind', f.empty, f.path);
   // Session-scoped TRUSTED runtime inputs, e.g. generated skill/plugin dirs —
   // after the masks so a broad hideDir can't blank skill delivery.
   for (const root of plan.readonlyRoots ?? []) a.push('--ro-bind', root, root);
@@ -351,6 +365,23 @@ export function sandboxedClaudeDataDir(sessionId: string, realDataDir: string): 
   return join(VARTMP_ROOT, sessionId, 'home-upper', rel);
 }
 
+/** Credential roots that must never be readable inside the file sandbox.
+ * Relay mode is the only credentialed send path; otherwise an agent could
+ * unset BOTMUX_SEND_RELAY and execute an absolute botmux binary against the
+ * real bots.json/send-cred files exposed by the HOME overlay lowerdir. */
+export function sandboxCredentialHidePaths(home: string, botmuxHome = join(home, '.botmux')): string[] {
+  // Mask the entire botmux state root. Exact-file masks are insufficient:
+  // setup/update creates timestamped bots.json backups, including ones created
+  // after a long-lived sandbox starts. Trusted skill roots and the per-session
+  // outbox are explicitly re-bound after privacy masks by buildSandboxArgs.
+  return [...new Set([
+    join(home, '.botmux'),
+    botmuxHome,
+    join(home, '.lark-cli'),
+    join(home, '.lark-cli-bots'),
+  ])].sort();
+}
+
 /** Proxy env vars forwarded into the sandbox so the CLI reaches the API even on
  *  the tmux backend (which otherwise only forwards a fixed whitelist). */
 const PROXY_ENV_KEYS = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'no_proxy', 'NO_PROXY', 'all_proxy', 'ALL_PROXY'] as const;
@@ -401,6 +432,10 @@ export function prepareSandbox(opts: {
   /** Runtime-generated roots that should be visible read-only inside bwrap.
    *  Trusted (daemon-produced) — bound after the privacy masks. */
   readonlyRoots?: readonly string[];
+  /** Daemon-derived private roots to re-open writable after mandatory masks. */
+  trustedWritablePaths?: readonly string[];
+  /** Credential paths to re-mask after trusted writable carve-outs. */
+  finalHidePaths?: readonly string[];
   /** User-configured extra read-only inputs (per-bot sandboxReadonlyPaths).
    *  Bound before the privacy masks (masks win) and rejected when they would
    *  shadow the home/project overlay roots. */
@@ -417,6 +452,7 @@ export function prepareSandbox(opts: {
   if (!ensureSandboxDeps(needFuse)) return null;
 
   const dataDir = resolveSandboxMountPath(opts.dataDir);
+  const botmuxHome = dirname(dataDir);
   const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
   const outbox = join(sessionRoot, 'outbox');
   const shimBin = join(sessionRoot, 'shimbin');
@@ -432,6 +468,14 @@ export function prepareSandbox(opts: {
   for (const d of [outbox, shimBin, empties]) mkdirSync(d, { recursive: true });
 
   const home = resolveSandboxMountPath(homedir());
+  // Masking BOTMUX_HOME is mandatory for the credential boundary.  A layout
+  // that makes it `/` or the whole user home cannot be masked without erasing
+  // the sandbox runtime itself, so refuse the spawn instead of silently
+  // exposing the custom session/config root.
+  if (botmuxHome === '/' || botmuxHome === home) {
+    console.error(`[sandbox] unsafe SESSION_DATA_DIR layout: BOTMUX_HOME resolves to ${botmuxHome}`);
+    return null;
+  }
   // BOTMUX_SANDBOX_SRC overrides the LOWER project source for spike testing only.
   const projectSource = resolveSandboxMountPath(process.env.BOTMUX_SANDBOX_SRC || opts.sourceWorkingDir);
   const projectMount = resolveSandboxMountPath(opts.sourceWorkingDir);
@@ -465,14 +509,25 @@ export function prepareSandbox(opts: {
   writeFileSync(shim, `#!/bin/sh\nexec node ${JSON.stringify(distCliJs())} "$@"\n`);
   chmodSync(shim, 0o755);
 
-  // Per-bot privacy masks: existing dirs → tmpfs blank; everything else → empty
-  // read-only placeholder file. No defaults (caller passes hidePaths explicitly).
+  // Credential masks are mandatory; per-bot privacy masks extend them.
+  // Existing dirs → tmpfs blank; everything else → empty read-only placeholder.
   // `~` resolves like the docs' examples (`~/.ssh`) — an unexpanded tilde would
   // fail existsSync and mask a literal `~/...` path, leaving the real one readable.
   const hideDirs: string[] = [];
   const hideFiles: { path: string; empty: string }[] = [];
+  const finalHideDirs: string[] = [];
+  const finalHideFiles: { path: string; empty: string }[] = [];
   let emptyIdx = 0;
-  for (const raw of opts.hidePaths ?? []) {
+  const customBotsConfig = process.env.BOTS_CONFIG?.trim();
+  const credentialPaths = [
+    // SESSION_DATA_DIR may live outside ~/.botmux.  Its parent is the
+    // authoritative BOTMUX_HOME everywhere else (send-cred, per-bot homes,
+    // sessions/receipts); mask that exact root so a custom location cannot be
+    // recovered through the sandbox's initial read-only bind of `/`.
+    ...sandboxCredentialHidePaths(home, botmuxHome),
+    ...(customBotsConfig ? [resolve(customBotsConfig)] : []),
+  ];
+  for (const raw of [...credentialPaths, ...(opts.hidePaths ?? [])]) {
     if (!raw || typeof raw !== 'string') continue;
     const p = expandTilde(raw, home);
     let isDir = false;
@@ -485,12 +540,26 @@ export function prepareSandbox(opts: {
       hideFiles.push({ path: p, empty });
     }
   }
+  for (const raw of opts.finalHidePaths ?? []) {
+    if (!raw || typeof raw !== 'string') continue;
+    const p = expandTilde(raw, home);
+    let isDir = false;
+    try { isDir = existsSync(p) && statSync(p).isDirectory(); } catch { /* */ }
+    if (isDir) {
+      finalHideDirs.push(p);
+    } else {
+      const empty = join(empties, `mask-${emptyIdx++}`);
+      try { writeFileSync(empty, ''); } catch { /* */ }
+      finalHideFiles.push({ path: p, empty });
+    }
+  }
 
   // CLI auth/login paths kept real+writable (token refresh / login must persist,
   // unlike isolated project edits). Resolve `~` and bind only existing paths — a
   // missing auth file isn't a valid mountpoint (the CLI must be logged in on the
   // host; login-from-scratch inside the sandbox isn't supported).
   const authReal = resolveExistingPaths(opts.authPaths, home);
+  const trustedWritableRoots = resolveExistingPaths(opts.trustedWritablePaths, home);
   const readonlyRoots = resolveExistingPaths(opts.readonlyRoots, home);
   const userReadonlyRoots = resolveUserReadonlyRoots(opts.userReadonlyPaths, home, projectMount);
 
@@ -503,6 +572,9 @@ export function prepareSandbox(opts: {
     hideDirs,
     hideFiles,
     authReal,
+    trustedWritableRoots,
+    finalHideDirs,
+    finalHideFiles,
     readonlyRoots,
     userReadonlyRoots,
     net: opts.net !== false,
@@ -534,6 +606,18 @@ export function prepareSandbox(opts: {
     BOTMUX_SEND_RELAY: outbox,                       // routes `botmux send` to the daemon outbox watcher
     PATH: `/run/sbxbin:${process.env.PATH ?? ''}`,   // /run/sbxbin first so `botmux` = the relay shim
   };
+  // The daemon discovery dir lives under the masked BOTMUX_HOME, so the only
+  // way an in-sandbox CLI can dial the daemon's loopback IPC (session-scoped,
+  // capability-gated routes like the v3 workflow relay) is this port marker.
+  // Not a credential: every route it reaches authenticates independently.
+  if (process.env.BOTMUX_DAEMON_IPC_PORT) {
+    env.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
+  }
+  // Never inherit a custom credential config path into the sandbox. Its host
+  // path is masked above as defense in depth, while unsetenv prevents an
+  // absolute botmux/lark client from being pointed at it explicitly.
+  args.push('--unsetenv', 'BOTS_CONFIG');
+  args.push('--unsetenv', 'BOTMUX_HOST_RELAY_AUTHORIZED');
   // Forward proxy vars so the CLI reaches the API on the tmux backend too.
   for (const k of PROXY_ENV_KEYS) {
     const v = process.env[k];
@@ -687,14 +771,18 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
 // watcher NEVER executes sandbox-supplied argv — it rebuilds the command from
 // these validated fields. This is the security boundary: a malicious agent can
 // write any outbox file, so everything here is treated as untrusted.
-//   { contentFile: <basename in outbox>, cardFile?: <basename in outbox>, attachments: [<basename>...], videos: [<basename>...], videoCovers: [<basename>...], flags: [...] }
+//   { contentFile: <basename>, preparedContentFile?: <basename>, cardFile?: <basename>, ... }
 export interface RelayRequest {
   contentFile?: unknown;
+  preparedContentFile?: unknown;
   cardFile?: unknown;
   attachments?: unknown;
   videos?: unknown;
   videoCovers?: unknown;
   flags?: unknown;
+  originTurnId?: unknown;
+  originDispatchAttempt?: unknown;
+  originCapability?: unknown;
 }
 // Presentation-only flags the sandbox may pass through. Path-bearing flags
 // (--content-file/--file(s)/--image(s)/--video(s)), routing flags
@@ -706,17 +794,22 @@ const RELAY_FLAGS_VAL = new Set(['--mention', '--quote']);
 
 export interface ValidatedRelay {
   contentName: string;
+  preparedContentName?: string;
   cardName?: string;
   attachmentNames: string[];
   videoNames: string[];
   videoCoverNames: string[];
   flags: string[];
+  originTurnId?: string;
+  originDispatchAttempt?: number;
+  originCapability?: string;
 }
 
 /**
  * PURE validation of an outbox relay request (schema + flag allowlist only — no
  * filesystem access, so it's deterministically testable):
- *  - contentFile/cardFile/attachments/videos/videoCovers must be plain basenames (no `/`, `\`, `..`).
+ *  - contentFile/preparedContentFile/cardFile/attachments/videos/videoCovers
+ *    must be plain basenames (no `/`, `\`, `..`).
  *  - only allowlisted presentation flags pass; any other flag → reject (this
  *    rejects raw `--content-file`/`--session-id`/path flags etc.).
  * The TOCTOU-safe filesystem read is handled separately by materializeOutboxFile,
@@ -727,6 +820,14 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
     typeof n === 'string' && !!n && !n.includes('/') && !n.includes('\\') && !n.includes('..');
 
   if (!safeName(req.contentFile)) return { ok: false, error: 'contentFile must be a plain outbox basename' };
+  const preparedContentName = req.preparedContentFile === undefined
+    ? undefined
+    : safeName(req.preparedContentFile)
+      ? req.preparedContentFile
+      : null;
+  if (preparedContentName === null) {
+    return { ok: false, error: 'preparedContentFile must be a plain outbox basename' };
+  }
   const cardName = req.cardFile === undefined
     ? undefined
     : safeName(req.cardFile)
@@ -765,7 +866,45 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
     }
     return { ok: false, error: `flag not allowed: ${f}` };
   }
-  return { ok: true, value: { contentName: req.contentFile, cardName, attachmentNames, videoNames, videoCoverNames, flags } };
+  const originTurnId = req.originTurnId === undefined
+    ? undefined
+    : typeof req.originTurnId === 'string' && req.originTurnId.trim() && req.originTurnId.length <= 256
+      ? req.originTurnId
+      : null;
+  if (originTurnId === null) return { ok: false, error: 'originTurnId must be a non-empty bounded string' };
+  const originDispatchAttempt = req.originDispatchAttempt === undefined
+    ? undefined
+    : typeof req.originDispatchAttempt === 'number'
+      && Number.isSafeInteger(req.originDispatchAttempt)
+      && req.originDispatchAttempt > 0
+      ? req.originDispatchAttempt
+      : null;
+  if (originDispatchAttempt === null) return { ok: false, error: 'originDispatchAttempt must be a positive safe integer' };
+  if (originDispatchAttempt !== undefined && originTurnId === undefined) {
+    return { ok: false, error: 'originDispatchAttempt requires originTurnId' };
+  }
+  const originCapability = req.originCapability === undefined
+    ? undefined
+    : typeof req.originCapability === 'string'
+      && /^[a-f0-9]{32,128}$/i.test(req.originCapability)
+      ? req.originCapability
+      : null;
+  if (originCapability === null) return { ok: false, error: 'originCapability must be a bounded hex token' };
+  return {
+    ok: true,
+    value: {
+      contentName: req.contentFile,
+      preparedContentName,
+      cardName,
+      attachmentNames,
+      videoNames,
+      videoCoverNames,
+      flags,
+      ...(originTurnId !== undefined ? { originTurnId } : {}),
+      ...(originDispatchAttempt !== undefined ? { originDispatchAttempt } : {}),
+      ...(originCapability !== undefined ? { originCapability } : {}),
+    },
+  };
 }
 
 /**
@@ -808,10 +947,41 @@ export function materializeOutboxFile(outbox: string, name: string, dest: string
  * build's `send` OUTSIDE the sandbox (full creds) against the private copies,
  * with the session-id FORCED. This keeps every Lark credential out of the sandbox.
  */
-export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, sessionId: string): () => void {
-  const cli = distCliJs();
-  const env = { ...baseEnv };
+export function buildRelayHostEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  preparedContentFile?: string,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.BOTMUX_SEND_RELAY;
+  delete env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
+  if (preparedContentFile) {
+    env.BOTMUX_CARD_LOCAL_LINK_MODE = 'disabled';
+    env.BOTMUX_CARD_PREPARED_CONTENT_FILE = preparedContentFile;
+  } else {
+    // A hand-written/incomplete relay request must never fall back to host
+    // filesystem probes. It may lose relative-path disambiguation, but cannot
+    // turn the worker into a host existence oracle.
+    env.BOTMUX_CARD_LOCAL_LINK_MODE = 'lexical';
+  }
+  return env;
+}
+
+export function startOutboxWatcher(
+  outbox: string,
+  baseEnv: NodeJS.ProcessEnv,
+  sessionId: string,
+  opts: {
+    /** Host-side authorization for a relay's claimed origin capability. When
+     *  absent the relay still runs, but carries NO durable origin — a missing
+     *  hook must never let the sandbox promote its own origin fields. */
+    authorize?: (claim: { capability?: string }) =>
+      | { ok: true; origin: { turnId?: string; dispatchAttempt?: number } }
+      | { ok: false; error: string };
+    cliPath?: string;
+  } = {},
+): () => void {
+  const cli = opts.cliPath ?? distCliJs();
+  const authorize = opts.authorize;
   const inFlight = new Set<string>();
   // Host-private staging — a sibling of the outbox, NOT bound into the sandbox.
   const staging = join(dirname(outbox), 'relay-staging');
@@ -839,6 +1009,11 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
 
       const v = validateRelayRequest(req);
       if (!v.ok) { finish(id, reqPath, name, staged, 1, '', `relay rejected: ${v.error}`); continue; }
+      const authorization = authorize?.({ capability: v.value.originCapability });
+      if (authorization && !authorization.ok) {
+        finish(id, reqPath, name, staged, 2, '', `relay rejected: ${authorization.error}`);
+        continue;
+      }
 
       try { mkdirSync(staging, { recursive: true }); } catch { /* */ }
       // Materialize content (TOCTOU-safe) into the private staging dir.
@@ -848,6 +1023,15 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
         continue;
       }
       staged.push(contentDest);
+      let preparedContentPath: string | undefined;
+      if (v.value.preparedContentName) {
+        preparedContentPath = join(staging, `${id}.card-content`);
+        if (!materializeOutboxFile(outbox, v.value.preparedContentName, preparedContentPath)) {
+          finish(id, reqPath, name, staged, 1, '', 'relay rejected: prepared content not a regular file in outbox');
+          continue;
+        }
+        staged.push(preparedContentPath);
+      }
       let cardPath: string | undefined;
       if (v.value.cardName) {
         cardPath = join(staging, `${id}.card.json`);
@@ -893,7 +1077,29 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, s
         ...videoCoverPaths.flatMap(a => ['--video-covers', a]),
         '--session-id', sessionId,  // forced — sandbox cannot target another session
       ];
-      const child = spawn(process.execPath, [cli, 'send', ...hostArgs], { env });
+      // Fail closed: a durable origin (turnId/dispatchAttempt) may come ONLY
+      // from a host-side authorize decision. The sandbox controls every byte of
+      // the relay request, so its originTurnId/dispatchAttempt are never trusted
+      // — without an authorize hook the relay runs with no durable origin.
+      const trustedOrigin = authorization?.ok ? authorization.origin : undefined;
+      // Master's relay host env (BOTMUX_SEND_RELAY stripped + prepared-content
+      // local-link mode) is the base for the watcher-spawned host re-exec.
+      const requestEnv: NodeJS.ProcessEnv = {
+        ...buildRelayHostEnv(baseEnv, preparedContentPath),
+        BOTMUX_SESSION_ID: sessionId,
+      };
+      // The host re-exec itself is trusted (the sandbox child has this marker
+      // explicitly unset). Scrub any inherited durable-origin markers first,
+      // then re-apply only what the host authorized; cmdSend still re-validates
+      // the exact receipt/IM origin carried below.
+      requestEnv.BOTMUX_HOST_RELAY_AUTHORIZED = '1';
+      delete requestEnv.BOTMUX_TURN_ID;
+      delete requestEnv.BOTMUX_DISPATCH_ATTEMPT;
+      if (trustedOrigin?.turnId !== undefined) requestEnv.BOTMUX_TURN_ID = trustedOrigin.turnId;
+      if (trustedOrigin?.dispatchAttempt !== undefined) {
+        requestEnv.BOTMUX_DISPATCH_ATTEMPT = String(trustedOrigin.dispatchAttempt);
+      }
+      const child = spawn(process.execPath, [cli, 'send', ...hostArgs], { env: requestEnv });
       let out = '', err = '';
       child.stdout.on('data', d => { out += d; });
       child.stderr.on('data', d => { err += d; });

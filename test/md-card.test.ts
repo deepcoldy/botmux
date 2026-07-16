@@ -7,6 +7,9 @@
  * rewrite plus baseline behaviors that must not regress.
  */
 import { describe, it, expect } from 'vitest';
+import { homedir, tmpdir } from 'node:os';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   buildCardBodyElements,
   buildImageCardElements,
@@ -15,6 +18,7 @@ import {
   brandFooterSegment,
   DEFAULT_BRAND_LABEL,
   hasMarkdown,
+  normalizeLocalHomeLinks,
 } from '../src/im/lark/md-card.js';
 
 function mdElements(out: any[]): Array<{ tag: 'markdown'; content: string }> {
@@ -189,6 +193,468 @@ describe('buildCardBodyElements', () => {
     const input = 'Use \\`\\`\\` for fences';
     const out = buildCardBodyElements(input);
     expect(mdElements(out)[0].content).toContain('\\`\\`\\`');
+  });
+});
+
+describe('normalizeLocalHomeLinks', () => {
+  const home = '/Users/alice';
+  const absoluteHomeFileExists = (path: string) => path.startsWith('/Users/alice/');
+
+  it('restores the leading slash dropped from a current-home link', () => {
+    expect(normalizeLocalHomeLinks('[report](Users/alice/work/report.md)', home, '/tmp/project', absoluteHomeFileExists))
+      .toBe('[report](/Users/alice/work/report.md)');
+    expect(normalizeLocalHomeLinks('[report](users/alice/work/report.md)', home, '/tmp/project', absoluteHomeFileExists))
+      .toBe('[report](/Users/alice/work/report.md)');
+  });
+
+  it('supports an angle-bracket destination containing spaces', () => {
+    expect(normalizeLocalHomeLinks('[report](<Users/alice/My Project/report.md>)', home, '/tmp/project', absoluteHomeFileExists))
+      .toBe('[report](</Users/alice/My Project/report.md>)');
+  });
+
+  it('repairs a destination with a CommonMark-escaped slash', () => {
+    expect(normalizeLocalHomeLinks(
+      '[report](Users/alice\\/work/report.md)', home, '/tmp/project',
+      path => path === '/Users/alice/work/report.md',
+    )).toBe('[report](/Users/alice\\/work/report.md)');
+  });
+
+  it('does not alter absolute, web, or unrelated relative links', () => {
+    const input = [
+      '[absolute](/Users/alice/work/a.md)',
+      '[web](https://example.test/Users/alice/a.md)',
+      '[relative](Users/guide.md)',
+      '[other user](Users/bob/a.md)',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home)).toBe(input);
+  });
+
+  it('preserves a current-home-shaped target when it exists relative to cwd', () => {
+    const seen: string[] = [];
+    const input = '[report](Users/alice/work/report.md)';
+    const output = normalizeLocalHomeLinks(input, home, '/tmp/project', path => {
+      seen.push(path);
+      return path === '/tmp/project/Users/alice/work/report.md';
+    });
+
+    expect(output).toBe(input);
+    expect(seen).toEqual(['/tmp/project/Users/alice/work/report.md']);
+  });
+
+  it('uses the source case when checking a cwd-relative target on Linux', () => {
+    const input = '[case-relative](Home/alice/a.md)';
+    const seen: string[] = [];
+    const output = normalizeLocalHomeLinks(input, '/home/alice', '/tmp/project', path => {
+      seen.push(path);
+      return path === '/tmp/project/Home/alice/a.md' || path === '/home/alice/a.md';
+    });
+
+    expect(output).toBe(input);
+    expect(seen).toEqual(['/tmp/project/Home/alice/a.md']);
+  });
+
+  it('preserves an exact-case relative file using real filesystem checks', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-md-card-case-'));
+    const fakeHome = join(root, 'home', 'alice');
+    const cwd = join(root, 'project');
+    const canonicalRelative = fakeHome.replace(/^\/+/, '');
+    const sourceRelative = canonicalRelative.replace(/home\/alice$/, 'Home/alice');
+    try {
+      mkdirSync(join(fakeHome), { recursive: true });
+      mkdirSync(join(cwd, sourceRelative), { recursive: true });
+      writeFileSync(join(fakeHome, 'a.md'), 'absolute');
+      writeFileSync(join(cwd, sourceRelative, 'a.md'), 'relative');
+      const input = `[case-relative](${sourceRelative}/a.md)`;
+      expect(normalizeLocalHomeLinks(input, fakeHome, cwd)).toBe(input);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('repairs a current-home-shaped target when it does not exist relative to cwd', () => {
+    expect(normalizeLocalHomeLinks(
+      '[report](Users/alice/work/report.md)',
+      home,
+      '/tmp/project',
+      path => path === '/Users/alice/work/report.md',
+    )).toBe('[report](/Users/alice/work/report.md)');
+  });
+
+  it('repairs Codex :line and :line:column file destinations', () => {
+    const exists = (path: string) => path === '/Users/alice/work/file.ts';
+    expect(normalizeLocalHomeLinks(
+      '[line](Users/alice/work/file.ts:57)', home, '/tmp/project', exists,
+    )).toBe('[line](/Users/alice/work/file.ts:57)');
+    expect(normalizeLocalHomeLinks(
+      '[column](Users/alice/work/file.ts:57:9)', home, '/tmp/project', exists,
+    )).toBe('[column](/Users/alice/work/file.ts:57:9)');
+  });
+
+  it('prefers a real filename containing a numeric colon suffix', () => {
+    const seen: string[] = [];
+    const exists = (path: string) => {
+      seen.push(path);
+      return path === '/Users/alice/work/file.ts:57';
+    };
+    expect(normalizeLocalHomeLinks(
+      '[file](Users/alice/work/file.ts:57)', home, '/tmp/project', exists,
+    )).toBe('[file](/Users/alice/work/file.ts:57)');
+    expect(seen).toContain('/Users/alice/work/file.ts:57');
+    expect(seen).not.toContain('/Users/alice/work/file.ts');
+  });
+
+  it('does not guess when neither the relative nor absolute target exists', () => {
+    const input = '[report](Users/alice/work/missing.md)';
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', () => false)).toBe(input);
+  });
+
+  it('does not allow a home-shaped target to escape the home via dot segments', () => {
+    const input = '[passwd](Users/alice/../../../etc/passwd)';
+    const seen: string[] = [];
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', path => {
+      seen.push(path);
+      return path === '/etc/passwd';
+    })).toBe(input);
+    expect(seen).toEqual([]);
+  });
+
+  it('does not let a source-position fallback escape the home', () => {
+    const input = '[escape](Users/alice/..:123)';
+    const seen: string[] = [];
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', path => {
+      seen.push(path);
+      return path === '/Users/alice/..';
+    })).toBe(input);
+    expect(seen).toEqual([
+      '/tmp/project/Users/alice/..:123',
+      '/Users/alice/..:123',
+    ]);
+  });
+
+  it('uses lexical repair without filesystem probes when requested', () => {
+    const seen: string[] = [];
+    expect(normalizeLocalHomeLinks(
+      '[report](Users/alice/work/report.md)',
+      home,
+      '/tmp/project',
+      path => { seen.push(path); return true; },
+      'lexical',
+    )).toBe('[report](/Users/alice/work/report.md)');
+    expect(seen).toEqual([]);
+
+    expect(normalizeLocalHomeLinks(
+      '[escape](Users/alice/..:123)', home, '/tmp/project', () => true, 'lexical',
+    )).toBe('[escape](Users/alice/..:123)');
+  });
+
+  it('leaves prepared content untouched without filesystem probes when disabled', () => {
+    const input = '[report](Users/alice/work/report.md)';
+    expect(normalizeLocalHomeLinks(
+      input,
+      home,
+      '/tmp/project',
+      () => { throw new Error('filesystem probe must stay disabled'); },
+      'disabled',
+    )).toBe(input);
+  });
+
+  it('never rewrites explicit dot-relative targets', () => {
+    const input = [
+      '[same dir](./Users/alice/report.md)',
+      '[parent dir](../Users/alice/report.md)',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', () => false)).toBe(input);
+  });
+
+  it('does not rewrite examples inside inline or fenced code', () => {
+    const input = [
+      '`[inline](Users/alice/a.md)`',
+      '```markdown',
+      '[fenced](Users/alice/b.md)',
+      '```',
+      '[real](Users/alice/c.md)',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
+      '`[inline](Users/alice/a.md)`',
+      '```markdown',
+      '[fenced](Users/alice/b.md)',
+      '```',
+      '[real](/Users/alice/c.md)',
+    ].join('\n'));
+  });
+
+  it('does not rewrite a link-shaped example in an indented code block', () => {
+    const input = [
+      '    [indented](Users/alice/a.md)',
+      '',
+      '[real](Users/alice/a.md)',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
+      '    [indented](Users/alice/a.md)',
+      '',
+      '[real](/Users/alice/a.md)',
+    ].join('\n'));
+  });
+
+  it('does not rewrite a link-shaped example in a multiline code span', () => {
+    const input = [
+      '`first line',
+      '[code](Users/alice/a.md)',
+      'last line`',
+      '',
+      '[real](Users/alice/a.md)',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
+      '`first line',
+      '[code](Users/alice/a.md)',
+      'last line`',
+      '',
+      '[real](/Users/alice/a.md)',
+    ].join('\n'));
+  });
+
+  it('does not rewrite malformed link syntax that markdown-it rejects', () => {
+    const input = '[not closed](Users/alice/a.md';
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe(input);
+  });
+
+  it('does not treat vertical-tab or form-feed as valid link whitespace', () => {
+    const input = [
+      '[vertical](\vUsers/alice/a.md)',
+      '[form](\fUsers/alice/a.md)',
+      '[real](Users/alice/a.md)',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
+      '[vertical](\vUsers/alice/a.md)',
+      '[form](\fUsers/alice/a.md)',
+      '[real](/Users/alice/a.md)',
+    ].join('\n'));
+  });
+
+  it('does not rewrite escaped link syntax or image destinations', () => {
+    const input = [
+      '\\[escaped](Users/alice/a.md)',
+      '![image](Users/alice/a.md)',
+      '[real](Users/alice/a.md)',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
+      '\\[escaped](Users/alice/a.md)',
+      '![image](Users/alice/a.md)',
+      '[real](/Users/alice/a.md)',
+    ].join('\n'));
+  });
+
+  it('does not rewrite code inside nested blockquote and list fences', () => {
+    const input = [
+      '> ```markdown',
+      '> [quoted](Users/alice/a.md)',
+      '> ```',
+      '',
+      '- item',
+      '  ```markdown',
+      '  [listed](Users/alice/a.md)',
+      '  ```',
+      '',
+      '[real](Users/alice/a.md)',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
+      '> ```markdown',
+      '> [quoted](Users/alice/a.md)',
+      '> ```',
+      '',
+      '- item',
+      '  ```markdown',
+      '  [listed](Users/alice/a.md)',
+      '  ```',
+      '',
+      '[real](/Users/alice/a.md)',
+    ].join('\n'));
+  });
+
+  it('preserves CRLF, angle brackets, query, fragment, and link title bytes', () => {
+    const input = '[report](  <Users/alice/My Project/a.md?raw=1#L2>  "title"  )\r\nnext';
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists))
+      .toBe('[report](  </Users/alice/My Project/a.md?raw=1#L2>  "title"  )\r\nnext');
+  });
+
+  it('uses markdown semantics with lone-CR line endings', () => {
+    const input = [
+      'intro',
+      '',
+      '~~~',
+      '[fenced](Users/alice/a.md)',
+      '~~~',
+      '',
+      '    [indented](Users/alice/a.md)',
+      '',
+      '[real](Users/alice/a.md)',
+    ].join('\r');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
+      'intro',
+      '',
+      '~~~',
+      '[fenced](Users/alice/a.md)',
+      '~~~',
+      '',
+      '    [indented](Users/alice/a.md)',
+      '',
+      '[real](/Users/alice/a.md)',
+    ].join('\r'));
+  });
+
+  it('repairs a multiline link destination inside a blockquote', () => {
+    const input = '> [report](\n> Users/alice/a.md)';
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists))
+      .toBe('> [report](\n> /Users/alice/a.md)');
+  });
+
+  it('repairs real links inside GFM table cells', () => {
+    const input = [
+      '| file | note |',
+      '| --- | --- |',
+      '| [report](Users/alice/a.md) | keep |',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
+      '| file | note |',
+      '| --- | --- |',
+      '| [report](/Users/alice/a.md) | keep |',
+    ].join('\n'));
+  });
+
+  it('keeps exact offsets for a table link after an escaped pipe', () => {
+    const input = [
+      '| file |',
+      '| --- |',
+      '| before \\| [report](Users/alice/a.md) |',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
+      '| file |',
+      '| --- |',
+      '| before \\| [report](/Users/alice/a.md) |',
+    ].join('\n'));
+  });
+
+  it('does not combine link syntax across table cell boundaries', () => {
+    const input = [
+      '| first | second |',
+      '| --- | --- |',
+      '| [label | ](Users/alice/a.md) |',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe(input);
+  });
+
+  it('does not let an unmatched backtick in one table cell hide a real link in the next', () => {
+    const input = [
+      '| first | second |',
+      '| --- | --- |',
+      '| `code | [report](Users/alice/a.md) |',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
+      '| first | second |',
+      '| --- | --- |',
+      '| `code | [report](/Users/alice/a.md) |',
+    ].join('\n'));
+  });
+
+  it('repairs a link in a leading-pipe table nested in a blockquote', () => {
+    const input = [
+      '> | first | second |',
+      '> | --- | --- |',
+      '> | keep | [report](Users/alice/a.md) |',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
+      '> | first | second |',
+      '> | --- | --- |',
+      '> | keep | [report](/Users/alice/a.md) |',
+    ].join('\n'));
+  });
+
+  it('repairs repeated links in separate table cells independently', () => {
+    const input = [
+      '| first | second |',
+      '| --- | --- |',
+      '| [one](Users/alice/a.md) | [two](Users/alice/a.md) |',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
+      '| first | second |',
+      '| --- | --- |',
+      '| [one](/Users/alice/a.md) | [two](/Users/alice/a.md) |',
+    ].join('\n'));
+  });
+
+  it('repairs a destination that repeats the home prefix later in its path', () => {
+    const input = '[nested](Users/alice/archive/Users/alice/a.md)';
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', path => (
+      path === '/Users/alice/archive/Users/alice/a.md'
+    ))).toBe('[nested](/Users/alice/archive/Users/alice/a.md)');
+  });
+
+  it('repairs a link reference destination but not an image-only reference', () => {
+    const input = [
+      '[report][file]',
+      '![preview][image]',
+      '',
+      '[file]: Users/alice/a.md',
+      '[image]: Users/alice/image.png',
+    ].join('\n');
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists)).toBe([
+      '[report][file]',
+      '![preview][image]',
+      '',
+      '[file]: /Users/alice/a.md',
+      '[image]: Users/alice/image.png',
+    ].join('\n'));
+  });
+
+  it('does not let an unmatched backtick suppress later link repair', () => {
+    const input = 'unmatched ` example\n[real](Users/alice/c.md)';
+    expect(normalizeLocalHomeLinks(input, home, '/tmp/project', absoluteHomeFileExists))
+      .toBe('unmatched ` example\n[real](/Users/alice/c.md)');
+  });
+
+  it('supports a Linux home directory', () => {
+    expect(normalizeLocalHomeLinks(
+      '[log](home/alice/run.log)',
+      '/home/alice',
+      '/tmp/project',
+      path => path === '/home/alice/run.log',
+    ))
+      .toBe('[log](/home/alice/run.log)');
+  });
+
+  it('is applied by the card rendering pipeline', () => {
+    const home = homedir().replace(/\/+$/, '');
+    const missingSlash = home.replace(/^\/+/, '');
+    const content = mdElements(buildCardBodyElements(`[report](${missingSlash})`))[0].content;
+    expect(content).toBe(`[report](${home})`);
+  });
+
+  it('restores escaped fences before the card pipeline normalizes links', () => {
+    const home = homedir().replace(/\/+$/, '');
+    const relativeHome = home.replace(/^\/+/, '');
+    const input = [
+      '\\`\\`\\`markdown',
+      `[code](${relativeHome})`,
+      '\\`\\`\\`',
+      '',
+      `[real](${relativeHome})`,
+    ].join('\n');
+    const content = mdElements(buildCardBodyElements(input, tmpdir()))[0].content;
+    expect(content).toContain(`[code](${relativeHome})`);
+    expect(content).toContain(`[real](${home})`);
+  });
+
+  it('uses the caller working directory when the card pipeline disambiguates a relative target', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'botmux-md-card-cwd-'));
+    const relativeHome = homedir().replace(/^\/+|\/+$/g, '');
+    mkdirSync(join(cwd, relativeHome), { recursive: true });
+    try {
+      const input = `[home](${relativeHome})`;
+      const content = mdElements(buildCardBodyElements(input, cwd))[0].content;
+      expect(content).toBe(input);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });
 

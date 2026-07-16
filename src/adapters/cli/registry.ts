@@ -29,6 +29,53 @@ import { createGrokAdapter } from './grok.js';
 import { createKiroCliAdapter } from './kiro-cli.js';
 import { createRiffAdapter } from './riff.js';
 
+/**
+ * The first CLI executable (or nested runner dependency) before shell
+ * resolution.  Keep this next to the adapter factory switch so adding an
+ * adapter cannot accidentally make cheap setup/dashboard availability checks
+ * instantiate the adapter and trigger its lazy `resolvedBin` shell probes.
+ */
+const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
+  'claude-code': 'claude',
+  seed: 'seed',
+  relay: 'relay',
+  aiden: 'aiden',
+  coco: 'coco',
+  codex: 'codex',
+  // The adapter itself launches a bundled Node runner; codex is its real
+  // second-stage dependency.
+  'codex-app': 'codex',
+  cursor: 'cursor-agent',
+  gemini: 'gemini',
+  genius: 'genius',
+  opencode: 'opencode',
+  antigravity: 'agy',
+  mtr: 'mtr',
+  hermes: 'hermes',
+  // API-backed; no local executable is required.
+  mira: undefined,
+  // The adapter itself launches a bundled Node runner; mircli is its real
+  // second-stage dependency.
+  mir: 'mircli',
+  traex: 'traex',
+  pi: 'pi',
+  copilot: 'copilot',
+  'oh-my-pi': 'omp',
+  kimi: 'kimi',
+  grok: 'grok',
+  'kiro-cli': 'kiro-cli',
+  // API-backed; no local executable is required.
+  riff: undefined,
+};
+
+/** Return the unresolved command without constructing an adapter or spawning a
+ * shell.  This is deliberately safe for synchronous UI option enumeration. */
+export function rawCliExecutable(id: CliId, pathOverride?: string): string | undefined {
+  const normalized = id.toLowerCase() as CliId;
+  const override = pathOverride?.trim();
+  return override || RAW_CLI_EXECUTABLES[normalized];
+}
+
 /** Resolve a command name to its absolute path via shell `which`.
  *  Tries login shell first (-lc), then interactive shell (-ic) for tools
  *  whose installers add PATH entries to .bashrc/.zshrc only. */

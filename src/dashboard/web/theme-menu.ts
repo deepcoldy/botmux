@@ -107,12 +107,26 @@ export function initThemeMenu(): void {
     if (closeTimer != null) return;
     closeTimer = window.setTimeout(() => setOpen(false), CLOSE_DELAY_MS);
   };
+  const openFromHover = (event: PointerEvent) => {
+    if (event.pointerType === 'touch') return;
+    openMenu();
+  };
+  const closeFromHover = (event: PointerEvent) => {
+    if (event.pointerType === 'touch') return;
+    scheduleClose();
+  };
 
-  root.addEventListener('pointerenter', openMenu);
-  root.addEventListener('pointerleave', scheduleClose);
-  pop.addEventListener('pointerenter', openMenu);
-  pop.addEventListener('pointerleave', scheduleClose);
-  btn.addEventListener('focus', openMenu);
+  root.addEventListener('pointerenter', openFromHover);
+  root.addEventListener('pointerleave', closeFromHover);
+  pop.addEventListener('pointerenter', openFromHover);
+  pop.addEventListener('pointerleave', closeFromHover);
+  btn.addEventListener('click', event => {
+    event.stopPropagation();
+    setOpen(!open);
+  });
+  btn.addEventListener('focus', () => {
+    if (btn.matches(':focus-visible')) openMenu();
+  });
   root.addEventListener('focusout', e => {
     const next = e.relatedTarget;
     if (!(next instanceof Node) || !root.contains(next)) scheduleClose();
@@ -127,7 +141,7 @@ export function initThemeMenu(): void {
     if (open && !root.contains(e.target as Node)) setOpen(false);
   });
   document.addEventListener('pointermove', e => {
-    if (!open) return;
+    if (!open || e.pointerType === 'touch') return;
     const target = e.target;
     if (target instanceof Node && root.contains(target)) return;
     scheduleClose();

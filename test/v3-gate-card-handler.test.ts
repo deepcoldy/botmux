@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { handleV3GateAction, isV3GateAction, type V3GateCardHandlerDeps } from '../src/im/lark/v3-gate-card-handler.js';
 import { V3_GATE_APPROVE_ACTION, V3_GATE_REJECT_ACTION, v3GateCardNonce, type V3GateActionValue } from '../src/im/lark/v3-gate-card.js';
 
@@ -25,6 +28,55 @@ describe('isV3GateAction', () => {
 });
 
 describe('handleV3GateAction', () => {
+  it('Saved Workflow 无 grill 时从 run.json 读取 binding 做权限校验', async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'v3-gate-envelope-'));
+    try {
+      const runDir = join(baseDir, 'r1');
+      mkdirSync(runDir, { recursive: true });
+      const digest = `sha256:${'a'.repeat(64)}`;
+      writeFileSync(join(runDir, 'run.json'), JSON.stringify({
+        schemaVersion: 1,
+        engine: 'workflow-v3',
+        runId: 'r1',
+        createdAt: '2026-07-10T08:00:00.000Z',
+        chatBinding: { larkAppId: 'cli_test', chatId: 'oc_saved' },
+        source: {
+          kind: 'saved_definition',
+          workflowId: 'wf_0123456789abcdef0123456789abcdef',
+          revisionId: `rev_${'b'.repeat(64)}`,
+          humanVersion: 1,
+        },
+        artifacts: {
+          dag: { path: 'dag.json', sha256: digest },
+          spec: { path: 'spec.json', sha256: digest },
+          botSnapshots: { path: 'bots.snapshot.json', sha256: digest },
+          resolvedParams: { path: 'params.resolved.json', sha256: digest },
+          definitionSnapshot: { path: 'definition.snapshot.json', sha256: digest },
+        },
+        authorization: {
+          kind: 'published_revision',
+          authorizedAt: '2026-07-10T08:01:00.000Z',
+          workflowId: 'wf_0123456789abcdef0123456789abcdef',
+          revisionId: `rev_${'b'.repeat(64)}`,
+          definitionSnapshotSha256: digest,
+          dagSha256: digest,
+          specSha256: digest,
+        },
+      }));
+      const canResolve = vi.fn(() => true);
+      const resolveClick = vi.fn(() => ({ kind: 'resolved', resolution: 'approved' } as const));
+      const { deps: d } = deps({ baseDir, canResolve, resolveClick: resolveClick as any });
+      await handleV3GateAction(VALUE, 'ou_user', d);
+      expect(canResolve).toHaveBeenCalledWith(
+        { larkAppId: 'cli_test', chatId: 'oc_saved' },
+        'ou_user',
+      );
+      expect(resolveClick).toHaveBeenCalled();
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
   it('resolved → 返回冻结卡（green header / 已通过）+ driveRun 被调一次', async () => {
     const resolveClick = vi.fn(() => ({ kind: 'resolved', resolution: 'approved' } as const));
     const { deps: d, driveRun } = deps({ resolveClick: resolveClick as any });

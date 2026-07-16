@@ -2,6 +2,9 @@ export interface HistoryMessage {
   messageId: string;
   senderId: string;
   senderType: string;
+  /** Server-provided display name (`with_sender_name=true` read APIs). Used as
+   *  the fallback when local rosters / contact profiles can't name the sender. */
+  senderName?: string;
   msgType: string;
   content: string;
   createTime?: number;

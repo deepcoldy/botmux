@@ -36,6 +36,7 @@ describe('reconcileRiffBackendType (finding G — pairing invariant at the spawn
 
   it('falls back to the daemon default when a non-riff CLI carries backendType=riff', () => {
     expect(reconcileRiffBackendType('codex', 'riff', 'tmux')).toBe('tmux');
+    expect(reconcileRiffBackendType('codex-app', 'riff', 'tmux')).toBe('tmux');
     expect(reconcileRiffBackendType('claude-code', 'riff', 'pty')).toBe('pty');
   });
 

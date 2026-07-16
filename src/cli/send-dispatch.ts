@@ -7,6 +7,7 @@ export type SendMessageFn = (
   msgType?: string,
   uuid?: string,
   hookContext?: Record<string, unknown>,
+  options?: { suppressHook?: boolean },
 ) => Promise<string>;
 
 export type ReplyMessageFn = (
@@ -17,6 +18,7 @@ export type ReplyMessageFn = (
   replyInThread?: boolean,
   uuid?: string,
   hookContext?: Record<string, unknown>,
+  options?: { suppressHook?: boolean },
 ) => Promise<string>;
 
 export type DispatchPrimaryDeps = {
@@ -318,6 +320,10 @@ export type SendVideoAttachmentsDeps = {
   // with card/file/image sends. Later videos remain best-effort via `dispatch`.
   // Omitted for secondary sends (card is already the primary) → all use `dispatch`.
   primaryDispatch?: (content: string, msgType: string) => Promise<string>;
+  /** Optional hard cap checked before any upload/dispatch. Managed VC pure-video
+   * replies set this to one because only the primary media message has a durable
+   * action/provider identity; later bare media sends would duplicate on replay. */
+  maxMessages?: number;
 };
 
 export type SendVideoAttachmentsResult = {
@@ -330,6 +336,11 @@ export async function sendVideoAttachments(
   appId: string,
   videos: readonly VideoAttachmentInput[],
 ): Promise<SendVideoAttachmentsResult> {
+  if (deps.maxMessages !== undefined && videos.length > deps.maxMessages) {
+    throw new Error(
+      `受管 VC 回复一次最多发送 ${deps.maxMessages} 个视频；多视频请拆分为受管 action`,
+    );
+  }
   const sent: string[] = [];
   const failed: { path: string; coverPath: string; error: string }[] = [];
   // The first video that actually goes out uses `primaryDispatch` (quote chain);
@@ -367,8 +378,15 @@ export type DispatchPrimaryOptions = {
   content: string;
   msgType: string;
   hookContext: Record<string, unknown>;
+  /** Stable provider idempotency key for a crash-replayed primary effect. */
+  uuid?: string;
   MessageWithdrawnError: new (...args: any[]) => Error;
-  dispatch: (content: string, msgType: string) => Promise<string>;
+  dispatch: (content: string, msgType: string, uuid?: string, suppressHook?: boolean) => Promise<string>;
+  /** Provider UUID reconciliation must not repeat the local outbound hook. */
+  suppressHook?: boolean;
+  /** Revalidate any side-effect authority after an awaited quote failure and
+   * immediately before the fallback creates a top-level message. */
+  beforeQuoteFallback?: () => void | Promise<void>;
   onQuoteWithdrawn?: (messageId: string) => void;
 };
 
@@ -383,34 +401,50 @@ export async function dispatchPrimaryMessage(
 ): Promise<DispatchPrimaryResult> {
   if (!opts.quoteTargetId) {
     return {
-      messageId: await opts.dispatch(opts.content, opts.msgType),
+      messageId: await (opts.suppressHook
+        ? opts.dispatch(opts.content, opts.msgType, opts.uuid, true)
+        : opts.dispatch(opts.content, opts.msgType, opts.uuid)),
       primaryQuotedId: null,
     };
   }
 
   try {
-    const messageId = await deps.replyMessage(
+    const args = [
       opts.appId,
       opts.quoteTargetId,
       opts.content,
       opts.msgType,
       false,
-      undefined,
+      opts.uuid,
       opts.hookContext,
-    );
+    ] as const;
+    const messageId = opts.suppressHook
+      ? await deps.replyMessage(...args, { suppressHook: true })
+      : await deps.replyMessage(...args);
     return { messageId, primaryQuotedId: opts.quoteTargetId };
   } catch (err: any) {
     if (err instanceof opts.MessageWithdrawnError) {
+      await opts.beforeQuoteFallback?.();
       opts.onQuoteWithdrawn?.(opts.quoteTargetId);
       return {
-        messageId: await deps.sendMessage(
-          opts.appId,
-          opts.targetChatId,
-          opts.content,
-          opts.msgType,
-          undefined,
-          opts.hookContext,
-        ),
+        messageId: await (opts.suppressHook
+          ? deps.sendMessage(
+              opts.appId,
+              opts.targetChatId,
+              opts.content,
+              opts.msgType,
+              opts.uuid,
+              opts.hookContext,
+              { suppressHook: true },
+            )
+          : deps.sendMessage(
+              opts.appId,
+              opts.targetChatId,
+              opts.content,
+              opts.msgType,
+              opts.uuid,
+              opts.hookContext,
+            )),
         primaryQuotedId: null,
       };
     }

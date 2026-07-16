@@ -22,6 +22,7 @@ interface TerminalUrlSession {
   session: { sessionId: string; webPort?: number | null };
   workerPort: number | null;
   workerToken: string | null;
+  workerViewToken?: string | null;
   /** Riff AIO Sandbox web terminal link — when present, buildTerminalUrl
    *  returns this directly instead of building a local/proxy URL. */
   riffAccessUrl?: string;
@@ -67,6 +68,10 @@ export function resetTerminalProxy(): void {
   externalPort = 0;
 }
 
+function withCapability(base: string, name: 'token' | 'viewToken', value: string | null | undefined): string {
+  return value ? `${base}?${name}=${encodeURIComponent(value)}` : base;
+}
+
 export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean } = {}): string {
   // Riff backend: the AIO Sandbox link is the OPERATE entry — served via
   // 「获取操作链接」/ write links only (opts.write). The read-only
@@ -80,7 +85,8 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
   // proxies `/s/*` to the local terminal proxy — so terminals are reachable
   // centrally with no `:port`. Platform owner login grants write access, and an
   // explicitly requested private write link keeps its worker token as an
-  // alternative capability. Public/read-only links never carry that token.
+  // alternative capability. Read-only links carry a distinct view capability:
+  // knowing it never grants terminal input.
   // When 远程访问 is off the platform base is null and we fall through — first
   // to a self-hosted reverse proxy base (`BOTMUX_PUBLIC_URL`, same front-door
   // `/s/<id>` form), then to the local proxy/worker port.
@@ -88,8 +94,9 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
     const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
     if (platformBase) {
       const base = `${platformBase}/s/${ds.session.sessionId}`;
-      if (opts.write && ds.workerToken) return `${base}?token=${ds.workerToken}`;
-      return base;
+      return opts.write
+        ? withCapability(base, 'token', ds.workerToken)
+        : withCapability(base, 'viewToken', ds.workerViewToken);
     }
     // 自建反代（BOTMUX_PUBLIC_URL）：走 dashboard 前门 `/s/<id>`，无 per-bot 端口、
     // 对所有 bot 通。这里没有平台 SSO 兜底，故写链接必须像本地分支一样保留 token，
@@ -97,12 +104,15 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
     const publicBase = publicReverseProxyBaseUrl();
     if (publicBase) {
       const url = `${publicBase}/s/${ds.session.sessionId}`;
-      return opts.write && ds.workerToken ? `${url}?token=${ds.workerToken}` : url;
+      return opts.write
+        ? withCapability(url, 'token', ds.workerToken)
+        : withCapability(url, 'viewToken', ds.workerViewToken);
     }
   }
   const base = proxyReady
     ? `http://${config.web.externalHost}:${getTerminalAdvertisedPort()}/s/${ds.session.sessionId}`
     : `http://${config.web.externalHost}:${ds.workerPort ?? ds.session.webPort}`;
-  if (opts.write && ds.workerToken) return `${base}?token=${ds.workerToken}`;
-  return base;
+  return opts.write
+    ? withCapability(base, 'token', ds.workerToken)
+    : withCapability(base, 'viewToken', ds.workerViewToken);
 }
