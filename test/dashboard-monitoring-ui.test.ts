@@ -323,6 +323,8 @@ describe('dashboard monitoring session table', () => {
 
     expect(css).toMatch(/\.resource-page\s*\{[^}]*isolation:\s*isolate/s);
     expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*position:\s*fixed[^}]*z-index:\s*2147483647/s);
+    // Floating help is deliberately interactive so users can hover, select,
+    // and copy its text while it remains above following resource panels.
     expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*pointer-events:\s*auto/s);
     expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*user-select:\s*text/s);
   });
