@@ -559,7 +559,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/meeting', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -567,6 +567,12 @@ describe('DAEMON_COMMANDS set', () => {
 
   it('should no longer contain the removed /skip command (folded into bare /repo)', () => {
     expect(DAEMON_COMMANDS.has('/skip')).toBe(false);
+  });
+
+  it('uses /vc for meeting preparation without changing the existing /vc-auth command', () => {
+    expect(DAEMON_COMMANDS.has('/vc')).toBe(true);
+    expect(DAEMON_COMMANDS.has('/vc-auth')).toBe(true);
+    expect(DAEMON_COMMANDS.has('/meeting')).toBe(false);
   });
 
   it('keeps one /watch-comment command family instead of several /doc-* commands', () => {
@@ -586,7 +592,7 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 30 = the prior 29 commands + /meeting. /subscribe-lark-doc remains
+    // 30 = the prior 29 commands + /vc. /subscribe-lark-doc remains
     // as its original per-file API subscription command rather than an alias.
     expect(DAEMON_COMMANDS.size).toBe(30);
   });
@@ -682,7 +688,7 @@ describe('SESSIONLESS_DAEMON_COMMANDS set', () => {
   it('keeps the whole /watch-comment family session-less', () => {
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/watch-comment')).toBe(true);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/subscribe-lark-doc')).toBe(false);
-    expect(SESSIONLESS_DAEMON_COMMANDS.has('/meeting')).toBe(false);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/vc')).toBe(false);
   });
 
   it('excludes conversation/state commands that need a session', () => {
@@ -795,7 +801,7 @@ describe('/botconfig string field goes through coerceConfigValue (maxLen)', () =
   });
 });
 
-describe('/meeting preparation command', () => {
+describe('/vc preparation command', () => {
   it('binds a regular chat-scope Agent session to the normalized meeting number', async () => {
     const ds = makeDaemonSession({
       scope: 'chat',
@@ -804,9 +810,9 @@ describe('/meeting preparation command', () => {
     const deps = makeDeps(ds);
 
     await handleCommand(
-      '/meeting',
+      '/vc',
       ROOT_ID,
-      makeLarkMessage('/meeting prepare https://vc-my.larkoffice.com/j/688542737 --qa auto', { senderId: 'ou_owner' }),
+      makeLarkMessage('/vc prepare https://vc-my.larkoffice.com/j/688542737 --qa auto', { senderId: 'ou_owner' }),
       deps,
       LARK_APP_ID,
     );
@@ -840,9 +846,9 @@ describe('/meeting preparation command', () => {
     const deps = makeDeps(ds);
 
     await handleCommand(
-      '/meeting',
+      '/vc',
       ROOT_ID,
-      makeLarkMessage('/meeting prepare 688542737', { senderId: 'ou_owner' }),
+      makeLarkMessage('/vc prepare 688542737', { senderId: 'ou_owner' }),
       deps,
       LARK_APP_ID,
     );

@@ -2062,23 +2062,23 @@ export async function handleCommand(
         break;
       }
 
-      case '/meeting': {
+      case '/vc': {
         if (!larkAppId) {
-          await sessionReply(rootId, t('cmd.meeting.no_session', undefined, loc));
+          await sessionReply(rootId, t('cmd.vc.no_session', undefined, loc));
           break;
         }
         const ownerOpenId = getOwnerOpenId(larkAppId);
         if (!ownerOpenId || message.senderId !== ownerOpenId) {
-          await sessionReply(rootId, t('cmd.meeting.owner_only', undefined, loc));
+          await sessionReply(rootId, t('cmd.vc.owner_only', undefined, loc));
           break;
         }
         const request = parseVcMeetingPrepareCommand(message.content);
         const dataDir = config.session.dataDir;
         if (request.kind === 'usage' || request.kind === 'invalid') {
           const prefix = request.kind === 'invalid'
-            ? `${t('cmd.meeting.invalid', undefined, loc)}\n\n`
+            ? `${t('cmd.vc.invalid', undefined, loc)}\n\n`
             : '';
-          await sessionReply(rootId, prefix + t('cmd.meeting.usage', undefined, loc));
+          await sessionReply(rootId, prefix + t('cmd.vc.usage', undefined, loc));
           break;
         }
         if (request.kind === 'status') {
@@ -2089,7 +2089,7 @@ export async function handleCommand(
             ? (requestedRecord ? [requestedRecord] : [])
             : listVcMeetingPreparations(dataDir, larkAppId);
           if (records.length === 0) {
-            await sessionReply(rootId, t('cmd.meeting.none', undefined, loc));
+            await sessionReply(rootId, t('cmd.vc.none', undefined, loc));
             break;
           }
           const lines = records.map(record => [
@@ -2099,7 +2099,7 @@ export async function handleCommand(
             `  agent: \`${record.agentAppId}\``,
             `  Q&A: ${record.qaMode}`,
           ].join('\n'));
-          await sessionReply(rootId, [t('cmd.meeting.status_title', undefined, loc), '', ...lines].join('\n'));
+          await sessionReply(rootId, [t('cmd.vc.status_title', undefined, loc), '', ...lines].join('\n'));
           break;
         }
         if (request.kind === 'off') {
@@ -2114,12 +2114,12 @@ export async function handleCommand(
             count = removeVcMeetingPreparationsByChat(dataDir, larkAppId, ds.chatId);
           }
           await sessionReply(rootId, count > 0
-            ? t('cmd.meeting.stopped', { count }, loc)
-            : t('cmd.meeting.none', undefined, loc));
+            ? t('cmd.vc.stopped', { count }, loc)
+            : t('cmd.vc.none', undefined, loc));
           break;
         }
         if (!ds || ds.chatType !== 'group' || ds.scope !== 'chat') {
-          await sessionReply(rootId, t('cmd.meeting.need_group_chat', undefined, loc));
+          await sessionReply(rootId, t('cmd.vc.need_group_chat', undefined, loc));
           break;
         }
         const existingInChat = findVcMeetingPreparationByChat(dataDir, larkAppId, ds.chatId);
@@ -2134,18 +2134,18 @@ export async function handleCommand(
           qaMode: request.qaMode,
         });
         const replaced = existingInChat && existingInChat.meetingNo !== record.meetingNo
-          ? `\n${t('cmd.meeting.replaced', { meetingNo: existingInChat.meetingNo }, loc)}`
+          ? `\n${t('cmd.vc.replaced', { meetingNo: existingInChat.meetingNo }, loc)}`
           : '';
-        let preparedText = t('cmd.meeting.prepared', {
+        let preparedText = t('cmd.vc.prepared', {
           meetingNo: record.meetingNo,
           qaMode: record.qaMode,
         }, loc) + replaced;
         const meetingProjectDir = ds.workingDir ?? ds.session.workingDir;
         preparedText += meetingProjectDir
-          ? `\n\n${t('cmd.meeting.project_bound', { dir: meetingProjectDir }, loc)}`
-          : `\n\n${t('cmd.meeting.project_optional', undefined, loc)}`;
+          ? `\n\n${t('cmd.vc.project_bound', { dir: meetingProjectDir }, loc)}`
+          : `\n\n${t('cmd.vc.project_optional', undefined, loc)}`;
         await sessionReply(rootId, preparedText);
-        logger.info(`[${logTag}] /meeting prepare meetingNo=${record.meetingNo} chat=${record.prepChatId} agent=${record.agentAppId} qa=${record.qaMode}`);
+        logger.info(`[${logTag}] /vc prepare meetingNo=${record.meetingNo} chat=${record.prepChatId} agent=${record.agentAppId} qa=${record.qaMode}`);
         break;
       }
 
@@ -3041,7 +3041,7 @@ export async function handleCommand(
           t('help.land', undefined, loc),
           t('help.subscribe_doc', undefined, loc),
           t('help.watch_comment', undefined, loc),
-          t('help.meeting', undefined, loc),
+          t('help.vc', undefined, loc),
           t('help.summary', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),

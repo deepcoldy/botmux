@@ -14,7 +14,7 @@ export function extractVcMeetingNumber(value: string): string | undefined {
 }
 
 export function parseVcMeetingPrepareCommand(content: string): VcMeetingPrepareCommand {
-  const args = content.replace(/^\/meeting(?:\s+|$)/i, '').trim();
+  const args = content.replace(/^\/vc(?:\s+|$)/i, '').trim();
   if (!args || /^(help|帮助)$/i.test(args)) return { kind: 'usage' };
 
   const statusMatch = args.match(/^(status|状态)(?:\s+(.+))?$/i);
