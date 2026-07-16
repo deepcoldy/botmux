@@ -52,6 +52,8 @@ const mockedExecSync = vi.mocked(execSync);
 interface HerdrFixture {
   sessions: Array<{ name: string; running: boolean }>;
   agentsBySession: Record<string, Array<{ name?: string; agent?: string; pane_id?: string; terminal_id?: string; cwd?: string }>>;
+  panesBySession?: Record<string, Array<{ name?: string; pane_id?: string; terminal_id?: string; cwd?: string; foreground_cwd?: string }>>;
+  processByPane?: Record<string, { pid: number; name: string; argv: string[]; cwd: string }>;
   /** Throw on certain probes to simulate `unknown` validation result. */
   failOn?: (args: string[]) => boolean;
 }
@@ -70,6 +72,14 @@ function installHerdrFixture(fx: HerdrFixture) {
       if (argv.includes('agent') && argv.includes('list')) {
         const agents = fx.agentsBySession[sessionName] ?? [];
         return JSON.stringify({ result: { agents } }) as any;
+      }
+      if (argv.includes('pane') && argv.includes('list')) {
+        return JSON.stringify({ result: { panes: fx.panesBySession?.[sessionName] ?? [] } }) as any;
+      }
+      if (argv.includes('pane') && argv.includes('process-info')) {
+        const paneId = argv[argv.indexOf('--pane') + 1];
+        const proc = fx.processByPane?.[`${sessionName}:${paneId}`];
+        return JSON.stringify({ result: { process_info: { foreground_processes: proc ? [proc] : [] } } }) as any;
       }
     }
     return '' as any;
@@ -98,6 +108,7 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
           { name: 'cc', agent: 'claude', pane_id: '1-1', terminal_id: 't-1', cwd: '/projects/api' },
           { name: 'cx', agent: 'codex',  pane_id: '1-2', terminal_id: 't-2', cwd: '/projects/web' },
           { name: 'sh', agent: 'bash',   pane_id: '1-3', terminal_id: 't-3', cwd: '/home' },          // unknown CLI → filtered
+          { name: 'botmux-deadbeef', agent: 'claude', pane_id: '1-4', cwd: '/projects/managed' },      // botmux-managed shared agent → filtered
           { name: 'no-pane', agent: 'claude', cwd: '/projects/x' },                                   // missing pane_id → filtered
         ],
         'bmx-deadbeef': [
@@ -127,6 +138,31 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
       herdrPaneId: '1-2',
       cwd: '/projects/web',
     });
+  });
+
+  it('discovers a TraeX foreground process even before Herdr reports it as an agent', () => {
+    installHerdrFixture({
+      sessions: [{ name: 'work', running: true }],
+      agentsBySession: { work: [] },
+      panesBySession: {
+        work: [{ pane_id: 'w1:p1', terminal_id: 'term-1', cwd: '/projects/traex' }],
+      },
+      processByPane: {
+        'work:w1:p1': { pid: 4321, name: 'traex', argv: ['traex', '--resume'], cwd: '/projects/traex' },
+      },
+    });
+
+    expect(discoverAdoptableSessions('traex')).toEqual([
+      expect.objectContaining({
+        source: 'herdr',
+        herdrSessionName: 'work',
+        herdrPaneId: 'w1:p1',
+        herdrTerminalId: 'term-1',
+        cliPid: 4321,
+        cliId: 'traex',
+        cwd: '/projects/traex',
+      }),
+    ]);
   });
 
   it('filters by CliId when requested', () => {
@@ -186,6 +222,28 @@ describe('validateAdoptTarget (herdr branch)', () => {
     };
     expect(validateAdoptTargetState(target)).toBe('alive');
     expect(validateAdoptTarget(target)).toBe(true);
+  });
+
+  it("returns 'alive' for a hook-less TraeX pane whose foreground process still matches", () => {
+    installHerdrFixture({
+      sessions: [{ name: 'work', running: true }],
+      agentsBySession: { work: [] },
+      panesBySession: { work: [{ pane_id: 'w1:p1', cwd: '/x' }] },
+      processByPane: {
+        'work:w1:p1': { pid: 4321, name: 'traex', argv: ['traex', '--resume'], cwd: '/x' },
+      },
+    });
+    const target = {
+      source: 'herdr' as const,
+      herdrSessionName: 'work',
+      herdrPaneId: 'w1:p1',
+      cliPid: 4321,
+      cliId: 'traex' as const,
+      cwd: '/x',
+      paneCols: 200,
+      paneRows: 50,
+    };
+    expect(validateAdoptTargetState(target)).toBe('alive');
   });
 
   it("returns 'missing' when the pane disappeared (kept agent list, no match)", () => {

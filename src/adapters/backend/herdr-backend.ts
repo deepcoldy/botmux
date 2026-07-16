@@ -14,6 +14,18 @@ export interface HerdrExternalTarget {
   paneId?: string;
 }
 
+interface HerdrBackendOptions {
+  createSession?: boolean;
+  isReattach?: boolean;
+  externalTarget?: HerdrExternalTarget;
+  /** Managed agent inside a user's existing herdr session. */
+  agentName?: string;
+  /** Whether /close should stop the whole herdr session. */
+  ownsSession?: boolean;
+  /** Whether /close should close just the managed pane in a shared session. */
+  ownsAgent?: boolean;
+}
+
 // Slow output-streaming poll. We deliberately avoid the original 250ms tick:
 // herdr exposes `wait agent-status`, which we use to fire an immediate read on
 // every idle/working/blocked transition. The 500ms timer is a fallback for the
@@ -131,7 +143,7 @@ export class HerdrBackend implements SessionBackend {
   private readonly snapshotCbs: Array<(snapshot: string) => void> = [];
   private readonly webCursorCbs: Array<(cursor: HerdrWebTerminalCursor) => void> = [];
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
-  private readonly agentName = 'botmux';
+  private readonly agentName: string;
   private paneId: string | undefined;
   private lastText = '';
   private exited = false;
@@ -154,9 +166,10 @@ export class HerdrBackend implements SessionBackend {
   cliCwd?: string;
 
   constructor(
-    private readonly sessionName: string,
-    private readonly opts: { createSession?: boolean; isReattach?: boolean; externalTarget?: HerdrExternalTarget } = {},
+    readonly sessionName: string,
+    private readonly opts: HerdrBackendOptions = {},
   ) {
+    this.agentName = opts.agentName ?? 'botmux';
     if (opts.externalTarget?.paneId) this.paneId = opts.externalTarget.paneId;
   }
 
@@ -211,6 +224,21 @@ export class HerdrBackend implements SessionBackend {
       .filter((name: string) => name.startsWith('bmx-'));
   }
 
+  /** Pick a user-owned running session without creating anything. */
+  static preferredRunningSession(): string | undefined {
+    const raw = jsonCommand(['session', 'list', '--json']);
+    const sessions = extractSessions(raw).filter((s: any) =>
+      typeof s?.name === 'string' && s.running === true && !s.name.startsWith('bmx-'));
+    const envSession = process.env.HERDR_SESSION;
+    if (envSession && sessions.some((s: any) => s.name === envSession)) return envSession;
+    return sessions.find((s: any) => s.default === true)?.name ?? sessions[0]?.name;
+  }
+
+  static hasAgent(sessionName: string, agentName: string): boolean {
+    const raw = jsonCommand(herdrSessionArgs(sessionName, ['agent', 'get', agentName]), { timeout: 5000 });
+    return !!extractAgent(raw);
+  }
+
   get isReattach(): boolean {
     return this.opts.isReattach ?? false;
   }
@@ -259,9 +287,13 @@ export class HerdrBackend implements SessionBackend {
       if (existing) {
         this.paneId = existing.pane_id;
       } else {
+        const envArgs = this.opts.ownsSession === false
+          ? Object.entries(this.childEnv ?? {}).flatMap(([key, value]) => ['--env', `${key}=${value}`])
+          : [];
         const started = jsonCommand(herdrSessionArgs(this.sessionName, [
           'agent', 'start', this.agentName,
           '--cwd', opts.cwd,
+          ...envArgs,
           '--', bin, ...args,
         ]), { timeout: 10_000, env: this.childEnv });
         const agent = extractAgent(started);
@@ -385,12 +417,12 @@ export class HerdrBackend implements SessionBackend {
 
   destroySession(): void {
     this.kill();
-    // Only tear down the herdr session if botmux owns it. An adopted external
-    // target (externalTarget) is the user's own herdr session — botmux merely
-    // observes it, so /close must detach (kill) without stopping their CLI.
-    // Mirrors TmuxPipeBackend's ownsSession guard.
-    if (!this.opts.externalTarget) {
+    // Adopted targets are observation-only. A managed agent placed in a user's
+    // existing session owns its pane but never the surrounding herdr session.
+    if (this.opts.ownsSession ?? !this.opts.externalTarget) {
       HerdrBackend.killSession(this.sessionName);
+    } else if (this.opts.ownsAgent && this.paneId) {
+      runHerdr(herdrSessionArgs(this.sessionName, ['pane', 'close', this.paneId]), { timeout: 5000 });
     }
   }
 

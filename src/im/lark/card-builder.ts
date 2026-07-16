@@ -1860,15 +1860,15 @@ export function buildAdoptSelectCard(
   const unknownUptime = t('card.adopt.uptime_unknown', undefined, locale);
   const options = sessions.map((s) => {
     const zellij = 'zellijPaneId' in s;
-    const project = s.cwd.split('/').pop() || s.cwd;
     const cliName = getCliDisplayName(s.cliId);
+    const backendLabel = zellij ? 'zellij' : s.source;
     const uptime = s.startedAt ? formatDuration(Date.now() - s.startedAt) : unknownUptime;
     const targetLabel = zellij ? `${s.zellijSession}/${s.zellijPaneId}` : adoptTargetLabel(s);
     const value = zellij
       ? { zellijSession: s.zellijSession, zellijPaneId: s.zellijPaneId, cliPid: s.cliPid }
       : { key: adoptTargetKey(s), source: s.source, tmuxTarget: s.tmuxTarget, cliPid: s.cliPid };
     return {
-      text: { tag: 'plain_text' as const, content: `${cliName} · ${project} · ${targetLabel} · ${uptime}` },
+      text: { tag: 'plain_text' as const, content: `${cliName} · ${backendLabel} · ${targetLabel} · ${uptime}` },
       value: JSON.stringify(value),
     };
   });

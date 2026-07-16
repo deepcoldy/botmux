@@ -609,6 +609,25 @@ function extractHerdrAgents(raw: any): any[] {
   return Array.isArray(agents) ? agents : [];
 }
 
+function extractHerdrPanes(raw: any): any[] {
+  const panes = raw?.result?.panes;
+  return Array.isArray(panes) ? panes : [];
+}
+
+function herdrPaneCliProcess(raw: any, filterCliId?: CliId): { pid: number; cliId: CliId; cwd?: string } | undefined {
+  const info = raw?.result?.process_info;
+  const processes = Array.isArray(info?.foreground_processes) ? info.foreground_processes : [];
+  for (const proc of processes) {
+    const argv = Array.isArray(proc?.argv) ? proc.argv.filter((v: unknown): v is string => typeof v === 'string') : [];
+    const cliId = cliIdFromCommArgv(typeof proc?.name === 'string' ? proc.name : undefined, argv, filterCliId);
+    const pid = Number(proc?.pid);
+    if (cliId && Number.isInteger(pid) && pid > 0) {
+      return { pid, cliId, cwd: typeof proc?.cwd === 'string' ? proc.cwd : undefined };
+    }
+  }
+  return undefined;
+}
+
 function herdrAgentCliId(agent: any, filterCliId?: CliId): CliId | undefined {
   const name = typeof agent?.agent === 'string' ? basename(agent.agent) : '';
   return name ? cliIdForComm(name, filterCliId) : undefined;
@@ -624,7 +643,11 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
   for (const session of sessions) {
     const sessionName = session.name as string;
     const rawAgents = herdrJson(['--session', sessionName, 'agent', 'list']);
+    const discoveredPaneIds = new Set<string>();
     for (const agent of extractHerdrAgents(rawAgents)) {
+      // Managed agents can now live inside a user's shared herdr session, so
+      // session-name filtering alone no longer excludes botmux's own panes.
+      if (typeof agent?.name === 'string' && agent.name.startsWith('botmux-')) continue;
       const cliId = herdrAgentCliId(agent, filterCliId);
       if (!cliId) continue;
       if (filterCliId && cliId !== filterCliId) continue;
@@ -634,6 +657,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
       const agentName = typeof agent?.agent === 'string' ? agent.agent : undefined;
       if (!cwd || !paneId) continue;
       const claudeMeta = cliId === 'claude-code' ? findUniqueClaudeSessionByCwd(cwd) : undefined;
+      discoveredPaneIds.add(paneId);
       results.push({
         source: 'herdr',
         herdrSessionName: sessionName,
@@ -645,6 +669,44 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
         sessionId: claudeMeta?.sessionId,
         cwd,
         startedAt: claudeMeta?.startedAt,
+        paneCols: 200,
+        paneRows: 50,
+      });
+    }
+
+    // TraeX can be a real foreground CLI while Herdr still reports the pane as
+    // agent_status=unknown (its hook integration has not emitted state yet).
+    // Supplement agent-list discovery from pane process-info so such live CLIs
+    // remain adoptable; plain shell panes naturally fail cliId detection.
+    const rawPanes = herdrJson(['--session', sessionName, 'pane', 'list']);
+    for (const pane of extractHerdrPanes(rawPanes)) {
+      const paneId = typeof pane?.pane_id === 'string' ? pane.pane_id : undefined;
+      if (!paneId || discoveredPaneIds.has(paneId)) continue;
+      if (typeof pane?.name === 'string' && pane.name.startsWith('botmux-')) continue;
+      const rawInfo = herdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
+      const process = herdrPaneCliProcess(rawInfo, filterCliId);
+      if (!process) continue;
+      const cwd = process.cwd
+        ?? (typeof pane?.foreground_cwd === 'string' ? pane.foreground_cwd : undefined)
+        ?? (typeof pane?.cwd === 'string' ? pane.cwd : undefined);
+      if (!cwd) continue;
+      let sessionId: string | undefined;
+      if (process.cliId === 'traex') sessionId = findTraexRolloutByPid(process.pid)?.cliSessionId;
+      else if (process.cliId === 'codex') sessionId = findCodexRolloutByPid(process.pid)?.cliSessionId;
+      else if (process.cliId === 'coco') sessionId = findCocoSessionByPid(process.pid)?.sessionId;
+      const claudeMeta = process.cliId === 'claude-code' ? readClaudeSessionMeta(process.pid) : undefined;
+      results.push({
+        source: 'herdr',
+        herdrSessionName: sessionName,
+        herdrTarget: paneId,
+        herdrPaneId: paneId,
+        herdrAgentName: process.cliId,
+        herdrTerminalId: typeof pane?.terminal_id === 'string' ? pane.terminal_id : undefined,
+        cliPid: process.pid,
+        cliId: process.cliId,
+        sessionId: sessionId ?? claudeMeta?.sessionId,
+        cwd,
+        startedAt: claudeMeta?.startedAt ?? readProcessStartTime(process.pid),
         paneCols: 200,
         paneRows: 50,
       });
@@ -828,11 +890,26 @@ export function validateTmuxAdoptTarget(tmuxTarget: string, expectedPid: number,
 
 export type AdoptValidationResult = 'alive' | 'missing' | 'unknown';
 
-export function validateHerdrAdoptTarget(sessionName: string | undefined, paneId: string | undefined): AdoptValidationResult {
+export function validateHerdrAdoptTarget(
+  sessionName: string | undefined,
+  paneId: string | undefined,
+  expectedPid?: number,
+  expectedCliId?: CliId,
+): AdoptValidationResult {
   if (!sessionName || !paneId) return 'missing';
   const rawAgents = tryHerdrJson(['--session', sessionName, 'agent', 'list']);
   if (!rawAgents.ok) return 'unknown';
-  return extractHerdrAgents(rawAgents.value).some((agent: any) => agent?.pane_id === paneId) ? 'alive' : 'missing';
+  if (extractHerdrAgents(rawAgents.value).some((agent: any) => agent?.pane_id === paneId)) return 'alive';
+
+  // Hook-less/unknown panes (notably TraeX before its first lifecycle hook)
+  // are absent from agent list. Validate those against the live foreground
+  // process instead of rejecting a target discovery just found by process-info.
+  const rawInfo = tryHerdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
+  if (!rawInfo.ok) return 'unknown';
+  const process = herdrPaneCliProcess(rawInfo.value, expectedCliId);
+  if (!process) return 'missing';
+  if (expectedPid && process.pid !== expectedPid) return 'missing';
+  return 'alive';
 }
 
 export function validateAdoptTarget(target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>): boolean {
@@ -840,7 +917,12 @@ export function validateAdoptTarget(target: AdoptableSession | NonNullable<impor
 }
 
 export function validateAdoptTargetState(target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>): AdoptValidationResult {
-  if (target.source === 'herdr') return validateHerdrAdoptTarget(target.herdrSessionName, target.herdrPaneId ?? target.herdrTarget);
+  if (target.source === 'herdr') {
+    const pid = 'originalCliPid' in target
+      ? target.originalCliPid
+      : ('cliPid' in target ? target.cliPid : undefined);
+    return validateHerdrAdoptTarget(target.herdrSessionName, target.herdrPaneId ?? target.herdrTarget, pid, target.cliId);
+  }
   const pid = 'originalCliPid' in target
     ? target.originalCliPid
     : ('cliPid' in target ? target.cliPid : undefined);

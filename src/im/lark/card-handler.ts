@@ -2379,8 +2379,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     let selected: { key?: string; source?: string; tmuxTarget?: string; zellijSession?: string; zellijPaneId?: string; cliPid?: number };
     try { selected = JSON.parse(option); } catch { return; }
 
-    // Re-discover to get full session info and validate. Backend determines
-    // which discovery to run (re-confirms the pane + pid are still alive).
+    // Re-discover to get full session info and validate. Keep the same CLI
+    // filter used to build the card so a stale/tampered option cannot switch
+    // this bot to a different agent implementation.
     const botCfg = getBot(ds.larkAppId).config;
     let target: Awaited<ReturnType<typeof resolveAdoptTarget>>;
     async function resolveAdoptTarget() {

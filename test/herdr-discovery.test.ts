@@ -63,9 +63,9 @@ describe('validateHerdrAdoptTarget', () => {
   });
 
   it('returns "missing" when herdr returns ok but pane is not in list', () => {
-    mockExecFileSync.mockReturnValueOnce(
-      JSON.stringify({ result: { agents: [{ pane_id: 'pane-other' }] } }) as any,
-    );
+    mockExecFileSync
+      .mockReturnValueOnce(JSON.stringify({ result: { agents: [{ pane_id: 'pane-other' }] } }) as any)
+      .mockReturnValueOnce(JSON.stringify({ result: { process_info: { foreground_processes: [] } } }) as any);
     expect(validateHerdrAdoptTarget('sess', 'pane-1')).toBe('missing');
   });
 
@@ -80,7 +80,9 @@ describe('validateHerdrAdoptTarget', () => {
   });
 
   it('returns "missing" when herdr returns malformed payload (no agents array)', () => {
-    mockExecFileSync.mockReturnValueOnce(JSON.stringify({ result: {} }) as any);
+    mockExecFileSync
+      .mockReturnValueOnce(JSON.stringify({ result: {} }) as any)
+      .mockReturnValueOnce(JSON.stringify({ result: { process_info: { foreground_processes: [] } } }) as any);
     expect(validateHerdrAdoptTarget('sess', 'pane-1')).toBe('missing');
   });
 });

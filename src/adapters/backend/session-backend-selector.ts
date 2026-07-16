@@ -63,9 +63,13 @@ export interface SelectedSessionBackend {
    *  like the non-tmux (pty) path — screenshots via the headless renderer, web
    *  terminal via relay — but it owns a persistent zellij session internally. */
   isZellijMode: boolean;
+  persistentSessionName?: string;
+  isReattach?: boolean;
+  /** Set only when this spawn must create a herdr session because none exists. */
+  createdHerdrSessionName?: string;
 }
 
-export function selectSessionBackend(opts: { sessionId: string; backendType: BackendType; backendConfig?: RiffBackendConfig }): SelectedSessionBackend {
+export function selectSessionBackend(opts: { sessionId: string; backendType: BackendType; backendConfig?: RiffBackendConfig; reuseExistingHerdrSession?: boolean }): SelectedSessionBackend {
   if (opts.backendType === 'riff') {
     if (!opts.backendConfig) {
       throw new Error('riff backend requires backendConfig (baseUrl, etc.)');
@@ -86,6 +90,8 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
       isTmuxMode: false,
       isPipeMode: false,
       isZellijMode: true,
+      persistentSessionName: sessionName,
+      isReattach: reattach,
     };
   }
 
@@ -99,21 +105,51 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
   }
 
   if (opts.backendType === 'herdr') {
-    const sessionName = HerdrBackend.sessionName(opts.sessionId);
-    if (HerdrBackend.hasSession(sessionName)) {
+    const ownedSessionName = HerdrBackend.sessionName(opts.sessionId);
+    if (HerdrBackend.hasSession(ownedSessionName)) {
       return {
-        backend: new HerdrBackend(sessionName, { isReattach: true }),
+        backend: new HerdrBackend(ownedSessionName, { isReattach: true }),
         isTmuxMode: false,
         isPipeMode: true,
         isZellijMode: false,
+        persistentSessionName: ownedSessionName,
+        isReattach: true,
+      };
+    }
+
+    // Reuse the user's current/default running herdr session. Creating one
+    // session per botmux conversation is surprising and hides the agent from
+    // the user's normal workspace. The deterministic agent name also lets a
+    // restarted worker find the same pane again.
+    const hostSessionName = opts.reuseExistingHerdrSession === false
+      ? undefined
+      : HerdrBackend.preferredRunningSession();
+    if (hostSessionName) {
+      const agentName = `botmux-${opts.sessionId.slice(0, 8)}`;
+      const reattach = HerdrBackend.hasAgent(hostSessionName, agentName);
+      return {
+        backend: new HerdrBackend(hostSessionName, {
+          agentName,
+          isReattach: reattach,
+          ownsSession: false,
+          ownsAgent: true,
+        }),
+        isTmuxMode: false,
+        isPipeMode: true,
+        isZellijMode: false,
+        persistentSessionName: hostSessionName,
+        isReattach: reattach,
       };
     }
 
     return {
-      backend: new HerdrBackend(sessionName, { createSession: true }),
+      backend: new HerdrBackend(ownedSessionName, { createSession: true }),
       isTmuxMode: false,
       isPipeMode: true,
       isZellijMode: false,
+      persistentSessionName: ownedSessionName,
+      isReattach: false,
+      createdHerdrSessionName: ownedSessionName,
     };
   }
 
@@ -124,6 +160,8 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
       isTmuxMode: true,
       isPipeMode: true,
       isZellijMode: false,
+      persistentSessionName: sessionName,
+      isReattach: true,
     };
   }
 
@@ -132,5 +170,7 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
     isTmuxMode: true,
     isPipeMode: true,
     isZellijMode: false,
+    persistentSessionName: sessionName,
+    isReattach: false,
   };
 }

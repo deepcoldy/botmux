@@ -2361,12 +2361,9 @@ export async function handleCommand(
 
         const botCliId = botCfgForAdopt?.cliId;
 
-        // Discover BOTH tmux AND zellij sessions, regardless of the bot's own
-        // backend — a normal tmux bot should still be able to adopt a CLI the
-        // user is running inside zellij (and vice-versa). The adopt itself
-        // picks the right observe backend from the chosen target.
-        // discoverAdoptableZellijSessions returns [] when zellij isn't
-        // installed, so this is safe on tmux-only hosts.
+        // Discover every supported backend, but only offer live sessions for
+        // this bot's configured CLI. A Pi bot must not show Codex/TRAE panes:
+        // adopting one would unexpectedly change the agent behind the bot.
         const sessions: Array<AdoptableSession | ZellijAdoptableSession> = [
           ...discoverAdoptableSessions(botCliId),
           ...discoverAdoptableZellijSessions(botCliId),
