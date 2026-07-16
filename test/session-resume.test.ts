@@ -112,6 +112,8 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
 
 vi.mock('../src/core/session-discovery.js', () => ({
   validateAdoptTarget: vi.fn(() => true),
+  validateAdoptTargetState: vi.fn(() => 'alive'),
+  adoptTargetLabel: vi.fn(() => 'test-pane'),
 }));
 
 vi.mock('../src/core/session-activity.js', () => ({
@@ -120,7 +122,7 @@ vi.mock('../src/core/session-activity.js', () => ({
 }));
 
 import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
-import { restoreUsageLimitRuntimeState, closeSession } from '../src/core/worker-pool.js';
+import { restoreUsageLimitRuntimeState, closeSession, forkAdoptWorker } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -330,6 +332,48 @@ describe('resumeSession', () => {
       const ds = map.get(sessionKey('om_limit', 'app_test'));
       expect(ds).toBeDefined();
       expect(restoreUsageLimitRuntimeState).toHaveBeenCalledWith(ds);
+    });
+
+    it('restores ownerOpenId for a regular active session after daemon restart', async () => {
+      const s = sessionStore.createSession('oc_owner', 'om_owner', 'Owned topic');
+      s.larkAppId = 'app_test';
+      s.scope = 'thread';
+      s.cliId = 'claude-code';
+      s.workingDir = '/tmp/owned';
+      s.ownerOpenId = 'ou_persisted_owner';
+      sessionStore.updateSession(s);
+
+      const map = new Map<string, DaemonSession>();
+      await restoreActiveSessions(map);
+
+      expect(map.get(sessionKey('om_owner', 'app_test'))?.ownerOpenId).toBe('ou_persisted_owner');
+    });
+
+    it('restores ownerOpenId before re-forking an adopt session', async () => {
+      const s = sessionStore.createSession('oc_adopt_owner', 'om_adopt_owner', 'Adopt: test-pane');
+      s.larkAppId = 'app_test';
+      s.scope = 'thread';
+      s.cliId = 'claude-code';
+      s.ownerOpenId = 'ou_adopt_owner';
+      s.adoptedFrom = {
+        source: 'tmux',
+        tmuxTarget: 'test:0.0',
+        originalCliPid: 12345,
+        cliId: 'claude-code',
+        cwd: '/tmp/adopted',
+      };
+      sessionStore.updateSession(s);
+      vi.mocked(forkAdoptWorker).mockClear();
+
+      const map = new Map<string, DaemonSession>();
+      await restoreActiveSessions(map);
+
+      const restored = map.get(sessionKey('om_adopt_owner', 'app_test'));
+      expect(restored?.ownerOpenId).toBe('ou_adopt_owner');
+      expect(forkAdoptWorker).toHaveBeenCalledWith(
+        expect.objectContaining({ ownerOpenId: 'ou_adopt_owner' }),
+        { restoredFromMetadata: true },
+      );
     });
 
     it('restores the persisted clean sidecar for a long-running Codex App session', async () => {

@@ -47,6 +47,7 @@ import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
 import type { Session } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
+import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
@@ -8344,6 +8345,18 @@ function dashboardUrlForReport(): { url?: string; localUrl?: string } {
 }
 
 export async function startDaemon(botIndex?: number): Promise<void> {
+  // Repair a shared tmux server polluted by an older botmux immediately on
+  // daemon startup. This must not depend on restoring/spawning a bmx-* session:
+  // a user-held tmux server can outlive every botmux pane and still leak stale
+  // routing/profile env into newly-created user panes.
+  const tmuxEnvScrub = scrubTmuxServerGlobalEnv();
+  if (tmuxEnvScrub.removed.length > 0) {
+    logger.info(`[tmux] scrubbed ${tmuxEnvScrub.removed.length} server-global env key(s): ${tmuxEnvScrub.removed.join(', ')}`);
+  }
+  if (tmuxEnvScrub.failed.length > 0) {
+    logger.warn(`[tmux] failed to scrub server-global env key(s): ${tmuxEnvScrub.failed.join(', ')}`);
+  }
+
   // 首次启动时后台尝试安装 CJK 字体（Debian/Ubuntu），避免截图中文显示豆腐块。
   // 不阻塞：首张截图可能仍是豆腐块，装完重启 daemon 即可正常。
   ensureCjkFontsInstalled();

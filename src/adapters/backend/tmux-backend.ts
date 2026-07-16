@@ -3,8 +3,8 @@ import { execSync, execFileSync } from 'node:child_process';
 import { basename } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
-import { probeTmuxFunctional, tmuxEnv } from '../../setup/ensure-tmux.js';
-import { REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
+import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv } from '../../setup/ensure-tmux.js';
+import { BOTMUX_INJECTED_ENV_KEYS, REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
@@ -12,13 +12,20 @@ import { isExecutable } from '../../utils/executable.js';
 /**
  * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
  * new tmux pane inherits the tmux *server's* global environment, which the
- * (redacted) client env can't override — so if the server was ever started
- * with bare LARK_APP_* in scope (pre-upgrade botmux, or the user's own tmux),
- * those values reach the CLI despite redactChildEnv(). Unsetting them in the
- * wrapper shell removes them for this pane only, without touching the server
- * global env. Key names are fixed identifiers — no shell-escaping needed.
+ * client env can't override — so if the server was ever started with stale
+ * botmux routing/profile values or bare LARK_APP_* creds in scope, those values
+ * reach the CLI. Unsetting the complete managed allowlist in the wrapper shell
+ * removes them for this pane only before current values are re-injected. Key
+ * names are fixed identifiers — no shell-escaping needed.
  */
-const REDACTED_ENV_UNSET_CLAUSE = `unset ${REDACTED_CHILD_ENV_KEYS.join(' ')}`;
+const PANE_ENV_UNSET_KEYS = [...new Set([
+  ...REDACTED_CHILD_ENV_KEYS,
+  ...BOTMUX_INJECTED_ENV_KEYS,
+])];
+const PANE_ENV_UNSET_CLAUSE = `unset ${PANE_ENV_UNSET_KEYS.join(' ')}`;
+
+/** Guard so the fallback self-heal runs at most once in this worker process. */
+let serverGlobalEnvScrubbed = false;
 
 /**
  * TmuxBackend — session backend using tmux for process persistence.
@@ -173,6 +180,33 @@ export class TmuxBackend implements SessionBackend {
   }
 
   /**
+   * One-time self-heal: strip botmux-managed keys from the tmux SERVER's global
+   * environment. A server booted by an upgraded botmux is already clean (tmuxEnv
+   * strips the client env before `new-session`), but a server started by an
+   * OLDER botmux — or one that has outlived many daemon restarts — still carries
+   * a stale BOTMUX_SESSION_ID / BOTMUX_CHAT_ID / SESSION_DATA_DIR / … in its
+   * global env. That leaks into every co-tenant session on the socket (the
+   * user's own `tmux`), whose Claude Code then misroutes its AskUserQuestion
+   * hook to the leaked thread.
+   *
+   * Scrubbing the global table does NOT touch already-running panes' process
+   * environments — only panes created AFTER the scrub inherit the cleaned table
+   * — so this is safe to run against a live server with active sessions: no
+   * running bmx-* CLI is disturbed, and the user's next new pane comes up clean.
+   * The daemon proactively runs the same repair at startup, even when there are
+   * no active bmx-* sessions. This worker-local fallback covers standalone
+   * backend use and a transient failure during daemon startup.
+   */
+  static scrubServerGlobalEnvOnce(): void {
+    if (serverGlobalEnvScrubbed) return;
+    serverGlobalEnvScrubbed = true;
+    const result = scrubTmuxServerGlobalEnv();
+    if (result.failed.length > 0) {
+      logger.warn(`[tmux] failed to scrub server-global keys: ${result.failed.join(', ')}`);
+    }
+  }
+
+  /**
    * Create a parked diagnostic session after a CLI has exited. The worker uses
    * this only after it has already captured the failed pane's output, so the
    * browser can still attach to `bmx-*` and see the startup error while daemon
@@ -210,6 +244,9 @@ export class TmuxBackend implements SessionBackend {
   // ─── SessionBackend implementation ────────────────────────────────────────
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
+    // Self-heal a server polluted by a pre-upgrade botmux before we touch it
+    // (once per daemon process; no-op on a server this build booted clean).
+    TmuxBackend.scrubServerGlobalEnvOnce();
     this.reattaching = TmuxBackend.hasSession(this.sessionName);
     logger.debug(
       `[tmux:${this.sessionName}] spawn ${this.reattaching ? 'reattach' : 'new'} ` +
@@ -245,14 +282,13 @@ export class TmuxBackend implements SessionBackend {
       //     bash/zsh/sh-specific (bash needs `-i` for .bashrc; zsh needs
       //     `-l -i` for .zprofile + .zshrc). fish/csh/nu are remapped to a
       //     POSIX fallback because our SCRIPT is POSIX-syntax.
-      //   - SCRIPT = `cd -- "$1" && shift && unset <creds> && exec /usr/bin/env "$@"`:
+      //   - SCRIPT = `cd -- "$1" && shift && unset <managed> && exec /usr/bin/env "$@"`:
       //       * `cd -- "$1"` returns to the session's intended cwd even if
       //         the rcfile changed directory mid-load (.zshrc/.bashrc with
       //         a `cd ~/work` left in by mistake stays in opts.cwd).
-      //       * `unset LARK_APP_ID LARK_APP_SECRET CLAUDECODE`: the new pane
-      //         inherits the tmux *server's* global env, which the redacted
-      //         client env can't override — so unset the bare creds for this
-      //         pane only (REDACTED_ENV_UNSET_CLAUSE; see redactChildEnv).
+      //       * `unset <managed>`: the new pane inherits the tmux *server's*
+      //         global env, which the client env can't override. Clear every
+      //         botmux-owned key before this pane's values are re-injected.
       //       * `exec /usr/bin/env "$@"`: env(1) parses the leading KEY=VAL
       //         pairs in argv as overrides for the child process. This lands
       //         AFTER rcfile load, so botmux's per-session values (e.g.
@@ -552,81 +588,11 @@ export class TmuxBackend implements SessionBackend {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * The minimal set of env vars that botmux must inject into the CLI process
- * itself — values that user rcfiles cannot derive on their own (the namespaced
- * Lark app id for `botmux ask`, the daemon-assigned data directory, the BOTMUX
- * marker, the Claude root-mode escape hatch, the session owner's open_id).
- *
- * NOTE: the bot's bare `LARK_APP_ID` / `LARK_APP_SECRET` are deliberately NOT
- * here — the child must not see them (a CLI's own Lark OAuth would be hijacked
- * by the botmux IM app; see worker.ts redactChildEnv). The child resolves Lark
- * via the namespaced `BOTMUX_LARK_APP_ID` below or via bots.json on disk.
- *
- * Anything outside this list (PATH, HOME, NVM_BIN, PNPM_HOME, LANG, …) is
- * deliberately NOT forwarded from the daemon — the wrapping `$SHELL -l -i`
- * pass loads the user's rcfiles, and whatever they set is what the CLI sees.
- * This matches the user's mental model: "the tmux session should be like a
- * fresh terminal where the user runs the CLI manually."
- *
- * These values are injected via `/usr/bin/env KEY=VAL ... cli args` (not tmux
- * `-e`) so they land *after* rcfile load and override any leftover same-named
- * exports in the user's rcfile.
- */
-const BOTMUX_INJECTED_ENV_KEYS = [
-  '__OWNER_OPEN_ID',
-  'BOTMUX',
-  'SESSION_DATA_DIR',
-  'IS_SANDBOX',
-  // §5 of botmux ask v0.1.7: `botmux ask buttons` / `botmux hook <cli>` read
-  // these to locate the daemon, route the card back to this thread, and
-  // resolve approvers from session.owner. Without them, the hook client falls
-  // back to passthrough and the agent never reaches the Lark card.
-  'BOTMUX_SESSION_ID',
-  'BOTMUX_CHAT_ID',
-  'BOTMUX_LARK_APP_ID',
-  'BOTMUX_ROOT_MESSAGE_ID',
-  'BOTMUX_TURN_ID',
-  // Experimental Lark chat bot discovery. The daemon injects a canonical
-  // true/false value so `botmux bots list` inside long-lived panes matches the
-  // daemon's `<available_bots>` behavior instead of reading stale rcfile/tmux env.
-  'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
-  'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
-  // Explicit true-ready command for CLIs (Hermes) that notify Botmux once the
-  // real TUI input composer has rendered. It must reach tmux panes via the
-  // per-pane env prefix; otherwise the ready-gate waits for fallback timeouts.
-  'BOTMUX_READY_COMMAND',
-  // Hermes transcript/profile paths. The worker resolves the bridge state DB
-  // from this same child env, so persistent panes must receive these overrides
-  // too; otherwise the reader can watch one profile while Hermes writes another.
-  // BOTMUX_HERMES_STATE_DB intentionally remains unsupported here until its
-  // ownership/configuration contract is defined.
-  'HERMES_HOME',
-  'HERMES_BOTMUX_SOURCE_HOME',
-  'HERMES_BOTMUX_PROFILES_ROOT',
-  // Claude Code 2.1.x resume-summary 菜单的抑制阈值（issue #62）。worker 为
-  // claude-code 注入一个极大值绕过菜单；只有进了这条白名单才会被透传进 tmux pane。
-  'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
-  // Seed CLI（Claude Code fork）的数据根目录。worker 为 seed 注入它指向 seed 自己的
-  // `.claude-runtime`，bridge 才能盯对文件；不进白名单 tmux pane 就拿不到。
-  // v2 读隔离也用它把隔离 claude bot 的 config/transcript/memory 重定向进 per-bot
-  // BOT_HOME（`<BOTMUX_HOME>/bots/<appId>/claude`）——不进白名单 tmux pane 拿不到 →
-  // 隔离 bot 会掉回全局 ~/.claude（被 Seatbelt deny）而起不来。
-  'CLAUDE_CONFIG_DIR',
-  // v2 读隔离把隔离 codex bot 的 sessions/memory/state 重定向进 per-bot BOT_HOME
-  // （`<BOTMUX_HOME>/bots/<appId>/codex`）。同理必须透传进 pane。
-  'CODEX_HOME',
-  // cjadk wrapperCli（`cjadk <agent>`）启动时 worker 注入 `0`，让 cjadk 跑非交互模式
-  // （跳过启动选择器、清掉吃首条/碎裂多行的输入怪癖），对齐 cjadk 官方 `cjadk feishu`
-  // wrapper。只有 cjadk 启动会被设上此值，其它 bot 不带 → 不进白名单 tmux pane 拿不到，
-  // cjadk 就回到交互模式（本次 bug 的根因）。
-  'CJADK_INTERACTIVE',
-] as const;
-
-/**
  * Build the `KEY=VAL` argv slice passed to `/usr/bin/env`. Only forwards the
- * keys in `BOTMUX_INJECTED_ENV_KEYS` and only when the value is defined —
- * `IS_SANDBOX` for instance is only set when the daemon is running as root.
- * Pure function for unit-testing without spawning tmux.
+ * centralized BOTMUX_INJECTED_ENV_KEYS allowlist and only when the value is
+ * defined — `IS_SANDBOX` for instance is only set in sandboxed sessions.
+ * Everything else (PATH, HOME, NVM, locale, …) comes from the user's rcfile.
+ * Bare LARK_APP_* credentials are deliberately absent and remain redacted.
  */
 export function buildBotmuxEnvAssignments(
   env: NodeJS.ProcessEnv | undefined,
@@ -660,8 +626,8 @@ export function buildBotmuxEnvAssignments(
  *   $0 = '_' (placeholder), $1 = cwd, $2..N = KEY=VAL... bin args...
  *
  * The `cd` step makes the CLI's cwd survive a wayward `cd` in the user's
- * rcfile. The `unset` step removes bare creds the pane inherited from the tmux
- * server's global env (REDACTED_ENV_UNSET_CLAUSE). The PATH prepend puts the
+ * rcfile. The `unset` step removes stale botmux-owned values the pane inherited
+ * from the tmux server's global env. The PATH prepend puts the
  * daemon-written wrapper dir (~/.botmux/bin, which holds THIS build's `botmux`)
  * ahead of any npm-global botmux the rcfile put earlier in PATH — otherwise the
  * agent's `botmux` could resolve to a stale build. Critical under read isolation:
@@ -673,11 +639,11 @@ export function buildBotmuxEnvAssignments(
  * POSIX-syntax (works in bash/zsh/sh); fish/csh/nu users get remapped to
  * bash/zsh/sh by resolveUserShell() so they hit the same SCRIPT path.
  */
-export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${REDACTED_ENV_UNSET_CLAUSE} && export PATH="$HOME/.botmux/bin:$PATH" && exec /usr/bin/env "$@"`;
+export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${PANE_ENV_UNSET_CLAUSE} && export PATH="$HOME/.botmux/bin:$PATH" && exec /usr/bin/env "$@"`;
 
 export const DIAGNOSTIC_SHELL_SCRIPT = [
   'cd -- "$1" 2>/dev/null || cd "$HOME" 2>/dev/null || cd /',
-  REDACTED_ENV_UNSET_CLAUSE,
+  PANE_ENV_UNSET_CLAUSE,
   'clear',
   `printf '\\033[1;31m[botmux] Agent CLI exited. Auto-restart is paused and the last terminal output is preserved below.\\033[0m\\n\\n'`,
   'cat -- "$2" 2>/dev/null || true',
@@ -702,9 +668,9 @@ export function buildDebugKeepShellScript(shellPath: string): string {
   const safeShell = shellPath.replace(/'/g, `'\\''`);
   return [
     'cd -- "$1" && shift',
-    // Same redaction as SHELL_WRAPPER_SCRIPT — so neither the CLI nor the
-    // interactive debug shell that follows sees server/rcfile-inherited creds.
-    REDACTED_ENV_UNSET_CLAUSE,
+    // Same managed-env cleanup as SHELL_WRAPPER_SCRIPT — so neither the CLI nor
+    // the interactive debug shell sees stale server/rcfile-owned values.
+    PANE_ENV_UNSET_CLAUSE,
     // Same PATH prepend as SHELL_WRAPPER_SCRIPT (wrapper build wins over stale npm-global).
     'export PATH="$HOME/.botmux/bin:$PATH"',
     '/usr/bin/env "$@"',

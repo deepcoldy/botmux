@@ -24,6 +24,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
+import { isBotmuxManagedTmuxEnvKey } from '../utils/child-env.js';
 
 export interface TmuxResult {
   installed: boolean;
@@ -117,6 +118,16 @@ function probeTmuxVersion(): TmuxVersionProbe {
  * when forwarding caller-provided env). TMUX_TMPDIR is intentionally left
  * alone — it just changes the socket directory and is the user's deliberate
  * override if set.
+ *
+ * tmuxEnv ALSO strips botmux's own session/bot-scoped vars
+ * (isBotmuxManagedTmuxEnvKey): when botmux's first `tmux new-session` boots the
+ * server, tmux copies this client env into the server's *global* environment,
+ * which then leaks into every co-tenant session on the socket — including the
+ * user's own interactive tmux, whose Claude Code would then misroute its
+ * AskUserQuestion hook to whatever BOTMUX_SESSION_ID/CHAT_ID it inherited. The
+ * pane gets the correct per-session values from the env(1) wrapper injection
+ * instead, so this strip is invisible to botmux's own sessions. See
+ * TMUX_CLIENT_STRIP_KEYS in utils/child-env.ts.
  */
 const TMUX_PATH_EXTRAS = [
   '/opt/homebrew/bin',
@@ -141,11 +152,77 @@ function withTmuxSearchPath(pathValue: string | undefined): string {
 }
 
 export function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const { TMUX: _tmux, TMUX_PANE: _pane, ...rest } = env;
+  const rest: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    // TMUX/TMUX_PANE would re-target a dead parent server; botmux-managed keys
+    // would seed the server's shared global env and leak to co-tenant sessions.
+    if (key === 'TMUX' || key === 'TMUX_PANE') continue;
+    if (isBotmuxManagedTmuxEnvKey(key)) continue;
+    rest[key] = value;
+  }
   return {
     ...rest,
     PATH: withTmuxSearchPath(rest.PATH),
   };
+}
+
+export interface TmuxGlobalEnvScrubResult {
+  /** False means no tmux server answered (or tmux was temporarily unavailable). */
+  serverFound: boolean;
+  removed: string[];
+  failed: string[];
+}
+
+/**
+ * Remove botmux-managed values from an already-running tmux server's global
+ * environment. This repairs servers started by pre-isolation botmux builds,
+ * including a user-owned server that survives while no bmx-* session exists.
+ * Running panes keep their process environments; only future panes inherit the
+ * cleaned table.
+ *
+ * socketName exists for isolated tests. Production intentionally targets the
+ * default server after tmuxEnv() strips a possibly-stale parent $TMUX pointer.
+ */
+export function scrubTmuxServerGlobalEnv(socketName?: string): TmuxGlobalEnvScrubResult {
+  const socketArgs = socketName ? ['-L', socketName] : [];
+  let output: string;
+  try {
+    output = execFileSync('tmux', [...socketArgs, 'show-environment', '-g'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 3000,
+      env: tmuxEnv(),
+    });
+  } catch {
+    return { serverFound: false, removed: [], failed: [] };
+  }
+  if (typeof output !== 'string') {
+    return { serverFound: false, removed: [], failed: [] };
+  }
+
+  const names = output.split('\n')
+    // `show-environment -g` prints `NAME=value`, or `-NAME` for an explicitly
+    // removed entry. Take the name in both shapes.
+    .map(line => (line.startsWith('-') ? line.slice(1) : line.split('=', 1)[0]).trim())
+    .filter(name => name.length > 0 && isBotmuxManagedTmuxEnvKey(name));
+
+  const removed: string[] = [];
+  const failed: string[] = [];
+  for (const name of new Set(names)) {
+    try {
+      execFileSync('tmux', [...socketArgs, 'set-environment', '-g', '-u', name], {
+        stdio: 'ignore',
+        timeout: 2000,
+        env: tmuxEnv(),
+      });
+      removed.push(name);
+    } catch {
+      // Keep the exact failed key observable to callers without exposing its
+      // (potentially sensitive) old value in logs.
+      failed.push(name);
+    }
+  }
+  return { serverFound: true, removed, failed };
 }
 
 function cleanupTmuxProbeSocket(sockName: string, env: NodeJS.ProcessEnv = process.env): void {
