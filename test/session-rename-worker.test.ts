@@ -69,7 +69,7 @@ describe('worker native session rename queue', () => {
 
   it('serializes passthrough writes without changing their busy-delivery semantics', () => {
     const rawRegion = caseRegion('raw_input');
-    expect(rawRegion).toContain('if (sessionRenameInFlight)');
+    expect(rawRegion).toContain('if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight)');
     expect(rawRegion).toContain('pendingRawInputs.push(msg)');
     expect(rawRegion).toContain('await deliverRawInput(msg)');
 

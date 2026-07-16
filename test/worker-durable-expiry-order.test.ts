@@ -50,23 +50,35 @@ describe('worker durable lease expiry ordering', () => {
     const restartEnd = workerSource.indexOf('// ─── HTTP + WebSocket Server', restartStart);
     const restart = workerSource.slice(restartStart, restartEnd);
     const arm = restart.indexOf('cliRestartInProgress = true;');
-    const revoke = restart.indexOf('revokeManagedTurnOriginForRestart();', arm);
+    const rawArm = restart.indexOf('rawInputRestartGate = true;', arm);
+    const revoke = restart.indexOf('revokeManagedTurnOriginForRestart();', rawArm);
     const destroy = restart.indexOf('destroySession?.()', arm);
     const kill = restart.indexOf('killCli({ preservePending: opts.preservePending });', destroy);
     const spawn = restart.indexOf("spawnCli({ ...lastInitConfig, resume: true, prompt: '' });", destroy);
     const release = restart.indexOf('cliRestartInProgress = false;', spawn);
-    const wake = restart.indexOf('void flushPending();', release);
+    const riffRawRelease = restart.indexOf(
+      "if (effectiveBackendType === 'riff' && isPromptReady) releaseRawInputRestartGate();",
+      release,
+    );
+    const wake = restart.indexOf('void flushPending();', riffRawRelease);
 
     expect(restartStart).toBeGreaterThanOrEqual(0);
     expect(restartEnd).toBeGreaterThan(restartStart);
     expect(arm).toBeGreaterThanOrEqual(0);
-    expect(revoke).toBeGreaterThan(arm);
+    expect(rawArm).toBeGreaterThan(arm);
+    expect(revoke).toBeGreaterThan(rawArm);
     expect(revoke).toBeLessThan(destroy);
     expect(destroy).toBeGreaterThan(arm);
     expect(kill).toBeGreaterThan(destroy);
     expect(spawn).toBeGreaterThan(kill);
     expect(release).toBeGreaterThan(spawn);
-    expect(wake).toBeGreaterThan(release);
+    expect(riffRawRelease).toBeGreaterThan(release);
+    expect(wake).toBeGreaterThan(riffRawRelease);
+
+    const promptStart = workerSource.indexOf('function markPromptReady(): void');
+    const promptEnd = workerSource.indexOf('\nfunction persistCliSessionId(', promptStart);
+    const promptReady = workerSource.slice(promptStart, promptEnd);
+    expect(promptReady).toContain('if (!cliRestartInProgress) releaseRawInputRestartGate();');
 
     const flushStart = workerSource.indexOf('async function flushPending(): Promise<void>');
     const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
@@ -83,6 +95,19 @@ describe('worker durable lease expiry ordering', () => {
     expect(sendToPty.indexOf('if (cliRestartInProgress || !backend)')).toBeLessThan(
       sendToPty.indexOf('pendingInputAllowsTypeAhead'),
     );
+
+    const rawStart = workerSource.indexOf("case 'raw_input':");
+    const rawEnd = workerSource.indexOf("case 'rename_session':", rawStart);
+    const rawInput = workerSource.slice(rawStart, rawEnd);
+    const rawGate = rawInput.indexOf(
+      'if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight)',
+    );
+    const rawQueue = rawInput.indexOf('pendingRawInputs.push(msg)', rawGate);
+    const rawDeliver = rawInput.indexOf('await deliverRawInput(msg)', rawQueue);
+    expect(rawGate).toBeGreaterThanOrEqual(0);
+    expect(rawQueue).toBeGreaterThan(rawGate);
+    expect(rawDeliver).toBeGreaterThan(rawQueue);
+    expect(rawInput).not.toContain('isPromptReady');
 
     const killStart = workerSource.indexOf('function killCli(');
     const killEnd = workerSource.indexOf('async function restartCliProcess(', killStart);

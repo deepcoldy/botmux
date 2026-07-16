@@ -77,6 +77,7 @@ describe('suspendWorker', () => {
       worker,
       workerPort: 3456,
       workerToken: 'token',
+      managedTurnOrigin: { capability: 'cap-live', turnId: 'om-live' },
       lastScreenStatus: 'idle',
       exitEventEmitted: false,
     };
@@ -89,6 +90,7 @@ describe('suspendWorker', () => {
     expect(ds.worker).toBe(null);
     expect(ds.workerPort).toBe(null);
     expect(ds.workerToken).toBe(null);
+    expect(ds.managedTurnOrigin).toBeUndefined();
     expect(ds.lastScreenStatus).toBeUndefined();
     // The worker's suspend handler destroys the backing session + CLI, so the
     // next turn must cold-resume: mark history (→ forkWorker resume=true builds
@@ -112,10 +114,27 @@ describe('suspendWorker', () => {
       worker,
       workerPort: 3456,
       workerToken: 'token',
+      managedTurnOrigin: { capability: 'cap-pty', turnId: 'om-pty' },
     };
 
     expect(suspendWorker(ds, 'idle_budget')).toBe(false);
     expect(worker.send).not.toHaveBeenCalled();
     expect(ds.worker).toBe(worker);
+    expect(ds.managedTurnOrigin).toEqual({ capability: 'cap-pty', turnId: 'om-pty' });
+  });
+
+  it.each([
+    ['missing', null],
+    ['already killed', { killed: true }],
+  ])('clears managed-turn authority when the worker generation is %s', (_state, worker) => {
+    const ds: any = {
+      session: { sessionId: 'sid-absent', status: 'active' },
+      initConfig: { backendType: 'tmux' },
+      worker,
+      managedTurnOrigin: { capability: 'cap-stale', turnId: 'om-stale' },
+    };
+
+    expect(suspendWorker(ds, 'idle_budget')).toBe(false);
+    expect(ds.managedTurnOrigin).toBeUndefined();
   });
 });

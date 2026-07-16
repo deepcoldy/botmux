@@ -506,6 +506,46 @@ describe('session.start lifecycle integration', () => {
 });
 
 describe('managed turn authority worker generations', () => {
+  it('revokes the old capability immediately when a normal double-fork replacement fails', () => {
+    const oldWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: oldWorker,
+      managedTurnOrigin: { capability: 'old-capability', turnId: 'turn-old' },
+    });
+    forkMock.mockImplementationOnce(() => { throw new Error('replacement fork failed'); });
+
+    expect(() => forkWorker(ds, 'replacement', false)).toThrow('replacement fork failed');
+
+    expect(oldWorker.send).toHaveBeenCalledWith({ type: 'close' });
+    expect(oldWorker.kill).toHaveBeenCalled();
+    expect(ds.worker).toBeNull();
+    expect(ds.managedTurnOrigin).toBeUndefined();
+  });
+
+  it('revokes the old capability immediately when an adopt double-fork replacement fails', () => {
+    const oldWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: oldWorker,
+      managedTurnOrigin: { capability: 'old-adopt-capability', turnId: 'turn-old-adopt' },
+      adoptedFrom: {
+        source: 'tmux',
+        tmuxTarget: 'bmx-deadbeef:0.0',
+        originalCliPid: 23456,
+        sessionId: 'codex-session',
+        cliId: 'codex',
+        cwd: '/repo',
+      },
+    });
+    forkMock.mockImplementationOnce(() => { throw new Error('adopt replacement fork failed'); });
+
+    expect(() => forkAdoptWorker(ds)).toThrow('adopt replacement fork failed');
+
+    expect(oldWorker.send).toHaveBeenCalledWith({ type: 'close' });
+    expect(oldWorker.kill).toHaveBeenCalled();
+    expect(ds.worker).toBeNull();
+    expect(ds.managedTurnOrigin).toBeUndefined();
+  });
+
   it('revokes the exact live capability at terminal and leaves a rotated turn untouched', async () => {
     const ds = makeDs();
     forkWorker(ds, 'first', false);

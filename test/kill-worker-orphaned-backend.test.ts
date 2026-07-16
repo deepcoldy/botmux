@@ -84,10 +84,12 @@ beforeEach(() => {
 
 describe('killWorker — orphaned backing session teardown (no live worker)', () => {
   it('destroys the tmux backing session by deterministic name', () => {
-    killWorker(ds({}, { backendType: 'tmux' }));
+    const d = ds({ managedTurnOrigin: { capability: 'cap-stale', turnId: 'om-stale' } }, { backendType: 'tmux' });
+    killWorker(d);
     expect(tmuxKill).toHaveBeenCalledWith(EXPECTED_NAME);
     expect(herdrKill).not.toHaveBeenCalled();
     expect(zellijKill).not.toHaveBeenCalled();
+    expect(d.managedTurnOrigin).toBeUndefined();
   });
 
   it('destroys the herdr backing session', () => {
@@ -130,12 +132,16 @@ describe('killWorker — orphaned backing session teardown (no live worker)', ()
 describe('killWorker — with a live worker (unchanged path)', () => {
   it('sends the close IPC to the worker and does NOT kill the backing session directly', () => {
     const send = vi.fn();
-    const d = ds({ worker: { killed: false, send, once: vi.fn() } as any }, { backendType: 'tmux' });
+    const d = ds({
+      worker: { killed: false, send, once: vi.fn() } as any,
+      managedTurnOrigin: { capability: 'cap-live', turnId: 'om-live' },
+    }, { backendType: 'tmux' });
     killWorker(d);
     expect(send).toHaveBeenCalledWith({ type: 'close' });
     // The live worker's own destroySession() handles teardown — daemon must not
     // double-kill here.
     expect(tmuxKill).not.toHaveBeenCalled();
     expect(d.worker).toBeNull();
+    expect(d.managedTurnOrigin).toBeUndefined();
   });
 });

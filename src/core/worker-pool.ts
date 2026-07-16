@@ -1224,6 +1224,11 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 
 export function killWorker(ds: DaemonSession): void {
   clearUsageLimitState(ds);
+  // A managed-turn capability belongs to one concrete worker generation.
+  // Retiring (or observing the absence of) that generation must revoke the
+  // daemon-side copy synchronously; the worker may never get a chance to send
+  // its ordered revoke IPC on close/crash paths.
+  ds.managedTurnOrigin = undefined;
   if (!ds.worker || ds.worker.killed) {
     // No live worker to receive {type:'close'}, so its destroySession() — which
     // tears down the persistent backing session (tmux/herdr/zellij) — never
@@ -1307,7 +1312,11 @@ function reclaimParkedCrashDiagnostic(ds: DaemonSession): void {
 }
 
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
-  if (!ds.worker || ds.worker.killed) return false;
+  if (!ds.worker || ds.worker.killed) {
+    // There is no live generation that can still own this capability.
+    ds.managedTurnOrigin = undefined;
+    return false;
+  }
   if (!isSuspendableBackendType(ds.initConfig?.backendType)) return false;
 
   const w = ds.worker;
@@ -1322,6 +1331,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   ds.workerPort = null;
   ds.workerToken = null;
   ds.workerViewToken = null;
+  ds.managedTurnOrigin = undefined;
   // Screen state describes the process we just stopped. Keeping it would make
   // the dashboard hydrate this process-less logical session as idle/working.
   ds.lastScreenStatus = undefined;
@@ -1904,6 +1914,7 @@ export function forkWorker(
     ds.workerPort = null;
     ds.workerToken = null;
     ds.workerViewToken = null;
+    ds.managedTurnOrigin = undefined;
   }
 
   // Re-establishing a worker ends the cold-resume-suspended state: clear the
@@ -3657,6 +3668,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     ds.workerPort = null;
     ds.workerToken = null;
     ds.workerViewToken = null;
+    ds.managedTurnOrigin = undefined;
   }
 
   // No ensureCliSkills — adopt mode attaches to an existing CLI session

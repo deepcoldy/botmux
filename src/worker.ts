@@ -484,6 +484,10 @@ let isFlushing = false;
  * cancellation; this gate prevents new input or an old idle callback from
  * crossing that teardown fence. */
 let cliRestartInProgress = false;
+/** Raw slash commands require a real prompt and cannot use the ordinary
+ * type-ahead fallback. Keep them fenced across an owned restart until the
+ * replacement generation reaches its prompt. */
+let rawInputRestartGate = false;
 /** Per-spawn one-shot: have this spawn's bot.startupCommands been typed in yet?
  *  Reset in spawnCli so a restart/resume (which re-spawns the CLI) re-applies
  *  them — needed because session-only settings like `/effort ultracode` are lost
@@ -715,8 +719,9 @@ async function runStartupCommands(): Promise<void> {
 }
 
 const pendingMessages: PendingCliInput[] = [];
-/** Literal commands that arrived while native /rename owned the TUI. Normal
- * raw_input commands are still delivered immediately (including while busy). */
+/** Literal commands that arrived while native /rename owned the TUI or while
+ * an owned CLI restart was fenced. Normal raw_input commands are still
+ * delivered immediately (including while busy). */
 const pendingRawInputs: Array<Extract<DaemonToWorker, { type: 'raw_input' }>> = [];
 /** Latest requested canonical session title. Unlike a normal prompt this is an
  * administrative TUI command: never type-ahead while the agent is busy, never
@@ -3886,6 +3891,12 @@ function onPtyData(data: string): void {
   idleDetector?.feed(data);
 }
 
+function releaseRawInputRestartGate(): void {
+  if (!rawInputRestartGate) return;
+  rawInputRestartGate = false;
+  log('Replacement CLI prompt ready — releasing deferred passthrough commands');
+}
+
 function markPromptReady(): void {
   if (isPromptReady) return;  // guard against duplicate calls
   stopBusyPatternIdleProbe();
@@ -3906,6 +3917,10 @@ function markPromptReady(): void {
   }
   isPromptReady = true;
   clearSessionRenameInFlight();
+  // An old backend can still report idle while its async teardown is running.
+  // Only a prompt observed after the general restart fence drops may release
+  // slash commands to the replacement generation.
+  if (!cliRestartInProgress) releaseRawInputRestartGate();
   // CLI 实际启动成功（回到 prompt）：复位连续重启计数。
   // 任何能到这一步的 spawn 都算"成功"——后续即便再崩溃（不是 resume 目标不存在
   // 的问题），下一轮也该有新的 2 次重试预算，而不是被历史重启计数卡住。
@@ -4533,8 +4548,9 @@ function sendToPty(
   // type-ahead write is dropped (no input box yet) — markPromptReady()'s flush
   // delivers queued messages instead. See input-gate.ts; this fixes dispatch's
   // brief reaching Codex before its first idle and never landing.
-  if (!sessionRenameInFlight && commandLineWritesPending === 0
-    && shouldWriteNow({ isPromptReady, isFlushing, supportsTypeAhead, awaitingFirstPrompt })) {
+  if (!sessionRenameInFlight && commandLineWritesPending === 0 && shouldWriteNow({
+    isPromptReady, isFlushing, supportsTypeAhead, awaitingFirstPrompt,
+  })) {
     if (!mergedQueued) log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing
   } else {
@@ -6457,8 +6473,9 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   clearSessionRenameInFlight();
   if (!opts.preservePending) pendingMessages.length = 0;
   // pendingRawInputs contains only commands that were accepted but never typed
-  // because /rename owned the TUI. Preserve them across restart; unlike an
-  // in-flight raw command, replaying these cannot duplicate a side effect.
+  // because /rename owned the TUI or an owned CLI restart was already fenced.
+  // Preserve them across restart; unlike an in-flight raw command, replaying
+  // these cannot duplicate a side effect.
   scrollback = '';
   altBufferActive = false;
   trustHandled = false;
@@ -6479,6 +6496,7 @@ async function restartCliProcess(
   // of firing idle/task-done callbacks. Inputs accepted in that interval must
   // remain queued until a replacement backend has been installed.
   cliRestartInProgress = true;
+  rawInputRestartGate = true;
   // The Node worker stays alive through this restart, so the daemon will see
   // neither claude_exit nor worker-exit. Explicitly revoke the old turn's
   // authority now, before jitter/async teardown leaves a stale-send window.
@@ -6526,8 +6544,9 @@ async function restartCliProcess(
         }
         cliRestartInProgress = false;
         // Riff marks itself prompt-ready inside spawnCli(); that early flush is
-        // intentionally held by the restart gate above. Wake it now, while other
-        // backends will continue to respect their normal ready/idle gates.
+        // intentionally held by the restart gate above. Release its raw-input
+        // fence now; other backends keep it until their later markPromptReady().
+        if (effectiveBackendType === 'riff' && isPromptReady) releaseRawInputRestartGate();
         void flushPending();
       }, 500);
     } catch (err) {
@@ -7893,11 +7912,12 @@ process.on('message', async (raw: unknown) => {
 
     case 'raw_input': {
       // Preserve legacy busy delivery (/btw and other steering commands). A
-      // native /rename already submitted to the TUI is the sole exception: its
-      // command UI must return to the prompt before another slash command lands.
-      if (sessionRenameInFlight) {
+      // native /rename and an owned CLI restart are the exceptions: never splice
+      // into the rename UI, write through an old backend during async teardown,
+      // or type into the replacement before its real prompt is ready.
+      if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight) {
         pendingRawInputs.push(msg);
-        log(`Deferred passthrough slash command until native rename settles: ${msg.content}`);
+        log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
       } else {
         await deliverRawInput(msg);
       }

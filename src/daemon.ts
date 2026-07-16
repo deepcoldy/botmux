@@ -16403,6 +16403,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ds.workerPort = null;
           ds.workerToken = null;
           ds.workerViewToken = null;
+          ds.managedTurnOrigin = undefined;
         } else {
           killWorker(ds);
         }
