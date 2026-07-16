@@ -6942,19 +6942,11 @@ button.sidebar-create-btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-/* 必须排在上方基础规则之后：≤980px 侧边栏折叠为顶部横向 rail 时创建入口改横排。
-   同 specificity 靠源顺序取胜，挪回文件靠前的 media 块会被基础规则反超（PR #491 review）。 */
+/* ≤980px 侧边栏折叠为顶部横向 rail 后，只保留页面导航。
+   创建会话 / 创建机器人已分别位于对应页面标题区，避免移动端出现两层横向操作轨道。 */
 @media (max-width: 980px) {
   .sidebar-create-actions {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 0;
-    padding-bottom: 0;
-    border-bottom: 0;
-    overflow-x: auto;
-  }
-  button.sidebar-create-btn {
-    flex: 0 0 auto;
+    display: none;
   }
 }
 
