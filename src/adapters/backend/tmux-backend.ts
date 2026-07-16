@@ -588,6 +588,7 @@ export class TmuxBackend implements SessionBackend {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
+/**
  * Build the `KEY=VAL` argv slice passed to `/usr/bin/env`. Only forwards the
  * centralized BOTMUX_INJECTED_ENV_KEYS allowlist and only when the value is
  * defined — `IS_SANDBOX` for instance is only set in sandboxed sessions.

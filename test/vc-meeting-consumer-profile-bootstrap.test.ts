@@ -10,6 +10,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 const structuralDeps = {
   workingDirReady: (bot: { workingDir?: string }) => !!bot.workingDir,
   reliableTurnTerminal: (bot: { cliId?: string }) => bot.cliId === 'claude-code',
+  managedSideEffectIsolation: () => true,
 };
 
 async function freshModules() {
@@ -335,6 +336,18 @@ describe('lock-protected default VC consumer profile bootstrap', () => {
       expect(result).toMatchObject({ ok: true, seeded: false });
       expect(readConfig()).toEqual(before);
     }
+  });
+
+  it('does not seed a receiver that lacks managed side-effect isolation', async () => {
+    writeConfig([listener()]);
+    const before = readConfig();
+    const { bootstrap } = await freshModules();
+    const result = await bootstrap.bootstrapVcMeetingDefaultConsumerProfile('listener', {
+      ...structuralDeps,
+      managedSideEffectIsolation: () => false,
+    });
+    expect(result).toEqual({ ok: true, seeded: false, reason: 'no_eligible_agent' });
+    expect(readConfig()).toEqual(before);
   });
 
   it('serializes concurrent bootstraps so exactly one write wins', async () => {

@@ -71,6 +71,37 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver()).toEqual([{ content: 'ordinary IM', turnId: 'im-1' }]);
   });
 
+  it('preserves a clean explicit-IM envelope but leaves a clean durable replay to the receiver', () => {
+    const t = new InflightInputTracker();
+    const codexAppInput = { text: 'clean' };
+    const origin = {
+      listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member',
+      memberEpoch: 1, agentAppId: 'agent', ownerBootId: 'boot', ownerEpoch: 1,
+      membershipGeneration: 1, sinkOwnerGeneration: 1,
+      receiverSessionId: 'receiver', larkMessageId: 'im-clean',
+    };
+    t.onWrite({
+      content: '<legacy IM />',
+      turnId: 'im-clean',
+      vcMeetingImTurnOrigin: origin,
+      codexAppInput,
+    });
+    t.onWrite({
+      content: '<legacy delivery />',
+      turnId: 'delivery-clean',
+      dispatchAttempt: 7,
+      codexAppInput,
+    });
+
+    expect(t.onCliExit(item => item.dispatchAttempt === undefined)).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{
+      content: '<legacy IM />',
+      turnId: 'im-clean',
+      vcMeetingImTurnOrigin: origin,
+      codexAppInput,
+    }]);
+  });
+
   it('type-ahead: multiple writes before idle are all carried over in order', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('msg-1', 'a'));

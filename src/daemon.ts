@@ -99,6 +99,7 @@ import {
   writableTerminalLinkFor,
   findActiveBySessionId,
   getDaemonBootId,
+  type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
 import { ipcRoute, isTrustedHostIpcRequest, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner, setBotRenamer } from './core/dashboard-ipc-server.js';
 import { loadOrCreateDashboardSecret } from './dashboard/auth.js';
@@ -149,6 +150,7 @@ import {
   killPersistentSession,
   persistentSessionName,
   probePersistentSession,
+  resolvePairedSpawnBackendType,
   type PersistentBackendType,
 } from './core/persistent-backend.js';
 import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
@@ -195,6 +197,7 @@ import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/d
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
 import { shutdownBackendDisposition } from './core/persistent-backend.js';
+import { evaluateVcMeetingConsumerIsolation } from './services/vc-meeting-consumer-isolation.js';
 import { markSessionActivity, announcePendingRepoSession, publishAttentionPatch, clearAgentAttention } from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { WorkflowEventWatcher, handleWorkflowFanoutEvent } from './workflows/fanout.js';
@@ -342,7 +345,6 @@ import {
 } from './services/vc-meeting-feed-metadata-store.js';
 import { VcMeetingTerminalReconciler } from './services/vc-meeting-terminal-reconciler.js';
 import {
-  evaluateVcMeetingManagedOriginClaim,
   resolveVcMeetingImTurnOrigin,
   verifyVcMeetingManagedOriginClaim,
 } from './services/vc-meeting-send-policy.js';
@@ -1593,12 +1595,43 @@ function vcMeetingConsumerCandidateLabel(candidate: VcMeetingConsumerAgentConfig
   }
 }
 
+function vcMeetingConsumerIsolationForBot(
+  bot: BotConfig,
+  sessionBackendType?: import('./adapters/backend/types.js').BackendType,
+) {
+  const cliId = bot.cliId ?? config.daemon.cliId;
+  const backendType = resolvePairedSpawnBackendType(
+    cliId,
+    sessionBackendType,
+    bot.backendType,
+    config.daemon.backendType,
+  );
+  return {
+    backendType,
+    decision: evaluateVcMeetingConsumerIsolation({
+      sandbox: bot.sandbox,
+      platform: process.platform,
+      backendType,
+    }),
+  };
+}
+
+function assertVcMeetingConsumerAgentIsolation(bot: BotConfig): void {
+  const isolation = vcMeetingConsumerIsolationForBot(bot);
+  if (!isolation.decision.ok) {
+    throw new Error(
+      `agent ${bot.larkAppId} has no managed side-effect isolation: ${isolation.decision.error}`,
+    );
+  }
+}
+
 function assertVcMeetingConsumerAgentWorkingDir(candidate: VcMeetingConsumerAgentConfig, listenerChatId: string): void {
   const cfg = vcMeetingLocalBotConfig(candidate.larkAppId) ?? vcMeetingConfiguredBotConfig(candidate.larkAppId);
   if (!cfg) {
     if (findOnlineDaemon(candidate.larkAppId)) return;
     throw new Error(`agent ${candidate.larkAppId} is not online`);
   }
+  assertVcMeetingConsumerAgentIsolation(cfg);
   const rawWorkingDir =
     findOncallChat(candidate.larkAppId, listenerChatId)?.workingDir
     ?? cfg.oncallChats?.find(chat => chat.chatId === listenerChatId)?.workingDir
@@ -1624,6 +1657,18 @@ function resolveVcMeetingReceiverSession(sessionId: string): VcMeetingReceiverSe
     const bot = getBot(ds.larkAppId);
     const cliId = (ds.session.cliId as CliId | undefined) ?? bot.config.cliId;
     const adapter = createCliAdapterSync(cliId, bot.config.cliPathOverride);
+    const backendType = resolvePairedSpawnBackendType(
+      cliId,
+      ds.initConfig?.backendType ?? ds.session.backendType,
+      bot.config.backendType,
+      config.daemon.backendType,
+    );
+    const isolation = evaluateVcMeetingConsumerIsolation({
+      sandbox: ds.session.sandbox,
+      platform: process.platform,
+      backendType,
+    });
+    if (!isolation.ok) return undefined;
     return {
       sessionId: ds.session.sessionId,
       chatId: ds.chatId,
@@ -1646,7 +1691,11 @@ async function ensureVcMeetingReceiverSession(
   }
   if (existingSessionId) {
     const existing = resolveVcMeetingReceiverSession(existingSessionId);
-    if (!existing) throw new Error(`registered receiver session is not active: ${existingSessionId}`);
+    if (!existing) {
+      throw new Error(
+        `registered receiver session is not active or lacks managed side-effect isolation: ${existingSessionId}`,
+      );
+    }
     const ds = [...activeSessions.values()].find(candidate =>
       candidate.session.sessionId === existingSessionId) ?? findActiveBySessionId(existingSessionId);
     const identity = ds?.session.vcMeetingReceiver;
@@ -1680,6 +1729,12 @@ async function ensureVcMeetingReceiverSession(
   }
 
   const bot = getBot(selfAppId);
+  const isolation = vcMeetingConsumerIsolationForBot(bot.config);
+  if (!isolation.decision.ok) {
+    throw new Error(
+      `receiver agent ${selfAppId} has no managed side-effect isolation: ${isolation.decision.error}`,
+    );
+  }
   const rawWorkingDir = findOncallChat(selfAppId, chatId)?.workingDir
     ?? effectiveDefaultWorkingDir(bot.config)
     ?? bot.config.workingDir
@@ -1705,6 +1760,14 @@ async function ensureVcMeetingReceiverSession(
   session.lastMessageAt = new Date(now).toISOString();
   session.workingDir = workingDir.resolvedPath;
   session.cliId = bot.config.cliId;
+  // Freeze the security-critical launch decision at receiver creation.  A
+  // later live Bot-config edit must neither weaken this session nor make an
+  // old unisolated receiver appear eligible retroactively.
+  session.sandbox = true;
+  session.sandboxHidePaths = bot.config.sandboxHidePaths ?? [];
+  session.sandboxReadonlyPaths = bot.config.sandboxReadonlyPaths ?? [];
+  session.sandboxNetwork = bot.config.sandboxNetwork !== false;
+  session.backendType = isolation.backendType;
   sessionStore.updateSession(session);
 
   const ds: DaemonSession = {
@@ -2314,6 +2377,7 @@ export async function noteTurnReceived(
   // message — not a worker status edge — means type-ahead / busy-batched messages
   // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
   // the worker next goes idle.
+  if (ds.session.vcMeetingReceiver) return;
   if (!streamingCardDisabledFor(ds)) return;
   if (silentTurnReactionsFor(ds)) return;
   // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
@@ -2341,18 +2405,32 @@ async function sessionReply(
   msgType: string = 'text',
   larkAppId?: string,
   turnId?: string,
-  opts?: {
-    uuid?: string;
-    quoteMessageId?: string;
-    beforeQuoteFallback?: () => void | Promise<void>;
-  },
+  opts?: WorkerSessionReplyOptions,
 ): Promise<string> {
   let ds: DaemonSession | undefined;
-  if (larkAppId) {
-    ds = activeSessions.get(sessionKey(anchor, larkAppId));
-  } else {
-    for (const s of activeSessions.values()) {
-      if (sessionAnchorId(s) === anchor) { ds = s; break; }
+  const sourceSessionId = opts?.sourceSessionId?.trim();
+  if (sourceSessionId) {
+    const exact = [...activeSessions.values()].find(candidate =>
+      candidate.session.sessionId === sourceSessionId);
+    if (exact
+      && sessionAnchorId(exact) === anchor
+      && (!larkAppId || exact.larkAppId === larkAppId)) {
+      ds = exact;
+    } else {
+      logger.warn(
+        `[routing] Rejected invalid source session identity ${sourceSessionId.substring(0, 12)} `
+        + `for anchor=${anchor.substring(0, 16)} app=${larkAppId ?? '-'}`,
+      );
+      throw new Error('source session identity is stale or does not match the reply route');
+    }
+  }
+  if (!ds && !sourceSessionId) {
+    if (larkAppId) {
+      ds = activeSessions.get(sessionKey(anchor, larkAppId));
+    } else {
+      for (const s of activeSessions.values()) {
+        if (sessionAnchorId(s) === anchor) { ds = s; break; }
+      }
     }
   }
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
@@ -2362,6 +2440,26 @@ async function sessionReply(
     scope: ds.scope,
     anchor: sessionAnchorId(ds),
   } : undefined;
+  const outboundOptions = opts?.suppressHook || ds?.session.vcMeetingReceiver
+    ? { suppressHook: true }
+    : undefined;
+  const sendWithHookPolicy = (
+    chatId: string,
+    body: string,
+    type: string,
+    uuid?: string,
+  ): Promise<string> => outboundOptions
+    ? sendMessage(appId, chatId, body, type, uuid, hookContext, outboundOptions)
+    : sendMessage(appId, chatId, body, type, uuid, hookContext);
+  const replyWithHookPolicy = (
+    messageId: string,
+    body: string,
+    type: string,
+    replyInThread: boolean,
+    uuid?: string,
+  ): Promise<string> => outboundOptions
+    ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
+    : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext);
 
   // Chat-scope: post a plain message to the chat. No reply_in_thread → keeps
   // the conversation flat in 普通群. The card layer carries chatId in its button
@@ -2381,14 +2479,12 @@ async function sessionReply(
     const chatId = ds?.chatId ?? anchor;
     if (opts?.quoteMessageId) {
       try {
-        return await replyMessage(
-          appId,
+        return await replyWithHookPolicy(
           opts.quoteMessageId,
           content,
           msgType,
           false,
           opts.uuid,
-          hookContext,
         );
       } catch (err) {
         if (!(err instanceof MessageWithdrawnError)) throw err;
@@ -2397,7 +2493,7 @@ async function sessionReply(
           `[routing] VC IM quote target withdrawn (${opts.quoteMessageId}); `
           + 'falling back to one stable-UUID chat message',
         );
-        return sendMessage(appId, chatId, content, msgType, opts.uuid, hookContext);
+        return sendWithHookPolicy(chatId, content, msgType, opts.uuid);
       }
     }
     if (ds?.scope === 'chat') {
@@ -2415,20 +2511,20 @@ async function sessionReply(
       // (drives the real sessionReply) and test/reply-target-fallback.test.ts
       // (the resolveSessionReplyTarget × fallbackTurnId composition it relies on).
       const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds, turnId));
-      if (target.mode === 'thread') return replyMessage(appId, target.rootMessageId, content, msgType, true, undefined, hookContext);
+      if (target.mode === 'thread') return replyWithHookPolicy(target.rootMessageId, content, msgType, true, opts?.uuid);
       if (ds.session.rootMessageId) {
         const mode = await getChatMode(appId, chatId, { forceRefresh: true });
         if (mode === 'topic') {
           logger.warn(`[routing] Chat-scope session ${ds.session.sessionId.substring(0, 8)} is now topic-mode; replying in original thread ${ds.session.rootMessageId.substring(0, 12)}`);
-          return replyMessage(appId, ds.session.rootMessageId, content, msgType, true, undefined, hookContext);
+          return replyWithHookPolicy(ds.session.rootMessageId, content, msgType, true, opts?.uuid);
         }
       }
     }
-    return sendMessage(appId, chatId, content, msgType, undefined, hookContext);
+    return sendWithHookPolicy(chatId, content, msgType, opts?.uuid);
   }
 
   // Thread-scope (or unknown / legacy): reply in thread.
-  return replyMessage(appId, anchor, content, msgType, true, undefined, hookContext);
+  return replyWithHookPolicy(anchor, content, msgType, true, opts?.uuid);
 }
 
 // Test seams: drive the real sessionReply (the chat-scope thread/top-level
@@ -4051,63 +4147,34 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
 
   const askSession = findActiveBySessionId(parsed.sessionId);
   let boundAsk = parsed;
-  const body = raw && typeof raw === 'object' && !Array.isArray(raw)
-    ? raw as Record<string, unknown>
-    : {};
-  const claimedTurnId = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
-  const claimedAttempt = typeof body.originDispatchAttempt === 'number'
-    && Number.isSafeInteger(body.originDispatchAttempt)
-    && body.originDispatchAttempt > 0
-    ? body.originDispatchAttempt
-    : undefined;
-  const trustedHost = isTrustedHostIpcRequest(req);
-
-  // Ordinary read-isolated sessions authenticate with the exact live rotating
-  // capability. Dedicated meeting receivers keep their stricter durable sink
-  // policy below; that evaluator proves the same capability and additionally
-  // checks the live receipt / explicit-IM ownership fences.
-  if (!trustedHost && !askSession?.session.vcMeetingReceiver) {
+  if (!isTrustedHostIpcRequest(req)) {
+    const body = raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? raw as Record<string, unknown>
+      : {};
+    const claimedAttempt = typeof body.originDispatchAttempt === 'number'
+      && Number.isSafeInteger(body.originDispatchAttempt)
+      && body.originDispatchAttempt > 0
+      ? body.originDispatchAttempt
+      : undefined;
     const verified = authorizeSessionScopedIpc({
       trustedHost: false,
       sessionExists: !!askSession,
-      receiverSession: false,
+      receiverSession: !!askSession?.session.vcMeetingReceiver,
       allowReceiver: false,
       sessionId: parsed.sessionId,
       liveOrigin: askSession?.managedTurnOrigin,
       claimedCapability: typeof body.originCapability === 'string'
         ? body.originCapability
         : undefined,
-      claimedTurnId,
+      claimedTurnId: typeof body.originTurnId === 'string' ? body.originTurnId : undefined,
       claimedDispatchAttempt: claimedAttempt,
     });
     if (!verified.ok) {
-      return jsonRes(res, 403, { ok: false, error: verified.error });
-    }
-  }
-  if (askSession?.session.vcMeetingReceiver) {
-    const liveImOrigin = resolveVcMeetingImTurnOrigin(
-      askSession.session,
-      askSession.managedTurnOrigin?.turnId,
-    );
-    const decision = evaluateVcMeetingManagedOriginClaim(config.session.dataDir, {
-      receiverSessionId: parsed.sessionId,
-      currentImTurnOrigin: liveImOrigin,
-      liveOrigin: askSession.managedTurnOrigin,
-      claimedTurnId,
-      claimedDispatchAttempt: claimedAttempt,
-      claimedCapability: typeof body.originCapability === 'string'
-        ? body.originCapability
-        : undefined,
-    });
-    if (!decision.ok) {
       return jsonRes(res, 403, {
         ok: false,
-        error: decision.errorCode,
-        detail: decision.error,
+        error: verified.error,
       });
     }
-  }
-  if (!trustedHost) {
     // A session capability authenticates exactly one daemon session; it does
     // not let the caller choose another bot/chat/root. Bind every observable
     // ask route to that authenticated session before registering the card.
@@ -4118,6 +4185,17 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       rootMessageId: askSession!.session.scope === 'chat'
         ? null
         : askSession!.session.rootMessageId,
+    });
+  }
+  if (askSession?.session.vcMeetingReceiver) {
+    // A meeting receiver ask would post a Lark card outside the managed action
+    // ledger/provider-idempotency boundary. Durable replay could therefore
+    // duplicate an approval side effect. Meeting agents must request external
+    // effects through `vc-agent respond` / managed-action instead.
+    return jsonRes(res, 403, {
+      ok: false,
+      error: 'managed_action_required',
+      detail: 'meeting receiver asks are not an idempotent managed action',
     });
   }
 
@@ -4277,7 +4355,10 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
       claimedDispatchAttempt: claimedAttempt,
     });
     if (!verified.ok) {
-      return jsonRes(res, 403, { ok: false, error: verified.error });
+      return jsonRes(res, 403, {
+        ok: false,
+        error: verified.error,
+      });
     }
   }
   if (ds?.worker) {
@@ -13170,6 +13251,8 @@ export const __vcMeetingAgentTest = {
       chatId: ds.chatId,
       rootMessageId: ds.session.rootMessageId,
       scope: ds.scope,
+      sandbox: ds.session.sandbox,
+      backendType: ds.session.backendType,
       vcMeetingReceiver: ds.session.vcMeetingReceiver
         ? structuredClone(ds.session.vcMeetingReceiver)
         : undefined,
@@ -13685,6 +13768,7 @@ async function startInitialPassthroughSession(args: {
   logger.info(`[${tag(ds)}] No projects to select, queued initial raw passthrough ${commandContent.substring(0, 40)}`);
 }
 
+
 function vcMeetingApplicationContext(ctx: RoutingContext): string {
   return (ctx.vcMeetingContextLifecycle === 'sealed'
     ? '[会议上下文状态] 本轮正在复用一场已结束会议的专属会话；这是会后追问。可以基于既有会议上下文回答，但不得声称会议仍在进行，也不要尝试会中文本或语音动作。\n'
@@ -13704,7 +13788,6 @@ function mergeVcMeetingApplicationContext(
   if (lines.length === 0) return undefined;
   return `${[...new Set(lines)].join('\n')}\n`;
 }
-
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger } = ctx;
@@ -13788,6 +13871,12 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // botmux-workflow skill 的 prompt（改写 content，promptContent 随后从 content
   // 构造），fall-through 到正常 session 创建，让本话题 agent 接管整条链路。
   // run|cancel 不在此命中（归 v2 legacy，由下面 handleWorkflowCommandIfAny 处理）。
+  // Freeze the Lark-authored bytes before a workflow command rewrites the
+  // legacy model prompt. Codex App clean-input must keep those original bytes
+  // as the visible UserMessage and move the generated skill prompt into hidden
+  // untrusted context.
+  const codexAppVisibleText = content;
+  let workflowGrillPrompt: string | undefined;
   const newTopicGrill = parseWorkflowGrillTrigger(cmdContent);
   if (newTopicGrill) {
     if (await replyGrantRestrictionIfNeeded(larkAppId, chatId, senderOpenId, anchor, '/workflow')) {
@@ -13797,7 +13886,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       await sessionReply(anchor, WORKFLOW_USAGE, 'text', larkAppId);
       return;
     }
-    content = buildWorkflowGrillPrompt(newTopicGrill.goal);
+    workflowGrillPrompt = buildWorkflowGrillPrompt(newTopicGrill.goal);
+    content = workflowGrillPrompt;
     // 保留原 cmdContent（"/workflow new …"）供 title/日志；/workflow 非注册命令，
     // 下面的 parseSlashCommandInvocation 会让它落到正常 spawn 路径。
   } else {
@@ -13984,12 +14074,13 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // the very first interaction (no active session yet), the same hint that
   // handleThreadReply prepends needs to ride along here too. Without it, the
   // bot never learns about the quoted message_id and `botmux quoted` is dead
-  // weight on first turns. `content` (post force-topic-strip) is what the
-  // worker will see; promptContent wraps it for prompt-building paths but
-  // leaves `content` untouched for title / log substring uses.
-  const codexAppMessageContext = buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId));
+  // weight on first turns. `codexAppVisibleText` is the post-force-topic Lark
+  // text; `content` may instead be the generated workflow prompt on legacy
+  // paths. Keep those two lanes separate below.
+  const codexAppQuoteContext = buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId));
+  const codexAppMessageContext = codexAppQuoteContext + (workflowGrillPrompt ?? '');
   const codexAppApplicationContext = vcMeetingApplicationContext(ctx);
-  const promptContent = codexAppMessageContext + codexAppApplicationContext + content;
+  const promptContent = codexAppQuoteContext + codexAppApplicationContext + content;
 
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a
@@ -14051,7 +14142,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     hasHistory: false,
     pendingRepo: !pinnedWorkingDir || autoWt,
     pendingPrompt: promptContent,
-    pendingCodexAppText: content,
+    pendingCodexAppText: codexAppVisibleText,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
@@ -14084,7 +14175,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     const selfBot = getBot(larkAppId);
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: content, codexAppApplicationContext, codexAppMessageContext });
+    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, prompt);
     forkWorker(ds, prompt);
@@ -14116,7 +14207,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ds.pendingRepo = false;
     const selfBot = getBot(larkAppId);
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: content, codexAppApplicationContext, codexAppMessageContext });
+    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, prompt);
     forkWorker(ds, prompt);
@@ -14534,8 +14625,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     }
     const workflowPrompt = buildWorkflowGrillPrompt(threadGrill.goal);
     // Legacy/non-clean paths still need daemon-owned VC lifecycle context.
-    // Clean Codex App turns keep it in the trusted application lane while the
-    // generated workflow instruction remains hidden message context.
+    // For clean Codex App, keep that trusted context in the application lane
+    // and expose only quote/bot prefixes + the generated workflow prompt as
+    // hidden untrusted message context.
     promptContent = initialCodexAppMessageContext
       + initialCodexAppApplicationContext
       + workflowPrompt;
@@ -14945,7 +15037,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       pendingRepo: !pinnedWorkingDir || autoWt,
       pendingPrompt: promptContent,
       pendingCodexAppText: parsed.content,
-      pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
+      pendingCodexAppApplicationContext: codexAppApplicationContext,
       pendingCodexAppMessageContext: codexAppMessageContext,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
@@ -16310,6 +16402,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ds.worker = null;
           ds.workerPort = null;
           ds.workerToken = null;
+          ds.workerViewToken = null;
         } else {
           killWorker(ds);
         }

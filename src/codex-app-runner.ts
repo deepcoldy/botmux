@@ -9,6 +9,7 @@ import {
   parseCodexVersion,
   type CodexVersion,
 } from './adapters/cli/codex-app-turn.js';
+import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 
 type JsonObject = Record<string, any>;
 
@@ -29,7 +30,10 @@ interface PendingRequest {
 }
 
 interface ActiveTurn {
-  turnId?: string;
+  /** Codex app-server's native turn id. This is used only to correlate
+   * notifications from the server; botmux routing uses the stable client
+   * message id carried alongside the queued input. */
+  nativeTurnId?: string;
   serverStarted: boolean;
   startedAtMs: number;
   finalText: string;
@@ -44,8 +48,7 @@ interface QueuedInput {
   codexAppInput?: CodexAppTurnInput;
 }
 
-const OSC_PREFIX = '\x1b]777;botmux:';
-const OSC_END = '\x07';
+const output = new RunnerControlWriter();
 
 function asError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
@@ -72,20 +75,16 @@ function parseArgs(argv: string[]): Args {
   return out;
 }
 
-function b64Json(value: unknown): string {
-  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64');
-}
-
 function emitMarker(kind: string, payload: unknown): void {
-  process.stdout.write(`${OSC_PREFIX}${kind}:${b64Json(payload)}${OSC_END}`);
+  output.marker(kind, payload);
 }
 
 function writeLine(text = ''): void {
-  process.stdout.write(text + '\n');
+  output.line(text);
 }
 
 function prompt(): void {
-  process.stdout.write('› ');
+  output.display('› ');
 }
 
 function appDeveloperInstructions(args: Args): string {
@@ -137,7 +136,7 @@ class AppServerClient {
     this.child.stderr.on('data', chunk => {
       const text = chunk.toString('utf8');
       this.lastStderr = (this.lastStderr + text).slice(-8000);
-      if (process.env.BOTMUX_CODEX_APP_DEBUG === '1') process.stderr.write(text);
+      if (process.env.BOTMUX_CODEX_APP_DEBUG === '1') output.error(text);
     });
     this.child.on('error', err => {
       const hint = (err as NodeJS.ErrnoException).code === 'ENOENT'
@@ -252,7 +251,7 @@ let args: Args;
 try {
   args = parseArgs(process.argv.slice(2));
 } catch (err: any) {
-  console.error(err?.message ?? err);
+  output.error(`${err?.message ?? err}\n`);
   process.exit(2);
 }
 
@@ -335,11 +334,11 @@ function handleServerRequest(msg: JsonObject): boolean {
 function handleNotification(msg: JsonObject): void {
   const params = msg.params ?? {};
   if (!activeTurn || params.threadId !== threadId) return;
-  if (activeTurn.turnId && params.turnId && params.turnId !== activeTurn.turnId) return;
+  if (activeTurn.nativeTurnId && params.turnId && params.turnId !== activeTurn.nativeTurnId) return;
 
   if (msg.method === 'turn/started') {
     activeTurn.serverStarted = true;
-    activeTurn.turnId = params.turn?.id ?? params.turnId ?? activeTurn.turnId;
+    activeTurn.nativeTurnId = params.turn?.id ?? params.turnId ?? activeTurn.nativeTurnId;
     return;
   }
 
@@ -358,12 +357,12 @@ function handleNotification(msg: JsonObject): void {
     const itemId = String(params.itemId ?? '');
     activeTurn.itemText.set(itemId, (activeTurn.itemText.get(itemId) ?? '') + delta);
     activeTurn.allAgentText += delta;
-    process.stdout.write(delta);
+    output.display(delta);
     return;
   }
 
   if (msg.method === 'item/commandExecution/outputDelta' || msg.method === 'item/fileChange/outputDelta') {
-    process.stdout.write(String(params.delta ?? ''));
+    output.display(String(params.delta ?? ''));
     return;
   }
 
@@ -380,7 +379,7 @@ function handleNotification(msg: JsonObject): void {
 
   if (msg.method === 'turn/completed') {
     const turn = params.turn;
-    if (turn?.id && activeTurn.turnId && turn.id !== activeTurn.turnId) return;
+    if (turn?.id && activeTurn.nativeTurnId && turn.id !== activeTurn.nativeTurnId) return;
     if (turn?.error?.message && !activeTurn.finalText) {
       activeTurn.finalText = `Codex App turn failed: ${turn.error.message}`;
     }
@@ -489,14 +488,21 @@ async function runTurn(message: QueuedInput): Promise<void> {
     });
     result = await client.request('turn/start', built.params);
   }
-  turn.turnId = result.turn?.id ?? turn.turnId;
+  turn.nativeTurnId = result.turn?.id ?? turn.nativeTurnId;
   await turn.done;
 
   const finalText = (turn.finalText || turn.allAgentText).trim();
   const completedAtMs = Date.now();
   if (finalText) {
+    // clientUserMessageId is the daemon-frozen botmux/Lark turn identity. The
+    // app-server generates a different id for the same logical turn; exposing
+    // that native id as `turnId` breaks daemon wait maps, VC suppression and
+    // reply routing. When no structured sidecar exists, omit turnId so the
+    // worker deliberately falls back to its current botmux turn attribution.
+    const stableTurnId = message.codexAppInput?.clientUserMessageId;
     emitMarker('final', {
-      turnId: turn.turnId ?? `codex-app-${completedAtMs}`,
+      ...(stableTurnId ? { turnId: stableTurnId } : {}),
+      ...(turn.nativeTurnId ? { nativeTurnId: turn.nativeTurnId } : {}),
       content: finalText,
       startedAtMs: turn.startedAtMs,
       completedAtMs,
@@ -516,13 +522,18 @@ async function drainQueue(): Promise<void> {
         await runTurn(next);
       } catch (err: any) {
         const message = `Codex App runner error: ${err?.message ?? err}`;
+        const completedAtMs = Date.now();
+        const stableTurnId = next.codexAppInput?.clientUserMessageId;
+        const nativeTurnId = activeTurn?.nativeTurnId;
         writeLine(message);
         emitMarker('final', {
-          turnId: `codex-app-error-${Date.now()}`,
+          ...(stableTurnId ? { turnId: stableTurnId } : {}),
+          ...(nativeTurnId ? { nativeTurnId } : {}),
           content: message,
-          startedAtMs: Date.now(),
-          completedAtMs: Date.now(),
+          startedAtMs: activeTurn?.startedAtMs ?? completedAtMs,
+          completedAtMs,
         });
+        activeTurn = null;
       }
       prompt();
     }
@@ -597,6 +608,6 @@ process.on('SIGINT', () => {
 });
 
 main().catch(err => {
-  console.error(err?.stack ?? err?.message ?? err);
+  output.error(`${err?.stack ?? err?.message ?? err}\n`);
   process.exit(1);
 });

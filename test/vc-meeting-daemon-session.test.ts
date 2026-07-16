@@ -367,6 +367,8 @@ function registerConsumerAgentBot(
     larkAppSecret: 'agent-secret',
     name: opts.name ?? 'Agent Claude',
     cliId: 'claude-code',
+    sandbox: true,
+    backendType: 'pty',
     ...(opts.workingDir === null ? {} : { workingDir: opts.workingDir ?? process.cwd() }),
   });
 }
@@ -1483,6 +1485,8 @@ describe('VC meeting daemon session lifecycle', () => {
       larkAppSecret: 'secret',
       name: 'Meeting Bot',
       cliId: 'claude-code',
+      sandbox: true,
+      backendType: 'pty',
       workingDir: process.cwd(),
       vcMeetingAgent: {
         enabled: true,
@@ -1934,6 +1938,8 @@ describe('VC meeting daemon session lifecycle', () => {
       larkAppSecret: 'secret',
       name: 'Meeting Bot',
       cliId: 'claude-code',
+      sandbox: true,
+      backendType: 'pty',
       workingDir: process.cwd(),
       vcMeetingAgent: {
         enabled: true,
@@ -1996,6 +2002,8 @@ describe('VC meeting daemon session lifecycle', () => {
       chatId: 'oc_listener_1',
       rootMessageId: 'oc_listener_1',
       scope: 'chat',
+      sandbox: true,
+      backendType: 'pty',
       vcMeetingReceiver: {
         listenerAppId: APP_ID,
         meetingId: 'm_joined_222222224',
@@ -4994,6 +5002,8 @@ describe('VC meeting daemon session lifecycle', () => {
       larkAppSecret: 'agent-secret',
       name: 'Unsupported Gemini',
       cliId: 'gemini',
+      sandbox: true,
+      backendType: 'pty',
       workingDir: process.cwd(),
     });
     registerBot({
@@ -5025,6 +5035,51 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(interactiveCardMarkdownContent(result)).toContain('选择 agent 失败，已回退只监听');
     expect(interactiveCardMarkdownContent(result)).toContain('reliable turn terminal contract');
     const stored = runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_454545454');
+    expect(stored?.consumerMode).toBe('listenOnly');
+    expect(stored?.selectedAgentAppId).toBeUndefined();
+  });
+
+  it('fails selection closed before creating a receiver for an unsandboxed agent', async () => {
+    registerBot({
+      larkAppId: AGENT_APP_ID,
+      larkAppSecret: 'agent-secret',
+      name: 'Unisolated Claude',
+      cliId: 'claude-code',
+      backendType: 'pty',
+      workingDir: process.cwd(),
+      sandbox: false,
+    });
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Unisolated Claude' }],
+        },
+      },
+    });
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_unisolated_consumer',
+      meeting: { id: 'm_unisolated_consumer', meetingNo: '454545455', topic: 'Unisolated consumer' },
+      raw: { event: { meeting: { id: 'm_unisolated_consumer', meeting_no: '454545455' } } },
+    });
+
+    const result = await selectConsumerAgentViaCard('Unisolated Claude');
+    expect(result.header.title.content).toBe('仅同步会议消息');
+    expect(interactiveCardMarkdownContent(result)).toContain('选择 agent 失败，已回退只监听');
+    expect(interactiveCardMarkdownContent(result)).toContain('managed side-effect isolation');
+    expect(addBotToChatCalls).toHaveLength(0);
+    expect(__vcMeetingAgentTest.receiverSessionSnapshot('m_unisolated_consumer')).toBeUndefined();
+    const stored = runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_454545455');
     expect(stored?.consumerMode).toBe('listenOnly');
     expect(stored?.selectedAgentAppId).toBeUndefined();
   });

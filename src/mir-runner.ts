@@ -35,6 +35,7 @@ import {
   type MiramcpAutostartResult,
 } from './mir-local-runtime.js';
 import { normalizeMircliPrompt } from './mir-prompt.js';
+import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 
 interface Args {
   sessionId: string;
@@ -44,8 +45,7 @@ interface Args {
   mircliBin?: string;
 }
 
-const OSC_PREFIX = '\x1b]777;botmux:';
-const OSC_END = '\x07';
+const output = new RunnerControlWriter();
 const DEFAULT_QUERY_TIMEOUT = '10m';
 const DEFAULT_RUNNER_TIMEOUT_MS = 12 * 60 * 1000;
 const MARKER_PREFIX = '::botmux-mir:';
@@ -70,20 +70,16 @@ function parseArgs(argv: string[]): Args {
   return out;
 }
 
-function b64Json(value: unknown): string {
-  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64');
-}
-
 function emitMarker(kind: string, payload: unknown): void {
-  process.stdout.write(`${OSC_PREFIX}${kind}:${b64Json(payload)}${OSC_END}`);
+  output.marker(kind, payload);
 }
 
 function writeLine(text = ''): void {
-  process.stdout.write(text + '\n');
+  output.line(text);
 }
 
 function prompt(): void {
-  process.stdout.write('› ');
+  output.display('› ');
 }
 
 function errorMessage(err: unknown): string {
@@ -100,10 +96,10 @@ function logMiramcpAutostart(result: MiramcpAutostartResult): void {
   ].filter(Boolean).join(' ');
   const message = `[mir] miramcp auto-start ${details}\n`;
   if (result.status === 'started_pending' || result.status === 'missing_bin' || result.status === 'spawn_failed' || result.status === 'invalid_config' || result.status === 'missing_device_id') {
-    process.stderr.write(message);
+    output.error(message);
     return;
   }
-  if (process.env.DEBUG) process.stderr.write(message);
+  if (process.env.DEBUG) output.error(message);
 }
 
 function boolEnv(name: string, fallback: boolean): boolean {
@@ -196,7 +192,7 @@ class MircliClient {
         try {
           logMiramcpAutostart(ensureMiramcpBridgeStarted({ mircliBin: bin }));
         } catch (err) {
-          process.stderr.write(`[mir] miramcp auto-start threw error=${errorMessage(err)}\n`);
+          output.error(`[mir] miramcp auto-start threw error=${errorMessage(err)}\n`);
           // Best-effort: mircli will surface the concrete MCP error if the
           // bridge is still unavailable.
         }
@@ -281,7 +277,7 @@ let args: Args;
 try {
   args = parseArgs(process.argv.slice(2));
 } catch (err) {
-  console.error(`Mir runner: ${errorMessage(err)}`);
+  output.error(`Mir runner: ${errorMessage(err)}\n`);
   process.exit(2);
 }
 
@@ -304,7 +300,7 @@ async function runTurn(content: string): Promise<void> {
     writeLine();
     writeLine(result.finalText);
     emitMarker('final', {
-      turnId: result.turnId,
+      nativeTurnId: result.turnId,
       content: result.finalText,
       startedAtMs,
       completedAtMs,
@@ -327,7 +323,6 @@ async function drainQueue(): Promise<void> {
         const message = `Mir runner error: ${errorMessage(err)}`;
         writeLine(message);
         emitMarker('final', {
-          turnId: `mir-error-${now}`,
           content: message,
           startedAtMs: now,
           completedAtMs: now,
@@ -390,6 +385,6 @@ async function main(): Promise<void> {
 process.on('SIGTERM', () => { process.exit(0); });
 
 main().catch(err => {
-  console.error(`Mir runner failed: ${errorMessage(err)}`);
+  output.error(`Mir runner failed: ${errorMessage(err)}\n`);
   process.exit(1);
 });

@@ -3,12 +3,21 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  VC_MEETING_LISTENER_PROVIDER_DEDUP_SAFE_MS,
   finishVcMeetingImReply,
+  prepareVcMeetingDeliveryReply,
   prepareVcMeetingImReply,
 } from '../src/services/vc-meeting-im-reply.js';
+import {
+  findVcMeetingAction,
+  finishVcMeetingAction,
+} from '../src/services/vc-meeting-action-store.js';
 import type { VcMeetingImTurnOrigin } from '../src/types.js';
 import {
+  acceptVcMeetingDelivery,
   applyVcMeetingMemberProjection,
+  markVcMeetingDeliveryAmbiguous,
+  markVcMeetingDeliveryDispatched,
   type VcMeetingMemberProjectionInput,
 } from '../src/services/vc-meeting-delivery-store.js';
 
@@ -67,7 +76,7 @@ afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 describe('VC explicit IM assistant reply ledger', () => {
   it('locks the first output and reuses one provider UUID across ambiguous replay', () => {
     const first = prepareVcMeetingImReply(dir, origin, output, 100);
-    expect(first).toMatchObject({ kind: 'send', replay: false });
+    expect(first).toMatchObject({ kind: 'send', replay: false, providerReplay: false });
     if (first.kind !== 'send') throw new Error('expected first send claim');
     expect(first.providerKey).toMatch(/^vcp_[0-9a-f]+$/);
     expect(first.providerKey.length).toBeLessThanOrEqual(50);
@@ -76,6 +85,7 @@ describe('VC explicit IM assistant reply ledger', () => {
     expect(replay).toMatchObject({
       kind: 'send',
       replay: true,
+      providerReplay: true,
       providerKey: first.providerKey,
     });
 
@@ -94,6 +104,67 @@ describe('VC explicit IM assistant reply ledger', () => {
     if (mismatch.kind === 'send') {
       expect(mismatch.canonicalOutput.content).not.toBe(changedOutput.content);
     }
+  });
+
+  it('never retries an ambiguous provider call after the Lark UUID safety window', () => {
+    const attemptedAt = 100;
+    const first = prepareVcMeetingImReply(dir, origin, output, attemptedAt);
+    if (first.kind !== 'send') throw new Error('expected first send claim');
+
+    expect(prepareVcMeetingImReply(
+      dir,
+      origin,
+      output,
+      attemptedAt + VC_MEETING_LISTENER_PROVIDER_DEDUP_SAFE_MS,
+    )).toMatchObject({ kind: 'send', providerReplay: true });
+
+    expect(prepareVcMeetingImReply(
+      dir,
+      origin,
+      output,
+      attemptedAt + VC_MEETING_LISTENER_PROVIDER_DEDUP_SAFE_MS + 1,
+    )).toMatchObject({
+      kind: 'conflict',
+      reason: 'invalid_state',
+      detail: expect.stringContaining('manual review'),
+    });
+    expect(findVcMeetingAction(dir, {
+      listenerAppId: origin.listenerAppId,
+      meetingId: origin.meetingId,
+    }, first.ref.actionId)).toMatchObject({
+      status: 'unknown',
+      errorCode: 'provider_idempotency_window_expired',
+    });
+
+    // Even after the provider's full one-hour dedupe TTL, terminal unknown is
+    // a manual state and can never be turned back into an automatic send.
+    expect(prepareVcMeetingImReply(dir, origin, output, attemptedAt + 60 * 60_000 + 1))
+      .toMatchObject({ kind: 'conflict', reason: 'invalid_state' });
+  });
+
+  it('only reconciles succeeded records missing messageId inside the UUID safety window', () => {
+    const attemptedAt = 100;
+    const first = prepareVcMeetingImReply(dir, origin, output, attemptedAt);
+    if (first.kind !== 'send') throw new Error('expected first send claim');
+    expect(finishVcMeetingAction(dir, first.ref, { status: 'succeeded' }, attemptedAt + 1))
+      .toMatchObject({ kind: 'updated', record: { status: 'succeeded' } });
+
+    expect(prepareVcMeetingImReply(
+      dir,
+      origin,
+      output,
+      attemptedAt + VC_MEETING_LISTENER_PROVIDER_DEDUP_SAFE_MS,
+    )).toMatchObject({ kind: 'succeeded', providerReplay: true });
+    expect(prepareVcMeetingImReply(
+      dir,
+      origin,
+      output,
+      attemptedAt + VC_MEETING_LISTENER_PROVIDER_DEDUP_SAFE_MS + 1,
+    )).toMatchObject({
+      kind: 'conflict',
+      reason: 'invalid_state',
+      detail: expect.stringContaining('manual review'),
+    });
   });
 
   it('refuses a late replay after the member is removed or ownership changes', () => {
@@ -146,5 +217,107 @@ describe('VC explicit IM assistant reply ledger', () => {
     if (first.kind === 'send' && second.kind === 'send') {
       expect(second.providerKey).not.toBe(first.providerKey);
     }
+  });
+});
+
+describe('VC durable delivery assistant reply ledger', () => {
+  const deliveryOrigin = {
+    receiverSessionId: origin.receiverSessionId,
+    stableTurnId: 'delivery-stable-key',
+    dispatchAttempt: 1,
+  };
+  const deliveryOutput = {
+    targetChatId: output.targetChatId,
+    msgType: output.msgType,
+    content: output.content,
+  };
+  const deliveryKey = {
+    listenerAppId: origin.listenerAppId,
+    meetingId: origin.meetingId,
+    memberId: origin.memberId,
+    memberEpoch: origin.memberEpoch,
+    deliveryKey: deliveryOrigin.stableTurnId,
+  };
+
+  beforeEach(() => {
+    project({
+      membershipGeneration: 2,
+      responseMode: 'listener_thread',
+      capabilities: ['meeting.read', 'listener.output.request'],
+    });
+    expect(acceptVcMeetingDelivery(dir, {
+      ...deliveryKey,
+      ownerBootId: origin.ownerBootId,
+      ownerEpoch: origin.ownerEpoch,
+      membershipGeneration: 2,
+      inputHash: 'delivery-input-hash',
+      fromSeq: 1,
+      toSeq: 1,
+      responseMode: 'listener_thread',
+      receiverBootId: 'receiver-boot-a',
+    })).toMatchObject({ kind: 'accepted' });
+    expect(markVcMeetingDeliveryDispatched(dir, deliveryKey, {
+      receiverBootId: 'receiver-boot-a',
+      workerGeneration: 1,
+    })).toMatchObject({ ok: true, receipt: { dispatchAttempt: 1 } });
+  });
+
+  it('reuses one provider UUID and first output across an ambiguous replay attempt', () => {
+    const first = prepareVcMeetingDeliveryReply(dir, deliveryOrigin, deliveryOutput, 100);
+    expect(first).toMatchObject({ kind: 'send', replay: false, providerReplay: false });
+    if (first.kind !== 'send') throw new Error('expected first delivery reply claim');
+
+    expect(markVcMeetingDeliveryAmbiguous(dir, deliveryKey, {
+      workerGeneration: 1,
+      dispatchAttempt: 1,
+    }, 110)).toMatchObject({ ok: true, receipt: { status: 'ambiguous' } });
+    expect(markVcMeetingDeliveryDispatched(dir, deliveryKey, {
+      receiverBootId: 'receiver-boot-b',
+      workerGeneration: 2,
+    }, 120)).toMatchObject({ ok: true, receipt: { dispatchAttempt: 2 } });
+
+    const changed = { ...deliveryOutput, content: '{"changed":true}' };
+    const replay = prepareVcMeetingDeliveryReply(dir, {
+      ...deliveryOrigin,
+      dispatchAttempt: 2,
+    }, changed, 130);
+    expect(replay).toMatchObject({
+      kind: 'send',
+      replay: true,
+      providerReplay: true,
+      providerKey: first.providerKey,
+      outputMismatch: true,
+      canonicalOutput: deliveryOutput,
+    });
+  });
+
+  it('rejects the stale attempt after the receipt has moved to its retry', () => {
+    expect(prepareVcMeetingDeliveryReply(dir, deliveryOrigin, deliveryOutput)).toMatchObject({ kind: 'send' });
+    expect(markVcMeetingDeliveryAmbiguous(dir, deliveryKey, {
+      workerGeneration: 1,
+      dispatchAttempt: 1,
+    })).toMatchObject({ ok: true });
+    expect(markVcMeetingDeliveryDispatched(dir, deliveryKey, {
+      receiverBootId: 'receiver-boot-b',
+      workerGeneration: 2,
+    })).toMatchObject({ ok: true, receipt: { dispatchAttempt: 2 } });
+
+    expect(prepareVcMeetingDeliveryReply(dir, deliveryOrigin, deliveryOutput)).toMatchObject({
+      kind: 'conflict',
+      reason: 'invalid_origin',
+    });
+  });
+
+  it('returns the committed provider result without sending a second delivery reply', () => {
+    const first = prepareVcMeetingDeliveryReply(dir, deliveryOrigin, deliveryOutput, 100);
+    if (first.kind !== 'send') throw new Error('expected first delivery reply claim');
+    finishVcMeetingImReply(dir, first.ref, 'om_delivery_reply', 110);
+
+    expect(prepareVcMeetingDeliveryReply(dir, deliveryOrigin, deliveryOutput, 120)).toMatchObject({
+      kind: 'succeeded',
+      providerKey: first.providerKey,
+      messageId: 'om_delivery_reply',
+      canonicalOutput: deliveryOutput,
+    });
   });
 });

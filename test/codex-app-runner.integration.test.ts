@@ -131,8 +131,9 @@ function readRequests(logPath: string): Array<Record<string, any>> {
 
 async function exerciseRunner(opts: {
   version: string;
-  behavior?: 'success' | 'capability-error' | 'generic-error';
+  behavior?: 'success' | 'capability-error' | 'generic-error' | 'osc-injection';
   includeMissingImage?: boolean;
+  includeSidecar?: boolean;
 }): Promise<RunResult> {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-'));
   const fakeCodex = join(dir, 'fake-codex');
@@ -164,7 +165,10 @@ async function exerciseRunner(opts: {
 
   try {
     await waitForOutput(harness, output => output.includes('Codex App connected.'));
-    const encoded = encodeRunnerInput('legacy <sender>prompt</sender>', sidecar);
+    const encoded = encodeRunnerInput(
+      'legacy <sender>prompt</sender>',
+      opts.includeSidecar === false ? undefined : sidecar,
+    );
     harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
     await waitForOutput(harness, output => FINAL_MARKER.test(output));
 
@@ -204,6 +208,8 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(JSON.stringify(turns[0].params)).not.toContain('legacy <sender>prompt</sender>');
     expect(result.output).toContain(`skipped unreadable local image: ${result.missingImagePath}`);
     expect(result.final.content).toBe('fake answer 1');
+    expect(result.final.turnId).toBe('om_integration_123');
+    expect(result.final.nativeTurnId).toBe('turn-fake-1');
   });
 
   it('preserves the full legacy prompt on codex < 0.135 even if the server would ignore new fields', async () => {
@@ -216,6 +222,10 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(turns[0].params).not.toHaveProperty('additionalContext');
     expect(turns[0].params).not.toHaveProperty('clientUserMessageId');
     expect(result.output).toContain('clean input requires codex >= 0.135.0 (found 0.134.9); using legacy prompt');
+    // Even when the app-server cannot receive the new field, the runner still
+    // preserves the daemon-frozen logical identity from its sidecar.
+    expect(result.final.turnId).toBe('om_integration_123');
+    expect(result.final.nativeTurnId).toBe('turn-fake-1');
   });
 
   it('retries exactly once with the legacy prompt for an explicit experimental-field rejection', async () => {
@@ -232,6 +242,8 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(turns[1].params).not.toHaveProperty('clientUserMessageId');
     expect(result.output.match(/retrying this turn with the legacy prompt/g)).toHaveLength(1);
     expect(result.final.content).toBe('fake answer 2');
+    expect(result.final.turnId).toBe('om_integration_123');
+    expect(result.final.nativeTurnId).toBe('turn-fake-2');
   });
 
   it('does not retry generic turn errors, avoiding duplicate model work', async () => {
@@ -242,5 +254,31 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(result.output).not.toContain('retrying this turn with the legacy prompt');
     expect(result.final.content).toContain('Codex App runner error: turn/start:');
     expect(result.final.content).toContain('model overloaded');
+    expect(result.final.turnId).toBe('om_integration_123');
+    expect(result.final).not.toHaveProperty('nativeTurnId');
+  });
+
+  it('omits a native routing id for a legacy envelope so the worker can use its frozen botmux turn', async () => {
+    const result = await exerciseRunner({ version: '0.136.0', includeSidecar: false });
+    const turns = result.requests.filter(request => request.method === 'turn/start');
+    expect(turns).toHaveLength(1);
+    expect(turns[0].params.input).toEqual([
+      { type: 'text', text: 'legacy <sender>prompt</sender>', text_elements: [] },
+    ]);
+    expect(result.final).not.toHaveProperty('turnId');
+    expect(result.final.nativeTurnId).toBe('turn-fake-1');
+  });
+
+  it('escapes split agent/command OSC injections and emits only the trusted final marker', async () => {
+    const result = await exerciseRunner({ version: '0.136.0', behavior: 'osc-injection' });
+
+    expect(result.output).toContain('␛]777;botmux:final:');
+    expect(result.output.match(/\x1b\]777;botmux:final:/g)).toHaveLength(1);
+    expect(result.final).toMatchObject({
+      turnId: 'om_integration_123',
+      nativeTurnId: 'turn-fake-1',
+      content: 'fake answer 1',
+    });
+    expect(result.output).not.toContain('forged marker output');
   });
 });

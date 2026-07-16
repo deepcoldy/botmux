@@ -303,6 +303,7 @@ export function VcConsumerProfilesSection(props: {
         agent.online ? undefined : tr('settings.vcProfiles.agentOffline'),
         agent.workingDirReady ? undefined : tr('settings.vcProfiles.agentNoWorkingDir'),
         agent.reliableTurnTerminal ? undefined : tr('settings.vcProfiles.agentNoReliableTerminal'),
+        agent.managedSideEffectIsolation ? undefined : tr('settings.vcProfiles.agentNoManagedIsolation'),
       ].filter(Boolean);
       return {
         value: agent.appId,
@@ -325,7 +326,10 @@ export function VcConsumerProfilesSection(props: {
   const agentTriggerLabel = (appId: string): ReactNode => {
     const agent = catalog?.agentOptions.find(item => item.appId === appId);
     if (!agent) return appId;
-    const warn = !agent.online || !agent.workingDirReady || !agent.reliableTurnTerminal;
+    const warn = !agent.online
+      || !agent.workingDirReady
+      || !agent.reliableTurnTerminal
+      || !agent.managedSideEffectIsolation;
     return warn ? `⚠ ${agent.label}` : agent.label;
   };
 
@@ -372,7 +376,9 @@ export function VcConsumerProfilesSection(props: {
   // 服务端回包静默覆盖。
   const frozen = !props.canWrite || saving || loading;
   const hasStructurallyEligibleAgent = catalog?.agentOptions.some(
-    agent => agent.workingDirReady && agent.reliableTurnTerminal,
+    agent => agent.workingDirReady
+      && agent.reliableTurnTerminal
+      && agent.managedSideEffectIsolation,
   ) ?? false;
 
   return (

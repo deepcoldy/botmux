@@ -62,9 +62,14 @@ import { ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
 import { loadBotConfigs, type BotConfig } from './bot-registry.js';
 import { readGlobalConfig } from './global-config.js';
-import { resolveTerminalWriteForRequest } from './core/terminal-write-auth.js';
+import {
+  deriveTerminalViewToken,
+  resolveTerminalAccessForRequest,
+  safeTerminalTokenEqual,
+  type TerminalAccessDecision,
+} from './core/terminal-write-auth.js';
 import { readPlatformBinding } from './platform/binding.js';
-import { loadPersistedToken } from './dashboard/auth.js';
+import { loadDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
 import {
   shouldRunQuietRotation,
@@ -412,12 +417,21 @@ const authedClients = new WeakSet<WebSocket>();
 /** Per-WS-client tmux/zellij attach PTYs. */
 const clientPtys = new Map<WebSocket, pty.IPty>();
 const writeToken = randomBytes(16).toString('hex');
+// Standalone/test fallback. Production replaces this after init with a stable
+// per-session HMAC derived from the host-only dashboard secret.
+let viewToken = randomBytes(32).toString('base64url');
 
 // Active dashboard token, persisted by the dashboard process at this stable
 // path (mirrors dashboard.ts TOKEN_PATH). The platform proxy injects it as the
 // `botmux_dashboard_token` cookie on every request it fronts, so its presence
 // proves a request traversed the platform's authenticated front door.
 const DASHBOARD_TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
+const DASHBOARD_SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
+
+function refreshTerminalViewToken(): void {
+  const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
+  if (secret && sessionId) viewToken = deriveTerminalViewToken(secret, sessionId);
+}
 
 /**
  * Resolve terminal write permission for one request. The platform-injected
@@ -433,10 +447,11 @@ const DASHBOARD_TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
  * `botmux bind`/unbind and dashboard token rotation are hot-reloaded without
  * restarting this worker, so a cached value would go stale.
  */
-function resolveTerminalWriteForReq(req: IncomingMessage, tokenMatches: boolean): { hasWrite: boolean; platformReadonly: boolean } {
-  return resolveTerminalWriteForRequest(
+function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): TerminalAccessDecision {
+  return resolveTerminalAccessForRequest(
     req.headers,
-    tokenMatches,
+    safeTerminalTokenEqual(url.searchParams.get('token'), writeToken),
+    safeTerminalTokenEqual(url.searchParams.get('viewToken'), viewToken),
     () => readPlatformBinding() !== null,
     () => loadPersistedToken(DASHBOARD_TOKEN_PATH),
   );
@@ -771,7 +786,9 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
   // Enter lands. sendToPty also observes commandLineWritesPending, so another
   // raw command's text -> Enter window cannot be interrupted by the follow-up.
   if (sent && msg.followUpContent) {
-    sendToPty(msg.followUpContent, undefined, { codexAppInput: msg.followUpCodexAppInput });
+    sendToPty(msg.followUpContent, undefined, {
+      codexAppInput: msg.followUpCodexAppInput,
+    });
     log(`Enqueued follow-up after raw input (${msg.followUpContent.length} chars)`);
   }
   // A pending /rename may have been held by the command-write mutex. It still
@@ -870,6 +887,7 @@ function readRegularHostFileNoFollow(filePath: string): string | null {
     }
   }
 }
+
 function completeManagedTurnOriginRevocation(
   revoked: typeof sandboxRelayCapability,
   turnId: string | undefined,
@@ -2141,10 +2159,11 @@ function stopBridgeWatcher(): void {
  * Lark turn.
  *
  * The turnId is returned so the writeInput failure path can call
- * `bridgeQueue.dropPendingTurn(turnId)` after deferred recheck conclusively
- * fails — otherwise an Enter-eaten-by-TUI submit leaves a fingerprint that
- * no jsonl line will ever match, and `maybeSwitchBridgeJsonl` burns 99%
- * CPU scanning all sibling jsonls for it on every poll tick.
+ * `bridgeQueue.dropPendingTurn(turnId, dispatchAttempt)` after deferred
+ * recheck conclusively fails — otherwise an Enter-eaten-by-TUI submit leaves
+ * a fingerprint that no jsonl line will ever match, and
+ * `maybeSwitchBridgeJsonl` burns 99% CPU scanning all sibling jsonls for it
+ * on every poll tick.
  */
 function bridgeMarkPendingTurn(
   messageText: string,
@@ -3992,10 +4011,10 @@ const SUBMIT_DEFERRED_RECHECK_MS = 20_000;
  *
  *  `bridgeTurnId` is the BridgeTurnQueue mark created right before the
  *  failing writeInput. When the deferred recheck conclusively fails (= no
- *  jsonl line will ever match this fingerprint), we drop the mark — leaving
- *  it would keep `maybeSwitchBridgeJsonl` doing full-directory scans every
- *  poll tick for a fingerprint that's permanently dead, the 99% CPU bug
- *  this whole patch series is fixing. */
+ *  jsonl line will ever match this fingerprint), we drop that exact dispatch
+ *  attempt's mark — leaving it would keep `maybeSwitchBridgeJsonl` doing
+ *  full-directory scans every poll tick for a fingerprint that's permanently
+ *  dead, the 99% CPU bug this whole patch series is fixing. */
 function scheduleSubmitFailureNotify(
   msg: string,
   recheck: (() => SubmitRecheckResult | Promise<SubmitRecheckResult>) | undefined,
@@ -4013,10 +4032,10 @@ function scheduleSubmitFailureNotify(
   };
   const dropBridgeMark = (): void => {
     if (!bridgeTurnId) return;
-    const dropped = bridgeQueue.dropPendingTurn(bridgeTurnId);
+    const dropped = bridgeQueue.dropPendingTurn(bridgeTurnId, turnIdentity?.dispatchAttempt);
     if (dropped) {
       if (dropped.contentFingerprint) bridgeFingerprintScanLastMs.delete(dropped.contentFingerprint);
-      log(`Bridge mark dropped after submit failure (turnId=${bridgeTurnId}) — rotation-fallback scan will stop spinning on this fingerprint.`);
+      log(`Bridge mark dropped after submit failure (turnId=${bridgeTurnId}, attempt=${turnIdentity?.dispatchAttempt ?? '-'}) — rotation-fallback scan will stop spinning on this fingerprint.`);
     }
   };
   if (failureReason) {
@@ -4235,6 +4254,11 @@ async function flushPending(): Promise<void> {
   // Codex on codex-cli 0.134.0.
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
+  const typeAheadAllowed = pendingInputAllowsTypeAhead(
+    cliAdapter.supportsTypeAhead === true,
+    durableTurnInFlight,
+    pendingMessages[0],
+  );
   // Native /rename is an administrative command, not a steer/queued model
   // message. It must wait for a real prompt even on type-ahead CLIs. Normal
   // pending messages can still drain while busy; the rename stays queued.
@@ -4248,11 +4272,6 @@ async function flushPending(): Promise<void> {
     if (pendingMessages.length === 0 && pendingRawInputs.length === 0) return;
   }
   if (!isPromptReady && pendingMessages.length === 0) return;
-  const typeAheadAllowed = pendingInputAllowsTypeAhead(
-    cliAdapter.supportsTypeAhead === true,
-    durableTurnInFlight,
-    pendingMessages[0],
-  );
   if (!isPromptReady && !typeAheadAllowed) return;
 
   isFlushing = true;
@@ -4458,9 +4477,11 @@ function sendToPty(
   const next: PendingCliInput = {
     content,
     turnId,
-    ...(opts.codexAppInput !== undefined ? { codexAppInput: opts.codexAppInput } : {}),
+    ...(opts.codexAppInput ? { codexAppInput: opts.codexAppInput } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
-    ...(opts.vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin: opts.vcMeetingImTurnOrigin } : {}),
+    ...(opts.vcMeetingImTurnOrigin
+      ? { vcMeetingImTurnOrigin: opts.vcMeetingImTurnOrigin }
+      : {}),
   };
   // During an exact lease-fenced CLI restart the worker stays alive while the
   // backend is rebuilt. Preserve incoming attempt N+1 in the worker queue; the
@@ -4513,7 +4534,7 @@ function sendToPty(
   // delivers queued messages instead. See input-gate.ts; this fixes dispatch's
   // brief reaching Codex before its first idle and never landing.
   if (!sessionRenameInFlight && commandLineWritesPending === 0
-      && shouldWriteNow({ isPromptReady, isFlushing, supportsTypeAhead, awaitingFirstPrompt })) {
+    && shouldWriteNow({ isPromptReady, isFlushing, supportsTypeAhead, awaitingFirstPrompt })) {
     if (!mergedQueued) log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing
   } else {
@@ -5871,7 +5892,15 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
           // sensitive set, keep the own BOT_HOME real+writable (authPaths), and re-
           // expose the own attachments bucket read-only after the masks (readonlyRoots).
           hidePaths: [...(cfg.sandboxHidePaths ?? []), ...(readIsoLinuxMasks?.hidePaths ?? [])],
-          authPaths: [...(cliAdapter.authPaths ?? []), ...(readIsoLinuxMasks?.ownReadWritePaths ?? [])],
+          authPaths: [...(cliAdapter.authPaths ?? [])],
+          // BOTMUX_HOME is credential-masked wholesale. Re-open only this
+          // bot's daemon-derived private CLI home after that parent mask, then
+          // re-mask its send credential so an untrusted receiver cannot bypass
+          // the host-authorized relay with a direct Lark API call.
+          trustedWritablePaths: readIsoLinuxMasks?.ownReadWritePaths ?? [],
+          finalHidePaths: readIsoLinuxMasks
+            ? [sendCredFilePath(dataDir, cfg.larkAppId)]
+            : [],
           extraExecPaths: cliAdapter.sandboxExtraExecPaths?.(),
           readonlyRoots: [...(cfg.skillReadonlyRoots ?? []), ...(readIsoLinuxMasks?.ownReadOnlyPaths ?? [])],
           userReadonlyPaths: cfg.sandboxReadonlyPaths ?? [],
@@ -6445,41 +6474,68 @@ async function restartCliProcess(
     log(`Restart ignored in adopt mode (${reason})`);
     return;
   }
+  // Set before touching destroySession(): remote teardown can await for many
+  // seconds while the old backend object is still non-null and still capable
+  // of firing idle/task-done callbacks. Inputs accepted in that interval must
+  // remain queued until a replacement backend has been installed.
+  cliRestartInProgress = true;
+  // The Node worker stays alive through this restart, so the daemon will see
+  // neither claude_exit nor worker-exit. Explicitly revoke the old turn's
+  // authority now, before jitter/async teardown leaves a stale-send window.
+  // This deliberately preserves currentBotmuxTurnId/dispatchAttempt for the
+  // old backend's terminal attribution.
+  revokeManagedTurnOriginForRestart();
   log(`Restart requested (${reason})`);
   // Tier-2 guard: 2nd consecutive in-worker restart forces FRESH. Tier-1
   // adapter probing is still re-run on every spawn.
   consecutiveInWorkerRestarts++;
   log(`Restart count: ${consecutiveInWorkerRestarts} (>=2 forces FRESH)`);
   const restart = async (): Promise<void> => {
-    tmuxRestartTimer = null;
-    const restartingBackend = backend;
-    if (restartingBackend) intentionalRestartBackend = restartingBackend;
-    // Riff teardown cancels a remote task asynchronously. Wait for the cancel
-    // (bounded) before respawning, otherwise the old and replacement tasks can
-    // overlap and both emit into the same Lark thread. Local backends normally
-    // return void here and continue synchronously.
-    const teardown = restartingBackend?.destroySession?.();
-    if (teardown && typeof (teardown as Promise<void>).then === 'function') {
-      try {
-        await Promise.race([
-          teardown as Promise<void>,
-          new Promise<void>(resolve => setTimeout(resolve, 22_000)),
-        ]);
-      } catch { /* destroySession logs its own failure details */ }
-    }
-    killCli({ preservePending: opts.preservePending });
-    awaitingFirstPrompt = true;
-    setTimeout(async () => {
-      if (lastInitConfig) {
-        startScreenUpdates();
-        startScreenAnalyzer();
+    try {
+      tmuxRestartTimer = null;
+      const restartingBackend = backend;
+      if (restartingBackend) intentionalRestartBackend = restartingBackend;
+      // Riff teardown cancels a remote task asynchronously. Wait for the cancel
+      // (bounded) before respawning, otherwise the old and replacement tasks can
+      // overlap and both emit into the same Lark thread. Local backends normally
+      // return void here and continue synchronously. A synchronous throw is
+      // handled by the same fatal restart path below, so it cannot leave the
+      // input gate permanently armed.
+      const teardown = restartingBackend?.destroySession?.();
+      if (teardown && typeof (teardown as Promise<void>).then === 'function') {
         try {
-          spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
-        } catch (err) {
-          await sendFatalWorkerErrorAndExit(err);
-        }
+          await Promise.race([
+            teardown as Promise<void>,
+            new Promise<void>(resolve => setTimeout(resolve, 22_000)),
+          ]);
+        } catch { /* destroySession logs its own failure details */ }
       }
-    }, 500);
+      killCli({ preservePending: opts.preservePending });
+      awaitingFirstPrompt = true;
+      setTimeout(async () => {
+        if (lastInitConfig) {
+          startScreenUpdates();
+          startScreenAnalyzer();
+          try {
+            spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
+          } catch (err) {
+            cliRestartInProgress = false;
+            await sendFatalWorkerErrorAndExit(err);
+            return;
+          }
+        }
+        cliRestartInProgress = false;
+        // Riff marks itself prompt-ready inside spawnCli(); that early flush is
+        // intentionally held by the restart gate above. Wake it now, while other
+        // backends will continue to respect their normal ready/idle gates.
+        void flushPending();
+      }, 500);
+    } catch (err) {
+      cliRestartInProgress = false;
+      try {
+        await sendFatalWorkerErrorAndExit(err);
+      } catch { /* sendFatalWorkerErrorAndExit is already best-effort */ }
+    }
   };
   if (effectiveBackendType === 'tmux' && !opts.immediate) {
     const delayMs = tmuxRestartJitterMs(lastInitConfig?.sessionId ?? '', consecutiveInWorkerRestarts);
@@ -6503,20 +6559,45 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         res.end('Bad Request');
         return;
       }
-      const tokenMatches = url.searchParams.get('token') === writeToken;
-      const { hasWrite, platformReadonly } = resolveTerminalWriteForReq(req, tokenMatches);
+      const { hasRead, hasWrite, platformReadonly } = resolveTerminalAccessForReq(req, url);
+      if (!hasRead) {
+        res.writeHead(403, {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Cache-Control': 'no-store',
+        });
+        res.end('Forbidden');
+        return;
+      }
       const loginHdr = req.headers['x-botmux-login-url'];
       const loginUrl = typeof loginHdr === 'string' && /^https?:\/\/[^"'<>\s]+$/.test(loginHdr) ? loginHdr : '';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl));
     });
 
-    wss = new WebSocketServer({ server: httpServer });
+    wss = new WebSocketServer({
+      server: httpServer,
+      // Reject before the WebSocket handshake completes.  Closing from the
+      // `connection` callback is too late: an unauthenticated localhost scanner
+      // briefly becomes a client and races the terminal history seed.
+      verifyClient: ({ req }, done) => {
+        const url = parseWorkerRequestUrl(req);
+        if (!url) {
+          done(false, 400, 'Bad Request');
+          return;
+        }
+        if (!resolveTerminalAccessForReq(req, url).hasRead) {
+          done(false, 403, 'Forbidden');
+          return;
+        }
+        done(true);
+      },
+    });
 
     wss.on('connection', (ws, req: IncomingMessage) => {
       wsClients.add(ws);
 
-      // Check token from query string for write access
+      // Read access was already checked before the WebSocket handshake. Resolve
+      // again here only to decide whether this client may write.
       const url = parseWorkerRequestUrl(req);
       if (!url) {
         log(`Bad worker WS URL rejected: ${JSON.stringify(req.url ?? '')}`);
@@ -6524,8 +6605,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         ws.close(1008, 'Bad Request');
         return;
       }
-      const tokenMatches = url.searchParams.get('token') === writeToken;
-      const { hasWrite } = resolveTerminalWriteForReq(req, tokenMatches);
+      const { hasWrite } = resolveTerminalAccessForReq(req, url);
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
 
@@ -6554,7 +6634,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
 
         const startAttach = (cols: number, rows: number) => {
           if (cp) return;
-          cp = pty.spawn('tmux', ['attach-session', '-t', tmuxTarget], {
+          // Defense in depth: view-capability clients attach through tmux's
+          // own read-only mode as well as the WebSocket input gate below.
+          cp = pty.spawn('tmux', [
+            'attach-session',
+            ...(!hasWrite ? ['-r'] : []),
+            '-t', tmuxTarget,
+          ], {
             name: 'xterm-256color',
             cols,
             rows,
@@ -6590,12 +6676,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 cp.resize(msg.cols, msg.rows);
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
-              if (!authedClients.has(ws)) {
-                // Read-only: allow mouse events through (scroll/click are
-                // non-destructive in tmux — just views history / selects text).
-                // SGR mouse: \x1b[<...  X10 mouse: \x1b[M...
-                if (!/^\x1b\[([<M])/.test(msg.data)) return;
-              }
+              // Mouse protocols carry clicks, releases, drags and wheel input;
+              // a mouse-aware TUI may bind any of them to approvals/actions.
+              // A view capability therefore forwards no input bytes at all.
+              if (!authedClients.has(ws)) return;
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -6665,10 +6749,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!cp) { clearTimeout(spawnTimer); startAttach(msg.cols, msg.rows); }
               else cp.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
-              if (!authedClients.has(ws)) {
-                // Read-only: only let mouse events (scroll/select) through.
-                if (!/^\x1b\[([<M])/.test(msg.data)) return;
-              }
+              if (!authedClients.has(ws)) return;
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -6719,13 +6800,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
               backend?.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
-              if (!authedClients.has(ws)) {
-                // Read-only: allow ONLY wheel scroll sequences (SGR buttons 64-67).
-                // Scrolling the CLI's own view is non-destructive and lets read-only
-                // viewers page back through an alt-screen TUI's history (Claude etc.,
-                // which has no local scrollback). Everything else is dropped.
-                if (!/^(\x1b\[<6[4-7];\d+;\d+M)+$/.test(msg.data)) return;
-              }
+              if (!authedClients.has(ws)) return;
               backend?.write(msg.data);
             }
           } catch { /* ignore non-JSON or bad messages */ }
@@ -6988,9 +7063,9 @@ document.getElementById('terminal').addEventListener('contextmenu',function(e){e
 var ws_=null,el=document.getElementById('status');
 term.onData(function(d){
   if(!hasToken){
-    // Allow mouse events through (scroll/click) — server accepts these in read-only.
-    // Keyboard input triggers the toast instead.
-    if(!/^\\x1b\\[[<M]/.test(d)){_showReadonlyToast();return;}
+    // Mouse escape sequences are input too: a TUI can bind clicks or wheel
+    // events to actions. View links never forward terminal bytes.
+    _showReadonlyToast();return;
   }
   if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'input',data:d}));
 });
@@ -7013,13 +7088,14 @@ function onViewportResize(){
 }
 window.addEventListener('resize',onViewportResize);
 (function connect(){
-  var t=new URLSearchParams(location.search).get('token')||'';
   // Derive base from the current path so the WS connects to the same prefix the
   // page was served under — works both directly (path '/') and behind the
-  // per-daemon reverse proxy ('/s/{sessionId}'). See terminal-proxy.ts.
+  // per-daemon reverse proxy ('/s/{sessionId}'). Preserve the complete query:
+  // write links carry token, while read-only links carry the distinct
+  // viewToken capability. See terminal-proxy.ts.
   var base=location.pathname.replace(/\\/+$/,'');
   var proto=location.protocol==='https:'?'wss':'ws';
-  var ws=new WebSocket(proto+'://'+location.host+base+'/?token='+t);
+  var ws=new WebSocket(proto+'://'+location.host+base+'/'+location.search);
   ws_=ws;ws.binaryType='arraybuffer';
   // Force a resize on every (re)connect: clear the dedup memory first. On
   // reconnect the browser grid is usually unchanged, so without this the
@@ -7049,7 +7125,7 @@ window.addEventListener('resize',onViewportResize);
 // tmux — their whole transcript is redrawn by the app inside the fixed alt-screen
 // grid, so term.scrollLines() reveals nothing. In the alternate buffer we forward
 // scrolling as SGR mouse-wheel events so the CLI scrolls its own transcript and
-// repaints (works in read-only too: the server only lets wheel sequences through).
+// repaints. This is write-capability only; view links stay locally scrollable.
 // Normal-buffer CLIs keep xterm's native scrollback scroll. Capture-phase +
 // stopPropagation pre-empts xterm's own handler. Skipped for pure tmux/zellij
 // ATTACH (gate), where the attach client owns scrolling via copy-mode.
@@ -7083,7 +7159,7 @@ function _cellAt(clientX,clientY){
   return col+';'+row;
 }
 function _fwdScroll(px,coord){
-  if(!ws_||ws_.readyState!==1)return;
+  if(!hasToken||!ws_||ws_.readyState!==1)return;
   coord=coord||(((term.cols>>1)+1)+';'+((term.rows>>1)+1)); // never (1,1)
   _scrollAccum+=px;var data='',n=0;
   while(Math.abs(_scrollAccum)>=_SCROLL_STEP&&n<6){
@@ -7100,6 +7176,9 @@ if(!${isTmuxMode && !isPipeMode}){
       // mouse-mode CLI could swallow the wheel, so drive scrollback directly.
       if(!hasToken){e.preventDefault();e.stopPropagation();term.scrollLines(e.deltaY>0?3:-3);}
       return;
+    }
+    if(!hasToken){
+      e.preventDefault();e.stopPropagation();term.scrollLines(e.deltaY>0?3:-3);return;
     }
     e.preventDefault();e.stopPropagation();
     // Normalise deltaMode to px: line→~16px, page→~one screen.
@@ -7423,7 +7502,7 @@ if(!${isTmuxMode && !isPipeMode}){
   },{capture:true,passive:true});
   _tTerm.addEventListener('touchmove',function(e){
     // Normal buffer / multi-touch / no start → let xterm (or the browser) handle it.
-    if(term.buffer.active.type!=='alternate'||_tLastY===null||e.touches.length!==1)return;
+    if(!hasToken||term.buffer.active.type!=='alternate'||_tLastY===null||e.touches.length!==1)return;
     e.preventDefault();e.stopPropagation();
     var y=e.touches[0].clientY;
     // finger drags down (y grows) → px<0 → scroll up (history); report the touched cell
@@ -7459,6 +7538,9 @@ function emitTurnTerminal(
       log(`Structured bridge retired terminal attempt turn=${turnId.slice(0, 12)} attempt=${dispatchAttempt ?? '-'} status=${status}`);
     }
   }
+  // Revoke before publishing terminal. The daemon receives same-worker IPC in
+  // order, and the worker-side relay becomes unusable synchronously.
+  revokeManagedTurnOriginForTerminal(turnId, dispatchAttempt);
   send({
     type: 'turn_terminal',
     sessionId,
@@ -7555,6 +7637,7 @@ process.on('message', async (raw: unknown) => {
       if (lastInitConfig) return;  // already initialized
       lastInitConfig = msg;
       sessionId = msg.sessionId;
+      refreshTerminalViewToken();
       if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
       // Pin this worker's i18n locale early so every t() call below resolves
       // against the bot's chosen language without each callsite needing to
@@ -7642,9 +7725,9 @@ process.on('message', async (raw: unknown) => {
           pendingMessages.push({
             content: msg.prompt,
             turnId: msg.turnId,
-            codexAppInput: msg.promptCodexAppInput,
             dispatchAttempt: msg.dispatchAttempt,
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
+            codexAppInput: msg.promptCodexAppInput,
           });
         }
 
@@ -7661,6 +7744,7 @@ process.on('message', async (raw: unknown) => {
           type: 'ready',
           port,
           token: writeToken,
+          viewToken,
           turnId: currentBotmuxTurnId,
           dispatchAttempt: currentBotmuxDispatchAttempt,
         });

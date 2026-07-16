@@ -125,6 +125,22 @@ describe('buildSandboxArgs (overlay model)', () => {
     expect(skillIdx).toBeGreaterThan(maskIdx);
   });
 
+  it('re-opens the own private CLI home after its parent mask, then re-masks send credentials', () => {
+    const ownHome = '/custom/botmux/bots/app_self';
+    const sendCred = `${ownHome}/send-cred.json`;
+    const empty = '/data/sandboxes/s1/empties/mask-final';
+    const a = buildSandboxArgs(plan({
+      hideDirs: ['/custom/botmux'],
+      trustedWritableRoots: [ownHome],
+      finalHideFiles: [{ path: sendCred, empty }],
+    }));
+    const parentMaskIdx = a.indexOf('/custom/botmux');
+    const ownHomeIdx = tripleIdx(a, '--bind', ownHome, ownHome);
+    const sendCredIdx = tripleIdx(a, '--ro-bind', empty, sendCred);
+    expect(ownHomeIdx).toBeGreaterThan(parentMaskIdx);
+    expect(sendCredIdx).toBeGreaterThan(ownHomeIdx);
+  });
+
   it('no clone/scrub artefacts: never binds a per-session clone "work" dir', () => {
     const a = buildSandboxArgs(plan());
     // The old model bound a `git clone` "work" dir; the overlay model never does
@@ -348,6 +364,13 @@ describe('validateRelayRequest', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--session-id', 'other'] }).ok).toBe(false);
   });
 
+  it('rejects sandbox-supplied --attention (receiver cannot emit an unledgered daemon hook)', () => {
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--attention'],
+    })).toMatchObject({ ok: false, error: 'flag not allowed: --attention' });
+  });
+
   it('rejects a value-taking flag whose value is itself a flag (--mention --session-id desync)', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--mention', '--session-id'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--quote', '--mention'] }).ok).toBe(false);
@@ -381,6 +404,15 @@ describe('sandbox credential boundary', () => {
     writeFileSync(join(home, '.botmux', 'bots.json.previous.json'), '{}');
     const hidden = sandboxCredentialHidePaths(home);
     expect(hidden).toContain(join(home, '.botmux'));
+  });
+
+  it('masks both the default and custom BOTMUX_HOME roots', () => {
+    expect(sandboxCredentialHidePaths('/home/agent', '/srv/botmux-runtime')).toEqual([
+      '/home/agent/.botmux',
+      '/home/agent/.lark-cli',
+      '/home/agent/.lark-cli-bots',
+      '/srv/botmux-runtime',
+    ].sort());
   });
 });
 

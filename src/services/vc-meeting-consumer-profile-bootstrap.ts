@@ -5,18 +5,23 @@ import {
   parseBotConfigsFromText,
 } from '../bot-registry.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { config } from '../config.js';
+import { resolvePairedSpawnBackendType } from '../core/persistent-backend.js';
 import { canonicalJson } from '../workflows/events/idempotency.js';
 import { rmwBotEntry } from './config-store.js';
+import { evaluateVcMeetingConsumerIsolation } from './vc-meeting-consumer-isolation.js';
 
 export interface VcMeetingConsumerBootstrapAgent {
   appId: string;
   workingDirReady: boolean;
   reliableTurnTerminal: boolean;
+  managedSideEffectIsolation: boolean;
 }
 
 export interface VcMeetingConsumerBootstrapAgentDeps {
   workingDirReady(bot: BotConfig): boolean;
   reliableTurnTerminal(bot: BotConfig): boolean;
+  managedSideEffectIsolation(bot: BotConfig): boolean;
 }
 
 const defaultAgentDeps: VcMeetingConsumerBootstrapAgentDeps = {
@@ -35,6 +40,20 @@ const defaultAgentDeps: VcMeetingConsumerBootstrapAgentDeps = {
       return false;
     }
   },
+  managedSideEffectIsolation(bot) {
+    const cliId = bot.cliId ?? config.daemon.cliId;
+    const backendType = resolvePairedSpawnBackendType(
+      cliId,
+      undefined,
+      bot.backendType,
+      config.daemon.backendType,
+    );
+    return evaluateVcMeetingConsumerIsolation({
+      sandbox: bot.sandbox,
+      platform: process.platform,
+      backendType,
+    }).ok;
+  },
 };
 
 export function buildVcMeetingConsumerBootstrapAgents(
@@ -45,6 +64,7 @@ export function buildVcMeetingConsumerBootstrapAgents(
     appId: bot.larkAppId,
     workingDirReady: deps.workingDirReady(bot),
     reliableTurnTerminal: deps.reliableTurnTerminal(bot),
+    managedSideEffectIsolation: deps.managedSideEffectIsolation(bot),
   })).sort((a, b) => (a.appId === b.appId ? 0 : a.appId < b.appId ? -1 : 1));
 }
 
@@ -60,7 +80,9 @@ export function selectVcMeetingDefaultConsumerAgent(
   preferredAgentAppIds: readonly string[] = [],
 ): VcMeetingConsumerBootstrapAgent | undefined {
   const eligible = agents
-    .filter(agent => agent.workingDirReady && agent.reliableTurnTerminal)
+    .filter(agent => agent.workingDirReady
+      && agent.reliableTurnTerminal
+      && agent.managedSideEffectIsolation)
     .sort((a, b) => (a.appId === b.appId ? 0 : a.appId < b.appId ? -1 : 1));
   for (const appId of preferredAgentAppIds) {
     const preferred = eligible.find(agent => agent.appId === appId);

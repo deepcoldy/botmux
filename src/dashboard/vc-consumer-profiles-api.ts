@@ -47,6 +47,7 @@ export interface VcMeetingAgentOptionDto {
   online: boolean;
   workingDirReady: boolean;
   reliableTurnTerminal: boolean;
+  managedSideEffectIsolation: boolean;
 }
 
 export interface VcMeetingConsumerProfilesGetBody {
@@ -94,6 +95,7 @@ export interface VcMeetingConsumerProfilesApiDeps {
   onlineBotName(appId: string): string | undefined;
   isOnline(appId: string): boolean;
   adapterReliableTurnTerminal(cliId: string | undefined, cliPathOverride?: string): boolean;
+  managedSideEffectIsolation(bot: BotConfig): boolean;
   /** Called after a successful PUT so the live daemon reloads the new catalog. */
   reloadDaemons(appIds: string[]): Promise<void>;
 }
@@ -282,7 +284,8 @@ export function vcMeetingConsumerProfilesFromDtos(
 export function buildVcMeetingAgentOptions(
   deps: Pick<
     VcMeetingConsumerProfilesApiDeps,
-    'loadBotConfigs' | 'effectiveDefaultWorkingDir' | 'onlineBotName' | 'isOnline' | 'adapterReliableTurnTerminal'
+    'loadBotConfigs' | 'effectiveDefaultWorkingDir' | 'onlineBotName' | 'isOnline'
+    | 'adapterReliableTurnTerminal' | 'managedSideEffectIsolation'
   >,
 ): VcMeetingAgentOptionDto[] {
   let configs: BotConfig[];
@@ -305,6 +308,7 @@ export function buildVcMeetingAgentOptions(
       online: deps.isOnline(bot.larkAppId),
       workingDirReady,
       reliableTurnTerminal: deps.adapterReliableTurnTerminal(bot.cliId, bot.cliPathOverride),
+      managedSideEffectIsolation: deps.managedSideEffectIsolation(bot),
     };
   }).sort((a, b) => (a.appId === b.appId ? 0 : a.appId < b.appId ? -1 : 1));
 }

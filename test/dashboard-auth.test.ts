@@ -148,6 +148,7 @@ describe('dashboard secret persistence', () => {
     expect(loadDashboardSecret(secretPath)).toBe(secret);
     expect(statSync(secretPath).mode & 0o777).toBe(0o600);
   });
+
   it('ignores a legacy stale repair lock and converges through a permanent seed', () => {
     mkdirSync(join(dir, 'nested'));
     writeFileSync(secretPath, ' \n');

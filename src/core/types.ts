@@ -41,6 +41,9 @@ export interface DaemonSession {
   worker: ChildProcess | null;   // fork'd worker process
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
+  /** Independent read-only xterm capability. Optional for hydrated/legacy
+   * sessions; live workers publish it with their ready event. */
+  workerViewToken?: string | null;
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
   workerGeneration?: number;

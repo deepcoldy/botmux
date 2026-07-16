@@ -58,6 +58,15 @@ vi.mock('../src/config.js', () => ({
   config: { web: { externalHost: 'localhost' }, session: { dataDir: '/tmp' } },
 }));
 
+vi.mock('../src/global-config.js', () => ({
+  isRemoteAccessEnabled: vi.fn(() => false),
+}));
+
+vi.mock('../src/platform/binding.js', () => ({
+  platformMachineBaseUrl: vi.fn(() => null),
+  publicReverseProxyBaseUrl: vi.fn(() => null),
+}));
+
 vi.mock('../src/services/session-store.js', () => ({
   closeSession: vi.fn(),
   updateSession: vi.fn(),
@@ -94,7 +103,13 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
 
 // ─── Imports under test ────────────────────────────────────────────────────
 
-import { recallFrozenCards, parkStreamCard, restoreUsageLimitRuntimeState, scheduleCardPatch } from '../src/core/worker-pool.js';
+import {
+  recallFrozenCards,
+  parkStreamCard,
+  postFreshStreamingCard,
+  restoreUsageLimitRuntimeState,
+  scheduleCardPatch,
+} from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 
@@ -148,6 +163,7 @@ beforeEach(() => {
   loadFrozenCardsMock.mockReset();
   loadFrozenCardsMock.mockReturnValue(new Map());
   persistStreamCardStateMock.mockClear();
+  vi.mocked(buildStreamingCard).mockClear();
   setTerminalProxyPort(8800);
 });
 
@@ -365,6 +381,50 @@ describe('restoreUsageLimitRuntimeState', () => {
     expect(ds.usageLimit.retryReady).toBe(true);
     expect(ds.usageLimitRetryTimer).toBeUndefined();
     expect(persistStreamCardStateMock).toHaveBeenCalledWith(ds);
+  });
+
+  it('updates receiver retry state without patching a Lark card', () => {
+    const now = new Date('2026-05-22T10:00:00Z').getTime();
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const ds = makeDs();
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1',
+      memberId: 'member-1', memberEpoch: 1,
+    };
+    ds.streamCardId = 'om_legacy_card';
+    ds.session.webPort = 8080;
+    ds.usageLimit = {
+      limited: true,
+      kind: 'usage',
+      retryAtMs: now + 1_000,
+      retryLabel: '10:01 AM',
+      retryReady: false,
+    };
+
+    restoreUsageLimitRuntimeState(ds);
+    vi.advanceTimersByTime(1_000);
+
+    expect(ds.usageLimit.retryReady).toBe(true);
+    expect(persistStreamCardStateMock).toHaveBeenCalledWith(ds);
+    expect(buildStreamingCard).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('receiver streaming card boundary', () => {
+  it('refuses a fresh group-visible streaming card for a dedicated receiver', async () => {
+    const ds = makeDs();
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1',
+      memberId: 'member-1', memberEpoch: 1,
+    };
+    ds.workerPort = 4567;
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+
+    await expect(postFreshStreamingCard(ds, sessionReply)).resolves.toBe(false);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(buildStreamingCard).not.toHaveBeenCalled();
   });
 });
 

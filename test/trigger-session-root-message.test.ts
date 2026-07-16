@@ -193,29 +193,6 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(send).toHaveBeenCalledWith({ type: 'message', content: expect.stringContaining('follow:') });
   });
 
-  it('keeps external-event wrappers hidden on a live clean Codex App turn', async () => {
-    mockGetBot.mockReturnValue({
-      config: { larkAppId: APP, cliId: 'codex-app', codexAppCleanInput: true, workingDir: '/tmp' },
-      botName: 'Bot',
-      botOpenId: 'ou_bot',
-    });
-    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
-    const req = request();
-    req.instruction = 'Summarize the alert for the operator.';
-
-    await triggerSessionTurn(req, {
-      larkAppId: APP,
-      activeSessions: new Map([[sessionKey(ROOT, APP), ds]]),
-    });
-
-    const opts = mockBuildFollowUpCliInput.mock.calls.at(-1)?.[2];
-    expect(opts.codexAppText).toBe('外部事件触发');
-    expect(opts.codexAppApplicationContext).toContain('Summarize the alert for the operator.');
-    expect(opts.codexAppMessageContext).toContain('<botmux_external_event trusted="false">');
-    expect(opts.codexAppMessageContext).toContain('"alert": "x"');
-    expect(opts.codexAppMessageContext).not.toContain('Summarize the alert for the operator.');
-  });
-
   it('uses an internal stable turn id without changing the public trigger schema', async () => {
     const send = vi.fn();
     const ds = existingDs({ worker: { killed: false, send } as any, workerGeneration: 7 });
@@ -239,11 +216,39 @@ describe('triggerSessionTurn rootMessageId target', () => {
     });
   });
 
+  it('keeps clean input and a stable durable attempt on the same live IPC', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'codex-app', codexAppCleanInput: true, workingDir: '/tmp' },
+      botName: 'Bot',
+      botOpenId: 'ou_bot',
+    });
+    const send = vi.fn();
+    const ds = existingDs({ worker: { killed: false, send } as any, workerGeneration: 8 });
+    const beforeDispatch = vi.fn(() => ({ dispatchAttempt: 3 }));
+
+    await triggerSessionTurn(
+      request(),
+      { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+      { stableTurnId: 'vcd_clean_delivery', beforeDispatch },
+    );
+
+    expect(beforeDispatch.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]!);
+    expect(send).toHaveBeenCalledWith({
+      type: 'message',
+      content: expect.stringContaining('follow:'),
+      codexAppInput: { text: '外部事件触发' },
+      turnId: 'vcd_clean_delivery',
+      dispatchAttempt: 3,
+    });
+  });
+
   it('does not persist durable delivery input as the user resume prompt', async () => {
     const send = vi.fn();
     const ds = existingDs({ worker: { killed: false, send } as any, workerGeneration: 7 });
     ds.session.lastUserPrompt = 'previous user prompt';
     ds.session.lastCliInput = 'previous rendered input';
+    ds.session.lastCodexAppInput = { text: 'previous clean input' };
+    ds.lastCodexAppInput = { text: 'previous live clean input' };
     const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
 
     const res = await triggerSessionTurn(
@@ -261,6 +266,31 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockRememberLastCliInput).not.toHaveBeenCalled();
     expect(ds.session.lastUserPrompt).toBe('previous user prompt');
     expect(ds.session.lastCliInput).toBe('previous rendered input');
+    expect(ds.session.lastCodexAppInput).toEqual({ text: 'previous clean input' });
+    expect(ds.lastCodexAppInput).toEqual({ text: 'previous live clean input' });
+  });
+
+  it('keeps external-event wrappers hidden on a live clean Codex App turn', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'codex-app', codexAppCleanInput: true, workingDir: '/tmp' },
+      botName: 'Bot',
+      botOpenId: 'ou_bot',
+    });
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const req = request();
+    req.instruction = 'Summarize the alert for the operator.';
+
+    await triggerSessionTurn(req, {
+      larkAppId: APP,
+      activeSessions: new Map([[sessionKey(ROOT, APP), ds]]),
+    });
+
+    const opts = mockBuildFollowUpCliInput.mock.calls.at(-1)?.[2];
+    expect(opts.codexAppText).toBe('外部事件触发');
+    expect(opts.codexAppApplicationContext).toContain('Summarize the alert for the operator.');
+    expect(opts.codexAppMessageContext).toContain('<botmux_external_event trusted="false">');
+    expect(opts.codexAppMessageContext).toContain('"alert": "x"');
+    expect(opts.codexAppMessageContext).not.toContain('Summarize the alert for the operator.');
   });
 
   it('reuses an existing root session whose worker is not running', async () => {
@@ -357,6 +387,35 @@ describe('triggerSessionTurn rootMessageId target', () => {
       ds,
       expect.objectContaining({ content: expect.stringContaining('follow:') }),
       { resume: true, turnId: 'vcd_dormant_session_delivery', dispatchAttempt: 5 },
+    );
+  });
+
+  it('keeps clean input and a stable durable attempt on the same dormant fork', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'codex-app', codexAppCleanInput: true, workingDir: '/tmp' },
+      botName: 'Bot',
+      botOpenId: 'ou_bot',
+    });
+    const ds = existingDs({ scope: 'chat', workerGeneration: 4 });
+    ds.session.rootMessageId = CHAT;
+    const req = request({ sessionId: ds.session.sessionId, rootMessageId: undefined });
+    const beforeDispatch = vi.fn(() => ({ dispatchAttempt: 6 }));
+
+    await triggerSessionTurn(
+      req,
+      { larkAppId: APP, activeSessions: new Map([[sessionKey(CHAT, APP), ds]]) },
+      { stableTurnId: 'vcd_clean_dormant_delivery', beforeDispatch },
+    );
+
+    expect(beforeDispatch.mock.invocationCallOrder[0])
+      .toBeLessThan(mockForkWorker.mock.invocationCallOrder[0]!);
+    expect(mockForkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({
+        content: expect.stringContaining('follow:'),
+        codexAppInput: { text: '外部事件触发' },
+      }),
+      { resume: true, turnId: 'vcd_clean_dormant_delivery', dispatchAttempt: 6 },
     );
   });
 

@@ -189,6 +189,41 @@ describe('resumeSession', () => {
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
     });
 
+    it('rejects manual resume for a closed dedicated VC receiver without mutating its state or routing map', async () => {
+      const receiver = makeClosedSession({
+        chatId: 'oc_listener',
+        rootMessageId: 'oc_listener',
+        scope: 'chat',
+      });
+      receiver.vcMeetingReceiver = {
+        listenerAppId: 'listener_app',
+        meetingId: 'meeting-42',
+        memberId: 'member-agent',
+        memberEpoch: 7,
+      };
+      sessionStore.updateSession(receiver);
+      sessionStore.closeSession(receiver.sessionId);
+      const map = new Map<string, DaemonSession>();
+      const ordinaryChatKey = sessionKey('oc_listener', 'app_test');
+      const ordinaryChat = {
+        session: { sessionId: 'ordinary-chat-session', cliId: 'claude-code' },
+        worker: {},
+        chatId: 'oc_listener',
+        scope: 'chat',
+        larkAppId: 'app_test',
+      } as unknown as DaemonSession;
+      map.set(ordinaryChatKey, ordinaryChat);
+      wp.registry = map;
+
+      const r = await resumeSession(receiver.sessionId, map);
+
+      expect(r).toEqual({ ok: false, error: 'vc_receiver_managed' });
+      expect(sessionStore.getSession(receiver.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(1);
+      expect(map.get(ordinaryChatKey)).toBe(ordinaryChat);
+      expect(closeSession).not.toHaveBeenCalled();
+    });
+
     it('returns anchor_occupied when a REAL in-memory session owns the anchor', async () => {
       const closed = makeClosedSession({ rootMessageId: 'om_thread_X' });
       const map = new Map<string, DaemonSession>();

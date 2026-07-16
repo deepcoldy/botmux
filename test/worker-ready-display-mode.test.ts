@@ -18,6 +18,7 @@ import { EventEmitter } from 'node:events';
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
 const updateMessageMock = vi.fn(async () => {});
+const { loggerInfoMock } = vi.hoisted(() => ({ loggerInfoMock: vi.fn() }));
 
 vi.mock('../src/im/lark/client.js', () => {
   class MessageWithdrawnError extends Error {
@@ -33,6 +34,7 @@ vi.mock('../src/im/lark/client.js', () => {
 vi.mock('../src/im/lark/card-builder.js', () => ({
   buildStreamingCard: vi.fn((...args: any[]) => JSON.stringify({
     type: 'streaming',
+    readUrl: args[2],
     localCliReady: args[15] === true,
   })),
   buildSessionCard: vi.fn(() => '{"type":"session"}'),
@@ -112,7 +114,7 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+  logger: { info: loggerInfoMock, warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
@@ -200,11 +202,22 @@ describe('Worker ready: set_display_mode re-sync', () => {
     const ds = makeDs({ streamCardPending: true, streamCardId: undefined, worker: fakeWorker });
 
     __testOnly_setupWorkerHandlers(ds, fakeWorker);
-    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc', turnId: 'om_turn_ready' });
+    fakeWorker.emit('message', {
+      type: 'ready',
+      port: 9999,
+      token: 'tok_abc',
+      viewToken: 'view_cap',
+      turnId: 'om_turn_ready',
+    });
     await flush();
 
     expect(sessionReplyMock).toHaveBeenCalledTimes(1);
     expect(sessionReplyMock.mock.calls[0][4]).toBe('om_turn_ready');
+    expect(ds.workerViewToken).toBe('view_cap');
+    expect(JSON.stringify(sessionReplyMock.mock.calls[0][1])).toContain('viewToken=view_cap');
+    const logs = loggerInfoMock.mock.calls.flat().join('\n');
+    expect(logs).toContain('viewToken=[redacted]');
+    expect(logs).not.toContain('view_cap');
   });
 
   it('doc-native session never posts a streaming card to the virtual doc: chat id', async () => {

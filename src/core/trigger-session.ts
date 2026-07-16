@@ -12,10 +12,10 @@ import { markSessionActivity } from './session-activity.js';
 import { forkWorker, getCurrentCliVersion, sendWorkerInput } from './worker-pool.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import * as messageQueue from '../services/message-queue.js';
-import type { CliTurnPayload } from '../types.js';
 import type { DaemonSession } from './types.js';
 import { sessionKey } from './types.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
+import type { CliTurnPayload } from '../types.js';
 
 export interface TriggerSessionDeps {
   larkAppId: string;

@@ -9,7 +9,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { randomBytes, createHmac } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { config } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
@@ -117,6 +117,8 @@ import {
   buildVcMeetingConsumerBootstrapAgents,
   seedVcMeetingDefaultConsumerProfile,
 } from './services/vc-meeting-consumer-profile-bootstrap.js';
+import { evaluateVcMeetingConsumerIsolation } from './services/vc-meeting-consumer-isolation.js';
+import { resolvePairedSpawnBackendType } from './core/persistent-backend.js';
 import {
   readVcMeetingConsumerProfiles,
   updateVcMeetingConsumerProfiles,
@@ -145,6 +147,7 @@ import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugi
 import { assertPluginBindingTransition, describePluginDependencyError } from './core/plugins/dependencies.js';
 import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import type { InstalledPluginRecord, PluginDashboardEntry } from './core/plugins/types.js';
+import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -245,17 +248,6 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
   });
 }
 
-/** Sign a loopback request to a daemon's write-link route. The daemon verifies
- *  with the same .dashboard-secret, so only a caller that can read the secret —
- *  the dashboard — can mint write tokens; a bare local process that only knows
- *  the ipcPort can't. Same scheme as the `botmux dashboard` → /__cli/rotate
- *  HMAC. */
-function signDaemonTokenHeaders(): Record<string, string> {
-  const ts = Math.floor(Date.now() / 1000).toString();
-  const nonce = randomBytes(8).toString('hex');
-  const sig = createHmac('sha256', SECRET).update(`${ts}:${nonce}`).digest('base64url');
-  return { 'X-Botmux-Cli-Ts': ts, 'X-Botmux-Cli-Nonce': nonce, 'X-Botmux-Cli-Auth': sig };
-}
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
@@ -441,6 +433,16 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
         return false;
       }
     },
+    managedSideEffectIsolation: bot => evaluateVcMeetingConsumerIsolation({
+      sandbox: bot.sandbox,
+      platform: process.platform,
+      backendType: resolvePairedSpawnBackendType(
+        bot.cliId ?? config.daemon.cliId,
+        undefined,
+        bot.backendType,
+        config.daemon.backendType,
+      ),
+    }).ok,
     reloadDaemons: reloadVcMeetingBotConfigOnDaemons,
   };
 }
@@ -451,7 +453,7 @@ async function reloadVcMeetingBotConfigOnDaemons(appIds: string[]): Promise<void
   await Promise.all(unique.map(async appId => {
     const d = registry.getByAppId(appId);
     if (!d) return;
-    await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-config/reload`, {
+    await fetchDaemonIpc(d.ipcPort, '/api/bot-config/reload', {
       method: 'POST',
       signal: AbortSignal.timeout(10_000),
     }).catch(() => undefined);
@@ -804,7 +806,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
 // route call through this so error codes / merge semantics stay identical.
 async function reloadLocaleOnAllDaemons(): Promise<void> {
   await Promise.all(registry.list().map(d =>
-    fetch(`http://127.0.0.1:${d.ipcPort}/api/locale/reload`, { method: 'POST' }).catch(() => undefined),
+    fetchDaemonIpc(d.ipcPort, '/api/locale/reload', { method: 'POST' }).catch(() => undefined),
   ));
 }
 const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
@@ -827,6 +829,7 @@ const groupsActionDeps: GroupsActionDeps = {
   registryGetByAppId: (id) => registry.getByAppId(id),
   proxyToDaemon,
   closeSessionsMatching,
+  fetch: fetchDaemonUrl,
 };
 
 // ─── PR2 C8: Route B internal API (`/__daemon/*`) ───────────────────────────
@@ -958,8 +961,8 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
     // 1. Hydrate snapshot (blocking — completes before we wire SSE)
     try {
       const [sRes, schRes] = await Promise.all([
-        fetch(`http://127.0.0.1:${d.ipcPort}/api/sessions`),
-        fetch(`http://127.0.0.1:${d.ipcPort}/api/schedules`),
+        fetchDaemonIpc(d.ipcPort, '/api/sessions'),
+        fetchDaemonIpc(d.ipcPort, '/api/schedules'),
       ]);
       const s = await sRes.json() as { sessions: any[] };
       const sch = await schRes.json() as { schedules: any[] };
@@ -974,6 +977,7 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
         d.larkAppId,
         subscribeDaemon(d, aggregator, e =>
           logger.warn(`[aggregator] ${d.larkAppId}: ${e.message}`),
+          (_url, init) => fetchDaemonIpc(d.ipcPort, '/api/events', init),
         ),
       );
     }
@@ -1444,7 +1448,17 @@ async function proxyToDaemon(
       headers: { 'content-type': 'application/json' },
     });
   }
-  return fetch(`http://127.0.0.1:${d.ipcPort}${daemonPath}`, init);
+  return fetchDaemonIpc(d.ipcPort, daemonPath, init);
+}
+
+/** Authenticated adapter for helpers that receive a discovered daemon URL. */
+function fetchDaemonUrl(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+  const url = new URL(input instanceof Request ? input.url : String(input));
+  const port = Number(url.port);
+  if (url.hostname !== '127.0.0.1' || !Number.isSafeInteger(port) || port <= 0) {
+    return Promise.reject(new Error('daemon helper attempted a non-loopback URL'));
+  }
+  return fetchDaemonIpc(port, `${url.pathname}${url.search}`, init);
 }
 
 /** Create a Feishu group from the team UI: pick a creator daemon among the
@@ -1614,7 +1628,7 @@ async function createLifecycleGroupForWebhook(
   const allowed = creator.resolvedAllowedUsers ?? [];
   const ownerUnionIds = allowed.filter(u => u.startsWith('on_'));
   const userOpenIds = allowed.filter(u => u.startsWith('ou_'));
-  const upstream = await fetch(`http://127.0.0.1:${creator.ipcPort}/api/groups/create`, {
+  const upstream = await fetchDaemonIpc(creator.ipcPort, '/api/groups/create', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -1648,7 +1662,7 @@ async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
     .sort((a, b) => a.botIndex - b.botIndex);
   await Promise.all(onlineBots.map(async d => {
     try {
-      const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups`);
+      const r = await fetchDaemonIpc(d.ipcPort, '/api/groups');
       if (!r.ok) return;
       const j = await r.json() as { chats?: any[] };
       for (const c of j.chats ?? []) {
@@ -1898,7 +1912,7 @@ async function dashboardSkillReferencesMany(skillNames: readonly string[]): Prom
   const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
   const onlineConfigs = await Promise.all(onlineBots.map(async d => {
     try {
-      const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`, {
+      const r = await fetchDaemonIpc(d.ipcPort, '/api/bot-default-oncall', {
         signal: AbortSignal.timeout(1_500),
       });
       if (!r.ok) return null;
@@ -1956,8 +1970,8 @@ const server = createServer(async (req, res) => {
     // proxy on proxyBasePort+idx), so we resolve the session's owning daemon's
     // proxy port from the aggregator rows and forward there, streaming the
     // response straight back. Mounted before the dashboard auth gate because the
-    // terminal proxy / worker enforces its own write gate (read-only without
-    // token / platform role).
+    // worker independently requires a view/write capability or authenticated
+    // dashboard cookie before serving either HTTP or WebSocket terminal data.
     if (url.pathname === '/s' || url.pathname.startsWith('/s/')) {
       const sessionId = parseTerminalSessionId(url.pathname);
       const tport = sessionId ? aggregator.terminalProxyPortOf(sessionId) : undefined;
@@ -2903,7 +2917,7 @@ const server = createServer(async (req, res) => {
       const sid = decodeURIComponent(m[1]);
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
-      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/write-link`, { method: 'GET', headers: signDaemonTokenHeaders() });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/write-link`, { method: 'GET' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -3054,7 +3068,7 @@ const server = createServer(async (req, res) => {
       const merged = new Map<string, RoleProfileAggregate>();
       await Promise.all(registry.list().map(async d => {
         try {
-          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/role-profiles`);
+          const r = await fetchDaemonIpc(d.ipcPort, '/api/role-profiles');
           if (!r.ok) return;
           const j = await r.json() as { profiles?: any[]; larkAppId?: string };
           for (const p of j.profiles ?? []) {
@@ -3152,7 +3166,10 @@ const server = createServer(async (req, res) => {
       const byBot = new Map<string, RoleProfileEntryAggregate>();
       await Promise.all(registry.list().map(async d => {
         try {
-          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/role-profiles/${encodeURIComponent(profileId)}`);
+          const r = await fetchDaemonIpc(
+            d.ipcPort,
+            `/api/role-profiles/${encodeURIComponent(profileId)}`,
+          );
           if (!r.ok) return;
           const j = await r.json() as { entries?: any[] };
           for (const entry of j.entries ?? []) {
@@ -3249,7 +3266,7 @@ const server = createServer(async (req, res) => {
       const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, agentFields)).sort((a, b) => a.botIndex - b.botIndex);
       const out = await Promise.all(onlineBots.map(async d => {
         try {
-          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`);
+          const r = await fetchDaemonIpc(d.ipcPort, '/api/bot-default-oncall');
           if (!r.ok) {
             return botDefaultsPayload(d, undefined, `http_${r.status}`);
           }
@@ -3718,8 +3735,9 @@ const server = createServer(async (req, res) => {
           : undefined,
         roleProfileId: roleProfileId ?? undefined,
       };
-      const upstream = await fetch(
-        `http://127.0.0.1:${creator.ipcPort}/api/groups/create`,
+      const upstream = await fetchDaemonIpc(
+        creator.ipcPort,
+        '/api/groups/create',
         { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(forwardBody) },
       );
       const upstreamText = await upstream.text();

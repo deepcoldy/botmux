@@ -44,4 +44,81 @@ describe('worker durable lease expiry ordering', () => {
     expect(restart).toBeGreaterThan(exactBranch);
     expect(ack).toBeGreaterThan(restart);
   });
+
+  it('holds new input for the full async teardown window and wakes it only after replacement spawn', () => {
+    const restartStart = workerSource.indexOf('async function restartCliProcess(');
+    const restartEnd = workerSource.indexOf('// ─── HTTP + WebSocket Server', restartStart);
+    const restart = workerSource.slice(restartStart, restartEnd);
+    const arm = restart.indexOf('cliRestartInProgress = true;');
+    const revoke = restart.indexOf('revokeManagedTurnOriginForRestart();', arm);
+    const destroy = restart.indexOf('destroySession?.()', arm);
+    const kill = restart.indexOf('killCli({ preservePending: opts.preservePending });', destroy);
+    const spawn = restart.indexOf("spawnCli({ ...lastInitConfig, resume: true, prompt: '' });", destroy);
+    const release = restart.indexOf('cliRestartInProgress = false;', spawn);
+    const wake = restart.indexOf('void flushPending();', release);
+
+    expect(restartStart).toBeGreaterThanOrEqual(0);
+    expect(restartEnd).toBeGreaterThan(restartStart);
+    expect(arm).toBeGreaterThanOrEqual(0);
+    expect(revoke).toBeGreaterThan(arm);
+    expect(revoke).toBeLessThan(destroy);
+    expect(destroy).toBeGreaterThan(arm);
+    expect(kill).toBeGreaterThan(destroy);
+    expect(spawn).toBeGreaterThan(kill);
+    expect(release).toBeGreaterThan(spawn);
+    expect(wake).toBeGreaterThan(release);
+
+    const flushStart = workerSource.indexOf('async function flushPending(): Promise<void>');
+    const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
+    const flush = workerSource.slice(flushStart, flushEnd);
+    expect(flush.indexOf('if (cliRestartInProgress) return;')).toBeGreaterThanOrEqual(0);
+    expect(flush.indexOf('if (cliRestartInProgress) return;')).toBeLessThan(
+      flush.indexOf('if (!backend || !cliAdapter) return;'),
+    );
+
+    const sendStart = flushEnd + 1;
+    const sendEnd = workerSource.indexOf('// ─── Screen Update Timer', sendStart);
+    const sendToPty = workerSource.slice(sendStart, sendEnd);
+    expect(sendToPty).toContain('if (cliRestartInProgress || !backend)');
+    expect(sendToPty.indexOf('if (cliRestartInProgress || !backend)')).toBeLessThan(
+      sendToPty.indexOf('pendingInputAllowsTypeAhead'),
+    );
+
+    const killStart = workerSource.indexOf('function killCli(');
+    const killEnd = workerSource.indexOf('async function restartCliProcess(', killStart);
+    const killCli = workerSource.slice(killStart, killEnd);
+    for (const clear of [
+      'currentBotmuxTurnId = undefined;',
+      'currentBotmuxDispatchAttempt = undefined;',
+      'currentVcMeetingImTurnOrigin = undefined;',
+    ]) {
+      expect(killCli).toContain(clear);
+    }
+
+    const revokeStart = workerSource.indexOf('function revokeManagedTurnOriginForRestart()');
+    const revokeEnd = workerSource.indexOf('function authorizeManagedSend(', revokeStart);
+    const revokeAuthority = workerSource.slice(revokeStart, revokeEnd);
+    const commonRevokeStart = workerSource.indexOf('function completeManagedTurnOriginRevocation(');
+    const commonRevoke = workerSource.slice(commonRevokeStart, revokeStart);
+    expect(commonRevoke).toContain('sandboxRelayCapability = null;');
+    expect(commonRevoke).toContain('currentVcMeetingImTurnOrigin = undefined;');
+    expect(commonRevoke).toContain("type: 'managed_turn_origin_revoked'");
+    expect(revokeAuthority).not.toContain('currentBotmuxTurnId = undefined;');
+    expect(revokeAuthority).not.toContain('currentBotmuxDispatchAttempt = undefined;');
+
+    const terminalStart = workerSource.indexOf('function emitTurnTerminal(');
+    const terminalEnd = workerSource.indexOf('\nfunction workerIpcPayload(', terminalStart);
+    const terminal = workerSource.slice(terminalStart, terminalEnd);
+    expect(terminal).toContain('revokeManagedTurnOriginForTerminal(turnId, dispatchAttempt);');
+    expect(terminal.indexOf('revokeManagedTurnOriginForTerminal(turnId, dispatchAttempt);'))
+      .toBeLessThan(terminal.indexOf("type: 'turn_terminal'"));
+
+    const flushStartForRotation = workerSource.indexOf('async function flushPending(): Promise<void>');
+    const flushEndForRotation = workerSource.indexOf('\nfunction sendToPty(', flushStartForRotation);
+    const flushForRotation = workerSource.slice(flushStartForRotation, flushEndForRotation);
+    const assignNextTurn = flushForRotation.indexOf('currentBotmuxTurnId = item.turnId;');
+    const republish = flushForRotation.indexOf('publishSandboxRelayCapability();', assignNextTurn);
+    expect(assignNextTurn).toBeGreaterThanOrEqual(0);
+    expect(republish).toBeGreaterThan(assignNextTurn);
+  });
 });

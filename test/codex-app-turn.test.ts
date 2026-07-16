@@ -5,6 +5,7 @@ import {
   isCleanInputCapabilityError,
   isCodexAppTurnInput,
   parseCodexVersion,
+  resolveCodexAppFinalTurnIdentity,
   supportsClientUserMessageId,
   supportsCodexAppCleanInput,
 } from '../src/adapters/cli/codex-app-turn.js';
@@ -95,5 +96,50 @@ describe('Codex App clean-input protocol mapping', () => {
     expect(isCleanInputCapabilityError(new Error('turn/start: {"code":-32600,"message":"additionalContext requires experimentalApi capability"}'))).toBe(true);
     expect(isCleanInputCapabilityError(new Error('turn/start: {"code":-32600,"message":"generic invalid request"}'))).toBe(false);
     expect(isCleanInputCapabilityError(new Error('network timeout'))).toBe(false);
+  });
+
+  it('keeps stable marker identity and treats the app-server id as diagnostics only', () => {
+    expect(resolveCodexAppFinalTurnIdentity({
+      turnId: 'om_123',
+      nativeTurnId: 'turn-native-9',
+    }, 'om_123', 'codex-app-fallback')).toEqual({
+      ok: true,
+      turnId: 'om_123',
+      nativeTurnId: 'turn-native-9',
+    });
+  });
+
+  it('rejects a marker that tries to choose a different or unbound botmux turn', () => {
+    expect(resolveCodexAppFinalTurnIdentity({ turnId: 'om_forged' }, 'om_current', 'fallback'))
+      .toEqual({
+        ok: false,
+        reason: 'turn_mismatch',
+        markerTurnId: 'om_forged',
+        currentBotmuxTurnId: 'om_current',
+      });
+    expect(resolveCodexAppFinalTurnIdentity({ turnId: 'om_stale' }, undefined, 'fallback'))
+      .toEqual({
+        ok: false,
+        reason: 'turn_mismatch',
+        markerTurnId: 'om_stale',
+      });
+  });
+
+  it('falls back to the worker-owned turn for a legacy marker instead of using its native id', () => {
+    expect(resolveCodexAppFinalTurnIdentity({
+      nativeTurnId: 'turn-native-legacy',
+    }, 'om_legacy_current', 'codex-app-fallback')).toEqual({
+      ok: true,
+      turnId: 'om_legacy_current',
+      nativeTurnId: 'turn-native-legacy',
+    });
+    expect(resolveCodexAppFinalTurnIdentity({
+      turnId: '',
+      nativeTurnId: 'turn-native-local',
+    }, undefined, 'codex-app-fallback')).toEqual({
+      ok: true,
+      turnId: 'codex-app-fallback',
+      nativeTurnId: 'turn-native-local',
+    });
   });
 });

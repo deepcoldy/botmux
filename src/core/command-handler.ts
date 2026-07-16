@@ -71,6 +71,7 @@ import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
+import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 
@@ -2859,8 +2860,9 @@ export async function handleCommand(
           try {
             const ctrl = new AbortController();
             const tt = setTimeout(() => ctrl.abort(), 5000);
-            const res = await fetch(
-              `http://127.0.0.1:${daemon.ipcPort}/api/sessions/migrate-to-chat`,
+            const res = await fetchDaemonIpc(
+              daemon.ipcPort,
+              '/api/sessions/migrate-to-chat',
               {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },

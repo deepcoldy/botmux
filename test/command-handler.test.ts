@@ -45,6 +45,18 @@ vi.mock('../src/config.js', () => ({
   },
 }));
 
+// command-handler's cross-daemon calls are authenticated in production. These
+// unit tests exercise relay orchestration with a stubbed global fetch, so keep
+// that seam while bypassing host-secret filesystem setup.
+vi.mock('../src/core/daemon-ipc-auth.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/daemon-ipc-auth.js')>();
+  return {
+    ...actual,
+    fetchDaemonIpc: (port: number, path: string, init?: RequestInit) =>
+      fetch(`http://127.0.0.1:${port}${path}`, init),
+  };
+});
+
 vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: vi.fn(() => ({})),
   isRemoteAccessEnabled: vi.fn(() => false),

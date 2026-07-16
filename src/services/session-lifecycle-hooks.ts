@@ -48,6 +48,20 @@ export function emitSessionLifecycleHook(
     for (const key of lastIdleEmits.keys()) {
       if (key.includes(prefix)) lastIdleEmits.delete(key);
     }
+  }
+
+  // Dedicated VC receivers process meeting-derived, untrusted content. User
+  // hooks are an external side-effect channel outside the listener action
+  // ledger, so every lifecycle event from such a session fails closed. Keep
+  // the exit cleanup above so the dedupe map cannot retain dead sessions.
+  if (ds.session.vcMeetingReceiver) {
+    logger.debug(
+      `[hooks] ${event} suppressed for dedicated VC receiver ${ds.session.sessionId}`,
+    );
+    return false;
+  }
+
+  if (event === 'session.exit') {
     if (shutdownInProgress) {
       logger.debug(`[hooks] session.exit suppressed during daemon shutdown (session ${ds.session.sessionId})`);
       return false;
@@ -64,6 +78,7 @@ export function emitSessionStateTransitionHook(
   newState: StreamStatus | undefined,
   body: Record<string, unknown> = {},
 ): boolean {
+  if (ds.session.vcMeetingReceiver) return false;
   if (!newState || prevState === newState) return false;
   if (prevState !== 'idle' && newState !== 'idle') return false;
 

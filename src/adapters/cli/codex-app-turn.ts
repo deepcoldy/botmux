@@ -18,6 +18,39 @@ export interface CodexAppTurnStartParams {
   clientUserMessageId?: string;
 }
 
+/** Resolve a runner `final` marker without ever mistaking Codex app-server's
+ * native turn id for botmux's stable logical turn. Legacy runner envelopes do
+ * not carry a client id, so the worker-owned current turn is their authority. */
+export function resolveCodexAppFinalTurnIdentity(
+  payload: { turnId?: unknown; nativeTurnId?: unknown },
+  currentBotmuxTurnId: string | undefined,
+  fallbackTurnId: string,
+):
+  | { ok: true; turnId: string; nativeTurnId?: string }
+  | { ok: false; reason: 'turn_mismatch'; markerTurnId: string; currentBotmuxTurnId?: string } {
+  const markerTurnId = typeof payload.turnId === 'string' && payload.turnId.length > 0
+    ? payload.turnId
+    : undefined;
+  const nativeTurnId = typeof payload.nativeTurnId === 'string' && payload.nativeTurnId.length > 0
+    ? payload.nativeTurnId
+    : undefined;
+  // The worker-frozen turn is the authority. A marker id is only a redundant
+  // equality assertion; it can never choose or resurrect another turn.
+  if (markerTurnId && markerTurnId !== currentBotmuxTurnId) {
+    return {
+      ok: false,
+      reason: 'turn_mismatch',
+      markerTurnId,
+      ...(currentBotmuxTurnId ? { currentBotmuxTurnId } : {}),
+    };
+  }
+  return {
+    ok: true,
+    turnId: currentBotmuxTurnId ?? fallbackTurnId,
+    ...(nativeTurnId ? { nativeTurnId } : {}),
+  };
+}
+
 export function parseCodexVersion(output: string): CodexVersion | undefined {
   const m = output.match(/(?:^|\s)(\d+)\.(\d+)\.(\d+)(?:\s|$|-)/);
   if (!m) return undefined;

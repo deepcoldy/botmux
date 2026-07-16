@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
-import { verifyHmac } from '../dashboard/auth.js';
+import { cliAuthBind, verifyHmac } from '../dashboard/auth.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -145,6 +145,14 @@ interface Route {
 
 const routes: Route[] = [];
 
+/** Requests that crossed the server-wide trusted-host gate. The legacy
+ * write-link handlers consult this marker so they do not verify (and consume)
+ * the same one-shot nonce twice. */
+const trustedHostRequests = new WeakSet<IncomingMessage>();
+export function isTrustedHostIpcRequest(req: IncomingMessage): boolean {
+  return trustedHostRequests.has(req);
+}
+
 /** Register a handler. Path supports `:name` segments captured into the params object. */
 export function ipcRoute(method: string, path: string, handler: Handler): void {
   const keys: string[] = [];
@@ -166,20 +174,16 @@ export async function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-// ─── Token-route auth (loopback HMAC) ───────────────────────────────────────
+// ─── Trusted-host auth (loopback + route-bound HMAC) ────────────────────────
 //
-// Most IPC routes are loopback-trusted: the codebase's threat model treats a
-// local botmux process as already root-equivalent on the box (see the
-// migrate-to-chat route below), so close/resume/sandbox-diff carry no per-route
-// auth. The two write-link routes are different — they HAND OUT a reusable
-// terminal-control credential (the worker write token: GET /write-link returns
-// the URL, POST /write-link-card delivers it as a private Lark card), so they
-// additionally require the caller to prove it can read ~/.botmux/.dashboard-secret.
-// That keeps a sandboxed worker, or a random local process that merely discovered
-// the ipcPort, from minting write tokens for sessions it doesn't own. The legit
-// callers — the dashboard proxy and `botmux term-link` — sign with the same secret
-// + scheme as `botmux dashboard` → /__cli/rotate. (A same-user process that can
-// read the secret is out of scope: it's already trusted.)
+// Production start enables a server-wide gate: loopback is connectivity, not
+// identity, because a Linux bwrap CLI keeps host networking for model egress.
+// Every data/read or mutation route therefore requires proof that the caller
+// can read ~/.botmux/.dashboard-secret. Only health and a tiny set of handlers
+// with their own exact live-worker capability checks are admitted without it.
+// The two write-link handlers retain their historical local check for unit-test
+// compatibility; production requests arrive pre-authorized and are marked in
+// trustedHostRequests so the one-shot nonce is not consumed twice.
 let injectedIpcSecret: string | null = null;
 /** Test seam: override the secret used to verify token-route HMAC. */
 export function setIpcAuthSecret(secret: string | null): void { injectedIpcSecret = secret; }
@@ -189,6 +193,7 @@ function ipcAuthSecret(): string | null {
   catch { return null; }
 }
 function tokenRouteAuthorized(req: IncomingMessage): boolean {
+  if (trustedHostRequests.has(req)) return true;
   const secret = ipcAuthSecret();
   if (!secret) return false; // fail-closed: no secret on disk → nobody can sign
   const ts = req.headers['x-botmux-cli-ts'];
@@ -196,6 +201,51 @@ function tokenRouteAuthorized(req: IncomingMessage): boolean {
   const sig = req.headers['x-botmux-cli-auth'];
   if (typeof ts !== 'string' || typeof nonce !== 'string' || typeof sig !== 'string') return false;
   return verifyHmac(secret, { ts, nonce, sig }, req.socket.remoteAddress ?? '').ok;
+}
+
+function routeHasPublicAccess(method: string, pathname: string): boolean {
+  // Liveness contains no data and performs no mutation.
+  return method === 'GET' && pathname === '/__health';
+}
+
+function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean {
+  // The receiver action endpoint performs its own rotating worker-capability
+  // verification and then enters the durable action ledger. Keeping this one
+  // aperture is what preserves managed meeting actions from inside bwrap.
+  if (method === 'POST' && pathname === '/api/vc-meetings/action-request') return true;
+  // These two CLI-in-sandbox endpoints verify the same rotating capability in
+  // their handlers and bind it to body.sessionId. They cannot be bare loopback
+  // exceptions: a receiver that learned another session id could otherwise
+  // forge readiness or an ask for that session.
+  if (method === 'POST' && pathname === '/api/session-ready') return true;
+  if (method === 'POST' && pathname === '/api/asks') return true;
+  if (method === 'POST' && pathname === '/api/hooks/emit') return true;
+  if (method === 'POST' && pathname === '/api/attention') return true;
+  return false;
+}
+
+function trustedHostAuthorized(
+  req: IncomingMessage,
+  pathname: string,
+  port: number,
+  secret: string,
+): { ok: true } | { ok: false; reason: string } {
+  const ts = req.headers['x-botmux-cli-ts'];
+  const nonce = req.headers['x-botmux-cli-nonce'];
+  const sig = req.headers['x-botmux-cli-auth'];
+  if (typeof ts !== 'string' || typeof nonce !== 'string' || typeof sig !== 'string') {
+    return { ok: false, reason: 'missing_headers' };
+  }
+  const bind = cliAuthBind(req.method ?? 'GET', pathname, port);
+  const verified = verifyHmac(
+    secret,
+    { ts, nonce, sig },
+    req.socket.remoteAddress ?? '',
+    bind,
+  );
+  return verified.ok
+    ? { ok: true }
+    : { ok: false, reason: verified.reason ?? 'unauthorized' };
 }
 
 ipcRoute('GET', '/__health', (_req, res) => {
@@ -2503,10 +2553,33 @@ ipcRoute('GET', '/api/events', (_req, res) => {
   res.on('close', () => { off(); clearInterval(hb); });
 });
 
-export function startIpcServer(opts: { port: number; host: string }): Promise<IpcServerHandle> {
+export function startIpcServer(opts: {
+  port: number;
+  host: string;
+  /** Enable the production trusted-host boundary. The verifier reloads the
+   * tiny secret file for each request so concurrent fleet bootstrap or a
+   * deliberate secret repair cannot strand a daemon on a stale cached key.
+   * Tests that omit this option retain the lightweight in-process server. */
+  authRequired?: boolean;
+}): Promise<IpcServerHandle> {
+  let boundPort = opts.port;
   const server: Server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+      const method = req.method ?? 'GET';
+      const publicRoute = routeHasPublicAccess(method, url.pathname);
+      const capabilityRoute = routeHasNarrowUntrustedAuth(method, url.pathname);
+      if (opts.authRequired && !publicRoute) {
+        const secret = ipcAuthSecret();
+        const auth = secret
+          ? trustedHostAuthorized(req, url.pathname, boundPort, secret)
+          : { ok: false as const, reason: 'secret_unavailable' };
+        if (auth.ok) {
+          trustedHostRequests.add(req);
+        } else if (!capabilityRoute) {
+          return jsonRes(res, 401, { ok: false, error: 'unauthorized', reason: auth.reason });
+        }
+      }
       for (const r of routes) {
         if (r.method !== req.method) continue;
         const m = r.pattern.exec(url.pathname);
@@ -2532,8 +2605,11 @@ export function startIpcServer(opts: { port: number; host: string }): Promise<Ip
     port: opts.port,
     host: opts.host,
     log: (m) => logger.warn(`[dashboard-ipc] ${m}`),
-  }).then((port) => ({
+  }).then((port) => {
+    boundPort = port;
+    return {
     port,
     close: () => new Promise<void>(r => server.close(() => r())),
-  }));
+  };
+  });
 }

@@ -35,7 +35,7 @@ vi.mock('../src/im/lark/client.js', async () => {
 });
 
 import { registerBot } from '../src/bot-registry.js';
-import { sessionKey } from '../src/core/types.js';
+import { activeSessionKey, sessionKey } from '../src/core/types.js';
 import { __testOnly_sessionReply as sessionReply, __testOnly_activeSessions as activeSessions } from '../src/daemon.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -63,6 +63,30 @@ function seedSharedSession(currentReplyTarget?: Target): DaemonSession {
     currentReplyTarget,
   } as unknown as DaemonSession;
   activeSessions.set(sessionKey(CHAT, APP), ds);
+  return ds;
+}
+
+function seedReceiverSession(): DaemonSession {
+  const ds = {
+    scope: 'chat',
+    chatId: CHAT,
+    larkAppId: APP,
+    session: {
+      sessionId: 'sess-receiver-' + Math.random().toString(36).slice(2),
+      chatId: CHAT,
+      rootMessageId: CHAT,
+      title: 'meeting receiver',
+      status: 'active',
+      createdAt: NOW,
+      vcMeetingReceiver: {
+        listenerAppId: 'listener-app',
+        meetingId: 'meeting-1',
+        memberId: 'member-1',
+        memberEpoch: 1,
+      },
+    },
+  } as unknown as DaemonSession;
+  activeSessions.set(activeSessionKey(ds), ds);
   return ds;
 }
 
@@ -96,6 +120,66 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     seedSharedSession(undefined);
     await sessionReply(CHAT, 'hello', 'text', APP);
     expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('routes a dedicated receiver by exact source session when an ordinary session shares its chat', async () => {
+    const ordinary = seedSharedSession({ rootMessageId: 'om_ordinary_topic', turnId: 'turn-ordinary', updatedAt: NOW });
+    const receiver = seedReceiverSession();
+
+    await sessionReply(CHAT, 'receiver output', 'text', APP, 'turn-receiver', {
+      sourceSessionId: receiver.session.sessionId,
+      uuid: 'vcd_delivery_stable',
+      suppressHook: true,
+    });
+
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      APP,
+      CHAT,
+      'receiver output',
+      'text',
+      'vcd_delivery_stable',
+      {
+        sessionId: receiver.session.sessionId,
+        scope: receiver.scope,
+        anchor: CHAT,
+      },
+      { suppressHook: true },
+    );
+    expect(receiver.session.sessionId).not.toBe(ordinary.session.sessionId);
+  });
+
+  it('keeps receiver hook attribution when no ordinary chat session exists', async () => {
+    const receiver = seedReceiverSession();
+
+    await sessionReply(CHAT, 'receiver only', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+    });
+
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      APP,
+      CHAT,
+      'receiver only',
+      'text',
+      undefined,
+      {
+        sessionId: receiver.session.sessionId,
+        scope: receiver.scope,
+        anchor: CHAT,
+      },
+      { suppressHook: true },
+    );
+  });
+
+  it('fails closed when a receiver source session is stale instead of using the ordinary chat slot', async () => {
+    seedSharedSession({ rootMessageId: 'om_ordinary_topic', turnId: 'turn-ordinary', updatedAt: NOW });
+
+    await expect(sessionReply(CHAT, 'stale receiver output', 'text', APP, undefined, {
+      sourceSessionId: 'sess-closed-receiver',
+    })).rejects.toThrow(/source session identity/i);
+
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
     expect(mocks.replyMessage).not.toHaveBeenCalled();
   });
 

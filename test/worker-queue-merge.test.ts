@@ -8,13 +8,14 @@ import {
   terminalReleasesDurableTurn,
 } from '../src/utils/pending-input-queue.js';
 
+const imOrigin = {
+  listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member',
+  memberEpoch: 1, agentAppId: 'agent', ownerBootId: 'boot', ownerEpoch: 1,
+  membershipGeneration: 1, sinkOwnerGeneration: 1,
+  receiverSessionId: 'receiver', larkMessageId: 'im-1',
+};
+
 describe('mergeQueuedCliInput', () => {
-  const imOrigin = {
-    listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member',
-    memberEpoch: 1, agentAppId: 'agent', ownerBootId: 'boot', ownerEpoch: 1,
-    membershipGeneration: 1, sinkOwnerGeneration: 1,
-    receiverSessionId: 'receiver', larkMessageId: 'im-1',
-  };
   it('returns false when there is no queued message to merge into', () => {
     const pending: Array<{ content: string; turnId?: string }> = [];
 
@@ -28,22 +29,6 @@ describe('mergeQueuedCliInput', () => {
     expect(mergeQueuedCliInput(pending, { content: 'second', turnId: 't2' })).toBe(true);
 
     expect(pending).toEqual([{ content: 'first\n\nsecond', turnId: 't2' }]);
-  });
-
-  it('never merges structured Codex App turns because context is per-message', () => {
-    const pending = [{
-      content: 'legacy-1',
-      turnId: 't1',
-      codexAppInput: { text: 'clean-1' },
-    }];
-    const next = {
-      content: 'legacy-2',
-      turnId: 't2',
-      codexAppInput: { text: 'clean-2' },
-    };
-    expect(mergeQueuedCliInput(pending, next)).toBe(false);
-    expect(pending).toHaveLength(1);
-    expect(pending[0].codexAppInput.text).toBe('clean-1');
   });
 
   it('never merges across a durable envelope boundary in either direction', () => {
@@ -127,5 +112,85 @@ describe('durable turn queue boundary', () => {
     expect(terminalReleasesDurableTurn(current, { turnId: 'delivery', dispatchAttempt: 1 })).toBe(false);
     expect(terminalReleasesDurableTurn(current, { turnId: 'other', dispatchAttempt: 2 })).toBe(false);
     expect(terminalReleasesDurableTurn(current, { turnId: 'delivery', dispatchAttempt: 2 })).toBe(true);
+  });
+
+  it('never merges structured Codex App turns because context is per-message', () => {
+    const pending = [{
+      content: 'legacy-1',
+      turnId: 't1',
+      codexAppInput: { text: 'clean-1' },
+    }];
+    const next = {
+      content: 'legacy-2',
+      turnId: 't2',
+      codexAppInput: { text: 'clean-2' },
+    };
+    expect(mergeQueuedCliInput(pending, next)).toBe(false);
+    expect(pending).toHaveLength(1);
+    expect(pending[0].codexAppInput.text).toBe('clean-1');
+  });
+
+  it('never merges a clean sidecar across a durable or explicit-IM boundary', () => {
+    const cleanDurable = [{
+      content: 'legacy delivery',
+      turnId: 'delivery',
+      dispatchAttempt: 2,
+      codexAppInput: { text: 'external event' },
+    }];
+    expect(mergeQueuedCliInput(cleanDurable, {
+      content: 'legacy IM',
+      turnId: 'im-1',
+      codexAppInput: { text: 'human follow-up' },
+    })).toBe(false);
+    expect(cleanDurable).toEqual([{
+      content: 'legacy delivery',
+      turnId: 'delivery',
+      dispatchAttempt: 2,
+      codexAppInput: { text: 'external event' },
+    }]);
+
+    const cleanIm = [{
+      content: 'legacy IM',
+      turnId: 'im-1',
+      vcMeetingImTurnOrigin: imOrigin,
+      codexAppInput: { text: 'human follow-up' },
+    }];
+    expect(mergeQueuedCliInput(cleanIm, {
+      content: 'legacy delivery',
+      turnId: 'delivery',
+      dispatchAttempt: 3,
+      codexAppInput: { text: 'external event' },
+    })).toBe(false);
+    expect(cleanIm).toEqual([{
+      content: 'legacy IM',
+      turnId: 'im-1',
+      vcMeetingImTurnOrigin: imOrigin,
+      codexAppInput: { text: 'human follow-up' },
+    }]);
+  });
+
+  it('never merges when only one side carries a clean sidecar', () => {
+    const structuredTail = [{
+      content: 'legacy-1',
+      turnId: 't1',
+      codexAppInput: { text: 'clean-1' },
+    }];
+    expect(mergeQueuedCliInput(structuredTail, {
+      content: 'legacy-2',
+      turnId: 't2',
+    })).toBe(false);
+    expect(structuredTail).toEqual([{
+      content: 'legacy-1',
+      turnId: 't1',
+      codexAppInput: { text: 'clean-1' },
+    }]);
+
+    const ordinaryTail = [{ content: 'legacy-1', turnId: 't1' }];
+    expect(mergeQueuedCliInput(ordinaryTail, {
+      content: 'legacy-2',
+      turnId: 't2',
+      codexAppInput: { text: 'clean-2' },
+    })).toBe(false);
+    expect(ordinaryTail).toEqual([{ content: 'legacy-1', turnId: 't1' }]);
   });
 });

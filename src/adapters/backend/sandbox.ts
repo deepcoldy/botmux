@@ -137,6 +137,13 @@ export interface SandboxPlan {
    *  (daemon-produced, e.g. skill plugin dirs) — bound AFTER the privacy masks so
    *  a broad hideDir can't break skill delivery. */
   readonlyRoots?: string[];
+  /** Daemon-generated private roots re-bound writable AFTER credential masks.
+   * Used for the current bot's isolated CLI home only; never accepts user
+   * config. */
+  trustedWritableRoots?: string[];
+  /** Crown-jewel masks emitted after trusted writable carve-outs. */
+  finalHideDirs?: string[];
+  finalHideFiles?: { path: string; empty: string }[];
   /** User-configured read-only inputs (per-bot sandboxReadonlyPaths). Bound BEFORE
    *  the privacy masks so hidePaths always win over them — an entry overlapping a
    *  masked path must never re-expose the real content. */
@@ -175,6 +182,13 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   // Per-bot privacy masks (opt-in, no defaults).
   for (const dir of plan.hideDirs) a.push('--tmpfs', dir);
   for (const f of plan.hideFiles) a.push('--ro-bind', f.empty, f.path);
+  // Re-open only daemon-derived private roots (for example this bot's own
+  // BOT_HOME) after their parent BOTMUX_HOME was blanked.
+  for (const root of plan.trustedWritableRoots ?? []) a.push('--bind', root, root);
+  // A private root can itself contain a credential that the sandbox must not
+  // recover (notably send-cred.json). Re-deny those after the carve-out.
+  for (const dir of plan.finalHideDirs ?? []) a.push('--tmpfs', dir);
+  for (const f of plan.finalHideFiles ?? []) a.push('--ro-bind', f.empty, f.path);
   // Session-scoped TRUSTED runtime inputs, e.g. generated skill/plugin dirs —
   // after the masks so a broad hideDir can't blank skill delivery.
   for (const root of plan.readonlyRoots ?? []) a.push('--ro-bind', root, root);
@@ -355,16 +369,17 @@ export function sandboxedClaudeDataDir(sessionId: string, realDataDir: string): 
  * Relay mode is the only credentialed send path; otherwise an agent could
  * unset BOTMUX_SEND_RELAY and execute an absolute botmux binary against the
  * real bots.json/send-cred files exposed by the HOME overlay lowerdir. */
-export function sandboxCredentialHidePaths(home: string): string[] {
+export function sandboxCredentialHidePaths(home: string, botmuxHome = join(home, '.botmux')): string[] {
   // Mask the entire botmux state root. Exact-file masks are insufficient:
   // setup/update creates timestamped bots.json backups, including ones created
   // after a long-lived sandbox starts. Trusted skill roots and the per-session
   // outbox are explicitly re-bound after privacy masks by buildSandboxArgs.
-  return [
+  return [...new Set([
     join(home, '.botmux'),
+    botmuxHome,
     join(home, '.lark-cli'),
     join(home, '.lark-cli-bots'),
-  ].sort();
+  ])].sort();
 }
 
 /** Proxy env vars forwarded into the sandbox so the CLI reaches the API even on
@@ -417,6 +432,10 @@ export function prepareSandbox(opts: {
   /** Runtime-generated roots that should be visible read-only inside bwrap.
    *  Trusted (daemon-produced) — bound after the privacy masks. */
   readonlyRoots?: readonly string[];
+  /** Daemon-derived private roots to re-open writable after mandatory masks. */
+  trustedWritablePaths?: readonly string[];
+  /** Credential paths to re-mask after trusted writable carve-outs. */
+  finalHidePaths?: readonly string[];
   /** User-configured extra read-only inputs (per-bot sandboxReadonlyPaths).
    *  Bound before the privacy masks (masks win) and rejected when they would
    *  shadow the home/project overlay roots. */
@@ -433,6 +452,7 @@ export function prepareSandbox(opts: {
   if (!ensureSandboxDeps(needFuse)) return null;
 
   const dataDir = resolveSandboxMountPath(opts.dataDir);
+  const botmuxHome = dirname(dataDir);
   const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
   const outbox = join(sessionRoot, 'outbox');
   const shimBin = join(sessionRoot, 'shimbin');
@@ -448,6 +468,14 @@ export function prepareSandbox(opts: {
   for (const d of [outbox, shimBin, empties]) mkdirSync(d, { recursive: true });
 
   const home = resolveSandboxMountPath(homedir());
+  // Masking BOTMUX_HOME is mandatory for the credential boundary.  A layout
+  // that makes it `/` or the whole user home cannot be masked without erasing
+  // the sandbox runtime itself, so refuse the spawn instead of silently
+  // exposing the custom session/config root.
+  if (botmuxHome === '/' || botmuxHome === home) {
+    console.error(`[sandbox] unsafe SESSION_DATA_DIR layout: BOTMUX_HOME resolves to ${botmuxHome}`);
+    return null;
+  }
   // BOTMUX_SANDBOX_SRC overrides the LOWER project source for spike testing only.
   const projectSource = resolveSandboxMountPath(process.env.BOTMUX_SANDBOX_SRC || opts.sourceWorkingDir);
   const projectMount = resolveSandboxMountPath(opts.sourceWorkingDir);
@@ -487,10 +515,16 @@ export function prepareSandbox(opts: {
   // fail existsSync and mask a literal `~/...` path, leaving the real one readable.
   const hideDirs: string[] = [];
   const hideFiles: { path: string; empty: string }[] = [];
+  const finalHideDirs: string[] = [];
+  const finalHideFiles: { path: string; empty: string }[] = [];
   let emptyIdx = 0;
   const customBotsConfig = process.env.BOTS_CONFIG?.trim();
   const credentialPaths = [
-    ...sandboxCredentialHidePaths(home),
+    // SESSION_DATA_DIR may live outside ~/.botmux.  Its parent is the
+    // authoritative BOTMUX_HOME everywhere else (send-cred, per-bot homes,
+    // sessions/receipts); mask that exact root so a custom location cannot be
+    // recovered through the sandbox's initial read-only bind of `/`.
+    ...sandboxCredentialHidePaths(home, botmuxHome),
     ...(customBotsConfig ? [resolve(customBotsConfig)] : []),
   ];
   for (const raw of [...credentialPaths, ...(opts.hidePaths ?? [])]) {
@@ -506,12 +540,26 @@ export function prepareSandbox(opts: {
       hideFiles.push({ path: p, empty });
     }
   }
+  for (const raw of opts.finalHidePaths ?? []) {
+    if (!raw || typeof raw !== 'string') continue;
+    const p = expandTilde(raw, home);
+    let isDir = false;
+    try { isDir = existsSync(p) && statSync(p).isDirectory(); } catch { /* */ }
+    if (isDir) {
+      finalHideDirs.push(p);
+    } else {
+      const empty = join(empties, `mask-${emptyIdx++}`);
+      try { writeFileSync(empty, ''); } catch { /* */ }
+      finalHideFiles.push({ path: p, empty });
+    }
+  }
 
   // CLI auth/login paths kept real+writable (token refresh / login must persist,
   // unlike isolated project edits). Resolve `~` and bind only existing paths — a
   // missing auth file isn't a valid mountpoint (the CLI must be logged in on the
   // host; login-from-scratch inside the sandbox isn't supported).
   const authReal = resolveExistingPaths(opts.authPaths, home);
+  const trustedWritableRoots = resolveExistingPaths(opts.trustedWritablePaths, home);
   const readonlyRoots = resolveExistingPaths(opts.readonlyRoots, home);
   const userReadonlyRoots = resolveUserReadonlyRoots(opts.userReadonlyPaths, home, projectMount);
 
@@ -524,6 +572,9 @@ export function prepareSandbox(opts: {
     hideDirs,
     hideFiles,
     authReal,
+    trustedWritableRoots,
+    finalHideDirs,
+    finalHideFiles,
     readonlyRoots,
     userReadonlyRoots,
     net: opts.net !== false,

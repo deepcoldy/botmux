@@ -155,15 +155,21 @@ export class BridgeTurnQueue {
     return dropped;
   }
 
-  /** Drop a specific pending turn by turnId iff it has not yet started
-   *  collecting assistant text. Returns the dropped turn or null if not
-   *  found / already started. Used by the worker when a writeInput's
-   *  deferred recheck conclusively fails — the user has been notified
-   *  the message was lost, so keeping a fingerprint-bearing mark around
-   *  only fuels the per-tick rotation-fallback scan that already
-   *  spammed 99% CPU once (no jsonl line will ever match). */
-  dropPendingTurn(turnId: string): BridgePendingTurn | null {
-    const idx = this.queue.findIndex(t => t.turnId === turnId && !t.started);
+  /** Drop one exact pending delivery attempt iff it has not yet started
+   *  collecting assistant text. A durable retry reuses turnId with a higher
+   *  dispatchAttempt, so matching only turnId would let attempt N's delayed
+   *  submit-failure timer delete the live mark for retry N+1. Returns the
+   *  dropped turn or null if the exact attempt is not found / already started.
+   *  Used by the worker when a writeInput's deferred recheck conclusively
+   *  fails — the user has been notified the message was lost, so keeping a
+   *  fingerprint-bearing mark around only fuels the per-tick rotation-fallback
+   *  scan that already spammed 99% CPU once (no jsonl line will ever match). */
+  dropPendingTurn(turnId: string, dispatchAttempt?: number): BridgePendingTurn | null {
+    const idx = this.queue.findIndex(t =>
+      t.turnId === turnId
+      && t.dispatchAttempt === dispatchAttempt
+      && !t.started,
+    );
     if (idx === -1) return null;
     const [dropped] = this.queue.splice(idx, 1);
     return dropped;

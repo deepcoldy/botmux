@@ -533,7 +533,7 @@ export type DaemonToWorker =
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
-  | { type: 'ready'; port: number; token: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'ready'; port: number; token: string; viewToken?: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'cli_session_id'; cliSessionId: string }
   | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'prompt_ready' }
@@ -555,6 +555,11 @@ export type WorkerToDaemon =
       disposition: 'queued_removed' | 'cli_fenced';
     }
   | { type: 'managed_turn_origin'; sessionId: string; capability: string; turnId?: string; dispatchAttempt?: number }
+  /** An in-worker CLI restart rotates the managed-send authority without
+   * replacing the Node worker. Carry the old token so the daemon can revoke
+   * exactly that generation and ignore a delayed revoke after the next turn
+   * has already published a fresh token. */
+  | { type: 'managed_turn_origin_revoked'; sessionId: string; capability?: string; turnId?: string; dispatchAttempt?: number }
   | {
       type: 'final_output';
       /** Worker-side botmux session identity. Daemon validates this before

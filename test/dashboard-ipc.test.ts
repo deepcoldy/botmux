@@ -4,7 +4,8 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
 import * as larkClient from '../src/im/lark/client.js';
@@ -25,6 +26,20 @@ function tokenAuthHeaders(secret = TEST_IPC_SECRET): Record<string, string> {
   const nonce = randomBytes(8).toString('hex');
   const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
   return { 'X-Botmux-Cli-Ts': ts, 'X-Botmux-Cli-Nonce': nonce, 'X-Botmux-Cli-Auth': sig };
+}
+
+function trustedHostHeaders(
+  method: string,
+  path: string,
+  port: number,
+  secret = TEST_IPC_SECRET,
+): Record<string, string> {
+  const auth = signCliAuth(secret, cliAuthBind(method, path, port));
+  return {
+    'X-Botmux-Cli-Ts': auth.ts,
+    'X-Botmux-Cli-Nonce': auth.nonce,
+    'X-Botmux-Cli-Auth': auth.sig,
+  };
 }
 
 function parseSseFrame(raw: string): { type: string; body: any } | null {
@@ -99,6 +114,57 @@ describe('dashboard IPC server', () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/nope`);
     expect(res.status).toBe(404);
+  });
+
+  it('denies sandbox-like loopback reads and mutations but accepts route-bound trusted-host calls', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    let mutations = 0;
+    const mutationPath = '/api/test-receiver-ipc-mutation';
+    ipcRoute('POST', mutationPath, (_req, res) => {
+      mutations += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const base = `http://127.0.0.1:${handle.port}`;
+
+    const leakedRead = await fetch(`${base}/api/sessions`);
+    expect(leakedRead.status).toBe(401);
+    expect(mutations).toBe(0);
+
+    const forgedMutation = await fetch(`${base}${mutationPath}`, { method: 'POST' });
+    expect(forgedMutation.status).toBe(401);
+    expect(mutations).toBe(0);
+
+    const trustedRead = await fetch(`${base}/api/sessions`, {
+      headers: trustedHostHeaders('GET', '/api/sessions', handle.port),
+    });
+    expect(trustedRead.status).toBe(200);
+
+    const trustedMutation = await fetch(`${base}${mutationPath}`, {
+      method: 'POST',
+      headers: trustedHostHeaders('POST', mutationPath, handle.port),
+    });
+    expect(trustedMutation.status).toBe(200);
+    expect(mutations).toBe(1);
+
+    const wrongRoute = await fetch(`${base}${mutationPath}`, {
+      method: 'POST',
+      headers: trustedHostHeaders('GET', '/api/sessions', handle.port),
+    });
+    expect(wrongRoute.status).toBe(401);
+    expect(mutations).toBe(1);
+
+    const rotatedSecret = 'test-ipc-secret-rotated-deadbeef';
+    setIpcAuthSecret(rotatedSecret);
+    const staleSecret = await fetch(`${base}/api/sessions`, {
+      headers: trustedHostHeaders('GET', '/api/sessions', handle.port),
+    });
+    expect(staleSecret.status).toBe(401);
+    const currentSecret = await fetch(`${base}/api/sessions`, {
+      headers: trustedHostHeaders('GET', '/api/sessions', handle.port, rotatedSecret),
+    });
+    expect(currentSecret.status).toBe(200);
   });
 });
 
@@ -468,6 +534,53 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
 });
 
 describe('POST /api/sessions/:sessionId/resume', () => {
+  it('rejects a managed VC receiver without reactivating or waking it', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-'));
+    const prevConfigDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init();
+      workerPool.setActiveSessionsRegistry(registry);
+
+      const session = sessionStore.createSession('oc_listener', 'oc_listener', '[Meeting] meeting-42', 'group');
+      session.larkAppId = '';
+      session.scope = 'chat';
+      session.cliId = 'codex' as any;
+      session.workingDir = process.cwd();
+      session.vcMeetingReceiver = {
+        listenerAppId: 'listener-app',
+        meetingId: 'meeting-42',
+        memberId: 'member-agent',
+        memberEpoch: 7,
+      };
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(
+        `http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume?wake=1`,
+        { method: 'POST' },
+      );
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        ok: false,
+        error: 'vc_receiver_managed',
+      });
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
+      expect(registry.size).toBe(0);
+      expect(forkSpy).not.toHaveBeenCalled();
+    } finally {
+      forkSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('wakes a resumed session immediately when wake=1 is set', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-'));
     const prevDataDir = process.env.SESSION_DATA_DIR;

@@ -87,6 +87,7 @@ import {
   applyVcMeetingMemberProjection,
   completeVcMeetingDelivery,
   failVcMeetingDelivery,
+  markVcMeetingDeliveryAmbiguous,
   markVcMeetingDeliveryDispatched,
 } from '../src/services/vc-meeting-delivery-store.js';
 import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
@@ -857,6 +858,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     ds.session.vcMeetingImTurnOrigins = { om_human_a: origin };
     const msg = {
       ...finalOutputMsg(),
+      content: 'safe body <at id="ou_injected">Injected</at>',
       turnId: 'om_human_a',
       lastUuid: 'bridge-a',
     };
@@ -869,7 +871,13 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply.mock.calls[0][5]).toMatchObject({
       quoteMessageId: 'om_human_a',
       uuid: expect.stringMatching(/^vcp_[0-9a-f]+$/),
+      sourceSessionId: ds.session.sessionId,
+      suppressHook: true,
     });
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    expect(cardJson).not.toContain('ou_human_a');
+    expect(cardJson).not.toContain('<at');
+    expect(cardJson).toContain('＜at');
     const providerUuid = sessionReply.mock.calls[0][5].uuid;
     expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
       listenerAppId: origin.listenerAppId,
@@ -988,11 +996,95 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][5]).toMatchObject({
+      uuid: expect.stringMatching(/^vcp_[0-9a-f]+$/),
+      sourceSessionId: ds.session.sessionId,
+      suppressHook: true,
+    });
     expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
       listenerAppId: 'listener-app',
       meetingId: 'meeting-1',
       targetChatId: ds.chatId,
     })).toEqual(['om_meeting_fallback']);
+  });
+
+  it('reuses one provider UUID when a listener reply is accepted before crash reconciliation', async () => {
+    const providerMessages = new Map<string, string>();
+    let crashAfterFirstAccept = true;
+    const sessionReply = vi.fn(async (...args: any[]) => {
+      const uuid = args[5]?.uuid as string;
+      expect(uuid).toMatch(/^vcp_[0-9a-f]+$/);
+      const messageId = providerMessages.get(uuid) ?? 'om_provider_once';
+      providerMessages.set(uuid, messageId);
+      if (crashAfterFirstAccept) {
+        crashAfterFirstAccept = false;
+        throw new Error('simulated daemon crash after provider accepted UUID');
+      }
+      return messageId;
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1',
+      memberId: 'member-1', memberEpoch: 1,
+    };
+    seedReceiverReceipt('listener_thread');
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    const first = {
+      ...finalOutputMsg(),
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+      lastUuid: 'bridge-attempt-1',
+    };
+    __testOnly_deliverFinalOutput(ds, first, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+
+    const deliveryKey = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1',
+      memberId: 'member-1', memberEpoch: 1,
+      deliveryKey: 'delivery-stable-key',
+    };
+    expect(markVcMeetingDeliveryAmbiguous('/tmp/test-sessions', deliveryKey, {
+      workerGeneration: 1,
+      dispatchAttempt: 1,
+    })).toMatchObject({ ok: true, receipt: { status: 'ambiguous' } });
+    expect(markVcMeetingDeliveryDispatched('/tmp/test-sessions', deliveryKey, {
+      receiverBootId: 'receiver-boot-2',
+      workerGeneration: 2,
+    })).toMatchObject({ ok: true, receipt: { dispatchAttempt: 2 } });
+
+    __testOnly_deliverFinalOutput(ds, {
+      ...first,
+      content: 'changed replay answer must not create another effect',
+      dispatchAttempt: 2,
+      lastUuid: 'bridge-attempt-2',
+    }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    const firstUuid = sessionReply.mock.calls[0][5].uuid;
+    expect(sessionReply.mock.calls[1][5].uuid).toBe(firstUuid);
+    expect(sessionReply.mock.calls[0][5]).toMatchObject({ suppressHook: true });
+    expect(sessionReply.mock.calls[1][5]).toMatchObject({ suppressHook: true });
+    expect(providerMessages).toEqual(new Map([[firstUuid, 'om_provider_once']]));
+    expect(listVcMeetingActions('/tmp/test-sessions', {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+    })).toEqual([
+      expect.objectContaining({
+        status: 'succeeded',
+        providerKey: firstUuid,
+        externalRefs: { messageId: 'om_provider_once' },
+      }),
+    ]);
   });
 
   it('does not emit a delayed final output after the delivery failed terminally', async () => {
@@ -1266,7 +1358,7 @@ describe('Worker turn_terminal routing', () => {
     expect(ds.suppressedFinalOutputTurns.get('delivery-stable-key')).toBe(2);
   });
 
-  it('suppresses streaming, TUI, and diagnostic Lark UI during a silent receiver attempt', async () => {
+  it('suppresses non-final streaming, TUI, and diagnostic UI for a listener_thread receiver', async () => {
     const ds = makeDs();
     ds.scope = 'chat';
     ds.session.scope = 'chat';
@@ -1277,7 +1369,7 @@ describe('Worker turn_terminal routing', () => {
       memberEpoch: 1,
     };
     ds.suppressedFinalOutputTurns = new Map([['delivery-stable-key', 1]]);
-    seedSilentReceiverReceipt();
+    seedReceiverReceipt('listener_thread');
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -1392,6 +1484,17 @@ describe('Worker turn_terminal routing', () => {
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     (ds.worker as any).emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'live-capability',
+      turnId: 'om_live',
+    } satisfies Extract<WorkerToDaemon, { type: 'managed_turn_origin' }>);
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'live-capability',
+      turnId: 'om_live',
+    });
+
+    (ds.worker as any).emit('message', {
       type: 'claude_exit', code: 9, signal: 'SIGKILL',
     } satisfies Extract<WorkerToDaemon, { type: 'claude_exit' }>);
     await Promise.resolve();
@@ -1402,5 +1505,41 @@ describe('Worker turn_terminal routing', () => {
       code: 9,
       signal: 'SIGKILL',
     });
+    expect(ds.managedTurnOrigin).toBeUndefined();
+  });
+
+  it('ignores stale-worker CLI exit authority changes after replacement', async () => {
+    const ds = makeDs();
+    const oldWorker = ds.worker as any;
+    const replacementWorker = makeDs().worker as any;
+    const onCliExit = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onCliExit,
+    });
+    __testOnly_setupWorkerHandlers(ds, oldWorker);
+    ds.worker = replacementWorker;
+    __testOnly_setupWorkerHandlers(ds, replacementWorker);
+
+    replacementWorker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'replacement-capability',
+      turnId: 'om_replacement',
+    } satisfies Extract<WorkerToDaemon, { type: 'managed_turn_origin' }>);
+
+    oldWorker.emit('message', {
+      type: 'claude_exit', code: 9, signal: 'SIGKILL',
+    } satisfies Extract<WorkerToDaemon, { type: 'claude_exit' }>);
+    await Promise.resolve();
+
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'replacement-capability',
+      turnId: 'om_replacement',
+    });
+    expect(onCliExit).not.toHaveBeenCalled();
   });
 });

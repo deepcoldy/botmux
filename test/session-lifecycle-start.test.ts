@@ -237,6 +237,123 @@ describe('Codex App clean-input feature gate', () => {
     expect(init.turnId).toBe('om_on');
   });
 
+  it('keeps clean input and durable metadata atomic on a cold fork', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+    const ds = makeDs();
+    forkWorker(ds, payload, { turnId: 'delivery-1', dispatchAttempt: 4 });
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      prompt: payload.content,
+      promptCodexAppInput: { text: 'clean', clientUserMessageId: 'delivery-1' },
+      turnId: 'delivery-1',
+      dispatchAttempt: 4,
+    }));
+  });
+
+  it('resolves explicit meeting IM origin while keeping the clean live sidecar', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    const origin = {
+      listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member',
+      memberEpoch: 1, agentAppId: 'agent', ownerBootId: 'boot', ownerEpoch: 1,
+      membershipGeneration: 1, sinkOwnerGeneration: 1,
+      receiverSessionId: ds.session.sessionId, larkMessageId: 'om_vc_im',
+    };
+    ds.session.vcMeetingImTurnOrigins = { om_vc_im: origin };
+
+    expect(sendWorkerInput(ds, payload, 'om_vc_im')).toBe(true);
+    expect(worker.send).toHaveBeenCalledWith({
+      type: 'message',
+      content: payload.content,
+      codexAppInput: { text: 'clean', clientUserMessageId: 'om_vc_im' },
+      turnId: 'om_vc_im',
+      vcMeetingImTurnOrigin: origin,
+    });
+  });
+
+  it('resolves explicit meeting IM origin while keeping the clean cold-fork sidecar', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+    const ds = makeDs();
+    const origin = {
+      listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member',
+      memberEpoch: 1, agentAppId: 'agent', ownerBootId: 'boot', ownerEpoch: 1,
+      membershipGeneration: 1, sinkOwnerGeneration: 1,
+      receiverSessionId: ds.session.sessionId, larkMessageId: 'om_vc_cold',
+    };
+    ds.session.vcMeetingImTurnOrigins = { om_vc_cold: origin };
+
+    forkWorker(ds, payload, { resume: true, turnId: 'om_vc_cold' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      prompt: payload.content,
+      promptCodexAppInput: { text: 'clean', clientUserMessageId: 'om_vc_cold' },
+      turnId: 'om_vc_cold',
+      vcMeetingImTurnOrigin: origin,
+    }));
+  });
+
+  it('does not re-attribute an empty restore to the previous turn or its meeting authority', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+    const ds = makeDs({
+      currentReplyTarget: {
+        rootMessageId: 'om_root',
+        turnId: 'om_previous_vc',
+        updatedAt: new Date().toISOString(),
+      },
+      managedTurnOrigin: {
+        capability: 'previous-capability',
+        turnId: 'om_previous_vc',
+      },
+    });
+    const origin = {
+      listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member',
+      memberEpoch: 1, agentAppId: 'agent', ownerBootId: 'boot', ownerEpoch: 1,
+      membershipGeneration: 1, sinkOwnerGeneration: 1,
+      receiverSessionId: ds.session.sessionId, larkMessageId: 'om_previous_vc',
+    };
+    ds.session.vcMeetingImTurnOrigins = { om_previous_vc: origin };
+
+    forkWorker(ds, '', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init.prompt).toBe('');
+    expect(init.turnId).toBeUndefined();
+    expect(init.vcMeetingImTurnOrigin).toBeUndefined();
+    expect(init).not.toHaveProperty('promptCodexAppInput');
+    expect(ds.managedTurnOrigin).toBeUndefined();
+  });
+
+  it('keeps previous-turn attribution fallback for a non-empty accepted prompt', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+    const ds = makeDs({
+      currentReplyTarget: {
+        rootMessageId: 'om_root',
+        turnId: 'om_current_vc',
+        updatedAt: new Date().toISOString(),
+      },
+    });
+    const origin = {
+      listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member',
+      memberEpoch: 1, agentAppId: 'agent', ownerBootId: 'boot', ownerEpoch: 1,
+      membershipGeneration: 1, sinkOwnerGeneration: 1,
+      receiverSessionId: ds.session.sessionId, larkMessageId: 'om_current_vc',
+    };
+    ds.session.vcMeetingImTurnOrigins = { om_current_vc: origin };
+
+    forkWorker(ds, payload, { resume: true });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      prompt: payload.content,
+      promptCodexAppInput: { text: 'clean', clientUserMessageId: 'om_current_vc' },
+      turnId: 'om_current_vc',
+      vcMeetingImTurnOrigin: origin,
+    }));
+  });
+
   it('starts an old queued activation without a sidecar and a modern one with exactly one', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
     const oldPayload = applyQueuedCodexAppLegacyFallback({
@@ -388,6 +505,167 @@ describe('session.start lifecycle integration', () => {
   });
 });
 
+describe('managed turn authority worker generations', () => {
+  it('revokes the exact live capability at terminal and leaves a rotated turn untouched', async () => {
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'terminal-capability',
+      turnId: 'turn-terminal',
+    });
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-terminal',
+      status: 'completed',
+    });
+    await vi.waitFor(() => expect(ds.managedTurnOrigin).toBeUndefined());
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'next-capability',
+      turnId: 'turn-next',
+    });
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-terminal',
+      status: 'completed',
+    });
+    await Promise.resolve();
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'next-capability',
+      turnId: 'turn-next',
+    });
+  });
+
+  it('revokes a live origin across an intentional CLI restart and accepts only the next turn token', () => {
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'before-restart',
+      turnId: 'turn-before-restart',
+      dispatchAttempt: 4,
+    });
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'before-restart',
+      turnId: 'turn-before-restart',
+      dispatchAttempt: 4,
+    });
+
+    // Intentional restart keeps the Node worker alive, so this explicit
+    // message is the only host-side revocation edge.
+    worker.emit('message', {
+      type: 'managed_turn_origin_revoked',
+      sessionId: ds.session.sessionId,
+      capability: 'before-restart',
+      turnId: 'turn-before-restart',
+      dispatchAttempt: 4,
+    });
+    expect(ds.managedTurnOrigin).toBeUndefined();
+
+    // The first real turn on the replacement CLI rotates/re-publishes.
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'after-restart',
+      turnId: 'turn-after-restart',
+      dispatchAttempt: 5,
+    });
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'after-restart',
+      turnId: 'turn-after-restart',
+      dispatchAttempt: 5,
+    });
+
+    // A late duplicate revoke for the old token cannot erase the new turn.
+    worker.emit('message', {
+      type: 'managed_turn_origin_revoked',
+      sessionId: ds.session.sessionId,
+      capability: 'before-restart',
+      turnId: 'turn-before-restart',
+      dispatchAttempt: 4,
+    });
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'after-restart',
+      turnId: 'turn-after-restart',
+      dispatchAttempt: 5,
+    });
+  });
+
+  it('clears authority on refork and ignores a stale worker announcement', () => {
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    firstWorker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'first-capability',
+      turnId: 'turn-first',
+    });
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'first-capability',
+      turnId: 'turn-first',
+    });
+
+    forkWorker(ds, 'second', false);
+    const secondWorker = forkMock.mock.results.at(-1)!.value;
+    expect(ds.managedTurnOrigin).toBeUndefined();
+
+    firstWorker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'stale-capability',
+      turnId: 'turn-stale',
+    });
+    expect(ds.managedTurnOrigin).toBeUndefined();
+
+    secondWorker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'second-capability',
+      turnId: 'turn-second',
+      dispatchAttempt: 2,
+    });
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'second-capability',
+      turnId: 'turn-second',
+      dispatchAttempt: 2,
+    });
+
+    firstWorker.emit('message', {
+      type: 'managed_turn_origin_revoked',
+      sessionId: ds.session.sessionId,
+      capability: 'first-capability',
+      turnId: 'turn-first',
+    });
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'second-capability',
+      turnId: 'turn-second',
+      dispatchAttempt: 2,
+    });
+
+    firstWorker.emit('exit', 0);
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'second-capability',
+      turnId: 'turn-second',
+      dispatchAttempt: 2,
+    });
+
+    secondWorker.emit('exit', 0);
+    expect(ds.managedTurnOrigin).toBeUndefined();
+  });
+});
+
 describe('worker startup failure delivery', () => {
   it('keeps the clean init payload and reports a structured failure once to its exact originating turn', async () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
@@ -498,6 +776,9 @@ describe('worker startup failure delivery', () => {
       'text',
       'app_test',
       'turn-start',
+      // scopedReply now forwards an (empty) opts arg after the vc-agent merge
+      // added beforeQuoteFallback support; the startup-failure delivery is
+      // otherwise unchanged.
       undefined,
     );
   });
@@ -568,15 +849,15 @@ describe('worker startup failure delivery', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
-  it('still surfaces a VC receiver IM-turn (no dispatchAttempt) fork error exactly once', async () => {
+  it('keeps a VC receiver IM-turn fork error out of auxiliary Lark UI', async () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
     (ds.session as unknown as { vcMeetingReceiver: unknown }).vcMeetingReceiver = {
       meetingId: 'm1', memberId: 'mem1', memberEpoch: 1,
     };
-    // A listener-group @agent IM turn has no durable dispatchAttempt; the gate is
-    // precise, so its startup failure is still surfaced (not blanket-suppressed).
+    // A listener-group @agent IM turn has no durable dispatchAttempt, but a
+    // startup diagnostic is not the exact authorized reply action.
     forkWorker(ds, 'deliver', { turnId: 'im-turn' });
     const worker = forkMock.mock.results.at(-1)!.value;
 
@@ -584,7 +865,7 @@ describe('worker startup failure delivery', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
   it('posts a generic fallback when the worker exits before ready or structured error', async () => {

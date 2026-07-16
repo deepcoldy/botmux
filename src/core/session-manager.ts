@@ -1510,15 +1510,30 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
  *                          a fresh thread session); refuse rather than clobber
  *   - 'adopt_unsupported' — adopt sessions are torn down by /close and have
  *                          no resume semantics
+ *   - 'vc_receiver_managed' — dedicated meeting receivers are reconstructed
+ *                          through the meeting membership/hub lifecycle; a
+ *                          manual resume could resurrect a stale member epoch
  */
 export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported'; activeSessionId?: string }> {
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'vc_receiver_managed'; activeSessionId?: string }> {
   const session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
+
+  // A dedicated VC receiver is not an ordinary chat conversation. Its
+  // identity is fenced by (meeting, member, epoch) and its active-map slot is
+  // reconstructed by the meeting hub/membership lifecycle. Reactivating a
+  // closed receiver through the generic dashboard/card/CLI path would bypass
+  // that ownership check, potentially revive a stale epoch, and (before the
+  // dedicated-key fix) collapse it into the listener chat's ordinary slot.
+  // Keep it closed and let the authoritative meeting lifecycle create or
+  // recover the correct receiver binding.
+  if (session.vcMeetingReceiver) {
+    return { ok: false, error: 'vc_receiver_managed' };
+  }
 
   // Adopt sessions don't survive /close — the user's tmux pane and original
   // CLI pid have already moved on, and bringing the bridge back without a live

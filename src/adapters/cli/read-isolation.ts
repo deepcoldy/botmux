@@ -493,9 +493,10 @@ export interface LinuxReadIsolationInput {
  * SAME cross-bot-sensitive set as macOS, but the per-bot classes (other bots'
  * BOT_HOMEs / lark configs / session stores / identities / send-creds / attachment
  * buckets) are enumerated PER SIBLING instead of wholesale-denied + regex-matched.
- * The bot's OWN slice is simply never masked (so it stays readable through the
- * overlay), and its BOT_HOME is additionally bound real+writable via
- * `ownReadWritePaths` so its redirected CLI data persists — matching macOS.
+ * The read-isolation-specific set does not mask the bot's OWN slice. The file
+ * sandbox still masks BOTMUX_HOME wholesale as its mandatory credential
+ * boundary, so `ownReadWritePaths` re-opens only this bot's BOT_HOME after that
+ * parent mask; the worker separately re-masks send-cred.json.
  *
  * Pure: the worker resolves the impure inputs (sibling list, sidecar glob, realpath).
  * NOTE: keep the `shared` set in lock-step with {@link buildV2DenyPaths} — the
@@ -506,10 +507,10 @@ export function buildLinuxReadIsolationMasks(input: LinuxReadIsolationInput): {
   /** Paths to blank inside bwrap (prepareSandbox stat-classifies: dir→tmpfs,
    *  file→empty ro-bind, missing→skipped). Feed as prepareSandbox.hidePaths. */
   hidePaths: string[];
-  /** The bot's OWN BOT_HOME — bound REAL + writable (feed as authPaths) so the
+  /** The bot's OWN BOT_HOME — bound REAL + writable (feed as
+   *  prepareSandbox.trustedWritablePaths) so the
    *  redirected CLI data (CLAUDE_CONFIG_DIR/CODEX_HOME) persists and escapes the
-   *  write overlay. Its parent `bots/` is enumerated per-sibling (NOT wholesale-
-   *  masked) so this real bind survives. */
+   *  write overlay after the mandatory BOTMUX_HOME mask. */
   ownReadWritePaths: string[];
   /** The bot's OWN slices that sit UNDER a wholesale-masked parent and must be
    *  re-exposed read-only AFTER the masks (feed as readonlyRoots — bound after the
@@ -551,8 +552,9 @@ export function buildLinuxReadIsolationMasks(input: LinuxReadIsolationInput): {
 
   // Per-sibling enumeration for the classes macOS covers by REGEX (bwrap has none):
   // other bots' BOT_HOMEs, lark configs, session stores, identities, send-creds. Own
-  // BOT_HOME + lark + session stay UNMASKED (readable via the overlay lower; BOT_HOME
-  // also bound real+writable below). identities/send-cred get NO own carve-out — the
+  // BOT_HOME + lark + session stay UNMASKED by this per-bot set (the outer file
+  // sandbox still masks BOTMUX_HOME wholesale and re-opens only own BOT_HOME).
+  // identities/send-cred get NO own carve-out — the
   // CLI never reads them (daemon-side) — so the own ones are masked too.
   const perBot: string[] = [];
   for (const raw of input.siblingAppIds) {

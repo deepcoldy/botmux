@@ -289,6 +289,7 @@ function makeDeps(over: Partial<VcMeetingConsumerProfilesApiDeps> = {}): VcMeeti
     onlineBotName: vi.fn(() => 'agent-online-name'),
     isOnline: vi.fn(() => true),
     adapterReliableTurnTerminal: vi.fn(() => true),
+    managedSideEffectIsolation: vi.fn(() => true),
     reloadDaemons: vi.fn(async () => {}),
     ...over,
   };
@@ -306,7 +307,7 @@ function putRequest(over: Record<string, unknown> = {}): Record<string, unknown>
 }
 
 describe('buildVcMeetingAgentOptions', () => {
-  it('maps registry bots to the 6-field option DTO (listener not excluded)', () => {
+  it('maps registry bots to the isolation-aware option DTO (listener not excluded)', () => {
     const deps = makeDeps();
     expect(buildVcMeetingAgentOptions(deps)).toEqual([{
       appId: 'app_agent',
@@ -315,6 +316,7 @@ describe('buildVcMeetingAgentOptions', () => {
       online: true,
       workingDirReady: true,
       reliableTurnTerminal: true,
+      managedSideEffectIsolation: true,
     }]);
   });
 
@@ -333,6 +335,7 @@ describe('buildVcMeetingAgentOptions', () => {
       online: false,
       workingDirReady: false,
       reliableTurnTerminal: false,
+      managedSideEffectIsolation: true,
     }]);
   });
 
@@ -362,6 +365,7 @@ function agentOption(
     online: true,
     workingDirReady: true,
     reliableTurnTerminal: true,
+    managedSideEffectIsolation: true,
     ...over,
   };
 }
@@ -378,11 +382,12 @@ describe('default VC consumer profile bootstrap', () => {
     const options = [
       agentOption('app_no_dir', { workingDirReady: false }),
       agentOption('app_no_terminal', { reliableTurnTerminal: false }),
+      agentOption('app_no_isolation', { managedSideEffectIsolation: false }),
       agentOption('app_offline_ready', { online: false }),
     ];
     expect(selectVcMeetingDefaultConsumerAgent('app_no_dir', options)?.appId)
       .toBe('app_offline_ready');
-    expect(selectVcMeetingDefaultConsumerAgent('x', options.slice(0, 2))).toBeUndefined();
+    expect(selectVcMeetingDefaultConsumerAgent('x', options.slice(0, 3))).toBeUndefined();
   });
 
   it('seeds a visible full-capability minutes profile on the first enable', () => {

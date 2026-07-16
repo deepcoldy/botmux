@@ -84,8 +84,10 @@ import {
 } from '../services/vc-meeting-send-policy.js';
 import {
   finishVcMeetingImReply,
+  prepareVcMeetingDeliveryReply,
   prepareVcMeetingImReply,
 } from '../services/vc-meeting-im-reply.js';
+import { neutralizeLarkAtTags } from '../services/send-policy.js';
 import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-message-store.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 
@@ -110,6 +112,19 @@ const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
 
 // ─── Callbacks set by daemon at startup ─────────────────────────────────────
 
+export interface WorkerSessionReplyOptions {
+  uuid?: string;
+  quoteMessageId?: string;
+  beforeQuoteFallback?: () => void | Promise<void>;
+  /** Do not fan meeting-derived content out through user-configured outbound
+   * hooks. Dedicated VC replies have one audited external effect: Lark. */
+  suppressHook?: boolean;
+  /** Exact daemon session that produced this output. Dedicated VC receivers
+   * share a visible chat anchor with ordinary sessions, so the anchor alone
+   * cannot identify the transcript/lifecycle owner. */
+  sourceSessionId?: string;
+}
+
 export interface WorkerPoolCallbacks {
   sessionReply: (
     rootId: string,
@@ -117,11 +132,7 @@ export interface WorkerPoolCallbacks {
     msgType?: string,
     larkAppId?: string,
     turnId?: string,
-    opts?: {
-      uuid?: string;
-      quoteMessageId?: string;
-      beforeQuoteFallback?: () => void | Promise<void>;
-    },
+    opts?: WorkerSessionReplyOptions,
   ) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
@@ -500,6 +511,10 @@ export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefine
 }
 
 function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
+  // Dedicated VC receivers keep limit state for dashboard/audit only. A timer
+  // must never revive or mutate an old/manual Lark card after the synchronous
+  // screen_update path has already suppressed auxiliary UI.
+  if (ds.session.vcMeetingReceiver) return;
   if (ds.lastScreenStatus !== 'limited') return;
   const port = ds.workerPort ?? ds.session.webPort;
   if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !port) return;
@@ -676,6 +691,9 @@ export async function postFreshStreamingCard(
   ds: DaemonSession,
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>,
 ): Promise<boolean> {
+  // Receiver terminals can contain meeting-derived private context. Never
+  // publish one into the listener chat as a streaming-card side channel.
+  if (ds.session.vcMeetingReceiver) return false;
   if (isDocNativeSession(ds)) return false;
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port) return false;
@@ -1229,6 +1247,7 @@ export function killWorker(ds: DaemonSession): void {
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
+  ds.workerViewToken = null;
 }
 
 /**
@@ -1302,6 +1321,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
+  ds.workerViewToken = null;
   // Screen state describes the process we just stopped. Keeping it would make
   // the dashboard hydrate this process-less logical session as idle/working.
   ds.lastScreenStatus = undefined;
@@ -1810,6 +1830,15 @@ export function forkWorker(
     resume = resumeOrTurnId;
   }
 
+  // An empty prompt is a pure worker reattach/restore, not a newly accepted
+  // user turn. Never inherit the previous reply target in that case: doing so
+  // would re-publish stale per-turn authority (notably an explicit meeting IM
+  // origin) into a fresh worker lifetime after a daemon restart. Non-empty
+  // prompts keep the historical fallback for callers that accepted a turn
+  // before they learned to pass its id explicitly.
+  const initAttributionTurnId = initTurnId
+    ?? (prompt.length > 0 ? ds.currentReplyTarget?.turnId : undefined);
+
   // A fork() whose cwd no longer exists emits an unhandled 'error' (spawn
   // ENOENT) that crashes the WHOLE daemon (→ pm2 crash-loop). Fall back to
   // home so a stale session workingDir can never take the daemon down.
@@ -1874,6 +1903,7 @@ export function forkWorker(
     ds.worker = null;
     ds.workerPort = null;
     ds.workerToken = null;
+    ds.workerViewToken = null;
   }
 
   // Re-establishing a worker ends the cold-resume-suspended state: clear the
@@ -1932,12 +1962,12 @@ export function forkWorker(
     logger.error(`[${t}] Worker fork error: ${reason}`);
     if (startupState.failureNotified) return;
     startupState.failureNotified = true;
-    // A durable VC meeting delivery fork failure is fenced to the receipt/lease
-    // chain (workerGeneration → ambiguous → retry); replying here would bypass
-    // that boundary and could post on a silent delivery.
-    if (ds.session.vcMeetingReceiver && initDispatchAttempt !== undefined) {
+    // A dedicated VC receiver has no auxiliary Lark output channel. Durable
+    // failures stay on the receipt/lease chain, and exact IM turns may only
+    // produce their ledgered final reply — never a fork diagnostic.
+    if (ds.session.vcMeetingReceiver) {
       logger.info(
-        `[${t}] VC durable fork failure left to receipt/lease recovery `
+        `[${t}] VC receiver fork failure kept out of auxiliary Lark UI `
         + `turn=${initTurnId?.slice(0, 12) ?? '-'} attempt=${initDispatchAttempt}: ${reason}`,
       );
       return;
@@ -1954,6 +1984,9 @@ export function forkWorker(
       'text',
       ds.larkAppId,
       fallbackTurnId(ds, initTurnId),
+      ds.session.vcMeetingReceiver
+        ? { sourceSessionId: ds.session.sessionId }
+        : undefined,
     ).catch(replyErr => logger.error(`[${t}] Failed to deliver worker fork error to Lark: ${replyErr}`));
   });
 
@@ -1979,7 +2012,7 @@ export function forkWorker(
   const promptCodexAppInput = codexAppInputForSession(
     ds,
     promptPayload.codexAppInput,
-    initTurnId ?? ds.currentReplyTarget?.turnId,
+    initAttributionTurnId,
   );
   const initMsg: DaemonToWorker = {
     type: 'init',
@@ -2038,11 +2071,11 @@ export function forkWorker(
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
-    turnId: initTurnId ?? ds.currentReplyTarget?.turnId,
+    turnId: initAttributionTurnId,
     dispatchAttempt: initDispatchAttempt,
     vcMeetingImTurnOrigin: resolveVcMeetingImTurnOrigin(
       ds.session,
-      initTurnId ?? ds.currentReplyTarget?.turnId,
+      initAttributionTurnId,
     ),
     pluginBindings: botCfg.plugins,
     skillPolicy: botCfg.skills,
@@ -2113,6 +2146,11 @@ function setupWorkerHandlers(
   const t = tag(ds);
   const workerGeneration = (ds.workerGeneration ?? 0) + 1;
   ds.workerGeneration = workerGeneration;
+  // Managed turn authority is issued by one concrete worker lifetime. A
+  // replacement must advertise a fresh capability before daemon-mediated
+  // exits may use it; carrying the old value across a restore/refork would
+  // let stale per-turn authority escape its generation.
+  ds.managedTurnOrigin = undefined;
   // Source authorization belongs to one worker lifetime. A replacement worker
   // must announce its own Hermes sources before any stamped final_output is
   // trusted; `/clear` rebinds within the same lifetime accumulate afterwards.
@@ -2126,25 +2164,40 @@ function setupWorkerHandlers(
     content: string,
     msgType?: string,
     turnId?: string,
-    opts?: {
-      uuid?: string;
-      quoteMessageId?: string;
-      beforeQuoteFallback?: () => void | Promise<void>;
-    },
+    opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
   ) => cb.sessionReply(
     sessionAnchorId(ds),
     content,
     msgType,
     ds.larkAppId,
     fallbackTurnId(ds, turnId),
-    opts,
+    ds.session.vcMeetingReceiver
+      ? { ...opts, sourceSessionId: ds.session.sessionId }
+      : opts,
   );
-  const managedUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean => {
+  const ordinaryManagedSuppression = (
+    turnId?: string,
+    dispatchAttempt?: number,
+  ): boolean => {
+    const armedThrough = turnId ? ds.suppressedFinalOutputTurns?.get(turnId) : undefined;
+    return dispatchAttempt !== undefined
+      && armedThrough !== undefined
+      && dispatchAttempt <= armedThrough;
+  };
+  /** Auxiliary worker UI is never an authorized output channel for a dedicated
+   * VC receiver. Dashboard/audit state is still updated before these guards. */
+  const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean => {
+    if (ds.session.vcMeetingReceiver) return true;
+    return ordinaryManagedSuppression(turnId, dispatchAttempt);
+  };
+  /** final_output is the sole exception: listener_thread and exact IM replies
+   * may proceed into the durable action ledger; silent/stale attempts do not. */
+  const managedFinalOutputSuppressed = (
+    turnId?: string,
+    dispatchAttempt?: number,
+  ): boolean => {
     if (!ds.session.vcMeetingReceiver) {
-      const armedThrough = turnId ? ds.suppressedFinalOutputTurns?.get(turnId) : undefined;
-      return dispatchAttempt !== undefined
-        && armedThrough !== undefined
-        && dispatchAttempt <= armedThrough;
+      return ordinaryManagedSuppression(turnId, dispatchAttempt);
     }
     // Resolve every Lark-facing worker event against durable origin state. The
     // receipt freezes responseMode, so terminal→idle updates and daemon restore
@@ -2175,9 +2228,9 @@ function setupWorkerHandlers(
     // (marked ambiguous and retried under the side-effect boundary); a direct
     // sessionReply here would bypass that and could post on a silent delivery.
     // Ordinary IM turns and non-receiver sessions still notify exactly once.
-    if (ds.session.vcMeetingReceiver && dispatchAttempt !== undefined) {
+    if (managedAuxUiSuppressed(turnId, dispatchAttempt)) {
       logger.info(
-        `[${t}] VC durable startup failure left to receipt/lease recovery `
+        `[${t}] VC receiver startup failure kept out of auxiliary Lark UI `
         + `turn=${turnId?.slice(0, 12) ?? '-'} attempt=${dispatchAttempt}: ${reason}`,
       );
       return;
@@ -2207,12 +2260,13 @@ function setupWorkerHandlers(
         startupState.ready = true;
         ds.workerPort = msg.port;
         ds.workerToken = msg.token;
+        ds.workerViewToken = msg.viewToken ?? null;
         // Persist port so it can be reused after daemon restart
         ds.session.webPort = msg.port;
         sessionStore.updateSession(ds.session);
         const readOnlyUrl = buildTerminalUrl(ds);
         const writeUrl = buildTerminalUrl(ds, { write: true });
-        logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl}`);
+        logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl.replace(/\?.*$/, '?viewToken=[redacted]')}`);
         if (ds.usageLimit) {
           ds.lastScreenStatus = 'limited';
           armUsageLimitRetryTimer(ds);
@@ -2226,8 +2280,8 @@ function setupWorkerHandlers(
           },
         });
 
-        if (managedUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
-          logger.info(`[${t}] Silent VC delivery — suppressing ready/streaming card output`);
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          logger.info(`[${t}] Managed VC receiver — suppressing ready/streaming card output`);
           break;
         }
 
@@ -2485,7 +2539,9 @@ function setupWorkerHandlers(
         // is known, so consumers exclude this session from native parsers
         // before its first positive-delta record exists.
         recordOwnershipForDaemonSession(ds);
-        if (!wasLocalCliOpenReady && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
+        if (!managedAuxUiSuppressed()
+          && !wasLocalCliOpenReady
+          && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
           scheduleLocalCliOpenReadinessPatch(ds);
         }
         break;
@@ -2542,7 +2598,7 @@ function setupWorkerHandlers(
           }
         }
 
-        if (managedUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
 
         // Bot opted out of the streaming card — dashboard SSE above already got
         // the status patch; just don't touch any Lark card.
@@ -2657,7 +2713,7 @@ function setupWorkerHandlers(
           content: ds.lastScreenContent ?? '',
         });
         persistStreamCardState(ds);
-        if (managedUiSuppressed()) break;
+        if (managedAuxUiSuppressed()) break;
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) break;
         const readUrl = buildTerminalUrl(ds);
@@ -2711,8 +2767,8 @@ function setupWorkerHandlers(
         // session.title; publishing this prompt description as `patch.title`
         // would temporarily overwrite a user-issued /rename until refresh.
         ds.currentTurnTitle = msg.description;
-        if (managedUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
-          logger.info(`[${t}] Silent VC delivery — TUI prompt kept in dashboard/audit only`);
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          logger.info(`[${t}] Managed VC receiver — TUI prompt kept in dashboard/audit only`);
           break;
         }
         try {
@@ -2737,6 +2793,11 @@ function setupWorkerHandlers(
       case 'tui_prompt_resolved': {
         // TUI prompt is no longer showing — update card if it exists
         logger.info(`[${t}] TUI prompt resolved${msg.selectedText ? `: ${msg.selectedText}` : ''}`);
+        if (managedAuxUiSuppressed()) {
+          ds.tuiPromptCardId = undefined;
+          ds.tuiPromptOptions = undefined;
+          break;
+        }
         if (ds.tuiPromptCardId) {
           const resolvedCard = buildTuiPromptResolvedCard(msg.selectedText ?? tr('card.action.tui_done', undefined, loc), loc);
           updateMessage(ds.larkAppId, ds.tuiPromptCardId, resolvedCard).catch(err =>
@@ -2750,6 +2811,14 @@ function setupWorkerHandlers(
       }
 
       case 'claude_exit': {
+        // CLI-generation authority must not outlive the concrete worker/CLI
+        // pair that issued it. A delayed message from a replaced Node worker
+        // must neither clear nor restart the replacement generation.
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored claude_exit from stale worker generation`);
+          break;
+        }
+        ds.managedTurnOrigin = undefined;
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} exited (code: ${msg.code}, signal: ${msg.signal})`);
         ds.hasHistory = true;
         try {
@@ -2762,7 +2831,7 @@ function setupWorkerHandlers(
         } catch (err: any) {
           logger.error(`[${t}] Failed to reconcile CLI exit generation ${workerGeneration}: ${err.message}`);
         }
-        const suppressExitUi = managedUiSuppressed(msg.turnId, msg.dispatchAttempt);
+        const suppressExitUi = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
 
         // Do NOT auto-restart in adopt mode — there's nothing to restart
         if (ds.adoptedFrom) {
@@ -2895,7 +2964,7 @@ function setupWorkerHandlers(
         });
         // Refresh the live streaming card (writable/AIO link) — parks a pending
         // flag when the card POST is still in-flight and flushes once it lands.
-        scheduleRiffAccessUrlPatch(ds);
+        if (!managedAuxUiSuppressed()) scheduleRiffAccessUrlPatch(ds);
         break;
       }
 
@@ -2942,7 +3011,7 @@ function setupWorkerHandlers(
           reason: 'user_notify',
           message: msg.message,
         });
-        if (managedUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         try {
           await scopedReply(msg.message, 'text', msg.turnId);
         } catch (err: any) {
@@ -2952,12 +3021,24 @@ function setupWorkerHandlers(
       }
 
       case 'turn_terminal': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored turn_terminal from stale worker generation`);
+          break;
+        }
         if (msg.sessionId !== ds.session.sessionId) {
           logger.warn(
             `[${t}] Dropped turn_terminal with mismatched sessionId ` +
             `(worker=${msg.sessionId}, daemon=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
           );
           break;
+        }
+        // Defense in depth: the worker sends a token-matched revoke before the
+        // terminal IPC, but an older/mixed worker must still lose authority at
+        // this exact terminal edge. Tuple-match prevents a late turn N event
+        // from clearing a capability already rotated for turn N+1.
+        if (ds.managedTurnOrigin?.turnId === msg.turnId
+          && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
+          ds.managedTurnOrigin = undefined;
         }
         try {
           await cb.onTurnTerminal?.(ds, msg, { workerGeneration });
@@ -2998,6 +3079,10 @@ function setupWorkerHandlers(
       }
 
       case 'managed_turn_origin': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored managed_turn_origin from stale worker generation`);
+          break;
+        }
         if (msg.sessionId !== ds.session.sessionId) {
           logger.warn(`[${t}] Dropped managed_turn_origin with mismatched sessionId`);
           break;
@@ -3012,6 +3097,33 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'managed_turn_origin_revoked': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored managed_turn_origin_revoked from stale worker generation`);
+          break;
+        }
+        if (msg.sessionId !== ds.session.sessionId) {
+          logger.warn(`[${t}] Dropped managed_turn_origin_revoked with mismatched sessionId`);
+          break;
+        }
+        // Same-worker IPC is ordered, but token-match as well so a delayed
+        // revoke can never clear authority already rotated by the next turn.
+        if (msg.capability
+          && ds.managedTurnOrigin?.capability
+          && ds.managedTurnOrigin.capability !== msg.capability) {
+          logger.warn(`[${t}] Ignored stale managed turn origin revoke after capability rotation`);
+          break;
+        }
+        if (!msg.capability && ds.managedTurnOrigin
+          && (ds.managedTurnOrigin.turnId !== msg.turnId
+            || ds.managedTurnOrigin.dispatchAttempt !== msg.dispatchAttempt)) {
+          logger.warn(`[${t}] Ignored unbound stale managed turn origin revoke`);
+          break;
+        }
+        ds.managedTurnOrigin = undefined;
+        break;
+      }
+
       case 'final_output': {
         // Adopt-bridge: worker harvested the assistant turn from Claude Code's
         // transcript JSONL and forwarded it to us. Dedup with a session-scoped
@@ -3020,7 +3132,7 @@ function setupWorkerHandlers(
         if (!msg.content || !msg.content.trim()) break;
         if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
         if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
-        if (managedUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+        if (managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt)) {
           logger.debug(`[${t}] final_output captured/discarded for silent turn ${msg.turnId.substring(0, 8)}`);
           break;
         }
@@ -3051,6 +3163,7 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored adopt_preamble from non-adopt worker`);
           break;
         }
+        if (managedAuxUiSuppressed(msg.turnId)) break;
         if (!msg.userText.trim() && !msg.assistantText.trim()) break;
         const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
         const cardJson = buildContextualReplyCard({
@@ -3087,10 +3200,12 @@ function setupWorkerHandlers(
     }
     // Clear the current child before notifying durable consumers. A callback
     // may schedule a retry; it must not observe/send to this dead IPC channel.
-    // A stale takeover worker never clears the replacement.
+    // A stale takeover worker never clears the replacement — during takeover the
+    // old worker's exit fires AFTER the new worker has been assigned.
     if (ds.worker === worker) {
       ds.worker = null;
       ds.workerPort = null;
+      ds.managedTurnOrigin = undefined;
     }
     try {
       const notified = cb.onWorkerExit?.(ds, {
@@ -3189,6 +3304,9 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   if (!list || list.length === 0) return;
   // Detach the batch first so a second idle edge can't double-flip it.
   ds.pendingAckReactions = [];
+  // A dedicated receiver has no progress-reaction channel. Clear any stale
+  // in-memory entries restored from an older build without touching Lark.
+  if (ds.session.vcMeetingReceiver) return;
   const silent = silentTurnReactions(ds);
   const doneEmoji = doneReactionEmojiFor(ds);
   for (const ack of list) {
@@ -3219,10 +3337,13 @@ function deliverFinalOutput(
   t: string,
   attempt: number,
 ): void {
+  const managedReceiver = !!ds.session.vcMeetingReceiver;
   // Wait Mode / HTTP Sync Override:
   // If this turn is being waited for by an HTTP webhook request, intercept the
   // output, resolve the Promise immediately, and DO NOT send it to Lark.
-  const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
+  // Dedicated receivers are structurally pinned to their audited listener
+  // action and may never be diverted into these generic host-side sinks.
+  const waitPromise = managedReceiver ? undefined : ds.pendingWaitPromises?.get(msg.turnId);
   if (waitPromise) {
     waitPromise.resolve(msg.content);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
@@ -3230,7 +3351,7 @@ function deliverFinalOutput(
     return;
   }
 
-  const asyncResult = ds.asyncTriggerResults?.get(msg.turnId);
+  const asyncResult = managedReceiver ? undefined : ds.asyncTriggerResults?.get(msg.turnId);
   if (asyncResult) {
     asyncResult.status = 'completed';
     asyncResult.content = msg.content;
@@ -3245,18 +3366,16 @@ function deliverFinalOutput(
     content: string,
     msgType?: string,
     turnId?: string,
-    opts?: {
-      uuid?: string;
-      quoteMessageId?: string;
-      beforeQuoteFallback?: () => void | Promise<void>;
-    },
+    opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
   ) => cb.sessionReply(
     sessionAnchorId(ds),
     content,
     msgType,
     ds.larkAppId,
     fallbackTurnId(ds, turnId),
-    opts,
+    ds.session.vcMeetingReceiver
+      ? { ...opts, sourceSessionId: ds.session.sessionId }
+      : opts,
   );
   setTimeout(async () => {
     // Guard: if the user closed the session (or it was torn down for any
@@ -3269,7 +3388,7 @@ function deliverFinalOutput(
     try {
       // 文档评论入口分流：本轮若来自飞书文档评论（/watch-comment / /subscribe-lark-doc），把正文
       // 发表为文档评论（而非飞书卡片），状态卡/占位卡仍留在飞书会话起点。
-      const docTurn = ds.docCommentTurns?.get(msg.turnId);
+      const docTurn = managedReceiver ? undefined : ds.docCommentTurns?.get(msg.turnId);
       if (docTurn) {
         // 嵌套回复到用户那条评论 thread（已挂在其下，无需再 ↪ 前缀）。这是兜底路径
         // （模型没显式 botmux send），默认 @ 回原评论人，仅首块加。
@@ -3349,16 +3468,27 @@ function deliverFinalOutput(
         && managedDecision.kind === 'listener_thread'
         ? managedDecision.meetingOwner
         : undefined;
-      const recipientOpenId = imOrigin?.replyTargetSenderOpenId
-        ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+      // Meeting-derived text is untrusted card markdown. A model-authored
+      // native <at> tag and the ordinary owner footer would both create a
+      // second addressing side effect outside the action ledger.
+      const safeAssistantText = managedReceiver
+        ? neutralizeLarkAtTags(msg.content)
+        : msg.content;
+      const safeUserText = managedReceiver && msg.userText !== undefined
+        ? neutralizeLarkAtTags(msg.userText)
+        : msg.userText;
+      const recipientOpenId = managedReceiver
+        ? undefined
+        : imOrigin?.replyTargetSenderOpenId
+          ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: msg.kind === 'local-turn-headless'
               ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
               : tr('card.local_turn', undefined, localeForBot(ds.larkAppId)),
-            userText: msg.kind === 'local-turn' ? msg.userText ?? '' : undefined,
-            assistantText: msg.content,
+            userText: msg.kind === 'local-turn' ? safeUserText ?? '' : undefined,
+            assistantText: safeAssistantText,
             assistantLabel: getCliDisplayName(effectiveCliId),
             recipientOpenId,
             brand: resolveBrandLabel(ds.larkAppId),
@@ -3367,7 +3497,7 @@ function deliverFinalOutput(
             localHomeLinkMode,
           })
         : buildMarkdownCard(
-            msg.content,
+            safeAssistantText,
             recipientOpenId,
             resolveBrandLabel(ds.larkAppId),
             localeForBot(ds.larkAppId),
@@ -3384,18 +3514,28 @@ function deliverFinalOutput(
       const preparedImReply = imOrigin
         ? prepareVcMeetingImReply(config.session.dataDir, imOrigin, proposedOutput)
         : undefined;
-      if (preparedImReply?.kind === 'conflict') {
+      const preparedDeliveryReply = !imOrigin
+        && listenerOutputOwner
+        && msg.dispatchAttempt !== undefined
+        ? prepareVcMeetingDeliveryReply(config.session.dataDir, {
+            receiverSessionId: ds.session.sessionId,
+            stableTurnId: msg.turnId,
+            dispatchAttempt: msg.dispatchAttempt,
+          }, proposedOutput)
+        : undefined;
+      const preparedListenerReply = preparedImReply ?? preparedDeliveryReply;
+      if (preparedListenerReply?.kind === 'conflict') {
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.error(
-          `[${t}] VC IM fallback suppressed (${preparedImReply.reason}) `
-          + `turn=${msg.turnId.substring(0, 8)}: ${preparedImReply.detail}`,
+          `[${t}] VC listener fallback suppressed (${preparedListenerReply.reason}) `
+          + `turn=${msg.turnId.substring(0, 8)}: ${preparedListenerReply.detail}`,
         );
         return;
       }
-      const canonicalOutput = preparedImReply?.canonicalOutput ?? proposedOutput;
-      if (preparedImReply?.outputMismatch) {
+      const canonicalOutput = preparedListenerReply?.canonicalOutput ?? proposedOutput;
+      if (preparedListenerReply?.outputMismatch) {
         logger.warn(
-          `[${t}] VC IM reply output_mismatch action=${preparedImReply.ref.actionId} `
+          `[${t}] VC listener reply output_mismatch action=${preparedListenerReply.ref.actionId} `
           + `turn=${msg.turnId}; reusing first canonical output`,
         );
       }
@@ -3421,11 +3561,11 @@ function deliverFinalOutput(
           );
         }
       };
-      if (preparedImReply?.kind === 'succeeded' && preparedImReply.messageId) {
-        recordPrimaryOutput(preparedImReply.messageId);
+      if (preparedListenerReply?.kind === 'succeeded' && preparedListenerReply.messageId) {
+        recordPrimaryOutput(preparedListenerReply.messageId);
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(
-          `[${t}] VC IM fallback replayed existing provider result `
+          `[${t}] VC listener fallback replayed existing provider result `
           + `(turn ${msg.turnId.substring(0, 8)})`,
         );
         return;
@@ -3439,17 +3579,21 @@ function deliverFinalOutput(
         canonicalOutput.content,
         canonicalOutput.msgType,
         msg.turnId,
-        preparedImReply
+        preparedListenerReply
           ? {
-              uuid: preparedImReply.providerKey,
+              uuid: preparedListenerReply.providerKey,
               quoteMessageId: canonicalOutput.quoteTargetId,
               beforeQuoteFallback: revalidateManagedSend,
+              // Managed output has one audited external effect (the Lark
+              // provider call). Never fan meeting content out to user hooks,
+              // including the first attempt and crash reconciliation replay.
+              suppressHook: true,
             }
           : undefined,
       );
       recordPrimaryOutput(messageId);
-      if (preparedImReply?.kind === 'send' || preparedImReply?.kind === 'succeeded') {
-        finishVcMeetingImReply(config.session.dataDir, preparedImReply.ref, messageId);
+      if (preparedListenerReply?.kind === 'send' || preparedListenerReply?.kind === 'succeeded') {
+        finishVcMeetingImReply(config.session.dataDir, preparedListenerReply.ref, messageId);
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
@@ -3512,6 +3656,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     ds.worker = null;
     ds.workerPort = null;
     ds.workerToken = null;
+    ds.workerViewToken = null;
   }
 
   // No ensureCliSkills — adopt mode attaches to an existing CLI session
