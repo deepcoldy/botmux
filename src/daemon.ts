@@ -11225,7 +11225,7 @@ async function activateVcMeetingPreparationBinding(
   const listenerChatId = session.listenerChatId ?? configuredVcMeetingListenerChatId(cfg);
   if (!listenerChatId) return { ok: false, error: 'listener chat is not ready' };
   try {
-    // /meeting 来自现有群会话，因此 Q&A 不要求配置全局 workingDir；没有项目绑定时
+    // /vc prepare 来自现有群会话，因此 Q&A 不要求配置全局 workingDir；没有项目绑定时
     // 仍可只使用分享文档、会前背景和近期字幕回答。这里仅确保目标 Agent 可达，
     // 并固定为 chat-scope，避免回退到 thread 会话。
     await ensureVcMeetingAgentChatBinding({
