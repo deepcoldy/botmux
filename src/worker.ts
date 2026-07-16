@@ -7509,7 +7509,10 @@ process.on('message', async (raw: unknown) => {
         try {
           spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
         } catch (err) {
-          await sendFatalWorkerErrorAndExit(err, msg.turnId);
+          // Pass the message's own attempt (not the stale currentBotmux* from a
+          // prior IM turn) so a durable delivery relaunch failure carries the
+          // right attribution for the daemon's receipt/lease gate.
+          await sendFatalWorkerErrorAndExit(err, msg.turnId, msg.dispatchAttempt);
           return;
         }
       }

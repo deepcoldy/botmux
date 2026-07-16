@@ -94,6 +94,13 @@ type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 type WorkerStartupState = {
   ready: boolean;
   failureNotified: boolean;
+  /** Init turn attribution frozen at fork. A durable VC delivery is dispatched
+   *  (queued) into a not-yet-ready worker; if that worker dies before ready
+   *  (fork ENOENT, syntax/import crash, abrupt exit) the fork-level `error` and
+   *  pre-ready `exit` paths must route the failure through the same receipt/lease
+   *  gate as a structured error, not reply out-of-band. */
+  initTurnId?: string;
+  initDispatchAttempt?: number;
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1913,7 +1920,9 @@ export function forkWorker(
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },
   } as WindowsForkOptions);
-  const startupState: WorkerStartupState = { ready: false, failureNotified: false };
+  const startupState: WorkerStartupState = {
+    ready: false, failureNotified: false, initTurnId, initDispatchAttempt,
+  };
 
   // A fork-level failure (spawn ENOENT, etc.) emits 'error'; without a handler
   // the unhandled event crashes the daemon. It also happens before worker IPC
@@ -1923,6 +1932,16 @@ export function forkWorker(
     logger.error(`[${t}] Worker fork error: ${reason}`);
     if (startupState.failureNotified) return;
     startupState.failureNotified = true;
+    // A durable VC meeting delivery fork failure is fenced to the receipt/lease
+    // chain (workerGeneration → ambiguous → retry); replying here would bypass
+    // that boundary and could post on a silent delivery.
+    if (ds.session.vcMeetingReceiver && initDispatchAttempt !== undefined) {
+      logger.info(
+        `[${t}] VC durable fork failure left to receipt/lease recovery `
+        + `turn=${initTurnId?.slice(0, 12) ?? '-'} attempt=${initDispatchAttempt}: ${reason}`,
+      );
+      return;
+    }
     const cliName = getCliDisplayName(agentCfg.cliId);
     const message = tr('worker.start_failed', { cliName, reason }, botLocale(botCfg));
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
@@ -3061,7 +3080,10 @@ function setupWorkerHandlers(
     // replacement kills are excluded to avoid noisy false alarms.
     if (!startupState.ready && !startupState.failureNotified && !worker.killed && ds.session.status !== 'closed') {
       const reason = tr('worker.start_exited_early', { code: code ?? 'null' }, loc);
-      void notifyStartupFailure(reason);
+      // Carry the frozen init attribution so an abrupt pre-ready exit of a
+      // durable VC delivery is fenced to the receipt/lease chain, not replied
+      // out-of-band (which could post on a silent delivery).
+      void notifyStartupFailure(reason, startupState.initTurnId, startupState.initDispatchAttempt);
     }
     // Clear the current child before notifying durable consumers. A callback
     // may schedule a retry; it must not observe/send to this dead IPC channel.

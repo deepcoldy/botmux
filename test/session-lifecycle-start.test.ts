@@ -531,6 +531,62 @@ describe('worker startup failure delivery', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
+  it('leaves a durable VC delivery pre-ready worker exit to the receipt chain (no reply)', async () => {
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    (ds.session as unknown as { vcMeetingReceiver: unknown }).vcMeetingReceiver = {
+      meetingId: 'm1', memberId: 'mem1', memberEpoch: 1,
+    };
+    // Dispatched (queued) into a worker that dies before ready — no structured
+    // error precedes it, so the abrupt-exit guard must use the frozen init attempt.
+    forkWorker(ds, 'deliver', { turnId: 'vc-delivery', dispatchAttempt: 3 });
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('exit', 9);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('leaves a durable VC delivery fork-level error to the receipt chain (no reply)', async () => {
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    (ds.session as unknown as { vcMeetingReceiver: unknown }).vcMeetingReceiver = {
+      meetingId: 'm1', memberId: 'mem1', memberEpoch: 1,
+    };
+    forkWorker(ds, 'deliver', { turnId: 'vc-delivery', dispatchAttempt: 3 });
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    // OS-level fork failure (e.g. spawn ENOENT) surfaces via the child 'error' event.
+    worker.emit('error', new Error('spawn ENOENT'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('still surfaces a VC receiver IM-turn (no dispatchAttempt) fork error exactly once', async () => {
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    (ds.session as unknown as { vcMeetingReceiver: unknown }).vcMeetingReceiver = {
+      meetingId: 'm1', memberId: 'mem1', memberEpoch: 1,
+    };
+    // A listener-group @agent IM turn has no durable dispatchAttempt; the gate is
+    // precise, so its startup failure is still surfaced (not blanket-suppressed).
+    forkWorker(ds, 'deliver', { turnId: 'im-turn' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('error', new Error('spawn ENOENT'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
   it('posts a generic fallback when the worker exits before ready or structured error', async () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
     initWorkerPool({

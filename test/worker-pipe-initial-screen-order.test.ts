@@ -186,7 +186,10 @@ describe('worker pipe initial screen ordering', () => {
     expect(guard).toContain('throw new Error(backendGateUserMessage(');
     expect(guard).not.toContain("effectiveBackend = 'pty'");
     expect(source).toContain('await sendAndFlush({');
-    expect(source).toContain('await sendFatalWorkerErrorAndExit(err, msg.turnId)');
+    // The crash-loop relaunch carries the message's own durable attempt so a
+    // meeting delivery relaunch failure is attributed to the right receipt
+    // (not the stale currentBotmux* from a prior IM turn).
+    expect(source).toContain('await sendFatalWorkerErrorAndExit(err, msg.turnId, msg.dispatchAttempt)');
     expect(source).toContain('await sendFatalWorkerErrorAndExit(err);');
   });
 
