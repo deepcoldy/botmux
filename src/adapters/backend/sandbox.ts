@@ -913,6 +913,9 @@ export function startOutboxWatcher(
   baseEnv: NodeJS.ProcessEnv,
   sessionId: string,
   opts: {
+    /** Host-side authorization for a relay's claimed origin capability. When
+     *  absent the relay still runs, but carries NO durable origin — a missing
+     *  hook must never let the sandbox promote its own origin fields. */
     authorize?: (claim: { capability?: string }) =>
       | { ok: true; origin: { turnId?: string; dispatchAttempt?: number } }
       | { ok: false; error: string };
@@ -1016,23 +1019,27 @@ export function startOutboxWatcher(
         ...videoCoverPaths.flatMap(a => ['--video-covers', a]),
         '--session-id', sessionId,  // forced — sandbox cannot target another session
       ];
-      const trustedOrigin = authorization?.ok
-        ? authorization.origin
-        : { turnId: v.value.originTurnId, dispatchAttempt: v.value.originDispatchAttempt };
+      // Fail closed: a durable origin (turnId/dispatchAttempt) may come ONLY
+      // from a host-side authorize decision. The sandbox controls every byte of
+      // the relay request, so its originTurnId/dispatchAttempt are never trusted
+      // — without an authorize hook the relay runs with no durable origin.
+      const trustedOrigin = authorization?.ok ? authorization.origin : undefined;
+      // Master's relay host env (BOTMUX_SEND_RELAY stripped + prepared-content
+      // local-link mode) is the base for the watcher-spawned host re-exec.
       const requestEnv: NodeJS.ProcessEnv = {
         ...buildRelayHostEnv(baseEnv, preparedContentPath),
         BOTMUX_SESSION_ID: sessionId,
       };
-      // This marker exists only on the watcher-spawned host re-exec. The
-      // sandbox child has it explicitly unset above. cmdSend still validates
-      // the exact receipt/IM origin carried in the trusted env below.
+      // The host re-exec itself is trusted (the sandbox child has this marker
+      // explicitly unset). Scrub any inherited durable-origin markers first,
+      // then re-apply only what the host authorized; cmdSend still re-validates
+      // the exact receipt/IM origin carried below.
       requestEnv.BOTMUX_HOST_RELAY_AUTHORIZED = '1';
-      if (trustedOrigin.turnId !== undefined) requestEnv.BOTMUX_TURN_ID = trustedOrigin.turnId;
-      else delete requestEnv.BOTMUX_TURN_ID;
-      if (trustedOrigin.dispatchAttempt !== undefined) {
+      delete requestEnv.BOTMUX_TURN_ID;
+      delete requestEnv.BOTMUX_DISPATCH_ATTEMPT;
+      if (trustedOrigin?.turnId !== undefined) requestEnv.BOTMUX_TURN_ID = trustedOrigin.turnId;
+      if (trustedOrigin?.dispatchAttempt !== undefined) {
         requestEnv.BOTMUX_DISPATCH_ATTEMPT = String(trustedOrigin.dispatchAttempt);
-      } else {
-        delete requestEnv.BOTMUX_DISPATCH_ATTEMPT;
       }
       const child = spawn(process.execPath, [cli, 'send', ...hostArgs], { env: requestEnv });
       let out = '', err = '';

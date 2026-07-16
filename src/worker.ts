@@ -7328,13 +7328,20 @@ let fatalWorkerErrorPending = false;
  * used both during init and after a previously-ready worker tries to recover
  * from a stopped/crashed CLI, so those later paths cannot regress to a silent
  * unhandled rejection/exception. */
-async function sendFatalWorkerErrorAndExit(err: unknown, turnId = currentBotmuxTurnId): Promise<void> {
+async function sendFatalWorkerErrorAndExit(
+  err: unknown,
+  turnId = currentBotmuxTurnId,
+  dispatchAttempt = currentBotmuxDispatchAttempt,
+): Promise<void> {
   if (fatalWorkerErrorPending) return;
   fatalWorkerErrorPending = true;
   await sendAndFlush({
     type: 'error',
     message: err instanceof Error ? err.message : String(err),
     turnId,
+    // Carry the durable attempt so the daemon can leave a meeting delivery
+    // failure to the receipt/lease recovery path instead of replying out-of-band.
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
   });
   process.exit(1);
 }

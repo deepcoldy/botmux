@@ -2144,9 +2144,25 @@ function setupWorkerHandlers(
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
-  const notifyStartupFailure = async (reason: string, turnId?: string): Promise<void> => {
+  const notifyStartupFailure = async (
+    reason: string,
+    turnId?: string,
+    dispatchAttempt?: number,
+  ): Promise<void> => {
     if (startupState.failureNotified) return;
     startupState.failureNotified = true;
+    // A durable VC meeting delivery attempt must not surface its startup/relaunch
+    // failure out-of-band. The worker-generation exit is fenced to the receipt
+    // (marked ambiguous and retried under the side-effect boundary); a direct
+    // sessionReply here would bypass that and could post on a silent delivery.
+    // Ordinary IM turns and non-receiver sessions still notify exactly once.
+    if (ds.session.vcMeetingReceiver && dispatchAttempt !== undefined) {
+      logger.info(
+        `[${t}] VC durable startup failure left to receipt/lease recovery `
+        + `turn=${turnId?.slice(0, 12) ?? '-'} attempt=${dispatchAttempt}: ${reason}`,
+      );
+      return;
+    }
     const cliName = getCliDisplayName(sessionCliId(ds, botCfg));
     const message = tr('worker.start_failed', { cliName, reason }, loc);
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
@@ -2841,7 +2857,7 @@ function setupWorkerHandlers(
         // `error` is a fatal launch-generation signal. It normally arrives
         // during init, but can also follow a previously-ready worker whose CLI
         // recovery/restart fails; that later failure must remain user-visible.
-        await notifyStartupFailure(msg.message, msg.turnId);
+        await notifyStartupFailure(msg.message, msg.turnId, msg.dispatchAttempt);
         break;
       }
 

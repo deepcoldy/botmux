@@ -425,6 +425,7 @@ describe('worker startup failure delivery', () => {
       'text',
       'app_test',
       'turn-clean-start',
+      undefined,
     );
   });
 
@@ -467,6 +468,7 @@ describe('worker startup failure delivery', () => {
       'text',
       'app_test',
       'turn-live-clean',
+      undefined,
     );
   });
 
@@ -496,7 +498,37 @@ describe('worker startup failure delivery', () => {
       'text',
       'app_test',
       'turn-start',
+      undefined,
     );
+  });
+
+  it('leaves a durable VC meeting delivery startup failure to the receipt chain (no out-of-band reply)', async () => {
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    // A dedicated meeting receiver session: durable delivery failures are fenced
+    // to the receipt/lease chain (workerGeneration → ambiguous → retry), so they
+    // must NOT be surfaced out-of-band (which could also post on a silent delivery).
+    (ds.session as unknown as { vcMeetingReceiver: unknown }).vcMeetingReceiver = {
+      meetingId: 'm1', memberId: 'mem1', memberEpoch: 1,
+    };
+    forkWorker(ds, 'deliver', { turnId: 'vc-delivery' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    // A durable meeting delivery attempt carries a dispatchAttempt.
+    worker.emit('message', {
+      type: 'error', message: 'boom during delivery', turnId: 'vc-delivery', dispatchAttempt: 3,
+    });
+    worker.emit('exit', 1);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
   it('posts a generic fallback when the worker exits before ready or structured error', async () => {

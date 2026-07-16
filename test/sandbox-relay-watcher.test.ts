@@ -114,4 +114,93 @@ describe('sandbox relay watcher host handoff', () => {
       stop();
     }
   });
+
+  it('never promotes sandbox-supplied origin fields without host authorization (fail closed)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-forged-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+
+    const fixture = join(root, 'origin-echo.mjs');
+    writeFileSync(fixture, `
+      process.stdout.write(JSON.stringify({
+        authorized: process.env.BOTMUX_HOST_RELAY_AUTHORIZED ?? null,
+        turnId: process.env.BOTMUX_TURN_ID ?? null,
+        dispatchAttempt: process.env.BOTMUX_DISPATCH_ATTEMPT ?? null,
+        sessionId: process.env.BOTMUX_SESSION_ID ?? null,
+      }));
+    `);
+
+    const id = 'forged-1';
+    writeFileSync(join(outbox, `${id}.content`), 'RAW');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      contentFile: `${id}.content`,
+      flags: ['--no-mention'],
+      // Sandbox-forged durable origin — the sandbox controls every byte here and
+      // must never have it promoted to a trusted origin without a host authorize.
+      originTurnId: 'forged-turn',
+      originDispatchAttempt: 99,
+    }));
+
+    // baseEnv also carries stale/inherited trust markers that must be scrubbed.
+    const stop = startOutboxWatcher(outbox, {
+      ...process.env,
+      BOTMUX_TURN_ID: 'stale-inherited-turn',
+      BOTMUX_DISPATCH_ATTEMPT: '7',
+      BOTMUX_HOST_RELAY_AUTHORIZED: '',
+    }, 'forced-session', { cliPath: fixture }); // deliberately no authorize hook
+
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code, response.stderr).toBe(0);
+      const child = JSON.parse(response.stdout) as {
+        authorized: string | null; turnId: string | null; dispatchAttempt: string | null; sessionId: string | null;
+      };
+      // The host re-exec itself is trusted, but with no authorize decision the
+      // durable origin is dropped and inherited markers scrubbed — the forged
+      // originTurnId/dispatchAttempt never reach the host send.
+      expect(child.authorized).toBe('1');
+      expect(child.turnId).toBeNull();
+      expect(child.dispatchAttempt).toBeNull();
+      expect(child.sessionId).toBe('forced-session');
+    } finally {
+      stop();
+    }
+  });
+
+  it('rejects a relay whose claimed origin capability fails host authorization', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-reject-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+
+    const fixture = join(root, 'should-not-run.mjs');
+    writeFileSync(fixture, `process.stdout.write(JSON.stringify({ ran: true }));`);
+
+    const id = 'reject-1';
+    writeFileSync(join(outbox, `${id}.content`), 'RAW');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      contentFile: `${id}.content`,
+      flags: ['--no-mention'],
+      originCapability: 'deadbeef'.repeat(4), // 32-char hex, but the host rejects it
+    }));
+
+    const authorize = vi.fn(() => ({ ok: false as const, error: 'origin_mismatch: relay capability is stale' }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-session', { cliPath: fixture, authorize });
+
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      // Rejected before any host child is spawned; the fixture never runs.
+      expect(response.code).toBe(2);
+      expect(response.stdout).toBe('');
+      expect(response.stderr).toContain('relay rejected');
+      expect(authorize).toHaveBeenCalledWith({ capability: 'deadbeef'.repeat(4) });
+    } finally {
+      stop();
+    }
+  });
 });
