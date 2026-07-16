@@ -551,6 +551,31 @@ describe('HerdrBackend callbacks', () => {
     }
   });
 
+  it('delivers frames emitted before the first onData listener is registered', async () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: 'w1:p1' } } }),
+      },
+    ]);
+
+    const backend = new HerdrBackend(SESSION);
+    backend.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const observerIndex = mockedSpawn.mock.calls.findIndex(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
+    fakeChildren[observerIndex]!.stdout.write(`${JSON.stringify({
+      type: 'terminal.frame', seq: 1, full: true, encoding: 'ansi', width: 80, height: 24,
+      bytes: Buffer.from('early baseline').toString('base64'),
+    })}\n`);
+    await waitForImmediate();
+
+    const seen: string[] = [];
+    backend.onData(data => seen.push(data));
+    expect(seen).toEqual(['early baseline']);
+    backend.kill();
+  });
+
   it('decodes one UTF-8 character split across consecutive terminal frames', async () => {
     setHerdrResponses([
       { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
@@ -653,7 +678,7 @@ describe('HerdrBackend callbacks', () => {
     expect(exits).toEqual([]);
   });
 
-  it('reattach drops the initial full frame and emits ordered incremental frames once', async () => {
+  it('reattach forwards the observer full frame before ordered incremental frames', async () => {
     setHerdrResponses([
       { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
       { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('w1:p1') },
@@ -669,10 +694,8 @@ describe('HerdrBackend callbacks', () => {
     const observer = observerIndex >= 0 ? fakeChildren[observerIndex] : undefined;
     try {
       expect(observer).toBeDefined();
-      expect(mockedSpawn.mock.calls.some(([, args]) =>
-        Array.isArray(args) && args.includes('wait') && args.includes('agent-status'))).toBe(false);
       for (const frame of [
-        { seq: 1, full: true, text: 'seeded screen' },
+        { seq: 1, full: true, text: 'reattached screen' },
         { seq: 2, full: false, text: ' delta' },
         { seq: 2, full: false, text: ' duplicate' },
         { seq: 1, full: false, text: ' stale' },
@@ -684,7 +707,7 @@ describe('HerdrBackend callbacks', () => {
         })}\n`);
       }
       await waitForImmediate();
-      expect(seen.join('')).toBe(' delta done');
+      expect(seen.join('')).toBe('reattached screen delta done');
       expect(herdrCall('agent', 'read')).toBeUndefined();
       backend.kill();
       expect(observer!.killed).toBe(true);
@@ -692,6 +715,7 @@ describe('HerdrBackend callbacks', () => {
       if (!observer?.killed) backend.kill();
     }
   });
+
   it('terminal.closed emits onExit when the observed agent disappeared', async () => {
     let agentAlive = true;
     setHerdrResponses([

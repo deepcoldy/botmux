@@ -84,7 +84,7 @@ describe('HerdrBackend (e2e)', () => {
     expect(HerdrBackend.hasSession(TEST_SESSION)).toBe(true);
   }, TEST_TIMEOUT);
 
-  it.skipIf(!HerdrBackend.isAvailable())('re-attach suppresses the seeded full frame and streams new output', async () => {
+  it.skipIf(!HerdrBackend.isAvailable())('re-attach streams its full baseline and subsequent output', async () => {
     // Phase 1: create a long-lived interactive agent and detach its observer.
     const be1 = new HerdrBackend(TEST_SESSION);
     const renderer = new TerminalRenderer(80, 24);
@@ -95,25 +95,19 @@ describe('HerdrBackend (e2e)', () => {
     renderer.dispose();
     expect(HerdrBackend.hasSession(TEST_SESSION)).toBe(true);
 
-    // Phase 2: worker reattach seeds the existing screen separately. The
-    // observer must suppress only its first full frame, then stream new data.
+    // Phase 2: the observer full frame is the authoritative reattach baseline;
+    // subsequent writes must arrive as incremental frames without a seed race.
     const be2 = new HerdrBackend(TEST_SESSION, { isReattach: true });
     const out2: string[] = [];
     be2.onData(data => out2.push(data));
     be2.spawn('/bin/bash', ['-lc', 'echo SHOULD_NOT_RUN'], spawnOpts());
     expect(be2.isReattach).toBe(true);
-    await waitFor(() => {
-      const screen = be2.captureCurrentScreen();
-      return screen.includes('PHASE1_MARKER') && !screen.includes('SHOULD_NOT_RUN');
-    }, 10_000, 'reattach seed contains PHASE1 but not SHOULD_NOT_RUN');
+    await waitFor(() => out2.join('').includes('PHASE1_MARKER'), 10_000, 'reattach streamed full baseline');
 
-    // Allow the observer's initial full frame to arrive before exercising the
-    // new incremental path, matching normal user input after restore.
-    await new Promise(resolve => setTimeout(resolve, 500));
     be2.write('PHASE2_DELTA');
     be2.sendSpecialKeys('Enter');
     await waitFor(() => out2.join('').includes('PHASE2_DELTA'), 10_000, 'reattach streamed PHASE2_DELTA');
-    expect(out2.join('')).not.toContain('PHASE1_MARKER');
+    expect(out2.join('')).not.toContain('SHOULD_NOT_RUN');
 
     be2.destroySession();
     await waitFor(() => !HerdrBackend.hasSession(TEST_SESSION), 10_000, 'session torn down');
