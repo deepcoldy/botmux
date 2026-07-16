@@ -2595,7 +2595,9 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('topic group default: a non-@ reply inside an owned topic continues the session', async () => {
+  it('topic group default (always): a non-@ reply inside an owned topic is ignored in a multi-person group', async () => {
+    // #336 曾无条件放行「owned-topic 免@续话」，导致多人话题群里旁人不 @ 也触发
+    // bot。现在话题群与普通群共用「群聊 @ 策略」：默认 always 必须 @。
     setupBotState({ allowedUsers: [USER_OPEN_ID] }); // default always
     mockGetChatMode.mockResolvedValue('topic');
     mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 });
@@ -2608,6 +2610,57 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       threadId: 'owned-topic-root',
       messageId: 'msg-in-owned-topic-group',
       chatId: 'chat-topic-group',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('topic group + mention mode topic: a non-@ reply inside an owned topic continues the session', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'topic' });
+    mockGetChatMode.mockResolvedValue('topic');
+    mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 });
+    handlers.resolveReplyThreadAlias.mockReturnValue(null);
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'owned-topic-root');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'continue without @ under topic tier' }),
+      rootId: 'owned-topic-root',
+      threadId: 'owned-topic-root',
+      messageId: 'msg-in-owned-topic-tier',
+      chatId: 'chat-topic-group-tier',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'owned-topic-root',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('topic group default, solo 1v1: a non-@ reply inside an owned topic still continues the session', async () => {
+    // 1人1bot 的 solo 群保留免@体验（走 userCount<=1 && botCount<=1 的末条放行）。
+    setupBotState({ allowedUsers: [USER_OPEN_ID] }); // default always
+    mockGetChatMode.mockResolvedValue('topic');
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
+    handlers.resolveReplyThreadAlias.mockReturnValue(null);
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'owned-topic-root');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'solo group, continue without @' }),
+      rootId: 'owned-topic-root',
+      threadId: 'owned-topic-root',
+      messageId: 'msg-in-owned-topic-solo',
+      chatId: 'chat-topic-group-solo',
       chatType: 'group',
     });
 

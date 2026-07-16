@@ -2496,28 +2496,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // permitted senders. (The shared fold-back's replyRootId is already
           // handled by the first clause.)
           const mentionMode = resolveGroupMentionMode(larkAppId);
-          // 话题群 owned-topic 免@续话 — single-bot groups only. In a multi-bot
-          // topic every co-resident bot owns a session on the same thread anchor,
-          // so relaxing here would make ALL of them answer a message that
-          // @mentioned only one (or none) of them; botCount > 1 keeps the
-          // "@ required" contract. `stats` is the cached group stats (fetched
-          // above when ownsSession; its 999/999 API-failure fallback also lands
-          // on the safe "require @" side). A message that @mentions another
-          // specific member is a redirect to someone else → back off, mirroring
-          // the ambient carve-out.
-          const ownedTopicGroupFollowup = !explicitlyMentionedThisBot
-            && isAllowed
-            && ownsSession
-            && !!stats && stats.botCount <= 1
-            && !mentionsAnotherMember(larkAppId, message)
-            && routing.scope === 'thread'
-            && !!message.thread_id
-            && await getChatMode(larkAppId, chatId) === 'topic';
+          // 话题群 owned-topic 免@续话不再无条件放行（#336 引入的默认行为回归：
+          // 多人群里旁人不 @ 也会触发 bot）。现在与普通群共用同一套「群聊 @ 策略」:
+          // 默认 'always' 在多人群里必须 @，想要话题内免@续话就把 mentionMode 配成
+          // 'topic'（下方条款已同时覆盖话题群 thread 与普通群 shared topic），
+          // 'never'/'ambient' 亦按各自语义生效。1人1bot 的 solo 群仍走末条放行。
           const relax = (!!replyRootId && isAllowed)
             || (!!substituteTrigger && isAllowed)
             || (isAllowed && mentionMode === 'never')
             || (isAllowed && mentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message))
-            || ownedTopicGroupFollowup
             || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsAnotherMember(larkAppId, message))
             || (ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
           if (!relax) {

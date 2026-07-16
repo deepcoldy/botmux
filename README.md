@@ -94,7 +94,7 @@ botmux 可以管理 CLI 无关的自定义 Skill Registry，并按 bot 配置在
 
 ### 多机器人协作
 
-同一台机器上可运行多个飞书机器人，每个机器人可对应不同的 CLI。同一群聊中通过 @mention 路由消息，仅有一个机器人时无需 @ 自动响应；多机器人时 `@<bot1> @<bot2> /t xxx` 可让每个被 @ 的机器人在同一条消息上各自独立开新话题。先发一次 `@<bot1> @<bot2> /introduce` 让它们互相登记 open_id，之后各 bot 就能在自己的会话里显式 @mention 对方协作（命令详见 [📖 文档 · 斜杠命令](https://deepcoldy.github.io/botmux/slash-commands)）。
+同一台机器上可运行多个飞书机器人，每个机器人可对应不同的 CLI。同一群聊中通过 @mention 路由消息，仅「你 + 1 个机器人」的 1v1 群无需 @ 自动响应，多人群默认必须 @（可通过「群聊 @ 策略」配置话题内免 @ / 全群免 @）；多机器人时 `@<bot1> @<bot2> /t xxx` 可让每个被 @ 的机器人在同一条消息上各自独立开新话题。先发一次 `@<bot1> @<bot2> /introduce` 让它们互相登记 open_id，之后各 bot 就能在自己的会话里显式 @mention 对方协作（命令详见 [📖 文档 · 斜杠命令](https://deepcoldy.github.io/botmux/slash-commands)）。
 
 ### 多话题协作模式
 
