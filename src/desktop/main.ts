@@ -1,4 +1,4 @@
-import { app, shell, type BrowserWindow, type Tray } from 'electron';
+import { app, session, shell, type BrowserWindow, type Tray } from 'electron';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +15,8 @@ import { normalizeBotmuxVersion, resolveEffectiveBotmuxVersion } from '../utils/
 let quitting = false;
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
+
+configureDesktopCommandLine();
 
 app.on('before-quit', () => {
   quitting = true;
@@ -46,6 +48,7 @@ if (!singleInstanceLock) {
 
 async function bootstrap(): Promise<void> {
   await app.whenReady();
+  configureDesktopSessionPermissions();
 
   const desktopDir = __dirname;
   const paths = resolveDesktopPaths({
@@ -111,6 +114,37 @@ async function bootstrap(): Promise<void> {
       void shell.openPath(paths.botmuxHome);
     },
   });
+}
+
+function configureDesktopCommandLine(): void {
+  // Botmux Desktop embeds a local dashboard and never captures screen contents.
+  // Disable Chromium's macOS capture picker features so Electron cannot fall
+  // through to a system Screen Recording permission prompt on startup.
+  app.commandLine.appendSwitch('disable-features', [
+    'ScreenCaptureKitPickerScreen',
+    'ScreenCaptureKitStreamPickerSonoma',
+  ].join(','));
+}
+
+function configureDesktopSessionPermissions(): void {
+  const desktopSession = session.defaultSession;
+  desktopSession.setPermissionCheckHandler((_webContents, permission) => {
+    return isAllowedDesktopPermission(permission);
+  });
+  desktopSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+    callback(isAllowedDesktopPermission(permission));
+  });
+  desktopSession.setDevicePermissionHandler(() => false);
+  desktopSession.setDisplayMediaRequestHandler((_request, callback) => {
+    callback({});
+  }, { useSystemPicker: false });
+}
+
+function isAllowedDesktopPermission(permission: string): boolean {
+  // Keep same-origin clipboard writes for the shell's "copy logs" affordance.
+  // Everything else is denied locally instead of escalating to macOS privacy
+  // prompts such as camera, microphone, screen capture, Bluetooth, or devices.
+  return permission === 'clipboard-sanitized-write';
 }
 
 function resolveDesktopAppVersion(rawVersion: string): string {
