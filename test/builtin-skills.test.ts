@@ -7,6 +7,17 @@ import { describe, it, expect } from 'vitest';
 import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME } from '../src/skills/definitions.js';
 
 describe('built-in botmux-send skill', () => {
+  it('requires explicit botmux runtime evidence before invoking send', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-send');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('BOTMUX_SESSION_ID');
+    expect(skill!.content).toContain('<botmux_routing>');
+    expect(skill!.content).toContain('本 skill 出现在可用 skills 列表');
+    expect(skill!.content).toContain('当前目录恰好是 botmux 仓库');
+    expect(skill!.content).toContain('禁止试探性执行');
+    expect(skill!.content).toContain('最终 assistant message 会自动转发到飞书');
+  });
+
   it('teaches safe multiline sends across Unix and Windows shells', () => {
     const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-send');
     expect(skill).toBeDefined();

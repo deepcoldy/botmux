@@ -240,12 +240,24 @@ JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`r
 
 const SEND_SKILL = `---
 name: botmux-send
-description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
+description: 仅在当前 prompt 明确包含 botmux 飞书/Lark 路由上下文、环境中存在 BOTMUX_SESSION_ID，或用户明确要求向飞书发送消息时使用；不要仅因本 skill 可用、当前目录是 botmux 项目或系统安装了 botmux 就触发。用于发送图文、文件、卡片、@mention，以及在确实需要人类介入时通过 \`--attention\` 举手。若运行时说明最终 assistant message 会自动转发，则常规最终回复不要调用 botmux send。
 ---
 
 # botmux-send — 向飞书话题发送消息
 
-**核心规则**：用户在飞书上阅读，看不到你的终端输出。想让用户看到的内容**必须**通过 \`botmux send\` 发送。
+## 使用前先确认运行上下文
+
+调用 \`botmux send\` 前，必须至少满足一项：
+
+- 当前 prompt 明确含有 \`<botmux_routing>\` / \`<botmux_reminder>\` 和 session 信息；
+- 环境变量 \`BOTMUX_SESSION_ID\` 非空；
+- 用户明确要求把内容发送到飞书/Lark，并提供了可用的目标或 \`--session-id\`。
+
+**不要**把以下信息当成飞书会话证据：本 skill 出现在可用 skills 列表、当前目录恰好是 botmux 仓库、或系统中能执行 \`botmux\`。这些情况都可能发生在普通的本地 Pi/Codex/Claude 会话中；没有上述明确证据时，应通过当前 agent harness 的正常最终回复通道回答，禁止试探性执行 \`botmux send\`。
+
+如果更高优先级的运行时指令说明“最终 assistant message 会自动转发到飞书”，常规最终回复同样走正常回复通道；仅在明确要求中途推送、发送附件或跨 bot @mention 时调用本命令。
+
+**核心规则**：仅当已确认当前回复必须经 botmux 投递时，用户才看不到终端输出；此时需要用户看到的内容必须通过 \`botmux send\` 发送。
 
 **格式自动处理**：内容含 markdown 语法时自动用飞书卡片（schema 2.0）发送，原生渲染；纯文本走普通消息。**该用 md 就用 md**——结构化内容（列表、表格、代码块）不要手撸成纯文本。
 
