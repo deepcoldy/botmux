@@ -174,7 +174,7 @@ export default defineConfig({
   builderConfig: {
     // 默认（妙搭发布）：static 走 jsDelivr CDN。GitHub Pages 发布时用 BOTMUX_DOCS_ASSET_PREFIX
     // 覆盖成同源子路径（Pages 原生服务 static，无需 CDN）。
-    output: { assetPrefix: process.env.BOTMUX_DOCS_ASSET_PREFIX || "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v28/" },
+    output: { assetPrefix: process.env.BOTMUX_DOCS_ASSET_PREFIX || "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v29/" },
   },
   themeConfig: {
     editLink: {
