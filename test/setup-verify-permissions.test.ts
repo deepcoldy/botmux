@@ -38,6 +38,7 @@ import {
   buildRemainingSteps,
   BOTMUX_REQUIRED_SCOPES,
   DOC_FEATURE_SCOPES,
+  DOC_WATCH_SCOPES,
   VC_MEETING_BOT_EVENTS,
   VC_MEETING_FEATURE_SCOPES,
 } from '../src/setup/verify-permissions.js';
@@ -309,6 +310,12 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
     expect(DOC_FEATURE_SCOPES.map(s => s.name).sort()).toEqual([...DOC_COMMENT_OAUTH_SCOPES].sort());
     // Doc-feature scopes are opt-in → must never be critical (would nag every bot).
     expect(DOC_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
+    expect(DOC_WATCH_SCOPES.map(s => s.name).sort()).toEqual([
+      'docs:document.comment:create',
+      'docs:document.comment:read',
+      'wiki:wiki:readonly',
+    ]);
+    expect(DOC_WATCH_SCOPES.every(s => !s.critical)).toBe(true);
   });
 
   it('VC meeting feature scopes are valid manifest scopes and opt-in only', async () => {

@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
-import { BotPolicyCard, SkillsInstallPanel } from '../src/dashboard/web/skills-page.js';
+import { BotPolicyCard, InstalledSkillsLibrary, RemoveSkillsDialog, SkillsInstallPanel } from '../src/dashboard/web/skills-page.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -165,5 +165,111 @@ describe('dashboard skills install panel', () => {
     expect(root.findAllByProps({ 'data-action': 'confirm-install-selection' })).toHaveLength(1);
     expect(root.findAllByProps({ 'data-action': 'toggle-all-source-skills' })).toHaveLength(1);
     expect(root.findAllByProps({ className: 'skills-candidate-row' })).toHaveLength(2);
+  });
+});
+
+describe('installed Skills library', () => {
+  function renderLibrary(props: Partial<React.ComponentProps<typeof InstalledSkillsLibrary>> = {}): TestRenderer.ReactTestRenderer {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(InstalledSkillsLibrary, {
+        skills: [
+          { name: 'deploy-api', displayName: 'Deploy API', description: 'Publish backend services', tags: ['release'] },
+          { name: 'deploy-web', displayName: 'Deploy Web', description: 'Publish frontend assets' },
+          { name: 'review', displayName: 'Code Review', description: 'Review pull requests' },
+        ],
+        busySkill: null,
+        removingNames: new Set(),
+        status: null,
+        onUpdate: vi.fn(),
+        onRequestRemove: vi.fn(),
+        ...props,
+      }));
+    });
+    return renderer;
+  }
+
+  it('filters immediately across name, display name, description, and tags, with a distinct no-results state', () => {
+    const renderer = renderLibrary();
+    const root = renderer.root;
+    const search = root.findByProps({ 'data-action': 'search-installed-skills' });
+
+    act(() => search.props.onChange({ currentTarget: { value: 'backend' } }));
+    expect(root.findAllByProps({ 'data-skill': 'deploy-api' })).toHaveLength(1);
+    expect(root.findAllByProps({ 'data-skill': 'deploy-web' })).toHaveLength(0);
+
+    act(() => search.props.onChange({ currentTarget: { value: 'release' } }));
+    expect(root.findAllByProps({ 'data-skill': 'deploy-api' })).toHaveLength(1);
+
+    act(() => search.props.onChange({ currentTarget: { value: 'calendar' } }));
+    expect(root.findAllByProps({ 'data-empty': 'search' })).toHaveLength(1);
+    act(() => root.findByProps({ 'data-action': 'clear-installed-search-empty' }).props.onClick());
+    expect(root.findAllByProps({ 'data-skill': 'review' })).toHaveLength(1);
+  });
+
+  it('selects only the current filtered results and preserves hidden selections when the query changes', () => {
+    const onRequestRemove = vi.fn();
+    const renderer = renderLibrary({ onRequestRemove });
+    const root = renderer.root;
+    const search = root.findByProps({ 'data-action': 'search-installed-skills' });
+
+    act(() => search.props.onChange({ currentTarget: { value: 'deploy' } }));
+    act(() => root.findByProps({ 'data-action': 'select-installed-skills' }).props.onClick());
+    expect(root.findByProps({ className: 'skills-select-all-results' }).findByType('span').children.join('')).toBe('全选 2 个搜索结果');
+    const selectAll = root.findByProps({ className: 'skills-select-all-results' }).findByType('input');
+    act(() => selectAll.props.onChange());
+
+    act(() => search.props.onChange({ currentTarget: { value: 'review' } }));
+    expect(root.findByProps({ className: 'skills-bulk-action-bar' }).findByType('small').children.join('')).toContain('2');
+    act(() => root.findByProps({ 'data-action': 'remove-selected-skills' }).props.onClick());
+
+    expect(onRequestRemove).toHaveBeenCalledTimes(1);
+    expect(new Set(onRequestRemove.mock.calls[0][0])).toEqual(new Set(['deploy-api', 'deploy-web']));
+  });
+
+  it('keeps the search query when selection mode is cancelled and routes single removal through the parent', () => {
+    const onRequestRemove = vi.fn();
+    const renderer = renderLibrary({ onRequestRemove });
+    const root = renderer.root;
+    const search = root.findByProps({ 'data-action': 'search-installed-skills' });
+
+    act(() => search.props.onChange({ currentTarget: { value: 'review' } }));
+    act(() => root.findByProps({ 'data-action': 'select-installed-skills' }).props.onClick());
+    act(() => root.findByProps({ 'data-action': 'cancel-installed-selection' }).props.onClick());
+    expect(root.findByProps({ 'data-action': 'search-installed-skills' }).props.value).toBe('review');
+
+    act(() => root.findByProps({ 'data-action': 'remove-skill' }).props.onClick());
+    expect(onRequestRemove).toHaveBeenCalledWith(['review']);
+    expect(root.findAllByProps({ 'data-skill': 'review' })).toHaveLength(1);
+  });
+
+  it('labels an unfiltered selection as all installed Skills rather than the current page', () => {
+    const renderer = renderLibrary();
+    const root = renderer.root;
+
+    act(() => root.findByProps({ 'data-action': 'select-installed-skills' }).props.onClick());
+
+    expect(root.findByProps({ className: 'skills-select-all-results' }).findByType('span').children.join('')).toBe('全选全部 3 个');
+  });
+
+  it('adds Bot-reference risk only in the second confirmation and keeps affected Bot names', () => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(RemoveSkillsDialog, {
+        names: ['apple-design'],
+        references: [{ name: 'apple-design', bots: ['设计 Bot', '开发 Bot'] }],
+        busy: false,
+        error: null,
+        onCancel: vi.fn(),
+        onConfirm: vi.fn(),
+      }));
+    });
+    const root = renderer.root;
+
+    expect(root.findByType('h3').children.join('')).toBe('仍要删除“apple-design”？');
+    expect(root.findAllByType('p').map(node => node.children.join('')).join(' ')).toContain('它正被 2 个 Bot 引用');
+    expect(root.findAllByType('button').map(node => node.children.join(''))).toContain('仍要删除');
+    expect(root.findByType('li').findByType('span').children.join('')).toBe('设计 Bot, 开发 Bot');
+    expect(root.findAllByType('ul')).toHaveLength(1);
   });
 });

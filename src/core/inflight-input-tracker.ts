@@ -20,7 +20,15 @@
  * early and degrades to the old lose-on-crash behavior for that turn only.
  */
 
-export type InflightItem = { content: string; turnId?: string };
+import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
+
+export type InflightItem = {
+  content: string;
+  turnId?: string;
+  dispatchAttempt?: number;
+  vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+  codexAppInput?: CodexAppTurnInput;
+};
 
 export class InflightInputTracker {
   private unacked: InflightItem[] = [];
@@ -42,10 +50,11 @@ export class InflightInputTracker {
    *  Appends (rather than replaces) so a double exit before the respawn
    *  consumes the stash can't drop the earlier batch. Returns how many
    *  items were newly stashed by THIS exit. */
-  onCliExit(): number {
-    const n = this.unacked.length;
-    if (n > 0) this.carryOver.push(...this.unacked.splice(0));
-    return n;
+  onCliExit(shouldCarry: (item: InflightItem) => boolean = () => true): number {
+    const exiting = this.unacked.splice(0);
+    const carried = exiting.filter(shouldCarry);
+    if (carried.length > 0) this.carryOver.push(...carried);
+    return carried.length;
   }
 
   /** A fresh CLI is spawning: hand back everything that must be re-queued,

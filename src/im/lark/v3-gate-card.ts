@@ -3,13 +3,14 @@
  * 但**自带 action namespace + value 形态**（codex review #4）：
  *   - action: `v3_gate_approve` / `v3_gate_reject`
  *   - value: `{ action, runId, waitId, nodeId, nonce, selected }`
- * 刻意不复用 v0.2 `workflow-card-handler` 的 wait path —— v3 的 wait 权威是
+ * 刻意不复用已下线的 v2 wait path —— v3 的 wait 权威是
  * `waits/<id>.json + journal.ndjson`，跟 v0.2 events schema 不同（见 humanGate
  * daemon-card 设计 §4.3）。本文件**纯函数**，不碰 daemon / IO，单测友好。
  */
 
 import { config } from '../../config.js';
 import { DEFAULT_HUMAN_GATE_OPTIONS } from '../../workflows/v3/dag.js';
+import { splitV3HostGatePrompt } from '../../workflows/v3/host-bindings.js';
 
 export const V3_GATE_APPROVE_ACTION = 'v3_gate_approve';
 export const V3_GATE_REJECT_ACTION = 'v3_gate_reject';
@@ -39,6 +40,9 @@ export interface V3GateCardInput {
   options?: string[];
   approveOptions?: string[];
   approvers?: string[];
+  /** Host-only trusted identity. The hash is rendered independently from the
+   * authored prompt so a long prompt can never truncate away what is approved. */
+  hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string };
   /** 有值 → 渲染冻结的「已通过 / 已拒绝」卡（无按钮，防 stale UI 重复提交）。 */
   resolution?: { kind: V3GateResolutionKind; by?: string; selected?: string };
 }
@@ -59,7 +63,8 @@ export function buildV3GateCard(input: V3GateCardInput): string {
   const nonce = input.nonce ?? v3GateCardNonce(input.runId, input.waitId);
   const webDetailUrl = input.webDetailUrl ?? v3RunDetailUrl(input.runId);
   const promptMax = input.promptMaxChars ?? DEFAULT_PROMPT_MAX_CHARS;
-  const prompt = truncate(input.prompt, promptMax);
+  const hostPrompt = input.hostApproval ? splitV3HostGatePrompt(input.prompt) : undefined;
+  const prompt = truncate(hostPrompt?.authoredPrompt ?? input.prompt, promptMax);
   const resolution = input.resolution;
   const options = input.options ?? [...DEFAULT_HUMAN_GATE_OPTIONS];
   const approveOptions = input.approveOptions ?? (options.includes('approve') ? ['approve'] : [options[0]!]);
@@ -80,20 +85,50 @@ export function buildV3GateCard(input: V3GateCardInput): string {
     { tag: 'hr' },
     {
       tag: 'div',
-      text: { tag: 'lark_md', content: `**审批内容**\n${escapeMd(prompt)}` },
+      text: { tag: 'lark_md', content: '**审批内容**' },
+    },
+    {
+      tag: 'div',
+      // Gate prompts can contain user/agent-authored data. Keep them out of
+      // lark_md so Lark tags such as <at id=all></at> cannot turn displaying
+      // an approval card into a pre-approval notification side effect.
+      text: { tag: 'plain_text', content: prompt },
     },
   ];
+
+  if (input.hostApproval) {
+    elements.push({ tag: 'hr' });
+    elements.push({
+      tag: 'div',
+      text: {
+        tag: 'plain_text',
+        content: `冻结输入 Hash（本次批准对象）\n${input.hostApproval.inputHash}`,
+      },
+    });
+    if (hostPrompt?.preview) {
+      elements.push({
+        tag: 'div',
+        // The preview is derived from upstream result data. Rendering it as
+        // plain text is a security boundary: markdown escaping alone does not
+        // neutralize Lark-native tags (<at>, links, etc.).
+        text: {
+          tag: 'plain_text',
+          content: `冻结输入预览（完整；敏感字段按键名脱敏）\n${hostPrompt.preview}`,
+        },
+      });
+    }
+  }
 
   if (resolution) {
     elements.push({ tag: 'hr' });
     elements.push({
       tag: 'div',
       text: {
-        tag: 'lark_md',
+        tag: 'plain_text',
         content:
           (resolution.kind === 'approved' ? '✅ 已通过' : '❌ 已拒绝') +
-          (resolution.selected ? ` · ${escapeMd(short(resolution.selected, 20))}` : '') +
-          (resolution.by ? ` · by ${escapeMd(short(resolution.by, 20))}` : ''),
+          (resolution.selected ? ` · ${short(resolution.selected, 20)}` : '') +
+          (resolution.by ? ` · by ${short(resolution.by, 20)}` : ''),
       },
     });
   } else {
@@ -108,7 +143,7 @@ export function buildV3GateCard(input: V3GateCardInput): string {
     actions: [
       {
         tag: 'button',
-        text: { tag: 'plain_text', content: 'Web 详情' },
+        text: { tag: 'plain_text', content: 'Web 详情（需登录）' },
         type: 'default',
         multi_url: {
           url: webDetailUrl, pc_url: webDetailUrl, android_url: webDetailUrl, ios_url: webDetailUrl,

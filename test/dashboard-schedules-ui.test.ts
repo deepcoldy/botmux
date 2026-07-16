@@ -1,7 +1,16 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { filterSchedules, fmtScheduleDate } from '../src/dashboard/web/schedules-page.js';
 
 describe('dashboard schedules React page helpers', () => {
+  it('reads enabled filter checkbox state before entering React state updaters', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+
+    expect(page).toContain('const enabledOnly = event.currentTarget.checked;');
+    expect(page).not.toContain('enabledOnly: e.currentTarget.checked');
+    expect(page).not.toContain('enabledOnly: event.currentTarget.checked');
+  });
+
   it('filters by kind, enabled state, and text query', () => {
     const rows = [
       { id: 'daily', name: 'Daily Standup', enabled: true, parsed: { kind: 'cron', display: '0 9 * * *' }, nextRunAt: '2026-06-30T09:00:00.000Z' },

@@ -109,6 +109,8 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt).toContain('第二行');
     expect(prompt).toContain('botmux send "第一行\\n第二行"');
     expect(prompt).toContain('字面量');
+    expect(prompt).toContain('JSON.stringify');
+    expect(prompt).toContain('--content-file');
   });
 
   it('uses final-output routing hints for Hermes instead of normal botmux send guidance', () => {
@@ -304,6 +306,11 @@ describe('buildFollowUpContent', () => {
     expect(content.indexOf('<botmux_reminder>')).toBeLessThan(content.indexOf('<user_message>'));
     expect(content.indexOf('<sender ')).toBeGreaterThan(content.indexOf('</user_message>'));
     expect(content.indexOf('<mentions>')).toBeGreaterThan(content.indexOf('</user_message>'));
+    // Complex send guidance is discoverable once in the opening catalog; keep
+    // every follow-up reminder intentionally tiny.
+    expect(content).toContain('<botmux_reminder>回复必须 botmux send，终端输出用户看不到</botmux_reminder>');
+    expect(content).not.toContain('JSON.stringify');
+    expect(content).not.toContain('botmux skill show botmux-send');
   });
 
   it('uses final-output reminder for Hermes follow-ups', () => {

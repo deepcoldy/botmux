@@ -5,7 +5,7 @@
  * Unlike the interactive PTY adapters, `mir` drives mircli through its
  * non-interactive Print Mode: each botmux turn spawns
  *
- *     mircli -p <content> --lean --output-format text --session-id <sid> -y \
+ *     mircli -p <content> --output-format text --session-id <sid> -y \
  *            --append-system-prompt <local-runtime-context>
  *
  * in the botmux workspace cwd, captures stdout, and ships it back to the daemon
@@ -35,6 +35,7 @@ import {
   type MiramcpAutostartResult,
 } from './mir-local-runtime.js';
 import { normalizeMircliPrompt } from './mir-prompt.js';
+import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 
 interface Args {
   sessionId: string;
@@ -44,15 +45,14 @@ interface Args {
   mircliBin?: string;
 }
 
-const OSC_PREFIX = '\x1b]777;botmux:';
-const OSC_END = '\x07';
+const output = new RunnerControlWriter();
 const DEFAULT_QUERY_TIMEOUT = '10m';
 const DEFAULT_RUNNER_TIMEOUT_MS = 12 * 60 * 1000;
 const MARKER_PREFIX = '::botmux-mir:';
 // Backend Claude-harness builtin tools that route to the cloud sandbox; mircli's
 // own local tools are the lowercase equivalents. Optionally hard-disallow these
 // (MIRCLI_DISALLOW_BUILTIN=1) to push the model onto the local tools. Off by
-// default — the validated path relies on --lean + the local MCP bridge.
+// default — the validated path relies on the full tool_list + local MCP bridge.
 const BUILTIN_SANDBOX_TOOLS = ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'];
 
 function parseArgs(argv: string[]): Args {
@@ -70,20 +70,16 @@ function parseArgs(argv: string[]): Args {
   return out;
 }
 
-function b64Json(value: unknown): string {
-  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64');
-}
-
 function emitMarker(kind: string, payload: unknown): void {
-  process.stdout.write(`${OSC_PREFIX}${kind}:${b64Json(payload)}${OSC_END}`);
+  output.marker(kind, payload);
 }
 
 function writeLine(text = ''): void {
-  process.stdout.write(text + '\n');
+  output.line(text);
 }
 
 function prompt(): void {
-  process.stdout.write('› ');
+  output.display('› ');
 }
 
 function errorMessage(err: unknown): string {
@@ -100,10 +96,10 @@ function logMiramcpAutostart(result: MiramcpAutostartResult): void {
   ].filter(Boolean).join(' ');
   const message = `[mir] miramcp auto-start ${details}\n`;
   if (result.status === 'started_pending' || result.status === 'missing_bin' || result.status === 'spawn_failed' || result.status === 'invalid_config' || result.status === 'missing_device_id') {
-    process.stderr.write(message);
+    output.error(message);
     return;
   }
-  if (process.env.DEBUG) process.stderr.write(message);
+  if (process.env.DEBUG) output.error(message);
 }
 
 function boolEnv(name: string, fallback: boolean): boolean {
@@ -149,9 +145,15 @@ function runtimeSystemPrompt(): string {
     'BotMux invokes you in a non-interactive message bridge. NEVER emit ```ask_user_call``` or ```ask_user_form_call``` fences for local path, permission, or environment issues.',
     'If the target path is not obvious, use the actual local runtime cwd above. Do not ask the user to choose a path when this cwd is provided.',
     'This BotMux session is not running in /home/mira/.session. Do not report /home/mira/.session as the working directory for this session.',
-    'Local filesystem, shell/bash, git, and BotMux CLI tools are available through the Mir CLI local tool bridge for this process.',
+    'Local filesystem, shell/bash, git, and BotMux CLI tools are available through the Mir CLI local tool bridge (mira_local_bash / mira_local_read_file / local_filesystem_* tools) for this process.',
     'When the user asks to create, read, list, edit, or inspect local files, run bash/shell commands, inspect git, or operate BotMux, you MUST call the local tools against the actual local cwd above.',
-    'Prefer local bash commands that operate from the current cwd with relative paths first; if an absolute physical cwd fails, retry the same operation from the current cwd and then with the local tool path alias before reporting failure.',
+    // The bridged local tools execute inside the user's miramcp bridge process,
+    // whose working directory is wherever the bridge was started — NOT this
+    // session's workspace. Relative paths therefore resolve against the wrong
+    // directory (observed live: `cat file.txt` returning empty in a workspace
+    // that clearly contained it).
+    `IMPORTANT: local tools execute in a separate bridge process whose working directory is NOT this session's cwd. NEVER rely on relative paths or an implied cwd. Prefix EVERY local bash command with \`cd ${paths.cwd} && \`, and pass absolute paths (under the actual local runtime cwd above) to every local file tool.`,
+    'If an absolute path under the actual cwd fails as outside allowed roots, retry the same operation with the local tool path alias above before reporting failure.',
     'Do not say the local MCP bridge is disconnected, that only a cloud sandbox is available, or that the operation is cancelled unless a concrete local tool invocation actually returned that error.',
     'If a local tool invocation fails, report the exact failed operation and error concisely, then stop or ask for the missing input.',
   );
@@ -190,7 +192,7 @@ class MircliClient {
         try {
           logMiramcpAutostart(ensureMiramcpBridgeStarted({ mircliBin: bin }));
         } catch (err) {
-          process.stderr.write(`[mir] miramcp auto-start threw error=${errorMessage(err)}\n`);
+          output.error(`[mir] miramcp auto-start threw error=${errorMessage(err)}\n`);
           // Best-effort: mircli will surface the concrete MCP error if the
           // bridge is still unavailable.
         }
@@ -206,7 +208,15 @@ class MircliClient {
         }
       }
       const args = splitEnvArgs(process.env.MIRCLI_EXTRA_ARGS);
-      if (boolEnv('MIRCLI_LEAN', true) && !args.includes('--lean') && !args.includes('--ultra')) {
+      // MIRCLI_LEAN defaults OFF: the Mira completion API only enables tools the
+      // client lists in config.tool_list (it accepts no client tool schemas), and
+      // `--lean` skips that injection entirely. Lean sessions therefore never get
+      // the LocalMcp package — mira_local_bash / local_filesystem_* via the user's
+      // miramcp bridge — leaving only the cloud-sandbox builtins, which mircli's
+      // local-only coding mode hard-blocks. Net effect: no usable local tools
+      // ("本地工具没有暴露"). Verified against mircli v2.10.0: full mode exposes
+      // mcp__proxy___<device>__mira_local_bash etc., lean mode exposes none.
+      if (boolEnv('MIRCLI_LEAN', false) && !args.includes('--lean') && !args.includes('--ultra')) {
         args.push('--lean');
       }
       args.push(
@@ -267,7 +277,7 @@ let args: Args;
 try {
   args = parseArgs(process.argv.slice(2));
 } catch (err) {
-  console.error(`Mir runner: ${errorMessage(err)}`);
+  output.error(`Mir runner: ${errorMessage(err)}\n`);
   process.exit(2);
 }
 
@@ -290,7 +300,7 @@ async function runTurn(content: string): Promise<void> {
     writeLine();
     writeLine(result.finalText);
     emitMarker('final', {
-      turnId: result.turnId,
+      nativeTurnId: result.turnId,
       content: result.finalText,
       startedAtMs,
       completedAtMs,
@@ -313,7 +323,6 @@ async function drainQueue(): Promise<void> {
         const message = `Mir runner error: ${errorMessage(err)}`;
         writeLine(message);
         emitMarker('final', {
-          turnId: `mir-error-${now}`,
           content: message,
           startedAtMs: now,
           completedAtMs: now,
@@ -376,6 +385,6 @@ async function main(): Promise<void> {
 process.on('SIGTERM', () => { process.exit(0); });
 
 main().catch(err => {
-  console.error(`Mir runner failed: ${errorMessage(err)}`);
+  output.error(`Mir runner failed: ${errorMessage(err)}\n`);
   process.exit(1);
 });

@@ -26,3 +26,29 @@ export function planGroupCreator(
   }
   return { creatorLarkAppId: pickFallback(selectedIds), inviteUser: false };
 }
+
+export interface TeamGroupCreatePayloadInput {
+  name: string;
+  larkAppIds: string[];
+  userOpenIds: string[];
+  ownerUnionIds: string[];
+  transferOwnerUnionId?: string;
+  roleProfileId?: string;
+}
+
+/**
+ * Build the daemon request for a team-created group. The caller derives the
+ * initiating operator from authenticated team identity; keep that explicit
+ * instead of guessing from ownerUnionIds, which also contains bot owners.
+ */
+export function buildTeamGroupCreatePayload(args: TeamGroupCreatePayloadInput) {
+  const transferOwnerUnionId = args.transferOwnerUnionId?.trim();
+  return {
+    name: args.name,
+    larkAppIds: args.larkAppIds,
+    userOpenIds: args.userOpenIds,
+    ownerUnionIds: args.ownerUnionIds,
+    ...(transferOwnerUnionId ? { transferOwnerUnionId } : {}),
+    ...(args.roleProfileId ? { roleProfileId: args.roleProfileId } : {}),
+  };
+}

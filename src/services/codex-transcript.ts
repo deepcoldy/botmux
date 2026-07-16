@@ -112,6 +112,12 @@ export interface CodexBridgeEvent {
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). */
   text: string;
+  /** Optional durable-delivery terminal outcome carried by bridges with an
+   *  explicit completion record (for example Grok `turn_completed`). Codex
+   *  final-answer records omit it and retain the historical completed
+   *  default. */
+  terminalStatus?: 'completed' | 'failed' | 'ambiguous';
+  terminalErrorCode?: string;
   sourceSessionId?: string;
   /** Keep the pending turn's original markTimeMs instead of moving it to the
    *  transcript user timestamp. Used by bridges whose committed user

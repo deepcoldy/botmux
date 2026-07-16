@@ -17,7 +17,7 @@ import { readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { config } from '../config.js';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
 import { buildTeamRoster, type LiveBot } from '../services/team-roster.js';
 import { buildFederatedRoster } from '../services/federation-roster.js';
 import { getDeploymentIdentity, setDeploymentName } from '../services/deployment-identity.js';
@@ -35,7 +35,14 @@ import { setDeploymentOwner } from '../services/deployment-identity.js';
 import { createPairing, getPairingStatus, consumePairing } from '../services/pairing-store.js';
 import { resolveAllowedUsersWithMap, resolveUserUnionId } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { fetchWithTimeout, hubError, orchestrateFederatedGroup, type Fetcher } from './federated-group-core.js';
+import {
+  fetchWithTimeout,
+  hubError,
+  orchestrateFederatedGroup,
+  type Fetcher,
+  type TeamGroupCreateResult,
+  type TeamGroupOwnerTransferResult,
+} from './federated-group-core.js';
 
 export interface OwnerCandidate { unionId: string; name: string }
 
@@ -301,9 +308,12 @@ export interface FederationSpokeDeps {
   liveBots?: () => LiveBot[];
   /** Injected by dashboard.ts — picks a local online creator + proxies to its
    *  daemon's /api/groups/create (federated bots are added by larkAppId). */
-  createTeamGroup?: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[] }) => Promise<{
-    ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; invalidOwnerUnionIds?: string[]; error?: string;
-  }>;
+  createTeamGroup?: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[]; transferOwnerUnionId?: string }) => Promise<TeamGroupCreateResult>;
+  transferTeamGroupOwner?: (args: {
+    creatorLarkAppId: string;
+    chatId: string;
+    transferOwnerUnionId: string;
+  }) => Promise<TeamGroupOwnerTransferResult>;
   /** Test seam: resolve owner candidates from allowedUsers (defaults to the real
    *  Feishu-backed resolver). */
   ownerCandidates?: () => Promise<OwnerCandidate[]>;
@@ -390,7 +400,16 @@ export async function handleFederationSpokeApi(
     if (localOnline.size > 0 && !larkAppIds.some(id => localOnline.has(id))) {
       jsonRes(res, 400, { ok: false, error: 'no_local_online_bot' }); return true;
     }
-    const out = await orchestrateFederatedGroup(dataDir, { name, larkAppIds, operatorUnionId, requestId: randomUUID(), teamId }, { createTeamGroup: deps.createTeamGroup, fetcher, live });
+    const out = await orchestrateFederatedGroup(
+      dataDir,
+      { name, larkAppIds, operatorUnionId, requestId: randomUUID(), teamId },
+      {
+        createTeamGroup: deps.createTeamGroup,
+        transferTeamGroupOwner: deps.transferTeamGroupOwner,
+        fetcher,
+        live,
+      },
+    );
     jsonRes(res, out.status, out.body);
     return true;
   }

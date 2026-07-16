@@ -410,10 +410,7 @@ export const INLINE_PAYLOAD_MAX_BYTES = 4096;
  * still be safely retried with the same uuid.  Feishu's documented uuid
  * dedupe window is 1 hour (spike report §1.2).
  */
-export const PROVIDER_TTL_MS: Record<string, number> = {
-  'feishu-im': 60 * 60 * 1000,
-  'botmux-schedule': Number.MAX_SAFE_INTEGER, // schedule entry id is permanent
-};
+export { PROVIDER_TTL_MS } from '../shared/provider-reconciler.js';
 
 // ─── Re-export Sha256Schema for callers ─────────────────────────────────────
 

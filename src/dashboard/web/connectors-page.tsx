@@ -99,6 +99,19 @@ export function buildConnectorInstructionUpdateBody(
   };
 }
 
+export function buildConnectorKindOptions(
+  tr: (key: string) => string,
+): Array<{ value: 'turn' | 'workflow'; label: string; disabled?: boolean }> {
+  return [
+    { value: 'turn', label: tr('connectors.kindTurn') },
+    {
+      value: 'workflow',
+      label: tr('connectors.kindWorkflowRetiring'),
+      disabled: true,
+    },
+  ];
+}
+
 function webhookUrl(id: string): string {
   return `${location.origin}/webhook/${encodeURIComponent(id)}`;
 }
@@ -107,7 +120,7 @@ function ConnectorDropdown<T extends string>(props: {
   id: string;
   label: string;
   value: T;
-  options: Array<{ value: T; label: ReactNode }>;
+  options: Array<{ value: T; label: ReactNode; disabled?: boolean }>;
   onChange(value: T): void;
 }): JSX.Element {
   return (
@@ -303,10 +316,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       : [{ value: '', label: tr('connectors.noOnlineBots') }],
     [bots, tr],
   );
-  const kindOptions = useMemo(() => [
-    { value: 'turn' as const, label: tr('connectors.kindTurn') },
-    { value: 'workflow' as const, label: tr('connectors.kindWorkflow') },
-  ], [tr]);
+  const kindOptions = useMemo(() => buildConnectorKindOptions(tr), [tr]);
   const modeOptions = useMemo(() => [
     { value: 'dynamic' as const, label: tr('connectors.modeDynamic') },
     { value: 'fixed' as const, label: tr('connectors.modeFixed') },
@@ -456,6 +466,10 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
     const botId = form.botId;
     if (!name) { setCreateMsg({ text: tr('connectors.errName'), error: true }); return; }
     if (!botId) { setCreateMsg({ text: tr('connectors.errBot'), error: true }); return; }
+    if (form.kind === 'workflow') {
+      setCreateMsg({ text: tr('connectors.errLegacyWorkflowRetired'), error: true });
+      return;
+    }
 
     const body: any = {
       name,
@@ -465,10 +479,6 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       verify: { type: form.verify },
       loggingPolicy: { storePayload: form.storePayload, storeHeaders: true, retentionDays: 14 },
     };
-    if (form.kind === 'workflow') {
-      if (!form.workflowId.trim()) { setCreateMsg({ text: tr('connectors.errWf'), error: true }); return; }
-      body.target.workflowId = form.workflowId.trim();
-    }
     if (form.mode === 'fixed') {
       const chatId = form.manualChat ? form.manualChatId.trim() : form.chatId;
       if (!chatId) { setCreateMsg({ text: tr('connectors.errChat'), error: true }); return; }
@@ -968,6 +978,7 @@ function ConnectorList(props: {
               <code>{url}{isToken ? '/<token>' : ''}</code>
             </div>
             {isToken ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.tokenHint') }} /> : null}
+            {c.target.kind === 'workflow' ? <div className="muted connector-item-note">{tr('connectors.legacyWorkflowNote')}</div> : null}
             {c.target.mode === 'dynamic' ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.dynamicReqHint') }} /> : null}
             {c.promptEnvelope?.instruction ? <div className="muted connector-item-note">{tr('connectors.instructionPrefix')}{c.promptEnvelope.instruction}</div> : null}
             {editMsg ? <div className={editMsg.error ? 'err connector-item-note' : 'muted connector-item-note'}>{editMsg.text}</div> : null}

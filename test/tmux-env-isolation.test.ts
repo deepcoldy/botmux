@@ -18,10 +18,11 @@
  */
 import { describe, it, expect } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { tmuxEnv, probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
+import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv } from '../src/setup/ensure-tmux.js';
+import { BOTMUX_INJECTED_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, isBotmuxManagedTmuxEnvKey } from '../src/utils/child-env.js';
 
 describe('tmuxEnv()', () => {
   it('strips TMUX and TMUX_PANE from the env', () => {
@@ -45,6 +46,69 @@ describe('tmuxEnv()', () => {
     });
     expect(stripped.TMUX).toBeUndefined();
     expect(stripped.TMUX_TMPDIR).toBe('/custom/tmp');
+  });
+
+  it('strips botmux session/bot-scoped vars so they never seed the tmux server global env', () => {
+    // The leak this guards against: the first `tmux new-session` copies its
+    // client env into the server's *global* env, which then bleeds into the
+    // user's own co-tenant tmux sessions → a plain Claude Code there inherits
+    // BOTMUX_SESSION_ID/CHAT_ID and misroutes its AskUserQuestion hook to Lark.
+    const stripped = tmuxEnv({
+      BOTMUX: '1',
+      BOTMUX_SESSION_ID: '190222fc-bc5f-4481-849b-6161901b8506',
+      BOTMUX_CHAT_ID: 'oc_abc',
+      BOTMUX_LARK_APP_ID: 'cli_x',
+      BOTMUX_ROOT_MESSAGE_ID: 'om_x',
+      BOTMUX_BOT_INDEX: '12',           // daemon-internal, swept by the BOTMUX prefix
+      BOTMUX_QUIET_RESTART: '1',
+      SESSION_DATA_DIR: '/root/.botmux/data',
+      IS_SANDBOX: '1',
+      CLAUDE_CONFIG_DIR: '/root/.seed/.claude-runtime',
+      CODEX_HOME: '/root/.codex-bot',
+      HERMES_HOME: '/root/.hermes-bot',
+      HERMES_BOTMUX_SOURCE_HOME: '/root/.hermes-source',
+      HERMES_BOTMUX_PROFILES_ROOT: '/root/.hermes-profiles',
+      CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: '2147483647',
+      CJADK_INTERACTIVE: '0',
+      __OWNER_OPEN_ID: 'ou_x',
+      LARK_APP_ID: 'cli_bot',           // bare creds must not seed the global either
+      LARK_APP_SECRET: 'secret',
+      CLAUDECODE: '1',
+      // Legit passthrough — the tmux client still needs these.
+      PATH: '/usr/bin',
+      HOME: '/root',
+      LANG: 'en_US.UTF-8',
+      TERM: 'tmux-256color',
+    });
+    for (const leaked of [
+      'BOTMUX', 'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_LARK_APP_ID',
+      'BOTMUX_ROOT_MESSAGE_ID', 'BOTMUX_BOT_INDEX', 'BOTMUX_QUIET_RESTART',
+      'SESSION_DATA_DIR', 'IS_SANDBOX', 'CLAUDE_CONFIG_DIR', '__OWNER_OPEN_ID',
+      'CODEX_HOME', 'HERMES_HOME', 'HERMES_BOTMUX_SOURCE_HOME',
+      'HERMES_BOTMUX_PROFILES_ROOT', 'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
+      'CJADK_INTERACTIVE',
+      'LARK_APP_ID', 'LARK_APP_SECRET', 'CLAUDECODE',
+    ]) {
+      expect(stripped[leaked]).toBeUndefined();
+    }
+    // Non-botmux env the tmux client legitimately needs survives.
+    expect(stripped.HOME).toBe('/root');
+    expect(stripped.LANG).toBe('en_US.UTF-8');
+    expect(stripped.TERM).toBe('tmux-256color');
+    expect(stripped.PATH?.split(':')[0]).toBe('/usr/bin');
+  });
+
+  it('does not strip lookalike keys that merely contain "BOTMUX" mid-name', () => {
+    // The sweep is a prefix match (startsWith), not a substring match, so a
+    // user var like MY_BOTMUX_HINT is left untouched.
+    const stripped = tmuxEnv({ MY_BOTMUX_HINT: 'keep', PATH: '/usr/bin' });
+    expect(stripped.MY_BOTMUX_HINT).toBe('keep');
+  });
+
+  it('classifies every per-pane and redacted key as tmux-managed', () => {
+    for (const key of [...BOTMUX_INJECTED_ENV_KEYS, ...REDACTED_CHILD_ENV_KEYS]) {
+      expect(isBotmuxManagedTmuxEnvKey(key), key).toBe(true);
+    }
   });
 
   it('is safe to call with no args (defaults to process.env)', () => {
@@ -172,5 +236,85 @@ describe('tmux subcommand with stale $TMUX', () => {
         rmSync(probeTmpdir, { recursive: true, force: true });
       }
     },
+  );
+
+  it.skipIf(!tmuxAvailable)(
+    'startup scrub cleans a legacy server without mutating already-running panes',
+    () => {
+      const sock = `bmx-scrub-${process.pid}-${Date.now()}`;
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-tmux-scrub-'));
+      const existingOut = join(dir, 'existing.env');
+      const freshOut = join(dir, 'fresh.env');
+      const pollutedEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        BOTMUX_SESSION_ID: 'stale-session',
+        BOTMUX_CHAT_ID: 'stale-chat',
+        CODEX_HOME: '/stale/codex',
+        HERMES_HOME: '/stale/hermes',
+        LARK_APP_ID: 'stale-app',
+        HOME: '/safe/home',
+      };
+      delete pollutedEnv.TMUX;
+      delete pollutedEnv.TMUX_PANE;
+
+      try {
+        const started = spawnSync('tmux', [
+          '-L', sock, 'new-session', '-d', '-s', 'holder', '--',
+          '/bin/sh', '-c',
+          'tmux -L "$1" wait-for bmx-go; /usr/bin/env > "$2"; tmux -L "$1" wait-for -S bmx-existing-done; sleep 60',
+          '_', sock, existingOut,
+        ], { env: pollutedEnv, encoding: 'utf-8', timeout: 10_000 });
+        expect(started.status, started.stderr).toBe(0);
+
+        const scrub = scrubTmuxServerGlobalEnv(sock);
+        expect(scrub.serverFound).toBe(true);
+        expect(scrub.failed).toEqual([]);
+        expect(scrub.removed).toEqual(expect.arrayContaining([
+          'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'CODEX_HOME', 'HERMES_HOME', 'LARK_APP_ID',
+        ]));
+
+        const globalEnv = spawnSync('tmux', ['-L', sock, 'show-environment', '-g'], {
+          env: tmuxEnv(), encoding: 'utf-8', timeout: 5000,
+        });
+        expect(globalEnv.status, globalEnv.stderr).toBe(0);
+        expect(globalEnv.stdout).toContain('HOME=/safe/home');
+        for (const key of ['BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'CODEX_HOME', 'HERMES_HOME', 'LARK_APP_ID']) {
+          expect(globalEnv.stdout).not.toMatch(new RegExp(`(?:^|\\n)-?${key}(?:=|\\n|$)`));
+        }
+
+        // The holder existed before the global-table repair, so its process
+        // environment remains untouched.
+        expect(spawnSync('tmux', ['-L', sock, 'wait-for', '-S', 'bmx-go'], {
+          env: tmuxEnv(), timeout: 5000,
+        }).status).toBe(0);
+        expect(spawnSync('tmux', ['-L', sock, 'wait-for', 'bmx-existing-done'], {
+          env: tmuxEnv(), timeout: 5000,
+        }).status).toBe(0);
+        const existingEnv = readFileSync(existingOut, 'utf-8').split('\n');
+        expect(existingEnv).toContain('BOTMUX_SESSION_ID=stale-session');
+        expect(existingEnv).toContain('CODEX_HOME=/stale/codex');
+
+        // A raw pane created after the scrub no longer inherits any stale key.
+        const fresh = spawnSync('tmux', [
+          '-L', sock, 'new-session', '-d', '-s', 'fresh', '--',
+          '/bin/sh', '-c',
+          '/usr/bin/env > "$1"; tmux -L "$2" wait-for -S bmx-fresh-done; sleep 60',
+          '_', freshOut, sock,
+        ], { env: pollutedEnv, encoding: 'utf-8', timeout: 10_000 });
+        expect(fresh.status, fresh.stderr).toBe(0);
+        expect(spawnSync('tmux', ['-L', sock, 'wait-for', 'bmx-fresh-done'], {
+          env: tmuxEnv(), timeout: 5000,
+        }).status).toBe(0);
+        const freshEnv = readFileSync(freshOut, 'utf-8').split('\n');
+        for (const key of ['BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'CODEX_HOME', 'HERMES_HOME', 'LARK_APP_ID']) {
+          expect(freshEnv.some(line => line.startsWith(`${key}=`)), key).toBe(false);
+        }
+        expect(freshEnv).toContain('HOME=/safe/home');
+      } finally {
+        spawnSync('tmux', ['-L', sock, 'kill-server'], { env: tmuxEnv(), timeout: 5000 });
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    30_000,
   );
 });

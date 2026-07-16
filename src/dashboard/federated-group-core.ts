@@ -41,11 +41,38 @@ export function hubError(e: unknown): { status: number; error: string } {
   return e instanceof HubTimeout ? { status: 504, error: 'hub_timeout' } : { status: 502, error: 'hub_unreachable' };
 }
 
+export interface TeamGroupCreateResult {
+  ok: boolean;
+  chatId?: string;
+  shareLink?: string;
+  creator?: string;
+  invalidBotIds?: string[];
+  invalidUserIds?: string[];
+  invalidOwnerUnionIds?: string[];
+  ownerTransferredTo?: string | null;
+  transferError?: string | null;
+  notifyMessageId?: string | null;
+  notifyError?: string | null;
+  error?: string;
+}
+
+export interface TeamGroupOwnerTransferResult {
+  ownerTransferredTo: string | null;
+  transferError: string | null;
+  notifyMessageId?: string | null;
+  notifyError?: string | null;
+}
+
 export interface OrchestrateGroupDeps {
   /** Picks a LOCAL online creator + proxies to its daemon (federated bots added by app_id). */
-  createTeamGroup: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[] }) => Promise<{
-    ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; invalidOwnerUnionIds?: string[]; error?: string;
-  }>;
+  createTeamGroup: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[]; transferOwnerUnionId?: string }) => Promise<TeamGroupCreateResult>;
+  /** Re-enter the ORIGINAL local creator daemon after a remote deployment has
+   *  added the operator. Uses union_id so no app-scoped open_id crosses layers. */
+  transferTeamGroupOwner?: (args: {
+    creatorLarkAppId: string;
+    chatId: string;
+    transferOwnerUnionId: string;
+  }) => Promise<TeamGroupOwnerTransferResult>;
   fetcher: Fetcher;
   /** Live daemon-registry bots (authoritative local roster source). */
   live?: LiveBot[];
@@ -98,19 +125,28 @@ export async function orchestrateFederatedGroup(
   ]));
   const missingOperatorIdentity = !operatorUnionId;
 
-  const r = await deps.createTeamGroup({ name, larkAppIds: eligible, ownerUnionIds });
+  const r = await deps.createTeamGroup({
+    name,
+    larkAppIds: eligible,
+    ownerUnionIds,
+    transferOwnerUnionId: operatorUnionId,
+  });
   if (r.ok) {
     // The creator bot adds the owners IT can reach; owners outside its app's
     // visibility scope (Lark code 232024 — typically owners of OTHER deployments)
     // come back as invalidOwnerUnionIds. Add each of those via THEIR OWN
     // deployment's bot (which has them in scope) — hub→spoke delegate-add-owner.
-    let invalidOwners = r.invalidOwnerUnionIds ?? [];
+    const initiallyInvalidOwners = r.invalidOwnerUnionIds ?? [];
+    let invalidOwners = initiallyInvalidOwners;
     if (invalidOwners.length > 0 && r.chatId) {
       invalidOwners = await delegateAddOwners(dataDir, teamId, r.chatId, invalidOwners, eligible, requestId, deps.fetcher);
     }
+    const completed = await completeLocalDeferredOwnerTransfer(
+      r, initiallyInvalidOwners, invalidOwners, operatorUnionId, deps.transferTeamGroupOwner,
+    );
     // 记录 team↔chatId 绑定 —— 看板团队筛选据此识别「dashboard 发起的协作群」。
     if (r.chatId) recordTeamGroup(dataDir, teamId, String(r.chatId));
-    return { status: 200, body: { ...r, invalidOwnerUnionIds: invalidOwners, missingOperatorIdentity, skippedNoOwner } };
+    return { status: 200, body: { ...completed, invalidOwnerUnionIds: invalidOwners, missingOperatorIdentity, skippedNoOwner } };
   }
 
   // No local online creator → delegate to a reachable deployment that owns a
@@ -125,19 +161,23 @@ export async function orchestrateFederatedGroup(
         const dr = await fetchWithTimeout(deps.fetcher, `${dep.callbackUrl}/api/federation/delegate-group`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: `Bearer ${dep.delegationToken}` },
-          body: JSON.stringify({ name, larkAppIds: eligible, ownerUnionIds, requestId }),
+          body: JSON.stringify({ name, larkAppIds: eligible, ownerUnionIds, transferOwnerUnionId: operatorUnionId, requestId }),
         });
         const dj = await dr.json().catch(() => ({} as any));
         if (dr.ok && dj?.ok && dj.chatId) {
           // The delegate creator added the owners IT could; owners it couldn't
           // reach (e.g. a THIRD deployment's owner) must still be added via their
           // own deployment — same post-create delegation as the local-create path.
-          let invalidOwners = dj.invalidOwnerUnionIds ?? [];
+          const initiallyInvalidOwners: string[] = dj.invalidOwnerUnionIds ?? [];
+          let invalidOwners = initiallyInvalidOwners;
           if (invalidOwners.length > 0) {
             invalidOwners = await delegateAddOwners(dataDir, teamId, dj.chatId, invalidOwners, eligible, requestId, deps.fetcher);
           }
+          const completed = await completeDelegatedDeferredOwnerTransfer(
+            dep, dj, initiallyInvalidOwners, invalidOwners, operatorUnionId, requestId, deps.fetcher,
+          );
           recordTeamGroup(dataDir, teamId, String(dj.chatId));
-          return { status: 200, body: { ...dj, invalidOwnerUnionIds: invalidOwners, delegatedTo: dep.name, missingOperatorIdentity, skippedNoOwner } };
+          return { status: 200, body: { ...completed, invalidOwnerUnionIds: invalidOwners, delegatedTo: dep.name, missingOperatorIdentity, skippedNoOwner } };
         }
         lastErr = dj?.error || `hub_${dr.status}`;
       } catch (e) {
@@ -150,6 +190,76 @@ export async function orchestrateFederatedGroup(
     return { status: 502, body: { ok: false, error: lastErr } };
   }
   return { status: 502, body: r };
+}
+
+function deferredOperatorWasAdded(
+  operatorUnionId: string | undefined,
+  initiallyInvalidOwners: string[],
+  invalidOwners: string[],
+): operatorUnionId is string {
+  return !!operatorUnionId
+    && initiallyInvalidOwners.includes(operatorUnionId)
+    && !invalidOwners.includes(operatorUnionId);
+}
+
+async function completeLocalDeferredOwnerTransfer(
+  created: TeamGroupCreateResult,
+  initiallyInvalidOwners: string[],
+  invalidOwners: string[],
+  operatorUnionId: string | undefined,
+  transfer: OrchestrateGroupDeps['transferTeamGroupOwner'],
+): Promise<TeamGroupCreateResult> {
+  if (!deferredOperatorWasAdded(operatorUnionId, initiallyInvalidOwners, invalidOwners)) return created;
+  if (!created.chatId || !created.creator || !transfer) {
+    return { ...created, ownerTransferredTo: null, transferError: 'owner_transfer_retry_unavailable' };
+  }
+  try {
+    return {
+      ...created,
+      ...await transfer({
+        creatorLarkAppId: created.creator,
+        chatId: created.chatId,
+        transferOwnerUnionId: operatorUnionId,
+      }),
+    };
+  } catch {
+    return { ...created, ownerTransferredTo: null, transferError: 'owner_transfer_retry_failed' };
+  }
+}
+
+async function completeDelegatedDeferredOwnerTransfer(
+  creatorDeployment: { callbackUrl?: string; delegationToken?: string },
+  created: TeamGroupCreateResult,
+  initiallyInvalidOwners: string[],
+  invalidOwners: string[],
+  operatorUnionId: string | undefined,
+  requestId: string,
+  fetcher: Fetcher,
+): Promise<TeamGroupCreateResult> {
+  if (!deferredOperatorWasAdded(operatorUnionId, initiallyInvalidOwners, invalidOwners)) return created;
+  if (!creatorDeployment.callbackUrl || !creatorDeployment.delegationToken) {
+    return { ...created, ownerTransferredTo: null, transferError: 'owner_transfer_retry_unavailable' };
+  }
+  try {
+    const rr = await fetchWithTimeout(fetcher, `${creatorDeployment.callbackUrl}/api/federation/delegate-transfer-owner`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${creatorDeployment.delegationToken}` },
+      body: JSON.stringify({ requestId }),
+    });
+    const rj = await rr.json().catch(() => ({} as any));
+    if (!rr.ok || !rj?.ok) {
+      return { ...created, ownerTransferredTo: null, transferError: rj?.error || `owner_transfer_http_${rr.status}` };
+    }
+    return {
+      ...created,
+      ownerTransferredTo: rj.ownerTransferredTo ?? null,
+      transferError: rj.transferError ?? null,
+      notifyMessageId: rj.notifyMessageId ?? null,
+      notifyError: rj.notifyError ?? null,
+    };
+  } catch (e) {
+    return { ...created, ownerTransferredTo: null, transferError: hubError(e).error };
+  }
 }
 
 /**

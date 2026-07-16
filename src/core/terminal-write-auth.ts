@@ -2,11 +2,13 @@
 //
 // The web terminal grants write access one of two ways:
 //
-//  1. Platform-injected role — when a central platform fronts `/s`, it
+//  1. Private write-link token — the `?token=<workerToken>` query param. An
+//     explicitly issued write link is an independent capability and wins
+//     outright, including for a viewer the platform sees as guest/teammate.
+//
+//  2. Platform-injected role — when a central platform fronts `/s`, it
 //     authenticates the viewer and injects `X-Botmux-Role` (owner | teammate |
 //     guest), first stripping any client-supplied copy. Only `owner` may write.
-//
-//  2. Legacy write token — the `?token=<workerToken>` query param.
 //
 // The role header is trustworthy ONLY on a request that actually came through
 // the platform's authenticated reverse proxy. The dashboard `/s` bridge and the
@@ -24,7 +26,7 @@
 //
 // Otherwise the role header is ignored and write falls back to `?token=`.
 
-import { timingSafeEqual } from 'node:crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 
 export interface TerminalWriteInput {
   /** Value of the `X-Botmux-Role` request header (normalized to a single string, or undefined). */
@@ -38,18 +40,61 @@ export interface TerminalWriteInput {
   platformProxied: boolean;
 }
 
+export interface TerminalAccessInput extends TerminalWriteInput {
+  /** Whether the request's `?viewToken=` matched the worker's read capability. */
+  viewTokenMatches: boolean;
+}
+
+export interface TerminalAccessDecision {
+  hasRead: boolean;
+  hasWrite: boolean;
+  platformReadonly: boolean;
+}
+
+/**
+ * Derive a stable, read-only terminal capability for one session.  The domain
+ * separator prevents this HMAC from being confused with any other use of the
+ * dashboard secret, while binding to sessionId keeps a token from opening a
+ * different worker.  The host-only secret is masked from sandboxed CLIs.
+ */
+export function deriveTerminalViewToken(secret: string, sessionId: string): string {
+  return createHmac('sha256', secret)
+    .update('botmux-terminal-view-v1\0')
+    .update(sessionId)
+    .digest('base64url');
+}
+
 export function resolveTerminalWrite(
   { role, tokenMatches, platformBound, platformProxied }: TerminalWriteInput,
 ): { hasWrite: boolean; platformReadonly: boolean } {
+  // A matching private write-link token is an independent capability: the owner
+  // explicitly issued that link, so it grants write even for a viewer the
+  // platform authenticated as guest/teammate. Without it, a verified platform
+  // role decides; a role header outside the verified-proxy path is ignored.
+  if (tokenMatches) return { hasWrite: true, platformReadonly: false };
   if (platformBound && platformProxied && typeof role === 'string' && role) {
     const hasWrite = role === 'owner';
     return { hasWrite, platformReadonly: !hasWrite };
   }
-  return { hasWrite: tokenMatches, platformReadonly: false };
+  return { hasWrite: false, platformReadonly: false };
+}
+
+/** Resolve both read and write access without ever promoting a view token. */
+export function resolveTerminalAccess(input: TerminalAccessInput): TerminalAccessDecision {
+  const write = resolveTerminalWrite(input);
+  return {
+    // A valid dashboard cookie proves that the request passed through the
+    // authenticated dashboard/platform front door.  It grants observation even
+    // on an unbound local dashboard, while write still follows the stricter
+    // token/platform-owner rules above.
+    hasRead: write.hasWrite || input.viewTokenMatches || input.platformProxied,
+    ...write,
+  };
 }
 
 /** Constant-time equality (avoids leaking the dashboard token through compare timing). */
-function safeEqual(a: string, b: string): boolean {
+export function safeTerminalTokenEqual(a: string | null | undefined, b: string): boolean {
+  if (!a) return false;
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
   if (ab.length !== bb.length) return false;
@@ -90,6 +135,32 @@ export function resolveTerminalWriteForRequest(
   const role = typeof rawRole === 'string' ? rawRole : undefined;
   const cookieToken = readDashboardCookie(headers['cookie']);
   const activeToken = getDashboardToken();
-  const platformProxied = !!activeToken && !!cookieToken && safeEqual(cookieToken, activeToken);
+  const platformProxied = !!activeToken && safeTerminalTokenEqual(cookieToken, activeToken);
   return resolveTerminalWrite({ role, tokenMatches, platformBound: isPlatformBound(), platformProxied });
+}
+
+/**
+ * Request-level terminal access gate.  Unlike the legacy write-only resolver,
+ * this explicitly denies observation unless the caller has a view/write
+ * capability or an authenticated dashboard cookie.
+ */
+export function resolveTerminalAccessForRequest(
+  headers: Record<string, string | string[] | undefined>,
+  tokenMatches: boolean,
+  viewTokenMatches: boolean,
+  isPlatformBound: () => boolean,
+  getDashboardToken: () => string | null,
+): TerminalAccessDecision {
+  const rawRole = headers['x-botmux-role'];
+  const role = typeof rawRole === 'string' ? rawRole : undefined;
+  const cookieToken = readDashboardCookie(headers['cookie']);
+  const activeToken = getDashboardToken();
+  const platformProxied = !!activeToken && safeTerminalTokenEqual(cookieToken, activeToken);
+  return resolveTerminalAccess({
+    role,
+    tokenMatches,
+    viewTokenMatches,
+    platformBound: isPlatformBound(),
+    platformProxied,
+  });
 }

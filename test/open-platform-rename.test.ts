@@ -33,6 +33,9 @@ function fakeClient(calls: Call[], overrides: Record<string, unknown | ((body: u
         }
         throw new Error(`unexpected console call: ${path}`);
       },
+      async postForm(): Promise<unknown> {
+        throw new Error('unexpected form upload');
+      },
     },
   });
 }

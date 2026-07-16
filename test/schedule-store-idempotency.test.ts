@@ -148,13 +148,11 @@ describe('createTask — id provided, task exists with identical canonical input
     expect(second.repeat?.completed).toBe(1);
   });
 
-  it('ignores chatType (advisory field) — caller-omitted still matches', async () => {
-    const { createTask } = await freshImport();
+  it('treats chatType as canonical because it changes future session semantics', async () => {
+    const { createTask, IdempotencyConflictError } = await freshImport();
     const id = 'wf_chattype';
-    const a = createTask({ ...BASE_PARAMS, id, chatType: 'group' });
-    const b = createTask({ ...BASE_PARAMS, id }); // chatType missing
-    expect(b.id).toBe(a.id);
-    expect(b.chatType).toBe('group'); // existing preserved
+    createTask({ ...BASE_PARAMS, id, chatType: 'group' });
+    expect(() => createTask({ ...BASE_PARAMS, id })).toThrow(IdempotencyConflictError);
   });
 });
 

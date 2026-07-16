@@ -90,6 +90,72 @@ tail -f /tmp/botmux-hook.log
 
 默认会把 `content`、`message`、`description`、`finalOutput`、`lastScreenContent` 截断到 **600 字符**，并补充 `xxxLength` / `xxxTruncated`；只有 `redact.fullContentEvents` 内的事件透传全文。
 
+## 实践：用 session.start hook 自动更新 Skills
+
+botmux 原生集成了 agentbuddy 作为 skill 来源（`botmux skills install <agentbuddy命令>` 安装，`botmux skills update <name>` 更新）。配合 `session.start` hook，可以在每次新会话启动时自动检查并更新已安装的 skills，等效于 Relay / Claude Code settings.json 中的 SessionStart Hook。
+
+### 更新单个 skill
+
+```json
+[
+  {
+    "event": "session.start",
+    "command": "botmux skills update my-skill-name",
+    "timeoutMs": 60000
+  }
+]
+```
+
+### 更新全部已安装 skills
+
+`botmux skills update` 只接受单个 skill 名称，不支持 `*` 或正则。更新全部需要脚本循环：
+
+```bash
+#!/bin/bash
+# ~/bin/botmux-update-all-skills.sh
+botmux skills list | cut -f1 | while read -r name; do
+  [ -n "$name" ] && botmux skills update "$name"
+done
+```
+
+```json
+[
+  {
+    "event": "session.start",
+    "command": "/root/bin/botmux-update-all-skills.sh",
+    "timeoutMs": 120000
+  }
+]
+```
+
+### 直接调用 agentbuddy CLI 更新用户全局 Skills
+
+如果想直接运行 `npx agentbuddy update`（更新用户全局 skills，而非 botmux 管理的 skills），需要注意 botmux hook 的执行环境限制：`shell: false`（不支持重定向、管道）、环境变量被清洗（只保留 PATH/HOME/TMPDIR/SHELL/USER 等基础项）。建议写成包装脚本：
+
+```bash
+#!/bin/bash
+# ~/bin/agentbuddy-update.sh
+export npm_config_registry="https://bnpm.byted.org"
+npx -y agentbuddy update -y 2>/dev/null
+```
+
+```json
+[
+  {
+    "event": "session.start",
+    "command": "/root/bin/agentbuddy-update.sh",
+    "timeoutMs": 120000
+  }
+]
+```
+
+### 注意事项
+
+- **超时**：默认 `timeoutMs` 为 5000ms，agentbuddy update 涉及网络请求通常需要更久，必须显式加大（建议 60s+）。超时后 botmux 会先 `SIGTERM` 再 `SIGKILL` 整个进程组。
+- **fire-and-forget**：hook 是异步执行，不会阻塞会话启动；skill 更新完成后需新会话才生效。
+- **filter 过滤**：可用 `filter` 限定只对特定 `chatId` 或 `senderOpenId` 生效，避免所有会话都跑更新。
+- **推荐方式**：优先使用 `botmux skills update`（方式一），它经过 botmux 的 telemetry 清理（`clearAgentbuddyTelemetry`），更新的是 botmux 注入的 skill 版本，与 botmux skill 生命周期一致。
+
 ## 写自己的 hook
 
 hook 命令可以是任意 executable：bash / Python / Node / Go 二进制、公司内部 CLI、HTTP 转发器都行。命令 `exit 0` 视为成功；非 0 / 超时 / 找不到命令只写 botmux 日志，不会影响收发消息、定时任务或 session 生命周期。

@@ -25,6 +25,7 @@ export interface MaintenanceCfgInput {
 export interface DashboardSettingsInput {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  enableLocalCliOpen: boolean;
   maintenance: MaintenanceCfgInput;
   localDevInstall: boolean;
   /** Defaults to supported when absent for older dashboard payloads. */
@@ -42,6 +43,7 @@ export type SettingsSectionKey = 'access' | 'cards' | 'maintenance';
 export type SettingsToggleKey =
   | 'publicReadOnly'
   | 'openTerminalInFeishu'
+  | 'enableLocalCliOpen'
   | 'autoUpdate'
   | 'autoRestart';
 
@@ -126,6 +128,13 @@ export function composeSections(
         labelKey: 'settings.openTerminalInFeishu',
         hintKey: 'settings.openTerminalInFeishuHelp',
         enabled: settings.openTerminalInFeishu === true,
+        state: { enabled: canWrite },
+      },
+      {
+        key: 'enableLocalCliOpen',
+        labelKey: 'settings.enableLocalCliOpen',
+        hintKey: 'settings.enableLocalCliOpenHelp',
+        enabled: settings.enableLocalCliOpen === true,
         state: { enabled: canWrite },
       },
     ],

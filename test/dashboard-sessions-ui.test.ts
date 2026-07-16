@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
@@ -7,7 +8,9 @@ import {
   CLI_FILTER_OPTIONS,
   isUnknownChatSession,
   restartConfirmMessage,
+  historySenderKey,
   sessionLocationText,
+  shouldOpenWritableTerminal,
 } from '../src/dashboard/web/sessions.js';
 import { CliFilterGroup } from '../src/dashboard/web/sessions-page.js';
 
@@ -20,6 +23,7 @@ const kanbanCallbacks: SessionsKanbanCallbacks = {
     history: '<svg></svg>',
     lock: '<svg></svg>',
     restart: '<svg></svg>',
+    terminal: '<svg></svg>',
     unlock: '<svg></svg>',
   },
   lockActionLabel: row => (row.locked ? 'unlock' : 'lock'),
@@ -34,6 +38,8 @@ const kanbanCallbacks: SessionsKanbanCallbacks = {
   onRestart: () => {},
   onTeamScope: () => {},
   onToggleLock: () => {},
+  onToggleSelect: () => {},
+  selectedSessionIds: new Set<string>(),
 };
 
 function renderKanban(state: Partial<SessionsKanbanState>): string {
@@ -55,11 +61,21 @@ function renderKanban(state: Partial<SessionsKanbanState>): string {
 }
 
 describe('dashboard sessions filters', () => {
+  it('reads filter input values before entering React state updaters', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+
+    expect(page).toContain('const q = event.currentTarget.value;');
+    expect(page).toContain('const active = event.currentTarget.checked;');
+    expect(page).not.toContain('q: event.currentTarget.value');
+    expect(page).not.toContain('active: event.currentTarget.checked');
+  });
+
   it('derives CLI filter options from the shared CLI registry', () => {
     expect(CLI_FILTER_OPTIONS).toContain('codex');
     expect(CLI_FILTER_OPTIONS).toContain('codex-app');
     expect(CLI_FILTER_OPTIONS).toContain('mira');
     expect(CLI_FILTER_OPTIONS).toContain('pi');
+    expect(CLI_FILTER_OPTIONS).toContain('kiro-cli');
     expect(CLI_FILTER_OPTIONS).toContain('unknown');
     expect(new Set(CLI_FILTER_OPTIONS).size).toBe(CLI_FILTER_OPTIONS.length);
   });
@@ -94,6 +110,20 @@ describe('dashboard sessions filters', () => {
     expect(isUnknownChatSession(row, () => 'SellerIM Agent 集中营')).toBe(false);
     expect(isUnknownChatSession(namedDirect)).toBe(false);
     expect(isUnknownChatSession({}, () => null)).toBe(false);
+  });
+
+  it('groups consecutive app/bot history records by sender identity', () => {
+    expect(historySenderKey({ senderType: 'app', senderId: 'ou_bot' }))
+      .toBe(historySenderKey({ senderType: 'bot', senderId: 'ou_bot' }));
+    expect(historySenderKey({ senderType: 'bot', senderId: 'ou_other' }))
+      .not.toBe(historySenderKey({ senderType: 'bot', senderId: 'ou_bot' }));
+  });
+
+  it('prioritizes dashboard auth over public read-only sharing', () => {
+    expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: false })).toBe(true);
+    expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: true })).toBe(true);
+    expect(shouldOpenWritableTerminal({ authed: false, publicReadOnly: true })).toBe(false);
+    expect(shouldOpenWritableTerminal({ authed: false, publicReadOnly: false })).toBe(false);
   });
 
   it('renders the CLI filter as a multi-select checkbox group, not a dropdown', () => {
@@ -162,8 +192,10 @@ describe('dashboard sessions kanban react view', () => {
       ],
     });
 
-    expect(html).toContain('class="kanban-cluster"');
+    expect(html).toContain('class="kanban-cluster collapsed"');
     expect(html).toContain('data-chat="oc_1"');
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).not.toContain('data-id="cluster-a"');
     expect((html.match(/data-id="closed-/g) ?? []).length).toBe(50);
     expect(html).toContain('还有 5 个未显示');
   });

@@ -50,6 +50,7 @@
 | `lang` | 该 bot 的界面语言 `zh` / `en`；留空回落 `BOTMUX_LANG` / `LANG` 环境变量 |
 | `customPassthroughCommands` | 在固定透传白名单和当前 CLI adapter 默认放行命令之上，额外放行透传给底层 CLI 的 slash 命令，如 `["/export"]`（Claude Code / Codex 的 `/goal` 已默认放行）。自动归一化（缺失的 `/` 自动补、转小写、仅留 `[a-z0-9:_-]`、去重）；会遮蔽 botmux daemon 命令（如 `/status`）的项会被丢弃，配了也不生效。用 `/list-slash-command` 查看完整放行清单。见 [斜杠命令](/slash-commands) |
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
+| `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
 
 ### 接入 GLM / 第三方服务商（per-bot env）
 
@@ -70,6 +71,33 @@
 - **隔离**：env 按会话注入到 CLI 进程，全后端一致（tmux / zellij 经每个 pane 注入，绝不写共享 server 全局），所以一个 bot 的服务商配置不会串到别的 bot。
 - **安全**：值以明文存在 `bots.json` 与进程环境，不是密钥保险箱；`/config get` 等聊天面会脱敏显示（dashboard 编辑器 owner 鉴权后显示原值）。
 - 改完下个**新会话**生效。
+
+### Codex App 纯净输入（实验性）
+
+`codexAppCleanInput` 用于清理 Codex App 中显示的用户消息，同时保留 Botmux 调用模型所需的上下文。默认值为 `false` / `off`，关闭时完全沿用原来的组合 prompt 行为。
+
+可由 owner / `allowedUsers` 通过 `/botconfig` 热更新，无需重启 daemon：
+
+```text
+/botconfig set codexAppCleanInput on
+/botconfig set codexAppCleanInput off
+```
+
+也可直接写进对应 bot 的配置（手改 `bots.json` 后仍按本文末尾说明重启）：
+
+```json
+{
+  "cliId": "codex-app",
+  "codexAppCleanInput": true
+}
+```
+
+- 仅 Botmux 托管且 session 实际 CLI 为 `codex-app` 时使用此开关；其它 CLI 和 `/adopt` 外部桥接 session 不受影响。session 已冻结的 CLI 优先于后来修改的 bot 默认 CLI。
+- 开启后，用户发起的 turn 以用户原文作为 Codex App 的文本 `UserMessage`；Botmux 自己发起的 external trigger、文档预热等合成 turn 使用简短可读标签。sender、mentions、附件路径、引用、role、whiteboard、Skills 和合成 turn 的内部指令等上下文主要通过隐藏的 `additionalContext` 提供。可读的绝对路径图片还会作为 `localImage` 输入；缺失、相对或不可读图片会跳过原生图片项并记录提示，但附件路径仍留在上下文中。
+- 可识别的 Codex CLI `>= 0.135` 才启用纯净文本和 `additionalContext`；`>= 0.136` 时还会附带独立的 `clientUserMessageId`。版本过旧或无法识别时直接使用 legacy 组合 prompt。
+- 只有 app-server 在 `turn/started` 前明确拒绝 `additionalContext` / `clientUserMessageId` 实验字段时，runner 才用 legacy prompt **重试一次**，并在该 runner 生命周期内关闭纯净模式。网络、超时、模型或一般 turn 错误不会自动重试，以免重复执行。
+- `/botconfig` 切换在**下一次派发给 Codex worker**时采样；普通 live 消息通常就是下一条消息，等待 repo 选择的首轮则在 repo commit 时采样。已排队或正在执行的 turn 不会被中途改写，也不会回填既有历史。
+- `additionalContext` 不出现在 Codex App 的普通用户消息气泡中，但仍可能保存在原始 rollout / 诊断记录里。开启时 Botmux 自身也会保留 legacy prompt 与结构化 sidecar 以支持兼容降级和 `retry_last_task`。此功能只解决 App 展示与普通历史阅读的整洁度，**不是**隐私擦除或安全脱敏机制。
 
 ## 工作目录
 

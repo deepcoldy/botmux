@@ -1,13 +1,12 @@
 /**
  * v3 capability override（P2）— schema 校验 + 合并语义 + goal 渲染。
- *
- * 红线：节点只能降权/改道，永不提权——permissionMode 类型层面没有 'bypass'，
- * mergeNodeCapability 的 disableCliBypass 是 sticky-true。
+ * Workflow 权限姿态固定为 bypass；节点只允许改模型/追加指令。
  */
 import { describe, it, expect } from 'vitest';
 
 import { validateDag, DagValidationError } from '../src/workflows/v3/dag.js';
 import { mergeNodeCapability, renderGoalFile } from '../src/workflows/v3/runtime.js';
+import { botToSnapshot } from '../src/workflows/v3/bot-resolve.js';
 import type { BotSnapshot } from '../src/workflows/v3/contract.js';
 
 function goal(id: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -31,26 +30,33 @@ function problemsOf(fn: () => unknown): string[] {
 // ─── validateDag ─────────────────────────────────────────────────────────────
 
 describe('validateDag: override 校验', () => {
-  it('合法 override 归一化保留（model trim、三字段齐活）', () => {
+  it('合法 override 归一化保留（model trim + node instructions）', () => {
     const d = validateDag(
       dag([
         goal('a', {
-          override: { model: ' claude-haiku-4-5 ', permissionMode: 'restricted', systemPromptAppend: '只读分析，不要修改文件' },
+          override: { model: ' claude-haiku-4-5 ', systemPromptAppend: '只读分析，不要修改文件' },
         }),
       ]),
     );
     expect(d.nodes[0]!.override).toEqual({
       model: 'claude-haiku-4-5',
-      permissionMode: 'restricted',
       systemPromptAppend: '只读分析，不要修改文件',
     });
   });
 
-  it('permissionMode 没有 bypass 值（结构性防提权）', () => {
+  it('permissionMode 已下线，任何值都显式拒绝', () => {
     const problems = problemsOf(() =>
-      validateDag(dag([goal('a', { override: { permissionMode: 'bypass' } })])),
+      validateDag(dag([goal('a', { override: { permissionMode: 'restricted' } })])),
     );
-    expect(problems.some((p) => p.includes("only reduce privilege"))).toBe(true);
+    expect(
+      problems.some(
+        (p) =>
+          p.includes('unsupported key') &&
+          p.includes('permissionMode was removed') &&
+          p.includes('always require CLI bypass') &&
+          p.includes('delete this key'),
+      ),
+    ).toBe(true);
   });
 
   it('toolsSubset（P2b 延期）→ 显式报错而非静默忽略', () => {
@@ -112,9 +118,8 @@ describe('validateDag: override 校验', () => {
 
 // ─── mergeNodeCapability ─────────────────────────────────────────────────────
 
-describe('mergeNodeCapability: 只准降权', () => {
+describe('mergeNodeCapability: 只允许模型改道', () => {
   const permissive: BotSnapshot = { larkAppId: 'app', cliId: 'claude-code', workingDir: '/w', model: 'base-model' };
-  const restrictedBot: BotSnapshot = { ...permissive, disableCliBypass: true };
 
   it('无 override → 快照原样', () => {
     expect(mergeNodeCapability(permissive, undefined)).toEqual(permissive);
@@ -124,13 +129,12 @@ describe('mergeNodeCapability: 只准降权', () => {
     expect(mergeNodeCapability(permissive, { model: 'node-model' }).model).toBe('node-model');
   });
 
-  it('restricted 节点在宽松 bot 上 → 收紧', () => {
-    expect(mergeNodeCapability(permissive, { permissionMode: 'restricted' }).disableCliBypass).toBe(true);
-  });
-
-  it('受限 bot + inherit 节点 → 仍受限（sticky-true，不可清除）', () => {
-    expect(mergeNodeCapability(restrictedBot, { permissionMode: 'inherit' }).disableCliBypass).toBe(true);
-    expect(mergeNodeCapability(restrictedBot, { model: 'm' }).disableCliBypass).toBe(true);
+  it('受限 bot 在快照生成前 fail-fast，不能进入 workflow', () => {
+    expect(() => botToSnapshot({
+      larkAppId: 'restricted-app',
+      cliId: 'claude-code',
+      disableCliBypass: true,
+    } as any)).toThrow(/requires CLI bypass permissions.*disableCliBypass=true/);
   });
 });
 

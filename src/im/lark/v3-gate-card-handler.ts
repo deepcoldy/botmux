@@ -1,6 +1,6 @@
 /**
  * v3 humanGate 审批卡点击处理 —— card-handler 的 v3 分支（对称于 v0.2 的
- * `workflow-card-handler`，但走 v3 自己的 wait/journal 权威，不复用 v0.2 wait
+ * 走 v3 自己的 wait/journal 权威，不复用已下线的 v2 wait
  * path）。把一次点击翻译成：权限校验 → `resolveV3GateClick`（幂等 + terminal-safe）
  * → 冻结卡 / toast + 触发 `driveV3Run` 续跑。
  *
@@ -16,9 +16,8 @@ import {
   v3GateCardNonce,
   type V3GateActionValue,
 } from './v3-gate-card.js';
-import { resolveV3GateClick } from '../../workflows/v3/daemon-run.js';
+import { readV3RunChatBinding, resolveV3GateClick } from '../../workflows/v3/daemon-run.js';
 import {
-  readGrillState,
   defaultBaseDir,
   type RunChatBinding,
 } from '../../workflows/v3/grill-state.js';
@@ -67,8 +66,7 @@ export async function handleV3GateAction(
     return { toast: { type: 'warning', content: 'gate 卡已失效（nonce 不匹配）' } };
   }
   const runDir = join(baseDir, value.runId);
-  const grill = readGrillState(runDir);
-  const binding = grill?.chatBinding;
+  const binding = readV3RunChatBinding(runDir);
 
   if (deps.canResolve && !deps.canResolve(binding, operatorOpenId)) {
     return { toast: { type: 'warning', content: '你没有权限审批这个 gate' } };
@@ -130,11 +128,13 @@ export async function handleV3GateAction(
   // resolved → drive the run forward (fresh replay) + freeze this card.
   deps.driveRun(value.runId);
   const prompt = readWait(runDir, value.waitId)?.prompt ?? '';
+  const hostApproval = readWait(runDir, value.waitId)?.hostApproval;
   const frozen = buildV3GateCard({
     runId: value.runId,
     waitId: value.waitId,
     nodeId: value.nodeId,
     prompt,
+    hostApproval,
     resolution: { kind: outcome.resolution, by: operatorOpenId, selected },
   });
   return JSON.parse(frozen);

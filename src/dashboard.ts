@@ -3,13 +3,13 @@ import { createServer, get as httpGet, request as httpRequest, type IncomingMess
 import { createServer as createTcpServer, connect as netConnect } from 'node:net';
 import type { Duplex } from 'node:stream';
 import {
-  readFileSync, existsSync, mkdirSync, statSync, createReadStream,
+  readFileSync, existsSync, mkdirSync, readdirSync, statSync, createReadStream,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { randomBytes, createHmac } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { config } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
@@ -20,17 +20,23 @@ import {
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
-import { planGroupCreator } from './dashboard/team-group.js';
-import { handleWorkflowApi, jsonRes } from './dashboard/workflow-api.js';
+import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
+import { jsonRes } from './dashboard/http.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
 import { defaultRunsDir as v3RunsDir } from './workflows/v3/ops-projection.js';
+import {
+  verifyWorkflowDaemonIpcResponse,
+  workflowDaemonIpcHeaders,
+  WORKFLOW_DAEMON_IPC_ROUTE_PREFIX,
+  type WorkflowDaemonIpcTarget,
+} from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import { redactGroupsForPublic, redactSchedulesForPublic } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
-import { getRunsDir } from './workflows/runs-dir.js';
+import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 import { FeishuLoginManager } from './dashboard/feishu-login.js';
 import {
@@ -41,10 +47,13 @@ import {
   TTADK_DEFAULT_MODEL,
   TTADK_MODEL_SUGGESTIONS,
 } from './setup/cli-selection.js';
+import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { invalidateGlobalConfigCache, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import { buildDashboardUrls, type DashboardUrls } from './core/dashboard-url.js';
+import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxInstallRoot } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
@@ -59,6 +68,7 @@ import {
   UnsupportedGlobalInstallError,
   type GlobalInstallPlan,
 } from './utils/global-install.js';
+import { listCliRuntimeUpdateEntries } from './core/cli-runtime-update.js';
 import { writeRestartIntent } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
 import { spawn } from 'node:child_process';
@@ -75,34 +85,42 @@ import {
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
 } from './dashboard/groups-action-helpers.js';
-import { defaultWorkflowsActionDeps } from './dashboard/workflows-action-helpers.js';
-import {
-  listRuns as listRunsImpl,
-  readRunSnapshot as readRunSnapshotImpl,
-  scrubSnapshotForUnauthed as scrubSnapshotImpl,
-  isValidRunId as isValidRunIdImpl,
-  TERMINAL_RUN_STATUSES as TERMINAL_RUN_STATUSES_IMPL,
-  type RunSnapshotDTO,
-} from './workflows/ops-projection.js';
 import { createDaemonInternalApi } from './dashboard/daemon-internal-api.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
+import { createCliAdapterSync } from './adapters/cli/registry.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
   installLocalSkillLinks,
   readSkillRegistry,
   removeInstalledSkill,
+  removeInstalledSkills,
   updateInstalledSkillAsync,
 } from './services/skill-registry-store.js';
 import { redactGitUrlCredentials } from './core/skills/sources.js';
-import { getBot, loadBotConfigs, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
 import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
+import {
+  handleVcMeetingConsumerProfilesGet,
+  handleVcMeetingConsumerProfilesPut,
+  type VcMeetingConsumerProfilesApiDeps,
+} from './dashboard/vc-consumer-profiles-api.js';
+import {
+  buildVcMeetingConsumerBootstrapAgents,
+  seedVcMeetingDefaultConsumerProfile,
+} from './services/vc-meeting-consumer-profile-bootstrap.js';
+import { evaluateVcMeetingConsumerIsolation } from './services/vc-meeting-consumer-isolation.js';
+import { resolvePairedSpawnBackendType } from './core/persistent-backend.js';
+import {
+  readVcMeetingConsumerProfiles,
+  updateVcMeetingConsumerProfiles,
+} from './services/vc-meeting-consumer-profile-store.js';
 import { isValidRoleProfileId } from './services/role-profile-store.js';
 import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
@@ -112,19 +130,30 @@ import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
-import { automateOpenPlatformSetup } from './setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
+import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 import { larkHosts } from './im/lark/lark-hosts.js';
 import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
+import { readPluginRegistry } from './services/plugin-registry-store.js';
+import { pluginRuntimeDir, resolvePluginPath } from './core/plugins/paths.js';
+import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
+import { listPluginServiceStatus, startPluginServices, stopPluginServices } from './core/plugins/service-manager.js';
+import { materializePlugin } from './core/plugins/materializer.js';
+import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
+import { assertPluginBindingTransition, describePluginDependencyError } from './core/plugins/dependencies.js';
+import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import type { InstalledPluginRecord, PluginDashboardEntry } from './core/plugins/types.js';
+import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
 
-const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
+const SECRET_PATH = dashboardSecretPath();
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
 /** Per-daemon budget for the cross-daemon insight overview fan-out — bounds
  *  aggregate latency when one daemon's insight parse is slow or hung. */
 const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;
 const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
-const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
+const REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
 // botmux instance on this host). The actually-bound port is persisted here so
 // the `botmux dashboard` CLI can reach /__cli/rotate without guessing.
@@ -217,17 +246,6 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
   });
 }
 
-/** Sign a loopback request to a daemon's write-link route. The daemon verifies
- *  with the same .dashboard-secret, so only a caller that can read the secret —
- *  the dashboard — can mint write tokens; a bare local process that only knows
- *  the ipcPort can't. Same scheme as the `botmux dashboard` → /__cli/rotate
- *  HMAC. */
-function signDaemonTokenHeaders(): Record<string, string> {
-  const ts = Math.floor(Date.now() / 1000).toString();
-  const nonce = randomBytes(8).toString('hex');
-  const sig = createHmac('sha256', SECRET).update(`${ts}:${nonce}`).digest('base64url');
-  return { 'X-Botmux-Cli-Ts': ts, 'X-Botmux-Cli-Nonce': nonce, 'X-Botmux-Cli-Auth': sig };
-}
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
@@ -298,8 +316,14 @@ const attaching = new Set<string>();   // dedup concurrent attaches per appId
 interface ResolvedDashboardSettings {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  enableLocalCliOpen: boolean;
+  localCliOpenMode: 'attach' | 'resume';
   /** Experimental current-chat bot discovery via Lark `/members/bots`. Default ON. */
   chatBotDiscovery: boolean;
+  /** Machine-wide opt-in TraeX herdr plugin bootstrap. Default OFF.
+   *  `recommendedSource`/`recommendedRef` are a non-default, author-recommended
+   *  source the SPA can offer as a one-click fill; never persisted unless picked. */
+  herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
@@ -391,13 +415,43 @@ function refreshLocalVcMeetingAgentConfig(appId: string): void {
   }
 }
 
+function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
+  return {
+    readSnapshot: readVcMeetingConsumerProfiles,
+    updateSnapshot: updateVcMeetingConsumerProfiles,
+    loadBotConfigs,
+    effectiveDefaultWorkingDir,
+    onlineBotName: appId => registry.getByAppId(appId)?.botName,
+    isOnline: appId => !!registry.getByAppId(appId),
+    adapterReliableTurnTerminal: (cliId, cliPathOverride) => {
+      if (!cliId) return false;
+      try {
+        return createCliAdapterSync(cliId as CliId, cliPathOverride).reliableTurnTerminal === true;
+      } catch {
+        return false;
+      }
+    },
+    managedSideEffectIsolation: bot => evaluateVcMeetingConsumerIsolation({
+      sandbox: bot.sandbox,
+      platform: process.platform,
+      backendType: resolvePairedSpawnBackendType(
+        bot.cliId ?? config.daemon.cliId,
+        undefined,
+        bot.backendType,
+        config.daemon.backendType,
+      ),
+    }).ok,
+    reloadDaemons: reloadVcMeetingBotConfigOnDaemons,
+  };
+}
+
 async function reloadVcMeetingBotConfigOnDaemons(appIds: string[]): Promise<void> {
   const unique = [...new Set(appIds.filter(Boolean))];
   for (const appId of unique) refreshLocalVcMeetingAgentConfig(appId);
   await Promise.all(unique.map(async appId => {
     const d = registry.getByAppId(appId);
     if (!d) return;
-    await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-config/reload`, {
+    await fetchDaemonIpc(d.ipcPort, '/api/bot-config/reload', {
       method: 'POST',
       signal: AbortSignal.timeout(10_000),
     }).catch(() => undefined);
@@ -557,13 +611,13 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
               };
             }
           }
-          // Event subscription is also critical: if all 3 event update endpoints
-          // failed (eventWarning set, subscribedEventCount === 0), the bot won't
-          // receive vc.bot.meeting_*_v1 push events → meeting invite black hole.
-          if (result.eventWarning && result.subscribedEventCount === 0) {
+          // Event subscription is also critical: listener 缺任一 VC 事件都收不到
+          // 会议邀请(missingVcEvents 判定,总 count 无法区分缺的是不是 VC)。
+          const eventGateError = vcListenerEventGateError(result);
+          if (eventGateError) {
             return {
               ok: false,
-              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: 事件订阅全部失败(${result.eventWarning})，bot 无法接收会议邀请事件。请到开放平台手动订阅 VC 会议事件后重试。`,
+              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。请到开放平台手动订阅 VC 会议事件后重试。`,
             };
           }
         } else {
@@ -605,13 +659,13 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
               };
             }
           }
-          // Also check event subscription status — if event update failed (all 3
-          // endpoints) before the downstream api_error hit, the bot still won't
-          // receive meeting invite events → listener black hole.
-          if (result.eventWarning && (result.subscribedEventCount ?? 0) === 0) {
+          // Also check event subscription status — automation 走到订阅阶段时
+          // missingVcEvents 会带回来;listener 缺任一 VC 事件都不能保存。
+          const eventGateError = vcListenerEventGateError(result);
+          if (eventGateError) {
             return {
               ok: false,
-              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: 事件订阅失败(${result.eventWarning})，bot 无法接收会议邀请事件。自动化配置失败(${reason})，请手动订阅 VC 会议事件后重试。`,
+              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。自动化配置失败(${reason})，请手动订阅 VC 会议事件后重试。`,
             };
           }
         }
@@ -634,7 +688,8 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
         const entry = raw[idx] as Record<string, unknown>;
         const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
         let entryChanged = false;
-        if (next.enabled !== true) {
+        const firstEnable = next.enabled !== true;
+        if (firstEnable) {
           next.enabled = true;
           next.dashboardManagedListener = true;
           entryChanged = true;
@@ -644,17 +699,30 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
           entryChanged = true;
         }
         const mc = next.meetingConsumer;
-        if (!mc || typeof mc !== 'object' || Array.isArray(mc)) {
-          next.meetingConsumer = { enabled: true };
+        const mcRec = mc && typeof mc === 'object' && !Array.isArray(mc)
+          ? { ...(mc as Record<string, unknown>) }
+          : {};
+        // Selecting a global listener is the Dashboard's explicit opt-in to the
+        // complete meeting pipeline. It intentionally re-enables the listener's
+        // consumer surface; profile/default ownership is still preserved by the
+        // own-property gates in seedVcMeetingDefaultConsumerProfile below.
+        if (mcRec.enabled !== true) {
+          mcRec.enabled = true;
           entryChanged = true;
-        } else {
-          const mcRec = mc as Record<string, unknown>;
-          if (mcRec.enabled !== true) {
-            mcRec.enabled = true;
-            next.meetingConsumer = mcRec;
-            entryChanged = true;
-          }
         }
+        if (seedVcMeetingDefaultConsumerProfile(
+          mcRec,
+          nextAppId,
+          // Resolve against the latest locked bots.json snapshot, not a stale
+          // pre-lock load. This also makes fallback selection independent of
+          // the order in which bot entries happen to be stored.
+          buildVcMeetingConsumerBootstrapAgents(
+            parseBotConfigsFromText(JSON.stringify(raw)),
+          ),
+        )) {
+          entryChanged = true;
+        }
+        next.meetingConsumer = mcRec;
         if (entryChanged) {
           compactVcMeetingAgentEntry(entry, next);
           changed = true;
@@ -677,7 +745,13 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
         }
       }
 
-      if (changed) await writeRawConfigAtomic(path, raw);
+      if (changed) {
+        // Validate the complete post-mutation file before replacing bots.json.
+        // Keep this path symmetric with daemon bootstrap so a future generated
+        // default cannot make the Dashboard persist an invalid registry.
+        parseBotConfigsFromText(JSON.stringify(raw));
+        await writeRawConfigAtomic(path, raw);
+      }
     });
   } catch (err: any) {
     return { ok: false, error: `vcMeetingAgent_listenerBot_config_write_failed: ${err?.message ?? err}` };
@@ -695,7 +769,16 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
   return {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
+    enableLocalCliOpen: dashboard.enableLocalCliOpen === true,
+    localCliOpenMode: dashboard.localCliOpenMode ?? 'attach',
     chatBotDiscovery: dashboard.chatBotDiscovery !== false, // default ON
+    herdrTraexPlugin: {
+      enabled: dashboard.herdrTraexPlugin?.enabled === true,
+      source: dashboard.herdrTraexPlugin?.source ?? '',
+      ref: dashboard.herdrTraexPlugin?.ref ?? '',
+      recommendedSource: TRAEX_RECOMMENDED_SOURCE,
+      recommendedRef: TRAEX_RECOMMENDED_REF,
+    },
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,
@@ -721,7 +804,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
 // route call through this so error codes / merge semantics stay identical.
 async function reloadLocaleOnAllDaemons(): Promise<void> {
   await Promise.all(registry.list().map(d =>
-    fetch(`http://127.0.0.1:${d.ipcPort}/api/locale/reload`, { method: 'POST' }).catch(() => undefined),
+    fetchDaemonIpc(d.ipcPort, '/api/locale/reload', { method: 'POST' }).catch(() => undefined),
   ));
 }
 const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
@@ -744,6 +827,7 @@ const groupsActionDeps: GroupsActionDeps = {
   registryGetByAppId: (id) => registry.getByAppId(id),
   proxyToDaemon,
   closeSessionsMatching,
+  fetch: fetchDaemonUrl,
 };
 
 // ─── PR2 C8: Route B internal API (`/__daemon/*`) ───────────────────────────
@@ -768,15 +852,6 @@ const daemonInternalApi = createDaemonInternalApi({
   buildGroupsMatrix,
   settingsApplierDeps: settingsWriteApplierDeps,
   groupsActionDeps,
-  workflowsActionDeps: defaultWorkflowsActionDeps<RunSnapshotDTO>({
-    runsDir: getRunsDir(),
-    proxyToDaemon,
-    listRuns: listRunsImpl,
-    readRunSnapshot: readRunSnapshotImpl,
-    scrubSnapshotForUnauthed: scrubSnapshotImpl,
-    TERMINAL_RUN_STATUSES: TERMINAL_RUN_STATUSES_IMPL,
-    isValidRunId: isValidRunIdImpl,
-  }),
   proxyToDaemon,
   ownerOf: (sid) => aggregator.ownerOf(sid),
   scheduleOwnerOf: (id) => aggregator.scheduleOwnerOf(id),
@@ -827,7 +902,7 @@ async function cachedChangelog(current: string, now = Date.now()): Promise<Chang
 }
 
 /**
- * Run the ownership-aware npm/pnpm update for the manual-update flow WITHOUT blocking
+ * Run the ownership-aware npm/pnpm/Bun update for the manual-update flow WITHOUT blocking
  * the event loop (async spawn, not execSync — the dashboard must keep serving
  * during the ~10-30s install). Resolves on exit 0; rejects with the tail of
  * stdout/stderr on a non-zero exit, spawn error, or 3-minute timeout. Args are
@@ -837,9 +912,9 @@ function runGlobalInstallLatest(plan: GlobalInstallPlan): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const child = spawn(plan.command, plan.args, {
       cwd: globalInstallUpdateCwd(),
-      env: process.env,
+      env: { ...process.env, ...plan.env },
       stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32', // resolve npm.cmd / pnpm.cmd
+      shell: process.platform === 'win32', // resolve npm.cmd / pnpm.cmd / bun.exe
     });
     let tail = '';
     const capture = (d: Buffer): void => { tail = (tail + d.toString()).slice(-2000); };
@@ -875,8 +950,8 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
     // 1. Hydrate snapshot (blocking — completes before we wire SSE)
     try {
       const [sRes, schRes] = await Promise.all([
-        fetch(`http://127.0.0.1:${d.ipcPort}/api/sessions`),
-        fetch(`http://127.0.0.1:${d.ipcPort}/api/schedules`),
+        fetchDaemonIpc(d.ipcPort, '/api/sessions'),
+        fetchDaemonIpc(d.ipcPort, '/api/schedules'),
       ]);
       const s = await sRes.json() as { sessions: any[] };
       const sch = await schRes.json() as { schedules: any[] };
@@ -891,6 +966,7 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
         d.larkAppId,
         subscribeDaemon(d, aggregator, e =>
           logger.warn(`[aggregator] ${d.larkAppId}: ${e.message}`),
+          (_url, init) => fetchDaemonIpc(d.ipcPort, '/api/events', init),
         ),
       );
     }
@@ -1048,6 +1124,301 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
   }
 }
 
+function dashboardEntriesForRecord(record: InstalledPluginRecord): PluginDashboardEntry[] {
+  return record.contributions?.dashboard ?? [];
+}
+
+function listDashboardPluginEntries(): Array<{ pluginId: string; id: string; route: string; entry: string; url: string; displayName?: string; pinned: boolean }> {
+  const pinned = new Set(normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? []);
+  const out: Array<{ pluginId: string; id: string; route: string; entry: string; url: string; displayName?: string; pinned: boolean }> = [];
+  for (const record of Object.values(readPluginRegistry().plugins)) {
+    const dashboardEntries = dashboardEntriesForRecord(record);
+    for (const entry of dashboardEntries) {
+      out.push({
+        pluginId: record.id,
+        id: entry.id,
+        route: entry.route,
+        entry: entry.entry,
+        url: `/plugins/${encodeURIComponent(record.id)}/${entry.entry}`,
+        pinned: pinned.has(record.id),
+        ...(record.manifest.displayName ? { displayName: record.manifest.displayName } : {}),
+      });
+    }
+  }
+  return out.sort((a, b) => a.pluginId.localeCompare(b.pluginId) || a.id.localeCompare(b.id));
+}
+
+function servePluginStatic(res: ServerResponse, pathname: string): boolean {
+  const match = pathname.match(/^\/plugins\/([^/]+)\/(.+)$/);
+  if (!match) return false;
+  const pluginId = decodeURIComponent(match[1]);
+  const relPath = decodeURIComponent(match[2]);
+  const record = readPluginRegistry().plugins[pluginId];
+  if (!record) return false;
+  const dashboardEntries = dashboardEntriesForRecord(record);
+  const allowed = dashboardEntries.some((entry) => {
+    const base = entry.entry.replace(/\/[^/]*$/, '/');
+    return relPath === entry.entry || relPath.startsWith(base);
+  });
+  if (!allowed) return false;
+  try {
+    return serveFileAbs(res, resolvePluginPath(pluginRuntimeDir(pluginId), relPath, 'dashboard_asset'));
+  } catch {
+    return false;
+  }
+}
+
+function addPluginId(list: unknown, pluginId: string): string[] {
+  const current = normalizePluginIdList(list) ?? [];
+  return current.includes(pluginId) ? current : [...current, pluginId];
+}
+
+function removePluginId(list: unknown, pluginId: string): string[] {
+  return (normalizePluginIdList(list) ?? []).filter(id => id !== pluginId);
+}
+
+function pluginEnabledPatch(body: unknown): boolean | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const enabled = (body as { enabled?: unknown }).enabled;
+  return typeof enabled === 'boolean' ? enabled : null;
+}
+
+function pluginPinnedPatch(body: unknown): boolean | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const pinned = (body as { pinned?: unknown }).pinned;
+  return typeof pinned === 'boolean' ? pinned : null;
+}
+
+function writeDashboardPluginPin(pluginId: string, pinned: boolean): void {
+  const current = normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? [];
+  const next = pinned ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+  mergeDashboardConfig({ pinnedPlugins: next });
+}
+
+function requireInstalledPlugin(pluginId: string): InstalledPluginRecord | null {
+  if (!isValidPluginId(pluginId)) return null;
+  return readPluginRegistry().plugins[pluginId] ?? null;
+}
+
+function cleanPluginListForInstalled(list: unknown, installed: Set<string>): string[] {
+  return (normalizePluginIdList(list) ?? []).filter(id => installed.has(id));
+}
+
+function latestGatewayDiagnostics(): Map<string, unknown[]> {
+  const root = join(config.session.dataDir, 'mcp-gateway');
+  const byPlugin = new Map<string, unknown[]>();
+  if (!existsSync(root)) return byPlugin;
+  let files: string[] = [];
+  try {
+    files = readdirSync(root)
+      .filter(file => file.endsWith('.json'))
+      .sort((a, b) => statSync(join(root, b)).mtimeMs - statSync(join(root, a)).mtimeMs)
+      .slice(0, 50);
+  } catch { return byPlugin; }
+  const seen = new Set<string>();
+  for (const file of files) {
+    try {
+      const parsed = JSON.parse(readFileSync(join(root, file), 'utf-8'));
+      for (const server of Array.isArray(parsed?.servers) ? parsed.servers : []) {
+        const pluginId = typeof server?.pluginId === 'string' ? server.pluginId : '';
+        const serverName = typeof server?.serverName === 'string' ? server.serverName : '';
+        if (!pluginId || !serverName) continue;
+        const key = `${pluginId}\0${serverName}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const bucket = byPlugin.get(pluginId) ?? [];
+        bucket.push({ ...server, sessionId: parsed.sessionId, generatedAt: parsed.generatedAt });
+        byPlugin.set(pluginId, bucket);
+      }
+    } catch { /* one corrupt diagnostic must not hide the plugin page */ }
+  }
+  return byPlugin;
+}
+
+async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
+  const registryFile = readPluginRegistry();
+  const installed = new Set(Object.keys(registryFile.plugins));
+  const globalPlugins = cleanPluginListForInstalled(readGlobalConfig().plugins, installed);
+  const globalSet = new Set(globalPlugins);
+  const pinnedSet = new Set(normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? []);
+  let botConfigs: BotConfig[] = [];
+  try { botConfigs = loadBotConfigs(); } catch { /* setup can render before bots.json exists */ }
+  const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
+  const bots = botConfigs.map((bot, index) => {
+    return {
+      id: bot.larkAppId,
+      name: bot.displayName || onlineByAppId.get(bot.larkAppId)?.botName || bot.name || `Bot ${index + 1}`,
+      plugins: resolveEffectivePluginIds(bot, { plugins: globalPlugins }),
+    };
+  });
+  const gatewayAdapters = [...new Map(botConfigs.map(bot => {
+    const adapter = createCliAdapterSync(bot.cliId, bot.cliPathOverride);
+    return [adapter.id, inspectGatewayEntry(adapter)] as const;
+  })).values()];
+  const gatewayDiagnostics = latestGatewayDiagnostics();
+  const serviceReports = await listPluginServiceStatus();
+  const serviceByPlugin = new Map<string, typeof serviceReports>();
+  for (const report of serviceReports) {
+    const bucket = serviceByPlugin.get(report.pluginId) ?? [];
+    bucket.push(report);
+    serviceByPlugin.set(report.pluginId, bucket);
+  }
+  const plugins = Object.values(registryFile.plugins)
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map(record => ({
+      id: record.id,
+      packageName: record.packageName,
+      version: record.version,
+      source: record.source,
+      installedAt: record.installedAt,
+      updatedAt: record.updatedAt,
+      displayName: record.manifest.displayName,
+      dependencies: record.manifest.dependencies?.plugins ?? [],
+      contributions: record.contributions ?? {},
+      skillsCount: record.contributions?.skills?.length ?? (record.manifest as any).skills?.length ?? 0,
+      mcpCount: record.contributions?.mcp ? 1 : 0,
+      dashboard: dashboardEntriesForRecord(record).map(entry => ({
+        ...entry,
+        url: `/plugins/${encodeURIComponent(record.id)}/${entry.entry}`,
+      })),
+      service: record.manifest.service,
+      serviceReport: serviceByPlugin.get(record.id)?.[0],
+      pinnedToSidebar: pinnedSet.has(record.id) && dashboardEntriesForRecord(record).length > 0,
+      enabledGlobal: globalSet.has(record.id),
+      enabledByBot: Object.fromEntries(bots.map(bot => [bot.id, bot.plugins.includes(record.id)])),
+      gatewayAdapters,
+      mcpDiagnostics: gatewayDiagnostics.get(record.id) ?? [],
+    }));
+  return { plugins, globalPlugins, bots, gatewayAdapters };
+}
+
+function writeGlobalPluginBinding(pluginId: string, enabled: boolean): void {
+  const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+  assertPluginBindingTransition(pluginId, enabled, current);
+  if (enabled) materializePlugin(pluginId);
+  const next = enabled ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+  mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
+}
+
+async function writeBotPluginBinding(pluginId: string, larkAppId: string, enabled: boolean): Promise<boolean> {
+  try { loadBotConfigs(); } catch { return false; }
+  const path = requireConfigPath();
+  const defaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+  return withFileLock(path, async () => {
+    const raw = await readRawConfig(path);
+    const index = findEntryIndex(raw, larkAppId);
+    if (index < 0) return false;
+    const entry = raw[index];
+    const current = Object.prototype.hasOwnProperty.call(entry, 'plugins') ? entry.plugins : undefined;
+    const effective = resolveEffectivePluginIds(
+      { plugins: normalizePluginIdList(current) ?? [] },
+      { plugins: defaults },
+    );
+    assertPluginBindingTransition(pluginId, enabled, effective);
+    if (enabled) materializePlugin(pluginId);
+    const next = updateBotPluginOverride(current, pluginId, enabled);
+    if (next.length > 0) entry.plugins = next;
+    else delete entry.plugins;
+    await writeRawConfigAtomic(path, raw);
+    return true;
+  });
+}
+
+function pluginJson(res: ServerResponse, status: number, body: unknown): true {
+  jsonRes(res, status, body);
+  return true;
+}
+
+async function handlePluginManagementApi(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+): Promise<boolean> {
+  if (req.method === 'GET' && url.pathname === '/api/plugins') {
+    return pluginJson(res, 200, await listDashboardPluginsPayload());
+  }
+
+  let match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/pin$/);
+  if (match) {
+    if (req.method !== 'PUT') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    const record = requireInstalledPlugin(pluginId);
+    if (!record) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    if (dashboardEntriesForRecord(record).length === 0) {
+      return pluginJson(res, 409, { ok: false, error: 'plugin_dashboard_not_found' });
+    }
+    let body: unknown;
+    try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
+    const pinned = pluginPinnedPatch(body);
+    if (pinned === null) return pluginJson(res, 400, { ok: false, error: 'invalid_pinned' });
+    writeDashboardPluginPin(pluginId, pinned);
+    return pluginJson(res, 200, { ok: true, ...(await listDashboardPluginsPayload()) });
+  }
+
+  match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/global$/);
+  if (match) {
+    if (req.method !== 'PUT') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    let body: unknown;
+    try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
+    const enabled = pluginEnabledPatch(body);
+    if (enabled === null) return pluginJson(res, 400, { ok: false, error: 'invalid_enabled' });
+    try {
+      writeGlobalPluginBinding(pluginId, enabled);
+    } catch (error) {
+      const message = describePluginDependencyError(error);
+      if (message) return pluginJson(res, 409, { ok: false, error: message });
+      throw error;
+    }
+    return pluginJson(res, 200, { ok: true, ...(await listDashboardPluginsPayload()) });
+  }
+
+  match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/bots\/([^/]+)$/);
+  if (match) {
+    if (req.method !== 'PUT') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    const larkAppId = decodeURIComponent(match[2]);
+    if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    let body: unknown;
+    try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
+    const enabled = pluginEnabledPatch(body);
+    if (enabled === null) return pluginJson(res, 400, { ok: false, error: 'invalid_enabled' });
+    if ((normalizePluginIdList(readGlobalConfig().plugins) ?? []).includes(pluginId)) {
+      return pluginJson(res, 409, {
+        ok: false,
+        error: `插件 ${pluginId} 已全局启用；请先关闭全局启用，再按 Bot 配置。`,
+      });
+    }
+    try {
+      if (!await writeBotPluginBinding(pluginId, larkAppId, enabled)) {
+        return pluginJson(res, 404, { ok: false, error: 'bot_not_found' });
+      }
+    } catch (error) {
+      const message = describePluginDependencyError(error);
+      if (message) return pluginJson(res, 409, { ok: false, error: message });
+      throw error;
+    }
+    return pluginJson(res, 200, { ok: true, ...(await listDashboardPluginsPayload()) });
+  }
+
+  match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/services\/(start|stop|restart)$/);
+  if (match) {
+    if (req.method !== 'POST') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    const pluginId = decodeURIComponent(match[1]);
+    const action = match[2];
+    if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    const reports = action === 'start'
+      ? await startPluginServices([pluginId])
+      : action === 'restart'
+        ? [...await stopPluginServices([pluginId]), ...await startPluginServices([pluginId])]
+        : await stopPluginServices([pluginId]);
+    return pluginJson(res, 200, { ok: true, reports, ...(await listDashboardPluginsPayload()) });
+  }
+
+  return false;
+}
+
 // ─── HTTP routing ────────────────────────────────────────────────────────────
 
 function authedToken(req: IncomingMessage, url: URL): string | undefined {
@@ -1066,7 +1437,88 @@ async function proxyToDaemon(
       headers: { 'content-type': 'application/json' },
     });
   }
-  return fetch(`http://127.0.0.1:${d.ipcPort}${daemonPath}`, init);
+  const method = String(init.method ?? 'GET').toUpperCase();
+  const workflowPathTail = daemonPath.startsWith(`${WORKFLOW_DAEMON_IPC_ROUTE_PREFIX}/`)
+    ? daemonPath.slice(WORKFLOW_DAEMON_IPC_ROUTE_PREFIX.length + 1)
+    : '';
+  const isWorkflowMutation = method === 'POST' &&
+    /^[^/]+\/(?:start|cancel|retry|grant)(?:\?.*)?$/.test(workflowPathTail);
+  if (!isWorkflowMutation) {
+    // Non-workflow routes ride the shared trusted-host wrapper (route-bound
+    // X-Botmux-Cli-* HMAC). Workflow mutations keep the domain-separated
+    // full-envelope protocol below; the daemon admits that prefix through its
+    // narrow capability aperture and the handler fail-closes on the envelope.
+    return fetchDaemonIpc(d.ipcPort, daemonPath, init);
+  }
+  if (d.workflowIpcProtocol !== 'v1' || !d.bootInstanceId) {
+    return new Response(JSON.stringify({
+      ok: false,
+      error: 'daemon_upgrade_required',
+      message: 'target daemon does not advertise Workflow IPC v1; upgrade and restart all botmux processes',
+    }), { status: 503, headers: { 'content-type': 'application/json' } });
+  }
+  const bodyRaw = init.body === undefined || init.body === null
+    ? ''
+    : typeof init.body === 'string'
+      ? init.body
+      : (() => { throw new Error('Workflow daemon mutation body must be a pre-serialized string'); })();
+  const target: WorkflowDaemonIpcTarget = {
+    larkAppId: d.larkAppId,
+    ipcPort: d.ipcPort,
+    bootInstanceId: d.bootInstanceId,
+  };
+  const authHeaders = workflowDaemonIpcHeaders({
+    secret: SECRET,
+    method,
+    pathWithQuery: daemonPath,
+    bodyRaw,
+    target,
+  });
+  const workflowResponseAuth = {
+    nonce: authHeaders['X-Botmux-Workflow-Ipc-Nonce']!,
+    target,
+  };
+  const headers = new Headers(init.headers);
+  for (const [key, value] of Object.entries(authHeaders)) {
+    headers.set(key, value);
+  }
+  const upstream = await fetch(
+    `http://127.0.0.1:${d.ipcPort}${daemonPath}`,
+    { ...init, headers },
+  );
+  const responseBody = await upstream.text();
+  const authenticated = verifyWorkflowDaemonIpcResponse({
+    secret: SECRET,
+    requestNonce: workflowResponseAuth.nonce,
+    method,
+    pathWithQuery: daemonPath,
+    status: upstream.status,
+    body: responseBody,
+    target: workflowResponseAuth.target,
+    signature: upstream.headers.get('x-botmux-workflow-ipc-response-signature'),
+  });
+  if (!authenticated) {
+    return new Response(JSON.stringify({
+      ok: false,
+      error: 'daemon_response_unauthenticated',
+      message: 'target daemon response did not verify as Workflow IPC v1',
+    }), { status: 502, headers: { 'content-type': 'application/json' } });
+  }
+  return new Response(responseBody, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: upstream.headers,
+  });
+}
+
+/** Authenticated adapter for helpers that receive a discovered daemon URL. */
+function fetchDaemonUrl(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+  const url = new URL(input instanceof Request ? input.url : String(input));
+  const port = Number(url.port);
+  if (url.hostname !== '127.0.0.1' || !Number.isSafeInteger(port) || port <= 0) {
+    return Promise.reject(new Error('daemon helper attempted a non-loopback URL'));
+  }
+  return fetchDaemonIpc(port, `${url.pathname}${url.search}`, init);
 }
 
 /** Create a Feishu group from the team UI: pick a creator daemon among the
@@ -1118,8 +1570,8 @@ function liveBots(): { larkAppId: string; botName: string; cliId?: string }[] {
   });
 }
 
-async function createTeamGroup(args: { name: string; larkAppIds: string[]; userOpenId?: string; preferredCreator?: string; ownerUnionIds?: string[]; roleProfileId?: string }): Promise<{
-  ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; invalidUserIds?: string[]; invalidOwnerUnionIds?: string[]; error?: string; autoInviteUnavailable?: boolean;
+async function createTeamGroup(args: { name: string; larkAppIds: string[]; userOpenId?: string; preferredCreator?: string; ownerUnionIds?: string[]; transferOwnerUnionId?: string; roleProfileId?: string }): Promise<TeamGroupCreateResult & {
+  autoInviteUnavailable?: boolean;
 }> {
   const selectedIds = Array.from(new Set(args.larkAppIds.filter(Boolean)));
   if (selectedIds.length === 0) return { ok: false, error: 'no_bots_selected' };
@@ -1144,13 +1596,14 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
     const upstream = await proxyToDaemon(plan.creatorLarkAppId, '/api/groups/create', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
+      body: JSON.stringify(buildTeamGroupCreatePayload({
         name: args.name,
         larkAppIds: selectedIds,
         userOpenIds,
         ownerUnionIds: args.ownerUnionIds ?? [],
-        ...(args.roleProfileId ? { roleProfileId: args.roleProfileId } : {}),
-      }),
+        transferOwnerUnionId: args.transferOwnerUnionId,
+        roleProfileId: args.roleProfileId,
+      })),
     });
     const text = await upstream.text();
     let parsed: any = null;
@@ -1158,9 +1611,51 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
     if (!upstream.ok || !parsed?.ok || typeof parsed.chatId !== 'string') {
       return { ok: false, error: parsed?.error ?? `group_create_http_${upstream.status}` };
     }
-    return { ok: true, chatId: parsed.chatId, shareLink: typeof parsed.shareLink === 'string' ? parsed.shareLink : undefined, invalidBotIds: parsed.invalidBotIds ?? [], invalidUserIds: parsed.invalidUserIds ?? [], invalidOwnerUnionIds: parsed.invalidOwnerUnionIds ?? [], autoInviteUnavailable: !plan.inviteUser };
+    return {
+      ok: true,
+      chatId: parsed.chatId,
+      creator: plan.creatorLarkAppId,
+      shareLink: typeof parsed.shareLink === 'string' ? parsed.shareLink : undefined,
+      invalidBotIds: parsed.invalidBotIds ?? [],
+      invalidUserIds: parsed.invalidUserIds ?? [],
+      invalidOwnerUnionIds: parsed.invalidOwnerUnionIds ?? [],
+      ownerTransferredTo: parsed.ownerTransferredTo ?? null,
+      transferError: parsed.transferError ?? null,
+      notifyMessageId: parsed.notifyMessageId ?? null,
+      notifyError: parsed.notifyError ?? null,
+      autoInviteUnavailable: !plan.inviteUser,
+    };
   } catch {
     return { ok: false, error: 'group_create_proxy_failed' };
+  }
+}
+
+async function transferTeamGroupOwner(args: {
+  creatorLarkAppId: string;
+  chatId: string;
+  transferOwnerUnionId: string;
+}): Promise<TeamGroupOwnerTransferResult> {
+  try {
+    const upstream = await proxyToDaemon(args.creatorLarkAppId, '/api/groups/transfer-owner', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chatId: args.chatId, ownerUnionId: args.transferOwnerUnionId }),
+    });
+    const parsed = await upstream.json().catch(() => null) as any;
+    if (!upstream.ok || !parsed?.ok) {
+      return {
+        ownerTransferredTo: null,
+        transferError: parsed?.error ?? `owner_transfer_http_${upstream.status}`,
+      };
+    }
+    return {
+      ownerTransferredTo: parsed.ownerTransferredTo ?? null,
+      transferError: parsed.transferError ?? null,
+      notifyMessageId: parsed.notifyMessageId ?? null,
+      notifyError: parsed.notifyError ?? null,
+    };
+  } catch {
+    return { ownerTransferredTo: null, transferError: 'owner_transfer_proxy_failed' };
   }
 }
 
@@ -1193,7 +1688,7 @@ async function createLifecycleGroupForWebhook(
   const allowed = creator.resolvedAllowedUsers ?? [];
   const ownerUnionIds = allowed.filter(u => u.startsWith('on_'));
   const userOpenIds = allowed.filter(u => u.startsWith('ou_'));
-  const upstream = await fetch(`http://127.0.0.1:${creator.ipcPort}/api/groups/create`, {
+  const upstream = await fetchDaemonIpc(creator.ipcPort, '/api/groups/create', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -1227,7 +1722,7 @@ async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
     .sort((a, b) => a.botIndex - b.botIndex);
   await Promise.all(onlineBots.map(async d => {
     try {
-      const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/groups`);
+      const r = await fetchDaemonIpc(d.ipcPort, '/api/groups');
       if (!r.ok) return;
       const j = await r.json() as { chats?: any[] };
       for (const c of j.chats ?? []) {
@@ -1460,39 +1955,45 @@ function mergeSkillReferenceBot(refs: Map<string, SkillReferenceBot>, ref: Skill
   current.direct ||= ref.direct;
 }
 
-async function dashboardSkillReferences(skillName: string): Promise<SkillReferenceSummary> {
-  const refs = new Map<string, SkillReferenceBot>();
+async function dashboardSkillReferencesMany(skillNames: readonly string[]): Promise<Map<string, SkillReferenceSummary>> {
+  const uniqueNames = [...new Set(skillNames)];
+  const refsBySkill = new Map(uniqueNames.map(name => [name, new Map<string, SkillReferenceBot>()]));
   try {
-    for (const ref of analyzeSkillReferences(skillName, {
-      bots: loadBotConfigs(),
-    }).bots) mergeSkillReferenceBot(refs, ref);
+    const configuredBots = loadBotConfigs();
+    for (const name of uniqueNames) {
+      const refs = refsBySkill.get(name)!;
+      for (const ref of analyzeSkillReferences(name, { bots: configuredBots }).bots) mergeSkillReferenceBot(refs, ref);
+    }
   } catch {
     // Fall back to online daemon data below when the dashboard process cannot
     // read persistent bot config.
   }
 
   const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
-  const onlineRefs = await Promise.all(onlineBots.map(async d => {
+  const onlineConfigs = await Promise.all(onlineBots.map(async d => {
     try {
-      const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`, {
+      const r = await fetchDaemonIpc(d.ipcPort, '/api/bot-default-oncall', {
         signal: AbortSignal.timeout(1_500),
       });
       if (!r.ok) return null;
       const j = await r.json() as any;
-      const [ref] = analyzeSkillReferences(skillName, {
-        bots: [{ larkAppId: d.larkAppId, botName: d.botName ?? j.botName ?? d.larkAppId, skills: j.skills as BotSkillPolicy | null | undefined }],
-      }).bots;
-      return ref ?? null;
+      return { larkAppId: d.larkAppId, botName: d.botName ?? j.botName ?? d.larkAppId, skills: j.skills as BotSkillPolicy | null | undefined };
     } catch {
       return null;
     }
   }));
-  for (const ref of onlineRefs) {
-    if (ref) mergeSkillReferenceBot(refs, ref);
+  const availableOnlineConfigs = onlineConfigs.filter(config => config !== null);
+  for (const name of uniqueNames) {
+    const refs = refsBySkill.get(name)!;
+    for (const ref of analyzeSkillReferences(name, { bots: availableOnlineConfigs }).bots) mergeSkillReferenceBot(refs, ref);
   }
-  return {
+  return new Map([...refsBySkill].map(([name, refs]) => [name, {
     bots: [...refs.values()].sort((a, b) => a.botName.localeCompare(b.botName)),
-  };
+  }]));
+}
+
+async function dashboardSkillReferences(skillName: string): Promise<SkillReferenceSummary> {
+  return (await dashboardSkillReferencesMany([skillName])).get(skillName) ?? { bots: [] };
 }
 
 /** Extract the sessionId from a terminal path `/s/<sessionId>[/...]`. Returns
@@ -1529,8 +2030,8 @@ const server = createServer(async (req, res) => {
     // proxy on proxyBasePort+idx), so we resolve the session's owning daemon's
     // proxy port from the aggregator rows and forward there, streaming the
     // response straight back. Mounted before the dashboard auth gate because the
-    // terminal proxy / worker enforces its own write gate (read-only without
-    // token / platform role).
+    // worker independently requires a view/write capability or authenticated
+    // dashboard cookie before serving either HTTP or WebSocket terminal data.
     if (url.pathname === '/s' || url.pathname.startsWith('/s/')) {
       const sessionId = parseTerminalSessionId(url.pathname);
       const tport = sessionId ? aggregator.terminalProxyPortOf(sessionId) : undefined;
@@ -1567,7 +2068,7 @@ const server = createServer(async (req, res) => {
     // Federation HUB endpoints — cross-deployment, self-authed by invite code /
     // syncToken, so mounted before the token gate (like webhook/team routes).
     // createTeamGroup injected for the delegate-group path (hub→spoke 拉群).
-    if (await handleFederationApi(req, res, url, { createTeamGroup, liveBots })) {
+    if (await handleFederationApi(req, res, url, { createTeamGroup, transferTeamGroupOwner, liveBots })) {
       return;
     }
 
@@ -1637,11 +2138,8 @@ const server = createServer(async (req, res) => {
       activeToken: activeToken ?? '',
       publicReadOnly: dashboardSettings.publicReadOnly,
     });
-    // `authed` is consumed by route handlers that need to distinguish
-    // "request got in via public-read carve-out" from "request has a
-    // valid cookie" — e.g. `/api/workflows/runs/<id>/snapshot` strips
-    // log bytes when unauth'd.  Mirror of the `authed` check in
-    // `decideDashboardAuth`.
+    // `authed` is consumed by route handlers that distinguish the public-read
+    // carve-out from a valid management cookie (notably v3 run details).
     const authed = !!presentedToken && presentedToken === activeToken && !!activeToken;
 
     if (decision.kind === 'deny401') {
@@ -1657,6 +2155,14 @@ const server = createServer(async (req, res) => {
       });
       res.end();
       return;
+    }
+
+    if (url.pathname === '/api/workflows' || url.pathname.startsWith('/api/workflows/')) {
+      return jsonRes(res, 410, {
+        ok: false,
+        error: 'legacy_workflow_retired',
+        message: 'v2 workflow dashboard APIs are retired; use /api/v3/runs for v3 run visibility',
+      });
     }
 
     if (req.method === 'GET' && url.pathname === '/__dev/reload') {
@@ -1676,6 +2182,20 @@ const server = createServer(async (req, res) => {
       }, 500);
       req.on('close', () => clearInterval(timer));
       return;
+    }
+
+    if ((url.pathname === '/api/plugins' || url.pathname.startsWith('/api/plugins/'))
+      && await handlePluginManagementApi(req, res, url)) {
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/plugins/dashboard') {
+      return jsonRes(res, 200, { plugins: listDashboardPluginEntries() });
+    }
+
+    if (req.method === 'GET' && url.pathname.startsWith('/plugins/')) {
+      if (servePluginStatic(res, url.pathname)) return;
+      res.writeHead(404); res.end(); return;
     }
 
     // ─── Static frontend (index.html + /assets/* + /game/* + root icons) ───
@@ -1857,7 +2377,18 @@ const server = createServer(async (req, res) => {
         if ('feishuLoginQr' in result && result.feishuLoginQr) body.feishuLoginQr = result.feishuLoginQr;
         return jsonRes(res, 400, body);
       }
-      return jsonRes(res, 200, { ok: true, settings: result.settings });
+      // Opt-in TraeX herdr plugin: when this write enabled it (with a spec),
+      // install right away instead of waiting for the next daemon restart, and
+      // echo the outcome back so the SPA can toast success/failure. No-op for
+      // any settings write that didn't touch herdrTraexPlugin (or left it off /
+      // spec-less). Runs in-daemon (herdr on PATH here); never throws.
+      const herdrTraexInstall = await maybeInstallTraexPluginOnSettingsChange(
+        typeof parsed === 'object' && parsed !== null && 'herdrTraexPlugin' in parsed,
+        result.settings.herdrTraexPlugin,
+      );
+      return jsonRes(res, 200, herdrTraexInstall
+        ? { ok: true, settings: result.settings, herdrTraexInstall }
+        : { ok: true, settings: result.settings });
     }
 
     // ─── Version & manual update ─────────────────────────────────────────────
@@ -1875,10 +2406,22 @@ const server = createServer(async (req, res) => {
       // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
       // 2.86.0) is NOT flagged behind — exactly the canary case we want.
       const latest = await cachedLatestVersion();
+      const cliUpdates = listCliRuntimeUpdateEntries(config.session.dataDir).map((entry) => ({
+        cliId: entry.cliId,
+        binPath: entry.binPath,
+        current: entry.current,
+        latest: entry.latest,
+        updateAvailable: entry.updateAvailable,
+        updateCommand: entry.updateCommand,
+        ...(entry.installTarget ? { installTarget: entry.installTarget } : {}),
+        lastCheckedAt: entry.lastCheckedAt,
+      }));
       return jsonRes(res, 200, {
         current,
         latest,
         behind: !!latest && isNewerVersion(latest, current),
+        cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
+        cliUpdates,
         localDevInstall: isLocalDevInstall(),
         updateSupported: installPlan !== null,
         updateManager: installPlan?.manager ?? installManager,
@@ -1971,6 +2514,41 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && url.pathname === '/api/skills') {
       return jsonRes(res, 200, dashboardSkillsPayload());
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/api/skills') {
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+      const rawNames = Array.isArray(body.names) ? body.names : [];
+      if (rawNames.some(name => typeof name !== 'string')) return jsonRes(res, 400, { ok: false, error: 'invalid_skill_names' });
+      const names = [...new Set((rawNames as string[]).map(name => name.trim()).filter(Boolean))];
+      if (names.length === 0) return jsonRes(res, 400, { ok: false, error: 'skills_required' });
+      if (names.length > 500) return jsonRes(res, 400, { ok: false, error: 'too_many_skills' });
+      const registrySkills = readSkillRegistry().skills;
+      const missing = names.filter(name => !registrySkills[name]);
+      if (missing.length > 0) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed', missing });
+
+      const referencesBySkill = await dashboardSkillReferencesMany(names);
+      const references = names.map(name => ({ name, refs: referencesBySkill.get(name) ?? { bots: [] } }));
+      const affectedSkills = references
+        .filter(item => item.refs.bots.length > 0)
+        .map(item => ({ name: item.name, affectedBots: item.refs.bots }));
+      if (body.force !== true && affectedSkills.length > 0) {
+        return jsonRes(res, 409, {
+          ok: false,
+          error: 'skills_in_use',
+          affectedSkills,
+        });
+      }
+
+      const result = removeInstalledSkills(names);
+      if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason, missing: result.missing });
+      return jsonRes(res, 200, { ok: true, removed: result.removed, affectedSkills });
     }
 
     if (req.method === 'PUT' && url.pathname === '/api/skills/global') {
@@ -2125,7 +2703,7 @@ const server = createServer(async (req, res) => {
     }
 
     // Federation SPOKE endpoints (owner actions) — token-gated above.
-    if (await handleFederationSpokeApi(req, res, url, { createTeamGroup, liveBots })) {
+    if (await handleFederationSpokeApi(req, res, url, { createTeamGroup, transferTeamGroupOwner, liveBots })) {
       return;
     }
 
@@ -2137,23 +2715,47 @@ const server = createServer(async (req, res) => {
     // 含 aiden×claude / aiden×codex 网关项——前端打开"添加机器人"表单时拉取填充下拉.
     // id 既可能是普通 cliId, 也可能是 'aiden-x-claude' 这类选择键, 由 resolveCliSelection 解析.
     if (req.method === 'GET' && url.pathname === '/api/cli-options') {
+      const webSession = await botOnboarding.sessionStatus();
       return jsonRes(res, 200, {
-        options: CLI_SELECT_OPTIONS.map((o) => ({
-          id: o.key,
-          label: o.label,
-          // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
-          ...(isTtadkWrapper(o.wrapperCli)
-            ? { gateway: 'ttadk' as const, acceptsModel: ttadkAcceptsModel(o.wrapperCli) }
-            : {}),
-        })),
+        options: CLI_SELECT_OPTIONS.map((o) => {
+          // Keep the all-options scan shell-free so opening the form remains
+          // instant even when most of the 20+ CLIs are absent. The selected
+          // option is checked again with shell/rc resolution on submit/save.
+          const availability = checkCliAvailability({
+            cliId: o.cliId,
+            wrapperCli: o.wrapperCli,
+          }, { shellFallback: false });
+          return {
+            id: o.key,
+            label: o.label,
+            available: availability.available,
+            command: availability.command,
+            availabilityReason: availability.reason,
+            // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
+            ...(isTtadkWrapper(o.wrapperCli)
+              ? { gateway: 'ttadk' as const, acceptsModel: ttadkAcceptsModel(o.wrapperCli) }
+              : {}),
+          };
+        }),
         // ttadk 模型默认值 + 候选 (单一事实源在 cli-selection), 供前端模型框使用.
         ttadkModelDefault: TTADK_DEFAULT_MODEL,
         ttadkModelSuggestions: TTADK_MODEL_SUGGESTIONS,
+        suggestedAppName: botOnboarding.suggestedAppName(),
+        webSession,
       });
     }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
-      let parsed: { cliId?: unknown; workingDir?: unknown; dirMode?: unknown; model?: unknown };
+      let parsed: {
+        appName?: unknown;
+        registrationMode?: unknown;
+        sessionMode?: unknown;
+        expectedIdentity?: unknown;
+        cliId?: unknown;
+        workingDir?: unknown;
+        dirMode?: unknown;
+        model?: unknown;
+      };
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -2164,7 +2766,7 @@ const server = createServer(async (req, res) => {
       }
       // CLI: 把下拉传来的选择键 (普通 cliId 或 aiden-x-claude/codex) 解析成
       // { cliId, wrapperCli }——空 → 默认 claude-code; 非法键 → 400.
-      let cliId: CliId | undefined;
+      let cliId: CliId;
       let wrapperCli: string | undefined;
       try {
         const key = typeof parsed.cliId === 'string' && parsed.cliId.trim() ? parsed.cliId.trim() : 'claude-code';
@@ -2173,6 +2775,15 @@ const server = createServer(async (req, res) => {
         wrapperCli = sel.wrapperCli;
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
+      }
+      const availability = checkCliAvailability({ cliId, wrapperCli });
+      if (!availability.available) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'cli_not_found',
+          command: availability.command,
+          message: `所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 dashboard 所在机器安装后重试。`,
+        });
       }
       // 工作目录: 留空 → '~'; 在 daemon 主机上校验目录确实存在 (对齐 setup 的
       // ensureBotWorkingDirsExist). 失败 fail-fast, 让用户在扫码前就改对.
@@ -2191,7 +2802,40 @@ const server = createServer(async (req, res) => {
       }
       const dirMode = dirModeRaw === 'fixed' ? 'fixed' as const : dirModeRaw === 'card' ? 'card' as const : undefined;
       const model = typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : undefined;
-      const job = botOnboarding.start({ cliId, wrapperCli, workingDir, dirMode, model });
+      const appName = typeof parsed.appName === 'string' && parsed.appName.trim() ? parsed.appName.trim() : undefined;
+      if (appName && Array.from(appName).length > 64) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_app_name', message: '应用名称不能超过 64 个字符' });
+      }
+      const registrationModeRaw = typeof parsed.registrationMode === 'string' ? parsed.registrationMode.trim() : '';
+      if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web 或 compat' });
+      }
+      const registrationMode = registrationModeRaw === 'compat' ? 'compat' as const : 'web' as const;
+      const sessionModeRaw = typeof parsed.sessionMode === 'string' ? parsed.sessionMode.trim() : '';
+      if (registrationMode === 'web' && sessionModeRaw && sessionModeRaw !== 'reuse' && sessionModeRaw !== 'qr') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_session_mode', message: 'sessionMode 必须是 reuse 或 qr' });
+      }
+      const identityRecord = parsed.expectedIdentity && typeof parsed.expectedIdentity === 'object' && !Array.isArray(parsed.expectedIdentity)
+        ? parsed.expectedIdentity as Record<string, unknown>
+        : {};
+      const expectedIdentity = typeof identityRecord.userId === 'string' && identityRecord.userId
+        && typeof identityRecord.tenantId === 'string' && identityRecord.tenantId
+        ? { userId: identityRecord.userId, tenantId: identityRecord.tenantId }
+        : undefined;
+      if (registrationMode === 'web' && sessionModeRaw === 'reuse' && !expectedIdentity) {
+        return jsonRes(res, 400, { ok: false, error: 'missing_expected_identity', message: '免扫码添加前必须确认当前账号与企业' });
+      }
+      const sessionMode = sessionModeRaw === 'reuse' ? 'reuse' as const : 'qr' as const;
+      const job = botOnboarding.start({
+        appName,
+        registrationMode,
+        ...(registrationMode === 'web' ? { sessionMode, expectedIdentity } : {}),
+        cliId,
+        wrapperCli,
+        workingDir,
+        dirMode,
+        model,
+      });
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
     }
     let mOwner: RegExpMatchArray | null;
@@ -2338,7 +2982,7 @@ const server = createServer(async (req, res) => {
       const sid = decodeURIComponent(m[1]);
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
-      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/write-link`, { method: 'GET', headers: signDaemonTokenHeaders() });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/write-link`, { method: 'GET' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -2374,24 +3018,13 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // ─── Workflows (D0 read-only + D1 cancel mutation) ───────────────────────
-    //
-    // Dashboard reads runsDir directly (single-process; cross-daemon ownership
-    // doesn't matter for read-only).  All readers in `ops-projection` are
-    // pure: no mkdir, no EventLog instantiation.  Unknown / corrupt run → 404.
-    // Mutations are intentionally proxied to the owner daemon from
-    // chat-binding.larkAppId so only the daemon with live workflow runtime
-    // context writes the event log.
-    if (await handleWorkflowApi(req, res, url, {
-      runsDir: getRunsDir(),
+    // v3 workflow runs. Reads project directly from disk; cancel resolves the
+    // immutable run owner and proxies to that daemon (the dashboard never
+    // writes the v3 journal itself).
+    if (await handleV3RunsApi(req, res, url, {
+      runsDir: v3RunsDir(),
       proxyToDaemon,
     }, authed)) {
-      return;
-    }
-
-    // v3 workflow runs (read-only DAG + per-node terminal projection).  Reads
-    // the v3 run dirs directly; no daemon proxy (v3 runs are plain files).
-    if (await handleV3RunsApi(req, res, url, { runsDir: v3RunsDir() }, authed)) {
       return;
     }
 
@@ -2457,6 +3090,28 @@ const server = createServer(async (req, res) => {
     }
 
     // ─── Profiles (aggregate/proxy to daemon) ─────────────────────────────
+    // ─── 会议角色预设（私有 API：不在 PUBLIC_READ_PATHS，未认证已被 401） ───
+    if (url.pathname === '/api/vc-meeting/consumer-profiles') {
+      if (req.method === 'GET') {
+        const out = await handleVcMeetingConsumerProfilesGet(
+          url.searchParams.get('listenerBotAppId') ?? '',
+          vcMeetingConsumerProfilesApiDeps(),
+        );
+        return jsonRes(res, out.status, out.body);
+      }
+      if (req.method === 'PUT') {
+        let parsed: unknown;
+        try {
+          parsed = await readJsonBody(req);
+        } catch {
+          return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+        }
+        const out = await handleVcMeetingConsumerProfilesPut(parsed, vcMeetingConsumerProfilesApiDeps());
+        return jsonRes(res, out.status, out.body);
+      }
+      return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/role-profiles') {
       type RoleProfileAggregate = {
         profileId: string;
@@ -2467,7 +3122,7 @@ const server = createServer(async (req, res) => {
       const merged = new Map<string, RoleProfileAggregate>();
       await Promise.all(registry.list().map(async d => {
         try {
-          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/role-profiles`);
+          const r = await fetchDaemonIpc(d.ipcPort, '/api/role-profiles');
           if (!r.ok) return;
           const j = await r.json() as { profiles?: any[]; larkAppId?: string };
           for (const p of j.profiles ?? []) {
@@ -2565,7 +3220,10 @@ const server = createServer(async (req, res) => {
       const byBot = new Map<string, RoleProfileEntryAggregate>();
       await Promise.all(registry.list().map(async d => {
         try {
-          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/role-profiles/${encodeURIComponent(profileId)}`);
+          const r = await fetchDaemonIpc(
+            d.ipcPort,
+            `/api/role-profiles/${encodeURIComponent(profileId)}`,
+          );
           if (!r.ok) return;
           const j = await r.json() as { entries?: any[] };
           for (const entry of j.entries ?? []) {
@@ -2662,7 +3320,7 @@ const server = createServer(async (req, res) => {
       const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, agentFields)).sort((a, b) => a.botIndex - b.botIndex);
       const out = await Promise.all(onlineBots.map(async d => {
         try {
-          const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`);
+          const r = await fetchDaemonIpc(d.ipcPort, '/api/bot-default-oncall');
           if (!r.ok) {
             return botDefaultsPayload(d, undefined, `http_${r.status}`);
           }
@@ -2824,6 +3482,24 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/riff — proxy to that bot's daemon. Body
+    // `{ riff: string }` (raw JSON text; '' = clear).
+    let mBotRiff: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotRiff = url.pathname.match(/^\/api\/bots\/([^/]+)\/riff$/))) {
+      const appId = decodeURIComponent(mBotRiff[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-riff`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/sandbox — proxy to that bot's daemon. Body `{ enabled: boolean }`.
     let mBotSandbox: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotSandbox = url.pathname.match(/^\/api\/bots\/([^/]+)\/sandbox$/))) {
@@ -2832,6 +3508,41 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-sandbox`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/read-isolation — proxy to that bot's daemon. Body `{ enabled: boolean }`.
+    let mBotReadIso: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotReadIso = url.pathname.match(/^\/api\/bots\/([^/]+)\/read-isolation$/))) {
+      const appId = decodeURIComponent(mBotReadIso[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-read-isolation`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/backend-type — proxy to that bot's daemon. Body
+    // `{ backendType: 'pty'|'tmux'|'herdr'|'zellij'|'' }` ('' / 'auto' clears the override).
+    let mBotBackendType: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotBackendType = url.pathname.match(/^\/api\/bots\/([^/]+)\/backend-type$/))) {
+      const appId = decodeURIComponent(mBotBackendType[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-backend-type`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -3096,8 +3807,9 @@ const server = createServer(async (req, res) => {
           : undefined,
         roleProfileId: roleProfileId ?? undefined,
       };
-      const upstream = await fetch(
-        `http://127.0.0.1:${creator.ipcPort}/api/groups/create`,
+      const upstream = await fetchDaemonIpc(
+        creator.ipcPort,
+        '/api/groups/create',
         { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(forwardBody) },
       );
       const upstreamText = await upstream.text();

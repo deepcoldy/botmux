@@ -1,6 +1,25 @@
 // test/terminal-url.test.ts
-import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { config } from '../src/config.js';
+
+vi.mock('../src/global-config.js', () => ({
+  isRemoteAccessEnabled: vi.fn(() => false),
+}));
+
+// Partial mock: platformMachineBaseUrl is stubbed (no real platform.json on the
+// test box should leak in), but publicReverseProxyBaseUrl stays REAL — the
+// BOTMUX_PUBLIC_URL suite below drives it through process.env per test.
+vi.mock('../src/platform/binding.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/platform/binding.js')>();
+  return {
+    ...actual,
+    platformMachineBaseUrl: vi.fn(() => null),
+  };
+});
+
+import { isRemoteAccessEnabled } from '../src/global-config.js';
+import { platformMachineBaseUrl } from '../src/platform/binding.js';
+
 import {
   setTerminalProxyPort,
   setTerminalExternalPort,
@@ -9,7 +28,12 @@ import {
   buildTerminalUrl,
 } from '../src/core/terminal-url.js';
 
-const ds = { session: { sessionId: 'sess-123' }, workerPort: 9090, workerToken: 'wtok' };
+const ds = {
+  session: { sessionId: 'sess-123' },
+  workerPort: 9090,
+  workerToken: 'wtok',
+  workerViewToken: 'vtok',
+};
 
 // Keep the whole file hermetic w.r.t. BOTMUX_PUBLIC_URL, which buildTerminalUrl
 // now reads live and may be set in the shell running the suite (in prod it IS).
@@ -25,10 +49,14 @@ afterAll(() => {
 });
 
 describe('buildTerminalUrl', () => {
-  beforeEach(() => setTerminalProxyPort(8801));
+  beforeEach(() => {
+    vi.mocked(isRemoteAccessEnabled).mockReturnValue(false);
+    vi.mocked(platformMachineBaseUrl).mockReturnValue(null);
+    setTerminalProxyPort(8801);
+  });
 
   it('builds a read-only sub-path URL on the proxy port', () => {
-    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8801/s/sess-123`);
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8801/s/sess-123?viewToken=vtok`);
   });
 
   it('appends the worker token for write access', () => {
@@ -45,7 +73,31 @@ describe('buildTerminalUrl', () => {
 
   it('reflects an updated proxy port', () => {
     setTerminalProxyPort(8899);
-    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8899/s/sess-123`);
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8899/s/sess-123?viewToken=vtok`);
+  });
+});
+
+describe('buildTerminalUrl — platform remote access', () => {
+  beforeEach(() => {
+    setTerminalProxyPort(8801);
+    vi.mocked(isRemoteAccessEnabled).mockReturnValue(true);
+    vi.mocked(platformMachineBaseUrl).mockReturnValue('https://m-machine.botmux.example');
+  });
+
+  afterEach(() => {
+    vi.mocked(isRemoteAccessEnabled).mockReturnValue(false);
+    vi.mocked(platformMachineBaseUrl).mockReturnValue(null);
+    resetTerminalProxy();
+  });
+
+  it('keeps public platform links read-only', () => {
+    expect(buildTerminalUrl(ds)).toBe('https://m-machine.botmux.example/s/sess-123?viewToken=vtok');
+  });
+
+  it('preserves the private write token on platform links', () => {
+    expect(buildTerminalUrl(ds, { write: true })).toBe(
+      'https://m-machine.botmux.example/s/sess-123?token=wtok',
+    );
   });
 });
 
@@ -55,7 +107,7 @@ describe('buildTerminalUrl — WEB_EXTERNAL_PORT override', () => {
 
   it('advertises the external port instead of the local proxy port', () => {
     setTerminalExternalPort(9000);
-    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:9000/s/sess-123`);
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:9000/s/sess-123?viewToken=vtok`);
   });
 
   it('keeps the external port when appending the write token', () => {
@@ -67,13 +119,13 @@ describe('buildTerminalUrl — WEB_EXTERNAL_PORT override', () => {
 
   it('advertises the local proxy port when the external port is 0 (unset)', () => {
     setTerminalExternalPort(0);
-    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8801/s/sess-123`);
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8801/s/sess-123?viewToken=vtok`);
   });
 
   it('ignores the external port in direct fallback mode (per-session ports win)', () => {
     resetTerminalProxy();          // proxy never bound → direct worker ports
     setTerminalExternalPort(9000); // even with an external port configured...
-    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:9090`); // ...the worker port is used
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:9090?viewToken=vtok`); // ...the worker port is used
   });
 });
 
@@ -114,7 +166,7 @@ describe('buildTerminalUrl — BOTMUX_PUBLIC_URL (self-hosted reverse proxy)', (
 
   it('routes read-only links through the front door with no port', () => {
     process.env.BOTMUX_PUBLIC_URL = 'https://botmux.example.com';
-    expect(buildTerminalUrl(ds)).toBe('https://botmux.example.com/s/sess-123');
+    expect(buildTerminalUrl(ds)).toBe('https://botmux.example.com/s/sess-123?viewToken=vtok');
   });
 
   it('keeps the write token on the front-door link (no platform SSO here)', () => {
@@ -126,17 +178,17 @@ describe('buildTerminalUrl — BOTMUX_PUBLIC_URL (self-hosted reverse proxy)', (
 
   it('trims a trailing slash on the configured base', () => {
     process.env.BOTMUX_PUBLIC_URL = 'https://botmux.example.com/';
-    expect(buildTerminalUrl(ds)).toBe('https://botmux.example.com/s/sess-123');
+    expect(buildTerminalUrl(ds)).toBe('https://botmux.example.com/s/sess-123?viewToken=vtok');
   });
 
   it('overrides the local proxy-port form when set', () => {
     process.env.BOTMUX_PUBLIC_URL = 'http://botmux.example.com';
     // even with a proxy port bound, the public base wins over host:8801
-    expect(buildTerminalUrl(ds)).toBe('http://botmux.example.com/s/sess-123');
+    expect(buildTerminalUrl(ds)).toBe('http://botmux.example.com/s/sess-123?viewToken=vtok');
   });
 
   it('falls back to the local proxy port when unset', () => {
-    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8801/s/sess-123`);
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8801/s/sess-123?viewToken=vtok`);
   });
 });
 
@@ -144,7 +196,7 @@ describe('buildTerminalUrl — proxy unavailable fallback', () => {
   beforeEach(() => resetTerminalProxy());
 
   it('falls back to the direct worker port when the proxy never bound', () => {
-    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:9090`);
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:9090?viewToken=vtok`);
   });
 
   it('falls back with the write token appended', () => {

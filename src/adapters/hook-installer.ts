@@ -15,10 +15,11 @@ import { hookCommandParts } from './hook-command.js';
 
 export interface HookInstallConfig {
   readonly configPath: string;
-  readonly format: 'claude-settings' | 'opencode-plugin';
-  /** 可选（claude-settings）：同时把 SessionStart 就绪 hook 命令写进全局 settings.json。
-   *  见 adapters/cli/types.ts 的同名字段说明（为 wrapperCli=aiden x claude 这类剥 --settings
-   *  的启动器提供就绪信号）。 */
+  readonly format: 'claude-settings' | 'opencode-plugin' | 'grok-hooks';
+  /** 可选：SessionStart 就绪 hook 命令。
+   *  - claude-settings：写全局 settings.json
+   *  - grok-hooks：写 `~/.grok/hooks/*.json` 的 SessionStart
+   *  见 adapters/cli/types.ts 同名字段。 */
   readonly sessionStartCommand?: string;
 }
 
@@ -350,6 +351,45 @@ function installOpenCodePlugin(configPath: string, parts: { cmd: string; args: s
   }
 }
 
+// ─── Grok hooks/*.json 格式 ───────────────────────────────────────────────────
+//
+// Grok discovers global hooks from `~/.grok/hooks/*.json` (always trusted).
+// Schema:
+//   { "hooks": { "SessionStart": [ { "hooks": [ { "type":"command", "command":"..." } ] } ] } }
+// We only install SessionStart → `botmux session-ready` for the ready-gate.
+// Grok has no AskUserQuestion-equivalent hook today, so ask still uses the
+// botmux-ask skill / prompt catalog path.
+
+function installGrokHooks(configPath: string, sessionStartCommand: string | undefined): void {
+  if (!sessionStartCommand) {
+    logger.info(`[hook] grok-hooks 未提供 sessionStartCommand，跳过 → ${configPath}`);
+    return;
+  }
+  const doc = {
+    hooks: {
+      SessionStart: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command: sessionStartCommand,
+              // Fail-open: Grok ignores hook failures for lifecycle events.
+              // Exit 0 when BOTMUX_* env is missing so standalone `grok` is quiet.
+            },
+          ],
+        },
+      ],
+    },
+  };
+  const content = JSON.stringify(doc, null, 2) + '\n';
+  const changed = writeIfChanged(configPath, content);
+  if (changed) {
+    logger.info(`[hook] 已写入 Grok SessionStart ready hook → ${configPath}`);
+  } else {
+    logger.info(`[hook] Grok ready hook 已是最新，跳过写入 → ${configPath}`);
+  }
+}
+
 // ─── 主入口 ───────────────────────────────────────────────────────────────────
 
 /**
@@ -374,6 +414,10 @@ export function installHook(
       case 'opencode-plugin':
         // OpenCode 插件走 argv parts（异步 spawn），不复用 shell 字符串，避免被 split 拆坏。
         installOpenCodePlugin(configPath, hookCommandParts(cliId));
+        break;
+      case 'grok-hooks':
+        // Grok has no ask-hook surface yet; only SessionStart ready-gate.
+        installGrokHooks(configPath, hookInstall.sessionStartCommand);
         break;
       default: {
         // TypeScript exhaustiveness（编译时保障，运行时防御）

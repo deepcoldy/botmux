@@ -24,16 +24,19 @@ import {
   KANBAN_TEAM_STORAGE_KEY,
   normalizeSessionsViewMode,
   readStoredBoardOrder,
+  readStoredCreateKeepOpen,
   readStoredKanbanGroupBy,
   readStoredSessionsShowUnknownChats,
   readStoredSessionsViewMode,
   type KanbanGroupBy,
   type SessionsViewMode,
   writeStoredBoardOrder,
+  writeStoredCreateKeepOpen,
   writeStoredKanbanGroupBy,
   writeStoredSessionsShowUnknownChats,
   writeStoredSessionsViewMode,
 } from './preferences.js';
+import { OPEN_CREATE_SESSION_EVENT, consumePendingCreateSession } from './create-session-entry.js';
 import {
   BOARD_COLUMNS,
   CLI_FILTER_OPTIONS,
@@ -44,6 +47,7 @@ import {
   deriveSessionBoardColumn,
   fetchPickerBots,
   formatTokenCount,
+  historySenderKey,
   isUnknownChatSession,
   lockActionLabel,
   openWriteLink,
@@ -54,6 +58,7 @@ import {
   sessionRuntimeCounts,
   sessionSearchText,
   sessionStatusText,
+  shouldOpenWritableTerminal,
   terminalHref,
   tokenCount,
   type BoardColumnId,
@@ -192,32 +197,34 @@ function IconActionButton(props: {
 
 function TerminalControls(props: { row: any; url: string | null }): JSX.Element | null {
   if (!props.url) return null;
+  const readOnly = !shouldOpenWritableTerminal();
   return (
-    <span className={`term-pill${ui.authed ? '' : ' solo'}`}>
-      <a
-        className="term-btn term-open"
-        href={props.url}
-        target="_blank"
-        rel="noopener"
-        title={t('sessions.openTerminal')}
-        aria-label={t('sessions.openTerminal')}
-        onClick={event => event.stopPropagation()}
-        dangerouslySetInnerHTML={rawHtml(ICON.terminal)}
-      />
-      {ui.authed ? (
+    <span className={`term-pill${readOnly ? ' readonly' : ' writable'}`}>
+      {readOnly ? (
+        <a
+          className="term-btn term-open"
+          href={props.url}
+          target="_blank"
+          rel="noopener"
+          title={t('sessions.openTerminal')}
+          aria-label={t('sessions.openTerminal')}
+          onClick={event => event.stopPropagation()}
+          dangerouslySetInnerHTML={rawHtml(ICON.terminal)}
+        />
+      ) : (
         <button
           type="button"
           className="term-btn term-write"
           data-action="write-link"
-          title={t('sessions.writeLinkHint')}
-          aria-label={t('sessions.writeLink')}
+          title={t('sessions.openTerminal')}
+          aria-label={t('sessions.openTerminal')}
           onClick={(event) => {
             event.stopPropagation();
             void openWriteLink(props.row, event.currentTarget);
           }}
-          dangerouslySetInnerHTML={rawHtml(ICON.key)}
+          dangerouslySetInnerHTML={rawHtml(ICON.terminal)}
         />
-      ) : null}
+      )}
     </span>
   );
 }
@@ -468,7 +475,10 @@ function SessionsFilters(props: {
         name="q"
         placeholder={t('sessions.search')}
         value={props.filters.q}
-        onChange={event => props.setFilters(prev => ({ ...prev, q: event.currentTarget.value }))}
+        onChange={event => {
+          const q = event.currentTarget.value;
+          props.setFilters(prev => ({ ...prev, q }));
+        }}
       />
       <DropdownMenu
         label={statusLabel}
@@ -519,7 +529,10 @@ function SessionsFilters(props: {
           type="checkbox"
           name="active"
           checked={props.filters.active}
-          onChange={event => props.setFilters(prev => ({ ...prev, active: event.currentTarget.checked }))}
+          onChange={event => {
+            const active = event.currentTarget.checked;
+            props.setFilters(prev => ({ ...prev, active }));
+          }}
         />
         <span className="filter-toggle-label">{t('sessions.activeOnly')}</span>
         <span className="filter-toggle-switch" aria-hidden="true" />
@@ -1015,22 +1028,23 @@ function BoardView(props: {
   );
 }
 
-function HistoryBubble(props: { row: any; message: any; ownerOpenId?: string }): JSX.Element {
+function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: boolean }): JSX.Element {
   const m = props.message;
-  const mine = m.senderType === 'user';
-  const name = mine
+  const human = m.senderType === 'user';
+  const botSender = m.senderType === 'app' || m.senderType === 'bot';
+  const name = human
     ? (m.senderName || (props.ownerOpenId && m.senderId === props.ownerOpenId ? t('sessions.history.owner') : t('sessions.history.user')))
-    : botDisplayName(props.row);
+    : (m.senderName || String(m.senderId ?? '').slice(0, 16) || t(botSender ? 'sessions.history.bot' : 'sessions.history.system'));
   const content = String(m.content ?? '').trim() || `[${m.msgType ?? 'message'}]`;
   return (
-    <div className={`history-msg${mine ? ' mine' : ''}`}>
-      {mine ? (
+    <div className={`history-msg${props.groupStart ? ' group-start' : ' continuation'}`}>
+      {props.groupStart ? (human ? (
         m.senderAvatar ? (
           <img className="history-avatar-img" src={String(m.senderAvatar)} alt="" decoding="async" referrerPolicy="no-referrer" />
         ) : <span className="history-avatar-user" aria-hidden="true">{String(name).slice(0, 1)}</span>
-      ) : <span dangerouslySetInnerHTML={rawHtml(botAvatarHtml({ name: botDisplayName(props.row), larkAppId: props.row.larkAppId, size: 'sm' }))} />}
+      ) : <span className="history-avatar-bot" dangerouslySetInnerHTML={rawHtml(botAvatarHtml({ name, larkAppId: m.senderBotAppId, avatarUrl: m.senderAvatar, size: 'sm' }))} />) : <span className="history-avatar-spacer" aria-hidden="true" />}
       <div className="history-msg-main">
-        <div className="history-msg-meta"><span>{name}</span><time>{historyTime(m.createTime)}</time></div>
+        {props.groupStart ? <div className="history-msg-meta"><span>{name}</span><time>{historyTime(m.createTime)}</time></div> : null}
         <div className="history-bubble">{content}</div>
       </div>
     </div>
@@ -1082,8 +1096,13 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
             ) : null}
             {!props.state.loading && !props.state.error && props.state.messages.length > 0 ? (
               <div className="history-list">
-                {props.state.messages.map((message, index) => (
-                  <HistoryBubble key={message.messageId ?? index} row={row} message={message} ownerOpenId={props.state?.ownerOpenId} />
+                {props.state.messages.map((message, index, messages) => (
+                  <HistoryBubble
+                    key={message.messageId ?? index}
+                    message={message}
+                    ownerOpenId={props.state?.ownerOpenId}
+                    groupStart={index === 0 || historySenderKey(messages[index - 1]) !== historySenderKey(message)}
+                  />
                 ))}
               </div>
             ) : null}
@@ -1506,6 +1525,9 @@ function CreateSessionDialog(props: {
   const [bindWorkingDir, setBindWorkingDir] = useState('');
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [botQuery, setBotQuery] = useState('');
+  const [keepOpen, setKeepOpen] = useState(() => readStoredCreateKeepOpen(windowStorage()));
+  const [keptSuccess, setKeptSuccess] = useState<any>(null);
 
   useEffect(() => {
     if (!state) return;
@@ -1518,6 +1540,8 @@ function CreateSessionDialog(props: {
     setBindWorkingDir('');
     setAdvancedOpen(false);
     setSubmitting(false);
+    setBotQuery('');
+    setKeptSuccess(null);
   }, [state]);
 
   if (!state) return null;
@@ -1556,6 +1580,11 @@ function CreateSessionDialog(props: {
   const checkedIds = [...selectedBots];
   const leadOptions = checkedIds;
   const nameOf = (id: string) => bots.find(bot => bot.larkAppId === id)?.botName ?? id;
+  const botQueryNorm = botQuery.trim().toLowerCase();
+  const visibleBots = botQueryNorm
+    ? bots.filter(bot =>
+      bot.botName.toLowerCase().includes(botQueryNorm) || bot.larkAppId.toLowerCase().includes(botQueryNorm))
+    : bots;
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const text = content.trim();
@@ -1564,6 +1593,7 @@ function CreateSessionDialog(props: {
     const leadLarkAppId = lead || checkedIds[0] || '';
     if (mode === 'lead' && (!leadLarkAppId || !checkedIds.includes(leadLarkAppId))) { alert(t('sessions.create.errLead')); return; }
     setSubmitting(true);
+    setKeptSuccess(null);
     try {
       const r = await fetch('/api/sessions/create', {
         method: 'POST',
@@ -1579,8 +1609,16 @@ function CreateSessionDialog(props: {
         }),
       });
       const body = await r.json().catch(() => null);
-      if (r.ok && body?.ok) props.onSuccess(body);
-      else if (r.status !== 401) alert(`${t('sessions.create.failed')}: ${body?.error ?? r.status}`);
+      if (r.ok && body?.ok) {
+        if (keepOpen) {
+          // 连续创建：不切成功页、不关弹窗，保留机器人勾选等配置，清空内容/群名继续下一条
+          setKeptSuccess(body);
+          setContent('');
+          setName('');
+        } else {
+          props.onSuccess(body);
+        }
+      } else if (r.status !== 401) alert(`${t('sessions.create.failed')}: ${body?.error ?? r.status}`);
     } catch (e) {
       alert(`${t('sessions.create.failed')}: ${e}`);
     } finally {
@@ -1599,28 +1637,42 @@ function CreateSessionDialog(props: {
         <fieldset className="cs-bots">
           <legend>{t('sessions.create.bots')}</legend>
           {bots.length ? (
-            <div className="cs-bot-list">
-              {bots.map(bot => (
-                <label key={bot.larkAppId} className="cs-bot">
-                  <input
-                    type="checkbox"
-                    name="bot"
-                    value={bot.larkAppId}
-                    checked={selectedBots.has(bot.larkAppId)}
-                    onChange={event => {
-                      const checked = event.currentTarget.checked;
-                      setSelectedBots(prev => {
-                        const next = new Set(prev);
-                        if (checked) next.add(bot.larkAppId);
-                        else next.delete(bot.larkAppId);
-                        if (!next.has(lead)) setLead(next.values().next().value ?? '');
-                        return next;
-                      });
-                    }}
-                  /> <span>{bot.botName}</span>
-                </label>
-              ))}
-            </div>
+            <>
+              <input
+                className="cs-bot-search"
+                type="search"
+                name="botSearch"
+                placeholder={t('sessions.create.botSearchPlaceholder')}
+                aria-label={t('sessions.create.botSearchPlaceholder')}
+                value={botQuery}
+                onChange={event => setBotQuery(event.currentTarget.value)}
+              />
+              {visibleBots.length ? (
+                <div className="cs-bot-list">
+                  {visibleBots.map(bot => (
+                    <label key={bot.larkAppId} className="cs-bot">
+                      <input
+                        type="checkbox"
+                        name="bot"
+                        value={bot.larkAppId}
+                        checked={selectedBots.has(bot.larkAppId)}
+                        onChange={event => {
+                          const checked = event.currentTarget.checked;
+                          setSelectedBots(prev => {
+                            const next = new Set(prev);
+                            if (checked) next.add(bot.larkAppId);
+                            else next.delete(bot.larkAppId);
+                            if (!next.has(lead)) setLead(next.values().next().value ?? '');
+                            return next;
+                          });
+                        }}
+                      /> <span>{bot.botName}</span>
+                    </label>
+                  ))}
+                </div>
+              ) : <p className="cs-empty">{t('sessions.create.noBotMatch')}</p>}
+              {checkedIds.length ? <small>{t('sessions.create.selectedCount', { n: String(checkedIds.length) })}</small> : null}
+            </>
           ) : <p className="cs-empty">{t('sessions.create.noBots')}</p>}
         </fieldset>
         <fieldset className="cs-mode">
@@ -1671,7 +1723,33 @@ function CreateSessionDialog(props: {
           </div>
           ) : null}
         </fieldset>
+        {keptSuccess ? (
+          <p className="cs-keep-success" role="status">
+            <span>
+              {keptSuccess.column === 'backlog' ? t('sessions.create.doneBacklog') : t('sessions.create.doneInProgress')}
+              {Array.isArray(keptSuccess.failed) && keptSuccess.failed.length > 0
+                ? ` · ${t('sessions.create.partialFail', { n: String(keptSuccess.failed.length) })}`
+                : ''}
+            </span>
+            {typeof keptSuccess.shareLink === 'string' && keptSuccess.shareLink
+              ? <a href={keptSuccess.shareLink} target="_blank" rel="noopener">{t('sessions.create.openChat')}</a>
+              : null}
+          </p>
+        ) : null}
         <div className="actions cs-actions">
+          <label className="cs-keep-open" title={t('sessions.create.keepOpenHelp')}>
+            <input
+              type="checkbox"
+              name="keepOpen"
+              checked={keepOpen}
+              onChange={event => {
+                const next = event.currentTarget.checked;
+                setKeepOpen(next);
+                writeStoredCreateKeepOpen(windowStorage(), next);
+              }}
+            />
+            <span>{t('sessions.create.keepOpen')}</span>
+          </label>
           <button type="button" id="cs-cancel" onClick={props.onClose}>{t('sessions.create.cancel')}</button>
           <button type="submit" className="cs-submit" disabled={submitting || bots.length === 0}>{submitting ? t('sessions.create.submitting') : t('sessions.create.submit')}</button>
         </div>
@@ -2226,7 +2304,7 @@ function SessionsPage(): JSX.Element {
     setTermState({ sessionId: row.sessionId, url: readonlyUrl, loading: true });
     void (async () => {
       let url = readonlyUrl;
-      if (ui.authed) {
+      if (shouldOpenWritableTerminal()) {
         try {
           const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/write-link`);
           const body = await r.json().catch(() => ({}));
@@ -2433,6 +2511,18 @@ function SessionsPage(): JSX.Element {
     }
   };
 
+  // 侧边菜单「创建会话」入口：已在本页时收事件直接打开；跨页跳转时消费挂载前的 pending
+  useEffect(() => {
+    const maybeOpenFromEntry = () => {
+      if (consumePendingCreateSession() && ui.authed) void openCreateSession();
+    };
+    maybeOpenFromEntry();
+    window.addEventListener(OPEN_CREATE_SESSION_EVENT, maybeOpenFromEntry);
+    return () => window.removeEventListener(OPEN_CREATE_SESSION_EVENT, maybeOpenFromEntry);
+    // openCreateSession 只碰稳定的 ref/setState，取首次渲染的闭包即可
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <section className="page sessions-page">
       <div className="page-heading">
@@ -2636,6 +2726,7 @@ function SessionsPage(): JSX.Element {
                 history: ICON.history,
                 lock: ICON.lock,
                 restart: ICON.restart,
+                terminal: ICON.terminal,
                 unlock: ICON.unlock,
               }}
               lockActionLabel={lockActionLabel}
@@ -2650,6 +2741,13 @@ function SessionsPage(): JSX.Element {
               onRestart={(row, button) => { const s = store.sessions.get(String(row.sessionId)); if (s) void restartSession(s, button); }}
               onTeamScope={scope => setTeamScopeText(scope ? t('sessions.kanban.teamScope', { chats: scope.chats, sessions: scope.sessions }) : '')}
               onToggleLock={(row, button) => { const s = store.sessions.get(String(row.sessionId)); if (s) void setSessionLocked(s, !s.locked, button); }}
+              onToggleSelect={row => setSelected(prev => {
+                const id = String(row.sessionId);
+                const next = new Set(prev);
+                if (next.has(id)) next.delete(id); else next.add(id);
+                return next;
+              })}
+              selectedSessionIds={selected}
             />
           ) : null}
         </div>

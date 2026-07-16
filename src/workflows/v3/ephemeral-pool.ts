@@ -19,7 +19,7 @@ import {
   syntheticSessionUuid,
   type WorkerHandle,
   type WorkerProcessFactory,
-} from '../daemon-spawn.js';
+} from '../shared/worker-process.js';
 import {
   GOAL_ENV,
   type RunNode,
@@ -27,7 +27,15 @@ import {
   type RunNodeResult,
   type WorkerSessionInfo,
 } from './contract.js';
-import { workflowSandboxInitFields } from '../spawn-policy.js';
+import { workflowSandboxInitFields } from '../shared/sandbox-policy.js';
+import {
+  armV3AttemptWorkerFence,
+  bindV3AttemptWorkerFence,
+  closeV3ArmedFenceWithoutSpawn,
+  closeV3AttemptWorkerFence,
+  readV3AttemptWorkerFence,
+  removeV3AttemptWorkerFence,
+} from './worker-fence.js';
 
 type WorkerEvent = WorkerToDaemon;
 
@@ -74,29 +82,133 @@ async function runNodeImpl(
   req: RunNodeRequest,
   deps: RunNodeInternalDeps,
 ): Promise<RunNodeResult> {
-  const secret = await deps.resolveLarkAppSecret(req.botSnapshot.larkAppId);
   const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH] ?? join(req.attemptDir, 'manifest.json');
   const ptyLogPath = join(req.attemptDir, 'pty.log');
-  if (!secret) return { status: 'fail', manifestPath };
+  if (!req.workerFence) await mkdir(req.attemptDir, { recursive: true });
+  const armedFence = req.workerFence ??
+    armV3AttemptWorkerFence({
+      attemptDir: req.attemptDir,
+      runId: req.runId,
+      attemptId: req.attemptId,
+    });
+  // A durable run cancel may beat this dispatch into the pool. Never resolve
+  // credentials or fork a worker for an already-aborted attempt.
+  if (req.cancelSignal?.aborted) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'pre_aborted');
+    return { status: 'cancelled', manifestPath, cancelReason: req.cancelSignal.reason };
+  }
+  let secret: string | undefined;
+  try {
+    secret = await deps.resolveLarkAppSecret(req.botSnapshot.larkAppId);
+  } catch (err) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
+    throw err;
+  }
+  if (req.cancelSignal?.aborted) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'pre_aborted');
+    return { status: 'cancelled', manifestPath, cancelReason: req.cancelSignal.reason };
+  }
+  if (!secret) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'secret_missing');
+    return { status: 'fail', manifestPath };
+  }
 
-  await mkdir(dirname(stdoutPath(req)), { recursive: true });
-  await mkdir(dirname(stderrPath(req)), { recursive: true });
+  try {
+    await mkdir(dirname(stdoutPath(req)), { recursive: true });
+    await mkdir(dirname(stderrPath(req)), { recursive: true });
+  } catch (err) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
+    throw err;
+  }
+
+  if (req.cancelSignal?.aborted) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'pre_aborted');
+    return { status: 'cancelled', manifestPath, cancelReason: req.cancelSignal.reason };
+  }
 
   const cwd = expandWorkflowWorkingDir(req.botSnapshot.workingDir) ?? process.cwd();
   const sessionId = syntheticSessionUuid(`v3-${req.runId}-${req.attemptId}`);
-  const worker = deps.factory.spawn({
-    workerPath: deps.workerPath,
-    cwd,
-    env: {
-      ...process.env,
-      ...req.env,
-      [GOAL_ENV.V3_MARKER]: '1',
-      BOTMUX_WORKFLOW: '1',
-      BOTMUX_WORKFLOW_PTY_LOG_PATH: ptyLogPath,
-      BOTMUX_WORKFLOW_RUN_ID: req.runId,
-      BOTMUX_WORKFLOW_NODE_ID: req.node.id,
-    },
+  let worker: WorkerHandle;
+  try {
+    worker = deps.factory.spawn({
+      workerPath: deps.workerPath,
+      cwd,
+      env: {
+        ...process.env,
+        ...req.env,
+        [GOAL_ENV.V3_MARKER]: '1',
+        BOTMUX_WORKFLOW: '1',
+        BOTMUX_WORKFLOW_PTY_LOG_PATH: ptyLogPath,
+        BOTMUX_WORKFLOW_RUN_ID: req.runId,
+        BOTMUX_WORKFLOW_NODE_ID: req.node.id,
+      },
+    });
+  } catch (err) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'spawn_threw');
+    throw err;
+  }
+
+  // Register a close waiter before activation so even a child that fails in
+  // its first tick cannot escape the bind-failure drain path below.
+  let outerCloseSeen = false;
+  let resolveOuterClose: (() => void) | undefined;
+  let deferredWorkerError: Error | undefined;
+  let forwardWorkerError: ((error: Error) => void) | undefined;
+  const outerClose = new Promise<void>((resolve) => {
+    resolveOuterClose = resolve;
+    worker.on('close', () => {
+      outerCloseSeen = true;
+      resolve();
+    });
   });
+  // A fork that fails asynchronously emits `error` before/alongside `close`
+  // and may have no pid, which makes fence binding fail immediately. Install
+  // the listener before binding so that path cannot surface an unhandled
+  // EventEmitter error and crash the daemon. Once the main settle state
+  // exists, forward the first deferred error into its ordinary failure path.
+  worker.on('error', (err) => {
+    void appendLine(stderrPath(req), `[worker] process error: ${err.message}`);
+    if (forwardWorkerError) forwardWorkerError(err);
+    else deferredWorkerError ??= err;
+  });
+  try {
+    bindV3AttemptWorkerFence({
+      worker,
+      attemptDir: req.attemptDir,
+      armed: armedFence,
+      onCleanupError: (err) => {
+        void appendLine(stderrPath(req), `[v3] worker fence close failed: ${err instanceof Error ? err.message : String(err)}`);
+      },
+    });
+  } catch (bindError) {
+    // Fork succeeded, so never reject until the outer process resource fence
+    // closes. Otherwise runtime could settle the node while an unfenced worker
+    // continues executing. Escalate close → TERM → KILL and then preserve a
+    // closed tombstone (or remove the still-armed record after proven close).
+    try { worker.send({ type: 'close' }); } catch { /* child may not have IPC */ }
+    const term = setTimeout(() => {
+      try { worker.kill('SIGTERM'); } catch { /* already gone */ }
+    }, 250);
+    const kill = setTimeout(() => {
+      try { worker.kill('SIGKILL'); } catch { /* already gone */ }
+    }, 250 + deps.cancelGraceMs);
+    if (!outerCloseSeen) await outerClose;
+    clearTimeout(term);
+    clearTimeout(kill);
+    try {
+      const current = readV3AttemptWorkerFence(req.attemptDir, {
+        runId: req.runId,
+        attemptId: req.attemptId,
+      });
+      if (current?.phase === 'active') closeV3AttemptWorkerFence(req.attemptDir, current);
+      else if (current?.phase === 'armed') removeV3AttemptWorkerFence(req.attemptDir, current);
+    } catch { /* recovery will fail closed on a malformed/stale fence */ }
+    throw bindError;
+  } finally {
+    // Keep a strong reference until listeners are installed; this assignment
+    // also documents that close can race activation without being lost.
+    void resolveOuterClose;
+  }
 
   drainWorkerDiagnostics(worker, req);
 
@@ -109,9 +221,9 @@ async function runNodeImpl(
     cliId: req.botSnapshot.cliId,
     cliPathOverride: req.botSnapshot.cliPathOverride,
     model: req.botSnapshot.model,
-    // P2: 受限 bot / restricted 节点 → worker 关闭 CLI 权限旁路（adapter 据此
-    // 不再注入 --dangerously-skip-permissions / --yolo 等 bypass flag）。
-    disableCliBypass: req.botSnapshot.disableCliBypass === true,
+    // Workflow workers require CLI bypass permissions by product contract.
+    // Restricted bots are rejected before a BotSnapshot is created.
+    disableCliBypass: false,
     ...workflowSandboxInitFields(req.botSnapshot),
     backendType: 'pty' as const,
     prompt: '',
@@ -124,7 +236,9 @@ async function runNodeImpl(
 
   return new Promise<RunNodeResult>((resolve) => {
     let settled = false;
+    let pendingResult: { status: 'ok' | 'fail'; reason: string } | undefined;
     let quiesceTimer: NodeJS.Timeout | undefined;
+    let sigtermTimer: NodeJS.Timeout | undefined;
     let sigkillTimer: NodeJS.Timeout | undefined;
     let manifestTimer: NodeJS.Timeout | undefined;
     let manifestCandidate: { size: number; mtimeMs: number; firstSeenMs: number } | undefined;
@@ -134,6 +248,7 @@ async function runNodeImpl(
     let initSent = false;
     let goalSent = false;
     let sessionReadyNotified = false;
+    let cancelReason: unknown;
 
     const hardDeadline = setTimeout(() => {
       finish('fail', 'timeout');
@@ -160,28 +275,36 @@ async function runNodeImpl(
       }
     }
 
-    function cleanup(signal: NodeJS.Signals = 'SIGTERM'): void {
+    function requestWorkerExit(): void {
       clearTimeout(hardDeadline);
       if (quiesceTimer) clearTimeout(quiesceTimer);
       if (manifestTimer) clearTimeout(manifestTimer);
-      req.cancelSignal?.removeEventListener('abort', onAbort);
       try { worker.send({ type: 'close' }); } catch { /* worker may be gone */ }
-      setTimeout(() => {
-        try { worker.kill(signal); } catch { /* worker may be gone */ }
+      sigtermTimer = setTimeout(() => {
+        try { worker.kill('SIGTERM'); } catch { /* worker may be gone */ }
       }, 250);
+      // A normal success/failure must also be fenced by the outer worker exit.
+      // If close+SIGTERM cannot stop it, use the same bounded hard fallback as
+      // cancellation; never leave the runtime waiting forever on a wedged child.
+      sigkillTimer = setTimeout(() => {
+        void appendLine(stderrPath(req), `[v3] worker exit grace expired; escalating to SIGKILL`);
+        try { worker.kill('SIGKILL'); } catch { /* worker may be gone */ }
+      }, 250 + deps.cancelGraceMs);
     }
 
     function finish(status: RunNodeResult['status'], reason: string): void {
-      if (settled) return;
-      settled = true;
-      cleanup(status === 'ok' ? 'SIGTERM' : 'SIGTERM');
-      void appendLine(stderrPath(req), `[v3] worker finished status=${status} reason=${reason}`);
-      resolve({ status, manifestPath, sessionInfo: sessionInfo() });
+      if (settled || cancelRequested || pendingResult) return;
+      if (status === 'cancelled') return;
+      pendingResult = { status, reason };
+      void appendLine(stderrPath(req), `[v3] worker outcome claimed status=${status} reason=${reason}; waiting for worker exit`);
+      requestWorkerExit();
     }
 
     function onAbort(): void {
       if (settled || cancelRequested) return;
       cancelRequested = true;
+      cancelReason = req.cancelSignal?.reason;
+      pendingResult = undefined;
       clearTimeout(hardDeadline);
       if (quiesceTimer) {
         clearTimeout(quiesceTimer);
@@ -190,6 +313,14 @@ async function runNodeImpl(
       if (manifestTimer) {
         clearTimeout(manifestTimer);
         manifestTimer = undefined;
+      }
+      if (sigtermTimer) {
+        clearTimeout(sigtermTimer);
+        sigtermTimer = undefined;
+      }
+      if (sigkillTimer) {
+        clearTimeout(sigkillTimer);
+        sigkillTimer = undefined;
       }
       void appendLine(stderrPath(req), `[v3] cancel signal received; sending close+SIGINT`);
       try { worker.send({ type: 'close' }); } catch { /* already gone */ }
@@ -240,7 +371,16 @@ async function runNodeImpl(
     }
 
     worker.on('message', (event: WorkerEvent) => {
-      if (cancelRequested && event.type !== 'claude_exit') return;
+      if (cancelRequested) {
+        // CLI exit is not the outer worker exit.  The worker may still own a
+        // PTY, file descriptors, or sandbox cleanup, so no IPC message may
+        // settle cancellation; only ChildProcess 'close' below is the fence.
+        if (event.type === 'claude_exit') {
+          void appendLine(stderrPath(req), `[worker] cli exited while cancellation waits for worker exit`);
+        }
+        return;
+      }
+      if (pendingResult) return;
       switch (event.type) {
         case 'ready':
           webPort = event.port;
@@ -276,14 +416,40 @@ async function runNodeImpl(
       }
     });
 
-    worker.on('error', (err) => {
-      void appendLine(stderrPath(req), `[worker] process error: ${err.message}`);
+    forwardWorkerError = (err) => {
+      if (cancelRequested) return;
       finish('fail', 'worker-process-error');
-    });
+    };
+    if (deferredWorkerError) {
+      const err = deferredWorkerError;
+      deferredWorkerError = undefined;
+      setImmediate(() => forwardWorkerError?.(err));
+    }
 
-    worker.on('exit', (code) => {
+    worker.on('close', (code) => {
+      if (sigtermTimer) clearTimeout(sigtermTimer);
       if (sigkillTimer) clearTimeout(sigkillTimer);
-      if (!settled) finish(cancelRequested ? 'fail' : (code === 0 ? 'ok' : 'fail'), 'worker-exit');
+      if (settled) return;
+      clearTimeout(hardDeadline);
+      if (quiesceTimer) clearTimeout(quiesceTimer);
+      if (manifestTimer) clearTimeout(manifestTimer);
+      req.cancelSignal?.removeEventListener('abort', onAbort);
+      if (cancelRequested) {
+        settled = true;
+        void appendLine(stderrPath(req), `[v3] worker closed after cancellation code=${code ?? 'null'}`);
+        resolve({
+          status: 'cancelled',
+          manifestPath,
+          cancelReason,
+          sessionInfo: sessionInfo(),
+        });
+        return;
+      }
+      settled = true;
+      const status = pendingResult?.status ?? (code === 0 ? 'ok' : 'fail');
+      const reason = pendingResult?.reason ?? 'worker-exit';
+      void appendLine(stderrPath(req), `[v3] worker closed status=${status} reason=${reason} code=${code ?? 'null'}`);
+      resolve({ status, manifestPath, sessionInfo: sessionInfo() });
     });
 
     try {

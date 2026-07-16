@@ -20,6 +20,8 @@
  * plaintext). See the design doc for the two-layer rationale.
  */
 
+import { managedOriginCapabilityPath } from '../../core/managed-origin-capability.js';
+
 /** Normalize a path for the deny/allow lists: require ABSOLUTE, strip trailing
  *  slashes, reject `..` traversal. Returns null for anything unusable so the
  *  caller drops it (a silently-ignored relative path is a fail-open trap).
@@ -73,6 +75,30 @@ export function botHomePath(botmuxHome: string, appId: string): string {
   return `${botmuxHome.replace(/\/+$/, '')}/bots/${assertSafeAppId(appId)}`;
 }
 
+/**
+ * Minimal read carve-outs needed to launch a CLI whose executable itself lives
+ * under a globally denied data root. The standalone Codex installer exposes
+ * `~/.local/bin/codex` as a symlink through
+ * `~/.codex/packages/standalone/current`; allowing only the final canonical
+ * binary is insufficient because Seatbelt must read the intermediate `current`
+ * symlink while resolving execvp(). Re-open the executable package tree only —
+ * auth.json, config.toml, sessions and the rest of ~/.codex remain denied.
+ *
+ * Inputs must already be canonicalized by the worker (this module stays pure).
+ */
+export function buildCliExecutableReadCarveOuts(input: {
+  homeDir: string;
+  cliId: string;
+  resolvedBin: string;
+}): string[] {
+  if (input.cliId !== 'codex') return [];
+  const h = input.homeDir.replace(/\/+$/, '');
+  const bin = normalizeIsolationPath(input.resolvedBin);
+  const standaloneRoot = `${h}/.codex/packages/standalone`;
+  if (!bin || (bin !== standaloneRoot && !bin.startsWith(`${standaloneRoot}/`))) return [];
+  return [standaloneRoot];
+}
+
 export interface V2IsolationContext {
   /** The bot user's home directory. */
   homeDir: string;
@@ -80,12 +106,18 @@ export interface V2IsolationContext {
    *  agent runs (`botmux send`/`list`/`status`) needs broad read access to it (config,
    *  daemon registry, pm2, session store). Only its cross-bot-SENSITIVE parts are denied. */
   botmuxHome: string;
+  /** Canonical fixed `~/.botmux` root when it differs from botmuxHome (custom
+   * SESSION_DATA_DIR or a symlinked default root). */
+  defaultBotmuxHome?: string;
   /** botmux session data root (SESSION_DATA_DIR, e.g. `~/.botmux/data`). */
   sessionDataDir: string;
   /** This bot's Feishu app id. All carve-outs are keyed on it (immutable, never the
    *  user-controllable cwd) — sibling data needs NO enumeration: per-bot dirs are
    *  denied WHOLESALE and per-bot session files by a filename-pattern regex. */
   currentAppId: string;
+  /** Current botmux session. Used only to carve back the exact rotating IPC
+   * capability file from the otherwise denied read-isolation runtime dir. */
+  currentSessionId: string;
   /** Per-bot extra deny paths (BotConfig.readDenyExtraPaths). */
   extraDenyPaths?: string[];
 }
@@ -108,6 +140,7 @@ export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
   const h = ctx.homeDir.replace(/\/+$/, '');
   const bh = ctx.botmuxHome.replace(/\/+$/, '');
   const sd = ctx.sessionDataDir.replace(/\/+$/, '');
+  const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
   return dedupe(
     [
       // ── F1: whole-deny the CLI data dirs (own is redirected to BOT_HOME) ──
@@ -168,6 +201,10 @@ export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
       // session ids and appIds. sandbox-exec parses the profile BEFORE applying it,
       // and the markers are read by the daemon — the sandboxed CLI never reads these.
       `${sd}/read-isolation`,
+      // Worker PID markers contain every live session/turn/attempt tuple. They
+      // are routing metadata, never a credential, and isolated CLIs now use an
+      // exact per-session capability carve-out for fresh turn context.
+      `${sd}/.botmux-cli-pids`,
       // NOTE: schedules.json is deliberately NOT denied. It's a read-modify-write
       // store: denying the read makes a sandboxed `botmux schedule` load an empty
       // map and then overwrite the shared file, silently wiping EVERY bot's tasks
@@ -184,6 +221,11 @@ export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
       // agent's send/list/status never do, so denying it costs the agent nothing. Its
       // sibling `.dashboard-token` (dashboard bearer) is denied for the same reason;
       // `.dashboard-port` is just a port number (no credential value) → left readable.
+      // The dashboard IPC secret/token live at the fixed default home even
+      // when SESSION_DATA_DIR points at a custom BOTMUX_HOME. Deny both roots:
+      // the fixed real credential location and the custom runtime root.
+      `${defaultBh}/.dashboard-secret`,
+      `${defaultBh}/.dashboard-token`,
       `${bh}/.dashboard-secret`,
       `${bh}/.dashboard-token`,
       // NOTE: extraDenyPaths (readDenyExtraPaths) are NOT here — they go to
@@ -214,7 +256,10 @@ function escapeForRegex(p: string): string {
 export function buildV2DenyRegexes(ctx: V2IsolationContext): string[] {
   const sd = ctx.sessionDataDir.replace(/\/+$/, '');
   const bh = ctx.botmuxHome.replace(/\/+$/, '');
-  return [
+  const h = ctx.homeDir.replace(/\/+$/, '');
+  const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
+  const dashboardRoots = dedupe([defaultBh, bh]);
+  return dedupe([
     `^${escapeForRegex(sd)}/sessions-[^/]+\\.json$`,
     // Any `bots.json.` sidecar (backups/temp) — trailing dot so it matches
     // bots.json.bak / .tmp / .bak.<suffix> but NOT the exact bots.json (that is
@@ -229,7 +274,60 @@ export function buildV2DenyRegexes(ctx: V2IsolationContext): string[] {
     // prompt injection only), so the OWN file gets NO carve-out — the whole
     // filename class is denied.
     `^${escapeForRegex(sd)}/identities-[^/]+\\.json$`,
-  ];
+    // Secret/token creation and atomic rotation use sibling temp files. Deny
+    // the whole basename class at both the fixed and custom roots so a live
+    // isolated process cannot race-read a fully populated temp inode.
+    ...dashboardRoots.flatMap(root => [
+      `^${escapeForRegex(root)}/\\.dashboard-secret(?:\\.|$)`,
+      `^${escapeForRegex(root)}/\\.dashboard-token(?:\\.|$)`,
+    ]),
+  ]);
+}
+
+/** Host-owned authority files that a read-isolated child must not mutate.
+ * Read isolation otherwise keeps normal write access for backwards
+ * compatibility, so these rules are emitted after every other write allow. */
+export function buildReadIsolationProtectedWriteRules(
+  ctx: V2IsolationContext,
+  extraRoots: { dashboardRoots?: string[]; sessionDataDirs?: string[] } = {},
+): {
+  denyWritePaths: string[];
+  denyWriteRegexes: string[];
+  denyWriteLiterals: string[];
+} {
+  const h = ctx.homeDir.replace(/\/+$/, '');
+  const bh = ctx.botmuxHome.replace(/\/+$/, '');
+  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
+  const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
+  const dashboardRoots = dedupe([
+    defaultBh,
+    bh,
+    ...(extraRoots.dashboardRoots ?? []).map(root => root.replace(/\/+$/, '')),
+  ]);
+  const sessionDataDirs = dedupe([
+    sd,
+    ...(extraRoots.sessionDataDirs ?? []).map(root => root.replace(/\/+$/, '')),
+  ]);
+  return {
+    denyWritePaths: dedupe([
+      ...dashboardRoots.flatMap(root => [
+        `${root}/.dashboard-secret`,
+        `${root}/.dashboard-token`,
+      ]),
+      ...sessionDataDirs.flatMap(root => [
+        `${root}/.botmux-cli-pids`,
+        `${root}/read-isolation`,
+      ]),
+    ]),
+    denyWriteRegexes: dedupe(dashboardRoots.flatMap(root => [
+      `^${escapeForRegex(root)}/\\.dashboard-secret(?:\\.|$)`,
+      `^${escapeForRegex(root)}/\\.dashboard-token(?:\\.|$)`,
+    ])),
+    // Prevent replacing an entire authority-bearing root to sidestep the
+    // exact/regex child rules. `literal` protects only the directory entry;
+    // ordinary writes to unrelated descendants remain available.
+    denyWriteLiterals: dedupe([...dashboardRoots, ...sessionDataDirs]),
+  };
 }
 
 /** The v2 Seatbelt carve-outs that accompany {@link buildV2DenyPaths} +
@@ -261,13 +359,222 @@ export function buildV2CarveOuts(ctx: V2IsolationContext): {
       // read files the user uploads in chat. getAttachmentsDir keys the bucket on the
       // appId precisely so this spawn-time-static carve-out can exist.
       `${sd}/attachments/${self}`,
+      // Parent read-isolation/ stays wholesale-denied; only this session's
+      // rotating origin capability is visible to the confined CLI.
+      managedOriginCapabilityPath(sd, ctx.currentSessionId),
     ],
     // file-read-metadata on the wholesale-denied parents so the CLI/skill can realpath()
     // through them WITHOUT `ls` (enumeration) leaking.
-    traverseDirs: [`${bh}/bots`, `${h}/.lark-cli-bots`, `${sd}/attachments`],
+    traverseDirs: [
+      `${bh}/bots`, `${h}/.lark-cli-bots`, `${sd}/attachments`, `${sd}/read-isolation`,
+    ],
     finalDenyPaths: (ctx.extraDenyPaths ?? [])
       .map(normalizeIsolationPath)
       .filter((p): p is string => !!p),
+  };
+}
+
+// ─── Mac file-sandbox: WRITE isolation (the Seatbelt twin of Linux bwrap) ─────
+
+export interface WriteSandboxContext {
+  /** The bot user's home directory. */
+  homeDir: string;
+  /** BOTMUX_HOME root (e.g. `~/.botmux`). */
+  botmuxHome: string;
+  /** botmux session data root (SESSION_DATA_DIR, e.g. `~/.botmux/data`). */
+  sessionDataDir: string;
+  /** The session's project working dir — writes here PERSIST (the point of the sandbox). */
+  workingDir: string;
+  /** This bot's Feishu app id (keys its own BOT_HOME carve-out). */
+  currentAppId: string;
+  /** Extra writable roots the worker resolves at spawn time (realpath'd TMPDIR,
+   *  extra worktrees, admin-configured writable paths). */
+  extraWritePaths?: string[];
+}
+
+/**
+ * Write-isolation rules for the macOS file sandbox — the FUNCTIONAL twin of the
+ * Linux bwrap overlay (which lets the agent read the whole real FS but confines
+ * WRITES). Seatbelt has no copy-on-write overlay, so we approximate the same
+ * guarantee with a deny-all-writes + allow-list: the agent can write its project
+ * and the ephemeral scratch/cache the CLI needs, but CANNOT tamper the rest of
+ * your real disk (home dotfiles, other projects, other bots' data, system dirs).
+ * Reads stay wide open (like Linux) — this is orthogonal to read isolation, which
+ * layers its own read-deny set into the SAME profile when also enabled.
+ *
+ * `allowWritePaths` re-open the writable zones AFTER the profile's `(deny
+ * file-write* (subpath "/"))`; `denyWritePaths` are crown jewels re-denied AFTER
+ * the allows (Seatbelt last-match), so they stay protected even if the project or
+ * an allowed zone nests them. The allow-list is intentionally generous toward
+ * CLI scratch/cache — the exact set is empirically tuned on real macOS (a missing
+ * cache path makes the CLI fail, an over-broad one weakens the sandbox). Pure: the
+ * worker realpath's every path (symlink-safe) before emitting.
+ */
+export function buildWriteSandboxRules(ctx: WriteSandboxContext): {
+  allowWritePaths: string[];
+  allowWriteRegexes: string[];
+  denyWritePaths: string[];
+} {
+  const h = ctx.homeDir.replace(/\/+$/, '');
+  const bh = ctx.botmuxHome.replace(/\/+$/, '');
+  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
+  const defaultBh = `${h}/.botmux`;
+  const wd = ctx.workingDir.replace(/\/+$/, '');
+  const keep = (arr: string[]) =>
+    dedupe(arr.map(normalizeIsolationPath).filter((p): p is string => !!p));
+  return {
+    allowWritePaths: keep([
+      // The project — writes here PERSIST (no overlay/landing step; direct like a
+      // non-sandboxed run would, only nothing OUTSIDE the allow-list can be touched).
+      wd,
+      // Own BOT_HOME — where read isolation redirects the CLI's data when co-enabled;
+      // harmless to allow when write-sandbox is standalone (dir just won't exist).
+      botHomePath(bh, ctx.currentAppId),
+      // CLI data dirs (write-sandbox standalone leaves them at the real path).
+      `${h}/.claude`, `${h}/.claude.json`, `${h}/.codex`,
+      // Claude Code's updater/OAuth refresh uses sibling lock directories rather
+      // than placing every state file under ~/.claude. Without these, a valid
+      // login can fail to refresh because lock acquisition returns EPERM.
+      `${h}/.claude.lock`, `${h}/.claude.json.lock`,
+      `${h}/.local/state/claude`,
+      // Ephemeral scratch / caches every CLI + spawned tool (git, npm, node) needs.
+      `${h}/Library/Caches`,
+      `${h}/Library/Application Support`,
+      `${h}/.cache`,
+      `${h}/.npm`,
+      '/private/var/folders',   // macOS per-user TMPDIR / DARWIN_USER_TEMP_DIR root
+      '/private/tmp', '/tmp', '/var/tmp',
+      '/dev',                   // ptys, /dev/null, /dev/tty — required to run at all
+      ...(ctx.extraWritePaths ?? []),
+    ]),
+    allowWriteRegexes: [
+      // Claude Code saves ~/.claude.json atomically through a PID/random-suffixed
+      // sibling (e.g. .claude.json.tmp.1234.abcd). A subpath rule for the exact
+      // state file cannot match those siblings, so allow only that basename class
+      // at the home root — not arbitrary home dotfiles.
+      `^${escapeForRegex(h)}/\\.claude\\.json\\.tmp\\.[^/]+$`,
+    ],
+    denyWritePaths: keep([
+      // Crown jewels — re-denied AFTER the allows so a semi-trusted operator can't
+      // plant an ssh key or tamper another bot's creds even if the project/home
+      // nests these. (Most already fall under deny-by-default; this is the guard for
+      // a broad workingDir and defence-in-depth.)
+      `${h}/.ssh`, `${h}/.aws`, `${h}/.gnupg`,
+      `${bh}/bots.json`,
+      `${bh}/feishu-session.json`,
+      `${defaultBh}/.dashboard-secret`, `${defaultBh}/.dashboard-token`,
+      `${bh}/.dashboard-secret`, `${bh}/.dashboard-token`,
+      `${sd}/.botmux-cli-pids`, `${sd}/read-isolation`,
+    ]),
+  };
+}
+
+// ─── Linux read isolation: bwrap mask set (the Seatbelt read-deny twin) ──────
+
+export interface LinuxReadIsolationInput {
+  ctx: V2IsolationContext;
+  /** Every OTHER bot's appId — the worker enumerates these from the registry.
+   *  bwrap has NO regex (unlike the macOS Seatbelt profile), so each sibling's
+   *  per-bot paths are masked INDIVIDUALLY. Consequence: the mask set is
+   *  spawn-time-static — a bot added AFTER this session spawned isn't covered
+   *  until a cold restart (the macOS regex covers new bots without one). */
+  siblingAppIds: string[];
+  /** Existing `bots.json.*` sidecars (backups/tmp) globbed by the worker at spawn
+   *  — each carries every bot's plaintext secret under a dynamic name that no
+   *  wholesale rule matches, so they're masked individually. */
+  botsJsonSidecars?: string[];
+}
+
+/**
+ * The bwrap MASK set for Linux read isolation — the functional twin of the macOS
+ * Seatbelt read-deny profile ({@link buildV2DenyPaths} + regexes + carve-outs),
+ * expressed for bwrap (which blanks paths with tmpfs/empty-binds and has no regex).
+ *
+ * SAME cross-bot-sensitive set as macOS, but the per-bot classes (other bots'
+ * BOT_HOMEs / lark configs / session stores / identities / send-creds / attachment
+ * buckets) are enumerated PER SIBLING instead of wholesale-denied + regex-matched.
+ * The read-isolation-specific set does not mask the bot's OWN slice. The file
+ * sandbox still masks BOTMUX_HOME wholesale as its mandatory credential
+ * boundary, so `ownReadWritePaths` re-opens only this bot's BOT_HOME after that
+ * parent mask; the worker separately re-masks send-cred.json.
+ *
+ * Pure: the worker resolves the impure inputs (sibling list, sidecar glob, realpath).
+ * NOTE: keep the `shared` set in lock-step with {@link buildV2DenyPaths} — the
+ * `read-isolation.test.ts` parity test fails if a sensitive path is added to one
+ * platform but not the other.
+ */
+export function buildLinuxReadIsolationMasks(input: LinuxReadIsolationInput): {
+  /** Paths to blank inside bwrap (prepareSandbox stat-classifies: dir→tmpfs,
+   *  file→empty ro-bind, missing→skipped). Feed as prepareSandbox.hidePaths. */
+  hidePaths: string[];
+  /** The bot's OWN BOT_HOME — bound REAL + writable (feed as
+   *  prepareSandbox.trustedWritablePaths) so the
+   *  redirected CLI data (CLAUDE_CONFIG_DIR/CODEX_HOME) persists and escapes the
+   *  write overlay after the mandatory BOTMUX_HOME mask. */
+  ownReadWritePaths: string[];
+  /** The bot's OWN slices that sit UNDER a wholesale-masked parent and must be
+   *  re-exposed read-only AFTER the masks (feed as readonlyRoots — bound after the
+   *  tmpfs masks). Currently the own attachments bucket, under the wholesale
+   *  `data/attachments` mask. Read-only is enough (the agent only READS uploads). */
+  ownReadOnlyPaths: string[];
+} {
+  const { ctx } = input;
+  const h = ctx.homeDir.replace(/\/+$/, '');
+  const bh = ctx.botmuxHome.replace(/\/+$/, '');
+  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
+  const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
+  const self = assertSafeAppId(ctx.currentAppId);
+  const keep = (arr: string[]) => dedupe(arr.map(normalizeIsolationPath).filter((p): p is string => !!p));
+
+  // Cross-bot-sensitive paths handled WHOLESALE (not per-bot, OR a per-bot dir with
+  // a non-enumerable layout) — MUST mirror the same entries in buildV2DenyPaths.
+  const shared = [
+    `${h}/.claude`, `${h}/.claude.json`, `${h}/.codex`,
+    `${h}/.ssh`, `${h}/.aws`, `${h}/.azure`, `${h}/.gnupg`, `${h}/.netrc`,
+    `${h}/.config/gh`, `${h}/.config/glab-cli`, `${h}/.config/gcloud`, `${h}/.config/op`,
+    `${h}/.config/1Password`, `${h}/.1password`, `${h}/.password-store`,
+    `${h}/.git-credentials`, `${h}/.npmrc`, `${h}/.pypirc`, `${h}/.docker/config.json`, `${h}/.kube`,
+    `${h}/Library/Keychains`,
+    `${bh}/bots.json`, `${bh}/logs`, `${h}/.lark-cli`,
+    `${bh}/feishu-session.json`,
+    `${defaultBh}/.dashboard-secret`, `${defaultBh}/.dashboard-token`,
+    `${bh}/.dashboard-secret`, `${bh}/.dashboard-token`,
+    `${sd}/sessions.json`, `${sd}/frozen-cards`, `${sd}/turn-sends`,
+    `${sd}/crash-diagnostics`, `${sd}/queues`, `${sd}/read-isolation`,
+    `${sd}/.botmux-cli-pids`,
+    // attachments/ is masked WHOLESALE (like macOS) — covers every sibling bucket
+    // AND the legacy flat per-messageId layout (which per-sibling enumeration can't
+    // reach); the OWN bucket is re-exposed read-only via ownReadOnlyPaths below.
+    `${sd}/attachments`,
+    // schedules.json + whiteboards deliberately NOT masked (same owner decision as
+    // macOS: RMW-clobber / shared content).
+  ];
+
+  // Per-sibling enumeration for the classes macOS covers by REGEX (bwrap has none):
+  // other bots' BOT_HOMEs, lark configs, session stores, identities, send-creds. Own
+  // BOT_HOME + lark + session stay UNMASKED by this per-bot set (the outer file
+  // sandbox still masks BOTMUX_HOME wholesale and re-opens only own BOT_HOME).
+  // identities/send-cred get NO own carve-out — the
+  // CLI never reads them (daemon-side) — so the own ones are masked too.
+  const perBot: string[] = [];
+  for (const raw of input.siblingAppIds) {
+    let sib: string;
+    try { sib = assertSafeAppId(raw); } catch { continue; }
+    if (sib === self) continue;
+    perBot.push(
+      `${bh}/bots/${sib}`,
+      `${h}/.lark-cli-bots/${sib}`,
+      `${sd}/sessions-${sib}.json`,
+      `${sd}/identities-${sib}.json`,
+      `${sd}/.send-cred-${sib}`,
+    );
+  }
+  perBot.push(`${sd}/identities-${self}.json`, `${sd}/.send-cred-${self}`);
+
+  return {
+    hidePaths: keep([...shared, ...perBot, ...(input.botsJsonSidecars ?? [])]),
+    ownReadWritePaths: keep([botHomePath(bh, self)]),
+    ownReadOnlyPaths: keep([`${sd}/attachments/${self}`]),
   };
 }
 
@@ -285,8 +592,10 @@ export function evaluateReadIsolationGate(opts: {
   configured: boolean;
   adapterSupports: boolean;
   wrapperCliSet: boolean;
-  /** process.platform — the Seatbelt wrapper exists on macOS only (Linux bwrap
-   *  is unimplemented; fail-closed rather than run unisolated). */
+  /** process.platform — read isolation is enforced by macOS Seatbelt (sandbox-exec)
+   *  OR Linux bwrap masks; unsupported elsewhere (fail-closed rather than run
+   *  unisolated). NOTE: on Linux the masks ride the bwrap file sandbox, so the caller
+   *  must ensure the sandbox is on (see readIsoConfigured in worker.ts). */
   platform: string;
   /** SESSION_DATA_DIR present (BOT_HOME + profile paths derive from it). */
   sessionDataDirSet: boolean;
@@ -296,14 +605,8 @@ export function evaluateReadIsolationGate(opts: {
     return { enabled: false, failClosedReason: 'the CLI adapter does not support read isolation' };
   if (opts.wrapperCliSet)
     return { enabled: false, failClosedReason: 'wrapperCli strips the CLI spawn args, read isolation cannot be enforced' };
-  if (opts.platform !== 'darwin')
-    return {
-      enabled: false,
-      failClosedReason:
-        opts.platform === 'linux'
-          ? 'Linux external-wrapper isolation not yet implemented (bwrap TODO)'
-          : `external-wrapper isolation unsupported on ${opts.platform}`,
-    };
+  if (opts.platform !== 'darwin' && opts.platform !== 'linux')
+    return { enabled: false, failClosedReason: `read isolation unsupported on ${opts.platform}` };
   if (!opts.sessionDataDirSet)
     return { enabled: false, failClosedReason: 'missing SESSION_DATA_DIR' };
   return { enabled: true };
@@ -324,6 +627,18 @@ export function buildSeatbeltProfile(
   finalDenyPaths: string[] = [],
   traverseDirs: string[] = [],
   denyRegexes: string[] = [],
+  /** When set, layer the macOS file-sandbox WRITE isolation (Linux-bwrap twin) into
+   *  the SAME profile: deny all writes, re-allow the writable zones, then final-deny
+   *  the crown jewels. Reads are unaffected. Omit for read-isolation-only sessions. */
+  writeSandbox?: { allowWritePaths: string[]; allowWriteRegexes?: string[]; denyWritePaths: string[] },
+  /** Host-owned files that must remain immutable even for legacy read-only
+   * isolation (where writes are otherwise unrestricted). Emitted last so they
+   * also win over a broad write-sandbox allow. */
+  protectedWrites?: {
+    denyWritePaths: string[];
+    denyWriteRegexes?: string[];
+    denyWriteLiterals?: string[];
+  },
 ): string {
   const esc = (p: string) => p.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   // Regex literals (#"…") pass backslashes RAW to the regex engine — do NOT
@@ -347,7 +662,33 @@ export function buildSeatbeltProfile(
   // FINAL denies win over the carve-outs — admin `readDenyExtraPaths` must hold even
   // for a path that falls under the bot's own re-allowed BOT_HOME.
   for (const p of finalDenyPaths) lines.push(`(deny file-read* (subpath "${esc(p)}"))`);
+  // ── Write isolation (macOS file sandbox): deny ALL writes, re-allow the writable
+  // zones, then re-deny the crown jewels. Ordered AFTER the read rules but they are
+  // an independent operation class (file-write* vs file-read*), so they never
+  // interact with the read allow/deny above. Emitted only when write-sandbox is on.
+  if (writeSandbox) {
+    lines.push('(deny file-write* (subpath "/"))');
+    for (const p of writeSandbox.allowWritePaths) lines.push(`(allow file-write* (subpath "${esc(p)}"))`);
+    for (const r of writeSandbox.allowWriteRegexes ?? []) lines.push(`(allow file-write* (regex #"${escRe(r)}"))`);
+    for (const p of writeSandbox.denyWritePaths) lines.push(`(deny file-write* (subpath "${esc(p)}"))`);
+  }
+  for (const p of protectedWrites?.denyWritePaths ?? []) {
+    lines.push(`(deny file-write* (subpath "${esc(p)}"))`);
+  }
+  for (const r of protectedWrites?.denyWriteRegexes ?? []) {
+    lines.push(`(deny file-write* (regex #"${escRe(r)}"))`);
+  }
+  for (const p of protectedWrites?.denyWriteLiterals ?? []) {
+    lines.push(`(deny file-write* (literal "${esc(p)}"))`);
+  }
   return lines.join('\n') + '\n';
+}
+
+export const ISOLATION_PANE_MARKER_VERSION = 2;
+
+/** Versioned marker written beside a freshly spawned persistent sandbox. */
+export function isolationPaneMarkerContent(bootId: string): string {
+  return JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, bootId });
 }
 
 /**
@@ -357,17 +698,21 @@ export function buildSeatbeltProfile(
  * STAYS isolated for its whole lifetime — including across daemon restarts (the
  * sandbox is on the CLI process, independent of the daemon).
  *
- * We stamp a marker file when we spawn an isolated CLI. A reattach is safe iff that
- * marker EXISTS: its presence means "this pane was spawned isolated", so warm
- * reattach (preserving resume/context + tmux idle-suspend) is safe regardless of
- * which daemon lifetime spawned it. A pane with NO marker was spawned WITHOUT
- * isolation (before the feature was enabled, or by an old build) → NOT safe; the
- * caller kills it and cold-spawns fresh isolated instead. (The marker's content is
- * a daemon boot id, kept only for debugging — it is deliberately NOT compared, as
- * comparing it would wrongly kill isolated panes on every restart and drop resume.)
+ * We stamp a versioned marker file when we spawn an isolated CLI. A reattach is
+ * safe only when the live process was launched with the current policy version.
+ * This matters during security upgrades: a legacy Seatbelt process keeps its old
+ * permissions across daemon restarts and must be cold-spawned under the new
+ * profile. The boot id remains diagnostic and is not compared across restarts.
  */
 export function isolatedPaneReattachSafe(markerContent: string | null | undefined): boolean {
-  return (markerContent ?? '').trim().length > 0;
+  try {
+    const parsed = JSON.parse(markerContent ?? '') as { version?: unknown; bootId?: unknown };
+    return parsed.version === ISOLATION_PANE_MARKER_VERSION
+      && typeof parsed.bootId === 'string'
+      && parsed.bootId.trim().length > 0;
+  } catch {
+    return false;
+  }
 }
 
 function dedupe(xs: string[]): string[] {

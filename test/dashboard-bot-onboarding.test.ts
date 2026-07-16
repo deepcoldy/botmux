@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BotOnboardingManager } from '../src/dashboard/bot-onboarding.js';
@@ -72,6 +72,170 @@ describe('BotOnboardingManager', () => {
 
     pending.resolve({ ok: false, error: 'aborted', message: 'cancelled' });
     await job.done;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('uses one Feishu Web QR as the primary path and carries the chosen app name through the job', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-web-'));
+    const pending = deferred<any>();
+    const registerApp = vi.fn(async () => ({ ok: false as const, error: 'unknown' as const, message: 'must not run' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      createApp: async (opts) => {
+        expect(opts.forceQrLogin).toBe(true);
+        expect(opts.disableBytedcliFallback).toBe(true);
+        await opts.onQrCode?.({ qrText: 'ascii', qrPayload: '{"qrlogin":{"token":"one-scan"}}' });
+        return pending.promise;
+      },
+      registerApp,
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async opts => {
+        expect(opts.disableQrLogin).toBe(true);
+        expect(opts.disableBytedcliFallback).toBe(true);
+        return autoOk();
+      },
+      renderQrDataUrl: (payload) => `data:image/svg+xml;base64,${Buffer.from(payload).toString('base64')}`,
+    });
+
+    const job = manager.start({ appName: '研发助手', sessionMode: 'qr' });
+    await Promise.resolve();
+    expect(manager.get(job.id)).toMatchObject({
+      status: 'waiting_for_scan',
+      appName: '研发助手',
+      qrDataUrl: expect.stringContaining('data:image/svg+xml;base64,'),
+    });
+
+    pending.resolve({
+      ok: true,
+      appId: 'cli_web',
+      appSecret: 'web-secret',
+      brand: 'feishu',
+      sessionFile: '/tmp/feishu-session.json',
+      sessionSource: 'qr_login',
+      sessionIdentity: { userId: 'u_1', userName: 'Alice', tenantId: 't_1', tenantName: 'Example' },
+    });
+    await job.done;
+
+    expect(registerApp).not.toHaveBeenCalled();
+    expect(manager.get(job.id)).toMatchObject({ status: 'needs_owner', appId: 'cli_web', appName: '研发助手' });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reuses a UI-confirmed session without a QR and binds creation to that account and tenant', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-reuse-'));
+    const createApp = vi.fn(async (opts) => {
+      expect(opts.forceQrLogin).toBeUndefined();
+      expect(opts.disableQrLogin).toBe(true);
+      expect(opts.expectedIdentity).toEqual({ userId: 'u_1', tenantId: 't_1' });
+      return {
+        ok: false as const,
+        reason: 'api_error' as const,
+        message: 'stop after checking options',
+      };
+    });
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      createApp,
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+    });
+
+    const job = manager.start({
+      appName: '免扫机器人',
+      sessionMode: 'reuse',
+      expectedIdentity: { userId: 'u_1', tenantId: 't_1' },
+    });
+    await job.done;
+
+    expect(createApp).toHaveBeenCalledOnce();
+    expect(manager.get(job.id)).toMatchObject({ status: 'failed', appName: '免扫机器人' });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('defaults the app name to the next botmux process index', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-name-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    writeFileSync(botsJsonPath, JSON.stringify([{ larkAppId: 'cli_0' }, { larkAppId: 'cli_1' }]));
+    const manager = new BotOnboardingManager({ botsJsonPath, registerApp: async () => ({ ok: false, error: 'aborted', message: 'stop' }) });
+    expect(manager.suggestedAppName()).toBe('botmux-2');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reports the cached account and tenant for explicit pre-create confirmation', async () => {
+    const manager = new BotOnboardingManager({
+      botsJsonPath: '/tmp/botmux-session-status-bots.json',
+      inspectSession: async () => ({
+        ok: true,
+        source: 'botmux_cache',
+        sessionFile: '/tmp/feishu-session.json',
+        identity: {
+          userId: 'u_1',
+          userName: 'Alice',
+          email: 'alice@example.com',
+          tenantId: 't_1',
+          tenantName: 'Example',
+        },
+      }),
+    });
+
+    await expect(manager.sessionStatus()).resolves.toEqual({
+      status: 'ready',
+      source: 'botmux_cache',
+      identity: {
+        userId: 'u_1',
+        userName: 'Alice',
+        email: 'alice@example.com',
+        tenantId: 't_1',
+        tenantName: 'Example',
+      },
+    });
+  });
+
+  it('does not invoke the SDK fallback when Web creation already returned an app id', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-orphan-'));
+    const registerApp = vi.fn(async () => ({ ok: false as const, error: 'unknown' as const, message: 'must not run' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      createApp: async () => ({ ok: false, reason: 'api_error', message: 'secret failed', appId: 'cli_kept' }),
+      registerApp,
+    });
+    const job = manager.start();
+    await job.done;
+    expect(registerApp).not.toHaveBeenCalled();
+    expect(manager.get(job.id)).toMatchObject({ status: 'failed', appId: 'cli_kept', error: 'api_error' });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('does not silently fall back to a second QR when Web creation fails before creating an app', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-no-fallback-'));
+    const registerApp = vi.fn(async () => ({ ok: false as const, error: 'unknown' as const, message: 'must not run' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      createApp: async () => ({ ok: false, reason: 'network', message: 'console unavailable' }),
+      registerApp,
+    });
+    const job = manager.start({ appName: 'One Scan' });
+    await job.done;
+    expect(registerApp).not.toHaveBeenCalled();
+    expect(manager.get(job.id)).toMatchObject({
+      status: 'failed', error: 'network', appName: 'One Scan', registrationMode: 'web',
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('uses the SDK only after compatibility mode is explicitly selected and does not claim a custom app name', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-compat-'));
+    const createApp = vi.fn();
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      createApp,
+      registerApp: async () => ({ ok: false, error: 'aborted', message: 'cancelled' }),
+    });
+    const job = manager.start({ appName: 'Cannot Apply', registrationMode: 'compat' });
+    await job.done;
+    expect(createApp).not.toHaveBeenCalled();
+    expect(manager.get(job.id)).toMatchObject({ status: 'failed', registrationMode: 'compat' });
+    expect(manager.get(job.id)?.appName).toBeUndefined();
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -152,6 +316,60 @@ describe('BotOnboardingManager', () => {
     const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
     expect(bots).toHaveLength(1);
     expect(bots[0]).toMatchObject({ larkAppId: 'cli_new', cliId: 'claude-code', allowedUsers: ['owner@corp.com'] });
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('restores a needs_owner job after a dashboard restart and then completes it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-restart-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const pendingStorePath = `${botsJsonPath}.onboarding-pending.json`;
+    const firstManager = new BotOnboardingManager({
+      botsJsonPath,
+      registerApp: async () => ({
+        ok: true,
+        appId: 'cli_restart',
+        appSecret: 'restart-secret',
+        brand: 'feishu',
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+    const job = firstManager.start({ cliId: 'codex', workingDir: dir });
+    await job.done;
+
+    expect(firstManager.get(job.id)?.status).toBe('needs_owner');
+    expect(existsSync(botsJsonPath)).toBe(false);
+    expect(statSync(pendingStorePath).mode & 0o777).toBe(0o600);
+
+    // 模拟 Dashboard 进程重启：新 manager 从私有恢复文件拿回同一个 job 与待落盘配置。
+    const restartedManager = new BotOnboardingManager({
+      botsJsonPath,
+      registerApp: async () => ({ ok: false, error: 'unknown', message: 'must not create again' }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+    });
+    expect(restartedManager.get(job.id)).toMatchObject({
+      status: 'needs_owner',
+      appId: 'cli_restart',
+      cliId: 'codex',
+      workingDir: dir,
+    });
+
+    batchGetIdMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user_list: [{ email: 'owner@corp.com', user_id: 'ou_owner' }] },
+    });
+    expect(await restartedManager.submitOwner(job.id, ['owner@corp.com'])).toEqual({ ok: true });
+    expect(restartedManager.get(job.id)?.status).toBe('completed');
+    expect(existsSync(pendingStorePath)).toBe(false);
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf-8'))[0]).toMatchObject({
+      larkAppId: 'cli_restart',
+      cliId: 'codex',
+      workingDir: dir,
+      allowedUsers: ['owner@corp.com'],
+    });
 
     rmSync(dir, { recursive: true, force: true });
   });

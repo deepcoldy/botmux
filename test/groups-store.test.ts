@@ -174,6 +174,15 @@ describe('groups-store wrappers', () => {
     expect(call.data.owner_id).toBe('ou_human');
   });
 
+  it('transferChatOwner can transfer by union_id after a cross-deployment invite', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 0 });
+    const r = await transferChatOwner('cli_creator', 'oc_chat', 'on_human', 'union_id');
+    expect(r).toEqual({ ok: true });
+    const call = chatUpdateStub.mock.calls[0][0];
+    expect(call.params.user_id_type).toBe('union_id');
+    expect(call.data.owner_id).toBe('on_human');
+  });
+
   it('transferChatOwner returns error on non-zero Lark response', async () => {
     chatUpdateStub.mockResolvedValueOnce({ code: 230002, msg: 'user not in chat' });
     const r = await transferChatOwner('cli_creator', 'oc_chat', 'ou_ghost');

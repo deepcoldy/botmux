@@ -208,6 +208,39 @@ describe('nextAttemptIdFor', () => {
     expect(nextAttemptIdFor(events, 'a')).toBe('a/attempts/003'); // 预留已消费
     expect(latestAttemptIdFor(events, 'a')).toBe('a/attempts/002');
   });
+
+  it('仅有 pre-intent blocked verdict 也消费 attempt number', () => {
+    const events: StoredEvent[] = [
+      ts({
+        type: 'nodeBlocked',
+        nodeId: 'send',
+        instanceId: 'send#001',
+        attemptId: 'send#001/attempts/001',
+        errorClass: 'resultInvalid',
+        errorCode: 'HOST_INPUT_UNRECOVERABLE',
+      }),
+    ];
+    expect(latestAttemptIdFor(events, 'send#001')).toBe('send#001/attempts/001');
+    expect(nextAttemptIdFor(events, 'send#001')).toBe('send#001/attempts/002');
+  });
+
+  it('迟到的旧 attempt verdict 不会让 latest 从 002 回退到 001', () => {
+    const events: StoredEvent[] = [
+      ts({
+        type: 'nodeDispatched', nodeId: 'a', instanceId: 'a#001',
+        attemptId: 'a#001/attempts/001',
+      }),
+      ts({
+        type: 'nodeDispatched', nodeId: 'a', instanceId: 'a#001',
+        attemptId: 'a#001/attempts/002',
+      }),
+      ts({
+        type: 'nodeBlocked', nodeId: 'a', instanceId: 'a#001',
+        attemptId: 'a#001/attempts/001', errorClass: 'workerError',
+      }),
+    ];
+    expect(latestAttemptIdFor(events, 'a#001')).toBe('a#001/attempts/002');
+  });
 });
 
 // ─── runtime verdict：自报契约 + blocked 不塌 ────────────────────────────────

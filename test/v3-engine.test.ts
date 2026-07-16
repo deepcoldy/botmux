@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -57,9 +57,123 @@ describe('validateDag', () => {
     expect(err!.problems.length).toBeGreaterThanOrEqual(2);
   });
 
-  it('拒绝 type:host（MVP 未实现执行器）', () => {
-    expect(() => validateDag({ runId: 'r', nodes: [{ id: 'a', type: 'host', depends: [], inputs: [] }] }))
-      .toThrow(/host/);
+  it('接受有 runtime gate 的 host，并拒绝未知 executor/无 gate', () => {
+    const host = validateDag({
+      runId: 'r',
+      nodes: [{
+        id: 'send', type: 'host', executor: 'feishu-send',
+        input: {
+          larkAppId: { $ref: 'context.larkAppId' },
+          chatId: { $ref: 'context.chatId' },
+          content: 'hello',
+        },
+        depends: [], inputs: [], humanGate: { prompt: '发送？' },
+      }],
+    }).nodes[0]!;
+    expect(host.type).toBe('host');
+    expect(host.executor).toBe('feishu-send');
+    expect(() => validateDag({
+      runId: 'r',
+      nodes: [{ id: 'a', type: 'host', executor: 'unknown', input: {}, depends: [], inputs: [], humanGate: { prompt: 'x' } }],
+    })).toThrow(/executor/);
+    expect(() => validateDag({
+      runId: 'r',
+      nodes: [{ id: 'a', type: 'host', executor: 'feishu-send', input: {}, depends: [], inputs: [] }],
+    })).toThrow(/must declare a humanGate/);
+  });
+
+  it('host gate 固定 approve/reject 语义，不允许拒绝按钮授权副作用', () => {
+    const input = {
+      larkAppId: { $ref: 'context.larkAppId' },
+      chatId: { $ref: 'context.chatId' },
+      content: 'hello',
+    };
+    expect(() => validateDag({
+      runId: 'r',
+      nodes: [{
+        id: 'send', type: 'host', executor: 'feishu-send', input,
+        depends: [], inputs: [], humanGate: { prompt: '发送？', options: ['reject'] },
+      }],
+    })).toThrow(/must include "approve" explicitly/);
+    expect(() => validateDag({
+      runId: 'r',
+      nodes: [{
+        id: 'send', type: 'host', executor: 'feishu-send', input,
+        depends: [], inputs: [],
+        humanGate: {
+          prompt: '发送？',
+          options: ['approve', 'reject'],
+          approveOptions: ['reject'],
+        },
+      }],
+    })).toThrow(/must be exactly \["approve"\]/);
+    expect(() => validateDag({
+      runId: 'r',
+      nodes: [{
+        id: 'send', type: 'host', executor: 'feishu-send', input,
+        depends: [], inputs: [],
+        humanGate: {
+          prompt: '发送？',
+          options: ['approve', 'cancel'],
+          approveOptions: ['approve', 'cancel'],
+        },
+      }],
+    })).toThrow(/must be exactly \["approve"\]/);
+  });
+
+  it('schedule host requires exact chat identity and rejects local-only delivery in P0', () => {
+    const input = {
+      name: 'follow up',
+      schedule: '30m',
+      prompt: 'do work',
+      workingDir: '/workspace',
+      larkAppId: { $ref: 'context.larkAppId' },
+      chatId: { $ref: 'context.chatId' },
+      chatType: { $ref: 'context.chatType' },
+      deliver: 'origin',
+    };
+    expect(() => validateDag({
+      runId: 'r',
+      nodes: [{
+        id: 'schedule', type: 'host', executor: 'botmux-schedule', input,
+        depends: [], inputs: [], humanGate: { prompt: '创建定时任务？' },
+      }],
+    })).not.toThrow();
+    expect(() => validateDag({
+      runId: 'r',
+      nodes: [{
+        id: 'schedule', type: 'host', executor: 'botmux-schedule',
+        input: { ...input, deliver: 'local' },
+        depends: [], inputs: [], humanGate: { prompt: '创建定时任务？' },
+      }],
+    })).toThrow(/does not support local-only/);
+    expect(() => validateDag({
+      runId: 'r',
+      nodes: [{
+        id: 'schedule', type: 'host', executor: 'botmux-schedule',
+        input: { ...input, chatType: { $ref: 'params.chatType' } },
+        depends: [], inputs: [], humanGate: { prompt: '创建定时任务？' },
+      }],
+    })).toThrow(/context\.chatType/);
+  });
+
+  it('host result binding 必须指向 depends，且 revisit cone 不能包含 host', () => {
+    expect(() => validateDag({
+      runId: 'r',
+      nodes: [
+        { id: 'plan', type: 'goal', goal: 'plan', depends: [], inputs: [] },
+        { id: 'send', type: 'host', executor: 'feishu-send', input: { content: { $ref: 'plan.result.text' } }, depends: [], inputs: [], humanGate: { prompt: 'x' } },
+      ],
+    })).toThrow(/must also be in depends/);
+
+    expect(() => validateDag({
+      runId: 'r',
+      nodes: [
+        { id: 'draft', type: 'goal', goal: 'draft', depends: [], inputs: [] },
+        { id: 'send', type: 'host', executor: 'feishu-send', input: { content: { $ref: 'draft.result.text' } }, depends: ['draft'], inputs: [], humanGate: { prompt: 'x' } },
+        { id: 'review', type: 'goal', goal: 'review', depends: ['send'], inputs: [], revisitTo: ['draft'] },
+      ],
+    })).toThrow(/host nodes are not allowed in a revisit cone/);
   });
 
   it('拒绝 depends 指向不存在的节点', () => {
@@ -484,6 +598,55 @@ describe('journal + state', () => {
     }
   });
 
+  it('valid + torn tail 后 append 会先持久修复，不把两个 JSON 粘死', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-torn-repair-'));
+    try {
+      const jp = join(dir, 'journal.ndjson');
+      appendEvent(jp, { type: 'runStarted', runId: 'r' });
+      appendFileSync(jp, '{"ts":2,"type":"nodeDispa');
+
+      appendEvent(jp, { type: 'runSucceeded' });
+
+      const raw = readFileSync(jp, 'utf-8');
+      expect(raw.endsWith('\n')).toBe(true);
+      expect(raw).not.toContain('nodeDispa');
+      expect(readJournal(jp).map((event) => event.type)).toEqual(['runStarted', 'runSucceeded']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('保留完整但缺 newline 的最后事件，再安全 append', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-tail-seal-'));
+    try {
+      const jp = join(dir, 'journal.ndjson');
+      writeFileSync(jp, JSON.stringify({ ts: 1, type: 'runStarted', runId: 'r' }));
+
+      appendEvent(jp, { type: 'runSucceeded' });
+
+      expect(readJournal(jp).map((event) => event.type)).toEqual(['runStarted', 'runSucceeded']);
+      expect(readFileSync(jp, 'utf-8').split('\n').filter(Boolean)).toHaveLength(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('已 newline 提交的中段损坏仍 fail loud', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-middle-corrupt-'));
+    try {
+      const jp = join(dir, 'journal.ndjson');
+      writeFileSync(
+        jp,
+        `${JSON.stringify({ ts: 1, type: 'runStarted', runId: 'r' })}\n{not-json}\n` +
+        `${JSON.stringify({ ts: 3, type: 'runSucceeded' })}\n`,
+      );
+
+      expect(() => readJournal(jp)).toThrow(/corrupted at line 2/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('instance 层: dispatch 带 instanceId → instances + effectiveInstanceId', () => {
     const snap = materialize([
       { ts: 1, type: 'nodeDispatched', nodeId: 'A', instanceId: 'A#001', attemptId: 'A#001/attempts/001' },
@@ -531,6 +694,17 @@ describe('journal + state', () => {
     expect(snap.instances.get('A#002')!.status).toBe('running');
     // 迟到 settle 不能解冻刷新态：A#001 仍是 superseded（菲菲 review blocker 1）
     expect(snap.instances.get('A#001')!.status).toBe('superseded');
+  });
+
+  it('instance 层: first-observation block 不会把 superseded 旧实例重新提升为 effective', () => {
+    const snap = materialize([
+      { ts: 1, type: 'nodeDispatched', nodeId: 'A', instanceId: 'A#001', attemptId: 'A#001/attempts/001' },
+      { ts: 2, type: 'nodeInstanceSuperseded', nodeId: 'A', instanceId: 'A#001', byNodeId: 'A', reason: 'refresh' },
+      // 模拟旧进程迟到的 integrity block；node view 此时没有 effective。
+      { ts: 3, type: 'nodeBlocked', nodeId: 'A', instanceId: 'A#001', attemptId: 'A#001/attempts/001', errorClass: 'resultInvalid' },
+    ]);
+    expect(snap.nodes.get('A')).toEqual({ status: 'pending' });
+    expect(snap.instances.get('A#001')).toEqual({ status: 'superseded' });
   });
 
   it('instance 层: gate 挂 instance — A#001 批准不污染 A#002（约束6）', () => {

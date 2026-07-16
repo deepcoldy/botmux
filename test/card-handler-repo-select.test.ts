@@ -79,6 +79,7 @@ vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
   ensureSessionWhiteboard: vi.fn(),
   buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
+  buildNewTopicCliInput: vi.fn(() => ({ content: 'mock-prompt' })),
   getAvailableBots: vi.fn(async () => []),
   persistStreamCardState: vi.fn(),
   resumeSession: vi.fn(),
@@ -102,6 +103,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 vi.mock('../src/services/git-worktree.js', () => ({
   createRepoWorktree: vi.fn(),
   removeRepoWorktree: vi.fn(async () => {}),
+  pushWorktreeBranch: vi.fn(async () => {}),
   dirSuffixForBranch: (branch: string) => branch.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'branch',
 }));
 
@@ -123,9 +125,10 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
 import { forkWorker, killWorker, deliverEphemeralOrReply, deliverWriteLinkCard } from '../src/core/worker-pool.js';
-import { getAvailableBots } from '../src/core/session-manager.js';
+import { buildNewTopicCliInput, getAvailableBots } from '../src/core/session-manager.js';
+import { getBot } from '../src/bot-registry.js';
 import { createSession, closeSession } from '../src/services/session-store.js';
-import { createRepoWorktree, removeRepoWorktree } from '../src/services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch, removeRepoWorktree } from '../src/services/git-worktree.js';
 import { applyConfigField } from '../src/services/bot-config-store.js';
 import { deleteMessage } from '../src/im/lark/client.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
@@ -199,6 +202,14 @@ function makeManualEvent(path: string, operator = OWNER) {
   };
 }
 
+function makeSkipEvent(operator = OWNER) {
+  return {
+    operator: { open_id: operator },
+    action: { value: { action: 'skip_repo', root_id: ROOT_ID } },
+    context: { open_message_id: 'om_card' },
+  };
+}
+
 function makeWorktreeSubmitEvent(branch = '', paths?: string[], operator = OWNER) {
   return {
     operator: { open_id: operator },
@@ -222,6 +233,12 @@ function deferred<T>() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(getBot).mockImplementation(() => ({
+    config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+    resolvedAllowedUsers: [],
+    botName: 'testbot',
+    botOpenId: 'ou_bot',
+  }) as any);
   let n = 0;
   vi.mocked(createSession).mockImplementation((chatId: string, rootId: string, title: string, chatType?: string) => ({
     sessionId: `uuid-new-${++n}`,
@@ -239,6 +256,7 @@ beforeEach(() => {
 describe('repo select card — plain switch', () => {
   it('pendingRepo selection forks the CLI with the buffered prompt', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hello world', worker: null });
+    ds.session.riffRepoDirs = ['/stale/riff/repo'];
     const { deps, sessionReply } = makeDeps(ds);
 
     await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
@@ -247,11 +265,74 @@ describe('repo select card — plain switch', () => {
     expect(ds.workingDir).toBe('/repos/alpha');
     expect(ds.session.workingDir).toBe('/repos/alpha');
     expect(forkWorker).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(forkWorker).mock.calls[0]![1]).toBe('mock-prompt');
+    expect(vi.mocked(forkWorker).mock.calls[0]![1]).toEqual({ content: 'mock-prompt' });
+    expect(ds.session.riffRepoDirs).toBeUndefined();
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('已选择');
     expect(killWorker).not.toHaveBeenCalled();
     // First-spawn (pendingRepo) closes nothing, so no "session closed" card.
     expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
+  });
+
+  it('pendingRepo selection forwards the complete Codex App sidecar to forkWorker', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hello world', worker: null });
+    ds.session.cliId = 'codex-app';
+    const substituteTrigger = {
+      target: { userId: 'u_configured' },
+      observedMention: { name: 'Observed Person', userId: 'u_configured' },
+      disclosure: 'prefix' as const,
+    };
+    ds.pendingSubstituteTrigger = substituteTrigger;
+    const codexAppInput = {
+      text: 'hello world',
+      additionalContext: {
+        botmux_substitute_policy: { kind: 'application' as const, value: 'fixed policy' },
+        botmux_substitute_target: { kind: 'untrusted' as const, value: 'observed identity' },
+      },
+    };
+    vi.mocked(buildNewTopicCliInput).mockReturnValueOnce({ content: 'mock-prompt', codexAppInput });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(forkWorker).mock.calls[0]![1]).toEqual({
+      content: 'mock-prompt',
+      codexAppInput,
+    });
+    expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![11]).toEqual(expect.objectContaining({
+      substituteTrigger,
+    }));
+  });
+
+  it('skip_repo also forwards the complete Codex App sidecar to forkWorker', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hello world', worker: null });
+    ds.session.cliId = 'codex-app';
+    const substituteTrigger = {
+      target: { userId: 'u_configured' },
+      observedMention: { name: 'Observed Person', userId: 'u_configured' },
+      disclosure: 'prefix' as const,
+    };
+    ds.pendingSubstituteTrigger = substituteTrigger;
+    const codexAppInput = {
+      text: 'hello world',
+      additionalContext: {
+        botmux_substitute_policy: { kind: 'application' as const, value: 'fixed policy' },
+        botmux_substitute_target: { kind: 'untrusted' as const, value: 'observed identity' },
+      },
+    };
+    vi.mocked(buildNewTopicCliInput).mockReturnValueOnce({ content: 'mock-prompt', codexAppInput });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSkipEvent(), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(forkWorker).mock.calls[0]![1]).toEqual({
+      content: 'mock-prompt',
+      codexAppInput,
+    });
+    expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![11]).toEqual(expect.objectContaining({
+      substituteTrigger,
+    }));
   });
 
   it('mid-session selection closes the old session and forks a fresh one', async () => {
@@ -515,6 +596,117 @@ describe('repo select card — worktree open', () => {
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('worktree 已创建');
   });
 
+  it('Riff multi-repo pushes every branch and preserves the user-selected repo order', async () => {
+    vi.mocked(getBot).mockImplementation(() => ({
+      config: {
+        larkAppId: APP_ID,
+        larkAppSecret: 'secret',
+        cliId: 'riff',
+        backendType: 'riff',
+      },
+      resolvedAllowedUsers: [],
+      botName: 'testbot',
+      botOpenId: 'ou_bot',
+    }) as any);
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    ds.session.cliId = 'riff';
+    const { deps } = makeDeps(ds);
+    vi.mocked(createRepoWorktree)
+      .mockResolvedValueOnce({ path: '/repos/feat-riff/alpha', branch: 'feat/riff-alpha', baseRef: 'origin/master' })
+      .mockResolvedValueOnce({ path: '/repos/feat-riff/beta', branch: 'feat/riff-beta', baseRef: 'origin/master' });
+
+    await handleCardAction(makeWorktreeSubmitEvent('feat/riff', ['/repos/alpha', '/repos/beta']), deps, APP_ID);
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+
+    expect(pushWorktreeBranch).toHaveBeenCalledTimes(2);
+    expect(pushWorktreeBranch).toHaveBeenNthCalledWith(1, '/repos/feat-riff/alpha', 'feat/riff-alpha');
+    expect(pushWorktreeBranch).toHaveBeenNthCalledWith(2, '/repos/feat-riff/beta', 'feat/riff-beta');
+    expect(ds.session.riffRepoDirs).toEqual([
+      '/repos/feat-riff/alpha',
+      '/repos/feat-riff/beta',
+    ]);
+  });
+
+  it('uses the reconciled CLI/backend pair when deciding whether to push a worktree branch', async () => {
+    vi.mocked(getBot).mockImplementation(() => ({
+      config: {
+        larkAppId: APP_ID,
+        larkAppSecret: 'secret',
+        cliId: 'codex-app',
+        backendType: 'riff',
+      },
+      resolvedAllowedUsers: [],
+      botName: 'testbot',
+      botOpenId: 'ou_bot',
+    }) as any);
+    const invalidNonRiffDs = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    invalidNonRiffDs.session.cliId = 'codex-app';
+    const { deps: invalidDeps } = makeDeps(invalidNonRiffDs);
+    vi.mocked(createRepoWorktree).mockResolvedValueOnce({
+      path: '/repos/codex-app-wt', branch: 'feat/codex-app', baseRef: 'origin/master',
+    });
+
+    await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), invalidDeps, APP_ID);
+    await vi.waitFor(() => expect(invalidNonRiffDs.worktreeCreating).toBe(false));
+    expect(pushWorktreeBranch).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    vi.mocked(getBot).mockImplementation(() => ({
+      config: {
+        larkAppId: APP_ID,
+        larkAppSecret: 'secret',
+        cliId: 'riff',
+        backendType: 'pty',
+      },
+      resolvedAllowedUsers: [],
+      botName: 'testbot',
+      botOpenId: 'ou_bot',
+    }) as any);
+    const invalidRiffDs = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    invalidRiffDs.session.cliId = 'riff';
+    const { deps: riffDeps } = makeDeps(invalidRiffDs);
+    vi.mocked(createRepoWorktree).mockResolvedValueOnce({
+      path: '/repos/riff-wt', branch: 'feat/riff-local', baseRef: 'origin/master',
+    });
+
+    await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), riffDeps, APP_ID);
+    await vi.waitFor(() => expect(invalidRiffDs.worktreeCreating).toBe(false));
+    expect(pushWorktreeBranch).toHaveBeenCalledOnce();
+    expect(pushWorktreeBranch).toHaveBeenCalledWith('/repos/riff-wt', 'feat/riff-local');
+  });
+
+  it('stamps multi-repo Riff directories on the fresh mid-session replacement', async () => {
+    vi.mocked(getBot).mockImplementation(() => ({
+      config: {
+        larkAppId: APP_ID,
+        larkAppSecret: 'secret',
+        cliId: 'riff',
+        backendType: 'riff',
+      },
+      resolvedAllowedUsers: [],
+      botName: 'testbot',
+      botOpenId: 'ou_bot',
+    }) as any);
+    const ds = makeDs();
+    const oldSession = ds.session;
+    const { deps } = makeDeps(ds);
+    vi.mocked(createRepoWorktree)
+      .mockResolvedValueOnce({ path: '/repos/mid-riff/alpha', branch: 'feat/mid-alpha', baseRef: 'origin/master' })
+      .mockResolvedValueOnce({ path: '/repos/mid-riff/beta', branch: 'feat/mid-beta', baseRef: 'origin/master' });
+
+    await handleCardAction(makeWorktreeSubmitEvent('feat/mid', ['/repos/alpha', '/repos/beta']), deps, APP_ID);
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+
+    expect(closeSession).toHaveBeenCalledWith('uuid-old');
+    expect(ds.session).not.toBe(oldSession);
+    expect(oldSession.riffRepoDirs).toBeUndefined();
+    expect(ds.session.riffRepoDirs).toEqual([
+      '/repos/mid-riff/alpha',
+      '/repos/mid-riff/beta',
+    ]);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+  });
+
   it('reads official form multi-select values from action.form_value and creates all selected repos', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
     const { deps } = makeDeps(ds);
@@ -733,7 +925,7 @@ describe('repo select card — manual directory entry', () => {
     expect(ds.workingDir).toBe(tmpDir);
     expect(ds.session.workingDir).toBe(tmpDir);
     expect(forkWorker).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(forkWorker).mock.calls[0]![1]).toBe('mock-prompt');
+    expect(vi.mocked(forkWorker).mock.calls[0]![1]).toEqual({ content: 'mock-prompt' });
     const reply = sessionReply.mock.calls.map(c => c[1]).join();
     expect(reply).toContain('已选择');
     expect(reply).toContain(basename(tmpDir));

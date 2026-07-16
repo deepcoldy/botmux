@@ -41,6 +41,7 @@ import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
@@ -48,6 +49,8 @@ import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createGrokAdapter } from '../src/adapters/cli/grok.js';
+import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
@@ -332,6 +335,52 @@ describe('writeInput: multiline, tmux mode', () => {
     }
   });
 
+  it('kiro-cli: sends multiline input with documented Ctrl+J soft newlines', async () => {
+    const adapter = createKiroCliAdapter('/bin/kiro-cli');
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, MULTILINE);
+
+    expect(pty.pasteText).not.toHaveBeenCalled();
+    expect(pty.sendText.mock.calls.map(c => c[0])).toEqual(['/session-id', 'first line', 'Session ID: abc-123']);
+    expect(pty.sendSpecialKeys.mock.calls).toEqual([
+      ['Enter'],
+      ['C-j'],
+      ['C-j'],
+      ['Enter'],
+    ]);
+  });
+
+  it('kiro-cli: asks for /session-id only once per PTY', async () => {
+    const adapter = createKiroCliAdapter('/bin/kiro-cli');
+    const pty = makeTmuxPty();
+
+    await adapter.writeInput(pty, 'first');
+    await adapter.writeInput(pty, 'second');
+
+    expect(pty.sendText.mock.calls.map(c => c[0])).toEqual(['/session-id', 'first', 'second']);
+    expect(pty.sendSpecialKeys.mock.calls).toEqual([
+      ['Enter'],
+      ['Enter'],
+      ['Enter'],
+    ]);
+  });
+
+  it('kiro-cli: asks for /session-id once in raw PTY fallback', async () => {
+    const adapter = createKiroCliAdapter('/bin/kiro-cli');
+    const pty = makeRawPty();
+
+    await adapter.writeInput(pty, 'first');
+    await adapter.writeInput(pty, 'second');
+
+    expect(pty.write.mock.calls.map(c => c[0])).toEqual([
+      '/session-id\r',
+      'first',
+      '\r',
+      'second',
+      '\r',
+    ]);
+  });
+
   it('claude-code: fails before typing when only unsupported Cmd+Enter can submit', async () => {
     const adapter = createClaudeCodeAdapter('/bin/claude');
     writeClaudeKeybindings({
@@ -521,6 +570,19 @@ describe('supportsTypeAhead flag', () => {
 
   it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex' && name !== 'genius'))('%s: undefined (default behavior)', (_name, adapter) => {
     expect(adapter.supportsTypeAhead).toBeUndefined();
+  });
+});
+
+describe('reliableTurnTerminal capability', () => {
+  it('is enabled only for the first transcript-backed meeting consumers', () => {
+    // Claude completion is derived from non-tool stop_reason / turn_duration
+    // JSONL markers, never from its prompt-looking screen-idle edge.
+    expect(createClaudeCodeAdapter('/bin/claude').reliableTurnTerminal).toBe(true);
+    expect(createCodexAdapter('/bin/codex').reliableTurnTerminal).toBe(true);
+    expect(createTraexAdapter('/bin/traex').reliableTurnTerminal).toBe(true);
+    expect(createGrokAdapter('/bin/grok').reliableTurnTerminal).toBe(true);
+    expect(createCocoAdapter('/bin/coco').reliableTurnTerminal).toBeUndefined();
+    expect(createPiAdapter('/bin/pi').reliableTurnTerminal).toBeUndefined();
   });
 });
 
@@ -997,6 +1059,8 @@ describe('codex writeInput submission confirmation', () => {
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1016,6 +1080,8 @@ describe('codex writeInput submission confirmation', () => {
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1033,6 +1099,8 @@ describe('codex writeInput submission confirmation', () => {
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
       'new-codex-session',
     ]);
   });
@@ -1051,6 +1119,8 @@ describe('codex writeInput submission confirmation', () => {
         '--no-alt-screen',
         '-c',
         'shell_environment_policy.set.BOTMUX_SESSION_ID="custom-botmux-session"',
+        '-c',
+        'check_for_update_on_startup=false',
         'custom-codex-session',
       ]);
 
@@ -1074,6 +1144,8 @@ describe('codex writeInput submission confirmation', () => {
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
     ]);
   });
 
@@ -1090,6 +1162,8 @@ describe('codex writeInput submission confirmation', () => {
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
       '-C',
       '/repo/root',
     ]);

@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createHmac } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import {
   mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync, statSync,
 } from 'node:fs';
@@ -146,6 +148,74 @@ describe('dashboard secret persistence', () => {
     expect(loadDashboardSecret(secretPath)).toBe(secret);
     expect(statSync(secretPath).mode & 0o777).toBe(0o600);
   });
+
+  it('ignores a legacy stale repair lock and converges through a permanent seed', () => {
+    mkdirSync(join(dir, 'nested'));
+    writeFileSync(secretPath, ' \n');
+    const lockPath = `${secretPath}.repair.lock`;
+    writeFileSync(lockPath, '');
+
+    const secret = loadOrCreateDashboardSecret(secretPath);
+
+    expect(secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(loadDashboardSecret(secretPath)).toBe(secret);
+    expect(statSync(secretPath).mode & 0o777).toBe(0o600);
+    expect(loadDashboardSecret(`${secretPath}.repair-seed`)).toBe(secret);
+    expect(statSync(`${secretPath}.repair-seed`).mode & 0o777).toBe(0o600);
+    expect(existsSync(lockPath)).toBe(true); // ignored legacy residue cannot block startup
+  });
+
+  it('concurrent processes repairing one corrupt secret converge on the repair seed', async () => {
+    mkdirSync(join(dir, 'nested'));
+    writeFileSync(secretPath, ' \n');
+    const goPath = join(dir, 'go');
+    const authModuleUrl = new URL('../src/dashboard/auth.ts', import.meta.url).href;
+    const childSource = `
+      import { existsSync, writeFileSync } from 'node:fs';
+      const [secretPath, readyPath, goPath] = process.argv.slice(1);
+      const { loadOrCreateDashboardSecret } = await import(${JSON.stringify(authModuleUrl)});
+      writeFileSync(readyPath, 'ready');
+      while (!existsSync(goPath)) await new Promise(resolve => setTimeout(resolve, 5));
+      process.stdout.write(loadOrCreateDashboardSecret(secretPath));
+    `;
+    const children = Array.from({ length: 8 }, (_, index) => {
+      const readyPath = join(dir, `ready-${index}`);
+      const child = spawn(process.execPath, [
+        '--import', 'tsx', '--input-type=module', '-e', childSource,
+        secretPath, readyPath, goPath,
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', chunk => { stdout += String(chunk); });
+      child.stderr.on('data', chunk => { stderr += String(chunk); });
+      return { child, readyPath, stdout: () => stdout, stderr: () => stderr };
+    });
+
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!children.every(entry => existsSync(entry.readyPath))) {
+        if (Date.now() >= deadline) throw new Error('repair children did not reach barrier');
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      writeFileSync(goPath, 'go');
+      const exits = await Promise.all(children.map(async entry => {
+        const [code, signal] = await once(entry.child, 'close');
+        return { code, signal, stdout: entry.stdout(), stderr: entry.stderr() };
+      }));
+      for (const result of exits) {
+        expect(result, result.stderr).toMatchObject({ code: 0, signal: null });
+      }
+      const secrets = exits.map(result => result.stdout);
+      expect(new Set(secrets).size).toBe(1);
+      expect(secrets[0]).toBe(loadDashboardSecret(secretPath));
+      expect(secrets[0]).toBe(loadDashboardSecret(`${secretPath}.repair-seed`));
+      expect(statSync(secretPath).mode & 0o777).toBe(0o600);
+    } finally {
+      for (const { child } of children) {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }
+    }
+  }, 20_000);
 });
 
 describe('parseCookie', () => {
@@ -321,6 +391,19 @@ describe('decideDashboardAuth — protected surface', () => {
       activeToken: TOK,
     });
     expect(d.kind).toBe('deny401');
+  });
+
+  it('GET /api/v3 run list/detail without token → deny401', () => {
+    for (const pathname of ['/api/v3/runs', '/api/v3/runs/project-review-1']) {
+      const d = decideDashboardAuth({
+        method: 'GET',
+        pathname,
+        hasTokenParam: false,
+        presentedToken: undefined,
+        activeToken: TOK,
+      });
+      expect(d.kind, pathname).toBe('deny401');
+    }
   });
 
   it('POST / static-looking path is NOT public (only GET is)', () => {
@@ -511,6 +594,9 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
       '/api/bots',
       '/api/skills',
       '/api/cli-options',
+      // Workflow projections contain user-authored goals and identifiers.
+      '/api/v3/runs',
+      '/api/v3/runs/project-review-1',
       // Mints a token-bearing writable terminal URL — never public, even in
       // publicReadOnly (the daemon IPC behind it is also loopback-HMAC gated).
       '/api/sessions/sess-1/write-link',

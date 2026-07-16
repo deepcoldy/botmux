@@ -1,4 +1,5 @@
 import type { PtyHandle } from './types.js';
+import type { CodexAppTurnInput } from '../../types.js';
 import { delay } from '../../utils/timing.js';
 
 /**
@@ -40,8 +41,11 @@ export const RUNNER_INPUT_CHUNK_BYTES = 1024;
  *  pane pty between writes. */
 export const RUNNER_INPUT_THROTTLE_MS = 20;
 
-export function encodeRunnerInput(content: string): string {
-  return Buffer.from(JSON.stringify({ type: 'message', content }), 'utf8').toString('base64');
+export function encodeRunnerInput(content: string, codexAppInput?: CodexAppTurnInput): string {
+  const payload = codexAppInput
+    ? { type: 'message', content, codexAppInput }
+    : { type: 'message', content };
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
 }
 
 /** Split an ASCII string into <=maxBytes pieces. Safe because the caller only
@@ -79,8 +83,9 @@ export async function writeRunnerInput(
   pty: PtyHandle,
   markerPrefix: string,
   content: string,
+  codexAppInput?: CodexAppTurnInput,
 ): Promise<{ submitted: boolean }> {
-  const line = `${markerPrefix}${encodeRunnerInput(content)}`;
+  const line = `${markerPrefix}${encodeRunnerInput(content, codexAppInput)}`;
 
   // Non-tmux fallback (raw PTY): a single write is fine — there's no send-keys
   // process to time out, and the PTY write isn't bounded the same way.

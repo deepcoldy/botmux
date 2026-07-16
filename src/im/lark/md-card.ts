@@ -19,11 +19,210 @@
  * the outer block (CommonMark spec).
  */
 
+import { homedir } from 'node:os';
+import { existsSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { resolve } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
 import { t, type Locale } from '../../i18n/index.js';
 
 const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
+const MAX_LOCAL_HOME_LINK_REPAIRS = 256;
+
+export type LocalHomeLinkMode = 'filesystem' | 'lexical' | 'disabled';
+
+interface LocalHomeCandidate {
+  id: number;
+  start: number;
+  end: number;
+  value: string;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Find home-prefix occurrences that are worth asking markdown-it about. The
+ * scan deliberately over-matches prose and code: a unique, URL-safe marker is
+ * injected before each occurrence and only markers that markdown-it returns
+ * as the start of a real `link_open` href are accepted. This keeps CommonMark
+ * semantics (containers, code, tables, and all newline styles) in one parser
+ * instead of recreating source maps or inline rules here.
+ */
+function collectLocalHomeLinkCandidates(
+  input: string,
+  relativeHome: string,
+): LocalHomeCandidate[] {
+  const homeOccurrence = new RegExp(
+    `${escapeRegExp(relativeHome)}(?=$|[/?#>:()\\s\\\\])`,
+    'gi',
+  );
+  const candidates: LocalHomeCandidate[] = [];
+  for (const match of input.matchAll(homeOccurrence)) {
+    const start = match.index;
+    candidates.push({
+      id: candidates.length,
+      start,
+      end: start + match[0].length,
+      value: '',
+    });
+  }
+  return candidates;
+}
+
+function chooseLinkMarkerPrefix(input: string): string {
+  let prefix: string;
+  do {
+    prefix = `bmxlocallink${randomBytes(12).toString('hex')}x`;
+  } while (input.includes(prefix));
+  return prefix;
+}
+
+/** Return only candidates that markdown-it confirms start a real link href. */
+function validateLocalHomeLinkCandidates(
+  input: string,
+  candidates: LocalHomeCandidate[],
+): LocalHomeCandidate[] {
+  if (candidates.length === 0) return [];
+
+  const markerPrefix = chooseLinkMarkerPrefix(input);
+  const markedParts: string[] = [];
+  let sourceCursor = 0;
+  for (const candidate of candidates) {
+    const marker = `${markerPrefix}${candidate.id}x/`;
+    markedParts.push(input.slice(sourceCursor, candidate.start), marker);
+    sourceCursor = candidate.start;
+  }
+  markedParts.push(input.slice(sourceCursor));
+  const marked = markedParts.join('');
+
+  const byId = new Map(candidates.map(candidate => [candidate.id, candidate]));
+  const confirmed = new Set<number>();
+  const markerPattern = new RegExp(`^${escapeRegExp(markerPrefix)}(\\d+)x/`);
+  const anyMarkerPattern = new RegExp(`${escapeRegExp(markerPrefix)}\\d+x/`, 'g');
+  for (const token of md.parse(marked, {})) {
+    if (token.type !== 'inline') continue;
+    for (const child of token.children ?? []) {
+      if (child.type !== 'link_open') continue;
+      const href = child.attrGet('href') ?? '';
+      const markerMatch = href.match(markerPattern);
+      if (!markerMatch) continue;
+      const id = Number(markerMatch[1]);
+      const candidate = byId.get(id);
+      if (!candidate) continue;
+      const marker = markerMatch[0];
+      candidate.value = md.normalizeLinkText(
+        href.slice(marker.length).replace(anyMarkerPattern, ''),
+      );
+      confirmed.add(id);
+    }
+  }
+  return candidates.filter(candidate => confirmed.has(candidate.id));
+}
+
+/**
+ * Restore the leading slash when a model emits the current user's home path
+ * as a relative Markdown link destination. Codex file links are normally
+ * absolute (`/Users/alice/...` or `/home/alice/...`); without the slash,
+ * Feishu resolves the destination as a relative URL and cannot open it.
+ *
+ * The repair is intentionally narrow: it only matches the current host home
+ * prefix and only in destinations markdown-it recognizes as real inline links.
+ * Web links, existing absolute paths, other users' homes, and general
+ * relative links are left unchanged. An ambiguous home-shaped target is only
+ * repaired when the absolute file exists and the same target does not exist
+ * relative to the current working directory.
+ */
+export function normalizeLocalHomeLinks(
+  input: string,
+  homeDir = homedir(),
+  cwd = process.cwd(),
+  pathExists: (path: string) => boolean = existsSync,
+  mode: LocalHomeLinkMode = 'filesystem',
+): string {
+  if (mode === 'disabled') return input;
+  const relativeHome = homeDir.replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!relativeHome || relativeHome === homeDir) return input;
+
+  const homePrefix = new RegExp(`^${escapeRegExp(relativeHome)}(?=$|[/?#])`, 'i');
+  const normalizedHome = resolve(homeDir);
+  const pathExistence = new Map<string, boolean>();
+  const cachedPathExists = (path: string): boolean => {
+    let exists = pathExistence.get(path);
+    if (exists === undefined) {
+      exists = pathExists(path);
+      pathExistence.set(path, exists);
+    }
+    return exists;
+  };
+
+  const confirmedDestinations = validateLocalHomeLinkCandidates(
+    input,
+    collectLocalHomeLinkCandidates(input, relativeHome),
+  );
+  // Filesystem mode caps synchronous probes over untrusted model output.
+  // Lexical mode performs no I/O, so it can repair every confirmed link.
+  const destinations = mode === 'filesystem'
+    ? confirmedDestinations.slice(0, MAX_LOCAL_HOME_LINK_REPAIRS)
+    : confirmedDestinations;
+  const repairs: Array<{ start: number; end: number }> = [];
+  for (const destination of destinations) {
+    const homeMatch = destination.value.match(homePrefix);
+    if (!homeMatch) continue;
+
+    const relativeTarget = destination.value.split(/[?#]/, 1)[0];
+    const absoluteTargetText = `${relativeHome}${destination.value.slice(homeMatch[0].length)}`
+      .split(/[?#]/, 1)[0];
+    const strippedRelativeTarget = relativeTarget.replace(/:\d+(?::\d+)?$/, '');
+    const strippedAbsoluteTargetText = absoluteTargetText.replace(/:\d+(?::\d+)?$/, '');
+    const targetTexts = [{ relative: relativeTarget, absolute: absoluteTargetText }];
+    const hasPositionSuffix = strippedRelativeTarget !== relativeTarget &&
+      strippedAbsoluteTargetText !== absoluteTargetText;
+    if (hasPositionSuffix) {
+      targetTexts.push({ relative: strippedRelativeTarget, absolute: strippedAbsoluteTargetText });
+    }
+
+    const targetCandidates = targetTexts.map(target => ({
+      relative: resolve(cwd, target.relative),
+      absolute: resolve('/', target.absolute),
+    }));
+    if (targetCandidates[0].absolute !== normalizedHome &&
+        !targetCandidates[0].absolute.startsWith(`${normalizedHome}/`)) continue;
+
+    // A numeric suffix can be a Codex source position. Never let removing it
+    // create a second candidate outside HOME (for example `..:123`). In
+    // filesystem mode the exact literal filename remains eligible; lexical
+    // mode cannot distinguish it safely, so it leaves the link unchanged.
+    const strippedCandidateIsSafe = targetCandidates.length === 1 ||
+      targetCandidates[1].absolute === normalizedHome ||
+      targetCandidates[1].absolute.startsWith(`${normalizedHome}/`);
+    if (mode === 'lexical' && !strippedCandidateIsSafe) continue;
+
+    if (mode === 'filesystem') {
+      const safeCandidates = strippedCandidateIsSafe ? targetCandidates : targetCandidates.slice(0, 1);
+      // Preserve the source spelling/case for cwd-relative disambiguation. On
+      // a case-sensitive filesystem, `Home/alice/a` and `home/alice/a` differ.
+      if (safeCandidates.some(target => cachedPathExists(target.relative))) continue;
+      if (!safeCandidates.some(target => cachedPathExists(target.absolute))) continue;
+    }
+
+    const rawHome = input.slice(destination.start, destination.end);
+    if (rawHome.toLowerCase() !== homeMatch[0].toLowerCase()) continue;
+    repairs.push({ start: destination.start, end: destination.end });
+  }
+
+  if (repairs.length === 0) return input;
+  const outputParts: string[] = [];
+  let outputCursor = 0;
+  for (const repair of repairs) {
+    outputParts.push(input.slice(outputCursor, repair.start), `/${relativeHome}`);
+    outputCursor = repair.end;
+  }
+  outputParts.push(input.slice(outputCursor));
+  return outputParts.join('');
+}
 
 /** Default footer brand when a bot has no custom `brandLabel` configured. */
 export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux)';
@@ -143,6 +342,16 @@ function unescapeFenceLines(input: string): string {
   return input.replace(/^[ ]{0,3}(?:\\`){3,}[^\n`]*$/gm, m => m.replace(/\\`/g, '`'));
 }
 
+/** Normalize source bytes that must be settled before the card is rendered. */
+export function prepareCardMarkdown(
+  input: string,
+  cwd = process.cwd(),
+  localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+): string {
+  input = unescapeFenceLines(input);
+  return normalizeLocalHomeLinks(input, homedir(), cwd, existsSync, localHomeLinkMode);
+}
+
 /**
  * Split markdown into card v2 body elements:
  *   1. Pipe tables → native `table` widget (Feishu's markdown widget can't
@@ -156,14 +365,21 @@ function unescapeFenceLines(input: string): string {
  * All non-table blocks are merged into a single `markdown` element to keep
  * card element counts modest.
  */
-export function buildCardBodyElements(input: string): any[] {
+export function buildCardBodyElements(
+  input: string,
+  cwd = process.cwd(),
+  localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+): any[] {
   if (!input) return [];
+  // Recover model-escaped fences first so markdown-it can classify their
+  // contents as code before local-link normalization inspects link tokens.
+  input = prepareCardMarkdown(input, cwd, localHomeLinkMode);
   // Pre-pass: a line that is nothing but 2+ images renders as a side-by-side
   // image row (column_set) instead of stacked full-width images. Everything
   // else flows through the markdown element builder unchanged. Fence-aware so
   // image-looking lines inside ``` code blocks are left intact.
   const elements: any[] = [];
-  for (const seg of splitImageRowSegments(unescapeFenceLines(input))) {
+  for (const seg of splitImageRowSegments(input)) {
     if (seg.type === 'imgrow') elements.push(imageRowElement(seg.keys));
     else elements.push(...buildMarkdownElements(seg.content));
   }
@@ -355,8 +571,13 @@ function splitImageRowSegments(input: string): BodySegment[] {
  * one rendering path: a caller that embeds `![](img_key)` directly and puts two
  * on a line (e.g. the menu poster) gets the same grid without using `--images`.
  */
-export function buildImageCardElements(md: string, imageKeys: string[]): any[] {
-  if (imageKeys.length === 0) return md ? buildCardBodyElements(md) : [];
+export function buildImageCardElements(
+  md: string,
+  imageKeys: string[],
+  cwd = process.cwd(),
+  localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+): any[] {
+  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode) : [];
 
   const used = new Set<number>();
   const keyAt = (idx: number): string | null =>
@@ -387,7 +608,7 @@ export function buildImageCardElements(md: string, imageKeys: string[]): any[] {
   const trailing = imageKeys.map((k, i) => (used.has(i) ? '' : `![](${k})`)).filter(Boolean).join('\n\n');
   if (trailing) resolved = resolved ? `${resolved}\n\n${trailing}` : trailing;
 
-  return buildCardBodyElements(resolved);
+  return buildCardBodyElements(resolved, cwd, localHomeLinkMode);
 }
 
 /**
@@ -426,8 +647,15 @@ export function hasMarkdown(text: string): boolean {
  * suppressed, else custom. When brand and recipient are both absent the whole
  * footer (HR included) is omitted.
  */
-export function buildMarkdownCard(md: string, recipientOpenId?: string, brand?: string, locale?: Locale): string {
-  const elements = md ? buildCardBodyElements(md) : [];
+export function buildMarkdownCard(
+  md: string,
+  recipientOpenId?: string,
+  brand?: string,
+  locale?: Locale,
+  workingDir?: string,
+  localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+): string {
+  const elements = md ? buildCardBodyElements(md, workingDir, localHomeLinkMode) : [];
   const footerParts: string[] = [];
   const brandSeg = brandFooterSegment(brand);
   if (brandSeg) footerParts.push(brandSeg);
@@ -480,8 +708,20 @@ export function buildContextualReplyCard(opts: {
   recipientOpenId?: string;
   brand?: string;
   locale?: Locale;
+  workingDir?: string;
+  localHomeLinkMode?: LocalHomeLinkMode;
 }): string {
-  const { title, userText, assistantText, assistantLabel, recipientOpenId, brand, locale } = opts;
+  const {
+    title,
+    userText,
+    assistantText,
+    assistantLabel,
+    recipientOpenId,
+    brand,
+    locale,
+    workingDir,
+    localHomeLinkMode = 'filesystem',
+  } = opts;
   const elements: any[] = [];
 
   elements.push({
@@ -505,7 +745,7 @@ export function buildContextualReplyCard(opts: {
   });
 
   const bodyElements = assistantText.trim()
-    ? buildCardBodyElements(assistantText)
+    ? buildCardBodyElements(assistantText, workingDir, localHomeLinkMode)
     : [{ tag: 'markdown', content: `*${t('common.empty_paren', undefined, locale)}*` }];
   for (const el of bodyElements) elements.push(el);
 

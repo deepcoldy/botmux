@@ -7,6 +7,7 @@ import { mountReactPage, type PageDisposer } from './react-mount.js';
 
 interface SkillRow {
   name: string;
+  displayName?: string;
   description?: string;
   tags?: string[];
   source?: Record<string, any>;
@@ -54,6 +55,11 @@ type DeliveryMode = 'auto' | 'prompt' | 'native';
 type ProjectTrustMode = 'off' | 'all';
 
 const INSTALLED_SKILLS_ROWS_PER_PAGE = 2;
+
+interface SkillRemovalReference {
+  name: string;
+  bots: string[];
+}
 
 function nativeLibraryLabel(path: string | undefined, tr: ReturnType<typeof useT>): string | null {
   const p = String(path ?? '').replace(/\\/g, '/');
@@ -324,6 +330,401 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
   );
 }
 
+export function InstalledSkillsLibrary(props: {
+  skills: SkillRow[];
+  busySkill: string | null;
+  removingNames: Set<string>;
+  status: StatusMessage;
+  onUpdate(name: string): void;
+  onRequestRemove(names: string[]): void;
+}) {
+  const tr = useT();
+  const selectAllRef = useRef<HTMLInputElement | null>(null);
+  const previousSkillNamesRef = useRef(new Set(props.skills.map(skill => skill.name)));
+  const queryRef = useRef('');
+  const selectionModeRef = useRef(false);
+  const escapeQueryRef = useRef<string | null>(null);
+  const [query, setQuery] = useState('');
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [page, setPage] = useState(0);
+  const [viewportWidth, setViewportWidth] = useState(() => typeof window === 'undefined' ? 1200 : window.innerWidth);
+
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  queryRef.current = query;
+  selectionModeRef.current = selectionMode;
+  const filteredSkills = useMemo(() => {
+    if (!normalizedQuery) return props.skills;
+    return props.skills.filter(skill => [
+      skill.name,
+      skill.displayName,
+      skill.description,
+      ...(skill.tags ?? []),
+      sourceLabel(skill, tr),
+    ].filter(Boolean).join('\n').toLocaleLowerCase().includes(normalizedQuery));
+  }, [normalizedQuery, props.skills, tr]);
+  const pageSize = installedSkillsColumnCount(viewportWidth) * INSTALLED_SKILLS_ROWS_PER_PAGE;
+  const pageCount = Math.max(1, Math.ceil(filteredSkills.length / pageSize));
+  const visibleSkills = filteredSkills.slice(page * pageSize, page * pageSize + pageSize);
+  const filteredNames = useMemo(() => new Set(filteredSkills.map(skill => skill.name)), [filteredSkills]);
+  const selectedInResults = filteredSkills.filter(skill => selected.has(skill.name)).length;
+  const hiddenSelectedCount = Math.max(0, selected.size - selectedInResults);
+  const allResultsSelected = filteredSkills.length > 0 && selectedInResults === filteredSkills.length;
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  useEffect(() => setPage(0), [normalizedQuery, pageSize]);
+
+  useEffect(() => {
+    setPage(current => Math.min(Math.max(0, current), pageCount - 1));
+  }, [pageCount]);
+
+  useEffect(() => {
+    const installed = new Set(props.skills.map(skill => skill.name));
+    const removed = [...previousSkillNamesRef.current].some(name => !installed.has(name));
+    setSelected(current => {
+      const next = new Set([...current].filter(name => installed.has(name)));
+      return next.size === current.size ? current : next;
+    });
+    if (removed) {
+      setSelectionMode(false);
+      setSelected(new Set());
+    }
+    previousSkillNamesRef.current = installed;
+  }, [props.skills]);
+
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = selectedInResults > 0 && !allResultsSelected;
+    }
+  }, [allResultsSelected, selectedInResults]);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || !selectionModeRef.current) return;
+      const preservedQuery = queryRef.current;
+      escapeQueryRef.current = preservedQuery;
+      event.preventDefault();
+      event.stopPropagation();
+      setSelectionMode(false);
+      setSelected(new Set());
+      window.setTimeout(() => {
+        setQuery(current => current || preservedQuery);
+        escapeQueryRef.current = null;
+      }, 50);
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || escapeQueryRef.current === null) return;
+      const preservedQuery = escapeQueryRef.current;
+      escapeQueryRef.current = null;
+      event.preventDefault();
+      event.stopPropagation();
+      setQuery(preservedQuery);
+    };
+    document.addEventListener('keydown', onKeyDown, true);
+    document.addEventListener('keyup', onKeyUp, true);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown, true);
+      document.removeEventListener('keyup', onKeyUp, true);
+    };
+  }, []);
+
+  function toggleSelected(name: string): void {
+    setSelected(current => {
+      const next = new Set(current);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  }
+
+  function toggleAllResults(): void {
+    setSelected(current => {
+      const next = new Set(current);
+      if (allResultsSelected) {
+        for (const name of filteredNames) next.delete(name);
+      } else {
+        for (const name of filteredNames) next.add(name);
+      }
+      return next;
+    });
+  }
+
+  function cancelSelection(preserveQuery = false): void {
+    const preservedQuery = query;
+    setSelectionMode(false);
+    setSelected(new Set());
+    if (preserveQuery && typeof window !== 'undefined') {
+      window.setTimeout(() => setQuery(preservedQuery), 0);
+    }
+  }
+
+  return (
+    <section className="skills-installed-block">
+      <SectionHeader title={tr('skills.installed')} count={tr('skills.installedCount', { count: props.skills.length })} hint={tr('skills.installedHelp')}>
+        <div className="skills-installed-header-actions">
+          {selectionMode ? (
+            <button type="button" data-action="cancel-installed-selection" onClick={() => cancelSelection()}>{tr('skills.cancel')}</button>
+          ) : (
+            <button
+              type="button"
+              data-action="select-installed-skills"
+              disabled={props.skills.length === 0}
+              onClick={() => setSelectionMode(true)}
+            >{tr('skills.select')}</button>
+          )}
+        </div>
+      </SectionHeader>
+      <section className="bd-card skills-installed-panel">
+        <div className="skills-library-toolbar">
+          <label className="skills-installed-search">
+            <span className="sr-only">{tr('skills.searchLabel')}</span>
+            <input
+              type="text"
+              role="searchbox"
+              inputMode="search"
+              data-action="search-installed-skills"
+              placeholder={tr('skills.searchPlaceholder')}
+              value={query}
+              onChange={event => setQuery(event.currentTarget.value)}
+              onKeyDown={event => {
+                if (event.key !== 'Escape' || !selectionMode) return;
+                event.preventDefault();
+                event.stopPropagation();
+                cancelSelection(true);
+              }}
+            />
+            {query ? (
+              <button type="button" data-action="clear-installed-search" aria-label={tr('skills.clearSearch')} onClick={() => setQuery('')}>×</button>
+            ) : null}
+          </label>
+          {selectionMode ? (
+            <label className="skills-select-all-results">
+              <input
+                ref={selectAllRef}
+                type="checkbox"
+                checked={allResultsSelected}
+                disabled={filteredSkills.length === 0 || props.removingNames.size > 0}
+                onChange={toggleAllResults}
+              />
+              <span>{normalizedQuery
+                ? tr('skills.selectSearchResults', { count: filteredSkills.length })
+                : tr('skills.selectAllSkills', { count: filteredSkills.length })}</span>
+            </label>
+          ) : null}
+          {normalizedQuery ? <span className="skills-filter-count">{tr('skills.resultCount', { count: filteredSkills.length })}</span> : null}
+          {pageCount > 1 ? (
+            <div className="skills-pager">
+              <button
+                type="button"
+                className="skills-pager-button"
+                data-action="page-installed-skills"
+                data-dir="-1"
+                aria-label={tr('skills.prevPage')}
+                title={tr('skills.prevPage')}
+                disabled={page === 0}
+                onClick={() => setPage(current => Math.max(0, current - 1))}
+              >&lsaquo;</button>
+              <span>{tr('skills.pageStatus', { page: page + 1, pages: pageCount })}</span>
+              <button
+                type="button"
+                className="skills-pager-button"
+                data-action="page-installed-skills"
+                data-dir="1"
+                aria-label={tr('skills.nextPage')}
+                title={tr('skills.nextPage')}
+                disabled={page >= pageCount - 1}
+                onClick={() => setPage(current => Math.min(pageCount - 1, current + 1))}
+              >&rsaquo;</button>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="skills-installed-live" role="status" aria-live="polite">
+          {props.status ? <span className={statusClass(props.status)}>{props.status.text}</span> : null}
+        </div>
+
+        {props.skills.length === 0 ? (
+          <div className="skills-library-empty">
+            <strong>{tr('skills.emptyTitle')}</strong>
+            <p>{tr('skills.emptyHelp')}</p>
+          </div>
+        ) : filteredSkills.length === 0 ? (
+          <div className="skills-library-empty" data-empty="search">
+            <strong>{tr('skills.noResultsTitle', { query: query.trim() })}</strong>
+            <p>{tr('skills.noResultsHelp')}</p>
+            <button type="button" data-action="clear-installed-search-empty" onClick={() => setQuery('')}>{tr('skills.clearSearch')}</button>
+          </div>
+        ) : (
+          <div className="skills-list">
+            {visibleSkills.map(skill => {
+              const isSelected = selected.has(skill.name);
+              const isRemoving = props.removingNames.has(skill.name);
+              return (
+                <article
+                  className={`skills-row skills-installed-card${selectionMode ? ' is-selectable' : ''}${isSelected ? ' is-selected' : ''}${isRemoving ? ' is-removing' : ''}`}
+                  data-skill={skill.name}
+                  data-selection-mode={selectionMode ? 'true' : undefined}
+                  key={skill.name}
+                  aria-busy={isRemoving || undefined}
+                  onClick={selectionMode ? () => toggleSelected(skill.name) : undefined}
+                >
+                  <div className="skills-row-body">
+                    <div className="skills-row-title">
+                      {selectionMode ? (
+                        <input
+                          type="checkbox"
+                          aria-label={tr('skills.selectNamed', { skill: skill.displayName ?? skill.name })}
+                          checked={isSelected}
+                          disabled={isRemoving}
+                          onClick={event => event.stopPropagation()}
+                          onChange={() => toggleSelected(skill.name)}
+                        />
+                      ) : null}
+                      <span>
+                        <strong>{skill.displayName ?? skill.name}</strong>
+                        {skill.displayName && skill.displayName !== skill.name ? <small className="skills-canonical-name">{skill.name}</small> : null}
+                      </span>
+                    </div>
+                    {skill.description ? <p>{skill.description}</p> : null}
+                    <small className="skills-source-badge">{sourceLabel(skill, tr)}</small>
+                    {isRemoving ? <span className="skills-removing-label">{tr('skills.removing')}</span> : null}
+                  </div>
+                  {selectionMode ? null : (
+                    <div className="skills-card-actions">
+                      <button type="button" data-action="update-skill" disabled={props.busySkill === `${skill.name}:update` || isRemoving} onClick={() => props.onUpdate(skill.name)}>
+                        {tr('skills.update')}
+                      </button>
+                      <button type="button" data-action="remove-skill" disabled={isRemoving} onClick={() => props.onRequestRemove([skill.name])}>
+                        {tr('skills.remove')}
+                      </button>
+                    </div>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      {selectionMode ? (
+        <div className="skills-bulk-action-bar" role="toolbar" aria-label={tr('skills.bulkActions')}>
+          <span>
+            <strong>{tr('skills.selectedCount', { count: selected.size })}</strong>
+            {hiddenSelectedCount > 0 ? <small>{tr('skills.selectedHidden', { count: hiddenSelectedCount })}</small> : null}
+          </span>
+          <button
+            type="button"
+            className="danger"
+            data-action="remove-selected-skills"
+            disabled={selected.size === 0 || props.removingNames.size > 0}
+            onClick={() => props.onRequestRemove([...selected])}
+          >{tr('skills.removeSelected', { count: selected.size })}</button>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+export function RemoveSkillsDialog(props: {
+  names: string[] | null;
+  references: SkillRemovalReference[];
+  busy: boolean;
+  error: string | null;
+  onCancel(): void;
+  onConfirm(force: boolean): void;
+}): JSX.Element {
+  const tr = useT();
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const names = props.names ?? [];
+  const force = props.references.length > 0;
+  const visibleNames = names.slice(0, 3);
+  const referencedBotCount = new Set(props.references.flatMap(reference => reference.bots)).size;
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (props.names && !dialog.open) {
+      try { dialog.showModal(); } catch { /* dialog may already be opening */ }
+    } else if (!props.names && dialog.open) {
+      dialog.close();
+    }
+  }, [props.names]);
+
+  return (
+    <dialog
+      className="skills-remove-dialog"
+      data-remove-skills-dialog
+      ref={dialogRef}
+      onCancel={event => {
+        event.preventDefault();
+        if (!props.busy) props.onCancel();
+      }}
+      onClick={event => {
+        if (event.target === event.currentTarget && !props.busy) props.onCancel();
+      }}
+    >
+      <article>
+        <header>
+          <h3>{force
+            ? names.length === 1
+              ? tr('skills.removeInUseOneTitle', { skill: names[0] })
+              : tr('skills.removeInUseManyTitle', { count: names.length })
+            : names.length === 1
+              ? tr('skills.removeOneTitle', { skill: names[0] })
+              : tr('skills.removeManyTitle', { count: names.length })}</h3>
+          <p>{force
+            ? names.length === 1
+              ? tr('skills.removeInUseOneHelp', { count: referencedBotCount })
+              : tr('skills.removeInUseManyHelp', { count: referencedBotCount })
+            : names.length === 1
+              ? tr('skills.removeOnePermanentHelp')
+              : tr('skills.removePermanentHelp')}</p>
+        </header>
+        <div className="skills-remove-dialog-body">
+          {names.length > 1 ? (
+            <>
+              <ul>
+                {visibleNames.map(name => <li key={name}>{name}</li>)}
+              </ul>
+              {names.length > visibleNames.length ? <p>{tr('skills.removeMore', { count: names.length - visibleNames.length })}</p> : null}
+            </>
+          ) : null}
+          {props.references.length > 0 ? (
+            <div className="skills-remove-reference-warning" role="alert">
+              <strong>{tr('skills.removeReferencesDetail')}</strong>
+              <ul>
+                {props.references.map(reference => (
+                  <li key={reference.name}><strong>{reference.name}</strong><span>{reference.bots.join(', ')}</span></li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {props.error ? <p className="hint-warn" role="alert">{props.error}</p> : null}
+        </div>
+        <footer className="actions">
+          <button type="button" autoFocus disabled={props.busy} onClick={props.onCancel}>{tr('skills.cancel')}</button>
+          <button type="button" className="danger" disabled={props.busy} onClick={() => props.onConfirm(force)}>
+            {props.busy
+              ? tr('skills.removing')
+              : force
+                ? tr('skills.removeAnyway')
+                : names.length === 1
+                  ? tr('skills.removeOneConfirm')
+                  : tr('skills.removeSelected', { count: names.length })}
+          </button>
+        </footer>
+      </article>
+    </dialog>
+  );
+}
+
 function SkillsPage() {
   const tr = useT();
   const mountedRef = useRef(true);
@@ -337,7 +738,6 @@ function SkillsPage() {
   const [delivery, setDelivery] = useState<DeliveryMode>('auto');
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
 
   const [installSource, setInstallSource] = useState('');
   const [installPath, setInstallPath] = useState('');
@@ -353,16 +753,18 @@ function SkillsPage() {
   const [activeDiscoveryKey, setActiveDiscoveryKey] = useState<string | null>(null);
   const [selectedDiscovered, setSelectedDiscovered] = useState<Set<string>>(() => new Set());
 
-  const [installedSkillsPage, setInstalledSkillsPage] = useState(0);
   const [globalBusy, setGlobalBusy] = useState<'project' | 'delivery' | null>(null);
   const [skillBusy, setSkillBusy] = useState<string | null>(null);
   const [botBusy, setBotBusy] = useState<string | null>(null);
   const [botStatuses, setBotStatuses] = useState<Record<string, StatusMessage>>({});
+  const [installedStatus, setInstalledStatus] = useState<StatusMessage>(null);
+  const [pendingRemoval, setPendingRemoval] = useState<string[] | null>(null);
+  const [removalDialogOpen, setRemovalDialogOpen] = useState(false);
+  const [removalReferences, setRemovalReferences] = useState<SkillRemovalReference[]>([]);
+  const [removalError, setRemovalError] = useState<string | null>(null);
+  const [removingNames, setRemovingNames] = useState<Set<string>>(() => new Set());
 
   const installedNames = useMemo(() => new Set(skills.map(skill => skill.name)), [skills]);
-  const installedPageSize = installedSkillsColumnCount(viewportWidth) * INSTALLED_SKILLS_ROWS_PER_PAGE;
-  const installedPageCount = Math.max(1, Math.ceil(skills.length / installedPageSize));
-  const visibleSkills = skills.slice(installedSkillsPage * installedPageSize, installedSkillsPage * installedPageSize + installedPageSize);
   const activeDiscoveryGroup = useMemo(() => {
     if (nativeSkillGroups.length === 0) return undefined;
     const active = activeDiscoveryKey ? nativeSkillGroups.find(group => discoveryGroupKey(group) === activeDiscoveryKey) : undefined;
@@ -445,18 +847,19 @@ function SkillsPage() {
   useEffect(() => {
     mountedRef.current = true;
     void refresh();
-    const onResize = () => setViewportWidth(window.innerWidth);
-    window.addEventListener('resize', onResize);
     return () => {
       mountedRef.current = false;
       clearTimers();
-      window.removeEventListener('resize', onResize);
     };
   }, [clearTimers, refresh]);
 
   useEffect(() => {
-    setInstalledSkillsPage(page => Math.min(Math.max(0, page), installedPageCount - 1));
-  }, [installedPageCount]);
+    if (!installedStatus || removingNames.size > 0) return undefined;
+    const id = window.setTimeout(() => {
+      if (mountedRef.current) setInstalledStatus(null);
+    }, 6_000);
+    return () => window.clearTimeout(id);
+  }, [installedStatus, removingNames]);
 
   useEffect(() => {
     const dialog = discoveryDialogRef.current;
@@ -696,37 +1099,70 @@ function SkillsPage() {
     }
   }
 
-  async function removeSkill(name: string): Promise<void> {
-    if (!window.confirm(`${tr('skills.remove')} ${name}?`)) return;
-    setSkillBusy(`${name}:remove`);
+  function requestSkillRemoval(names: string[]): void {
+    const unique = [...new Set(names.filter(name => installedNames.has(name)))];
+    if (unique.length === 0) return;
+    setPendingRemoval(unique);
+    setRemovalDialogOpen(true);
+    setRemovalReferences([]);
+    setRemovalError(null);
+  }
+
+  function cancelSkillRemoval(): void {
+    if (removingNames.size > 0) return;
+    setRemovalDialogOpen(false);
+    setPendingRemoval(null);
+    setRemovalReferences([]);
+    setRemovalError(null);
+  }
+
+  async function confirmSkillRemoval(force: boolean): Promise<void> {
+    const names = pendingRemoval ?? [];
+    if (names.length === 0) return;
+    setRemovingNames(new Set(names));
+    setRemovalDialogOpen(false);
+    setRemovalError(null);
+    setInstalledStatus({ text: tr('skills.removingCount', { count: names.length }), ok: true });
     try {
-      await jsonRequest(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE', body: '{}' });
+      const body = await jsonRequest('/api/skills', {
+        method: 'DELETE',
+        body: JSON.stringify({ names, force }),
+      });
       if (!mountedRef.current) return;
-      await refresh();
+      const removed = Array.isArray(body.removed) ? body.removed.filter((name: unknown): name is string => typeof name === 'string') : names;
+      const removedNames = new Set(removed);
+      setSkills(current => current.filter(skill => !removedNames.has(skill.name)));
+      setInstalledStatus({
+        text: removed.length === 1
+          ? tr('skills.removedOne', { skill: removed[0] })
+          : tr('skills.removedMany', { count: removed.length }),
+        ok: true,
+      });
+      setPendingRemoval(null);
+      setRemovalReferences([]);
     } catch (err: any) {
       if (!mountedRef.current) return;
-      if (err?.status === 409 && err?.body?.error === 'skill_in_use') {
-        const affected = Array.isArray(err.body.affectedBots)
-          ? err.body.affectedBots.map((bot: any) => {
-            const label = bot?.botName || bot?.larkAppId;
-            return label ? `${label}` : '';
-          }).filter(Boolean)
-          : referencingBotLabels(name);
-        const refs = [affected.length ? `Bot: ${affected.join(', ')}` : ''].filter(Boolean).join('; ') || '-';
-        if (!window.confirm(tr('skills.removeInUse', { skill: name, refs }))) return;
-        try {
-          await jsonRequest(`/api/skills/${encodeURIComponent(name)}?force=1`, { method: 'DELETE', body: '{}' });
-          if (!mountedRef.current) return;
-          await refresh();
-          return;
-        } catch (forceErr: any) {
-          if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${forceErr?.message ?? forceErr}`);
-          return;
-        }
+      if (err?.status === 409 && err?.body?.error === 'skills_in_use') {
+        const references = Array.isArray(err.body.affectedSkills)
+          ? err.body.affectedSkills.map((item: any): SkillRemovalReference | null => {
+            const name = typeof item?.name === 'string' ? item.name : '';
+            const bots = Array.isArray(item?.affectedBots)
+              ? item.affectedBots.map((bot: any) => bot?.botName || bot?.larkAppId || '').filter(Boolean)
+              : referencingBotLabels(name);
+            return name ? { name, bots } : null;
+          }).filter((item: SkillRemovalReference | null): item is SkillRemovalReference => item !== null)
+          : [];
+        setRemovalReferences(references);
+        setRemovalDialogOpen(true);
+        setInstalledStatus(null);
+        return;
       }
-      window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
+      const message = tr('skills.removeFailed', { detail: mapInstallError(err?.message ?? String(err)) });
+      setRemovalError(message);
+      setRemovalDialogOpen(true);
+      setInstalledStatus({ text: message, ok: false });
     } finally {
-      if (mountedRef.current) setSkillBusy(null);
+      if (mountedRef.current) setRemovingNames(new Set());
     }
   }
 
@@ -867,60 +1303,23 @@ function SkillsPage() {
             </section>
           </div>
 
-          <section className="skills-installed-block">
-            <SectionHeader title={tr('skills.installed')} count={tr('skills.skillCount', { count: skills.length })} hint={tr('skills.installedHelp')}>
-              {installedPageCount > 1 ? (
-                <div className="skills-installed-toolbar">
-                  <div className="skills-pager">
-                    <button
-                      type="button"
-                      className="skills-pager-button"
-                      data-action="page-installed-skills"
-                      data-dir="-1"
-                      aria-label={tr('skills.prevPage')}
-                      title={tr('skills.prevPage')}
-                      disabled={installedSkillsPage === 0}
-                      onClick={() => setInstalledSkillsPage(page => Math.max(0, page - 1))}
-                    >&lsaquo;</button>
-                    <span>{tr('skills.pageStatus', { page: installedSkillsPage + 1, pages: installedPageCount })}</span>
-                    <button
-                      type="button"
-                      className="skills-pager-button"
-                      data-action="page-installed-skills"
-                      data-dir="1"
-                      aria-label={tr('skills.nextPage')}
-                      title={tr('skills.nextPage')}
-                      disabled={installedSkillsPage >= installedPageCount - 1}
-                      onClick={() => setInstalledSkillsPage(page => Math.min(installedPageCount - 1, page + 1))}
-                    >&rsaquo;</button>
-                  </div>
-                </div>
-              ) : null}
-            </SectionHeader>
-            <section className="bd-card skills-installed-panel">
-              {skills.length === 0 ? <p className="empty">{tr('skills.empty')}</p> : (
-                <div className="skills-list">
-                  {visibleSkills.map(skill => (
-                    <article className="skills-row skills-installed-card" data-skill={skill.name} key={skill.name}>
-                      <div className="skills-row-body">
-                        <strong>{skill.name}</strong>
-                        {skill.description ? <p>{skill.description}</p> : null}
-                        <small className="skills-source-badge">{sourceLabel(skill, tr)}</small>
-                      </div>
-                      <div className="skills-card-actions">
-                        <button type="button" data-action="update-skill" disabled={skillBusy === `${skill.name}:update`} onClick={() => void updateSkill(skill.name)}>
-                          {tr('skills.update')}
-                        </button>
-                        <button type="button" data-action="remove-skill" disabled={skillBusy === `${skill.name}:remove`} onClick={() => void removeSkill(skill.name)}>
-                          {tr('skills.remove')}
-                        </button>
-                      </div>
-                    </article>
-                  ))}
-                </div>
-              )}
-            </section>
-          </section>
+          <InstalledSkillsLibrary
+            skills={skills}
+            busySkill={skillBusy}
+            removingNames={removingNames}
+            status={installedStatus}
+            onUpdate={name => void updateSkill(name)}
+            onRequestRemove={requestSkillRemoval}
+          />
+
+          <RemoveSkillsDialog
+            names={removalDialogOpen ? pendingRemoval : null}
+            references={removalReferences}
+            busy={removingNames.size > 0}
+            error={removalError}
+            onCancel={cancelSkillRemoval}
+            onConfirm={force => void confirmSkillRemoval(force)}
+          />
 
           <dialog
             className="skills-discovery-dialog"

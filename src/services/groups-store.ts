@@ -122,20 +122,22 @@ export async function createChat(
  * is the case right after createChat since the creator bot is the implicit
  * owner.
  *
- * `newOwnerOpenId` must be in the calling bot's app scope — Lark open_ids are
- * app-scoped, see operator-selector.ts for why.
+ * Defaults to open_id for existing callers. Deferred federation completion can
+ * pass union_id after another deployment has added the user, avoiding any
+ * cross-app open_id handoff.
  */
 export async function transferChatOwner(
   ownerLarkAppId: string,
   chatId: string,
-  newOwnerOpenId: string,
+  newOwnerId: string,
+  userIdType: 'open_id' | 'union_id' = 'open_id',
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const client = getBotClient(ownerLarkAppId);
   try {
     const res: any = await (client as any).im.v1.chat.update({
       path: { chat_id: chatId },
-      params: { user_id_type: 'open_id' },
-      data: { owner_id: newOwnerOpenId },
+      params: { user_id_type: userIdType },
+      data: { owner_id: newOwnerId },
     });
     if (res.code !== 0 && res.code !== undefined) {
       return { ok: false, error: `${res.msg ?? 'unknown'} (code: ${res.code})` };
@@ -147,7 +149,8 @@ export async function transferChatOwner(
 }
 
 /**
- * Fetch the current owner of a chat (as an open_id). Used by group-creator to
+ * Fetch the current owner of a chat (open_id by default, optionally union_id).
+ * Used by group-creator to
  * verify the post-transfer state when transferChatOwner returns an error —
  * Lark sometimes ACKs a transfer slowly (e.g. 504 Gateway Timeout) even though
  * the server-side write succeeded, so a follow-up read disambiguates "really
@@ -157,12 +160,14 @@ export async function transferChatOwner(
  * callers treat undefined as "unknown" and keep the original error.
  */
 export async function getChatOwner(
-  larkAppId: string, chatId: string,
+  larkAppId: string,
+  chatId: string,
+  userIdType: 'open_id' | 'union_id' = 'open_id',
 ): Promise<string | undefined> {
   const client = getBotClient(larkAppId);
   try {
     const res: any = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {
-      user_id_type: 'open_id',
+      user_id_type: userIdType,
     });
     if (res.code !== 0 && res.code !== undefined) return undefined;
     const owner = res.data?.owner_id;

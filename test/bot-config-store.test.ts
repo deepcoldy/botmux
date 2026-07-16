@@ -81,6 +81,7 @@ describe('bot-config store', () => {
     expect(keys).not.toContain('repoPickerMode');
     expect(keys).toContain('skills');
     expect(keys).toContain('silentTurnReactions');
+    expect(keys).toContain('codexAppCleanInput');
   });
 
   it('parseBooleanValue accepts on/off variants and rejects junk', async () => {
@@ -197,6 +198,20 @@ describe('bot-config store', () => {
     expect(invalid.silentTurnReactions).toBeUndefined();
   });
 
+  it('parses codexAppCleanInput strictly and defaults it off', async () => {
+    const { registry } = await freshModules();
+    const [on, off, invalid, missing] = registry.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'clean-on', larkAppSecret: 's', cliId: 'codex-app', codexAppCleanInput: true },
+      { larkAppId: 'clean-off', larkAppSecret: 's', cliId: 'codex-app', codexAppCleanInput: false },
+      { larkAppId: 'clean-invalid', larkAppSecret: 's', cliId: 'codex-app', codexAppCleanInput: 'true' },
+      { larkAppId: 'clean-missing', larkAppSecret: 's', cliId: 'codex-app' },
+    ]));
+    expect(on.codexAppCleanInput).toBe(true);
+    expect(off.codexAppCleanInput).toBeUndefined();
+    expect(invalid.codexAppCleanInput).toBeUndefined();
+    expect(missing.codexAppCleanInput).toBeUndefined();
+  });
+
   it('parses substituteMode, retaining a disabled config\'s targets', async () => {
     const { registry } = await freshModules();
     const [enabled, disabled, empty, emailOnly] = registry.parseBotConfigsFromText(JSON.stringify([
@@ -275,16 +290,16 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.skills).toBeUndefined();
   });
 
-  it('sets/sanitizes/unsets per-bot env (JSON) and masks values in the apply result', async () => {
+  it('sets/round-trips legal per-bot env (JSON) and masks values in the apply result', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('env')!;
     expect(spec.kind).toBe('json');
     expect(spec.effect).toBe('next-session');
 
-    // sanitize: drop reserved key, keep provider creds, stringify primitives
+    // Legal provider/proxy keys only — stringify primitives, persist + mask.
     const coerced = store.coerceConfigValue(
       spec,
-      '{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ANTHROPIC_AUTH_TOKEN":"glm-key","BOTMUX_SESSION_ID":"hijack","TIMEOUT":30}',
+      '{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","ANTHROPIC_AUTH_TOKEN":"glm-key","TIMEOUT":30}',
     );
     expect(coerced).toEqual({
       ok: true,
@@ -316,16 +331,41 @@ describe('bot-config store', () => {
       expect(r1.newText).toContain('ANTHROPIC_AUTH_TOKEN=••••');
     }
 
-    // a fully-invalid object (only reserved/garbage keys) is rejected
-    expect(store.coerceConfigValue(spec, '{"BOTMUX_X":"y","1BAD":"z"}')).toEqual({ ok: false, reason: 'invalid_json' });
     // non-object JSON rejected
     expect(store.coerceConfigValue(spec, '"a-string"')).toEqual({ ok: false, reason: 'invalid_json' });
     expect(store.coerceConfigValue(spec, '[1,2]')).toEqual({ ok: false, reason: 'invalid_json' });
+    // garbage-only object (no reserved keys, nothing valid after sanitize)
+    expect(store.coerceConfigValue(spec, '{"1BAD":"z"}')).toEqual({ ok: false, reason: 'invalid_json' });
 
     const r2 = await store.applyConfigField('app_default', spec, null);
     expect(r2.ok).toBe(true);
     expect(readConfig().env).toBeUndefined();
     expect(registry.getBot('app_default').config.env).toBeUndefined();
+  });
+
+  it('rejects reserved env keys (BOTMUX_*/GROK_HOME/CODEX_HOME) instead of silent drop', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('env')!;
+
+    // Any reserved key fails the whole write so users see the error (no
+    // split-brain from quietly accepting GROK_HOME while daemon paths stay default).
+    expect(store.coerceConfigValue(
+      spec,
+      '{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic","BOTMUX_SESSION_ID":"hijack"}',
+    )).toEqual({ ok: false, reason: 'reserved_env' });
+
+    expect(store.coerceConfigValue(
+      spec,
+      '{"GROK_HOME":"/tmp/evil-grok","ANTHROPIC_AUTH_TOKEN":"x"}',
+    )).toEqual({ ok: false, reason: 'reserved_env' });
+
+    expect(store.coerceConfigValue(
+      spec,
+      '{"CODEX_HOME":"/tmp/evil-codex"}',
+    )).toEqual({ ok: false, reason: 'reserved_env' });
+
+    // Reserved-only object also fails as reserved_env (not invalid_json).
+    expect(store.coerceConfigValue(spec, '{"BOTMUX_X":"y"}')).toEqual({ ok: false, reason: 'reserved_env' });
   });
 
   it('boolean field writes true / deletes key on false (keeps bots.json tidy)', async () => {
@@ -339,6 +379,22 @@ describe('bot-config store', () => {
     await store.applyConfigField('app_default', spec, false);
     expect(readConfig().disableStreamingCard).toBeUndefined();
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
+  });
+
+  it('codexAppCleanInput is immediate, default-off, and deletes its key when disabled', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex-app' });
+    const spec = store.findConfigField('codexAppCleanInput')!;
+    expect(spec.effect).toBe('immediate');
+    expect(registry.getBot('app_default').config.codexAppCleanInput).toBeUndefined();
+
+    const enabled = await store.applyConfigField('app_default', spec, true);
+    expect(enabled).toMatchObject({ ok: true, oldText: 'off', newText: 'on', effect: 'immediate' });
+    expect(readConfig().codexAppCleanInput).toBe(true);
+    expect(registry.getBot('app_default').config.codexAppCleanInput).toBe(true);
+
+    await store.applyConfigField('app_default', spec, false);
+    expect(readConfig().codexAppCleanInput).toBeUndefined();
+    expect(registry.getBot('app_default').config.codexAppCleanInput).toBeUndefined();
   });
 
   it('silentTurnReactions writes true / deletes key on false (keeps bots.json tidy)', async () => {

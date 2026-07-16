@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { Buffer } from 'node:buffer';
 import { extractMiraHistoryFinalText, sanitizeMiraFinalText } from './mira-output.js';
+import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 
 type JsonObject = Record<string, any>;
 
@@ -29,8 +30,7 @@ const DEFAULT_DATA_SOURCES = ['manus'];
 const LAST_ROUND_RETRY_DELAYS_MS = [0, 250, 750];
 const COOKIE_DB_PATH = process.env.MIRA_COOKIE_DB
   ?? join(homedir(), 'Library', 'Application Support', 'mira', 'Cookies');
-const OSC_PREFIX = '\x1b]777;botmux:';
-const OSC_END = '\x07';
+const output = new RunnerControlWriter();
 
 function parseArgs(argv: string[]): Args {
   const out: Args = { sessionId: '' };
@@ -48,20 +48,16 @@ function parseArgs(argv: string[]): Args {
   return out;
 }
 
-function b64Json(value: unknown): string {
-  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64');
-}
-
 function emitMarker(kind: string, payload: unknown): void {
-  process.stdout.write(`${OSC_PREFIX}${kind}:${b64Json(payload)}${OSC_END}`);
+  output.marker(kind, payload);
 }
 
 function writeLine(text = ''): void {
-  process.stdout.write(text + '\n');
+  output.line(text);
 }
 
 function prompt(): void {
-  process.stdout.write('› ');
+  output.display('› ');
 }
 
 function errorMessage(err: unknown): string {
@@ -414,7 +410,7 @@ let args: Args;
 try {
   args = parseArgs(process.argv.slice(2));
 } catch (err) {
-  console.error(errorMessage(err));
+  output.error(`${errorMessage(err)}\n`);
   process.exit(2);
 }
 
@@ -437,7 +433,7 @@ async function runTurn(content: string): Promise<void> {
     writeLine();
     writeLine(result.finalText);
     emitMarker('final', {
-      turnId: result.turnId,
+      nativeTurnId: result.turnId,
       content: result.finalText,
       startedAtMs,
       completedAtMs,
@@ -460,7 +456,6 @@ async function drainQueue(): Promise<void> {
         const message = `Mira runner error: ${errorMessage(err)}`;
         writeLine(message);
         emitMarker('final', {
-          turnId: `mira-error-${now}`,
           content: message,
           startedAtMs: now,
           completedAtMs: now,
@@ -524,6 +519,6 @@ process.on('SIGTERM', () => {
 });
 
 main().catch(err => {
-  console.error(`Mira runner failed: ${errorMessage(err)}`);
+  output.error(`Mira runner failed: ${errorMessage(err)}\n`);
   process.exit(1);
 });

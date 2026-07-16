@@ -1,6 +1,6 @@
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import {
-  readFileSync, existsSync, mkdirSync, chmodSync,
+  readFileSync, existsSync, mkdirSync, chmodSync, linkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { dirname } from 'node:path';
@@ -104,9 +104,48 @@ export function loadOrCreateDashboardSecret(secretPath: string): string {
   if (existing) return existing;
   const secret = randomBytes(32).toString('base64url');
   mkdirSync(dirname(secretPath), { recursive: true });
-  atomicWriteFileSync(secretPath, secret, { mode: 0o600 });
-  chmodSync(secretPath, 0o600);
-  return secret;
+  // Daemon fleets and the dashboard start concurrently on a fresh install.
+  // A rename-based "atomic write" is individually atomic but not
+  // create-if-absent: two winners can each return a different key while only
+  // the last rename remains on disk. Publish a fully-written temp inode with
+  // link(2) instead. The link is atomic and fails with EEXIST for every loser;
+  // losers then read the single winner's complete value.
+  const temp = `${secretPath}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+  try {
+    writeFileSync(temp, secret, { mode: 0o600, flag: 'wx' });
+    try {
+      linkSync(temp, secretPath);
+      chmodSync(secretPath, 0o600);
+      return secret;
+    } catch (err) {
+      const raced = loadDashboardSecret(secretPath);
+      if (raced) return raced;
+      // Existing-but-empty/corrupt file: publish one permanent repair seed via
+      // link(2). Every concurrent initializer either wins that O_EXCL election
+      // or reads the same fully-written seed, then atomically restores the main
+      // path with the identical value. Keeping the 0600 seed makes crash recovery
+      // replayable and avoids stale PID locks (and their delete/recreate races).
+      const repairSeedPath = `${secretPath}.repair-seed`;
+      let repairSecret: string;
+      try {
+        linkSync(temp, repairSeedPath);
+        chmodSync(repairSeedPath, 0o600);
+        repairSecret = secret;
+      } catch (seedErr) {
+        if ((seedErr as NodeJS.ErrnoException).code !== 'EEXIST') throw seedErr;
+        const published = loadDashboardSecret(repairSeedPath);
+        if (!published) {
+          throw new Error(`dashboard secret repair seed is unreadable: ${repairSeedPath}`);
+        }
+        repairSecret = published;
+      }
+      atomicWriteFileSync(secretPath, repairSecret, { mode: 0o600 });
+      chmodSync(secretPath, 0o600);
+      return repairSecret;
+    }
+  } finally {
+    try { unlinkSync(temp); } catch { /* already absent */ }
+  }
 }
 
 /**
@@ -164,15 +203,10 @@ export function buildSetCookie(token: string): string {
  *
  * Public surfaces today (codex review v0.1.2 → canary.3):
  *   - `GET/HEAD /`, `/assets/*`, root icons    — static SPA shell
- *   - `GET /api/workflows/*`                   — workflow read-only API,
- *                                                EXCEPT `…/terminal-log/raw`
- *                                                which serves full PTY byte
- *                                                streams (may include keys,
- *                                                env, tokens) and requires
- *                                                cookie auth.
+ *   - `GET /api/workflows/*`                   — zero-I/O legacy retirement
+ *                                                tombstone (HTTP 410).
  *
- * Anything else (sessions, schedules, dashboard rotate, POST /api/workflows
- * /…/cancel, etc.) requires the active session token, matching the
+ * Anything else (sessions, schedules, dashboard rotate, etc.) requires the active session token, matching the
  * "get_write_link" pattern that the chat web terminal already uses.
  */
 export type AuthDecision =
@@ -186,9 +220,11 @@ export type AuthDecision =
  *  even in public mode — so a newly-added GET endpoint is private by default
  *  and can't silently leak (connector configs, webhook-secret metadata,
  *  trigger logs, role/persona files, per-bot config, onboarding, raw PTY are
- *  all absent on purpose). Workflow reads + the static SPA shell are public in
- *  ALL modes and handled separately in decideDashboardAuth.
- *  口径：公开 = 会话板 / 排程(脱敏) / 设置(只读) / 群名册 / 事件流 / workflow 进度。 */
+ *  all absent on purpose). The static SPA shell and the zero-I/O legacy
+ *  workflow tombstone are handled separately in decideDashboardAuth. Full v3
+ *  workflow projections stay private because goals, node ids, and run ids can
+ *  contain project or personal information.
+ *  口径：公开 = 会话板 / 排程(脱敏) / 设置(只读) / 群名册 / 事件流。 */
 const PUBLIC_READ_PATHS: ReadonlySet<string> = new Set([
   '/api/sessions',    // session board
   '/api/schedules',   // schedules page — task prompt redacted for anon upstream
@@ -212,26 +248,17 @@ export function decideDashboardAuth(opts: {
 }): AuthDecision {
   const { method, pathname, hasTokenParam, presentedToken, activeToken, publicReadOnly } = opts;
 
-  // `…/terminal-log/raw` streams full PTY bytes (`?stream=pty`) or worker
-  // diagnostic log (`?stream=diag`). PTY transcript can leak API keys / env
-  // vars / token reads that happened to scroll the terminal, so both stream
-  // variants stay behind cookie auth in EVERY mode (workflow reads excluded).
+  // Historical `…/terminal-log/raw` routes are gone, but keep the generic raw
+  // suffix excluded from public-read policy so future APIs cannot expose a PTY
+  // transcript by accidentally inheriting this carve-out.
   const isRawTerminalLog = pathname.endsWith('/terminal-log/raw');
 
-  // Workflow read-only paths + static SPA shell are public in EVERY mode — the
-  // dashboard must be linkable from Lark cards without forcing a
-  // `botmux dashboard` round-trip.  Write actions still need a cookie / token.
+  // The legacy workflow prefix is now a public zero-I/O 410 tombstone. Keeping
+  // it public lets stale cards/clients receive an actionable retirement result.
   const isWorkflowReadOnly =
     method === 'GET' &&
-    pathname.startsWith('/api/workflows/') &&
+    (pathname === '/api/workflows' || pathname.startsWith('/api/workflows/')) &&
     !isRawTerminalLog;
-  // v3 read-only API is link-shareable like the v0.2 one, EXCEPT the per-node
-  // raw PTY stream (`…/pty-log`) which — same rationale as terminal-log/raw —
-  // can leak secrets that scrolled the terminal, so it stays behind cookie auth.
-  const isV3ReadOnly =
-    method === 'GET' &&
-    pathname.startsWith('/api/v3/') &&
-    !pathname.endsWith('/pty-log');
   const isStaticShell =
     (method === 'GET' || method === 'HEAD') &&
     (
@@ -253,7 +280,7 @@ export function decideDashboardAuth(opts: {
 
   const authed = !!presentedToken && presentedToken === activeToken;
 
-  if (!authed && !isWorkflowReadOnly && !isV3ReadOnly && !isStaticShell && !isPublicRead) {
+  if (!authed && !isWorkflowReadOnly && !isStaticShell && !isPublicRead) {
     return { kind: 'deny401' };
   }
 

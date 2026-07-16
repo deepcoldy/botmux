@@ -147,6 +147,49 @@ describe('BridgeTurnQueue', () => {
     expect(ready[0].assistantUuids).toEqual(['a1']);
   });
 
+  it('releases an empty turn only when the caller supplies a reliable terminal boundary', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('delivery-key', undefined, 100, undefined, 3);
+    q.ingest([user('u-empty')]);
+
+    expect(q.drainEmittable()).toEqual([]);
+    expect(q.drainEmittable({ terminalBoundary: true })).toMatchObject([
+      { turnId: 'delivery-key', dispatchAttempt: 3, assistantUuids: [] },
+    ]);
+  });
+
+  it('does not let a stale submit-failure attempt delete a retry with the same turnId', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('delivery-key', makeFingerprint('durable prompt'), 100, 'durable prompt', 1);
+    q.mark('delivery-key', makeFingerprint('durable prompt'), 200, 'durable prompt', 2);
+
+    expect(q.dropPendingTurn('delivery-key', 1)).toEqual(
+      expect.objectContaining({ turnId: 'delivery-key', dispatchAttempt: 1 }),
+    );
+    expect(q.peek()).toEqual([
+      expect.objectContaining({ turnId: 'delivery-key', dispatchAttempt: 2 }),
+    ]);
+
+    // A second callback from attempt 1 is stale. It must not fall back to
+    // turnId-only matching and retire the live retry mark.
+    expect(q.dropPendingTurn('delivery-key', 1)).toBeNull();
+    expect(q.peek()).toEqual([
+      expect.objectContaining({ turnId: 'delivery-key', dispatchAttempt: 2 }),
+    ]);
+
+    q.ingest([
+      user('u-retry', 'durable prompt'),
+      assistant('a-retry', 'retry answer'),
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({
+        turnId: 'delivery-key',
+        dispatchAttempt: 2,
+        assistantUuids: ['a-retry'],
+      }),
+    ]);
+  });
+
   it('tool-result user events do not break collection for the current turn', () => {
     const q = new BridgeTurnQueue();
     q.mark('t1');

@@ -29,6 +29,42 @@ async function json(res: Response): Promise<any> {
   return res.json();
 }
 
+async function seedLegacyWorkflowConnector(): Promise<any> {
+  const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+  const { upsertConnector } = await import('../src/services/connector-store.js');
+  const secret = createWebhookSecret('legacy-workflow-secret');
+  return upsertConnector({
+    id: 'conn_legacy_workflow',
+    name: 'Legacy report',
+    enabled: true,
+    verify: {
+      type: 'token',
+      secretRef: secret.ref,
+      signatureHeader: 'x-botmux-signature',
+      timestampHeader: 'x-botmux-timestamp',
+      nonceHeader: 'x-botmux-nonce',
+      toleranceSeconds: 300,
+    },
+    target: {
+      mode: 'fixed',
+      kind: 'workflow',
+      botId: 'app1',
+      chatId: 'oc_legacy',
+      workflowId: 'weekly-report',
+    },
+    promptEnvelope: {
+      sourceName: 'legacy-report',
+      headerAllowlist: [],
+      includeRawText: false,
+      maxBodyBytes: 1024,
+    },
+    loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+    lifecycleExtractors: null,
+    createdAt: '2026-07-01T00:00:00.000Z',
+    updatedAt: '2026-07-01T00:00:00.000Z',
+  });
+}
+
 beforeEach(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'botmux-connector-api-'));
   prevDataDir = process.env.SESSION_DATA_DIR;
@@ -45,6 +81,95 @@ afterEach(async () => {
 });
 
 describe('connector-api write routes', () => {
+  it('rejects new workflow connectors without retaining a connector or generated secret', async () => {
+    const res = await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Retired workflow target',
+        target: {
+          mode: 'fixed',
+          kind: 'workflow',
+          botId: 'app1',
+          chatId: 'oc_1',
+          workflowId: 'weekly-report',
+        },
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await json(res)).toMatchObject({
+      ok: false,
+      error: 'legacy_workflow_connector_creation_disabled',
+    });
+    expect((await json(await fetch(`${baseUrl}/api/connectors`))).connectors).toEqual([]);
+    expect((await json(await fetch(`${baseUrl}/api/webhook-secrets`))).secrets).toEqual([]);
+  });
+
+  it('does not allow an existing turn connector to become a workflow connector', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Turn target',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+      }),
+    }));
+
+    const update = await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: { kind: 'workflow', workflowId: 'weekly-report' } }),
+    });
+    expect(update.status).toBe(400);
+    expect(await json(update)).toMatchObject({
+      ok: false,
+      error: 'legacy_workflow_connector_creation_disabled',
+    });
+    const stored = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`));
+    expect(stored.connector.target.kind).toBe('turn');
+  });
+
+  it('allows non-target maintenance on legacy workflow connectors but keeps their target immutable', async () => {
+    const legacy = await seedLegacyWorkflowConnector();
+    const maintained = await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(legacy.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Legacy report (maintained)',
+        rotateSecret: true,
+        promptEnvelope: { sourceName: 'legacy-report', instruction: 'Keep this alive during migration.' },
+      }),
+    });
+    expect(maintained.status).toBe(200);
+    expect(await json(maintained)).toMatchObject({
+      ok: true,
+      connector: {
+        name: 'Legacy report (maintained)',
+        target: legacy.target,
+      },
+    });
+
+    const targetChange = await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(legacy.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: { mode: 'fixed', chatId: 'oc_other' } }),
+    });
+    expect(targetChange.status).toBe(400);
+    expect(await json(targetChange)).toMatchObject({
+      ok: false,
+      error: 'legacy_workflow_connector_target_immutable',
+    });
+
+    const toggled = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(legacy.id)}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: false }),
+    }));
+    expect(toggled.connector.enabled).toBe(false);
+    expect(toggled.connector.target).toEqual(legacy.target);
+  });
+
   it('creates a connector with a generated one-time secret, then lists it without plaintext', async () => {
     const res = await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',
@@ -184,8 +309,8 @@ describe('connector-api write routes', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        name: 'Workflow room',
-        target: { mode: 'fixed', kind: 'workflow', botId: 'app1', chatId: 'oc_old', workflowId: 'wf_old' },
+        name: 'Fixed turn',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_old' },
         lifecycleExtractors: { dedupKey: '$.alert.id' },
       }),
     }));

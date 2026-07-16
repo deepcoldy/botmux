@@ -6,9 +6,9 @@ import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js'
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { t, type Locale } from '../../i18n/index.js';
-import { localTerminalCapable } from '../../core/local-terminal-opener.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
+import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -199,6 +199,9 @@ const cliDisplayNames: Record<CliId, string> = {
   'copilot': 'Copilot',
   'oh-my-pi': 'Oh My Pi',
   'kimi': 'Kimi',
+  'grok': 'Grok Build',
+  'kiro-cli': 'Kiro',
+  'riff': 'Riff',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
@@ -251,39 +254,27 @@ export function terminalMultiUrl(url: string): Record<string, string> {
     : directMultiUrl(url);
 }
 
-function localCliLabel(cliName: string): string {
-  return cliName.replace(/\s+(App|CLI)$/i, '');
-}
-
-/** 💻「打开 <CLI>」本机直开按钮暂时隐藏——打磨好前先不放出来。两个原因：
- *  1) 实际只有 mac 桌面能用：生产 daemon 跑在 headless Linux 上没有 GUI，
- *     localTerminalCapable() 恒 false，按钮根本不出现；只有在 mac 上跑 daemon 才看得到。
- *  2) 点了会在本机 Terminal 里 `resume` 同一个 CLI 会话，把会话从 botmux worker/PTY
- *     抢到本地，飞书这侧的对话就此断开、不再跟随——破坏了飞书对话的连续性。
+/** 💻「打开 <CLI>」默认隐藏，通过 dashboard.enableLocalCliOpen 显式开启：
+ *  1) 当前 iTerm-first opener 只支持 macOS；生产 daemon 常跑在 headless Linux，
+ *     即使误开开关也不能生成一个必然失败的按钮。
+ *  2) `attach` 模式只在当前 backend 有精确 attach 目标时显示，尽量保持同一路 I/O/历史；
+ *     `resume` 模式才要求 CLI direct resume readiness，且可能破坏飞书连续性。
  *
- *  优化方向（做到这些、不破坏飞书对话连续性后再放出来）：
- *  - 本机直开走 tmux attach（附到 botmux 会话所在的那个 tmux/pane），而不是另起一个
- *    `resume` 进程另开一份会话；
- *  - 本机终端 ↔ 飞书双向同步：本地敲的输入、CLI 的输出，飞书侧要能同步跟随，两边共用
- *    同一路 I/O，谁在哪敲都不断线。
- *
- *  重新启用：删掉下面这行 HIDE_OPEN_LOCAL_CLI_BUTTON 判断即可（按钮实现 + card-handler
- *  的 open_local_terminal 处理都还在，未删）。
- *  （标 boolean 而非字面量 true，免得 TS 把后面的 localTerminalCapable() 判成 unreachable。） */
-const HIDE_OPEN_LOCAL_CLI_BUTTON: boolean = true;
-
-/** Zero or one local-CLI open button — only on hosts that can actually pop a
- *  native terminal (macOS, or Linux with a GUI session); headless servers get
- *  no button instead of one that always toasts "unsupported". */
-function openLocalTerminalButtons(actionBase: Record<string, string>, cliName: string, locale?: Locale): any[] {
-  if (HIDE_OPEN_LOCAL_CLI_BUTTON) return [];
-  if (!localTerminalCapable()) return [];
-  return [{
+ *  localCliReady 必须由调用方按当前配置模式计算；handler 也会重复校验，防止已发出的
+ *  旧卡片绕过开关或模式切换。 */
+function localCliButton(cliId: CliId, actionBase: Record<string, string>, locale: Locale | undefined, localCliReady: boolean): any | undefined {
+  if (!isLocalCliOpenEnabled() || !localCliReady) return undefined;
+  const labelKey = cliId === 'codex'
+    ? 'card.btn.open_local_codex'
+    : cliId === 'traex'
+      ? 'card.btn.open_local_trae'
+      : 'card.btn.open_local_cli';
+  return {
     tag: 'button',
-    text: { tag: 'plain_text', content: t('card.btn.open_local_cli', { cliName: localCliLabel(cliName) }, locale) },
+    text: { tag: 'plain_text', content: t(labelKey, { cliName: getCliDisplayName(cliId) }, locale) },
     type: 'default',
-    value: { action: 'open_local_terminal', ...actionBase },
-  }];
+    value: { action: 'open_local_cli', ...actionBase },
+  };
 }
 
 /**
@@ -300,9 +291,11 @@ export function buildSessionCard(
   showManageButtons?: boolean,
   adoptMode?: boolean,
   locale?: Locale,
+  localCliReady = false,
 ): string {
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
-  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
+  const effectiveCliId = cliId ?? 'claude-code';
+  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId };
   const actions: any[] = [
     {
       tag: 'button',
@@ -310,9 +303,10 @@ export function buildSessionCard(
       type: 'primary',
       multi_url: terminalMultiUrl(terminalUrl),
     },
-    ...openLocalTerminalButtons(actionBase, cliName, locale),
   ];
   if (!showManageButtons) {
+    const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady) : undefined;
+    if (localBtn) actions.push(localBtn);
     actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
@@ -713,6 +707,7 @@ export function buildStreamingCard(
   locale?: Locale,
   usageLimit?: CliUsageLimitState,
   writableTerminalUrl?: string,
+  localCliReady = false,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = getCliDisplayName(effectiveCliId);
@@ -755,7 +750,8 @@ export function buildStreamingCard(
     type: 'primary',
     multi_url: terminalMultiUrl(terminalUrl),
   });
-  headerActions.push(...openLocalTerminalButtons(actionBase, cliName, locale));
+  const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady) : undefined;
+  if (localBtn) headerActions.push(localBtn);
   if (status === 'limited' && usageLimit?.retryReady) {
     headerActions.push({
       tag: 'button',
@@ -808,7 +804,9 @@ export function buildStreamingCard(
 
   // ── Quick-action keys (only when the screenshot is visible — in text mode
   //    there's no visible cursor/input, so these keys would fire blindly) ──
-  if (displayMode === 'screenshot') {
+  // riff：远端任务后端没有可驱动的终端，PTY 快捷键只会变成内容为控制字符的
+  // follow-up 任务（worker 侧也有同款拒绝守卫），整排隐藏。
+  if (displayMode === 'screenshot' && cliId !== 'riff') {
     const mkKey = (label: string, key: string) => ({
       tag: 'button',
       text: { tag: 'plain_text', content: label },
@@ -920,7 +918,6 @@ export function buildPrivateSnapshotCard(
         type: 'primary',
         multi_url: terminalMultiUrl(terminalUrl),
       },
-      ...openLocalTerminalButtons(actionBase, cliName, locale),
       {
         tag: 'button',
         text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },

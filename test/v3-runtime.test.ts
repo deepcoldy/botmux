@@ -9,7 +9,16 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  readFileSync,
+  mkdirSync,
+  statSync,
+  symlinkSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -25,10 +34,15 @@ import {
   writePendingWait,
   readWait,
   resolveWait,
+  resolveWaitOnce,
   listPendingWaits,
+  waitPath,
+  waitsDir,
 } from '../src/workflows/v3/human-gate.js';
 import {
   GOAL_ENV,
+  V3_SUPPORTED_CLIS,
+  isV3SupportedCli,
   type BotSnapshot,
   type GoalInputs,
   type Manifest,
@@ -202,8 +216,116 @@ describe('runWorkflow — research→summarize 最小闭环', () => {
   });
 });
 
-describe('runWorkflow — capability downgrade reaches the worker snapshot (P2 安全红线看门测试)', () => {
-  it('restricted override → runNode 收到的 req.botSnapshot.disableCliBypass === true', async () => {
+describe('runWorkflow — Saved Workflow parameter isolation', () => {
+  it('delivers only explicitly referenced values to each node', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-param-isolation-'));
+    try {
+      const dag = validateDag({
+        runId: 'param-isolation',
+        nodes: [
+          {
+            id: 'authorized',
+            type: 'goal',
+            goal: 'Fetch ${params.customer} for ${context.chatId}',
+            depends: [],
+            inputs: [],
+          },
+          {
+            id: 'unrelated',
+            type: 'goal',
+            goal: 'Produce an unrelated summary',
+            depends: [],
+            inputs: [],
+          },
+        ],
+      });
+      const seen: Record<string, GoalInputs> = {};
+      const runNode: RunNode = async (req) => {
+        seen[req.node.id] = JSON.parse(readFileSync(req.inputsPath, 'utf-8')) as GoalInputs;
+        const file = product(req.outputDir, 'out.md', `# ${req.node.id}`);
+        return {
+          status: 'ok',
+          manifestPath: writeManifest(req, {
+            schemaVersion: 1, status: 'ok', summary: 'done', files: [file],
+          }),
+        };
+      };
+
+      const outcome = await runWorkflow(
+        dag,
+        { runNode, validateManifest, resolveBotSnapshot },
+        {
+          baseDir: base,
+          resolvedWorkflowData: {
+            params: { customer: 'customer-private-value', unused: 'must-not-leak' },
+            context: { chatId: 'oc_private', initiatorOpenId: 'ou_private' },
+          },
+        },
+      );
+
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+      const authorizedInput = seen.authorized!.inputs.find((item) => item.from === 'workflow');
+      expect(authorizedInput).toBeTruthy();
+      expect(JSON.parse(readFileSync(authorizedInput!.path, 'utf-8'))).toEqual({
+        params: { customer: 'customer-private-value' },
+        context: { chatId: 'oc_private' },
+      });
+      expect(seen.unrelated!.inputs.some((item) => item.from === 'workflow')).toBe(false);
+      const unrelatedAttempt = join(base, dag.runId, 'unrelated#001', 'attempts', '001');
+      expect(() => readFileSync(join(unrelatedAttempt, 'workflow-inputs.json'), 'utf-8')).toThrow();
+      expect(readFileSync(join(unrelatedAttempt, 'goal.txt'), 'utf-8')).not.toContain('customer-private-value');
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('runWorkflow — model override reaches the worker snapshot', () => {
+  it('envelope-backed run uses frozen snapshots and never rewrites authorized artifacts', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-pinned-'));
+    try {
+      const dag = validateDag({
+        runId: 'pinned-001',
+        nodes: [{ id: 'work', type: 'goal', goal: 'work', depends: [], inputs: [] }],
+      });
+      const runDir = join(base, dag.runId);
+      mkdirSync(runDir, { recursive: true });
+      const dagBytes = '{"authorized":"dag bytes"}\n';
+      const botBytes = '{"authorized":"bot bytes"}\n';
+      writeFileSync(join(runDir, 'dag.json'), dagBytes);
+      writeFileSync(join(runDir, 'bots.snapshot.json'), botBytes);
+
+      const runNode: RunNode = async (req) => {
+        expect(req.botSnapshot.workingDir).toBe('/frozen');
+        const file = product(req.outputDir, 'out.md', 'done');
+        return {
+          status: 'ok',
+          manifestPath: writeManifest(req, {
+            schemaVersion: 1, status: 'ok', summary: 'done', files: [file],
+          }),
+        };
+      };
+      const deps: V3RuntimeDeps = {
+        runNode,
+        validateManifest,
+        resolveBotSnapshot: () => { throw new Error('must not resolve live bot'); },
+      };
+      const outcome = await runWorkflow(dag, deps, {
+        baseDir: base,
+        authorizedArtifacts: true,
+        frozenBotSnapshots: new Map([['', {
+          larkAppId: 'cli_test', cliId: 'claude-code', workingDir: '/frozen',
+        }]]),
+      });
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+      expect(readFileSync(join(runDir, 'dag.json'), 'utf-8')).toBe(dagBytes);
+      expect(readFileSync(join(runDir, 'bots.snapshot.json'), 'utf-8')).toBe(botBytes);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('node model override is applied without changing the workflow-wide bypass posture', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-rt-cap-'));
     try {
       const seen: Record<string, BotSnapshot> = {};
@@ -215,27 +337,22 @@ describe('runWorkflow — capability downgrade reaches the worker snapshot (P2 �
         });
         return { status: 'ok', manifestPath };
       };
-      // resolveBotSnapshot returns a FULL-power snapshot (no disableCliBypass):
-      // the node override must be what forces the restriction onto the worker.
-      const fullPowerResolve = (): BotSnapshot => ({ larkAppId: 'cli_test', cliId: 'claude-code', workingDir: '/tmp' });
+      const fullPowerResolve = (): BotSnapshot => ({
+        larkAppId: 'cli_test', cliId: 'claude-code', workingDir: '/tmp', model: 'base-model',
+      });
       const dag = validateDag({
         runId: 'cap-001',
         nodes: [
-          { id: 'open', type: 'goal', goal: 'full power', depends: [], inputs: [] },
-          { id: 'restricted', type: 'goal', goal: 'locked down', depends: [], inputs: [], override: { permissionMode: 'restricted' } },
+          { id: 'base', type: 'goal', goal: 'base model', depends: [], inputs: [] },
+          { id: 'redirected', type: 'goal', goal: 'different model', depends: [], inputs: [], override: { model: 'node-model' } },
         ],
       });
       const deps: V3RuntimeDeps = { runNode, validateManifest, resolveBotSnapshot: fullPowerResolve };
       const outcome = await runWorkflow(dag, deps, { baseDir: base });
       expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
 
-      // The restricted node's worker MUST receive disableCliBypass. A regression
-      // that wires the un-merged snapshot (botSnap instead of effSnap) at the
-      // runNode call site would run the restricted node at FULL permission while
-      // every mergeNodeCapability unit test still passes — this is its watchdog.
-      expect(seen['restricted']?.disableCliBypass).toBe(true);
-      // Sibling without override keeps the resolved (full) capability.
-      expect(seen['open']?.disableCliBypass).toBeUndefined();
+      expect(seen['redirected']?.model).toBe('node-model');
+      expect(seen['base']?.model).toBe('base-model');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -653,6 +770,65 @@ describe('human-gate 文件等待存储', () => {
     }
   });
 
+  it('resolveWaitOnce 跨进程 CAS 以第一个决议为准', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-gate-cas-'));
+    try {
+      writePendingWait(dir, { waitId: 'deploy#001-gate', nodeId: 'deploy', prompt: 'ship?' });
+      expect(resolveWaitOnce(dir, 'deploy#001-gate', 'rejected', 'ou_first')).toMatchObject({
+        changed: true,
+        wait: { status: 'rejected', by: 'ou_first' },
+      });
+      expect(resolveWaitOnce(dir, 'deploy#001-gate', 'approved', 'ou_second')).toMatchObject({
+        changed: false,
+        wait: { status: 'rejected', by: 'ou_first' },
+      });
+      expect(readWait(dir, 'deploy#001-gate')).toMatchObject({ status: 'rejected', by: 'ou_first' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('host wait 以 0600/0700 持久化，且拒绝 final/parent symlink', () => {
+    const root = mkdtempSync(join(tmpdir(), 'v3-gate-private-'));
+    const runDir = join(root, 'run');
+    const outside = join(root, 'outside');
+    mkdirSync(runDir, { mode: 0o700 });
+    mkdirSync(outside, { mode: 0o700 });
+    try {
+      const approval = {
+        attemptId: 'send#001/attempts/001',
+        approvalDigest: `sha256:${'a'.repeat(64)}`,
+        inputHash: `sha256:${'b'.repeat(64)}`,
+      };
+      writePendingWait(runDir, {
+        waitId: 'send#001-host-001-gate',
+        nodeId: 'send',
+        instanceId: 'send#001',
+        prompt: 'approve exact input',
+        hostApproval: approval,
+      });
+      expect(statSync(waitPath(runDir, 'send#001-host-001-gate')).mode & 0o077).toBe(0);
+      expect(statSync(waitsDir(runDir)).mode & 0o077).toBe(0);
+
+      const externalFile = join(outside, 'victim.json');
+      writeFileSync(externalFile, 'unchanged', { mode: 0o600 });
+      symlinkSync(externalFile, waitPath(runDir, 'evil'));
+      expect(() => writePendingWait(runDir, {
+        waitId: 'evil', nodeId: 'send', prompt: 'x', hostApproval: approval,
+      })).toThrow(/regular file/);
+      expect(readFileSync(externalFile, 'utf-8')).toBe('unchanged');
+
+      rmSync(waitsDir(runDir), { recursive: true, force: true });
+      symlinkSync(outside, waitsDir(runDir));
+      expect(() => writePendingWait(runDir, {
+        waitId: 'escape', nodeId: 'send', prompt: 'x', hostApproval: approval,
+      })).toThrow(/real directory/);
+      expect(existsSync(join(outside, 'escape.json'))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('createFileGate：决策前已 pending，决策后落盘 resolved 并返回结果', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'v3-gate-f-'));
     try {
@@ -674,7 +850,13 @@ describe('human-gate 文件等待存储', () => {
 });
 
 describe('runtime CLI 白名单守卫', () => {
-  it('节点 bot 解析到非 claude-code/codex 的 CLI → run 启动即报错', async () => {
+  it('白名单包含五个已验证 /goal 的 CLI', () => {
+    expect(V3_SUPPORTED_CLIS).toEqual(['claude-code', 'codex', 'seed', 'traex', 'relay']);
+    for (const cliId of V3_SUPPORTED_CLIS) expect(isV3SupportedCli(cliId)).toBe(true);
+    expect(isV3SupportedCli('gemini')).toBe(false);
+  });
+
+  it('节点 bot 解析到未验证 /goal 的 CLI → run 启动即报错', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-cli-guard-'));
     try {
       const deps: V3RuntimeDeps = {
@@ -689,7 +871,7 @@ describe('runtime CLI 白名单守卫', () => {
     }
   });
 
-  it('codex CLI 放行', async () => {
+  it.each(V3_SUPPORTED_CLIS)('%s CLI 放行', async (cliId) => {
     const base = mkdtempSync(join(tmpdir(), 'v3-cli-ok-'));
     try {
       const runNode: RunNode = async (req) => {
@@ -699,9 +881,9 @@ describe('runtime CLI 白名单守卫', () => {
       };
       const deps: V3RuntimeDeps = {
         runNode, validateManifest,
-        resolveBotSnapshot: () => ({ larkAppId: 'a', cliId: 'codex', workingDir: '/tmp' }),
+        resolveBotSnapshot: () => ({ larkAppId: 'a', cliId, workingDir: '/tmp' }),
       };
-      const dag = validateDag({ runId: 'codex-run', nodes: [{ id: 'n', type: 'goal', goal: 'g', depends: [], inputs: [] }] });
+      const dag = validateDag({ runId: `cli-${cliId}`, nodes: [{ id: 'n', type: 'goal', goal: 'g', depends: [], inputs: [] }] });
       const outcome = await runWorkflow(dag, deps, { baseDir: base });
       expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
     } finally {
@@ -930,8 +1112,14 @@ describe('runWorkflow — 跨节点 revisit A→B→C', () => {
     try {
       const runId = 'g';
       const jp = join(base, runId, 'journal.ndjson');
-      // 造一个"卡在 REVISIT_BUDGET_EXHAUSTED"的 run:C#002 想回溯 A 但预算耗尽。
+      // First event creates the historical run directory; legacy mutation
+      // authorization then verifies the canonical DAG identity below.
       appendEvent(jp, { type: 'runStarted', runId });
+      writeFileSync(join(base, runId, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [{ id: 'C', type: 'goal', goal: 'c', depends: [], inputs: [] }],
+      }));
+      // 造一个"卡在 REVISIT_BUDGET_EXHAUSTED"的 run:C#002 想回溯 A 但预算耗尽。
       appendEvent(jp, { type: 'nodeDispatched', nodeId: 'C', instanceId: 'C#002', attemptId: 'C#002/attempts/001' });
       appendEvent(jp, { type: 'nodeRevisitRequested', nodeId: 'C', instanceId: 'C#001', attemptId: 'C#001/attempts/001', toNodeId: 'A' });
       appendEvent(jp, {
@@ -971,6 +1159,10 @@ describe('runWorkflow — 跨节点 revisit A→B→C', () => {
       const runId = 'g';
       const jp = join(base, runId, 'journal.ndjson');
       appendEvent(jp, { type: 'runStarted', runId });
+      writeFileSync(join(base, runId, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [{ id: 'C', type: 'goal', goal: 'c', depends: [], inputs: [] }],
+      }));
       appendEvent(jp, { type: 'nodeDispatched', nodeId: 'C', instanceId: 'C#002', attemptId: 'C#002/attempts/001' });
       appendEvent(jp, { type: 'nodeRevisitRequested', nodeId: 'C', instanceId: 'C#001', attemptId: 'C#001/attempts/001', toNodeId: 'A' });
       appendEvent(jp, {

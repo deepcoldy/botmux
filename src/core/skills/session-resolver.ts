@@ -7,6 +7,7 @@ export function resolveSessionSkillManifest(opts: {
   cliId: CliId;
   workingDir: string;
   botPolicy: BotSkillPolicy | undefined;
+  pluginSkills?: SkillPackage[];
   globalProjectSkills?: 'off' | 'trusted' | 'all';
   globalDelivery?: 'auto' | 'prompt' | 'native';
   registrySkills: SkillPackage[];
@@ -16,6 +17,7 @@ export function resolveSessionSkillManifest(opts: {
   const resolved = resolveSkillPolicy({
     registrySkills: opts.registrySkills,
     projectSkills: opts.projectSkills,
+    pluginSkills: opts.pluginSkills,
     globalProjectSkills: opts.globalProjectSkills,
     globalDelivery: opts.globalDelivery,
     botPolicy: opts.botPolicy,

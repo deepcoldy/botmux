@@ -243,6 +243,18 @@ export async function createRepoWorktree(
   return { path: wtPath, branch, baseRef };
 }
 
+/**
+ * Push a freshly created worktree branch to origin (`push -u`). Used by the
+ * riff flow: the remote sandbox clones from origin, so a local-only worktree
+ * branch is invisible to it — pushing the branch pointer (no new objects,
+ * seconds) lets the riff task pin the new branch. Throws on failure; callers
+ * degrade to the default-branch fallback with a warning.
+ */
+export async function pushWorktreeBranch(worktreePath: string, branch: string): Promise<void> {
+  await git(['push', '-u', 'origin', branch], resolve(worktreePath), 60_000);
+  logger.info(`[git-worktree] pushed branch ${branch} to origin (${worktreePath})`);
+}
+
 /** Remove a worktree created by {@link createRepoWorktree}. Used to roll back the
  *  worktrees already built when a later repo in a multi-repo batch fails — leaves
  *  the branch in place (it may be a pre-existing branch we only checked out, and a

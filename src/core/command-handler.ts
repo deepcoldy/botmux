@@ -6,20 +6,21 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import { repoPickerScanOptions } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
-import { createRepoWorktree } from '../services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
+import { resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
 import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
-import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
@@ -32,11 +33,12 @@ import { discoverAdoptableSessions, validateAdoptTarget, adoptTargetKey, adoptTa
 import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
-import { resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
-import { UserTokenMissingError } from '../im/lark/client.js';
+import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
+import { parseDocWatchCommand } from './doc-watch-command.js';
+import { latestDocCommentPollCursor } from './doc-comment-poller.js';
 import {
-  putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession,
-  type CommentTriggerMode,
+  putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription,
+  type CommentTriggerMode, type DocSubscription,
 } from '../services/doc-subs-store.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import {
@@ -69,6 +71,9 @@ import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
+import { fetchDaemonIpc } from './daemon-ipc-auth.js';
+import { updateSessionTitle } from './session-title.js';
+import { requestAgentSessionRename } from './session-rename.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -88,7 +93,19 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment']);
+
+/**
+ * Daemon commands that operate on an ALREADY-EXISTING session and must never
+ * pre-create one. `/rename` renames the current session — with no session there
+ * is nothing to rename, so the daemon routes must skip their generic
+ * "createSession + activeSessions.set(worker:null)" pre-create block and let
+ * handleCommand's `!ds` branch reply no_active_session. Without this, `/rename`
+ * in a brand-new topic (or a thread with no session) would spawn a phantom
+ * worker:null session just to rename it, polluting the dashboard. (Same class
+ * of fix as the `/card` / `/term` special cases in daemon.ts.)
+ */
+export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename']);
 
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
@@ -334,6 +351,8 @@ export interface CommandHandlerDeps {
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
+  /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
+  prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
 }
 
 // ─── Schedule command ────────────────────────────────────────────────────────
@@ -585,6 +604,83 @@ async function handleRoleCommand(
   await sessionReply(rootId, t('role.help', undefined, loc));
 }
 
+/**
+ * Resolve the workingDir for a newly created scheduled task, mirroring the
+ * layered lookup used by the normal new-session spawn path (see
+ * `resolvePinnedWorkingDir` in daemon.ts) but STRICTLY read-only: it never
+ * triggers the defaultOncall auto-bind side effect (which writes to bots.json).
+ * Creating a schedule must not mutate oncall binding state.
+ *
+ * Priority:
+ *   1) existing session workingDir (ds.workingDir — already pinned via /cd or
+ *      a previously-applied oncall bind)
+ *   2) this bot/chat oncall binding (read-only findOncallChat, no auto-bind)
+ *   3) this bot's effective default working dir (defaultWorkingDir, or
+ *      defaultOncall.workingDir when Oncall 模式 is on)
+ *   4) legacy bot.config.workingDir
+ *   5) '~'
+ *
+ * Deliberate deltas vs `resolvePinnedWorkingDir` (do NOT "sync" them away):
+ *   - no sibling-inherit layer (findInheritablePeer) — a schedule needs a
+ *     deterministic dir at create time, not whatever peer session happens to
+ *     be open at that moment;
+ *   - extra layers 4/5 — a schedule has no interactive repo-select card to
+ *     fall back on, so it must always resolve to something;
+ *   - every layer validates the candidate dir and falls through when it is
+ *     stale (deleted/renamed): a dead path would otherwise be baked into
+ *     schedules.json (workingDir is not editable afterwards) and every fire
+ *     would silently spawn in $HOME. This includes layer 1 — a ds restored
+ *     by restoreActiveSessions (worker:null) or idle-suspended keeps a
+ *     workingDir no live process is running in, so it can be stale too.
+ */
+function resolveScheduleWorkingDir(
+  ds: DaemonSession | undefined,
+  chatId: string,
+  larkAppId: string | undefined,
+): string {
+  // Validate candidates and fall through (returning the RAW form — keep `~`;
+  // expansion happens at fire time via getSessionWorkingDir), matching the
+  // other copies of this ladder (daemon resolveBotDefaultWorkingDir,
+  // trigger-session).
+  const usable = (dir: string, layer: string): boolean => {
+    const v = validateWorkingDir(dir);
+    if (v.ok) return true;
+    logger.warn(`[schedule] ${layer} workingDir "${dir}" invalid — falling through: ${v.error}`);
+    return false;
+  };
+
+  // Layer 1: existing session dir already pinned.
+  if (ds?.workingDir && usable(ds.workingDir, 'session')) return ds.workingDir;
+
+  const appId = ds?.larkAppId ?? larkAppId;
+  // getBot() throws for unregistered ids — degrade to the '~' fallback
+  // instead of aborting the whole /schedule command.
+  let bot: ReturnType<typeof getBot> | undefined;
+  try {
+    bot = appId ? getBot(appId) : getAllBots()[0];
+  } catch {
+    bot = undefined;
+  }
+  if (!bot) return '~';
+
+  // Layer 2: oncall binding for this chat (read-only — does NOT auto-bind).
+  const oncallEntry = findOncallChat(bot.config.larkAppId, ds?.chatId ?? chatId);
+  if (oncallEntry?.workingDir && usable(oncallEntry.workingDir, 'oncall-binding')) {
+    return oncallEntry.workingDir;
+  }
+
+  // Layer 3: effective default working dir (defaultWorkingDir or
+  // defaultOncall.workingDir). Read-only — never writes state.
+  const effectiveDefault = effectiveDefaultWorkingDir(bot.config);
+  if (effectiveDefault && usable(effectiveDefault, 'effective-default')) return effectiveDefault;
+
+  // Layer 4: legacy workingDir field.
+  if (bot.config.workingDir && usable(bot.config.workingDir, 'legacy')) return bot.config.workingDir;
+
+  // Layer 5: home fallback.
+  return '~';
+}
+
 async function handleScheduleCommand(
   args: string,
   rootId: string,
@@ -674,7 +770,7 @@ async function handleScheduleCommand(
   const parsed = scheduler.parseNaturalSchedule(trimmed);
   if (parsed) {
     const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
-    const workingDir = ds?.workingDir ?? (ds?.larkAppId ? getBot(ds.larkAppId).config.workingDir ?? '~' : getAllBots()[0]?.config.workingDir ?? '~');
+    const workingDir = resolveScheduleWorkingDir(ds, chatId, larkAppId);
     const taskScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
     // "新话题" keyword → every fire opens a brand-new topic in a fresh session.
     const { deliver, prompt: schedPrompt } = scheduler.extractDeliveryMode(parsed.prompt);
@@ -1261,6 +1357,9 @@ export async function handleCommand(
         killWorker(ds);
         ds.workingDir = targetPath;
         ds.session.workingDir = targetPath;
+        // cwd 变了，riff 多仓 stamp（选择卡多选时写入）随之失效——保留会让下次
+        // refork 仍按旧仓库组合推导、无视新目录。
+        ds.session.riffRepoDirs = undefined;
         sessionStore.updateSession(ds.session);
         if (validation.created) {
           await sessionReply(rootId, t('cmd.cd.created_switched', { path: resolvedPath }, loc));
@@ -1268,6 +1367,37 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.cd.switched', { path: resolvedPath }, loc));
         }
         logger.info(`[${logTag}] Working directory changed to ${resolvedPath} by /cd command${validation.created ? ' (auto-created)' : ''}`);
+        break;
+      }
+
+      case '/rename': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        const rawTitle = message.content.replace(/^\/rename\s*/i, '').trim();
+        if (!rawTitle) {
+          await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
+          break;
+        }
+        const updated = updateSessionTitle(ds.session, rawTitle);
+        if (!updated.ok) {
+          await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
+          break;
+        }
+        const agentSync = requestAgentSessionRename(ds, updated.title);
+        const cliName = getCliDisplayName(agentSync.cliId ?? ds.session.cliId ?? 'claude-code');
+        if (agentSync.status === 'requested') {
+          await sessionReply(rootId, t('cmd.rename.updated_requested', { title: updated.title, cliName }, loc));
+        } else if (agentSync.status === 'not_running') {
+          await sessionReply(rootId, t('cmd.rename.updated_not_running', { title: updated.title }, loc));
+        } else if (agentSync.status === 'unsupported') {
+          await sessionReply(rootId, t('cmd.rename.updated_unsupported', { title: updated.title, cliName }, loc));
+        } else {
+          await sessionReply(rootId, t('cmd.rename.updated_failed', { title: updated.title, cliName }, loc));
+          logger.warn(`[${logTag}] Native session rename request failed for ${cliName}: ${agentSync.error}`);
+        }
+        logger.info(`[${logTag}] Session renamed by /rename: ${updated.title} (agentSync=${agentSync.status})`);
         break;
       }
 
@@ -1299,13 +1429,13 @@ export async function handleCommand(
             // dropped: wrap them now (full prompt-building context lives here)
             // and stash for delivery right after the raw input on prompt_ready.
             if (hasBufferedInput) {
-              const { buildNewTopicPrompt, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
+              const { buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
               ensureSessionWhiteboard(ds!);
-              const followUpPrompt = buildNewTopicPrompt(
+              const followUpInput = buildNewTopicCliInput(
                 pendingPrompt,
                 ds!.session.sessionId,
-                botCfg.cliId,
-                botCfg.cliPathOverride,
+                ds!.session.cliId ?? botCfg.cliId,
+                ds!.session.cliPathOverride ?? botCfg.cliPathOverride,
                 ds!.pendingAttachments,
                 ds!.pendingMentions,
                 await getAvailableBots(ds!.larkAppId, ds!.chatId),
@@ -1313,23 +1443,39 @@ export async function handleCommand(
                 { name: selfBot.botName, openId: selfBot.botOpenId },
                 loc,
                 ds!.pendingSender,
-                { larkAppId, chatId: ds!.chatId, whiteboardId: ds!.session.whiteboardId },
+                {
+                  larkAppId,
+                  chatId: ds!.chatId,
+                  whiteboardId: ds!.session.whiteboardId,
+                  substituteTrigger: ds!.pendingSubstituteTrigger,
+                  codexAppText: ds!.pendingCodexAppText,
+                  codexAppApplicationContext: ds!.pendingCodexAppApplicationContext,
+                  codexAppMessageContext: ds!.pendingCodexAppMessageContext,
+                  codexAppFollowUps: ds!.pendingCodexAppFollowUps,
+                  codexAppFollowUpContexts: ds!.pendingCodexAppFollowUpContexts,
+                },
               );
               ds!.pendingFollowUpInput = {
-                userPrompt: pendingPrompt || (ds!.pendingFollowUps?.join('\n\n') ?? ''),
-                cliInput: followUpPrompt,
+                userPrompt: ds!.pendingCodexAppText !== undefined || ds!.pendingCodexAppFollowUps
+                  ? [ds!.pendingCodexAppText ?? '', ...(ds!.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
+                  : pendingPrompt || ds!.pendingFollowUps?.join('\n\n') || '',
+                cliInput: followUpInput.content,
+                ...((ds!.session.cliId ?? botCfg.cliId) === 'codex-app' && botCfg.codexAppCleanInput === true && followUpInput.codexAppInput
+                  ? { codexAppInput: followUpInput.codexAppInput }
+                  : {}),
+                codexAppInputGateFrozen: true,
               };
             }
             rememberLastCliInput(ds!, pendingRawInput, pendingRawInput);
             forkWorker(ds!, '', false);
           } else if (hasBufferedInput) {
-            const { buildNewTopicPrompt, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
+            const { buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
             ensureSessionWhiteboard(ds!);
-            const prompt = buildNewTopicPrompt(
+            const prompt = buildNewTopicCliInput(
               pendingPrompt,
               ds!.session.sessionId,
-              botCfg.cliId,
-              botCfg.cliPathOverride,
+              ds!.session.cliId ?? botCfg.cliId,
+              ds!.session.cliPathOverride ?? botCfg.cliPathOverride,
               ds!.pendingAttachments,
               ds!.pendingMentions,
               await getAvailableBots(ds!.larkAppId, ds!.chatId),
@@ -1337,7 +1483,17 @@ export async function handleCommand(
               { name: selfBot.botName, openId: selfBot.botOpenId },
               loc,
               ds!.pendingSender,
-              { larkAppId, chatId: ds!.chatId, whiteboardId: ds!.session.whiteboardId },
+              {
+                larkAppId,
+                chatId: ds!.chatId,
+                whiteboardId: ds!.session.whiteboardId,
+                substituteTrigger: ds!.pendingSubstituteTrigger,
+                codexAppText: ds!.pendingCodexAppText,
+                codexAppApplicationContext: ds!.pendingCodexAppApplicationContext,
+                codexAppMessageContext: ds!.pendingCodexAppMessageContext,
+                codexAppFollowUps: ds!.pendingCodexAppFollowUps,
+                codexAppFollowUpContexts: ds!.pendingCodexAppFollowUpContexts,
+              },
             );
             // Last-line defence: prompt prep awaited above — if anything
             // replaced OR closed the session in that window (`/close` deletes
@@ -1356,10 +1512,16 @@ export async function handleCommand(
             forkWorker(ds!, '', false);
           }
           ds!.pendingPrompt = undefined;
+          ds!.pendingCodexAppText = undefined;
+          ds!.pendingCodexAppApplicationContext = undefined;
+          ds!.pendingCodexAppMessageContext = undefined;
           ds!.pendingAttachments = undefined;
           ds!.pendingMentions = undefined;
+          ds!.pendingSubstituteTrigger = undefined;
           ds!.pendingSender = undefined;
           ds!.pendingFollowUps = undefined;
+          ds!.pendingCodexAppFollowUps = undefined;
+          ds!.pendingCodexAppFollowUpContexts = undefined;
           await sessionReply(rootId, replyText);
         };
 
@@ -1372,6 +1534,8 @@ export async function handleCommand(
             // First spawn: pin the new cwd onto the CURRENT session, then fork.
             ds!.workingDir = selectedPath;
             ds!.session.workingDir = selectedPath;
+            // A single repo selection supersedes any stale multi-Riff stamp.
+            ds!.session.riffRepoDirs = undefined;
             sessionStore.updateSession(ds!.session);
             await forkPendingCli(t('cmd.repo.selected_in_pending', { name: displayName }, loc));
           } else {
@@ -1494,6 +1658,22 @@ export async function handleCommand(
               logger.info(`[${logTag}] Worktree ${creation.path} created but session changed mid-flight — not switching`);
               await sessionReply(rootId, t('cmd.repo.worktree_created_not_switched', { path: creation.path, branch: creation.branch }, loc));
               break;
+            }
+            const botCfg = getBot(ds.larkAppId).config;
+            const effectiveBackend = resolvePairedSpawnBackendType(
+              wasPending ? (ds.session.cliId ?? botCfg.cliId) : botCfg.cliId,
+              wasPending ? ds.session.backendType : undefined,
+              botCfg.backendType,
+              config.daemon.backendType,
+            );
+            if (effectiveBackend === 'riff') {
+              try {
+                await pushWorktreeBranch(creation.path, creation.branch);
+              } catch (e) {
+                const errMsg = e instanceof Error ? e.message : String(e);
+                logger.warn(`[${logTag}] riff worktree branch push failed (${creation.branch}): ${errMsg}`);
+                await sessionReply(rootId, t('card.repo.riff_worktree_push_failed', { branch: creation.branch, error: errMsg }, loc));
+              }
             }
             await sessionReply(rootId, t('cmd.repo.worktree_created', {
               path: creation.path, branch: creation.branch, base: creation.baseRef,
@@ -1747,6 +1927,9 @@ export async function handleCommand(
       }
 
       case '/subscribe-lark-doc': {
+        // 保留 origin/master 的既有语义：显式获取文档 scope 的 User Token，调用
+        // 飞书逐文件 subscribe API，再把文档绑定到当前会话。新增的评论监听、自动
+        // 会话和审批能力走独立的 /watch-comment，不改变这个远端已有命令。
         if (!ds || !larkAppId) { await sessionReply(rootId, t('cmd.subdoc.no_session', undefined, loc)); break; }
         const arg = message.content.replace(/^\/subscribe-lark-doc\s*/i, '').trim();
         const anchor = sessionAnchorId(ds);
@@ -1755,7 +1938,8 @@ export async function handleCommand(
           t(m === 'all' ? 'cmd.subdoc.mode_all' : 'cmd.subdoc.mode_mention', undefined, loc);
 
         if (arg === 'list' || arg === '列表') {
-          const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor);
+          const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor)
+            .filter(s => s.managedBy !== 'watch-comment');
           if (!subs.length) { await sessionReply(rootId, t('cmd.subdoc.none', undefined, loc)); break; }
           const lines = subs.map(s => `• ${s.docTitle || s.fileToken}（${modeLabel(s.commentTriggerMode)}）`);
           await sessionReply(rootId, [t('cmd.subdoc.list_title', undefined, loc), ...lines].join('\n'));
@@ -1763,7 +1947,8 @@ export async function handleCommand(
         }
 
         if (arg === 'off' || arg === 'stop' || arg === '退订') {
-          const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor);
+          const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor)
+            .filter(s => s.managedBy !== 'watch-comment');
           for (const s of subs) {
             await unsubscribeDocFile(larkAppId, { fileToken: s.fileToken, fileType: s.fileType });
             removeDocSubscription(dataDir, larkAppId, s.fileToken);
@@ -1774,9 +1959,7 @@ export async function handleCommand(
 
         if (!arg) { await sessionReply(rootId, t('cmd.subdoc.usage', undefined, loc)); break; }
 
-        // 评论事件官方推荐用户身份订阅，tenant 订阅大概率收不到推送 → 需要带文档 scope
-        // 的 User Token。文档 scope 不在通用 /login 里（避免污染所有 bot 的登录），
-        // 这里按需生成带 DOC_COMMENT_OAUTH_SCOPES 的专用授权链接。
+        // 旧流程：文档 scope 不污染通用 /login；缺少时由本命令发专用 OAuth 链接。
         const subCfg = getBot(larkAppId).config;
         const replyDocLogin = async () => {
           const { authUrl } = generateAuthUrl(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand), DOC_COMMENT_OAUTH_SCOPES);
@@ -1805,6 +1988,7 @@ export async function handleCommand(
             scope: ds.scope,
             chatId: ds.chatId,
             commentTriggerMode: mode,
+            managedBy: 'subscribe-lark-doc',
             ownerOpenId: message.senderId,
             createdAt: Date.now(),
           });
@@ -1817,12 +2001,173 @@ export async function handleCommand(
           ));
           logger.info(`[${logTag}] /subscribe-lark-doc → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${rebound ? ' (rebound)' : ''}`);
         } catch (err) {
-          // token 缺失 / 失效 / 缺文档 scope（403）→ 给带文档 scope 的重新授权链接。
-          if (err instanceof UserTokenMissingError) {
+          // 1069603 重新 OAuth 无法修复；保留实际返回该业务码的身份，避免把
+          // tenant-only 失败误归因到当前用户。只有 token 缺失 / 失效才重新授权。
+          if (err instanceof DocSubscriptionPermissionError) {
+            const identity = err.source === 'user'
+              ? t('cmd.subdoc.permission_identity_user', undefined, loc)
+              : err.source === 'tenant'
+                ? t('cmd.subdoc.permission_identity_tenant', undefined, loc)
+                : err.source === 'both'
+                  ? t('cmd.subdoc.permission_identity_both', undefined, loc)
+                  : t('cmd.subdoc.permission_identity_unknown', undefined, loc);
+            await sessionReply(rootId, t('cmd.subdoc.manage_required', {
+              code: err.larkCode,
+              identity,
+            }, loc));
+          } else if (err instanceof UserTokenMissingError) {
             await replyDocLogin();
           } else {
             await sessionReply(rootId, t('cmd.subdoc.failed', { err: err instanceof Error ? err.message : String(err) }, loc));
           }
+        }
+        break;
+      }
+
+      case '/watch-comment': {
+        if (!larkAppId) { await sessionReply(rootId, t('cmd.watch.no_session', undefined, loc)); break; }
+        const request = parseDocWatchCommand(message.content);
+        const dataDir = config.session.dataDir;
+        const modeLabel = (m: CommentTriggerMode) =>
+          t(m === 'all' ? 'cmd.subdoc.mode_all' : 'cmd.subdoc.mode_mention', undefined, loc);
+
+        if (request.kind === 'usage' || request.kind === 'invalid') {
+          const prefix = request.kind === 'invalid' && request.reason === 'conflicting_modes'
+            ? `${t('cmd.watch.conflicting_modes', undefined, loc)}\n\n`
+            : '';
+          await sessionReply(rootId, prefix + t('cmd.watch.usage', undefined, loc));
+          break;
+        }
+
+        // 设计：只有 bot owner 能管理文档评论监听（watch / list / off）。非 owner 无法
+        // 主动发起监听，只能在文档里 @bot 触发回复——那条路径会私信通知 owner 审计
+        // （notify-not-approve，见 event-dispatcher.processCommentEvent），不经这里。
+        const ownerOpenId = getOwnerOpenId(larkAppId);
+        if (!ownerOpenId || message.senderId !== ownerOpenId) {
+          await sessionReply(rootId, t('cmd.watch.owner_only', undefined, loc));
+          break;
+        }
+
+        if (request.kind === 'list') {
+          // 命令已收归 owner-only，无 session 时直接列全部（不再按 ownerOpenId 过滤），
+          // 否则非 owner @bot 触发的 auto-sub 对 owner 不可见。
+          const subs = (ds
+            ? listDocSubscriptionsForSession(dataDir, larkAppId, sessionAnchorId(ds))
+            : listAllDocSubscriptions(dataDir, larkAppId))
+            .filter(s => s.managedBy === 'watch-comment');
+          if (!subs.length) { await sessionReply(rootId, t(ds ? 'cmd.watch.none' : 'cmd.watch.none_owned', undefined, loc)); break; }
+          const lines = subs.map(s => {
+            const wd = s.workingDir ? ` 📂${s.workingDir}` : '';
+            return `• ${s.docTitle || s.fileToken}（${modeLabel(s.commentTriggerMode)}）${wd}`;
+          });
+          await sessionReply(rootId, [t(ds ? 'cmd.watch.list_title' : 'cmd.watch.list_title_owned', undefined, loc), ...lines].join('\n'));
+          break;
+        }
+
+        if (request.kind === 'off') {
+          if (request.docRef) {
+            try {
+              const file = await resolveDocFile(larkAppId, request.docRef);
+              const existing = getDocSubscription(dataDir, larkAppId, file.fileToken);
+              if (!existing || existing.managedBy !== 'watch-comment') { await sessionReply(rootId, t('cmd.watch.not_found', undefined, loc)); break; }
+              removeDocSubscription(dataDir, larkAppId, file.fileToken);
+              await sessionReply(rootId, t('cmd.watch.stopped_one', { title: file.fileToken.slice(0, 12) }, loc));
+            } catch (err) {
+              await sessionReply(rootId, t('cmd.watch.failed', { err: err instanceof Error ? err.message : String(err) }, loc));
+            }
+            break;
+          }
+          // 命令已收归 owner-only，无 session 时直接列全部（不再按 ownerOpenId 过滤）。
+          const subs = (ds
+            ? listDocSubscriptionsForSession(dataDir, larkAppId, sessionAnchorId(ds))
+            : listAllDocSubscriptions(dataDir, larkAppId))
+            .filter(s => s.managedBy === 'watch-comment');
+          for (const s of subs) {
+            removeDocSubscription(dataDir, larkAppId, s.fileToken);
+          }
+          await sessionReply(rootId, t(ds ? 'cmd.watch.stopped_all' : 'cmd.watch.stopped_owned', { count: subs.length }, loc));
+          break;
+        }
+
+        if (request.kind !== 'watch') {
+          await sessionReply(rootId, t('cmd.watch.usage', undefined, loc));
+          break;
+        }
+        let validatedDir: string | undefined;
+        if (request.workingDir) {
+          const v = validateWorkingDir(request.workingDir, loc);
+          if (!v.ok) { await sessionReply(rootId, v.error); break; }
+          validatedDir = v.resolvedPath;
+        }
+
+        const botCfg = getBot(larkAppId).config;
+        try {
+          const file = await resolveDocFile(larkAppId, request.docRef);
+          const existing = getDocSubscription(dataDir, larkAppId, file.fileToken);
+          const mode: CommentTriggerMode = request.requestedMode
+            ?? (botCfg.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
+          const anchor = ds ? sessionAnchorId(ds) : `doc:${file.fileToken}`;
+          const effectiveDir = validatedDir ?? existing?.workingDir ?? botCfg.docRepoMap?.[file.fileToken];
+          let pollCursorAt: number | undefined;
+          let pollCursorReplyId: string | undefined;
+          let pollBaselineReady: boolean | undefined;
+          if (mode === 'all') {
+            const canReuseBaseline = existing?.managedBy === 'watch-comment'
+              && existing.commentTriggerMode === 'all'
+              && existing.pollBaselineReady === true;
+            if (canReuseBaseline) {
+              pollCursorAt = existing.pollCursorAt;
+              pollCursorReplyId = existing.pollCursorReplyId;
+              pollBaselineReady = true;
+            } else {
+              try {
+                const latest = latestDocCommentPollCursor(await listDocComments(larkAppId, file));
+                pollCursorAt = latest?.createdAt ?? Math.floor(Date.now() / 1000);
+                pollCursorReplyId = latest?.replyId ?? '';
+                pollBaselineReady = true;
+              } catch (err) {
+                // 不让一次读取失败阻塞登记。poller 首次成功时只建立基线，不重放历史。
+                pollBaselineReady = false;
+                logger.warn(`[${logTag}] /watch-comment baseline failed for ${file.fileToken.slice(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            }
+          }
+          const subscription: DocSubscription = {
+            fileToken: file.fileToken,
+            fileType: file.fileType,
+            sessionAnchor: anchor,
+            sessionId: ds?.session.sessionId,
+            scope: ds?.scope ?? 'chat',
+            chatId: ds?.chatId ?? `doc:${file.fileToken}`,
+            commentTriggerMode: mode,
+            managedBy: 'watch-comment',
+            ownerOpenId: message.senderId,
+            workingDir: effectiveDir,
+            pollCursorAt,
+            pollCursorReplyId,
+            pollBaselineReady,
+            createdAt: existing?.createdAt ?? Date.now(),
+          };
+          const { previous } = putDocSubscription(dataDir, larkAppId, subscription);
+          const rebound = previous && previous.sessionAnchor !== anchor;
+          let replyText = t(!ds ? 'cmd.watch.started_lazy' : rebound ? 'cmd.watch.started_moved' : 'cmd.watch.started', {
+            title: file.fileToken.slice(0, 12),
+            mode: modeLabel(mode),
+          }, loc);
+          if (effectiveDir) replyText += `\n📂 ${t('cmd.watch.working_dir', { dir: effectiveDir }, loc)}`;
+          if (ds && deps.prewarmDocCommentSession) {
+            try {
+              await deps.prewarmDocCommentSession(ds, subscription);
+              replyText += `\n\n${t('cmd.watch.prewarming', undefined, loc)}`;
+            } catch (err) {
+              logger.warn(`[${logTag}] /watch-comment prewarm failed for ${file.fileToken.slice(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+              replyText += `\n\n${t('cmd.watch.prewarm_failed', undefined, loc)}`;
+            }
+          }
+          await sessionReply(rootId, replyText);
+          logger.info(`[${logTag}] /watch-comment → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${effectiveDir ? ` wd=${effectiveDir}` : ''}${rebound ? ' (rebound)' : ''}${ds ? '' : ' (doc-native lazy session)'}`);
+        } catch (err) {
+          await sessionReply(rootId, t('cmd.watch.failed', { err: err instanceof Error ? err.message : String(err) }, loc));
         }
         break;
       }
@@ -2529,8 +2874,9 @@ export async function handleCommand(
           try {
             const ctrl = new AbortController();
             const tt = setTimeout(() => ctrl.abort(), 5000);
-            const res = await fetch(
-              `http://127.0.0.1:${daemon.ipcPort}/api/sessions/migrate-to-chat`,
+            const res = await fetchDaemonIpc(
+              daemon.ipcPort,
+              '/api/sessions/migrate-to-chat',
               {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
@@ -2711,6 +3057,7 @@ export async function handleCommand(
           t('help.repo_n', undefined, loc),
           t('help.repo_path', undefined, loc),
           t('help.repo_wt', undefined, loc),
+          t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
           t('help.card', undefined, loc),
           t('help.term', undefined, loc),
@@ -2718,6 +3065,7 @@ export async function handleCommand(
           t('help.insight', undefined, loc),
           t('help.land', undefined, loc),
           t('help.subscribe_doc', undefined, loc),
+          t('help.watch_comment', undefined, loc),
           t('help.summary', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),

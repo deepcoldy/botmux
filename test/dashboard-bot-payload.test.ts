@@ -54,6 +54,13 @@ describe('dashboard bot payload helpers', () => {
     });
   });
 
+  it('projects Codex App clean history mode as an explicit default-off boolean', () => {
+    const daemon = { larkAppId: 'app_codex', botName: 'Codex', cliId: 'codex-app' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ codexAppCleanInput: false });
+    expect(botDefaultsPayload(daemon, { codexAppCleanInput: true }))
+      .toMatchObject({ codexAppCleanInput: true });
+  });
+
   it('derives agentSelectionKey from cliId + wrapperCli so the 修改CLI dropdown highlights wrapper gateways', () => {
     // 裸 CLI：选择键 = cliId。
     expect(botDefaultsPayload(

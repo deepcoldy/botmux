@@ -2,6 +2,11 @@ export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule' | 'vc
 export type TriggerTargetKind = 'turn' | 'workflow';
 export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored' | 'completed';
 export type TriggerAsyncStatus = 'pending' | 'completed';
+export type LegacyWorkflowRetirementReason =
+  | 'pending'
+  | 'migrated'
+  | 'changed_after_migration'
+  | 'identity_conflict';
 
 export interface TriggerRequest {
   source: {
@@ -49,6 +54,7 @@ export type TriggerErrorCode =
   | 'dry_run'
   | 'invalid_signature'
   | 'chat_not_allowed'
+  | 'legacy_workflow_retired'
   | 'group_create_failed'
   | 'lifecycle_extract_failed'
   | 'rate_limited'
@@ -72,6 +78,10 @@ export interface TriggerResponse {
   message?: string;
   errorCode?: TriggerErrorCode;
   error?: string;
+  /** Structured recovery metadata when a v2 definition is no longer runnable. */
+  reason?: LegacyWorkflowRetirementReason;
+  targetWorkflowId?: string;
+  targetRevisionId?: string;
   promptPreview?: string;
   output?: {
     content: string;

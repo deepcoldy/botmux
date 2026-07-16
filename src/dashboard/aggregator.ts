@@ -110,6 +110,7 @@ export function subscribeDaemon(
   d: DaemonInfo,
   agg: Aggregator,
   onError: (e: Error) => void,
+  fetchImpl: typeof fetch = fetch,
 ): () => void {
   const ctrl = new AbortController();
   const url = `http://127.0.0.1:${d.ipcPort}/api/events`;
@@ -117,7 +118,7 @@ export function subscribeDaemon(
   (async () => {
     while (!ctrl.signal.aborted) {
       try {
-        const res = await fetch(url, { signal: ctrl.signal });
+        const res = await fetchImpl(url, { signal: ctrl.signal });
         if (!res.ok || !res.body) throw new Error(`bad status ${res.status}`);
         const reader = res.body.getReader();
         const dec = new TextDecoder();

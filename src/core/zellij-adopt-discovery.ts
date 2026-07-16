@@ -24,7 +24,7 @@ import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid } from '../services/traex-transcript.js';
 import { findServerPid } from '../adapters/backend/zellij-backend.js';
 import {
-  listLiveSessions, parseListPanesJson,
+  listLiveSessions, parseListPanesJson, type ListedPane,
 } from './zellij-session-discovery.js';
 import { zellijEnv } from '../setup/ensure-zellij.js';
 import { logger } from '../utils/logger.js';
@@ -136,6 +136,27 @@ function paneNum(paneId: string): number {
   return m ? Number(m[1]) : 0;
 }
 
+/**
+ * The pane set used for the positional pane↔pid alignment: every terminal pane
+ * that has a LIVE process behind it, sorted by pane id (= creation order).
+ *
+ * This must mirror exactly what `paneShellChildren` counts on the process side,
+ * or the count guard refuses the whole session. Two states used to break that
+ * invariant (both reproduced live — the "/adopt finds nothing" bug):
+ *  - FLOATING terminal panes have a pane shell like any tiled pane, so they
+ *    MUST be included (they were filtered out, leaving an extra child).
+ *  - EXITED held panes (`zellij run` command finished, pane kept for re-run)
+ *    have NO process left, so they must be excluded (they added a terminal
+ *    with no matching child).
+ * Floating panes are also perfectly adoptable — every drive/dump action takes
+ * an explicit --pane-id — so they stay in the results too.
+ */
+export function alignmentPanes(listed: ListedPane[]): ListedPane[] {
+  return listed
+    .filter(p => !p.isPlugin && !p.exited)
+    .sort((a, b) => paneNum(a.paneId) - paneNum(b.paneId));
+}
+
 /** Live pane dimensions (content area) for a paneId in a session. */
 function paneDimensions(session: string, paneId: string): { cols: number; rows: number } | undefined {
   try {
@@ -187,9 +208,7 @@ export function discoverAdoptableZellijSessions(filterCliId?: CliId): ZellijAdop
 
     const panesOut = zellijRead(session, ['list-panes', '--json']);
     if (!panesOut) continue;
-    const terminals = parseListPanesJson(panesOut)
-      .filter(p => !p.isPlugin && !p.isFloating)
-      .sort((a, b) => paneNum(a.paneId) - paneNum(b.paneId));
+    const terminals = alignmentPanes(parseListPanesJson(panesOut));
     if (terminals.length === 0) continue;
 
     const serverPid = findServerPid(session);
@@ -208,7 +227,9 @@ export function discoverAdoptableZellijSessions(filterCliId?: CliId): ZellijAdop
     // persistent pane shells/commands remain, so the count guard is stable.
     const children = paneShellChildren(serverPid);
     if (children.length !== terminals.length) {
-      logger.debug(`[zellij-adopt] ${session}: pane processes(${children.length}) != terminals(${terminals.length}) — can't align, refusing`);
+      // warn (not debug): this refusal makes every CLI in the session invisible
+      // to /adopt, so it must be diagnosable from live daemon logs.
+      logger.warn(`[zellij-adopt] ${session}: pane processes(${children.length}) != live terminals(${terminals.length}) — can't align, refusing`);
       continue;
     }
 

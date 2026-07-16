@@ -108,6 +108,12 @@ export function sessionSearchText(s: any): string {
 
 export const terminalHref = sessionTerminalHref;
 
+export function shouldOpenWritableTerminal(state: { authed: boolean; publicReadOnly: boolean } = ui): boolean {
+  if (state.authed) return true;
+  if (state.publicReadOnly) return false;
+  return false;
+}
+
 // Cohesive icon set for the session-card action bar — stroke-based (CSS sets
 // stroke:currentColor), 16px viewBox to match the sidebar nav glyphs. Icons
 // instead of text labels keep rows fixed width across locales.
@@ -115,7 +121,7 @@ export const ICON = {
   pin: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 14.3s4.2-3.9 4.2-7.3A4.2 4.2 0 0 0 8 2.9a4.2 4.2 0 0 0-4.2 4.1C3.8 10.4 8 14.3 8 14.3z"/><circle cx="8" cy="6.9" r="1.5"/></svg>',
   openChat: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9.4 2.8h3.8v3.8"/><path d="M13.2 2.8 7.3 8.7"/><path d="M11.5 9.3v2.9a1.2 1.2 0 0 1-1.2 1.2H3.8a1.2 1.2 0 0 1-1.2-1.2V5.7a1.2 1.2 0 0 1 1.2-1.2h2.9"/></svg>',
   details: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.4" y="2.6" width="11.2" height="10.8" rx="2"/><path d="M5.2 5.4h5.6"/><path d="M5.2 8h5.6"/><path d="M5.2 10.6h3.2"/></svg>',
-  terminal: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.7" y="2.7" width="12.6" height="10.6" rx="2"/><path d="M4.4 6.3 6.4 8.1 4.4 9.9"/><path d="M8.2 10.2h3.4"/></svg>',
+  terminal: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.8" y="2.2" width="12.4" height="10.5" rx="2"/><path d="M1.8 5h12.4"/><circle cx="4" cy="3.6" r=".45" fill="currentColor" stroke="none"/><path d="m4.2 7.3 1.8 1.6-1.8 1.6"/><path d="M8 10.6h3.4"/></svg>',
   key: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6" cy="6.1" r="3"/><path d="M8.1 8.2 13 13.1"/><path d="M11.3 11.4 12.6 10.1"/><path d="M12.7 12.8 13.7 11.8"/></svg>',
   lock: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="7" width="10" height="6.4" rx="1.8"/><path d="M5.1 7V5.4a2.9 2.9 0 0 1 5.8 0V7"/><path d="M8 9.5v1.4"/></svg>',
   unlock: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="7" width="10" height="6.4" rx="1.8"/><path d="M5.1 7V5.3a2.9 2.9 0 0 1 5.1-1.9"/><path d="M8 9.5v1.4"/></svg>',
@@ -152,6 +158,14 @@ export async function openWriteLink(s: any, btn?: HTMLButtonElement): Promise<vo
   } finally {
     if (btn) btn.disabled = false;
   }
+}
+
+export function historySenderKey(message: any): string {
+  const rawType = String(message?.senderType ?? 'unknown');
+  const type = rawType === 'app' || rawType === 'bot' ? 'bot' : rawType;
+  const id = String(message?.senderId ?? '').trim();
+  const name = String(message?.senderName ?? '').trim();
+  return `${type}:${id || name || 'unknown'}`;
 }
 
 export function deriveSessionBoardColumn(s: any): BoardColumnId | null {

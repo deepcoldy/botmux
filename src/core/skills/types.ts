@@ -2,6 +2,7 @@ import type { CliId } from '../../adapters/cli/types.js';
 
 export type SkillSource =
   | { type: 'bundled'; packageName: string }
+  | { type: 'plugin'; pluginId: string; root: string }
   | { type: 'user'; root: string }
   | { type: 'project'; root: string }
   | { type: 'admin'; root: string }

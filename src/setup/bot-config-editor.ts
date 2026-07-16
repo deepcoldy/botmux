@@ -25,6 +25,9 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   // 新增 CLI 一律追加到尾部：序号是脚本化 setup（非 TTY 管道喂数字）的稳定接口，
   // 插位会让老脚本静默选错 CLI。
   '21': 'genius',
+  '22': 'grok',
+  '23': 'kiro-cli',
+  '24': 'riff',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -56,6 +59,9 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'relay': 'Relay',
   'mir': 'Mir CLI',
   'kimi': 'Kimi',
+  'grok': 'Grok Build',
+  'kiro-cli': 'Kiro',
+  'riff': 'Riff',
 };
 
 /**
@@ -326,6 +332,11 @@ export function parseBotSelection(
   const byAppId = bots.findIndex(b => b.larkAppId === raw);
   if (byAppId >= 0) return byAppId;
 
+  const byConfiguredName = bots.findIndex(b => (
+    typeof b.name === 'string' && normalizeBotProcessName(b.name) === raw
+  ));
+  if (byConfiguredName >= 0) return byConfiguredName;
+
   const byProcessName = bots.findIndex((b, i) => botProcessName(b, i) === raw);
   return byProcessName >= 0 ? byProcessName : undefined;
 }
@@ -389,8 +400,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     if (backendType === '-') {
       delete out.backendType;
     } else if (backendType) {
-      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij') {
-        throw new Error(`backendType must be "pty", "tmux", "herdr", or "zellij": ${backendType}`);
+      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'riff') {
+        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", or "riff": ${backendType}`);
       }
       out.backendType = backendType;
     }

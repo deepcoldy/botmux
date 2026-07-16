@@ -48,11 +48,16 @@ function makeRepo(name: string): string {
 }
 
 /** Register one bot pointing defaultWorkingDir at `dir`, toggle configurable. */
-async function loadWithBot(dir: string, autoWorktree: boolean) {
+async function loadWithBot(
+  dir: string,
+  autoWorktree: boolean,
+  agent: { cliId?: string; backendType?: string } = {},
+) {
   writeFileSync(configPath, JSON.stringify([{
     larkAppId: 'app_wt',
     larkAppSecret: 'secret',
-    cliId: 'claude-code',
+    cliId: agent.cliId ?? 'claude-code',
+    ...(agent.backendType ? { backendType: agent.backendType } : {}),
     defaultWorkingDir: dir,
     ...(autoWorktree ? { defaultWorkingDirAutoWorktree: true } : {}),
   }], null, 2), 'utf-8');
@@ -89,6 +94,30 @@ describe('maybeCreateDefaultWorktree', () => {
     // Two notices, in order: the "creating…" heads-up THEN the "created" result.
     expect(notices).toHaveLength(2);
     expect(notices[1]).toContain(r.dir);
+  });
+
+  it('does not push for an invalid codex-app + riff backend pair', async () => {
+    const repo = makeRepo('codex-invalid-riff');
+    const { mod } = await loadWithBot(repo, true, { cliId: 'codex-app', backendType: 'riff' });
+
+    const r = await mod.maybeCreateDefaultWorktree('app_wt', repo, {
+      isBotDefaultDir: true, locale: 'zh',
+    });
+
+    const branch = git(r.dir, 'branch', '--show-current');
+    expect(git(repo, 'ls-remote', '--heads', 'origin', `refs/heads/${branch}`)).toBe('');
+  });
+
+  it('pushes when a Riff CLI is paired with a stale local backend', async () => {
+    const repo = makeRepo('riff-invalid-local');
+    const { mod } = await loadWithBot(repo, true, { cliId: 'riff', backendType: 'pty' });
+
+    const r = await mod.maybeCreateDefaultWorktree('app_wt', repo, {
+      isBotDefaultDir: true, locale: 'zh',
+    });
+
+    const branch = git(r.dir, 'branch', '--show-current');
+    expect(git(repo, 'ls-remote', '--heads', 'origin', `refs/heads/${branch}`)).toContain(`refs/heads/${branch}`);
   });
 
   it('non-git default dir falls back WITHOUT a premature "creating" notice (single fallback notice)', async () => {

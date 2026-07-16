@@ -5,7 +5,7 @@
  * Run: pnpm vitest run test/team-group.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { planGroupCreator } from '../src/dashboard/team-group.js';
+import { buildTeamGroupCreatePayload, planGroupCreator } from '../src/dashboard/team-group.js';
 
 const onlineAll = () => true;
 const pick = (ids: string[]) => ids[0] ?? null;
@@ -32,5 +32,32 @@ describe('planGroupCreator', () => {
 
   it('null creator when nothing pickable', () => {
     expect(planGroupCreator(['cli_a'], 'cli_x', onlineAll, () => null)).toEqual({ creatorLarkAppId: null, inviteUser: false });
+  });
+});
+
+describe('buildTeamGroupCreatePayload', () => {
+  it('forwards the authenticated operator union_id as the team-group owner transfer target', () => {
+    expect(buildTeamGroupCreatePayload({
+      name: '协作群',
+      larkAppIds: ['cli_a', 'cli_b'],
+      userOpenIds: [],
+      ownerUnionIds: ['on_operator', 'on_other_owner'],
+      transferOwnerUnionId: 'on_operator',
+    })).toEqual({
+      name: '协作群',
+      larkAppIds: ['cli_a', 'cli_b'],
+      userOpenIds: [],
+      ownerUnionIds: ['on_operator', 'on_other_owner'],
+      transferOwnerUnionId: 'on_operator',
+    });
+  });
+
+  it('does not guess a transfer target from bot owners when the operator identity is unavailable', () => {
+    expect(buildTeamGroupCreatePayload({
+      name: '无人群',
+      larkAppIds: ['cli_a'],
+      userOpenIds: [],
+      ownerUnionIds: ['on_bot_owner'],
+    })).not.toHaveProperty('transferOwnerUnionId');
   });
 });

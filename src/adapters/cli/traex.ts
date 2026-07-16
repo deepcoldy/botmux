@@ -1,9 +1,10 @@
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { traeStateDbPath, traeSessionsRoot } from '../../services/traex-paths.js';
+import { traexRolloutHasUserInputSince } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
 
@@ -16,27 +17,11 @@ import { delay } from '../../utils/timing.js';
  *
  * The important difference from the upstream Codex adapter:
  *   - Data lives under ~/.trae (not ~/.codex), configurable via TRAE_HOME.
- *   - There is no global history.jsonl. The per-session rollout JSONL format
- *     is identical, but submit verification falls back to scanning the
- *     threads SQLite table (state_5.sqlite) whose `first_user_message`
- *     column is written synchronously when the CLI commits a user submit.
+ *   - There is no global history.jsonl. Submit verification uses the threads
+ *     SQLite table as the authoritative session/path index, then requires an
+ *     exact role=user record in that rollout's post-submit byte delta.
  *   - Skills are installed into ~/.trae/skills.
  */
-
-function normaliseHistoryText(text: string): string {
-  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-}
-
-function textMatches(actual: string, expected: string): boolean {
-  if (actual === expected) return true;
-  const na = normaliseHistoryText(actual);
-  const ne = normaliseHistoryText(expected);
-  if (na === ne) return true;
-  // first_user_message may be truncated by SQLite substr / UI. Accept a
-  // prefix match when expected is longer than what the DB recorded.
-  if (na.length > 0 && (ne.startsWith(na) || na.startsWith(ne.slice(0, na.length)))) return true;
-  return false;
-}
 
 // -- SQLite helpers (node:sqlite, Node 22+ experimental) -----------------
 
@@ -57,7 +42,7 @@ function loadSqlite(): typeof sqliteModule {
   sqliteLoadAttempted = true;
   // node:sqlite is the built-in experimental SQLite binding available in
   // Node 22+. The runtime may still reject it (older Node without the
-  // feature); we swallow that and degrade gracefully.
+  // feature); callers treat that as verification-unavailable and fail closed.
   // 必须走 createRequire：本包是 ESM（"type":"module"），裸 require 是
   // ReferenceError —— 之前就是被这里的 try/catch 吞掉，导致生产 dist 里
   // SQLite 提交验证/会话反查整条链路静默失效。
@@ -86,42 +71,66 @@ function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
   }
 }
 
-/** Snapshot of the newest thread's (id, updated_at_ms, first_user_message)
- *  immediately before a submit. Used after the paste+Enter to detect a new
- *  row (first turn) or a changed first_user_message (unlikely but cheap to
- *  check alongside id+updated_at_ms). */
 interface ThreadSnapshot {
-  id?: string;
-  updatedAtMs?: number;
-  firstMessage?: string;
+  id: string;
+  updatedAtMs: number;
+  rolloutPath: string;
+  rolloutOffset: number;
 }
 
-function snapLatestThread(): ThreadSnapshot {
-  return withDb((db) => {
-    const row = db.prepare(
-      'SELECT id, updated_at_ms AS updatedAtMs, first_user_message AS firstMessage ' +
-      'FROM threads ORDER BY updated_at_ms DESC LIMIT 1',
-    ).get() as ThreadSnapshot | undefined;
-    return row ?? { };
-  }) ?? { };
+interface SubmitSnapshot {
+  newestUpdatedAtMs: number;
+  byId: Map<string, ThreadSnapshot>;
 }
 
-/** Return { found, cliSessionId } if, compared to `before`, a newer thread
- *  now exists whose first_user_message matches `expectedText`. */
-function detectNewThread(before: ThreadSnapshot, expectedText: string): { found: boolean; cliSessionId?: string } {
+function currentFileSize(path: string): number {
+  if (!path || !existsSync(path)) return 0;
+  try { return statSync(path).size; } catch { return 0; }
+}
+
+/** Snapshot recent SQLite thread rows and each rollout's complete byte size
+ * before touching the PTY. The DB is an index; the rollout delta below is the
+ * actual submit proof. `null` means verification is unavailable and callers
+ * must fail closed before writing any bytes. */
+function snapRecentThreads(): SubmitSnapshot | null {
   return withDb((db) => {
     const rows = db.prepare(
-      'SELECT id, updated_at_ms AS updatedAtMs, first_user_message AS firstMessage ' +
-      'FROM threads WHERE updated_at_ms >= COALESCE(?, 0) ORDER BY updated_at_ms DESC LIMIT 5',
-    ).all(before.updatedAtMs ?? 0) as ThreadSnapshot[];
+      'SELECT id, COALESCE(updated_at_ms, 0) AS updatedAtMs, rollout_path AS rolloutPath ' +
+      'FROM threads ORDER BY updated_at_ms DESC LIMIT 64',
+    ).all() as Array<Omit<ThreadSnapshot, 'rolloutOffset'>>;
+    const byId = new Map<string, ThreadSnapshot>();
+    let newestUpdatedAtMs = 0;
+    for (const row of rows) {
+      if (!row.id || !row.rolloutPath) continue;
+      newestUpdatedAtMs = Math.max(newestUpdatedAtMs, Number(row.updatedAtMs) || 0);
+      byId.set(row.id, {
+        id: row.id,
+        updatedAtMs: Number(row.updatedAtMs) || 0,
+        rolloutPath: row.rolloutPath,
+        rolloutOffset: currentFileSize(row.rolloutPath),
+      });
+    }
+    return { newestUpdatedAtMs, byId };
+  });
+}
+
+/** Resolve the session whose rollout gained this exact role=user record.
+ * Works for the first prompt, later prompts in the same thread, and a freshly
+ * rotated thread. Sibling processes can update SQLite concurrently, but their
+ * rollout delta cannot match our full prompt accidentally. */
+function detectSubmittedThread(before: SubmitSnapshot, expectedText: string): { found: boolean; cliSessionId?: string } {
+  return withDb((db) => {
+    const rows = db.prepare(
+      'SELECT id, COALESCE(updated_at_ms, 0) AS updatedAtMs, rollout_path AS rolloutPath ' +
+      'FROM threads WHERE COALESCE(updated_at_ms, 0) >= ? ORDER BY updated_at_ms DESC LIMIT 64',
+    ).all(before.newestUpdatedAtMs) as Array<Omit<ThreadSnapshot, 'rolloutOffset'>>;
     for (const r of rows) {
-      // Skip the exact row we saw before (same id AND same timestamp).
-      if (r.id && before.id && r.id === before.id && r.updatedAtMs === before.updatedAtMs) continue;
-      if (r.firstMessage && textMatches(r.firstMessage, expectedText)) {
+      if (!r.id || !r.rolloutPath) continue;
+      const prior = before.byId.get(r.id);
+      const fromOffset = prior?.rolloutPath === r.rolloutPath ? prior.rolloutOffset : 0;
+      if (traexRolloutHasUserInputSince(r.rolloutPath, fromOffset, expectedText)) {
         return { found: true, cliSessionId: r.id };
       }
-      // A fresh thread whose first_message is empty so far (still being
-      // written) will be caught on a later poll.
     }
     return { found: false };
   }) ?? { found: false };
@@ -145,6 +154,31 @@ function latestTraeSessionForBotmuxSession(botmuxSessionId: string): string | un
 
 // -------------------------------------------------------------------------
 
+/**
+ * TRAE/Codex sanitizes the environment inherited by model shell tools. Goal
+ * mode is file-backed, so the agent must receive these non-secret path vars or
+ * commands such as `cat $BOTMUX_GOAL_PATH` collapse to an empty argument and
+ * can hang on stdin. Forward only the goal contract, not the full worker env.
+ */
+const TRAEX_GOAL_ENV_KEYS = [
+  'BOTMUX_GOAL_PATH',
+  'BOTMUX_GOAL_INPUTS_PATH',
+  'BOTMUX_GOAL_OUTPUT_DIR',
+  'BOTMUX_GOAL_MANIFEST_PATH',
+  'BOTMUX_GOAL_ATTEMPT_DIR',
+  'BOTMUX_V3_GOAL',
+] as const;
+
+function goalEnvConfigArgs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const args: string[] = [];
+  for (const key of TRAEX_GOAL_ENV_KEYS) {
+    const value = env[key];
+    if (value === undefined) continue;
+    args.push('-c', `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
+  }
+  return args;
+}
+
 export function createTraexAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'traex';
   let cachedBin: string | undefined;
@@ -158,8 +192,18 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass }) {
       const baseArgs = [
-        ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
+        ...(!disableCliBypass ? [
+          '--dangerously-bypass-approvals-and-sandbox',
+          // Supported TRAE baseline 0.200.16+ has a second interactive
+          // "Hooks need review" gate
+          // after folder trust. Goal-mode workers have no human at their PTY,
+          // so without the automation-specific hook flag they never reach the
+          // prompt and `/goal` is never delivered. Keep it tied to the existing
+          // bypass decision: restricted bots must not gain hook trust.
+          '--dangerously-bypass-hook-trust',
+        ] : []),
         '--no-alt-screen',
+        ...goalEnvConfigArgs(),
       ];
       if (model && model.trim()) baseArgs.push('--model', model.trim());
       if (workingDir) baseArgs.push('-C', workingDir);
@@ -176,8 +220,8 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       return `traex resume ${sid}`;
     },
 
-    /** Import path: TRAE writes Codex-shaped rollout files under
-     *  `<TRAE_HOME>/cli/sessions` — same parser as Codex. */
+    /** Import path: TRAE writes Codex-family rollout files under
+     *  `<TRAE_HOME>/cli/sessions`. */
     listResumableSessions({ limit, exclude }) {
       return discoverRolloutSessions(traeSessionsRoot(), limit, exclude);
     },
@@ -195,9 +239,17 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         }
       };
 
-      // Take the snapshot BEFORE the paste so we can tell a newly-appeared
-      // thread from pre-existing ones.
-      const beforeSnap = snapLatestThread();
+      // Reliable delivery requires an attributable submit. Refuse before the
+      // paste if the SQLite session/path index cannot be read; writing first
+      // and discovering that verification is unavailable would make replay
+      // ambiguous and could execute the same action twice.
+      const beforeSnap = snapRecentThreads();
+      if (!beforeSnap) {
+        return {
+          submitted: false,
+          failureReason: 'TRAE SQLite 提交验证不可用，已在写入前安全拒绝。',
+        };
+      }
 
       try {
         if (pty.pasteText) pty.pasteText(content);
@@ -208,15 +260,8 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       await delay(200);
       if (!trySendEnter()) return { submitted: false };
 
-      // SQLite-backed submit verification. When node:sqlite is unavailable
-      // or the DB is missing (first run), we short-circuit and return
-      // undefined ("no verification performed, assume OK") — same behaviour
-      // as the Hermes / Aiden adapters.
-      const canVerify = loadSqlite() && existsSync(traeStateDbPath());
-      if (!canVerify) return undefined;
-
       for (let attempt = 0; attempt < 3; attempt++) {
-        const match = detectNewThread(beforeSnap, content);
+        const match = detectSubmittedThread(beforeSnap, content);
         if (match.found) {
           return match.cliSessionId
             ? { submitted: true, cliSessionId: match.cliSessionId }
@@ -225,14 +270,14 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         await delay(800);
         if (!trySendEnter()) return { submitted: false };
       }
-      const finalMatch = detectNewThread(beforeSnap, content);
+      const finalMatch = detectSubmittedThread(beforeSnap, content);
       if (finalMatch.found) {
         return finalMatch.cliSessionId
           ? { submitted: true, cliSessionId: finalMatch.cliSessionId }
           : { submitted: true };
       }
       const recheck = () => {
-        const late = detectNewThread(beforeSnap, content);
+        const late = detectSubmittedThread(beforeSnap, content);
         return late.found
           ? { submitted: true, cliSessionId: late.cliSessionId }
           : false;
@@ -251,6 +296,9 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // TRAE 0.200+ shares Codex's type-ahead behaviour: input submitted while
     // a turn is running is parked and merged into the active turn.
     supportsTypeAhead: true,
+    // task_complete in the per-session rollout is an explicit durable turn
+    // boundary; worker.ts drains it independently of screen-idle detection.
+    reliableTurnTerminal: true,
     // TRAE's trust/advisory startup screens can accept stdin before the real
     // composer exists, so the worker's 15s soft fallback must wait for the
     // prompt marker. A hard cap in the worker still prevents permanent hangs.

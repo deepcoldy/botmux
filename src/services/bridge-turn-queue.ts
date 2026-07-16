@@ -28,16 +28,34 @@
  * Baseline (`absorb()`) takes a batch of historical events and registers
  * their uuids as already-seen so future ingest doesn't double-attribute.
  */
-import { normaliseForFingerprint, isMeaningfulUserEvent, isMeaningfulQueuedCommand, extractTurnStartText, type TranscriptEvent } from './claude-transcript.js';
+import {
+  normaliseForFingerprint,
+  isMeaningfulUserEvent,
+  isMeaningfulQueuedCommand,
+  extractTurnStartText,
+  isClaudeTurnTerminalEvent,
+  type TranscriptEvent,
+} from './claude-transcript.js';
 
 // Re-export so existing callers (worker.ts, tests) don't need to change
 // their import path now that these helpers live in claude-transcript.ts.
 export { normaliseForFingerprint };
 
+function assistantHasVisibleText(content: unknown): boolean {
+  if (typeof content === 'string') return content.length > 0;
+  if (!Array.isArray(content)) return false;
+  return content.some((block: any) => block?.type === 'text' && typeof block.text === 'string' && block.text.length > 0);
+}
+
 export interface BridgePendingTurn {
   turnId: string;
+  dispatchAttempt?: number;
   started: boolean;
   assistantUuids: string[];
+  /** An authoritative transcript boundary closed this turn. Durable turns may
+   * never settle from screen-idle alone; worker terminal emission requires
+   * this bit (or an explicit failure/exit path outside the queue). */
+  terminalObserved?: boolean;
   /** Set when this turn was synthesised from a local-terminal user event
    *  (no matching Lark fingerprint). Causes the worker emit path to format
    *  the Lark message with both user text and assistant text under a
@@ -77,12 +95,6 @@ export interface BridgePendingTurn {
   markTimeMs?: number;
 }
 
-function assistantHasVisibleText(content: unknown): boolean {
-  if (typeof content === 'string') return content.length > 0;
-  if (!Array.isArray(content)) return false;
-  return content.some((block: any) => block?.type === 'text' && typeof block.text === 'string' && block.text.length > 0);
-}
-
 /** Trim a Lark message into a stable fingerprint. Keeps a leading window
  *  of non-whitespace-collapsed content; long enough to disambiguate, short
  *  enough that minor formatting differences (newlines, attachment hints
@@ -115,9 +127,16 @@ export class BridgeTurnQueue {
    *  `markTimeMs` is captured here so the rotation fallback can bound its
    *  fingerprint scan to events written after this point — protects short
    *  fingerprints from matching old history in unrelated sibling jsonls. */
-  mark(turnId: string, contentFingerprint?: string, markTimeMs: number = Date.now(), contentNormalized?: string): string {
+  mark(
+    turnId: string,
+    contentFingerprint?: string,
+    markTimeMs: number = Date.now(),
+    contentNormalized?: string,
+    dispatchAttempt?: number,
+  ): string {
     this.queue.push({
       turnId,
+      dispatchAttempt,
       started: false,
       assistantUuids: [],
       contentFingerprint,
@@ -136,15 +155,21 @@ export class BridgeTurnQueue {
     return dropped;
   }
 
-  /** Drop a specific pending turn by turnId iff it has not yet started
-   *  collecting assistant text. Returns the dropped turn or null if not
-   *  found / already started. Used by the worker when a writeInput's
-   *  deferred recheck conclusively fails — the user has been notified
-   *  the message was lost, so keeping a fingerprint-bearing mark around
-   *  only fuels the per-tick rotation-fallback scan that already
-   *  spammed 99% CPU once (no jsonl line will ever match). */
-  dropPendingTurn(turnId: string): BridgePendingTurn | null {
-    const idx = this.queue.findIndex(t => t.turnId === turnId && !t.started);
+  /** Drop one exact pending delivery attempt iff it has not yet started
+   *  collecting assistant text. A durable retry reuses turnId with a higher
+   *  dispatchAttempt, so matching only turnId would let attempt N's delayed
+   *  submit-failure timer delete the live mark for retry N+1. Returns the
+   *  dropped turn or null if the exact attempt is not found / already started.
+   *  Used by the worker when a writeInput's deferred recheck conclusively
+   *  fails — the user has been notified the message was lost, so keeping a
+   *  fingerprint-bearing mark around only fuels the per-tick rotation-fallback
+   *  scan that already spammed 99% CPU once (no jsonl line will ever match). */
+  dropPendingTurn(turnId: string, dispatchAttempt?: number): BridgePendingTurn | null {
+    const idx = this.queue.findIndex(t =>
+      t.turnId === turnId
+      && t.dispatchAttempt === dispatchAttempt
+      && !t.started,
+    );
     if (idx === -1) return null;
     const [dropped] = this.queue.splice(idx, 1);
     return dropped;
@@ -212,15 +237,14 @@ export class BridgeTurnQueue {
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (role === 'assistant') {
         if ((ev as any).isSidechain === true) continue;
-        if (!assistantHasVisibleText(ev.message?.content)) continue;
-        if (!this.collecting) {
-          // Headless local turn: assistant text arrived without any
+        const hasVisibleText = assistantHasVisibleText(ev.message?.content);
+        if (hasVisibleText && !this.collecting) {
+          // Headless local turn: an assistant boundary arrived without any
           // collecting context. Typical trigger: daemon restart cut off
           // an in-flight model stream — baseline absorbed the original
           // user event (uuid added to `seen`) and the worker process lost
           // its in-memory `collecting` pointer. Without this synthesis the
-          // continuation would be silently dropped (assistantHasVisibleText
-          // events with no `collecting` were just skipped before).
+          // continuation would be silently dropped.
           // Headless turns have no userUuid; emit-side formatting omits
           // the user block. Inserted at the head of the unstarted region
           // so a subsequent normal turn doesn't get reordered ahead of it.
@@ -238,7 +262,15 @@ export class BridgeTurnQueue {
           else this.queue.splice(insertAt, 0, headless);
           this.collecting = headless;
         }
-        this.collecting.assistantUuids.push(uuid);
+        if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
+        if (isClaudeTurnTerminalEvent(ev) && this.collecting) {
+          this.collecting.terminalObserved = true;
+        }
+      } else if (isClaudeTurnTerminalEvent(ev)) {
+        // Claude normally writes this as `system/turn_duration` immediately
+        // after the final assistant line. It is a second marker for the same
+        // logical boundary; setting a bit is naturally idempotent.
+        if (this.collecting) this.collecting.terminalObserved = true;
       }
     }
   }
@@ -261,11 +293,22 @@ export class BridgeTurnQueue {
    *       suppressed, fallback shown — exactly what the type-ahead-disable
    *       in commit b2d9791 was protecting against). */
   private handleTurnStart(uuid: string, ev: TranscriptEvent, sourceJsonlPath?: string): void {
+    // A following real user/queued-command event is itself a transcript-order
+    // proof that the previous durable turn ended. This covers older Claude
+    // JSONL variants that omitted the explicit final marker, without trusting
+    // the TUI's prompt-looking screen. Keep the turn queued so an empty/silent
+    // durable delivery still produces its terminal receipt.
+    if (this.collecting?.dispatchAttempt !== undefined && !this.collecting.terminalObserved) {
+      this.collecting.terminalObserved = true;
+      this.collecting = null;
+    }
     // Head-of-line block drop: previous turn never produced any visible
     // assistant text and a new meaningful turn-start has arrived → Claude
     // is single-threaded over the PTY, so the old turn will never get
     // text. Applies to both Lark and local turns.
-    if (this.collecting && this.collecting.assistantUuids.length === 0) {
+    if (this.collecting
+      && !this.collecting.terminalObserved
+      && this.collecting.assistantUuids.length === 0) {
       const idx = this.queue.indexOf(this.collecting);
       if (idx >= 0) this.queue.splice(idx, 1);
       this.collecting = null;
@@ -318,14 +361,29 @@ export class BridgeTurnQueue {
     }
   }
 
-  /** Pop FIFO any leading turn that's started AND has assistant text.
+  /** Pop FIFO any leading turn that's started and normally has visible text.
+   *  The worker calls with terminalBoundary=true only after the CLI's prompt
+   *  detector reports idle; that explicit boundary also releases an empty or
+   *  tool-only turn so durable delivery can settle without fabricating output.
    *  Returns the popped turns in order; the caller is responsible for
-   *  rebuilding the text payload from the assistant uuids. */
-  drainEmittable(): BridgePendingTurn[] {
+   *  rebuilding the optional visible payload from the assistant uuids. */
+  drainEmittable(opts: {
+    terminalBoundary?: boolean;
+    /** Pop only turns carrying an authoritative transcript boundary. */
+    explicitTerminalOnly?: boolean;
+    /** Screen idle may release ordinary fallback turns, but never a durable
+     * receiver turn whose receipt depends on an exact terminal contract. */
+    requireExplicitTerminalForDurable?: boolean;
+  } = {}): BridgePendingTurn[] {
     const out: BridgePendingTurn[] = [];
     while (this.queue.length > 0) {
       const head = this.queue[0];
-      if (!head.started || head.assistantUuids.length === 0) break;
+      if (!head.started) break;
+      if (opts.explicitTerminalOnly && !head.terminalObserved) break;
+      if (opts.requireExplicitTerminalForDurable
+        && head.dispatchAttempt !== undefined
+        && !head.terminalObserved) break;
+      if (!opts.terminalBoundary && !head.terminalObserved && head.assistantUuids.length === 0) break;
       this.queue.shift();
       if (this.collecting === head) this.collecting = null;
       out.push(head);

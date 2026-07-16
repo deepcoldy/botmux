@@ -425,11 +425,18 @@ export interface ClaudeFamilyVariant {
   readonly modelChoices?: readonly string[];
   /** Auth/login paths kept real+writable in the file sandbox (see CliAdapter.authPaths). */
   readonly authPaths?: readonly string[];
+  /** Opt in only after this concrete fork passes the terminal contract. */
+  readonly reliableTurnTerminal?: boolean;
 }
 
 export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
   return createClaudeFamilyAdapter({
     id: 'claude-code',
+    // Claude Code JSONL carries authoritative final boundaries: final
+    // assistant stop_reason (non-tool) and system/turn_duration. The worker
+    // refuses durable submits unless it has first installed an attributable
+    // bridge mark, and failure/exit paths share the same terminal deduper.
+    reliableTurnTerminal: true,
     authPaths: ['~/.claude/.credentials.json'],
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
@@ -447,8 +454,13 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
   let cachedBin: string | undefined;
   return {
     id: variant.id,
+    mcpGateway: {
+      configPath: variant.stateJsonPath,
+      format: 'claude-json',
+    },
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     supportsTypeAhead: true,
+    reliableTurnTerminal: variant.reliableTurnTerminal,
     // Isolation = worker-side whole-process Seatbelt wrapper. Claude's built-in
     // --settings sandbox is NOT used: it only sandboxes Bash (main process
     // unsandboxed, and network Bash commands can ESCAPE it). Claude's own data
@@ -833,6 +845,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // 收到信号前不投首条 prompt，绕开 cjadk 启动选择器吞首条消息的 bug。
     injectsReadyHook: true,
     defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal'] : undefined,
+    // Seed shares most of this adapter but has not been verified to expose the
+    // same native session-rename command. Keep the capability exact to Claude.
+    buildSessionRenameCommand: variant.id === 'claude-code'
+      ? (title) => `/rename ${title}`
+      : undefined,
     systemHints: [],
     altScreen: false,
     // Skills are injected per-session via --plugin-dir (see buildArgs), NOT

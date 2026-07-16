@@ -1,4 +1,4 @@
-// Local-runtime helpers for the mir adapter (driving local mircli -p --lean).
+// Local-runtime helpers for the mir adapter (driving local mircli -p).
 // Adapted from shunminli (李舜民)'s PR #245 (src/mira-local-runtime.ts) — credit to author.
 // Folded into the `mir` adapter per Plan A (mira stays Web API, mir = local mircli).
 import { spawn, spawnSync } from 'node:child_process';

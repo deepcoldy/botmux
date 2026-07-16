@@ -55,6 +55,8 @@ describe('parseSetupCommand', () => {
     expect(cmd).toMatchObject({
       action: 'add',
       json: true,
+      createApp: false,
+      compatibilityMode: false,
       openPlatformAuto: false,
       flags: {
         appId: 'cli_x',
@@ -71,6 +73,44 @@ describe('parseSetupCommand', () => {
     expect(on).toMatchObject({ action: 'add', openPlatformAuto: true });
     const off = parseSetupCommand(['add', '--open-platform-auto', '--no-open-platform-auto']);
     expect(off).toMatchObject({ action: 'add', openPlatformAuto: false });
+  });
+
+  it('parses one-scan --create-app, defaults automation on, and lets --no-open-platform-auto override it', () => {
+    expect(parseSetupCommand([
+      'add', '--create-app', '--app-name', 'My Bot', '--allowed-users', 'owner@example.com',
+    ])).toMatchObject({
+      action: 'add',
+      createApp: true,
+      compatibilityMode: false,
+      openPlatformAuto: true,
+      flags: { appName: 'My Bot', allowedUsers: 'owner@example.com' },
+    });
+    expect(parseSetupCommand(['add', '--create-app', '--no-open-platform-auto'])).toMatchObject({
+      action: 'add', createApp: true, openPlatformAuto: false,
+    });
+  });
+
+  it('requires explicit compatibility mode and keeps custom-name support honest', () => {
+    expect(parseSetupCommand(['add', '--create-app', '--compatibility-mode'])).toMatchObject({
+      action: 'add', createApp: true, compatibilityMode: true,
+    });
+    expect(() => parseSetupCommand(['add', '--compatibility-mode'])).toThrow(/必须与 add --create-app/);
+    expect(() => parseSetupCommand(['add', '--create-app', '--compatibility-mode', '--app-name', 'Bot'])).toThrow(/不支持 --app-name/);
+  });
+
+  it('parses explicit account switching only for the Feishu create-app path', () => {
+    expect(parseSetupCommand(['add', '--create-app', '--switch-account'])).toMatchObject({
+      action: 'add', createApp: true, switchAccount: true,
+    });
+    expect(() => parseSetupCommand(['add', '--switch-account'])).toThrow(/必须与 add --create-app/);
+    expect(() => parseSetupCommand(['add', '--create-app', '--compatibility-mode', '--switch-account'])).toThrow(/不适用于 SDK 兼容模式/);
+    expect(() => parseSetupCommand(['list', '--switch-account'])).toThrow(/仅适用于 add --create-app/);
+    expect(() => parseSetupCommand(['edit', 'botmux-0', '--switch-account'])).toThrow(/仅适用于 add --create-app/);
+  });
+
+  it('rejects ambiguous create-app credential combinations and app-name without creation', () => {
+    expect(() => parseSetupCommand(['add', '--create-app', '--app-id', 'cli_x'])).toThrow(/不能与 --app-id/);
+    expect(() => parseSetupCommand(['add', '--app-name', 'Bot'])).toThrow(/必须与 add --create-app/);
   });
 
   it('accepts "-" as a clear value but treats a following --flag as a missing value', () => {
@@ -169,6 +209,10 @@ describe('buildBotFromAddFlags', () => {
 });
 
 describe('editInputFromFlags', () => {
+  it('rejects --app-name outside add --create-app', () => {
+    expect(() => editInputFromFlags({ appName: 'Bot' })).toThrow(/仅与 add --create-app/);
+  });
+
   it('maps only the provided flags', () => {
     expect(editInputFromFlags({})).toEqual({});
     expect(editInputFromFlags({ model: 'opus', backend: 'tmux' })).toEqual({

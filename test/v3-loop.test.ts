@@ -35,7 +35,7 @@ import {
   loopExhaustedInfoFor,
   reconcileV3PendingGates,
 } from '../src/workflows/v3/daemon-run.js';
-import { birthRun } from '../src/workflows/v3/grill-state.js';
+import { birthRun, readGrillState, writeGrillState } from '../src/workflows/v3/grill-state.js';
 import { projectRun } from '../src/workflows/v3/ops-projection.js';
 import { readAndValidateManifest, ManifestValidationError } from '../src/workflows/v3/manifest.js';
 import {
@@ -606,6 +606,10 @@ describe('requestV3LoopGrant + retry loop guard', () => {
         ? { chatBinding: { larkAppId: 'cli_test', chatId: 'oc_chat', rootMessageId: 'om_root' } }
         : {}),
     });
+    const dagPath = join(runDir, 'dag.json');
+    writeFileSync(dagPath, JSON.stringify({ ...loopDagRaw(), runId }));
+    const grill = readGrillState(runDir)!;
+    writeGrillState(runDir, { ...grill, status: 'dag_approved', dagPath });
     const journalPath = join(runDir, 'journal.ndjson');
     appendEvent(journalPath, { type: 'runStarted', runId });
     appendEvent(journalPath, { type: 'loopStarted', loopId: 'fix' });
@@ -768,6 +772,10 @@ describe('requestV3LoopGrant + retry loop guard', () => {
           goal: 'g', baseDir: base, runId,
           chatBinding: { larkAppId: 'cli_test', chatId: 'oc_chat', rootMessageId: 'om_root' },
         });
+        const dagPath = join(runDir, 'dag.json');
+        writeFileSync(dagPath, JSON.stringify({ ...loopDagRaw(), runId }));
+        const grill = readGrillState(runDir)!;
+        writeGrillState(runDir, { ...grill, status: 'dag_approved', dagPath });
         const journalPath = join(runDir, 'journal.ndjson');
         appendEvent(journalPath, { type: 'runStarted', runId });
         for (const e of extra) appendEvent(journalPath, e);
@@ -791,8 +799,8 @@ describe('requestV3LoopGrant + retry loop guard', () => {
         { type: 'runBlocked', blockedNodeId: 'fix' },
         { type: 'loopIterationGranted', loopId: 'fix', fromIteration: 1 },
       ]);
-      // (4) NEGATIVE: a body instance genuinely in flight is real running —
-      // that run stays in the fencing-backlog bucket (no resume record).
+      // (4) A body instance genuinely in flight is recovered by the unified
+      // attempt barrier: fence-drain the orphan, then re-dispatch it.
       seedControl('cw-inflight-260606-0004', [
         { type: 'loopStarted', loopId: 'fix' },
         { type: 'loopIterationStarted', loopId: 'fix', iteration: 1 },
@@ -804,7 +812,7 @@ describe('requestV3LoopGrant + retry loop guard', () => {
       expect(byId.get('cw-started-260606-0001')).toMatchObject({ resume: true });
       expect(byId.get('cw-continue-260606-0002')).toMatchObject({ resume: true });
       expect(byId.get('cw-granted-260606-0003')).toMatchObject({ resume: true });
-      expect(byId.has('cw-inflight-260606-0004')).toBe(false);
+      expect(byId.get('cw-inflight-260606-0004')).toMatchObject({ resume: true, repost: [] });
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

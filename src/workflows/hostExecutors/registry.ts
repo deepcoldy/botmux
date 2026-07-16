@@ -1,4 +1,4 @@
-import type { ProviderReconciler } from '../resume.js';
+import type { ProviderReconciler } from '../shared/provider-reconciler.js';
 import {
   botmuxScheduleExecutor,
   botmuxScheduleReconciler,

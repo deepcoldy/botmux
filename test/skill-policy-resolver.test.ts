@@ -28,6 +28,20 @@ describe('skill policy resolver', () => {
     expect(result.prioritySkills).toEqual([]);
   });
 
+  it('includes plugin skills without requiring a user skill policy', () => {
+    const result = resolveSkillPolicy({
+      registrySkills: [],
+      projectSkills: [],
+      pluginSkills: [pkg('browser', ['browser'], { type: 'plugin', pluginId: 'agent-chrome', root: '/plugins/agent-chrome' })],
+      botPolicy: undefined,
+      workingDir: '/repo',
+    });
+
+    expect(result.enabled).toBe(true);
+    expect(result.prioritySkills.map((skill) => skill.name)).toEqual(['browser']);
+    expect(result.prioritySkills[0].priorityReason).toBe('plugin:agent-chrome');
+  });
+
   it('resolves direct skill includes only', () => {
     const result = resolveSkillPolicy({
       registrySkills: [

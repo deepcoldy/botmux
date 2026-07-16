@@ -37,7 +37,10 @@ import { isValidTimeZone } from '../utils/timezone.js';
 export interface ResolvedDashboardSettingsView {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  enableLocalCliOpen: boolean;
+  localCliOpenMode: 'attach' | 'resume';
   chatBotDiscovery: boolean;
+  herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId?: string | null;
@@ -74,7 +77,7 @@ export type ParseMaintenanceResult =
 export interface SettingsWriteApplierDeps {
   /** Snapshot of `~/.botmux/config.json`. Used to look up the persisted autoUpdate state when the incoming patch doesn't change it. */
   readGlobalConfig: () => GlobalConfig;
-  /** Atomic write of dashboard-level fields (publicReadOnly / openTerminalInFeishu). */
+  /** Atomic write of dashboard-level fields. */
   mergeDashboardConfig: (patch: DashboardGlobalConfig) => DashboardGlobalConfig;
   /** Atomic write of global-level fields (repoPickerMode / scheduleTimeZone / …).
    *  Mirrors the real `mergeGlobalConfig`: a `null` value deletes that key. */
@@ -133,7 +136,13 @@ export type ApplySettingsWriteResult =
 export type ApplySettingsWriteError =
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
+  | 'invalid_enableLocalCliOpen'
+  | 'invalid_localCliOpenMode'
   | 'invalid_chatBotDiscovery'
+  | 'invalid_herdrTraexPlugin'
+  | 'invalid_herdrTraexPlugin_enabled'
+  | 'invalid_herdrTraexPlugin_source'
+  | 'invalid_herdrTraexPlugin_ref'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
@@ -150,12 +159,20 @@ export type ApplySettingsWriteError =
   | 'empty_patch'
   | string;          // catch-all: parseMaintenancePatch error strings
 
+function isValidHerdrPluginSource(value: string): boolean {
+  return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/.test(value);
+}
+
+function isValidHerdrPluginRef(value: string): boolean {
+  return !value.startsWith('-') && !/[\s\0]/.test(value);
+}
+
 /**
  * Apply a parsed (object) settings patch. Returns success with the post-merge
  * snapshot, or an error code string on validation failure.
  *
  * Behaviour mirrors `dashboard.ts:460-498` exactly:
- *   - Validates `publicReadOnly` / `openTerminalInFeishu` are booleans.
+ *   - Validates dashboard toggles are booleans.
  *   - Validates `repoPickerMode` is 'all' | 'repos'.
  *   - Validates `lang` is a valid locale or null.
  *   - Defers maintenance validation to `parseMaintenancePatch` (returns its error verbatim).
@@ -184,11 +201,51 @@ export async function applySettingsWrite(
     }
     patch.openTerminalInFeishu = obj.openTerminalInFeishu;
   }
+  if ('enableLocalCliOpen' in obj) {
+    if (typeof obj.enableLocalCliOpen !== 'boolean') {
+      return { ok: false, error: 'invalid_enableLocalCliOpen' };
+    }
+    patch.enableLocalCliOpen = obj.enableLocalCliOpen;
+  }
+  if ('localCliOpenMode' in obj) {
+    if (obj.localCliOpenMode !== 'attach' && obj.localCliOpenMode !== 'resume') {
+      return { ok: false, error: 'invalid_localCliOpenMode' };
+    }
+    patch.localCliOpenMode = obj.localCliOpenMode;
+  }
   if ('chatBotDiscovery' in obj) {
     if (typeof obj.chatBotDiscovery !== 'boolean') {
       return { ok: false, error: 'invalid_chatBotDiscovery' };
     }
     patch.chatBotDiscovery = obj.chatBotDiscovery;
+  }
+  if ('herdrTraexPlugin' in obj) {
+    const raw = obj.herdrTraexPlugin;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_herdrTraexPlugin' };
+    }
+    const h = raw as Record<string, unknown>;
+    const current = deps.readGlobalConfig().dashboard?.herdrTraexPlugin ?? {};
+    const next = { ...current };
+    if ('enabled' in h) {
+      if (typeof h.enabled !== 'boolean') return { ok: false, error: 'invalid_herdrTraexPlugin_enabled' };
+      next.enabled = h.enabled;
+    }
+    if ('source' in h) {
+      if (typeof h.source !== 'string') return { ok: false, error: 'invalid_herdrTraexPlugin_source' };
+      const source = h.source.trim();
+      if (source && !isValidHerdrPluginSource(source)) return { ok: false, error: 'invalid_herdrTraexPlugin_source' };
+      if (source) next.source = source;
+      else delete next.source;
+    }
+    if ('ref' in h) {
+      if (typeof h.ref !== 'string') return { ok: false, error: 'invalid_herdrTraexPlugin_ref' };
+      const ref = h.ref.trim();
+      if (ref && !isValidHerdrPluginRef(ref)) return { ok: false, error: 'invalid_herdrTraexPlugin_ref' };
+      if (ref) next.ref = ref;
+      else delete next.ref;
+    }
+    patch.herdrTraexPlugin = next;
   }
 
   let touched = false;

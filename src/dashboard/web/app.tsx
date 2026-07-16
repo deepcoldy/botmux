@@ -22,9 +22,11 @@ import {
   loadAndRenderDashboardRoute,
 } from './route-lifecycle.js';
 import { buildBotCards, loadGroupsSnapshot } from './overview.js';
-import { BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT } from './bot-onboarding.js';
+import { BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT, openBotOnboarding } from './bot-onboarding.js';
+import { requestOpenCreateSession } from './create-session-entry.js';
 import { InfoTip } from './dashboard-components.js';
 import { initFloatingScrollbars } from './floating-scrollbars.js';
+import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -42,7 +44,16 @@ type NavItem = {
   labelKey?: string;
   label?: string;
   manage?: boolean;
+  plugin?: boolean;
   icon: ReactNode;
+};
+
+type PluginDashboardNavEntry = {
+  pluginId: string;
+  id: string;
+  route: string;
+  displayName?: string;
+  pinned?: boolean;
 };
 
 const MANAGE_ROUTES = [
@@ -50,6 +61,7 @@ const MANAGE_ROUTES = [
   'role-profiles',
   'bot-defaults',
   'skills',
+  'plugins',
   'team',
   'connectors',
   'insights',
@@ -114,10 +126,13 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'office', href: '#/office', labelKey: 'nav.office', icon: <><rect x="3" y="4" width="10" height="7" rx="2" /><circle cx="6" cy="7.5" r="1" /><circle cx="10" cy="7.5" r="1" /><path d="M8 4V2M4.5 11v2M11.5 11v2" /></> },
   { id: 'bot-defaults', href: '#/bot-defaults', labelKey: 'nav.botDefaults', manage: true, icon: <><rect x="2.5" y="5" width="11" height="8" rx="2" /><circle cx="5.8" cy="9" r="1" /><circle cx="10.2" cy="9" r="1" /><path d="M8 5V2.5M5.5 13v1.2M10.5 13v1.2" /></> },
   { id: 'skills', href: '#/skills', labelKey: 'nav.skills', manage: true, icon: <><path d="M3 2.5h10v3H3zM3 7h10v6.5H3z" /><path d="M5.4 9.2h5.2M5.4 11.2h3.8" /></> },
+  { id: 'plugins', href: '#/plugins', label: '插件', manage: true, icon: <><path d="M6.4 1.8h3.2v3h2.8v3.2H9.6v2.8H6.4V8H3.6V4.8h2.8z" /><path d="M2.2 11.8h11.6v2.4H2.2z" /></> },
   { id: 'team', href: '#/team', labelKey: 'nav.team', manage: true, icon: <><circle cx="8" cy="8" r="6.2" /><path d="M1.8 8h12.4M8 1.8c-2 1.8-2 10.6 0 12.4 2-1.8 2-10.6 0-12.4z" /></> },
   { id: 'connectors', href: '#/connectors', labelKey: 'nav.connectors', manage: true, icon: <><path d="M5.5 6.5v-3a2.5 2.5 0 0 1 5 0v3" /><rect x="3.5" y="6.5" width="9" height="7" rx="2" /></> },
   { id: 'settings', href: '#/settings', labelKey: 'nav.settings', icon: <><path d="M8 1.75 9.35 2.05 10 3.28l1.38.3 1.04-.96.96.96-.96 1.04.3 1.38 1.23.65L14.25 8l-.3 1.35-1.23.65-.3 1.38.96 1.04-.96.96-1.04-.96-1.38.3-.65 1.23L8 14.25l-1.35-.3L6 12.72l-1.38-.3-1.04.96-.96-.96.96-1.04-.3-1.38-1.23-.65L1.75 8l.3-1.35 1.23-.65.3-1.38-.96-1.04.96-.96 1.04.96 1.38-.3.65-1.23z" /><circle cx="8" cy="8" r="2" /></> },
 ];
+
+let pinnedPluginNavItems: NavItem[] = [];
 
 let isAuthed = true;
 let publicReadOnly = false;
@@ -125,6 +140,7 @@ let activeHash = location.hash || '#/';
 let ownerAvatar: OwnerAvatar | null = null;
 let updateBehind = false;
 let latestVersion: string | null = null;
+let updateBadgeKind: 'botmux' | 'codex' | null = null;
 let routeRoot: HTMLElement | null = null;
 let appRoot: ReturnType<typeof createRoot> | null = null;
 
@@ -143,11 +159,10 @@ function labelOf(item: NavItem): string {
 
 function isActiveNav(item: NavItem, hash: string): boolean {
   const current = hash || '#/';
-  if (
-    item.id === 'workflows' &&
-    (current === '#/legacy-workflow' || current.startsWith('#/legacy-workflow?') || current.startsWith('#/legacy-workflow/'))
-  ) {
-    return true;
+  if (item.id === 'plugins' && pinnedPluginNavItems.some(plugin => (
+    plugin.href === current || current.startsWith(`${plugin.href}?`) || current.startsWith(`${plugin.href}/`)
+  ))) {
+    return false;
   }
   if (
     item.id === 'sessions' &&
@@ -163,11 +178,29 @@ function isActiveNav(item: NavItem, hash: string): boolean {
   );
 }
 
+function sidebarNavItems(): NavItem[] {
+  if (pinnedPluginNavItems.length === 0) return NAV_ITEMS;
+  const pluginIndex = NAV_ITEMS.findIndex(item => item.id === 'plugins');
+  if (pluginIndex < 0) return [...NAV_ITEMS, ...pinnedPluginNavItems];
+  return [
+    ...NAV_ITEMS.slice(0, pluginIndex + 1),
+    ...pinnedPluginNavItems,
+    ...NAV_ITEMS.slice(pluginIndex + 1),
+  ];
+}
+
 function navClassName(item: NavItem): string | undefined {
   const classes = [];
   if (isActiveNav(item, activeHash)) classes.push('active');
   if (item.id === 'settings' && updateBehind) classes.push('nav-has-update');
   return classes.length ? classes.join(' ') : undefined;
+}
+
+function updateBadgeTitle(): string {
+  const version = latestVersion ? `v${latestVersion}` : '';
+  return updateBadgeKind === 'codex'
+    ? t('update.navRuntimeBadgeTitle', { version })
+    : t('update.navBadgeTitle', { version });
 }
 
 function setRouteRoot(node: HTMLElement | null): void {
@@ -285,15 +318,70 @@ function closeThemeMenuFromStatus(): void {
 
 function TopbarStatusMenu(props: { summary: TopbarStatusSummary; autoOpen?: boolean }): JSX.Element {
   const { autoOpen = false, summary } = props;
+  const [open, setOpen] = useState(false);
+  const [autoDismissed, setAutoDismissed] = useState(false);
+  const [hoverSuppressed, setHoverSuppressed] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const autoVisible = autoOpen && !autoDismissed;
+  const visible = open || autoVisible;
+
+  useEffect(() => {
+    if (!autoOpen) setAutoDismissed(false);
+  }, [autoOpen]);
+
+  useEffect(() => {
+    if (!visible) return undefined;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && rootRef.current?.contains(target)) return;
+      setOpen(false);
+      setAutoDismissed(true);
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    return () => document.removeEventListener('pointerdown', closeOnOutsidePointer);
+  }, [visible]);
+
+  const toggle = () => {
+    closeThemeMenuFromStatus();
+    if (visible) {
+      setOpen(false);
+      setAutoDismissed(true);
+      setHoverSuppressed(true);
+      return;
+    }
+    setHoverSuppressed(false);
+    setOpen(true);
+  };
+
   return (
     <div
-      className={`topbar-status-menu${autoOpen ? ' topbar-status-auto-open' : ''}`}
+      ref={rootRef}
+      className={`topbar-status-menu${autoVisible ? ' topbar-status-auto-open' : ''}${open ? ' is-open' : ''}${hoverSuppressed ? ' suppress-hover' : ''}`}
       onPointerEnter={closeThemeMenuFromStatus}
+      onPointerLeave={() => setHoverSuppressed(false)}
       onFocusCapture={closeThemeMenuFromStatus}
+      onBlur={event => {
+        const next = event.relatedTarget;
+        if (!(next instanceof Node) || !event.currentTarget.contains(next)) setOpen(false);
+      }}
+      onKeyDown={event => {
+        if (event.key !== 'Escape') return;
+        setOpen(false);
+        setAutoDismissed(true);
+        setHoverSuppressed(true);
+        (event.currentTarget.querySelector('#status') as HTMLButtonElement | null)?.focus();
+      }}
     >
-      <span id="status" className="connection-status" aria-haspopup="true" aria-expanded={autoOpen}>
+      <button
+        type="button"
+        id="status"
+        className="connection-status"
+        aria-haspopup="true"
+        aria-expanded={visible}
+        onClick={toggle}
+      >
         {t('overview.sessionOverview')}
-      </span>
+      </button>
       <div className="topbar-status-pop">
         {summary.attentionNotice ? (
           <a className="topbar-attention-notice" href="#/sessions">
@@ -449,25 +537,38 @@ function DashboardShell(): JSX.Element {
         </header>
         <div className="chrome-body">
           <aside className="sidebar">
+            {isAuthed ? (
+              <div className="sidebar-create-actions">
+                <button type="button" className="sidebar-create-btn" onClick={() => requestOpenCreateSession()}>
+                  {icon(<><path d="M2 3.5h12v7H6l-3 3v-3H2z" /><path d="M8 4.9v4.2M5.9 7h4.2" /></>)}
+                  <span className="sidebar-nav-label">{t('nav.createSession')}</span>
+                </button>
+                <button type="button" className="sidebar-create-btn" onClick={() => void openBotOnboarding()}>
+                  {icon(<><rect x="2.5" y="6" width="11" height="7.5" rx="2" /><circle cx="5.8" cy="9.75" r="1" /><circle cx="10.2" cy="9.75" r="1" /><path d="M8 6V3.8M6.3 1.9h3.4" /></>)}
+                  <span className="sidebar-nav-label">{t('nav.createBot')}</span>
+                </button>
+              </div>
+            ) : null}
             <nav className="sidebar-nav" aria-label="Dashboard">
-              {NAV_ITEMS.filter(item => isAuthed || !item.manage).map(item => (
+              {sidebarNavItems().filter(item => isAuthed || !item.manage).map(item => (
                 <a
                   key={item.id}
                   href={item.href}
                   data-route={item.id}
-                  className={navClassName(item)}
+                  className={[navClassName(item), item.plugin ? 'sidebar-plugin-item' : ''].filter(Boolean).join(' ') || undefined}
+                  title={item.plugin ? labelOf(item) : undefined}
                 >
                   {icon(item.icon)}
                   <span className="sidebar-nav-label">{labelOf(item)}</span>
                   {item.id === 'settings' && updateBehind ? (
                     <InfoTip
                       className="nav-update-tip"
-                      label={t('update.navBadgeTitle', { version: latestVersion ? `v${latestVersion}` : '' })}
+                      label={updateBadgeTitle()}
                       trigger={<span className="nav-update-dot" aria-hidden="true" />}
                       preventClick={false}
                       focusable={false}
                     >
-                      {t('update.navBadgeTitle', { version: latestVersion ? `v${latestVersion}` : '' })}
+                      {updateBadgeTitle()}
                     </InfoTip>
                   ) : null}
                 </a>
@@ -543,10 +644,33 @@ async function loadAuthState(): Promise<void> {
       isAuthed = !!j.authed;
       ui.authed = isAuthed;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
+      ui.publicReadOnly = publicReadOnly;
       const serverLocale = normalizeDashboardLocale(j.lang);
       if (serverLocale) ui.setLocale(serverLocale);
     }
   } catch { /* keep defaults */ }
+}
+
+async function loadPinnedPluginNavItems(): Promise<void> {
+  try {
+    const response = await fetch('/api/plugins/dashboard');
+    if (!response.ok) return;
+    const body = await response.json();
+    const entries = (Array.isArray(body?.plugins) ? body.plugins : []) as PluginDashboardNavEntry[];
+    pinnedPluginNavItems = entries
+      .filter(entry => entry.pinned === true && typeof entry.route === 'string')
+      .map(entry => ({
+        id: `plugin:${entry.pluginId}:${entry.id}`,
+        href: entry.route,
+        label: entry.displayName || entry.pluginId,
+        manage: true,
+        plugin: true,
+        icon: <><path d="M5.2 2.2h5.6v3.1l1.7 1.7-1.4 1.4-1-1v6.4H5.9V7.4l-1 1L3.5 7l1.7-1.7z" /><path d="M8 13.8v1" /></>,
+      }));
+    renderShell();
+  } catch {
+    // The core navigation remains usable when plugin metadata is unavailable.
+  }
 }
 
 async function persistLocale(locale: DashboardLocale): Promise<void> {
@@ -566,8 +690,22 @@ async function checkUpdateBadge(): Promise<void> {
     const r = await fetch('/api/update/status');
     if (!r.ok) return;
     const j = await r.json();
-    updateBehind = j.behind === true;
-    latestVersion = updateBehind && j.latest ? String(j.latest) : null;
+    const runtime = Array.isArray(j.cliUpdates)
+      ? j.cliUpdates.find((entry: any) => entry?.updateAvailable === true && entry?.latest)
+      : null;
+    if (j.behind === true && j.latest) {
+      updateBehind = true;
+      updateBadgeKind = 'botmux';
+      latestVersion = String(j.latest);
+    } else if (runtime) {
+      updateBehind = true;
+      updateBadgeKind = 'codex';
+      latestVersion = String(runtime.latest);
+    } else {
+      updateBehind = false;
+      updateBadgeKind = null;
+      latestVersion = null;
+    }
     renderShell();
   } catch { /* best-effort */ }
 }
@@ -599,6 +737,9 @@ async function route(): Promise<void> {
   }
   if (hash.startsWith('#/v3')) {
     window.location.replace(`#/workflows${hash.slice('#/v3'.length)}`);
+    return;
+  } else if (hash.startsWith('#/legacy-workflow')) {
+    window.location.replace('#/workflows');
     return;
   } else if (/^#\/workflows(?:\/|-)catalog(?:[/?].*)?$/.test(hash)) {
     window.location.replace('#/workflows');
@@ -671,6 +812,8 @@ void (async () => {
 
   await loadAuthState();
   renderShell();
+  window.addEventListener(PLUGIN_PINS_CHANGED_EVENT, () => { void loadPinnedPluginNavItems(); });
+  void loadPinnedPluginNavItems();
   void checkUpdateBadge();
   initOwnerAvatar();
   try {

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   birthRun,
+  mintV3RunId,
   readGrillState,
   readRunChatBinding,
   writeGrillState,
@@ -39,17 +40,28 @@ describe('grill-state — birthRun', () => {
     }
   });
 
-  it('不给 runId 时生成 <slug>-<yymmdd-hhmm>；CJK goal slug 回退 run', () => {
+  it('不给 runId 时生成 <slug>-<精确时间>-<随机后缀>；CJK goal slug 回退 run', () => {
     const base = freshBase();
     try {
-      const now = new Date(2026, 5, 2, 9, 7); // 2026-06-02 09:07（本地）
-      const cjk = birthRun({ goal: '帮我调研竞品', baseDir: base, now });
-      expect(cjk.runId).toBe('run-260602-0907');
-      const en = birthRun({ goal: 'Research Competitors Now!!', baseDir: base, now });
-      expect(en.runId).toBe('research-competitors-now-260602-0907');
+      const now = new Date(2026, 5, 2, 9, 7, 8, 9); // 2026-06-02 09:07:08.009（本地）
+      const cjk = birthRun({ goal: '帮我调研竞品', baseDir: base, now, randomSuffix: 'a1b2c3d4' });
+      expect(cjk.runId).toBe('run-260602-090708-009-a1b2c3d4');
+      const en = birthRun({ goal: 'Research Competitors Now!!', baseDir: base, now, randomSuffix: 'e5f6a7b8' });
+      expect(en.runId).toBe('research-competitors-now-260602-090708-009-e5f6a7b8');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
+  });
+
+  it('同目标同一毫秒仍由短随机后缀区分，且保持可读前缀', () => {
+    const now = new Date(2026, 5, 2, 9, 7, 8, 9);
+    const first = mintV3RunId('帮我调研竞品', now, '11111111');
+    const second = mintV3RunId('帮我调研竞品', now, '22222222');
+    expect(first).toBe('run-260602-090708-009-11111111');
+    expect(second).toBe('run-260602-090708-009-22222222');
+    expect(first).not.toBe(second);
+    expect(first).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
+    expect(() => mintV3RunId('g', now, '../bad!!')).toThrow(/8 hexadecimal/);
   });
 });
 

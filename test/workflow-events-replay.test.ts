@@ -3,9 +3,9 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  EventLog,
-  type EventDraft,
-} from '../src/workflows/events/append.js';
+  FrozenV2EventLog,
+  type FrozenV2EventDraft as EventDraft,
+} from './helpers/frozen-v2-event-log.js';
 import {
   replay,
   type Snapshot,
@@ -21,11 +21,11 @@ const sampleOutputRef = {
 };
 
 let baseDir: string;
-let log: EventLog;
+let log: FrozenV2EventLog;
 
 beforeEach(() => {
   baseDir = mkdtempSync(join(tmpdir(), 'wf-replay-'));
-  log = new EventLog(RUN_ID, baseDir);
+  log = new FrozenV2EventLog(RUN_ID, baseDir);
 });
 afterEach(() => {
   rmSync(baseDir, { recursive: true, force: true });

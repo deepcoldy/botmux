@@ -3,20 +3,22 @@ import { describe, expect, it } from 'vitest';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 
 describe('dashboard i18n helpers', () => {
-  it('renders English workflow labels with interpolation', () => {
+  it('renders English v3 workflow labels with interpolation', () => {
     const t = createDashboardTranslator('en');
-    expect(t('nav.workflowCatalog')).toBe('Catalog');
-    expect(t('workflow.detail.approve')).toBe('Approve');
-    expect(t('catalog.run')).toBe('Run');
-    expect(t('workflow.list.loaded', { count: 2, time: '10:00:00' })).toBe('2 runs · refreshed 10:00:00');
+    expect(t('nav.workflows')).toBe('Workflows');
+    expect(t('workflow.v3.cancel')).toBe('Cancel run');
+    expect(t('workflow.v3.cancelConfirm', { runId: 'run-42' })).toBe(
+      'Cancel v3 workflow run run-42?\n\nCompleted nodes remain committed; running nodes will be interrupted.',
+    );
   });
 
-  it('renders Chinese workflow labels with interpolation', () => {
+  it('renders Chinese v3 workflow labels with interpolation', () => {
     const t = createDashboardTranslator('zh');
-    expect(t('nav.workflowCatalog')).toBe('目录');
-    expect(t('workflow.detail.approve')).toBe('通过');
-    expect(t('catalog.run')).toBe('运行');
-    expect(t('workflow.list.loaded', { count: 2, time: '10:00:00' })).toBe('2 个运行 · 刷新于 10:00:00');
+    expect(t('nav.workflows')).toBe('工作流');
+    expect(t('workflow.v3.cancel')).toBe('取消运行');
+    expect(t('workflow.v3.cancelConfirm', { runId: 'run-42' })).toBe(
+      '确认取消 v3 工作流运行 run-42？\n\n已完成的节点会保留，运行中的节点会被中断。',
+    );
   });
 
   it('renders the memory (PSS) help as three structured lines in both locales', () => {

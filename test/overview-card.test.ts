@@ -21,7 +21,6 @@ import {
   OVERVIEW_ACTION_GOTO_SCHEDULES,
   OVERVIEW_ACTION_GOTO_SETTINGS,
   OVERVIEW_ACTION_GOTO_GROUPS,
-  OVERVIEW_ACTION_GOTO_WORKFLOWS,
 } from '../src/im/lark/overview-card.js';
 
 const INVOKER = 'ou_owner';
@@ -146,18 +145,7 @@ describe('buildOverviewCard', () => {
     expect(visible).toContain('📂 设置');
     expect(visible).toContain('🧑‍🤝‍🧑 群组');
     expect(visible).toContain('📂 群组');
-    expect(visible).toContain('🌀 工作流');
-    expect(visible).toContain('📂 工作流');
-    expect(visible).not.toContain('Workflows');
-  });
-
-  it('en overview keeps workflows labels in English', () => {
-    const json = buildOverviewCard(
-      { sessions: [], schedules: [], settings: makeSettings() },
-      { invokerOpenId: INVOKER, locale: 'en' as const },
-    );
-    expect(json).toContain('🌀 Workflows');
-    expect(json).toContain('📂 Workflows');
+    expect(visible).not.toContain('工作流');
   });
 
   // codex 2026-06-09 blocker: a paused task with lastStatus='error' must
@@ -223,9 +211,9 @@ describe('buildOverviewCard', () => {
     );
     const parsed = JSON.parse(json);
     const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
-    // 6 action rows: goto-sessions, goto-schedules, goto-settings,
-    // goto-groups, goto-workflows, footer refresh.
-    expect(actionRows.length).toBe(6);
+    // 5 action rows: goto-sessions, goto-schedules, goto-settings,
+    // goto-groups, footer refresh.
+    expect(actionRows.length).toBe(5);
     let buttonCount = 0;
     for (const row of actionRows) {
       for (const btn of (row.actions as any[])) {
@@ -234,7 +222,7 @@ describe('buildOverviewCard', () => {
       }
     }
     // Each action row has exactly one button in slice 1.
-    expect(buttonCount).toBe(6);
+    expect(buttonCount).toBe(5);
   });
 
   it('action.value carries action + invoker_open_id and NOTHING identity-like', () => {
@@ -254,7 +242,6 @@ describe('buildOverviewCard', () => {
     expect(json).toContain(OVERVIEW_ACTION_GOTO_SCHEDULES);
     expect(json).toContain(OVERVIEW_ACTION_GOTO_SETTINGS);
     expect(json).toContain(OVERVIEW_ACTION_GOTO_GROUPS);
-    expect(json).toContain(OVERVIEW_ACTION_GOTO_WORKFLOWS);
   });
 });
 
@@ -280,9 +267,6 @@ describe('handleOverviewCardAction', () => {
       }
       if (req.path === '/__daemon/groups-matrix' || req.path === '/__daemon/groups-matrix?scope=global') {
         return { status: 200, body: { chats: [], bots: [] }, raw: '' };
-      }
-      if (req.path === '/__daemon/workflows-runs-snapshot?all=1' || req.path === '/__daemon/workflows-runs-snapshot?all=1&scope=global') {
-        return { status: 200, body: { runs: [] }, raw: '' };
       }
       return { status: 404, body: {}, raw: '' };
     });

@@ -33,6 +33,9 @@ class DashboardUiState {
   // must not see a control whose endpoint they'd 401 on. Defaults true so a
   // transient probe failure never hides it from a real token holder.
   authed = true;
+  // Effective dashboard sharing policy. When enabled, tokenless visitors may
+  // read allow-listed dashboard data; it does not downgrade authenticated users.
+  publicReadOnly = false;
   private listeners = new Set<UiListener>();
   private translate = createDashboardTranslator(this.locale);
   private mediaQuery: MediaQueryList | null = null;

@@ -217,6 +217,35 @@ describe('session lifecycle hook helper', () => {
     // session.exit + second idle = 3 total calls
     expect(emitHookEventMock).toHaveBeenCalledTimes(3);
   });
+
+  it('fails closed for dedicated VC receivers while retaining exit dedupe cleanup', () => {
+    const ds = makeDs();
+
+    emitSessionStateTransitionHook(ds, 'working', 'idle', { source: 'ordinary' });
+    expect(emitHookEventMock).toHaveBeenCalledTimes(1);
+
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      memberId: 'member-1',
+      memberEpoch: 1,
+    };
+    emitSessionLifecycleHook(ds, 'session.requires_attention', {
+      reason: 'tui_prompt',
+      description: 'meeting-derived secret',
+    });
+    emitSessionStateTransitionHook(ds, 'working', 'idle', {
+      source: 'screen_update',
+      content: 'meeting transcript',
+    });
+    emitSessionLifecycleHook(ds, 'session.exit', { reason: 'exit_code_1' });
+    expect(emitHookEventMock).toHaveBeenCalledTimes(1);
+
+    // The suppressed receiver exit still pruned its old idle dedupe key.
+    ds.session.vcMeetingReceiver = undefined;
+    emitSessionStateTransitionHook(ds, 'working', 'idle', { source: 'ordinary-again' });
+    expect(emitHookEventMock).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('worker-pool lifecycle hook integration', () => {
@@ -286,6 +315,31 @@ describe('worker-pool lifecycle hook integration', () => {
     }));
   });
 
+  it('does not emit lifecycle hooks for receiver TUI, notifications, status, or exit', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, lastScreenStatus: 'working' });
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      memberId: 'member-1',
+      memberEpoch: 1,
+    };
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'tui_prompt',
+      description: 'Approve meeting action?',
+      options: [{ text: 'Yes', selected: false }],
+      multiSelect: false,
+    });
+    worker.emit('message', { type: 'user_notify', message: 'meeting-derived diagnostic' });
+    worker.emit('message', { type: 'screen_update', content: 'transcript', status: 'idle' });
+    worker.emit('exit', 1);
+    await flush();
+
+    expect(emitHookEventMock).not.toHaveBeenCalled();
+  });
+
   it('emits session.exit from worker process exit', () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker });
@@ -298,5 +352,36 @@ describe('worker-pool lifecycle hook integration', () => {
       reason: 'exit_code_1',
       code: 1,
     }));
+  });
+
+  it('forwards exact durable_expiry_ready evidence with worker generation', async () => {
+    const onDurableExpiryReady = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onDurableExpiryReady,
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'durable_expiry_ready',
+      sessionId: 'sid-lifecycle-test',
+      turnId: 'delivery-1',
+      dispatchAttempt: 3,
+      disposition: 'queued_removed',
+    });
+    await flush();
+
+    expect(onDurableExpiryReady).toHaveBeenCalledWith(ds, {
+      sessionId: 'sid-lifecycle-test',
+      turnId: 'delivery-1',
+      dispatchAttempt: 3,
+      workerGeneration: 1,
+      disposition: 'queued_removed',
+    });
   });
 });

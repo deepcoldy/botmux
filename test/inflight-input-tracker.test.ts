@@ -30,6 +30,17 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver()).toEqual([]);
   });
 
+  it('preserves the Codex App structured sidecar across a crash replay', () => {
+    const t = new InflightInputTracker();
+    const codexAppInput = {
+      text: 'clean',
+      additionalContext: { botmux_sender: { kind: 'untrusted' as const, value: 'Alice' } },
+    };
+    t.onWrite({ content: '<legacy />', turnId: 'om_1', codexAppInput });
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{ content: '<legacy />', turnId: 'om_1', codexAppInput }]);
+  });
+
   it('completed turn: idle clears in-flight, a later crash re-queues nothing', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('hello'));
@@ -37,6 +48,58 @@ describe('InflightInputTracker', () => {
 
     expect(t.onCliExit()).toBe(0);
     expect(t.takeCarryOver()).toEqual([]);
+  });
+
+  it('durable terminal clears the attempt before a later CLI exit can carry it over', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'meeting delivery', turnId: 'delivery-1', dispatchAttempt: 3 });
+
+    // worker emitTurnTerminal uses this same completion edge before releasing
+    // the durable arbiter back to the receiver-owned replay loop.
+    t.onTurnComplete();
+
+    expect(t.onCliExit()).toBe(0);
+    expect(t.takeCarryOver()).toEqual([]);
+  });
+
+  it('CLI exit leaves durable replay to the receiver while preserving ordinary carry-over', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'ordinary IM', turnId: 'im-1' });
+    t.onWrite({ content: 'meeting delivery', turnId: 'delivery-1', dispatchAttempt: 2 });
+
+    expect(t.onCliExit(item => item.dispatchAttempt === undefined)).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{ content: 'ordinary IM', turnId: 'im-1' }]);
+  });
+
+  it('preserves a clean explicit-IM envelope but leaves a clean durable replay to the receiver', () => {
+    const t = new InflightInputTracker();
+    const codexAppInput = { text: 'clean' };
+    const origin = {
+      listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member',
+      memberEpoch: 1, agentAppId: 'agent', ownerBootId: 'boot', ownerEpoch: 1,
+      membershipGeneration: 1, sinkOwnerGeneration: 1,
+      receiverSessionId: 'receiver', larkMessageId: 'im-clean',
+    };
+    t.onWrite({
+      content: '<legacy IM />',
+      turnId: 'im-clean',
+      vcMeetingImTurnOrigin: origin,
+      codexAppInput,
+    });
+    t.onWrite({
+      content: '<legacy delivery />',
+      turnId: 'delivery-clean',
+      dispatchAttempt: 7,
+      codexAppInput,
+    });
+
+    expect(t.onCliExit(item => item.dispatchAttempt === undefined)).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{
+      content: '<legacy IM />',
+      turnId: 'im-clean',
+      vcMeetingImTurnOrigin: origin,
+      codexAppInput,
+    }]);
   });
 
   it('type-ahead: multiple writes before idle are all carried over in order', () => {

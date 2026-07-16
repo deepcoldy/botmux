@@ -1,10 +1,20 @@
 import { createRequire } from 'node:module';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { logger } from '../utils/logger.js';
 import { normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry } from '../setup/bot-config-editor.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
 import { validateCredentials, buildRemainingSteps, type CredentialValidation, type RemainingStep } from '../setup/verify-permissions.js';
+import { resolveSetupAppName } from '../setup/app-name.js';
 import {
   automateOpenPlatformSetup,
+  createFeishuOpenPlatformApp,
+  inspectCachedFeishuOpenPlatformSession,
+  type CreateFeishuOpenPlatformAppOptions,
+  type CreateFeishuOpenPlatformAppResult,
+  type FeishuOpenPlatformSessionInspectionResult,
+  type FeishuWebSessionIdentity,
   type OpenPlatformAutomationOptions,
   type OpenPlatformAutomationResult,
 } from '../setup/open-platform-automation.js';
@@ -20,9 +30,9 @@ export type BotOnboardingStatus =
   | 'starting'
   | 'waiting_for_scan'
   | 'verifying'
-  // bots.json 已写入, 正在自动配置开放平台权限 (导入 scope / redirect / 发版).
+  // 正在自动配置开放平台权限 (导入 scope / redirect / 发版).
   | 'configuring_permissions'
-  // 自动配置需要第二次扫码 (登录开放平台 Web 会话); 与建应用的 QR 不是同一个.
+  // 仅显式兼容模式可能需要第二次扫码；Feishu 主路径不会进入此状态.
   | 'waiting_for_platform_scan'
   // 扫码人身份无法被新 app 验证 → 不落盘空 allowedUsers 的开放 bot, 等用户在
   // Dashboard 手动填写并通过校验的 owner 后才进入 completed (fail-closed).
@@ -51,15 +61,17 @@ export interface BotOnboardingSnapshot {
   status: BotOnboardingStatus;
   createdAt: number;
   updatedAt: number;
-  // 建应用扫码 (第 1 个二维码)
+  // 建应用扫码（Feishu 主路径仅此一个二维码）
   qrUrl?: string;
   qrDataUrl?: string;
   expireAt?: number;
-  // 开放平台登录扫码 (第 2 个二维码, 自动配置权限用; 缓存命中则不出现)
+  // 显式兼容模式的开放平台登录扫码；主路径不会出现。
   platformQrDataUrl?: string;
   /** 自动配置进度文案 (来自 automation onStatus) */
   permissionStatusMsg?: string;
   appId?: string;
+  appName?: string;
+  registrationMode?: 'web' | 'compat';
   brand?: 'feishu' | 'lark';
   // 实际写入的 CLI / 工作目录, 供前端完成页回显
   cliId?: string;
@@ -82,6 +94,16 @@ export interface BotOnboardingSnapshot {
 
 /** 调用方 (dashboard) 已校验过的表单输入: CLI / 工作目录 / model. */
 export interface BotOnboardingInput {
+  /** 飞书应用名称；留空时按待追加的 bots.json 行号生成 botmux-N。 */
+  appName?: string;
+  /** 默认 Feishu 单码主路径；compat 是用户明确确认过的 SDK 兼容模式。 */
+  registrationMode?: 'web' | 'compat';
+  /**
+   * reuse: 使用表单已展示并确认的身份，缓存失效时不静默弹码；
+   * qr: 用户明确选择首次登录/更换账号，强制生成新二维码。
+   */
+  sessionMode?: 'reuse' | 'qr';
+  expectedIdentity?: Pick<FeishuWebSessionIdentity, 'userId' | 'tenantId'>;
   cliId?: CliId;
   /** 通用启动前缀（如 "aiden x claude"）；aiden×* 选项解析所得，普通 CLI 为空。 */
   wrapperCli?: string;
@@ -96,6 +118,8 @@ export interface BotOnboardingInput {
 }
 
 type RegisterAppFn = (opts?: RegisterAppOptions) => Promise<RegisterAppResult>;
+type CreateAppFn = (opts: CreateFeishuOpenPlatformAppOptions) => Promise<CreateFeishuOpenPlatformAppResult>;
+type InspectSessionFn = () => Promise<FeishuOpenPlatformSessionInspectionResult>;
 type ValidateCredentialsFn = (
   appId: string,
   appSecret: string,
@@ -105,6 +129,15 @@ type AutomateOpenPlatformFn = (opts: OpenPlatformAutomationOptions) => Promise<O
 
 export interface BotOnboardingManagerOptions {
   botsJsonPath: string;
+  /**
+   * needs_owner 的私有恢复文件。默认与 bots.json 同目录，权限固定 0600；仅用于
+   * Dashboard 进程重启后继续完成已经创建、但尚未写入 bots.json 的应用。
+   */
+  pendingStorePath?: string;
+  /** 单次 Feishu Web 登录建应用主路径；测试可注入。 */
+  createApp?: CreateAppFn;
+  inspectSession?: InspectSessionFn;
+  /** SDK device flow fallback；显式只注入 registerApp 时保留旧测试路径。 */
   registerApp?: RegisterAppFn;
   validateCredentials?: ValidateCredentialsFn;
   automateOpenPlatform?: AutomateOpenPlatformFn;
@@ -126,6 +159,20 @@ export interface BotOnboardingJob {
   id: string;
   done: Promise<void>;
 }
+
+interface PersistedPendingOnboardingJob {
+  snapshot: BotOnboardingSnapshot;
+  bot: Record<string, any>;
+}
+
+interface PersistedPendingOnboardingStore {
+  version: 1;
+  jobs: PersistedPendingOnboardingJob[];
+}
+
+export type BotOnboardingSessionStatus =
+  | { status: 'ready'; source: string; identity: FeishuWebSessionIdentity }
+  | { status: 'scan_required'; reason?: string };
 
 function svgEscape(value: string): string {
   return value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
@@ -163,20 +210,89 @@ export class BotOnboardingManager {
   // 避免在 owner 确认前就有一个空 allowlist 的可启动 bot 留在磁盘上（重启即 fail-open）。
   // 也不放进 jobs 快照（那个会序列化给前端、会泄漏 secret）。owner 校验通过后才 append。
   private readonly pendingBots = new Map<string, Record<string, any>>();
+  private readonly createApp?: CreateAppFn;
+  private readonly inspectSession: InspectSessionFn;
   private readonly registerApp: RegisterAppFn;
   private readonly validateCredentials: ValidateCredentialsFn;
   private readonly automateOpenPlatform: AutomateOpenPlatformFn;
   private readonly renderQrDataUrl: (url: string) => string;
   private readonly now: () => number;
   private readonly startBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
+  private readonly pendingStorePath: string;
 
   constructor(private readonly opts: BotOnboardingManagerOptions) {
+    // 生产默认走单次 Web session；旧单测/外部注入若只给 registerApp，则明确
+    // 视为要求直接测 SDK 路径，避免批量改写既有测试缝。
+    this.createApp = opts.createApp ?? (opts.registerApp ? undefined : createFeishuOpenPlatformApp);
+    this.inspectSession = opts.inspectSession ?? (() => inspectCachedFeishuOpenPlatformSession());
     this.registerApp = opts.registerApp ?? tryRegisterApp;
     this.validateCredentials = opts.validateCredentials ?? validateCredentials;
     this.automateOpenPlatform = opts.automateOpenPlatform ?? automateOpenPlatformSetup;
     this.renderQrDataUrl = opts.renderQrDataUrl ?? renderQrSvgDataUrl;
     this.now = opts.now ?? (() => Date.now());
     this.startBotLive = opts.startBotLive;
+    this.pendingStorePath = opts.pendingStorePath ?? `${opts.botsJsonPath}.onboarding-pending.json`;
+    this.restorePendingJobs();
+  }
+
+  /**
+   * 恢复 owner 待确认任务。凭证只存在 0600 私有文件和内存中，公开 job snapshot
+   * 仍不包含 secret；bot 也仍未进入 bots.json，因此重启不会把空 allowlist bot
+   * 启起来。若上次进程在写入 bots.json 后、清理恢复文件前退出，则把该 job 恢复
+   * 为 completed，避免前端得到 unknown_onboarding_job。
+   */
+  private restorePendingJobs(): void {
+    if (!existsSync(this.pendingStorePath)) return;
+    let parsed: PersistedPendingOnboardingStore;
+    try {
+      parsed = JSON.parse(readFileSync(this.pendingStorePath, 'utf-8')) as PersistedPendingOnboardingStore;
+    } catch {
+      return;
+    }
+    if (parsed?.version !== 1 || !Array.isArray(parsed.jobs)) return;
+
+    const persistedBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    for (const record of parsed.jobs) {
+      const snapshot = record?.snapshot;
+      const bot = record?.bot;
+      if (!snapshot || snapshot.status !== 'needs_owner' || typeof snapshot.id !== 'string') continue;
+      if (!bot || typeof bot.larkAppId !== 'string' || typeof bot.larkAppSecret !== 'string') continue;
+      if (snapshot.appId && snapshot.appId !== bot.larkAppId) continue;
+
+      const existingIndex = persistedBots.findIndex((entry: any) => entry?.larkAppId === bot.larkAppId);
+      if (existingIndex >= 0) {
+        this.jobs.set(snapshot.id, { ...snapshot, status: 'completed', addedBotIndex: existingIndex, updatedAt: this.now() });
+        continue;
+      }
+      this.jobs.set(snapshot.id, { ...snapshot });
+      this.pendingBots.set(snapshot.id, { ...bot });
+    }
+    // 丢弃损坏项，以及「bot 已落盘但恢复文件尚未来得及清理」的旧凭证。
+    this.savePendingJobs();
+  }
+
+  /** 原子保存所有 needs_owner 任务；文件不为空时始终是 0600。 */
+  private savePendingJobs(): void {
+    const jobs: PersistedPendingOnboardingJob[] = [];
+    for (const [id, bot] of this.pendingBots) {
+      const snapshot = this.jobs.get(id);
+      if (snapshot?.status === 'needs_owner') jobs.push({ snapshot: { ...snapshot }, bot: { ...bot } });
+    }
+    if (jobs.length === 0) {
+      try {
+        unlinkSync(this.pendingStorePath);
+      } catch (err: any) {
+        if (err?.code !== 'ENOENT') logger.warn(`[bot-onboarding] 无法清理 owner 待确认恢复文件: ${err?.message ?? String(err)}`);
+      }
+      return;
+    }
+    const store: PersistedPendingOnboardingStore = { version: 1, jobs };
+    try {
+      atomicWriteFileSync(this.pendingStorePath, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
+    } catch (err: any) {
+      // 保留内存态继续让当前页面完成；仅失去进程重启恢复能力，不把已创建应用误报失败。
+      logger.warn(`[bot-onboarding] 无法持久化 owner 待确认任务: ${err?.message ?? String(err)}`);
+    }
   }
 
   /**
@@ -213,6 +329,17 @@ export class BotOnboardingManager {
     return job ? { ...job } : undefined;
   }
 
+  suggestedAppName(): string {
+    return resolveSetupAppName(undefined, readBotsJsonOrEmpty(this.opts.botsJsonPath).length);
+  }
+
+  async sessionStatus(): Promise<BotOnboardingSessionStatus> {
+    const inspected = await this.inspectSession();
+    return inspected.ok
+      ? { status: 'ready', source: inspected.source, identity: inspected.identity }
+      : { status: 'scan_required', reason: inspected.reason };
+  }
+
   private patch(id: string, patch: Partial<BotOnboardingSnapshot>): void {
     const current = this.jobs.get(id);
     if (!current) return;
@@ -220,20 +347,55 @@ export class BotOnboardingManager {
   }
 
   private async run(id: string, input: BotOnboardingInput = {}): Promise<void> {
-    const result = await this.registerApp({
-      onQRCodeReady: info => {
-        this.patch(id, {
-          status: 'waiting_for_scan',
-          qrUrl: info.url,
-          qrDataUrl: this.renderQrDataUrl(info.url),
-          expireAt: this.now() + info.expireIn * 1000,
-        });
-      },
-      onStatusChange: info => {
-        if (info.status === 'slow_down') this.patch(id, { message: 'slow_down' });
-        if (info.status === 'domain_switched') this.patch(id, { message: 'domain_switched' });
-      },
+    // Freeze the resolved name before any asynchronous work. Later bot list
+    // changes must not make the name drift midway through onboarding.
+    const appName = resolveSetupAppName(input.appName, readBotsJsonOrEmpty(this.opts.botsJsonPath).length);
+    this.patch(id, {
+      registrationMode: input.registrationMode ?? 'web',
+      // SDK/Lark compatibility mode cannot apply a custom application name, so
+      // do not claim that the resolved Feishu name was used.
+      ...(input.registrationMode === 'compat' ? {} : { appName }),
     });
+
+    let result: RegisterAppResult;
+    if (input.registrationMode === 'compat' || !this.createApp) {
+      result = await this.registerWithSdk(id);
+    } else {
+      const created = await this.createApp({
+        name: appName,
+        ...(input.sessionMode === 'reuse'
+          ? { disableQrLogin: true, expectedIdentity: input.expectedIdentity }
+          : { forceQrLogin: true }),
+        disableBytedcliFallback: true,
+        onQrCode: info => {
+          this.patch(id, {
+            status: 'waiting_for_scan',
+            qrUrl: undefined,
+            qrDataUrl: this.renderQrDataUrl(info.qrPayload),
+            expireAt: this.now() + 120_000,
+          });
+        },
+        onStatus: message => {
+          this.patch(id, { message });
+        },
+      });
+      if (created.ok) {
+        result = created;
+      } else if (created.appId) {
+        this.patch(id, {
+          status: 'failed',
+          appId: created.appId,
+          error: created.reason,
+          message: `${created.message}；应用已经创建。为避免重复创建，本任务不会重试创建。可在开放平台读取 App Secret 后运行 botmux setup add --app-id ${created.appId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> --open-platform-auto 继续。`,
+        });
+        return;
+      } else {
+        // Never surprise the user with a second QR. The frontend may offer a
+        // clearly labelled compatibility action that starts a separate job.
+        this.patch(id, { status: 'failed', error: created.reason, message: created.message });
+        return;
+      }
+    }
 
     if (!result.ok) {
       this.patch(id, { status: 'failed', error: result.error, message: result.message });
@@ -241,7 +403,7 @@ export class BotOnboardingManager {
     }
     // brand (feishu / lark) 由扫码 tenant_brand 自动识别后落盘；daemon 链路
     // 全程从 BotConfig.brand 派生域名，feishu / lark 都能直接跑。
-    this.patch(id, { status: 'verifying', appId: result.appId, brand: result.brand });
+    this.patch(id, { status: 'verifying', appId: result.appId, brand: result.brand, message: undefined });
     const validation = await this.validateCredentials(result.appId, result.appSecret, result.brand);
     if (!validation.ok) {
       this.patch(id, {
@@ -283,7 +445,11 @@ export class BotOnboardingManager {
     // 只有「能确认 owner」时才落盘——见下方两条路径。
 
     // 跑 setup 同款开放平台自动配置 (导入权限 / 配 redirect / 建并发版)。
-    const auto = await this.runPermissionAutomation(id, result.appId, result.brand, { cliId, workingDir });
+    const auto = await this.runPermissionAutomation(id, result.appId, result.brand, {
+      cliId,
+      workingDir,
+      registrationMode: input.registrationMode ?? 'web',
+    });
 
     // 关键顺序：先确认 owner, 再决定是否落盘 + 终态。completed 必须意味着「bots.json
     // 里这个 bot 带着至少一个 owner」, 绝不产出空 allowedUsers 的可启动 bot。
@@ -303,7 +469,25 @@ export class BotOnboardingManager {
       // owner 没法自动确认：bot 先不落盘, 暂存内存等用户手动填 owner 校验通过后再写。
       this.pendingBots.set(id, bot);
       this.finalizePermissions(id, result.appId, result.brand, undefined, auto, 'needs_owner');
+      this.savePendingJobs();
     }
+  }
+
+  private async registerWithSdk(id: string): Promise<RegisterAppResult> {
+    return this.registerApp({
+      onQRCodeReady: info => {
+        this.patch(id, {
+          status: 'waiting_for_scan',
+          qrUrl: info.url,
+          qrDataUrl: this.renderQrDataUrl(info.url),
+          expireAt: this.now() + info.expireIn * 1000,
+        });
+      },
+      onStatusChange: info => {
+        if (info.status === 'slow_down') this.patch(id, { message: 'slow_down' });
+        if (info.status === 'domain_switched') this.patch(id, { message: 'domain_switched' });
+      },
+    });
   }
 
   /** 把 bot append/更新进 bots.json（按 larkAppId upsert, 幂等），返回它的行号。 */
@@ -362,6 +546,7 @@ export class BotOnboardingManager {
     this.pendingBots.delete(id);
     await this.runLiveStart(id, appId);
     this.patch(id, { status: 'completed', addedBotIndex });
+    this.savePendingJobs();
     return { ok: true };
   }
 
@@ -374,7 +559,7 @@ export class BotOnboardingManager {
     id: string,
     appId: string,
     brand: 'feishu' | 'lark',
-    meta: { cliId: string; workingDir: string },
+    meta: { cliId: string; workingDir: string; registrationMode: 'web' | 'compat' },
   ): Promise<OpenPlatformAutomationResult> {
     this.patch(id, {
       status: 'configuring_permissions',
@@ -387,6 +572,11 @@ export class BotOnboardingManager {
       return await this.automateOpenPlatform({
         appId,
         brand,
+        // The Feishu primary path must never surprise the user with a second
+        // QR. It reuses the session created moments earlier or falls back to
+        // manual recovery. Only explicit compatibility mode may scan again.
+        disableQrLogin: meta.registrationMode === 'web',
+        disableBytedcliFallback: meta.registrationMode === 'web',
         onQrCode: info => {
           this.patch(id, {
             status: 'waiting_for_platform_scan',

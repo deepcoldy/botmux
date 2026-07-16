@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/card-builder.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
@@ -22,7 +22,8 @@ import {
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
-import { globalConfigPath } from '../src/global-config.js';
+import { LOCAL_CLI_IDS } from '../src/services/local-cli-opener.js';
+import { globalConfigPath, mergeDashboardConfig } from '../src/global-config.js';
 
 // The terminal button's URL wrapping now depends on the global dashboard
 // setting `openTerminalInFeishu` (read via readGlobalConfig at build time):
@@ -30,17 +31,15 @@ import { globalConfigPath } from '../src/global-config.js';
 // empty temp dir so these tests see the DEFAULT (no config.json → direct),
 // independent of whatever the test runner's real ~/.botmux/config.json holds.
 let cardTestHome: string;
+let platformSpy: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
   cardTestHome = mkdtempSync(join(tmpdir(), 'botmux-card-builder-'));
   vi.stubEnv('HOME', cardTestHome);
-  // The local-CLI button is currently hard-hidden (HIDE_OPEN_LOCAL_CLI_BUTTON),
-  // so its assertions no longer depend on localTerminalCapable(). Keep pinning a
-  // GUI-looking env anyway so the button-present assertions stay deterministic
-  // once the button is re-enabled.
-  vi.stubEnv('DISPLAY', ':0');
+  platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
   mkdirSync(dirname(globalConfigPath()), { recursive: true });
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   rmSync(cardTestHome, { recursive: true, force: true });
 });
@@ -87,7 +86,12 @@ function expectDirectUrl(actual: string, targetUrl: string): void {
 
 /** Opt into the Feishu sidebar wrapper for the current (isolated) HOME. */
 function enableOpenTerminalInFeishu(): void {
-  writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { openTerminalInFeishu: true } }));
+  mergeDashboardConfig({ openTerminalInFeishu: true });
+}
+
+/** Explicitly opt in to native CLI opening for the isolated desktop host. */
+function enableLocalCliOpen(): void {
+  mergeDashboardConfig({ enableLocalCliOpen: true });
 }
 
 // ─── getCliDisplayName ────────────────────────────────────────────────────
@@ -131,6 +135,10 @@ describe('getCliDisplayName', () => {
 
   it('should return "Pi" for pi', () => {
     expect(getCliDisplayName('pi')).toBe('Pi');
+  });
+
+  it('should return "Kiro" for kiro-cli', () => {
+    expect(getCliDisplayName('kiro-cli')).toBe('Kiro');
   });
 });
 
@@ -216,6 +224,20 @@ describe('buildSessionCard', () => {
   // ── Group card (showManageButtons = false / undefined) ─────────────────
 
   describe('group card (showManageButtons=false)', () => {
+    it('keeps native CLI opening hidden by default', () => {
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en'));
+      const actions = findActions(card);
+      expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
+    });
+
+    it('keeps native CLI opening hidden on Linux even when explicitly enabled', () => {
+      enableLocalCliOpen();
+      platformSpy.mockReturnValue('linux');
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en'));
+      const actions = findActions(card);
+      expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
+    });
+
     it('should have terminal button with primary type and multi_url', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));
       const actions = findActions(card);
@@ -249,16 +271,61 @@ describe('buildSessionCard', () => {
       expect(linkBtn.value.session_id).toBe(SID);
     });
 
-    // 「💻 打开 <CLI>」本机直开按钮当前经 card-builder 的 HIDE_OPEN_LOCAL_CLI_BUTTON
-    // 硬隐藏（打磨好前不放出来——会破坏飞书对话连续性），在所有平台、所有 CLI 都不再渲染。
-    // 重新启用时把这条改回「按钮存在 + 标签『打开 Codex』、codex-app 去掉 App 后缀」，
-    // 并恢复 headless-host 隐藏用例（localTerminalCapable() 的单元覆盖仍在
-    // local-terminal-opener.test.ts）。
-    it('hides the local-CLI open button on every host while HIDE_OPEN_LOCAL_CLI_BUTTON is set', () => {
-      for (const cli of ['codex', 'codex-app', undefined] as const) {
+    it('includes Open Codex beside Web Terminal for codex sessions only', () => {
+      enableLocalCliOpen();
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en', true));
+      const actions = findActions(card);
+      expect(actions[0].text.content).toBe('🖥️ Open Web Terminal');
+      expect(actions[1].text.content).toBe('Open Codex');
+      expect(actions[1].value).toMatchObject({
+        action: 'open_local_cli',
+        root_id: ROOT,
+        session_id: SID,
+        cli_id: 'codex',
+      });
+    });
+
+    it('includes Open TRAE beside Web Terminal for traex sessions', () => {
+      enableLocalCliOpen();
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'traex', false, false, 'en', true));
+      const actions = findActions(card);
+      expect(buttonTexts(actions)).toContain('Open TRAE');
+      expect(actions.find((a: any) => a.text.content === 'Open TRAE')?.value.action).toBe('open_local_cli');
+    });
+
+    it('shows native CLI opening only when local CLI readiness is true', () => {
+      enableLocalCliOpen();
+      const notReady = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en', false));
+      const ready = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en', true));
+
+      expect(findActions(notReady).some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
+      expect(findActions(ready).some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
+    });
+
+    it('includes a local-CLI open button for every adapter with a portable resume command', () => {
+      enableLocalCliOpen();
+      for (const cli of LOCAL_CLI_IDS) {
+        const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli, false, false, undefined, true));
+        const actions = findActions(card);
+        expect(actions.find((a: any) => a.value?.action === 'open_local_cli')?.value.cli_id).toBe(cli);
+      }
+    });
+
+    it('can include local attach buttons for non-resume CLIs when mode-aware readiness is true', () => {
+      enableLocalCliOpen();
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', false, false, 'en', true));
+      const actions = findActions(card);
+      const btn = actions.find((a: any) => a.value?.action === 'open_local_cli');
+      expect(btn?.value.cli_id).toBe('gemini');
+      expect(btn?.text.content).toBe('💻 Open Gemini');
+    });
+
+    it('does not include local-CLI open buttons when precise local resume is unavailable', () => {
+      enableLocalCliOpen();
+      for (const cli of ['codex-app', 'gemini', 'mira', 'mir', undefined] as const) {
         const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli));
         const actions = findActions(card);
-        expect(actions.some((a: any) => a.value?.action === 'open_local_terminal')).toBe(false);
+        expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
       }
     });
 
@@ -280,11 +347,18 @@ describe('buildSessionCard', () => {
       expect(closeBtn.value.session_id).toBe(SID);
     });
 
-    // local-terminal 按钮已隐藏（见上），故为 3：terminal + get_write_link + close
     it('should have exactly 3 buttons (terminal, get_write_link, close)', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));
       const actions = findActions(card);
       expect(actions).toHaveLength(3);
+    });
+
+    it('should have exactly 4 buttons for codex (terminal, Open Codex, get_write_link, close)', () => {
+      enableLocalCliOpen();
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, undefined, true));
+      const actions = findActions(card);
+      expect(actions).toHaveLength(4);
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['url', 'open_local_cli', 'get_write_link', 'close']);
     });
   });
 
@@ -321,11 +395,18 @@ describe('buildSessionCard', () => {
       expect(closeBtn).toBeDefined();
     });
 
-    // local-terminal 按钮已隐藏（见上），故为 3：terminal + restart + close
     it('should have exactly 3 buttons (terminal, restart, close)', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, undefined, true));
       const actions = findActions(card);
       expect(actions).toHaveLength(3);
+    });
+
+    it('does not include Open Codex in codex DM management cards', () => {
+      enableLocalCliOpen();
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', true, false, 'en'));
+      const actions = findActions(card);
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['url', 'restart', 'close']);
+      expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
     });
   });
 
@@ -617,11 +698,28 @@ describe('buildStreamingCard', () => {
       expect(closeBtn.type).toBe('danger');
     });
 
-    // local-terminal 按钮已隐藏（见上），故为 4：toggle + terminal + get_write_link + close
     it('should have exactly 4 buttons (toggle, terminal, get_write_link, close)', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       const actions = findActions(card);
       expect(actions).toHaveLength(4);
+    });
+
+    it('should include Open TRAE beside Web Terminal for traex streaming cards', () => {
+      enableLocalCliOpen();
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, true));
+      const actions = findActions(card);
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'close']);
+      expect(actions[2].text.content).toBe('Open TRAE');
+      expect(actions[2].value.cli_id).toBe('traex');
+    });
+
+    it('shows streaming native CLI opening only when local CLI readiness is true', () => {
+      enableLocalCliOpen();
+      const notReady = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'codex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, false));
+      const ready = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'codex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, true));
+
+      expect(findActions(notReady).some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
+      expect(findActions(ready).some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
     });
   });
 
@@ -1274,11 +1372,10 @@ describe('buildPrivateSnapshotCard', () => {
       .flatMap((e: any) => e.actions ?? []);
   }
 
-  it('exposes open-terminal link, get_write_link, close — no local-terminal (hidden), no patch-driven controls', () => {
+  it('exposes open-terminal link, get_write_link, close for non-Codex/TRAE sessions, with no patch-driven controls', () => {
     const card = build({ screen: 'hello' });
     const btns = allButtons(card);
     const actions = btns.map((b: any) => b.value?.action).filter(Boolean);
-    // open_local_terminal 按钮已隐藏（HIDE_OPEN_LOCAL_CLI_BUTTON），不再出现
     expect(actions.sort()).toEqual(['close', 'get_write_link']);
     // open-terminal is a URL button (no callback action)
     const link = btns.find((b: any) => b.multi_url);
@@ -1290,6 +1387,24 @@ describe('buildPrivateSnapshotCard', () => {
     for (const bad of ['toggle_display', 'export_text', 'refresh_screenshot', 'term_action']) {
       expect(actions).not.toContain(bad);
     }
+  });
+
+  it('does not add Open Codex to private snapshots for codex sessions', () => {
+    enableLocalCliOpen();
+    const card = parse(buildPrivateSnapshotCard(
+      'https://t.example/ro',
+      'my session',
+      'idle',
+      'codex',
+      undefined,
+      'hello',
+      'sess-9',
+      'om_anchor',
+      'en',
+    ));
+    const btns = allButtons(card);
+    expect(btns.some((b: any) => b.value?.action === 'open_local_cli')).toBe(false);
+    expect(btns.map((b: any) => b.value?.action ?? 'url')).toEqual(['url', 'get_write_link', 'close']);
   });
 
   it('callback buttons carry root_id/session_id/cli_id for handler resolution', () => {

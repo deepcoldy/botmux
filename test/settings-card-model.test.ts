@@ -13,6 +13,7 @@ function makeSettings(overrides: Partial<DashboardSettingsInput> = {}): Dashboar
   return {
     publicReadOnly: false,
     openTerminalInFeishu: false,
+    enableLocalCliOpen: false,
     maintenance: {},
     localDevInstall: false,
     ...overrides,
@@ -24,7 +25,7 @@ describe('settings-card-model · composeSections', () => {
     const dto = composeSections(makeSettings());
     expect(dto.sections.map(s => s.key)).toEqual(['access', 'cards', 'maintenance']);
     expect(dto.sections[0].toggles.map(t => t.key)).toEqual(['publicReadOnly']);
-    expect(dto.sections[1].toggles.map(t => t.key)).toEqual(['openTerminalInFeishu']);
+    expect(dto.sections[1].toggles.map(t => t.key)).toEqual(['openTerminalInFeishu', 'enableLocalCliOpen']);
     expect(dto.sections[2].toggles.map(t => t.key)).toEqual(['autoUpdate', 'autoRestart']);
   });
 

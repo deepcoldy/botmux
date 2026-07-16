@@ -10,7 +10,6 @@ import { t, type Locale } from '../../i18n/index.js';
 export type DashboardModule =
   | 'overview'
   | 'sessions'
-  | 'workflows'
   | 'groups'
   | 'schedules'
   | 'settings';
@@ -18,7 +17,6 @@ export type DashboardModule =
 export const DASHBOARD_MODULES: ReadonlyArray<DashboardModule> = [
   'overview',
   'sessions',
-  'workflows',
   'groups',
   'schedules',
   'settings',

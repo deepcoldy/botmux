@@ -146,7 +146,10 @@ async function sendJson(method: string, url: string, body?: unknown): Promise<Js
 }
 
 function responseErrorText(res: JsonResponse): string {
-  return String(res.body?.error ?? res.status);
+  const reason = typeof res.body?.reason === 'string' ? res.body.reason : '';
+  const manual = typeof res.body?.manualCommand === 'string' ? res.body.manualCommand : '';
+  if (reason && manual) return `${reason}（${manual}）`;
+  return String(reason || res.body?.error || res.status);
 }
 
 function caughtErrorText(e: any): string {
@@ -247,6 +250,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     ...bot,
     disableStreamingCard: body.disableStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
+    codexAppCleanInput: body.codexAppCleanInput,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
     botToBotSameDir: body.botToBotSameDir,
@@ -495,7 +499,11 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
           <section className="bd-tile">
             <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} />
             <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
-            <SandboxSection bot={bot} patchBot={patchBot} />
+            {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
+            {bot.cliId !== 'riff' && <SandboxSection bot={bot} patchBot={patchBot} />}
+            {/* riff：backendType 与 CLI 选择 1:1 绑定（spawn 层强制配对），
+                手动切 pty/tmux 只会制造坏组合，隐藏该区块。 */}
+            {bot.cliId !== 'riff' && <BackendTypeSection bot={bot} patchBot={patchBot} />}
           </section>
           <section className="bd-tile">
             <RuntimeEnvironmentSection bot={bot} patchBot={patchBot} />
@@ -511,6 +519,7 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
           </section>
           <section className="bd-tile">
             <CardBehaviorSection bot={bot} putCardPref={putCardPref} />
+            <CodexAppDisplaySection bot={bot} putCardPref={putCardPref} />
             <SummaryTriggerSection bot={bot} patchBot={patchBot} />
             <BrandSection bot={bot} patchBot={patchBot} />
           </section>
@@ -827,7 +836,9 @@ export function BotAgentSection(props: {
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, { cliId: cliKey, model });
       if (res.ok && res.body.ok) {
-        setAgentStatus({ text: `✓ ${tr('botDefaults.agentSaved')}`, ok: true });
+        setAgentStatus(res.body.availabilityWarning
+          ? { text: `⚠️ ${res.body.availabilityWarning}` }
+          : { text: `✓ ${tr('botDefaults.agentSaved')}`, ok: true });
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
           wrapperCli: res.body.wrapperCli ?? null,
@@ -841,6 +852,34 @@ export function BotAgentSection(props: {
       setAgentStatus({ text: `✗ ${caughtErrorText(e)}` });
     } finally {
       setAgentBusy(false);
+    }
+  }
+
+  /**
+   * Persist the CLI selection as riff before saving riff config. Selecting
+   * riff in the dropdown hides the「保存 Agent」button (model/skill rows are
+   * replaced by RiffSection), so without this the cliId change would never
+   * reach PUT /agent — the bot would stay on its old CLI and backendType
+   * would never auto-flip to riff. Returns false when persisting failed.
+   */
+  async function persistRiffCliSelection(): Promise<boolean> {
+    if (bot.cliId === 'riff') return true; // already persisted
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, { cliId: 'riff', model: '' });
+      if (res.ok && res.body.ok) {
+        patchBot(bot.larkAppId, {
+          cliId: res.body.cliId,
+          wrapperCli: res.body.wrapperCli ?? null,
+          model: res.body.model ?? '',
+          agentSelectionKey: res.body.selectionKey ?? 'riff',
+        });
+        return true;
+      }
+      setAgentStatus({ text: `✗ ${responseErrorText(res)}` });
+      return false;
+    } catch (e: any) {
+      setAgentStatus({ text: `✗ ${caughtErrorText(e)}` });
+      return false;
     }
   }
 
@@ -866,7 +905,9 @@ export function BotAgentSection(props: {
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const cliOptions = cliState.options.map(option => ({
     value: option.id,
-    label: `${option.label}（${option.id}）`,
+    label: option.available === false
+      ? tr('botDefaults.agentMissingOption', { label: option.label, command: option.command ?? option.id })
+      : `${option.label}（${option.id}）`,
   }));
   const dynamicSkillOptions = [
     { value: 'dynamic', label: tr('botDefaults.skillInjectionDynamic') },
@@ -879,11 +920,13 @@ export function BotAgentSection(props: {
     { value: 'off', label: tr('botDefaults.skillInjectionOff') },
   ];
 
+  const isRiff = cliKey === 'riff';
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionAgent')}</h3>
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <span>{tr('botDefaults.agentCli')}</span>
           <DropdownField
             dataInput="agentCliId"
@@ -893,28 +936,36 @@ export function BotAgentSection(props: {
             options={cliOptions}
             onChange={updateCli}
           />
-        </label>
+          {option?.available === false ? (
+            <small className="hint-warn">
+              {tr('botDefaults.agentMissingHint', { command: option.command ?? cliKey })}
+            </small>
+          ) : null}
+        </div>
       </div>
-      <div className="bd-row">
-        <label>
-          <FieldTitle help={tr('botDefaults.agentHelp')}>{tr('botDefaults.agentModel')}</FieldTitle>
-          <input
-            type="text"
-            data-input="agentModel"
-            list={`agent-model-suggestions-${bot.larkAppId}`}
-            placeholder={modelPlaceholder}
-            value={model}
-            disabled={agentBusy || modelDisabledByCli}
-            onChange={event => setModel(event.currentTarget.value)}
-          />
-          <datalist id={`agent-model-suggestions-${bot.larkAppId}`}>
-            {suggestions.map(item => <option value={item} key={item} />)}
-          </datalist>
-        </label>
-      </div>
-      {siSupport === 'dynamic' ? (
+      {!isRiff && (
         <div className="bd-row">
           <label>
+            <FieldTitle help={tr('botDefaults.agentHelp')}>{tr('botDefaults.agentModel')}</FieldTitle>
+            <input
+              type="text"
+              data-input="agentModel"
+              list={`agent-model-suggestions-${bot.larkAppId}`}
+              placeholder={modelPlaceholder}
+              value={model}
+              disabled={agentBusy || modelDisabledByCli}
+              onChange={event => setModel(event.currentTarget.value)}
+            />
+            <datalist id={`agent-model-suggestions-${bot.larkAppId}`}>
+              {suggestions.map(item => <option value={item} key={item} />)}
+            </datalist>
+          </label>
+        </div>
+      )}
+      {isRiff && <RiffSection bot={bot} patchBot={patchBot} persistCliSelection={persistRiffCliSelection} />}
+      {!isRiff && siSupport === 'dynamic' ? (
+        <div className="bd-row">
+          <div className="bd-field">
             <FieldTitle help={tr('botDefaults.skillInjectionHelpDynamic')}>{tr('botDefaults.skillInjection')}</FieldTitle>
             <DropdownField
               dataInput="skillInjection"
@@ -924,11 +975,11 @@ export function BotAgentSection(props: {
               options={dynamicSkillOptions}
               onChange={() => undefined}
             />
-          </label>
+          </div>
         </div>
-      ) : siSupport === 'global' ? (
+      ) : !isRiff && siSupport === 'global' ? (
         <div className="bd-row">
-          <label>
+          <div className="bd-field">
             <FieldTitle help={tr('botDefaults.skillInjectionHelp')}>{tr('botDefaults.skillInjection')}</FieldTitle>
             <DropdownField
               dataInput="skillInjection"
@@ -938,16 +989,18 @@ export function BotAgentSection(props: {
               options={skillOptions}
               onChange={next => void saveSkillInjection(next)}
             />
-          </label>
+          </div>
           <div className="actions">
             <StatusSpan status={skillStatus} attr={{ 'data-skill-injection-status': '' }} />
           </div>
         </div>
       ) : null}
-      <div className="actions bd-section-actions">
-        <button type="button" className="primary" data-action="save-agent" disabled={agentBusy} onClick={() => void saveAgent()}>{tr('botDefaults.agentSave')}</button>
-        <StatusSpan status={agentStatus} attr={{ 'data-agent-status': '' }} />
-      </div>
+      {!isRiff && (
+        <div className="actions bd-section-actions">
+          <button type="button" className="primary" data-action="save-agent" disabled={agentBusy} onClick={() => void saveAgent()}>{tr('botDefaults.agentSave')}</button>
+          <StatusSpan status={agentStatus} attr={{ 'data-agent-status': '' }} />
+        </div>
+      )}
     </section>
   );
 }
@@ -1027,7 +1080,7 @@ function WorkingDirSection(props: {
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionWorkingDir')}</h3>
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <FieldTitle help={tr('botDefaults.workingDirModeHelp')}>{tr('botDefaults.workingDirMode')}</FieldTitle>
           <DropdownField
             dataInput="workingDirMode"
@@ -1037,7 +1090,7 @@ function WorkingDirSection(props: {
             options={modeOptions}
             onChange={next => setMode(next as 'off' | 'default' | 'oncall')}
           />
-        </label>
+        </div>
       </div>
       <div className="bd-row" data-wd-dir-row hidden={mode === 'off'}>
         <label>
@@ -1164,6 +1217,12 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     }
   }
 
+  // Read isolation rides the SAME toggle: it applies additionally wherever the
+  // CLI + platform can enforce it (claude/codex on macOS/Linux, no wrapper). Show a
+  // capability line so the owner sees whether THIS bot's sandbox also read-isolates
+  // (the "labelled separately" requirement) — best-effort: write protection always
+  // applies; read isolation only where supported.
+  const readIsoSupported = bot.readIsolationSupported === true;
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionSandbox')}</h3>
@@ -1175,8 +1234,75 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         help={tr('botDefaults.sandboxHelp')}
         onChange={checked => void toggle(checked)}
       />
+      <p className="bd-section-note" data-read-iso-capability={readIsoSupported ? 'yes' : 'no'}>
+        {readIsoSupported ? `＋ ${tr('botDefaults.sandboxReadIsoOn')}` : tr('botDefaults.sandboxReadIsoOff')}
+      </p>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-sandbox-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+const BACKEND_TYPE_OPTIONS: Array<{ value: string; labelKey: string }> = [
+  { value: '', labelKey: 'botDefaults.backendAuto' },
+  { value: 'tmux', labelKey: 'botDefaults.backendTmux' },
+  { value: 'herdr', labelKey: 'botDefaults.backendHerdr' },
+  { value: 'zellij', labelKey: 'botDefaults.backendZellij' },
+  { value: 'pty', labelKey: 'botDefaults.backendPty' },
+];
+
+function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const [value, setValue] = useState(typeof bot.backendType === 'string' ? bot.backendType : '');
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => setValue(typeof bot.backendType === 'string' ? bot.backendType : ''), [bot.backendType]);
+
+  const options = useMemo(() => BACKEND_TYPE_OPTIONS.map(o => ({ value: o.value, label: tr(o.labelKey) })), [tr]);
+
+  async function save(next: string): Promise<void> {
+    const prev = value;
+    setValue(next);
+    setStatus(null);
+    setBusy(true);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/backend-type`, { backendType: next });
+      if (res.ok && res.body.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.backendSaved')}`, ok: true });
+        patchBot(bot.larkAppId, { backendType: typeof res.body.backendType === 'string' ? res.body.backendType : null });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+        setValue(prev);  // revert optimistic selection
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+      setValue(prev);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionBackend')}</h3>
+      <div className="bd-row">
+        <div className="bd-field">
+          <FieldTitle help={tr('botDefaults.backendHelp')}>{tr('botDefaults.backendLabel')}</FieldTitle>
+          <DropdownField
+            dataInput="backendType"
+            ariaLabel={tr('botDefaults.backendLabel')}
+            value={value}
+            disabled={busy}
+            options={options}
+            onChange={next => void save(next)}
+          />
+        </div>
+        <div className="actions">
+          <StatusSpan status={status} attr={{ 'data-backend-status': '' }} />
+        </div>
       </div>
     </section>
   );
@@ -1444,6 +1570,54 @@ function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: Ca
   );
 }
 
+export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+  const tr = useT();
+  const [cleanInput, setCleanInput] = useState(props.bot.codexAppCleanInput === true);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => setCleanInput(props.bot.codexAppCleanInput === true), [props.bot.codexAppCleanInput]);
+
+  async function save(checked: boolean): Promise<void> {
+    const previous = cleanInput;
+    setCleanInput(checked);
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await props.putCardPref({ codexAppCleanInput: checked });
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setCleanInput(previous);
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setCleanInput(previous);
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section" data-codex-app-display>
+      <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAppDisplay')}</h3>
+      <ToggleRow
+        checked={cleanInput}
+        disabled={busy}
+        dataAction="toggle-codex-app-clean-input"
+        title={tr('botDefaults.codexAppCleanInput')}
+        help={tr('botDefaults.codexAppCleanInputHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <small className="bd-section-note">{tr('botDefaults.codexAppCleanInputCompat')}</small>
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-codex-app-clean-input-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
 function CrossBotSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const [sameDir, setSameDir] = useState(props.bot.botToBotSameDir !== false);
@@ -1642,7 +1816,7 @@ function SessionModeSection(props: {
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionSessionMode')}</h3>
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <FieldTitle help={tr('botDefaults.p2pHelp')}>{tr('botDefaults.p2pMode')}</FieldTitle>
           <DropdownField
             dataInput="p2pMode"
@@ -1652,11 +1826,11 @@ function SessionModeSection(props: {
             options={p2pOptions}
             onChange={next => void saveP2p(next)}
           />
-        </label>
+        </div>
         <div className="actions"><StatusSpan status={p2pStatus} attr={{ 'data-p2p-status': '' }} /></div>
       </div>
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <FieldTitle help={tr('botDefaults.regularGroupModeHelp')}>{tr('botDefaults.regularGroupMode')}</FieldTitle>
           <DropdownField
             dataInput="regularGroupMode"
@@ -1669,11 +1843,11 @@ function SessionModeSection(props: {
               void saveCardMode('regular', { regularGroupReplyMode: next }, setRegularStatus);
             }}
           />
-        </label>
+        </div>
         <div className="actions"><StatusSpan status={regularStatus} attr={{ 'data-regular-group-status': '' }} /></div>
       </div>
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <FieldTitle help={tr('botDefaults.mentionModeHelp')}>{tr('botDefaults.mentionMode')}</FieldTitle>
           <DropdownField
             dataInput="regularGroupMentionMode"
@@ -1686,11 +1860,11 @@ function SessionModeSection(props: {
               void saveCardMode('mention', { regularGroupMentionMode: next }, setMentionStatus);
             }}
           />
-        </label>
+        </div>
         <div className="actions"><StatusSpan status={mentionStatus} attr={{ 'data-mention-mode-status': '' }} /></div>
       </div>
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <FieldTitle help={tr('botDefaults.docSubscribeModeHelp')}>{tr('botDefaults.docSubscribeMode')}</FieldTitle>
           <DropdownField
             dataInput="docSubscribeDefaultMode"
@@ -1703,7 +1877,7 @@ function SessionModeSection(props: {
               void saveCardMode('doc', { docSubscribeDefaultMode: next }, setDocStatus);
             }}
           />
-        </label>
+        </div>
         <div className="actions"><StatusSpan status={docStatus} attr={{ 'data-doc-subscribe-mode-status': '' }} /></div>
       </div>
     </section>
@@ -1922,7 +2096,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         onChange={setEnabled}
       />
       <div className="bd-row">
-        <label>
+        <div className="bd-field">
           <FieldTitle>{tr('botDefaults.substituteDisclosure')}</FieldTitle>
           <DropdownField<'prefix' | 'none'>
             dataInput="substituteDisclosure"
@@ -1932,7 +2106,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
             options={disclosureOptions}
             onChange={value => setDisclosure(value)}
           />
-        </label>
+        </div>
       </div>
       <div className="bd-row">
         <label>
@@ -2308,6 +2482,140 @@ function EnvSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       <div className="actions">
         <button type="button" className="primary" data-action="save-env" disabled={busy} onClick={() => void save()}>{tr('botDefaults.envSave')}</button>
         <StatusSpan status={status} attr={{ 'data-env-status': '' }} />
+      </div>
+    </div>
+  );
+}
+
+/** Agents supported by the riff runner (free text still allowed for new ones). */
+const RIFF_AGENT_SUGGESTIONS = ['aiden', 'aiden-claude', 'codex', 'opencode'];
+
+function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCliSelection?: () => Promise<boolean> }) {
+  const tr = useT();
+  const riff = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
+  const [baseUrl, setBaseUrl] = useState(typeof riff.baseUrl === 'string' ? riff.baseUrl : '');
+  const [agent, setAgent] = useState(typeof riff.agent === 'string' ? riff.agent : '');
+  const [model, setModel] = useState(typeof riff.model === 'string' ? riff.model : '');
+  const [jwtEnv, setJwtEnv] = useState(typeof riff.jwtEnv === 'string' ? riff.jwtEnv : '');
+  const [sandboxCluster, setSandboxCluster] = useState(typeof riff.sandboxCluster === 'string' ? riff.sandboxCluster : '');
+  const [injectStatusLines, setInjectStatusLines] = useState(riff.injectStatusLines !== false);
+  const [systemPrompt, setSystemPrompt] = useState(typeof riff.systemPrompt === 'string' ? riff.systemPrompt : '');
+  const [setupCommands, setSetupCommands] = useState(
+    Array.isArray(riff.setupCommands) ? riff.setupCommands.join('\n') : '',
+  );
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const r = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
+    setBaseUrl(typeof r.baseUrl === 'string' ? r.baseUrl : '');
+    setAgent(typeof r.agent === 'string' ? r.agent : '');
+    setModel(typeof r.model === 'string' ? r.model : '');
+    setJwtEnv(typeof r.jwtEnv === 'string' ? r.jwtEnv : '');
+    setSandboxCluster(typeof r.sandboxCluster === 'string' ? r.sandboxCluster : '');
+    setInjectStatusLines(r.injectStatusLines !== false);
+    setSystemPrompt(typeof r.systemPrompt === 'string' ? r.systemPrompt : '');
+    setSetupCommands(Array.isArray(r.setupCommands) ? r.setupCommands.join('\n') : '');
+  }, [props.bot.riff]);
+
+  async function save(): Promise<void> {
+    setStatus(null);
+    setBusy(true);
+    try {
+      const config: Record<string, unknown> = {};
+      if (baseUrl.trim()) config.baseUrl = baseUrl.trim();
+      if (agent.trim()) config.agent = agent.trim();
+      if (model.trim()) config.model = model.trim();
+      if (jwtEnv.trim()) config.jwtEnv = jwtEnv.trim();
+      if (sandboxCluster.trim()) config.sandboxCluster = sandboxCluster.trim();
+      // 显式持久化布尔——省略字段时后端按“开启”解释（!== false），
+      // 只存 true 会导致该开关永远关不掉。
+      config.injectStatusLines = injectStatusLines;
+      if (systemPrompt.trim()) config.systemPrompt = systemPrompt.trim();
+      if (setupCommands.trim()) {
+        config.setupCommands = setupCommands.split('\n').map(s => s.trim()).filter(Boolean);
+      }
+      const json = Object.keys(config).length ? JSON.stringify(config) : '';
+      // Save order matters: riff config FIRST, agent switch AFTER. PUT /agent
+      // flips cliId/backendType AND closes CLI-mismatched sessions immediately,
+      // so doing it first would leave a half-configured riff bot (and killed
+      // sessions) when the /riff write fails. A saved-but-unused riff config
+      // from the reverse failure mode is harmless.
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/riff`, { riff: json });
+      if (res.ok && res.body.ok) {
+        const next = typeof res.body.riff === 'string' && res.body.riff ? JSON.parse(res.body.riff) : null;
+        props.patchBot(props.bot.larkAppId, { riff: next });
+        if (props.persistCliSelection && !(await props.persistCliSelection())) {
+          setStatus({ text: `✗ ${tr('botDefaults.riffCliPersistFailed')}` });
+          return;
+        }
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="bd-subsection">
+      <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.riffHelp')}>{tr('botDefaults.sectionRiff')}</FieldTitle></h4>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffBaseUrl')}</span>
+          <input type="text" data-input="riff-base-url" placeholder={tr('botDefaults.riffBaseUrlPlaceholder')} value={baseUrl} disabled={busy} onChange={e => setBaseUrl(e.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span><FieldTitle help={tr('botDefaults.riffAgentHelp')}>{tr('botDefaults.riffAgent')}</FieldTitle></span>
+          <input type="text" data-input="riff-agent" list={`riff-agent-suggestions-${props.bot.larkAppId}`} placeholder={tr('botDefaults.riffAgentPlaceholder')} value={agent} disabled={busy} onChange={e => setAgent(e.currentTarget.value)} />
+          <datalist id={`riff-agent-suggestions-${props.bot.larkAppId}`}>
+            {RIFF_AGENT_SUGGESTIONS.map(item => <option value={item} key={item} />)}
+          </datalist>
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span><FieldTitle help={tr('botDefaults.riffModelHelp')}>{tr('botDefaults.riffModel')}</FieldTitle></span>
+          <input type="text" data-input="riff-model" placeholder={tr('botDefaults.riffModelPlaceholder')} value={model} disabled={busy} onChange={e => setModel(e.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span><FieldTitle help={tr('botDefaults.riffJwtEnvHelp')}>{tr('botDefaults.riffJwtEnv')}</FieldTitle></span>
+          <input type="text" data-input="riff-jwt-env" placeholder={tr('botDefaults.riffJwtEnvPlaceholder')} value={jwtEnv} disabled={busy} onChange={e => setJwtEnv(e.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffSandboxCluster')}</span>
+          <input type="text" data-input="riff-sandbox-cluster" placeholder={tr('botDefaults.riffSandboxClusterPlaceholder')} value={sandboxCluster} disabled={busy} onChange={e => setSandboxCluster(e.currentTarget.value)} />
+        </label>
+      </div>
+      <label className="toggle-row">
+        <input type="checkbox" data-input="riff-inject-status-lines" checked={injectStatusLines} disabled={busy} onChange={e => setInjectStatusLines(e.currentTarget.checked)} />
+        <span className="switch" aria-hidden="true" />
+        <span className="toggle-tx"><strong><FieldTitle help={tr('botDefaults.riffInjectStatusLinesHelp')}>{tr('botDefaults.riffInjectStatusLines')}</FieldTitle></strong></span>
+      </label>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffSystemPrompt')}</span>
+          <textarea data-input="riff-system-prompt" placeholder={tr('botDefaults.riffSystemPromptPlaceholder')} value={systemPrompt} disabled={busy} onChange={e => setSystemPrompt(e.currentTarget.value)} rows={4} />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.riffSetupCommands')}</span>
+          <textarea data-input="riff-setup-commands" placeholder={tr('botDefaults.riffSetupCommandsPlaceholder')} value={setupCommands} disabled={busy} onChange={e => setSetupCommands(e.currentTarget.value)} rows={3} />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-riff" disabled={busy} onClick={() => void save()}>{tr('botDefaults.riffSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-riff-status': '' }} />
       </div>
     </div>
   );

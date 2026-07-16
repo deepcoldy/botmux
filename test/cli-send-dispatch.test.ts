@@ -53,6 +53,56 @@ describe('dispatchPrimaryMessage hook context wiring', () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  it('passes a stable provider uuid through the primary quote path', async () => {
+    const replyMessage = vi.fn(async () => 'om_reply');
+    await dispatchPrimaryMessage(
+      { replyMessage, sendMessage: vi.fn(async () => 'om_send') },
+      {
+        ...baseOptions,
+        quoteTargetId: 'om_quote',
+        uuid: 'vcp_stable_reply',
+        dispatch: vi.fn(async () => 'om_dispatch'),
+        content: '{"schema":"2.0"}',
+        msgType: 'interactive',
+      },
+    );
+    expect(replyMessage).toHaveBeenCalledWith(
+      'cli_app',
+      'om_quote',
+      '{"schema":"2.0"}',
+      'interactive',
+      false,
+      'vcp_stable_reply',
+      baseOptions.hookContext,
+    );
+  });
+
+  it('suppresses a second outbound hook during provider UUID reconciliation', async () => {
+    const replyMessage = vi.fn(async () => 'om_reply');
+    await dispatchPrimaryMessage(
+      { replyMessage, sendMessage: vi.fn(async () => 'om_send') },
+      {
+        ...baseOptions,
+        quoteTargetId: 'om_quote',
+        uuid: 'vcp_stable_reply',
+        suppressHook: true,
+        dispatch: vi.fn(async () => 'om_dispatch'),
+        content: 'canonical answer',
+        msgType: 'text',
+      },
+    );
+    expect(replyMessage).toHaveBeenCalledWith(
+      'cli_app',
+      'om_quote',
+      'canonical answer',
+      'text',
+      false,
+      'vcp_stable_reply',
+      baseOptions.hookContext,
+      { suppressHook: true },
+    );
+  });
+
   it('passes hookContext when withdrawn quote falls back to plain send', async () => {
     const replyMessage = vi.fn(async () => {
       throw new MessageWithdrawnError('withdrawn');
@@ -79,6 +129,31 @@ describe('dispatchPrimaryMessage hook context wiring', () => {
       undefined,
       baseOptions.hookContext,
     );
+  });
+
+  it('awaits authority revalidation before a withdrawn quote falls back', async () => {
+    const replyMessage = vi.fn(async () => {
+      throw new MessageWithdrawnError('withdrawn');
+    });
+    const sendMessage = vi.fn(async () => 'om_send');
+    const beforeQuoteFallback = vi.fn(async () => {
+      throw new Error('membership authority expired');
+    });
+
+    await expect(dispatchPrimaryMessage(
+      { replyMessage, sendMessage },
+      {
+        ...baseOptions,
+        quoteTargetId: 'om_quote',
+        dispatch: vi.fn(async () => 'om_dispatch'),
+        beforeQuoteFallback,
+        content: 'answer',
+        msgType: 'text',
+      },
+    )).rejects.toThrow('membership authority expired');
+
+    expect(beforeQuoteFallback).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 });
 
@@ -503,6 +578,44 @@ describe('sendVideoAttachments (best-effort media messages)', () => {
     expect(res.failed).toEqual([]);
     expect(res.sent[0]).toBe('primary:{"file_key":"file:/tmp/a.mp4","image_key":"image:/tmp/a.png","duration":0}');
     expect(res.sent[1]).toBe('plain:{"file_key":"file:/tmp/b.mp4","image_key":"image:/tmp/b.png","duration":0}');
+  });
+
+  it('fails a managed multi-video primary before any upload or dispatch', async () => {
+    const uploadFile = vi.fn(async () => 'file:key');
+    const uploadImage = vi.fn(async () => 'image:key');
+    const primaryDispatch = vi.fn(async () => 'om_primary');
+    const dispatch = vi.fn(async () => 'om_plain');
+
+    await expect(sendVideoAttachments(
+      { uploadFile, uploadImage, dispatch, primaryDispatch, maxMessages: 1 },
+      'cli_app',
+      [
+        { videoPath: '/tmp/a.mp4', coverPath: '/tmp/a.png', durationMs: 0 },
+        { videoPath: '/tmp/b.mp4', coverPath: '/tmp/b.png', durationMs: 0 },
+      ],
+    )).rejects.toThrow('受管 VC 回复一次最多发送 1 个视频');
+
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(uploadImage).not.toHaveBeenCalled();
+    expect(primaryDispatch).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('keeps one managed video on the primary provider-identity dispatch', async () => {
+    const uploadFile = vi.fn(async () => 'file:key');
+    const uploadImage = vi.fn(async () => 'image:key');
+    const primaryDispatch = vi.fn(async () => 'om_provider_keyed');
+    const dispatch = vi.fn(async () => 'om_unkeyed');
+
+    const result = await sendVideoAttachments(
+      { uploadFile, uploadImage, dispatch, primaryDispatch, maxMessages: 1 },
+      'cli_app',
+      [{ videoPath: '/tmp/a.mp4', coverPath: '/tmp/a.png', durationMs: 0 }],
+    );
+
+    expect(result).toMatchObject({ sent: ['om_provider_keyed'], failed: [] });
+    expect(primaryDispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).not.toHaveBeenCalled();
   });
 
   it('hands the primary (quote) slot to the next video when the first one fails to send', async () => {

@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
-import { buildSandboxArgs, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { buildSandboxArgs, buildRelayHostEnv, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, sandboxCredentialHidePaths, resolveUserReadonlyRoots, sandboxOverlayPaths, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
 
@@ -125,6 +125,22 @@ describe('buildSandboxArgs (overlay model)', () => {
     expect(skillIdx).toBeGreaterThan(maskIdx);
   });
 
+  it('re-opens the own private CLI home after its parent mask, then re-masks send credentials', () => {
+    const ownHome = '/custom/botmux/bots/app_self';
+    const sendCred = `${ownHome}/send-cred.json`;
+    const empty = '/data/sandboxes/s1/empties/mask-final';
+    const a = buildSandboxArgs(plan({
+      hideDirs: ['/custom/botmux'],
+      trustedWritableRoots: [ownHome],
+      finalHideFiles: [{ path: sendCred, empty }],
+    }));
+    const parentMaskIdx = a.indexOf('/custom/botmux');
+    const ownHomeIdx = tripleIdx(a, '--bind', ownHome, ownHome);
+    const sendCredIdx = tripleIdx(a, '--ro-bind', empty, sendCred);
+    expect(ownHomeIdx).toBeGreaterThan(parentMaskIdx);
+    expect(sendCredIdx).toBeGreaterThan(ownHomeIdx);
+  });
+
   it('no clone/scrub artefacts: never binds a per-session clone "work" dir', () => {
     const a = buildSandboxArgs(plan());
     // The old model bound a `git clone` "work" dir; the overlay model never does
@@ -159,6 +175,22 @@ describe('resolveSandboxMountPath', () => {
     expect(resolveSandboxMountPath(linkHome)).toBe(realpathSync(realHome));
 
     rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('sandboxOverlayPaths', () => {
+  it('keeps host-side merged mounts outside the HOME-backed data tree', () => {
+    const paths = sandboxOverlayPaths('/home/u/.botmux/data', 's1');
+    expect(paths.projectMerged).toBe('/var/tmp/botmux-sbx/s1/proj-merged');
+    expect(paths.homeMerged).toBe('/var/tmp/botmux-sbx/s1/home-merged');
+    expect(paths.projectMerged.startsWith('/home/u/')).toBe(false);
+    expect(paths.homeMerged.startsWith('/home/u/')).toBe(false);
+  });
+
+  it('retains the old in-data-dir paths for upgrade cleanup only', () => {
+    const paths = sandboxOverlayPaths('/home/u/.botmux/data', 's1');
+    expect(paths.legacyProjectMerged).toBe('/home/u/.botmux/data/sandboxes/s1/proj-merged');
+    expect(paths.legacyHomeMerged).toBe('/home/u/.botmux/data/sandboxes/s1/home-merged');
   });
 });
 
@@ -269,9 +301,28 @@ describe('codex-app sandboxExtraExecPaths', () => {
 // blocker: only plain outbox basenames + allowlisted flags pass; raw argv /
 // path flags / sandbox-chosen session-id are rejected.
 describe('validateRelayRequest', () => {
+  it('forces host-relayed cards to use probe-free lexical link repair', () => {
+    expect(buildRelayHostEnv({
+      BOTMUX_SEND_RELAY: '/sandbox/outbox',
+      BOTMUX_CARD_LOCAL_LINK_MODE: 'filesystem',
+      KEEP_ME: 'yes',
+    })).toMatchObject({
+      BOTMUX_CARD_LOCAL_LINK_MODE: 'lexical',
+      KEEP_ME: 'yes',
+    });
+    expect(buildRelayHostEnv({ BOTMUX_SEND_RELAY: '/sandbox/outbox' }))
+      .not.toHaveProperty('BOTMUX_SEND_RELAY');
+
+    expect(buildRelayHostEnv({}, '/private/staging/prepared.md')).toMatchObject({
+      BOTMUX_CARD_LOCAL_LINK_MODE: 'disabled',
+      BOTMUX_CARD_PREPARED_CONTENT_FILE: '/private/staging/prepared.md',
+    });
+  });
+
   it('accepts plain basenames + allowlisted presentation flags', () => {
     const r = validateRelayRequest({
       contentFile: 'c.content',
+      preparedContentFile: 'c.card-content',
       attachments: ['a.png'],
       videos: ['replay.mp4'],
       videoCovers: ['cover.png'],
@@ -280,6 +331,7 @@ describe('validateRelayRequest', () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.value.contentName).toBe('c.content');
+    expect(r.value.preparedContentName).toBe('c.card-content');
     expect(r.value.attachmentNames).toEqual(['a.png']);
     expect(r.value.videoNames).toEqual(['replay.mp4']);
     expect(r.value.videoCoverNames).toEqual(['cover.png']);
@@ -299,6 +351,25 @@ describe('validateRelayRequest', () => {
     expect(r.value.flags).toEqual(['--no-mention']);
   });
 
+  it('validates and preserves a frozen relay origin', () => {
+    const r = validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--no-mention'],
+      originTurnId: 'delivery-key',
+      originDispatchAttempt: 3,
+    });
+    expect(r).toMatchObject({
+      ok: true,
+      value: { originTurnId: 'delivery-key', originDispatchAttempt: 3 },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content', originDispatchAttempt: 1,
+    })).toMatchObject({ ok: false });
+    expect(validateRelayRequest({
+      contentFile: 'c.content', originTurnId: 'delivery-key', originDispatchAttempt: 0,
+    })).toMatchObject({ ok: false });
+  });
+
   it('rejects the raw-hostArgs exploit (path-bearing flag not allowlisted)', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--content-file', '/root/.botmux/bots.json'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--files', '/root/.ssh/id_rsa'] }).ok).toBe(false);
@@ -309,6 +380,13 @@ describe('validateRelayRequest', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--session-id', 'other'] }).ok).toBe(false);
   });
 
+  it('rejects sandbox-supplied --attention (receiver cannot emit an unledgered daemon hook)', () => {
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--attention'],
+    })).toMatchObject({ ok: false, error: 'flag not allowed: --attention' });
+  });
+
   it('rejects a value-taking flag whose value is itself a flag (--mention --session-id desync)', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--mention', '--session-id'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', flags: ['--quote', '--mention'] }).ok).toBe(false);
@@ -316,12 +394,41 @@ describe('validateRelayRequest', () => {
 
   it('rejects non-basename content / attachment names (../ traversal)', () => {
     expect(validateRelayRequest({ contentFile: '../../etc/passwd' }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', preparedContentFile: '../prepared' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', attachments: ['../secret'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', cardFile: '../card.json' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', videos: ['../secret.mp4'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', videoCovers: ['../cover.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'a/b' }).ok).toBe(false);
     expect(validateRelayRequest({ /* missing contentFile */ flags: [] }).ok).toBe(false);
+  });
+});
+
+describe('sandbox credential boundary', () => {
+  it('masks every direct botmux/Lark credential source so relay is the only send path', () => {
+    expect(sandboxCredentialHidePaths('/home/agent')).toEqual([
+      '/home/agent/.lark-cli',
+      '/home/agent/.lark-cli-bots',
+      '/home/agent/.botmux',
+    ].sort());
+  });
+
+  it('covers timestamped/future bots.json sidecars by masking their parent state root', () => {
+    const home = tmp();
+    mkdirSync(join(home, '.botmux'), { recursive: true });
+    writeFileSync(join(home, '.botmux', 'bots.json.bak-20260711'), '{}');
+    writeFileSync(join(home, '.botmux', 'bots.json.previous.json'), '{}');
+    const hidden = sandboxCredentialHidePaths(home);
+    expect(hidden).toContain(join(home, '.botmux'));
+  });
+
+  it('masks both the default and custom BOTMUX_HOME roots', () => {
+    expect(sandboxCredentialHidePaths('/home/agent', '/srv/botmux-runtime')).toEqual([
+      '/home/agent/.botmux',
+      '/home/agent/.lark-cli',
+      '/home/agent/.lark-cli-bots',
+      '/srv/botmux-runtime',
+    ].sort());
   });
 });
 
@@ -545,7 +652,12 @@ describe('sandbox landing from upper layer', () => {
     expect(readFileSync(join(target, 'b.txt'), 'utf8')).toBe('new b\n');
   });
 
-  it('a BRAND-NEW opaque dir is mkdir-only (does NOT rm -rf unrelated real files)', () => {
+  // Linux-only: this asserts overlay-landing (applySandboxDiff) behaviour, which
+  // only runs for the Linux bwrap sandbox — macOS uses a Seatbelt write-sandbox
+  // with no upper layer to land, so apply is never invoked there and its opaque-dir
+  // semantics (xattr-driven) don't hold off-Linux. The sibling landing tests are
+  // pure fs logic and stay cross-platform; only this apply-behaviour case is gated.
+  it.skipIf(process.platform !== 'linux')('a BRAND-NEW opaque dir is mkdir-only (does NOT rm -rf unrelated real files)', () => {
     // Regression #10: overlay marks BOTH new and replaced dirs opaque. apply must
     // only rm -rf an opaque dir that ALSO exists in the target; a purely-new dir
     // must not clobber concurrent real files that drifted under that path.

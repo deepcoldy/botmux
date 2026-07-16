@@ -829,15 +829,27 @@ function agentbuddyReinstallOpts(source: Extract<SkillSource, { type: 'agentbudd
 }
 
 export function removeInstalledSkill(name: string): { ok: true } | { ok: false; reason: string } {
+  const result = removeInstalledSkills([name]);
+  return result.ok ? { ok: true } : { ok: false, reason: result.reason };
+}
+
+export function removeInstalledSkills(names: readonly string[]):
+  | { ok: true; removed: string[] }
+  | { ok: false; reason: string; missing?: string[] } {
+  const uniqueNames = [...new Set(names.map(name => name.trim()).filter(Boolean))];
+  if (uniqueNames.length === 0) return { ok: false, reason: 'skills_required' };
   const registry = readSkillRegistry();
-  const pkg = registry.skills[name];
-  if (!pkg) return { ok: false, reason: 'skill_not_installed' };
-  delete registry.skills[name];
+  const missing = uniqueNames.filter(name => !registry.skills[name]);
+  if (missing.length > 0) return { ok: false, reason: 'skill_not_installed', missing };
+  const packages = uniqueNames.map(name => registry.skills[name]);
+  for (const name of uniqueNames) delete registry.skills[name];
   writeSkillRegistry(registry);
-  if (pkg.source.type !== 'local-link' && isStoreManagedRoot(pkg.rootDir)) {
-    rmSync(pkg.rootDir, { recursive: true, force: true });
+  for (const pkg of packages) {
+    if (pkg.source.type !== 'local-link' && isStoreManagedRoot(pkg.rootDir)) {
+      rmSync(pkg.rootDir, { recursive: true, force: true });
+    }
   }
-  return { ok: true };
+  return { ok: true, removed: uniqueNames };
 }
 
 function isStoreManagedRoot(rootDir: string): boolean {

@@ -151,6 +151,26 @@ describe('writeRunnerInput — tmux mode', () => {
     expect(textChunks.join('')).toBe(MARKER + encodeRunnerInput(content));
   });
 
+  it('keeps the legacy JSON shape exact unless a Codex App sidecar is explicitly provided', async () => {
+    const legacy = JSON.parse(Buffer.from(encodeRunnerInput('hello'), 'base64').toString('utf8'));
+    expect(legacy).toEqual({ type: 'message', content: 'hello' });
+
+    const encoded = encodeRunnerInput('legacy prompt', {
+      text: 'clean text',
+      additionalContext: { botmux_sender: { kind: 'untrusted', value: 'Alice' } },
+      clientUserMessageId: 'om_1',
+    });
+    expect(JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'))).toEqual({
+      type: 'message',
+      content: 'legacy prompt',
+      codexAppInput: {
+        text: 'clean text',
+        additionalContext: { botmux_sender: { kind: 'untrusted', value: 'Alice' } },
+        clientUserMessageId: 'om_1',
+      },
+    });
+  });
+
   it('reports submitted:false and flushes the partial when a chunk is dropped', async () => {
     const big = 'B'.repeat(15_000);
     const { pty, textChunks, enterCount } = fakeTmuxPty({ failTextAt: 2 });

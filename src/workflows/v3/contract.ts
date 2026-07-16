@@ -16,6 +16,7 @@
 
 import type { CliId } from '../../adapters/cli/types.js';
 import type { V3GoalNode } from './dag.js';
+import type { V3ArmedAttemptWorkerFence } from './worker-fence.js';
 
 // ─── Manifest (node product declaration) ───────────────────────────────────
 
@@ -183,18 +184,22 @@ export type GoalAnswer =
 // ─── Supported CLIs ─────────────────────────────────────────────────────────
 
 /**
- * v3 goal-mode is delivered via the native `/goal` command, which only Claude
- * Code, Codex, and Seed support (2026-06-01, Seed added
- * 2026-06-02).  We deliberately do NOT abstract goal delivery across every CLI
- * — instead the feature is scoped to the CLIs whose command mechanism can host
- * `/goal`.  Seed is a Claude Code-compatible CLI (binary `seed`): identical
- * flags, slash commands, and session layout — it
- * reuses the entire claude-family adapter, so `/goal`, paste-detection
- * avoidance, and the manifest watcher all behave exactly as on claude-code with
- * zero CLI-specific branching.  The runtime rejects a run whose nodes resolve
- * to any other CLI at start time.
+ * v3 goal-mode is delivered via the native `/goal` command.  Keep this list
+ * capability-based and explicit. Claude Code, Codex, Seed, and Traex have
+ * direct `/goal` execution evidence (Traex 0.200.16+ also needs its automation
+ * hook-trust flag). Relay is admitted from its exact Claude-family adapter and
+ * slash-command compatibility with Seed; a Relay-binary smoke remains pending
+ * on hosts where that binary is installed. The manifest watcher and goal env
+ * contract are CLI-neutral after dispatch. The runtime rejects a run whose
+ * nodes resolve to any other CLI at start time.
  */
-export const V3_SUPPORTED_CLIS: readonly CliId[] = ['claude-code', 'codex', 'seed'];
+export const V3_SUPPORTED_CLIS: readonly CliId[] = [
+  'claude-code',
+  'codex',
+  'seed',
+  'traex',
+  'relay',
+];
 
 export function isV3SupportedCli(cliId: CliId): boolean {
   return V3_SUPPORTED_CLIS.includes(cliId);
@@ -219,11 +224,6 @@ export interface BotSnapshot {
   cliId: CliId;
   cliPathOverride?: string;
   model?: string;
-  /** Frozen from the bot's `disableCliBypass` config — when true the CLI's
-   *  permission bypass stays OFF for every node of this run.  A node-level
-   *  `override.permissionMode:'restricted'` can additionally set this per
-   *  dispatch; nothing can clear it (no-escalation red line, P2). */
-  disableCliBypass?: boolean;
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
    *  these fields when spawning outside the main forkWorker path. */
   sandbox?: boolean;
@@ -258,6 +258,9 @@ export interface RunNodeRequest {
   outputDir: string;
   /** Already includes the GOAL_ENV keys; pool merges into the worker env. */
   env: Record<string, string>;
+  /** Durable pre-fork ownership record. The pool must activate this exact
+   * fence before it sends init, and may resolve only after outer `close`. */
+  workerFence?: V3ArmedAttemptWorkerFence;
   timeoutMs: number;
   cancelSignal?: AbortSignal;
   /** Called as soon as the worker web terminal is ready, before the node
@@ -275,7 +278,10 @@ export interface RunNodeResult {
   /** Process-level outcome.  Final node verdict = this AND manifest validation
    *  (runtime validates the manifest at `manifestPath` after `runNode`
    *  resolves — codex point 4: NOT v0.2 final_output semantics). */
-  status: 'ok' | 'fail';
+  status: 'ok' | 'fail' | 'cancelled';
+  /** Preserved AbortSignal.reason for a cancelled worker. The runtime treats
+   *  this as audit/control metadata only; it is never rendered to users. */
+  cancelReason?: unknown;
   /** Where the worker wrote its manifest (defaults to attemptDir/manifest.json
    *  but returned explicitly so the layout stays the pool's choice within
    *  attemptDir). */

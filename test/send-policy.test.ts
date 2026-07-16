@@ -1,5 +1,16 @@
-import { describe, it, expect } from 'vitest';
-import { resolveQuoteTarget, validateMentionDecision, parseAttentionFlag, attentionUsageError } from '../src/services/send-policy.js';
+import { describe, it, expect, vi } from 'vitest';
+import {
+  resolveQuoteTarget,
+  validateMentionDecision,
+  parseAttentionFlag,
+  attentionUsageError,
+  managedVcQuoteError,
+  managedVcCustomCardError,
+  managedVcSendControlError,
+  managedVcSendPayloadError,
+  containsLarkAtTag,
+  neutralizeLarkAtTags,
+} from '../src/services/send-policy.js';
 
 describe('resolveQuoteTarget', () => {
   const base = { isChatScope: true, sendTopLevel: false, noQuote: false };
@@ -27,6 +38,162 @@ describe('resolveQuoteTarget', () => {
 
   it('--top-level never quotes', () => {
     expect(resolveQuoteTarget({ ...base, sendTopLevel: true, sessionQuoteTargetId: 'om_a' })).toBeNull();
+  });
+});
+
+describe('managedVcQuoteError', () => {
+  it('rejects a durable cross-chat quote before any provider call', () => {
+    const providerCall = vi.fn();
+    const error = managedVcQuoteError({
+      managed: true,
+      durableDelivery: true,
+      explicitQuote: 'om_message_in_other_chat',
+    });
+    if (!error) providerCall();
+
+    expect(error).toMatch(/durable delivery/);
+    expect(providerCall).not.toHaveBeenCalled();
+  });
+
+  it('allows only the exact routed message for an explicit IM turn', () => {
+    expect(managedVcQuoteError({
+      managed: true,
+      durableDelivery: false,
+      explicitImMessageId: 'om_current',
+      explicitQuote: 'om_current',
+    })).toBeNull();
+    expect(managedVcQuoteError({
+      managed: true,
+      durableDelivery: false,
+      explicitImMessageId: 'om_current',
+      explicitQuote: 'om_other_chat',
+    })).toMatch(/精确路由/);
+  });
+
+  it('does not change ordinary-session quote behavior', () => {
+    expect(managedVcQuoteError({
+      managed: false,
+      durableDelivery: false,
+      explicitQuote: 'om_any',
+    })).toBeNull();
+  });
+});
+
+describe('managedVcCustomCardError', () => {
+  it('rejects custom card JSON before a managed VC provider call', () => {
+    const providerCall = vi.fn();
+    const error = managedVcCustomCardError(true, true);
+    if (!error) providerCall();
+
+    expect(error).toMatch(/card-json/);
+    expect(providerCall).not.toHaveBeenCalled();
+  });
+
+  it('keeps ordinary custom cards and botmux-owned managed cards available', () => {
+    expect(managedVcCustomCardError(false, true)).toBeNull();
+    expect(managedVcCustomCardError(true, false)).toBeNull();
+  });
+});
+
+describe('managedVcSendControlError', () => {
+  const safe = {
+    managed: true,
+    sendTopLevel: false,
+    attentionRequested: false,
+    explicitMentionCount: 0,
+    mentionBack: false,
+    noMention: true,
+  };
+
+  it('freezes routing and attention before a provider call', () => {
+    const providerCall = vi.fn();
+    for (const input of [
+      { ...safe, sendTopLevel: true },
+      { ...safe, overrideChatId: 'oc_other' },
+      { ...safe, sendInto: 'om_other' },
+      { ...safe, attentionRequested: true },
+    ]) {
+      const error = managedVcSendControlError(input);
+      if (!error) providerCall();
+      expect(error).toBeTruthy();
+    }
+    expect(providerCall).not.toHaveBeenCalled();
+  });
+
+  it('requires --no-mention and rejects both explicit mention forms', () => {
+    expect(managedVcSendControlError({ ...safe, noMention: false })).toMatch(/--no-mention/);
+    expect(managedVcSendControlError({ ...safe, explicitMentionCount: 1 })).toMatch(/--mention/);
+    expect(managedVcSendControlError({ ...safe, mentionBack: true })).toMatch(/--mention-back/);
+    expect(managedVcSendControlError(safe)).toBeNull();
+  });
+
+  it('does not change ordinary send controls', () => {
+    expect(managedVcSendControlError({
+      ...safe,
+      managed: false,
+      sendTopLevel: true,
+      attentionRequested: true,
+      explicitMentionCount: 1,
+      mentionBack: true,
+      noMention: false,
+    })).toBeNull();
+  });
+});
+
+describe('managedVcSendPayloadError', () => {
+  const safe = {
+    managed: true,
+    asVoice: false,
+    hasBodyText: true,
+    imageCount: 0,
+    fileCount: 0,
+    videoCount: 0,
+    containsNativeAtTag: false,
+  };
+
+  it('rejects every provider-upload shape before provider work', () => {
+    const providerCall = vi.fn();
+    for (const input of [
+      { ...safe, fileCount: 1 },
+      { ...safe, imageCount: 1 },
+      { ...safe, asVoice: true },
+      { ...safe, videoCount: 2, hasBodyText: false },
+      { ...safe, videoCount: 1 },
+      { ...safe, videoCount: 1, hasBodyText: false, imageCount: 1 },
+      { ...safe, videoCount: 1, asVoice: true },
+    ]) {
+      const error = managedVcSendPayloadError(input);
+      if (!error) providerCall();
+      expect(error).toBeTruthy();
+    }
+    expect(providerCall).not.toHaveBeenCalled();
+  });
+
+  it('allows only ordinary managed text cards', () => {
+    expect(managedVcSendPayloadError(safe)).toBeNull();
+  });
+
+  it('rejects native Lark at tags in managed card text', () => {
+    expect(containsLarkAtTag('hello <at id="ou_x"></at>')).toBe(true);
+    expect(containsLarkAtTag('hello <atlas>')).toBe(false);
+    expect(managedVcSendPayloadError({ ...safe, containsNativeAtTag: true })).toMatch(/<at/);
+  });
+
+  it('neutralizes native mention controls without changing ordinary text', () => {
+    expect(neutralizeLarkAtTags('hello <at id="ou_x">Alice</at>!'))
+      .toBe('hello ＜at id="ou_x">Alice＜/at＞!');
+    expect(containsLarkAtTag(neutralizeLarkAtTags('<AT>bot</AT>'))).toBe(false);
+    expect(neutralizeLarkAtTags('hello <atlas>')).toBe('hello <atlas>');
+  });
+
+  it('does not change ordinary attachment behavior', () => {
+    expect(managedVcSendPayloadError({
+      ...safe,
+      managed: false,
+      fileCount: 2,
+      videoCount: 3,
+      containsNativeAtTag: true,
+    })).toBeNull();
   });
 });
 

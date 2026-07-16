@@ -22,8 +22,25 @@
  * approveOptions / approvers are persisted for crash-safe card recovery.
  */
 
-import { writeFileSync, readFileSync, existsSync, mkdirSync, renameSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  readdirSync,
+  unlinkSync,
+} from 'node:fs';
+import { dirname, join } from 'node:path';
+import { withFileLockSync } from '../../utils/file-lock.js';
+import { fsyncDirectorySyncPortable, fsyncRegularFileSync } from '../../utils/fs-durability.js';
 import { DEFAULT_HUMAN_GATE_OPTIONS, type V3HumanGate } from './dag.js';
 import type { V3RuntimeDeps } from './runtime.js';
 
@@ -47,6 +64,8 @@ export interface GateWait {
   by?: string;
   /** The concrete option selected by the reviewer. */
   selected?: string;
+  /** Host-only: the exact frozen provider input this approval covers. */
+  hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string };
 }
 
 /** The concrete (non-optional) shape the runtime injects as `resolveGate`. */
@@ -62,13 +81,76 @@ export function waitPath(runDir: string, waitId: string): string {
   return join(waitsDir(runDir), `${waitId}.json`);
 }
 
+/** Host approvals are per frozen attempt, while ordinary gates remain per
+ * runtime instance. Including the attempt number prevents a safe pre-intent
+ * retry from reusing an already-resolved approval file. */
+export function v3GateWaitId(
+  nodeId: string,
+  instanceId?: string,
+  hostApproval?: { attemptId: string },
+): string {
+  const base = instanceId ?? nodeId;
+  if (!hostApproval) return `${base}-gate`;
+  const attempt = hostApproval.attemptId.slice(hostApproval.attemptId.lastIndexOf('/') + 1);
+  if (!/^\d{3}$/.test(attempt)) {
+    throw new Error(`v3 human-gate: invalid host attempt id ${JSON.stringify(hostApproval.attemptId)}`);
+  }
+  return `${base}-host-${attempt}-gate`;
+}
+
 /** Atomic JSON write (tmp + rename) so a crash never leaves a torn wait file. */
 function atomicWriteJson(path: string, value: unknown): void {
-  const dir = join(path, '..');
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, JSON.stringify(value, null, 2));
-  renameSync(tmp, path);
+  const dir = dirname(path);
+  const runDir = dirname(dir);
+  assertRealDirectory(runDir, 'run directory');
+  if (!existsSync(dir)) {
+    try { mkdirSync(dir, { mode: 0o700 }); } catch { /* race: assert below */ }
+  }
+  assertRealDirectory(dir, 'waits directory');
+  chmodSync(dir, 0o700);
+  if (existsSync(path)) assertPrivateRegularWaitFile(path, false);
+  const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(
+      tmp,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    writeFileSync(fd, JSON.stringify(value, null, 2), 'utf-8');
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    // Rename replaces a raced final symlink rather than following it, but an
+    // already-present one is an integrity signal and was rejected above.
+    renameSync(tmp, path);
+  } catch (err) {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* tolerate */ }
+    }
+    try { unlinkSync(tmp); } catch { /* tolerate */ }
+    throw err;
+  }
+  chmodSync(path, 0o600);
+  fsyncRegularFileSync(path);
+  fsyncDirectorySyncPortable(dir);
+}
+
+function assertRealDirectory(path: string, label: string): void {
+  const stat = lstatSync(path);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`v3 human-gate: ${label} must be a real directory`);
+  }
+}
+
+function assertPrivateRegularWaitFile(path: string, requirePrivate = true): void {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error('v3 human-gate: wait file must be a regular file');
+  }
+  if (requirePrivate && (stat.mode & 0o077) !== 0) {
+    throw new Error('v3 human-gate: host wait file must not be group/world accessible');
+  }
 }
 
 /** Write the initial `pending` wait file for a gate.  Overwrites any stale
@@ -76,7 +158,7 @@ function atomicWriteJson(path: string, value: unknown): void {
 export function writePendingWait(
   runDir: string,
   input: { waitId: string; nodeId: string; prompt: string } &
-    Partial<Pick<GateWait, 'options' | 'approveOptions' | 'approvers' | 'instanceId'>>,
+    Partial<Pick<GateWait, 'options' | 'approveOptions' | 'approvers' | 'instanceId' | 'hostApproval'>>,
 ): GateWait {
   const options = input.options ?? [...DEFAULT_HUMAN_GATE_OPTIONS];
   const approveOptions = input.approveOptions ?? (options.includes('approve') ? ['approve'] : [options[0]!]);
@@ -88,6 +170,7 @@ export function writePendingWait(
     options,
     approveOptions,
     approvers: input.approvers ?? [],
+    ...(input.hostApproval ? { hostApproval: input.hostApproval } : {}),
     status: 'pending',
     createdAt: Date.now(),
   };
@@ -98,8 +181,17 @@ export function writePendingWait(
 /** Read a single wait file, or `undefined` if it doesn't exist. */
 export function readWait(runDir: string, waitId: string): GateWait | undefined {
   const path = waitPath(runDir, waitId);
+  if (existsSync(waitsDir(runDir))) assertRealDirectory(waitsDir(runDir), 'waits directory');
   if (!existsSync(path)) return undefined;
-  return normalizeWaitFile(JSON.parse(readFileSync(path, 'utf-8')) as Partial<GateWait>);
+  const pathStat = lstatSync(path);
+  if (!pathStat.isFile() || pathStat.isSymbolicLink()) {
+    throw new Error('v3 human-gate: wait file must be a regular file');
+  }
+  const wait = normalizeWaitFile(JSON.parse(readFileSync(path, 'utf-8')) as Partial<GateWait>);
+  if (wait.hostApproval && (pathStat.mode & 0o077) !== 0) {
+    throw new Error('v3 human-gate: host wait file must not be group/world accessible');
+  }
+  return wait;
 }
 
 /** Transition a wait to approved / rejected.  Throws if the wait is missing
@@ -111,11 +203,43 @@ export function resolveWait(
   by: string,
   selected?: string,
 ): GateWait {
-  const existing = readWait(runDir, waitId);
-  if (!existing) throw new Error(`v3 human-gate: no pending wait "${waitId}" in ${runDir}`);
-  const resolved: GateWait = { ...existing, status: resolution, resolvedAt: Date.now(), by, selected };
-  atomicWriteJson(waitPath(runDir, waitId), resolved);
-  return resolved;
+  const outcome = resolveWaitOnce(runDir, waitId, resolution, by, selected);
+  if (!outcome.changed) {
+    throw new Error(
+      `v3 human-gate: wait "${waitId}" is already ${outcome.wait.status}; first resolution wins`,
+    );
+  }
+  return outcome.wait;
+}
+
+/** Cross-process compare-and-set for a pending wait. Exactly one resolver may
+ *  transition it; every later contradictory click observes the first result. */
+export function resolveWaitOnce(
+  runDir: string,
+  waitId: string,
+  resolution: 'approved' | 'rejected',
+  by: string,
+  selected?: string,
+): { wait: GateWait; changed: boolean } {
+  const path = waitPath(runDir, waitId);
+  if (existsSync(waitsDir(runDir))) assertRealDirectory(waitsDir(runDir), 'waits directory');
+  if (!existsSync(path)) {
+    throw new Error(`v3 human-gate: no pending wait "${waitId}" in ${runDir}`);
+  }
+  return withFileLockSync(path, () => {
+    const existing = readWait(runDir, waitId);
+    if (!existing) throw new Error(`v3 human-gate: no pending wait "${waitId}" in ${runDir}`);
+    if (existing.status !== 'pending') return { wait: existing, changed: false };
+    const resolved: GateWait = {
+      ...existing,
+      status: resolution,
+      resolvedAt: Date.now(),
+      by,
+      selected,
+    };
+    atomicWriteJson(path, resolved);
+    return { wait: resolved, changed: true };
+  });
 }
 
 export function normalizeGateWaitInput(gate: V3HumanGate): Pick<GateWait, 'prompt' | 'options' | 'approveOptions' | 'approvers'> {
@@ -149,7 +273,8 @@ export function listPendingWaits(runDir: string): GateWait[] {
   for (const name of readdirSync(dir)) {
     if (!name.endsWith('.json') || name.endsWith('.tmp')) continue;
     try {
-      const wait = normalizeWaitFile(JSON.parse(readFileSync(join(dir, name), 'utf-8')) as Partial<GateWait>);
+      const wait = readWait(runDir, name.slice(0, -'.json'.length));
+      if (!wait) continue;
       if (wait.status === 'pending') out.push(wait);
     } catch {
       // skip a torn / unparseable wait file (mid-write crash)
@@ -160,6 +285,25 @@ export function listPendingWaits(runDir: string): GateWait[] {
 
 function normalizeWaitFile(raw: Partial<GateWait>): GateWait {
   const options = raw.options ?? [...DEFAULT_HUMAN_GATE_OPTIONS];
+  let hostApproval: GateWait['hostApproval'];
+  if (raw.hostApproval !== undefined) {
+    const approval = raw.hostApproval as unknown as Record<string, unknown>;
+    if (
+      !approval ||
+      typeof approval !== 'object' ||
+      Array.isArray(approval) ||
+      Object.keys(approval).sort().join(',') !== 'approvalDigest,attemptId,inputHash' ||
+      typeof approval.attemptId !== 'string' ||
+      !/\/attempts\/\d{3}$/.test(approval.attemptId) ||
+      typeof approval.approvalDigest !== 'string' ||
+      !/^sha256:[0-9a-f]{64}$/.test(approval.approvalDigest) ||
+      typeof approval.inputHash !== 'string' ||
+      !/^sha256:[0-9a-f]{64}$/.test(approval.inputHash)
+    ) {
+      throw new Error('v3 human-gate: malformed hostApproval in wait file');
+    }
+    hostApproval = approval as unknown as NonNullable<GateWait['hostApproval']>;
+  }
   return {
     waitId: raw.waitId ?? '',
     nodeId: raw.nodeId ?? '',
@@ -173,6 +317,7 @@ function normalizeWaitFile(raw: Partial<GateWait>): GateWait {
     resolvedAt: raw.resolvedAt,
     by: raw.by,
     selected: raw.selected,
+    ...(hostApproval ? { hostApproval } : {}),
   };
 }
 
@@ -191,10 +336,14 @@ function normalizeWaitFile(raw: Partial<GateWait>): GateWait {
 export function createFileGate(deps: {
   awaitDecision: (wait: GateWait) => Promise<{ resolution: 'approved' | 'rejected'; by: string; selected?: string }>;
 }): GateResolver {
-  return async ({ nodeId, prompt, waitId, runDir }) => {
-    const wait = writePendingWait(runDir, { waitId, nodeId, prompt });
+  return async ({ nodeId, prompt, waitId, runDir, hostApproval }) => {
+    const wait = writePendingWait(runDir, { waitId, nodeId, prompt, ...(hostApproval ? { hostApproval } : {}) });
     const { resolution, by, selected } = await deps.awaitDecision(wait);
-    resolveWait(runDir, waitId, resolution, by, selected);
-    return { resolution, by, selected };
+    const settled = resolveWaitOnce(runDir, waitId, resolution, by, selected);
+    return {
+      resolution: settled.wait.status === 'approved' ? 'approved' : 'rejected',
+      by: settled.wait.by ?? by,
+      selected: settled.wait.selected,
+    };
   };
 }

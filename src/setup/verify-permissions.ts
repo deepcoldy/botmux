@@ -75,7 +75,7 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   { name: 'application:application:self_manage', desc: '应用自查 (免审批)', critical: false },
 ];
 
-/** 文档评论入口（/subscribe-lark-doc）专用的 app 权限。**不在** BOTMUX_REQUIRED_SCOPES
+/** 文档评论入口（/watch-comment / /subscribe-lark-doc）专用的 app 权限。**不在** BOTMUX_REQUIRED_SCOPES
  *  里——它是 opt-in 特性，只对「已订阅过文档」的 bot 启动自检（见
  *  event-dispatcher.checkRequiredScopes 的文档就绪分支），不给没用该特性的 bot 添噪。
  *  名字单一事实源 = utils/user-token.DOC_COMMENT_OAUTH_SCOPES（同名 OAuth user scope），
@@ -88,6 +88,20 @@ const DOC_SCOPE_DESC: Record<string, string> = {
   'wiki:wiki:readonly': '解析 wiki 节点（订阅 wiki 文档时）',
 };
 export const DOC_FEATURE_SCOPES: RequiredScope[] = DOC_COMMENT_OAUTH_SCOPES.map((name) => ({
+  name,
+  desc: DOC_SCOPE_DESC[name] ?? name,
+  critical: false,
+}));
+
+/** `/watch-comment` only consumes the app-level comment notice event and uses
+ * app identity to read/reply. It does not call the per-file subscribe API, so
+ * the two subscription-specific user scopes intentionally stay out. */
+const DOC_WATCH_SCOPE_NAMES = [
+  'docs:document.comment:read',
+  'docs:document.comment:create',
+  'wiki:wiki:readonly',
+] as const;
+export const DOC_WATCH_SCOPES: RequiredScope[] = DOC_WATCH_SCOPE_NAMES.map((name) => ({
   name,
   desc: DOC_SCOPE_DESC[name] ?? name,
   critical: false,

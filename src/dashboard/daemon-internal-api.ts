@@ -45,12 +45,6 @@ import {
   isAuthorizedForGlobalSettings,
   type SettingsOwnerResolverDeps,
 } from './settings-owner-resolver.js';
-import {
-  listWorkflowRuns,
-  runApproveReject,
-  runCancel,
-  type WorkflowsActionDeps,
-} from './workflows-action-helpers.js';
 
 export type SimpleHttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
 
@@ -73,7 +67,6 @@ export interface DaemonInternalApiDeps {
   // ─── WRITE ACTIONS (via helpers) ───────────────────────────────────
   settingsApplierDeps: SettingsWriteApplierDeps;
   groupsActionDeps: GroupsActionDeps;
-  workflowsActionDeps: WorkflowsActionDeps<any>;
 
   // ─── SIMPLE PROXY TARGETS ─────────────────────────────────────────
   proxyToDaemon: (larkAppId: string, daemonPath: string, init: RequestInit) => Promise<Response>;
@@ -120,12 +113,6 @@ interface RouteDef {
 }
 
 /** ─── Helpers ──────────────────────────────────────────────────────── */
-
-function parseStatusesParam(raw: string | null): Set<string> | undefined {
-  if (raw === null) return undefined;
-  const s = new Set(raw.split(',').map(x => x.trim()).filter(Boolean));
-  return s.size > 0 ? s : undefined;
-}
 
 async function readUpstream(upstream: Response): Promise<unknown> {
   const text = await upstream.text();
@@ -236,6 +223,32 @@ function scopeGroupsMatrixByCaller(
 /** ─── Route table ────────────────────────────────────────────────── */
 
 const ROUTES: RouteDef[] = [
+  // One-version zero-I/O tombstone for stale Feishu dashboard cards. It is
+  // intentionally ahead of all live routes and never resolves a run owner.
+  {
+    method: 'GET',
+    pathRe: /^\/__daemon\/workflows-runs(?:-snapshot|\/.*)$/,
+    handle: async () => ({
+      status: 410,
+      body: {
+        ok: false,
+        error: 'legacy_workflow_retired',
+        message: 'v2 workflow run APIs are retired; migrate definitions with botmux template migrate-v3 and inspect v3 runs via /api/v3/runs',
+      },
+    }),
+  },
+  {
+    method: 'POST',
+    pathRe: /^\/__daemon\/workflows-runs(?:-snapshot|\/.*)$/,
+    handle: async () => ({
+      status: 410,
+      body: {
+        ok: false,
+        error: 'legacy_workflow_retired',
+        message: 'v2 workflow run APIs are retired; migrate definitions with botmux template migrate-v3 and inspect v3 runs via /api/v3/runs',
+      },
+    }),
+  },
   // ── READ ──────────────────────────────
   {
     method: 'GET',
@@ -283,40 +296,6 @@ const ROUTES: RouteDef[] = [
         ? matrix
         : scopeGroupsMatrixByCaller(matrix, ctx.callerAppId);
       return { status: 200, body: scoped };
-    },
-  },
-  {
-    method: 'GET',
-    pathRe: /^\/__daemon\/workflows-runs-snapshot$/,
-    handle: async (_m, ctx, deps) => {
-      const query = {
-        all: ctx.url.searchParams.get('all') === '1',
-        statuses: parseStatusesParam(ctx.url.searchParams.get('status')),
-      };
-      // listWorkflowRuns returns HandlerResult, not a raw array. Filter only
-      // successful `{ runs }` bodies; pass through errors and malformed bodies
-      // so callers see the real failure instead of an empty list.
-      const result = await listWorkflowRuns(query, deps.workflowsActionDeps);
-      if (
-        result.status === 200 &&
-        result.body &&
-        typeof result.body === 'object' &&
-        Array.isArray((result.body as { runs?: unknown }).runs)
-      ) {
-        const runs = (result.body as { runs: ReadonlyArray<unknown> }).runs;
-        const scoped = ctx.url.searchParams.get('scope') === 'global'
-          ? runs.slice()
-          : scopeRowsByCaller(
-              runs,
-              ctx.callerAppId,
-              r => (r as { chatBinding?: { larkAppId?: unknown } })?.chatBinding?.larkAppId as string | undefined,
-            );
-        return {
-          status: 200,
-          body: { ...(result.body as Record<string, unknown>), runs: scoped },
-        };
-      }
-      return result;
     },
   },
   {
@@ -494,69 +473,6 @@ const ROUTES: RouteDef[] = [
         { method: 'DELETE' },
       );
       return { status: upstream.status, body: await readUpstream(upstream) };
-    },
-  },
-
-  // ── WRITE: workflows × 3 ──────────────
-  //
-  // Cross-bot owner gate. The workflow helpers resolve routing from
-  // readRunSnapshot, so Route B checks the owner before proxying. Unlike
-  // sessions/schedules, workflows have no legacy "proxy to caller" fallback:
-  // a run without chatBinding has no routable owner and should fall through to
-  // the helper's existing 409 (`needs_lark_or_cli` / `needs_cli_cancel`).
-  //
-  //   - snapshot null → 404 unknown_run (don't expose the helper's
-  //     non-existent run path)
-  //   - owner !== undefined + caller mismatch → 403 workflow_owner_mismatch
-  //   - owner !== undefined + caller match (or test seam) → fall through
-  //   - owner === undefined → fall through (helper returns 409)
-  //
-  // Apply the same gate to approve/reject even if the current card only
-  // exposes cancel.
-  {
-    method: 'POST',
-    pathRe: /^\/__daemon\/workflows-runs\/([^/]+)\/(approve|reject)$/,
-    handle: async (m, ctx, deps) => {
-      const runId = decodeURIComponent(m[1]);
-      const action = m[2] as 'approve' | 'reject';
-      // Preserve bad-input semantics: invalid ids return 400 bad_run_id rather
-      // than being shadowed as 404 unknown_run by the owner snapshot lookup.
-      if (!deps.workflowsActionDeps.isValidRunId(runId)) {
-        return { status: 400, body: { ok: false, error: 'bad_run_id' } };
-      }
-      const snap = await deps.workflowsActionDeps.readRunSnapshot(
-        deps.workflowsActionDeps.runsDir,
-        runId,
-      );
-      if (!snap) return { status: 404, body: { ok: false, error: 'unknown_run' } };
-      const owner = snap.chatBinding?.larkAppId;
-      const isGlobal = ctx.url.searchParams.get('scope') === 'global';
-      if (!isGlobal && owner !== undefined && ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
-        return { status: 403, body: { ok: false, error: 'workflow_owner_mismatch' } };
-      }
-      return runApproveReject(runId, action, ctx.bodyRaw, deps.workflowsActionDeps);
-    },
-  },
-  {
-    method: 'POST',
-    pathRe: /^\/__daemon\/workflows-runs\/([^/]+)\/cancel$/,
-    handle: async (m, ctx, deps) => {
-      const runId = decodeURIComponent(m[1]);
-      // Preserve the same bad-input semantics as approve/reject.
-      if (!deps.workflowsActionDeps.isValidRunId(runId)) {
-        return { status: 400, body: { ok: false, error: 'bad_run_id' } };
-      }
-      const snap = await deps.workflowsActionDeps.readRunSnapshot(
-        deps.workflowsActionDeps.runsDir,
-        runId,
-      );
-      if (!snap) return { status: 404, body: { ok: false, error: 'unknown_run' } };
-      const owner = snap.chatBinding?.larkAppId;
-      const isGlobal = ctx.url.searchParams.get('scope') === 'global';
-      if (!isGlobal && owner !== undefined && ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
-        return { status: 403, body: { ok: false, error: 'workflow_owner_mismatch' } };
-      }
-      return runCancel(runId, ctx.bodyRaw, deps.workflowsActionDeps);
     },
   },
 

@@ -419,11 +419,18 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
 export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
   const msgType = msg.msg_type ?? 'text';
   const rawContent = msg.body?.content ?? '';
+  // sender_name is only present when the fetch opted in via with_sender_name=true
+  // (all client.ts message read paths do). Covers bot senders too — the one case
+  // local rosters can't resolve for third-party bots.
+  const senderName = typeof msg.sender?.sender_name === 'string' && msg.sender.sender_name.trim()
+    ? msg.sender.sender_name.trim()
+    : undefined;
   return {
     messageId: msg.message_id ?? '',
     rootId: msg.root_id ?? msg.thread_id ?? '',
     senderId: msg.sender?.id ?? '',
     senderType: msg.sender?.sender_type ?? 'unknown',
+    ...(senderName ? { senderName } : {}),
     msgType,
     content: extractTextContent(msgType, normalizeApiMessageContent(msgType, rawContent), undefined, numberer),
     createTime: msg.create_time ?? '',
@@ -677,8 +684,15 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
             else if (node.tag === 'a') {
               // Keep the href so links survive — Format A separates text/href,
               // and dropping href loses real content (规则配置/详情/Trace 链接).
+              // Bare long URLs (e.g. Argos Kibana 处理建议) come back with
+              // text === href, both cut at the same offset, and the remainder
+              // spilling into the FOLLOWING text nodes of the same paragraph.
+              // Emitting `text(href)` would double the truncated URL and
+              // corrupt the line; a single copy lets join('') below reconnect
+              // the full URL from those remainder nodes.
               const t = node.text ?? '';
-              textNodes.push(node.href && t ? `${t}(${node.href})` : (t || node.href || ''));
+              if (t && t === node.href) textNodes.push(t);
+              else textNodes.push(node.href && t ? `${t}(${node.href})` : (t || node.href || ''));
             }
             else if (node.tag === 'at') textNodes.push(`@${node.user_name ?? 'unknown'}`);
             else if (node.tag === 'img' || node.tag === 'image') {
@@ -686,8 +700,14 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
               if (k) textNodes.push(imgLabel(k));
             }
             else if (node.tag === 'button') {
+              // Same jump-URL policy as Format B: simple cards reach history
+              // via the Format A list view WITHOUT a resolve pass, so dropping
+              // the URL here would lose button links on that main path.
               const btnText = typeof node.text === 'string' ? node.text : node.text?.content;
-              if (btnText) buttons.push(`[${btnText}]`);
+              if (btnText) {
+                const url = buttonOpenUrl(node);
+                buttons.push(url ? `[${btnText}](${url})` : `[${btnText}]`);
+              }
             }
             else if (node.tag === 'input') {
               const ph = typeof node.placeholder === 'string' ? node.placeholder : node.placeholder?.content;
@@ -824,7 +844,7 @@ export function mergeCardText(textA: string, textB: string): string {
  */
 export async function resolveMergedCardContent(
   larkAppId: string, messageId: string, numberer?: ImgNumberer,
-): Promise<{ text: string; structuredContent: string } | null> {
+): Promise<{ text: string; structuredContent: string; resources: MessageResource[] } | null> {
   const [aRes, bRes] = await Promise.all([
     getMessageDetail(larkAppId, messageId, { userCardContent: false }).catch(() => null),
     getMessageDetail(larkAppId, messageId, { userCardContent: true }).catch(() => null),
@@ -832,6 +852,12 @@ export async function resolveMergedCardContent(
   const aContent = aRes?.items?.[0]?.body?.content;
   const bContent = bRes?.items?.[0]?.body?.content;
   if (!aContent && !bContent) return null;
+  const structuredContent = (bContent ?? aContent)!;
+  // Resources BEFORE text so the shared numberer assigns [图片 N] in attachment
+  // order and the text extraction below reuses those numbers (same ordering
+  // contract as parseEventMessage / buildForwardedTree). Callers that don't
+  // pass a numberer are unaffected (fresh internal one, unnumbered text).
+  const resources = extractResources('interactive', structuredContent, numberer);
   const textA = aContent ? extractCardContent(normalizeApiMessageContent('interactive', aContent), numberer) : '';
   const textB = bContent ? extractCardContent(normalizeApiMessageContent('interactive', bContent), numberer) : '';
   const merged = mergeCardText(textA, textB);
@@ -839,7 +865,7 @@ export async function resolveMergedCardContent(
   // Carry the structured card JSON (B preferred) alongside the merged text so
   // resource extraction (image_key/file_key) keeps working — extractResources
   // walks elements/body, extractCardContent short-circuits on the text key.
-  return { text: merged, structuredContent: (bContent ?? aContent)! };
+  return { text: merged, structuredContent, resources };
 }
 
 /**
@@ -860,6 +886,43 @@ export async function resolveEventCard(data: RawEventData, larkAppId: string): P
     return;
   }
   unwrapUserDsl(data);
+}
+
+/** First non-empty string among the candidates. Deliberately NOT `??` — Lark
+ *  payloads carry empty-string placeholders (e.g. multi_url: {url: '', pc_url:
+ *  'https://…'}) which nullish coalescing would return, swallowing the valid
+ *  platform URL behind it. */
+function firstNonEmptyString(...candidates: unknown[]): string | undefined {
+  for (const c of candidates) {
+    if (typeof c === 'string' && c) return c;
+  }
+  return undefined;
+}
+
+/** Resolve a card button's jump target across schema generations: v1 `url` /
+ *  `multi_url`, v2 `behaviors: [{type:'open_url', default_url, pc_url, …}]`.
+ *  Returns undefined for callback-only buttons (they have no followable URL). */
+function buttonOpenUrl(el: any): string | undefined {
+  const direct = firstNonEmptyString(
+    el.url,
+    el.multi_url?.url, el.multi_url?.pc_url, el.multi_url?.android_url, el.multi_url?.ios_url,
+  );
+  if (direct) return direct;
+  if (Array.isArray(el.behaviors)) {
+    for (const b of el.behaviors) {
+      if (b?.type !== 'open_url') continue;
+      const u = firstNonEmptyString(b.default_url, b.pc_url, b.url, b.android_url, b.ios_url);
+      if (u) return u;
+    }
+  }
+  return undefined;
+}
+
+/** Fold an image's alt text into its placeholder: `[图片 2]` + alt →
+ *  `[图片 2: 报警前30分钟今(红)昨(蓝)同比]`. Consumers that pattern-match the
+ *  placeholder tolerate the suffix (they match `[图片…]` loosely). */
+function withImgAlt(label: string, alt: string): string {
+  return label.endsWith(']') ? `${label.slice(0, -1)}: ${alt}]` : `${label} (${alt})`;
 }
 
 type ResourcePusher = (resources: MessageResource[], r: MessageResource) => void;
@@ -927,9 +990,15 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   }
 
   // button — text may be a plain_text object (v2) or a string (v1 simplified).
+  // Jump buttons carry their target as v1 `url`/`multi_url` or v2 `behaviors`
+  // open_url; keep it so the reader can actually follow the link (e.g. Argos
+  // [分析报告] → the report URL). Callback buttons have no URL and stay bare.
   if (tag === 'button') {
     const btnText = typeof el.text === 'string' ? el.text : el.text?.content;
-    if (btnText) parts.push(`[${btnText}]`);
+    if (btnText) {
+      const url = buttonOpenUrl(el);
+      parts.push(url ? `[${btnText}](${url})` : `[${btnText}]`);
+    }
   }
 
   // input — surface the placeholder so the reader knows the field is there.
@@ -950,9 +1019,12 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   }
 
   // image — emit a numbered placeholder matching the attachment list order.
+  // Carry the alt text when present: for chart images (Argos 同比曲线图) the
+  // alt is often the only machine-readable description of what the image shows.
   if (tag === 'img' || tag === 'image') {
     const k = el.image_key ?? el.img_key;
-    if (k) parts.push(imgLabel(k));
+    const alt = (typeof el.alt === 'string' ? el.alt : el.alt?.content)?.trim();
+    if (k) parts.push(alt ? withImgAlt(imgLabel(k), alt) : imgLabel(k));
   }
 
   // note blocks (v1 only — v2 removed the tag but we still parse v1 cards)
