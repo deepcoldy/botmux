@@ -1,6 +1,6 @@
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import {
-  readFileSync, existsSync, mkdirSync, chmodSync,
+  readFileSync, existsSync, mkdirSync, chmodSync, linkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { dirname } from 'node:path';
@@ -104,9 +104,48 @@ export function loadOrCreateDashboardSecret(secretPath: string): string {
   if (existing) return existing;
   const secret = randomBytes(32).toString('base64url');
   mkdirSync(dirname(secretPath), { recursive: true });
-  atomicWriteFileSync(secretPath, secret, { mode: 0o600 });
-  chmodSync(secretPath, 0o600);
-  return secret;
+  // Daemon fleets and the dashboard start concurrently on a fresh install.
+  // A rename-based "atomic write" is individually atomic but not
+  // create-if-absent: two winners can each return a different key while only
+  // the last rename remains on disk. Publish a fully-written temp inode with
+  // link(2) instead. The link is atomic and fails with EEXIST for every loser;
+  // losers then read the single winner's complete value.
+  const temp = `${secretPath}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+  try {
+    writeFileSync(temp, secret, { mode: 0o600, flag: 'wx' });
+    try {
+      linkSync(temp, secretPath);
+      chmodSync(secretPath, 0o600);
+      return secret;
+    } catch (err) {
+      const raced = loadDashboardSecret(secretPath);
+      if (raced) return raced;
+      // Existing-but-empty/corrupt file: publish one permanent repair seed via
+      // link(2). Every concurrent initializer either wins that O_EXCL election
+      // or reads the same fully-written seed, then atomically restores the main
+      // path with the identical value. Keeping the 0600 seed makes crash recovery
+      // replayable and avoids stale PID locks (and their delete/recreate races).
+      const repairSeedPath = `${secretPath}.repair-seed`;
+      let repairSecret: string;
+      try {
+        linkSync(temp, repairSeedPath);
+        chmodSync(repairSeedPath, 0o600);
+        repairSecret = secret;
+      } catch (seedErr) {
+        if ((seedErr as NodeJS.ErrnoException).code !== 'EEXIST') throw seedErr;
+        const published = loadDashboardSecret(repairSeedPath);
+        if (!published) {
+          throw new Error(`dashboard secret repair seed is unreadable: ${repairSeedPath}`);
+        }
+        repairSecret = published;
+      }
+      atomicWriteFileSync(secretPath, repairSecret, { mode: 0o600 });
+      chmodSync(secretPath, 0o600);
+      return repairSecret;
+    }
+  } finally {
+    try { unlinkSync(temp); } catch { /* already absent */ }
+  }
 }
 
 /**

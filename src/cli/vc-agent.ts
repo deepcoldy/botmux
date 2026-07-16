@@ -20,6 +20,8 @@ import { config } from '../config.js';
 import { listVcMeetingRuntimeSessions } from '../services/vc-meeting-runtime-store.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { resolveSessionContext } from '../core/session-marker.js';
+import { fetchDaemonIpc } from '../core/daemon-ipc-auth.js';
+import { readManagedOriginCapability } from '../core/managed-origin-capability.js';
 import type { NormalizedVcMeetingItem } from '../vc-agent/types.js';
 
 const VC_AGENT_SPEAK_MAX_TEXT_LENGTH = 200;
@@ -289,18 +291,13 @@ async function cmdRequestOutput(args: string[]): Promise<void> {
   const receiverSessionId = process.env.BOTMUX_SESSION_ID;
   const receiverAppId = process.env.BOTMUX_LARK_APP_ID;
   const receiverPortRaw = Number(process.env.BOTMUX_DAEMON_IPC_PORT);
-  const liveOrigin = resolveSessionContext(config.session.dataDir, undefined);
-  let originCapability: string | undefined;
+  const liveOrigin = resolveSessionContext(config.session.dataDir, receiverSessionId);
   const relayDir = process.env.BOTMUX_SEND_RELAY;
-  if (relayDir) {
-    try {
-      const raw = JSON.parse(readFileSync(
-        join(relayDir, '.botmux-origin-capability.json'),
-        'utf-8',
-      )) as { token?: unknown };
-      if (typeof raw.token === 'string') originCapability = raw.token;
-    } catch { /* receiver daemon fails closed */ }
-  }
+  const originCapability = readManagedOriginCapability(
+    config.session.dataDir,
+    receiverSessionId,
+    relayDir,
+  )?.capability;
   const discoveredReceiver = receiverAppId ? findOnlineDaemon(receiverAppId) : null;
   const receiverPort = Number.isSafeInteger(receiverPortRaw) && receiverPortRaw > 0
     ? receiverPortRaw
@@ -341,7 +338,7 @@ async function cmdRequestOutput(args: string[]): Promise<void> {
   ensureBotRegistryLoaded();
   const daemon = findOnlineDaemon(larkAppId);
   if (!daemon) throw new Error(`daemon offline for ${larkAppId}`);
-  const response = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/vc-meetings/output-request`, {
+  const response = await fetchDaemonIpc(daemon.ipcPort, '/api/vc-meetings/output-request', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -399,5 +396,3 @@ export async function cmdVcAgent(command: string, args: string[]): Promise<void>
     process.exit(1);
   }
 }
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';

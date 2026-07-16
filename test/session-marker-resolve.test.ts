@@ -3,6 +3,10 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveSessionContext } from '../src/core/session-marker.js';
+import {
+  managedOriginCapabilityPath,
+  replaceManagedOriginCapabilityFile,
+} from '../src/core/managed-origin-capability.js';
 
 // resolveSessionContext is the layer that powers session-id inference for
 // `botmux send` / history / bots. Regression guard: a detached/backgrounded
@@ -18,6 +22,13 @@ describe('resolveSessionContext()', () => {
     const markersDir = join(dir, '.botmux-cli-pids');
     mkdirSync(markersDir, { recursive: true });
     writeFileSync(join(markersDir, String(pid)), body);
+  }
+
+  function writeCapability(sessionId: string, body: Record<string, unknown>): void {
+    replaceManagedOriginCapabilityFile(
+      managedOriginCapabilityPath(dir, sessionId),
+      JSON.stringify({ sessionId, ...body }),
+    );
   }
 
   it('prefers the marker (with its fresh turnId) over the env when ancestry resolves', () => {
@@ -50,6 +61,55 @@ describe('resolveSessionContext()', () => {
     // No markers dir at all → ancestry walk returns null, the detached case.
     const ctx = resolveSessionContext(dir, 'env-sid', process.pid);
     expect(ctx).toEqual({ sessionId: 'env-sid' });
+  });
+
+  it('uses the protected per-session capability snapshot when PID markers are hidden', () => {
+    writeCapability('env-sid', {
+      capability: 'ab'.repeat(32),
+      turnId: 'turn-protected',
+      dispatchAttempt: 3,
+    });
+    expect(resolveSessionContext(dir, 'env-sid', process.pid)).toEqual({
+      sessionId: 'env-sid',
+      turnId: 'turn-protected',
+      dispatchAttempt: 3,
+    });
+  });
+
+  it('prefers a live marker over a residual same-session capability snapshot', () => {
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'env-sid',
+      turnId: 'turn-live',
+      dispatchAttempt: 1,
+    }));
+    writeCapability('env-sid', {
+      capability: 'bc'.repeat(32),
+      turnId: 'turn-residual',
+      dispatchAttempt: 4,
+    });
+    expect(resolveSessionContext(dir, 'env-sid', process.pid)).toEqual({
+      sessionId: 'env-sid',
+      turnId: 'turn-live',
+      dispatchAttempt: 1,
+    });
+  });
+
+  it('does not mix a marker with another session capability', () => {
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'marker-sid',
+      turnId: 'turn-marker',
+      dispatchAttempt: 1,
+    }));
+    writeCapability('env-sid', {
+      capability: 'cd'.repeat(32),
+      turnId: 'turn-protected',
+      dispatchAttempt: 2,
+    });
+    expect(resolveSessionContext(dir, 'env-sid', process.pid)).toEqual({
+      sessionId: 'marker-sid',
+      turnId: 'turn-marker',
+      dispatchAttempt: 1,
+    });
   });
 
   it('falls back to env when the matched marker is empty/legacy (no usable sessionId)', () => {

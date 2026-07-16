@@ -74,8 +74,8 @@ export function isTrustedVcMeetingHostRelayParent(
 }
 
 /** Authorize a daemon-mediated exit (ask/action relay) against the worker's
- * live origin registry. The caller may prove the current turn with the rotating
- * capability (sandbox) or an exact live marker tuple (non-sandbox). */
+ * live origin registry. Only the rotating capability proves authority; the
+ * visible turn tuple is routing/diagnostic context and is never a credential. */
 export function evaluateVcMeetingManagedOriginClaim(
   dataDir: string,
   input: {
@@ -116,10 +116,7 @@ export function verifyVcMeetingManagedOriginClaim(
   const live = input.liveOrigin;
   const capabilityMatches = !!live && !!input.claimedCapability
     && input.claimedCapability === live.capability;
-  const markerMatches = !!live && !!input.claimedTurnId
-    && input.claimedTurnId === live.turnId
-    && input.claimedDispatchAttempt === live.dispatchAttempt;
-  if (!live || (!capabilityMatches && !markerMatches)) {
+  if (!live || !capabilityMatches) {
     return { ok: false, errorCode: 'origin_unproven', error: 'managed origin claim is stale or missing' };
   }
   return {

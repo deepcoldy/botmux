@@ -22,6 +22,7 @@ describe('worker backend exit crash ordering', () => {
     const callback = workerSource.slice(start, end);
     const clearIntentional = callback.indexOf('if (intentionalRestart) intentionalRestartBackend = null;');
     const identityFence = callback.indexOf('if (backend !== observedBackend)');
+    const revokeCapability = callback.indexOf('completeManagedTurnOriginRevocation(');
     const clearDurable = callback.indexOf('durableTurnInFlight = false;');
     const stashInflight = callback.indexOf('inflightInputs.onCliExit');
     const clearBackend = callback.indexOf('backend = null;');
@@ -30,6 +31,7 @@ describe('worker backend exit crash ordering', () => {
     expect(clearIntentional).toBeGreaterThanOrEqual(0);
     expect(identityFence).toBeGreaterThan(clearIntentional);
     expect(callback.slice(identityFence, clearDurable)).toMatch(/return;/);
+    expect(revokeCapability).toBeGreaterThan(identityFence);
     for (const mutation of [clearDurable, stashInflight, clearBackend, emitExit]) {
       expect(mutation).toBeGreaterThan(identityFence);
     }

@@ -100,7 +100,13 @@ import {
   findActiveBySessionId,
   getDaemonBootId,
 } from './core/worker-pool.js';
-import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner, setBotRenamer } from './core/dashboard-ipc-server.js';
+import { ipcRoute, isTrustedHostIpcRequest, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner, setBotRenamer } from './core/dashboard-ipc-server.js';
+import { loadOrCreateDashboardSecret } from './dashboard/auth.js';
+import { daemonIpcAuthHeaders, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
+import {
+  authorizeSessionScopedIpc,
+  bindSessionScopedIpcIdentity,
+} from './core/daemon-ipc-session-auth.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
@@ -1767,11 +1773,18 @@ async function fetchVcMeetingDaemonJson(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   if (typeof timer.unref === 'function') timer.unref();
   try {
-    const authenticatedHeaders = withVcMeetingDaemonAuthHeader(
+    const vcAuthenticatedHeaders = withVcMeetingDaemonAuthHeader(
       config.session.dataDir,
       larkAppId,
       init.headers,
     );
+    const authenticatedHeaders = daemonIpcAuthHeaders({
+      secret: loadDaemonIpcSecret(),
+      port: daemon.ipcPort,
+      method: init.method ?? 'GET',
+      path,
+      headers: vcAuthenticatedHeaders,
+    });
     const upstream = await fetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, {
       ...init,
       headers: authenticatedHeaders,
@@ -4037,16 +4050,41 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   if ('error' in parsed) return jsonRes(res, 400, { ok: false, error: parsed.error });
 
   const askSession = findActiveBySessionId(parsed.sessionId);
+  let boundAsk = parsed;
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : {};
+  const claimedTurnId = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
+  const claimedAttempt = typeof body.originDispatchAttempt === 'number'
+    && Number.isSafeInteger(body.originDispatchAttempt)
+    && body.originDispatchAttempt > 0
+    ? body.originDispatchAttempt
+    : undefined;
+  const trustedHost = isTrustedHostIpcRequest(req);
+
+  // Ordinary read-isolated sessions authenticate with the exact live rotating
+  // capability. Dedicated meeting receivers keep their stricter durable sink
+  // policy below; that evaluator proves the same capability and additionally
+  // checks the live receipt / explicit-IM ownership fences.
+  if (!trustedHost && !askSession?.session.vcMeetingReceiver) {
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: false,
+      sessionExists: !!askSession,
+      receiverSession: false,
+      allowReceiver: false,
+      sessionId: parsed.sessionId,
+      liveOrigin: askSession?.managedTurnOrigin,
+      claimedCapability: typeof body.originCapability === 'string'
+        ? body.originCapability
+        : undefined,
+      claimedTurnId,
+      claimedDispatchAttempt: claimedAttempt,
+    });
+    if (!verified.ok) {
+      return jsonRes(res, 403, { ok: false, error: verified.error });
+    }
+  }
   if (askSession?.session.vcMeetingReceiver) {
-    const body = raw && typeof raw === 'object' && !Array.isArray(raw)
-      ? raw as Record<string, unknown>
-      : {};
-    const claimedTurnId = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
-    const claimedAttempt = typeof body.originDispatchAttempt === 'number'
-      && Number.isSafeInteger(body.originDispatchAttempt)
-      && body.originDispatchAttempt > 0
-      ? body.originDispatchAttempt
-      : undefined;
     const liveImOrigin = resolveVcMeetingImTurnOrigin(
       askSession.session,
       askSession.managedTurnOrigin?.turnId,
@@ -4069,16 +4107,29 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       });
     }
   }
+  if (!trustedHost) {
+    // A session capability authenticates exactly one daemon session; it does
+    // not let the caller choose another bot/chat/root. Bind every observable
+    // ask route to that authenticated session before registering the card.
+    boundAsk = bindSessionScopedIpcIdentity(parsed, {
+      sessionId: askSession!.session.sessionId,
+      larkAppId: askSession!.larkAppId,
+      chatId: askSession!.chatId,
+      rootMessageId: askSession!.session.scope === 'chat'
+        ? null
+        : askSession!.session.rootMessageId,
+    });
+  }
 
   // 谁能答复 = 谁能在该 chat 跟 bot 说话（canTalk）。鉴权在 broker 点击时按注入的
   // canTalkChecker 判定（见下方 setAskCanTalkChecker），daemon 这里不再预解析 approver。
   const result = await registerAskBroker({
-    larkAppId: parsed.larkAppId,
-    chatId: parsed.chatId,
-    rootMessageId: parsed.rootMessageId,
-    sessionId: parsed.sessionId,
-    questions: parsed.questions,
-    timeoutMs: parsed.timeoutMs,
+    larkAppId: boundAsk.larkAppId,
+    chatId: boundAsk.chatId,
+    rootMessageId: boundAsk.rootMessageId,
+    sessionId: boundAsk.sessionId,
+    questions: boundAsk.questions,
+    timeoutMs: boundAsk.timeoutMs,
   });
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
@@ -4122,7 +4173,14 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
 // happens on the user's next reply (clearAgentAttentionForHumanInbound) or on
 // session close. No thread ping here: `send` already delivered the message.
 ipcRoute('POST', '/api/attention', async (req, res) => {
-  let raw: { sessionId?: unknown; kind?: unknown; reason?: unknown };
+  let raw: {
+    sessionId?: unknown;
+    kind?: unknown;
+    reason?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+    originCapability?: unknown;
+  };
   try {
     raw = await readJsonBody(req);
   } catch {
@@ -4134,6 +4192,29 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
   let ds: DaemonSession | undefined;
   for (const s of activeSessions.values()) {
     if (s.session.sessionId === sessionId) { ds = s; break; }
+  }
+  if (!isTrustedHostIpcRequest(req)) {
+    const claimedAttempt = typeof raw.originDispatchAttempt === 'number'
+      && Number.isSafeInteger(raw.originDispatchAttempt)
+      && raw.originDispatchAttempt > 0
+      ? raw.originDispatchAttempt
+      : undefined;
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: false,
+      sessionExists: !!ds,
+      receiverSession: !!ds?.session.vcMeetingReceiver,
+      allowReceiver: false,
+      sessionId,
+      liveOrigin: ds?.managedTurnOrigin,
+      claimedCapability: typeof raw.originCapability === 'string'
+        ? raw.originCapability
+        : undefined,
+      claimedTurnId: typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined,
+      claimedDispatchAttempt: claimedAttempt,
+    });
+    if (!verified.ok) {
+      return jsonRes(res, 403, { ok: false, error: verified.error });
+    }
   }
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
 
@@ -4156,7 +4237,13 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
 // 选择器吞首条消息）。找不到会话 / worker 仍返回 200（best-effort）：worker 侧
 // 有超时兜底，信号丢失不致命，没必要让 hook 客户端报错。
 ipcRoute('POST', '/api/session-ready', async (req, res) => {
-  let raw: { sessionId?: unknown; source?: unknown };
+  let raw: {
+    sessionId?: unknown;
+    source?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+  };
   try {
     raw = await readJsonBody(req);
   } catch {
@@ -4169,6 +4256,29 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
   let ds: DaemonSession | undefined;
   for (const s of activeSessions.values()) {
     if (s.session.sessionId === sessionId) { ds = s; break; }
+  }
+  if (!isTrustedHostIpcRequest(req)) {
+    const claimedAttempt = typeof raw.originDispatchAttempt === 'number'
+      && Number.isSafeInteger(raw.originDispatchAttempt)
+      && raw.originDispatchAttempt > 0
+      ? raw.originDispatchAttempt
+      : undefined;
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: false,
+      sessionExists: !!ds,
+      receiverSession: !!ds?.session.vcMeetingReceiver,
+      allowReceiver: true,
+      sessionId,
+      liveOrigin: ds?.managedTurnOrigin,
+      claimedCapability: typeof raw.originCapability === 'string'
+        ? raw.originCapability
+        : undefined,
+      claimedTurnId: typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined,
+      claimedDispatchAttempt: claimedAttempt,
+    });
+    if (!verified.ok) {
+      return jsonRes(res, 403, { ok: false, error: verified.error });
+    }
   }
   if (ds?.worker) {
     try {
@@ -4199,14 +4309,63 @@ ipcRoute('POST', '/api/hooks/emit', async (req, res) => {
   if (!raw || typeof raw !== 'object') {
     return jsonRes(res, 400, { ok: false, error: 'bad_body' });
   }
-  const { event, payload } = raw as { event?: unknown; payload?: unknown };
+  const {
+    event,
+    payload,
+    sessionId,
+    originTurnId,
+    originDispatchAttempt,
+    originCapability,
+  } = raw as {
+    event?: unknown;
+    payload?: unknown;
+    sessionId?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+    originCapability?: unknown;
+  };
   if (typeof event !== 'string' || !(HOOK_EVENTS as readonly string[]).includes(event)) {
     return jsonRes(res, 400, { ok: false, error: 'bad_event' });
   }
   if (!payload || typeof payload !== 'object') {
     return jsonRes(res, 400, { ok: false, error: 'bad_payload' });
   }
-  emitHookEventLocal(event as HookEvent, payload as Record<string, unknown>);
+  let boundPayload = payload as Record<string, unknown>;
+  if (!isTrustedHostIpcRequest(req)) {
+    const sid = typeof sessionId === 'string' ? sessionId : '';
+    const ds = sid ? findActiveBySessionId(sid) : undefined;
+    const claimedAttempt = typeof originDispatchAttempt === 'number'
+      && Number.isSafeInteger(originDispatchAttempt)
+      && originDispatchAttempt > 0
+      ? originDispatchAttempt
+      : undefined;
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: false,
+      sessionExists: !!ds,
+      receiverSession: !!ds?.session.vcMeetingReceiver,
+      allowReceiver: false,
+      sessionId: sid,
+      liveOrigin: ds?.managedTurnOrigin,
+      claimedCapability: typeof originCapability === 'string' ? originCapability : undefined,
+      claimedTurnId: typeof originTurnId === 'string' ? originTurnId : undefined,
+      claimedDispatchAttempt: claimedAttempt,
+    });
+    if (!verified.ok) {
+      return jsonRes(res, 403, { ok: false, error: verified.error });
+    }
+    // Do not let a valid capability for session A forge session B's identity
+    // inside the hook payload. Hook-specific fields remain caller supplied;
+    // routing/identity fields come only from the authenticated daemon session.
+    boundPayload = bindSessionScopedIpcIdentity(boundPayload, {
+      sessionId: ds!.session.sessionId,
+      chatId: ds!.chatId,
+      larkAppId: ds!.larkAppId,
+      rootMessageId: ds!.session.scope === 'chat'
+        ? null
+        : ds!.session.rootMessageId,
+    });
+  }
+  emitHookEventLocal(event as HookEvent, boundPayload);
   return jsonRes(res, 202, { ok: true });
 });
 
@@ -15692,7 +15851,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // descriptor and hit ECONNREFUSED before we're listening — that left every
   // newly-started daemon's hydrate failing on dashboard startup. Binds to
   // 127.0.0.1 only since the dashboard sibling runs on the same host.
-  const ipcHandle = await startIpcServer({ port: ipcPort, host: '127.0.0.1' });
+  // Loopback alone is not an identity boundary: Linux bwrap receivers retain
+  // host networking for model egress and can also dial 127.0.0.1. Require the
+  // host-only shared secret on every daemon IPC route except the tiny
+  // capability-gated receiver/readiness apertures in dashboard-ipc-server.
+  loadOrCreateDashboardSecret(
+    join(homedir(), '.botmux', '.dashboard-secret'),
+  );
+  const ipcHandle = await startIpcServer({
+    port: ipcPort,
+    host: '127.0.0.1',
+    authRequired: true,
+  });
   // startIpcServer probes upward on EADDRINUSE (e.g. a second botmux instance on
   // this host already holds ipcBasePort+idx), so the bound port may differ from
   // the requested one. Republish the ACTUAL port into the descriptor before it

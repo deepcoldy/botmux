@@ -78,6 +78,8 @@ import {
   UnsupportedGlobalInstallError,
 } from './utils/global-install.js';
 import { loadDashboardSecret } from './dashboard/auth.js';
+import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
+import { readManagedOriginCapability } from './core/managed-origin-capability.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
   formatBotInfoEntriesForCli,
@@ -5000,14 +5002,11 @@ async function relaySend(
     ? prepareCardMarkdown(extractCardText(content), process.cwd(), 'filesystem')
     : undefined;
   const id = randomBytes(8).toString('hex');
-  let originCapability: string | undefined;
-  try {
-    const raw = JSON.parse(readFileSync(join(relayDir, '.botmux-origin-capability.json'), 'utf-8')) as { token?: unknown };
-    if (typeof raw.token === 'string') originCapability = raw.token;
-  } catch {
-    // The host watcher will fail closed. Keeping this best-effort here gives a
-    // clear relay rejection instead of trusting spawn-time turn env.
-  }
+  const originCapability = readManagedOriginCapability(
+    resolveDataDir(),
+    sid,
+    relayDir,
+  )?.capability;
   // Structured request: the daemon-side watcher rebuilds the argv from these
   // validated fields (it NEVER executes raw argv — see buildRelayHostArgs).
   // Content + attachments are written into the shared outbox as plain
@@ -5223,7 +5222,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // whose turn/attempt is refreshed by the worker. BOTMUX_TURN_ID is a
   // spawn-time fallback and can be stale in a detached child after a later
   // delivery starts, so it is never authority for receiver policy.
-  const liveMarkerCtx = resolveSessionContext(resolveDataDir(), undefined);
+  const liveMarkerCtx = resolveSessionContext(
+    resolveDataDir(),
+    process.env.BOTMUX_SESSION_ID,
+  );
   const trustedHostRelay = process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1';
   const trustedRelayAttemptRaw = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
   const trustedRelayCandidate = trustedHostRelay && process.env.BOTMUX_SESSION_ID
@@ -6186,11 +6188,30 @@ async function cmdSend(rest: string[]): Promise<void> {
       try {
         const daemon = findDaemon(appId);
         if (!daemon) throw new Error(`找不到 daemon (larkAppId=${appId})`);
-        const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/attention`, {
+        const originCapability = readManagedOriginCapability(
+          resolveDataDir(),
+          sid,
+          process.env.BOTMUX_SEND_RELAY,
+        )?.capability;
+        const request = {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sessionId: sid, larkAppId: appId, action: 'raise', kind: attention.kind, reason: text.trim() }),
-        });
+          body: JSON.stringify({
+            sessionId: sid,
+            larkAppId: appId,
+            action: 'raise',
+            kind: attention.kind,
+            reason: text.trim(),
+            originCapability,
+            originTurnId: liveMarkerCtx?.turnId,
+            originDispatchAttempt: liveMarkerCtx?.dispatchAttempt,
+          }),
+        } satisfies RequestInit;
+        let secret: string | undefined;
+        try { secret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
+        const res = secret
+          ? await fetchDaemonIpc(daemon.ipcPort, '/api/attention', request, secret)
+          : await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/attention`, request);
         if (!res.ok) throw new Error(`daemon HTTP ${res.status}`);
         attentionRaised = true;
         console.error(`🙋 已举手：本会话已进 dashboard「需要你」列（用户回复后自动撤下）`);
@@ -6738,13 +6759,32 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
 
   let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, {
+    const requestBody = { ...body };
+    if (typeof requestBody.originCapability !== 'string') {
+      const sessionId = typeof requestBody.sessionId === 'string'
+        ? requestBody.sessionId
+        : undefined;
+      const claim = readManagedOriginCapability(
+        resolveDataDir(),
+        sessionId,
+        process.env.BOTMUX_SEND_RELAY,
+      );
+      if (claim) requestBody.originCapability = claim.capability;
+    }
+    const init = {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(requestBody),
       // No client-side timeout — broker enforces `timeoutMs` and will respond
       // with `kind:'timedOut'` so this fetch always settles.
-    });
+    } satisfies RequestInit;
+    let hostSecret: string | undefined;
+    if (!process.env.BOTMUX_SEND_RELAY) {
+      try { hostSecret = loadDaemonIpcSecret(); } catch { /* read-isolated CLI uses rotating capability auth */ }
+    }
+    res = hostSecret
+      ? await fetchDaemonIpc(daemon.ipcPort, '/api/asks', init, hostSecret)
+      : await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, init);
   } catch (fetchErr) {
     const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
     const err = new Error(
@@ -6839,20 +6879,16 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   }
 
   const larkAppId = process.env.BOTMUX_LARK_APP_ID!;
-  const liveAskOrigin = resolveSessionContext(resolveDataDir(), undefined);
-  let askOriginCapability: string | undefined;
+  const askSessionId = process.env.BOTMUX_SESSION_ID!;
+  const liveAskOrigin = resolveSessionContext(resolveDataDir(), askSessionId);
   const askRelayDir = process.env.BOTMUX_SEND_RELAY;
-  if (askRelayDir) {
-    try {
-      const raw = JSON.parse(readFileSync(
-        join(askRelayDir, '.botmux-origin-capability.json'),
-        'utf-8',
-      )) as { token?: unknown };
-      if (typeof raw.token === 'string') askOriginCapability = raw.token;
-    } catch { /* daemon will fail closed for managed receiver asks */ }
-  }
+  const askOriginCapability = readManagedOriginCapability(
+    resolveDataDir(),
+    askSessionId,
+    askRelayDir,
+  )?.capability;
   const body = {
-    sessionId: process.env.BOTMUX_SESSION_ID!,
+    sessionId: askSessionId,
     chatId: process.env.BOTMUX_CHAT_ID!,
     larkAppId,
     rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID || null,
@@ -7109,11 +7145,37 @@ async function cmdSessionReady(): Promise<void> {
   const daemon = findDaemon(larkAppId);
   if (daemon) {
     try {
-      await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/session-ready`, {
+      const relayDir = process.env.BOTMUX_SEND_RELAY;
+      const originCapability = readManagedOriginCapability(
+        resolveDataDir(),
+        sessionId,
+        relayDir,
+      )?.capability;
+      const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);
+      const envAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
+      const originTurnId = liveOrigin?.turnId ?? process.env.BOTMUX_TURN_ID;
+      const originDispatchAttempt = liveOrigin?.dispatchAttempt
+        ?? (Number.isSafeInteger(envAttempt) && envAttempt > 0 ? envAttempt : undefined);
+      const init = {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId, source }),
-      });
+        body: JSON.stringify({
+          sessionId,
+          source,
+          originCapability,
+          originTurnId,
+          originDispatchAttempt,
+        }),
+      } satisfies RequestInit;
+      let hostSecret: string | undefined;
+      if (!relayDir) {
+        try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
+      }
+      if (!hostSecret) {
+        await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/session-ready`, init);
+      } else {
+        await fetchDaemonIpc(daemon.ipcPort, '/api/session-ready', init, hostSecret);
+      }
     } catch { /* daemon 不可达 → 放弃，worker 走超时兜底 */ }
   }
   process.exit(0);

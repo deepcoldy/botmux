@@ -311,7 +311,7 @@ describe('evaluateVcMeetingManagedSend', () => {
       receiverSessionId: 'receiver-session',
       liveOrigin,
       claimedTurnId: 'delivery-key',
-      claimedDispatchAttempt: 2,
+      claimedDispatchAttempt: 1,
     })).toMatchObject({ ok: false, errorCode: 'origin_unproven' });
   });
 });
