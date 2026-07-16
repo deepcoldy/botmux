@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import { botmuxInstallRoot, botmuxVersion } from '../utils/install-info.js';
 import { resolveEffectiveBotmuxVersion } from '../utils/version-info.js';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
 
 export interface DesktopCompatManifest {
   schemaVersion: 1;

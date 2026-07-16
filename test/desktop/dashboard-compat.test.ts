@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -41,6 +42,12 @@ describe('dashboard desktop compat manifest', () => {
 
     const post = await fetch(`${started.baseUrl}/__desktop/compat`, { method: 'POST' });
     expect(post.status).toBe(404);
+  });
+
+  it('uses the shared dashboard HTTP helper instead of the removed workflow module', () => {
+    const compatSource = readFileSync(new URL('../../src/dashboard/compat.ts', import.meta.url), 'utf8');
+    expect(compatSource).toContain("from './http.js'");
+    expect(compatSource).not.toContain('./workflow-api.js');
   });
 });
 
