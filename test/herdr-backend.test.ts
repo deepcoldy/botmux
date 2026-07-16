@@ -551,6 +551,108 @@ describe('HerdrBackend callbacks', () => {
     }
   });
 
+  it('decodes one UTF-8 character split across consecutive terminal frames', async () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: 'w1:p1' } } }),
+      },
+    ]);
+
+    const backend = new HerdrBackend(SESSION);
+    const seen: string[] = [];
+    backend.onData(data => seen.push(data));
+    backend.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const observerIndex = mockedSpawn.mock.calls.findIndex(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
+    const observer = fakeChildren[observerIndex]!;
+    const bytes = Buffer.from('你');
+
+    observer.stdout.write(`${JSON.stringify({
+      type: 'terminal.frame', seq: 1, full: true, encoding: 'ansi', width: 80, height: 24,
+      bytes: bytes.subarray(0, 2).toString('base64'),
+    })}\n`);
+    observer.stdout.write(`${JSON.stringify({
+      type: 'terminal.frame', seq: 2, full: false, encoding: 'ansi', width: 80, height: 24,
+      bytes: bytes.subarray(2).toString('base64'),
+    })}\n`);
+    await waitForImmediate();
+
+    expect(seen.join('')).toBe('你');
+    expect(seen.join('')).not.toContain('�');
+    backend.kill();
+  });
+
+  it('restarts a disconnected observer and forwards its full rebaseline before new deltas', async () => {
+    vi.useFakeTimers();
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('w1:p1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('w1:p1') },
+    ]);
+
+    const backend = new HerdrBackend(SESSION, { isReattach: true });
+    const seen: string[] = [];
+    const exits: Array<[number | null, string | null]> = [];
+    backend.onData(data => seen.push(data));
+    backend.onExit((code, signal) => exits.push([code, signal]));
+    backend.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const firstObserverIndex = mockedSpawn.mock.calls.findIndex(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
+    const firstObserver = fakeChildren[firstObserverIndex]!;
+
+    firstObserver.emit('exit', 1, null);
+    expect(firstObserver.killed).toBe(true);
+    firstObserver.stdout.write(`${JSON.stringify({
+      type: 'terminal.frame', seq: 99, full: false, encoding: 'ansi', width: 80, height: 24,
+      bytes: Buffer.from('stale observer').toString('base64'),
+    })}\n`);
+    vi.advanceTimersByTime(500);
+
+    const observerCalls = mockedSpawn.mock.calls.filter(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
+    expect(observerCalls).toHaveLength(2);
+    const restartedObserver = fakeChildren.at(-1)!;
+    restartedObserver.stdout.write(`${JSON.stringify({
+      type: 'terminal.frame', seq: 1, full: true, encoding: 'ansi', width: 80, height: 24,
+      bytes: Buffer.from('reconnected baseline').toString('base64'),
+    })}\n`);
+    restartedObserver.stdout.write(`${JSON.stringify({
+      type: 'terminal.frame', seq: 2, full: false, encoding: 'ansi', width: 80, height: 24,
+      bytes: Buffer.from(' delta').toString('base64'),
+    })}\n`);
+    await vi.runAllTicks();
+
+    expect(seen.join('')).toBe('reconnected baseline delta');
+    expect(exits).toEqual([]);
+    backend.kill();
+  });
+  it('kill cancels a pending observer restart', () => {
+    vi.useFakeTimers();
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('w1:p1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('w1:p1') },
+    ]);
+
+    const backend = new HerdrBackend(SESSION, { isReattach: true });
+    const exits: Array<[number | null, string | null]> = [];
+    backend.onExit((code, signal) => exits.push([code, signal]));
+    backend.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const observerIndex = mockedSpawn.mock.calls.findIndex(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
+    fakeChildren[observerIndex]!.emit('exit', 1, null);
+
+    backend.kill();
+    vi.advanceTimersByTime(500);
+
+    const observerCalls = mockedSpawn.mock.calls.filter(([, args]) =>
+      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
+    expect(observerCalls).toHaveLength(1);
+    expect(exits).toEqual([]);
+  });
+
   it('reattach drops the initial full frame and emits ordered incremental frames once', async () => {
     setHerdrResponses([
       { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
@@ -641,30 +743,6 @@ describe('HerdrBackend callbacks', () => {
     expect(exits).toEqual([[7, null]]);
   });
 
-  it('restarts a disconnected observer when the agent is still alive', () => {
-    vi.useFakeTimers();
-    setHerdrResponses([
-      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
-      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('w1:p1') },
-      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('w1:p1') },
-    ]);
-
-    const backend = new HerdrBackend(SESSION, { isReattach: true });
-    backend.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
-    const observersBefore = mockedSpawn.mock.calls.filter(([, args]) =>
-      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
-    const observerIndex = mockedSpawn.mock.calls.findIndex(([, args]) =>
-      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
-    const firstObserver = fakeChildren[observerIndex]!;
-
-    firstObserver.emit('exit', 1, null);
-    expect(firstObserver.killed).toBe(true);
-    vi.advanceTimersByTime(500);
-    const observersAfter = mockedSpawn.mock.calls.filter(([, args]) =>
-      Array.isArray(args) && args.includes('terminal') && args.includes('observe'));
-    expect(observersAfter).toHaveLength(observersBefore.length + 1);
-    backend.kill();
-  });
 
   it('resize replaces the observer and forwards its full rebaseline frame', async () => {
     setHerdrResponses([
