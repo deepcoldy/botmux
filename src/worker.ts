@@ -4385,11 +4385,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         reason = 'zellij 功能性探针失败（需 zellij >= 0.44）';
       }
     } else if (effectiveBackend === 'herdr') {
-      // herdr's isAvailable() is a cheap, non-destructive `herdr --version`
-      // (not a disposable session probe), so it has no PR#249 false-negative
-      // risk and needs no existing-session exemption.
+      // Native terminal streaming is available from Herdr 0.7.2. The version
+      // probe is cheap and non-destructive, so existing sessions do not bypass
+      // this compatibility gate.
       available = HerdrBackend.isAvailable();
-      reason = 'herdr 功能性探针失败';
+      reason = 'herdr 不可用或版本低于 0.7.2（请执行 herdr update）';
     }
     const decision = decideBackendGate({ requested: effectiveBackend, available, hasExistingSession });
     if (decision.action === 'gate') {
