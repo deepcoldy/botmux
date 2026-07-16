@@ -15,6 +15,11 @@ describe('built-in botmux-send skill', () => {
     expect(skill!.content).toContain('--content-file');
     expect(skill!.content).toContain('Set-Content -LiteralPath $msg -Encoding utf8');
     expect(skill!.content).toContain('不要把中文直接通过 here-string');
+    expect(skill!.content).toContain('botmux send [content]` 接收原始正文');
+    expect(skill!.content).toContain('只有 `--card-json` / `--card-file` 的卡片输入才按 JSON 解析');
+    expect(skill!.content).toContain('JSON.stringify');
+    expect(skill!.content).toContain('外层工具协议会自行编码命令字符串');
+    expect(skill!.content).toContain('字面量 `\\n` 反解成换行');
   });
 
   it('warns that mention-back/no-mention are switches without values', () => {

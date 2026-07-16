@@ -652,8 +652,8 @@ export function buildNewTopicPrompt(
   if (!adapter.injectsSessionContext && adapter.skillsDir) {
     const mode = resolveSkillInjectionModeForApp(opts?.larkAppId);
     if (mode === 'prompt') {
-      // excludeRoutingCovered: send/history/quoted/bots live in <botmux_routing>
-      // already, so the catalog carries only the additional task capabilities.
+      // history/quoted/bots are fully covered by <botmux_routing>; send stays in
+      // the catalog as a compact trigger for complex delivery and safety rules.
       const entries = builtinSkillEntries({ asksViaHook: adapter.asksViaHook, whiteboardEnabled: whiteboardEnabled(), excludeRoutingCovered: true });
       skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
     } else if (mode === 'off') {

@@ -2,7 +2,7 @@
  * Built-in skill injection mode — how botmux's own bridge skills
  * (botmux-send / botmux-schedule / …) reach a CLI that only supports a GLOBAL
  * skills directory (codex/gemini/opencode/cursor/coco/traex/pi/oh-my-pi/mtr/
- * genius — everything with an adapter `skillsDir`, i.e. no per-session
+ * kiro-cli/genius/grok — everything with an adapter `skillsDir`, i.e. no per-session
  * `--plugin-dir` injection like Claude Code).
  *
  * Three modes, resolved from per-bot `skillInjection` (bots.json) → machine-wide
@@ -100,7 +100,8 @@ export function shouldInstallGlobalSkills(skillsDir: string): boolean {
  *    (claude-code / seed / relay), which set `pluginDir`. Not configurable: they
  *    always inject dynamically, no global leak. The mode knobs don't apply.
  *  - 'global': a shared global skills dir (`skillsDir`) — codex/gemini/opencode/
- *    cursor/coco/traex/pi/oh-my-pi/mtr/genius — where global|prompt|off applies.
+ *    cursor/coco/traex/pi/oh-my-pi/mtr/kiro-cli/genius/grok — where
+ *    global|prompt|off applies.
  *  - 'none': neither — the CLI has no skill mechanism (antigravity/aiden/hermes/
  *    mir/mira/codex-app), so there's nothing to configure.
  * Capability-based (not a hardcoded id list) so claude-family forks like relay
@@ -117,11 +118,20 @@ export function resolveSkillInjectionSupport(cliId: CliId, cliPathOverride?: str
 
 export interface BuiltinSkillEntry { name: string; description: string; content: string; }
 
-/** Skills already covered operationally by the always-present `<botmux_routing>`
- *  block (communication primitives). Excluded from the prompt-mode catalog so the
- *  catalog only carries the *additional* task capabilities and doesn't restate
- *  what routing says. `botmux skill show <name>` still serves their full text. */
-const ROUTING_COVERED_SKILLS = new Set(['botmux-send', 'botmux-history', 'botmux-quoted', 'botmux-bots']);
+/** Skills fully covered operationally by the always-present `<botmux_routing>`
+ *  block. `botmux-send` intentionally stays discoverable: routing teaches the
+ *  basic command, while its full skill owns complex delivery and safety rules. */
+const FULLY_ROUTING_COVERED_SKILLS = new Set(['botmux-history', 'botmux-quoted', 'botmux-bots']);
+
+/** Keep the prompt-mode discovery cost bounded. The native/global skill keeps
+ *  its full frontmatter description; the one-line session catalog only needs a
+ *  high-signal trigger for the send cases that routing does not fully cover. */
+function promptCatalogDescription(entry: BuiltinSkillEntry, locale?: Locale): string {
+  if (entry.name !== 'botmux-send') return entry.description;
+  return locale === 'en'
+    ? 'Read once before the first complex Lark send: multi-line/structured Markdown (tables or code blocks), attachments/cards/@mentions, cross-chat/top-level publishing, or --attention. Follow the full heredoc/--content-file guidance; never pass JSON.stringify/JSON-escaped \\n as literal text.'
+    : '首次复杂飞书发送前读取：多行/结构化 Markdown（表格或代码块）、附件/卡片/@mention、跨群/顶层发布或 --attention。按完整说明使用 heredoc/--content-file，不要把 JSON.stringify/JSON 转义产生的 \\n 当字面量发送。';
+}
 
 /** First `description:` value from a SKILL.md YAML frontmatter (single line). */
 function frontmatterDescription(content: string): string {
@@ -139,15 +149,15 @@ function frontmatterDescription(content: string): string {
 export function builtinSkillEntries(opts: {
   asksViaHook?: boolean;
   whiteboardEnabled?: boolean;
-  /** Drop the comms skills already spelled out in `<botmux_routing>` (send/
-   *  history/quoted/bots). Set for the prompt-mode catalog; leave off for
-   *  `botmux skill list`, which surfaces everything available. */
+  /** Drop comms skills fully covered by `<botmux_routing>` (history/quoted/bots).
+   *  Send remains as an on-demand complex-delivery skill. Set for the prompt-mode
+   *  catalog; leave off for `botmux skill list`, which surfaces everything. */
   excludeRoutingCovered?: boolean;
 }): BuiltinSkillEntry[] {
   let defs = [...BUILTIN_SKILLS];
   if (!opts.asksViaHook) defs.push({ name: ASK_SKILL_NAME, content: ASK_SKILL });
   if (opts.whiteboardEnabled) defs.push({ name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL });
-  if (opts.excludeRoutingCovered) defs = defs.filter((d) => !ROUTING_COVERED_SKILLS.has(d.name));
+  if (opts.excludeRoutingCovered) defs = defs.filter((d) => !FULLY_ROUTING_COVERED_SKILLS.has(d.name));
   return defs.map((d) => ({ name: d.name, description: frontmatterDescription(d.content), content: d.content }));
 }
 
@@ -170,9 +180,9 @@ export function buildBuiltinSkillCatalogBlock(entries: BuiltinSkillEntry[], loca
   if (entries.length === 0) return '';
   const en = locale === 'en';
   const intro = en
-    ? 'Beyond the send/history/quoted/bots commands in <botmux_routing>, you have these additional botmux skills (this botmux session only). Match the task against a description, then run `botmux skill show <name>` to read that skill\'s full instructions before acting — do not guess the commands.'
-    : '除了 <botmux_routing> 里已说明的 send / history / quoted / bots，你还有下面这些 botmux 内置技能（仅在当前 botmux 会话内可用）。先按描述判断该用哪个，再用 `botmux skill show <name>` 读取完整说明后再执行——不要凭空猜命令。';
-  const lines = entries.map((e) => `- ${e.name}: ${e.description}`);
+    ? '<botmux_routing> covers basic communication only. These supplementary botmux skills are available in this session. Match the task against a description, then run `botmux skill show <name>` to read that skill\'s full instructions before acting — do not guess the commands.'
+    : '<botmux_routing> 只覆盖基础通信用法。当前 botmux 会话还有下面这些可按需读取的内置技能。先按描述判断该用哪个，再用 `botmux skill show <name>` 读取完整说明后再执行——不要凭空猜命令。';
+  const lines = entries.map((e) => `- ${e.name}: ${promptCatalogDescription(e, locale)}`);
   // Distinct tag from the user-registered skill catalog (`<botmux_skills
   // mode=...>`, injected only in the worker via prepareSessionSkillPrompt) so
   // the two never collide and can co-exist in one prompt.

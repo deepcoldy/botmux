@@ -62,7 +62,7 @@ export function buildBotmuxSystemPromptText(opts: {
   botName?: string;
   botOpenId?: string;
   /** Optional built-in skill catalog / help pointer for injectsSessionContext
-   *  CLIs that have a global `skillsDir` (genius) running in `prompt` / `off`
+   *  CLIs that have a global `skillsDir` (genius/grok) running in `prompt` / `off`
    *  mode — appended after the routing/identity blocks. Claude Code delivers
    *  skills via --plugin-dir and passes nothing here. */
   builtinSkillBlock?: string;
