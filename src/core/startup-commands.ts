@@ -65,9 +65,14 @@ export function normalizeStartupCommandList(arr: unknown): string[] {
  * daemon restart recovering an existing session — is the SAME CLI with its
  * effort/model/context already established, so re-typing `/effort` (idempotent)
  * or `/clear`,`/compact` (NOT idempotent) would corrupt it. Skip on reattach.
+ * Also skip adapters that explicitly lack a TUI command transport: their stdin
+ * may accept text as normal user turns, which is not slash-command semantics.
  */
-export function shouldRunStartupCommandsOnSpawn(opts: { willReattachPersistent: boolean }): boolean {
-  return !opts.willReattachPersistent;
+export function shouldRunStartupCommandsOnSpawn(opts: {
+  willReattachPersistent: boolean;
+  acceptsTuiStartupCommands?: boolean;
+}): boolean {
+  return !opts.willReattachPersistent && opts.acceptsTuiStartupCommands !== false;
 }
 
 /**

@@ -7,6 +7,7 @@ import {
   shouldRunStartupCommandsOnSpawn,
   shouldDeferInitialPromptForStartup,
 } from '../src/core/startup-commands.js';
+import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
 describe('normalizeStartupCommand', () => {
   it('trims, adds a leading slash, and preserves argument spaces', () => {
@@ -66,6 +67,26 @@ describe('shouldRunStartupCommandsOnSpawn', () => {
     expect(shouldRunStartupCommandsOnSpawn({ willReattachPersistent: false })).toBe(true);
     expect(shouldRunStartupCommandsOnSpawn({ willReattachPersistent: true })).toBe(false);
   });
+
+  it('skips literal TUI commands for protocol adapters that opt out', () => {
+    expect(shouldRunStartupCommandsOnSpawn({
+      willReattachPersistent: false,
+      acceptsTuiStartupCommands: false,
+    })).toBe(false);
+  });
+
+  it('keeps existing adapters enabled when the capability is unspecified', () => {
+    expect(shouldRunStartupCommandsOnSpawn({
+      willReattachPersistent: false,
+      acceptsTuiStartupCommands: undefined,
+    })).toBe(true);
+  });
+});
+
+describe('codex-app startup-command capability', () => {
+  it('does not expose TUI startup commands through its protocol runner', () => {
+    expect(createCodexAppAdapter('/bin/echo').acceptsTuiStartupCommands).toBe(false);
+  });
 });
 
 describe('shouldDeferInitialPromptForStartup', () => {
@@ -92,9 +113,11 @@ describe('worker.ts startup-commands wiring', () => {
 
   it('re-arms the one-shot from the reattach prediction, not unconditionally', () => {
     // The re-arm is gated on the reattach prediction (skip on live reattach)…
-    expect(src).toContain('hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent })');
+    expect(src).toContain('const shouldRunStartupCommands = shouldRunStartupCommandsOnSpawn({');
+    expect(src).toContain('acceptsTuiStartupCommands: cliAdapter.acceptsTuiStartupCommands');
+    expect(src).toContain('hasRunStartupCommands = !shouldRunStartupCommands');
     // …and it lives AFTER willReattachPersistent is computed (must read it).
-    expect(src.indexOf('hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn'))
+    expect(src.indexOf('const shouldRunStartupCommands = shouldRunStartupCommandsOnSpawn'))
       .toBeGreaterThan(src.indexOf('const willReattachPersistent ='));
   });
 

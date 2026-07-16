@@ -4669,7 +4669,18 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // Fresh spawns (incl. resume that starts a new CLI, where hasSession is false)
   // arm it. spawnCli is synchronous up to backend spawn, so this lands before
   // any flushPending consumes the flag.
-  hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent });
+  const shouldRunStartupCommands = shouldRunStartupCommandsOnSpawn({
+    willReattachPersistent,
+    acceptsTuiStartupCommands: cliAdapter.acceptsTuiStartupCommands,
+  });
+  if (
+    cfg.startupCommands?.length
+    && !willReattachPersistent
+    && cliAdapter.acceptsTuiStartupCommands === false
+  ) {
+    log(`Skipping ${cfg.startupCommands.length} startup command(s) — ${cfg.cliId} has no TUI command transport`);
+  }
+  hasRunStartupCommands = !shouldRunStartupCommands;
   // Re-arm the bare-shell launch detector for this spawn (fresh OR reattach). It
   // runs once on the first flush and only fires when the pane leaf is actually a
   // bare shell, so a healthy reattach (leaf = the live CLI) self-excludes while a

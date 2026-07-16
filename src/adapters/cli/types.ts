@@ -118,6 +118,12 @@ export interface CliAdapter {
    *  triggered the resume would be lost. */
   readonly initialPromptArgsIgnoredOnResume?: boolean;
 
+  /** Whether botmux may type BotConfig.startupCommands as literal TUI input.
+   *  Defaults to true for backwards compatibility. Protocol-backed adapters
+   *  without a command TUI (for example codex-app) can set this to false:
+   *  otherwise `/effort ...` is indistinguishable from a normal user turn. */
+  readonly acceptsTuiStartupCommands?: boolean;
+
   /** Build a shell command string the user can paste into a terminal to
    *  resume this CLI session locally — independent of botmux. Used by the
    *  "session closed" card so users have an obvious way to keep the

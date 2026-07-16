@@ -76,6 +76,11 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return writeRunnerInput(pty, '::botmux-codex-app:', content, codexAppInput);
     },
 
+    // This adapter talks to app-server through a line-framed Node runner; it
+    // does not expose the Codex CLI TUI command parser. Literal `/effort ...`
+    // input would therefore start a model turn instead of changing a setting.
+    acceptsTuiStartupCommands: false,
+
     completionPattern: undefined,
     readyPattern: /›/,
     systemHints: [],
