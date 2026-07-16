@@ -134,3 +134,36 @@ print(row[0] or 0)
   if (proc.status !== 0) return 0;
   return Number.parseInt(proc.stdout.trim(), 10) || 0;
 }
+
+export function hermesSessionExists(sessionId: string | undefined, dbPath = HERMES_STATE_DB): boolean | undefined {
+  const sid = sessionId?.trim();
+  if (!sid || !existsSync(dbPath)) return undefined;
+  const script = `
+import sqlite3
+conn = sqlite3.connect(${JSON.stringify(dbPath)})
+sid = ${JSON.stringify(sid)}
+
+def has_table(name):
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1", (name,)).fetchone()
+    return row is not None
+
+if has_table('sessions'):
+    row = conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (sid,)).fetchone()
+    if row is not None:
+        print('1')
+        raise SystemExit(0)
+
+if has_table('messages'):
+    row = conn.execute("SELECT 1 FROM messages WHERE session_id = ? LIMIT 1", (sid,)).fetchone()
+    print('1' if row is not None else '0')
+    raise SystemExit(0)
+
+print('0')
+`;
+  const proc = spawnSync('python3', ['-c', script], { encoding: 'utf8' });
+  if (proc.status !== 0) return undefined;
+  const out = proc.stdout.trim();
+  if (out === '1') return true;
+  if (out === '0') return false;
+  return undefined;
+}

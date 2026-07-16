@@ -3,6 +3,7 @@ import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+import { hermesSessionExists } from '../../services/hermes-transcript.js';
 
 export function createHermesAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
@@ -14,16 +15,20 @@ export function createHermesAdapter(pathOverride?: string): CliAdapter {
     id: 'hermes',
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, disableCliBypass }) {
+    buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass }) {
       const args: string[] = [];
-      if (resume) args.push('--resume', sessionId);
+      if (resume) args.push('--resume', resumeSessionId ?? sessionId);
       if (!disableCliBypass) args.push('--yolo', '--accept-hooks');
       args.push('--pass-session-id');
       return args;
     },
 
-    buildResumeCommand({ sessionId }) {
-      return `hermes --resume ${sessionId}`;
+    buildResumeCommand({ sessionId, cliSessionId }) {
+      return `hermes --resume ${cliSessionId ?? sessionId}`;
+    },
+
+    checkResumeTargetExists({ sessionId, cliSessionId, stateDbPath }) {
+      return hermesSessionExists(cliSessionId ?? sessionId, stateDbPath);
     },
 
     async writeInput(pty: PtyHandle, content: string) {
