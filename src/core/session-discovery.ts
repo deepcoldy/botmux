@@ -614,6 +614,43 @@ function herdrAgentCliId(agent: any, filterCliId?: CliId): CliId | undefined {
   return name ? cliIdForComm(name, filterCliId) : undefined;
 }
 
+function herdrForegroundProcesses(raw: any): any[] {
+  const processes = raw?.result?.process_info?.foreground_processes
+    ?? raw?.process_info?.foreground_processes;
+  return Array.isArray(processes) ? processes : [];
+}
+
+function herdrProcessPid(process: any): number | undefined {
+  const pid = process?.pid;
+  return typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+/** Resolve the CLI pid from Herdr's pane process metadata. Direct executable
+ * identities win over launcher argv matches when both members of a foreground
+ * process group are reported (for example node → native codex). */
+function herdrCliPid(raw: any, cliId: CliId): number | undefined {
+  const processes = herdrForegroundProcesses(raw).filter(p => herdrProcessPid(p) !== undefined);
+  for (const process of processes) {
+    for (const value of [process?.argv0, process?.name]) {
+      if (typeof value === 'string' && cliIdForComm(basename(value), cliId) === cliId) {
+        return herdrProcessPid(process);
+      }
+    }
+  }
+  for (const process of processes) {
+    const comm = typeof process?.name === 'string'
+      ? basename(process.name)
+      : (typeof process?.argv0 === 'string' ? basename(process.argv0) : undefined);
+    if (!comm) continue;
+    const argv = Array.isArray(process?.argv)
+      ? process.argv.filter((arg: unknown): arg is string => typeof arg === 'string')
+      : [];
+    if (typeof process?.argv0 === 'string') argv.unshift(process.argv0);
+    if (cliIdFromCommArgv(comm, argv, cliId) === cliId) return herdrProcessPid(process);
+  }
+  return undefined;
+}
+
 function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[] {
   const rawSessions = herdrJson(['session', 'list', '--json']);
   const sessions = extractHerdrSessions(rawSessions).filter((s: any) => {
@@ -633,6 +670,11 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
       const terminalId = typeof agent?.terminal_id === 'string' ? agent.terminal_id : undefined;
       const agentName = typeof agent?.agent === 'string' ? agent.agent : undefined;
       if (!cwd || !paneId) continue;
+      const processInfo = herdrJson([
+        '--session', sessionName,
+        'pane', 'process-info', '--pane', paneId,
+      ]);
+      const cliPid = herdrCliPid(processInfo, cliId);
       const claudeMeta = cliId === 'claude-code' ? findUniqueClaudeSessionByCwd(cwd) : undefined;
       results.push({
         source: 'herdr',
@@ -641,6 +683,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
         herdrPaneId: paneId,
         herdrAgentName: agentName,
         herdrTerminalId: terminalId,
+        ...(cliPid ? { cliPid } : {}),
         cliId,
         sessionId: claudeMeta?.sessionId,
         cwd,
@@ -853,3 +896,4 @@ export function validateAdoptTargetState(target: AdoptableSession | NonNullable<
 export const __testOnly_readComm = readComm;
 export const __testOnly_readCwd = readCwd;
 export const __testOnly_getChildPids = getChildPids;
+export const __testOnly_herdrCliPid = herdrCliPid;

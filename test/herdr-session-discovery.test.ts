@@ -52,6 +52,14 @@ const mockedExecSync = vi.mocked(execSync);
 interface HerdrFixture {
   sessions: Array<{ name: string; running: boolean }>;
   agentsBySession: Record<string, Array<{ name?: string; agent?: string; pane_id?: string; terminal_id?: string; cwd?: string }>>;
+  processInfoByPane?: Record<string, {
+    foreground_processes?: Array<{
+      pid?: number;
+      name?: string;
+      argv0?: string;
+      argv?: string[];
+    }>;
+  }>;
   /** Throw on certain probes to simulate `unknown` validation result. */
   failOn?: (args: string[]) => boolean;
 }
@@ -70,6 +78,11 @@ function installHerdrFixture(fx: HerdrFixture) {
       if (argv.includes('agent') && argv.includes('list')) {
         const agents = fx.agentsBySession[sessionName] ?? [];
         return JSON.stringify({ result: { agents } }) as any;
+      }
+      if (argv.includes('pane') && argv.includes('process-info')) {
+        const paneId = argv[argv.indexOf('--pane') + 1];
+        const process_info = fx.processInfoByPane?.[paneId] ?? {};
+        return JSON.stringify({ result: { process_info } }) as any;
       }
     }
     return '' as any;
@@ -104,6 +117,21 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
           { name: 'botmux', agent: 'claude', pane_id: '5-5', cwd: '/projects/own' },
         ],
       },
+      processInfoByPane: {
+        '1-1': {
+          foreground_processes: [
+            { pid: 4101, name: 'node', argv0: 'claude' },
+          ],
+        },
+        '1-2': {
+          // Herdr may return both the native CLI and its launcher in one
+          // foreground process group. Prefer the direct native identity.
+          foreground_processes: [
+            { pid: 4202, name: 'codex', argv0: 'codex' },
+            { pid: 4201, name: 'node', argv0: 'node', argv: ['node', '/opt/bin/codex'] },
+          ],
+        },
+      },
     });
 
     const sessions = discoverAdoptableSessions();
@@ -117,6 +145,7 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
       herdrPaneId: '1-1',
       herdrTarget: '1-1',
       herdrTerminalId: 't-1',
+      cliPid: 4101,
       cwd: '/projects/api',
     });
 
@@ -125,8 +154,51 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
       source: 'herdr',
       herdrSessionName: 'work',
       herdrPaneId: '1-2',
+      cliPid: 4202,
       cwd: '/projects/web',
     });
+  });
+
+  it('leaves cliPid unset when pane process metadata has no matching CLI', () => {
+    installHerdrFixture({
+      sessions: [{ name: 'work', running: true }],
+      agentsBySession: {
+        work: [{ agent: 'pi', pane_id: '1-1', cwd: '/projects/pi' }],
+      },
+      processInfoByPane: {
+        '1-1': {
+          foreground_processes: [{ pid: 4301, name: 'bash', argv0: 'bash' }],
+        },
+      },
+    });
+
+    const [session] = discoverAdoptableSessions('pi');
+    expect(session).toMatchObject({ source: 'herdr', cliId: 'pi', cwd: '/projects/pi' });
+    expect(session).not.toHaveProperty('cliPid');
+  });
+
+  it('parses the Pi integration PID from pane process-info', () => {
+    installHerdrFixture({
+      sessions: [{ name: 'work', running: true }],
+      agentsBySession: {
+        work: [{ agent: 'pi', pane_id: '1-1', terminal_id: 'term-pi', cwd: '/projects/pi' }],
+      },
+      processInfoByPane: {
+        '1-1': {
+          // Live Herdr 0.7.4 reports Pi as a node process with argv0=pi.
+          foreground_processes: [{ pid: 16493, name: 'node', argv0: 'pi' }],
+        },
+      },
+    });
+
+    expect(discoverAdoptableSessions('pi')).toEqual([
+      expect.objectContaining({
+        source: 'herdr',
+        herdrPaneId: '1-1',
+        cliId: 'pi',
+        cliPid: 16493,
+      }),
+    ]);
   });
 
   it('filters by CliId when requested', () => {

@@ -211,6 +211,12 @@ import {
   RELAY_ORIGIN_CAPABILITY_BASENAME,
   replaceManagedOriginCapabilityFile,
 } from './core/managed-origin-capability.js';
+import {
+  claimCliPidMarkerFile,
+  releaseCliPidMarkerFile,
+  updateCliPidMarkerFile,
+  type CliPidMarkerRecord,
+} from './core/cli-pid-marker.js';
 import { CodexRpcEngine } from './codex-rpc-engine.js';
 
 // A worker must never trust an INHERITED session-level CLI home pointer
@@ -1361,46 +1367,99 @@ function authorizeManagedSend(
     : { ok: false, error: `${decision.errorCode}: ${decision.error}` };
 }
 
-function clearRpcEnginePidMarker(): void {
-  if (!rpcEnginePidMarker) return;
-  try { unlinkSync(rpcEnginePidMarker); } catch { /* already gone */ }
-  rpcEnginePidMarker = null;
+function cliPidMarkerRecord(path: string): CliPidMarkerRecord {
+  const markerPid = Number(basename(path));
+  const procStart = Number.isInteger(markerPid) && markerPid > 0
+    ? readProcessStartIdentity(markerPid)
+    : undefined;
+  return {
+    sessionId,
+    turnId: currentBotmuxTurnId ?? null,
+    dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
+    ...(procStart ? { procStart } : {}),
+    workerPid: process.pid,
+  };
 }
 
-function registerRpcEnginePidMarker(pid: number | undefined): void {
-  clearRpcEnginePidMarker();
-  if (!pid || !process.env.SESSION_DATA_DIR) return;
+function writeCliPidMarkerPath(path: string, reclaimSameSession = false): boolean {
+  if (!sessionId) return false;
   try {
-    const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
-    mkdirSync(markersDir, { recursive: true });
-    rpcEnginePidMarker = join(markersDir, String(pid));
-    writeCliPidMarker();
-    log(`Codex RPC app-server PID marker written: ${pid}`);
+    const marker = cliPidMarkerRecord(path);
+    const result = reclaimSameSession
+      ? claimCliPidMarkerFile(path, marker)
+      : updateCliPidMarkerFile(path, marker);
+    if (!result.written) {
+      log(`CLI PID marker ${path} not updated: owned by session ${result.ownerSessionId}`);
+      return false;
+    }
+    return true;
   } catch (err: any) {
-    rpcEnginePidMarker = null;
-    log(`Failed to write Codex RPC app-server PID marker: ${err?.message ?? err}`);
+    log(`Failed to update CLI PID marker ${path}: ${err?.message ?? err}`);
+    return false;
   }
 }
 
 function writeCliPidMarker(): void {
-  if (!sessionId) return;
   for (const markerPath of [cliPidMarker, rpcEnginePidMarker]) {
-    if (!markerPath) continue;
-    try {
-      // 原子写：daemon 侧（killStalePids 等）随时读这个 marker JSON。
-      const markerPid = Number(basename(markerPath));
-      const procStart = Number.isInteger(markerPid) && markerPid > 0
-        ? readProcessStartIdentity(markerPid)
-        : undefined;
-      atomicWriteFileSync(markerPath, JSON.stringify({
-        sessionId,
-        turnId: currentBotmuxTurnId ?? null,
-        dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
-        ...(procStart ? { procStart } : {}),
-      }));
-    } catch (err: any) {
-      log(`Failed to update CLI PID marker ${markerPath}: ${err?.message ?? err}`);
+    if (markerPath) writeCliPidMarkerPath(markerPath);
+  }
+}
+
+function releaseCliPidMarkerPath(path: string): void {
+  if (!sessionId) return;
+  try {
+    releaseCliPidMarkerFile(path, cliPidMarkerRecord(path));
+  } catch (err: any) {
+    log(`Failed to clean up CLI PID marker ${path}: ${err?.message ?? err}`);
+  }
+}
+
+function claimCliPidMarker(pid: number, source: string): void {
+  if (!process.env.SESSION_DATA_DIR || !sessionId) return;
+  const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
+  try {
+    mkdirSync(markersDir, { recursive: true });
+    cliPidMarker = join(markersDir, String(pid));
+    if (writeCliPidMarkerPath(cliPidMarker, true)) {
+      log(`CLI PID marker written (${source}): ${pid}`);
+    } else {
+      cliPidMarker = null;
     }
+  } catch (err: any) {
+    cliPidMarker = null;
+    log(`Failed to write CLI PID marker (${source}): ${err?.message ?? err}`);
+  }
+}
+
+function releaseCliPidMarker(): void {
+  if (!cliPidMarker) return;
+  const path = cliPidMarker;
+  cliPidMarker = null;
+  releaseCliPidMarkerPath(path);
+}
+
+function clearRpcEnginePidMarker(): void {
+  if (!rpcEnginePidMarker) return;
+  const path = rpcEnginePidMarker;
+  rpcEnginePidMarker = null;
+  releaseCliPidMarkerPath(path);
+}
+
+function registerRpcEnginePidMarker(pid: number | undefined): void {
+  clearRpcEnginePidMarker();
+  if (!pid || !process.env.SESSION_DATA_DIR || !sessionId) return;
+  try {
+    const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
+    mkdirSync(markersDir, { recursive: true });
+    rpcEnginePidMarker = join(markersDir, String(pid));
+    if (writeCliPidMarkerPath(rpcEnginePidMarker, true)) {
+      log(`Codex RPC app-server PID marker written: ${pid}`);
+    } else {
+      rpcEnginePidMarker = null;
+    }
+  } catch (err: any) {
+    rpcEnginePidMarker = null;
+    log(`Failed to write Codex RPC app-server PID marker: ${err?.message ?? err}`);
   }
 }
 let lastStructuredBridgeActivityAtMs = 0;
@@ -5550,6 +5609,7 @@ async function spawnCli(
       rows,
       env: process.env as Record<string, string>,
     });
+    if (cfg.adoptCliPid) claimCliPidMarker(cfg.adoptCliPid, 'herdr adopt');
 
     wireHerdrWebTerminalRelays(herdrBe);
     seedBackendScreen('herdr adopt', herdrBe);
@@ -5569,6 +5629,7 @@ async function spawnCli(
     });
     backend.onExit((code, signal) => {
       log(`Adopted herdr stream ended (code: ${code}, signal: ${signal})`);
+      releaseCliPidMarker();
       backend = null;
       isPromptReady = false;
       stopBridgeWatcher();
@@ -5610,6 +5671,7 @@ async function spawnCli(
       rows,
       env: process.env as Record<string, string>,
     });
+    if (cfg.adoptCliPid) claimCliPidMarker(cfg.adoptCliPid, `${effectiveBackendType} adopt`);
 
     // Seed the shared scrollback with the pane's current screen so any
     // already-connected (or future) WS clients render meaningful content
@@ -5632,6 +5694,7 @@ async function spawnCli(
     });
     backend.onExit((code, signal) => {
       log(`Adopted pipe-pane stream ended (code: ${code}, signal: ${signal})`);
+      releaseCliPidMarker();
       backend = null;
       isPromptReady = false;
       stopBridgeWatcher();
@@ -6751,17 +6814,7 @@ async function spawnCli(
   // can verify they were spawned inside a botmux session by walking the
   // process tree and looking for a matching pid file in this directory.
   const cliPid = backend.getChildPid?.();
-  if (cliPid && process.env.SESSION_DATA_DIR) {
-    const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
-    try {
-      mkdirSync(markersDir, { recursive: true });
-      cliPidMarker = join(markersDir, String(cliPid));
-      writeCliPidMarker();
-      log(`CLI PID marker written: ${cliPid}`);
-    } catch (err: any) {
-      log(`Failed to write CLI PID marker: ${err.message}`);
-    }
-  }
+  if (cliPid) claimCliPidMarker(cliPid, 'spawn');
 
   // wrapperCli launcher (e.g. `aiden x claude`): the pid wired above is the
   // LAUNCHER's, but it forks the real CLI (real Claude Code, Codex, …) as a
@@ -6825,17 +6878,7 @@ async function spawnCli(
       if (!backend) return;
       const pid = backend.getChildPid?.();
       if (pid) {
-        if (process.env.SESSION_DATA_DIR && !cliPidMarker) {
-          try {
-            const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
-            mkdirSync(markersDir, { recursive: true });
-            cliPidMarker = join(markersDir, String(pid));
-            writeCliPidMarker();
-            log(`CLI PID marker written (async): ${pid}`);
-          } catch (err: any) {
-            log(`Failed to write CLI PID marker (async): ${err.message}`);
-          }
-        }
+        if (!cliPidMarker) claimCliPidMarker(pid, 'async spawn');
         if (claudeDataDir || cfg.cliId === 'grok') {
           (backend as TmuxBackend | PtyBackend | ZellijBackend).cliPid = pid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend).cliCwd = cfg.workingDir;
@@ -7235,11 +7278,8 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   // would dangle a watcher pinned to a stale jsonl path.
   stopBridgeWatcher();
   stopCodexBridge();
-  // Clean up CLI PID marker
-  if (cliPidMarker) {
-    try { unlinkSync(cliPidMarker); } catch { /* already gone */ }
-    cliPidMarker = null;
-  }
+  // Clean up only the marker still owned by this worker generation.
+  releaseCliPidMarker();
   completeManagedTurnOriginRevocation(
     sandboxRelayCapability,
     currentBotmuxTurnId,
@@ -9225,7 +9265,7 @@ function teardownSandboxBestEffort(): void {
 // and process.exit(1), killing a live session over a dropped log write. Install
 // the guard before any further stdout writes (log() writes to process.stdout).
 installStdioEpipeGuard();
-process.on('exit', () => { teardownSandboxBestEffort(); stopCodexRpcEngine(); });
+process.on('exit', () => { releaseCliPidMarker(); teardownSandboxBestEffort(); stopCodexRpcEngine(); });
 process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   // A broken pipe on stdout/stderr (or any socket) must not tear down a live
   // session — the stdio guard handles those it can; this is the backstop.

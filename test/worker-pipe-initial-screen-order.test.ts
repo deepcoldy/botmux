@@ -205,6 +205,28 @@ describe('worker pipe initial screen ordering', () => {
     expect(herdrBlock).toContain('herdrBe.cliPid = cfg.adoptCliPid');
     expect(herdrBlock).toContain('cfg.adoptCwd ?? cfg.workingDir');
     expect(herdrBlock).toContain('herdrBe.cliCwd');
+    expect(herdrBlock).toContain("if (cfg.adoptCliPid) claimCliPidMarker(cfg.adoptCliPid, 'herdr adopt')");
+    expect(herdrBlock).toContain('releaseCliPidMarker();');
+  });
+
+  it('keeps adopt marker turn updates and cleanup on the worker lifecycle', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const pipeStart = source.indexOf("cfg.adoptMode && (cfg.adoptTmuxTarget || cfg.adoptZellijPaneId)");
+    const pipeEnd = source.indexOf("cliAdapter = createCliAdapterSync", pipeStart);
+    const pipeBlock = source.slice(pipeStart, pipeEnd);
+    expect(pipeBlock).toContain('if (cfg.adoptCliPid) claimCliPidMarker(');
+    expect(pipeBlock).toContain('releaseCliPidMarker();');
+
+    const messageStart = source.indexOf("case 'message':");
+    const messageEnd = source.indexOf("case 'raw_input':", messageStart);
+    const messageBlock = source.slice(messageStart, messageEnd);
+    expect(messageBlock).toContain('if (lastInitConfig?.adoptMode)');
+    expect(messageBlock).toContain('writeCliPidMarker();');
+
+    const killStart = source.indexOf('function killCli(');
+    const killEnd = source.indexOf('\nfunction ', killStart + 1);
+    expect(source.slice(killStart, killEnd)).toContain('releaseCliPidMarker();');
+    expect(source).toContain("process.on('exit', () => { releaseCliPidMarker();");
   });
 
   it('wires Herdr adopt snapshots before seeding the initial screen', () => {
