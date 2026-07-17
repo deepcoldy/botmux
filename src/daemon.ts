@@ -15922,6 +15922,10 @@ async function maybeIngestDeliveryEnvelope(input: {
     logger.warn(`[delivery-envelope] unknown/wrong-goal task=${result.taskId} goal=${goalChatId} msg=${input.parsed.messageId}`);
     return true;
   }
+  if (result.outcome === 'task_not_dispatched') {
+    logger.warn(`[delivery-envelope] task not dispatched yet task=${result.taskId} goal=${goalChatId} msg=${input.parsed.messageId}`);
+    return true;
+  }
   if (result.outcome === 'unauthorized') {
     logger.warn(`[delivery-envelope] unauthorized senderOpenId=${senderOpenId} senderUnionId=${senderUnionId ?? ''} task=${result.taskId} goal=${goalChatId} msg=${input.parsed.messageId} allowedOpenIds=[${result.allowedOpenIds.join(',')}] allowedUnionIds=[${result.allowedUnionIds.join(',')}] app=${input.larkAppId}`);
     return true;

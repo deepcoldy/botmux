@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -141,12 +141,14 @@ describe('reconcileTaskByCriteria — verify → ledger events', () => {
   it('worker reported + verify pass → accepts the existing report (no synthetic report)', () => {
     const led = dispatched('t3');
     led.append(draft({ type: 'TaskReported', actor: 'worker', taskId: 't3', chatId: 'oc_g', idempotencyKey: 'reported:t3-r1', payload: { taskId: 't3', reportId: 't3-r1', summary: 'done', evidence: [{ kind: 'path', path: '/tmp/vd-demo/x.txt' }] } }));
-    const r = reconcileTaskByCriteria(led, 't3', { checkedBy: 'sup', now: TS, verify: pass });
+    const onAccepted = vi.fn();
+    const r = reconcileTaskByCriteria(led, 't3', { checkedBy: 'sup', now: TS, verify: pass, onAccepted });
     expect(r.action).toBe('accepted');
     expect(r.reportId).toBe('t3-r1');
     const task = led.task('t3')!;
     expect(task.reports).toHaveLength(1); // reused existing, no synthesis
     expect(task.status).toBe('accepted');
+    expect(onAccepted).toHaveBeenCalledWith({ taskId: 't3', goalChatId: 'oc_g', acceptedEventId: r.eventId });
   });
 
   it('worker reported + verify fail → rejects the existing report with check_failed', () => {

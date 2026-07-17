@@ -50,7 +50,14 @@ import {
   generateTaskId,
   parseDeliveryDuration,
 } from './core/verified-delivery.js';
-import { REJECT_REASON, type HelpKind, type RejectReason, type TaskStatus } from './verified-delivery/types.js';
+import { resolveTaskPlanTransition } from './verified-delivery/planning.js';
+import {
+  REJECT_REASON,
+  type HelpKind,
+  type RejectReason,
+  type TaskDispatchWorkerSpec,
+  type TaskStatus,
+} from './verified-delivery/types.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
@@ -4311,6 +4318,54 @@ async function triggerGoalWatchdogFromCli(
   return { contacted, injected, reconciled, busy, rateLimited };
 }
 
+/** Fast-path dependency release check after an accept. Failure is deliberately
+ * ignored: the daemon's periodic scan is the correctness fallback. */
+async function triggerGoalReleaseCheckFromCli(
+  goalChatId: string,
+  sessionId?: string,
+  larkAppId?: string,
+): Promise<boolean> {
+  if (sessionId && larkAppId) {
+    const daemon = findDaemon(larkAppId);
+    if (daemon) {
+      const ctrl = new AbortController();
+      const tt = setTimeout(() => ctrl.abort(), 3_000);
+      try {
+        const res = await postSessionScopedDaemonIpc(
+          daemon.ipcPort,
+          sessionId,
+          '/api/goal/release-check',
+          { goalChatId, reason: 'task-accepted', callerSessionId: sessionId },
+          ctrl.signal,
+        );
+        if (res.ok) return true;
+      } catch {
+        // Fall through to trusted-host fan-out.
+      } finally {
+        clearTimeout(tt);
+      }
+    }
+  }
+  const results = await Promise.all(listOnlineDaemons().map(async (daemon) => {
+    const ctrl = new AbortController();
+    const tt = setTimeout(() => ctrl.abort(), 3_000);
+    try {
+      const res = await fetchDaemonIpc(daemon.ipcPort, '/api/goal/release-check', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ goalChatId, reason: 'task-accepted' }),
+        signal: ctrl.signal,
+      });
+      return res.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(tt);
+    }
+  }));
+  return results.some(Boolean);
+}
+
 async function cmdResume(): Promise<void> {
   const target = process.argv[3];
   if (!target) {
@@ -7010,7 +7065,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   群级派活（默认，不开话题）:
     botmux dispatch --title "子项目标题" --bot <open_id[:名字[:角色]]> [--bot ...] \\
         [--brief "简报" | --brief-file <path>] [--repo <工作目录> | --needs-repo <远端URL或别名>] [--standby] \\
-        [--task-id <id>] [--acceptance-hint <text>] [--new-topic]
+        [--task-id <id>] [--acceptance-hint <text>] [--after <上游taskId>]... [--new-topic]
   往已有话题追加（激活待命 bot / 追加协调）:
     botmux dispatch --into <话题根消息id> --bot <spec> [--bot ...] (--brief ... | --brief-file ...)
 
@@ -7019,6 +7074,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --new-topic: 显式开隔离话题，适合多执行者并行、深度协作或防刷屏。
   --repo:   先用 /repo 给每个子 bot 定好工作目录——spawn 时不弹「选仓库」卡、不用手点。
   --needs-repo: 跨设备派活时声明所需项目；接收端用自己的本地目录自检，缺少时立即求助。
+  --after: 只登记依赖关系，不立即联系执行者；所有上游任务验收通过后自动派发。可重复。
   --standby: 配合 --repo——只把 bot 拉起来定好目录待命（不派简报），之后用 --into 或群级消息派具体任务。
   --into:   不建种子，直接回到已有话题线程 @ bot 追加一条。
   返回 JSON（含 delivery=chat|thread），供主控/监管者登记派活位置。
@@ -7034,6 +7090,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --new-topic           显式为本次派活开独立话题（默认不开）
   --task-id <id>        覆盖可信交付任务号（默认自动生成 task-<slug>-<hash8>）
   --acceptance-hint <t> 监管者打算如何验收，随任务简报和交付记录一起传给执行者
+  --after <taskId>      等该上游任务验收通过后再自动派发，可重复
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
   --chat-id <id>        覆盖目标群（默认当前会话所在群）
   --skip-readiness-check 跳过已确认的群成员/版本不兼容错误（仍打印诊断）
@@ -7058,12 +7115,15 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const newTopic = rest.includes('--new-topic');
   const skipReadinessCheck = rest.includes('--skip-readiness-check');
   const botSpecs = argValues(rest, '--bot');
+  const hasAfter = rest.some((value) => value === '--after' || value.startsWith('--after='));
+  const afterTaskIds = argValues(rest, '--after');
 
   let brief = argValue(rest, '--brief') ?? '';
   if (briefFile) {
     if (!existsSync(briefFile)) { console.error(`文件不存在: ${briefFile}`); process.exit(1); }
     brief = readFileSync(briefFile, 'utf-8');
   }
+  const briefBase = brief;
 
   const taskId = (!intoRoot && !standby)
     ? (explicitTaskId?.trim() || generateTaskId({ title: title.trim() || '子项目', brief }))
@@ -7104,6 +7164,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }
   if (repo && needsRepo) {
     console.error('--repo 与 --needs-repo 不能同用：前者共享路径，后者让每台机器自行解析项目。');
+    process.exit(1);
+  }
+  if (hasAfter && afterTaskIds.length === 0) {
+    console.error('--after 需要一个上游任务号，可重复传入。');
+    process.exit(1);
+  }
+  if (hasAfter && (repo || standby || intoRoot || newTopic || skipReadinessCheck)) {
+    console.error('--after 只支持群级单消息派发，不能与 --repo / --standby / --into / --new-topic / --skip-readiness-check 同用。');
     process.exit(1);
   }
   if (needsRepo && (standby || intoRoot)) {
@@ -7148,6 +7216,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const targetChatId = overrideChatId ?? s.chatId;
   if (!targetChatId) { console.error(`session ${sid} 缺少 chatId，且未提供 --chat-id`); process.exit(1); }
   const appId = s.larkAppId!;
+  const deliveryLedger = openLedger();
+  if (taskId && !hasAfter) {
+    const current = deliveryLedger.task(taskId);
+    if (current?.plan && current.status === 'cancelled') {
+      console.error(`任务 ${taskId} 是已取消的依赖任务；如需重开，请重复原来的 --after 声明。`);
+      process.exit(1);
+    }
+  }
 
   const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
   let botConfigs: ReturnType<typeof loadBotConfigs> = [];
@@ -7250,6 +7326,85 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     });
   } catch { /* best effort: workers without botUnionId fall back to open_id auth */ }
   const hasWorkerBotUnionIds = workerBotUnionIds.some(Boolean);
+  if (hasAfter) {
+    if (!taskId) {
+      console.error('--after 需要一个新任务号；请勿与 --standby 或 --into 同用。');
+      process.exit(1);
+    }
+    let transition;
+    try {
+      transition = resolveTaskPlanTransition({
+        taskId,
+        dependsOnTaskIds: afterTaskIds,
+        current: deliveryLedger.task(taskId),
+      });
+    } catch (err: any) {
+      console.error(`依赖任务登记失败: ${err.message}`);
+      process.exit(1);
+    }
+    for (const dependencyId of transition.dependsOnTaskIds) {
+      const dependency = deliveryLedger.task(dependencyId);
+      if (!dependency) {
+        console.error(`依赖任务登记失败: 未找到上游任务 ${dependencyId}`);
+        process.exit(1);
+      }
+      if (dependency.chatId !== targetChatId) {
+        console.error(`依赖任务登记失败: 上游任务 ${dependencyId} 不属于当前目标群`);
+        process.exit(1);
+      }
+    }
+    const frozenWorkerSpecs: TaskDispatchWorkerSpec[] = built.mentionedOpenIds.map((openId, index) => ({
+      openId,
+      name: workerNames[index] || undefined,
+      role: bots[index]?.role?.trim() || undefined,
+      larkAppId: workerLarkAppIds[index] || undefined,
+      cliId: workerCliIds[index] || undefined,
+      unionId: workerBotUnionIds[index] || undefined,
+    }));
+    try {
+      const planned = deliveryLedger.append({
+        type: 'TaskPlanned',
+        actor: 'orchestrator',
+        taskId,
+        chatId: targetChatId,
+        ts: Date.now(),
+        idempotencyKey: transition.idempotencyKey,
+        payload: {
+          taskId,
+          chatId: targetChatId,
+          title: title.trim(),
+          dependsOnTaskIds: transition.dependsOnTaskIds,
+          planGeneration: transition.planGeneration,
+          reopenOfCancelEventId: transition.reopenOfCancelEventId,
+          plannedBy: s.ownerOpenId?.trim() || sid,
+          dispatchSpec: {
+            title: title.trim(),
+            briefBase,
+            workers: frozenWorkerSpecs,
+            senderLarkAppId: appId,
+            requiredRepo: needsRepo || undefined,
+            acceptanceHint: acceptanceHint?.trim() || undefined,
+            acceptanceCriteria: parsedAcceptance.criteria,
+          },
+        },
+      });
+      console.log(JSON.stringify({
+        success: true,
+        mode: 'planned',
+        taskId,
+        chatId: targetChatId,
+        dependsOnTaskIds: transition.dependsOnTaskIds,
+        planGeneration: transition.planGeneration,
+        released: false,
+        contactedWorkers: false,
+        deduped: planned.deduped,
+      }, null, 2));
+      return;
+    } catch (err: any) {
+      console.error(`依赖任务登记失败: ${err.message}`);
+      process.exit(1);
+    }
+  }
   const { sendMessage, replyMessage, probeChatBotMembership } = await import('./im/lark/client.js');
 
   let membership;
@@ -7316,7 +7471,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     }
 
     if (taskId) {
-      openLedger().append({
+      deliveryLedger.append({
         type: 'TaskDispatched',
         actor: 'orchestrator',
         taskId,
@@ -7775,7 +7930,7 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
   查看任务:
     botmux delivery show --task <taskId>
   列出任务:
-    botmux delivery list [--goal <chatId>] [--status dispatched|reported|accepted|rejected|blocked|escalated|cancelled] [--older-than 2h]
+    botmux delivery list [--goal <chatId>] [--status planned|dispatched|reported|accepted|rejected|blocked|escalated|cancelled] [--older-than 2h]
   验收通过:
     botmux delivery accept --task <taskId> [--report <reportId>] \\
         [--checked-by <id>] [--note <text>] [--evidence-checked <ref>]... [--ran-command <cmd>]...
@@ -7802,9 +7957,9 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
   if (sub === 'list') {
     const goal = argValue(rest, '--goal', '--chat-id');
     const status = argValue(rest, '--status');
-    const validStatuses = new Set<TaskStatus>(['dispatched', 'reported', 'accepted', 'rejected', 'blocked', 'escalated', 'cancelled']);
+    const validStatuses = new Set<TaskStatus>(['planned', 'dispatched', 'reported', 'accepted', 'rejected', 'blocked', 'escalated', 'cancelled']);
     if (status && !validStatuses.has(status as TaskStatus)) {
-      console.error('delivery list: --status 必须是 dispatched / reported / accepted / rejected / blocked / escalated / cancelled');
+      console.error('delivery list: --status 必须是 planned / dispatched / reported / accepted / rejected / blocked / escalated / cancelled');
       process.exit(1);
     }
     const taskStatus = status as TaskStatus | undefined;
@@ -8056,7 +8211,17 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
         },
       });
     }
-    console.log(JSON.stringify({ success: true, taskId, reportId, accepted: true, deduped: result.deduped }));
+    const releaseCheckTriggered = !result.deduped && task.chatId
+      ? await triggerGoalReleaseCheckFromCli(task.chatId, sid ?? undefined, s?.larkAppId)
+      : false;
+    console.log(JSON.stringify({
+      success: true,
+      taskId,
+      reportId,
+      accepted: true,
+      deduped: result.deduped,
+      releaseCheckTriggered,
+    }));
     return;
   }
 

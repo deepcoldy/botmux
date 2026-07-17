@@ -7,9 +7,9 @@
 //
 // Aesthetic: borrows the v3 "flight recorder" language — mono-LED task ids, status
 // LEDs, staged reveal — but stays inside the dashboard's CSS variables + themes.
-// No DAG: subtasks are flat (no deps); the lifecycle pipeline IS the progress
-// model. The "核验" stage lights amber while a report awaits verification — exactly
-// the gap the goal-watchdog fills, made visible.
+// Dependency-gated tasks stay visible as "等待依赖" until their immutable upstream
+// edges are satisfied. The "核验" stage lights amber while a report awaits
+// verification — exactly the gap the goal-watchdog fills, made visible.
 import { escapeHtml, relTime, loadNameMaps, botNameForOpenId, botNameForAppId, chatNameForId } from './ui.js';
 import { isMissingRepoBlocker } from '../../core/repo-help.js';
 
@@ -22,9 +22,10 @@ interface BoardAttempt { reportId: string; ts?: number; verdict?: 'accepted' | '
 interface BoardTask {
   taskId: string; title?: string; status: string;
   workerOpenIds?: string[]; workerNames?: string[]; latestReportId?: string; reportCount: number;
+  dependsOnTaskIds?: string[];
   acceptanceCriteria?: AcceptanceCriteria; acceptanceHint?: string;
   latestVerdict?: 'accepted' | 'rejected'; rejectReason?: string; autoReconciled?: boolean;
-  dispatchedAt?: number; latestReportedAt?: number; latestVerdictAt?: number; acceptedAt?: number; rejectedAt?: number;
+  plannedAt?: number; dispatchedAt?: number; latestReportedAt?: number; latestVerdictAt?: number; acceptedAt?: number; rejectedAt?: number;
   cancelledAt?: number;
   checkedBy?: string; evidenceChecked?: string[]; ranCommands?: string[]; evidence?: BoardEvidence[];
   attempts: BoardAttempt[];
@@ -41,7 +42,7 @@ interface GoalNotificationRetryRecord {
 interface BoardGoal {
   goalChatId: string; title?: string; hasCharter: boolean;
   charterUpdatedAt?: string; charterContent?: string; lastActivityAt?: number;
-  counts: { dispatched: number; reported: number; accepted: number; rejected: number; blocked: number; escalated: number; cancelled?: number; total: number };
+  counts: { planned: number; dispatched: number; reported: number; accepted: number; rejected: number; blocked: number; escalated: number; cancelled?: number; total: number };
   tasks: BoardTask[];
   narrations?: BoardNarration[];
 }
@@ -75,7 +76,7 @@ interface AttentionBoard {
 }
 
 const STATUS_LABEL: Record<string, string> = {
-  dispatched: '待交付', reported: '已提交', accepted: '已验收', rejected: '已驳回',
+  planned: '等待依赖', dispatched: '待交付', reported: '已提交', accepted: '已验收', rejected: '已驳回',
   blocked: '求助中', escalated: '已升级人工', cancelled: '已取消',
 };
 const HELP_KIND_LABEL: Record<string, string> = {
@@ -101,7 +102,7 @@ function stageState(t: BoardTask, key: string): StageState {
   const reported = t.reportCount > 0;
   const verdict = t.latestVerdict;
   switch (key) {
-    case 'dispatch': return 'done';
+    case 'dispatch': return t.status === 'planned' ? 'pending' : 'done';
     case 'report': return reported ? 'done' : 'pending';
     case 'check': return verdict ? 'done' : reported ? 'active' : 'pending';
     case 'verdict':
@@ -179,12 +180,13 @@ function goalRow(g: BoardGoal, selected: boolean): string {
   const progressTitle = denom
     ? `${pct}% 已验收${cancelled ? ` · ${cancelled} 已取消` : ''}`
     : `${cancelled} 个任务均已取消，无待验收任务`;
-  const segs = (['accepted', 'reported', 'dispatched', 'blocked', 'escalated', 'rejected', 'cancelled'] as const)
+  const segs = (['accepted', 'reported', 'dispatched', 'planned', 'blocked', 'escalated', 'rejected', 'cancelled'] as const)
     .map(k => (c[k] ?? 0) ? `<span class="gb-seg gb-seg-${k}" style="flex:${c[k]}"></span>` : '')
     .join('');
   const badges = [
     c.escalated > 0 ? `<span class="gb-mini gb-mini-esc">${c.escalated} 待你拍</span>` : '',
     c.blocked > 0 ? `<span class="gb-mini gb-mini-blk">${c.blocked} 求助</span>` : '',
+    c.planned > 0 ? `<span class="gb-mini gb-mini-wait">${c.planned} 等待依赖</span>` : '',
     c.dispatched + c.reported > 0 ? `<span class="gb-mini gb-mini-active">${c.dispatched + c.reported} 在跑</span>` : '',
     c.rejected > 0 ? `<span class="gb-mini gb-mini-rej">${c.rejected} 驳回</span>` : '',
     cancelled > 0 ? `<span class="gb-mini gb-mini-quiet">${cancelled} 已取消</span>` : '',
@@ -229,6 +231,8 @@ function taskRow(t: BoardTask, selected: boolean): string {
       ? `<span class="gb-via gb-via-escalated" title="${escapeHtml(t.escalation.reason)}">🙋 等人拍板</span>`
       : t.status === 'cancelled' && t.cancellation
         ? `<span class="gb-via gb-via-cancelled" title="${escapeHtml(t.cancellation.reason)}">⏹ ${escapeHtml(t.cancellation.reason.length > 18 ? t.cancellation.reason.slice(0, 18) + '…' : t.cancellation.reason)}</span>`
+        : t.status === 'planned' && t.dependsOnTaskIds?.length
+          ? `<span class="gb-via gb-via-planned" title="等待：${escapeHtml(t.dependsOnTaskIds.join('、'))}">⏳ 等待 ${escapeHtml(t.dependsOnTaskIds.map(shortId).join('、'))}</span>`
         : '';
   const accTag = t.acceptanceCriteria ? '<span class="gb-acc-dot" title="结构化验收标准">◆</span>'
     : t.acceptanceHint ? '<span class="gb-acc-dot gb-acc-legacy" title="自由文本验收口径">◇</span>' : '';
@@ -268,7 +272,7 @@ function acceptanceHtml(t: BoardTask): string {
 }
 function timelineHtml(t: BoardTask): string {
   const steps: Array<[string, number | undefined]> = [
-    ['派发', t.dispatchedAt], ['提交', t.latestReportedAt],
+    ['登记依赖', t.plannedAt], ['派发', t.dispatchedAt], ['提交', t.latestReportedAt],
     [t.latestVerdict === 'rejected' ? '驳回' : '验收', t.latestVerdictAt],
     ['取消', t.status === 'cancelled' ? t.cancelledAt : undefined],
   ];
@@ -278,6 +282,11 @@ function timelineHtml(t: BoardTask): string {
     return `<div class="gb-tl-step"><span class="gb-tl-dot"></span><span class="gb-tl-label">${label}</span>
       <span class="gb-tl-time">${fmtTs(ts)}</span>${delta ? `<span class="gb-tl-delta">${delta}</span>` : ''}</div>`;
   }).join('')}</div>`;
+}
+function dependenciesHtml(t: BoardTask): string {
+  if (!t.dependsOnTaskIds?.length) return '';
+  return `<div class="gb-sec gb-sec-deps"><h3>前置任务</h3><div class="gb-deps">${t.dependsOnTaskIds.map((taskId) =>
+    `<span class="gb-dep" title="${escapeHtml(taskId)}">${escapeHtml(shortId(taskId))}</span>`).join('')}</div><p class="gb-muted">全部验收通过后，系统自动派发本任务。</p></div>`;
 }
 function trailHtml(t: BoardTask): string {
   if (!t.checkedBy && !t.evidenceChecked?.length && !t.ranCommands?.length && !t.evidence?.length) {
@@ -434,6 +443,7 @@ function detailHtml(t: BoardTask | null, goalChatId: string | null): string {
     }).join('、')}</p>` : ''}
     ${sealHtml(t)}
     ${cancelHtml(t)}
+    ${dependenciesHtml(t)}
     ${(t.help || t.escalation) && t.status !== 'cancelled' ? `<div class="gb-sec gb-sec-help"><h3>求助 / 升级</h3>${helpHtml(t)}</div>` : ''}
     ${goalChatId ? decisionHtml(t, goalChatId) : ''}
     <div class="gb-sec"><h3>生命周期</h3>${timelineHtml(t)}</div>
@@ -556,7 +566,7 @@ export function renderGoalsPage(root: HTMLElement): () => void {
     if (!g) { mainEl.innerHTML = '<div class="gb-main-empty"><p>选择左侧一个目标查看子任务</p></div>'; return; }
     mainEl.innerHTML = `<div class="gb-main-head">
         <span class="gb-main-title" title="${escapeHtml(goalName(g))}">${escapeHtml(goalName(g))}</span>
-        <span class="gb-main-counts">已验收 ${g.counts.accepted} · 共 ${g.counts.total}${g.counts.rejected ? ` · 驳回 ${g.counts.rejected}` : ''}</span>
+        <span class="gb-main-counts">已验收 ${g.counts.accepted} · 共 ${g.counts.total}${g.counts.planned ? ` · 等待依赖 ${g.counts.planned}` : ''}${g.counts.rejected ? ` · 驳回 ${g.counts.rejected}` : ''}</span>
       </div>${gridHtml(g, selTask)}${narrationsHtml(g)}`;
   }
   const decideDraft: Record<string, string> = {}; // preserve an in-progress decision across poll repaints

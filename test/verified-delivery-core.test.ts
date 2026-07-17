@@ -109,4 +109,28 @@ describe('verified-delivery core helpers', () => {
       reportCount: 0,
     });
   });
+
+  it('includes dependency ids for planned delivery-list rows', () => {
+    const events: LedgerEvent[] = [{
+      eventId: '1', seq: 1, type: 'TaskPlanned', actor: 'orchestrator', taskId: 'downstream',
+      chatId: 'oc_goal', idempotencyKey: 'planned:downstream', ts: 100,
+      payload: {
+        taskId: 'downstream', chatId: 'oc_goal', title: 'Downstream', dependsOnTaskIds: ['upstream-a', 'upstream-b'],
+        planGeneration: 1, plannedBy: 'supervisor',
+        dispatchSpec: { title: 'Downstream', briefBase: 'do d', workers: [{ openId: 'ou_worker' }], senderLarkAppId: 'cli_sup' },
+      },
+    }];
+    const tasks: TaskView[] = [{
+      taskId: 'downstream', chatId: 'oc_goal', status: 'planned', reports: [],
+      plan: {
+        planEventId: '1', planGeneration: 1, dependsOnTaskIds: ['upstream-a', 'upstream-b'],
+        plannedBy: 'supervisor',
+        dispatchSpec: { title: 'Downstream', briefBase: 'do d', workers: [{ openId: 'ou_worker' }], senderLarkAppId: 'cli_sup' },
+      },
+    }];
+
+    const rows = buildDeliveryListRows({ events, tasks, status: 'planned', now: 200 });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].dependsOnTaskIds).toEqual(['upstream-a', 'upstream-b']);
+  });
 });

@@ -4,6 +4,7 @@ import type { Evidence } from './types.js';
 
 export type DeliveryEnvelopeIngestResult =
   | { outcome: 'unknown_task'; taskId: string }
+  | { outcome: 'task_not_dispatched'; taskId: string }
   | {
       outcome: 'unauthorized';
       taskId: string;
@@ -42,6 +43,9 @@ export function ingestParsedDeliveryEnvelope(input: {
   const task = ledger.task(envelope.taskId);
   if (!task || task.chatId !== goalChatId) {
     return { outcome: 'unknown_task', taskId: envelope.taskId };
+  }
+  if (task.status === 'planned') {
+    return { outcome: 'task_not_dispatched', taskId: envelope.taskId };
   }
 
   const senderUnionId = input.senderUnionId?.trim();

@@ -88,6 +88,7 @@ export interface DeliveryListRow {
   reportCount: number;
   workerTopicRoot?: string;
   workerOpenIds?: string[];
+  dependsOnTaskIds?: string[];
   acceptanceHint?: string;
   createdAt?: number;
   updatedAt?: number;
@@ -144,6 +145,7 @@ export function buildDeliveryListRows(input: {
         reportCount: task.reports.length,
         workerTopicRoot: task.workerTopicRoot,
         workerOpenIds: task.workerOpenIds,
+        dependsOnTaskIds: task.plan?.dependsOnTaskIds,
         acceptanceHint: task.acceptanceHint,
         createdAt: t?.createdAt,
         updatedAt: t?.updatedAt,

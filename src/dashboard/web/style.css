@@ -22727,6 +22727,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .gb-seg-accepted { background: var(--success); }
 .gb-seg-reported { background: var(--accent); }
 .gb-seg-dispatched { background: var(--faint); }
+.gb-seg-planned { background: color-mix(in srgb, var(--muted) 44%, var(--surface)); }
 .gb-seg-rejected { background: var(--danger); }
 .gb-seg-blocked { background: var(--warning); }
 .gb-seg-escalated { background: var(--warning); }
@@ -22736,6 +22737,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .gb-badges { display: flex; gap: 5px; flex-wrap: wrap; }
 .gb-mini { font-size: .68rem; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border-soft); }
 .gb-mini-active { color: var(--accent-strong); border-color: var(--accent-soft); background: var(--accent-soft); }
+.gb-mini-wait { color: var(--muted); background: var(--surface-muted); border-style: dashed; }
 .gb-mini-rej { color: var(--danger); border-color: var(--danger-soft); background: var(--danger-soft); }
 .gb-mini-blk { color: var(--warning); border-color: var(--warning-soft); background: var(--warning-soft); }
 .gb-mini-esc { color: #fff; border-color: var(--warning); background: var(--warning); font-weight: 600; }
@@ -22778,6 +22780,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 
 .gb-pill { font-size: .72rem; padding: 2px 8px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
 .gb-pill-dispatched { background: var(--surface-muted); color: var(--muted); }
+.gb-pill-planned { background: var(--surface-muted); color: var(--muted); border: 1px dashed var(--border-soft); }
 .gb-pill-reported { background: var(--accent-soft); color: var(--accent-strong); }
 .gb-pill-accepted { background: var(--success-soft); color: var(--success); }
 .gb-pill-rejected { background: var(--danger-soft); color: var(--danger); }
@@ -22793,6 +22796,9 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .gb-via-blocked { background: var(--warning-soft); color: var(--warning); border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent); }
 .gb-via-escalated { background: var(--warning); color: #fff; }
 .gb-via-cancelled { background: var(--surface-muted); color: var(--faint); border: 1px solid var(--border-soft); }
+.gb-via-planned { background: var(--surface-muted); color: var(--muted); border: 1px dashed var(--border-soft); }
+.gb-deps { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 7px; }
+.gb-dep { font-family: var(--font-mono); font-size: .72rem; color: var(--muted); background: var(--surface-muted); border: 1px solid var(--border-soft); padding: 3px 7px; border-radius: 4px; }
 /* cancelled rows read as archived: dimmed but still legible for the audit trail */
 .gb-trow:has(.gb-pill-cancelled) { opacity: .62; }
 .gb-cancelled-note { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: var(--radius); background: var(--surface-muted); color: var(--muted); }

@@ -65,6 +65,59 @@ function seedReported(taskId: string, ts = TS + 1000): void {
 }
 
 describe('verified-delivery CLI e2e（delivery 回路，零飞书）', () => {
+  it('`dispatch --after` 只登记依赖任务，不触发飞书发送', () => {
+    const sessionId = 'session-planning-supervisor';
+    writeFileSync(join(dataDir, 'sessions-cli_sup.json'), JSON.stringify({
+      [sessionId]: {
+        sessionId,
+        chatId: GOAL_CHAT,
+        rootMessageId: GOAL_CHAT,
+        title: 'goal supervisor',
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        larkAppId: 'cli_sup',
+        ownerOpenId: 'ou_owner',
+      },
+    }));
+    seedDispatched('task-upstream', 'Upstream');
+
+    const out = cli('dispatch', [
+      '--session-id', sessionId,
+      '--title', 'Downstream',
+      '--bot', 'ou_worker:Worker:coder',
+      '--brief', 'Use the upstream result.',
+      '--task-id', 'task-downstream',
+      '--after', 'task-upstream',
+      '--needs-repo', 'https://github.com/acme/project.git',
+    ]);
+
+    expect(out.status).toBe(0);
+    expect(out.json).toMatchObject({
+      mode: 'planned',
+      taskId: 'task-downstream',
+      dependsOnTaskIds: ['task-upstream'],
+      planGeneration: 1,
+      released: false,
+      contactedWorkers: false,
+    });
+    const task = delivery(['show', '--task', 'task-downstream']).json.task;
+    expect(task).toMatchObject({
+      status: 'planned',
+      plan: {
+        dependsOnTaskIds: ['task-upstream'],
+        plannedBy: 'ou_owner',
+        dispatchSpec: {
+          title: 'Downstream',
+          briefBase: 'Use the upstream result.',
+          senderLarkAppId: 'cli_sup',
+          requiredRepo: 'github.com/acme/project',
+          workers: [{ openId: 'ou_worker', name: 'Worker', role: 'coder' }],
+        },
+      },
+    });
+    expect(delivery(['list', '--status', 'planned']).json.tasks[0].dependsOnTaskIds).toEqual(['task-upstream']);
+  });
+
   it('`report` 缺少监管者坐标时先失败且不写入交付记录', () => {
     const sessionId = 'session-without-report-target';
     writeFileSync(join(dataDir, 'sessions-cli_test.json'), JSON.stringify({

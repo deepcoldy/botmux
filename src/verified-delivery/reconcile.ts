@@ -199,6 +199,9 @@ export interface ReconcileOpts {
   defaultTimeoutMs?: number;
   /** Inject a verifier (tests stub this to avoid real fs/exec). */
   verify?: (criteria: AcceptanceCriteria) => AcceptanceVerifyResult;
+  /** Best-effort fast path for dependency release. Periodic scanning remains
+   *  the correctness fallback, so callback failures never undo an acceptance. */
+  onAccepted?: (input: { taskId: string; goalChatId?: string; acceptedEventId: string }) => void;
 }
 
 function verifySummary(v: AcceptanceVerifyResult): string {
@@ -266,6 +269,13 @@ export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, op
           ranCommands: verify.ranCommands.length ? verify.ranCommands : undefined,
         },
       });
+      if (!res.deduped) {
+        try {
+          opts.onAccepted?.({ taskId, goalChatId: task.chatId, acceptedEventId: res.event.eventId });
+        } catch {
+          // Best effort only; the periodic release scan repairs missed triggers.
+        }
+      }
       return { taskId, action: 'accepted', verify, reportId, deduped: res.deduped, eventId: res.event.eventId };
     }
     // Artifacts satisfy the criteria but the worker NEVER filed a report. The
