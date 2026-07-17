@@ -7874,17 +7874,16 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
     }
     const by = argValue(rest, '--by')?.trim() || checkedBy;
     const pendingReports = task.reports.filter((report) => !report.verdict).length;
-    const latestDispatch = [...ledger.read()].reverse().find((event) =>
-      event.taskId === taskId && event.type === 'TaskDispatched');
+    const activationEventId = task.activationEventId ?? 'unknown';
     const result = ledger.append({
       type: 'TaskCancelled',
       actor: 'orchestrator',
       taskId,
       chatId: task.chatId,
       ts: Date.now(),
-      // One cancellation per dispatch attempt: retries of this command dedupe,
-      // while an explicit re-dispatch can later be cancelled again.
-      idempotencyKey: `cancelled:${taskId}:${latestDispatch?.eventId ?? 'unknown'}`,
+      // One cancellation per activation: ordinary tasks bind to their latest
+      // dispatch; dependency-gated tasks bind to their latest plan generation.
+      idempotencyKey: `cancelled:${taskId}:${activationEventId}`,
       payload: { taskId, reason, by },
     });
     if (!result.deduped && s?.larkAppId) {

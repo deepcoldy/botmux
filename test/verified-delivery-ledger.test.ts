@@ -2,12 +2,93 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { openLedger } from '../src/verified-delivery/ledger.js';
-import type { LedgerEventDraft } from '../src/verified-delivery/types.js';
+import { deriveTaskReleaseId, openLedger, type LedgerHandle } from '../src/verified-delivery/ledger.js';
+import type { LedgerEventDraft, TaskDispatchIntentPayload, TaskPlannedPayload } from '../src/verified-delivery/types.js';
 
 const TS = 1_700_000_000_000;
 function draft(p: Partial<LedgerEventDraft> & Pick<LedgerEventDraft, 'type' | 'taskId' | 'idempotencyKey' | 'payload'>): LedgerEventDraft {
   return { actor: 'orchestrator', ts: TS, ...p } as LedgerEventDraft;
+}
+
+function acceptDependency(ledger: LedgerHandle, taskId: string, chatId = 'oc_goal'): string {
+  ledger.append(draft({
+    type: 'TaskDispatched', taskId, chatId, idempotencyKey: `dispatched:${taskId}`,
+    payload: { taskId, title: taskId },
+  }));
+  ledger.append(draft({
+    type: 'TaskReported', actor: 'worker', taskId, chatId, idempotencyKey: `reported:${taskId}:r1`,
+    payload: { taskId, reportId: `${taskId}-r1`, summary: 'done', evidence: [{ kind: 'path', path: `/tmp/${taskId}` }] },
+  }));
+  const accepted = ledger.append(draft({
+    type: 'TaskAccepted', taskId, chatId, idempotencyKey: `accepted:${taskId}:r1`,
+    payload: { taskId, reportId: `${taskId}-r1`, checkedBy: 'supervisor' },
+  }));
+  return accepted.event.eventId;
+}
+
+function planPayload(input: {
+  taskId?: string;
+  dependsOnTaskIds?: string[];
+  generation?: number;
+  reopenOfCancelEventId?: string;
+  brief?: string;
+} = {}): TaskPlannedPayload {
+  const taskId = input.taskId ?? 'downstream';
+  return {
+    taskId,
+    chatId: 'oc_goal',
+    title: 'downstream work',
+    dependsOnTaskIds: input.dependsOnTaskIds ?? ['upstream'],
+    planGeneration: input.generation ?? 1,
+    reopenOfCancelEventId: input.reopenOfCancelEventId,
+    dispatchSpec: {
+      title: 'downstream work',
+      briefBase: input.brief ?? 'consume upstream output',
+      workers: [{ openId: 'ou_worker', name: 'Worker', role: 'coder', larkAppId: 'cli_worker', cliId: 'codex', unionId: 'on_worker' }],
+      senderLarkAppId: 'cli_supervisor',
+      requiredRepo: 'github.com/acme/project',
+      acceptanceHint: 'check output',
+    },
+    plannedBy: 'ou_supervisor',
+  };
+}
+
+function releaseIntent(input: {
+  taskId?: string;
+  planEventId: string;
+  acceptedEventId: string;
+  attempt?: number;
+}): TaskDispatchIntentPayload {
+  const taskId = input.taskId ?? 'downstream';
+  const attempt = input.attempt ?? 0;
+  const releaseId = deriveTaskReleaseId(input.planEventId, [input.acceptedEventId], attempt);
+  const workers = [{ openId: 'ou_worker', name: 'Worker', role: 'coder', larkAppId: 'cli_worker', cliId: 'codex', unionId: 'on_worker' }];
+  return {
+    taskId,
+    releaseId,
+    attempt,
+    planEventId: input.planEventId,
+    planGeneration: 1,
+    satisfiedBy: [{ taskId: 'upstream', acceptedEventId: input.acceptedEventId }],
+    senderLarkAppId: 'cli_supervisor',
+    goalChatId: 'oc_goal',
+    frozenKickoffText: '<at user_id="ou_worker"></at>\nconsume upstream output',
+    frozenWorkerSpecs: workers,
+    frozenDispatchedPayload: {
+      taskId,
+      title: 'downstream work',
+      workerOpenIds: ['ou_worker'],
+      workerNames: ['Worker'],
+      workerLarkAppIds: ['cli_worker'],
+      workerCliIds: ['codex'],
+      workerBotUnionIds: ['on_worker'],
+      requiredRepo: 'github.com/acme/project',
+      acceptanceHint: 'check output',
+      brief: 'consume upstream output',
+      releaseId,
+    },
+    releasedBy: 'daemon:cli_supervisor',
+  };
 }
 
 describe('verified-delivery ledger', () => {
@@ -33,6 +114,7 @@ describe('verified-delivery ledger', () => {
 
     const t = led.task('task-1')!;
     expect(t.status).toBe('accepted');
+    expect(t.acceptedEventId).toBe('3');
     expect(t.acceptanceHint).toBe('run check.py exit 0');
     expect(t.workerTopicRoot).toBe('om_root');
     expect(t.requiredRepo).toBe('github.com/acme/project');
@@ -268,6 +350,213 @@ describe('verified-delivery ledger', () => {
     expect(b.deduped).toBe(true);
     expect(b.event.seq).toBe(a.event.seq);
     expect(led.read()).toHaveLength(1);
+  });
+
+  it('materializes a dependency-gated plan and rejects early lifecycle events', () => {
+    const led = openLedger({ baseDir });
+    acceptDependency(led, 'upstream');
+    const planned = led.append(draft({
+      type: 'TaskPlanned', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: 'planned:downstream',
+      payload: planPayload(),
+    }));
+
+    expect(led.task('downstream')).toMatchObject({
+      status: 'planned',
+      activationEventId: planned.event.eventId,
+      plan: {
+        planEventId: planned.event.eventId,
+        planGeneration: 1,
+        dependsOnTaskIds: ['upstream'],
+      },
+      workerNames: ['Worker'],
+      requiredRepo: 'github.com/acme/project',
+    });
+    expect(() => led.append(draft({
+      type: 'TaskReported', actor: 'worker', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: 'reported:too-early',
+      payload: { taskId: 'downstream', reportId: 'early', summary: 'not actually dispatched', evidence: [{ kind: 'path', path: '/tmp/early' }] },
+    }))).toThrow(/has not been dispatched/);
+    expect(() => led.append(draft({
+      type: 'TaskHelpRequested', actor: 'worker', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: 'help:too-early',
+      payload: { taskId: 'downstream', blocker: 'too early' },
+    }))).toThrow(/has not been dispatched/);
+    expect(() => led.append(draft({
+      type: 'TaskDispatched', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: 'dispatched:bypass',
+      payload: { taskId: 'downstream', title: 'bypass' },
+    }))).toThrow(/current open release/);
+    const fakeIntent = releaseIntent({ planEventId: planned.event.eventId, acceptedEventId: led.task('upstream')!.acceptedEventId! });
+    expect(() => led.append(draft({
+      type: 'TaskDispatchIntent', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: `intent:${fakeIntent.releaseId}`,
+      payload: fakeIntent,
+    }))).toThrow(/claimReadyPlan/);
+    expect(led.read().filter((event) => event.taskId === 'downstream')).toHaveLength(1);
+  });
+
+  it('claims a ready plan once, persists failure classification, then dispatches it', () => {
+    const led = openLedger({ baseDir });
+    const acceptedEventId = acceptDependency(led, 'upstream');
+    const planned = led.append(draft({
+      type: 'TaskPlanned', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: 'planned:downstream',
+      payload: planPayload(),
+    }));
+    const intent = releaseIntent({ planEventId: planned.event.eventId, acceptedEventId });
+
+    expect(led.claimReadyPlan({
+      taskId: 'downstream',
+      expectedPlanEventId: planned.event.eventId,
+      expectedAcceptedEventIds: ['stale-accept'],
+      ts: TS + 10,
+      intent,
+    })).toEqual({ result: 'stale' });
+
+    const first = led.claimReadyPlan({
+      taskId: 'downstream',
+      expectedPlanEventId: planned.event.eventId,
+      expectedAcceptedEventIds: [acceptedEventId],
+      ts: TS + 11,
+      intent,
+    });
+    expect(first.result).toBe('created');
+    const second = led.claimReadyPlan({
+      taskId: 'downstream',
+      expectedPlanEventId: planned.event.eventId,
+      expectedAcceptedEventIds: [acceptedEventId],
+      ts: TS + 12,
+      intent,
+    });
+    expect(second.result).toBe('open-intent');
+    expect(led.read().filter((event) => event.type === 'TaskDispatchIntent')).toHaveLength(1);
+
+    led.append(draft({
+      type: 'TaskDispatchFailed', taskId: 'downstream', chatId: 'oc_goal',
+      idempotencyKey: `dispatch-failed:${intent.releaseId}:ambiguous`, ts: TS + 13,
+      payload: {
+        taskId: 'downstream', releaseId: intent.releaseId, planEventId: intent.planEventId,
+        planGeneration: 1, attempt: 0, failureClass: 'ambiguous', code: 'net:timeout',
+        detail: 'request timed out', failedBy: 'daemon:cli_supervisor',
+      },
+    }));
+    expect(led.task('downstream')?.pendingRelease?.failure).toMatchObject({
+      failureClass: 'ambiguous', code: 'net:timeout',
+    });
+
+    expect(() => led.append(draft({
+      type: 'TaskDispatched', taskId: 'downstream', chatId: 'oc_goal',
+      idempotencyKey: `dispatched:release:${intent.releaseId}`, ts: TS + 14,
+      payload: { ...intent.frozenDispatchedPayload, title: 'mutated after claim', dispatchMessageId: 'om_bad' },
+    }))).toThrow(/payload must match the frozen release intent/);
+
+    led.append(draft({
+      type: 'TaskDispatched', taskId: 'downstream', chatId: 'oc_goal',
+      idempotencyKey: `dispatched:release:${intent.releaseId}`, ts: TS + 15,
+      payload: { ...intent.frozenDispatchedPayload, dispatchMessageId: 'om_release' },
+    }));
+    expect(led.task('downstream')).toMatchObject({
+      status: 'dispatched',
+      latestReleaseId: intent.releaseId,
+      dispatchMessageId: 'om_release',
+    });
+    expect(led.task('downstream')?.pendingRelease).toBeUndefined();
+  });
+
+  it('returns not-ready until every dependency has a real accepted transition', () => {
+    const led = openLedger({ baseDir });
+    led.append(draft({
+      type: 'TaskDispatched', taskId: 'upstream', chatId: 'oc_goal', idempotencyKey: 'dispatched:upstream',
+      payload: { taskId: 'upstream' },
+    }));
+    const planned = led.append(draft({
+      type: 'TaskPlanned', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: 'planned:downstream',
+      payload: planPayload(),
+    }));
+    const placeholder = releaseIntent({ planEventId: planned.event.eventId, acceptedEventId: 'not-accepted' });
+    expect(led.claimReadyPlan({
+      taskId: 'downstream', expectedPlanEventId: planned.event.eventId,
+      expectedAcceptedEventIds: ['not-accepted'], ts: TS + 1, intent: placeholder,
+    })).toEqual({ result: 'not-ready' });
+    expect(led.read().some((event) => event.type === 'TaskDispatchIntent')).toBe(false);
+  });
+
+  it('reopens a cancelled plan with immutable edges and a new activation id', () => {
+    const led = openLedger({ baseDir });
+    acceptDependency(led, 'upstream');
+    acceptDependency(led, 'other-upstream');
+    const gen1 = led.append(draft({
+      type: 'TaskPlanned', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: 'planned:downstream',
+      payload: planPayload(),
+    }));
+    const cancel1 = led.append(draft({
+      type: 'TaskCancelled', taskId: 'downstream', chatId: 'oc_goal',
+      idempotencyKey: `cancelled:downstream:${gen1.event.eventId}`,
+      payload: { taskId: 'downstream', reason: 'pause generation 1' },
+    }));
+    expect(() => led.append(draft({
+      type: 'TaskPlanned', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: `planned:downstream:${cancel1.event.eventId}`,
+      payload: planPayload({ generation: 2, reopenOfCancelEventId: cancel1.event.eventId, dependsOnTaskIds: ['other-upstream'] }),
+    }))).toThrow(/dependencies are immutable/);
+
+    const gen2 = led.append(draft({
+      type: 'TaskPlanned', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: `planned:downstream:${cancel1.event.eventId}`,
+      payload: planPayload({ generation: 2, reopenOfCancelEventId: cancel1.event.eventId, brief: 'second generation' }),
+    }));
+    expect(led.task('downstream')).toMatchObject({
+      status: 'planned', activationEventId: gen2.event.eventId,
+      plan: { planGeneration: 2, dependsOnTaskIds: ['upstream'] },
+    });
+    const cancel2 = led.append(draft({
+      type: 'TaskCancelled', taskId: 'downstream', chatId: 'oc_goal',
+      idempotencyKey: `cancelled:downstream:${gen2.event.eventId}`,
+      payload: { taskId: 'downstream', reason: 'pause generation 2' },
+    }));
+    expect(cancel2.deduped).toBe(false);
+    expect(cancel2.event.eventId).not.toBe(cancel1.event.eventId);
+    expect(led.task('downstream')).toMatchObject({ status: 'cancelled', cancellationEventId: cancel2.event.eventId });
+  });
+
+  it('defensively ignores historical attempts to bypass a planned dependency gate', () => {
+    const led = openLedger({ baseDir });
+    const acceptedEventId = acceptDependency(led, 'upstream');
+    const currentRows = led.read();
+    const plannedSeq = currentRows.length + 1;
+    const plannedEventId = String(plannedSeq);
+    const tamperedIntent = releaseIntent({ planEventId: plannedEventId, acceptedEventId });
+    tamperedIntent.frozenDispatchedPayload = {
+      ...tamperedIntent.frozenDispatchedPayload,
+      title: 'tampered historical payload',
+    };
+    const rows = [
+      ...currentRows,
+      { ...draft({ type: 'TaskPlanned', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: 'planned:downstream', payload: planPayload() }), eventId: plannedEventId, seq: plannedSeq },
+      { ...draft({ type: 'TaskDispatchIntent', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: `intent:${tamperedIntent.releaseId}`, payload: tamperedIntent }), eventId: String(plannedSeq + 1), seq: plannedSeq + 1 },
+      { ...draft({ type: 'TaskReported', actor: 'worker', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: 'reported:illegal', payload: { taskId: 'downstream', reportId: 'illegal', summary: 'early', evidence: [{ kind: 'path', path: '/tmp/early' }] } }), eventId: String(plannedSeq + 2), seq: plannedSeq + 2 },
+      { ...draft({ type: 'TaskDispatched', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: 'dispatched:illegal', payload: { taskId: 'downstream', title: 'bypass' } }), eventId: String(plannedSeq + 3), seq: plannedSeq + 3 },
+      { type: 'FutureTaskEvent', actor: 'orchestrator', taskId: 'ghost-future', chatId: 'oc_goal', idempotencyKey: 'future:1', ts: TS, payload: { taskId: 'ghost-future' }, eventId: String(plannedSeq + 4), seq: plannedSeq + 4 },
+    ];
+    writeFileSync(join(baseDir, 'ledger.ndjson'), rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+
+    const replay = openLedger({ baseDir });
+    expect(replay.task('downstream')).toMatchObject({
+      status: 'planned', plan: { planEventId: plannedEventId },
+    });
+    expect(replay.task('downstream')?.pendingRelease).toBeUndefined();
+    expect(replay.task('downstream')?.reports).toHaveLength(0);
+    expect(replay.task('ghost-future')).toBeUndefined();
+    expect(replay.task('upstream')?.acceptedEventId).toBe(acceptedEventId);
+  });
+
+  it('keeps acceptedEventId pinned to the event that actually accepted the current report', () => {
+    const led = openLedger({ baseDir });
+    const acceptedEventId = acceptDependency(led, 'stable-accepted');
+    led.append(draft({
+      type: 'TaskAccepted', taskId: 'stable-accepted', chatId: 'oc_goal', idempotencyKey: 'accepted:stable-accepted:duplicate-verdict',
+      payload: { taskId: 'stable-accepted', reportId: 'stable-accepted-r1', checkedBy: 'late-reviewer' },
+    }));
+    led.append(draft({
+      type: 'TaskRejected', taskId: 'stable-accepted', chatId: 'oc_goal', idempotencyKey: 'rejected:stable-accepted:late',
+      payload: { taskId: 'stable-accepted', reportId: 'stable-accepted-r1', reason: 'late-reject' },
+    }));
+    expect(led.task('stable-accepted')).toMatchObject({
+      status: 'accepted', acceptedEventId, reports: [{ reportId: 'stable-accepted-r1', verdict: 'accepted' }],
+    });
   });
 
   it('tasks(chatId) scopes the board to one chat', () => {

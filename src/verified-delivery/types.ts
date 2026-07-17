@@ -77,11 +77,13 @@ export interface AcceptanceCriteria {
 }
 
 /** The current materialized state of one task (read-model, derived from events).
+ *  planned = the task is durably registered but has not been sent to a worker;
+ *  its dependency gate is owned by the release engine.
  *  blocked = worker raised a help request, awaiting the supervisor.
  *  escalated = supervisor couldn't resolve, awaiting a human decision.
  *  cancelled = supervisor intentionally stopped the task; only an explicit
  *  re-dispatch may reactivate it. */
-export type TaskStatus = 'dispatched' | 'reported' | 'accepted' | 'rejected' | 'blocked' | 'escalated' | 'cancelled';
+export type TaskStatus = 'planned' | 'dispatched' | 'reported' | 'accepted' | 'rejected' | 'blocked' | 'escalated' | 'cancelled';
 
 /** Why a worker is stuck (kept tiny + enum-like so the board/stats can group). */
 export type HelpKind = 'access' | 'ambiguous' | 'impossible' | 'repeated_failure' | 'other';
@@ -125,6 +127,73 @@ export interface TaskCancellationView {
   by?: string;
 }
 
+/** One worker as frozen by TaskPlanned. This is deliberately wider than the
+ *  local dispatch-worker-meta lookup result: a release must be able to rebuild
+ *  the exact wire mention and final TaskDispatched payload after a restart. */
+export interface TaskDispatchWorkerSpec {
+  openId: string;
+  name?: string;
+  role?: string;
+  larkAppId?: string;
+  cliId?: string;
+  unionId?: string;
+}
+
+/** Complete v1 dispatch surface frozen when a dependency-gated task is planned.
+ *  Adding a new dispatch option requires adding it here explicitly. */
+export interface TaskPlanDispatchSpec {
+  title: string;
+  briefBase: string;
+  workers: TaskDispatchWorkerSpec[];
+  senderLarkAppId: string;
+  requiredRepo?: string;
+  acceptanceHint?: string;
+  acceptanceCriteria?: AcceptanceCriteria;
+}
+
+export interface TaskPlanView {
+  planEventId: string;
+  planGeneration: number;
+  dependsOnTaskIds: string[];
+  dispatchSpec: TaskPlanDispatchSpec;
+  plannedBy: string;
+}
+
+export interface TaskReleaseDependency {
+  taskId: string;
+  acceptedEventId: string;
+}
+
+export type TaskDispatchFailureClass = 'definite' | 'ambiguous';
+
+export interface TaskDispatchFailureView {
+  eventId: string;
+  ts: number;
+  failureClass: TaskDispatchFailureClass;
+  code: string;
+  detail: string;
+  failedBy: string;
+}
+
+/** An outbox-style release claim. While this view is present the task remains
+ *  planned; only a matching TaskDispatched may advance it. */
+export interface TaskPendingReleaseView {
+  intentEventId: string;
+  intentAt: number;
+  releaseId: string;
+  attempt: number;
+  planEventId: string;
+  planGeneration: number;
+  satisfiedBy: TaskReleaseDependency[];
+  senderLarkAppId: string;
+  goalChatId: string;
+  frozenKickoffText: string;
+  frozenWorkerSpecs: TaskDispatchWorkerSpec[];
+  frozenDispatchedPayload: TaskDispatchedPayload;
+  releasedBy: string;
+  failure?: TaskDispatchFailureView;
+}
+
 export interface TaskView {
   taskId: string;
   chatId?: string;
@@ -153,6 +222,20 @@ export interface TaskView {
   acceptanceHint?: string;    // legacy free-text intent (kept for back-compat / display)
   acceptanceCriteria?: AcceptanceCriteria; // P1 #7: structured, validated verify plan (preferred)
   status: TaskStatus;
+  /** Event that most recently activated this task (TaskPlanned for dependency-
+   *  gated tasks, TaskDispatched otherwise). Cancellation idempotency binds here. */
+  activationEventId?: string;
+  /** The event that actually transitioned the current report to accepted. */
+  acceptedEventId?: string;
+  /** Present for every task that has ever used the dependency gate. */
+  plan?: TaskPlanView;
+  /** Present while a planned release has been claimed but not dispatched. */
+  pendingRelease?: TaskPendingReleaseView;
+  latestReleaseId?: string;
+  dispatchMessageId?: string;
+  dispatchConfirmedBy?: string;
+  /** Event id of the cancellation currently represented by `cancellation`. */
+  cancellationEventId?: string;
   latestReportId?: string;
   reports: TaskReportView[];  // every attempt, in order
   /** Latest help request (present once a worker has ever raised one). */
@@ -197,6 +280,53 @@ export interface TaskDispatchedPayload {
   brief?: string;
   acceptanceHint?: string;
   acceptanceCriteria?: AcceptanceCriteria;
+  /** Present when this dispatch materialized a TaskDispatchIntent. */
+  releaseId?: string;
+  /** Lark send receipt. May be absent only for an explicit human confirmation. */
+  dispatchMessageId?: string;
+  confirmedBy?: string;
+}
+
+/** Register a task and its immutable dependency edges without contacting the
+ *  worker. A later generation may update the dispatch spec but not the edges. */
+export interface TaskPlannedPayload {
+  taskId: string;
+  chatId: string;
+  title: string;
+  dependsOnTaskIds: string[];
+  planGeneration: number;
+  reopenOfCancelEventId?: string;
+  dispatchSpec: TaskPlanDispatchSpec;
+  plannedBy: string;
+}
+
+/** Durable outbox claim for one automatic release attempt. */
+export interface TaskDispatchIntentPayload {
+  taskId: string;
+  releaseId: string;
+  attempt: number;
+  planEventId: string;
+  planGeneration: number;
+  satisfiedBy: TaskReleaseDependency[];
+  senderLarkAppId: string;
+  goalChatId: string;
+  frozenKickoffText: string;
+  frozenWorkerSpecs: TaskDispatchWorkerSpec[];
+  frozenDispatchedPayload: TaskDispatchedPayload;
+  releasedBy: string;
+}
+
+/** Persistent classification of a release attempt that did not complete. */
+export interface TaskDispatchFailedPayload {
+  taskId: string;
+  releaseId: string;
+  planEventId: string;
+  planGeneration: number;
+  attempt: number;
+  failureClass: TaskDispatchFailureClass;
+  code: string;
+  detail: string;
+  failedBy: string;
 }
 
 /** Provenance for an event that entered the ledger from a goal-group delivery
@@ -284,6 +414,9 @@ export const REJECT_REASON = {
 export type RejectReason = (typeof REJECT_REASON)[keyof typeof REJECT_REASON];
 
 export type LedgerEventType =
+  | 'TaskPlanned'
+  | 'TaskDispatchIntent'
+  | 'TaskDispatchFailed'
   | 'TaskDispatched'
   | 'TaskReported'
   | 'TaskAccepted'
@@ -305,6 +438,9 @@ export interface LedgerEventDraft {
   /** Unix ms; the CLI stamps it (the ledger module never reads the clock). */
   ts: number;
   payload:
+    | TaskPlannedPayload
+    | TaskDispatchIntentPayload
+    | TaskDispatchFailedPayload
     | TaskDispatchedPayload
     | TaskReportedPayload
     | TaskAcceptedPayload

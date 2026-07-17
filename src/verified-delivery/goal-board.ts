@@ -65,6 +65,8 @@ export interface GoalBoardTask {
   workerCliIds?: string[];
   workerBotUnionIds?: string[];
   requiredRepo?: string;
+  /** Immutable dependency edges for a task waiting behind the release gate. */
+  dependsOnTaskIds?: string[];
   latestReportId?: string;
   reportCount: number;
   /** Structured verify plan (preferred); undefined for legacy tasks. */
@@ -78,6 +80,7 @@ export interface GoalBoardTask {
   autoReconciled?: boolean;
 
   // ── lifecycle timestamps (unix ms; from ledger events) ────────────────────
+  plannedAt?: number;
   dispatchedAt?: number;
   latestReportedAt?: number;
   latestVerdictAt?: number;
@@ -115,7 +118,7 @@ export interface GoalBoardGoal {
   charterContent?: string;
   /** Most recent delivery activity across this goal's tasks (unix ms). */
   lastActivityAt?: number;
-  counts: { dispatched: number; reported: number; accepted: number; rejected: number; blocked: number; escalated: number; cancelled: number; total: number };
+  counts: { planned: number; dispatched: number; reported: number; accepted: number; rejected: number; blocked: number; escalated: number; cancelled: number; total: number };
   tasks: GoalBoardTask[];
   /** Recent human-readable narration events (newest first) — the same clean
    *  stream the goal chat shows, incl. 「人类决策到达」(not a ledger fact). */
@@ -135,10 +138,11 @@ export function goalCharterId(goal: string): string {
 /** Order tasks within a goal: needs-attention (escalated→human, blocked→supervisor)
  *  first, then active (dispatched/reported), then terminal — by ledger order
  *  (which is dispatch order, since taskIds aren't time-sortable). */
-const STATUS_RANK: Record<TaskStatus, number> = { escalated: -2, blocked: -1, dispatched: 0, reported: 1, rejected: 2, cancelled: 3, accepted: 4 };
+const STATUS_RANK: Record<TaskStatus, number> = { escalated: -2, blocked: -1, planned: 0, dispatched: 1, reported: 2, rejected: 3, cancelled: 4, accepted: 5 };
 
 /** Per-task timing + per-report timing, derived from the raw event stream. */
 interface TaskTiming {
+  plannedAt?: number;
   dispatchedAt?: number;
   latestReportedAt?: number;
   latestVerdictAt?: number;
@@ -160,7 +164,9 @@ function collectTimings(events: LedgerEvent[]): Map<string, TaskTiming> {
   };
   for (const e of events) {
     const t = ensure(e.taskId);
-    if (e.type === 'TaskDispatched') {
+    if (e.type === 'TaskPlanned') {
+      t.plannedAt = e.ts;
+    } else if (e.type === 'TaskDispatched') {
       if (t.dispatchedAt === undefined) t.dispatchedAt = e.ts; // first dispatch
     } else if (e.type === 'TaskReported') {
       const p = e.payload as TaskReportedPayload;
@@ -201,6 +207,7 @@ function toBoardTask(t: TaskView, timing: TaskTiming | undefined): GoalBoardTask
     workerCliIds: t.workerCliIds,
     workerBotUnionIds: t.workerBotUnionIds,
     requiredRepo: t.requiredRepo,
+    dependsOnTaskIds: t.plan?.dependsOnTaskIds,
     latestReportId: t.latestReportId,
     reportCount: t.reports.length,
     attempts: t.reports.map((r) => {
@@ -228,6 +235,7 @@ function toBoardTask(t: TaskView, timing: TaskTiming | undefined): GoalBoardTask
   if (latest?.evidence?.length) task.evidence = toBoardEvidence(latest.evidence);
 
   if (timing) {
+    if (timing.plannedAt !== undefined) task.plannedAt = timing.plannedAt;
     if (timing.dispatchedAt !== undefined) task.dispatchedAt = timing.dispatchedAt;
     if (timing.latestReportedAt !== undefined) task.latestReportedAt = timing.latestReportedAt;
     if (timing.latestVerdictAt !== undefined) task.latestVerdictAt = timing.latestVerdictAt;
@@ -266,7 +274,7 @@ export function buildGoalBoard(opts: { baseDir?: string; chatId?: string } = {})
       try { charterContent = readWhiteboard(meta.id, { allowDisabled: true, missingAsEmpty: true }); } catch { /* tolerate */ }
     }
 
-    const counts = { dispatched: 0, reported: 0, accepted: 0, rejected: 0, blocked: 0, escalated: 0, cancelled: 0, total: tasks.length };
+    const counts = { planned: 0, dispatched: 0, reported: 0, accepted: 0, rejected: 0, blocked: 0, escalated: 0, cancelled: 0, total: tasks.length };
     for (const t of tasks) counts[t.status] += 1;
 
     const boardTasks = tasks
@@ -275,7 +283,7 @@ export function buildGoalBoard(opts: { baseDir?: string; chatId?: string } = {})
 
     let lastActivityAt: number | undefined;
     for (const t of boardTasks) {
-      for (const ts of [t.dispatchedAt, t.latestReportedAt, t.latestVerdictAt, t.cancelledAt]) {
+      for (const ts of [t.plannedAt, t.dispatchedAt, t.latestReportedAt, t.latestVerdictAt, t.cancelledAt]) {
         if (ts !== undefined && (lastActivityAt === undefined || ts > lastActivityAt)) lastActivityAt = ts;
       }
     }

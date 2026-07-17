@@ -86,6 +86,8 @@ export function classifyTaskDisposition(task: ClassifiableTask, ctx: Disposition
   };
 
   switch (task.status) {
+    case 'planned':
+      return { bucket: 'quiet', reason: 'waiting_dependencies', next: '等待上游任务验收' };
     case 'escalated':
       return { bucket: 'needsHuman', reason: 'escalated', next: '等人拍板' };
     case 'blocked':

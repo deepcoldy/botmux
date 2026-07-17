@@ -27,10 +27,36 @@ describe('buildGoalBoard — ledger projection', () => {
     const board = buildGoalBoard({ baseDir });
     expect(board.goals.map((g) => g.goalChatId).sort()).toEqual(['oc_g1', 'oc_g2']);
     const g1 = board.goals.find((g) => g.goalChatId === 'oc_g1')!;
-    expect(g1.counts).toEqual({ dispatched: 1, reported: 0, accepted: 1, rejected: 0, blocked: 0, escalated: 0, cancelled: 0, total: 2 });
+    expect(g1.counts).toEqual({ planned: 0, dispatched: 1, reported: 0, accepted: 1, rejected: 0, blocked: 0, escalated: 0, cancelled: 0, total: 2 });
     expect(g1.hasCharter).toBe(false); // no whiteboard created in this test
     // active task (dispatched) sorts before terminal (accepted)
     expect(g1.tasks.map((t) => t.taskId)).toEqual(['t-a', 't-b']);
+  });
+
+  it('projects planned tasks as waiting work without treating them as dispatched', () => {
+    const led = openLedger({ baseDir });
+    led.append(draft({
+      type: 'TaskDispatched', taskId: 'upstream', chatId: 'oc_g', idempotencyKey: 'd:upstream', ts: TS,
+      payload: { taskId: 'upstream', title: 'Upstream' },
+    }));
+    led.append(draft({
+      type: 'TaskPlanned', taskId: 'downstream', chatId: 'oc_g', idempotencyKey: 'planned:downstream', ts: TS + 1,
+      payload: {
+        taskId: 'downstream', chatId: 'oc_g', title: 'Downstream', dependsOnTaskIds: ['upstream'],
+        planGeneration: 1, plannedBy: 'sup',
+        dispatchSpec: {
+          title: 'Downstream', briefBase: 'wait first', senderLarkAppId: 'cli_sup',
+          workers: [{ openId: 'ou_worker', name: 'Worker' }],
+        },
+      },
+    }));
+
+    const goal = buildGoalBoard({ baseDir, chatId: 'oc_g' }).goals[0];
+    expect(goal.counts).toMatchObject({ planned: 1, dispatched: 1, total: 2 });
+    expect(goal.lastActivityAt).toBe(TS + 1);
+    expect(goal.tasks.find((task) => task.taskId === 'downstream')).toMatchObject({
+      status: 'planned', plannedAt: TS + 1, dependsOnTaskIds: ['upstream'], reportCount: 0,
+    });
   });
 
   it('projects cancellation reason, time and count without losing prior reports', () => {
