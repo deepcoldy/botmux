@@ -1078,7 +1078,7 @@ describe('PUT /api/bot-riff config safety (finding H)', () => {
       const res = await fetch(`${base}/api/bot-riff`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ riff: JSON.stringify({ baseUrl: 'https://riff-new.example', agent: 'codex' }) }),
+        body: JSON.stringify({ riff: JSON.stringify({ baseUrl: 'https://riff-new.example', reasoningEffort: 'high' }) }),
       });
       expect(res.status).toBe(200);
       const body = await res.json();
@@ -1089,7 +1089,9 @@ describe('PUT /api/bot-riff config safety (finding H)', () => {
       const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0].riff;
       expect(stored).toMatchObject({
         baseUrl: 'https://riff-new.example',
-        agent: 'codex',
+        reasoningEffort: 'high',
+        // agent 已下线 UI（服务端写死 codex）——存量值按隐藏字段保留
+        agent: 'aiden',
         templateId: 'tpl-1',
         jwt: 'SECRET-JWT',
         env: { API_KEY: 'SECRET-ENV' },

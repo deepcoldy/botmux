@@ -2666,15 +2666,17 @@ function EnvSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   );
 }
 
-/** Agents supported by the riff runner (free text still allowed for new ones). */
-const RIFF_AGENT_SUGGESTIONS = ['codex', 'aiden', 'aiden-claude', 'opencode'];
+/** riff UI 建议主动选择的模型（服务端另有隐藏降级备胎，不在此列）。 */
+const RIFF_MODEL_SUGGESTIONS = ['gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.4', 'gpt-5.4-pro'];
+/** codex 思考等级档位（与 riff 服务端对齐）；'' = 跟随 riff 默认（medium）。 */
+const RIFF_REASONING_EFFORT_OPTIONS = ['', 'low', 'medium', 'high', 'xhigh'];
 
 function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCliSelection?: () => Promise<boolean> }) {
   const tr = useT();
   const riff = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
   const [baseUrl, setBaseUrl] = useState(typeof riff.baseUrl === 'string' ? riff.baseUrl : '');
-  const [agent, setAgent] = useState(typeof riff.agent === 'string' ? riff.agent : '');
   const [model, setModel] = useState(typeof riff.model === 'string' ? riff.model : '');
+  const [reasoningEffort, setReasoningEffort] = useState(typeof riff.reasoningEffort === 'string' ? riff.reasoningEffort : '');
   const [jwtEnv, setJwtEnv] = useState(typeof riff.jwtEnv === 'string' ? riff.jwtEnv : '');
   const [systemPrompt, setSystemPrompt] = useState(typeof riff.systemPrompt === 'string' ? riff.systemPrompt : '');
   const [setupCommands, setSetupCommands] = useState(
@@ -2686,8 +2688,8 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
   useEffect(() => {
     const r = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
     setBaseUrl(typeof r.baseUrl === 'string' ? r.baseUrl : '');
-    setAgent(typeof r.agent === 'string' ? r.agent : '');
     setModel(typeof r.model === 'string' ? r.model : '');
+    setReasoningEffort(typeof r.reasoningEffort === 'string' ? r.reasoningEffort : '');
     setJwtEnv(typeof r.jwtEnv === 'string' ? r.jwtEnv : '');
     setSystemPrompt(typeof r.systemPrompt === 'string' ? r.systemPrompt : '');
     setSetupCommands(Array.isArray(r.setupCommands) ? r.setupCommands.join('\n') : '');
@@ -2699,8 +2701,8 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
     try {
       const config: Record<string, unknown> = {};
       if (baseUrl.trim()) config.baseUrl = baseUrl.trim();
-      if (agent.trim()) config.agent = agent.trim();
       if (model.trim()) config.model = model.trim();
+      if (reasoningEffort) config.reasoningEffort = reasoningEffort;
       if (jwtEnv.trim()) config.jwtEnv = jwtEnv.trim();
       if (systemPrompt.trim()) config.systemPrompt = systemPrompt.trim();
       if (setupCommands.trim()) {
@@ -2742,18 +2744,25 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
       </div>
       <div className="bd-row">
         <label>
-          <span><FieldTitle help={tr('botDefaults.riffAgentHelp')}>{tr('botDefaults.riffAgent')}</FieldTitle></span>
-          <input type="text" data-input="riff-agent" list={`riff-agent-suggestions-${props.bot.larkAppId}`} placeholder={tr('botDefaults.riffAgentPlaceholder')} value={agent} disabled={busy} onChange={e => setAgent(e.currentTarget.value)} />
-          <datalist id={`riff-agent-suggestions-${props.bot.larkAppId}`}>
-            {RIFF_AGENT_SUGGESTIONS.map(item => <option value={item} key={item} />)}
+          <span><FieldTitle help={tr('botDefaults.riffModelHelp')}>{tr('botDefaults.riffModel')}</FieldTitle></span>
+          <input type="text" data-input="riff-model" list={`riff-model-suggestions-${props.bot.larkAppId}`} placeholder={tr('botDefaults.riffModelPlaceholder')} value={model} disabled={busy} onChange={e => setModel(e.currentTarget.value)} />
+          <datalist id={`riff-model-suggestions-${props.bot.larkAppId}`}>
+            {RIFF_MODEL_SUGGESTIONS.map(item => <option value={item} key={item} />)}
           </datalist>
         </label>
       </div>
       <div className="bd-row">
-        <label>
-          <span><FieldTitle help={tr('botDefaults.riffModelHelp')}>{tr('botDefaults.riffModel')}</FieldTitle></span>
-          <input type="text" data-input="riff-model" placeholder={tr('botDefaults.riffModelPlaceholder')} value={model} disabled={busy} onChange={e => setModel(e.currentTarget.value)} />
-        </label>
+        <div className="bd-field">
+          <FieldTitle help={tr('botDefaults.riffReasoningEffortHelp')}>{tr('botDefaults.riffReasoningEffort')}</FieldTitle>
+          <DropdownField
+            dataInput="riff-reasoning-effort"
+            ariaLabel={tr('botDefaults.riffReasoningEffort')}
+            value={reasoningEffort}
+            disabled={busy}
+            options={RIFF_REASONING_EFFORT_OPTIONS.map(v => ({ value: v, label: v === '' ? tr('botDefaults.riffReasoningEffortDefault') : v }))}
+            onChange={next => setReasoningEffort(next)}
+          />
+        </div>
       </div>
       <div className="bd-row">
         <label>

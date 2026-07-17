@@ -42,10 +42,13 @@ const DEFAULT_RIFF_SYSTEM_PROMPT = [
  * Mandatory setup commands run in the riff sandbox to ensure `botmux` is
  * available. These are ALWAYS sent to the riff API via `config.setupCommands`
  * (not via prompt injection) so the install is reliable and not dependent on
- * the agent parsing a prompt. The riff sandbox has Node.js (it runs aiden),
+ * the agent parsing a prompt. The riff sandbox has Node.js (it runs codex),
  * so npm install works. Any user-configured setupCommands are appended AFTER
  * these mandatory commands.
  */
+/** riff（codex bridge）接受的思考等级档位——与服务端 shared/reasoningEffort 对齐。 */
+export const RIFF_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
+
 const MANDATORY_SETUP_COMMANDS = [
   // Unconditional install/upgrade: a `which botmux` guard would skip the
   // install when the sandbox image preinstalls an older botmux, freezing the
@@ -60,8 +63,13 @@ const MANDATORY_SETUP_COMMANDS = [
 export interface RiffBackendConfig {
   baseUrl: string;
   templateId?: string;
+  /** @deprecated riff 服务端已收敛仅支持 codex（其它值 400）；本字段不再被读取，
+   *  任务一律以 agent=codex 创建。保留仅为兼容存量 bots.json。 */
   agent?: string;
   model?: string;
+  /** codex 思考等级（low/medium/high/xhigh），写入沙箱 config.toml 的
+   *  model_reasoning_effort；留空走 riff 默认 medium。非法值静默丢弃。 */
+  reasoningEffort?: string;
   /** Direct JWT token (takes precedence over jwtEnv). */
   jwt?: string;
   /** Name of env var containing the JWT token (default: RIFF_JWT). */
@@ -571,12 +579,16 @@ export class RiffBackend implements SessionBackend {
     const url = `${this.config.baseUrl}/api/task-execute`;
 
     // riff task-execute body: origin at top level, prompt inside config.userPrompt
-    // agent 可选值: codex (默认), aiden, aiden-claude, opencode
+    // agent 写死 codex：riff 服务端已下线其它 runner（aiden 等一律 400
+    // UNSUPPORTED_TASK_AGENT），配置项不再暴露。
     const config: Record<string, unknown> = {
       userPrompt: this.injectSystemPrompt(prompt),
-      agent: this.config.agent ?? 'codex',
+      agent: 'codex',
     };
     if (this.config.model) config.model = this.config.model;
+    if (RIFF_REASONING_EFFORTS.includes(this.config.reasoningEffort as typeof RIFF_REASONING_EFFORTS[number])) {
+      config.reasoningEffort = this.config.reasoningEffort;
+    }
     if (this.config.sandboxCluster) config.sandboxCluster = this.config.sandboxCluster;
     // Repos: explicit config.repos (e.g. derived from the session's local
     // workingDir by the worker) wins over defaultRepo/defaultBranch. The API's

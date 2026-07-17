@@ -354,9 +354,9 @@ describe('RiffBackend', () => {
     });
   });
 
-  describe('agent default (config simplification)', () => {
-    it('defaults the task agent to codex when not configured', async () => {
-      const be = makeBackend({ injectStatusLines: false });
+  describe('agent hardcode + reasoning effort', () => {
+    it('always sends agent=codex, even when legacy config still says aiden', async () => {
+      const be = makeBackend({ injectStatusLines: false, agent: 'aiden' });
       be.spawn('', [], {} as any);
       be.write('hi');
       await flush();
@@ -364,6 +364,20 @@ describe('RiffBackend', () => {
       await flush();
       const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
       expect(JSON.parse(String(exec.init?.body)).config.agent).toBe('codex');
+    });
+
+    it('passes a valid reasoningEffort through and drops invalid/empty ones', async () => {
+      for (const [effort, expected] of [['xhigh', 'xhigh'], ['bogus', undefined], [undefined, undefined]] as const) {
+        calls.length = 0; resolvers.length = 0;
+        const be = makeBackend({ injectStatusLines: false, reasoningEffort: effort });
+        be.spawn('', [], {} as any);
+        be.write('hi');
+        await flush();
+        resolvers.shift()!(taskResponse('task-1'));
+        await flush();
+        const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
+        expect(JSON.parse(String(exec.init?.body)).config.reasoningEffort).toBe(expected);
+      }
     });
   });
 

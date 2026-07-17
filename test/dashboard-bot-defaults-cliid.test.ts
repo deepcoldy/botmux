@@ -71,7 +71,7 @@ describe('bot onboarding Agent availability warning', () => {
 });
 
 describe('riff CLI switch persistence (PR #467 P1)', () => {
-  it('save-riff persists the CLI selection via PUT /agent before PUT /riff', async () => {
+  it('save-riff saves the riff config first, then persists the CLI selection (PUT /riff → /agent)', async () => {
     const requests: Array<{ method: string; url: string; body: any }> = [];
     (globalThis as any).fetch = async (url: string, init?: any) => {
       requests.push({ method: init?.method ?? 'GET', url: String(url), body: init?.body ? JSON.parse(init.body) : undefined });
@@ -101,6 +101,10 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     // （DropdownField 是自定义组件：按组件 prop dataInput 定位并调用其 onChange）
     act(() => { root.findByProps({ dataInput: 'agentCliId' }).props.onChange('riff'); });
     expect(root.findAllByProps({ 'data-action': 'save-agent' })).toHaveLength(0);
+    // Agent 配置已下线：面板不得再渲染 riff-agent 输入框
+    expect(root.findAllByProps({ 'data-input': 'riff-agent' })).toHaveLength(0);
+    // 思考等级下拉选择 xhigh → 保存的 PUT /riff 必须携带 reasoningEffort
+    act(() => { root.findByProps({ dataInput: 'riff-reasoning-effort' }).props.onChange('xhigh'); });
     const baseUrlInput = root.findByProps({ 'data-input': 'riff-base-url' });
     act(() => { baseUrlInput.props.onChange({ currentTarget: { value: 'https://riff.example' } }); });
     // 点「保存 Riff 配置」→ 先 PUT /riff 存配置，成功后再 PUT /agent 落盘
@@ -109,6 +113,7 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     const puts = requests.filter(r => r.method === 'PUT');
     expect(puts.map(r => r.url.split('/').pop())).toEqual(['riff', 'agent']);
     expect(puts[1]!.body).toEqual({ cliId: 'riff', model: '' });
+    expect(JSON.parse(puts[0]!.body.riff)).toMatchObject({ reasoningEffort: 'xhigh' });
   });
 });
 

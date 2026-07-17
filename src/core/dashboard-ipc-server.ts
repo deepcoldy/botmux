@@ -2275,13 +2275,13 @@ ipcRoute('PUT', '/api/bot-env', async (req, res) => {
 });
 
 // Per-bot riff 后端配置。Body `{ riff: string }`（原始 JSON 文本，如
-// `{"baseUrl":"https://...","agent":"aiden","model":"...","injectStatusLines":true}`）：
+// `{"baseUrl":"https://...","model":"gpt-5.5","reasoningEffort":"high"}`）：
 // 空白 → 清除；否则按 json kind 解析后落盘。走 applyConfigField（与 /botconfig
 // 同一写盘 + 内存热更新路径），next-session 生效。仅 backendType=riff 时使用。
 /** riff 配置里 dashboard 可编辑的字段——PUT /bot-riff 只覆盖这些，其余保留。 */
 // sandboxCluster / injectStatusLines 已从 dashboard UI 移除（前者极少用、后者
 // 恒默认开启）——不在此集合中意味着存量 bots.json 值按「隐藏字段」原样保留。
-const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'agent', 'model', 'jwtEnv', 'systemPrompt', 'setupCommands']);
+const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'model', 'reasoningEffort', 'jwtEnv', 'systemPrompt', 'setupCommands']);
 
 /** 发给浏览器前脱敏：明文 jwt / env（可能含各类密钥）绝不进 dashboard 响应。 */
 function redactRiffForClient(riff: unknown): Record<string, unknown> | null {

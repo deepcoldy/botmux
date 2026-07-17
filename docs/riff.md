@@ -1,6 +1,6 @@
 # Riff 机器人接入指南
 
-> Riff 后端：消息发给飞书机器人 → riff 云端沙箱运行 agent（aiden / codex 等）→ 结果自动回到飞书。agent 跑在远端沙箱里，本机无需安装任何 CLI；botmux 自动把仓库、环境变量、回投凭证带进沙箱。要求 botmux ≥ 2.109.0。
+> Riff 后端：消息发给飞书机器人 → riff 云端沙箱运行 codex agent → 结果自动回到飞书。agent 跑在远端沙箱里，本机无需安装任何 CLI；botmux 自动把仓库、环境变量、回投凭证带进沙箱。要求 botmux ≥ 2.109.0。
 
 ## 快速接入（约 5 分钟）
 
@@ -11,8 +11,8 @@
    | 字段 | 怎么填 |
    |------|--------|
    | Base URL | **必填**。线上 `https://riff.bytedance.net`；BOE 测试环境 `https://riff-infra-boe.bytedance.net` |
-   | Agent | 默认 `codex`；可选 `aiden` / `aiden-claude` / `opencode` |
-   | 模型 | **留空**（推荐，使用 riff 侧默认模型） |
+   | 模型 | **留空**（默认 `gpt-5.5`）；推荐可选：`gpt-5.5` / `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-5.4` / `gpt-5.4-pro`（输入框有下拉建议） |
+   | 思考等级 | codex 推理强度（low / medium / high / xhigh），留空跟随默认 medium |
    | JWT 环境变量 | 一般**留空**，见「认证（JWT）」 |
    | System Prompt / 额外初始化命令 | 可选。自定义 System Prompt 是**追加**在内置路由规则之后，不会替换它 |
 
@@ -72,7 +72,7 @@ python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/ka
 
 | 现象 | 原因与处理 |
 |------|-----------|
-| 发消息后没回复 | ① JWT 过期（见上）② Agent 名不受支持（只认 codex / aiden / aiden-claude / opencode）③ 打开「Web 终端」日志页看 `[riff] 错误` 行 |
+| 发消息后没回复 | ① JWT 过期（见上）② 模型名不在支持清单（非法值会 400 并回显完整清单）③ 打开「Web 终端」日志页看 `[riff] 错误` 行 |
 | 报「仓库 xxx 不存在」 | Base URL 环境与仓库不匹配，或填了外部仓库；确认是 code.byted.org 上的 `group/repo` |
 | 保存配置报 invalid_base_url | Base URL 必填且必须以 http(s) 开头 |
 | 继续对话每轮都要几分钟 | 正常应为秒级（follow-up 复用暖沙箱）；若每轮冷启动，检查是否每次 /close 后重开、或配置中途被改 |
