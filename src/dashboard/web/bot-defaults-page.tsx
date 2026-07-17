@@ -2753,7 +2753,8 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
       </div>
       <div className="bd-row">
         <div className="bd-field">
-          <FieldTitle help={tr('botDefaults.riffReasoningEffortHelp')}>{tr('botDefaults.riffReasoningEffort')}</FieldTitle>
+          {/* 标题包 <span> 走字段标签样式，与同级 Base URL/模型/JWT 对齐 */}
+          <span><FieldTitle help={tr('botDefaults.riffReasoningEffortHelp')}>{tr('botDefaults.riffReasoningEffort')}</FieldTitle></span>
           <DropdownField
             dataInput="riff-reasoning-effort"
             ariaLabel={tr('botDefaults.riffReasoningEffort')}

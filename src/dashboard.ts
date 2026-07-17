@@ -129,6 +129,8 @@ import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncM
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
+import { handleDesktopCompat } from './dashboard/compat.js';
+import { isDashboardChunkJsPath, missingDashboardChunkModule } from './dashboard/stale-chunk-module.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
@@ -1124,6 +1126,22 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
   }
 }
 
+function serveMissingDashboardChunkModule(req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
+  if (!isDashboardChunkJsPath(pathname)) return false;
+  const body = missingDashboardChunkModule();
+  res.writeHead(200, {
+    'content-type': 'application/javascript',
+    'cache-control': 'no-store',
+    'content-length': String(Buffer.byteLength(body)),
+  });
+  if (req.method === 'HEAD') {
+    res.end();
+    return true;
+  }
+  res.end(body);
+  return true;
+}
+
 function dashboardEntriesForRecord(record: InstalledPluginRecord): PluginDashboardEntry[] {
   return record.contributions?.dashboard ?? [];
 }
@@ -2022,6 +2040,13 @@ const server = createServer(async (req, res) => {
       return res.end(DASHBOARD_SELF_NONCE);
     }
 
+    // Desktop shell compatibility probe (read-only, no token required). Keep it
+    // outside the browser auth gate so packaged desktop apps can decide whether
+    // this runtime speaks their dashboard protocol before loading the SPA.
+    if (handleDesktopCompat(req, res, url)) {
+      return;
+    }
+
     // Web terminal reverse-proxy: `/s/<sessionId>/*` → the owning bot daemon's
     // terminal proxy. The central platform only tunnels the dashboard port, so
     // terminal links served under the machine subdomain
@@ -2225,6 +2250,7 @@ const server = createServer(async (req, res) => {
           ? '/favicon.png'
         : url.pathname;
       if (serveStatic(req, res, lookupPath)) return;
+      if (serveMissingDashboardChunkModule(req, res, lookupPath)) return;
     }
 
     // ─── HD2D office assets (token-gated: download triggers a ~74MB fetch) ──

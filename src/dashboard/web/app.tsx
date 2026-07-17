@@ -21,6 +21,7 @@ import {
   createDashboardRouteState,
   loadAndRenderDashboardRoute,
 } from './route-lifecycle.js';
+import { maybeReloadBrowserForStaleRouteChunk } from './stale-chunk-reload.js';
 import { buildBotCards, loadGroupsSnapshot } from './overview.js';
 import { BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT, openBotOnboarding } from './bot-onboarding.js';
 import { requestOpenCreateSession } from './create-session-entry.js';
@@ -194,6 +195,53 @@ function navClassName(item: NavItem): string | undefined {
   if (isActiveNav(item, activeHash)) classes.push('active');
   if (item.id === 'settings' && updateBehind) classes.push('nav-has-update');
   return classes.length ? classes.join(' ') : undefined;
+}
+
+function readShellLocale(): DashboardLocale | null {
+  const fromSearch = normalizeDashboardLocale(new URLSearchParams(location.search).get('locale'));
+  if (fromSearch) return fromSearch;
+
+  const queryIndex = location.hash.indexOf('?');
+  if (queryIndex < 0) return null;
+  // Desktop keeps shell flags inside the hash so auth redirects preserve them.
+  return normalizeDashboardLocale(new URLSearchParams(location.hash.slice(queryIndex + 1)).get('locale'));
+}
+
+function applyShellLocaleFromHash(): boolean {
+  const shellLocale = readShellLocale();
+  if (!shellLocale || shellLocale === ui.locale) return false;
+  // Desktop changes locale by rewriting the embedded webview hash. That is an
+  // in-page navigation, so the dashboard must re-apply locale before routing.
+  ui.setLocale(shellLocale);
+  return true;
+}
+
+function readHashActionParams(): { path: string; params: URLSearchParams } | null {
+  const queryIndex = location.hash.indexOf('?');
+  if (queryIndex < 0) return null;
+  return {
+    path: location.hash.slice(0, queryIndex) || '#/',
+    params: new URLSearchParams(location.hash.slice(queryIndex + 1)),
+  };
+}
+
+function consumeDesktopShellRouteAction(): boolean {
+  const action = readHashActionParams();
+  const open = action?.params.get('open');
+  if (!action || !open) return false;
+  if (open !== 'bot-onboarding' && open !== 'create-session') return false;
+
+  action.params.delete('open');
+  const query = action.params.toString();
+  // Desktop uses hash flags as one-shot commands; clear them so locale/route
+  // re-renders do not reopen the same dialog.
+  history.replaceState(null, '', query ? `${action.path}?${query}` : action.path);
+  if (open === 'bot-onboarding') {
+    window.dispatchEvent(new Event(OPEN_BOT_ONBOARDING_EVENT));
+  } else {
+    requestOpenCreateSession();
+  }
+  return true;
 }
 
 function updateBadgeTitle(): string {
@@ -645,7 +693,7 @@ async function loadAuthState(): Promise<void> {
       ui.authed = isAuthed;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
       ui.publicReadOnly = publicReadOnly;
-      const serverLocale = normalizeDashboardLocale(j.lang);
+      const serverLocale = readShellLocale() ?? normalizeDashboardLocale(j.lang);
       if (serverLocale) ui.setLocale(serverLocale);
     }
   } catch { /* keep defaults */ }
@@ -759,8 +807,15 @@ async function route(): Promise<void> {
       matched ? matched.load : loadOverviewPage,
       { rerenderOnUiChange: matched ? matched.rerenderOnUiChange : false },
     );
+    if (seq === routeState.seq && isAuthed) consumeDesktopShellRouteAction();
   } catch (err) {
     if (seq !== routeState.seq) return;
+    if (maybeReloadBrowserForStaleRouteChunk(err, {
+      href: window.location.href,
+      hash,
+      getSessionStorage: () => window.sessionStorage,
+      reload: () => window.location.reload(),
+    })) return;
     getRouteRoot().innerHTML = `<section class="page"><div class="empty">Dashboard route failed: ${escapeHtml(String(err))}</div></section>`;
     routeState.pageDispose = null;
     routeState.rerenderOnUiChange = true;
@@ -796,6 +851,7 @@ function initOwnerAvatar(): void {
 
 void (async () => {
   ui.init();
+  applyShellLocaleFromHash();
   const host = document.getElementById('app-root');
   if (!host) throw new Error('missing dashboard app root');
   initFloatingScrollbars(host);
@@ -824,6 +880,8 @@ void (async () => {
   }
   void loadNameMaps().then(renderShell);
   void loadGroupsSnapshot().then(renderShell);
-  window.addEventListener('hashchange', () => { void route(); });
+  window.addEventListener('hashchange', () => {
+    if (!applyShellLocaleFromHash()) void route();
+  });
   void route();
 })();

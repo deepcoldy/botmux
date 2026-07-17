@@ -1,0 +1,699 @@
+:root {
+  color-scheme: dark;
+  /* Desktop shell tokens mirror the bundled dashboard's dark design system. */
+  --bg: #07090f;
+  --bg-soft: #0b0f17;
+  --surface: #0e141d;
+  --surface-raised: #151d29;
+  --surface-muted: #0b1018;
+  --text: #eef2f8;
+  --muted: #99a3b3;
+  --faint: #5d6675;
+  --border: #25303f;
+  --border-soft: #1a2330;
+  --accent: #5be3ff;
+  --accent-strong: #8feeff;
+  --accent-soft: rgba(91, 227, 255, 0.13);
+  --info: #4f8bff;
+  --info-soft: rgba(79, 139, 255, 0.14);
+  --danger: #ff6b81;
+  --danger-soft: rgba(255, 107, 129, 0.13);
+  --warning: #ffc24d;
+  --success: #4ee69a;
+  --success-soft: rgba(78, 230, 154, 0.13);
+  --on-accent: #051018;
+  --radius: 14px;
+  --radius-sm: 9px;
+  --sidebar-width: 250px;
+  --topbar-height: 56px;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  /* Match desktopWindowMinWidth: 980px dashboard content + 250px native rail. */
+  min-width: 1230px;
+  min-height: 680px;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  color: var(--text);
+  background:
+    linear-gradient(180deg, rgba(17, 24, 39, 0.72), rgba(7, 9, 15, 0.98)),
+    var(--bg);
+}
+
+button,
+select,
+input {
+  font: inherit;
+}
+
+button {
+  min-width: 0;
+  height: 36px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0 12px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+button:focus-visible,
+select:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button:disabled,
+select:disabled,
+input:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  height: 100vh;
+  padding: 18px 14px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.03);
+  border-right: 1px solid var(--border);
+  backdrop-filter: blur(20px);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  padding: 6px 8px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  color: #06101a;
+  background: radial-gradient(circle at 32% 28%, #aef4ff, var(--accent) 38%, var(--info) 68%, #0a1530 105%);
+  box-shadow: 0 0 16px rgba(91, 227, 255, 0.42), inset 0 0 8px rgba(255, 255, 255, 0.3);
+  font-weight: 700;
+}
+
+.brand-text {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.brand-text strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.brand-text strong {
+  font-size: 15px;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+
+.sidebar-nav {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 2px;
+  margin-top: 18px;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+  align-content: start;
+  /* Master keeps adding dashboard sections; scroll only the menu so runtime
+     controls stay reachable at the bottom of the native shell. */
+  scrollbar-width: thin;
+}
+
+.sidebar-nav a {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-height: 36px;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.sidebar-nav a:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.sidebar-nav a.active {
+  color: var(--accent-strong);
+  background: linear-gradient(120deg, rgba(91, 227, 255, 0.16), rgba(79, 139, 255, 0.10));
+  border-color: rgba(91, 227, 255, 0.30);
+  box-shadow: inset 0 0 0 1px rgba(91, 227, 255, 0.10);
+}
+
+.sidebar-nav svg {
+  flex: 0 0 17px;
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.sidebar-nav::-webkit-scrollbar {
+  width: 6px;
+}
+
+.sidebar-nav::-webkit-scrollbar-thumb {
+  background: rgba(153, 163, 179, 0.28);
+  border-radius: 999px;
+}
+
+.sidebar-foot {
+  display: grid;
+  gap: 8px;
+  flex: 0 0 auto;
+  margin-top: 10px;
+  padding: 10px 6px 0;
+  border-top: 1px solid var(--border);
+}
+
+.runtime-line {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #87909b;
+  box-shadow: 0 0 0 3px rgba(135, 144, 155, 0.18);
+}
+
+.status-dot[data-status="running"] {
+  background: var(--success);
+  box-shadow: 0 0 0 3px rgba(78, 230, 154, 0.16);
+}
+
+.status-dot[data-status="starting"] {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(91, 227, 255, 0.16);
+}
+
+.status-dot[data-status="degraded"] {
+  background: var(--warning);
+  box-shadow: 0 0 0 3px rgba(189, 123, 25, 0.2);
+}
+
+.status-dot[data-status="not_configured"],
+.status-dot[data-status="stopped"] {
+  background: #9aa3ad;
+}
+
+.runtime-copy {
+  min-width: 0;
+}
+
+.runtime-status {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-meta {
+  min-height: 0;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.runtime-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: rgba(6, 10, 16, 0.42);
+}
+
+.runtime-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 0;
+  height: 28px;
+  padding: 0 6px;
+  border-radius: 6px;
+  border-color: transparent;
+  color: var(--muted);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  transition: background 150ms ease, border-color 150ms ease, color 150ms ease, box-shadow 150ms ease;
+}
+
+.runtime-action[hidden] {
+  display: none;
+}
+
+.runtime-action svg {
+  flex: 0 0 13px;
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.runtime-action-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-action:hover:not(:disabled) {
+  color: var(--text);
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.065);
+}
+
+.runtime-action-primary {
+  color: var(--on-accent);
+  background: linear-gradient(135deg, var(--accent), var(--info));
+  box-shadow: 0 4px 12px rgba(79, 139, 255, 0.2);
+}
+
+.runtime-action-primary svg {
+  fill: currentColor;
+  stroke: none;
+}
+
+.runtime-action-primary:hover:not(:disabled) {
+  color: var(--on-accent);
+  border-color: rgba(174, 244, 255, 0.68);
+  background: linear-gradient(135deg, var(--accent-strong), #6aa2ff);
+  box-shadow: 0 5px 14px rgba(91, 227, 255, 0.24);
+}
+
+.runtime-action-danger {
+  color: #ff91a1;
+}
+
+.runtime-action-danger:hover:not(:disabled) {
+  color: #ffd8de;
+  border-color: rgba(255, 107, 129, 0.34);
+  background: var(--danger-soft);
+}
+
+.runtime-action-quiet {
+  color: var(--muted);
+}
+
+.runtime-action-takeover {
+  grid-column: 1 / -1;
+  min-height: 30px;
+  justify-content: center;
+  padding: 0 10px;
+  border-color: rgba(255, 194, 77, 0.28);
+  background:
+    linear-gradient(90deg, rgba(255, 194, 77, 0.18), rgba(255, 194, 77, 0.07)),
+    rgba(255, 194, 77, 0.06);
+  color: var(--warning);
+}
+
+.runtime-action-takeover:hover:not(:disabled) {
+  color: #ffe1a3;
+  border-color: rgba(255, 194, 77, 0.52);
+  background:
+    linear-gradient(90deg, rgba(255, 194, 77, 0.25), rgba(255, 194, 77, 0.1)),
+    rgba(255, 194, 77, 0.08);
+}
+
+.footer-meta-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  align-items: center;
+  min-width: 0;
+}
+
+.login-row {
+  display: grid;
+  grid-template-columns: 14px minmax(0, auto);
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  margin-top: 0;
+  padding: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.login-row input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.login-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.version-line {
+  min-height: 0;
+  min-width: 0;
+  padding: 0;
+  color: var(--faint);
+  font-size: 10.5px;
+  line-height: 1.2;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace {
+  display: grid;
+  grid-template-rows: var(--topbar-height) minmax(0, 1fr);
+  min-width: 0;
+  min-height: 100vh;
+}
+
+.topbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  padding: 8px 20px;
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(18px);
+}
+
+.topbar-title {
+  display: none;
+}
+
+.topbar-title strong,
+.topbar-title span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topbar-title strong {
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.topbar-title span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.topbar-status,
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.topbar-status {
+  justify-content: flex-end;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.status-pill strong {
+  color: var(--accent-strong);
+  font-size: 15px;
+}
+
+.topbar-actions {
+  justify-content: flex-end;
+}
+
+.locale-toggle {
+  display: inline-flex;
+  gap: 2px;
+  height: 32px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.locale-toggle button {
+  height: 24px;
+  min-width: 32px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.locale-toggle button.active {
+  background: linear-gradient(120deg, var(--accent), var(--info));
+  color: var(--on-accent);
+}
+
+.topbar-actions > button,
+.topbar-actions > a,
+.logs-actions button {
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--text);
+}
+
+.topbar-actions > button:hover:not(:disabled),
+.topbar-actions > a:hover,
+.logs-actions button:hover:not(:disabled) {
+  border-color: rgba(91, 227, 255, 0.34);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.topbar-actions > a {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 14px;
+  text-decoration: none;
+}
+
+#create-session-btn,
+#add-bot-btn {
+  border-color: transparent;
+  background: linear-gradient(120deg, var(--accent), var(--info));
+  color: var(--on-accent);
+  box-shadow: 0 4px 16px rgba(91, 227, 255, 0.24);
+}
+
+#create-session-btn:hover:not(:disabled),
+#add-bot-btn:hover:not(:disabled) {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+
+#stop-btn {
+  color: var(--danger);
+}
+
+.dashboard-host {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+}
+
+#dashboard-frame {
+  /* Electron webview guests only resize reliably when the host is flex-laid. */
+  display: flex;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: var(--bg);
+}
+
+#dashboard-frame[data-visible="false"] {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.empty-dashboard {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  padding: 32px;
+  color: var(--muted);
+  font-size: 15px;
+  text-align: center;
+  background: var(--bg);
+}
+
+.empty-dashboard[hidden] {
+  display: none;
+}
+
+.logs {
+  /* The drawer overlays only the dashboard area; the control rail stays usable. */
+  position: fixed;
+  left: var(--sidebar-width);
+  right: 0;
+  bottom: 0;
+  z-index: 10;
+  height: min(42vh, 340px);
+  min-height: 260px;
+  display: grid;
+  grid-template-rows: 54px minmax(0, 1fr);
+  background: rgba(14, 20, 29, 0.96);
+  color: var(--text);
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -18px 42px rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(18px);
+  transform: translateY(100%);
+  transition: transform 160ms ease;
+}
+
+.logs.open {
+  transform: translateY(0);
+}
+
+.logs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.logs-heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.logs-heading h2 {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.2;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+#log-target {
+  width: 180px;
+  max-width: 28vw;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 28px 0 10px;
+  color: var(--text);
+  background: var(--surface-raised);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.logs-actions {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.logs-actions button {
+  height: 32px;
+  padding: 0 10px;
+}
+
+.log-output {
+  margin: 0;
+  padding: 12px;
+  min-width: 0;
+  overflow: auto;
+  color: #dbe3eb;
+  background: var(--surface-muted);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

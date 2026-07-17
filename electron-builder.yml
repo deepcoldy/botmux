@@ -1,0 +1,16 @@
+appId: com.botmux.desktop
+productName: Botmux
+extraMetadata:
+  main: dist/desktop/main.cjs
+asar: true
+files:
+  - dist/desktop/**
+afterPack: build/after-pack.cjs
+mac:
+  category: public.app-category.developer-tools
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+dmg:
+  sign: false

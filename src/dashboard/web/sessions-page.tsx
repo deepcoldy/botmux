@@ -2497,7 +2497,7 @@ function SessionsPage(): JSX.Element {
     setCreateState(null);
   }, []);
 
-  const openCreateSession = async (): Promise<void> => {
+  const openCreateSession = useCallback(async (): Promise<void> => {
     const requestId = createRequestRef.current + 1;
     createRequestRef.current = requestId;
     setCreateState({ bots: [], loading: true });
@@ -2509,7 +2509,7 @@ function SessionsPage(): JSX.Element {
     } finally {
       if (createRequestRef.current === requestId) setCreateLoading(false);
     }
-  };
+  }, []);
 
   // 侧边菜单「创建会话」入口：已在本页时收事件直接打开；跨页跳转时消费挂载前的 pending
   useEffect(() => {
