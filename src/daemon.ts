@@ -1,8 +1,8 @@
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync, realpathSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -27,7 +27,6 @@ import {
   stopCliRuntimeUpdateMonitor,
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
-import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession } from './core/persistent-backend.js';
 import { classifyGoalWorkerHealth, type GoalWorkerProcessState, type GoalWorkerSessionState } from './core/goal-worker-health.js';
 import { countGoalWorkerReassignAttempts, DEFAULT_GOAL_WORKER_REASSIGN_MAX_ATTEMPTS, latestTaskDispatchEvent } from './core/goal-reassign-budget.js';
 import { statSync } from 'node:fs';
@@ -84,7 +83,7 @@ import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js'
 import type { Session, VcMeetingImTurnOrigin } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
-import { invalidWorkingDirs } from './utils/working-dir.js';
+import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
@@ -122,7 +121,7 @@ import {
 } from './core/worker-pool.js';
 import { ipcRoute, isTrustedHostIpcRequest, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setBotRenamer } from './core/dashboard-ipc-server.js';
 import { loadOrCreateDashboardSecret } from './dashboard/auth.js';
-import { daemonIpcAuthHeaders, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
+import { daemonIpcAuthHeaders, fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
   authorizeSessionScopedIpc,
   bindSessionScopedIpcIdentity,
@@ -2435,7 +2434,7 @@ async function fetchGoalWorkerHealth(goalChatId: string, workerLarkAppId: string
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 1_500);
   try {
-    const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/worker-health-local`, {
+    const res = await fetchDaemonIpc(daemon.ipcPort, '/api/goal/worker-health-local', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ goalChatId, workerLarkAppId }),
@@ -2699,7 +2698,7 @@ async function triggerGoalWatchdogAcrossDaemons(input: {
     const ctrl = new AbortController();
     const tt = setTimeout(() => ctrl.abort(), 3_000);
     try {
-      const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/watchdog`, {
+      const res = await fetchDaemonIpc(daemon.ipcPort, '/api/goal/watchdog', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(input),
@@ -4559,6 +4558,42 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
 // daemon-native entry creates that session directly while reusing the normal
 // session store and forkWorker path. Goal charter is task-scoped (`goal charter`)
 // and intentionally not auto-injected as a session whiteboard.
+function authorizeGoalSessionIpc(
+  req: IncomingMessage,
+  ds: DaemonSession | undefined,
+  raw: {
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+  },
+): ReturnType<typeof authorizeSessionScopedIpc> {
+  const claimedAttempt = typeof raw.originDispatchAttempt === 'number'
+    && Number.isSafeInteger(raw.originDispatchAttempt)
+    && raw.originDispatchAttempt > 0
+    ? raw.originDispatchAttempt
+    : undefined;
+  return authorizeSessionScopedIpc({
+    trustedHost: isTrustedHostIpcRequest(req),
+    sessionExists: !!ds,
+    receiverSession: !!ds?.session.vcMeetingReceiver,
+    allowReceiver: false,
+    sessionId: ds?.session.sessionId ?? '',
+    liveOrigin: ds?.managedTurnOrigin,
+    claimedCapability: typeof raw.originCapability === 'string' ? raw.originCapability : undefined,
+    claimedTurnId: typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined,
+    claimedDispatchAttempt: claimedAttempt,
+  });
+}
+
+function canonicalGoalWorkingDir(input: string): string {
+  const resolved = resolve(expandHomePath(input));
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
 ipcRoute('POST', '/api/goal/supervise', async (req, res) => {
   let raw: {
     chatId?: unknown;
@@ -4569,11 +4604,44 @@ ipcRoute('POST', '/api/goal/supervise', async (req, res) => {
     workingDir?: unknown;
     parentSessionId?: unknown;
     larkAppId?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
   };
   try {
     raw = await readJsonBody(req);
   } catch {
     return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!isTrustedHostIpcRequest(req)) {
+    const parentSessionId = typeof raw.parentSessionId === 'string' ? raw.parentSessionId.trim() : '';
+    const parent = findActiveSessionById(parentSessionId);
+    const verified = authorizeGoalSessionIpc(req, parent, raw);
+    if (!verified.ok || !parent || parent.larkAppId !== currentDaemonLarkAppId) {
+      return jsonRes(res, 403, { ok: false, error: verified.ok ? 'origin_unproven' : verified.error });
+    }
+    raw.parentSessionId = parent.session.sessionId;
+    raw.parentChatId = parent.chatId;
+    raw.parentRoot = parent.session.scope === 'chat' ? undefined : parent.session.rootMessageId;
+    raw.larkAppId = parent.larkAppId;
+    // A session capability proves the caller's current session, but it must not
+    // let that caller ask the host daemon to open an unrelated filesystem path.
+    // Keep the child supervisor inside the project already granted to the L1.
+    const authorizedWorkingDir = parent.workingDir ?? parent.session.workingDir;
+    const requestedWorkingDir = typeof raw.workingDir === 'string' && raw.workingDir.trim()
+      ? raw.workingDir.trim()
+      : undefined;
+    if (requestedWorkingDir && (
+      !authorizedWorkingDir
+      || canonicalGoalWorkingDir(requestedWorkingDir) !== canonicalGoalWorkingDir(authorizedWorkingDir)
+    )) {
+      return jsonRes(res, 403, {
+        ok: false,
+        errorCode: 'working_dir_not_authorized',
+        error: '当前会话未授权该项目目录；请先把当前会话切换到目标项目，再启动目标。',
+      });
+    }
+    raw.workingDir = authorizedWorkingDir;
   }
   const chatId = typeof raw.chatId === 'string' ? raw.chatId.trim() : '';
   const parentChatId = typeof raw.parentChatId === 'string' ? raw.parentChatId.trim() : '';
@@ -5060,7 +5128,7 @@ async function routeGoalParentReplyAcrossDaemons(record: GoalParentNotificationR
     const ctrl = new AbortController();
     const tt = setTimeout(() => ctrl.abort(), 3_000);
     try {
-      const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/route-parent-reply`, {
+      const res = await fetchDaemonIpc(daemon.ipcPort, '/api/goal/route-parent-reply', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -5236,11 +5304,26 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
     attentionReason?: unknown;
     decisionOptions?: unknown;
     done?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
   };
   try {
     raw = await readJsonBody(req);
   } catch {
     return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!isTrustedHostIpcRequest(req)) {
+    const supervisorSessionId = typeof raw.supervisorSessionId === 'string'
+      ? raw.supervisorSessionId.trim()
+      : '';
+    const supervisor = findActiveSessionById(supervisorSessionId);
+    const verified = authorizeGoalSessionIpc(req, supervisor, raw);
+    if (!verified.ok || !supervisor?.session.goalSupervisor) {
+      return jsonRes(res, 403, { ok: false, error: verified.ok ? 'origin_unproven' : verified.error });
+    }
+    raw.supervisorSessionId = supervisor.session.sessionId;
+    raw.goalChatId = supervisor.session.goalSupervisor.goalChatId;
   }
   const summary = typeof raw.summary === 'string' ? raw.summary.trim() : '';
   const attentionKindRaw = typeof raw.attentionKind === 'string' ? raw.attentionKind.trim().toLowerCase() : '';
@@ -5368,7 +5451,15 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
 // different bot daemon, so callers broadcast this route to all online daemons;
 // only the daemon with an active chat-scope L2 will inject a turn.
 ipcRoute('POST', '/api/goal/watchdog', async (req, res) => {
-  let raw: { goalChatId?: unknown; reason?: unknown };
+  let raw: {
+    goalChatId?: unknown;
+    reason?: unknown;
+    broadcast?: unknown;
+    callerSessionId?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+  };
   try {
     raw = await readJsonBody(req);
   } catch {
@@ -5378,6 +5469,25 @@ ipcRoute('POST', '/api/goal/watchdog', async (req, res) => {
   const reason = typeof raw.reason === 'string' && raw.reason.trim() ? raw.reason.trim() : 'ipc';
   if (!goalChatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_goalChatId', error: 'goalChatId is required' });
   try {
+    if (raw.broadcast === true) {
+      if (!isTrustedHostIpcRequest(req)) {
+        const callerSessionId = typeof raw.callerSessionId === 'string' ? raw.callerSessionId.trim() : '';
+        const caller = findActiveSessionById(callerSessionId);
+        const verified = authorizeGoalSessionIpc(req, caller, raw);
+        if (!verified.ok || !caller || caller.chatId !== goalChatId) {
+          return jsonRes(res, 403, { ok: false, error: verified.ok ? 'origin_unproven' : verified.error });
+        }
+      }
+      const result = await triggerGoalWatchdogAcrossDaemons({
+        goalChatId,
+        reason,
+        sourceSessionId: typeof raw.callerSessionId === 'string' ? raw.callerSessionId.trim() || undefined : undefined,
+      });
+      return jsonRes(res, 200, { ok: true, ...result });
+    }
+    if (!isTrustedHostIpcRequest(req)) {
+      return jsonRes(res, 403, { ok: false, error: 'origin_unproven' });
+    }
     const results = await runGoalWatchdogForGoalOnThisDaemon(goalChatId, reason);
     return jsonRes(res, 200, { ok: true, results });
   } catch (err: any) {

@@ -1143,7 +1143,7 @@ $${GOAL_ENV.INPUTS_PATH}
 
 const ORCHESTRATE_SKILL = `---
 name: botmux-orchestrate
-description: 作为「主 bot/编排者」做**两级编排**：L1（主群）规划 + 跟用户对齐 + 建 goal 群 + 起 L2 监管化身；L2（goal 群内的化身）派子任务给 worker、查账本验收、维护 goal charter、全部完成后通知 L1。触发：用户提到「群协作模式」「两级编排」「goal 群」「监管化身」，或要「把大项目拆给多个机器人并行做」「协调多个 bot」「你当总控/编排」「一个写一个 review 多组并行」，或显式提到 botmux orchestrate / goal supervise / dispatch 派活。
+description: 作为「主 bot/编排者」做**两级编排**：L1（主群）规划 + 跟用户对齐 + 建 goal 群 + 起 L2 监管化身；L2（goal 群内的化身）派子任务给 worker、查账本验收、维护 goal charter、全部完成后通知 L1。仅当任务同时需要「多个 bot 分工」+「持续的 goal 群/多话题协调与进度板」+「主 bot 汇总验收」时触发；若只是一个有界 DAG、跑完即散、产出单一交付物，应使用 botmux-workflow；单步任务直接处理。用户提到「群协作模式」「两级编排」「goal 群」「监管化身」，或显式提到 botmux orchestrate / goal supervise / dispatch 派活时也使用。
 ---
 
 # botmux-orchestrate — 两级编排（L1 主群总控 + L2 goal 群监管，默认群级会话）

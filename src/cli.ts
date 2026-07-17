@@ -3780,15 +3780,14 @@ async function cmdSuspend(): Promise<void> {
   if (failed > 0) process.exitCode = 1;
 }
 
-/** 会话级 CLI IPC（slash/cd）的 POST：与 postAsk 同款双路径——能读 host secret
- *  （非隔离进程）走 trusted-host HMAC 签名；读不到（沙箱 BOTMUX_SEND_RELAY /
- *  macOS 读隔离 carve-out）改带本会话当前轮换的 origin capability，由 daemon
- *  handler 与活跃记录比对。两条路都不读 bots.json。 */
-async function postSessionCliIpc(
+/** 会话级 CLI IPC 的 POST：能读 host secret 时走 trusted-host HMAC；读不到
+ * 时带本会话当前轮换的 origin capability，由目标 handler 绑定活跃会话身份。 */
+async function postSessionScopedDaemonIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd',
+  path: string,
   payload: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
   let hostSecret: string | undefined;
@@ -3807,15 +3806,30 @@ async function postSessionCliIpc(
       if (claim.dispatchAttempt !== undefined) requestBody.originDispatchAttempt = claim.dispatchAttempt;
     }
   }
-  const path = `/api/sessions/${encodeURIComponent(sessionId)}/${route}`;
   const init = {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(requestBody),
+    ...(signal ? { signal } : {}),
   } satisfies RequestInit;
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
     : fetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
+/** slash/cd 保持独立窄路由，复用同一套 host-secret / session-capability 双路径。 */
+async function postSessionCliIpc(
+  ipcPort: number,
+  sessionId: string,
+  route: 'slash' | 'cd',
+  payload: Record<string, unknown>,
+): Promise<Response> {
+  return postSessionScopedDaemonIpc(
+    ipcPort,
+    sessionId,
+    `/api/sessions/${encodeURIComponent(sessionId)}/${route}`,
+    payload,
+  );
 }
 
 /** botmux slash "<斜杠命令>"：请求 daemon 在本会话 idle 后把命令敲入自己的 CLI。
@@ -4221,7 +4235,49 @@ async function cmdWorkflowGrant(runId: string | undefined, rest: string[]): Prom
   console.log(`➕ v3 run "${runId}" 已追加一轮，loop 将带上一轮反馈重跑。`);
 }
 
-async function triggerGoalWatchdogFromCli(goalChatId: string, reason: string): Promise<{ contacted: number; injected: number; reconciled: number; busy: number; rateLimited: number }> {
+async function triggerGoalWatchdogFromCli(
+  goalChatId: string,
+  reason: string,
+  sessionId?: string,
+  larkAppId?: string,
+): Promise<{ contacted: number; injected: number; reconciled: number; busy: number; rateLimited: number }> {
+  if (sessionId && larkAppId) {
+    const daemon = findDaemon(larkAppId);
+    if (daemon) {
+      const ctrl = new AbortController();
+      const tt = setTimeout(() => ctrl.abort(), 3_000);
+      try {
+        const res = await postSessionScopedDaemonIpc(
+          daemon.ipcPort,
+          sessionId,
+          '/api/goal/watchdog',
+          { goalChatId, reason, broadcast: true, callerSessionId: sessionId },
+          ctrl.signal,
+        );
+        if (res.ok) {
+          const body = await res.json().catch(() => null) as {
+            contacted?: number;
+            injected?: number;
+            reconciled?: number;
+            busy?: number;
+            rateLimited?: number;
+          } | null;
+          return {
+            contacted: body?.contacted ?? 0,
+            injected: body?.injected ?? 0,
+            reconciled: body?.reconciled ?? 0,
+            busy: body?.busy ?? 0,
+            rateLimited: body?.rateLimited ?? 0,
+          };
+        }
+      } catch {
+        // Fall through to the trusted-host fan-out. In a read-isolated session
+        // this may also fail; the periodic watchdog remains the final fallback.
+      } finally {
+        clearTimeout(tt);
+      }
+    }
+  }
   const daemons = listOnlineDaemons();
   let contacted = 0;
   let injected = 0;
@@ -4232,7 +4288,7 @@ async function triggerGoalWatchdogFromCli(goalChatId: string, reason: string): P
     const ctrl = new AbortController();
     const tt = setTimeout(() => ctrl.abort(), 3_000);
     try {
-      const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/watchdog`, {
+      const res = await fetchDaemonIpc(daemon.ipcPort, '/api/goal/watchdog', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ goalChatId, reason }),
@@ -7644,7 +7700,7 @@ async function cmdHelp(rest: string[]): Promise<void> {
     },
   });
 
-  const watchdog = await triggerGoalWatchdogFromCli(goalChatId, `help:${taskId}`);
+  const watchdog = await triggerGoalWatchdogFromCli(goalChatId, `help:${taskId}`, sid ?? undefined, s?.larkAppId);
   let envelopeMessageId: string | undefined;
   if (s?.larkAppId) {
     try {
@@ -7902,6 +7958,7 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
     if (!argFlag(rest, '--no-notify-parent')) {
       try {
         if (!s?.larkAppId) throw new Error('无法推断当前 L2 session/larkAppId；可传 --session-id 或 --no-notify-parent。');
+        if (!sid) throw new Error('无法推断当前 L2 session；可传 --session-id 或 --no-notify-parent。');
         const daemon = findDaemon(s.larkAppId);
         if (!daemon) throw new Error(`未找到在线 daemon (larkAppId=${s.larkAppId})`);
         const summary = [
@@ -7910,10 +7967,11 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
           retryBrief ? `建议/待确认: ${retryBrief}` : undefined,
           task.chatId ? `goal: ${task.chatId}` : undefined,
         ].filter(Boolean).join('\n');
-        const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/notify-parent`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
+        const res = await postSessionScopedDaemonIpc(
+          daemon.ipcPort,
+          sid,
+          '/api/goal/notify-parent',
+          {
             supervisorSessionId: sid,
             goalChatId: task.chatId,
             taskId,
@@ -7921,8 +7979,8 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
             attentionKind: 'help',
             attentionReason: reason,
             decisionOptions,
-          }),
-        });
+          },
+        );
         const body = await res.json().catch(() => null) as { ok?: boolean; error?: string; attentionRaised?: boolean } | null;
         if (!res.ok || !body?.ok) throw new Error(body?.error ?? `daemon HTTP ${res.status}`);
         parentNotified = true;
@@ -8088,11 +8146,18 @@ async function requestGoalSupervisor(input: GoalSuperviseCliRequest): Promise<an
 
   let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/supervise`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(input),
-    });
+    res = input.parentSessionId
+      ? await postSessionScopedDaemonIpc(
+          daemon.ipcPort,
+          input.parentSessionId,
+          '/api/goal/supervise',
+          input as unknown as Record<string, unknown>,
+        )
+      : await fetchDaemonIpc(daemon.ipcPort, '/api/goal/supervise', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(input),
+        });
   } catch (err: any) {
     throw new Error(`无法连接监管者 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
   }
@@ -8562,10 +8627,11 @@ async function cmdGoalNotifyParent(rest: string[]): Promise<void> {
 
   let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/notify-parent`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
+    res = await postSessionScopedDaemonIpc(
+      daemon.ipcPort,
+      sid,
+      '/api/goal/notify-parent',
+      {
         supervisorSessionId: sid,
         goalChatId,
         taskId,
@@ -8574,8 +8640,8 @@ async function cmdGoalNotifyParent(rest: string[]): Promise<void> {
         attentionReason: attention.requested ? summary.trim() : undefined,
         decisionOptions,
         done,
-      }),
-    });
+      },
+    );
   } catch (err: any) {
     console.error(`无法连接 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
     process.exit(1);

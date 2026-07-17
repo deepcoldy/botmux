@@ -66,6 +66,7 @@ const MANAGE_ROUTES = [
   'connectors',
   'insights',
   'whiteboards',
+  'goals',
 ];
 
 const NAV_ITEMS: NavItem[] = [
@@ -118,6 +119,19 @@ const NAV_ITEMS: NavItem[] = [
         <circle cx="3.4" cy="12.4" r="1.9" />
         <circle cx="12.6" cy="8" r="1.9" />
         <path d="M5.2 4.4l5.6 2.8M5.2 11.6l5.6-2.8" />
+      </>
+    ),
+  },
+  {
+    id: 'goals',
+    href: '#/goals',
+    labelKey: 'nav.goals',
+    manage: true,
+    icon: (
+      <>
+        <circle cx="8" cy="8" r="6.2" />
+        <circle cx="8" cy="8" r="2.8" />
+        <path d="M8 1.8V4M8 12v2.2M1.8 8H4M12 8h2.2" />
       </>
     ),
   },

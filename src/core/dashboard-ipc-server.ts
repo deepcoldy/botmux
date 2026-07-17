@@ -235,6 +235,12 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd)$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
+  // Goal commands are issued by the active L1/L2/worker CLI itself. Their
+  // handlers bind the request to that exact live session via the rotating
+  // origin capability before accepting any caller-selectable coordinates.
+  if (method === 'POST' && pathname === '/api/goal/supervise') return true;
+  if (method === 'POST' && pathname === '/api/goal/notify-parent') return true;
+  if (method === 'POST' && pathname === '/api/goal/watchdog') return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
   // protocol (request signature over method/path/exact body with nonce
   // anti-replay + boot audience, signed response), keyed on the same host

@@ -212,6 +212,31 @@ describe('attention signals', () => {
   });
 });
 
+describe('goal dashboard daemon IPC wiring', () => {
+  const source = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
+
+  function between(start: string, end: string): string {
+    const from = source.indexOf(start);
+    const to = source.indexOf(end, from + start.length);
+    expect(from, `missing marker: ${start}`).toBeGreaterThanOrEqual(0);
+    expect(to, `missing marker: ${end}`).toBeGreaterThan(from);
+    return source.slice(from, to);
+  }
+
+  it('signs live-risk reads and all goal mutations sent to daemon IPC', () => {
+    const regions = [
+      between('async function collectGoalAttentionLiveRisks(', '/** Create a Feishu group'),
+      between('const mGoalWatchdog =', 'const mGoalNotificationRetry ='),
+      between('const mGoalNotificationRetry =', 'const mGoalDecision ='),
+      between('const mGoalDecision =', 'const mWhiteboard ='),
+    ];
+    for (const region of regions) {
+      expect(region).toContain('fetchDaemonIpc(');
+      expect(region).not.toContain('await fetch(`http://127.0.0.1:');
+    }
+  });
+});
+
 // The dashboard "open terminal" link is built from row.proxyPort (sessions.ts
 // terminalHref), NOT buildTerminalUrl — so the row must carry the SAME advertised
 // port the card links use, or the relay scenario gives a broken dashboard link.

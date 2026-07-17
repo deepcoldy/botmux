@@ -1533,7 +1533,8 @@ async function collectGoalAttentionLiveRisks(chatId?: string): Promise<any[]> {
   const qs = chatId ? `?chatId=${encodeURIComponent(chatId)}` : '';
   const chunks = await Promise.all(registry.list().map(async d => {
     try {
-      const upstream = await fetch(`http://127.0.0.1:${d.ipcPort}/api/goals/attention/live${qs}`, {
+      const path = `/api/goals/attention/live${qs}`;
+      const upstream = await fetchDaemonIpc(d.ipcPort, path, {
         method: 'GET',
         signal: AbortSignal.timeout(2_000),
       });
@@ -2740,7 +2741,7 @@ const server = createServer(async (req, res) => {
       let lastError: any = null;
       await Promise.all(registry.list().map(async (d) => {
         try {
-          const upstream = await fetch(`http://127.0.0.1:${d.ipcPort}/api/goal/watchdog`, {
+          const upstream = await fetchDaemonIpc(d.ipcPort, '/api/goal/watchdog', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ goalChatId, reason }),
@@ -2779,7 +2780,7 @@ const server = createServer(async (req, res) => {
         let triggerError: string | undefined;
         if (d) {
           try {
-            const upstream = await fetch(`http://127.0.0.1:${d.ipcPort}/api/goal-notification-retries/process`, {
+            const upstream = await fetchDaemonIpc(d.ipcPort, '/api/goal-notification-retries/process', {
               method: 'POST',
               signal: AbortSignal.timeout(3_000),
             });
@@ -2813,7 +2814,7 @@ const server = createServer(async (req, res) => {
       let lastError: any = null;
       for (const d of registry.list()) {
         try {
-          const upstream = await fetch(`http://127.0.0.1:${d.ipcPort}/api/goals/${encodeURIComponent(goalChatId)}/decision`, {
+          const upstream = await fetchDaemonIpc(d.ipcPort, `/api/goals/${encodeURIComponent(goalChatId)}/decision`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body,

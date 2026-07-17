@@ -6,6 +6,7 @@ describe('dashboard i18n helpers', () => {
   it('renders English v3 workflow labels with interpolation', () => {
     const t = createDashboardTranslator('en');
     expect(t('nav.workflows')).toBe('Workflows');
+    expect(t('nav.goals')).toBe('Goals');
     expect(t('workflow.v3.cancel')).toBe('Cancel run');
     expect(t('workflow.v3.cancelConfirm', { runId: 'run-42' })).toBe(
       'Cancel v3 workflow run run-42?\n\nCompleted nodes remain committed; running nodes will be interrupted.',
@@ -15,6 +16,7 @@ describe('dashboard i18n helpers', () => {
   it('renders Chinese v3 workflow labels with interpolation', () => {
     const t = createDashboardTranslator('zh');
     expect(t('nav.workflows')).toBe('工作流');
+    expect(t('nav.goals')).toBe('目标看板');
     expect(t('workflow.v3.cancel')).toBe('取消运行');
     expect(t('workflow.v3.cancelConfirm', { runId: 'run-42' })).toBe(
       '确认取消 v3 工作流运行 run-42？\n\n已完成的节点会保留，运行中的节点会被中断。',
