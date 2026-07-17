@@ -713,7 +713,7 @@ async function handleScheduleCommand(
       const nextStr = next ? t('schedule.next_label', { time: next.toLocaleString(timeLocale, { timeZone }) }, loc) : '';
       const lastStr = task.lastRunAt ? t('schedule.last_label', { time: new Date(task.lastRunAt).toLocaleString(timeLocale, { timeZone }) }, loc) : '';
       const display = task.parsed?.display ?? task.schedule;
-      return `${status} [${task.id}] ${display} | ${task.name}\n   prompt: ${task.prompt.substring(0, 50)}${task.prompt.length > 50 ? '...' : ''}${nextStr}${lastStr}`;
+      return `${status} [${task.id}] ${display} | ${task.name}${task.silent ? ' 🔇' : ''}\n   prompt: ${task.prompt.substring(0, 50)}${task.prompt.length > 50 ? '...' : ''}${nextStr}${lastStr}`;
     });
     await sessionReply(rootId, `${t('schedule.list_header', { count: tasks.length }, loc)}\n\n${lines.join('\n\n')}`);
     return;
@@ -774,8 +774,13 @@ async function handleScheduleCommand(
     const workingDir = resolveScheduleWorkingDir(ds, chatId, larkAppId);
     const taskScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
     // "新话题" keyword → every fire opens a brand-new topic in a fresh session.
-    const { deliver, prompt: schedPrompt } = scheduler.extractDeliveryMode(parsed.prompt);
-    const schedName = deliver === 'new-topic'
+    // "静默" keyword → fires post no banner; the model decides whether to send.
+    const { deliver, silent, prompt: schedPrompt } = scheduler.extractScheduleModifiers(parsed.prompt);
+    if (silent && deliver === 'new-topic') {
+      await sessionReply(rootId, t('schedule.silent_new_topic_conflict', undefined, loc));
+      return;
+    }
+    const schedName = schedPrompt !== parsed.prompt
       ? (schedPrompt.length > 20 ? schedPrompt.slice(0, 20) + '...' : schedPrompt)
       : parsed.name;
     const task = scheduler.addTask({
@@ -790,6 +795,7 @@ async function handleScheduleCommand(
       chatType: ds?.chatType === 'p2p' ? 'p2p' : 'topic_group',
       larkAppId,
       deliver,
+      silent,
     });
     const next = scheduler.getNextRun(task.id);
     const nextStr = next ? next.toLocaleString(timeLocale, { timeZone }) : 'N/A';
@@ -802,7 +808,8 @@ async function handleScheduleCommand(
       next: nextStr,
     }, loc);
     const deliverNote = deliver === 'new-topic' ? '\n' + t('schedule.deliver_new_topic', undefined, loc) : '';
-    await sessionReply(rootId, createdMsg + deliverNote);
+    const silentNote = silent ? '\n' + t('schedule.silent_note', undefined, loc) : '';
+    await sessionReply(rootId, createdMsg + deliverNote + silentNote);
     return;
   }
 

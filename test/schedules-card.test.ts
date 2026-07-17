@@ -426,6 +426,18 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     expect(delivery.value.target_delivery).toBe('new-topic');
   });
 
+  it('silent task → delivery switch disabled with the silent reason note', () => {
+    const detail = detailFor({ id: 'sch_silent', deliver: 'origin', silent: true } as any);
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const delivery = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_DELIVERY,
+    );
+    expect(delivery.disabled).toBe(true);
+    expect(json).toContain('静默任务不能切换为每次新话题');
+  });
+
   it('scope=global → detail shows owning bot and chat', () => {
     const detail = detailFor({
       id: 'sch_global_detail',

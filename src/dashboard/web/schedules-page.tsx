@@ -88,6 +88,7 @@ function ScheduleRowCard(props: {
         <div className="schedule-chip-strip">
           <span>{kind}</span>
           <span>{tr('schedules.delivery')}: {deliveryLabel(s, tr)}</span>
+          {s.silent ? <span>🔇 {tr('schedules.silent')}</span> : null}
           <span>{tr('schedules.next')}: {fmtScheduleDate(s.nextRunAt, scheduleTimeZone)}</span>
           <span>{tr('schedules.last')}: {fmtScheduleDate(s.lastRunAt, scheduleTimeZone)}{s.lastStatus === 'error' ? ' · error' : ''}</span>
           <span>{tr('schedules.repeat')}: {repeatLabel(s)}</span>
@@ -109,7 +110,8 @@ function ScheduleRowCard(props: {
             tr={tr}
             onClick={() => props.onAction(s.id, toggleOp)}
           />
-          {s.deliver === 'local' ? null : (
+          {/* silent tasks can't switch to new-topic (needs a first message) — hide like 'local' */}
+          {s.deliver === 'local' || s.silent ? null : (
             <ActionButton
               op="delivery"
               label={s.deliver === 'new-topic' ? tr('schedules.useOrigin') : tr('schedules.useNewTopic')}

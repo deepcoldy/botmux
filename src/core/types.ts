@@ -117,6 +117,13 @@ export interface DaemonSession {
    *  real CLI input (rememberLastCliInput) — the next turn posts a card normally.
    *  In-memory only. See core/restart-report.ts. */
   suppressRecoveryCard?: boolean;
+  /** Set by executeScheduledTask for `silent` scheduled fires: suppresses the
+   *  automatic streaming card (post/patch) AND bridge final_output forwarding
+   *  so the fire leaves zero daemon-initiated messages in the group — the
+   *  model alone decides whether to `botmux send` (报警). Cleared on the first
+   *  real CLI input (rememberLastCliInput), same lifecycle as
+   *  suppressRecoveryCard. In-memory only. */
+  silentScheduledTurn?: boolean;
   /** Session-scoped override: when true, the streaming card is posted/patched
    *  even if the bot has `disableStreamingCard` set. Flipped on by the `/card`
    *  command so a user can manually summon a live card in an otherwise-quiet

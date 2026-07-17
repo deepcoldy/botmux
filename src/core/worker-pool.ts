@@ -308,7 +308,7 @@ export function writableTerminalLinkFor(ds: DaemonSession): string | undefined {
 }
 
 function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
-  if (!isLocalCliOpenEnabled() || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+  if (!isLocalCliOpenEnabled() || streamingCardDisabled(ds) || ds.suppressRecoveryCard || ds.silentScheduledTurn) {
     ds.pendingLocalCliButtonRefresh = undefined;
     return;
   }
@@ -358,7 +358,7 @@ function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
  * in-card writable link would stay stale until the next status-edge PATCH.
  */
 export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
-  if (streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+  if (streamingCardDisabled(ds) || ds.suppressRecoveryCard || ds.silentScheduledTurn) {
     ds.pendingRiffUrlCardRefresh = undefined;
     return;
   }
@@ -2380,6 +2380,14 @@ function setupWorkerHandlers(
           break;
         }
 
+        // Silent scheduled fire: leave zero daemon-initiated messages in the
+        // group. The model alone decides whether to `botmux send`. Cleared by
+        // the next real user input (rememberLastCliInput).
+        if (ds.silentScheduledTurn) {
+          logger.info(`[${t}] Silent scheduled turn — suppressing streaming card`);
+          break;
+        }
+
         // If a previous streaming card survived (e.g. daemon restart), try to
         // PATCH it with the new "starting" state instead of POSTing a fresh card.
         // ds.streamCardPending forces a new card (e.g. mid-session repo switch
@@ -2686,6 +2694,9 @@ function setupWorkerHandlers(
         // redraws on resume. Stay silent (no post/patch) until the first real
         // user turn clears the flag. Dashboard SSE above still reflects status.
         if (ds.suppressRecoveryCard) break;
+
+        // Silent scheduled fire — no card post/patch (dashboard SSE unaffected).
+        if (ds.silentScheduledTurn) break;
 
         const readUrl = buildTerminalUrl(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
@@ -3212,6 +3223,14 @@ function setupWorkerHandlers(
         if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
         if (managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt)) {
           logger.debug(`[${t}] final_output captured/discarded for silent turn ${msg.turnId.substring(0, 8)}`);
+          break;
+        }
+        // Silent scheduled fire: bridge CLIs (hermes/codex-app style) forward
+        // the final assistant answer automatically — that would defeat "只有
+        // 符合条件才报警". The silent-schedule prompt hint routes alerts
+        // through `botmux send` instead.
+        if (ds.silentScheduledTurn) {
+          logger.debug(`[${t}] final_output discarded for silent scheduled turn`);
           break;
         }
         if (!msg.sessionId) {

@@ -293,6 +293,46 @@ export function extractDeliveryMode(prompt: string): { deliver: 'origin' | 'new-
   return { deliver: 'origin', prompt };
 }
 
+/**
+ * Detect a leading "silent" keyword in a /schedule prompt and strip it.  Lets
+ * users write `/schedule 每30分钟 静默 检查服务，挂了才报警` so fires post no
+ * "🕐 task started" banner and the model decides whether to `botmux send`.
+ * The keyword must be followed by whitespace/punctuation — a prompt that
+ * merely *starts with* 静默 as part of a longer word (静默模式…) is left
+ * untouched only when nothing separates it, so document the spaced form.
+ */
+export function extractSilentMode(prompt: string): { silent: boolean; prompt: string } {
+  const zh = prompt.match(/^\s*(?:静默|悄悄)(?:执行|运行|地)?[\s,，、:：。-]+(.+)$/s);
+  if (zh && zh[1].trim()) return { silent: true, prompt: zh[1].trim() };
+  const en = prompt.match(/^\s*silent(?:ly)?[\s,:：-]+(.+)$/is);
+  if (en && en[1].trim()) return { silent: true, prompt: en[1].trim() };
+  return { silent: false, prompt };
+}
+
+/**
+ * Extract both /schedule prompt modifiers (delivery + silent) regardless of
+ * their order ("静默 新话题 …" / "新话题 静默 …").  The combination is NOT
+ * validated here — callers reject silent+new-topic with a user-facing error.
+ */
+export function extractScheduleModifiers(prompt: string): {
+  deliver: 'origin' | 'new-topic';
+  silent: boolean;
+  prompt: string;
+} {
+  let deliver: 'origin' | 'new-topic' = 'origin';
+  let silent = false;
+  let rest = prompt;
+  // Two keywords max — loop twice so either order is handled.
+  for (let i = 0; i < 2; i++) {
+    const d = extractDeliveryMode(rest);
+    if (d.deliver === 'new-topic') { deliver = 'new-topic'; rest = d.prompt; continue; }
+    const s = extractSilentMode(rest);
+    if (s.silent) { silent = true; rest = s.prompt; continue; }
+    break;
+  }
+  return { deliver, silent, prompt: rest };
+}
+
 // ─── next-run computation ───────────────────────────────────────────────────
 
 /** Compute the next run time for a parsed schedule. Returns ISO string, or null if exhausted. */
@@ -523,7 +563,14 @@ export function addTask(params: {
   parsed?: ParsedSchedule;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
+  silent?: boolean;
 }): ScheduledTask {
+  // Single choke point for the invalid combination — every creation entry
+  // (CLI/slash/dashboard/workflow) funnels through here. Entry points give
+  // friendlier errors first; this guard catches anything they miss.
+  if (params.silent && params.deliver === 'new-topic') {
+    throw new Error('silent schedules cannot use deliver:new-topic — a new topic requires a first message');
+  }
   const parsed = params.parsed ?? parseSchedule(params.schedule);
   const nextRunAt = computeNextRun(parsed) ?? undefined;
   const task = scheduleStore.createTask({
@@ -543,6 +590,7 @@ export function addTask(params: {
     nextRunAt,
     repeat: params.repeat,
     deliver: params.deliver ?? 'origin',
+    silent: params.silent,
   });
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${parsed.display}, next: ${nextRunAt ?? 'N/A'}`);
   return task;
@@ -666,6 +714,11 @@ export function toggleDelivery(id: string): { ok: boolean; error?: string; deliv
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
   if (task.deliver === 'local') return { ok: false, error: 'local_not_toggleable' };
+  // Silent tasks must stay in-place: new-topic needs a first message to open
+  // the topic, which contradicts "post nothing on fire".
+  if (task.silent && task.deliver !== 'new-topic') {
+    return { ok: false, error: 'silent_task_origin_only' };
+  }
   const next: 'origin' | 'new-topic' = task.deliver === 'new-topic' ? 'origin' : 'new-topic';
   scheduleStore.updateTask(id, { deliver: next });
   dashboardEventBus.publish({

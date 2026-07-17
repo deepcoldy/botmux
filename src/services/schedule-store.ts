@@ -84,6 +84,7 @@ export function canonicalScheduleInput(t: {
   larkAppId?: string;
   repeat?: { times: number | null; completed?: number };
   deliver?: 'origin' | 'local' | 'new-topic';
+  silent?: boolean;
 }): unknown {
   return {
     name: t.name,
@@ -112,6 +113,9 @@ export function canonicalScheduleInput(t: {
     // `times` is the durable user intent.
     repeat: t.repeat ? { times: t.repeat.times } : undefined,
     deliver: t.deliver ?? 'origin',
+    // `silent: false`/absent normalizes to undefined (dropped by
+    // computeInputHash) so pre-existing tasks keep their canonical hash.
+    silent: t.silent === true ? true : undefined,
   };
 }
 
@@ -193,6 +197,7 @@ function migrate(raw: any): ScheduledTask | null {
     lastDeliveryError: raw.lastDeliveryError,
     repeat: raw.repeat,
     deliver: raw.deliver ?? 'origin',
+    silent: raw.silent === true ? true : undefined,
   };
 }
 
@@ -393,6 +398,7 @@ export function createTask(params: {
   nextRunAt?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
+  silent?: boolean;
 }): ScheduledTask {
   return mutateTasks(working => {
     if (params.id) {
@@ -441,6 +447,7 @@ export function createTask(params: {
       nextRunAt: params.nextRunAt,
       repeat: params.repeat,
       deliver: params.deliver ?? 'origin',
+      silent: params.silent === true ? true : undefined,
     };
     working.set(task.id, task);
     return { result: task, changed: true };

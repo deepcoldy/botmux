@@ -478,6 +478,8 @@ export const messages: Record<string, string> = {
   'schedule.triggered_now': '已触发定时任务 {id} 立即执行',
   'schedule.created': '✅ 定时任务已创建！\n\nID: {id}\n名称: {name}\n规则: {rule}\nPrompt: {prompt}\n工作目录: {dir}\n下次执行: {next}',
   'schedule.deliver_new_topic': '投递方式: 每次开新话题（独立会话，互不串扰）',
+  'schedule.silent_note': '静默模式: 触发时不发「执行中」提示，模型判断满足条件才 botmux send 报警，否则完全静默',
+  'schedule.silent_new_topic_conflict': '「静默」与「新话题」不能同时使用：新话题必须由首条消息开启。要「有异常才开新话题」，可在任务描述里让模型报警时用 botmux send 顶层发送。',
   'schedule.parse_failed': '无法解析定时任务，请使用自然语言格式：\n\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报\n/schedule 每小时 检查服务健康状态\n/schedule 每30分钟 ping一下服务\n/schedule 每月1号9:00 生成月报\n\n管理命令：\n/schedule list — 查看所有任务\n/schedule remove <id> — 删除任务\n/schedule enable <id> — 启用任务\n/schedule disable <id> — 禁用任务\n/schedule run <id> — 立即执行一次',
 
   // ─── /help ───────────────────────────────────────────────────────────────
@@ -878,6 +880,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.pause.disabled.alreadyPaused': '任务已暂停',
   'card.dashboard.schedules.resume.disabled.alreadyEnabled': '任务已启用',
   'card.dashboard.schedules.delivery.disabled.local': '本地投递模式不支持在卡片中切换',
+  'card.dashboard.schedules.delivery.disabled.silent': '静默任务不能切换为每次新话题（新话题必须由首条消息开启）',
   'card.dashboard.schedules.delivery.disabled.alreadyOrigin': '已是原话题投递',
   'card.dashboard.schedules.delivery.disabled.alreadyNewTopic': '已是每次新话题投递',
   'card.dashboard.schedules.pause_failed': '⚠️ 暂停失败：{reason}',

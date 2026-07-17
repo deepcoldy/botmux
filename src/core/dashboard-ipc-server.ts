@@ -1239,6 +1239,7 @@ export interface ScheduleRow {
   lastError?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
+  silent?: boolean;
   feishuChatLink: string;
 }
 
@@ -1261,6 +1262,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     lastError: t.lastError,
     repeat: t.repeat,
     deliver: t.deliver ?? 'origin',
+    silent: t.silent,
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }

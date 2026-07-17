@@ -455,6 +455,14 @@ export interface ScheduledTask {
    *    a fresh session (never reuses a prior session / never replies in-thread)
    *  - 'local': log only, no delivery */
   deliver?: 'origin' | 'local' | 'new-topic';
+  /** Silent execution: fires post NO "🕐 task started" banner / creator notice,
+   *  and the spawned turn suppresses daemon-initiated group output (streaming
+   *  card, bridge final_output forwarding). The prompt is wrapped with a hint
+   *  telling the model to `botmux send` only when its alert condition is met —
+   *  "符合条件报警、不符合条件静默". Incompatible with deliver:'new-topic'
+   *  (a new topic can only be opened by a first message); creation rejects the
+   *  combination and a runtime encounter falls back to a loud fire. */
+  silent?: boolean;
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }

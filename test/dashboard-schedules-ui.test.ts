@@ -37,6 +37,14 @@ describe('dashboard schedules React page helpers', () => {
     expect(fmtScheduleDate()).toBe('—');
   });
 
+  it('renders a silent chip and hides the delivery toggle for silent schedules', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    // chip in the meta strip
+    expect(page).toContain("s.silent ? <span>🔇 {tr('schedules.silent')}</span> : null");
+    // delivery switch hidden for silent tasks (like 'local') — silent can't go new-topic
+    expect(page).toContain("s.deliver === 'local' || s.silent ? null : (");
+  });
+
   it('formats in the given schedule timezone, not the browser zone', () => {
     // 2026-07-08T01:00Z = 09:00 in Asia/Shanghai. Rendering with the effective
     // schedule tz must show 09 (+ a zone suffix), regardless of the test host zone.

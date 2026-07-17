@@ -165,6 +165,7 @@ vi.mock('../src/core/scheduler.js', () => ({
   getNextRun: vi.fn(),
   addTask: vi.fn(),
   extractDeliveryMode: vi.fn((prompt: string) => ({ deliver: 'origin' as const, prompt })),
+  extractScheduleModifiers: vi.fn((prompt: string) => ({ deliver: 'origin' as const, silent: false, prompt })),
 }));
 
 vi.mock('../src/services/project-scanner.js', () => ({
@@ -2507,6 +2508,55 @@ describe('handleCommand', () => {
 
       const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
       expect(callArgs.workingDir).toBe('~/repo/oncall');
+    });
+
+    it('静默 keyword: passes silent:true to addTask and echoes the silent note', async () => {
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'interval', minutes: 30, display: '每 30 分钟' },
+        prompt: '静默 检查服务，挂了才报警',
+        name: '静默 检查服务，挂了才报警',
+      });
+      vi.mocked(scheduler.extractScheduleModifiers).mockReturnValue({
+        deliver: 'origin',
+        silent: true,
+        prompt: '检查服务，挂了才报警',
+      });
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-silent', prompt: '检查服务，挂了才报警' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-27T10:30:00+08:00'));
+
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每30分钟 静默 检查服务，挂了才报警'), deps, LARK_APP_ID);
+
+      expect(scheduler.addTask).toHaveBeenCalledTimes(1);
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.silent).toBe(true);
+      expect(callArgs.prompt).toBe('检查服务，挂了才报警');
+      // stripped-modifier prompt becomes the task name (mirrors 新话题 behaviour)
+      expect(callArgs.name).toBe('检查服务，挂了才报警');
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('静默模式');
+    });
+
+    it('静默 + 新话题 conflict: rejects with a hint and creates nothing', async () => {
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '每日 09:00' },
+        prompt: '静默 新话题 生成日报',
+        name: '静默 新话题 生成日报',
+      });
+      vi.mocked(scheduler.extractScheduleModifiers).mockReturnValue({
+        deliver: 'new-topic',
+        silent: true,
+        prompt: '生成日报',
+      });
+
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日9:00 静默 新话题 生成日报'), deps, LARK_APP_ID);
+
+      expect(scheduler.addTask).not.toHaveBeenCalled();
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('不能同时使用');
     });
   });
 
