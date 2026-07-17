@@ -561,6 +561,57 @@ describe('createFeishuOpenPlatformApp', () => {
 });
 
 describe('automateOpenPlatformSetup', () => {
+  it('forwards forceQrLogin so configure --switch-account ignores a valid cache', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-auto-force-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    let initCount = 0;
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href.includes('/accounts/qrlogin/init')) {
+        initCount++;
+        return Response.json(
+          { code: 0, data: { step_info: { token: 'fresh-token' } } },
+          { headers: { 'x-flow-key': 'fresh-flow' } },
+        );
+      }
+      if (href.includes('/accounts/qrlogin/polling')) {
+        return Response.json({
+          code: 0,
+          data: { next_step: 'enter_app', step_info: { status: 1, cross_login_uri: 'https://accounts.feishu.cn/fresh-cross' } },
+        });
+      }
+      if (href === 'https://accounts.feishu.cn/fresh-cross') {
+        return new Response('', {
+          status: 302,
+          headers: {
+            location: 'https://ask.feishu.cn/',
+            'set-cookie': 'session=fresh-cookie; Domain=.feishu.cn; Path=/; Secure; HttpOnly',
+          },
+        });
+      }
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app/cli_x/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+      if (href.includes('/scope/all/cli_x')) return Response.json({ code: 1, msg: 'stop after login' });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_x',
+      sessionFilePath: sessionFile,
+      forceQrLogin: true,
+      disableBytedcliFallback: true,
+      fetchImpl,
+      pollIntervalMs: 0,
+      maxWaitMs: 1000,
+      onQrCode: () => {},
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: 'api_error' });
+    expect(initCount).toBe(1);
+    expect(readStoredCookiesFromSessionFile(sessionFile)?.find(c => c.name === 'session')?.value).toBe('fresh-cookie');
+  });
+
   it('returns login failure so setup can fall back to manual steps without aborting', async () => {
     const fetchImpl = (async () => {
       throw new Error('login down');

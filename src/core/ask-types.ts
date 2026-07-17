@@ -98,6 +98,9 @@ export interface CreateAskInput {
   /** Absolute deadline; computed by caller from `--timeout`. Broker won't
    *  re-compute. */
   timeoutMs: number;
+  /** 发起 ask 的会话类型。仅用于点击鉴权时把 chatType 喂给 canTalk（p2pOpen 腿）；
+   *  缺省时该腿 fail-closed，鉴权退回原语义。 */
+  chatType?: 'group' | 'p2p';
 }
 
 /** Daemon-internal state for a pending ask. Not exported on the IPC boundary —
@@ -114,6 +117,8 @@ export interface PendingAsk {
   chatId: string;
   rootMessageId: string | null;
   sessionId: string;
+  /** 发起 ask 的会话类型（见 CreateAskInput.chatType）。 */
+  chatType?: 'group' | 'p2p';
   /** 问题列表，替代旧的 `options` + `prompt`。 */
   questions: ReadonlyArray<AskQuestion>;
   /** 当前已勾选答案快照。仅 daemon/card 内部使用；CLI IPC 边界不暴露。 */

@@ -10,7 +10,7 @@ import { applyBotConfigEdits } from '../src/setup/bot-config-editor.js';
 
 describe('isScriptedSetupInvocation', () => {
   it('recognizes scripted subcommands and help aliases', () => {
-    for (const first of ['list', 'add', 'edit', 'remove', 'help', '--help', '-h']) {
+    for (const first of ['list', 'add', 'configure', 'edit', 'remove', 'help', '--help', '-h']) {
       expect(isScriptedSetupInvocation([first])).toBe(true);
     }
   });
@@ -104,13 +104,32 @@ describe('parseSetupCommand', () => {
     });
     expect(() => parseSetupCommand(['add', '--switch-account'])).toThrow(/必须与 add --create-app/);
     expect(() => parseSetupCommand(['add', '--create-app', '--compatibility-mode', '--switch-account'])).toThrow(/不适用于 SDK 兼容模式/);
-    expect(() => parseSetupCommand(['list', '--switch-account'])).toThrow(/仅适用于 add --create-app/);
-    expect(() => parseSetupCommand(['edit', 'botmux-0', '--switch-account'])).toThrow(/仅适用于 add --create-app/);
+    expect(() => parseSetupCommand(['list', '--switch-account'])).toThrow(/add --create-app 或 configure/);
+    expect(() => parseSetupCommand(['edit', 'botmux-0', '--switch-account'])).toThrow(/add --create-app 或 configure/);
   });
 
   it('rejects ambiguous create-app credential combinations and app-name without creation', () => {
     expect(() => parseSetupCommand(['add', '--create-app', '--app-id', 'cli_x'])).toThrow(/不能与 --app-id/);
     expect(() => parseSetupCommand(['add', '--app-name', 'Bot'])).toThrow(/必须与 add --create-app/);
+  });
+
+  it('parses configure as a stable retry entry and rejects unrelated flags', () => {
+    expect(parseSetupCommand(['configure', 'botmux-1', '--json'])).toEqual({
+      action: 'configure',
+      selector: 'botmux-1',
+      json: true,
+      switchAccount: false,
+    });
+    expect(parseSetupCommand(['configure', 'cli_x', '--switch-account'])).toEqual({
+      action: 'configure',
+      selector: 'cli_x',
+      json: false,
+      switchAccount: true,
+    });
+    expect(() => parseSetupCommand(['configure'])).toThrow(/需要指定机器人/);
+    expect(() => parseSetupCommand(['configure', 'a', 'b'])).toThrow(/只接受一个机器人标识/);
+    expect(() => parseSetupCommand(['configure', 'botmux-1', '--cli', 'codex'])).toThrow(/不接受字段参数/);
+    expect(() => parseSetupCommand(['configure', 'botmux-1', '--open-platform-auto'])).toThrow(/只接受机器人标识、--switch-account 和 --json/);
   });
 
   it('accepts "-" as a clear value but treats a following --flag as a missing value', () => {

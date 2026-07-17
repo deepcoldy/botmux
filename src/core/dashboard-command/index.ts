@@ -24,7 +24,6 @@ import { handleDashboardSettings, type DashboardSettingsCommandDeps } from './se
 import { handleDashboardSessions, type DashboardSessionsCommandDeps } from './sessions.js';
 import { handleDashboardSchedules, type DashboardSchedulesCommandDeps } from './schedules.js';
 import { handleDashboardOverview, type DashboardOverviewCommandDeps } from './overview.js';
-import { handleDashboardWorkflows, type DashboardWorkflowsCommandDeps } from './workflows.js';
 import { handleDashboardGroups, type DashboardGroupsCommandDeps } from './groups.js';
 
 /** Optional test seam. Production omits these overrides. */
@@ -35,7 +34,6 @@ export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
   sessions?: DashboardSessionsCommandDeps;
   schedules?: DashboardSchedulesCommandDeps;
   overview?: DashboardOverviewCommandDeps;
-  workflows?: DashboardWorkflowsCommandDeps;
   groups?: DashboardGroupsCommandDeps;
 }
 
@@ -104,7 +102,8 @@ export async function handleDashboardCommand(
   }
 
   if (sub === 'workflows') {
-    return handleDashboardWorkflows(message, subArgs, rootId, _chatId, deps, larkAppId, gate.adminOpenId, testDeps.workflows);
+    await reply('v2 workflow 面板已下线；请在 Web Dashboard 的 Workflows 页面查看 v3 运行。');
+    return;
   }
 
   if (sub === 'groups') {

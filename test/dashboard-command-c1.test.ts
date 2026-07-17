@@ -100,9 +100,9 @@ describe('ensureDashboardOwner (per-bot allowedUsers admin)', () => {
 /** ─── stub.ts content + module list ─────────────────────────────────── */
 
 describe('stub module list', () => {
-  it('lists the 6 module slugs in the canonical order', () => {
+  it('lists the 5 active module slugs in the canonical order', () => {
     expect([...DASHBOARD_MODULES]).toEqual([
-      'overview', 'sessions', 'workflows', 'groups', 'schedules', 'settings',
+      'overview', 'sessions', 'groups', 'schedules', 'settings',
     ]);
   });
 
@@ -116,7 +116,9 @@ describe('stub module list', () => {
   });
 
   it('buildHelpText with/without unknown_module', () => {
-    expect(buildHelpText('zh')).toContain('/dashboard');
+    const help = buildHelpText('zh');
+    expect(help).toContain('/dashboard');
+    expect(help).not.toContain('`workflows`');
     expect(buildHelpText('zh', { unknownModule: 'foo' })).toContain('foo');
   });
 });
@@ -143,15 +145,14 @@ describe('handleDashboardCommand — admin gate covers all subcommands', () => {
 /** ─── Admin-gated replies all go to DM, NOT topic interactive ──────── */
 
 describe('handleDashboardCommand — admin dispatch DMs the invoking admin', () => {
-  // All 5 modules (overview / sessions / workflows / groups / schedules)
-  // plus settings now have real handlers; the parametric stub loop has
-  // dropped to zero entries. Verify the stub fallback path is no longer
-  // reachable from a real module slug.
+  // All 5 active modules have real handlers. Legacy `workflows` is deliberately
+  // absent from the registry and handled separately as a v2-retirement
+  // tombstone, so the parametric stub loop has dropped to zero entries.
   it('no module-stub fallback remains — every DASHBOARD_MODULES slug has a real handler', () => {
     // Sanity: this is the canonical list of dashboard slugs; if any are
     // still stub-bound the parametric loop above would be non-empty.
     expect([...DASHBOARD_MODULES]).toEqual([
-      'overview', 'sessions', 'workflows', 'groups', 'schedules', 'settings',
+      'overview', 'sessions', 'groups', 'schedules', 'settings',
     ]);
   });
 

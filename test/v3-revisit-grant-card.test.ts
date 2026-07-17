@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,7 +16,8 @@ import {
   type V3RevisitGrantActionValue,
 } from '../src/im/lark/v3-revisit-grant-card.js';
 import { handleV3RevisitGrantAction } from '../src/im/lark/v3-revisit-grant-card-handler.js';
-import { birthRun } from '../src/workflows/v3/grill-state.js';
+import { birthRun, readGrillState, writeGrillState } from '../src/workflows/v3/grill-state.js';
+import { validateDag } from '../src/workflows/v3/dag.js';
 import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 
 const INPUT = {
@@ -72,6 +73,24 @@ describe('handleV3RevisitGrantAction', () => {
       goal: 'g', baseDir: base, runId,
       chatBinding: { larkAppId: 'cli_test', chatId: 'oc_chat', rootMessageId: 'om_root' },
     });
+    const dagPath = join(runDir, 'dag.json');
+    const dag = validateDag({
+      runId,
+      nodes: [
+        { id: 'A', type: 'goal', goal: 'prepare', depends: [], inputs: [] },
+        {
+          id: 'C',
+          type: 'goal',
+          goal: 'complete and revisit when needed',
+          depends: ['A'],
+          inputs: [{ from: 'A' }],
+          revisitTo: ['A'],
+        },
+      ],
+    });
+    writeFileSync(dagPath, `${JSON.stringify(dag)}\n`);
+    const grill = readGrillState(runDir)!;
+    writeGrillState(runDir, { ...grill, status: 'dag_approved', dagPath });
     const journalPath = join(runDir, 'journal.ndjson');
     appendEvent(journalPath, { type: 'runStarted', runId });
     appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'C', instanceId: 'C#002', attemptId: 'C#002/attempts/001' });

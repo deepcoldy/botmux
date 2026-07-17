@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { canonicalJson, computeInputHash } from '../workflows/events/idempotency.js';
+import { canonicalJson, computeInputHash } from '../utils/canonical-input-hash.js';
 import type {
   VcMeetingConsumerManagedSink,
   VcMeetingConsumerProfileFilter,

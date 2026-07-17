@@ -154,6 +154,8 @@ export interface OpenPlatformAutomationOptions {
   sessionFilePath?: string;
   bytedcliFallbackSessionFilePath?: string;
   disableBytedcliFallback?: boolean;
+  /** Ignore cached sessions and require a fresh QR login. */
+  forceQrLogin?: boolean;
   /** Reuse a valid cache or fail instead of presenting another QR. */
   disableQrLogin?: boolean;
   fetchImpl?: typeof fetch;
@@ -588,6 +590,7 @@ export async function automateOpenPlatformSetup(
     sessionFilePath: options.sessionFilePath,
     bytedcliFallbackSessionFilePath: options.bytedcliFallbackSessionFilePath,
     disableBytedcliFallback: options.disableBytedcliFallback,
+    forceQrLogin: options.forceQrLogin,
     disableQrLogin: options.disableQrLogin,
     fetchImpl: fetcher,
     pollIntervalMs: options.pollIntervalMs,

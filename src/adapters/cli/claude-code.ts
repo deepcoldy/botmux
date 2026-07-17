@@ -467,6 +467,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // is redirected into BOT_HOME via CLAUDE_CONFIG_DIR, so resume/memory work
     // while the global ~/.claude stays denied.
     supportsReadIsolation: true,
+    supportsSessionCwdMove: true,
     claudeDataDir: variant.dataDir,
     claudeStateJsonPath: variant.stateJsonPath,
     spawnEnv: variant.spawnEnv,

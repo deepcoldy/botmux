@@ -142,6 +142,7 @@ export function buildFooterAddressing(
   s: { ownerOpenId?: string; lastCallerOpenId?: string },
   opts: {
     isOncall: boolean;
+    isSubstitute?: boolean;
     hasExplicitBotMention?: boolean;
     knownBotOpenIds?: Set<string>;
   },
@@ -155,7 +156,7 @@ export function buildFooterAddressing(
   // explicitly (--mention-back) and rides in mentions[], not here.
   if (opts.hasExplicitBotMention) return { sendTo: undefined, cc: [] };
 
-  if (!opts.isOncall) return { sendTo: ownerHuman, cc: [] };
+  if (!opts.isOncall && !opts.isSubstitute) return { sendTo: ownerHuman, cc: [] };
 
   const caller = s.lastCallerOpenId ?? owner;
   const callerIsBot = !!caller && botIds.has(caller);

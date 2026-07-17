@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
-import { canonicalJson, computeInputHash } from '../workflows/events/idempotency.js';
+import { canonicalJson, computeInputHash } from '../utils/canonical-input-hash.js';
 
 const DIR_NAME = 'vc-meeting-actions';
 const SCHEMA_VERSION = 1;

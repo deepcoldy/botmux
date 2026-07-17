@@ -121,6 +121,101 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('auto-confirms the owner from the web session email and completes without needs_owner', async () => {
+    // Web 主路径没有 device-flow 的 userOpenId, 但 session identity 里有创建者邮箱——
+    // 能解析成 union_id 时直接落 on_ 完成, 不再让用户手填一遍 owner。
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-web-owner-'));
+    batchGetIdMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user_list: [{ email: 'creator@corp.com', user_id: 'on_creator' }] },
+    });
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      createApp: async () => ({
+        ok: true,
+        appId: 'cli_web_owner',
+        appSecret: 'web-secret',
+        brand: 'feishu',
+        sessionFile: '/tmp/feishu-session.json',
+        sessionSource: 'botmux_cache',
+        sessionIdentity: { userId: 'u_1', userName: 'Alice', email: 'creator@corp.com', tenantId: 't_1', tenantName: 'Example' },
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+    });
+
+    const job = manager.start({ sessionMode: 'reuse', expectedIdentity: { userId: 'u_1', tenantId: 't_1' } });
+    await job.done;
+
+    expect(manager.get(job.id)?.status).toBe('completed');
+    expect(batchGetIdMock).toHaveBeenCalledWith({
+      params: { user_id_type: 'union_id' },
+      data: { emails: ['creator@corp.com'], include_resigned: false },
+    });
+    const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
+    expect(bots[0]).toMatchObject({ larkAppId: 'cli_web_owner', allowedUsers: ['on_creator'] });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('falls back to the raw session email when union_id resolution is inconclusive', async () => {
+    // scope 未生效 / 网络错误等无法证伪 → 直接落邮箱, 运行时 resolveAllowedUsers 再解析。
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-web-email-'));
+    batchGetIdMock.mockRejectedValueOnce(new Error('scope not effective yet'));
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      createApp: async () => ({
+        ok: true,
+        appId: 'cli_web_email',
+        appSecret: 'web-secret',
+        brand: 'feishu',
+        sessionFile: '/tmp/feishu-session.json',
+        sessionSource: 'botmux_cache',
+        sessionIdentity: { userId: 'u_1', userName: 'Alice', email: 'creator@corp.com', tenantId: 't_1', tenantName: 'Example' },
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+    });
+
+    const job = manager.start({ sessionMode: 'reuse' });
+    await job.done;
+
+    expect(manager.get(job.id)?.status).toBe('completed');
+    const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
+    expect(bots[0]).toMatchObject({ larkAppId: 'cli_web_email', allowedUsers: ['creator@corp.com'] });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('keeps needs_owner with a prefill suggestion when the session email is conclusively unusable', async () => {
+    // 确凿不在本企业（成功响应但查不到 user_id, 如个人邮箱）→ 不落盘, 回落 needs_owner
+    // 并把邮箱作为 suggestedOwner 预填给前端复核。
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-web-unusable-'));
+    // 默认 batchGetIdMock 即 code 0 + 空 user_list（见 beforeEach）。
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      createApp: async () => ({
+        ok: true,
+        appId: 'cli_web_unusable',
+        appSecret: 'web-secret',
+        brand: 'feishu',
+        sessionFile: '/tmp/feishu-session.json',
+        sessionSource: 'botmux_cache',
+        sessionIdentity: { userId: 'u_1', userName: 'Alice', email: 'personal@gmail.com', tenantId: 't_1', tenantName: 'Example' },
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+    });
+
+    const job = manager.start({ sessionMode: 'reuse' });
+    await job.done;
+
+    const status = manager.get(job.id);
+    expect(status?.status).toBe('needs_owner');
+    expect(status?.suggestedOwner).toBe('personal@gmail.com');
+    expect(JSON.stringify(status)).not.toContain('web-secret');
+    expect(existsSync(join(dir, 'bots.json'))).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('reuses a UI-confirmed session without a QR and binds creation to that account and tenant', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-reuse-'));
     const createApp = vi.fn(async (opts) => {

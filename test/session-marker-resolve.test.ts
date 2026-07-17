@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveSessionContext } from '../src/core/session-marker.js';
+import { readProcessStartIdentity, resolveSessionContext } from '../src/core/session-marker.js';
 import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
@@ -125,5 +125,22 @@ describe('resolveSessionContext()', () => {
   it('does not invent a turnId on the env path', () => {
     const ctx = resolveSessionContext(dir, 'env-sid', process.pid);
     expect(ctx?.turnId).toBeUndefined();
+  });
+
+  it('never falls back to an ambient PATH ps probe on Linux', () => {
+    if (process.platform !== 'linux') return;
+    const fakeBin = join(dir, 'bin');
+    const touched = join(dir, 'ambient-ps-ran');
+    mkdirSync(fakeBin);
+    writeFileSync(join(fakeBin, 'ps'), `#!/bin/sh\ntouch ${JSON.stringify(touched)}\n`, { mode: 0o700 });
+    const previousPath = process.env.PATH;
+    process.env.PATH = fakeBin;
+    try {
+      expect(readProcessStartIdentity(999_999_999)).toBeUndefined();
+      expect(existsSync(touched)).toBe(false);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
   });
 });

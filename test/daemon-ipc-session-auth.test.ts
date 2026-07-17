@@ -124,6 +124,13 @@ describe('daemon session-scoped IPC route wiring', () => {
     const registerAt = route.indexOf('registerAskBroker({');
     expect(bindAt).toBeGreaterThanOrEqual(0);
     expect(registerAt).toBeGreaterThan(bindAt);
+    expect(route).toContain('const askChatType = askSession?.chatType;');
+    expect(route).toMatch(
+      /registerAskBroker\(\{\s*larkAppId: boundAsk\.larkAppId,[\s\S]*chatType: askChatType,/,
+    );
+    expect(route).not.toMatch(
+      /registerAskBroker\(\{\s*larkAppId: parsed\.larkAppId,/,
+    );
   });
 
   it('binds hook identity before emitting the event', () => {

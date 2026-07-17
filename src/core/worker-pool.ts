@@ -18,7 +18,7 @@ import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
-import { fallbackTurnId } from './reply-target.js';
+import { fallbackTurnId, isSubstituteTurn } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
@@ -29,6 +29,7 @@ import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
 import { buildMarkdownCard, buildContextualReplyCard, type LocalHomeLinkMode } from '../im/lark/md-card.js';
+import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
@@ -267,13 +268,16 @@ export function isRelayableRealSession(ds: DaemonSession): boolean {
 // session card. Read fresh from the in-memory registry so a dashboard toggle
 // takes effect without a daemon restart. The `/card` command can override it
 // per-session via `ds.streamingCardForced` (manually summon a live card).
-function streamingCardDisabled(ds: DaemonSession): boolean {
+function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
   if (isDocNativeSession(ds)) return true;
   if (ds.streamingCardForced) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
     return cfg.disableStreamingCard === true
-      || (!!ds.chatId && !!cfg.noCardChats?.includes(ds.chatId));
+      || (!!ds.chatId && !!cfg.noCardChats?.includes(ds.chatId))
+      // Per-turn substitute gate — see streamingCardDisabledFor in daemon.ts.
+      // Callers with a turnId (screen updates) get an exact per-turn answer.
+      || isSubstituteTurn(ds, turnId);
   } catch { return false; }
 }
 
@@ -874,7 +878,7 @@ export interface WriteLinkOwnerDelivery {
  * `botmux term-link`) and the single-operator delivery
  * ({@link deliverWritableTerminalCardTo}, behind the `/term` slash command).
  */
-function buildWritableTerminalCard(ds: DaemonSession): string | null {
+export function buildWritableTerminalCard(ds: DaemonSession): string | null {
   // Riff backend: the sandbox URL is the writable link — no local worker/token needed.
   if (ds.riffAccessUrl) {
     const botCfg = getBot(ds.larkAppId).config;
@@ -958,6 +962,52 @@ export async function deliverWritableTerminalCardTo(
   return deliverWriteLinkCard(ds, operatorOpenId, cardJson);
 }
 
+export interface SubstituteControlCardDelivery {
+  sent: number;
+  total: number;
+}
+
+/**
+ * DM a writable-terminal control card to the bot's owner(s) for a substitute-mode session.
+ * Guards against duplicate sends via `session.substituteControlCardSent`.
+ */
+export async function deliverSubstituteControlCard(ds: DaemonSession): Promise<SubstituteControlCardDelivery> {
+  if (ds.session.substituteControlCardSent) return { sent: 0, total: 0 };
+  const cardJson = buildWritableTerminalCard(ds);
+  if (!cardJson) {
+    logger.warn(`[${tag(ds)}] substitute control card skipped: terminal not ready`);
+    return { sent: 0, total: 0 };
+  }
+
+  const audience = resolvePrivateCardAudience(ds);
+  if (audience.length === 0) {
+    logger.debug(`[${tag(ds)}] substitute control card skipped: no owner audience`);
+    return { sent: 0, total: 0 };
+  }
+
+  let sent = 0;
+  const CONCURRENCY = 5;
+  for (let i = 0; i < audience.length; i += CONCURRENCY) {
+    const batch = audience.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map(async (openId) => {
+      try {
+        await sendUserMessage(ds.larkAppId, openId, cardJson, 'interactive');
+        sent++;
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] substitute control card DM to ${openId.substring(0, 8)}… failed: ${err instanceof Error ? err.message : err}`);
+      }
+    }));
+  }
+
+  if (sent > 0) {
+    ds.session.substituteControlCardSent = true;
+    sessionStore.updateSession(ds.session);
+    logger.info(`[${tag(ds)}] substitute control card DM'd to ${sent}/${audience.length} owner(s)`);
+  }
+
+  return { sent, total: audience.length };
+}
+
 /**
  * Deliver a status confirmation (restart / session-closed / resume) as a
  * "visible-to-the-operator-only" ephemeral message in a plain group; on failure
@@ -1011,9 +1061,12 @@ export async function deliverEphemeralOrReply(
  * Otherwise stores the card JSON on `ds.pendingCardJson` (overwriting
  * any previously queued value — only the latest state matters).
  */
-export function scheduleCardPatch(ds: DaemonSession, cardJson: string): void {
+export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: string): void {
   // Bot opted out of the streaming card — never patch one into existence.
-  if (streamingCardDisabled(ds)) return;
+  // Turn-exact when the caller has turn context (screen updates): a substitute
+  // turn arriving mid-PATCH must not suppress a normal turn's card (or vice
+  // versa) just because it overwrote the latest-turn slot.
+  if (streamingCardDisabled(ds, turnId)) return;
   ds.pendingCardJson = cardJson;
   // Capture the card ID now — by the time flushCardPatch runs, ds.streamCardId
   // may have been overwritten by a new turn's card (CARD_POSTING_SENTINEL).
@@ -2029,6 +2082,7 @@ export function forkWorker(
     type: 'init',
     sessionId: ds.session.sessionId,
     chatId: ds.chatId,
+    chatType: ds.chatType,
     rootMessageId: sessionAnchorId(ds),
     workingDir: cwd,
     cliId: agentCfg.cliId,
@@ -2291,6 +2345,14 @@ function setupWorkerHandlers(
           },
         });
 
+        // Substitute-mode control card: DM owner(s) a writable terminal + manage buttons.
+        // Consumed before any early break below so avatar-style (card-off) sessions
+        // still deliver the owner control card.
+        if (ds.pendingSubstituteControlCard) {
+          ds.pendingSubstituteControlCard = false;
+          void deliverSubstituteControlCard(ds);
+        }
+
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
           logger.info(`[${t}] Managed VC receiver — suppressing ready/streaming card output`);
           break;
@@ -2299,8 +2361,11 @@ function setupWorkerHandlers(
         // Bot opted out of the streaming card: the terminal is up and the
         // final answer will still arrive via `botmux send`; just don't post the
         // live status card. (workerPort/token above are still set so the web
-        // terminal + dashboard keep working.)
-        if (streamingCardDisabled(ds)) {
+        // terminal + dashboard keep working.) Ready carries the spawning
+        // turn's id — gate on THAT turn, not on whichever turn was accepted
+        // last (a queued normal turn must not resurrect a substitute turn's
+        // initial card, nor the reverse).
+        if (streamingCardDisabled(ds, msg.turnId)) {
           logger.info(`[${t}] Streaming card disabled for this bot — skipping card post`);
           break;
         }
@@ -2612,8 +2677,10 @@ function setupWorkerHandlers(
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
 
         // Bot opted out of the streaming card — dashboard SSE above already got
-        // the status patch; just don't touch any Lark card.
-        if (streamingCardDisabled(ds)) break;
+        // the status patch; just don't touch any Lark card. Turn-exact: a
+        // substitute turn's screen updates stay card-less even after a queued
+        // normal turn overwrote currentReplyTarget (and vice versa).
+        if (streamingCardDisabled(ds, msg.turnId)) break;
 
         // Restart recovery: a restored worker may emit screen updates as the CLI
         // redraws on resume. Stay silent (no post/patch) until the first real
@@ -2705,7 +2772,7 @@ function setupWorkerHandlers(
             writableTerminalLinkFor(ds),
             isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           );
-          scheduleCardPatch(ds, cardJson);
+          scheduleCardPatch(ds, cardJson, msg.turnId);
         }
         break;
       }
@@ -3183,7 +3250,7 @@ function setupWorkerHandlers(
           assistantText: msg.assistantText,
           assistantLabel: getCliDisplayName(effectiveCliId),
           recipientOpenId,
-          brand: resolveBrandLabel(ds.larkAppId),
+          brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
           locale: localeForBot(ds.larkAppId),
           workingDir: ds.workingDir,
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
@@ -3502,7 +3569,7 @@ function deliverFinalOutput(
             assistantText: safeAssistantText,
             assistantLabel: getCliDisplayName(effectiveCliId),
             recipientOpenId,
-            brand: resolveBrandLabel(ds.larkAppId),
+            brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
@@ -3510,7 +3577,7 @@ function deliverFinalOutput(
         : buildMarkdownCard(
             safeAssistantText,
             recipientOpenId,
-            resolveBrandLabel(ds.larkAppId),
+            renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
             localeForBot(ds.larkAppId),
             ds.workingDir,
             localHomeLinkMode,
@@ -3777,6 +3844,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     type: 'init',
     sessionId: ds.session.sessionId,
     chatId: ds.chatId,
+    chatType: ds.chatType,
     rootMessageId: sessionAnchorId(ds),
     workingDir: adopted.cwd,
     cliId: adoptedCliId,

@@ -21,10 +21,9 @@
  * `randomNonce` / `secret` are all injectable.
  */
 
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
+import { dashboardSecretPath } from '../core/dashboard-secret.js';
 import { loadDashboardSecret } from './auth.js';
 import { signDaemonRequest } from './daemon-internal-auth.js';
 
@@ -34,7 +33,7 @@ const DEFAULT_TIMEOUT_MS = 5000;
 const DEFAULT_BASE_BACKOFF_MS = 100;
 const DEFAULT_MAX_BACKOFF_MS = 5_000;
 
-const SECRET_PATH_DEFAULT = join(homedir(), '.botmux', '.dashboard-secret');
+const SECRET_PATH_DEFAULT = dashboardSecretPath();
 
 export interface DaemonClientOptions {
   /** Base URL of the dashboard process (default `http://127.0.0.1:7891`). */

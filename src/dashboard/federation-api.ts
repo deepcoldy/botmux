@@ -11,7 +11,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { config } from '../config.js';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
 import { consumeInvite } from '../services/invite-store.js';
 import { getTeam } from '../services/team-store.js';
 import {

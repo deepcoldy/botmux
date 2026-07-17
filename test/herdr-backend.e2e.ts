@@ -163,6 +163,24 @@ describe('HerdrBackend (e2e)', () => {
     backend.destroySession();
   }, TEST_TIMEOUT);
 
+  it.skipIf(!HerdrBackend.isAvailable())('web attach resizes the real agent terminal', async () => {
+    const backend = new HerdrBackend(TEST_SESSION);
+    backend.spawn('/bin/bash', ['-lc', `trap 'printf "SIZE "; stty size' WINCH; echo READY; while :; do sleep 0.1; done`], spawnOpts());
+    await waitFor(() => backend.captureCurrentScreen().includes('READY'), 10_000, 'resize fixture ready');
+
+    const viewer = {};
+    backend.acquireWebTerminal(viewer);
+    backend.resizeWebTerminal(viewer, 80, 24);
+    await waitFor(() => backend.captureCurrentScreen().includes('SIZE 24 80'), 10_000, 'initial 80x24 WINCH');
+
+    backend.resizeWebTerminal(viewer, 150, 42);
+    await waitFor(() => backend.captureCurrentScreen().includes('SIZE 42 150'), 10_000, 'resized 150x42 WINCH');
+
+    backend.releaseWebTerminal(viewer);
+    expect(HerdrBackend.hasSession(TEST_SESSION)).toBe(true);
+    backend.destroySession();
+  }, TEST_TIMEOUT);
+
   it.skipIf(!HerdrBackend.isAvailable())('destroySession stops the herdr session', async () => {
     const backend = new HerdrBackend(TEST_SESSION);
     backend.spawn('/bin/bash', ['-lc', 'sleep 30'], spawnOpts());

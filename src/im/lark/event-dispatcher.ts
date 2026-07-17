@@ -1114,6 +1114,11 @@ export function resolveSubstituteTrigger(
   return undefined;
 }
 
+function isSubstituteAllowedChat(cfg: { chats?: string[] } | undefined, chatId: string): boolean {
+  if (!cfg?.chats?.length) return true;
+  return cfg.chats.includes(chatId);
+}
+
 function mentionMatchesBot(m: any, larkAppId: string, botOpenId?: string): boolean {
   const openId = mentionOpenId(m);
   if (botOpenId && openId === botOpenId) return true;
@@ -1159,6 +1164,9 @@ function mentionAppId(m: any): string | undefined {
 // access for sibling Bot B in the same deployment; Bot B must bind the same chat
 // itself, or continue using its own allowedUsers/chatGrants/globalGrants.
 
+/** 会话类型（与 daemon / DaemonSession 的 chatType 同域）。p2pOpen 腿据此判定。 */
+export type ChatKind = 'group' | 'p2p';
+
 export type TalkReason =
   | 'allowedUser'
   | 'oncall'
@@ -1169,6 +1177,7 @@ export type TalkReason =
   | 'open'
   | 'chatGrant'
   | 'globalGrant'
+  | 'p2pOpen'
   | 'none';
 
 export interface TalkEvaluation {
@@ -1212,14 +1221,19 @@ function hasGlobalGrant(larkAppId: string, openId: string | undefined): boolean 
 function hasConfiguredAllowlist(bot: ReturnType<typeof getBot>): boolean {
   return (bot.config.allowedUsers?.length ?? 0) > 0
     || (bot.config.allowedChatGroups?.length ?? 0) > 0
-    || (bot.config.globalGrants?.length ?? 0) > 0;
+    || (bot.config.globalGrants?.length ?? 0) > 0
+    // p2pOpen 也是一次显式的权限边界声明：配了它 = 进入限制态。否则「只配 p2pOpen、
+    // 没配 allowedUsers」会 fall through 到 open 模式，把**群聊**和 **canOperate** 一起
+    // 放开（陌生人能 /restart /cd），与 p2pOpen「只开私聊 talk」的语义正好相反。
+    // 此时若没配 allowedUsers → 谁都不能 operate（fail-closed），bot-registry 会告警。
+    || bot.config.p2pOpen === true;
 }
 
 export function canTalk(
   larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined,
-  senderUnionId?: string, memberUnionId?: string,
+  senderUnionId?: string, memberUnionId?: string, chatType?: ChatKind,
 ): boolean {
-  return evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId).allowed;
+  return evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType).allowed;
 }
 
 /**
@@ -1229,10 +1243,12 @@ export function canTalk(
  * @param memberUnionId  发送方 union（teamMember 腿）——可为真人 union（未锁 bot）。
  *   仅授 chat 作用域内的 talk、不授 operate，且要求 union 在该团队的成员名单里
  *   （memberUnionIds 来自平台鉴权的团队成员，非机器自报），故喂真人 union 是安全的。
+ * @param chatType  当前会话类型。**仅 p2pOpen 腿读它**；省略时该腿不生效（fail-closed），
+ *   所以拿不到 chatType 的调用点保持原语义、不会误放行。
  */
 export function evaluateTalk(
   larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined,
-  senderUnionId?: string, memberUnionId?: string,
+  senderUnionId?: string, memberUnionId?: string, chatType?: ChatKind,
 ): TalkEvaluation {
   const bot = getBot(larkAppId);
   // allowedChatGroups 是"talk-open 的 chat_id 列表"：当前消息来自其中之一即放行（仅 canTalk）。
@@ -1265,6 +1281,11 @@ export function evaluateTalk(
     return { allowed: true, reason: 'teamMember' };
   }
   if (chatId && bot.config.allowedChatGroups?.includes(chatId)) return { allowed: true, reason: 'allowedChatGroup' };
+
+  // p2pOpen：私聊维度的 talk-open，与 oncall（群维度）同一个安全模型——放行 canTalk，
+  // canOperate 一行不读它（管理仍限 allowedUsers）。谁能私聊由飞书应用「可用范围」控制。
+  // chatType 省略 → 该腿不生效（fail-closed），未接入 chatType 的调用点语义不变。
+  if (chatType === 'p2p' && bot.config.p2pOpen === true) return { allowed: true, reason: 'p2pOpen' };
 
   // globalGrants 与 allowedChatGroups 同样确立"有白名单"语义：只配 globalGrants 也算限制态，
   // 不能 fall through 到"全开放"。用原始配置判定（见 hasConfiguredAllowlist）：配了 owner
@@ -2244,7 +2265,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         );
         // 人的路径（bot 发送方已在上面的分支 return）：union 走 memberUnionId 腿，
         // 不进 bot-trust 腿——teamBot 只认 bot-locked union。
-        const isAllowed = canTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId);
+        const isAllowed = canTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId, chatType);
 
         // /introduce — collaboration handshake. Intercept before any routing
         // so the command never reaches a CLI session (each @ed bot's daemon
@@ -2295,10 +2316,20 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // Cheap in-memory gate FIRST: skip the getChatMode roundtrip and the
         // per-chat toggle disk read entirely for bots that never configured a
         // substitute target (the overwhelming majority on the hot path).
-        let substituteTrigger = getBot(larkAppId).config.substituteMode?.enabled === true
-          && chatType === 'group'
-          && await getChatMode(larkAppId, chatId) === 'group'
-          && isSubstituteEnabledForChat(larkAppId, chatId)
+        const substituteCfg = getBot(larkAppId).config.substituteMode;
+        let substituteChatMode: 'group' | 'topic' | undefined;
+        // chats 白名单在 getChatMode 之前（纯内存判断走在 API roundtrip 前），
+        // 对普通群与话题群统一生效：白名单是「替身可触发的群」清单，与群形态无关。
+        if (substituteCfg?.enabled === true && chatType === 'group' && isSubstituteAllowedChat(substituteCfg, chatId)) {
+          const chatMode = await getChatMode(larkAppId, chatId);
+          const modeSupported = chatMode === 'group'
+            // 话题群支持默认开（缺省=开，normalize 只在显式 false 时关）。
+            || (chatMode === 'topic' && substituteCfg.topicGroups !== false);
+          if (modeSupported && isSubstituteEnabledForChat(larkAppId, chatId)) {
+            substituteChatMode = chatMode as 'group' | 'topic';
+          }
+        }
+        let substituteTrigger = substituteChatMode
           ? resolveSubstituteTrigger(larkAppId, message)
           : undefined;
         if (substituteTrigger && !explicitlyMentionedThisBot) {
@@ -2306,11 +2337,35 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           const stripped = rawText ? stripLeadingMentions(rawText.trim(), message?.mentions ?? []).trim() : '';
           if (stripped.startsWith('/')) substituteTrigger = undefined;
         }
+        if (substituteTrigger && substituteChatMode === 'topic'
+            && substituteCfg?.topicActiveSessionTrigger === false
+            && (handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false)) {
+          // 话题里已有本 bot 活跃会话 + 用户关掉了「活跃话题也触发」：
+          // 单独 @替身对象 是明确转交，必须在任何通用免 @ 规则前直接让路；
+          // 只清掉 metadata 不够，1v1 群/mentionMode=never 仍会把消息喂给 bot。
+          substituteTrigger = undefined;
+          if (!explicitlyMentionedThisBot) {
+            logger.debug(
+              `[substitute:${larkAppId}] active-topic trigger disabled; backing off ` +
+              `msg=${messageId.substring(0, 12)} thread=${String(routing.anchor).substring(0, 12)}`,
+            );
+            return;
+          }
+        }
         if (substituteTrigger) {
-          routing.scope = 'chat';
-          routing.anchor = chatId;
-          routingSource = 'regular-group-chat';
-          if (message.root_id && message.thread_id) replyRootId = message.root_id;
+          if (substituteChatMode === 'group') {
+            routing.scope = 'chat';
+            routing.anchor = chatId;
+            routingSource = 'regular-group-chat';
+            // Top-level substitute messages need their own reply anchor so that
+            // concurrent triggers from different users in the same chat-scope
+            // session don't collapse or thread under the wrong message. Existing
+            // real threads keep their root_id.
+            replyRootId = (message.root_id && message.thread_id) ? message.root_id : messageId;
+          }
+          // 话题群：保持 decideRouting 的 thread-scope/话题锚点不动——替身回合
+          // 直接搭该话题自己的会话（无会话则由 handleNewTopic 新开），与普通群
+          // 「搭群 chat-scope 会话」同构；回复天然落回本话题，无需 replyRootId。
           const configuredTargetId = substituteTrigger.target.openId
             ?? substituteTrigger.target.userId
             ?? substituteTrigger.target.unionId
@@ -2318,7 +2373,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           const configuredTargetForLog = JSON.stringify(configuredTargetId.slice(0, 128));
           logger.info(
             `[substitute:${larkAppId}] mention target=${configuredTargetForLog} ` +
-            `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)} → chat-scope`,
+            `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)} → ${substituteChatMode === 'group' ? 'chat-scope' : `topic thread=${String(routing.anchor).substring(0, 12)}`}`,
           );
         }
 
@@ -2496,28 +2551,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // permitted senders. (The shared fold-back's replyRootId is already
           // handled by the first clause.)
           const mentionMode = resolveGroupMentionMode(larkAppId);
-          // 话题群 owned-topic 免@续话 — single-bot groups only. In a multi-bot
-          // topic every co-resident bot owns a session on the same thread anchor,
-          // so relaxing here would make ALL of them answer a message that
-          // @mentioned only one (or none) of them; botCount > 1 keeps the
-          // "@ required" contract. `stats` is the cached group stats (fetched
-          // above when ownsSession; its 999/999 API-failure fallback also lands
-          // on the safe "require @" side). A message that @mentions another
-          // specific member is a redirect to someone else → back off, mirroring
-          // the ambient carve-out.
-          const ownedTopicGroupFollowup = !explicitlyMentionedThisBot
-            && isAllowed
-            && ownsSession
-            && !!stats && stats.botCount <= 1
-            && !mentionsAnotherMember(larkAppId, message)
-            && routing.scope === 'thread'
-            && !!message.thread_id
-            && await getChatMode(larkAppId, chatId) === 'topic';
+          // 话题群 owned-topic 免@续话不再无条件放行（#336 引入的默认行为回归：
+          // 多人群里旁人不 @ 也会触发 bot）。现在与普通群共用同一套「群聊 @ 策略」:
+          // 默认 'always' 在多人群里必须 @，想要话题内免@续话就把 mentionMode 配成
+          // 'topic'（下方条款已同时覆盖话题群 thread 与普通群 shared topic），
+          // 'never'/'ambient' 亦按各自语义生效。1人1bot 的 solo 群仍走末条放行。
           const relax = (!!replyRootId && isAllowed)
             || (!!substituteTrigger && isAllowed)
             || (isAllowed && mentionMode === 'never')
             || (isAllowed && mentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message))
-            || ownedTopicGroupFollowup
             || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsAnotherMember(larkAppId, message))
             || (ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
           if (!relax) {
@@ -2550,6 +2592,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             }
           }
         } else if (!isAllowed) {
+          // 私聊被挡目前是静默丢弃：owner 不在这个 p2p 会话里，把授权申请卡 reply 回来只会
+          // 发给陌生人自己（卡上的按钮又是 owner 专属），既不可用又泄露 owner —— 所以不发。
+          // 真正的修法是把申请发到 owner 自己的 DM 并加 owner 维度节流，单独一个 PR 做。
           logger.debug(`Ignoring p2p message from non-allowed user: ${senderOpenId}`);
           return;
         }

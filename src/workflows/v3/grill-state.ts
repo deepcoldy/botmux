@@ -16,6 +16,7 @@
  * the `Date.now` ban is only inside Workflow() orchestration scripts.
  */
 import { writeFileSync, renameSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -42,6 +43,9 @@ export const GRILL_STATE_SCHEMA_VERSION = 1;
 export interface RunChatBinding {
   larkAppId: string;
   chatId: string;
+  /** Exact IM kind used when a schedule later creates a session. Optional only
+   * for envelopes written before the v3 host protocol existed. */
+  chatType?: 'group' | 'p2p';
   /** thread anchor (rootMessageId) so the card lands in the grill topic. */
   rootMessageId?: string;
   sessionId?: string;
@@ -145,7 +149,27 @@ function slug(goal: string): string {
 
 function stamp(d: Date): string {
   const p = (n: number) => String(n).padStart(2, '0');
-  return `${String(d.getFullYear()).slice(2)}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+  const ms = String(d.getMilliseconds()).padStart(3, '0');
+  return `${String(d.getFullYear()).slice(2)}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}-${ms}`;
+}
+
+/**
+ * Mint a readable, path-safe, collision-resistant v3 run id.
+ *
+ * The previous `<slug>-<minute>` shape made every CJK goal fall back to the
+ * same `run` prefix and could reuse the same directory twice in one minute.
+ * Millisecond precision helps operators sort runs, while the UUID suffix is
+ * the actual collision guard across concurrent daemon processes.
+ */
+export function mintV3RunId(
+  goal: string,
+  now: Date = new Date(),
+  randomSuffix: string = randomUUID().slice(0, 8),
+): string {
+  if (!/^[0-9a-f]{8}$/i.test(randomSuffix)) {
+    throw new Error('v3 runId random suffix must be exactly 8 hexadecimal characters');
+  }
+  return `${slug(goal)}-${stamp(now)}-${randomSuffix}`;
 }
 
 export interface BirthResult {
@@ -155,21 +179,24 @@ export interface BirthResult {
 }
 
 /**
- * Birth a run: allocate a runId (`<slug>-<yymmdd-hhmm>` unless one is given —
- * OQ-D), create its runDir, and write the initial `grilling` state.  grill is
- * the birth point of a run; spec.md and the later dag.json both live in runDir.
+ * Birth a run: allocate a readable collision-resistant runId unless one is
+ * given (OQ-D), create its runDir, and write the initial `grilling` state.
+ * grill is the birth point of a run; spec.md and the later dag.json both live
+ * in runDir.
  */
 export function birthRun(opts: {
   goal: string;
   baseDir?: string;
   runId?: string;
   now?: Date;
+  /** Test seam for deterministic generated ids; production callers omit it. */
+  randomSuffix?: string;
   /** 飞书话题绑定（grill 经 daemon 出生时带；CLI/dev 出生省略）. */
   chatBinding?: RunChatBinding;
 }): BirthResult {
   const baseDir = opts.baseDir ?? defaultBaseDir();
   const now = opts.now ?? new Date();
-  const runId = opts.runId ?? `${slug(opts.goal)}-${stamp(now)}`;
+  const runId = opts.runId ?? mintV3RunId(opts.goal, now, opts.randomSuffix);
   const runDir = join(baseDir, runId);
   const iso = now.toISOString();
   const state: GrillState = {

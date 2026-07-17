@@ -16,11 +16,14 @@
  * concurrent clicks / start can't double-spawn.
  */
 
-import { dirname, join } from 'node:path';
-import { existsSync, mkdirSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
-import { isLoopNode, loadDag } from './dag.js';
+import { atomicWriteFileSync } from '../../utils/atomic-write.js';
+import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
+import { isHostNode, isLoopNode, loadDag, type V3Dag } from './dag.js';
 import {
   runWorkflow,
   nextAttemptIdFor,
@@ -36,22 +39,58 @@ import { readAndValidateManifest, ManifestValidationError } from './manifest.js'
 import {
   readGrillState,
   defaultBaseDir,
+  GRILL_STATUS_FILE,
+  type GrillState,
   type RunChatBinding,
 } from './grill-state.js';
-import { resolveBotConfig, botToSnapshot } from './bot-resolve.js';
+import {
+  resolveBotConfig,
+  botToSnapshot,
+  freezeDagBotSnapshots,
+  parseFrozenBotSnapshots,
+  serializeFrozenBotSnapshots,
+} from './bot-resolve.js';
+import {
+  loadAuthorizedV3Run,
+  artifactRef,
+  makeLegacyV3RunEnvelope,
+  publishRunEnvelopeOnce,
+  readRunEnvelope,
+  RunEnvelopeIntegrityError,
+  type V3RunEnvelope,
+} from './run-envelope.js';
 import {
   canResolveGateWait,
   normalizeGateWaitInput,
   readWait,
   resolveWait,
+  resolveWaitOnce,
   selectedResolution,
+  v3GateWaitId,
   writePendingWait,
+  type GateWait,
   type GateWaitStatus,
 } from './human-gate.js';
-import { readJournal, appendEvent, type StoredEvent, type V3ErrorClass } from './journal.js';
+import {
+  readJournal,
+  appendEvent,
+  withJournalMutationSync,
+  type StoredEvent,
+  type V3ErrorClass,
+} from './journal.js';
 import { materialize } from './state.js';
+import { openV3WorkerAttempts } from './attempt-ledger.js';
+import { openV3HostEffects } from './host-effect-ledger.js';
+import { readAndVerifyV3PreparedHostInput } from './host-execution.js';
+import { composeV3HostGatePrompt, renderV3HostInputPreview } from './host-bindings.js';
+import { V3_DRIVE_LEASE_MAX_WAIT_MS, v3DriveLeaseTarget } from './drive-lease.js';
+import {
+  createDefaultHostExecutorRegistry,
+  createDefaultProviderReconcilers,
+} from '../hostExecutors/registry.js';
 import { isValidRunId } from './ops-projection.js';
 import { GOAL_ANSWER_FILE, type GoalAnswer, type GoalAsk, type ValidateManifest } from './contract.js';
+import { validateSpec } from './spec.js';
 
 /**
  * runId → runDir with a path-traversal guard (codex review #2).  runIds reach
@@ -61,6 +100,578 @@ import { GOAL_ANSWER_FILE, type GoalAnswer, type GoalAsk, type ValidateManifest 
 export function safeRunDir(baseDir: string, runId: string): string {
   if (!isValidRunId(runId)) throw new Error(`v3: invalid runId "${runId}"`);
   return join(baseDir, runId);
+}
+
+export interface V3RunExecutionContext {
+  dag: V3Dag;
+  binding?: RunChatBinding;
+  /** Present for immutable envelope-backed ad-hoc/saved runs. */
+  botSnapshots?: Map<string, import('./contract.js').BotSnapshot>;
+  envelope?: V3RunEnvelope;
+  resolvedWorkflowData?: { params: Record<string, unknown>; context: Record<string, string> };
+  /** False only for the one-version legacy grill fallback. */
+  authorizedArtifacts: boolean;
+}
+
+export type V3RunStartPreflight =
+  | {
+    ok: true;
+    context: V3RunExecutionContext;
+    /** Compatibility detail for old callers/tests; saved runs have no grill. */
+    grill?: GrillState & { dagPath: string };
+  }
+  | {
+    ok: false;
+    error:
+      | 'no_grill_state'
+      | 'dag_not_approved'
+      | 'approved_dag_missing'
+      | 'approved_dag_invalid'
+      | 'run_envelope_invalid'
+      | 'run_source_not_daemon_startable';
+    status?: GrillState['status'];
+    detail?: string;
+  };
+
+function parseResolvedWorkflowData(raw: unknown): {
+  params: Record<string, unknown>;
+  context: Record<string, string>;
+} {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('params.resolved.json must be an object');
+  }
+  const root = raw as Record<string, unknown>;
+  const extra = Object.keys(root).filter((key) => key !== 'params' && key !== 'context');
+  if (extra.length > 0) throw new Error(`params.resolved.json has unsupported key(s): ${extra.join(', ')}`);
+  if (!root.params || typeof root.params !== 'object' || Array.isArray(root.params)) {
+    throw new Error('params.resolved.json.params must be an object');
+  }
+  if (!root.context || typeof root.context !== 'object' || Array.isArray(root.context)) {
+    throw new Error('params.resolved.json.context must be an object');
+  }
+  const context = root.context as Record<string, unknown>;
+  if (Object.values(context).some((value) => typeof value !== 'string')) {
+    throw new Error('params.resolved.json.context values must be strings');
+  }
+  return {
+    params: { ...(root.params as Record<string, unknown>) },
+    context: { ...(context as Record<string, string>) },
+  };
+}
+
+function assertResolvedWorkflowContextMatchesBinding(
+  data: { context: Record<string, string> },
+  binding: RunChatBinding | undefined,
+): void {
+  if (!binding) {
+    throw new Error('saved definition run must carry an authorized chatBinding');
+  }
+  const expected: Record<string, string | undefined> = {
+    chatId: binding.chatId,
+    larkAppId: binding.larkAppId,
+    chatType: binding.chatType,
+    rootMessageId: binding.rootMessageId,
+    initiatorOpenId: binding.ownerOpenId,
+  };
+  for (const [key, actual] of Object.entries(data.context)) {
+    if (!Object.prototype.hasOwnProperty.call(expected, key)) continue;
+    if (!expected[key] || expected[key] !== actual) {
+      throw new Error(
+        `params.resolved.json context.${key} does not match run.json chatBinding`,
+      );
+    }
+  }
+}
+
+function parseSavedDefinitionWorkflowData(
+  raw: unknown,
+  binding: RunChatBinding | undefined,
+): { params: Record<string, unknown>; context: Record<string, string> } {
+  const data = parseResolvedWorkflowData(raw);
+  assertResolvedWorkflowContextMatchesBinding(data, binding);
+  return data;
+}
+
+function bindingWorkflowData(binding: RunChatBinding | undefined): {
+  params: Record<string, unknown>;
+  context: Record<string, string>;
+} | undefined {
+  if (!binding) return undefined;
+  return {
+    params: {},
+    context: {
+      chatId: binding.chatId,
+      larkAppId: binding.larkAppId,
+      ...(binding.chatType ? { chatType: binding.chatType } : {}),
+      ...(binding.rootMessageId ? { rootMessageId: binding.rootMessageId } : {}),
+      ...(binding.ownerOpenId ? { initiatorOpenId: binding.ownerOpenId } : {}),
+    },
+  };
+}
+
+function mutationIntegrityError(detail: string): RunEnvelopeIntegrityError {
+  return new RunEnvelopeIntegrityError(
+    'envelope_invalid',
+    `v3 run mutation authorization failed: ${detail}`,
+  );
+}
+
+function assertLegacyMutationIdentity(runDir: string): void {
+  const expectedRunId = basename(runDir);
+  const journalPath = join(runDir, 'journal.ndjson');
+  const events = readJournal(journalPath);
+  const starts = events.filter((event) => event.type === 'runStarted');
+  if (starts.length !== 1 || starts[0]!.runId !== expectedRunId) {
+    const seen = starts.map((event) => event.runId).join(', ') || '(none)';
+    throw mutationIntegrityError(
+      `legacy journal identity mismatch: directory=${expectedRunId}, runStarted=${seen}`,
+    );
+  }
+
+  const grillPath = join(runDir, GRILL_STATUS_FILE);
+  const grill = readGrillState(runDir);
+  if (existsSync(grillPath) && !grill) {
+    throw mutationIntegrityError('legacy grill state exists but is unreadable');
+  }
+  if (grill) {
+    if (grill.runId !== expectedRunId) {
+      throw mutationIntegrityError(
+        `legacy grill identity mismatch: directory=${expectedRunId}, grill=${grill.runId}`,
+      );
+    }
+    if (grill.status !== 'dag_approved') {
+      throw mutationIntegrityError(
+        `legacy grill is not Gate-2 approved (status=${grill.status})`,
+      );
+    }
+  }
+
+  const candidateDagPaths = new Set<string>();
+  const canonicalDagPath = join(runDir, 'dag.json');
+  if (existsSync(canonicalDagPath)) candidateDagPaths.add(canonicalDagPath);
+  if (grill?.dagPath) {
+    const runRoot = resolve(runDir);
+    const approvedDagPath = resolve(grill.dagPath);
+    const rel = relative(runRoot, approvedDagPath);
+    if (rel === '' || isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) {
+      throw mutationIntegrityError('legacy approved DAG path must stay inside its run directory');
+    }
+    if (!existsSync(approvedDagPath)) {
+      throw mutationIntegrityError('legacy approved DAG is missing');
+    }
+    candidateDagPaths.add(approvedDagPath);
+  }
+  if (candidateDagPaths.size === 0) {
+    throw mutationIntegrityError('legacy run has no verifiable DAG');
+  }
+  for (const dagPath of candidateDagPaths) {
+    let dag: V3Dag;
+    try {
+      dag = loadDag(dagPath);
+    } catch (err) {
+      throw mutationIntegrityError(
+        `legacy DAG is invalid (${dagPath}): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (dag.runId !== expectedRunId) {
+      throw mutationIntegrityError(
+        `legacy DAG identity mismatch: directory=${expectedRunId}, dag=${dag.runId}`,
+      );
+    }
+  }
+}
+
+/**
+ * Mutation authorization boundary for card/CLI recovery actions.
+ *
+ * Envelope-backed runs re-verify every pinned artifact immediately before a
+ * wait file or journal can change. Only a genuinely missing run.json may use
+ * the one-release legacy path, which still requires directory, journal, grill,
+ * and DAG identities to agree. An existing invalid/tampered envelope never
+ * falls back to legacy state.
+ */
+export function assertV3RunIntegrityForMutation(runDir: string): void {
+  const expectedRunId = basename(runDir);
+  const envelope = readRunEnvelope(runDir, expectedRunId);
+  if (envelope.kind === 'invalid') {
+    throw mutationIntegrityError(envelope.problems.join('; '));
+  }
+  if (envelope.kind === 'missing') {
+    assertLegacyMutationIdentity(runDir);
+    return;
+  }
+
+  const loaded = loadAuthorizedV3Run(runDir, { expectedRunId });
+  if (loaded.botSnapshots !== undefined) {
+    parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag);
+  }
+  if (loaded.envelope.source.kind === 'saved_definition') {
+    parseSavedDefinitionWorkflowData(loaded.resolvedParams, loaded.envelope.chatBinding);
+  }
+}
+
+function assertPathInsideRunDir(runDir: string, path: string, label: string): string {
+  const runRoot = resolve(runDir);
+  const candidate = resolve(path);
+  const rel = relative(runRoot, candidate);
+  if (rel === '' || isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) {
+    throw new Error(`${label} must stay inside its run directory`);
+  }
+  return candidate;
+}
+
+function loadLegacyDagForStart(
+  runDir: string,
+  grill: GrillState & { dagPath: string },
+): V3Dag {
+  const expectedRunId = basename(runDir);
+  if (grill.runId !== expectedRunId) {
+    throw new Error(`legacy run identity mismatch: directory=${expectedRunId}, grill=${grill.runId}`);
+  }
+  const approvedDagPath = assertPathInsideRunDir(runDir, grill.dagPath, 'legacy approved DAG path');
+  if (!existsSync(approvedDagPath)) throw new Error('legacy approved DAG is missing');
+
+  const journalPath = join(runDir, 'journal.ndjson');
+  const events = readJournal(journalPath);
+  if (events.length > 0) {
+    const starts = events.filter((event) => event.type === 'runStarted');
+    if (starts.length !== 1 || starts[0]!.runId !== expectedRunId) {
+      throw new Error(
+        `legacy journal identity mismatch: directory=${expectedRunId}, ` +
+        `runStarted=${starts.map((event) => event.runId).join(', ') || '(none)'}`,
+      );
+    }
+  }
+
+  // Once runtime has created the canonical root DAG, it is execution truth.
+  // Before first dispatch the approved grill DAG is the only available source.
+  const canonicalDagPath = join(runDir, 'dag.json');
+  const dag = loadDag(existsSync(canonicalDagPath) ? canonicalDagPath : approvedDagPath);
+  if (dag.runId !== expectedRunId) {
+    throw new Error(`legacy DAG identity mismatch: directory=${expectedRunId}, dag=${dag.runId}`);
+  }
+  return dag;
+}
+
+/**
+ * Gate-2 authorization seam shared by the daemon IPC and the actual driver.
+ * Checking only `dagPath` is insufficient: architect writes that path while
+ * the run is still `dag_ready`, before the user has approved the DAG.
+ */
+export function preflightV3RunStart(runDir: string): V3RunStartPreflight {
+  const envelopeRead = readRunEnvelope(runDir);
+  if (envelopeRead.kind === 'invalid') {
+    return {
+      ok: false,
+      error: 'run_envelope_invalid',
+      detail: envelopeRead.problems.join('; '),
+    };
+  }
+  if (envelopeRead.kind === 'ok') {
+    if (envelopeRead.envelope.source.kind === 'manual_cli') {
+      return {
+        ok: false,
+        error: 'run_source_not_daemon_startable',
+        detail: 'manual_cli runs are local-only',
+      };
+    }
+    try {
+      const loaded = loadAuthorizedV3Run(runDir, {
+        allowedSources: ['ad_hoc', 'saved_definition', 'legacy_v3'],
+      });
+      const botSnapshots = loaded.botSnapshots === undefined
+        ? undefined
+        : parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag);
+      const resolvedWorkflowData = loaded.envelope.source.kind === 'saved_definition'
+        ? parseSavedDefinitionWorkflowData(loaded.resolvedParams, loaded.envelope.chatBinding)
+        : bindingWorkflowData(loaded.envelope.chatBinding);
+      return {
+        ok: true,
+        context: {
+          dag: loaded.dag,
+          binding: loaded.envelope.chatBinding,
+          ...(botSnapshots ? { botSnapshots } : {}),
+          ...(resolvedWorkflowData ? { resolvedWorkflowData } : {}),
+          envelope: loaded.envelope,
+          authorizedArtifacts: true,
+        },
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: 'run_envelope_invalid',
+        detail: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  // One-version compatibility: a run created before run.json existed may still
+  // start from the old Gate-2 grill marker. Existing-but-corrupt envelopes
+  // never reach this fallback.
+  const grill = readGrillState(runDir);
+  if (!grill) return { ok: false, error: 'no_grill_state' };
+  if (grill.status !== 'dag_approved') {
+    return { ok: false, error: 'dag_not_approved', status: grill.status };
+  }
+  if (!grill.dagPath) {
+    return { ok: false, error: 'approved_dag_missing', status: grill.status };
+  }
+  try {
+    const approvedGrill = grill as GrillState & { dagPath: string };
+    const dag = loadLegacyDagForStart(runDir, approvedGrill);
+    return {
+      ok: true,
+      grill: approvedGrill,
+      context: {
+        dag,
+        binding: grill.chatBinding,
+        ...(bindingWorkflowData(grill.chatBinding)
+          ? { resolvedWorkflowData: bindingWorkflowData(grill.chatBinding)! }
+          : {}),
+        authorizedArtifacts: false,
+      },
+    };
+  } catch (err) {
+    if (err instanceof Error && err.message === 'legacy approved DAG is missing') {
+      return {
+        ok: false,
+        error: 'approved_dag_missing',
+        status: grill.status,
+      };
+    }
+    return {
+      ok: false,
+      error: 'approved_dag_invalid',
+      status: grill.status,
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
+ * Seal a pre-run.json grill run immediately before its first worker dispatch.
+ * Legacy Gate-2 bytes were never digest-pinned, so the envelope is honest
+ * about that historical limitation; from this point onward the canonical DAG
+ * and bot identities are immutable and every retry/resume verifies them.
+ */
+function sealLegacyV3Run(
+  runDir: string,
+  grill: GrillState & { dagPath: string },
+  preflightDag: V3Dag,
+  bots: BotConfig[],
+): V3RunExecutionContext {
+  return withFileLockSync(join(runDir, 'run.json'), () => {
+    const current = readRunEnvelope(runDir);
+    if (current.kind === 'invalid') {
+      throw new Error(`legacy run envelope is invalid: ${current.problems.join('; ')}`);
+    }
+    if (current.kind === 'ok') {
+      if (current.envelope.source.kind === 'manual_cli') {
+        throw new Error('manual_cli runs are local-only');
+      }
+      const loaded = loadAuthorizedV3Run(runDir, {
+        allowedSources: ['ad_hoc', 'saved_definition', 'legacy_v3'],
+      });
+      const botSnapshots = loaded.botSnapshots === undefined
+        ? undefined
+        : parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag);
+      const resolvedWorkflowData = loaded.envelope.source.kind === 'saved_definition'
+        ? parseSavedDefinitionWorkflowData(loaded.resolvedParams, loaded.envelope.chatBinding)
+        : bindingWorkflowData(loaded.envelope.chatBinding);
+      return {
+        dag: loaded.dag,
+        binding: loaded.envelope.chatBinding,
+        ...(botSnapshots ? { botSnapshots } : {}),
+        ...(resolvedWorkflowData ? { resolvedWorkflowData } : {}),
+        envelope: loaded.envelope,
+        authorizedArtifacts: true,
+      };
+    }
+
+    const runId = basename(runDir);
+    if (grill.runId !== runId || preflightDag.runId !== runId) {
+      throw new Error(
+        `legacy run identity changed before sealing: directory=${runId}, ` +
+        `grill=${grill.runId}, dag=${preflightDag.runId}`,
+      );
+    }
+
+    const canonicalDagPath = join(runDir, 'dag.json');
+    if (existsSync(canonicalDagPath)) {
+      const canonicalDag = loadDag(canonicalDagPath);
+      if (JSON.stringify(canonicalDag) !== JSON.stringify(preflightDag)) {
+        throw new Error('legacy canonical DAG changed between preflight and sealing');
+      }
+    } else {
+      atomicWriteFileSync(
+        canonicalDagPath,
+        `${JSON.stringify(preflightDag, null, 2)}\n`,
+        { mode: 0o600 },
+      );
+    }
+    const dag = loadDag(canonicalDagPath);
+
+    const botPath = join(runDir, 'bots.snapshot.json');
+    let botSnapshots;
+    if (existsSync(botPath)) {
+      const raw = JSON.parse(readFileSync(botPath, 'utf-8')) as unknown;
+      botSnapshots = parseFrozenBotSnapshots(raw, dag);
+    } else {
+      botSnapshots = freezeDagBotSnapshots(dag, bots);
+      atomicWriteFileSync(
+        botPath,
+        `${JSON.stringify(serializeFrozenBotSnapshots(botSnapshots), null, 2)}\n`,
+        { mode: 0o600 },
+      );
+    }
+
+    const artifacts: import('./run-envelope.js').V3LegacyRunEnvelope['artifacts'] = {
+      dag: artifactRef(runDir, 'dag.json'),
+      botSnapshots: artifactRef(runDir, 'bots.snapshot.json'),
+    };
+    const specPath = join(runDir, 'spec.json');
+    if (existsSync(specPath)) {
+      try {
+        const spec = validateSpec(JSON.parse(readFileSync(specPath, 'utf-8')));
+        if (spec.runId === runId) artifacts.spec = artifactRef(runDir, 'spec.json');
+      } catch {
+        // Historical specs were optional and not execution inputs. Omit an
+        // unverifiable/corrupt one rather than blessing it into the envelope.
+      }
+    }
+
+    const journalEvents = readJournal(join(runDir, 'journal.ndjson'));
+    const legacyEnvelope = makeLegacyV3RunEnvelope({
+      runId,
+      createdAt: grill.createdAt,
+      backfilledAt: new Date().toISOString(),
+      original: 'grill',
+      basis: journalEvents.length > 0 ? 'runtime_started' : 'grill_dag_approved',
+      ...(grill.chatBinding ? { chatBinding: grill.chatBinding } : {}),
+      artifacts,
+    });
+    publishRunEnvelopeOnce(runDir, legacyEnvelope);
+
+    const loaded = loadAuthorizedV3Run(runDir, { allowedSources: ['legacy_v3'] });
+    return {
+      dag: loaded.dag,
+      binding: loaded.envelope.chatBinding,
+      botSnapshots: parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag),
+      ...(bindingWorkflowData(loaded.envelope.chatBinding)
+        ? { resolvedWorkflowData: bindingWorkflowData(loaded.envelope.chatBinding)! }
+        : {}),
+      envelope: loaded.envelope,
+      authorizedArtifacts: true,
+    };
+  });
+}
+
+/** Envelope-first binding lookup shared by daemon routes, card handlers, and
+ * cold attach. Corrupt run.json fails closed; only a genuinely missing
+ * envelope may use the one-version grill fallback. */
+export function readV3RunChatBinding(runDir: string): RunChatBinding | undefined {
+  const envelope = readRunEnvelope(runDir);
+  if (envelope.kind === 'ok') return envelope.envelope.chatBinding;
+  if (envelope.kind === 'invalid') return undefined;
+  return readGrillState(runDir)?.chatBinding;
+}
+
+/** Verified DAG for recovery/display logic, with the same missing-only legacy
+ * fallback as the start path. */
+export function loadV3RunDagForRecovery(runDir: string): V3Dag | undefined {
+  const envelope = readRunEnvelope(runDir);
+  if (envelope.kind === 'ok') {
+    try { return loadAuthorizedV3Run(runDir).dag; } catch { return undefined; }
+  }
+  if (envelope.kind === 'invalid') return undefined;
+  const grill = readGrillState(runDir);
+  if (!grill?.dagPath || !existsSync(grill.dagPath)) return undefined;
+  try { return loadDag(grill.dagPath); } catch { return undefined; }
+}
+
+interface TrustedHostGateMaterial {
+  waitId: string;
+  nodeId: string;
+  instanceId: string;
+  prompt: string;
+  options: string[];
+  approveOptions: string[];
+  approvers: string[];
+  hostApproval: { attemptId: string; approvalDigest: string; inputHash: string };
+}
+
+/** Rebuild the host approval UI from authorized DAG + durable prepared bytes.
+ * waits/*.json is mutable delivery state and is never trusted as the approval
+ * object by itself. */
+function trustedHostGateMaterial(
+  runDir: string,
+  runId: string,
+  nodeId: string,
+  instanceId: string,
+  events: readonly StoredEvent[],
+): TrustedHostGateMaterial | undefined {
+  const dag = loadV3RunDagForRecovery(runDir);
+  const node = dag?.nodes.find((candidate) => candidate.id === nodeId);
+  if (!node || !isHostNode(node) || !node.humanGate) return undefined;
+  const dispatched = [...events].reverse().find(
+    (event): event is StoredEvent & { type: 'gateDispatched' } =>
+      event.type === 'gateDispatched' &&
+      event.nodeId === nodeId &&
+      event.instanceId === instanceId &&
+      !!event.hostApproval,
+  );
+  if (!dispatched?.hostApproval) return undefined;
+  const prepared = [...events].reverse().find(
+    (event): event is StoredEvent & { type: 'hostInputPrepared' } =>
+      event.type === 'hostInputPrepared' &&
+      event.nodeId === nodeId &&
+      event.instanceId === instanceId &&
+      event.attemptId === dispatched.hostApproval!.attemptId,
+  );
+  const registered = createDefaultHostExecutorRegistry().get(node.executor);
+  if (!prepared || !registered) return undefined;
+  if (
+    prepared.approvalDigest !== dispatched.hostApproval.approvalDigest ||
+    prepared.inputHash !== dispatched.hostApproval.inputHash
+  ) return undefined;
+  try {
+    const artifact = readAndVerifyV3PreparedHostInput({
+      runDir,
+      inputRef: prepared.inputRef,
+      expected: { ...prepared, runId },
+      registered,
+    });
+    const authored = normalizeGateWaitInput(node.humanGate);
+    const hostApproval = {
+      attemptId: prepared.attemptId,
+      approvalDigest: prepared.approvalDigest,
+      inputHash: prepared.inputHash,
+    };
+    return {
+      nodeId,
+      instanceId,
+      waitId: v3GateWaitId(nodeId, instanceId, hostApproval),
+      ...authored,
+      prompt: composeV3HostGatePrompt(
+        authored.prompt,
+        renderV3HostInputPreview(node.executor, artifact.prepared.parsedInput, prepared.inputHash),
+      ),
+      hostApproval,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function waitMatchesTrustedHostGate(wait: GateWait, trusted: TrustedHostGateMaterial): boolean {
+  return wait.waitId === trusted.waitId &&
+    wait.nodeId === trusted.nodeId &&
+    wait.instanceId === trusted.instanceId &&
+    wait.prompt === trusted.prompt &&
+    JSON.stringify(wait.options) === JSON.stringify(trusted.options) &&
+    JSON.stringify(wait.approveOptions) === JSON.stringify(trusted.approveOptions) &&
+    JSON.stringify(wait.approvers) === JSON.stringify(trusted.approvers) &&
+    JSON.stringify(wait.hostApproval) === JSON.stringify(trusted.hostApproval);
 }
 
 export type V3TerminalOutcome = Extract<V3RunOutcome, { reason: 'terminal' }>;
@@ -79,6 +690,8 @@ export interface V3BlockedInfo {
   /** Present when errorCode === 'REVISIT_BUDGET_EXHAUSTED': the ancestor this
    *  node tried to revisit → the daemon posts a revisit-grant card. */
   revisitTo?: string;
+  /** No generic retry may mint a fresh idempotency key for this attempt. */
+  retryForbidden?: 'host-effect-uncertain';
 }
 
 /** Latest `nodeBlocked` details for a node (card content).  Falls back to a
@@ -96,6 +709,15 @@ export function blockedInfoFor(events: StoredEvent[], nodeId: string): V3Blocked
         message: e.message,
         ...(e.ask ? { ask: e.ask } : {}),
         ...(e.revisitTo ? { revisitTo: e.revisitTo } : {}),
+      };
+    } else if (e.type === 'hostEffectUncertain' && e.nodeId === nodeId) {
+      found = {
+        nodeId,
+        attemptId: e.attemptId,
+        errorClass: 'workerError',
+        errorCode: e.errorCode,
+        message: '外部操作的最终状态无法确认，请先在目标系统完成对账；为避免重复副作用，普通重试已禁用。',
+        retryForbidden: 'host-effect-uncertain',
       };
     }
   }
@@ -178,6 +800,8 @@ export interface V3DaemonRunDeps {
   /** Report a terminal run (final card / message).  Optional. */
   onTerminal?: (runId: string, outcome: V3TerminalOutcome, binding?: RunChatBinding) => Promise<void>;
   maxParallel?: number;
+  /** Low-latency interrupt delivery. Durable intent always lives in journal. */
+  cancelSignal?: AbortSignal;
 }
 
 /**
@@ -189,12 +813,23 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
   const baseDir = deps.baseDir ?? defaultBaseDir();
   const runDir = safeRunDir(baseDir, runId);
 
-  const grill = readGrillState(runDir);
-  if (!grill) throw new Error(`v3 daemon run: no grill state for "${runId}" in ${runDir}`);
-  if (!grill.dagPath || !existsSync(grill.dagPath)) {
-    throw new Error(`v3 daemon run: "${runId}" has no approved dag (status=${grill.status})`);
+  const preflight = preflightV3RunStart(runDir);
+  if (!preflight.ok && preflight.error === 'no_grill_state') {
+    throw new Error(`v3 daemon run: no grill state for "${runId}" in ${runDir}`);
   }
-  const binding = grill.chatBinding;
+  if (!preflight.ok) {
+    if (
+      preflight.error === 'run_envelope_invalid' ||
+      preflight.error === 'run_source_not_daemon_startable'
+    ) {
+      throw new Error(
+        `v3 daemon run: "${runId}" authorization failed (${preflight.error})` +
+        (preflight.detail ? `: ${preflight.detail}` : ''),
+      );
+    }
+    throw new Error(`v3 daemon run: "${runId}" has no approved dag (status=${preflight.status ?? 'unknown'})`);
+  }
+  let context = preflight.context;
 
   // Was the run ALREADY terminal before this (re-)drive?  A coalesced re-drive or
   // a `/start` retry of a finished run re-runs no work (the journal is terminal),
@@ -203,9 +838,16 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
   const journalPath = join(runDir, 'journal.ndjson');
   const wasAlreadyTerminal =
     existsSync(journalPath) &&
-    ['succeeded', 'failed'].includes(materialize(readJournal(journalPath)).runStatus);
+    ['succeeded', 'failed', 'cancelled'].includes(materialize(readJournal(journalPath)).runStatus);
 
   const bots = (deps.loadBots ?? loadBotConfigs)();
+  if (!context.authorizedArtifacts) {
+    if (!preflight.grill) {
+      throw new Error(`v3 daemon run: legacy run "${runId}" has no approved grill basis`);
+    }
+    context = sealLegacyV3Run(runDir, preflight.grill, context.dag, bots);
+  }
+  const binding = context.binding;
   // Secret resolver by larkAppId from live bots.json; no env fallback (contract).
   const secretById = new Map(bots.map((b) => [b.larkAppId, b.larkAppSecret]));
   const resolveLarkAppSecret = (larkAppId: string): string | undefined => secretById.get(larkAppId);
@@ -223,14 +865,24 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
   const resolveBotSnapshot = (botId: string | undefined) => botToSnapshot(resolveBotConfig(botId, bots));
 
   const runNode = (deps.makeRunNode ?? defaultMakeRunNode)(resolveLarkAppSecret);
-  const dag = loadDag(grill.dagPath);
+  const dag = context.dag;
 
   // suspend mode → no resolveGate (runtime writes the wait + returns awaitingGate).
-  const runtimeDeps: V3RuntimeDeps = { runNode, validateManifest, resolveBotSnapshot };
+  const runtimeDeps: V3RuntimeDeps = {
+    runNode,
+    validateManifest,
+    resolveBotSnapshot,
+    hostExecutors: createDefaultHostExecutorRegistry(),
+    hostReconcilers: createDefaultProviderReconcilers(),
+  };
   const opts: V3RuntimeOptions = {
     baseDir,
     gateMode: 'suspend',
+    ...(context.botSnapshots ? { frozenBotSnapshots: context.botSnapshots } : {}),
+    ...(context.authorizedArtifacts ? { authorizedArtifacts: true } : {}),
+    ...(context.resolvedWorkflowData ? { resolvedWorkflowData: context.resolvedWorkflowData } : {}),
     ...(deps.maxParallel ? { globalConcurrency: deps.maxParallel } : {}),
+    ...(deps.cancelSignal ? { cancelSignal: deps.cancelSignal } : {}),
   };
 
   const outcome = await runWorkflow(dag, runtimeDeps, opts);
@@ -317,6 +969,7 @@ export function resolveV3GateClick(
   const runDir = safeRunDir(baseDir, runId);
   const journalPath = join(runDir, 'journal.ndjson');
   if (!existsSync(journalPath)) return { kind: 'stale-run', reason: 'missing' };
+  assertV3RunIntegrityForMutation(runDir);
   const snap = materialize(readJournal(journalPath));
   if (snap.runStatus !== 'running') return { kind: 'stale-run', reason: 'terminal' };
 
@@ -332,31 +985,122 @@ export function resolveV3GateClick(
   if (wait.instanceId && wait.instanceId !== snap.nodes.get(wait.nodeId)?.effectiveInstanceId) {
     return { kind: 'stale-run', reason: 'stale-node' };
   }
+  const dagNode = loadV3RunDagForRecovery(runDir)?.nodes.find((node) => node.id === wait.nodeId);
+  const trustedHost = dagNode && isHostNode(dagNode) && wait.instanceId
+    ? trustedHostGateMaterial(runDir, runId, wait.nodeId, wait.instanceId, readJournal(journalPath))
+    : undefined;
+  if (dagNode && isHostNode(dagNode)) {
+    if (!trustedHost || !waitMatchesTrustedHostGate(wait, trustedHost)) {
+      return { kind: 'stale-run', reason: 'no-wait' };
+    }
+  }
   if (!canResolveGateWait(wait, input.by)) return { kind: 'unauthorized' };
   const resolution = selectedResolution(wait, input.selected);
   if (!resolution) return { kind: 'stale-run', reason: 'no-wait' };
 
-  resolveWait(runDir, input.waitId, resolution, input.by, input.selected);
-  const instanceId = snap.nodes.get(wait.nodeId)?.effectiveInstanceId;
+  const settled = resolveWaitOnce(
+    runDir,
+    input.waitId,
+    resolution,
+    input.by,
+    input.selected,
+  );
+  if (!settled.changed) {
+    return { kind: 'already-settled', status: settled.wait.status };
+  }
+  const resolvedWait = settled.wait;
+  if (trustedHost && !waitMatchesTrustedHostGate(resolvedWait, trustedHost)) {
+    appendEvent(journalPath, {
+      type: 'gateResolved',
+      nodeId: trustedHost.nodeId,
+      instanceId: trustedHost.instanceId,
+      waitId: trustedHost.waitId,
+      resolution: 'rejected',
+      by: 'system-host-wait-integrity',
+      hostApproval: trustedHost.hostApproval,
+    });
+    return { kind: 'resolved', resolution: 'rejected' };
+  }
+  const instanceId = snap.nodes.get(resolvedWait.nodeId)?.effectiveInstanceId;
   appendEvent(journalPath, {
     type: 'gateResolved',
     // nodeId from the WAIT FILE, not caller input (codex review #1): the wait is
     // the authoritative state — a wrong/stale caller nodeId must not let us write
     // gateResolved for a different node.
-    nodeId: wait.nodeId,
+    nodeId: resolvedWait.nodeId,
     ...(instanceId ? { instanceId } : {}),
     waitId: input.waitId,
     resolution,
     by: input.by,
     selected: input.selected,
+    ...(trustedHost
+      ? { hostApproval: trustedHost.hostApproval }
+      : resolvedWait.hostApproval ? { hostApproval: resolvedWait.hostApproval } : {}),
   });
   return { kind: 'resolved', resolution };
+}
+
+export type V3RunCancelOutcome =
+  | { kind: 'requested'; cancelRequestId: string }
+  | { kind: 'already-requested'; cancelRequestId: string }
+  | { kind: 'already-cancelled'; cancelRequestId?: string }
+  | { kind: 'already-terminal'; status: 'succeeded' | 'failed' }
+  | { kind: 'stale-run'; reason: 'missing' };
+
+const CANCEL_ACTOR_MAX = 128;
+const CANCEL_REASON_MAX = 500;
+
+/**
+ * Durable, idempotent run-cancel mutation shared by CLI, IM, cards and the
+ * dashboard daemon endpoint. The journal lock is the linearization boundary:
+ * a true terminal committed first wins; otherwise the first cancel request
+ * wins and every repeat reuses its id.
+ */
+export function requestV3RunCancel(
+  baseDir: string,
+  runId: string,
+  input: { by: string; reason?: string },
+): V3RunCancelOutcome {
+  const runDir = safeRunDir(baseDir, runId);
+  if (!existsSync(runDir)) return { kind: 'stale-run', reason: 'missing' };
+  assertV3RunIntegrityForMutation(runDir);
+
+  const by = input.by.trim();
+  if (!by || by.length > CANCEL_ACTOR_MAX || /[\r\n\0]/.test(by)) {
+    throw new Error(`v3 cancel actor must be 1-${CANCEL_ACTOR_MAX} safe characters`);
+  }
+  const reason = input.reason?.trim();
+  if (reason !== undefined && (reason.length === 0 || reason.length > CANCEL_REASON_MAX || /[\0]/.test(reason))) {
+    throw new Error(`v3 cancel reason must be 1-${CANCEL_REASON_MAX} characters`);
+  }
+
+  const journalPath = join(runDir, 'journal.ndjson');
+  return withJournalMutationSync(journalPath, ({ events, append }) => {
+    const snap = materialize([...events]);
+    if (snap.runStatus === 'cancelled') {
+      return { kind: 'already-cancelled', cancelRequestId: snap.cancelRequestId };
+    }
+    if (snap.runStatus === 'succeeded' || snap.runStatus === 'failed') {
+      return { kind: 'already-terminal', status: snap.runStatus };
+    }
+    if (snap.runStatus === 'cancelling' && snap.cancelRequestId) {
+      return { kind: 'already-requested', cancelRequestId: snap.cancelRequestId };
+    }
+    const cancelRequestId = `cancel-${randomUUID()}`;
+    append({
+      type: 'runCancelRequested',
+      cancelRequestId,
+      by,
+      ...(reason ? { reason } : {}),
+    }, { durable: true });
+    return { kind: 'requested', cancelRequestId };
+  });
 }
 
 export type V3RetryOutcome =
   | { kind: 'requested'; nodeId: string; previousAttemptId: string; nextAttemptId: string }
   | { kind: 'already-requested'; nodeId: string }
-  | { kind: 'stale-run'; reason: 'missing' | 'not-blocked' | 'stale-attempt' | 'loop-node' | 'invalid-answer' };
+  | { kind: 'stale-run'; reason: 'missing' | 'not-blocked' | 'stale-attempt' | 'loop-node' | 'invalid-answer' | 'host-effect-uncertain' };
 
 type V3RetryAnswerInput =
   | { selected: string; by: string }
@@ -404,6 +1148,7 @@ export function requestV3Retry(
   const runDir = safeRunDir(baseDir, runId);
   const journalPath = join(runDir, 'journal.ndjson');
   if (!existsSync(journalPath)) return { kind: 'stale-run', reason: 'missing' };
+  assertV3RunIntegrityForMutation(runDir);
 
   const events = readJournal(journalPath);
   const snap = materialize(events);
@@ -446,12 +1191,19 @@ export function requestV3Retry(
   const previousAttemptId = latestAttemptIdFor(events, attemptKey);
   if (!previousAttemptId) return { kind: 'stale-run', reason: 'not-blocked' };
   const info = blockedInfoFor(events, nodeId);
+  if (events.some((event) =>
+    (event.type === 'hostEffectIntent' || event.type === 'hostEffectUncertain') &&
+    event.attemptId === previousAttemptId)) {
+    return { kind: 'stale-run', reason: 'host-effect-uncertain' };
+  }
   // Freshness gate (codex blocker): the click must target the CURRENTLY
   // blocked attempt, not an earlier one whose card survived in the chat.
   if (input.expectedAttemptId && input.expectedAttemptId !== info.attemptId) {
     return { kind: 'stale-run', reason: 'stale-attempt' };
   }
   const nextAttemptId = nextAttemptIdFor(events, attemptKey);
+  const resetGate = events.some((event) =>
+    event.type === 'hostInputPrepared' && event.attemptId === previousAttemptId);
 
   // Runtime human-ask answer: persist the chosen option next to the asked
   // attempt (answer.json) and carry its path on the retry event — buildInputs
@@ -495,6 +1247,7 @@ export function requestV3Retry(
     reason: 'blockedRetry',
     previousErrorClass: info.errorClass,
     previousErrorCode: info.errorCode,
+    ...(resetGate ? { resetGate: true } : {}),
     ...(answer ? { answer } : {}),
   });
   return { kind: 'requested', nodeId, previousAttemptId, nextAttemptId };
@@ -525,6 +1278,7 @@ export function requestRevisitGrant(
   const runDir = safeRunDir(baseDir, runId);
   const journalPath = join(runDir, 'journal.ndjson');
   if (!existsSync(journalPath)) return { kind: 'stale-run', reason: 'missing' };
+  assertV3RunIntegrityForMutation(runDir);
 
   // Reject a half-filled pair before touching state (never widen to run grant).
   const hasSource = input.sourceNodeId !== undefined;
@@ -596,6 +1350,7 @@ export function requestV3LoopGrant(
   const runDir = safeRunDir(baseDir, runId);
   const journalPath = join(runDir, 'journal.ndjson');
   if (!existsSync(journalPath)) return { kind: 'stale-run', reason: 'missing' };
+  assertV3RunIntegrityForMutation(runDir);
 
   const events = readJournal(journalPath);
   const snap = materialize(events);
@@ -675,6 +1430,9 @@ export interface V3GateRunnerDeps {
   postRevisitGrantCard?: (binding: RunChatBinding, info: V3RevisitBudgetBlockedInfo, runId: string) => Promise<void>;
   /** Notify a terminal run (optional, daemon-supplied). */
   notifyTerminal?: (binding: RunChatBinding | undefined, runId: string, outcome: V3TerminalOutcome) => Promise<void>;
+  /** Best-effort observability hooks. They must never affect run semantics. */
+  onDriveBegin?: (runId: string) => void | Promise<void>;
+  onDriveEnd?: (runId: string) => void | Promise<void>;
   /** runtime deps passthrough (tests inject; daemon uses real pool). */
   loadBots?: V3DaemonRunDeps['loadBots'];
   makeRunNode?: V3DaemonRunDeps['makeRunNode'];
@@ -691,8 +1449,23 @@ export interface V3GateRunnerDeps {
  * source is always the runDir.
  */
 export function createV3GateRunner(deps: V3GateRunnerDeps) {
+  const baseDir = deps.baseDir ?? defaultBaseDir();
   const inFlight = new Set<string>();
   const rerunRequested = new Set<string>();
+  const activeControllers = new Map<string, AbortController>();
+
+  const invokeLifecycleHook = (
+    hook: ((runId: string) => void | Promise<void>) | undefined,
+    runId: string,
+    phase: 'begin' | 'end',
+  ): void => {
+    if (!hook) return;
+    void Promise.resolve()
+      .then(() => hook(runId))
+      .catch((err) => deps.onError?.(runId, new Error(
+        `v3 progress ${phase} hook failed: ${err instanceof Error ? err.message : String(err)}`,
+      )));
+  };
 
   async function drive(runId: string): Promise<void> {
     // Coalesce (codex blocker #2): if a drive is already in flight for this run,
@@ -708,25 +1481,65 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
     try {
       do {
         rerunRequested.delete(runId); // clear before the run; a request DURING re-sets it
-        await driveV3Run(runId, {
-          baseDir: deps.baseDir,
-          loadBots: deps.loadBots,
-          makeRunNode: deps.makeRunNode,
-          validateManifest: deps.validateManifest,
-          maxParallel: deps.maxParallel,
-          postGateCard: (binding, gate, rid) => deps.postCard(binding, gate, rid),
-          postBlockedCard: deps.postBlockedCard,
-          postLoopGrantCard: deps.postLoopGrantCard,
-          postRevisitGrantCard: deps.postRevisitGrantCard,
-          onTerminal: (rid, outcome, binding) =>
-            deps.notifyTerminal ? deps.notifyTerminal(binding, rid, outcome) : Promise.resolve(),
-        });
+        invokeLifecycleHook(deps.onDriveBegin, runId, 'begin');
+        const controller = new AbortController();
+        activeControllers.set(runId, controller);
+        try {
+          // The in-memory guard above prevents duplicate drives inside one
+          // daemon.  This lease extends the same invariant across rolling
+          // restarts / an accidental second daemon: only the process that owns
+          // the live worker promises may schedule, drain peers, or publish a
+          // run boundary.
+          // A cancel request itself uses the independent journal lock, so it
+          // can still wake the lease holder while a second daemon waits here.
+          const leaseTarget = v3DriveLeaseTarget(baseDir, runId);
+          let leaseSettled = false;
+          while (!leaseSettled) {
+            try {
+              await withFileLock(leaseTarget, async () => {
+                // A durable cancel can land while driveV3Run is no longer in
+                // runtime (for example it is awaiting a slow gate-card POST).
+                // Re-fold under the SAME lease before releasing ownership so
+                // the request cannot be stranded between runtime and transport.
+                do {
+                  await driveV3Run(runId, {
+                    baseDir,
+                    loadBots: deps.loadBots,
+                    makeRunNode: deps.makeRunNode,
+                    validateManifest: deps.validateManifest,
+                    maxParallel: deps.maxParallel,
+                    cancelSignal: controller.signal,
+                    postGateCard: (binding, gate, rid) => deps.postCard(binding, gate, rid),
+                    postBlockedCard: deps.postBlockedCard,
+                    postLoopGrantCard: deps.postLoopGrantCard,
+                    postRevisitGrantCard: deps.postRevisitGrantCard,
+                    onTerminal: (rid, outcome, binding) =>
+                      deps.notifyTerminal ? deps.notifyTerminal(binding, rid, outcome) : Promise.resolve(),
+                  });
+                } while (currentRunStatus(baseDir, runId) === 'cancelling');
+              }, { maxWaitMs: V3_DRIVE_LEASE_MAX_WAIT_MS });
+              leaseSettled = true;
+            } catch (err) {
+              // A second daemon may legitimately wait longer than one lock
+              // window while the owner drains a wedged CLI or a Lark request.
+              // Durable cancellation must keep a waiter alive until the lease
+              // is released; ordinary duplicate drives may still fail fast.
+              const lockTimedOut = err instanceof Error && err.message.includes('file-lock timeout waiting for');
+              if (lockTimedOut && currentRunStatus(baseDir, runId) === 'cancelling') continue;
+              throw err;
+            }
+          }
+        } finally {
+          if (activeControllers.get(runId) === controller) activeControllers.delete(runId);
+          invokeLifecycleHook(deps.onDriveEnd, runId, 'end');
+        }
       } while (rerunRequested.has(runId));
     } catch (err) {
       deps.onError?.(runId, err);
     } finally {
       inFlight.delete(runId);
       rerunRequested.delete(runId);
+      activeControllers.delete(runId);
     }
   }
 
@@ -735,10 +1548,20 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
     void drive(runId);
   }
 
+  /** Deliver an already-durable cancel request to the active runtime and make
+   *  sure a fresh replay runs even when the request raced post-card/teardown. */
+  function cancelAndDrive(runId: string, cancelRequestId: string): void {
+    const controller = activeControllers.get(runId);
+    if (controller && !controller.signal.aborted) {
+      controller.abort({ kind: 'run', cancelRequestId });
+    }
+    driveDetached(runId);
+  }
+
   async function coldAttach(ownerLarkAppId?: string): Promise<void> {
     let recs: V3GateRecovery[] = [];
     try {
-      recs = reconcileV3PendingGates(deps.baseDir, ownerLarkAppId);
+      recs = reconcileV3PendingGates(baseDir, ownerLarkAppId);
     } catch (err) {
       deps.onError?.('(cold-attach)', err);
       return;
@@ -786,7 +1609,19 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
     }
   }
 
-  return { drive, driveDetached, coldAttach };
+  return { drive, driveDetached, cancelAndDrive, coldAttach };
+}
+
+function currentRunStatus(baseDir: string, runId: string): ReturnType<typeof materialize>['runStatus'] | undefined {
+  try {
+    const journalPath = join(safeRunDir(baseDir, runId), 'journal.ndjson');
+    if (!existsSync(journalPath)) return undefined;
+    return materialize(readJournal(journalPath)).runStatus;
+  } catch {
+    // The actual drive path reports integrity/journal errors. This helper is
+    // only a retry predicate and must never convert corruption into a spin.
+    return undefined;
+  }
 }
 
 /**
@@ -812,28 +1647,63 @@ export function reconcileV3PendingGates(baseDir: string = defaultBaseDir(), owne
       if (!statSync(runDir).isDirectory()) continue;
       const journalPath = join(runDir, 'journal.ndjson');
       if (!existsSync(journalPath)) continue;
+      // Recovery may recreate a missing wait or heal a resolved wait by
+      // appending gateResolved. Apply the same authorization boundary as live
+      // clicks before cold-attach can mutate or repost anything for this run.
+      assertV3RunIntegrityForMutation(runDir);
 
       const events = readJournal(journalPath);
       const snap = materialize(events);
-      if (snap.runStatus === 'succeeded' || snap.runStatus === 'failed') continue;
+      const hasOpenAttempts =
+        openV3WorkerAttempts(events).length > 0 || openV3HostEffects(events).length > 0;
+      if (
+        snap.runStatus === 'succeeded' ||
+        snap.runStatus === 'failed' ||
+        snap.runStatus === 'cancelled'
+      ) {
+        if (!hasOpenAttempts) continue;
+        const binding = readV3RunChatBinding(runDir);
+        if (ownerLarkAppId && binding?.larkAppId !== ownerLarkAppId) continue;
+        if (!binding) continue;
+        // Pre-barrier histories may have published a terminal before a peer
+        // outer process closed. Re-drive only to clean resources; driveV3Run's
+        // already-terminal guard suppresses duplicate terminal notification.
+        out.push({ runId, runDir, binding, repost: [], resume: true });
+        continue;
+      }
+
+      if (snap.runStatus === 'cancelling') {
+        const binding = readV3RunChatBinding(runDir);
+        if (ownerLarkAppId && binding?.larkAppId !== ownerLarkAppId) continue;
+        // Never repost stale gate/retry cards while cancellation is in
+        // progress. A cold drive converges pending/gated nodes immediately;
+        // workers from the dead daemon exit on IPC disconnect.
+        out.push({ runId, runDir, binding, repost: [], resume: true });
+        continue;
+      }
 
       if (snap.runStatus === 'blocked') {
+        if (hasOpenAttempts) {
+          const binding = readV3RunChatBinding(runDir);
+          if (ownerLarkAppId && binding?.larkAppId !== ownerLarkAppId) continue;
+          if (!binding) continue;
+          // Cleanup must finish before the retry/grant card is visible: an
+          // immediate click must never overlap a pre-block bypass worker.
+          out.push({ runId, runDir, binding, repost: [], resume: true });
+          continue;
+        }
         // Blocked run: repost the recovery card (covers the crash window
         // between the runBlocked append and the original card send) — grant
         // card for an exhausted loop, retry card for a blocked node.  Owner-
         // filtered like gates; binding-less (CLI/dev) runs are left alone.
-        const grill = readGrillState(runDir);
-        const binding = grill?.chatBinding;
+        const binding = readV3RunChatBinding(runDir);
         if (ownerLarkAppId && binding?.larkAppId !== ownerLarkAppId) continue;
         if (!binding || !snap.blockedNodeId) continue;
         if (snap.loops.has(snap.blockedNodeId)) {
           const info = loopExhaustedInfoFor(events, snap.blockedNodeId);
-          if (grill?.dagPath && existsSync(grill.dagPath)) {
-            try {
-              const loopNode = loadDag(grill.dagPath).nodes.find((n) => n.id === snap.blockedNodeId);
-              if (loopNode && isLoopNode(loopNode)) info.maxIterations = loopNode.maxIterations;
-            } catch { /* display-only enrichment — card renders without it */ }
-          }
+          const recoveryDag = loadV3RunDagForRecovery(runDir);
+          const loopNode = recoveryDag?.nodes.find((n) => n.id === snap.blockedNodeId);
+          if (loopNode && isLoopNode(loopNode)) info.maxIterations = loopNode.maxIterations;
           out.push({ runId, runDir, binding, repost: [], repostLoopGrant: info, resume: false });
         } else {
           // Revisit-budget block → grant card; otherwise the plain retry card.
@@ -855,14 +1725,25 @@ export function reconcileV3PendingGates(baseDir: string = defaultBaseDir(), owne
       // runStatus === 'running'
       const rec = reconcileOneRun(runId, runDir, journalPath, snap, ownerLarkAppId);
       if (rec) {
-        out.push(rec);
+        // A pending gate may coexist with an attempt owned by the dead daemon.
+        // Let the drive fence/requeue it first; that drive will post every gate
+        // still pending after resource convergence.
+        out.push(hasOpenAttempts ? { ...rec, repost: [], resume: true } : rec);
         continue;
       }
-      // No gate to reconcile.  If nothing is (phantom-)running, the run died in
-      // a resumable spot — e.g. crash right after a `nodeRetryRequested` append
-      // (before the redrive) or right after start — so re-drive it.  Runs with
-      // phantom `running` nodes are the dangling-attempt recovery gap (worker
-      // fencing backlog) and are deliberately left alone.
+      if (hasOpenAttempts) {
+        const binding = readV3RunChatBinding(runDir);
+        if (ownerLarkAppId && binding?.larkAppId !== ownerLarkAppId) continue;
+        if (!binding) continue;
+        out.push({ runId, runDir, binding, repost: [], resume: true });
+        continue;
+      }
+      // No gate or open attempt to reconcile. If nothing is materialized as
+      // running, the run died in a resumable control spot — e.g. crash right
+      // after `nodeRetryRequested` or start — so re-drive it. Open worker
+      // attempts were handled above by the unified fence barrier; a remaining
+      // running node without an open ledger record is malformed/legacy state
+      // and stays fail-closed here.
       //
       // Composite LOOP nodes are excluded from the phantom check (codex loop
       // review blocker): a loop is 'running' in PURE CONTROL states with no
@@ -875,8 +1756,7 @@ export function reconcileV3PendingGates(baseDir: string = defaultBaseDir(), owne
         ([id, s]) => s.status === 'running' && !snap.loops.has(id),
       );
       if (!hasRunning) {
-        const grill = readGrillState(runDir);
-        const binding = grill?.chatBinding;
+        const binding = readV3RunChatBinding(runDir);
         if (ownerLarkAppId && binding?.larkAppId !== ownerLarkAppId) continue;
         if (!binding) continue; // CLI/dev runs are not the daemon's to adopt
         out.push({ runId, runDir, binding, repost: [], resume: true });
@@ -897,13 +1777,13 @@ function reconcileOneRun(
   snap: ReturnType<typeof materialize>,
   ownerLarkAppId?: string,
 ): V3GateRecovery | undefined {
+  const events = readJournal(journalPath);
   const gateWaitingNodes = [...snap.nodes.entries()]
     .filter(([, s]) => s.status === 'gateWaiting')
     .map(([id]) => id);
   if (gateWaitingNodes.length === 0) return undefined;
 
-  const grill = readGrillState(runDir); // defensive: undefined on corrupt (won't throw)
-  const binding = grill?.chatBinding;
+  const binding = readV3RunChatBinding(runDir);
 
   // Multi-daemon owner filter (codex blocker #1): each bot daemon must only
   // touch runs bound to ITS larkAppId — otherwise every online daemon re-posts
@@ -912,14 +1792,26 @@ function reconcileOneRun(
   if (ownerLarkAppId && binding?.larkAppId !== ownerLarkAppId) return undefined;
 
   // dag (for humanGate.prompt when re-creating a missing wait).
-  const dagNodeGate = new Map<string, ReturnType<typeof normalizeGateWaitInput>>();
-  if (grill?.dagPath && existsSync(grill.dagPath)) {
-    try {
-      for (const n of loadDag(grill.dagPath).nodes) {
-        if (n.humanGate?.prompt) dagNodeGate.set(n.id, normalizeGateWaitInput(n.humanGate));
+  const dagNodeGate = new Map<string, ReturnType<typeof normalizeGateWaitInput> & {
+    hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string };
+  }>();
+  const trustedHostGates = new Map<string, TrustedHostGateMaterial>();
+  const recoveryDag = loadV3RunDagForRecovery(runDir);
+  if (recoveryDag) {
+    for (const n of recoveryDag.nodes) {
+      if (!n.humanGate?.prompt) continue;
+      const gate = normalizeGateWaitInput(n.humanGate);
+      if (!isHostNode(n)) {
+        dagNodeGate.set(n.id, gate);
+        continue;
       }
-    } catch {
-      /* dag unreadable — fall back to a generic prompt below */
+      const instanceId = snap.nodes.get(n.id)?.effectiveInstanceId;
+      if (!instanceId) continue;
+      const trusted = trustedHostGateMaterial(runDir, runId, n.id, instanceId, events);
+      if (trusted) {
+        trustedHostGates.set(n.id, trusted);
+        dagNodeGate.set(n.id, trusted);
+      }
     }
   }
 
@@ -929,20 +1821,93 @@ function reconcileOneRun(
     // Instance-level waitId mirrors startGate so recovery reads the SAME wait
     // file the dispatch wrote (stale-card protection).
     const instanceId = snap.nodes.get(nodeId)?.effectiveInstanceId;
-    const waitId = `${instanceId ?? nodeId}-gate`;
+    const recoveredGate = dagNodeGate.get(nodeId);
+    const trustedHostGate = trustedHostGates.get(nodeId);
+    const dispatchedHostApproval = [...events].reverse().find(
+      (event): event is StoredEvent & { type: 'gateDispatched' } =>
+        event.type === 'gateDispatched' &&
+        event.nodeId === nodeId &&
+        event.instanceId === instanceId &&
+        !!event.hostApproval,
+    )?.hostApproval;
+    const waitId = v3GateWaitId(
+      nodeId,
+      instanceId,
+      trustedHostGate?.hostApproval ?? recoveredGate?.hostApproval ?? dispatchedHostApproval,
+    );
     let wait = readWait(runDir, waitId);
+    const recoveryNode = recoveryDag?.nodes.find((node) => node.id === nodeId);
+    if (recoveryNode && isHostNode(recoveryNode)) {
+      if (!trustedHostGate) {
+        // The mutable wait can never substitute for missing/corrupt frozen
+        // input. Reject with the token from the durable dispatch, if any.
+        appendEvent(journalPath, {
+          type: 'gateResolved',
+          nodeId,
+          ...(instanceId ? { instanceId } : {}),
+          waitId,
+          resolution: 'rejected',
+          by: 'system-host-input-unrecoverable',
+          ...(dispatchedHostApproval ? { hostApproval: dispatchedHostApproval } : {}),
+        });
+        resume = true;
+        continue;
+      }
+      if (wait?.status === 'pending' && !waitMatchesTrustedHostGate(wait, trustedHostGate)) {
+        // Pending delivery state is safe to repair because no human decision
+        // has landed. Re-render from authorized DAG + verified sidecar.
+        wait = writePendingWait(runDir, trustedHostGate);
+      } else if (wait && wait.status !== 'pending' && !waitMatchesTrustedHostGate(wait, trustedHostGate)) {
+        appendEvent(journalPath, {
+          type: 'gateResolved',
+          nodeId,
+          ...(instanceId ? { instanceId } : {}),
+          waitId,
+          resolution: 'rejected',
+          by: 'system-host-wait-integrity',
+          hostApproval: trustedHostGate.hostApproval,
+        });
+        resume = true;
+        continue;
+      }
+    }
     if (!wait) {
-      const gate = dagNodeGate.get(nodeId) ?? normalizeGateWaitInput({ prompt: '(humanGate — 等待人工审批)' });
-      wait = writePendingWait(runDir, { waitId, nodeId, ...(instanceId ? { instanceId } : {}), ...gate });
+      const gate = dagNodeGate.get(nodeId);
+      if (!gate && recoveryNode && isHostNode(recoveryNode)) {
+        // A host gate is approval of one frozen input hash. If that input
+        // cannot be verified, never recreate a generic/static card that could
+        // approve different bytes; reject the gate and surface a failed run.
+        const dispatched = [...events].reverse().find(
+          (event): event is StoredEvent & { type: 'gateDispatched' } =>
+            event.type === 'gateDispatched' && event.nodeId === nodeId && event.instanceId === instanceId,
+        );
+        appendEvent(journalPath, {
+          type: 'gateResolved',
+          nodeId,
+          ...(instanceId ? { instanceId } : {}),
+          waitId,
+          resolution: 'rejected',
+          by: 'system-host-input-unrecoverable',
+          ...(dispatched?.hostApproval ? { hostApproval: dispatched.hostApproval } : {}),
+        });
+        resume = true;
+        continue;
+      }
+      const safeGate = gate ?? normalizeGateWaitInput({ prompt: '(humanGate — 等待人工审批)' });
+      wait = writePendingWait(runDir, { waitId, nodeId, ...(instanceId ? { instanceId } : {}), ...safeGate });
     }
     if (wait.status === 'pending') {
+      const display = trustedHostGate ?? wait;
       repost.push({
         nodeId,
         waitId,
-        prompt: wait.prompt,
-        options: wait.options,
-        approveOptions: wait.approveOptions,
-        approvers: wait.approvers,
+        prompt: display.prompt,
+        options: display.options,
+        approveOptions: display.approveOptions,
+        approvers: display.approvers,
+        ...(trustedHostGate
+          ? { hostApproval: trustedHostGate.hostApproval }
+          : wait.hostApproval ? { hostApproval: wait.hostApproval } : {}),
       });
     } else {
       // resolved wait but node still gateWaiting → journal lost gateResolved → heal.
@@ -955,6 +1920,9 @@ function reconcileOneRun(
         resolution: wait.status,
         by: wait.by ?? 'system',
         selected: wait.selected,
+        ...(trustedHostGate
+          ? { hostApproval: trustedHostGate.hostApproval }
+          : wait.hostApproval ? { hostApproval: wait.hostApproval } : {}),
       });
       resume = true;
     }

@@ -99,8 +99,10 @@ describe('worker durable lease expiry ordering', () => {
     const rawStart = workerSource.indexOf("case 'raw_input':");
     const rawEnd = workerSource.indexOf("case 'rename_session':", rawStart);
     const rawInput = workerSource.slice(rawStart, rawEnd);
+    // PR #441 起入队条件还含注入围栏（injectionFlushing / barrier）——本测试只钉
+    // restart/rename 三因子仍在场且顺序不变，不钉整行。
     const rawGate = rawInput.indexOf(
-      'if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight)',
+      'if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight',
     );
     const rawQueue = rawInput.indexOf('pendingRawInputs.push(msg)', rawGate);
     const rawDeliver = rawInput.indexOf('await deliverRawInput(msg)', rawQueue);

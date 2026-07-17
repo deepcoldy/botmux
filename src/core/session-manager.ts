@@ -1669,9 +1669,15 @@ export async function executeScheduledTask(
     logger.debug('No bots configured, skipping scheduled task');
     return;
   }
-  const bot =
-    (task.larkAppId && allBots.find(b => b.config.larkAppId === task.larkAppId)) ||
-    allBots[0];
+  const bot = task.larkAppId
+    ? allBots.find(b => b.config.larkAppId === task.larkAppId)
+    : allBots[0];
+  if (!bot) {
+    throw new Error(
+      `Scheduled task ${task.id} is bound to unavailable bot ${task.larkAppId}; ` +
+      'refusing to deliver through a different bot',
+    );
+  }
   const larkAppId = bot.config.larkAppId;
 
   const { getChatMode, sendMessage, replyMessage } = await import('../im/lark/client.js');

@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
-import { buildSandboxArgs, buildRelayHostEnv, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, sandboxCredentialHidePaths, resolveUserReadonlyRoots, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { buildSandboxArgs, buildRelayHostEnv, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, sandboxCredentialHidePaths, resolveUserReadonlyRoots, sandboxOverlayPaths, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
 
@@ -175,6 +175,22 @@ describe('resolveSandboxMountPath', () => {
     expect(resolveSandboxMountPath(linkHome)).toBe(realpathSync(realHome));
 
     rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('sandboxOverlayPaths', () => {
+  it('keeps host-side merged mounts outside the HOME-backed data tree', () => {
+    const paths = sandboxOverlayPaths('/home/u/.botmux/data', 's1');
+    expect(paths.projectMerged).toBe('/var/tmp/botmux-sbx/s1/proj-merged');
+    expect(paths.homeMerged).toBe('/var/tmp/botmux-sbx/s1/home-merged');
+    expect(paths.projectMerged.startsWith('/home/u/')).toBe(false);
+    expect(paths.homeMerged.startsWith('/home/u/')).toBe(false);
+  });
+
+  it('retains the old in-data-dir paths for upgrade cleanup only', () => {
+    const paths = sandboxOverlayPaths('/home/u/.botmux/data', 's1');
+    expect(paths.legacyProjectMerged).toBe('/home/u/.botmux/data/sandboxes/s1/proj-merged');
+    expect(paths.legacyHomeMerged).toBe('/home/u/.botmux/data/sandboxes/s1/home-merged');
   });
 });
 

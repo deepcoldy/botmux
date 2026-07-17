@@ -145,6 +145,28 @@ describe('registerAsk happy path', () => {
 });
 
 describe('tryResolveAsk gating', () => {
+  it('persists chatType and forwards it to the canTalk checker', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const checker = vi.fn((_app: string, _chat: string, _openId: string, chatType?: 'group' | 'p2p') =>
+      chatType === 'p2p');
+    setCanTalkChecker(checker);
+
+    const pending = registerAsk(makeInput({ chatType: 'p2p' }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const ask = d.sendCalls[0]!;
+    expect(ask.chatType).toBe('p2p');
+    expect(tryResolveAsk({
+      askId: ask.askId,
+      nonce: ask.nonce,
+      selected: 'yes',
+      by: 'ou_p2p_user',
+    })).toBe('accepted');
+    await expect(pending).resolves.toMatchObject({ kind: 'answered', by: 'ou_p2p_user' });
+    expect(checker).toHaveBeenCalledWith('cli_app', 'oc_chat', 'ou_p2p_user', 'p2p');
+  });
+
   it('returns "stale" for unknown askId', () => {
     const d = mockDispatcher();
     setCardDispatcher(d);

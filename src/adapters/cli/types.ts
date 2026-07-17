@@ -290,6 +290,15 @@ export interface CliAdapter {
    *  silently unisolated. */
   readonly supportsReadIsolation?: boolean;
 
+  /** CLI 支持会话内移动工作目录（如 Claude Code ≥2.1.205 的 /cd）。
+   *  true → botmux cd 走 idle 注入（不重启进程）；缺省 → 杀进程冷启动兜底。
+   *  ⚠️ 这是家族级声明，不做运行时版本探测：若部署的二进制过旧（或 fork 变体
+   *  没有会话内 /cd），注入会被 TUI 当 unknown command 静默吞掉——daemon 记录
+   *  已重钉、进程仍留在旧目录，直到下一次 respawn 才收敛（inject_command 已同步
+   *  lastInitConfig.workingDir，任何重启路径都落新目录）。部署前提见
+   *  docs/roles/deploy-runbook.md 第 1 步的版本检查。 */
+  readonly supportsSessionCwdMove?: boolean;
+
   /** When true, the worker's soft first-prompt timeout keeps queued input held
    *  until this adapter's `readyPattern` appears. Use only for CLIs whose startup
    *  screens can accept and swallow stdin before the real composer exists; the

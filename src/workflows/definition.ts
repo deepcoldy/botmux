@@ -1,5 +1,7 @@
 /**
- * WorkflowDefinition — canonical JSON shape for v0 workflows
+ * Frozen Workflow v2 definition schema retained only for offline migration
+ * and archive verification. It is not executable after the v2 retirement.
+ * Canonical JSON shape for historical v0/v0.2 workflows
  * (see /tmp/wf-ui-v0.md §3 for the spec).
  *
  * Two node types:
@@ -15,6 +17,12 @@
 
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+
+import { canonicalJsonStringify } from '../utils/canonical-json.js';
+
+// Compatibility export for callers that historically imported the encoder
+// from the legacy definition module.
+export { canonicalJsonStringify } from '../utils/canonical-json.js';
 
 // ─── Field schemas ─────────────────────────────────────────────────────────
 
@@ -253,28 +261,6 @@ export const WorkflowDefinitionSchema = z.object({
 export type WorkflowDefinition = z.infer<typeof WorkflowDefinitionSchema>;
 
 // ─── Canonical JSON stringify ──────────────────────────────────────────────
-
-/**
- * Canonical JSON: object keys sorted recursively, arrays preserved in
- * order, compact (no extra whitespace).  Defined this way so that any
- * authoring-tool round-trip (YAML→JSON, TS builder→JSON) produces an
- * identical string when the underlying data is the same.
- *
- * Numbers are emitted via JSON.stringify so NaN/Infinity (illegal in
- * JSON) round-trip to errors — caller should reject those in schema.
- */
-export function canonicalJsonStringify(value: unknown): string {
-  return JSON.stringify(canonicalize(value));
-}
-
-function canonicalize(value: unknown): unknown {
-  if (value === null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) return value.map(canonicalize);
-  const obj = value as Record<string, unknown>;
-  const sorted: Record<string, unknown> = {};
-  for (const k of Object.keys(obj).sort()) sorted[k] = canonicalize(obj[k]);
-  return sorted;
-}
 
 // ─── revisionId ────────────────────────────────────────────────────────────
 

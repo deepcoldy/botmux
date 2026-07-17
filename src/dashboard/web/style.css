@@ -6752,93 +6752,7 @@ dialog.onboarding-dialog::backdrop {
   }
 }
 
-/* ─── Workflow runtime: list, detail, parallel timeline, IO cards ─── */
-/* Status pills + dangling badges piggyback on the global semantic tokens
-   (--accent / --success / --warning / --danger + their *-soft pairs) so
-   light <-> dark switches just by flipping data-theme on <html>. */
-.wf-status { padding: 0.05rem 0.4rem; border-radius: 999px; font-size: 11px; font-variant: small-caps; background: var(--bg-soft); color: var(--muted); }
-.wf-status-pending       { background: var(--bg-soft); color: var(--muted); }
-.wf-status-running       { background: var(--accent-soft); color: var(--accent); }
-.wf-status-waiting       { background: var(--warning-soft); color: var(--warning); }
-.wf-status-succeeded     { background: var(--success-soft); color: var(--success); }
-.wf-status-failed        { background: var(--danger-soft); color: var(--danger); }
-.wf-status-cancelled     { background: var(--bg-soft); color: var(--muted); }
-.wf-dangling.has  { color: var(--danger); font-weight: 600; }
-.wf-dangling.none { color: var(--muted); }
-.wf-run-error { margin-top: 0.25rem; max-width: 360px; white-space: normal; overflow-wrap: anywhere; color: var(--muted); font-size: 12px; }
-
-.wf-subnav { display: flex; gap: 0.4rem; margin-bottom: 0.8rem; border-bottom: 1px solid var(--border); padding-bottom: 0; }
-.wf-subnav a { padding: 0.35rem 0.7rem; color: var(--muted); text-decoration: none; border-bottom: 2px solid transparent; margin-bottom: -1px; }
-.wf-subnav a.active { color: var(--fg); border-bottom-color: var(--fg); font-weight: 600; }
-.wf-subnav a:hover { color: var(--fg); }
-
-.wf-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.6rem; margin-bottom: 0.8rem; }
-.wf-summary-item { border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.6rem; min-width: 0; background: var(--surface); }
-.wf-summary-item span { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0; margin-bottom: 0.2rem; }
-.wf-summary-item strong { display: block; font-weight: 600; overflow-wrap: anywhere; }
-.wf-summary-item .wf-status { display: inline-block; }
-.wf-panel { border: 1px solid var(--border); border-radius: 6px; padding: 0.7rem; margin-bottom: 0.8rem; background: var(--surface); }
-.wf-panel-title { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.5rem; }
-.wf-panel-title h3 { margin: 0; font-size: 15px; }
-.wf-panel-title button { margin-left: auto; }
-.wf-dangling-panel.has { border-color: var(--danger); background: var(--danger-soft); }
-.wf-dangling-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.7rem; }
-.wf-dangling-grid ul { margin: 0.25rem 0 0; padding-left: 1.1rem; }
-.wf-dangling-grid li { margin: 0.15rem 0; overflow-wrap: anywhere; }
-.wf-table-scroll { overflow-x: auto; }
-.wf-timeline-scroll { max-height: 520px; overflow: auto; border: 1px solid var(--border); border-radius: 4px; }
-.wf-timeline-scroll table th { position: sticky; top: 0; z-index: 1; }
-.wf-parallel-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin: 0 0 0.35rem 170px; }
-.wf-parallel-list { display: grid; gap: 0.45rem; }
-.wf-parallel-row { display: grid; grid-template-columns: 160px minmax(220px, 1fr); gap: 0.6rem; align-items: center; }
-.wf-parallel-label { min-width: 0; }
-.wf-parallel-label code { display: block; overflow-wrap: anywhere; }
-.wf-parallel-label .muted { display: block; margin-top: 0.1rem; font-size: 11px; overflow-wrap: anywhere; }
-.wf-parallel-track { position: relative; height: 28px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-muted); overflow: hidden; }
-/* Coloured bars sit on top of any theme; foreground stays #fff because the
-   bars carry the strong fill themselves and the contrast holds in both modes. */
-.wf-parallel-bar { position: absolute; top: 4px; bottom: 4px; min-width: 3px; border-radius: 3px; display: flex; align-items: center; padding: 0 0.35rem; color: #fff; font-size: 11px; line-height: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.wf-parallel-running, .wf-parallel-effectAttempting { background: var(--accent); }
-.wf-parallel-waiting { background: var(--warning); }
-.wf-parallel-pending { background: #8250df; }
-.wf-parallel-succeeded { background: var(--success); }
-.wf-parallel-failed, .wf-parallel-timedOut { background: var(--danger); }
-.wf-parallel-cancelled { background: var(--faint); }
-:root[data-theme="dark"] .wf-parallel-running,
-:root[data-theme="dark"] .wf-parallel-effectAttempting { color: var(--on-accent); }
-:root[data-theme="dark"] .wf-parallel-waiting,
-:root[data-theme="dark"] .wf-parallel-succeeded,
-:root[data-theme="dark"] .wf-parallel-cancelled { color: var(--bg); }
-:root[data-theme="dark"] .wf-parallel-failed,
-:root[data-theme="dark"] .wf-parallel-timedOut { color: var(--on-danger); }
-.wf-io-list { display: grid; gap: 0.7rem; }
-.wf-io-card { border: 1px solid var(--border); border-radius: 6px; padding: 0.65rem; background: var(--surface); }
-.wf-io-card.is-focused { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
-.wf-io-card header { display: flex; justify-content: space-between; gap: 0.8rem; align-items: flex-start; }
-.wf-io-card header > div:first-child { min-width: 0; }
-.wf-io-card header code, .wf-io-meta code { overflow-wrap: anywhere; }
-.wf-io-card header .muted { display: block; margin-top: 0.1rem; overflow-wrap: anywhere; }
-.wf-io-meta { margin-top: 0.35rem; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-.wf-approval-box { margin-top: 0.6rem; padding: 0.55rem; border: 1px solid var(--warning); border-radius: 4px; background: var(--warning-soft); }
-.wf-approval-box label span { display: block; margin-bottom: 0.25rem; color: var(--muted); font-size: 12px; }
-.wf-approval-comment { width: 100%; resize: vertical; min-height: 48px; padding: 0.35rem 0.45rem; border: 1px solid var(--border); border-radius: var(--radius); font: inherit; background: var(--surface); color: var(--fg); }
-.wf-approval-actions { display: flex; align-items: center; gap: 0.45rem; margin-top: 0.45rem; flex-wrap: wrap; }
-.wf-approval-status { margin: 0.5rem 0 0; }
-.wf-io-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0.55rem; margin-top: 0.6rem; }
-.wf-io-block { border: 1px solid var(--border); border-radius: 4px; background: var(--surface-muted); min-width: 0; }
-.wf-io-block summary { cursor: pointer; padding: 0.4rem 0.5rem; font-weight: 600; }
-.wf-io-block summary .muted { margin-left: 0.3rem; font-weight: 400; }
-.wf-io-pre { margin: 0; padding: 0.5rem; max-height: 340px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--surface); color: var(--fg); border-top: 1px solid var(--border); }
-.wf-io-empty { padding: 0.5rem; }
-.wf-terminal-block { grid-column: 1 / -1; }
-.wf-terminal-actions { padding: 0.45rem 0.5rem; border-top: 1px solid var(--border); background: var(--surface); display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; }
-.wf-resume-status { padding: 0.35rem 0.5rem; border-top: 1px solid var(--border); }
-/* Terminal iframe content is itself a CLI surface (Tokyo Night theme), so
-   the wrapper stays dark in both modes to avoid a white flash before xterm
-   boots. */
-.wf-terminal-frame { display: block; width: 100%; height: 460px; border: 0; border-top: 1px solid var(--border); background: #0d1117; }
-.wf-error-msg { display: block; margin-top: 0.15rem; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
-
+.v3-terminal-frame { display: block; width: 100%; height: 460px; border: 0; border-top: 1px solid var(--border); background: #0d1117; }
 /* v3 per-node terminal panel (live iframe / replay) */
 .v3-terminal-panel { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: #0d1117; }
 .v3-terminal-head { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.6rem; background: var(--surface); border-bottom: 1px solid var(--border); font-size: 12px; }
@@ -6850,40 +6764,9 @@ dialog.onboarding-dialog::backdrop {
 .v3-terminal-dot.closed { background: #188038; }
 .v3-terminal-empty { padding: 1.5rem 0.75rem; text-align: center; border: 1px dashed var(--border); border-radius: 6px; }
 
-/* Workflow catalog */
-.catalog-head, .catalog-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.8rem; margin-bottom: 0.8rem; }
-.catalog-head h2, .catalog-detail-head h2 { margin: 0 0 0.15rem; font-size: 18px; line-height: 1.25; }
-.catalog-run-form { display: grid; gap: 0.65rem; max-width: 900px; }
-.catalog-run-form label span, .catalog-param header { display: block; margin-bottom: 0.25rem; color: var(--muted); font-size: 12px; }
-.catalog-run-form textarea, .catalog-run-form input[type=text] { width: 100%; padding: 0.4rem 0.5rem; border: 1px solid var(--border); border-radius: var(--radius); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--fg); background: var(--surface); }
-.catalog-run-form textarea { resize: vertical; min-height: 150px; }
-.catalog-chat-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.65rem; }
-.catalog-param-errors { background: var(--warning-soft); border-left: 3px solid var(--warning); padding: 0.45rem 0.65rem; border-radius: 3px; }
-.catalog-param-errors ul { margin: 0.35rem 0 0; padding-left: 1.2rem; }
-.catalog-param-list { display: grid; gap: 0.55rem; }
-.catalog-param { border: 1px solid var(--border); border-radius: 4px; padding: 0.55rem; background: var(--surface-muted); }
-.catalog-param header { display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; margin-bottom: 0.35rem; }
-
 @media (max-width: 720px) {
-  .wf-summary-grid { grid-template-columns: 1fr 1fr; }
-  .wf-panel { padding: 0.55rem; }
-  .wf-parallel-axis { margin-left: 0; }
-  .wf-parallel-row { grid-template-columns: 1fr; gap: 0.25rem; }
-  .wf-io-card header { flex-direction: column; }
-  .wf-io-grid { grid-template-columns: 1fr; }
-  .wf-terminal-frame { height: 360px; }
-  .wf-approval-actions button { flex: 1 1 120px; }
-  .wf-timeline-scroll { max-height: 420px; }
-  .catalog-head, .catalog-detail-head { flex-direction: column; }
-  .catalog-chat-grid { grid-template-columns: 1fr; }
+  .v3-terminal-frame { height: 360px; }
 }
-
-@media (max-width: 460px) {
-  .wf-summary-grid { grid-template-columns: 1fr; }
-  .wf-approval-actions { flex-direction: column; align-items: stretch; }
-  .wf-approval-actions button { width: 100%; }
-}
-
 /* ════════════════════════════════════════════════════════════════════════════
    数字员工工作台 — 统一视觉层（未来 / 科技 / 数字人）
    设计语言：深色实底、清晰边界、克制面板与标签。
@@ -7059,19 +6942,11 @@ button.sidebar-create-btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-/* 必须排在上方基础规则之后：≤980px 侧边栏折叠为顶部横向 rail 时创建入口改横排。
-   同 specificity 靠源顺序取胜，挪回文件靠前的 media 块会被基础规则反超（PR #491 review）。 */
+/* ≤980px 侧边栏折叠为顶部横向 rail 后，只保留页面导航。
+   创建会话 / 创建机器人已分别位于对应页面标题区，避免移动端出现两层横向操作轨道。 */
 @media (max-width: 980px) {
   .sidebar-create-actions {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 0;
-    padding-bottom: 0;
-    border-bottom: 0;
-    overflow-x: auto;
-  }
-  button.sidebar-create-btn {
-    flex: 0 0 auto;
+    display: none;
   }
 }
 
@@ -8237,6 +8112,37 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   line-height: 1;
   text-align: left;
   cursor: pointer;
+}
+/* 长列表下拉的过滤框：滚动时钉在弹层顶部（负 margin 盖住弹层 padding）。 */
+.sect-sort-pop input.sect-sort-search[type="search"] {
+  position: sticky;
+  top: -6px;
+  z-index: 1;
+  box-sizing: border-box;
+  width: calc(100% + 12px);
+  margin: -6px -6px 0;
+  height: var(--button-height) !important;
+  min-height: var(--button-height) !important;
+  max-height: var(--button-height) !important;
+  padding: 0 var(--button-padding-x) !important;
+  border: none !important;
+  border-bottom: 1px solid var(--border-soft) !important;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0 !important;
+  background: var(--surface) !important;
+  background-clip: padding-box;
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+  box-shadow: none;
+}
+.sect-sort-pop input.sect-sort-search[type="search"]:focus {
+  border-bottom-color: var(--accent) !important;
+}
+.sect-sort-pop .sect-sort-empty {
+  margin: 0;
+  padding: 8px var(--button-padding-x);
+  color: var(--muted);
+  font-size: 12px;
 }
 .sect-sort-pop button[aria-current="true"] {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
@@ -11164,23 +11070,6 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
   .session-board-move { transition: none; }
 }
 
-/* 工作流子导航：下划线 tab → 圆角段 */
-.wf-subnav { border-bottom: 0; gap: 6px; }
-.wf-subnav a {
-  border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  padding: 6px 16px;
-  margin-bottom: 0;
-  font-size: 12.5px;
-  font-weight: 600;
-}
-.wf-subnav a.active {
-  color: var(--accent-strong);
-  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
-  background: var(--accent-soft);
-  border-bottom-color: color-mix(in srgb, var(--accent) 35%, transparent);
-}
-
 @media (max-width: 980px) {
   .chrome-body {
     display: flex;
@@ -11700,14 +11589,14 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
   color: var(--accent-strong);
 }
 
-.page :where(.card, .bd-card, .panel, .metric-card, .roles-tree-panel, .roles-editor-panel, .wf-panel, .wf-summary-item, .wf-io-card, .v3r-graph-card, .v3r-panel) {
+.page :where(.card, .bd-card, .panel, .metric-card, .roles-tree-panel, .roles-editor-panel, .v3r-graph-card, .v3r-panel) {
   border-color: var(--border-soft);
   border-radius: var(--radius-lg);
   background: var(--surface);
   box-shadow: none;
 }
 
-:root[data-theme="dark"] .page :where(.card, .bd-card, .panel, .metric-card, .roles-tree-panel, .roles-editor-panel, .wf-panel, .wf-summary-item, .wf-io-card, .v3r-graph-card, .v3r-panel),
+:root[data-theme="dark"] .page :where(.card, .bd-card, .panel, .metric-card, .roles-tree-panel, .roles-editor-panel, .v3r-graph-card, .v3r-panel),
 :root[data-theme="dark"] .bd-roster,
 :root[data-theme="dark"] .bd-profile-head,
 :root[data-theme="dark"] .bd-tile {
@@ -11718,7 +11607,7 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
 }
 
 .page :where(.card, .bd-card, .settings-card, .skills-installed-panel, .skills-defaults-panel, .skills-install-panel) > h2:first-child,
-.page :where(.bd-section-title, .skills-section-head h2, .wf-panel-title h3, .roles-profile-section-title) {
+.page :where(.bd-section-title, .skills-section-head h2, .roles-profile-section-title) {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -11731,7 +11620,7 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
 }
 
 .page :where(.card, .bd-card, .settings-card, .skills-installed-panel, .skills-defaults-panel, .skills-install-panel) > h2:first-child::before,
-.page :where(.bd-section-title, .skills-section-head h2, .wf-panel-title h3, .roles-profile-section-title)::before {
+.page :where(.bd-section-title, .skills-section-head h2, .roles-profile-section-title)::before {
   content: "";
   width: var(--section-title-dot-size);
   height: var(--section-title-dot-size);
@@ -11780,14 +11669,14 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
   vertical-align: bottom;
 }
 
-.page :where(.skills-row, .skills-discovery-row, .skills-candidate-row, .roles-group-row, .roles-bot-row, .roles-profile-row, .overview-list-item, .connector-item-card, .wf-io-card) {
+.page :where(.skills-row, .skills-discovery-row, .skills-candidate-row, .roles-group-row, .roles-bot-row, .roles-profile-row, .overview-list-item, .connector-item-card) {
   transition:
     border-color 150ms ease,
     background-color 150ms ease,
     transform 150ms ease;
 }
 
-.page :where(.skills-row, .skills-discovery-row, .roles-group-row, .roles-bot-row, .roles-profile-row, .connector-item-card, .wf-io-card):hover {
+.page :where(.skills-row, .skills-discovery-row, .roles-group-row, .roles-bot-row, .roles-profile-row, .connector-item-card):hover {
   border-color: color-mix(in srgb, var(--accent) 32%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 5%, var(--surface));
 }
@@ -11803,8 +11692,7 @@ tbody tr[data-chat]:hover {
   background: color-mix(in srgb, var(--accent) 5%, var(--surface));
 }
 
-.schedules-page .actions-cell,
-.workflows-page td:last-child {
+.schedules-page .actions-cell {
   white-space: normal;
 }
 
@@ -13481,36 +13369,13 @@ main:has(.whiteboards-page) {
   }
 }
 
-.workflows-page .data-table,
-.legacy-workflow-page table {
-  overflow: hidden;
-}
-
-.workflows-page .page-heading h1 code {
-  font-size: inherit;
-  line-height: inherit;
-}
-
-.workflows-page .page-heading-actions .toolbar-status:empty {
-  display: none;
-}
-
-.wf-summary-grid,
 .v3r-wrap {
   gap: 12px;
 }
 
-.wf-panel,
-.wf-summary-item,
-.wf-io-card,
 .v3r-panel,
 .v3r-graph-card {
   padding: 12px;
-}
-
-.wf-panel-title {
-  min-height: var(--section-title-row-height);
-  margin-bottom: var(--section-title-content-gap);
 }
 
 .v3r-graph-card {
@@ -14341,7 +14206,6 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .dashboard-toolbar .segmented,
-.wf-subnav.dashboard-toolbar,
 .team-subnav.dashboard-toolbar,
 .connectors-subnav.dashboard-toolbar {
   display: inline-flex;
@@ -14359,7 +14223,6 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .dashboard-toolbar .segmented button,
-.wf-subnav.dashboard-toolbar a,
 .team-subnav.dashboard-toolbar a,
 .connectors-subnav.dashboard-toolbar a {
   display: inline-flex;
@@ -14381,7 +14244,6 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .dashboard-toolbar .segmented button.active,
 .dashboard-toolbar .segmented button[aria-pressed="true"],
-.wf-subnav.dashboard-toolbar a.active,
 .team-subnav.dashboard-toolbar a.active,
 .connectors-subnav.dashboard-toolbar a.active {
   background: var(--dashboard-toolbar-active-bg);
@@ -14390,7 +14252,6 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .dashboard-toolbar .segmented button:hover,
-.wf-subnav.dashboard-toolbar a:hover,
 .team-subnav.dashboard-toolbar a:hover,
 .connectors-subnav.dashboard-toolbar a:hover {
   color: var(--accent-strong);
@@ -14399,7 +14260,6 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .dashboard-toolbar .segmented button.active:hover,
 .dashboard-toolbar .segmented button[aria-pressed="true"]:hover,
-.wf-subnav.dashboard-toolbar a.active:hover,
 .team-subnav.dashboard-toolbar a.active:hover,
 .connectors-subnav.dashboard-toolbar a.active:hover {
   background: var(--dashboard-toolbar-active-bg);
@@ -14441,7 +14301,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
   padding: 0 var(--button-padding-x);
 }
 
-.page :where(.actions, .update-actions, .schedule-actions, .roles-editor-actions, .connector-item-actions, .connector-edit-actions, .team-manage-actions, .team-role-actions, .wf-approval-actions, .wf-terminal-actions) {
+.page :where(.actions, .update-actions, .schedule-actions, .roles-editor-actions, .connector-item-actions, .connector-edit-actions, .team-manage-actions, .team-role-actions) {
   align-items: center;
   gap: 8px;
 }
@@ -18003,7 +17863,6 @@ button.webhook-log-row.active {
 
 :root[data-skin="cyber"] .dashboard-toolbar .segmented button.active,
 :root[data-skin="cyber"] .dashboard-toolbar .segmented button[aria-pressed="true"],
-:root[data-skin="cyber"] .wf-subnav.dashboard-toolbar a.active,
 :root[data-skin="cyber"] .team-subnav.dashboard-toolbar a.active {
   background: var(--dashboard-toolbar-active-bg);
   color: var(--dashboard-toolbar-active-fg);
@@ -18651,6 +18510,8 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .v3r-node.st-skipped .v3r-box, .v3r-node.st-cancelled .v3r-box { stroke-dasharray: 4 3; }
 .rs-running   { --ns: var(--v3r-running); }
 .rs-succeeded { --ns: var(--v3r-done); }
+.rs-cancelling { --ns: var(--v3r-blocked); }
+.rs-cancelled { --ns: var(--v3r-skipped); }
 .rs-blocked   { --ns: var(--v3r-blocked); }
 .rs-failed    { --ns: var(--v3r-failed); }
 
@@ -18848,15 +18709,6 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
   margin-left: 0;
 }
 
-.workflow-version-switch {
-  flex: none;
-  white-space: nowrap;
-}
-
-.page-heading-actions .workflow-version-switch {
-  margin-left: 2px;
-}
-
 .v3r-detail-heading {
   overflow: visible;
 }
@@ -18907,8 +18759,31 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
   flex: none;
 }
 
-.legacy-workflow-status-menu {
-  --dropdown-trigger-width: 136px;
+.page-heading-actions > button.v3r-cancel-button {
+  border-color: color-mix(in srgb, var(--danger) 48%, var(--border-soft));
+  background: color-mix(in srgb, var(--danger) 5%, transparent);
+  color: var(--danger);
+}
+
+.page-heading-actions > button.v3r-cancel-button:hover:not(:disabled) {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 11%, transparent);
+  color: var(--danger);
+}
+
+.v3r-cancel-notice {
+  padding: .62rem .82rem;
+  border: 1px solid color-mix(in srgb, var(--warning) 34%, var(--border-soft));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
+  color: var(--warning);
+  font-size: 12px;
+}
+
+.v3r-cancel-notice.done {
+  border-color: color-mix(in srgb, var(--muted) 28%, var(--border-soft));
+  background: color-mix(in srgb, var(--muted) 6%, var(--surface));
+  color: var(--muted);
 }
 
 .v3r-run-count {
@@ -19152,8 +19027,7 @@ main:has(.workflows-page .v3r-wrap) .v3r-term-slot {
   overflow: hidden;
 }
 
-main:has(.workflows-page .v3r-runs-section),
-main:has(.legacy-workflow-page .workflow-runs-table-wrap) {
+main:has(.workflows-page .v3r-runs-section) {
   padding-bottom: 0;
   overflow: hidden;
 }
@@ -19174,93 +19048,6 @@ main:has(.workflows-page .v3r-runs-section) .v3r-runs-section {
 
 main:has(.workflows-page .v3r-runs-section) .v3r-run-list {
   height: 100%;
-}
-
-main:has(.legacy-workflow-page .workflow-runs-table-wrap) .legacy-workflow-page {
-  height: 100%;
-  min-height: 0;
-  grid-template-rows: auto auto minmax(0, 1fr);
-  overflow: hidden;
-}
-
-.workflow-runs-table-wrap {
-  min-height: 0;
-  overflow: auto;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  box-shadow: var(--shadow);
-}
-
-.workflows-page .workflow-runs-table {
-  width: 100%;
-  min-width: 860px;
-  border-collapse: separate;
-  border-spacing: 0;
-  overflow: hidden;
-  border: 0;
-  border-radius: 0;
-  background: var(--surface);
-  box-shadow: none;
-}
-
-.workflows-page .workflow-runs-table thead th {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: var(--surface);
-}
-
-.workflows-page .workflow-runs-table tbody tr:hover {
-  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
-}
-
-.wf-summary-grid {
-  margin-bottom: 0;
-  gap: 10px;
-}
-
-.wf-summary-item,
-.wf-panel,
-.wf-io-card,
-.wf-io-block {
-  border-color: var(--border-soft);
-  border-radius: var(--radius-lg);
-}
-
-.wf-panel {
-  margin-bottom: 0;
-  display: grid;
-  gap: var(--section-title-content-gap);
-}
-
-.wf-panel-title {
-  margin-bottom: 0;
-  align-items: flex-end;
-}
-
-.wf-panel-title button {
-  min-height: var(--button-height);
-  padding: 0 var(--button-padding-x);
-  border-radius: var(--radius-full);
-}
-
-.wf-timeline-scroll,
-.wf-parallel-track {
-  border-color: var(--border-soft);
-  border-radius: var(--radius-lg);
-}
-
-.wf-approval-box {
-  border-radius: var(--radius-lg);
-  background: color-mix(in srgb, var(--warning) 10%, var(--surface));
-}
-
-.wf-terminal-actions,
-.wf-resume-status,
-.wf-terminal-frame,
-.wf-io-pre {
-  border-color: var(--border-soft);
 }
 
 @media (max-width: 1180px) {
@@ -21034,7 +20821,7 @@ dialog select[multiple]:hover:not(:disabled) {
   min-width: 0;
 }
 
-.bot-defaults-page .bd-substitute-target-row > :where(.bd-field-menu, input) {
+.bot-defaults-page .bd-substitute-target-row > :where(.bd-field-menu, input, .bd-substitute-target-name) {
   min-width: 0;
 }
 
@@ -21133,6 +20920,67 @@ dialog select[multiple]:hover:not(:disabled) {
   .bot-defaults-page .bd-substitute-target-id { grid-area: id; }
   .bot-defaults-page .bd-substitute-target-name { grid-area: name; }
   .bot-defaults-page .bd-substitute-target-remove { grid-area: remove; }
+}
+
+.bot-defaults-page .bd-substitute-target-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.bot-defaults-page .bd-substitute-target-name > input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.bot-defaults-page .bd-substitute-target-name > input:disabled {
+  background: transparent;
+  color: var(--text);
+  opacity: 1;
+  cursor: default;
+}
+
+.bot-defaults-page .bd-substitute-target-name-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-height: 26px;
+  padding: 4px 16px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: none;
+}
+
+:root[data-theme="dark"] .bot-defaults-page .bd-substitute-target-name-chip {
+  color: var(--bg);
+}
+
+.bot-defaults-page .bd-substitute-target-resolving {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.bot-defaults-page .bd-substitute-target-resolution-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border-soft));
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface-muted));
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
 }
 
 .bot-defaults-page .bd-field-menu {

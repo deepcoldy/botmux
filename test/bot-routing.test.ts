@@ -144,6 +144,13 @@ describe('buildFooterAddressing', () => {
     )).toEqual({ sendTo: 'ou_owner', cc: [] });
   });
 
+  it('uses the current caller for a substitute-triggered reply outside oncall chats', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_substitute_caller' },
+      { isOncall: false, isSubstitute: true, knownBotOpenIds },
+    )).toEqual({ sendTo: 'ou_substitute_caller', cc: [] });
+  });
+
   it('uses the last caller in oncall chats when the caller is human', () => {
     expect(buildFooterAddressing(
       { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_human_caller' },

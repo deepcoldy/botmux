@@ -30,6 +30,19 @@ vi.mock('../src/services/substitute-chat-toggle-store.js', () => ({
   setSubstituteEnabledForChat: (...a: any[]) => mockSetSubstituteEnabledForChat(...a),
 }));
 
+const mockGetBot = vi.fn(() => ({
+  config: {
+    substituteMode: {
+      enabled: true,
+      targets: [{ openId: 'ou_sub' }],
+      topicGroups: true,
+    },
+  },
+}));
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: (...a: any[]) => mockGetBot(...a),
+}));
+
 vi.mock('../src/i18n/index.js', () => ({
   t: (key: string) => key,
   localeForBot: () => 'zh',
@@ -67,6 +80,15 @@ describe('tryHandleSubstituteCommand', () => {
     mockCanTalk.mockReturnValue(true);
     mockGetChatMode.mockResolvedValue('group');
     mockIsSubstituteEnabledForChat.mockReturnValue(true);
+    mockGetBot.mockReturnValue({
+      config: {
+        substituteMode: {
+          enabled: true,
+          targets: [{ openId: 'ou_sub' }],
+          topicGroups: true,
+        },
+      },
+    });
   });
 
   it('non-command messages are ignored', async () => {
@@ -99,12 +121,34 @@ describe('tryHandleSubstituteCommand', () => {
     expect(lastReply()).toBe('cmd.substitute.owner_only');
   });
 
-  it('only works in regular groups', async () => {
+  it('rejects p2p but accepts topic groups (per-chat toggle applies to both group kinds)', async () => {
     await tryHandleSubstituteCommand(APP, msg('/substitute off', 'p2p'), USER);
     expect(lastReply()).toBe('cmd.substitute.unsupported');
 
+    // 话题群同样支持 per-chat 开关（话题群替身支持随 PR 放开）。
     mockGetChatMode.mockResolvedValue('topic');
     await tryHandleSubstituteCommand(APP, msg('/substitute off'), USER);
-    expect(lastReply()).toBe('cmd.substitute.unsupported');
+    expect(lastReply()).toBe('cmd.substitute.updated_off');
+    expect(mockSetSubstituteEnabledForChat).toHaveBeenCalledWith(APP, 'oc_group', false);
+  });
+
+  it('topicGroups=false reports the bot-level disable instead of a false per-chat success', async () => {
+    mockGetChatMode.mockResolvedValue('topic');
+    mockGetBot.mockReturnValue({
+      config: {
+        substituteMode: {
+          enabled: true,
+          targets: [{ openId: 'ou_sub' }],
+          topicGroups: false,
+        },
+      },
+    });
+
+    await tryHandleSubstituteCommand(APP, msg('/substitute status'), USER);
+    expect(lastReply()).toBe('cmd.substitute.topic_disabled');
+
+    await tryHandleSubstituteCommand(APP, msg('/substitute on'), USER);
+    expect(lastReply()).toBe('cmd.substitute.topic_disabled');
+    expect(mockSetSubstituteEnabledForChat).not.toHaveBeenCalled();
   });
 });

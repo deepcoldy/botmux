@@ -318,7 +318,7 @@ describe('dashboard monitoring session table', () => {
     expect(css).toMatch(/\.ui-info-pop\s*\{[^}]*white-space:\s*pre-line/s);
   });
 
-  it('layers resource metric help popovers above following panels', () => {
+  it('layers resource metric help popovers above following panels and keeps them interactive', () => {
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
 
     expect(css).toMatch(/\.resource-page\s*\{[^}]*isolation:\s*isolate/s);

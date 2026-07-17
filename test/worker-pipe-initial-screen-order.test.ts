@@ -206,4 +206,16 @@ describe('worker pipe initial screen ordering', () => {
     expect(herdrBlock).toContain('cfg.adoptCwd ?? cfg.workingDir');
     expect(herdrBlock).toContain('herdrBe.cliCwd');
   });
+
+  it('wires Herdr adopt snapshots before seeding the initial screen', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const herdrStart = source.indexOf("cfg.adoptSource === 'herdr'");
+    const herdrEnd = source.indexOf("log(`Adopt mode (herdr):", herdrStart);
+    const herdrBlock = source.slice(herdrStart, herdrEnd);
+
+    const relayIdx = herdrBlock.indexOf('wireHerdrWebTerminalRelays(herdrBe);');
+    const seedIdx = herdrBlock.indexOf("seedBackendScreen('herdr adopt', herdrBe);");
+    expect(relayIdx).toBeGreaterThan(-1);
+    expect(seedIdx).toBeGreaterThan(relayIdx);
+  });
 });

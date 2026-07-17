@@ -21,7 +21,7 @@ import {
   beginWebhookLifecycleFiring,
   failWebhookLifecycleGroup,
 } from '../services/webhook-lifecycle-store.js';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
 import { dispatchTriggerRequest, newTriggerId, queryTriggerResult, type TriggerApiDeps } from './trigger-api.js';
 
 const replayNonces = new Map<string, number>();
@@ -203,7 +203,9 @@ function dynamicRootMessageId(req: IncomingMessage, url: URL, payload: unknown):
 function parseTriggerResponseOptions(
   req: IncomingMessage,
   url: URL,
-): { waitForFinalOutput?: true; asyncReturnSessionId?: true; timeoutMs?: number } {
+): { dryRun?: true; waitForFinalOutput?: true; asyncReturnSessionId?: true; timeoutMs?: number } {
+  const rawDryRun = url.searchParams.get('dryRun') ?? headerValue(req, 'x-botmux-dry-run');
+  const dryRun = rawDryRun === '1' || rawDryRun === 'true' || rawDryRun === 'yes';
   const rawWait = url.searchParams.get('wait') ?? headerValue(req, 'x-botmux-wait');
   const wait = rawWait === '1' || rawWait === 'true' || rawWait === 'yes';
   const rawAsync = url.searchParams.get('async') ?? headerValue(req, 'x-botmux-async');
@@ -211,6 +213,7 @@ function parseTriggerResponseOptions(
   const rawTimeout = url.searchParams.get('timeoutMs') ?? headerValue(req, 'x-botmux-timeout-ms');
   const timeoutMs = rawTimeout ? Number(rawTimeout) : undefined;
   return {
+    ...(dryRun ? { dryRun: true } : {}),
     ...(wait ? { waitForFinalOutput: true } : {}),
     ...(asyncReturnSessionId ? { asyncReturnSessionId: true } : {}),
     ...(Number.isFinite(timeoutMs) ? { timeoutMs } : {}),
@@ -430,6 +433,19 @@ export async function handleWebhookRoute(
   }
 
   const responseOptions = parseTriggerResponseOptions(req, url);
+  // Stored workflow connectors are tombstones only after the v2 runtime
+  // retirement. Fail before lifecycle state or group creation; dispatching to
+  // a daemon would make the safety property depend on daemon version/skew.
+  if (connector.target.kind === 'workflow') {
+    webhookError(
+      res,
+      410,
+      connectorId,
+      'legacy_workflow_retired',
+      'v2 workflow connector targets are retired; migrate the definition and replace this connector with a turn target',
+    );
+    return true;
+  }
   if ((responseOptions.waitForFinalOutput || responseOptions.asyncReturnSessionId) && connector.target.kind !== 'turn') {
     fail(400, 'bad_request', 'wait mode is only supported for turn connectors');
     return true;
@@ -477,6 +493,19 @@ export async function handleWebhookRoute(
     return true;
   }
   if (connector.target.mode === 'new-group') {
+    // A turn-targeted dry-run cannot be truthfully preflighted before a chat
+    // exists. Never satisfy a read-only request by creating lifecycle state or
+    // a Feishu group; reject it explicitly instead.
+    if (responseOptions.dryRun && connector.target.kind === 'turn') {
+      webhookError(
+        res,
+        400,
+        connectorId,
+        'bad_request',
+        'dryRun is not supported for new-group turn connectors because no target chat exists yet',
+      );
+      return true;
+    }
     // Dedup is optional. Configured → events with the same extracted value share
     // one group (create once, reuse after). Not configured → every event spins
     // up a fresh group. (No firing/resolved status; groups are never auto-closed.)
@@ -492,7 +521,14 @@ export async function handleWebhookRoute(
         return true;
       }
       dedupKey = value;
-      const begun = await beginWebhookLifecycleFiring(connector.id, dedupKey);
+    }
+
+    if (dedupPath) {
+      // Extraction above either returned or assigned this value. Keep the
+      // narrowed alias local to the lifecycle branch so every side-effecting
+      // store/group call receives the exact preflighted key.
+      const lifecycleDedupKey = dedupKey!;
+      const begun = await beginWebhookLifecycleFiring(connector.id, lifecycleDedupKey);
       if (begun.action === 'creating') {
         jsonRes(res, 202, {
           ...webhookOkLog(connector.id, 'ignored', 'lifecycle group creation already in progress', 202, auditMeta()),
@@ -505,21 +541,21 @@ export async function handleWebhookRoute(
         chatId = begun.record.chatId;
       } else {
         if (!deps.createLifecycleGroup) {
-          await failWebhookLifecycleGroup(connector.id, dedupKey, begun.record.lifecycleId);
+          await failWebhookLifecycleGroup(connector.id, lifecycleDedupKey, begun.record.lifecycleId);
           fail(501, 'group_create_failed', 'createLifecycleGroup hook not configured');
           return true;
         }
         let created: { chatId: string; creatorLarkAppId?: string };
         try {
-          created = await deps.createLifecycleGroup(connector, { dedupKey });
+          created = await deps.createLifecycleGroup(connector, { dedupKey: lifecycleDedupKey });
         } catch (e: any) {
-          await failWebhookLifecycleGroup(connector.id, dedupKey, begun.record.lifecycleId);
+          await failWebhookLifecycleGroup(connector.id, lifecycleDedupKey, begun.record.lifecycleId);
           fail(502, 'group_create_failed', e?.message ?? String(e));
           return true;
         }
         const activated = await activateWebhookLifecycleGroup(
           connector.id,
-          dedupKey,
+          lifecycleDedupKey,
           begun.record.lifecycleId,
           created.chatId,
           { creatorLarkAppId: created.creatorLarkAppId },

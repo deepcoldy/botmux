@@ -9,7 +9,7 @@ import type {
   VcMeetingConsumerConfig,
   VcMeetingConsumerProfileConfig,
 } from '../types.js';
-import { canonicalJson } from '../workflows/events/idempotency.js';
+import { canonicalJson } from '../utils/canonical-input-hash.js';
 import {
   readRawConfig,
   requireConfigPath,

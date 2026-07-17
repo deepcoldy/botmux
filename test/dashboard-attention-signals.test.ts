@@ -190,7 +190,9 @@ describe('attention signals', () => {
     expect(clearIdx).toBeGreaterThanOrEqual(0);
     for (const marker of [
       'isCallbackUrl(content)',
-      'handleWorkflowCommandIfAny',
+      'handleV3SavedWorkflowCommandIfAny',
+      'parseWorkflowGrillTrigger',
+      'isLegacyTemplateCommand',
       'parseSlashCommandInvocation',
       'findPendingAskByAnchor',
     ]) {

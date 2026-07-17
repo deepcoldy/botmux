@@ -757,6 +757,8 @@ export interface SubstituteTarget {
   email?: string;
   /** Human-readable label for prompt disclosure. */
   name?: string;
+  /** Cached avatar URL so the dashboard can show the resolved person's picture. */
+  avatarUrl?: string;
 }
 
 export interface SubstituteModeConfig {
@@ -764,6 +766,22 @@ export interface SubstituteModeConfig {
   targets: SubstituteTarget[];
   /** prefix = disclose "I will answer on behalf of X"; none = no extra disclosure instruction. */
   disclosure?: 'prefix' | 'none';
+  /** Optional allow-list of chat IDs. When provided, substitute trigger only fires in these chats. */
+  chats?: string[];
+  /** When true, do not automatically DM the owner a control card for substitute-mode sessions. */
+  disableControlCard?: boolean;
+  /** How the bot replies to a substitute-mode trigger:
+   *  - 'thread' (default): reply in a Lark thread under the trigger message.
+   *  - 'quote': quote-reply the trigger message without creating a new topic.
+   */
+  replyMode?: 'thread' | 'quote';
+  /** 话题群支持：在话题群（chat_mode=topic）里也响应替身触发。替身回合沿话题
+   *  路由进该话题自己的会话（无会话则新开），与普通群「进群 chat-scope 会话」
+   *  同构。缺省 true；显式 false 关闭。 */
+  topicGroups?: boolean;
+  /** 话题里已有本 bot 活跃会话时是否仍触发替身（替身回合注入该会话）。false 时
+   *  回落到原让路行为（@别人=转交别人，保持沉默）。仅话题群路径生效，缺省 true。 */
+  topicActiveSessionTrigger?: boolean;
 }
 
 export interface VcMeetingAgentConfig {
@@ -993,6 +1011,19 @@ export interface BotConfig {
   /** Additional plugin ids enabled only for this bot. */
   plugins?: string[];
   /**
+   * 私聊对话全开（默认关闭）。开启后**任何人都能和本 bot 私聊**（talk-only），无需
+   * 逐个加 globalGrants —— 谁能私聊由飞书应用的「可用范围」控制，botmux 侧不再设闸。
+   *
+   * **只放行 canTalk，canOperate 绝不读它**：`/restart`、`/cd`、`/repo`、卡片按钮等
+   * 管理操作仍只认 allowedUsers。与 oncall（群维度的 talk-open，管理权仍限 owner）
+   * 是同一个安全模型，本字段只是把它补到 p2p 维度——oncall/defaultOncall 明确不绑
+   * p2p（oncall-store.ts 的 `chatType !== 'group'` 短路），故私聊此前只有「逐人白名单」
+   * 与「三张名单全空 → 人人是 admin」两个极端。
+   *
+   * 不影响群：群里仍按 allowedUsers / allowedChatGroups / oncall / grants 判定。
+   */
+  p2pOpen?: boolean;
+  /**
    * 消息额度机制（默认关闭）。`defaultLimit` 的"是否配置"本身就是开关：
    *   • 未配置（undefined）→ 关闭：无显式数字的 /grant 仍是"无限授权"（当前行为）。
    *   • 配置正整数 D    → 开启默认额度：`/grant @x`（不带数字）套用 D 条额度。
@@ -1010,7 +1041,7 @@ export interface BotConfig {
   /**
    * 开启后：仅靠 per-user 授权（chatGrants / globalGrants）放行的发送者，禁止使用**任何
    * 斜杠命令**——botmux 自身的 DAEMON 命令、透传（PASSTHROUGH）命令、全部 `/workflow`
-   * （即兴 grill）/ `/template`（跑模板）子命令、`/introduce`、`/t`/`/topic` —— 只能普通对话。owner / allowedUsers / oncall /
+   * 子命令、已退休的 `/template` tombstone、`/introduce`、`/t`/`/topic` —— 只能普通对话。owner / allowedUsers / oncall /
    * allowedChatGroup 整群成员不受影响。判定以 slash-command invocation 命中为准（不是"凡以
    * `/` 开头的文本"，避免误伤讨论命令用法的普通对话）。默认 false（保持现状：被授权人可用透传）。
    */
@@ -1065,6 +1096,11 @@ export interface BotConfig {
    * routing or permissions.
    */
   brandLabel?: string;
+  /**
+   * botmux slash 可注入的 CLI 原生斜杠命令 allowlist（如 ["/compact","/model"]）。
+   * 缺省/空 = 通用注入关闭。/cd 永远被拒（见 core/slash-inject.ts）。
+   */
+  tuiSlashAllow?: string[];
   /**
    * When true, suppress the live streaming session card entirely. The web
    * terminal still runs and the final answer still arrives via `botmux send`;
@@ -1356,6 +1392,12 @@ export function registerBot(cfg: BotConfig): BotState {
     resolvedAllowedUsers: [...(cfg.allowedUsers ?? [])],
     rawAllowedUserResolution: new Map(),
   };
+  // p2pOpen 是一次显式的权限边界声明（进入限制态），但它只授 talk。没有 allowedUsers 就
+  // 没有任何人能 operate（/restart、/cd、卡片按钮全锁死），也没有 owner 可以处置授权卡 ——
+  // 这几乎肯定是配错了，明确告警而不是静默把 bot 变成谁也管不了的状态。
+  if (cfg.p2pOpen === true && (cfg.allowedUsers?.length ?? 0) === 0) {
+    logger.warn(`[bot:${cfg.larkAppId}] p2pOpen 已开启但未配 allowedUsers：任何人都能私聊，但没有人能执行管理操作（/restart、/cd、卡片按钮）。请补上 allowedUsers。`);
+  }
   bots.set(cfg.larkAppId, state);
   return state;
 }
@@ -1533,6 +1575,15 @@ export function resolveBrandLabel(larkAppId: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * 只读 accessor：该 bot 配置的 tuiSlashAllow allowlist（TUI 通用 slash 注入用）。
+ * 仅读内存态注册表，daemon 进程内使用；无需 bots.json 磁盘回退（不同于
+ * resolveBrandLabel——`botmux send` 等一次性 CLI 进程不消费此 accessor）。
+ */
+export function getBotTuiSlashAllow(larkAppId: string): string[] | undefined {
+  return bots.get(larkAppId)?.config.tuiSlashAllow;
 }
 
 /**
@@ -1720,6 +1771,23 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (uniq.length > 0) customPassthroughCommands = uniq;
     }
 
+    // tuiSlashAllow：botmux 通用 slash 注入通道（inject_command，见
+    // core/slash-inject.ts）的 CLI 原生命令 allowlist。归一化规则与
+    // customPassthroughCommands 同款：转小写、自动补前导 `/`、按
+    // /^\/[a-z0-9][a-z0-9:_-]*$/ 过滤非法项、去重。非法/缺省/空 → undefined
+    // （= 通用注入关闭，默认拒绝）。/cd 即使写在这里也会被
+    // validateSlashInjection 的固定黑名单挡住，这里不重复过滤。
+    let tuiSlashAllow: string[] | undefined;
+    if (Array.isArray(entry.tuiSlashAllow)) {
+      const normalized = entry.tuiSlashAllow
+        .filter((x: any): x is string => typeof x === 'string')
+        .map((x: string) => x.trim().toLowerCase())
+        .map((x: string) => (x.startsWith('/') ? x : `/${x}`))
+        .filter((x: string) => /^\/[a-z0-9][a-z0-9:_-]*$/.test(x));
+      const uniq = [...new Set<string>(normalized)];
+      if (uniq.length > 0) tuiSlashAllow = uniq;
+    }
+
     // startupCommands：开会话后、首条 prompt 前自动敲进 CLI 的 slash 命令行（可带
     // 参数，如 `/effort ultracode`）。归一化：去多余空白、补前导 `/`、去重；空 →
     // undefined（与 customPassthroughCommands 同款"不写空数组保持干净"）。
@@ -1812,12 +1880,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       chatReplyModes,
       chatGrants,
       globalGrants,
+      // 只落显式 true（undefined = 关），与 restrictGrantCommands 同款，保持 bots.json 干净。
+      p2pOpen: entry.p2pOpen === true || undefined,
       messageQuota,
       quotaState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       // Default is ON, so only explicit false is meaningful/persisted.
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
       customPassthroughCommands,
+      tuiSlashAllow,
       startupCommands,
       env,
       skills,

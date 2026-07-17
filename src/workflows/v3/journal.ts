@@ -7,15 +7,29 @@
  * checkpoint.  Concurrency / retry / gate / cancel / failure-root-cause all
  * leave an ordered trail here.
  *
- * Append-only + line-oriented = crash-tolerant by construction: a torn final
- * line (process died mid-write) is skipped on read; everything before it is
- * intact.  No locking needed for the journal itself — appends are serialized
- * by the single runtime loop (the per-node LOCK guards worker dispatch, not
- * the journal).
+ * Append-only + line-oriented is crash-tolerant only when the next writer
+ * repairs an interrupted FINAL line first. Read-only projections may ignore
+ * that tail, but appending after it would concatenate two JSON objects and
+ * permanently corrupt the history. Every mutation therefore takes the same
+ * cross-process journal lock and repairs an unterminated tail before writing
+ * the next event.
  */
 
-import { appendFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  fstatSync,
+  ftruncateSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+} from 'node:fs';
 import { dirname } from 'node:path';
+import { fsyncDirectorySyncPortable } from '../../utils/fs-durability.js';
+import { withFileLockSync } from '../../utils/file-lock.js';
 import type { GoalAsk } from './contract.js';
 
 // ─── Event taxonomy ─────────────────────────────────────────────────────────
@@ -32,6 +46,17 @@ export type V3ErrorClass =
   | 'cancelled';       // run cancelled out from under the node
 
 export type V3RunFailureReason = 'allSinksSkipped';
+
+/** Bounded, privacy-safe identity for an external effect whose final provider
+ *  outcome cannot be proved. Full inputs/errors stay in the protected attempt
+ *  artifacts and logs; terminal cards only need this machine-readable tuple. */
+export interface V3UncertainHostEffect {
+  nodeId: string;
+  instanceId: string;
+  attemptId: string;
+  executor: string;
+  errorCode: string;
+}
 
 /**
  * The MVP event union.  Static DAG + fail-fast, so the lifecycle is small:
@@ -61,6 +86,70 @@ export type V3Event =
   // carry their own expanded nodeId) omit it, and consumers fall back to
   // nodeId-keyed behavior (instance restoration design 2026-06-08).
   | { type: 'nodeDispatched'; nodeId: string; instanceId?: string; attemptId: string; loop?: V3LoopRef }
+  // Host preparation is NOT a dispatch and carries no claim that a provider
+  // call began. It freezes the exact parsed input before a runtime gate. The
+  // host rail intentionally never emits nodeDispatched/worker-fence events.
+  | {
+      type: 'hostInputPrepared';
+      nodeId: string;
+      instanceId: string;
+      attemptId: string;
+      executor: string;
+      provider: string;
+      inputRef: { path: string; sha256: string; bytes: number };
+      inputHash: string;
+      idempotencyKey: string;
+      idempotencyTtlMs: number;
+      approvalDigest: string;
+    }
+  // The linearization boundary for an external side effect. Durable BEFORE
+  // provider invocation; recovery of an open intent must use this exact
+  // attempt/key/input and must never mint a generic orphan retry.
+  | {
+      type: 'hostEffectIntent';
+      nodeId: string;
+      instanceId: string;
+      attemptId: string;
+      executor: string;
+      provider: string;
+      inputRef: { path: string; sha256: string; bytes: number };
+      inputHash: string;
+      idempotencyKey: string;
+      idempotencyTtlMs: number;
+      approvalDigest: string;
+    }
+  // Close proof for the host ledger when the provider outcome cannot be
+  // established without risking a duplicate effect. Ordinary runs become
+  // blocked; cancellation carries the bounded identities into runCancelled.
+  | {
+      type: 'hostEffectUncertain';
+      nodeId: string;
+      instanceId: string;
+      attemptId: string;
+      executor: string;
+      reason:
+        | 'ttlExpired'
+        | 'inputUnrecoverable'
+        | 'outputUnrecoverable'
+        | 'definitionMismatch'
+        | 'unknownProvider'
+        | 'inputHashMismatch'
+        | 'providerUncertain';
+      errorCode: string;
+    }
+  | {
+      type: 'hostEffectRetryDeferred';
+      nodeId: string;
+      instanceId: string;
+      attemptId: string;
+      retryCount: number;
+      nextRetryAt: number;
+      errorCode: string;
+    }
+  // Durable proof that the attempt's pre-fork worker fence was published
+  // before factory.spawn(). Recovery treats a missing/corrupt fence after this
+  // marker as unknown until process discovery proves no outer worker remains.
+  | { type: 'nodeWorkerFenceArmed'; nodeId: string; instanceId?: string; attemptId: string }
   // Written when the node's worker web terminal is ready (mid-run) so the
   // dashboard can attach to an in-flight node's LIVE terminal instead of waiting
   // for completion.  Kept even if the node later fails (terminal info survives).
@@ -104,6 +193,8 @@ export type V3Event =
       reason: 'blockedRetry';
       previousErrorClass?: V3ErrorClass;
       previousErrorCode?: string;
+      /** Host pre-intent retry must approve the newly frozen attempt again. */
+      resetGate?: boolean;
       // Present ONLY when the retry answers a runtime human-ask: the human's
       // selected option or free-text answer, persisted to `answer.path` (an absolute path, next to
       // the asked attempt).  buildInputs injects it into the retry attempt's
@@ -113,8 +204,10 @@ export type V3Event =
     }
   // Gate is per-INSTANCE: `A#001`'s approval must not clear `A#002` after a
   // revisit (constraint 6).  `instanceId` optional for back-compat.
-  | { type: 'gateDispatched'; nodeId: string; instanceId?: string; waitId: string }
-  | { type: 'gateResolved'; nodeId: string; instanceId?: string; waitId: string; resolution: 'approved' | 'rejected'; by: string; selected?: string }
+  | { type: 'gateDispatched'; nodeId: string; instanceId?: string; waitId: string;
+      hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string } }
+  | { type: 'gateResolved'; nodeId: string; instanceId?: string; waitId: string; resolution: 'approved' | 'rejected'; by: string; selected?: string;
+      hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string } }
   // ── edge activation lifecycle ──
   // Conditional edge predicates read a source node's validated result.json
   // exactly once, then persist the verdict here.  Replay / dashboards /
@@ -137,17 +230,32 @@ export type V3Event =
   // It is not a failure and does not trigger fail-fast; its outgoing edges
   // become inactive by pure derivation from node state + static DAG.
   | { type: 'nodeSkipped'; nodeId: string; reason: 'triggerRuleUnsatisfied'; detail?: string }
-  // A neutral terminal for early-release losers.  This is deliberately NOT
-  // nodeFailed(errorClass:'cancelled'): cancellation means "no longer needed",
-  // not "requires intervention", and must not trip the fail-fast sweep.
-  | {
+  // A neutral terminal for early-release losers and run-level cancellation.
+  // This is deliberately NOT nodeFailed(errorClass:'cancelled'): cancellation
+  // means "no longer needed", not "requires intervention", and must not trip
+  // the fail-fast sweep.  `byNodeId` is mandatory only for an early-release
+  // winner; user cancellation carries the durable run-level actor instead.
+  | ({
       type: 'nodeCancelled';
       nodeId: string;
       instanceId?: string;
       attemptId?: string;
-      reason: 'earlyReleaseLoser';
-      byNodeId: string;
       detail?: string;
+    } & (
+      | { reason: 'earlyReleaseLoser'; byNodeId: string }
+      | { reason: 'runCancelled'; cancelRequestId: string }
+    ))
+  // Durable resource close proof for an attempt whose normal node verdict was
+  // intentionally discarded (terminal peer teardown, obsolete revisit/
+  // early-release work, or crash recovery). This event may be appended after a
+  // run terminal while cleaning up a pre-fix history; it never changes the run
+  // verdict by itself.
+  | {
+      type: 'nodeAttemptDrained';
+      nodeId: string;
+      instanceId?: string;
+      attemptId: string;
+      reason: 'terminalPeer' | 'obsoleteAttempt' | 'orphanRecovery' | 'runCancellation';
     }
   // ── cross-node revisit / instance lifecycle (instance restoration 2026-06-08) ──
   // A node's worker emitted result.json `status:"revisit"` requesting a jump
@@ -223,6 +331,17 @@ export type V3Event =
   // loop analogue of nodeRetryRequested — journal event, never an in-memory
   // patch).  Consumed by the next loopIterationStarted.
   | { type: 'loopIterationGranted'; loopId: string; fromIteration: number; by?: string }
+  // Durable user intent is its own boundary.  Runtime treats every later
+  // non-cancellation settle as stale, aborts live workers, neutral-cancels all
+  // unfinished nodes, then appends runCancelled.  A crash between these two
+  // records is recoverable by replay + cold re-drive.
+  | { type: 'runCancelRequested'; cancelRequestId: string; by: string; reason?: string }
+  | {
+      type: 'runCancelled';
+      cancelRequestId: string;
+      by: string;
+      uncertainHostEffects?: V3UncertainHostEffect[];
+    }
   | { type: 'runSucceeded' }
   | { type: 'runFailed'; failedNodeId?: string; reason?: V3RunFailureReason; detail?: string }
   // Terminal-for-now: every non-done path is blocked (recoverable).  A retry
@@ -235,6 +354,148 @@ export type StoredEvent = V3Event & { ts: number };
 
 // ─── Append ─────────────────────────────────────────────────────────────────
 
+export interface JournalMutation {
+  /** Lazy snapshot; access it before calling append when doing read/check/write. */
+  readonly events: readonly StoredEvent[];
+  /** Append while retaining the mutation's already-held cross-process lock. */
+  append(event: V3Event, options?: { durable?: boolean }): StoredEvent;
+}
+
+function fsyncFile(journalPath: string): void {
+  const fd = openSync(journalPath, 'r');
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Parse NDJSON while optionally tolerating only the physical unterminated tail. */
+function parseJournalText(
+  raw: string,
+  journalPath: string,
+  tolerateTornFinal: boolean,
+): StoredEvent[] {
+  const lines = raw.split('\n');
+  const out: StoredEvent[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i]!.trim();
+    if (!trimmed) continue;
+    try {
+      out.push(JSON.parse(trimmed) as StoredEvent);
+    } catch (err) {
+      // Only the physical final segment can be torn. An invalid line followed
+      // by a newline is committed corruption even when trailing whitespace
+      // makes it the last non-empty line.
+      if (tolerateTornFinal && i === lines.length - 1 && !raw.endsWith('\n')) break;
+      throw new Error(
+        `v3 journal corrupted at line ${i + 1} of ${journalPath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  return out;
+}
+
+/**
+ * Validate committed records and normalize an unterminated tail before a
+ * writer appends. A syntactically complete JSON tail is preserved and sealed
+ * with `\n`; an incomplete tail is truncated to the last newline. Repair
+ * bytes are fsynced before the next append, and any already-terminated corrupt
+ * record fails closed.
+ */
+function repairJournalTailForMutation(journalPath: string): void {
+  if (!existsSync(journalPath)) return;
+  // The healthy hot path reads one byte, not the full journal. Runtime and
+  // host control paths already replay before deciding what to append; this
+  // boundary's extra responsibility is preventing a torn physical tail from
+  // being glued to the next record.
+  const probeFd = openSync(journalPath, 'r');
+  try {
+    const size = fstatSync(probeFd).size;
+    if (size === 0) return;
+    const lastByte = Buffer.allocUnsafe(1);
+    readSync(probeFd, lastByte, 0, 1, size - 1);
+    if (lastByte[0] === 0x0a) return;
+  } finally {
+    closeSync(probeFd);
+  }
+
+  // Recovery is exceptional, so a full validation/read here is intentional:
+  // it proves every committed prefix line before repairing only the tail.
+  const raw = readFileSync(journalPath);
+  parseJournalText(raw.toString('utf-8'), journalPath, true);
+  const lastNewline = raw.lastIndexOf(0x0a);
+  const tail = raw.subarray(lastNewline + 1).toString('utf-8');
+  let completeJson = false;
+  if (tail.trim()) {
+    try {
+      JSON.parse(tail.trim());
+      completeJson = true;
+    } catch {
+      // A read-only projection may ignore this tail; mutation removes it so
+      // the next JSON object can never be glued onto the interrupted record.
+    }
+  }
+
+  if (completeJson) {
+    appendFileSync(journalPath, '\n');
+    fsyncFile(journalPath);
+  } else {
+    const fd = openSync(journalPath, 'r+');
+    try {
+      ftruncateSync(fd, lastNewline + 1);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  }
+  // Conservative: explicitly persist the repair boundary as a whole, even
+  // though truncating an existing inode does not normally change its dirent.
+  fsyncDirectorySyncPortable(dirname(journalPath));
+}
+
+/**
+ * Run one read/check/append mutation under the journal's sole lock. Callers
+ * such as start-intent use this instead of nesting a file lock around
+ * appendEvent (the generic file lock is deliberately non-reentrant).
+ */
+export function withJournalMutationSync<T>(
+  journalPath: string,
+  fn: (mutation: JournalMutation) => T,
+): T {
+  const dir = dirname(journalPath);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  return withFileLockSync(journalPath, () => {
+    repairJournalTailForMutation(journalPath);
+    let eventsSnapshot: StoredEvent[] | undefined;
+    let appended = false;
+    let journalExisted = existsSync(journalPath);
+    const append = (event: V3Event, options: { durable?: boolean } = {}): StoredEvent => {
+      const stored: StoredEvent = { ts: Date.now(), ...event };
+      const created = !journalExisted;
+      appendFileSync(journalPath, JSON.stringify(stored) + '\n');
+      appended = true;
+      journalExisted = true;
+      if (options.durable) {
+        fsyncFile(journalPath);
+        if (created) fsyncDirectorySyncPortable(dirname(journalPath));
+      }
+      return stored;
+    };
+    return fn({
+      get events() {
+        // Generic appendEvent never pays a full replay. Atomic read/check/
+        // append callers opt in by accessing this lazy snapshot.
+        if (appended && eventsSnapshot === undefined) {
+          throw new Error('journal mutation events must be read before the first append');
+        }
+        return eventsSnapshot ??= readJournal(journalPath);
+      },
+      append,
+    });
+  });
+}
+
 /**
  * Append one event as a single NDJSON line.  Stamps `ts` (epoch ms) at write
  * time.  Creates the parent directory if missing so the very first
@@ -245,11 +506,18 @@ export type StoredEvent = V3Event & { ts: number };
  * open a window where `decideNext` runs against stale state.
  */
 export function appendEvent(journalPath: string, event: V3Event): StoredEvent {
-  const stored: StoredEvent = { ts: Date.now(), ...event };
-  const dir = dirname(journalPath);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  appendFileSync(journalPath, JSON.stringify(stored) + '\n');
-  return stored;
+  return withJournalMutationSync(journalPath, ({ append }) => append(event));
+}
+
+/**
+ * Append an event and force both its bytes and a newly-created journal dirent
+ * to stable storage before returning. Reserved for host acknowledgement
+ * boundaries (for example `/start` returning HTTP 202) and resource-close
+ * proofs that must reach disk before a worker fence is removed. Other hot
+ * runtime transitions keep using {@link appendEvent}.
+ */
+export function appendEventDurable(journalPath: string, event: V3Event): StoredEvent {
+  return withJournalMutationSync(journalPath, ({ append }) => append(event, { durable: true }));
 }
 
 // ─── Read / replay ────────────────────────────────────────────────────────
@@ -264,25 +532,5 @@ export function appendEvent(journalPath: string, event: V3Event): StoredEvent {
  */
 export function readJournal(journalPath: string): StoredEvent[] {
   if (!existsSync(journalPath)) return [];
-  const raw = readFileSync(journalPath, 'utf-8');
-  const lines = raw.split('\n');
-  // Only the last non-empty line can legitimately be a half-written append.
-  let lastNonEmpty = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i]!.trim()) { lastNonEmpty = i; break; }
-  }
-  const out: StoredEvent[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i]!.trim();
-    if (!trimmed) continue;
-    try {
-      out.push(JSON.parse(trimmed) as StoredEvent);
-    } catch (err) {
-      if (i === lastNonEmpty) break; // torn final line from an interrupted append — tolerate
-      throw new Error(
-        `v3 journal corrupted at line ${i + 1} of ${journalPath}: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  }
-  return out;
+  return parseJournalText(readFileSync(journalPath, 'utf-8'), journalPath, true);
 }

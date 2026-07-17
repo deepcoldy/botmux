@@ -300,10 +300,82 @@ export async function resolveUnionIdFromOpenId(
   }
 }
 
-/** 用户资料（名字+头像）查询缓存：key = appId:idType:id。负结果也缓存——
- *  不在通讯录可见范围（41050）的用户每次查都会失败，别反复打 API。 */
-const userProfileCache = new Map<string, { name: string; avatarUrl?: string } | null>();
+/** 用户资料（名字+头像）查询缓存：key = appId:idType:id。字符串值 = 确定性
+ *  负结果的类别（跨应用/不可见/无效 id），每次查都会失败，别反复打 API。
+ *  瞬时失败（网络/频控/服务端 40003）不缓存——下次调用应当重试，负缓存瞬时
+ *  错误会把合法用户长期钉成「查不到」。 */
+type DefinitiveProfileMiss = 'cross_app' | 'not_visible' | 'invalid_id';
+const userProfileCache = new Map<string, { name: string; avatarUrl?: string } | DefinitiveProfileMiss>();
 const USER_PROFILE_CACHE_MAX = 1000;
+
+/** Contact API 确定性失败码 → 类别（重试也不会变）：99992361 open_id 属其他
+ *  应用；41050 无权限看该用户（不在通讯录可见范围）；41012 user id 无效 /
+ *  40001 参数无效。其余非零码（如 40003 internal error）与网络异常视为瞬时。
+ *  SDK 基于 Axios，非 2xx 以异常抛出、业务码在 response.data.code——调用方
+ *  的 catch 也要走这里（getLarkErrorCode 提取）。 */
+function classifyContactErrorCode(code: number | undefined): DefinitiveProfileMiss | undefined {
+  if (code === 99992361) return 'cross_app';
+  if (code === 41050) return 'not_visible';
+  if (code === 41012 || code === 40001) return 'invalid_id';
+  return undefined;
+}
+
+export type UserProfileLookup =
+  | { status: 'ok'; profile: { name: string; avatarUrl?: string } }
+  /** Definitive: the open_id belongs to another app (99992361). */
+  | { status: 'cross_app' }
+  /** Definitive: outside this app's contact visibility scope (41050). */
+  | { status: 'not_visible' }
+  /** Definitive: no such user / malformed id (41012 / 40001). */
+  | { status: 'invalid_id' }
+  /** Transient: network / rate limit / server error — retry may succeed. */
+  | { status: 'error' };
+
+/**
+ * 严格版用户资料查询：按原因区分确定性失败（跨应用/不可见/无效 id）与瞬时
+ * 失败。需要据此做决策的调用方（如替身对象解析——误把瞬时失败当跨应用会引导
+ * 用户删掉合法配置）用这个；只要 best-effort 名字的调用方用 {@link getUserProfile}。
+ */
+export async function getUserProfileStrict(
+  larkAppId: string,
+  userId: string,
+  idType: 'open_id' | 'union_id' = 'open_id',
+): Promise<UserProfileLookup> {
+  const key = `${larkAppId}:${idType}:${userId}`;
+  const hit = userProfileCache.get(key);
+  if (hit !== undefined) return typeof hit === 'string' ? { status: hit } : { status: 'ok', profile: hit };
+  let out: UserProfileLookup;
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(userId)}`, {
+      user_id_type: idType,
+    });
+    const u = res?.code === 0 ? res?.data?.user : null;
+    if (u?.name) {
+      out = { status: 'ok', profile: { name: String(u.name), avatarUrl: u.avatar?.avatar_72 ?? u.avatar?.avatar_240 ?? undefined } };
+    } else {
+      const miss = res?.code === 0 ? 'not_visible' : classifyContactErrorCode(res?.code);
+      if (miss) out = { status: miss };
+      else {
+        logger.debug(`[user-profile] lookup transient code for ${userId.substring(0, 12)}: ${res?.code} ${res?.msg ?? ''}`);
+        out = { status: 'error' };
+      }
+    }
+  } catch (err) {
+    // 非 2xx 走这里（Axios throw）——先提业务码再定性，别把跨应用当瞬时错误。
+    const miss = classifyContactErrorCode(getLarkErrorCode(err));
+    if (miss) out = { status: miss };
+    else {
+      logger.debug(`[user-profile] lookup threw for ${userId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+      out = { status: 'error' };
+    }
+  }
+  if (out.status !== 'error') {
+    if (userProfileCache.size >= USER_PROFILE_CACHE_MAX) userProfileCache.clear();
+    userProfileCache.set(key, out.status === 'ok' ? out.profile : out.status);
+  }
+  return out;
+}
 
 /**
  * Best-effort 拉用户资料（名字 + 头像 URL）。拿不到（缺 scope / 不在可见
@@ -314,25 +386,8 @@ export async function getUserProfile(
   userId: string,
   idType: 'open_id' | 'union_id' = 'open_id',
 ): Promise<{ name: string; avatarUrl?: string } | null> {
-  const key = `${larkAppId}:${idType}:${userId}`;
-  const hit = userProfileCache.get(key);
-  if (hit !== undefined) return hit;
-  let out: { name: string; avatarUrl?: string } | null = null;
-  try {
-    const c = getBotClient(larkAppId);
-    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(userId)}`, {
-      user_id_type: idType,
-    });
-    const u = res?.code === 0 ? res?.data?.user : null;
-    if (u?.name) {
-      out = { name: String(u.name), avatarUrl: u.avatar?.avatar_72 ?? u.avatar?.avatar_240 ?? undefined };
-    }
-  } catch (err) {
-    logger.debug(`[user-profile] lookup threw for ${userId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
-  }
-  if (userProfileCache.size >= USER_PROFILE_CACHE_MAX) userProfileCache.clear();
-  userProfileCache.set(key, out);
-  return out;
+  const r = await getUserProfileStrict(larkAppId, userId, idType);
+  return r.status === 'ok' ? r.profile : null;
 }
 
 /**
@@ -870,8 +925,13 @@ export async function uploadFile(larkAppId: string, filePath: string, opts?: { d
  */
 export async function resolveAllowedUsersWithMap(
   larkAppId: string, raw: string[],
-): Promise<{ resolved: string[]; map: Map<string, string> }> {
+): Promise<{ resolved: string[]; map: Map<string, string>; errored?: boolean }> {
   const map = new Map<string, string>();
+  // True when a TRANSIENT failure (throw / rate limit / server error) hit any
+  // requested item — the caller can then say "resolution failed, retry" instead
+  // of the misleading "this identifier does not exist". Definitive failures
+  // (id invalid / not visible: DEFINITIVE_CONTACT_ERROR_CODES) don't set it.
+  let errored = false;
   const openIds: string[] = [];
   const emails: string[] = [];
   const unionIds: string[] = [];
@@ -916,9 +976,11 @@ export async function resolveAllowedUsersWithMap(
           map.set(uid, oid);
           logger.info(`Resolved ${uid} → ${oid}`);
         } else {
+          if (!classifyContactErrorCode(res?.code)) errored = true;
           logger.warn(`Failed to resolve union_id ${uid} to open_id: ${res?.msg} (code: ${res?.code})`);
         }
       } catch (err: any) {
+        if (!classifyContactErrorCode(getLarkErrorCode(err))) errored = true;
         logger.warn(`resolve union_id ${uid} failed: ${err?.message ?? err}`);
       }
     }
@@ -930,6 +992,7 @@ export async function resolveAllowedUsersWithMap(
           data: { emails, include_resigned: false },
         });
         if (res.code !== 0) {
+          errored = true;
           logger.warn(`Failed to resolve emails to open_ids: ${res.msg} (code: ${res.code})`);
         } else {
           const userList: any[] = res.data?.user_list ?? [];
@@ -949,6 +1012,7 @@ export async function resolveAllowedUsersWithMap(
           }
         }
       } catch (err: any) {
+        errored = true;
         logger.warn(`resolveAllowedUsers failed: ${err.message}`);
       }
     }
@@ -967,7 +1031,7 @@ export async function resolveAllowedUsersWithMap(
       resolved.push(oid);
     }
   }
-  return { resolved, map };
+  return { resolved, map, errored };
 }
 
 /**

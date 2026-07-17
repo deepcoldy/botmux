@@ -1,5 +1,10 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import * as pty from 'node-pty';
+import xtermHeadless from '@xterm/headless';
 import type { BackendType, SessionBackend, SpawnOpts, SessionProbe } from './types.js';
+import { logger } from '../../utils/logger.js';
+
+const { Terminal } = xtermHeadless;
 
 export type PersistentBackendType = Exclude<BackendType, 'pty'>;
 
@@ -34,6 +39,16 @@ const STATUS_WAIT_TIMEOUT_MS = 30_000;
 const SETTLED_STATUSES = ['done', 'blocked', 'idle'] as const;
 
 type JsonCommandResult = { ok: true; value: any | undefined } | { ok: false };
+
+export interface HerdrWebTerminalSize {
+  cols: number;
+  rows: number;
+}
+
+export interface HerdrWebTerminalCursor {
+  col: number;
+  row: number;
+}
 
 function tryJsonCommand(args: string[], opts?: { timeout?: number; input?: string; env?: NodeJS.ProcessEnv }): JsonCommandResult {
   try {
@@ -112,6 +127,8 @@ export class HerdrBackend implements SessionBackend {
   private pollTimer: NodeJS.Timeout | null = null;
   private statusWaitProcesses: ChildProcess[] = [];
   private readonly dataCbs: Array<(d: string) => void> = [];
+  private readonly snapshotCbs: Array<(snapshot: string) => void> = [];
+  private readonly webCursorCbs: Array<(cursor: HerdrWebTerminalCursor) => void> = [];
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
   private readonly agentName = 'botmux';
   private paneId: string | undefined;
@@ -121,6 +138,13 @@ export class HerdrBackend implements SessionBackend {
   private cols = 200;
   private rows = 50;
   private agentProbeFailures = 0;
+  private webAttach: pty.IPty | null = null;
+  private webCursorTerminal: InstanceType<typeof Terminal> | null = null;
+  private webCursor: HerdrWebTerminalCursor | null = null;
+  private webCursorTimer: NodeJS.Timeout | null = null;
+  private webOwner: object | null = null;
+  private webSize: HerdrWebTerminalSize | null = null;
+  private readonly webViewers = new Map<object, HerdrWebTerminalSize | null>();
 
   private childEnv: Record<string, string> | undefined;
 
@@ -283,8 +307,66 @@ export class HerdrBackend implements SessionBackend {
     this.rows = rows;
   }
 
+  acquireWebTerminal(viewer: object): HerdrWebTerminalSize | null {
+    if (this.opts.externalTarget || this.exited) return null;
+    if (!this.webViewers.has(viewer)) this.webViewers.set(viewer, null);
+    return this.webOwner && this.webOwner !== viewer ? this.webSize : null;
+  }
+
+  resizeWebTerminal(viewer: object, cols: number, rows: number): HerdrWebTerminalSize | null {
+    if (this.opts.externalTarget || this.exited || !this.webViewers.has(viewer)) return null;
+    const size = { cols, rows };
+    this.webViewers.set(viewer, size);
+    if (!this.webOwner) this.webOwner = viewer;
+    if (this.webOwner !== viewer) return null;
+
+    if (this.webAttach) {
+      this.webCursorTerminal?.resize(cols, rows);
+      this.webAttach.resize(cols, rows);
+    } else if (!this.startWebAttach(size)) {
+      return null;
+    }
+    this.cols = cols;
+    this.rows = rows;
+    this.webSize = size;
+    return size;
+  }
+
+  releaseWebTerminal(viewer: object): object | null {
+    if (this.opts.externalTarget || !this.webViewers.has(viewer)) return null;
+    const wasOwner = this.webOwner === viewer;
+    this.webViewers.delete(viewer);
+    if (!wasOwner) return null;
+
+    if (this.webViewers.size === 0) {
+      this.resetWebTerminal();
+      return null;
+    }
+    const promoted = this.webViewers.keys().next().value as object;
+    this.webOwner = promoted;
+    return promoted;
+  }
+
+  isWebTerminalOwner(viewer: object): boolean {
+    return this.webOwner === viewer;
+  }
+
   onData(cb: (data: string) => void): void {
     this.dataCbs.push(cb);
+  }
+
+  /** Full interpreted terminal frame for snapshot-aware web history merging. */
+  onSnapshot(cb: (snapshot: string) => void): void {
+    this.snapshotCbs.push(cb);
+  }
+
+  /** Cursor coordinates from the real managed attach stream (0-based). */
+  onWebTerminalCursor(cb: (cursor: HerdrWebTerminalCursor) => void): void {
+    this.webCursorCbs.push(cb);
+  }
+
+  getWebTerminalCursor(): HerdrWebTerminalCursor | null {
+    return this.webCursor;
   }
 
   onExit(cb: (code: number | null, signal: string | null) => void): void {
@@ -294,6 +376,7 @@ export class HerdrBackend implements SessionBackend {
   kill(): void {
     if (this.exited) return;
     this.exited = true;
+    this.resetWebTerminal();
     this.stopPolling();
     this.stopStatusWatcher();
     this.serverProcess = null;
@@ -352,6 +435,89 @@ export class HerdrBackend implements SessionBackend {
       sleepSync(SERVER_BOOT_POLL_MS);
     }
     throw new Error(`failed to start herdr session ${this.sessionName}`);
+  }
+
+  private startWebAttach(size: HerdrWebTerminalSize): boolean {
+    const target = this.paneId ?? this.agentName;
+    const cursorTerminal = new Terminal({
+      cols: size.cols,
+      rows: size.rows,
+      scrollback: 0,
+      allowProposedApi: true,
+    });
+    try {
+      const attach = pty.spawn('herdr', [
+        '--session', this.sessionName,
+        'agent', 'attach', target,
+      ], {
+        name: 'xterm-256color',
+        cols: size.cols,
+        rows: size.rows,
+        env: this.childEnv ?? {},
+      });
+      this.webAttach = attach;
+      this.resetWebCursorTracking();
+      this.webCursorTerminal = cursorTerminal;
+      attach.onData(data => {
+        // The polling read API returns screen text but no cursor metadata. The
+        // managed attach stream is the authoritative source for cursor moves;
+        // render it headlessly and relay only the final coordinates.
+        cursorTerminal.write(data, () => {
+          if (this.webCursorTerminal !== cursorTerminal) return;
+          if (this.webCursorTimer) clearTimeout(this.webCursorTimer);
+          this.webCursorTimer = setTimeout(() => {
+            this.webCursorTimer = null;
+            if (this.webCursorTerminal !== cursorTerminal) return;
+            const buffer = cursorTerminal.buffer.active;
+            const cursor = { col: buffer.cursorX, row: buffer.cursorY };
+            if (this.webCursor?.col === cursor.col && this.webCursor?.row === cursor.row) return;
+            this.webCursor = cursor;
+            for (const cb of this.webCursorCbs) {
+              try { cb(cursor); } catch { /* listener crash shouldn't kill attach */ }
+            }
+          }, 10);
+          this.webCursorTimer.unref?.();
+        });
+      });
+      attach.onExit(({ exitCode, signal }) => {
+        if (this.webAttach !== attach) return;
+        this.webAttach = null;
+        this.resetWebCursorTracking();
+        logger.warn(
+          `[herdr] web terminal attach exited session=${this.sessionName} target=${target} ` +
+          `code=${exitCode} signal=${signal ?? 'null'}`,
+        );
+      });
+      return true;
+    } catch (err: any) {
+      cursorTerminal.dispose();
+      logger.error(
+        `[herdr] web terminal attach failed session=${this.sessionName} target=${target}: ` +
+        `${err?.message ?? err}`,
+      );
+      return false;
+    }
+  }
+
+  private resetWebTerminal(): void {
+    const attach = this.webAttach;
+    this.webAttach = null;
+    this.webOwner = null;
+    this.webSize = null;
+    this.webViewers.clear();
+    this.resetWebCursorTracking();
+    if (attach) {
+      try { attach.kill(); } catch { /* already gone */ }
+    }
+  }
+
+  private resetWebCursorTracking(): void {
+    if (this.webCursorTimer) clearTimeout(this.webCursorTimer);
+    this.webCursorTimer = null;
+    const cursorTerminal = this.webCursorTerminal;
+    this.webCursorTerminal = null;
+    this.webCursor = null;
+    cursorTerminal?.dispose();
   }
 
   private getAgent(): any | undefined {
@@ -430,6 +596,9 @@ export class HerdrBackend implements SessionBackend {
     if (this.exited) return;
     const next = this.readRecentAnsi();
     if (!next || next === this.lastText) return;
+    for (const cb of this.snapshotCbs) {
+      try { cb(next); } catch { /* listener crash shouldn't kill polling */ }
+    }
     let delta = '';
     if (next.startsWith(this.lastText)) {
       delta = next.slice(this.lastText.length);
@@ -547,6 +716,7 @@ export class HerdrBackend implements SessionBackend {
   private handleExit(code: number | null, signal: string | null): void {
     if (this.exited) return;
     this.exited = true;
+    this.resetWebTerminal();
     this.stopPolling();
     this.stopStatusWatcher();
     for (const cb of this.exitCbs) {

@@ -69,6 +69,11 @@ describe('createCliAdapterSync factory', () => {
     expect(() => createCliAdapterSync('unknown-cli' as CliId)).toThrow(/Unknown CLI adapter/);
   });
 
+  it('supportsSessionCwdMove：claude-code true，codex 缺省', () => {
+    expect(createCliAdapterSync('claude-code').supportsSessionCwdMove).toBe(true);
+    expect(createCliAdapterSync('codex').supportsSessionCwdMove).toBeUndefined();
+  });
+
   it.each(ALL_CLI_IDS)('adapter for "%s" has resolvedBin set', (id) => {
     const adapter = createCliAdapterSync(id, `/opt/${id}`);
     if (id === 'codex-app' || id === 'mira' || id === 'mir') expect(adapter.resolvedBin).toBe(process.execPath);
@@ -1294,6 +1299,39 @@ describe('readyPattern', () => {
 
   it('copilot has no readyPattern', () => {
     expect(createCopilotAdapter('/bin/copilot').readyPattern).toBeUndefined();
+  });
+});
+
+describe('traex automation trust flags', () => {
+  it('bypasses both permission and hook-review gates for automation by default', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-goal', resume: false });
+    expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(args).toContain('--dangerously-bypass-hook-trust');
+  });
+
+  it('does not bypass permissions or hook trust for a restricted bot', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-goal',
+      resume: false,
+      disableCliBypass: true,
+    });
+    expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(args).not.toContain('--dangerously-bypass-hook-trust');
+  });
+
+  it('forwards only the file-backed goal contract into TRAE shell tools', () => {
+    vi.stubEnv('BOTMUX_GOAL_PATH', '/tmp/goal "quoted".txt');
+    vi.stubEnv('BOTMUX_GOAL_MANIFEST_PATH', '/tmp/manifest.json');
+    vi.stubEnv('BOTMUX_V3_GOAL', '1');
+    try {
+      const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-goal', resume: false });
+      expect(args).toContain('shell_environment_policy.set.BOTMUX_GOAL_PATH="/tmp/goal \\"quoted\\".txt"');
+      expect(args).toContain('shell_environment_policy.set.BOTMUX_GOAL_MANIFEST_PATH="/tmp/manifest.json"');
+      expect(args).toContain('shell_environment_policy.set.BOTMUX_V3_GOAL="1"');
+      expect(args).not.toContain('shell_environment_policy.inherit="all"');
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 

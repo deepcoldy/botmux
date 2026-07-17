@@ -393,6 +393,19 @@ describe('decideDashboardAuth — protected surface', () => {
     expect(d.kind).toBe('deny401');
   });
 
+  it('GET /api/v3 run list/detail without token → deny401', () => {
+    for (const pathname of ['/api/v3/runs', '/api/v3/runs/project-review-1']) {
+      const d = decideDashboardAuth({
+        method: 'GET',
+        pathname,
+        hasTokenParam: false,
+        presentedToken: undefined,
+        activeToken: TOK,
+      });
+      expect(d.kind, pathname).toBe('deny401');
+    }
+  });
+
   it('POST / static-looking path is NOT public (only GET is)', () => {
     const d = decideDashboardAuth({
       method: 'POST',
@@ -581,6 +594,9 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
       '/api/bots',
       '/api/skills',
       '/api/cli-options',
+      // Workflow projections contain user-authored goals and identifiers.
+      '/api/v3/runs',
+      '/api/v3/runs/project-review-1',
       // Mints a token-bearing writable terminal URL — never public, even in
       // publicReadOnly (the daemon IPC behind it is also loopback-HMAC gated).
       '/api/sessions/sess-1/write-link',

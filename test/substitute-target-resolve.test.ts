@@ -17,7 +17,11 @@ const deps: SubstituteResolveDeps = {
     return { resolved: [...new Set(map.values())], map };
   },
   async getProfile(_app, openId) {
-    return NAMES[openId] ? { name: NAMES[openId] } : null;
+    if (NAMES[openId]) return { status: 'ok' as const, profile: { name: NAMES[openId] } };
+    if (openId === 'ou_other_app') return { status: 'cross_app' as const };
+    if (openId === 'ou_hidden') return { status: 'not_visible' as const };
+    if (openId === 'ou_bogus') return { status: 'invalid_id' as const };
+    return { status: 'not_visible' as const };
   },
 };
 
@@ -42,7 +46,10 @@ describe('resolveSubstituteTargets', () => {
       { email: 'ghost@x.com' },
     ], deps);
     expect(targets).toEqual([{ openId: 'ou_alice', name: 'Alice', email: 'alice@x.com' }]);
-    expect(resolution.map(r => [r.input, r.ok])).toEqual([['alice@x.com', true], ['ghost@x.com', false]]);
+    expect(resolution.map(r => [r.input, r.ok, r.reason])).toEqual([
+      ['alice@x.com', true, undefined],
+      ['ghost@x.com', false, 'unresolvable'],
+    ]);
   });
 
   it('dedupes the same person while keeping a chip per input line', async () => {
@@ -65,6 +72,65 @@ describe('resolveSubstituteTargets', () => {
     const boom: SubstituteResolveDeps = { resolveRaw: async () => { throw new Error('no creds'); }, getProfile: deps.getProfile };
     const { targets, resolution } = await resolveSubstituteTargets('app', [{ email: 'alice@x.com' }], boom);
     expect(targets).toEqual([]);
-    expect(resolution).toEqual([{ input: 'alice@x.com', ok: false }]);
+    expect(resolution).toEqual([{ input: 'alice@x.com', ok: false, reason: 'resolve_failed' }]);
+  });
+
+  it('rejects a cross-app or unknown open_id so it cannot silently fail at runtime', async () => {
+    const { targets, resolution } = await resolveSubstituteTargets('app', [{ openId: 'ou_other_app' }], deps);
+    expect(targets).toEqual([]);
+    expect(resolution).toEqual([{ input: 'ou_other_app', ok: false, reason: 'cross_app_open_id' }]);
+  });
+
+  it('keeps definitive causes distinct: contact-scope not_visible and invalid_id are not "cross-app"', async () => {
+    const hidden = await resolveSubstituteTargets('app', [{ openId: 'ou_hidden' }], deps);
+    expect(hidden.targets).toEqual([]);
+    expect(hidden.resolution).toEqual([{ input: 'ou_hidden', ok: false, reason: 'not_visible' }]);
+
+    const bogus = await resolveSubstituteTargets('app', [{ openId: 'ou_bogus' }], deps);
+    expect(bogus.targets).toEqual([]);
+    expect(bogus.resolution).toEqual([{ input: 'ou_bogus', ok: false, reason: 'unresolvable' }]);
+  });
+
+  it('reports a transient profile failure for a hand-typed open_id as resolve_failed, not cross-app', async () => {
+    // A transient network / rate-limit error must not tell the user their
+    // open_id "belongs to another app" — that misleads them into discarding a
+    // perfectly valid target. Only a definitive not_visible is cross-app.
+    const flaky: SubstituteResolveDeps = {
+      resolveRaw: deps.resolveRaw,
+      getProfile: async () => ({ status: 'error' as const }),
+    };
+    const { targets, resolution } = await resolveSubstituteTargets('app', [{ openId: 'ou_direct' }], flaky);
+    expect(targets).toEqual([]);
+    expect(resolution).toEqual([{ input: 'ou_direct', ok: false, reason: 'resolve_failed' }]);
+
+    // Same for a thrown lookup (defensive: the injected impl shouldn't throw).
+    const throwing: SubstituteResolveDeps = {
+      resolveRaw: deps.resolveRaw,
+      getProfile: async () => { throw new Error('timeout'); },
+    };
+    const thrown = await resolveSubstituteTargets('app', [{ openId: 'ou_direct' }], throwing);
+    expect(thrown.resolution).toEqual([{ input: 'ou_direct', ok: false, reason: 'resolve_failed' }]);
+  });
+
+  it('reports resolve_failed for an email when the batch resolver signals a transient error', async () => {
+    // The real resolveAllowedUsersWithMap swallows API errors internally and
+    // never rejects — the errored flag is the only production-reachable signal.
+    const flaky: SubstituteResolveDeps = {
+      resolveRaw: async () => ({ resolved: [], map: new Map(), errored: true }),
+      getProfile: deps.getProfile,
+    };
+    const { targets, resolution } = await resolveSubstituteTargets('app', [{ email: 'alice@x.com' }], flaky);
+    expect(targets).toEqual([]);
+    expect(resolution).toEqual([{ input: 'alice@x.com', ok: false, reason: 'resolve_failed' }]);
+  });
+
+  it('keeps an email-resolved target when only the profile lookup transiently fails', async () => {
+    const flaky: SubstituteResolveDeps = {
+      resolveRaw: deps.resolveRaw,
+      getProfile: async () => ({ status: 'error' as const }),
+    };
+    const { targets, resolution } = await resolveSubstituteTargets('app', [{ email: 'alice@x.com', name: 'A.' }], flaky);
+    expect(targets).toEqual([{ openId: 'ou_alice', name: 'A.', email: 'alice@x.com' }]);
+    expect(resolution).toEqual([{ input: 'alice@x.com', ok: true, openId: 'ou_alice', name: 'A.', avatarUrl: undefined }]);
   });
 });

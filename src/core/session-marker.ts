@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { readManagedOriginCapability } from './managed-origin-capability.js';
 
 export interface AncestorSessionContext {
@@ -9,26 +9,184 @@ export interface AncestorSessionContext {
   dispatchAttempt?: number;
 }
 
-export function parseSessionMarker(raw: string): AncestorSessionContext {
-  const text = raw.trim();
-  if (!text) return { sessionId: '' };
-  if (text.startsWith('{')) {
-    try {
-      const parsed = JSON.parse(text) as { sessionId?: unknown; turnId?: unknown; dispatchAttempt?: unknown };
-      return {
-        sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : '',
-        turnId: typeof parsed.turnId === 'string' ? parsed.turnId : undefined,
-        dispatchAttempt: typeof parsed.dispatchAttempt === 'number'
-          && Number.isSafeInteger(parsed.dispatchAttempt)
-          && parsed.dispatchAttempt > 0
-          ? parsed.dispatchAttempt
-          : undefined,
-      };
-    } catch {
-      return { sessionId: '' };
-    }
+interface IdentityBoundSessionMarker extends AncestorSessionContext {
+  procStart?: string;
+}
+
+export interface AuthenticatedAncestorSessionContext extends AncestorSessionContext {
+  markerPid: number;
+  procStart: string;
+}
+
+export class SessionMarkerAuthenticationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SessionMarkerAuthenticationError';
   }
-  return { sessionId: text };
+}
+
+const LINUX_BOOT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Kernel-generated identity that changes on every Linux boot. */
+export function readLinuxBootIdentity(): string | undefined {
+  if (process.platform !== 'linux') return undefined;
+  try {
+    const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    return LINUX_BOOT_ID_RE.test(bootId) ? bootId.toLowerCase() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Stable process-birth identity used to reject stale marker files after PID
+ * reuse. Linux exposes start ticks in /proc; macOS/other Unix falls back to
+ * ps(1)'s process start timestamp so mutating commands remain cross-platform.
+ */
+export function readProcessStartIdentity(pid: number): string | undefined {
+  if (!Number.isInteger(pid) || pid <= 1) return undefined;
+  if (process.platform === 'linux') {
+    try {
+      const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const closeParen = raw.lastIndexOf(')');
+      if (closeParen >= 0) {
+        const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
+        if (fields[19]) return fields[19];
+      }
+    } catch { /* disappeared or unreadable: never fall through to ambient ps */ }
+    return undefined;
+  }
+  const ps = systemPsBin();
+  if (!ps) return undefined;
+  try {
+    const started = execFileSync(
+      ps,
+      ['-o', 'lstart=', '-p', String(pid)],
+      {
+        encoding: 'utf-8',
+        timeout: 2000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: { PATH: '/usr/bin:/bin', LANG: 'C' },
+      },
+    ).trim();
+    return started || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function systemPsBin(): string | undefined {
+  for (const candidate of ['/usr/bin/ps', '/bin/ps']) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function readParentPid(pid: number): number | undefined {
+  if (process.platform === 'linux') {
+    try {
+      const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const closeParen = raw.lastIndexOf(')');
+      if (closeParen < 0) return undefined;
+      const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
+      const parent = Number(fields[1]);
+      return Number.isSafeInteger(parent) && parent > 0 ? parent : undefined;
+    } catch { return undefined; }
+  }
+  const ps = systemPsBin();
+  if (!ps) return undefined;
+  try {
+    const out = execFileSync(ps, ['-o', 'ppid=', '-p', String(pid)], {
+      encoding: 'utf-8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'],
+      env: { PATH: '/usr/bin:/bin', LANG: 'C' },
+    }).trim();
+    const parent = Number(out);
+    return Number.isSafeInteger(parent) && parent > 0 ? parent : undefined;
+  } catch { return undefined; }
+}
+
+function parseDispatchAttempt(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? value
+    : undefined;
+}
+
+function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarker {
+  const text = raw.trim();
+  if (!text.startsWith('{')) return { sessionId: text };
+  try {
+    const parsed = JSON.parse(text) as {
+      sessionId?: unknown; turnId?: unknown; dispatchAttempt?: unknown; procStart?: unknown;
+    };
+    const dispatchAttempt = parseDispatchAttempt(parsed.dispatchAttempt);
+    return {
+      sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : '',
+      ...(typeof parsed.turnId === 'string' ? { turnId: parsed.turnId } : {}),
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      ...(typeof parsed.procStart === 'string' ? { procStart: parsed.procStart } : {}),
+    };
+  } catch {
+    return { sessionId: '' };
+  }
+}
+
+export function parseSessionMarker(raw: string): AncestorSessionContext {
+  const parsed = parseIdentityBoundSessionMarker(raw);
+  return {
+    sessionId: parsed.sessionId,
+    ...(parsed.turnId ? { turnId: parsed.turnId } : {}),
+    ...(parsed.dispatchAttempt !== undefined ? { dispatchAttempt: parsed.dispatchAttempt } : {}),
+  };
+}
+
+/**
+ * Strong marker lookup for authority-bearing commands. Unlike the legacy
+ * read/reply resolver, this requires the worker's JSON procStart binding and
+ * verifies it against the live ancestor process before returning identity.
+ */
+export function findAuthenticatedAncestorSessionContext(
+  dataDir: string,
+  startPid: number = process.ppid,
+): AuthenticatedAncestorSessionContext | null {
+  const markersDir = join(dataDir, '.botmux-cli-pids');
+  if (!existsSync(markersDir)) return null;
+
+  let pid = startPid;
+  for (let depth = 0; depth < 8 && pid > 1; depth++) {
+    const markerPath = join(markersDir, String(pid));
+    if (existsSync(markerPath)) {
+      let marker: IdentityBoundSessionMarker;
+      try {
+        marker = parseIdentityBoundSessionMarker(readFileSync(markerPath, 'utf-8'));
+      } catch (err) {
+        throw new SessionMarkerAuthenticationError(
+          `无法读取 CLI process marker ${markerPath}：${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (!marker.sessionId || !marker.turnId || !marker.procStart) {
+        throw new SessionMarkerAuthenticationError(
+          `CLI process marker ${markerPath} 缺少 sessionId/turnId/procStart，不能用于变更操作授权`,
+        );
+      }
+      const liveStart = readProcessStartIdentity(pid);
+      if (!liveStart || liveStart !== marker.procStart) {
+        throw new SessionMarkerAuthenticationError(
+          `CLI process marker ${markerPath} 已过期或 PID 被复用，拒绝授权`,
+        );
+      }
+      return {
+        sessionId: marker.sessionId,
+        turnId: marker.turnId,
+        ...(marker.dispatchAttempt !== undefined ? { dispatchAttempt: marker.dispatchAttempt } : {}),
+        markerPid: pid,
+        procStart: marker.procStart,
+      };
+    }
+    const parent = readParentPid(pid);
+    if (!parent) break;
+    pid = parent;
+  }
+  return null;
 }
 
 /**
@@ -47,11 +205,9 @@ export function findAncestorSessionContext(dataDir: string, startPid: number = p
     if (existsSync(markerPath)) {
       try { return parseSessionMarker(readFileSync(markerPath, 'utf-8')); } catch { return { sessionId: '' }; }
     }
-    try {
-      const out = execSync(`ps -o ppid= -p ${pid}`, { encoding: 'utf-8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-      pid = parseInt(out, 10);
-      if (isNaN(pid)) break;
-    } catch { break; }
+    const parent = readParentPid(pid);
+    if (!parent) break;
+    pid = parent;
   }
   return null;
 }

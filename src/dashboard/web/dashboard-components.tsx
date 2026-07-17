@@ -376,17 +376,32 @@ type DropdownMenuProps<T extends string> = {
   value: T;
   options: DropdownOption<T>[];
   onChange: (value: T) => void;
+  /** Filter box at the top of the popup, for long option lists (e.g. 20+ CLIs). */
+  searchable?: boolean;
+  searchPlaceholder?: string;
+  /** Shown instead of options when the filter matches nothing. */
+  searchEmptyLabel?: ReactNode;
 };
 
 export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): JSX.Element {
   const detailsRef = useRef<HTMLDetailsElement | null>(null);
-  const choose = (next: T, button: HTMLButtonElement) => {
-    button.closest('details')?.removeAttribute('open');
+  const searchRef = useRef<HTMLInputElement | null>(null);
+  const [query, setQuery] = useState('');
+  const choose = (next: T) => {
+    detailsRef.current?.removeAttribute('open');
     // Re-selecting the already-active value is a no-op: close the menu but skip
     // onChange, so auto-saving dropdowns don't fire a redundant write + "saved" flash.
     if (next === props.value) return;
     props.onChange(next);
   };
+  const queryNorm = query.trim().toLowerCase();
+  // Match on the visible label when it is plain text, plus the value itself
+  // (users search either "Claude" or "claude-code").
+  const visibleOptions = props.searchable && queryNorm
+    ? props.options.filter(option =>
+      option.value.toLowerCase().includes(queryNorm)
+      || (typeof option.label === 'string' && option.label.toLowerCase().includes(queryNorm)))
+    : props.options;
 
   useEffect(() => {
     if (typeof document === 'undefined') return undefined;
@@ -417,7 +432,18 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): JSX
   const className = ['sect-sort-menu', props.disabled ? 'is-disabled' : '', props.className].filter(Boolean).join(' ');
 
   return (
-    <details id={props.id} className={className} ref={detailsRef} hidden={props.hidden} style={props.style}>
+    <details
+      id={props.id}
+      className={className}
+      ref={detailsRef}
+      hidden={props.hidden}
+      style={props.style}
+      onToggle={event => {
+        if (!props.searchable || !event.currentTarget.open) return;
+        setQuery('');
+        searchRef.current?.focus();
+      }}
+    >
       <summary
         aria-label={props.ariaLabel}
         aria-disabled={props.disabled ? true : undefined}
@@ -432,17 +458,41 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): JSX
         <span className="sect-sort-value">{props.label}</span>
       </summary>
       <div className="sect-sort-pop">
-        {props.options.map(option => (
+        {props.searchable ? (
+          <input
+            ref={searchRef}
+            className="sect-sort-search"
+            type="search"
+            placeholder={props.searchPlaceholder}
+            aria-label={props.searchPlaceholder}
+            autoComplete="off"
+            spellCheck={false}
+            value={query}
+            onChange={event => setQuery(event.currentTarget.value)}
+            onKeyDown={event => {
+              if (event.key !== 'Enter') return;
+              // The dropdown often sits inside a <form>: never let Enter submit
+              // it. Enter picks the first matching option instead.
+              event.preventDefault();
+              const first = visibleOptions.find(option => !option.disabled);
+              if (first) choose(first.value);
+            }}
+          />
+        ) : null}
+        {visibleOptions.map(option => (
           <button
             key={option.value}
             type="button"
             disabled={option.disabled}
             aria-current={props.value === option.value ? 'true' : undefined}
-            onClick={event => choose(option.value, event.currentTarget)}
+            onClick={() => choose(option.value)}
           >
             {option.label}
           </button>
         ))}
+        {props.searchable && visibleOptions.length === 0
+          ? <p className="sect-sort-empty">{props.searchEmptyLabel}</p>
+          : null}
       </div>
     </details>
   );

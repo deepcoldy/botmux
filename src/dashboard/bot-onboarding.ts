@@ -88,6 +88,11 @@ export interface BotOnboardingSnapshot {
   permission?: BotOnboardingPermission;
   /** 自动配置失败时的手动权限步骤 (深链) */
   remainingSteps?: RemainingStep[];
+  /**
+   * needs_owner 时的预填建议：创建应用所用 Web session 的账号邮箱。前端已在表单
+   * 顶部展示过该邮箱，不算新增暴露；仅当自动确认失败需要用户复核时给出。
+   */
+  suggestedOwner?: string;
   error?: string;
   message?: string;
 }
@@ -358,6 +363,9 @@ export class BotOnboardingManager {
     });
 
     let result: RegisterAppResult;
+    // Web 主路径的登录身份邮箱。免扫码/单扫链路没有 device-flow 的 userOpenId,
+    // 自动确认 owner 只能靠它——正是表单顶部「将使用 …」展示并确认过的账号。
+    let sessionEmail: string | undefined;
     if (input.registrationMode === 'compat' || !this.createApp) {
       result = await this.registerWithSdk(id);
     } else {
@@ -381,6 +389,7 @@ export class BotOnboardingManager {
       });
       if (created.ok) {
         result = created;
+        sessionEmail = created.sessionIdentity?.email?.trim() || undefined;
       } else if (created.appId) {
         this.patch(id, {
           status: 'failed',
@@ -460,6 +469,13 @@ export class BotOnboardingManager {
       // 成 owner, 导致 /grant 和授权卡片一直判 non-owner。
       ownerEntry = await resolveScannerAllowedUser(result.appId, result.appSecret, result.userOpenId, result.brand);
     }
+    if (!ownerEntry && sessionEmail) {
+      // Web 主路径：创建应用的登录账号邮箱就是 owner（表单第一步已展示并确认），
+      // 不再让用户手填一遍。能解析成 union_id 就落 on_；无法证伪（scope 未生效 /
+      // 网络错误）直接落邮箱，运行时 resolveAllowedUsers 会再解析成本 app open_id；
+      // 只有确凿不在本企业时才回落 needs_owner。
+      ownerEntry = await resolveSessionEmailAllowedUser(result.appId, result.appSecret, sessionEmail, result.brand);
+    }
 
     if (ownerEntry) {
       const addedBotIndex = this.persistBot({ ...bot, allowedUsers: [ownerEntry] });
@@ -468,6 +484,7 @@ export class BotOnboardingManager {
     } else {
       // owner 没法自动确认：bot 先不落盘, 暂存内存等用户手动填 owner 校验通过后再写。
       this.pendingBots.set(id, bot);
+      if (sessionEmail) this.patch(id, { suggestedOwner: sessionEmail });
       this.finalizePermissions(id, result.appId, result.brand, undefined, auto, 'needs_owner');
       this.savePendingJobs();
     }
@@ -648,6 +665,30 @@ async function resolveScannerAllowedUser(appId: string, appSecret: string, openI
     }
   } catch { /* do not trust scanner open_id when verification fails */ }
   return undefined;
+}
+
+/**
+ * 用新应用自身凭证把 Web 登录身份邮箱解析成 owner 条目。
+ *   - 解析出 union_id → 落 on_（跨 app 稳定，与扫码链路对齐）。
+ *   - 成功响应但查不到任何 user_id → 确凿不在本企业（如个人邮箱）→ undefined,
+ *     调用方回落 needs_owner 让用户复核。
+ *   - 请求失败 / 无法证伪（contact scope 未生效、网络错误）→ 直接返回邮箱本身:
+ *     它来自刚完成登录的开放平台会话本人, 运行时 resolveAllowedUsers 会再解析。
+ */
+async function resolveSessionEmailAllowedUser(appId: string, appSecret: string, email: string, brand: Brand = 'feishu'): Promise<string | undefined> {
+  try {
+    const client = new Lark.Client({ appId, appSecret, domain: sdkDomain(brand), disableTokenCache: false });
+    const res = await (client as any).contact.v3.user.batchGetId({
+      params: { user_id_type: 'union_id' },
+      data: { emails: [email], include_resigned: false },
+    });
+    if (res?.code === 0) {
+      const list: any[] = res.data?.user_list ?? [];
+      const hit = list.find(u => typeof u?.user_id === 'string' && u.user_id);
+      return hit ? hit.user_id : undefined;
+    }
+  } catch { /* 无法证伪 → 信任会话邮箱 */ }
+  return email;
 }
 
 // 跨 app open_id 的固定错误码：用本 app 凭证查别的 app 视角的 ou_ 必返这个。

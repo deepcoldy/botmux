@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,7 +16,8 @@ import {
   type V3LoopGrantActionValue,
 } from '../src/im/lark/v3-loop-grant-card.js';
 import { handleV3LoopGrantAction } from '../src/im/lark/v3-loop-grant-card-handler.js';
-import { birthRun } from '../src/workflows/v3/grill-state.js';
+import { birthRun, readGrillState, writeGrillState } from '../src/workflows/v3/grill-state.js';
+import { validateDag } from '../src/workflows/v3/dag.js';
 import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 
 const INPUT = {
@@ -69,6 +70,32 @@ describe('handleV3LoopGrantAction', () => {
       goal: 'g', baseDir: base, runId,
       chatBinding: { larkAppId: 'cli_test', chatId: 'oc_chat', rootMessageId: 'om_root' },
     });
+    const dagPath = join(runDir, 'dag.json');
+    const dag = validateDag({
+      runId,
+      nodes: [{
+        id: 'fix',
+        type: 'loop',
+        maxIterations: 1,
+        body: {
+          nodes: [{
+            id: 'verify',
+            type: 'goal',
+            goal: 'verify the fix',
+            resultSchema: {
+              type: 'object',
+              properties: { passed: { type: 'boolean' } },
+              required: ['passed'],
+            },
+          }],
+        },
+        exit: { node: 'verify', when: { path: 'result.passed', equals: true } },
+        output: { from: 'verify' },
+      }],
+    });
+    writeFileSync(dagPath, `${JSON.stringify(dag)}\n`);
+    const grill = readGrillState(runDir)!;
+    writeGrillState(runDir, { ...grill, status: 'dag_approved', dagPath });
     const journalPath = join(runDir, 'journal.ndjson');
     appendEvent(journalPath, { type: 'runStarted', runId });
     appendEvent(journalPath, { type: 'loopStarted', loopId: 'fix' });

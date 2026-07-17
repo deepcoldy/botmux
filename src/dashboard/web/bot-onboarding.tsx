@@ -43,6 +43,8 @@ type OnboardingJob = {
   liveStartMessage?: string;
   permission?: OnboardingPermission;
   remainingSteps?: RemainingStep[];
+  /** needs_owner 时的预填建议（创建应用所用账号的邮箱）。 */
+  suggestedOwner?: string;
   error?: string;
   message?: string;
 };
@@ -429,12 +431,15 @@ function OnboardingForm(props: {
   const dirPlaceholder = props.form.dirMode === 'card'
     ? t('botOnboarding.dirPlaceholderCard')
     : t('botOnboarding.dirPlaceholderFixed');
-  const cliOptions = props.cliState.options.map(option => ({
-    value: option.id,
-    label: option.available === false
-      ? t('botOnboarding.cliMissingOption', { label: option.label, command: option.command ?? option.id })
-      : option.label,
-  }));
+  // 按名称首字母排序，方便在 20+ 个 CLI 里定位；排序用原始 label（缺失告警前缀不参与）。
+  const cliOptions = [...props.cliState.options]
+    .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
+    .map(option => ({
+      value: option.id,
+      label: option.available === false
+        ? t('botOnboarding.cliMissingOption', { label: option.label, command: option.command ?? option.id })
+        : option.label,
+    }));
   const dirModeOptions: Array<{ value: OnboardingFormState['dirMode']; label: string }> = [
     { value: 'fixed', label: t('botOnboarding.dirModeFixed') },
     { value: 'card', label: t('botOnboarding.dirModeCard') },
@@ -502,6 +507,9 @@ function OnboardingForm(props: {
           label={onboardingOptionLabel(cliOptions, props.form.cliId)}
           value={props.form.cliId}
           options={cliOptions}
+          searchable
+          searchPlaceholder={t('common.dropdownSearch')}
+          searchEmptyLabel={t('common.dropdownSearchEmpty')}
           onChange={cliId => {
             props.onFormChange(syncModelForCli(props.form, cliId, props.cliState));
           }}
@@ -604,7 +612,8 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   const applyJob = useCallback((job: OnboardingJob) => {
     setView({ kind: 'job', job });
     if (job.status === 'needs_owner') {
-      setOwnerInput('');
+      // 预填创建账号的邮箱（后端自动确认失败时给出），用户复核/修改后提交。
+      setOwnerInput(job.suggestedOwner ?? '');
       setOwnerIdInput('');
     }
     if (shouldStopPolling(job)) stopPolling();

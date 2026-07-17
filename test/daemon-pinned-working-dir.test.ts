@@ -347,4 +347,32 @@ describe('resolvePinnedWorkingDir', () => {
     expect(result.oncallEntry?.workingDir).toBe(selfOncallDir);
     expect(result.pinnedWorkingDir).toBe(selfOncallDir);
   });
+
+  it('uses defaultWorkingDir after an auto-bound oncall chat is released', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const oncallDir = tempDir('self-oncall-repo');
+    const defaultDir = tempDir('self-default-repo');
+    // Simulates the state after the dashboard switched from Oncall mode to
+    // defaultWorkingDir mode: the autobound chat record is gone from oncallChats
+    // but the old oncall dir is still preserved in defaultOncall for round-trip.
+    botRegistry.registerBot({
+      larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code',
+      defaultWorkingDir: defaultDir,
+      defaultOncall: { enabled: false, workingDir: oncallDir, since: 5_000 },
+      defaultOncallAutoboundChats: ['oc_chat'],
+    });
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      larkAppId: 'app-self',
+    });
+
+    expect(result.oncallEntry).toBeFalsy();
+    expect(result.inheritedFrom).toBeNull();
+    expect(result.pinnedWorkingDir).toBe(defaultDir);
+    expect(result.pinnedFromBotDefault).toBe(true);
+  });
 });

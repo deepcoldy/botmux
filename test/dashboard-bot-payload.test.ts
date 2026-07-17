@@ -132,6 +132,7 @@ describe('dashboard bot payload helpers', () => {
       enabled: true,
       targets: [{ userId: 'u_alice', name: 'Alice' }],
       disclosure: 'prefix',
+      chats: ['oc_a', 'oc_b'],
     };
     expect(botDefaultsPayload(daemon, { substituteMode })).toMatchObject({
       substituteMode,

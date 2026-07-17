@@ -5,7 +5,10 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
 import { cliAuthBind, verifyHmac } from '../dashboard/auth.js';
+import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
+import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
+import { dashboardSecretPath } from './dashboard-secret.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as groupsStore from '../services/groups-store.js';
@@ -61,9 +64,9 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
@@ -84,19 +87,10 @@ import {
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
 import { triggerSessionTurn } from './trigger-session.js';
-import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.js';
-import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
-
-// Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
-// deps). Until set, workflow-targeted triggers report not-implemented.
-let workflowRunner: ((input: TriggerInput) => Promise<TriggerResult>) | null = null;
-export function setWorkflowRunner(fn: (input: TriggerInput) => Promise<TriggerResult>): void {
-  workflowRunner = fn;
-}
 
 // 机器人真·改名 renamer，由 daemon 启动时注册（开放平台自动化 + daemon 侧
 // botName/descriptor/bots-info 同步都在 daemon 的闭包里做）。未注册（测试环境）
@@ -116,8 +110,13 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, loadBotConfigs, readBotSkillPolicy } from '../bot-registry.js';
+import { getBotBrand, getBot, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
+import { validateSlashInjection } from './slash-inject.js';
+import { validateRoleLibraryPath } from './role-library.js';
+import { repinSessionWorkingDir } from './session-cwd.js';
+import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
+import type { CliId } from '../adapters/cli/types.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, Session } from '../types.js';
@@ -189,10 +188,14 @@ let injectedIpcSecret: string | null = null;
 export function setIpcAuthSecret(secret: string | null): void { injectedIpcSecret = secret; }
 function ipcAuthSecret(): string | null {
   if (injectedIpcSecret) return injectedIpcSecret;
-  try { return readFileSync(join(homedir(), '.botmux', '.dashboard-secret'), 'utf8').trim() || null; }
+  try { return readFileSync(dashboardSecretPath(), 'utf8').trim() || null; }
   catch { return null; }
 }
-function tokenRouteAuthorized(req: IncomingMessage): boolean {
+/** Authenticate legacy terminal-token routes with the machine-local dashboard
+ * secret. Workflow v3 mutations intentionally use their separate, full-request
+ * protocol (`workflows/v3/daemon-ipc-auth`) and must never call this bare
+ * ts:nonce verifier. */
+export function ipcHmacAuthorized(req: IncomingMessage): boolean {
   if (trustedHostRequests.has(req)) return true;
   const secret = ipcAuthSecret();
   if (!secret) return false; // fail-closed: no secret on disk → nobody can sign
@@ -219,8 +222,25 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
   if (method === 'POST' && pathname === '/api/asks') return true;
+  // botmux slash / botmux cd（角色切换）：合法调用方是会话内的 CLI 自身，沙箱 /
+  // 读隔离下读不到 host secret。两个 handler 内验证该会话的 rotating per-turn
+  // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
+  // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd)$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
+  // Workflow v3 mutations carry their own domain-separated full-envelope
+  // protocol (request signature over method/path/exact body with nonce
+  // anti-replay + boot audience, signed response), keyed on the same host
+  // secret as the outer gate. The handler fail-closes on that envelope, which
+  // is strictly stronger binding than the outer ts:nonce HMAC, so the prefix
+  // is admitted here instead of being double-signed with the same secret.
+  if (method === 'POST' && pathname.startsWith(`${WORKFLOW_DAEMON_IPC_ROUTE_PREFIX}/`)) return true;
+  // Workflow v3 session relay: sandboxed / read-isolated chat CLIs cannot read
+  // the host secret, so these handlers verify the session's rotating per-turn
+  // capability and re-derive the caller tuple from the daemon's own live
+  // session record (same posture as /api/asks above).
+  if (method === 'POST' && pathname.startsWith(`${V3_SESSION_RUN_MUTATION_ROUTE_PREFIX}/`)) return true;
   return false;
 }
 
@@ -373,6 +393,122 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', (_req, res, params) => {
     return jsonRes(res, 409, { ok: false, error: 'backend_not_suspendable' });
   }
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: true });
+});
+
+/** 会话级 CLI IPC（slash/cd）的调用方证明：trusted-host（.dashboard-secret HMAC，
+ *  外层 gate 已验）直接放行；否则（沙箱/读隔离 CLI 读不到 secret，走
+ *  routeHasNarrowUntrustedAuth 窄孔进来）必须出示该会话当前轮换的 capability，
+ *  与 daemon 活跃记录里的 managedTurnOrigin 比对（/api/asks 同款姿势）。
+ *  capability 只证明「我是这个会话当前这一轮的 CLI」——绑定 URL sessionId，
+ *  拿到别的 sessionId 也伪造不了它的 capability。会话不存在时对未签名调用方
+ *  同样回 origin_unproven，不提供「哪些 sessionId 活跃」的探针。 */
+function sessionCliIpcAuth(
+  req: IncomingMessage,
+  ds: DaemonSession | undefined,
+  sessionId: string,
+  body: Record<string, unknown> | undefined,
+): { ok: true } | { ok: false; error: string } {
+  const claimedAttempt = typeof body?.originDispatchAttempt === 'number'
+    && Number.isSafeInteger(body.originDispatchAttempt)
+    && body.originDispatchAttempt > 0
+    ? body.originDispatchAttempt
+    : undefined;
+  const decision = authorizeSessionScopedIpc({
+    trustedHost: isTrustedHostIpcRequest(req),
+    sessionExists: !!ds,
+    receiverSession: !!ds?.session.vcMeetingReceiver,
+    allowReceiver: false,
+    sessionId,
+    liveOrigin: ds?.managedTurnOrigin,
+    claimedCapability: typeof body?.originCapability === 'string' ? body.originCapability : undefined,
+    claimedTurnId: typeof body?.originTurnId === 'string' ? body.originTurnId : undefined,
+    claimedDispatchAttempt: claimedAttempt,
+  });
+  return decision.ok ? { ok: true } : { ok: false, error: decision.error };
+}
+
+/** 向本会话 CLI 注入一条 allowlist 内的原生斜杠命令（idle 后生效）。
+ *  鉴权双路径（见 sessionCliIpcAuth）：trusted-host 签名或本会话 rotating
+ *  capability；命令面由 allowlist（默认空=全拒）承担。 */
+ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
+  const body = await readJsonBody<{ command?: string } & Record<string, unknown>>(req)
+    .catch(() => ({} as { command?: string } & Record<string, unknown>));
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  // Adopt/observed 会话是收编的用户自有 pane，用户可能正在里面打字——机器注入
+  // 会与人的输入交错。与 /suspend、/restart 同款排除。
+  if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
+    return jsonRes(res, 409, { ok: false, error: 'adopt_inject_unsupported' });
+  }
+  if (!ds.worker || ds.worker.killed) return jsonRes(res, 409, { ok: false, error: 'no_live_worker' });
+  const allow = getBotTuiSlashAllow(ds.larkAppId);
+  const v = validateSlashInjection(body?.command ?? '', allow);
+  if (!v.ok) return jsonRes(res, 403, { ok: false, error: v.error });
+  try {
+    ds.worker.send({ type: 'inject_command', command: v.command } as DaemonToWorker);
+  } catch {
+    // slash 注入无状态（不像 /cd 那样已 repin 记录），send 失败不需要杀进程
+    // 冷启动——直接把失败面报给调用方即可。
+    return jsonRes(res, 502, { ok: false, error: 'worker_send_failed' });
+  }
+  jsonRes(res, 200, { ok: true, sessionId: params.sessionId, queued: v.command });
+});
+
+/** 会话内切换工作目录（角色切换专用）：硬校验角色库根 → 更新记录落盘（唯一事实源）
+ *  → 按能力位选择 idle 注入 /cd（进程不死）或杀进程冷启动兜底。
+ *  鉴权双路径（见 sessionCliIpcAuth）：trusted-host 签名或本会话 rotating
+ *  capability；目录面由 validateRoleLibraryPath 硬校验承担（realpath 归一 +
+ *  dev/ino 包含判断，角色库根之外一律拒）。
+ *  不发话题消息（AI 自己发角色化确认）。 */
+ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
+  const body = await readJsonBody<{ dir?: string } & Record<string, unknown>>(req)
+    .catch(() => ({} as { dir?: string } & Record<string, unknown>));
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  // Adopt/observed 会话是收编的用户自有 pane——注入或冷重启都会打断用户自己的
+  // 终端会话。与 /suspend、/restart、/slash 同款排除。
+  if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
+    return jsonRes(res, 409, { ok: false, error: 'adopt_cd_unsupported' });
+  }
+  const v = validateRoleLibraryPath(body?.dir ?? '');
+  if (!v.ok) {
+    return jsonRes(res, v.error === 'outside_role_library' ? 403 : 400, { ok: false, error: v.error });
+  }
+  repinSessionWorkingDir(ds, v.resolvedPath);
+  const cliId = ds.session.cliId;
+  let canInject = false;
+  try { canInject = !!(cliId && createCliAdapterSync(cliId as CliId).supportsSessionCwdMove); } catch { /* unknown cli */ }
+  if (ds.worker && !ds.worker.killed && canInject) {
+    // updateWorkingDir 随 inject_command 带给 worker：会话内 /cd 后 worker 内部的
+    // respawn（claude_exit 自动重启 / IM /restart / dashboard restart）必须收敛到
+    // 新目录，而不是陈旧的 lastInitConfig.workingDir。daemon 侧的 ds.initConfig 同步
+    // 更新，保持与 worker 侧一致（下次 forkWorker 用它重建 init 消息）。
+    if (ds.initConfig) ds.initConfig.workingDir = v.resolvedPath;
+    try {
+      ds.worker.send({ type: 'inject_command', command: `/cd ${v.resolvedPath}`, updateWorkingDir: v.resolvedPath } as DaemonToWorker);
+    } catch {
+      // send() 抛异常：worker 进程实际上已经不可达（管道已断），但 above 的
+      // repinSessionWorkingDir 已经把记录改成了新目录——绝不能留下「记录新、
+      // 进程仍在旧目录」的分裂状态。杀掉 worker 让下一条消息冷启动进新目录。
+      killWorker(ds);
+      return jsonRes(res, 200, { ok: true, mode: 'cold-restart', dir: v.resolvedPath });
+    }
+    return jsonRes(res, 200, { ok: true, mode: 'inject', dir: v.resolvedPath });
+  }
+  // Unconditional (no `ds.worker` guard), matching the IM `/cd` command handler
+  // (src/core/command-handler.ts) — killWorker() already no-ops safely when there
+  // is no live worker. That "no worker" branch is exactly what must run here for a
+  // lazy-restored-after-daemon-restart or crash-stopped TmuxBackend/HerdrBackend/
+  // ZellijBackend session: the persistent backing pane survives the worker's death
+  // and still binds the OLD cwd, so it must be torn down via
+  // destroyOrphanedBackingSession (called from inside killWorker) or the next
+  // resume would silently reattach to it and ignore the just-repinned workingDir.
+  killWorker(ds);
+  jsonRes(res, 200, { ok: true, mode: 'cold-restart', dir: v.resolvedPath });
 });
 
 /** 解析 session（活跃优先，已关闭兜底）。活跃会话取 ds.session —— registry 与
@@ -759,12 +895,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/lock', async (req, res, params) => {
  *
  * Two gates protect it: at the dashboard's HTTP boundary this path is absent
  * from the public allow-list, so an anonymous browser 401s; and here on the
- * daemon IPC, tokenRouteAuthorized requires a loopback-HMAC signed with
+ * daemon IPC, ipcHmacAuthorized requires a loopback-HMAC signed with
  * .dashboard-secret, so a local process that merely knows the ipcPort still
  * can't pull a write token.
  */
 ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
-  if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   // Riff backend: the sandbox URL is the writable link — no local worker needed.
@@ -787,7 +923,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
  * credential, just into Lark rather than into the HTTP response.
  */
 ipcRoute('POST', '/api/sessions/:sessionId/write-link-card', async (req, res, params) => {
-  if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   const r = await deliverWriteLinkCardToOwners(ds);
@@ -1166,15 +1302,22 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
     }
   }
   try {
-    let result;
     if (valid.request.target.kind === 'workflow') {
-      if (!workflowRunner) {
-        return jsonRes(res, 501, { ok: false, errorCode: 'workflow_trigger_not_implemented', error: 'workflow runner not wired on this daemon' });
-      }
-      result = await triggerWorkflowFromEnvelope(valid.request, { larkAppId: cachedLarkAppId, runWorkflow: workflowRunner });
-    } else {
-      result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
+      return jsonRes(res, 410, {
+        ok: false,
+        errorCode: 'legacy_workflow_retired',
+        error: 'v2 workflow trigger targets are retired; migrate the definition and run it through /workflow',
+      });
     }
+    const activeSessions = getActiveSessionsRegistry();
+    if (!activeSessions) {
+      return jsonRes(res, 503, {
+        ok: false,
+        errorCode: 'trigger_failed',
+        error: 'active session registry unavailable',
+      });
+    }
+    const result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
     const status = result.ok
       ? 200
       : result.errorCode === 'bot_not_in_chat'
@@ -1721,15 +1864,41 @@ ipcRoute('PUT', '/api/bot-substitute-mode', async (req, res) => {
   const { targets, resolution } = await substituteModeStore.resolveSubstituteTargets(
     cachedLarkAppId,
     rec.targets,
-    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfile },
+    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfileStrict },
   );
+  const chats = Array.isArray(rec.chats)
+    ? [...new Set(rec.chats.map(String).map(s => s.trim()).filter(Boolean))]
+    : [];
   const r = await substituteModeStore.updateBotSubstituteMode(cachedLarkAppId, {
     enabled: rec.enabled === true,
     targets,
     disclosure: rec.disclosure === 'none' ? 'none' : 'prefix',
+    replyMode: rec.replyMode === 'quote' ? 'quote' : 'thread',
+    disableControlCard: rec.disableControlCard === true,
+    ...(chats.length ? { chats } : {}),
+    // 话题群开关：显式 false 才关（旧客户端不带字段 → normalize 缺省开）。
+    topicGroups: rec.topicGroups,
+    topicActiveSessionTrigger: rec.topicActiveSessionTrigger,
   });
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason, resolution });
   jsonRes(res, 200, { ok: true, substituteMode: r.substituteMode, resolution });
+});
+
+// Preview resolution for a single substitute target without persisting anything.
+// Used by the dashboard to auto-fill name/avatar while the user is typing.
+ipcRoute('POST', '/api/bot-substitute-targets/resolve', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const rec = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+  const target = rec.target && typeof rec.target === 'object' && !Array.isArray(rec.target) ? rec.target : {};
+  const { resolution } = await substituteModeStore.resolveSubstituteTargets(
+    cachedLarkAppId,
+    [target],
+    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfileStrict },
+  );
+  jsonRes(res, 200, { ok: true, resolution: resolution[0] ?? null });
 });
 
 // Per-bot explicit `/summary` history range. Body `{ limit, sinceHours }`.
@@ -2065,7 +2234,9 @@ ipcRoute('PUT', '/api/bot-env', async (req, res) => {
 // 空白 → 清除；否则按 json kind 解析后落盘。走 applyConfigField（与 /botconfig
 // 同一写盘 + 内存热更新路径），next-session 生效。仅 backendType=riff 时使用。
 /** riff 配置里 dashboard 可编辑的字段——PUT /bot-riff 只覆盖这些，其余保留。 */
-const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'agent', 'model', 'jwtEnv', 'sandboxCluster', 'injectStatusLines', 'systemPrompt', 'setupCommands']);
+// sandboxCluster / injectStatusLines 已从 dashboard UI 移除（前者极少用、后者
+// 恒默认开启）——不在此集合中意味着存量 bots.json 值按「隐藏字段」原样保留。
+const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'agent', 'model', 'jwtEnv', 'systemPrompt', 'setupCommands']);
 
 /** 发给浏览器前脱敏：明文 jwt / env（可能含各类密钥）绝不进 dashboard 响应。 */
 function redactRiffForClient(riff: unknown): Record<string, unknown> | null {

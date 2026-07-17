@@ -19,7 +19,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc && cp src/setup/lark-scopes.json dist/setup/ && pnpm dashboard:bundle && chmod +x dist/cli.js",
+    "build": "node scripts/clean-dist.mjs && tsc && cp src/setup/lark-scopes.json dist/setup/ && pnpm dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs",
     "dashboard:bundle": "node scripts/build-dashboard.mjs",
     "dashboard:watch": "node scripts/build-dashboard.mjs --watch",
     "daemon": "tsx src/index-daemon.ts",

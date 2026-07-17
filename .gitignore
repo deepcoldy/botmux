@@ -26,3 +26,7 @@ docs-site/.magic-token
 # (hd2d-assets-*), never committed. See src/dashboard/hd2d-assets.ts
 src/dashboard/web/game/index.wasm
 src/dashboard/web/game/index.pck
+
+# Playwright MCP verification artifacts
+.playwright-mcp/
+dashboard-substitute*.png

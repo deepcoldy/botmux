@@ -300,46 +300,5 @@ describe('handleCardAction → overview dispatch returns { card } only on succes
       expect(cardJson).not.toContain('"page_size"');
     });
 
-    it('goto_workflows → workflows card has ↩ 总览 + origin threaded; ?all=1 query sent', async () => {
-      const runs = Array.from({ length: 12 }, (_, i) => ({
-        runId: `r_${i}`,
-        workflowId: `wf_${i}`,
-        status: 'running',
-        startedAt: 1_000_000 - i * 100,
-        updatedAt: 1_500_000,
-        nodesDone: 1,
-        nodesTotal: 3,
-      }));
-      const requestSpy = vi.fn(async (req: any) => {
-        // codex 2026-06-09 blocker: must request ?all=1 (default listRuns
-        // hides terminal runs). Match path strictly.
-        if (req.method === 'GET' && req.path === '/__daemon/workflows-runs-snapshot?all=1&scope=global') {
-          return { status: 200, raw: '', body: { runs } };
-        }
-        throw new Error('unexpected: ' + JSON.stringify(req));
-      });
-      mockedCreateClient.mockReturnValue({ request: requestSpy } as any);
-
-      const data: CardActionData = {
-        operator: { open_id: INVOKER },
-        action: { value: { action: 'dash_overview_goto_workflows', invoker_open_id: INVOKER } },
-        context: { open_message_id: 'om_card' },
-      };
-      const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
-
-      expect(result.card).toBeDefined();
-      const cardJson = JSON.stringify(result.card?.data);
-      // Workflows sub-card.
-      expect(cardJson).toContain('Dashboard 工作流');
-      // PAGE_SIZE=5 → 12 runs / 5 = 3 pages.
-      expect(cardJson).toContain('第 1/3 页');
-      // Back-to-overview + origin.
-      expect(cardJson).toContain('"action":"dash_overview_refresh"');
-      expect(cardJson).toContain('↩ 总览');
-      expect(cardJson).toContain('"origin":"overview"');
-      expect(cardJson).toContain('"dashboard_scope":"global"');
-      // page_size omitted at default.
-      expect(cardJson).not.toContain('"page_size"');
-    });
   });
 });

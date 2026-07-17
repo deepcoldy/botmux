@@ -154,6 +154,31 @@ function latestTraeSessionForBotmuxSession(botmuxSessionId: string): string | un
 
 // -------------------------------------------------------------------------
 
+/**
+ * TRAE/Codex sanitizes the environment inherited by model shell tools. Goal
+ * mode is file-backed, so the agent must receive these non-secret path vars or
+ * commands such as `cat $BOTMUX_GOAL_PATH` collapse to an empty argument and
+ * can hang on stdin. Forward only the goal contract, not the full worker env.
+ */
+const TRAEX_GOAL_ENV_KEYS = [
+  'BOTMUX_GOAL_PATH',
+  'BOTMUX_GOAL_INPUTS_PATH',
+  'BOTMUX_GOAL_OUTPUT_DIR',
+  'BOTMUX_GOAL_MANIFEST_PATH',
+  'BOTMUX_GOAL_ATTEMPT_DIR',
+  'BOTMUX_V3_GOAL',
+] as const;
+
+function goalEnvConfigArgs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const args: string[] = [];
+  for (const key of TRAEX_GOAL_ENV_KEYS) {
+    const value = env[key];
+    if (value === undefined) continue;
+    args.push('-c', `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
+  }
+  return args;
+}
+
 export function createTraexAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'traex';
   let cachedBin: string | undefined;
@@ -167,8 +192,18 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass }) {
       const baseArgs = [
-        ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
+        ...(!disableCliBypass ? [
+          '--dangerously-bypass-approvals-and-sandbox',
+          // Supported TRAE baseline 0.200.16+ has a second interactive
+          // "Hooks need review" gate
+          // after folder trust. Goal-mode workers have no human at their PTY,
+          // so without the automation-specific hook flag they never reach the
+          // prompt and `/goal` is never delivered. Keep it tied to the existing
+          // bypass decision: restricted bots must not gain hook trust.
+          '--dangerously-bypass-hook-trust',
+        ] : []),
         '--no-alt-screen',
+        ...goalEnvConfigArgs(),
       ];
       if (model && model.trim()) baseArgs.push('--model', model.trim());
       if (workingDir) baseArgs.push('-C', workingDir);

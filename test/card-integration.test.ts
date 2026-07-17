@@ -706,6 +706,34 @@ describe('Card integration: full event flow', () => {
       expect(sm.resumeSession).not.toHaveBeenCalled();
     });
 
+    it('sensitive fallback should reject when only p2pOpen is configured', async () => {
+      // 回归（codex 复验）：p2pOpen 与 globalGrants 同理——它也是一次显式的权限边界声明，
+      // 这条手写 fallback 必须把它算进 hasAllowlist，否则「只配 p2pOpen、无 allowedUsers」的
+      // 部署会让敏感卡片动作 fall through 成全开放（p2pOpen 只该开私聊 talk，绝不给 operate）。
+      const botRegMod = await import('../src/bot-registry.js');
+      vi.mocked(botRegMod.getAllBots).mockReturnValueOnce([{
+        config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', p2pOpen: true } as any,
+        resolvedAllowedUsers: [],
+        botOpenId: 'ou_bot',
+      } as any]);
+
+      const sessionId = 'closed-uuid-fallback-p2popen';
+      const sessions = new Map<string, DaemonSession>();
+      const deps = makeDeps(sessions);
+
+      const sessionStoreMod = await import('../src/services/session-store.js');
+      vi.mocked(sessionStoreMod.getSession).mockReturnValue({
+        sessionId, chatId: 'oc_chat', rootMessageId: ROOT_ID,
+        title: 'closed', status: 'closed', createdAt: '2026-01-01T00:00:00.000Z',
+        scope: 'thread',
+      } as any);
+      const sm = await import('../src/core/session-manager.js');
+
+      await handleCardAction(makeResumeEvent(ROOT_ID, sessionId, 'ou_user'), deps, undefined);
+
+      expect(sm.resumeSession).not.toHaveBeenCalled();
+    });
+
     it('resume should reject when operator is not in allowedUsers', async () => {
       // canOperate is gated through bot-registry.getBot(...).resolvedAllowedUsers
       // — switch the mock to a bot with a non-empty allowlist that excludes the

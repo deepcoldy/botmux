@@ -1,5 +1,9 @@
 # v3 MVP 引擎 —— claude × codex 分工 + 接口契约
 
+> **历史 MVP 快照，已被 2026-07 的统一 v3 引擎方案取代。** 文中的“与 v0.2
+> 并行且不动旧引擎”只描述当时的实现阶段；当前 v2 runtime 已下线，只保留离线
+> 定义迁移与历史归档工具。
+
 - 日期：2026-06-01
 - 上游设计：`2026-06-01-next-gen-workflow-design.md`（v2，用户已拍：A 方案先做引擎 / v0.2 不管 / v3 独立新功能）
 - 目标：**端到端跑通一个 hand-written `dag.json`**，验证三件最不确定的事 —— ephemeral worker + 文件 IPC + 并发调度。grill/architect 自动化壳**本期不做**。

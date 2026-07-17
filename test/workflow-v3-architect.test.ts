@@ -73,17 +73,11 @@ describe('buildArchitectGoal', () => {
     expect(goal).toContain('every value reaches some sink');
   });
 
-  // NOTE (codex nit #18): this asserts the architect PROMPT *teaches* the
-  // capability/override rules — it is NOT proof that downgrade is *enforced*.
-  // The actual enforcement is tested elsewhere: validateDag (dag.ts suite,
-  // type-level "no bypass") + runtime wiring (v3-runtime.test.ts asserts the
-  // restricted snapshot reaches `req.botSnapshot.disableCliBypass`).
-  it('teaches per-node capability override: model 改道 / restricted 降权 / 无 bypass', () => {
+  it('teaches per-node capability override while fixing permission posture to bypass', () => {
     const goal = buildArchitectGoal('/r/spec.md', '/r/spec.json');
     expect(goal).toContain('Per-node capability override');
-    expect(goal).toContain('never escalate');
-    expect(goal).toContain('permissionMode: "restricted"');
-    expect(goal).toContain('NO "bypass" value');
+    expect(goal).toContain('every workflow worker requires CLI bypass permissions');
+    expect(goal).toContain('never emit `permissionMode`');
     expect(goal).toContain('systemPromptAppend');
   });
 });

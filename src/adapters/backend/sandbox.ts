@@ -14,7 +14,10 @@
  * bwrap 0.8.0 has NO --overlay, so we mount the overlay ON THE HOST then bind the
  * merged dir into bwrap. overlayfs forbids upper/work INSIDE lower, so the HOME
  * overlay (lower=/root) puts upper/work OUTSIDE /root (under /var/tmp/...). The
- * PROJECT overlay upper/work under <dataDir>/sandboxes/<sessionId>/ is fine.
+ * merged mountpoints also live there: putting home-merged below HOME makes the
+ * rootless FUSE overlay recursively contain itself, and bwrap can block forever
+ * while resolving later bind destinations. Project upper/work stay under the
+ * data dir because they are the persistent, landable changeset.
  *
  * Linux-only (overlayfs + bwrap depend on Linux). macOS reuses Anthropic's
  * sandbox-exec approach and is handled elsewhere.
@@ -60,20 +63,40 @@ export function mountOverlay(opts: { lower: string; upper: string; work: string;
   return f.status === 0;
 }
 
-/** True iff `path` is currently a mountpoint (host-side overlay still mounted). */
-export function isMounted(path: string): boolean {
-  return spawnSync('mountpoint', ['-q', path], { stdio: 'ignore' }).status === 0;
+function decodeMountInfoPath(raw: string): string {
+  return raw.replace(/\\([0-7]{3})/g, (_match, octal: string) =>
+    String.fromCharCode(Number.parseInt(octal, 8)));
 }
 
-/** Unmount an overlay merged dir. Best-effort: lazy-umount (`-l`) if a normal
- *  umount fails (busy fd from a still-draining child). No-op if not a mount. */
+/** True iff `path` is currently a mountpoint (host-side overlay still mounted).
+ *  Read mountinfo instead of stat'ing the path: a broken recursive FUSE mount can
+ *  leave any path-based `mountpoint` probe blocked in uninterruptible I/O. */
+export function isMounted(path: string): boolean {
+  const target = resolve(path);
+  try {
+    const mountInfo = readFileSync('/proc/self/mountinfo', 'utf8');
+    return mountInfo.split('\n').some(line => {
+      const fields = line.split(' ');
+      return fields.length > 4 && decodeMountInfoPath(fields[4]) === target;
+    });
+  } catch {
+    return spawnSync('mountpoint', ['-q', target], {
+      stdio: 'ignore',
+      timeout: 2_000,
+    }).status === 0;
+  }
+}
+
+/** Unmount an overlay merged dir. Best-effort: lazy detach if a normal unmount
+ *  fails because a still-draining bwrap child holds the FUSE mount busy. */
 export function unmountOverlay(merged: string): void {
   if (!isMounted(merged)) return; // not a mountpoint
   // kernel overlay → `umount`; fuse-overlayfs → `fusermount -u` (a non-root
-  // daemon can't `umount` its own fuse mount); lazy `-l` as a last resort for a
-  // busy fd from a still-draining child.
-  if (spawnSync('umount', [merged], { stdio: 'ignore' }).status === 0) return;
+  // daemon can't `umount` its own fuse mount). `fusermount -uz` is the critical
+  // rootless busy-mount fallback; plain `umount -l` is usually not permitted.
   if (spawnSync('fusermount', ['-u', merged], { stdio: 'ignore' }).status === 0) return;
+  if (spawnSync('umount', [merged], { stdio: 'ignore' }).status === 0) return;
+  if (spawnSync('fusermount', ['-uz', merged], { stdio: 'ignore' }).status === 0) return;
   spawnSync('umount', ['-l', merged], { stdio: 'ignore' });
 }
 
@@ -283,6 +306,49 @@ export function resolveSandboxMountPath(p: string): string {
   return canonicalize(p);
 }
 
+export interface SandboxOverlayPaths {
+  sessionRoot: string;
+  runtimeRoot: string;
+  projectMerged: string;
+  homeMerged: string;
+  legacyProjectMerged: string;
+  legacyHomeMerged: string;
+}
+
+/** Host-side overlay mountpoints must not live below HOME, because HOME is the
+ *  lower layer of the home overlay. The old layout did exactly that and allowed
+ *  fuse-overlayfs to recursively expose its own mountpoint. Keep the legacy
+ *  paths here only so upgrades can tear down pre-fix sessions safely. */
+export function sandboxOverlayPaths(dataDir: string, sessionId: string): SandboxOverlayPaths {
+  const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sessionId);
+  const runtimeRoot = join(VARTMP_ROOT, sessionId);
+  return {
+    sessionRoot,
+    runtimeRoot,
+    projectMerged: join(runtimeRoot, 'proj-merged'),
+    homeMerged: join(runtimeRoot, 'home-merged'),
+    legacyProjectMerged: join(sessionRoot, 'proj-merged'),
+    legacyHomeMerged: join(sessionRoot, 'home-merged'),
+  };
+}
+
+function overlayMountCandidates(paths: SandboxOverlayPaths): string[] {
+  return [
+    paths.projectMerged,
+    paths.homeMerged,
+    paths.legacyProjectMerged,
+    paths.legacyHomeMerged,
+  ];
+}
+
+function unmountSandboxOverlays(paths: SandboxOverlayPaths): void {
+  for (const merged of overlayMountCandidates(paths)) unmountOverlay(merged);
+}
+
+function hasMountedSandboxOverlay(paths: SandboxOverlayPaths): boolean {
+  return overlayMountCandidates(paths).some(isMounted);
+}
+
 /**
  * Resolve user-configured sandboxReadonlyPaths: tilde-expand, drop non-existent
  * entries, and REJECT entries that (after resolving symlinks + normalizing) are
@@ -404,9 +470,9 @@ export function localSandboxApplies(platform: NodeJS.Platform, backendType: stri
  * treats null as a hard error and does NOT silently run unsandboxed).
  *
  * Layout under <dataDir>/sandboxes/<sessionId>/: outbox, shimbin, proj-upper
- * (the landable changeset), proj-work, proj-merged, home-merged. The HOME
- * overlay's upper/work live under /var/tmp/botmux-sbx/<sessionId>/ because
- * overlayfs forbids upper/work inside the lower (= the real home).
+ * (the landable changeset), and proj-work. Host-only merged mountpoints plus the
+ * HOME overlay upper/work live under /var/tmp/botmux-sbx/<sessionId>/ so none of
+ * the FUSE mountpoints is nested below the HOME lower layer.
  */
 export function prepareSandbox(opts: {
   /** Whether the sandbox is on for THIS session (per-bot BotConfig.sandbox OR
@@ -453,16 +519,17 @@ export function prepareSandbox(opts: {
 
   const dataDir = resolveSandboxMountPath(opts.dataDir);
   const botmuxHome = dirname(dataDir);
-  const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
+  const overlayPaths = sandboxOverlayPaths(dataDir, opts.sessionId);
+  const sessionRoot = overlayPaths.sessionRoot;
   const outbox = join(sessionRoot, 'outbox');
   const shimBin = join(sessionRoot, 'shimbin');
   const empties = join(sessionRoot, 'empties');
   const projUpper = join(sessionRoot, 'proj-upper');   // THE LANDABLE CHANGESET
   const projWork = join(sessionRoot, 'proj-work');
-  const projMerged = join(sessionRoot, 'proj-merged');
-  const homeMerged = join(sessionRoot, 'home-merged');  // merged may live under sessionRoot
-  // HOME overlay upper/work MUST be OUTSIDE the home lower (overlayfs constraint).
-  const vartmp = join(VARTMP_ROOT, opts.sessionId);
+  const projMerged = overlayPaths.projectMerged;
+  const homeMerged = overlayPaths.homeMerged;
+  // HOME overlay upper/work and both merged mountpoints MUST be outside HOME.
+  const vartmp = overlayPaths.runtimeRoot;
   const homeUpper = join(vartmp, 'home-upper');
   const homeWork = join(vartmp, 'home-work');
   for (const d of [outbox, shimBin, empties]) mkdirSync(d, { recursive: true });
@@ -482,8 +549,7 @@ export function prepareSandbox(opts: {
 
   // A same-session re-spawn (e.g. in-pane /clear) re-enters here; unmount any
   // stale merged overlays first so we don't stack a second mount on the same dir.
-  unmountOverlay(projMerged);
-  unmountOverlay(homeMerged);
+  unmountSandboxOverlays(overlayPaths);
 
   // Mount the HOME overlay (lower=real home → reads pass through, writes isolate).
   const homeOk = mountOverlay({ lower: home, upper: homeUpper, work: homeWork, merged: homeMerged });
@@ -606,6 +672,13 @@ export function prepareSandbox(opts: {
     BOTMUX_SEND_RELAY: outbox,                       // routes `botmux send` to the daemon outbox watcher
     PATH: `/run/sbxbin:${process.env.PATH ?? ''}`,   // /run/sbxbin first so `botmux` = the relay shim
   };
+  // The daemon discovery dir lives under the masked BOTMUX_HOME, so the only
+  // way an in-sandbox CLI can dial the daemon's loopback IPC (session-scoped,
+  // capability-gated routes like the v3 workflow relay) is this port marker.
+  // Not a credential: every route it reaches authenticates independently.
+  if (process.env.BOTMUX_DAEMON_IPC_PORT) {
+    env.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
+  }
   // Never inherit a custom credential config path into the sandbox. Its host
   // path is masked above as defense in depth, while unsetenv prevents an
   // absolute botmux/lark client from being pointed at it explicitly.
@@ -627,8 +700,7 @@ export function prepareSandbox(opts: {
     workDir: projUpper,
     homeUpper,
     cleanup: () => {
-      unmountOverlay(projMerged);
-      unmountOverlay(homeMerged);
+      unmountSandboxOverlays(overlayPaths);
       try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
       try { rmSync(vartmp, { recursive: true, force: true }); } catch { /* */ }
     },
@@ -648,24 +720,20 @@ export function prepareSandbox(opts: {
  */
 export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }): { outbox: string; workDir: string; cleanup: () => void } | null {
   if (process.platform !== 'linux') return null;
-  const dataDir = resolveSandboxMountPath(opts.dataDir);
-  const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
+  const overlayPaths = sandboxOverlayPaths(opts.dataDir, opts.sessionId);
+  const sessionRoot = overlayPaths.sessionRoot;
   const outbox = join(sessionRoot, 'outbox');
   const projUpper = join(sessionRoot, 'proj-upper');
   if (!existsSync(outbox) && !existsSync(projUpper)) return null; // never sandboxed
   // Ensure the outbox exists (the watcher reads it); never (re)mount here.
   try { mkdirSync(outbox, { recursive: true }); } catch { /* */ }
-  const projMerged = join(sessionRoot, 'proj-merged');
-  const homeMerged = join(sessionRoot, 'home-merged');
-  const vartmp = join(VARTMP_ROOT, opts.sessionId);
   return {
     outbox,
     workDir: projUpper,
     cleanup: () => {
-      unmountOverlay(projMerged);
-      unmountOverlay(homeMerged);
+      unmountSandboxOverlays(overlayPaths);
       try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
-      try { rmSync(vartmp, { recursive: true, force: true }); } catch { /* */ }
+      try { rmSync(overlayPaths.runtimeRoot, { recursive: true, force: true }); } catch { /* */ }
     },
   };
 }
@@ -673,11 +741,10 @@ export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }
 /** Reclaim one session's overlay residue: unmount both merged overlays + rm the
  *  per-session tree (incl. the /var/tmp home scratch). Idempotent / best-effort. */
 function reclaimSandbox(dataDir: string, sid: string): void {
-  const sessionRoot = join(resolveSandboxMountPath(dataDir), 'sandboxes', sid);
-  unmountOverlay(join(sessionRoot, 'proj-merged'));
-  unmountOverlay(join(sessionRoot, 'home-merged'));
-  try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
-  try { rmSync(join(VARTMP_ROOT, sid), { recursive: true, force: true }); } catch { /* */ }
+  const overlayPaths = sandboxOverlayPaths(dataDir, sid);
+  unmountSandboxOverlays(overlayPaths);
+  try { rmSync(overlayPaths.sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+  try { rmSync(overlayPaths.runtimeRoot, { recursive: true, force: true }); } catch { /* */ }
 }
 
 /** Scan the process table for sandbox session-ids referenced by any running
@@ -743,7 +810,8 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
   // cause of the 2026-06-10 incident — keep it as the FIRST gate.
   const live = liveSandboxSids();
   for (const sid of sids) {
-    const sessionRoot = join(root, sid);
+    const overlayPaths = sandboxOverlayPaths(sandboxDataDir, sid);
+    const sessionRoot = overlayPaths.sessionRoot;
     if (live.has(sid)) continue; // a running process holds this sandbox — leave it
     if (activeSessionIds.has(sid)) {
       // Active session: keep it while a host-side overlay is still mounted (= a
@@ -751,7 +819,7 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
       // AND the tree is older than the spawn grace, the worker/CLI is dead →
       // reclaim the dead residue. We NEVER tear down a live mount, so a genuinely
       // live persistent (tmux/herdr/zellij) session keeps its changeset.
-      if (isMounted(join(sessionRoot, 'proj-merged')) || isMounted(join(sessionRoot, 'home-merged'))) continue;
+      if (hasMountedSandboxOverlay(overlayPaths)) continue;
       let ageOk = false;
       try { ageOk = now - statSync(sessionRoot).mtimeMs > ACTIVE_DEAD_GRACE_MS; } catch { ageOk = false; }
       if (!ageOk) continue; // too fresh — could be a worker mid-spawn

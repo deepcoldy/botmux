@@ -13,7 +13,7 @@
  * Run:  pnpm vitest run test/reply-target-fallback.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { fallbackTurnId, resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveSessionReplyTarget } from '../src/core/reply-target.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const NOW = new Date().toISOString();
@@ -93,5 +93,106 @@ describe('fallbackTurnId × resolveSessionReplyTarget (the leak fix)', () => {
     const ds = makeDs();
     const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds as DaemonSession, undefined));
     expect(target).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  it('quoteOnly currentReplyTarget resolves to quote mode, not thread mode', () => {
+    const ds = makeDs({
+      currentReplyTarget: { rootMessageId: 'om_trigger', turnId: 'turn-1', updatedAt: NOW, quoteOnly: true },
+    });
+    const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds as DaemonSession, undefined));
+    expect(target).toEqual({ mode: 'quote', rootMessageId: 'om_trigger' });
+  });
+});
+
+describe('per-turn replyTargets — queued/concurrent turns keep their own anchor', () => {
+  // codex 2nd-review P2: currentReplyTarget is a single slot. Trigger A, then
+  // trigger B while A is still executing → B overwrites the slot → A's send
+  // (turnId mismatch) used to degrade to a top-level plain send. The per-turn
+  // map keeps both anchors alive; both arrival orders are covered.
+  function beginBoth(ds: DaemonSession, first: 'a' | 'b' = 'a') {
+    const order = first === 'a'
+      ? [['om_trigger_a', 'turn-a', true], ['om_trigger_b', 'turn-b', false]] as const
+      : [['om_trigger_b', 'turn-b', false], ['om_trigger_a', 'turn-a', true]] as const;
+    for (const [root, turn, substitute] of order) {
+      beginReplyTargetTurn(ds, root, turn, NOW, { quoteOnly: false, substitute });
+    }
+  }
+
+  it('turn A keeps its thread anchor after turn B overwrites currentReplyTarget', () => {
+    const ds = makeDs() as DaemonSession;
+    beginBoth(ds, 'a');
+    expect(ds.currentReplyTarget?.turnId).toBe('turn-b'); // slot = latest
+    expect(resolveSessionReplyTarget(ds, 'turn-a')).toEqual({ mode: 'thread', rootMessageId: 'om_trigger_a' });
+    expect(resolveSessionReplyTarget(ds, 'turn-b')).toEqual({ mode: 'thread', rootMessageId: 'om_trigger_b' });
+  });
+
+  it('same in the reverse arrival order', () => {
+    const ds = makeDs() as DaemonSession;
+    beginBoth(ds, 'b');
+    expect(ds.currentReplyTarget?.turnId).toBe('turn-a');
+    expect(resolveSessionReplyTarget(ds, 'turn-a')).toEqual({ mode: 'thread', rootMessageId: 'om_trigger_a' });
+    expect(resolveSessionReplyTarget(ds, 'turn-b')).toEqual({ mode: 'thread', rootMessageId: 'om_trigger_b' });
+  });
+
+  it('per-turn quoteOnly survives the overwrite', () => {
+    const ds = makeDs() as DaemonSession;
+    beginReplyTargetTurn(ds, 'om_quote_turn', 'turn-q', NOW, { quoteOnly: true, substitute: true });
+    beginReplyTargetTurn(ds, 'om_thread_turn', 'turn-t', NOW, { quoteOnly: false, substitute: false });
+    expect(resolveSessionReplyTarget(ds, 'turn-q')).toEqual({ mode: 'quote', rootMessageId: 'om_quote_turn' });
+    expect(resolveSessionReplyTarget(ds, 'turn-t')).toEqual({ mode: 'thread', rootMessageId: 'om_thread_turn' });
+  });
+
+  it('pickTurnReplyTarget prefers the exact per-turn entry and falls back to the slot', () => {
+    const ds = makeDs() as DaemonSession;
+    beginBoth(ds, 'a');
+    expect(pickTurnReplyTarget(ds.session, 'turn-a')).toEqual({ rootMessageId: 'om_trigger_a', turnId: 'turn-a', quoteOnly: false, substitute: true });
+    // Unknown turn → the (latest) single slot, preserving legacy behavior for
+    // sessions persisted before the map existed.
+    expect(pickTurnReplyTarget({ currentReplyTarget: ds.session.currentReplyTarget }, 'turn-x')?.turnId).toBe('turn-b');
+  });
+
+  it('a rootless normal turn is NOT judged substitute after a substitute turn overwrites the slot (codex delta repro)', () => {
+    // Real sequence for 普通群 replyMode=chat: a top-level normal @bot turn has
+    // no replyRootId (begin clears the slot, writes NO map entry); then a
+    // substitute trigger B begins. Turn A must not inherit B's flag via the
+    // slot fallback.
+    const ds = makeDs() as DaemonSession;
+    beginReplyTargetTurn(ds, undefined, 'turn-normal-a', NOW);
+    beginReplyTargetTurn(ds, 'om_trigger_b', 'turn-sub-b', NOW, { quoteOnly: false, substitute: true });
+
+    expect(isSubstituteTurn(ds, 'turn-normal-a')).toBe(false);
+    expect(isSubstituteTurn(ds, 'turn-sub-b')).toBe(true);
+    // And the rootless turn still routes plain, not under B's anchor.
+    expect(resolveSessionReplyTarget(ds, 'turn-normal-a')).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  it('reverse order: substitute turn stays card-off after a rootless normal turn clears the slot', () => {
+    const ds = makeDs() as DaemonSession;
+    beginReplyTargetTurn(ds, 'om_trigger_b', 'turn-sub-b', NOW, { quoteOnly: false, substitute: true });
+    beginReplyTargetTurn(ds, undefined, 'turn-normal-a', NOW);
+
+    expect(isSubstituteTurn(ds, 'turn-sub-b')).toBe(true); // map survives the slot clear
+    expect(isSubstituteTurn(ds, 'turn-normal-a')).toBe(false);
+  });
+
+  it('isSubstituteTurn without turn context keeps the latest-slot fallback', () => {
+    const ds = makeDs() as DaemonSession;
+    beginReplyTargetTurn(ds, 'om_trigger_b', 'turn-sub-b', NOW, { substitute: true });
+    expect(isSubstituteTurn(ds)).toBe(true);
+    beginReplyTargetTurn(ds, undefined, 'turn-normal-a', NOW);
+    expect(isSubstituteTurn(ds)).toBe(false); // slot cleared by the rootless turn
+  });
+
+  it('bounds the map and evicted turns degrade to the legacy single-slot behavior', () => {
+    const ds = makeDs() as DaemonSession;
+    for (let i = 0; i < 40; i++) {
+      beginReplyTargetTurn(ds, `om_${i}`, `turn-${i}`, new Date(Date.parse(NOW) + i * 1000).toISOString());
+    }
+    const keys = Object.keys(ds.session.replyTargets ?? {});
+    expect(keys.length).toBe(32);
+    expect(keys).not.toContain('turn-0'); // oldest pruned
+    expect(keys).toContain('turn-39');
+    // Evicted turn: map miss + slot mismatch → plain (pre-map behavior).
+    expect(resolveSessionReplyTarget(ds, 'turn-0')).toEqual({ mode: 'plain', chatId: 'oc_chat' });
   });
 });

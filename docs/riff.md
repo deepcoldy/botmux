@@ -11,7 +11,7 @@
    | 字段 | 怎么填 |
    |------|--------|
    | Base URL | **必填**。线上 `https://riff.bytedance.net`；BOE 测试环境 `https://riff-infra-boe.bytedance.net` |
-   | Agent | 默认 `aiden`；可选 `aiden-claude` / `codex` / `opencode` |
+   | Agent | 默认 `codex`；可选 `aiden` / `aiden-claude` / `opencode` |
    | 模型 | **留空**（推荐，使用 riff 侧默认模型） |
    | JWT 环境变量 | 一般**留空**，见「认证（JWT）」 |
    | System Prompt / 额外初始化命令 | 可选。自定义 System Prompt 是**追加**在内置路由规则之后，不会替换它 |
@@ -72,7 +72,7 @@ python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/ka
 
 | 现象 | 原因与处理 |
 |------|-----------|
-| 发消息后没回复 | ① JWT 过期（见上）② Agent 名不受支持（只认 aiden / aiden-claude / codex / opencode）③ 打开「Web 终端」日志页看 `[riff] 错误` 行 |
+| 发消息后没回复 | ① JWT 过期（见上）② Agent 名不受支持（只认 codex / aiden / aiden-claude / opencode）③ 打开「Web 终端」日志页看 `[riff] 错误` 行 |
 | 报「仓库 xxx 不存在」 | Base URL 环境与仓库不匹配，或填了外部仓库；确认是 code.byted.org 上的 `group/repo` |
 | 保存配置报 invalid_base_url | Base URL 必填且必须以 http(s) 开头 |
 | 继续对话每轮都要几分钟 | 正常应为秒级（follow-up 复用暖沙箱）；若每轮冷启动，检查是否每次 /close 后重开、或配置中途被改 |

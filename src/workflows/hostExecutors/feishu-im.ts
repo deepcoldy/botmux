@@ -1,4 +1,4 @@
-import type { ProviderReconciler } from '../resume.js';
+import type { ProviderReconciler } from '../shared/provider-reconciler.js';
 import { feishuReplyReconciler } from './feishu-reply.js';
 import { feishuSendReconciler } from './feishu-send.js';
 
@@ -8,15 +8,15 @@ import { feishuSendReconciler } from './feishu-send.js';
  * `effectAttempted.provider` is intentionally `feishu-im` for both
  * `feishu-send` and `feishu-reply` because Feishu's idempotency surface
  * is the IM uuid field.  The executor id identifies the author-facing
- * operation; resume only sees the provider, so it dispatches by the
- * recovered effect input shape.
+ * operation; durable recovery sees the provider, so it dispatches by the
+ * verified frozen effect-input shape.
  */
 export const feishuImReconciler: ProviderReconciler = {
   provider: 'feishu-im',
   requiresEffectInput: true,
 
   canonicalInput(input) {
-    // The hash guard in resume needs to canonicalize via the SAME shape
+    // The recovery hash guard must canonicalize via the SAME shape
     // the original executor used.  Dispatch by input discriminator —
     // identical logic to idempotentSubmit's routing.
     if (isRecord(input) && Object.prototype.hasOwnProperty.call(input, 'rootMessageId')) {

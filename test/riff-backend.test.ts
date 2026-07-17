@@ -354,6 +354,19 @@ describe('RiffBackend', () => {
     });
   });
 
+  describe('agent default (config simplification)', () => {
+    it('defaults the task agent to codex when not configured', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      be.spawn('', [], {} as any);
+      be.write('hi');
+      await flush();
+      resolvers.shift()!(taskResponse('task-1'));
+      await flush();
+      const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
+      expect(JSON.parse(String(exec.init?.body)).config.agent).toBe('codex');
+    });
+  });
+
   describe('repo reuse (复用本地仓库+分支)', () => {
     it('parseRiffRepoName normalizes internal specs and rejects external hosts', () => {
       expect(parseRiffRepoName('git@code.byted.org:webinfra/agent-monorepo.git')).toBe('webinfra/agent-monorepo');

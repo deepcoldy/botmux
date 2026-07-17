@@ -18,13 +18,13 @@ export async function updateBotSubstituteMode(
 ): Promise<{ ok: true; substituteMode: SubstituteModeConfig | null } | { ok: false; reason: string }> {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
-  const normalized = normalizeSubstituteMode(raw);
-  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-    const enabled = (raw as Record<string, unknown>).enabled;
-    const targets = (raw as Record<string, unknown>).targets;
-    if (enabled === true && (!Array.isArray(targets) || targets.length === 0 || !normalized)) {
-      return { ok: false, reason: 'targets_required' };
-    }
+  const rec = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const chats = Array.isArray(rec.chats)
+    ? [...new Set(rec.chats.map(String).map(s => s.trim()).filter(Boolean))]
+    : [];
+  const normalized = normalizeSubstituteMode({ ...rec, chats: chats.length ? chats : undefined });
+  if (rec.enabled === true && (!Array.isArray(rec.targets) || rec.targets.length === 0 || !normalized)) {
+    return { ok: false, reason: 'targets_required' };
   }
 
   const r = await rmwBotEntry<SubstituteModeConfig | null>(larkAppId, (entry) => {
@@ -48,15 +48,28 @@ export interface SubstituteTargetResolution {
   openId?: string;
   name?: string;
   avatarUrl?: string;
+  /** Machine-readable failure reason when ok=false. */
+  reason?: 'cross_app_open_id' | 'not_visible' | 'resolve_failed' | 'unresolvable';
 }
 
 /** Injected Lark resolvers (real impls live in `im/lark/client`; tests mock). */
 export interface SubstituteResolveDeps {
   /** Resolve a mixed list of `ou_*` / `on_*` / email strings → open_ids, with a
-   *  `raw → open_id` map (matches `resolveAllowedUsersWithMap`). */
-  resolveRaw: (larkAppId: string, raw: string[]) => Promise<{ resolved: string[]; map: Map<string, string> }>;
-  /** open_id → display name (+ avatar). Returns null when unknown. */
-  getProfile: (larkAppId: string, openId: string) => Promise<{ name: string; avatarUrl?: string } | null>;
+   *  `raw → open_id` map (matches `resolveAllowedUsersWithMap`). `errored`
+   *  reports a transient failure during resolution (real impl swallows API
+   *  errors internally, so a thrown rejection alone can't signal this). */
+  resolveRaw: (larkAppId: string, raw: string[]) => Promise<{ resolved: string[]; map: Map<string, string>; errored?: boolean }>;
+  /** open_id → profile lookup with per-cause definitive/transient distinction
+   *  (matches `getUserProfileStrict`): 'cross_app' = belongs to another app;
+   *  'not_visible' = outside this app's contact visibility scope; 'invalid_id'
+   *  = no such user / malformed; 'error' = transient, retry may succeed. */
+  getProfile: (larkAppId: string, openId: string) => Promise<
+    | { status: 'ok'; profile: { name: string; avatarUrl?: string } }
+    | { status: 'cross_app' }
+    | { status: 'not_visible' }
+    | { status: 'invalid_id' }
+    | { status: 'error' }
+  >;
 }
 
 type RawTarget = { openId?: string; userId?: string; unionId?: string; email?: string; name?: string };
@@ -88,9 +101,13 @@ export async function resolveSubstituteTargets(
 
   const rawList = inputs.map(i => i.raw).filter(Boolean);
   let map = new Map<string, string>();
+  let resolveErrored = false;
   if (rawList.length) {
-    try { ({ map } = await deps.resolveRaw(larkAppId, rawList)); }
-    catch { map = new Map(); }
+    try {
+      const r = await deps.resolveRaw(larkAppId, rawList);
+      map = r.map;
+      resolveErrored = r.errored === true;
+    } catch { resolveErrored = true; map = new Map(); }
   }
 
   const targets: SubstituteTarget[] = [];
@@ -99,20 +116,38 @@ export async function resolveSubstituteTargets(
 
   for (const { t, raw } of inputs) {
     if (!raw) continue;
+    const isRawOpenId = !!t.openId;
     const openId = map.get(raw) ?? (t.openId && map.has(t.openId) ? map.get(t.openId) : undefined);
 
     if (openId) {
       let name = t.name;
       let avatarUrl: string | undefined;
-      try {
-        const p = await deps.getProfile(larkAppId, openId);
-        if (p?.name) { name = p.name; avatarUrl = p.avatarUrl; }
-      } catch { /* keep the caller-supplied name */ }
+      // Per-cause lookup: definitive failures keep their reason (跨应用 ≠
+      // 通讯录不可见 ≠ 无效 id)，'error' is transient (network / rate limit)
+      // and must not masquerade as any definitive cause or the user gets told
+      // to discard a perfectly valid target.
+      const lookup = await deps.getProfile(larkAppId, openId)
+        .catch(() => ({ status: 'error' as const }));
+      if (lookup.status === 'ok' && lookup.profile.name) {
+        name = lookup.profile.name;
+        avatarUrl = lookup.profile.avatarUrl;
+      } else if (isRawOpenId) {
+        // A hand-typed open_id must be reachable by this app to be matchable at
+        // runtime. Email/union_id resolved open_ids are already app-scoped, so a
+        // failed profile lookup is not fatal for them.
+        const reason = lookup.status === 'cross_app' ? 'cross_app_open_id'
+          : lookup.status === 'not_visible' ? 'not_visible'
+          : lookup.status === 'invalid_id' ? 'unresolvable'
+          : 'resolve_failed';
+        resolution.push({ input: raw, ok: false, reason });
+        continue;
+      }
       resolution.push({ input: raw, ok: true, openId, name, avatarUrl });
       if (seen.has(openId)) continue; // dedupe duplicate people, keep both chips
       seen.add(openId);
       const out: SubstituteTarget = { openId };
       if (name) out.name = name;
+      if (avatarUrl) out.avatarUrl = avatarUrl;
       if (t.email) out.email = t.email;
       targets.push(out);
     } else if (t.userId) {
@@ -123,7 +158,7 @@ export async function resolveSubstituteTargets(
       if (t.email) out.email = t.email;
       targets.push(out);
     } else {
-      resolution.push({ input: raw, ok: false });
+      resolution.push({ input: raw, ok: false, reason: resolveErrored ? 'resolve_failed' : 'unresolvable' });
     }
   }
 

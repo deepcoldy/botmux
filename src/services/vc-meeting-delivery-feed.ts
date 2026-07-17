@@ -4,7 +4,7 @@ import type {
   VcMeetingActivityType,
   VcMeetingActor,
 } from '../vc-agent/types.js';
-import { canonicalJson, computeInputHash } from '../workflows/events/idempotency.js';
+import { canonicalJson, computeInputHash } from '../utils/canonical-input-hash.js';
 import {
   VC_MEETING_DELIVERY_SCHEMA_VERSION,
   computeVcMeetingDeliveryInputHash,

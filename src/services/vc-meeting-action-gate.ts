@@ -35,7 +35,7 @@ import {
   type VcMeetingDeliveryReceiptRecord,
   type VcMeetingMemberProjectionRecord,
 } from './vc-meeting-delivery-store.js';
-import { canonicalJson, computeInputHash } from '../workflows/events/idempotency.js';
+import { canonicalJson, computeInputHash } from '../utils/canonical-input-hash.js';
 
 const MAX_OUTPUT_CHARS = 200;
 

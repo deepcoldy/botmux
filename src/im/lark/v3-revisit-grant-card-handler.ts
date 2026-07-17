@@ -15,13 +15,9 @@ import {
   v3RevisitGrantCardNonce,
   type V3RevisitGrantActionValue,
 } from './v3-revisit-grant-card.js';
-import { requestRevisitGrant, revisitBudgetBlockedInfoFor } from '../../workflows/v3/daemon-run.js';
+import { requestRevisitGrant, revisitBudgetBlockedInfoFor, readV3RunChatBinding } from '../../workflows/v3/daemon-run.js';
 import { readJournal } from '../../workflows/v3/journal.js';
-import {
-  readGrillState,
-  defaultBaseDir,
-  type RunChatBinding,
-} from '../../workflows/v3/grill-state.js';
+import { defaultBaseDir, type RunChatBinding } from '../../workflows/v3/grill-state.js';
 import { isValidRunId } from '../../workflows/v3/ops-projection.js';
 
 export function isV3RevisitGrantAction(action: unknown): boolean {
@@ -58,8 +54,7 @@ export async function handleV3RevisitGrantAction(
   }
   const tier = value.tier === 'run' ? 'run' : 'pair';
   const runDir = join(baseDir, value.runId);
-  const grill = readGrillState(runDir);
-  const binding = grill?.chatBinding;
+  const binding = readV3RunChatBinding(runDir);
 
   if (deps.canResolve && !deps.canResolve(binding, operatorOpenId)) {
     return { toast: { type: 'warning', content: '你没有权限准许这个 run 的回溯' } };

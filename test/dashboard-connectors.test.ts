@@ -2,10 +2,23 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildConnectorInstructionUpdateBody,
+  buildConnectorKindOptions,
   replaceConnectorById,
 } from '../src/dashboard/web/connectors-page.js';
 
 describe('dashboard connector instruction editing', () => {
+  it('keeps the legacy workflow kind visible but disabled in the create surface', () => {
+    const options = buildConnectorKindOptions((key) => key);
+    expect(options).toEqual([
+      { value: 'turn', label: 'connectors.kindTurn' },
+      {
+        value: 'workflow',
+        label: 'connectors.kindWorkflowRetiring',
+        disabled: true,
+      },
+    ]);
+  });
+
   it('updates only the prompt envelope and leaves secrets untouched', () => {
     const body = buildConnectorInstructionUpdateBody(
       { name: 'Prod alerts', promptEnvelope: { sourceName: 'alerts' } },

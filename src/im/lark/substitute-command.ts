@@ -4,6 +4,7 @@ import { getChatMode, replyMessage } from './client.js';
 import { isSubstituteEnabledForChat, setSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { logger } from '../../utils/logger.js';
+import { getBot } from '../../bot-registry.js';
 
 export async function tryHandleSubstituteCommand(
   larkAppId: string,
@@ -27,8 +28,16 @@ export async function tryHandleSubstituteCommand(
         .catch(err => logger.warn(`[substitute] reply failed: ${err?.message ?? err}`))
     : Promise.resolve();
 
-  if (!chatId || isP2p || (await getChatMode(larkAppId, chatId)) !== 'group') {
+  // 普通群与话题群都支持 per-chat 开关；只有 p2p / 未知 chat_mode 拒绝。
+  const chatMode = !chatId || isP2p ? undefined : await getChatMode(larkAppId, chatId);
+  if (!chatId || isP2p || (chatMode !== 'group' && chatMode !== 'topic')) {
     await reply(t('cmd.substitute.unsupported', undefined, loc));
+    return true;
+  }
+  if (chatMode === 'topic' && getBot(larkAppId).config.substituteMode?.topicGroups === false) {
+    // topicGroups 是 bot 级总开关；per-chat toggle 不能越过它。若仍回 status_on /
+    // updated_on，用户会看到“已开启”但 dispatcher 永远不触发，形成假成功。
+    await reply(t('cmd.substitute.topic_disabled', undefined, loc));
     return true;
   }
 

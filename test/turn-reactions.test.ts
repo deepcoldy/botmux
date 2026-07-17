@@ -126,6 +126,72 @@ describe('two-phase turn reactions', () => {
     expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_sub']);
   });
 
+  it('substitute turn is card-off even when streaming card is globally enabled', async () => {
+    registerWith(false);
+    const ds = makeDs({
+      currentReplyTarget: { rootMessageId: 'om_trigger', turnId: 'om_a', updatedAt: new Date().toISOString(), substitute: true },
+    });
+
+    await noteTurnReceived(ds, 'om_a');
+
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
+    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
+  });
+
+  it('queued substitute turn A stays card-off after normal turn B overwrote the slot (per-turn gate)', async () => {
+    registerWith(false);
+    const ds = makeDs({
+      // Slot points at the LATEST turn (normal B); the executing turn A is a
+      // substitute turn recorded in the per-turn map.
+      currentReplyTarget: { rootMessageId: 'om_b', turnId: 'om_b', updatedAt: new Date().toISOString() },
+      session: {
+        sessionId: 'sess-ab', chatId: 'oc_x', rootMessageId: 'om_root',
+        replyTargets: {
+          om_a: { rootMessageId: 'om_trigger_a', updatedAt: new Date().toISOString(), substitute: true },
+          om_b: { rootMessageId: 'om_b', updatedAt: new Date().toISOString() },
+        },
+      },
+    });
+
+    await noteTurnReceived(ds, 'om_a');
+
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
+  });
+
+  it('reverse order: normal turn A keeps its card after substitute turn B overwrote the slot', async () => {
+    registerWith(false);
+    const ds = makeDs({
+      currentReplyTarget: { rootMessageId: 'om_trigger_b', turnId: 'om_b', updatedAt: new Date().toISOString(), substitute: true },
+      session: {
+        sessionId: 'sess-ba', chatId: 'oc_x', rootMessageId: 'om_root',
+        replyTargets: {
+          om_a: { rootMessageId: 'om_a', updatedAt: new Date().toISOString() },
+          om_b: { rootMessageId: 'om_trigger_b', updatedAt: new Date().toISOString(), substitute: true },
+        },
+      },
+    });
+
+    await noteTurnReceived(ds, 'om_a');
+
+    // Normal turn A is card-on → no ack reaction for it, even though the slot
+    // currently belongs to substitute turn B.
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions ?? []).toEqual([]);
+  });
+
+  it('a later non-substitute turn in the same session gets the streaming card back (no session latch)', async () => {
+    registerWith(false);
+    const ds = makeDs({
+      // A direct @bot turn overwrote the reply target: substitute flag gone.
+      currentReplyTarget: { rootMessageId: 'om_direct', turnId: 'om_b', updatedAt: new Date().toISOString() },
+    });
+
+    await noteTurnReceived(ds, 'om_b');
+
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions ?? []).toEqual([]);
+  });
+
   it('silentTurnReactions suppresses receipt reactions in card-off sessions', async () => {
     registerWith(true, { silentTurnReactions: true });
     const ds = makeDs();

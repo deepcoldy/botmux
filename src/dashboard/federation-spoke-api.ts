@@ -17,7 +17,7 @@ import { readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { config } from '../config.js';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
 import { buildTeamRoster, type LiveBot } from '../services/team-roster.js';
 import { buildFederatedRoster } from '../services/federation-roster.js';
 import { getDeploymentIdentity, setDeploymentName } from '../services/deployment-identity.js';

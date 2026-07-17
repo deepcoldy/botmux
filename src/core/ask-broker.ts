@@ -39,11 +39,11 @@ let dispatcher: AskCardDispatcher | null = null;
  *  honour the bot's canTalk gate without importing Lark types: whoever may
  *  address the bot in this chat may answer its `botmux ask`. Returns false until
  *  wired, so an unwired broker authorizes no one (daemon always wires it). */
-let canTalkChecker: ((larkAppId: string, chatId: string, openId: string) => boolean) | null = null;
+let canTalkChecker: ((larkAppId: string, chatId: string, openId: string, chatType?: 'group' | 'p2p') => boolean) | null = null;
 
 /** Wire the canTalk predicate. Called once during daemon bootstrap. */
 export function setCanTalkChecker(
-  fn: (larkAppId: string, chatId: string, openId: string) => boolean,
+  fn: (larkAppId: string, chatId: string, openId: string, chatType?: 'group' | 'p2p') => boolean,
 ): void {
   canTalkChecker = fn;
 }
@@ -52,7 +52,7 @@ export function setCanTalkChecker(
  *  `botmux ask` is a talk-level interaction (answering the agent's question),
  *  so it follows the canTalk gate — not the stricter canOperate / allowedUsers. */
 function isAuthorizedToAnswer(ask: InternalPending, by: string): boolean {
-  return canTalkChecker?.(ask.larkAppId, ask.chatId, by) ?? false;
+  return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.chatType) ?? false;
 }
 
 /** Window during which a settled ask is still queryable so race-losers get a
@@ -117,6 +117,7 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
       chatId: input.chatId,
       rootMessageId: input.rootMessageId,
       sessionId: input.sessionId,
+      chatType: input.chatType,
       questions: input.questions,
       createdAt,
       deadlineAt,

@@ -491,6 +491,7 @@ describe('buildReforkPrompt', () => {
     expect(out).not.toContain('<session_id>');
     expect(out).toContain('hello');
   });
+
 });
 
 // ─── renderSenderTag — <sender> attribute rendering / XML escape ────────────

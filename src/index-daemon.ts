@@ -21,7 +21,7 @@ dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 // hook-runner's CLI gate would then mistake the daemon for CLI context and
 // forward every hook event to the daemon itself (/api/hooks/emit) in an
 // infinite self-loop. Scrub unconditionally at boot.
-for (const k of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_ROOT_MESSAGE_ID']) {
+for (const k of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_CHAT_TYPE', 'BOTMUX_ROOT_MESSAGE_ID']) {
   delete process.env[k];
 }
 

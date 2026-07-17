@@ -15,7 +15,11 @@
 
 import { writeFileSync, renameSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { StoredEvent, V3RunFailureReason } from './journal.js';
+import type {
+  StoredEvent,
+  V3RunFailureReason,
+  V3UncertainHostEffect,
+} from './journal.js';
 import type {
   V3EdgeRunState,
   V3LoopRunState,
@@ -25,10 +29,23 @@ import type {
   V3RunState,
 } from './orchestrator.js';
 
-export type V3RunStatus = 'running' | 'succeeded' | 'failed' | 'blocked';
+export type V3RunStatus =
+  | 'running'
+  | 'cancelling'
+  | 'cancelled'
+  | 'succeeded'
+  | 'failed'
+  | 'blocked';
 
 export interface V3RunSnapshot {
   runStatus: V3RunStatus;
+  /** First-wins durable cancellation boundary. Once present, later ordinary
+   *  dispatch/settle events are audit-only and cannot revive the run. */
+  cancelRequestId?: string;
+  cancelRequestedBy?: string;
+  /** External effects that may have been applied even though the run reached
+   *  cancellation. Safe, bounded identities only — never provider payloads. */
+  uncertainHostEffects?: V3UncertainHostEffect[];
   /** Set once `runFailed` is observed — the node that triggered fail-fast. */
   failedNodeId?: string;
   /** Workflow-level failure reason; ordinary node failures keep using
@@ -73,6 +90,8 @@ export interface V3RunSnapshot {
  *   edgeResolved       → edges[first `${from}->${to}`] (first-wins)
  *   nodeSkipped        → skipped
  *   nodeCancelled      → cancelled (settle-wins; late same-attempt settle ignored)
+ *   nodeAttemptDrained → pending only when the exact current attempt was
+ *                        still running; otherwise resource-audit only
  */
 export function materialize(events: StoredEvent[]): V3RunSnapshot {
   const nodes: V3RunState = new Map();
@@ -81,11 +100,15 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
   const loops: V3LoopRunState = new Map();
   const edges: V3EdgeRunState = new Map();
   let runStatus: V3RunStatus = 'running';
+  let cancelRequestId: string | undefined;
+  let cancelRequestedBy: string | undefined;
   let failedNodeId: string | undefined;
   let failureReason: V3RunFailureReason | undefined;
   let failureDetail: string | undefined;
   let blockedNodeId: string | undefined;
+  let uncertainHostEffects: V3UncertainHostEffect[] | undefined;
   const cancelledAttempts = new Map<string, string | undefined>();
+  const resolvedWaitIds = new Set<string>();
 
   const set = (id: string, status: V3NodeStatus, gateCleared?: boolean): void => {
     const prev = nodes.get(id);
@@ -146,6 +169,20 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
   };
 
   for (const e of events) {
+    // A durable cancel request is a journal cut: work already committed before
+    // it stays committed, while every later ordinary worker/gate/control event
+    // is stale audit data. Only cancellation convergence records may mutate the
+    // folded state after the cut. This makes request-vs-settle races linear by
+    // journal order, including two-daemon overlap windows.
+    if (
+      cancelRequestId !== undefined &&
+      e.type !== 'runCancelRequested' &&
+      e.type !== 'nodeCancelled' &&
+      e.type !== 'nodeAttemptDrained' &&
+      e.type !== 'hostEffectUncertain' &&
+      e.type !== 'hostEffectRetryDeferred' &&
+      e.type !== 'runCancelled'
+    ) continue;
     switch (e.type) {
       case 'runStarted':
         runStatus = 'running';
@@ -163,6 +200,43 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         else set(e.nodeId, 'running');
         attempts.set(e.instanceId ?? e.nodeId, e.attemptId); // constraint 3: key by instance when present
         break;
+      case 'hostInputPrepared':
+        // Preparation reserves an attempt id but is not execution: no provider
+        // call can start before hostEffectIntent. It DOES establish the
+        // instance as the node's effective pending instance so a preparation
+        // failure can settle the authored node instead of only an orphan
+        // instance record.
+        instances.set(e.instanceId, { status: 'pending' });
+        nodes.set(e.nodeId, {
+          status: 'pending',
+          effectiveInstanceId: e.instanceId,
+        });
+        attempts.set(e.instanceId, e.attemptId);
+        break;
+      case 'hostEffectIntent':
+        if (instances.get(e.instanceId)?.status === 'cancelled') break;
+        recordInstance(e.nodeId, e.instanceId, 'running', true);
+        attempts.set(e.instanceId, e.attemptId);
+        break;
+      case 'hostEffectUncertain': {
+        const identity: V3UncertainHostEffect = {
+          nodeId: e.nodeId,
+          instanceId: e.instanceId,
+          attemptId: e.attemptId,
+          executor: e.executor,
+          errorCode: e.errorCode,
+        };
+        const prior = uncertainHostEffects ?? [];
+        if (!prior.some((item) => item.attemptId === e.attemptId)) {
+          uncertainHostEffects = [...prior, identity];
+        }
+        // After a cancellation cut this is audit/terminal-warning state only;
+        // the finalizer still neutral-cancels the materialized running node.
+        if (cancelRequestId !== undefined) break;
+        if (e.instanceId) recordInstance(e.nodeId, e.instanceId, 'blocked', false);
+        else set(e.nodeId, 'blocked');
+        break;
+      }
       case 'nodeSucceeded':
         if (cancelledCovers(e.instanceId ?? e.nodeId, e.attemptId)) break;
         if (e.instanceId) recordInstance(e.nodeId, e.instanceId, 'done', false);
@@ -175,7 +249,17 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         break;
       case 'nodeBlocked':
         if (cancelledCovers(e.instanceId ?? e.nodeId, e.attemptId)) break;
-        if (e.instanceId) recordInstance(e.nodeId, e.instanceId, 'blocked', false);
+        if (e.instanceId) {
+          // A crash can leave an invalid host-input sidecar before the normal
+          // hostInputPrepared event establishes the instance pointer. Its
+          // integrity block is the first durable observation of that instance;
+          // make it effective so the run really blocks and operator retry can
+          // reserve attempt 002. Never promote a late settle over an existing
+          // node, and recordInstance still rejects superseded instances.
+          const firstObservation = !nodes.has(e.nodeId) && !instances.has(e.instanceId);
+          recordInstance(e.nodeId, e.instanceId, 'blocked', firstObservation);
+          if (firstObservation) attempts.set(e.instanceId, e.attemptId);
+        }
         else set(e.nodeId, 'blocked');
         break;
       case 'nodeRetryRequested':
@@ -184,8 +268,16 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         // pending — NOT a memory-only patch that evaporates on next replay.
         // Constraint 5: retry is a new ATTEMPT inside the SAME instance — the
         // node keeps its effectiveInstanceId; only its status goes pending.
-        set(e.nodeId, 'pending');
-        if (e.instanceId) instances.set(e.instanceId, { status: 'pending' });
+        if (e.resetGate) {
+          nodes.set(e.nodeId, {
+            status: 'pending',
+            ...(e.instanceId ? { effectiveInstanceId: e.instanceId } : {}),
+          });
+          if (e.instanceId) instances.set(e.instanceId, { status: 'pending' });
+        } else {
+          set(e.nodeId, 'pending');
+          if (e.instanceId) instances.set(e.instanceId, { status: 'pending' });
+        }
         attempts.set(e.instanceId ?? e.nodeId, e.nextAttemptId); // constraint 3
         if (runStatus === 'blocked') {
           runStatus = 'running';
@@ -216,24 +308,44 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         break;
       }
       case 'gateDispatched':
+        if (resolvedWaitIds.has(e.waitId)) break;
         if (nodes.get(e.nodeId)?.status === 'cancelled') break;
         // Gate is per-INSTANCE (constraint 6): A#001's approval must not clear
         // A#002.  When the event carries instanceId, the gate state lives on
         // the instance + (when effective) mirrors to the node.
         if (e.instanceId) {
-          instances.set(e.instanceId, { status: 'gateWaiting' });
-          nodes.set(e.nodeId, { ...(nodes.get(e.nodeId) ?? {}), status: 'gateWaiting', effectiveInstanceId: e.instanceId });
+          instances.set(e.instanceId, {
+            status: 'gateWaiting',
+          });
+          nodes.set(e.nodeId, {
+            ...(nodes.get(e.nodeId) ?? {}),
+            status: 'gateWaiting',
+            effectiveInstanceId: e.instanceId,
+          });
         } else set(e.nodeId, 'gateWaiting');
         break;
       case 'gateResolved': {
+        // The wait file uses the same first-wins rule. Replay must not let a
+        // later contradictory click flip an already-authorized decision.
+        if (resolvedWaitIds.has(e.waitId)) break;
+        resolvedWaitIds.add(e.waitId);
         if (nodes.get(e.nodeId)?.status === 'cancelled') break;
         const approved = e.resolution === 'approved';
         if (e.instanceId) {
-          instances.set(e.instanceId, approved ? { status: 'pending', gateCleared: true } : { status: 'failed' });
+          instances.set(e.instanceId, approved ? {
+            status: 'pending',
+            gateCleared: true,
+            ...(e.hostApproval ? { approvedHostInput: e.hostApproval } : {}),
+          } : { status: 'failed' });
           // Only mirror to the node view if this instance is the live one.
           if (nodes.get(e.nodeId)?.effectiveInstanceId === e.instanceId) {
             const prev = nodes.get(e.nodeId)!;
-            nodes.set(e.nodeId, approved ? { ...prev, status: 'pending', gateCleared: true } : { ...prev, status: 'failed' });
+            nodes.set(e.nodeId, approved ? {
+              ...prev,
+              status: 'pending',
+              gateCleared: true,
+              ...(e.hostApproval ? { approvedHostInput: e.hostApproval } : {}),
+            } : { ...prev, status: 'failed' });
           }
         } else if (approved) set(e.nodeId, 'pending', true);
         else set(e.nodeId, 'failed');
@@ -264,6 +376,54 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         cancelledAttempts.set(e.instanceId ?? e.nodeId, e.attemptId);
         if (e.instanceId) recordInstance(e.nodeId, e.instanceId, 'cancelled', false);
         else set(e.nodeId, 'cancelled');
+        break;
+      case 'nodeAttemptDrained': {
+        // A drained peer must be retryable after a blocked run is reopened or
+        // after crash recovery. Never revive an obsolete/settled instance, and
+        // A legacy runBlocked may precede peer close; reset that exact peer so
+        // a later retry re-dispatches it. True terminals/cancellation stay
+        // audit-only, and runStatus/blockedNodeId themselves are unchanged.
+        if (runStatus !== 'running' && runStatus !== 'blocked') break;
+        const key = e.instanceId ?? e.nodeId;
+        if (attempts.get(key) !== e.attemptId) break;
+        if (e.instanceId) {
+          if (instances.get(e.instanceId)?.status !== 'running') break;
+          instances.set(e.instanceId, { status: 'pending' });
+          const current = nodes.get(e.nodeId);
+          if (current?.effectiveInstanceId === e.instanceId && current.status === 'running') {
+            nodes.set(e.nodeId, {
+              status: 'pending',
+              effectiveInstanceId: e.instanceId,
+              ...(current.gateCleared ? { gateCleared: true } : {}),
+            });
+          }
+        } else if (nodes.get(e.nodeId)?.status === 'running') {
+          set(e.nodeId, 'pending');
+        }
+        break;
+      }
+      case 'runCancelRequested':
+        // First request wins. A true terminal event committed before it wins
+        // instead; requestV3RunCancel normally prevents that combination, but
+        // replay stays fail-safe for legacy/corrupt histories too.
+        if (
+          cancelRequestId === undefined &&
+          runStatus !== 'succeeded' &&
+          runStatus !== 'failed' &&
+          runStatus !== 'cancelled'
+        ) {
+          cancelRequestId = e.cancelRequestId;
+          cancelRequestedBy = e.by;
+          runStatus = 'cancelling';
+          blockedNodeId = undefined;
+        }
+        break;
+      case 'runCancelled':
+        if (cancelRequestId !== undefined && e.cancelRequestId === cancelRequestId) {
+          runStatus = 'cancelled';
+          blockedNodeId = undefined;
+          uncertainHostEffects = e.uncertainHostEffects ?? uncertainHostEffects;
+        }
         break;
       case 'runSucceeded':
         runStatus = 'succeeded';
@@ -318,7 +478,21 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
     }
   }
 
-  return { runStatus, failedNodeId, failureReason, failureDetail, blockedNodeId, nodes, instances, attempts, loops, edges };
+  return {
+    runStatus,
+    cancelRequestId,
+    cancelRequestedBy,
+    uncertainHostEffects,
+    failedNodeId,
+    failureReason,
+    failureDetail,
+    blockedNodeId,
+    nodes,
+    instances,
+    attempts,
+    loops,
+    edges,
+  };
 }
 
 // ─── STATE checkpoint (atomic write / read) ────────────────────────────────
@@ -327,6 +501,9 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
  *  human-readable and `jq`-able. */
 interface StateFile {
   runStatus: V3RunStatus;
+  cancelRequestId?: string;
+  cancelRequestedBy?: string;
+  uncertainHostEffects?: V3UncertainHostEffect[];
   failedNodeId?: string;
   failureReason?: V3RunFailureReason;
   failureDetail?: string;
@@ -350,6 +527,9 @@ export function writeState(statePath: string, snap: V3RunSnapshot): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const file: StateFile = {
     runStatus: snap.runStatus,
+    cancelRequestId: snap.cancelRequestId,
+    cancelRequestedBy: snap.cancelRequestedBy,
+    uncertainHostEffects: snap.uncertainHostEffects,
     failedNodeId: snap.failedNodeId,
     failureReason: snap.failureReason,
     failureDetail: snap.failureDetail,
@@ -374,6 +554,9 @@ export function readState(statePath: string): V3RunSnapshot | undefined {
   const file = JSON.parse(readFileSync(statePath, 'utf-8')) as StateFile;
   return {
     runStatus: file.runStatus,
+    cancelRequestId: file.cancelRequestId,
+    cancelRequestedBy: file.cancelRequestedBy,
+    uncertainHostEffects: file.uncertainHostEffects,
     failedNodeId: file.failedNodeId,
     failureReason: file.failureReason,
     failureDetail: file.failureDetail,

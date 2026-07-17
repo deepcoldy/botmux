@@ -146,7 +146,13 @@ export interface DaemonSession {
   lastCliInput?: string;
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
-  currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
+  currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
+  /** One-shot runtime flag set by the daemon when creating a substitute
+   *  (分身) session. The worker-pool consumes and clears it once the worker
+   *  reports ready, triggering a one-time substitute control card post so the
+   *  new session is immediately controllable. In-memory only (resets on daemon
+   *  restart). See core/worker-pool.ts and the substitute session creation path. */
+  pendingSubstituteControlCard?: boolean;
   currentTurnTitle?: string;      // title for the current turn's streaming card
   cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)

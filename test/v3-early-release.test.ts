@@ -233,6 +233,10 @@ describe('v3 early-release / loser cancellation', () => {
       const runDir = join(base, runId);
       const journalPath = join(runDir, 'journal.ndjson');
       appendEvent(journalPath, { type: 'runStarted', runId });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [{ id: 'review', type: 'goal', goal: 'review', depends: [], inputs: [] }],
+      }));
       appendEvent(journalPath, { type: 'gateDispatched', nodeId: 'review', waitId: 'review-gate' });
       writePendingWait(runDir, { waitId: 'review-gate', nodeId: 'review', prompt: 'approve?' });
       appendEvent(journalPath, {

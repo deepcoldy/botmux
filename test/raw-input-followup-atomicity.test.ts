@@ -34,7 +34,7 @@ describe('worker raw_input handler', () => {
 
   it('queues through an owned restart until the replacement prompt, while preserving normal busy delivery', () => {
     const gateIdx = region.indexOf(
-      'if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight)',
+      'if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight',
     );
     const queueIdx = region.indexOf('pendingRawInputs.push(msg)');
     const deliverIdx = region.indexOf('await deliverRawInput(msg)');
@@ -46,6 +46,19 @@ describe('worker raw_input handler', () => {
     // break /btw-style passthrough. The restart-only latch preserves that path.
     expect(region).not.toContain('isPromptReady');
     expect(region).not.toContain('sendRawCommandLine(');
+  });
+
+  it('also defers behind the TUI injection fence: mid-injection (injectionFlushing) and queued cwd barrier (shouldDeferUserFlush) both queue instead of busy-delivering', () => {
+    // PR #441 二审阻塞项：raw_input 曾绕过注入 barrier——/cd 注入的 quiescence
+    // 等待期间（Serially 只互斥 text→Enter 短窗口）或 barrier 尚未开始时，
+    // passthrough 会直送、执行在旧 cwd 的 CLI 里。两个围栏必须与 restart/rename
+    // 同在入队条件里。
+    const gate = region.slice(
+      region.indexOf('if (cliRestartInProgress'),
+      region.indexOf('pendingRawInputs.push(msg)'),
+    );
+    expect(gate).toContain('injectionFlushing');
+    expect(gate).toContain('shouldDeferUserFlush(pendingInjections)');
   });
 });
 

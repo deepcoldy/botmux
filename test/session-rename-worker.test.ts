@@ -69,7 +69,9 @@ describe('worker native session rename queue', () => {
 
   it('serializes passthrough writes without changing their busy-delivery semantics', () => {
     const rawRegion = caseRegion('raw_input');
-    expect(rawRegion).toContain('if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight)');
+    // PR #441 起入队条件多了注入围栏（injectionFlushing / barrier），rename 围栏
+    // 仍必须在场——只钉本测试关心的三个 restart/rename 因子，不钉整行。
+    expect(rawRegion).toContain('if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight');
     expect(rawRegion).toContain('pendingRawInputs.push(msg)');
     expect(rawRegion).toContain('await deliverRawInput(msg)');
 

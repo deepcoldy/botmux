@@ -1,5 +1,5 @@
 /**
- * `botmux setup <list|add|edit|remove>` 非 TUI（脚本化）模式：argv 解析 + 纯映射。
+ * `botmux setup <list|add|configure|edit|remove>` 非 TUI（脚本化）模式：argv 解析 + 纯映射。
  *
  * 动机：给 coding agent / 脚本一个**字段级**的稳定接口。以前脚本化 setup 只能
  * 对交互问答「管道喂数字」，TUI 问题序列一变（比如新增一问）答案就静默错位；
@@ -44,6 +44,7 @@ export type SetupCommand =
   | { action: 'help' }
   | { action: 'list'; json: boolean }
   | { action: 'add'; json: boolean; createApp: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; flags: SetupBotFlags }
+  | { action: 'configure'; json: boolean; selector: string; switchAccount: boolean }
   | { action: 'edit'; json: boolean; selector: string; flags: SetupBotFlags }
   | { action: 'remove'; json: boolean; selector: string; yes: boolean };
 
@@ -97,6 +98,11 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
       两种 add 方式都要求至少一个完整邮箱、union_id on_xxx 或 open_id ou_xxx
       作为 owner，写盘前会用凭证换 tenant_access_token 校验；失败不写盘。
 
+  botmux setup configure <进程名|AppID> [--switch-account] [--json]
+      对已添加的机器人重跑开放平台权限、长连接事件、redirect 与发版。
+      用于 add 返回 partial 后继续，不会重复创建应用；成功后自动尝试上线。
+      登录账号不对时加 --switch-account 明确重新扫码。
+
   botmux setup edit <进程名|AppID> [字段选项...]
       按字段修改机器人（如 botmux setup edit botmux-0 --cli codex）。
       至少给一个字段选项；值传 - 表示清空该字段。
@@ -128,7 +134,7 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --json                     输出机器可读 JSON（含 ok / error 字段）
   --create-app               add 时扫码创建应用，不再要求 --app-id/--app-secret
   --compatibility-mode       显式使用 SDK 兼容模式（可能需要额外扫码）
-  --switch-account           不复用缓存，重新扫码并覆盖本机飞书登录态
+  --switch-account           add --create-app / configure 时重新扫码并覆盖登录态
   --open-platform-auto       add 成功后执行开放平台自动配置（默认跳过；
                              --create-app 时默认开启）
   --no-open-platform-auto    跳过开放平台权限/发版自动配置
@@ -195,7 +201,7 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
 
   if (action === 'list') {
     const { json, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'list' });
-    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app。');
+    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app 或 configure。');
     if (positional.length > 0) throw new Error(`list 不接受多余参数: ${positional.join(' ')}`);
     return { action: 'list', json };
   }
@@ -232,9 +238,27 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
     };
   }
 
+  if (action === 'configure') {
+    const {
+      json,
+      yes,
+      createApp,
+      compatibilityMode,
+      switchAccount,
+      openPlatformAutoSpecified,
+      positional,
+    } = parseBotFieldFlags(rest, { allowFields: false, action: 'configure' });
+    if (yes || createApp || compatibilityMode || openPlatformAutoSpecified) {
+      throw new Error('configure 只接受机器人标识、--switch-account 和 --json。查看用法：botmux setup help');
+    }
+    if (positional.length === 0) throw new Error('configure 需要指定机器人（进程名 botmux-N 或 AppID）。');
+    if (positional.length > 1) throw new Error(`configure 只接受一个机器人标识: ${positional.join(' ')}`);
+    return { action: 'configure', json, selector: positional[0], switchAccount };
+  }
+
   if (action === 'edit') {
     const { flags, json, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'edit' });
-    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app。');
+    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app 或 configure。');
     if (positional.length === 0) throw new Error('edit 需要指定机器人（进程名 botmux-N 或 AppID）。');
     if (positional.length > 1) throw new Error(`edit 只接受一个机器人标识: ${positional.join(' ')}`);
     return { action: 'edit', json, selector: positional[0], flags };
@@ -242,7 +266,7 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
 
   if (action === 'remove') {
     const { json, yes, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'remove' });
-    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app。');
+    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app 或 configure。');
     if (positional.length === 0) throw new Error('remove 需要指定机器人（进程名 botmux-N 或 AppID）。');
     if (positional.length > 1) throw new Error(`remove 只接受一个机器人标识: ${positional.join(' ')}`);
     return { action: 'remove', json, selector: positional[0], yes };

@@ -19,6 +19,7 @@ import {
 } from '../src/im/lark/v3-blocked-card.js';
 import { handleV3BlockedAction } from '../src/im/lark/v3-blocked-card-handler.js';
 import { birthRun, readGrillState, writeGrillState } from '../src/workflows/v3/grill-state.js';
+import { validateDag } from '../src/workflows/v3/dag.js';
 import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 import { ASK_HUMAN_ERROR_CODE, GOAL_ANSWER_FILE } from '../src/workflows/v3/contract.js';
 
@@ -48,6 +49,20 @@ describe('buildV3BlockedCard', () => {
       attemptId: 'deploy/attempts/001',
       nonce: v3BlockedCardNonce(INPUT.runId, 'deploy', 'deploy/attempts/001'),
     });
+    expect(JSON.stringify(card)).toContain('被中止的并行节点也会重新执行');
+  });
+
+  it('host effect uncertain 显示对账警告且不提供普通重试', () => {
+    const card = JSON.parse(buildV3BlockedCard({
+      ...INPUT,
+      errorCode: 'HOST_EFFECT_TTL_EXPIRED',
+      retryForbidden: 'host-effect-uncertain',
+    }));
+    expect(card.header.template).toBe('red');
+    expect(card.header.title.content).toContain('外部效果待核实');
+    const json = JSON.stringify(card);
+    expect(json).toContain('请先在目标系统对账');
+    expect(json).not.toContain(V3_BLOCKED_RETRY_ACTION);
   });
 
   it('retried 冻结卡：green + 无重试按钮 + 显示新 attempt', () => {
@@ -144,11 +159,25 @@ describe('buildV3BlockedCard', () => {
 });
 
 describe('handleV3BlockedAction', () => {
-  function seed(base: string, runId: string): string {
+  /** Legacy fixture: no run.json, so mutation auth must still prove Gate-2. */
+  function birthApprovedRun(base: string, runId: string): string {
     const { runDir } = birthRun({
       goal: 'g', baseDir: base, runId,
       chatBinding: { larkAppId: 'cli_test', chatId: 'oc_chat', rootMessageId: 'om_root' },
     });
+    const dagPath = join(runDir, 'dag.json');
+    const dag = validateDag({
+      runId,
+      nodes: [{ id: 'deploy', type: 'goal', goal: 'deploy', depends: [], inputs: [] }],
+    });
+    writeFileSync(dagPath, `${JSON.stringify(dag)}\n`);
+    const grill = readGrillState(runDir)!;
+    writeGrillState(runDir, { ...grill, status: 'dag_approved', dagPath });
+    return runDir;
+  }
+
+  function seed(base: string, runId: string): string {
+    const runDir = birthApprovedRun(base, runId);
     const journalPath = join(runDir, 'journal.ndjson');
     appendEvent(journalPath, { type: 'runStarted', runId });
     appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'deploy', attemptId: 'deploy/attempts/001' });
@@ -215,10 +244,7 @@ describe('handleV3BlockedAction', () => {
   it('ask 选项点击 → 写 answer.json + nodeRetryRequested.answer + 冻结「已回答」卡 + driveRun', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-blocked-card-'));
     const runId = 'ask-260606-0001';
-    const { runDir } = birthRun({
-      goal: 'g', baseDir: base, runId,
-      chatBinding: { larkAppId: 'cli_test', chatId: 'oc_chat', rootMessageId: 'om_root' },
-    });
+    const runDir = birthApprovedRun(base, runId);
     const journalPath = join(runDir, 'journal.ndjson');
     // 受阻的那个 attempt 一定跑过（它写了 ask.json），目录存在 → answer.json 能落它旁边
     mkdirSync(join(runDir, 'deploy', 'attempts', '001'), { recursive: true });
@@ -258,10 +284,7 @@ describe('handleV3BlockedAction', () => {
   it('ask 自由文本提交 → 原子写 answer.json + nodeRetryRequested.answer + 冻结「已回答」卡 + driveRun', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-blocked-card-'));
     const runId = 'ask-260606-0002';
-    const { runDir } = birthRun({
-      goal: 'g', baseDir: base, runId,
-      chatBinding: { larkAppId: 'cli_test', chatId: 'oc_chat', rootMessageId: 'om_root' },
-    });
+    const runDir = birthApprovedRun(base, runId);
     const journalPath = join(runDir, 'journal.ndjson');
     mkdirSync(join(runDir, 'deploy', 'attempts', '001'), { recursive: true });
     appendEvent(journalPath, { type: 'runStarted', runId });

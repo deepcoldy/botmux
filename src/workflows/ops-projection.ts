@@ -1,7 +1,8 @@
 /**
- * Shared projection helpers for workflow operator surfaces.
+ * Frozen read-only projection for archived v2 workflow runs.
  *
- * Used by CLI (`botmux workflow ls` / `tail`) and the dashboard backend.
+ * The v2 execution engine is retired. Migration/archive verification retains
+ * this projector so historical bytes can still be checked before deletion.
  * All readers in here are pure: they never `mkdir` and never validate
  * caller-provided runIds as filesystem paths without going through
  * `isValidRunId` first.  Callers built on top of this module can hand
@@ -35,7 +36,7 @@ import {
   type Snapshot,
 } from './events/replay.js';
 import type { OutputRef } from './events/payloads.js';
-import { workActivityId } from './orchestrator.js';
+import { workActivityId } from './migration/v2-read-only-ids.js';
 import {
   attemptTerminalSidecarPath,
   type AttemptTerminalSidecar,

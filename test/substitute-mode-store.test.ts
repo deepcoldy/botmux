@@ -65,6 +65,8 @@ describe('substitute-mode store', () => {
       expect(r.substituteMode).toEqual({
         enabled: true,
         disclosure: 'none',
+        topicGroups: true,
+        topicActiveSessionTrigger: true,
         targets: [
           { userId: 'u_alice', name: 'Alice' },
           { openId: 'ou_bob', email: 'bob@example.com' },
@@ -85,7 +87,7 @@ describe('substitute-mode store', () => {
     });
     expect(r).toEqual({
       ok: true,
-      substituteMode: { enabled: false, disclosure: 'prefix', targets: [{ openId: 'ou_bob', name: 'Bob' }] },
+      substituteMode: { enabled: false, disclosure: 'prefix', topicGroups: true, topicActiveSessionTrigger: true, targets: [{ openId: 'ou_bob', name: 'Bob' }] },
     });
     expect(readConfig().substituteMode.enabled).toBe(false);
 
@@ -96,6 +98,8 @@ describe('substitute-mode store', () => {
     expect(reloaded.registry.getBot('app_default').config.substituteMode).toEqual({
       enabled: false,
       disclosure: 'prefix',
+      topicGroups: true,
+      topicActiveSessionTrigger: true,
       targets: [{ openId: 'ou_bob', name: 'Bob' }],
     });
   });
@@ -115,6 +119,31 @@ describe('substitute-mode store', () => {
     expect(r).toEqual({ ok: true, substituteMode: null });
     expect(readConfig().substituteMode).toBeUndefined();
     expect(registry.getBot('app_default').config.substituteMode).toBeUndefined();
+  });
+
+  it('persists and normalizes allowed chat whitelist', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotSubstituteMode('app_default', {
+      enabled: true,
+      disclosure: 'prefix',
+      targets: [{ openId: 'ou_alice', name: 'Alice' }],
+      chats: ['oc_a', ' oc_b ', '', 'oc_a'],
+    });
+
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.substituteMode).toMatchObject({
+        enabled: true,
+        disclosure: 'prefix',
+        targets: [{ openId: 'ou_alice', name: 'Alice' }],
+        chats: ['oc_a', 'oc_b'],
+      });
+    }
+    expect(registry.getBot('app_default').config.substituteMode?.chats).toEqual(['oc_a', 'oc_b']);
+    expect(readConfig().substituteMode.chats).toEqual(['oc_a', 'oc_b']);
   });
 
   it('rejects enabled mode without a matchable target', async () => {
@@ -138,5 +167,41 @@ describe('substitute-mode store', () => {
     })).toEqual({ ok: false, reason: 'targets_required' });
 
     expect(readConfig().substituteMode).toBeUndefined();
+  });
+
+  it('话题群开关：显式 false 才关，缺省/其它值一律落回开', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    // 显式关：持久化并在重载后保持 false。
+    const r = await store.updateBotSubstituteMode('app_default', {
+      enabled: true,
+      targets: [{ openId: 'ou_bob', name: 'Bob' }],
+      topicGroups: false,
+      topicActiveSessionTrigger: false,
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.substituteMode?.topicGroups).toBe(false);
+      expect(r.substituteMode?.topicActiveSessionTrigger).toBe(false);
+    }
+    const reloaded = await freshModules();
+    reloaded.registry.loadBotConfigs().forEach(c => reloaded.registry.registerBot(c));
+    expect(reloaded.registry.getBot('app_default').config.substituteMode).toMatchObject({
+      topicGroups: false,
+      topicActiveSessionTrigger: false,
+    });
+
+    // 旧客户端 PUT（不带字段）→ 缺省开，不残留旧 false。
+    const r2 = await reloaded.store.updateBotSubstituteMode('app_default', {
+      enabled: true,
+      targets: [{ openId: 'ou_bob', name: 'Bob' }],
+    });
+    expect(r2.ok).toBe(true);
+    if (r2.ok) {
+      expect(r2.substituteMode?.topicGroups).toBe(true);
+      expect(r2.substituteMode?.topicActiveSessionTrigger).toBe(true);
+    }
   });
 });
