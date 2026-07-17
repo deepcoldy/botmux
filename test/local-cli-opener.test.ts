@@ -3,6 +3,10 @@
  * Run: pnpm vitest run test/local-cli-opener.test.ts
  */
 import { describe, it, expect, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import {
   appleScriptQuote,
   buildItermAppleScript,
@@ -18,6 +22,17 @@ import {
 } from '../src/services/local-cli-opener.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import type { DaemonSession } from '../src/core/types.js';
+
+async function withCommandFileTempRoot<T>(run: (root: string) => Promise<T>): Promise<T> {
+  const root = mkdtempSync(join(tmpdir(), 'botmux-local-cli-opener-test-'));
+  vi.stubEnv('TMPDIR', root);
+  try {
+    return await run(root);
+  } finally {
+    vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
 
 function ds(overrides: Partial<DaemonSession> = {}): DaemonSession {
   return {
@@ -410,39 +425,120 @@ describe('local-cli-opener', () => {
   });
 
   it('reports a local terminal error when neither iTerm nor Terminal.app can be opened', async () => {
-    const runOsascript = vi.fn(async () => ({ ok: false, stderr: 'automation denied' }));
-    const runOpenCommand = vi.fn(() => ({ ok: false, stderr: 'open failed' }));
-    const result = await openLocalCliInIterm(ds(), {
-      platform: 'darwin',
-      mode: 'resume',
-      runOsascript,
-      runOpenCommand,
-      adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
-    });
+    await withCommandFileTempRoot(async () => {
+      const runOsascript = vi.fn(async () => ({ ok: false, stderr: 'automation denied' }));
+      const scriptPaths: string[] = [];
+      const runOpenCommand = vi.fn(async (args: string[]) => {
+        scriptPaths.push(args[2]);
+        return { ok: false, stderr: 'open failed' };
+      });
+      const result = await openLocalCliInIterm(ds(), {
+        platform: 'darwin',
+        mode: 'resume',
+        runOsascript,
+        runOpenCommand,
+        adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
+      });
 
-    expect(result.ok).toBe(false);
-    expect(!result.ok && result.error).toBe('terminal_unavailable');
-    expect(!result.ok && result.message).toContain('Terminal.app');
-    expect(runOsascript).toHaveBeenCalledTimes(5);
-    expect(runOpenCommand).toHaveBeenCalledTimes(1);
+      expect(result.ok).toBe(false);
+      expect(!result.ok && result.error).toBe('terminal_unavailable');
+      expect(!result.ok && result.message).toContain('AppleScript or Launch Services');
+      expect(!result.ok && result.message).toContain('iTerm: open failed');
+      expect(!result.ok && result.message).toContain('Terminal.app: open failed');
+      expect(runOsascript).toHaveBeenCalledTimes(5);
+      expect(runOpenCommand).toHaveBeenCalledTimes(2);
+      expect(runOpenCommand.mock.calls.map(([args]) => args.slice(0, 2))).toEqual([
+        ['-b', 'com.googlecode.iterm2'],
+        ['-b', 'com.apple.Terminal'],
+      ]);
+      expect(scriptPaths[0]).toBe(scriptPaths[1]);
+      expect(existsSync(dirname(scriptPaths[0]))).toBe(false);
+    });
   });
 
-  it('falls back to Launch Services (open -a iTerm) when AppleScript is blocked', async () => {
-    const runOsascript = vi.fn(async () => ({ ok: false, stderr: 'automation denied (-1743)' }));
-    const runOpenCommand = vi.fn(() => ({ ok: true }));
-    const result = await openLocalCliInIterm(ds(), {
-      platform: 'darwin',
-      mode: 'resume',
-      runOsascript,
-      runOpenCommand,
-      adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
-    });
+  it('falls back to an async iTerm Launch Services request with a self-cleaning command file', async () => {
+    await withCommandFileTempRoot(async (root) => {
+      const fakeBin = mkdtempSync(join(root, 'bin-'));
+      symlinkSync('/usr/bin/true', join(fakeBin, 'codex'));
+      const runOsascript = vi.fn(async () => ({ ok: false, stderr: 'automation denied (-1743)' }));
+      const runOpenCommand = vi.fn(async () => ({ ok: true }));
+      const result = await openLocalCliInIterm(ds({ workingDir: root }), {
+        platform: 'darwin',
+        mode: 'resume',
+        runOsascript,
+        runOpenCommand,
+        adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
+      });
 
-    expect(result.ok).toBe(true);
-    expect(runOsascript).toHaveBeenCalledTimes(5);
-    expect(runOpenCommand).toHaveBeenCalledTimes(1);
-    const scriptPath = runOpenCommand.mock.calls[0][0];
-    expect(scriptPath).toMatch(/botmux-open-.*open-cli\.command$/);
+      expect(result.ok).toBe(true);
+      expect(runOsascript).toHaveBeenCalledTimes(5);
+      expect(runOpenCommand).toHaveBeenCalledTimes(1);
+      const args = runOpenCommand.mock.calls[0][0];
+      const scriptPath = args[2];
+      const scriptDir = dirname(scriptPath);
+      expect(args.slice(0, 2)).toEqual(['-b', 'com.googlecode.iterm2']);
+      expect(scriptPath).toMatch(/botmux-open-command-.*open-cli\.command$/);
+      expect(statSync(scriptPath).mode & 0o777).toBe(0o700);
+      const script = readFileSync(scriptPath, 'utf8');
+      const cleanup = `/bin/rm -rf -- '${scriptDir}' >/dev/null 2>&1 || true`;
+      expect(script).toContain('#!/bin/bash\ncd /\n');
+      expect(script).toContain(cleanup);
+      expect(script.indexOf(cleanup)).toBeLessThan(script.indexOf("codex resume 'sid'"));
+      execFileSync(scriptPath, [], { env: { ...process.env, PATH: `${fakeBin}:/usr/bin:/bin` } });
+      expect(existsSync(scriptDir)).toBe(false);
+    });
+  });
+
+  it('falls back to Terminal.app when iTerm is unavailable through Launch Services', async () => {
+    await withCommandFileTempRoot(async () => {
+      const runOsascript = vi.fn(async () => ({ ok: false, stderr: 'automation denied (-1743)' }));
+      const runOpenCommand = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: false, stderr: 'iTerm is not installed' })
+        .mockResolvedValueOnce({ ok: true });
+      const result = await openLocalCliInIterm(ds(), {
+        platform: 'darwin',
+        mode: 'resume',
+        runOsascript,
+        runOpenCommand,
+        adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
+      });
+
+      expect(result.ok).toBe(true);
+      expect(runOpenCommand).toHaveBeenCalledTimes(2);
+      expect(runOpenCommand.mock.calls.map(([args]) => args.slice(0, 2))).toEqual([
+        ['-b', 'com.googlecode.iterm2'],
+        ['-b', 'com.apple.Terminal'],
+      ]);
+      expect(runOpenCommand.mock.calls[0][0][2]).toBe(runOpenCommand.mock.calls[1][0][2]);
+    });
+  });
+
+  it('sweeps stale command dirs without touching similarly named botmux temp dirs', async () => {
+    await withCommandFileTempRoot(async (root) => {
+      const stale = mkdtempSync(join(root, 'botmux-open-command-'));
+      const legacyStale = mkdtempSync(join(root, 'botmux-open-'));
+      const recent = mkdtempSync(join(root, 'botmux-open-command-'));
+      const unrelated = mkdtempSync(join(root, 'botmux-open-local-cli-'));
+      const old = new Date(Date.now() - 48 * 60 * 60 * 1000);
+      utimesSync(stale, old, old);
+      utimesSync(legacyStale, old, old);
+      utimesSync(unrelated, old, old);
+
+      const result = await openLocalCliInIterm(ds(), {
+        platform: 'darwin',
+        mode: 'resume',
+        runOsascript: vi.fn(async () => ({ ok: false, stderr: 'automation denied' })),
+        runOpenCommand: vi.fn(async () => ({ ok: false, stderr: 'open failed' })),
+        adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(existsSync(stale)).toBe(false);
+      expect(existsSync(legacyStale)).toBe(false);
+      expect(existsSync(recent)).toBe(true);
+      expect(existsSync(unrelated)).toBe(true);
+    });
   });
 
   it('launches TRAE in iTerm with traex resume instead of URL schemes', async () => {
