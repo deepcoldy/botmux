@@ -7037,10 +7037,21 @@ async function spawnCli(
   let willReattachPersistent = selectedBackend.isReattach === true;
   if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length && persistentSessionName && effectiveBackendType !== 'pty') {
     const persistentTarget = selectedBackend.persistentBackendTarget;
-    const paneLive = persistentTarget
-      ? probePersistentBackendTarget(persistentTarget) === 'exists'
-      : false;
-    if (paneLive) {
+    // Fail closed on an inconclusive probe: treating 'unknown' as "no pane"
+    // would cold-spawn a second CLI next to a live one holding MCP state.
+    const paneProbe = persistentTarget
+      ? probePersistentBackendTarget(persistentTarget)
+      : 'missing';
+    if (paneProbe === 'unknown') {
+      throw new Error(
+        `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
+        `could not verify existing ${effectiveBackendType} pane`,
+      );
+    }
+    if (effectiveBackendType === 'zmx') {
+      resolvedZmxSessionProbe = paneProbe;
+    }
+    if (paneProbe === 'exists') {
       // The trusted Gateway host belongs to the worker and cannot survive a
       // worker/daemon replacement. Cold-resume the CLI so its MCP client gets a
       // fresh relay socket instead of reattaching to a dead connection.
@@ -7048,6 +7059,21 @@ async function spawnCli(
       const persistentTarget = selectedBackend.persistentBackendTarget;
       if (persistentTarget) killPersistentBackendTarget(persistentTarget);
       else killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
+      // Confirm the stale pane is really gone before re-selecting. Re-selection
+      // below decides reattach-vs-fresh from this probe, so an unconfirmed kill
+      // would let the new backend reattach to the pane we just tried to remove.
+      const postKillProbe = persistentTarget
+        ? probePersistentBackendTarget(persistentTarget)
+        : probePersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
+      if (postKillProbe !== 'missing') {
+        throw new Error(
+          `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
+          `could not confirm stale ${effectiveBackendType} pane termination`,
+        );
+      }
+      if (effectiveBackendType === 'zmx') {
+        resolvedZmxSessionProbe = postKillProbe;
+      }
       selectedBackend = selectBackend();
       isTmuxMode = selectedBackend.isTmuxMode;
       isPipeMode = selectedBackend.isPipeMode;
