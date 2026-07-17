@@ -30,6 +30,55 @@ describe('Herdr web snapshot history', () => {
       .toEqual(['X', 'Y', 'A', 'B', 'C', 'D', 'E', 'FOOTER']);
   });
 
+  it('keeps fixed TUI chrome while inserting newly revealed rows into the scroll region', () => {
+    const initial = mergeHerdrWebSnapshot(
+      null,
+      snapshot(['HEADER', 'A', 'B', 'C', 'FOOTER']),
+      null,
+    );
+    const next = mergeHerdrWebSnapshot(
+      initial.state,
+      snapshot(['HEADER', 'X', 'A', 'B', 'FOOTER']),
+      'up',
+    );
+
+    expect(next.addedLines).toBe(1);
+    expect(next.state.history.map(line => line.replace(/\x1b\[[0-9;]*m/g, '')))
+      .toEqual(['HEADER', 'X', 'A', 'B', 'C', 'FOOTER']);
+  });
+
+  it('handles repeated rows without choosing an ambiguous quadratic overlap', () => {
+    const initial = mergeHerdrWebSnapshot(
+      null,
+      snapshot(['HEADER', 'ROW', 'ROW', 'A', 'B', 'FOOTER']),
+      null,
+    );
+    const next = mergeHerdrWebSnapshot(
+      initial.state,
+      snapshot(['HEADER', 'X', 'ROW', 'ROW', 'A', 'FOOTER']),
+      'up',
+    );
+
+    expect(next.addedLines).toBe(1);
+    expect(next.state.history.map(line => line.replace(/\x1b\[[0-9;]*m/g, '')))
+      .toEqual(['HEADER', 'X', 'ROW', 'ROW', 'A', 'B', 'FOOTER']);
+  });
+
+  it('merges a 10k-line snapshot in bounded linear time', () => {
+    const previous = Array.from({ length: 10_000 }, (_, index) => `LINE-${index}`);
+    const initial = mergeHerdrWebSnapshot(null, snapshot(previous), null);
+    const started = performance.now();
+    const next = mergeHerdrWebSnapshot(
+      initial.state,
+      snapshot(['OLDER', ...previous.slice(0, -1)]),
+      'up',
+    );
+
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(next.addedLines).toBe(1);
+    expect(next.state.history).toHaveLength(10_001);
+  });
+
   it('replaces rather than appends when a live frame has no paging direction', () => {
     const initial = mergeHerdrWebSnapshot(null, snapshot(['A', 'B', 'STATUS old']), null);
     const live = mergeHerdrWebSnapshot(initial.state, snapshot(['A', 'B', 'STATUS new']), null);

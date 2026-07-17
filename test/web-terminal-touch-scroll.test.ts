@@ -39,6 +39,10 @@ describe('web terminal touch scrolling', () => {
       .toBeLessThan(wheelBlock.indexOf('_fwdScroll(px,_cellAt'));
   });
 
+  it('refreshes captured history after every later native output burst', () => {
+    expect(workerSource).toContain("if (herdrWebRenderMode === 'frame') relayHerdrWebDelta(frame.data);\n  else scheduleHerdrWebSnapshot(be);");
+  });
+
   it('bounds remote scroll ticks per gesture instead of per browser event', () => {
     const wheelBlock = scriptBlock('// ── Wheel / touch scroll handling ──');
 
@@ -62,8 +66,8 @@ describe('web terminal touch scrolling', () => {
   it('replaces merged Herdr history and preserves the reader anchor', () => {
     expect(workerSource).toContain('1989;history;${merged.addedLines}');
     expect(workerSource).toContain("var _hh=data.match(/^\\x1b\\]1989;history;([0-9]+)\\x07/)");
-    expect(workerSource).toContain('data=data.slice(_hh[0].length);_cancelInitialFollow();term.reset();term.clear()');
-    expect(workerSource).toContain("data='\\\\x1b[2J\\\\x1b[H'+data");
+    expect(workerSource).toContain("_queueTermWrite('\\\\x1b[2J\\\\x1b[H'+_hd,true");
+    expect(workerSource).toContain('if(job.replace){term.reset();term.clear()}');
     expect(workerSource).toContain('if(_ha>0)term.scrollToLine(_hy+_ha)');
   });
 

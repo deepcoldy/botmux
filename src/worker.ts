@@ -110,6 +110,7 @@ import { createServer as createHttpServer, type IncomingMessage } from 'node:htt
 import { WebSocketServer, WebSocket } from 'ws';
 import { listenWebTerminalWithFallback } from './utils/web-terminal-listen.js';
 import { HerdrWebTerminalBinding } from './utils/herdr-web-terminal-binding.js';
+import { MaxWaitDebouncer } from './utils/max-wait-debouncer.js';
 import { TERMINAL_FAVICON_DATA_URI } from './utils/terminal-favicon.js';
 import type {
   CodexAppTurnInput,
@@ -141,7 +142,11 @@ import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
-import { HerdrBackend, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
+import {
+  HerdrBackend,
+  type HerdrTerminalFrame,
+  type HerdrWebTerminalCursor,
+} from './adapters/backend/herdr-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
@@ -3102,6 +3107,18 @@ let scrollback = '';
 let herdrWebHistory: HerdrWebHistoryState | null = null;
 let herdrWebScrollDirection: HerdrWebScrollDirection = null;
 let herdrWebCursor: HerdrWebTerminalCursor | null = null;
+let herdrWebSnapshotGeneration = 0;
+let herdrWebSnapshotPending = false;
+let herdrWebSnapshotInFlight = false;
+let herdrWebRenderMode: 'frame' | 'history' = 'frame';
+const herdrWebNeedsResync = new WeakSet<WebSocket>();
+const HERDR_WEB_SNAPSHOT_SETTLE_MS = 120;
+const HERDR_WEB_SNAPSHOT_MAX_WAIT_MS = 600;
+const herdrWebSnapshotDebouncer = new MaxWaitDebouncer(
+  HERDR_WEB_SNAPSHOT_SETTLE_MS,
+  HERDR_WEB_SNAPSHOT_MAX_WAIT_MS,
+  () => { void captureHerdrWebSnapshot(); },
+);
 const WORKFLOW_TRANSCRIPT_MAX = 2_000_000; // chars (~2MB)
 const WORKFLOW_OUTPUT_END_MARKER = '</WORKFLOW_OUTPUT>';
 const CRASH_DIAGNOSTIC_RAW_MAX = 200_000; // enough scrollback for the web terminal without huge temp files
@@ -3142,12 +3159,127 @@ function relayHerdrWebSnapshot(snapshot: string): void {
     MAX_SCROLLBACK,
   );
   herdrWebHistory = merged.state;
+  herdrWebRenderMode = 'history';
   herdrWebScrollDirection = null;
   scrollback = renderHerdrWebHistory(merged.state);
   const payload = `\x1b]1989;history;${merged.addedLines}\x07${scrollback}${herdrWebCursorSequence()}`;
   for (const ws of wsClients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    if (ws.bufferedAmount > MAX_SCROLLBACK) {
+      herdrWebNeedsResync.add(ws);
+      continue;
+    }
+    herdrWebNeedsResync.delete(ws);
+    ws.send(payload);
   }
+}
+
+function cancelHerdrWebSnapshotRequests(): void {
+  herdrWebSnapshotDebouncer.cancel();
+  herdrWebSnapshotGeneration++;
+  herdrWebSnapshotPending = false;
+}
+
+function relayHerdrWebFullFrame(frame: HerdrTerminalFrame): void {
+  cancelHerdrWebSnapshotRequests();
+  herdrWebRenderMode = 'frame';
+  herdrWebHistory = null;
+  herdrWebScrollDirection = null;
+  scrollback = frame.data;
+  const payload = `\x1b]1989;frame\x07${frame.data}${herdrWebCursorSequence()}`;
+  for (const ws of wsClients) {
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    if (ws.bufferedAmount > MAX_SCROLLBACK) {
+      herdrWebNeedsResync.add(ws);
+      continue;
+    }
+    herdrWebNeedsResync.delete(ws);
+    ws.send(payload);
+  }
+}
+
+function relayHerdrWebDelta(data: string): void {
+  scrollback += data;
+  if (scrollback.length > MAX_SCROLLBACK) {
+    let cut = scrollback.length - MAX_SCROLLBACK;
+    const escAt = scrollback.indexOf('\x1b', cut);
+    cut = escAt >= 0 ? escAt : cut;
+    scrollback = `\x1bc${scrollback.slice(cut)}`;
+  }
+  for (const ws of wsClients) {
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    if (herdrWebNeedsResync.has(ws)) {
+      if (ws.bufferedAmount <= MAX_SCROLLBACK) {
+        ws.send(`\x1b]1989;history;0\x07${scrollback}${herdrWebCursorSequence()}`);
+        herdrWebNeedsResync.delete(ws);
+      }
+      continue;
+    }
+    if (ws.bufferedAmount > MAX_SCROLLBACK) {
+      herdrWebNeedsResync.add(ws);
+      continue;
+    }
+    ws.send(data);
+  }
+}
+
+async function captureHerdrWebSnapshot(): Promise<void> {
+  const be = backend;
+  if (
+    !(be instanceof HerdrBackend)
+    || !herdrWebSnapshotPending
+    || herdrWebSnapshotInFlight
+    || wsClients.size === 0
+  ) return;
+
+  const generation = herdrWebSnapshotGeneration;
+  herdrWebSnapshotPending = false;
+  herdrWebSnapshotInFlight = true;
+  let snapshot = '';
+  try {
+    snapshot = await be.captureCurrentScreenAsync();
+  } catch (error) {
+    log(`[herdr-web] snapshot capture failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  herdrWebSnapshotInFlight = false;
+
+  if (
+    backend === be
+    && generation === herdrWebSnapshotGeneration
+    && wsClients.size > 0
+    && snapshot.length > 0
+  ) {
+    relayHerdrWebSnapshot(snapshot);
+  }
+
+  // Frames arriving during the async read request one more serialized capture
+  // without invalidating the usable result that is already in flight.
+  if (
+    herdrWebSnapshotPending
+    && backend instanceof HerdrBackend
+    && wsClients.size > 0
+  ) herdrWebSnapshotDebouncer.schedule();
+}
+
+function scheduleHerdrWebSnapshot(be: HerdrBackend): void {
+  if (backend !== be || wsClients.size === 0) return;
+  herdrWebSnapshotPending = true;
+  if (!herdrWebSnapshotInFlight) herdrWebSnapshotDebouncer.schedule();
+}
+
+function relayHerdrTerminalFrame(be: HerdrBackend, frame: HerdrTerminalFrame): void {
+  if (backend !== be) return;
+  onPtyData(frame.data, frame);
+  if (frame.full) {
+    relayHerdrWebFullFrame(frame);
+    return;
+  }
+  // A captured line-history buffer and a native grid delta use different
+  // coordinate spaces. Never apply CUP-based observer deltas to history: it
+  // overwrites older rows. While remotely scrolled, settle another explicit
+  // capture instead; normal live mode remains a zero-poll native stream.
+  if (herdrWebRenderMode === 'frame') relayHerdrWebDelta(frame.data);
+  else scheduleHerdrWebSnapshot(be);
 }
 
 function applyHerdrWebBindingResult(
@@ -3188,7 +3320,6 @@ function restoreHerdrWebBindings(): void {
 }
 
 function wireHerdrWebTerminalRelays(be: HerdrBackend): void {
-  be.onSnapshot(relayHerdrWebSnapshot);
   be.onWebTerminalCursor(relayHerdrWebCursor);
 }
 
@@ -3970,13 +4101,16 @@ function splitCodexAppControl(data: string): string {
 
 // ─── Prompt Detection ────────────────────────────────────────────────────────
 
-function onPtyData(data: string): void {
+function onPtyData(data: string, frame?: HerdrTerminalFrame): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
   lastPtyActivityAtMs = Date.now();
   maybeCaptureKiroSessionId(data);
-  captureWorkflowTranscript(data);
-  renderer?.write(data);
+  // A native full frame is an authoritative grid replacement, not new CLI
+  // transcript. Appending it duplicates or overwrites reattach scrollback.
+  if (!frame?.full) captureWorkflowTranscript(data);
+  if (frame?.full) renderer?.replace(data, frame.width, frame.height);
+  else renderer?.write(data);
 
   // In tmux-attach mode, each web client has its own tmux attach PTY —
   // no relay needed. In non-tmux mode AND in pipe mode (adopt-bridge),
@@ -5116,14 +5250,13 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       env: process.env as Record<string, string>,
     });
 
+    herdrBe.onTerminalFrame(frame => relayHerdrTerminalFrame(herdrBe, frame));
     wireHerdrWebTerminalRelays(herdrBe);
-    seedBackendScreen('herdr adopt', herdrBe);
 
     setupAdoptTranscriptBridges(cfg);
     setupAdoptInputAdapter(cfg);
     setupAdoptIdleDetection(cfg, 'herdr');
 
-    backend.onData(onPtyData);
     backend.onAccessUrl?.((url) => {
       send({ type: 'riff_access_url', accessUrl: url });
     });
@@ -5235,11 +5368,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         reason = 'zellij 功能性探针失败（需 zellij >= 0.44）';
       }
     } else if (effectiveBackend === 'herdr') {
-      // herdr's isAvailable() is a cheap, non-destructive `herdr --version`
-      // (not a disposable session probe), so it has no PR#249 false-negative
-      // risk and needs no existing-session exemption.
+      // Native terminal streaming is available from Herdr 0.7.2. The version
+      // probe is cheap and non-destructive, so existing sessions do not bypass
+      // this compatibility gate.
       available = HerdrBackend.isAvailable();
-      reason = 'herdr 功能性探针失败';
+      reason = 'herdr 不可用或版本低于 0.7.2（请执行 herdr update）';
     }
     const decision = decideBackendGate({ requested: effectiveBackend, available, hasExistingSession });
     if (decision.action === 'gate') {
@@ -6456,21 +6589,27 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     });
   }
 
-  backend.onData(onPtyData);
   const observedBackend = backend;
-  backend.onAccessUrl?.((url) => {
+  const sessionBackend = backend as SessionBackend;
+  if (backend instanceof HerdrBackend) {
+    const herdrBackend = backend;
+    herdrBackend.onTerminalFrame(frame => relayHerdrTerminalFrame(herdrBackend, frame));
+  } else {
+    backend.onData(onPtyData);
+  }
+  sessionBackend.onAccessUrl?.((url) => {
     send({ type: 'riff_access_url', accessUrl: url });
   });
   // Remote-task turn boundary (riff): flushPending() marks the session busy on
   // every write and riff has no PTY output, so the idle detector never re-arms
   // prompt-ready — without this hook a follow-up arriving mid-task would sit
   // in pendingMessages forever once the task finishes.
-  backend.onTaskDone?.(() => {
+  sessionBackend.onTaskDone?.(() => {
     log(`${cliName()} task finished — re-arming prompt-ready for queued follow-ups`);
     markPromptReady();
   });
   // riff：任务 id 变更同步给 daemon 持久化，daemon 重启后 follow-up 血缘不断。
-  backend.onTaskId?.((taskId) => {
+  sessionBackend.onTaskId?.((taskId) => {
     send({ type: 'riff_task_id', taskId });
   });
   if (backend instanceof HerdrBackend) {
@@ -6561,7 +6700,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 
   if (isPipeMode && backend && 'isReattach' in backend && backend.isReattach) {
     log(`Re-attached to existing ${effectiveBackendType} session via pipe backend: ${persistentSessionName}`);
-    seedBackendScreen(`${effectiveBackendType} reattach`, backend);
+    // Herdr's first observer frame is a full authoritative baseline. Seeding
+    // its renderer first and then appending that frame corrupts scrollback.
+    if (!(backend instanceof HerdrBackend)) {
+      seedBackendScreen(`${effectiveBackendType} reattach`, backend);
+    }
     scheduleReattachIdleProbe(`${effectiveBackendType} reattach`, backend);
   }
 
@@ -6678,6 +6821,8 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   herdrWebHistory = null;
   herdrWebScrollDirection = null;
   herdrWebCursor = null;
+  cancelHerdrWebSnapshotRequests();
+  herdrWebRenderMode = 'frame';
   altBufferActive = false;
   trustHandled = false;
   codexUpdateDialogGuard.reset();
@@ -7028,6 +7173,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         if (seed.length > 0) {
           ws.send(seed + herdrWebCursorSequence());
         }
+        if (backend instanceof HerdrBackend && herdrWebRenderMode === 'history') {
+          // No captures run without viewers. Refresh the retained seed once a
+          // reader reconnects so output produced in the gap becomes visible.
+          herdrWebScrollDirection = null;
+          scheduleHerdrWebSnapshot(backend);
+        }
 
         ws.on('message', (raw) => {
           try {
@@ -7042,9 +7193,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // Mouse protocols can encode approvals/actions as well as wheel input.
               // A read-only view capability must never forward bytes to the backend.
               if (!authedClients.has(ws)) return;
-              if (usesHerdrSnapshotWebHistory()) {
+              if (backend instanceof HerdrBackend) {
                 if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
+                if (herdrWebScrollDirection) scheduleHerdrWebSnapshot(backend);
               }
               backend?.write(msg.data);
             }
@@ -7054,6 +7206,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         ws.on('close', () => {
           wsClients.delete(ws);
           herdrWebBindings.delete(ws);
+          if (wsClients.size === 0) {
+            // Keep the last bounded history as a reconnect seed, but stop the
+            // 10k-line capture process while nobody is watching.
+            cancelHerdrWebSnapshotRequests();
+            herdrWebScrollDirection = null;
+          }
           const promoted = herdrWebBinding.release() as WebSocket | null;
           if (promoted?.readyState === WebSocket.OPEN) {
             promoted.send('\x1b]1989;owner\x07');
@@ -7266,6 +7424,25 @@ function _settleInitialBottom(){
     _initialFollow=false;
   },500);
 }
+// Serialize every xterm write at the application layer. Calling reset() while
+// an earlier xterm.write() is still queued lets a following full/history frame
+// overtake its own reset and corrupts the grid. One job completes before the
+// next job may reset or write.
+var _termJobs=[],_termJobActive=false;
+function _queueTermWrite(data,replace,after,before){
+  _termJobs.push({data:data,replace:replace,after:after,before:before});
+  _drainTermWrites();
+}
+function _drainTermWrites(){
+  if(_termJobActive||!_termJobs.length)return;
+  _termJobActive=true;var job=_termJobs.shift();
+  if(job.before)job.before();
+  if(job.replace){term.reset();term.clear()}
+  term.write(job.data,function(){
+    if(job.after)job.after();
+    _termJobActive=false;_drainTermWrites();
+  });
+}
 var _initialViewport=term.element&&term.element.querySelector('.xterm-viewport');
 var _initialTerminalRoot=document.getElementById('terminal');
 if(_initialTerminalRoot){
@@ -7363,18 +7540,22 @@ window.addEventListener('resize',onViewportResize);
   ws.onopen=function(){el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize()};
   ws.onmessage=function(e){
     var data=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);
+    // Herdr observer full frames replace the current grid. Reset before
+    // writing them so reconnect/resize baselines never append to scrollback.
+    var _hfr=data.match(/^\x1b\]1989;frame\x07/);
+    if(_hfr){var _hfd=data.slice(_hfr[0].length);_cancelInitialFollow();_queueTermWrite(_hfd,true,_settleInitialBottom);return}
     // Snapshot-aware Herdr history replaces the buffer instead of appending a
     // mostly-overlapping full screen. Preserve the reader's anchor when older
     // rows were prepended; otherwise preserve their current position/follow.
     var _hh=data.match(/^\x1b\]1989;history;([0-9]+)\x07/);
     if(_hh){
-      var _ha=+_hh[1],_hb=term.buffer.active,_hy=_hb.viewportY,_hBottom=_hy===_hb.baseY;
-      data=data.slice(_hh[0].length);_cancelInitialFollow();term.reset();term.clear();
-      data='\\x1b[2J\\x1b[H'+data;
-      term.write(data,function(){
-        if(_ha>0)term.scrollToLine(_hy+_ha);
-        else if(_hBottom)term.scrollToBottom();
-        else term.scrollToLine(_hy);
+      var _ha=+_hh[1],_hd=data.slice(_hh[0].length),_hy=0,_hBottom=false;_cancelInitialFollow();
+      _queueTermWrite('\\x1b[2J\\x1b[H'+_hd,true,function(){
+          if(_ha>0)term.scrollToLine(_hy+_ha);
+          else if(_hBottom)term.scrollToBottom();
+          else term.scrollToLine(_hy);
+        },function(){
+          var _hb=term.buffer.active;_hy=_hb.viewportY;_hBottom=_hy===_hb.baseY;
       });
       return;
     }
@@ -7400,7 +7581,7 @@ window.addEventListener('resize',onViewportResize);
     // Intercept OSC 52 clipboard sequence from tmux (set-clipboard on)
     var m=data.match(/\\x1b\\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\\x07|\\x1b\\\\)/);
     if(m){try{_clipBuf=new TextDecoder().decode(Uint8Array.from(atob(m[1]),function(c){return c.charCodeAt(0)}));_doCopy(_clipBuf);_showCopied()}catch(ex){}}
-    term.write(data,_settleInitialBottom);
+    _queueTermWrite(data,false,_settleInitialBottom);
   };
   ws.onclose=function(){ws_=null;el.textContent='disconnected';el.className='err';setTimeout(connect,2000)};
   ws.onerror=function(){ws.close()};

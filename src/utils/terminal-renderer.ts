@@ -82,6 +82,14 @@ export class TerminalRenderer {
     this.terminal.write(data);
   }
 
+  /** Replace the terminal grid with an authoritative full-frame baseline. */
+  replace(data: string, cols = this.terminal.cols, rows = this.terminal.rows): void {
+    this.terminal.dispose();
+    this.terminal = new Terminal({ cols, rows, allowProposedApi: true });
+    this.lastHash = '';
+    this.terminal.write(data);
+  }
+
   /** Reset the change-detection hash so the next snapshot registers as changed. */
   markNewTurn(): void {
     this.lastHash = '';

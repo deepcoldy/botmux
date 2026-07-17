@@ -12,6 +12,7 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
+import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const children = new Set<ChildProcess>();
@@ -121,6 +122,15 @@ function agentPaneId(sessionName: string): string {
   return paneId;
 }
 
+function terminalBufferText(renderer: TerminalRenderer): string {
+  const buffer = renderer.xterm.buffer.active;
+  const lines: string[] = [];
+  for (let index = 0; index < buffer.length; index++) {
+    lines.push(buffer.getLine(index)?.translateToString(true) ?? '');
+  }
+  return lines.join('\n');
+}
+
 describe('worker Herdr web terminal lifecycle', () => {
   it.skipIf(!HerdrBackend.isAvailable())(
     'restores the connected browser grid automatically after an in-worker restart',
@@ -158,6 +168,8 @@ while :; do sleep 0.1; done
       child.send(init);
       const ready = await waitForReady(child, logs);
       const ws = await openWriteWebSocket(ready);
+      let received = '';
+      ws.on('message', data => { received += data.toString(); });
       ws.send(JSON.stringify({ type: 'resize', cols: 120, rows: 36 }));
 
       const before = await waitFor(() => {
@@ -178,6 +190,12 @@ while :; do sleep 0.1; done
 
       expect(after.pid).not.toBe(before.pid);
       expect(after.size).toBe('36 120');
+      await waitFor(
+        () => received.includes('\x1b]1989;frame\x07'),
+        5_000,
+        'observer full frame reaches browser after resize',
+      );
+      expect(received).toContain('\x1b]1989;frame\x07');
       expect(ws.readyState).toBe(WebSocket.OPEN);
       ws.close();
       child.send({ type: 'close' } satisfies DaemonToWorker);
@@ -186,18 +204,21 @@ while :; do sleep 0.1; done
   );
 
   it.skipIf(!HerdrBackend.isAvailable())(
-    'streams live snapshots from an adopted external Herdr pane',
+    'streams live native frames from an adopted external Herdr pane',
     async () => {
       const root = mkdtempSync(join(tmpdir(), 'botmux-herdr-adopt-'));
       tempDirs.add(root);
       const trigger = join(root, 'emit-live');
+      const busyDone = join(root, 'emit-live-done');
       const externalSession = `adopt-e2e-${Date.now().toString(36)}`;
       sessions.add(externalSession);
       const external = new HerdrBackend(externalSession);
       external.spawn('/bin/bash', [
         '-lc',
-        `echo ADOPT_INITIAL; while [ ! -f '${trigger}' ]; do sleep 0.1; done; `
-        + 'echo ADOPT_LIVE_UPDATE; while :; do sleep 1; done',
+        `for i in $(seq -w 1 40); do echo HISTORY-$i; done; echo ADOPT_INITIAL; `
+        + `while [ ! -f '${trigger}' ]; do sleep 0.1; done; `
+        + 'for i in $(seq -w 1 40); do echo ADOPT_LIVE_UPDATE-$i; sleep 0.05; done; '
+        + `touch '${busyDone}'; while :; do sleep 1; done`,
       ], {
         cwd: root,
         cols: 100,
@@ -209,6 +230,11 @@ while :; do sleep 0.1; done
         10_000,
         'external pane initial marker',
       );
+      // The fixture backend only starts the external pane. Detach its observer
+      // before the worker adopts the pane: Herdr currently exposes one native
+      // terminal observer stream per pane session.
+      external.kill();
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 500));
 
       const sessionId = `hradp${Date.now().toString(36)}`;
       const logs: string[] = [];
@@ -236,23 +262,72 @@ while :; do sleep 0.1; done
       child.send(init);
       const ready = await waitForReady(child, logs);
       const ws = await openWriteWebSocket(ready);
-      let received = '';
-      ws.on('message', data => { received += data.toString(); });
+      const rendered = new TerminalRenderer(100, 30);
+      const messages: string[] = [];
+      let liveOutputStarted = false;
+      let historyRefreshedWhileBusy = false;
+      ws.on('message', raw => {
+        let data = raw.toString();
+        messages.push(data);
+        if (
+          liveOutputStarted
+          && data.startsWith('\x1b]1989;history;')
+          && data.includes('ADOPT_LIVE_UPDATE')
+          && !existsSync(busyDone)
+        ) historyRefreshedWhileBusy = true;
+        const marker = data.match(/^\x1b\]1989;(?:frame|history;\d+)\x07/);
+        if (marker) {
+          data = data.slice(marker[0].length);
+          rendered.replace(data, 100, 30);
+        } else {
+          rendered.write(data);
+        }
+      });
       await waitFor(
-        () => received.includes('ADOPT_INITIAL'),
+        () => terminalBufferText(rendered).includes('ADOPT_INITIAL'),
         5_000,
-        'adopt initial screen seed',
+        'adopt observer full viewport',
       );
 
-      received = '';
+      // Enter line-history mode through the same mouse-wheel packet used by
+      // the browser. Subsequent native CUP/grid deltas are intentionally not
+      // applied to that coordinate space, so each output burst must schedule
+      // a fresh explicit capture instead of leaving the browser frozen.
+      ws.send(JSON.stringify({ type: 'input', data: '\x1b[<64;1;1M' }));
+      await waitFor(
+        () => messages.some(message => message.startsWith('\x1b]1989;history;')),
+        5_000,
+        'remote scroll enters captured history mode',
+      );
+      const historyMessagesBeforeLive = messages.filter(message =>
+        message.startsWith('\x1b]1989;history;')).length;
+
+      liveOutputStarted = true;
       writeFileSync(trigger, 'go');
       await waitFor(
-        () => received.includes('ADOPT_LIVE_UPDATE'),
+        () => external.captureCurrentScreen().includes('ADOPT_LIVE_UPDATE'),
         5_000,
-        'adopt live snapshot relay',
+        'external pane live marker',
       );
+      try {
+        await waitFor(
+          () => messages.filter(message => message.startsWith('\x1b]1989;history;')).length
+              > historyMessagesBeforeLive
+            && rendered.rawSnapshot().includes('ADOPT_LIVE_UPDATE')
+            && historyRefreshedWhileBusy,
+          5_000,
+          '50ms continuous output refreshes history before the stream becomes quiet',
+        );
+      } catch (error) {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}\n${logs.join('')}`
+          + `\nterminal=${JSON.stringify(terminalBufferText(rendered))}`
+          + `\nlast-message=${JSON.stringify(messages.at(-1)?.slice(-2000))}`,
+        );
+      }
 
-      expect(received).toContain('ADOPT_LIVE_UPDATE');
+      expect(rendered.rawSnapshot()).toContain('ADOPT_LIVE_UPDATE');
+      rendered.dispose();
       ws.close();
       child.send({ type: 'close' } satisfies DaemonToWorker);
       external.destroySession();

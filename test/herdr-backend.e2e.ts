@@ -17,14 +17,16 @@
  */
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { rmSync } from 'node:fs';
+import { rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
+import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 
 // Unique enough to never collide with anything the user has running.
 const TEST_SESSION = 'bmx-e2e7777';
 const TEST_TIMEOUT = 30_000;
+const REATTACH_SENTINEL = `/tmp/botmux-herdr-reattach-${process.pid}`;
 
 /**
  * Hard reset for a test session. `herdr session stop` is asynchronous and
@@ -58,58 +60,68 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, label = 'con
 describe('HerdrBackend (e2e)', () => {
   beforeEach(() => {
     hardResetSession(TEST_SESSION);
+    rmSync(REATTACH_SENTINEL, { force: true });
   });
 
   afterEach(() => {
     hardResetSession(TEST_SESSION);
+    rmSync(REATTACH_SENTINEL, { force: true });
   });
 
   it.skipIf(!HerdrBackend.isAvailable())('spawn captures output from a live herdr agent', async () => {
     const backend = new HerdrBackend(TEST_SESSION);
-    const output: string[] = [];
-    backend.onData(d => output.push(d));
+    const renderer = new TerminalRenderer(80, 24);
+    backend.onData(data => renderer.write(data));
 
     backend.spawn('/bin/bash', ['-lc', 'echo HELLO_HERDR; sleep 30'], spawnOpts());
 
-    await waitFor(() => output.join('').includes('HELLO_HERDR'), 10_000, 'HELLO_HERDR in output');
-    expect(output.join('')).toContain('HELLO_HERDR');
+    await waitFor(() => renderer.rawSnapshot().includes('HELLO_HERDR'), 10_000, 'HELLO_HERDR in output');
+    expect(renderer.rawSnapshot()).toContain('HELLO_HERDR');
     expect(HerdrBackend.hasSession(TEST_SESSION)).toBe(true);
     expect(backend.isReattach).toBe(false);
 
     backend.kill();
+    renderer.dispose();
     // kill() only tears down the backend's observers; the herdr session and
     // its agent process must outlive a detach so daemon restarts can resume.
     expect(HerdrBackend.hasSession(TEST_SESSION)).toBe(true);
   }, TEST_TIMEOUT);
 
-  it.skipIf(!HerdrBackend.isAvailable())('re-attach observes the same agent without spawning a new one', async () => {
-    // Phase 1: create the session and let it produce a marker line.
+  it.skipIf(!HerdrBackend.isAvailable())('re-attach streams its full baseline and subsequent output', async () => {
+    // Phase 1: create a long-lived interactive agent and detach its observer.
     const be1 = new HerdrBackend(TEST_SESSION);
-    const out1: string[] = [];
-    be1.onData(d => out1.push(d));
-    be1.spawn('/bin/bash', ['-lc', 'echo PHASE1_MARKER; sleep 30'], spawnOpts());
-    await waitFor(() => out1.join('').includes('PHASE1_MARKER'), 10_000, 'PHASE1_MARKER');
+    const renderer = new TerminalRenderer(80, 24);
+    be1.onData(data => renderer.write(data));
+    be1.spawn('/bin/bash', ['-lc', `echo PHASE1_MARKER; while [ ! -f ${REATTACH_SENTINEL} ]; do sleep 0.05; done; echo PHASE2_DELTA; sleep 30`], spawnOpts());
+    await waitFor(() => renderer.rawSnapshot().includes('PHASE1_MARKER'), 10_000, 'PHASE1_MARKER');
     be1.kill();
+    renderer.dispose();
     expect(HerdrBackend.hasSession(TEST_SESSION)).toBe(true);
 
-    // Phase 2: a second backend attaches to the same session. It must NOT
-    // start a fresh `bash` (the bin/args are ignored on reuse), and it
-    // should see PHASE1_MARKER on its first `pane read --source recent`.
+    // Phase 2: the worker consumes the first observer record as a full grid
+    // replacement, then applies later records as increments. It must NOT start
+    // a fresh bash or append a separately captured seed before that baseline.
     const be2 = new HerdrBackend(TEST_SESSION, { isReattach: true });
-    const out2: string[] = [];
-    be2.onData(d => out2.push(d));
+    const reattachRenderer = new TerminalRenderer(80, 24);
     be2.spawn('/bin/bash', ['-lc', 'echo SHOULD_NOT_RUN'], spawnOpts());
     expect(be2.isReattach).toBe(true);
+    be2.onTerminalFrame(frame => {
+      if (frame.full) reattachRenderer.replace(frame.data, frame.width, frame.height);
+      else reattachRenderer.write(frame.data);
+    });
+    await waitFor(
+      () => reattachRenderer.rawSnapshot().includes('PHASE1_MARKER'),
+      5_000,
+      'reattach rendered full baseline',
+    );
 
-    // Read recent pane content via the backend's capture API. Don't gate on
-    // onData here — the second backend snapshots last-text at spawn time so
-    // the marker shows up in captureCurrentScreen, not the delta stream.
-    await waitFor(() => {
-      const screen = be2.captureCurrentScreen();
-      return screen.includes('PHASE1_MARKER') && !screen.includes('SHOULD_NOT_RUN');
-    }, 10_000, 'pane recent contains PHASE1 but not SHOULD_NOT_RUN');
+    writeFileSync(REATTACH_SENTINEL, 'go');
+    await waitFor(() => be2.captureCurrentScreen().includes('PHASE2_DELTA'), 10_000, 'pane produced PHASE2_DELTA');
+    await waitFor(() => reattachRenderer.rawSnapshot().includes('PHASE2_DELTA'), 10_000, 'reattach rendered PHASE2_DELTA');
+    expect(reattachRenderer.rawSnapshot()).not.toContain('SHOULD_NOT_RUN');
 
     be2.destroySession();
+    reattachRenderer.dispose();
     await waitFor(() => !HerdrBackend.hasSession(TEST_SESSION), 10_000, 'session torn down');
   }, TEST_TIMEOUT);
 
@@ -145,22 +157,21 @@ describe('HerdrBackend (e2e)', () => {
 
   it.skipIf(!HerdrBackend.isAvailable())('write() routes input to the pane and the shell echoes it back', async () => {
     const backend = new HerdrBackend(TEST_SESSION);
+    const renderer = new TerminalRenderer(80, 24);
+    backend.onData(data => renderer.write(data));
     backend.spawn('/bin/bash', ['-lc', 'cat'], spawnOpts());
     await waitFor(() => HerdrBackend.hasSession(TEST_SESSION), 10_000, 'session up');
 
-    const seen: string[] = [];
-    backend.onData(d => seen.push(d));
-
-    // `cat` echoes stdin to stdout — verifies the full write→pane→read loop.
-    // PTY line discipline submits on CR (Enter), not LF — use sendSpecialKeys
-    // for the Enter so the line is actually delivered to cat's stdin.
+    // `cat` echoes stdin to stdout — verifies the full write→pane→stream loop.
+    // PTY line discipline submits on CR (Enter), not LF.
     backend.write('PING_FROM_BOTMUX');
     backend.sendSpecialKeys('Enter');
 
-    await waitFor(() => seen.join('').includes('PING_FROM_BOTMUX'), 10_000, 'cat echoed input');
-    expect(seen.join('')).toContain('PING_FROM_BOTMUX');
+    await waitFor(() => renderer.rawSnapshot().includes('PING_FROM_BOTMUX'), 10_000, 'cat echoed input');
+    expect(renderer.rawSnapshot()).toContain('PING_FROM_BOTMUX');
 
     backend.destroySession();
+    renderer.dispose();
   }, TEST_TIMEOUT);
 
   it.skipIf(!HerdrBackend.isAvailable())('web attach resizes the real agent terminal', async () => {

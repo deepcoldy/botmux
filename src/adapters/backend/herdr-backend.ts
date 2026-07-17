@@ -1,6 +1,8 @@
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import * as pty from 'node-pty';
 import xtermHeadless from '@xterm/headless';
+import { StringDecoder } from 'node:string_decoder';
+import { z } from 'zod';
 import type { BackendType, SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { logger } from '../../utils/logger.js';
 
@@ -14,29 +16,36 @@ export interface HerdrExternalTarget {
   paneId?: string;
 }
 
-// Slow output-streaming poll. We deliberately avoid the original 250ms tick:
-// herdr exposes `wait agent-status`, which we use to fire an immediate read on
-// every idle/working/blocked transition. The 500ms timer is a fallback for the
-// in-the-middle-of-working case where output streams without a status flip.
-const POLL_INTERVAL_MS = 500;
-const READ_LINES = 10_000;
+const MIN_STREAMING_VERSION = [0, 7, 2] as const;
+const OBSERVER_RESTART_DELAY_MS = 500;
+const OBSERVER_RESTART_MAX_DELAY_MS = 5000;
+const OBSERVER_DEGRADED_AFTER_FAILURES = 3;
 const MAX_AGENT_PROBE_FAILURES = 3;
+const MAX_OBSERVER_BACKOFF_EXPONENT = 8;
+const MAX_PENDING_DATA_CHARS = 1_000_000;
+// Snapshot reads are now only used on explicit capture calls. Live output uses
+// `terminal session observe` and never scans this fixed window.
+const READ_LINES = 10_000;
 // Inter-attempt sleep while waiting for `herdr server` to come up.
 // Synchronous (execFileSync 'sleep') because spawn() must stay sync.
 const SERVER_BOOT_POLL_MS = 100;
 const SERVER_BOOT_DEADLINE_MS = 5000;
-// `herdr wait agent-status` blocks until a transition; we cap it so a
-// long-stuck agent still re-arms the watcher and we never accumulate an
-// indefinitely-orphaned subprocess on process teardown.
-const STATUS_WAIT_TIMEOUT_MS = 30_000;
-// States we treat as "result settled — flush the pane now". `done` and
-// `blocked` are the user-facing signals (turn finished / input requested);
-// `idle` is the degraded form of `done` after the herdr UI marks it seen,
-// included because we read via the socket API and herdr may not register
-// our reads as "seeing" → without it the watcher could miss legitimate
-// turn completions. `working` is intentionally absent: we don't need an
-// event for "started streaming", the slow timer covers that path.
-const SETTLED_STATUSES = ['done', 'blocked', 'idle'] as const;
+
+const TERMINAL_STREAM_MESSAGE_SCHEMA = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('terminal.frame'),
+    seq: z.number().int().nonnegative(),
+    full: z.boolean(),
+    encoding: z.literal('ansi'),
+    width: z.number().int().positive(),
+    height: z.number().int().positive(),
+    bytes: z.string(),
+  }),
+  z.object({
+    type: z.literal('terminal.closed'),
+    reason: z.string().optional(),
+  }),
+]);
 
 type JsonCommandResult = { ok: true; value: any | undefined } | { ok: false };
 
@@ -48,6 +57,15 @@ export interface HerdrWebTerminalSize {
 export interface HerdrWebTerminalCursor {
   col: number;
   row: number;
+}
+
+/** One native Herdr terminal frame. A full frame replaces the current grid. */
+export interface HerdrTerminalFrame {
+  data: string;
+  full: boolean;
+  seq: number;
+  width: number;
+  height: number;
 }
 
 function tryJsonCommand(args: string[], opts?: { timeout?: number; input?: string; env?: NodeJS.ProcessEnv }): JsonCommandResult {
@@ -114,30 +132,31 @@ function extractReadText(raw: any): string {
   return typeof raw?.result?.read?.text === 'string' ? raw.result.read.text : '';
 }
 
-function longestSuffixPrefix(previous: string, next: string): number {
-  const max = Math.min(previous.length, next.length);
-  for (let len = max; len > 0; len--) {
-    if (previous.endsWith(next.slice(0, len))) return len;
-  }
-  return 0;
-}
 
 export class HerdrBackend implements SessionBackend {
   private serverProcess: ChildProcess | null = null;
-  private pollTimer: NodeJS.Timeout | null = null;
-  private statusWaitProcesses: ChildProcess[] = [];
+  private observerProcess: ChildProcess | null = null;
+  private observerRestartTimer: NodeJS.Timeout | null = null;
+  private observerBuffer = '';
+  private streamDecoder = new StringDecoder('utf8');
+  private lastFrameSeq = -1;
+  private observerSawFrame = false;
+  private observerFailures = 0;
+  private agentProbeFailures = 0;
+  private observerProbeGeneration = 0;
+  private pendingFullFrame = false;
+  private pendingData = '';
+  private pendingFrames: HerdrTerminalFrame[] = [];
   private readonly dataCbs: Array<(d: string) => void> = [];
-  private readonly snapshotCbs: Array<(snapshot: string) => void> = [];
+  private readonly frameCbs: Array<(frame: HerdrTerminalFrame) => void> = [];
   private readonly webCursorCbs: Array<(cursor: HerdrWebTerminalCursor) => void> = [];
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
   private readonly agentName = 'botmux';
   private paneId: string | undefined;
-  private lastText = '';
   private exited = false;
   private started = false;
   private cols = 200;
   private rows = 50;
-  private agentProbeFailures = 0;
   private webAttach: pty.IPty | null = null;
   private webCursorTerminal: InstanceType<typeof Terminal> | null = null;
   private webCursor: HerdrWebTerminalCursor | null = null;
@@ -161,7 +180,18 @@ export class HerdrBackend implements SessionBackend {
 
   static isAvailable(): boolean {
     try {
-      execFileSync('herdr', ['--version'], { stdio: 'ignore', timeout: 3000 });
+      const output = execFileSync('herdr', ['--version'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+      });
+      const match = /^herdr\s+(\d+)\.(\d+)\.(\d+)/i.exec(output.trim());
+      if (!match) return false;
+      const installed = [Number(match[1]), Number(match[2]), Number(match[3])] as const;
+      for (let index = 0; index < MIN_STREAMING_VERSION.length; index++) {
+        if (installed[index] > MIN_STREAMING_VERSION[index]) return true;
+        if (installed[index] < MIN_STREAMING_VERSION[index]) return false;
+      }
       return true;
     } catch {
       return false;
@@ -270,16 +300,7 @@ export class HerdrBackend implements SessionBackend {
     }
 
     this.started = true;
-    // Baseline policy mirrors the tmux/PTY backends:
-    //   - Fresh spawn: lastText='' so the first poll emits everything from
-    //     t=0 (matches the PTY contract — listeners see all output even if
-    //     the agent echoed before the first read).
-    //   - Re-attach / external adopt: snapshot the current screen so we only
-    //     stream new deltas. Worker.ts explicitly seeds the initial screen
-    //     via captureCurrentScreen() in those paths.
-    this.lastText = (this.isReattach || this.opts.externalTarget) ? this.readRecentAnsi() : '';
-    this.startPolling();
-    this.startStatusWatcher();
+    this.startObserver();
   }
 
   write(data: string): void {
@@ -303,8 +324,12 @@ export class HerdrBackend implements SessionBackend {
   }
 
   resize(cols: number, rows: number): void {
+    if (this.cols === cols && this.rows === rows) return;
     this.cols = cols;
     this.rows = rows;
+    if (!this.started || this.exited) return;
+    this.stopObserver();
+    this.startObserver();
   }
 
   acquireWebTerminal(viewer: object): HerdrWebTerminalSize | null {
@@ -326,9 +351,11 @@ export class HerdrBackend implements SessionBackend {
     } else if (!this.startWebAttach(size)) {
       return null;
     }
-    this.cols = cols;
-    this.rows = rows;
     this.webSize = size;
+    // The managed attach owns the real agent PTY size. Resize it first so the
+    // CLI receives SIGWINCH, then restart the observer at the same grid and
+    // wait for its authoritative full rebaseline.
+    this.resize(cols, rows);
     return size;
   }
 
@@ -353,11 +380,22 @@ export class HerdrBackend implements SessionBackend {
 
   onData(cb: (data: string) => void): void {
     this.dataCbs.push(cb);
+    if (!this.pendingData || this.exited) return;
+    try { cb(this.pendingData); } catch { /* listener crash must not kill the observer */ }
   }
 
-  /** Full interpreted terminal frame for snapshot-aware web history merging. */
-  onSnapshot(cb: (snapshot: string) => void): void {
-    this.snapshotCbs.push(cb);
+  /** Structured native stream; callers must replace rather than append full frames. */
+  onTerminalFrame(cb: (frame: HerdrTerminalFrame) => void): void {
+    this.frameCbs.push(cb);
+    if (this.pendingFrames.length > 0 && !this.exited) {
+      for (const frame of this.pendingFrames) {
+        try { cb(frame); } catch { /* listener crash must not kill the observer */ }
+      }
+    }
+    // A structured consumer has received the same initial frames and will keep
+    // receiving all future data. Do not retain a duplicate compatibility
+    // stream forever when no onData listener exists (the normal worker path).
+    if (this.dataCbs.length === 0) this.pendingData = '';
   }
 
   /** Cursor coordinates from the real managed attach stream (0-based). */
@@ -377,8 +415,9 @@ export class HerdrBackend implements SessionBackend {
     if (this.exited) return;
     this.exited = true;
     this.resetWebTerminal();
-    this.stopPolling();
-    this.stopStatusWatcher();
+    this.stopObserver();
+    this.pendingData = '';
+    this.pendingFrames = [];
     this.serverProcess = null;
   }
 
@@ -403,6 +442,31 @@ export class HerdrBackend implements SessionBackend {
 
   captureCurrentScreen(): string {
     return this.readRecentAnsi();
+  }
+
+  captureCurrentScreenAsync(): Promise<string> {
+    const target = this.paneId ?? this.agentName;
+    return new Promise(resolve => {
+      execFile(
+        'herdr',
+        herdrSessionArgs(this.sessionName, [
+          'agent', 'read', target,
+          '--source', 'recent', '--lines', String(READ_LINES), '--format', 'ansi',
+        ]),
+        { encoding: 'utf8', timeout: 5000, maxBuffer: 16 * 1024 * 1024 },
+        (error, stdout) => {
+          if (error) {
+            resolve('');
+            return;
+          }
+          try {
+            resolve(extractReadText(stdout.trim() ? JSON.parse(stdout) : undefined));
+          } catch {
+            resolve('');
+          }
+        },
+      );
+    });
   }
 
   captureViewport(): string {
@@ -525,9 +589,23 @@ export class HerdrBackend implements SessionBackend {
     return extractAgent(raw);
   }
 
-  private listAgents(): any[] | null {
-    const raw = tryJsonCommand(herdrSessionArgs(this.sessionName, ['agent', 'list']), { timeout: 5000 });
-    return raw.ok ? extractAgents(raw.value) : null;
+  private listAgentsAsync(cb: (agents: any[] | null) => void): void {
+    execFile(
+      'herdr',
+      herdrSessionArgs(this.sessionName, ['agent', 'list']),
+      { encoding: 'utf8', timeout: 5000, maxBuffer: 16 * 1024 * 1024 },
+      (error, stdout) => {
+        if (error) {
+          cb(null);
+          return;
+        }
+        try {
+          cb(extractAgents(stdout.trim() ? JSON.parse(stdout) : undefined));
+        } catch {
+          cb(null);
+        }
+      },
+    );
   }
 
   // NOTE: we use `agent read` (not `pane read`) for capture. Both accept the
@@ -552,175 +630,196 @@ export class HerdrBackend implements SessionBackend {
     ));
   }
 
-  private startPolling(): void {
-    this.stopPolling();
-    this.pollTimer = setInterval(() => this.poll(), POLL_INTERVAL_MS);
-    this.pollTimer.unref?.();
-  }
-
-  private stopPolling(): void {
-    if (this.pollTimer) clearInterval(this.pollTimer);
-    this.pollTimer = null;
-  }
-
-  private poll(): void {
-    if (this.exited) return;
-    const agents = this.listAgents();
-    if (agents === null) {
-      this.agentProbeFailures++;
-      if (this.agentProbeFailures < MAX_AGENT_PROBE_FAILURES) return;
-      this.handleExit(0, null);
-      return;
-    }
-    this.agentProbeFailures = 0;
-    // Exit detection. Verified against herdr v0.6.6: when the CLI process exits,
-    // herdr DROPS the agent row from `agent list` (it does NOT keep a
-    // running:false tombstone). So the primary signal is "our agent is no
-    // longer in the list". We also treat an explicit terminal marker as exited
-    // (agentRowExited) to stay robust if a future herdr keeps a tombstone row —
-    // otherwise name-presence alone would never report the exit and the worker
-    // would never emit `claude_exit`, hanging the session.
-    const matchingAgent = agents.find(agent => agent?.name === this.agentName || agent?.pane_id === this.paneId);
-    const agentExited = matchingAgent ? agentRowExited(matchingAgent) : true;
-    if (this.started && agentExited) {
-      const exitCode = typeof matchingAgent?.exit_code === 'number' ? matchingAgent.exit_code : 0;
-      this.handleExit(exitCode, null);
-      return;
-    }
-
-    this.readAndEmitDelta();
-  }
-
-  /** Read herdr pane recent output and emit the delta vs. last snapshot. */
-  private readAndEmitDelta(): void {
-    if (this.exited) return;
-    const next = this.readRecentAnsi();
-    if (!next || next === this.lastText) return;
-    for (const cb of this.snapshotCbs) {
-      try { cb(next); } catch { /* listener crash shouldn't kill polling */ }
-    }
-    let delta = '';
-    if (next.startsWith(this.lastText)) {
-      delta = next.slice(this.lastText.length);
-    } else if (this.lastText.endsWith(next)) {
-      this.lastText = next;
-      return;
-    } else {
-      const overlap = longestSuffixPrefix(this.lastText, next);
-      delta = overlap > 0 ? next.slice(overlap) : next;
-    }
-    this.lastText = next;
-    if (!delta) return;
-    for (const cb of this.dataCbs) {
-      try { cb(delta); } catch { /* listener crash shouldn't kill polling */ }
-    }
-  }
-
-  /**
-   * Spawn one `herdr wait agent-status` child per "result settled" status
-   * (done / blocked / idle). The first to fire wins → we read+emit, then
-   * tear down the losers and re-arm a fresh cohort. Parallel watchers are
-   * needed because the herdr CLI only accepts one --status at a time, and
-   * we genuinely care about all three transitions: `done` is "turn finished
-   * with output", `blocked` is "agent wants user input", `idle` is the
-   * degraded form of done after herdr's UI marks it seen.
-   */
-  private startStatusWatcher(): void {
+  private startObserver(): void {
     if (this.exited) return;
     const paneTarget = this.paneId ?? this.agentName;
     if (!paneTarget) return;
-    this.stopStatusWatcher();
-    const cohort: ChildProcess[] = [];
-    const armedAt = Date.now();
-    for (const status of SETTLED_STATUSES) {
-      const child = spawn('herdr', [
-        '--session', this.sessionName,
-        'wait', 'agent-status', paneTarget,
-        '--status', status,
-        '--timeout', String(STATUS_WAIT_TIMEOUT_MS),
-      ], { stdio: ['ignore', 'ignore', 'ignore'] });
-      cohort.push(child);
+    clearTimeout(this.observerRestartTimer ?? undefined);
+    this.observerRestartTimer = null;
+    this.observerBuffer = '';
+    this.streamDecoder = new StringDecoder('utf8');
+    this.lastFrameSeq = -1;
+    this.observerSawFrame = false;
+    this.pendingFullFrame = false;
 
-      child.on('exit', (code) => {
-        // Only the first child to finish (across the cohort) drives the
-        // re-arm cycle; later finishers in the same cohort are dropped.
-        if (!this.statusWaitProcesses.includes(child)) return;
-        const wasFirstSettle = this.statusWaitProcesses === cohort;
-        // Drop this child from the active cohort.
-        this.statusWaitProcesses = this.statusWaitProcesses.filter(c => c !== child);
-        if (!wasFirstSettle || this.exited) return;
-        // First exit in this cohort — tear down siblings, then read+re-arm.
-        this.stopStatusWatcher();
-        this.readAndEmitDelta();
+    const child = spawn('herdr', [
+      '--session', this.sessionName,
+      'terminal', 'session', 'observe', paneTarget,
+      '--cols', String(this.cols),
+      '--rows', String(this.rows),
+    ], { stdio: ['ignore', 'pipe', 'ignore'] });
+    this.observerProcess = child;
 
-        // Storm guard. code 0 = the watched status was genuinely reached (a
-        // real transition, which can legitimately happen instantly) → re-arm
-        // immediately, the normal hot path. The danger is a NON-ZERO instant
-        // return: when the agent's pane has gone away (the CLI exited), `herdr
-        // wait agent-status` returns code 1 within MILLISECONDS rather than
-        // after the 30s timeout. The old code re-armed on every non-0 code
-        // synchronously, so a dead pane spun a tight spawn loop (thousands of
-        // `herdr wait` children/sec) that starved the 500ms poll timer → the
-        // session never reported its exit and hung. So for a non-zero code we
-        // first distinguish "real long timeout" (child lived a meaningful
-        // fraction of the window — agent still working, re-arm normally) from
-        // "instant return" (pane likely gone — check liveness; only re-arm via
-        // a deferred timer, never synchronously, so poll() can run and we can't
-        // spin). Verified on v0.6.6: the exited agent's row disappears from
-        // `agent list`.
-        if (code !== 0) {
-          const elapsed = Date.now() - armedAt;
-          const returnedInstantly = elapsed < STATUS_WAIT_TIMEOUT_MS / 2;
-          if (returnedInstantly) {
-            const agents = this.listAgents();
-            if (agents !== null) {
-              const matching = agents.find(a => a?.pane_id === this.paneId || a?.name === this.agentName);
-              const exited = matching ? agentRowExited(matching) : true;
-              if (exited) {
-                const exitCode = typeof matching?.exit_code === 'number' ? matching.exit_code : 0;
-                this.handleExit(exitCode, null);
-                return;
-              }
-            }
-            // Agent still alive but the wait returned instantly (transient
-            // herdr hiccup). Re-arm on a later tick, never synchronously, so we
-            // can't spin: the deferred timer yields the loop to poll(). unref
-            // so we never hold the event loop open.
-            if (this.exited) return;
-            const t = setTimeout(() => { if (!this.exited) this.startStatusWatcher(); }, POLL_INTERVAL_MS);
-            t.unref?.();
-            return;
-          }
-        }
-        // Normal path: a genuine status transition (code 0) or a real
-        // long-timeout (code 1 after ~30s of working) — re-arm immediately.
-        this.startStatusWatcher();
-      });
-      child.on('error', () => {
-        // `herdr` missing or unspawnable: drop from cohort. Timer-based poll
-        // still acts as the fallback signal.
-        this.statusWaitProcesses = this.statusWaitProcesses.filter(c => c !== child);
-      });
-    }
-    this.statusWaitProcesses = cohort;
+    child.stdout?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk: string) => this.consumeObserverChunk(child, chunk));
+    child.on('error', error => {
+      logger.warn(`[herdr:${this.sessionName}] terminal observer failed: ${error.message}`);
+      this.handleObserverDisconnect(child);
+    });
+    child.on('exit', (code, signal) => {
+      if (this.observerProcess !== child || this.exited) return;
+      logger.debug(`[herdr:${this.sessionName}] terminal observer exited code=${code} signal=${signal}`);
+      this.handleObserverDisconnect(child);
+    });
   }
 
-  private stopStatusWatcher(): void {
-    const active = this.statusWaitProcesses;
-    this.statusWaitProcesses = [];
-    for (const child of active) {
-      try { child.kill('SIGTERM'); } catch { /* already gone */ }
+  private consumeObserverChunk(child: ChildProcess, chunk: string): void {
+    if (this.observerProcess !== child || this.exited) return;
+    this.observerBuffer += chunk;
+    let newline = this.observerBuffer.indexOf('\n');
+    while (newline >= 0) {
+      const line = this.observerBuffer.slice(0, newline).trim();
+      this.observerBuffer = this.observerBuffer.slice(newline + 1);
+      if (line) this.consumeObserverLine(child, line);
+      if (this.observerProcess !== child || this.exited) return;
+      newline = this.observerBuffer.indexOf('\n');
     }
+  }
+
+  private consumeObserverLine(child: ChildProcess, line: string): void {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(line);
+    } catch (error) {
+      logger.warn(`[herdr:${this.sessionName}] malformed terminal stream JSON: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    const parsed = TERMINAL_STREAM_MESSAGE_SCHEMA.safeParse(raw);
+    if (!parsed.success) {
+      logger.warn(`[herdr:${this.sessionName}] unsupported terminal stream record: ${parsed.error.message}`);
+      return;
+    }
+    const message = parsed.data;
+    if (message.type === 'terminal.closed') {
+      logger.debug(`[herdr:${this.sessionName}] terminal stream closed: ${message.reason ?? 'no reason'}`);
+      this.handleObserverDisconnect(child);
+      return;
+    }
+    if (message.seq <= this.lastFrameSeq) return;
+    this.lastFrameSeq = message.seq;
+    const bytes = Buffer.from(message.bytes, 'base64');
+    if (message.full) {
+      this.streamDecoder = new StringDecoder('utf8');
+      this.pendingFullFrame = true;
+    }
+    const data = this.streamDecoder.write(bytes);
+    if (!data) return;
+    const frame: HerdrTerminalFrame = {
+      data,
+      full: this.pendingFullFrame,
+      seq: message.seq,
+      width: message.width,
+      height: message.height,
+    };
+    this.pendingFullFrame = false;
+    this.observerSawFrame = true;
+    this.observerFailures = 0;
+    this.agentProbeFailures = 0;
+
+    if (this.frameCbs.length === 0) {
+      if (frame.full) this.pendingFrames = [frame];
+      else this.pendingFrames.push(frame);
+      // Listener registration is normally immediate after spawn. Keep a hard
+      // bound anyway so a missing consumer cannot retain an unbounded stream.
+      if (this.pendingFrames.length > 1024) this.pendingFrames.splice(0, this.pendingFrames.length - 1024);
+    } else {
+      this.pendingFrames = [];
+      for (const cb of this.frameCbs) {
+        try { cb(frame); } catch { /* listener crash must not kill the observer */ }
+      }
+    }
+
+    // Compatibility surface for direct backend consumers. Worker uses the
+    // structured API above so it can replace full frames instead of appending.
+    if (this.dataCbs.length === 0) {
+      if (this.frameCbs.length > 0) {
+        this.pendingData = '';
+        return;
+      }
+      this.pendingData = frame.full ? data : this.pendingData + data;
+      if (this.pendingData.length > MAX_PENDING_DATA_CHARS) {
+        this.pendingData = this.pendingData.slice(-MAX_PENDING_DATA_CHARS);
+      }
+      return;
+    }
+    this.pendingData = '';
+    for (const cb of this.dataCbs) {
+      try { cb(data); } catch { /* listener crash must not kill the observer */ }
+    }
+  }
+
+  private handleObserverDisconnect(child: ChildProcess): void {
+    if (this.observerProcess !== child || this.exited) return;
+    this.observerProcess = null;
+    try { child.kill('SIGTERM'); } catch { /* already gone */ }
+    const sawFrame = this.observerSawFrame;
+    const generation = ++this.observerProbeGeneration;
+    this.listAgentsAsync(agents => {
+      if (this.exited || generation !== this.observerProbeGeneration) return;
+      if (agents !== null) {
+        this.agentProbeFailures = 0;
+        const matching = agents.find(agent => agent?.name === this.agentName || agent?.pane_id === this.paneId);
+        if (!matching || agentRowExited(matching)) {
+          const exitCode = typeof matching?.exit_code === 'number' ? matching.exit_code : 0;
+          this.handleExit(exitCode, null);
+          return;
+        }
+      } else {
+        this.agentProbeFailures++;
+        if (this.agentProbeFailures >= MAX_AGENT_PROBE_FAILURES) {
+          logger.error(
+            `[herdr:${this.sessionName}] cannot verify agent after ${this.agentProbeFailures} attempts`,
+          );
+          this.handleExit(1, null);
+          return;
+        }
+      }
+
+      // A live agent plus an observer that repeatedly exits before producing
+      // one valid frame can mean another client owns Herdr's single observer
+      // slot. The CLI is still alive, so degrade to a capped retry instead of
+      // fabricating an exit. Only a missing agent or consecutive probe failure
+      // may end the backend.
+      this.observerFailures = sawFrame
+        ? 0
+        : Math.min(this.observerFailures + 1, MAX_OBSERVER_BACKOFF_EXPONENT);
+      if (this.observerFailures === OBSERVER_DEGRADED_AFTER_FAILURES) {
+        logger.error(
+          `[herdr:${this.sessionName}] terminal observer unavailable after ${this.observerFailures} attempts; agent is alive, retrying`,
+        );
+      }
+
+      const delay = Math.min(
+        OBSERVER_RESTART_MAX_DELAY_MS,
+        OBSERVER_RESTART_DELAY_MS * (2 ** Math.max(0, this.observerFailures - 1)),
+      );
+      this.observerRestartTimer = setTimeout(() => {
+        this.observerRestartTimer = null;
+        if (!this.exited) this.startObserver();
+      }, delay);
+      this.observerRestartTimer.unref?.();
+    });
+  }
+
+  private stopObserver(): void {
+    this.observerProbeGeneration++;
+    clearTimeout(this.observerRestartTimer ?? undefined);
+    this.observerRestartTimer = null;
+    const child = this.observerProcess;
+    this.observerProcess = null;
+    if (!child) return;
+    try { child.kill('SIGTERM'); } catch { /* already gone */ }
   }
 
   private handleExit(code: number | null, signal: string | null): void {
     if (this.exited) return;
     this.exited = true;
     this.resetWebTerminal();
-    this.stopPolling();
-    this.stopStatusWatcher();
+    this.stopObserver();
+    this.pendingData = '';
+    this.pendingFrames = [];
     for (const cb of this.exitCbs) {
-      try { cb(code, signal); } catch { /* listener crash shouldn't kill teardown */ }
+      try { cb(code, signal); } catch { /* listener crash must not kill teardown */ }
     }
   }
 }

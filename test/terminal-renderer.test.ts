@@ -69,6 +69,20 @@ describe('TerminalRenderer width matches source pane', () => {
     r160.dispose();
   });
 
+  it('replaces an old reattach seed with a full observer baseline', async () => {
+    const renderer = new TerminalRenderer(20, 4);
+    await writeAndFlush(renderer, 'OLD-1\r\nOLD-2\r\nOLD-3\r\nOLD-4\r\nOLD-5');
+
+    renderer.replace('\x1b[2J\x1b[HBASE-1\r\nBASE-2', 30, 6);
+    await writeAndFlush(renderer, '');
+
+    expect(renderer.xterm.cols).toBe(30);
+    expect(renderer.xterm.rows).toBe(6);
+    expect(renderer.rawSnapshot()).toContain('BASE-1');
+    expect(renderer.rawSnapshot()).not.toContain('OLD-5');
+    renderer.dispose();
+  });
+
   it('snapshot reads past the old 160-col clamp on a 270-col renderer', async () => {
     // Live failure: snapshot was clamped at 160 cols regardless of the
     // renderer's actual width, silently dropping any pane content past
