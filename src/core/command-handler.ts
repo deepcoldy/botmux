@@ -20,7 +20,7 @@ import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
-import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
@@ -2608,6 +2608,33 @@ export async function handleCommand(
           });
           const targetScope = targetRouting.scope;
           const targetAnchor = targetRouting.anchor;
+          // ── Reply WHERE the user typed /relay ─────────────────────────────
+          // Not through sessionReply: in chat-scope groups (普通群扁平 /
+          // chat-topic / shared) that path either leaks to the chat top level
+          // (the /relay scratch has no turn state to fold back into) or lands
+          // in the CURRENT turn's 话题 (a real chat-scope session) — both away
+          // from the 话题 the user invoked in (申晗 live 反馈). The target
+          // routing already encodes the invocation spot:
+          //   thread → reply_in_thread into that 话题 (for 话题群 / DM-thread
+          //            top-level this seeds the 话题 on the /relay message —
+          //            same place the relayed session will land);
+          //   chat   → quote-reply the /relay message at the top level.
+          // Fallback to sessionReply if the reply API refuses (e.g. the
+          // command message was withdrawn mid-flight).
+          const replyAtInvocation = async (content: string, msgType?: string): Promise<void> => {
+            try {
+              await replyMessage(
+                myAppId,
+                targetScope === 'thread' ? targetAnchor : message.messageId,
+                content,
+                msgType ?? 'text',
+                /*replyInThread*/ targetScope === 'thread',
+              );
+            } catch (err) {
+              logger.warn(`[${logTag}] /relay reply-at-invocation failed (${err instanceof Error ? err.message : err}); falling back to sessionReply`);
+              await sessionReply(rootId, content, msgType);
+            }
+          };
           // ── Existing-session guard (anchor-based) ─────────────────────────
           // A real session already sitting AT the target anchor would collide
           // on sessionKey(targetAnchor, larkAppId) after transfer — Map.set
@@ -2623,7 +2650,7 @@ export async function handleCommand(
             && !!c.worker   // real running session, not a placeholder
           );
           if (conflict) {
-            await sessionReply(rootId, t('cmd.relay.target_has_session', { title: conflict.session.title || conflict.session.sessionId.substring(0, 8) }, loc));
+            await replyAtInvocation(t('cmd.relay.target_has_session', { title: conflict.session.title || conflict.session.sessionId.substring(0, 8) }, loc));
             break;
           }
           // Shared candidate-collection logic — used here at initial render
@@ -2635,7 +2662,7 @@ export async function handleCommand(
           const entries = await collectRelayPickerEntries(activeSessions, myAppId, targetAnchor, operatorOpenId);
           const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
           const card = buildRelayPickerCard(entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined, targetScope, targetChatType);
-          await sessionReply(rootId, card, 'interactive');
+          await replyAtInvocation(card, 'interactive');
           break;
         }
         const afterFlag = argsLine.replace(/^--create\s*/i, '').trim();
