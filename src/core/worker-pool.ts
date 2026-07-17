@@ -1599,22 +1599,6 @@ export async function closeSession(
     // crash/limited turn may never have reached an idle edge).
     recordUsageForDaemonSession(ds);
     killWorker(ds);
-    // 文档入口清理：会话关闭即删除其绑定。只有旧
-    // /subscribe-lark-doc 记录需要调飞书逐文件退订 API；
-    // /watch-comment 仅依赖应用级评论事件，删本地监听表即可。
-    try {
-      const anchor = sessionAnchorId(ds);
-      const subs = listDocSubscriptionsForSession(config.session.dataDir, ds.larkAppId, anchor);
-      for (const sub of subs) {
-        if (sub.managedBy !== 'watch-comment') {
-          await unsubscribeDocFile(ds.larkAppId, { fileToken: sub.fileToken, fileType: sub.fileType });
-        }
-        removeDocSubscription(config.session.dataDir, ds.larkAppId, sub.fileToken);
-      }
-      if (subs.length) logger.info(`[doc-comment] session ${sessionId.slice(0, 8)} closed → removed ${subs.length} doc binding(s)`);
-    } catch (err: any) {
-      logger.warn(`[doc-comment] cleanup on close failed for ${sessionId.slice(0, 8)}: ${err?.message ?? err}`);
-    }
     activeSessionsRegistry?.delete(activeSessionKey(ds));
     // Mark the captured object too. Async message/card paths may already hold a
     // reference to `ds`; deleting only the registry entry would not stop one of

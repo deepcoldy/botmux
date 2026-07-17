@@ -275,12 +275,30 @@ describe('POST /api/sessions/:sessionId/rename', () => {
       });
 
       expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ ok: true, title: 'New Title', agentSync: 'requested' });
-      expect(sessionStore.getSession(session.sessionId)?.title).toBe('New Title');
+      const renameResult = await res.json();
+      expect(renameResult).toEqual({
+        ok: true,
+        title: 'New Title',
+        titleUpdatedAt: expect.any(String),
+        titleSource: 'dashboard',
+        agentSync: 'requested',
+      });
+      expect(sessionStore.getSession(session.sessionId)).toMatchObject({
+        title: 'New Title',
+        titleUpdatedAt: renameResult.titleUpdatedAt,
+        titleSource: 'dashboard',
+      });
       expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'New Title' });
       expect(events).toContainEqual({
         type: 'session.update',
-        body: { sessionId: session.sessionId, patch: { title: 'New Title' } },
+        body: {
+          sessionId: session.sessionId,
+          patch: {
+            title: 'New Title',
+            titleUpdatedAt: renameResult.titleUpdatedAt,
+            titleSource: 'dashboard',
+          },
+        },
       });
     } finally {
       findSpy?.mockRestore();

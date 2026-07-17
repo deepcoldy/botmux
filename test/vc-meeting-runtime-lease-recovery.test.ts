@@ -10,7 +10,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 import { __testOnly_createVcMeetingRuntimeLeaseRecovery as createRecovery } from '../src/daemon.js';
 
-type FakeSession = DaemonSession & { testPersistentScope?: 'tmux' | 'herdr' | 'zellij' | 'none' | 'unknown' };
+type FakeSession = DaemonSession & { testPersistentScope?: 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'none' | 'unknown' };
 
 function ref(overrides: Partial<VcMeetingAmbiguousReceiptRef> = {}): VcMeetingAmbiguousReceiptRef {
   return {
@@ -83,9 +83,9 @@ function fakeSession(options: {
 
 function harness(input: {
   sessions?: FakeSession[];
-  probe?: (backend: 'tmux' | 'herdr' | 'zellij', sessionName: string) => 'exists' | 'missing' | 'unknown';
+  probe?: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx', sessionName: string) => 'exists' | 'missing' | 'unknown';
   missingPersistentScope?: FakeSession['testPersistentScope'];
-  backendAvailable?: (backend: 'tmux' | 'herdr' | 'zellij') => boolean;
+  backendAvailable?: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx') => boolean;
 } = {}) {
   const sessions = new Map((input.sessions ?? []).map(ds => [ds.session.sessionId, ds]));
   const sent: Array<{ sessionId: string; turnId: string; dispatchAttempt: number }> = [];
@@ -109,11 +109,11 @@ function harness(input: {
     },
     resolvePersistentScope: (ds: FakeSession) => ds.testPersistentScope ?? 'unknown',
     resolveMissingPersistentScope: () => input.missingPersistentScope ?? 'unknown',
-    backendAvailable: (backend: 'tmux' | 'herdr' | 'zellij') => input.backendAvailable?.(backend) ?? true,
+    backendAvailable: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx') => input.backendAvailable?.(backend) ?? true,
     killPersistent: (backend: string, sessionName: string) => {
       backingKills.push(`${backend}:${sessionName}`);
     },
-    probePersistent: (backend: 'tmux' | 'herdr' | 'zellij', sessionName: string) => {
+    probePersistent: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx', sessionName: string) => {
       probes.push(`${backend}:${sessionName}`);
       return input.probe?.(backend, sessionName) ?? 'missing';
     },
@@ -224,8 +224,8 @@ describe('VC meeting runtime lease recovery', () => {
     });
     h.recovery.arm(ref(), 'agent_test');
 
-    expect(h.backingKills.map(value => value.split(':')[0])).toEqual(['tmux', 'herdr', 'zellij']);
-    expect(h.probes.map(value => value.split(':')[0])).toEqual(['tmux', 'herdr', 'zellij']);
+    expect(h.backingKills.map(value => value.split(':')[0])).toEqual(['tmux', 'herdr', 'zellij', 'zmx']);
+    expect(h.probes.map(value => value.split(':')[0])).toEqual(['tmux', 'herdr', 'zellij', 'zmx']);
     expect(h.recovery.snapshot()).toMatchObject([{
       receiverSessionId: 'session_a',
       deliveryKey: 'delivery_a',

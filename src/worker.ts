@@ -5902,18 +5902,6 @@ async function spawnCli(
     }
   }
 
-  const selectedBackend = selectSessionBackend({
-    sessionId: cfg.sessionId,
-    backendType: effectiveBackend,
-    backendConfig: riffBackendConfig,
-    hasExistingSession: effectiveBackend === 'zmx'
-      ? resolvedZmxSessionProbe === 'exists'
-      : undefined,
-  });
-  isTmuxMode = selectedBackend.isTmuxMode;
-  isPipeMode = selectedBackend.isPipeMode;
-  isZellijMode = selectedBackend.isZellijMode;
-  backend = selectedBackend.backend;
   const adapterSessionId = cfg.resume
     ? (cfg.originalSessionId ?? cfg.sessionId)
     : cfg.sessionId;
@@ -6189,17 +6177,33 @@ async function spawnCli(
     config.session.dataDir,
   );
   if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length && persistentSessionName && effectiveBackendType !== 'pty') {
-    const paneLive = effectiveBackendType === 'tmux'
-      ? TmuxBackend.hasSession(persistentSessionName)
-      : effectiveBackendType === 'zellij'
-        ? ZellijBackend.hasSession(persistentSessionName)
-        : HerdrBackend.hasSession(persistentSessionName);
-    if (paneLive) {
+    const persistentBackendType = effectiveBackendType as PersistentBackendType;
+    const paneProbe = probePersistentSession(persistentBackendType, persistentSessionName);
+    if (paneProbe === 'unknown') {
+      throw new Error(
+        `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
+        `could not verify existing ${effectiveBackendType} pane`,
+      );
+    }
+    if (effectiveBackendType === 'zmx') {
+      resolvedZmxSessionProbe = paneProbe;
+    }
+    if (paneProbe === 'exists') {
       // The trusted Gateway host belongs to the worker and cannot survive a
       // worker/daemon replacement. Cold-resume the CLI so its MCP client gets a
       // fresh relay socket instead of reattaching to a dead connection.
       log(`[mcp-gateway] persistent pane ${cfg.sessionId} has plugin MCP state — cold-resuming with a fresh host`);
-      killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
+      killPersistentSession(persistentBackendType, persistentSessionName);
+      const postKillProbe = probePersistentSession(persistentBackendType, persistentSessionName);
+      if (postKillProbe !== 'missing') {
+        throw new Error(
+          `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
+          `could not confirm stale ${effectiveBackendType} pane termination`,
+        );
+      }
+      if (effectiveBackendType === 'zmx') {
+        resolvedZmxSessionProbe = postKillProbe;
+      }
     }
   }
   const willReattachPersistent = persistentSessionName
@@ -6211,6 +6215,22 @@ async function spawnCli(
           ? resolvedZmxSessionProbe === 'exists'
         : HerdrBackend.hasSession(persistentSessionName)
     : false;
+
+  // Persistent-session policy gates above may intentionally kill a stale pane.
+  // Select the concrete backend only afterwards so it cannot retain a stale
+  // isReattach/createSession decision for the pane that was just removed.
+  const selectedBackend = selectSessionBackend({
+    sessionId: cfg.sessionId,
+    backendType: effectiveBackend,
+    backendConfig: riffBackendConfig,
+    hasExistingSession: effectiveBackend === 'zmx'
+      ? resolvedZmxSessionProbe === 'exists'
+      : undefined,
+  });
+  isTmuxMode = selectedBackend.isTmuxMode;
+  isPipeMode = selectedBackend.isPipeMode;
+  isZellijMode = selectedBackend.isZellijMode;
+  backend = selectedBackend.backend;
 
   // The plugin set is stable only for the lifetime of one real CLI process.
   // A warm worker reattach keeps the existing Gateway and catalog untouched;

@@ -560,6 +560,19 @@ export function discoverV3AttemptWorker(attemptDir: string): V3AttemptWorkerDisc
       }
     }
 
+    // Both predicates are mandatory. Check the non-sensitive command line
+    // first so unrelated same-uid processes with intentionally unreadable
+    // environments (for example sshd, gpg-agent, or sd-pam) can be ruled out
+    // instead of making every attempt discovery permanently ambiguous.
+    // Failure to inspect a possible command remains fail-closed.
+    try {
+      if (!isBotmuxWorkerCommandLine(readFileSync(join(procDir, 'cmdline')))) continue;
+    } catch (err) {
+      if (isGoneProcError(err)) continue;
+      unverifiablePids.push(pid);
+      continue;
+    }
+
     let envMatches = false;
     try {
       envMatches = readFileSync(join(procDir, 'environ'))
@@ -575,13 +588,6 @@ export function discoverV3AttemptWorker(attemptDir: string): V3AttemptWorkerDisc
     }
     if (!envMatches) continue;
 
-    try {
-      if (!isBotmuxWorkerCommandLine(readFileSync(join(procDir, 'cmdline')))) continue;
-    } catch (err) {
-      if (isGoneProcError(err)) continue;
-      unverifiablePids.push(pid);
-      continue;
-    }
     const procStart = readProcessStartIdentity(pid);
     if (!procStart) {
       if (processExists(pid) !== 'missing') unverifiablePids.push(pid);

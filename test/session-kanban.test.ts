@@ -46,7 +46,7 @@ describe('session-board normalizers', () => {
     expect(normalizeSessionTitle('  修复登录 bug  ')).toBe('修复登录 bug');
     expect(normalizeSessionTitle('第一行\n  第二行')).toBe('第一行 第二行');
     expect(normalizeSessionTitle('安全\r\n标题\t\u001b[31m\u0000\u009b')).toBe('安全 标题 [31m');
-    expect(normalizeSessionTitle('\x1b]52;c;payload\x07安全\t标题\u009b2J')).toBe(']52;c;payload安全 标题2J');
+    expect(normalizeSessionTitle('\x1b]52;c;payload\x07安全\t标题\u009b2J')).toBe(']52;c;payload 安全 标题 2J');
     expect(normalizeSessionTitle('a'.repeat(300))).toHaveLength(200);
     expect(normalizeSessionTitle('   ')).toBeNull();
     expect(normalizeSessionTitle('')).toBeNull();

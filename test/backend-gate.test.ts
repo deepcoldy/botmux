@@ -93,3 +93,33 @@ describe('ZMX filesystem-isolation gate', () => {
     expect(failure).toBeGreaterThan(notify);
   });
 });
+
+describe('persistent backend cold-restart ordering', () => {
+  it('selects the backend only after stale persistent panes have been removed', () => {
+    const coldRestartGate = workerSource.indexOf(
+      'if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length',
+    );
+    const backendSelection = workerSource.indexOf(
+      'const selectedBackend = selectSessionBackend({',
+    );
+
+    expect(coldRestartGate).toBeGreaterThan(-1);
+    expect(backendSelection).toBeGreaterThan(coldRestartGate);
+  });
+
+  it('fails closed on an uncertain MCP pane and refreshes the cached ZMX probe after killing it', () => {
+    const start = workerSource.indexOf(
+      'if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length',
+    );
+    const end = workerSource.indexOf('const willReattachPersistent =', start);
+    const gate = workerSource.slice(start, end);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(gate).toContain('probePersistentSession(');
+    expect(gate).toContain("paneProbe === 'unknown'");
+    expect(gate).toContain("postKillProbe !== 'missing'");
+    expect(gate).toContain("effectiveBackendType === 'zmx'");
+    expect(gate).toContain('resolvedZmxSessionProbe = postKillProbe');
+  });
+});

@@ -54,7 +54,9 @@ describe('startInitialPassthroughSession ownership', () => {
 
   it('hands a registration loser to the post-rollback winner with live passthrough semantics', () => {
     expect(region).toContain('rollbackRejectedSessionAndGetWinner(activeSessions, creationKey, ds)');
-    expect(region).toContain('deliverPassthroughToExistingSession(winner, cmd, commandContent, anchor, larkAppId)');
+    expect(region).toContain('deliverPassthroughToExistingSession(winner, cmd, commandContent, anchor, larkAppId, {');
+    expect(region).toContain("senderIsBot: parsed.senderType === 'app' || parsed.senderType === 'bot'");
+    expect(region).toContain('substitute,');
   });
 });
 
