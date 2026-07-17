@@ -163,9 +163,14 @@ export function findAuthenticatedAncestorSessionContext(
           `无法读取 CLI process marker ${markerPath}：${err instanceof Error ? err.message : String(err)}`,
         );
       }
-      if (!marker.sessionId || !marker.turnId || !marker.procStart) {
+      if (!marker.sessionId || !marker.procStart) {
         throw new SessionMarkerAuthenticationError(
-          `CLI process marker ${markerPath} 缺少 sessionId/turnId/procStart，不能用于变更操作授权`,
+          '后台进程信息不完整，暂时不能执行变更。请运行 botmux restart 后重试。',
+        );
+      }
+      if (!marker.turnId) {
+        throw new SessionMarkerAuthenticationError(
+          '当前会话还没有绑定到这条消息，暂时不能执行变更。请在原话题重新发送一次；如果仍失败，请运行 botmux restart。',
         );
       }
       const liveStart = readProcessStartIdentity(pid);

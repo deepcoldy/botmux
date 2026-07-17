@@ -480,87 +480,130 @@ export async function commitRepoSelection(
   const commitGenSessionId = ds.session.sessionId;
 
   if (ds.pendingRepo) {
-    // First spawn: pin the new cwd onto the CURRENT session before forking.
-    ds.workingDir = dirPath;
-    ds.session.workingDir = dirPath;
-    // riff 多仓 stamp：只有多仓 worktree 流显式传入（保留用户选择顺序，首仓=primary）；
-    // 其它选仓路径一律清除旧 stamp——workingDir 变了，旧的多仓组合不再成立。
-    ds.session.riffRepoDirs = opts?.riffRepoDirs;
-    sessionStore.updateSession(ds.session);
-    const selfBot = getBot(ds.larkAppId);
-    const botCfg = selfBot.config;
-    const effectiveCliId = sessionCliId(ds);
-    // First-time repo selection — now spawn CLI with the original prompt
-    ds.pendingRepo = false;
-    publishAttentionPatch(ds);
-    const pendingPrompt = ds.pendingPrompt ?? '';
-    const pendingRawInput = ds.pendingRawInput;
-    // Raw-input cold start still wraps any input buffered while the repo card
-    // was pending — see the skip_repo branch for the rationale.
-    const hasBufferedInput =
-      pendingPrompt.trim().length > 0 ||
-      (ds.pendingAttachments?.length ?? 0) > 0 ||
-      (ds.pendingFollowUps?.length ?? 0) > 0;
-    if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
-    const wrappedInput = (!pendingRawInput || hasBufferedInput)
-      ? buildNewTopicCliInput(
-          pendingPrompt,
-          ds.session.sessionId,
-          effectiveCliId,
-          botCfg.cliPathOverride,
-          ds.pendingAttachments,
-          ds.pendingMentions,
-          await getAvailableBots(ds.larkAppId, ds.chatId),
-          ds.pendingFollowUps,
-          { name: selfBot.botName, openId: selfBot.botOpenId },
-          locTarget,
-          ds.pendingSender,
-          {
-            larkAppId: ds.larkAppId,
-            chatId: ds.chatId,
-            whiteboardId: ds.session.whiteboardId,
-            substituteTrigger: ds.pendingSubstituteTrigger,
-            codexAppText: ds.pendingCodexAppText,
-            codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
-            codexAppMessageContext: ds.pendingCodexAppMessageContext,
-            codexAppFollowUps: ds.pendingCodexAppFollowUps,
-            codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
-          },
-        )
-      : { content: '' };
-    const prompt = pendingRawInput ? '' : wrappedInput;
-    // Last-line defence: prompt prep awaited above — if anything replaced
-    // OR closed the session in that window, forking now would clobber it
-    // (or resurrect a /close'd session).
-    if (!sessionStillActive() || ds.session.sessionId !== commitGenSessionId) {
-      logger.warn(`[${tag(ds)}] Session replaced or closed while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds.session.sessionId}, active=${sessionStillActive()}) — aborting this fork`);
+    // Card select/skip and auto-worktree converge here; the text /repo path
+    // mirrors this transaction through the same in-memory claim. Only one may
+    // own the pending -> worker transition, including prompt preparation.
+    if (ds.pendingRepoCommitInFlight) {
+      logger.info(`[${tag(ds)}] Pending repo commit already in flight — ignoring duplicate selection`);
       return;
     }
-    if (pendingRawInput && hasBufferedInput) {
-      ds.pendingFollowUpInput = {
-        userPrompt: ds.pendingCodexAppText !== undefined || ds.pendingCodexAppFollowUps
-          ? [ds.pendingCodexAppText ?? '', ...(ds.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
-          : pendingPrompt || ds.pendingFollowUps?.join('\n\n') || '',
-        cliInput: wrappedInput.content,
-        ...(effectiveCliId === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
-          ? { codexAppInput: wrappedInput.codexAppInput }
-          : {}),
-        codexAppInputGateFrozen: true,
-      };
+    ds.pendingRepoCommitInFlight = true;
+    let committed = false;
+    try {
+      // Claim before mutating the selected directory so two different card
+      // choices cannot overwrite each other while one prompt is being built.
+      ds.workingDir = dirPath;
+      ds.session.workingDir = dirPath;
+      ds.session.riffRepoDirs = opts?.riffRepoDirs;
+      sessionStore.updateSession(ds.session);
+      const selfBot = getBot(ds.larkAppId);
+      const botCfg = selfBot.config;
+      const effectiveCliId = sessionCliId(ds);
+
+      // Keep pendingRepo=true across this await. New topic messages therefore
+      // remain buffered on this same session instead of racing a worker-null
+      // safety-net fork. Snapshot every pending field only after it settles.
+      const needsPromptContext = !ds.pendingRawInput ||
+        (ds.pendingPrompt?.trim().length ?? 0) > 0 ||
+        (ds.pendingAttachments?.length ?? 0) > 0 ||
+        (ds.pendingFollowUps?.length ?? 0) > 0;
+      const availableBots = needsPromptContext
+        ? await getAvailableBots(ds.larkAppId, ds.chatId)
+        : [];
+      if (!sessionStillActive() || ds.session.sessionId !== commitGenSessionId ||
+          !ds.pendingRepo || (ds.worker && !ds.worker.killed)) {
+        logger.warn(`[${tag(ds)}] Session changed while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds.session.sessionId}, active=${sessionStillActive()}, pending=${!!ds.pendingRepo}, worker=${!!ds.worker}) — aborting this fork`);
+        return;
+      }
+
+      const pendingPrompt = ds.pendingPrompt ?? '';
+      const pendingRawInput = ds.pendingRawInput;
+      const hasBufferedInput =
+        pendingPrompt.trim().length > 0 ||
+        (ds.pendingAttachments?.length ?? 0) > 0 ||
+        (ds.pendingFollowUps?.length ?? 0) > 0;
+      if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
+      const wrappedInput = (!pendingRawInput || hasBufferedInput)
+        ? buildNewTopicCliInput(
+            pendingPrompt,
+            ds.session.sessionId,
+            effectiveCliId,
+            botCfg.cliPathOverride,
+            ds.pendingAttachments,
+            ds.pendingMentions,
+            availableBots,
+            ds.pendingFollowUps,
+            { name: selfBot.botName, openId: selfBot.botOpenId },
+            locTarget,
+            ds.pendingSender,
+            {
+              larkAppId: ds.larkAppId,
+              chatId: ds.chatId,
+              whiteboardId: ds.session.whiteboardId,
+              substituteTrigger: ds.pendingSubstituteTrigger,
+              codexAppText: ds.pendingCodexAppText,
+              codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
+              codexAppMessageContext: ds.pendingCodexAppMessageContext,
+              codexAppFollowUps: ds.pendingCodexAppFollowUps,
+              codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
+            },
+          )
+        : { content: '' };
+      const prompt = pendingRawInput ? '' : wrappedInput;
+      const pendingTurnId = ds.pendingTurnId;
+      const previousPendingFollowUpInput = ds.pendingFollowUpInput;
+      if (pendingRawInput && hasBufferedInput) {
+        ds.pendingFollowUpInput = {
+          userPrompt: ds.pendingCodexAppText !== undefined || ds.pendingCodexAppFollowUps
+            ? [ds.pendingCodexAppText ?? '', ...(ds.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
+            : pendingPrompt || ds.pendingFollowUps?.join('\n\n') || '',
+          cliInput: wrappedInput.content,
+          ...(ds.pendingFollowUpTurnId ? { turnId: ds.pendingFollowUpTurnId } : {}),
+          ...(effectiveCliId === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
+            ? { codexAppInput: wrappedInput.codexAppInput }
+            : {}),
+          codexAppInputGateFrozen: true,
+        };
+      }
+
+      // From here through forkWorker there is no await: publish the state
+      // transition atomically from the router's point of view.
+      ds.pendingRepo = false;
+      publishAttentionPatch(ds);
+      try {
+        if (pendingRawInput) {
+          // pendingRawTurnId is applied at the literal PTY write boundary.
+          forkWorker(ds, '', false);
+        } else if (pendingTurnId && hasBufferedInput) {
+          forkWorker(ds, prompt, { turnId: pendingTurnId });
+        } else {
+          forkWorker(ds, prompt);
+        }
+      } catch (e) {
+        ds.pendingRepo = true;
+        ds.pendingFollowUpInput = previousPendingFollowUpInput;
+        publishAttentionPatch(ds);
+        throw e;
+      }
+      rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
+      ds.pendingPrompt = undefined;
+      ds.pendingCodexAppText = undefined;
+      ds.pendingCodexAppApplicationContext = undefined;
+      ds.pendingCodexAppMessageContext = undefined;
+      ds.pendingAttachments = undefined;
+      ds.pendingMentions = undefined;
+      ds.pendingSubstituteTrigger = undefined;
+      ds.pendingSender = undefined;
+      ds.pendingFollowUps = undefined;
+      ds.pendingCodexAppFollowUps = undefined;
+      ds.pendingCodexAppFollowUpContexts = undefined;
+      ds.pendingFollowUpTurnId = undefined;
+      ds.pendingTurnId = undefined;
+      committed = true;
+    } finally {
+      ds.pendingRepoCommitInFlight = false;
     }
-    rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
-    ds.pendingPrompt = undefined;
-    ds.pendingCodexAppText = undefined;
-    ds.pendingCodexAppApplicationContext = undefined;
-    ds.pendingCodexAppMessageContext = undefined;
-    ds.pendingAttachments = undefined;
-    ds.pendingMentions = undefined;
-    ds.pendingSubstituteTrigger = undefined;
-    ds.pendingSender = undefined;
-    ds.pendingFollowUps = undefined;
-    ds.pendingCodexAppFollowUps = undefined;
-    ds.pendingCodexAppFollowUpContexts = undefined;
-    forkWorker(ds, prompt);
+    if (!committed) return;
     // A card click has no turn of its own — anchor the confirmation to the
     // session's current reply-target turn so a shared fold-back topic keeps
     // it in-thread (same leak as the /repo command path).
@@ -2249,77 +2292,23 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (actionType === 'skip_repo' && ds) {
       const locDs = localeForBot(ds.larkAppId);
       if (ds.pendingRepo) {
-        const selfBot = getBot(ds.larkAppId);
-        const botCfg = selfBot.config;
-        const effectiveCliId = sessionCliId(ds);
-        // Skip repo selection — spawn CLI with default working dir
-        ds.pendingRepo = false;
-        publishAttentionPatch(ds);
-        const pendingPrompt = ds.pendingPrompt ?? '';
-        const pendingRawInput = ds.pendingRawInput;
-        // Raw-input cold start still wraps any input buffered while the repo
-        // card was pending (follow-ups / attachments) — delivered right after
-        // the raw input on prompt_ready instead of being dropped.
-        const hasBufferedInput =
-          pendingPrompt.trim().length > 0 ||
-          (ds.pendingAttachments?.length ?? 0) > 0 ||
-          (ds.pendingFollowUps?.length ?? 0) > 0;
-        if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
-        const wrappedInput = (!pendingRawInput || hasBufferedInput)
-          ? buildNewTopicCliInput(
-              pendingPrompt,
-              ds.session.sessionId,
-              effectiveCliId,
-              botCfg.cliPathOverride,
-              ds.pendingAttachments,
-              ds.pendingMentions,
-              await getAvailableBots(ds.larkAppId, ds.chatId),
-              ds.pendingFollowUps,
-              { name: selfBot.botName, openId: selfBot.botOpenId },
-              locDs,
-              ds.pendingSender,
-              {
-                larkAppId: ds.larkAppId,
-                chatId: ds.chatId,
-                whiteboardId: ds.session.whiteboardId,
-                substituteTrigger: ds.pendingSubstituteTrigger,
-                codexAppText: ds.pendingCodexAppText,
-                codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
-                codexAppMessageContext: ds.pendingCodexAppMessageContext,
-                codexAppFollowUps: ds.pendingCodexAppFollowUps,
-                codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
-              },
-            )
-          : { content: '' };
-        const prompt = pendingRawInput ? '' : wrappedInput;
-        if (pendingRawInput && hasBufferedInput) {
-          ds.pendingFollowUpInput = {
-              userPrompt: ds.pendingCodexAppText !== undefined || ds.pendingCodexAppFollowUps
-                ? [ds.pendingCodexAppText ?? '', ...(ds.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
-                : pendingPrompt || ds.pendingFollowUps?.join('\n\n') || '',
-              cliInput: wrappedInput.content,
-              ...(effectiveCliId === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
-                ? { codexAppInput: wrappedInput.codexAppInput }
-                : {}),
-              codexAppInputGateFrozen: true,
-            };
-          }
-        rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
-        ds.pendingPrompt = undefined;
-        ds.pendingCodexAppText = undefined;
-        ds.pendingCodexAppApplicationContext = undefined;
-        ds.pendingCodexAppMessageContext = undefined;
-        ds.pendingAttachments = undefined;
-        ds.pendingMentions = undefined;
-        ds.pendingSubstituteTrigger = undefined;
-        ds.pendingSender = undefined;
-        ds.pendingFollowUps = undefined;
-        ds.pendingCodexAppFollowUps = undefined;
-        ds.pendingCodexAppFollowUpContexts = undefined;
-        forkWorker(ds, prompt);
+        if (ds.worktreeCreating || ds.pendingRepoCommitInFlight) {
+          return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locDs) } };
+        }
         const cwd = getSessionWorkingDir(ds);
-        await sessionReply(rootId, t('cmd.skip.opened', { cwd }, locDs));
-        logger.info(`[${tag(ds)}] Skip repo, spawning CLI in ${cwd}`);
+        // Reuse the same claimed pending->worker transition as a normal repo
+        // selection. This keeps buffering active across prompt preparation and
+        // makes skip/select races single-winner.
+        await commitRepoSelection(
+          { ds, rootId, cardMessageId: undefined, larkAppId, operatorOpenId, activeSessions, sessionReply },
+          cwd,
+          pathBasename(cwd) || cwd,
+          { suppressConfirmReply: true },
+        );
+        if (!ds.pendingRepo) {
+          await sessionReply(rootId, t('cmd.skip.opened', { cwd }, locDs));
+          logger.info(`[${tag(ds)}] Skip repo, spawning CLI in ${cwd}`);
+        }
       } else {
         await sessionReply(rootId, t('card.action.continue_using_current_repo', { cwd: getSessionWorkingDir(ds) }, locDs));
       }
@@ -2344,7 +2333,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       // A worktree creation in flight holds the commit lock — a manual switch
       // interleaving there would double-fork (same guard as the plain switch).
-      if (ds.worktreeCreating) {
+      if (ds.worktreeCreating || ds.pendingRepoCommitInFlight) {
         return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locDs) } };
       }
       const selectedPath = validation.resolvedPath;
@@ -2381,7 +2370,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (selectedPaths.length === 0) {
         return { toast: { type: 'error', content: t('card.repo.worktree_empty', undefined, locDs) } };
       }
-      if (ds.worktreeCreating) {
+      if (ds.worktreeCreating || ds.pendingRepoCommitInFlight) {
         return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locDs) } };
       }
       const branch = String(action?.form_value?.repo_worktree_branch ?? '').trim() || undefined;
@@ -2636,7 +2625,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // ack the card action immediately with a toast and finish asynchronously.
     // On failure the card (and pendingRepo state) stays put so the user can
     // pick again or fall back to a plain switch.
-    if (targetDs.worktreeCreating) {
+    if (targetDs.worktreeCreating || targetDs.pendingRepoCommitInFlight) {
       // The async path escapes the card-action in-flight dedup — gate repeats
       // here, or two creations would race and the loser's commitSelection
       // would yank the session the winner just spawned.
@@ -2754,7 +2743,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // worktree commit awaits (Lark replies, prompt prep) after its generation
   // checks; a plain selection interleaving there would double-fork. One lock
   // gates both kinds until the commit settles.
-  if (targetDs.worktreeCreating) {
+  if (targetDs.worktreeCreating || targetDs.pendingRepoCommitInFlight) {
     return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locTarget) } };
   }
   await commitRepoSelection(commitCtx, selectedPath, displayName);

@@ -64,9 +64,18 @@ export interface DaemonSession {
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
+  /** One in-memory owner is preparing the pending repo's first worker. Kept
+   *  separate from worktreeCreating because plain select, skip, and /repo can
+   *  also await prompt context before the fork. */
+  pendingRepoCommitInFlight?: boolean;
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
   worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
+  /** Exact Lark message id whose user input is waiting for the first worker
+   *  spawn. This is intentionally in-memory and must come from the accepted
+   *  inbound event: restoring a session must never recover per-turn authority
+   *  from an older persisted quote target. */
+  pendingTurnId?: string;
   /** Clean Codex App text/context retained alongside pendingPrompt while repo
    * selection delays the first turn. The legacy enriched prompt remains the
    * compatibility source for every other CLI. */
@@ -81,6 +90,11 @@ export interface DaemonSession {
    *  botmux-wrapped `<user_message>`. In-memory only to avoid replaying after
    *  daemon restart. */
   pendingRawInput?: string;
+  /** Exact accepted turn for pendingRawInput. Kept until prompt_ready delivers
+   *  the literal command. Raw cold-start workers deliberately spawn without
+   *  human turn authority; the worker rotates this turn immediately before
+   *  the command is written to the CLI. */
+  pendingRawTurnId?: string;
   /** Wrapped prompt for messages buffered while a pendingRawInput session
    *  waited for repo selection (pendingFollowUps / attachments). Built at the
    *  fork site (where prompt-building context lives) and delivered right
@@ -90,6 +104,7 @@ export interface DaemonSession {
   pendingFollowUpInput?: {
     userPrompt: string;
     cliInput: string;
+    turnId?: string;
     codexAppInput?: CodexAppTurnInput;
     /** The clean-input feature gate was evaluated when this follow-up was
      * staged; prompt_ready must not re-read a later config value. */
@@ -103,6 +118,9 @@ export interface DaemonSession {
    *  matching the original caller, not the user who clicked the card. */
   pendingSender?: import('../im/lark/identity-cache.js').ResolvedSender;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
+  /** Exact turn for a same-caller pendingRawInput follow-up batch. Cleared on
+   *  mixed callers so the combined prompt fails closed instead of borrowing. */
+  pendingFollowUpTurnId?: string;
   pendingCodexAppFollowUps?: string[]; // matching raw user texts for clean Codex App materialization
   pendingCodexAppFollowUpContexts?: string[]; // matching metadata-only context; never duplicates the raw follow-up text
   ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM

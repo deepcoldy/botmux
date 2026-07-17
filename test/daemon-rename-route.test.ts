@@ -37,6 +37,12 @@ const mocks = vi.hoisted(() => {
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
+    resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
+      openId
+        ? { openId, type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const }
+        : undefined
+    )),
+    forkWorker: vi.fn(),
     createSession: vi.fn((chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p') => ({
       sessionId: `sess-fake-${++seq}`,
       chatId,
@@ -63,6 +69,16 @@ vi.mock('../src/im/lark/client.js', async () => {
 vi.mock('../src/services/session-store.js', async () => {
   const actual = await vi.importActual<any>('../src/services/session-store.js');
   return { ...actual, createSession: mocks.createSession, updateSession: mocks.updateSession };
+});
+
+vi.mock('../src/im/lark/identity-cache.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/identity-cache.js');
+  return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
+});
+
+vi.mock('../src/core/worker-pool.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/worker-pool.js');
+  return { ...actual, forkWorker: (...args: any[]) => mocks.forkWorker(...args) };
 });
 
 import { registerBot } from '../src/bot-registry.js';
@@ -132,6 +148,58 @@ function seedThreadSession(anchor: string, title: string): DaemonSession {
   return ds;
 }
 
+function seedLiveChatSession(send = vi.fn()): DaemonSession {
+  const ds = {
+    scope: 'chat',
+    chatId: CHAT,
+    chatType: 'group',
+    larkAppId: APP,
+    worker: { killed: false, send },
+    workerPort: null,
+    workerToken: null,
+    spawnedAt: Date.now(),
+    cliVersion: '1.0.0',
+    lastMessageAt: Date.now(),
+    hasHistory: false,
+    ownerOpenId: OWNER,
+    currentReplyTarget: {
+      rootMessageId: 'om_stale_root',
+      turnId: 'om_stale_turn',
+      updatedAt: NOW,
+    },
+    session: {
+      sessionId: 'sess-live-chat-' + Math.random().toString(36).slice(2),
+      chatId: CHAT,
+      rootMessageId: 'om_original_root',
+      title: 'live chat',
+      status: 'active',
+      createdAt: NOW,
+      larkAppId: APP,
+      scope: 'chat',
+      quoteTargetId: 'om_stale_quote',
+      quoteTargetSenderOpenId: 'ou_stale_caller',
+      lastCallerOpenId: 'ou_stale_caller',
+      currentReplyTarget: {
+        rootMessageId: 'om_stale_root',
+        turnId: 'om_stale_turn',
+        updatedAt: NOW,
+      },
+    },
+  } as unknown as DaemonSession;
+  activeSessions.set(sessionKey(CHAT, APP), ds);
+  return ds;
+}
+
+function seedPendingRawSession(anchor: string): DaemonSession {
+  const ds = seedThreadSession(anchor, 'pending raw');
+  ds.pendingRepo = true;
+  ds.pendingPrompt = '';
+  ds.pendingRawInput = '/goal start';
+  ds.pendingRawTurnId = 'om_initial_raw';
+  ds.pendingSender = { openId: OWNER, type: 'user' };
+  return ds;
+}
+
 /** All text replied through the mocked Lark client in this test, joined. */
 function repliedText(): string {
   return [...mocks.replyMessage.mock.calls, ...mocks.sendMessage.mock.calls]
@@ -146,7 +214,13 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.sendMessage.mockResolvedValue('om_top');
     mocks.getChatMode.mockResolvedValue('group');
     activeSessions.clear();
-    const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER] });
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
     bot.resolvedAllowedUsers = [OWNER];
   });
 
@@ -221,5 +295,97 @@ describe('/rename production routing — must not pre-create a session (review P
 
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(activeSessions.has(sessionKey('om_new_2', APP))).toBe(true);
+  });
+
+  it('new topic: passes the accepted Lark message id into the first worker', async () => {
+    await handleNewTopic(
+      makeEventData('om_workflow_new', '/workflow new 修复首轮授权'),
+      makeCtx('om_workflow_new', 'om_workflow_new'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ turnId: 'om_workflow_new' });
+  });
+
+  it('thread safety-net: passes the accepted reply id into the first worker', async () => {
+    await handleThreadReply(
+      makeEventData('om_workflow_reply', '/workflow new 修复首轮授权', 'om_fresh_root'),
+      makeCtx('om_fresh_root', 'om_workflow_reply'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ turnId: 'om_workflow_reply' });
+  });
+
+  it('live passthrough binds raw input and reply metadata to the accepted message', async () => {
+    const send = vi.fn();
+    const ds = seedLiveChatSession(send);
+    const messageId = 'om_model_turn';
+    const replyRootId = 'om_model_reply_root';
+
+    await handleThreadReply(
+      makeEventData(messageId, '/model opus', replyRootId),
+      {
+        chatId: CHAT,
+        messageId,
+        chatType: 'group' as const,
+        scope: 'chat' as const,
+        anchor: CHAT,
+        replyRootId,
+        larkAppId: APP,
+      },
+    );
+
+    expect(send).toHaveBeenCalledWith({
+      type: 'raw_input',
+      content: '/model opus',
+      turnId: messageId,
+    });
+    expect(ds.session.quoteTargetId).toBe(messageId);
+    expect(ds.session.quoteTargetSenderOpenId).toBe(OWNER);
+    expect(ds.session.lastCallerOpenId).toBe(OWNER);
+    expect(ds.currentReplyTarget).toMatchObject({ rootMessageId: replyRootId, turnId: messageId });
+    expect(ds.session.currentReplyTarget).toMatchObject({ rootMessageId: replyRootId, turnId: messageId });
+    expect(mocks.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('pending raw same-caller follow-up rotates both staged turns to the latest message', async () => {
+    const anchor = 'om_pending_raw_root';
+    const ds = seedPendingRawSession(anchor);
+    const messageId = 'om_pending_raw_followup';
+
+    await handleThreadReply(
+      makeEventData(messageId, '补充同一个人的要求', anchor),
+      makeCtx(anchor, messageId),
+    );
+
+    expect(ds.pendingRawTurnId).toBe(messageId);
+    expect(ds.pendingFollowUpTurnId).toBe(messageId);
+    expect(ds.pendingFollowUps).toHaveLength(1);
+    expect(ds.session.quoteTargetId).toBe(messageId);
+  });
+
+  it('pending raw mixed-caller follow-up clears both staged turns', async () => {
+    const anchor = 'om_pending_raw_mixed_root';
+    const ds = seedPendingRawSession(anchor);
+    const ownerMessageId = 'om_pending_owner_followup';
+
+    await handleThreadReply(
+      makeEventData(ownerMessageId, '先由原调用者补充', anchor),
+      makeCtx(anchor, ownerMessageId),
+    );
+    expect(ds.pendingRawTurnId).toBe(ownerMessageId);
+    expect(ds.pendingFollowUpTurnId).toBe(ownerMessageId);
+
+    const strangerMessageId = 'om_pending_stranger_followup';
+    const strangerData = makeEventData(strangerMessageId, '再由另一个人补充', anchor);
+    strangerData.sender = { sender_id: { open_id: 'ou_stranger' }, sender_type: 'user' };
+    await handleThreadReply(strangerData, makeCtx(anchor, strangerMessageId));
+
+    expect(ds.pendingRawTurnId).toBeUndefined();
+    expect(ds.pendingFollowUpTurnId).toBeUndefined();
+    expect(ds.pendingFollowUps).toHaveLength(2);
+    expect(ds.session.quoteTargetId).toBe(strangerMessageId);
+    expect(ds.session.lastCallerOpenId).toBe('ou_stranger');
   });
 });

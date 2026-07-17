@@ -15209,6 +15209,12 @@ async function startInitialPassthroughSession(args: {
   const directChatSender = chatType === 'p2p'
     ? await resolveSender(larkAppId, senderOpenId, parsed.senderType)
     : undefined;
+  // Group cold-start passthroughs only need a stable caller identity while the
+  // repo picker is pending. Avoid adding a contact lookup to every /goal start;
+  // an optional display name can be learned later from the normal cache path.
+  const initialPassthroughSender = directChatSender ?? (senderOpenId
+    ? { openId: senderOpenId, type: senderIsBot ? 'bot' as const : 'user' as const }
+    : undefined);
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
   const session = sessionStore.createSession(chatId, rootIdForStore, commandContent.substring(0, 50), chatType);
   const now = Date.now();
@@ -15253,6 +15259,8 @@ async function startInitialPassthroughSession(args: {
     pendingRepo: !pinnedWorkingDir || autoWt,
     pendingPrompt: '',
     pendingRawInput: commandContent,
+    pendingRawTurnId: messageId,
+    pendingSender: (!pinnedWorkingDir || autoWt) ? initialPassthroughSender : undefined,
     ownerOpenId,
     currentTurnTitle: commandContent.substring(0, 50),
     workingDir: pinnedWorkingDir,
@@ -15276,6 +15284,8 @@ async function startInitialPassthroughSession(args: {
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     rememberLastCliInput(ds, commandContent, commandContent);
+    // Raw passthrough gets its human turn only at the literal PTY write
+    // boundary (prompt_ready -> raw_input), never during CLI startup.
     forkWorker(ds, '', false);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -15730,6 +15740,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     hasHistory: false,
     pendingRepo: !pinnedWorkingDir || autoWt,
     pendingPrompt: promptContent,
+    pendingTurnId: messageId,
     pendingCodexAppText: codexAppVisibleText,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
@@ -15770,7 +15781,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, prompt);
-    forkWorker(ds, prompt);
+    forkWorker(ds, prompt, { turnId: messageId });
+    ds.pendingTurnId = undefined;
     const reason = pinnedFromRequirement
       ? 'dispatch repo requirement'
       : oncallEntry
@@ -15804,7 +15816,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, prompt);
-    forkWorker(ds, prompt);
+    forkWorker(ds, prompt, { turnId: messageId });
+    ds.pendingTurnId = undefined;
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
 }
@@ -16547,11 +16560,32 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // 收紧到与 daemon 命令同档；这会同时改变真人 oncall 成员的现有行为，应单独评估。
       const ds = existingDs;
       if (ds?.worker && !ds.worker.killed) {
+        // Passthrough commands bypass the normal message-forwarding block
+        // below, so bind this accepted Lark turn here before the worker rotates
+        // its marker at the actual PTY write boundary.
+        ds.session.quoteTargetId = parsed.messageId;
+        ds.session.quoteTargetSenderOpenId = threadSenderOpenId;
+        ds.session.quoteTargetSenderIsBot = isForeignBot;
+        const substituteReplyMode = substituteTrigger
+          ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
+          : 'thread';
+        beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), {
+          quoteOnly: substituteReplyMode === 'quote',
+          substitute: !!substituteTrigger,
+        });
+        if (threadSenderOpenId && ds.session.lastCallerOpenId !== threadSenderOpenId) {
+          ds.session.lastCallerOpenId = threadSenderOpenId;
+        }
+        sessionStore.updateSession(ds.session);
         // Mark a new turn so the CLI's response to /model, /clear, /compact, etc.
         // shows up as a fresh streaming card instead of silently PATCH-ing the
         // previous turn's card.
         beginNewTurn(ds, commandContent);
-        ds.worker.send({ type: 'raw_input', content: commandContent } as DaemonToWorker);
+        ds.worker.send({
+          type: 'raw_input',
+          content: commandContent,
+          turnId: parsed.messageId,
+        } as DaemonToWorker);
         markSessionActivity(ds);
         logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
       } else {
@@ -16734,9 +16768,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // Update last message time + last caller (used by `botmux send` to address
   // reply cards to whoever triggered this turn — matters in oncall groups
   // where the caller is often not the session owner).
+  const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   if (ds) {
     markSessionActivity(ds);
-    const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
     // quoteTargetId changes every inbound message (always a new message_id), so
     // — unlike lastCallerOpenId — persist unconditionally. Powers `botmux send`'s
     // default chat-scope quote chain + --mention-back.
@@ -16760,7 +16794,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   }
 
   // If waiting for repo selection, buffer the message and remind user
-  if (ds?.pendingRepo) {
+  if (ds?.pendingRepo || ds?.pendingRepoCommitInFlight) {
     // Enrich content with attachment hints and mention metadata (same as normal send)
     const codexAppFollowUpContextParts: string[] = [];
     if (codexAppMessageContext) codexAppFollowUpContextParts.push(codexAppMessageContext);
@@ -16784,7 +16818,15 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // follow-ups now fold into the same <user_message>, so a same-user tag is
     // pure duplication. A differing sender still gets attributed so the CLI can
     // tell multi-user buffered messages apart after repo selection unlocks.
-    const followUpSender = await getThreadSender();
+    // This branch is also the synchronization barrier for a pending first
+    // worker. Do not await contact/name resolution here: a commit waiting on
+    // getAvailableBots could otherwise resume first, snapshot stale buffers,
+    // and fork before this message is appended. Event identity is sufficient
+    // for caller equality and sender attribution; names remain optional.
+    const followUpSender: import('./im/lark/identity-cache.js').ResolvedSender | undefined = callerOpenId
+      ? { openId: callerOpenId, type: isForeignBot ? 'bot' : 'user' }
+      : undefined;
+    const hadBufferedFollowUps = (ds.pendingFollowUps?.length ?? 0) > 0;
     if (followUpSender?.openId && followUpSender.openId !== ds.pendingSender?.openId) {
       // This buffer folds into the opening <user_message> after repo selection,
       // so pair the foreign sender tag with the cursor anti-echo note: without
@@ -16797,6 +16839,34 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       if (followUpSenderBlock) {
         enriched = `${followUpSenderBlock}\n${enriched}`;
         codexAppFollowUpContextParts.unshift(followUpSenderBlock);
+      }
+    }
+    const sameInitialCaller = !!followUpSender?.openId
+      && followUpSender.openId === ds.pendingSender?.openId;
+    if (ds.pendingRawInput) {
+      if ((!hadBufferedFollowUps || ds.pendingFollowUpTurnId) && sameInitialCaller) {
+        // The persisted quote target is a single latest-turn pointer. Treat a
+        // same-caller raw command + buffered follow-ups as one batch and join
+        // every staged PTY input to that latest turn. Keeping the raw command
+        // on its older id would fail provenance as soon as the follow-up moves
+        // the durable pointer forward.
+        ds.pendingRawTurnId = parsed.messageId;
+        ds.pendingFollowUpTurnId = parsed.messageId;
+      } else {
+        // Mixed callers cannot share one durable turn pointer. Revoke the
+        // entire batch rather than letting either identity borrow the other.
+        ds.pendingRawTurnId = undefined;
+        ds.pendingFollowUpTurnId = undefined;
+      }
+    } else if (ds.pendingTurnId) {
+      // One deferred model prompt may fold several same-user messages together;
+      // bind it to the newest exact message so the durable quote and marker
+      // still join. If another user contributes, clear authority instead of
+      // letting either identity authorize the combined prompt.
+      if (sameInitialCaller) {
+        ds.pendingTurnId = parsed.messageId;
+      } else {
+        ds.pendingTurnId = undefined;
       }
     }
     if (!ds.pendingFollowUps) ds.pendingFollowUps = [];
@@ -16814,7 +16884,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // Auto-worktree pending (worktreeCreating) has no repo card to point at — the
     // message IS buffered (folded on commit), so just say "hold on, building worktree"
     // instead of the misleading "pick a repo from the card above".
-    const pendingReplyKey = ds.worktreeCreating ? 'daemon.worktree_building_wait' : 'daemon.choose_repo_first';
+    const pendingReplyKey = (ds.worktreeCreating || ds.pendingRepoCommitInFlight)
+      ? 'daemon.worktree_building_wait'
+      : 'daemon.choose_repo_first';
     await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
     return;
   }
@@ -16904,6 +16976,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       hasHistory: false,
       pendingRepo: !pinnedWorkingDir || autoWt,
       pendingPrompt: promptContent,
+      pendingTurnId: parsed.messageId,
       pendingCodexAppText: parsed.content,
       pendingCodexAppApplicationContext: codexAppApplicationContext,
       pendingCodexAppMessageContext: codexAppMessageContext,
@@ -16943,7 +17016,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       rememberLastCliInput(newDs, promptContent, prompt);
-      forkWorker(newDs, prompt);
+      forkWorker(newDs, prompt, { turnId: parsed.messageId });
+      newDs.pendingTurnId = undefined;
       const reason = pinnedFromRequirement
         ? 'dispatch repo requirement'
         : oncallEntry
@@ -16977,7 +17051,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       rememberLastCliInput(newDs, promptContent, prompt);
-      forkWorker(newDs, prompt);
+      forkWorker(newDs, prompt, { turnId: parsed.messageId });
+      newDs.pendingTurnId = undefined;
     }
 
     return;

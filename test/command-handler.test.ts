@@ -2022,8 +2022,34 @@ describe('handleCommand', () => {
   // ─── bare /repo while pending (replaces the old /skip command) ────────────
 
   describe('/repo (bare) while pending', () => {
+    it('does not consume the pending launch while a card commit owns the shared claim', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingRepoCommitInFlight: true,
+        pendingPrompt: 'hello world',
+        pendingTurnId: 'om_pending_turn',
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(getAvailableBots).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(true);
+      expect(ds.pendingRepoCommitInFlight).toBe(true);
+      expect(ds.pendingPrompt).toBe('hello world');
+      expect(ds.pendingTurnId).toBe('om_pending_turn');
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(replies).toContain('已有一个 worktree 正在创建');
+    });
+
     it('should boot the CLI idle (no prompt submitted) when launched via /repo itself', async () => {
-      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', repoCardMessageId: 'om_card' });
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '',
+        pendingTurnId: 'om_repo_command_only',
+        repoCardMessageId: 'om_card',
+      });
       const deps = makeDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
@@ -2037,6 +2063,7 @@ describe('handleCommand', () => {
       // Cleared pending state + withdrew the (already-sent) card.
       expect(ds.pendingRepo).toBe(false);
       expect(ds.pendingPrompt).toBeUndefined();
+      expect(ds.pendingTurnId).toBeUndefined();
       expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'om_card');
       expect(ds.repoCardMessageId).toBeUndefined();
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
@@ -2048,7 +2075,11 @@ describe('handleCommand', () => {
     it('should still submit a buffered first message when bare /repo skips the card', async () => {
       // Normal flow: real first message → card shown → user types bare /repo to
       // skip. The buffered message must be delivered, not dropped.
-      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '帮我看看这个 bug' });
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '帮我看看这个 bug',
+        pendingTurnId: 'om_buffered_first',
+      });
       const deps = makeDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
@@ -2058,8 +2089,13 @@ describe('handleCommand', () => {
       expect(ensureSessionWhiteboard).toHaveBeenCalledWith(ds);
       expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe('帮我看看这个 bug');
       expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][11]).toMatchObject({ whiteboardId: 'wb_test' });
-      expect(forkWorker).toHaveBeenCalledWith(ds, { content: 'WRAPPED:帮我看看这个 bug' });
+      expect(forkWorker).toHaveBeenCalledWith(
+        ds,
+        { content: 'WRAPPED:帮我看看这个 bug' },
+        { turnId: 'om_buffered_first' },
+      );
       expect(ds.pendingRepo).toBe(false);
+      expect(ds.pendingTurnId).toBeUndefined();
     });
 
     it('forwards the pending substitute trigger and complete Codex App sidecar', async () => {
@@ -2102,7 +2138,13 @@ describe('handleCommand', () => {
       // /goal cold start → repo card → bare /repo skip: the raw command must
       // NOT be wrapped into a prompt; it stays on ds.pendingRawInput and the
       // prompt_ready handler delivers it literally.
-      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', pendingRawInput: '/goal 发布 onboarding' });
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '',
+        pendingTurnId: 'om_goal_first',
+        pendingRawInput: '/goal 发布 onboarding',
+        pendingRawTurnId: 'om_goal_first',
+      });
       const deps = makeDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
@@ -2110,7 +2152,9 @@ describe('handleCommand', () => {
       expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
       expect(buildNewTopicPrompt).not.toHaveBeenCalled();
       expect(ds.pendingRawInput).toBe('/goal 发布 onboarding');
+      expect(ds.pendingRawTurnId).toBe('om_goal_first');
       expect(ds.pendingFollowUpInput).toBeUndefined();
+      expect(ds.pendingTurnId).toBeUndefined();
     });
 
     it('raw-input cold start wraps follow-ups buffered during repo wait into pendingFollowUpInput', async () => {
