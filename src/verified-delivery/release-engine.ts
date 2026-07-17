@@ -246,6 +246,39 @@ function appendReleaseFailure(input: {
   }
 }
 
+function appendReleasedDispatch(input: {
+  ledger: LedgerHandle;
+  pending: TaskPendingReleaseView;
+  ts: number;
+  messageId?: string;
+  confirmedBy?: string;
+}): 'appended' | 'stale' {
+  const { ledger, pending } = input;
+  const taskId = pending.frozenDispatchedPayload.taskId;
+  try {
+    ledger.append({
+      type: 'TaskDispatched',
+      actor: 'orchestrator',
+      taskId,
+      chatId: pending.goalChatId,
+      ts: input.ts,
+      idempotencyKey: `dispatched:release:${pending.releaseId}`,
+      payload: {
+        ...pending.frozenDispatchedPayload,
+        ...(input.messageId ? { dispatchMessageId: input.messageId } : {}),
+        ...(input.confirmedBy ? { confirmedBy: input.confirmedBy } : {}),
+      },
+    });
+    return 'appended';
+  } catch (error) {
+    const current = ledger.task(taskId);
+    const sameOpenRelease = current?.status === 'planned'
+      && current.pendingRelease?.releaseId === pending.releaseId;
+    if (!sameOpenRelease) return 'stale';
+    throw error;
+  }
+}
+
 async function executePendingRelease(input: {
   task: TaskView;
   pending: TaskPendingReleaseView;
@@ -301,15 +334,15 @@ async function executePendingRelease(input: {
     };
   }
 
-  deps.ledger.append({
-    type: 'TaskDispatched',
-    actor: 'orchestrator',
-    taskId: task.taskId,
-    chatId: pending.goalChatId,
+  const appendResult = appendReleasedDispatch({
+    ledger: deps.ledger,
+    pending,
     ts: deps.now(),
-    idempotencyKey: `dispatched:release:${pending.releaseId}`,
-    payload: { ...pending.frozenDispatchedPayload, dispatchMessageId: messageId },
+    messageId,
   });
+  if (appendResult === 'stale') {
+    return { taskId: task.taskId, outcome: 'stale', releaseId: pending.releaseId };
+  }
   return { taskId: task.taskId, outcome: 'dispatched', releaseId: pending.releaseId };
 }
 
@@ -438,14 +471,14 @@ export function confirmTaskRelease(input: {
   ) {
     return { taskId: input.taskId, outcome: 'waiting-human', releaseId: pending.releaseId };
   }
-  input.ledger.append({
-    type: 'TaskDispatched',
-    actor: 'orchestrator',
-    taskId: input.taskId,
-    chatId: pending.goalChatId,
+  const appendResult = appendReleasedDispatch({
+    ledger: input.ledger,
+    pending,
     ts: input.now,
-    idempotencyKey: `dispatched:release:${pending.releaseId}`,
-    payload: { ...pending.frozenDispatchedPayload, confirmedBy: input.confirmedBy.trim() },
+    confirmedBy: input.confirmedBy.trim(),
   });
+  if (appendResult === 'stale') {
+    return { taskId: input.taskId, outcome: 'stale', releaseId: pending.releaseId };
+  }
   return { taskId: input.taskId, outcome: 'dispatched', releaseId: pending.releaseId };
 }

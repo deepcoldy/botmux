@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -85,10 +85,33 @@ describe('goal watchdog', () => {
       task('', 'oc_a', 'dispatched'),
       { ...task('t6', 'oc_a', 'blocked'), help: { blocker: '缺权限', kind: 'access', workerOpenId: 'ou_w' } },
       { ...task('t7', 'oc_a', 'escalated'), escalation: { reason: '需要人拍' } },
+      task('t8', 'oc_a', 'planned'),
     ]);
 
     expect([...grouped.keys()]).toEqual(['oc_a']);
     expect(grouped.get('oc_a')?.map((t) => t.taskId)).toEqual(['t1', 't2', 't3', 't6']);
+  });
+
+  it('does no supervisor wake, stale inspection, or reassignment work for planned-only goals', async () => {
+    const inject = vi.fn();
+    const reviveSupervisor = vi.fn();
+    const workerHealthFacts = vi.fn();
+    const reassignDeadWorker = vi.fn();
+
+    expect(await runGoalWatchdogOnce({
+      larkAppId: 'cli_main',
+      activeSessions: new Map(),
+      ledger: ledger([task('waiting-upstream', 'oc_goal', 'planned')]),
+      now: 10_000,
+      inject,
+      reviveSupervisor,
+      workerHealthFacts,
+      reassignDeadWorker,
+    })).toEqual([]);
+    expect(inject).not.toHaveBeenCalled();
+    expect(reviveSupervisor).not.toHaveBeenCalled();
+    expect(workerHealthFacts).not.toHaveBeenCalled();
+    expect(reassignDeadWorker).not.toHaveBeenCalled();
   });
 
   it('injects only into an active chat-scope goal supervisor session', async () => {

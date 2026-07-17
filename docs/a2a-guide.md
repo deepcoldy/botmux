@@ -132,6 +132,38 @@ botmux dispatch \
 
 `/repo` 和 `--repo` 只适合同机路径预热；跨设备代码任务使用 `--needs-repo`。
 
+### 有先后依赖的任务
+
+后续任务依赖上游产出时，用 `--after` 先登记，不要提前启动执行者：
+
+```bash
+# A 立即派发
+botmux dispatch \
+  --chat-id "<目标群 chatId>" \
+  --task-id "task-api-contract" \
+  --title "产出接口说明" \
+  --bot "<执行者 A open_id>:执行者 A:开发" \
+  --needs-repo "https://github.com/acme/project.git" \
+  --brief "整理接口说明并提交结果"
+
+# B 只登记；A 验收通过后由系统自动派发
+botmux dispatch \
+  --chat-id "<目标群 chatId>" \
+  --task-id "task-api-client" \
+  --title "实现接口客户端" \
+  --bot "<执行者 B open_id>:执行者 B:开发" \
+  --needs-repo "https://github.com/acme/project.git" \
+  --after "task-api-contract" \
+  --brief "基于已验收的接口说明实现客户端"
+```
+
+- `--after` 可以重复传入；只有所有上游任务都验收通过，后续任务才会自动派发。
+- 等待期间执行者不会启动，也不会收到消息；看板显示“等待上游任务”。
+- 自动派发沿用普通派活协议，对端不需要特殊操作；跨设备项目仍由 `--needs-repo` 自检。
+- 系统只把上游的任务号、提交摘要、报告号和可跨设备访问的 URL 证据带给下游。内联证据只给摘要，本机路径不会当作远端可访问路径。
+- 上游被驳回、取消或升级时，后续任务不会被误派。监管者可先修复上游，也可取消后续任务。
+- `--after` 不与 `--repo`、`--standby`、`--into`、`--new-topic` 或 `--skip-readiness-check` 同用。
+
 ## 6. 执行者提交结果或求助
 
 完成后必须提交带证据的结果，不能只在群里说“完成了”：
@@ -210,9 +242,10 @@ botmux delivery cancel --task "<taskId>" \
 2. 每台机器执行 `botmux bind`，加入同一个平台团队。
 3. 在主控会话运行 `botmux goal start`，一次选团队、监管者、执行者和项目并开工。
 4. 同机任务用本机目录；跨设备代码任务由监管者自动使用项目 remote。
-5. 执行者用 `botmux report --task` 带证据提交，卡住用 `botmux help --task`。
-6. 监管者核验后通过、驳回、重派或升级给人。
-7. 全部验收后汇总并结束会话，群和交付记录保留。
+5. 有先后关系的任务用 `dispatch --after <上游任务号>` 先登记，系统在上游验收后自动派发。
+6. 执行者用 `botmux report --task` 带证据提交，卡住用 `botmux help --task`。
+7. 监管者核验后通过、驳回、重派或升级给人。
+8. 全部验收后汇总并结束会话，群和交付记录保留。
 
 ## 常见问题
 
@@ -242,3 +275,7 @@ botmux delivery cancel --task "<taskId>" \
 ### 缺少项目环境算失败吗
 
 不算。它是可恢复的求助状态。监管者可以安排准备环境、换一台已有项目的执行者，或升级给人决定。
+
+### 为什么加了 `--after` 后执行者没有立即收到消息
+
+这是预期行为。任务先进入“等待上游”状态；只有所有 `--after` 指向的任务都验收通过，系统才会自动派发。普通聊天里的“完成了”不算验收，必须先有正式提交结果，再由监管者验收通过。

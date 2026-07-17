@@ -112,6 +112,262 @@ describe('dependency release engine', () => {
     });
   });
 
+  it('waits for every dependency without sending or raising attention when only some are accepted', async () => {
+    ledger.append(draft({
+      type: 'TaskDispatched', taskId: 'multi-upstream-a', chatId: 'oc_multi', idempotencyKey: 'dispatch:multi-a',
+      payload: { taskId: 'multi-upstream-a', title: 'A' },
+    }));
+    ledger.append(draft({
+      type: 'TaskReported', actor: 'worker', taskId: 'multi-upstream-a', chatId: 'oc_multi', idempotencyKey: 'report:multi-a',
+      payload: {
+        taskId: 'multi-upstream-a', reportId: 'multi-a-r1', summary: 'A ready',
+        evidence: [{ kind: 'path', path: '/tmp/multi-a' }],
+      },
+    }));
+    ledger.append(draft({
+      type: 'TaskAccepted', taskId: 'multi-upstream-a', chatId: 'oc_multi', idempotencyKey: 'accept:multi-a',
+      payload: { taskId: 'multi-upstream-a', reportId: 'multi-a-r1', checkedBy: 'ou_supervisor' },
+    }));
+    ledger.append(draft({
+      type: 'TaskDispatched', taskId: 'multi-upstream-b', chatId: 'oc_multi', idempotencyKey: 'dispatch:multi-b',
+      payload: { taskId: 'multi-upstream-b', title: 'B' },
+    }));
+    const multiPlan: TaskPlannedPayload = {
+      taskId: 'multi-downstream',
+      chatId: 'oc_multi',
+      title: 'Join A and B',
+      dependsOnTaskIds: ['multi-upstream-a', 'multi-upstream-b'],
+      planGeneration: 1,
+      dispatchSpec: {
+        title: 'Join A and B',
+        briefBase: 'Combine both accepted outputs.',
+        workers: [{ openId: 'ou_worker', name: 'Worker', role: 'coder', larkAppId: 'cli_worker' }],
+        senderLarkAppId: 'cli_supervisor',
+      },
+      plannedBy: 'ou_supervisor',
+    };
+    ledger.append(draft({
+      type: 'TaskPlanned', taskId: 'multi-downstream', chatId: 'oc_multi', idempotencyKey: 'planned:multi-downstream',
+      payload: multiPlan,
+    }));
+
+    expect(await runGoalReleaseCheck({
+      goalChatId: 'oc_multi', ownerLarkAppId: 'cli_supervisor', mode: 'trigger', deps,
+    })).toEqual([{ taskId: 'multi-downstream', outcome: 'not-ready' }]);
+    expect(send).not.toHaveBeenCalled();
+    expect(buildGoalAttentionContext({ ledger, now }).releaseRisks?.has('multi-downstream')).toBe(false);
+
+    ledger.append(draft({
+      type: 'TaskReported', actor: 'worker', taskId: 'multi-upstream-b', chatId: 'oc_multi', idempotencyKey: 'report:multi-b',
+      payload: {
+        taskId: 'multi-upstream-b', reportId: 'multi-b-r1', summary: 'B ready',
+        evidence: [{ kind: 'path', path: '/tmp/multi-b' }],
+      },
+    }));
+    ledger.append(draft({
+      type: 'TaskAccepted', taskId: 'multi-upstream-b', chatId: 'oc_multi', idempotencyKey: 'accept:multi-b',
+      payload: { taskId: 'multi-upstream-b', reportId: 'multi-b-r1', checkedBy: 'ou_supervisor' },
+    }));
+
+    expect(await runGoalReleaseCheck({
+      goalChatId: 'oc_multi', ownerLarkAppId: 'cli_supervisor', mode: 'trigger', deps,
+    })).toEqual([expect.objectContaining({ taskId: 'multi-downstream', outcome: 'dispatched' })]);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]![0].text).toContain('A ready');
+    expect(send.mock.calls[0]![0].text).toContain('B ready');
+  });
+
+  it('lets concurrent trigger checks produce one send while the other observes the open intent', async () => {
+    readiness.mockImplementation(async () => {
+      await Promise.resolve();
+      return { ok: true, issues: [] };
+    });
+
+    const [first, second] = await Promise.all([
+      runGoalReleaseCheck({ goalChatId: 'oc_goal', ownerLarkAppId: 'cli_supervisor', mode: 'trigger', deps }),
+      runGoalReleaseCheck({ goalChatId: 'oc_goal', ownerLarkAppId: 'cli_supervisor', mode: 'trigger', deps }),
+    ]);
+
+    expect([first[0]?.outcome, second[0]?.outcome].sort()).toEqual(['dispatched', 'open-intent']);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(ledger.read().filter((event) => event.type === 'TaskDispatchIntent')).toHaveLength(1);
+  });
+
+  it('rejects a stale frozen claim after cancel and replan, then releases the new generation bytes', async () => {
+    const stale = buildTaskReleaseClaim({
+      ledger,
+      taskId: 'downstream',
+      attempt: 0,
+      releasedBy: deps.releasedBy,
+    })!;
+    const current = ledger.task('downstream')!;
+    const cancelled = ledger.append(draft({
+      type: 'TaskCancelled', taskId: 'downstream', chatId: 'oc_goal',
+      idempotencyKey: `cancelled:downstream:${current.activationEventId}`,
+      payload: { taskId: 'downstream', reason: 'refresh frozen instructions', by: 'ou_supervisor' },
+    }));
+    ledger.append(draft({
+      type: 'TaskPlanned', taskId: 'downstream', chatId: 'oc_goal',
+      idempotencyKey: `planned:downstream:${cancelled.event.eventId}`,
+      payload: {
+        taskId: 'downstream',
+        chatId: 'oc_goal',
+        title: 'Consume API contract v2',
+        dependsOnTaskIds: current.plan!.dependsOnTaskIds,
+        planGeneration: 2,
+        reopenOfCancelEventId: cancelled.event.eventId,
+        dispatchSpec: {
+          ...current.plan!.dispatchSpec,
+          title: 'Consume API contract v2',
+          briefBase: 'Implement the refreshed client instructions.',
+        },
+        plannedBy: 'ou_supervisor',
+      },
+    }));
+
+    expect(ledger.claimReadyPlan({
+      taskId: 'downstream',
+      expectedPlanEventId: stale.expectedPlanEventId,
+      expectedAcceptedEventIds: stale.expectedAcceptedEventIds,
+      ts: now,
+      intent: stale.intent,
+    })).toEqual({ result: 'stale' });
+
+    expect(await runGoalReleaseCheck({
+      goalChatId: 'oc_goal', ownerLarkAppId: 'cli_supervisor', mode: 'trigger', deps,
+    })).toEqual([expect.objectContaining({ taskId: 'downstream', outcome: 'dispatched' })]);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]![0].text).toContain('Implement the refreshed client instructions.');
+    expect(send.mock.calls[0]![0].text).not.toContain('Implement the client.');
+    expect(ledger.task('downstream')?.plan?.planGeneration).toBe(2);
+  });
+
+  it('keeps downstream planned across an upstream cancel and generation-2 restart, then releases from the new acceptance', async () => {
+    const appendAccepted = (taskId: string, chatId: string) => {
+      ledger.append(draft({
+        type: 'TaskDispatched', taskId, chatId, idempotencyKey: `dispatch:${taskId}`,
+        payload: { taskId, title: taskId },
+      }));
+      ledger.append(draft({
+        type: 'TaskReported', actor: 'worker', taskId, chatId, idempotencyKey: `report:${taskId}:r1`,
+        payload: {
+          taskId, reportId: `${taskId}-r1`, summary: `${taskId} ready`,
+          evidence: [{ kind: 'path', path: `/tmp/${taskId}` }],
+        },
+      }));
+      return ledger.append(draft({
+        type: 'TaskAccepted', taskId, chatId, idempotencyKey: `accept:${taskId}:r1`,
+        payload: { taskId, reportId: `${taskId}-r1`, checkedBy: 'ou_supervisor' },
+      })).event.eventId;
+    };
+    const chatId = 'oc_generation';
+    appendAccepted('generation-root', chatId);
+    const upstreamPlan: TaskPlannedPayload = {
+      taskId: 'generation-upstream',
+      chatId,
+      title: 'Prepare generated contract',
+      dependsOnTaskIds: ['generation-root'],
+      planGeneration: 1,
+      dispatchSpec: {
+        title: 'Prepare generated contract',
+        briefBase: 'Produce the generated contract.',
+        workers: [{ openId: 'ou_worker', name: 'Worker', role: 'coder', larkAppId: 'cli_worker' }],
+        senderLarkAppId: 'cli_supervisor',
+      },
+      plannedBy: 'ou_supervisor',
+    };
+    const generationOne = ledger.append(draft({
+      type: 'TaskPlanned', taskId: upstreamPlan.taskId, chatId,
+      idempotencyKey: `planned:${upstreamPlan.taskId}`, payload: upstreamPlan,
+    }));
+    const cancelled = ledger.append(draft({
+      type: 'TaskCancelled', taskId: upstreamPlan.taskId, chatId,
+      idempotencyKey: `cancelled:${upstreamPlan.taskId}:${generationOne.event.eventId}`,
+      payload: { taskId: upstreamPlan.taskId, reason: 'pause upstream', by: 'ou_supervisor' },
+    }));
+    ledger.append(draft({
+      type: 'TaskPlanned', taskId: upstreamPlan.taskId, chatId,
+      idempotencyKey: `planned:${upstreamPlan.taskId}:${cancelled.event.eventId}`,
+      payload: {
+        ...upstreamPlan,
+        planGeneration: 2,
+        reopenOfCancelEventId: cancelled.event.eventId,
+        dispatchSpec: { ...upstreamPlan.dispatchSpec, briefBase: 'Produce the generation-2 contract.' },
+      },
+    }));
+    const downstreamPlan: TaskPlannedPayload = {
+      taskId: 'generation-downstream',
+      chatId,
+      title: 'Consume generated contract',
+      dependsOnTaskIds: [upstreamPlan.taskId],
+      planGeneration: 1,
+      dispatchSpec: {
+        title: 'Consume generated contract',
+        briefBase: 'Consume the accepted generation.',
+        workers: [{ openId: 'ou_worker', name: 'Worker', role: 'coder', larkAppId: 'cli_worker' }],
+        senderLarkAppId: 'cli_supervisor',
+      },
+      plannedBy: 'ou_supervisor',
+    };
+    ledger.append(draft({
+      type: 'TaskPlanned', taskId: downstreamPlan.taskId, chatId,
+      idempotencyKey: `planned:${downstreamPlan.taskId}`, payload: downstreamPlan,
+    }));
+
+    expect(await runGoalReleaseCheck({
+      goalChatId: chatId, ownerLarkAppId: 'cli_supervisor', mode: 'trigger', deps,
+    })).toEqual([
+      expect.objectContaining({ taskId: upstreamPlan.taskId, outcome: 'dispatched' }),
+      { taskId: downstreamPlan.taskId, outcome: 'not-ready' },
+    ]);
+    expect(ledger.task(downstreamPlan.taskId)?.status).toBe('planned');
+
+    ledger.append(draft({
+      type: 'TaskReported', actor: 'worker', taskId: upstreamPlan.taskId, chatId,
+      idempotencyKey: `report:${upstreamPlan.taskId}:r1`,
+      payload: {
+        taskId: upstreamPlan.taskId,
+        reportId: `${upstreamPlan.taskId}-r1`,
+        summary: 'generation 2 ready',
+        evidence: [{ kind: 'path', path: '/tmp/generation-2' }],
+      },
+    }));
+    const acceptedGenerationTwo = ledger.append(draft({
+      type: 'TaskAccepted', taskId: upstreamPlan.taskId, chatId,
+      idempotencyKey: `accept:${upstreamPlan.taskId}:r1`,
+      payload: {
+        taskId: upstreamPlan.taskId,
+        reportId: `${upstreamPlan.taskId}-r1`,
+        checkedBy: 'ou_supervisor',
+      },
+    })).event.eventId;
+
+    expect(await runGoalReleaseCheck({
+      goalChatId: chatId, ownerLarkAppId: 'cli_supervisor', mode: 'trigger', deps,
+    })).toEqual([expect.objectContaining({ taskId: downstreamPlan.taskId, outcome: 'dispatched' })]);
+    const downstreamIntent = ledger.read().find((event) =>
+      event.type === 'TaskDispatchIntent' && event.taskId === downstreamPlan.taskId,
+    );
+    expect(downstreamIntent?.payload).toMatchObject({
+      satisfiedBy: [{ taskId: upstreamPlan.taskId, acceptedEventId: acceptedGenerationTwo }],
+    });
+  });
+
+  it('does not evaluate a planned task after it is explicitly cancelled', async () => {
+    const downstream = ledger.task('downstream')!;
+    ledger.append(draft({
+      type: 'TaskCancelled', taskId: 'downstream', chatId: 'oc_goal',
+      idempotencyKey: `cancelled:downstream:${downstream.activationEventId}`,
+      payload: { taskId: 'downstream', reason: 'scope removed', by: 'ou_supervisor' },
+    }));
+
+    expect(await runGoalReleaseCheck({
+      goalChatId: 'oc_goal', ownerLarkAppId: 'cli_supervisor', mode: 'trigger', deps,
+    })).toEqual([]);
+    expect(send).not.toHaveBeenCalled();
+    expect(ledger.task('downstream')?.status).toBe('cancelled');
+  });
+
   it('leaves an existing claim to the recovery path instead of racing it from a trigger', async () => {
     const frozen = buildTaskReleaseClaim({ ledger, taskId: 'downstream', attempt: 0, releasedBy: deps.releasedBy });
     expect(frozen).toBeDefined();
@@ -185,6 +441,37 @@ describe('dependency release engine', () => {
     expect(send).toHaveBeenCalledTimes(2);
     expect(send.mock.calls[0]![0].uuid).toBe(send.mock.calls[1]![0].uuid);
     expect(ledger.task('downstream')?.status).toBe('dispatched');
+  });
+
+  it('treats cancellation between send and the final dispatch append as a benign stale release', async () => {
+    let cancelled = false;
+    const racingLedger: LedgerHandle = {
+      ...ledger,
+      append: (event) => {
+        if (event.type === 'TaskDispatched' && event.taskId === 'downstream' && !cancelled) {
+          cancelled = true;
+          const current = ledger.task('downstream')!;
+          ledger.append(draft({
+            type: 'TaskCancelled', taskId: 'downstream', chatId: 'oc_goal',
+            idempotencyKey: `cancelled:downstream:${current.activationEventId}`,
+            payload: { taskId: 'downstream', reason: 'scope changed during release', by: 'ou_supervisor' },
+          }));
+        }
+        return ledger.append(event);
+      },
+    };
+
+    const result = await runGoalReleaseCheck({
+      goalChatId: 'oc_goal',
+      ownerLarkAppId: 'cli_supervisor',
+      mode: 'trigger',
+      deps: { ...deps, ledger: racingLedger },
+    });
+
+    expect(result).toEqual([expect.objectContaining({ taskId: 'downstream', outcome: 'stale' })]);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(ledger.task('downstream')?.status).toBe('cancelled');
+    expect(ledger.read().filter((event) => event.type === 'TaskDispatched' && event.taskId === 'downstream')).toHaveLength(0);
   });
 
   it('replays an ambiguous attempt within 55 minutes using the exact same uuid', async () => {
@@ -271,6 +558,42 @@ describe('dependency release engine', () => {
     expect(confirmed).toMatchObject({ outcome: 'dispatched', releaseId: failed[0]?.releaseId });
     expect(ledger.task('downstream')).toMatchObject({ status: 'dispatched', dispatchConfirmedBy: 'ou_supervisor' });
     expect(ledger.task('downstream')?.dispatchMessageId).toBeUndefined();
+  });
+
+  it('treats cancellation racing with confirm-as-sent as stale instead of throwing', () => {
+    const frozen = buildTaskReleaseClaim({ ledger, taskId: 'downstream', attempt: 0, releasedBy: deps.releasedBy })!;
+    ledger.claimReadyPlan({
+      taskId: 'downstream',
+      expectedPlanEventId: frozen.expectedPlanEventId,
+      expectedAcceptedEventIds: frozen.expectedAcceptedEventIds,
+      ts: now,
+      intent: frozen.intent,
+    });
+    const pending = ledger.task('downstream')!.pendingRelease!;
+    let cancelled = false;
+    const racingLedger: LedgerHandle = {
+      ...ledger,
+      append: (event) => {
+        if (event.type === 'TaskDispatched' && event.taskId === 'downstream' && !cancelled) {
+          cancelled = true;
+          const current = ledger.task('downstream')!;
+          ledger.append(draft({
+            type: 'TaskCancelled', taskId: 'downstream', chatId: 'oc_goal',
+            idempotencyKey: `cancelled:downstream:${current.activationEventId}`,
+            payload: { taskId: 'downstream', reason: 'scope changed before confirmation', by: 'ou_supervisor' },
+          }));
+        }
+        return ledger.append(event);
+      },
+    };
+
+    expect(confirmTaskRelease({
+      ledger: racingLedger,
+      taskId: 'downstream',
+      confirmedBy: 'ou_supervisor',
+      now: pending.intentAt + TASK_RELEASE_AUTO_RETRY_WINDOW_MS,
+    })).toMatchObject({ outcome: 'stale', releaseId: pending.releaseId });
+    expect(ledger.task('downstream')?.status).toBe('cancelled');
   });
 
   it('classifies provider rejection as definite and transport/server uncertainty as ambiguous', () => {

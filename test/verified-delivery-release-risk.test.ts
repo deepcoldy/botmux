@@ -190,6 +190,42 @@ describe('dependency release risks', () => {
     expect(deriveTaskReleaseRisks({ tasks: ledger.tasks(), events: ledger.read(), now: TS + 10_000_000 })).toEqual([]);
   });
 
+  it('stays quiet when a rejected dependency is corrected within the threshold and becomes releasable', () => {
+    appendUpstream(ledger, 'rejected');
+    appendDownstreamPlan(ledger);
+    expect(deriveTaskReleaseRisks({
+      tasks: ledger.tasks(),
+      events: ledger.read(),
+      now: TS + 20 + DEFAULT_REJECTED_DEPENDENCY_STALL_MS - 1,
+    })).toEqual([]);
+
+    ledger.append(draft({
+      type: 'TaskReported', actor: 'worker', taskId: 'upstream', chatId: 'oc_goal',
+      idempotencyKey: 'report:upstream:r2', ts: TS + 30,
+      payload: {
+        taskId: 'upstream', reportId: 'upstream-r2', summary: 'contract corrected',
+        evidence: [{ kind: 'path', path: '/tmp/contract-v2.json' }],
+      },
+    }));
+    ledger.append(draft({
+      type: 'TaskAccepted', taskId: 'upstream', chatId: 'oc_goal',
+      idempotencyKey: 'accept:upstream:r2', ts: TS + 40,
+      payload: { taskId: 'upstream', reportId: 'upstream-r2', checkedBy: 'ou_supervisor' },
+    }));
+
+    expect(deriveTaskReleaseRisks({ tasks: ledger.tasks(), events: ledger.read(), now: TS + 41 })).toEqual([]);
+    expect(buildTaskReleaseClaim({
+      ledger,
+      taskId: 'downstream',
+      attempt: 0,
+      releasedBy: 'daemon:cli_supervisor',
+    })).toMatchObject({
+      intent: {
+        satisfiedBy: [{ taskId: 'upstream', acceptedEventId: ledger.task('upstream')?.acceptedEventId }],
+      },
+    });
+  });
+
   it('uses the default stall threshold for absent/invalid env values and accepts zero', () => {
     expect(resolveRejectedDependencyStallMs(undefined)).toBe(DEFAULT_REJECTED_DEPENDENCY_STALL_MS);
     expect(resolveRejectedDependencyStallMs('not-a-number')).toBe(DEFAULT_REJECTED_DEPENDENCY_STALL_MS);

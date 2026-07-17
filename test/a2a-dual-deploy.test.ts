@@ -30,7 +30,9 @@ import { formatHelpEnvelope, formatReportEnvelope, parseDeliveryEnvelope } from 
 import { ingestParsedDeliveryEnvelope } from '../src/verified-delivery/envelope-ingest.js';
 import { openLedger } from '../src/verified-delivery/ledger.js';
 import { reconcileTaskByCriteria } from '../src/verified-delivery/reconcile.js';
+import { runGoalReleaseCheck } from '../src/verified-delivery/release-engine.js';
 import { classifyTaskDisposition } from '../src/verified-delivery/attention.js';
+import type { TaskPlannedPayload } from '../src/verified-delivery/types.js';
 import { parseEventMessage } from '../src/im/lark/message-parser.js';
 
 interface DeploymentIdentity {
@@ -102,6 +104,207 @@ afterEach(() => {
 });
 
 describe('A2A dual-deployment delivery loop', () => {
+  it('keeps downstream work planned until upstream acceptance, then releases and accepts it across deployments', async () => {
+    const supervisorData = tempRoot('supervisor-dependency');
+    const workerData = tempRoot('worker-dependency');
+    const workerRepos = tempRoot('worker-dependency-repos');
+    const repoRemote = 'https://github.com/acme/dependency-chain.git';
+    const repoPath = makeRepo(workerRepos, repoRemote);
+    const upstreamOutput = join(repoPath, 'upstream.txt');
+    const downstreamOutput = join(repoPath, 'downstream.txt');
+    const ledger = openLedger({ baseDir: join(supervisorData, 'verified-delivery') });
+    const bus = new FakeLarkBus();
+    const supervisor: DeploymentIdentity = {
+      appId: 'cli_supervisor', name: 'codex-loopy', unionId: 'on_supervisor', peerScopedOpenId: 'ou_supervisor_seen_by_worker',
+    };
+    const worker: DeploymentIdentity = {
+      appId: 'cli_worker', name: 'relay-loopy', unionId: 'on_worker_stable', peerScopedOpenId: 'ou_worker_seen_by_supervisor',
+    };
+    const upstreamTaskId = 'dual-dependency-upstream';
+    const downstreamTaskId = 'dual-dependency-downstream';
+    let now = 100;
+
+    ledger.append({
+      type: 'TaskDispatched', actor: 'orchestrator', taskId: upstreamTaskId, chatId: 'oc_dual_deploy', ts: now++,
+      idempotencyKey: `dispatched:${upstreamTaskId}`,
+      payload: {
+        taskId: upstreamTaskId,
+        title: '生成上游接口说明',
+        workerOpenIds: [worker.peerScopedOpenId],
+        workerNames: [worker.name],
+        workerLarkAppIds: [worker.appId],
+        workerCliIds: ['relay'],
+        workerBotUnionIds: [worker.unionId],
+        requiredRepo: repoRemote,
+        acceptanceCriteria: {
+          version: 1,
+          artifacts: [{ path: upstreamOutput, checks: [{ type: 'exists' }, { type: 'contains', text: 'UPSTREAM_PASS' }] }],
+        },
+      },
+    });
+    const downstreamPlan: TaskPlannedPayload = {
+      taskId: downstreamTaskId,
+      chatId: 'oc_dual_deploy',
+      title: '消费上游接口说明',
+      dependsOnTaskIds: [upstreamTaskId],
+      planGeneration: 1,
+      dispatchSpec: {
+        title: '消费上游接口说明',
+        briefBase: '读取上游验收摘要，生成下游验证文件。',
+        workers: [{
+          openId: worker.peerScopedOpenId,
+          name: worker.name,
+          role: '执行者',
+          larkAppId: worker.appId,
+          cliId: 'relay',
+          unionId: worker.unionId,
+        }],
+        senderLarkAppId: supervisor.appId,
+        requiredRepo: repoRemote,
+        acceptanceHint: '下游文件存在且包含 DOWNSTREAM_PASS',
+        acceptanceCriteria: {
+          version: 1,
+          artifacts: [{ path: downstreamOutput, checks: [{ type: 'exists' }, { type: 'contains', text: 'DOWNSTREAM_PASS' }] }],
+        },
+      },
+      plannedBy: supervisor.name,
+    };
+    ledger.append({
+      type: 'TaskPlanned', actor: 'orchestrator', taskId: downstreamTaskId, chatId: 'oc_dual_deploy', ts: now++,
+      idempotencyKey: `planned:${downstreamTaskId}`,
+      payload: downstreamPlan,
+    });
+
+    const daemon = await import('../src/daemon.js');
+    const upstreamDispatch = buildDispatchMessages({
+      title: '生成上游接口说明',
+      brief: '生成接口说明并提交结果。',
+      bots: [{ openId: worker.peerScopedOpenId, name: worker.name, role: '执行者' }],
+      repoRequirement: { taskId: upstreamTaskId, repo: repoRemote },
+    });
+    const inboundUpstreamDispatch = bus.deliver(supervisor, worker, upstreamDispatch.kickoffText);
+    expect(await daemon.__testOnly_preflightDispatchRepo({
+      parsed: inboundUpstreamDispatch,
+      larkAppId: worker.appId,
+      chatId: 'oc_dual_deploy',
+      scope: 'chat',
+      anchor: 'oc_dual_deploy',
+    }, {
+      scanDirs: [workerRepos],
+      dataDir: workerData,
+      sendAccessHelp: vi.fn(async () => { throw new Error('repo hit must not request help'); }),
+    })).toEqual({ handled: false, workingDir: repoPath });
+
+    const releasedDispatches: ReturnType<FakeLarkBus['deliver']>[] = [];
+    const releaseDeps = {
+      ledger,
+      now: () => now++,
+      releasedBy: supervisor.name,
+      checkReadiness: vi.fn(async () => ({ ok: true, issues: [] })),
+      send: vi.fn(async ({ text }: { text: string }) => {
+        const delivered = bus.deliver(supervisor, worker, text);
+        releasedDispatches.push(delivered);
+        return delivered.messageId;
+      }),
+    };
+    expect(await runGoalReleaseCheck({
+      goalChatId: 'oc_dual_deploy', ownerLarkAppId: supervisor.appId, mode: 'trigger', deps: releaseDeps,
+    })).toEqual([{ taskId: downstreamTaskId, outcome: 'not-ready' }]);
+    expect(releasedDispatches).toHaveLength(0);
+
+    writeFileSync(upstreamOutput, 'UPSTREAM_PASS\n');
+    const inboundUpstreamReport = bus.deliver(worker, supervisor, buildReportText({
+      orchOpenId: supervisor.peerScopedOpenId,
+      content: formatReportEnvelope({
+        taskId: upstreamTaskId,
+        reportId: 'dual-upstream-report',
+        summary: '上游接口说明已生成',
+        evidence: [{ kind: 'inline', name: 'contract', text: 'UPSTREAM_PASS' }],
+      }),
+    }));
+    const upstreamEnvelope = parseDeliveryEnvelope(inboundUpstreamReport.content);
+    if (!upstreamEnvelope) throw new Error('expected upstream report envelope');
+    expect(ingestParsedDeliveryEnvelope({
+      envelope: upstreamEnvelope,
+      ledger,
+      goalChatId: 'oc_dual_deploy',
+      senderOpenId: inboundUpstreamReport.senderId,
+      senderUnionId: inboundUpstreamReport.senderUnionId,
+      messageId: inboundUpstreamReport.messageId,
+      now: now++,
+    })).toMatchObject({ outcome: 'report', taskId: upstreamTaskId });
+
+    expect(await runGoalReleaseCheck({
+      goalChatId: 'oc_dual_deploy', ownerLarkAppId: supervisor.appId, mode: 'trigger', deps: releaseDeps,
+    })).toEqual([{ taskId: downstreamTaskId, outcome: 'not-ready' }]);
+    expect(releasedDispatches).toHaveLength(0);
+
+    const acceptedUpstream = reconcileTaskByCriteria(ledger, upstreamTaskId, {
+      checkedBy: supervisor.name,
+      now: now++,
+    });
+    expect(acceptedUpstream.action).toBe('accepted');
+    const released = await runGoalReleaseCheck({
+      goalChatId: 'oc_dual_deploy', ownerLarkAppId: supervisor.appId, mode: 'trigger', deps: releaseDeps,
+    });
+    expect(released).toEqual([expect.objectContaining({ taskId: downstreamTaskId, outcome: 'dispatched' })]);
+    expect(releasedDispatches).toHaveLength(1);
+    expect(releasedDispatches[0]!.content).toContain('[botmux-dispatch v1]');
+    expect(releasedDispatches[0]!.content).toContain('上游接口说明已生成');
+    expect(releasedDispatches[0]!.content).not.toContain('UPSTREAM_PASS');
+
+    expect(await daemon.__testOnly_preflightDispatchRepo({
+      parsed: releasedDispatches[0]!,
+      larkAppId: worker.appId,
+      chatId: 'oc_dual_deploy',
+      scope: 'chat',
+      anchor: 'oc_dual_deploy',
+    }, {
+      scanDirs: [workerRepos],
+      dataDir: workerData,
+      sendAccessHelp: vi.fn(async () => { throw new Error('released repo hit must not request help'); }),
+    })).toEqual({ handled: false, workingDir: repoPath });
+
+    writeFileSync(downstreamOutput, 'DOWNSTREAM_PASS\n');
+    const inboundDownstreamReport = bus.deliver(worker, supervisor, buildReportText({
+      orchOpenId: supervisor.peerScopedOpenId,
+      content: formatReportEnvelope({
+        taskId: downstreamTaskId,
+        reportId: 'dual-downstream-report',
+        summary: '下游消费完成',
+        evidence: [{ kind: 'inline', name: 'result', text: 'DOWNSTREAM_PASS' }],
+      }),
+    }));
+    const downstreamEnvelope = parseDeliveryEnvelope(inboundDownstreamReport.content);
+    if (!downstreamEnvelope) throw new Error('expected downstream report envelope');
+    expect(ingestParsedDeliveryEnvelope({
+      envelope: downstreamEnvelope,
+      ledger,
+      goalChatId: 'oc_dual_deploy',
+      senderOpenId: inboundDownstreamReport.senderId,
+      senderUnionId: inboundDownstreamReport.senderUnionId,
+      messageId: inboundDownstreamReport.messageId,
+      now: now++,
+    })).toMatchObject({ outcome: 'report', taskId: downstreamTaskId });
+    expect(reconcileTaskByCriteria(ledger, downstreamTaskId, {
+      checkedBy: supervisor.name,
+      now: now++,
+    }).action).toBe('accepted');
+
+    expect(ledger.read().map((event) => `${event.type}:${event.taskId}`)).toEqual([
+      `TaskDispatched:${upstreamTaskId}`,
+      `TaskPlanned:${downstreamTaskId}`,
+      `TaskReported:${upstreamTaskId}`,
+      `TaskAccepted:${upstreamTaskId}`,
+      `TaskDispatchIntent:${downstreamTaskId}`,
+      `TaskDispatched:${downstreamTaskId}`,
+      `TaskReported:${downstreamTaskId}`,
+      `TaskAccepted:${downstreamTaskId}`,
+    ]);
+    expect(ledger.task(downstreamTaskId)).toMatchObject({ status: 'accepted' });
+    expect(ledger.task(downstreamTaskId)?.reports).toHaveLength(1);
+  });
+
   it('routes repo hit → report → union_id-authorized ingestion → automatic acceptance', async () => {
     const supervisorData = tempRoot('supervisor');
     const workerData = tempRoot('worker');
