@@ -17,6 +17,7 @@ import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
 import { openLedger } from '../src/verified-delivery/ledger.js';
+import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -963,6 +964,21 @@ describe('GET /api/goals', () => {
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('GET /api/goals/attention/live auth', () => {
+  it('rejects a bare loopback caller and accepts the trusted dashboard wrapper with a query', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const path = '/api/goals/attention/live?chatId=oc_goal';
+
+    const bare = await fetch(`http://127.0.0.1:${handle.port}${path}`);
+    expect(bare.status).toBe(401);
+
+    const trusted = await fetchDaemonIpc(handle.port, path, { method: 'GET' }, TEST_IPC_SECRET);
+    expect(trusted.status).toBe(200);
+    expect(await trusted.json()).toMatchObject({ systemRisk: expect.any(Array) });
   });
 });
 

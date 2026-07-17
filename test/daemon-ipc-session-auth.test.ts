@@ -106,6 +106,7 @@ describe('daemon IPC session-scoped fallback', () => {
 
 describe('daemon session-scoped IPC route wiring', () => {
   const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+  const ipcServerSource = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
 
   function between(start: string, end: string): string {
     const from = source.indexOf(start);
@@ -142,5 +143,55 @@ describe('daemon session-scoped IPC route wiring', () => {
     const emitAt = route.indexOf('emitHookEventLocal(event as HookEvent, boundPayload)');
     expect(bindAt).toBeGreaterThanOrEqual(0);
     expect(emitAt).toBeGreaterThan(bindAt);
+  });
+
+  it('admits only the capability-checked goal command apertures', () => {
+    for (const path of [
+      '/api/goal/supervise',
+      '/api/goal/notify-parent',
+      '/api/goal/watchdog',
+    ]) {
+      expect(ipcServerSource).toContain(`pathname === '${path}'`);
+    }
+  });
+
+  it('binds goal supervise to the authenticated L1 session before starting L2', () => {
+    const route = between(
+      "ipcRoute('POST', '/api/goal/supervise'",
+      'function findActiveSessionById(',
+    );
+    const authAt = route.indexOf('authorizeGoalSessionIpc(req, parent, raw)');
+    const startAt = route.indexOf('startGoalSupervisor({');
+    expect(authAt).toBeGreaterThanOrEqual(0);
+    expect(startAt).toBeGreaterThan(authAt);
+    expect(route).toContain('raw.parentChatId = parent.chatId;');
+    expect(route).toContain('raw.larkAppId = parent.larkAppId;');
+    expect(route).toContain('const authorizedWorkingDir = parent.workingDir ?? parent.session.workingDir;');
+    expect(route).toContain("errorCode: 'working_dir_not_authorized'");
+    expect(route).toContain('raw.workingDir = authorizedWorkingDir;');
+  });
+
+  it('binds goal notify-parent to the authenticated supervisor session', () => {
+    const route = between(
+      "ipcRoute('POST', '/api/goal/notify-parent'",
+      "ipcRoute('POST', '/api/goal/watchdog'",
+    );
+    const authAt = route.indexOf('authorizeGoalSessionIpc(req, supervisor, raw)');
+    const notifyAt = route.indexOf('notifyGoalParent(notifyReq');
+    expect(authAt).toBeGreaterThanOrEqual(0);
+    expect(notifyAt).toBeGreaterThan(authAt);
+    expect(route).toContain('raw.goalChatId = supervisor.session.goalSupervisor.goalChatId;');
+  });
+
+  it('lets an authenticated goal member request a host-signed watchdog fan-out', () => {
+    const route = between(
+      "ipcRoute('POST', '/api/goal/watchdog'",
+      '// ─── session-ready IPC route',
+    );
+    const authAt = route.indexOf('authorizeGoalSessionIpc(req, caller, raw)');
+    const fanoutAt = route.indexOf('triggerGoalWatchdogAcrossDaemons({');
+    expect(authAt).toBeGreaterThanOrEqual(0);
+    expect(fanoutAt).toBeGreaterThan(authAt);
+    expect(route).toContain('caller.chatId !== goalChatId');
   });
 });
