@@ -4,7 +4,7 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
@@ -1287,6 +1287,118 @@ describe('PUT /api/bot-rename', () => {
 
       expect(called).toBe(0);
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].displayName).toBeUndefined();
+    });
+  });
+});
+
+describe('PUT /api/bot-avatar', () => {
+  async function withAvatarServer(fn: (base: string) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-avatar-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-avatar-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      await fn(`http://127.0.0.1:${handle.port}`);
+    } finally {
+      setBotAvatarChanger(null);
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('decodes the (data-URL) base64 body and returns the changer outcome', async () => {
+    await withAvatarServer(async (base) => {
+      const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+      const seen: Buffer[] = [];
+      setBotAvatarChanger(async (image) => {
+        seen.push(image);
+        return { ok: true, avatarUrl: 'https://cdn.example/new-avatar', versionId: 'v-9' };
+      });
+
+      const res = await fetch(`${base}/api/bot-avatar`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ imageBase64: `data:image/png;base64,${png.toString('base64')}` }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, avatarUrl: 'https://cdn.example/new-avatar', versionId: 'v-9' });
+      expect(seen).toHaveLength(1);
+      expect(seen[0].equals(png)).toBe(true); // data URL 前缀被剥掉、按 base64 解码
+    });
+  });
+
+  it('maps changer failures to 502 (feishu-side) / 400 (invalid_image) with the structured reason', async () => {
+    await withAvatarServer(async (base) => {
+      setBotAvatarChanger(async () => ({ ok: false, reason: 'no_session', message: 'run botmux setup' }));
+      const feishuFail = await fetch(`${base}/api/bot-avatar`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ imageBase64: Buffer.from('x').toString('base64') }),
+      });
+      expect(feishuFail.status).toBe(502);
+      expect(await feishuFail.json()).toMatchObject({ ok: false, error: 'no_session', message: 'run botmux setup' });
+
+      setBotAvatarChanger(async () => ({ ok: false, reason: 'invalid_image', message: 'not a png' }));
+      const badImage = await fetch(`${base}/api/bot-avatar`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ imageBase64: Buffer.from('x').toString('base64') }),
+      });
+      expect(badImage.status).toBe(400);
+      expect(await badImage.json()).toMatchObject({ ok: false, error: 'invalid_image' });
+    });
+  });
+
+  it('rejects missing/oversized payloads without calling the changer, and 501s when unwired', async () => {
+    await withAvatarServer(async (base) => {
+      let called = 0;
+      setBotAvatarChanger(async () => { called++; return { ok: true, avatarUrl: 'u' }; });
+
+      const missing = await fetch(`${base}/api/bot-avatar`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      expect(missing.status).toBe(400);
+      expect(await missing.json()).toMatchObject({ ok: false, error: 'image_required' });
+
+      // JSON 顶层为 null：属性访问前必须收窄，返回 400 而不是 500。
+      const nullBody = await fetch(`${base}/api/bot-avatar`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: 'null',
+      });
+      expect(nullBody.status).toBe(400);
+      expect(await nullBody.json()).toMatchObject({ ok: false, error: 'image_required' });
+
+      const huge = await fetch(`${base}/api/bot-avatar`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ imageBase64: 'A'.repeat(3_000_001) }),
+      });
+      expect(huge.status).toBe(413);
+      expect(await huge.json()).toMatchObject({ ok: false, error: 'image_too_large' });
+
+      expect(called).toBe(0);
+
+      setBotAvatarChanger(null);
+      const unwired = await fetch(`${base}/api/bot-avatar`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ imageBase64: Buffer.from('x').toString('base64') }),
+      });
+      expect(unwired.status).toBe(501);
+      expect(await unwired.json()).toMatchObject({ ok: false, error: 'avatar_not_wired' });
     });
   });
 });

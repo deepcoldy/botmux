@@ -8676,6 +8676,57 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   width: 48px;
   height: 48px;
 }
+/* 档案头头像可点击上传（BotAvatarControl）。 */
+.bd-avatar-editable { position: relative; }
+.bd-avatar-btn {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  border-radius: var(--radius-full);
+  cursor: pointer;
+}
+.bd-avatar-btn:disabled { cursor: progress; }
+.bd-avatar-edit-badge {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  font-size: 11px;
+  border-radius: var(--radius-full);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  box-shadow: var(--shadow);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  pointer-events: none;
+}
+.bd-avatar-editable:hover .bd-avatar-edit-badge,
+.bd-avatar-btn:focus-visible .bd-avatar-edit-badge,
+.bd-avatar-btn:disabled .bd-avatar-edit-badge { opacity: 1; }
+/* 状态气泡挂在头像下方，避免撑坏 58px 头像栏的网格布局。 */
+.bd-avatar-status {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 6;
+  min-width: 240px;
+  max-width: 340px;
+  padding: 6px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  line-height: 1.5;
+}
+.bd-avatar-status .bd-feishu-login { margin-left: 6px; }
 .bd-profile-main {
   min-width: 0;
   display: grid;

@@ -163,6 +163,19 @@ describe('renameBotOnOpenPlatform', () => {
     expect(calls.every(c => !c.path.includes('/base_info/') && !c.path.includes('/app_version/create/') && !c.path.includes('/publish/commit/'))).toBe(true);
   });
 
+  it('fails closed when visible/online is structurally broken (data:null) — no default-empty publish', async () => {
+    const calls: Call[] = [];
+    const r = await renameBotOnOpenPlatform('cli_x', '新名字', undefined, {
+      loadCookies: () => COOKIES,
+      clientFactory: fakeClient(calls, {
+        '/developers/v1/app/cli_x': BASE_INFO,
+        '/developers/v1/visible/online/cli_x': { data: null },
+      }),
+    });
+    expect(r).toMatchObject({ ok: false, reason: 'api_error' });
+    expect(calls.every(c => !c.path.includes('/base_info/') && !c.path.includes('/app_version/create/') && !c.path.includes('/publish/commit/'))).toBe(true);
+  });
+
   it('fails closed on PARTIAL parse loss too (one member id unparseable)', async () => {
     const calls: Call[] = [];
     const r = await renameBotOnOpenPlatform('cli_x', '新名字', undefined, {

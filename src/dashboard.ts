@@ -3719,6 +3719,37 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/avatar — proxy to that bot's daemon. Body
+    // `{ imageBase64: string }` (512×512 PNG, canvas-normalized by the web UI).
+    // The daemon runs the Open Platform automation (upload icon + base_info +
+    // publish a version); there is no local fallback — failures return the
+    // structured reason so the UI can prompt for a Feishu web login.
+    let mBotAvatar: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotAvatar = url.pathname.match(/^\/api\/bots\/([^/]+)\/avatar$/))) {
+      const appId = decodeURIComponent(mBotAvatar[1]);
+      const chunks: Buffer[] = [];
+      let received = 0;
+      for await (const c of req) {
+        received += (c as Buffer).length;
+        // base64 of a 512×512 PNG stays well under this; cap before buffering more.
+        if (received > 4_000_000) {
+          res.writeHead(413, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'image_too_large' }));
+          return;
+        }
+        chunks.push(c as Buffer);
+      }
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-avatar`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/max-live-workers — proxy to that bot's daemon. Body
     // `{ maxLiveWorkers: number | null }` (null = clear → fall back to the
     // built-in default of 30; a positive integer overrides it).

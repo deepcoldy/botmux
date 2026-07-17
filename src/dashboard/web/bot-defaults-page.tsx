@@ -28,7 +28,7 @@ import {
   RefreshIconButton,
   dropdownLabel,
 } from './dashboard-components.js';
-import { botAvatarHtml, loadNameMaps, ui } from './ui.js';
+import { botAvatarHtml, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
@@ -481,9 +481,7 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
   return (
     <article className="bd-card bd-profile" data-appid={bot.larkAppId}>
       <header className="bd-profile-head">
-        <div className="bd-profile-avatar">
-          <Html html={botAvatarHtml({ name, larkAppId: bot.larkAppId, dot: 'ok' })} />
-        </div>
+        <BotAvatarControl bot={bot} name={name} patchBot={patchBot} />
         <div className="bd-profile-main">
           <BotProfileIdentity
             bot={bot}
@@ -544,6 +542,141 @@ function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: Patch
       <LaunchShellSection bot={props.bot} patchBot={props.patchBot} />
       <EnvSection bot={props.bot} patchBot={props.patchBot} />
     </section>
+  );
+}
+
+/** console 头像上传只实测过 512×512 PNG，前端统一归一化成这一形态再上传。 */
+const AVATAR_UPLOAD_SIDE = 512;
+
+/** 任意用户图片 → 512×512 PNG dataURL（短边 cover 裁剪居中）。 */
+async function normalizeAvatarImage(file: File): Promise<string> {
+  const bitmap = await createImageBitmap(file);
+  try {
+    const side = Math.min(bitmap.width, bitmap.height);
+    if (!side) throw new Error('empty image');
+    const canvas = document.createElement('canvas');
+    canvas.width = AVATAR_UPLOAD_SIDE;
+    canvas.height = AVATAR_UPLOAD_SIDE;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('canvas unavailable');
+    const sx = (bitmap.width - side) / 2;
+    const sy = (bitmap.height - side) / 2;
+    ctx.drawImage(bitmap, sx, sy, side, side, 0, 0, AVATAR_UPLOAD_SIDE, AVATAR_UPLOAD_SIDE);
+    return canvas.toDataURL('image/png');
+  } finally {
+    bitmap.close();
+  }
+}
+
+/** 档案头头像：点击选图 → 归一化 → 走开放平台自动化真改飞书应用头像并发版。
+ *  与改名同款失败语义：缺飞书 Web 登录态时给扫码入口，登录成功自动重试。 */
+function BotAvatarControl(props: { bot: BotDefaultsRow; name: string; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, name, patchBot } = props;
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [loginVisible, setLoginVisible] = useState(false);
+  const [loginOpen, setLoginOpen] = useState(false);
+  // 待上传图片留到登录成功后重试；成功/明确失败时清掉。
+  const pendingRef = useRef<string | null>(null);
+
+  function avatarFailText(error: string, message?: string): string {
+    const known = ['no_session', 'session_expired', 'no_access', 'unsupported_brand'];
+    const detail = known.includes(error) ? tr(`botDefaults.avatarWarn.${error}`) : (message || error);
+    return tr('botDefaults.avatarFailed', { error: detail });
+  }
+
+  const upload = useCallback(async (imageBase64: string) => {
+    setBusy(true);
+    setStatus({ text: `⏳ ${tr('botDefaults.avatarUploading')}`, ok: true });
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/avatar`, { imageBase64 });
+      if (res.ok && res.body.ok) {
+        const url = typeof res.body.avatarUrl === 'string' ? res.body.avatarUrl : '';
+        if (url) overrideBotAvatar(bot.larkAppId, name, url);
+        // 行内容不变，触发一次重绘让 orb 读到覆写后的头像映射。
+        patchBot(bot.larkAppId, current => ({ ...current }));
+        pendingRef.current = null;
+        setLoginVisible(false);
+        setStatus({ text: `✓ ${tr('botDefaults.avatarOkFeishu')}`, ok: true });
+      } else {
+        const err = String(res.body?.error ?? '');
+        const message = typeof res.body?.message === 'string' ? res.body.message : undefined;
+        setStatus({ text: `✗ ${avatarFailText(err, message ?? responseErrorText(res))}` });
+        const needLogin = err === 'no_session' || err === 'session_expired';
+        setLoginVisible(needLogin);
+        if (!needLogin) pendingRef.current = null;
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${tr('botDefaults.avatarFailed', { error: caughtErrorText(e) })}` });
+    } finally {
+      setBusy(false);
+    }
+  }, [bot.larkAppId, name, patchBot, tr]);
+
+  async function handleFile(file: File | undefined): Promise<void> {
+    if (!file || busy) return;
+    // 归一化阶段就置 busy：canvas 解码大图有可感知耗时，这个窗口里不该还能
+    // 再开一次选图/触发并发提交（服务端另有 per-app 串行队列兜底）。
+    setBusy(true);
+    let dataUrl: string;
+    try {
+      dataUrl = await normalizeAvatarImage(file);
+    } catch {
+      setBusy(false);
+      setStatus({ text: `✗ ${tr('botDefaults.avatarBadImage')}` });
+      return;
+    }
+    pendingRef.current = dataUrl;
+    await upload(dataUrl);
+  }
+
+  return (
+    <div className="bd-profile-avatar bd-avatar-editable" data-avatar-control>
+      <button
+        type="button"
+        className="bd-avatar-btn"
+        data-action="edit-bot-avatar"
+        title={tr('botDefaults.avatarTitle')}
+        aria-label={tr('botDefaults.avatarTitle')}
+        disabled={busy}
+        onClick={() => inputRef.current?.click()}
+      >
+        <Html html={botAvatarHtml({ name, larkAppId: bot.larkAppId, dot: 'ok' })} />
+        <span className="bd-avatar-edit-badge" aria-hidden="true">{busy ? '⏳' : '✎'}</span>
+      </button>
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/*"
+        hidden
+        data-input="botAvatarFile"
+        onChange={event => {
+          const file = event.currentTarget.files?.[0];
+          event.currentTarget.value = ''; // 允许再次选择同一文件
+          void handleFile(file);
+        }}
+      />
+      {status ? (
+        <small className={statusClass(status, 'bd-avatar-status')} data-avatar-status>
+          {status.text}
+          {loginVisible ? (
+            <button type="button" className="bd-feishu-login" data-action="feishu-login-avatar" onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
+          ) : null}
+        </small>
+      ) : null}
+      {loginOpen ? (
+        <FeishuLoginModal
+          onClose={() => setLoginOpen(false)}
+          onSuccess={() => {
+            setLoginVisible(false);
+            setLoginOpen(false);
+            if (pendingRef.current) void upload(pendingRef.current);
+          }}
+        />
+      ) : null}
+    </div>
   );
 }
 

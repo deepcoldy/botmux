@@ -102,6 +102,16 @@ let botRenamer: ((newName: string) => Promise<BotRenameOutcome>) | null = null;
 export function setBotRenamer(fn: ((newName: string) => Promise<BotRenameOutcome>) | null): void {
   botRenamer = fn;
 }
+// 机器人真·改头像，注册方式同 renamer（开放平台自动化 + daemon 侧
+// botAvatarUrl/descriptor/bots-info 同步在 daemon 闭包里做）。头像没有
+// botmux 侧的本地等价物，失败不降级，把结构化原因原样返回给前端。
+export type BotAvatarOutcome =
+  | { ok: true; avatarUrl: string; versionId?: string }
+  | { ok: false; reason: string; message: string };
+let botAvatarChanger: ((image: Buffer) => Promise<BotAvatarOutcome>) | null = null;
+export function setBotAvatarChanger(fn: ((image: Buffer) => Promise<BotAvatarOutcome>) | null): void {
+  botAvatarChanger = fn;
+}
 import {
   composeRowFromActive,
   composeRowFromClosed,
@@ -2011,6 +2021,41 @@ ipcRoute('PUT', '/api/bot-rename', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, name);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, mode: 'local', botName: getBotName(), warning: 'renamer_not_wired' });
+});
+
+// 机器人改头像（dashboard 档案头头像入口）。Body `{ imageBase64: string }`——
+// 512×512 PNG 的 base64（可带 data URL 前缀，前端 canvas 归一化产出）。走开放
+// 平台自动化真改飞书应用头像（上传图片 + 改基础信息 + 建版发布，群内头像生效）。
+// 头像没有本地降级等价物：失败直接把结构化原因返回（no_session / session_expired
+// 时前端引导扫码重登）。响应：{ ok, avatarUrl?, versionId? } | { ok:false, error, message }。
+ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { imageBase64?: unknown } | null;
+  try { body = await readJsonBody<{ imageBase64?: unknown } | null>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  // JSON 顶层可以是 null / 数组 / 标量——属性访问前先收窄成普通对象（400 而非 500）。
+  const rawB64 = typeof body?.imageBase64 === 'string'
+    ? body.imageBase64.replace(/^data:image\/[a-z+.-]+;base64,/i, '').trim()
+    : '';
+  if (!rawB64) return jsonRes(res, 400, { ok: false, error: 'image_required' });
+  // 512×512 PNG 远小于此上限；超出即拒，避免把任意大 payload 灌进 console 上传。
+  if (rawB64.length > 3_000_000) return jsonRes(res, 413, { ok: false, error: 'image_too_large' });
+  const image = Buffer.from(rawB64, 'base64');
+
+  if (!botAvatarChanger) return jsonRes(res, 501, { ok: false, error: 'avatar_not_wired' });
+  let changed: BotAvatarOutcome;
+  try {
+    changed = await botAvatarChanger(image);
+  } catch (err) {
+    changed = { ok: false, reason: 'api_error', message: err instanceof Error ? err.message : String(err) };
+  }
+  if (changed.ok) {
+    return jsonRes(res, 200, { ok: true, avatarUrl: changed.avatarUrl, versionId: changed.versionId });
+  }
+  // invalid_image 是调用方参数问题（4xx），其余是飞书侧/环境失败（502）。
+  const status = changed.reason === 'invalid_image' ? 400 : 502;
+  jsonRes(res, status, { ok: false, error: changed.reason, message: changed.message });
 });
 
 // Per-bot agent launch settings. Body `{ cliId, model }` where `cliId` is the

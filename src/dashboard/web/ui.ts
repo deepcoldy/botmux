@@ -295,6 +295,16 @@ function persistAvatarCache(): void {
 
 hydrateAvatarCache(); // 模块加载即回灌，先于任何页面渲染
 
+/** Bot 改头像成功后本地即时生效：更新内存映射 + localStorage 缓存，让所有
+ *  渲染点（配置页 / 会话行 / 总览）下一次重绘就用新图，不必等 /api/groups
+ *  的注册表数据收敛。 */
+export function overrideBotAvatar(larkAppId: string, name: string | undefined, url: string): void {
+  if (!larkAppId || !url) return;
+  botAvatarByAppId.set(larkAppId, url);
+  if (name) botAvatarByName.set(String(name), url);
+  persistAvatarCache();
+}
+
 export function loadNameMaps(): Promise<void> {
   nameMapsPromise ??= (async () => {
     try {
