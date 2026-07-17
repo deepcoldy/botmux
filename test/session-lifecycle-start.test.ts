@@ -326,7 +326,7 @@ describe('Codex App clean-input feature gate', () => {
     expect(ds.managedTurnOrigin).toBeUndefined();
   });
 
-  it('keeps previous-turn attribution fallback for a non-empty accepted prompt', () => {
+  it('does not lend a previous human turn to a non-empty system prompt', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
     const ds = makeDs({
       currentReplyTarget: {
@@ -346,12 +346,13 @@ describe('Codex App clean-input feature gate', () => {
     forkWorker(ds, payload, { resume: true });
 
     const worker = forkMock.mock.results.at(-1)!.value;
-    expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({
       prompt: payload.content,
-      promptCodexAppInput: { text: 'clean', clientUserMessageId: 'om_current_vc' },
-      turnId: 'om_current_vc',
-      vcMeetingImTurnOrigin: origin,
+      promptCodexAppInput: { text: 'clean' },
     }));
+    expect(init.turnId).toBeUndefined();
+    expect(init.vcMeetingImTurnOrigin).toBeUndefined();
   });
 
   it('starts an old queued activation without a sidecar and a modern one with exactly one', () => {

@@ -1900,14 +1900,12 @@ export function forkWorker(
     resume = resumeOrTurnId;
   }
 
-  // An empty prompt is a pure worker reattach/restore, not a newly accepted
-  // user turn. Never inherit the previous reply target in that case: doing so
-  // would re-publish stale per-turn authority (notably an explicit meeting IM
-  // origin) into a fresh worker lifetime after a daemon restart. Non-empty
-  // prompts keep the historical fallback for callers that accepted a turn
-  // before they learned to pass its id explicitly.
-  const initAttributionTurnId = initTurnId
-    ?? (prompt.length > 0 ? ds.currentReplyTarget?.turnId : undefined);
+  // Per-turn authority is never inferred from mutable session state. Human
+  // message routes pass their accepted Lark message id explicitly; restore,
+  // scheduler, card retry and other system starts stay unattributed. Falling
+  // back to currentReplyTarget here would let a later system prompt reuse an
+  // older human turn after a worker replacement.
+  const initAttributionTurnId = initTurnId;
 
   // A fork() whose cwd no longer exists emits an unhandled 'error' (spawn
   // ENOENT) that crashes the WHOLE daemon (→ pm2 crash-loop). Fall back to
@@ -2588,6 +2586,8 @@ function setupWorkerHandlers(
         if (ds.pendingRawInput && ds.worker && !ds.worker.killed) {
           const rawInput = ds.pendingRawInput;
           ds.pendingRawInput = undefined;
+          const rawTurnId = ds.pendingRawTurnId;
+          ds.pendingRawTurnId = undefined;
           // Input buffered while the repo card was pending rides on the SAME
           // IPC: worker message handlers run concurrently (async handlers
           // don't serialize), so a separate `message` IPC could write into
@@ -2601,7 +2601,9 @@ function setupWorkerHandlers(
           ds.worker.send({
             type: 'raw_input',
             content: rawInput,
+            ...(rawTurnId ? { turnId: rawTurnId } : {}),
             followUpContent: followUp?.cliInput,
+            ...(followUp?.turnId ? { followUpTurnId: followUp.turnId } : {}),
             ...(followUpCodexAppInput ? { followUpCodexAppInput } : {}),
           } as DaemonToWorker);
           logger.info(`[${t}] Sent pending raw input after prompt_ready: ${rawInput.substring(0, 80)}${followUp ? ` (+follow-up ${followUp.cliInput.length} chars)` : ''}`);
