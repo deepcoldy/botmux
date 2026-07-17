@@ -118,6 +118,36 @@ describe('verified-delivery CLI e2e（delivery 回路，零飞书）', () => {
     expect(delivery(['list', '--status', 'planned']).json.tasks[0].dependsOnTaskIds).toEqual(['task-upstream']);
   });
 
+  it('`dispatch --after` refuses to freeze a bot app_id that Lark cannot mention', () => {
+    const sessionId = 'session-unresolved-worker';
+    writeFileSync(join(dataDir, 'sessions-cli_sup.json'), JSON.stringify({
+      [sessionId]: {
+        sessionId,
+        chatId: GOAL_CHAT,
+        rootMessageId: GOAL_CHAT,
+        title: 'goal supervisor',
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        larkAppId: 'cli_sup',
+        ownerOpenId: 'ou_owner',
+      },
+    }));
+    seedDispatched('task-upstream', 'Upstream');
+
+    const out = cli('dispatch', [
+      '--session-id', sessionId,
+      '--title', 'Downstream',
+      '--bot', 'cli_remote:Remote Worker:coder',
+      '--brief', 'Use the upstream result.',
+      '--task-id', 'task-unmentionable',
+      '--after', 'task-upstream',
+    ]);
+
+    expect(out.status).toBe(1);
+    expect(out.raw).toContain('还没有群内可 @ 的身份');
+    expect(openLedger({ baseDir: ledgerBase }).task('task-unmentionable')).toBeUndefined();
+  });
+
   it('`report` 缺少监管者坐标时先失败且不写入交付记录', () => {
     const sessionId = 'session-without-report-target';
     writeFileSync(join(dataDir, 'sessions-cli_test.json'), JSON.stringify({

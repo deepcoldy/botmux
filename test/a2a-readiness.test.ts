@@ -3,7 +3,9 @@ import {
   A2A_CAPABILITY_DELIVERY_V1,
   A2A_CAPABILITY_DISPATCH_REPO_V1,
   evaluateDispatchReadiness,
+  resolveDispatchMentionIdentities,
 } from '../src/core/a2a-readiness.js';
+import { buildDispatchMessages } from '../src/core/dispatch.js';
 
 const localWorker = {
   openId: 'ou_local',
@@ -79,6 +81,61 @@ describe('evaluateDispatchReadiness', () => {
     });
     expect(result.ok).toBe(true);
     expect(result.issues).toEqual([]);
+  });
+
+  it('resolves an app_id into the observer-scoped mention handle used on the wire', () => {
+    const resolution = resolveDispatchMentionIdentities({
+      workers: [{ ...remoteWorker, openId: 'cli_remote', name: 'cli_remote' }],
+      membership: { known: true, members: [{ openId: 'ou_receiver_scoped', name: 'relay-loopy(d2)' }] },
+      peers: [{ larkAppId: 'cli_remote', name: 'relay-loopy(d2)' }],
+    });
+    expect(resolution.issues).toEqual([]);
+    expect(resolution.workers[0]!.openId).toBe('ou_receiver_scoped');
+
+    const message = buildDispatchMessages({
+      title: 'Remote task',
+      brief: 'Run checks.',
+      bots: [{ openId: resolution.workers[0]!.openId, name: 'relay-loopy(d2)' }],
+    });
+    expect(message.kickoffText).toContain('<at user_id="ou_receiver_scoped"></at>');
+    expect(message.kickoffText).not.toContain('cli_remote');
+  });
+
+  it('hard-fails when only an app_id is known and membership cannot be read', () => {
+    const result = evaluateDispatchReadiness({
+      workers: [{ ...remoteWorker, openId: 'cli_remote' }],
+      membership: { known: false, members: [], reason: 'timeout' },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.issues).toContainEqual(expect.objectContaining({
+      code: 'mention_identity_unavailable',
+      severity: 'error',
+    }));
+  });
+
+  it('hard-fails ambiguous display-name matches instead of mentioning an arbitrary bot', () => {
+    const result = evaluateDispatchReadiness({
+      workers: [{ ...remoteWorker, openId: 'cli_remote' }],
+      membership: {
+        known: true,
+        members: [
+          { openId: 'ou_remote_a', name: 'relay-loopy(d2)' },
+          { openId: 'ou_remote_b', name: 'relay-loopy(d2)' },
+        ],
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.issues).toContainEqual(expect.objectContaining({ code: 'mention_identity_ambiguous' }));
+  });
+
+  it('rejects a frozen release when the current group resolves a different open_id', () => {
+    const result = evaluateDispatchReadiness({
+      workers: [{ ...remoteWorker, openId: 'ou_stale_scope' }],
+      membership: { known: true, members: [{ openId: 'ou_current_scope', name: 'relay-loopy(d2)' }] },
+      requireExactMentionOpenIds: true,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.issues).toContainEqual(expect.objectContaining({ code: 'mention_identity_mismatch' }));
   });
 
   it('warns for a remote worker whose capabilities are not yet advertised', () => {

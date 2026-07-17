@@ -207,7 +207,7 @@ export function buildGoalStartBrief(input: {
   brief?: string;
   teamName?: string;
   supervisorName: string;
-  workers: Array<{ name: string; larkAppId: string; local: boolean }>;
+  workers: Array<{ name: string; larkAppId: string; mentionOpenId?: string; local: boolean }>;
   localWorkingDir?: string;
   requiredRepo?: string;
 }): string {
@@ -220,7 +220,7 @@ export function buildGoalStartBrief(input: {
     `- 监管者：${input.supervisorName}`,
     `- 执行者：${input.workers.map((worker) => `${worker.name}${worker.local ? '（本机）' : '（远端）'}`).join('、')}`,
     '- 派活坐标（可直接复制）：',
-    ...input.workers.map((worker) => `  --bot ${worker.larkAppId}:${worker.name}:执行者`),
+    ...input.workers.map((worker) => `  --bot ${worker.mentionOpenId ?? worker.larkAppId}:${worker.name}:执行者`),
     ...(input.localWorkingDir ? [`- 本机项目目录：${input.localWorkingDir}`] : []),
     ...(input.requiredRepo ? [`- 项目仓库：${input.requiredRepo}`] : []),
     ...(hasRemoteWorker && !input.requiredRepo ? ['- 项目仓库：未指定；远端代码任务派发前必须先向主控确认项目。'] : []),

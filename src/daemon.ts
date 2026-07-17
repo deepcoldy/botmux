@@ -2322,6 +2322,10 @@ function createGoalReleaseEngineDeps(): ReleaseEngineDeps {
         membership,
         peers: collectA2AReleasePeers(),
         requiredCapabilities,
+        // The intent already froze the kickoff bytes. If the roster resolves a
+        // different observer-scoped handle, fail visibly instead of sending an
+        // immutable message whose @ would be empty or target the wrong bot.
+        requireExactMentionOpenIds: true,
       });
       for (const issue of readiness.issues) {
         const log = issue.severity === 'error' ? logger.warn.bind(logger) : logger.info.bind(logger);

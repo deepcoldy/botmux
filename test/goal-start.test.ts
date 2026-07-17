@@ -167,7 +167,7 @@ describe('buildGoalStartBrief', () => {
       supervisorName: codex.name,
       workers: [
         { name: traex.name, larkAppId: traex.larkAppId, local: true },
-        { name: relay.name, larkAppId: relay.larkAppId, local: false },
+        { name: relay.name, larkAppId: relay.larkAppId, mentionOpenId: 'ou_relay_seen_by_codex', local: false },
       ],
       localWorkingDir: '/workspace/project',
       requiredRepo: 'github.com/acme/project',
@@ -176,10 +176,10 @@ describe('buildGoalStartBrief', () => {
     expect(brief).toContain('团队：a2a 跨设备测试');
     expect(brief).toContain('traex-loopy（本机）');
     expect(brief).toContain('relay-loopy(d2)（远端）');
-    expect(brief).toContain('--bot cli_relay:relay-loopy(d2):执行者');
-    const relaySpec = brief.split('\n').find((line) => line.includes('--bot cli_relay'))?.trim().replace(/^--bot\s+/, '');
+    expect(brief).toContain('--bot ou_relay_seen_by_codex:relay-loopy(d2):执行者');
+    const relaySpec = brief.split('\n').find((line) => line.includes('--bot ou_relay_seen_by_codex'))?.trim().replace(/^--bot\s+/, '');
     expect(parseDispatchBotSpec(relaySpec ?? '')).toEqual({
-      openId: 'cli_relay',
+      openId: 'ou_relay_seen_by_codex',
       name: 'relay-loopy(d2)',
       role: '执行者',
     });

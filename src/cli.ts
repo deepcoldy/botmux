@@ -33,7 +33,7 @@ import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { AskArgsError, parseAskOptions } from './core/ask-args.js';
-import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, buildReportText, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
+import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, buildReportText, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, type DispatchBot } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
 import { inspectLocalRepo, normalizeRepoRemote } from './core/repo-requirement.js';
 import { normalizeDispatchBotsForSender, resolveDispatchWorkerBotUnionIds, resolveDispatchWorkerMetas } from './core/dispatch-worker-meta.js';
@@ -41,6 +41,8 @@ import {
   A2A_CAPABILITY_DELIVERY_V1,
   A2A_CAPABILITY_DISPATCH_REPO_V1,
   evaluateDispatchReadiness,
+  isMentionableBotOpenId,
+  resolveDispatchMentionIdentities,
   type A2APeerCapability,
 } from './core/a2a-readiness.js';
 import {
@@ -103,6 +105,7 @@ import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { buildGoalStartBrief, buildGoalStartRetryCommand, resolveGoalStartInvitee, resolveGoalStartSelection, type GoalStartBot, type GoalStartTeam } from './cli/goal-start.js';
+import { mergeBotOpenIdCrossRef, readBotOpenIdCrossRefRecord } from './services/bot-openid-crossref-store.js';
 import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-liveness.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
@@ -7215,7 +7218,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  let bots;
+  let bots: DispatchBot[];
   try {
     bots = botSpecs.map(parseDispatchBotSpec);
   } catch (err: any) {
@@ -7258,11 +7261,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     const botInfoPath = join(resolveDataDir(), 'bots-info.json');
     if (existsSync(botInfoPath)) botInfoEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8'));
   } catch { /* best effort */ }
-  let senderScopedBotOpenIds: Record<string, string> = {};
-  try {
-    const crossRefPath = join(resolveDataDir(), `bot-openids-${appId}.json`);
-    if (existsSync(crossRefPath)) senderScopedBotOpenIds = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
-  } catch { /* best effort */ }
+  const senderScopedBotOpenIds = readBotOpenIdCrossRefRecord(resolveDataDir(), appId);
   bots = normalizeDispatchBotsForSender({
     bots,
     botInfoEntries,
@@ -7347,6 +7346,16 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   } catch { /* best effort: workers without botUnionId fall back to open_id auth */ }
   const hasWorkerBotUnionIds = workerBotUnionIds.some(Boolean);
   if (hasAfter) {
+    const unresolvedWorkers = built.mentionedOpenIds
+      .map((openId, index) => ({ openId, name: workerNames[index] ?? openId }))
+      .filter((worker) => !isMentionableBotOpenId(worker.openId));
+    if (unresolvedWorkers.length > 0) {
+      console.error(
+        `依赖任务登记失败: ${unresolvedWorkers.map((worker) => worker.name).join('、')} ` +
+        '还没有群内可 @ 的身份。请先用 botmux goal start 创建/核验目标群，或先直接派发一次完成身份同步。',
+      );
+      process.exit(1);
+    }
     if (!taskId) {
       console.error('--after 需要一个新任务号；请勿与 --standby 或 --into 同用。');
       process.exit(1);
@@ -7444,15 +7453,21 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }));
   const requiredCapabilities = taskId ? [A2A_CAPABILITY_DELIVERY_V1] : [];
   if (needsRepo) requiredCapabilities.push(A2A_CAPABILITY_DISPATCH_REPO_V1);
+  const dispatchWorkers = built.mentionedOpenIds.map((openId, index) => ({
+    openId,
+    name: workerNames[index] ?? openId,
+    larkAppId: workerLarkAppIds[index] || undefined,
+    cliId: workerCliIds[index] || undefined,
+    unionId: workerBotUnionIds[index] || undefined,
+    local: !!workerLarkAppIds[index] && localAppIds.has(workerLarkAppIds[index]),
+  }));
+  const mentionResolution = resolveDispatchMentionIdentities({
+    workers: dispatchWorkers,
+    membership,
+    peers,
+  });
   const readiness = evaluateDispatchReadiness({
-    workers: built.mentionedOpenIds.map((openId, index) => ({
-      openId,
-      name: workerNames[index] ?? openId,
-      larkAppId: workerLarkAppIds[index] || undefined,
-      cliId: workerCliIds[index] || undefined,
-      unionId: workerBotUnionIds[index] || undefined,
-      local: !!workerLarkAppIds[index] && localAppIds.has(workerLarkAppIds[index]),
-    })),
+    workers: dispatchWorkers,
     membership,
     peers,
     requiredCapabilities,
@@ -7461,12 +7476,37 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     const prefix = issue.severity === 'error' ? '❌' : '⚠️';
     console.error(`${prefix} ${issue.detail}`);
   }
+  const identityBlocked = readiness.issues.some((issue) => (
+    issue.code === 'mention_identity_unavailable'
+    || issue.code === 'mention_identity_ambiguous'
+    || issue.code === 'mention_identity_mismatch'
+  ));
+  if (identityBlocked) {
+    console.error('派活已停止：无法构造有效的机器人 @。请重新运行 goal start 核验群成员，不能用 --skip-readiness-check 绕过。');
+    process.exit(1);
+  }
   if (!readiness.ok && !skipReadinessCheck) {
     console.error('派活前检查未通过。请先把执行者加入目标群或升级对端；确认要绕过时使用 --skip-readiness-check。');
     process.exit(1);
   }
   if (!readiness.ok && skipReadinessCheck) {
     console.error('⚠️ 已按 --skip-readiness-check 继续派活；接收端仍会执行协议校验。');
+  }
+  bots = bots.map((bot, index) => ({ ...bot, openId: mentionResolution.workers[index]!.openId }));
+  built = buildDispatchMessages({
+    title: title.trim() || '子项目',
+    brief,
+    bots,
+    repoRequirement: needsRepo && taskId ? { taskId, repo: needsRepo } : undefined,
+  });
+  try {
+    mergeBotOpenIdCrossRef(resolveDataDir(), appId, mentionResolution.matches.flatMap((match, index) => {
+      if (!match.memberName || !isMentionableBotOpenId(match.openId)) return [];
+      const names = new Set([match.memberName, workerNames[index]].map((name) => name?.trim()).filter(Boolean));
+      return [...names].map((name) => ({ name: name!, openId: match.openId }));
+    }));
+  } catch (err: any) {
+    console.error(`⚠️ 已解析执行者身份，但本地身份缓存写入失败：${err?.message ?? err}`);
   }
   try {
     // --into: append into an existing thread (activate standby bots / coordinate).
@@ -8535,19 +8575,6 @@ async function cmdGoalStart(rest: string[]): Promise<void> {
     console.error('⚠️ 当前目标包含远端执行者，但没有项目仓库要求。如果这是代码任务，请传 --project <本地目录|Git remote>；非代码任务可继续。');
   }
 
-  const effectiveBrief = buildGoalStartBrief({
-    brief,
-    teamName: selection.team?.teamName,
-    supervisorName: selection.supervisor.name,
-    workers: selection.workers.map((worker) => ({
-      name: worker.name,
-      larkAppId: worker.larkAppId,
-      local: worker.local,
-    })),
-    localWorkingDir,
-    requiredRepo,
-  });
-
   let chatId = existingChatId;
   let groupCreated = false;
   let groupResult: any;
@@ -8556,35 +8583,7 @@ async function cmdGoalStart(rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  if (chatId) {
-    const { probeChatBotMembership } = await import('./im/lark/client.js');
-    let membership;
-    try {
-      membership = await probeChatBotMembership(selection.supervisor.larkAppId, chatId);
-    } catch (err: any) {
-      membership = { known: false as const, members: [] as [], reason: err?.message ?? String(err) };
-    }
-    const readiness = evaluateDispatchReadiness({
-      workers: [selection.supervisor, ...selection.workers].map((bot) => ({
-        openId: bot.openId ?? bot.larkAppId,
-        name: bot.name,
-        larkAppId: bot.larkAppId,
-        cliId: bot.cliId,
-        unionId: bot.unionId,
-        local: bot.local,
-      })),
-      membership,
-      peers: selection.team?.bots,
-    });
-    for (const issue of readiness.issues) console.error(`${issue.severity === 'error' ? '❌' : '⚠️'} ${issue.detail}`);
-    if (!readiness.ok && !skipReadinessCheck) {
-      console.error('目标群成员不完整，未启动监管者。请先把缺少的机器人加入群；确认要绕过时使用 --skip-readiness-check。');
-      process.exit(1);
-    }
-    if (!readiness.ok && skipReadinessCheck) {
-      console.error('⚠️ 已按 --skip-readiness-check 继续启动；后续派活和接收端仍会独立校验。');
-    }
-  } else {
+  if (!chatId) {
     const { getDeploymentIdentity } = await import('./services/deployment-identity.js');
     const invitee = resolveGoalStartInvitee({
       lastCallerOpenId: parent.lastCallerOpenId,
@@ -8650,6 +8649,103 @@ async function cmdGoalStart(rest: string[]): Promise<void> {
       return;
     }
   }
+
+  const { probeChatBotMembership } = await import('./im/lark/client.js');
+  const goalBots = [selection.supervisor, ...selection.workers];
+  const knownGoalBotOpenIds = readBotOpenIdCrossRefRecord(dataDir, selection.supervisor.larkAppId);
+  const knownGoalBotOpenIdByName = new Map(
+    Object.entries(knownGoalBotOpenIds).map(([name, openId]) => [name.trim().toLowerCase(), openId]),
+  );
+  const goalReadinessWorkers = goalBots.map((bot) => ({
+    // app_id is stable identity metadata, not a mention handle. The roster
+    // probe below must resolve every row into this supervisor app's ou_* scope.
+    openId: knownGoalBotOpenIdByName.get(bot.name.trim().toLowerCase())
+      ?? (bot.larkAppId === selection.supervisor.larkAppId ? bot.openId : undefined)
+      ?? bot.larkAppId,
+    name: bot.name,
+    larkAppId: bot.larkAppId,
+    cliId: bot.cliId,
+    unionId: bot.unionId,
+    local: bot.local,
+  }));
+  let membership;
+  let mentionResolution;
+  const probeAttempts = groupCreated ? 4 : 1;
+  for (let attempt = 0; attempt < probeAttempts; attempt++) {
+    try {
+      membership = await probeChatBotMembership(selection.supervisor.larkAppId, chatId!);
+    } catch (err: any) {
+      membership = { known: false as const, members: [] as [], reason: err?.message ?? String(err) };
+    }
+    mentionResolution = resolveDispatchMentionIdentities({
+      workers: goalReadinessWorkers,
+      membership,
+      peers: selection.team?.bots,
+    });
+    if (mentionResolution.issues.length === 0 || attempt === probeAttempts - 1) break;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
+  }
+  const readiness = evaluateDispatchReadiness({
+    workers: goalReadinessWorkers,
+    membership: membership!,
+    peers: selection.team?.bots,
+  });
+  for (const issue of readiness.issues) console.error(`${issue.severity === 'error' ? '❌' : '⚠️'} ${issue.detail}`);
+  const identityBlocked = readiness.issues.some((issue) => (
+    issue.code === 'mention_identity_unavailable'
+    || issue.code === 'mention_identity_ambiguous'
+    || issue.code === 'mention_identity_mismatch'
+  ));
+  if (identityBlocked || (!readiness.ok && !skipReadinessCheck)) {
+    const retryCommand = buildGoalStartRetryCommand({
+      chatId: chatId!, title, teamId: selection.team?.teamId, workers: selection.workers,
+      project: retryProject, brief, sessionId: sid, skipReadinessCheck,
+    });
+    console.error(identityBlocked
+      ? '目标群里无法解析出可用的机器人 @ 身份，未启动监管者；这个错误不能跳过。'
+      : '目标群成员不完整，未启动监管者。请先把缺少的机器人加入群；确认要绕过时使用 --skip-readiness-check。');
+    if (groupCreated) {
+      console.error(`群已保留，身份同步后续跑：${retryCommand}`);
+      console.log(JSON.stringify({
+        success: false,
+        stage: 'group_readiness',
+        chatId,
+        shareLink: groupResult?.shareLink,
+        readiness,
+        retryCommand,
+      }, null, 2));
+      process.exitCode = 1;
+      return;
+    }
+    process.exit(1);
+  }
+  if (!readiness.ok && skipReadinessCheck) {
+    console.error('⚠️ 已按 --skip-readiness-check 继续启动；后续派活和接收端仍会独立校验。');
+  }
+  try {
+    mergeBotOpenIdCrossRef(dataDir, selection.supervisor.larkAppId, mentionResolution!.matches.flatMap((match, index) => {
+      if (!match.memberName || !isMentionableBotOpenId(match.openId)) return [];
+      return [
+        { name: goalBots[index]!.name, openId: match.openId },
+        { name: match.memberName, openId: match.openId },
+      ];
+    }));
+  } catch (err: any) {
+    console.error(`⚠️ 群成员已核验，但本地身份缓存写入失败：${err?.message ?? err}`);
+  }
+  const effectiveBrief = buildGoalStartBrief({
+    brief,
+    teamName: selection.team?.teamName,
+    supervisorName: selection.supervisor.name,
+    workers: selection.workers.map((worker, index) => ({
+      name: worker.name,
+      larkAppId: worker.larkAppId,
+      mentionOpenId: mentionResolution!.workers[index + 1]!.openId,
+      local: worker.local,
+    })),
+    localWorkingDir,
+    requiredRepo,
+  });
 
   if (selection.team) {
     const { recordTeamGroup } = await import('./services/team-groups-store.js');
