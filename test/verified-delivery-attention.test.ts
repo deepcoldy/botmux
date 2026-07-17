@@ -51,6 +51,17 @@ describe('classifyTaskDisposition — the shared pure rule', () => {
     expect(classifyTaskDisposition(task('cancelled'))).toEqual({ bucket: 'quiet', reason: 'cancelled', next: '已取消' });
   });
 
+  it('planned stays quiet unless the caller supplies a release risk', () => {
+    expect(classifyTaskDisposition(task('planned')).reason).toBe('waiting_dependencies');
+    expect(classifyTaskDisposition(task('planned'), {
+      releaseRisks: new Map([['x', {
+        bucket: 'systemRisk' as const,
+        reason: 'release:definite',
+        next: '自动派发失败，修复后重试',
+      }]]),
+    })).toEqual({ bucket: 'systemRisk', reason: 'release:definite', next: '自动派发失败，修复后重试' });
+  });
+
   it('dispatched → inProgress; rejected → inProgress (not terminal, retrying)', () => {
     expect(classifyTaskDisposition(task('dispatched'))).toMatchObject({ bucket: 'inProgress', reason: 'dispatched' });
     expect(classifyTaskDisposition(task('rejected'))).toMatchObject({ bucket: 'inProgress', reason: 'rejected_retrying' });
@@ -163,6 +174,70 @@ describe('buildGoalAttentionBoard — cross-goal rollup', () => {
     expect(b.systemRisk[0].disposition.reason).toBe('reassign_budget_exhausted');
     expect(b.inProgress.map((t) => t.taskId)).toEqual(['t-ok']); // unaffected task stays inProgress
     expect(b.counts).toMatchObject({ systemRisk: 1, inProgress: 1 });
+  });
+
+  it('carries release diagnostics onto the system-risk row', () => {
+    const led = openLedger({ baseDir });
+    led.append(draft({
+      type: 'TaskDispatched', taskId: 't-up', chatId: 'oc_g', idempotencyKey: 'd:up', ts: T(0),
+      payload: { taskId: 't-up' },
+    }));
+    led.append(draft({
+      type: 'TaskPlanned', taskId: 't-down', chatId: 'oc_g', idempotencyKey: 'planned:t-down', ts: T(1),
+      payload: {
+        taskId: 't-down', chatId: 'oc_g', title: 'Downstream', dependsOnTaskIds: ['t-up'], planGeneration: 1,
+        dispatchSpec: {
+          title: 'Downstream', briefBase: 'continue',
+          workers: [{ openId: 'ou_worker', name: 'Worker', role: 'coder' }],
+          senderLarkAppId: 'cli_supervisor',
+        },
+        plannedBy: 'ou_supervisor',
+      },
+    }));
+    const b = buildGoalAttentionBoard({
+      baseDir,
+      context: {
+        releaseRisks: new Map([['t-down', {
+          bucket: 'systemRisk', reason: 'release:definite', next: '自动派发失败',
+          detail: '执行者不在群', releaseId: 'rel1-test', upstreamTaskId: 't-up', occurredAt: T(5),
+        }]]),
+      },
+    });
+    expect(b.systemRisk[0]).toMatchObject({
+      taskId: 't-down', riskDetail: '执行者不在群', releaseId: 'rel1-test', upstreamTaskId: 't-up',
+      lastActivityAt: T(5),
+    });
+  });
+
+  it('shows how many planned downstream tasks an escalated upstream is holding', () => {
+    const led = openLedger({ baseDir });
+    led.append(draft({
+      type: 'TaskDispatched', taskId: 't-up', chatId: 'oc_g', idempotencyKey: 'd:up', ts: T(0),
+      payload: { taskId: 't-up', title: 'Upstream' },
+    }));
+    led.append(draft({
+      type: 'TaskEscalated', taskId: 't-up', chatId: 'oc_g', idempotencyKey: 'e:up', ts: T(1),
+      payload: { taskId: 't-up', reason: '需要人决定' },
+    }));
+    for (const taskId of ['t-down-1', 't-down-2']) {
+      led.append(draft({
+        type: 'TaskPlanned', taskId, chatId: 'oc_g', idempotencyKey: `planned:${taskId}`, ts: T(2),
+        payload: {
+          taskId, chatId: 'oc_g', title: taskId, dependsOnTaskIds: ['t-up'], planGeneration: 1,
+          dispatchSpec: {
+            title: taskId,
+            briefBase: 'continue',
+            workers: [{ openId: 'ou_worker', name: 'Worker', role: 'coder' }],
+            senderLarkAppId: 'cli_supervisor',
+          },
+          plannedBy: 'ou_supervisor',
+        },
+      }));
+    }
+
+    expect(buildGoalAttentionBoard({ baseDir }).needsHuman[0]).toMatchObject({
+      taskId: 't-up', affectedDownstreamCount: 2,
+    });
   });
 
   it('carries the required repo onto a missing-project attention row', () => {

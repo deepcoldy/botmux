@@ -42,6 +42,21 @@ export type ClaimReadyPlanResult =
   | { result: 'not-ready' }
   | { result: 'stale' };
 
+export interface ClaimRetryReleaseInput {
+  taskId: string;
+  expectedReleaseId: string;
+  approvedBy: string;
+  ts: number;
+  intent: TaskDispatchIntentPayload;
+}
+
+export type ClaimRetryReleaseResult =
+  | { result: 'created'; intent: LedgerEvent }
+  | { result: 'open-intent'; intent: LedgerEvent }
+  | { result: 'already-dispatched' }
+  | { result: 'not-retryable' }
+  | { result: 'stale' };
+
 export interface LedgerHandle {
   /** Append an event; same idempotencyKey twice ⇒ second is a no-op. */
   append(draft: LedgerEventDraft): { event: LedgerEvent; deduped: boolean };
@@ -57,7 +72,11 @@ export interface LedgerHandle {
   readInlineEvidence(ref: string): string;
   /** Atomically claim one ready dependency-gated task. Network I/O happens later. */
   claimReadyPlan(input: ClaimReadyPlanInput): ClaimReadyPlanResult;
+  /** Atomically supersede a failed/expired release with attempt+1. */
+  claimRetryRelease(input: ClaimRetryReleaseInput): ClaimRetryReleaseResult;
 }
+
+export const TASK_RELEASE_AUTO_RETRY_WINDOW_MS = 55 * 60_000;
 
 export function deriveTaskReleaseId(
   planEventId: string,
@@ -646,6 +665,69 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
     });
   }
 
+  function claimRetryRelease(input: ClaimRetryReleaseInput): ClaimRetryReleaseResult {
+    const draft: LedgerEventDraft = {
+      type: 'TaskDispatchIntent',
+      actor: 'orchestrator',
+      taskId: input.taskId,
+      chatId: input.intent.goalChatId,
+      idempotencyKey: `intent:${input.intent.releaseId}`,
+      ts: input.ts,
+      payload: input.intent,
+    };
+    const invariant = validateLedgerEventDraft(draft);
+    if (invariant.errors.length > 0) {
+      throw new Error(`verified-delivery ledger invariant violation: ${invariant.errors.join('; ')}`);
+    }
+
+    return withLock(() => {
+      const existing = read();
+      const state = materialize(existing);
+      const current = state.get(input.taskId);
+      if (!current) return { result: 'not-retryable' };
+      if (current.status !== 'planned') {
+        return current.plan && current.status !== 'cancelled'
+          ? { result: 'already-dispatched' }
+          : { result: 'not-retryable' };
+      }
+      const pending = current.pendingRelease;
+      if (!current.plan || !pending) return { result: 'not-retryable' };
+      if (pending.releaseId !== input.expectedReleaseId) return { result: 'stale' };
+      const approvedBy = input.approvedBy.trim();
+      if (!approvedBy || input.intent.releasedBy !== approvedBy) return { result: 'not-retryable' };
+      if (
+        pending.failure?.failureClass !== 'definite' &&
+        input.ts - pending.intentAt < TASK_RELEASE_AUTO_RETRY_WINDOW_MS
+      ) {
+        return { result: 'not-retryable' };
+      }
+
+      const satisfiedBy: TaskReleaseDependency[] = [];
+      for (const dependencyId of current.plan.dependsOnTaskIds) {
+        const dependency = state.get(dependencyId);
+        if (dependency?.status !== 'accepted' || !dependency.acceptedEventId) {
+          return { result: 'not-retryable' };
+        }
+        satisfiedBy.push({ taskId: dependencyId, acceptedEventId: dependency.acceptedEventId });
+      }
+      const intent = input.intent;
+      const acceptedEventIds = satisfiedBy.map((dependency) => dependency.acceptedEventId);
+      if (
+        intent.attempt !== pending.attempt + 1 ||
+        intent.releaseId !== deriveTaskReleaseId(current.plan.planEventId, acceptedEventIds, intent.attempt) ||
+        intent.planEventId !== current.plan.planEventId ||
+        !intentMatchesCurrentPlan(current, intent, satisfiedBy)
+      ) {
+        return { result: 'stale' };
+      }
+
+      const duplicate = existing.find((event) => event.idempotencyKey === draft.idempotencyKey);
+      if (duplicate) return { result: 'open-intent', intent: duplicate };
+      const event = appendUnlocked(existing, draft);
+      return { result: 'created', intent: event };
+    });
+  }
+
   function writeInlineEvidence(content: string, name?: string): Extract<Evidence, { kind: 'inline' }> {
     ensureDirs();
     const bytes = Buffer.byteLength(content, 'utf-8');
@@ -673,5 +755,6 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
     writeInlineEvidence,
     readInlineEvidence,
     claimReadyPlan,
+    claimRetryRelease,
   };
 }

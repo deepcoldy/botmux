@@ -150,6 +150,8 @@ describe('daemon session-scoped IPC route wiring', () => {
       '/api/goal/supervise',
       '/api/goal/notify-parent',
       '/api/goal/watchdog',
+      '/api/goal/release-check',
+      '/api/goal/release-action',
     ]) {
       expect(ipcServerSource).toContain(`pathname === '${path}'`);
     }
@@ -193,5 +195,32 @@ describe('daemon session-scoped IPC route wiring', () => {
     expect(authAt).toBeGreaterThanOrEqual(0);
     expect(fanoutAt).toBeGreaterThan(authAt);
     expect(route).toContain('caller.chatId !== goalChatId');
+  });
+
+  it('allows only the owning goal supervisor to confirm or retry a planned release', () => {
+    const route = between(
+      "ipcRoute('POST', '/api/goal/release-action'",
+      "ipcRoute('POST', '/api/goal/release-check'",
+    );
+    const authAt = route.indexOf('authorizeGoalSessionIpc(req, caller, raw)');
+    const mutateAt = route.indexOf('confirmTaskRelease({');
+    expect(authAt).toBeGreaterThanOrEqual(0);
+    expect(mutateAt).toBeGreaterThan(authAt);
+    expect(route).toContain("caller.session.goalSupervisor?.goalChatId !== task.chatId");
+    expect(route).toContain("error: 'goal_supervisor_required'");
+    expect(route).toContain("error: 'wrong_release_owner'");
+  });
+
+  it('authenticates a session-scoped release-check before host fan-out', () => {
+    const route = between(
+      "ipcRoute('POST', '/api/goal/release-check'",
+      "ipcRoute('POST', '/api/goal/watchdog'",
+    );
+    const authAt = route.indexOf('authorizeGoalSessionIpc(req, caller, raw)');
+    const fanoutAt = route.indexOf('triggerGoalReleaseAcrossDaemons({');
+    expect(authAt).toBeGreaterThanOrEqual(0);
+    expect(fanoutAt).toBeGreaterThan(authAt);
+    expect(route).toContain('caller.chatId !== goalChatId');
+    expect(route).toContain('if (!isTrustedHostIpcRequest(req))');
   });
 });

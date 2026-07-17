@@ -35,7 +35,7 @@ interface BoardTask {
 }
 interface BoardNarration { goalChatId: string; type: string; taskId?: string; text: string; ts: number }
 interface GoalNotificationRetryRecord {
-  id: string; ownerLarkAppId: string; kind: 'human-attention' | 'completion-confirm'; status?: 'pending' | 'dead';
+  id: string; ownerLarkAppId: string; kind: 'human-attention' | 'completion-confirm'; status?: 'pending' | 'sent' | 'dead';
   goalChatId: string; goalTitle?: string; taskId?: string; taskTitle?: string; summary: string; attentionKind?: string; attentionReason?: string;
   attempts: number; nextAttemptAt: number; lastError?: string; deadAt?: number; deadReason?: string; createdAt: number; updatedAt: number;
 }
@@ -64,6 +64,8 @@ interface AttnTask {
   // tasks (an escalation materialized without one) — keep it optional and guard.
   goalChatId: string; goalTitle?: string; taskId?: string; title?: string;
   workerNames?: string[]; requiredRepo?: string; disposition: AttnDisposition; lastActivityAt?: number;
+  affectedDownstreamCount?: number;
+  riskDetail?: string; releaseId?: string; upstreamTaskId?: string;
   recentEvidence?: AttnEvidence;
   // present only on live-probe systemRisk rows (IPC enrichment, not a ledger fact):
   source?: 'ledger' | 'live'; liveKind?: string; liveDetail?: string; sessionId?: string; larkAppId?: string;
@@ -376,7 +378,7 @@ function narrationsHtml(g: BoardGoal): string {
 }
 
 function notificationRetriesHtml(records: GoalNotificationRetryRecord[]): string {
-  const visible = records.filter(r => (r.status === 'dead') || r.attempts > 0 || r.lastError);
+  const visible = records.filter(r => r.status !== 'sent' && ((r.status === 'dead') || r.attempts > 0 || r.lastError));
   if (!visible.length) return '';
   return `<div class="gb-retries">
     <div class="gb-retries-head">⚠️ 关键通知投递异常 <span>${visible.length} 条</span></div>
@@ -463,11 +465,17 @@ function attnRow(t: AttnTask): string {
         : '<span class="attn-src attn-src-ledger" title="交付记录/存储派生，稳态事实">📒 记录</span>')
     : '';
   const missingRepo = t.disposition.reason === 'help:missing_repo';
+  const releaseDefinite = t.disposition.reason === 'release:definite';
+  const releaseAmbiguous = t.disposition.reason === 'release:ambiguous_expired';
+  const dependencyRisk = t.disposition.reason.startsWith('dependency:');
   // 缺项目环境的行没有提交摘要可看——把「缺哪个项目」放进摘要槽，比 blocker 原文更省读。
   const sum = missingRepo && t.requiredRepo
     ? `缺少项目：${t.requiredRepo}`
-    : t.recentEvidence?.latestSummary;
+    : t.riskDetail ?? t.recentEvidence?.latestSummary;
   const ev = sum ? `<span class="attn-ev" title="${escapeHtml(sum)}">${escapeHtml(sum.length > 56 ? sum.slice(0, 56) + '…' : sum)}</span>` : '';
+  const impact = t.affectedDownstreamCount
+    ? `<span class="attn-ev" title="当前有 ${t.affectedDownstreamCount} 个后续任务在等待">影响 ${t.affectedDownstreamCount} 个后续</span>`
+    : '';
   const task = t.taskId
     ? `<span class="attn-task">${escapeHtml(t.title || shortId(t.taskId))}</span>`
     : '<span class="attn-task attn-task-none">—</span>';
@@ -484,6 +492,9 @@ function attnRow(t: AttnTask): string {
   // 一键动作（真动作，区别于轻量唤醒）：走既有「下发决策」通道注入 [panel-action v1]，
   // 由监管者查交付记录后执行真命令并留痕——dashboard 不直接写账、不直接派活。
   const panelActs: Array<[string, string]> = !t.taskId ? []
+    : releaseAmbiguous ? [['confirm-release', '确认已派'], ['retry-release', '重试派发'], ['escalate-human', '升级给人']]
+    : releaseDefinite ? [['retry-release', '重试派发'], ['escalate-human', '升级给人']]
+    : dependencyRisk ? [['resolve-dependency', '处理依赖'], ['escalate-human', '升级给人']]
     : t.disposition.bucket === 'systemRisk' ? [['reassign-worker', '重派'], ['escalate-human', '升级给人']]
     // 缺项目环境有明确处置分支：准备环境（走求助处理）/ 换有环境的执行者 / 升级给人
     : missingRepo ? [['resolve-help', '准备环境'], ['switch-worker', '换执行者'], ['escalate-human', '升级给人']]
@@ -495,7 +506,7 @@ function attnRow(t: AttnTask): string {
   return `<div class="attn-row-wrap attn-${escapeHtml(t.disposition.bucket)}">
   <button type="button" class="attn-row" data-goal="${escapeHtml(t.goalChatId)}" data-task="${escapeHtml(t.taskId ?? '')}" title="${escapeHtml(title)}">
     <span class="attn-next">${escapeHtml(t.disposition.next)}</span>
-    ${task}<span class="attn-goal">${goal}</span>${who}${src}${ev}
+    ${task}<span class="attn-goal">${goal}</span>${who}${src}${impact}${ev}
     <span class="attn-age">${t.lastActivityAt ? fmtTs(t.lastActivityAt) : ''}</span>
   </button>${action}</div>`;
 }
@@ -652,6 +663,9 @@ export function renderGoalsPage(root: HTMLElement): () => void {
     'switch-worker': { instruction: '请换一个可用执行者重新派发，并在交付记录里写清原因。' },
     'escalate-human': { instruction: '请走正式「升级给人」流程（delivery escalate），附清楚背景；能预判方向就带上推荐选项。' },
     'resolve-help': { instruction: '请处理该执行者的求助：能定的直接给处置指示，不能定的再升级给人。' },
+    'confirm-release': { instruction: '先核对群历史，只有确认原派发消息确实已送达时，才运行 botmux delivery release-confirm --task <taskId>；拿不准就不要确认。' },
+    'retry-release': { instruction: '先修复派发失败原因并确认可能重复消息的风险，再运行 botmux delivery release-retry --task <taskId>。' },
+    'resolve-dependency': { instruction: '请检查该任务的上游依赖：上游取消时决定取消后续或另建任务；上游驳回滞留时推动补交、重派或升级给人，并留下交付记录。' },
   };
   // 缺项目环境（reason=help:missing_repo）时给更对症的指令；<repo> 由 data-repo 填充。
   const MISSING_REPO_INSTRUCTION: Record<string, string> = {
@@ -666,9 +680,9 @@ export function renderGoalsPage(root: HTMLElement): () => void {
     if (!goal || !task || !meta) return;
     const reason = btn.dataset.reason || '看板一键动作';
     const override = reason === 'help:missing_repo' ? MISSING_REPO_INSTRUCTION[act] : undefined;
-    const instruction = override
+    const instruction = (override
       ? override.replace('<repo>', btn.dataset.repo || '（见任务求助记录）')
-      : meta.instruction;
+      : meta.instruction).replaceAll('<taskId>', task);
     const text = [
       '[panel-action v1]',
       `action: ${act}`,

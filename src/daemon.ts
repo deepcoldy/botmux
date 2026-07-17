@@ -30,7 +30,7 @@ import { sendRestartReportIfPending } from './core/restart-report.js';
 import { classifyGoalWorkerHealth, type GoalWorkerProcessState, type GoalWorkerSessionState } from './core/goal-worker-health.js';
 import { countGoalWorkerReassignAttempts, DEFAULT_GOAL_WORKER_REASSIGN_MAX_ATTEMPTS, latestTaskDispatchEvent } from './core/goal-reassign-budget.js';
 import { statSync } from 'node:fs';
-import { addReaction, getChatMode, getMessageChatId, listChatBotMembers, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { addReaction, getChatMode, getMessageChatId, listChatBotMembers, listChatMemberOpenIds, MessageWithdrawnError, probeChatBotMembership, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigs,
@@ -64,8 +64,10 @@ import { normalizeGoalDecisionOptions, type GoalDecisionOption } from './service
 import { getGoalChat } from './services/goal-chat-store.js';
 import {
   listDueGoalNotificationRetries,
+  listGoalNotificationRetries,
   markGoalNotificationRetryAttempt,
   markGoalNotificationRetryDead,
+  markGoalNotificationRetrySent,
   removeGoalNotificationRetry,
   upsertGoalNotificationRetry,
   type GoalNotificationRetryRecord,
@@ -272,10 +274,31 @@ import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js';
 import { emitGoalNarration } from './verified-delivery/narration.js';
 import { openLedger } from './verified-delivery/ledger.js';
+import {
+  confirmTaskRelease,
+  retryTaskRelease,
+  runGoalReleaseCheck,
+  type ReleaseEngineDeps,
+  type TaskReleaseResult,
+} from './verified-delivery/release-engine.js';
+import {
+  deriveTaskReleaseRisks,
+  resolveRejectedDependencyStallMs,
+  taskReleaseRiskNotificationId,
+  type TaskReleaseRisk,
+} from './verified-delivery/release-risk.js';
 import { detectUnsupportedDeliveryEnvelope, formatHelpEnvelope, parseDeliveryEnvelope } from './verified-delivery/envelope.js';
 import { ingestParsedDeliveryEnvelope } from './verified-delivery/envelope-ingest.js';
 import { detectUnsupportedDispatchRepoRequirement, formatDispatchRepoRequirement, inspectLocalRepoAsync, parseDispatchRepoRequirement, resolveRepoRequirement } from './core/repo-requirement.js';
 import { buildMissingRepoBlocker } from './core/repo-help.js';
+import {
+  A2A_CAPABILITY_DELIVERY_V1,
+  A2A_CAPABILITY_DISPATCH_REPO_V1,
+  evaluateDispatchReadiness,
+  type A2APeerCapability,
+} from './core/a2a-readiness.js';
+import { buildFederatedRoster } from './services/federation-roster.js';
+import { listPlatformTeams } from './services/platform-team-store.js';
 import {
   DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
   injectGoalSupervisorTurn,
@@ -2227,6 +2250,141 @@ const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
 let currentDaemonLarkAppId = '';
 const goalWatchdogRetryTimers = new Map<string, NodeJS.Timeout>();
 const goalParentReplyRoutes: Map<string, number> = new BoundedMap(1000);
+const goalReleaseChecksInFlight = new Set<string>();
+
+function collectA2AReleasePeers(): A2APeerCapability[] {
+  const peers: A2APeerCapability[] = [];
+  try {
+    for (const bot of buildFederatedRoster(config.session.dataDir).bots) {
+      peers.push({
+        larkAppId: bot.larkAppId,
+        unionId: bot.botUnionId,
+        name: bot.name,
+        cliId: bot.cliId,
+        botmuxVersion: bot.botmuxVersion,
+        a2aCapabilities: bot.a2aCapabilities,
+      });
+    }
+  } catch (err) {
+    logger.warn(`[goal-release] federation roster unavailable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    const localByAppId = new Map(getAllBots().map((bot) => [bot.config.larkAppId, bot.config]));
+    for (const team of listPlatformTeams(config.session.dataDir)) {
+      for (const bot of team.bots) {
+        const local = localByAppId.get(bot.appId);
+        peers.push({
+          larkAppId: bot.appId,
+          unionId: bot.unionId,
+          name: bot.name?.trim() || local?.displayName || local?.cliId || bot.appId,
+          cliId: local?.cliId,
+          botmuxVersion: bot.botmuxVersion,
+          a2aCapabilities: bot.a2aCapabilities,
+        });
+      }
+    }
+  } catch (err) {
+    logger.warn(`[goal-release] platform roster unavailable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return peers;
+}
+
+function createGoalReleaseEngineDeps(): ReleaseEngineDeps {
+  return {
+    ledger: openLedger(),
+    now: () => Date.now(),
+    releasedBy: `daemon:${currentDaemonLarkAppId}`,
+    checkReadiness: async (_task, pending) => {
+      let membership;
+      try {
+        membership = await probeChatBotMembership(pending.senderLarkAppId, pending.goalChatId);
+      } catch (err) {
+        membership = {
+          known: false as const,
+          members: [] as [],
+          reason: err instanceof Error ? err.message : String(err),
+        };
+      }
+      const localAppIds = new Set(getAllBots().map((bot) => bot.config.larkAppId));
+      const requiredCapabilities = [A2A_CAPABILITY_DELIVERY_V1];
+      if (pending.frozenDispatchedPayload.requiredRepo) {
+        requiredCapabilities.push(A2A_CAPABILITY_DISPATCH_REPO_V1);
+      }
+      const readiness = evaluateDispatchReadiness({
+        workers: pending.frozenWorkerSpecs.map((worker) => ({
+          openId: worker.openId,
+          name: worker.name?.trim() || worker.openId,
+          larkAppId: worker.larkAppId,
+          cliId: worker.cliId,
+          unionId: worker.unionId,
+          local: !!worker.larkAppId && localAppIds.has(worker.larkAppId),
+        })),
+        membership,
+        peers: collectA2AReleasePeers(),
+        requiredCapabilities,
+      });
+      for (const issue of readiness.issues) {
+        const log = issue.severity === 'error' ? logger.warn.bind(logger) : logger.info.bind(logger);
+        log(`[goal-release] readiness ${issue.severity} task=${pending.frozenDispatchedPayload.taskId} code=${issue.code} detail=${issue.detail}`);
+      }
+      return readiness;
+    },
+    send: ({ larkAppId, chatId, text, uuid, recovery }) =>
+      sendMessage(larkAppId, chatId, text, 'text', uuid, undefined, { suppressHook: recovery }),
+  };
+}
+
+function goalHasPlannedDependent(goalChatId: string, upstreamTaskId: string): boolean {
+  return openLedger().tasks(goalChatId).some((task) =>
+    task.status === 'planned' && task.plan?.dependsOnTaskIds.includes(upstreamTaskId));
+}
+
+async function runGoalReleaseCheckOnThisDaemon(
+  goalChatId: string,
+  mode: 'trigger' | 'recovery',
+  reason: string,
+): Promise<TaskReleaseResult[]> {
+  if (!currentDaemonLarkAppId || isGoalPanelApp(currentDaemonLarkAppId)) return [];
+  if (goalReleaseChecksInFlight.has(goalChatId)) return [];
+  goalReleaseChecksInFlight.add(goalChatId);
+  try {
+    const results = await runGoalReleaseCheck({
+      goalChatId,
+      ownerLarkAppId: currentDaemonLarkAppId,
+      mode,
+      deps: createGoalReleaseEngineDeps(),
+    });
+    const ledger = openLedger();
+    const risks = deriveTaskReleaseRisks({
+      tasks: ledger.tasks(goalChatId),
+      events: ledger.read(),
+      now: Date.now(),
+      rejectedStallMs: resolveRejectedDependencyStallMs(process.env.BOTMUX_A2A_DEP_REJECTED_STALL_MS),
+    });
+    for (const risk of risks) {
+      await notifyGoalReleaseRiskBestEffort(risk);
+    }
+    const changed = results.filter((result) => !['not-ready', 'open-intent', 'already-dispatched'].includes(result.outcome));
+    if (changed.length > 0) {
+      logger.info(`[goal-release] goal=${goalChatId} reason=${reason} results=${changed.map((result) => `${result.taskId}:${result.outcome}`).join(',')}`);
+    }
+    return results;
+  } finally {
+    goalReleaseChecksInFlight.delete(goalChatId);
+  }
+}
+
+async function runAllGoalReleaseChecksOnThisDaemon(reason: string): Promise<void> {
+  if (!currentDaemonLarkAppId || isGoalPanelApp(currentDaemonLarkAppId)) return;
+  const goalChatIds = new Set(
+    openLedger().tasks()
+      .filter((task) => task.status === 'planned' && task.chatId && task.plan?.dispatchSpec.senderLarkAppId === currentDaemonLarkAppId)
+      .map((task) => task.chatId!),
+  );
+  for (const goalChatId of goalChatIds) {
+    await runGoalReleaseCheckOnThisDaemon(goalChatId, 'recovery', reason);
+  }
+}
 
 function parsePositiveIntEnv(name: string): number {
   const raw = process.env[name];
@@ -2667,6 +2825,11 @@ async function runGoalWatchdogForGoalOnThisDaemon(goalChatId: string, reason: st
     onReviveFailure: handleGoalReviveFailure,
     workerHealthFacts: buildWorkerHealthFacts,
     reassignDeadWorker: reassignDeadGoalWorker,
+    onAccepted: ({ taskId, goalChatId: acceptedGoalChatId }) => {
+      if (!acceptedGoalChatId || !goalHasPlannedDependent(acceptedGoalChatId, taskId)) return;
+      void runGoalReleaseCheckOnThisDaemon(acceptedGoalChatId, 'trigger', `reconcile-accepted:${taskId}`)
+        .catch((err: any) => logger.warn(`[goal-release] reconcile trigger failed: ${err?.message ?? err}`));
+    },
   });
   if (shouldRetryGoalWatchdog(results)) scheduleGoalWatchdogRetry(goalChatId, reason);
   const injected = countGoalWatchdogStatus(results, 'injected');
@@ -2679,6 +2842,36 @@ async function runGoalWatchdogForGoalOnThisDaemon(goalChatId: string, reason: st
     logger.info(`[goal-watchdog] event result goal=${goalChatId} reason=${reason} injected=${injected} reconciled=${reconciled} revived=${revived} reassigned=${reassigned} busy=${busy} rateLimited=${rateLimited}`);
   }
   return results;
+}
+
+async function triggerGoalReleaseAcrossDaemons(input: {
+  goalChatId: string;
+  reason: string;
+}): Promise<{ contacted: number; results: TaskReleaseResult[] }> {
+  const daemons = listOnlineDaemons();
+  let contacted = 0;
+  const results: TaskReleaseResult[] = [];
+  await Promise.all(daemons.map(async (daemon) => {
+    const ctrl = new AbortController();
+    const tt = setTimeout(() => ctrl.abort(), 3_000);
+    try {
+      const response = await fetchDaemonIpc(daemon.ipcPort, '/api/goal/release-check', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(input),
+        signal: ctrl.signal,
+      });
+      contacted++;
+      if (!response.ok) return;
+      const body = await response.json().catch(() => null) as { results?: TaskReleaseResult[] } | null;
+      if (Array.isArray(body?.results)) results.push(...body.results);
+    } catch {
+      // Daemon descriptors are best-effort; periodic recovery remains authoritative.
+    } finally {
+      clearTimeout(tt);
+    }
+  }));
+  return { contacted, results };
 }
 
 async function triggerGoalWatchdogAcrossDaemons(input: {
@@ -4894,6 +5087,58 @@ async function sendGoalHumanAttention(input: {
   return result;
 }
 
+async function notifyGoalReleaseRiskBestEffort(risk: TaskReleaseRisk): Promise<void> {
+  const goalChatId = risk.goalChatId;
+  if (!goalChatId) return;
+  const id = taskReleaseRiskNotificationId(risk);
+  if (!id) return;
+  if (listGoalNotificationRetries().some((record) => record.id === id)) return;
+  const supervisor = findGoalSupervisorForNotify({ goalChatId });
+  const parent = findActiveSessionById(supervisor?.session.goalSupervisor?.parentSessionId);
+  const isDefinite = risk.kind === 'release_definite';
+  const isAmbiguous = risk.kind === 'release_ambiguous_expired';
+  const reason = risk.detail ? `${risk.next}：${risk.detail}` : risk.next;
+  const summary = isDefinite
+    ? `任务 ${risk.taskId} 没有派发成功。请先修复原因，再选择“重试派发”或升级给人。`
+    : isAmbiguous
+      ? `任务 ${risk.taskId} 的派发结果无法确认。请先查目标群历史，再选择“确认已派”或“重试派发”。`
+      : `任务 ${risk.taskId} 的上游依赖需要处理：${risk.next}。`;
+  const record = retryRecordFromHumanAttention({
+    parent,
+    supervisor,
+    taskId: risk.taskId,
+    summary,
+    attentionKind: risk.reason,
+    attentionReason: reason,
+    decisionOptions: isDefinite
+      ? [
+          { key: 'retry-release', label: '修复后重试派发', recommended: true },
+          { key: 'escalate-human', label: '升级给人' },
+        ]
+      : isAmbiguous ? [
+          { key: 'confirm-release', label: '确认已派' },
+          { key: 'retry-release', label: '重试派发', recommended: true },
+          { key: 'escalate-human', label: '升级给人' },
+        ] : [
+          { key: 'resolve-dependency', label: '处理依赖', recommended: true },
+          { key: 'escalate-human', label: '升级给人' },
+        ],
+  });
+  if (!record) {
+    logger.warn(`[goal-release] cannot notify parent goal=${goalChatId} task=${risk.taskId}: missing supervisor/parent coordinates`);
+    return;
+  }
+  const retained = upsertGoalNotificationRetry({ ...record, id, retainOnSuccess: true, nextAttemptAt: Date.now() });
+  const result = await sendGoalHumanAttentionRecord(retained);
+  if (result.sent) {
+    markGoalNotificationRetrySent(id);
+    logger.info(`[goal-release] notified human goal=${goalChatId} task=${risk.taskId} risk=${risk.kind}`);
+  } else {
+    upsertGoalNotificationRetry({ ...retained, status: 'pending', lastError: result.error });
+    logger.warn(`[goal-release] queued human notification goal=${goalChatId} task=${risk.taskId}: ${result.error}`);
+  }
+}
+
 function buildGoalCompletionConfirmCard(input: {
   ownerOpenId?: string;
   goalTitle?: string;
@@ -5021,7 +5266,8 @@ async function processGoalNotificationRetries(): Promise<void> {
       ? await sendGoalHumanAttentionRecord(record)
       : await sendGoalCompletionConfirmationRecord(record);
     if (result.sent) {
-      removeGoalNotificationRetry(record.id);
+      if (record.retainOnSuccess) markGoalNotificationRetrySent(record.id);
+      else removeGoalNotificationRetry(record.id);
       logger.info(`[goal-notification-retry] delivered ${record.kind} id=${record.id} goal=${record.goalChatId}`);
       continue;
     }
@@ -5442,6 +5688,99 @@ ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
     return jsonRes(res, 200, { ...result, attentionRaised, humanNotified, humanNotifyError, completionCardSent, completionCardError });
   } catch (err: any) {
     logger.warn(`[goal-notify-parent] IPC failed: ${err?.message ?? err}`);
+    return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
+});
+
+// Session-scoped manual recovery for an expired/definite planned release. The
+// caller must be the active goal supervisor session on the frozen sender daemon.
+ipcRoute('POST', '/api/goal/release-action', async (req, res) => {
+  let raw: {
+    taskId?: unknown;
+    action?: unknown;
+    by?: unknown;
+    callerSessionId?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+  };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const taskId = typeof raw.taskId === 'string' ? raw.taskId.trim() : '';
+  const action = raw.action === 'confirm' || raw.action === 'retry' ? raw.action : '';
+  const by = typeof raw.by === 'string' ? raw.by.trim() : '';
+  const callerSessionId = typeof raw.callerSessionId === 'string' ? raw.callerSessionId.trim() : '';
+  if (!taskId || !action || !by || !callerSessionId) {
+    return jsonRes(res, 400, { ok: false, error: 'taskId, action, by and callerSessionId are required' });
+  }
+  const caller = findActiveSessionById(callerSessionId);
+  const verified = authorizeGoalSessionIpc(req, caller, raw);
+  const ledger = openLedger();
+  const task = ledger.task(taskId);
+  if (!verified.ok || !caller || !task?.chatId || caller.chatId !== task.chatId) {
+    return jsonRes(res, 403, { ok: false, error: verified.ok ? 'origin_unproven' : verified.error });
+  }
+  if (caller.session.goalSupervisor?.goalChatId !== task.chatId) {
+    return jsonRes(res, 403, { ok: false, error: 'goal_supervisor_required' });
+  }
+  if (task.plan?.dispatchSpec.senderLarkAppId !== currentDaemonLarkAppId) {
+    return jsonRes(res, 409, { ok: false, error: 'wrong_release_owner' });
+  }
+  try {
+    const result = action === 'confirm'
+      ? confirmTaskRelease({ ledger, taskId, confirmedBy: by, now: Date.now() })
+      : await retryTaskRelease({ taskId, approvedBy: by, deps: createGoalReleaseEngineDeps() });
+    return jsonRes(res, 200, { ok: true, result });
+  } catch (err: any) {
+    logger.warn(`[goal-release] manual ${action} failed task=${taskId}: ${err?.message ?? err}`);
+    return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
+});
+
+// Internal: ask the daemon that owns a planned task's frozen sender identity to
+// release any newly-ready dependency-gated work. A session-scoped caller may
+// broadcast; each daemon still filters by senderLarkAppId before sending.
+ipcRoute('POST', '/api/goal/release-check', async (req, res) => {
+  let raw: {
+    goalChatId?: unknown;
+    reason?: unknown;
+    broadcast?: unknown;
+    callerSessionId?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+  };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const goalChatId = typeof raw.goalChatId === 'string' ? raw.goalChatId.trim() : '';
+  const reason = typeof raw.reason === 'string' && raw.reason.trim() ? raw.reason.trim() : 'ipc';
+  if (!goalChatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_goalChatId', error: 'goalChatId is required' });
+  try {
+    if (raw.broadcast === true) {
+      if (!isTrustedHostIpcRequest(req)) {
+        const callerSessionId = typeof raw.callerSessionId === 'string' ? raw.callerSessionId.trim() : '';
+        const caller = findActiveSessionById(callerSessionId);
+        const verified = authorizeGoalSessionIpc(req, caller, raw);
+        if (!verified.ok || !caller || caller.chatId !== goalChatId) {
+          return jsonRes(res, 403, { ok: false, error: verified.ok ? 'origin_unproven' : verified.error });
+        }
+      }
+      const result = await triggerGoalReleaseAcrossDaemons({ goalChatId, reason });
+      return jsonRes(res, 200, { ok: true, ...result });
+    }
+    if (!isTrustedHostIpcRequest(req)) {
+      return jsonRes(res, 403, { ok: false, error: 'origin_unproven' });
+    }
+    const results = await runGoalReleaseCheckOnThisDaemon(goalChatId, 'trigger', reason);
+    return jsonRes(res, 200, { ok: true, results });
+  } catch (err: any) {
+    logger.warn(`[goal-release] IPC trigger failed: ${err?.message ?? err}`);
     return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
   }
 });
@@ -17896,7 +18235,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       onReviveFailure: handleGoalReviveFailure,
       workerHealthFacts: buildWorkerHealthFacts,
       reassignDeadWorker: reassignDeadGoalWorker,
+      onAccepted: ({ taskId, goalChatId }) => {
+        if (!goalChatId || !goalHasPlannedDependent(goalChatId, taskId)) return;
+        void runGoalReleaseCheckOnThisDaemon(goalChatId, 'trigger', `reconcile-accepted:${taskId}`)
+          .catch((err: any) => logger.warn(`[goal-release] reconcile trigger failed: ${err?.message ?? err}`));
+      },
     });
+
+  const goalReleaseTimer = setInterval(() => {
+    void runAllGoalReleaseChecksOnThisDaemon('periodic').catch((err: any) => {
+      logger.warn(`[goal-release] periodic scan failed: ${err?.message ?? err}`);
+    });
+  }, 60_000);
+  goalReleaseTimer.unref?.();
+  setTimeout(() => {
+    void runAllGoalReleaseChecksOnThisDaemon('startup').catch((err: any) => {
+      logger.warn(`[goal-release] startup scan failed: ${err?.message ?? err}`);
+    });
+  }, 5_000).unref?.();
 
   const goalNotificationRetryTimer = setInterval(() => {
     void processGoalNotificationRetries().catch((err: any) => {
@@ -18001,6 +18357,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     if (goalWatchdogTimer) clearInterval(goalWatchdogTimer);
+    clearInterval(goalReleaseTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });
@@ -18077,6 +18434,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(idleWorkerSweepTimer);
     clearInterval(docCommentPollTimer);
     if (goalWatchdogTimer) clearInterval(goalWatchdogTimer);
+    clearInterval(goalReleaseTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the

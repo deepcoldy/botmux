@@ -211,6 +211,9 @@ describe('built-in botmux-orchestrate skill', () => {
     expect(skill!.content).toContain('switch-worker');
     expect(skill!.content).toContain('escalate-human');
     expect(skill!.content).toContain('resolve-help');
+    expect(skill!.content).toContain('confirm-release');
+    expect(skill!.content).toContain('delivery release-confirm --task');
+    expect(skill!.content).toContain('delivery release-retry --task');
     expect(skill!.content).toContain('先查交付记录和 charter');
     expect(skill!.content).toContain('delivery escalate');
     expect(skill!.content).toContain('--needs-repo <git remote URL>');

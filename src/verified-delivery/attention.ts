@@ -15,13 +15,15 @@
  *
  * Purity boundary (hard, agreed with codex): this module reads NOTHING live — no
  * activeSessions, no process liveness, no command execution, no filesystem
- * verification, and no clock. Two kinds of risk are therefore NOT computed here
+ * verification, and no clock. These risks are therefore NOT computed here
  * and must be SUPPLIED via DispositionContext by the IPC/daemon layer:
  *   - reassign-budget exhaustion — needs a clock (windowed count) and the
  *     core/goal-reassign-budget predicate; that layering + the clock belong to
  *     the live side, so the Set is passed in (single wiring point, no drift).
  *   - dead-letter — read from the goal-notification retry store; carried in the
  *     same context for symmetry / one assembly point.
+ *   - dependency/release risk — derived from ledger timestamps/events by the
+ *     caller because its rejected/ambiguous thresholds need an explicit clock.
  * Live PROCESS health (supervisor/worker liveness, zombie, revive) is a separate
  * concern layered on at the IPC seam and tagged `live` — it is never mixed into
  * the bucket verdict this module produces. The classifier owns the RULE; the
@@ -51,6 +53,13 @@ export interface TaskDisposition {
   next: string;
 }
 
+export interface ReleaseRiskDisposition extends TaskDisposition {
+  detail?: string;
+  releaseId?: string;
+  upstreamTaskId?: string;
+  occurredAt?: number;
+}
+
 /** The minimal task shape the classifier needs — satisfied structurally by BOTH
  *  the ledger's TaskView and the board's GoalBoardTask, so the watchdog (TaskView)
  *  and the dashboard board (GoalBoardTask) share one rule with no adapter. */
@@ -70,6 +79,8 @@ export interface DispositionContext {
   reassignBudgetExhausted?: ReadonlySet<string>;
   /** Tasks whose critical human-attention notification has dead-lettered. */
   deadLetterTaskIds?: ReadonlySet<string>;
+  /** Planned tasks whose dependency/release ledger needs a person. */
+  releaseRisks?: ReadonlyMap<string, ReleaseRiskDisposition>;
 }
 
 /** PURE. The single source of truth for "what state is this task in + what's it
@@ -87,7 +98,7 @@ export function classifyTaskDisposition(task: ClassifiableTask, ctx: Disposition
 
   switch (task.status) {
     case 'planned':
-      return { bucket: 'quiet', reason: 'waiting_dependencies', next: '等待上游任务验收' };
+      return ctx.releaseRisks?.get(id) ?? { bucket: 'quiet', reason: 'waiting_dependencies', next: '等待上游任务验收' };
     case 'escalated':
       return { bucket: 'needsHuman', reason: 'escalated', next: '等人拍板' };
     case 'blocked':
@@ -145,6 +156,12 @@ export interface AttentionTask {
   larkAppId?: string;
   /** Most recent delivery activity for this task (unix ms; for ordering/age). */
   lastActivityAt?: number;
+  /** Planned downstream tasks currently blocked by this escalated upstream task. */
+  affectedDownstreamCount?: number;
+  /** Ledger-derived release/dependency diagnosis for a system-risk row. */
+  riskDetail?: string;
+  releaseId?: string;
+  upstreamTaskId?: string;
   recentEvidence?: AttentionEvidence;
 }
 
@@ -166,7 +183,7 @@ const RECENTLY_COMPLETED_LIMIT = 12;
 
 function taskLastActivity(t: GoalBoardTask): number | undefined {
   let last: number | undefined;
-  for (const ts of [t.dispatchedAt, t.latestReportedAt, t.latestVerdictAt, t.acceptedAt, t.rejectedAt, t.cancelledAt]) {
+  for (const ts of [t.plannedAt, t.dispatchedAt, t.latestReportedAt, t.latestVerdictAt, t.acceptedAt, t.rejectedAt, t.cancelledAt]) {
     if (ts !== undefined && (last === undefined || ts > last)) last = ts;
   }
   return last;
@@ -225,9 +242,23 @@ export function buildGoalAttentionBoard(
   const completed: AttentionTask[] = [];
 
   for (const goal of board.goals) {
+    const affectedDownstream = new Map<string, number>();
+    for (const candidate of goal.tasks) {
+      if (candidate.status !== 'planned') continue;
+      for (const dependencyId of candidate.dependsOnTaskIds ?? []) {
+        affectedDownstream.set(dependencyId, (affectedDownstream.get(dependencyId) ?? 0) + 1);
+      }
+    }
     for (const t of goal.tasks) {
       const disposition = classifyTaskDisposition(t, ctx);
       const at = toAttentionTask(goal, t, disposition);
+      const releaseRisk = ctx.releaseRisks?.get(t.taskId);
+      if (releaseRisk?.detail) at.riskDetail = releaseRisk.detail;
+      if (releaseRisk?.releaseId) at.releaseId = releaseRisk.releaseId;
+      if (releaseRisk?.upstreamTaskId) at.upstreamTaskId = releaseRisk.upstreamTaskId;
+      if (releaseRisk?.occurredAt !== undefined) at.lastActivityAt = releaseRisk.occurredAt;
+      const affected = t.status === 'escalated' ? affectedDownstream.get(t.taskId) : undefined;
+      if (affected) at.affectedDownstreamCount = affected;
       switch (disposition.bucket) {
         case 'needsHuman': needsHuman.push(at); break;
         case 'blocked': blocked.push(at); break;

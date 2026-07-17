@@ -4,9 +4,14 @@ import {
   type AttentionTask,
   type DispositionContext,
   type GoalAttentionBoard,
+  type ReleaseRiskDisposition,
 } from '../verified-delivery/attention.js';
 import type { GoalBoardTask } from '../verified-delivery/goal-board.js';
 import type { TaskView } from '../verified-delivery/types.js';
+import {
+  deriveTaskReleaseRisks,
+  resolveRejectedDependencyStallMs,
+} from '../verified-delivery/release-risk.js';
 import { listGoalNotificationRetries } from '../services/goal-notification-retry-store.js';
 import {
   countGoalWorkerReassignAttempts,
@@ -42,6 +47,20 @@ export function buildGoalAttentionContext(opts: GoalAttentionBuildOptions = {}):
   const now = opts.now ?? Date.now();
   const events = ledger.read();
   const tasks = ledger.tasks(opts.chatId);
+  const releaseRisks = new Map<string, ReleaseRiskDisposition>(deriveTaskReleaseRisks({
+    tasks,
+    events,
+    now,
+    rejectedStallMs: resolveRejectedDependencyStallMs(process.env.BOTMUX_A2A_DEP_REJECTED_STALL_MS),
+  }).map((risk) => [risk.taskId, {
+    bucket: 'systemRisk',
+    reason: risk.reason,
+    next: risk.next,
+    detail: risk.detail,
+    releaseId: risk.releaseId,
+    upstreamTaskId: risk.upstreamTaskId,
+    occurredAt: risk.occurredAt,
+  }]));
 
   const reassignBudgetExhausted = new Set<string>();
   for (const task of tasks) {
@@ -59,7 +78,7 @@ export function buildGoalAttentionContext(opts: GoalAttentionBuildOptions = {}):
     deadLetterTaskIds.add(record.taskId);
   }
 
-  return { reassignBudgetExhausted, deadLetterTaskIds };
+  return { reassignBudgetExhausted, deadLetterTaskIds, releaseRisks };
 }
 
 function stampLedgerRisk(task: AttentionTask): AttentionTask {

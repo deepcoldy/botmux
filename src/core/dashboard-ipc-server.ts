@@ -251,6 +251,8 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   if (method === 'POST' && pathname === '/api/goal/supervise') return true;
   if (method === 'POST' && pathname === '/api/goal/notify-parent') return true;
   if (method === 'POST' && pathname === '/api/goal/watchdog') return true;
+  if (method === 'POST' && pathname === '/api/goal/release-check') return true;
+  if (method === 'POST' && pathname === '/api/goal/release-action') return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
   // protocol (request signature over method/path/exact body with nonce
   // anti-replay + boot audience, signed response), keyed on the same host

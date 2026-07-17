@@ -11,7 +11,9 @@ export interface GoalNotificationRetryRecord {
   id: string;
   ownerLarkAppId: string;
   kind: GoalNotificationRetryKind;
-  status?: 'pending' | 'dead';
+  status?: 'pending' | 'sent' | 'dead';
+  /** Keep a sent tombstone so a ledger-rebuilt risk cannot notify twice. */
+  retainOnSuccess?: boolean;
   candidates: string[];
   parentChatId: string;
   parentRoot?: string;
@@ -32,6 +34,7 @@ export interface GoalNotificationRetryRecord {
   lastError?: string;
   deadAt?: number;
   deadReason?: string;
+  sentAt?: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -58,7 +61,14 @@ function loadAll(): Record<string, GoalNotificationRetryRecord> {
 function saveAll(records: Record<string, GoalNotificationRetryRecord>): void {
   mkdirSync(config.session.dataDir, { recursive: true });
   const entries = Object.entries(records)
-    .sort((a, b) => (b[1].updatedAt ?? b[1].createdAt ?? 0) - (a[1].updatedAt ?? a[1].createdAt ?? 0))
+    .sort((a, b) => {
+      // Sent tombstones are dedupe history. Never let them evict a live retry or
+      // dead-letter that still requires operator action when the store is full.
+      const aSent = a[1].status === 'sent' ? 1 : 0;
+      const bSent = b[1].status === 'sent' ? 1 : 0;
+      if (aSent !== bSent) return aSent - bSent;
+      return (b[1].updatedAt ?? b[1].createdAt ?? 0) - (a[1].updatedAt ?? a[1].createdAt ?? 0);
+    })
     .slice(0, MAX_RECORDS);
   atomicWriteFileSync(storePath(), JSON.stringify(Object.fromEntries(entries), null, 2));
 }
@@ -68,8 +78,9 @@ export function upsertGoalNotificationRetry(record: Omit<GoalNotificationRetryRe
   const now = Date.now();
   const prev = all[record.id];
   const next: GoalNotificationRetryRecord = {
+    ...prev,
     ...record,
-    status: record.status ?? (prev?.status === 'dead' ? 'dead' : 'pending'),
+    status: record.status ?? (prev?.status === 'dead' || prev?.status === 'sent' ? prev.status : 'pending'),
     attempts: record.attempts ?? prev?.attempts ?? 0,
     createdAt: record.createdAt ?? prev?.createdAt ?? now,
     updatedAt: record.updatedAt ?? now,
@@ -88,8 +99,23 @@ export function removeGoalNotificationRetry(id: string): void {
 
 export function listDueGoalNotificationRetries(ownerLarkAppId: string, now = Date.now()): GoalNotificationRetryRecord[] {
   return Object.values(loadAll())
-    .filter((r) => (r.status ?? 'pending') !== 'dead' && r.ownerLarkAppId === ownerLarkAppId && r.nextAttemptAt <= now)
+    .filter((r) => (r.status ?? 'pending') === 'pending' && r.ownerLarkAppId === ownerLarkAppId && r.nextAttemptAt <= now)
     .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt);
+}
+
+export function markGoalNotificationRetrySent(id: string, now = Date.now()): GoalNotificationRetryRecord | null {
+  const all = loadAll();
+  const prev = all[id];
+  if (!prev) return null;
+  const next: GoalNotificationRetryRecord = {
+    ...prev,
+    status: 'sent',
+    sentAt: now,
+    updatedAt: now,
+  };
+  all[id] = next;
+  saveAll(all);
+  return next;
 }
 
 export function listGoalNotificationRetries(): GoalNotificationRetryRecord[] {
@@ -141,6 +167,7 @@ export function retryGoalNotification(id: string, now = Date.now()): GoalNotific
     nextAttemptAt: now,
     deadAt: undefined,
     deadReason: undefined,
+    sentAt: undefined,
     updatedAt: now,
   };
   all[id] = next;

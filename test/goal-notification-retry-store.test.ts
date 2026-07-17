@@ -8,6 +8,7 @@ import {
   listGoalNotificationRetries,
   markGoalNotificationRetryDead,
   markGoalNotificationRetryAttempt,
+  markGoalNotificationRetrySent,
   removeGoalNotificationRetry,
   retryGoalNotification,
   upsertGoalNotificationRetry,
@@ -81,5 +82,17 @@ describe('goal notification retry store', () => {
     expect(retried).toMatchObject({ id: 'r-dead', status: 'pending', attempts: 0, nextAttemptAt: 20_000 });
     expect(retried?.deadAt).toBeUndefined();
     expect(listDueGoalNotificationRetries('cli_a', 20_000).map((r) => r.id)).toEqual(['r-dead']);
+  });
+
+  it('retains sent tombstones without scheduling them again', () => {
+    upsertGoalNotificationRetry({ ...record('r-sent'), retainOnSuccess: true });
+    expect(markGoalNotificationRetrySent('r-sent', 2_000)).toMatchObject({
+      id: 'r-sent', status: 'sent', sentAt: 2_000, retainOnSuccess: true,
+    });
+    expect(listDueGoalNotificationRetries('cli_a', 10_000)).toEqual([]);
+    expect(listGoalNotificationRetries()[0]).toMatchObject({ id: 'r-sent', status: 'sent' });
+    expect(upsertGoalNotificationRetry({ ...record('r-sent'), retainOnSuccess: true })).toMatchObject({
+      id: 'r-sent', status: 'sent', sentAt: 2_000,
+    });
   });
 });

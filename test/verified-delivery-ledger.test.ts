@@ -2,7 +2,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { deriveTaskReleaseId, openLedger, type LedgerHandle } from '../src/verified-delivery/ledger.js';
+import {
+  deriveTaskReleaseId,
+  openLedger,
+  TASK_RELEASE_AUTO_RETRY_WINDOW_MS,
+  type LedgerHandle,
+} from '../src/verified-delivery/ledger.js';
 import type { LedgerEventDraft, TaskDispatchIntentPayload, TaskPlannedPayload } from '../src/verified-delivery/types.js';
 
 const TS = 1_700_000_000_000;
@@ -58,6 +63,7 @@ function releaseIntent(input: {
   planEventId: string;
   acceptedEventId: string;
   attempt?: number;
+  releasedBy?: string;
 }): TaskDispatchIntentPayload {
   const taskId = input.taskId ?? 'downstream';
   const attempt = input.attempt ?? 0;
@@ -87,7 +93,7 @@ function releaseIntent(input: {
       brief: 'consume upstream output',
       releaseId,
     },
-    releasedBy: 'daemon:cli_supervisor',
+    releasedBy: input.releasedBy ?? 'daemon:cli_supervisor',
   };
 }
 
@@ -456,6 +462,122 @@ describe('verified-delivery ledger', () => {
       dispatchMessageId: 'om_release',
     });
     expect(led.task('downstream')?.pendingRelease).toBeUndefined();
+  });
+
+  it('claims an attempt+1 release only after the previous release is safe for manual retry', () => {
+    const led = openLedger({ baseDir });
+    const acceptedEventId = acceptDependency(led, 'upstream');
+    const planned = led.append(draft({
+      type: 'TaskPlanned', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: 'planned:downstream',
+      payload: planPayload(),
+    }));
+    const firstIntent = releaseIntent({ planEventId: planned.event.eventId, acceptedEventId });
+    expect(led.claimReadyPlan({
+      taskId: 'downstream', expectedPlanEventId: planned.event.eventId,
+      expectedAcceptedEventIds: [acceptedEventId], ts: TS + 10, intent: firstIntent,
+    }).result).toBe('created');
+
+    const retryIntent = releaseIntent({
+      planEventId: planned.event.eventId,
+      acceptedEventId,
+      attempt: 1,
+      releasedBy: 'ou_supervisor',
+    });
+    const retryInput = {
+      taskId: 'downstream',
+      expectedReleaseId: firstIntent.releaseId,
+      approvedBy: 'ou_supervisor',
+      ts: TS + 10 + TASK_RELEASE_AUTO_RETRY_WINDOW_MS - 1,
+      intent: retryIntent,
+    };
+    expect(led.claimRetryRelease(retryInput)).toEqual({ result: 'not-retryable' });
+    expect(led.claimRetryRelease({ ...retryInput, approvedBy: 'ou_other' })).toEqual({ result: 'not-retryable' });
+
+    const created = led.claimRetryRelease({
+      ...retryInput,
+      ts: TS + 10 + TASK_RELEASE_AUTO_RETRY_WINDOW_MS,
+    });
+    expect(created.result).toBe('created');
+    expect(led.task('downstream')?.pendingRelease).toMatchObject({
+      releaseId: retryIntent.releaseId,
+      attempt: 1,
+      releasedBy: 'ou_supervisor',
+    });
+    expect(led.claimRetryRelease({
+      ...retryInput,
+      expectedReleaseId: retryIntent.releaseId,
+      ts: TS + 10 + TASK_RELEASE_AUTO_RETRY_WINDOW_MS + 1,
+    }).result).toBe('not-retryable');
+    expect(led.read().filter((event) => event.type === 'TaskDispatchIntent')).toHaveLength(2);
+  });
+
+  it('allows an explicitly approved retry immediately after a definite failure', () => {
+    const led = openLedger({ baseDir });
+    const acceptedEventId = acceptDependency(led, 'upstream');
+    const planned = led.append(draft({
+      type: 'TaskPlanned', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: 'planned:downstream',
+      payload: planPayload(),
+    }));
+    const firstIntent = releaseIntent({ planEventId: planned.event.eventId, acceptedEventId });
+    led.claimReadyPlan({
+      taskId: 'downstream', expectedPlanEventId: planned.event.eventId,
+      expectedAcceptedEventIds: [acceptedEventId], ts: TS + 10, intent: firstIntent,
+    });
+    led.append(draft({
+      type: 'TaskDispatchFailed', taskId: 'downstream', chatId: 'oc_goal',
+      idempotencyKey: `dispatch-failed:${firstIntent.releaseId}:definite`, ts: TS + 11,
+      payload: {
+        taskId: 'downstream', releaseId: firstIntent.releaseId, planEventId: firstIntent.planEventId,
+        planGeneration: 1, attempt: 0, failureClass: 'definite', code: 'readiness:worker_not_in_chat',
+        detail: 'worker is not in the goal chat', failedBy: 'daemon:cli_supervisor',
+      },
+    }));
+    const retryIntent = releaseIntent({
+      planEventId: planned.event.eventId,
+      acceptedEventId,
+      attempt: 1,
+      releasedBy: 'ou_supervisor',
+    });
+    expect(led.claimRetryRelease({
+      taskId: 'downstream', expectedReleaseId: firstIntent.releaseId,
+      approvedBy: 'ou_supervisor', ts: TS + 12, intent: retryIntent,
+    }).result).toBe('created');
+  });
+
+  it('rejects a retry claim when its release id, attempt, or dependency snapshot is stale', () => {
+    const led = openLedger({ baseDir });
+    const acceptedEventId = acceptDependency(led, 'upstream');
+    const planned = led.append(draft({
+      type: 'TaskPlanned', taskId: 'downstream', chatId: 'oc_goal', idempotencyKey: 'planned:downstream',
+      payload: planPayload(),
+    }));
+    const firstIntent = releaseIntent({ planEventId: planned.event.eventId, acceptedEventId });
+    led.claimReadyPlan({
+      taskId: 'downstream', expectedPlanEventId: planned.event.eventId,
+      expectedAcceptedEventIds: [acceptedEventId], ts: TS + 10, intent: firstIntent,
+    });
+    const retryIntent = releaseIntent({
+      planEventId: planned.event.eventId,
+      acceptedEventId,
+      attempt: 1,
+      releasedBy: 'ou_supervisor',
+    });
+    const ts = TS + 10 + TASK_RELEASE_AUTO_RETRY_WINDOW_MS;
+    expect(led.claimRetryRelease({
+      taskId: 'downstream', expectedReleaseId: 'rel1-stale', approvedBy: 'ou_supervisor', ts, intent: retryIntent,
+    })).toEqual({ result: 'stale' });
+    expect(led.claimRetryRelease({
+      taskId: 'downstream', expectedReleaseId: firstIntent.releaseId, approvedBy: 'ou_supervisor', ts,
+      intent: { ...retryIntent, attempt: 2 },
+    })).toEqual({ result: 'stale' });
+    expect(led.claimRetryRelease({
+      taskId: 'downstream', expectedReleaseId: firstIntent.releaseId, approvedBy: 'ou_supervisor', ts,
+      intent: {
+        ...retryIntent,
+        releaseId: 'rel1-forged',
+        frozenDispatchedPayload: { ...retryIntent.frozenDispatchedPayload, releaseId: 'rel1-forged' },
+      },
+    })).toEqual({ result: 'stale' });
   });
 
   it('returns not-ready until every dependency has a real accepted transition', () => {

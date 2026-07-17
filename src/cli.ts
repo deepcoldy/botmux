@@ -4335,7 +4335,7 @@ async function triggerGoalReleaseCheckFromCli(
           daemon.ipcPort,
           sessionId,
           '/api/goal/release-check',
-          { goalChatId, reason: 'task-accepted', callerSessionId: sessionId },
+          { goalChatId, reason: 'task-accepted', broadcast: true, callerSessionId: sessionId },
           ctrl.signal,
         );
         if (res.ok) return true;
@@ -4364,6 +4364,26 @@ async function triggerGoalReleaseCheckFromCli(
     }
   }));
   return results.some(Boolean);
+}
+
+async function requestGoalReleaseActionFromCli(input: {
+  taskId: string;
+  action: 'confirm' | 'retry';
+  by: string;
+  sessionId: string;
+  larkAppId: string;
+}): Promise<unknown> {
+  const daemon = findDaemon(input.larkAppId);
+  if (!daemon) throw new Error(`未找到在线监管者 daemon (larkAppId=${input.larkAppId})`);
+  const response = await postSessionScopedDaemonIpc(
+    daemon.ipcPort,
+    input.sessionId,
+    '/api/goal/release-action',
+    { ...input, callerSessionId: input.sessionId },
+  );
+  const body = await response.json().catch(() => null) as { ok?: boolean; error?: string; result?: unknown } | null;
+  if (!response.ok || !body?.ok) throw new Error(body?.error ?? `daemon HTTP ${response.status}`);
+  return body.result;
 }
 
 async function cmdResume(): Promise<void> {
@@ -7943,6 +7963,9 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
         [--options "a=方案A,b=方案B"] [--recommended a]
   取消任务:
     botmux delivery cancel --task <taskId> --reason <text> [--by <id>]
+  处理自动派发的不确定结果:
+    botmux delivery release-confirm --task <taskId> [--by <id>] [--session-id <监管者会话id>]
+    botmux delivery release-retry --task <taskId> [--by <id>] [--session-id <监管者会话id>]
 
 说明:
   --report 省略时默认使用该任务 latestReportId。
@@ -8006,7 +8029,10 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
     return;
   }
 
-  if (sub !== 'accept' && sub !== 'reject' && sub !== 'escalate' && sub !== 'cancel') {
+  if (
+    sub !== 'accept' && sub !== 'reject' && sub !== 'escalate' && sub !== 'cancel' &&
+    sub !== 'release-confirm' && sub !== 'release-retry'
+  ) {
     console.error(`delivery: 未知子命令 ${sub}`);
     process.exit(1);
   }
@@ -8016,6 +8042,28 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
   const sessions = loadSessions();
   const s = sid ? sessions.get(sid) : undefined;
   const checkedBy = argValue(rest, '--checked-by') ?? s?.larkAppId ?? s?.ownerOpenId ?? 'orchestrator';
+
+  if (sub === 'release-confirm' || sub === 'release-retry') {
+    if (!sid || !s?.larkAppId) {
+      console.error(`${sub} 必须在该目标的在线监管者会话中运行，或传 --session-id。`);
+      process.exit(1);
+    }
+    const by = argValue(rest, '--by')?.trim() || s.ownerOpenId?.trim() || s.larkAppId;
+    try {
+      const result = await requestGoalReleaseActionFromCli({
+        taskId,
+        action: sub === 'release-confirm' ? 'confirm' : 'retry',
+        by,
+        sessionId: sid,
+        larkAppId: s.larkAppId,
+      });
+      console.log(JSON.stringify({ success: true, taskId, action: sub, result }, null, 2));
+      return;
+    } catch (err) {
+      console.error(`${sub} 失败：${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  }
 
   if (sub === 'cancel') {
     const reason = argValue(rest, '--reason')?.trim();
@@ -8211,7 +8259,9 @@ async function cmdDelivery(sub: string, rest: string[]): Promise<void> {
         },
       });
     }
-    const releaseCheckTriggered = !result.deduped && task.chatId
+    const hasPlannedDependent = !result.deduped && !!task.chatId && ledger.tasks(task.chatId).some((candidate) =>
+      candidate.status === 'planned' && candidate.plan?.dependsOnTaskIds.includes(taskId));
+    const releaseCheckTriggered = hasPlannedDependent && task.chatId
       ? await triggerGoalReleaseCheckFromCli(task.chatId, sid ?? undefined, s?.larkAppId)
       : false;
     console.log(JSON.stringify({

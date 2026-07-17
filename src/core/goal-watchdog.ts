@@ -58,6 +58,7 @@ export interface GoalWatchdogDeps {
   workerHealthFacts?: (task: TaskView, goalChatId: string) => Promise<string[]> | string[];
   reassignDeadWorker?: (task: TaskView, goalChatId: string, now: number) => Promise<GoalWatchdogReassignResult> | GoalWatchdogReassignResult;
   reassignGraceMs?: number;
+  onAccepted?: (input: { taskId: string; goalChatId?: string; acceptedEventId: string }) => void;
 }
 
 export type GoalWatchdogReviveResult =
@@ -428,6 +429,7 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
         now,
         defaultCwd: deps.defaultCwd,
         defaultTimeoutMs: deps.defaultTimeoutMs,
+        onAccepted: deps.onAccepted,
       });
       if (reconcile.action === 'no-criteria') {
         if (task.status === 'reported' && !supervisorIsColdWake) continue;
@@ -515,6 +517,7 @@ export async function runGoalWatchdogForGoal(input: {
   workerHealthFacts?: GoalWatchdogDeps['workerHealthFacts'];
   reassignDeadWorker?: GoalWatchdogDeps['reassignDeadWorker'];
   reassignGraceMs?: number;
+  onAccepted?: GoalWatchdogDeps['onAccepted'];
 }): Promise<GoalWatchdogResult[]> {
   return runGoalWatchdogOnce({
     larkAppId: input.larkAppId,
@@ -527,6 +530,7 @@ export async function runGoalWatchdogForGoal(input: {
     workerHealthFacts: input.workerHealthFacts,
     reassignDeadWorker: input.reassignDeadWorker,
     reassignGraceMs: input.reassignGraceMs,
+    onAccepted: input.onAccepted,
     reviveSupervisor: async (goalChatId) => {
       const r = await ensureGoalSupervisorFromRegistry(goalChatId, {
         larkAppId: input.larkAppId,
@@ -547,6 +551,7 @@ export function startGoalWatchdog(input: {
   workerHealthFacts?: GoalWatchdogDeps['workerHealthFacts'];
   reassignDeadWorker?: GoalWatchdogDeps['reassignDeadWorker'];
   reassignGraceMs?: number;
+  onAccepted?: GoalWatchdogDeps['onAccepted'];
 }): NodeJS.Timeout | null {
   const disabled = process.env.BOTMUX_GOAL_WATCHDOG === '0' || process.env.BOTMUX_GOAL_WATCHDOG === 'false';
   if (disabled) {
@@ -565,6 +570,7 @@ export function startGoalWatchdog(input: {
         workerHealthFacts: input.workerHealthFacts,
         reassignDeadWorker: input.reassignDeadWorker,
         reassignGraceMs: input.reassignGraceMs,
+        onAccepted: input.onAccepted,
         reviveSupervisor: async (goalChatId) => {
           const r = await ensureGoalSupervisorFromRegistry(goalChatId, {
             larkAppId: input.larkAppId,
