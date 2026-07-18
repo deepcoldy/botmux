@@ -1,5 +1,22 @@
 import { describe, it, expect } from 'vitest';
-import { parseBotConfigsFromText, getOwnerOpenId, registerBot } from '../src/bot-registry.js';
+import { parseBotConfigsFromText, getOwnerOpenId, registerBot, resolveBrandLabel } from '../src/bot-registry.js';
+
+describe('resolveBrandLabel from in-memory registration (isolated-bot send path)', () => {
+  // The isolated-bot `botmux send` path registers the bot from send-cred.json
+  // (bots.json is read-denied in the sandbox) and then calls resolveBrandLabel.
+  // Since resolveBrandLabel returns the in-mem config's brandLabel WITHOUT a
+  // bots.json fallback once registered, the footer role name/link only survives
+  // if brandLabel was carried through send-cred → registerBot. This locks that in.
+  it('returns the registered brandLabel (so an isolated send footer keeps the role template)', () => {
+    registerBot({ larkAppId: 'brand_reg_1', larkAppSecret: 's', cliId: 'claude-code', brandLabel: '[{cwdName}]({cwdUrl})' } as import('../src/bot-registry.js').BotConfig);
+    expect(resolveBrandLabel('brand_reg_1')).toBe('[{cwdName}]({cwdUrl})');
+  });
+
+  it('returns undefined when a registered bot has no brandLabel (default-brand footer)', () => {
+    registerBot({ larkAppId: 'brand_reg_2', larkAppSecret: 's', cliId: 'claude-code' } as import('../src/bot-registry.js').BotConfig);
+    expect(resolveBrandLabel('brand_reg_2')).toBeUndefined();
+  });
+});
 
 describe('bot-registry grant additions', () => {
   it('parseBotConfigsFromText preserves & filters chatReplyModes (four-state incl. chat-topic)', () => {

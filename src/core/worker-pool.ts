@@ -2133,6 +2133,10 @@ export function forkWorker(
     larkAppId: botCfg.larkAppId,
     larkAppSecret: botCfg.larkAppSecret,
     brand: normalizeBrand(botCfg.brand),
+    // Carry the footer brand template into the init msg so the worker can write
+    // it into send-cred.json — an isolated bot's sandboxed `botmux send` can't
+    // read bots.json, so without this its footer loses the role name/link.
+    brandLabel: botCfg.brandLabel,
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
@@ -3858,6 +3862,10 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     larkAppId: botCfg.larkAppId,
     larkAppSecret: botCfg.larkAppSecret,
     brand: normalizeBrand(botCfg.brand),
+    // Carry the footer brand template into the init msg so the worker can write
+    // it into send-cred.json — an isolated bot's sandboxed `botmux send` can't
+    // read bots.json, so without this its footer loses the role name/link.
+    brandLabel: botCfg.brandLabel,
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),

@@ -5295,6 +5295,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // to read the cred file from.
     if (cfg.larkAppSecret) sessionEnv.BOTMUX_LARK_APP_SECRET = cfg.larkAppSecret;
     if (cfg.brand) sessionEnv.BOTMUX_LARK_BRAND = cfg.brand;
+    // Footer brand template for the riff env-mode send path (no send-cred file);
+    // riffModeSession() reads it back into the synthetic BotConfig so the footer
+    // keeps the role name/link instead of degrading to the default brand.
+    // `!== undefined` (not truthiness): '' is a meaningful value = "suppress the
+    // footer", and must round-trip as '' rather than collapse to the default.
+    if (cfg.brandLabel !== undefined) sessionEnv.BOTMUX_LARK_BRAND_LABEL = cfg.brandLabel;
     const chatBotDiscovery = resolveChatBotDiscoveryConfig();
     sessionEnv.BOTMUX_LARK_LIST_BOTS_API_ENABLED = chatBotDiscovery.listBotsApiEnabled ? 'true' : 'false';
     sessionEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
@@ -5676,7 +5682,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       mkdirSync(dirname(credPath), { recursive: true });
       writeFileSync(
         credPath,
-        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand }),
+        // brandLabel: the footer brand template — an isolated bot's sandboxed
+        // `botmux send` reads it from here (bots.json is read-denied), else its
+        // card footer falls back to default and loses the role name/link.
+        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, brandLabel: cfg.brandLabel }),
         { mode: 0o600 },
       );
     } catch (e) {

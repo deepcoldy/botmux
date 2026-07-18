@@ -5521,7 +5521,7 @@ async function registerSelfFromCredFile(): Promise<void> {
   const sd = process.env.SESSION_DATA_DIR;
   if (!appId || !sd) return;
   const { sendCredFilePath } = await import('./adapters/cli/read-isolation.js');
-  let cred: { larkAppSecret?: string; brand?: string };
+  let cred: { larkAppSecret?: string; brand?: string; brandLabel?: string };
   try {
     // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
     // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
@@ -5536,6 +5536,10 @@ async function registerSelfFromCredFile(): Promise<void> {
     larkAppSecret: cred.larkAppSecret,
     cliId: 'claude-code',
     brand: cred.brand as 'feishu' | 'lark' | undefined,
+    // brandLabel from send-cred → resolveBrandLabel() returns it for this
+    // in-mem-registered isolated bot (no bots.json read), so the footer keeps
+    // the role name/link instead of degrading to the default brand.
+    brandLabel: cred.brandLabel,
   } as import('./bot-registry.js').BotConfig);
 }
 
@@ -5581,6 +5585,12 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
   }
 
   const brand = process.env.BOTMUX_LARK_BRAND as 'feishu' | 'lark' | undefined;
+  // Footer brand template — riff has no send-cred file, so the daemon injects it
+  // via env (mirrors BOTMUX_LARK_BRAND). Without it resolveBrandLabel() returns
+  // undefined and the riff sandbox card footer loses the role name/link.
+  // Read raw (no `|| undefined`): unset env → undefined (default footer), but an
+  // explicit '' means "suppress footer" and must survive as '', not collapse.
+  const brandLabel: string | undefined = process.env.BOTMUX_LARK_BRAND_LABEL;
   // Only trust a real message id as the thread anchor — chat-scope sessions
   // anchor on the chat id (oc_…), which must NOT be used as a reply target.
   const rootEnv = process.env.BOTMUX_ROOT_MESSAGE_ID;
@@ -5594,6 +5604,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     larkAppId: appId,
     larkAppSecret: appSecret,
     brand,
+    brandLabel,
     cliId: 'riff',
     allowedUsers: [],
   } as unknown as import('./bot-registry.js').BotConfig;
