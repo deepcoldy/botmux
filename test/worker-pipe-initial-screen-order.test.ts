@@ -207,15 +207,18 @@ describe('worker pipe initial screen ordering', () => {
     expect(herdrBlock).toContain('herdrBe.cliCwd');
   });
 
-  it('wires Herdr adopt snapshots before seeding the initial screen', () => {
+  it('wires Herdr adopt native frames without a duplicate capture seed', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const herdrStart = source.indexOf("cfg.adoptSource === 'herdr'");
     const herdrEnd = source.indexOf("log(`Adopt mode (herdr):", herdrStart);
     const herdrBlock = source.slice(herdrStart, herdrEnd);
 
+    const frameIdx = herdrBlock.indexOf('herdrBe.onTerminalFrame(');
     const relayIdx = herdrBlock.indexOf('wireHerdrWebTerminalRelays(herdrBe);');
     const seedIdx = herdrBlock.indexOf("seedBackendScreen('herdr adopt', herdrBe);");
+    expect(frameIdx).toBeGreaterThan(-1);
+    expect(relayIdx).toBeGreaterThan(frameIdx);
     expect(relayIdx).toBeGreaterThan(-1);
-    expect(seedIdx).toBeGreaterThan(relayIdx);
+    expect(seedIdx).toBe(-1);
   });
 });

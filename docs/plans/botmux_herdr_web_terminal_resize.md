@@ -81,7 +81,7 @@
 
 - [ ] 执行 `pnpm switch:here && botmux restart`，确认全局 shim 与 live daemon 都来自当前 checkout。
 - [ ] 在无浏览器 viewer 时，用一次短命 direct attach 把测试会话缩回已知小尺寸，建立可复现的验收前置状态。
-- [ ] 浏览器打开 `http://10.92.191.86:8802/s/a9edf38b-55c1-4056-bcc5-4a307e17672b`。
+- [ ] 浏览器打开测试环境的 Web Terminal URL（不要在文档中记录内网地址或真实 session ID）。
 - [ ] 机器判定 DOM：`#terminal`、`.xterm`、`.xterm-screen` 的 bounding box 各覆盖 viewport 宽高至少 95%；banner 为只读，状态为 connected。
 - [ ] 机器判定尺寸：读取页面主 world 的 `term.cols/rows`，必须与 Herdr server 最新 `TerminalAnsi` attach/resize 的 cols/rows 完全一致。
 - [ ] 机器判定截图：以非页面背景像素计算 OpenCode 内容 bounding box，宽度至少占 viewport 90%（修复前现场约 33%）；`agent read` 行宽仅作辅助证据。

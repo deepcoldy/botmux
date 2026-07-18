@@ -6,7 +6,7 @@ const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 
 describe('web terminal initial viewport follow', () => {
   it('settles the first asynchronous xterm write burst at the bottom', () => {
-    expect(workerSource).toContain('term.write(data,_settleInitialBottom)');
+    expect(workerSource).toContain('_queueTermWrite(data,false,_settleInitialBottom)');
     expect(workerSource).toMatch(
       /function _settleInitialBottom\(\)\{[\s\S]*?term\.scrollToBottom\(\)[\s\S]*?setTimeout\(function\(\)\{[\s\S]*?term\.scrollToBottom\(\)[\s\S]*?_initialFollow=false;/,
     );
