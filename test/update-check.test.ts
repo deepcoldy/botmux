@@ -132,6 +132,51 @@ describe('fetchReleasesSince', () => {
     expect(out.ok).toBe(true);
     expect(out.releases.map(r => r.version)).toEqual(['2.85.1']);
   });
+
+  it('adds GitHub bearer auth when githubToken is configured', async () => {
+    let auth: string | null = null;
+    await fetchReleasesSince('2.85.0', {
+      auth: { env: { GITHUB_TOKEN: ' ghp_secret ' }, envFilePath: null },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return jsonResponse(200, []);
+      },
+    });
+    expect(auth).toBe('Bearer ghp_secret');
+  });
+
+  it('omits GitHub bearer auth when githubToken is blank', async () => {
+    let auth: string | null = 'present';
+    await fetchReleasesSince('2.85.0', {
+      auth: { env: { GITHUB_TOKEN: '   ' }, envFilePath: null },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return jsonResponse(200, []);
+      },
+    });
+    expect(auth).toBeNull();
+  });
+
+  it('uses env-file auth fallback when process env is unset', async () => {
+    let auth: string | null = null;
+    await fetchReleasesSince('2.85.0', {
+      auth: {
+        env: {},
+        envFilePath: '/tmp/global.env',
+        fileExists: () => true,
+        readTextFile: () => 'GITHUB_TOKEN=ghp_from_file\n',
+      },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return jsonResponse(200, []);
+      },
+    });
+    expect(auth).toBe('Bearer ghp_from_file');
+  });
+
   it('ok:true with an empty list when already latest (genuinely empty)', async () => {
     const out = await fetchReleasesSince('2.85.1', { fetchImpl: async () => jsonResponse(200, [{ tag_name: 'v2.85.1' }]) });
     expect(out).toMatchObject({ ok: true, releases: [] });

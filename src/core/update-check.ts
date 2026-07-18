@@ -7,6 +7,7 @@
  * failure (offline, rate-limited, registry hiccup) so the card degrades to
  * "couldn't check" rather than erroring. The version math is pure (unit tested).
  */
+import { githubAuthHeaders, type GithubAuthResolveOptions } from './github-auth.js';
 import { GITHUB_REPO } from './restart-report.js';
 
 export interface ReleaseNote {
@@ -99,6 +100,7 @@ const REGISTRY_LATEST_URL = 'https://registry.npmjs.org/botmux/latest';
 export interface FetchOpts {
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  auth?: GithubAuthResolveOptions;
 }
 
 /**
@@ -144,7 +146,11 @@ export async function fetchReleasesSince(
   const fetchImpl = opts?.fetchImpl ?? fetch;
   try {
     const res = await fetchImpl(`https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=100`, {
-      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'botmux' },
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'botmux',
+        ...githubAuthHeaders(opts?.auth),
+      },
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });
     if (!res.ok) return { ok: false, rateLimited: res.status === 403, releases: [] };

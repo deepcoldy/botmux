@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { countActiveSessionsOnDisk } from '../src/services/session-store.js';
-import { buildRestartReportText, sendRestartReportIfPending } from '../src/core/restart-report.js';
+import { buildRestartReportText, sendRestartReportIfPending, fetchChangelog } from '../src/core/restart-report.js';
 import { writeRestartIntentTo, restartIntentPathIn } from '../src/services/restart-intent-store.js';
 
 function writeSessions(dir: string, name: string, sessions: Record<string, { status: string }>) {
@@ -161,5 +161,52 @@ describe('sendRestartReportIfPending', () => {
     await sendRestartReportIfPending(w);
     await sendRestartReportIfPending(w);
     expect(sent).toHaveLength(1);
+  });
+});
+
+describe('fetchChangelog', () => {
+  it('adds GitHub bearer auth when githubToken is configured', async () => {
+    let auth: string | null = null;
+    const notes = await fetchChangelog('2.85.1', {
+      auth: { env: { GITHUB_TOKEN: ' ghp_secret ' }, envFilePath: null },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return { ok: true, json: async () => ({ body: 'notes' }) } as Response;
+      },
+    });
+    expect(notes).toBe('notes');
+    expect(auth).toBe('Bearer ghp_secret');
+  });
+
+  it('omits GitHub bearer auth when githubToken is blank', async () => {
+    let auth: string | null = 'present';
+    await fetchChangelog('2.85.1', {
+      auth: { env: { GITHUB_TOKEN: '   ' }, envFilePath: null },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return { ok: true, json: async () => ({ body: 'notes' }) } as Response;
+      },
+    });
+    expect(auth).toBeNull();
+  });
+
+  it('uses env-file auth fallback when process env is unset', async () => {
+    let auth: string | null = null;
+    await fetchChangelog('2.85.1', {
+      auth: {
+        env: {},
+        envFilePath: '/tmp/global.env',
+        fileExists: () => true,
+        readTextFile: () => 'GITHUB_TOKEN=ghp_from_file\n',
+      },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return { ok: true, json: async () => ({ body: 'notes' }) } as Response;
+      },
+    });
+    expect(auth).toBe('Bearer ghp_from_file');
   });
 });

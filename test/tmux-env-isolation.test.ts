@@ -22,7 +22,12 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv } from '../src/setup/ensure-tmux.js';
-import { BOTMUX_INJECTED_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, isBotmuxManagedTmuxEnvKey } from '../src/utils/child-env.js';
+import {
+  BOTMUX_INJECTED_ENV_KEYS,
+  REDACTED_CHILD_ENV_KEYS,
+  isBotmuxManagedTmuxEnvKey,
+  isBotmuxManagedTmuxServerGlobalEnvKey,
+} from '../src/utils/child-env.js';
 
 describe('tmuxEnv()', () => {
   it('strips TMUX and TMUX_PANE from the env', () => {
@@ -108,6 +113,14 @@ describe('tmuxEnv()', () => {
   it('classifies every per-pane and redacted key as tmux-managed', () => {
     for (const key of [...BOTMUX_INJECTED_ENV_KEYS, ...REDACTED_CHILD_ENV_KEYS]) {
       expect(isBotmuxManagedTmuxEnvKey(key), key).toBe(true);
+    }
+  });
+
+  it('does not classify GitHub tokens as botmux-owned tmux server-global keys', () => {
+    expect(isBotmuxManagedTmuxServerGlobalEnvKey('GITHUB_TOKEN')).toBe(false);
+    expect(isBotmuxManagedTmuxServerGlobalEnvKey('GH_TOKEN')).toBe(false);
+    for (const key of ['BOTMUX_SESSION_ID', 'LARK_APP_ID', 'LARK_APP_SECRET', 'CLAUDECODE']) {
+      expect(isBotmuxManagedTmuxServerGlobalEnvKey(key), key).toBe(true);
     }
   });
 
@@ -252,6 +265,8 @@ describe('tmux subcommand with stale $TMUX', () => {
         CODEX_HOME: '/stale/codex',
         HERMES_HOME: '/stale/hermes',
         LARK_APP_ID: 'stale-app',
+        GITHUB_TOKEN: 'ghp_server_global',
+        GH_TOKEN: 'ghs_server_global',
         HOME: '/safe/home',
       };
       delete pollutedEnv.TMUX;
@@ -272,15 +287,23 @@ describe('tmux subcommand with stale $TMUX', () => {
         expect(scrub.removed).toEqual(expect.arrayContaining([
           'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'CODEX_HOME', 'HERMES_HOME', 'LARK_APP_ID',
         ]));
+        expect(scrub.removed).not.toContain('GITHUB_TOKEN');
+        expect(scrub.removed).not.toContain('GH_TOKEN');
 
         const globalEnv = spawnSync('tmux', ['-L', sock, 'show-environment', '-g'], {
           env: tmuxEnv(), encoding: 'utf-8', timeout: 5000,
         });
         expect(globalEnv.status, globalEnv.stderr).toBe(0);
         expect(globalEnv.stdout).toContain('HOME=/safe/home');
+        expect(globalEnv.stdout).toContain('GITHUB_TOKEN=ghp_server_global');
+        expect(globalEnv.stdout).toContain('GH_TOKEN=ghs_server_global');
         for (const key of ['BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'CODEX_HOME', 'HERMES_HOME', 'LARK_APP_ID']) {
           expect(globalEnv.stdout).not.toMatch(new RegExp(`(?:^|\\n)-?${key}(?:=|\\n|$)`));
         }
+
+        const strippedClientEnv = tmuxEnv(pollutedEnv);
+        expect(strippedClientEnv.GITHUB_TOKEN).toBeUndefined();
+        expect(strippedClientEnv.GH_TOKEN).toBeUndefined();
 
         // The holder existed before the global-table repair, so its process
         // environment remains untouched.

@@ -3,7 +3,18 @@
 // 让 Node 内置 happy-eyeballs 自动选最优路径（IPv4/IPv6 谁先到用谁）。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-const { FakeWebSocket } = vi.hoisted(() => {
+const { FakeWebSocket, createWebSocketStream, netConnect } = vi.hoisted(() => {
+  const fakeStream = () => {
+    const stream = {
+      on: vi.fn(),
+      pipe: vi.fn(),
+      destroy: vi.fn(),
+    };
+    stream.on.mockReturnValue(stream);
+    stream.pipe.mockReturnValue(stream);
+    return stream;
+  };
+
   class FakeWebSocket {
     static OPEN = 1;
     static instances: FakeWebSocket[] = [];
@@ -31,11 +42,16 @@ const { FakeWebSocket } = vi.hoisted(() => {
 
     send(): void {}
     close(): void {}
-    terminate(): void {}
+    terminate = vi.fn();
   }
-  return { FakeWebSocket };
+  return {
+    FakeWebSocket,
+    createWebSocketStream: vi.fn(() => fakeStream()),
+    netConnect: vi.fn(() => fakeStream()),
+  };
 });
-vi.mock('ws', () => ({ WebSocket: FakeWebSocket, createWebSocketStream: vi.fn() }));
+vi.mock('ws', () => ({ WebSocket: FakeWebSocket, createWebSocketStream }));
+vi.mock('node:net', () => ({ default: { connect: netConnect } }));
 
 vi.mock('../src/platform/binding.js', () => ({
   setPlatformTeams: vi.fn(),
@@ -60,6 +76,8 @@ describe('tunnel-client 不强制协议族', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     FakeWebSocket.instances.length = 0;
+    createWebSocketStream.mockClear();
+    netConnect.mockClear();
   });
 
   afterEach(() => {
@@ -100,6 +118,26 @@ describe('tunnel-client 不强制协议族', () => {
     for (const d of dataDials) {
       expect(d.opts.family).toBeUndefined();
     }
+    handle.stop();
+  });
+
+  it('数据连接在 1.2s 后握手成功时不会被提前终止', async () => {
+    const handle = startPlatformTunnelClient(makeOpts());
+    const inst = FakeWebSocket.instances;
+    inst[0]!.readyState = FakeWebSocket.OPEN;
+    inst[0]!.emit('open');
+    inst[0]!.emit('message', JSON.stringify({ type: 'open-stream', streamId: 'slow-handshake' }));
+    const dataDials = inst.slice(CONTROL_DIAL_PARALLEL);
+
+    await vi.advanceTimersByTimeAsync(1_200);
+    expect(dataDials).toHaveLength(3);
+    expect(dataDials.every((dial) => dial.terminate.mock.calls.length === 0)).toBe(true);
+
+    dataDials[0]!.readyState = FakeWebSocket.OPEN;
+    dataDials[0]!.emit('open');
+    expect(dataDials[0]!.terminate).not.toHaveBeenCalled();
+    expect(createWebSocketStream).toHaveBeenCalledWith(dataDials[0]);
+    expect(netConnect).toHaveBeenCalledWith(7891, '127.0.0.1');
     handle.stop();
   });
 

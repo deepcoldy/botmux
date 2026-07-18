@@ -30,6 +30,17 @@ describe('redactChildEnv()', () => {
     expect(base.CLAUDECODE).toBe('1');
   });
 
+  it('removes GitHub tokens from child env', () => {
+    const out = redactChildEnv({
+      GITHUB_TOKEN: 'ghp_secret',
+      GH_TOKEN: 'ghs_secret',
+      KEEP: 'v',
+    });
+    expect('GITHUB_TOKEN' in out).toBe(false);
+    expect('GH_TOKEN' in out).toBe(false);
+    expect(out.KEEP).toBe('v');
+  });
+
   it('real node-pty child does NOT inherit a redacted var (not the string "undefined")', async () => {
     // End-to-end guard for the actual leak vector Codex found: a spawned child
     // must see the redacted var as genuinely UNSET. `${VAR+x}` expands to empty

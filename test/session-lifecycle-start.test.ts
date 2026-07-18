@@ -453,6 +453,19 @@ describe('session.start lifecycle integration', () => {
     }));
   });
 
+  it('removes GitHub tokens from the daemon→worker fork env', () => {
+    vi.stubEnv('GITHUB_TOKEN', 'ghp_secret');
+    vi.stubEnv('GH_TOKEN', 'ghs_secret');
+
+    forkWorker(makeDs(), 'hello', false);
+
+    const forkOpts = forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> } | undefined;
+    expect(forkOpts?.env?.GITHUB_TOKEN).toBeUndefined();
+    expect(forkOpts?.env?.GH_TOKEN).toBeUndefined();
+
+    vi.unstubAllEnvs();
+  });
+
   it('re-checks the resident-session cap after spawn and again on an idle edge', async () => {
     const enforceLiveSessionCap = vi.fn();
     initWorkerPool({
@@ -491,6 +504,27 @@ describe('session.start lifecycle integration', () => {
       adoptedFrom: 'bmx-deadbeef:0.0',
       pid: 12345,
     }));
+  });
+
+  it('removes GitHub tokens from the daemon→adopt-worker fork env', () => {
+    vi.stubEnv('GITHUB_TOKEN', 'ghp_secret');
+    vi.stubEnv('GH_TOKEN', 'ghs_secret');
+
+    forkAdoptWorker(makeDs({
+      adoptedFrom: {
+        tmuxTarget: 'bmx-deadbeef:0.0',
+        originalCliPid: 23456,
+        sessionId: 'codex-session',
+        cliId: 'codex',
+        cwd: '/repo',
+      },
+    }));
+
+    const forkOpts = forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> } | undefined;
+    expect(forkOpts?.env?.GITHUB_TOKEN).toBeUndefined();
+    expect(forkOpts?.env?.GH_TOKEN).toBeUndefined();
+
+    vi.unstubAllEnvs();
   });
 
   it('passes plugin bindings and Skill policy to the worker for CLI-generation refresh', () => {

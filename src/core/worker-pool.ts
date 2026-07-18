@@ -110,6 +110,13 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const WORKER_SIGTERM_BACKSTOP_MS = 2_000;
 const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
+const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN'] as const;
+
+function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base };
+  for (const key of WORKER_REDACTED_ENV_KEYS) delete env[key];
+  return env;
+}
 
 // ─── Callbacks set by daemon at startup ─────────────────────────────────────
 
@@ -1999,12 +2006,13 @@ export function forkWorker(
   const botmuxBinDir = join(homedir(), '.botmux', 'bin');
   const pathWithBotmux = prependBotmuxBin(botmuxBinDir, process.env.PATH);
 
+  const forkEnv = workerForkEnv(process.env);
   const worker = fork(workerPath, [], {
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     cwd,
     env: {
-      ...process.env,
+      ...forkEnv,
       PATH: pathWithBotmux,
       CLAUDECODE: undefined,
       BOTMUX: '1',  // Marker so user scripts/skills can detect a botmux-spawned CLI
@@ -3745,12 +3753,13 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   const rawAdoptCwd = adopted.cwd ?? ds.workingDir ?? process.cwd();
   const adoptCwd = rawAdoptCwd && existsSync(rawAdoptCwd) ? rawAdoptCwd : homedir();
   if (adoptCwd !== rawAdoptCwd) logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
+  const forkEnv = workerForkEnv(process.env);
   const worker = fork(workerPath, [], {
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     cwd: adoptCwd,
     env: {
-      ...process.env,
+      ...forkEnv,
       CLAUDECODE: undefined,
       BOTMUX: '1',
       LARK_APP_ID: botCfg.larkAppId,

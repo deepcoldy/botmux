@@ -278,6 +278,30 @@ describe('discoverAdoptableSessions', () => {
     });
   });
 
+  it('should discover panes in sessions whose name contains spaces', () => {
+    // 真实回归：tmux 会话名可以含空格（如「AD 智投星核心指标」）。list-panes 输出
+    // 变成 "AD 智投星核心指标:0.0 1000"，按第一个空格切分会把 pid 解析成 NaN，
+    // pane 被静默跳过，/adopt 永远扫不到这个会话。
+    setupMocks({
+      paneLines: 'AD 智投星核心指标:0.0 1000\n',
+      commMap: { 1000: 'fish', 1001: 'claude' },
+      childMap: { 1000: [1001] },
+      cwdMap: { 1001: '/home/user/project' },
+      dimsMap: { 'AD 智投星核心指标:0.0': '210 61' },
+      claudeMeta: {
+        1001: JSON.stringify({ sessionId: 'sess-spaced', cwd: '/home/user/project', startedAt: 1700000000000 }),
+      },
+    });
+
+    const results = discoverAdoptableSessions();
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.tmuxTarget).toBe('AD 智投星核心指标:0.0');
+    expect(results[0]!.panePid).toBe(1000);
+    expect(results[0]!.cliPid).toBe(1001);
+    expect(results[0]!.sessionId).toBe('sess-spaced');
+  });
+
   it('should discover multiple CLI types', () => {
     setupMocks({
       paneLines: 'dev:0.0 1000\ndev:1.0 2000\n',

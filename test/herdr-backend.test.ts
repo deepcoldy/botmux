@@ -283,6 +283,30 @@ describe('HerdrBackend.spawn', () => {
     be.kill();
   });
 
+  it('per-bot GitHub tokens still flow through injectEnv to the CLI start env', () => {
+    let listCount = 0;
+    setHerdrResponses([
+      {
+        match: a => a[0] === 'session' && a[1] === 'list',
+        reply: () => { listCount++; return listCount >= 2 ? EXISTING_SESSION_REPLY : EMPTY_SESSIONS_REPLY; },
+      },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { createSession: true });
+    be.spawn('claude', [], {
+      cwd: '/work', cols: 80, rows: 24,
+      env: { BOTMUX_SESSION_ID: 'sess_x' },
+      injectEnv: { GITHUB_TOKEN: 'ghp_explicit_bot' },
+    });
+
+    const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
+    expect(serverSpawn?.[2].env.GITHUB_TOKEN).toBe('ghp_explicit_bot');
+    const startOpts = findCallOpts(a => a.includes('agent') && a.includes('start'));
+    expect(startOpts?.env?.GITHUB_TOKEN).toBe('ghp_explicit_bot');
+    be.kill();
+  });
+
   it('without injectEnv the server env carries only the base env (no provider keys)', () => {
     let listCount = 0;
     setHerdrResponses([

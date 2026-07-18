@@ -11,6 +11,11 @@
 | `SESSION_DATA_DIR` | `~/.botmux/data` | 会话和队列存储目录 |
 | `BACKEND_TYPE` | _(自动检测)_ | `pty` 强制降级到纯 pty 模式 |
 | `DEBUG` | _(未设置)_ | 设为 `1` 启用调试日志 |
+| `GITHUB_TOKEN` | _(未设置)_ | GitHub Releases API 认证 token。用于 Dashboard changelog、更新检查、restart-report 等 botmux 自身发起的 GitHub 请求。优先级高于 `GH_TOKEN`。 |
+| `GH_TOKEN` | _(未设置)_ | GitHub Releases API 认证 token 后备变量。仅在 `GITHUB_TOKEN` 未设置时使用。 |
+
+> `GITHUB_TOKEN` / `GH_TOKEN` 可写在调用进程环境，或写入 `~/.botmux/.env` 供 daemon 与独立 Dashboard 进程读取。
+> botmux 只把它们用于自身 GitHub 请求，不会自动下发给 worker / agent；如需某个 bot 显式继承 token，需在该 bot 的 `env` 中单独配置。
 
 ### Dashboard 相关
 

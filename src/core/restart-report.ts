@@ -6,6 +6,7 @@
  * groups on restart (those stay silent now). See core/maintenance.ts and the
  * daemon startup wiring.
  */
+import { githubAuthHeaders, type GithubAuthResolveOptions } from './github-auth.js';
 import type { RestartKind } from '../services/restart-intent-store.js';
 import { consumeRestartIntent } from '../services/restart-intent-store.js';
 import { countActiveSessionsOnDisk } from '../services/session-store.js';
@@ -87,6 +88,7 @@ export interface RestartReportWiring {
   dashboardLocalUrl?: string | undefined;
   /** Send the interactive card as a p2p DM to the owner. */
   sendCard: (openId: string, cardJson: string) => Promise<void>;
+  githubAuth?: GithubAuthResolveOptions;
   now?: number;
   log?: (msg: string) => void;
 }
@@ -108,7 +110,7 @@ export async function sendRestartReportIfPending(w: RestartReportWiring): Promis
   const version = botmuxVersion();
   let changelog: string | undefined;
   if (intent.kind === 'update' && intent.newVersion) {
-    changelog = (await fetchChangelog(intent.newVersion))
+    changelog = (await fetchChangelog(intent.newVersion, { auth: w.githubAuth }))
       ?? t('restart.changelog_link_fallback', { url: releasesUrl(intent.newVersion) }, locale);
   }
   const card = buildRestartReportCard({
@@ -131,11 +133,19 @@ export async function sendRestartReportIfPending(w: RestartReportWiring): Promis
 
 /** Best-effort GitHub release notes for a version. null on any failure (offline,
  *  rate-limited, release not yet published) — caller falls back to a link. */
-export async function fetchChangelog(newVersion: string): Promise<string | null> {
+export async function fetchChangelog(
+  newVersion: string,
+  opts?: { auth?: GithubAuthResolveOptions; fetchImpl?: typeof fetch; timeoutMs?: number },
+): Promise<string | null> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
   try {
-    const res = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${vtag(newVersion)}`, {
-      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'botmux' },
-      signal: AbortSignal.timeout(8_000),
+    const res = await fetchImpl(`https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${vtag(newVersion)}`, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'botmux',
+        ...githubAuthHeaders(opts?.auth),
+      },
+      signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });
     if (!res.ok) return null;
     const body = await res.json() as { body?: string };

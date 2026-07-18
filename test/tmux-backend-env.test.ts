@@ -569,6 +569,8 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
           __OWNER_OPEN_ID: 'ou_stale',
           BOTMUX_SESSION_ID: 'stale-session',
           BOTMUX_CHAT_ID: 'stale-chat',
+          GITHUB_TOKEN: 'ghp_stale',
+          GH_TOKEN: 'ghs_stale',
           IS_SANDBOX: '1',
           CLAUDE_CONFIG_DIR: '/stale/claude',
           CODEX_HOME: '/stale/codex',
@@ -585,11 +587,41 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
       expect(lines).toContain('BOTMUX_SESSION_ID=fresh-session');
       expect(lines).toContain('BOTMUX_CHAT_ID=fresh-chat');
       for (const key of [
+        'GITHUB_TOKEN', 'GH_TOKEN',
         'IS_SANDBOX', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'HERMES_HOME',
         'HERMES_BOTMUX_SOURCE_HOME', 'HERMES_BOTMUX_PROFILES_ROOT',
       ]) {
         expect(lines.some(line => line.startsWith(`${key}=`)), key).toBe(false);
       }
+    },
+  );
+
+  it.skipIf(!hasEnvBin)(
+    'wrapper unsets inherited GitHub tokens before re-adding an explicit per-bot pane token',
+    () => {
+      const cwd = tmpdir();
+      const envAssignments = buildBotmuxEnvAssignments(
+        { BOTMUX: '1', SESSION_DATA_DIR: '/fresh-dir' },
+        { GITHUB_TOKEN: 'ghp_explicit_bot' },
+      );
+      const result = spawnSync(
+        '/bin/sh',
+        ['-c', SCRIPT, '_', cwd, ...envAssignments, '/usr/bin/env'],
+        {
+          encoding: 'utf-8',
+          env: {
+            GITHUB_TOKEN: 'ghp_stale_server',
+            GH_TOKEN: 'ghs_stale_server',
+            PATH: '/usr/bin:/bin',
+            HOME: '/tmp',
+          },
+        },
+      );
+      expect(result.status).toBe(0);
+      const lines = result.stdout.split('\n');
+      expect(lines).toContain('GITHUB_TOKEN=ghp_explicit_bot');
+      expect(lines.some(line => line === 'GITHUB_TOKEN=ghp_stale_server')).toBe(false);
+      expect(lines.some(line => line.startsWith('GH_TOKEN='))).toBe(false);
     },
   );
 

@@ -671,8 +671,10 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
     const lines = panesRaw.split('\n').filter(Boolean);
 
     for (const line of lines) {
-      // Parse: "session_name:window_index.pane_index pane_pid"
-      const spaceIdx = line.indexOf(' ');
+      // Parse: "session_name:window_index.pane_index pane_pid"。
+      // 必须按最后一个空格切分：会话名本身可能含空格（如「AD 智投星:0.0 651511」），
+      // 按第一个空格切会把 pid 解析成 NaN，pane 被静默跳过、/adopt 扫不到。
+      const spaceIdx = line.lastIndexOf(' ');
       if (spaceIdx === -1) continue;
 
       const tmuxTarget = line.slice(0, spaceIdx);

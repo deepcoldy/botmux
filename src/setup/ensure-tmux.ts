@@ -24,7 +24,10 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
-import { isBotmuxManagedTmuxEnvKey } from '../utils/child-env.js';
+import {
+  isBotmuxManagedTmuxEnvKey,
+  isBotmuxManagedTmuxServerGlobalEnvKey,
+} from '../utils/child-env.js';
 
 export interface TmuxResult {
   installed: boolean;
@@ -119,15 +122,13 @@ function probeTmuxVersion(): TmuxVersionProbe {
  * alone — it just changes the socket directory and is the user's deliberate
  * override if set.
  *
- * tmuxEnv ALSO strips botmux's own session/bot-scoped vars
- * (isBotmuxManagedTmuxEnvKey): when botmux's first `tmux new-session` boots the
- * server, tmux copies this client env into the server's *global* environment,
- * which then leaks into every co-tenant session on the socket — including the
- * user's own interactive tmux, whose Claude Code would then misroute its
- * AskUserQuestion hook to whatever BOTMUX_SESSION_ID/CHAT_ID it inherited. The
- * pane gets the correct per-session values from the env(1) wrapper injection
- * instead, so this strip is invisible to botmux's own sessions. See
- * TMUX_CLIENT_STRIP_KEYS in utils/child-env.ts.
+ * tmuxEnv ALSO strips botmux's own session/bot-scoped vars and daemon-side
+ * bare creds (isBotmuxManagedTmuxEnvKey): when botmux's first `tmux
+ * new-session` boots the server, tmux copies this client env into the server's
+ * *global* environment, which then leaks into every co-tenant session on the
+ * socket — including the user's own interactive tmux. The pane gets the
+ * correct per-session values from the env(1) wrapper injection instead, so
+ * this strip is invisible to botmux's own sessions.
  */
 const TMUX_PATH_EXTRAS = [
   '/opt/homebrew/bin',
@@ -204,7 +205,7 @@ export function scrubTmuxServerGlobalEnv(socketName?: string): TmuxGlobalEnvScru
     // `show-environment -g` prints `NAME=value`, or `-NAME` for an explicitly
     // removed entry. Take the name in both shapes.
     .map(line => (line.startsWith('-') ? line.slice(1) : line.split('=', 1)[0]).trim())
-    .filter(name => name.length > 0 && isBotmuxManagedTmuxEnvKey(name));
+    .filter(name => name.length > 0 && isBotmuxManagedTmuxServerGlobalEnvKey(name));
 
   const removed: string[] = [];
   const failed: string[] = [];

@@ -11,6 +11,11 @@
 | `SESSION_DATA_DIR` | `~/.botmux/data` | Session and queue storage directory |
 | `BACKEND_TYPE` | _(auto-detect)_ | `pty` forces a downgrade to pure pty mode |
 | `DEBUG` | _(unset)_ | Set to `1` to enable debug logging |
+| `GITHUB_TOKEN` | _(unset)_ | Auth token for GitHub Releases API requests made by botmux itself, including dashboard changelog, update checks, and restart-report. Takes precedence over `GH_TOKEN`. |
+| `GH_TOKEN` | _(unset)_ | Fallback auth token for GitHub Releases API requests. Used only when `GITHUB_TOKEN` is unset. |
+
+> `GITHUB_TOKEN` / `GH_TOKEN` may be provided in the calling process environment or in `~/.botmux/.env` so both the daemon and the standalone Dashboard process can read them.
+> botmux uses these tokens only for its own GitHub requests and strips them from default worker / agent inheritance. If a specific bot should receive a token explicitly, configure it in that bot's own `env`.
 
 ### Dashboard-related
 
