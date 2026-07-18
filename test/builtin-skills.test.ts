@@ -189,6 +189,48 @@ describe('built-in botmux-handoff skill', () => {
   });
 });
 
+describe('built-in botmux-orchestrate skill', () => {
+  it('teaches the product entry that creates a real goal group and starts supervision', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-orchestrate');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('botmux goal start');
+    expect(skill!.content).toContain('--team');
+    expect(skill!.content).toContain('--project');
+    expect(skill!.content).toContain('--chat-id <goalChatId>');
+    expect(skill!.content).toContain('平台机器人大厅会被拒绝');
+    expect(skill!.content).toContain('当前 L1 会话所属的本机在线 bot');
+    expect(skill!.content).toContain('新目标群只邀请当前目标的发起人');
+    expect(skill!.content).toContain('本机项目没有 origin 时必须先报错');
+  });
+
+  it('teaches L2 how to execute dashboard panel actions through the ledger workflow', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-orchestrate');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('[panel-action v1]');
+    expect(skill!.content).toContain('reassign-worker');
+    expect(skill!.content).toContain('switch-worker');
+    expect(skill!.content).toContain('escalate-human');
+    expect(skill!.content).toContain('resolve-help');
+    expect(skill!.content).toContain('confirm-release');
+    expect(skill!.content).toContain('delivery release-confirm --task');
+    expect(skill!.content).toContain('delivery release-retry --task');
+    expect(skill!.content).toContain('先查交付记录和 charter');
+    expect(skill!.content).toContain('delivery escalate');
+    expect(skill!.content).toContain('--needs-repo <git remote URL>');
+    expect(skill!.content).toContain('缺少项目环境');
+    expect(skill!.content).toContain('不弹仓库选择卡、不暂存任务');
+  });
+
+  it('teaches the supervisor to cancel unneeded tasks and keep workers on the help path', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-orchestrate');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('delivery cancel --task');
+    expect(skill!.content).toContain('已验收（accepted）不能取消');
+    expect(skill!.content).toContain('不许它自我取消');
+    expect(skill!.content).toContain('help:missing_repo');
+  });
+});
+
 describe('built-in botmux-whiteboard skill', () => {
   it('is NOT in BUILTIN_SKILLS — installed conditionally on the whiteboard toggle', () => {
     // The whiteboard feature is off by default, so its skill must not be written

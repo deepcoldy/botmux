@@ -9,6 +9,11 @@ const hoisted = vi.hoisted(() => {
     listBotsApiEnabled: false,
     listBotsApiTimeoutMs: 3000,
     listBotsApiItems: undefined as Array<{ bot_id: string; bot_name: string }> | undefined,
+    listBotsApiPages: undefined as Record<string, {
+      items: Array<{ bot_id: string; bot_name: string }>;
+      hasMore?: boolean;
+      nextPageToken?: string;
+    }> | undefined,
     listBotsApiError: undefined as Error | undefined,
     listBotsApiCode: 0,
     listBotsApiCalls: 0,
@@ -24,14 +29,20 @@ const hoisted = vi.hoisted(() => {
     }
 
     // isInChat and members/bots now route through client.request().
-    async request({ url }: { url: string }) {
+    async request({ url, params }: { url: string; params?: Record<string, unknown> }) {
       if (url.includes('/members/bots')) {
         state.listBotsApiCalls++;
         if (state.listBotsApiError) throw state.listBotsApiError;
+        const pageToken = String(params?.page_token ?? '');
+        const page = state.listBotsApiPages?.[pageToken];
         return {
           code: state.listBotsApiCode,
           msg: state.listBotsApiCode === 0 ? 'success' : 'business error',
-          data: { items: state.listBotsApiItems ?? [] },
+          data: {
+            items: page?.items ?? state.listBotsApiItems ?? [],
+            has_more: page?.hasMore ?? false,
+            page_token: page?.nextPageToken,
+          },
         };
       }
       if (url.includes('/members/is_in_chat')) {
@@ -88,6 +99,7 @@ describe('listChatBotMembers', () => {
     state.listBotsApiEnabled = false;
     state.listBotsApiTimeoutMs = 3000;
     state.listBotsApiItems = undefined;
+    state.listBotsApiPages = undefined;
     state.listBotsApiError = undefined;
     state.listBotsApiCode = 0;
     state.listBotsApiCalls = 0;
@@ -104,6 +116,74 @@ describe('listChatBotMembers', () => {
 
     expect(state.listBotsApiCalls).toBe(0);
     expect(bots.some(b => b.larkAppId === 'cli_self')).toBe(true);
+  });
+
+  it('probes authoritative membership even when roster discovery fallback is disabled', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-probe-chat-bots-'));
+    state.listBotsApiEnabled = false;
+    state.listBotsApiItems = [
+      { bot_id: 'ou_worker', bot_name: 'relay-loopy' },
+    ];
+
+    const { probeChatBotMembership } = await import('../src/im/lark/client.js');
+    await expect(probeChatBotMembership('cli_self', 'oc_goal')).resolves.toEqual({
+      known: true,
+      members: [{ openId: 'ou_worker', name: 'relay-loopy' }],
+    });
+    expect(state.listBotsApiCalls).toBe(1);
+  });
+
+  it('reads every /members/bots page before deciding that a worker is absent', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-probe-chat-bots-'));
+    state.listBotsApiPages = {
+      '': {
+        items: [{ bot_id: 'ou_first', bot_name: 'first-loopy' }],
+        hasMore: true,
+        nextPageToken: 'page-2',
+      },
+      'page-2': {
+        items: [{ bot_id: 'ou_worker', bot_name: 'relay-loopy' }],
+      },
+    };
+
+    const { probeChatBotMembership } = await import('../src/im/lark/client.js');
+    await expect(probeChatBotMembership('cli_self', 'oc_goal')).resolves.toEqual({
+      known: true,
+      members: [
+        { openId: 'ou_first', name: 'first-loopy' },
+        { openId: 'ou_worker', name: 'relay-loopy' },
+      ],
+    });
+    expect(state.listBotsApiCalls).toBe(2);
+  });
+
+  it('treats broken /members/bots pagination as unknown instead of a false absence', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-probe-chat-bots-'));
+    state.listBotsApiPages = {
+      '': {
+        items: [{ bot_id: 'ou_first', bot_name: 'first-loopy' }],
+        hasMore: true,
+      },
+    };
+
+    const { probeChatBotMembership } = await import('../src/im/lark/client.js');
+    await expect(probeChatBotMembership('cli_self', 'oc_goal')).resolves.toEqual({
+      known: false,
+      members: [],
+      reason: 'invalid_pagination',
+    });
+  });
+
+  it('makes membership API failures explicit instead of returning a false empty roster', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-probe-chat-bots-'));
+    state.listBotsApiError = new Error('gateway timeout');
+
+    const { probeChatBotMembership } = await import('../src/im/lark/client.js');
+    await expect(probeChatBotMembership('cli_self', 'oc_goal')).resolves.toEqual({
+      known: false,
+      members: [],
+      reason: 'gateway timeout',
+    });
   });
 
   it('uses /members/bots as current-chat truth when enabled and does not resurrect stale observed rows', async () => {

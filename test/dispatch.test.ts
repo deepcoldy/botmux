@@ -19,12 +19,14 @@ import {
   buildDispatchMessages,
   buildRepoPrimeText,
   buildReportContent,
+  buildReportText,
   findSubBotTopic,
   eligibleAutoMentionAliases,
   offTopicSubBotTopic,
   resolveReportTarget,
   resolveSendTarget,
 } from '../src/core/dispatch.js';
+import { parseDispatchRepoRequirement } from '../src/core/repo-requirement.js';
 
 describe('parseDispatchBotSpec', () => {
   it('parses a bare open_id', () => {
@@ -92,6 +94,42 @@ describe('buildDispatchMessages', () => {
   it('throws on an empty title', () => {
     expect(() => buildDispatchMessages({ title: '   ', brief: 'b', bots })).toThrow();
   });
+
+  it('appends repo preflight metadata after human task content', () => {
+    const r = buildDispatchMessages({
+      title: 't',
+      brief: '完成任务',
+      bots,
+      repoRequirement: { taskId: 'task-1', repo: 'https://github.com/acme/project.git' },
+    });
+    const text = allText(r.threadContent);
+    const parsed = parseDispatchRepoRequirement(text);
+    expect(parsed).toMatchObject({
+      taskId: 'task-1',
+      repo: 'https://github.com/acme/project.git',
+    });
+    expect(parsed?.content).toContain('完成任务');
+    expect(parsed?.content).toContain('Alice：coder');
+    expect(parsed?.content).not.toContain('[botmux-dispatch v1]');
+    expect(r.kickoffText).toContain('<at user_id="ou_a"></at>（coder）');
+    expect(r.kickoffText).toContain('完成任务');
+  });
+
+  it('builds a plain-text kickoff that survives receiver preflight', () => {
+    const r = buildDispatchMessages({
+      title: 't',
+      brief: '跨设备任务',
+      bots,
+      repoRequirement: { taskId: 'task-post-1', repo: 'git@git.example.com:team/repo.git' },
+    });
+    expect(r.kickoffText).toContain('<at user_id="ou_a"></at>');
+    expect(r.kickoffText).toContain('<at user_id="ou_b"></at>');
+    expect(parseDispatchRepoRequirement(r.kickoffText)).toMatchObject({
+      taskId: 'task-post-1',
+      repo: 'git@git.example.com:team/repo.git',
+      content: expect.stringContaining('跨设备任务'),
+    });
+  });
 });
 
 describe('buildRepoPrimeText', () => {
@@ -146,12 +184,49 @@ describe('buildReportContent', () => {
     expect(paras[1]).toEqual([{ tag: 'text', text: '产出在 /tmp/out' }]);
   });
 
+  it('keeps a delivery envelope at the first meaningful line', () => {
+    const envelope = [
+      '[botmux-report v1]',
+      'taskId: task-1',
+      'summary: 完成',
+      'evidence:',
+      '- inline: name=result PASS',
+    ].join('\n');
+    const paras = buildReportContent({
+      orchOpenId: 'ou_orch',
+      content: '远端项目命中并完成只读自检',
+      deliveryEnvelope: envelope,
+    });
+
+    expect(paras[0]).toEqual([
+      { tag: 'at', user_id: 'ou_orch' },
+      { tag: 'text', text: ' ' },
+      { tag: 'text', text: '[botmux-report v1]' },
+    ]);
+    expect(paras.flat().map((node) => node.tag === 'text' ? node.text : '').join('\n'))
+      .not.toContain('远端项目命中并完成只读自检');
+  });
+
   it('throws on empty content', () => {
     expect(() => buildReportContent({ orchOpenId: 'ou_orch', content: '   ' })).toThrow();
   });
 
   it('throws on empty orchestrator open_id', () => {
     expect(() => buildReportContent({ orchOpenId: '  ', content: 'x' })).toThrow();
+  });
+});
+
+describe('buildReportText', () => {
+  it('puts the native mention before the whole-message envelope', () => {
+    expect(buildReportText({
+      orchOpenId: 'ou_orch',
+      content: '[botmux-report v1]\ntaskId: task-1',
+    })).toBe('<at user_id="ou_orch"></at>\n[botmux-report v1]\ntaskId: task-1');
+  });
+
+  it('rejects empty content or orchestrator ids', () => {
+    expect(() => buildReportText({ orchOpenId: '', content: 'x' })).toThrow();
+    expect(() => buildReportText({ orchOpenId: 'ou_orch', content: ' ' })).toThrow();
   });
 });
 

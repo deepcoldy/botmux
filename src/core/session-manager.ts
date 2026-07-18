@@ -23,7 +23,7 @@ import {
 } from '../skills/injection-mode.js';
 import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, probePersistentBackendServer, killPersistentSession, type PersistentBackendType } from './persistent-backend.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
-import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { getBot, getAllBots, isGoalPanelApp, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
@@ -198,6 +198,18 @@ export function getProjectScanDir(ds?: DaemonSession): string {
   return getSessionWorkingDir(ds);
 }
 
+/** Configured project roots for a bot, usable before a DaemonSession exists. */
+export function getBotProjectScanDirs(larkAppId: string, extraWorkingDir?: string): string[] {
+  const bot = getBot(larkAppId);
+  const dirs = new Set<string>();
+  const workingDirs = bot.config.workingDirs?.length
+    ? bot.config.workingDirs
+    : parseWorkingDirList(bot.config.workingDir ?? '~');
+  for (const wd of workingDirs) dirs.add(expandHome(wd));
+  if (extraWorkingDir) dirs.add(expandHome(extraWorkingDir));
+  return [...dirs];
+}
+
 /**
  * Return all directories to scan for projects (supports multi-dir WORKING_DIR).
  * Each configured workingDir is used as the scan root AS-IS — scanProjects
@@ -206,18 +218,7 @@ export function getProjectScanDir(ds?: DaemonSession): string {
  */
 export function getProjectScanDirs(ds?: DaemonSession): string[] {
   if (ds?.larkAppId) {
-    const bot = getBot(ds.larkAppId);
-    const dirs = new Set<string>();
-    const workingDirs = bot.config.workingDirs?.length
-      ? bot.config.workingDirs
-      : parseWorkingDirList(bot.config.workingDir ?? '~');
-    for (const wd of workingDirs) {
-      dirs.add(expandHome(wd));
-    }
-    if (ds.workingDir) {
-      dirs.add(expandHome(ds.workingDir));
-    }
-    return [...dirs];
+    return getBotProjectScanDirs(ds.larkAppId, ds.workingDir);
   }
   // Fallback to global config
   const dirs = new Set<string>();
@@ -300,7 +301,7 @@ export async function getAvailableBots(
       // a same-cliId peer. Only surface bots we can RELIABLY @-mention from
       // here: an unreliable open_id (peer self-view / appId fallback) would make
       // the model's `botmux send --mention <open_id>` miss its target.
-      .filter(b => b.larkAppId !== currentAppId && b.mentionable)
+      .filter(b => b.larkAppId !== currentAppId && b.mentionable && !isGoalPanelApp(b.larkAppId))
       .map(b => ({
         name: b.name,
         displayName: b.displayName,

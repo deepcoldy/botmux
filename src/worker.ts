@@ -785,6 +785,16 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
   const targetBackend = backend;
   if (!targetBackend) return;
 
+  // A passthrough is still an accepted input boundary. Rotate (or revoke) the
+  // marker immediately before the literal command reaches the CLI so it can
+  // never inherit a previous human turn. System-generated raw commands omit
+  // turnId and therefore publish an explicitly unattributed marker.
+  currentBotmuxTurnId = msg.turnId;
+  currentBotmuxDispatchAttempt = undefined;
+  currentVcMeetingImTurnOrigin = undefined;
+  writeCliPidMarker();
+  publishSandboxRelayCapability();
+
   let sent = false;
   try {
     await sendRawCommandLineSerially(targetBackend, msg.content);
@@ -802,7 +812,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
   // Enter lands. sendToPty also observes commandLineWritesPending, so another
   // raw command's text -> Enter window cannot be interrupted by the follow-up.
   if (sent && msg.followUpContent) {
-    sendToPty(msg.followUpContent, undefined, {
+    sendToPty(msg.followUpContent, msg.followUpTurnId, {
       codexAppInput: msg.followUpCodexAppInput,
     });
     log(`Enqueued follow-up after raw input (${msg.followUpContent.length} chars)`);

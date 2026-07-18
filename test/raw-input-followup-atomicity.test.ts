@@ -74,8 +74,19 @@ describe('worker raw_input delivery', () => {
   });
 
   it('routes the follow-up through sendToPty (normal busy-queue semantics)', () => {
-    expect(region).toContain('sendToPty(msg.followUpContent, undefined, {');
+    expect(region).toContain('sendToPty(msg.followUpContent, msg.followUpTurnId, {');
     expect(region).toContain('codexAppInput: msg.followUpCodexAppInput');
+  });
+
+  it('rotates or revokes the marker immediately before writing the raw command', () => {
+    const bindIdx = region.indexOf('currentBotmuxTurnId = msg.turnId');
+    const markerIdx = region.indexOf('writeCliPidMarker()');
+    const capabilityIdx = region.indexOf('publishSandboxRelayCapability()');
+    const sendIdx = region.indexOf('await sendRawCommandLineSerially(targetBackend, msg.content)');
+    expect(bindIdx).toBeGreaterThanOrEqual(0);
+    expect(markerIdx).toBeGreaterThan(bindIdx);
+    expect(capabilityIdx).toBeGreaterThan(markerIdx);
+    expect(sendIdx).toBeGreaterThan(capabilityIdx);
   });
 
   it('holds ordinary prompt flushes only for the text-to-Enter critical window', () => {

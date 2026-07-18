@@ -37,6 +37,8 @@ export interface PlatformTeamBot {
   appId: string;
   unionId?: string;
   name?: string;
+  botmuxVersion?: string;
+  a2aCapabilities?: string[];
 }
 
 export interface PlatformTeamSyncTeam {
@@ -93,7 +95,21 @@ function sanitizeTeam(raw: unknown): PlatformTeamSyncTeam | null {
       if (!appId) continue;
       const unionId = typeof (b as Record<string, unknown>).unionId === 'string' ? String((b as Record<string, unknown>).unionId).trim() : '';
       const name = typeof (b as Record<string, unknown>).name === 'string' ? String((b as Record<string, unknown>).name) : undefined;
-      bots.push({ appId, unionId: unionId || undefined, name });
+      const botmuxVersion = typeof (b as Record<string, unknown>).botmuxVersion === 'string'
+        ? String((b as Record<string, unknown>).botmuxVersion).trim()
+        : '';
+      const a2aCapabilities = Array.isArray((b as Record<string, unknown>).a2aCapabilities)
+        ? ((b as Record<string, unknown>).a2aCapabilities as unknown[])
+          .filter((value): value is string => typeof value === 'string' && !!value.trim())
+          .map((value) => value.trim())
+        : undefined;
+      bots.push({
+        appId,
+        unionId: unionId || undefined,
+        name,
+        ...(botmuxVersion ? { botmuxVersion } : {}),
+        ...(a2aCapabilities ? { a2aCapabilities } : {}),
+      });
     }
   }
   const memberUnionIds = Array.isArray(t.memberUnionIds)

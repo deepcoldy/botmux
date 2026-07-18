@@ -1,8 +1,8 @@
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync, realpathSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -27,8 +27,10 @@ import {
   stopCliRuntimeUpdateMonitor,
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
+import { classifyGoalWorkerHealth, type GoalWorkerProcessState, type GoalWorkerSessionState } from './core/goal-worker-health.js';
+import { countGoalWorkerReassignAttempts, DEFAULT_GOAL_WORKER_REASSIGN_MAX_ATTEMPTS, latestTaskDispatchEvent } from './core/goal-reassign-budget.js';
 import { statSync } from 'node:fs';
-import { addReaction, getChatMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { addReaction, getChatMode, getMessageChatId, listChatBotMembers, listChatMemberOpenIds, MessageWithdrawnError, probeChatBotMembership, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigs,
@@ -36,6 +38,9 @@ import {
   getBot,
   getAllBots,
   getOwnerOpenId,
+  getBotBrand,
+  getGoalPanelConfig,
+  isGoalPanelApp,
   findOncallChat,
   effectiveDefaultWorkingDir,
   effectiveBotDisplayName,
@@ -54,6 +59,19 @@ import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import * as messageQueue from './services/message-queue.js';
+import { getGoalParentNotification, rememberGoalParentNotification, type GoalParentNotificationRecord } from './services/goal-parent-notification-store.js';
+import { normalizeGoalDecisionOptions, type GoalDecisionOption } from './services/goal-decision-options.js';
+import { getGoalChat } from './services/goal-chat-store.js';
+import {
+  listDueGoalNotificationRetries,
+  listGoalNotificationRetries,
+  markGoalNotificationRetryAttempt,
+  markGoalNotificationRetryDead,
+  markGoalNotificationRetrySent,
+  removeGoalNotificationRetry,
+  upsertGoalNotificationRetry,
+  type GoalNotificationRetryRecord,
+} from './services/goal-notification-retry-store.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
@@ -67,7 +85,7 @@ import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js'
 import type { Session, VcMeetingImTurnOrigin } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
-import { invalidWorkingDirs } from './utils/working-dir.js';
+import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
@@ -78,7 +96,7 @@ import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-pr
 import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
-import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { buildGoalHumanAttentionCard, buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
 import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
@@ -105,7 +123,7 @@ import {
 } from './core/worker-pool.js';
 import { ipcRoute, isTrustedHostIpcRequest, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger } from './core/dashboard-ipc-server.js';
 import { loadOrCreateDashboardSecret } from './dashboard/auth.js';
-import { daemonIpcAuthHeaders, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
+import { daemonIpcAuthHeaders, fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
   authorizeSessionScopedIpc,
   bindSessionScopedIpcIdentity,
@@ -119,10 +137,12 @@ import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
 import { consumeQuota, removeChatGrant, removeGlobalGrant } from './services/grant-store.js';
 import { abortCharge, commitCharge, beginCharge } from './services/quota-dedup.js';
+import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import {
   getSessionWorkingDir,
   getProjectScanDir,
   getProjectScanDirs,
+  getBotProjectScanDirs,
   expandHome,
   downloadResources,
   formatAttachmentsHint,
@@ -140,7 +160,6 @@ import {
 } from './core/session-manager.js';
 import { triggerSessionTurn } from './core/trigger-session.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
-import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -243,7 +262,7 @@ import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoF
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
-import { normalizeBrand } from './im/lark/lark-hosts.js';
+import { chatAppLink, normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
@@ -252,6 +271,45 @@ import { evaluateVcMeetingConsumerIsolation } from './services/vc-meeting-consum
 import { markSessionActivity, announcePendingRepoSession, publishAttentionPatch, clearAgentAttention } from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
+import { notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js';
+import { emitGoalNarration } from './verified-delivery/narration.js';
+import { openLedger } from './verified-delivery/ledger.js';
+import {
+  confirmTaskRelease,
+  retryTaskRelease,
+  runGoalReleaseCheck,
+  type ReleaseEngineDeps,
+  type TaskReleaseResult,
+} from './verified-delivery/release-engine.js';
+import {
+  deriveTaskReleaseRisks,
+  resolveRejectedDependencyStallMs,
+  taskReleaseRiskNotificationId,
+  type TaskReleaseRisk,
+} from './verified-delivery/release-risk.js';
+import { detectUnsupportedDeliveryEnvelope, formatHelpEnvelope, parseDeliveryEnvelope } from './verified-delivery/envelope.js';
+import { ingestParsedDeliveryEnvelope } from './verified-delivery/envelope-ingest.js';
+import { detectUnsupportedDispatchRepoRequirement, formatDispatchRepoRequirement, inspectLocalRepoAsync, parseDispatchRepoRequirement, resolveRepoRequirement } from './core/repo-requirement.js';
+import { buildMissingRepoBlocker } from './core/repo-help.js';
+import {
+  A2A_CAPABILITY_DELIVERY_V1,
+  A2A_CAPABILITY_DISPATCH_REPO_V1,
+  evaluateDispatchReadiness,
+  type A2APeerCapability,
+} from './core/a2a-readiness.js';
+import { buildFederatedRoster } from './services/federation-roster.js';
+import { listPlatformTeams } from './services/platform-team-store.js';
+import {
+  DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS,
+  injectGoalSupervisorTurn,
+  runGoalWatchdogForGoal,
+  shouldTriggerGoalWatchdogOnSessionBoundary,
+  startGoalWatchdog,
+  type GoalWatchdogReviveFailureEvent,
+  type GoalWatchdogReassignResult,
+  type GoalWatchdogResult,
+} from './core/goal-watchdog.js';
+import type { HelpKind, TaskView } from './verified-delivery/types.js';
 import {
   setCardDispatcher as setAskCardDispatcher,
   setCanTalkChecker as setAskCanTalkChecker,
@@ -2189,6 +2247,148 @@ const lastRepoScan: Map<string, import('./services/project-scanner.js').ProjectI
   new BoundedMap(500);
 const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }>();
 const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
+let currentDaemonLarkAppId = '';
+const goalWatchdogRetryTimers = new Map<string, NodeJS.Timeout>();
+const goalParentReplyRoutes: Map<string, number> = new BoundedMap(1000);
+const goalReleaseChecksInFlight = new Set<string>();
+
+function collectA2AReleasePeers(): A2APeerCapability[] {
+  const peers: A2APeerCapability[] = [];
+  try {
+    for (const bot of buildFederatedRoster(config.session.dataDir).bots) {
+      peers.push({
+        larkAppId: bot.larkAppId,
+        unionId: bot.botUnionId,
+        name: bot.name,
+        cliId: bot.cliId,
+        botmuxVersion: bot.botmuxVersion,
+        a2aCapabilities: bot.a2aCapabilities,
+      });
+    }
+  } catch (err) {
+    logger.warn(`[goal-release] federation roster unavailable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    const localByAppId = new Map(getAllBots().map((bot) => [bot.config.larkAppId, bot.config]));
+    for (const team of listPlatformTeams(config.session.dataDir)) {
+      for (const bot of team.bots) {
+        const local = localByAppId.get(bot.appId);
+        peers.push({
+          larkAppId: bot.appId,
+          unionId: bot.unionId,
+          name: bot.name?.trim() || local?.displayName || local?.cliId || bot.appId,
+          cliId: local?.cliId,
+          botmuxVersion: bot.botmuxVersion,
+          a2aCapabilities: bot.a2aCapabilities,
+        });
+      }
+    }
+  } catch (err) {
+    logger.warn(`[goal-release] platform roster unavailable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return peers;
+}
+
+function createGoalReleaseEngineDeps(): ReleaseEngineDeps {
+  return {
+    ledger: openLedger(),
+    now: () => Date.now(),
+    releasedBy: `daemon:${currentDaemonLarkAppId}`,
+    checkReadiness: async (_task, pending) => {
+      let membership;
+      try {
+        membership = await probeChatBotMembership(pending.senderLarkAppId, pending.goalChatId);
+      } catch (err) {
+        membership = {
+          known: false as const,
+          members: [] as [],
+          reason: err instanceof Error ? err.message : String(err),
+        };
+      }
+      const localAppIds = new Set(getAllBots().map((bot) => bot.config.larkAppId));
+      const requiredCapabilities = [A2A_CAPABILITY_DELIVERY_V1];
+      if (pending.frozenDispatchedPayload.requiredRepo) {
+        requiredCapabilities.push(A2A_CAPABILITY_DISPATCH_REPO_V1);
+      }
+      const readiness = evaluateDispatchReadiness({
+        workers: pending.frozenWorkerSpecs.map((worker) => ({
+          openId: worker.openId,
+          name: worker.name?.trim() || worker.openId,
+          larkAppId: worker.larkAppId,
+          cliId: worker.cliId,
+          unionId: worker.unionId,
+          local: !!worker.larkAppId && localAppIds.has(worker.larkAppId),
+        })),
+        membership,
+        peers: collectA2AReleasePeers(),
+        requiredCapabilities,
+        // The intent already froze the kickoff bytes. If the roster resolves a
+        // different observer-scoped handle, fail visibly instead of sending an
+        // immutable message whose @ would be empty or target the wrong bot.
+        requireExactMentionOpenIds: true,
+      });
+      for (const issue of readiness.issues) {
+        const log = issue.severity === 'error' ? logger.warn.bind(logger) : logger.info.bind(logger);
+        log(`[goal-release] readiness ${issue.severity} task=${pending.frozenDispatchedPayload.taskId} code=${issue.code} detail=${issue.detail}`);
+      }
+      return readiness;
+    },
+    send: ({ larkAppId, chatId, text, uuid, recovery }) =>
+      sendMessage(larkAppId, chatId, text, 'text', uuid, undefined, { suppressHook: recovery }),
+  };
+}
+
+function goalHasPlannedDependent(goalChatId: string, upstreamTaskId: string): boolean {
+  return openLedger().tasks(goalChatId).some((task) =>
+    task.status === 'planned' && task.plan?.dependsOnTaskIds.includes(upstreamTaskId));
+}
+
+async function runGoalReleaseCheckOnThisDaemon(
+  goalChatId: string,
+  mode: 'trigger' | 'recovery',
+  reason: string,
+): Promise<TaskReleaseResult[]> {
+  if (!currentDaemonLarkAppId || isGoalPanelApp(currentDaemonLarkAppId)) return [];
+  if (goalReleaseChecksInFlight.has(goalChatId)) return [];
+  goalReleaseChecksInFlight.add(goalChatId);
+  try {
+    const results = await runGoalReleaseCheck({
+      goalChatId,
+      ownerLarkAppId: currentDaemonLarkAppId,
+      mode,
+      deps: createGoalReleaseEngineDeps(),
+    });
+    const ledger = openLedger();
+    const risks = deriveTaskReleaseRisks({
+      tasks: ledger.tasks(goalChatId),
+      events: ledger.read(),
+      now: Date.now(),
+      rejectedStallMs: resolveRejectedDependencyStallMs(process.env.BOTMUX_A2A_DEP_REJECTED_STALL_MS),
+    });
+    for (const risk of risks) {
+      await notifyGoalReleaseRiskBestEffort(risk);
+    }
+    const changed = results.filter((result) => !['not-ready', 'open-intent', 'already-dispatched'].includes(result.outcome));
+    if (changed.length > 0) {
+      logger.info(`[goal-release] goal=${goalChatId} reason=${reason} results=${changed.map((result) => `${result.taskId}:${result.outcome}`).join(',')}`);
+    }
+    return results;
+  } finally {
+    goalReleaseChecksInFlight.delete(goalChatId);
+  }
+}
+
+async function runAllGoalReleaseChecksOnThisDaemon(reason: string): Promise<void> {
+  if (!currentDaemonLarkAppId || isGoalPanelApp(currentDaemonLarkAppId)) return;
+  const goalChatIds = new Set(
+    openLedger().tasks()
+      .filter((task) => task.status === 'planned' && task.chatId && task.plan?.dispatchSpec.senderLarkAppId === currentDaemonLarkAppId)
+      .map((task) => task.chatId!),
+  );
+  for (const goalChatId of goalChatIds) {
+    await runGoalReleaseCheckOnThisDaemon(goalChatId, 'recovery', reason);
+  }
+}
 
 function parsePositiveIntEnv(name: string): number {
   const raw = process.env[name];
@@ -2249,6 +2449,475 @@ function startMemoryDiagnostics(): ReturnType<typeof setInterval> | undefined {
   const timer = setInterval(() => logMemoryDiagnostics('interval'), intervalMs);
   if (typeof timer.unref === 'function') timer.unref();
   return timer;
+}
+
+function countGoalWatchdogStatus(results: GoalWatchdogResult[], status: GoalWatchdogResult['status']): number {
+  return results.filter((r) => r.status === status).length;
+}
+
+function shouldRetryGoalWatchdog(results: GoalWatchdogResult[]): boolean {
+  return results.some((r) => r.status === 'busy');
+}
+
+function scheduleGoalWatchdogRetry(goalChatId: string, reason: string): void {
+  if (goalWatchdogRetryTimers.has(goalChatId)) return;
+  const timer = setTimeout(() => {
+    goalWatchdogRetryTimers.delete(goalChatId);
+    void runGoalWatchdogForGoalOnThisDaemon(goalChatId, `retry:${reason}`).catch((err: any) => {
+      logger.warn(`[goal-watchdog] event retry failed goal=${goalChatId}: ${err?.message ?? err}`);
+    });
+  }, DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS);
+  timer.unref?.();
+  goalWatchdogRetryTimers.set(goalChatId, timer);
+  logger.info(`[goal-watchdog] scheduled event retry goal=${goalChatId} reason=${reason} delayMs=${DEFAULT_GOAL_WATCHDOG_EVENT_COOLDOWN_MS}`);
+}
+
+const reviveBudgetAttentionAt = new Map<string, number>();
+const REVIVE_BUDGET_ATTENTION_COOLDOWN_MS = 10 * 60_000;
+
+async function handleGoalReviveFailure(event: GoalWatchdogReviveFailureEvent): Promise<void> {
+  if (event.errorCode !== 'revive_budget_exhausted') return;
+  const now = Date.now();
+  const last = reviveBudgetAttentionAt.get(event.goalChatId) ?? 0;
+  if (last > 0 && now - last < REVIVE_BUDGET_ATTENTION_COOLDOWN_MS) return;
+  reviveBudgetAttentionAt.set(event.goalChatId, now);
+
+  const rec = getGoalChat(event.goalChatId);
+  if (!rec?.parentChatId) {
+    logger.warn(`[goal-watchdog] revive budget exhausted goal=${event.goalChatId} but parent chat is unknown`);
+    return;
+  }
+
+  const parent = findActiveSessionById(rec.parentSessionId);
+  const ownerOpenId = goalNotifyOwnerOpenId(parent);
+  const candidates = goalParentSenderCandidates(parent?.larkAppId, rec.larkAppId, currentDaemonLarkAppId);
+  const goalLink = chatAppLink(event.goalChatId, getBotBrand(candidates[0] ?? rec.larkAppId ?? currentDaemonLarkAppId));
+  const summary = [
+    `监工连续自动复活失败，已达到预算上限。`,
+    `原因: ${event.error}`,
+    event.pendingTaskIds.length > 0 ? `未完成任务: ${event.pendingTaskIds.join(', ')}` : undefined,
+    '需要人类确认：重启/重建 goal 监管者，或手动收尾该 goal。',
+  ].filter(Boolean).join('\n');
+
+  if (parent) {
+    parent.agentAttention = { kind: 'blocked', reason: `Goal 监工反复崩溃：${rec.title ?? event.goalChatId}`, at: now };
+    publishAttentionPatch(parent);
+    emitSessionLifecycleHook(parent, 'session.requires_attention', {
+      reason: 'goal_supervisor_revive_budget_exhausted',
+      kind: 'blocked',
+      message: parent.agentAttention.reason,
+    });
+  }
+
+  let lastError: string | undefined;
+  for (const larkAppId of candidates) {
+    const mention = ownerOpenId ? `<at user_id="${ownerOpenId}"></at> ` : '';
+    const text = [
+      `${mention}[goal] Goal 监工反复崩溃，需要你处理`,
+      rec.title ? `Goal: ${rec.title}` : undefined,
+      `goalChatId: ${event.goalChatId}`,
+      `打开 goal 群: ${goalLink}`,
+      '',
+      summary,
+    ].filter(Boolean).join('\n');
+    try {
+      const messageId = await sendMessage(larkAppId, rec.parentChatId, text, 'text');
+      if (messageId) {
+        rememberGoalParentNotification({
+          messageId,
+          larkAppId,
+          parentChatId: rec.parentChatId,
+          parentRoot: rec.parentRoot,
+          parentSessionId: rec.parentSessionId,
+          goalChatId: event.goalChatId,
+          goalTitle: rec.title,
+          summary,
+          attentionKind: 'blocked',
+          attentionReason: 'goal_supervisor_revive_budget_exhausted',
+          done: false,
+          createdAt: now,
+        });
+      }
+      logger.warn(`[goal-watchdog] revive budget exhausted goal=${event.goalChatId}; human attention sent via ${larkAppId}`);
+      return;
+    } catch (err: any) {
+      lastError = err?.message ?? String(err);
+      logger.warn(`[goal-watchdog] revive budget human attention via ${larkAppId} failed: ${lastError}`);
+    }
+  }
+  logger.warn(`[goal-watchdog] revive budget exhausted goal=${event.goalChatId}; human attention failed: ${lastError ?? 'no_sender_available'}`);
+}
+
+type LocalGoalWorkerHealth = {
+  larkAppId: string;
+  sessionId?: string;
+  session: GoalWorkerSessionState;
+  workerProcess: GoalWorkerProcessState;
+  lastActivityAt?: string;
+  title?: string;
+};
+
+const GOAL_WORKER_REASSIGN_COOLDOWN_MS = 15 * 60_000;
+
+function collectLocalGoalWorkerHealth(goalChatId: string, workerLarkAppId?: string): LocalGoalWorkerHealth[] {
+  const out: LocalGoalWorkerHealth[] = [];
+  for (const ds of activeSessions.values()) {
+    if (workerLarkAppId && ds.larkAppId !== workerLarkAppId) continue;
+    if (ds.chatId !== goalChatId || ds.scope !== 'chat') continue;
+    if (ds.session.goalSupervisor || isGoalPanelApp(ds.larkAppId)) continue;
+    const backendType = getSessionPersistentBackendType(ds);
+    const persistentProbe = backendType
+      ? probePersistentSession(backendType, persistentSessionName(backendType, ds.session.sessionId))
+      : undefined;
+    const health = classifyGoalWorkerHealth({
+      sessionStatus: ds.session.status,
+      suspendedColdResume: ds.session.suspendedColdResume,
+      worker: ds.worker,
+      persistentProbe,
+    });
+    out.push({
+      larkAppId: ds.larkAppId,
+      sessionId: ds.session.sessionId,
+      session: health.session,
+      workerProcess: health.workerProcess,
+      lastActivityAt: new Date(ds.lastMessageAt).toISOString(),
+      title: ds.session.title,
+    });
+  }
+  return out;
+}
+
+async function fetchGoalWorkerHealth(goalChatId: string, workerLarkAppId: string): Promise<LocalGoalWorkerHealth[]> {
+  if (workerLarkAppId === currentDaemonLarkAppId) {
+    return collectLocalGoalWorkerHealth(goalChatId, workerLarkAppId);
+  }
+  const daemon = findOnlineDaemon(workerLarkAppId);
+  if (!daemon) return [];
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 1_500);
+  try {
+    const res = await fetchDaemonIpc(daemon.ipcPort, '/api/goal/worker-health-local', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ goalChatId, workerLarkAppId }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return [];
+    const body = await res.json().catch(() => null) as { entries?: LocalGoalWorkerHealth[] } | null;
+    return Array.isArray(body?.entries) ? body.entries : [];
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function buildWorkerHealthFacts(task: TaskView, goalChatId: string): Promise<string[]> {
+  const workers = task.workerOpenIds ?? [];
+  const names = task.workerNames ?? [];
+  if (workers.length === 0) {
+    return [`[worker-health]\ntaskId: ${task.taskId}\nworkerOpenId: (none)\nworkerName: (unknown)\nsession: unknown\nworkerProcess: unknown\nfact: 账本没有记录 workerOpenIds，无法确定 worker 会话是否仍存活。\n建议：不要机械催该 worker；请判断恢复原会话、重派、缩 scope 或升级给人。`];
+  }
+
+  let roster: Awaited<ReturnType<typeof listChatBotMembers>> = [];
+  try {
+    roster = await listChatBotMembers(currentDaemonLarkAppId, goalChatId);
+  } catch (err: any) {
+    logger.warn(`[goal-watchdog] listChatBotMembers failed for worker health goal=${goalChatId}: ${err?.message ?? err}`);
+  }
+
+  const facts: string[] = [];
+  for (const [index, workerOpenId] of workers.entries()) {
+    const workerName = names[index] || workerOpenId;
+    const member = task.workerLarkAppIds?.[index]
+      ? undefined
+      : (roster.find((m) => m.openId === workerOpenId)
+        ?? roster.find((m) => m.displayName === workerName || m.name === workerName));
+    const workerLarkAppId = task.workerLarkAppIds?.[index] || member?.larkAppId || '';
+    let health: LocalGoalWorkerHealth | undefined;
+    if (workerLarkAppId) {
+      const entries = await fetchGoalWorkerHealth(goalChatId, workerLarkAppId);
+      health = entries.find((entry) => entry.larkAppId === workerLarkAppId);
+    }
+    const sessionState = health?.session ?? (workerLarkAppId ? 'missing' : 'unknown');
+    const workerProcess = health?.workerProcess ?? (workerLarkAppId ? 'unknown' : 'unknown');
+    const hardFact = workerLarkAppId
+      ? (health
+        ? `已解析到 ${workerName}(${workerLarkAppId}) 的 goal 群 chat-scope 会话，session=${sessionState}，workerProcess=${workerProcess}。`
+        : `已解析到 ${workerName}(${workerLarkAppId})，但该 bot daemon 当前没有这个 goal 群的 chat-scope worker 会话。`)
+      : `无法把账本 workerOpenId 解析到本机配置 bot；可能是外部 bot、未 /introduce，或 open_id 视角不匹配。`;
+    facts.push([
+      '[worker-health]',
+      `taskId: ${task.taskId}`,
+      `workerOpenId: ${workerOpenId}`,
+      `workerName: ${workerName}`,
+      `session: ${sessionState}`,
+      `workerProcess: ${workerProcess}`,
+      health?.lastActivityAt ? `lastActivityAt: ${health.lastActivityAt}` : undefined,
+      `fact: ${hardFact}`,
+      '建议：不要继续机械催该 worker；请判断恢复原会话、重派、缩 scope 或升级给人。',
+    ].filter(Boolean).join('\n'));
+  }
+  return facts;
+}
+
+type WorkerReassignCandidate = {
+  index: number;
+  workerOpenId: string;
+  workerName: string;
+  workerLarkAppId: string;
+  workerCliId?: string;
+  health?: LocalGoalWorkerHealth;
+  deadReason: string;
+};
+
+async function resolveWorkerReassignCandidate(task: TaskView, goalChatId: string): Promise<WorkerReassignCandidate | undefined> {
+  const workers = task.workerOpenIds ?? [];
+  for (const [index, workerOpenId] of workers.entries()) {
+    const workerName = task.workerNames?.[index] || workerOpenId;
+    const workerLarkAppId = task.workerLarkAppIds?.[index] || '';
+    const workerCliId = task.workerCliIds?.[index] || undefined;
+    if (!workerLarkAppId) continue;
+    const daemon = findOnlineDaemon(workerLarkAppId);
+    if (!daemon && workerLarkAppId !== currentDaemonLarkAppId) {
+      continue;
+    }
+    const entries = await fetchGoalWorkerHealth(goalChatId, workerLarkAppId);
+    const health = entries.find((entry) => entry.larkAppId === workerLarkAppId);
+    if (!health) {
+      return { index, workerOpenId, workerName, workerLarkAppId, workerCliId, deadReason: 'session_missing' };
+    }
+    if (health.session === 'suspended') continue;
+    if (health.session === 'closed') {
+      return { index, workerOpenId, workerName, workerLarkAppId, workerCliId, health, deadReason: 'session_closed' };
+    }
+    if (health.workerProcess === 'none' || health.workerProcess === 'killed') {
+      return { index, workerOpenId, workerName, workerLarkAppId, workerCliId, health, deadReason: `worker_${health.workerProcess}` };
+    }
+  }
+  return undefined;
+}
+
+async function reassignDeadGoalWorker(task: TaskView, goalChatId: string, now: number): Promise<GoalWatchdogReassignResult> {
+  if (task.status !== 'dispatched') return { status: 'skipped', reason: `status:${task.status}` };
+  const candidate = await resolveWorkerReassignCandidate(task, goalChatId);
+  if (!candidate) return { status: 'not-dead', reason: 'no_dead_worker' };
+  const epoch = Math.floor(now / GOAL_WORKER_REASSIGN_COOLDOWN_MS);
+  const ledger = openLedger();
+  const events = ledger.read();
+  const attempts = countGoalWorkerReassignAttempts(events, task.taskId, now);
+  if (attempts >= DEFAULT_GOAL_WORKER_REASSIGN_MAX_ATTEMPTS) {
+    const latestDispatch = latestTaskDispatchEvent(events, task.taskId);
+    const reason = [
+      `worker ${candidate.workerName}(${candidate.workerLarkAppId}) 反复不可达`,
+      `自动重派 ${attempts} 次仍未接住任务`,
+      `最近原因: ${candidate.deadReason}`,
+    ].join('；');
+    const retryBrief = [
+      `任务 ${task.taskId} 已停止自动重派。`,
+      `请人工判断：恢复 ${candidate.workerName}，换 worker，缩小范围，或取消该任务。`,
+    ].join('\n');
+    const result = ledger.append({
+      type: 'TaskEscalated',
+      actor: 'orchestrator',
+      taskId: task.taskId,
+      chatId: goalChatId,
+      ts: now,
+      idempotencyKey: `reassign-budget-exhausted:${task.taskId}:${latestDispatch?.eventId ?? 'unknown'}`,
+      payload: {
+        taskId: task.taskId,
+        reason,
+        by: 'goal-watchdog',
+        retryBrief,
+      },
+    });
+    if (!result.deduped) {
+      await emitGoalNarrationBestEffort({
+        larkAppId: currentDaemonLarkAppId,
+        goalChatId,
+        event: {
+          type: 'escalated',
+          key: `narr:escalated:${task.taskId}:${result.event.eventId}`,
+          taskId: task.taskId,
+          reason,
+        },
+      });
+      const supervisor = findGoalSupervisorForNotify({ goalChatId });
+      const summary = [
+        `Goal worker 自动重派预算耗尽: ${task.taskId}`,
+        reason,
+        retryBrief,
+        `goal: ${goalChatId}`,
+      ].join('\n');
+      const attention = await sendGoalHumanAttention({
+        supervisor,
+        taskId: task.taskId,
+        summary,
+        attentionKind: 'help',
+        attentionReason: reason,
+      });
+      if (!attention.sent) {
+        logger.warn(`[goal-watchdog] reassign budget human attention failed task=${task.taskId} goal=${goalChatId}: ${attention.error ?? 'unknown'}`);
+      }
+    }
+    logger.warn(`[goal-watchdog] reassign budget exhausted task=${task.taskId} goal=${goalChatId} worker=${candidate.workerLarkAppId} attempts=${attempts}`);
+    return { status: 'skipped', reason: 'reassign_budget_exhausted' };
+  }
+  const brief = [
+    task.title ? `任务：${task.title}` : `任务：${task.taskId}`,
+    `原 worker（${candidate.workerName}）会话状态异常：${candidate.deadReason}。`,
+    '请重新接手该任务；如果需要原上下文，请先查看 goal charter、delivery ledger 和本群历史。完成后仍按 botmux report 协议交付证据。',
+  ].join('\n');
+  const appended = ledger.append({
+    type: 'TaskDispatched',
+    actor: 'orchestrator',
+    taskId: task.taskId,
+    chatId: goalChatId,
+    ts: now,
+    idempotencyKey: `reassign:${task.taskId}:${candidate.workerLarkAppId}:${epoch}`,
+    payload: {
+      taskId: task.taskId,
+      title: task.title,
+      workerTopicRoot: task.workerTopicRoot,
+      workerOpenIds: [candidate.workerOpenId],
+      workerNames: [candidate.workerName],
+      workerLarkAppIds: [candidate.workerLarkAppId],
+      workerCliIds: candidate.workerCliId ? [candidate.workerCliId] : undefined,
+      workerBotUnionIds: task.workerBotUnionIds?.[candidate.index]
+        ? [task.workerBotUnionIds[candidate.index]!]
+        : undefined,
+      requiredRepo: task.requiredRepo,
+      brief,
+      acceptanceHint: task.acceptanceHint,
+      acceptanceCriteria: task.acceptanceCriteria,
+    },
+  });
+  if (appended.deduped) return { status: 'reassigned', reason: 'deduped' };
+  await sendMessage(
+    currentDaemonLarkAppId,
+    goalChatId,
+    [
+      `<at user_id="${candidate.workerOpenId}"></at> [goal-reassign] ${task.taskId}`,
+      `原会话已确认不可用（${candidate.deadReason}），请重新接手。`,
+      '先查 goal charter / delivery ledger / 群历史，完成后用 botmux report 交证据。',
+      task.requiredRepo
+        ? formatDispatchRepoRequirement({ taskId: task.taskId, repo: task.requiredRepo })
+        : undefined,
+    ].filter(Boolean).join('\n'),
+    'text',
+  );
+  await emitGoalNarrationBestEffort({
+    larkAppId: currentDaemonLarkAppId,
+    goalChatId,
+    event: {
+      type: 'reassigned',
+      key: `narr:reassign:${task.taskId}:${candidate.workerLarkAppId}:${epoch}`,
+      taskId: task.taskId,
+      deadWorker: candidate.workerName || candidate.workerLarkAppId,
+    },
+  });
+  logger.info(`[goal-watchdog] reassigned task=${task.taskId} goal=${goalChatId} worker=${candidate.workerLarkAppId} reason=${candidate.deadReason}`);
+  return { status: 'reassigned', reason: candidate.deadReason };
+}
+
+async function runGoalWatchdogForGoalOnThisDaemon(goalChatId: string, reason: string): Promise<GoalWatchdogResult[]> {
+  if (isGoalPanelApp(currentDaemonLarkAppId)) return [];
+  const results = await runGoalWatchdogForGoal({
+    larkAppId: currentDaemonLarkAppId,
+    activeSessions,
+    goalChatId,
+    onReviveFailure: handleGoalReviveFailure,
+    workerHealthFacts: buildWorkerHealthFacts,
+    reassignDeadWorker: reassignDeadGoalWorker,
+    onAccepted: ({ taskId, goalChatId: acceptedGoalChatId }) => {
+      if (!acceptedGoalChatId || !goalHasPlannedDependent(acceptedGoalChatId, taskId)) return;
+      void runGoalReleaseCheckOnThisDaemon(acceptedGoalChatId, 'trigger', `reconcile-accepted:${taskId}`)
+        .catch((err: any) => logger.warn(`[goal-release] reconcile trigger failed: ${err?.message ?? err}`));
+    },
+  });
+  if (shouldRetryGoalWatchdog(results)) scheduleGoalWatchdogRetry(goalChatId, reason);
+  const injected = countGoalWatchdogStatus(results, 'injected');
+  const reconciled = countGoalWatchdogStatus(results, 'reconciled');
+  const revived = countGoalWatchdogStatus(results, 'revived');
+  const reassigned = countGoalWatchdogStatus(results, 'reassigned');
+  const busy = countGoalWatchdogStatus(results, 'busy');
+  const rateLimited = countGoalWatchdogStatus(results, 'rate-limited');
+  if (injected > 0 || reconciled > 0 || revived > 0 || reassigned > 0 || busy > 0 || rateLimited > 0) {
+    logger.info(`[goal-watchdog] event result goal=${goalChatId} reason=${reason} injected=${injected} reconciled=${reconciled} revived=${revived} reassigned=${reassigned} busy=${busy} rateLimited=${rateLimited}`);
+  }
+  return results;
+}
+
+async function triggerGoalReleaseAcrossDaemons(input: {
+  goalChatId: string;
+  reason: string;
+}): Promise<{ contacted: number; results: TaskReleaseResult[] }> {
+  const daemons = listOnlineDaemons();
+  let contacted = 0;
+  const results: TaskReleaseResult[] = [];
+  await Promise.all(daemons.map(async (daemon) => {
+    const ctrl = new AbortController();
+    const tt = setTimeout(() => ctrl.abort(), 3_000);
+    try {
+      const response = await fetchDaemonIpc(daemon.ipcPort, '/api/goal/release-check', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(input),
+        signal: ctrl.signal,
+      });
+      contacted++;
+      if (!response.ok) return;
+      const body = await response.json().catch(() => null) as { results?: TaskReleaseResult[] } | null;
+      if (Array.isArray(body?.results)) results.push(...body.results);
+    } catch {
+      // Daemon descriptors are best-effort; periodic recovery remains authoritative.
+    } finally {
+      clearTimeout(tt);
+    }
+  }));
+  return { contacted, results };
+}
+
+async function triggerGoalWatchdogAcrossDaemons(input: {
+  goalChatId: string;
+  reason: string;
+  sourceSessionId?: string;
+}): Promise<{ contacted: number; injected: number; reconciled: number; revived: number; reassigned: number; busy: number; rateLimited: number }> {
+  const daemons = listOnlineDaemons();
+  let contacted = 0;
+  let injected = 0;
+  let reconciled = 0;
+  let revived = 0;
+  let reassigned = 0;
+  let busy = 0;
+  let rateLimited = 0;
+  await Promise.all(daemons.map(async (daemon) => {
+    const ctrl = new AbortController();
+    const tt = setTimeout(() => ctrl.abort(), 3_000);
+    try {
+      const res = await fetchDaemonIpc(daemon.ipcPort, '/api/goal/watchdog', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(input),
+        signal: ctrl.signal,
+      });
+      contacted++;
+      if (!res.ok) return;
+      const body = await res.json().catch(() => null) as { results?: Array<{ status?: string }> } | null;
+      const results = body?.results ?? [];
+      injected += results.filter((r) => r.status === 'injected').length;
+      reconciled += results.filter((r) => r.status === 'reconciled').length;
+      revived += results.filter((r) => r.status === 'revived').length;
+      reassigned += results.filter((r) => r.status === 'reassigned').length;
+      busy += results.filter((r) => r.status === 'busy').length;
+      rateLimited += results.filter((r) => r.status === 'rate-limited').length;
+    } catch {
+      // Daemon descriptors are best-effort. A dead peer will age out shortly.
+    } finally {
+      clearTimeout(tt);
+    }
+  }));
+  return { contacted, injected, reconciled, revived, reassigned, busy, rateLimited };
 }
 
 /**
@@ -2537,6 +3206,7 @@ export async function enforceMessageQuotaForCliInput(
   senderUnionId?: string,
   memberUnionId?: string,
   chatType?: 'group' | 'p2p',
+  opts?: { senderIsBot?: boolean },
 ): Promise<boolean> {
   // senderUnionId（bot-locked）让 evaluateTalk 认出跨部署团队 peer bot（teamBot 腿）；
   // memberUnionId（可为真人 union）走 teamMember 腿——否则外部闸门/群闸门放进来的
@@ -2547,6 +3217,11 @@ export async function enforceMessageQuotaForCliInput(
     logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
   }
+  // 任务模式豁免：bot/app 发来的编排消息（派活/回报/对账/求助/升级）不计入「消息额度」。
+  // 额度（/grant @某人 N 条）是给「人」按条限流的；bot↔bot 是系统编排流量——能不能发已由上面的
+  // 授权闸（ev.allowed）控制，不该再被按条扣到耗尽，否则长任务会把 worker 的额度烧光、做到一半被
+  // 自动收回授权、任务卡死。owner 要限某个 bot 仍可直接撤其对话授权，与额度无关。
+  if (opts?.senderIsBot) return true;
   if (!ev.quotaKey) return true;
   if (!senderOpenId) return false;
   // 去重三态：'done' = 同条已成功扣费 → 放行（不重复扣）；'pending' = 同条扣费 in-flight 未定论
@@ -2700,6 +3375,8 @@ const DAEMON_REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 interface DaemonDescriptor {
   larkAppId: string;
   botName: string;
+  /** Bot open_id from /bot/v3/info; used by dashboard name maps. */
+  botOpenId?: string;
   /** CLI adapter id from bots.json, used by dashboard roster before any sessions exist. */
   cliId: string;
   /** Lark app avatar URL (from /bot/v3/info); absent until the open_id probe lands. */
@@ -4069,6 +4746,1097 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
   publishAttentionPatch(ds);
   emitSessionLifecycleHook(ds, 'session.requires_attention', { reason: 'agent_request', kind, message: reason });
   return jsonRes(res, 200, { ok: true });
+});
+
+// ─── goal supervise IPC route (internal: start an L2 supervisor in goal chat) ─
+//
+// Lark self-messages are deliberately ignored before routing, so the main bot
+// cannot @ itself in the goal group to spawn the L2 supervisor. This thin
+// daemon-native entry creates that session directly while reusing the normal
+// session store and forkWorker path. Goal charter is task-scoped (`goal charter`)
+// and intentionally not auto-injected as a session whiteboard.
+function authorizeGoalSessionIpc(
+  req: IncomingMessage,
+  ds: DaemonSession | undefined,
+  raw: {
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+  },
+): ReturnType<typeof authorizeSessionScopedIpc> {
+  const claimedAttempt = typeof raw.originDispatchAttempt === 'number'
+    && Number.isSafeInteger(raw.originDispatchAttempt)
+    && raw.originDispatchAttempt > 0
+    ? raw.originDispatchAttempt
+    : undefined;
+  return authorizeSessionScopedIpc({
+    trustedHost: isTrustedHostIpcRequest(req),
+    sessionExists: !!ds,
+    receiverSession: !!ds?.session.vcMeetingReceiver,
+    allowReceiver: false,
+    sessionId: ds?.session.sessionId ?? '',
+    liveOrigin: ds?.managedTurnOrigin,
+    claimedCapability: typeof raw.originCapability === 'string' ? raw.originCapability : undefined,
+    claimedTurnId: typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined,
+    claimedDispatchAttempt: claimedAttempt,
+  });
+}
+
+function canonicalGoalWorkingDir(input: string): string {
+  const resolved = resolve(expandHomePath(input));
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+ipcRoute('POST', '/api/goal/supervise', async (req, res) => {
+  let raw: {
+    chatId?: unknown;
+    parentChatId?: unknown;
+    parentRoot?: unknown;
+    title?: unknown;
+    brief?: unknown;
+    workingDir?: unknown;
+    parentSessionId?: unknown;
+    larkAppId?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+  };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!isTrustedHostIpcRequest(req)) {
+    const parentSessionId = typeof raw.parentSessionId === 'string' ? raw.parentSessionId.trim() : '';
+    const parent = findActiveSessionById(parentSessionId);
+    const verified = authorizeGoalSessionIpc(req, parent, raw);
+    if (!verified.ok || !parent || parent.larkAppId !== currentDaemonLarkAppId) {
+      return jsonRes(res, 403, { ok: false, error: verified.ok ? 'origin_unproven' : verified.error });
+    }
+    raw.parentSessionId = parent.session.sessionId;
+    raw.parentChatId = parent.chatId;
+    raw.parentRoot = parent.session.scope === 'chat' ? undefined : parent.session.rootMessageId;
+    raw.larkAppId = parent.larkAppId;
+    // A session capability proves the caller's current session, but it must not
+    // let that caller ask the host daemon to open an unrelated filesystem path.
+    // Keep the child supervisor inside the project already granted to the L1.
+    const authorizedWorkingDir = parent.workingDir ?? parent.session.workingDir;
+    const requestedWorkingDir = typeof raw.workingDir === 'string' && raw.workingDir.trim()
+      ? raw.workingDir.trim()
+      : undefined;
+    if (requestedWorkingDir && (
+      !authorizedWorkingDir
+      || canonicalGoalWorkingDir(requestedWorkingDir) !== canonicalGoalWorkingDir(authorizedWorkingDir)
+    )) {
+      return jsonRes(res, 403, {
+        ok: false,
+        errorCode: 'working_dir_not_authorized',
+        error: '当前会话未授权该项目目录；请先把当前会话切换到目标项目，再启动目标。',
+      });
+    }
+    raw.workingDir = authorizedWorkingDir;
+  }
+  const chatId = typeof raw.chatId === 'string' ? raw.chatId.trim() : '';
+  const parentChatId = typeof raw.parentChatId === 'string' ? raw.parentChatId.trim() : '';
+  const title = typeof raw.title === 'string' ? raw.title.trim() : '';
+  const targetLarkAppId = typeof raw.larkAppId === 'string' ? raw.larkAppId.trim() : '';
+  if (!chatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_chatId', error: 'chatId is required' });
+  if (!parentChatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_parentChatId', error: 'parentChatId is required' });
+  if (!title) return jsonRes(res, 400, { ok: false, errorCode: 'missing_title', error: 'title is required' });
+  if (!targetLarkAppId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_larkAppId', error: 'larkAppId is required' });
+
+  const result = await startGoalSupervisor({
+    chatId,
+    parentChatId,
+    parentRoot: typeof raw.parentRoot === 'string' && raw.parentRoot.trim() ? raw.parentRoot.trim() : undefined,
+    title,
+    brief: typeof raw.brief === 'string' && raw.brief.trim() ? raw.brief : undefined,
+    workingDir: typeof raw.workingDir === 'string' && raw.workingDir.trim() ? raw.workingDir.trim() : undefined,
+    parentSessionId: typeof raw.parentSessionId === 'string' && raw.parentSessionId.trim() ? raw.parentSessionId.trim() : undefined,
+  }, { larkAppId: targetLarkAppId, activeSessions });
+  if (!result.ok) {
+    const status = result.errorCode === 'bot_not_in_chat' ? 404 : 400;
+    return jsonRes(res, status, result);
+  }
+  return jsonRes(res, 200, result);
+});
+
+function findActiveSessionById(sessionId?: string): DaemonSession | undefined {
+  if (!sessionId) return undefined;
+  for (const ds of activeSessions.values()) {
+    if (ds.session.sessionId === sessionId) return ds;
+  }
+  return undefined;
+}
+
+function findGoalSupervisorForNotify(input: { supervisorSessionId?: string; goalChatId?: string }): DaemonSession | undefined {
+  const bySession = findActiveSessionById(input.supervisorSessionId);
+  if (bySession?.session.goalSupervisor) return bySession;
+  const goalChatId = input.goalChatId;
+  if (!goalChatId) return undefined;
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId === currentDaemonLarkAppId && ds.session.goalSupervisor?.goalChatId === goalChatId) return ds;
+  }
+  return undefined;
+}
+
+function goalNotifyOwnerOpenId(parent?: DaemonSession): string | undefined {
+  return parent?.session.ownerOpenId
+    ?? parent?.ownerOpenId
+    ?? parent?.session.lastCallerOpenId
+    ?? parent?.session.creatorOpenId
+    ?? getOwnerOpenId(parent?.larkAppId ?? currentDaemonLarkAppId);
+}
+
+function goalPanelLarkAppId(): string | undefined {
+  return getGoalPanelConfig()?.larkAppId;
+}
+
+function goalParentSenderCandidates(...fallbacks: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const candidate of [goalPanelLarkAppId(), ...fallbacks]) {
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    out.push(candidate);
+  }
+  return out;
+}
+
+function uniqueLarkAppIds(...candidates: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const candidate of candidates) {
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    out.push(candidate);
+  }
+  return out;
+}
+
+function shortHash(input: string): string {
+  return createHash('sha256').update(input).digest('hex').slice(0, 12);
+}
+
+function retryBackoffMs(attempts: number): number {
+  return Math.min(15 * 60_000, 60_000 * 2 ** Math.max(0, attempts - 1));
+}
+
+const GOAL_NOTIFICATION_RETRY_MAX_ATTEMPTS = 24;
+const GOAL_NOTIFICATION_RETRY_DEAD_AFTER_MS = 24 * 60 * 60_000;
+
+function retryDeadReason(record: GoalNotificationRetryRecord, now = Date.now()): string | null {
+  if (record.attempts >= GOAL_NOTIFICATION_RETRY_MAX_ATTEMPTS) {
+    return `max_attempts_${GOAL_NOTIFICATION_RETRY_MAX_ATTEMPTS}`;
+  }
+  if (now - record.createdAt >= GOAL_NOTIFICATION_RETRY_DEAD_AFTER_MS) {
+    return 'ttl_24h';
+  }
+  return null;
+}
+
+function retryRecordFromHumanAttention(input: {
+  parent?: DaemonSession;
+  supervisor?: DaemonSession;
+  taskId?: string;
+  summary: string;
+  attentionKind: string;
+  attentionReason: string;
+  decisionOptions?: GoalDecisionOption[];
+  done?: boolean;
+}): GoalNotificationRetryRecord | null {
+  const meta = input.supervisor?.session.goalSupervisor;
+  const parentChatId = input.parent?.chatId ?? meta?.parentChatId;
+  const goalChatId = meta?.goalChatId ?? input.supervisor?.chatId;
+  if (!parentChatId || !goalChatId) return null;
+  const goalTitle = meta?.title ?? input.supervisor?.session.title?.replace(/^\[Goal\]\s*/, '');
+  const taskTitle = input.taskId ? openLedger().task(input.taskId)?.title : undefined;
+  const candidates = goalParentSenderCandidates(input.parent?.larkAppId, input.supervisor?.larkAppId, currentDaemonLarkAppId);
+  const now = Date.now();
+  return {
+    id: `human:${goalChatId}:${input.taskId ?? 'goal'}:${input.attentionKind}:${shortHash(`${input.attentionReason}\n${input.summary}`)}`,
+    ownerLarkAppId: currentDaemonLarkAppId,
+    kind: 'human-attention',
+    candidates,
+    parentChatId,
+    parentRoot: meta?.parentRoot,
+    parentSessionId: meta?.parentSessionId,
+    supervisorSessionId: input.supervisor?.session.sessionId,
+    goalChatId,
+    goalTitle,
+    taskId: input.taskId,
+    taskTitle,
+    summary: input.summary,
+    attentionKind: input.attentionKind,
+    attentionReason: input.attentionReason,
+    decisionOptions: input.decisionOptions,
+    done: input.done,
+    ownerOpenId: goalNotifyOwnerOpenId(input.parent),
+    attempts: 0,
+    nextAttemptAt: now + 60_000,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function retryRecordFromCompletion(input: {
+  parent?: DaemonSession;
+  supervisor?: DaemonSession;
+  summary: string;
+}): GoalNotificationRetryRecord | null {
+  const meta = input.supervisor?.session.goalSupervisor;
+  const parentChatId = input.parent?.chatId ?? meta?.parentChatId;
+  const goalChatId = meta?.goalChatId ?? input.supervisor?.chatId;
+  if (!parentChatId || !goalChatId) return null;
+  const goalTitle = meta?.title ?? input.supervisor?.session.title?.replace(/^\[Goal\]\s*/, '');
+  const candidates = uniqueLarkAppIds(input.parent?.larkAppId, input.supervisor?.larkAppId, currentDaemonLarkAppId);
+  const now = Date.now();
+  return {
+    id: `completion:${goalChatId}:${shortHash(input.summary)}`,
+    ownerLarkAppId: currentDaemonLarkAppId,
+    kind: 'completion-confirm',
+    candidates,
+    parentChatId,
+    parentRoot: meta?.parentRoot,
+    parentSessionId: meta?.parentSessionId,
+    supervisorSessionId: input.supervisor?.session.sessionId,
+    goalChatId,
+    goalTitle,
+    summary: input.summary,
+    done: true,
+    ownerOpenId: goalNotifyOwnerOpenId(input.parent),
+    attempts: 0,
+    nextAttemptAt: now + 60_000,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+async function sendGoalHumanAttentionRecord(record: GoalNotificationRetryRecord): Promise<{ sent: boolean; error?: string }> {
+  let lastError: string | undefined;
+  for (const larkAppId of record.candidates) {
+    const goalLink = chatAppLink(record.goalChatId, getBotBrand(larkAppId));
+    const ownerOpenId = getOwnerOpenId(larkAppId) ?? record.ownerOpenId;
+    const card = buildGoalHumanAttentionCard({
+      ownerOpenId,
+      goalTitle: record.goalTitle,
+      goalChatId: record.goalChatId,
+      goalLink,
+      taskId: record.taskId,
+      taskTitle: record.taskTitle,
+      attentionKind: record.attentionKind,
+      attentionReason: record.attentionReason,
+      decisionOptions: record.decisionOptions,
+      summary: record.summary,
+      notificationLarkAppId: larkAppId,
+      parentChatId: record.parentChatId,
+      parentRoot: record.parentRoot,
+      parentSessionId: record.parentSessionId,
+      supervisorSessionId: record.supervisorSessionId,
+    });
+    try {
+      const messageId = await sendMessage(larkAppId, record.parentChatId, card, 'interactive');
+      if (messageId) {
+        rememberGoalParentNotification({
+          messageId,
+          larkAppId,
+          parentChatId: record.parentChatId,
+          parentRoot: record.parentRoot,
+          parentSessionId: record.parentSessionId,
+          supervisorSessionId: record.supervisorSessionId,
+          goalChatId: record.goalChatId,
+          goalTitle: record.goalTitle,
+          taskId: record.taskId,
+          taskTitle: record.taskTitle,
+          summary: record.summary,
+          attentionKind: record.attentionKind,
+          attentionReason: record.attentionReason,
+          decisionOptions: record.decisionOptions,
+          done: record.done,
+          createdAt: Date.now(),
+        });
+      }
+      return { sent: true };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      logger.warn(`[goal-human-attention] send via ${larkAppId} failed: ${lastError}`);
+    }
+  }
+  return { sent: false, error: lastError ?? 'no_sender_available' };
+}
+
+async function sendGoalHumanAttention(input: {
+  parent?: DaemonSession;
+  supervisor?: DaemonSession;
+  taskId?: string;
+  summary: string;
+  attentionKind: string;
+  attentionReason: string;
+  decisionOptions?: GoalDecisionOption[];
+  done?: boolean;
+}): Promise<{ sent: boolean; error?: string }> {
+  const record = retryRecordFromHumanAttention(input);
+  if (!record) return { sent: false, error: 'missing_parent_or_goal_chat' };
+  const result = await sendGoalHumanAttentionRecord(record);
+  if (!result.sent) {
+    upsertGoalNotificationRetry({ ...record, lastError: result.error });
+    logger.warn(`[goal-notification-retry] queued ${record.kind} id=${record.id} goal=${record.goalChatId}: ${result.error}`);
+  } else {
+    removeGoalNotificationRetry(record.id);
+  }
+  return result;
+}
+
+async function notifyGoalReleaseRiskBestEffort(risk: TaskReleaseRisk): Promise<void> {
+  const goalChatId = risk.goalChatId;
+  if (!goalChatId) return;
+  const id = taskReleaseRiskNotificationId(risk);
+  if (!id) return;
+  if (listGoalNotificationRetries().some((record) => record.id === id)) return;
+  const supervisor = findGoalSupervisorForNotify({ goalChatId });
+  const parent = findActiveSessionById(supervisor?.session.goalSupervisor?.parentSessionId);
+  const isDefinite = risk.kind === 'release_definite';
+  const isAmbiguous = risk.kind === 'release_ambiguous_expired';
+  const reason = risk.detail ? `${risk.next}：${risk.detail}` : risk.next;
+  const summary = isDefinite
+    ? `任务 ${risk.taskId} 没有派发成功。请先修复原因，再选择“重试派发”或升级给人。`
+    : isAmbiguous
+      ? `任务 ${risk.taskId} 的派发结果无法确认。请先查目标群历史，再选择“确认已派”或“重试派发”。`
+      : `任务 ${risk.taskId} 的上游依赖需要处理：${risk.next}。`;
+  const record = retryRecordFromHumanAttention({
+    parent,
+    supervisor,
+    taskId: risk.taskId,
+    summary,
+    attentionKind: risk.reason,
+    attentionReason: reason,
+    decisionOptions: isDefinite
+      ? [
+          { key: 'retry-release', label: '修复后重试派发', recommended: true },
+          { key: 'escalate-human', label: '升级给人' },
+        ]
+      : isAmbiguous ? [
+          { key: 'confirm-release', label: '确认已派' },
+          { key: 'retry-release', label: '重试派发', recommended: true },
+          { key: 'escalate-human', label: '升级给人' },
+        ] : [
+          { key: 'resolve-dependency', label: '处理依赖', recommended: true },
+          { key: 'escalate-human', label: '升级给人' },
+        ],
+  });
+  if (!record) {
+    logger.warn(`[goal-release] cannot notify parent goal=${goalChatId} task=${risk.taskId}: missing supervisor/parent coordinates`);
+    return;
+  }
+  const retained = upsertGoalNotificationRetry({ ...record, id, retainOnSuccess: true, nextAttemptAt: Date.now() });
+  const result = await sendGoalHumanAttentionRecord(retained);
+  if (result.sent) {
+    markGoalNotificationRetrySent(id);
+    logger.info(`[goal-release] notified human goal=${goalChatId} task=${risk.taskId} risk=${risk.kind}`);
+  } else {
+    upsertGoalNotificationRetry({ ...retained, status: 'pending', lastError: result.error });
+    logger.warn(`[goal-release] queued human notification goal=${goalChatId} task=${risk.taskId}: ${result.error}`);
+  }
+}
+
+function buildGoalCompletionConfirmCard(input: {
+  ownerOpenId?: string;
+  goalTitle?: string;
+  goalChatId: string;
+  goalLink?: string;
+  summary: string;
+  supervisorSessionId?: string;
+}): string {
+  const mention = input.ownerOpenId ? `<at id=${input.ownerOpenId}></at> ` : '';
+  const title = input.goalTitle?.trim() || '当前目标';
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: { template: 'green', title: { tag: 'plain_text', content: `目标完成：${title}` } },
+    elements: [
+      {
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: [
+            `${mention}监管者报告目标已完成。`,
+            `**目标**：${title}`,
+            input.goalLink ? `[打开目标群](${input.goalLink})` : undefined,
+            '',
+            input.summary,
+          ].filter(Boolean).join('\n'),
+        },
+      },
+      { tag: 'hr' },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '结束并清理会话' },
+            type: 'primary',
+            value: {
+              action: 'goal_cleanup_confirm',
+              goal_chat_id: input.goalChatId,
+              supervisor_session_id: input.supervisorSessionId ?? '',
+            },
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '暂不' },
+            type: 'default',
+            value: {
+              action: 'goal_cleanup_skip',
+              goal_chat_id: input.goalChatId,
+              supervisor_session_id: input.supervisorSessionId ?? '',
+            },
+          },
+        ],
+      },
+    ],
+  });
+}
+
+async function sendGoalCompletionConfirmation(input: {
+  parent?: DaemonSession;
+  supervisor?: DaemonSession;
+  summary: string;
+}): Promise<{ sent: boolean; error?: string }> {
+  const record = retryRecordFromCompletion(input);
+  if (!record) return { sent: false, error: 'missing_parent_or_goal_chat' };
+  const result = await sendGoalCompletionConfirmationRecord(record);
+  if (!result.sent) {
+    upsertGoalNotificationRetry({ ...record, lastError: result.error });
+    logger.warn(`[goal-notification-retry] queued ${record.kind} id=${record.id} goal=${record.goalChatId}: ${result.error}`);
+  } else {
+    removeGoalNotificationRetry(record.id);
+  }
+  return result;
+}
+
+async function sendGoalCompletionConfirmationRecord(record: GoalNotificationRetryRecord): Promise<{ sent: boolean; error?: string }> {
+  let lastError: string | undefined;
+  for (const larkAppId of record.candidates) {
+    const goalLink = chatAppLink(record.goalChatId, getBotBrand(larkAppId));
+    const ownerOpenId = getOwnerOpenId(larkAppId) ?? record.ownerOpenId;
+    const card = buildGoalCompletionConfirmCard({
+      ownerOpenId,
+      goalTitle: record.goalTitle,
+      goalChatId: record.goalChatId,
+      goalLink,
+      summary: record.summary,
+      supervisorSessionId: record.supervisorSessionId,
+    });
+    try {
+      const messageId = await sendMessage(larkAppId, record.parentChatId, card, 'interactive');
+      if (messageId) {
+        rememberGoalParentNotification({
+          messageId,
+          larkAppId,
+          parentChatId: record.parentChatId,
+          parentRoot: record.parentRoot,
+          parentSessionId: record.parentSessionId,
+          supervisorSessionId: record.supervisorSessionId,
+          goalChatId: record.goalChatId,
+          goalTitle: record.goalTitle,
+          summary: record.summary,
+          done: true,
+          createdAt: Date.now(),
+        });
+      }
+      return { sent: true };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      logger.warn(`[goal-completion-confirm] send via ${larkAppId} failed: ${lastError}`);
+    }
+  }
+  return { sent: false, error: lastError ?? 'no_sender_available' };
+}
+
+async function processGoalNotificationRetries(): Promise<void> {
+  const due = listDueGoalNotificationRetries(currentDaemonLarkAppId);
+  if (due.length === 0) return;
+  for (const record of due) {
+    const preflightDeadReason = retryDeadReason(record);
+    if (preflightDeadReason) {
+      markGoalNotificationRetryDead(record.id, { reason: preflightDeadReason, lastError: record.lastError });
+      logger.error(`[goal-notification-retry] dead-letter ${record.kind} id=${record.id} goal=${record.goalChatId} reason=${preflightDeadReason}; requires human`);
+      continue;
+    }
+    const result = record.kind === 'human-attention'
+      ? await sendGoalHumanAttentionRecord(record)
+      : await sendGoalCompletionConfirmationRecord(record);
+    if (result.sent) {
+      if (record.retainOnSuccess) markGoalNotificationRetrySent(record.id);
+      else removeGoalNotificationRetry(record.id);
+      logger.info(`[goal-notification-retry] delivered ${record.kind} id=${record.id} goal=${record.goalChatId}`);
+      continue;
+    }
+    const attempts = record.attempts + 1;
+    const deadReason = retryDeadReason({ ...record, attempts });
+    if (deadReason) {
+      markGoalNotificationRetryDead(record.id, { reason: deadReason, lastError: result.error });
+      logger.error(`[goal-notification-retry] dead-letter ${record.kind} id=${record.id} goal=${record.goalChatId} attempts=${attempts} reason=${deadReason}; requires human: ${result.error}`);
+      continue;
+    }
+    markGoalNotificationRetryAttempt(record.id, {
+      attempts,
+      nextAttemptAt: Date.now() + retryBackoffMs(attempts),
+      lastError: result.error,
+    });
+    logger.warn(`[goal-notification-retry] retry failed ${record.kind} id=${record.id} attempts=${attempts}: ${result.error}`);
+  }
+}
+
+ipcRoute('POST', '/api/goal-notification-retries/process', async (_req, res) => {
+  try {
+    await processGoalNotificationRetries();
+    return jsonRes(res, 200, { ok: true });
+  } catch (err: any) {
+    logger.warn(`[goal-notification-retry] manual process failed: ${err?.message ?? err}`);
+    return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
+});
+
+function goalParentReplyCandidates(parsed: Pick<LarkMessage, 'parentId' | 'messageId'>): string[] {
+  // Only explicit quote/reply to the notification should route back to L2.
+  // `rootId` identifies the whole Lark topic/thread; using it here hijacks
+  // unrelated replies in the parent conversation.
+  return [parsed.parentId]
+    .filter((id): id is string => !!id && id !== parsed.messageId);
+}
+
+function findGoalNotificationRecordForReply(parsed: Pick<LarkMessage, 'parentId' | 'rootId' | 'messageId'>): GoalParentNotificationRecord | undefined {
+  for (const id of goalParentReplyCandidates(parsed)) {
+    const rec = getGoalParentNotification(id);
+    if (!rec) continue;
+    // Completion cards are terminal acknowledgements; later discussion in the
+    // parent thread must stay with L1/humans instead of being swallowed by L2.
+    if (rec.done) continue;
+    return rec;
+  }
+  return undefined;
+}
+
+function buildGoalParentReplyPrompt(record: GoalParentNotificationRecord, parsed: Pick<LarkMessage, 'messageId' | 'content'>): string {
+  return [
+    '[goal-parent-reply] L1/人类在主群回复了 goal 升级/完成通知。请把这条回复作为新的人工指示纳入本 goal 的统揽判断。',
+    `goal: ${record.goalTitle ?? record.goalChatId}`,
+    `goalChatId: ${record.goalChatId}`,
+    record.taskId ? `taskId: ${record.taskId}` : undefined,
+    `parentNotificationId: ${record.messageId}`,
+    `replyMessageId: ${parsed.messageId}`,
+    '',
+    'human reply:',
+    parsed.content.trim(),
+    '',
+    '请先查 goal charter 和 delivery ledger，再决定是澄清 worker、重派、accept/reject、或继续升级给人。',
+  ].filter(Boolean).join('\n');
+}
+
+function goalParentReplyRouteKey(record: GoalParentNotificationRecord, replyMessageId: string): string {
+  return `${record.messageId}:${replyMessageId}`;
+}
+
+async function routeGoalParentReplyToLocal(record: GoalParentNotificationRecord, parsed: Pick<LarkMessage, 'messageId' | 'content'>): Promise<{ routed: boolean; deduped?: boolean; error?: string; supervisorSessionId?: string }> {
+  const key = goalParentReplyRouteKey(record, parsed.messageId);
+  if (goalParentReplyRoutes.has(key)) return { routed: true, deduped: true };
+  const supervisor = findGoalSupervisorForNotify({
+    supervisorSessionId: record.supervisorSessionId,
+    goalChatId: record.goalChatId,
+  });
+  if (!supervisor) return { routed: false, error: 'no_supervisor' };
+  goalParentReplyRoutes.set(key, Date.now());
+  try {
+    await injectGoalSupervisorTurn(supervisor, buildGoalParentReplyPrompt(record, parsed));
+    await emitGoalNarrationBestEffort({
+      larkAppId: supervisor.larkAppId,
+      goalChatId: record.goalChatId,
+      event: {
+        type: 'human-decision',
+        key: `narr:decision:${record.goalChatId}:${parsed.messageId}`,
+        decisionText: parsed.content.trim(),
+        source: '主群回复中控',
+      },
+    });
+    return { routed: true, supervisorSessionId: supervisor.session.sessionId };
+  } catch (err) {
+    goalParentReplyRoutes.delete(key);
+    return { routed: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function routeGoalParentReplyAcrossDaemons(record: GoalParentNotificationRecord, parsed: Pick<LarkMessage, 'messageId' | 'content'>): Promise<{ contacted: number; routed: number; deduped: number }> {
+  const daemons = listOnlineDaemons();
+  let contacted = 0;
+  let routed = 0;
+  let deduped = 0;
+  await Promise.all(daemons.map(async (daemon) => {
+    const ctrl = new AbortController();
+    const tt = setTimeout(() => ctrl.abort(), 3_000);
+    try {
+      const res = await fetchDaemonIpc(daemon.ipcPort, '/api/goal/route-parent-reply', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          record,
+          reply: {
+            messageId: parsed.messageId,
+            content: parsed.content,
+          },
+        }),
+        signal: ctrl.signal,
+      });
+      contacted++;
+      if (!res.ok) return;
+      const body = await res.json().catch(() => null) as { routed?: boolean; deduped?: boolean } | null;
+      if (body?.routed && body.deduped) deduped++;
+      else if (body?.routed) routed++;
+    } catch {
+      // Daemon descriptors are best-effort. A dead peer will age out shortly.
+    } finally {
+      clearTimeout(tt);
+    }
+  }));
+  return { contacted, routed, deduped };
+}
+
+function buildGoalDashboardDecisionPrompt(input: { goalChatId: string; taskId?: string; text: string }): string {
+  return [
+    '[人工决策] 来自 dashboard 的人工指示。请作为本 goal 的 L2 监管者处理这条决策。',
+    `goalChatId: ${input.goalChatId}`,
+    input.taskId ? `taskId: ${input.taskId}` : undefined,
+    '',
+    'decision:',
+    input.text,
+    '',
+    '请先查 goal charter 和 delivery ledger，再据此引导 worker、代办、重派、accept/reject、关闭升级或继续升级给人，并把关键判断留痕到账本/charter。',
+  ].filter(Boolean).join('\n');
+}
+
+async function emitGoalNarrationBestEffort(input: Parameters<typeof emitGoalNarration>[0]): Promise<void> {
+  try {
+    await emitGoalNarration(input);
+  } catch (err) {
+    logger.warn(`[goal-narration] failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function maybeRouteGoalParentReply(parsed: LarkMessage, larkAppId: string, chatId?: string): Promise<boolean> {
+  if (parsed.senderType === 'app' || parsed.senderType === 'bot') return false;
+  const record = findGoalNotificationRecordForReply(parsed);
+  if (!record) return false;
+  if (chatId && record.parentChatId !== chatId) return false;
+  const local = await routeGoalParentReplyToLocal(record, parsed);
+  let routed = local.routed && !local.deduped;
+  let routedSessionId = local.supervisorSessionId;
+  if (!local.routed) {
+    const remote = await routeGoalParentReplyAcrossDaemons(record, parsed);
+    routed = remote.routed > 0;
+    if (!routed && remote.deduped === 0) {
+      logger.warn(`[goal-parent-reply] no active L2 for goal=${record.goalChatId} reply=${parsed.messageId} contacted=${remote.contacted}`);
+      return false;
+    }
+  }
+  try {
+    if (routed) {
+      await sendMessage(
+        record.larkAppId,
+        record.parentChatId,
+        `[goal] 已把你的回复转给 goal「${record.goalTitle ?? record.goalChatId}」的监管者。`,
+        'text',
+      );
+    }
+  } catch (err) {
+    logger.warn(`[goal-parent-reply] failed to send parent ack: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  logger.info(`[goal-parent-reply] routed parent reply ${parsed.messageId.substring(0, 12)} to L2 ${routedSessionId?.substring(0, 8) ?? 'remote'} goal=${record.goalChatId}`);
+  return true;
+}
+
+ipcRoute('POST', '/api/goal/route-parent-reply', async (req, res) => {
+  let raw: { record?: unknown; reply?: unknown };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const rec = raw.record as Partial<GoalParentNotificationRecord> | undefined;
+  const reply = raw.reply as Partial<Pick<LarkMessage, 'messageId' | 'content'>> | undefined;
+  if (!rec || typeof rec.messageId !== 'string' || typeof rec.larkAppId !== 'string' || typeof rec.parentChatId !== 'string' || typeof rec.goalChatId !== 'string') {
+    return jsonRes(res, 400, { ok: false, error: 'bad_record' });
+  }
+  if (!reply || typeof reply.messageId !== 'string' || typeof reply.content !== 'string') {
+    return jsonRes(res, 400, { ok: false, error: 'bad_reply' });
+  }
+  const result = await routeGoalParentReplyToLocal(rec as GoalParentNotificationRecord, {
+    messageId: reply.messageId,
+    content: reply.content,
+  });
+  if (!result.routed) {
+    return jsonRes(res, 404, { ok: false, error: result.error ?? 'no_supervisor' });
+  }
+  return jsonRes(res, 200, {
+    ok: true,
+    routed: true,
+    deduped: result.deduped === true,
+    supervisorSessionId: result.supervisorSessionId,
+  });
+});
+
+ipcRoute('POST', '/api/goals/:goalChatId/decision', async (req, res, params) => {
+  let raw: { taskId?: unknown; text?: unknown };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const goalChatId = params.goalChatId?.trim();
+  const text = typeof raw.text === 'string' ? raw.text.trim() : '';
+  const taskId = typeof raw.taskId === 'string' && raw.taskId.trim() ? raw.taskId.trim() : undefined;
+  if (!goalChatId) return jsonRes(res, 400, { ok: false, error: 'missing_goalChatId' });
+  if (!text) return jsonRes(res, 400, { ok: false, error: 'missing_text' });
+  const supervisor = findGoalSupervisorForNotify({ goalChatId });
+  if (!supervisor) return jsonRes(res, 404, { ok: false, error: 'no_supervisor' });
+  await injectGoalSupervisorTurn(supervisor, buildGoalDashboardDecisionPrompt({ goalChatId, taskId, text }));
+  await emitGoalNarrationBestEffort({
+    larkAppId: supervisor.larkAppId,
+    goalChatId,
+    event: {
+      type: 'human-decision',
+      key: `narr:decision:${goalChatId}:${taskId ?? 'goal'}:${Date.now()}`,
+      decisionText: text,
+      source: 'dashboard',
+    },
+  });
+  return jsonRes(res, 200, {
+    ok: true,
+    goalChatId,
+    taskId,
+    supervisorSessionId: supervisor.session.sessionId,
+  });
+});
+
+// Internal: return this daemon's local chat-scope worker sessions for a goal.
+// The goal watchdog owner uses this to give L2 hard worker-health facts across
+// bot daemons without letting the mechanical layer reassign or decide for L2.
+ipcRoute('POST', '/api/goal/worker-health-local', async (req, res) => {
+  let raw: { goalChatId?: unknown; workerLarkAppId?: unknown };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const goalChatId = typeof raw.goalChatId === 'string' ? raw.goalChatId.trim() : '';
+  const workerLarkAppId = typeof raw.workerLarkAppId === 'string' && raw.workerLarkAppId.trim()
+    ? raw.workerLarkAppId.trim()
+    : undefined;
+  if (!goalChatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_goalChatId', error: 'goalChatId is required' });
+  if (workerLarkAppId && workerLarkAppId !== currentDaemonLarkAppId) {
+    return jsonRes(res, 200, { ok: true, entries: [] });
+  }
+  return jsonRes(res, 200, { ok: true, entries: collectLocalGoalWorkerHealth(goalChatId, workerLarkAppId) });
+});
+
+// Internal: L2 supervisor notifies its L1 parent without sending a Lark
+// self-message. The parent coordinates are stored structurally on the L2
+// session by goal supervise; this route only injects into an active L1 session.
+ipcRoute('POST', '/api/goal/notify-parent', async (req, res) => {
+  let raw: {
+    supervisorSessionId?: unknown;
+    goalChatId?: unknown;
+    taskId?: unknown;
+    summary?: unknown;
+    attentionKind?: unknown;
+    attentionReason?: unknown;
+    decisionOptions?: unknown;
+    done?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+  };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!isTrustedHostIpcRequest(req)) {
+    const supervisorSessionId = typeof raw.supervisorSessionId === 'string'
+      ? raw.supervisorSessionId.trim()
+      : '';
+    const supervisor = findActiveSessionById(supervisorSessionId);
+    const verified = authorizeGoalSessionIpc(req, supervisor, raw);
+    if (!verified.ok || !supervisor?.session.goalSupervisor) {
+      return jsonRes(res, 403, { ok: false, error: verified.ok ? 'origin_unproven' : verified.error });
+    }
+    raw.supervisorSessionId = supervisor.session.sessionId;
+    raw.goalChatId = supervisor.session.goalSupervisor.goalChatId;
+  }
+  const summary = typeof raw.summary === 'string' ? raw.summary.trim() : '';
+  const attentionKindRaw = typeof raw.attentionKind === 'string' ? raw.attentionKind.trim().toLowerCase() : '';
+  const attentionKind = ['authz', 'decision', 'blocked', 'help'].includes(attentionKindRaw) ? attentionKindRaw : '';
+  const attentionReason = typeof raw.attentionReason === 'string' && raw.attentionReason.trim()
+    ? raw.attentionReason.replace(/\s+/g, ' ').trim().slice(0, 500)
+    : summary.replace(/\s+/g, ' ').trim().slice(0, 500);
+  const decisionOptions = normalizeGoalDecisionOptions(raw.decisionOptions);
+  if (!summary) return jsonRes(res, 400, { ok: false, errorCode: 'missing_summary', error: 'summary is required' });
+  const notifyReq = {
+    supervisorSessionId: typeof raw.supervisorSessionId === 'string' && raw.supervisorSessionId.trim() ? raw.supervisorSessionId.trim() : undefined,
+    goalChatId: typeof raw.goalChatId === 'string' && raw.goalChatId.trim() ? raw.goalChatId.trim() : undefined,
+    taskId: typeof raw.taskId === 'string' && raw.taskId.trim() ? raw.taskId.trim() : undefined,
+    summary,
+    attentionKind: attentionKind || undefined,
+    attentionReason: attentionReason || undefined,
+    decisionOptions,
+    done: raw.done === true,
+  };
+  const supervisorForHumanNotify = findGoalSupervisorForNotify(notifyReq);
+  try {
+    const result = await notifyGoalParent(notifyReq, { larkAppId: currentDaemonLarkAppId, activeSessions });
+    let parentDs: DaemonSession | undefined;
+    let humanNotified = false;
+    let humanNotifyError: string | undefined;
+    let completionCardSent = false;
+    let completionCardError: string | undefined;
+    if (!result.ok) {
+      if (result.errorCode === 'parent_not_active' && supervisorForHumanNotify && notifyReq.done) {
+        const card = await sendGoalCompletionConfirmation({
+          supervisor: supervisorForHumanNotify,
+          summary,
+        });
+        completionCardSent = card.sent;
+        completionCardError = card.error;
+        if (completionCardSent) {
+          return jsonRes(res, 200, {
+            ok: true,
+            parentActive: false,
+            goalChatId: supervisorForHumanNotify.session.goalSupervisor?.goalChatId,
+            done: true,
+            attentionRaised: false,
+            completionCardSent,
+            warning: result.errorCode,
+          });
+        }
+      }
+      if (result.errorCode === 'parent_not_active' && attentionKind && attentionReason && supervisorForHumanNotify) {
+        const direct = await sendGoalHumanAttention({
+          supervisor: supervisorForHumanNotify,
+          taskId: notifyReq.taskId,
+          summary,
+          attentionKind,
+          attentionReason,
+          decisionOptions,
+          done: notifyReq.done,
+        });
+        humanNotified = direct.sent;
+        humanNotifyError = direct.error;
+        if (humanNotified) {
+          return jsonRes(res, 200, {
+            ok: true,
+            parentActive: false,
+            goalChatId: supervisorForHumanNotify.session.goalSupervisor?.goalChatId,
+            taskId: notifyReq.taskId,
+            done: notifyReq.done,
+            attentionRaised: false,
+            humanNotified,
+            warning: result.errorCode,
+          });
+        }
+      }
+      const status = result.errorCode === 'parent_not_active' || result.errorCode === 'supervisor_not_found' ? 404 : 400;
+      return jsonRes(res, status, { ...result, humanNotified, humanNotifyError, completionCardSent, completionCardError });
+    }
+    let attentionRaised = false;
+    parentDs = findActiveSessionById(result.parentSessionId);
+    if (attentionKind && attentionReason) {
+      for (const ds of activeSessions.values()) {
+        if (ds.session.sessionId !== result.parentSessionId) continue;
+        parentDs = ds;
+        ds.agentAttention = { kind: attentionKind, reason: attentionReason, at: Date.now() };
+        publishAttentionPatch(ds);
+        emitSessionLifecycleHook(ds, 'session.requires_attention', { reason: 'goal_escalation', kind: attentionKind, message: attentionReason });
+        attentionRaised = true;
+        break;
+      }
+      const direct = await sendGoalHumanAttention({
+        parent: parentDs,
+        supervisor: supervisorForHumanNotify,
+        taskId: notifyReq.taskId,
+        summary,
+        attentionKind,
+        attentionReason,
+        decisionOptions,
+        done: notifyReq.done,
+      });
+      humanNotified = direct.sent;
+      humanNotifyError = direct.error;
+      if (humanNotifyError) {
+        logger.warn(`[goal-notify-parent] human attention send failed: ${humanNotifyError}`);
+      }
+    }
+    if (notifyReq.done && supervisorForHumanNotify) {
+      const card = await sendGoalCompletionConfirmation({
+        parent: parentDs,
+        supervisor: supervisorForHumanNotify,
+        summary,
+      });
+      completionCardSent = card.sent;
+      completionCardError = card.error;
+      if (completionCardError) {
+        logger.warn(`[goal-notify-parent] completion card send failed: ${completionCardError}`);
+      }
+    }
+    return jsonRes(res, 200, { ...result, attentionRaised, humanNotified, humanNotifyError, completionCardSent, completionCardError });
+  } catch (err: any) {
+    logger.warn(`[goal-notify-parent] IPC failed: ${err?.message ?? err}`);
+    return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
+});
+
+// Session-scoped manual recovery for an expired/definite planned release. The
+// caller must be the active goal supervisor session on the frozen sender daemon.
+ipcRoute('POST', '/api/goal/release-action', async (req, res) => {
+  let raw: {
+    taskId?: unknown;
+    action?: unknown;
+    by?: unknown;
+    callerSessionId?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+  };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const taskId = typeof raw.taskId === 'string' ? raw.taskId.trim() : '';
+  const action = raw.action === 'confirm' || raw.action === 'retry' ? raw.action : '';
+  const by = typeof raw.by === 'string' ? raw.by.trim() : '';
+  const callerSessionId = typeof raw.callerSessionId === 'string' ? raw.callerSessionId.trim() : '';
+  if (!taskId || !action || !by || !callerSessionId) {
+    return jsonRes(res, 400, { ok: false, error: 'taskId, action, by and callerSessionId are required' });
+  }
+  const caller = findActiveSessionById(callerSessionId);
+  const verified = authorizeGoalSessionIpc(req, caller, raw);
+  const ledger = openLedger();
+  const task = ledger.task(taskId);
+  if (!verified.ok || !caller || !task?.chatId || caller.chatId !== task.chatId) {
+    return jsonRes(res, 403, { ok: false, error: verified.ok ? 'origin_unproven' : verified.error });
+  }
+  if (caller.session.goalSupervisor?.goalChatId !== task.chatId) {
+    return jsonRes(res, 403, { ok: false, error: 'goal_supervisor_required' });
+  }
+  if (task.plan?.dispatchSpec.senderLarkAppId !== currentDaemonLarkAppId) {
+    return jsonRes(res, 409, { ok: false, error: 'wrong_release_owner' });
+  }
+  try {
+    const result = action === 'confirm'
+      ? confirmTaskRelease({ ledger, taskId, confirmedBy: by, now: Date.now() })
+      : await retryTaskRelease({ taskId, approvedBy: by, deps: createGoalReleaseEngineDeps() });
+    return jsonRes(res, 200, { ok: true, result });
+  } catch (err: any) {
+    logger.warn(`[goal-release] manual ${action} failed task=${taskId}: ${err?.message ?? err}`);
+    return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
+});
+
+// Internal: ask the daemon that owns a planned task's frozen sender identity to
+// release any newly-ready dependency-gated work. A session-scoped caller may
+// broadcast; each daemon still filters by senderLarkAppId before sending.
+ipcRoute('POST', '/api/goal/release-check', async (req, res) => {
+  let raw: {
+    goalChatId?: unknown;
+    reason?: unknown;
+    broadcast?: unknown;
+    callerSessionId?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+  };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const goalChatId = typeof raw.goalChatId === 'string' ? raw.goalChatId.trim() : '';
+  const reason = typeof raw.reason === 'string' && raw.reason.trim() ? raw.reason.trim() : 'ipc';
+  if (!goalChatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_goalChatId', error: 'goalChatId is required' });
+  try {
+    if (raw.broadcast === true) {
+      if (!isTrustedHostIpcRequest(req)) {
+        const callerSessionId = typeof raw.callerSessionId === 'string' ? raw.callerSessionId.trim() : '';
+        const caller = findActiveSessionById(callerSessionId);
+        const verified = authorizeGoalSessionIpc(req, caller, raw);
+        if (!verified.ok || !caller || caller.chatId !== goalChatId) {
+          return jsonRes(res, 403, { ok: false, error: verified.ok ? 'origin_unproven' : verified.error });
+        }
+      }
+      const result = await triggerGoalReleaseAcrossDaemons({ goalChatId, reason });
+      return jsonRes(res, 200, { ok: true, ...result });
+    }
+    if (!isTrustedHostIpcRequest(req)) {
+      return jsonRes(res, 403, { ok: false, error: 'origin_unproven' });
+    }
+    const results = await runGoalReleaseCheckOnThisDaemon(goalChatId, 'trigger', reason);
+    return jsonRes(res, 200, { ok: true, results });
+  } catch (err: any) {
+    logger.warn(`[goal-release] IPC trigger failed: ${err?.message ?? err}`);
+    return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
+});
+
+// Internal: ask whichever daemon owns the goal's L2 supervisor to inspect
+// pending verified-delivery tasks. Worker idle/exit events may happen in a
+// different bot daemon, so callers broadcast this route to all online daemons;
+// only the daemon with an active chat-scope L2 will inject a turn.
+ipcRoute('POST', '/api/goal/watchdog', async (req, res) => {
+  let raw: {
+    goalChatId?: unknown;
+    reason?: unknown;
+    broadcast?: unknown;
+    callerSessionId?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+  };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const goalChatId = typeof raw.goalChatId === 'string' ? raw.goalChatId.trim() : '';
+  const reason = typeof raw.reason === 'string' && raw.reason.trim() ? raw.reason.trim() : 'ipc';
+  if (!goalChatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_goalChatId', error: 'goalChatId is required' });
+  try {
+    if (raw.broadcast === true) {
+      if (!isTrustedHostIpcRequest(req)) {
+        const callerSessionId = typeof raw.callerSessionId === 'string' ? raw.callerSessionId.trim() : '';
+        const caller = findActiveSessionById(callerSessionId);
+        const verified = authorizeGoalSessionIpc(req, caller, raw);
+        if (!verified.ok || !caller || caller.chatId !== goalChatId) {
+          return jsonRes(res, 403, { ok: false, error: verified.ok ? 'origin_unproven' : verified.error });
+        }
+      }
+      const result = await triggerGoalWatchdogAcrossDaemons({
+        goalChatId,
+        reason,
+        sourceSessionId: typeof raw.callerSessionId === 'string' ? raw.callerSessionId.trim() || undefined : undefined,
+      });
+      return jsonRes(res, 200, { ok: true, ...result });
+    }
+    if (!isTrustedHostIpcRequest(req)) {
+      return jsonRes(res, 403, { ok: false, error: 'origin_unproven' });
+    }
+    const results = await runGoalWatchdogForGoalOnThisDaemon(goalChatId, reason);
+    return jsonRes(res, 200, { ok: true, results });
+  } catch (err: any) {
+    logger.warn(`[goal-watchdog] IPC trigger failed: ${err?.message ?? err}`);
+    return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
 });
 
 // ─── session-ready IPC route (internal: Claude-family 真就绪信号) ─────────────
@@ -13303,7 +15071,18 @@ async function resolvePinnedWorkingDir(ctx: {
   chatId: string;
   chatType: 'group' | 'p2p';
   larkAppId: string;
+  /** Receiver-local path resolved from a `[botmux-dispatch v1]` requirement. */
+  requiredWorkingDir?: string;
 }) {
+  if (ctx.requiredWorkingDir) {
+    return {
+      pinnedWorkingDir: ctx.requiredWorkingDir,
+      oncallEntry: undefined,
+      inheritedFrom: null,
+      pinnedFromBotDefault: false,
+      pinnedFromRequirement: true,
+    };
+  }
   let oncallEntry = findOncallChat(ctx.larkAppId, ctx.chatId);
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
@@ -13329,7 +15108,7 @@ async function resolvePinnedWorkingDir(ctx: {
   // latter is set (it wins over inherit), so `!oncallEntry && botDefaultWorkingDir`
   // fully characterizes "came from the bot's own default".
   const pinnedFromBotDefault = !oncallEntry && !!botDefaultWorkingDir;
-  return { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault };
+  return { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault, pinnedFromRequirement: false };
 }
 
 export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
@@ -13424,7 +15203,8 @@ async function startInitialPassthroughSession(args: {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
     parsed, commandContent, senderOpenId, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId,
   } = args;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType)) {
+  const senderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, { senderIsBot })) {
     return;
   }
 
@@ -13433,6 +15213,12 @@ async function startInitialPassthroughSession(args: {
   const directChatSender = chatType === 'p2p'
     ? await resolveSender(larkAppId, senderOpenId, parsed.senderType)
     : undefined;
+  // Group cold-start passthroughs only need a stable caller identity while the
+  // repo picker is pending. Avoid adding a contact lookup to every /goal start;
+  // an optional display name can be learned later from the normal cache path.
+  const initialPassthroughSender = directChatSender ?? (senderOpenId
+    ? { openId: senderOpenId, type: senderIsBot ? 'bot' as const : 'user' as const }
+    : undefined);
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
   const session = sessionStore.createSession(chatId, rootIdForStore, commandContent.substring(0, 50), chatType);
   const now = Date.now();
@@ -13451,7 +15237,13 @@ async function startInitialPassthroughSession(args: {
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, { ...parsed, content: commandContent });
 
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
+    scope,
+    anchor,
+    chatId,
+    chatType,
+    larkAppId,
+  });
   // Auto-worktree: register PENDING (router buffers, no force-fork) and build the
   // worktree off the critical path (see willAutoWorktree / runAutoWorktreeCommit).
   const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -13471,6 +15263,8 @@ async function startInitialPassthroughSession(args: {
     pendingRepo: !pinnedWorkingDir || autoWt,
     pendingPrompt: '',
     pendingRawInput: commandContent,
+    pendingRawTurnId: messageId,
+    pendingSender: (!pinnedWorkingDir || autoWt) ? initialPassthroughSender : undefined,
     ownerOpenId,
     currentTurnTitle: commandContent.substring(0, 50),
     workingDir: pinnedWorkingDir,
@@ -13494,6 +15288,8 @@ async function startInitialPassthroughSession(args: {
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     rememberLastCliInput(ds, commandContent, commandContent);
+    // Raw passthrough gets its human turn only at the literal PTY write
+    // boundary (prompt_ready -> raw_input), never during CLI startup.
     forkWorker(ds, '', false);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -13562,6 +15358,16 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // every event that flows through us teaches the cache without touching
   // the contact API. Must run before any await on the sender resolver.
   learnFromMentions(larkAppId, parsed.mentions);
+
+  if (await maybeIngestDeliveryEnvelope({ parsed, larkAppId, chatId })) {
+    return;
+  }
+  if (await maybeRouteGoalParentReply(parsed, larkAppId, chatId)) {
+    return;
+  }
+  if (isGoalPanelApp(larkAppId)) {
+    return;
+  }
 
   let content = parsed.content.trim();
   // Strip leading @<bot> mentions so "@bot /oncall bind" is recognized as a command.
@@ -13822,8 +15628,25 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     }
   }
 
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType)) {
+  const senderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType, { senderIsBot })) {
     return;
+  }
+
+  // A repo requirement can reveal whether a private checkout exists locally
+  // and may run git/scanner subprocesses. Only inspect it after the normal
+  // talk/team-trust gate has accepted the sender.
+  const dispatchRepo = await preflightDispatchRepo({
+    parsed,
+    larkAppId,
+    chatId,
+    scope,
+    anchor,
+  });
+  if (dispatchRepo.handled) return;
+  if (dispatchRepo.workingDir) {
+    content = parsed.content.trim();
+    cmdContent = stripLeadingMentions(content, parsed.mentions);
   }
 
   // Download attachments
@@ -13857,7 +15680,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Pin the working dir via the layered oncall / inherit / default lookup
   // (auto-binds a defaultOncall chat as a side effect). Shared with the
   // first-message `/repo` command branch so both paths stay consistent.
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault, pinnedFromRequirement } = await resolvePinnedWorkingDir({
+    scope,
+    anchor,
+    chatId,
+    chatType,
+    larkAppId,
+    requiredWorkingDir: dispatchRepo.workingDir,
+  });
   // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
   // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
   const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -13899,7 +15729,6 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     && scope === 'chat'
     && !botCfg.substituteMode?.disableControlCard
     && !session.substituteControlCardSent;
-
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -13915,6 +15744,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     hasHistory: false,
     pendingRepo: !pinnedWorkingDir || autoWt,
     pendingPrompt: promptContent,
+    pendingTurnId: messageId,
     pendingCodexAppText: codexAppVisibleText,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
@@ -13955,8 +15785,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, prompt);
-    forkWorker(ds, prompt);
-    const reason = oncallEntry
+    forkWorker(ds, prompt, { turnId: messageId });
+    ds.pendingTurnId = undefined;
+    const reason = pinnedFromRequirement
+      ? 'dispatch repo requirement'
+      : oncallEntry
       ? `oncall-bound chat ${chatId}`
       : inheritedFrom
       ? `inherited from sibling session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
@@ -13987,7 +15820,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, prompt);
-    forkWorker(ds, prompt);
+    forkWorker(ds, prompt, { turnId: messageId });
+    ds.pendingTurnId = undefined;
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
 }
@@ -14241,6 +16075,232 @@ function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
   return 'Bot';
 }
 
+interface DispatchRepoPreflightResult {
+  handled: boolean;
+  workingDir?: string;
+}
+
+interface DispatchRepoPreflightDeps {
+  scanDirs?: string[];
+  dataDir?: string;
+  sendAccessHelp?: typeof sendDispatchRepoAccessHelp;
+  resolveRequirement?: typeof resolveRepoRequirement;
+  inspectRepo?: typeof inspectLocalRepoAsync;
+}
+
+async function sendDispatchRepoAccessHelp(input: {
+  larkAppId: string;
+  chatId: string;
+  scope: 'thread' | 'chat';
+  anchor: string;
+  supervisorOpenId?: string;
+  taskId: string;
+  repo: string;
+  detail?: string;
+  blocker?: string;
+  helpKind?: HelpKind;
+}): Promise<void> {
+  const blocker = input.blocker ?? buildMissingRepoBlocker(input.repo, input.detail);
+  const envelope = formatHelpEnvelope({
+    taskId: input.taskId,
+    helpKind: input.helpKind ?? 'access',
+    blocker,
+  });
+  const text = input.supervisorOpenId
+    ? `<at user_id="${input.supervisorOpenId}"></at>\n${envelope}`
+    : envelope;
+  if (input.scope === 'thread') {
+    await replyMessage(input.larkAppId, input.anchor, text, 'text', true);
+  } else {
+    await sendMessage(input.larkAppId, input.chatId, text, 'text');
+  }
+}
+
+/**
+ * Resolve a dispatch's repo requirement before any session/card is created.
+ * A miss is converted into the existing `help(kind=access)` flow, so the
+ * supervisor decides whether to prepare the environment, switch workers, or
+ * fail the task. The daemon only reports the local fact.
+ */
+async function preflightDispatchRepo(input: {
+  parsed: LarkMessage;
+  larkAppId: string;
+  chatId: string;
+  scope: 'thread' | 'chat';
+  anchor: string;
+  existingSession?: DaemonSession;
+}, deps: DispatchRepoPreflightDeps = {}): Promise<DispatchRepoPreflightResult> {
+  const senderIsBot = input.parsed.senderType === 'app' || input.parsed.senderType === 'bot';
+  const unsupported = detectUnsupportedDispatchRepoRequirement(input.parsed.content);
+  if (unsupported) {
+    if (!senderIsBot) {
+      logger.warn(`[dispatch-repo] ignored non-bot unsupported version=${unsupported.version} msg=${input.parsed.messageId}`);
+      return { handled: false };
+    }
+    const blocker = `派活协议版本不兼容：收到 ${unsupported.version}，当前仅支持 ${unsupported.supportedVersion}。请升级执行者所在机器的 botmux 后重试。`;
+    try {
+      if (unsupported.taskId) {
+        await (deps.sendAccessHelp ?? sendDispatchRepoAccessHelp)({
+          larkAppId: input.larkAppId,
+          chatId: input.chatId,
+          scope: input.scope,
+          anchor: input.anchor,
+          supervisorOpenId: input.parsed.senderId,
+          taskId: unsupported.taskId,
+          repo: unsupported.repo ?? '(未识别)',
+          blocker,
+          helpKind: 'other',
+        });
+      } else {
+        const text = input.parsed.senderId
+          ? `<at user_id="${input.parsed.senderId}"></at>\n⚠️ ${blocker}`
+          : `⚠️ ${blocker}`;
+        if (input.scope === 'thread') await replyMessage(input.larkAppId, input.anchor, text, 'text', true);
+        else await sendMessage(input.larkAppId, input.chatId, text, 'text');
+      }
+    } catch (err) {
+      logger.error(`[dispatch-repo] failed to report unsupported version=${unsupported.version}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    logger.warn(`[dispatch-repo] unsupported version=${unsupported.version} supported=${unsupported.supportedVersion} task=${unsupported.taskId ?? ''} msg=${input.parsed.messageId}`);
+    return { handled: true };
+  }
+
+  const requirement = parseDispatchRepoRequirement(input.parsed.content);
+  if (!requirement) return { handled: false };
+
+  if (!senderIsBot) {
+    logger.warn(`[dispatch-repo] ignored non-bot requirement task=${requirement.taskId} msg=${input.parsed.messageId}`);
+    return { handled: false };
+  }
+
+  const resolution = await (deps.resolveRequirement ?? resolveRepoRequirement)({
+    requirement: requirement.repo,
+    scanDirs: deps.scanDirs ?? getBotProjectScanDirs(input.larkAppId),
+    dataDir: deps.dataDir ?? config.session.dataDir,
+  });
+  if (!resolution.ok) {
+    try {
+      await (deps.sendAccessHelp ?? sendDispatchRepoAccessHelp)({
+        larkAppId: input.larkAppId,
+        chatId: input.chatId,
+        scope: input.scope,
+        anchor: input.anchor,
+        supervisorOpenId: input.parsed.senderId,
+        taskId: requirement.taskId,
+        repo: requirement.repo,
+        detail: resolution.detail,
+      });
+    } catch (err) {
+      logger.error(`[dispatch-repo] failed to send access help task=${requirement.taskId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    logger.warn(
+      `[dispatch-repo] blocked task=${requirement.taskId} repo=${requirement.repo} ` +
+      `reason=${resolution.reason} detail=${resolution.detail ?? ''} stalePath=${resolution.stalePath ?? ''}`,
+    );
+    return { handled: true };
+  }
+
+  if (input.existingSession) {
+    const current = await (deps.inspectRepo ?? inspectLocalRepoAsync)(getSessionWorkingDir(input.existingSession));
+    if (!current.ok || current.remoteIdentity !== resolution.remoteIdentity) {
+      try {
+        await (deps.sendAccessHelp ?? sendDispatchRepoAccessHelp)({
+          larkAppId: input.larkAppId,
+          chatId: input.chatId,
+          scope: input.scope,
+          anchor: input.anchor,
+          supervisorOpenId: input.parsed.senderId,
+          taskId: requirement.taskId,
+          repo: requirement.repo,
+          detail: '当前执行会话正在使用其他项目，不能安全切换',
+        });
+      } catch (err) {
+        logger.error(`[dispatch-repo] failed to report active-session mismatch task=${requirement.taskId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      logger.warn(`[dispatch-repo] blocked active-session mismatch task=${requirement.taskId} current=${getSessionWorkingDir(input.existingSession)} wanted=${resolution.path}`);
+      return { handled: true };
+    }
+  }
+
+  input.parsed.content = requirement.content;
+  logger.info(
+    `[dispatch-repo] ready task=${requirement.taskId} repo=${requirement.repo} ` +
+    `path=${resolution.path} matchedBy=${resolution.matchedBy} source=${resolution.source}`,
+  );
+  return {
+    handled: false,
+    workingDir: input.existingSession ? undefined : resolution.path,
+  };
+}
+
+export const __testOnly_preflightDispatchRepo = preflightDispatchRepo;
+
+async function maybeIngestDeliveryEnvelope(input: {
+  parsed: LarkMessage;
+  larkAppId: string;
+  chatId?: string;
+}): Promise<boolean> {
+  const envelope = parseDeliveryEnvelope(input.parsed.content);
+  if (!envelope) {
+    const unsupported = detectUnsupportedDeliveryEnvelope(input.parsed.content);
+    if (unsupported) {
+      logger.warn(`[delivery-envelope] unsupported version kind=${unsupported.kind} version=${unsupported.version} supported=${unsupported.supportedVersion} msg=${input.parsed.messageId}`);
+      return true;
+    }
+    // A dispatch prompt may contain report/help examples for the worker. The
+    // trailing dispatch block is the authoritative outer protocol only when
+    // the whole message is NOT already a valid delivery envelope. This keeps a
+    // real report whose evidence quotes a dispatch block ingestible.
+    if (parseDispatchRepoRequirement(input.parsed.content)) return false;
+    return false;
+  }
+  const goalChatId = input.chatId ?? input.parsed.chatId;
+  const senderOpenId = input.parsed.senderId;
+  const senderUnionId = input.parsed.senderUnionId?.trim();
+  if (!goalChatId || !senderOpenId) return true;
+
+  const supervisor = findGoalSupervisorForNotify({ goalChatId });
+  if (!supervisor || supervisor.larkAppId !== input.larkAppId) {
+    logger.info(`[delivery-envelope] ignored on non-owner daemon goal=${goalChatId} task=${envelope.taskId} app=${input.larkAppId}`);
+    return true;
+  }
+
+  const result = ingestParsedDeliveryEnvelope({
+    envelope,
+    ledger: openLedger(),
+    goalChatId,
+    senderOpenId,
+    senderUnionId,
+    messageId: input.parsed.messageId,
+    now: Date.now(),
+  });
+  if (result.outcome === 'unknown_task') {
+    logger.warn(`[delivery-envelope] unknown/wrong-goal task=${result.taskId} goal=${goalChatId} msg=${input.parsed.messageId}`);
+    return true;
+  }
+  if (result.outcome === 'task_not_dispatched') {
+    logger.warn(`[delivery-envelope] task not dispatched yet task=${result.taskId} goal=${goalChatId} msg=${input.parsed.messageId}`);
+    return true;
+  }
+  if (result.outcome === 'unauthorized') {
+    logger.warn(`[delivery-envelope] unauthorized senderOpenId=${senderOpenId} senderUnionId=${senderUnionId ?? ''} task=${result.taskId} goal=${goalChatId} msg=${input.parsed.messageId} allowedOpenIds=[${result.allowedOpenIds.join(',')}] allowedUnionIds=[${result.allowedUnionIds.join(',')}] app=${input.larkAppId}`);
+    return true;
+  }
+  if (result.outcome === 'report_without_evidence') {
+    logger.warn(`[delivery-envelope] report without evidence ignored task=${result.taskId} msg=${input.parsed.messageId}`);
+    return true;
+  }
+  if (result.outcome === 'report') {
+    logger.info(`[delivery-envelope] report ingested task=${result.taskId} report=${result.reportId} deduped=${result.deduped}`);
+  } else {
+    logger.info(`[delivery-envelope] help ingested task=${result.taskId} deduped=${result.deduped}`);
+  }
+
+  void runGoalWatchdogForGoalOnThisDaemon(goalChatId, `delivery-envelope:${result.outcome}:${result.taskId}`)
+    .catch((err: any) => logger.warn(`[delivery-envelope] watchdog trigger failed goal=${goalChatId}: ${err?.message ?? err}`));
+  return true;
+}
+
 async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId, substituteTrigger } = ctx;
   await resolveNonsupportMessage(data, larkAppId);
@@ -14254,6 +16314,20 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 
   learnFromMentions(larkAppId, parsed.mentions);
 
+  if (await maybeIngestDeliveryEnvelope({ parsed, larkAppId, chatId: ctxChatId ?? data?.message?.chat_id })) {
+    return;
+  }
+  if (await maybeRouteGoalParentReply(parsed, larkAppId, ctxChatId ?? data?.message?.chat_id)) {
+    return;
+  }
+  // goal-panel is a sender-only relay. It only reacts to explicit replies to
+  // panel-sent goal notifications; ordinary parent-chat messages must remain
+  // silent so the panel never becomes a noisy conversational bot.
+  if (isGoalPanelApp(larkAppId)) {
+    return;
+  }
+
+  const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
   // Foreign bot @mention prefix: when sender is another botmux bot，把内容包成
   // [来自 X 的 @mention]\n<原文> 喂给 worker，让 CLI 知道这是另一个 bot 发的——
   // 不是用户直接发的——后续不需要按"对话用户"的方式处理。signal-file 路径
@@ -14289,7 +16363,6 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     + parsed.content;
   let promptContent = initialPromptContent;
   let rewrittenCodexAppMessageContext: string | undefined;
-  const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
   emitHookEvent('thread.reply', {
     larkAppId,
     chatId: ctxChatId,
@@ -14491,11 +16564,32 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // 收紧到与 daemon 命令同档；这会同时改变真人 oncall 成员的现有行为，应单独评估。
       const ds = existingDs;
       if (ds?.worker && !ds.worker.killed) {
+        // Passthrough commands bypass the normal message-forwarding block
+        // below, so bind this accepted Lark turn here before the worker rotates
+        // its marker at the actual PTY write boundary.
+        ds.session.quoteTargetId = parsed.messageId;
+        ds.session.quoteTargetSenderOpenId = threadSenderOpenId;
+        ds.session.quoteTargetSenderIsBot = isForeignBot;
+        const substituteReplyMode = substituteTrigger
+          ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
+          : 'thread';
+        beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), {
+          quoteOnly: substituteReplyMode === 'quote',
+          substitute: !!substituteTrigger,
+        });
+        if (threadSenderOpenId && ds.session.lastCallerOpenId !== threadSenderOpenId) {
+          ds.session.lastCallerOpenId = threadSenderOpenId;
+        }
+        sessionStore.updateSession(ds.session);
         // Mark a new turn so the CLI's response to /model, /clear, /compact, etc.
         // shows up as a fresh streaming card instead of silently PATCH-ing the
         // previous turn's card.
         beginNewTurn(ds, commandContent);
-        ds.worker.send({ type: 'raw_input', content: commandContent } as DaemonToWorker);
+        ds.worker.send({
+          type: 'raw_input',
+          content: commandContent,
+          turnId: parsed.messageId,
+        } as DaemonToWorker);
         markSessionActivity(ds);
         logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
       } else {
@@ -14634,8 +16728,27 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   }
 
   const quotaSenderOpenId = threadSenderOpenId;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor, threadTeamTrustUnionId, threadSenderUnionId, ctxChatType)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor, threadTeamTrustUnionId, threadSenderUnionId, ctxChatType, { senderIsBot: isBotSenderType })) {
     return;
+  }
+
+  // Keep project discovery behind the same sender trust gate as normal CLI
+  // input. Otherwise an arbitrary bot could use requirement hits/misses as a
+  // local repository existence oracle or force synchronous scans.
+  const contentBeforeDispatchPreflight = parsed.content;
+  const dispatchRepo = await preflightDispatchRepo({
+    parsed,
+    larkAppId,
+    chatId: ctxChatId ?? data?.message?.chat_id ?? '',
+    scope,
+    anchor,
+    existingSession: ds,
+  });
+  if (dispatchRepo.handled) return;
+  if (parsed.content !== contentBeforeDispatchPreflight && !threadGrill) {
+    promptContent = initialCodexAppMessageContext
+      + initialCodexAppApplicationContext
+      + parsed.content;
   }
 
   // When a command path rewrites the model prompt (for example /workflow),
@@ -14659,9 +16772,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // Update last message time + last caller (used by `botmux send` to address
   // reply cards to whoever triggered this turn — matters in oncall groups
   // where the caller is often not the session owner).
+  const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   if (ds) {
     markSessionActivity(ds);
-    const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
     // quoteTargetId changes every inbound message (always a new message_id), so
     // — unlike lastCallerOpenId — persist unconditionally. Powers `botmux send`'s
     // default chat-scope quote chain + --mention-back.
@@ -14685,7 +16798,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   }
 
   // If waiting for repo selection, buffer the message and remind user
-  if (ds?.pendingRepo) {
+  if (ds?.pendingRepo || ds?.pendingRepoCommitInFlight) {
     // Enrich content with attachment hints and mention metadata (same as normal send)
     const codexAppFollowUpContextParts: string[] = [];
     if (codexAppMessageContext) codexAppFollowUpContextParts.push(codexAppMessageContext);
@@ -14709,7 +16822,15 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // follow-ups now fold into the same <user_message>, so a same-user tag is
     // pure duplication. A differing sender still gets attributed so the CLI can
     // tell multi-user buffered messages apart after repo selection unlocks.
-    const followUpSender = await getThreadSender();
+    // This branch is also the synchronization barrier for a pending first
+    // worker. Do not await contact/name resolution here: a commit waiting on
+    // getAvailableBots could otherwise resume first, snapshot stale buffers,
+    // and fork before this message is appended. Event identity is sufficient
+    // for caller equality and sender attribution; names remain optional.
+    const followUpSender: import('./im/lark/identity-cache.js').ResolvedSender | undefined = callerOpenId
+      ? { openId: callerOpenId, type: isForeignBot ? 'bot' : 'user' }
+      : undefined;
+    const hadBufferedFollowUps = (ds.pendingFollowUps?.length ?? 0) > 0;
     if (followUpSender?.openId && followUpSender.openId !== ds.pendingSender?.openId) {
       // This buffer folds into the opening <user_message> after repo selection,
       // so pair the foreign sender tag with the cursor anti-echo note: without
@@ -14722,6 +16843,34 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       if (followUpSenderBlock) {
         enriched = `${followUpSenderBlock}\n${enriched}`;
         codexAppFollowUpContextParts.unshift(followUpSenderBlock);
+      }
+    }
+    const sameInitialCaller = !!followUpSender?.openId
+      && followUpSender.openId === ds.pendingSender?.openId;
+    if (ds.pendingRawInput) {
+      if ((!hadBufferedFollowUps || ds.pendingFollowUpTurnId) && sameInitialCaller) {
+        // The persisted quote target is a single latest-turn pointer. Treat a
+        // same-caller raw command + buffered follow-ups as one batch and join
+        // every staged PTY input to that latest turn. Keeping the raw command
+        // on its older id would fail provenance as soon as the follow-up moves
+        // the durable pointer forward.
+        ds.pendingRawTurnId = parsed.messageId;
+        ds.pendingFollowUpTurnId = parsed.messageId;
+      } else {
+        // Mixed callers cannot share one durable turn pointer. Revoke the
+        // entire batch rather than letting either identity borrow the other.
+        ds.pendingRawTurnId = undefined;
+        ds.pendingFollowUpTurnId = undefined;
+      }
+    } else if (ds.pendingTurnId) {
+      // One deferred model prompt may fold several same-user messages together;
+      // bind it to the newest exact message so the durable quote and marker
+      // still join. If another user contributes, clear authority instead of
+      // letting either identity authorize the combined prompt.
+      if (sameInitialCaller) {
+        ds.pendingTurnId = parsed.messageId;
+      } else {
+        ds.pendingTurnId = undefined;
       }
     }
     if (!ds.pendingFollowUps) ds.pendingFollowUps = [];
@@ -14739,7 +16888,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // Auto-worktree pending (worktreeCreating) has no repo card to point at — the
     // message IS buffered (folded on commit), so just say "hold on, building worktree"
     // instead of the misleading "pick a repo from the card above".
-    const pendingReplyKey = ds.worktreeCreating ? 'daemon.worktree_building_wait' : 'daemon.choose_repo_first';
+    const pendingReplyKey = (ds.worktreeCreating || ds.pendingRepoCommitInFlight)
+      ? 'daemon.worktree_building_wait'
+      : 'daemon.choose_repo_first';
     await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
     return;
   }
@@ -14799,12 +16950,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 
     // Use the same layered oncall / inherit / default lookup as handleNewTopic
     // so stale inherited peers are ignored consistently in both spawn paths.
-    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
+    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault, pinnedFromRequirement } = await resolvePinnedWorkingDir({
       scope,
       anchor,
       chatId: autoCreateChatId,
       chatType: autoCreateChatType,
       larkAppId,
+      requiredWorkingDir: dispatchRepo.workingDir,
     });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
     // Now we know the message will spawn or pend a real session — resolve
@@ -14828,6 +16980,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       hasHistory: false,
       pendingRepo: !pinnedWorkingDir || autoWt,
       pendingPrompt: promptContent,
+      pendingTurnId: parsed.messageId,
       pendingCodexAppText: parsed.content,
       pendingCodexAppApplicationContext: codexAppApplicationContext,
       pendingCodexAppMessageContext: codexAppMessageContext,
@@ -14867,8 +17020,11 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       rememberLastCliInput(newDs, promptContent, prompt);
-      forkWorker(newDs, prompt);
-      const reason = oncallEntry
+      forkWorker(newDs, prompt, { turnId: parsed.messageId });
+      newDs.pendingTurnId = undefined;
+      const reason = pinnedFromRequirement
+        ? 'dispatch repo requirement'
+        : oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
         : inheritedFrom
         ? `inherited from peer session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
@@ -14899,7 +17055,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, { larkAppId, chatId: autoCreateChatId, whiteboardId: newDs.session.whiteboardId, substituteTrigger, codexAppText: parsed.content, codexAppApplicationContext, codexAppMessageContext });
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       rememberLastCliInput(newDs, promptContent, prompt);
-      forkWorker(newDs, prompt);
+      forkWorker(newDs, prompt, { turnId: parsed.messageId });
+      newDs.pendingTurnId = undefined;
     }
 
     return;
@@ -15476,6 +17633,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     );
   }
   registerBot(cfg);
+  currentDaemonLarkAppId = cfg.larkAppId;
   selfDaemonLarkAppId = cfg.larkAppId;
   // Establish the target-scoped daemon control credential before publishing
   // the daemon descriptor or accepting IPC traffic. Corruption fails startup
@@ -15598,6 +17756,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const desc: DaemonDescriptor = {
     larkAppId: cfg.larkAppId,
     botName: cfg.displayName ?? cfg.larkAppId,
+    botOpenId: getBot(cfg.larkAppId).botOpenId,
     cliId: cfg.cliId,
     botIndex: idx,
     ipcPort,
@@ -15738,6 +17897,29 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     onDurableExpiryReady(_ds, context) {
       vcMeetingRuntimeLeaseRecovery.acknowledge(context);
+    },
+    onSessionIdleOrExit(ds: DaemonSession, reason: 'idle' | 'limited' | 'exit') {
+      // Worker/report is only a fast path in verified delivery. When any session
+      // in a goal group reaches a turn boundary, ask the L2 supervisor to inspect
+      // pending tasks immediately instead of waiting for the 5m periodic sweep.
+      if (!shouldTriggerGoalWatchdogOnSessionBoundary(ds) || !ds.chatId) return;
+      void triggerGoalWatchdogAcrossDaemons({
+        goalChatId: ds.chatId,
+        reason,
+        sourceSessionId: ds.session.sessionId,
+      }).then((results) => {
+        if (results.injected > 0) {
+          logger.info(`[goal-watchdog] event-triggered by ${reason} session=${ds.session.sessionId.substring(0, 8)} goal=${ds.chatId} contacted=${results.contacted} injected=${results.injected}`);
+        } else if (results.reconciled > 0) {
+          logger.info(`[goal-watchdog] event-reconciled by ${reason} session=${ds.session.sessionId.substring(0, 8)} goal=${ds.chatId} contacted=${results.contacted} reconciled=${results.reconciled}`);
+        } else if (results.revived > 0) {
+          logger.info(`[goal-watchdog] event-revived by ${reason} session=${ds.session.sessionId.substring(0, 8)} goal=${ds.chatId} contacted=${results.contacted} revived=${results.revived}`);
+        } else if (results.busy > 0 || results.rateLimited > 0) {
+          logger.info(`[goal-watchdog] event observed by ${reason} session=${ds.session.sessionId.substring(0, 8)} goal=${ds.chatId} contacted=${results.contacted} busy=${results.busy} rateLimited=${results.rateLimited}`);
+        }
+      }).catch((err: any) => {
+        logger.warn(`[goal-watchdog] event trigger failed: ${err?.message ?? err}`);
+      });
     },
   });
   // Expose the activeSessions Map (owned by daemon) to worker-pool readers,
@@ -15893,10 +18075,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     probeBotOpenId(cfg.larkAppId).then(() => {
       writeBotInfoFile(config.session.dataDir);
       const probedName = cfg.displayName ?? bot.botName;
+      const probedOpenId = bot.botOpenId;
       const probedAvatar = bot.botAvatarUrl;
       let descChanged = false;
       if (probedName && probedName !== desc.botName) {
         desc.botName = probedName;
+        descChanged = true;
+      }
+      if (probedOpenId && probedOpenId !== desc.botOpenId) {
+        desc.botOpenId = probedOpenId;
         descChanged = true;
       }
       if (probedAvatar && probedAvatar !== desc.botAvatarUrl) {
@@ -16119,6 +18306,44 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.warn(`[v3] progress-card cold-attach failed; continuing daemon startup: ${err instanceof Error ? err.message : String(err)}`);
   });
 
+  const goalWatchdogTimer = isGoalPanelApp(cfg.larkAppId)
+    ? undefined
+    : startGoalWatchdog({
+      larkAppId: cfg.larkAppId,
+      activeSessions,
+      onReviveFailure: handleGoalReviveFailure,
+      workerHealthFacts: buildWorkerHealthFacts,
+      reassignDeadWorker: reassignDeadGoalWorker,
+      onAccepted: ({ taskId, goalChatId }) => {
+        if (!goalChatId || !goalHasPlannedDependent(goalChatId, taskId)) return;
+        void runGoalReleaseCheckOnThisDaemon(goalChatId, 'trigger', `reconcile-accepted:${taskId}`)
+          .catch((err: any) => logger.warn(`[goal-release] reconcile trigger failed: ${err?.message ?? err}`));
+      },
+    });
+
+  const goalReleaseTimer = setInterval(() => {
+    void runAllGoalReleaseChecksOnThisDaemon('periodic').catch((err: any) => {
+      logger.warn(`[goal-release] periodic scan failed: ${err?.message ?? err}`);
+    });
+  }, 60_000);
+  goalReleaseTimer.unref?.();
+  setTimeout(() => {
+    void runAllGoalReleaseChecksOnThisDaemon('startup').catch((err: any) => {
+      logger.warn(`[goal-release] startup scan failed: ${err?.message ?? err}`);
+    });
+  }, 5_000).unref?.();
+
+  const goalNotificationRetryTimer = setInterval(() => {
+    void processGoalNotificationRetries().catch((err: any) => {
+      logger.warn(`[goal-notification-retry] tick failed: ${err?.message ?? err}`);
+    });
+  }, 60_000);
+  goalNotificationRetryTimer.unref?.();
+  setTimeout(() => {
+    void processGoalNotificationRetries().catch((err: any) => {
+      logger.warn(`[goal-notification-retry] startup tick failed: ${err?.message ?? err}`);
+    });
+  }, 15_000).unref?.();
   // Start scheduler in every daemon.  Each daemon owns exactly one bot, so
   // each filters to only execute tasks whose `larkAppId` matches its bot
   // (unmatched tasks are handled by the owning bot's daemon instead; a
@@ -16210,6 +18435,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    if (goalWatchdogTimer) clearInterval(goalWatchdogTimer);
+    clearInterval(goalReleaseTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });
@@ -16285,6 +18512,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(docCommentPollTimer);
+    if (goalWatchdogTimer) clearInterval(goalWatchdogTimer);
+    clearInterval(goalReleaseTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the

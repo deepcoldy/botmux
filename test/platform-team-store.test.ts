@@ -44,6 +44,45 @@ describe('applyPlatformTeamSync', () => {
     expect(isPlatformTeamBot(dataDir, undefined)).toBe(false);
   });
 
+  it('preserves optional per-bot version and A2A capability facts', () => {
+    applyPlatformTeamSync(dataDir, payload('rev-ready', [{
+      teamId: 't1',
+      teamName: 'team',
+      groupChatIds: ['oc_goal'],
+      memberUnionIds: [],
+      bots: [{
+        appId: 'cli_remote',
+        unionId: 'on_remote',
+        name: 'relay-loopy',
+        botmuxVersion: '2.109.0-canary.0',
+        a2aCapabilities: ['delivery-envelope:v1', 'dispatch-repo:v1', '', 42],
+      }],
+    }]));
+    expect(listPlatformTeams(dataDir)[0]?.bots[0]).toEqual({
+      appId: 'cli_remote',
+      unionId: 'on_remote',
+      name: 'relay-loopy',
+      botmuxVersion: '2.109.0-canary.0',
+      a2aCapabilities: ['delivery-envelope:v1', 'dispatch-repo:v1'],
+    });
+  });
+
+  it('preserves an explicit empty capability set instead of degrading it to unknown', () => {
+    applyPlatformTeamSync(dataDir, payload('rev-empty-capabilities', [{
+      teamId: 't1',
+      teamName: 'team',
+      groupChatIds: ['oc_goal'],
+      memberUnionIds: [],
+      bots: [{ appId: 'cli_legacy', a2aCapabilities: [] }],
+    }]));
+    expect(listPlatformTeams(dataDir)[0]?.bots[0]).toEqual({
+      appId: 'cli_legacy',
+      unionId: undefined,
+      name: undefined,
+      a2aCapabilities: [],
+    });
+  });
+
   it('mirrors group chats into team-groups under the platform prefix', () => {
     applyPlatformTeamSync(dataDir, payload('rev1', [team('t1', ['oc_hall'], [])]));
     expect(isTeamGroupChat(dataDir, 'oc_hall')).toBe(true);

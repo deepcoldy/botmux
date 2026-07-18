@@ -16,6 +16,8 @@ import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
+import { openLedger } from '../src/verified-delivery/ledger.js';
+import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -879,6 +881,107 @@ describe('POST /api/schedules/:id/(run|pause|resume)', () => {
   });
 });
 
+describe('GET /api/goals', () => {
+  it('returns the verified-delivery goal board from the ledger', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-goals-ipc-'));
+    const prevEnv = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    process.env.SESSION_DATA_DIR = dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      openLedger().append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId: 'task-goal',
+        chatId: 'oc_goal',
+        ts: 1_000,
+        idempotencyKey: 'dispatched:task-goal',
+        payload: { taskId: 'task-goal', title: 'Goal task' },
+      });
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/goals`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.goals).toHaveLength(1);
+      expect(body.goals[0]).toMatchObject({
+        goalChatId: 'oc_goal',
+        counts: { dispatched: 1, reported: 0, accepted: 0, rejected: 0, total: 1 },
+      });
+      expect(body.goals[0].tasks[0]).toMatchObject({ taskId: 'task-goal', title: 'Goal task', status: 'dispatched' });
+    } finally {
+      if (prevEnv === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevEnv;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns the operator attention board with ledger-derived risk', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-goals-attention-ipc-'));
+    const prevEnv = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    process.env.SESSION_DATA_DIR = dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      const now = Date.now();
+      const led = openLedger();
+      led.append({
+        type: 'TaskDispatched',
+        actor: 'orchestrator',
+        taskId: 'task-risk',
+        chatId: 'oc_goal',
+        ts: now - 10_000,
+        idempotencyKey: 'dispatched:task-risk',
+        payload: { taskId: 'task-risk', title: 'Risk task' },
+      });
+      for (let i = 1; i <= 3; i++) {
+        led.append({
+          type: 'TaskDispatched',
+          actor: 'orchestrator',
+          taskId: 'task-risk',
+          chatId: 'oc_goal',
+          ts: now - 5_000 + i,
+          idempotencyKey: `reassign:task-risk:${i}`,
+          payload: { taskId: 'task-risk', title: 'Risk task' },
+        });
+      }
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/goals/attention`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.systemRisk).toHaveLength(1);
+      expect(body.systemRisk[0]).toMatchObject({
+        taskId: 'task-risk',
+        source: 'ledger',
+        disposition: { bucket: 'systemRisk', reason: 'reassign_budget_exhausted' },
+      });
+      expect(body.counts.systemRisk).toBe(1);
+      expect(body.perGoal[0].tasks[0]).toMatchObject({ taskId: 'task-risk', status: 'dispatched' });
+    } finally {
+      if (prevEnv === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevEnv;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('GET /api/goals/attention/live auth', () => {
+  it('rejects a bare loopback caller and accepts the trusted dashboard wrapper with a query', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const path = '/api/goals/attention/live?chatId=oc_goal';
+
+    const bare = await fetch(`http://127.0.0.1:${handle.port}${path}`);
+    expect(bare.status).toBe(401);
+
+    const trusted = await fetchDaemonIpc(handle.port, path, { method: 'GET' }, TEST_IPC_SECRET);
+    expect(trusted.status).toBe(200);
+    expect(await trusted.json()).toMatchObject({ systemRisk: expect.any(Array) });
+  });
+});
+
 describe('SSE /api/events', () => {
   it('delivers a published event to a connected client', async () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
@@ -1417,6 +1520,15 @@ describe('GET /api/groups (Phase B)', () => {
 
   it('lists chats from groups-store when larkAppId set', async () => {
     setLarkAppId('test-app');
+    const bot = registerBot({
+      larkAppId: 'test-app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+    } as any);
+    bot.botOpenId = 'ou_test_bot';
+    bot.botName = 'Codex Test Bot';
     const spy = vi.spyOn(groupsStore, 'listChats').mockResolvedValue([
       { chatId: 'oc_1', name: 'team' },
     ]);
@@ -1424,10 +1536,15 @@ describe('GET /api/groups (Phase B)', () => {
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups`);
     expect(res.status).toBe(200);
     const body = await res.json();
+    expect(body.bots).toEqual([{
+      larkAppId: 'test-app',
+      botOpenId: 'ou_test_bot',
+      botName: 'Codex Test Bot',
+      cliId: 'codex',
+    }]);
     // Each chat now carries an `oncallChat` enrichment (null when unbound)
     // so the dashboard matrix can render toggle state without a second
-    // round-trip. With no bot registered for 'test-app' the lookup falls
-    // back to undefined → null in the response.
+    // round-trip.
     // `firstSeenAt` is the per-bot creation-order proxy added so the
     // dashboard can sort newly-added chats to the top. In this test the
     // store hasn't been init()'d (no daemon), so the value degrades to

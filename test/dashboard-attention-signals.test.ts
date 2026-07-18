@@ -182,10 +182,12 @@ describe('attention signals', () => {
     const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
     const start = src.indexOf('async function handleThreadReply(');
     expect(start).toBeGreaterThanOrEqual(0);
-    // 20000：窗口需罩住函数头到最后一个拦截点 (findPendingAskByAnchor) 的全部
-    // 源码——passthrough 冷启动等合法插入会把后续 marker 往后推，窗口太紧会误报。
-    // 语义断言不变：clear 在所有拦截点之前。
-    const region = src.slice(start, start + 20000);
+    // Slice the complete function instead of a fixed character window: valid
+    // preflight/intercept additions can grow the body without changing this
+    // ordering invariant.
+    const end = src.indexOf('\nasync function autoCreateDocSession(', start);
+    expect(end).toBeGreaterThan(start);
+    const region = src.slice(start, end);
     const clearIdx = region.indexOf('clearAgentAttentionForHumanInbound();');
     expect(clearIdx).toBeGreaterThanOrEqual(0);
     for (const marker of [
@@ -207,6 +209,31 @@ describe('attention signals', () => {
     expect(attentionWaitSince({ pendingRepo: true, lastMessageAt: 9999 })).toBe(9999);
     expect(attentionWaitSince({ agentAttention: { at: 'bad' }, lastMessageAt: 9999 })).toBe(9999);
     expect(attentionWaitSince({})).toBe(0);
+  });
+});
+
+describe('goal dashboard daemon IPC wiring', () => {
+  const source = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
+
+  function between(start: string, end: string): string {
+    const from = source.indexOf(start);
+    const to = source.indexOf(end, from + start.length);
+    expect(from, `missing marker: ${start}`).toBeGreaterThanOrEqual(0);
+    expect(to, `missing marker: ${end}`).toBeGreaterThan(from);
+    return source.slice(from, to);
+  }
+
+  it('signs live-risk reads and all goal mutations sent to daemon IPC', () => {
+    const regions = [
+      between('async function collectGoalAttentionLiveRisks(', '/** Create a Feishu group'),
+      between('const mGoalWatchdog =', 'const mGoalNotificationRetry ='),
+      between('const mGoalNotificationRetry =', 'const mGoalDecision ='),
+      between('const mGoalDecision =', 'const mWhiteboard ='),
+    ];
+    for (const region of regions) {
+      expect(region).toContain('fetchDaemonIpc(');
+      expect(region).not.toContain('await fetch(`http://127.0.0.1:');
+    }
   });
 });
 

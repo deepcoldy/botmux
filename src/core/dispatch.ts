@@ -14,6 +14,7 @@
  * (cli.ts) performs the actual sendMessage + replyMessage.
  */
 
+import { formatDispatchRepoRequirement, type DispatchRepoRequirement } from './repo-requirement.js';
 export { resolveSendTarget } from './reply-target.js';
 
 export interface DispatchBot {
@@ -33,6 +34,8 @@ export interface DispatchMessages {
   seedText: string;
   /** Lark 'post' content (paragraphs of nodes) for the threaded kickoff. */
   threadContent: PostParagraph[];
+  /** Plain-text kickoff with real <at> tags; cross-app bot delivery uses this. */
+  kickoffText: string;
   /** open_ids @-mentioned in the kickoff — the bots that will be triggered. */
   mentionedOpenIds: string[];
 }
@@ -64,6 +67,8 @@ export function buildDispatchMessages(input: {
   title: string;
   brief: string;
   bots: DispatchBot[];
+  /** Machine-readable repo preflight, stripped by the receiver before CLI input. */
+  repoRequirement?: DispatchRepoRequirement;
 }): DispatchMessages {
   const title = input.title.trim();
   if (!title) throw new Error('dispatch requires a title');
@@ -95,13 +100,28 @@ export function buildDispatchMessages(input: {
     content.push([{ tag: 'text', text: '分工：' }]);
     for (const b of input.bots) {
       const label = b.name || b.openId;
-      content.push([{ tag: 'text', text: `· ${label}：${b.role ?? '执行'}` }]);
+      content.push([{ tag: 'text', text: `· ${label}：${b.role ?? '执行者'}` }]);
     }
   }
+
+  if (input.repoRequirement) {
+    content.push([{ tag: 'text', text: '' }]);
+    for (const line of formatDispatchRepoRequirement(input.repoRequirement).split('\n')) {
+      content.push([{ tag: 'text', text: line }]);
+    }
+  }
+
+  // Bot-authored rich posts can arrive at the receiving app with an unresolved
+  // @_user_N placeholder and no usable mention identity. Plain text <at> tags
+  // take Lark's native mention path and reliably populate the receiver event.
+  const kickoffText = content.map(paragraph => paragraph.map((node) =>
+    node.tag === 'at' ? `<at user_id="${node.user_id}"></at>` : node.text,
+  ).join('')).join('\n');
 
   return {
     seedText,
     threadContent: content,
+    kickoffText,
     mentionedOpenIds: input.bots.map(b => b.openId),
   };
 }
@@ -150,10 +170,14 @@ export function buildRepoPrimeText(input: {
 export function buildReportContent(input: {
   orchOpenId: string;
   content: string;
+  deliveryEnvelope?: string;
 }): PostParagraph[] {
   const openId = input.orchOpenId.trim();
   if (!openId) throw new Error('report requires the orchestrator open_id');
-  const text = input.content.trim();
+  // A verified-delivery envelope is a whole-message protocol. It already
+  // carries the human summary, so prefixing `content` would move the header
+  // away from the first meaningful line and make cross-device ingestion skip it.
+  const text = (input.deliveryEnvelope ?? input.content).trim();
   if (!text) throw new Error('report requires content');
 
   const lines = text.split('\n');
@@ -164,6 +188,18 @@ export function buildReportContent(input: {
     paras.push([{ tag: 'text', text: lines[i] }]);
   }
   return paras;
+}
+
+/** Build the plain-text wire form used by verified-delivery reports. */
+export function buildReportText(input: {
+  orchOpenId: string;
+  content: string;
+}): string {
+  const openId = input.orchOpenId.trim();
+  if (!openId) throw new Error('report requires the orchestrator open_id');
+  const text = input.content.trim();
+  if (!text) throw new Error('report requires content');
+  return `<at user_id="${openId}"></at>\n${text}`;
 }
 
 /**

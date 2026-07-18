@@ -257,6 +257,16 @@ export interface Session {
   lastCodexAppInput?: CodexAppTurnInput;
   /** Default local project whiteboard bound to this session when the optional whiteboard feature is enabled. */
   whiteboardId?: string;
+  /** Present on daemon-native L2 goal supervisor sessions. Used to notify the
+   * L1 parent without going through Lark self-message routing. */
+  goalSupervisor?: {
+    goalChatId: string;
+    title: string;
+    parentChatId: string;
+    parentRoot?: string;
+    parentSessionId?: string;
+    createdAt: string;
+  };
   /** CLI-native resume id when it differs from botmux's sessionId (for example Codex thread id). */
   cliSessionId?: string;
   /**
@@ -508,7 +518,7 @@ export type DaemonToWorker =
    *  IPCs would race: process.on('message') handlers don't serialize, and the
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
-  | { type: 'raw_input'; content: string; followUpContent?: string; followUpCodexAppInput?: CodexAppTurnInput }
+  | { type: 'raw_input'; content: string; turnId?: string; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle

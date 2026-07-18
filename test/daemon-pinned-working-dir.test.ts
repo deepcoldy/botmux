@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/daemon-pinned-working-dir.test.ts test/inherit-peer.test.ts
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -57,6 +57,40 @@ afterEach(() => {
 });
 
 describe('resolvePinnedWorkingDir', () => {
+  it('uses a receiver-resolved repo requirement above oncall/default/inheritance', async () => {
+    const { botRegistry, sessionStore, daemon } = await loadFreshModules();
+    const requiredDir = tempDir('required-repo');
+    const oncallDir = tempDir('oncall-repo');
+    const defaultDir = tempDir('default-repo');
+    const peerDir = tempDir('peer-repo');
+    botRegistry.registerBot({ larkAppId: 'app-peer', larkAppSecret: 's', cliId: 'claude-code' });
+    botRegistry.registerBot({
+      larkAppId: 'app-self',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      oncallChats: [{ chatId: 'oc_chat', workingDir: oncallDir }],
+      defaultWorkingDir: defaultDir,
+    });
+    await seedPeerSession(sessionStore, peerDir);
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      larkAppId: 'app-self',
+      requiredWorkingDir: requiredDir,
+    });
+
+    expect(result).toMatchObject({
+      pinnedWorkingDir: requiredDir,
+      pinnedFromRequirement: true,
+      pinnedFromBotDefault: false,
+      inheritedFrom: null,
+    });
+    expect(result.oncallEntry).toBeUndefined();
+  });
+
   it('prefers THIS bot\'s own defaultWorkingDir over a valid same-anchor peer (no cross-bot dir pollution)', async () => {
     const { botRegistry, sessionStore, daemon } = await loadFreshModules();
     const peerDir = tempDir('peer-repo');
@@ -374,5 +408,120 @@ describe('resolvePinnedWorkingDir', () => {
     expect(result.inheritedFrom).toBeNull();
     expect(result.pinnedWorkingDir).toBe(defaultDir);
     expect(result.pinnedFromBotDefault).toBe(true);
+  });
+});
+
+describe('dispatch repo preflight', () => {
+  it('runs behind the normal sender trust gate on both inbound paths', () => {
+    const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
+    for (const [startMarker, endMarker] of [
+      ['async function handleNewTopic(', 'async function preflightDispatchRepo('],
+      ['async function handleThreadReply(', 'async function handleDocComment('],
+    ]) {
+      const start = src.indexOf(startMarker);
+      const end = src.indexOf(endMarker, start + startMarker.length);
+      expect(start).toBeGreaterThanOrEqual(0);
+      expect(end).toBeGreaterThan(start);
+      const region = src.slice(start, end);
+      const trustGate = region.lastIndexOf('enforceMessageQuotaForCliInput(');
+      const preflight = region.indexOf('preflightDispatchRepo({');
+      expect(trustGate).toBeGreaterThanOrEqual(0);
+      expect(preflight).toBeGreaterThan(trustGate);
+    }
+  });
+
+  it('returns handled and emits access help before any session can be created', async () => {
+    const { sessionStore, daemon } = await loadFreshModules();
+    const scanRoot = tempDir('empty-project-root');
+    const dataDir = tempDir('repo-data');
+    const sendAccessHelp = vi.fn(async () => {});
+    const resolveRequirement = vi.fn(async () => ({
+      ok: false as const,
+      reason: 'not_found' as const,
+      detail: '项目扫描达到上限；请先在该设备选择一次项目完成登记',
+    }));
+    const parsed = {
+      messageId: 'om_dispatch',
+      msgType: 'post',
+      content: [
+        '执行跨设备任务',
+        '',
+        '[botmux-dispatch v1]',
+        'taskId: task-missing-repo',
+        'repo: https://github.com/acme/missing.git',
+      ].join('\n'),
+      senderId: 'ou_supervisor',
+      senderUnionId: 'on_supervisor',
+      senderType: 'bot',
+      chatId: 'oc_goal',
+      chatType: 'group',
+      mentions: [],
+    } as any;
+
+    const result = await daemon.__testOnly_preflightDispatchRepo({
+      parsed,
+      larkAppId: 'app-worker',
+      chatId: 'oc_goal',
+      scope: 'chat',
+      anchor: 'oc_goal',
+    }, {
+      scanDirs: [scanRoot],
+      dataDir,
+      sendAccessHelp,
+      resolveRequirement,
+    });
+
+    expect(result).toEqual({ handled: true });
+    expect(resolveRequirement).toHaveBeenCalledWith(expect.objectContaining({
+      requirement: 'https://github.com/acme/missing.git',
+      scanDirs: [scanRoot],
+      dataDir,
+    }));
+    expect(sendAccessHelp).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task-missing-repo',
+      repo: 'https://github.com/acme/missing.git',
+      supervisorOpenId: 'ou_supervisor',
+      detail: '项目扫描达到上限；请先在该设备选择一次项目完成登记',
+    }));
+    expect(sessionStore.listSessions()).toHaveLength(0);
+  });
+
+  it('rejects an unsupported dispatch version with a structured help before repo scanning', async () => {
+    const { daemon } = await loadFreshModules();
+    const sendAccessHelp = vi.fn(async () => {});
+    const resolveRequirement = vi.fn();
+    const parsed = {
+      messageId: 'om_dispatch_v2',
+      msgType: 'text',
+      content: [
+        '执行跨设备任务',
+        '',
+        '[botmux-dispatch v2]',
+        'taskId: task-newer-protocol',
+        'repo: github.com/acme/project',
+      ].join('\n'),
+      senderId: 'ou_supervisor',
+      senderUnionId: 'on_supervisor',
+      senderType: 'bot',
+      chatId: 'oc_goal',
+      chatType: 'group',
+      mentions: [],
+    } as any;
+
+    const result = await daemon.__testOnly_preflightDispatchRepo({
+      parsed,
+      larkAppId: 'app-worker',
+      chatId: 'oc_goal',
+      scope: 'chat',
+      anchor: 'oc_goal',
+    }, { sendAccessHelp, resolveRequirement });
+
+    expect(result).toEqual({ handled: true });
+    expect(resolveRequirement).not.toHaveBeenCalled();
+    expect(sendAccessHelp).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task-newer-protocol',
+      repo: 'github.com/acme/project',
+      blocker: expect.stringContaining('收到 v2，当前仅支持 v1'),
+    }));
   });
 });

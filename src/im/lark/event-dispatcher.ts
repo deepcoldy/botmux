@@ -18,6 +18,7 @@ import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, extractMentionIdentities, type MentionIdentity } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
+import { recordObservedBotUnionId } from '../../services/observed-bot-union-ids-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMemberChat } from '../../services/platform-team-store.js';
@@ -46,6 +47,7 @@ import { localeForBot, t } from '../../i18n/index.js';
 import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
+import { isGoalChat } from '../../services/goal-chat-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode } from '../../services/chat-reply-mode-store.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
@@ -1013,7 +1015,9 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
       for (const paragraph of inner.content) {
         if (!Array.isArray(paragraph)) continue;
         for (const node of paragraph) {
-          if (node.tag === 'at' && node.user_id === botOpenId) return true;
+          // Bot-sent post messages may encode a bot target as app_id (`cli_`)
+          // even though the field is named user_id. Accept both identities.
+          if (node.tag === 'at' && (node.user_id === botOpenId || node.user_id === larkAppId)) return true;
         }
       }
     }
@@ -1045,7 +1049,7 @@ export function mentionsAnotherMember(larkAppId: string, message: any): boolean 
       if (oid === 'all') continue;     // @all → everyone incl. me
       return true;                     // a specific other member
     }
-    const appId = mentionAppId(m);
+    const appId = mentionAppId(m, larkAppId);
     if (appId) {
       if (appId === larkAppId) continue; // that's me, addressed by app_id
       if (appId === 'all') continue;
@@ -1063,7 +1067,7 @@ export function mentionsAnotherMember(larkAppId: string, message: any): boolean 
         for (const node of paragraph) {
           if (node.tag !== 'at') continue;
           const uid: string | undefined = node.user_id;
-          if (!uid || uid === botOpenId || uid === 'all') continue;
+          if (!uid || uid === botOpenId || uid === larkAppId || uid === 'all') continue;
           return true;
         }
       }
@@ -1127,7 +1131,7 @@ function mentionMatchesBot(m: any, larkAppId: string, botOpenId?: string): boole
   //   { id_type: "app_id", id: "cli_xxx" }
   // Treat that as an explicit mention of this daemon, but do not let app_id
   // flow through mentionOpenId(), which is persisted and used as an open_id.
-  const appId = mentionAppId(m);
+  const appId = mentionAppId(m, larkAppId);
   return Boolean(larkAppId && appId === larkAppId);
 }
 
@@ -1138,12 +1142,16 @@ function mentionIdType(m: any): string | undefined {
   return undefined;
 }
 
-function mentionAppId(m: any): string | undefined {
+function mentionAppId(m: any, larkAppId?: string): string | undefined {
   if (!m || typeof m !== 'object') return undefined;
   if (typeof m.appId === 'string') return m.appId;
   if (typeof m.app_id === 'string') return m.app_id;
   const idType = mentionIdType(m);
   if (idType === 'app_id' && typeof m.id === 'string') return m.id;
+  // Real bot-authored posts can expose a bare `cli_xxx` mention id without
+  // id_type. Prefix inference is safe here and avoids silently dropping the
+  // cross-bot event before the team trust gate can run.
+  if (!idType && typeof m.id === 'string' && (m.id === larkAppId || m.id.startsWith('cli_'))) return m.id;
   if (m.id && typeof m.id === 'object' && typeof m.id.app_id === 'string') return m.id.app_id;
   return undefined;
 }
@@ -1258,7 +1266,7 @@ export function evaluateTalk(
   // Oncall 群命中：默认不限额；仅当 bot 配了 messageQuota.defaultLimit 时，
   // 才挂 chat:<chatId>:<openId> 这一 quotaKey（与 chatGrant 同键、同计数器，
   // 便于 owner 后续 /grant @x N 续杯/重置）。
-  if (chatId && findOncallChat(larkAppId, chatId)) {
+  if (chatId && findOncallChat(larkAppId, chatId) && !isGoalChat(chatId)) {
     const def = bot.config.messageQuota?.defaultLimit;
     if (typeof def === 'number' && Number.isInteger(def) && def > 0 && senderOpenId) {
       return { allowed: true, reason: 'oncall', quotaKey: chatQuotaKey(chatId, senderOpenId) };
@@ -2098,6 +2106,28 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const isBotSenderType = senderType === 'app' || senderType === 'bot';
         if (isBotSenderType) {
           const senderOpenId = sender.sender_id?.open_id;
+          // Learn this bot's tenant-stable union_id from the event (cross-device
+          // verified-delivery authz anchor — union_id is the only worker id that is
+          // both stable cross-app AND on every inbound event; see
+          // services/observed-bot-union-ids-store + verified-delivery/types.ts). Resolve the
+          // bot's display name from our open_id cross-ref (populated when it was
+          // @mentioned), then record name → union_id for dispatch / federation
+          // roster to consume. Logs the unresolved-name case too — that diagnostic
+          // pinpoints why a bot's union_id wasn't learned (never @mentioned here).
+          const senderUnionId = sender.sender_id?.union_id;
+          if (senderUnionId && senderOpenId) {
+            let resolvedBotName: string | undefined;
+            for (const [n, oid] of readBotOpenIdCrossRef(config.session.dataDir, larkAppId)) {
+              if (oid === senderOpenId) { resolvedBotName = n; break; }
+            }
+            if (resolvedBotName) {
+              if (recordObservedBotUnionId(config.session.dataDir, resolvedBotName, senderUnionId, senderOpenId)) {
+                logger.info(`[bot-union-id] learned ${resolvedBotName} → ${senderUnionId} (app=${larkAppId})`);
+              }
+            } else {
+              logger.info(`[bot-union-id] observed union_id ${senderUnionId} for openId=${senderOpenId} (app=${larkAppId}, name unresolved — not @mentioned here yet, not recorded)`);
+            }
+          }
           const isSelfMessage = senderOpenId === getBot(larkAppId).botOpenId;
           // Self messages: learn our OWN union_id from the echo first (the only
           // reliable source — see bot-union-ids-store; reported to the platform
@@ -2127,7 +2157,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // tenant-stable union_id — we then honour it as a teammate in ANY chat
           // (see team-bots-store). Done BEFORE the @mention gate so even a non-@
           // message in a team group teaches us the teammate. Cheap + idempotent.
-          const senderUnionId = sender.sender_id?.union_id as string | undefined;
           if (senderUnionId && isTeamGroupChat(config.session.dataDir, chatId)) {
             recordTeamBot(config.session.dataDir, { unionId: senderUnionId });
           }

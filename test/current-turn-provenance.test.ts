@@ -116,7 +116,22 @@ describe('resolveCurrentTurnProvenance', () => {
       dataDir,
       envSessionId: 'sess-1',
       startPid: process.pid,
-    })).toThrow(/缺少 sessionId\/turnId\/procStart/);
+    })).toThrow(/后台进程信息不完整/);
+  });
+
+  it('explains an idle marker without trusting the inherited session env', () => {
+    const procStart = readProcessStartIdentity(process.pid);
+    if (!procStart) throw new Error('test process start identity unavailable');
+    writeFileSync(
+      join(dataDir, '.botmux-cli-pids', String(process.pid)),
+      JSON.stringify({ sessionId: 'sess-1', turnId: null, procStart }),
+    );
+    writeSession();
+    expect(() => resolveCurrentTurnProvenance({
+      dataDir,
+      envSessionId: 'sess-1',
+      startPid: process.pid,
+    })).toThrow(/还没有绑定到这条消息.*重新发送一次/);
   });
 
   it('fails closed for a detached in-session invocation instead of trusting env', () => {

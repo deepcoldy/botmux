@@ -31,6 +31,7 @@ import { removeTeamFederation, removeDeployment } from '../services/federation-s
 import { loadBotConfigs, registerBot, getBot, type BotConfig } from '../bot-registry.js';
 import { setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
 import { setBotOwner } from '../services/bot-owner-store.js';
+import { getBotUnionIdByName } from '../services/observed-bot-union-ids-store.js';
 import { setDeploymentOwner } from '../services/deployment-identity.js';
 import { createPairing, getPairingStatus, consumePairing } from '../services/pairing-store.js';
 import { resolveAllowedUsersWithMap, resolveUserUnionId } from '../im/lark/client.js';
@@ -43,6 +44,8 @@ import {
   type TeamGroupCreateResult,
   type TeamGroupOwnerTransferResult,
 } from './federated-group-core.js';
+import { CURRENT_A2A_CAPABILITIES } from '../core/a2a-readiness.js';
+import { resolveCurrentVersion } from '../utils/install-diagnostics.js';
 
 export interface OwnerCandidate { unionId: string; name: string }
 
@@ -170,6 +173,7 @@ function botConfigOrder(): string[] {
 /** This deployment's bots, in the shape the hub federates (bots.json order).
  *  Prefer the live daemon registry (authoritative) over bots-info.json. */
 function localBots(dataDir: string, live?: LiveBot[]): FederatedBot[] {
+  const version = resolveCurrentVersion();
   return buildTeamRoster(dataDir, undefined, undefined, live).bots.map(b => ({
     larkAppId: b.larkAppId,
     botName: b.name,
@@ -179,7 +183,14 @@ function localBots(dataDir: string, live?: LiveBot[]): FederatedBot[] {
     // owner (union_id+name) federated so the hub can pull owners into 拉群
     ownerUnionId: b.owner?.unionId,
     ownerName: b.owner?.name,
-    // botUnionId: not needed — 拉群 adds bots by app_id (larkAppId), see docs
+    // botUnionId: tenant-stable bot id, learned from observed bot-sender events
+    // (bot-union-ids-store). Advertised so a HUB can authorize this bot's
+    // cross-device delivery envelopes by union_id (verified-delivery). Undefined
+    // until this deployment has observed the bot in an event; the hub then falls
+    // back to open_id auth — see verified-delivery/types.ts workerBotUnionIds.
+    botUnionId: getBotUnionIdByName(dataDir, b.name),
+    botmuxVersion: version,
+    a2aCapabilities: [...CURRENT_A2A_CAPABILITIES],
   }));
 }
 
