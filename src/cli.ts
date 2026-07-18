@@ -148,6 +148,7 @@ import {
   enabledPluginDependents,
 } from './core/plugins/dependencies.js';
 import { authorizeV3DaemonCommand } from './workflows/v3/cli-daemon-command-authority.js';
+import { resolveDaemonIpcPort } from './utils/daemon-discovery.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -7744,8 +7745,18 @@ async function cmdSessionReady(): Promise<void> {
   // env 缺失 → adopt / 非 botmux 会话；就绪门控对它们不适用，静默放行。
   if (!sessionId || !larkAppId) process.exit(0);
 
-  const daemon = findDaemon(larkAppId);
-  if (daemon) {
+  // Host sessions discover the owning daemon through its descriptor. Linux
+  // bwrap / read-isolated sessions deliberately cannot read that directory,
+  // so use the worker-injected loopback port as a fallback. The port is not a
+  // credential: /api/session-ready still verifies the rotating per-turn
+  // capability carried below.
+  let discoveredPort: number | undefined;
+  try { discoveredPort = findDaemon(larkAppId)?.ipcPort; } catch { /* masked/unreadable registry */ }
+  const ipcPort = resolveDaemonIpcPort(
+    discoveredPort,
+    process.env.BOTMUX_DAEMON_IPC_PORT,
+  );
+  if (ipcPort) {
     try {
       const relayDir = process.env.BOTMUX_SEND_RELAY;
       const originCapability = readManagedOriginCapability(
@@ -7774,9 +7785,9 @@ async function cmdSessionReady(): Promise<void> {
         try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
       }
       if (!hostSecret) {
-        await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/session-ready`, init);
+        await fetch(`http://127.0.0.1:${ipcPort}/api/session-ready`, init);
       } else {
-        await fetchDaemonIpc(daemon.ipcPort, '/api/session-ready', init, hostSecret);
+        await fetchDaemonIpc(ipcPort, '/api/session-ready', init, hostSecret);
       }
     } catch { /* daemon 不可达 → 放弃，worker 走超时兜底 */ }
   }

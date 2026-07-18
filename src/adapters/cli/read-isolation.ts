@@ -505,7 +505,8 @@ export interface LinuxReadIsolationInput {
  */
 export function buildLinuxReadIsolationMasks(input: LinuxReadIsolationInput): {
   /** Paths to blank inside bwrap (prepareSandbox stat-classifies: dir→tmpfs,
-   *  file→empty ro-bind, missing→skipped). Feed as prepareSandbox.hidePaths. */
+   *  file→empty ro-bind; a missing ancestor of another mask is treated as a
+   *  directory so nested mounts remain valid). Feed as prepareSandbox.hidePaths. */
   hidePaths: string[];
   /** The bot's OWN BOT_HOME — bound REAL + writable (feed as
    *  prepareSandbox.trustedWritablePaths) so the

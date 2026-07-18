@@ -31,6 +31,36 @@ function realpathCwd(cwd: string): string {
  *  `~/.claude` keeps all existing call sites byte-for-byte unchanged. */
 export const DEFAULT_CLAUDE_DATA_DIR = join(homedir(), '.claude');
 
+/** Maximum UTF-8 payload for one tmux `send-keys -l` burst. A whole long line
+ *  is enough to trip Claude Code's paste detector even when line-to-line sends
+ *  are throttled, so split every non-empty line into small, paced chunks. */
+export const CLAUDE_INPUT_CHUNK_BYTES = 96;
+
+/** Split without cutting a Unicode code point or exceeding the byte budget. */
+export function chunkTextByUtf8Bytes(
+  text: string,
+  maxBytes: number = CLAUDE_INPUT_CHUNK_BYTES,
+): string[] {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 4) {
+    throw new RangeError('maxBytes must be an integer >= 4');
+  }
+  const chunks: string[] = [];
+  let chunk = '';
+  let chunkBytes = 0;
+  for (const char of text) {
+    const charBytes = Buffer.byteLength(char, 'utf8');
+    if (chunk && chunkBytes + charBytes > maxBytes) {
+      chunks.push(chunk);
+      chunk = '';
+      chunkBytes = 0;
+    }
+    chunk += char;
+    chunkBytes += charBytes;
+  }
+  if (chunk) chunks.push(chunk);
+  return chunks;
+}
+
 /** Resolve the JSONL transcript path Claude Code writes user/assistant turns to.
  *  Claude Code's project-hash scheme replaces every non-[A-Za-z0-9-] char with `-`
  *  (observed: `/foo/life_workspace` → `-foo-life-workspace`; `/`, `.`, `_` all become `-`).
@@ -638,11 +668,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // making tmux's paste-buffer drop the markers and turning embedded \r
       // into Enters that fragment the message into multiple submits.
       //
-      // Each tmux send-keys is throttled so the cumulative input rate stays
-      // below Claude Code's paste-burst threshold — otherwise on long messages
-      // (~1300+ chars / ~25+ lines) Ink flips into paste mode mid-stream and
-      // subsequent `\` + Enter pairs are kept as literal `\\\r` in the
-      // submitted content instead of being consumed as soft-newline markers.
+      // Each tmux send-keys is byte-bounded AND throttled so the cumulative
+      // input rate stays below Claude Code's paste-burst threshold. Throttling
+      // only between lines is insufficient: one long quoted-message line can
+      // itself flip Ink into paste mode, after which subsequent `\` + Enter
+      // pairs are kept as literal `\\\r` instead of soft-newline markers.
       //
       // The first writeInput after spawn lands before Ink's startup render
       // pass has fully drained, so even short messages trip paste-burst —
@@ -720,8 +750,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         const lines = content.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].length > 0) {
-            pty.sendText(lines[i]);
-            await tick();
+            for (const chunk of chunkTextByUtf8Bytes(lines[i])) {
+              pty.sendText(chunk);
+              await tick();
+            }
           }
           if (i < lines.length - 1) {
             if (!keybindings.enterIsNewline) {
@@ -919,7 +951,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       format: 'claude-settings',
       // SessionStart 就绪 hook 也写全局：进程级 --settings 那份会被 wrapperCli=`aiden x
       // claude` 剥掉（aiden 硬拒 --settings），全局这条是它唯一能拿到就绪信号的渠道，
-      // 避免首条 prompt 空等 45s。原生 claude 会同时收到进程级+全局两份，幂等无害。
+      // 避免首条 prompt 空等 45s；原生 Claude 也只从这一个来源读取 ready hook。
       sessionStartCommand: sessionReadyHookCommand(),
     },
     asksViaHook: true,

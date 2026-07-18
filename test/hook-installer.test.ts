@@ -7,10 +7,13 @@
  *   (c) 既有无关配置保留（合并而非覆盖）
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { installHook } from '../src/adapters/hook-installer.js';
+import {
+  hasInstalledSessionReadyHook,
+  installHook,
+} from '../src/adapters/hook-installer.js';
 
 // ─── 辅助：在临时目录创建独立的 configPath ─────────────────────────────────
 
@@ -100,11 +103,18 @@ describe('installHook — claude-settings', () => {
 
   it('(d) sessionStartCommand 时同时写入 SessionStart 就绪 hook，且幂等去重（路径变化也算同一条）', () => {
     const readyCmd = '/usr/bin/node /path/to/cli.js session-ready';
-    installHook('claude-code', { configPath, format: 'claude-settings', sessionStartCommand: readyCmd }, hookCommand);
+    const hookInstall = {
+      configPath,
+      format: 'claude-settings' as const,
+      sessionStartCommand: readyCmd,
+    };
+    expect(hasInstalledSessionReadyHook(hookInstall)).toBe(false);
+    installHook('claude-code', hookInstall, hookCommand);
 
     let settings = JSON.parse(readFileSync(configPath, 'utf-8'));
     let ss: any[] = settings.hooks?.SessionStart ?? [];
     expect(ss.some((g) => g.hooks?.some((e: any) => e.command === readyCmd))).toBe(true);
+    expect(hasInstalledSessionReadyHook(hookInstall)).toBe(true);
 
     // 幂等：用 npm-global 风格的不同 cli.js 绝对路径再装，应替换而非叠加（仍只有一条 botmux 就绪 hook）
     const readyCmd2 = '/opt/npm/lib/node_modules/botmux/dist/cli.js session-ready';
@@ -114,12 +124,99 @@ describe('installHook — claude-settings', () => {
     const botmuxReady = ss.filter((g) => g.hooks?.some((e: any) => e.command.includes('cli.js') && e.command.trimEnd().endsWith('session-ready')));
     expect(botmuxReady.length).toBe(1);
     expect(botmuxReady[0].hooks[0].command).toBe(readyCmd2);
+    expect(hasInstalledSessionReadyHook(hookInstall)).toBe(false);
+    expect(hasInstalledSessionReadyHook({ ...hookInstall, sessionStartCommand: readyCmd2 })).toBe(true);
+  });
+
+  it('ready preflight fails closed for malformed or unrelated SessionStart config', () => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { matcher: 'malformed-without-hooks' },
+          { hooks: [{ type: 'command', command: '/usr/bin/unrelated-ready-hook' }] },
+        ],
+      },
+    }));
+    expect(hasInstalledSessionReadyHook({
+      configPath,
+      format: 'claude-settings',
+      sessionStartCommand: '/usr/bin/node /path/to/cli.js session-ready',
+    })).toBe(false);
   });
 
   it('(e) 不传 sessionStartCommand 时不写 SessionStart（保持旧行为）', () => {
     installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
     const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
     expect(settings.hooks?.SessionStart).toBeUndefined();
+  });
+
+  it('read-isolation inherits only the global Claude env map and refreshes rotated auth', () => {
+    const globalPath = join(tmpDir, '.claude-global', 'settings.json');
+    mkdirSync(join(tmpDir, '.claude-global'), { recursive: true });
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(globalPath, JSON.stringify({
+      env: {
+        ANTHROPIC_AUTH_TOKEN: 'global-token-v1',
+        ANTHROPIC_BASE_URL: 'https://provider.example',
+        HTTP_PROXY: 'http://proxy.example',
+      },
+      hooks: {
+        SessionStart: [
+          { hooks: [{ type: 'command', command: '/usr/bin/global-unrelated-hook' }] },
+        ],
+      },
+      theme: 'global-theme-must-not-be-copied',
+    }));
+    writeFileSync(configPath, JSON.stringify({
+      env: {
+        ANTHROPIC_AUTH_TOKEN: 'stale-local-token',
+        BOT_LOCAL_ONLY: 'preserved',
+      },
+      theme: 'local-theme',
+    }));
+
+    const config = {
+      configPath,
+      format: 'claude-settings' as const,
+      sessionStartCommand: '/usr/bin/node /path/to/cli.js session-ready',
+      inheritClaudeEnvFrom: globalPath,
+    };
+    installHook('claude-code', config, hookCommand);
+
+    let settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(settings.env).toEqual({
+      ANTHROPIC_AUTH_TOKEN: 'global-token-v1',
+      BOT_LOCAL_ONLY: 'preserved',
+      ANTHROPIC_BASE_URL: 'https://provider.example',
+      HTTP_PROXY: 'http://proxy.example',
+    });
+    expect(settings.theme).toBe('local-theme');
+    expect(JSON.stringify(settings)).not.toContain('global-unrelated-hook');
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+
+    // Shared provider auth rotates: the next cold-spawn install refreshes it.
+    writeFileSync(globalPath, JSON.stringify({
+      env: {
+        ANTHROPIC_AUTH_TOKEN: 'global-token-v2',
+        ANTHROPIC_BASE_URL: 'https://provider-2.example',
+      },
+    }));
+    installHook('claude-code', config, hookCommand);
+    settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(settings.env.ANTHROPIC_AUTH_TOKEN).toBe('global-token-v2');
+    expect(settings.env.ANTHROPIC_BASE_URL).toBe('https://provider-2.example');
+    expect(settings.env.BOT_LOCAL_ONLY).toBe('preserved');
+
+    // Shared deletions are authoritative on the next cold spawn, while keys
+    // that only ever existed in the per-bot file remain untouched.
+    writeFileSync(globalPath, JSON.stringify({ env: {} }));
+    installHook('claude-code', config, hookCommand);
+    settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(settings.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(settings.env.ANTHROPIC_BASE_URL).toBeUndefined();
+    expect(settings.env.BOT_LOCAL_ONLY).toBe('preserved');
+    expect(statSync(`${configPath}.botmux-inherited-env.json`).mode & 0o777).toBe(0o600);
   });
 
   it('(c2) 已有同 hookCommand 的 PreToolUse entry 不会重复追加', () => {
