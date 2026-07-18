@@ -2539,6 +2539,7 @@ function hermesBridgeIngest(): void {
   // `/clear`-rotates mid-batch; the daemon accumulates them into its authorized
   // set, so a completed turn from an earlier source is not dropped as foreign.
   for (const boundSourceSessionId of filtered.newlyBoundSourceSessionIds) {
+    persistCliSessionId(boundSourceSessionId);
     send({ type: 'bridge_source_session', bridge: 'hermes', sourceSessionId: boundSourceSessionId });
     log(`Hermes bridge bound sourceSessionId=${boundSourceSessionId}`);
   }
@@ -5554,6 +5555,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   let effectiveResume = cfg.resume ?? false;
   let effectiveCliSessionId = cfg.cliSessionId;
   let effectiveAdapterSessionId = adapterSessionId;
+  const hermesResumeStateDbPath = cfg.cliId === 'hermes'
+    ? resolveHermesStateDbPath(
+      { ...process.env, ...sanitizePerBotEnv(cfg.env), BOTMUX_SESSION_ID: cfg.sessionId },
+      { botmuxSessionProfile: basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session' },
+    )
+    : undefined;
   const tier2ForceFresh = effectiveResume && consecutiveInWorkerRestarts >= 2;
   let tier1ProbeFalse = false;
   if (effectiveResume && !tier2ForceFresh && !willReattachPersistent) {
@@ -5562,6 +5569,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       cliSessionId: effectiveCliSessionId,
       workingDir: cfg.workingDir,
       dataDir: claudeDataDir,
+      stateDbPath: hermesResumeStateDbPath,
     });
     if (probe === false) tier1ProbeFalse = true;
   }

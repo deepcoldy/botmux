@@ -88,4 +88,33 @@ describe('hermes transcript reader', () => {
 
     expect(currentHermesStateOffset('/tmp/state.db')).toBe(42);
   });
+
+  it('checks whether a Hermes native session exists', async () => {
+    existsSyncMock.mockReturnValue(true);
+    spawnSyncMock.mockReturnValue({ status: 0, stdout: '1\n', stderr: '' } as any);
+    const { hermesSessionExists } = await import('../src/services/hermes-transcript.js');
+
+    expect(hermesSessionExists('20260716_163643_7782fd', '/tmp/state.db')).toBe(true);
+    expect(spawnSyncMock.mock.calls[0]?.[1]).toEqual(['-c', expect.stringContaining('SELECT 1 FROM sessions WHERE id = ? LIMIT 1')]);
+  });
+
+  it('returns false when Hermes session is provably absent', async () => {
+    existsSyncMock.mockReturnValue(true);
+    spawnSyncMock.mockReturnValue({ status: 0, stdout: '0\n', stderr: '' } as any);
+    const { hermesSessionExists } = await import('../src/services/hermes-transcript.js');
+
+    expect(hermesSessionExists('missing-session', '/tmp/state.db')).toBe(false);
+  });
+
+  it('returns undefined when Hermes state.db is missing or unreadable', async () => {
+    const { hermesSessionExists } = await import('../src/services/hermes-transcript.js');
+
+    existsSyncMock.mockReturnValue(false);
+    expect(hermesSessionExists('20260716_163643_7782fd', '/tmp/missing.db')).toBeUndefined();
+    expect(spawnSyncMock).not.toHaveBeenCalled();
+
+    existsSyncMock.mockReturnValue(true);
+    spawnSyncMock.mockReturnValue({ status: 1, stdout: '', stderr: 'broken' } as any);
+    expect(hermesSessionExists('20260716_163643_7782fd', '/tmp/state.db')).toBeUndefined();
+  });
 });

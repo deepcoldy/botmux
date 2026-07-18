@@ -397,6 +397,9 @@ export interface CliAdapter {
     /** Claude-family data dir (~/.claude, ~/.claude-runtime, …) so the probe
      *  targets the SAME root the adapter will actually write into. */
     dataDir?: string;
+    /** Optional CLI-specific resume store path resolved by the worker after
+     *  applying per-bot env/profile settings (for example Hermes state.db). */
+    stateDbPath?: string;
   }): boolean | undefined;
 
   /** Optional: discover sessions resumable from this CLI's on-disk transcript
