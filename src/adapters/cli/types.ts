@@ -244,8 +244,8 @@ export interface CliAdapter {
 
   /** When true, the adapter injects a `SessionStart` hook that calls
    *  `botmux session-ready` once the CLI's input box is genuinely rendered —
-   *  Claude-family via process-level `--settings`, Grok via its global
-   *  `hooks/*.json` (see `hookInstall.format: 'grok-hooks'`). The worker arms
+   *  Claude-family via its effective settings.json, Grok via its global
+   *  `hooks/*.json` (see `hookInstall`). The worker arms
    *  a ready-gate on this flag and holds the FIRST prompt until the signal
    *  arrives (or a fallback timeout), so a startup launcher's selector `❯` —
    *  which falsely matches `readyPattern` — can't trip an early flush that

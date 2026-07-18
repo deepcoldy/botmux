@@ -101,3 +101,20 @@ export function readManagedOriginCapability(
     return null;
   }
 }
+
+/**
+ * Verify that the child-visible capability transport contains the exact token
+ * currently authorized by the worker. Existence alone is insufficient: a
+ * writable relay can contain a stale token, malformed JSON, or even a directory
+ * at the reserved path after a prior sandbox generation.
+ */
+export function hasMatchingManagedOriginCapability(
+  dataDir: string,
+  sessionId: string | undefined,
+  expectedCapability: string | undefined,
+  relayDir?: string,
+): boolean {
+  if (!expectedCapability) return false;
+  return readManagedOriginCapability(dataDir, sessionId, relayDir)?.capability
+    === expectedCapability;
+}

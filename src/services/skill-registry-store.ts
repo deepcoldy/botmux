@@ -1,7 +1,7 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
@@ -206,12 +206,24 @@ function walkSkillDirs(parentDir: string, dir: string, out: DiscoveredSkillCandi
 }
 
 export function discoverLocalSkillCandidates(rootDir: string, opts: { fullDepth?: boolean } = {}): SkillSourceDiscovery {
-  const sourceDir = realpathSync(resolve(rootDir));
+  const requestedDir = resolve(rootDir);
+  const sourceDir = realpathSync(requestedDir);
   const candidates: DiscoveredSkillCandidate[] = [];
   const rootCandidate = candidateFromDir(sourceDir, sourceDir);
   if (rootCandidate) {
     candidates.push(rootCandidate);
     if (!opts.fullDepth) return { skills: dedupeAndSortCandidates(candidates) };
+  }
+  // Native CLI libraries are themselves named `skills` (for example
+  // ~/.claude/skills). When callers pass that library root directly, scan its
+  // immediate children instead of looking for a redundant skills/skills layer.
+  // Check both the requested and canonical paths so a symlink named `skills`
+  // still gets the expected behavior after realpath resolution.
+  if (basename(requestedDir) === 'skills' || basename(sourceDir) === 'skills') {
+    for (const child of listChildDirs(sourceDir)) {
+      const candidate = candidateFromDir(sourceDir, child);
+      if (candidate) candidates.push(candidate);
+    }
   }
   for (const relativeRoot of ['skills', '.agents/skills', '.botmux/skills']) {
     for (const child of listChildDirs(join(sourceDir, relativeRoot))) {

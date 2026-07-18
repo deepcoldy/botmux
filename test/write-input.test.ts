@@ -37,7 +37,11 @@ vi.mock('node:fs', async () => {
   return memfs.fs;
 });
 
-import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
+import {
+  CLAUDE_INPUT_CHUNK_BYTES,
+  chunkTextByUtf8Bytes,
+  createClaudeCodeAdapter,
+} from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
@@ -605,6 +609,30 @@ describe('writeInput: edge cases', () => {
     expect(pty.sendText).toHaveBeenCalledWith('check /tmp/a.png');
     expect(pty.sendText).toHaveBeenCalledWith('Session ID: x');
     expect(pty.sendSpecialKeys).toHaveBeenLastCalledWith('Enter');
+  });
+
+  it('claude-code: chunks one long Unicode line into paced UTF-8-safe sends', async () => {
+    const pty = makeTmuxPty();
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const content = `<user_message>${'中文🙂abc'.repeat(80)}</user_message>`;
+
+    await adapter.writeInput(pty, content);
+
+    const chunks = pty.sendText.mock.calls.map(call => call[0]);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.join('')).toBe(content);
+    expect(chunks.every(chunk => Buffer.byteLength(chunk, 'utf8') <= CLAUDE_INPUT_CHUNK_BYTES)).toBe(true);
+    expect(pty.sendSpecialKeys).toHaveBeenLastCalledWith('Enter');
+    expect(pty.pasteText).not.toHaveBeenCalled();
+  });
+
+  it('chunkTextByUtf8Bytes never splits surrogate pairs and round-trips exactly', () => {
+    const content = '甲🙂e\u0301乙🚀'.repeat(20);
+    const chunks = chunkTextByUtf8Bytes(content, 11);
+    expect(chunks.join('')).toBe(content);
+    expect(chunks.every(chunk => Buffer.byteLength(chunk, 'utf8') <= 11)).toBe(true);
+    expect(chunks.every(chunk => !/[\uD800-\uDBFF]$/.test(chunk))).toBe(true);
+    expect(chunks.every(chunk => !/^[\uDC00-\uDFFF]/.test(chunk))).toBe(true);
   });
 });
 

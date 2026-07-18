@@ -10,6 +10,7 @@ import type {
   VcMeetingConsumerResponseMode,
 } from '../types.js';
 import type { VcMeetingActivityType } from '../vc-agent/types.js';
+import type { VcMeetingPreparationQaMode } from './vc-meeting-preparations-store.js';
 
 const RUNTIME_SCHEMA_VERSION = 3 as const;
 
@@ -82,6 +83,10 @@ export interface VcMeetingRuntimeSessionRecord {
   listenerRejoinCardMessageId?: string;
   temporaryInstructionOpenIds?: string[];
   temporaryInstructionUnionIds?: string[];
+  preparationMeetingNo?: string;
+  qaMode?: VcMeetingPreparationQaMode;
+  qaAgentAppId?: string;
+  qaRecentOutputHashes?: string[];
   createdAt: number;
   updatedAt: number;
   expiresAt: number;
@@ -628,6 +633,16 @@ function normalizeRecord(value: unknown): VcMeetingRuntimeSessionRecord | undefi
     ...(Array.isArray(r.temporaryInstructionUnionIds)
       ? { temporaryInstructionUnionIds: normalizeIdList(r.temporaryInstructionUnionIds) }
       : {}),
+    ...(typeof r.preparationMeetingNo === 'string' && r.preparationMeetingNo.trim()
+      ? { preparationMeetingNo: r.preparationMeetingNo.trim() }
+      : {}),
+    ...(r.qaMode === 'auto' || r.qaMode === 'off' ? { qaMode: r.qaMode } : {}),
+    ...(typeof r.qaAgentAppId === 'string' && r.qaAgentAppId.trim()
+      ? { qaAgentAppId: r.qaAgentAppId.trim() }
+      : {}),
+    ...(Array.isArray(r.qaRecentOutputHashes)
+      ? { qaRecentOutputHashes: normalizeIdList(r.qaRecentOutputHashes).slice(-20) }
+      : {}),
     createdAt,
     updatedAt,
     expiresAt,
@@ -812,6 +827,10 @@ export function recordVcMeetingRuntimeSession(
     listenerRejoinCardMessageId?: string;
     temporaryInstructionOpenIds?: string[];
     temporaryInstructionUnionIds?: string[];
+    preparationMeetingNo?: string;
+    qaMode?: VcMeetingPreparationQaMode;
+    qaAgentAppId?: string;
+    qaRecentOutputHashes?: string[];
   },
   now = Date.now(),
 ): void {
@@ -880,6 +899,12 @@ export function recordVcMeetingRuntimeSession(
         : {}),
       ...(input.temporaryInstructionUnionIds !== undefined
         ? { temporaryInstructionUnionIds: normalizeIdList(input.temporaryInstructionUnionIds) }
+        : {}),
+      ...(input.preparationMeetingNo ? { preparationMeetingNo: input.preparationMeetingNo } : {}),
+      ...(input.qaMode ? { qaMode: input.qaMode } : {}),
+      ...(input.qaAgentAppId ? { qaAgentAppId: input.qaAgentAppId } : {}),
+      ...(input.qaRecentOutputHashes !== undefined
+        ? { qaRecentOutputHashes: normalizeIdList(input.qaRecentOutputHashes).slice(-20) }
         : {}),
       createdAt: prior?.createdAt ?? now,
       updatedAt: now,

@@ -5,6 +5,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  hasMatchingManagedOriginCapability,
   managedOriginCapabilityPath,
   readManagedOriginCapability,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
@@ -90,5 +91,28 @@ describe('managed origin capability transport', () => {
     });
     writeFileSync(relayPath, JSON.stringify({ token: 'not-a-capability' }));
     expect(readManagedOriginCapability(dir, 'session-a', relay)).toBeNull();
+  });
+
+  it('ready preflight rejects stale, malformed, and non-file relay capabilities', () => {
+    const dir = makeDir();
+    const relay = join(dir, 'relay');
+    mkdirSync(relay);
+    const relayPath = join(relay, RELAY_ORIGIN_CAPABILITY_BASENAME);
+    const current = '12'.repeat(32);
+
+    writeFileSync(relayPath, JSON.stringify({ token: current }));
+    expect(hasMatchingManagedOriginCapability(dir, 'session-a', current, relay)).toBe(true);
+    expect(hasMatchingManagedOriginCapability(dir, 'session-a', '34'.repeat(32), relay)).toBe(false);
+
+    writeFileSync(relayPath, '{broken-json');
+    expect(hasMatchingManagedOriginCapability(dir, 'session-a', current, relay)).toBe(false);
+
+    rmSync(relayPath, { force: true });
+    mkdirSync(relayPath);
+    expect(() => replaceManagedOriginCapabilityFile(
+      relayPath,
+      JSON.stringify({ token: current }),
+    )).toThrow();
+    expect(hasMatchingManagedOriginCapability(dir, 'session-a', current, relay)).toBe(false);
   });
 });

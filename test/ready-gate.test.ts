@@ -16,7 +16,12 @@ import { describe, it, expect } from 'vitest';
 import { ReadyGate, shouldArmReadyGate } from '../src/utils/ready-gate.js';
 
 describe('shouldArmReadyGate', () => {
-  const base = { injectsReadyHook: true, adoptMode: false, willReattachPersistent: false };
+  const base = {
+    injectsReadyHook: true,
+    readySignalAvailable: true,
+    adoptMode: false,
+    willReattachPersistent: false,
+  };
 
   it('arms a fresh Claude-family spawn (hook will fire)', () => {
     expect(shouldArmReadyGate(base)).toBe(true);
@@ -24,6 +29,10 @@ describe('shouldArmReadyGate', () => {
 
   it('does NOT arm a non-Claude CLI (no SessionStart hook injected)', () => {
     expect(shouldArmReadyGate({ ...base, injectsReadyHook: false })).toBe(false);
+  });
+
+  it('does NOT arm when hook/transport preflight says the signal cannot arrive', () => {
+    expect(shouldArmReadyGate({ ...base, readySignalAvailable: false })).toBe(false);
   });
 
   it('does NOT arm adopt panes (pre-existing, never got our --settings)', () => {
@@ -38,7 +47,12 @@ describe('shouldArmReadyGate', () => {
   });
 
   it('reattach exclusion wins even for an otherwise-eligible fresh-looking spawn', () => {
-    expect(shouldArmReadyGate({ injectsReadyHook: true, adoptMode: false, willReattachPersistent: true })).toBe(false);
+    expect(shouldArmReadyGate({
+      injectsReadyHook: true,
+      readySignalAvailable: true,
+      adoptMode: false,
+      willReattachPersistent: true,
+    })).toBe(false);
   });
 
   it('KEEPS arming for aiden x claude: --settings is stripped but the SessionStart hook is installed globally', () => {

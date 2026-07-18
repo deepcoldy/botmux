@@ -268,6 +268,7 @@ vi.mock('../src/utils/logger.js', () => ({
 
 vi.mock('../src/core/worker-pool.js', () => ({
   killWorker: vi.fn(),
+  suspendWorker: vi.fn(() => false),
   forkWorker: vi.fn(),
   forkAdoptWorker: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.42'),
@@ -380,6 +381,19 @@ vi.mock('../src/services/doc-subs-store.js', () => ({
   getDocSubscription: vi.fn(() => null),
 }));
 
+vi.mock('../src/services/vc-meeting-preparations-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/vc-meeting-preparations-store.js')>()),
+  findVcMeetingPreparationByChat: vi.fn(() => undefined),
+  getVcMeetingPreparation: vi.fn(() => undefined),
+  listVcMeetingPreparations: vi.fn(() => []),
+  putVcMeetingPreparation: vi.fn((_: string, input: any) => ({
+    ...input,
+    createdAt: 1,
+    updatedAt: 1,
+  })),
+  removeVcMeetingPreparation: vi.fn(() => undefined),
+  removeVcMeetingPreparationsByChat: vi.fn(() => 0),
+}));
 // The picker query helper now lives in services/relay-picker.ts — mock it so
 // the /relay picker tests can control the entry list directly without
 // patching activeSessions in lots of places.
@@ -447,7 +461,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { killWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
+import { killWorker, suspendWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } from '../src/core/session-manager.js';
@@ -462,6 +476,7 @@ import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SC
 import { DocSubscriptionPermissionError, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
 import { putDocSubscription, removeDocSubscription, listAllDocSubscriptions, getDocSubscription } from '../src/services/doc-subs-store.js';
 import { bindOncall } from '../src/services/oncall-store.js';
+import { putVcMeetingPreparation } from '../src/services/vc-meeting-preparations-store.js';
 import { existsSync, statSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -579,7 +594,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -587,6 +602,12 @@ describe('DAEMON_COMMANDS set', () => {
 
   it('should no longer contain the removed /skip command (folded into bare /repo)', () => {
     expect(DAEMON_COMMANDS.has('/skip')).toBe(false);
+  });
+
+  it('uses /vc for meeting preparation without changing the existing /vc-auth command', () => {
+    expect(DAEMON_COMMANDS.has('/vc')).toBe(true);
+    expect(DAEMON_COMMANDS.has('/vc-auth')).toBe(true);
+    expect(DAEMON_COMMANDS.has('/meeting')).toBe(false);
   });
 
   it('keeps one /watch-comment command family instead of several /doc-* commands', () => {
@@ -606,9 +627,9 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 30 = the prior 28 commands + /watch-comment + /rename. /subscribe-lark-doc
-    // remains as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(30);
+    // 31 = current master command set plus /vc. /subscribe-lark-doc remains
+    // as its original per-file API subscription command rather than an alias.
+    expect(DAEMON_COMMANDS.size).toBe(31);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -702,6 +723,7 @@ describe('SESSIONLESS_DAEMON_COMMANDS set', () => {
   it('keeps the whole /watch-comment family session-less', () => {
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/watch-comment')).toBe(true);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/subscribe-lark-doc')).toBe(false);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/vc')).toBe(false);
   });
 
   it('excludes conversation/state commands that need a session', () => {
@@ -811,6 +833,68 @@ describe('/botconfig string field goes through coerceConfigValue (maxLen)', () =
       rmSync(dir, { recursive: true, force: true });
       vi.mocked(getBot).mockImplementation(defaultGetBot as any);
     }
+  });
+});
+
+describe('/vc preparation command', () => {
+  it('binds a regular chat-scope Agent session to the normalized meeting number', async () => {
+    const ds = makeDaemonSession({
+      scope: 'chat',
+      session: makeSession({ scope: 'chat' }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand(
+      '/vc',
+      ROOT_ID,
+      makeLarkMessage('/vc prepare https://vc-my.larkoffice.com/j/688542737 --qa auto', { senderId: 'ou_owner' }),
+      deps,
+      LARK_APP_ID,
+    );
+
+    expect(putVcMeetingPreparation).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        larkAppId: LARK_APP_ID,
+        meetingNo: '688542737',
+        prepChatId: CHAT_ID,
+        agentAppId: LARK_APP_ID,
+        agentSessionId: 'sess-001',
+        qaMode: 'auto',
+      }),
+    );
+    expect(deps.sessionReply).toHaveBeenCalledWith(
+      ROOT_ID,
+      expect.stringMatching(/688542737[\s\S]*当前会话未绑定项目目录/),
+      undefined,
+      LARK_APP_ID,
+      'msg_001',
+    );
+  });
+
+  it('reports the project already bound to the preparation session', async () => {
+    const ds = makeDaemonSession({
+      scope: 'chat',
+      workingDir: '/work/ai-coding',
+      session: makeSession({ scope: 'chat', workingDir: '/work/ai-coding' }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand(
+      '/vc',
+      ROOT_ID,
+      makeLarkMessage('/vc prepare 688542737', { senderId: 'ou_owner' }),
+      deps,
+      LARK_APP_ID,
+    );
+
+    expect(deps.sessionReply).toHaveBeenCalledWith(
+      ROOT_ID,
+      expect.stringContaining('已复用当前会话绑定的项目：/work/ai-coding'),
+      undefined,
+      LARK_APP_ID,
+      'msg_001',
+    );
   });
 });
 
@@ -1061,7 +1145,11 @@ describe('handleCommand', () => {
     });
 
     it('/watch-comment works without a User Token and records the comment watch', async () => {
-      const ds = makeDaemonSession({ scope: 'thread' });
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        workingDir: '/work/current-session',
+        session: makeSession({ workingDir: '/work/current-session' }),
+      });
       const deps = makeDeps(ds);
 
       await handleCommand(
@@ -1088,12 +1176,60 @@ describe('handleCommand', () => {
           sessionId: 'sess-001',
           scope: 'thread',
           commentTriggerMode: 'all',
+          workingDir: '/work/current-session',
           managedBy: 'watch-comment',
         }),
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在启动并预热 AI 会话'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('工作目录：/work/current-session'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('/watch-comment without a bound project asks whether to bind one and defaults to document-only', async () => {
+      const ds = makeDaemonSession({ scope: 'chat', session: makeSession({ scope: 'chat' }) });
+      const deps = makeDeps(ds);
+      vi.mocked(getDocSubscription).mockReturnValueOnce({
+        fileToken: 'doc_token_12345678901234567890',
+        fileType: 'docx',
+        sessionAnchor: 'old-anchor',
+        scope: 'chat',
+        chatId: 'old-chat',
+        commentTriggerMode: 'all',
+        managedBy: 'watch-comment',
+        workingDir: '/work/old-binding',
+        pollBaselineReady: true,
+        pollCursorAt: 1,
+        pollCursorReplyId: 'reply-1',
+        createdAt: 1,
+      } as any);
+
+      await handleCommand(
+        '/watch-comment',
+        ROOT_ID,
+        makeLarkMessage('/watch-comment https://example.feishu.cn/docx/AbCdEf12345678901234 --all', { senderId: 'ou_owner' }),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(putDocSubscription).toHaveBeenCalledWith(
+        expect.any(String),
+        LARK_APP_ID,
+        expect.objectContaining({ workingDir: undefined }),
+      );
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('不操作则默认仅根据文档内容回答'),
         undefined,
         LARK_APP_ID,
         'msg_001',
@@ -1542,6 +1678,20 @@ describe('handleCommand', () => {
       expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('工作目录已切换');
+    });
+
+    it('should cold-suspend a persistent worker so cwd-scoped history can resume', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(suspendWorker).mockReturnValueOnce(true);
+
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /home/testuser/other-project'), deps, LARK_APP_ID);
+
+      expect(suspendWorker).toHaveBeenCalledWith(ds, 'working_dir_changed');
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe('/home/testuser/other-project');
     });
 
     it('should reject path that exists but is not a directory', async () => {

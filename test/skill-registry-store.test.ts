@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { skillRegistryPath } from '../src/core/skills/registry-paths.js';
-import { installLocalSkill, installLocalSkillLinks, readSkillRegistry, removeInstalledSkill, removeInstalledSkills } from '../src/services/skill-registry-store.js';
+import { discoverLocalSkillCandidates, installLocalSkill, installLocalSkillLinks, readSkillRegistry, removeInstalledSkill, removeInstalledSkills } from '../src/services/skill-registry-store.js';
 
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
@@ -25,6 +25,20 @@ describe('skill registry store', () => {
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
     rmSync(src, { recursive: true, force: true });
+  });
+
+  it('discovers direct children when the supplied source is a native skills root', () => {
+    const skillsRoot = join(src, '.claude', 'skills');
+    write(join(skillsRoot, 'deploy', 'SKILL.md'), '---\nname: deploy\n---\n# Deploy');
+    write(join(skillsRoot, 'review', 'SKILL.md'), '---\nname: review\n---\n# Review');
+    write(join(skillsRoot, 'not-a-skill', 'README.md'), '# Ignore');
+
+    const discovery = discoverLocalSkillCandidates(skillsRoot);
+
+    expect(discovery.skills.map(skill => [skill.name, skill.path])).toEqual([
+      ['deploy', 'deploy'],
+      ['review', 'review'],
+    ]);
   });
 
   it('installs a local copy into the botmux store and records registry metadata', () => {

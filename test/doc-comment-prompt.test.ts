@@ -40,6 +40,8 @@ describe('buildDocCommentPrompt', () => {
     expect(prompt).toContain('这个结论有什么依据');
     expect(prompt).toContain('先使用当前可用的飞书文档工具');
     expect(prompt).toContain('不要调用文档评论、回复或 reaction API');
+    expect(prompt).toContain('默认进入“仅文档”模式');
+    expect(prompt).toContain('不要读取或引用本机上的其它项目');
   });
 
   it('uses the Lark host and English guidance for an English bot', () => {
@@ -181,6 +183,20 @@ describe('buildDocWatchWarmupPrompt', () => {
     expect(prompt).toContain('读取文档');
     expect(prompt).toContain('不要发表或修改任何文档评论');
     expect(prompt).toContain('进入评论待命');
+    expect(prompt).toContain('默认进入“仅文档”模式');
+  });
+
+  it('allows relevant local code context when a project is explicitly bound', () => {
+    const prompt = buildDocWatchWarmupPrompt({
+      fileToken: 'doc_token_123',
+      fileType: 'docx',
+      projectDir: '/work/ai-coding',
+      brand: 'feishu',
+      locale: 'zh',
+    });
+    expect(prompt).toContain('当前会话已绑定项目目录：/work/ai-coding');
+    expect(prompt).toContain('仅当问题确实涉及实现、代码或仓库事实时');
+    expect(prompt).not.toContain('默认进入“仅文档”模式');
   });
 
   it('uses a concise visible label without exposing operational instructions', () => {
@@ -221,10 +237,10 @@ describe('buildDocWatchWarmupPrompt', () => {
     expect(cliInput.content).toContain(promptContent);
     expect(cliInput.codexAppInput?.text).toBe('文档评论助手预热：https://feishu.cn/docx/doc_live');
     expect(cliInput.codexAppInput?.text).not.toContain('读取文档');
-    expect(cliInput.codexAppInput?.additionalContext?.botmux_application_context).toEqual({
-      kind: 'application',
-      value: promptContent,
-    });
+    expect(joinedContext(
+      cliInput.codexAppInput?.additionalContext,
+      'botmux_application_context',
+    )).toBe(promptContent);
   });
 
   it('keeps the same clean split when a frozen Codex App session reforks', () => {
@@ -239,9 +255,9 @@ describe('buildDocWatchWarmupPrompt', () => {
 
     expect(cliInput.content).toContain(promptContent);
     expect(cliInput.codexAppInput?.text).toBe('文档评论助手预热：https://feishu.cn/docx/doc_refork');
-    expect(cliInput.codexAppInput?.additionalContext?.botmux_application_context).toEqual({
-      kind: 'application',
-      value: promptContent,
-    });
+    expect(joinedContext(
+      cliInput.codexAppInput?.additionalContext,
+      'botmux_application_context',
+    )).toBe(promptContent);
   });
 });

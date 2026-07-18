@@ -29,10 +29,10 @@ BOTMUX_NO_CLAIM=1 pnpm use:here   # 逃生阀：本次不认领
 当改动需要用户在飞书里**手动验证**（而非纯单测能覆盖），改完自测绿后执行：
 
 ```bash
-pnpm switch:here && botmux restart
+pnpm switch:here && pnpm daemon:restart
 ```
 
-否则用户测的还是旧代码（典型症状：新加的命令/配置「找不到」）。⚠️ 这会让**所有 bot** 都跑本 checkout 的 build；测试/合并完成后记得切回 canonical checkout，以免 review worktree 被删后全局 shim 失效。
+这里故意用 `pnpm daemon:restart`，确保从当前 checkout 的 `dist/cli.js` 重启；不要依赖裸 `botmux restart`，它可能被 PATH 中更靠前的 npm 全局安装抢先。否则用户测的还是旧代码（典型症状：新加的命令/配置「找不到」）。⚠️ 这会让**所有 bot** 都跑本 checkout 的 build；测试/合并完成后记得切回 canonical checkout，以免 review worktree 被删后全局 shim 失效。
 
 ## 模块结构
 
@@ -62,7 +62,7 @@ pnpm switch:here && botmux restart
 
 - 标题与 commit message 同格式：`type(scope): 中文描述`
 - 描述用**中文说明**：改了什么、为什么、影响面（涉及哪些模块/会话类型）
-- 附**实际测试验证**：贴出跑过的命令和关键结果（`pnpm build`、`pnpm test`、相关 e2e），不要只写「应该没问题」；需要 live 验证的先 `pnpm switch:here && botmux restart` 在飞书里实测并注明结果
+- 附**实际测试验证**：贴出跑过的命令和关键结果（`pnpm build`、`pnpm test`、相关 e2e），不要只写「应该没问题」；需要 live 验证的先 `pnpm switch:here && pnpm daemon:restart` 在飞书里实测并注明结果
 - UI 类改动（飞书卡片 / dashboard / web 终端）附**截图示意**，让 reviewer 不用跑代码就能看到效果
 
 ## Git 提交 & 发版规范

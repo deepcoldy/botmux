@@ -32,6 +32,19 @@ const groupCreateHolds = vi.hoisted(() => ({
 const realtimeVoiceEvents = vi.hoisted(() => [] as string[]);
 const meetingTextOutputs = vi.hoisted(() => [] as Array<{ meetingId: string; text: string; channel: 'text' | 'voice' }>);
 const triggerSessionCalls = vi.hoisted(() => [] as Array<{ req: any; larkAppId: string }>);
+const triggerSessionOutputs = vi.hoisted(() => [] as string[]);
+const triggerSessionWaitHolds = vi.hoisted(() => ({
+  count: 0,
+  resolvers: [] as Array<() => void>,
+}));
+const preparationRecords = vi.hoisted(() => [] as Array<{
+  larkAppId: string;
+  meetingNo: string;
+  prepChatId: string;
+  agentAppId: string;
+  agentSessionId?: string;
+  qaMode: 'off' | 'auto';
+}>);
 const onlineDaemons = vi.hoisted(() => new Map<string, { larkAppId: string; ipcPort: number; pid?: number; lastHeartbeat?: number }>());
 const remoteFetchCalls = vi.hoisted(() => [] as Array<{ url: string; init?: RequestInit; body?: any }>);
 const addBotToChatCalls = vi.hoisted(() => [] as Array<{ proxyLarkAppId: string; chatId: string; targetLarkAppIds: string[] }>);
@@ -66,6 +79,10 @@ const runtimeStoreRecords = vi.hoisted(() => [] as Array<{
   listenerRejoinCardMessageId?: string;
   temporaryInstructionOpenIds?: string[];
   temporaryInstructionUnionIds?: string[];
+  preparationMeetingNo?: string;
+  qaMode?: 'off' | 'auto';
+  qaAgentAppId?: string;
+  qaRecentOutputHashes?: string[];
   createdAt: number;
   updatedAt: number;
   expiresAt: number;
@@ -229,6 +246,22 @@ vi.mock('../src/core/trigger-session.js', () => ({
   ) => {
     triggerSessionCalls.push({ req, larkAppId: deps.larkAppId });
     opts?.beforeDispatch?.({ sessionId: req.target?.sessionId, workerGeneration: 1 });
+    if (req.options?.waitForFinalOutput) {
+      if (triggerSessionWaitHolds.count > 0) {
+        triggerSessionWaitHolds.count -= 1;
+        await new Promise<void>(resolve => triggerSessionWaitHolds.resolvers.push(resolve));
+      }
+      return {
+        ok: true,
+        triggerId: `trg_${triggerSessionCalls.length}`,
+        action: 'completed',
+        target: { kind: 'turn', chatId: req.target?.chatId, sessionId: 'sess_agent' },
+        output: {
+          content: triggerSessionOutputs.shift()
+            ?? (req.envelope?.format === 'botmux.vc-meeting.consumer.v1' ? 'NO_OUTPUT' : 'NO_ANSWER'),
+        },
+      };
+    }
     return {
       ok: true,
       triggerId: `trg_${triggerSessionCalls.length}`,
@@ -240,6 +273,13 @@ vi.mock('../src/core/trigger-session.js', () => ({
       },
     };
   }),
+}));
+
+vi.mock('../src/services/vc-meeting-preparations-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/vc-meeting-preparations-store.js')>()),
+  getVcMeetingPreparation: vi.fn((_dataDir: string, larkAppId: string, meetingNo: string) =>
+    preparationRecords.find(record => record.larkAppId === larkAppId && record.meetingNo === meetingNo),
+  ),
 }));
 
 vi.mock('../src/utils/daemon-discovery.js', () => ({
@@ -308,6 +348,10 @@ vi.mock('../src/services/vc-meeting-runtime-store.js', () => ({
     listenerRejoinCardMessageId?: string;
     temporaryInstructionOpenIds?: string[];
     temporaryInstructionUnionIds?: string[];
+    preparationMeetingNo?: string;
+    qaMode?: 'off' | 'auto';
+    qaAgentAppId?: string;
+    qaRecentOutputHashes?: string[];
   }) => {
     const idx = runtimeStoreRecords.findIndex(record =>
       record.larkAppId === input.larkAppId && record.meeting.id === input.meeting.id,
@@ -331,7 +375,7 @@ vi.mock('../src/services/vc-meeting-runtime-store.js', () => ({
 
 import { getBot, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
-import { __vcMeetingAgentTest } from '../src/daemon.js';
+import { __testOnly_activeSessions, __vcMeetingAgentTest } from '../src/daemon.js';
 import {
   acceptVcMeetingDelivery,
   applyVcMeetingMemberProjection,
@@ -390,6 +434,25 @@ function registerListenerBotForRejoin(opts: { realtimeVoice?: boolean } = {}): v
     },
   });
   bot.botOpenId = LISTENER_BOT_OPEN_ID;
+}
+
+function seedQaAgentSession(input: {
+  larkAppId: string;
+  chatId: string;
+  sessionId: string;
+  workingDir: string;
+}): void {
+  __testOnly_activeSessions.set(`qa-test:${input.larkAppId}:${input.chatId}`, {
+    larkAppId: input.larkAppId,
+    chatId: input.chatId,
+    scope: 'chat',
+    workingDir: input.workingDir,
+    session: {
+      sessionId: input.sessionId,
+      chatId: input.chatId,
+      workingDir: input.workingDir,
+    },
+  } as any);
 }
 
 function lastInteractiveCardAction(action: string): Record<string, string> {
@@ -713,6 +776,7 @@ describe('VC meeting daemon session lifecycle', () => {
     dataDirBeforeTest = config.session.dataDir;
     testDataDir = mkdtempSync(join(tmpdir(), 'botmux-vc-daemon-session-'));
     config.session.dataDir = testDataDir;
+    __testOnly_activeSessions.clear();
     __vcMeetingAgentTest.setGlobalVcMeetingAgentEnabledForTest(true);
     __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(null);
     __vcMeetingAgentTest.setCrossAppLocalReceiverForTest(true);
@@ -739,6 +803,10 @@ describe('VC meeting daemon session lifecycle', () => {
     addBotToChatHolds.resolvers.length = 0;
     chatReplyModeCalls.length = 0;
     triggerSessionCalls.length = 0;
+    triggerSessionOutputs.length = 0;
+    triggerSessionWaitHolds.count = 0;
+    triggerSessionWaitHolds.resolvers.length = 0;
+    preparationRecords.length = 0;
     onlineDaemons.clear();
     remoteFetchCalls.length = 0;
     realtimeVoiceEvents.length = 0;
@@ -759,6 +827,7 @@ describe('VC meeting daemon session lifecycle', () => {
   afterEach(() => {
     vi.useRealTimers();
     __vcMeetingAgentTest.reset();
+    __testOnly_activeSessions.clear();
     sentMessages.length = 0;
     patchedMessages.length = 0;
     patchFailures.count = 0;
@@ -781,6 +850,10 @@ describe('VC meeting daemon session lifecycle', () => {
     addBotToChatHolds.resolvers.length = 0;
     chatReplyModeCalls.length = 0;
     triggerSessionCalls.length = 0;
+    triggerSessionOutputs.length = 0;
+    triggerSessionWaitHolds.count = 0;
+    triggerSessionWaitHolds.resolvers.length = 0;
+    preparationRecords.length = 0;
     onlineDaemons.clear();
     remoteFetchCalls.length = 0;
     realtimeVoiceEvents.length = 0;
@@ -827,6 +900,413 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_session')).toBe(true);
     const state = __vcMeetingAgentTest.sessionState(APP_ID, 'm_session');
     expect(state?.dedup.transcriptBySentenceId.sent_1?.text).toBe('keep the agent state local first');
+  });
+
+  it('reuses a prepared chat with dedicated Q&A while keeping the generic consumer disabled', async () => {
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        meetingConsumer: { enabled: true },
+      },
+    });
+    preparationRecords.push({
+      larkAppId: APP_ID,
+      meetingNo: '688542737',
+      prepChatId: 'oc_preparation_chat',
+      agentAppId: APP_ID,
+      agentSessionId: 'sess_preparation',
+      qaMode: 'auto',
+    });
+    seedQaAgentSession({
+      larkAppId: APP_ID,
+      chatId: 'oc_preparation_chat',
+      sessionId: 'sess_preparation',
+      workingDir: '/workspace/meeting-project',
+    });
+    triggerSessionOutputs.push('Loop Engineering 是把一次性驱动 Agent，升级为设计可持续运行、反馈和改进的工程循环。');
+    __vcMeetingAgentTest.setOutputTextSenderForTest(async (session, req) => {
+      meetingTextOutputs.push({
+        meetingId: session.state.meeting.id,
+        text: req.content,
+        channel: 'text',
+      });
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_prepared_invite',
+      meeting: { id: 'm_prepared', meetingNo: '688542737', topic: 'test' },
+      raw: { event: { meeting: { id: 'm_prepared', meeting_no: '688542737', topic: 'test' } } },
+    });
+
+    expect(groupCreateCalls).toHaveLength(0);
+    expect(runtimeStoreRecords.at(-1)).toMatchObject({
+      listenerChatId: 'oc_preparation_chat',
+      consumerMode: 'listenOnly',
+      preparationMeetingNo: '688542737',
+      qaMode: 'auto',
+      qaAgentAppId: APP_ID,
+    });
+    expect(runtimeStoreRecords.at(-1)?.selectedAgentAppId).toBeUndefined();
+    expect(sentMessages.filter(message => message.msgType === 'interactive')).toHaveLength(0);
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_prepared_participant_joined',
+      meeting: { id: 'm_joined_688542737', meetingNo: '688542737', topic: 'test' },
+      raw: {
+        event: {
+          meeting_activity_items: [{
+            activity_event_type: 'participant_joined',
+            meeting: { id: 'm_joined_688542737', meeting_no: '688542737', topic: 'test' },
+            participant_joined_items: [{
+              participant: { id: { open_id: 'ou_new_participant' }, user_name: 'New Participant' },
+            }],
+          }],
+        },
+      },
+    });
+    expect(triggerSessionCalls).toHaveLength(0);
+    expect(__vcMeetingAgentTest.consumerPendingCount(APP_ID, 'm_joined_688542737')).toBe(0);
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_prepared_question',
+      meeting: { id: 'm_joined_688542737', meetingNo: '688542737', topic: 'test' },
+      raw: {
+        event: {
+          meeting_activity_items: [{
+            activity_event_type: 'chat_received',
+            meeting: { id: 'm_joined_688542737', meeting_no: '688542737', topic: 'test' },
+            chat_received_items: [{
+              message_id: 'msg_audience_question',
+              sender: { open_id: 'ou_audience', user_name: 'Audience' },
+              text: '什么是 Loop Engineering',
+            }],
+          }],
+        },
+      },
+    });
+    await __vcMeetingAgentTest.waitQaQueue(APP_ID, 'm_joined_688542737');
+
+    const qaCall = triggerSessionCalls.find(call => call.req.envelope?.format === 'botmux.vc-meeting.qa.v1');
+    expect(qaCall?.req.target).toMatchObject({ botId: APP_ID, chatId: 'oc_preparation_chat' });
+    expect(qaCall?.req.options?.waitForFinalOutput).toBe(true);
+    expect(qaCall?.req.options?.timeoutMs).toBe(105_000);
+    expect(qaCall?.req.instruction).toContain('/watch-comment');
+    expect(qaCall?.req.instruction).toContain('当前会议准备会话已绑定项目目录：/workspace/meeting-project');
+    expect(qaCall?.req.instruction).toContain('优先使用只读工具在该项目目录内搜索');
+    expect(qaCall?.req.instruction).toContain('可使用 Web Search');
+    expect(qaCall?.req.instruction).toContain('疑似拼写/语音识别变体');
+    expect(qaCall?.req.instruction).toContain('不能依赖问号、疑问词等表面句式');
+    expect(qaCall?.req.envelope.rawText).toContain('什么是 Loop Engineering');
+    expect(triggerSessionCalls.map(call => call.req.envelope?.format)).toEqual([
+      'botmux.vc-meeting.qa.v1',
+    ]);
+    expect(meetingTextOutputs).toEqual([{
+      meetingId: 'm_joined_688542737',
+      text: 'Loop Engineering 是把一次性驱动 Agent，升级为设计可持续运行、反馈和改进的工程循环。',
+      channel: 'text',
+    }]);
+    const archive = sentMessages.find(message => message.uuid?.includes('_qa_'));
+    expect(archive).toMatchObject({ receiveId: 'oc_preparation_chat', msgType: 'text' });
+    expect(JSON.parse(archive!.content).text).toContain('会议问答存档');
+    expect(JSON.parse(archive!.content).text).toContain('提问者：Audience');
+    expect(JSON.parse(archive!.content).text).toContain('问题：什么是 Loop Engineering');
+    expect(JSON.parse(archive!.content).text).toContain(
+      '回答：Loop Engineering 是把一次性驱动 Agent，升级为设计可持续运行、反馈和改进的工程循环。',
+    );
+
+    // 飞书会把 Bot 刚发出的会议弹幕再次作为 chat_received 推回来。它已经有
+    // 结构化问答存档，不应再进入会议同步或普通 consumer，避免群里出现三份答案。
+    await __vcMeetingAgentTest.flushListener(APP_ID, 'm_joined_688542737');
+    const sentBeforeEcho = sentMessages.length;
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_prepared_answer_echo',
+      meeting: { id: 'm_joined_688542737', meetingNo: '688542737', topic: 'test' },
+      raw: {
+        event: {
+          meeting_activity_items: [{
+            activity_event_type: 'chat_received',
+            meeting: { id: 'm_joined_688542737', meeting_no: '688542737', topic: 'test' },
+            chat_received_items: [{
+              message_id: 'msg_audience_answer_echo',
+              sender: { open_id: 'ou_meeting_bot', user_name: 'Meeting Bot' },
+              text: 'Loop Engineering 是把一次性驱动 Agent，升级为设计可持续运行、反馈和改进的工程循环。',
+            }],
+          }],
+        },
+      },
+    });
+    expect(__vcMeetingAgentTest.consumerPendingCount(APP_ID, 'm_joined_688542737')).toBe(0);
+    expect(await __vcMeetingAgentTest.flushListener(APP_ID, 'm_joined_688542737')).toMatchObject({ ok: true, sent: 0 });
+    expect(sentMessages).toHaveLength(sentBeforeEcho);
+    expect(triggerSessionCalls.map(call => call.req.envelope?.format)).toEqual([
+      'botmux.vc-meeting.qa.v1',
+    ]);
+  });
+
+  it('compresses an overlong Q&A answer in a second agent turn instead of slicing it', async () => {
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        meetingConsumer: { enabled: true },
+      },
+    });
+    preparationRecords.push({
+      larkAppId: APP_ID,
+      meetingNo: '688542737',
+      prepChatId: 'oc_preparation_chat',
+      agentAppId: APP_ID,
+      agentSessionId: 'sess_preparation',
+      qaMode: 'auto',
+    });
+    const rawAnswer = [
+      'Spec 是需求和验收标准的事实源，用于在编码前明确目标、边界与完成条件。',
+      '项目实现会围绕 Spec 展开，并通过代码、测试和评审验证是否满足约束。',
+      '对比其他方法时，应先确认术语定义、适用阶段和团队协作方式，再判断哪一种更适合当前场景。',
+      '如果术语来自项目内部，还需要读取仓库文档和实现后才能给出可靠结论。',
+      '不能只根据方法名称判断优劣，还要比较需求稳定性、交付节奏、协作成本和失败恢复方式。',
+      '最终选择应服务于当前分享所讨论的问题，而不是脱离上下文给出绝对排名。',
+    ].join('');
+    expect(rawAnswer.length).toBeGreaterThan(200);
+    const compressedAnswer = 'Spec 强调编码前明确目标、边界和验收标准；其他方法是否更好取决于适用阶段与团队场景。若术语来自项目内部，应先查仓库定义和实现再比较。';
+    triggerSessionOutputs.push(rawAnswer, compressedAnswer);
+    __vcMeetingAgentTest.setOutputTextSenderForTest(async (session, req) => {
+      meetingTextOutputs.push({
+        meetingId: session.state.meeting.id,
+        text: req.content,
+        channel: 'text',
+      });
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_prepared_compress_invite',
+      meeting: { id: 'm_prepared_compress', meetingNo: '688542737', topic: 'test' },
+      raw: { event: { meeting: { id: 'm_prepared_compress', meeting_no: '688542737', topic: 'test' } } },
+    });
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_prepared_compress_question',
+      meeting: { id: 'm_joined_688542737', meetingNo: '688542737', topic: 'test' },
+      raw: {
+        event: {
+          meeting_activity_items: [{
+            activity_event_type: 'chat_received',
+            meeting: { id: 'm_joined_688542737', meeting_no: '688542737', topic: 'test' },
+            chat_received_items: [{
+              message_id: 'msg_audience_compress_question',
+              sender: { open_id: 'ou_audience', user_name: 'Audience' },
+              text: 'Spec 和另一种开发方法有什么区别？',
+            }],
+          }],
+        },
+      },
+    });
+    await __vcMeetingAgentTest.waitQaQueue(APP_ID, 'm_joined_688542737');
+
+    const qaCalls = triggerSessionCalls.filter(call =>
+      call.req.envelope?.format === 'botmux.vc-meeting.qa.v1'
+      || call.req.envelope?.format === 'botmux.vc-meeting.qa-compress.v1',
+    );
+    expect(qaCalls.map(call => call.req.envelope.format)).toEqual([
+      'botmux.vc-meeting.qa.v1',
+      'botmux.vc-meeting.qa-compress.v1',
+    ]);
+    expect(qaCalls[1].req.envelope.rawText).toContain(rawAnswer);
+    expect(qaCalls[1].req.instruction).toContain('禁止调用任何工具');
+    expect(qaCalls[1].req.options.timeoutMs).toBe(15_000);
+    expect(meetingTextOutputs).toEqual([{
+      meetingId: 'm_joined_688542737',
+      text: compressedAnswer,
+      channel: 'text',
+    }]);
+    const archive = sentMessages.find(message => message.uuid?.includes('_qa_'));
+    expect(JSON.parse(archive!.content).text).toContain(`回答：${compressedAnswer}`);
+    expect(JSON.parse(archive!.content).text).not.toContain(rawAnswer);
+  });
+
+  it('routes an authorized user question only through dedicated Q&A, not the fast consumer', async () => {
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: { enabled: true },
+      },
+    });
+    preparationRecords.push({
+      larkAppId: APP_ID,
+      meetingNo: '688542737',
+      prepChatId: 'oc_preparation_chat',
+      agentAppId: APP_ID,
+      agentSessionId: 'sess_preparation',
+      qaMode: 'auto',
+    });
+    triggerSessionOutputs.push('Spec 是持久化需求规约；grill-me 用于澄清，plan mode 用于规划执行步骤。');
+    __vcMeetingAgentTest.setOutputTextSenderForTest(async (session, req) => {
+      meetingTextOutputs.push({ meetingId: session.state.meeting.id, text: req.content, channel: 'text' });
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_authorized_qa_invite',
+      meeting: { id: 'm_authorized_qa', meetingNo: '688542737', topic: 'test' },
+      raw: { event: { meeting: { id: 'm_authorized_qa', meeting_no: '688542737', topic: 'test' } } },
+    });
+    triggerSessionCalls.length = 0;
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_authorized_qa_question',
+      meeting: { id: 'm_joined_688542737', meetingNo: '688542737', topic: 'test' },
+      raw: {
+        event: {
+          meeting_activity_items: [{
+            activity_event_type: 'chat_received',
+            meeting: { id: 'm_joined_688542737', meeting_no: '688542737', topic: 'test' },
+            chat_received_items: [{
+              message_id: 'msg_authorized_qa_question',
+              sender: { open_id: TARGET_OPEN_ID, user_name: 'Owner' },
+              text: 'Spec、grill-me 和 plan mode 有什么区别？',
+            }],
+          }],
+        },
+      },
+    });
+    await __vcMeetingAgentTest.waitQaQueue(APP_ID, 'm_joined_688542737');
+
+    expect(triggerSessionCalls.map(call => call.req.envelope?.format)).toEqual([
+      'botmux.vc-meeting.qa.v1',
+    ]);
+    expect(meetingTextOutputs).toHaveLength(1);
+  });
+
+  it('serializes semantic screening for all audience chat while a Q&A turn is running', async () => {
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        meetingConsumer: { enabled: true },
+      },
+    });
+    preparationRecords.push({
+      larkAppId: APP_ID,
+      meetingNo: '688542737',
+      prepChatId: 'oc_preparation_chat',
+      agentAppId: APP_ID,
+      agentSessionId: 'sess_preparation',
+      qaMode: 'auto',
+    });
+    triggerSessionOutputs.push('这是专用 Q&A 的回答。', 'NO_ANSWER');
+    triggerSessionWaitHolds.count = 1;
+    __vcMeetingAgentTest.setOutputTextSenderForTest(async (session, req) => {
+      meetingTextOutputs.push({ meetingId: session.state.meeting.id, text: req.content, channel: 'text' });
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_qa_defer_invite',
+      meeting: { id: 'm_qa_defer', meetingNo: '688542737', topic: 'test' },
+      raw: { event: { meeting: { id: 'm_qa_defer', meeting_no: '688542737', topic: 'test' } } },
+    });
+    triggerSessionCalls.length = 0;
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_qa_defer_question',
+      meeting: { id: 'm_joined_688542737', meetingNo: '688542737', topic: 'test' },
+      raw: {
+        event: {
+          meeting_activity_items: [{
+            activity_event_type: 'chat_received',
+            meeting: { id: 'm_joined_688542737', meeting_no: '688542737', topic: 'test' },
+            chat_received_items: [{
+              message_id: 'msg_qa_defer_question',
+              sender: { open_id: 'ou_audience', user_name: 'Audience' },
+              text: '为什么需要 Spec？',
+            }],
+          }],
+        },
+      },
+    });
+    for (let i = 0; i < 20 && triggerSessionWaitHolds.resolvers.length === 0; i += 1) await Promise.resolve();
+    expect(triggerSessionWaitHolds.resolvers).toHaveLength(1);
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_qa_defer_context',
+      meeting: { id: 'm_joined_688542737', meetingNo: '688542737', topic: 'test' },
+      raw: {
+        event: {
+          meeting_activity_items: [{
+            activity_event_type: 'chat_received',
+            meeting: { id: 'm_joined_688542737', meeting_no: '688542737', topic: 'test' },
+            chat_received_items: [{
+              message_id: 'msg_qa_defer_context',
+              sender: { open_id: 'ou_other', user_name: 'Other' },
+              text: '讲得很清楚，谢谢',
+            }],
+          }],
+        },
+      },
+    });
+    const blocked = await __vcMeetingAgentTest.injectConsumer(APP_ID, 'm_joined_688542737', { force: true });
+    expect(blocked).toMatchObject({ ok: true, injected: 0 });
+    expect(triggerSessionCalls.map(call => call.req.envelope?.format)).toEqual([
+      'botmux.vc-meeting.qa.v1',
+    ]);
+
+    triggerSessionWaitHolds.resolvers.shift()?.();
+    await __vcMeetingAgentTest.waitQaQueue(APP_ID, 'm_joined_688542737');
+    expect(triggerSessionCalls.map(call => call.req.envelope?.format)).toEqual([
+      'botmux.vc-meeting.qa.v1',
+      'botmux.vc-meeting.qa.v1',
+    ]);
+    expect(triggerSessionCalls[1].req.envelope.rawText).toContain('讲得很清楚，谢谢');
+    expect(meetingTextOutputs).toHaveLength(1);
+    expect(sentMessages.filter(message => message.uuid?.includes('_qa_'))).toHaveLength(1);
   });
 
   it('global VC switch blocks new meeting sessions and startup restore', async () => {
@@ -9512,6 +9992,76 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(sentMessages).toHaveLength(1);
     expect(sentMessages[0].receiveId).toBe('oc_restored_listener');
     expect(JSON.parse(sentMessages[0].content).text).toContain('listener survives restart');
+  });
+
+  it('migrates a legacy prepared consumer binding to dedicated Q&A on restore', async () => {
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: { enabled: true },
+    });
+    preparationRecords.push({
+      larkAppId: APP_ID,
+      meetingNo: '688542737',
+      prepChatId: 'oc_preparation_restore',
+      agentAppId: APP_ID,
+      agentSessionId: 'sess_preparation_restore',
+      qaMode: 'auto',
+    });
+    runtimeStoreRecords.push({
+      larkAppId: APP_ID,
+      meeting: { id: 'm_prepared_restore', meetingNo: '688542737', topic: 'Prepared restore' },
+      listenerChatId: 'oc_preparation_restore',
+      consumerMode: 'agent',
+      selectedAgentAppId: APP_ID,
+      preparationMeetingNo: '688542737',
+      qaMode: 'auto',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    });
+    triggerSessionOutputs.push('恢复后仍由独立 Q&A 回答。');
+    __vcMeetingAgentTest.setOutputTextSenderForTest(async (session, req) => {
+      meetingTextOutputs.push({ meetingId: session.state.meeting.id, text: req.content, channel: 'text' });
+    });
+
+    __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+
+    expect(runtimeStoreRecords.at(-1)).toMatchObject({
+      consumerMode: 'listenOnly',
+      preparationMeetingNo: '688542737',
+      qaMode: 'auto',
+      qaAgentAppId: APP_ID,
+    });
+    expect(runtimeStoreRecords.at(-1)?.selectedAgentAppId).toBeUndefined();
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_prepared_restore_question',
+      meeting: { id: 'm_prepared_restore', meetingNo: '688542737', topic: 'Prepared restore' },
+      raw: {
+        event: {
+          meeting_activity_items: [{
+            activity_event_type: 'chat_received',
+            meeting: { id: 'm_prepared_restore', meeting_no: '688542737', topic: 'Prepared restore' },
+            chat_received_items: [{
+              message_id: 'msg_prepared_restore_question',
+              sender: { open_id: 'ou_restore_audience', user_name: 'Audience' },
+              text: '恢复之后自动问答还在吗',
+            }],
+          }],
+        },
+      },
+    });
+    await __vcMeetingAgentTest.waitQaQueue(APP_ID, 'm_prepared_restore');
+
+    expect(triggerSessionCalls.map(call => call.req.envelope?.format)).toEqual([
+      'botmux.vc-meeting.qa.v1',
+    ]);
+    expect(meetingTextOutputs.at(-1)?.text).toBe('恢复后仍由独立 Q&A 回答。');
   });
 
   it('runs a one-shot listener tick after restoring a listen-only runtime session', async () => {

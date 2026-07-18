@@ -25,18 +25,19 @@ const MAX_AGENT_PROBE_FAILURES = 3;
 // Synchronous (execFileSync 'sleep') because spawn() must stay sync.
 const SERVER_BOOT_POLL_MS = 100;
 const SERVER_BOOT_DEADLINE_MS = 5000;
-// `herdr wait agent-status` blocks until a transition; we cap it so a
-// long-stuck agent still re-arms the watcher and we never accumulate an
+// `herdr wait agent-status` blocks until the requested status, or succeeds
+// immediately when that status is already current. We cap it so a long-stuck
+// agent still re-arms the watcher and we never accumulate an
 // indefinitely-orphaned subprocess on process teardown.
 const STATUS_WAIT_TIMEOUT_MS = 30_000;
-// States we treat as "result settled — flush the pane now". `done` and
-// `blocked` are the user-facing signals (turn finished / input requested);
-// `idle` is the degraded form of `done` after the herdr UI marks it seen,
-// included because we read via the socket API and herdr may not register
-// our reads as "seeing" → without it the watcher could miss legitimate
-// turn completions. `working` is intentionally absent: we don't need an
-// event for "started streaming", the slow timer covers that path.
-const SETTLED_STATUSES = ['done', 'blocked', 'idle'] as const;
+// Watch the full useful lifecycle, not just settled statuses. Herdr's
+// `wait agent-status --status X` is level-triggered: when the pane is already
+// in X it succeeds immediately. After one status wins we therefore exclude it
+// from the next cohort until another lifecycle status wins. Watching `working`
+// is what re-enables `done`/`blocked`/`idle` for the following turn without
+// hot-looping on the settled state between turns.
+const WATCHED_STATUSES = ['working', 'done', 'blocked', 'idle'] as const;
+type WatchedStatus = typeof WATCHED_STATUSES[number];
 
 type JsonCommandResult = { ok: true; value: any | undefined } | { ok: false };
 
@@ -617,22 +618,25 @@ export class HerdrBackend implements SessionBackend {
   }
 
   /**
-   * Spawn one `herdr wait agent-status` child per "result settled" status
-   * (done / blocked / idle). The first to fire wins → we read+emit, then
-   * tear down the losers and re-arm a fresh cohort. Parallel watchers are
-   * needed because the herdr CLI only accepts one --status at a time, and
-   * we genuinely care about all three transitions: `done` is "turn finished
-   * with output", `blocked` is "agent wants user input", `idle` is the
-   * degraded form of done after herdr's UI marks it seen.
+   * Spawn one `herdr wait agent-status` child per useful status other than the
+   * current one. The first to fire wins → we read+emit, tear down the losers,
+   * and re-arm while excluding the winning (now-current) status.
+   *
+   * Excluding the current status is essential because Herdr waits are
+   * level-triggered. Re-arming the same status immediately would make a pane
+   * parked at `idle`/`done` spawn a new wait cohort every ~20ms and saturate
+   * the Herdr API socket. `working` participates solely to advance the state
+   * machine so settled statuses are eligible again on the next turn.
    */
-  private startStatusWatcher(): void {
+  private startStatusWatcher(currentStatus?: WatchedStatus): void {
     if (this.exited) return;
     const paneTarget = this.paneId ?? this.agentName;
     if (!paneTarget) return;
     this.stopStatusWatcher();
     const cohort: ChildProcess[] = [];
     const armedAt = Date.now();
-    for (const status of SETTLED_STATUSES) {
+    for (const status of WATCHED_STATUSES) {
+      if (status === currentStatus) continue;
       const child = spawn('herdr', [
         '--session', this.sessionName,
         'wait', 'agent-status', paneTarget,
@@ -645,20 +649,26 @@ export class HerdrBackend implements SessionBackend {
         // Only the first child to finish (across the cohort) drives the
         // re-arm cycle; later finishers in the same cohort are dropped.
         if (!this.statusWaitProcesses.includes(child)) return;
-        const wasFirstSettle = this.statusWaitProcesses === cohort;
+        const wasFirstExit = this.statusWaitProcesses === cohort;
         // Drop this child from the active cohort.
         this.statusWaitProcesses = this.statusWaitProcesses.filter(c => c !== child);
-        if (!wasFirstSettle || this.exited) return;
+        if (!wasFirstExit || this.exited) return;
         // First exit in this cohort — tear down siblings, then read+re-arm.
         this.stopStatusWatcher();
         this.readAndEmitDelta();
 
-        // Storm guard. code 0 = the watched status was genuinely reached (a
-        // real transition, which can legitimately happen instantly) → re-arm
-        // immediately, the normal hot path. The danger is a NON-ZERO instant
-        // return: when the agent's pane has gone away (the CLI exited), `herdr
-        // wait agent-status` returns code 1 within MILLISECONDS rather than
-        // after the 30s timeout. The old code re-armed on every non-0 code
+        // code 0 means the watched status is now current. Re-arm immediately,
+        // but exclude that status from the next cohort: Herdr returns success
+        // immediately while a status remains current, so including it again is
+        // the level-triggered success storm this state machine prevents.
+        if (code === 0) {
+          this.startStatusWatcher(status);
+          return;
+        }
+
+        // Non-zero storm guard: when the agent's pane has gone away (the CLI
+        // exited), `herdr wait agent-status` returns code 1 within MILLISECONDS
+        // rather than after the 30s timeout. The old code re-armed on every non-0 code
         // synchronously, so a dead pane spun a tight spawn loop (thousands of
         // `herdr wait` children/sec) that starved the 500ms poll timer → the
         // session never reported its exit and hung. So for a non-zero code we
@@ -668,33 +678,34 @@ export class HerdrBackend implements SessionBackend {
         // a deferred timer, never synchronously, so poll() can run and we can't
         // spin). Verified on v0.6.6: the exited agent's row disappears from
         // `agent list`.
-        if (code !== 0) {
-          const elapsed = Date.now() - armedAt;
-          const returnedInstantly = elapsed < STATUS_WAIT_TIMEOUT_MS / 2;
-          if (returnedInstantly) {
-            const agents = this.listAgents();
-            if (agents !== null) {
-              const matching = agents.find(a => a?.pane_id === this.paneId || a?.name === this.agentName);
-              const exited = matching ? agentRowExited(matching) : true;
-              if (exited) {
-                const exitCode = typeof matching?.exit_code === 'number' ? matching.exit_code : 0;
-                this.handleExit(exitCode, null);
-                return;
-              }
+        const elapsed = Date.now() - armedAt;
+        const returnedInstantly = elapsed < STATUS_WAIT_TIMEOUT_MS / 2;
+        if (returnedInstantly) {
+          const agents = this.listAgents();
+          if (agents !== null) {
+            const matching = agents.find(a => a?.pane_id === this.paneId || a?.name === this.agentName);
+            const exited = matching ? agentRowExited(matching) : true;
+            if (exited) {
+              const exitCode = typeof matching?.exit_code === 'number' ? matching.exit_code : 0;
+              this.handleExit(exitCode, null);
+              return;
             }
-            // Agent still alive but the wait returned instantly (transient
-            // herdr hiccup). Re-arm on a later tick, never synchronously, so we
-            // can't spin: the deferred timer yields the loop to poll(). unref
-            // so we never hold the event loop open.
-            if (this.exited) return;
-            const t = setTimeout(() => { if (!this.exited) this.startStatusWatcher(); }, POLL_INTERVAL_MS);
-            t.unref?.();
-            return;
           }
+          // Agent still alive but the wait returned instantly (transient
+          // herdr hiccup). Re-arm on a later tick, never synchronously, so we
+          // can't spin: the deferred timer yields the loop to poll(). unref
+          // so we never hold the event loop open.
+          if (this.exited) return;
+          const t = setTimeout(() => {
+            if (!this.exited) this.startStatusWatcher(currentStatus);
+          }, POLL_INTERVAL_MS);
+          t.unref?.();
+          return;
         }
-        // Normal path: a genuine status transition (code 0) or a real
-        // long-timeout (code 1 after ~30s of working) — re-arm immediately.
-        this.startStatusWatcher();
+        // A real long-timeout after ~30s: preserve the last winning status so
+        // the periodic timeout itself cannot re-introduce a level-triggered
+        // waiter for the unchanged current state.
+        this.startStatusWatcher(currentStatus);
       });
       child.on('error', () => {
         // `herdr` missing or unspawnable: drop from cohort. Timer-based poll

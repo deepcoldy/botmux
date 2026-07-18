@@ -2,7 +2,25 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { listOnlineDaemons } from '../src/utils/daemon-discovery.js';
+import {
+  listOnlineDaemons,
+  parseDaemonIpcPort,
+  resolveDaemonIpcPort,
+} from '../src/utils/daemon-discovery.js';
+
+describe('daemon IPC port fallback', () => {
+  it('prefers a discovered port and otherwise accepts a valid injected port', () => {
+    expect(resolveDaemonIpcPort(4310, '9999')).toBe(4310);
+    expect(resolveDaemonIpcPort(undefined, '9999')).toBe(9999);
+  });
+
+  it.each([undefined, '', '0', '-1', '65536', '12.5', 'not-a-port'])(
+    'rejects invalid injected port %s',
+    (raw) => {
+      expect(parseDaemonIpcPort(raw)).toBeUndefined();
+    },
+  );
+});
 
 describe('daemon discovery', () => {
   let dir: string;

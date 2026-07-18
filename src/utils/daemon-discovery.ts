@@ -33,6 +33,30 @@ function registryDir(): string {
   return join(resolveBotmuxDataDir(), 'dashboard-daemons');
 }
 
+/** Parse a loopback daemon IPC port from a descriptor or injected env value. */
+export function parseDaemonIpcPort(value: unknown): number | undefined {
+  const port = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && value.trim()
+      ? Number(value)
+      : Number.NaN;
+  return Number.isSafeInteger(port) && port >= 1 && port <= 65_535
+    ? port
+    : undefined;
+}
+
+/**
+ * Prefer host-visible daemon discovery, then fall back to the port explicitly
+ * injected into an isolated CLI. The fallback is only a loopback address
+ * marker; individual daemon routes still authenticate their own requests.
+ */
+export function resolveDaemonIpcPort(
+  discovered: unknown,
+  injected: unknown,
+): number | undefined {
+  return parseDaemonIpcPort(discovered) ?? parseDaemonIpcPort(injected);
+}
+
 /** List every daemon whose descriptor file is fresh (heartbeat within STALE_MS). */
 export function listOnlineDaemons(): OnlineDaemonInfo[] {
   const dir = registryDir();

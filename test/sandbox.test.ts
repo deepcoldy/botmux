@@ -11,6 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { buildSandboxArgs, buildRelayHostEnv, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, sandboxCredentialHidePaths, resolveUserReadonlyRoots, sandboxOverlayPaths, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
@@ -63,6 +64,16 @@ describe('buildSandboxArgs (overlay model)', () => {
     expect(bindDest(a, '--bind', '/data/sandboxes/s1/proj-merged')).toBe('/home/u/proj');
     const ci = a.indexOf('--chdir');
     expect(a[ci + 1]).toBe('/home/u/proj');
+  });
+
+  it('uses one project overlay when projectMount equals HOME (no shadowed home bind)', () => {
+    const a = buildSandboxArgs(plan({
+      home: '/home/u',
+      projectMount: '/home/u',
+    }));
+    expect(bindDest(a, '--bind', '/data/sandboxes/s1/home-merged')).toBeUndefined();
+    expect(bindDest(a, '--bind', '/data/sandboxes/s1/proj-merged')).toBe('/home/u');
+    expect(a.filter(x => x === '--bind')).toHaveLength(2); // project + outbox
   });
 
   it('masks hideDirs with a tmpfs and hideFiles with a read-only empty placeholder', () => {
@@ -216,6 +227,48 @@ describe('sandboxedClaudeDataDir (symlink HOME redirect)', () => {
       expect(sandboxedClaudeDataDir('sid-x', canonicalForm)).toBe(expected);
     } finally {
       if (prevHome !== undefined) process.env.HOME = prevHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('maps Claude data to proj-upper when the project mount is HOME', () => {
+    const root = tmp();
+    const home = join(root, 'home');
+    const dataDir = join(home, '.botmux', 'data');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      expect(sandboxedClaudeDataDir('sid-home', join(home, '.claude'), {
+        sourceWorkingDir: home,
+        dataDir,
+      })).toBe(join(dataDir, 'sandboxes', 'sid-home', 'proj-upper', '.claude'));
+    } finally {
+      if (prevHome !== undefined) process.env.HOME = prevHome;
+      else delete process.env.HOME;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps Claude data in home-upper for an ordinary project below HOME', () => {
+    const root = tmp();
+    const home = join(root, 'home');
+    const project = join(home, 'repo');
+    const dataDir = join(home, '.botmux', 'data');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    mkdirSync(project, { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      expect(sandboxedClaudeDataDir('sid-repo', join(home, '.claude'), {
+        sourceWorkingDir: project,
+        dataDir,
+      })).toBe(join('/var/tmp/botmux-sbx', 'sid-repo', 'home-upper', '.claude'));
+    } finally {
+      if (prevHome !== undefined) process.env.HOME = prevHome;
+      else delete process.env.HOME;
       rmSync(root, { recursive: true, force: true });
     }
   });
@@ -746,6 +799,104 @@ describe('resolveUserReadonlyRoots', () => {
 });
 
 describe.skipIf(process.platform !== 'linux')('prepareSandbox hidePaths masks', () => {
+  it('runs with projectMount=HOME using one external project upper (no recursive/shadowed overlay)', () => {
+    const root = tmp();
+    const home = join(root, 'home');
+    const dataDir = join(home, '.botmux', 'data');
+    mkdirSync(dataDir, { recursive: true });
+    const sid = `home-project-${Math.random().toString(36).slice(2)}`;
+    // Simulate an old release's empty in-lower scratch so restart exercises the
+    // upgrade conversion instead of only the brand-new-session path.
+    mkdirSync(join(dataDir, 'sandboxes', sid, 'proj-upper'), { recursive: true });
+    mkdirSync(join(dataDir, 'sandboxes', sid, 'proj-work'), { recursive: true });
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    let r: ReturnType<typeof prepareSandbox> = null;
+    try {
+      r = prepareSandbox({
+        enabled: true,
+        cliId: 'claude-code',
+        sessionId: sid,
+        sourceWorkingDir: home,
+        dataDir,
+        cliBin: '/bin/sh',
+        cliArgs: ['-c', 'printf sandbox-write > probe.txt'],
+      });
+      if (r === null) return; // overlay runtime unavailable in this env
+
+      const run = spawnSync(r.bin, r.args, {
+        env: { ...process.env, ...r.env },
+        encoding: 'utf8',
+        timeout: 10_000,
+      });
+      expect(run.error).toBeUndefined();
+      expect(run.status).toBe(0);
+      expect(realpathSync(r.workDir)).toBe(join('/var/tmp/botmux-sbx', sid, 'proj-upper'));
+      expect(readFileSync(join(r.workDir, 'probe.txt'), 'utf8')).toBe('sandbox-write');
+      expect(existsSync(join(home, 'probe.txt'))).toBe(false);
+
+      const paths = sandboxOverlayPaths(dataDir, sid);
+      const homeBindPresent = r.args.some(
+        (value, index) => value === '--bind' && r!.args[index + 1] === paths.homeMerged,
+      );
+      expect(homeBindPresent).toBe(false);
+    } finally {
+      if (r) r.cleanup();
+      if (prevHome !== undefined) process.env.HOME = prevHome;
+      else delete process.env.HOME;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('treats a missing masked parent as a directory when another mask targets its child', () => {
+    const root = tmp();
+    const home = join(root, 'home');
+    const dataDir = join(home, '.botmux', 'data');
+    mkdirSync(dataDir, { recursive: true });
+    const sid = `missing-mask-parent-${Math.random().toString(36).slice(2)}`;
+    const maskedParent = join(home, '.lark-cli-bots');
+    const maskedChild = join(maskedParent, 'cli_sibling');
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    let r: ReturnType<typeof prepareSandbox> = null;
+    try {
+      r = prepareSandbox({
+        enabled: true,
+        cliId: 'claude-code',
+        sessionId: sid,
+        sourceWorkingDir: home,
+        dataDir,
+        cliBin: '/bin/sh',
+        cliArgs: ['-c', 'test -d "$HOME/.lark-cli-bots"'],
+        hidePaths: [maskedChild],
+      });
+      if (r === null) return; // overlay runtime unavailable in this env
+
+      expect(existsSync(maskedParent)).toBe(false);
+      const parentMaskIdx = r.args.findIndex(
+        (value, index) => value === '--tmpfs' && r!.args[index + 1] === maskedParent,
+      );
+      expect(parentMaskIdx).toBeGreaterThanOrEqual(0);
+      expect(r.args.findIndex(
+        (value, index) => value === '--ro-bind' && r!.args[index + 2] === maskedParent,
+      )).toBe(-1);
+
+      const run = spawnSync(r.bin, r.args, {
+        env: { ...process.env, ...r.env },
+        encoding: 'utf8',
+        timeout: 10_000,
+      });
+      expect(run.error).toBeUndefined();
+      expect(run.stderr).toBe('');
+      expect(run.status).toBe(0);
+    } finally {
+      if (r) r.cleanup();
+      if (prevHome !== undefined) process.env.HOME = prevHome;
+      else delete process.env.HOME;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('tilde-expands hidePaths so the documented `~/...` form masks the real path', () => {
     const src = tmp();
     writeFileSync(join(src, 'file.txt'), 'x');
@@ -843,6 +994,61 @@ describe.skipIf(process.platform !== 'linux')('prepareSandbox hidePaths masks', 
       if (prevHome !== undefined) process.env.HOME = prevHome;
       if (prevSandbox !== undefined) process.env.BOTMUX_SANDBOX = prevSandbox;
       rmSync(linkHome, { force: true });
+    }
+  });
+
+  it('canonicalizes a final credential mask through a symlinked HOME carve-out', () => {
+    const src = tmp();
+    writeFileSync(join(src, 'file.txt'), 'x');
+    const realHome = tmp();
+    const linkHome = join(tmpdir(), 'sbx-final-mask-link-' + Math.random().toString(36).slice(2));
+    symlinkSync(realHome, linkHome);
+    const dataDir = join(linkHome, '.botmux', 'data');
+    const ownBotHome = join(realHome, '.botmux', 'bots', 'cli_self');
+    const rawSendCred = join(linkHome, '.botmux', 'bots', 'cli_self', 'send-cred.json');
+    const canonicalSendCred = join(ownBotHome, 'send-cred.json');
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(ownBotHome, { recursive: true });
+    writeFileSync(canonicalSendCred, 'TOP-SECRET');
+    const prevSandbox = process.env.BOTMUX_SANDBOX;
+    const prevHome = process.env.HOME;
+    delete process.env.BOTMUX_SANDBOX;
+    process.env.HOME = linkHome;
+    const sid = 'canonical-final-mask-' + Math.random().toString(36).slice(2);
+    let r: ReturnType<typeof prepareSandbox> = null;
+    try {
+      r = prepareSandbox({
+        enabled: true,
+        cliId: 'claude-code',
+        sessionId: sid,
+        sourceWorkingDir: src,
+        dataDir,
+        cliBin: '/bin/sh',
+        cliArgs: ['-c', 'test ! -s "$HOME/.botmux/bots/cli_self/send-cred.json"'],
+        trustedWritablePaths: [ownBotHome],
+        finalHidePaths: [rawSendCred],
+      });
+      if (r === null) return; // overlay runtime unavailable in this env
+
+      expect(r.args).toContain(canonicalSendCred);
+      expect(r.args).not.toContain(rawSendCred);
+      const run = spawnSync(r.bin, r.args, {
+        env: { ...process.env, ...r.env },
+        encoding: 'utf8',
+        timeout: 10_000,
+      });
+      expect(run.error).toBeUndefined();
+      expect(run.stderr).toBe('');
+      expect(run.status).toBe(0);
+    } finally {
+      if (r) r.cleanup();
+      if (prevHome !== undefined) process.env.HOME = prevHome;
+      else delete process.env.HOME;
+      if (prevSandbox !== undefined) process.env.BOTMUX_SANDBOX = prevSandbox;
+      else delete process.env.BOTMUX_SANDBOX;
+      rmSync(linkHome, { force: true });
+      rmSync(realHome, { recursive: true, force: true });
+      rmSync(src, { recursive: true, force: true });
     }
   });
 });

@@ -136,7 +136,7 @@ import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { cliUnavailableMessage } from './setup/cli-availability.js';
 import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
-import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
@@ -174,12 +174,18 @@ import { config, resolveChatBotDiscoveryConfig } from './config.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
 import { createHash } from 'node:crypto';
-import { installHook, type HookInstallConfig } from './adapters/hook-installer.js';
+import {
+  hasInstalledSessionReadyHook,
+  installHook,
+  type HookInstallConfig,
+} from './adapters/hook-installer.js';
 import { hookCommandFor } from './adapters/hook-command.js';
+import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
+  hasMatchingManagedOriginCapability,
   managedOriginCapabilityPath,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
   replaceManagedOriginCapabilityFile,
@@ -280,6 +286,23 @@ function provisionIsolatedBotHome(
     if (isClaude) {
       const cdir = join(botHome, 'claude');
       mkdirSync(cdir, { recursive: true });
+      // Settings: read-isolated Claude uses a fresh CLAUDE_CONFIG_DIR, so it
+      // otherwise loses provider auth/model/proxy values held in the shared
+      // ~/.claude/settings.json `env` map. Merge that map on EVERY cold spawn,
+      // then install botmux hooks into the same per-bot file. Global hooks and
+      // unrelated top-level settings are not inherited.
+      const isolatedSettingsPath = join(cdir, 'settings.json');
+      if (hookInstall) {
+        try {
+          installHook(cliId, {
+            ...hookInstall,
+            configPath: isolatedSettingsPath,
+            inheritClaudeEnvFrom: join(homedir(), '.claude', 'settings.json'),
+          }, hookCommandFor(cliId));
+        } catch (e) {
+          log(`[read-isolation] WARN per-bot settings/hook install failed: ${(e as Error).message}`);
+        }
+      }
       // Auth: a fresh CLAUDE_CONFIG_DIR does NOT inherit the shared account's OAuth
       // token → keep <cdir>/.credentials.json synced to the FRESHEST valid credential
       // on EVERY spawn (verified: Claude logs in from that file). Refreshing here (not
@@ -287,20 +310,16 @@ function provisionIsolatedBotHome(
       // spawn — no separate sync step needed. Same shared account for every bot.
       const fresh = freshestClaudeCred();
       if (fresh) writeCredIfChanged(join(cdir, '.credentials.json'), fresh);
-      else if (!existsSync(join(cdir, '.credentials.json'))) {
-        log(`[read-isolation] WARN no Claude credential found (keychain or ~/.claude/.credentials.json) — bot may hit login screen`);
+      else if (
+        !existsSync(join(cdir, '.credentials.json'))
+        && !claudeSettingsHasProviderAuth(isolatedSettingsPath)
+      ) {
+        log(`[read-isolation] WARN no Claude provider auth found (global settings env, keychain, or ~/.claude/.credentials.json) — bot may hit login screen`);
       }
       // State: seed <cdir>/.claude.json from the GLOBAL one MINUS `projects` (keeps the
       // onboarding/promo "seen" flags + account so no dialogs appear, without leaking
       // other projects' data), then trust this bot's cwd. Merge-safe on resume.
       seedAndTrustClaudeState(join(cdir, '.claude.json'), workingDir, log);
-      // Hooks: install the SessionStart-ready + askUserQuestion hooks into the PER-BOT
-      // settings.json (global ~/.claude/settings.json is Seatbelt-denied), else the
-      // worker's ready gate falls back to a slow timeout and AskUserQuestion won't relay.
-      if (hookInstall) {
-        try { installHook(cliId, { ...hookInstall, configPath: join(cdir, 'settings.json') }, hookCommandFor(cliId)); }
-        catch (e) { log(`[read-isolation] WARN per-bot hook install failed: ${(e as Error).message}`); }
-      }
     } else {
       const cdir = join(botHome, 'codex');
       mkdirSync(cdir, { recursive: true });
@@ -315,6 +334,23 @@ function provisionIsolatedBotHome(
     }
   } catch (e) {
     log(`[read-isolation] WARN provisioning bot home failed: ${(e as Error).message}`);
+  }
+}
+
+function claudeSettingsHasProviderAuth(settingsPath: string): boolean {
+  try {
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) as Record<string, unknown>;
+    const env = settings.env;
+    if (!env || typeof env !== 'object' || Array.isArray(env)) return false;
+    const record = env as Record<string, unknown>;
+    return (
+      (typeof record.ANTHROPIC_AUTH_TOKEN === 'string' && record.ANTHROPIC_AUTH_TOKEN.length > 0)
+      || (typeof record.ANTHROPIC_API_KEY === 'string' && record.ANTHROPIC_API_KEY.length > 0)
+      || record.CLAUDE_CODE_USE_BEDROCK === '1'
+      || record.CLAUDE_CODE_USE_VERTEX === '1'
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -821,7 +857,7 @@ let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let durableTurnInFlight = false;
-function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): void {
+function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
   const capability = {
     token: randomBytes(32).toString('hex'),
     ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
@@ -850,17 +886,32 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): voi
         }]
       : []),
   ];
+  let publishError: unknown;
   for (const file of files) {
     try {
       replaceManagedOriginCapabilityFile(file.path, file.body);
     } catch (err: any) {
       log(`Failed to publish managed origin capability: ${err?.message ?? err}`);
-      if (opts.failClosed) {
-        unlinkManagedOriginCapabilityFiles();
-        throw err;
-      }
+      publishError = err;
+      break;
     }
   }
+
+  if (publishError) {
+    // The disk/daemon/worker views must rotate as one authority generation. If
+    // the child-visible transport cannot publish the new token, revoke the old
+    // generation and leave no in-memory authority for ready/send preflights to
+    // mistake as usable. Any files written before a later failure are removed
+    // by the revocation helper as well.
+    completeManagedTurnOriginRevocation(
+      sandboxRelayCapability,
+      currentBotmuxTurnId,
+      currentBotmuxDispatchAttempt,
+    );
+    if (opts.failClosed) throw publishError;
+    return false;
+  }
+
   sandboxRelayCapability = capability;
   if (sessionId) {
     send({
@@ -873,6 +924,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): voi
         : {}),
     });
   }
+  return true;
 }
 
 function unlinkManagedOriginCapabilityFiles(): void {
@@ -5340,6 +5392,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // JSONL/pid/bridge gate below keys off it instead of `cliId === 'claude-code'`,
   // so a fork inherits the whole submit-confirm + bridge-fallback machinery.
   let claudeDataDir = cliAdapter.claudeDataDir;
+  let effectiveReadyHookInstall: HookInstallConfig | undefined = cliAdapter.hookInstall;
   // When this session will be file-sandboxed, the CLI's session jsonl is written
   // into the overlay's EPHEMERAL home upper (CLAUDE_CONFIG_DIR lives under $HOME),
   // invisible at the real path the bridge normally watches → "Bridge mark expired"
@@ -5351,7 +5404,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     (effectiveBackendType === 'pty' || effectiveBackendType === 'tmux') &&
     !!process.env.SESSION_DATA_DIR;
   if (claudeDataDir && willFileSandbox) {
-    const redirected = sandboxedClaudeDataDir(cfg.sessionId, claudeDataDir);
+    const redirected = sandboxedClaudeDataDir(cfg.sessionId, claudeDataDir, {
+      sourceWorkingDir: cfg.workingDir,
+      dataDir: process.env.SESSION_DATA_DIR,
+    });
     log(`[sandbox] redirecting Claude bridge dataDir → overlay upper: ${redirected}`);
     claudeDataDir = redirected;
   }
@@ -5432,6 +5488,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // Provision the per-bot config dir (auth + onboarding/trust seed + hooks for claude;
     // auth/config copy for codex) so the CLI starts fully set up under the Seatbelt wrapper.
     provisionIsolatedBotHome(isolationBotHome, cfg.workingDir, isClaudeFam, cfg.cliId, cliAdapter.hookInstall, log);
+    if (isClaudeFam && effectiveReadyHookInstall) {
+      effectiveReadyHookInstall = {
+        ...effectiveReadyHookInstall,
+        configPath: join(claudeDataDir!, 'settings.json'),
+      };
+    }
     if (cliAdapter.mcpGateway) {
       const isolatedConfigPath = isClaudeFam
         ? join(claudeDataDir!, '.claude.json')
@@ -5554,6 +5616,25 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   let effectiveResume = cfg.resume ?? false;
   let effectiveCliSessionId = cfg.cliSessionId;
   let effectiveAdapterSessionId = adapterSessionId;
+  // Claude-family transcripts are scoped by cwd. `/cd` keeps the same Botmux /
+  // CLI session id, so mirror the newest native transcript into the new cwd's
+  // project directory before the adapter probes or launches `--resume`.
+  // `claudeDataDir` is already the effective root here (global, per-bot read
+  // isolation root, or a preserved sandbox upper), so this never crosses bot
+  // isolation boundaries.
+  if (effectiveResume && !willReattachPersistent && claudeDataDir) {
+    const resumeSessionId = effectiveCliSessionId ?? effectiveAdapterSessionId;
+    try {
+      const synced = syncClaudeResumeTargetToCwd(resumeSessionId, cfg.workingDir, claudeDataDir);
+      if (synced.copied && synced.sourcePath) {
+        log(`Claude resume transcript synced for cwd change: ${synced.sourcePath} → ${synced.targetPath}`);
+      }
+    } catch (err) {
+      // Preserve the existing fail-safe: the adapter probe / two-tier fallback
+      // below still decides whether resume is possible.
+      log(`WARN Claude resume transcript sync failed: ${(err as Error).message}`);
+    }
+  }
   const tier2ForceFresh = effectiveResume && consecutiveInWorkerRestarts >= 2;
   let tier1ProbeFalse = false;
   if (effectiveResume && !tier2ForceFresh && !willReattachPersistent) {
@@ -6404,15 +6485,22 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     }
   }
 
-  // Arm the ready-gate for FRESH Claude-family spawns (which inject the
-  // SessionStart hook via --settings; see claude-code.ts buildArgs). Until
+  // Arm the ready-gate for FRESH ready-integrated spawns. Until
   // `botmux session-ready` fires (daemon → 'session_ready' IPC → releaseReadyGate)
   // we hold the first prompt so a cjadk-style startup selector's ❯ can't eat it.
-  // shouldArmReadyGate() excludes adopt (pre-existing pane, no --settings) AND
+  // shouldArmReadyGate() excludes adopt (pre-existing pane, no fresh hook) AND
   // persistent-backend reattach (daemon restart re-attaches an already-running
   // tmux/zellij/herdr Claude WITHOUT re-running its bin/args → no new
   // SessionStart hook → arming would hold the first post-recovery message until
-  // the timeout). Fallback: release after READY_SIGNAL_TIMEOUT_MS → readyPattern.
+  // the timeout).
+  //
+  // Installation is best-effort, so verify the hook in the EFFECTIVE config
+  // (global for ordinary sessions, per-bot CLAUDE_CONFIG_DIR under read
+  // isolation) before arming. Isolated children also need the injected loopback
+  // port plus a published rotating capability; without either the hook could
+  // run but never reach the daemon. A failed preflight leaves the gate open and
+  // immediately falls back to the adapter's normal readyPattern/quiescence path
+  // instead of blindly waiting READY_SIGNAL_TIMEOUT_MS.
   readyGate = new ReadyGate();
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
   if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
@@ -6420,8 +6508,36 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   promptReadyDetectedDuringSettle = false;
   // Reset quiescence baseline so the settle measures silence from THIS spawn.
   lastPtyOutputAtMs = Date.now();
+  const readyHookAvailable = effectiveReadyHookInstall
+    ? hasInstalledSessionReadyHook(effectiveReadyHookInstall)
+    : true; // Hermes emits BOTMUX_READY_COMMAND directly instead of a config hook.
+  const isolatedReadyTransportRequired = sandboxOn || willReadIsolate;
+  const readyPortAvailable = !isolatedReadyTransportRequired
+    || parseDaemonIpcPort(childEnv.BOTMUX_DAEMON_IPC_PORT) !== undefined;
+  const readyCapabilityAvailable = !isolatedReadyTransportRequired
+    || hasMatchingManagedOriginCapability(
+      process.env.SESSION_DATA_DIR ?? '',
+      cfg.sessionId,
+      sandboxRelayCapability?.token,
+      sandboxRelayOutbox ?? undefined,
+    );
+  const readySignalAvailable =
+    readyHookAvailable && readyPortAvailable && readyCapabilityAvailable;
+  const freshReadyGateCandidate =
+    cliAdapter.injectsReadyHook === true
+    && cfg.adoptMode !== true
+    && !willReattachPersistent;
+  if (freshReadyGateCandidate && !readySignalAvailable) {
+    const reasons = [
+      ...(!readyHookAvailable ? ['SessionStart hook missing from effective config'] : []),
+      ...(!readyPortAvailable ? ['BOTMUX_DAEMON_IPC_PORT missing/invalid'] : []),
+      ...(!readyCapabilityAvailable ? ['ready capability transport missing, unreadable, or stale'] : []),
+    ];
+    log(`Ready gate skipped — preflight failed: ${reasons.join('; ')}`);
+  }
   if (shouldArmReadyGate({
     injectsReadyHook: cliAdapter.injectsReadyHook === true,
+    readySignalAvailable,
     adoptMode: cfg.adoptMode === true,
     willReattachPersistent,
   })) {

@@ -784,7 +784,7 @@ describe('HerdrBackend callbacks', () => {
     expect(exits).toEqual([[7, null]]);
   });
 
-  it('status watcher: one wait child per settled status (done/blocked/idle), first exit wins', () => {
+  it('status watcher: excludes the current status when re-arming, preventing level-triggered success storms', () => {
     // Capture every fake `wait agent-status` child + its --status arg so the
     // test can drive a specific watcher's exit and verify the cohort
     // behaviour (first-to-fire reads, the rest get SIGTERM'd).
@@ -814,9 +814,11 @@ describe('HerdrBackend callbacks', () => {
     be.onData(d => seen.push(d));
     be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
 
-    // Cohort = one watcher per settled status.
+    // The initial cohort also watches `working`: after a settled state fires,
+    // observing the next working transition is what makes that settled state
+    // eligible again for the following turn.
     const cohort = waitChildren.slice();
-    expect(cohort.map(w => w.status).sort()).toEqual(['blocked', 'done', 'idle']);
+    expect(cohort.map(w => w.status).sort()).toEqual(['blocked', 'done', 'idle', 'working']);
 
     // Simulate the agent transitioning to `done` mid-turn — that watcher wins.
     paneText = 'baseline result';
@@ -826,16 +828,25 @@ describe('HerdrBackend callbacks', () => {
     // The win triggered a read+emit.
     expect(seen).toEqual([' result']);
 
-    // The two losing siblings got killed and a fresh cohort got armed.
+    // The losing siblings got killed and a fresh cohort got armed. Crucially,
+    // `done` is excluded while it remains the current status: Herdr's wait is
+    // level-triggered, so immediately watching `done` again would return code
+    // 0 in ~20ms forever and saturate the API socket.
     for (const w of cohort) {
       if (w !== doneWatcher) expect(w.child.killed).toBe(true);
     }
     const nextCohort = waitChildren.slice(cohort.length);
-    expect(nextCohort.map(w => w.status).sort()).toEqual(['blocked', 'done', 'idle']);
+    expect(nextCohort.map(w => w.status).sort()).toEqual(['blocked', 'idle', 'working']);
+
+    // Once the agent starts the next turn, `working` becomes current and
+    // `done` is armed again for that turn's completion.
+    nextCohort.find(w => w.status === 'working')!.child.emit('exit', 0, null);
+    const thirdCohort = waitChildren.slice(cohort.length + nextCohort.length);
+    expect(thirdCohort.map(w => w.status).sort()).toEqual(['blocked', 'done', 'idle']);
 
     be.kill();
     // kill() tears down the live cohort.
-    for (const w of nextCohort) expect(w.child.killed).toBe(true);
+    for (const w of thirdCohort) expect(w.child.killed).toBe(true);
   });
 
   it('status watcher: instant non-zero exit on a vanished agent emits onExit and does NOT re-arm (storm guard)', () => {
@@ -871,7 +882,7 @@ describe('HerdrBackend callbacks', () => {
     be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
 
     const cohort = waitChildren.slice();
-    expect(cohort.length).toBe(3);
+    expect(cohort.length).toBe(4);
 
     // The agent has now exited; the next `wait` returns code 1 instantly.
     agentGone = true;

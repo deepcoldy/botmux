@@ -4,7 +4,7 @@
  * 把 botmux 的 askUserQuestion hook 写入各 CLI 的配置文件。
  * 幂等：写前比对内容，相同则跳过；展开 ~ 路径；出错只 warn 不抛。
  */
-import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync, chmodSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -16,6 +16,11 @@ import { hookCommandParts } from './hook-command.js';
 export interface HookInstallConfig {
   readonly configPath: string;
   readonly format: 'claude-settings' | 'opencode-plugin' | 'grok-hooks';
+  /** Claude read-isolation: merge the shared settings `env` map into a
+   *  per-bot settings file before installing hooks. Shared values win so
+   *  rotated auth/provider/proxy settings refresh on every cold spawn; global
+   *  hooks and unrelated top-level settings are deliberately not inherited. */
+  readonly inheritClaudeEnvFrom?: string;
   /** 可选：SessionStart 就绪 hook 命令。
    *  - claude-settings：写全局 settings.json
    *  - grok-hooks：写 `~/.grok/hooks/*.json` 的 SessionStart
@@ -41,16 +46,19 @@ function readJsonFile<T>(filePath: string): T | null {
 }
 
 /** 幂等写文件：若内容与现有相同则跳过；自动创建目录。 */
-function writeIfChanged(filePath: string, content: string): boolean {
+function writeIfChanged(filePath: string, content: string, mode?: number): boolean {
   try {
     if (existsSync(filePath)) {
       const existing = readFileSync(filePath, 'utf-8');
-      if (existing === content) return false; // 内容相同，无需写入
+      if (existing === content) {
+        if (mode !== undefined) chmodSync(filePath, mode);
+        return false; // 内容相同，无需写入
+      }
     }
     mkdirSync(dirname(filePath), { recursive: true });
     // 原子写：目标是 ~/.claude/settings.json 这类被 CLI 并发读写的热配置，
     // 裸写半截会让并发读者拿到坏 JSON 再整文件覆写回来（cjadk 事故同类）。
-    atomicWriteFileSync(filePath, content);
+    atomicWriteFileSync(filePath, content, mode !== undefined ? { mode } : {});
     return true;
   } catch (err: any) {
     throw new Error(`写入 ${filePath} 失败：${err.message}`);
@@ -73,6 +81,15 @@ interface ClaudeHookGroup {
 interface ClaudeSettings {
   hooks?: Record<string, ClaudeHookGroup[]>;
   [key: string]: unknown;
+}
+
+interface InheritedClaudeEnvState {
+  version: 1;
+  keys: string[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
 /**
@@ -124,9 +141,11 @@ function removeBotmuxAskHookGroups(
  * 不按完整字符串比对——dev checkout 与 npm global 的 cli.js 绝对路径不同。
  */
 function isBotmuxReadyHookGroup(group: ClaudeHookGroup): boolean {
-  return group.hooks.some(
+  return Array.isArray(group?.hooks) && group.hooks.some(
     (e) =>
+      !!e &&
       e.type === 'command' &&
+      typeof e.command === 'string' &&
       e.command.includes('cli.js') &&
       e.command.trimEnd().endsWith('session-ready'),
   );
@@ -140,17 +159,71 @@ function removeBotmuxReadyHookGroups(hooks: Record<string, ClaudeHookGroup[]>, e
 }
 
 /**
+ * Read-only preflight used by the worker before it arms the ready gate.
+ * Installation is intentionally best-effort, so the gate must not assume that
+ * a requested SessionStart hook actually reached the CLI's effective config.
+ */
+export function hasInstalledSessionReadyHook(hookInstall: HookInstallConfig): boolean {
+  if (!hookInstall.sessionStartCommand) return false;
+  if (hookInstall.format !== 'claude-settings' && hookInstall.format !== 'grok-hooks') {
+    return false;
+  }
+  const settings = readJsonFile<ClaudeSettings>(expandHome(hookInstall.configPath));
+  const groups = settings?.hooks?.SessionStart;
+  return Array.isArray(groups) && groups.some(group =>
+    Array.isArray(group?.hooks) && group.hooks.some(entry =>
+      entry?.type === 'command'
+      && entry.command === hookInstall.sessionStartCommand,
+    ),
+  );
+}
+
+/**
  * 向 Claude settings.json 的 hooks.PreToolUse 合并 botmux ask hook entry。
  * AskUserQuestion 在 bypassPermissions 模式下不会经过 PermissionRequest，
  * 但 PreToolUse 仍会在工具执行前触发，因此这里必须挂 PreToolUse。
  * 保留其他事件和 entry，不破坏无关配置。
  *
- * 若提供 sessionStartCommand，再把 SessionStart「真就绪」hook 也写进全局 settings.json
- * （为 wrapperCli=`aiden x claude` 这类剥 --settings 的启动器提供就绪信号；原生 claude
- * 会同时收到进程级 --settings 那份，二者幂等无害）。
+ * 若提供 sessionStartCommand，再把 SessionStart「真就绪」hook 写进 settings.json。
+ * 这是 Claude-family 的单一 ready-hook 来源，也覆盖会剥掉进程级 --settings 的
+ * wrapperCli=`aiden x claude`。
  */
-function installClaudeSettings(configPath: string, hookCommand: string, sessionStartCommand?: string): void {
+function installClaudeSettings(
+  configPath: string,
+  hookCommand: string,
+  sessionStartCommand?: string,
+  inheritClaudeEnvFrom?: string,
+): void {
   const settings: ClaudeSettings = readJsonFile<ClaudeSettings>(configPath) ?? {};
+  let inheritedEnvState: { path: string; content: string } | undefined;
+  if (inheritClaudeEnvFrom) {
+    const source = readJsonFile<ClaudeSettings>(expandHome(inheritClaudeEnvFrom));
+    // A malformed/unreadable shared file is treated as a transient failure: do
+    // not erase the last known-good inherited env. A valid file with no `env`,
+    // however, is an authoritative deletion and must remove previously copied
+    // keys from the per-bot settings.
+    if (source) {
+      const inheritedStatePath = `${configPath}.botmux-inherited-env.json`;
+      const previousState = readJsonFile<InheritedClaudeEnvState>(inheritedStatePath);
+      const previousInheritedKeys = previousState?.version === 1 && Array.isArray(previousState.keys)
+        ? previousState.keys.filter((key): key is string => typeof key === 'string')
+        : [];
+      const localEnv = isRecord(settings.env) ? { ...settings.env } : {};
+      for (const key of previousInheritedKeys) delete localEnv[key];
+
+      const sharedEnv = isRecord(source.env) ? source.env : {};
+      const mergedEnv = { ...localEnv, ...sharedEnv };
+      if (Object.keys(mergedEnv).length > 0) settings.env = mergedEnv;
+      else delete settings.env;
+
+      // Track exactly which keys came from the shared file so a later cold
+      // spawn can propagate deletions without discarding per-bot-only entries.
+      inheritedEnvState = {
+        path: inheritedStatePath,
+        content: `${JSON.stringify({ version: 1, keys: Object.keys(sharedEnv).sort() }, null, 2)}\n`,
+      };
+    }
+  }
   const existingHooks = settings.hooks ?? {};
 
   // 构造 botmux PreToolUse hook group（只拦截 AskUserQuestion）
@@ -173,7 +246,14 @@ function installClaudeSettings(configPath: string, hookCommand: string, sessionS
 
   settings.hooks = existingHooks;
   const content = JSON.stringify(settings, null, 2) + '\n';
-  const changed = writeIfChanged(configPath, content);
+  // An inherited env can contain provider credentials. Keep the per-bot copy
+  // owner-only even if the pre-existing hook-only file was created as 0644.
+  const changed = writeIfChanged(configPath, content, inheritClaudeEnvFrom ? 0o600 : undefined);
+  if (inheritedEnvState) {
+    // Publish the ownership record only after the corresponding settings write
+    // succeeds, so a failed settings update cannot claim per-bot keys as shared.
+    writeIfChanged(inheritedEnvState.path, inheritedEnvState.content, 0o600);
+  }
   if (changed) {
     logger.info(`[hook] 已写入 Claude hook → ${configPath}`);
   } else {
@@ -409,7 +489,12 @@ export function installHook(
     const configPath = expandHome(hookInstall.configPath);
     switch (hookInstall.format) {
       case 'claude-settings':
-        installClaudeSettings(configPath, hookCommand, hookInstall.sessionStartCommand);
+        installClaudeSettings(
+          configPath,
+          hookCommand,
+          hookInstall.sessionStartCommand,
+          hookInstall.inheritClaudeEnvFrom,
+        );
         break;
       case 'opencode-plugin':
         // OpenCode 插件走 argv parts（异步 spawn），不复用 shell 字符串，避免被 split 拆坏。
