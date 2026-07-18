@@ -51,15 +51,15 @@ const BACKOFF_MAX_MS = 30_000;
 // 坏的 ECMP 分支「静默黑洞」（不回包、抓包实锤 ClientHello 无响应），好连接 ~90ms 就回。串行「拨一条
 // →黑洞等满超时→再拨」冷启动要赌好几秒；改成每波**并行拨几条、谁先到用谁、其余丢弃**：
 //  - 每波并行 DATA_DIAL_PARALLEL 条：~50% 单条成功率下，3 条里有 1 条好的概率 ~87.5% → 通常 ~90ms 就建好。
-//  - 单条超时 1s（好连接 90ms 就成，1s 足够判黑洞）；一波全黑洞才进下一波，最多 DATA_DIAL_MAX_WAVES 波。
+//  - 单条超时 3s（生产 TLB/TLS 握手可到 ~1.2s，需留足余量）；一波全黑洞才进下一波，最多 DATA_DIAL_MAX_WAVES 波。
 //  - 用完即弃、不常驻空闲连接（区别于「预热连接池」，不随机器数堆连接，可扩展）。
 //  - 平台对同一个 streamId 只 attach 第一条到的、其余自动 4004 关，协议无需改。
 //  - 配合平台连接池：建好的好连接会被复用，拨号（赌）只在冷启动/扩容发生，不是每请求。
-const DATA_DIAL_TIMEOUT_MS = 1_000;
+const DATA_DIAL_TIMEOUT_MS = 3_000;
 const DATA_DIAL_PARALLEL = 3;
 const DATA_DIAL_MAX_WAVES = 2;
 const DATA_DIAL_WAVE_BACKOFF_MS = 150;
-const DATA_DIAL_OVERALL_DEADLINE_MS = 6_000;
+const DATA_DIAL_OVERALL_DEADLINE_MS = 8_000;
 
 // 控制连接并行拨号（happy-eyeballs）：一轮并行拨几条、谁先握手成功用谁，兜住入口 VIP 对新建连接
 // ~35% 的黑洞。单条超时给足 TLS 握手时间（好连接 ~40ms，黑洞则等满超时判负）。
