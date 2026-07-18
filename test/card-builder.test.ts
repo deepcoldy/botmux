@@ -1233,6 +1233,26 @@ describe('buildRelayPickerCard', () => {
     expect(allMd).toMatch(/没有匹配|No sessions match/);
   });
 
+  // Regression (申晗现场): a p2p entry's chatLabel is the raw DM chatId while
+  // the card RENDERS the「单聊」literal — searching by the label the user sees
+  // must find the entry, not return「没有匹配」. The DM was also buried on
+  // page ~6 of 38 sessions, so search is the only realistic way to reach it.
+  it('search by the rendered p2p location label (单聊/私聊/dm) finds DM entries', () => {
+    const entries: RelayPickerEntry[] = [
+      { sessionId: 's-dm', chatLabel: 'oc_raw_dm_chat_id', title: '看一下Master分支', chatMode: 'p2p', workingDir: '/work/api' },
+      { sessionId: 's-grp', chatLabel: 'Project Alpha', title: 'PR review', chatMode: 'group', workingDir: '/work/api' },
+    ];
+    for (const q of ['单聊', '私聊', 'dm', 'p2p']) {
+      const card = parse(buildRelayPickerCard(entries, 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: q }));
+      const c = containers(card);
+      expect(c, `query "${q}" should match the DM entry`).toHaveLength(1);
+      expect(c[0].behaviors[0].value.session_id).toBe('s-dm');
+    }
+    // Group entries must NOT gain the aliases — searching 单聊 excludes them.
+    const grpOnly = parse(buildRelayPickerCard(entries.slice(1), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: '单聊' }));
+    expect(containers(grpOnly)).toHaveLength(0);
+  });
+
   it('selection highlights the chosen card and appends a confirm button', () => {
     const card = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { selectedSessionId: 'sess-2' }));
     const c = containers(card);

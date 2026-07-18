@@ -229,6 +229,10 @@ vi.mock('../src/im/lark/client.js', () => ({
   },
   deleteMessage: vi.fn(),
   sendMessage: vi.fn(async () => 'card-msg-id'),
+  // /relay picker replies land anchored at the invocation message / 话题 via
+  // replyMessage (reply-at-invocation), not sessionReply. Args mirror the
+  // real signature: (appId, messageId, content, msgType, replyInThread).
+  replyMessage: vi.fn(async () => 'picker-card-msg-id'),
   listChatBotMembers: vi.fn(async () => []),
   // Tests can override per-scenario via vi.mocked(getChatName).mockResolvedValue(...).
   // Default returns null so picker entries fall back to raw chatId.
@@ -450,7 +454,7 @@ import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensur
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
-import { deleteMessage, sendMessage, listChatBotMembers, UserTokenMissingError } from '../src/im/lark/client.js';
+import { deleteMessage, sendMessage, replyMessage, listChatBotMembers, UserTokenMissingError } from '../src/im/lark/client.js';
 import { buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
@@ -3101,9 +3105,14 @@ describe('handleCommand', () => {
 
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      // Reply was an interactive card (msgType='interactive') with v2 schema.
-      const [, replyContent, msgType] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      // The card is anchored at the invocation: flat 普通群 (default 'chat'
+      // mode) → quote-reply of the /relay message, NOT reply_in_thread, NOT
+      // sessionReply (which folds into the session's turn topic / top level).
+      const [, anchorMsgId, replyContent, msgType, inThread] = vi.mocked(replyMessage).mock.calls[0];
+      expect(anchorMsgId).toBe('msg_001');
+      expect(inThread).toBe(false);
       expect(msgType).toBe('interactive');
+      expect(deps.sessionReply).not.toHaveBeenCalled();
       const card = JSON.parse(replyContent as string);
       const containers = card.body.elements.filter((e: any) => e.tag === 'interactive_container');
       expect(containers).toHaveLength(1);
@@ -3113,6 +3122,57 @@ describe('handleCommand', () => {
       expect(cb.value.session_id).toBe('sess-other');
       expect(cb.value.target_chat_id).toBe(CHAT_ID);
       expect(mockedCreate).not.toHaveBeenCalled();
+    });
+
+    // Regression (申晗 live 反馈): /relay typed INSIDE a 话题 of a chat-mode
+    // 普通群 rendered the picker at the chat TOP LEVEL — the command routed to
+    // the chat-scope session (scratch, no turn state), so sessionReply's
+    // fold-back had nothing to anchor on and fell through to sendMessage.
+    // The card must instead reply_in_thread into the 话题 the user typed in
+    // (= the thread target the routing already computed).
+    it('picker card replies INTO the 话题 when /relay is typed inside a thread of a chat-mode group', async () => {
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }), scope: 'chat' });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other',
+          chatId: 'oc_other',
+          rootMessageId: 'om_other_root',
+          title: 'other task',
+          ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay', {
+        rootId: 'om_topic_root_x',
+        threadId: 'omt_thread_x',
+      }), deps, LARK_APP_ID);
+
+      const [, anchorMsgId, replyContent, msgType, inThread] = vi.mocked(replyMessage).mock.calls[0];
+      expect(anchorMsgId).toBe('om_topic_root_x');
+      expect(inThread).toBe(true);
+      expect(msgType).toBe('interactive');
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+      // The baked target matches where the card sits: the same 话题.
+      const card = JSON.parse(replyContent as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.target_scope).toBe('thread');
+      expect(containerValue?.root_id).toBe('om_topic_root_x');
+    });
+
+    it('picker falls back to sessionReply when reply-at-invocation fails', async () => {
+      vi.mocked(replyMessage).mockRejectedValueOnce(new Error('message withdrawn'));
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      const [, replyContent, msgType] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(msgType).toBe('interactive');
+      expect(JSON.parse(replyContent as string).schema).toBe('2.0');
     });
 
     it('picker excludes daemon-command scratch sessions (worker:null + no persisted CLI markers)', async () => {
@@ -3144,7 +3204,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      const [, replyContent] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      const [, , replyContent] = vi.mocked(replyMessage).mock.calls[0];
       const card = JSON.parse(replyContent as string);
       // Scratch must NOT show — picker empty (no interactive_containers).
       expect(card.body.elements.filter((e: any) => e.tag === 'interactive_container')).toHaveLength(0);
@@ -3170,7 +3230,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      const [, replyContent] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      const [, , replyContent] = vi.mocked(replyMessage).mock.calls[0];
       const card = JSON.parse(replyContent as string);
       // No interactive containers rendered — picker is empty after filtering out the adopt session.
       expect(card.body.elements.filter((e: any) => e.tag === 'interactive_container')).toHaveLength(0);
@@ -3204,7 +3264,11 @@ describe('handleCommand', () => {
       // p2p must NOT hit the chat-mode API (its failure default 'group' would
       // misclassify the DM).
       expect(vi.mocked(getChatNameAndMode)).not.toHaveBeenCalled();
-      const [, replyContent, msgType] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      // Thread-mode DM target seeds a 话题 on the /relay message — the card
+      // replies in_thread there so the picker sits where the session lands.
+      const [, anchorMsgId, replyContent, msgType, inThread] = vi.mocked(replyMessage).mock.calls[0];
+      expect(anchorMsgId).toBe('msg_001');
+      expect(inThread).toBe(true);
       expect(msgType).toBe('interactive');
       const card = JSON.parse(replyContent as string);
       const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
@@ -3239,7 +3303,10 @@ describe('handleCommand', () => {
 
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      const [, replyContent, msgType] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      // Flat DM → quote-reply of the /relay message (top level, no thread).
+      const [, anchorMsgId, replyContent, msgType, inThread] = vi.mocked(replyMessage).mock.calls[0];
+      expect(anchorMsgId).toBe('msg_001');
+      expect(inThread).toBe(false);
       expect(msgType).toBe('interactive');
       const card = JSON.parse(replyContent as string);
       const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
@@ -3260,7 +3327,10 @@ describe('handleCommand', () => {
 
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      const [, replyContent, msgType] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      // 话题群 top-level → card seeds the 话题 on the /relay message itself.
+      const [, anchorMsgId, replyContent, msgType, inThread] = vi.mocked(replyMessage).mock.calls[0];
+      expect(anchorMsgId).toBe('msg_001');
+      expect(inThread).toBe(true);
       expect(msgType).toBe('interactive');
       expect(String(replyContent)).not.toMatch(/话题群不支持|not supported in topic/);
       const card = JSON.parse(replyContent as string);
@@ -3289,7 +3359,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      const reply = vi.mocked(replyMessage).mock.calls[0][2] as string;
       expect(reply).toContain('PR review chat');
       expect(reply).toContain('已经有一个活跃会话');
       // Picker card should NOT have been rendered.
@@ -3319,7 +3389,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      const reply = vi.mocked(replyMessage).mock.calls[0][2] as string;
       expect(reply).toContain('live work');
       expect(reply).toContain('已经有一个活跃会话');
       // Picker MUST NOT have rendered.
@@ -3344,7 +3414,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      const [, replyContent] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      const [, , replyContent] = vi.mocked(replyMessage).mock.calls[0];
       const card = JSON.parse(replyContent as string);
       // No interactive containers — empty picker (otherUser's session filtered out).
       expect(card.body.elements.filter((e: any) => e.tag === 'interactive_container')).toHaveLength(0);
@@ -3371,6 +3441,62 @@ describe('handleCommand', () => {
 
       const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(reply).toContain('@ 至少一个机器人');
+      expect(mockedCreate).not.toHaveBeenCalled();
+    });
+
+    // ── p2p (私聊) solo --create ─────────────────────────────────────────────
+    // DMs have no member roster, so @-ing a bot is impossible there — the
+    // mention gate / leader election / roster resolve are all bypassed and the
+    // bot itself is the sole participant. New group = user + this bot; the DM
+    // session migrates over with no peer coordination.
+    it('p2p --create: solo relay without mentions — group is user + this bot, session migrates', async () => {
+      const ds = makeDaemonSession({
+        session: makeSession({ ownerOpenId: 'ou_sender', chatType: 'p2p' }),
+        chatType: 'p2p',
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create 搬去群里'), deps, LARK_APP_ID);
+
+      // Group created with ONLY this bot; ownership transferred to the sender.
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      const opts = mockedCreate.mock.calls[0][0];
+      expect(opts.larkAppIds).toEqual([LARK_APP_ID]);
+      expect(opts.userOpenIds).toEqual(['ou_sender']);
+      expect(opts.transferOwnerTo).toBe('ou_sender');
+
+      // No roster lookup for a DM — listChatBotMembers fails on p2p chats.
+      expect(mockedListBots).not.toHaveBeenCalled();
+
+      // The DM session was transferred into the new chat (chat-scope group).
+      const wp = await import('../src/core/worker-pool.js');
+      expect(wp.transferSession).toHaveBeenCalledWith('sess-001', 'oc_new_group', 'oc_new_group', 'group', 'chat');
+
+      // M1 lands in the new group and labels the source as 单聊 instead of
+      // leaking the raw DM chatId.
+      expect(mockedSend).toHaveBeenCalled();
+      const [, m1ChatId, m1Text] = mockedSend.mock.calls[0];
+      expect(m1ChatId).toBe('oc_new_group');
+      expect(m1Text).toContain('单聊');
+      expect(m1Text).not.toContain(CHAT_ID);
+
+      // Source-side report carries the new group name.
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('搬去群里');
+      expect(reply).toContain('Claude');
+    });
+
+    it('p2p --create: owner-only check still enforced', async () => {
+      const ds = makeDaemonSession({
+        session: makeSession({ ownerOpenId: 'ou_other_user', chatType: 'p2p' }),
+        chatType: 'p2p',
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create G'), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('发起人');
       expect(mockedCreate).not.toHaveBeenCalled();
     });
 

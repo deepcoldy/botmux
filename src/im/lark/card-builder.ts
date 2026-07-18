@@ -1522,15 +1522,25 @@ export interface RelayPickerState {
 const RELAY_PICKER_PAGE_SIZE = 5;
 const RELAY_SEARCH_FIELD = 'search';
 
+/** Search aliases appended to a p2p entry's haystack so searching by the
+ *  RENDERED location label finds it. A p2p entry's chatLabel carries the raw
+ *  DM chatId (an oc_ opaque id — never shown), while the card renders the
+ *  localized `card.relay.type_p2p` literal instead; without these aliases,
+ *  typing the label the user actually SEES (「单聊」) returned「没有匹配」.
+ *  Covers both locales' literals plus common synonyms so the filter stays
+ *  locale-agnostic. Keep in sync with the `card.relay.type_p2p` i18n values. */
+const RELAY_P2P_SEARCH_ALIASES = '单聊 私聊 p2p dm direct message';
+
 /**
  * Match against title / chatLabel / workingDir / cliId. Case-insensitive
- * substring. Empty / whitespace query matches everything.
+ * substring. Empty / whitespace query matches everything. p2p entries also
+ * match their rendered location label via RELAY_P2P_SEARCH_ALIASES.
  */
 function relayPickerFilter(entries: RelayPickerEntry[], query: string | undefined): RelayPickerEntry[] {
   const q = (query ?? '').trim().toLowerCase();
   if (!q) return entries;
   return entries.filter((e) => {
-    const haystack = [e.title, e.chatLabel, e.workingDir, e.cliId]
+    const haystack = [e.title, e.chatLabel, e.workingDir, e.cliId, e.chatMode === 'p2p' ? RELAY_P2P_SEARCH_ALIASES : undefined]
       .filter(Boolean)
       .join(' ')
       .toLowerCase();
