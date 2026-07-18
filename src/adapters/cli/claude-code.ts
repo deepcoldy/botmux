@@ -1,6 +1,6 @@
-import { existsSync, statSync, openSync, readSync, closeSync, readFileSync, readdirSync, readlinkSync, realpathSync } from 'node:fs';
+import { existsSync, statSync, lstatSync, openSync, readSync, closeSync, readFileSync, readdirSync, readlinkSync, realpathSync, mkdirSync, renameSync, copyFileSync, unlinkSync, rmdirSync, cpSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, sep } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
@@ -48,6 +48,126 @@ export function claudeJsonlPathForSession(sessionId: string, cwd: string, dataDi
 export function claudeProjectDir(cwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string {
   const projectHash = realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
   return join(dataDir, 'projects', projectHash);
+}
+
+/** Rescue an orphaned transcript stranded in another cwd bucket.
+ *
+ *  Claude buckets transcripts by cwd (`<dataDir>/projects/<slug(cwd)>/<sid>.jsonl`)
+ *  and `/cd` does NOT migrate the existing file — it only moves where FUTURE
+ *  turns are written. If the session restarts after a `/cd` with no turn
+ *  written in between, the transcript is stranded in the previous cwd's bucket
+ *  while `claude --resume` (and our pre-flight probe) only look in the current
+ *  one → the whole context is silently dropped.
+ *
+ *  `<sid>.jsonl` is unique per dataDir, so when the current bucket misses we
+ *  scan the sibling buckets and MOVE the hit into the current bucket (move, not
+ *  copy: a stale copy left behind would be resumed verbatim on a later `/cd`
+ *  back, silently losing every turn written since). Multiple hits (a copy
+ *  claude itself left behind after a post-/cd rewrite) → newest mtime wins.
+ *
+ *  Returns the source path on success, undefined when there is nothing to do
+ *  or the rescue failed — callers fall through to their unfixed behaviour. */
+export function rescueOrphanClaudeTranscript(sessionId: string, cwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string | undefined {
+  // Hard gate before doing anything that MOVES files: the sid is interpolated
+  // into filesystem paths, so refuse anything that isn't a plain UUID (all
+  // claude-family session ids are). Non-UUID → fall through to old behaviour.
+  if (!SESSION_UUID_RE.test(sessionId)) return undefined;
+  try {
+    const target = claudeJsonlPathForSession(sessionId, cwd, dataDir);
+    if (existsSync(target)) return undefined;
+    const projectsRoot = join(dataDir, 'projects');
+    const targetDir = dirname(target);
+    let best: { path: string; mtimeMs: number } | undefined;
+    for (const entry of readdirSync(projectsRoot)) {
+      const bucketDir = join(projectsRoot, entry);
+      if (bucketDir === targetDir) continue;
+      const candidate = join(bucketDir, `${sessionId}.jsonl`);
+      let mtimeMs: number;
+      try {
+        // lstat (NOT stat): a symlink named `<sid>.jsonl` planted under projects/
+        // must never be followed — statSync would resolve it and we could move a
+        // file from OUTSIDE this bot's dataDir into the bucket. lstat sees the link
+        // itself → isFile() is false → skipped.
+        const st = lstatSync(candidate);
+        if (!st.isFile()) continue;
+        mtimeMs = st.mtimeMs;
+      } catch { continue; }
+      if (!best || mtimeMs > best.mtimeMs) best = { path: candidate, mtimeMs };
+    }
+    if (!best) return undefined;
+    // Containment backstop against a symlinked ANCESTOR dir (lstat above only
+    // guards the final component): the resolved winner must still live under
+    // this dataDir's projects root. Anything escaping it → refuse to move.
+    const projectsRootReal = realpathSync(projectsRoot);
+    try {
+      if (!realpathSync(best.path).startsWith(projectsRootReal + sep)) return undefined;
+    } catch { return undefined; }
+    const targetDirExisted = existsSync(targetDir);
+    mkdirSync(targetDir, { recursive: true });
+    try {
+      renameSync(best.path, target);
+    } catch {
+      // Cross-device (EXDEV) or source-parent-permission edge: degrade to
+      // copy + unlink — the unlink matters, a stale source left behind would
+      // be resumed verbatim on a later /cd back (the exact bug move prevents).
+      try {
+        copyFileSync(best.path, target);
+      } catch (copyErr) {
+        // Total failure: undo the mkdir so the caller's "provably absent"
+        // probe semantics (absent projectDir → false) are not polluted by an
+        // empty dir we created. rmdirSync refuses non-empty dirs — safe.
+        if (!targetDirExisted) { try { rmdirSync(targetDir); } catch { /* best-effort */ } }
+        // The caller's fallback notify will say "does not exist on disk" —
+        // leave the accurate trace (found but unmovable) where ops can see it.
+        console.error(`[claude-code] found orphan transcript but could not move OR copy it (${(copyErr as Error).message}): ${best.path} → ${target}`);
+        throw copyErr;
+      }
+      try {
+        unlinkSync(best.path);
+      } catch {
+        console.error(`[claude-code] rescued transcript by COPY but could not remove the source — stale fork risk on a later /cd back: ${best.path}`);
+      }
+    }
+    // Migrate the adjacent `<sid>/` sidecar too. Claude stores per-session
+    // artifacts (tool-results etc.) in a sibling directory next to the jsonl;
+    // moving only the transcript would strand them in the old bucket and the
+    // resumed session could no longer resolve references into it. Best-effort
+    // and keyed off the SAME UUID-validated sid, so it cannot touch anything
+    // else. Failure here does NOT fail the rescue — the transcript (the thing
+    // --resume actually reads) is already in place; log and move on.
+    const srcSidecar = join(dirname(best.path), sessionId);
+    const dstSidecar = join(targetDir, sessionId);
+    try {
+      if (lstatSync(srcSidecar).isDirectory() && !existsSync(dstSidecar)) {
+        try {
+          renameSync(srcSidecar, dstSidecar);
+        } catch {
+          // Cross-device / partial: recursive copy then remove source.
+          // cpSync keeps dereference:false so symlinks inside the sidecar are
+          // copied as links, never followed out of the tree.
+          try {
+            cpSync(srcSidecar, dstSidecar, { recursive: true });
+          } catch (cpErr) {
+            // A partial destination would make EVERY future rescue skip this
+            // sidecar (the existsSync(dstSidecar) guard above) → split forever.
+            // Remove the partial copy so a later attempt can retry cleanly; the
+            // source stays intact (we only unlink it after a full copy).
+            try { rmSync(dstSidecar, { recursive: true, force: true }); } catch { /* best-effort */ }
+            throw cpErr;
+          }
+          rmSync(srcSidecar, { recursive: true, force: true });
+        }
+      }
+    } catch (sidecarErr) {
+      if ((sidecarErr as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        console.error(`[claude-code] rescued transcript but could not migrate its sidecar dir (tool results may be unresolved): ${srcSidecar} → ${dstSidecar}: ${(sidecarErr as Error).message}`);
+      }
+    }
+    console.error(`[claude-code] rescued orphan transcript for resume: ${best.path} → ${target}`);
+    return best.path;
+  } catch {
+    return undefined;
+  }
 }
 
 /** botmux ships its built-in skills as a Claude Code plugin here and injects it
@@ -498,10 +618,23 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       try {
         const p = claudeJsonlPathForSession(sid, workingDir, effectiveDataDir);
         if (existsSync(p)) return true;
+        // Snapshot BEFORE the rescue: a failed rescue may leave behind the
+        // project dir it mkdir'd, and the false/undefined split below must
+        // reflect the pre-rescue reality or "provably absent → false" would
+        // silently drift to undefined (spawn tries --resume, burns a tier-2
+        // restart on a guaranteed "No conversation found" exit).
+        const projectDirExisted = existsSync(dirname(p));
+        // Cross-bucket rescue: `/cd` moves the write target without migrating
+        // the existing transcript, so a restart in the post-/cd idle window
+        // probes an empty bucket while the real jsonl sits orphaned in the
+        // previous cwd's bucket. Heal by moving it here (claude --resume only
+        // reads the current cwd's bucket) instead of dropping the context.
+        if (rescueOrphanClaudeTranscript(sid, workingDir, effectiveDataDir)) return true;
         // Also try the project directory (allows partial matches): absent
         // projectDir means no resume target could possibly exist — Claude
         // writes `<sid>.jsonl` there on first submit and never moves it.
-        if (!existsSync(dirname(p))) return false;
+        // (Pre-rescue snapshot — see projectDirExisted above.)
+        if (!projectDirExisted) return false;
         // Project dir exists but this specific sid doesn't. Could be a
         // mid-session rotation the adapter's pid resolver would catch — don't
         // block, let spawn try; the secondary guard still covers it.
