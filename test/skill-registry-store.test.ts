@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { skillRegistryPath } from '../src/core/skills/registry-paths.js';
-import { discoverLocalSkillCandidates, installLocalSkill, installLocalSkillLinks, readSkillRegistry, removeInstalledSkill, removeInstalledSkills } from '../src/services/skill-registry-store.js';
+import { buildSkillInstallAuditSummary, discoverLocalSkillCandidates, installLocalSkill, installLocalSkillLinks, readSkillRegistry, removeInstalledSkill, removeInstalledSkills } from '../src/services/skill-registry-store.js';
 
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
@@ -50,6 +50,29 @@ describe('skill registry store', () => {
     expect(pkg.rootDir).toContain(join('.botmux', 'skills', 'store', 'deploy'));
     expect(readSkillRegistry().skills.deploy.name).toBe('deploy');
     expect(readFileSync(skillRegistryPath(), 'utf-8')).toContain('local-copy');
+  });
+
+  it('builds a static audit summary without following or executing resources', () => {
+    const skillDir = join(src, 'complex');
+    write(join(skillDir, 'SKILL.md'), '---\nname: complex\nversion: 1.2.3\n---\n# Complex');
+    write(join(skillDir, 'bin', 'delivery'), '#!/usr/bin/env bash\nexit 99\n');
+    write(join(skillDir, 'scripts', 'helper.py'), '#!/usr/bin/python3\nraise SystemExit(98)\n');
+    chmodSync(join(skillDir, 'bin', 'delivery'), 0o755);
+    chmodSync(join(skillDir, 'scripts', 'helper.py'), 0o755);
+    symlinkSync('../SKILL.md', join(skillDir, 'references-link'));
+    const pkg = installLocalSkill(skillDir, { link: false });
+
+    expect(buildSkillInstallAuditSummary(pkg)).toMatchObject({
+      name: 'complex',
+      sourceType: 'local-copy',
+      version: '1.2.3',
+      files: 3,
+      directories: 2,
+      symlinks: 1,
+      executables: ['bin/delivery', 'scripts/helper.py'],
+      executablesTruncated: false,
+      runtimes: ['bash', 'python3'],
+    });
   });
 
   it('installs a local link without copying files', () => {

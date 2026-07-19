@@ -92,6 +92,7 @@ import { createCliAdapterSync } from './adapters/cli/registry.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
+  buildSkillInstallAuditSummary,
   installLocalSkillLinks,
   readSkillRegistry,
   removeInstalledSkill,
@@ -1915,9 +1916,30 @@ function startSkillJob(type: SkillJob['type'], run: () => Promise<SkillPackage |
         job.skills = [result];
       }
       job.status = 'succeeded';
+      const audits = (job.skills ?? []).map(skill => {
+        try {
+          return buildSkillInstallAuditSummary(skill);
+        } catch {
+          return {
+            name: skill.name,
+            sourceType: skill.source.type,
+            auditError: 'static_scan_failed',
+          };
+        }
+      });
+      logger.info('[skills:audit] job succeeded', {
+        jobId: job.id,
+        operation: type,
+        skills: audits,
+      });
     } catch (err: any) {
       job.error = redactGitUrlCredentials(err?.message ?? String(err));
       job.status = 'failed';
+      logger.warn('[skills:audit] job failed', {
+        jobId: job.id,
+        operation: type,
+        error: job.error,
+      });
     } finally {
       job.updatedAt = new Date().toISOString();
       trimSkillJobs();

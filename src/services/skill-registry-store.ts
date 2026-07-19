@@ -1,10 +1,11 @@
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
+import { githubGitAuthEnv } from '../core/github-auth.js';
 import { loadSkillPackage } from '../core/skills/package.js';
 import { skillRegistryPath, skillSourcesDir, skillStoreDir } from '../core/skills/registry-paths.js';
 import type { SkillPackage, SkillSource } from '../core/skills/types.js';
@@ -38,6 +39,20 @@ export interface SkillInstallSelection {
   fullDepth?: boolean;
 }
 
+export interface SkillInstallAuditSummary {
+  name: string;
+  sourceType: SkillSource['type'];
+  commit?: string;
+  version?: string;
+  files: number;
+  directories: number;
+  symlinks: number;
+  bytes: number;
+  executables: string[];
+  executablesTruncated: boolean;
+  runtimes: string[];
+}
+
 export interface SkillRegistryFile {
   schemaVersion: 1;
   skills: Record<string, SkillPackage>;
@@ -60,6 +75,76 @@ export function readSkillRegistry(): SkillRegistryFile {
 function writeSkillRegistry(registry: SkillRegistryFile): void {
   mkdirSync(dirname(skillRegistryPath()), { recursive: true });
   atomicWriteFileSync(skillRegistryPath(), JSON.stringify(registry, null, 2) + '\n', { mode: 0o600 });
+}
+
+function shebangRuntime(path: string): string | undefined {
+  const buffer = Buffer.alloc(256);
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    const length = readSync(fd, buffer, 0, buffer.length, 0);
+    const line = buffer.subarray(0, length).toString('utf8').split(/\r?\n/, 1)[0];
+    const match = /^#!\s*(\S+)(?:\s+(\S+))?/.exec(line);
+    if (!match) return undefined;
+    const command = basename(match[1]);
+    return command === 'env' && match[2] ? basename(match[2]) : command;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** Static, non-executing install audit. Paths are relative to the Skill root;
+ * source URLs and absolute host paths are deliberately excluded from logs. */
+export function buildSkillInstallAuditSummary(pkg: SkillPackage): SkillInstallAuditSummary {
+  let files = 0;
+  let directories = 0;
+  let symlinks = 0;
+  let bytes = 0;
+  const executablePaths: string[] = [];
+  const runtimes = new Set<string>();
+  const pending = [''];
+  while (pending.length > 0) {
+    const relDir = pending.pop()!;
+    const absDir = relDir ? join(pkg.rootDir, relDir) : pkg.rootDir;
+    for (const entry of readdirSync(absDir, { withFileTypes: true })) {
+      const rel = (relDir ? join(relDir, entry.name) : entry.name).replace(/\\/g, '/');
+      const abs = join(pkg.rootDir, rel);
+      if (entry.isSymbolicLink()) {
+        symlinks++;
+        continue;
+      }
+      if (entry.isDirectory()) {
+        directories++;
+        pending.push(rel);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      files++;
+      const stat = lstatSync(abs);
+      bytes += stat.size;
+      if ((stat.mode & 0o111) !== 0) {
+        executablePaths.push(rel);
+        runtimes.add(shebangRuntime(abs) ?? 'native');
+      }
+    }
+  }
+  executablePaths.sort();
+  const commit = pkg.source.type === 'git' || pkg.source.type === 'github' ? pkg.source.commit : undefined;
+  return {
+    name: pkg.name,
+    sourceType: pkg.source.type,
+    ...(commit ? { commit } : {}),
+    ...(pkg.version ? { version: pkg.version } : {}),
+    files,
+    directories,
+    symlinks,
+    bytes,
+    executables: executablePaths.slice(0, 32),
+    executablesTruncated: executablePaths.length > 32,
+    runtimes: [...runtimes].sort(),
+  };
 }
 
 export function installLocalSkill(dir: string, opts: { link: boolean }): SkillPackage {
@@ -329,39 +414,96 @@ function formatGitFailure(args: string[], err: any): Error {
 // transport ever reached this layer, git itself refuses anything outside the
 // allowlist. GIT_TERMINAL_PROMPT=0 also keeps a private repo from hanging on an
 // interactive credential prompt instead of failing fast.
-function gitEnv(): NodeJS.ProcessEnv {
+function isGithubHttpsUrl(raw: string | undefined): boolean {
+  if (!raw) return false;
+  try {
+    const url = new URL(raw);
+    return url.protocol === 'https:' && (url.hostname === 'github.com' || url.hostname === 'www.github.com');
+  } catch {
+    return false;
+  }
+}
+
+function githubSshUrl(raw: string): string | null {
+  if (!isGithubHttpsUrl(raw)) return null;
+  try {
+    const url = new URL(raw);
+    const path = url.pathname.replace(/^\/+/, '');
+    return path ? `git@github.com:${path}` : null;
+  } catch {
+    return null;
+  }
+}
+
+function isGitAuthenticationFailure(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /authentication failed|could not read username|terminal prompts disabled|repository not found|unauthor|\b401\b|\b403\b/i.test(message);
+}
+
+function gitEnv(url?: string): NodeJS.ProcessEnv {
   return {
     ...process.env,
     GIT_ALLOW_PROTOCOL: 'https:http:ssh:git:file',
     GIT_TERMINAL_PROMPT: '0',
+    ...(isGithubHttpsUrl(url) ? githubGitAuthEnv() : {}),
   };
 }
 
-function git(args: string[], cwd?: string): string {
+function git(args: string[], cwd?: string, authUrl?: string): string {
   try {
     return execFileSync('git', args, {
       cwd,
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: gitTimeoutMs(),
-      env: gitEnv(),
+      env: gitEnv(authUrl),
     }).trim();
   } catch (err: any) {
     throw formatGitFailure(args, err);
   }
 }
 
-async function gitAsync(args: string[], cwd?: string): Promise<string> {
+async function gitAsync(args: string[], cwd?: string, authUrl?: string): Promise<string> {
   try {
     const result = await execFileAsync('git', args, {
       cwd,
       encoding: 'utf-8',
       timeout: gitTimeoutMs(),
-      env: gitEnv(),
+      env: gitEnv(authUrl),
     });
     return String(result.stdout ?? '').trim();
   } catch (err: any) {
     throw formatGitFailure(args, err);
+  }
+}
+
+function cloneGitSource(url: string, dir: string): void {
+  try {
+    git(['clone', '--', url, dir], skillSourcesDir(), url);
+  } catch (httpsError) {
+    const sshUrl = githubSshUrl(url);
+    if (!sshUrl || !isGitAuthenticationFailure(httpsError)) throw httpsError;
+    rmSync(dir, { recursive: true, force: true });
+    try {
+      git(['clone', '--', sshUrl, dir], skillSourcesDir());
+    } catch (sshError) {
+      throw new Error(`${httpsError instanceof Error ? httpsError.message : String(httpsError)}; ssh fallback failed: ${sshError instanceof Error ? sshError.message : String(sshError)}`);
+    }
+  }
+}
+
+async function cloneGitSourceAsync(url: string, dir: string): Promise<void> {
+  try {
+    await gitAsync(['clone', '--', url, dir], skillSourcesDir(), url);
+  } catch (httpsError) {
+    const sshUrl = githubSshUrl(url);
+    if (!sshUrl || !isGitAuthenticationFailure(httpsError)) throw httpsError;
+    rmSync(dir, { recursive: true, force: true });
+    try {
+      await gitAsync(['clone', '--', sshUrl, dir], skillSourcesDir());
+    } catch (sshError) {
+      throw new Error(`${httpsError instanceof Error ? httpsError.message : String(httpsError)}; ssh fallback failed: ${sshError instanceof Error ? sshError.message : String(sshError)}`);
+    }
   }
 }
 
@@ -371,9 +513,11 @@ function ensureGitSource(url: string): string {
   const dir = join(skillSourcesDir(), sourceId(url));
   mkdirSync(skillSourcesDir(), { recursive: true });
   if (existsSync(join(dir, '.git'))) {
-    git(['fetch', '--tags', '--prune'], dir);
+    git(['fetch', '--tags', '--prune'], dir, url);
   } else {
-    git(['clone', '--', url, dir]);
+    // Never inherit the daemon's cwd for clone: a daemon can outlive the
+    // checkout it was launched from, leaving process.cwd() deleted.
+    cloneGitSource(url, dir);
   }
   return dir;
 }
@@ -383,7 +527,7 @@ function checkoutGitSource(url: string, refValue: string | undefined): { sourceD
   const sourceDir = ensureGitSource(url);
   const ref = refValue ?? 'HEAD';
   if (ref === 'HEAD') {
-    git(['fetch', 'origin', 'HEAD'], sourceDir);
+    git(['fetch', 'origin', 'HEAD'], sourceDir, url);
     git(['checkout', 'FETCH_HEAD'], sourceDir);
   } else {
     git(['checkout', ref], sourceDir);
@@ -397,9 +541,11 @@ async function ensureGitSourceAsync(url: string): Promise<string> {
   const dir = join(skillSourcesDir(), sourceId(url));
   mkdirSync(skillSourcesDir(), { recursive: true });
   if (existsSync(join(dir, '.git'))) {
-    await gitAsync(['fetch', '--tags', '--prune'], dir);
+    await gitAsync(['fetch', '--tags', '--prune'], dir, url);
   } else {
-    await gitAsync(['clone', '--', url, dir]);
+    // See the synchronous path above: dashboard jobs must also be independent
+    // from a stale/deleted daemon launch directory.
+    await cloneGitSourceAsync(url, dir);
   }
   return dir;
 }
@@ -409,12 +555,81 @@ async function checkoutGitSourceAsync(url: string, refValue: string | undefined)
   const sourceDir = await ensureGitSourceAsync(url);
   const ref = refValue ?? 'HEAD';
   if (ref === 'HEAD') {
-    await gitAsync(['fetch', 'origin', 'HEAD'], sourceDir);
+    await gitAsync(['fetch', 'origin', 'HEAD'], sourceDir, url);
     await gitAsync(['checkout', 'FETCH_HEAD'], sourceDir);
   } else {
     await gitAsync(['checkout', ref], sourceDir);
   }
   return { sourceDir, ref, commit: await gitAsync(['rev-parse', 'HEAD'], sourceDir) };
+}
+
+function discoverCheckedOutGitSource(
+  sourceDir: string,
+  commit: string,
+  opts: { path?: string; fullDepth?: boolean },
+): SkillSourceDiscovery {
+  if (opts.path) {
+    const candidate = candidateFromDir(sourceDir, gitSkillDir(sourceDir, opts.path));
+    return { commit, skills: candidate ? [candidate] : [] };
+  }
+  return {
+    commit,
+    skills: discoverLocalSkillCandidates(sourceDir, { fullDepth: opts.fullDepth }).skills,
+  };
+}
+
+function checkoutTemporaryGitSource(url: string, refValue: string | undefined): { sourceDir: string; commit: string; cleanup: () => void } {
+  assertNoGitUrlCredentials(url);
+  assertAllowedGitProtocol(url);
+  assertSafeGitRef(refValue);
+  mkdirSync(skillSourcesDir(), { recursive: true });
+  const staging = mkdtempSync(join(skillSourcesDir(), '.discover-'));
+  const sourceDir = join(staging, 'repo');
+  try {
+    cloneGitSource(url, sourceDir);
+    const ref = refValue ?? 'HEAD';
+    if (ref === 'HEAD') {
+      git(['fetch', 'origin', 'HEAD'], sourceDir, url);
+      git(['checkout', 'FETCH_HEAD'], sourceDir);
+    } else {
+      git(['checkout', ref], sourceDir);
+    }
+    return {
+      sourceDir,
+      commit: git(['rev-parse', 'HEAD'], sourceDir),
+      cleanup: () => rmSync(staging, { recursive: true, force: true }),
+    };
+  } catch (error) {
+    rmSync(staging, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function checkoutTemporaryGitSourceAsync(url: string, refValue: string | undefined): Promise<{ sourceDir: string; commit: string; cleanup: () => void }> {
+  assertNoGitUrlCredentials(url);
+  assertAllowedGitProtocol(url);
+  assertSafeGitRef(refValue);
+  mkdirSync(skillSourcesDir(), { recursive: true });
+  const staging = mkdtempSync(join(skillSourcesDir(), '.discover-'));
+  const sourceDir = join(staging, 'repo');
+  try {
+    await cloneGitSourceAsync(url, sourceDir);
+    const ref = refValue ?? 'HEAD';
+    if (ref === 'HEAD') {
+      await gitAsync(['fetch', 'origin', 'HEAD'], sourceDir, url);
+      await gitAsync(['checkout', 'FETCH_HEAD'], sourceDir);
+    } else {
+      await gitAsync(['checkout', ref], sourceDir);
+    }
+    return {
+      sourceDir,
+      commit: await gitAsync(['rev-parse', 'HEAD'], sourceDir),
+      cleanup: () => rmSync(staging, { recursive: true, force: true }),
+    };
+  } catch (error) {
+    rmSync(staging, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 export function discoverGitSkillCandidates(opts: {
@@ -423,17 +638,12 @@ export function discoverGitSkillCandidates(opts: {
   path?: string;
   fullDepth?: boolean;
 }): SkillSourceDiscovery {
-  return withGitSourceLockSync(opts.url, () => {
-    const { sourceDir, commit } = checkoutGitSource(opts.url, opts.ref);
-    if (opts.path) {
-      const candidate = candidateFromDir(sourceDir, gitSkillDir(sourceDir, opts.path));
-      return { commit, skills: candidate ? [candidate] : [] };
-    }
-    return {
-      commit,
-      skills: discoverLocalSkillCandidates(sourceDir, { fullDepth: opts.fullDepth }).skills,
-    };
-  });
+  const checkout = checkoutTemporaryGitSource(opts.url, opts.ref);
+  try {
+    return discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, opts);
+  } finally {
+    checkout.cleanup();
+  }
 }
 
 export async function discoverGitSkillCandidatesAsync(opts: {
@@ -442,17 +652,12 @@ export async function discoverGitSkillCandidatesAsync(opts: {
   path?: string;
   fullDepth?: boolean;
 }): Promise<SkillSourceDiscovery> {
-  return withGitSourceLock(opts.url, async () => {
-    const { sourceDir, commit } = await checkoutGitSourceAsync(opts.url, opts.ref);
-    if (opts.path) {
-      const candidate = candidateFromDir(sourceDir, gitSkillDir(sourceDir, opts.path));
-      return { commit, skills: candidate ? [candidate] : [] };
-    }
-    return {
-      commit,
-      skills: discoverLocalSkillCandidates(sourceDir, { fullDepth: opts.fullDepth }).skills,
-    };
-  });
+  const checkout = await checkoutTemporaryGitSourceAsync(opts.url, opts.ref);
+  try {
+    return discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, opts);
+  } finally {
+    checkout.cleanup();
+  }
 }
 
 export function installGitSkill(opts: {
@@ -537,14 +742,17 @@ export function installGitSkillsFromSource(opts: {
   ref?: string;
   sourceOverride?: SkillSource;
 } & SkillInstallSelection): SkillPackage[] {
-  const discovery = discoverGitSkillCandidates({ url: opts.url, ref: opts.ref, fullDepth: opts.fullDepth });
-  const selected = selectDiscoveredSkills(discovery.skills, opts);
-  return selected.map(candidate => installGitSkill({
-    url: opts.url,
-    path: candidate.path,
-    ref: opts.ref,
-    sourceOverride: sourceOverrideForCandidate(opts.sourceOverride, candidate),
-  }));
+  return withGitSourceLockSync(opts.url, () => {
+    const checkout = checkoutGitSource(opts.url, opts.ref);
+    const discovery = discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, { fullDepth: opts.fullDepth });
+    const selected = selectDiscoveredSkills(discovery.skills, opts);
+    return selected.map(candidate => installGitSkillLocked({
+      url: opts.url,
+      path: candidate.path,
+      ref: opts.ref,
+      sourceOverride: sourceOverrideForCandidate(opts.sourceOverride, candidate),
+    }));
+  });
 }
 
 export async function installGitSkillsFromSourceAsync(opts: {
@@ -552,18 +760,21 @@ export async function installGitSkillsFromSourceAsync(opts: {
   ref?: string;
   sourceOverride?: SkillSource;
 } & SkillInstallSelection): Promise<SkillPackage[]> {
-  const discovery = await discoverGitSkillCandidatesAsync({ url: opts.url, ref: opts.ref, fullDepth: opts.fullDepth });
-  const selected = selectDiscoveredSkills(discovery.skills, opts);
-  const installed: SkillPackage[] = [];
-  for (const candidate of selected) {
-    installed.push(await installGitSkillAsync({
-      url: opts.url,
-      path: candidate.path,
-      ref: opts.ref,
-      sourceOverride: sourceOverrideForCandidate(opts.sourceOverride, candidate),
-    }));
-  }
-  return installed;
+  return withGitSourceLock(opts.url, async () => {
+    const checkout = await checkoutGitSourceAsync(opts.url, opts.ref);
+    const discovery = discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, { fullDepth: opts.fullDepth });
+    const selected = selectDiscoveredSkills(discovery.skills, opts);
+    const installed: SkillPackage[] = [];
+    for (const candidate of selected) {
+      installed.push(await installGitSkillAsyncLocked({
+        url: opts.url,
+        path: candidate.path,
+        ref: opts.ref,
+        sourceOverride: sourceOverrideForCandidate(opts.sourceOverride, candidate),
+      }));
+    }
+    return installed;
+  });
 }
 
 // --- agentbuddy (external CLI) skill source ---------------------------------

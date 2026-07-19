@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -61,6 +61,52 @@ describe('git skill install', () => {
     });
   });
 
+  it('clones successfully when the daemon launch directory was deleted', () => {
+    const originalCwd = process.cwd();
+    const staleCwd = mkdtempSync(join(tmpdir(), 'botmux-stale-cwd-'));
+    process.chdir(staleCwd);
+    rmSync(staleCwd, { recursive: true, force: true });
+
+    try {
+      const pkg = installGitSkill({ url: repo, path: 'skills/deploy', ref: 'HEAD' });
+      expect(pkg.name).toBe('deploy');
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+
+  it('falls back to SSH when a GitHub HTTPS clone needs authentication', () => {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const binDir = join(home, 'bin');
+    const fakeGit = join(binDir, 'git');
+    write(fakeGit, `#!/bin/sh
+if [ "$1" = "clone" ] && [ "$3" = "https://github.com/acme/private.git" ]; then
+  echo "fatal: could not read Username for 'https://github.com': terminal prompts disabled" >&2
+  exit 128
+fi
+if [ "$1" = "clone" ] && [ "$3" = "git@github.com:acme/private.git" ]; then
+  exec "$BOTMUX_TEST_REAL_GIT" clone -- "$BOTMUX_TEST_PRIVATE_REPO" "$4"
+fi
+exec "$BOTMUX_TEST_REAL_GIT" "$@"
+`);
+    chmodSync(fakeGit, 0o755);
+    vi.stubEnv('BOTMUX_TEST_REAL_GIT', realGit);
+    vi.stubEnv('BOTMUX_TEST_PRIVATE_REPO', repo);
+    vi.stubEnv('PATH', `${binDir}:${process.env.PATH}`);
+
+    const pkg = installGitSkill({
+      url: 'https://github.com/acme/private.git',
+      path: 'skills/deploy',
+      ref: 'HEAD',
+    });
+
+    expect(pkg.name).toBe('deploy');
+    expect(pkg.source).toMatchObject({
+      type: 'git',
+      url: 'https://github.com/acme/private.git',
+    });
+  });
+
   it('discovers skills from a git repository root', () => {
     write(join(repo, 'skills', 'review', 'SKILL.md'), '---\nname: review\ndescription: Review code\n---\n# Review');
     run('git', ['add', '.'], repo);
@@ -74,6 +120,16 @@ describe('git skill install', () => {
       ['review', 'skills/review'],
     ]);
     expect(discovered.skills.find(skill => skill.name === 'review')?.description).toBe('Review code');
+    expect(readdirSync(join(home, '.botmux', 'skills', 'sources'))).toEqual([]);
+  });
+
+  it('removes the throwaway checkout after async dashboard discovery', async () => {
+    const { discoverGitSkillCandidatesAsync } = await import('../src/services/skill-registry-store.js');
+
+    const discovered = await discoverGitSkillCandidatesAsync({ url: repo, ref: 'HEAD' });
+
+    expect(discovered.skills.map(skill => skill.name)).toEqual(['deploy']);
+    expect(readdirSync(join(home, '.botmux', 'skills', 'sources'))).toEqual([]);
   });
 
   it('installs the only discovered skill from a repository root', async () => {
