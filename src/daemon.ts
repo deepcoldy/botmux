@@ -249,7 +249,13 @@ import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocComment
 import { renderBufferedSenderBlock } from './core/session-manager.js';
 import { shutdownBackendDisposition } from './core/persistent-backend.js';
 import { evaluateVcMeetingConsumerIsolation } from './services/vc-meeting-consumer-isolation.js';
-import { markSessionActivity, announcePendingRepoSession, publishAttentionPatch, clearAgentAttention } from './core/session-activity.js';
+import {
+  markSessionActivity,
+  announcePendingRepoSession,
+  publishAttentionPatch,
+  publishLastInputFromBotPatch,
+  clearAgentAttention,
+} from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import {
@@ -15267,6 +15273,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     ds.session.quoteTargetId = parsed.messageId;
     ds.session.quoteTargetSenderOpenId = callerOpenId;
     ds.session.quoteTargetSenderIsBot = isForeignBot;
+    publishLastInputFromBotPatch(ds);
     if (ds.session.vcMeetingReceiver) {
       ds.vcMeetingImTurnOrigin = ctx.vcMeetingImTurnOrigin;
       if (ctx.vcMeetingImTurnOrigin) {

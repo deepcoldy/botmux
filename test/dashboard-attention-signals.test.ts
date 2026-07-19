@@ -9,7 +9,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'fs';
 import { composeRowFromActive } from '../src/core/dashboard-rows.js';
-import { announcePendingRepoSession, announceSessionRow, clearAgentAttention, publishAttentionPatch } from '../src/core/session-activity.js';
+import {
+  announcePendingRepoSession,
+  announceSessionRow,
+  clearAgentAttention,
+  publishAttentionPatch,
+  publishLastInputFromBotPatch,
+} from '../src/core/session-activity.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { attentionWaitSince } from '../src/dashboard/web/ui.js';
 import {
@@ -103,6 +109,36 @@ describe('attention signals', () => {
 
     // legacy sessions persisted before the scope field existed
     expect(composeRowFromActive(makeDs()).scope).toBeUndefined();
+  });
+
+  it('composeRowFromActive exposes the latest Bot-authored inbound turn as an inferred signal', () => {
+    const botTriggered = makeDs();
+    botTriggered.session.quoteTargetSenderIsBot = true;
+    expect(composeRowFromActive(botTriggered).lastInputFromBot).toBe(true);
+
+    const humanTriggered = makeDs();
+    humanTriggered.session.quoteTargetSenderIsBot = false;
+    expect(composeRowFromActive(humanTriggered).lastInputFromBot).toBe(false);
+  });
+
+  it('publishLastInputFromBotPatch updates the inferred sender signal in real time', () => {
+    const seen = collectEvents();
+    const ds = makeDs();
+    ds.session.quoteTargetSenderIsBot = true;
+    publishLastInputFromBotPatch(ds);
+    ds.session.quoteTargetSenderIsBot = false;
+    publishLastInputFromBotPatch(ds);
+
+    expect(seen).toEqual([
+      {
+        type: 'session.update',
+        body: { sessionId: 'sess-1', patch: { lastInputFromBot: true } },
+      },
+      {
+        type: 'session.update',
+        body: { sessionId: 'sess-1', patch: { lastInputFromBot: false } },
+      },
+    ]);
   });
 
   it('publishAttentionPatch emits session.update derived from session state', () => {

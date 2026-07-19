@@ -30,6 +30,11 @@ export interface SessionRow {
   chatDisplayName?: string;
   rootMessageId: string;
   threadId?: string;
+  /** Whether the most recent inbound turn was authored by another Bot.
+   *  This is deliberately latest-turn provenance, not durable collaboration
+   *  ancestry: the persisted quote target is overwritten on every inbound
+   *  message. Dashboard labels derived from it must therefore say inferred. */
+  lastInputFromBot?: boolean;
   /** Conversation unit ('thread' = topic-anchored, 'chat' = plain chat scope).
    *  Drives the board's locate button: chat-scope sessions have no topic to
    *  locate, so the dashboard offers "open chat" (feishuChatLink) instead.
@@ -145,6 +150,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     chatType: ds.chatType,
     chatDisplayName: directChatDisplayName(ds.session, ds.larkAppId),
     rootMessageId: ds.session.rootMessageId,
+    lastInputFromBot: ds.session.quoteTargetSenderIsBot === true,
     scope: ds.session.scope,
     title: ds.session.title,
     kanbanColumn: ds.session.kanbanColumn,
@@ -190,6 +196,7 @@ export function composeRowFromClosed(s: Session): SessionRow {
     chatType: s.chatType,
     chatDisplayName: directChatDisplayName(s, s.larkAppId),
     rootMessageId: s.rootMessageId,
+    lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
     title: s.title,
     kanbanColumn: s.kanbanColumn,

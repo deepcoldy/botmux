@@ -106,6 +106,115 @@ export function sessionSearchText(s: any): string {
   return `${JSON.stringify(s)} ${sessionLocationText(s)} ${sessionLocationTitle(s)}`.toLowerCase();
 }
 
+export type SessionTopicKind = 'thread' | 'chat' | 'session';
+
+/** Location-level grouping used by the Dashboard topic view.
+ *
+ * This is intentionally not called a collaboration graph. A thread anchor
+ * proves that sessions live in the same Lark topic, while chat-scope sessions
+ * can only be grouped at whole-chat granularity. Neither relation proves which
+ * session woke another one.
+ */
+export interface SessionTopicGroup<T = any> {
+  key: string;
+  kind: SessionTopicKind;
+  chatId: string;
+  rootMessageId?: string;
+  title: string;
+  rows: T[];
+  botCount: number;
+  activeCount: number;
+  closedCount: number;
+  inferredBotInputCount: number;
+  latestActivityAt: number;
+  multiBot: boolean;
+  inferredBotTriggered: boolean;
+}
+
+function nonEmptyString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function sessionTopicKind(s: any): SessionTopicKind {
+  const chatId = nonEmptyString(s?.chatId);
+  const rootMessageId = nonEmptyString(s?.rootMessageId);
+  if (s?.scope === 'chat') return chatId ? 'chat' : 'session';
+  return chatId && rootMessageId ? 'thread' : 'session';
+}
+
+/** Stable location key for the current schema. Keep it separate from any
+ * future `collaborationId`: location and logical task identity are different
+ * dimensions and must not silently alias each other. */
+export function sessionTopicKey(s: any): string {
+  const chatId = nonEmptyString(s?.chatId);
+  const rootMessageId = nonEmptyString(s?.rootMessageId);
+  const kind = sessionTopicKind(s);
+  if (kind === 'thread') {
+    return `thread:${encodeURIComponent(chatId)}:${encodeURIComponent(rootMessageId)}`;
+  }
+  if (kind === 'chat') return `chat:${encodeURIComponent(chatId)}`;
+  return `session:${encodeURIComponent(nonEmptyString(s?.sessionId) || 'unknown')}`;
+}
+
+function topicTitle(rows: any[], fallback: string): string {
+  const ordered = [...rows].sort((a, b) => Number(a?.spawnedAt ?? 0) - Number(b?.spawnedAt ?? 0));
+  for (const row of ordered) {
+    const title = nonEmptyString(row?.title);
+    if (title) return title;
+  }
+  return fallback;
+}
+
+/** Group arbitrary Dashboard rows by their best available Lark conversation
+ * anchor. Groups and members are sorted by recent activity for deterministic
+ * rendering. */
+export function groupSessionsByTopic<T extends Record<string, any>>(rows: readonly T[]): SessionTopicGroup<T>[] {
+  const grouped = new Map<string, T[]>();
+  for (const row of rows) {
+    const key = sessionTopicKey(row);
+    const bucket = grouped.get(key);
+    if (bucket) bucket.push(row);
+    else grouped.set(key, [row]);
+  }
+
+  const result: SessionTopicGroup<T>[] = [];
+  for (const [key, members] of grouped) {
+    const sorted = [...members].sort((a, b) => Number(b.lastMessageAt ?? 0) - Number(a.lastMessageAt ?? 0));
+    const first = sorted[0] ?? ({} as T);
+    const kind = sessionTopicKind(first);
+    const chatId = nonEmptyString(first.chatId);
+    const rootMessageId = kind === 'thread' ? nonEmptyString(first.rootMessageId) : '';
+    const botIds = new Set(sorted
+      .map(row => nonEmptyString(row.larkAppId) || nonEmptyString(row.botName))
+      .filter(Boolean));
+    // Missing identity must not turn two sessions into a false multi-Bot
+    // signal. Count the group as one unknown Bot, but only claim multi-Bot
+    // collaboration when at least two distinct identities are present.
+    const botCount = Math.max(1, botIds.size);
+    const activeCount = sorted.filter(row => row.status !== 'closed').length;
+    const inferredBotInputCount = sorted.filter(row => row.lastInputFromBot === true).length;
+    const latestActivityAt = sorted.reduce((max, row) => Math.max(max, Number(row.lastMessageAt ?? 0)), 0);
+    const fallback = rootMessageId || chatId || nonEmptyString(first.sessionId) || key;
+    result.push({
+      key,
+      kind,
+      chatId,
+      ...(rootMessageId ? { rootMessageId } : {}),
+      title: topicTitle(sorted, fallback),
+      rows: sorted,
+      botCount,
+      activeCount,
+      closedCount: sorted.length - activeCount,
+      inferredBotInputCount,
+      latestActivityAt,
+      multiBot: botIds.size > 1,
+      inferredBotTriggered: inferredBotInputCount > 0,
+    });
+  }
+
+  return result.sort((a, b) => b.latestActivityAt - a.latestActivityAt || a.key.localeCompare(b.key));
+}
+
 export const terminalHref = sessionTerminalHref;
 
 export function shouldOpenWritableTerminal(state: { authed: boolean; publicReadOnly: boolean } = ui): boolean {

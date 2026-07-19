@@ -47,6 +47,7 @@ import {
   deriveSessionBoardColumn,
   fetchPickerBots,
   formatTokenCount,
+  groupSessionsByTopic,
   historySenderKey,
   isUnknownChatSession,
   lockActionLabel,
@@ -57,12 +58,14 @@ import {
   sessionLocationTitle,
   sessionRuntimeCounts,
   sessionSearchText,
+  sessionTopicKey,
   sessionStatusText,
   shouldOpenWritableTerminal,
   terminalHref,
   tokenCount,
   type BoardColumnId,
   type PickerBot,
+  type SessionTopicGroup,
 } from './sessions.js';
 import { addMonitorRoomSessionIds, monitorRoomUrl } from './monitor-room-store.js';
 import { CreateActionButton, DropdownMenu, LoadingState } from './dashboard-components.js';
@@ -71,6 +74,7 @@ import {
   attentionWaitSince,
   botAvatarHtml,
   botDisplayName,
+  chatAvatarHtml,
   chatDisplayTitle,
   loadNameMaps,
   relTime,
@@ -93,6 +97,8 @@ type FiltersState = {
   status: string;
   adopt: string;
   chat: string;
+  multiBotTopics: boolean;
+  botTriggeredTopics: boolean;
   showUnknownChats: boolean;
   active: boolean;
   cli: Set<string>;
@@ -513,6 +519,32 @@ function SessionsFilters(props: {
       <label className="filter-toggle">
         <input
           type="checkbox"
+          name="multiBotTopics"
+          checked={props.filters.multiBotTopics}
+          onChange={event => {
+            const multiBotTopics = event.currentTarget.checked;
+            props.setFilters(prev => ({ ...prev, multiBotTopics }));
+          }}
+        />
+        <span className="filter-toggle-label">{t('sessions.multiBotTopics')}</span>
+        <span className="filter-toggle-switch" aria-hidden="true" />
+      </label>
+      <label className="filter-toggle">
+        <input
+          type="checkbox"
+          name="botTriggeredTopics"
+          checked={props.filters.botTriggeredTopics}
+          onChange={event => {
+            const botTriggeredTopics = event.currentTarget.checked;
+            props.setFilters(prev => ({ ...prev, botTriggeredTopics }));
+          }}
+        />
+        <span className="filter-toggle-label">{t('sessions.botTriggeredTopics')}</span>
+        <span className="filter-toggle-switch" aria-hidden="true" />
+      </label>
+      <label className="filter-toggle">
+        <input
+          type="checkbox"
           name="showUnknownChats"
           checked={props.filters.showUnknownChats}
           onChange={event => {
@@ -896,14 +928,18 @@ function BoardCard(props: {
           <IconActionButton action="restart" icon={ICON.restart} label={t('sessions.restart')} onClick={button => props.onRestart(row, button)} />
         ) : null}
         <TerminalControls row={row} url={term} />
-        <IconActionButton
-          action="lock"
-          icon={row.locked ? ICON.unlock : ICON.lock}
-          label={lockActionLabel(row)}
-          kind={row.locked ? 'locked' : ''}
-          onClick={button => props.onLock(row, !row.locked, button)}
-        />
-        <IconActionButton action="close" icon={ICON.close} label={t('sessions.close')} kind="danger" onClick={button => props.onClose(row, button)} />
+        {row.status !== 'closed' ? (
+          <>
+            <IconActionButton
+              action="lock"
+              icon={row.locked ? ICON.unlock : ICON.lock}
+              label={lockActionLabel(row)}
+              kind={row.locked ? 'locked' : ''}
+              onClick={button => props.onLock(row, !row.locked, button)}
+            />
+            <IconActionButton action="close" icon={ICON.close} label={t('sessions.close')} kind="danger" onClick={button => props.onClose(row, button)} />
+          </>
+        ) : null}
       </div>
     </article>
   );
@@ -1024,6 +1060,104 @@ function BoardView(props: {
           </section>
         );
       })}
+    </div>
+  );
+}
+
+type TopicGroupsViewProps = {
+  rows: SessionRow[];
+  relationRows?: SessionRow[];
+  selected: Set<string>;
+  hidden: boolean;
+  onToggleSelect: (row: SessionRow) => void;
+  onOpen: (row: SessionRow) => void;
+  onHistory: (row: SessionRow) => void;
+  onLocate: (row: SessionRow) => Promise<boolean>;
+  onRestart: (row: SessionRow, button?: HTMLButtonElement) => void;
+  onLock: (row: SessionRow, locked: boolean, button?: HTMLButtonElement) => void;
+  onClose: (row: SessionRow, button?: HTMLButtonElement) => void;
+};
+
+function topicGroupTitle(group: SessionTopicGroup<SessionRow>): string {
+  const title = stripMentionPrefix(group.title).trim();
+  if (title) return title;
+  if (group.kind === 'thread') return t('sessions.topic.untitled');
+  return group.kind === 'chat' ? t('sessions.topic.wholeChat') : t('sessions.topic.singleSession');
+}
+
+export function TopicGroupsView(props: TopicGroupsViewProps): JSX.Element {
+  const groups = useMemo(() => groupSessionsByTopic(props.rows), [props.rows]);
+  const relationGroups = useMemo(
+    () => new Map(groupSessionsByTopic(props.relationRows ?? props.rows).map(group => [group.key, group])),
+    [props.relationRows, props.rows],
+  );
+  return (
+    <div id="sessions-topics" className="sessions-topic-view" hidden={props.hidden}>
+      {groups.length ? groups.map(group => {
+        // Member cards respect the current session filters. Header metadata is
+        // derived from the complete store so a hidden closed sibling does not
+        // erase the topic's multi-Bot relationship.
+        const relation = relationGroups.get(group.key) ?? group;
+        const representative = group.rows[0];
+        const location = sessionLocationText(representative);
+        const title = topicGroupTitle(relation);
+        const anchor = relation.rootMessageId || relation.chatId;
+        return (
+          <section
+            key={group.key}
+            className={`session-topic-group${relation.multiBot ? ' multi-bot' : ''}${relation.inferredBotTriggered ? ' inferred-bot-trigger' : ''}`}
+            data-topic-key={group.key}
+          >
+            <header>
+              <span
+                className="session-topic-avatar"
+                dangerouslySetInnerHTML={rawHtml(chatAvatarHtml({ chatId: group.chatId, name: location, size: 'sm' }))}
+              />
+              <div className="session-topic-heading">
+                <span className="session-topic-location">{location}</span>
+                <h2 title={relation.title}>{title}</h2>
+                <code title={anchor}>{relation.kind === 'thread'
+                  ? anchor
+                  : relation.kind === 'chat'
+                    ? t('sessions.topic.wholeChat')
+                    : t('sessions.topic.singleSession')}</code>
+              </div>
+              <div className="session-topic-summary" aria-label={t('sessions.topic.summary')}>
+                {relation.multiBot ? <span className="topic-chip collaboration">{t('sessions.topic.collaboration')}</span> : null}
+                <span className="topic-chip">{t('sessions.topic.sessions', { count: relation.rows.length })}</span>
+                <span className="topic-chip">{t('sessions.topic.bots', { count: relation.botCount })}</span>
+                <span className="topic-chip active">{t('sessions.topic.active', { count: relation.activeCount })}</span>
+                {relation.closedCount ? <span className="topic-chip">{t('sessions.topic.closed', { count: relation.closedCount })}</span> : null}
+                {relation.inferredBotInputCount ? (
+                  <span className="topic-chip inferred" title={t('sessions.topic.inferredHint')}>
+                    {t('sessions.topic.botInputs', { count: relation.inferredBotInputCount })}
+                  </span>
+                ) : null}
+                <span className="session-topic-updated">{t('sessions.last')}: {relTime(relation.latestActivityAt)}</span>
+              </div>
+            </header>
+            <div className="session-topic-members">
+              {group.rows.map(row => (
+                <BoardCard
+                  key={row.sessionId}
+                  row={row}
+                  selected={props.selected.has(row.sessionId)}
+                  onToggleSelect={candidate => {
+                    if (candidate.status !== 'closed') props.onToggleSelect(candidate);
+                    else props.onOpen(candidate);
+                  }}
+                  onOpen={props.onOpen}
+                  onHistory={props.onHistory}
+                  onLocate={props.onLocate}
+                  onRestart={props.onRestart}
+                  onLock={props.onLock}
+                  onClose={props.onClose}
+                />
+              ))}
+            </div>
+          </section>
+        );
+      }) : <div className="sessions-topic-empty">{t('sessions.topic.empty')}</div>}
     </div>
   );
 }
@@ -1768,6 +1902,8 @@ function SessionsPage(): JSX.Element {
     status: '',
     adopt: '',
     chat: '',
+    multiBotTopics: false,
+    botTriggeredTopics: false,
     showUnknownChats: readStoredSessionsShowUnknownChats(windowStorage()),
     active: true,
     cli: new Set(CLI_FILTER_OPTIONS),
@@ -1852,21 +1988,32 @@ function SessionsPage(): JSX.Element {
     const cli = [...filters.cli];
     const cliFilterActive = cli.length > 0 && cli.length < CLI_FILTER_OPTIONS.length;
     const keepClosed = viewMode === 'kanban';
-    return storeRows
+    const acceptedTopicKeys = filters.multiBotTopics || filters.botTriggeredTopics
+      ? new Set(groupSessionsByTopic(storeRows)
+        .filter(group => !filters.multiBotTopics || group.multiBot)
+        .filter(group => !filters.botTriggeredTopics || group.inferredBotTriggered)
+        .map(group => group.key))
+      : null;
+    const base = storeRows
       .filter(s => !cliFilterActive || cli.includes(s.cliId ?? 'unknown'))
       .filter(s => filters.showUnknownChats || !isUnknownChatSession(s))
       .filter(s => !filters.status || s.status === filters.status)
       .filter(s => !filters.adopt || (filters.adopt === 'yes') === !!s.adopt)
       .filter(s => !filters.chat || String(s.chatId ?? '') === filters.chat)
       .filter(s => !filters.active || keepClosed || s.status !== 'closed')
-      .filter(s => !q || sessionSearchText(s).includes(q))
+      .filter(s => !q || sessionSearchText(s).includes(q));
+    if (!acceptedTopicKeys) {
+      return base.sort((a, b) => compareRows(a, b, sortKey, sortDir));
+    }
+    return base
+      .filter(row => acceptedTopicKeys.has(sessionTopicKey(row)))
       .sort((a, b) => compareRows(a, b, sortKey, sortDir));
   }, [filters, revision, sortDir, sortKey, storeRows, viewMode]);
   const runtimeCounts = useMemo(() => sessionRuntimeCounts(storeRows), [storeRows]);
 
   const rowsById = useMemo(() => new Map(storeRows.map(row => [row.sessionId, row])), [storeRows, revision]);
   const boardRows = useMemo(() => rows.filter(row => row.status !== 'closed'), [rows]);
-  const visibleRows = viewMode === 'table' ? rows : boardRows;
+  const visibleRows = viewMode === 'table' || viewMode === 'topics' ? rows : boardRows;
   const selectableRows = visibleRows.filter(row => row.status !== 'closed');
   const selectedRows = [...selected]
     .map(id => rowsById.get(id))
@@ -2534,6 +2681,7 @@ function SessionsPage(): JSX.Element {
               {([
                 ['kanban', t('sessions.viewKanban')],
                 ['board', t('sessions.viewBoard')],
+                ['topics', t('sessions.viewTopics')],
                 ['table', t('sessions.viewTable')],
               ] as const).map(([value, label]) => (
                 <button
@@ -2694,6 +2842,25 @@ function SessionsPage(): JSX.Element {
           onMoveColumnTo={moveColumnTo}
           onDragCol={setDragColId}
           onDragOverCol={setDragOverCol}
+          onToggleSelect={row => setSelected(prev => {
+            const next = new Set(prev);
+            if (next.has(row.sessionId)) next.delete(row.sessionId);
+            else next.add(row.sessionId);
+            return next;
+          })}
+          onOpen={row => setDrawerSessionId(row.sessionId)}
+          onHistory={openHistoryModal}
+          onLocate={row => locateSession(row)}
+          onRestart={(row, button) => void restartSession(row, button)}
+          onLock={(row, locked, button) => void setSessionLocked(row, locked, button)}
+          onClose={(row, button) => void closeSession(row, button)}
+        />
+
+        <TopicGroupsView
+          rows={rows}
+          relationRows={storeRows}
+          selected={selected}
+          hidden={viewMode !== 'topics'}
           onToggleSelect={row => setSelected(prev => {
             const next = new Set(prev);
             if (next.has(row.sessionId)) next.delete(row.sessionId);

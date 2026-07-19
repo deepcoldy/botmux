@@ -21,6 +21,23 @@ export function markSessionActivity(ds: DaemonSession, at: number = Date.now()):
   });
 }
 
+/** Publish the latest inbound sender kind after quoteTarget* has been updated.
+ *
+ * `markSessionActivity()` runs before some routing paths finish writing their
+ * quote provenance, so folding this field into its timestamp patch would race
+ * with the old value. Keep the patch explicit and call it immediately after
+ * assigning `quoteTargetSenderIsBot`.
+ */
+export function publishLastInputFromBotPatch(ds: DaemonSession): void {
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: {
+      sessionId: ds.session.sessionId,
+      patch: { lastInputFromBot: ds.session.quoteTargetSenderIsBot === true },
+    },
+  });
+}
+
 /** Push the current attention signals (repo-selection pending / TUI prompt
  *  open) to the dashboard. Call after mutating `ds.pendingRepo` or
  *  `ds.tuiPromptCardId` so the board view's needs-you column tracks live

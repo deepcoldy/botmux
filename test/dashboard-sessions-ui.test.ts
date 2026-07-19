@@ -6,13 +6,15 @@ import { SessionsKanbanView, type SessionsKanbanCallbacks, type SessionsKanbanSt
 import {
   canRestartSession,
   CLI_FILTER_OPTIONS,
+  groupSessionsByTopic,
   isUnknownChatSession,
   restartConfirmMessage,
   historySenderKey,
   sessionLocationText,
+  sessionTopicKey,
   shouldOpenWritableTerminal,
 } from '../src/dashboard/web/sessions.js';
-import { CliFilterGroup } from '../src/dashboard/web/sessions-page.js';
+import { CliFilterGroup, TopicGroupsView } from '../src/dashboard/web/sessions-page.js';
 
 const kanbanCallbacks: SessionsKanbanCallbacks = {
   canRestartSession: row => row.status !== 'closed',
@@ -66,8 +68,193 @@ describe('dashboard sessions filters', () => {
 
     expect(page).toContain('const q = event.currentTarget.value;');
     expect(page).toContain('const active = event.currentTarget.checked;');
+    expect(page).toContain('const multiBotTopics = event.currentTarget.checked;');
+    expect(page).toContain('const botTriggeredTopics = event.currentTarget.checked;');
     expect(page).not.toContain('q: event.currentTarget.value');
     expect(page).not.toContain('active: event.currentTarget.checked');
+    expect(page).not.toContain('multiBotTopics: event.currentTarget.checked');
+    expect(page).not.toContain('botTriggeredTopics: event.currentTarget.checked');
+  });
+
+  it('groups thread sessions by chat and root message without claiming ancestry', () => {
+    const rows = [
+      {
+        sessionId: 'codex',
+        chatId: 'oc_coding',
+        rootMessageId: 'om_topic',
+        scope: 'thread',
+        larkAppId: 'app_codex',
+        botName: 'Nil-Codex',
+        status: 'working',
+        title: '@Nil-Codex 协作排查',
+        spawnedAt: 10,
+        lastMessageAt: 100,
+        lastInputFromBot: true,
+      },
+      {
+        sessionId: 'traex',
+        chatId: 'oc_coding',
+        rootMessageId: 'om_topic',
+        scope: 'thread',
+        larkAppId: 'app_traex',
+        botName: 'Nil-TraeX',
+        status: 'closed',
+        title: '后续处理',
+        spawnedAt: 20,
+        lastMessageAt: 90,
+      },
+      {
+        sessionId: 'other-topic',
+        chatId: 'oc_coding',
+        rootMessageId: 'om_other',
+        scope: 'thread',
+        larkAppId: 'app_codex',
+        botName: 'Nil-Codex',
+        status: 'idle',
+        lastMessageAt: 80,
+      },
+    ];
+
+    const groups = groupSessionsByTopic(rows);
+    expect(groups).toHaveLength(2);
+    expect(sessionTopicKey(rows[0])).toBe(sessionTopicKey(rows[1]));
+    expect(sessionTopicKey(rows[0])).not.toBe(sessionTopicKey(rows[2]));
+    expect(groups[0]).toMatchObject({
+      kind: 'thread',
+      chatId: 'oc_coding',
+      rootMessageId: 'om_topic',
+      title: '@Nil-Codex 协作排查',
+      botCount: 2,
+      activeCount: 1,
+      closedCount: 1,
+      inferredBotInputCount: 1,
+      multiBot: true,
+      inferredBotTriggered: true,
+    });
+    expect(groups[0].rows.map(row => row.sessionId)).toEqual(['codex', 'traex']);
+  });
+
+  it('groups chat-scope sessions at whole-chat granularity', () => {
+    const first = { sessionId: 'a', chatId: 'oc_chat', rootMessageId: 'om_a', scope: 'chat', status: 'idle' };
+    const second = { sessionId: 'b', chatId: 'oc_chat', rootMessageId: 'om_b', scope: 'chat', status: 'idle' };
+    const groups = groupSessionsByTopic([first, second]);
+
+    expect(sessionTopicKey(first)).toBe(sessionTopicKey(second));
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({ kind: 'chat', chatId: 'oc_chat' });
+    expect(groups[0].rootMessageId).toBeUndefined();
+  });
+
+  it('keeps thread sessions with incomplete topic anchors separate', () => {
+    const first = {
+      sessionId: 'a', chatId: 'oc_chat', rootMessageId: '', scope: 'thread',
+      larkAppId: 'app_a', status: 'idle',
+    };
+    const second = {
+      sessionId: 'b', chatId: 'oc_chat', scope: 'thread',
+      larkAppId: 'app_b', status: 'idle',
+    };
+    const groups = groupSessionsByTopic([first, second]);
+
+    expect(sessionTopicKey(first)).not.toBe(sessionTopicKey(second));
+    expect(groups).toHaveLength(2);
+    expect(groups.every(group => group.kind === 'session')).toBe(true);
+    expect(groups.every(group => !group.multiBot)).toBe(true);
+  });
+
+  it('does not infer multiple Bots from sessions whose Bot identity is missing', () => {
+    const groups = groupSessionsByTopic([
+      { sessionId: 'a', chatId: 'oc_chat', rootMessageId: 'om_topic', scope: 'thread', status: 'idle' },
+      { sessionId: 'b', chatId: 'oc_chat', rootMessageId: 'om_topic', scope: 'thread', status: 'idle' },
+    ]);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({ botCount: 1, multiBot: false });
+  });
+
+  it('renders topic aggregation with multi-Bot and inferred trigger signals', () => {
+    const html = renderToStaticMarkup(createElement(TopicGroupsView, {
+      rows: [
+        {
+          sessionId: 'codex', chatId: 'oc_coding', rootMessageId: 'om_topic', scope: 'thread',
+          larkAppId: 'app_codex', botName: 'Nil-Codex', cliId: 'codex', status: 'working',
+          title: '@Nil-Codex 协作排查', lastMessageAt: 100, lastInputFromBot: true,
+        },
+        {
+          sessionId: 'traex', chatId: 'oc_coding', rootMessageId: 'om_topic', scope: 'thread',
+          larkAppId: 'app_traex', botName: 'Nil-TraeX', cliId: 'traex', status: 'idle',
+          title: '后续处理', lastMessageAt: 90,
+        },
+      ],
+      selected: new Set<string>(),
+      hidden: false,
+      onToggleSelect: () => {},
+      onOpen: () => {},
+      onHistory: () => {},
+      onLocate: async () => true,
+      onRestart: () => {},
+      onLock: () => {},
+      onClose: () => {},
+    }));
+
+    expect(html).toContain('class="session-topic-group multi-bot inferred-bot-trigger"');
+    expect(html).toContain('data-topic-key="thread');
+    expect(html).toContain('多 Bot 协作');
+    expect(html).toContain('1 个会话最近由 Bot 唤醒（推断）');
+    expect((html.match(/<article class="session-card/g) ?? []).length).toBe(2);
+  });
+
+  it('labels an incomplete topic anchor as a single session', () => {
+    const html = renderToStaticMarkup(createElement(TopicGroupsView, {
+      rows: [{
+        sessionId: 'orphan', chatId: 'oc_coding', rootMessageId: '', scope: 'thread',
+        larkAppId: 'app_codex', botName: 'Nil-Codex', cliId: 'codex', status: 'idle',
+        lastMessageAt: 100,
+      }],
+      selected: new Set<string>(),
+      hidden: false,
+      onToggleSelect: () => {},
+      onOpen: () => {},
+      onHistory: () => {},
+      onLocate: async () => true,
+      onRestart: () => {},
+      onLock: () => {},
+      onClose: () => {},
+    }));
+
+    expect(html).toContain('>单会话</code>');
+    expect(html).not.toContain('整群会话');
+  });
+
+  it('keeps full topic relation metadata when current filters hide sibling sessions', () => {
+    const visible = {
+      sessionId: 'codex', chatId: 'oc_coding', rootMessageId: 'om_topic', scope: 'thread',
+      larkAppId: 'app_codex', botName: 'Nil-Codex', cliId: 'codex', status: 'working',
+      title: '协作排查', lastMessageAt: 100,
+    };
+    const hiddenClosed = {
+      sessionId: 'traex', chatId: 'oc_coding', rootMessageId: 'om_topic', scope: 'thread',
+      larkAppId: 'app_traex', botName: 'Nil-TraeX', cliId: 'traex', status: 'closed',
+      title: '后续处理', lastMessageAt: 90, lastInputFromBot: true,
+    };
+    const html = renderToStaticMarkup(createElement(TopicGroupsView, {
+      rows: [visible],
+      relationRows: [visible, hiddenClosed],
+      selected: new Set<string>(),
+      hidden: false,
+      onToggleSelect: () => {},
+      onOpen: () => {},
+      onHistory: () => {},
+      onLocate: async () => true,
+      onRestart: () => {},
+      onLock: () => {},
+      onClose: () => {},
+    }));
+
+    expect(html).toContain('session-topic-group multi-bot inferred-bot-trigger');
+    expect(html).toContain('2 个会话');
+    expect(html).toContain('1 已关闭');
+    expect((html.match(/<article class="session-card/g) ?? []).length).toBe(1);
   });
 
   it('derives CLI filter options from the shared CLI registry', () => {

@@ -67,9 +67,10 @@ describe('dashboard skin preferences', () => {
 });
 
 describe('sessions view mode preference', () => {
-  it('accepts kanban, board, and table', () => {
+  it('accepts kanban, board, topics, and table', () => {
     expect(normalizeSessionsViewMode('kanban')).toBe('kanban');
     expect(normalizeSessionsViewMode('board')).toBe('board');
+    expect(normalizeSessionsViewMode('topics')).toBe('topics');
     expect(normalizeSessionsViewMode('table')).toBe('table');
     expect(normalizeSessionsViewMode('list')).toBeNull();
     expect(normalizeSessionsViewMode(undefined)).toBeNull();
@@ -82,6 +83,7 @@ describe('sessions view mode preference', () => {
     expect(readStoredSessionsViewMode(make(null))).toBe('board');
     expect(readStoredSessionsViewMode(make('nope'))).toBe('board');
     expect(readStoredSessionsViewMode(make('kanban'))).toBe('kanban');
+    expect(readStoredSessionsViewMode(make('topics'))).toBe('topics');
   });
 });
 

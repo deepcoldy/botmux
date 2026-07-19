@@ -17,12 +17,17 @@ describe('dashboard mobile layout', () => {
   });
 
   it('keeps the sessions view switch and bulk actions readable at phone widths', () => {
-    expect(css).toMatch(/main:has\(\.sessions-page\) \.sessions-view-toggle\s*\{[\s\S]*?grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\);[\s\S]*?width:\s*100%;/);
+    expect(css).toMatch(/main:has\(\.sessions-page\) \.sessions-view-toggle\s*\{[\s\S]*?grid-template-columns:\s*repeat\(4,\s*minmax\(0,\s*1fr\)\);[\s\S]*?width:\s*100%;/);
     expect(css).toMatch(/main:has\(\.sessions-page\) \.sessions-view-toggle button\s*\{[\s\S]*?white-space:\s*nowrap;/);
     expect(css).toMatch(/main:has\(\.sessions-page\) \.bulk-bar\s*\{[\s\S]*?top:\s*-16px;[\s\S]*?grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/);
     expect(css).toMatch(/\.bulk-bar\s*\{[\s\S]*?--bulk-bar-bg:\s*color-mix\(in srgb,\s*var\(--warning\) 10%,\s*var\(--bg\)\);[\s\S]*?background:\s*var\(--bulk-bar-bg\);/);
     expect(css).toMatch(/main:has\(\.sessions-page\) \.bulk-bar\s*\{[\s\S]*?box-shadow:\s*0 0 0 16px var\(--bulk-bar-bg\),\s*var\(--shadow\);/);
     expect(css).toMatch(/main:has\(\.sessions-page\) \.bulk-bar\[hidden\]\s*\{\s*display:\s*none;/);
     expect(css).toMatch(/main:has\(\.sessions-page\) \.bulk-bar button\s*\{[\s\S]*?white-space:\s*nowrap;/);
+  });
+
+  it('stacks topic aggregation cards on mobile', () => {
+    expect(css).toMatch(/main:has\(\.sessions-page\) \.sessions-topic-view\s*\{[\s\S]*?height:\s*auto;[\s\S]*?overflow:\s*visible;/);
+    expect(css).toMatch(/main:has\(\.sessions-page\) \.session-topic-members\s*\{\s*grid-template-columns:\s*1fr;/);
   });
 });

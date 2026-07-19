@@ -1,6 +1,6 @@
 export type ThemeMode = 'system' | 'light' | 'dark';
 export type ResolvedTheme = 'light' | 'dark';
-export type SessionsViewMode = 'kanban' | 'board' | 'table';
+export type SessionsViewMode = 'kanban' | 'board' | 'topics' | 'table';
 
 export const THEME_STORAGE_KEY = 'botmux.dashboard.theme';
 export const SESSIONS_VIEW_STORAGE_KEY = 'botmux.dashboard.sessions.view';
@@ -11,7 +11,7 @@ export function normalizeThemeMode(value: unknown): ThemeMode | null {
 }
 
 export function normalizeSessionsViewMode(value: unknown): SessionsViewMode | null {
-  return value === 'kanban' || value === 'board' || value === 'table' ? value : null;
+  return value === 'kanban' || value === 'board' || value === 'topics' || value === 'table' ? value : null;
 }
 
 export function resolveThemeMode(mode: ThemeMode, systemPrefersDark: boolean): ResolvedTheme {

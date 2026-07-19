@@ -417,7 +417,8 @@ main:has(.sessions-page) .sessions-view-stage {
   overflow: hidden;
 }
 
-main:has(.sessions-page) .sessions-view-stage[data-view="table"] {
+main:has(.sessions-page) .sessions-view-stage[data-view="table"],
+main:has(.sessions-page) .sessions-view-stage[data-view="topics"] {
   overflow: auto;
 }
 
@@ -2179,6 +2180,150 @@ button.primary {
 
 .sessions-board[hidden] {
   display: none;
+}
+
+/* ── Sessions topic view — group by Lark location, not inferred ancestry ─── */
+.sessions-topic-view {
+  display: grid;
+  grid-auto-rows: max-content;
+  align-content: start;
+  gap: 12px;
+  min-height: 0;
+  height: 100%;
+  padding: 10px;
+  overflow-y: auto;
+  box-sizing: border-box;
+}
+
+.sessions-topic-view[hidden] {
+  display: none;
+}
+
+.session-topic-group {
+  --topic-signal: var(--border);
+  min-width: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.session-topic-group.multi-bot {
+  --topic-signal: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border-soft));
+}
+
+.session-topic-group.inferred-bot-trigger {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--warning) 72%, transparent), var(--shadow);
+}
+
+.session-topic-group > header {
+  display: grid;
+  grid-template-columns: auto minmax(220px, 1fr) minmax(280px, auto);
+  align-items: center;
+  gap: 12px;
+  min-height: 74px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--topic-signal) 5%, var(--surface-muted));
+}
+
+.session-topic-avatar {
+  display: inline-flex;
+}
+
+.session-topic-heading {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.session-topic-location,
+.session-topic-updated {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.session-topic-heading h2 {
+  margin: 0;
+  color: var(--fg);
+  font-size: 14px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-topic-heading code {
+  max-width: min(58vw, 520px);
+  color: var(--faint);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-topic-summary {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.topic-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface-raised);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.topic-chip.collaboration {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface-raised));
+  color: var(--accent-strong);
+}
+
+.topic-chip.active {
+  border-color: color-mix(in srgb, var(--success) 36%, var(--border));
+  color: var(--success);
+}
+
+.topic-chip.inferred {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--warning) 44%, var(--border));
+  color: var(--warning);
+}
+
+.session-topic-members {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  align-items: start;
+  gap: 10px;
+  padding: 10px;
+}
+
+.session-topic-members .session-card {
+  --col-signal: var(--topic-signal);
+}
+
+.sessions-topic-empty {
+  min-height: 160px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
 }
 
 .session-board-column {
@@ -22592,7 +22737,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 
   main:has(.sessions-page) .sessions-view-toggle {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     width: 100%;
     min-width: 0;
     max-width: 100%;
@@ -22641,6 +22786,26 @@ button.ui-refresh-button.is-loading .ui-action-icon {
     height: auto;
     min-height: 0;
     overflow: visible;
+  }
+
+  main:has(.sessions-page) .sessions-topic-view {
+    height: auto;
+    overflow: visible;
+    padding-right: 0;
+    padding-left: 0;
+  }
+
+  main:has(.sessions-page) .session-topic-group > header {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  main:has(.sessions-page) .session-topic-summary {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+
+  main:has(.sessions-page) .session-topic-members {
+    grid-template-columns: 1fr;
   }
 
   main:has(.sessions-page) .session-board-column {
