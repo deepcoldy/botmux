@@ -1,4 +1,7 @@
 import { execFile } from 'node:child_process';
+import { chmod, lstat, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { CliAdapter, CliId } from '../adapters/cli/types.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { localTerminalCapable } from '../core/local-terminal-opener.js';
@@ -73,9 +76,22 @@ export interface LocalCliOpenerDeps {
   mode?: LocalCliOpenMode;
   adapterFactory?: (cliId: LocalCliId) => Pick<CliAdapter, 'buildResumeCommand'>;
   runOsascript?: (args: string[]) => Promise<{ ok: boolean; stderr?: string }>;
+  /** Launch-Services fallback: opens a .command file with a terminal app.
+   *  Used when AppleScript is blocked by missing Automation permission
+   *  (e.g. the daemon runs under PM2/launchd, so TCC never prompts). */
+  runOpenCommand?: (args: string[]) => Promise<{ ok: boolean; stderr?: string }>;
 }
 
 const OSASCRIPT = '/usr/bin/osascript';
+const OPEN = '/usr/bin/open';
+const OPEN_TARGETS = [
+  { label: 'iTerm', bundleId: 'com.googlecode.iterm2' },
+  { label: 'Terminal.app', bundleId: 'com.apple.Terminal' },
+] as const;
+const COMMAND_FILE_PREFIX = 'botmux-open-command-';
+const COMMAND_DIR_PATTERN = /^botmux-open-command-[A-Za-z0-9]{6}$/;
+const LEGACY_COMMAND_DIR_PATTERN = /^botmux-open-[A-Za-z0-9]{6}$/;
+const COMMAND_FILE_TTL_MS = 24 * 60 * 60 * 1000;
 const ITERM_TARGETS = [
   'application "/Applications/iTerm.app"',
   'application id "com.googlecode.iterm2"',
@@ -284,10 +300,103 @@ function defaultRunOsascript(args: string[]): Promise<{ ok: boolean; stderr?: st
 
 function terminalUnavailableMessage(errors: string[]): string {
   const detail = [...errors].reverse().find((e) => e.trim().length > 0);
-  const base = 'Neither iTerm nor Terminal.app could be opened with AppleScript.';
+  const base = 'Neither iTerm nor Terminal.app could be opened with AppleScript or Launch Services.';
   return detail
-    ? `${base} Install iTerm or allow Automation access, then retry. Last error: ${detail}`
-    : `${base} Install iTerm or allow Automation access, then retry.`;
+    ? `${base} Ensure a supported terminal is available or allow Automation access, then retry. Last error: ${detail}`
+    : `${base} Ensure a supported terminal is available or allow Automation access, then retry.`;
+}
+
+function defaultRunOpenCommand(args: string[]): Promise<{ ok: boolean; stderr?: string }> {
+  return new Promise((resolve) => {
+    execFile(OPEN, args, { timeout: 10_000 }, (err, _stdout, stderr) => {
+      resolve({ ok: !err, stderr: stderr?.trim() || (err ? String(err) : undefined) });
+    });
+  });
+}
+
+async function removeCommandDir(dir: string): Promise<void> {
+  try {
+    await rm(dir, { recursive: true, force: true });
+  } catch {
+    // Best-effort cleanup: a stale sweep on a later launch gets another chance.
+  }
+}
+
+function isCommandDirName(name: string): boolean {
+  return COMMAND_DIR_PATTERN.test(name) || LEGACY_COMMAND_DIR_PATTERN.test(name);
+}
+
+async function cleanupStaleCommandDirs(root: string, now: number = Date.now()): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !isCommandDirName(entry.name)) continue;
+    const dir = join(root, entry.name);
+    try {
+      const info = await lstat(dir);
+      if (now - info.mtimeMs >= COMMAND_FILE_TTL_MS) await removeCommandDir(dir);
+    } catch {
+      // The directory may have been removed by the launched script.
+    }
+  }
+}
+
+function scheduleCommandDirCleanup(dir: string): void {
+  const timer = setTimeout(() => {
+    void removeCommandDir(dir);
+  }, COMMAND_FILE_TTL_MS);
+  timer.unref();
+}
+
+/** Launch-Services fallback: write the command to a .command file and open it
+ *  with iTerm or Terminal.app. The script removes its own private temp directory
+ *  only after the terminal begins executing it, avoiding a race with the
+ *  asynchronous Launch Services request and iTerm's confirmation dialog. */
+async function openViaCommandFile(
+  command: string,
+  runOpen: LocalCliOpenerDeps['runOpenCommand'],
+): Promise<LocalCliOpenResult> {
+  const root = tmpdir();
+  await cleanupStaleCommandDirs(root);
+
+  let dir: string | undefined;
+  try {
+    dir = await mkdtemp(join(root, COMMAND_FILE_PREFIX));
+    const scriptPath = join(dir, 'open-cli.command');
+    const cleanup = `/bin/rm -rf -- ${shellQuote(dir)} >/dev/null 2>&1 || true`;
+    // Launch Services may start the script with its containing directory as cwd.
+    // Leave it before self-deleting so attach commands do not inherit a removed cwd.
+    await writeFile(scriptPath, `#!/bin/bash\ncd /\n${cleanup}\n${command}\n`, { mode: 0o700 });
+    await chmod(scriptPath, 0o700);
+  } catch (err) {
+    if (dir) await removeCommandDir(dir);
+    return fail('terminal_unavailable', `Failed to create command file: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  const scriptPath = join(dir, 'open-cli.command');
+  const openFn = runOpen ?? defaultRunOpenCommand;
+  const launchErrors: string[] = [];
+  for (const target of OPEN_TARGETS) {
+    let opened: { ok: boolean; stderr?: string };
+    try {
+      opened = await openFn(['-b', target.bundleId, scriptPath]);
+    } catch (err) {
+      opened = { ok: false, stderr: err instanceof Error ? err.message : String(err) };
+    }
+    if (opened.ok) {
+      scheduleCommandDirCleanup(dir);
+      return { ok: true, command };
+    }
+    launchErrors.push(`${target.label}: ${opened.stderr?.trim() || `${OPEN} failed`}`);
+  }
+
+  await removeCommandDir(dir);
+  return fail('terminal_unavailable', launchErrors.join('; '));
 }
 
 export async function openLocalCliInIterm(
@@ -315,6 +424,14 @@ export async function openLocalCliInIterm(
     if (launched.ok) return built;
     if (launched.stderr) errors.push(launched.stderr);
   }
+
+  // AppleScript failed (typically -1743 Automation permission denied).
+  // Fall back to Launch Services: open a self-cleaning .command file with iTerm
+  // or Terminal.app. This does not need Automation permission, which covers
+  // PM2/launchd environments where TCC never prompts for the daemon process.
+  const fallback = await openViaCommandFile(built.command, deps.runOpenCommand);
+  if (fallback.ok) return fallback;
+  errors.push(fallback.message);
 
   return fail('terminal_unavailable', terminalUnavailableMessage(errors));
 }
