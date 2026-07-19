@@ -3,7 +3,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync } 
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { config } from '../../config.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
-import { withFileLock } from '../../utils/file-lock.js';
+import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import { readPluginRegistry } from '../../services/plugin-registry-store.js';
 import {
   pluginHome,
@@ -56,6 +56,10 @@ const DEFAULT_LINK_WATCH_DELAY_MS = 2_000;
 function serviceLockTarget(): string {
   mkdirSync(pluginsHome(), { recursive: true });
   return `${pluginsHome()}/service-manager`;
+}
+
+export function withPluginServiceLockSync<T>(fn: () => T): T {
+  return withFileLockSync(serviceLockTarget(), fn, { maxWaitMs: 30_000 });
 }
 
 function definitionEnv(record: InstalledPluginRecord, definition: PluginServiceDefinition): Record<string, string> {

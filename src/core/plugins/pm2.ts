@@ -28,7 +28,9 @@ function pm2Bin(): string {
 
 function pm2Env(extra?: Record<string, string>): NodeJS.ProcessEnv {
   mkdirSync(PLUGIN_PM2_HOME, { recursive: true });
-  return { ...process.env, ...(extra ?? {}), PM2_HOME: PLUGIN_PM2_HOME };
+  const inherited = { ...process.env };
+  delete inherited.kill_timeout;
+  return { ...inherited, ...(extra ?? {}), PM2_HOME: PLUGIN_PM2_HOME };
 }
 
 export function runPluginPm2(args: string[], opts: { inherit?: boolean; timeoutMs?: number; env?: Record<string, string> } = {}): void {

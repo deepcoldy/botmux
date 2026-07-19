@@ -100,8 +100,13 @@ describe('plugin service lifecycle guard', () => {
     expect(readFileSync(join(first.runtimeDir, 'marker.txt'), 'utf8')).toBe('v1\n');
 
     writePluginSource(source, '0.2.0', 'v2');
-    pm2.capture.mockReturnValue(pm2List('online', 4123));
+    let observedServiceLock = false;
+    pm2.capture.mockImplementation(() => {
+      observedServiceLock = existsSync(join(home, '.botmux', 'plugins', 'service-manager.lock'));
+      return pm2List('online', 4123);
+    });
     expect(() => installLocalPlugin(source)).toThrow(PluginServiceRunningError);
+    expect(observedServiceLock).toBe(true);
     expect(readFileSync(join(first.runtimeDir, 'marker.txt'), 'utf8')).toBe('v1\n');
     expect(existsSync(join(home, '.botmux', 'plugins', 'service-demo', 'config.json'))).toBe(true);
 

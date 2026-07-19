@@ -14,7 +14,7 @@ import {
 import type { InstalledPluginRecord, PluginPackageManifest, PluginSettingsFile } from './types.js';
 import { readPluginRegistry, upsertInstalledPlugin } from '../../services/plugin-registry-store.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
-import { assertPluginServiceStopped } from './service-manager.js';
+import { assertPluginServiceStopped, withPluginServiceLockSync } from './service-manager.js';
 
 export interface InstallPluginOptions {
   source?: 'auto' | 'npm' | 'local';
@@ -122,17 +122,18 @@ export function installLocalPlugin(spec: string, opts: InstallPluginOptions = {}
     spec: sourceDir,
     ...(linked ? { link: true } : {}),
   }, sourceRuntimeDir);
-  assertExistingPluginServiceStopped(pkg.botmux.id);
   const stagedDir = stageRuntime(pkg.botmux.id, sourceRuntimeDir, linked);
-  let runtimeDir: string;
   try {
-    ensurePluginStateFiles(pkg.botmux.id);
-    runtimeDir = replacePluginRuntime(pkg.botmux.id, stagedDir);
+    return withPluginServiceLockSync(() => {
+      assertExistingPluginServiceStopped(pkg.botmux.id);
+      ensurePluginStateFiles(pkg.botmux.id);
+      const runtimeDir = replacePluginRuntime(pkg.botmux.id, stagedDir);
+      const record = upsertInstalledPlugin(stagedRecord);
+      return { record, runtimeDir };
+    });
   } finally {
     rmSync(stagedDir, { recursive: true, force: true });
   }
-  const record = upsertInstalledPlugin(stagedRecord);
-  return { record, runtimeDir };
 }
 
 function findBotmuxPackageUnderNodeModules(root: string): string {
@@ -175,17 +176,18 @@ export function installNpmPlugin(spec: string): InstallPluginResult {
     const pkg = readPackageManifest(tmpPackageDir);
     const tmpRuntimeDir = requireRuntimeDir(tmpPackageDir);
     const stagedRecord = makeRecord(pkg, { type: 'npm', spec }, tmpRuntimeDir);
-    assertExistingPluginServiceStopped(pkg.botmux.id);
     const stagedDir = stageRuntime(pkg.botmux.id, tmpRuntimeDir, false);
-    let runtimeDir: string;
     try {
-      ensurePluginStateFiles(pkg.botmux.id);
-      runtimeDir = replacePluginRuntime(pkg.botmux.id, stagedDir);
+      return withPluginServiceLockSync(() => {
+        assertExistingPluginServiceStopped(pkg.botmux.id);
+        ensurePluginStateFiles(pkg.botmux.id);
+        const runtimeDir = replacePluginRuntime(pkg.botmux.id, stagedDir);
+        const record = upsertInstalledPlugin(stagedRecord);
+        return { record, runtimeDir };
+      });
     } finally {
       rmSync(stagedDir, { recursive: true, force: true });
     }
-    const record = upsertInstalledPlugin(stagedRecord);
-    return { record, runtimeDir };
   } finally {
     rmSync(tmpRoot, { recursive: true, force: true });
   }
