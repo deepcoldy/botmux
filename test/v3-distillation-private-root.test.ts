@@ -2,6 +2,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   symlinkSync,
 } from 'node:fs';
@@ -22,7 +23,7 @@ afterEach(() => {
 
 describe('v3 distillation private scratch root', () => {
   it('is private and idempotent in a uid-qualified host tmp root', () => {
-    const base = mkdtempSync(join(tmpdir(), 'v3-distill-private-root-'));
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'v3-distill-private-root-')));
     roots.push(base);
 
     const expected = v3DistillationScratchRoot(base);
@@ -35,7 +36,7 @@ describe('v3 distillation private scratch root', () => {
   });
 
   it('rejects a pre-created symlink at the uid-qualified root', () => {
-    const base = mkdtempSync(join(tmpdir(), 'v3-distill-private-root-'));
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'v3-distill-private-root-')));
     roots.push(base);
     const target = join(base, 'target');
     mkdirSync(target, { mode: 0o700 });

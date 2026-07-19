@@ -2,7 +2,7 @@
  * Tests for TmuxBackend's shell-wrapped CLI launch.
  *
  * The design (see tmux-backend.ts spawn() else branch):
- *   tmux new-session ... -- <shell> <shellFlags> -c <SCRIPT> _ <cwd> KEY=VAL... bin args...
+ *   tmux new-session ... -- /usr/bin/env DISABLE_AUTO_UPDATE=true <shell> <shellFlags> -c <SCRIPT> _ <cwd> KEY=VAL... bin args...
  *
  * Goal: give the CLI an environment that matches "user opens a terminal and
  * runs the CLI by hand" — PATH / NVM / PNPM / mise / etc. come from the
@@ -16,6 +16,11 @@
  *
  * SCRIPT also `cd`s back to the requested cwd before exec, so a stray `cd`
  * in the user's rcfile doesn't drag the CLI's working directory away.
+ *
+ * Non-interactive startup: shellLaunchArgv() prepends
+ * `env DISABLE_AUTO_UPDATE=true` so the override is visible while the rcfile
+ * loads and prevents oh-my-zsh's update prompt. The wrapper unsets it again
+ * before launching the CLI, preserving the CLI's normal environment.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { existsSync, mkdtempSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
@@ -26,9 +31,11 @@ import {
   buildBotmuxEnvAssignments,
   buildDebugKeepShellScript,
   DIAGNOSTIC_SHELL_SCRIPT,
+  NON_INTERACTIVE_SHELL_ENV,
   resolveUserShell,
   resolveShellOverride,
   SHELL_WRAPPER_SCRIPT,
+  shellLaunchArgv,
 } from '../src/adapters/backend/tmux-backend.js';
 
 describe('buildBotmuxEnvAssignments()', () => {
@@ -235,6 +242,92 @@ describe('buildBotmuxEnvAssignments()', () => {
   });
 });
 
+describe('NON_INTERACTIVE_SHELL_ENV', () => {
+  it('includes DISABLE_AUTO_UPDATE=true (skip oh-my-zsh update in managed shell)', () => {
+    expect(NON_INTERACTIVE_SHELL_ENV).toContain('DISABLE_AUTO_UPDATE=true');
+  });
+
+  it('does not turn a prompt-mode shell into an unattended auto-update', () => {
+    expect(NON_INTERACTIVE_SHELL_ENV).not.toContain('DISABLE_UPDATE_PROMPT=true');
+  });
+
+  it('does not change git credential prompting for the managed CLI', () => {
+    expect(NON_INTERACTIVE_SHELL_ENV).not.toContain('GIT_TERMINAL_PROMPT=0');
+  });
+});
+
+describe('shellLaunchArgv()', () => {
+  it('prepends env(1) + non-interactive vars before shell + flags', () => {
+    const argv = shellLaunchArgv('/bin/zsh', ['-l', '-i']);
+    expect(argv).toEqual([
+      '/usr/bin/env',
+      'DISABLE_AUTO_UPDATE=true',
+      '/bin/zsh',
+      '-l',
+      '-i',
+    ]);
+  });
+
+  it('works with no flags (sh-style)', () => {
+    const argv = shellLaunchArgv('/bin/sh', []);
+    expect(argv).toEqual([
+      '/usr/bin/env',
+      'DISABLE_AUTO_UPDATE=true',
+      '/bin/sh',
+    ]);
+  });
+
+  it('works with a single flag (bash-style)', () => {
+    const argv = shellLaunchArgv('/bin/bash', ['-i']);
+    expect(argv).toEqual([
+      '/usr/bin/env',
+      'DISABLE_AUTO_UPDATE=true',
+      '/bin/bash',
+      '-i',
+    ]);
+  });
+});
+
+describe('shellLaunchArgv end-to-end (startup-only env lifecycle)', () => {
+  const hasEnvBin = existsSync('/usr/bin/env');
+  const hasBash = existsSync('/bin/bash');
+
+  it.skipIf(!hasEnvBin || !hasBash)(
+    'DISABLE_AUTO_UPDATE reaches the rcfile but not the final managed CLI',
+    () => {
+      // Plant a fake .bashrc that checks $DISABLE_AUTO_UPDATE. This emulates
+      // oh-my-zsh reading the legacy setting before deciding whether to prompt.
+      const dir = mkdtempSync(join(tmpdir(), 'bmx-env-rcfile-'));
+      try {
+        writeFileSync(join(dir, '.bashrc'),
+          `if [ "$DISABLE_AUTO_UPDATE" = "true" ]; then\n` +
+          `  echo RCFILE_UPDATE_CHECK_DISABLED\n` +
+          `else\n` +
+          `  echo RCFILE_WOULD_PROMPT_FOR_UPDATE\n` +
+          `fi\n`,
+        );
+        // Exercise the exact launch prefix + wrapper contract used by all three
+        // persistent backends, with env(1) as a stand-in for the final CLI.
+        const argv = shellLaunchArgv('/bin/bash', ['-i']);
+        const result = spawnSync(
+          argv[0],
+          [...argv.slice(1), '-c', SHELL_WRAPPER_SCRIPT, '_', dir, '/usr/bin/env'],
+          { encoding: 'utf-8', env: { HOME: dir, PATH: '/usr/bin:/bin' } },
+        );
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain('RCFILE_UPDATE_CHECK_DISABLED');
+        expect(result.stdout).not.toContain('RCFILE_WOULD_PROMPT_FOR_UPDATE');
+        const cliEnv = result.stdout.split('\n');
+        expect(cliEnv.some(line => line.startsWith('DISABLE_AUTO_UPDATE='))).toBe(false);
+        expect(cliEnv.some(line => line.startsWith('DISABLE_UPDATE_PROMPT='))).toBe(false);
+        expect(cliEnv.some(line => line.startsWith('GIT_TERMINAL_PROMPT='))).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
 describe('resolveUserShell()', () => {
   let tmpDir: string | undefined;
   afterEach(() => {
@@ -388,6 +481,7 @@ describe('buildDebugKeepShellScript()', () => {
   it('preserves the cd-back-to-cwd guard from the normal script', () => {
     const s = buildDebugKeepShellScript('/bin/bash');
     expect(s).toMatch(/^cd -- "\$1" && shift/);
+    expect(s).toContain('unset DISABLE_AUTO_UPDATE');
   });
 
   it('emits a clear banner so the user knows the CLI exited, not crashed', () => {

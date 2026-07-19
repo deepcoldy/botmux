@@ -12,14 +12,16 @@ export type VcMeetingConsumerIsolationResult =
 /**
  * VC meeting entries are untrusted input, while their consumer role can request
  * externally-visible side effects.  A receiver is therefore eligible only
- * when the whole CLI is inside the Linux bwrap boundary whose mandatory
+ * when the whole CLI is inside the Linux bwrap boundary. Its mandatory
  * credential masks and host-authorized outbox relay make the managed action
  * ledger the only credentialed Lark output path.
  *
- * macOS `sandbox: true` currently provides write isolation only; riff injects
- * the Lark app secret into the remote task; herdr/zellij are not wrapped by the
- * local bwrap implementation.  All are intentionally rejected instead of
- * treating a prompt instruction as a security boundary.
+ * On macOS, `sandbox: true` can also add Seatbelt read isolation for supported
+ * CLIs, but the ordinary sandbox still exposes this bot's own send credential
+ * and has no host-authorized outbox relay. Riff injects the Lark app secret into
+ * the remote task; herdr/zellij are not wrapped by the local bwrap
+ * implementation. All are intentionally rejected instead of treating a prompt
+ * instruction as a security boundary.
  */
 export function evaluateVcMeetingConsumerIsolation(input: {
   sandbox: boolean | undefined;

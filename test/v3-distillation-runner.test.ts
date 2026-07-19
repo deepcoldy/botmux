@@ -11,7 +11,7 @@ import {
 } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -23,8 +23,8 @@ import {
   V3DistillationRunnerError,
   buildV3DistillationModelPrompt,
   buildV3DistillationSystemPrompt,
-  runV3DistillationModel,
-  sweepAbandonedV3DistillationScratch,
+  runV3DistillationModel as runV3DistillationModelImpl,
+  sweepAbandonedV3DistillationScratch as sweepAbandonedV3DistillationScratchImpl,
   type V3DistillationStructuredInvocation,
 } from '../src/workflows/v3/distillation-runner.js';
 import type { V3DistillationModelFieldV1 } from '../src/workflows/v3/distillation-compiler.js';
@@ -32,6 +32,37 @@ import type { BotSnapshot } from '../src/workflows/v3/contract.js';
 
 const roots: string[] = [];
 const originalAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
+
+function hostPortableStockClaudeFixture(scratchParent: string | undefined): string {
+  if (!scratchParent) throw new Error('test fixture requires scratchParent');
+  const executable = join(dirname(scratchParent), 'synthetic-claude');
+  writeFileSync(executable, '#!/usr/bin/env node\n', { mode: 0o700 });
+  return executable;
+}
+
+function runV3DistillationModel(
+  input: Parameters<typeof runV3DistillationModelImpl>[0],
+  deps: NonNullable<Parameters<typeof runV3DistillationModelImpl>[1]> = {},
+) {
+  const useHostPortableSeams = process.platform !== 'linux';
+  const adapterBin = useHostPortableSeams && deps.adapterBin === process.execPath
+    ? hostPortableStockClaudeFixture(deps.scratchParent)
+    : deps.adapterBin;
+  return runV3DistillationModelImpl(input, {
+    ...(useHostPortableSeams ? { etcSnapshot: ['hosts'] } : {}),
+    ...deps,
+    adapterBin,
+  });
+}
+
+function sweepAbandonedV3DistillationScratch(
+  input: Parameters<typeof sweepAbandonedV3DistillationScratchImpl>[0] = {},
+) {
+  return sweepAbandonedV3DistillationScratchImpl({
+    platform: 'linux',
+    ...input,
+  });
+}
 
 beforeEach(() => {
   process.env.ANTHROPIC_API_KEY = 'synthetic-test-api-key';
@@ -319,8 +350,9 @@ describe('runV3DistillationModel', () => {
     expect(readdirSync(dirs.scratchParent)).toEqual([]);
   });
 
-  it('collapses the PID namespace before cleaning scratch', async () => {
-    if (process.platform !== 'linux') return;
+  it.skipIf(process.platform !== 'linux')(
+    'collapses the PID namespace before cleaning scratch',
+    async () => {
     const dirs = fixture();
     const executable = join(dirs.root, 'synthetic-model-runner.cjs');
     writeFileSync(executable, `#!/usr/bin/env node
@@ -361,7 +393,8 @@ setInterval(() => {}, 1000);
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(900);
     expect(() => process.kill(helperPid, 0)).toThrow();
     expect(readdirSync(dirs.scratchParent)).toEqual([]);
-  });
+    },
+  );
 
   it('rejects unsupported platforms, CLIs, and malformed fields before invocation', async () => {
     const dirs = fixture();
@@ -928,8 +961,9 @@ describe('sweepAbandonedV3DistillationScratch', () => {
     expect(existsSync(unrelated)).toBe(true);
   });
 
-  it('kills an exact orphaned model process group before removing its scratch', async () => {
-    if (process.platform !== 'linux') return;
+  it.skipIf(process.platform !== 'linux')(
+    'kills an exact orphaned model process group before removing its scratch',
+    async () => {
     const dirs = fixture();
     const scratch = join(dirs.scratchParent, 'botmux-v3-distill-orphan123');
     mkdirSync(scratch, { mode: 0o700 });
@@ -969,10 +1003,12 @@ describe('sweepAbandonedV3DistillationScratch', () => {
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error('orphan remained alive')), 2_000)),
     ]);
     expect(existsSync(scratch)).toBe(false);
-  });
+    },
+  );
 
-  it('never signals a PID/start-tick collision recorded by a previous boot', async () => {
-    if (process.platform !== 'linux') return;
+  it.skipIf(process.platform !== 'linux')(
+    'never signals a PID/start-tick collision recorded by a previous boot',
+    async () => {
     const dirs = fixture();
     const scratch = join(dirs.scratchParent, 'botmux-v3-distill-oldboot123');
     mkdirSync(scratch, { mode: 0o700 });
@@ -1011,10 +1047,12 @@ describe('sweepAbandonedV3DistillationScratch', () => {
     child.kill('SIGKILL');
     await new Promise<void>((resolve) => child.once('close', () => resolve()));
     expect(existsSync(scratch)).toBe(false);
-  });
+    },
+  );
 
-  it('never blind-kills or ages out a leaderless legacy process-group marker', async () => {
-    if (process.platform !== 'linux') return;
+  it.skipIf(process.platform !== 'linux')(
+    'never blind-kills or ages out a leaderless legacy process-group marker',
+    async () => {
     const dirs = fixture();
     const scratch = join(dirs.scratchParent, 'botmux-v3-distill-legacy123');
     mkdirSync(scratch, { mode: 0o700 });
@@ -1032,7 +1070,8 @@ describe('sweepAbandonedV3DistillationScratch', () => {
       maxAgeMs: 31 * 60_000,
     })).toBe(0);
     expect(existsSync(scratch)).toBe(true);
-  });
+    },
+  );
 
   it('retains corrupt ownership markers instead of treating them as markerless', async () => {
     const dirs = fixture();
@@ -1079,8 +1118,9 @@ describe('sweepAbandonedV3DistillationScratch', () => {
     expect(existsSync(live)).toBe(true);
   });
 
-  it('removes preparing-only scratch after a boot-id mismatch without waiting for age', async () => {
-    if (process.platform !== 'linux') return;
+  it.skipIf(process.platform !== 'linux')(
+    'removes preparing-only scratch after a boot-id mismatch without waiting for age',
+    async () => {
     const dirs = fixture();
     const scratch = join(dirs.scratchParent, 'botmux-v3-distill-preparing-boot');
     mkdirSync(scratch, { mode: 0o700 });
@@ -1099,7 +1139,8 @@ describe('sweepAbandonedV3DistillationScratch', () => {
       maxAgeMs: 31 * 60_000,
     })).toBe(1);
     expect(existsSync(scratch)).toBe(false);
-  });
+    },
+  );
 
   it('retains corrupt preparing markers instead of aging them out', async () => {
     const dirs = fixture();

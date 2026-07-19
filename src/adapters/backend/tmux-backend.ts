@@ -276,8 +276,13 @@ export class TmuxBackend implements SessionBackend {
       // terminal and ran it themselves.
       //
       // Shape:
-      //   tmux new-session -- <shell> <shellFlags> -c <SCRIPT> _ <cwd> KEY=VAL... bin args...
+      //   tmux new-session -- /usr/bin/env DISABLE_AUTO_UPDATE=true
+      //     <shell> <shellFlags> -c <SCRIPT> _ <cwd> KEY=VAL... bin args...
       //
+      //   - The env(1) prefix makes DISABLE_AUTO_UPDATE visible while the
+      //     shell loads its rcfile, then SCRIPT unsets it before execing the
+      //     CLI. This prevents oh-my-zsh's update prompt without changing the
+      //     final CLI environment or running an unattended update.
       //   - <shell> + <shellFlags> come from resolveUserShell() and are
       //     bash/zsh/sh-specific (bash needs `-i` for .bashrc; zsh needs
       //     `-l -i` for .zprofile + .zshrc). fish/csh/nu are remapped to a
@@ -327,7 +332,7 @@ export class TmuxBackend implements SessionBackend {
         '-x', String(opts.cols),
         '-y', String(opts.rows),
         '--',
-        shellSpec.shell, ...shellSpec.flags, '-c', script, '_',
+        ...shellLaunchArgv(shellSpec.shell, shellSpec.flags), '-c', script, '_',
         opts.cwd,
         ...envAssignments,
         bin, ...args,
@@ -588,6 +593,52 @@ export class TmuxBackend implements SessionBackend {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
+ * Env vars that must be set BEFORE the user's shell rcfile loads, so interactive
+ * prompts during rcfile sourcing don't block the shell startup and prevent the
+ * CLI from launching. These are injected as `env KEY=VAL shell -i -c '...'` so
+ * the rcfile sees them while sourcing. oh-my-zsh's check_for_upgrade.sh reads
+ * $DISABLE_AUTO_UPDATE before showing its "Would you like to update Oh My Zsh?
+ * [Y/n]" prompt.
+ *
+ * DISABLE_AUTO_UPDATE=true makes the botmux-managed shell skip the update check
+ * altogether. DISABLE_UPDATE_PROMPT is deliberately not used: oh-my-zsh maps it
+ * to update_mode=auto, which would modify the user's installation without the
+ * confirmation their normal prompt-mode shell requires. GIT_TERMINAL_PROMPT is
+ * also deliberately untouched so git commands run by the eventual CLI preserve
+ * the user's normal credential behavior.
+ *
+ * Why here and not in buildBotmuxEnvAssignments: those are injected via
+ * `exec /usr/bin/env "$@"` which runs AFTER rcfile load — too late for an
+ * oh-my-zsh update prompt that already blocked the shell. These must be in the
+ * shell process's own environment when it starts, so they're visible to the
+ * rcfile. Applied via `env(1)` prefix in shellLaunchArgv() so they work even
+ * when the tmux server was already started by a different client.
+ */
+export const NON_INTERACTIVE_SHELL_ENV = [
+  'DISABLE_AUTO_UPDATE=true',
+] as const;
+
+/** Remove rcfile-only launch overrides before the managed CLI is exec'd. */
+const NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE =
+  `unset ${NON_INTERACTIVE_SHELL_ENV.map(assignment => assignment.split('=', 1)[0]).join(' ')}`;
+
+/**
+ * Build the argv prefix that launches the user's shell with non-interactive
+ * env vars set BEFORE rcfile load. Returns:
+ *   ['/usr/bin/env', 'DISABLE_AUTO_UPDATE=true', shell, ...flags]
+ *
+ * Backends splat this before `-c <SCRIPT> _ <cwd> KEY=VAL... bin args...`:
+ *   tmux new-session ... -- /usr/bin/env DISABLE_AUTO_UPDATE=true <shell> <flags> -c <SCRIPT> _ ...
+ *
+ * The env(1) prefix sets the vars in the shell process's own environment so
+ * the rcfile sees them during sourcing; they are NOT in the tmux server global
+ * env (so they don't leak to the user's own interactive tmux sessions). The
+ * wrapper removes them after rcfile load and before execing the CLI.
+ */
+export function shellLaunchArgv(shell: string, flags: string[]): string[] {
+  return ['/usr/bin/env', ...NON_INTERACTIVE_SHELL_ENV, shell, ...flags];
+}
+
 /**
  * Build the `KEY=VAL` argv slice passed to `/usr/bin/env`. Only forwards the
  * centralized BOTMUX_INJECTED_ENV_KEYS allowlist and only when the value is
@@ -627,8 +678,9 @@ export function buildBotmuxEnvAssignments(
  *   $0 = '_' (placeholder), $1 = cwd, $2..N = KEY=VAL... bin args...
  *
  * The `cd` step makes the CLI's cwd survive a wayward `cd` in the user's
- * rcfile. The `unset` step removes stale botmux-owned values the pane inherited
- * from the tmux server's global env. The PATH prepend puts the
+ * rcfile. The first `unset` step removes stale botmux-owned values the pane
+ * inherited from the tmux server's global env; the second removes the
+ * rcfile-only launch override before the CLI starts. The PATH prepend puts the
  * daemon-written wrapper dir (~/.botmux/bin, which holds THIS build's `botmux`)
  * ahead of any npm-global botmux the rcfile put earlier in PATH — otherwise the
  * agent's `botmux` could resolve to a stale build. Critical under read isolation:
@@ -640,7 +692,7 @@ export function buildBotmuxEnvAssignments(
  * POSIX-syntax (works in bash/zsh/sh); fish/csh/nu users get remapped to
  * bash/zsh/sh by resolveUserShell() so they hit the same SCRIPT path.
  */
-export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${PANE_ENV_UNSET_CLAUSE} && export PATH="$HOME/.botmux/bin:$PATH" && exec /usr/bin/env "$@"`;
+export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${PANE_ENV_UNSET_CLAUSE} && ${NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE} && export PATH="$HOME/.botmux/bin:$PATH" && exec /usr/bin/env "$@"`;
 
 export const DIAGNOSTIC_SHELL_SCRIPT = [
   'cd -- "$1" 2>/dev/null || cd "$HOME" 2>/dev/null || cd /',
@@ -672,6 +724,8 @@ export function buildDebugKeepShellScript(shellPath: string): string {
     // Same managed-env cleanup as SHELL_WRAPPER_SCRIPT — so neither the CLI nor
     // the interactive debug shell sees stale server/rcfile-owned values.
     PANE_ENV_UNSET_CLAUSE,
+    // The pre-rcfile launch override must not reach the CLI or debug shell.
+    NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE,
     // Same PATH prepend as SHELL_WRAPPER_SCRIPT (wrapper build wins over stale npm-global).
     'export PATH="$HOME/.botmux/bin:$PATH"',
     '/usr/bin/env "$@"',

@@ -139,6 +139,8 @@ export interface V3DistillationRunnerDeps {
   removeScratch?: (path: string) => Promise<void>;
   /** Test seam for Linux endpoint-managed Claude policy discovery. */
   managedPolicyRoot?: string;
+  /** Test-only frozen Linux `/etc` view. */
+  etcSnapshot?: readonly string[];
   /** Test-only bwrap seam. Production always invokes the stock `bwrap`. */
   sandboxBin?: string;
 }
@@ -148,8 +150,10 @@ export async function sweepAbandonedV3DistillationScratch(input: {
   scratchParent?: string;
   nowMs?: number;
   maxAgeMs?: number;
+  /** Test-only platform seam for host-independent cleanup cases. */
+  platform?: NodeJS.Platform;
 } = {}): Promise<number> {
-  if (process.platform !== 'linux') return 0;
+  if ((input.platform ?? process.platform) !== 'linux') return 0;
   const parent = await realpath(
     input.scratchParent ?? ensureV3DistillationScratchRoot(),
   );
@@ -411,7 +415,9 @@ export async function runV3DistillationModel(
   }
   const managedPolicyRoot = deps.managedPolicyRoot ?? DEFAULT_MANAGED_POLICY_ROOT;
   const managedPolicyRootExists = assertNoLinuxManagedClaudePolicy(managedPolicyRoot);
-  const etcSnapshot = snapshotDistillationEtcEntries();
+  const etcSnapshot = deps.etcSnapshot === undefined
+    ? snapshotDistillationEtcEntries()
+    : [...deps.etcSnapshot];
   const modelInput = normalizeModelFields(input.fields);
   const timeoutMs = normalizeTimeout(input.timeoutMs);
   let scratchDir: string | undefined;

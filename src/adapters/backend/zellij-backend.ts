@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { zellijEnv, probeZellijFunctional } from '../../setup/ensure-zellij.js';
-import { resolveUserShell, buildBotmuxEnvAssignments, SHELL_WRAPPER_SCRIPT } from './tmux-backend.js';
+import { resolveUserShell, buildBotmuxEnvAssignments, SHELL_WRAPPER_SCRIPT, shellLaunchArgv } from './tmux-backend.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -316,8 +316,14 @@ export function kdlString(s: string): string {
 export function buildLayoutString(bin: string, args: string[], opts: SpawnOpts): string {
   const shellSpec = resolveUserShell(process.env, opts.launchShell);
   const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
+  // shellLaunchArgv() returns ['/usr/bin/env', 'DISABLE_AUTO_UPDATE=true',
+  // shell, ...flags] — the env(1) prefix sets the startup-only override BEFORE
+  // rcfile load so oh-my-zsh update prompts don't block shell startup. The
+  // wrapper removes it before execing the CLI. The first element is the pane
+  // command; the rest are leading args before the wrapper script flags.
+  const [cmd, ...launchArgs] = shellLaunchArgv(shellSpec.shell, shellSpec.flags);
   const paneArgs = [
-    ...shellSpec.flags, '-c', SHELL_WRAPPER_SCRIPT, '_',
+    ...launchArgs, '-c', SHELL_WRAPPER_SCRIPT, '_',
     opts.cwd,
     ...envAssignments,
     bin, ...args,
@@ -325,7 +331,7 @@ export function buildLayoutString(bin: string, args: string[], opts: SpawnOpts):
   const argsKdl = paneArgs.map(kdlString).join(' ');
   return [
     'layout {',
-    `    pane command=${kdlString(shellSpec.shell)} close_on_exit=true {`,
+    `    pane command=${kdlString(cmd)} close_on_exit=true {`,
     `        args ${argsKdl}`,
     '    }',
     '}',

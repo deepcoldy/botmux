@@ -32,7 +32,7 @@ describe('VC meeting consumer managed side-effect isolation', () => {
     },
   );
 
-  it('rejects macOS because its current sandbox does not confine credential reads', () => {
+  it('rejects macOS because its sandbox exposes the bot credential without a host relay', () => {
     expect(evaluateVcMeetingConsumerIsolation({
       sandbox: true,
       platform: 'darwin',

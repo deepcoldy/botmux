@@ -31,7 +31,7 @@ import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
 import { tmuxEnv } from '../../setup/ensure-tmux.js';
-import { buildBotmuxEnvAssignments, resolveUserShell, SHELL_WRAPPER_SCRIPT, TmuxBackend } from './tmux-backend.js';
+import { buildBotmuxEnvAssignments, resolveUserShell, SHELL_WRAPPER_SCRIPT, shellLaunchArgv, TmuxBackend } from './tmux-backend.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 
 function shellescape(s: string): string {
@@ -623,7 +623,7 @@ export class TmuxPipeBackend implements SessionBackend {
       '-x', String(opts.cols),
       '-y', String(opts.rows),
       '--',
-      shellSpec.shell, ...shellSpec.flags, '-c', SHELL_WRAPPER_SCRIPT, '_',
+      ...shellLaunchArgv(shellSpec.shell, shellSpec.flags), '-c', SHELL_WRAPPER_SCRIPT, '_',
       opts.cwd,
       ...envAssignments,
       bin, ...args,

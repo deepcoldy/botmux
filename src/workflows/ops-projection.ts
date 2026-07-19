@@ -18,7 +18,7 @@
  *     runDir + blobDir, which is wrong for a read-only API.
  */
 import { promises as fs } from 'node:fs';
-import { relative, resolve, sep, join, dirname } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import {
   parseWorkflowDefinition,
@@ -601,14 +601,34 @@ async function previewRef(
     cache.set(key, res);
     return res;
   }
-  if (!isPathInside(runDir, ref.outputPath)) {
-    const res = { ...base, error: 'outputPath is outside run directory' };
+  let outputPath: string;
+  try {
+    const [canonicalRunDir, canonicalOutputPath] = await Promise.all([
+      fs.realpath(runDir),
+      fs.realpath(ref.outputPath),
+    ]);
+    if (!isPathInside(canonicalRunDir, canonicalOutputPath)) {
+      const res = { ...base, error: 'outputPath is outside run directory' };
+      cache.set(key, res);
+      return res;
+    }
+    outputPath = canonicalOutputPath;
+  } catch (err) {
+    if (!isPathInside(runDir, ref.outputPath)) {
+      const res = { ...base, error: 'outputPath is outside run directory' };
+      cache.set(key, res);
+      return res;
+    }
+    const res = {
+      ...base,
+      error: err instanceof Error ? err.message : String(err),
+    };
     cache.set(key, res);
     return res;
   }
 
   try {
-    const handle = await fs.open(ref.outputPath, 'r');
+    const handle = await fs.open(outputPath, 'r');
     try {
       const stat = await handle.stat();
       const bytesToRead = Math.min(stat.size, BLOB_PREVIEW_MAX_BYTES);
@@ -648,7 +668,8 @@ async function previewRef(
 
 function isPathInside(parent: string, child: string): boolean {
   const rel = relative(resolve(parent), resolve(child));
-  return rel === '' || (!!rel && !rel.startsWith('..') && !rel.startsWith(sep));
+  return rel === '' ||
+    (!!rel && !rel.startsWith('..') && !rel.startsWith(sep) && !isAbsolute(rel));
 }
 
 function isJsonContent(contentType?: string): boolean {

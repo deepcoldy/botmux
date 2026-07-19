@@ -1,5 +1,12 @@
 /** Frozen v2 read-only projection coverage retained for archive verification. */
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -44,6 +51,7 @@ async function seedRun(input: {
   terminal?: 'succeeded' | 'failed';
   timestamp?: number;
   binding?: boolean;
+  escapeOutputPath?: boolean;
 }): Promise<FrozenV2EventLog> {
   const { runId } = input;
   const log = new FrozenV2EventLog(runId, runsDir);
@@ -57,7 +65,13 @@ async function seedRun(input: {
     outputSchemaVersion: 1,
     contentType: 'application/json',
   };
-  writeFileSync(outputPath, '{"ok":true}\n', 'utf-8');
+  if (input.escapeOutputPath) {
+    const outsidePath = join(root, `${runId}-outside.json`);
+    writeFileSync(outsidePath, '{"ok":true}\n', 'utf-8');
+    symlinkSync(outsidePath, outputPath);
+  } else {
+    writeFileSync(outputPath, '{"ok":true}\n', 'utf-8');
+  }
   writeFileSync(join(log.runDir, 'workflow.json'), canonicalJsonStringify(DEF), 'utf-8');
   if (input.binding) {
     writeFileSync(
@@ -193,6 +207,21 @@ describe('frozen v2 snapshot and event window', () => {
     expect(after?.events.map((event) => event.eventId)).toEqual(['window-4', 'window-5']);
     expect(await readEventWindow(runsDir, '../window')).toBeNull();
     expect(await readRunSnapshot(runsDir, 'missing')).toBeNull();
+  });
+
+  it('rejects an OutputRef symlink that resolves outside the run directory', async () => {
+    await seedRun({
+      runId: 'escape',
+      terminal: 'succeeded',
+      escapeOutputPath: true,
+    });
+    const snapshot = await readRunSnapshot(runsDir, 'escape');
+    const preview = Object.values(snapshot?.attemptIO ?? {})[0]?.output;
+    expect(preview).toMatchObject({
+      error: 'outputPath is outside run directory',
+    });
+    expect(preview).not.toHaveProperty('value');
+    expect(preview).not.toHaveProperty('text');
   });
 });
 

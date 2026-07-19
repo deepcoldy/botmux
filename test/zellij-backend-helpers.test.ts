@@ -58,6 +58,9 @@ describe('buildLayoutString', () => {
     });
     expect(kdl).toContain('layout {');
     expect(kdl).toContain('close_on_exit=true');
+    expect(kdl).toContain('pane command="/usr/bin/env"');
+    expect(kdl).toContain('"DISABLE_AUTO_UPDATE=true"');
+    expect(kdl).not.toContain('GIT_TERMINAL_PROMPT=0');
     // cwd is passed as a wrapper-script arg (execvp semantics, KDL-quoted).
     expect(kdl).toContain('"/work/dir"');
     expect(kdl).toContain('"claude"');

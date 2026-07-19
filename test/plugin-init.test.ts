@@ -72,14 +72,27 @@ function createTemplateFixture(root: string): string {
 
 function packTemplateFixture(template: string, destination: string): string {
   mkdirSync(destination, { recursive: true });
-  const result = JSON.parse(execFileSync('npm', [
+  const result: unknown = JSON.parse(execFileSync('npm', [
     'pack',
     '--ignore-scripts',
     '--json',
     '--pack-destination',
     destination,
   ], { cwd: template, encoding: 'utf-8' }));
-  return join(destination, result[0].filename);
+  const packed = Array.isArray(result)
+    ? result[0]
+    : result && typeof result === 'object'
+      ? Object.values(result)[0]
+      : undefined;
+  if (
+    !packed ||
+    typeof packed !== 'object' ||
+    !('filename' in packed) ||
+    typeof packed.filename !== 'string'
+  ) {
+    throw new Error('npm pack returned no filename');
+  }
+  return join(destination, packed.filename);
 }
 
 describe('plugin init', () => {

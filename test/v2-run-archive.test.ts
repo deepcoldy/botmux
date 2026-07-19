@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   rmSync,
   symlinkSync,
@@ -357,6 +358,7 @@ describe('v2 workflow-run content-addressed archive', () => {
 
   it('requires daemon-stop acknowledgement, quarantines atomically, and replays idempotently', async () => {
     seedTerminal();
+    const canonicalRunsDir = realpathSync(runsDir);
     const archived = await commitV2RunArchive({ runsDir, archiveBaseDir });
     await expect(retireV2RunSource({
       runsDir,
@@ -381,7 +383,7 @@ describe('v2 workflow-run content-addressed archive', () => {
     expect(lstatSync(retired.receiptPath).mode & 0o777).toBe(0o600);
     expect(retired.receipt).toMatchObject({
       archiveId: archived.manifest.archiveId,
-      sourceRunsDir: runsDir,
+      sourceRunsDir: canonicalRunsDir,
       quarantineDir: retired.quarantineDir,
       retiredAt: '2026-07-11T01:00:00.000Z',
     });
@@ -467,13 +469,22 @@ describe('v2 workflow-run content-addressed archive', () => {
   });
 
   it('retires absolute OutputRef paths and recovers after rename without replaying relocated projections', async () => {
+    const physicalRoot = join(root, 'physical');
+    const aliasRoot = join(root, 'alias');
+    mkdirSync(physicalRoot);
+    symlinkSync(physicalRoot, aliasRoot, 'dir');
+    runsDir = join(aliasRoot, 'workflow-runs');
+    mkdirSync(runsDir);
+
     seedSucceededWithAbsoluteOutputPath();
+    const canonicalRunsDir = realpathSync(runsDir);
     const archived = await commitV2RunArchive({ runsDir, archiveBaseDir });
     const projection = JSON.parse(readFileSync(
       join(archived.archiveDir, 'runs', 'run-absolute-output', 'projection.json'),
       'utf-8',
     ));
     expect(projection.attemptIO['att-1'].input.value).toEqual({ ok: true });
+    runsDir = canonicalRunsDir;
 
     await expect(retireV2RunSource({
       runsDir,

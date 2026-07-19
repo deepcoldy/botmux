@@ -93,6 +93,20 @@ const realtimeVoiceSpeakHolds = vi.hoisted(() => ({
   resolvers: [] as Array<() => void>,
 }));
 
+vi.mock('../src/services/vc-meeting-consumer-isolation.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/vc-meeting-consumer-isolation.js')>();
+  return {
+    ...actual,
+    // The lifecycle below is platform-independent and models the supported
+    // receiver path. Keep every case running on macOS while using the real
+    // policy logic with Linux selected; platform rejection remains covered by
+    // the focused isolation tests.
+    evaluateVcMeetingConsumerIsolation: (
+      input: Parameters<typeof actual.evaluateVcMeetingConsumerIsolation>[0],
+    ) => actual.evaluateVcMeetingConsumerIsolation({ ...input, platform: 'linux' }),
+  };
+});
+
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient {
     opts: Record<string, unknown>;
