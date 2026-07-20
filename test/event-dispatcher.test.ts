@@ -470,6 +470,49 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
     }));
   });
 
+  it('does not merge a root-linked clarification after the sender is revoked', async () => {
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA forwarded report' }),
+      messageId: 'msg-revoked-seed',
+      chatId: 'chat-revoked',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    const clarification = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '请分析这个慢查询' }),
+      rootId: 'msg-revoked-seed',
+      messageId: 'msg-revoked-clarification',
+      chatId: 'chat-revoked',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+    // Simulate /revoke between seed and clarification: keep an allowlist
+    // configured (so canTalk is not in 'open' mode) but remove the sender.
+    setupBotState({
+      allowedUsers: ['ou_someone_else'],
+      regularGroupMentionMode: 'never',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](clarification);
+    await flushEventWork();
+    // Clarification must not merge with the seed
+    expect(handlers.handleNewTopic).not.toHaveBeenCalledWith(clarification, expect.anything());
+
+    // Seed still flushes on its original timer, dispatched exactly once
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(seed, expect.objectContaining({
+      anchor: 'msg-revoked-seed',
+      forwardSeedData: undefined,
+    }));
+  });
+
   it('flushes an old pending seed instead of merging after mention mode becomes always', async () => {
     const seed = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,

@@ -2634,7 +2634,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           : '';
         const isControlCommand = strippedRoutingText.startsWith('/');
         let pairedForwardSeed;
-        if (senderOpenId && message.root_id && !isControlCommand) {
+        // Require isAllowed before pairing: a root-linked clarification from a
+        // sender who was /revoked within the grace window must not consume the
+        // seed from the buffer or overwrite the durable paired record. The seed
+        // stays in the buffer and flushes on its original timer. Paired seeds
+        // only arise under never/ambient modes, where a legitimate merge always
+        // requires isAllowed anyway.
+        if (senderOpenId && isAllowed && message.root_id && !isControlCommand) {
           await seedRoutingGates.get(message.root_id)?.ready;
           const pairingInput = {
             larkAppId,
