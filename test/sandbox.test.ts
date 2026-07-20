@@ -259,7 +259,13 @@ describe('sandboxedClaudeDataDir (symlink HOME redirect)', () => {
       expect(sandboxedClaudeDataDir('sid-home', join(home, '.claude'), {
         sourceWorkingDir: home,
         dataDir,
-      })).toBe(join(dataDir, 'sandboxes', 'sid-home', 'proj-upper', '.claude'));
+      })).toBe(join(
+        resolveSandboxMountPath(dataDir),
+        'sandboxes',
+        'sid-home',
+        'proj-upper',
+        '.claude',
+      ));
     } finally {
       if (prevHome !== undefined) process.env.HOME = prevHome;
       else delete process.env.HOME;

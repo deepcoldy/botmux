@@ -358,8 +358,14 @@ describe('plugin MCP Gateway', () => {
   });
 
   it('rejects a same-UID sibling process that scans the Gateway socket directory', async () => {
-    const socketRoot = join(home, 'socket-root');
-    mkdirSync(socketRoot, { recursive: true });
+    // On macOS keep this mock root directly under /tmp instead of the already
+    // nested per-test HOME. Darwin supports at most 103 bytes for a Unix socket
+    // path; nesting it under HOME produces an unsupported 118-byte fixture and
+    // tests path length rather than the same-UID authentication boundary.
+    const socketRoot = mkdtempSync(join(
+      process.platform === 'darwin' ? '/tmp' : tmpdir(),
+      'botmux-mcp-socket-root-',
+    ));
     vi.stubEnv('TMPDIR', socketRoot);
     const host = await startSessionMcpGatewayHost({
       sessionId: 'same-uid-victim',
@@ -393,6 +399,7 @@ describe('plugin MCP Gateway', () => {
       expect(JSON.parse(result.stdout)).toEqual({ scanned: 1, accepted: 0 });
     } finally {
       await host.close();
+      rmSync(socketRoot, { recursive: true, force: true });
     }
   });
 
