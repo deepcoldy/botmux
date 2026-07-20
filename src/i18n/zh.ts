@@ -1101,6 +1101,7 @@ export const messages: Record<string, string> = {
 
   // Restart / maintenance report (bot-0 DM to owner)
   'restart.updated_restarted': '🔄 **botmux 已更新并重启**',
+  'restart.rolled_back_restarted': '↩️ **botmux 已回退并重启**',
   'restart.restarted': '🔄 **botmux 已重启**',
   'restart.version_delta': '版本：{old} → {new}',
   'restart.version': '版本：{version}',

@@ -364,11 +364,15 @@ function SettingsPage() {
     setUpBusy(true);
     setUpMsg({ text: tr('update.restarting') });
     try {
-      await fetch('/api/update/restart', {
+      const response = await fetch('/api/update/restart', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(updatePayload ? { update: updatePayload } : {}),
       });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok || body.ok === false) {
+        throw new Error(String(body.detail ?? body.error ?? `HTTP ${response.status}`));
+      }
       if (!mountedRef.current) return;
     } catch (e) {
       if (!mountedRef.current) return;

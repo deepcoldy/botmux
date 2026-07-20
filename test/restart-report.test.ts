@@ -99,6 +99,21 @@ describe('buildRestartReportText', () => {
     expect(md).toContain('2.64.0');
     expect(md).toContain('2.65.0');
   });
+
+  it('rollback restart reports the old→new delta without a changelog', () => {
+    const md = buildRestartReportText({
+      kind: 'rollback',
+      version: '3.0.0',
+      sessionCount: 0,
+      oldVersion: '3.1.0',
+      newVersion: '3.0.0',
+      changelog: 'must not be shown',
+    });
+    expect(md).toContain('已回退并重启');
+    expect(md).toContain('3.1.0');
+    expect(md).toContain('3.0.0');
+    expect(md).not.toContain('must not be shown');
+  });
 });
 
 describe('sendRestartReportIfPending', () => {

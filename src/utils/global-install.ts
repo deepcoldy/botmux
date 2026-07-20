@@ -150,6 +150,24 @@ export function isAutoUpdateSupportedInstall(): boolean {
   return tryResolveGlobalInstallPlan() !== null;
 }
 
+/** Pin an install plan to one registry. Callers opt in explicitly (rollback only). */
+export function withGlobalInstallRegistry(
+  plan: GlobalInstallPlan,
+  registry = 'https://registry.npmjs.org/',
+): GlobalInstallPlan {
+  return {
+    ...plan,
+    env: {
+      ...plan.env,
+      // npm accepts either casing; setting both also prevents an inherited
+      // lowercase value from taking precedence. pnpm reads npm config env too.
+      NPM_CONFIG_REGISTRY: registry,
+      npm_config_registry: registry,
+      BUN_CONFIG_REGISTRY: registry,
+    },
+  };
+}
+
 export function formatGlobalInstallCommand(plan: GlobalInstallPlan): string {
   const quote = (arg: string): string => /\s/.test(arg) ? JSON.stringify(arg) : arg;
   return [plan.command, ...plan.args].map(quote).join(' ');

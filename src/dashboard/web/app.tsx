@@ -28,6 +28,7 @@ import { requestOpenCreateSession } from './create-session-entry.js';
 import { InfoTip } from './dashboard-components.js';
 import { initFloatingScrollbars } from './floating-scrollbars.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
+import { updateAndRestartBotmux, type BotmuxUpdatePhase } from './update-action.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -37,6 +38,17 @@ type TopbarStatusSummary = {
   idle: number;
   onlineBots: number;
   attentionNotice: TopbarAttentionNotice | null;
+};
+type BotmuxUpdateStatus = {
+  current: string;
+  latest: string | null;
+  versionLookupOk: boolean;
+  behind: boolean;
+  localDevInstall: boolean;
+  updateSupported: boolean;
+  updateCommand: string | null;
+  node: { version: string; required: number; ok: boolean };
+  installs: { entries: Array<{ binPath: string }>; multiple: boolean };
 };
 
 type NavItem = {
@@ -142,6 +154,7 @@ let ownerAvatar: OwnerAvatar | null = null;
 let updateBehind = false;
 let latestVersion: string | null = null;
 let updateBadgeKind: 'botmux' | 'codex' | null = null;
+let botmuxUpdateStatus: BotmuxUpdateStatus | null = null;
 let routeRoot: HTMLElement | null = null;
 let appRoot: ReturnType<typeof createRoot> | null = null;
 
@@ -475,6 +488,478 @@ function AuthExpiredOverlay(props: { open: boolean; onClose(): void }): JSX.Elem
   );
 }
 
+type TopbarUpdatePhase = 'idle' | BotmuxUpdatePhase | 'error';
+
+type RollbackVersion = {
+  version: string;
+  publishedAt: string | null;
+};
+
+function formatRollbackDate(publishedAt: string): string {
+  const date = new Date(publishedAt);
+  if (Number.isNaN(date.getTime())) return publishedAt.slice(0, 10);
+  try {
+    return new Intl.DateTimeFormat(ui.locale === 'zh' ? 'zh-CN' : 'en-US', {
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+    }).format(date);
+  } catch {
+    return publishedAt.slice(0, 10);
+  }
+}
+
+async function dashboardInstance(): Promise<string> {
+  const response = await fetch('/__selfcheck', { cache: 'no-store' });
+  const instance = await response.text();
+  if (!response.ok || !instance) {
+    throw new Error(t('update.healthCheckFailed'));
+  }
+  return instance;
+}
+
+function TopbarVersionControl(props: {
+  status: BotmuxUpdateStatus | null;
+  onRefresh(): Promise<boolean>;
+}): JSX.Element | null {
+  const { status } = props;
+  const [open, setOpen] = useState(false);
+  const [phase, setPhase] = useState<TopbarUpdatePhase>('idle');
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshFailed, setRefreshFailed] = useState(false);
+  const [errorDetail, setErrorDetail] = useState('');
+  const [rollbackOpen, setRollbackOpen] = useState(false);
+  const [rollbackLoaded, setRollbackLoaded] = useState(false);
+  const [rollbackLoading, setRollbackLoading] = useState(false);
+  const [rollbackLoadFailed, setRollbackLoadFailed] = useState(false);
+  const [rollbackVersions, setRollbackVersions] = useState<RollbackVersion[]>([]);
+  const [selectedRollback, setSelectedRollback] = useState<string | null>(null);
+  const [activeRollback, setActiveRollback] = useState<string | null>(null);
+  const actionInFlightRef = useRef(false);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const clearReconnectTimer = () => {
+    if (reconnectTimerRef.current === null) return;
+    window.clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
+  };
+
+  useEffect(() => {
+    actionInFlightRef.current = false;
+    setPhase('idle');
+    setRefreshing(false);
+    setRefreshFailed(false);
+    setErrorDetail('');
+    setRollbackOpen(false);
+    setRollbackLoaded(false);
+    setRollbackLoading(false);
+    setRollbackLoadFailed(false);
+    setRollbackVersions([]);
+    setSelectedRollback(null);
+    setActiveRollback(null);
+  }, [status?.current, status?.latest]);
+
+  useEffect(() => {
+    if (status) setRefreshFailed(status.versionLookupOk === false);
+  }, [status]);
+
+  useEffect(() => {
+    if (!open) setRollbackOpen(false);
+  }, [open]);
+
+  useEffect(() => () => clearReconnectTimer(), []);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnPointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      setOpen(false);
+      triggerRef.current?.focus();
+    };
+    document.addEventListener('pointerdown', closeOnPointerDown);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnPointerDown);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [open]);
+
+  if (!status) return null;
+
+  const behind = status.behind && !!status.latest;
+  const unknown = !status.latest;
+  const automatic = behind && status.updateSupported && !status.localDevInstall && status.node.ok;
+  const rollbackSupported = status.updateSupported && !status.localDevInstall && status.node.ok;
+  const busy = phase === 'updating' || phase === 'restarting';
+  const command = status.updateCommand ?? 'botmux update';
+  const currentVersion = `v${status.current}`;
+  const latestVersion = status.latest ? `v${status.latest}` : '';
+  const unavailableReason = status.localDevInstall
+    ? t('update.localDev')
+    : !status.updateSupported
+      ? t('update.unsupportedInstall')
+      : !status.node.ok
+        ? t('update.nodeWarn', { version: status.node.version, required: status.node.required })
+        : '';
+
+  const pollReconnect = (previousInstance: string) => {
+    const startedAt = Date.now();
+    const tick = async (): Promise<void> => {
+      try {
+        const response = await fetch('/__selfcheck', { cache: 'no-store' });
+        const instance = await response.text();
+        if (response.ok && instance && instance !== previousInstance) {
+          location.reload();
+          return;
+        }
+      } catch { /* dashboard is still restarting */ }
+      if (Date.now() - startedAt > 90_000) {
+        actionInFlightRef.current = false;
+        setPhase('error');
+        setErrorDetail(t('update.restartSlow'));
+        return;
+      }
+      reconnectTimerRef.current = window.setTimeout(() => void tick(), 2_000);
+    };
+    reconnectTimerRef.current = window.setTimeout(() => void tick(), 3_000);
+  };
+
+  const run = async () => {
+    if (!behind) return;
+    if (!automatic) {
+      setOpen(false);
+      location.hash = '#/settings';
+      return;
+    }
+    if (actionInFlightRef.current) return;
+
+    actionInFlightRef.current = true;
+    setActiveRollback(null);
+    setRefreshFailed(false);
+    setErrorDetail('');
+    try {
+      const previousInstance = await dashboardInstance();
+      const result = await updateAndRestartBotmux(fetch, setPhase);
+      if (!result.restarted) {
+        // Update installed but the restart handoff failed — surface it
+        // directly instead of polling for a reconnect that will never come.
+        actionInFlightRef.current = false;
+        setPhase('error');
+        setErrorDetail(t('update.restartFailed', { detail: result.restartError ?? 'unknown' }));
+        return;
+      }
+      pollReconnect(previousInstance);
+    } catch (error) {
+      actionInFlightRef.current = false;
+      setPhase('error');
+      setErrorDetail(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const loadRollbackVersions = async (force = false): Promise<boolean> => {
+    if (rollbackLoading) return !rollbackLoadFailed;
+    setRollbackLoading(true);
+    setRollbackLoadFailed(false);
+    try {
+      const response = await fetch(`/api/update/versions${force ? '?refresh=1' : ''}`, { cache: 'no-store' });
+      const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+      if (!body || !Array.isArray(body.versions)) throw new Error('Invalid rollback versions response');
+      const versions = body.versions
+        .filter((entry): entry is RollbackVersion => {
+          if (!entry || typeof entry !== 'object') return false;
+          const value = entry as Record<string, unknown>;
+          return typeof value.version === 'string'
+            && (typeof value.publishedAt === 'string' || value.publishedAt === null);
+        })
+        .slice(0, 3);
+      setRollbackVersions(versions);
+      setSelectedRollback(value => versions.some(entry => entry.version === value) ? value : null);
+      setRollbackLoaded(true);
+      const ok = response.ok && body.ok === true;
+      setRollbackLoadFailed(!ok);
+      return ok;
+    } catch {
+      setRollbackLoaded(true);
+      setRollbackLoadFailed(true);
+      return false;
+    } finally {
+      setRollbackLoading(false);
+    }
+  };
+
+  const runRollback = async () => {
+    if (!selectedRollback || !rollbackSupported || rollbackLoading || actionInFlightRef.current) return;
+
+    actionInFlightRef.current = true;
+    setActiveRollback(selectedRollback);
+    setRefreshFailed(false);
+    setErrorDetail('');
+    try {
+      const previousInstance = await dashboardInstance();
+      await updateAndRestartBotmux(fetch, setPhase, selectedRollback);
+      pollReconnect(previousInstance);
+    } catch (error) {
+      actionInFlightRef.current = false;
+      setPhase('error');
+      setErrorDetail(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const refresh = async () => {
+    if (refreshing || busy) return;
+    setRefreshing(true);
+    setRefreshFailed(false);
+    try {
+      const statusOk = await props.onRefresh();
+      if (rollbackOpen) await loadRollbackVersions(true);
+      setRefreshFailed(!statusOk);
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const message = phase === 'updating'
+    ? activeRollback
+      ? t('update.rollbackInstalling', { version: activeRollback })
+      : t('update.updating', { command })
+    : phase === 'restarting'
+      ? activeRollback
+        ? t('update.rollbackRestarting', { version: activeRollback })
+        : t('update.restarting')
+      : phase === 'error'
+        ? activeRollback
+          ? t('update.rollbackFailed', { detail: errorDetail })
+          : t('update.updateFailed', { detail: errorDetail })
+        : refreshFailed
+          ? t('update.topbarRefreshFailed')
+          : behind
+          ? automatic
+            ? t('update.versionUpgradePrompt', { version: latestVersion })
+            : unavailableReason
+          : status.latest
+            ? t('update.upToDate')
+            : t('update.checkUnavailable');
+  const action = !automatic
+    ? t('update.topbarReview')
+    : phase === 'error'
+      ? t('update.topbarRetry')
+      : phase === 'idle'
+        ? t('update.topbarAction')
+        : t('update.topbarWorking');
+  const versionSignal = phase === 'error' || (refreshFailed && unknown)
+    ? { className: 'is-error', symbol: '!' }
+    : behind
+      ? { className: 'has-update', symbol: '↑' }
+      : unknown
+        ? { className: 'is-unknown', symbol: '?' }
+        : { className: 'is-current', symbol: '✓' };
+
+  return (
+    <div ref={rootRef} className={`dashboard-version-control${open ? ' is-open' : ''}`}>
+      <button
+        ref={triggerRef}
+        type="button"
+        className={`dashboard-version-chip${behind ? ' has-update' : ''}${unknown ? ' is-unknown' : ''}${phase === 'error' ? ' is-error' : ''}`}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-label={`${currentVersion}. ${message}`}
+        title={message}
+        onClick={() => setOpen(value => !value)}
+      >
+        <span>{currentVersion}</span>
+        {busy
+          ? <span className="dashboard-update-spinner" aria-hidden="true" />
+          : <span
+              className={`dashboard-version-state ${versionSignal.className}`}
+              aria-hidden="true"
+            >{versionSignal.symbol}</span>}
+      </button>
+      {open ? (
+        <section
+          className="dashboard-version-popover"
+          role="dialog"
+          aria-modal="false"
+          aria-labelledby="dashboard-version-title"
+        >
+          <header className="dashboard-version-popover-head">
+            <strong id="dashboard-version-title">{t('update.current')}</strong>
+            <div className="dashboard-version-head-actions">
+              <button
+                type="button"
+                className={`dashboard-version-refresh${refreshing ? ' is-refreshing' : ''}`}
+                aria-label={t(refreshing ? 'update.topbarRefreshing' : 'update.topbarRefresh')}
+                title={t(refreshing ? 'update.topbarRefreshing' : 'update.topbarRefresh')}
+                disabled={refreshing || rollbackLoading || busy}
+                onClick={() => void refresh()}
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="M13.2 5.7A5.8 5.8 0 1 0 13 10.8" />
+                  <path d="M13.2 2.8v2.9h-2.9" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                className="dashboard-version-close"
+                aria-label={t('update.topbarClose')}
+                onClick={() => setOpen(false)}
+              >×</button>
+            </div>
+          </header>
+          <div className="dashboard-version-popover-body">
+            <div className="dashboard-version-current">
+              <strong>{currentVersion}</strong>
+              <span className={versionSignal.className} aria-hidden="true">
+                {busy ? <span className="dashboard-update-spinner" /> : versionSignal.symbol}
+              </span>
+            </div>
+            <p
+              className={`dashboard-version-message${phase === 'error' || refreshFailed ? ' is-error' : ''}`}
+              role={phase === 'error' || refreshFailed ? 'alert' : 'status'}
+              aria-live="polite"
+            >{message}</p>
+            <a
+              className="dashboard-version-release-link"
+              href="https://github.com/deepcoldy/botmux/releases"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M8 1.5a6.5 6.5 0 0 0-2.1 12.65c.33.06.45-.14.45-.32v-1.26c-1.84.4-2.23-.78-2.23-.78-.3-.76-.73-.96-.73-.96-.6-.41.05-.4.05-.4.66.05 1 .68 1 .68.59 1 1.54.72 1.92.55.06-.42.23-.72.42-.88-1.47-.17-3.02-.74-3.02-3.28 0-.72.26-1.32.68-1.78-.07-.17-.3-.84.07-1.75 0 0 .56-.18 1.79.68A6.2 6.2 0 0 1 8 4.63a6.2 6.2 0 0 1 1.71.22c1.23-.86 1.79-.68 1.79-.68.37.91.14 1.58.07 1.75.42.46.68 1.06.68 1.78 0 2.55-1.55 3.11-3.03 3.28.24.21.45.61.45 1.23v1.62c0 .18.12.38.46.32A6.5 6.5 0 0 0 8 1.5Z" />
+              </svg>
+              <span>{t('update.changelogViewOnGitHub')}</span>
+            </a>
+            {(behind || rollbackOpen) && status.installs.multiple ? (
+              <details className="dashboard-version-installs">
+                <summary>{t('update.multiInstallWarn')}</summary>
+                <ul>{status.installs.entries.map(entry => <li key={entry.binPath}>{entry.binPath}</li>)}</ul>
+              </details>
+            ) : null}
+            {rollbackSupported ? (
+              <details
+                className="dashboard-version-rollback"
+                open={rollbackOpen}
+                aria-busy={rollbackLoading}
+                onToggle={event => {
+                  const nextOpen = event.currentTarget.open;
+                  setRollbackOpen(nextOpen);
+                  if (nextOpen && !rollbackLoaded && !rollbackLoading) void loadRollbackVersions();
+                }}
+              >
+                <summary>
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <circle cx="8" cy="8" r="5.5" />
+                    <path d="M8 4.8V8l2.2 1.3" />
+                  </svg>
+                  <span>{t('update.rollbackTitle')}</span>
+                  <span className="dashboard-version-rollback-chevron" aria-hidden="true">⌄</span>
+                </summary>
+                <div className="dashboard-version-rollback-body">
+                  {rollbackLoading && rollbackVersions.length === 0 ? (
+                    <p className="dashboard-version-rollback-status" role="status" aria-live="polite">
+                      <span className="dashboard-update-spinner" aria-hidden="true" />
+                      {t('update.rollbackLoading')}
+                    </p>
+                  ) : null}
+                  {rollbackLoadFailed ? (
+                    <p className="dashboard-version-rollback-load-error" role="alert">
+                      <span>{t('update.rollbackLoadFailed')}</span>
+                      <button type="button" disabled={rollbackLoading} onClick={() => void loadRollbackVersions(true)}>
+                        {t('update.rollbackRetry')}
+                      </button>
+                    </p>
+                  ) : null}
+                  {rollbackLoaded && !rollbackLoading && !rollbackLoadFailed && rollbackVersions.length === 0 ? (
+                    <p className="dashboard-version-rollback-status">{t('update.rollbackEmpty')}</p>
+                  ) : null}
+                  {rollbackVersions.length > 0 ? (
+                    <fieldset disabled={busy || rollbackLoading || rollbackLoadFailed}>
+                      <legend>{t('update.rollbackHint')}</legend>
+                      <div className="dashboard-version-rollback-options">
+                        {rollbackVersions.map(entry => (
+                          <label
+                            key={entry.version}
+                            className={selectedRollback === entry.version ? 'is-selected' : ''}
+                          >
+                            <input
+                              type="radio"
+                              name="dashboard-rollback-version"
+                              value={entry.version}
+                              checked={selectedRollback === entry.version}
+                              onChange={() => setSelectedRollback(entry.version)}
+                            />
+                            <strong>v{entry.version}</strong>
+                            {entry.publishedAt ? (
+                              <time dateTime={entry.publishedAt}>{formatRollbackDate(entry.publishedAt)}</time>
+                            ) : null}
+                          </label>
+                        ))}
+                      </div>
+                    </fieldset>
+                  ) : null}
+                  {selectedRollback ? (
+                    <p id="dashboard-version-rollback-risk" className="dashboard-version-rollback-risk" role="note">
+                      <svg viewBox="0 0 16 16" aria-hidden="true">
+                        <path d="M7.1 2.3 1.8 12a1 1 0 0 0 .9 1.5h10.6a1 1 0 0 0 .9-1.5L8.9 2.3a1 1 0 0 0-1.8 0Z" />
+                        <path d="M8 5.5v3.6M8 11.6h.01" />
+                      </svg>
+                      <span>
+                        {t('update.rollbackRisk', { version: selectedRollback })}{' '}
+                        <a
+                          href={`https://github.com/deepcoldy/botmux/releases/tag/v${encodeURIComponent(selectedRollback)}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          aria-label={t('update.rollbackReleaseNotesA11y', { version: selectedRollback })}
+                        >{t('update.rollbackReleaseNotes', { version: selectedRollback })}</a>
+                      </span>
+                    </p>
+                  ) : null}
+                  {rollbackVersions.length > 0 ? (
+                    <button
+                      type="button"
+                      className="dashboard-version-rollback-action"
+                      disabled={!selectedRollback || rollbackLoading || rollbackLoadFailed || busy}
+                      aria-describedby={selectedRollback ? 'dashboard-version-rollback-risk' : undefined}
+                      onClick={() => void runRollback()}
+                    >
+                      {busy && activeRollback ? <span className="dashboard-update-spinner" aria-hidden="true" /> : null}
+                      {selectedRollback
+                        ? phase === 'error' && activeRollback === selectedRollback
+                          ? t('update.rollbackRetry')
+                          : t('update.rollbackAction', { version: selectedRollback })
+                        : t('update.rollbackSelect')}
+                    </button>
+                  ) : null}
+                </div>
+              </details>
+            ) : null}
+          </div>
+          {behind && !rollbackOpen && !activeRollback ? (
+            <footer className="dashboard-version-popover-actions">
+              <button type="button" className="dashboard-version-secondary" onClick={() => setOpen(false)}>
+                {busy ? t('update.topbarClose') : t('update.topbarLater')}
+              </button>
+              <button
+                type="button"
+                className="dashboard-version-primary"
+                disabled={busy}
+                onClick={() => void run()}
+              >
+                {busy ? <span className="dashboard-update-spinner" aria-hidden="true" /> : null}
+                {action}
+              </button>
+            </footer>
+          ) : null}
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
 function DashboardShell(): JSX.Element {
   const statusSummary = dashboardStatusSummary();
   const [botOnboardingOpen, setBotOnboardingOpen] = useState(false);
@@ -533,13 +1018,16 @@ function DashboardShell(): JSX.Element {
       <div className="app-shell">
         <header className="topbar">
           <div className="topbar-left">
-            <a className="brand" href="#/">
-              <span className="brand-mark" aria-hidden="true">
-                <img className="brand-logo-img" src="/assets/brand-logo.png" alt="" decoding="sync" loading="eager" fetchPriority="high" />
-              </span>
-              <strong className="brand-wordmark">Botmux</strong>
-              <span className="brand-product">Dashboard</span>
-            </a>
+            <div className="topbar-brand-block">
+              <a className="brand" href="#/">
+                <span className="brand-mark" aria-hidden="true">
+                  <img className="brand-logo-img" src="/assets/brand-logo.png" alt="" decoding="sync" loading="eager" fetchPriority="high" />
+                </span>
+                <strong className="brand-wordmark">Botmux</strong>
+                <span className="brand-product">Dashboard</span>
+              </a>
+              <TopbarVersionControl status={botmuxUpdateStatus} onRefresh={() => checkUpdateBadge(true)} />
+            </div>
           </div>
           <div className="topbar-actions">
             <TopbarStatusMenu summary={statusSummary} autoOpen={statusAutoOpen} />
@@ -732,12 +1220,13 @@ async function persistLocale(locale: DashboardLocale): Promise<void> {
   } catch { /* best-effort; UI already switched locally */ }
 }
 
-async function checkUpdateBadge(): Promise<void> {
-  if (!isAuthed) return;
+async function checkUpdateBadge(force = false): Promise<boolean> {
+  if (!isAuthed) return false;
   try {
-    const r = await fetch('/api/update/status');
-    if (!r.ok) return;
+    const r = await fetch(`/api/update/status${force ? '?refresh=1' : ''}`, { cache: 'no-store' });
+    if (!r.ok) return false;
     const j = await r.json();
+    botmuxUpdateStatus = j as BotmuxUpdateStatus;
     const runtime = Array.isArray(j.cliUpdates)
       ? j.cliUpdates.find((entry: any) => entry?.updateAvailable === true && entry?.latest)
       : null;
@@ -755,7 +1244,10 @@ async function checkUpdateBadge(): Promise<void> {
       latestVersion = null;
     }
     renderShell();
-  } catch { /* best-effort */ }
+    return j.versionLookupOk !== false;
+  } catch {
+    return false;
+  }
 }
 
 function renderAuthRequiredPage(host: HTMLElement): void {
@@ -871,6 +1363,10 @@ void (async () => {
   window.addEventListener(PLUGIN_PINS_CHANGED_EVENT, () => { void loadPinnedPluginNavItems(); });
   void loadPinnedPluginNavItems();
   void checkUpdateBadge();
+  window.setInterval(() => {
+    if (document.hidden) return;
+    void checkUpdateBadge();
+  }, 30 * 60_000);
   initOwnerAvatar();
   try {
     await bootstrap();

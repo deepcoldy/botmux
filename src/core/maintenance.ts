@@ -25,7 +25,13 @@ import { logger } from '../utils/logger.js';
 import { readGlobalConfig, type MaintenanceConfig } from '../global-config.js';
 import { evaluateDue } from './maintenance-schedule.js';
 import { anyDaemonBusy } from './daemon-heartbeat.js';
-import { writeRestartIntent, type RestartIntent } from '../services/restart-intent-store.js';
+import {
+  claimRestartLease,
+  clearRestartLease,
+  hasActiveRestartLease,
+  writeRestartIntent,
+  type RestartIntent,
+} from '../services/restart-intent-store.js';
 import {
   isLocalDevInstall,
   botmuxVersion,
@@ -51,6 +57,8 @@ export interface MaintenanceDeps {
   writeState: (s: MaintenanceState) => void;
   anyBusy: () => boolean;
   isLocalDev: () => boolean;
+  /** Serialize the complete install → optional restart handoff. */
+  withUpdateLock: (fn: () => void) => void;
   /** Current on-disk botmux version (read fresh — changes after runUpdate). */
   currentVersion: () => string;
   /** Updates the owning npm/pnpm/Bun global install (download/install only). */
@@ -93,26 +101,43 @@ export function runMaintenanceTick(deps: MaintenanceDeps): void {
     return;
   }
 
-  const before = deps.currentVersion();
+  let before = '';
+  let after = '';
+  let restartFailed = false;
   try {
-    deps.runUpdate();
+    deps.withUpdateLock(() => {
+      before = deps.currentVersion();
+      deps.runUpdate();
+      after = deps.currentVersion();
+      if (after !== before && cfg.autoRestart?.enabled) {
+        deps.writeIntent({ kind: 'update', oldVersion: before, newVersion: after, at: new Date(now).toISOString() });
+        try {
+          deps.triggerRestart();
+        } catch (e) {
+          // Update succeeded but the restart handoff failed (e.g. lease taken
+          // by a concurrent manual restart, or the detached driver did not
+          // start). The new version is already on disk — log it clearly so it
+          // isn't mistaken for a full update failure, and don't rethrow: the
+          // next tick sees after===before and would otherwise never retry.
+          restartFailed = true;
+          log(`auto-update: installed ${after} but restart failed: ${e instanceof Error ? e.message : e}`);
+        }
+      }
+    });
   } catch (e) {
     log(`auto-update failed: ${e instanceof Error ? e.message : e}`);
     return;
   }
-  const after = deps.currentVersion();
   if (after === before) {
     log('auto-update: already on the latest version');
     return;
   }
 
-  // A newer version was installed. Restart to apply it only if opted in.
-  if (cfg.autoRestart?.enabled) {
-    deps.writeIntent({ kind: 'update', oldVersion: before, newVersion: after, at: new Date(now).toISOString() });
-    deps.triggerRestart();
-    log(`auto-update: ${before} → ${after}, restarting to apply`);
-  } else {
+  // A newer version was installed.
+  if (!cfg.autoRestart?.enabled) {
     log(`auto-update: installed ${after} (was ${before}); auto-restart off — applies on next restart`);
+  } else if (!restartFailed) {
+    log(`auto-update: ${before} → ${after}, restarting to apply`);
   }
 }
 
@@ -188,10 +213,14 @@ export function installLatestBotmuxSync(plan: GlobalInstallPlan = resolveGlobalI
  * so the two never write the active global install concurrently. Both sides acquire
  * `withFileLock(Sync)` on this path.
  */
-export function globalInstallUpdateLockTarget(): string {
+export function globalInstallUpdateLockTargetIn(dataDir: string): string {
   // Keep the historical filename so old/new daemon-dashboard processes still
   // serialize correctly during a rolling upgrade.
-  return join(config.session.dataDir, 'npm-global-update');
+  return join(dataDir, 'npm-global-update');
+}
+
+export function globalInstallUpdateLockTarget(): string {
+  return globalInstallUpdateLockTargetIn(config.session.dataDir);
 }
 
 /**
@@ -232,7 +261,11 @@ function setsidAvailable(): boolean {
  *
  * @param reason short tag written to the log (e.g. 'auto-update', 'dashboard').
  */
-export function spawnDetachedRestart(reason: string, activePackageRoot?: string): void {
+export function spawnDetachedRestart(
+  reason: string,
+  activePackageRoot?: string,
+  restartLeaseId?: string,
+): ReturnType<typeof spawn> {
   const logFile = maintenanceRestartLogPath();
   let fd: number | undefined;
   try {
@@ -247,7 +280,13 @@ export function spawnDetachedRestart(reason: string, activePackageRoot?: string)
   const child = spawn(cmd, args, {
     detached: true,
     stdio: fd !== undefined ? ['ignore', fd, fd] : 'ignore',
-    env: process.env,
+    env: {
+      ...process.env,
+      ...(restartLeaseId ? {
+        BOTMUX_RESTART_LEASE_ID: restartLeaseId,
+        BOTMUX_RESTART_LEASE_DIR: config.session.dataDir,
+      } : {}),
+    },
     // Run from HOME, not the caller's cwd: the dashboard (cwd: PKG_ROOT) triggers
     // this right after a global update replaced that dir, so inheriting it
     // would start the restart driver in a deleted directory. See globalInstallUpdateCwd.
@@ -260,6 +299,7 @@ export function spawnDetachedRestart(reason: string, activePackageRoot?: string)
   if (fd !== undefined) {
     try { closeSync(fd); } catch { /* the detached child holds its own dup */ }
   }
+  return child;
 }
 
 function productionDeps(): MaintenanceDeps {
@@ -274,23 +314,29 @@ function productionDeps(): MaintenanceDeps {
     writeState: (s) => writeMaintenanceStateTo(config.session.dataDir, s),
     anyBusy: () => anyDaemonBusy(),
     isLocalDev: () => isLocalDevInstall(),
+    withUpdateLock: (fn) => withFileLockSync(globalInstallUpdateLockTarget(), () => {
+      if (hasActiveRestartLease()) throw new Error('restart already pending');
+      fn();
+    }, { maxWaitMs: 500 }),
     currentVersion: () => installPlan
       ? botmuxVersionAt(installPlan.activePackageRoot)
       : botmuxVersion(),
     runUpdate: () => {
       installPlan ??= resolveGlobalInstallPlan();
-      // Hold the shared update lock for the whole install so a concurrent
-      // dashboard manual update can't mutate the same install at the same time.
-      // Short wait: if the dashboard holds it (a manual update is mid-flight),
-      // don't block the daemon thread waiting out a 30s install — throw a lock
-      // timeout fast so the tick logs it and slips to the next day (the manual
-      // update is already bumping to latest anyway).
-      withFileLockSync(globalInstallUpdateLockTarget(), () => {
-        installLatestBotmuxSync(installPlan);
-      }, { maxWaitMs: 500 });
+      installLatestBotmuxSync(installPlan);
     },
     writeIntent: (intent) => writeRestartIntent(intent),
-    triggerRestart: () => spawnDetachedRestart('auto-update', installPlan?.activePackageRoot),
+    triggerRestart: () => {
+      const leaseId = claimRestartLease();
+      if (!leaseId) throw new Error('restart already pending');
+      try {
+        const child = spawnDetachedRestart('auto-update', installPlan?.activePackageRoot, leaseId);
+        if (!child.pid) throw new Error('restart driver did not start');
+      } catch (error) {
+        clearRestartLease(leaseId);
+        throw error;
+      }
+    },
     log: (msg) => logger.info(`[maintenance] ${msg}`),
   };
 }

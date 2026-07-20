@@ -26,7 +26,7 @@ export interface RestartReportInput {
    *  the central platform, so the owner can still reach the dashboard if the
    *  platform is down. */
   dashboardLocalUrl?: string;
-  /** kind==='update' only: the version delta + changelog body. */
+  /** Version delta for update/rollback; changelog is update-only. */
   oldVersion?: string;
   newVersion?: string;
   changelog?: string;
@@ -41,9 +41,11 @@ export function buildRestartReportText(input: RestartReportInput, locale?: Local
   const lines: string[] = [];
   lines.push(input.kind === 'update'
     ? t('restart.updated_restarted', undefined, locale)
-    : t('restart.restarted', undefined, locale));
+    : input.kind === 'rollback'
+      ? t('restart.rolled_back_restarted', undefined, locale)
+      : t('restart.restarted', undefined, locale));
 
-  if (input.kind === 'update' && input.oldVersion && input.newVersion) {
+  if (input.kind !== 'manual' && input.oldVersion && input.newVersion) {
     lines.push(t('restart.version_delta', { old: vtag(input.oldVersion), new: vtag(input.newVersion) }, locale));
   } else {
     lines.push(t('restart.version', { version: vtag(input.version) }, locale));
@@ -66,7 +68,7 @@ export function buildRestartReportCard(input: RestartReportInput, locale?: Local
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: {
-      template: input.kind === 'update' ? 'green' : 'blue',
+      template: input.kind === 'update' ? 'green' : input.kind === 'rollback' ? 'orange' : 'blue',
       title: { tag: 'plain_text', content: t('restart.card_title', undefined, locale) },
     },
     elements: [{ tag: 'markdown', content: buildRestartReportText(input, locale) }],

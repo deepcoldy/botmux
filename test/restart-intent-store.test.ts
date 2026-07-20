@@ -3,8 +3,13 @@ import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  clearRestartIntentTo,
   writeRestartIntentTo,
   consumeRestartIntentTo,
+  bindRestartLeaseTo,
+  claimRestartLeaseTo,
+  clearRestartLeaseTo,
+  hasActiveRestartLeaseTo,
   writeManualIntentIfAbsentTo,
   restartIntentPathIn,
 } from '../src/services/restart-intent-store.js';
@@ -24,6 +29,22 @@ describe('restart-intent store', () => {
     expect(existsSync(restartIntentPathIn(dir))).toBe(false);
   });
 
+  it('round-trips a rollback intent with its version delta', () => {
+    writeRestartIntentTo(dir, { kind: 'rollback', oldVersion: '3.1.0', newVersion: '3.0.0', at: iso(T0) });
+    expect(consumeRestartIntentTo(dir, T0 + 5_000)).toMatchObject({
+      kind: 'rollback',
+      oldVersion: '3.1.0',
+      newVersion: '3.0.0',
+    });
+  });
+
+  it('clears a rollback intent when restart launch fails', () => {
+    writeRestartIntentTo(dir, { kind: 'rollback', oldVersion: '3.1.0', newVersion: '3.0.0', at: iso(T0) });
+    clearRestartIntentTo(dir);
+    expect(existsSync(restartIntentPathIn(dir))).toBe(false);
+    expect(() => clearRestartIntentTo(dir)).not.toThrow();
+  });
+
   it('consume returns null and deletes a stale intent (aborted restart left it behind)', () => {
     writeRestartIntentTo(dir, { kind: 'manual', at: iso(T0) });
     const got = consumeRestartIntentTo(dir, T0 + 11 * 60_000);
@@ -33,6 +54,26 @@ describe('restart-intent store', () => {
 
   it('consume returns null when absent (crash / pm2 auto-restart leaves no breadcrumb)', () => {
     expect(consumeRestartIntentTo(dir, T0)).toBeNull();
+  });
+
+  it('claims one cross-process restart lease and recovers after expiry or clear', () => {
+    const first = claimRestartLeaseTo(dir, T0);
+    expect(first).toEqual(expect.any(String));
+    expect(hasActiveRestartLeaseTo(dir, T0 + 5_000)).toBe(true);
+    expect(claimRestartLeaseTo(dir, T0 + 5_000)).toBeNull();
+
+    const owned = claimRestartLeaseTo(dir, T0 + 61_000);
+    expect(owned).toEqual(expect.any(String));
+    expect(bindRestartLeaseTo(dir, owned!, process.pid, T0 + 61_000)).toBe(true);
+    expect(hasActiveRestartLeaseTo(dir, T0 + 31 * 60_000)).toBe(true);
+    clearRestartLeaseTo(dir, 'another-generation');
+    expect(hasActiveRestartLeaseTo(dir, T0 + 31 * 60_000)).toBe(true);
+    clearRestartLeaseTo(dir, owned!);
+    expect(hasActiveRestartLeaseTo(dir, T0 + 31 * 60_000)).toBe(false);
+
+    const dead = claimRestartLeaseTo(dir, T0 + 31 * 60_000);
+    expect(bindRestartLeaseTo(dir, dead!, 99_999_999, T0 + 31 * 60_000)).toBe(true);
+    expect(hasActiveRestartLeaseTo(dir, T0 + 31 * 60_000)).toBe(false);
   });
 
   it('writeManualIntentIfAbsent writes a manual intent when none exists', () => {

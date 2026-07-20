@@ -57,7 +57,16 @@ import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxInstallRoot } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
-import { fetchLatestVersion, fetchReleasesSince, isNewerVersion, type ChangelogResult } from './core/update-check.js';
+import {
+  fetchLatestVersion,
+  fetchReleasesSince,
+  fetchRollbackVersions,
+  compareVersions,
+  isCanonicalStableVersion,
+  isNewerVersion,
+  type ChangelogResult,
+  type RollbackVersionsResult,
+} from './core/update-check.js';
 import { GITHUB_REPO } from './core/restart-report.js';
 import { spawnDetachedRestart, globalInstallUpdateLockTarget, globalInstallUpdateCwd } from './core/maintenance.js';
 import {
@@ -65,11 +74,19 @@ import {
   formatGlobalInstallCommand,
   resolveGlobalInstallPlan,
   tryResolveGlobalInstallPlan,
+  withGlobalInstallRegistry,
   UnsupportedGlobalInstallError,
   type GlobalInstallPlan,
 } from './utils/global-install.js';
 import { listCliRuntimeUpdateEntries } from './core/cli-runtime-update.js';
-import { writeRestartIntent } from './services/restart-intent-store.js';
+import {
+  claimRestartLease,
+  clearRestartIntent,
+  clearRestartLease,
+  hasActiveRestartLease,
+  writeManualIntentIfAbsent,
+  writeRestartIntent,
+} from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
 import { spawn } from 'node:child_process';
 import {
@@ -899,15 +916,37 @@ let lastSuccessfulUpdatePlan: GlobalInstallPlan | undefined;
 const LATEST_TTL_MS = 30 * 60_000;
 const CHANGELOG_TTL_MS = 15 * 60_000;
 const FAILURE_TTL_MS = 60_000;
-let latestVersionCache: { value: string | null; at: number } | null = null;
+type LatestVersionCache = { value: string | null; at: number; lookupOk: boolean };
+let latestVersionCache: LatestVersionCache | null = null;
+let latestVersionLookupInFlight: Promise<LatestVersionCache> | null = null;
 let changelogCache: { key: string; value: ChangelogResult; at: number } | null = null;
+let rollbackVersionCache: { current: string; value: RollbackVersionsResult; at: number } | null = null;
+let rollbackVersionLookupInFlight: { current: string; value: Promise<RollbackVersionsResult> } | null = null;
 
-async function cachedLatestVersion(now = Date.now()): Promise<string | null> {
-  const ttl = latestVersionCache?.value ? LATEST_TTL_MS : FAILURE_TTL_MS;
-  if (latestVersionCache && now - latestVersionCache.at < ttl) return latestVersionCache.value;
-  const value = await fetchLatestVersion();
-  latestVersionCache = { value, at: now };
-  return value;
+async function cachedLatestVersion(force = false): Promise<LatestVersionCache> {
+  const now = Date.now();
+  const ttl = latestVersionCache?.lookupOk ? LATEST_TTL_MS : FAILURE_TTL_MS;
+  if (!force && latestVersionCache && now - latestVersionCache.at < ttl) return latestVersionCache;
+  // When forcing a refresh, don't piggy-back on an in-flight lookup that may
+  // have started before the user asked for a refresh — start a fresh one so
+  // the result reflects the current upstream state, not a stale query.
+  if (!force && latestVersionLookupInFlight) return latestVersionLookupInFlight;
+
+  const lookup = (async () => {
+    const value = await fetchLatestVersion();
+    latestVersionCache = {
+      value: value ?? latestVersionCache?.value ?? null,
+      at: Date.now(),
+      lookupOk: value !== null,
+    };
+    return latestVersionCache;
+  })();
+  latestVersionLookupInFlight = lookup;
+  try {
+    return await lookup;
+  } finally {
+    if (latestVersionLookupInFlight === lookup) latestVersionLookupInFlight = null;
+  }
 }
 
 async function cachedChangelog(current: string, now = Date.now()): Promise<ChangelogResult> {
@@ -918,6 +957,35 @@ async function cachedChangelog(current: string, now = Date.now()): Promise<Chang
   return value;
 }
 
+async function cachedRollbackVersions(current: string, force = false): Promise<RollbackVersionsResult> {
+  const now = Date.now();
+  const ttl = rollbackVersionCache?.value.ok ? LATEST_TTL_MS : FAILURE_TTL_MS;
+  if (!force && rollbackVersionCache?.current === current && now - rollbackVersionCache.at < ttl) {
+    return rollbackVersionCache.value;
+  }
+  if (rollbackVersionLookupInFlight?.current === current) return rollbackVersionLookupInFlight.value;
+
+  const lookup = (async () => {
+    const result = await fetchRollbackVersions(current);
+    const previous = rollbackVersionCache?.current === current ? rollbackVersionCache.value.versions : [];
+    const value = result.ok ? result : { ok: false, versions: previous };
+    rollbackVersionCache = { current, value, at: Date.now() };
+    return value;
+  })();
+  rollbackVersionLookupInFlight = { current, value: lookup };
+  try {
+    return await lookup;
+  } finally {
+    if (rollbackVersionLookupInFlight?.value === lookup) rollbackVersionLookupInFlight = null;
+  }
+}
+
+function currentInstalledVersion(): string {
+  if (!lastSuccessfulUpdatePlan) return resolveCurrentVersion();
+  const version = botmuxVersionAt(lastSuccessfulUpdatePlan.activePackageRoot);
+  return version === '0.0.0' ? resolveCurrentVersion() : version;
+}
+
 /**
  * Run the ownership-aware npm/pnpm/Bun update for the manual-update flow WITHOUT blocking
  * the event loop (async spawn, not execSync — the dashboard must keep serving
@@ -925,7 +993,7 @@ async function cachedChangelog(current: string, now = Date.now()): Promise<Chang
  * stdout/stderr on a non-zero exit, spawn error, or 3-minute timeout. Args are
  * a fixed literal — no shell interpolation of untrusted input.
  */
-function runGlobalInstallLatest(plan: GlobalInstallPlan): Promise<void> {
+function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const child = spawn(plan.command, plan.args, {
       cwd: globalInstallUpdateCwd(),
@@ -2438,15 +2506,16 @@ const server = createServer(async (req, res) => {
     // unauthenticated caller (in both normal and public-read mode). The explicit
     // `authed` guards on the two mutations are defense-in-depth for host actions.
     if (req.method === 'GET' && url.pathname === '/api/update/status') {
-      const current = resolveCurrentVersion();
-      const packageRoot = botmuxInstallRoot();
+      const current = currentInstalledVersion();
+      const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
       const installManager = detectGlobalInstallManager(packageRoot);
-      const installPlan = lastSuccessfulUpdatePlan ?? tryResolveGlobalInstallPlan(packageRoot);
+      const installPlan = tryResolveGlobalInstallPlan(packageRoot);
       // Compare against the npm `latest` dist-tag (always stable; the update
       // button installs `@latest`). isNewerVersion uses semver precedence, so a
       // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
       // 2.86.0) is NOT flagged behind — exactly the canary case we want.
-      const latest = await cachedLatestVersion();
+      const latestResult = await cachedLatestVersion(url.searchParams.get('refresh') === '1');
+      const latest = latestResult.value;
       const cliUpdates = listCliRuntimeUpdateEntries(config.session.dataDir).map((entry) => ({
         cliId: entry.cliId,
         binPath: entry.binPath,
@@ -2460,6 +2529,7 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, {
         current,
         latest,
+        versionLookupOk: latestResult.lookupOk,
         behind: !!latest && isNewerVersion(latest, current),
         cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
         cliUpdates,
@@ -2472,8 +2542,14 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/update/versions') {
+      const current = currentInstalledVersion();
+      const result = await cachedRollbackVersions(current, url.searchParams.get('refresh') === '1');
+      return jsonRes(res, 200, { current, ok: result.ok, versions: result.versions });
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/update/changelog') {
-      const current = resolveCurrentVersion();
+      const current = currentInstalledVersion();
       const result = await cachedChangelog(current);
       return jsonRes(res, 200, {
         current,
@@ -2489,7 +2565,8 @@ const server = createServer(async (req, res) => {
       if (isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'local_dev_no_update' });
       let installPlan: GlobalInstallPlan;
       try {
-        installPlan = lastSuccessfulUpdatePlan ?? resolveGlobalInstallPlan();
+        const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
+        installPlan = resolveGlobalInstallPlan(packageRoot);
       } catch (error) {
         if (error instanceof UnsupportedGlobalInstallError) {
           return jsonRes(res, 400, {
@@ -2504,17 +2581,23 @@ const server = createServer(async (req, res) => {
       if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
       updateInFlight = true;
-      const oldVersion = botmuxVersionAt(installPlan.activePackageRoot);
+      let oldVersion = '';
       // Acquire the shared cross-process lock so a scheduled maintenance
       // auto-update (running in the bot-0 daemon) can't update the same global
       // install concurrently. `acquired` distinguishes "lock held by
       // maintenance" (409) from "the package manager failed" (500). Short wait:
       // don't block the request on a full in-progress install — report busy fast.
       let acquired = false;
+      let blockedByRestart = false;
       try {
         await withFileLock(globalInstallUpdateLockTarget(), async () => {
           acquired = true;
-          await runGlobalInstallLatest(installPlan);
+          if (hasActiveRestartLease()) {
+            blockedByRestart = true;
+            return;
+          }
+          oldVersion = botmuxVersionAt(installPlan.activePackageRoot);
+          await runGlobalInstall(installPlan);
         }, { maxWaitMs: 2_000 });
       } catch (e) {
         if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
@@ -2522,6 +2605,7 @@ const server = createServer(async (req, res) => {
       } finally {
         updateInFlight = false;
       }
+      if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
       const newVersion = botmuxVersionAt(installPlan.activePackageRoot);
       lastSuccessfulUpdatePlan = installPlan;
       return jsonRes(res, 200, {
@@ -2533,24 +2617,237 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/update/rollback') {
+      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      if (isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'local_dev_no_update' });
+
+      let targetVersion = '';
+      try {
+        const parsed = await readJsonBody(req);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_version' });
+        }
+        const body = parsed as Record<string, unknown>;
+        if (Object.keys(body).length !== 1 || typeof body.version !== 'string' || !isCanonicalStableVersion(body.version)) {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_version' });
+        }
+        targetVersion = body.version;
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_json' });
+      }
+
+      const rollback = await cachedRollbackVersions(currentInstalledVersion());
+      if (!rollback.ok) return jsonRes(res, 503, { ok: false, error: 'versions_unavailable' });
+      if (!rollback.versions.some(entry => entry.version === targetVersion)) {
+        return jsonRes(res, 400, { ok: false, error: 'not_rollback_target' });
+      }
+
+      let installPlan: GlobalInstallPlan;
+      try {
+        const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
+        installPlan = withGlobalInstallRegistry(
+          resolveGlobalInstallPlan(packageRoot, process.platform, `botmux@${targetVersion}`),
+        );
+      } catch (error) {
+        if (error instanceof UnsupportedGlobalInstallError) {
+          return jsonRes(res, 400, {
+            ok: false,
+            error: 'unsupported_install_method',
+            manager: error.manager,
+          });
+        }
+        throw error;
+      }
+
+      const node = checkNode();
+      if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
+      if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+      updateInFlight = true;
+
+      let acquired = false;
+      let blockedByRestart = false;
+      let invalidRollbackTarget = false;
+      let installedVersionMismatch = '';
+      let restartIntentError = '';
+      let leaseId: string | null = null;
+      let oldVersion = '';
+      try {
+        await withFileLock(globalInstallUpdateLockTarget(), async () => {
+          acquired = true;
+          if (hasActiveRestartLease()) {
+            blockedByRestart = true;
+            return;
+          }
+
+          oldVersion = botmuxVersionAt(installPlan.activePackageRoot);
+          if (compareVersions(targetVersion, oldVersion) >= 0) {
+            invalidRollbackTarget = true;
+            return;
+          }
+
+          await runGlobalInstall(installPlan);
+          const newVersion = botmuxVersionAt(installPlan.activePackageRoot);
+          lastSuccessfulUpdatePlan = installPlan;
+          if (newVersion !== targetVersion) {
+            installedVersionMismatch = newVersion;
+            return;
+          }
+
+          leaseId = claimRestartLease();
+          if (!leaseId) {
+            blockedByRestart = true;
+            return;
+          }
+          try {
+            writeRestartIntent({
+              kind: 'rollback',
+              oldVersion,
+              newVersion,
+              at: new Date().toISOString(),
+            });
+          } catch (error) {
+            restartIntentError = error instanceof Error ? error.message : String(error);
+            clearRestartLease(leaseId);
+            leaseId = null;
+            return;
+          }
+
+          // Keep the install lock through restart handoff: maintenance cannot
+          // race in between the downgrade and the detached restart driver.
+          await new Promise<void>((resolveLaunch) => {
+            let launched = false;
+            const launch = () => {
+              if (launched) return;
+              launched = true;
+              try {
+                const child = spawnDetachedRestart('dashboard', installPlan.activePackageRoot, leaseId!);
+                if (!child.pid) throw new Error('restart driver did not start');
+              } catch (error) {
+                clearRestartLease(leaseId!);
+                clearRestartIntent();
+                logger.error(`[dashboard] rollback restart launch failed: ${error instanceof Error ? error.message : error}`);
+              } finally {
+                resolveLaunch();
+              }
+            };
+            res.once('finish', launch);
+            res.once('close', launch);
+            try {
+              jsonRes(res, 202, {
+                ok: true,
+                oldVersion,
+                newVersion,
+                changed: true,
+                manager: installPlan.manager,
+                operation: 'rollback',
+              });
+            } finally {
+              if (res.destroyed || res.writableFinished) launch();
+            }
+          });
+        }, { maxWaitMs: 2_000 });
+
+        if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        if (invalidRollbackTarget) return jsonRes(res, 409, { ok: false, error: 'not_rollback_target' });
+        if (installedVersionMismatch) {
+          return jsonRes(res, 500, {
+            ok: false,
+            error: 'install_version_mismatch',
+            expectedVersion: targetVersion,
+            actualVersion: installedVersionMismatch,
+          });
+        }
+        if (restartIntentError) {
+          return jsonRes(res, 500, { ok: false, error: 'restart_intent_failed', detail: restartIntentError });
+        }
+        return;
+      } catch (error) {
+        if (leaseId) clearRestartLease(leaseId);
+        if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        if (!res.headersSent) {
+          return jsonRes(res, 500, {
+            ok: false,
+            error: 'install_failed',
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+        logger.error(`[dashboard] rollback failed after response: ${error instanceof Error ? error.message : error}`);
+        return;
+      } finally {
+        updateInFlight = false;
+      }
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/update/restart') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
       let body: Record<string, unknown> = {};
       try {
         const parsed = await readJsonBody(req);
         if (parsed && typeof parsed === 'object') body = parsed as Record<string, unknown>;
       } catch { /* empty / bad body → plain restart */ }
       const upd = body.update && typeof body.update === 'object' ? body.update as Record<string, unknown> : null;
-      // After a manual update, leave an `update` breadcrumb so the fresh daemon
-      // DMs the owner the changelog (reuses the restart-report pipeline). A plain
-      // restart leaves none here; cmdRestart writes a `manual` breadcrumb itself.
-      if (upd && typeof upd.oldVersion === 'string' && typeof upd.newVersion === 'string' && upd.oldVersion !== upd.newVersion) {
-        try {
-          writeRestartIntent({ kind: 'update', oldVersion: upd.oldVersion, newVersion: upd.newVersion, at: new Date().toISOString() });
-        } catch { /* breadcrumb is best-effort */ }
+      let acquired = false;
+      let leaseId: string | null = null;
+      let activePackageRoot: string | undefined;
+      let shouldLaunch = false;
+      try {
+        await withFileLock(globalInstallUpdateLockTarget(), async () => {
+          acquired = true;
+          const claimed = claimRestartLease();
+          if (!claimed) {
+            jsonRes(res, 202, { ok: true, alreadyScheduled: true });
+            return;
+          }
+          leaseId = claimed;
+          try {
+            if (upd && typeof upd.oldVersion === 'string' && typeof upd.newVersion === 'string' && upd.oldVersion !== upd.newVersion) {
+              writeRestartIntent({ kind: 'update', oldVersion: upd.oldVersion, newVersion: upd.newVersion, at: new Date().toISOString() });
+            } else {
+              writeManualIntentIfAbsent();
+            }
+          } catch (error) {
+            clearRestartLease(leaseId);
+            leaseId = null;
+            jsonRes(res, 500, {
+              ok: false,
+              error: 'restart_intent_failed',
+              detail: error instanceof Error ? error.message : String(error),
+            });
+            return;
+          }
+          activePackageRoot = (lastSuccessfulUpdatePlan ?? tryResolveGlobalInstallPlan())?.activePackageRoot;
+          // Send acknowledgement while holding the lock, then release immediately.
+          // The lease itself prevents concurrent restarts — no need to hold the
+          // lock across the network round-trip waiting for res.finish.
+          jsonRes(res, 202, { ok: true });
+          shouldLaunch = true;
+        }, { maxWaitMs: 2_000 });
+      } catch (error) {
+        if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        throw error;
       }
-      spawnDetachedRestart('dashboard', lastSuccessfulUpdatePlan?.activePackageRoot);
-      return jsonRes(res, 200, { ok: true });
+      // Spawn the detached driver after the lock is released. The lease guards
+      // against double-restart; if launch fails we clear the lease so a retry
+      // can succeed.
+      if (shouldLaunch && leaseId) {
+        const launch = () => {
+          try {
+            const child = spawnDetachedRestart('dashboard', activePackageRoot, leaseId!);
+            if (!child.pid) throw new Error('restart driver did not start');
+          } catch (error) {
+            clearRestartLease(leaseId!);
+            logger.error(`[dashboard] restart launch failed: ${error instanceof Error ? error.message : error}`);
+          }
+        };
+        if (res.destroyed || res.writableFinished) {
+          launch();
+        } else {
+          res.once('finish', launch);
+          res.once('close', launch);
+        }
+      }
+      return;
     }
 
     if (req.method === 'GET' && url.pathname === '/api/skills') {

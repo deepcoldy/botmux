@@ -5,6 +5,7 @@ import {
   resolveGlobalInstallPlan,
   tryResolveGlobalInstallPlan,
   UnsupportedGlobalInstallError,
+  withGlobalInstallRegistry,
 } from '../src/utils/global-install.js';
 
 describe('resolveGlobalInstallPlan', () => {
@@ -107,5 +108,63 @@ describe('resolveGlobalInstallPlan', () => {
     expect(formatGlobalInstallCommand(plan)).toBe(
       'npm install -g --prefix "/home/bot/My Prefix" botmux@latest',
     );
+  });
+
+  it('passes an exact rollback package spec to npm, pnpm, and Bun', () => {
+    expect(resolveGlobalInstallPlan(
+      '/home/bot/.local/lib/node_modules/botmux',
+      'linux',
+      'botmux@3.0.0',
+    ).args).toEqual(['install', '-g', '--prefix', '/home/bot/.local', 'botmux@3.0.0']);
+    expect(resolveGlobalInstallPlan(
+      '/home/bot/.local/share/pnpm/global/5/.pnpm/botmux@3.1.0/node_modules/botmux',
+      'linux',
+      'botmux@3.0.0',
+    ).args.at(-1)).toBe('botmux@3.0.0');
+    expect(resolveGlobalInstallPlan(
+      '/home/bot/.bun/install/global/node_modules/botmux',
+      'linux',
+      'botmux@3.0.0',
+    ).args).toEqual(['add', '-g', 'botmux@3.0.0']);
+  });
+
+  it.each([
+    ['npm', '/home/bot/.local/lib/node_modules/botmux'],
+    ['pnpm', '/home/bot/.local/share/pnpm/global/5/.pnpm/botmux@3.1.0/node_modules/botmux'],
+    ['bun', '/home/bot/.bun/install/global/node_modules/botmux'],
+  ] as const)('pins a %s rollback plan to the public npm registry', (_manager, root) => {
+    const plan = resolveGlobalInstallPlan(root, 'linux', 'botmux@3.0.0');
+    const pinned = withGlobalInstallRegistry(plan);
+
+    expect(pinned).not.toBe(plan);
+    expect(pinned.args).toEqual(plan.args);
+    expect(pinned.env).toMatchObject({
+      NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+      npm_config_registry: 'https://registry.npmjs.org/',
+      BUN_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+    });
+    expect(plan.env?.NPM_CONFIG_REGISTRY).toBeUndefined();
+  });
+
+  it('preserves Bun install directories while overriding inherited registry config', () => {
+    const plan = resolveGlobalInstallPlan(
+      '/home/bot/.bun/install/global/node_modules/botmux',
+      'linux',
+      'botmux@3.0.0',
+    );
+    plan.env = {
+      ...plan.env,
+      NPM_CONFIG_REGISTRY: 'https://registry.example/',
+      npm_config_registry: 'https://registry.example/',
+      BUN_CONFIG_REGISTRY: 'https://registry.example/',
+    };
+
+    expect(withGlobalInstallRegistry(plan).env).toEqual({
+      BUN_INSTALL_GLOBAL_DIR: '/home/bot/.bun/install/global',
+      BUN_INSTALL_BIN: '/home/bot/.bun/bin',
+      NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+      npm_config_registry: 'https://registry.npmjs.org/',
+      BUN_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+    });
   });
 });

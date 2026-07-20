@@ -82,7 +82,8 @@ import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
-import { installLatestBotmuxSync } from './core/maintenance.js';
+import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
+import { withFileLockSync } from './utils/file-lock.js';
 import {
   formatGlobalInstallCommand,
   resolveGlobalInstallPlan,
@@ -126,7 +127,7 @@ import {
   whiteboardPath,
 } from './services/whiteboard-store.js';
 import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
-import { writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
+import { bindRestartLeaseTo, writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 import { stripLegacyPendingCardFields } from './services/session-store.js';
 import {
   evaluateVcMeetingManagedSend,
@@ -2438,6 +2439,18 @@ async function cmdStop(): Promise<void> {
 }
 
 async function cmdRestart(): Promise<void> {
+  const restartLeaseId = process.env.BOTMUX_RESTART_LEASE_ID;
+  const restartLeaseDir = process.env.BOTMUX_RESTART_LEASE_DIR;
+  delete process.env.BOTMUX_RESTART_LEASE_ID;
+  delete process.env.BOTMUX_RESTART_LEASE_DIR;
+  if (restartLeaseId) {
+    if (!restartLeaseDir) throw new Error('restart driver lease directory is missing');
+    let bound = false;
+    withFileLockSync(globalInstallUpdateLockTargetIn(restartLeaseDir), () => {
+      bound = bindRestartLeaseTo(restartLeaseDir, restartLeaseId, process.pid, Date.now());
+    });
+    if (!bound) throw new Error('failed to bind restart driver lease');
+  }
   if (!hasConfig()) {
     console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
