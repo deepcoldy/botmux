@@ -381,6 +381,32 @@ describe('RiffBackend', () => {
     });
   });
 
+  describe('sandbox cluster', () => {
+    it('sends the selected cluster as the task-execute top-level field', async () => {
+      const be = makeBackend({ injectStatusLines: false, sandboxCluster: 'cn' });
+      be.spawn('', [], {} as any);
+      be.write('hi');
+      await flush();
+      resolvers.shift()!(taskResponse('task-1'));
+      await flush();
+      const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
+      const body = JSON.parse(String(exec.init?.body));
+      expect(body.sandboxCluster).toBe('cn');
+      expect(body.config.sandboxCluster).toBeUndefined();
+    });
+
+    it('sends boe when the cluster is not configured', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      be.spawn('', [], {} as any);
+      be.write('hi');
+      await flush();
+      resolvers.shift()!(taskResponse('task-1'));
+      await flush();
+      const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
+      expect(JSON.parse(String(exec.init?.body)).sandboxCluster).toBe('boe');
+    });
+  });
+
   describe('repo reuse (复用本地仓库+分支)', () => {
     it('parseRiffRepoName normalizes internal specs and rejects external hosts', () => {
       expect(parseRiffRepoName('git@code.byted.org:webinfra/agent-monorepo.git')).toBe('webinfra/agent-monorepo');

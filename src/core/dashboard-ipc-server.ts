@@ -17,7 +17,7 @@ import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
-import { isValidRiffBaseUrl } from '../adapters/backend/riff-backend.js';
+import { isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
@@ -2279,9 +2279,9 @@ ipcRoute('PUT', '/api/bot-env', async (req, res) => {
 // 空白 → 清除；否则按 json kind 解析后落盘。走 applyConfigField（与 /botconfig
 // 同一写盘 + 内存热更新路径），next-session 生效。仅 backendType=riff 时使用。
 /** riff 配置里 dashboard 可编辑的字段——PUT /bot-riff 只覆盖这些，其余保留。 */
-// sandboxCluster / injectStatusLines 已从 dashboard UI 移除（前者极少用、后者
-// 恒默认开启）——不在此集合中意味着存量 bots.json 值按「隐藏字段」原样保留。
-const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'model', 'reasoningEffort', 'jwtEnv', 'systemPrompt', 'setupCommands']);
+// injectStatusLines 已从 dashboard UI 移除（恒默认开启）——不在此集合中意味着
+// 存量 bots.json 值按「隐藏字段」原样保留。
+const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'sandboxCluster', 'model', 'reasoningEffort', 'jwtEnv', 'systemPrompt', 'setupCommands']);
 
 /** 发给浏览器前脱敏：明文 jwt / env（可能含各类密钥）绝不进 dashboard 响应。 */
 function redactRiffForClient(riff: unknown): Record<string, unknown> | null {
@@ -2311,7 +2311,14 @@ ipcRoute('PUT', '/api/bot-riff', async (req, res) => {
     // 一个 model 就会静默删掉认证等隐藏配置。
     const prev = (getBot(cachedLarkAppId).config.riff ?? {}) as Record<string, unknown>;
     const preserved = Object.fromEntries(Object.entries(prev).filter(([k]) => !RIFF_UI_EDITABLE_KEYS.has(k)));
-    value = { ...preserved, ...value };
+    // Older dashboard clients do not send sandboxCluster. Preserve a valid
+    // existing selection for them; a brand-new config follows Riff's BOE
+    // default. New clients always submit the explicit dropdown value.
+    const sandboxCluster = value.sandboxCluster ?? prev.sandboxCluster ?? 'boe';
+    if (!isValidRiffSandboxCluster(sandboxCluster)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_sandbox_cluster' });
+    }
+    value = { ...preserved, ...value, sandboxCluster };
     if (!isValidRiffBaseUrl(value.baseUrl)) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_base_url' });
     }

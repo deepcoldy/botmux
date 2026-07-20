@@ -103,7 +103,9 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     expect(root.findAllByProps({ 'data-action': 'save-agent' })).toHaveLength(0);
     // Agent 配置已下线：面板不得再渲染 riff-agent 输入框
     expect(root.findAllByProps({ 'data-input': 'riff-agent' })).toHaveLength(0);
-    // 思考等级下拉选择 xhigh → 保存的 PUT /riff 必须携带 reasoningEffort
+    // 运行环境选择 CN、思考等级选择 xhigh → 保存的 PUT /riff 必须一起携带
+    // sandboxCluster / reasoningEffort。
+    act(() => { root.findByProps({ dataInput: 'riff-sandbox-cluster' }).props.onChange('cn'); });
     act(() => { root.findByProps({ dataInput: 'riff-reasoning-effort' }).props.onChange('xhigh'); });
     const baseUrlInput = root.findByProps({ 'data-input': 'riff-base-url' });
     act(() => { baseUrlInput.props.onChange({ currentTarget: { value: 'https://riff.example' } }); });
@@ -113,7 +115,7 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     const puts = requests.filter(r => r.method === 'PUT');
     expect(puts.map(r => r.url.split('/').pop())).toEqual(['riff', 'agent']);
     expect(puts[1]!.body).toEqual({ cliId: 'riff', model: '' });
-    expect(JSON.parse(puts[0]!.body.riff)).toMatchObject({ reasoningEffort: 'xhigh' });
+    expect(JSON.parse(puts[0]!.body.riff)).toMatchObject({ sandboxCluster: 'cn', reasoningEffort: 'xhigh' });
   });
 });
 

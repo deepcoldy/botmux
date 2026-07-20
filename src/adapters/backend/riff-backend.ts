@@ -48,6 +48,8 @@ const DEFAULT_RIFF_SYSTEM_PROMPT = [
  */
 /** riff（codex bridge）接受的思考等级档位——与服务端 shared/reasoningEffort 对齐。 */
 export const RIFF_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
+export const RIFF_SANDBOX_CLUSTERS = ['boe', 'cn'] as const;
+export type RiffSandboxCluster = typeof RIFF_SANDBOX_CLUSTERS[number];
 
 const MANDATORY_SETUP_COMMANDS = [
   // Unconditional install/upgrade: a `which botmux` guard would skip the
@@ -74,7 +76,9 @@ export interface RiffBackendConfig {
   jwt?: string;
   /** Name of env var containing the JWT token (default: RIFF_JWT). */
   jwtEnv?: string;
-  sandboxCluster?: string;
+  /** Sandbox resource pool selected for newly-created tasks. Riff defaults to
+   *  BOE when omitted; follow-ups inherit the parent task's sandbox. */
+  sandboxCluster?: RiffSandboxCluster;
   /**
    * Repos to clone into the riff sandbox, in the API's native shape
    * ({ repoName: 'group/repo', repoBranch? }). Takes precedence over
@@ -129,6 +133,10 @@ export function isValidRiffBaseUrl(v: unknown): v is string {
   } catch {
     return false;
   }
+}
+
+export function isValidRiffSandboxCluster(v: unknown): v is RiffSandboxCluster {
+  return RIFF_SANDBOX_CLUSTERS.includes(v as RiffSandboxCluster);
 }
 
 export interface RiffRepoRef {
@@ -589,7 +597,6 @@ export class RiffBackend implements SessionBackend {
     if (RIFF_REASONING_EFFORTS.includes(this.config.reasoningEffort as typeof RIFF_REASONING_EFFORTS[number])) {
       config.reasoningEffort = this.config.reasoningEffort;
     }
-    if (this.config.sandboxCluster) config.sandboxCluster = this.config.sandboxCluster;
     // Repos: explicit config.repos (e.g. derived from the session's local
     // workingDir by the worker) wins over defaultRepo/defaultBranch. The API's
     // native shape is { repoName, repoBranch } — it silently ignores unknown
@@ -619,6 +626,9 @@ export class RiffBackend implements SessionBackend {
       origin: 'botmux',
       threadId: this.sessionId,
       config,
+      // task-execute exposes sandboxCluster as a top-level request field. Keep
+      // it separate from config so botmux follows the public Riff API shape.
+      sandboxCluster: this.config.sandboxCluster ?? 'boe',
       useRunner: true,
     };
     if (this.config.templateId) payload.templateId = this.config.templateId;
