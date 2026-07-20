@@ -585,7 +585,17 @@ export async function commitRepoSelection(
     );
 
     const oldSession = ds.session;
-    const session = sessionStore.createSession(ds.chatId, rootId, dirLabel, ds.chatType);
+    // `rootId` is the routing anchor. For chat-scope sessions it is the
+    // `oc_...` chat id, not the traceable `om_...` message root stored on
+    // Session. Preserve the old identity and explicitly persist scope so card
+    // switches cannot recreate the session as a legacy scope-less thread.
+    const session = sessionStore.createSession(
+      ds.chatId,
+      ds.scope === 'chat' ? oldSession.rootMessageId : rootId,
+      dirLabel,
+      ds.chatType,
+      ds.scope,
+    );
     ds.session = session;
     ds.lastUserPrompt = undefined;
     ds.lastCliInput = undefined;

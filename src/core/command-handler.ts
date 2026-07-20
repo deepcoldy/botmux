@@ -1627,7 +1627,18 @@ export async function handleCommand(
             );
 
             const oldSession = ds!.session;
-            const session = sessionStore.createSession(ds!.chatId, rootId, displayName, ds!.chatType);
+            // `rootId` is the routing anchor. For chat-scope sessions it is the
+            // `oc_...` chat id, not the traceable `om_...` message root stored on
+            // Session. Preserve the old identity and explicitly persist scope so
+            // repo switches cannot turn a chat session into a legacy scope-less
+            // record that the CLI later mistakes for a thread.
+            const session = sessionStore.createSession(
+              ds!.chatId,
+              ds!.scope === 'chat' ? oldSession.rootMessageId : rootId,
+              displayName,
+              ds!.chatType,
+              ds!.scope,
+            );
             ds!.session = session;
             ds!.lastUserPrompt = undefined;
             ds!.lastCliInput = undefined;

@@ -127,7 +127,7 @@ import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-hand
 import { forkWorker, killWorker, deliverEphemeralOrReply, deliverWriteLinkCard } from '../src/core/worker-pool.js';
 import { buildNewTopicCliInput, getAvailableBots, getSessionWorkingDir } from '../src/core/session-manager.js';
 import { getBot } from '../src/bot-registry.js';
-import { createSession, closeSession } from '../src/services/session-store.js';
+import { createSession, closeSession, updateSession } from '../src/services/session-store.js';
 import { createRepoWorktree, pushWorktreeBranch, removeRepoWorktree } from '../src/services/git-worktree.js';
 import { applyConfigField } from '../src/services/bot-config-store.js';
 import { deleteMessage } from '../src/im/lark/client.js';
@@ -243,10 +243,11 @@ beforeEach(() => {
     botOpenId: 'ou_bot',
   }) as any);
   let n = 0;
-  vi.mocked(createSession).mockImplementation((chatId: string, rootId: string, title: string, chatType?: string) => ({
+  vi.mocked(createSession).mockImplementation((chatId: string, rootId: string, title: string, chatType?: string, scope?: 'thread' | 'chat') => ({
     sessionId: `uuid-new-${++n}`,
     chatId,
     rootMessageId: rootId,
+    scope,
     title,
     status: 'active',
     createdAt: new Date().toISOString(),
@@ -710,6 +711,46 @@ describe('repo select card — plain switch', () => {
     expect(forkWorker).not.toHaveBeenCalled();
     expect(ds.session.sessionId).toBe('uuid-old');
     expect(ds.session.workingDir).toBe('/repos/gamma');
+  });
+
+  it('mid-session chat selection preserves scope and the original message root', async () => {
+    const originalRoot = 'om_original_chat_start';
+    const ds = makeDs({
+      scope: 'chat',
+      session: {
+        ...makeDs().session,
+        scope: 'chat',
+        rootMessageId: originalRoot,
+      },
+    });
+    ds.session.workingDir = '/repos/gamma';
+    const activeSessions = new Map([[sessionKey(CHAT_ID, APP_ID), ds]]);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const deps: CardHandlerDeps = {
+      activeSessions,
+      sessionReply,
+      lastRepoScan: new Map([[CHAT_ID, PROJECTS]]),
+    };
+    const event = {
+      ...makeSelectEvent('repo_switch', '/repos/beta'),
+      action: {
+        option: '/repos/beta',
+        value: { key: 'repo_switch' as const, root_id: CHAT_ID },
+      },
+    };
+
+    await handleCardAction(event, deps, APP_ID);
+
+    expect(createSession).toHaveBeenCalledWith(CHAT_ID, originalRoot, 'beta (main)', 'group', 'chat');
+    expect(ds.session.scope).toBe('chat');
+    expect(ds.session.rootMessageId).toBe(originalRoot);
+    const persisted = vi.mocked(updateSession).mock.calls.find(
+      ([s]) => s.sessionId.startsWith('uuid-new-'),
+    )?.[0];
+    expect(persisted).toEqual(expect.objectContaining({
+      scope: 'chat',
+      rootMessageId: originalRoot,
+    }));
   });
 
   it('ignores a keyless dropdown (option + root_id, no repo_switch/repo_worktree key)', async () => {
