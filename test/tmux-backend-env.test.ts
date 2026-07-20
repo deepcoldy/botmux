@@ -55,7 +55,6 @@ describe('buildBotmuxEnvAssignments()', () => {
       PATH: '/usr/bin',
       HOME: '/home/u',
       NVM_BIN: '/home/u/.nvm/versions/node/v20/bin',
-      HTTP_PROXY: 'http://proxy:8080',
       LANG: 'en_US.UTF-8',
     });
     expect(out).toEqual([
@@ -144,14 +143,66 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out.every(s => !s.endsWith('=undefined'))).toBe(true);
   });
 
-  it('does NOT forward arbitrary env even when set (PATH, HTTP_PROXY, ...)', () => {
+  it('does NOT forward arbitrary env even when set (PATH, LANG, ...)', () => {
     const out = buildBotmuxEnvAssignments({
       PATH: '/should/not/leak',
-      HTTP_PROXY: 'http://should/not/leak',
       LANG: 'should-not-leak',
       BOTMUX: 'kept',
     });
     expect(out).toEqual(['BOTMUX=kept']);
+  });
+
+  // ── Proxy env forwarding (PROXY_ENV_KEYS) ──────────────────────────────────
+  it('forwards proxy vars (HTTP_PROXY, https_proxy, no_proxy, ...) so the CLI can dial the API', () => {
+    // Proxy vars are NOT in BOTMUX_INJECTED_ENV_KEYS (which drives tmux server
+    // scrubbing) — they're injected explicitly here so the pane reaches the
+    // upstream API even when the tmux server / shell rcfile has no proxy set.
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      HTTP_PROXY: 'http://proxy:8080',
+      https_proxy: 'http://proxy:8080',
+      no_proxy: 'localhost,127.0.0.1',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('HTTP_PROXY=http://proxy:8080');
+    expect(out).toContain('https_proxy=http://proxy:8080');
+    expect(out).toContain('no_proxy=localhost,127.0.0.1');
+    expect(out).not.toContain('PATH=/usr/bin');
+  });
+
+  it('preserves empty-string proxy values (HTTP_PROXY=) as an explicit "no proxy" override', () => {
+    // An empty string is a deliberate value (unset the proxy), distinct from
+    // "not set at all" (undefined → skipped). Must survive as `HTTP_PROXY=`.
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      HTTP_PROXY: '',
+    });
+    expect(out).toContain('HTTP_PROXY=');
+  });
+
+  it('skips proxy keys whose value is undefined (no proxy configured)', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      SESSION_DATA_DIR: '/d',
+      // No proxy vars set at all.
+    });
+    expect(out).toEqual(['BOTMUX=1', 'SESSION_DATA_DIR=/d']);
+    expect(out.some(s => /^(HTTP_PROXY|HTTPS_PROXY|http_proxy|https_proxy|no_proxy|NO_PROXY|all_proxy|ALL_PROXY)=/.test(s))).toBe(false);
+  });
+
+  it('per-bot injectEnv proxy overrides the daemon-side proxy (appended last, so it wins)', () => {
+    // injectEnv is appended AFTER the botmux-managed + proxy keys, so a bot's
+    // own HTTPS_PROXY shadows the daemon-side one — last `KEY=VAL` on the argv
+    // wins under `/usr/bin/env`.
+    const out = buildBotmuxEnvAssignments(
+      { BOTMUX: '1', HTTPS_PROXY: 'http://daemon-proxy:8080' },
+      { HTTPS_PROXY: 'http://bot-proxy:3128' },
+    );
+    expect(out).toContain('HTTPS_PROXY=http://daemon-proxy:8080');
+    expect(out).toContain('HTTPS_PROXY=http://bot-proxy:3128');
+    // The per-bot value must come last so env(1) applies it last.
+    expect(out.indexOf('HTTPS_PROXY=http://bot-proxy:3128'))
+      .toBeGreaterThan(out.indexOf('HTTPS_PROXY=http://daemon-proxy:8080'));
   });
 
   it('preserves values with spaces, quotes, equals, newlines (argv array, no shell parsing)', () => {

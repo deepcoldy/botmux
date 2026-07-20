@@ -1057,8 +1057,9 @@ describe('PUT /api/bot-riff config safety (finding H)', () => {
           jwt: 'SECRET-JWT',
           env: { API_KEY: 'SECRET-ENV' },
           logLevel: 'verbose',
-          // 已移出 UI 的两个字段：UI 保存省略它们时旧值必须原样保留
+          // sandboxCluster 现在可编辑；旧 dashboard 保存省略时仍须兼容保留。
           sandboxCluster: 'boe',
+          // 已移出 UI 的字段：UI 保存省略时旧值必须原样保留。
           injectStatusLines: false,
         },
       }], null, 2));
@@ -1073,7 +1074,7 @@ describe('PUT /api/bot-riff config safety (finding H)', () => {
     }
   }
 
-  it('preserves hidden fields (jwt/templateId/env/logLevel) on a UI-field save and redacts the response', async () => {
+  it('preserves hidden fields and an old-client sandbox selection on save, then redacts the response', async () => {
     await withRiffBot(async (base, configPath) => {
       const res = await fetch(`${base}/api/bot-riff`, {
         method: 'PUT',
@@ -1096,10 +1097,31 @@ describe('PUT /api/bot-riff config safety (finding H)', () => {
         jwt: 'SECRET-JWT',
         env: { API_KEY: 'SECRET-ENV' },
         logLevel: 'verbose',
-        // UI 已不回写这两个字段——存量值按隐藏字段保留
+        // 旧 dashboard 未回写 sandboxCluster 时兼容保留原选择。
         sandboxCluster: 'boe',
+        // UI 已不回写 injectStatusLines——存量值按隐藏字段保留。
         injectStatusLines: false,
       });
+    });
+  });
+
+  it('updates sandboxCluster and rejects unsupported values', async () => {
+    await withRiffBot(async (base, configPath) => {
+      const update = await fetch(`${base}/api/bot-riff`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ riff: JSON.stringify({ baseUrl: 'https://riff-new.example', sandboxCluster: 'cn' }) }),
+      });
+      expect(update.status).toBe(200);
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].riff.sandboxCluster).toBe('cn');
+
+      const invalid = await fetch(`${base}/api/bot-riff`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ riff: JSON.stringify({ baseUrl: 'https://riff-new.example', sandboxCluster: 'sg' }) }),
+      });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ ok: false, error: 'invalid_sandbox_cluster' });
     });
   });
 

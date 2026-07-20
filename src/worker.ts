@@ -149,7 +149,12 @@ import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.
 import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
 import { selectSessionBackend, decideBackendGate, backendGateUserMessage } from './adapters/backend/session-backend-selector.js';
-import { deriveRiffReposFromDirs, deriveRiffRepoFromWorkingDir, isValidRiffBaseUrl } from './adapters/backend/riff-backend.js';
+import {
+  deriveRiffReposFromDirs,
+  deriveRiffRepoFromWorkingDir,
+  isValidRiffBaseUrl,
+  isValidRiffSandboxCluster,
+} from './adapters/backend/riff-backend.js';
 import { prepareSandbox, attachSandboxOutbox, startOutboxWatcher, sandboxEnabled, sandboxedClaudeDataDir, localSandboxApplies } from './adapters/backend/sandbox.js';
 import type { BackendType, SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
@@ -5328,6 +5333,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // far harder to diagnose than an explicit spawn refusal.
     if (!isValidRiffBaseUrl(cfg.backendConfig.baseUrl)) {
       throw new Error(`riff baseUrl 未配置或非法（需 http(s) URL，当前: ${JSON.stringify(cfg.backendConfig.baseUrl ?? null)}）——请在 dashboard 的 Riff 配置中填写`);
+    }
+    if (cfg.backendConfig.sandboxCluster !== undefined && !isValidRiffSandboxCluster(cfg.backendConfig.sandboxCluster)) {
+      throw new Error(`riff sandboxCluster 非法（仅支持 boe/cn，当前: ${JSON.stringify(cfg.backendConfig.sandboxCluster)}）——请在 dashboard 的 Riff 配置中重新选择`);
     }
     const sessionEnv: Record<string, string> = {
       BOTMUX_SESSION_ID: cfg.sessionId,

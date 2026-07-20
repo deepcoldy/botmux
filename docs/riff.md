@@ -11,6 +11,7 @@
    | 字段 | 怎么填 |
    |------|--------|
    | Base URL | **必填**。线上 `https://riff.bytedance.net`；BOE 测试环境 `https://riff-infra-boe.bytedance.net` |
+   | 运行环境 | 新任务使用的沙箱资源池：`BOE`（配置值 `boe`）或 `CN`（配置值 `cn`）；不配置时 Riff 默认 `boe`。该选择与 Base URL 所指向的 Riff 服务环境相互独立 |
    | 模型 | **留空**（默认 `gpt-5.5`）；推荐可选：`gpt-5.5` / `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-5.4` / `gpt-5.4-pro`（输入框有下拉建议） |
    | 思考等级 | codex 推理强度（low / medium / high / xhigh），留空跟随默认 medium |
    | JWT 环境变量 | 一般**留空**，见「认证（JWT）」 |
@@ -18,6 +19,17 @@
 
 4. 点「保存 Riff 配置」——CLI 与会话后端自动配对切换到 riff（该机器人现存旧会话会被关闭）。
 5. 群里 @机器人 发消息即可。首轮任务约 2-5 分钟（沙箱冷启动）；继续对话秒级接续同一沙箱与上下文。
+
+保存后会在 `bots.json` 写入如下配置；创建首轮任务时，botmux 把 `sandboxCluster` 作为 `POST /api/task-execute` 的顶层字段发送。后续追问沿用父任务的沙箱与运行环境。
+
+```json
+{
+  "riff": {
+    "baseUrl": "https://riff.bytedance.net",
+    "sandboxCluster": "cn"
+  }
+}
+```
 
 ## 认证（JWT）
 

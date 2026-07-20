@@ -2670,11 +2670,14 @@ function EnvSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
 const RIFF_MODEL_SUGGESTIONS = ['gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.4', 'gpt-5.4-pro'];
 /** codex 思考等级档位（与 riff 服务端对齐）；'' = 跟随 riff 默认（medium）。 */
 const RIFF_REASONING_EFFORT_OPTIONS = ['', 'low', 'medium', 'high', 'xhigh'];
+/** riff task-execute 的 sandboxCluster；缺省行为与服务端一致，回落 BOE。 */
+const RIFF_SANDBOX_CLUSTER_OPTIONS = ['boe', 'cn'] as const;
 
 function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCliSelection?: () => Promise<boolean> }) {
   const tr = useT();
   const riff = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
   const [baseUrl, setBaseUrl] = useState(typeof riff.baseUrl === 'string' ? riff.baseUrl : '');
+  const [sandboxCluster, setSandboxCluster] = useState(riff.sandboxCluster === 'cn' ? 'cn' : 'boe');
   const [model, setModel] = useState(typeof riff.model === 'string' ? riff.model : '');
   const [reasoningEffort, setReasoningEffort] = useState(typeof riff.reasoningEffort === 'string' ? riff.reasoningEffort : '');
   const [jwtEnv, setJwtEnv] = useState(typeof riff.jwtEnv === 'string' ? riff.jwtEnv : '');
@@ -2688,6 +2691,7 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
   useEffect(() => {
     const r = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
     setBaseUrl(typeof r.baseUrl === 'string' ? r.baseUrl : '');
+    setSandboxCluster(r.sandboxCluster === 'cn' ? 'cn' : 'boe');
     setModel(typeof r.model === 'string' ? r.model : '');
     setReasoningEffort(typeof r.reasoningEffort === 'string' ? r.reasoningEffort : '');
     setJwtEnv(typeof r.jwtEnv === 'string' ? r.jwtEnv : '');
@@ -2701,6 +2705,7 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
     try {
       const config: Record<string, unknown> = {};
       if (baseUrl.trim()) config.baseUrl = baseUrl.trim();
+      config.sandboxCluster = sandboxCluster;
       if (model.trim()) config.model = model.trim();
       if (reasoningEffort) config.reasoningEffort = reasoningEffort;
       if (jwtEnv.trim()) config.jwtEnv = jwtEnv.trim();
@@ -2741,6 +2746,19 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
           <span>{tr('botDefaults.riffBaseUrl')}</span>
           <input type="text" data-input="riff-base-url" placeholder={tr('botDefaults.riffBaseUrlPlaceholder')} value={baseUrl} disabled={busy} onChange={e => setBaseUrl(e.currentTarget.value)} />
         </label>
+      </div>
+      <div className="bd-row">
+        <div className="bd-field">
+          <span><FieldTitle help={tr('botDefaults.riffSandboxClusterHelp')}>{tr('botDefaults.riffSandboxCluster')}</FieldTitle></span>
+          <DropdownField
+            dataInput="riff-sandbox-cluster"
+            ariaLabel={tr('botDefaults.riffSandboxCluster')}
+            value={sandboxCluster}
+            disabled={busy}
+            options={RIFF_SANDBOX_CLUSTER_OPTIONS.map(value => ({ value, label: value.toUpperCase() }))}
+            onChange={next => setSandboxCluster(next)}
+          />
+        </div>
       </div>
       <div className="bd-row">
         <label>

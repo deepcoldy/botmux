@@ -28,6 +28,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { basename, isAbsolute, join, dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
+import { PROXY_ENV_KEYS } from '../../utils/child-env.js';
 
 /** Host root for the HOME overlay's upper/work — MUST be OUTSIDE the home lower
  *  (overlayfs forbids upper/work inside lower). */
@@ -502,10 +503,6 @@ export function sandboxCredentialHidePaths(home: string, botmuxHome = join(home,
     join(home, '.lark-cli-bots'),
   ])].sort();
 }
-
-/** Proxy env vars forwarded into the sandbox so the CLI reaches the API even on
- *  the tmux backend (which otherwise only forwards a fixed whitelist). */
-const PROXY_ENV_KEYS = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'no_proxy', 'NO_PROXY', 'all_proxy', 'ALL_PROXY'] as const;
 
 /**
  * Whether the LOCAL bwrap file sandbox applies to this spawn at all.
