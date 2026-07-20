@@ -77,9 +77,29 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'CJADK_INTERACTIVE',
 ] as const;
 
+/** Proxy env vars that must reach the CLI child process so it can dial the
+ *  upstream API on hosts without direct internet access. Forwarded explicitly
+ *  by buildBotmuxEnvAssignments (tmux/tmux-pipe/zellij backends) and
+ *  prepareSandbox (bwrap); the pty backend inherits them via the full child env.
+ *  Deliberately NOT in BOTMUX_INJECTED_ENV_KEYS: that list drives tmuxEnv()
+ *  stripping and scrubTmuxServerGlobalEnv() cleanup — adding proxy keys there
+ *  would delete the user's own tmux server proxy config. */
+export const PROXY_ENV_KEYS = [
+  'http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY',
+  'no_proxy', 'NO_PROXY', 'all_proxy', 'ALL_PROXY',
+] as const;
+
 const TMUX_CLIENT_STRIP_KEYS: ReadonlySet<string> = new Set([
   ...BOTMUX_INJECTED_ENV_KEYS,
   ...REDACTED_CHILD_ENV_KEYS,
+  // Strip proxy vars from the tmux CLIENT env so botmux doesn't seed the
+  // shared server's global env with daemon-side proxy (which may contain
+  // embedded credentials) and leak it to the user's own interactive panes.
+  // Deliberately NOT in TMUX_SERVER_GLOBAL_SCRUB_KEYS: we must not delete
+  // proxy config the user set on their own tmux server. Per-pane injection
+  // via buildBotmuxEnvAssignments reads opts.env directly, so it's unaffected
+  // by this client-side strip.
+  ...PROXY_ENV_KEYS,
 ]);
 
 const TMUX_SERVER_GLOBAL_SCRUB_KEYS: ReadonlySet<string> = new Set([

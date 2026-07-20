@@ -4,7 +4,7 @@ import { basename } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv } from '../../setup/ensure-tmux.js';
-import { BOTMUX_INJECTED_ENV_KEYS, REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
+import { BOTMUX_INJECTED_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
@@ -653,6 +653,15 @@ export function buildBotmuxEnvAssignments(
   const out: string[] = [];
   if (env) {
     for (const key of BOTMUX_INJECTED_ENV_KEYS) {
+      const val = env[key];
+      if (val === undefined) continue;
+      out.push(`${key}=${val}`);
+    }
+    // Proxy vars are not in BOTMUX_INJECTED_ENV_KEYS (which drives tmuxEnv
+    // stripping + server-global scrub) — inject them explicitly here so the
+    // CLI reaches the API even when the tmux server was started without proxy
+    // in its global env, or the shell rcfile doesn't set them.
+    for (const key of PROXY_ENV_KEYS) {
       const val = env[key];
       if (val === undefined) continue;
       out.push(`${key}=${val}`);

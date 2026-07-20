@@ -24,6 +24,7 @@ import { join } from 'node:path';
 import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv } from '../src/setup/ensure-tmux.js';
 import {
   BOTMUX_INJECTED_ENV_KEYS,
+  PROXY_ENV_KEYS,
   REDACTED_CHILD_ENV_KEYS,
   isBotmuxManagedTmuxEnvKey,
   isBotmuxManagedTmuxServerGlobalEnvKey,
@@ -121,6 +122,25 @@ describe('tmuxEnv()', () => {
     expect(isBotmuxManagedTmuxServerGlobalEnvKey('GH_TOKEN')).toBe(false);
     for (const key of ['BOTMUX_SESSION_ID', 'LARK_APP_ID', 'LARK_APP_SECRET', 'CLAUDECODE']) {
       expect(isBotmuxManagedTmuxServerGlobalEnvKey(key), key).toBe(true);
+    }
+  });
+
+  it('classifies every proxy key as tmux client-managed (stripped by tmuxEnv)', () => {
+    // PROXY_ENV_KEYS are in TMUX_CLIENT_STRIP_KEYS so botmux never seeds the
+    // shared tmux server's global env with daemon-side proxy (which may carry
+    // embedded credentials) and leaks it to the user's own interactive panes.
+    for (const key of PROXY_ENV_KEYS) {
+      expect(isBotmuxManagedTmuxEnvKey(key), key).toBe(true);
+    }
+  });
+
+  it('does not classify proxy keys as botmux-owned tmux server-global keys', () => {
+    // PROXY_ENV_KEYS are deliberately NOT in TMUX_SERVER_GLOBAL_SCRUB_KEYS:
+    // scrubTmuxServerGlobalEnv must not delete proxy config the user set on
+    // their own tmux server. Per-pane injection reads opts.env directly, so
+    // the client-side strip above doesn't affect botmux's own sessions.
+    for (const key of PROXY_ENV_KEYS) {
+      expect(isBotmuxManagedTmuxServerGlobalEnvKey(key), key).toBe(false);
     }
   });
 
