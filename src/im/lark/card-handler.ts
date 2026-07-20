@@ -65,7 +65,7 @@ import { publishAttentionPatch, announcePendingRepoSession } from '../../core/se
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
-import { sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isRepoCardConsumed } from '../../core/types.js';
+import { sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isRepoCardConsumed, isActiveRepoCard, claimCurrentRepoCard } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
@@ -542,6 +542,17 @@ export async function commitRepoSelection(
     return;
   } else {
     // Mid-session repo switch — close old session, start fresh.
+    // Claim the current card BEFORE killWorker / any await. A concurrent click
+    // on the same Feishu card must not pass a second kill+fork while the first
+    // switch is still awaiting confirm replies. Correctness does not depend on
+    // deleteMessage succeeding.
+    const claimedCard = claimCurrentRepoCard(ds, cardMessageId);
+    if (cardMessageId && !claimedCard) {
+      // Stale / already-claimed card (entry check races can still reach here).
+      logger.info(`[${tag(ds)}] Ignoring stale mid-session repo card ${cardMessageId}`);
+      return;
+    }
+
     // Safety net (mirrors the `/repo` text-command path): build the same
     // "session closed" card `/close` emits BEFORE displacing the old session
     // (it reads the live session's identity off `ds`). The new session reuses
@@ -611,18 +622,17 @@ export async function commitRepoSelection(
     ds.lastScreenStatus = undefined;
     forkWorker(ds, '', false);
     if (!opts?.suppressConfirmReply) {
-      await sessionReply(rootId, t('cmd.repo.switched_to', { name: dirLabel }, locTarget));
+      try {
+        await sessionReply(rootId, t('cmd.repo.switched_to', { name: dirLabel }, locTarget));
+      } catch (e) {
+        logger.warn(`[${tag(ds)}] Confirm reply after mid-session repo switch failed: ${e instanceof Error ? e.message : e}`);
+      }
     }
     logger.info(`[${tag(ds)}] Repo switched to ${dirPath}, new session created`);
-  }
-
-  // Withdraw the repo selection card (mid-session path). Mark consumed first so
-  // a second click on the same card cannot double-switch while delete lags.
-  const midCard = cardMessageId ?? ds.repoCardMessageId;
-  markRepoCardConsumed(ds, midCard);
-  ds.repoCardMessageId = undefined;
-  if (midCard && larkAppId) {
-    try { await deleteMessage(larkAppId, midCard); } catch { /* best-effort */ }
+    // Best-effort withdraw — card already claimed above.
+    if (claimedCard && larkAppId) {
+      try { await deleteMessage(larkAppId, claimedCard); } catch { /* best-effort */ }
+    }
   }
 }
 
@@ -2139,7 +2149,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     if (actionType === 'skip_repo' && ds) {
       const locDs = localeForBot(ds.larkAppId);
-      if (isRepoCardConsumed(ds, cardMessageId)) {
+      // Only the live posted card may act — covers consumed, wrong card, and
+      // post-restart (repoCardMessageId is in-memory and empty after reboot).
+      if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {
         return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, locDs) } };
       }
       if (ds.pendingRepo) {
@@ -2180,7 +2192,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // needs a scanned git repo root, not an arbitrary path.
     if (actionType === 'repo_manual_submit' && ds) {
       const locDs = localeForBot(ds.larkAppId);
-      if (isRepoCardConsumed(ds, cardMessageId)) {
+      if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {
         return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, locDs) } };
       }
       const rawPath = String(action?.form_value?.repo_manual_path ?? '').trim();
@@ -2226,7 +2238,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     if (actionType === 'repo_worktree_submit' && ds) {
       const locDs = localeForBot(ds.larkAppId);
-      if (isRepoCardConsumed(ds, cardMessageId)) {
+      if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {
         return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, locDs) } };
       }
       const selectedPaths = stringListFromLarkMultiSelect(action?.form_value?.repo_worktree_paths);
@@ -2443,10 +2455,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return;
   }
 
-  // Stale click on a card already used for a successful pending→worker (or
-  // mid-session) commit. Must reject before the mid-session switch path can
-  // killWorker — Feishu withdraw may still show the card.
-  if (isRepoCardConsumed(targetDs, cardMessageId)) {
+  // Only the live posted card may drive selection. Covers: already-consumed,
+  // wrong/old card, and post-restart (repoCardMessageId is in-memory). Must
+  // reject before mid-session switch can killWorker.
+  if (cardMessageId && !isActiveRepoCard(targetDs, cardMessageId)) {
     return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, localeForBot(targetDs.larkAppId)) } };
   }
 

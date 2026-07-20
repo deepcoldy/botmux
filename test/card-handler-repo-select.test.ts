@@ -172,6 +172,9 @@ function makeDs(overrides?: Partial<DaemonSession>): DaemonSession {
     cliVersion: '1.0.0',
     lastMessageAt: Date.now(),
     hasHistory: true,
+    // Match makeSelectEvent / makeSkipEvent / makeManualEvent open_message_id —
+    // only the live posted card may drive selection.
+    repoCardMessageId: 'om_card',
     ...overrides,
   } as unknown as DaemonSession;
 }
@@ -650,6 +653,63 @@ describe('repo select card — plain switch', () => {
     // the switch target — otherwise `claude --resume` reopens it in the wrong cwd.
     expect(closedCard).toContain('gamma');
     expect(closedCard).not.toContain('beta');
+    expect(ds.repoCardMessageId).toBeUndefined();
+    expect(ds.consumedRepoCardMessageIds).toContain('om_card');
+  });
+
+  it('mid-session claims the card before confirm await so a second click cannot double kill/fork', async () => {
+    // Regression: mid-session used to mark consumed only after sessionReply.
+    // Park the "已切换" reply; a second click on the same card must toast and
+    // not kill/create/fork again.
+    const ds = makeDs();
+    ds.session.workingDir = '/repos/gamma';
+    const { deps, sessionReply } = makeDeps(ds);
+    let releaseReply: (() => void) | undefined;
+    sessionReply.mockImplementation(async (_root, text) => {
+      if (typeof text === 'string' && text.includes('已切换') && !releaseReply) {
+        return new Promise<string>(res => { releaseReply = () => res('om_switched'); });
+      }
+      return 'om_reply';
+    });
+
+    const first = handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+    await vi.waitFor(() => expect(forkWorker).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(releaseReply).toBeTruthy());
+    // Card must already be claimed before the hung confirm reply.
+    expect(ds.repoCardMessageId).toBeUndefined();
+    expect(ds.consumedRepoCardMessageIds).toContain('om_card');
+    expect(ds.session.sessionId).toMatch(/^uuid-new-/);
+    const sessionAfterFirst = ds.session.sessionId;
+
+    const late = await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+    expect(late?.toast?.content).toMatch(/仓库已选定|ignore the old card/i);
+    expect(killWorker).toHaveBeenCalledTimes(1);
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.sessionId).toBe(sessionAfterFirst);
+    expect(ds.workingDir).toBe('/repos/alpha');
+
+    releaseReply!();
+    await first;
+    expect(killWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.sessionId).toBe(sessionAfterFirst);
+  });
+
+  it('rejects a card click after restart-like state (no live repoCardMessageId)', async () => {
+    // P2: consumed list is in-memory; after daemon restart both it and
+    // repoCardMessageId are empty. Old Feishu cards must still be rejected.
+    const ds = makeDs({ repoCardMessageId: undefined, consumedRepoCardMessageIds: undefined });
+    ds.session.workingDir = '/repos/gamma';
+    const { deps } = makeDeps(ds);
+
+    const late = await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+    expect(late?.toast?.content).toMatch(/仓库已选定|ignore the old card/i);
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(createSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.session.sessionId).toBe('uuid-old');
+    expect(ds.session.workingDir).toBe('/repos/gamma');
   });
 
   it('ignores a keyless dropdown (option + root_id, no repo_switch/repo_worktree key)', async () => {

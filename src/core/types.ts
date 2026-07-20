@@ -293,6 +293,45 @@ export function isRepoCardConsumed(ds: DaemonSession, cardMessageId: string | un
   return !!cardMessageId && !!ds.consumedRepoCardMessageIds?.includes(cardMessageId);
 }
 
+/**
+ * Whether a card callback may drive repo selection for this session.
+ * Only the currently posted card (`ds.repoCardMessageId`) is valid — after it
+ * is claimed/cleared, or after a daemon restart (field is in-memory), stale
+ * Feishu cards must not mid-session-switch. Previously-consumed ids are also
+ * rejected while the process is still up.
+ */
+export function isActiveRepoCard(ds: DaemonSession, cardMessageId: string | undefined): boolean {
+  if (!cardMessageId) return false;
+  if (isRepoCardConsumed(ds, cardMessageId)) return false;
+  return ds.repoCardMessageId === cardMessageId;
+}
+
+/**
+ * Atomically claim the session's current repo-select card for this action.
+ * Succeeds only when `cardMessageId` is the live `ds.repoCardMessageId` (or
+ * `cardMessageId` is omitted and a current card exists — text path withdrawing
+ * the open card). On success: clears `repoCardMessageId` and marks consumed
+ * BEFORE any killWorker / network await so concurrent callbacks cannot
+ * double-switch. Returns the claimed id, or undefined if the action must not
+ * proceed as a card-driven selection.
+ */
+export function claimCurrentRepoCard(ds: DaemonSession, cardMessageId: string | undefined): string | undefined {
+  const current = ds.repoCardMessageId;
+  if (!current) {
+    // No live card — reject any card id (restart / already claimed). Text path
+    // with no cardMessageId also gets undefined (caller proceeds without card).
+    return undefined;
+  }
+  if (cardMessageId && cardMessageId !== current) return undefined;
+  if (isRepoCardConsumed(ds, current)) {
+    ds.repoCardMessageId = undefined;
+    return undefined;
+  }
+  ds.repoCardMessageId = undefined;
+  markRepoCardConsumed(ds, current);
+  return current;
+}
+
 /** Resolve the routing anchor for an active session — chatId for chat-scope
  *  sessions, rootMessageId for thread-scope. Used to compute `sessionKey()` at
  *  storage and lookup time. */

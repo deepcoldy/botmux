@@ -86,7 +86,7 @@ import {
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
-import { sessionKey, sessionAnchorId, markRepoCardConsumed } from './types.js';
+import { sessionKey, sessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
@@ -1599,11 +1599,15 @@ export async function handleCommand(
             // anchor — expected; `/close` the new one first, or use the
             // command.) Mirrors the `/close` case above.
             //
+            // Claim any open repo card BEFORE killWorker / await so a concurrent
+            // card click cannot double-switch while this text path runs.
+            //
             // The new cwd is NOT written onto the old session here — it would
             // pollute the displaced session's stored workingDir (and the closed
             // card), so `claude --resume` later would reopen the old context in
             // the new repo's cwd. The new repo is pinned onto the fresh session
             // below instead.
+            const claimedCard = claimCurrentRepoCard(ds!, undefined);
             const closedCard = buildClosedSessionCard(ds!, loc);
             killWorker(ds!);
             sessionStore.closeSession(ds!.session.sessionId);
@@ -1630,12 +1634,13 @@ export async function handleCommand(
             sessionStore.updateSession(ds!.session);
             ds!.hasHistory = false;
             forkWorker(ds!, '', false);
-            await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
-            const midCard = ds!.repoCardMessageId;
-            markRepoCardConsumed(ds!, midCard);
-            ds!.repoCardMessageId = undefined;
-            if (midCard) {
-              try { await deleteMessage(ds!.larkAppId, midCard); } catch { /* best-effort */ }
+            try {
+              await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
+            } catch (e) {
+              logger.warn(`[${logTag}] Confirm reply after mid-session repo switch failed: ${e instanceof Error ? e.message : e}`);
+            }
+            if (claimedCard) {
+              try { await deleteMessage(ds!.larkAppId, claimedCard); } catch { /* best-effort */ }
             }
           }
           logger.info(`[${logTag}] Repo selected via ${how}: ${selectedPath}`);
