@@ -32,6 +32,9 @@ export type ScheduleInput = {
    *  canonicalScheduleInput. */
   repeat?: { times: number | null };
   deliver?: 'origin' | 'local' | 'new-topic';
+  /** Silent fires: no "task started" banner; the spawned turn suppresses
+   *  daemon-initiated group output and the model decides whether to send. */
+  silent?: boolean;
 };
 
 export type ScheduleOutput = {
@@ -61,6 +64,7 @@ const ScheduleInputSchema = z.object({
   larkAppId: z.string().optional(),
   repeat: z.object({ times: z.number().int().positive().nullable() }).optional(),
   deliver: z.enum(['origin', 'local', 'new-topic']).optional(),
+  silent: z.boolean().optional(),
 });
 
 export function parseScheduleInput(input: unknown): ScheduleInput {
@@ -120,6 +124,13 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
         message: 'v3 schedule host does not support deliver=local in P0',
       };
     }
+    if (input.silent && input.deliver === 'new-topic') {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_SILENT_NEW_TOPIC_CONFLICT',
+        message: 'silent schedules cannot use deliver=new-topic (a new topic requires a first message)',
+      };
+    }
     if (input.parsed.kind !== 'once') return { ok: true };
     const runAtMs = input.parsed.runAt ? Date.parse(input.parsed.runAt) : Number.NaN;
     // Keep exactly the scheduler's two-minute one-shot catch-up window. Once
@@ -150,6 +161,7 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
       larkAppId: input.larkAppId,
       repeat: input.repeat ? { times: input.repeat.times, completed: 0 } : undefined,
       deliver: input.deliver,
+      silent: input.silent,
     });
     return {
       output: { taskId: task.id },

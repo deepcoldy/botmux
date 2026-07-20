@@ -5,9 +5,9 @@ import { loadSkillPackage } from '../skills/package.js';
 import type {
   BotmuxPluginManifest,
   PluginCliCommandIndexEntry,
-  PluginContributions,
   PluginMcpServer,
   PluginServiceMode,
+  ScannedPluginContributions,
 } from './types.js';
 
 function isFile(path: string): boolean {
@@ -118,7 +118,7 @@ function readCliCommands(raw: unknown): PluginCliCommandIndexEntry[] {
   return commands;
 }
 
-function scanSkills(runtimeDir: string, pluginId: string): PluginContributions['skills'] {
+function scanSkills(runtimeDir: string, pluginId: string): ScannedPluginContributions['skills'] {
   const root = join(runtimeDir, 'skills');
   if (!isDirectory(root)) return undefined;
   const skills = readdirSync(root)
@@ -134,20 +134,20 @@ function scanSkills(runtimeDir: string, pluginId: string): PluginContributions['
   return skills.length > 0 ? skills : undefined;
 }
 
-function scanMcp(runtimeDir: string, pluginId: string): PluginContributions['mcp'] {
+function scanMcp(runtimeDir: string, pluginId: string): ScannedPluginContributions['mcp'] {
   const rel = 'mcp/index.json';
   if (!isFile(join(runtimeDir, rel))) return undefined;
   const file = resolvePluginPath(runtimeDir, rel, 'mcp_entry');
   return readMcpServer(JSON.parse(readFileSync(file, 'utf-8')), rel, runtimeDir, pluginId);
 }
 
-function scanDashboard(runtimeDir: string, pluginId: string): PluginContributions['dashboard'] {
+function scanDashboard(runtimeDir: string, pluginId: string): ScannedPluginContributions['dashboard'] {
   const entry = 'dashboard/index.js';
   if (!isFile(join(runtimeDir, entry))) return undefined;
   return [{ id: pluginId, route: `#/plugins/${pluginId}`, entry }];
 }
 
-function scanCli(runtimeDir: string): PluginContributions['cli'] {
+function scanCli(runtimeDir: string): ScannedPluginContributions['cli'] {
   const entry = 'cli/index.js';
   const commandsPath = 'cli/commands.json';
   const hasEntry = isFile(join(runtimeDir, entry));
@@ -159,7 +159,7 @@ function scanCli(runtimeDir: string): PluginContributions['cli'] {
   return { entry, commandsPath, commands };
 }
 
-function scanService(runtimeDir: string, mode: PluginServiceMode | undefined): PluginContributions['service'] {
+function scanService(runtimeDir: string, mode: PluginServiceMode | undefined): ScannedPluginContributions['service'] {
   const entry = 'service/index.js';
   const exists = isFile(join(runtimeDir, entry));
   if (!exists && !mode) return undefined;
@@ -168,13 +168,13 @@ function scanService(runtimeDir: string, mode: PluginServiceMode | undefined): P
   return { entry, mode: mode! };
 }
 
-export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPluginManifest): PluginContributions | undefined {
+export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPluginManifest): ScannedPluginContributions | undefined {
   const skills = scanSkills(runtimeDir, manifest.id);
   const mcp = scanMcp(runtimeDir, manifest.id);
   const dashboard = scanDashboard(runtimeDir, manifest.id);
   const cli = scanCli(runtimeDir);
   const service = scanService(runtimeDir, manifest.service?.mode);
-  const contributions: PluginContributions = {
+  const contributions: ScannedPluginContributions = {
     ...(skills ? { skills } : {}),
     ...(mcp ? { mcp } : {}),
     ...(dashboard ? { dashboard } : {}),
@@ -184,6 +184,6 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
   return Object.keys(contributions).length > 0 ? contributions : undefined;
 }
 
-export function contributionSkills(contributions: PluginContributions | undefined): string[] {
+export function contributionSkills(contributions: ScannedPluginContributions | undefined): string[] {
   return contributions?.skills?.map(entry => entry.path) ?? [];
 }

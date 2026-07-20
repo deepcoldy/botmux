@@ -4454,6 +4454,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   schedule list                        列出所有任务
   schedule add <schedule> <prompt>     添加任务（ex: "30m" / "every 2h" / "每日9:00" / "0 9 * * *"）
        --new-topic                     每次触发在同群开一个新话题、起独立会话（不续旧话题）
+       --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警（与 --new-topic 互斥）
   schedule remove <id>                 删除任务
   schedule pause|resume <id>           暂停/恢复
   schedule run <id>                    标记立即执行
@@ -4575,6 +4576,7 @@ interface CurrentSession {
   workingDir?: string;
   larkAppId?: string;
   chatType?: 'group' | 'p2p';
+  scope?: 'thread' | 'chat';
 }
 
 /** Detect current session info from ancestor marker + session files. */
@@ -4591,6 +4593,7 @@ function detectCurrentSession(): CurrentSession | null {
     workingDir: s.workingDir,
     larkAppId: s.larkAppId,
     chatType: s.chatType,
+    scope: s.scope,
   };
 }
 
@@ -4915,7 +4918,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       const prompt = t.prompt ?? '';
       const chatId = t.chatId ?? '—';
       const rootId = t.rootMessageId ?? '—';
-      console.log(`${status} [${t.id}] ${display} | ${t.name}`);
+      console.log(`${status} [${t.id}] ${display} | ${t.name}${t.silent ? ' 🔇静默' : ''}`);
       console.log(`   prompt: ${prompt.length > 60 ? prompt.slice(0, 60) + '…' : prompt}`);
       console.log(`   chat: ${chatId.slice(0, 12)}…   thread: ${rootId.slice(0, 16)}…`);
       console.log(`   next: ${next}   last: ${last}${t.lastStatus === 'error' ? ' ❌' : ''}`);
@@ -4925,9 +4928,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   }
 
   if (sub === 'add') {
-    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic']);
+    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--silent']);
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--root-msg-id ROOT] [--lark-app-id APP] [--workdir DIR] [--new-topic]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--root-msg-id ROOT] [--lark-app-id APP] [--workdir DIR] [--new-topic] [--silent]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -4947,6 +4950,13 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     const deliver: 'origin' | 'local' | 'new-topic' = rest.includes('--new-topic')
       ? 'new-topic'
       : ((argValue(rest, '--deliver') as 'origin' | 'local' | 'new-topic' | undefined) ?? 'origin');
+    // --silent: fires post no "执行中" banner; the spawned turn stays quiet and
+    // the model only `botmux send`s when the alert condition in the prompt is met.
+    const silent = rest.includes('--silent');
+    if (silent && deliver === 'new-topic') {
+      console.error('--silent 与 --new-topic 不能同时使用：新话题必须由首条消息开启。要「有异常才开新话题」，请在 prompt 里指示模型报警时用 botmux send 顶层发送。');
+      process.exit(1);
+    }
 
     if (!chatId) {
       console.error('无法推断 chat-id。请加上 --chat-id <CHAT_ID>，或从 Lark 话题内的 CLI 会话中运行本命令。');
@@ -4973,7 +4983,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       creatorRootMessageId: cur?.rootMessageId,
       creatorLarkAppId: cur?.larkAppId,
       chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
+      scope: cur?.scope,
       deliver,
+      silent,
     });
 
     const next = task.nextRunAt ? new Date(task.nextRunAt).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() }) : '—';
@@ -4982,6 +4994,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     console.log(`   下次执行: ${next}`);
     console.log(`   工作目录: ${workingDir}`);
     console.log(`   话题: ${deliver === 'new-topic' ? '(每次新开话题，独立会话)' : rootMessageId ?? '(将新开)'}`);
+    if (silent) console.log('   静默: 触发时不发「执行中」提示，由模型判断是否需要 botmux send 报警');
     return;
   }
 
@@ -8559,6 +8572,31 @@ function printPluginUsage(): void {
 `);
 }
 
+function printPluginServiceRunningError(err: unknown): boolean {
+  if (!err || typeof err !== 'object' || (err as any).code !== 'plugin_service_running') return false;
+  const pluginId = String((err as any).pluginId ?? 'unknown');
+  const operation = String((err as any).operation ?? 'update');
+  const status = String((err as any).serviceStatus ?? 'unknown');
+  const pid = typeof (err as any).pid === 'number' ? `, PID ${(err as any).pid}` : '';
+  const operationLabel = operation === 'uninstall' ? '卸载' : operation === 'install' ? '安装' : '更新';
+  console.error(`❌ 无法${operationLabel}插件 ${pluginId}：插件服务仍在运行（${status}${pid}）。`);
+  console.error(`   请先运行: botmux plugin service stop ${pluginId}`);
+  console.error('   Botmux 不会在安装、更新或卸载时隐式停止插件服务。');
+  return true;
+}
+
+function printPluginServiceDeleteError(err: unknown): boolean {
+  if (!err || typeof err !== 'object' || (err as any).code !== 'plugin_service_delete_failed') return false;
+  const failures = Array.isArray((err as any).failures) ? (err as any).failures : [];
+  const details = failures
+    .map((failure: any) => `${String(failure.pluginId ?? 'unknown')}: ${String(failure.warning ?? 'PM2 删除失败')}`)
+    .join('; ');
+  console.error('❌ 插件服务的 PM2 记录删除失败，插件未卸载。');
+  if (details) console.error(`   ${details}`);
+  console.error('   请确认 PM2 可用后重新执行卸载；Botmux 未清理插件文件、配置或绑定。');
+  return true;
+}
+
 async function cmdPlugin(args: string[]): Promise<void> {
   const sub = (args[0] ?? 'list').toLowerCase();
   if (sub === 'help' || sub === '--help' || sub === '-h') {
@@ -8572,7 +8610,16 @@ async function cmdPlugin(args: string[]): Promise<void> {
     const { installPlugin } = await import('./core/plugins/install.js');
     const { resolveOfficialPluginPackageSpec } = await import('./core/plugins/init.js');
     const resolvedSpec = resolveOfficialPluginPackageSpec(spec);
-    const result = installPlugin(resolvedSpec, { link: args.includes('--link') });
+    let result;
+    try {
+      result = installPlugin(resolvedSpec, { link: args.includes('--link') });
+    } catch (err) {
+      if (printPluginServiceRunningError(err)) {
+        process.exitCode = 1;
+        return;
+      }
+      throw err;
+    }
     const enabledPlugins = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
     if (enabledPlugins.includes(result.record.id)) {
       const { materializePlugin } = await import('./core/plugins/materializer.js');
@@ -8667,26 +8714,57 @@ async function cmdPlugin(args: string[]): Promise<void> {
   if (sub === 'uninstall' || sub === 'remove' || sub === 'rm') {
     const pluginId = requirePluginId(args[1]);
     assertPluginInstalled(pluginId);
-    const enabledEverywhere = new Set(normalizePluginIdList(readGlobalConfig().plugins) ?? []);
-    for (const bot of loadBotsJson()) {
-      for (const id of normalizePluginIdList(bot.plugins) ?? []) enabledEverywhere.add(id);
-    }
-    const dependents = enabledPluginDependents(pluginId, [...enabledEverywhere], registry);
-    if (dependents.length > 0) {
-      console.error(`❌ 不能卸载 ${pluginId}，以下已启用插件依赖它: ${dependents.join(', ')}`);
-      console.error('   请先在对应作用域显式禁用这些插件。');
-      process.exit(1);
-    }
+    const {
+      assertPluginServiceStopped,
+      deletePluginServicesOrThrowUnlocked,
+      withPluginServiceLock,
+    } = await import('./core/plugins/service-manager.js');
     const { dematerializePlugin } = await import('./core/plugins/materializer.js');
-    const { deletePluginServices } = await import('./core/plugins/service-manager.js');
-    dematerializePlugin(pluginId);
-    await deletePluginServices([pluginId]);
-    await removePluginSkillRegistryEntries(pluginId);
-    const { removeInstalledPlugin } = await import('./services/plugin-registry-store.js');
+    const { readPluginRegistry, removeInstalledPlugin } = await import('./services/plugin-registry-store.js');
     const { pluginHome } = await import('./core/plugins/paths.js');
-    removeInstalledPlugin(pluginId);
-    removePluginBindingsEverywhere(pluginId);
-    rmSync(pluginHome(pluginId), { recursive: true, force: true });
+    try {
+      await withPluginServiceLock(async () => {
+        const lockedRegistry = readPluginRegistry();
+        const installed = lockedRegistry.plugins[pluginId];
+        if (!installed) throw new Error(`plugin_not_installed:${pluginId}`);
+
+        const enabledEverywhere = new Set(normalizePluginIdList(readGlobalConfig().plugins) ?? []);
+        for (const bot of loadBotsJson()) {
+          for (const id of normalizePluginIdList(bot.plugins) ?? []) enabledEverywhere.add(id);
+        }
+        const dependents = enabledPluginDependents(pluginId, [...enabledEverywhere], lockedRegistry);
+        if (dependents.length > 0) {
+          throw new Error(`plugin_has_enabled_dependents:${pluginId}:${dependents.join(',')}`);
+        }
+        if (installed.manifest.service) {
+          assertPluginServiceStopped(pluginId, 'uninstall');
+        }
+
+        await deletePluginServicesOrThrowUnlocked([pluginId]);
+        dematerializePlugin(pluginId);
+        await removePluginSkillRegistryEntries(pluginId);
+        removeInstalledPlugin(pluginId);
+        removePluginBindingsEverywhere(pluginId);
+        rmSync(pluginHome(pluginId), { recursive: true, force: true });
+      });
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith(`plugin_has_enabled_dependents:${pluginId}:`)) {
+        const dependents = err.message.slice(`plugin_has_enabled_dependents:${pluginId}:`.length).split(',').filter(Boolean);
+        console.error(`❌ 不能卸载 ${pluginId}，以下已启用插件依赖它: ${dependents.join(', ')}`);
+        console.error('   请先在对应作用域显式禁用这些插件。');
+        process.exitCode = 1;
+        return;
+      }
+      if (printPluginServiceRunningError(err)) {
+        process.exitCode = 1;
+        return;
+      }
+      if (printPluginServiceDeleteError(err)) {
+        process.exitCode = 1;
+        return;
+      }
+      throw err;
+    }
     console.log(`✅ 已卸载插件: ${pluginId}`);
     return;
   }
@@ -8824,6 +8902,7 @@ switch (command) {
       process.exitCode = 2;
       break;
     }
+    process.env.SESSION_DATA_DIR ??= resolveDataDir();
     const { runMcpGateway } = await import('./core/plugins/mcp/gateway.js');
     await runMcpGateway();
     break;

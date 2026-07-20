@@ -1307,6 +1307,64 @@ describe('Worker turn_terminal routing', () => {
     expect(ds.suppressedFinalOutputTurns.has('delivery-stable-key')).toBe(true);
   });
 
+  it('keeps an overlapping silent schedule exact while a queued normal turn stays loud', async () => {
+    const ds = makeDs();
+    ds.silentScheduledTurns = new Map([['schedule-turn', Date.now()]]);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'ready', port: 4567, token: 'token', turnId: 'schedule-turn',
+    } satisfies Extract<WorkerToDaemon, { type: 'ready' }>);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'silent progress', status: 'working', turnId: 'schedule-turn',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    (ds.worker as any).emit('message', {
+      type: 'tui_prompt', description: 'silent approval',
+      options: [{ text: 'allow', selected: false }], turnId: 'schedule-turn',
+    } satisfies Extract<WorkerToDaemon, { type: 'tui_prompt' }>);
+    (ds.worker as any).emit('message', {
+      type: 'user_notify', message: 'silent warning', turnId: 'schedule-turn',
+    } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'silent automatic answer', lastUuid: 'silent-uuid', turnId: 'schedule-turn',
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    (ds.worker as any).emit('message', {
+      type: 'error', message: 'silent startup failure', turnId: 'schedule-turn',
+    } satisfies Extract<WorkerToDaemon, { type: 'error' }>);
+    await Promise.resolve();
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    (ds.worker as any).emit('message', {
+      type: 'user_notify', message: 'normal warning', turnId: 'normal-turn',
+    } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][1]).toBe('normal warning');
+    expect(sessionReply.mock.calls[0][4]).toBe('normal-turn');
+
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId,
+      turnId: 'schedule-turn', status: 'completed',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+    await Promise.resolve();
+    expect(ds.silentScheduledTurns?.has('schedule-turn')).toBe(true);
+
+    // A trailing event after terminal is still tied to the silent turn.
+    (ds.worker as any).emit('message', {
+      type: 'user_notify', message: 'late silent warning', turnId: 'schedule-turn',
+    } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps a newer silent retry armed when stale output and terminal arrive first', async () => {
     const ds = makeDs();
     ds.suppressedFinalOutputTurns = new Map([['delivery-stable-key', 2]]);

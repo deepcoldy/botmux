@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { parsePluginPackageManifest } from '../src/core/plugins/manifest.js';
 import { scanPluginContributions } from '../src/core/plugins/convention-scanner.js';
 import { normalizePluginIdList } from '../src/core/plugins/ids.js';
-import { pluginMaterializedPath, pluginRegistryPath, resolvePluginPath } from '../src/core/plugins/paths.js';
+import { pluginHome, pluginMaterializedPath, pluginMcpPrivatePath, pluginRegistryPath, resolvePluginPath } from '../src/core/plugins/paths.js';
 import { readPluginRegistry, upsertInstalledPlugin } from '../src/services/plugin-registry-store.js';
 import { resolveEffectivePluginIds, updateBotPluginOverride } from '../src/core/plugins/effective.js';
 import { assertPluginBindingTransition, enabledPluginDependents } from '../src/core/plugins/dependencies.js';
@@ -15,6 +15,7 @@ import { collectPluginCliCommands } from '../src/core/plugins/runtime.js';
 import { dematerializePlugin, materializePlugin } from '../src/core/plugins/materializer.js';
 import { resolvePluginSkillPackages } from '../src/core/plugins/skills.js';
 import { readSkillRegistry } from '../src/services/skill-registry-store.js';
+import { readPluginMcpDescriptor } from '../src/core/plugins/mcp/private-store.js';
 
 describe('plugin manifest and registry basics', () => {
   let home: string;
@@ -245,6 +246,149 @@ describe('plugin manifest and registry basics', () => {
     expect(JSON.parse(readFileSync(pluginRegistryPath(), 'utf8')).plugins['agent-chrome'].version).toBe('0.1.0');
   });
 
+  it('stores MCP commands and credentials in a protected private descriptor', () => {
+    const source = join(home, 'private-mcp-source');
+    mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
+    writeFileSync(join(source, 'package.json'), JSON.stringify({
+      name: '@botmux-ai/plugin-private-mcp',
+      version: '0.1.0',
+      keywords: ['botmux-plugin'],
+      botmux: { schemaVersion: 1, id: 'private-mcp' },
+    }));
+    writeFileSync(join(source, 'dist', 'mcp', 'server.mjs'), 'process.stdin.resume();\n');
+    writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
+      command: ['node', './mcp/server.mjs'],
+      env: { PRIVATE_MCP_TOKEN: 'secret-value-never-in-registry' },
+    }));
+
+    const installed = installLocalPlugin(source);
+    const persisted = JSON.parse(readFileSync(pluginRegistryPath(), 'utf8'));
+    expect(persisted.plugins['private-mcp'].contributions.mcp).toEqual({
+      name: 'private-mcp',
+      transport: 'stdio',
+      privateRef: 'private/mcp.json',
+    });
+    expect(JSON.stringify(persisted)).not.toContain('secret-value-never-in-registry');
+    expect(JSON.stringify(persisted)).not.toContain('./mcp/server.mjs');
+
+    const privatePath = pluginMcpPrivatePath('private-mcp');
+    expect(lstatSync(privatePath).mode & 0o777).toBe(0o600);
+    expect(readPluginMcpDescriptor('private-mcp', installed.record.contributions!.mcp!)).toMatchObject({
+      name: 'private-mcp',
+      command: ['node', './mcp/server.mjs'],
+      env: { PRIVATE_MCP_TOKEN: 'secret-value-never-in-registry' },
+    });
+  });
+
+  it('atomically migrates legacy registry MCP descriptors and is idempotent', () => {
+    const now = new Date().toISOString();
+    mkdirSync(join(home, '.botmux'), { recursive: true });
+    writeFileSync(pluginRegistryPath(), JSON.stringify({
+      schemaVersion: 1,
+      plugins: {
+        legacy: {
+          id: 'legacy',
+          packageName: '@botmux-ai/plugin-legacy',
+          version: '0.1.0',
+          source: { type: 'npm', spec: '@botmux-ai/plugin-legacy' },
+          manifest: { schemaVersion: 1, id: 'legacy' },
+          contributions: {
+            mcp: {
+              name: 'legacy',
+              transport: 'streamable-http',
+              url: 'https://mcp.example.test/private',
+              headers: { Authorization: 'Bearer legacy-secret' },
+            },
+          },
+          installedAt: now,
+          updatedAt: now,
+        },
+      },
+    }));
+
+    const migrated = readPluginRegistry();
+    expect(migrated.plugins.legacy.contributions?.mcp).toEqual({
+      name: 'legacy',
+      transport: 'streamable-http',
+      privateRef: 'private/mcp.json',
+    });
+    const firstPrivate = readFileSync(pluginMcpPrivatePath('legacy'), 'utf8');
+    expect(firstPrivate).toContain('Bearer legacy-secret');
+    expect(readFileSync(pluginRegistryPath(), 'utf8')).not.toContain('Bearer legacy-secret');
+
+    expect(readPluginRegistry().plugins.legacy.contributions?.mcp).toEqual(
+      migrated.plugins.legacy.contributions?.mcp,
+    );
+    expect(readFileSync(pluginMcpPrivatePath('legacy'), 'utf8')).toBe(firstPrivate);
+  });
+
+  it('fails closed and leaves the legacy registry untouched when private migration cannot commit', () => {
+    const now = new Date().toISOString();
+    const id = 'legacy-broken';
+    const external = join(home, 'external-private');
+    mkdirSync(pluginHome(id), { recursive: true });
+    mkdirSync(external, { recursive: true });
+    symlinkSync(external, join(pluginHome(id), 'private'), 'dir');
+    const legacyRegistry = JSON.stringify({
+      schemaVersion: 1,
+      plugins: {
+        [id]: {
+          id,
+          packageName: `@botmux-ai/plugin-${id}`,
+          version: '0.1.0',
+          source: { type: 'npm', spec: `@botmux-ai/plugin-${id}` },
+          manifest: { schemaVersion: 1, id },
+          contributions: {
+            mcp: { name: id, transport: 'stdio', command: ['node', 'server.js'] },
+          },
+          installedAt: now,
+          updatedAt: now,
+        },
+      },
+    });
+    mkdirSync(dirname(pluginRegistryPath()), { recursive: true });
+    writeFileSync(pluginRegistryPath(), legacyRegistry);
+
+    expect(() => readPluginRegistry()).toThrow(/plugin_mcp_registry_migration_failed:unsafe_plugin_private_dir/);
+    expect(readFileSync(pluginRegistryPath(), 'utf8')).toBe(legacyRegistry);
+    expect(existsSync(join(external, 'mcp.json'))).toBe(false);
+  });
+
+  it('fails closed instead of preserving malformed or leaked MCP registry fields', () => {
+    const now = new Date().toISOString();
+    const id = 'legacy-malformed';
+    const legacyRegistry = JSON.stringify({
+      schemaVersion: 1,
+      plugins: {
+        [id]: {
+          id,
+          packageName: `@botmux-ai/plugin-${id}`,
+          version: '0.1.0',
+          source: { type: 'npm', spec: `@botmux-ai/plugin-${id}` },
+          manifest: { schemaVersion: 1, id },
+          contributions: {
+            mcp: {
+              name: id,
+              transport: 'stdio',
+              privateRef: 'private/mcp.json',
+              env: { TOKEN: 'must-not-remain-public' },
+            },
+          },
+          installedAt: now,
+          updatedAt: now,
+        },
+      },
+    });
+    mkdirSync(dirname(pluginRegistryPath()), { recursive: true });
+    writeFileSync(pluginRegistryPath(), legacyRegistry);
+
+    expect(() => readPluginRegistry()).toThrow(
+      /plugin_mcp_registry_migration_failed:invalid_plugin_mcp_contribution:legacy-malformed/,
+    );
+    expect(readFileSync(pluginRegistryPath(), 'utf8')).toBe(legacyRegistry);
+    expect(existsSync(pluginMcpPrivatePath(id))).toBe(false);
+  });
+
   it('resolves plugin paths only inside the plugin root', () => {
     const root = join(home, '.botmux', 'plugins', 'agent-chrome', 'dist');
     mkdirSync(root, { recursive: true });
@@ -333,6 +477,7 @@ describe('plugin manifest and registry basics', () => {
 
     const result = installLocalPlugin(source, { link: true });
     expect(lstatSync(result.runtimeDir).isSymbolicLink()).toBe(true);
+    expect(result.record.source).toEqual({ type: 'local', spec: source, link: true });
     expect(readFileSync(join(result.runtimeDir, 'marker.txt'), 'utf8')).toBe('v1\n');
 
     writeFileSync(join(source, 'dist', 'marker.txt'), 'v2\n');

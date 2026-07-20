@@ -119,6 +119,16 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
+  it('forwards the worker-owned MCP relay capability into the CLI pane', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_MCP_GATEWAY_SOCKET: '/tmp/botmux-mcp/session/gateway.sock',
+      BOTMUX_MCP_GATEWAY_REQUIRED: '1',
+    });
+    expect(out).toContain('BOTMUX_MCP_GATEWAY_SOCKET=/tmp/botmux-mcp/session/gateway.sock');
+    expect(out).toContain('BOTMUX_MCP_GATEWAY_REQUIRED=1');
+  });
+
   it('forwards Hermes profile paths so the pane and transcript reader use the same state DB', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',

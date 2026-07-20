@@ -40,7 +40,10 @@ server.setRequestHandler(ListToolsRequestSchema, request => request.params?.curs
     });
 
 server.setRequestHandler(CallToolRequestSchema, request => ({
-  content: [{ type: 'text', text: `${serverName}:${request.params.name}:${JSON.stringify(request.params.arguments ?? {})}` }],
+  content: [{
+    type: 'text',
+    text: `${serverName}:${request.params.name}:${JSON.stringify(request.params.arguments ?? {})}:session=${process.env.BOTMUX_SESSION_ID || ''}:token=${process.env.PRIVATE_MCP_TOKEN || ''}`,
+  }],
 }));
 
 server.setRequestHandler(ListPromptsRequestSchema, () => ({

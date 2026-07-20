@@ -8,7 +8,7 @@
  * Run:  pnpm vitest run test/scheduler.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseNaturalSchedule, parseSchedule, computeNextRun, extractDeliveryMode, planCronRealign } from '../src/core/scheduler.js';
+import { parseNaturalSchedule, parseSchedule, computeNextRun, extractDeliveryMode, extractSilentMode, extractScheduleModifiers, planCronRealign } from '../src/core/scheduler.js';
 
 // ─── Helper ──────────────────────────────────────────────────────────────────
 
@@ -237,6 +237,57 @@ describe('extractDeliveryMode (新话题 keyword)', () => {
 
   it('keyword with nothing after it stays origin (degenerate)', () => {
     expect(extractDeliveryMode('新话题')).toEqual({ deliver: 'origin', prompt: '新话题' });
+  });
+});
+
+describe('extractSilentMode (静默 keyword)', () => {
+  it('strips leading 静默 and resolves silent', () => {
+    expect(extractSilentMode('静默 检查服务状态，挂了才报警')).toEqual({ silent: true, prompt: '检查服务状态，挂了才报警' });
+  });
+
+  it('accepts 静默执行 / 静默运行 variants', () => {
+    expect(extractSilentMode('静默执行 检查构建')).toEqual({ silent: true, prompt: '检查构建' });
+    expect(extractSilentMode('静默运行：ping 服务')).toEqual({ silent: true, prompt: 'ping 服务' });
+  });
+
+  it('accepts 悄悄 variant and punctuation separators', () => {
+    expect(extractSilentMode('悄悄，看看磁盘水位')).toEqual({ silent: true, prompt: '看看磁盘水位' });
+  });
+
+  it('accepts english silent / silently', () => {
+    expect(extractSilentMode('silent: check the service')).toEqual({ silent: true, prompt: 'check the service' });
+    expect(extractSilentMode('silently - poll CI status')).toEqual({ silent: true, prompt: 'poll CI status' });
+  });
+
+  it('does NOT match 静默 glued into a longer phrase without separator', () => {
+    expect(extractSilentMode('静默模式下测试应用')).toEqual({ silent: false, prompt: '静默模式下测试应用' });
+  });
+
+  it('does not treat mid-sentence 静默 as the keyword', () => {
+    expect(extractSilentMode('检查服务是否静默失败')).toEqual({ silent: false, prompt: '检查服务是否静默失败' });
+  });
+
+  it('keyword with nothing after it stays non-silent (degenerate)', () => {
+    expect(extractSilentMode('静默')).toEqual({ silent: false, prompt: '静默' });
+  });
+});
+
+describe('extractScheduleModifiers (combined keywords)', () => {
+  it('plain prompt: no modifiers', () => {
+    expect(extractScheduleModifiers('帮我看AI新闻')).toEqual({ deliver: 'origin', silent: false, prompt: '帮我看AI新闻' });
+  });
+
+  it('silent only', () => {
+    expect(extractScheduleModifiers('静默 检查服务')).toEqual({ deliver: 'origin', silent: true, prompt: '检查服务' });
+  });
+
+  it('new-topic only', () => {
+    expect(extractScheduleModifiers('新话题 生成日报')).toEqual({ deliver: 'new-topic', silent: false, prompt: '生成日报' });
+  });
+
+  it('both keywords, either order (conflict is rejected by callers)', () => {
+    expect(extractScheduleModifiers('静默 新话题 检查服务')).toEqual({ deliver: 'new-topic', silent: true, prompt: '检查服务' });
+    expect(extractScheduleModifiers('新话题 静默 检查服务')).toEqual({ deliver: 'new-topic', silent: true, prompt: '检查服务' });
   });
 });
 

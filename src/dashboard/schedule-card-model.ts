@@ -53,6 +53,9 @@ export interface ScheduleCardTaskInput {
    *  `times === null` ⇒ forever; finite `times` ⇒ auto-removes after N runs.
    *  `completed` counts how many runs have fired. */
   repeat?: { times: number | null; completed: number };
+  /** Silent fires (no start banner, model decides whether to send). Silent
+   *  tasks cannot switch to new-topic delivery. */
+  silent?: boolean;
 }
 
 export type ScheduleKind = ParsedSchedule['kind'];
@@ -207,6 +210,11 @@ export function computeDeliveryButtonAvailability(
   const current = normalizeScheduleDelivery(task.deliver);
   if (current === 'local') {
     return { enabled: false, reasonKey: 'schedules.action.delivery.local' };
+  }
+  // Silent tasks fire without any message; new-topic needs a first message to
+  // open the topic, so the switch is disabled (mirrors scheduler.toggleDelivery).
+  if (task.silent && target === 'new-topic') {
+    return { enabled: false, reasonKey: 'schedules.action.delivery.silentOriginOnly' };
   }
   if (current === target) {
     return {

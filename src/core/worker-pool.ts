@@ -91,6 +91,7 @@ import {
 import { neutralizeLarkAtTags } from '../services/send-policy.js';
 import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-message-store.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
+import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -1900,14 +1901,12 @@ export function forkWorker(
     resume = resumeOrTurnId;
   }
 
-  // An empty prompt is a pure worker reattach/restore, not a newly accepted
-  // user turn. Never inherit the previous reply target in that case: doing so
-  // would re-publish stale per-turn authority (notably an explicit meeting IM
-  // origin) into a fresh worker lifetime after a daemon restart. Non-empty
-  // prompts keep the historical fallback for callers that accepted a turn
-  // before they learned to pass its id explicitly.
-  const initAttributionTurnId = initTurnId
-    ?? (prompt.length > 0 ? ds.currentReplyTarget?.turnId : undefined);
+  // Per-turn authority is never inferred from mutable session state. Human
+  // message routes pass their accepted Lark message id explicitly; restore,
+  // scheduler, card retry and other system starts stay unattributed. Falling
+  // back to currentReplyTarget here would let a later system prompt reuse an
+  // older human turn after a worker replacement.
+  const initAttributionTurnId = initTurnId;
 
   // A fork() whose cwd no longer exists emits an unhandled 'error' (spawn
   // ENOENT) that crashes the WHOLE daemon (→ pm2 crash-loop). Fall back to
@@ -2023,7 +2022,9 @@ export function forkWorker(
     },
   } as WindowsForkOptions);
   const startupState: WorkerStartupState = {
-    ready: false, failureNotified: false, initTurnId, initDispatchAttempt,
+    ready: false, failureNotified: false,
+    initTurnId: initAttributionTurnId,
+    initDispatchAttempt,
   };
 
   // A fork-level failure (spawn ENOENT, etc.) emits 'error'; without a handler
@@ -2034,28 +2035,28 @@ export function forkWorker(
     logger.error(`[${t}] Worker fork error: ${reason}`);
     if (startupState.failureNotified) return;
     startupState.failureNotified = true;
-    // A dedicated VC receiver has no auxiliary Lark output channel. Durable
-    // failures stay on the receipt/lease chain, and exact IM turns may only
-    // produce their ledgered final reply — never a fork diagnostic.
-    if (ds.session.vcMeetingReceiver) {
+    emitSessionLifecycleHook(ds, 'session.requires_attention', {
+      reason: 'worker_fork_error',
+      message: reason,
+    });
+    // A dedicated VC receiver and a silent schedule have no auxiliary Lark
+    // output channel. Keep lifecycle/dashboard state above, but never leak a
+    // fork diagnostic into the chat.
+    if (ds.session.vcMeetingReceiver || isSilentScheduledTurn(ds, initAttributionTurnId)) {
       logger.info(
-        `[${t}] VC receiver fork failure kept out of auxiliary Lark UI `
-        + `turn=${initTurnId?.slice(0, 12) ?? '-'} attempt=${initDispatchAttempt}: ${reason}`,
+        `[${t}] Managed/silent fork failure kept out of auxiliary Lark UI `
+        + `turn=${initAttributionTurnId?.slice(0, 12) ?? '-'} attempt=${initDispatchAttempt}: ${reason}`,
       );
       return;
     }
     const cliName = getCliDisplayName(agentCfg.cliId);
     const message = tr('worker.start_failed', { cliName, reason }, botLocale(botCfg));
-    emitSessionLifecycleHook(ds, 'session.requires_attention', {
-      reason: 'worker_fork_error',
-      message: reason,
-    });
     void cb.sessionReply(
       sessionAnchorId(ds),
       message,
       'text',
       ds.larkAppId,
-      fallbackTurnId(ds, initTurnId),
+      fallbackTurnId(ds, initAttributionTurnId),
       ds.session.vcMeetingReceiver
         ? { sourceSessionId: ds.session.sessionId }
         : undefined,
@@ -2260,6 +2261,7 @@ function setupWorkerHandlers(
   /** Auxiliary worker UI is never an authorized output channel for a dedicated
    * VC receiver. Dashboard/audit state is still updated before these guards. */
   const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean => {
+    if (isSilentScheduledTurn(ds, turnId)) return true;
     if (ds.session.vcMeetingReceiver) return true;
     return ordinaryManagedSuppression(turnId, dispatchAttempt);
   };
@@ -2269,6 +2271,7 @@ function setupWorkerHandlers(
     turnId?: string,
     dispatchAttempt?: number,
   ): boolean => {
+    if (isSilentScheduledTurn(ds, turnId)) return true;
     if (!ds.session.vcMeetingReceiver) {
       return ordinaryManagedSuppression(turnId, dispatchAttempt);
     }
@@ -2296,6 +2299,10 @@ function setupWorkerHandlers(
   ): Promise<void> => {
     if (startupState.failureNotified) return;
     startupState.failureNotified = true;
+    emitSessionLifecycleHook(ds, 'session.requires_attention', {
+      reason: 'worker_start_failed',
+      message: reason,
+    });
     // A durable VC meeting delivery attempt must not surface its startup/relaunch
     // failure out-of-band. The worker-generation exit is fenced to the receipt
     // (marked ambiguous and retried under the side-effect boundary); a direct
@@ -2303,17 +2310,13 @@ function setupWorkerHandlers(
     // Ordinary IM turns and non-receiver sessions still notify exactly once.
     if (managedAuxUiSuppressed(turnId, dispatchAttempt)) {
       logger.info(
-        `[${t}] VC receiver startup failure kept out of auxiliary Lark UI `
+        `[${t}] Managed/silent startup failure kept out of auxiliary Lark UI `
         + `turn=${turnId?.slice(0, 12) ?? '-'} attempt=${dispatchAttempt}: ${reason}`,
       );
       return;
     }
     const cliName = getCliDisplayName(sessionCliId(ds, botCfg));
     const message = tr('worker.start_failed', { cliName, reason }, loc);
-    emitSessionLifecycleHook(ds, 'session.requires_attention', {
-      reason: 'worker_start_failed',
-      message: reason,
-    });
     try {
       await scopedReply(message, 'text', turnId);
     } catch (err: any) {
@@ -2362,7 +2365,7 @@ function setupWorkerHandlers(
         }
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
-          logger.info(`[${t}] Managed VC receiver — suppressing ready/streaming card output`);
+          logger.info(`[${t}] Managed/silent turn — suppressing ready/streaming card output`);
           break;
         }
 
@@ -2588,6 +2591,8 @@ function setupWorkerHandlers(
         if (ds.pendingRawInput && ds.worker && !ds.worker.killed) {
           const rawInput = ds.pendingRawInput;
           ds.pendingRawInput = undefined;
+          const rawTurnId = ds.pendingRawTurnId;
+          ds.pendingRawTurnId = undefined;
           // Input buffered while the repo card was pending rides on the SAME
           // IPC: worker message handlers run concurrently (async handlers
           // don't serialize), so a separate `message` IPC could write into
@@ -2601,7 +2606,9 @@ function setupWorkerHandlers(
           ds.worker.send({
             type: 'raw_input',
             content: rawInput,
+            ...(rawTurnId ? { turnId: rawTurnId } : {}),
             followUpContent: followUp?.cliInput,
+            ...(followUp?.turnId ? { followUpTurnId: followUp.turnId } : {}),
             ...(followUpCodexAppInput ? { followUpCodexAppInput } : {}),
           } as DaemonToWorker);
           logger.info(`[${t}] Sent pending raw input after prompt_ready: ${rawInput.substring(0, 80)}${followUp ? ` (+follow-up ${followUp.cliInput.length} chars)` : ''}`);
@@ -2623,7 +2630,7 @@ function setupWorkerHandlers(
         // is known, so consumers exclude this session from native parsers
         // before its first positive-delta record exists.
         recordOwnershipForDaemonSession(ds);
-        if (!managedAuxUiSuppressed()
+        if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
           && !wasLocalCliOpenReady
           && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
           scheduleLocalCliOpenReadinessPatch(ds);
@@ -2799,7 +2806,7 @@ function setupWorkerHandlers(
           content: ds.lastScreenContent ?? '',
         });
         persistStreamCardState(ds);
-        if (managedAuxUiSuppressed()) break;
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) break;
         const readUrl = buildTerminalUrl(ds);
@@ -2854,7 +2861,7 @@ function setupWorkerHandlers(
         // would temporarily overwrite a user-issued /rename until refresh.
         ds.currentTurnTitle = msg.description;
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
-          logger.info(`[${t}] Managed VC receiver — TUI prompt kept in dashboard/audit only`);
+          logger.info(`[${t}] Managed/silent turn — TUI prompt kept in dashboard/audit only`);
           break;
         }
         try {
@@ -2879,7 +2886,7 @@ function setupWorkerHandlers(
       case 'tui_prompt_resolved': {
         // TUI prompt is no longer showing — update card if it exists
         logger.info(`[${t}] TUI prompt resolved${msg.selectedText ? `: ${msg.selectedText}` : ''}`);
-        if (managedAuxUiSuppressed()) {
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
           ds.tuiPromptCardId = undefined;
           ds.tuiPromptOptions = undefined;
           break;
@@ -3050,7 +3057,7 @@ function setupWorkerHandlers(
         });
         // Refresh the live streaming card (writable/AIO link) — parks a pending
         // flag when the card POST is still in-flight and flushes once it lands.
-        if (!managedAuxUiSuppressed()) scheduleRiffAccessUrlPatch(ds);
+        if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) scheduleRiffAccessUrlPatch(ds);
         break;
       }
 

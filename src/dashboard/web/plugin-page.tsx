@@ -43,10 +43,7 @@ interface PluginSkillContribution {
 interface PluginMcpContribution {
   name?: string;
   transport?: string;
-  command?: string[];
-  env?: Record<string, string>;
-  url?: string;
-  headers?: Record<string, string>;
+  privateRef?: string;
 }
 
 interface PluginCliCommand {
@@ -389,15 +386,8 @@ function McpPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Elemen
     label: server.name || 'mcp',
     content: (
       <div className="plugin-info-stack">
-        <div>
-          <span>{server.transport === 'streamable-http' ? '服务地址' : '启动命令'}</span>
-          <InlineCode>{server.transport === 'streamable-http' ? server.url || '-' : server.command?.join(' ') || '-'}</InlineCode>
-        </div>
         <div><span>传输</span><Tags values={[server.transport || 'stdio']} /></div>
-        <div><span>环境变量</span><Tags values={Object.keys(server.env ?? {})} /></div>
-        {Object.keys(server.headers ?? {}).length > 0
-          ? <div><span>请求头</span><Tags values={Object.keys(server.headers ?? {})} /></div>
-          : null}
+        <div><span>运行配置</span><Tags values={['受保护，由 Gateway 按会话加载']} /></div>
       </div>
     ),
   }] : [];

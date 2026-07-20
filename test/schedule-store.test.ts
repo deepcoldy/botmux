@@ -123,6 +123,38 @@ describe('schedule-store', () => {
 
       expect(t1.id).not.toBe(t2.id);
     });
+
+    it('persists silent:true and normalizes silent:false/absent to undefined', async () => {
+      const { createTask } = await freshImport();
+      const silentTask = createTask({ ...TASK_PARAMS, name: 'Silent', silent: true });
+      const loudTask = createTask({ ...TASK_PARAMS, name: 'Loud', silent: false });
+      const legacyTask = createTask({ ...TASK_PARAMS, name: 'Legacy' });
+
+      expect(silentTask.silent).toBe(true);
+      expect(loudTask.silent).toBeUndefined();
+      expect(legacyTask.silent).toBeUndefined();
+
+      const data = JSON.parse(readFileSync(join(tempDir, 'schedules.json'), 'utf-8'));
+      expect(data[silentTask.id].silent).toBe(true);
+      expect('silent' in data[loudTask.id]).toBe(false);
+    });
+
+    it('canonical hash: silent:false/absent are identical (legacy compat), silent:true differs', async () => {
+      const { canonicalScheduleInput, createTask, IdempotencyConflictError } = await freshImport();
+      const { computeInputHash } = await import('../src/utils/canonical-input-hash.js');
+
+      const absent = computeInputHash(canonicalScheduleInput(TASK_PARAMS));
+      const explicitFalse = computeInputHash(canonicalScheduleInput({ ...TASK_PARAMS, silent: false }));
+      const explicitTrue = computeInputHash(canonicalScheduleInput({ ...TASK_PARAMS, silent: true }));
+      expect(explicitFalse).toBe(absent);
+      expect(explicitTrue).not.toBe(absent);
+
+      // create-or-return-identical: same id + silent flip must conflict, not no-op.
+      createTask({ ...TASK_PARAMS, id: 'fixed-id1', silent: true });
+      expect(() => createTask({ ...TASK_PARAMS, id: 'fixed-id1' })).toThrow(IdempotencyConflictError);
+      const same = createTask({ ...TASK_PARAMS, id: 'fixed-id1', silent: true });
+      expect(same.id).toBe('fixed-id1');
+    });
   });
 
   describe('getTask', () => {

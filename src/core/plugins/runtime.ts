@@ -29,6 +29,8 @@ export interface PluginServiceDefinition {
     args?: string[];
     env?: Record<string, string>;
     autorestart?: boolean;
+    killTimeoutMs?: number;
+    watchDelayMs?: number;
   };
   urls?(ctx: { host: string; env: Record<string, string>; port?: number }): {
     openUrl?: string;

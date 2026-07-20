@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import {
+  CreateActionButton,
   DropdownMenu,
   OverviewList,
   OverviewListItem,
@@ -64,6 +65,8 @@ function ScheduleRowCard(props: {
   feedback: Record<string, ActionFeedback>;
   tr: ReturnType<typeof useT>;
   onAction(id: string, op: ScheduleAction): void;
+  onEdit(schedule: ScheduleRow): void;
+  onDelete(schedule: ScheduleRow): void;
 }) {
   const { schedule: s, scheduleTimeZone, tr } = props;
   const kind = String(s.parsed?.kind ?? 'unknown');
@@ -88,8 +91,17 @@ function ScheduleRowCard(props: {
         <div className="schedule-chip-strip">
           <span>{kind}</span>
           <span>{tr('schedules.delivery')}: {deliveryLabel(s, tr)}</span>
+          {s.silent ? <span>🔇 {tr('schedules.silent')}</span> : null}
           <span>{tr('schedules.next')}: {fmtScheduleDate(s.nextRunAt, scheduleTimeZone)}</span>
-          <span>{tr('schedules.last')}: {fmtScheduleDate(s.lastRunAt, scheduleTimeZone)}{s.lastStatus === 'error' ? ' · error' : ''}</span>
+          <span>{tr('schedules.last')}: {fmtScheduleDate(s.lastRunAt, scheduleTimeZone)}</span>
+          {s.lastStatus === 'error' ? (
+            <span
+              className="schedule-error-chip"
+              title={typeof s.lastError === 'string' ? s.lastError : undefined}
+            >
+              ⚠ {tr('schedules.error')}: {typeof s.lastError === 'string' && s.lastError.length > 60 ? s.lastError.slice(0, 60) + '…' : (s.lastError ?? tr('schedules.errorUnknown'))}
+            </span>
+          ) : null}
           <span>{tr('schedules.repeat')}: {repeatLabel(s)}</span>
         </div>
       </OverviewListMain>
@@ -109,7 +121,8 @@ function ScheduleRowCard(props: {
             tr={tr}
             onClick={() => props.onAction(s.id, toggleOp)}
           />
-          {s.deliver === 'local' ? null : (
+          {/* silent tasks can't switch to new-topic (needs a first message) — hide like 'local' */}
+          {s.deliver === 'local' || s.silent ? null : (
             <ActionButton
               op="delivery"
               label={s.deliver === 'new-topic' ? tr('schedules.useOrigin') : tr('schedules.useNewTopic')}
@@ -118,6 +131,22 @@ function ScheduleRowCard(props: {
               onClick={() => props.onAction(s.id, 'delivery')}
             />
           )}
+          <button
+            type="button"
+            className="schedule-action-button schedule-edit-button"
+            onClick={() => props.onEdit(s)}
+            title={tr('schedules.edit')}
+          >
+            <span className="schedule-action-label">{tr('schedules.edit')}</span>
+          </button>
+          <button
+            type="button"
+            className="schedule-action-button schedule-delete-button"
+            onClick={() => props.onDelete(s)}
+            title={tr('schedules.delete')}
+          >
+            <span className="schedule-action-label">{tr('schedules.delete')}</span>
+          </button>
         </div>
       </OverviewListTail>
     </OverviewListItem>
@@ -134,6 +163,19 @@ function SchedulesPage() {
   const [pending, setPending] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<Record<string, ActionFeedback>>({});
   const feedbackTimers = useRef(new Map<string, number>());
+  const [formOpen, setFormOpen] = useState(false);
+  const [editing, setEditing] = useState<ScheduleRow | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [bots, setBots] = useState<Array<{ larkAppId: string; botName?: string }>>([]);
+
+  useEffect(() => {
+    fetch('/api/bots')
+      .then(r => r.json())
+      .then(b => {
+        if (Array.isArray(b?.bots)) setBots(b.bots);
+      })
+      .catch(() => undefined);
+  }, []);
 
   const rows = useMemo(
     () => filterSchedules(scheduleRows, filters),
@@ -183,6 +225,65 @@ function SchedulesPage() {
     }
   }
 
+  function openCreate(): void {
+    setEditing(null);
+    setFormError(null);
+    setFormOpen(true);
+  }
+
+  function openEdit(s: ScheduleRow): void {
+    setEditing(s);
+    setFormError(null);
+    setFormOpen(true);
+  }
+
+  async function handleDelete(s: ScheduleRow): Promise<void> {
+    if (!window.confirm(tr('schedules.deleteConfirm'))) return;
+    const key = `${s.id}:delete`;
+    setPending(key);
+    try {
+      const r = await fetch(`/api/schedules/${encodeURIComponent(s.id)}`, { method: 'DELETE' });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body.ok === false) throw new Error(body?.error ?? `HTTP ${r.status}`);
+      showFeedback(key, 'success');
+    } catch {
+      showFeedback(key, 'error');
+    } finally {
+      setPending(cur => cur === key ? null : cur);
+    }
+  }
+
+  async function handleSubmit(data: {
+    name: string; schedule: string; prompt: string;
+    deliver: 'origin' | 'new-topic'; deliverTouched: boolean; silent: boolean;
+    chatId: string; larkAppId: string;
+  }): Promise<void> {
+    setFormError(null);
+    try {
+      const url = editing ? `/api/schedules/${encodeURIComponent(editing.id)}` : '/api/schedules';
+      const method = editing ? 'PATCH' : 'POST';
+      // When editing, chatId/larkAppId are immutable (PATCH ignores them);
+      // when creating, larkAppId selects the owning bot/daemon.
+      // Only include `deliver` in the PATCH when the user explicitly changed it,
+      // so legacy 'local' tasks aren't silently rewritten to 'origin'.
+      const payload = editing
+        ? { name: data.name, schedule: data.schedule, prompt: data.prompt, silent: data.silent, ...(data.deliverTouched ? { deliver: data.deliver } : {}) }
+        : data;
+      const r = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body.ok === false) {
+        throw new Error(body?.error ?? `HTTP ${r.status}`);
+      }
+      setFormOpen(false);
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   return (
     <section className="page schedules-page">
       <div className="page-heading">
@@ -190,6 +291,7 @@ function SchedulesPage() {
           <p className="eyebrow">{tr('nav.schedules')}</p>
           <h1>{tr('schedules.title')}</h1>
         </div>
+        <CreateActionButton onClick={openCreate} disabled={bots.length === 0}>{tr('schedules.create')}</CreateActionButton>
       </div>
       <form id="sched-filters" className="filters dashboard-toolbar">
         <input
@@ -246,12 +348,24 @@ function SchedulesPage() {
                   feedback={feedback}
                   tr={tr}
                   onAction={(id, op) => void runAction(id, op)}
+                  onEdit={openEdit}
+                  onDelete={s => void handleDelete(s)}
                 />
               ))}
             </OverviewList>
           )}
         </div>
       </section>
+      {formOpen ? (
+        <ScheduleFormModal
+          editing={editing}
+          error={formError}
+          bots={bots}
+          tr={tr}
+          onClose={() => setFormOpen(false)}
+          onSubmit={data => void handleSubmit(data)}
+        />
+      ) : null}
     </section>
   );
 }
@@ -321,4 +435,195 @@ function ScheduleEnabledSwitch(props: {
 
 export function renderSchedulesPage(root: HTMLElement): PageDisposer {
   return mountReactPage(root, <SchedulesPage />);
+}
+
+interface ScheduleFormData {
+  name: string;
+  schedule: string;
+  prompt: string;
+  deliver: 'origin' | 'new-topic';
+  /** Whether the user explicitly changed the deliver radio. When false (e.g.
+   *  editing a legacy 'local' task), deliver is omitted from the PATCH so we
+   *  don't silently rewrite the task's delivery mode. */
+  deliverTouched: boolean;
+  silent: boolean;
+  chatId: string;
+  larkAppId: string;
+}
+
+function ScheduleFormModal(props: {
+  editing: ScheduleRow | null;
+  error: string | null;
+  bots: Array<{ larkAppId: string; botName?: string }>;
+  tr: ReturnType<typeof useT>;
+  onClose(): void;
+  onSubmit(data: ScheduleFormData): void;
+}) {
+  const { editing, tr, bots } = props;
+  const [name, setName] = useState(editing?.name ?? '');
+  const [schedule, setSchedule] = useState(editing?.schedule ?? '');
+  const [prompt, setPrompt] = useState(editing?.prompt ?? '');
+  const [deliver, setDeliver] = useState<'origin' | 'new-topic'>(
+    editing?.deliver === 'new-topic' ? 'new-topic' : 'origin',
+  );
+  const [deliverTouched, setDeliverTouched] = useState(false);
+  const [silent, setSilent] = useState(editing?.silent === true);
+  const [chatId, setChatId] = useState(editing?.chatId ?? '');
+  const [larkAppId, setLarkAppId] = useState(editing?.larkAppId ?? bots[0]?.larkAppId ?? '');
+
+  // If the modal opened before /api/bots resolved, default to the first bot
+  // once it arrives so the submit button doesn't stay permanently disabled.
+  useEffect(() => {
+    if (!editing && !larkAppId && bots.length > 0) {
+      setLarkAppId(bots[0].larkAppId);
+    }
+  }, [editing, larkAppId, bots]);
+
+  // silent + new-topic are mutually exclusive
+  const silentNewTopicConflict = silent && deliver === 'new-topic';
+
+  function handleSubmit(e: React.FormEvent): void {
+    e.preventDefault();
+    if (silentNewTopicConflict) return;
+    if (!editing && !larkAppId) return;
+    props.onSubmit({ name, schedule, prompt, deliver, deliverTouched, silent, chatId, larkAppId });
+  }
+
+  return (
+    <div className="schedule-form-overlay" onClick={props.onClose}>
+      <div
+        className="schedule-form-dialog"
+        role="dialog"
+        aria-modal="true"
+        onClick={e => e.stopPropagation()}
+      >
+        <h2>{editing ? tr('schedules.edit') : tr('schedules.create')}</h2>
+        <form onSubmit={handleSubmit} className="schedule-form">
+          {!editing ? (
+            <label className="schedule-form-field">
+              <span className="schedule-form-label">{tr('schedules.form.bot')}</span>
+              <select
+                value={larkAppId}
+                onChange={e => setLarkAppId(e.target.value)}
+                required
+              >
+                {bots.map(b => (
+                  <option key={b.larkAppId} value={b.larkAppId}>
+                    {b.botName ?? b.larkAppId}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          <label className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.name')}</span>
+            <input
+              type="text"
+              value={name}
+              onChange={e => setName(e.target.value)}
+              required
+              autoFocus
+            />
+          </label>
+          <label className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.schedule')}</span>
+            <input
+              type="text"
+              value={schedule}
+              onChange={e => setSchedule(e.target.value)}
+              placeholder={tr('schedules.form.scheduleHelp')}
+              required
+            />
+            <small className="schedule-form-help">{tr('schedules.form.scheduleHelp')}</small>
+          </label>
+          <label className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.prompt')}</span>
+            <textarea
+              value={prompt}
+              onChange={e => setPrompt(e.target.value)}
+              rows={4}
+              required
+            />
+            <small className="schedule-form-help">{tr('schedules.form.promptHelp')}</small>
+          </label>
+          {!editing ? (
+            <label className="schedule-form-field">
+              <span className="schedule-form-label">{tr('schedules.form.chat')}</span>
+              <input
+                type="text"
+                value={chatId}
+                onChange={e => setChatId(e.target.value)}
+                placeholder="oc_..."
+                required
+              />
+            </label>
+          ) : null}
+          <div className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.deliver')}</span>
+            <div className="schedule-form-radio-group">
+              <label>
+                <input
+                  type="radio"
+                  name="deliver"
+                  value="origin"
+                  checked={deliver === 'origin'}
+                  onChange={() => { setDeliver('origin'); setDeliverTouched(true); }}
+                />
+                {tr('schedules.deliveryOrigin')}
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="deliver"
+                  value="new-topic"
+                  checked={deliver === 'new-topic'}
+                  onChange={() => { setDeliver('new-topic'); setDeliverTouched(true); }}
+                  disabled={silent}
+                />
+                {tr('schedules.deliveryNewTopic')}
+              </label>
+            </div>
+          </div>
+          <label className="schedule-form-field schedule-form-toggle">
+            <input
+              type="checkbox"
+              checked={silent}
+              onChange={e => {
+                setSilent(e.target.checked);
+                // silent + new-topic are mutually exclusive: auto-switch to origin
+                // and mark deliver as touched so the PATCH includes it (otherwise
+                // the backend still sees new-topic and rejects silent:true).
+                if (e.target.checked && deliver === 'new-topic') {
+                  setDeliver('origin');
+                  setDeliverTouched(true);
+                }
+              }}
+            />
+            <span>
+              {tr('schedules.form.silent')}
+              <small className="schedule-form-help">{tr('schedules.form.silentHelp')}</small>
+            </span>
+          </label>
+          {silentNewTopicConflict ? (
+            <p className="schedule-form-error">{tr('schedules.form.silentNewTopicConflict')}</p>
+          ) : null}
+          {props.error ? (
+            <p className="schedule-form-error">{props.error}</p>
+          ) : null}
+          <div className="schedule-form-actions">
+            <button type="button" className="schedule-form-cancel" onClick={props.onClose}>
+              {tr('schedules.form.cancel')}
+            </button>
+            <button
+              type="submit"
+              className="schedule-form-submit"
+              disabled={silentNewTopicConflict || (!editing && !larkAppId)}
+            >
+              {editing ? tr('schedules.form.save') : tr('schedules.form.create')}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
 }

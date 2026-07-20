@@ -6,6 +6,7 @@ import { renderSkillCatalogBlock } from '../skills/prompt.js';
 import { prepareSessionSkillPrompt } from '../skills/session-runtime.js';
 import type { SessionSkillManifest } from '../skills/types.js';
 import { refreshSessionPluginManifest, type SessionPluginManifest } from './session-manifest.js';
+import { refreshSessionMcpRuntimeManifest } from './mcp/session-runtime.js';
 import { resolvePluginSkillPackages } from './skills.js';
 
 export interface CliPluginGenerationResult {
@@ -49,6 +50,12 @@ export function prepareCliPluginGeneration(opts: {
     sessionId: opts.sessionId,
     bot: opts.bot,
     global: opts.global,
+    dataDir: opts.dataDir,
+    now: opts.now,
+  });
+  refreshSessionMcpRuntimeManifest({
+    sessionId: opts.sessionId,
+    pluginIds: pluginManifest.pluginIds,
     dataDir: opts.dataDir,
     now: opts.now,
   });

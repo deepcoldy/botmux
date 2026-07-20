@@ -15,8 +15,8 @@
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, basename } from 'node:path';
-import { homedir } from 'node:os';
+import { join, basename, dirname } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
   evaluateReadIsolationGate,
@@ -60,7 +60,21 @@ import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
-import { ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import { defaultGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import {
+  sessionMcpGatewayPathRegex,
+  startSessionMcpGatewayHost,
+  type SessionMcpGatewayHost,
+} from './core/plugins/mcp/host.js';
+import {
+  MCP_GATEWAY_REQUIRED_ENV,
+  MCP_GATEWAY_SOCKET_ENV,
+} from './core/plugins/mcp/environment.js';
+import {
+  readSessionMcpRuntimeManifest,
+  sessionMcpRuntimeHostOnlyPaths,
+  type SessionMcpRuntimeManifest,
+} from './core/plugins/mcp/session-runtime.js';
 import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
 import { loadBotConfigs, type BotConfig } from './bot-registry.js';
 import { readGlobalConfig } from './global-config.js';
@@ -105,7 +119,6 @@ import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByCha
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
-import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { listenWebTerminalWithFallback } from './utils/web-terminal-listen.js';
@@ -209,6 +222,7 @@ let sandboxRelayOutbox: string | null = null;
 let sandboxRelayCapability: { token: string; turnId?: string; dispatchAttempt?: number } | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
+let sessionMcpGatewayHost: SessionMcpGatewayHost | null = null;
 /** Counts consecutive in-worker restart cycles (see case 'restart'). Used by
  *  the SECONDARY guard so an adapter whose checkResumeTargetExists misses
  *  (returns undefined) or whose resume target vanishes between the check and
@@ -224,6 +238,15 @@ let tmuxRestartTimer: NodeJS.Timeout | null = null;
 let resumeFallbackNotified = false;
 /** Skill catalog to attach to the first user turn after a prompt-less CLI restart. */
 let deferredPluginSkillCatalog: string | null = null;
+
+function stopSessionMcpGatewayHost(): void {
+  const host = sessionMcpGatewayHost;
+  sessionMcpGatewayHost = null;
+  if (!host) return;
+  void host.close().catch((error) => {
+    log(`[mcp-gateway] host shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
+}
 
 function refreshCliPluginGeneration(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
@@ -826,6 +849,16 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
   const targetBackend = backend;
   if (!targetBackend) return;
 
+  // A passthrough is still an accepted input boundary. Rotate (or revoke) the
+  // marker immediately before the literal command reaches the CLI so it can
+  // never inherit a previous human turn. System-generated raw commands omit
+  // turnId and therefore publish an explicitly unattributed marker.
+  currentBotmuxTurnId = msg.turnId;
+  currentBotmuxDispatchAttempt = undefined;
+  currentVcMeetingImTurnOrigin = undefined;
+  writeCliPidMarker();
+  publishSandboxRelayCapability();
+
   let sent = false;
   try {
     await sendRawCommandLineSerially(targetBackend, msg.content);
@@ -843,7 +876,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
   // Enter lands. sendToPty also observes commandLineWritesPending, so another
   // raw command's text -> Enter window cannot be interrupted by the follow-up.
   if (sent && msg.followUpContent) {
-    sendToPty(msg.followUpContent, undefined, {
+    sendToPty(msg.followUpContent, msg.followUpTurnId, {
       codexAppInput: msg.followUpCodexAppInput,
     });
     log(`Enqueued follow-up after raw input (${msg.followUpContent.length} chars)`);
@@ -3427,7 +3460,12 @@ function startScreenAnalyzer(): void {
       },
       onTuiPromptResolved: (selectedText) => {
         tuiPromptBlocking = false;
-        send({ type: 'tui_prompt_resolved', selectedText });
+        send({
+          type: 'tui_prompt_resolved',
+          selectedText,
+          turnId: currentBotmuxTurnId,
+          dispatchAttempt: currentBotmuxDispatchAttempt,
+        });
         // Flush any messages that were queued during the prompt
         flushPending();
       },
@@ -3559,7 +3597,13 @@ async function captureAndUpload(): Promise<void> {
 
   let status: RuntimeScreenStatus = isPromptReady ? 'idle' : 'working';
   if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
-  send({ type: 'screenshot_uploaded', imageKey, ...usageLimitTracker.classify(usageLimitContent, status) });
+  send({
+    type: 'screenshot_uploaded',
+    imageKey,
+    ...usageLimitTracker.classify(usageLimitContent, status),
+    turnId: currentBotmuxTurnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+  });
 }
 
 function applyDisplayMode(mode: DisplayMode): void {
@@ -4174,7 +4218,12 @@ function markPromptReady(): void {
 function persistCliSessionId(cliSessionId: string): void {
   if (!cliSessionId || !sessionId) return;
   if (lastInitConfig) lastInitConfig.cliSessionId = cliSessionId;
-  send({ type: 'cli_session_id', cliSessionId });
+  send({
+    type: 'cli_session_id',
+    cliSessionId,
+    turnId: currentBotmuxTurnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+  });
   try {
     const session = sessionStore.getSession(sessionId);
     if (!session || session.cliSessionId === cliSessionId) return;
@@ -4768,7 +4817,12 @@ function sendToPty(
     tuiPromptBlocking = false;
     screenAnalyzer?.notifySelection('lark-input');
     // Tear down the prompt card so the user doesn't see stale options.
-    send({ type: 'tui_prompt_resolved', selectedText: 'user-override' });
+    send({
+      type: 'tui_prompt_resolved',
+      selectedText: 'user-override',
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
   }
   // See flushPending: type-ahead adapters flush even while the CLI is busy.
   // Claude attributes `attachment(queued_command)` identically to `role:user`;
@@ -5131,7 +5185,7 @@ function scheduleBusyPatternIdleProbe(source: string): void {
   busyPatternIdleProbeTimer.unref?.();
 }
 
-function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+async function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<void> {
   clearSessionRenameInFlight();
   // (startupCommands one-shot is re-armed below, AFTER the reattach-vs-fresh
   // prediction — only a genuinely fresh CLI process replays them; see
@@ -5188,7 +5242,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 
     backend.onData(onPtyData);
     backend.onAccessUrl?.((url) => {
-      send({ type: 'riff_access_url', accessUrl: url });
+      send({
+        type: 'riff_access_url',
+        accessUrl: url,
+        turnId: currentBotmuxTurnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+      });
     });
     backend.onExit((code, signal) => {
       log(`Adopted herdr stream ended (code: ${code}, signal: ${signal})`);
@@ -5246,7 +5305,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 
     backend.onData(onPtyData);
     backend.onAccessUrl?.((url) => {
-      send({ type: 'riff_access_url', accessUrl: url });
+      send({
+        type: 'riff_access_url',
+        accessUrl: url,
+        turnId: currentBotmuxTurnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+      });
     });
     backend.onExit((code, signal) => {
       log(`Adopted pipe-pane stream ended (code: ${code}, signal: ${signal})`);
@@ -5584,6 +5648,24 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       }
     }
   }
+  let mcpRuntimeManifest: SessionMcpRuntimeManifest | null = readSessionMcpRuntimeManifest(
+    cfg.sessionId,
+    config.session.dataDir,
+  );
+  if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length && persistentSessionName && effectiveBackendType !== 'pty') {
+    const paneLive = effectiveBackendType === 'tmux'
+      ? TmuxBackend.hasSession(persistentSessionName)
+      : effectiveBackendType === 'zellij'
+        ? ZellijBackend.hasSession(persistentSessionName)
+        : HerdrBackend.hasSession(persistentSessionName);
+    if (paneLive) {
+      // The trusted Gateway host belongs to the worker and cannot survive a
+      // worker/daemon replacement. Cold-resume the CLI so its MCP client gets a
+      // fresh relay socket instead of reattaching to a dead connection.
+      log(`[mcp-gateway] persistent pane ${cfg.sessionId} has plugin MCP state — cold-resuming with a fresh host`);
+      killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
+    }
+  }
   const willReattachPersistent = persistentSessionName
     ? effectiveBackendType === 'tmux'
       ? TmuxBackend.hasSession(persistentSessionName)
@@ -5595,7 +5677,19 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // The plugin set is stable only for the lifetime of one real CLI process.
   // A warm worker reattach keeps the existing Gateway and catalog untouched;
   // every fresh/resumed CLI spawn atomically refreshes both from current Bot config.
-  if (!willReattachPersistent) refreshCliPluginGeneration(cfg, cliAdapter);
+  if (!willReattachPersistent) {
+    refreshCliPluginGeneration(cfg, cliAdapter);
+    mcpRuntimeManifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
+    stopSessionMcpGatewayHost();
+    if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length) {
+      sessionMcpGatewayHost = await startSessionMcpGatewayHost({
+        sessionId: cfg.sessionId,
+        dataDir: config.session.dataDir,
+        onError: error => log(`[mcp-gateway] host error: ${error.message}`),
+      });
+      log(`[mcp-gateway] trusted host listening for ${mcpRuntimeManifest.entries.length} plugin server(s)`);
+    }
+  }
 
   // Re-arm the startup-commands one-shot ONLY for a genuinely fresh CLI process.
   // A reattach to a LIVE persistent pane (daemon-restart recovery) is the SAME
@@ -5887,6 +5981,13 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = redactChildEnv(process.env);
+  if (sessionMcpGatewayHost) {
+    childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;
+    childEnv[MCP_GATEWAY_REQUIRED_ENV] = '1';
+  } else {
+    delete childEnv[MCP_GATEWAY_SOCKET_ENV];
+    delete childEnv[MCP_GATEWAY_REQUIRED_ENV];
+  }
   // Put the daemon-written wrapper dir (~/.botmux/bin/botmux = THIS build) ahead of any
   // stale npm-global botmux in PATH, so the agent's `botmux` is always this build. Matters
   // most under read isolation: only this build has the send-cred reader — a shadowing stale
@@ -6031,6 +6132,28 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         sessionDataDirs: [readIsolationCtx.sessionDataDir],
       });
     }
+    if (mcpRuntimeManifest) {
+      finalDenyPaths.push(...sessionMcpRuntimeHostOnlyPaths(
+        mcpRuntimeManifest,
+        config.session.dataDir,
+      ).map(canonical));
+    }
+    // Every isolated macOS CLI is denied access to all same-UID Gateway socket
+    // directories. A session with its own Gateway gets one narrow, later READ
+    // carve-out for its token; writes stay denied so the CLI cannot unlink or
+    // replace even its own worker-managed socket. Sessions without plugin MCP
+    // state get no read carve-out at all.
+    const gatewaySocketRoot = canonical(
+      sessionMcpGatewayHost ? dirname(sessionMcpGatewayHost.socketDir) : tmpdir(),
+    );
+    const gatewaySocketRegex = sessionMcpGatewayPathRegex(gatewaySocketRoot);
+    denyRegexes.push(gatewaySocketRegex);
+    if (sessionMcpGatewayHost) allowPaths.push(canonical(sessionMcpGatewayHost.socketDir));
+    protectedWrites = {
+      denyWritePaths: protectedWrites?.denyWritePaths ?? [],
+      denyWriteRegexes: [...(protectedWrites?.denyWriteRegexes ?? []), gatewaySocketRegex],
+      denyWriteLiterals: protectedWrites?.denyWriteLiterals ?? [],
+    };
     // WRITE rules — the macOS file-sandbox (Linux-bwrap twin). Realpath the writable
     // zones + crown-jewel re-denies for the same symlink-safety reason as reads.
     const writeRules = writeSandboxRules
@@ -6202,7 +6325,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
             ? [sendCredFilePath(dataDir, cfg.larkAppId)]
             : [],
           extraExecPaths: cliAdapter.sandboxExtraExecPaths?.(),
-          readonlyRoots: [...(cfg.skillReadonlyRoots ?? []), ...(readIsoLinuxMasks?.ownReadOnlyPaths ?? [])],
+          readonlyRoots: [
+            ...(cfg.skillReadonlyRoots ?? []),
+            ...(readIsoLinuxMasks?.ownReadOnlyPaths ?? []),
+          ],
+          mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
+          trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
           userReadonlyPaths: cfg.sandboxReadonlyPaths ?? [],
           net: cfg.sandboxNetwork !== false,
         });
@@ -6589,7 +6717,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   backend.onData(onPtyData);
   const observedBackend = backend;
   backend.onAccessUrl?.((url) => {
-    send({ type: 'riff_access_url', accessUrl: url });
+    send({
+      type: 'riff_access_url',
+      accessUrl: url,
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
   });
   // Remote-task turn boundary (riff): flushPending() marks the session busy on
   // every write and riff has no PTY output, so the idle detector never re-arms
@@ -6618,6 +6751,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
       return;
     }
+    stopSessionMcpGatewayHost();
     const exitedTurnId = currentBotmuxTurnId;
     const exitedDispatchAttempt = currentBotmuxDispatchAttempt;
     // Fail closed as soon as this CLI generation ends. The Node worker may
@@ -6746,6 +6880,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 }
 
 function killCli(opts: { preservePending?: boolean } = {}): void {
+  stopSessionMcpGatewayHost();
   destroyCrashDiagnosticTerminal('killCli');
   idleDetector?.dispose();
   idleDetector = null;
@@ -6866,7 +7001,7 @@ async function restartCliProcess(
           startScreenUpdates();
           startScreenAnalyzer();
           try {
-            spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
+            await spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
           } catch (err) {
             cliRestartInProgress = false;
             await sendFatalWorkerErrorAndExit(err);
@@ -8131,7 +8266,7 @@ process.on('message', async (raw: unknown) => {
           port = await startWebServer(config.web.workerHost, msg.webPort);
           log('Workflow worker mode: web terminal enabled; skipping screen updates and screen analyzer');
         }
-        spawnCli(msg);
+        await spawnCli(msg);
 
         // Queue the initial prompt — flushed when CLI shows idle.
         // Adapters with passesInitialPromptViaArgs (e.g. Gemini -i) bake the
@@ -8227,7 +8362,7 @@ process.on('message', async (raw: unknown) => {
         startScreenUpdates();
         startScreenAnalyzer();
         try {
-          spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
+          await spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
         } catch (err) {
           // Pass the message's own attempt (not the stale currentBotmux* from a
           // prior IM turn) so a durable delivery relaunch failure carries the
@@ -8614,6 +8749,7 @@ process.on('message', async (raw: unknown) => {
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  stopSessionMcpGatewayHost();
   if (tmuxRestartTimer) {
     clearTimeout(tmuxRestartTimer);
     tmuxRestartTimer = null;

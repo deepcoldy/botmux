@@ -63,6 +63,8 @@ describe('tmuxEnv()', () => {
       BOTMUX: '1',
       BOTMUX_SESSION_ID: '190222fc-bc5f-4481-849b-6161901b8506',
       BOTMUX_CHAT_ID: 'oc_abc',
+      BOTMUX_MCP_GATEWAY_SOCKET: '/tmp/botmux-mcp/session/gateway.sock',
+      BOTMUX_MCP_GATEWAY_REQUIRED: '1',
       BOTMUX_LARK_APP_ID: 'cli_x',
       BOTMUX_ROOT_MESSAGE_ID: 'om_x',
       BOTMUX_BOT_INDEX: '12',           // daemon-internal, swept by the BOTMUX prefix
@@ -88,6 +90,7 @@ describe('tmuxEnv()', () => {
     });
     for (const leaked of [
       'BOTMUX', 'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_LARK_APP_ID',
+      'BOTMUX_MCP_GATEWAY_SOCKET', 'BOTMUX_MCP_GATEWAY_REQUIRED',
       'BOTMUX_ROOT_MESSAGE_ID', 'BOTMUX_BOT_INDEX', 'BOTMUX_QUIET_RESTART',
       'SESSION_DATA_DIR', 'IS_SANDBOX', 'CLAUDE_CONFIG_DIR', '__OWNER_OPEN_ID',
       'CODEX_HOME', 'HERMES_HOME', 'HERMES_BOTMUX_SOURCE_HOME',

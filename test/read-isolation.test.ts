@@ -207,6 +207,40 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(buildV2CarveOuts(v2()).allowPaths).toContain('/Users/bot/.botmux/data/sessions-cli_self.json');
   });
 
+  it('keeps plugin-private MCP descriptors and every session snapshot host-only', () => {
+    const ctx = v2({
+      botmuxHome: '/srv/botmux',
+      sessionDataDir: '/srv/botmux/data',
+    });
+    const regexes = buildV2DenyRegexes(ctx).map(pattern => new RegExp(pattern));
+    for (const path of [
+      '/Users/bot/.botmux/plugins/demo/private/mcp.json',
+      '/srv/botmux/plugins/demo/private/mcp.json',
+      '/Users/bot/.botmux/plugins/demo/dist/mcp/index.json',
+      '/srv/botmux/data/sessions/session-self/plugin-mcp-runtime.json',
+      '/srv/botmux/data/sessions/session-other/plugin-mcp-runtime.json',
+    ]) expect(regexes.some(regex => regex.test(path))).toBe(true);
+
+    const ownSnapshot = '/srv/botmux/data/sessions/session-self/plugin-mcp-runtime.json';
+    const siblingSnapshot = '/srv/botmux/data/sessions/session-other/plugin-mcp-runtime.json';
+    const carve = buildV2CarveOuts(ctx);
+    expect(carve.allowPaths).not.toContain(ownSnapshot);
+    expect(carve.allowPaths).not.toContain(siblingSnapshot);
+    const profile = buildSeatbeltProfile(
+      buildV2DenyPaths(ctx),
+      carve.allowPaths,
+      carve.finalDenyPaths,
+      carve.traverseDirs,
+      buildV2DenyRegexes(ctx),
+    );
+    expect(profile).not.toContain(`(allow file-read* (subpath "${ownSnapshot}"))`);
+
+    const protectedWrites = buildReadIsolationProtectedWriteRules(ctx);
+    const writeRegexes = protectedWrites.denyWriteRegexes.map(pattern => new RegExp(pattern));
+    expect(writeRegexes.some(regex => regex.test(ownSnapshot))).toBe(true);
+    expect(writeRegexes.some(regex => regex.test('/Users/bot/.botmux/plugins/demo/private/mcp.json'))).toBe(true);
+  });
+
   it('denies every bots.json SIDECAR (backup/temp) — .bak carries all siblings secrets', () => {
     // Regression: the exact bots.json is subpath-denied, but its setup/migration
     // backups (bots.json.bak, .bak.<suffix>, .tmp) carry the SAME plaintext
@@ -317,7 +351,7 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(c.finalDenyPaths).toEqual(['/ok/path']);
   });
 
-  it('assertSafeAppId rejects path-traversal / separators, accepts real Feishu ids (review L2)', () => {
+  it('rejects unsafe app ids and hashes session ids before using them in paths', () => {
     expect(assertSafeAppId('cli_aab4eaea67395bc9')).toBe('cli_aab4eaea67395bc9');
     expect(() => assertSafeAppId('../evil')).toThrow();
     expect(() => assertSafeAppId('a/b')).toThrow();
@@ -329,6 +363,9 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(() => assertSafeAppId('..')).toThrow();
     expect(() => assertSafeAppId('...')).toThrow();
     expect(() => buildV2CarveOuts(v2({ currentAppId: '..' }))).toThrow();
+    expect(buildV2CarveOuts(v2({ currentSessionId: '../other' })).allowPaths).toContain(
+      managedOriginCapabilityPath('/Users/bot/.botmux/data', '../other'),
+    );
     // botHomePath must also reject an unsafe id (used for own + other BOT_HOMEs)
     expect(() => botHomePath('/Users/bot/.botmux', '../x')).toThrow();
   });
@@ -608,6 +645,7 @@ describe('isolatedPaneReattachSafe', () => {
     // memory and must be killed + cold-spawned after a security upgrade.
     expect(isolatedPaneReattachSafe('boot-abc')).toBe(false);
     expect(isolatedPaneReattachSafe(JSON.stringify({ version: 1, bootId: 'old' }))).toBe(false);
+    expect(isolatedPaneReattachSafe(JSON.stringify({ version: 2, bootId: 'old-mcp-policy' }))).toBe(false);
     // No / blank marker → pane was NOT spawned isolated → unsafe (kill + cold-spawn).
     expect(isolatedPaneReattachSafe(null)).toBe(false);
     expect(isolatedPaneReattachSafe(undefined)).toBe(false);
@@ -628,6 +666,23 @@ describe('worker capability carve-out ordering', () => {
     expect(canonicalizeAt).toBeGreaterThan(publishAt);
     expect(source).toContain('replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(');
     expect(source).toContain('marker = readRegularHostFileNoFollow(');
+  });
+
+  it('denies every same-UID Gateway socket before allowing only the current session socket', () => {
+    const regexAt = source.indexOf('const gatewaySocketRegex = sessionMcpGatewayPathRegex(gatewaySocketRoot)');
+    const denyAt = source.indexOf('denyRegexes.push(gatewaySocketRegex)');
+    const allowAt = source.indexOf(
+      'if (sessionMcpGatewayHost) allowPaths.push(canonical(sessionMcpGatewayHost.socketDir))',
+    );
+    const writeDenyAt = source.indexOf(
+      'denyWriteRegexes: [...(protectedWrites?.denyWriteRegexes ?? []), gatewaySocketRegex]',
+    );
+    const profileAt = source.indexOf('replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(');
+    expect(regexAt).toBeGreaterThanOrEqual(0);
+    expect(denyAt).toBeGreaterThan(regexAt);
+    expect(allowAt).toBeGreaterThan(denyAt);
+    expect(writeDenyAt).toBeGreaterThan(allowAt);
+    expect(profileAt).toBeGreaterThan(writeDenyAt);
   });
 });
 

@@ -274,6 +274,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.worktree_created': '🌿 Worktree created: `{path}`\nBranch `{branch}`, based on `{base}`',
   'cmd.repo.worktree_failed': '❌ Worktree creation failed: {error}',
   'cmd.repo.worktree_in_progress': '⏳ A worktree is already being created — please wait…',
+  'cmd.repo.card_already_consumed': '✅ Repo already selected — please ignore the old card',
   'cmd.repo.worktree_created_not_switched': '🌿 Worktree created: `{path}` (branch `{branch}`), but the session changed meanwhile — not switched automatically. Use `/repo {path}` to open it.',
   'cmd.repo.worktree_switch_failed': '⚠️ Worktree created at `{path}`, but switching to it failed: {error}\nUse `/repo {path}` to open it manually.',
   // Used when 「default-directory-only」mode has「auto-create worktree」on, at new
@@ -489,6 +490,8 @@ export const messages: Record<string, string> = {
   'schedule.triggered_now': 'Triggered scheduled task {id} now',
   'schedule.created': '✅ Scheduled task created!\n\nID: {id}\nName: {name}\nRule: {rule}\nPrompt: {prompt}\nWorking dir: {dir}\nNext run: {next}',
   'schedule.deliver_new_topic': 'Delivery: opens a new topic each run (fresh, isolated session)',
+  'schedule.silent_note': 'Silent mode: fires post no "started" banner; the model only sends (botmux send) when the alert condition is met, otherwise stays fully silent',
+  'schedule.silent_new_topic_conflict': '"Silent" and "new topic" cannot be combined: a new topic requires a first message. For "open a topic only on alert", instruct the model in the prompt to use a top-level botmux send when alerting.',
   'schedule.parse_failed': 'Cannot parse schedule. Use a natural-language form:\n\n/schedule daily 17:50 summarize today\'s AI news\n/schedule weekdays 9:00 check service status\n/schedule mondays 10:00 generate weekly report\n/schedule hourly check service health\n/schedule every 30 minutes ping the service\n/schedule 1st of each month 9:00 generate monthly report\n\nManagement:\n/schedule list — list all tasks\n/schedule remove <id> — delete a task\n/schedule enable <id> — enable a task\n/schedule disable <id> — disable a task\n/schedule run <id> — run once now',
 
   // ─── /help ───────────────────────────────────────────────────────────────
@@ -890,6 +893,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.pause.disabled.alreadyPaused': 'Schedule is already paused',
   'card.dashboard.schedules.resume.disabled.alreadyEnabled': 'Schedule is already enabled',
   'card.dashboard.schedules.delivery.disabled.local': 'Local-only delivery cannot be changed from the card',
+  'card.dashboard.schedules.delivery.disabled.silent': 'Silent tasks cannot switch to new-topic delivery (a new topic requires a first message)',
   'card.dashboard.schedules.delivery.disabled.alreadyOrigin': 'Already delivering to the original topic',
   'card.dashboard.schedules.delivery.disabled.alreadyNewTopic': 'Already delivering to a new topic every time',
   'card.dashboard.schedules.pause_failed': '⚠️ Pause failed: {reason}',

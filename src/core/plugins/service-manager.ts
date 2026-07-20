@@ -1,10 +1,17 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { config } from '../../config.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
-import { withFileLock } from '../../utils/file-lock.js';
+import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import { readPluginRegistry } from '../../services/plugin-registry-store.js';
-import { pluginHome, pluginRuntimeDir, pluginServiceStatePath, pluginsHome } from './paths.js';
+import {
+  pluginHome,
+  pluginRuntimeDir,
+  pluginServicePm2ConfigPath,
+  pluginServiceStatePath,
+  pluginsHome,
+} from './paths.js';
 import { loadPluginServiceDefinition, type PluginServiceDefinition } from './runtime.js';
 import { capturePluginPm2, pluginPm2AppName, runPluginPm2 } from './pm2.js';
 import type { InstalledPluginRecord, PluginServiceMode, PluginServiceState } from './types.js';
@@ -21,6 +28,34 @@ export interface PluginServiceReport {
   warning?: string;
 }
 
+export type PluginLifecycleOperation = 'install' | 'update' | 'uninstall';
+
+export class PluginServiceRunningError extends Error {
+  readonly code = 'plugin_service_running';
+
+  constructor(
+    readonly pluginId: string,
+    readonly operation: PluginLifecycleOperation,
+    readonly serviceStatus: string,
+    readonly pid?: number,
+  ) {
+    super(`plugin_service_running:${pluginId}:${operation}:${serviceStatus}${pid ? `:${pid}` : ''}`);
+    this.name = 'PluginServiceRunningError';
+  }
+}
+
+export class PluginServiceDeleteError extends Error {
+  readonly code = 'plugin_service_delete_failed';
+  readonly failures: PluginServiceReport[];
+
+  constructor(readonly reports: PluginServiceReport[]) {
+    const failures = reports.filter(report => report.action === 'failed');
+    super(`plugin_service_delete_failed:${failures.map(report => report.pluginId).join(',')}`);
+    this.name = 'PluginServiceDeleteError';
+    this.failures = failures;
+  }
+}
+
 interface Pm2AppInfo {
   name: string;
   pid?: number;
@@ -28,9 +63,19 @@ interface Pm2AppInfo {
   pm2Env?: Record<string, unknown>;
 }
 
+const DEFAULT_LINK_WATCH_DELAY_MS = 2_000;
+
 function serviceLockTarget(): string {
   mkdirSync(pluginsHome(), { recursive: true });
   return `${pluginsHome()}/service-manager`;
+}
+
+export function withPluginServiceLockSync<T>(fn: () => T): T {
+  return withFileLockSync(serviceLockTarget(), fn, { maxWaitMs: 30_000 });
+}
+
+export function withPluginServiceLock<T>(fn: () => Promise<T> | T): Promise<T> {
+  return withFileLock(serviceLockTarget(), async () => fn(), { maxWaitMs: 30_000 });
 }
 
 function definitionEnv(record: InstalledPluginRecord, definition: PluginServiceDefinition): Record<string, string> {
@@ -50,6 +95,94 @@ function definitionCwd(record: InstalledPluginRecord, definition: PluginServiceD
 function definitionScript(record: InstalledPluginRecord, definition: PluginServiceDefinition): string {
   const script = definition.pm2.script;
   return isAbsolute(script) ? script : resolve(definitionCwd(record, definition), script);
+}
+
+function isLinkedPlugin(record: InstalledPluginRecord): boolean {
+  if (record.source.type !== 'local') return false;
+  if (record.source.link === true) return true;
+  try {
+    return lstatSync(pluginRuntimeDir(record.id)).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function linkedWatchPath(record: InstalledPluginRecord): string {
+  if (record.source.type === 'local' && record.source.spec) {
+    const runtimeDir = resolve(record.source.spec, 'dist');
+    const buildWatchDir = resolve(runtimeDir, 'botmux-build');
+    return existsSync(buildWatchDir) ? buildWatchDir : runtimeDir;
+  }
+  return pluginRuntimeDir(record.id);
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`);
+    return `{${entries.join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function serviceConfigHash(
+  record: InstalledPluginRecord,
+  definition: PluginServiceDefinition,
+  linked: boolean,
+): string {
+  return createHash('sha256').update(stableJson({
+    script: definitionScript(record, definition),
+    cwd: definitionCwd(record, definition),
+    args: definition.pm2.args ?? [],
+    env: definitionEnv(record, definition),
+    autorestart: definition.pm2.autorestart !== false,
+    killTimeoutMs: definition.pm2.killTimeoutMs ?? null,
+    watch: linked ? linkedWatchPath(record) : false,
+    watchDelayMs: linked ? definition.pm2.watchDelayMs ?? DEFAULT_LINK_WATCH_DELAY_MS : null,
+  })).digest('hex').slice(0, 16);
+}
+
+function pm2ConfigHash(app: Pm2AppInfo): string | undefined {
+  const direct = app.pm2Env?.BOTMUX_PLUGIN_SERVICE_CONFIG_HASH;
+  if (typeof direct === 'string') return direct;
+  const nested = app.pm2Env?.env;
+  if (nested && typeof nested === 'object') {
+    const value = (nested as Record<string, unknown>).BOTMUX_PLUGIN_SERVICE_CONFIG_HASH;
+    if (typeof value === 'string') return value;
+  }
+  return undefined;
+}
+
+function writePm2Config(
+  record: InstalledPluginRecord,
+  definition: PluginServiceDefinition,
+  env: Record<string, string>,
+  linked: boolean,
+): string {
+  const watchDelayMs = Number.isFinite(definition.pm2.watchDelayMs)
+    ? Math.max(0, Number(definition.pm2.watchDelayMs))
+    : DEFAULT_LINK_WATCH_DELAY_MS;
+  const killTimeoutMs = Number.isFinite(definition.pm2.killTimeoutMs)
+    ? Math.max(0, Number(definition.pm2.killTimeoutMs))
+    : undefined;
+  const app = {
+    name: pluginPm2AppName(record.id),
+    script: definitionScript(record, definition),
+    cwd: definitionCwd(record, definition),
+    time: true,
+    autorestart: definition.pm2.autorestart !== false,
+    ...(definition.pm2.args?.length ? { args: definition.pm2.args } : {}),
+    ...(killTimeoutMs !== undefined ? { kill_timeout: killTimeoutMs } : {}),
+    watch: linked ? [linkedWatchPath(record)] : false,
+    ...(linked ? { watch_delay: watchDelayMs } : {}),
+    env,
+  };
+  const file = pluginServicePm2ConfigPath(record.id);
+  mkdirSync(dirname(file), { recursive: true });
+  atomicWriteFileSync(file, JSON.stringify({ apps: [app] }, null, 2) + '\n', { mode: 0o600 });
+  return file;
 }
 
 function parsePm2JlistOutput(output: string): any[] {
@@ -80,6 +213,16 @@ function readPm2Apps(): Pm2AppInfo[] {
 
 function findPm2App(name: string): Pm2AppInfo | undefined {
   return readPm2Apps().find(app => app.name === name);
+}
+
+function isStoppedPm2App(app: Pm2AppInfo): boolean {
+  return app.pid === undefined && (app.status === 'stopped' || app.status === 'errored');
+}
+
+export function assertPluginServiceStopped(pluginId: string, operation: PluginLifecycleOperation): void {
+  const app = findPm2App(pluginPm2AppName(pluginId));
+  if (!app || isStoppedPm2App(app)) return;
+  throw new PluginServiceRunningError(pluginId, operation, app.status ?? 'unknown', app.pid);
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -174,63 +317,67 @@ function reportFromState(
   };
 }
 
-function startPm2(record: InstalledPluginRecord, definition: PluginServiceDefinition): void {
+function startPm2(record: InstalledPluginRecord, definition: PluginServiceDefinition): 'started' | 'already-running' {
   const name = pluginPm2AppName(record.id);
-  const env = definitionEnv(record, definition);
-  const existing = findPm2App(name);
+  const linked = isLinkedPlugin(record);
+  const configHash = serviceConfigHash(record, definition, linked);
+  const env = {
+    ...definitionEnv(record, definition),
+    BOTMUX_PLUGIN_LINKED: linked ? '1' : '0',
+    BOTMUX_PLUGIN_SERVICE_CONFIG_HASH: configHash,
+  };
+  const pm2Config = writePm2Config(record, definition, env, linked);
+  let existing = findPm2App(name);
   if (existing) {
-    if (existing.status === 'online') return;
-    runPluginPm2(['start', name, '--update-env'], { inherit: false, env, timeoutMs: 30_000 });
-    return;
+    const currentHash = pm2ConfigHash(existing);
+    const needsDefinitionRefresh = currentHash
+      ? currentHash !== configHash || (linked && existing.status !== 'online')
+      : linked || existing.status !== 'online';
+    if (needsDefinitionRefresh) {
+      runPluginPm2(['delete', name], { inherit: false, timeoutMs: 30_000 });
+      existing = undefined;
+    }
   }
-  const args = [
-    'start',
-    definitionScript(record, definition),
-    '--name',
-    name,
-    '--cwd',
-    definitionCwd(record, definition),
-    '--time',
-    '--update-env',
-  ];
-  if (definition.pm2.autorestart === false) args.push('--no-autorestart');
-  if (definition.pm2.args?.length) args.push('--', ...definition.pm2.args);
-  runPluginPm2(args, { inherit: false, env, timeoutMs: 30_000 });
+  if (existing) {
+    if (existing.status === 'online') return 'already-running';
+    runPluginPm2(['start', name, '--update-env'], { inherit: false, env, timeoutMs: 30_000 });
+    return 'started';
+  }
+  runPluginPm2(['start', pm2Config, '--only', name, '--update-env'], {
+    inherit: false,
+    env,
+    timeoutMs: 30_000,
+  });
+  return 'started';
 }
 
 export async function startPluginServices(
   pluginIds?: readonly string[],
   options: { autoOnly?: boolean } = {},
 ): Promise<PluginServiceReport[]> {
-  return withFileLock(serviceLockTarget(), async () => {
+  return withPluginServiceLock(async () => {
     const reports: PluginServiceReport[] = [];
     for (const record of selectedRecords(pluginIds, options.autoOnly === true)) {
       try {
         const definition = await loadPluginServiceDefinition(record);
         if (!definition) continue;
-        const before = findPm2App(pluginPm2AppName(record.id));
-        if (before?.status === 'online') {
-          const state = writeServiceState(record, definition, before);
-          reports.push(reportFromState(record, 'already-running', state));
-          continue;
-        }
-        startPm2(record, definition);
+        const action = startPm2(record, definition);
         const app = findPm2App(pluginPm2AppName(record.id));
         const state = writeServiceState(record, definition, app);
-        reports.push(reportFromState(record, 'started', state));
+        reports.push(reportFromState(record, action, state));
       } catch (err: any) {
         reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
       }
     }
     return reports;
-  }, { maxWaitMs: 30_000 });
+  });
 }
 
 export async function stopPluginServices(
   pluginIds?: readonly string[],
   options: { autoOnly?: boolean } = {},
 ): Promise<PluginServiceReport[]> {
-  return withFileLock(serviceLockTarget(), async () => {
+  return withPluginServiceLock(async () => {
     const reports: PluginServiceReport[] = [];
     for (const record of selectedRecords(pluginIds, options.autoOnly === true)) {
       try {
@@ -252,26 +399,44 @@ export async function stopPluginServices(
       }
     }
     return reports;
-  }, { maxWaitMs: 30_000 });
+  });
+}
+
+export async function deletePluginServicesUnlocked(pluginIds?: readonly string[]): Promise<PluginServiceReport[]> {
+  const reports: PluginServiceReport[] = [];
+  for (const record of selectedRecords(pluginIds)) {
+    try {
+      const name = pluginPm2AppName(record.id);
+      if (findPm2App(name)) {
+        runPluginPm2(['delete', name], { inherit: false, timeoutMs: 30_000 });
+        const remaining = findPm2App(name);
+        if (remaining) {
+          throw new Error(`pm2_delete_not_applied:${name}:${remaining.status ?? 'unknown'}`);
+        }
+      }
+      deleteServiceState(record.id);
+      reports.push(reportFromState(record, 'deleted', undefined));
+    } catch (err: any) {
+      reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
+    }
+  }
+  return reports;
+}
+
+/** Destructive lifecycle callers use the strict variant so a PM2 failure
+ * aborts before registry/runtime/binding cleanup can begin. */
+export async function deletePluginServicesOrThrowUnlocked(
+  pluginIds?: readonly string[],
+): Promise<PluginServiceReport[]> {
+  const reports = await deletePluginServicesUnlocked(pluginIds);
+  if (reports.some(report => report.action === 'failed')) {
+    throw new PluginServiceDeleteError(reports);
+  }
+  return reports;
 }
 
 export async function deletePluginServices(pluginIds?: readonly string[]): Promise<PluginServiceReport[]> {
-  return withFileLock(serviceLockTarget(), async () => {
-    const reports: PluginServiceReport[] = [];
-    for (const record of selectedRecords(pluginIds)) {
-      try {
-        const definition = await loadPluginServiceDefinition(record);
-        if (!definition) continue;
-        const name = pluginPm2AppName(record.id);
-        if (findPm2App(name)) runPluginPm2(['delete', name], { inherit: false, timeoutMs: 30_000 });
-        deleteServiceState(record.id);
-        reports.push(reportFromState(record, 'deleted', undefined));
-      } catch (err: any) {
-        reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
-      }
-    }
-    return reports;
-  }, { maxWaitMs: 30_000 });
+  return withPluginServiceLock(() => deletePluginServicesUnlocked(pluginIds));
 }
 
 export async function listPluginServiceStatus(): Promise<PluginServiceReport[]> {

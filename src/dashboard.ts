@@ -251,6 +251,21 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
+
+/**
+ * Resolve which daemon owns a schedule row. For rows with an explicit
+ * `larkAppId`, returns that. For legacy rows (no owner stamp), falls back to
+ * the primary daemon (botIndex === 0) — the only daemon that executes legacy
+ * tasks (see scheduler.belongsToOwner). Returns undefined when the row is
+ * genuinely unknown or no daemon is online.
+ */
+function resolveScheduleOwner(id: string): string | undefined {
+  const explicit = aggregator.scheduleOwnerOf(id);
+  if (explicit) return explicit;
+  if (!aggregator.scheduleExists(id)) return undefined;
+  const primary = registry.list().find(d => d.botIndex === 0);
+  return primary?.larkAppId;
+}
 /**
  * Bring a freshly-onboarded bot online without a fleet-wide restart by spawning
  * `botmux start-bot <appId> --json` (see cli.ts:ensureBotDaemonStarted). The new
@@ -3036,9 +3051,62 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/schedules\/([^/]+)\/(run|pause|resume|delivery)$/))) {
       const id = decodeURIComponent(m[1]); const op = m[2];
-      const owner = aggregator.scheduleOwnerOf(id);
+      const owner = resolveScheduleOwner(id);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_schedule' });
       const upstream = await proxyToDaemon(owner, `/api/schedules/${id}/${op}`, { method: 'POST' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // Create a new scheduled task. Body must include `larkAppId` to select
+    // which bot/daemon owns the task (multi-bot dashboards cannot guess).
+    if (req.method === 'POST' && url.pathname === '/api/schedules') {
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      if (body === null || typeof body !== 'object') {
+        return jsonRes(res, 400, { ok: false, error: 'body_must_be_object' });
+      }
+      const b = body as Record<string, unknown>;
+      const larkAppId = typeof b.larkAppId === 'string' ? b.larkAppId : '';
+      if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });
+      const upstream = await proxyToDaemon(larkAppId, '/api/schedules', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // Update an existing task (PATCH) or delete it (DELETE). Both route to
+    // the daemon that owns the task. Legacy rows (no larkAppId) fall back to
+    // the primary daemon (botIndex === 0) so they remain editable.
+    if (req.method === 'PATCH' && (m = url.pathname.match(/^\/api\/schedules\/([^/]+)$/))) {
+      const id = decodeURIComponent(m[1]);
+      const owner = resolveScheduleOwner(id);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_schedule' });
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      if (body === null || typeof body !== 'object') {
+        return jsonRes(res, 400, { ok: false, error: 'body_must_be_object' });
+      }
+      const upstream = await proxyToDaemon(owner, `/api/schedules/${id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    if (req.method === 'DELETE' && (m = url.pathname.match(/^\/api\/schedules\/([^/]+)$/))) {
+      const id = decodeURIComponent(m[1]);
+      const owner = resolveScheduleOwner(id);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_schedule' });
+      const upstream = await proxyToDaemon(owner, `/api/schedules/${id}`, { method: 'DELETE' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;

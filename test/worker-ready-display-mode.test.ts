@@ -526,9 +526,11 @@ describe('Worker ready: set_display_mode re-sync', () => {
     const ds = makeDs({
       worker: fakeWorker,
       pendingRawInput: '/goal ship the onboarding flow',
+      pendingRawTurnId: 'om_goal_turn',
       pendingFollowUpInput: {
         userPrompt: '另外帮我顺手看下 CI',
         cliInput: '<user_message>另外帮我顺手看下 CI</user_message>',
+        turnId: 'om_followup_turn',
       },
     } as Partial<DaemonSession>);
 
@@ -542,9 +544,12 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(fakeWorker.send).toHaveBeenCalledWith({
       type: 'raw_input',
       content: '/goal ship the onboarding flow',
+      turnId: 'om_goal_turn',
       followUpContent: '<user_message>另外帮我顺手看下 CI</user_message>',
+      followUpTurnId: 'om_followup_turn',
     });
     expect(ds.pendingRawInput).toBeUndefined();
+    expect(ds.pendingRawTurnId).toBeUndefined();
     expect(ds.pendingFollowUpInput).toBeUndefined();
 
     fakeWorker.send.mockClear();

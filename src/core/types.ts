@@ -64,9 +64,26 @@ export interface DaemonSession {
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
+  /** One in-memory owner is preparing the pending repo's first worker. Kept
+   *  separate from worktreeCreating because plain select, skip, and /repo can
+   *  also await prompt context before the fork. */
+  pendingRepoCommitInFlight?: boolean;
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
+  /**
+   * Repo-select card message ids already consumed by a successful pending→worker
+   * transition (or an explicit mid-session card switch). Stale clicks on these
+   * cards must not be treated as a new mid-session switch that kills the just-
+   * started worker — Feishu card withdraw is best-effort and may lag or fail.
+   * In-memory only; not persisted.
+   */
+  consumedRepoCardMessageIds?: string[];
   worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
+  /** Exact Lark message id whose user input is waiting for the first worker
+   *  spawn. This is intentionally in-memory and must come from the accepted
+   *  inbound event: restoring a session must never recover per-turn authority
+   *  from an older persisted quote target. */
+  pendingTurnId?: string;
   /** Clean Codex App text/context retained alongside pendingPrompt while repo
    * selection delays the first turn. The legacy enriched prompt remains the
    * compatibility source for every other CLI. */
@@ -81,6 +98,11 @@ export interface DaemonSession {
    *  botmux-wrapped `<user_message>`. In-memory only to avoid replaying after
    *  daemon restart. */
   pendingRawInput?: string;
+  /** Exact accepted turn for pendingRawInput. Kept until prompt_ready delivers
+   *  the literal command. Raw cold-start workers deliberately spawn without
+   *  human turn authority; the worker rotates this turn immediately before
+   *  the command is written to the CLI. */
+  pendingRawTurnId?: string;
   /** Wrapped prompt for messages buffered while a pendingRawInput session
    *  waited for repo selection (pendingFollowUps / attachments). Built at the
    *  fork site (where prompt-building context lives) and delivered right
@@ -90,6 +112,7 @@ export interface DaemonSession {
   pendingFollowUpInput?: {
     userPrompt: string;
     cliInput: string;
+    turnId?: string;
     codexAppInput?: CodexAppTurnInput;
     /** The clean-input feature gate was evaluated when this follow-up was
      * staged; prompt_ready must not re-read a later config value. */
@@ -103,6 +126,9 @@ export interface DaemonSession {
    *  matching the original caller, not the user who clicked the card. */
   pendingSender?: import('../im/lark/identity-cache.js').ResolvedSender;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
+  /** Exact turn for a same-caller pendingRawInput follow-up batch. Cleared on
+   *  mixed callers so the combined prompt fails closed instead of borrowing. */
+  pendingFollowUpTurnId?: string;
   pendingCodexAppFollowUps?: string[]; // matching raw user texts for clean Codex App materialization
   pendingCodexAppFollowUpContexts?: string[]; // matching metadata-only context; never duplicates the raw follow-up text
   ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
@@ -117,6 +143,12 @@ export interface DaemonSession {
    *  real CLI input (rememberLastCliInput) — the next turn posts a card normally.
    *  In-memory only. See core/restart-report.ts. */
   suppressRecoveryCard?: boolean;
+  /** Turn-exact ids for silent scheduled fires. Every worker→Lark output path
+   *  checks its own turn id against this bounded in-memory registry, so a
+   *  queued normal user turn cannot un-hush the schedule (or inherit its hush).
+   *  Entries outlive turn_terminal briefly to cover trailing worker events and
+   *  are pruned by age/size when new silent turns are armed. */
+  silentScheduledTurns?: Map<string, number>;
   /** Session-scoped override: when true, the streaming card is posted/patched
    *  even if the bot has `disableStreamingCard` set. Flipped on by the `/card`
    *  command so a user can manually summon a live card in an otherwise-quiet
@@ -250,6 +282,60 @@ export interface DaemonSession {
  *  between the two address spaces are not possible. */
 export function sessionKey(anchorId: string, larkAppId: string): string {
   return `${anchorId}::${larkAppId}`;
+}
+
+const CONSUMED_REPO_CARD_CAP = 16;
+
+/** Record a repo-select card as already consumed. Correctness for stale clicks
+ *  depends on this local mark — not on Feishu deleteMessage succeeding. */
+export function markRepoCardConsumed(ds: DaemonSession, cardMessageId: string | undefined): void {
+  if (!cardMessageId) return;
+  const ids = ds.consumedRepoCardMessageIds ?? (ds.consumedRepoCardMessageIds = []);
+  if (!ids.includes(cardMessageId)) ids.push(cardMessageId);
+  if (ids.length > CONSUMED_REPO_CARD_CAP) ids.splice(0, ids.length - CONSUMED_REPO_CARD_CAP);
+}
+
+export function isRepoCardConsumed(ds: DaemonSession, cardMessageId: string | undefined): boolean {
+  return !!cardMessageId && !!ds.consumedRepoCardMessageIds?.includes(cardMessageId);
+}
+
+/**
+ * Whether a card callback may drive repo selection for this session.
+ * Only the currently posted card (`ds.repoCardMessageId`) is valid — after it
+ * is claimed/cleared, or after a daemon restart (field is in-memory), stale
+ * Feishu cards must not mid-session-switch. Previously-consumed ids are also
+ * rejected while the process is still up.
+ */
+export function isActiveRepoCard(ds: DaemonSession, cardMessageId: string | undefined): boolean {
+  if (!cardMessageId) return false;
+  if (isRepoCardConsumed(ds, cardMessageId)) return false;
+  return ds.repoCardMessageId === cardMessageId;
+}
+
+/**
+ * Atomically claim the session's current repo-select card for this action.
+ * Succeeds only when `cardMessageId` is the live `ds.repoCardMessageId` (or
+ * `cardMessageId` is omitted and a current card exists — text path withdrawing
+ * the open card). On success: clears `repoCardMessageId` and marks consumed
+ * BEFORE any killWorker / network await so concurrent callbacks cannot
+ * double-switch. Returns the claimed id, or undefined if the action must not
+ * proceed as a card-driven selection.
+ */
+export function claimCurrentRepoCard(ds: DaemonSession, cardMessageId: string | undefined): string | undefined {
+  const current = ds.repoCardMessageId;
+  if (!current) {
+    // No live card — reject any card id (restart / already claimed). Text path
+    // with no cardMessageId also gets undefined (caller proceeds without card).
+    return undefined;
+  }
+  if (cardMessageId && cardMessageId !== current) return undefined;
+  if (isRepoCardConsumed(ds, current)) {
+    ds.repoCardMessageId = undefined;
+    return undefined;
+  }
+  ds.repoCardMessageId = undefined;
+  markRepoCardConsumed(ds, current);
+  return current;
 }
 
 /** Resolve the routing anchor for an active session — chatId for chat-scope

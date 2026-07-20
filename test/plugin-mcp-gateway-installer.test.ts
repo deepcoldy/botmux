@@ -3,6 +3,10 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { ensureGatewayEntry, inspectGatewayEntry, removeGatewayEntry } from '../src/core/plugins/mcp/gateway-installer.js';
+import {
+  MCP_GATEWAY_FORWARDED_ENV_KEYS,
+  MCP_GATEWAY_OWNER_ENV,
+} from '../src/core/plugins/mcp/environment.js';
 
 describe('plugin MCP Gateway installer', () => {
   let home: string;
@@ -65,6 +69,9 @@ describe('plugin MCP Gateway installer', () => {
     expect(text).toContain('[mcp_servers.keep]');
     expect(text).toContain('[mcp_servers.botmux]');
     expect(text).toContain(`command = ${JSON.stringify(join(home, '.botmux', 'bin', 'botmux'))}`);
+    expect(text).toContain(
+      `env_vars = [${MCP_GATEWAY_FORWARDED_ENV_KEYS.map(value => JSON.stringify(value)).join(', ')}]`,
+    );
     expect(text.match(/\[mcp_servers\.botmux\]/g)).toHaveLength(1);
     expect(text).not.toContain('botmux plugin demo');
     expect(text).not.toContain('legacy-without-leading-marker');
@@ -88,7 +95,13 @@ describe('plugin MCP Gateway installer', () => {
       type: 'stdio',
       command: join(home, '.botmux', 'bin', 'botmux'),
       args: ['mcp', 'serve'],
-      env: { BOTMUX_MCP_GATEWAY: '1' },
+      env: {
+        [MCP_GATEWAY_OWNER_ENV]: '1',
+        BOTMUX_SESSION_ID: '${BOTMUX_SESSION_ID:-}',
+        SESSION_DATA_DIR: '${SESSION_DATA_DIR:-}',
+        BOTMUX_MCP_GATEWAY_SOCKET: '${BOTMUX_MCP_GATEWAY_SOCKET:-}',
+        BOTMUX_MCP_GATEWAY_REQUIRED: '${BOTMUX_MCP_GATEWAY_REQUIRED:-}',
+      },
     });
 
     expect(removeGatewayEntry(adapter).state).toBe('removed');

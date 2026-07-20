@@ -6,10 +6,13 @@ import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
 import { expandHomePath } from '../../../utils/working-dir.js';
 import { readPluginRegistry } from '../../../services/plugin-registry-store.js';
 import { readMaterializedPlugin } from '../materializer.js';
+import {
+  MCP_GATEWAY_FORWARDED_ENV_KEYS,
+  MCP_GATEWAY_OWNER_ENV,
+} from './environment.js';
 
 const GATEWAY_START = '# >>> botmux mcp gateway';
 const GATEWAY_END = '# <<< botmux mcp gateway';
-const GATEWAY_OWNER_ENV = 'BOTMUX_MCP_GATEWAY';
 
 export interface GatewayEntryReport {
   cliId: string;
@@ -113,6 +116,7 @@ function renderCodexEntry(entry: GatewayEntry): string {
     '[mcp_servers.botmux]',
     `command = ${JSON.stringify(entry.command)}`,
     `args = [${entry.args.map(value => JSON.stringify(value)).join(', ')}]`,
+    `env_vars = [${MCP_GATEWAY_FORWARDED_ENV_KEYS.map(value => JSON.stringify(value)).join(', ')}]`,
     GATEWAY_END,
   ].join('\n');
 }
@@ -141,7 +145,12 @@ function gatewayJsonValue(entry: GatewayEntry): Record<string, unknown> {
     type: 'stdio',
     command: entry.command,
     args: entry.args,
-    env: { [GATEWAY_OWNER_ENV]: '1' },
+    env: {
+      [MCP_GATEWAY_OWNER_ENV]: '1',
+      // Claude expands these from the owning CLI process when it starts the
+      // stdio relay. Empty defaults keep standalone Claude runs valid.
+      ...Object.fromEntries(MCP_GATEWAY_FORWARDED_ENV_KEYS.map(key => [key, `\${${key}:-}`])),
+    },
   };
 }
 
@@ -172,7 +181,7 @@ function isOwnedJsonEntry(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const env = (value as Record<string, unknown>).env;
   return !!env && typeof env === 'object' && !Array.isArray(env)
-    && (env as Record<string, unknown>)[GATEWAY_OWNER_ENV] === '1';
+    && (env as Record<string, unknown>)[MCP_GATEWAY_OWNER_ENV] === '1';
 }
 
 function removeClaudeEntry(path: string): boolean {

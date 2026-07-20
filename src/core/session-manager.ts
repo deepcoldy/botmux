@@ -4,6 +4,7 @@
  * session restoration, and scheduled task execution.
  */
 import { existsSync, statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { expandHome } from './working-dir.js';
 import { config } from '../config.js';
@@ -53,6 +54,7 @@ import { parseWorkingDirList } from '../utils/working-dir.js';
 import { resolveRoleInjection } from './role-resolver.js';
 import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../services/whiteboard-store.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
+import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -1655,6 +1657,33 @@ export async function resumeSession(
 
 // ─── Scheduled task execution ────────────────────────────────────────────────
 
+/**
+ * Prompt preamble for silent scheduled fires. The regular first-turn wrapper
+ * instructs the model to post progress updates via `botmux send`; a silent
+ * monitoring task needs the opposite default — say nothing unless the alert
+ * condition in the task prompt is met. Exported for tests.
+ */
+export function buildSilentScheduleHint(taskName: string, locale?: Locale): string {
+  if (locale === 'en') {
+    return [
+      '<botmux_silent_schedule trusted="true">',
+      `This is a SILENT run of scheduled task "${taskName}". No trigger message was posted in the chat; the user does not know this run is happening.`,
+      '- Do NOT send progress or confirmation messages ("started", "checked, all good", "done").',
+      '- Only when the result meets the notify condition described in the task (an anomaly found, an alert threshold hit, or the task explicitly asks for a deliverable) should you `botmux send` the conclusion.',
+      '- Otherwise finish the turn completely silently — do not call `botmux send` at all.',
+      '</botmux_silent_schedule>',
+    ].join('\n');
+  }
+  return [
+    '<botmux_silent_schedule trusted="true">',
+    `本次是定时任务「${taskName}」的静默执行：群里没有发送任何触发提示，用户不知道本次运行。`,
+    '- 不要发送过程性/确认性消息（“开始执行”“检查完毕，一切正常”“已完成”都不要发）。',
+    '- 仅当结果满足任务描述中需要通知用户的条件（发现异常、达到报警阈值、任务本身要求交付产物）时，才用 `botmux send` 发送结论。',
+    '- 不满足条件就完全静默地结束本轮，不要调用 `botmux send`。',
+    '</botmux_silent_schedule>',
+  ].join('\n');
+}
+
 export async function executeScheduledTask(
   task: ScheduledTask,
   activeSessions: Map<string, DaemonSession>,
@@ -1691,6 +1720,22 @@ export async function executeScheduledTask(
       ? 'thread'
       : (task.rootMessageId ? 'thread' : 'chat');
 
+  // Silent execution: post no "🕐 task started" banner / creator notice and
+  // reuse the pre-existing anchor (thread rootMessageId or chatId) directly.
+  // Paths where the banner message ITSELF creates the anchor (new-topic, or a
+  // thread task without rootMessageId) cannot be silent — creation rejects
+  // those combinations; if a stored task still reaches here, fall back to a
+  // loud fire rather than dropping the run.
+  let silent = task.silent === true;
+  if (silent && task.deliver === 'new-topic') {
+    logger.warn(`[scheduler] Task ${task.id} is silent+new-topic (should be rejected at creation); firing loud`);
+    silent = false;
+  }
+  if (silent && scope === 'thread' && !task.rootMessageId) {
+    logger.warn(`[scheduler] Silent task ${task.id} has no thread anchor; firing loud`);
+    silent = false;
+  }
+
   // Decide where to route the "🕐 task started" notification and where the
   // session conversation lands.
   //
@@ -1721,35 +1766,51 @@ export async function executeScheduledTask(
     // keep scheduled continuations in the original thread when we have one.
     const chatMode = await getChatMode(larkAppId, task.chatId, { forceRefresh: true });
     if (chatMode === 'topic' && task.rootMessageId) {
-      try {
-        await replyMessage(larkAppId, task.rootMessageId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)), 'text', true);
+      if (silent) {
+        // No banner probe — trust the stored anchor. If the topic was deleted,
+        // the model's own `botmux send` surfaces the failure.
         anchor = task.rootMessageId;
         isContinuation = true;
-      } catch (err: any) {
-        logger.warn(`[scheduler] Failed to reply in converted topic chat ${task.rootMessageId} (${err.message}); falling back to new thread`);
-        anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
+      } else {
+        try {
+          await replyMessage(larkAppId, task.rootMessageId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)), 'text', true);
+          anchor = task.rootMessageId;
+          isContinuation = true;
+        } catch (err: any) {
+          logger.warn(`[scheduler] Failed to reply in converted topic chat ${task.rootMessageId} (${err.message}); falling back to new thread`);
+          anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
+        }
       }
-    } else if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
-      const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-      replyMessage(
-        creatorAppId,
-        task.creatorRootMessageId,
-        t('scheduler.task_triggered_target_chat', { name: task.name }, localeForBot(creatorAppId)),
-        'text',
-        true,
-      ).catch((err: any) => {
-        logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
-      });
     } else {
-      // Same-chat: post the start banner to the chat as a plain message.
-      try {
-        await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
-      } catch (err: any) {
-        logger.warn(`[scheduler] Failed to post start banner in chat ${task.chatId} (${err.message})`);
+      if (silent) {
+        // No banner / creator notice — the chat itself is the anchor.
+      } else if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
+        const creatorAppId = task.creatorLarkAppId ?? larkAppId;
+        replyMessage(
+          creatorAppId,
+          task.creatorRootMessageId,
+          t('scheduler.task_triggered_target_chat', { name: task.name }, localeForBot(creatorAppId)),
+          'text',
+          true,
+        ).catch((err: any) => {
+          logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
+        });
+      } else {
+        // Same-chat: post the start banner to the chat as a plain message.
+        try {
+          await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
+        } catch (err: any) {
+          logger.warn(`[scheduler] Failed to post start banner in chat ${task.chatId} (${err.message})`);
+        }
       }
+      // Assign the chat anchor ONLY on this branch. This used to run
+      // unconditionally after the whole chain, clobbering the converted-topic
+      // branch's rootMessageId anchor — which made the runtimeScope 'thread'
+      // promotion below unreachable and re-posted every scheduled reply as a
+      // new top-level topic in converted groups.
+      anchor = task.chatId;
+      isContinuation = !!activeSessions.get(sessionKey(anchor, larkAppId));
     }
-    anchor = task.chatId;
-    isContinuation = !!activeSessions.get(sessionKey(anchor, larkAppId));
   } else {
     // thread-scope path (existing logic)
     const isCrossThread =
@@ -1758,32 +1819,41 @@ export async function executeScheduledTask(
       task.creatorRootMessageId !== task.rootMessageId;
 
     if (isCrossThread) {
-      const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-      replyMessage(
-        creatorAppId,
-        task.creatorRootMessageId!,
-        t('scheduler.task_triggered_target_thread', { name: task.name }, localeForBot(creatorAppId)),
-        'text',
-        true,
-      ).catch((err: any) => {
-        logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
-      });
+      if (!silent) {
+        const creatorAppId = task.creatorLarkAppId ?? larkAppId;
+        replyMessage(
+          creatorAppId,
+          task.creatorRootMessageId!,
+          t('scheduler.task_triggered_target_thread', { name: task.name }, localeForBot(creatorAppId)),
+          'text',
+          true,
+        ).catch((err: any) => {
+          logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
+        });
+      }
       anchor = task.rootMessageId!;
       isContinuation = true;
     } else if (task.rootMessageId) {
-      try {
-        await replyMessage(
-          larkAppId,
-          task.rootMessageId,
-          t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)),
-          'text',
-          true,
-        );
+      if (silent) {
+        // No banner probe — trust the stored anchor. If the topic was deleted,
+        // the model's own `botmux send` surfaces the failure.
         anchor = task.rootMessageId;
         isContinuation = true;
-      } catch (err: any) {
-        logger.warn(`[scheduler] Failed to reply in original thread ${task.rootMessageId} (${err.message}); falling back to new thread`);
-        anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
+      } else {
+        try {
+          await replyMessage(
+            larkAppId,
+            task.rootMessageId,
+            t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)),
+            'text',
+            true,
+          );
+          anchor = task.rootMessageId;
+          isContinuation = true;
+        } catch (err: any) {
+          logger.warn(`[scheduler] Failed to reply in original thread ${task.rootMessageId} (${err.message}); falling back to new thread`);
+          anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
+        }
       }
     } else {
       anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
@@ -1792,13 +1862,23 @@ export async function executeScheduledTask(
 
   refreshCliVersion(bot.config.cliId, bot.config.cliPathOverride);
 
+  // Silent fires flip the model's default from "post progress via botmux send"
+  // to "say nothing unless the alert condition is met".
+  const firePrompt = silent
+    ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${task.prompt}`
+    : task.prompt;
+  // Every fire gets a stable identity before it enters a worker queue. Silent
+  // output suppression follows this exact id instead of mutable session state,
+  // so overlapping/queued normal turns retain their own delivery semantics.
+  const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
+
   // Inject into a live session if one already exists at this anchor.
   const existing = activeSessions.get(sessionKey(anchor, larkAppId));
   if (isContinuation && existing?.worker && !existing.worker.killed) {
     markSessionActivity(existing);
     try {
       ensureSessionWhiteboard(existing);
-      const input = buildFollowUpCliInput(task.prompt, existing.session.sessionId, {
+      const input = buildFollowUpCliInput(firePrompt, existing.session.sessionId, {
         isAdoptMode: false,
         cliId: existing.session.cliId ?? bot.config.cliId,
         cliPathOverride: existing.session.cliPathOverride ?? bot.config.cliPathOverride,
@@ -1808,10 +1888,15 @@ export async function executeScheduledTask(
         whiteboardId: existing.session.whiteboardId,
       });
       rememberLastCliInput(existing, task.prompt, input);
-      sendWorkerInput(existing, input);
-      logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}`);
+      if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
+      if (!sendWorkerInput(existing, input, scheduledTurnId)) {
+        if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
+        throw new Error('worker unavailable');
+      }
+      logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
       return;
     } catch (err: any) {
+      if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
       logger.warn(`[scheduler] Failed to inject into live session (${err.message}); spawning fresh worker`);
     }
   }
@@ -1849,12 +1934,18 @@ export async function executeScheduledTask(
     workingDir: task.workingDir,
   };
   ensureSessionWhiteboard(ds);
-  const prompt = buildNewTopicCliInput(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
+  const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
   activeSessions.set(sessionKey(anchor, larkAppId), ds);
   rememberLastCliInput(ds, task.prompt, prompt);
-  forkWorker(ds, prompt);
+  if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
+  try {
+    forkWorker(ds, prompt, scheduledTurnId);
+  } catch (err) {
+    if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
+    throw err;
+  }
 
-  logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, scope: ${scope}, anchor: ${anchor}, continuation: ${isContinuation})`);
+  logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, scope: ${scope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
 }
 
 // ─── Dashboard「创建会话」spawn / activate ───────────────────────────────────

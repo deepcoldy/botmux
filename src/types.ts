@@ -455,6 +455,14 @@ export interface ScheduledTask {
    *    a fresh session (never reuses a prior session / never replies in-thread)
    *  - 'local': log only, no delivery */
   deliver?: 'origin' | 'local' | 'new-topic';
+  /** Silent execution: fires post NO "🕐 task started" banner / creator notice,
+   *  and the spawned turn suppresses daemon-initiated group output (streaming
+   *  card, bridge final_output forwarding). The prompt is wrapped with a hint
+   *  telling the model to `botmux send` only when its alert condition is met —
+   *  "符合条件报警、不符合条件静默". Incompatible with deliver:'new-topic'
+   *  (a new topic can only be opened by a first message); creation rejects the
+   *  combination and a runtime encounter falls back to a loud fire. */
+  silent?: boolean;
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }
@@ -508,7 +516,7 @@ export type DaemonToWorker =
    *  IPCs would race: process.on('message') handlers don't serialize, and the
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
-  | { type: 'raw_input'; content: string; followUpContent?: string; followUpCodexAppInput?: CodexAppTurnInput }
+  | { type: 'raw_input'; content: string; turnId?: string; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
@@ -553,15 +561,15 @@ export type DaemonToWorker =
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | { type: 'ready'; port: number; token: string; viewToken?: string; turnId?: string; dispatchAttempt?: number }
-  | { type: 'cli_session_id'; cliSessionId: string }
+  | { type: 'cli_session_id'; cliSessionId: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'prompt_ready' }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
   | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string; dispatchAttempt?: number }
-  | { type: 'tui_prompt_resolved'; selectedText?: string }
-  | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState }
+  | { type: 'tui_prompt_resolved'; selectedText?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
   | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }
   /** Runtime lease recovery ACK. Emitted only after the exact durable attempt
@@ -624,5 +632,5 @@ export type WorkerToDaemon =
       errorCode?: string;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
-  | { type: 'riff_access_url'; accessUrl: string; directAccessUrl?: string }
+  | { type: 'riff_access_url'; accessUrl: string; directAccessUrl?: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'riff_task_id'; taskId: string | null };

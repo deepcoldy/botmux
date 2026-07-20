@@ -1239,6 +1239,7 @@ export interface ScheduleRow {
   lastError?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
+  silent?: boolean;
   feishuChatLink: string;
 }
 
@@ -1261,6 +1262,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     lastError: t.lastError,
     repeat: t.repeat,
     deliver: t.deliver ?? 'origin',
+    silent: t.silent,
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }
@@ -1279,6 +1281,126 @@ ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200
 // Toggle delivery mode between 'origin' (reply in original thread) and
 // 'new-topic' (open a brand-new topic + fresh session on every fire).
 ipcRoute('POST', '/api/schedules/:id/delivery', (_req, res, p) => jsonRes(res, 200, scheduler.toggleDelivery(p.id)));
+
+// Create a new scheduled task from the dashboard. chatId selects which chat
+// the task fires into; workingDir defaults to the daemon's cwd.
+ipcRoute('POST', '/api/schedules', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  if (body === null || typeof body !== 'object') {
+    return jsonRes(res, 400, { ok: false, error: 'body_must_be_object' });
+  }
+  const b = body as Record<string, unknown>;
+  // Runtime validation — never trust the TS cast alone.
+  const name = typeof b.name === 'string' ? b.name.trim() : '';
+  const schedule = typeof b.schedule === 'string' ? b.schedule.trim() : '';
+  const prompt = typeof b.prompt === 'string' ? b.prompt : '';
+  const chatId = typeof b.chatId === 'string' ? b.chatId.trim() : '';
+  // Validate silent type — if present, must be boolean (no silent degradation).
+  let silent = false;
+  if (b.silent !== undefined) {
+    if (typeof b.silent !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'silent' });
+    }
+    silent = b.silent;
+  }
+  // `local` (log-only, no delivery) is not implemented in the executor —
+  // reject it from the dashboard API rather than silently degrading to origin.
+  let deliver: 'origin' | 'new-topic' = 'origin';
+  if (b.deliver !== undefined) {
+    if (b.deliver !== 'origin' && b.deliver !== 'new-topic') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_deliver', field: 'deliver' });
+    }
+    deliver = b.deliver;
+  }
+  // Validate required fields are present AND non-empty after trim.
+  if (!name) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'name' });
+  if (!schedule) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'schedule' });
+  if (!prompt.trim()) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'prompt' });
+  if (!chatId) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'chatId' });
+  // Note: bot↔chat membership is intentionally NOT validated here.
+  // listChatBotMembers returns [] both when the API is unavailable and when
+  // no bot has been observed in the chat yet, so we cannot reliably tell
+  // "bot not in chat" (should 400) from "unknown" (should fail-open).
+  // A task whose bot is not in the target chat will fail at fire time with
+  // a clear lastError, which is the pre-existing behavior for CLI-created
+  // tasks. Adding a flaky gate here would block valid creates.
+  try {
+    const task = scheduler.addTask({
+      name,
+      schedule,
+      prompt,
+      workingDir: typeof b.workingDir === 'string' ? b.workingDir : process.cwd(),
+      chatId,
+      scope: 'chat',
+      chatType: 'group',
+      larkAppId: cachedLarkAppId,
+      deliver,
+      silent,
+    });
+    dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: composeScheduleRow(task) } });
+    jsonRes(res, 200, { ok: true, task: composeScheduleRow(task) });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    jsonRes(res, 400, { ok: false, error: msg });
+  }
+});
+
+// Update editable fields of an existing task (name, prompt, schedule, deliver, silent).
+ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  if (body === null || typeof body !== 'object') {
+    return jsonRes(res, 400, { ok: false, error: 'body_must_be_object' });
+  }
+  const b = body as Record<string, unknown>;
+  const updates: {
+    name?: string; prompt?: string; schedule?: string;
+    deliver?: 'origin' | 'new-topic'; silent?: boolean;
+  } = {};
+  // If a field is present, it must be the correct type and (for strings)
+  // non-empty after trim — otherwise 400, never silently ignore.
+  if (b.name !== undefined) {
+    if (typeof b.name !== 'string' || !b.name.trim()) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'name' });
+    }
+    updates.name = b.name.trim();
+  }
+  if (b.prompt !== undefined) {
+    if (typeof b.prompt !== 'string' || !b.prompt.trim()) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'prompt' });
+    }
+    updates.prompt = b.prompt;
+  }
+  if (b.schedule !== undefined) {
+    if (typeof b.schedule !== 'string' || !b.schedule.trim()) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'schedule' });
+    }
+    updates.schedule = b.schedule.trim();
+  }
+  if (b.deliver !== undefined) {
+    if (b.deliver !== 'origin' && b.deliver !== 'new-topic') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_deliver', field: 'deliver' });
+    }
+    updates.deliver = b.deliver;
+  }
+  if (b.silent !== undefined) {
+    if (typeof b.silent !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'silent' });
+    }
+    updates.silent = b.silent;
+  }
+  const result = scheduler.updateTask(p.id, updates);
+  if (!result.ok) return jsonRes(res, 400, result);
+  const task = scheduleStore.getTask(p.id);
+  jsonRes(res, 200, { ok: true, task: task ? composeScheduleRow(task) : undefined });
+});
+
+// Delete a scheduled task.
+ipcRoute('DELETE', '/api/schedules/:id', (_req, res, p) => {
+  jsonRes(res, 200, scheduler.removeTaskForDashboard(p.id));
+});
 
 ipcRoute('POST', '/api/trigger', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, errorCode: 'bot_not_found', error: 'larkAppId_not_set' });

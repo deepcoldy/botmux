@@ -29,6 +29,10 @@ import { basename, isAbsolute, join, dirname, relative, resolve } from 'node:pat
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { PROXY_ENV_KEYS } from '../../utils/child-env.js';
+import {
+  MCP_GATEWAY_REQUIRED_ENV,
+  MCP_GATEWAY_SOCKET_ENV,
+} from '../../core/plugins/mcp/environment.js';
 
 /** Host root for the HOME overlay's upper/work — MUST be OUTSIDE the home lower
  *  (overlayfs forbids upper/work inside lower). */
@@ -149,6 +153,9 @@ export interface SandboxPlan {
   homeMerged: string;
   /** Daemon-mediated `botmux send` outbox — bound LAST so it wins over any mask. */
   outbox: string;
+  /** Trusted worker-side MCP socket directory. The sandbox sees only this
+   * session's socket at a fixed path under its private /run tmpfs. */
+  mcpGatewaySocket?: { hostDir: string; sandboxDir: string };
   /** Per-bot privacy masks: directories blanked with an empty tmpfs. */
   hideDirs: string[];
   /** Per-bot privacy masks: files blanked with a read-only empty placeholder. */
@@ -161,6 +168,11 @@ export interface SandboxPlan {
    *  (daemon-produced, e.g. skill plugin dirs) — bound AFTER the privacy masks so
    *  a broad hideDir can't break skill delivery. */
   readonlyRoots?: string[];
+  /** Sensitive files inside readonlyRoots that must stay hidden. Applied after
+   * the readonly bind so that re-exposing a plugin runtime cannot reveal its
+   * install-time MCP descriptor. */
+  postReadonlyHideDirs?: string[];
+  postReadonlyHideFiles?: { path: string; empty: string }[];
   /** Daemon-generated private roots re-bound writable AFTER credential masks.
    * Used for the current bot's isolated CLI home only; never accepts user
    * config. */
@@ -193,6 +205,10 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   a.push('--ro-bind', '/', '/');
   // Fresh kernel/runtime dirs (the ro-bind of / would otherwise carry host /tmp etc.).
   a.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--tmpfs', '/run', '--tmpfs', '/dev/shm');
+  if (plan.mcpGatewaySocket) {
+    a.push('--dir', plan.mcpGatewaySocket.sandboxDir);
+    a.push('--ro-bind', plan.mcpGatewaySocket.hostDir, plan.mcpGatewaySocket.sandboxDir);
+  }
   // Write-isolated home + project (overlay merged: reads=real lower, writes=upper).
   // If cwd IS HOME, two binds to the same destination would make the later
   // project bind silently shadow the home overlay. Use the project overlay as
@@ -221,6 +237,11 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   // Session-scoped TRUSTED runtime inputs, e.g. generated skill/plugin dirs —
   // after the masks so a broad hideDir can't blank skill delivery.
   for (const root of plan.readonlyRoots ?? []) a.push('--ro-bind', root, root);
+  // A readonly runtime root can contain install-time credentials that the child
+  // does not need. Re-mask those paths after the root bind so mount order cannot
+  // re-expose them.
+  for (const dir of plan.postReadonlyHideDirs ?? []) a.push('--tmpfs', dir);
+  for (const f of plan.postReadonlyHideFiles ?? []) a.push('--ro-bind', f.empty, f.path);
   // Outbox LAST so it wins even if a mask covers a parent dir.
   a.push('--bind', plan.outbox, plan.outbox);
   // Isolate namespaces (keep net unless explicitly disabled).
@@ -406,7 +427,11 @@ export function resolveUserReadonlyRoots(
 /** Absolute path to this build's compiled cli.js (dist/cli.js), derived from
  *  this module's own location (dist/adapters/backend/sandbox.js → ../../cli.js). */
 function distCliJs(): string {
-  return fileURLToPath(new URL('../../cli.js', import.meta.url));
+  const colocated = fileURLToPath(new URL('../../cli.js', import.meta.url));
+  if (existsSync(colocated)) return colocated;
+  // `pnpm daemon` loads this module from src/ through tsx, while the trusted
+  // sandbox shim must still execute the built CLI entrypoint.
+  return fileURLToPath(new URL('../../../dist/cli.js', import.meta.url));
 }
 
 /** Is file-sandbox enabled for this session? Spike gate = env; the real
@@ -551,6 +576,13 @@ export function prepareSandbox(opts: {
   /** Runtime-generated roots that should be visible read-only inside bwrap.
    *  Trusted (daemon-produced) — bound after the privacy masks. */
   readonlyRoots?: readonly string[];
+  /** Sensitive descendants of readonlyRoots that are re-masked after those
+   * roots are mounted. */
+  postReadonlyHidePaths?: readonly string[];
+  /** Absolute Botmux command paths already written into a CLI's MCP config.
+   * When a target lives below the masked BOTMUX_HOME, bind the trusted relay
+   * shim at that exact path so an absolute MCP command remains executable. */
+  trustedBotmuxCommandPaths?: readonly string[];
   /** Daemon-derived private roots to re-open writable after mandatory masks. */
   trustedWritablePaths?: readonly string[];
   /** Credential paths to re-mask after trusted writable carve-outs. */
@@ -561,6 +593,8 @@ export function prepareSandbox(opts: {
   userReadonlyPaths?: readonly string[];
   /** Keep network egress. Defaults to true for backwards compatibility. */
   net?: boolean;
+  /** Worker-owned Unix socket for the credential-bearing MCP Gateway. */
+  mcpGatewaySocketPath?: string;
 }): SandboxSpawn | null {
   if (!opts.enabled) return null;
   if (process.platform !== 'linux') return null; // overlayfs + bwrap are Linux-only
@@ -706,6 +740,8 @@ export function prepareSandbox(opts: {
   const hideFiles: { path: string; empty: string }[] = [];
   const finalHideDirs: string[] = [];
   const finalHideFiles: { path: string; empty: string }[] = [];
+  const postReadonlyHideDirs: string[] = [];
+  const postReadonlyHideFiles: { path: string; empty: string }[] = [];
   let emptyIdx = 0;
   const customBotsConfig = process.env.BOTS_CONFIG?.trim();
   const credentialPaths = [
@@ -751,6 +787,22 @@ export function prepareSandbox(opts: {
   };
   classifyMasks([...credentialPaths, ...(opts.hidePaths ?? [])], hideDirs, hideFiles);
   classifyMasks(opts.finalHidePaths ?? [], finalHideDirs, finalHideFiles);
+  classifyMasks(opts.postReadonlyHidePaths ?? [], postReadonlyHideDirs, postReadonlyHideFiles);
+
+  let mcpGatewaySocket: SandboxPlan['mcpGatewaySocket'];
+  let sandboxMcpGatewaySocketPath: string | undefined;
+  if (opts.mcpGatewaySocketPath) {
+    try {
+      const socketPath = resolve(opts.mcpGatewaySocketPath);
+      if (!lstatSync(socketPath).isSocket()) return null;
+      const hostDir = realpathSync(dirname(socketPath));
+      const sandboxDir = '/run/botmux-mcp';
+      mcpGatewaySocket = { hostDir, sandboxDir };
+      sandboxMcpGatewaySocketPath = join(sandboxDir, basename(socketPath));
+    } catch {
+      return null;
+    }
+  }
 
   // CLI auth/login paths kept real+writable (token refresh / login must persist,
   // unlike isolated project edits). Resolve `~` and bind only existing paths — a
@@ -767,6 +819,7 @@ export function prepareSandbox(opts: {
     home,
     homeMerged,
     outbox,
+    mcpGatewaySocket,
     hideDirs,
     hideFiles,
     authReal,
@@ -774,6 +827,8 @@ export function prepareSandbox(opts: {
     finalHideDirs,
     finalHideFiles,
     readonlyRoots,
+    postReadonlyHideDirs,
+    postReadonlyHideFiles,
     userReadonlyRoots,
     net: opts.net !== false,
   };
@@ -782,6 +837,28 @@ export function prepareSandbox(opts: {
   // read-only (`--ro-bind / /`), so bwrap can't mkdir a new mountpoint at the
   // root (/sbxbin) → it must live under a writable tmpfs (/run). PATH points here.
   args.push('--ro-bind', shimBin, '/run/sbxbin');
+  const trustedBotmuxRoots = [...new Set([
+    canonicalizeWithMissingTail(join(home, '.botmux')),
+    canonicalizeWithMissingTail(botmuxHome),
+  ])];
+  for (const rawTarget of [...new Set(opts.trustedBotmuxCommandPaths ?? [])]) {
+    if (!rawTarget || typeof rawTarget !== 'string') continue;
+    const target = canonicalizeWithMissingTail(expandTilde(rawTarget, home));
+    const trustedRoot = trustedBotmuxRoots.find(root => {
+      const rel = relative(root, target);
+      return rel !== '' && rel !== '..' && !rel.startsWith('../') && !isAbsolute(rel);
+    });
+    // External commands stay visible through the initial read-only bind of `/`.
+    // Only replace commands below a masked Botmux root, and reject symlink escapes.
+    if (!trustedRoot) continue;
+    const rel = relative(trustedRoot, target);
+    let current = trustedRoot;
+    for (const segment of dirname(rel).split('/').filter(segment => segment && segment !== '.')) {
+      current = join(current, segment);
+      args.push('--dir', current);
+    }
+    args.push('--ro-bind', shim, target);
+  }
   // botmux skill/plugin dir (claude `--plugin-dir` points here; carries the
   // botmux-send etc. skills, no secrets). Re-exposed read-only at its real path.
   const pluginDir = join(home, '.botmux', 'claude-plugin');
@@ -810,6 +887,10 @@ export function prepareSandbox(opts: {
   // Not a credential: every route it reaches authenticates independently.
   if (process.env.BOTMUX_DAEMON_IPC_PORT) {
     env.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
+  }
+  if (sandboxMcpGatewaySocketPath) {
+    env[MCP_GATEWAY_SOCKET_ENV] = sandboxMcpGatewaySocketPath;
+    env[MCP_GATEWAY_REQUIRED_ENV] = '1';
   }
   // Never inherit a custom credential config path into the sandbox. Its host
   // path is masked above as defense in depth, while unsetenv prevents an

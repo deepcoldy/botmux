@@ -86,6 +86,16 @@ describe('scheduler.toggleDelivery', () => {
     expect(publish).not.toHaveBeenCalled();
   });
 
+  it('REFUSES to switch a silent task to new-topic (silent fires post no opening message)', async () => {
+    const { toggleDelivery } = await import('../src/core/scheduler.js');
+    const id = seed('origin');
+    store.get(id)!.silent = true;
+    const r = toggleDelivery(id);
+    expect(r).toEqual({ ok: false, error: 'silent_task_origin_only' });
+    expect(store.get(id)!.deliver).toBe('origin');
+    expect(publish).not.toHaveBeenCalled();
+  });
+
   it('publishes a schedule.updated event with the new deliver', async () => {
     const { toggleDelivery } = await import('../src/core/scheduler.js');
     const id = seed('origin');
