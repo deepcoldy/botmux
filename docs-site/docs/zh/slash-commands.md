@@ -17,6 +17,32 @@
 | `/insight` | owner 专用：在当前会话即时回一张「本会话洞察摘要」卡片（聚合指标 + 规则建议；动作 span 明细 / 逐轮对账 / 对话回放在 Dashboard「洞察」页看） |
 | `/t <prompt>` `/topic <prompt>` | 普通群内强制开新话题 |
 
+## 💬 回复模式（`/reply-mode`）
+
+控制 bot 在当前聊天里被 @ 触发时如何开会话。无参数（或 `status`）查看当前模式；带参数修改（owner 专用）。多 bot 群里需 @ 具体 bot 才生效。
+
+**私聊（1:1 DM）**——只有 `chat` / `topic` 两态：
+
+| 命令 | 说明 |
+|------|------|
+| `/reply-mode` `/reply-mode status` | 查看当前私聊会话模式 |
+| `/reply-mode chat` | 扁平连续 DM 会话（同一 bot 的 DM 消息共用一个会话） |
+| `/reply-mode topic` | 每条 DM 独立会话/线程（默认） |
+
+`shared` / `chat-topic` 依赖群内原生话题，私聊不支持，会被拒绝。
+
+**普通群**——顶层 @ 的开会话方式：
+
+| 命令 | 说明 |
+|------|------|
+| `/reply-mode` `/reply-mode status` | 查看当前群回复模式 |
+| `/reply-mode chat` | 整群连续会话（顶层 @ 都进同一个会话） |
+| `/reply-mode chat-topic` | 顶层连续、原生话题各自独立会话 |
+| `/reply-mode new-topic` | 每次 @ 新建话题与独立会话 |
+| `/reply-mode topic` `/reply-mode shared` | 话题展示但共享同一会话（`topic` 是 `shared` 的兼容别名） |
+
+群级设置会覆盖 dashboard「Bot 配置 → 普通群模式」的默认值。
+
 ## 🔀 透传给底层 CLI
 
 `/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` —— 字面送达底层 CLI，交给它的内置命令处理。
