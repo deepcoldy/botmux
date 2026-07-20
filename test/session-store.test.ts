@@ -64,6 +64,7 @@ import {
   updateSession,
   updateSessionPid,
   findActiveSessionsByRoot,
+  repairMissingChatScope,
 } from '../src/services/session-store.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -151,6 +152,52 @@ describe('init()', () => {
     const persisted = JSON.parse(readFileSync(fp, 'utf-8'));
     expect(persisted.broken.scope).toBe('chat');
     expect(persisted.legacyThread.scope).toBeUndefined();
+  });
+
+  it('ignores malformed entries while repairing healthy sessions', () => {
+    mkdirSync(tempDir, { recursive: true });
+    const fp = join(tempDir, 'sessions.json');
+    writeFileSync(fp, JSON.stringify({
+      missingChatId: { sessionId: 'missing-chat-id' },
+      primitive: 'not-a-session',
+      broken: {
+        sessionId: 'broken',
+        chatId: 'oc_chat',
+        rootMessageId: 'oc_chat',
+        title: 'Broken repo switch',
+        status: 'active',
+        createdAt: '2026-07-18T00:00:00.000Z',
+      },
+      healthy: {
+        sessionId: 'healthy',
+        chatId: 'oc_chat',
+        rootMessageId: 'om_thread',
+        scope: 'thread',
+        title: 'Healthy thread',
+        status: 'active',
+        createdAt: '2026-07-18T00:00:00.000Z',
+      },
+    }));
+
+    init();
+
+    expect(getSession('broken')?.scope).toBe('chat');
+    expect(getSession('healthy')?.title).toBe('Healthy thread');
+    expect(listSessions()).toHaveLength(4);
+  });
+
+  it('repairs the corruption signature through the shared deserialization helper', () => {
+    const record: Record<string, unknown> = {
+      sessionId: 'broken',
+      chatId: 'oc_chat',
+      rootMessageId: 'oc_chat',
+    };
+
+    expect(repairMissingChatScope(record)).toBe(true);
+    expect(record.scope).toBe('chat');
+    expect(repairMissingChatScope(record)).toBe(false);
+    expect(repairMissingChatScope(null)).toBe(false);
+    expect(repairMissingChatScope({ sessionId: 'malformed' })).toBe(false);
   });
 
   it('keeps loaded sessions available when persisting a scope repair fails', () => {

@@ -7,6 +7,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliSource = readFileSync(join(__dirname, '..', 'src', 'cli.ts'), 'utf8');
 
 describe('cmdSend hook context wiring', () => {
+  it('repairs scope-less chat records in both CLI session file loaders', () => {
+    const loadSessionsStart = cliSource.indexOf('function loadSessions()');
+    const saveSessionStart = cliSource.indexOf('function saveSession(', loadSessionsStart);
+    const loadSessions = cliSource.slice(loadSessionsStart, saveSessionStart);
+
+    expect(loadSessionsStart).toBeGreaterThanOrEqual(0);
+    expect(loadSessions.match(/repairMissingChatScope\(/g)).toHaveLength(2);
+    expect(loadSessions).toMatch(/repairMissingChatScope\(s\);[\s\S]*?sessions\.set\(s\.sessionId, s\)/);
+    expect(loadSessions).toMatch(/repairMissingChatScope\(session\);[\s\S]*?sessions\.set\(session\.sessionId, session\)/);
+  });
+
   it('passes the current session id into outbound send/reply hooks', () => {
     expect(cliSource).toContain('const hookContext = {');
     expect(cliSource).toMatch(/sendMessage\(\s*appId,\s*sendTarget\.chatId,\s*content,\s*msgType,\s*uuid,\s*hookContext,/);

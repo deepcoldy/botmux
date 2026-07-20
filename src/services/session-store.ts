@@ -48,13 +48,17 @@ function ensureDir(): void {
 // narrow signature so ordinary legacy records without scope keep their
 // documented thread fallback. The original trace message cannot be recovered,
 // but chat routing does not use rootMessageId.
-function repairMissingChatScope(session: Session): boolean {
+export function repairMissingChatScope(session: unknown): boolean {
+  if (!session || typeof session !== 'object' || Array.isArray(session)) return false;
+  const record = session as Record<string, unknown>;
   if (
-    session.scope === undefined
-    && session.chatId.startsWith('oc_')
-    && session.rootMessageId === session.chatId
+    record.scope === undefined
+    && typeof record.chatId === 'string'
+    && record.chatId.startsWith('oc_')
+    && typeof record.rootMessageId === 'string'
+    && record.rootMessageId === record.chatId
   ) {
-    session.scope = 'chat';
+    record.scope = 'chat';
     return true;
   }
   return false;
