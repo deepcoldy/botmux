@@ -325,6 +325,36 @@ describe('codex buildArgs', () => {
     expect(args[idx + 1]).toBe('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
   });
 
+  it('RPC mode: attaches to the app-server thread AND disables the startup update check', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-rpc', resume: true,
+      remoteWsUrl: 'ws://127.0.0.1:9931', remoteThreadId: 'thread-abc',
+    });
+    // pure --remote viewer: no paste-mode bypass flag, no stale resume path
+    expect(args).toEqual([
+      '--remote', 'ws://127.0.0.1:9931', 'resume', '--no-alt-screen',
+      '-c', 'check_for_update_on_startup=false', 'thread-abc',
+    ]);
+    // the -c disable must land BEFORE the thread id (a resume-subcommand config)
+    const cIdx = args.indexOf('-c');
+    expect(args[cIdx + 1]).toBe('check_for_update_on_startup=false');
+    expect(args.indexOf('thread-abc')).toBeGreaterThan(cIdx);
+    // no interactive-paste bypass flag leaks into the viewer args
+    expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+  });
+
+  it('traex RPC mode: same --remote viewer args + update-check disabled', () => {
+    const traex = createTraexAdapter('/bin/traex');
+    const args = traex.buildArgs({
+      sessionId: 'sess-rpc', resume: true,
+      remoteWsUrl: 'ws://127.0.0.1:9932', remoteThreadId: 'thread-xyz',
+    });
+    expect(args).toEqual([
+      '--remote', 'ws://127.0.0.1:9932', 'resume', '--no-alt-screen',
+      '-c', 'check_for_update_on_startup=false', 'thread-xyz',
+    ]);
+  });
+
   it('does not inject a stale turn id into Codex shell environment policy', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
     expect(args.join('\n')).not.toContain('BOTMUX_TURN_ID');

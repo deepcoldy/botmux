@@ -103,6 +103,23 @@ function normalizeLifecycleExtractors(v: unknown): ConnectorDefinition['lifecycl
   return { dedupKey: r.dedupKey.trim() };
 }
 
+function normalizeTopicMessage(
+  value: unknown,
+  prior: ConnectorDefinition['topicMessage'] | undefined,
+): { ok: true; value: NonNullable<ConnectorDefinition['topicMessage']> } | { ok: false; error: string } {
+  const raw = record(value ?? prior);
+  const mode = typeof raw.mode === 'string' ? raw.mode : prior?.mode ?? 'default';
+  if (!['default', 'custom', 'none'].includes(mode)) {
+    return { ok: false, error: 'bad_topic_message_mode' };
+  }
+  if (mode !== 'custom') return { ok: true, value: { mode } as NonNullable<ConnectorDefinition['topicMessage']> };
+
+  const text = typeof raw.text === 'string' ? raw.text.trim() : prior?.text?.trim() ?? '';
+  if (!text) return { ok: false, error: 'topic_message_required' };
+  if (Array.from(text).length > 200) return { ok: false, error: 'topic_message_too_long' };
+  return { ok: true, value: { mode: 'custom', text } };
+}
+
 function sameStringSet(left: string[] | undefined, right: string[] | undefined): boolean {
   return JSON.stringify([...new Set(left ?? [])].sort())
     === JSON.stringify([...new Set(right ?? [])].sort());
@@ -173,6 +190,8 @@ function normalizeConnectorInput(
     verify.type === 'hmac-sha256' || verify.type === 'token'
       ? verify.type
       : prior?.verify.type ?? 'token';
+  const topicMessage = normalizeTopicMessage(c.topicMessage, prior?.topicMessage);
+  if (!topicMessage.ok) return topicMessage;
 
   const now = new Date().toISOString();
   const next: ConnectorDefinition = {
@@ -219,6 +238,7 @@ function normalizeConnectorInput(
         ? (promptEnvelope.instruction.trim() ? { instruction: promptEnvelope.instruction.trim().slice(0, 8000) } : {})
         : prior?.promptEnvelope.instruction ? { instruction: prior.promptEnvelope.instruction } : {}),
     },
+    topicMessage: topicMessage.value,
     loggingPolicy: {
       storePayload: bool(loggingPolicy.storePayload, prior?.loggingPolicy.storePayload ?? true),
       storeHeaders: bool(loggingPolicy.storeHeaders, prior?.loggingPolicy.storeHeaders ?? true),

@@ -88,7 +88,7 @@ vi.mock('../src/im/lark/card-handler.js', () => ({
   runAutoWorktreeCommit: (...args: any[]) => mockRunAutoWorktreeCommit(...args),
 }));
 
-import { triggerSessionTurn } from '../src/core/trigger-session.js';
+import { buildExternalEventTopicMessage, triggerSessionTurn } from '../src/core/trigger-session.js';
 import { sessionKey } from '../src/core/types.js';
 
 const APP = 'app1';
@@ -158,6 +158,37 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const ds = activeSessions.get(sessionKey(ROOT, APP));
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+  });
+
+  it('keeps the localized topic seed by default', () => {
+    expect(buildExternalEventTopicMessage(request(), APP)).toBe('外部事件触发：alerts');
+  });
+
+  it('uses a connector-owned custom topic seed when opening a new topic', async () => {
+    const req = request({ rootMessageId: undefined });
+    req.presentation = { topicMessage: 'CI 构建失败，请检查发布流水线' };
+    const activeSessions = new Map<string, DaemonSession>();
+
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, 'CI 构建失败，请检查发布流水线');
+    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, 'om_new_topic', '[External] alerts', 'group');
+    expect(activeSessions.get(sessionKey('om_new_topic', APP))?.scope).toBe('thread');
+  });
+
+  it('suppresses the topic seed and keeps a topicless automation session chat-scoped', async () => {
+    const req = request({ rootMessageId: undefined });
+    req.presentation = { topicMessage: null };
+    const activeSessions = new Map<string, DaemonSession>();
+
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, CHAT, '[External] alerts', 'group');
+    const ds = activeSessions.get(sessionKey(CHAT, APP));
+    expect(ds?.scope).toBe('chat');
+    expect(ds?.session.externalTriggerTopicless).toBe(true);
     expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
   });
 

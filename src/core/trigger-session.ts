@@ -55,6 +55,19 @@ export function buildExternalEventVisibleText(req: TriggerRequest, larkAppId?: s
   return t('trigger.external_event_clean', undefined, larkAppId ? localeForBot(larkAppId) : undefined);
 }
 
+/** Feishu topic seed for a new external-event session. `null` is an explicit
+ * connector-owner choice to run without the otherwise required notice. */
+export function buildExternalEventTopicMessage(req: TriggerRequest, larkAppId?: string): string | null {
+  const configured = req.presentation?.topicMessage;
+  if (configured === null) return null;
+  if (typeof configured === 'string' && configured.trim()) return configured.trim();
+  return t(
+    'trigger.external_event',
+    { source: req.envelope.sourceName },
+    larkAppId ? localeForBot(larkAppId) : undefined,
+  );
+}
+
 /** Connector-owner directives are trusted application context. Keep them
  * separate from the full legacy wrapper, which also contains untrusted event
  * bytes and therefore must never be promoted wholesale to developer context. */
@@ -298,6 +311,7 @@ export async function triggerSessionTurn(
 
   const dryRun = !!req.options?.dryRun;
   const prompt = buildUntrustedEventPrompt(req, triggerId);
+  const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
   const codexAppText = buildExternalEventVisibleText(req, larkAppId);
   const codexAppApplicationContext = buildExternalEventApplicationContext(req);
   const codexAppMessageContext = buildExternalEventDataContext(req, triggerId);
@@ -343,7 +357,8 @@ export async function triggerSessionTurn(
   // group's one chat-scope session. Explicit rootMessageId is a stricter target:
   // it always routes to that thread anchor after daemon-side chat ownership check.
   const regularGroupMode: ChatReplyMode = isHttpVirtualSession ? 'chat' : resolveRegularGroupMode(larkAppId, chatId);
-  if (!ds && !req.target.sessionId && !rootMessageId && !isHttpVirtualSession && regularGroupMode !== 'new-topic') {
+  if (!ds && !req.target.sessionId && !rootMessageId && !isHttpVirtualSession
+      && (regularGroupMode !== 'new-topic' || topicMessage === null)) {
     ds = deps.activeSessions.get(sessionKey(chatId, larkAppId));
   }
 
@@ -500,8 +515,8 @@ export async function triggerSessionTurn(
   const shouldOpenOwnTopic = !rootMessageId
     && !isHttpVirtualSession
     && externalEventOpensOwnTopic(chatMode, regularGroupMode);
-  if (shouldOpenOwnTopic) {
-    anchor = await sendMessage(larkAppId, chatId, t('trigger.external_event', { source: req.envelope.sourceName }, localeForBot(larkAppId)));
+  if (shouldOpenOwnTopic && topicMessage !== null) {
+    anchor = await sendMessage(larkAppId, chatId, topicMessage);
     scope = 'thread';
   }
 
@@ -509,6 +524,7 @@ export async function triggerSessionTurn(
   const now = Date.now();
   session.larkAppId = larkAppId;
   session.scope = scope;
+  if (shouldOpenOwnTopic && topicMessage === null) session.externalTriggerTopicless = true;
   session.lastMessageAt = new Date(now).toISOString();
   session.workingDir = wd.workingDir;
   session.cliId = bot.config.cliId;

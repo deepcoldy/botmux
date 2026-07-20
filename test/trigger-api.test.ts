@@ -36,6 +36,22 @@ describe('trigger request contract', () => {
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
   });
 
+  it('accepts a custom or suppressed topic message and rejects malformed presentation', () => {
+    const custom = request();
+    custom.presentation = { topicMessage: 'Build failed' };
+    expect(validateTriggerRequest(custom).ok).toBe(true);
+
+    const silent = request();
+    silent.presentation = { topicMessage: null };
+    expect(validateTriggerRequest(silent).ok).toBe(true);
+
+    for (const topicMessage of ['', 'x'.repeat(201), 42]) {
+      const bad = request() as any;
+      bad.presentation = { topicMessage };
+      expect(validateTriggerRequest(bad).ok).toBe(false);
+    }
+  });
+
   it('allows wait-mode turn triggers without a chatId or sessionId', () => {
     const req = request();
     delete (req.target as any).chatId;

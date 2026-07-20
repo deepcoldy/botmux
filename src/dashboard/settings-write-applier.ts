@@ -41,6 +41,7 @@ export interface ResolvedDashboardSettingsView {
   localCliOpenMode: 'attach' | 'resume';
   chatBotDiscovery: boolean;
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
+  codexRpcInput: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId?: string | null;
@@ -143,6 +144,7 @@ export type ApplySettingsWriteError =
   | 'invalid_herdrTraexPlugin_enabled'
   | 'invalid_herdrTraexPlugin_source'
   | 'invalid_herdrTraexPlugin_ref'
+  | 'invalid_codexRpcInput'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
@@ -246,6 +248,12 @@ export async function applySettingsWrite(
       else delete next.ref;
     }
     patch.herdrTraexPlugin = next;
+  }
+  if ('codexRpcInput' in obj) {
+    if (typeof obj.codexRpcInput !== 'boolean') {
+      return { ok: false, error: 'invalid_codexRpcInput' };
+    }
+    patch.codexRpcInput = obj.codexRpcInput;
   }
 
   let touched = false;

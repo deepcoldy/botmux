@@ -6,6 +6,7 @@ import { config } from '../config.js';
 export type ConnectorVerifyType = 'hmac-sha256' | 'token';
 export type ConnectorTargetMode = 'dynamic' | 'fixed' | 'new-group';
 export type ConnectorTargetKind = 'turn' | 'workflow';
+export type ConnectorTopicMessageMode = 'default' | 'custom' | 'none';
 
 export interface ConnectorDefinition {
   id: string;
@@ -38,6 +39,13 @@ export interface ConnectorDefinition {
     // Trusted task ("what should the bot do with this event"); injected above the
     // untrusted event data when a turn fires. Empty/absent = no extra instruction.
     instruction?: string;
+  };
+  /** Feishu topic seed shown when this webhook has to open a new topic.
+   *  Missing on older stores means `default` for backwards compatibility. */
+  topicMessage?: {
+    mode: ConnectorTopicMessageMode;
+    /** Custom text may contain `{source}`, resolved from promptEnvelope.sourceName. */
+    text?: string;
   };
   loggingPolicy: {
     storePayload: boolean;

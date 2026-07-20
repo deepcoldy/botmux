@@ -19,6 +19,7 @@ interface Connector {
     workflowId?: string;
   };
   promptEnvelope: { sourceName: string; instruction?: string };
+  topicMessage?: { mode: 'default' | 'custom' | 'none'; text?: string };
   loggingPolicy?: { storePayload: boolean; storeHeaders: boolean; retentionDays: number };
   lifecycleExtractors?: { dedupKey: string } | null;
 }
@@ -47,6 +48,8 @@ interface CreateForm {
   deduplicate: boolean;
   dedup: string;
   instruction: string;
+  topicMessageMode: 'default' | 'custom' | 'none';
+  topicMessageText: string;
   verify: 'token' | 'hmac-sha256';
   secret: string;
   storePayload: boolean;
@@ -82,6 +85,8 @@ const emptyForm: CreateForm = {
   deduplicate: false,
   dedup: '',
   instruction: '',
+  topicMessageMode: 'default',
+  topicMessageText: '',
   verify: 'token',
   secret: '',
   storePayload: true,
@@ -273,6 +278,8 @@ function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm
     deduplicate: Boolean(connector.lifecycleExtractors?.dedupKey),
     dedup: connector.lifecycleExtractors?.dedupKey || '',
     instruction: connector.promptEnvelope?.instruction || '',
+    topicMessageMode: connector.topicMessage?.mode || 'default',
+    topicMessageText: connector.topicMessage?.text || '',
     verify: connector.verify?.type || 'token',
     secret: '',
     storePayload: connector.loggingPolicy?.storePayload !== false,
@@ -470,12 +477,21 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       setCreateMsg({ text: tr('connectors.errLegacyWorkflowRetired'), error: true });
       return;
     }
+    const topicMessageText = form.topicMessageText.trim();
+    if (form.topicMessageMode === 'custom' && !topicMessageText) {
+      setCreateMsg({ text: tr('connectors.errTopicMessage'), error: true });
+      return;
+    }
 
     const body: any = {
       name,
       enabled: editingConnector?.enabled ?? true,
       target: { kind: form.kind, mode: form.mode, botId },
       promptEnvelope: { sourceName: name, instruction: form.instruction.trim() },
+      topicMessage: {
+        mode: form.topicMessageMode,
+        ...(form.topicMessageMode === 'custom' ? { text: topicMessageText } : {}),
+      },
       verify: { type: form.verify },
       loggingPolicy: { storePayload: form.storePayload, storeHeaders: true, retentionDays: 14 },
     };
@@ -536,6 +552,8 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           dedup: '',
           secret: '',
           instruction: '',
+          topicMessageMode: 'default',
+          topicMessageText: '',
           allowChats: [],
           storePayload: true,
         }));
@@ -815,6 +833,47 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
             />
           </label>
 
+          <div className="cn-field cn-field-wide connector-topic-message-config">
+            <FieldTitle help={tr('connectors.topicMessageHint')}>{tr('connectors.topicMessage')}</FieldTitle>
+            <div className="connector-topic-message-options" role="radiogroup" aria-label={tr('connectors.topicMessage')}>
+              {(['default', 'custom', 'none'] as const).map(mode => (
+                <button
+                  key={mode}
+                  type="button"
+                  role="radio"
+                  aria-checked={form.topicMessageMode === mode}
+                  className={`connector-topic-message-option${form.topicMessageMode === mode ? ' selected' : ''}`}
+                  onClick={() => patchForm({ topicMessageMode: mode })}
+                >
+                  <span className="connector-strategy-radio" aria-hidden="true" />
+                  <span>
+                    <b>{tr(`connectors.topicMessage${mode === 'default' ? 'Default' : mode === 'custom' ? 'Custom' : 'None'}`)}</b>
+                    <small>{tr(`connectors.topicMessage${mode === 'default' ? 'DefaultHint' : mode === 'custom' ? 'CustomHint' : 'NoneHint'}`)}</small>
+                  </span>
+                </button>
+              ))}
+            </div>
+            {form.topicMessageMode === 'custom' ? (
+              <label className="connector-topic-message-input" htmlFor="cn-topic-message">
+                <input
+                  id="cn-topic-message"
+                  type="text"
+                  maxLength={200}
+                  value={form.topicMessageText}
+                  onChange={event => patchForm({ topicMessageText: event.currentTarget.value })}
+                  placeholder={tr('connectors.topicMessageCustomPh')}
+                />
+                <small>{tr('connectors.topicMessageCustomHelp')}<span>{Array.from(form.topicMessageText).length}/200</span></small>
+              </label>
+            ) : (
+              <p className={`connector-topic-message-preview${form.topicMessageMode === 'none' ? ' muted' : ''}`}>
+                {form.topicMessageMode === 'none'
+                  ? tr('connectors.topicMessageNonePreview')
+                  : tr('connectors.topicMessagePreview', { source: form.name.trim() || tr('connectors.topicMessageSourceFallback') })}
+              </p>
+            )}
+          </div>
+
           <label className="connector-log-policy cn-field-wide" htmlFor="cn-store-payload">
             <input id="cn-store-payload" type="checkbox" checked={form.storePayload} onChange={e => patchForm({ storePayload: e.currentTarget.checked })} />
             <span>
@@ -981,6 +1040,13 @@ function ConnectorList(props: {
             {c.target.kind === 'workflow' ? <div className="muted connector-item-note">{tr('connectors.legacyWorkflowNote')}</div> : null}
             {c.target.mode === 'dynamic' ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.dynamicReqHint') }} /> : null}
             {c.promptEnvelope?.instruction ? <div className="muted connector-item-note">{tr('connectors.instructionPrefix')}{c.promptEnvelope.instruction}</div> : null}
+            <div className="muted connector-item-note">
+              {c.topicMessage?.mode === 'none'
+                ? tr('connectors.topicMessageListNone')
+                : c.topicMessage?.mode === 'custom'
+                  ? tr('connectors.topicMessageListCustom', { text: c.topicMessage.text || '' })
+                  : tr('connectors.topicMessageListDefault')}
+            </div>
             {editMsg ? <div className={editMsg.error ? 'err connector-item-note' : 'muted connector-item-note'}>{editMsg.text}</div> : null}
             <div className="connector-item-actions">
               <button className="ghost" type="button" onClick={() => props.onEdit(c)}>{tr('connectors.btnEdit')}</button>

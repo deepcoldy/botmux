@@ -4,7 +4,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { verifyWebhookSignature, verifyWebhookToken } from '../src/dashboard/webhook-routes.js';
+import { connectorTriggerPresentation, verifyWebhookSignature, verifyWebhookToken } from '../src/dashboard/webhook-routes.js';
 import type { ConnectorDefinition } from '../src/services/connector-store.js';
 
 let server: Server | null = null;
@@ -199,6 +199,22 @@ describe('webhook route verification helpers', () => {
     expect(verifyWebhookToken('s3cret', '')).toBe(false);
     expect(verifyWebhookToken('s3cret', 's3cret-longer')).toBe(false);
   });
+
+  it('resolves connector-owned custom and disabled topic presentation', () => {
+    const connector = {
+      name: 'Deploy alerts',
+      promptEnvelope: { sourceName: 'production' },
+    } as ConnectorDefinition;
+    expect(connectorTriggerPresentation(connector)).toBeUndefined();
+    expect(connectorTriggerPresentation({
+      ...connector,
+      topicMessage: { mode: 'custom', text: '发布异常：{source}' },
+    })).toEqual({ topicMessage: '发布异常：production' });
+    expect(connectorTriggerPresentation({
+      ...connector,
+      topicMessage: { mode: 'none' },
+    })).toEqual({ topicMessage: null });
+  });
 });
 
 describe('webhook token mode', () => {
@@ -270,6 +286,28 @@ describe('webhook token mode', () => {
     });
     expect(res.status).toBe(200);
     expect((await res.json()).ok).toBe(true);
+  });
+
+  it('forwards topic presentation from connector config, never from request data', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'delivered' }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const connector = await seedTokenConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({ ...connector, topicMessage: { mode: 'custom', text: 'Alert from {source}' } });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ presentation: { topicMessage: 'untrusted override' } }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(captured[0].presentation).toEqual({ topicMessage: 'Alert from simple' });
+    expect(captured[0].envelope.payload.presentation.topicMessage).toBe('untrusted override');
   });
 
   it('rejects a wrong path token with 401', async () => {

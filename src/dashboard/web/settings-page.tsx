@@ -22,6 +22,7 @@ interface DashboardSettings {
     recommendedSource: string;
     recommendedRef: string;
   };
+  codexRpcInput: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId: string | null;
@@ -116,6 +117,7 @@ function parseSettings(s: any): DashboardSettings {
       recommendedSource: typeof s?.herdrTraexPlugin?.recommendedSource === 'string' ? s.herdrTraexPlugin.recommendedSource : '',
       recommendedRef: typeof s?.herdrTraexPlugin?.recommendedRef === 'string' ? s.herdrTraexPlugin.recommendedRef : '',
     },
+    codexRpcInput: s?.codexRpcInput === true,
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: typeof s?.vcMeetingAgent?.listenerBotAppId === 'string' ? s.vcMeetingAgent.listenerBotAppId : null,
@@ -513,7 +515,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -623,6 +625,13 @@ function SettingsBody(props: {
               onSave={patch => saveHerdrTraexPlugin(patch)}
             />
           ) : null}
+          <ToggleRow
+            title={tr('settings.codexRpcInput')}
+            help={tr('settings.codexRpcInputHelp')}
+            checked={settings.codexRpcInput}
+            disabled={dis || savingKey === 'codexRpcInput'}
+            onChange={value => saveBoolean('codexRpcInput', value)}
+          />
         </SettingsBlock>
         <SettingsBlock title={tr('settings.sectionWhiteboard')}>
           <ToggleRow

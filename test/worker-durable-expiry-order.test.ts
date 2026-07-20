@@ -54,7 +54,7 @@ describe('worker durable lease expiry ordering', () => {
     const revoke = restart.indexOf('revokeManagedTurnOriginForRestart();', rawArm);
     const destroy = restart.indexOf('destroySession?.()', arm);
     const kill = restart.indexOf('killCli({ preservePending: opts.preservePending });', destroy);
-    const spawn = restart.indexOf("spawnCli({ ...lastInitConfig, resume: true, prompt: '' });", destroy);
+    const spawn = restart.indexOf('await spawnCli(restartCfg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });', destroy);
     const release = restart.indexOf('cliRestartInProgress = false;', spawn);
     const riffRawRelease = restart.indexOf(
       "if (effectiveBackendType === 'riff' && isPromptReady) releaseRawInputRestartGate();",

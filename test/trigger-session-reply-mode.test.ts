@@ -104,6 +104,17 @@ describe('triggerSessionTurn — webhook honors 普通群会话模式 (chat-scop
     expect(res.target?.sessionId).toBeUndefined();
   });
 
+  it('a disabled topic seed deliberately reuses the topicless chat-scope automation session', async () => {
+    setMode('new-topic');
+    const activeSessions = new Map<string, DaemonSession>();
+    activeSessions.set(sessionKey(CHAT, APP), liveChatScopeSession());
+    const req = dryRunReq();
+    req.presentation = { topicMessage: null };
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    expect(res.target?.sessionId).toBe('sess_existing');
+    expect(res.message).toContain('would inject into existing session');
+  });
+
   it('per-chat new-topic override beats a chat per-bot default', async () => {
     setMode('chat', 'new-topic');
     const res = await run();

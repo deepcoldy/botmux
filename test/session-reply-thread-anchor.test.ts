@@ -125,6 +125,18 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     expect(mocks.replyMessage).not.toHaveBeenCalled();
   });
 
+  it('topicless webhook automation stays flat even when the destination is a topic group', async () => {
+    const ds = seedSharedSession(undefined);
+    ds.session.externalTriggerTopicless = true;
+    mocks.getChatMode.mockResolvedValue('topic');
+
+    await sessionReply(CHAT, 'automation output', 'text', APP);
+
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.getChatMode).not.toHaveBeenCalled();
+  });
+
   it('a queued earlier turn still replies under ITS OWN trigger after a later turn overwrote the slot', async () => {
     // codex 2nd-review P2 repro: trigger A, then trigger B before A's reply.
     // currentReplyTarget = B (single slot), but turn A resolves via the

@@ -101,6 +101,8 @@ describe('worker.ts startup-commands wiring', () => {
   it('defers the args-baked initial prompt when startup commands are present', () => {
     // buildArgs gets undefined (not baked) and the init handler queues it instead.
     expect(src).toContain('initialPrompt: deferInitialPrompt ? undefined : (cfg.prompt || undefined)');
-    expect(src).toContain('!cliAdapter?.passesInitialPromptViaArgs || deferInitialPrompt');
+    expect(src).toContain('shouldQueueInitialPrompt({');
+    expect(src).toContain('passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,');
+    expect(src).toContain('deferInitialPrompt,');
   });
 });

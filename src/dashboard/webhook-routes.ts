@@ -161,6 +161,21 @@ function pickAllowedHeaders(req: IncomingMessage, allowlist: string[]): Record<s
   return out;
 }
 
+/** Resolve the connector-owned topic seed once at the trusted webhook edge.
+ * The request body can never override this presentation setting. */
+export function connectorTriggerPresentation(
+  connector: ConnectorDefinition,
+): TriggerRequest['presentation'] | undefined {
+  const mode = connector.topicMessage?.mode ?? 'default';
+  if (mode === 'none') return { topicMessage: null };
+  if (mode !== 'custom') return undefined;
+  const text = connector.topicMessage?.text?.trim();
+  if (!text) return undefined;
+  const source = connector.promptEnvelope.sourceName || connector.name;
+  const resolved = text.replaceAll('{source}', source);
+  return { topicMessage: Array.from(resolved).slice(0, 200).join('') };
+}
+
 function dynamicChatId(req: IncomingMessage, url: URL, payload: unknown): string | undefined {
   const fromQuery = url.searchParams.get('chatId') ?? undefined;
   if (fromQuery) return fromQuery;
@@ -433,6 +448,7 @@ export async function handleWebhookRoute(
   }
 
   const responseOptions = parseTriggerResponseOptions(req, url);
+  const presentation = connectorTriggerPresentation(connector);
   // Stored workflow connectors are tombstones only after the v2 runtime
   // retirement. Fail before lifecycle state or group creation; dispatching to
   // a daemon would make the safety property depend on daemon version/skew.
@@ -485,6 +501,7 @@ export async function handleWebhookRoute(
         ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
       },
       ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
+      ...(presentation ? { presentation } : {}),
       options: responseOptions,
     };
 
@@ -610,6 +627,7 @@ export async function handleWebhookRoute(
         ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
       },
       ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
+      ...(presentation ? { presentation } : {}),
       options: { ...(dedupKey ? { dedupKey } : {}), ...responseOptions },
     };
 
@@ -660,6 +678,7 @@ export async function handleWebhookRoute(
       ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
     },
     ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
+    ...(presentation ? { presentation } : {}),
     options: responseOptions,
   };
 

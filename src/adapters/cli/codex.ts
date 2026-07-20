@@ -145,7 +145,19 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, readIsolation }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, readIsolation, remoteWsUrl, remoteThreadId }) {
+      // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
+      // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
+      // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
+      // path, no history.jsonl verify. --no-alt-screen keeps pane capture working.
+      if (remoteWsUrl && remoteThreadId) {
+        // -c check_for_update_on_startup=false: an RPC pane is a pure viewer with
+        // NO terminal input path, so codex's interactive "Update available … Press
+        // enter to continue" dialog would block the resume forever and freeze the
+        // Web terminal. Disable the check at the PROCESS level (never the user's
+        // global config). The bounded startup-dialog watcher is only a fail-safe.
+        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId];
+      }
       // Read isolation for Codex is enforced by the worker's Seatbelt wrapper,
       // NOT by codex's own profile (codex 0.137 can't express a read blocklist).
       // So spawn args are unchanged — keep bypass so codex's own nested sandbox

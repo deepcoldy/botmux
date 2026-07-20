@@ -231,6 +231,49 @@ describe('connector-api write routes', () => {
     expect(cleared.connector.promptEnvelope.instruction).toBeUndefined();
   });
 
+  it('supports default, custom, and disabled topic messages as a product setting', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Deploy alerts',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+        topicMessage: { mode: 'custom', text: '  发布异常：{source}  ' },
+      }),
+    }));
+    expect(created.connector.topicMessage).toEqual({ mode: 'custom', text: '发布异常：{source}' });
+
+    const disabled = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ topicMessage: { mode: 'none', text: 'must be discarded' } }),
+    }));
+    expect(disabled.connector.topicMessage).toEqual({ mode: 'none' });
+
+    const defaulted = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ topicMessage: { mode: 'default' } }),
+    }));
+    expect(defaulted.connector.topicMessage).toEqual({ mode: 'default' });
+  });
+
+  it('rejects empty and overlong custom topic messages', async () => {
+    for (const text of ['   ', 'x'.repeat(201)]) {
+      const res = await fetch(`${baseUrl}/api/connectors`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Invalid notice',
+          target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+          topicMessage: { mode: 'custom', text },
+        }),
+      });
+      expect(res.status).toBe(400);
+      expect((await json(res)).error).toMatch(/^topic_message_(required|too_long)$/);
+    }
+  });
+
   it('keeps HMAC mode when explicitly requested and omits the token from the URL', async () => {
     const created = await json(await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',

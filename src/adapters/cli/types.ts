@@ -104,6 +104,12 @@ export interface CliAdapter {
      *  shell subprocesses so `botmux send` finds its cred file) — the isolation
      *  itself is enforced worker-side, not via CLI args. */
     readIsolation?: boolean;
+    /** Hybrid Codex input mode. When set, the codex adapter launches the TUI as
+     *  a client of an external app-server (`--remote <ws>`) and resumes the
+     *  botmux-owned thread, so user input is delivered via JSON-RPC (turn/start)
+     *  instead of a drop-prone tmux paste. Both are set together or neither. */
+    remoteWsUrl?: string;
+    remoteThreadId?: string;
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).

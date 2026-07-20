@@ -35,6 +35,11 @@ export interface TriggerRequest {
   // OUTSIDE envelope so it is never serialized into the untrusted event JSON;
   // the prompt builder renders it as a trusted directive above the event data.
   instruction?: string;
+  /** Trusted presentation chosen by the connector owner. Undefined keeps the
+   * localized default topic seed; null suppresses the seed entirely. */
+  presentation?: {
+    topicMessage?: string | null;
+  };
   options?: {
     dryRun?: boolean;
     dedupKey?: string;
@@ -130,6 +135,18 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   }
   if (typeof envelope.sourceName !== 'string' || envelope.trusted !== false) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'envelope.sourceName is required and envelope.trusted must be false' } };
+  }
+  if (raw.presentation !== undefined) {
+    if (!isRecord(raw.presentation)) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation must be an object' } };
+    }
+    const topicMessage = raw.presentation.topicMessage;
+    if (topicMessage !== undefined && topicMessage !== null && typeof topicMessage !== 'string') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.topicMessage must be a string or null' } };
+    }
+    if (typeof topicMessage === 'string' && (!topicMessage.trim() || Array.from(topicMessage.trim()).length > 200)) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.topicMessage must contain 1 to 200 characters' } };
+    }
   }
   if (waitForFinalOutput && target.kind !== 'turn') {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'waitForFinalOutput is only supported for turn targets' } };
