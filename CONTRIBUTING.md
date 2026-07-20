@@ -177,9 +177,22 @@ pnpm test:all            # Unit + E2E (needs real CLIs / browser session)
 pnpm test:e2e            # All *.e2e.ts (sequential)
 pnpm test:codex          # Codex input E2E
 pnpm test:gemini         # Gemini CLI input E2E
+pnpm test:dashboard-update          # Isolated Dashboard rollback/update round trip
+pnpm test:dashboard-update -- --real  # Same check with a real historical npm package
+pnpm test:dashboard-update -- --serve # Keep the isolated fixture lab open for UI testing
 pnpm test:bench          # Benchmark the unit suite (see docs/test-benchmark.md)
 pnpm test:bench --compare   # serial vs parallel vs parallel+time-scale table
 ```
+
+The Dashboard update integration test is opt-in and requires npm registry
+access. The default mode builds two temporary package versions; `--real`
+executes the published historical package with the current user's permissions,
+so its configuration isolation is not an OS sandbox. Both modes run only the
+Dashboard with an isolated `HOME`, npm prefix/cache, `PM2_HOME`, data directory,
+PATH and loopback port, then clean up automatically. `--serve`
+prints a one-time local URL and keeps the lab running until Ctrl-C; if the
+process is interrupted, run `node scripts/dashboard-update-itest.mjs --down`
+to remove the marked lab directory safely.
 
 > **Speed knob:** adapter `writeInput()` waits real wall-clock time to confirm a
 > submit (poll the CLI history/transcript). `BOTMUX_TIME_SCALE` (read by
