@@ -790,6 +790,32 @@ describe('parseEventMessage: parentId surfacing', () => {
   });
 });
 
+describe('parseEventMessage: shared resource numbering', () => {
+  const makeImageEvent = (messageId: string, imageKey: string) => ({
+    sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+    message: {
+      message_id: messageId,
+      message_type: 'image',
+      content: JSON.stringify({ image_key: imageKey }),
+      chat_id: 'oc_chat',
+      chat_type: 'group',
+      create_time: '1000',
+    },
+  });
+
+  it('continues numbering and deduplicates resources across paired events', () => {
+    const numberer = createImgNumberer();
+    const first = parseEventMessage(makeImageEvent('om_first', 'img_a'), numberer);
+    const second = parseEventMessage(makeImageEvent('om_second', 'img_b'), numberer);
+    const duplicate = parseEventMessage(makeImageEvent('om_third', 'img_a'), numberer);
+
+    expect(first.parsed.content).toBe('[图片 1]');
+    expect(second.parsed.content).toBe('[图片 2]');
+    expect(duplicate.parsed.content).toBe('[图片 1]');
+    expect(duplicate.resources).toEqual([]);
+  });
+});
+
 // ─── mentionOpenId: tolerate both Lark mention.id shapes ──────────────────
 //
 // WS event (im.message.receive_v1) → id is an OBJECT { open_id, ... }.
