@@ -941,10 +941,13 @@ function SkillsPage() {
 
   // Translate the backend's terse install error codes into actionable messages.
   // agentbuddy runs on the deploy host, so its failures (missing CLI, not logged
-  // in) need host-side guidance the operator can act on. Non-agentbuddy codes
-  // fall through unchanged.
+  // in) need host-side guidance the operator can act on. Git authentication
+  // failures get equivalent host-side guidance; other codes fall through.
   function mapInstallError(raw: string): string {
     const msg = raw || '';
+    if (msg.startsWith('skill_git_command_failed') && /authentication failed|could not read username|repository not found|unauthor|\b401\b|\b403\b/i.test(msg)) {
+      return tr('skills.gitNeedsAuth');
+    }
     if (msg.startsWith('agentbuddy_not_found')) return tr('skills.agentbuddyNotFound');
     if (msg.startsWith('agentbuddy_command_failed')) {
       return /login|credential|unauthor|not logged|401|403/i.test(msg)

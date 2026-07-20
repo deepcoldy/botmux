@@ -73,9 +73,12 @@ botmux skills install github:acme/agent-skills/skills/deploy-runbook
 botmux skills install github:acme/agent-skills --path skills/deploy-runbook --ref main
 ```
 
-私有仓库认证交给系统 Git 凭证、SSH agent 或 `gh auth`。botmux 不保存 GitHub token；带 username/password/token 的 HTTPS Git URL 会被拒绝，避免凭证进入 registry 或 Dashboard。
+私有仓库可复用部署机已有权限：GitHub HTTPS 来源依次读取进程或 `~/.botmux/.env` 中的 `GITHUB_TOKEN` / `GH_TOKEN`、当前 `gh auth` 账号；若注入的 token 鉴权失败，会先去掉临时请求头，让公开仓库匿名访问或系统 Git credential helper 接管，仍为鉴权失败时才自动改用 SSH URL 重试。显式 `git@github.com:owner/repo.git` 来源也直接使用 SSH agent/key。botmux 只把 HTTPS token 作为限定到 `github.com` 的临时 Git 请求头，不写入 URL、命令行或 registry；带 username/password/token 的 HTTPS Git URL 会被拒绝，避免凭证进入 Dashboard 和错误日志。
 Git/GitHub 的 `--path` 必须是仓库内相对路径；绝对路径、`..` segment 或解析到 checkout 外部的 symlink 会被拒绝。
 Git 安装/更新会给底层 Git 命令设置超时，默认 60 秒；需要更长时间时可设置 `BOTMUX_SKILL_GIT_TIMEOUT_MS`。
+Dashboard/CLI 的 Git `discover` 使用一次性 checkout，扫描结束即删除；只有实际安装/更新的来源保留在 `~/.botmux/skills/sources`，避免预览 URL 与最终安装 URL 不同时留下两份长期缓存。
+
+Dashboard 安装/更新 job 完成后会通过现有 logger 写入 `[skills:audit]` 静态审计摘要，包括来源类型、commit、版本、文件/目录/symlink/字节数、相对可执行文件路径与 shebang runtime。审计不记录来源 URL 或绝对路径，也不会执行 Skill 的安装脚本、二进制或测试；失败 job 记录脱敏后的错误。
 
 ### 制品仓库（agentbuddy）
 
