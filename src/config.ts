@@ -17,9 +17,13 @@ function getLocalIp(): string {
   return 'localhost';
 }
 
-const configuredWebExternalHost = process.env.WEB_EXTERNAL_HOST;
+function nonBlankHost(value: string | undefined): string | undefined {
+  return value?.trim() || undefined;
+}
+
+const configuredWebExternalHost = nonBlankHost(process.env.WEB_EXTERNAL_HOST);
 const configuredDashboardExternalHost =
-  process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST ?? process.env.WEB_EXTERNAL_HOST;
+  nonBlankHost(process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST) ?? configuredWebExternalHost;
 
 export function getWebExternalHost(): string {
   return configuredWebExternalHost ?? getLocalIp();

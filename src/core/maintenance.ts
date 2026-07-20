@@ -243,6 +243,15 @@ export function buildRestartLauncher(
   return { cmd: node, args: [cliEntry, 'restart'] };
 }
 
+export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...inheritedEnv };
+  // The dashboard/daemon snapshot may outlive a ~/.botmux/.env edit. Let the
+  // fresh lifecycle CLI resolve these two settings from the file again.
+  delete env.WEB_EXTERNAL_HOST;
+  delete env.BOTMUX_DASHBOARD_EXTERNAL_HOST;
+  return env;
+}
+
 function setsidAvailable(): boolean {
   try {
     execSync('command -v setsid', { stdio: 'ignore' });
@@ -281,7 +290,7 @@ export function spawnDetachedRestart(
     detached: true,
     stdio: fd !== undefined ? ['ignore', fd, fd] : 'ignore',
     env: {
-      ...process.env,
+      ...detachedRestartEnv(),
       ...(restartLeaseId ? {
         BOTMUX_RESTART_LEASE_ID: restartLeaseId,
         BOTMUX_RESTART_LEASE_DIR: config.session.dataDir,

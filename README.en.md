@@ -228,6 +228,7 @@ Each conversation turn gets a live-updating Feishu card — your main window for
 
 Each session exposes a web terminal at `http://<WEB_EXTERNAL_HOST>:<port>`.
 
+- When `WEB_EXTERNAL_HOST` is unset or blank, start/restart auto-detects the current non-loopback IPv4 address. To pin a proxy, NAT address, or hostname, set it explicitly in `~/.botmux/.env`. Restarts launched from a botmux session, the Dashboard, or auto-update treat that file as authoritative so the old daemon address cannot leak into the new processes.
 - **Read-only link** — shown on the streaming card in the group thread
 - **Write-enabled link** — sent via DM on demand (click "Get Write Link" on the card)
 

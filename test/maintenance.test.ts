@@ -7,6 +7,7 @@ import {
   readMaintenanceStateTo,
   writeMaintenanceStateTo,
   buildRestartLauncher,
+  detachedRestartEnv,
   maintenanceRestartLogPath,
   globalInstallUpdateCwd,
   spawnDetachedRestart,
@@ -188,6 +189,19 @@ describe('buildRestartLauncher', () => {
 
   it('falls back to a plain detached node spawn when setsid is unavailable', () => {
     expect(buildRestartLauncher(NODE, CLI, false)).toEqual({ cmd: NODE, args: [CLI, 'restart'] });
+  });
+});
+
+describe('detachedRestartEnv', () => {
+  it('drops runtime host snapshots before launching a managed restart', () => {
+    const inherited = {
+      WEB_EXTERNAL_HOST: '10.255.64.131',
+      BOTMUX_DASHBOARD_EXTERNAL_HOST: '10.255.64.131',
+      PATH: '/usr/bin',
+    };
+
+    expect(detachedRestartEnv(inherited)).toEqual({ PATH: '/usr/bin' });
+    expect(inherited.WEB_EXTERNAL_HOST).toBe('10.255.64.131');
   });
 });
 
