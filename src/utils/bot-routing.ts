@@ -139,7 +139,7 @@ export function stripCodeSpans(text: string): string {
  * default addressing (owner / oncall last-caller) is unchanged.
  */
 export function buildFooterAddressing(
-  s: { ownerOpenId?: string; lastCallerOpenId?: string },
+  s: { ownerOpenId?: string; lastCallerOpenId?: string; lastCallerIsBot?: boolean },
   opts: {
     isOncall: boolean;
     isSubstitute?: boolean;
@@ -159,7 +159,7 @@ export function buildFooterAddressing(
   if (!opts.isOncall && !opts.isSubstitute) return { sendTo: ownerHuman, cc: [] };
 
   const caller = s.lastCallerOpenId ?? owner;
-  const callerIsBot = !!caller && botIds.has(caller);
+  const callerIsBot = !!caller && (s.lastCallerIsBot === true || botIds.has(caller));
 
   // Oncall + last caller is a bot (but this reply itself has no explicit bot
   // target) → fall back to the human owner rather than pinging the bot caller.

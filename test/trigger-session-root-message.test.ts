@@ -29,9 +29,11 @@ vi.mock('../src/services/oncall-store.js', () => ({
 
 const mockCreateSession = vi.fn();
 const mockUpdateSession = vi.fn();
+const mockCloseSession = vi.fn();
 vi.mock('../src/services/session-store.js', () => ({
   createSession: (...args: any[]) => mockCreateSession(...args),
   updateSession: (...args: any[]) => mockUpdateSession(...args),
+  closeSession: (...args: any[]) => mockCloseSession(...args),
 }));
 
 vi.mock('../src/services/message-queue.js', () => ({
@@ -39,10 +41,18 @@ vi.mock('../src/services/message-queue.js', () => ({
 }));
 
 const mockForkWorker = vi.fn();
+const mockQueuedTailAdmission = vi.fn();
+const activeKeyLocks = vi.hoisted(() => ({
+  byMap: new WeakMap<Map<string, any>, Map<string, Promise<void>>>(),
+}));
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: (...args: any[]) => mockForkWorker(...args),
   sendWorkerInput: (ds: any, payload: any, turnId?: string, opts: any = {}) => {
     if (!ds.worker || ds.worker.killed) return false;
+    const gated = ds.session.queuedActivationPending === true
+      || (ds.session.queuedActivationTail?.length ?? 0) > 0
+      || (ds.initialStartPending === true && ds.session.queuedActivationInput !== undefined);
+    if (gated) return mockQueuedTailAdmission(ds, payload, turnId, opts);
     ds.worker.send({
       type: 'message',
       content: typeof payload === 'string' ? payload : payload.content,
@@ -56,10 +66,32 @@ vi.mock('../src/core/worker-pool.js', () => ({
     });
     return true;
   },
+  hasQueuedActivationAdmissionGate: (ds: any) => ds.session.queuedActivationPending === true
+    || (ds.session.queuedActivationTail?.length ?? 0) > 0
+    || (ds.initialStartPending === true && ds.session.queuedActivationInput !== undefined),
   getCurrentCliVersion: vi.fn(() => 'test-cli-version'),
+  withActiveSessionKeyLock: vi.fn(async (map: Map<string, any>, key: string, action: () => any) => {
+    let locks = activeKeyLocks.byMap.get(map);
+    if (!locks) {
+      locks = new Map();
+      activeKeyLocks.byMap.set(map, locks);
+    }
+    const previous = locks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const tail = previous.catch(() => {}).then(() => hold);
+    locks.set(key, tail);
+    await previous.catch(() => {});
+    try { return await action(); }
+    finally {
+      release();
+      if (locks.get(key) === tail) locks.delete(key);
+    }
+  }),
 }));
 
 const mockRememberLastCliInput = vi.fn();
+const mockGetAvailableBots = vi.fn(async () => []);
 const mockBuildFollowUpCliInput = vi.fn((prompt: string, _sessionId?: string, opts?: any) => ({
   content: `follow:${prompt}`,
   codexAppInput: opts?.cliId === 'codex-app' && opts?.codexAppText ? { text: opts.codexAppText } : undefined,
@@ -74,7 +106,7 @@ vi.mock('../src/core/session-manager.js', () => ({
   buildNewTopicPrompt: vi.fn((prompt: string) => `new:${prompt}`),
   buildNewTopicCliInput: (...args: any[]) => mockBuildNewTopicCliInput(...args),
   ensureSessionWhiteboard: vi.fn(),
-  getAvailableBots: vi.fn(async () => []),
+  getAvailableBots: (...args: any[]) => mockGetAvailableBots(...args),
   rememberLastCliInput: (...args: any[]) => mockRememberLastCliInput(...args),
 }));
 
@@ -90,6 +122,7 @@ vi.mock('../src/im/lark/card-handler.js', () => ({
 
 import { buildExternalEventTopicMessage, triggerSessionTurn } from '../src/core/trigger-session.js';
 import { sessionKey } from '../src/core/types.js';
+import { withActiveSessionKeyLock } from '../src/core/worker-pool.js';
 
 const APP = 'app1';
 const CHAT = 'oc_root_chat';
@@ -136,6 +169,25 @@ describe('triggerSessionTurn rootMessageId target', () => {
       botOpenId: 'ou_bot',
     });
     mockGetMessageChatId.mockResolvedValue(CHAT);
+    mockQueuedTailAdmission.mockImplementation((ds: any, payload: any, turnId?: string, opts: any = {}) => {
+      const order = (ds.session.queuedActivationTailNextOrder ?? 0) + 1;
+      ds.session.queuedActivationTailNextOrder = order;
+      ds.session.queuedActivationTail = [
+        ...(ds.session.queuedActivationTail ?? []),
+        {
+          id: `tail-${order}`,
+          order,
+          userPrompt: typeof payload === 'string' ? payload : payload.content,
+          cliInput: typeof payload === 'string' ? { content: payload } : payload,
+          turnId: turnId ?? `tail-turn-${order}`,
+          ...(opts.dispatchAttempt !== undefined
+            ? { dispatchAttempt: opts.dispatchAttempt }
+            : {}),
+        },
+      ];
+      mockUpdateSession(ds.session);
+      return true;
+    });
     mockCreateSession.mockImplementation((chatId: string, rootMessageId: string, title: string, chatType: 'group' | 'p2p') => ({
       sessionId: 'sess_new',
       chatId,
@@ -222,6 +274,126 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockCreateSession).not.toHaveBeenCalled();
     expect(mockForkWorker).not.toHaveBeenCalled();
     expect(send).toHaveBeenCalledWith({ type: 'message', content: expect.stringContaining('follow:') });
+  });
+
+  it.each([
+    ['normal opening', undefined],
+    ['raw text-to-Enter opening', '/goal OPENING_RAW_N'],
+  ])('durably queues an external trigger behind a live %s activation', async (_label, pendingRawInput) => {
+    const send = vi.fn();
+    const ds = existingDs({
+      worker: { killed: false, send } as any,
+      initialStartPending: true,
+      ...(pendingRawInput ? { pendingRawInput } : {}),
+    });
+    Object.assign(ds.session, {
+      cliId: 'claude-code',
+      queuedActivationPending: true,
+      queuedActivationToken: 'opening-token',
+      queuedActivationInput: { content: pendingRawInput ? '' : 'OPENING_N' },
+      queuedActivationTurnId: 'turn-opening',
+    });
+    const beforeDispatch = vi.fn(() => ({ dispatchAttempt: 4 }));
+
+    const res = await triggerSessionTurn(
+      request(),
+      { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+      { stableTurnId: 'external-follower-n1', beforeDispatch },
+    );
+
+    expect(res).toMatchObject({
+      ok: true,
+      triggerId: 'external-follower-n1',
+      action: 'queued',
+    });
+    expect(send).not.toHaveBeenCalled();
+    expect(mockQueuedTailAdmission).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ content: expect.stringContaining('follow:') }),
+      'external-follower-n1',
+      { dispatchAttempt: 4 },
+    );
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({
+        turnId: 'external-follower-n1',
+        dispatchAttempt: 4,
+        cliInput: expect.objectContaining({ content: expect.stringContaining('follow:') }),
+      }),
+    ]);
+    expect(mockRememberLastCliInput).toHaveBeenCalled();
+  });
+
+  it('reports failure and does not send or persist input history when gated tail admission fails', async () => {
+    const send = vi.fn();
+    const ds = existingDs({
+      worker: { killed: false, send } as any,
+      initialStartPending: true,
+    });
+    Object.assign(ds.session, {
+      cliId: 'claude-code',
+      queuedActivationPending: true,
+      queuedActivationToken: 'opening-token',
+      queuedActivationInput: { content: 'OPENING_N' },
+    });
+    mockQueuedTailAdmission.mockReturnValueOnce(false);
+
+    const res = await triggerSessionTurn(request(), {
+      larkAppId: APP,
+      activeSessions: new Map([[sessionKey(ROOT, APP), ds]]),
+    });
+
+    expect(res).toMatchObject({ ok: false, errorCode: 'trigger_failed' });
+    expect(send).not.toHaveBeenCalled();
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(mockRememberLastCliInput).not.toHaveBeenCalled();
+  });
+
+  it('does not report delivery or persist input while a retained Riff abort fence is active', async () => {
+    const send = vi.fn();
+    const ds = existingDs({
+      worker: { killed: false, send } as any,
+      riffShutdownState: {
+        phase: 'preparing',
+        requestId: 'shutdown-abort-awaiting-ack',
+        taskId: 'task-current',
+      },
+    });
+    const res = await triggerSessionTurn(request(), {
+      larkAppId: APP,
+      activeSessions: new Map([[sessionKey(ROOT, APP), ds]]),
+    });
+
+    expect(res).toMatchObject({
+      ok: false,
+      errorCode: 'trigger_failed',
+      error: expect.stringContaining('shutdown-preparing'),
+    });
+    expect(send).not.toHaveBeenCalled();
+    expect(mockRememberLastCliInput).not.toHaveBeenCalled();
+  });
+
+  it('does not refork or ACK a trigger after the exact fenced worker has exited', async () => {
+    const ds = existingDs({
+      worker: null,
+      riffShutdownState: {
+        phase: 'prepared',
+        requestId: 'shutdown-worker-exited',
+        taskId: 'task-drained-unverified',
+      },
+    });
+    const res = await triggerSessionTurn(request(), {
+      larkAppId: APP,
+      activeSessions: new Map([[sessionKey(ROOT, APP), ds]]),
+    });
+
+    expect(res).toMatchObject({
+      ok: false,
+      errorCode: 'trigger_failed',
+      error: expect.stringContaining('shutdown-prepared'),
+    });
+    expect(mockForkWorker).not.toHaveBeenCalled();
+    expect(mockRememberLastCliInput).not.toHaveBeenCalled();
+    expect(ds.riffShutdownState).toMatchObject({ requestId: 'shutdown-worker-exited' });
   });
 
   it('uses an internal stable turn id without changing the public trigger schema', async () => {
@@ -334,6 +506,31 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('follow:') }, { resume: true, turnId: expect.stringMatching(/^trg_/) });
   });
 
+  it('fails closed for a dormant ledger-only owner instead of reforking over it', async () => {
+    const ds = existingDs();
+    ds.session.cliId = 'codex-app';
+    ds.session.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-owned',
+      turnId: 'turn-owned',
+      state: 'prepared',
+      content: 'durable existing turn',
+      deliverySink: 'lark',
+    }];
+
+    const res = await triggerSessionTurn(request(), {
+      larkAppId: APP,
+      activeSessions: new Map([[sessionKey(ROOT, APP), ds]]),
+    });
+
+    expect(res).toMatchObject({
+      ok: false,
+      errorCode: 'trigger_failed',
+      error: expect.stringContaining('durable_owner'),
+    });
+    expect(mockForkWorker).not.toHaveBeenCalled();
+    expect(mockRememberLastCliInput).not.toHaveBeenCalled();
+  });
+
   it('preserves the clean split when an external event reforks a stopped Codex App session', async () => {
     mockGetBot.mockReturnValue({
       config: { larkAppId: APP, cliId: 'codex-app', codexAppCleanInput: true, workingDir: '/tmp' },
@@ -377,6 +574,37 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(ds?.pendingCodexAppMessageContext).toContain('<botmux_external_event trusted="false">');
     expect(ds?.pendingCodexAppMessageContext).not.toContain('Inspect the alert.');
     expect(mockRunAutoWorktreeCommit).toHaveBeenCalledWith(expect.objectContaining({ ds }));
+  });
+
+  it('closes the unpublished trigger row when auto-worktree setup persistence fails', async () => {
+    mockBotAutoWorktreeEnabled.mockReturnValue(true);
+    mockUpdateSession
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => { throw new Error('setup store unavailable'); });
+    const activeSessions = new Map<string, DaemonSession>();
+
+    await expect(triggerSessionTurn(request(), { larkAppId: APP, activeSessions }))
+      .rejects.toThrow('setup store unavailable');
+
+    expect(activeSessions.has(sessionKey(ROOT, APP))).toBe(false);
+    expect(mockCloseSession).toHaveBeenCalledTimes(1);
+    expect(mockCloseSession).toHaveBeenCalledWith('sess_new');
+    expect(mockRunAutoWorktreeCommit).not.toHaveBeenCalled();
+    expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+
+  it('never closes an incumbent when the trigger creation path loses the key claim', async () => {
+    mockBotAutoWorktreeEnabled.mockReturnValue(true);
+    const send = vi.fn();
+    const incumbent = existingDs({ worker: { killed: false, send } as any });
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), incumbent]]);
+
+    const result = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions });
+
+    expect(result).toMatchObject({ ok: true, target: { sessionId: incumbent.session.sessionId } });
+    expect(activeSessions.get(sessionKey(ROOT, APP))).toBe(incumbent);
+    expect(mockCloseSession).not.toHaveBeenCalled();
+    expect(mockCreateSession).not.toHaveBeenCalled();
   });
 
   it('passes the clean split into a new Codex App session without worktree staging', async () => {
@@ -475,6 +703,72 @@ describe('triggerSessionTurn rootMessageId target', () => {
     waiter.resolve('done');
     await expect(promise).resolves.toMatchObject({ ok: true, action: 'completed', output: { content: 'done' } });
     expect(mockCreateSession).not.toHaveBeenCalled();
+  });
+
+  it('shares first-owner locking with a paused resume claim and reuses the resume winner', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    const key = sessionKey(ROOT, APP);
+    const resumed = existingDs();
+    resumed.session.cliId = 'claude-code';
+    let resumeEntered!: () => void;
+    let releaseResume!: () => void;
+    const entered = new Promise<void>(resolve => { resumeEntered = resolve; });
+    const paused = new Promise<void>(resolve => { releaseResume = resolve; });
+
+    const resumeClaim = withActiveSessionKeyLock(activeSessions, key, async () => {
+      expect(activeSessions.has(key)).toBe(false);
+      resumeEntered();
+      await paused;
+      activeSessions.set(key, resumed);
+    });
+    await entered;
+
+    const triggering = triggerSessionTurn(request(), { larkAppId: APP, activeSessions });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(mockCreateSession).not.toHaveBeenCalled();
+
+    releaseResume();
+    await resumeClaim;
+    const result = await triggering;
+
+    expect(result).toMatchObject({ ok: true, target: { sessionId: 'sess_existing' } });
+    expect(activeSessions.get(key)).toBe(resumed);
+    expect(mockCreateSession).not.toHaveBeenCalled();
+    expect(mockForkWorker).toHaveBeenCalledWith(resumed, expect.anything(), expect.objectContaining({ resume: true }));
+  });
+
+  it('keeps the opening reservation and buffers when new-session fork pre-accept throws', async () => {
+    mockForkWorker.mockImplementationOnce(() => { throw new Error('fork preaccept failed'); });
+    const activeSessions = new Map<string, DaemonSession>();
+
+    await expect(triggerSessionTurn(request(), { larkAppId: APP, activeSessions }))
+      .rejects.toThrow('fork preaccept failed');
+
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.initialStartPending).toBe(true);
+    expect(ds?.pendingPrompt).toContain('<botmux_external_event trusted="false">');
+    expect(ds?.pendingCodexAppText).toBe('外部事件触发');
+  });
+
+  it('cleans the wait registry but retains the opening reservation when write-ahead throws', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    const req = request();
+    req.options = { waitForFinalOutput: true, timeoutMs: 1000 };
+
+    const result = await triggerSessionTurn(
+      req,
+      { larkAppId: APP, activeSessions },
+      {
+        stableTurnId: 'stable_write_ahead_failure',
+        beforeDispatch: () => { throw new Error('write-ahead failed'); },
+      },
+    );
+
+    expect(result).toMatchObject({ ok: false, errorCode: 'trigger_failed', error: 'write-ahead failed' });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.initialStartPending).toBe(true);
+    expect(ds?.pendingWaitPromises?.size ?? 0).toBe(0);
+    expect(mockForkWorker).not.toHaveBeenCalled();
   });
 
   it('requires chatId when rootMessageId is specified', async () => {

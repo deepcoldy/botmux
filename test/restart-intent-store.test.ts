@@ -11,6 +11,11 @@ import {
   clearRestartLeaseTo,
   hasActiveRestartLeaseTo,
   writeManualIntentIfAbsentTo,
+  writeRestartAttemptIntentTo,
+  commitRestartIntentAttemptTo,
+  claimRestartIntentForReportTo,
+  hasPreparedRestartIntentTo,
+  removeRestartIntentAttemptTo,
   restartIntentPathIn,
 } from '../src/services/restart-intent-store.js';
 
@@ -101,6 +106,96 @@ describe('restart-intent store', () => {
   it('tolerates corrupt JSON (consume returns null and removes the file)', () => {
     writeFileSync(restartIntentPathIn(dir), '{bad json');
     expect(consumeRestartIntentTo(dir, T0)).toBeNull();
+    expect(existsSync(restartIntentPathIn(dir))).toBe(false);
+  });
+
+  it('rolls back only the exact failed start attempt and preserves a newer writer', () => {
+    writeRestartAttemptIntentTo(
+      dir,
+      { kind: 'manual', at: iso(T0) },
+      T0,
+      'attempt-old',
+    );
+    expect(removeRestartIntentAttemptTo(dir, 'attempt-old')).toBe(true);
+    expect(existsSync(restartIntentPathIn(dir))).toBe(true);
+    expect(consumeRestartIntentTo(dir, T0 + 500)).toBeNull();
+
+    writeRestartAttemptIntentTo(
+      dir,
+      { kind: 'manual', at: iso(T0) },
+      T0,
+      'attempt-old',
+    );
+    writeRestartIntentTo(dir, {
+      kind: 'update', oldVersion: '1', newVersion: '2', at: iso(T0 + 1_000),
+    });
+    // The newer writer is deferred behind the prepared fence. Aborting the
+    // partial start keeps it non-consumable until a later verified restart.
+    expect(consumeRestartIntentTo(dir, T0 + 1_500)).toBeNull();
+    expect(removeRestartIntentAttemptTo(dir, 'attempt-old')).toBe(true);
+    expect(consumeRestartIntentTo(dir, T0 + 2_000)).toBeNull();
+    expect(hasPreparedRestartIntentTo(dir, T0 + 2_000)).toBe(false);
+
+    writeRestartAttemptIntentTo(
+      dir,
+      { kind: 'manual', at: iso(T0 + 2_000) },
+      T0 + 2_000,
+      'attempt-new',
+    );
+    expect(commitRestartIntentAttemptTo(dir, 'attempt-new')).toBe(true);
+    expect(consumeRestartIntentTo(dir, T0 + 3_000)).toMatchObject({
+      kind: 'update', oldVersion: '1', newVersion: '2',
+    });
+  });
+
+  it('does not expose a prepared restart until the exact attempt commits', () => {
+    writeRestartAttemptIntentTo(
+      dir,
+      { kind: 'manual', at: iso(T0) },
+      T0,
+      'attempt-verified',
+    );
+    expect(hasPreparedRestartIntentTo(dir, T0 + 1_000)).toBe(true);
+    expect(consumeRestartIntentTo(dir, T0 + 1_000)).toBeNull();
+    expect(existsSync(restartIntentPathIn(dir))).toBe(true);
+
+    expect(commitRestartIntentAttemptTo(dir, 'wrong-attempt')).toBe(false);
+    expect(commitRestartIntentAttemptTo(dir, 'attempt-verified')).toBe(true);
+    expect(hasPreparedRestartIntentTo(dir, T0 + 2_000)).toBe(false);
+    expect(consumeRestartIntentTo(dir, T0 + 2_000)).toMatchObject({
+      kind: 'manual',
+      attemptId: 'attempt-verified',
+      attemptState: 'committed',
+    });
+  });
+
+  it('atomically claims a commit that lands after a prepared observation', () => {
+    writeRestartAttemptIntentTo(
+      dir,
+      { kind: 'manual', at: iso(T0) },
+      T0,
+      'attempt-racy-commit',
+    );
+    expect(claimRestartIntentForReportTo(dir, T0 + 1_000)).toEqual({ state: 'prepared' });
+
+    // This is the old consume(prepared)->commit->hasPrepared(false) gap. The
+    // next operation now observes+claims committed under one lock.
+    expect(commitRestartIntentAttemptTo(dir, 'attempt-racy-commit')).toBe(true);
+    expect(claimRestartIntentForReportTo(dir, T0 + 1_001)).toMatchObject({
+      state: 'claimed',
+      intent: { attemptId: 'attempt-racy-commit', attemptState: 'committed' },
+    });
+    expect(existsSync(restartIntentPathIn(dir))).toBe(false);
+  });
+
+  it('expires an abandoned prepared attempt without ever reporting it', () => {
+    writeRestartAttemptIntentTo(
+      dir,
+      { kind: 'manual', at: iso(T0) },
+      T0,
+      'attempt-crashed-cli',
+    );
+    expect(consumeRestartIntentTo(dir, T0 + 11 * 60_000)).toBeNull();
     expect(existsSync(restartIntentPathIn(dir))).toBe(false);
   });
 });

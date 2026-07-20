@@ -43,6 +43,7 @@ function makeDs(over: {
   ownerOpenId?: string;
   adoptedFrom?: any;
   cliId?: string | undefined;
+  backendType?: 'riff' | 'tmux';
   worker?: any;
   scope?: 'thread' | 'chat';
   rootMessageId?: string;
@@ -63,6 +64,7 @@ function makeDs(over: {
       ownerOpenId: over.ownerOpenId ?? OWNER,
       workingDir: '/tmp',
       cliId: 'cliId' in over ? over.cliId : ('claude-code' as any),
+      backendType: over.backendType,
       adoptedFrom: over.adoptedFrom,
     },
     worker: over.worker ?? null,
@@ -124,6 +126,26 @@ describe('collectRelayPickerEntries', () => {
     // Only `keep` survives the filters — despite the others having a much
     // larger lastMessageAt, sort runs AFTER selection.
     expect(entries.map(e => e.sessionId)).toEqual(['keep']);
+  });
+
+  it('does not offer Riff sessions whose remote reply route cannot be retargeted', async () => {
+    const local = makeDs({ sessionId: 'local', chatId: 'oc_local', lastMessageAt: 100 });
+    const riff = makeDs({
+      sessionId: 'riff',
+      chatId: 'oc_riff',
+      lastMessageAt: 9_999,
+      cliId: 'riff',
+      backendType: 'riff',
+    });
+
+    const entries = await collectRelayPickerEntries(
+      registryOf(riff, local),
+      APP,
+      CURRENT_CHAT,
+      OWNER,
+    );
+
+    expect(entries.map(entry => entry.sessionId)).toEqual(['local']);
   });
 
   it('excludes by ANCHOR, not chatId — same-chat other-topic sessions stay in candidates', async () => {

@@ -1,6 +1,7 @@
 import type { DaemonSession } from './types.js';
 import { suspendWorker } from './worker-pool.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
+import { runDetachedBotTurnMutation } from './bot-turn-mutation-gate.js';
 
 /**
  * Default per-bot live-session cap applied when a bot has no explicit
@@ -79,4 +80,23 @@ export function sweepIdleWorkers(
     liveCount--;
   }
   return suspended;
+}
+
+/**
+ * Run a cap sweep only after every already-admitted inbound turn has either
+ * durably accepted its input or finished.  A worker spawn can put the bot over
+ * cap while another handler is paused in sender/reaction setup, before that
+ * handler has changed its screen status or dispatch ledger.  A synchronous
+ * sweep could otherwise mistake that handler's worker for idle, suspend it,
+ * and make the subsequent send fail before acceptance.
+ *
+ * This is deliberately a detached mutation.  Spawn/idle callbacks commonly
+ * run inside an admission and must not await the drain of their own lease.
+ */
+export function sweepIdleWorkersAfterTurnDrain(
+  larkAppId: string,
+  activeSessions: Map<string, DaemonSession>,
+  opts: IdleWorkerSweepOptions = {},
+): Promise<IdleWorkerSweepResult[]> {
+  return runDetachedBotTurnMutation(larkAppId, () => sweepIdleWorkers(activeSessions, opts));
 }

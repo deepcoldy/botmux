@@ -170,6 +170,105 @@ describe('RiffBackend', () => {
     });
   });
 
+  describe('graceful shutdown detach drain', () => {
+    it('fences new writes, waits for a slow create, returns its exact id, and never cancels or streams it', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const ids: Array<string | null> = [];
+      be.onTaskId(id => ids.push(id));
+      be.spawn('', [], {} as any);
+      be.write('opening turn');
+      await flush();
+
+      let settled = false;
+      const prepare = be.prepareShutdownDetach().then(result => {
+        settled = true;
+        return result;
+      });
+      await flush();
+      expect(settled).toBe(false);
+
+      // This write arrived after the shutdown fence and must not extend the
+      // drain or create a new remote task.
+      be.write('must be rejected');
+      resolvers.shift()!(taskResponse('task-shutdown-late'));
+      const result = await prepare;
+
+      expect(result).toEqual({ ok: true, taskId: 'task-shutdown-late' });
+      expect(ids).toEqual(['task-shutdown-late']);
+      expect(calls.filter(c => c.url.includes('/api/task-execute')).length).toBe(1);
+      expect(calls.filter(c => c.url.includes('/api/task-follow-up')).length).toBe(0);
+      expect(calls.filter(c => c.url.includes('/api/task-cancel')).length).toBe(0);
+      expect(calls.filter(c => c.url.includes('/api2/task-stream')).length).toBe(0);
+    });
+
+    it('drains two writes accepted before the fence and reports the newest child lineage', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const ids: Array<string | null> = [];
+      be.onTaskId(id => ids.push(id));
+      be.write('first accepted write');
+      be.write('second accepted write');
+      await flush();
+
+      const prepare = be.prepareShutdownDetach();
+      resolvers.shift()!(taskResponse('task-drain-1'));
+      await flush();
+      const follow = calls.find(c => c.url.includes('/api/task-follow-up'));
+      expect(follow).toBeDefined();
+      expect(JSON.parse(String(follow!.init?.body)).parentTaskId).toBe('task-drain-1');
+      resolvers.shift()!(taskResponse('task-drain-2'));
+
+      await expect(prepare).resolves.toEqual({ ok: true, taskId: 'task-drain-2' });
+      expect(ids).toEqual(['task-drain-1', 'task-drain-2']);
+      expect(calls.filter(c => c.url.includes('/api/task-cancel')).length).toBe(0);
+      expect(calls.filter(c => c.url.includes('/api2/task-stream')).length).toBe(0);
+    });
+
+    it('abort restores admission and reconnects the exact drained task', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      be.write('opening turn');
+      await flush();
+      const prepare = be.prepareShutdownDetach();
+      resolvers.shift()!(taskResponse('task-abort-resume'));
+      await expect(prepare).resolves.toEqual({ ok: true, taskId: 'task-abort-resume' });
+      expect(calls.filter(c => c.url.includes('/api2/task-stream')).length).toBe(0);
+
+      await be.abortShutdownDetach();
+      await flush();
+      expect(calls.filter(c => c.url.includes('/api2/task-stream?id=task-abort-resume')).length).toBe(1);
+
+      be.write('follow-up after aborted shutdown');
+      await flush();
+      expect(calls.filter(c => c.url.includes('/api/task-follow-up')).length).toBe(1);
+    });
+
+    it('abort invalidates a still-draining prepare and restores admission only after it settles', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      be.write('accepted before shutdown');
+      await flush();
+
+      const prepare = be.prepareShutdownDetach();
+      let abortSettled = false;
+      const abort = be.abortShutdownDetach().then(result => {
+        abortSettled = true;
+        return result;
+      });
+      await flush();
+      expect(abortSettled).toBe(false);
+      expect((be as any).shutdownDetaching).toBe(true);
+
+      resolvers.shift()!(taskResponse('task-abort-during-drain'));
+      await expect(prepare).resolves.toEqual({
+        ok: false,
+        taskId: 'task-abort-during-drain',
+        error: 'shutdown_detach_aborted',
+      });
+      await expect(abort).resolves.toEqual({ ok: true, taskId: 'task-abort-during-drain' });
+      expect((be as any).shutdownDetachPrepared).toBe(false);
+      expect((be as any).shutdownDetaching).toBe(false);
+      expect(calls.filter(c => c.url.includes('/api/task-cancel'))).toHaveLength(0);
+    });
+  });
+
   describe('SSE clean EOF without done (finding C)', () => {
     it('treats a clean EOF with no done event as a stream failure — session must not stay busy forever', async () => {
       const be = makeBackend({ injectStatusLines: false });
@@ -515,7 +614,10 @@ describe('RiffBackend', () => {
       expect(cancels.length).toBeGreaterThanOrEqual(1);
       expect(JSON.parse(String(cancels[cancels.length - 1]!.init?.body ?? '{}')).id ?? JSON.parse(String(cancels[0]!.init?.body)).id).toBe('task-late');
       expect(calls.filter(c => c.url.includes('/api2/task-stream')).length).toBe(0);
-      expect((be as any).currentTaskId).not.toBe('task-late');
+      // The cancelled child remains the exact lineage anchor until durable
+      // close commit. An abort can therefore continue from it, not its stale
+      // parent; it is still never streamed while prepare is fenced.
+      expect((be as any).currentTaskId).toBe('task-late');
     });
 
     it('close during follow-up: the late follow-up task is cancelled', async () => {
@@ -536,8 +638,141 @@ describe('RiffBackend', () => {
       await destroyP;
       const cancelIds = calls.filter(c => c.url.includes('/api/task-cancel')).map(c => JSON.parse(String(c.init?.body)).id);
       expect(cancelIds).toContain('task-late-2');
-      // late follow-up 不得成为 current，也不得开流
-      expect((be as any).currentTaskId).not.toBe('task-late-2');
+      // Preserve the cancelled child as retry lineage, but never stream it.
+      expect((be as any).currentTaskId).toBe('task-late-2');
+      expect(calls.filter(c => c.url.includes('/api2/task-stream?id=task-late-2')).length).toBe(0);
+    });
+  });
+
+  describe('close prepare / abort / retry state contract', () => {
+    it('restores write admission after cancel failure, then allows a close retry', async () => {
+      const be = makeBackend({ resumeParentTaskId: 'task-parent', injectStatusLines: false });
+      let cancelCalls = 0;
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        calls.push({ url: u, init });
+        if (u.includes('/api/task-cancel')) {
+          cancelCalls++;
+          return cancelCalls <= 2
+            ? new Response('cancel failed', { status: 500 })
+            : Response.json({ success: true, data: {} });
+        }
+        if (u.includes('/api/task-follow-up')) return taskResponse('task-after-failure');
+        if (u.includes('/api2/task-stream')) return pendingSseResponse();
+        if (u.includes('/api/task-detail')) return Response.json({ success: true, data: { task: {} } });
+        return taskResponse('unexpected-create');
+      });
+
+      const failed = await be.destroySession();
+      expect(failed).toMatchObject({ ok: false, taskId: 'task-parent' });
+      expect((be as any).closing).toBe(false);
+
+      be.write('continue after failed close');
+      await flush(); await flush();
+      const follow = calls.find(c => c.url.includes('/api/task-follow-up'));
+      expect(follow).toBeDefined();
+      expect(JSON.parse(String(follow!.init?.body)).parentTaskId).toBe('task-parent');
+
+      const retried = await be.destroySession();
+      expect(retried).toEqual({ ok: true, taskId: 'task-after-failure' });
+    });
+
+    it('aborts a successful prepare without losing a late-created child lineage', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      be.write('opening message');
+      await flush();
+      const preparedP = be.destroySession();
+      resolvers.shift()!(taskResponse('task-late-prepared'));
+      const prepared = await preparedP;
+      expect(prepared).toEqual({ ok: true, taskId: 'task-late-prepared' });
+      expect((be as any).closing).toBe(true);
+
+      await be.abortDestroySession();
+      expect((be as any).closing).toBe(false);
+      be.write('continue after durable commit failure');
+      await flush();
+      const follow = calls.find(c => c.url.includes('/api/task-follow-up'));
+      expect(follow).toBeDefined();
+      expect(JSON.parse(String(follow!.init?.body)).parentTaskId).toBe('task-late-prepared');
+    });
+
+    it('does not reopen admission when close timeout wins during an in-flight cancel', async () => {
+      const be = makeBackend({ resumeParentTaskId: 'task-timeout-parent', injectStatusLines: false });
+      (be as any).destroyDeadlineMs = 10;
+      let resolveCancel!: (response: Response) => void;
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        calls.push({ url: u, init });
+        if (u.includes('/api/task-cancel')) {
+          return new Promise<Response>(resolve => { resolveCancel = resolve; });
+        }
+        if (u.includes('/api/task-follow-up')) return taskResponse('task-after-timeout');
+        if (u.includes('/api2/task-stream')) return pendingSseResponse();
+        if (u.includes('/api/task-detail')) return Response.json({ success: true, data: { task: {} } });
+        return taskResponse('unexpected-create');
+      });
+
+      let settled = false;
+      const closeP = be.destroySession().then(result => { settled = true; return result; });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(settled).toBe(false);
+      be.write('must remain fenced');
+      await flush();
+      expect(calls.filter(c => c.url.includes('/api/task-follow-up')).length).toBe(0);
+
+      resolveCancel(Response.json({ success: true, data: {} }));
+      const result = await closeP;
+      expect(result).toEqual({ ok: false, taskId: 'task-timeout-parent', error: 'close_timeout' });
+      expect((be as any).closing).toBe(false);
+
+      be.write('admitted after cancel settled');
+      await flush();
+      expect(calls.filter(c => c.url.includes('/api/task-follow-up')).length).toBe(1);
+    });
+
+    it('cannot publish a prepared close after an abort races a late successful cancel', async () => {
+      const be = makeBackend({ resumeParentTaskId: 'task-abort-race', injectStatusLines: false });
+      let resolveCancel!: (response: Response) => void;
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        calls.push({ url: u, init });
+        if (u.includes('/api/task-cancel')) {
+          return new Promise<Response>(resolve => { resolveCancel = resolve; });
+        }
+        if (u.includes('/api/task-follow-up')) return taskResponse('task-after-abort-race');
+        if (u.includes('/api2/task-stream')) return pendingSseResponse();
+        if (u.includes('/api/task-detail')) return Response.json({ success: true, data: { task: {} } });
+        return taskResponse('unexpected-create');
+      });
+
+      let closeSettled = false;
+      const close = be.destroySession().then(result => {
+        closeSettled = true;
+        return result;
+      });
+      await flush();
+      expect(resolveCancel).toBeTypeOf('function');
+
+      let abortSettled = false;
+      const abort = be.abortDestroySession().then(() => { abortSettled = true; });
+      await flush();
+      expect(closeSettled).toBe(false);
+      expect(abortSettled).toBe(false);
+      expect((be as any).closing).toBe(true);
+
+      resolveCancel(Response.json({ success: true, data: {} }));
+      await expect(close).resolves.toEqual({
+        ok: false,
+        taskId: 'task-abort-race',
+        error: 'close_aborted',
+      });
+      await abort;
+      expect((be as any).closePrepared).toBe(false);
+      expect((be as any).closing).toBe(false);
+
+      be.write('admitted after exact abort');
+      await flush();
+      expect(calls.filter(c => c.url.includes('/api/task-follow-up'))).toHaveLength(1);
     });
   });
 

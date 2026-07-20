@@ -178,6 +178,27 @@ describe('relay_confirm button click', () => {
     expect(transferSessionMock).not.toHaveBeenCalled();
   });
 
+  it('refuses a Riff relay before posting M1 or invoking transferSession', async () => {
+    const ds = makeDs({
+      cliId: 'riff',
+      backendType: 'riff',
+      riffParentTaskId: 'task-riff-card',
+    });
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
+
+    const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
+
+    expect(r?.toast?.type).toBe('error');
+    expect(r?.toast?.content).toContain('Riff');
+    expect(getChatNameMock).not.toHaveBeenCalled();
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(transferSessionMock).not.toHaveBeenCalled();
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+    expect(ds.session.riffParentTaskId).toBe('task-riff-card');
+  });
+
   it('refuses to relay a session onto its own anchor (same_anchor)', async () => {
     // Thread-scope source anchored at om_source_root; targeting that same 话题
     // root → same anchor → refuse (relaying onto itself). A different chat /

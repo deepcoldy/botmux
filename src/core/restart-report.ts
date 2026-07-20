@@ -8,7 +8,9 @@
  */
 import { githubAuthHeaders, type GithubAuthResolveOptions } from './github-auth.js';
 import type { RestartKind } from '../services/restart-intent-store.js';
-import { consumeRestartIntent } from '../services/restart-intent-store.js';
+import {
+  claimRestartIntentForReport,
+} from '../services/restart-intent-store.js';
 import { countActiveSessionsOnDisk } from '../services/session-store.js';
 import { botmuxVersion } from '../utils/install-info.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
@@ -93,6 +95,10 @@ export interface RestartReportWiring {
   githubAuth?: GithubAuthResolveOptions;
   now?: number;
   log?: (msg: string) => void;
+  /** Test seam; production uses an unref-free ordinary async timer because the
+   * daemon itself remains alive. */
+  wait?: (ms: number) => Promise<void>;
+  preparedCommitWaitMs?: number;
 }
 
 /**
@@ -103,8 +109,23 @@ export interface RestartReportWiring {
  */
 export async function sendRestartReportIfPending(w: RestartReportWiring): Promise<void> {
   const log = w.log ?? (() => {});
-  const intent = consumeRestartIntent(w.now ?? Date.now());
-  if (!intent) return; // no breadcrumb → crash/reboot → stay silent
+  const now = () => w.now ?? Date.now();
+  const wait = w.wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  let claim = claimRestartIntentForReport(now());
+  let remainingPreparedWaitMs = Math.max(0, w.preparedCommitWaitMs ?? 45_000);
+  const pollMs = 100;
+  // A primary daemon from a partial PM2 launch may reach this hook before the
+  // CLI has verified the configured fleet. One atomic claim distinguishes
+  // prepared/committed/absent; never infer state from two independently locked
+  // reads because commit can land between them.
+  while (claim.state === 'prepared' && remainingPreparedWaitMs > 0) {
+    const delayMs = Math.min(pollMs, remainingPreparedWaitMs);
+    await wait(delayMs);
+    remainingPreparedWaitMs -= delayMs;
+    claim = claimRestartIntentForReport(now());
+  }
+  if (claim.state !== 'claimed') return; // no committed breadcrumb → stay silent
+  const intent = claim.intent;
   if (!w.ownerOpenId) { log('restart-report: no owner configured — skipping DM'); return; }
 
   const locale = localeForBot(w.primaryLarkAppId);

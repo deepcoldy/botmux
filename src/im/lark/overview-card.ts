@@ -31,10 +31,11 @@ export const OVERVIEW_ACTION_GOTO_SCHEDULES = 'dash_overview_goto_schedules' as 
 export const OVERVIEW_ACTION_GOTO_SETTINGS = 'dash_overview_goto_settings' as const;
 export const OVERVIEW_ACTION_GOTO_GROUPS = 'dash_overview_goto_groups' as const;
 
-/** Status set treated as "active" (working / analyzing / starting / limited). */
+/** Status set treated as active rather than falsely counted as idle. */
 const ACTIVE_STATUSES: ReadonlySet<string> = new Set([
   'working',
   'analyzing',
+  'stalled',
   'starting',
   'limited',
 ]);

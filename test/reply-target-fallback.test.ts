@@ -13,7 +13,12 @@
  * Run:  pnpm vitest run test/reply-target-fallback.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import {
+  beginReplyTargetTurn,
+  fallbackTurnId,
+  frozenReplyContextForTurn,
+  resolveSessionReplyTarget,
+} from '../src/core/reply-target.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const NOW = new Date().toISOString();
@@ -194,5 +199,33 @@ describe('per-turn replyTargets — queued/concurrent turns keep their own ancho
     expect(keys).toContain('turn-39');
     // Evicted turn: map miss + slot mismatch → plain (pre-map behavior).
     expect(resolveSessionReplyTarget(ds, 'turn-0')).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+});
+
+describe('frozen reply context', () => {
+  it('keeps turn A root, quote, and sender after mutable state advances to B', () => {
+    const ds = makeDs() as DaemonSession;
+    ds.session.quoteTargetId = 'om_a';
+    ds.session.quoteTargetSenderOpenId = 'ou_a';
+    ds.session.quoteTargetSenderIsBot = false;
+    beginReplyTargetTurn(ds, 'om_root_a', 'om_a', NOW);
+
+    ds.session.quoteTargetId = 'om_b';
+    ds.session.quoteTargetSenderOpenId = 'ou_b';
+    ds.session.quoteTargetSenderIsBot = true;
+    beginReplyTargetTurn(ds, 'om_root_b', 'om_b', NOW);
+
+    expect(frozenReplyContextForTurn(ds, 'om_a')).toEqual({
+      target: { mode: 'thread', rootMessageId: 'om_root_a' },
+      quoteTargetId: 'om_a',
+      replyTargetSenderOpenId: 'ou_a',
+      replyTargetSenderIsBot: false,
+    });
+    expect(frozenReplyContextForTurn(ds, 'om_b')).toEqual({
+      target: { mode: 'thread', rootMessageId: 'om_root_b' },
+      quoteTargetId: 'om_b',
+      replyTargetSenderOpenId: 'ou_b',
+      replyTargetSenderIsBot: true,
+    });
   });
 });

@@ -1,14 +1,17 @@
 import type { CodexAppTurnInput } from '../../types.js';
 
 export interface PtyHandle {
-  write(data: string): void;
+  /** `false` means the backend rejected the write before it could confirm
+   * delivery. Callers must not silently promote that result to success. */
+  write(data: string): void | boolean;
   /** Send text literally via tmux send-keys -l (tmux mode only).
-   *  Returns `false` when the write was dropped (e.g. send-keys failed while the
-   *  pane is still alive) so callers can surface a non-submission; `void`/`true`
-   *  means the write was issued. Backends that can't tell return void. */
+   *  Returns `false` when the backend could not confirm the write (for example,
+   *  send-keys timed out while the pane stayed alive). Delivery may still have
+   *  occurred, so callers must treat false as ambiguous rather than proof that
+   *  zero bytes landed. `void`/`true` means the write was issued. */
   sendText?(text: string): void | boolean;
   /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
-   *  Returns `false` on a dropped write (see sendText). */
+   *  Returns `false` on an unconfirmed write (see sendText). */
   sendSpecialKeys?(...keys: string[]): void | boolean;
   /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it). */
   pasteText?(text: string): void;
@@ -29,6 +32,19 @@ export type SubmitRecheckResult = boolean | {
   submitted: boolean;
   cliSessionId?: string;
 };
+
+/** What the adapter can prove about a failed runner-protocol write.
+ *
+ * Runner adapters write a framed line and then a newline.  `submitted:false`
+ * alone is insufficient for recovery: the line may be untouched, may have
+ * been flushed as an invalid fragment, or may still be a complete valid frame
+ * waiting in the runner's stdin buffer.  Only the first two dispositions are
+ * safe to cancel/retry in the same generation. */
+export type RunnerSubmissionDisposition =
+  | 'submitted'
+  | 'untouched'
+  | 'flushed_invalid'
+  | 'dirty_unknown';
 
 /** A session discovered on disk that botmux can resume (import) into a topic —
  *  surfaced by `/adopt`'s second filter. Unlike an AdoptableSession (a live
@@ -193,6 +209,7 @@ export interface CliAdapter {
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
+    submissionDisposition?: RunnerSubmissionDisposition;
     /** Non-transient reason when the adapter knows submission is impossible
      *  without waiting for transcript confirmation (for example an unsupported
      *  terminal keybinding). Worker surfaces this immediately. */
@@ -211,6 +228,7 @@ export interface CliAdapter {
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
+    submissionDisposition?: RunnerSubmissionDisposition;
     failureReason?: string;
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;

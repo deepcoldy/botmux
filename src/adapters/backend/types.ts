@@ -41,7 +41,9 @@ export interface SpawnOpts {
 
 export interface SessionBackend {
   spawn(bin: string, args: string[], opts: SpawnOpts): void;
-  write(data: string): void;
+  /** Returns false only when the backend can prove the write was not accepted.
+   * Legacy implementations may return void on success. */
+  write(data: string): void | boolean;
   resize(cols: number, rows: number): void;
   onData(cb: (data: string) => void): void;
   onExit(cb: (code: number | null, signal: string | null) => void): void;
@@ -75,8 +77,42 @@ export interface SessionBackend {
    *  so the follow-up lineage survives daemon restarts. `null` clears the
    *  persisted lineage (follow-up failed → next message starts fresh). */
   onTaskId?(cb: (taskId: string | null) => void): void;
-  /** Async-capable teardown: riff awaits the remote task-cancel here. */
-  destroySession?(): void | Promise<void>;
+  /** Async-capable teardown: Riff returns a confirmed cancellation result so
+   * daemon-driven explicit close can fence late create/follow-up races before
+   * publishing the durable closed row. Local backends remain synchronous. */
+  destroySession?(): void | Promise<void | SessionDestroyResult>;
+  /** Roll back a successful remote prepare when the daemon could not commit
+   * the durable closed row. The backend must restore write admission without
+   * discarding the last task lineage. */
+  abortDestroySession?(): void | Promise<void>;
+  /** Finalize a successful prepare after the durable row is closed. */
+  commitDestroySession?(): void;
+  /** Graceful daemon shutdown for a remote-task backend. Fence only NEW
+   * writes, drain every write accepted before the fence, and return the exact
+   * final lineage without cancelling it. The daemon persists that lineage
+   * before telling the worker it may exit. */
+  prepareShutdownDetach?(): Promise<SessionShutdownDetachResult>;
+  /** Restore admission/streaming when the daemon cannot complete a prepared
+   * shutdown detach (for example, lineage persistence failed). */
+  abortShutdownDetach?(): SessionShutdownDetachResult | Promise<SessionShutdownDetachResult>;
+  /** Finalize a shutdown detach after exact lineage persistence has been
+   * acknowledged by the daemon. Shutdown refusal never cancels remote work. */
+  commitShutdownDetach?(): void;
+}
+
+export interface SessionDestroyResult {
+  ok: boolean;
+  /** Exact remote task that failed cancellation and must remain retryable. */
+  taskId?: string;
+  error?: string;
+}
+
+export interface SessionShutdownDetachResult {
+  ok: boolean;
+  /** Exact final lineage after all pre-fence writes have drained. `null` is
+   * authoritative and clears any stale durable parent. */
+  taskId: string | null;
+  error?: string;
 }
 
 /**

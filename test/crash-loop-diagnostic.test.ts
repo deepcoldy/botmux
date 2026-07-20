@@ -180,7 +180,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     // First 3 auto-restart in place; the 4th asks the worker to park a
     // diagnostic shell (deferred park) and keeps it alive (no close).
-    expect(worker.send).toHaveBeenCalledWith({ type: 'restart' });
+    expect(worker.send).toHaveBeenCalledWith({ type: 'restart', reason: 'cli_crash' });
     expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
     expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });
     // Survives daemon restart: lazy cold-resume + idle, restart counter reset.
@@ -215,5 +215,27 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     expect(worker.send).toHaveBeenCalledWith({ type: 'close' });
     expect(ds.session.suspendedColdResume).toBeFalsy();
+  });
+
+  it('fails closed on an unexpected Riff exit without restarting or retiring its generation', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-riff-unexpected-exit', worker);
+    ds.session.cliId = 'riff';
+    ds.session.backendType = 'riff';
+    ds.session.riffParentTaskId = 'task-riff-unexpected-exit';
+    ds.initConfig = { backendType: 'riff' } as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await crashTimes(worker, 1);
+
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'restart', reason: 'cli_crash' });
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'park_diagnostic' });
+    expect(ds.worker).toBe(worker);
+    expect(ds.session.riffParentTaskId).toBe('task-riff-unexpected-exit');
+    expect(ds.session.status).toBe('active');
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(restartCounts.has('sid-riff-unexpected-exit')).toBe(false);
   });
 });

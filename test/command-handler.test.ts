@@ -284,6 +284,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   // resolves as idempotent close so unrelated tests don't need to think
   // about it.
   closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false })),
+  withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   // `isRelayableRealSession(ds)` — true when ds.worker is set OR persisted
   // CLI markers exist (session.cliId / session.lastCliInput). The default
   // makeSession fixture sets cliId='claude-code' so most tests pass the
@@ -414,6 +415,8 @@ vi.mock('../src/services/relay-picker.js', () => ({
       if (c.chatId === currentChatId) continue;
       if (c.session.ownerOpenId !== operatorOpenId) continue;
       if (c.session.adoptedFrom) continue;
+      if ((c.initConfig?.backendType ?? c.session.backendType) === 'riff'
+          || c.session.cliId === 'riff') continue;
       // Real-session filter (same predicate as production picker).
       if (!c.worker && !c.session?.cliId && !c.session?.lastCliInput) continue;
       out.push({
@@ -463,7 +466,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { killWorker, suspendWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
+import { killWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } from '../src/core/session-manager.js';
@@ -1343,9 +1346,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
 
-      expect(killWorker).toHaveBeenCalledWith(ds);
-      expect(sessionStore.closeSession).toHaveBeenCalledWith('sess-001');
-      expect(deps.activeSessions.has(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(false);
+      expect(closeWorkerPoolSession).toHaveBeenCalledWith('sess-001');
       // The「会话已关闭」card is delivered「仅自己可见」-first: it routes through
       // deliverEphemeralOrReply targeting the user who ran /close (message.senderId),
       // so plain groups get an ephemeral (visible-to-you) card and topic groups
@@ -1428,7 +1429,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
 
-      expect(workerSend).toHaveBeenCalledWith({ type: 'restart' });
+      expect(workerSend).toHaveBeenCalledWith({ type: 'restart', reason: 'operator' });
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
@@ -1436,6 +1437,49 @@ describe('handleCommand', () => {
         LARK_APP_ID,
         'msg_001',
       );
+    });
+
+    it('refuses live Riff restart without retiring the worker or task lineage', async () => {
+      const workerSend = vi.fn();
+      const worker = { killed: false, send: workerSend } as any;
+      const session = makeSession({
+        cliId: 'riff',
+        backendType: 'riff',
+        riffParentTaskId: 'task-riff-restart',
+      });
+      const ds = makeDaemonSession({
+        session,
+        worker,
+        initConfig: { backendType: 'riff' } as any,
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
+
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.worker).toBe(worker);
+      expect(ds.session.riffParentTaskId).toBe('task-riff-restart');
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('Riff');
+    });
+
+    it('refuses workerless Riff restart without falsely reporting termination or clearing lineage', async () => {
+      const session = makeSession({
+        cliId: 'riff',
+        backendType: 'riff',
+        riffParentTaskId: 'task-riff-workerless-restart',
+      });
+      const ds = makeDaemonSession({ session, worker: null });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
+
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.worker).toBeNull();
+      expect(ds.session.riffParentTaskId).toBe('task-riff-workerless-restart');
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('Riff');
+      expect(reply).not.toContain('进程已终止');
     });
 
     it('should kill dead worker and reply recovery message when worker is already killed', async () => {
@@ -1657,6 +1701,58 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('已自动创建并切换');
     });
 
+    it('refuses Riff /cd before path creation and leaves route, cwd, worker, and lineage untouched', async () => {
+      vi.mocked(existsSync).mockReturnValue(false);
+      const worker = { killed: false, send: vi.fn() } as any;
+      const session = makeSession({
+        cliId: 'riff',
+        backendType: 'riff',
+        riffParentTaskId: 'task-riff-cd',
+        workingDir: '/source/repo',
+        riffRepoDirs: ['/source/repo'],
+      });
+      const ds = makeDaemonSession({
+        session,
+        worker,
+        workingDir: '/source/repo',
+        initConfig: { backendType: 'riff' } as any,
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /brand-new/riff'), deps, LARK_APP_ID);
+
+      expect(existsSync).not.toHaveBeenCalled();
+      expect(mkdirSync).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(ds.worker).toBe(worker);
+      expect(ds.workingDir).toBe('/source/repo');
+      expect(ds.session).toMatchObject({
+        workingDir: '/source/repo',
+        riffRepoDirs: ['/source/repo'],
+        riffParentTaskId: 'task-riff-cd',
+      });
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('Riff');
+    });
+
+    it('should reject before path creation while Codex App dispatch ownership is non-empty', async () => {
+      vi.mocked(existsSync).mockReturnValue(false);
+      const ds = makeDaemonSession();
+      ds.session.codexAppDispatchLedger = [
+        { dispatchId: 'd-1', turnId: 't-1', state: 'accepted', content: 'owned' },
+      ];
+      const originalWorkingDir = ds.workingDir;
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /brand-new/owned'), deps, LARK_APP_ID);
+
+      expect(mkdirSync).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe(originalWorkingDir);
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('未结算');
+    });
+
     it('should reject /cd when auto-create fails', async () => {
       vi.mocked(existsSync).mockReturnValue(false);
       vi.mocked(mkdirSync).mockImplementationOnce(() => { throw new Error('EACCES: permission denied'); });
@@ -1866,14 +1962,18 @@ describe('handleCommand', () => {
 
       expect(ds.workingDir).toBe('/home/testuser/project-b');
       // ds.session is replaced by createSession result (pendingRepo is false → else branch)
-      expect(killWorker).toHaveBeenCalledWith(ds);
-      expect(sessionStore.closeSession).toHaveBeenCalled();
+      expect(closeWorkerPoolSession).toHaveBeenCalledWith('sess-001');
       expect(sessionStore.createSession).toHaveBeenCalledWith(
         CHAT_ID, ROOT_ID, 'project-b (dev)', 'group', undefined,
       );
       expect(ds.session.sessionId).toBe('new-session-123');
       expect(ds.hasHistory).toBe(false);
       expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(withActiveSessionKeyLock).toHaveBeenCalledWith(
+        deps.activeSessions,
+        sessionKey(ROOT_ID, LARK_APP_ID),
+        expect.any(Function),
+      );
     });
 
     it('mid-session chat switch preserves scope and the original message root', async () => {
@@ -2215,25 +2315,29 @@ describe('handleCommand', () => {
   // ─── bare /repo while pending (replaces the old /skip command) ────────────
 
   describe('/repo (bare) while pending', () => {
-    it('does not consume the pending launch while a card commit owns the shared claim', async () => {
+    it('retains the opening reservation and buffers when forkWorker fails before accept', async () => {
       const ds = makeDaemonSession({
         pendingRepo: true,
-        pendingRepoCommitInFlight: true,
-        pendingPrompt: 'hello world',
-        pendingTurnId: 'om_pending_turn',
+        initialStartPending: true,
+        pendingPrompt: 'first prompt',
+        pendingFollowUps: ['buffered follow-up'],
       });
       const deps = makeDeps(ds);
+      vi.mocked(forkWorker).mockImplementationOnce(() => {
+        expect(ds.pendingRepo).toBe(true);
+        expect(ds.initialStartPending).toBe(true);
+        expect(ds.pendingPrompt).toBe('first prompt');
+        expect(ds.pendingFollowUps).toEqual(['buffered follow-up']);
+        throw new Error('fork preaccept failed');
+      });
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
 
-      expect(forkWorker).not.toHaveBeenCalled();
-      expect(getAvailableBots).not.toHaveBeenCalled();
       expect(ds.pendingRepo).toBe(true);
-      expect(ds.pendingRepoCommitInFlight).toBe(true);
-      expect(ds.pendingPrompt).toBe('hello world');
-      expect(ds.pendingTurnId).toBe('om_pending_turn');
-      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
-      expect(replies).toContain('已有一个 worktree 正在创建');
+      expect(ds.initialStartPending).toBe(true);
+      expect(ds.pendingPrompt).toBe('first prompt');
+      expect(ds.pendingFollowUps).toEqual(['buffered follow-up']);
+      expect(deleteMessage).not.toHaveBeenCalled();
     });
 
     it('should boot the CLI idle (no prompt submitted) when launched via /repo itself', async () => {
@@ -2347,11 +2451,7 @@ describe('handleCommand', () => {
       expect(ensureSessionWhiteboard).toHaveBeenCalledWith(ds);
       expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe('帮我看看这个 bug');
       expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][11]).toMatchObject({ whiteboardId: 'wb_test' });
-      expect(forkWorker).toHaveBeenCalledWith(
-        ds,
-        { content: 'WRAPPED:帮我看看这个 bug' },
-        { turnId: 'om_buffered_first' },
-      );
+      expect(forkWorker).toHaveBeenCalledWith(ds, { content: 'WRAPPED:帮我看看这个 bug' }, false);
       expect(ds.pendingRepo).toBe(false);
       expect(ds.pendingTurnId).toBeUndefined();
     });
@@ -2388,7 +2488,7 @@ describe('handleCommand', () => {
       expect(forkWorker).toHaveBeenCalledWith(ds, {
         content: 'WRAPPED:clean',
         codexAppInput,
-      });
+      }, false);
       expect(ds.pendingSubstituteTrigger).toBeUndefined();
     });
 
@@ -3444,6 +3544,32 @@ describe('handleCommand', () => {
       const dd = await import('../src/utils/daemon-discovery.js');
       vi.mocked(dd.findOnlineDaemon).mockReset();
       vi.mocked(dd.findOnlineDaemon).mockReturnValue(null);
+    });
+
+    it('refuses Riff --create before resolving members or creating a destination group', async () => {
+      const worker = { killed: false, send: vi.fn() } as any;
+      const ds = makeDaemonSession({
+        worker,
+        initConfig: { backendType: 'riff' } as any,
+        session: makeSession({
+          ownerOpenId: 'ou_sender',
+          cliId: 'riff',
+          backendType: 'riff',
+          riffParentTaskId: 'task-riff-create-relay',
+        }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create G @Codex', {
+        mentions: [{ key: '@_user_1', name: 'Codex', openId: 'ou_codex' }],
+      }), deps, LARK_APP_ID);
+
+      expect(mockedListBots).not.toHaveBeenCalled();
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect(mockedSend).not.toHaveBeenCalled();
+      expect(worker.send).not.toHaveBeenCalled();
+      expect(ds.session.riffParentTaskId).toBe('task-riff-create-relay');
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('Riff');
     });
 
     it('renders the relay picker card when invoked without --create', async () => {

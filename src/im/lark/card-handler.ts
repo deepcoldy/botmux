@@ -59,13 +59,13 @@ import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
-import { sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isRepoCardConsumed, isActiveRepoCard, claimCurrentRepoCard } from '../../core/types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isActiveRepoCard } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
@@ -82,6 +82,9 @@ import {
   openLocalCliInIterm,
   preflightLocalCliOpen,
 } from '../../services/local-cli-opener.js';
+import { hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
+import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
+import { runDetachedBotTurnAdmission, withBotTurnAdmission, withBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -362,199 +365,183 @@ export async function commitRepoSelection(
   // The worktree flow already posted a precise "worktree 已创建：path 分支 …"
   // line before funnelling in here — suppress the redundant "已选择/已切换"
   // confirmation so the user sees a single message, not two.
-  // pinWorkingDir=false: "直接开始"/skip keeps the default cwd for this launch
-  // without persisting it (esp. $HOME) onto session.workingDir — sibling bots
-  // must still get their own repo card instead of inheriting HOME.
-  // confirmReplyText: optional confirmation to send under the same claim
-  // (used by skip_repo so the post-fork reply window cannot race a second click).
   opts?: {
     suppressConfirmReply?: boolean;
     confirmReplyText?: string;
     pinWorkingDir?: boolean;
     riffRepoDirs?: string[];
   },
-): Promise<void> {
+): Promise<boolean> {
   const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply } = ctx;
   const locTarget = localeForBot(ds.larkAppId);
   // `/close` deletes the active-map entry without touching sessionId or
   // pendingRepo — identity against the map is the only tell that the session
   // this flow captured is gone. Checked alongside the generation snapshots.
-  const repoSessionKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
+  const repoSessionKey = activeSessionKey(ds);
   const sessionStillActive = () => activeSessions.get(repoSessionKey) === ds;
   const commitGenSessionId = ds.session.sessionId;
   const pinWorkingDir = opts?.pinWorkingDir !== false;
 
+  // Card callbacks are replayable. Only the currently published picker may
+  // mutate this session; a withdrawn/replaced card must stay stale even after
+  // the activation FIFO eventually settles. Internal auto-worktree commits do
+  // not originate from a card and deliberately omit cardMessageId.
+  if (cardMessageId !== undefined
+    && (!ds.repoCardMessageId || cardMessageId !== ds.repoCardMessageId)) {
+    logger.warn(
+      `[${tag(ds)}] Ignoring stale repo-card callback ${cardMessageId} `
+      + `(current=${ds.repoCardMessageId ?? 'none'})`,
+    );
+    return false;
+  }
+
+  if (!ds.pendingRepo
+    && hasProtectedSessionMutationOwnership(ds)) {
+    await sessionReply(
+      rootId,
+      '当前会话仍有待提交消息，暂不能切换仓库；请等待提交完成或关闭会话。',
+    );
+    return false;
+  }
+
   if (ds.pendingRepo) {
-    // Card select/skip and auto-worktree converge here; the text /repo path
-    // mirrors this transaction through the same in-memory claim. Only one may
-    // own the pending -> worker transition, including prompt preparation.
-    if (ds.pendingRepoCommitInFlight) {
-      logger.info(`[${tag(ds)}] Pending repo commit already in flight — ignoring duplicate selection`);
-      return;
+    const targetSessionId = ds.session.sessionId;
+    const started = await withBotTurnMutation(ds.larkAppId, async () => {
+    const current = [...activeSessions.values()].find(
+      candidate => candidate.session.sessionId === targetSessionId
+        && candidate.session.status === 'active',
+    );
+    if (!current || current !== ds || !current.pendingRepo) return false;
+    // "Start directly" launches in the resolved default cwd without pinning
+    // HOME onto the session for sibling-bot inheritance.
+    if (pinWorkingDir) {
+      ds.workingDir = dirPath;
+      ds.session.workingDir = dirPath;
     }
-    ds.pendingRepoCommitInFlight = true;
-    let committed = false;
-    try {
-      // Claim before mutating the selected directory so two different card
-      // choices cannot overwrite each other while one prompt is being built.
-      // Skip/bare-start may intentionally leave workingDir unpinned so the
-      // launch uses the bot default without persisting $HOME for siblings.
-      if (pinWorkingDir) {
-        ds.workingDir = dirPath;
-        ds.session.workingDir = dirPath;
-      }
-      ds.session.riffRepoDirs = opts?.riffRepoDirs;
-      sessionStore.updateSession(ds.session);
-      const selfBot = getBot(ds.larkAppId);
-      const botCfg = selfBot.config;
-      const effectiveCliId = sessionCliId(ds);
-
-      // Keep pendingRepo=true across this await. New topic messages therefore
-      // remain buffered on this same session instead of racing a worker-null
-      // safety-net fork. Snapshot every pending field only after it settles.
-      const needsPromptContext = !ds.pendingRawInput ||
-        (ds.pendingPrompt?.trim().length ?? 0) > 0 ||
-        (ds.pendingAttachments?.length ?? 0) > 0 ||
-        (ds.pendingFollowUps?.length ?? 0) > 0;
-      const availableBots = needsPromptContext
-        ? await getAvailableBots(ds.larkAppId, ds.chatId)
-        : [];
-      if (!sessionStillActive() || ds.session.sessionId !== commitGenSessionId ||
-          !ds.pendingRepo || (ds.worker && !ds.worker.killed)) {
-        logger.warn(`[${tag(ds)}] Session changed while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds.session.sessionId}, active=${sessionStillActive()}, pending=${!!ds.pendingRepo}, worker=${!!ds.worker}) — aborting this fork`);
-        return;
-      }
-
-      const pendingPrompt = ds.pendingPrompt ?? '';
-      const pendingRawInput = ds.pendingRawInput;
-      const hasBufferedInput =
-        pendingPrompt.trim().length > 0 ||
-        (ds.pendingAttachments?.length ?? 0) > 0 ||
-        (ds.pendingFollowUps?.length ?? 0) > 0;
-      if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
-      const wrappedInput = (!pendingRawInput || hasBufferedInput)
-        ? buildNewTopicCliInput(
-            pendingPrompt,
-            ds.session.sessionId,
-            effectiveCliId,
-            botCfg.cliPathOverride,
-            ds.pendingAttachments,
-            ds.pendingMentions,
-            availableBots,
-            ds.pendingFollowUps,
-            { name: selfBot.botName, openId: selfBot.botOpenId },
-            locTarget,
-            ds.pendingSender,
-            {
-              larkAppId: ds.larkAppId,
-              chatId: ds.chatId,
-              whiteboardId: ds.session.whiteboardId,
-              substituteTrigger: ds.pendingSubstituteTrigger,
-              codexAppText: ds.pendingCodexAppText,
-              codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
-              codexAppMessageContext: ds.pendingCodexAppMessageContext,
-              codexAppFollowUps: ds.pendingCodexAppFollowUps,
-              codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
-            },
-          )
-        : { content: '' };
-      const prompt = pendingRawInput ? '' : wrappedInput;
-      const pendingTurnId = ds.pendingTurnId;
-      const previousPendingFollowUpInput = ds.pendingFollowUpInput;
-      if (pendingRawInput && hasBufferedInput) {
-        ds.pendingFollowUpInput = {
-          userPrompt: ds.pendingCodexAppText !== undefined || ds.pendingCodexAppFollowUps
-            ? [ds.pendingCodexAppText ?? '', ...(ds.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
-            : pendingPrompt || ds.pendingFollowUps?.join('\n\n') || '',
-          cliInput: wrappedInput.content,
-          ...(ds.pendingFollowUpTurnId ? { turnId: ds.pendingFollowUpTurnId } : {}),
-          ...(effectiveCliId === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
-            ? { codexAppInput: wrappedInput.codexAppInput }
-            : {}),
-          codexAppInputGateFrozen: true,
-        };
-      }
-
-      // From here through forkWorker there is no await: publish the state
-      // transition atomically from the router's point of view.
-      ds.pendingRepo = false;
-      publishAttentionPatch(ds);
-      try {
-        if (pendingRawInput) {
-          // pendingRawTurnId is applied at the literal PTY write boundary.
-          forkWorker(ds, '', false);
-        } else if (pendingTurnId && hasBufferedInput) {
-          forkWorker(ds, prompt, { turnId: pendingTurnId });
-        } else {
-          forkWorker(ds, prompt);
-        }
-      } catch (e) {
-        ds.pendingRepo = true;
-        ds.pendingFollowUpInput = previousPendingFollowUpInput;
-        publishAttentionPatch(ds);
-        throw e;
-      }
-      rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
-      ds.pendingPrompt = undefined;
-      ds.pendingCodexAppText = undefined;
-      ds.pendingCodexAppApplicationContext = undefined;
-      ds.pendingCodexAppMessageContext = undefined;
-      ds.pendingAttachments = undefined;
-      ds.pendingMentions = undefined;
-      ds.pendingSubstituteTrigger = undefined;
-      ds.pendingSender = undefined;
-      ds.pendingFollowUps = undefined;
-      ds.pendingCodexAppFollowUps = undefined;
-      ds.pendingCodexAppFollowUpContexts = undefined;
-      ds.pendingFollowUpTurnId = undefined;
-      ds.pendingTurnId = undefined;
-      committed = true;
-
-      // Local one-shot consume BEFORE any network await. Feishu withdraw is
-      // best-effort and may lag/fail; correctness for stale card clicks depends
-      // on this mark so a second callback cannot mid-session-switch after claim
-      // release (and so a sessionReply throw that jumps to finally still leaves
-      // the card locally invalid).
-      const cardToWithdraw = cardMessageId ?? ds.repoCardMessageId;
-      markRepoCardConsumed(ds, cardToWithdraw);
-      ds.repoCardMessageId = undefined;
-
-      // Hold the claim through confirmation + best-effort card withdraw so a
-      // concurrent in-flight select still sees pendingRepoCommitInFlight.
-      try {
-        if (!opts?.suppressConfirmReply) {
-          // A card click has no turn of its own — anchor the confirmation to the
-          // session's current reply-target turn so a shared fold-back topic keeps
-          // it in-thread (same leak as the /repo command path).
-          await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: dirLabel }, locTarget), undefined, fallbackTurnId(ds, undefined));
-        } else if (opts.confirmReplyText) {
-          await sessionReply(rootId, opts.confirmReplyText, undefined, fallbackTurnId(ds, undefined));
-        }
-      } catch (e) {
-        logger.warn(`[${tag(ds)}] Confirm reply after pending repo commit failed: ${e instanceof Error ? e.message : e}`);
-      }
-      if (cardToWithdraw && larkAppId) {
-        try { await deleteMessage(larkAppId, cardToWithdraw); } catch { /* card may already be gone */ }
-      }
-    } finally {
-      ds.pendingRepoCommitInFlight = false;
+    // riff 多仓 stamp：只有多仓 worktree 流显式传入（保留用户选择顺序，首仓=primary）；
+    // 其它选仓路径一律清除旧 stamp——workingDir 变了，旧的多仓组合不再成立。
+    ds.session.riffRepoDirs = opts?.riffRepoDirs;
+    sessionStore.updateSession(ds.session);
+    const selfBot = getBot(ds.larkAppId);
+    const botCfg = selfBot.config;
+    const effectiveCliId = sessionCliId(ds);
+    // First-time repo selection — now spawn CLI with the original prompt
+    const pendingPrompt = ds.pendingPrompt ?? '';
+    const pendingRawInput = ds.pendingRawInput;
+    // Raw-input cold start still wraps any input buffered while the repo card
+    // was pending — see the skip_repo branch for the rationale.
+    const hasBufferedInput =
+      pendingPrompt.trim().length > 0 ||
+      ds.pendingCodexAppText !== undefined ||
+      (ds.pendingAttachments?.length ?? 0) > 0 ||
+      (ds.pendingFollowUps?.length ?? 0) > 0;
+    if (hasBufferedInput) ensureSessionWhiteboard(ds);
+    const wrappedInput = hasBufferedInput
+      ? buildNewTopicCliInput(
+          pendingPrompt,
+          ds.session.sessionId,
+          effectiveCliId,
+          botCfg.cliPathOverride,
+          ds.pendingAttachments,
+          ds.pendingMentions,
+          await getAvailableBots(ds.larkAppId, ds.chatId),
+          ds.pendingFollowUps,
+          { name: selfBot.botName, openId: selfBot.botOpenId },
+          locTarget,
+          ds.pendingSender,
+          {
+            larkAppId: ds.larkAppId,
+            chatId: ds.chatId,
+            whiteboardId: ds.session.whiteboardId,
+            substituteTrigger: ds.pendingSubstituteTrigger,
+            codexAppText: ds.pendingCodexAppText,
+            codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
+            codexAppMessageContext: ds.pendingCodexAppMessageContext,
+            codexAppFollowUps: ds.pendingCodexAppFollowUps,
+            codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
+          },
+        )
+      : undefined;
+    const prompt = pendingRawInput ? '' : (wrappedInput ?? '');
+    // Last-line defence: prompt prep awaited above — if anything replaced
+    // OR closed the session in that window, forking now would clobber it
+    // (or resurrect a /close'd session).
+    if (!sessionStillActive() || ds.session.sessionId !== commitGenSessionId) {
+      logger.warn(`[${tag(ds)}] Session replaced or closed while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds.session.sessionId}, active=${sessionStillActive()}) — aborting this fork`);
+      return false;
     }
-    if (!committed) return;
+    if (pendingRawInput && hasBufferedInput && wrappedInput) {
+      ds.pendingFollowUpInput = {
+        userPrompt: ds.pendingCodexAppText !== undefined || ds.pendingCodexAppFollowUps
+          ? [ds.pendingCodexAppText ?? '', ...(ds.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
+          : pendingPrompt || ds.pendingFollowUps?.join('\n\n') || '',
+        cliInput: wrappedInput.content,
+        ...((ds.pendingFollowUpTurnIds?.at(-1) ?? ds.pendingFollowUpTurnId)
+          ? { turnId: ds.pendingFollowUpTurnIds?.at(-1) ?? ds.pendingFollowUpTurnId }
+          : {}),
+        ...(effectiveCliId === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
+          ? { codexAppInput: wrappedInput.codexAppInput }
+          : {}),
+        codexAppInputGateFrozen: true,
+      };
+    }
+    if (pendingRawInput) rememberLastCliInput(ds, pendingRawInput, pendingRawInput);
+    else if (hasBufferedInput && wrappedInput) rememberLastCliInput(ds, pendingPrompt, wrappedInput);
+    // Keep the reservation and every buffered opening field intact through
+    // forkWorker's synchronous pre-accept/write-ahead phase. If it throws,
+    // the user can retry this exact selection without losing the first turn.
+    const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
+    forkWorker(
+      ds,
+      prompt,
+      !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+    );
+    ds.pendingRepo = false;
+    // A queued activation owns the route through its adapter-level ACK. Every
+    // buffer below was synchronously folded into prompt N and is safe to clear;
+    // later inbounds observe this gate and enter the separate exact staged FIFO.
+    ds.initialStartPending = ds.session.queuedActivationPending === true;
+    publishAttentionPatch(ds);
+    ds.pendingPrompt = undefined;
+    ds.pendingCodexAppText = undefined;
+    ds.pendingCodexAppApplicationContext = undefined;
+    ds.pendingCodexAppMessageContext = undefined;
+    ds.pendingAttachments = undefined;
+    ds.pendingMentions = undefined;
+    ds.pendingSubstituteTrigger = undefined;
+    ds.pendingSender = undefined;
+    ds.pendingFollowUps = undefined;
+    ds.pendingFollowUpTurnId = undefined;
+    ds.pendingFollowUpTurnIds = undefined;
+    ds.pendingCodexAppFollowUps = undefined;
+    ds.pendingCodexAppFollowUpContexts = undefined;
+    ds.pendingCodexAppFollowUpGateAccepted = undefined;
+    ds.pendingTurnId = undefined;
+    return true;
+    });
+    if (!started) return false;
+    // Invalidate synchronously at the successful commit boundary. Card delete
+    // and confirmation delivery are best effort and may await/fail; neither is
+    // allowed to leave a replayable mutation capability behind.
+    const cardToWithdraw = cardMessageId ?? ds.repoCardMessageId;
+    markRepoCardConsumed(ds, cardToWithdraw);
+    ds.repoCardMessageId = undefined;
+    // A card click has no turn of its own — anchor the confirmation to the
+    // session's current reply-target turn so a shared fold-back topic keeps
+    // it in-thread (same leak as the /repo command path).
+    if (!opts?.suppressConfirmReply) {
+      await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: dirLabel }, locTarget), undefined, fallbackTurnId(ds, undefined));
+    } else if (opts.confirmReplyText) {
+      await sessionReply(rootId, opts.confirmReplyText, undefined, fallbackTurnId(ds, undefined));
+    }
+    if (cardToWithdraw && larkAppId) {
+      try { await deleteMessage(larkAppId, cardToWithdraw); }
+      catch { /* best-effort */ }
+    }
     logger.info(`[${tag(ds)}] Repo selected: ${dirPath}, spawning CLI`);
-    return;
+    return true;
   } else {
     // Mid-session repo switch — close old session, start fresh.
-    // Claim the current card BEFORE killWorker / any await. A concurrent click
-    // on the same Feishu card must not pass a second kill+fork while the first
-    // switch is still awaiting confirm replies. Correctness does not depend on
-    // deleteMessage succeeding.
-    const claimedCard = claimCurrentRepoCard(ds, cardMessageId);
-    if (cardMessageId && !claimedCard) {
-      // Stale / already-claimed card (entry check races can still reach here).
-      logger.info(`[${tag(ds)}] Ignoring stale mid-session repo card ${cardMessageId}`);
-      return;
-    }
-
     // Safety net (mirrors the `/repo` text-command path): build the same
     // "session closed" card `/close` emits BEFORE displacing the old session
     // (it reads the live session's identity off `ds`). The new session reuses
@@ -566,73 +553,98 @@ export async function commitRepoSelection(
     // the displaced session's stored workingDir (and the closed card), so
     // `claude --resume` later would reopen the old context in the new repo's
     // cwd. The new repo is pinned onto the fresh session below instead.
-    const closedCard = buildClosedSessionCard(ds, locTarget);
+    const targetSessionId = ds.session.sessionId;
+    const switched = await withBotTurnMutation(ds.larkAppId, async () => {
+      const candidate = [...activeSessions.values()].find(
+        candidate => candidate.session.sessionId === targetSessionId,
+      );
+      if (!candidate || candidate !== ds || candidate.session.status !== 'active') {
+        return { ok: false as const, error: 'session_replaced' as const };
+      }
+      const key = activeSessionKey(candidate);
+      return withActiveSessionKeyLock(activeSessions, key, async () => {
+        const current = [...activeSessions.values()].find(
+          owner => owner.session.sessionId === targetSessionId,
+        );
+        if (!current || current !== candidate
+          || activeSessions.get(key) !== current
+          || current.session.status !== 'active') {
+          return { ok: false as const, error: 'session_replaced' as const };
+        }
+        if (hasProtectedSessionMutationOwnership(current)) {
+          return { ok: false as const, error: 'dispatch_pending' as const };
+        }
+        const closedCard = buildClosedSessionCard(current, locTarget);
+        // Preserve the old card in memory before durable close clears its old
+        // frozen-card file; it is re-keyed under the replacement session below.
+        parkStreamCard(current);
+        const oldSession = current.session;
+        const closeResult = await closeWorkerPoolSession(targetSessionId);
+        if (!closeResult.ok) {
+          return { ok: false as const, error: 'close_failed' as const, closeResult };
+        }
+        if (activeSessions.get(key) === current) activeSessions.delete(key);
+        if (activeSessions.has(key)) {
+          return { ok: false as const, error: 'session_replaced' as const };
+        }
+        const cardToWithdraw = cardMessageId ?? current.repoCardMessageId;
+        markRepoCardConsumed(current, cardToWithdraw);
+        current.repoCardMessageId = undefined;
 
-    killWorker(ds);
-    // Park the current card in `frozenCards` so the next POST under the new
-    // session sweeps it via recall. closeSession() wipes the on-disk
-    // frozen-cards file under the OLD sessionId, but the in-memory Map
-    // travels with `ds` into the new session and still carries the
-    // old messageId for deletion. If fork or POST fails, the parked card
-    // stays in the thread instead of vanishing prematurely.
-    parkStreamCard(ds);
-    sessionStore.closeSession(ds.session.sessionId);
-
-    await deliverEphemeralOrReply(
-      ds,
-      operatorOpenId,
-      closedCard,
-      'interactive',
-      () => sessionReply(rootId, closedCard, 'interactive'),
-    );
-
-    const oldSession = ds.session;
-    // `rootId` is the routing anchor. For chat-scope sessions it is the
-    // `oc_...` chat id, not the traceable `om_...` message root stored on
-    // Session. Preserve the old identity and explicitly persist scope so card
-    // switches cannot recreate the session as a legacy scope-less thread.
-    const session = sessionStore.createSession(
-      ds.chatId,
-      ds.scope === 'chat' ? oldSession.rootMessageId : rootId,
-      dirLabel,
-      ds.chatType,
-      ds.scope,
-    );
-    ds.session = session;
-    ds.lastUserPrompt = undefined;
-    ds.lastCliInput = undefined;
-    // Pin workingDir + larkAppId onto the new session before forkWorker.
-    // Without this, a daemon restart restores the session with an empty
-    // workingDir and the worker spawns in the bot's default cwd, so
-    // `claude --resume` looks in the wrong .claude/projects/<hash>/ dir and
-    // exits code 0 immediately, crash-looping until the rate-limiter trips.
-    ds.workingDir = dirPath;
-    ds.session.workingDir = dirPath;
-    ds.session.larkAppId = ds.larkAppId;
-    ds.session.chatDisplayName = oldSession.chatDisplayName;
-    ds.session.ownerOpenId = oldSession.ownerOpenId;
-    ds.session.creatorOpenId = oldSession.creatorOpenId;
-    ds.session.lastCallerOpenId = oldSession.lastCallerOpenId;
-    // Stamp the newly-created session, not the displaced session that was just
-    // closed. Plain/single-repo switches pass undefined and clear stale state.
-    ds.session.riffRepoDirs = opts?.riffRepoDirs;
-    sessionStore.updateSession(ds.session);
-    ds.hasHistory = false;
-    // Re-persist the parked card under the NEW sessionId so a daemon crash
-    // before the next POST doesn't strand it. closeSession() above wiped
-    // the on-disk file under the OLD sessionId; without this re-save, the
-    // in-memory Map only survives in process memory.
-    if (ds.frozenCards && ds.frozenCards.size > 0) {
-      saveFrozenCards(ds.session.sessionId, ds.frozenCards);
+        const session = sessionStore.createSession(
+          current.chatId,
+          current.scope === 'chat' ? oldSession.rootMessageId : rootId,
+          dirLabel,
+          current.chatType,
+          current.scope,
+        );
+        current.session = session;
+        current.lastUserPrompt = undefined;
+        current.lastCliInput = undefined;
+        current.workingDir = dirPath;
+        session.workingDir = dirPath;
+        session.larkAppId = current.larkAppId;
+        session.chatDisplayName = oldSession.chatDisplayName;
+        session.ownerOpenId = oldSession.ownerOpenId;
+        session.creatorOpenId = oldSession.creatorOpenId;
+        session.lastCallerOpenId = oldSession.lastCallerOpenId;
+        session.riffRepoDirs = opts?.riffRepoDirs;
+        sessionStore.updateSession(session);
+        current.hasHistory = false;
+        if (current.frozenCards && current.frozenCards.size > 0) {
+          saveFrozenCards(session.sessionId, current.frozenCards);
+        }
+        current.streamCardId = undefined;
+        current.streamCardNonce = undefined;
+        current.streamCardPending = undefined;
+        current.lastScreenContent = undefined;
+        current.lastScreenStatus = undefined;
+        activeSessions.set(key, current);
+        forkWorker(current, '', false);
+        return { ok: true as const, current, closedCard, cardToWithdraw };
+      });
+    });
+    if (!switched.ok) {
+      if (switched.error === 'dispatch_pending') {
+        await sessionReply(
+          rootId,
+          '当前 Codex App 仍有未结算消息，暂不能切换仓库；请等待本轮完成或关闭会话。',
+        );
+      } else if (switched.error === 'close_failed') {
+        await sessionReply(
+          rootId,
+          'Riff 远端任务取消失败，原会话仍保持活跃；未切换仓库，请重试。',
+        );
+      }
+      return false;
     }
-    // Drop the old turn's streaming-card reference so worker_ready POSTs a
-    // fresh card for the new session instead of PATCHing the previous one.
-    ds.streamCardId = undefined;
-    ds.streamCardNonce = undefined;
-    ds.streamCardPending = undefined;
-    ds.lastScreenContent = undefined;
-    ds.lastScreenStatus = undefined;
-    forkWorker(ds, '', false);
+    await deliverEphemeralOrReply(
+      switched.current,
+      operatorOpenId,
+      switched.closedCard,
+      'interactive',
+      () => sessionReply(rootId, switched.closedCard, 'interactive'),
+    );
     if (!opts?.suppressConfirmReply) {
       try {
         await sessionReply(rootId, t('cmd.repo.switched_to', { name: dirLabel }, locTarget));
@@ -640,12 +652,14 @@ export async function commitRepoSelection(
         logger.warn(`[${tag(ds)}] Confirm reply after mid-session repo switch failed: ${e instanceof Error ? e.message : e}`);
       }
     }
-    logger.info(`[${tag(ds)}] Repo switched to ${dirPath}, new session created`);
-    // Best-effort withdraw — card already claimed above.
-    if (claimedCard && larkAppId) {
-      try { await deleteMessage(larkAppId, claimedCard); } catch { /* best-effort */ }
+    if (switched.cardToWithdraw && larkAppId) {
+      try { await deleteMessage(larkAppId, switched.cardToWithdraw); }
+      catch { /* best-effort */ }
     }
+    logger.info(`[${tag(switched.current)}] Repo switched to ${dirPath}, new session created`);
   }
+
+  return true;
 }
 
 /**
@@ -690,7 +704,11 @@ export async function runAutoWorktreeCommit(deps: {
     // pendingRepo session, folds any messages buffered during creation (pendingPrompt
     // + pendingFollowUps) into the first turn. suppressConfirmReply: the worktree
     // helper already posted the '已创建/回退' line, so skip the '已选择' confirmation.
-    await commitRepoSelection(
+    // The worktree build is intentionally detached from its caller's inbound
+    // admission. Re-enter with a fresh lease at the delayed commit/fork edge;
+    // the outer lease may have ended minutes ago and must not authorize this
+    // descendant across a bot-wide config mutation.
+    await runDetachedBotTurnAdmission(larkAppId, () => commitRepoSelection(
       {
         ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,
         // Never reached under suppressConfirmReply for a pendingRepo session.
@@ -699,7 +717,7 @@ export async function runAutoWorktreeCommit(deps: {
       wt.dir,
       pathBasename(wt.dir),
       { suppressConfirmReply: true },
-    );
+    ));
   } catch (e) {
     // No recovery fork here: forking with an empty prompt would DROP the buffered
     // first turn (pendingPrompt lives only in-memory, not the message queue). Leave
@@ -1229,6 +1247,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (sourceDs.session.ownerOpenId && sourceDs.session.ownerOpenId !== operatorOpenId) {
       return { toast: { type: 'error', content: t('card.relay.toast_not_owner', undefined, loc) } };
     }
+    if ((sourceDs.initConfig?.backendType ?? sourceDs.session.backendType) === 'riff'
+        || sourceDs.session.cliId === 'riff') {
+      return { toast: { type: 'error', content: t('card.relay.toast_riff_not_relayable', undefined, loc) } };
+    }
     // Anchor-based self-relay guard: a thread-scope source in the SAME chat
     // (different 话题) is a legitimate cross-topic move, so refuse only when the
     // source and target anchors are identical.
@@ -1314,6 +1336,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       if (r.error === 'adopt_not_relayable') {
         return { toast: { type: 'error', content: t('card.relay.toast_adopt_not_relayable', undefined, loc) } };
+      }
+      if (r.error === 'riff_not_relayable') {
+        return { toast: { type: 'error', content: t('card.relay.toast_riff_not_relayable', undefined, loc) } };
       }
       if (r.error === 'worker_busy') {
         return { toast: { type: 'error', content: t('card.relay.toast_worker_busy', undefined, loc) } };
@@ -1586,8 +1611,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         logger.info(`[${tag(ds)}] voice_summary blocked because worker is busy: ${ds.lastScreenStatus ?? 'unknown'}`);
         return { toast: { type: 'warning', content: t('card.voice.toast_worker_busy', undefined, locDs) } };
       }
-      voicedCardIds.add(dedupeKey);
-      if (voicedCardIds.size > 5000) { voicedCardIds.clear(); voicedCardIds.add(dedupeKey); }
+      if ((!ds.worker || ds.worker.killed) && hasProtectedSessionMutationOwnership(ds)) {
+        logger.info(`[${tag(ds)}] voice_summary deferred behind durable opening ownership`);
+        return { toast: { type: 'warning', content: t('card.voice.toast_worker_busy', undefined, locDs) } };
+      }
       const instruction = voiceSummaryInstruction(locDs);
       const voiceInput = {
         content: instruction,
@@ -1598,8 +1625,26 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           'application',
         ),
       };
-      if (ds.worker && !ds.worker.killed) sendWorkerInput(ds, voiceInput);
-      else forkWorker(ds, voiceInput, ds.hasHistory);
+      let accepted = false;
+      try {
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, voiceInput);
+        else {
+          forkWorker(ds, voiceInput, ds.hasHistory);
+          accepted = true;
+        }
+      } catch (err) {
+        logger.warn(
+          `[${tag(ds)}] voice_summary failed before acceptance: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (!accepted) {
+        return { toast: { type: 'warning', content: t('card.voice.toast_worker_busy', undefined, locDs) } };
+      }
+      // Burn the replay key only after live IPC or the durable activation tail
+      // accepted the exact instruction.
+      voicedCardIds.add(dedupeKey);
+      if (voicedCardIds.size > 5000) { voicedCardIds.clear(); voicedCardIds.add(dedupeKey); }
       logger.info(`[${tag(ds)}] voice_summary triggered by ${operatorOpenId ?? '?'}`);
       return { toast: { type: 'success', content: t('card.voice.toast_wait', undefined, locDs) } };
     }
@@ -1610,26 +1655,63 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // which violates the bridge invariant. Defense in depth — buildSessionCard
       // already omits the restart button when adoptMode=true, but a stale
       // pre-fix card or a malformed action payload could still arrive.
-      const locDs = localeForBot(ds.larkAppId);
-      if (ds.adoptedFrom) {
-        logger.warn(`[${tag(ds)}] Rejected restart on adopt session — would kill user's pane`);
+      const targetSessionId = ds.session.sessionId;
+      const targetAppId = ds.larkAppId;
+      const locDs = localeForBot(targetAppId);
+      const restart = await withBotTurnMutation(targetAppId, async () => {
+        const current = [...activeSessions.values()].find(
+          candidate => candidate.session.sessionId === targetSessionId
+            && candidate.session.status === 'active',
+        );
+        if (!current) return { status: 'gone' as const };
+        if (current.adoptedFrom || current.initConfig?.adoptMode) {
+          logger.warn(`[${tag(current)}] Rejected restart on adopt session — would kill user's pane`);
+          return { status: 'adopted' as const };
+        }
+        if ((current.initConfig?.backendType ?? current.session.backendType) === 'riff'
+            || sessionCliId(current) === 'riff') {
+          logger.warn(`[${tag(current)}] Rejected restart on Riff session — lineage owner retained`);
+          return { status: 'riff' as const };
+        }
+        if (hasProtectedSessionMutationOwnership(current)) {
+          return { status: 'pending' as const };
+        }
+        const effectiveCliId = sessionCliId(current);
+        if (current.worker && !current.worker.killed) {
+          logger.info(`[${tag(current)}] Restart via card button`);
+          current.worker.send({ type: 'restart', reason: 'operator' } as DaemonToWorker);
+          return { status: 'restarted' as const, current, effectiveCliId };
+        }
+        logger.info(`[${tag(current)}] Re-forking worker via card button`);
+        forkWorker(current, '', current.hasHistory);
+        return { status: 'reforked' as const, current, effectiveCliId };
+      });
+      if (restart.status === 'gone') {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
+      }
+      if (restart.status === 'adopted') {
         await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, locDs));
         return;
       }
-      const botCfg = getBot(ds.larkAppId).config;
-      const effectiveCliId = sessionCliId(ds);
-      if (ds.worker) {
-        logger.info(`[${tag(ds)}] Restart via card button`);
-        ds.worker.send({ type: 'restart' } as DaemonToWorker);
-        const cliName = getCliDisplayName(effectiveCliId);
+      if (restart.status === 'riff') {
+        await sessionReply(rootId, t('cmd.restart.riff_unsupported', undefined, locDs));
+        return;
+      }
+      if (restart.status === 'pending') {
+        await sessionReply(
+          rootId,
+          '当前 Codex App 仍有未结算消息，暂不能重启；请等待本轮完成或关闭会话。',
+        );
+        return;
+      }
+      if (restart.status === 'restarted') {
+        const cliName = getCliDisplayName(restart.effectiveCliId);
         const restartedMsg = t('card.action.restarted', { cliName }, locDs);
-        await deliverEphemeralOrReply(ds, operatorOpenId, restartedMsg, 'text', () => sessionReply(rootId, restartedMsg));
+        await deliverEphemeralOrReply(restart.current, operatorOpenId, restartedMsg, 'text', () => sessionReply(rootId, restartedMsg));
       } else {
-        logger.info(`[${tag(ds)}] Re-forking worker via card button`);
-        forkWorker(ds, '', ds.hasHistory);
-        const cliName = getCliDisplayName(effectiveCliId);
+        const cliName = getCliDisplayName(restart.effectiveCliId);
         const restartedFreshMsg = t('card.action.restarted_fresh', { cliName }, locDs);
-        await deliverEphemeralOrReply(ds, operatorOpenId, restartedFreshMsg, 'text', () => sessionReply(rootId, restartedFreshMsg));
+        await deliverEphemeralOrReply(restart.current, operatorOpenId, restartedFreshMsg, 'text', () => sessionReply(rootId, restartedFreshMsg));
         // DM card will be sent by the ready handler when worker starts
       }
     }
@@ -1640,13 +1722,38 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // 会话」却静默无反应会让人以为按钮坏了，给一条失败 toast（成功路径不弹，已关卡即反馈）。
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
       }
-      const botCfg = getBot(ds.larkAppId).config;
-      // Build the closed card BEFORE killWorker/closeSession — it reads the
-      // live session's identity off `ds`.
-      const card = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
-      killWorker(ds);
-      sessionStore.closeSession(ds.session.sessionId);
-      activeSessions.delete(sKey);
+      const targetSessionId = ds.session.sessionId;
+      const closed = await withBotTurnMutation(ds.larkAppId, async () => {
+        // Card payload roots survive transfers. Re-resolve by immutable session
+        // id after draining admissions, then let the pool remove the target's
+        // CURRENT activeSessionKey. Never delete the stale payload root, which
+        // may now belong to an unrelated pending FIFO owner.
+        const current = [...activeSessions.values()].find(
+          candidate => candidate.session.sessionId === targetSessionId,
+        );
+        if (!current) return undefined;
+        const botCfg = getBot(current.larkAppId).config;
+        const card = buildClosedSessionCard(current, localeForBot(current.larkAppId));
+        const result = await closeWorkerPoolSession(targetSessionId);
+        if (!result.ok) return { status: 'failed' as const, current, failure: result };
+        return { status: 'closed' as const, current, botCfg, card };
+      });
+      if (!closed) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+      }
+      if (closed.status === 'failed') {
+        logger.warn(
+          `[${tag(closed.current)}] close card refused: ${closed.failure.error} `
+          + `task=${closed.failure.taskId}`,
+        );
+        return {
+          toast: {
+            type: 'error',
+            content: 'Riff 远端任务取消失败；会话仍保持活跃，请重试关闭。',
+          },
+        };
+      }
+      const { current, botCfg, card } = closed;
       // The closed card carries session title / CLI name / workingDir / resume
       // command. In private-card mode those must not leak to the group — send the
       // closed card ephemeral to the same owner audience instead. No group
@@ -1655,15 +1762,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // clicked, so a card built in private mode stays ephemeral even if the
       // bot's `privateCard` config was turned off in the meantime.
       if (value?.visibility === 'private' || botCfg.privateCard) {
-        const audience = resolvePrivateCardAudience(ds);
+        const audience = resolvePrivateCardAudience(current);
         for (const openId of audience) {
-          await sendEphemeralCard(ds.larkAppId, ds.chatId, openId, card).catch(err =>
-            logger.warn(`[${tag(ds)}] private close card ephemeral send to ${openId.substring(0, 8)}… failed: ${err}`));
+          await sendEphemeralCard(current.larkAppId, current.chatId, openId, card).catch(err =>
+            logger.warn(`[${tag(current)}] private close card ephemeral send to ${openId.substring(0, 8)}… failed: ${err}`));
         }
-        logger.info(`[${tag(ds)}] Closed via card button (private close card → ${audience.length} owner(s))`);
+        logger.info(`[${tag(current)}] Closed via card button (private close card → ${audience.length} owner(s))`);
       } else {
-        await deliverEphemeralOrReply(ds, operatorOpenId, card, 'interactive', () => sessionReply(rootId, card, 'interactive'));
-        logger.info(`[${tag(ds)}] Closed via card button`);
+        await deliverEphemeralOrReply(current, operatorOpenId, card, 'interactive', () => sessionReply(rootId, card, 'interactive'));
+        logger.info(`[${tag(current)}] Closed via card button`);
       }
     }
 
@@ -1697,9 +1804,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'disconnect' && ds) {
-      killWorker(ds);
-      sessionStore.closeSession(ds.session.sessionId);
-      activeSessions.delete(sKey);
+      const targetSessionId = ds.session.sessionId;
+      const disconnected = await withBotTurnMutation(ds.larkAppId, async () => {
+        const current = [...activeSessions.values()].find(
+          candidate => candidate.session.sessionId === targetSessionId,
+        );
+        if (!current) return undefined;
+        await closeWorkerPoolSession(targetSessionId);
+        return current;
+      });
+      if (!disconnected) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+      }
       await sessionReply(rootId, t('card.action.disconnected', undefined, localeForBot(ds.larkAppId)));
       logger.info(`[${tag(ds)}] Disconnected (adopt) via card button`);
     }
@@ -1725,6 +1841,36 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return;
       }
 
+      const retryCodexAppInput = ds.lastCodexAppInput
+        ? (({ clientUserMessageId: _priorMessageId, ...input }) => input)(ds.lastCodexAppInput)
+        : undefined;
+      const retryInput = {
+        content: cliInput,
+        ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
+      };
+      if ((!ds.worker || ds.worker.killed) && hasProtectedSessionMutationOwnership(ds)) {
+        await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
+        return;
+      }
+      let accepted = false;
+      try {
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
+        else {
+          forkWorker(ds, retryInput, ds.hasHistory);
+          accepted = true;
+        }
+      } catch (err) {
+        logger.warn(
+          `[${tag(ds)}] retry_last_task failed before acceptance: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (!accepted) {
+        await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
+        return;
+      }
+      // Only now consume the one-shot retry state and advertise working: live
+      // IPC or the durable activation tail already owns the exact retry input.
       clearUsageLimitState(ds);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;
@@ -1755,16 +1901,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         );
         scheduleCardPatch(ds, cardJson);
       }
-
-      const retryCodexAppInput = ds.lastCodexAppInput
-        ? (({ clientUserMessageId: _priorMessageId, ...input }) => input)(ds.lastCodexAppInput)
-        : undefined;
-      const retryInput = {
-        content: cliInput,
-        ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
-      };
-      if (ds.worker && !ds.worker.killed) sendWorkerInput(ds, retryInput);
-      else forkWorker(ds, retryInput, ds.hasHistory);
       logger.info(`[${tag(ds)}] Retrying last task after usage limit`);
       if (cardJson) {
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
@@ -2181,31 +2317,27 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, locDs) } };
       }
       if (ds.pendingRepo) {
-        if (ds.worktreeCreating || ds.pendingRepoCommitInFlight) {
-          return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locDs) } };
-        }
         const cwd = getSessionWorkingDir(ds);
-        // Reuse the same claimed pending->worker transition as a normal repo
-        // selection. This keeps buffering active across prompt preparation and
-        // makes skip/select races single-winner. Do NOT pin the resolved default
-        // cwd (often $HOME) onto session.workingDir — that would let sibling
-        // bots inherit HOME instead of getting their own repo card. Confirmation
-        // + card withdraw run under the claim inside commitRepoSelection.
-        await commitRepoSelection(
-          { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply },
+        // "Start directly" is the same pending-start commit as choosing a
+        // directory, just pinned to the current/default cwd. Reusing the shared
+        // helper gives this card path the bot mutation, exact-owner recheck,
+        // buffered-sidecar handling, and fork-before-release ordering.
+        const started = await commitRepoSelection(
+          { ds, rootId, cardMessageId, larkAppId: larkAppId ?? ds.larkAppId, operatorOpenId, activeSessions, sessionReply },
           cwd,
-          pathBasename(cwd) || cwd,
+          cwd,
           {
             suppressConfirmReply: true,
             confirmReplyText: t('cmd.skip.opened', { cwd }, locDs),
             pinWorkingDir: false,
           },
         );
-        if (!ds.pendingRepo) {
+        if (started) {
           logger.info(`[${tag(ds)}] Skip repo, spawning CLI in ${cwd}`);
         }
       } else {
         await sessionReply(rootId, t('card.action.continue_using_current_repo', { cwd: getSessionWorkingDir(ds) }, locDs));
+        markRepoCardConsumed(ds, cardMessageId);
         if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
         ds.repoCardMessageId = undefined;
       }
@@ -2248,10 +2380,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // re-send a fresh repo card in the new mode — a form can't ride an
       // in-place patch, so the old card is withdrawn and a new one posted.
       const locDs = localeForBot(ds.larkAppId);
-      // Same active-card gate as skip/manual/worktree: a stale card must not
-      // flip bot config or replace the live repo card after claim/restart.
-      if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {
-        return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, locDs) } };
+      if (!cardMessageId || !ds.repoCardMessageId || cardMessageId !== ds.repoCardMessageId) {
+        logger.warn(
+          `[${tag(ds)}] Ignoring stale worktree-toggle picker ${cardMessageId ?? 'none'} `
+          + `(current=${ds.repoCardMessageId ?? 'none'})`,
+        );
+        return { toast: { type: 'warning', content: t('card.repo.toast_stale_picker', undefined, locDs) } };
       }
       const spec = findConfigField('worktreeMultiPicker');
       if (!spec) return;
@@ -2259,18 +2393,47 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const r = await applyConfigField(ds.larkAppId, spec, next);
       if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, locDs) } };
       const projects = lastRepoScan.get(ds.chatId) ?? [];
-      // await so a rejected delete is caught here (not an unhandled rejection);
-      // a missing/already-gone card is fine — we post the fresh one regardless.
-      if (ds.repoCardMessageId && ds.larkAppId) { try { await deleteMessage(ds.larkAppId, ds.repoCardMessageId); } catch { /* card already gone */ } }
       const newCard = buildRepoSelectCard(projects, getSessionWorkingDir(ds), rootId, locDs, next);
-      ds.repoCardMessageId = await sessionReply(rootId, newCard, 'interactive');
+      const oldCardMessageId = ds.repoCardMessageId;
+      let newCardMessageId: string;
+      try {
+        newCardMessageId = await sessionReply(rootId, newCard, 'interactive');
+      } catch (err) {
+        logger.warn(
+          `[${tag(ds)}] Failed to publish replacement repo picker; old card remains authoritative: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+        return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: err instanceof Error ? err.message : String(err) }, locDs) } };
+      }
+      try {
+        // Switch durable authority before changing runtime identity or
+        // withdrawing the old card. A failed write leaves the old picker fully
+        // usable and makes the newly-published card stale by exact-ID guard.
+        persistPendingRepoCardMessageId(ds, newCardMessageId);
+      } catch (err) {
+        logger.error(
+          `[${tag(ds)}] Failed to persist replacement repo picker ${newCardMessageId}; `
+          + `old picker ${oldCardMessageId} retained: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+        return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: err instanceof Error ? err.message : String(err) }, locDs) } };
+      }
+      ds.repoCardMessageId = newCardMessageId;
+      // The fresh ID is now durable. Withdrawal is best-effort and cannot
+      // invalidate the new authority if Lark reports the old card missing.
+      try { await deleteMessage(ds.larkAppId, oldCardMessageId); }
+      catch { /* card already gone */ }
       return { toast: { type: 'info', content: t(next ? 'card.repo.toast_worktree_mode_switched' : 'card.repo.toast_worktree_mode_switched_back', undefined, locDs) } };
     }
 
     if (actionType === 'repo_worktree_submit' && ds) {
       const locDs = localeForBot(ds.larkAppId);
-      if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {
-        return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, locDs) } };
+      if (!cardMessageId || !ds.repoCardMessageId || cardMessageId !== ds.repoCardMessageId) {
+        logger.warn(
+          `[${tag(ds)}] Ignoring stale worktree-submit picker ${cardMessageId ?? 'none'} `
+          + `(current=${ds.repoCardMessageId ?? 'none'})`,
+        );
+        return { toast: { type: 'warning', content: t('card.repo.toast_stale_picker', undefined, locDs) } };
       }
       const selectedPaths = stringListFromLarkMultiSelect(action?.form_value?.repo_worktree_paths);
       if (selectedPaths.length === 0) {
@@ -2486,11 +2649,22 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return;
   }
 
-  // Only the live posted card may drive selection. Covers: already-consumed,
-  // wrong/old card, and post-restart (repoCardMessageId is in-memory). Must
-  // reject before mid-session switch can killWorker.
-  if (cardMessageId && !isActiveRepoCard(targetDs, cardMessageId)) {
-    return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, localeForBot(targetDs.larkAppId)) } };
+  // The picker message id is the capability for every repo dropdown. Check it
+  // before slug generation, worktreeCreating, git creation/push, or commit.
+  // In particular the direct single-select `repo_worktree` callback does not
+  // pass through the form-submit branch above, so relying on the later commit
+  // check would allow a stale card to create an orphan worktree first.
+  if (!cardMessageId || !targetDs.repoCardMessageId || cardMessageId !== targetDs.repoCardMessageId) {
+    logger.warn(
+      `[${tag(targetDs)}] Ignoring stale ${repoKey} picker ${cardMessageId ?? 'none'} `
+      + `(current=${targetDs.repoCardMessageId ?? 'none'})`,
+    );
+    return {
+      toast: {
+        type: 'warning',
+        content: t('card.repo.toast_stale_picker', undefined, localeForBot(targetDs.larkAppId)),
+      },
+    };
   }
 
   // 权限边界：pendingRepo（首次选 repo 才能 spawn）放行「会话发起人 或 canOperate」，

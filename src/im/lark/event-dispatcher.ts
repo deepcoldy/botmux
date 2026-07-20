@@ -600,6 +600,28 @@ function eventIdForKey(data: any): string | undefined {
   return data?.event_id ?? data?.uuid ?? data?.header?.event_id ?? data?.event?.event_id;
 }
 
+/**
+ * Synchronous first-stage routing lane for inbound Lark messages.
+ *
+ * Routing can await bot identity, chat mode, oncall binding, summary expansion,
+ * and VC catch-up before it discovers the canonical daemon anchor. Reserving
+ * only at that later anchor lets a faster N+1 reach the session before N.
+ *
+ * This barrier must be chat-wide, not thread-wide: a topic seed has no thread_id
+ * and initially looks chat-shaped, while its first reply carries thread_id; both
+ * later canonicalize to the seed message_id. Shared-topic aliases likewise fold
+ * a thread-shaped event back into a chat owner. Per-thread raw lanes therefore
+ * cannot prove arrival order. The barrier is released as soon as canonical work
+ * is synchronously enqueued below, so handlers for distinct canonical topics can
+ * still run concurrently.
+ */
+export function rawMessageIngressAnchor(larkAppId: string, message: any): string {
+  const chatId = typeof message?.chat_id === 'string' && message.chat_id.trim()
+    ? message.chat_id.trim()
+    : '__chatless__';
+  return `lark-message-routing:${larkAppId}:${chatId}`;
+}
+
 // card.action.trigger is a synchronous callback with a 3s deadline and NO
 // re-push (unlike events). If a handler (e.g. restart, which spawns a worker)
 // might exceed the budget, we ACK before 3s with a toast and patch the card
@@ -2905,9 +2927,22 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const claim = messageIdForKey
         ? () => claimMessageOnce(larkAppId, messageIdForKey)
         : () => claimEventOnce(eventKey);
-      let seedRoutingGate: { ready: Promise<void>; complete: () => void } | undefined;
-      const scheduled = scheduleAckSafeEvent(eventKey, () => processMessageEvent(data, seedRoutingGate), 'message event', claim);
       const rawMessage = data?.message;
+      const ingressAnchor = rawMessageIngressAnchor(larkAppId, rawMessage);
+      let seedRoutingGate: { ready: Promise<void>; complete: () => void } | undefined;
+      // Reserve the app/chat ingress lane before any routing await. Canonical
+      // per-anchor serialization inside processMessageEvent remains the final
+      // execution fence after aliases and chat mode are resolved.
+      const scheduled = scheduleAckSafeEvent(
+        eventKey,
+        () => serializeByAnchor(
+          ingressAnchor,
+          () => processMessageEvent(data, seedRoutingGate),
+          0,
+        ),
+        'message event',
+        claim,
+      );
       const rawSenderType = data?.sender?.sender_type;
       if (
         scheduled

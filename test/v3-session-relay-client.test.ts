@@ -15,6 +15,7 @@ import {
 } from '../src/workflows/v3/session-relay-client.js';
 
 const CAPABILITY = 'c'.repeat(64);
+const ORIGIN_CHANNEL = 'a'.repeat(64);
 
 describe('readWorkflowSessionRelayContext', () => {
   let root: string;
@@ -49,6 +50,7 @@ describe('readWorkflowSessionRelayContext', () => {
     writeFileSync(
       join(relayDir, RELAY_ORIGIN_CAPABILITY_BASENAME),
       JSON.stringify({ token: CAPABILITY }),
+      { mode: 0o600 },
     );
     const context = readWorkflowSessionRelayContext({
       env: {
@@ -72,41 +74,59 @@ describe('readWorkflowSessionRelayContext', () => {
     // host session (whose live marker is visible) must keep the strictly
     // stronger marker + signed-envelope path instead of being hijacked onto
     // the relay with a stale token.
-    const carveOut = managedOriginCapabilityPath(dataDir, 'sess-1');
+    const carveOut = managedOriginCapabilityPath(dataDir, 'sess-1', ORIGIN_CHANNEL);
     mkdirSync(dirname(carveOut), { recursive: true });
-    writeFileSync(carveOut, JSON.stringify({ sessionId: 'sess-1', capability: CAPABILITY }));
+    writeFileSync(carveOut, JSON.stringify({
+      sessionId: 'sess-1',
+      channelId: ORIGIN_CHANNEL,
+      capability: CAPABILITY,
+    }), { mode: 0o600 });
     expect(readWorkflowSessionRelayContext({
-      env: { BOTMUX_SESSION_ID: 'sess-1' },
+      env: {
+        BOTMUX_SESSION_ID: 'sess-1',
+        BOTMUX_ORIGIN_CHANNEL_ID: ORIGIN_CHANNEL,
+      },
       dataDir,
       findMarker: () => ({ sessionId: 'sess-1', turnId: 'turn-1' }),
     })).toBeNull();
     // A corrupt marker ({sessionId: ''}) does not count as live — same
     // precedence as resolveSessionContext.
     expect(readWorkflowSessionRelayContext({
-      env: { BOTMUX_SESSION_ID: 'sess-1' },
+      env: {
+        BOTMUX_SESSION_ID: 'sess-1',
+        BOTMUX_ORIGIN_CHANNEL_ID: ORIGIN_CHANNEL,
+      },
       dataDir,
       findMarker: () => ({ sessionId: '' }),
     })).not.toBeNull();
   });
 
   it('detects a macOS read-isolated session via the per-session carve-out file', () => {
-    const carveOut = managedOriginCapabilityPath(dataDir, 'sess-1');
+    const carveOut = managedOriginCapabilityPath(dataDir, 'sess-1', ORIGIN_CHANNEL);
     mkdirSync(dirname(carveOut), { recursive: true });
     writeFileSync(carveOut, JSON.stringify({
       sessionId: 'sess-1',
+      channelId: ORIGIN_CHANNEL,
       capability: CAPABILITY,
       turnId: 'turn-7',
       dispatchAttempt: 2,
-    }));
+      ipcPort: 4321,
+    }), { mode: 0o600 });
     const context = readWorkflowSessionRelayContext({
-      env: { BOTMUX_SESSION_ID: 'sess-1' },
+      env: {
+        BOTMUX_SESSION_ID: 'sess-1',
+        BOTMUX_ORIGIN_CHANNEL_ID: ORIGIN_CHANNEL,
+        BOTMUX_DAEMON_IPC_PORT: '4999',
+      },
       dataDir,
     });
     expect(context).toEqual({
       sessionId: 'sess-1',
       capability: CAPABILITY,
+      originChannelId: ORIGIN_CHANNEL,
       turnId: 'turn-7',
       dispatchAttempt: 2,
+      ipcPortFallback: 4321,
     });
   });
 
@@ -114,6 +134,7 @@ describe('readWorkflowSessionRelayContext', () => {
     writeFileSync(
       join(relayDir, RELAY_ORIGIN_CAPABILITY_BASENAME),
       JSON.stringify({ token: CAPABILITY }),
+      { mode: 0o600 },
     );
     for (const bad of ['abc', '0', '-4310', '4310.5']) {
       const context = readWorkflowSessionRelayContext({
@@ -133,6 +154,7 @@ describe('postWorkflowSessionRunMutation', () => {
   const context: WorkflowSessionRelayContext = {
     sessionId: 'sess-1',
     capability: CAPABILITY,
+    originChannelId: ORIGIN_CHANNEL,
     turnId: 'turn-7',
     dispatchAttempt: 2,
     larkAppId: 'cli_owner',
@@ -156,11 +178,14 @@ describe('postWorkflowSessionRunMutation', () => {
     expect(response).toEqual({ ok: true, status: 200, bodyRaw: JSON.stringify({ ok: true }) });
     expect(fetchImpl).toHaveBeenCalledOnce();
     const [url, init] = fetchImpl.mock.calls[0]! as unknown as [string, RequestInit];
-    expect(url).toBe('http://127.0.0.1:4999/api/v3/session-runs/run-1/cancel');
+    // The protected capability snapshot's port is authoritative routing data;
+    // mutable discovery descriptors cannot override it.
+    expect(url).toBe('http://127.0.0.1:4310/api/v3/session-runs/run-1/cancel');
     expect(JSON.parse(String(init.body))).toEqual({
       reason: 'stop',
       sessionId: 'sess-1',
       originCapability: CAPABILITY,
+      originChannelId: ORIGIN_CHANNEL,
       originTurnId: 'turn-7',
       originDispatchAttempt: 2,
     });
@@ -182,9 +207,9 @@ describe('postWorkflowSessionRunMutation', () => {
     });
   });
 
-  it('prefers discovery, falls back to the env port marker, then fails closed', async () => {
+  it('prefers the protected capability port, falls back to discovery, then fails closed', async () => {
     const fetchImpl = fetchOk();
-    const resolveIpcPort = vi.fn(() => undefined);
+    const resolveIpcPort = vi.fn(() => 4999);
     await postWorkflowSessionRunMutation({
       context,
       runId: 'run-1',
@@ -194,6 +219,20 @@ describe('postWorkflowSessionRunMutation', () => {
     });
     expect(resolveIpcPort).toHaveBeenCalledWith('cli_owner');
     expect(String(fetchImpl.mock.calls[0]![0])).toContain(':4310/');
+
+    const discoveryFetch = fetchOk();
+    await postWorkflowSessionRunMutation({
+      context: {
+        sessionId: 'sess-1',
+        capability: CAPABILITY,
+        larkAppId: 'cli_owner',
+      },
+      runId: 'run-1',
+      mutation: 'start',
+      resolveIpcPort,
+      fetchImpl: discoveryFetch,
+    });
+    expect(String(discoveryFetch.mock.calls[0]![0])).toContain(':4999/');
 
     await expect(postWorkflowSessionRunMutation({
       context: { sessionId: 'sess-1', capability: CAPABILITY },
