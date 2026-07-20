@@ -369,7 +369,10 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
   return [];
 }
 
-export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; resources: MessageResource[] } {
+export function parseEventMessage(
+  data: RawEventData,
+  numberer: ImgNumberer = createImgNumberer(),
+): { parsed: LarkMessage; resources: MessageResource[] } {
   const { sender, message } = data;
 
   // Trace non-text messages at debug only (DEBUG=1 gated). The raw card/post
@@ -384,7 +387,6 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
   // Share numberer so in-body [图片 N] placeholders use the same numbers as
   // the attachment list. Resources first → numbers assigned; text second →
   // reuses them.
-  const numberer = createImgNumberer();
   const resources = extractResources(message.message_type, message.content, numberer);
 
   // Extract structured mentions

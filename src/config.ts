@@ -127,6 +127,23 @@ export function vcMeetingAgentGlobalListenerBotAppId(): string | undefined {
   return globalVcMeetingAgentListenerBotAppId();
 }
 
+const DEFAULT_FORWARD_FOLLOWUP_WAIT_MS = 1_500;
+const MAX_FORWARD_FOLLOWUP_WAIT_MS = 10_000;
+
+/**
+ * Grace period for coalescing a newly forwarded topic with the user's
+ * immediate root-linked clarification. Zero is an explicit kill switch.
+ */
+export function resolveForwardFollowupWaitMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.BOTMUX_FORWARD_FOLLOWUP_WAIT_MS?.trim();
+  if (!raw) return DEFAULT_FORWARD_FOLLOWUP_WAIT_MS;
+
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return DEFAULT_FORWARD_FOLLOWUP_WAIT_MS;
+  if (value === 0) return 0;
+  return Math.min(MAX_FORWARD_FOLLOWUP_WAIT_MS, Math.max(1, Math.trunc(value)));
+}
+
 export const config = {
   lark: {
     appId: process.env.LARK_APP_ID ?? '',
@@ -158,6 +175,7 @@ export const config = {
      *  BOTMUX_RECOVERY_FORK_DELAY_MS. */
     recoveryForkBatchSize: Math.max(1, Number(process.env.BOTMUX_RECOVERY_FORK_BATCH) || 5),
     recoveryForkDelayMs: Math.max(0, Number(process.env.BOTMUX_RECOVERY_FORK_DELAY_MS ?? 250)),
+    forwardFollowupWaitMs: resolveForwardFollowupWaitMs(),
     workingDir: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean)[0] || '~',
     workingDirs: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean),
     allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
