@@ -129,7 +129,7 @@ import {
 } from './services/whiteboard-store.js';
 import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
 import { bindRestartLeaseTo, writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
-import { stripLegacyPendingCardFields } from './services/session-store.js';
+import { repairMissingChatScope, stripLegacyPendingCardFields } from './services/session-store.js';
 import {
   evaluateVcMeetingManagedSend,
   isTrustedVcMeetingHostRelayParent,
@@ -2918,7 +2918,9 @@ function loadSessions(): Map<string, SessionData> {
       legacyData = JSON.parse(readFileSync(legacyFp, 'utf-8'));
       for (const [, v] of Object.entries(legacyData)) {
         const s = v as SessionData;
-        if (s.sessionId) sessions.set(s.sessionId, s);
+        if (!s || typeof s !== 'object' || !s.sessionId) continue;
+        repairMissingChatScope(s);
+        sessions.set(s.sessionId, s);
       }
     } catch { /* ignore */ }
   }
@@ -2933,7 +2935,8 @@ function loadSessions(): Map<string, SessionData> {
           const data = JSON.parse(readFileSync(join(dataDir, file), 'utf-8'));
           for (const [, v] of Object.entries(data)) {
             const session = v as SessionData;
-            if (!session.sessionId) continue;
+            if (!session || typeof session !== 'object' || !session.sessionId) continue;
+            repairMissingChatScope(session);
             // Stamp larkAppId so saveSession writes back to the correct file
             if (!session.larkAppId) session.larkAppId = appId;
             sessions.set(session.sessionId, session);
