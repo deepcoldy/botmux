@@ -166,7 +166,7 @@ vi.mock('../src/core/scheduler.js', () => ({
   getNextRun: vi.fn(),
   addTask: vi.fn(),
   extractDeliveryMode: vi.fn((prompt: string) => ({ deliver: 'origin' as const, prompt })),
-  extractScheduleModifiers: vi.fn((prompt: string) => ({ deliver: 'origin' as const, silent: false, prompt })),
+  extractScheduleModifiers: vi.fn((prompt: string) => ({ deliver: 'origin' as const, silent: false, freshContext: false, prompt })),
 }));
 
 vi.mock('../src/services/project-scanner.js', () => ({
@@ -2815,6 +2815,7 @@ describe('handleCommand', () => {
       vi.mocked(scheduler.extractScheduleModifiers).mockReturnValue({
         deliver: 'origin',
         silent: true,
+        freshContext: false,
         prompt: '检查服务，挂了才报警',
       });
       vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-silent', prompt: '检查服务，挂了才报警' } as any);
@@ -2843,6 +2844,7 @@ describe('handleCommand', () => {
       vi.mocked(scheduler.extractScheduleModifiers).mockReturnValue({
         deliver: 'new-topic',
         silent: true,
+        freshContext: false,
         prompt: '生成日报',
       });
 

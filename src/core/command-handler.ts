@@ -793,9 +793,13 @@ async function handleScheduleCommand(
     const taskScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
     // "新话题" keyword → every fire opens a brand-new topic in a fresh session.
     // "静默" keyword → fires post no banner; the model decides whether to send.
-    const { deliver, silent, prompt: schedPrompt } = scheduler.extractScheduleModifiers(parsed.prompt);
+    const { deliver, silent, freshContext, prompt: schedPrompt } = scheduler.extractScheduleModifiers(parsed.prompt);
     if (silent && deliver === 'new-topic') {
       await sessionReply(rootId, t('schedule.silent_new_topic_conflict', undefined, loc));
+      return;
+    }
+    if (freshContext && !silent) {
+      await sessionReply(rootId, t('schedule.fresh_context_requires_silent', undefined, loc));
       return;
     }
     const schedName = schedPrompt !== parsed.prompt
@@ -814,6 +818,7 @@ async function handleScheduleCommand(
       larkAppId,
       deliver,
       silent,
+      freshContext,
     });
     const next = scheduler.getNextRun(task.id);
     const nextStr = next ? next.toLocaleString(timeLocale, { timeZone }) : 'N/A';
@@ -827,7 +832,8 @@ async function handleScheduleCommand(
     }, loc);
     const deliverNote = deliver === 'new-topic' ? '\n' + t('schedule.deliver_new_topic', undefined, loc) : '';
     const silentNote = silent ? '\n' + t('schedule.silent_note', undefined, loc) : '';
-    await sessionReply(rootId, createdMsg + deliverNote + silentNote);
+    const freshContextNote = freshContext ? '\n' + t('schedule.fresh_context_note', undefined, loc) : '';
+    await sessionReply(rootId, createdMsg + deliverNote + silentNote + freshContextNote);
     return;
   }
 

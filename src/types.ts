@@ -473,6 +473,13 @@ export interface ScheduledTask {
    *  (a new topic can only be opened by a first message); creation rejects the
    *  combination and a runtime encounter falls back to a loud fire. */
   silent?: boolean;
+  /** Fresh-context silent execution: each run spawns a brand-new CLI session
+   * (killing any prior session at the anchor) so consecutive runs never share
+   * history/context. Only valid with silent:true — a loud new-topic fire already
+   * gets a fresh session by opening a new topic. Creation rejects the
+   * non-silent combination; a stored task that reaches executeScheduledTask
+   * with freshContext but no silent falls back to normal silent behaviour. */
+  freshContext?: boolean;
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }

@@ -92,6 +92,7 @@ function ScheduleRowCard(props: {
           <span>{kind}</span>
           <span>{tr('schedules.delivery')}: {deliveryLabel(s, tr)}</span>
           {s.silent ? <span>🔇 {tr('schedules.silent')}</span> : null}
+          {s.freshContext ? <span>🆕 {tr('schedules.freshContext')}</span> : null}
           <span>{tr('schedules.next')}: {fmtScheduleDate(s.nextRunAt, scheduleTimeZone)}</span>
           <span>{tr('schedules.last')}: {fmtScheduleDate(s.lastRunAt, scheduleTimeZone)}</span>
           {s.lastStatus === 'error' ? (
@@ -256,6 +257,7 @@ function SchedulesPage() {
   async function handleSubmit(data: {
     name: string; schedule: string; prompt: string;
     deliver: 'origin' | 'new-topic'; deliverTouched: boolean; silent: boolean;
+    freshContext: boolean;
     chatId: string; larkAppId: string;
   }): Promise<void> {
     setFormError(null);
@@ -267,7 +269,7 @@ function SchedulesPage() {
       // Only include `deliver` in the PATCH when the user explicitly changed it,
       // so legacy 'local' tasks aren't silently rewritten to 'origin'.
       const payload = editing
-        ? { name: data.name, schedule: data.schedule, prompt: data.prompt, silent: data.silent, ...(data.deliverTouched ? { deliver: data.deliver } : {}) }
+        ? { name: data.name, schedule: data.schedule, prompt: data.prompt, silent: data.silent, freshContext: data.freshContext, ...(data.deliverTouched ? { deliver: data.deliver } : {}) }
         : data;
       const r = await fetch(url, {
         method,
@@ -447,6 +449,7 @@ interface ScheduleFormData {
    *  don't silently rewrite the task's delivery mode. */
   deliverTouched: boolean;
   silent: boolean;
+  freshContext: boolean;
   chatId: string;
   larkAppId: string;
 }
@@ -468,6 +471,7 @@ function ScheduleFormModal(props: {
   );
   const [deliverTouched, setDeliverTouched] = useState(false);
   const [silent, setSilent] = useState(editing?.silent === true);
+  const [freshContext, setFreshContext] = useState(editing?.freshContext === true);
   const [chatId, setChatId] = useState(editing?.chatId ?? '');
   const [larkAppId, setLarkAppId] = useState(editing?.larkAppId ?? bots[0]?.larkAppId ?? '');
 
@@ -486,7 +490,7 @@ function ScheduleFormModal(props: {
     e.preventDefault();
     if (silentNewTopicConflict) return;
     if (!editing && !larkAppId) return;
-    props.onSubmit({ name, schedule, prompt, deliver, deliverTouched, silent, chatId, larkAppId });
+    props.onSubmit({ name, schedule, prompt, deliver, deliverTouched, silent, freshContext, chatId, larkAppId });
   }
 
   return (
@@ -597,6 +601,11 @@ function ScheduleFormModal(props: {
                   setDeliver('origin');
                   setDeliverTouched(true);
                 }
+                // fresh-context requires silent: unchecking silent also unchecks
+                // fresh-context so the submitted data stays consistent.
+                if (!e.target.checked && freshContext) {
+                  setFreshContext(false);
+                }
               }}
             />
             <span>
@@ -604,6 +613,19 @@ function ScheduleFormModal(props: {
               <small className="schedule-form-help">{tr('schedules.form.silentHelp')}</small>
             </span>
           </label>
+          {silent ? (
+            <label className="schedule-form-field schedule-form-toggle">
+              <input
+                type="checkbox"
+                checked={freshContext}
+                onChange={e => setFreshContext(e.target.checked)}
+              />
+              <span>
+                {tr('schedules.form.freshContext')}
+                <small className="schedule-form-help">{tr('schedules.form.freshContextHelp')}</small>
+              </span>
+            </label>
+          ) : null}
           {silentNewTopicConflict ? (
             <p className="schedule-form-error">{tr('schedules.form.silentNewTopicConflict')}</p>
           ) : null}

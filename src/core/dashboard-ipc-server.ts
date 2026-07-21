@@ -1252,6 +1252,7 @@ export interface ScheduleRow {
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  freshContext?: boolean;
   feishuChatLink: string;
 }
 
@@ -1275,6 +1276,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     repeat: t.repeat,
     deliver: t.deliver ?? 'origin',
     silent: t.silent,
+    freshContext: t.freshContext,
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }
@@ -1317,6 +1319,15 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
     }
     silent = b.silent;
   }
+  // Validate freshContext type — if present, must be boolean. Only valid
+  // with silent:true (enforced by addTask choke point).
+  let freshContext = false;
+  if (b.freshContext !== undefined) {
+    if (typeof b.freshContext !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'freshContext' });
+    }
+    freshContext = b.freshContext;
+  }
   // `local` (log-only, no delivery) is not implemented in the executor —
   // reject it from the dashboard API rather than silently degrading to origin.
   let deliver: 'origin' | 'new-topic' = 'origin';
@@ -1350,6 +1361,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       larkAppId: cachedLarkAppId,
       deliver,
       silent,
+      freshContext,
     });
     dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: composeScheduleRow(task) } });
     jsonRes(res, 200, { ok: true, task: composeScheduleRow(task) });
@@ -1370,6 +1382,7 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
   const updates: {
     name?: string; prompt?: string; schedule?: string;
     deliver?: 'origin' | 'new-topic'; silent?: boolean;
+    freshContext?: boolean;
   } = {};
   // If a field is present, it must be the correct type and (for strings)
   // non-empty after trim — otherwise 400, never silently ignore.
@@ -1402,6 +1415,12 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
       return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'silent' });
     }
     updates.silent = b.silent;
+  }
+  if (b.freshContext !== undefined) {
+    if (typeof b.freshContext !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'freshContext' });
+    }
+    updates.freshContext = b.freshContext;
   }
   const result = scheduler.updateTask(p.id, updates);
   if (!result.ok) return jsonRes(res, 400, result);

@@ -491,6 +491,8 @@ export const messages: Record<string, string> = {
   'schedule.created': '✅ Scheduled task created!\n\nID: {id}\nName: {name}\nRule: {rule}\nPrompt: {prompt}\nWorking dir: {dir}\nNext run: {next}',
   'schedule.deliver_new_topic': 'Delivery: opens a new topic each run (fresh, isolated session)',
   'schedule.silent_note': 'Silent mode: fires post no "started" banner; the model only sends (botmux send) when the alert condition is met, otherwise stays fully silent',
+  'schedule.fresh_context_note': 'Fresh context: each silent run uses a brand-new CLI session with no inherited history',
+  'schedule.fresh_context_requires_silent': '"Fresh context" can only be used with "silent": non-silent tasks (like "new topic") already get a fresh session each run, so this option is unnecessary.',
   'schedule.silent_new_topic_conflict': '"Silent" and "new topic" cannot be combined: a new topic requires a first message. For "open a topic only on alert", instruct the model in the prompt to use a top-level botmux send when alerting.',
   'schedule.parse_failed': 'Cannot parse schedule. Use a natural-language form:\n\n/schedule daily 17:50 summarize today\'s AI news\n/schedule weekdays 9:00 check service status\n/schedule mondays 10:00 generate weekly report\n/schedule hourly check service health\n/schedule every 30 minutes ping the service\n/schedule 1st of each month 9:00 generate monthly report\n\nManagement:\n/schedule list — list all tasks\n/schedule remove <id> — delete a task\n/schedule enable <id> — enable a task\n/schedule disable <id> — disable a task\n/schedule run <id> — run once now',
 

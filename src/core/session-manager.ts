@@ -1729,6 +1729,13 @@ export async function executeScheduledTask(
     silent = false;
   }
 
+  // Fresh-context: each silent run gets a brand-new CLI session with no
+  // inherited history. Kill any live session at the anchor before spawning so
+  // previous runs don't pollute context or consume tokens. Only meaningful
+  // with silent; if a stored task reaches here with freshContext but no
+  // silent, ignore it (normal silent behaviour applies).
+  const freshContext = silent && task.freshContext === true;
+
   // Decide where to route the "🕐 task started" notification and where the
   // session conversation lands.
   //
@@ -1866,8 +1873,23 @@ export async function executeScheduledTask(
   const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
 
   // Inject into a live session if one already exists at this anchor.
+  // Fresh-context silent tasks never reuse a prior session — each run gets a
+  // brand-new context, so we skip continuation entirely and evict any live
+  // session at the anchor before spawning.
   const existing = activeSessions.get(sessionKey(anchor, larkAppId));
-  if (isContinuation && existing?.worker && !existing.worker.killed) {
+  if (freshContext && existing) {
+    // Kill the prior session's worker so its history/context/tokens don't leak
+    // into the fresh run. closeSession removes it from the global registry; we
+    // also delete from the local activeSessions map so the new spawn below can
+    // re-key at the same anchor without a stale entry.
+    try {
+      await closeSession(existing.session.sessionId);
+    } catch (err: any) {
+      logger.warn(`[scheduler] Failed to close prior session for fresh-context task ${task.id}: ${err.message}`);
+    }
+    activeSessions.delete(sessionKey(anchor, larkAppId));
+  }
+  if (!freshContext && isContinuation && existing?.worker && !existing.worker.killed) {
     markSessionActivity(existing);
     try {
       ensureSessionWhiteboard(existing);
@@ -1923,7 +1945,7 @@ export async function executeScheduledTask(
     spawnedAt: sessionCreatedAtMs(session),
     cliVersion: getCurrentCliVersion(),
     lastMessageAt: now,
-    hasHistory: isContinuation,
+    hasHistory: freshContext ? false : isContinuation,
     workingDir: task.workingDir,
   };
   ensureSessionWhiteboard(ds);

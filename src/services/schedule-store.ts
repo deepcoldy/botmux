@@ -85,6 +85,7 @@ export function canonicalScheduleInput(t: {
   repeat?: { times: number | null; completed?: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  freshContext?: boolean;
 }): unknown {
   return {
     name: t.name,
@@ -116,6 +117,9 @@ export function canonicalScheduleInput(t: {
     // `silent: false`/absent normalizes to undefined (dropped by
     // computeInputHash) so pre-existing tasks keep their canonical hash.
     silent: t.silent === true ? true : undefined,
+    // `freshContext: false`/absent normalizes to undefined (same rationale
+    // as silent) so pre-existing tasks keep their canonical hash.
+    freshContext: t.freshContext === true ? true : undefined,
   };
 }
 
@@ -198,6 +202,7 @@ function migrate(raw: any): ScheduledTask | null {
     repeat: raw.repeat,
     deliver: raw.deliver ?? 'origin',
     silent: raw.silent === true ? true : undefined,
+    freshContext: raw.freshContext === true ? true : undefined,
   };
 }
 
@@ -399,6 +404,7 @@ export function createTask(params: {
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  freshContext?: boolean;
 }): ScheduledTask {
   return mutateTasks(working => {
     if (params.id) {
@@ -448,6 +454,7 @@ export function createTask(params: {
       repeat: params.repeat,
       deliver: params.deliver ?? 'origin',
       silent: params.silent === true ? true : undefined,
+      freshContext: params.freshContext === true ? true : undefined,
     };
     working.set(task.id, task);
     return { result: task, changed: true };
@@ -471,7 +478,7 @@ export function removeTask(id: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir'
+    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'freshContext' | 'workingDir'
   >>,
 ): void {
   mutateTasks(working => {

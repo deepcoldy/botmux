@@ -4478,6 +4478,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   schedule add <schedule> <prompt>     添加任务（ex: "30m" / "every 2h" / "每日9:00" / "0 9 * * *"）
        --new-topic                     每次触发在同群开一个新话题、起独立会话（不续旧话题）
        --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警（与 --new-topic 互斥）
+       --fresh-context                 静默执行时每次使用全新 CLI 会话（不继承历史上下文；仅可与 --silent 同用）
   schedule remove <id>                 删除任务
   schedule pause|resume <id>           暂停/恢复
   schedule run <id>                    标记立即执行
@@ -4976,8 +4977,15 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     // --silent: fires post no "执行中" banner; the spawned turn stays quiet and
     // the model only `botmux send`s when the alert condition in the prompt is met.
     const silent = rest.includes('--silent');
+    // --fresh-context: each silent fire runs in a brand-new CLI session with no
+    // inherited history. Only valid with --silent.
+    const freshContext = rest.includes('--fresh-context');
     if (silent && deliver === 'new-topic') {
       console.error('--silent 与 --new-topic 不能同时使用：新话题必须由首条消息开启。要「有异常才开新话题」，请在 prompt 里指示模型报警时用 botmux send 顶层发送。');
+      process.exit(1);
+    }
+    if (freshContext && !silent) {
+      console.error('--fresh-context 仅可与 --silent 同时使用：非静默任务（如 --new-topic）每次已自动开新会话，无需额外指定。');
       process.exit(1);
     }
 
@@ -5009,6 +5017,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       scope: cur?.scope,
       deliver,
       silent,
+      freshContext,
     });
 
     const next = task.nextRunAt ? new Date(task.nextRunAt).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() }) : '—';
@@ -5018,6 +5027,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     console.log(`   工作目录: ${workingDir}`);
     console.log(`   话题: ${deliver === 'new-topic' ? '(每次新开话题，独立会话)' : rootMessageId ?? '(将新开)'}`);
     if (silent) console.log('   静默: 触发时不发「执行中」提示，由模型判断是否需要 botmux send 报警');
+    if (freshContext) console.log('   独立上下文: 每次运行使用全新 CLI 会话，不继承历史上下文');
     return;
   }
 

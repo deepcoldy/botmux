@@ -310,27 +310,48 @@ export function extractSilentMode(prompt: string): { silent: boolean; prompt: st
 }
 
 /**
- * Extract both /schedule prompt modifiers (delivery + silent) regardless of
- * their order ("静默 新话题 …" / "新话题 静默 …").  The combination is NOT
- * validated here — callers reject silent+new-topic with a user-facing error.
+ * Detect a leading "fresh context" keyword in a /schedule prompt and strip it.
+ * Lets users write `/schedule 每30分钟 静默 独立 检查服务，挂了才报警` so each
+ * silent fire runs in a brand-new CLI session with no inherited history. The
+ * keyword must be followed by whitespace/punctuation. Only meaningful when
+ * combined with silent — callers validate that combination.
+ */
+export function extractFreshContextMode(prompt: string): { freshContext: boolean; prompt: string } {
+  const zh = prompt.match(/^\s*(?:独立|全新上下文|新上下文|每次独立)(?:执行|运行|地)?[\s,，、:：。-]+(.+)$/s);
+  if (zh && zh[1].trim()) return { freshContext: true, prompt: zh[1].trim() };
+  const en = prompt.match(/^\s*(?:fresh[\s-]?context|independent)(?:[\s,，、:：。-]+|$)(.*)$/is);
+  if (en && en[1].trim()) return { freshContext: true, prompt: en[1].trim() };
+  return { freshContext: false, prompt };
+}
+
+/**
+ * Extract /schedule prompt modifiers (delivery + silent + fresh-context)
+ * regardless of their order.  Up to three keywords are consumed (one per
+ * modifier) so any ordering works.  Combinations are NOT validated here —
+ * callers reject invalid ones (silent+new-topic, fresh-context without silent)
+ * with a user-facing error.
  */
 export function extractScheduleModifiers(prompt: string): {
   deliver: 'origin' | 'new-topic';
   silent: boolean;
+  freshContext: boolean;
   prompt: string;
 } {
   let deliver: 'origin' | 'new-topic' = 'origin';
   let silent = false;
+  let freshContext = false;
   let rest = prompt;
-  // Two keywords max — loop twice so either order is handled.
-  for (let i = 0; i < 2; i++) {
+  // Three keywords max — loop three times so any order is handled.
+  for (let i = 0; i < 3; i++) {
     const d = extractDeliveryMode(rest);
     if (d.deliver === 'new-topic') { deliver = 'new-topic'; rest = d.prompt; continue; }
     const s = extractSilentMode(rest);
     if (s.silent) { silent = true; rest = s.prompt; continue; }
+    const f = extractFreshContextMode(rest);
+    if (f.freshContext) { freshContext = true; rest = f.prompt; continue; }
     break;
   }
-  return { deliver, silent, prompt: rest };
+  return { deliver, silent, freshContext, prompt: rest };
 }
 
 // ─── next-run computation ───────────────────────────────────────────────────
@@ -564,12 +585,18 @@ export function addTask(params: {
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  freshContext?: boolean;
 }): ScheduledTask {
   // Single choke point for the invalid combination — every creation entry
   // (CLI/slash/dashboard/workflow) funnels through here. Entry points give
   // friendlier errors first; this guard catches anything they miss.
   if (params.silent && params.deliver === 'new-topic') {
     throw new Error('silent schedules cannot use deliver:new-topic — a new topic requires a first message');
+  }
+  // fresh-context only makes sense with silent: a loud new-topic fire already
+  // gets a fresh session by opening a new topic.
+  if (params.freshContext && !params.silent) {
+    throw new Error('fresh-context requires silent:true — only silent runs need an explicit fresh-session guarantee');
   }
   const parsed = params.parsed ?? parseSchedule(params.schedule);
   const nextRunAt = computeNextRun(parsed) ?? undefined;
@@ -591,6 +618,7 @@ export function addTask(params: {
     repeat: params.repeat,
     deliver: params.deliver ?? 'origin',
     silent: params.silent,
+    freshContext: params.freshContext,
   });
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${parsed.display}, next: ${nextRunAt ?? 'N/A'}`);
   return task;
@@ -742,6 +770,7 @@ export function updateTask(
     schedule?: string;
     deliver?: 'origin' | 'new-topic';
     silent?: boolean;
+    freshContext?: boolean;
   },
 ): { ok: boolean; error?: string } {
   const task = scheduleStore.getTask(id);
@@ -754,11 +783,18 @@ export function updateTask(
     return { ok: false, error: 'silent_new_topic_exclusive' };
   }
 
+  // fresh-context requires silent (same rule as addTask).
+  const nextFreshContext = updates.freshContext ?? task.freshContext === true;
+  if (nextFreshContext && !nextSilent) {
+    return { ok: false, error: 'fresh_context_requires_silent' };
+  }
+
   const patch: Record<string, unknown> = {};
   if (updates.name !== undefined) patch.name = updates.name;
   if (updates.prompt !== undefined) patch.prompt = updates.prompt;
   if (updates.deliver !== undefined) patch.deliver = updates.deliver;
   if (updates.silent !== undefined) patch.silent = updates.silent === true ? true : undefined;
+  if (updates.freshContext !== undefined) patch.freshContext = updates.freshContext === true ? true : undefined;
 
   // Re-parse + recompute next run when the schedule expression changes.
   if (updates.schedule !== undefined && updates.schedule !== task.schedule) {

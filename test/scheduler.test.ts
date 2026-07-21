@@ -274,20 +274,29 @@ describe('extractSilentMode (静默 keyword)', () => {
 
 describe('extractScheduleModifiers (combined keywords)', () => {
   it('plain prompt: no modifiers', () => {
-    expect(extractScheduleModifiers('帮我看AI新闻')).toEqual({ deliver: 'origin', silent: false, prompt: '帮我看AI新闻' });
+    expect(extractScheduleModifiers('帮我看AI新闻')).toEqual({ deliver: 'origin', silent: false, freshContext: false, prompt: '帮我看AI新闻' });
   });
 
   it('silent only', () => {
-    expect(extractScheduleModifiers('静默 检查服务')).toEqual({ deliver: 'origin', silent: true, prompt: '检查服务' });
+    expect(extractScheduleModifiers('静默 检查服务')).toEqual({ deliver: 'origin', silent: true, freshContext: false, prompt: '检查服务' });
   });
 
   it('new-topic only', () => {
-    expect(extractScheduleModifiers('新话题 生成日报')).toEqual({ deliver: 'new-topic', silent: false, prompt: '生成日报' });
+    expect(extractScheduleModifiers('新话题 生成日报')).toEqual({ deliver: 'new-topic', silent: false, freshContext: false, prompt: '生成日报' });
   });
 
   it('both keywords, either order (conflict is rejected by callers)', () => {
-    expect(extractScheduleModifiers('静默 新话题 检查服务')).toEqual({ deliver: 'new-topic', silent: true, prompt: '检查服务' });
-    expect(extractScheduleModifiers('新话题 静默 检查服务')).toEqual({ deliver: 'new-topic', silent: true, prompt: '检查服务' });
+    expect(extractScheduleModifiers('静默 新话题 检查服务')).toEqual({ deliver: 'new-topic', silent: true, freshContext: false, prompt: '检查服务' });
+    expect(extractScheduleModifiers('新话题 静默 检查服务')).toEqual({ deliver: 'new-topic', silent: true, freshContext: false, prompt: '检查服务' });
+  });
+
+  it('silent + fresh-context, either order', () => {
+    expect(extractScheduleModifiers('静默 独立 检查服务')).toEqual({ deliver: 'origin', silent: true, freshContext: true, prompt: '检查服务' });
+    expect(extractScheduleModifiers('独立 静默 检查服务')).toEqual({ deliver: 'origin', silent: true, freshContext: true, prompt: '检查服务' });
+  });
+
+  it('fresh-context only (caller rejects without silent)', () => {
+    expect(extractScheduleModifiers('独立 检查服务')).toEqual({ deliver: 'origin', silent: false, freshContext: true, prompt: '检查服务' });
   });
 });
 

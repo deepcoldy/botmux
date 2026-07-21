@@ -56,6 +56,9 @@ export interface ScheduleCardTaskInput {
   /** Silent fires (no start banner, model decides whether to send). Silent
    *  tasks cannot switch to new-topic delivery. */
   silent?: boolean;
+  /** Fresh-context silent fires: each run spawns a fresh CLI session with no
+   * inherited history. Only valid with silent:true. */
+  freshContext?: boolean;
 }
 
 export type ScheduleKind = ParsedSchedule['kind'];
