@@ -224,6 +224,15 @@ describe('writeInput: single-line, tmux mode', () => {
     expect(pty.pasteText).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['hermes', createHermesAdapter('/bin/hermes')],
+    ['pi', createPiAdapter('/bin/pi')],
+    ['mtr', createMtrAdapter('/bin/mtr')],
+  ] satisfies AdapterEntry[])('%s: returns undefined without authoritative submit evidence', async (_name, adapter) => {
+    const result = await adapter.writeInput(makeTmuxPty(), 'silent submit path');
+    expect(result).toBeUndefined();
+  });
+
   it.each(PASTE_BUFFER_ADAPTERS)('%s: pasteText + delayed Enter, no sendText', async (_name, adapter) => {
     const pty = makeTmuxPty();
     await adapter.writeInput(pty, 'hello world');
@@ -1203,7 +1212,7 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
     const result = await adapter.writeInput(pty, MULTILINE);
 
-    expect(result).toBeUndefined();
+    expect(result).toEqual({ submitted: true });
     expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
     expect(pty.sendText).not.toHaveBeenCalled();
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
@@ -1330,8 +1339,9 @@ describe('coco writeInput submission confirmation', () => {
     const pty = makeCocoPasteTmuxPty();
     const result = await adapter.writeInput(pty, MULTILINE);
 
-    // Successful submit returns undefined (no warning needed)
-    expect(result).toBeUndefined();
+    // Verified history append is authoritative for the worker's bounded
+    // structured-turn start lease.
+    expect(result).toEqual({ submitted: true });
     // tmux paste-buffer path: single pasteText with the whole content, then
     // exactly one Enter (no retries — the mock confirmed via history.jsonl).
     expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
@@ -1393,8 +1403,8 @@ describe('coco writeInput submission confirmation', () => {
     const result = await adapter.writeInput(pty, angled);
 
     // Success path: JSON-decode + startsWith finds the Go-escaped content,
-    // so writeInput returns undefined (no warning queued).
-    expect(result).toBeUndefined();
+    // so writeInput returns an authoritative submit confirmation.
+    expect(result).toEqual({ submitted: true });
   });
 
   it('skips verification on fresh install with no history.jsonl yet', async () => {
@@ -1445,8 +1455,8 @@ describe('coco writeInput submission confirmation', () => {
     const adapter = createCocoAdapter('/bin/coco');
     const result = await adapter.writeInput(pty, prompt);
 
-    // Confirmed → no warning, and no spurious retry Enters.
-    expect(result).toBeUndefined();
+    // Confirmed → authoritative success, no warning or spurious retry Enters.
+    expect(result).toEqual({ submitted: true });
     const enterCalls = (pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter').length;
     expect(enterCalls).toBe(1);
   });

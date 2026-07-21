@@ -32,7 +32,14 @@ describe('worker pipe initial screen ordering', () => {
 
   it('runs a busy-pattern idle probe after each submitted input', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const writeIdx = source.indexOf('result = await cliAdapter.writeStructuredInput(backend, msg, item.codexAppInput);');
+    // After hybrid RPC merge, structured write may go through writeAdapter path.
+    let writeIdx = source.indexOf('result = item.codexAppInput && writeAdapter.writeStructuredInput');
+    if (writeIdx < 0) {
+      writeIdx = source.indexOf('await writeAdapter.writeStructuredInput(writeBackend, msg, item.codexAppInput)');
+    }
+    if (writeIdx < 0) {
+      writeIdx = source.indexOf('result = await cliAdapter.writeStructuredInput(backend, msg, item.codexAppInput);');
+    }
     const probeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);');
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
 
@@ -205,14 +212,18 @@ describe('worker pipe initial screen ordering', () => {
     );
     const readySetIdx = mark.indexOf('isPromptReady = true;');
     const promptReadySendIdx = mark.indexOf("send({ type: 'prompt_ready' });");
-    const idleUpdateIdx = mark.indexOf("usageLimitTracker.classify(content, 'idle')");
+    const idleUpdateIdx = mark.indexOf(
+      'usageLimitTracker.classify(content, projectedRuntimeScreenStatus())',
+    );
 
     expect(proofGuardIdx).toBeGreaterThan(-1);
     expect(proofGuardIdx).toBeLessThan(livenessGuardIdx);
     expect(livenessGuardIdx).toBeGreaterThan(-1);
     expect(signedIdleGuardIdx).toBeGreaterThan(livenessGuardIdx);
-    // The explicit runner queue wins before any immediate daemon/card idle
+    // The explicit runner queue wins before any immediate daemon/card status
     // projection; returning from the guard therefore suppresses both paths.
+    // The shared projector composes the structured lifecycle gate with signed
+    // Codex App liveness instead of hard-coding an idle card update here.
     expect(livenessGuardIdx).toBeLessThan(readySetIdx);
     expect(signedIdleGuardIdx).toBeLessThan(readySetIdx);
     expect(readySetIdx).toBeLessThan(promptReadySendIdx);

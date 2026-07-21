@@ -4,19 +4,24 @@
  * Codex stores each session's full transcript at
  *   ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<cliSessionId>.jsonl
  * and creates the file lazily on the first user submit. Inside, the bridge
- * fallback only cares about two `response_item.payload.type === 'message'`
- * shapes:
+ * fallback consumes two `response_item.payload.type === 'message'` shapes and
+ * one terminal UI-event shape:
  *
  *   - role=user             → the user's prompt text (input_text content)
  *   - role=assistant +
  *     phase=final_answer    → the model's final reply (output_text content)
+ *   - event_msg.turn_aborted → the active turn ended without a final reply
  *
- * Why these and not `event_msg`:
+ * Why final text still comes from `response_item`, while abort comes from
+ * `event_msg`:
  *   - `response_item` is the canonical transcript record; `event_msg` is a
  *     UI-event stream that can carry the same final text via two channels
  *     (`agent_message phase=final_answer` AND `task_complete.last_agent_message`).
- *     Picking `response_item` keeps the reader to a single source of truth
- *     and avoids any chance of double-emit if both paths are present.
+ *     Picking `response_item` keeps final text to a single source of truth and
+ *     avoids any chance of double-emit if both paths are present.
+ *   - An interrupted turn has no assistant response_item at all. Codex records
+ *     only `event_msg.payload.type === 'turn_aborted'`; without that terminal
+ *     edge a transcript-started lifecycle would remain busy forever.
  *   - Skipping role=developer (system instructions), phase=commentary
  *     (mid-turn status), reasoning, and function_call* keeps the bridge
  *     focused on what the user actually said and what the model finally
@@ -107,8 +112,9 @@ export interface CodexBridgeEvent {
   timestampMs: number;
   /** Discriminator for the queue layer:
    *   - 'user' starts a pending Lark turn (fingerprint-matched)
-   *   - 'assistant_final' closes the currently-collecting turn */
-  kind: 'user' | 'assistant_final';
+   *   - 'assistant_final' closes the currently-collecting turn with output
+   *   - 'turn_aborted' closes it without producing fallback output */
+  kind: 'user' | 'assistant_final' | 'turn_aborted';
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). */
   text: string;
@@ -125,6 +131,11 @@ export interface CodexBridgeEvent {
   preserveMarkTimeMs?: boolean;
 }
 
+/** Terminal lifecycle edges understood by the shared structured bridge. */
+export function isStructuredTerminalEvent(event: Pick<CodexBridgeEvent, 'kind'>): boolean {
+  return event.kind === 'assistant_final' || event.kind === 'turn_aborted';
+}
+
 /** Extract the last completed user/assistant turn from a Codex / CoCo bridge
  *  event sequence. Used by /adopt to surface the previous turn as a
  *  preamble card in the Lark thread — gives the user context to continue
@@ -136,7 +147,7 @@ export interface CodexBridgeEvent {
  *  undefined when either side is missing — typically a fresh session whose
  *  user typed something but the model hasn't replied yet. */
 export function extractLastCodexTurn(
-  events: readonly { kind: 'user' | 'assistant_final'; text: string }[],
+  events: readonly { kind: 'user' | 'assistant_final' | 'turn_aborted'; text: string }[],
 ): { userText: string; assistantText: string } | undefined {
   let assistantIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {
@@ -324,18 +335,26 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     cursor += lineByteLen;
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
-    if (obj?.type !== 'response_item') continue;
     const p = obj.payload;
-    if (!p || typeof p !== 'object' || p.type !== 'message') continue;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
+    if (obj?.type === 'event_msg' && p?.type === 'turn_aborted') {
+      const reason = typeof p.reason === 'string' ? p.reason : 'aborted';
+      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'turn_aborted', text: reason });
+      continue;
+    }
+    if (obj?.type !== 'response_item') continue;
+    if (!p || typeof p !== 'object' || p.type !== 'message') continue;
     if (p.role === 'user') {
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
     } else if (p.role === 'assistant' && p.phase === 'final_answer') {
       const text = joinTextBlocks(p.content, 'output_text');
-      if (!text) continue;
+      // final_answer is the authoritative normal terminal boundary even when
+      // Codex records an empty output_text. The worker deliberately suppresses
+      // an empty final_output, but reliable delivery still needs a completed
+      // exact-attempt turn_terminal and the lifecycle gate must be released.
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text });
     }
     // Skip role=developer (instructions), phase=commentary (mid-turn

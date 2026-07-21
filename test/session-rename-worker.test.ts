@@ -26,14 +26,21 @@ describe('worker native session rename queue', () => {
     const promptLoopIdx = region.indexOf('while (pendingMessages.length > 0');
 
     expect(region).toContain('const sessionRenameReady = isPromptReady && pendingSessionRename !== null');
-    expect(region).toContain('if (sessionRenameInFlight) return');
+    expect(region).toContain('if (sessionRenameInFlight()) return');
     expect(region).toContain('if (commandLineWritesPending > 0) return');
     expect(region).toContain('const rawInputReady = isPromptReady');
-    expect(region).toContain('await sendRawCommandLineSerially(backend, buildRename(title))');
+    expect(region).toContain('await sendRawCommandLineSerially(renameBackend, buildRename(title))');
+    expect(region).toContain("sessionRenamePhase = 'reserved'");
+    expect(region).toContain("sessionRenamePhase = 'writing'");
+    expect(region).toContain("sessionRenamePhase = 'sent'");
     expect(region).toContain('armSessionRenameIdleTimeout()');
     expect(region).toContain("effectiveBackendType === 'riff'");
     expect(renameIdx).toBeGreaterThanOrEqual(0);
     expect(renameIdx).toBeLessThan(promptLoopIdx);
+    expect(region.indexOf("sessionRenamePhase = 'writing'"))
+      .toBeLessThan(region.indexOf('await sendRawCommandLineSerially(renameBackend'));
+    expect(region.indexOf('await sendRawCommandLineSerially(renameBackend'))
+      .toBeLessThan(region.indexOf("sessionRenamePhase = 'sent'"));
   });
 
   it('blocks type-ahead messages until the rename command returns to prompt', () => {
@@ -44,8 +51,10 @@ describe('worker native session rename queue', () => {
     const readyEnd = workerSource.indexOf('\nfunction persistCliSessionId', readyStart);
     const readyRegion = workerSource.slice(readyStart, readyEnd);
 
-    expect(sendToPtyRegion).toContain('!sessionRenameInFlight && commandLineWritesPending === 0 && shouldWriteNow');
-    expect(readyRegion).toContain('clearSessionRenameInFlight()');
+    expect(sendToPtyRegion).toContain('!sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow');
+    expect(readyRegion).toContain('settleSessionRenameOnPrompt()');
+    expect(workerSource).toContain("if (sessionRenamePhase === 'sent') forceClearSessionRenameInFlight()");
+    expect(workerSource).toContain("if (sessionRenamePhase === 'writing') sessionRenamePhase = 'sent'");
     expect(workerSource).toContain('Native session rename idle timeout');
   });
 
@@ -69,9 +78,9 @@ describe('worker native session rename queue', () => {
 
   it('serializes passthrough writes without changing their busy-delivery semantics', () => {
     const rawRegion = caseRegion('raw_input');
-    // PR #441 起入队条件多了注入围栏（injectionFlushing / barrier），rename 围栏
-    // 仍必须在场——只钉本测试关心的三个 restart/rename 因子，不钉整行。
-    expect(rawRegion).toContain('if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight');
+    // PR #441 起入队条件多了注入围栏；rename 仍为函数形式的 phase gate。
+    expect(rawRegion).toContain('if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight()');
+    expect(rawRegion).toContain('injectionFlushing || shouldDeferUserFlush(pendingInjections)');
     expect(rawRegion).toContain('pendingRawInputs.push(msg)');
     expect(rawRegion).toContain('await deliverRawInput(msg)');
 
@@ -82,6 +91,6 @@ describe('worker native session rename queue', () => {
     expect(flushRegion).toContain('await deliverRawInput(raw)');
     expect(workerSource).toContain('await sendRawCommandLineSerially(targetBackend, msg.content)');
     expect(flushRegion.indexOf('await deliverRawInput(raw)'))
-      .toBeLessThan(flushRegion.indexOf('await sendRawCommandLineSerially(backend, buildRename(title))'));
+      .toBeLessThan(flushRegion.indexOf('await runAdoptSessionRenameSequence({'));
   });
 });

@@ -49,6 +49,21 @@ export const STRUCTURED_BRIDGE_ADOPT_CLI_IDS = [
 const ALWAYS_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ALWAYS_CLI_IDS);
 const ADOPT_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ADOPT_CLI_IDS);
 
+/** Drivers whose transcript contract exposes every terminal edge needed for a
+ *  strong started-turn status gate. Codex has final_answer plus explicit
+ *  turn_aborted parsing. Other structured drivers still
+ *  use the queue for attribution, but their interrupted/error shapes are not
+ *  yet complete enough to let a started turn suppress screen-ready forever. */
+export const STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS = [
+  'codex',
+] as const satisfies readonly CliId[];
+
+const LIFECYCLE_BLOCKING_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS);
+
+export function isStructuredBridgeLifecycleBlockingCli(cliId: string | undefined): boolean {
+  return !!cliId && LIFECYCLE_BLOCKING_SET.has(cliId);
+}
+
 /** Worker `codexBridgeFallbackActive` — cursor only when adoptMode. */
 export function isStructuredBridgeFallbackActive(
   cliId: string | undefined,
@@ -90,6 +105,7 @@ export function isStructuredBridgeAdoptIdleCli(cliId: string | undefined): boole
 export const STRUCTURED_BRIDGE_ADOPT_INPUT_CLI_IDS = [
   'codex',
   'traex',
+  'coco',
   'pi',
   'grok',
   'mtr',

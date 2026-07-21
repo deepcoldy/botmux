@@ -230,7 +230,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       // silently mask a real submit failure on a new install.
       if (!existsSync(HISTORY_PATH) && baseByte === 0) {
         if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 1200)) {
-          return undefined;
+          return { submitted: true };
         }
         if (!existsSync(HISTORY_PATH)) {
           return undefined;
@@ -242,12 +242,12 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
 
       for (let attempt = 0; attempt < 3; attempt++) {
         if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 800)) {
-          return undefined;
+          return { submitted: true };
         }
         if (!trySendEnter()) return { submitted: false };
       }
       if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 800)) {
-        return undefined;
+        return { submitted: true };
       }
       // In-band budget exhausted. Hand the worker a recheck closure: a slow
       // CoCo (cold start, large initial prompt, heavy hooks) may still
