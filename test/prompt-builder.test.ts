@@ -307,8 +307,11 @@ describe('buildFollowUpContent', () => {
     expect(content.indexOf('<sender ')).toBeGreaterThan(content.indexOf('</user_message>'));
     expect(content.indexOf('<mentions>')).toBeGreaterThan(content.indexOf('</user_message>'));
     // Complex send guidance is discoverable once in the opening catalog; keep
-    // every follow-up reminder intentionally tiny.
-    expect(content).toContain('<botmux_reminder>回复必须 botmux send，终端输出用户看不到</botmux_reminder>');
+    // every follow-up reminder intentionally tiny. It still carries the
+    // anti-resend signal so a thinking-only turn's CLI nudge doesn't drive a
+    // duplicate send.
+    expect(content).toContain('<botmux_reminder>回复必须 botmux send，终端输出用户看不到');
+    expect(content).toMatch(/<botmux_reminder>[^<]*别因「无输出」提示重发[^<]*<\/botmux_reminder>/);
     expect(content).not.toContain('JSON.stringify');
     expect(content).not.toContain('botmux skill show botmux-send');
   });

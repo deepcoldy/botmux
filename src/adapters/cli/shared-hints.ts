@@ -31,6 +31,7 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     t('ai.shell.heredoc_example', undefined, locale),
     t('ai.shell.helpers', undefined, locale),
     t('ai.shell.when_to_send', undefined, locale),
+    t('ai.shell.no_visible_output_ok', undefined, locale),
     t('ai.shell.mention_gate', undefined, locale),
     workflowDiscoveryHint(locale),
   ];
@@ -50,6 +51,7 @@ export const BOTMUX_SHELL_HINTS: string[] = [
   t('ai.shell.heredoc_example'),
   t('ai.shell.helpers'),
   t('ai.shell.when_to_send'),
+  t('ai.shell.no_visible_output_ok'),
   t('ai.shell.mention_gate'),
   workflowDiscoveryHint(),
 ];
@@ -112,6 +114,7 @@ export function buildBotmuxSystemPromptText(opts: {
     '<botmux_routing>',
     t('ai.routing.intro', undefined, locale),
     t('ai.routing.must_use_botmux', undefined, locale),
+    t('ai.routing.no_visible_output_ok', undefined, locale),
     '',
     t('ai.routing.usage_heading', undefined, locale),
     t('ai.routing.usage_send_when', undefined, locale),
