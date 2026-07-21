@@ -91,11 +91,21 @@ export async function handleAskCardAction(
     return staleToast(locale);
   }
 
-  // 旧单选即答路径：按钮直接携带 key，调用 tryResolveAsk（单问单选便捷封装）
+  // 旧单选即答路径：按钮直接携带 key，调用 tryResolveAsk（单问单选便捷封装）。
+  // accepted 时直接返回终态卡片，让飞书在回调响应里同步替换——不依赖 onSettle 异步 PATCH
+  // （异步 PATCH 在飞书侧常因回调已返回而被忽略，导致卡片停在未作答态）。
   if (action === ASK_SELECT_ACTION) {
     const selected = asString(value?.key);
     if (!selected) return staleToast(locale);
-    return toastForOutcome(tryResolveAsk({ askId, nonce, selected, by }), locale);
+    const outcome = tryResolveAsk({ askId, nonce, selected, by });
+    if (outcome !== 'accepted') return toastForOutcome(outcome, locale);
+    return settledCardResponse(askId, {
+      kind: 'answered',
+      answers: [[selected]],
+      by,
+      comment: null,
+      timedOut: false,
+    });
   }
 
   if (action === ASK_TOGGLE_ACTION) {
@@ -110,18 +120,53 @@ export async function handleAskCardAction(
   }
 
   // 新 Submit 路径：优先从按钮累积态提交；兼容旧 form_value 回调。
+  // 同 ASK_SELECT_ACTION：accepted 时同步返回终态卡片。
   if (action === ASK_SUBMIT_ACTION) {
     const formValue = data.action?.form_value ?? {};
     if (Object.keys(formValue).length > 0) {
       // 推断问题数量：找最大 qN 的 N+1
       const questionCount = guessQuestionCount(formValue);
       const selections = parseFormSelections(formValue, questionCount);
-      return toastForOutcome(submitAsk({ askId, nonce, by, selections }), locale);
+      const outcome = submitAsk({ askId, nonce, by, selections });
+      if (outcome !== 'accepted') return toastForOutcome(outcome, locale);
+      return settledCardResponse(askId, {
+        kind: 'answered',
+        answers: selections,
+        by,
+        comment: null,
+        timedOut: false,
+      });
     }
-    return toastForOutcome(submitAsk({ askId, nonce, by }), locale);
+    const outcome = submitAsk({ askId, nonce, by });
+    if (outcome !== 'accepted') return toastForOutcome(outcome, locale);
+    const updated = getAskSnapshot(askId);
+    const answers = updated?.selections ?? updated?.questions.map(() => []) ?? [];
+    return settledCardResponse(askId, {
+      kind: 'answered',
+      answers,
+      by,
+      comment: null,
+      timedOut: false,
+    });
   }
 
   return staleToast(locale);
+}
+
+/**
+ * 构建 settled 终态卡片响应，让飞书在卡片回调响应里**同步**替换原卡片。
+ *
+ * 为什么需要这个：ASK_SELECT / ASK_SUBMIT 成功 settle 后，若只返回 `undefined`
+ * （toastForOutcome('accepted')），飞书不会原地更新卡片，只能依赖 settle() 里
+ * dispatcher.onSettle 异步调 updateMessage 去 PATCH——但异步 PATCH 在飞书侧常因
+ * 回调响应已返回而被忽略/时序竞争，导致卡片停在未作答态。
+ * 这里直接返回终态卡片 JSON，飞书在同一次回调响应里替换，与 ASK_TOGGLE / grant
+ * card 的同步替换路径一致。onSettle 仍保留作兜底（双重更新同内容，幂等无害）。
+ */
+function settledCardResponse(askId: string, result: AskResult): Record<string, unknown> | undefined {
+  const updated = getAskSnapshot(askId);
+  if (!updated) return undefined;
+  return JSON.parse(buildAskCard(updated, result)) as Record<string, unknown>;
 }
 
 /**

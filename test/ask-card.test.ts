@@ -205,7 +205,7 @@ describe('buildAskCard', () => {
 });
 
 describe('handleAskCardAction', () => {
-  it('旧单选路径 ask_select：resolves pending ask，返回 undefined（无 toast）', async () => {
+  it('旧单选路径 ask_select：resolves pending ask，返回终态卡片（同步替换）', async () => {
     let askId = '';
     setCardDispatcher({
       async send(ask) {
@@ -239,7 +239,7 @@ describe('handleAskCardAction', () => {
     });
     expect(stale?.toast.content).toContain('失效');
 
-    // 正确 nonce + key → accepted
+    // 正确 nonce + key → accepted，返回终态卡片（飞书同步替换，不依赖 onSettle 异步 PATCH）
     const accepted = await handleAskCardAction({
       operator: { open_id: 'ou_owner' },
       action: {
@@ -251,7 +251,9 @@ describe('handleAskCardAction', () => {
         },
       },
     });
-    expect(accepted).toBeUndefined();
+    expect(accepted).toBeDefined();
+    expect(accepted?.toast).toBeUndefined();
+    expect((accepted as Record<string, any>)?.header?.title?.content).toContain('已结束');
     await expect(promise).resolves.toMatchObject({ kind: 'answered', answers: [['deploy']], by: 'ou_owner' });
   });
 
@@ -555,6 +557,77 @@ describe('handleAskCardAction: ask_submit 路径', () => {
     });
 
     expect(result?.toast.content).toContain('失效');
+  });
+
+  it('ask_submit（form_value 单选）accepted → 返回终态卡片，飞书同步替换', async () => {
+    const captured = await registerTestAsk();
+
+    const result = await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: ASK_SUBMIT_ACTION, ask_id: captured.askId, nonce: captured.nonce },
+        form_value: { q0: '0::y' },
+      },
+    });
+
+    // 返回终态卡片（非 undefined、非 toast），飞书在回调响应里同步替换
+    expect(result).toBeDefined();
+    expect(result?.toast).toBeUndefined();
+    const card = result as Record<string, any>;
+    expect(card.header?.title?.content).toContain('已结束');
+    expect(card.header?.template).toBe('green');
+    // 终态卡片包含选中的答案摘要
+    expect(JSON.stringify(card)).toContain('是');
+  });
+
+  it('ask_submit（累积勾选后提交）accepted → 返回终态卡片，含已选状态', async () => {
+    // 注册一个多选问题的 ask
+    let captured: PendingAsk | undefined;
+    setCardDispatcher({
+      async send(ask) {
+        captured = ask;
+        return { messageId: 'om_ask' };
+      },
+    });
+    registerAsk({
+      larkAppId: 'cli_ask',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      sessionId: 'sess-1',
+      questions: [
+        { prompt: 'q', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+      ],
+      timeoutMs: 10_000,
+    });
+    await Promise.resolve();
+
+    // 先勾选 a
+    await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: {
+          action: ASK_TOGGLE_ACTION,
+          ask_id: captured!.askId,
+          nonce: captured!.nonce,
+          question_index: '0',
+          key: 'a',
+        },
+      },
+    });
+
+    // 再提交（无 form_value，使用累积勾选）
+    const result = await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: ASK_SUBMIT_ACTION, ask_id: captured!.askId, nonce: captured!.nonce },
+      },
+    });
+
+    expect(result).toBeDefined();
+    expect(result?.toast).toBeUndefined();
+    const card = result as Record<string, any>;
+    expect(card.header?.title?.content).toContain('已结束');
+    expect(JSON.stringify(card)).toContain('A');
   });
 });
 
