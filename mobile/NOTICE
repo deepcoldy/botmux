@@ -1,0 +1,7 @@
+Botmux Mobile includes substantial portions of Orca Mobile
+(https://github.com/stablyai/orca mobile/), used under the MIT License.
+
+Copyright (c) 2026 Lovecast Inc.
+
+The original Orca LICENSE terms apply to vendored Orca Mobile sources.
+Botmux modifications are MIT; see the repository root LICENSE.

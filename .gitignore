@@ -36,3 +36,14 @@ desktop/.smoke-user-data/
 desktop/.env
 desktop/.env.*
 !desktop/.env.example
+
+# Mobile Expo local / secrets (never commit)
+mobile/node_modules/
+mobile/.expo/
+mobile/dist/
+mobile/android/
+mobile/ios/
+mobile/web-build/
+mobile/.env
+mobile/.env.*
+!mobile/.env.example

@@ -51,6 +51,10 @@
     "desktop:ide": "pnpm --dir desktop dev",
     "desktop:ide:build": "pnpm --dir desktop exec electron-vite build",
     "desktop:ide:install": "pnpm --dir desktop install",
+    "mobile:start": "pnpm --dir mobile start",
+    "mobile:install": "pnpm --dir mobile install",
+    "mobile:typecheck": "pnpm --dir mobile typecheck",
+    "mobile:test": "pnpm --dir mobile test",
     "prepublishOnly": "npm run build",
     "prepare": "git config core.hooksPath scripts/git-hooks 2>/dev/null || true"
   },

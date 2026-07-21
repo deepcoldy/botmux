@@ -27,16 +27,24 @@
 
 > 📖 **完整文档**（命令 / 配置 / 最佳实践 / 排错）：**<https://deepcoldy.github.io/botmux/>** ——本 README 只讲为什么用它和怎么快速上手。
 
-### Orca-class Desktop（开发中）
+### Orca-class Desktop + Mobile（在本仓库维护）
 
-仓库 `desktop/` 为 **Orca 整树 vendor 的 Electron IDE**（worktree / 终端 / git / browser / mobile RPC 等，与 Orca 毫米级对齐）。与飞书 daemon 并存、独立 userData。开发：
+| 目录 | 说明 |
+|---|---|
+| `desktop/` | Electron IDE（worktree / 终端 / git / browser / 配对 mobile RPC 等） |
+| `mobile/` | Expo 移动端（配对桌面控制 + Botmux Feishu bridge 会话列表） |
+
+与飞书 daemon 并存、独立 userData。**上游 Orca 已独立；PC/移动端改动请在 botmux 内维护，勿再依赖推送 stablyai/orca。**
 
 ```bash
+# Desktop IDE
 cd desktop && pnpm install && pnpm dev
+
+# Mobile (Expo) — 需本机已配对运行中的 Desktop
+cd mobile && pnpm install && pnpm start
 ```
 
-说明与归因见 [`desktop/README.md`](desktop/README.md)、[`desktop/NOTICE`](desktop/NOTICE)。旧 `src/desktop` 薄壳仅作 legacy。
-
+说明与归因见 [`desktop/README.md`](desktop/README.md)、[`desktop/NOTICE`](desktop/NOTICE)、[`mobile/NOTICE`](mobile/NOTICE)。旧 `src/desktop` 薄壳仅作 legacy。
 ## 演示
 
 | 飞书流式卡片 | Web 终端 | tmux 会话管理 | 多机器人协作 |
