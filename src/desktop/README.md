@@ -1,4 +1,18 @@
-# Botmux Desktop 本地源码安装
+# Botmux Desktop（legacy 薄壳）
+
+> **Deprecated for new work.** Orca-class Desktop lives in repo-root `desktop/`
+> (vendor import of Orca). Develop and package from there:
+>
+> ```bash
+> cd desktop && pnpm install && pnpm dev
+> ```
+>
+> See `desktop/README.md`, `desktop/NOTICE`, and `desktop/docs/botmux-bridge.md`.
+> Multi-host Botmux Sessions (Feishu) are only in the new Desktop.
+> This `src/desktop` tree remains the older Electron shell that embeds the web
+> dashboard via `<webview>` and supervises the global `botmux` CLI.
+
+# Botmux Desktop 本地源码安装（legacy）
 
 Botmux Desktop 目前没有 Apple Developer ID 签名和公证包，所以暂不提供可直接分发给他人的安装包。想体验 App 的用户需要下载源码，在自己的机器上本地构建和安装。
 

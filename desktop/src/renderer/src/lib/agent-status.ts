@@ -1,0 +1,269 @@
+import type { TerminalTab, TuiAgent, Worktree } from '../../../shared/types'
+import type { AgentStatusState, AgentType } from '../../../shared/agent-status-types'
+import { tabHasLivePty } from './tab-has-live-pty'
+import type { WorktreeStatus } from './worktree-status'
+import { tuiAgentToAgentKind } from '../../../shared/agent-kind'
+import type { AgentKind } from '../../../shared/telemetry-events'
+
+// Re-export from shared module so existing renderer imports continue to work.
+// Why: the main process now needs the same agent detection logic for stat
+// tracking. Moving to shared avoids duplicating the detection code.
+export {
+  type AgentStatus,
+  detectAgentStatusFromTitle,
+  clearWorkingIndicators,
+  createAgentStatusTracker,
+  normalizeTerminalTitle,
+  isGeminiTerminalTitle,
+  isClaudeAgent,
+  isClaudeManagementTitle,
+  getAgentLabel
+} from '../../../shared/agent-detection'
+import type { AgentStatus } from '../../../shared/agent-detection'
+import { classifyTitleActivity, resolveTitleActivityLabel } from './pane-agent-evidence'
+
+type AgentQueryArgs = {
+  tabsByWorktree: Record<string, TerminalTab[]>
+  runtimePaneTitlesByTabId: Record<string, Record<number, string>>
+  // Why: title-scraped agent activity (pane titles, tab.title) survives sleep
+  // because runtimePaneTitlesByTabId is intentionally preserved under
+  // keepIdentifiers for wake recovery. Without the live-PTY map, slept tabs
+  // whose preserved titles still match a working pattern would surface as
+  // working agents through the title-bar count, dock badge, and per-worktree
+  // aggregates. Threading ptyIdsByTabId lets every title-scrape branch gate
+  // on actual liveness (`tabHasLivePty`).
+  ptyIdsByTabId: Record<string, string[]>
+  worktreesByRepo: Record<string, Worktree[]>
+}
+
+export type WorkingAgentEntry = {
+  label: string
+  status: AgentStatus
+  tabId: string
+  paneId: number | null
+}
+
+export type WorktreeAgents = {
+  agents: WorkingAgentEntry[]
+}
+
+export function getWorkingAgentsPerWorktree({
+  tabsByWorktree,
+  runtimePaneTitlesByTabId,
+  ptyIdsByTabId,
+  worktreesByRepo
+}: AgentQueryArgs): Record<string, WorktreeAgents> {
+  const validIds = collectWorktreeIds(worktreesByRepo)
+  const result: Record<string, WorktreeAgents> = {}
+
+  for (const [worktreeId, tabs] of Object.entries(tabsByWorktree)) {
+    // Why: tabsByWorktree can retain orphaned entries for worktrees that no
+    // longer exist in git (e.g. deleted worktrees whose tab cleanup didn't
+    // complete, or worktrees removed outside OrcaBotmux). worktreesByRepo is the
+    // source of truth — only include worktrees that still exist.
+    if (!validIds.has(worktreeId)) {
+      continue
+    }
+    const agents: WorkingAgentEntry[] = []
+
+    for (const tab of tabs) {
+      // Why: title-scraped activity must be gated on actual PTY liveness.
+      // runtimePaneTitlesByTabId is preserved under sleep (keepIdentifiers),
+      // so a slept tab whose pane titles still match a working pattern would
+      // surface as a working agent without this gate.
+      if (!tabHasLivePty(ptyIdsByTabId, tab.id)) {
+        continue
+      }
+      const paneTitles = runtimePaneTitlesByTabId[tab.id]
+      if (paneTitles && Object.keys(paneTitles).length > 0) {
+        for (const [paneIdStr, title] of Object.entries(paneTitles)) {
+          if (classifyTitleActivity(title) === 'working') {
+            const label = resolveTitleActivityLabel(title)
+            if (label) {
+              agents.push({
+                label,
+                status: 'working',
+                tabId: tab.id,
+                paneId: Number(paneIdStr)
+              })
+            }
+          }
+        }
+      } else if (classifyTitleActivity(tab.title) === 'working') {
+        const label = resolveTitleActivityLabel(tab.title)
+        if (label) {
+          agents.push({ label, status: 'working', tabId: tab.id, paneId: null })
+        }
+      }
+    }
+
+    if (agents.length > 0) {
+      result[worktreeId] = { agents }
+    }
+  }
+
+  return result
+}
+
+// Re-exported from shared so mobile shows the same agent labels (one source of
+// truth). Kept re-exported here so existing `@/lib/agent-status` importers work.
+export { formatAgentTypeLabel } from '../../../shared/agent-type-label'
+
+// Why: AgentIcon expects a TuiAgent, but AgentType is a broader union
+// (WellKnownAgentType | (string & {})) that includes 'unknown' and arbitrary
+// strings reported by hook payloads. Return null for the unknown case so
+// AgentIcon renders a neutral "?" glyph — using 'claude' as a fallback
+// caused Codex panes to briefly show the Claude icon before the hook fired.
+// Why: we also guard against arbitrary strings (e.g. a hook reporting
+// agentType: "weirdo") by checking membership in an explicit record. A
+// blind `as TuiAgent` cast would pass values through that AgentIcon can't
+// render, producing a broken icon or falling back to an unrelated glyph.
+// Why: modeled as `Record<TuiAgent, true>` rather than a Set so the TypeScript
+// compiler fails to build when a TuiAgent member is added to shared/types.ts
+// without being added here — a Set<TuiAgent> is structurally permissive and
+// would silently accept a subset of the union.
+const ICONABLE_AGENT_TYPES: Record<TuiAgent, true> = {
+  claude: true,
+  'claude-agent-teams': true,
+  openclaude: true,
+  codex: true,
+  autohand: true,
+  opencode: true,
+  'mimo-code': true,
+  pi: true,
+  omp: true,
+  gemini: true,
+  antigravity: true,
+  aider: true,
+  goose: true,
+  amp: true,
+  kilo: true,
+  kiro: true,
+  crush: true,
+  aug: true,
+  cline: true,
+  codebuff: true,
+  'command-code': true,
+  continue: true,
+  cursor: true,
+  droid: true,
+  kimi: true,
+  'mistral-vibe': true,
+  'qwen-code': true,
+  rovo: true,
+  hermes: true,
+  openclaw: true,
+  copilot: true,
+  grok: true,
+  devin: true,
+  ante: true
+}
+
+export function agentTypeToIconAgent(agentType: AgentType | null | undefined): TuiAgent | null {
+  if (!agentType || agentType === 'unknown') {
+    return null
+  }
+  return Object.prototype.hasOwnProperty.call(ICONABLE_AGENT_TYPES, agentType)
+    ? (agentType as TuiAgent)
+    : null
+}
+
+// Why: telemetry's `agent_kind` enum derives from the TuiAgent mapping. Share
+// one resolver so the notes-send dropdown and the sidebar send path stamp
+// identical agent_kind values on `agent_prompt_sent`.
+export function agentKindForAgentType(agentType: AgentType | null | undefined): AgentKind {
+  const tuiAgent = agentTypeToIconAgent(agentType)
+  return tuiAgent ? tuiAgentToAgentKind(tuiAgent) : 'other'
+}
+
+// Why: the freshness gate moved into the pane-agent-evidence resolvers; the
+// re-export keeps this module's many existing importers unchanged.
+export { isExplicitAgentStatusFresh } from './pane-agent-evidence'
+
+/**
+ * Map an explicit AgentStatusState to the visual Status used by
+ * StatusIndicator and WorktreeCard.
+ *
+ * | Explicit State | Visual Status | Meaning                        |
+ * |----------------|---------------|--------------------------------|
+ * | working        | working       | agent actively executing       |
+ * | blocked        | permission    | agent needs user attention     |
+ * | waiting        | permission    | agent needs user attention     |
+ * | done           | done          | task complete but pane live    |
+ */
+export function mapAgentStatusStateToVisualStatus(state: AgentStatusState): WorktreeStatus {
+  switch (state) {
+    case 'working':
+      return 'working'
+    case 'blocked':
+    case 'waiting':
+      return 'permission'
+    case 'done':
+      return 'done'
+  }
+}
+
+export function countWorkingAgents({
+  tabsByWorktree,
+  runtimePaneTitlesByTabId,
+  ptyIdsByTabId,
+  worktreesByRepo
+}: AgentQueryArgs): number {
+  const validIds = collectWorktreeIds(worktreesByRepo)
+  let count = 0
+
+  for (const [worktreeId, tabs] of Object.entries(tabsByWorktree)) {
+    if (!validIds.has(worktreeId)) {
+      continue
+    }
+    for (const tab of tabs) {
+      count += countWorkingAgentsForTab(tab, runtimePaneTitlesByTabId, ptyIdsByTabId)
+    }
+  }
+
+  return count
+}
+
+function collectWorktreeIds(worktreesByRepo: Record<string, Worktree[]>): Set<string> {
+  const ids = new Set<string>()
+  for (const worktrees of Object.values(worktreesByRepo)) {
+    for (const wt of worktrees) {
+      ids.add(wt.id)
+    }
+  }
+  return ids
+}
+
+function countWorkingAgentsForTab(
+  tab: TerminalTab,
+  runtimePaneTitlesByTabId: Record<string, Record<number, string>>,
+  ptyIdsByTabId: Record<string, string[]>
+): number {
+  // Why: liveness precondition shared with getWorkingAgentsPerWorktree.
+  // runtimePaneTitlesByTabId is preserved under sleep (keepIdentifiers) and
+  // tab.ptyId is the wake-hint sessionId, not a liveness signal. Without
+  // this gate, slept tabs whose preserved titles still match a working
+  // pattern would inflate the title-bar agent count and dock badge.
+  if (!tabHasLivePty(ptyIdsByTabId, tab.id)) {
+    return 0
+  }
+  let count = 0
+  const paneTitles = runtimePaneTitlesByTabId[tab.id]
+  // Why: split-pane tabs can host multiple concurrent agents, but the
+  // legacy tab title only reflects the last pane title update that won the
+  // tab label. Prefer pane-level titles whenever TerminalPane is mounted,
+  // and fall back to the tab title only for tabs we have not mounted yet
+  // (for example restored-but-unvisited worktrees).
+  if (paneTitles && Object.keys(paneTitles).length > 0) {
+    for (const title of Object.values(paneTitles)) {
+      if (classifyTitleActivity(title) === 'working') {
+        count += 1
+      }
+    }
+    return count
+  }
+  if (classifyTitleActivity(tab.title) === 'working') {
+    count += 1
+  }
+  return count
+}

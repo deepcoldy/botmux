@@ -263,6 +263,8 @@ import {
   setCardDispatcher as setAskCardDispatcher,
   setCanTalkChecker as setAskCanTalkChecker,
   registerAsk as registerAskBroker,
+  listPendingAsks,
+  submitAskFromDesktop,
   findPendingAskByAnchor,
   submitCustomReply,
 } from './core/ask-broker.js';
@@ -4058,6 +4060,49 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   }
 
   return jsonRes(res, 200, result);
+});
+
+// Desktop / dashboard: list pending ask-hooks for operator UI (not agent-facing).
+ipcRoute('GET', '/api/asks/pending', (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  const asks = listPendingAsks().map((a) => ({
+    askId: a.askId,
+    sessionId: a.sessionId,
+    larkAppId: a.larkAppId,
+    chatId: a.chatId,
+    rootMessageId: a.rootMessageId,
+    questions: a.questions,
+    deadlineAt: a.deadlineAt,
+    createdAt: a.createdAt,
+  }));
+  return jsonRes(res, 200, { asks });
+});
+
+// Desktop answers an ask (bypasses Feishu canTalk; trusted host only).
+ipcRoute('POST', '/api/asks/answer', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  let body: { askId?: string; selections?: string[][]; by?: string };
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!body.askId || !Array.isArray(body.selections)) {
+    return jsonRes(res, 400, { ok: false, error: 'askId_and_selections_required' });
+  }
+  const outcome = submitAskFromDesktop({
+    askId: body.askId,
+    selections: body.selections,
+    by: typeof body.by === 'string' ? body.by : 'desktop',
+  });
+  if (outcome !== 'accepted') {
+    return jsonRes(res, 409, { ok: false, error: outcome });
+  }
+  return jsonRes(res, 200, { ok: true, outcome });
 });
 
 // ─── attention IPC route (internal: set needs-you state) ─────────────────────

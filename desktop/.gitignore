@@ -1,0 +1,20 @@
+node_modules/
+out/
+dist/
+.DS_Store
+*.log
+.vite/
+coverage/
+playwright-report/
+test-results/
+pr-evidence/
+# Local Electron smoke / dogfood userData — never commit cookies, caches, tokens
+.smoke-user-data/
+*.local
+.env
+.env.*
+!.env.example
+# Native / SPM build products (may embed absolute local paths)
+**/.build/
+# Benchmark machine dumps often embed host usernames / absolute paths
+tools/benchmarks/results/

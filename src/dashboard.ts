@@ -54,6 +54,7 @@ import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import { buildDashboardUrls, type DashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
+import { enrichSessionRowsForPresentation } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxInstallRoot } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
@@ -2290,7 +2291,77 @@ const server = createServer(async (req, res) => {
           ? { ...s, botName: n }
           : s;
       });
-      return jsonRes(res, 200, { sessions });
+      // Presentation enrichment (bot avatar + git repo/branch) — additive,
+      // cached, best-effort; Desktop sidebar renders these, board ignores them.
+      const enriched = await enrichSessionRowsForPresentation(sessions, config.session.dataDir);
+      return jsonRes(res, 200, { sessions: enriched });
+    }
+
+    // Desktop / operator UI: aggregate pending ask-hooks across daemons.
+    if (req.method === 'GET' && url.pathname === '/api/asks/pending') {
+      const daemons = registry.list();
+      const asks: unknown[] = [];
+      await Promise.all(daemons.map(async (d) => {
+        try {
+          const upstream = await fetchDaemonIpc(d.ipcPort, '/api/asks/pending');
+          if (!upstream.ok) return;
+          const body = await upstream.json() as { asks?: unknown[] };
+          for (const a of body.asks ?? []) {
+            asks.push({
+              ...(typeof a === 'object' && a ? a : {}),
+              botName: d.botName,
+              larkAppId: d.larkAppId,
+            });
+          }
+        } catch {
+          /* offline daemon */
+        }
+      }));
+      return jsonRes(res, 200, { asks });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/asks/answer') {
+      let body: { askId?: string; selections?: string[][]; by?: string; larkAppId?: string };
+      try {
+        body = await readJsonBody(req) as typeof body;
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      if (!body.askId || !Array.isArray(body.selections)) {
+        return jsonRes(res, 400, { ok: false, error: 'askId_and_selections_required' });
+      }
+      // Prefer explicit bot; else try each daemon until one accepts.
+      const candidates = body.larkAppId
+        ? registry.list().filter((d) => d.larkAppId === body.larkAppId)
+        : registry.list();
+      for (const d of candidates) {
+        try {
+          const upstream = await proxyToDaemon(d.larkAppId, '/api/asks/answer', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              askId: body.askId,
+              selections: body.selections,
+              by: body.by ?? 'desktop',
+            }),
+          });
+          const text = await upstream.text();
+          if (upstream.ok) {
+            res.writeHead(upstream.status, { 'content-type': 'application/json' });
+            res.end(text);
+            return;
+          }
+          // 409 stale on wrong daemon — try next
+          if (upstream.status !== 409) {
+            res.writeHead(upstream.status, { 'content-type': 'application/json' });
+            res.end(text);
+            return;
+          }
+        } catch {
+          /* try next */
+        }
+      }
+      return jsonRes(res, 409, { ok: false, error: 'stale' });
     }
     if (req.method === 'POST' && url.pathname === '/api/sessions/cleanup-idle') {
       let body: { olderThanHours?: unknown; sessionIds?: unknown };

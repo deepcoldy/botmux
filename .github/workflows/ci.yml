@@ -28,3 +28,26 @@ jobs:
       - run: npm install -g pnpm@9.5.0
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+
+  # Orca-class Desktop (vendor tree under desktop/) — separate packageManager/Node path.
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: desktop
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - run: corepack enable && corepack prepare pnpm@10.24.0 --activate
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec electron-vite build
+      - name: Desktop smoke (no Electron GUI)
+        env:
+          BOTMUX_SMOKE_SKIP_ELECTRON: '1'
+        run: pnpm smoke:desktop

@@ -1,0 +1,541 @@
+const { chmodSync, existsSync, readdirSync } = require('node:fs')
+const { execFileSync } = require('node:child_process')
+const { join, resolve } = require('node:path')
+const electronBuilderNativeRebuild = require('./scripts/electron-builder-native-rebuild.cjs')
+const {
+  assertPackagedDaemonEntryExists,
+  verifyPackagedDaemonEntryBoots
+} = require('./scripts/verify-packaged-daemon-entry.cjs')
+const {
+  createPackagedRuntimeNodeModuleResources,
+  prunePackagedRuntimeNodeModules,
+  verifyPackagedMainRuntimeDeps
+} = require('./packaged-runtime-node-modules.cjs')
+
+const isMacRelease = process.env.ORCA_MAC_RELEASE === '1'
+const isLinuxArm64Release = process.env.ORCA_LINUX_ARM64_RELEASE === '1'
+const featureWallResources = {
+  from: 'resources/onboarding/feature-wall',
+  to: 'onboarding/feature-wall'
+}
+// Why: freshness detection needs immutable identity metadata from this exact
+// app build, but never needs the skill package bytes or a runtime network read.
+const skillFreshnessResources = {
+  from: 'resources/skills',
+  to: 'skills'
+}
+// Why: SSH relay deploy resolves bundles from process.resourcesPath in packaged
+// apps. Keeping relay assets as extraResources makes them real directories
+// instead of paths hidden inside app.asar.
+const relayExtraResource = {
+  from: 'out/relay',
+  to: 'relay'
+}
+// Why: the main bundle, packaged CLI, SSH paths, and speech worker all execute
+// from package directories where pnpm's symlink farm is absent. Copy the exact
+// runtime dependency closure to Resources/node_modules so bare require() calls
+// do not fall through to a developer checkout's node_modules.
+const botmuxTermRelayResource = {
+  // Why: OrcaBotmux session "PTY" button runs this from process.resourcesPath when packaged.
+  from: 'scripts/orca-botmux-term-relay.mjs',
+  to: 'orca-botmux-term-relay.mjs'
+}
+
+const commonExtraResources = [
+  relayExtraResource,
+  skillFreshnessResources,
+  botmuxTermRelayResource
+]
+const macSpeechNativeResource = {
+  from: 'node_modules/sherpa-onnx-darwin-${arch}',
+  to: 'node_modules/sherpa-onnx-darwin-${arch}'
+}
+const linuxSpeechNativeResource = {
+  from: 'node_modules/sherpa-onnx-linux-${arch}',
+  to: 'node_modules/sherpa-onnx-linux-${arch}'
+}
+const winSpeechNativeResource = {
+  from: 'node_modules/sherpa-onnx-win-x64',
+  to: 'node_modules/sherpa-onnx-win-x64'
+}
+
+/** @type {import('electron-builder').Configuration} */
+module.exports = {
+  appId: 'com.orca_botmux.desktop',
+  productName: 'orca_botmux',
+  directories: {
+    buildResources: 'resources/build'
+  },
+  files: [
+    '!**/.vscode/*',
+    // Why: these repo-only inputs are either bundled into out/ or copied via
+    // extraResources. Shipping them in app.asar bloats the desktop bundle.
+    '!src{,/**/*}',
+    '!config{,/**/*}',
+    '!docs{,/**/*}',
+    '!mobile{,/**/*}',
+    '!native{,/**/*}',
+    '!skills{,/**/*}',
+    // Why: authoritative guide markdown is compiled into out/cli; shipping the
+    // authoring sources too would duplicate content without a runtime consumer.
+    '!skill-guides{,/**/*}',
+    '!tests{,/**/*}',
+    // Why: pr-evidence/ is a local e2e screenshot output (ORCA_CAPTURE_EVIDENCE);
+    // it is gitignored, but exclude it defensively so a stray local capture at
+    // package time never bloats app.asar.
+    '!pr-evidence{,/**/*}',
+    '!Casks{,/**/*}',
+    '!{AGENTS.md,CLAUDE.md,DEVELOPING.md,bundle-size-progress.md}',
+    '!out/**/*.test.js',
+    '!electron.vite.config.{js,ts,mjs,cjs}',
+    '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,CHANGELOG.md,README.md}',
+    '!{.env,.env.*,.npmrc,pnpm-lock.yaml}',
+    '!tsconfig.json',
+    // Why: feature-wall media is copied via extraResources so runtime can read
+    // it from process.resourcesPath; exclude the source copy from app.asar.
+    '!resources/onboarding/feature-wall/**',
+    '!resources/skills/**'
+  ],
+  // Why: the CLI entry-point lives in out/cli/ but imports shared modules
+  // from out/shared/ and local hook mutators from out/main/. These paths must be
+  // unpacked so that Node's require() can resolve the cross-directory imports
+  // when the CLI runs outside the asar archive.
+  // Why: daemon-entry.js is forked as a separate Node.js process and must be
+  // accessible on disk (not inside the asar archive) for child_process.fork().
+  // Why: the CLI is compiled by tsc (not bundled), so its runtime imports
+  // resolve at runtime via Node's normal module lookup. The shim launches
+  // the CLI with ELECTRON_RUN_AS_NODE, which bypasses Electron's asar
+  // integration — dependencies inside the asar archive are invisible to
+  // require(). Unpack CLI runtime deps so they resolve from
+  // app.asar.unpacked/node_modules/.
+  // Why: remote runtime connections use WebSocket + E2EE from the packaged CLI
+  // before the GUI process starts, so those deps need the same treatment.
+  // Why: out/package.json pins compiled output to CommonJS so parent
+  // package.json files with type=module cannot change the packaged CLI loader.
+  // Why: sherpa-onnx native bindings (platform-specific subpackages) must be
+  // unpacked because they ship .node addons + .dylib/.so files that cannot be
+  // dlopen()'d from inside the asar archive.
+  asarUnpack: [
+    'out/package.json',
+    'out/cli/**',
+    'out/shared/**',
+    'out/main/agent-hooks/**',
+    'out/main/antigravity/**',
+    'out/main/claude/**',
+    'out/main/codex/**',
+    'out/main/copilot/**',
+    'out/main/cursor/**',
+    'out/main/droid/**',
+    'out/main/gemini/**',
+    'out/main/grok/**',
+    'out/main/hermes/**',
+    'out/main/win32-utils.js',
+    'out/main/daemon-entry.js',
+    'out/main/computer-sidecar.js',
+    'out/main/parcel-watcher-process-entry.js',
+    'out/main/chunks/**',
+    'resources/**',
+    'node_modules/ws/**',
+    'node_modules/tweetnacl/**',
+    'node_modules/zod/**',
+    'node_modules/yaml/**',
+    'node_modules/sherpa-onnx*/**'
+  ],
+  afterPack: async (context) => {
+    const resourcesDir =
+      context.electronPlatformName === 'darwin'
+        ? join(
+            context.appOutDir,
+            `${context.packager.appInfo.productFilename}.app`,
+            'Contents',
+            'Resources'
+          )
+        : join(context.appOutDir, 'resources')
+    if (!existsSync(resourcesDir)) {
+      return
+    }
+    prunePackagedRuntimeNodeModules(resourcesDir, context.electronPlatformName, context.arch)
+    verifyPackagedMainRuntimeDeps(resourcesDir)
+    // Why: boot the packaged daemon-entry under plain Node, but only for the
+    // slice matching the packaging host's arch — daemon-entry.js is JS, yet it
+    // require()s the native (N-API) node-pty for the TARGET arch, which the host
+    // Node cannot load cross-arch. `Arch` enum: ia32=0, x64=1, armv7l=2,
+    // arm64=3, universal=4 (universal contains the host slice, so run it).
+    const archEnumByNodeArch = { ia32: 0, x64: 1, armv7l: 2, arm64: 3 }
+    const hostArchEnum = archEnumByNodeArch[process.arch]
+    if (context.arch === hostArchEnum || context.arch === 4) {
+      verifyPackagedDaemonEntryBoots(resourcesDir)
+    } else {
+      // Why: a cross-arch slice can't be booted by the host Node, but the
+      // unpacked entry must still exist — its absence is a layout regression
+      // regardless of arch, so only the boot is skipped, not the check.
+      assertPackagedDaemonEntryExists(resourcesDir)
+      console.log(
+        `[verify-packaged-daemon-entry] skipped boot on cross-arch slice (target ${context.arch}, host ${process.arch})`
+      )
+    }
+    chmodUnixCliLaunchers(resourcesDir, context.electronPlatformName)
+    chmodMacServeSimHelpers(resourcesDir, context.electronPlatformName)
+    for (const filename of readdirSync(resourcesDir)) {
+      if (!filename.startsWith('agent-browser-')) {
+        continue
+      }
+      // Why: the upstream package has inconsistent executable bits across
+      // platform binaries (notably darwin-x64). child_process.execFile needs
+      // the copied binary to be executable in packaged apps.
+      chmodSync(join(resourcesDir, filename), 0o755)
+    }
+    if (context.electronPlatformName === 'darwin') {
+      await signMacComputerUseHelper(join(resourcesDir, 'OrcaBotmux Computer Use.app'), context.packager)
+      await signMacNotificationStatusHelper(
+        join(resourcesDir, '..', 'MacOS', 'orca-botmux-notification-status'),
+        context.packager
+      )
+    }
+  },
+  win: {
+    executableName: 'orca_botmux',
+    // Why: Windows installers are signed after electron-builder packaging by
+    // SignPath, so the packager cannot infer the updater publisherName.
+    signtoolOptions: {
+      publisherName: 'SignPath Foundation'
+    },
+    extraResources: [
+      ...commonExtraResources,
+      ...createPackagedRuntimeNodeModuleResources('win32'),
+      winSpeechNativeResource,
+      {
+        from: 'resources/win32/bin/orca_botmux.cmd',
+        to: 'bin/orca_botmux.cmd'
+      },
+      {
+        from: 'native/windows-cli-launcher/.build/orca_botmux.exe',
+        to: 'bin/orca_botmux.exe'
+      },
+      {
+        from: 'node_modules/agent-browser/bin/agent-browser-win32-x64.exe',
+        to: 'agent-browser-win32-x64.exe'
+      },
+      {
+        from: 'native/computer-use-windows/runtime.ps1',
+        to: 'computer-use-windows/runtime.ps1'
+      },
+      featureWallResources
+    ]
+  },
+  nsis: {
+    artifactName: 'orca-botmux-windows-setup.${ext}',
+    shortcutName: '${productName}',
+    uninstallDisplayName: '${productName}',
+    createDesktopShortcut: 'always',
+    // Why: on a real uninstall, stop and remove the relocated terminal daemon
+    // (which lives outside the install dir under LOCALAPPDATA by design). Guarded
+    // by ${isUpdated} inside so it never runs during an update's uninstallOldVersion.
+    include: resolve(__dirname, 'nsis', 'daemon-host-uninstall.nsh')
+  },
+  mac: {
+    icon: 'resources/build/icon.icns',
+    entitlements: 'resources/build/entitlements.mac.plist',
+    entitlementsInherit: 'resources/build/entitlements.mac.plist',
+    extendInfo: {
+      NSAppleEventsUsageDescription:
+        'OrcaBotmux allows terminal-launched developer tools to automate local apps when you request it.',
+      NSBluetoothAlwaysUsageDescription:
+        'OrcaBotmux allows terminal-launched developer tools to access Bluetooth devices when you request it.',
+      NSBluetoothPeripheralUsageDescription:
+        'OrcaBotmux allows terminal-launched developer tools to access Bluetooth devices when you request it.',
+      NSCameraUsageDescription: "Application requests access to the device's camera.",
+      NSLocationUsageDescription:
+        'OrcaBotmux allows terminal-launched developer tools to access location when you request it.',
+      NSLocalNetworkUsageDescription:
+        'OrcaBotmux allows terminal-launched developer tools to discover and connect to local development servers when you request it.',
+      NSMicrophoneUsageDescription: "Application requests access to the device's microphone.",
+      NSAudioCaptureUsageDescription:
+        'OrcaBotmux allows terminal-launched developer tools to capture desktop audio when you request it.',
+      NSBonjourServices: ['_http._tcp', '_https._tcp'],
+      NSDocumentsFolderUsageDescription:
+        "Application requests access to the user's Documents folder.",
+      NSDownloadsFolderUsageDescription:
+        "Application requests access to the user's Downloads folder."
+    },
+    // Why: local macOS validation builds should launch without Apple release
+    // credentials. Hardened runtime + notarization stay enabled only on the
+    // explicit release path so production artifacts remain strict while dev
+    // artifacts do not fail with broken ad-hoc launch behavior.
+    hardenedRuntime: isMacRelease,
+    notarize: isMacRelease,
+    extraResources: [
+      ...commonExtraResources,
+      ...createPackagedRuntimeNodeModuleResources('darwin'),
+      macSpeechNativeResource,
+      {
+        from: 'resources/darwin/bin/orca_botmux',
+        to: 'bin/orca_botmux'
+      },
+      {
+        from: 'node_modules/agent-browser/bin/agent-browser-darwin-${arch}',
+        to: 'agent-browser-darwin-${arch}'
+      },
+      // Why: serve-sim resolves its helper binary and camera assets relative
+      // to dist/serve-sim.js, so the whole package must be a real resource dir.
+      {
+        from: 'node_modules/serve-sim',
+        to: 'serve-sim'
+      },
+      {
+        from: 'native/computer-use-macos/.build/release/OrcaBotmux Computer Use.app',
+        to: 'OrcaBotmux Computer Use.app'
+      },
+      featureWallResources
+    ],
+    // Why: the notification-status helper must execute from Contents/MacOS —
+    // on macOS 26 UNUserNotificationCenter aborts (bundleProxyForCurrentProcess
+    // is nil) for executables launched out of Contents/Resources (#7929).
+    extraFiles: [
+      {
+        from: 'native/notification-status-macos/.build/release/orca-botmux-notification-status',
+        to: 'MacOS/orca-botmux-notification-status'
+      }
+    ],
+    target: [
+      {
+        target: 'dmg',
+        arch: ['x64', 'arm64']
+      },
+      {
+        target: 'zip',
+        arch: ['x64', 'arm64']
+      }
+    ]
+  },
+  // Why: release builds should fail if signing is unavailable instead of
+  // silently downgrading to ad-hoc artifacts that look shippable in CI logs.
+  forceCodeSigning: isMacRelease,
+  dmg: {
+    artifactName: 'orca-botmux-macos-${arch}.${ext}'
+  },
+  // Why: deep-link pairing QR uses orca_botmux://pair (orca_botmux:// still decoded for legacy).
+  protocols: [
+    {
+      name: 'OrcaBotmux Pairing',
+      schemes: ['orca_botmux']
+    }
+  ],
+  linux: {
+    // Why: avoid colliding with GNOME OrcaBotmux accessibility package on Ubuntu.
+    executableName: 'orca_botmux',
+    // Why: the icns source lets electron-builder emit standard hicolor PNG
+    // sizes; a single 1024px PNG is ignored by some Linux docks/launchers.
+    icon: 'resources/build/icon.icns',
+    desktop: {
+      entry: {
+        // Why: keep a stable WM_CLASS for dock grouping after rebrand.
+        StartupWMClass: 'orca_botmux'
+      }
+    },
+    extraResources: [
+      ...commonExtraResources,
+      ...createPackagedRuntimeNodeModuleResources('linux'),
+      linuxSpeechNativeResource,
+      {
+        from: 'resources/linux/bin/orca-botmux-ide',
+        to: 'bin/orca-botmux-ide'
+      },
+      {
+        from: 'node_modules/agent-browser/bin/agent-browser-linux-${arch}',
+        to: 'agent-browser-linux-${arch}'
+      },
+      {
+        from: 'native/computer-use-linux/runtime.py',
+        to: 'computer-use-linux/runtime.py'
+      },
+      featureWallResources
+    ],
+    target: ['AppImage', 'deb'],
+    maintainer: 'stablyai',
+    category: 'Utility'
+  },
+  appImage: {
+    artifactName: isLinuxArm64Release ? 'orca-botmux-linux-arm64.${ext}' : 'orca-botmux-linux.${ext}'
+  },
+  deb: {
+    packageName: 'orca-botmux-ide',
+    artifactName: 'orca-botmux-ide_${version}_${arch}.${ext}',
+    // Why: xvfb lets the bundled `orca-botmux-desktop serve` CLI run browser panes on a headless
+    // Linux host — Chromium needs a display server even for offscreen rendering,
+    // and serve starts Xvfb itself when present (see ensure-virtual-display.ts).
+    depends: [
+      'python3',
+      'python3-gi',
+      'gir1.2-atspi-2.0',
+      'at-spi2-core',
+      'xdotool',
+      'xclip',
+      'xvfb'
+    ],
+    // Why: symlink the bundled CLI onto PATH at install time so `orca-botmux-ide serve`
+    // works on a headless host. The in-app CLI registration (CliInstaller) is
+    // GUI-triggered and can never run on a server, so without this the CLI is
+    // unreachable from the shell on exactly the hosts that need it.
+    afterInstall: 'resources/linux/packaging/after-install.sh',
+    afterRemove: 'resources/linux/packaging/after-remove.sh'
+  },
+  rpm: {
+    packageName: 'orca-botmux-ide',
+    artifactName: 'orca-botmux-ide-${version}.${arch}.${ext}',
+    // Why: see deb depends. RPM distros ship Xvfb as xorg-x11-server-Xvfb (there
+    // is no `xvfb` package), so the name differs from the deb here.
+    depends: [
+      'python3',
+      'python3-gobject',
+      'at-spi2-core',
+      'xdotool',
+      'xclip',
+      'xorg-x11-server-Xvfb'
+    ],
+    // Why: same headless CLI-on-PATH registration as deb; rpm runs these via fpm.
+    afterInstall: 'resources/linux/packaging/after-install.sh',
+    afterRemove: 'resources/linux/packaging/after-remove.sh'
+  },
+  beforeBuild: electronBuilderNativeRebuild,
+  // Why: must be true so that electron-builder rebuilds native modules
+  // (node-pty) for each target architecture when producing dual-arch macOS
+  // builds (x64 + arm64). With npmRebuild disabled, CI on an arm64 runner
+  // packages arm64 binaries into the x64 DMG, causing "posix_spawnp failed"
+  // on Intel Macs. The beforeBuild hook performs OrcaBotmux's targeted rebuild and
+  // returns false so electron-builder does not rebuild optional cpu-features.
+  npmRebuild: true,
+  publish: {
+    provider: 'github',
+    owner: 'stablyai',
+    repo: 'orca_botmux',
+    releaseType: 'release'
+  }
+}
+
+function chmodUnixCliLaunchers(resourcesDir, electronPlatformName) {
+  if (electronPlatformName === 'win32') {
+    return
+  }
+  for (const launcherName of ['orca_botmux', 'orca-botmux-ide']) {
+    const launcherPath = join(resourcesDir, 'bin', launcherName)
+    if (!existsSync(launcherPath)) {
+      continue
+    }
+    // Why: packaged Unix installs expose these extraResources as public shell
+    // commands, and source/packager mode drift must not ship a non-executable CLI.
+    chmodSync(launcherPath, 0o755)
+  }
+}
+
+function chmodMacServeSimHelpers(resourcesDir, electronPlatformName) {
+  if (electronPlatformName !== 'darwin') {
+    return
+  }
+  const helperPaths = [
+    join(resourcesDir, 'serve-sim', 'bin', 'serve-sim-bin'),
+    join(resourcesDir, 'serve-sim', 'dist', 'simcam', 'serve-sim-camera-helper'),
+    join(resourcesDir, 'node_modules', 'serve-sim', 'bin', 'serve-sim-bin'),
+    join(resourcesDir, 'node_modules', 'serve-sim', 'dist', 'simcam', 'serve-sim-camera-helper')
+  ]
+  for (const helperPath of helperPaths) {
+    if (existsSync(helperPath)) {
+      chmodSync(helperPath, 0o755)
+    }
+  }
+}
+
+async function signMacComputerUseHelper(helperAppPath, packager) {
+  if (!existsSync(helperAppPath)) {
+    if (isMacRelease) {
+      throw new Error(`Missing OrcaBotmux Computer Use helper app at ${helperAppPath}`)
+    }
+    return
+  }
+  const codeSigningInfo =
+    isMacRelease && process.env.CSC_LINK && packager?.codeSigningInfo?.value
+      ? await packager.codeSigningInfo.value
+      : null
+  const identity =
+    process.env.ORCA_COMPUTER_MACOS_SIGN_IDENTITY ??
+    process.env.CSC_NAME ??
+    findInstalledMacSigningIdentity(codeSigningInfo?.keychainFile) ??
+    (isMacRelease ? null : '-')
+  if (!identity) {
+    throw new Error('Missing signing identity for OrcaBotmux Computer Use helper app')
+  }
+  // Why: TCC grants attach to this nested app's code identity. Sign it before
+  // the outer OrcaBotmux.app is sealed so production builds preserve that identity.
+  execFileSync('codesign', codesignArgs(identity, helperAppPath), { stdio: 'inherit' })
+  execFileSync('codesign', ['--verify', '--deep', '--strict', helperAppPath], {
+    stdio: 'inherit'
+  })
+}
+
+async function signMacNotificationStatusHelper(helperPath, packager) {
+  if (!existsSync(helperPath)) {
+    if (isMacRelease) {
+      throw new Error(`Missing orca-botmux-notification-status helper at ${helperPath}`)
+    }
+    return
+  }
+  const codeSigningInfo =
+    isMacRelease && process.env.CSC_LINK && packager?.codeSigningInfo?.value
+      ? await packager.codeSigningInfo.value
+      : null
+  const identity =
+    process.env.CSC_NAME ??
+    findInstalledMacSigningIdentity(codeSigningInfo?.keychainFile) ??
+    (isMacRelease ? null : '-')
+  if (!identity) {
+    throw new Error('Missing signing identity for orca-botmux-notification-status helper')
+  }
+  // Why: macOS keys notification records to the code-signing identifier; the
+  // binary embeds the app's CFBundleIdentifier in __TEXT,__info_plist so this
+  // (and any later) `codesign --force` derives the correct identifier. Sign
+  // before the outer OrcaBotmux.app is sealed, like the computer-use helper.
+  const args = ['--force', '--sign', identity]
+  if (isMacRelease) {
+    args.push('--options', 'runtime', '--timestamp')
+  }
+  args.push(helperPath)
+  execFileSync('codesign', args, { stdio: 'inherit' })
+  execFileSync('codesign', ['--verify', '--strict', helperPath], { stdio: 'inherit' })
+}
+
+function codesignArgs(identity, targetPath) {
+  const args = ['--force', '--deep', '--sign', identity]
+  if (isMacRelease) {
+    args.push(
+      '--options',
+      'runtime',
+      '--timestamp',
+      '--entitlements',
+      resolve(__dirname, '../resources/build/entitlements.computer-use.mac.plist')
+    )
+  }
+  args.push(targetPath)
+  return args
+}
+
+function findInstalledMacSigningIdentity(keychainFile) {
+  try {
+    const output = execFileSync(
+      'security',
+      ['find-identity', '-v', '-p', 'codesigning', ...(keychainFile ? [keychainFile] : [])],
+      {
+        encoding: 'utf8'
+      }
+    )
+    const releaseMatch =
+      output.match(/"([^"]*Developer ID Application:[^"]+)"/) ??
+      output.match(/"([^"]*Apple Distribution:[^"]+)"/)
+    if (releaseMatch?.[1]) {
+      return releaseMatch[1]
+    }
+    if (!isMacRelease) {
+      return output.match(/"([^"]*Apple Development:[^"]+)"/)?.[1] ?? null
+    }
+  } catch {}
+  return null
+}

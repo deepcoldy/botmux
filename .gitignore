@@ -30,3 +30,9 @@ src/dashboard/web/game/index.pck
 # Playwright MCP verification artifacts
 .playwright-mcp/
 dashboard-substitute*.png
+
+# Desktop Electron dogfood userData / secrets (never commit)
+desktop/.smoke-user-data/
+desktop/.env
+desktop/.env.*
+!desktop/.env.example

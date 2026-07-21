@@ -1,0 +1,669 @@
+/**
+ * E2E tests for the first-launch Onboarding flow.
+ *
+ * The onboarding overlay is gated by `OnboardingState.closedAt === null` (see
+ * `shouldShowOnboarding` in `should-show-onboarding.ts`). Each test gets a fresh
+ * Electron instance + isolated userData dir, so persistence starts clean and
+ * the overlay renders on first paint without any setup.
+ */
+
+import { test, expect } from './helpers/orca-botmux-app'
+import { waitForSessionReady } from './helpers/store'
+import type { Page } from '@stablyai/playwright-test'
+import type { GlobalSettings, TuiAgent } from '../../src/shared/types'
+import { ONBOARDING_FINAL_STEP } from '../../src/shared/constants'
+
+type OnboardingState = {
+  closedAt: number | null
+  outcome: 'completed' | 'dismissed' | null
+  lastCompletedStep: number
+  checklist: Record<string, boolean>
+}
+
+const SKIP_TO_PROJECT_SETUP_BUTTON = /^Skip to project setup$/i
+const TASK_SOURCES_HEADING = /Set up GitHub tasks/i
+const WINDOWS_TERMINAL_HEADING = /Set Windows terminal defaults/i
+const ADD_PROJECT_DIALOG_HEADING = /Add (?:a server project|a project|another project)/i
+
+async function getOnboardingState(page: Page): Promise<OnboardingState> {
+  return page.evaluate(() => window.api.onboarding.get() as Promise<OnboardingState>)
+}
+
+async function getSettings(page: Page): Promise<GlobalSettings> {
+  return page.evaluate(() => window.api.settings.get())
+}
+
+async function getDocumentThemeClass(page: Page): Promise<'dark' | 'light'> {
+  return page.evaluate(() =>
+    document.documentElement.classList.contains('dark') ? 'dark' : 'light'
+  )
+}
+
+function onboardingFooter(page: Page) {
+  return page
+    .locator('footer')
+    .filter({
+      has: page.getByRole('button', { name: /Back|Continue|Add your first project|Set up|Skip/i })
+    })
+    .first()
+}
+
+function onboardingFooterButton(page: Page, name: RegExp) {
+  return onboardingFooter(page).getByRole('button', { name })
+}
+
+function onboardingNotificationSoundSelect(page: Page) {
+  return page.getByRole('combobox').first()
+}
+
+async function expectOnboardingNotificationSoundMenuClosed(page: Page): Promise<void> {
+  await expect(page.getByRole('option', { name: /Choose Custom File/i })).toHaveCount(0)
+}
+
+async function expectOnboardingSkipConfirmationClosed(page: Page): Promise<void> {
+  await expect(page.getByRole('dialog', { name: /Skip onboarding\?/i })).toHaveCount(0)
+}
+
+async function expectOnboardingSkipConfirmationOpen(page: Page): Promise<void> {
+  await expect(page.getByRole('dialog', { name: /Skip onboarding\?/i })).toBeVisible()
+}
+
+async function expectOnboardingNotificationSound(page: Page, name: RegExp): Promise<void> {
+  await expect(onboardingNotificationSoundSelect(page)).toContainText(name)
+}
+
+async function chooseOnboardingNotificationSound(page: Page, name: RegExp): Promise<void> {
+  const soundSelect = onboardingNotificationSoundSelect(page)
+  await soundSelect.click()
+  const option = page.getByRole('option', { name })
+  await expect(option).toBeVisible()
+  // Why: the select menu extends over the onboarding footer on small CI
+  // viewports; keyboard selection avoids pointer fall-through to Skip.
+  await option.press('Enter')
+  await expect(soundSelect).toContainText(name)
+  await expectOnboardingNotificationSoundMenuClosed(page)
+  await expectOnboardingSkipConfirmationClosed(page)
+}
+
+async function expectOnboardingCustomSoundOption(page: Page): Promise<void> {
+  const soundSelect = onboardingNotificationSoundSelect(page)
+  await soundSelect.click()
+  await expect(page.getByRole('option', { name: /Choose Custom File/i })).toBeVisible()
+  await page.getByRole('option', { selected: true }).press('Enter')
+  await expectOnboardingNotificationSoundMenuClosed(page)
+  await expectOnboardingSkipConfirmationClosed(page)
+}
+
+async function continueOnboarding(page: Page): Promise<void> {
+  await onboardingFooterButton(page, /^(Continue|Add your first project)\b/).click()
+}
+
+async function expectOnboardingProgress(page: Page, label: RegExp): Promise<void> {
+  await expect(page.getByText(label)).toBeVisible()
+}
+
+async function expectAddProjectDialog(page: Page): Promise<void> {
+  await expect(page.getByRole('heading', { name: ADD_PROJECT_DIALOG_HEADING })).toBeVisible()
+}
+
+async function continueFromPostNotificationsToRepo(page: Page): Promise<void> {
+  if (await page.getByRole('heading', { name: ADD_PROJECT_DIALOG_HEADING }).isVisible()) {
+    return
+  }
+  await continueThroughOptionalTaskSourcesAndWindowsTerminal(page)
+  await expect(page.getByRole('heading', { name: /Set up notifications/i })).toBeVisible()
+  await expectOnboardingProgress(page, /^[345] of [345]$/)
+  await expect(onboardingFooterButton(page, /^Add your first project\b/)).toBeVisible()
+  await continueOnboarding(page)
+  await expectAddProjectDialog(page)
+}
+
+async function continueThroughOptionalTaskSourcesAndWindowsTerminal(page: Page): Promise<void> {
+  const taskSourcesVisible = await page
+    .getByRole('heading', { name: TASK_SOURCES_HEADING })
+    .waitFor({ state: 'visible', timeout: 1_000 })
+    .then(() => true)
+    .catch(() => false)
+  if (taskSourcesVisible) {
+    await expectOnboardingProgress(page, /^3 of [45]$/)
+    await continueOnboarding(page)
+  }
+  const windowsTerminalVisible = await page
+    .getByRole('heading', { name: WINDOWS_TERMINAL_HEADING })
+    .waitFor({ state: 'visible', timeout: 1_000 })
+    .then(() => true)
+    .catch(() => false)
+  if (windowsTerminalVisible) {
+    await expectOnboardingProgress(page, /^[34] of [45]$/)
+    await continueOnboarding(page)
+  }
+  await expect(page.getByRole('heading', { name: /Set up notifications/i })).toBeVisible()
+}
+
+async function continueFromThemeToNotifications(page: Page): Promise<void> {
+  await continueOnboarding(page)
+  await continueThroughOptionalTaskSourcesAndWindowsTerminal(page)
+}
+
+test.describe('Onboarding flow', () => {
+  // Why: the shared fixture pre-seeds onboarding as closed so non-onboarding
+  // tests don't get blocked by the fullscreen overlay. Opt out here so this
+  // spec actually exercises the first-launch flow.
+  test.use({ dismissOnboarding: false })
+
+  test.beforeEach(async ({ orcaBotmuxPage }) => {
+    // Per-test userData is freshly minted by the orcaBotmuxPage fixture, so persisted
+    // onboarding state defaults to `closedAt: null, lastCompletedStep: -1` and
+    // the overlay paints on its own once App's bootstrap effect resolves.
+    await waitForSessionReady(orcaBotmuxPage)
+  })
+
+  test('renders on first launch with the agent step active', async ({ orcaBotmuxPage }) => {
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
+      timeout: 15_000
+    })
+    await expectOnboardingProgress(orcaBotmuxPage, /^1 of [345]$/)
+    await expect(onboardingFooterButton(orcaBotmuxPage, /^Continue\b/)).toBeVisible()
+    await expect(onboardingFooterButton(orcaBotmuxPage, SKIP_TO_PROJECT_SETUP_BUTTON)).toBeVisible()
+    // Why: Back is not rendered on the first step (was previously rendered-but-
+    // disabled with `disabled:invisible`, now conditionally mounted).
+    await expect(orcaBotmuxPage.getByRole('button', { name: 'Back', exact: true })).toHaveCount(0)
+    // Footer hint shows the platform-correct continue shortcut (⌘ on Mac,
+    // Ctrl elsewhere). Match either form so the test runs cross-platform.
+    // Why: scope to the footer action so background UI shortcut hints cannot
+    // false-positive this assertion.
+    await expect(
+      onboardingFooterButton(orcaBotmuxPage, /^Continue\b/)
+        .locator('span')
+        .filter({ hasText: /⌘|Ctrl/ })
+        .first()
+    ).toBeVisible()
+  })
+
+  test('Continue advances steps, persists progress, and applies user-visible settings', async ({
+    orcaBotmuxPage
+  }) => {
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
+      timeout: 15_000
+    })
+
+    // --- Step 1: agent ---
+    // Force a deterministic, non-default selection so the assertion below
+    // proves the wizard actually wrote the user's choice (not just the
+    // pre-selected detected agent). Codex sits in the top-6 catalog when no
+    // agents are detected, otherwise behind the "Show N more agents" details
+    // expander — open it if codex isn't visible.
+    const targetAgent: TuiAgent = 'codex'
+    const codexButton = orcaBotmuxPage.getByRole('button', { name: /^Codex\s/ })
+    // Why: isVisible() is a one-shot probe — on slow renderer paint it would
+    // race the wizard mount and falsely take the "show more agents" branch.
+    // waitFor with a small timeout actually retries until the button paints.
+    const codexVisible = await codexButton
+      .first()
+      .waitFor({ state: 'visible', timeout: 1_000 })
+      .then(() => true)
+      .catch(() => false)
+    if (!codexVisible) {
+      await orcaBotmuxPage.getByText(/Show \d+ more agents/).click()
+    }
+    await codexButton.click()
+
+    await continueOnboarding(orcaBotmuxPage)
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Make it feel like home/i })).toBeVisible()
+    await expectOnboardingProgress(orcaBotmuxPage, /^2 of [345]$/)
+    await expect
+      .poll(async () => (await getOnboardingState(orcaBotmuxPage)).lastCompletedStep, {
+        timeout: 5_000,
+        message: 'lastCompletedStep did not advance to 1 after first Continue'
+      })
+      .toBe(1)
+    // The agent choice must be persisted to settings (the user will see this
+    // pre-selected when they later open a new tab / agent picker).
+    await expect
+      .poll(async () => (await getSettings(orcaBotmuxPage)).defaultTuiAgent, { timeout: 5_000 })
+      .toBe(targetAgent)
+
+    // --- Step 2: theme ---
+    // Default settings.theme is 'system', so the document class can resolve to
+    // either 'dark' or 'light' depending on the host. Click the opposite tile
+    // so we always observe a live flip — the assertion that proves the wizard
+    // applies the choice immediately, not just on Continue.
+    // Why: 'system' resolves async on mount, so wait for the class to settle
+    // before snapshotting — otherwise startingTheme can be stale.
+    await orcaBotmuxPage.waitForFunction(
+      () =>
+        document.documentElement.classList.contains('dark') ||
+        document.documentElement.classList.contains('light')
+    )
+    const startingTheme = await getDocumentThemeClass(orcaBotmuxPage)
+    const oppositeTheme: 'dark' | 'light' = startingTheme === 'dark' ? 'light' : 'dark'
+    const oppositeTileName = oppositeTheme === 'light' ? /Bright & crisp/ : /Easy on the eyes/
+    await orcaBotmuxPage.getByRole('button', { name: oppositeTileName }).click()
+    await expect
+      .poll(async () => getDocumentThemeClass(orcaBotmuxPage), { timeout: 5_000 })
+      .toBe(oppositeTheme)
+
+    await continueOnboarding(orcaBotmuxPage)
+    // Why: the theme Continue persists step 2, then persists *through* any
+    // skipped optional steps (integrations is skipped when gh is installed,
+    // windows_terminal off macOS), so lastCompletedStep can land at 2, 3, or 4.
+    // Key off the settled "theme step committed" lower bound rather than a fixed
+    // window that assumed integrations always renders.
+    await expect
+      .poll(async () => (await getOnboardingState(orcaBotmuxPage)).lastCompletedStep, {
+        timeout: 5_000,
+        message: 'lastCompletedStep did not advance past the theme step after second Continue'
+      })
+      .toBeGreaterThanOrEqual(2)
+    await expect
+      .poll(async () => (await getSettings(orcaBotmuxPage)).theme, { timeout: 5_000 })
+      .toBe(oppositeTheme)
+    await continueThroughOptionalTaskSourcesAndWindowsTerminal(orcaBotmuxPage)
+    await expectOnboardingProgress(orcaBotmuxPage, /^[345] of [345]$/)
+    await expect
+      .poll(async () => [3, 4].includes((await getOnboardingState(orcaBotmuxPage)).lastCompletedStep), {
+        timeout: 5_000,
+        message: 'lastCompletedStep did not include optional setup progress'
+      })
+      .toBe(true)
+
+    // --- Step 3: notifications ---
+    await expectOnboardingNotificationSound(orcaBotmuxPage, /System Default/i)
+    await expect(orcaBotmuxPage.getByRole('button', { name: /Send Test Notification/i })).toBeVisible()
+    await expectOnboardingCustomSoundOption(orcaBotmuxPage)
+
+    await continueFromPostNotificationsToRepo(orcaBotmuxPage)
+
+    // Verify the source defaults land without asking users to configure each
+    // source in the onboarding UI.
+    await expect
+      .poll(
+        async () => {
+          const s = await getSettings(orcaBotmuxPage)
+          return {
+            agentTaskComplete: s.notifications.agentTaskComplete,
+            terminalBell: s.notifications.terminalBell,
+            enabled: s.notifications.enabled,
+            customSoundId: s.notifications.customSoundId
+          }
+        },
+        { timeout: 5_000 }
+      )
+      .toEqual({
+        agentTaskComplete: true,
+        terminalBell: true,
+        enabled: true,
+        customSoundId: 'system'
+      })
+
+    await expect
+      .poll(
+        async () => {
+          const state = await getOnboardingState(orcaBotmuxPage)
+          return {
+            closedAt: state.closedAt === null ? null : 'set',
+            outcome: state.outcome,
+            addedRepo: state.checklist.addedRepo,
+            lastCompletedStep: state.lastCompletedStep
+          }
+        },
+        { timeout: 5_000 }
+      )
+      .toEqual({
+        closedAt: 'set',
+        outcome: 'completed',
+        addedRepo: false,
+        lastCompletedStep: ONBOARDING_FINAL_STEP
+      })
+  })
+
+  test('Cmd/Ctrl+Enter advances steps like Continue', async ({ orcaBotmuxPage }) => {
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
+      timeout: 15_000
+    })
+
+    // Why: the OS the renderer reports drives whether Cmd or Ctrl is the
+    // accelerator (OnboardingFlow.tsx checks navigator.userAgent).
+    const isMac = await orcaBotmuxPage.evaluate(() => navigator.userAgent.includes('Mac'))
+    const accelerator = isMac ? 'Meta+Enter' : 'Control+Enter'
+
+    // Why: in headless Linux CI the window-level capture-phase listener can
+    // miss synthetic keyboard events when no element holds focus. Click an
+    // inert area inside the overlay first to anchor focus, then press.
+    await orcaBotmuxPage.locator('footer').click({ position: { x: 1, y: 1 } })
+    await orcaBotmuxPage.keyboard.press(accelerator)
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Make it feel like home/i })).toBeVisible()
+    await expect
+      .poll(async () => (await getOnboardingState(orcaBotmuxPage)).lastCompletedStep, {
+        timeout: 5_000
+      })
+      .toBe(1)
+  })
+
+  test('Skip opens Add Project, saves the selected agent, and completes onboarding', async ({
+    orcaBotmuxPage
+  }) => {
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
+      timeout: 15_000
+    })
+    const codexButton = orcaBotmuxPage.getByRole('button', { name: /^Codex\s/ })
+    const codexVisible = await codexButton
+      .first()
+      .waitFor({ state: 'visible', timeout: 1_000 })
+      .then(() => true)
+      .catch(() => false)
+    if (!codexVisible) {
+      await orcaBotmuxPage.getByText(/Show \d+ more agents/).click()
+    }
+    await codexButton.click()
+
+    await onboardingFooterButton(orcaBotmuxPage, SKIP_TO_PROJECT_SETUP_BUTTON).click()
+
+    await expectAddProjectDialog(orcaBotmuxPage)
+
+    await expect
+      .poll(
+        async () => {
+          const state = await getOnboardingState(orcaBotmuxPage)
+          return {
+            closedAt: state.closedAt === null ? null : 'set',
+            outcome: state.outcome,
+            dismissed: state.checklist.dismissed,
+            lastCompletedStep: state.lastCompletedStep
+          }
+        },
+        { timeout: 5_000 }
+      )
+      .toEqual({
+        closedAt: 'set',
+        outcome: 'completed',
+        dismissed: false,
+        lastCompletedStep: ONBOARDING_FINAL_STEP
+      })
+    await expect
+      .poll(async () => (await getSettings(orcaBotmuxPage)).defaultTuiAgent, { timeout: 5_000 })
+      .toBe('codex')
+  })
+
+  test('Skip from theme restores the entry theme choice', async ({ orcaBotmuxPage }) => {
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
+      timeout: 15_000
+    })
+    await continueOnboarding(orcaBotmuxPage)
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Make it feel like home/i })).toBeVisible()
+
+    await orcaBotmuxPage.waitForFunction(
+      () =>
+        document.documentElement.classList.contains('dark') ||
+        document.documentElement.classList.contains('light')
+    )
+    const entryTheme = (await getSettings(orcaBotmuxPage)).theme
+    const startingTheme = await getDocumentThemeClass(orcaBotmuxPage)
+    const oppositeTheme: 'dark' | 'light' = startingTheme === 'dark' ? 'light' : 'dark'
+    const oppositeTileName = oppositeTheme === 'light' ? /Bright & crisp/ : /Easy on the eyes/
+    await orcaBotmuxPage.getByRole('button', { name: oppositeTileName }).click()
+    await expect
+      .poll(async () => getDocumentThemeClass(orcaBotmuxPage), { timeout: 5_000 })
+      .toBe(oppositeTheme)
+
+    await onboardingFooterButton(orcaBotmuxPage, SKIP_TO_PROJECT_SETUP_BUTTON).click()
+
+    await expectAddProjectDialog(orcaBotmuxPage)
+    await expect
+      .poll(async () => (await getSettings(orcaBotmuxPage)).theme, { timeout: 5_000 })
+      .toBe(entryTheme)
+    await expect
+      .poll(async () => getDocumentThemeClass(orcaBotmuxPage), { timeout: 5_000 })
+      .toBe(startingTheme)
+  })
+
+  test('Skip preserves runtime server project setup UI', async ({ orcaBotmuxPage }) => {
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
+      timeout: 15_000
+    })
+    await orcaBotmuxPage.evaluate(async () => {
+      const store = window.__store
+      if (!store) {
+        throw new Error('window.__store is not available')
+      }
+      // Why: after #5071 the server-path add step gates on the registered
+      // runtime-environment list (store.runtimeEnvironments), not just the
+      // activeRuntimeEnvironmentId setting. Seed a redacted environment so the
+      // host option exists and the "on host" add UI renders.
+      const now = Date.now()
+      store.getState().setRuntimeEnvironments([
+        {
+          id: 'env-e2e',
+          name: 'E2E Server',
+          createdAt: now,
+          updatedAt: now,
+          lastUsedAt: null,
+          runtimeId: null,
+          source: 'manual',
+          endpoints: [
+            {
+              id: 'ws-env-e2e',
+              kind: 'websocket',
+              label: 'WebSocket',
+              endpoint: 'wss://e2e.invalid/ws'
+            }
+          ],
+          preferredEndpointId: 'ws-env-e2e'
+        }
+      ])
+      // Why: a runtime host is only auto-selectable (health 'available') when it
+      // has a live, protocol-compatible status; without one it reads
+      // 'disconnected' and the Add Project dialog falls back to Local Mac.
+      // runtimeProtocolVersion 3 clears MIN_COMPATIBLE_RUNTIME_SERVER_VERSION.
+      store.getState().setRuntimeEnvironmentStatus('env-e2e', {
+        status: {
+          runtimeId: 'env-e2e-runtime',
+          rendererGraphEpoch: 0,
+          graphStatus: 'ready',
+          authoritativeWindowId: null,
+          liveTabCount: 0,
+          liveLeafCount: 0,
+          runtimeProtocolVersion: 3,
+          minCompatibleRuntimeClientVersion: 1
+        },
+        checkedAt: now
+      })
+      await store.getState().updateSettings({ activeRuntimeEnvironmentId: 'env-e2e' })
+    })
+    await expect
+      .poll(async () => (await getSettings(orcaBotmuxPage)).activeRuntimeEnvironmentId, {
+        timeout: 5_000
+      })
+      .toBe('env-e2e')
+
+    await onboardingFooterButton(orcaBotmuxPage, SKIP_TO_PROJECT_SETUP_BUTTON).click()
+
+    await expectAddProjectDialog(orcaBotmuxPage)
+    // The runtime env is selected as the Add Project host and the browse action
+    // is host-scoped, proving the server project-setup UI is preserved on skip.
+    await expect(orcaBotmuxPage.getByText('Existing Git repository or folder on this host')).toBeVisible()
+    await expect(orcaBotmuxPage.getByRole('button', { name: /Browse folder/i })).toBeVisible()
+    await expect(orcaBotmuxPage.getByRole('button', { name: /Clone from URL/i })).toBeVisible()
+    await expect(orcaBotmuxPage.getByRole('button', { name: /Create new project/i })).toBeVisible()
+    await expect(onboardingFooterButton(orcaBotmuxPage, SKIP_TO_PROJECT_SETUP_BUTTON)).toHaveCount(0)
+    expect((await getOnboardingState(orcaBotmuxPage)).closedAt).not.toBeNull()
+  })
+
+  test('Skip from notifications does not request permission', async ({ orcaBotmuxPage }) => {
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
+      timeout: 15_000
+    })
+    await continueOnboarding(orcaBotmuxPage)
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Make it feel like home/i })).toBeVisible()
+    await continueFromThemeToNotifications(orcaBotmuxPage)
+
+    await orcaBotmuxPage.evaluate(() => {
+      localStorage.removeItem('orca_botmux.e2e.notificationPermissionRequested')
+      window.api.notifications.requestPermission = async () => {
+        localStorage.setItem('orca_botmux.e2e.notificationPermissionRequested', '1')
+        return { supported: true, platform: 'darwin', requested: true }
+      }
+    })
+    await expectOnboardingNotificationSound(orcaBotmuxPage, /System Default/i)
+
+    await expect(onboardingFooterButton(orcaBotmuxPage, SKIP_TO_PROJECT_SETUP_BUTTON)).toHaveCount(0)
+    await continueOnboarding(orcaBotmuxPage)
+
+    await expectAddProjectDialog(orcaBotmuxPage)
+    await expect
+      .poll(
+        async () =>
+          orcaBotmuxPage.evaluate(() => localStorage.getItem('orca_botmux.e2e.notificationPermissionRequested')),
+        { timeout: 5_000 }
+      )
+      .toBeNull()
+  })
+
+  test('selected agent button reports aria-pressed=true', async ({ orcaBotmuxPage }) => {
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
+      timeout: 15_000
+    })
+
+    const codexButton = orcaBotmuxPage.getByRole('button', { name: /^Codex\s/ })
+    const codexVisible = await codexButton
+      .first()
+      .waitFor({ state: 'visible', timeout: 1_000 })
+      .then(() => true)
+      .catch(() => false)
+    if (!codexVisible) {
+      await orcaBotmuxPage.getByText(/Show \d+ more agents/).click()
+    }
+    await codexButton.click()
+    // Why: AgentButton now sets aria-pressed so screen readers and assistive
+    // tech can announce the selection. Verify the attribute reflects state.
+    await expect(codexButton).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  test('notification sound choice persists on Continue', async ({ orcaBotmuxPage }) => {
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
+      timeout: 15_000
+    })
+    await continueOnboarding(orcaBotmuxPage)
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Make it feel like home/i })).toBeVisible()
+    await continueFromThemeToNotifications(orcaBotmuxPage)
+
+    await chooseOnboardingNotificationSound(orcaBotmuxPage, /^Ding$/i)
+
+    await continueFromPostNotificationsToRepo(orcaBotmuxPage)
+    await expect
+      .poll(
+        async () => {
+          const s = await getSettings(orcaBotmuxPage)
+          return {
+            agentTaskComplete: s.notifications.agentTaskComplete,
+            terminalBell: s.notifications.terminalBell,
+            customSoundId: s.notifications.customSoundId
+          }
+        },
+        { timeout: 5_000 }
+      )
+      .toEqual({ agentTaskComplete: true, terminalBell: true, customSoundId: 'ding' })
+  })
+
+  test('typing in the clone-url input does not hijack Enter as a global shortcut', async ({
+    orcaBotmuxPage
+  }) => {
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
+      timeout: 15_000
+    })
+    // Advance to the Add Project dialog.
+    await continueOnboarding(orcaBotmuxPage)
+    await continueOnboarding(orcaBotmuxPage)
+    await continueFromPostNotificationsToRepo(orcaBotmuxPage)
+    await orcaBotmuxPage.getByRole('button', { name: /Clone from URL/i }).click()
+
+    // Why: focus the clone-url input and press Cmd/Ctrl+Enter. The capture-
+    // phase keydown handler should bail via isEditableTarget, so the dialog
+    // should remain visible and the empty clone form must not submit.
+    const isMac = await orcaBotmuxPage.evaluate(() => navigator.userAgent.includes('Mac'))
+    const accelerator = isMac ? 'Meta+Enter' : 'Control+Enter'
+    const input = orcaBotmuxPage.getByPlaceholder('https://github.com/user/repo.git')
+    await input.click()
+    await input.press(accelerator)
+    // Brief wait so any (incorrect) handler firing would have already happened.
+    await orcaBotmuxPage.waitForTimeout(250)
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Clone from URL/i })).toBeVisible()
+    await expect(input).toBeVisible()
+    expect((await getOnboardingState(orcaBotmuxPage)).closedAt).not.toBeNull()
+  })
+
+  test('Back returns to the previous step without losing progress', async ({ orcaBotmuxPage }) => {
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
+      timeout: 15_000
+    })
+
+    await continueOnboarding(orcaBotmuxPage)
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Make it feel like home/i })).toBeVisible()
+    await expect
+      .poll(async () => (await getOnboardingState(orcaBotmuxPage)).lastCompletedStep, {
+        timeout: 5_000
+      })
+      .toBe(1)
+
+    // Why: exact match — the app sidebar also exposes a "Go back" button that
+    // would otherwise match this regex.
+    await orcaBotmuxPage.getByRole('button', { name: 'Back', exact: true }).click()
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible()
+    await expectOnboardingProgress(orcaBotmuxPage, /^1 of [345]$/)
+
+    // Why: "without losing progress" means persisted lastCompletedStep stays
+    // at 1 — Back rewinds the visible step but must not roll persistence back.
+    // Poll because persistence flushes async via IPC after the Back click.
+    await expect
+      .poll(async () => (await getOnboardingState(orcaBotmuxPage)).lastCompletedStep, {
+        timeout: 5_000
+      })
+      .toBe(1)
+  })
+
+  test('final notification step can be dismissed via Escape or click-off', async ({ orcaBotmuxPage }) => {
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
+      timeout: 15_000
+    })
+
+    // Advance to the final notification step. Its primary button hands off to
+    // Add Project, so the footer offers no "Skip to project setup" shortcut —
+    // but click-off and Escape must still open the skip-confirmation dialog like
+    // every other step, so the modal never feels stuck.
+    await continueOnboarding(orcaBotmuxPage)
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Make it feel like home/i })).toBeVisible()
+    await continueFromThemeToNotifications(orcaBotmuxPage)
+
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Set up notifications/i })).toBeVisible()
+    await expect(onboardingFooterButton(orcaBotmuxPage, SKIP_TO_PROJECT_SETUP_BUTTON)).toHaveCount(0)
+
+    // Escape opens the confirmation; "No, keep going" returns to the step with
+    // onboarding still open.
+    await orcaBotmuxPage.keyboard.press('Escape')
+    await expectOnboardingSkipConfirmationOpen(orcaBotmuxPage)
+    await orcaBotmuxPage.getByRole('button', { name: /No, keep going/i }).click()
+    await expectOnboardingSkipConfirmationClosed(orcaBotmuxPage)
+    await expect(orcaBotmuxPage.getByRole('heading', { name: /Set up notifications/i })).toBeVisible()
+    expect((await getOnboardingState(orcaBotmuxPage)).closedAt).toBeNull()
+
+    // Click-off opens the confirmation; Skip dismisses onboarding outright (no
+    // Add Project handoff — that is the primary button's job).
+    await orcaBotmuxPage.locator('[data-onboarding-overlay]').click({ position: { x: 8, y: 40 } })
+    await expectOnboardingSkipConfirmationOpen(orcaBotmuxPage)
+    await orcaBotmuxPage.getByRole('button', { name: /^Skip$/ }).click()
+
+    await expect
+      .poll(
+        async () => {
+          const state = await getOnboardingState(orcaBotmuxPage)
+          return {
+            closedAt: state.closedAt === null ? null : 'set',
+            outcome: state.outcome,
+            dismissed: state.checklist.dismissed
+          }
+        },
+        { timeout: 5_000 }
+      )
+      .toEqual({ closedAt: 'set', outcome: 'dismissed', dismissed: true })
+  })
+})

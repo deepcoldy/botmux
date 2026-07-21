@@ -1,0 +1,508 @@
+/* ── Terminal ────────────────────────────────────────── */
+
+.terminal-container {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+/* Ensure pane manager root fills its absolutely-positioned container */
+.pane-manager-root {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Reset the global border/outline base rule inside terminal panes */
+.pane-manager-root *,
+.pane-manager-root *::before,
+.pane-manager-root *::after {
+  border-color: transparent;
+  outline: none;
+}
+
+.pane-manager-root .xterm {
+  height: 100%;
+  width: 100%;
+}
+
+.pane-manager-root .xterm-viewport {
+  /* Why: xterm/VS Code keep the scrollbar gutter stable. `auto` lets Linux
+     DOM scrollbars appear/disappear, which can feed resize/reflow jitter. */
+  overflow-y: scroll;
+}
+
+/* xterm.css hard-codes the viewport background to #000 (for opaque macOS
+   scrollbars). On light-themed terminals at fractional-pixel positions (e.g.
+   the install terminals inside centered setup modals), that black layer
+   anti-aliases into a faint 1px line above/below the themed .xterm. Match
+   xterm's own selector so this also covers terminals mounted outside the pane
+   manager, and let the themed .xterm background show through; the viewport
+   reuses the canonical editor scrollbar rules in main.css. */
+.xterm:not(.allow-transparency) .xterm-viewport {
+  background-color: transparent;
+}
+
+/* Round the xterm DOM scrollbar thumb; xterm has no option for this, and its
+   default .xterm-slider has square corners. */
+.xterm .xterm-scrollable-element > .xterm-scrollbar > .xterm-slider {
+  border-radius: 4px;
+}
+
+/* xterm.css sets position:absolute;top:0 on .xterm-helpers but omits left,
+   leaving left:auto. In Electron's Blink, left:auto can resolve to a non-zero
+   value and offset the IME candidate window away from the cursor. Anchoring it
+   explicitly to 0 matches the intended layout and fixes the IME position. */
+.pane-manager-root .xterm .xterm-helpers {
+  left: 0;
+}
+
+.pane-manager-root .xterm .xterm-helper-textarea {
+  /* Why: Chromium can still paint the native caret for xterm's hidden helper
+     textarea on Windows, which shows up as a stale cursor during redraws. */
+  caret-color: transparent;
+}
+
+/* Divider: the element is a wide transparent hit area; the visible line is
+   drawn by ::after so that setting `background` on the element never hides it. */
+.pane-divider.is-vertical,
+.pane-divider.is-horizontal {
+  --divider-thickness: 4px;
+  background: transparent !important;
+}
+
+.pane-divider::after {
+  content: '';
+  position: absolute;
+  border-radius: 1px;
+  background: var(--orca-botmux-terminal-divider-color, transparent);
+  transition: background 100ms ease;
+}
+
+.pane-divider.is-vertical::after {
+  /* Negative insets on the cross axis extend the line into perpendicular
+     divider hit zones so that intersecting splits visually connect (├ not |-). */
+  top: calc(-1 * var(--divider-extension, 5px));
+  bottom: calc(-1 * var(--divider-extension, 5px));
+  left: 50%;
+  width: var(--divider-thickness);
+  transform: translateX(-50%);
+}
+
+.pane-divider.is-horizontal::after {
+  left: calc(-1 * var(--divider-extension, 5px));
+  right: calc(-1 * var(--divider-extension, 5px));
+  top: 50%;
+  height: var(--divider-thickness);
+  transform: translateY(-50%);
+}
+
+.pane-divider.is-vertical:hover::after,
+.pane-divider.is-vertical.is-dragging::after,
+.pane-divider.is-horizontal:hover::after,
+.pane-divider.is-horizontal.is-dragging::after {
+  background: var(
+    --orca-botmux-terminal-divider-color-strong,
+    var(--orca-botmux-terminal-divider-color, transparent)
+  );
+}
+
+/* ── Pane drag handle ─────────────────────────────────── */
+
+.pane-drag-handle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 12px;
+  z-index: 10;
+  cursor: grab;
+  opacity: 0;
+  transition: opacity 150ms ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.15);
+}
+
+/* Three-dot ellipsis indicator */
+.pane-drag-handle::after {
+  content: '···';
+  font-size: 10px;
+  letter-spacing: 1px;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+/* Only show when hovering the handle itself, and only with multiple panes */
+.has-multiple-panes .pane-drag-handle {
+  pointer-events: auto;
+}
+
+.has-multiple-panes .pane-drag-handle:hover {
+  opacity: 1;
+}
+
+.pane-drag-handle:active {
+  cursor: grabbing;
+}
+
+/* Dim the source pane while dragging */
+.pane.is-drag-source {
+  opacity: 0.4 !important;
+}
+
+.pane.pane-focus-rim-flash::before {
+  content: '';
+  position: absolute;
+  inset: 1px;
+  z-index: 30;
+  pointer-events: none;
+  border: 1.5px solid color-mix(in srgb, var(--terminal-pane-locate) 68%, transparent);
+  border-radius: 2px;
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--terminal-pane-locate) 34%, transparent),
+    0 0 18px color-mix(in srgb, var(--terminal-pane-locate) 36%, transparent);
+  animation: pane-focus-rim-flash 1.5s ease-out forwards;
+}
+
+.pane[data-terminal-attention] .xterm-container {
+  box-shadow: none;
+}
+
+.pane[data-terminal-attention] .xterm-container::after {
+  content: '';
+  position: absolute;
+  inset: 0 4px 4px 0;
+  z-index: 5;
+  pointer-events: none;
+  border-radius: 2px;
+  box-shadow:
+    inset 0 0 0 1.5px color-mix(in srgb, var(--terminal-pane-locate) 64%, transparent),
+    inset 0 0 0 3px color-mix(in srgb, var(--terminal-pane-locate) 18%, transparent);
+}
+
+@keyframes pane-focus-rim-flash {
+  0% {
+    opacity: 1;
+  }
+  24% {
+    opacity: 0.42;
+  }
+  46% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pane.pane-focus-rim-flash::before {
+    animation: none;
+  }
+}
+
+/* Suppress pointer events on terminals during pane drag so overlay works */
+.is-pane-dragging .pane {
+  pointer-events: none;
+}
+
+/* ── Drop overlay ─────────────────────────────────────── */
+
+.pane-drop-overlay,
+.tab-drop-overlay {
+  position: absolute;
+  z-index: 9999;
+  background: rgba(59, 130, 246, 0.2);
+  border: 2px solid rgba(59, 130, 246, 0.5);
+  border-radius: 4px;
+  pointer-events: none;
+}
+
+.pane-drop-overlay[data-pane-drop-overlay-kind='insertion'] {
+  background: var(--chart-2);
+  border: 0;
+  border-radius: 0;
+}
+
+.tab-drop-overlay__label {
+  font-size: 11px;
+  color: var(--primary-foreground);
+  background: color-mix(in srgb, var(--chart-2) 20%, transparent);
+}
+
+/* ── Pane title bar ──────────────────────────────────── */
+
+:root {
+  --orca-botmux-pane-title-height: 24px;
+  --orca-botmux-pane-title-fg: var(--terminal-pane-title-on-dark-fg);
+  --orca-botmux-pane-title-input-fg: var(--terminal-pane-title-on-dark-input-fg);
+  --orca-botmux-pane-title-placeholder: var(--terminal-pane-title-on-dark-placeholder);
+  --orca-botmux-pane-title-button-fg: var(--terminal-pane-title-on-dark-button-fg);
+  --orca-botmux-pane-title-button-hover-fg: var(--terminal-pane-title-on-dark-button-hover-fg);
+  --orca-botmux-pane-title-input-bg: var(--terminal-pane-title-on-dark-input-bg);
+  --orca-botmux-pane-title-separator: var(--terminal-pane-title-on-dark-separator);
+}
+
+[data-pane-title-surface='light'] {
+  --orca-botmux-pane-title-fg: var(--terminal-pane-title-on-light-fg);
+  --orca-botmux-pane-title-input-fg: var(--terminal-pane-title-on-light-input-fg);
+  --orca-botmux-pane-title-placeholder: var(--terminal-pane-title-on-light-placeholder);
+  --orca-botmux-pane-title-button-fg: var(--terminal-pane-title-on-light-button-fg);
+  --orca-botmux-pane-title-button-hover-fg: var(--terminal-pane-title-on-light-button-hover-fg);
+  --orca-botmux-pane-title-input-bg: var(--terminal-pane-title-on-light-input-bg);
+  --orca-botmux-pane-title-separator: var(--terminal-pane-title-on-light-separator);
+}
+
+/* Floating title overlay. The title owns the top strip of the pane, while titled
+   panes reserve matching terminal height so the first row remains visible. */
+.pane-title-overlay-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  pointer-events: none;
+}
+
+.pane-title-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: var(--orca-botmux-pane-title-height);
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  font-size: 13px;
+  font-family: var(--font-mono);
+  color: var(--orca-botmux-pane-title-fg, rgb(255 255 255 / 0.52));
+  background: var(--orca-botmux-pane-title-bg, #000);
+  border-bottom: 1px solid var(--orca-botmux-pane-title-separator, rgb(255 255 255 / 0.06));
+  pointer-events: auto;
+  user-select: none;
+}
+
+.pane-title-drag-handle {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 32px;
+  height: var(--orca-botmux-pane-title-height);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  opacity: 0;
+  background: color-mix(in srgb, var(--orca-botmux-pane-title-fg) 36%, transparent);
+  transform: translateX(-50%);
+  transition: opacity 150ms ease;
+}
+
+.pane-title-drag-handle::after {
+  content: '...';
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: 0;
+  color: var(--orca-botmux-pane-title-button-hover-fg);
+}
+
+.pane-title-drag-handle:hover {
+  opacity: 1;
+}
+
+.pane-title-drag-handle:active {
+  cursor: grabbing;
+}
+
+.session-restored-banner {
+  position: absolute;
+  top: 0;
+  left: 8px;
+  z-index: 5;
+  height: var(--orca-botmux-pane-title-height);
+  display: flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--orca-botmux-pane-title-fg);
+  background: transparent;
+  user-select: none;
+  pointer-events: none;
+}
+
+.pane-title-text {
+  align-self: stretch;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  line-height: var(--orca-botmux-pane-title-height);
+}
+
+.pane-title-text:focus-visible {
+  outline: 1px solid var(--ring);
+  outline-offset: 1px;
+}
+
+.pane-title-bar[data-chromeless] {
+  background: transparent;
+  border-bottom: none;
+  padding: 0 2px;
+  pointer-events: none;
+}
+
+.pane-title-bar[data-chromeless] .pane-title-actions {
+  pointer-events: auto;
+}
+
+.pane-title-bar[data-chromeless] .pane-title-split-trigger,
+.pane-title-bar[data-chromeless] .pane-title-close {
+  position: relative;
+  width: 18px;
+  min-width: 18px;
+  height: var(--orca-botmux-pane-title-height);
+  padding: 0;
+}
+
+.pane-title-bar[data-chromeless] .pane-title-close {
+  margin-left: -1px;
+}
+
+.pane-title-bar[data-chromeless] .pane-title-split-trigger::before,
+.pane-title-bar[data-chromeless] .pane-title-close::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 23px;
+  height: 23px;
+  background: radial-gradient(
+    circle,
+    var(--orca-botmux-pane-title-bg, var(--background)) 0 44%,
+    color-mix(in srgb, var(--orca-botmux-pane-title-bg, var(--background)) 74%, transparent) 62%,
+    transparent 100%
+  );
+  border-radius: 9999px;
+  transform: translate(-50%, -50%);
+}
+
+.pane-title-close {
+  flex-shrink: 0;
+  margin-left: auto;
+  color: var(--orca-botmux-pane-title-button-fg, rgb(255 255 255 / 0.3));
+  background: transparent;
+  opacity: 0;
+  transition:
+    opacity 120ms ease,
+    color 120ms ease;
+}
+
+.pane-title-actions {
+  position: relative;
+  z-index: 3;
+}
+
+.pane-title-split-trigger {
+  color: var(--orca-botmux-pane-title-button-fg, rgb(255 255 255 / 0.3));
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.pane-title-bar[data-chromeless] .pane-title-split-trigger svg,
+.pane-title-bar[data-chromeless] .pane-title-close svg {
+  /* Why: chromeless controls overlap row-one terminal text; the rounded backing
+     clears text inside open glyphs without adding one shared toolbar fill. */
+  position: relative;
+  stroke-width: 2.75px;
+}
+
+.pane-title-bar[data-active-pane] .pane-title-split-trigger,
+.pane-title-bar[data-active-pane] .pane-title-close,
+.pane-title-bar:hover .pane-title-split-trigger,
+.pane-title-bar:focus-within .pane-title-split-trigger {
+  opacity: 1;
+}
+
+.pane-title-bar:hover .pane-title-close,
+.pane-title-bar:focus-within .pane-title-close,
+.pane-title-close:focus-visible {
+  opacity: 1;
+}
+
+.pane-title-close:hover,
+.pane-title-close:active,
+.pane-title-close[data-state='delayed-open'],
+.pane-title-close[data-state='instant-open'],
+.pane-title-split-trigger:hover,
+.pane-title-split-trigger:active,
+.pane-title-split-trigger[data-state='delayed-open'],
+.pane-title-split-trigger[data-state='instant-open'] {
+  background: transparent;
+  color: var(--orca-botmux-pane-title-button-hover-fg, rgb(255 255 255 / 0.8));
+}
+
+/* Inline edit input — matches the title text styling exactly to prevent
+   layout shift. A subtle bottom border indicates active edit mode. */
+/* When inline-editing, remove the bar's side padding so the input
+   stretches edge-to-edge; the input carries its own left padding. */
+.pane-title-bar[data-editing] {
+  padding: 0;
+}
+
+.pane-title-input {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  height: var(--orca-botmux-pane-title-height);
+  box-sizing: border-box;
+  padding: 0 8px;
+  margin: 0;
+  border: 1px solid transparent;
+  border-radius: 0;
+  background: var(--orca-botmux-pane-title-input-bg, rgb(255 255 255 / 0.04));
+  outline: none;
+  font-size: 13px;
+  line-height: 20px;
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  color: var(--orca-botmux-pane-title-input-fg, rgb(255 255 255 / 0.7));
+  caret-color: var(--orca-botmux-pane-title-input-fg, rgb(255 255 255 / 0.7));
+}
+
+.pane-title-input::placeholder {
+  color: var(--orca-botmux-pane-title-placeholder, rgb(255 255 255 / 0.38));
+}
+
+.pane-title-input:focus-visible {
+  border-color: var(--ring);
+}
+
+/* Baseline xterm-container layout — padding is driven by CSS custom properties
+   so Ghostty-imported window-padding-x/y can be applied without inline styles.
+   The fallback 4px preserves the legacy default. */
+.xterm-container {
+  position: relative;
+  width: calc(100% - var(--pane-padding-x, 4px));
+  height: calc(100% - var(--pane-padding-y, 4px));
+  margin-top: var(--pane-padding-y, 4px);
+  margin-left: var(--pane-padding-x, 4px);
+}
+
+/* When a pane has a title, shift the terminal content down to make room.
+   The .pane container uses position: relative, so the absolutely-positioned
+   title bar occupies the top title-height pixels. Height is reduced by the
+   same amount to prevent overflow/clipping. */
+.pane[data-has-title] .xterm-container {
+  margin-top: var(--orca-botmux-pane-title-height);
+  height: calc(100% - var(--orca-botmux-pane-title-height)); /* match margin-top */
+}

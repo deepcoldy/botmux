@@ -27,6 +27,16 @@
 
 > 📖 **完整文档**（命令 / 配置 / 最佳实践 / 排错）：**<https://deepcoldy.github.io/botmux/>** ——本 README 只讲为什么用它和怎么快速上手。
 
+### Orca-class Desktop（开发中）
+
+仓库 `desktop/` 为 **Orca 整树 vendor 的 Electron IDE**（worktree / 终端 / git / browser / mobile RPC 等，与 Orca 毫米级对齐）。与飞书 daemon 并存、独立 userData。开发：
+
+```bash
+cd desktop && pnpm install && pnpm dev
+```
+
+说明与归因见 [`desktop/README.md`](desktop/README.md)、[`desktop/NOTICE`](desktop/NOTICE)。旧 `src/desktop` 薄壳仅作 legacy。
+
 ## 演示
 
 | 飞书流式卡片 | Web 终端 | tmux 会话管理 | 多机器人协作 |

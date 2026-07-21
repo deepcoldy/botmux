@@ -12,6 +12,34 @@ pnpm daemon:logs          # 查看日志
 
 - 每次修改后需要 `pnpm build` 然后 `pnpm daemon:restart`
 
+### Orca-class Desktop（`desktop/`）
+
+仓库根目录下的 **`desktop/`** 是从 Orca 整树 vendor 的 Electron IDE（毫米级对齐 Orca Desktop）。与飞书 daemon/CLI **独立安装、独立 userData**。
+
+```bash
+cd desktop
+corepack enable && corepack prepare pnpm@10.24.0 --activate
+pnpm install
+pnpm exec electron-vite build   # 生产构建 main/preload/renderer → out/
+pnpm dev                        # 开发热更（推荐日常）
+# 或：pnpm exec electron .      # 跑已构建的 out/
+```
+
+- 详见 `desktop/README.md`、`desktop/NOTICE`（MIT 归因 Lovecast / Orca）
+- **新 Desktop 工作只改 `desktop/`**；`src/desktop` 是旧 webview 薄壳，已 deprecated
+- Desktop 用 pnpm 10；根 CLI 仍用 pnpm 9 — 不要混在一个 lock 里
+- **Botmux Sessions 桥**（右侧栏 Botmux / Settings → Botmux Sessions）：
+  - **多 host** 并行（local + N×SSH + **platform 隧道**），会话带 `hostId`
+  - 连接状态持久化到 Desktop userData，启动后 SSH handlers 就绪自动重连
+  - SSH 连接时尝试 **自动 Orca SSH connect**，并优先 port-forward
+  - 会话列表约 12s 轮询；write-link 自动补 `?t=` token
+  - **Ask-hooks**：`GET/POST /api/asks/*` + 侧栏 Needs answer + OS Notification
+  - **PTY**：会话 **PTY** 按钮 → `botmux-term-relay.mjs` 进 Desktop xterm（实验）
+  - 设计说明：`desktop/docs/botmux-bridge.md`；回归：`desktop/docs/capability-regression-matrix.md`
+  - Runtime 别名：`BotmuxRuntimeService`（`desktop/src/main/runtime/botmux-runtime.ts`）
+- 本地包：`cd desktop && pnpm pack:local` → `dist/mac-arm64/Botmux.app`；冒烟：`pnpm smoke:desktop`
+- **Mobile companion 未做**（刻意后置）
+
 ### 多 checkout：全局 `botmux` 指向谁
 
 全局 `botmux` 命令走 `~/.botmux/bin/botmux` 瘦 wrapper，指向「最后认领的 checkout」的 `dist/cli.js`（daemon 启动时也会写）：
@@ -36,6 +64,8 @@ pnpm switch:here && pnpm daemon:restart
 
 ## 模块结构
 
+- `desktop/` — Orca-class Electron Desktop（vendor import；main/renderer/runtime RPC）
+- `src/desktop/` — **legacy** 薄壳（webview + 全局 CLI 监管），勿再扩展
 - `daemon.ts` — 薄编排层，组装各模块并启动
 - `worker.ts` — Worker 子进程，通过适配器管理 CLI + PTY
 - `server.ts` — Web 终端 HTTP 服务（xterm.js）
@@ -45,7 +75,7 @@ pnpm switch:here && pnpm daemon:restart
 - `adapters/backend/` — 会话后端：`PtyBackend`、`TmuxBackend`
 - `skills/` — 开箱即用的 Skill 定义 + installer
 - `core/types.ts` — `DaemonSession` 是核心类型，所有模块从此导入
-- `core/` — `worker-pool`、`command-handler`、`session-manager`、`cost-calculator`、`scheduler`
+- `core/` — `worker-pool`、`command-handler`、`session-manager`、`cost-calculator`、`scheduler`、`session-row-enrichment`（/api/sessions 展示增强：bot 头像 + git 仓库/分支）
 - `im/lark/` — 飞书：事件路由（`event-dispatcher`）、卡片（`card-builder`/`card-handler`）、API（`client`）、消息解析（`message-parser`）
 - `utils/` — `idle-detector`（CLI 空闲检测）、`terminal-renderer`（xterm.js 截屏）、`logger`
 

@@ -1,0 +1,8 @@
+Botmux Desktop includes substantial portions of Orca
+(https://github.com/stablyai/orca), used under the MIT License.
+
+Copyright (c) 2026 Lovecast Inc.
+
+The original Orca LICENSE is preserved in this directory as LICENSE (from the
+vendor import). Botmux modifications are also MIT; see the repository root
+LICENSE for Botmux project copyright.

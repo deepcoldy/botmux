@@ -48,6 +48,9 @@
     "desktop:dev": "pnpm build && pnpm desktop:bundle && electron dist/desktop/main.cjs",
     "desktop:pack": "pnpm desktop:pack:local",
     "desktop:pack:local": "node scripts/desktop-pack-local.mjs",
+    "desktop:ide": "pnpm --dir desktop dev",
+    "desktop:ide:build": "pnpm --dir desktop exec electron-vite build",
+    "desktop:ide:install": "pnpm --dir desktop install",
     "prepublishOnly": "npm run build",
     "prepare": "git config core.hooksPath scripts/git-hooks 2>/dev/null || true"
   },

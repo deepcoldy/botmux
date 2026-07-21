@@ -1,0 +1,14 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./config/tsconfig.node.json" },
+    { "path": "./config/tsconfig.web.json" },
+    { "path": "./config/tsconfig.relay.json" }
+  ],
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/renderer/src/*"]
+    }
+  }
+}
