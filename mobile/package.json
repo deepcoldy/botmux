@@ -83,6 +83,9 @@
   "pnpm": {
     "overrides": {
       "xcode>uuid": "11.1.1"
-    }
+    },
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }
