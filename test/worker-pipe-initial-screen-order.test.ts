@@ -90,8 +90,8 @@ describe('worker pipe initial screen ordering', () => {
     // Synthetic working must not be rewritten by classifyScreenUsageLimit
     // (rate-limit banner would otherwise collapse seed to limited→limited).
     expect(source).toContain('opts?.force');
-    // Short-turn fix: flushPending publishes working immediately on submit.
-    expect(source).toContain("// Immediate working for card-off reaction settle");
+    // Every submitted item starts a fresh runtime write cycle immediately.
+    expect(source).toContain('beginCliWriteCycle()');
   });
 
   it('runs a busy-pattern idle probe after each submitted input — except reliableTurnTerminal CLIs', () => {
@@ -348,8 +348,10 @@ describe('worker pipe initial screen ordering', () => {
     expect(proofGuardIdx).toBeLessThan(livenessGuardIdx);
     expect(livenessGuardIdx).toBeGreaterThan(-1);
     expect(signedIdleGuardIdx).toBeGreaterThan(livenessGuardIdx);
-    // The explicit runner queue wins before any immediate daemon/card idle
+    // The explicit runner queue wins before any immediate daemon/card status
     // projection; returning from the guard therefore suppresses both paths.
+    // The shared projector composes the structured lifecycle gate with signed
+    // Codex App liveness instead of hard-coding an idle card update here.
     expect(livenessGuardIdx).toBeLessThan(readySetIdx);
     expect(signedIdleGuardIdx).toBeLessThan(readySetIdx);
     expect(readySetIdx).toBeLessThan(promptReadySendIdx);
