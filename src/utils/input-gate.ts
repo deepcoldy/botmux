@@ -47,3 +47,50 @@ export function shouldReleaseFirstPromptTimeout(state: {
   if (!state.hasReadyPattern) return true;
   return state.elapsedMs >= state.hardTimeoutMs;
 }
+
+/**
+ * After the ready-gate releases (real SessionStart signal OR the timeout
+ * fallback), the worker settles for PTY quiescence and then decides whether to
+ * mark the prompt ready (which flushes for ALL adapters) vs. just calling
+ * flushPending() (which only flushes for type-ahead adapters). Marking ready is
+ * correct when ANY of these hold:
+ *   - promptReadyAfterSettle         — the real SessionStart/BOTMUX_READY_COMMAND
+ *                                      signal fired (authoritative: input box exists).
+ *   - promptReadyDetectedDuringSettle — the idle detector fired during the
+ *                                      settle (a readyPattern/idle proved readiness).
+ *   - readyPatternSeenDuringHold      — a readyPattern fired WHILE the gate was
+ *                                      holding (markPromptReady was blocked by
+ *                                      readyGate.shouldHold()). The input box
+ *                                      exists; the gate only deferred delivery.
+ *
+ * Pins the Hermes regression: a non-type-ahead adapter that renders its prompt
+ * (❯) during the hold but never fires the SessionStart signal must be marked
+ * ready at settle — otherwise settle calls flushPending(), which bails on
+ * !isPromptReady && !typeAheadAllowed and leaves the first message queued until
+ * the hard timeout (and, before the hard-timeout fix, forever).
+ */
+export function decideSettleMarkReady(state: {
+  promptReadyAfterSettle: boolean;
+  promptReadyDetectedDuringSettle: boolean;
+  readyPatternSeenDuringHold: boolean;
+}): boolean {
+  return state.promptReadyAfterSettle || state.promptReadyDetectedDuringSettle || state.readyPatternSeenDuringHold;
+}
+
+/**
+ * At the first-prompt hard timeout the worker has waited the full cap. For
+ * type-ahead adapters flushPending() drains the queue even while !isPromptReady
+ * (the TUI parks input in its own queue). For non-type-ahead adapters
+ * flushPending() bails on !isPromptReady && !typeAheadAllowed, so the worker
+ * must mark the prompt ready first (markPromptReady() then flushes).
+ * Returns the action the worker must take:
+ *   - 'flush'      — call flushPending() (type-ahead adapters).
+ *   - 'mark-ready' — call markPromptReady() (non-type-ahead adapters).
+ *
+ * Pins the regression where non-type-ahead adapters only logged "forcing
+ * queued message flush" at the hard timeout without actually delivering the
+ * held first message.
+ */
+export function decideHardTimeoutAction(supportsTypeAhead: boolean): 'flush' | 'mark-ready' {
+  return supportsTypeAhead ? 'flush' : 'mark-ready';
+}

@@ -39,7 +39,7 @@ import { readProcessStartIdentity } from './core/session-marker.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
-import { shouldReleaseFirstPromptTimeout, shouldWriteNow } from './utils/input-gate.js';
+import { decideHardTimeoutAction, decideSettleMarkReady, shouldReleaseFirstPromptTimeout, shouldWriteNow } from './utils/input-gate.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
@@ -882,6 +882,15 @@ let isSettlingFirstFlush = false;
  *  ready yet, or flushPending will be blocked by isSettlingFirstFlush and a
  *  later markPromptReady call would return early with the first prompt stranded. */
 let promptReadyDetectedDuringSettle = false;
+/** While the ready-gate is holding, the IdleDetector may still fire on a real
+ *  readyPattern (e.g. Hermes's ❯) — proving the input box exists — but
+ *  markPromptReady() returns early because the gate is armed. Record that the
+ *  pattern was seen so the gate's timeout-fallback settle can mark the prompt
+ *  ready immediately instead of delivering into a !isPromptReady state that
+ *  flushPending() rejects for non-type-ahead adapters. Without this, a Hermes
+ *  spawn that renders ❯ but never fires BOTMUX_READY_COMMAND waits the full
+ *  hard timeout (and previously never delivered at all). */
+let readyPatternSeenDuringHold = false;
 
 /** Wait until the PTY has been quiet for READY_FLUSH_SETTLE_MS (Ink render
  *  drained), capped at READY_FLUSH_SETTLE_CAP_MS, then flush the held prompt.
@@ -894,8 +903,13 @@ function settleThenFlush(startedAtMs: number, promptReadyAfterSettle: boolean): 
   const quietForMs = now - lastPtyOutputAtMs;
   if (quietForMs >= READY_FLUSH_SETTLE_MS || now - startedAtMs >= READY_FLUSH_SETTLE_CAP_MS) {
     isSettlingFirstFlush = false;
-    const shouldMarkPromptReady = promptReadyAfterSettle || promptReadyDetectedDuringSettle;
+    const shouldMarkPromptReady = decideSettleMarkReady({
+      promptReadyAfterSettle,
+      promptReadyDetectedDuringSettle,
+      readyPatternSeenDuringHold,
+    });
     promptReadyDetectedDuringSettle = false;
+    readyPatternSeenDuringHold = false;
     log(`Ready-gate settle done (quiet ${quietForMs}ms); ${shouldMarkPromptReady ? 'marking prompt ready' : 'delivering held first prompt'}`);
     if (shouldMarkPromptReady) {
       markPromptReady();
@@ -4436,6 +4450,11 @@ function markPromptReady(): void {
   // releaseReadyGate() drives flushPending() once the real signal lands, and a
   // later genuine idle then runs this fully. No-op for non-armed gates.
   if (readyGate.shouldHold()) {
+    // A real readyPattern fired while the gate was holding — the input box
+    // exists. Remember it so the gate's timeout-fallback settle can mark the
+    // prompt ready (see settleThenFlush) instead of letting flushPending()
+    // reject the held message for non-type-ahead adapters.
+    readyPatternSeenDuringHold = true;
     log('Idle detected but holding for SessionStart ready signal (startup selector guard)');
     return;
   }
@@ -6945,6 +6964,7 @@ async function spawnCli(
   if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
   isSettlingFirstFlush = false;
   promptReadyDetectedDuringSettle = false;
+  readyPatternSeenDuringHold = false;
   // Reset quiescence baseline so the settle measures silence from THIS spawn.
   lastPtyOutputAtMs = Date.now();
   const readyHookAvailable = effectiveReadyHookInstall
@@ -7169,7 +7189,23 @@ async function spawnCli(
     // invoking markPromptReady() would claim the CLI is idle while it's still
     // mid-boot, so flushPending() alone is safer — it respects typeAheadAllowed
     // and drains pendingMessages now.
-    if (cliAdapter?.supportsTypeAhead) flushPending();
+    //
+    // Non-type-ahead adapters (Hermes etc.) flushPending() rejects the held
+    // message while isPromptReady is false — it bails on
+    // `!isPromptReady && !typeAheadAllowed`. The hard cap means we've waited
+    // long enough. By now the ready gate's 45s fallback has already released
+    // the gate (READY_SIGNAL_TIMEOUT_MS < this 90s hard cap) and the post-
+    // release settle has drained, so markPromptReady() proceeds: it sets
+    // isPromptReady and drains the held first prompt. Without this, a spawn
+    // that never fires the ready signal (and whose readyPattern the idle
+    // detector never matched) would hold the first queued message forever —
+    // the previous code only logged "forcing flush" without actually flushing
+    // for non-type-ahead adapters.
+    if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush') {
+      flushPending();
+      return;
+    }
+    markPromptReady();
   };
   setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_TIMEOUT_MS, false), FIRST_PROMPT_TIMEOUT_MS);
 
@@ -7196,6 +7232,7 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
   isSettlingFirstFlush = false;
   promptReadyDetectedDuringSettle = false;
+  readyPatternSeenDuringHold = false;
   stopScreenAnalyzer();
   stopScreenUpdates();
   backend?.kill();

@@ -108,13 +108,45 @@ describe('worker pipe initial screen ordering', () => {
     expect(deferredFlagIdx).toBeGreaterThan(settleGuardIdx);
     expect(deferredFlagIdx).toBeLessThan(readySetIdx);
 
-    expect(settle).toContain('const shouldMarkPromptReady = promptReadyAfterSettle || promptReadyDetectedDuringSettle;');
-    expect(settle.indexOf('promptReadyDetectedDuringSettle = false;')).toBeGreaterThan(
-      settle.indexOf('const shouldMarkPromptReady = promptReadyAfterSettle || promptReadyDetectedDuringSettle;'),
-    );
-    expect(settle.indexOf('markPromptReady();')).toBeGreaterThan(
-      settle.indexOf('const shouldMarkPromptReady = promptReadyAfterSettle || promptReadyDetectedDuringSettle;'),
-    );
+    // THE HERMES FIX (gate fallback path): when markPromptReady fires while the
+    // ready-gate is still holding (a readyPattern like ❯ appeared before the
+    // SessionStart signal), it must record readyPatternSeenDuringHold so the
+    // gate's timeout-fallback settle marks the prompt ready — otherwise a
+    // non-type-ahead adapter's held first message is dropped by flushPending()
+    // on !isPromptReady && !typeAheadAllowed.
+    const holdGuardIdx = mark.indexOf('if (readyGate.shouldHold())');
+    const holdFlagIdx = mark.indexOf('readyPatternSeenDuringHold = true;', holdGuardIdx);
+    expect(holdGuardIdx).toBeGreaterThan(-1);
+    expect(holdFlagIdx).toBeGreaterThan(holdGuardIdx);
+    expect(holdFlagIdx).toBeLessThan(readySetIdx);
+
+    const decideIdx = settle.indexOf('const shouldMarkPromptReady = decideSettleMarkReady({');
+    expect(decideIdx).toBeGreaterThan(-1);
+    // readyPatternSeenDuringHold must be wired into the settle decision.
+    expect(settle.indexOf('readyPatternSeenDuringHold,', decideIdx)).toBeGreaterThan(decideIdx);
+    // Both deferred flags are reset after the decision (so the next spawn is clean).
+    expect(settle.indexOf('promptReadyDetectedDuringSettle = false;', decideIdx)).toBeGreaterThan(decideIdx);
+    expect(settle.indexOf('readyPatternSeenDuringHold = false;', decideIdx)).toBeGreaterThan(decideIdx);
+    expect(settle.indexOf('markPromptReady();', decideIdx)).toBeGreaterThan(decideIdx);
+  });
+
+  it('forces the first prompt for non-type-ahead adapters at the hard timeout', () => {
+    // THE HERMES FIX (hard-timeout path): previously the hard cap only logged
+    // "forcing queued message flush" and flushed for type-ahead adapters only;
+    // non-type-ahead adapters (Hermes) never delivered. The release must now
+    // route non-type-ahead adapters to markPromptReady() (which then flushes).
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const fallbackStart = source.indexOf('const releaseFirstPromptTimeout =');
+    const decideIdx = source.indexOf("decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true)", fallbackStart);
+    const markReadyIdx = source.indexOf('markPromptReady();', decideIdx);
+    const flushIdx = source.indexOf("if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush')", fallbackStart);
+
+    expect(fallbackStart).toBeGreaterThan(-1);
+    expect(decideIdx).toBeGreaterThan(fallbackStart);
+    // The type-ahead flush branch and the non-type-ahead mark-ready path both
+    // exist, in the right order.
+    expect(flushIdx).toBeGreaterThan(fallbackStart);
+    expect(markReadyIdx).toBeGreaterThan(flushIdx);
   });
 
   it('honors a true ready signal that arrives AFTER the timeout fallback (slow cold start)', () => {
