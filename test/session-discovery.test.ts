@@ -322,6 +322,54 @@ describe('discoverAdoptableSessions', () => {
     expect(results[1]!.paneRows).toBe(50);
   });
 
+  it('should bind a Codex rollout opened by the native child below its Node launcher', () => {
+    const cliSessionId = '019f829a-3c55-75c3-b408-bb44fd88c067';
+    setupMocks({
+      paneLines: 'codex:0.0 1000\n',
+      // npm's `codex` shim stays alive as a Node launcher. Its argv matches
+      // Codex before discovery reaches the native child that owns the rollout.
+      commMap: { 1000: 'zsh', 1001: 'node', 1002: 'codex' },
+      cmdlineMap: { 1001: ['node', '/opt/codex/bin/codex'] },
+      childMap: { 1000: [1001], 1001: [1002] },
+      cwdMap: { 1001: '/workspace/project', 1002: '/workspace/project' },
+      dimsMap: { 'codex:0.0': '160 50' },
+      procFdMap: {
+        1002: [`/home/testuser/.codex/sessions/2026/07/21/rollout-2026-07-21T03-00-00-${cliSessionId}.jsonl`],
+      },
+    });
+
+    const results = discoverAdoptableSessions('codex');
+
+    expect(results).toHaveLength(1);
+    // The worker must poll the native pid so it can late-bind a rollout that
+    // is not open yet when `/adopt` first scans the pane.
+    expect(results[0]!.cliPid).toBe(1002);
+    expect(results[0]!.sessionId).toBe(cliSessionId);
+  });
+
+  it('should keep the outer native Codex pid when it launches a shell with an inner Codex', () => {
+    const outerSessionId = '019f829a-3c55-75c3-b408-bb44fd88c068';
+    const innerSessionId = '019f829a-3c55-75c3-b408-bb44fd88c069';
+    setupMocks({
+      paneLines: 'codex:0.0 1000\n',
+      commMap: { 1000: 'zsh', 1001: 'codex', 1002: 'bash', 1003: 'codex' },
+      childMap: { 1000: [1001], 1001: [1002], 1002: [1003] },
+      cwdMap: { 1001: '/workspace/outer', 1003: '/workspace/inner' },
+      dimsMap: { 'codex:0.0': '160 50' },
+      procFdMap: {
+        1001: [`/home/testuser/.codex/sessions/2026/07/21/rollout-2026-07-21T03-00-00-${outerSessionId}.jsonl`],
+        1003: [`/home/testuser/.codex/sessions/2026/07/21/rollout-2026-07-21T03-01-00-${innerSessionId}.jsonl`],
+      },
+    });
+
+    const results = discoverAdoptableSessions('codex');
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliPid).toBe(1001);
+    expect(results[0]!.sessionId).toBe(outerSessionId);
+    expect(results[0]!.cwd).toBe('/workspace/outer');
+  });
+
   it('should discover seed and relay processes by comm (Claude Code forks)', () => {
     setupMocks({
       paneLines: 'dev:0.0 1000\ndev:1.0 2000\n',
@@ -871,6 +919,19 @@ describe('validateAdoptTarget', () => {
 
     const result = validateAdoptTarget(tmuxTarget('mysession:0.0', 1002, 'aiden'));
     expect(result).toBe(true);
+  });
+
+  it('should validate the native Codex pid below an argv-matched Node launcher', () => {
+    setupMocks({
+      paneLines: 'codex:0.0 1000\n',
+      commMap: { 1000: 'zsh', 1001: 'node', 1002: 'codex' },
+      cmdlineMap: { 1001: ['node', '/opt/codex/bin/codex'] },
+      childMap: { 1000: [1001], 1001: [1002] },
+      cwdMap: {},
+      dimsMap: {},
+    });
+
+    expect(validateAdoptTarget(tmuxTarget('codex:0.0', 1002, 'codex'))).toBe(true);
   });
 
   // Regression: a Cursor agent installed under the generic name `agent` is only

@@ -15,13 +15,18 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 
 let tempDir: string;
+const daemonConfig = vi.hoisted(() => ({ backendType: 'pty' as 'pty' | 'tmux' }));
 
 vi.mock('../src/config.js', () => ({
   config: {
     session: {
       get dataDir() { return tempDir; },
     },
-    daemon: { backendType: 'pty', workingDir: '~', workingDirs: ['~'] },
+    daemon: {
+      get backendType() { return daemonConfig.backendType; },
+      workingDir: '~',
+      workingDirs: ['~'],
+    },
   },
 }));
 
@@ -80,7 +85,13 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
-    config: { larkAppId: 'app_test', cliId: 'claude-code', workingDir: '~', workingDirs: ['~'] },
+    config: {
+      larkAppId: 'app_test',
+      cliId: 'claude-code',
+      workingDir: '~',
+      workingDirs: ['~'],
+      get backendType() { return daemonConfig.backendType === 'tmux' ? 'tmux' : undefined; },
+    },
     botName: 'TestBot',
     botOpenId: 'ou_test',
     resolvedAllowedUsers: [],
@@ -107,7 +118,12 @@ vi.mock('../src/adapters/cli/registry.js', () => ({
 }));
 
 vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
-  TmuxBackend: { sessionName: vi.fn((id: string) => `bmx-${id.slice(0, 8)}`), hasSession: vi.fn(() => false) },
+  TmuxBackend: {
+    sessionName: vi.fn((id: string) => `bmx-${id.slice(0, 8)}`),
+    hasSession: vi.fn(() => false),
+    probeSession: vi.fn(() => 'missing'),
+    serverState: vi.fn(() => 'running'),
+  },
 }));
 
 vi.mock('../src/core/session-discovery.js', () => ({
@@ -123,12 +139,14 @@ vi.mock('../src/core/session-activity.js', () => ({
 
 import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
 import { restoreUsageLimitRuntimeState, closeSession, forkAdoptWorker } from '../src/core/worker-pool.js';
+import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'session-resume-test-'));
+  daemonConfig.backendType = 'pty';
   sessionStore.init();
   wp.registry = null;
   vi.mocked(closeSession).mockClear();
@@ -442,6 +460,65 @@ describe('resumeSession', () => {
         expect.objectContaining({ ownerOpenId: 'ou_adopt_owner' }),
         { restoredFromMetadata: true },
       );
+    });
+
+    it('does not zombie-close a restored external adopt session when the daemon backend is tmux', async () => {
+      daemonConfig.backendType = 'tmux';
+      const s = sessionStore.createSession('oc_adopt_tmux', 'om_adopt_tmux', 'Adopt: test-pane');
+      s.larkAppId = 'app_test';
+      s.scope = 'thread';
+      s.cliId = 'codex';
+      s.adoptedFrom = {
+        source: 'tmux',
+        tmuxTarget: 'external:0.0',
+        originalCliPid: 12345,
+        cliId: 'codex',
+        cwd: '/tmp/adopted',
+      };
+      sessionStore.updateSession(s);
+
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      await restoreActiveSessions(map);
+
+      expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
+      expect(map.get(sessionKey('om_adopt_tmux', 'app_test'))?.session.sessionId).toBe(s.sessionId);
+      expect(forkAdoptWorker).toHaveBeenCalledWith(
+        expect.objectContaining({ adoptedFrom: s.adoptedFrom }),
+        { restoredFromMetadata: true },
+      );
+      expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    });
+
+    it('restores a renamed adopt session from metadata without probing a bmx backing session', async () => {
+      daemonConfig.backendType = 'tmux';
+      const s = sessionStore.createSession('oc_adopt_renamed', 'om_adopt_renamed', 'Renamed topic');
+      s.larkAppId = 'app_test';
+      s.scope = 'thread';
+      s.cliId = 'claude-code';
+      s.adoptedFrom = {
+        source: 'tmux',
+        tmuxTarget: 'external:0.0',
+        originalCliPid: 12345,
+        cliId: 'claude-code',
+        cwd: '/tmp/adopted',
+      };
+      sessionStore.updateSession(s);
+      vi.mocked(forkAdoptWorker).mockClear();
+      vi.mocked(TmuxBackend.probeSession).mockClear();
+
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      await restoreActiveSessions(map);
+
+      expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
+      expect(map.get(sessionKey('om_adopt_renamed', 'app_test'))?.session.sessionId).toBe(s.sessionId);
+      expect(forkAdoptWorker).toHaveBeenCalledWith(
+        expect.objectContaining({ adoptedFrom: s.adoptedFrom }),
+        { restoredFromMetadata: true },
+      );
+      expect(TmuxBackend.probeSession).not.toHaveBeenCalled();
+      expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
     });
 
     it('restores the persisted clean sidecar for a long-running Codex App session', async () => {

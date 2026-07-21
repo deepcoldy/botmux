@@ -337,7 +337,7 @@ function findCliProcess(
   rootPid: number,
   maxDepth: number,
   filterCliId?: CliId,
-): { pid: number; cliId: CliId } | undefined {
+): { pid: number; cliId: CliId; matchedByComm: boolean } | undefined {
   // BFS through the process tree
   let current = [rootPid];
 
@@ -347,8 +347,9 @@ function findCliProcess(
     for (const pid of current) {
       const comm = readComm(pid);
       if (comm) {
+        const commCliId = cliIdForComm(comm, filterCliId);
         const cliId = cliIdFromCommArgv(comm, readCmdline(pid), filterCliId);
-        if (cliId) return { pid, cliId };
+        if (cliId) return { pid, cliId, matchedByComm: commCliId === cliId };
       }
       next.push(...getChildPids(pid));
     }
@@ -357,6 +358,35 @@ function findCliProcess(
   }
 
   return undefined;
+}
+
+/** Verify a specific pid is still a matching CLI within the pane process tree.
+ * Unlike findCliProcess, this does not stop at an argv-matched launcher. */
+function hasCliProcess(
+  rootPid: number,
+  expectedPid: number,
+  maxDepth: number,
+  filterCliId?: CliId,
+): boolean {
+  let frontier = [rootPid];
+  const seen = new Set<number>();
+
+  for (let depth = 0; depth <= maxDepth && frontier.length > 0; depth++) {
+    const next: number[] = [];
+    for (const pid of frontier) {
+      if (seen.has(pid)) continue;
+      seen.add(pid);
+      if (pid === expectedPid) {
+        const comm = readComm(pid);
+        return comm !== undefined
+          && cliIdFromCommArgv(comm, readCmdline(pid), filterCliId) !== undefined;
+      }
+      next.push(...getChildPids(pid));
+    }
+    frontier = next;
+  }
+
+  return false;
 }
 
 /**
@@ -692,38 +722,47 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
       // 3b. Filter by CLI type if requested
       if (filterCliId && match.cliId !== filterCliId) continue;
 
+      // npm's `codex` shim can remain as a Node launcher whose argv matches
+      // before generic discovery reaches the native child. Only follow that
+      // launcher: a process whose comm is already `codex` is the selected CLI
+      // itself and may legitimately have another Codex deeper in its tree.
+      // Other CLIs preserve legacy pid selection; their wrapper behavior is
+      // handled by explicit wrapperCli.
+      const cliPid = match.cliId === 'codex' && !match.matchedByComm
+        ? (findLaunchedCliPid(match.pid, 'codex') ?? match.pid)
+        : match.pid;
+
       // 4. Read CLI working directory (Linux: /proc; macOS: lsof)
-      const cwd = readCwd(match.pid);
+      const cwd = readCwd(cliPid);
       if (!cwd) continue;
 
       // 5. Try to read CLI session metadata
       let sessionId: string | undefined;
       let startedAt: number | undefined;
       if (match.cliId === 'claude-code') {
-        const meta = readClaudeSessionMeta(match.pid);
+        const meta = readClaudeSessionMeta(cliPid);
         if (meta) {
           sessionId = meta.sessionId;
           startedAt = meta.startedAt;
         }
       } else if (match.cliId === 'codex') {
-        // Codex has no per-pid state file — bind via the open rollout fd in
-        // /proc. Worker-side has the same probe as a fallback so this is
-        // best-effort: we resolve here so the daemon-side adopt UI shows
-        // an accurate "currently in session X" hint.
-        const rollout = findCodexRolloutByPid(match.pid);
+        // Codex has no per-pid state file — bind via the native process's open
+        // rollout fd. Missing is acceptable: the worker keeps polling cliPid
+        // and attaches when the first post-adopt turn creates/opens the file.
+        const rollout = findCodexRolloutByPid(cliPid);
         if (rollout) sessionId = rollout.cliSessionId;
       } else if (match.cliId === 'coco') {
         // CoCo: probe /proc/<pid>/fd for an open file under the session dir
         // (session.log / traces.jsonl). events.jsonl itself is opened-written-
         // closed per event so it's not reliable on its own. Worker-side
         // re-probes too, so undefined here is acceptable.
-        const cocoSession = findCocoSessionByPid(match.pid);
+        const cocoSession = findCocoSessionByPid(cliPid);
         if (cocoSession) sessionId = cocoSession.sessionId;
       } else if (match.cliId === 'traex') {
         // TRAE: same open-rollout-fd probe as Codex, with a TRAE-specific
         // path matcher (~/.trae/cli/sessions/...). Worker-side re-probes by
         // pid as a fallback, so undefined here is acceptable.
-        const rollout = findTraexRolloutByPid(match.pid);
+        const rollout = findTraexRolloutByPid(cliPid);
         if (rollout) sessionId = rollout.cliSessionId;
       }
 
@@ -731,7 +770,7 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
       // this only Claude (which has a session JSON with startedAt) shows a real
       // uptime; every other CLI — cursor/codex/coco/gemini… — rendered "未知".
       if (startedAt === undefined) {
-        startedAt = readProcessStartTime(match.pid);
+        startedAt = readProcessStartTime(cliPid);
       }
 
       // 6. Get pane dimensions
@@ -742,7 +781,7 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
         source: 'tmux',
         tmuxTarget,
         panePid,
-        cliPid: match.pid,
+        cliPid,
         cliId: match.cliId,
         sessionId,
         cwd,
@@ -780,9 +819,10 @@ export function validateTmuxAdoptTarget(tmuxTarget: string, expectedPid: number,
     return false;
   }
 
-  // Search the process tree for the expected CLI PID
-  const match = findCliProcess(panePid, 3, filterCliId);
-  return match !== undefined && match.pid === expectedPid;
+  // Search for the expected PID itself. A Codex Node launcher can match by
+  // argv before the native Codex child, so validating only the first generic
+  // match would reject the native pid returned by discovery.
+  return hasCliProcess(panePid, expectedPid, 6, filterCliId);
 }
 
 
