@@ -138,10 +138,11 @@ vi.mock('../src/bot-registry.js', () => ({
 
 vi.mock('../src/services/session-store.js', () => ({
   closeSession: vi.fn(),
-  createSession: vi.fn((_chatId: string, _rootId: string, title: string, chatType: string) => ({
+  createSession: vi.fn((_chatId: string, _rootId: string, title: string, chatType: string, scope?: 'thread' | 'chat') => ({
     sessionId: 'new-session-123',
     chatId: _chatId,
     rootMessageId: _rootId,
+    scope,
     title,
     status: 'active' as const,
     createdAt: new Date().toISOString(),
@@ -1863,11 +1864,43 @@ describe('handleCommand', () => {
       expect(killWorker).toHaveBeenCalledWith(ds);
       expect(sessionStore.closeSession).toHaveBeenCalled();
       expect(sessionStore.createSession).toHaveBeenCalledWith(
-        CHAT_ID, ROOT_ID, 'project-b (dev)', 'group',
+        CHAT_ID, ROOT_ID, 'project-b (dev)', 'group', undefined,
       );
       expect(ds.session.sessionId).toBe('new-session-123');
       expect(ds.hasHistory).toBe(false);
       expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    });
+
+    it('mid-session chat switch preserves scope and the original message root', async () => {
+      const originalRoot = 'om_original_chat_start';
+      const ds = makeDaemonSession({
+        pendingRepo: false,
+        scope: 'chat',
+        session: makeSession({ scope: 'chat', rootMessageId: originalRoot }),
+      });
+      const deps = makeDeps(ds);
+      deps.activeSessions.clear();
+      deps.activeSessions.set(sessionKey(CHAT_ID, LARK_APP_ID), ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
+      ]);
+
+      // A chat-scope command is routed with the oc_ chat anchor, not the
+      // traceable om_ message root stored on Session.
+      await handleCommand('/repo', CHAT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(sessionStore.createSession).toHaveBeenCalledWith(
+        CHAT_ID, originalRoot, 'project-a (main)', 'group', 'chat',
+      );
+      expect(ds.session.scope).toBe('chat');
+      expect(ds.session.rootMessageId).toBe(originalRoot);
+      const persisted = vi.mocked(sessionStore.updateSession).mock.calls.find(
+        ([s]) => s.sessionId === 'new-session-123',
+      )?.[0];
+      expect(persisted).toEqual(expect.objectContaining({
+        scope: 'chat',
+        rootMessageId: originalRoot,
+      }));
     });
 
     it('mid-session switch should persist workingDir + larkAppId on the new session', async () => {
@@ -1945,7 +1978,7 @@ describe('handleCommand', () => {
 
       expect(ds.workingDir).toBe('/home/testuser/payments');
       expect(sessionStore.createSession).toHaveBeenCalledWith(
-        CHAT_ID, ROOT_ID, 'payments (main)', 'group',
+        CHAT_ID, ROOT_ID, 'payments (main)', 'group', undefined,
       );
       expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
       // the pending repo-selection card must be withdrawn after resolving

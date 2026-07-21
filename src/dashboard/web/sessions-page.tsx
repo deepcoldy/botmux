@@ -6,7 +6,9 @@ import {
   useRef,
   useState,
   type DragEvent,
+  type ClipboardEvent as ReactClipboardEvent,
   type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent,
   type CSSProperties,
   type ReactNode,
@@ -69,6 +71,14 @@ import {
 } from './sessions.js';
 import { addMonitorRoomSessionIds, monitorRoomUrl } from './monitor-room-store.js';
 import { CreateActionButton, DropdownMenu, LoadingState } from './dashboard-components.js';
+import {
+  filterMentionBots,
+  findMentionTrigger,
+  insertBotMention,
+  insertImageMarkers,
+  removeAndReindexImageMarkers,
+  type MentionTrigger,
+} from './create-session-composer.js';
 import { store } from './store.js';
 import {
   attentionWaitSince,
@@ -134,6 +144,31 @@ type CreateSessionState = {
   loading?: boolean;
   success?: any;
 };
+
+type CreateSessionImage = {
+  id: string;
+  ordinal: number;
+  marker: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  dataBase64: string;
+  previewUrl: string;
+};
+
+const CREATE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const CREATE_IMAGE_MAX_COUNT = 8;
+const CREATE_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+const CREATE_IMAGE_MAX_TOTAL_BYTES = 25 * 1024 * 1024;
+
+function imageFileDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('bad_image_data'));
+    reader.onerror = () => reject(reader.error ?? new Error('image_read_failed'));
+    reader.readAsDataURL(file);
+  });
+}
 
 type IdleCleanupBarProps = {
   busy: boolean;
@@ -1651,6 +1686,7 @@ function CreateSessionDialog(props: {
   }, [props]);
 
   const [content, setContent] = useState('');
+  const [images, setImages] = useState<CreateSessionImage[]>([]);
   const [selectedBots, setSelectedBots] = useState<Set<string>>(new Set());
   const [mode, setMode] = useState<'lead' | 'all'>('lead');
   const [lead, setLead] = useState('');
@@ -1662,10 +1698,15 @@ function CreateSessionDialog(props: {
   const [botQuery, setBotQuery] = useState('');
   const [keepOpen, setKeepOpen] = useState(() => readStoredCreateKeepOpen(windowStorage()));
   const [keptSuccess, setKeptSuccess] = useState<any>(null);
+  const [mentionTrigger, setMentionTrigger] = useState<MentionTrigger | null>(null);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const contentRef = useRef<HTMLTextAreaElement>(null);
+  const nextImageOrdinalRef = useRef(1);
 
   useEffect(() => {
     if (!state) return;
     setContent('');
+    setImages([]);
     setSelectedBots(new Set());
     setMode('lead');
     setLead('');
@@ -1676,6 +1717,9 @@ function CreateSessionDialog(props: {
     setSubmitting(false);
     setBotQuery('');
     setKeptSuccess(null);
+    setMentionTrigger(null);
+    setMentionIndex(0);
+    nextImageOrdinalRef.current = 1;
   }, [state]);
 
   if (!state) return null;
@@ -1719,6 +1763,103 @@ function CreateSessionDialog(props: {
     ? bots.filter(bot =>
       bot.botName.toLowerCase().includes(botQueryNorm) || bot.larkAppId.toLowerCase().includes(botQueryNorm))
     : bots;
+  const mentionBots = mentionTrigger
+    ? filterMentionBots(bots, mentionTrigger.query).slice(0, 8)
+    : [];
+
+  const chooseMentionBot = (bot: PickerBot): void => {
+    if (!mentionTrigger) return;
+    const inserted = insertBotMention(content, mentionTrigger, bot.botName);
+    setContent(inserted.text);
+    setMentionTrigger(null);
+    setMentionIndex(0);
+    setSelectedBots(prev => new Set(prev).add(bot.larkAppId));
+    setLead(prev => prev || bot.larkAppId);
+    requestAnimationFrame(() => {
+      const textarea = contentRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      textarea.setSelectionRange(inserted.caret, inserted.caret);
+    });
+  };
+
+  const handleContentKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>): void => {
+    if (!mentionTrigger || mentionBots.length === 0) return;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      const delta = event.key === 'ArrowDown' ? 1 : -1;
+      setMentionIndex(index => (index + delta + mentionBots.length) % mentionBots.length);
+      return;
+    }
+    if (event.key === 'Enter' || event.key === 'Tab') {
+      event.preventDefault();
+      chooseMentionBot(mentionBots[Math.min(mentionIndex, mentionBots.length - 1)]!);
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      setMentionTrigger(null);
+    }
+  };
+
+  const handleContentPaste = async (event: ReactClipboardEvent<HTMLTextAreaElement>): Promise<void> => {
+    const pasted = [...event.clipboardData.files].filter(file => file.type.startsWith('image/'));
+    if (pasted.length === 0) return;
+    event.preventDefault();
+    const pasteStart = event.currentTarget.selectionStart ?? content.length;
+    const pasteEnd = event.currentTarget.selectionEnd ?? pasteStart;
+    const supported = pasted.filter(file => CREATE_IMAGE_TYPES.has(file.type.toLowerCase()));
+    if (supported.length !== pasted.length) {
+      alert(t('sessions.create.imageUnsupported'));
+      return;
+    }
+    if (images.length + supported.length > CREATE_IMAGE_MAX_COUNT) {
+      alert(t('sessions.create.imageCountLimit', { n: String(CREATE_IMAGE_MAX_COUNT) }));
+      return;
+    }
+    if (supported.some(file => file.size > CREATE_IMAGE_MAX_BYTES)) {
+      alert(t('sessions.create.imageSizeLimit'));
+      return;
+    }
+    const nextTotal = images.reduce((sum, image) => sum + image.size, 0)
+      + supported.reduce((sum, file) => sum + file.size, 0);
+    if (nextTotal > CREATE_IMAGE_MAX_TOTAL_BYTES) {
+      alert(t('sessions.create.imageTotalLimit'));
+      return;
+    }
+    try {
+      const firstOrdinal = nextImageOrdinalRef.current;
+      const added = await Promise.all(supported.map(async (file, index): Promise<CreateSessionImage> => {
+        const previewUrl = await imageFileDataUrl(file);
+        const comma = previewUrl.indexOf(',');
+        if (comma < 0) throw new Error('bad_image_data');
+        const ordinal = firstOrdinal + index;
+        return {
+          id: `${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`,
+          ordinal,
+          marker: `[${t('sessions.create.imageMarker', { n: String(ordinal) })}]`,
+          name: file.name || `pasted-image-${images.length + index + 1}`,
+          mimeType: file.type.toLowerCase(),
+          size: file.size,
+          dataBase64: previewUrl.slice(comma + 1),
+          previewUrl,
+        };
+      }));
+      nextImageOrdinalRef.current += added.length;
+      const inserted = insertImageMarkers(content, pasteStart, pasteEnd, added.map(image => image.marker));
+      setContent(inserted.text);
+      setImages(prev => [...prev, ...added]);
+      setMentionTrigger(null);
+      requestAnimationFrame(() => {
+        const textarea = contentRef.current;
+        if (!textarea) return;
+        textarea.focus();
+        textarea.setSelectionRange(inserted.caret, inserted.caret);
+      });
+    } catch {
+      alert(t('sessions.create.imageReadFailed'));
+    }
+  };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const text = content.trim();
@@ -1740,6 +1881,11 @@ function CreateSessionDialog(props: {
           leadLarkAppId: mode === 'lead' ? leadLarkAppId : undefined,
           name: name.trim() || undefined,
           bindWorkingDir: bindWorkingDir.trim() || undefined,
+          images: images.map(image => ({
+            name: image.name,
+            mimeType: image.mimeType,
+            dataBase64: image.dataBase64,
+          })),
         }),
       });
       const body = await r.json().catch(() => null);
@@ -1748,6 +1894,8 @@ function CreateSessionDialog(props: {
           // 连续创建：不切成功页、不关弹窗，保留机器人勾选等配置，清空内容/群名继续下一条
           setKeptSuccess(body);
           setContent('');
+          setImages([]);
+          nextImageOrdinalRef.current = 1;
           setName('');
         } else {
           props.onSuccess(body);
@@ -1766,7 +1914,86 @@ function CreateSessionDialog(props: {
       <form id="cs-form" onSubmit={submit}>
         <fieldset className="cs-content">
           <legend>{t('sessions.create.content')}</legend>
-          <textarea name="content" rows={5} placeholder={t('sessions.create.contentPlaceholder')} required value={content} onChange={event => setContent(event.currentTarget.value)} />
+          <div className="cs-composer">
+            <textarea
+              ref={contentRef}
+              name="content"
+              rows={5}
+              placeholder={t('sessions.create.contentPlaceholder')}
+              aria-describedby="cs-content-help"
+              required
+              value={content}
+              onChange={event => {
+                const textarea = event.currentTarget;
+                const next = textarea.value;
+                setContent(next);
+                setMentionTrigger(findMentionTrigger(next, textarea.selectionStart ?? next.length));
+                setMentionIndex(0);
+              }}
+              onClick={event => setMentionTrigger(findMentionTrigger(content, event.currentTarget.selectionStart ?? content.length))}
+              onKeyDown={handleContentKeyDown}
+              onPaste={event => { void handleContentPaste(event); }}
+              onBlur={() => setTimeout(() => setMentionTrigger(null), 0)}
+            />
+            {mentionTrigger ? (
+              <div className="cs-mention-menu" role="listbox" aria-label={t('sessions.create.mentionBots')}>
+                {mentionBots.length ? mentionBots.map((bot, index) => (
+                  <button
+                    key={bot.larkAppId}
+                    type="button"
+                    role="option"
+                    aria-selected={index === mentionIndex}
+                    className={index === mentionIndex ? 'active' : undefined}
+                    onMouseDown={event => event.preventDefault()}
+                    onClick={() => chooseMentionBot(bot)}
+                  >
+                    <strong>@{bot.botName}</strong>
+                    <small>{bot.larkAppId}</small>
+                  </button>
+                )) : <p>{t('sessions.create.noBotMatch')}</p>}
+              </div>
+            ) : null}
+          </div>
+          <small id="cs-content-help">{t('sessions.create.contentHelp')}</small>
+          {images.length ? (
+            <div className="cs-image-list" aria-label={t('sessions.create.pastedImages')}>
+              {images.map(image => (
+                <figure key={image.id} className="cs-image-item">
+                  <img src={image.previewUrl} alt={image.name} />
+                  <figcaption title={`${image.marker} ${image.name}`}>
+                    <strong>{image.marker}</strong>
+                    <span>{image.name}</span>
+                  </figcaption>
+                  <button
+                    type="button"
+                    className="cs-image-remove"
+                    aria-label={t('sessions.create.removeImage', { name: `${image.marker} ${image.name}` })}
+                    title={t('sessions.create.removeImage', { name: `${image.marker} ${image.name}` })}
+                    onClick={() => {
+                      const remaining = images.filter(item => item.id !== image.id);
+                      const reconciled = removeAndReindexImageMarkers(
+                        content,
+                        image.marker,
+                        remaining.map(item => item.marker),
+                        index => `[${t('sessions.create.imageMarker', { n: String(index + 1) })}]`,
+                      );
+                      setContent(reconciled.text);
+                      setImages(remaining.map((item, index) => ({
+                        ...item,
+                        ordinal: index + 1,
+                        marker: reconciled.markers[index]!,
+                      })));
+                      nextImageOrdinalRef.current = remaining.length + 1;
+                    }}
+                  >
+                    <svg aria-hidden="true" viewBox="0 0 24 24">
+                      <path d="M7 7l10 10M17 7 7 17" />
+                    </svg>
+                  </button>
+                </figure>
+              ))}
+            </div>
+          ) : null}
         </fieldset>
         <fieldset className="cs-bots">
           <legend>{t('sessions.create.bots')}</legend>

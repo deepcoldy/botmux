@@ -63,6 +63,20 @@ function renderKanban(state: Partial<SessionsKanbanState>): string {
 }
 
 describe('dashboard sessions filters', () => {
+  it('wires @ completion and pasted-image previews into the create-session composer', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+
+    expect(page).toContain('findMentionTrigger');
+    expect(page).toContain('onPaste={event => { void handleContentPaste(event); }}');
+    expect(page).toContain('event.preventDefault();');
+    expect(page).toContain('images: images.map(image => ({');
+    expect(page).toContain('className="cs-image-list"');
+    expect(page).toContain('insertImageMarkers(content, pasteStart, pasteEnd');
+    expect(page).toContain('className="cs-image-remove"');
+    expect(page).toContain('removeAndReindexImageMarkers(');
+    expect(page).toContain('nextImageOrdinalRef.current = remaining.length + 1;');
+  });
+
   it('reads filter input values before entering React state updaters', () => {
     const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
 

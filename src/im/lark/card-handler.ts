@@ -15,7 +15,7 @@ import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
-import { checkNonce, clearPending, markDenied, getPendingQuota } from './grant-pending.js';
+import { checkNonce, clearPending, markDenied, getPendingQuota, getPendingMessage } from './grant-pending.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
 import {
   handleV3GateAction,
@@ -104,6 +104,8 @@ export interface CardHandlerDeps {
   /** VC meeting invite/consumer card actions. Implemented in daemon to
    *  keep meeting sessions, tombstones, and listener-group state single-owned. */
   vcMeetingCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
+  /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。 */
+  replayGrantedMessage?: (data: any, larkAppId: string) => void;
 }
 
 /**
@@ -585,7 +587,17 @@ export async function commitRepoSelection(
     );
 
     const oldSession = ds.session;
-    const session = sessionStore.createSession(ds.chatId, rootId, dirLabel, ds.chatType);
+    // `rootId` is the routing anchor. For chat-scope sessions it is the
+    // `oc_...` chat id, not the traceable `om_...` message root stored on
+    // Session. Preserve the old identity and explicitly persist scope so card
+    // switches cannot recreate the session as a legacy scope-less thread.
+    const session = sessionStore.createSession(
+      ds.chatId,
+      ds.scope === 'chat' ? oldSession.rootMessageId : rootId,
+      dirLabel,
+      ds.chatType,
+      ds.scope,
+    );
     ds.session = session;
     ds.lastUserPrompt = undefined;
     ds.lastCliInput = undefined;
@@ -784,6 +796,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     targets.forEach((tt, i) => idToName.set(tt, names[i] ?? ''));
     // 额度挂在 pending 上（/grant @x N 解析所得；多目标共用同一额度）；clearPending 前先读出来。
     const quota = getPendingQuota(larkAppId, grantChatId, targets[0]);
+    // 触发本次授权申请的原始消息事件：授权成功后重放，用户无需再 @ 一遍。
+    // 自助申请卡每次只对应一个 target，取第一个即可。
+    const pendingMessage = getPendingMessage(larkAppId, grantChatId, targets[0]);
     const granted: string[] = [];
     const failed: Array<{ openId: string; reason: string }> = [];
     for (const tt of targets) {
@@ -865,6 +880,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           }
         })
         .catch(err => logger.error(`grant post-callback background tasks failed: ${err}`));
+    }
+    // 授权成功后重放触发本次申请的原始消息，用户无需再 @ 一遍。
+    // replayGrantedMessage 内部异步执行（setImmediate），不阻塞 callback 响应。
+    if (pendingMessage && deps.replayGrantedMessage) {
+      try {
+        deps.replayGrantedMessage(pendingMessage, larkAppId);
+      } catch (err) {
+        logger.warn(`replay granted message failed (grant still applied): ${err}`);
+      }
     }
     return resultCardBody;
   }

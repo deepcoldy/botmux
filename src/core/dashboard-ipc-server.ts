@@ -70,6 +70,7 @@ import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listT
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
+import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { buildTerminalUrl } from './terminal-url.js';
@@ -626,6 +627,13 @@ ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
   const parsed = parseSpawnRequest(body);
   if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error });
   const postBanner = !!(body as any).postBanner;
+  let attachments;
+  try {
+    attachments = materializeDashboardImages(cachedLarkAppId, parsed.value.images);
+  } catch (err: any) {
+    logger.error(`[createSession] failed to persist Dashboard images: ${err?.message ?? err}`);
+    return jsonRes(res, 500, { ok: false, error: 'image_store_failed' });
+  }
   const r = await spawnDashboardSession(activeSessions, undefined, {
     larkAppId: cachedLarkAppId,
     chatId: parsed.value.chatId,
@@ -633,12 +641,16 @@ ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
     column: parsed.value.column,
     role: parsed.value.role,
     coworkers: parsed.value.coworkers,
+    attachments,
     title: parsed.value.title,
     postBanner,
     ownerOpenId: parsed.value.ownerOpenId,
     ownerUnionId: parsed.value.ownerUnionId,
   });
-  if (!r.ok) return jsonRes(res, r.error === 'session_exists' ? 409 : 500, r);
+  if (!r.ok) {
+    cleanupMaterializedDashboardImages(cachedLarkAppId, attachments);
+    return jsonRes(res, r.error === 'session_exists' ? 409 : 500, r);
+  }
   jsonRes(res, 200, r);
 });
 

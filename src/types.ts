@@ -151,6 +151,12 @@ export interface Session {
    * 一并清空。 */
   queuedCodexAppText?: string;
   queuedCodexAppMessageContext?: string;
+  /** Dashboard 粘贴图片对应的本地附件。只在 queued 会话激活前持久化；路径位于
+   * 当前 bot 自己的 attachments/<appId>/ bucket，可被 read-isolation 安全放行。 */
+  queuedAttachments?: LarkAttachment[];
+  /** Dashboard-created image files retained while the session is active so
+   * the CLI can read them, then removed by session-store on close. */
+  dashboardAttachments?: LarkAttachment[];
   createdAt: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;

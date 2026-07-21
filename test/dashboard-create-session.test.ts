@@ -34,8 +34,10 @@ vi.mock('../src/services/session-store.js', () => ({
 vi.mock('../src/services/message-queue.js', () => ({ ensureQueue: vi.fn() }));
 
 const sendMessageMock = vi.fn(async () => 'om_banner_123');
+const uploadImageMock = vi.fn(async () => 'img_dashboard_123');
 vi.mock('../src/im/lark/client.js', () => ({
   sendMessage: (...a: any[]) => sendMessageMock(...a),
+  uploadImage: (...a: any[]) => uploadImageMock(...a),
   downloadMessageResource: vi.fn(),
   listChatBotMembers: vi.fn(async () => []),
   getChatMode: vi.fn(),
@@ -111,6 +113,7 @@ beforeEach(() => {
   sessionSeq = 0;
   forkWorkerMock.mockClear();
   sendMessageMock.mockClear();
+  uploadImageMock.mockClear();
   (dashboardEventBus.publish as any).mockClear();
   vi.mocked(getBot).mockReturnValue({
     config: { cliId: 'claude-code', cliPathOverride: undefined, defaultWorkingDir: '/tmp' },
@@ -154,6 +157,18 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(bannerText).toContain('第二步收尾'); // tail must survive — was dropped by the 300-char slice
   });
 
+  it('posts pasted images after the visible task banner without changing spawn routing', async () => {
+    const active = new Map<string, DaemonSession>();
+    await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: '看图修复', column: 'in_progress', role: 'solo', postBanner: true,
+      attachments: [{ type: 'image', path: '/tmp/dashboard-shot.png', name: 'dashboard-shot.png' }],
+    });
+    expect(uploadImageMock).toHaveBeenCalledWith(APP, '/tmp/dashboard-shot.png');
+    expect(sendMessageMock).toHaveBeenCalledTimes(2);
+    expect(sendMessageMock.mock.calls[1]).toEqual([APP, CHAT, JSON.stringify({ image_key: 'img_dashboard_123' }), 'image']);
+    expect(forkWorkerMock.mock.calls[0][1].content).toContain('/tmp/dashboard-shot.png');
+  });
+
   it('lead-role backlog stores the orchestration preamble in queuedPrompt (preserved through activation)', async () => {
     const active = new Map<string, DaemonSession>();
     await spawnDashboardSession(active, undefined, {
@@ -164,6 +179,25 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(ds.session.queuedPrompt).toContain('<botmux_lead_dispatch>');
     expect(ds.session.queuedPrompt).toContain('Coder');
     expect(ds.session.queuedPrompt).toContain('拆活给大家');
+  });
+
+  it('persists pasted images across restore and injects them when the backlog starts', async () => {
+    const attachment = { type: 'image' as const, path: '/tmp/dashboard-shot.png', name: 'dashboard-shot.png' };
+    const beforeRestart = new Map<string, DaemonSession>();
+    await spawnDashboardSession(beforeRestart, undefined, {
+      larkAppId: APP, chatId: CHAT, content: '按截图修复', column: 'backlog', role: 'solo', attachments: [attachment],
+    });
+    expect(beforeRestart.get(sessionKey(CHAT, APP))!.session.queuedAttachments).toEqual([attachment]);
+    expect(beforeRestart.get(sessionKey(CHAT, APP))!.session.dashboardAttachments).toEqual([attachment]);
+
+    const afterRestart = new Map<string, DaemonSession>();
+    await restoreActiveSessions(afterRestart);
+    const restored = afterRestart.get(sessionKey(CHAT, APP))!;
+    expect(restored.pendingAttachments).toEqual([attachment]);
+    forkWorkerMock.mockClear();
+    expect(await activateQueuedSession(restored)).toMatchObject({ ok: true });
+    expect(forkWorkerMock.mock.calls[0][1].content).toContain('/tmp/dashboard-shot.png');
+    expect(restored.session.queuedAttachments).toBeUndefined();
   });
 
   it('persists and restores the clean Codex App sidecar across daemon restart before activation', async () => {

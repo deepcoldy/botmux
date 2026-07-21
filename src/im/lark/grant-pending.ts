@@ -14,7 +14,7 @@ const STALE_PENDING_MS = 24 * 60 * 60 * 1000;
  *  最多每分钟跑一次，避免在热路径上对全表做 O(n) 扫描。 */
 const PRUNE_INTERVAL_MS = 60 * 1000;
 
-type Entry = { state: 'pending' | 'denied'; nonce?: string; ts: number; quota?: number };
+type Entry = { state: 'pending' | 'denied'; nonce?: string; ts: number; quota?: number; messageData?: any };
 const table = new Map<string, Entry>();
 let lastPrunedAt = 0;
 
@@ -34,19 +34,21 @@ function pruneStale(now: number): void {
   }
 }
 
-/** 开一张待处置的卡，返回 nonce。`quota` 为可选的消息额度（已解析），落授权时透传给 grant-store。 */
-export function openPending(larkAppId: string, chatId: string, target: string, quota?: number): string {
-  return openPendingMulti(larkAppId, chatId, [target], quota);
+/** 开一张待处置的卡，返回 nonce。`quota` 为可选的消息额度（已解析），落授权时透传给 grant-store。
+ *  `messageData` 为触发本次授权申请的原始飞书消息事件，授权成功后可重放，让用户无需再 @ 一遍。 */
+export function openPending(larkAppId: string, chatId: string, target: string, quota?: number, messageData?: any): string {
+  return openPendingMulti(larkAppId, chatId, [target], quota, messageData);
 }
 
 /** owner 一次 /grant 多个目标：同一张卡 → 多个 target 共用同一 nonce，
  *  owner 点一次范围即对全部目标生效。校验时每个 target 独立 checkNonce。
- *  `quota`（若有）对每个 target 各自生效（每人 N 条额度）。 */
-export function openPendingMulti(larkAppId: string, chatId: string, targets: string[], quota?: number): string {
+ *  `quota`（若有）对每个 target 各自生效（每人 N 条额度）。
+ *  `messageData` 为触发本次授权申请的原始飞书消息事件，授权成功后可重放。 */
+export function openPendingMulti(larkAppId: string, chatId: string, targets: string[], quota?: number, messageData?: any): string {
   const nonce = randomUUID();
   const ts = Date.now();
   pruneStale(ts);
-  for (const target of targets) table.set(key(larkAppId, chatId, target), { state: 'pending', nonce, ts, quota });
+  for (const target of targets) table.set(key(larkAppId, chatId, target), { state: 'pending', nonce, ts, quota, messageData });
   return nonce;
 }
 
@@ -54,6 +56,12 @@ export function openPendingMulti(larkAppId: string, chatId: string, targets: str
 export function getPendingQuota(larkAppId: string, chatId: string, target: string): number | undefined {
   const e = table.get(key(larkAppId, chatId, target));
   return e && e.state === 'pending' ? e.quota : undefined;
+}
+
+/** 回读 pending 上挂的原始消息事件（授权成功后重放，让用户无需再 @ 一遍）。无 / 非 pending → undefined。 */
+export function getPendingMessage(larkAppId: string, chatId: string, target: string): any {
+  const e = table.get(key(larkAppId, chatId, target));
+  return e && e.state === 'pending' ? e.messageData : undefined;
 }
 
 /** 卡片处置前校验：必须仍 pending 且 nonce 匹配。 */

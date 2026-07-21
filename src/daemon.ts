@@ -240,7 +240,7 @@ let selfV3BootInstanceId: string | undefined;
  *  VC listener switch, every agent daemon may receive a fenced membership. */
 let selfDaemonLarkAppId: string | undefined;
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
@@ -3529,6 +3529,10 @@ const v3GateRunner = createV3GateRunner({
   },
 });
 
+// 每个 bot 的 EventHandlers，授权成功后重放消息时需要。
+// key = larkAppId，在 startLarkEventDispatcher 调用时写入。
+const botHandlers = new Map<string, EventHandlers>();
+
 const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
@@ -3571,6 +3575,16 @@ const cardDeps: CardHandlerDeps = {
       `[v3-distillation:${proposalId}] card action failed: ` +
       stableV3DistillationErrorCode(err),
     ),
+  },
+  // 授权成功后重放触发本次申请的原始消息，用户无需再 @ 一遍。
+  // replayMessageEvent 由 startLarkEventDispatcher 内部注入到 handlers 上。
+  replayGrantedMessage: (data, larkAppId) => {
+    const handlers = botHandlers.get(larkAppId);
+    if (!handlers?.replayMessageEvent) {
+      logger.warn(`replayGrantedMessage: no handlers/replayMessageEvent for ${larkAppId}`);
+      return;
+    }
+    handlers.replayMessageEvent(data);
   },
 };
 
@@ -16650,7 +16664,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
 
     // Start event dispatcher for this bot
-    startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, {
+    const botEventHandlers: EventHandlers = {
       handleCardAction: (data, appId) => handleCardAction(data, cardDeps, appId),
       handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
       handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
@@ -16673,7 +16687,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const evicted = activeSessions.delete(key);
         logger.info(`[chat-mode-converted] ${chatId.substring(0, 12)} evicted=${evicted}; worker (if any) keeps running until /close`);
       },
-    }, normalizeBrand(cfg.brand));
+    };
+    // 存起来供授权成功后重放消息用（replayGrantedMessage → replayMessageEvent）。
+    botHandlers.set(cfg.larkAppId, botEventHandlers);
+    startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, botEventHandlers, normalizeBrand(cfg.brand));
 
     // A distillation command is durably prepared before its model run/card
     // delivery. Resume active prepared/proposed allocations after a daemon
