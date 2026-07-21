@@ -3,6 +3,8 @@ import {
   normalizeCreateMode,
   normalizeCreateColumn,
   deriveSessionTitleFromContent,
+  deriveCreateGroupName,
+  selectCreateSessionTargets,
   parseSpawnRequest,
   composeSpawnCodexAppContext,
   composeSpawnUserContent,
@@ -37,6 +39,28 @@ describe('deriveSessionTitleFromContent', () => {
   });
   it('falls back to a placeholder for blank content', () => {
     expect(deriveSessionTitleFromContent('   \n  ')).toBeTruthy();
+  });
+});
+
+describe('deriveCreateGroupName', () => {
+  it('uses the explicit trimmed name when present', () => {
+    expect(deriveCreateGroupName('  自定义群名  ', '内容首行')).toBe('自定义群名');
+  });
+  it('falls back to the first non-empty content line when blank', () => {
+    expect(deriveCreateGroupName('   ', '\n  修复创建会话  \n详情')).toBe('修复创建会话');
+  });
+});
+
+describe('selectCreateSessionTargets', () => {
+  const joined = ['lead', 'sub-a', 'sub-b'];
+  it('Lead mode starts only the Lead even when task content may mention subs', () => {
+    expect(selectCreateSessionTargets('lead', joined, 'lead')).toEqual(['lead']);
+  });
+  it('all mode starts every joined bot', () => {
+    expect(selectCreateSessionTargets('all', joined, 'lead')).toEqual(joined);
+  });
+  it('does not start a Lead that failed to join', () => {
+    expect(selectCreateSessionTargets('lead', ['sub-a'], 'lead')).toEqual([]);
   });
 });
 

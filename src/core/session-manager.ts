@@ -15,7 +15,6 @@ import { logger } from '../utils/logger.js';
 import { forkWorker, sendWorkerInput, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
-import { assertSafeAppId } from '../adapters/cli/read-isolation.js';
 import {
   resolveSkillInjectionModeForApp,
   builtinSkillEntries,
@@ -55,6 +54,9 @@ import { resolveRoleInjection } from './role-resolver.js';
 import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../services/whiteboard-store.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
+import { getAttachmentsDir } from './attachment-path.js';
+
+export { getAttachmentsDir } from './attachment-path.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -233,16 +235,6 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
 }
 
 // ─── Attachment download ─────────────────────────────────────────────────────
-
-export function getAttachmentsDir(larkAppId: string, messageId: string): string {
-  // Per-appId bucket (attachments/<appId>/<messageId>/): the read-isolation Seatbelt
-  // profile is static at CLI spawn time, so an isolated bot's own uploads can only be
-  // re-allowed by a spawn-time-known key — its appId (see buildV2CarveOuts). The
-  // attachments/ root stays wholesale-denied, covering every sibling's bucket AND the
-  // legacy per-messageId layout. assertSafeAppId keeps the segment traversal-safe —
-  // the same guarantee the carve-out path construction relies on.
-  return join(resolve(config.session.dataDir), 'attachments', assertSafeAppId(larkAppId), messageId);
-}
 
 export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[]): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
   if (resources.length === 0) return { attachments: [], needLogin: false };
@@ -1301,6 +1293,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         pendingPrompt: session.queuedPrompt,
         pendingCodexAppText: session.queuedCodexAppText,
         pendingCodexAppMessageContext: session.queuedCodexAppMessageContext,
+        pendingAttachments: session.queuedAttachments,
         currentTurnTitle: session.currentTurnTitle ?? session.title,
       };
       const anchor = sessionAnchorId(ds);
@@ -2008,7 +2001,7 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
 
   const buildPrompt = () => buildNewTopicCliInput(
     userContent, ds.session.sessionId, bot.config.cliId, bot.config.cliPathOverride,
-    undefined, undefined, undefined, undefined,
+    ds.pendingAttachments, undefined, undefined, undefined,
     { name: bot.botName, openId: bot.botOpenId }, locale, undefined,
     {
       larkAppId,
@@ -2054,6 +2047,7 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
   ds.pendingCodexAppText = undefined;
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
+  ds.pendingAttachments = undefined;
 }
 
 export interface SpawnDashboardSessionArgs {
@@ -2068,6 +2062,9 @@ export interface SpawnDashboardSessionArgs {
   role: SpawnRole;
   /** 群里其它可协作的 bot（lead 用来列 sub bot、collab 用来提示同伴）。 */
   coworkers?: Coworker[];
+  /** Images pasted into the Dashboard content box, already validated and
+   * materialized inside this daemon's per-app attachment bucket. */
+  attachments?: LarkAttachment[];
   /** 会话标题，缺省取内容首行。 */
   title?: string;
   /** 是否在群里发一条可见的任务横幅（只由 creator/lead 那一次 spawn 发，避免 N 个 bot 重复刷屏）。 */
@@ -2109,8 +2106,17 @@ export async function spawnDashboardSession(
   let bannerMessageId: string | undefined;
   if (args.postBanner) {
     try {
-      const { sendMessage } = await import('../im/lark/client.js');
+      const { sendMessage, uploadImage } = await import('../im/lark/client.js');
       bannerMessageId = await sendMessage(larkAppId, chatId, t('cmd.createSession.banner', { content }, locale));
+      for (const attachment of args.attachments ?? []) {
+        if (attachment.type !== 'image') continue;
+        try {
+          const imageKey = await uploadImage(larkAppId, attachment.path);
+          await sendMessage(larkAppId, chatId, JSON.stringify({ image_key: imageKey }), 'image');
+        } catch (err: any) {
+          logger.warn(`[createSession] pasted image post failed in ${chatId}: ${err?.message ?? err}`);
+        }
+      }
     } catch (err: any) {
       logger.warn(`[createSession] banner send failed in ${chatId}: ${err?.message ?? err}`);
     }
@@ -2132,11 +2138,13 @@ export async function spawnDashboardSession(
   session.creatorOpenId = session.ownerOpenId;
   if (args.ownerUnionId) session.ownerUnionId = args.ownerUnionId;
   session.lastMessageAt = new Date(now).toISOString();
+  if (args.attachments?.length) session.dashboardAttachments = args.attachments;
   if (column === 'backlog') {
     session.queued = true;
     session.queuedPrompt = userContent;
     session.queuedCodexAppText = content;
     session.queuedCodexAppMessageContext = codexAppMessageContext;
+    session.queuedAttachments = args.attachments;
     session.kanbanColumn = 'backlog';
   }
 
@@ -2165,6 +2173,7 @@ export async function spawnDashboardSession(
     currentTurnTitle: resolvedTitle,
     pendingCodexAppText: content,
     pendingCodexAppMessageContext: codexAppMessageContext,
+    pendingAttachments: args.attachments,
   };
   activeSessions.set(sessionKey(anchor, larkAppId), ds);
 
@@ -2196,6 +2205,7 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     ds.session.queuedPrompt = undefined;
     ds.session.queuedCodexAppText = undefined;
     ds.session.queuedCodexAppMessageContext = undefined;
+    ds.session.queuedAttachments = undefined;
     sessionStore.updateSession(ds.session);
     return { ok: true };
   }
@@ -2205,10 +2215,12 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
   // forkOrShowRepoCard will carry it through either immediate fork or /repo.
   ds.pendingCodexAppText ??= ds.session.queuedCodexAppText;
   ds.pendingCodexAppMessageContext ??= ds.session.queuedCodexAppMessageContext;
+  ds.pendingAttachments ??= ds.session.queuedAttachments;
   ds.session.queued = false;
   ds.session.queuedPrompt = undefined;
   ds.session.queuedCodexAppText = undefined;
   ds.session.queuedCodexAppMessageContext = undefined;
+  ds.session.queuedAttachments = undefined;
   ds.pendingPrompt = undefined;
   // 激活即视为开始：从待办池挪到进行中，让卡片归位。
   if (ds.session.kanbanColumn === 'backlog') ds.session.kanbanColumn = 'in_progress';

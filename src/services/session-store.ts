@@ -3,6 +3,7 @@ import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import type { Session } from '../types.js';
 
@@ -218,6 +219,15 @@ export function closeSession(sessionId: string): void {
   load();
   const session = sessions.get(sessionId);
   if (session) {
+    if (session.larkAppId && session.dashboardAttachments?.length) {
+      try {
+        cleanupMaterializedDashboardImages(session.larkAppId, session.dashboardAttachments);
+        session.dashboardAttachments = undefined;
+        session.queuedAttachments = undefined;
+      } catch (error: any) {
+        logger.warn(`Failed to clean Dashboard images for session ${sessionId}: ${error?.message ?? error}`);
+      }
+    }
     session.status = 'closed';
     session.closedAt = new Date().toISOString();
     save();

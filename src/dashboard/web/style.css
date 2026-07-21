@@ -22234,6 +22234,131 @@ dialog.onboarding-dialog .onboarding-technical > code {
   resize: vertical;
   min-height: 124px;
 }
+.create-session-modal .cs-composer {
+  position: relative;
+}
+.create-session-modal .cs-mention-menu {
+  position: absolute;
+  z-index: 3;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  display: grid;
+  max-height: 220px;
+  padding: 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  overflow: auto;
+}
+.create-session-modal .cs-mention-menu > button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--cs-inner-gap);
+  width: 100%;
+  min-height: 38px;
+  margin: 0;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  box-shadow: none;
+}
+.create-session-modal .cs-mention-menu > button:hover,
+.create-session-modal .cs-mention-menu > button.active {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+.create-session-modal .cs-mention-menu > button small {
+  min-width: 0;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.create-session-modal .cs-mention-menu > p {
+  margin: 0;
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.create-session-modal .cs-image-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: var(--cs-inner-gap);
+}
+.create-session-modal .cs-image-item {
+  position: relative;
+  min-width: 0;
+  margin: 0;
+  padding: 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+.create-session-modal .cs-image-item img {
+  display: block;
+  width: 100%;
+  height: 78px;
+  border-radius: var(--radius-sm);
+  object-fit: contain;
+  background: var(--surface-muted);
+}
+.create-session-modal .cs-image-item figcaption {
+  display: grid;
+  gap: 2px;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.create-session-modal .cs-image-item figcaption strong {
+  color: var(--fg);
+  font-size: 11px;
+  line-height: 1.25;
+}
+.create-session-modal .cs-image-item figcaption span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.create-session-modal .cs-image-item > .cs-image-remove {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 2;
+  box-sizing: border-box;
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  min-width: 34px;
+  height: 34px;
+  min-height: 34px;
+  margin: 0;
+  padding: 0 !important;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  color: var(--fg);
+  line-height: 1;
+  box-shadow: 0 2px 8px color-mix(in srgb, #000 28%, transparent);
+  touch-action: manipulation;
+}
+.create-session-modal .cs-image-item > .cs-image-remove svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+}
 .create-session-modal fieldset {
   margin: 0;
   padding: var(--cs-gap);

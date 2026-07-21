@@ -153,6 +153,8 @@ import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-bat
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
+import { deriveCreateGroupName, selectCreateSessionTargets } from './core/session-create.js';
+import { parseDashboardImageUploads } from './core/dashboard-images.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 import { larkHosts } from './im/lark/lark-hosts.js';
 import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
@@ -4289,7 +4291,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/sessions/create') {
       let parsed: {
         content?: unknown; larkAppIds?: unknown; mode?: unknown; column?: unknown;
-        leadLarkAppId?: unknown; name?: unknown; bindWorkingDir?: unknown;
+        leadLarkAppId?: unknown; name?: unknown; bindWorkingDir?: unknown; images?: unknown;
       };
       try {
         const chunks: Buffer[] = [];
@@ -4310,7 +4312,9 @@ const server = createServer(async (req, res) => {
       if (!column) return jsonRes(res, 400, { ok: false, error: 'bad_column' });
       const bindWorkingDir = typeof parsed.bindWorkingDir === 'string' && parsed.bindWorkingDir.trim()
         ? parsed.bindWorkingDir.trim() : undefined;
-      const name = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim().slice(0, 60) : undefined;
+      const name = deriveCreateGroupName(parsed.name, content);
+      const parsedImages = parseDashboardImageUploads(parsed.images);
+      if (!parsedImages.ok) return jsonRes(res, 400, { ok: false, error: parsedImages.error });
 
       // 解析 creator：lead 模式 = lead bot；一起开工 = pickCreatorForGroup 在选中里挑一个在线的。
       let creatorLarkAppId: string;
@@ -4367,9 +4371,7 @@ const server = createServer(async (req, res) => {
 
       // spawn 目标：lead 模式只有 lead；一起开工是所有成功入群的选中 bot。
       const joinedIds = selectedIds.filter(id => !invalidBotIds.includes(id) && !!registry.getByAppId(id));
-      const targets = mode === 'lead'
-        ? (joinedIds.includes(creatorLarkAppId) ? [creatorLarkAppId] : [])
-        : joinedIds;
+      const targets = selectCreateSessionTargets(mode, joinedIds, creatorLarkAppId);
       if (targets.length === 0) {
         return jsonRes(res, 200, { ok: true, chatId, shareLink: groupResp.shareLink, spawned: [], failed: [], warning: 'no_spawn_target' });
       }
@@ -4381,7 +4383,7 @@ const server = createServer(async (req, res) => {
       await Promise.all(targets.map(async (appId) => {
         const role = mode === 'lead' ? 'lead' : (targets.length > 1 ? 'collab' : 'solo');
         // lead 的 coworker = 所有 sub（除自己）；collab 的 coworker = 其它并列 bot（除自己）。
-        const coworkerIds = (mode === 'lead' ? selectedIds : targets).filter(id => id !== appId);
+        const coworkerIds = (mode === 'lead' ? joinedIds : targets).filter(id => id !== appId);
         const coworkers = coworkerIds.map(id => ({ name: nameOf(id) }));
         try {
           const up = await proxyToDaemon(appId, '/api/sessions/spawn', {
@@ -4389,6 +4391,7 @@ const server = createServer(async (req, res) => {
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({
               chatId, content, column, role, coworkers,
+              images: parsedImages.images,
               postBanner: appId === creatorLarkAppId,
             }),
           });
