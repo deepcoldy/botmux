@@ -53,7 +53,16 @@ export function isCmdJPaletteQueryTooLarge(
   return isClipboardTextByteLengthOverLimit(query, maxBytes)
 }
 
-function normalizeQuery(value: string): string {
+/**
+ * Normalize a free-text keyword for Cmd+J matching.
+ * Why: settings searchEntries / repo.displayName can pass nullish fragments at
+ * runtime (partial repo metadata, sparse keyword arrays). Treat non-strings as
+ * empty so uniqueNormalized never throws on value.length.
+ */
+function normalizeQuery(value: string | null | undefined): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    return ''
+  }
   let normalized = ''
   let pendingWhitespace = false
   for (let index = 0; index < value.length; index += 1) {
@@ -107,7 +116,7 @@ function targetEntryKeywordParts(entryTitle: string): string[] {
   return [entryTitle, `${entryTitle} settings`]
 }
 
-function uniqueNormalized(values: readonly string[]): string[] {
+function uniqueNormalized(values: readonly (string | null | undefined)[]): string[] {
   return [...new Set(values.map(normalizeQuery).filter(Boolean))]
 }
 

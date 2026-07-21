@@ -208,6 +208,35 @@ describe('Cmd+J palette middle-band ranking', () => {
     })
   })
 
+  it('tolerates nullish search keywords without throwing (modal.worktree-palette)', () => {
+    const withHoles = [
+      ...sections,
+      {
+        id: 'repo-partial',
+        title: 'Partial Repo',
+        description: 'Repo with incomplete metadata.',
+        icon: Settings,
+        searchEntries: [
+          {
+            title: 'Display name',
+            // Runtime-shaped: sparse keyword arrays from incomplete repo fields.
+            keywords: [undefined as unknown as string, null as unknown as string, 'repo']
+          },
+          {
+            title: undefined as unknown as string,
+            targetSectionId: 'name',
+            cmdJKeywords: [undefined as unknown as string, 'project name']
+          }
+        ],
+        group: 'project'
+      }
+    ]
+
+    expect(() => buildCmdJSettingsResults(withHoles)).not.toThrow()
+    const results = buildCmdJSettingsResults(withHoles)
+    expect(results.some((r) => r.sectionId === 'repo-partial')).toBe(true)
+  })
+
   it('does not match settings on one-character or description-only queries', () => {
     expect(top('t')).toBeUndefined()
     expect(top('cookie import')).toBeUndefined()

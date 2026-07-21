@@ -39,7 +39,11 @@ type RankedProjectResult = {
 const PROJECT_GROUP_ALIASES = ['group', 'repo group']
 const PROJECT_ALIASES = ['project', 'repo']
 
-function normalizeQuery(value: string): string {
+/** Same nullish guard as palette-results — project/repo labels can be incomplete. */
+function normalizeQuery(value: string | null | undefined): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    return ''
+  }
   let normalized = ''
   let pendingWhitespace = false
   for (let index = 0; index < value.length; index += 1) {
@@ -73,7 +77,7 @@ function isCmdJPaletteWhitespace(code: number): boolean {
   )
 }
 
-function uniqueNormalized(values: readonly string[]): string[] {
+function uniqueNormalized(values: readonly (string | null | undefined)[]): string[] {
   return [...new Set(values.map(normalizeQuery).filter(Boolean))]
 }
 
