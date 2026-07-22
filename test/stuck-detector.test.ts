@@ -123,35 +123,36 @@ describe('StuckDetector', () => {
     detector.dispose();
   });
 
-  it('matches [Y/n] confirmation pattern', () => {
+  it('matches hook review pattern', () => {
     const onStuck = vi.fn();
     const detector = new StuckDetector(1000, {
       isActuallyStuck: () => true,
       onStuck,
-      getSnapshot: () => 'Proceed? [Y/n]',
+      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.',
     });
 
     detector.arm();
     vi.advanceTimersByTime(1000);
 
     expect(onStuck).toHaveBeenCalledTimes(1);
-    expect(onStuck.mock.calls[0][1]).toBe('yes/no confirmation');
+    expect(onStuck.mock.calls[0][1]).toBe('hook review prompt');
     detector.dispose();
   });
 
-  it('matches Press ... to pattern', () => {
+  it('does not match generic [Y/n] or Press prompts (out of scope for this PR)', () => {
     const onStuck = vi.fn();
     const detector = new StuckDetector(1000, {
       isActuallyStuck: () => true,
       onStuck,
-      getSnapshot: () => 'Press space or enter to toggle',
+      getSnapshot: () => 'Proceed? [Y/n]\nPress space or enter to toggle',
     });
 
     detector.arm();
     vi.advanceTimersByTime(1000);
 
     expect(onStuck).toHaveBeenCalledTimes(1);
-    expect(onStuck.mock.calls[0][1]).toBe('key-press prompt');
+    // No pattern match — label is undefined (unknown stall)
+    expect(onStuck.mock.calls[0][1]).toBeUndefined();
     detector.dispose();
   });
 
