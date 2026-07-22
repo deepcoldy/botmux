@@ -243,11 +243,12 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
   if (method === 'POST' && pathname === '/api/asks') return true;
-  // botmux slash / botmux cd（角色切换）：合法调用方是会话内的 CLI 自身，沙箱 /
-  // 读隔离下读不到 host secret。两个 handler 内验证该会话的 rotating per-turn
+  // botmux slash / botmux cd（角色切换）/ botmux delete（关闭自身）：合法调用方
+  // 是会话内的 CLI 自身，沙箱 / 读隔离下读不到 host secret。handler 内验证
+  // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close)$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
@@ -358,7 +359,15 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
   jsonRes(res, 404, { error: 'not_found' });
 });
 
-ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {
+/** Canonical daemon-side close used by the dashboard and `botmux delete`.
+ *  Host callers authenticate with HMAC; a read-isolated CLI may close only its
+ *  exact live session with the rotating per-turn capability. */
+ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req)
+    .catch(() => ({} as Record<string, unknown>));
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   const r = await closeSession(params.sessionId);
   jsonRes(res, 200, r);
 });
