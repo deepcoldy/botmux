@@ -191,6 +191,8 @@ describe('createGroupWithBots', () => {
       oncallBindings: [],
       roleProfileBootstrapMessageId: null,
       roleProfileBootstrapError: null,
+      kickoffMessageId: null,
+      kickoffError: null,
     });
   });
 
@@ -392,6 +394,99 @@ describe('createGroupWithBots', () => {
     });
     expect(result.invalidBotIds).toEqual(['cli_zombie']);
     expect(result.invalidUserIds).toEqual(['ou_banned']);
+  });
+
+  it('sends kickoff using the target bot open_id observed by the creator app', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_kickoff', invalidBotIds: [], invalidUserIds: [] });
+    mockListChatBotMembers.mockResolvedValue([
+      { larkAppId: CREATOR, openId: 'ou_creator', mentionable: true },
+      { larkAppId: OTHER_BOT, openId: 'ou_other_seen_by_creator', mentionable: true },
+    ]);
+    mockSendMessage.mockResolvedValue('om_kickoff');
+
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR, OTHER_BOT],
+      kickoffBotLarkAppId: OTHER_BOT,
+      kickoffPrompt: 'Review PR 562',
+    });
+
+    expect(mockListChatBotMembers).toHaveBeenCalledWith(CREATOR, 'oc_kickoff');
+    expect(mockSendMessage).toHaveBeenCalledWith(
+      CREATOR,
+      'oc_kickoff',
+      '<at user_id="ou_other_seen_by_creator"></at> Review PR 562',
+      'text',
+    );
+    expect(result.kickoffMessageId).toBe('om_kickoff');
+    expect(result.kickoffError).toBeNull();
+  });
+
+  it('does not send kickoff when Lark rejected the target bot invite', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_kickoff', invalidBotIds: [], invalidUserIds: [] });
+    mockAddBotToChat.mockResolvedValue([{ id: OTHER_BOT, ok: false, error: 'invalid_id' }]);
+
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR, OTHER_BOT],
+      kickoffBotLarkAppId: OTHER_BOT,
+      kickoffPrompt: 'Review PR 562',
+    });
+
+    expect(mockListChatBotMembers).not.toHaveBeenCalled();
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result.kickoffMessageId).toBeNull();
+    expect(result.kickoffError).toBe('invitee_rejected');
+  });
+
+  it('surfaces an unmentionable kickoff target without aborting group creation', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_kickoff', invalidBotIds: [], invalidUserIds: [] });
+    mockListChatBotMembers.mockResolvedValue([
+      { larkAppId: OTHER_BOT, openId: 'ou_other_self_scope', mentionable: false },
+    ]);
+
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR, OTHER_BOT],
+      kickoffBotLarkAppId: OTHER_BOT,
+      kickoffPrompt: 'Review PR 562',
+    });
+
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result.kickoffMessageId).toBeNull();
+    expect(result.kickoffError).toBe('kickoff_bot_not_mentionable');
+  });
+
+  it('surfaces kickoff send failure without aborting group creation', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_kickoff', invalidBotIds: [], invalidUserIds: [] });
+    mockListChatBotMembers.mockResolvedValue([
+      { larkAppId: OTHER_BOT, openId: 'ou_other_seen_by_creator', mentionable: true },
+    ]);
+    mockSendMessage.mockRejectedValue(new Error('network down'));
+
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR, OTHER_BOT],
+      kickoffBotLarkAppId: OTHER_BOT,
+      kickoffPrompt: 'Review PR 562',
+    });
+
+    expect(result.chatId).toBe('oc_kickoff');
+    expect(result.kickoffMessageId).toBeNull();
+    expect(result.kickoffError).toBe('network down');
+  });
+
+  it('requires paired kickoff service arguments', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_kickoff', invalidBotIds: [], invalidUserIds: [] });
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR, OTHER_BOT],
+      kickoffBotLarkAppId: OTHER_BOT,
+    });
+
+    expect(mockListChatBotMembers).not.toHaveBeenCalled();
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result.kickoffError).toBe('kickoff_args_must_be_paired');
   });
 
   it('materializes the creator role directly and posts a bootstrap command for peers', async () => {

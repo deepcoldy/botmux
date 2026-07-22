@@ -23,6 +23,15 @@ export interface BotInfoForResolve {
   botName: string | null;
 }
 
+export interface BotInfoForKickoff {
+  larkAppId: string;
+  botOpenId: string | null;
+}
+
+export type ResolvedKickoff =
+  | { ok: true; targetLarkAppId?: string; prompt?: string }
+  | { ok: false; error: string };
+
 export interface ResolvedBots {
   /** Resolved larkAppIds in input order, deduped. First element is creator. */
   larkAppIds: string[];
@@ -95,4 +104,43 @@ export function resolveBotRefs(
   }
 
   return { larkAppIds: out, invalid, ambiguousWarnings };
+}
+
+/**
+ * Validate the optional kickoff pair and resolve the user-facing bot open_id
+ * back to a selected larkAppId. The service later obtains the target bot's
+ * observer-scoped open_id from the creator app before sending the @mention;
+ * a bot's self-reported open_id is not valid across Lark apps.
+ */
+export function resolveKickoff(
+  botOpenIdRaw: string | undefined,
+  promptRaw: string | undefined,
+  selectedLarkAppIds: string[],
+  botInfo: BotInfoForKickoff[],
+): ResolvedKickoff {
+  const botOpenId = botOpenIdRaw?.trim() || undefined;
+  const prompt = promptRaw?.trim() || undefined;
+
+  if (!botOpenId && !prompt) return { ok: true };
+  if (!botOpenId || !prompt) {
+    return { ok: false, error: '--kickoff-bot 与 --kickoff-prompt 必须同时提供且不能为空。' };
+  }
+
+  const matches = botInfo.filter(info => info.botOpenId?.trim() === botOpenId);
+  if (matches.length === 0) {
+    return { ok: false, error: `--kickoff-bot 未匹配到本机 bot: ${botOpenId}` };
+  }
+  if (matches.length > 1) {
+    return { ok: false, error: `--kickoff-bot 匹配到多个本机 bot，请检查 bots-info.json: ${botOpenId}` };
+  }
+
+  const targetLarkAppId = matches[0].larkAppId;
+  if (!selectedLarkAppIds.includes(targetLarkAppId)) {
+    return { ok: false, error: '--kickoff-bot 必须属于本次 --bot 列表。' };
+  }
+  if (targetLarkAppId === selectedLarkAppIds[0]) {
+    return { ok: false, error: '--kickoff-bot 不能是 creator（第一个 --bot）。' };
+  }
+
+  return { ok: true, targetLarkAppId, prompt };
 }
