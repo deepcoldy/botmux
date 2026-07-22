@@ -66,6 +66,65 @@ describe('v3 ephemeral pool', () => {
     expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
   });
 
+  it('threads the run chat binding into worker init so CLI children get real BOTMUX_* identity env', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const req: RunNodeRequest = {
+      ...request(),
+      chatBinding: {
+        larkAppId: 'cli_app',
+        chatId: 'oc_real_chat',
+        chatType: 'group',
+        rootMessageId: 'om_real_root',
+        ownerOpenId: 'ou_real_owner',
+      },
+    };
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+
+    expect(worker.init).toMatchObject({
+      chatId: 'oc_real_chat',
+      chatType: 'group',
+      rootMessageId: 'om_real_root',
+      ownerOpenId: 'ou_real_owner',
+    });
+
+    worker.emitExit(0);
+    await promise;
+  });
+
+  it('keeps synthetic chat ids and no owner for standalone runs without a chat binding', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const req = request();
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+
+    expect(worker.init?.chatId).toBe(`v3-chat-${req.runId}`);
+    expect(worker.init?.rootMessageId).toBe(`v3-root-${req.attemptId}`);
+    expect('chatType' in worker.init).toBe(false);
+    expect('ownerOpenId' in worker.init).toBe(false);
+
+    worker.emitExit(0);
+    await promise;
+  });
+
   it('passes frozen sandbox policy to the goal-mode worker init', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);

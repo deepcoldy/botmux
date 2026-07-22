@@ -81,6 +81,7 @@ import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-liveness.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
+import { dispatchDeferredTopicSend, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { resolveDaemonExternalHostEnv } from './cli/daemon-lifecycle-env.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
@@ -2870,6 +2871,7 @@ interface SessionData {
   /** 'thread' (legacy default) → cmdSend uses reply_in_thread to rootMessageId.
    *  'chat' → cmdSend posts a plain message to chatId (普通群整群一个会话). */
   scope?: 'thread' | 'chat';
+  deferredScheduleRun?: DeferredScheduleRunData;
   vcMeetingReceiver?: {
     listenerAppId: string;
     meetingId: string;
@@ -4315,6 +4317,8 @@ async function cmdResume(): Promise<void> {
     console.error('❌ daemon 中找不到该会话（可能已被清理）。');
   } else if (errCode === 'adopt_unsupported') {
     console.error('❌ adopt 接管会话不支持 resume。');
+  } else if (errCode === 'deferred_unmaterialized') {
+    console.error('❌ 该静默定时轮次未创建话题，隐藏会话只保留审计记录，不能 resume。');
   } else {
     console.error(`❌ 恢复失败: ${errCode}`);
   }
@@ -4488,8 +4492,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 定时任务（可在 CLI 会话内自动推断 chat）:
   schedule list                        列出所有任务
   schedule add <schedule> <prompt>     添加任务（ex: "30m" / "every 2h" / "每日9:00" / "0 9 * * *"）
-       --new-topic                     每次触发在同群开一个新话题、起独立会话（不续旧话题）
-       --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警（与 --new-topic 互斥）
+       --top-level                     在群消息顶层执行（后续会话形态跟随普通群会话模式）
+       --topic --root-msg-id <om_...>  固定在指定话题下执行
+       --new-topic [--topic-title ...] 每次创建新话题和独立会话
+       --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警
   schedule remove <id>                 删除任务
   schedule pause|resume <id>           暂停/恢复
   schedule run <id>                    标记立即执行
@@ -4963,9 +4969,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   }
 
   if (sub === 'add') {
-    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--silent']);
+    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent']);
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--root-msg-id ROOT] [--lark-app-id APP] [--workdir DIR] [--new-topic] [--silent]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--lark-app-id APP] [--workdir DIR] [--silent]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -4977,24 +4983,48 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
 
     const cur = detectCurrentSession();
     const chatId = argValue(rest, '--chat-id') ?? cur?.chatId;
-    const rootMessageId = argValue(rest, '--root-msg-id') ?? cur?.rootMessageId;
+    const explicitRootMessageId = argValue(rest, '--root-msg-id');
+    const rootMessageId = explicitRootMessageId
+      ?? (chatId && chatId === cur?.chatId ? cur.rootMessageId : undefined);
     const larkAppId = argValue(rest, '--lark-app-id') ?? cur?.larkAppId;
     const workingDir = argValue(rest, '--workdir') ?? cur?.workingDir ?? process.cwd();
     const name = argValue(rest, '--name') ?? (promptArg.length > 20 ? promptArg.slice(0, 20) + '…' : promptArg);
-    // --new-topic: every fire opens a brand-new topic in a fresh session.
-    const deliver: 'origin' | 'local' | 'new-topic' = rest.includes('--new-topic')
-      ? 'new-topic'
-      : ((argValue(rest, '--deliver') as 'origin' | 'local' | 'new-topic' | undefined) ?? 'origin');
+    const legacyDeliver = argValue(rest, '--deliver') as 'origin' | 'local' | 'new-topic' | undefined;
+    const wantsNewTopic = rest.includes('--new-topic') || legacyDeliver === 'new-topic';
+    const wantsTopLevel = rest.includes('--top-level');
+    const wantsTopic = rest.includes('--topic');
+    if ([wantsNewTopic, wantsTopLevel, wantsTopic].filter(Boolean).length > 1) {
+      console.error('--top-level、--topic 与 --new-topic 只能选择一个。');
+      process.exit(1);
+    }
+    const requestedDeliver = legacyDeliver;
+    const deliver: 'origin' | 'local' = requestedDeliver === 'local' ? 'local' : 'origin';
     // --silent: fires post no "执行中" banner; the spawned turn stays quiet and
     // the model only `botmux send`s when the alert condition in the prompt is met.
     const silent = rest.includes('--silent');
-    if (silent && deliver === 'new-topic') {
-      console.error('--silent 与 --new-topic 不能同时使用：新话题必须由首条消息开启。要「有异常才开新话题」，请在 prompt 里指示模型报警时用 botmux send 顶层发送。');
-      process.exit(1);
-    }
-
     if (!chatId) {
       console.error('无法推断 chat-id。请加上 --chat-id <CHAT_ID>，或从 Lark 话题内的 CLI 会话中运行本命令。');
+      process.exit(1);
+    }
+    const executionPosition: 'top-level' | 'topic' | 'new-topic' = wantsNewTopic
+      ? 'new-topic'
+      : wantsTopLevel
+        ? 'top-level'
+        : wantsTopic
+          ? 'topic'
+          : cur?.scope === 'chat' ? 'top-level' : rootMessageId ? 'topic' : 'top-level';
+    const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
+    if (scope === 'thread' && !rootMessageId) {
+      console.error('话题下执行需要 --root-msg-id <ROOT_MESSAGE_ID>，或从 Lark 话题会话中运行。');
+      process.exit(1);
+    }
+    const topicTitle = argValue(rest, '--topic-title');
+    if (topicTitle && executionPosition !== 'new-topic') {
+      console.error('--topic-title 仅可与 --new-topic 一起使用。');
+      process.exit(1);
+    }
+    if (topicTitle && Array.from(topicTitle.trim()).length > 200) {
+      console.error('--topic-title 最多 200 个字符。');
       process.exit(1);
     }
 
@@ -5018,7 +5048,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       creatorRootMessageId: cur?.rootMessageId,
       creatorLarkAppId: cur?.larkAppId,
       chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
-      scope: cur?.scope,
+      scope,
+      executionPosition,
+      topicTitle,
       deliver,
       silent,
     });
@@ -5028,7 +5060,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     console.log(`   规则: ${parsed.display}`);
     console.log(`   下次执行: ${next}`);
     console.log(`   工作目录: ${workingDir}`);
-    console.log(`   话题: ${deliver === 'new-topic' ? '(每次新开话题，独立会话)' : rootMessageId ?? '(将新开)'}`);
+    console.log(`   执行位置: ${executionPosition === 'new-topic' ? '每次新话题' : executionPosition === 'top-level' ? '群消息顶层' : '话题下'}`);
+    if (executionPosition === 'new-topic' && topicTitle?.trim()) console.log(`   新话题标题: ${topicTitle.trim()}`);
     if (silent) console.log('   静默: 触发时不发「执行中」提示，由模型判断是否需要 botmux send 报警');
     return;
   }
@@ -5638,6 +5671,10 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
   const scope: 'thread' | 'chat' =
     scopeEnv === 'chat' || scopeEnv === 'thread' ? scopeEnv : (rootMessageId ? 'thread' : 'chat');
   const ownerOpenId = process.env.BOTMUX_OWNER_OPEN_ID;
+  const deferredTaskId = process.env.BOTMUX_DEFERRED_SCHEDULE_TASK_ID;
+  const deferredTurnId = process.env.BOTMUX_DEFERRED_SCHEDULE_TURN_ID;
+  const deferredRoutingAnchor = process.env.BOTMUX_DEFERRED_SCHEDULE_ROUTING_ANCHOR;
+  const deferredCreatedAt = process.env.BOTMUX_DEFERRED_SCHEDULE_CREATED_AT;
 
   const botConfig = {
     larkAppId: appId,
@@ -5657,6 +5694,19 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     larkAppId: appId,
     scope,
     ownerOpenId,
+    ...(deferredTaskId && deferredTurnId && deferredRoutingAnchor && deferredCreatedAt
+      ? {
+          deferredScheduleRun: {
+            taskId: deferredTaskId,
+            turnId: deferredTurnId,
+            routingAnchor: deferredRoutingAnchor,
+            ...(process.env.BOTMUX_DEFERRED_SCHEDULE_TOPIC_TITLE
+              ? { topicTitle: process.env.BOTMUX_DEFERRED_SCHEDULE_TOPIC_TITLE }
+              : {}),
+            createdAt: deferredCreatedAt,
+          },
+        }
+      : {}),
     // 刻意不设 quoteTargetSenderOpenId：env 是任务创建时冻结的，follow-up 轮
     // 换了触发人后 --mention-back 会错误 @ 最初 owner。riff routing 明确禁用
     // mention-back（@ 硬门会拒绝并提示 agent 改用 --mention <本轮 sender>）。
@@ -5959,6 +6009,8 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  let deferredMaterializedByThisCommand = false;
+  let deferredTopicRootMessageIdForOutput: string | undefined;
 
   // 本轮的回复锚点：优先按 turnId 精确取 per-turn 落点（排队/并发轮次不再被
   // 后到轮次覆盖 currentReplyTarget 而塌成群顶层 plain），无记录再退回单槽。
@@ -6090,40 +6142,61 @@ async function cmdSend(rest: string[]): Promise<void> {
         messageId = prepared.messageId;
       } else {
         revalidateVcMeetingManagedSend();
-        const canonicalTarget = resolveSendTarget({
-          into: sendInto,
-          topLevel: sendTopLevel,
-          chatScope: s.scope === 'chat',
-          chatId: canonicalOutput.targetChatId,
-          rootMessageId: s.rootMessageId,
-          replyTargetRootId: turnReplyTarget?.rootMessageId,
-          replyTargetTurnId: turnReplyTarget?.turnId,
-          replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
-          currentTurnId,
-        });
         const managedProviderOptions = prepared
           ? { suppressHook: true }
           : undefined;
-        messageId = canonicalTarget.mode === 'plain'
-          ? await sendMessage(
-              appId,
-              canonicalTarget.chatId,
-              canonicalOutput.content,
-              canonicalOutput.msgType,
-              prepared?.providerKey,
-              undefined,
-              managedProviderOptions,
-            )
-          : await replyMessage(
-              appId,
-              canonicalTarget.rootMessageId,
-              canonicalOutput.content,
-              canonicalOutput.msgType,
-              canonicalTarget.mode === 'thread',
-              prepared?.providerKey,
-              undefined,
-              managedProviderOptions,
-            );
+        const deferred = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
+          ? await dispatchDeferredTopicSend({
+              dataDir: resolveDataDir(),
+              session: s as SessionData & { larkAppId: string },
+              currentTurnId,
+              explicitTopLevel: sendTopLevel,
+              reuseBoundRootWhenTopLevel: deferredMaterializedByThisCommand,
+              content: canonicalOutput.content,
+              msgType: canonicalOutput.msgType,
+              uuid: prepared?.providerKey,
+              sendRoot: (body, type, uuid) => sendMessage(appId, targetChatId, body, type, uuid, undefined, managedProviderOptions),
+              sendTitleSeed: (title, uuid) => sendMessage(appId, targetChatId, title, 'text', uuid),
+              replyRoot: (root, body, type, uuid) => replyMessage(appId, root, body, type, true, uuid, undefined, managedProviderOptions),
+            })
+          : { handled: false };
+        if (deferred.handled && deferred.messageId) {
+          deferredMaterializedByThisCommand ||= deferred.materializedNow === true;
+          deferredTopicRootMessageIdForOutput = deferred.rootMessageId;
+          messageId = deferred.messageId;
+        } else {
+          const canonicalTarget = resolveSendTarget({
+            into: sendInto,
+            topLevel: sendTopLevel,
+            chatScope: s.scope === 'chat',
+            chatId: canonicalOutput.targetChatId,
+            rootMessageId: s.rootMessageId,
+            replyTargetRootId: turnReplyTarget?.rootMessageId,
+            replyTargetTurnId: turnReplyTarget?.turnId,
+            replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
+            currentTurnId,
+          });
+          messageId = canonicalTarget.mode === 'plain'
+            ? await sendMessage(
+                appId,
+                canonicalTarget.chatId,
+                canonicalOutput.content,
+                canonicalOutput.msgType,
+                prepared?.providerKey,
+                undefined,
+                managedProviderOptions,
+              )
+            : await replyMessage(
+                appId,
+                canonicalTarget.rootMessageId,
+                canonicalOutput.content,
+                canonicalOutput.msgType,
+                canonicalTarget.mode === 'thread',
+                prepared?.providerKey,
+                undefined,
+                managedProviderOptions,
+              );
+        }
         if (prepared?.kind === 'send' || prepared?.kind === 'succeeded') {
           finishVcMeetingImReply(resolveDataDir(), prepared.ref, messageId);
         }
@@ -6131,7 +6204,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       recordVcMeetingPrimaryOutput(messageId, canonicalOutput.targetChatId);
       // 语音也是一次回复：写 bridge fallback marker，否则本轮会被判为"没发 botmux send"
       // 而触发兜底，多补一张文本卡。与文本/卡片路径同口径：仅同话题回复才记。
-      if (!sendTopLevel && !overrideChatId && !sendInto) {
+      if ((!sendTopLevel || !!deferredTopicRootMessageIdForOutput)
+        && (!overrideChatId || overrideChatId === s.chatId)
+        && !sendInto) {
         try {
           const markerDir = join(resolveDataDir(), 'turn-sends');
           if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
@@ -6139,7 +6214,16 @@ async function cmdSend(rest: string[]): Promise<void> {
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
       console.error(`✓ 已发送语音 ${messageId} ｜ ${Math.round(out.durationMs / 1000)}s`);
-      console.log(JSON.stringify({ success: true, messageId, sessionId: sid, kind: 'voice', durationMs: out.durationMs }));
+      console.log(JSON.stringify({
+        success: true,
+        messageId,
+        sessionId: sid,
+        kind: 'voice',
+        durationMs: out.durationMs,
+        ...(deferredTopicRootMessageIdForOutput
+          ? { deferredTopicRootMessageId: deferredTopicRootMessageIdForOutput, turnId: currentTurnId }
+          : {}),
+      }));
     } catch (e: any) {
       console.error(`语音发送失败：${e?.message ?? e}`);
       if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ } }
@@ -6323,7 +6407,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single
   // decision point. Used for file attachments (always plain in chat scope).
   const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
-  const dispatch = (
+  const dispatch = async (
     content: string,
     msgType: string,
     uuid?: string,
@@ -6332,6 +6416,46 @@ async function cmdSend(rest: string[]): Promise<void> {
     // This closure also carries attachments, so every Lark call re-checks the
     // exact durable attempt/member instead of inheriting the early cmd gate.
     revalidateVcMeetingManagedSend();
+    if (!sendInto && (!overrideChatId || overrideChatId === s.chatId)) {
+      const deferred = await dispatchDeferredTopicSend({
+        dataDir: resolveDataDir(),
+        session: s as SessionData & { larkAppId: string },
+        currentTurnId,
+        explicitTopLevel: sendTopLevel,
+        reuseBoundRootWhenTopLevel: deferredMaterializedByThisCommand,
+        content,
+        msgType,
+        uuid,
+        sendRoot: (body, type, rootUuid) => sendMessage(
+          appId,
+          targetChatId,
+          body,
+          type,
+          rootUuid,
+          hookContext,
+          suppressHook ? { suppressHook: true } : undefined,
+        ),
+        // The optional title is the root seed and the actual alert follows as
+        // its first reply. Do not emit a user outbound hook for presentation-
+        // only seed text; the alert itself still goes through the hook path.
+        sendTitleSeed: (title, rootUuid) => sendMessage(appId, targetChatId, title, 'text', rootUuid),
+        replyRoot: (root, body, type, replyUuid) => replyMessage(
+          appId,
+          root,
+          body,
+          type,
+          true,
+          replyUuid,
+          hookContext,
+          suppressHook ? { suppressHook: true } : undefined,
+        ),
+      });
+      if (deferred.handled && deferred.messageId) {
+        deferredMaterializedByThisCommand ||= deferred.materializedNow === true;
+        deferredTopicRootMessageIdForOutput = deferred.rootMessageId;
+        return deferred.messageId;
+      }
+    }
     return sendTarget.mode === 'plain'
       ? sendMessage(
           appId,
@@ -6792,7 +6916,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     // sends can suppress transcript fallback when their content appears to
     // cover the same final answer; detoured sends suppress only when they
     // closed a pending response card for this turn.
-    if (shouldRecordBridgeMarker) recordBridgeSendMarker(sentAtMs, messageId, text);
+    if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
+      recordBridgeSendMarker(sentAtMs, messageId, text);
+    }
 
     // Send attachments as separate messages — best-effort. The primary message
     // is already delivered above; a failing attachment must not throw out to the
@@ -6878,6 +7004,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       sessionId: sid,
       quotedMessageId: primaryQuotedId,
       mentioned: mentions.map(m => ({ open_id: m.open_id, name: m.name })),
+      ...(deferredTopicRootMessageIdForOutput
+        ? { deferredTopicRootMessageId: deferredTopicRootMessageIdForOutput, turnId: currentTurnId }
+        : {}),
       ...(attention.requested ? { attentionRaised, attentionError } : {}),
       ...(failedAttachments.length > 0
         ? { failedAttachments: failedAttachments.map(f => f.path) }

@@ -43,7 +43,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('msgType: canonicalOutput.msgType');
     expect(cmdSend).toContain('quoteTargetId: canonicalOutput.quoteTargetId');
     expect(cmdSend).toMatch(
-      /const dispatch = \([^)]*\): Promise<string> => \{[\s\S]*?revalidateVcMeetingManagedSend\(\);/,
+      /const dispatch = async \([^)]*\): Promise<string> => \{[\s\S]*?revalidateVcMeetingManagedSend\(\);/,
     );
     expect(cmdSend).toMatch(
       /const dispatchPrimary = async \([^)]*\): Promise<string> => \{\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*revalidateVcMeetingManagedSend\(\);/,

@@ -6,7 +6,11 @@
  *    reuses task.rootMessageId, spawned session carries a turn-exact silent id and
  *    the CLI prompt is wrapped with the silent-schedule hint
  *  - loud fire keeps posting the banner (control)
- *  - runtime fallback: silent+new-topic (store-level bypass) fires loud
+ *  - explicit fresh-topic fires post their configured title and own a new anchor
+ *  - silent fresh-topic fires start at a durable virtual anchor and defer the
+ *    visible Lark root until the first botmux send
+ *  - chat-scope fires honor the bot/chat regular-group mode for flat, shared,
+ *    and independent-topic routing
  *  - live-session injection: silent id follows the queued turn even when busy
  *  - converted-topic regression: chat-scope task in a topic-converted group
  *    anchors at rootMessageId (previously clobbered by the trailing
@@ -139,6 +143,7 @@ beforeEach(() => {
   replyMessageMock.mockClear();
   getChatModeMock.mockClear();
   getChatModeMock.mockResolvedValue('group');
+  delete (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode;
 });
 
 describe('executeScheduledTask — silent thread fire', () => {
@@ -175,25 +180,78 @@ describe('executeScheduledTask — silent thread fire', () => {
   });
 });
 
-describe('executeScheduledTask — silent runtime fallbacks (creation-time guards bypassed)', () => {
-  it('silent + new-topic falls back to a loud fire (banner creates the anchor)', async () => {
+describe('executeScheduledTask — fresh-topic execution', () => {
+  it('posts the custom title and always starts an independent thread session', async () => {
     const active = new Map<string, DaemonSession>();
-    await executeScheduledTask(baseTask({ deliver: 'new-topic', silent: true }), active, refreshCliVersion);
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'shared';
+    await executeScheduledTask(baseTask({
+      executionPosition: 'new-topic',
+      topicTitle: '每日发布巡检',
+      chatType: 'group',
+    }), active, refreshCliVersion);
 
-    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendMessageMock).toHaveBeenCalledWith(APP, CHAT, '每日发布巡检');
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(getChatModeMock).not.toHaveBeenCalled();
     const ds = active.get(sessionKey('om_banner_123', APP))!;
     expect(ds).toBeTruthy();
-    expect(ds.silentScheduledTurns).toBeUndefined();
-    expect(forkedCliInput()).not.toContain('<botmux_silent_schedule');
+    expect(ds.scope).toBe('thread');
+    expect(ds.session.rootMessageId).toBe('om_banner_123');
+    expect(ds.hasHistory).toBe(false);
   });
 
-  it('silent thread task without rootMessageId falls back to a loud fire', async () => {
+  it('uses the standard task-start notice when no custom title is configured', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ executionPosition: 'new-topic', chatType: 'group' }), active, refreshCliVersion);
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendMessageMock.mock.calls[0][2]).toContain('服务巡检');
+    expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
+  });
+
+  it('starts fresh-topic + silent at an isolated virtual anchor without a visible seed', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      executionPosition: 'new-topic',
+      silent: true,
+      topicTitle: '按需巡检告警',
+    }), active, refreshCliVersion);
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(active.size).toBe(1);
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    const [[key, ds]] = [...active.entries()];
+    expect(key).toMatch(/^schedule-run:task0001:[^:]+::cli_app_test$/);
+    expect(ds.scope).toBe('chat');
+    expect(ds.session.rootMessageId).toBe(ds.session.deferredScheduleRun?.routingAnchor);
+    expect(ds.session.deferredScheduleRun).toMatchObject({
+      taskId: 'task0001',
+      turnId: forkedTurnId(),
+      topicTitle: '按需巡检告警',
+    });
+    expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
+  });
+
+  it('gives every silent fresh-topic fire a distinct session and virtual anchor', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ executionPosition: 'new-topic', silent: true }), active, refreshCliVersion);
+    await executeScheduledTask(baseTask({ executionPosition: 'new-topic', silent: true }), active, refreshCliVersion);
+
+    expect(active.size).toBe(2);
+    expect(new Set([...active.values()].map(ds => ds.session.sessionId)).size).toBe(2);
+    expect(new Set([...active.values()].map(ds => ds.session.deferredScheduleRun?.routingAnchor)).size).toBe(2);
+  });
+
+  it('thread task without a real root safely degrades to silent chat scope', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ scope: 'thread', silent: true }), active, refreshCliVersion);
 
-    expect(sendMessageMock).toHaveBeenCalledTimes(1);
-    const ds = active.get(sessionKey('om_banner_123', APP))!;
-    expect(ds.silentScheduledTurns).toBeUndefined();
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.scope).toBe('chat');
+    expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
   });
 });
 
@@ -220,6 +278,81 @@ describe('executeScheduledTask — silent chat-scope fire', () => {
     expect(replyMessageMock).not.toHaveBeenCalled();
     expect(sendMessageMock).not.toHaveBeenCalled();
     expect(active.get(sessionKey(CHAT, APP))).toBeTruthy();
+  });
+});
+
+describe('executeScheduledTask — chat-scope regular-group mode', () => {
+  it('cross-chat loud execution notifies the creator and still uses a target-chat trigger', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'new-topic';
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({
+      scope: 'chat',
+      chatType: 'group',
+      creatorChatId: 'oc_creator_chat',
+      creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    expect(replyMessageMock).toHaveBeenCalledWith(
+      APP,
+      'om_creator_root',
+      expect.any(String),
+      'text',
+      true,
+    );
+    expect(sendMessageMock).toHaveBeenCalledWith(APP, CHAT, expect.any(String));
+    expect(active.get(sessionKey(CHAT, APP))).toBeUndefined();
+    expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
+  });
+
+  it('new-topic mode uses the top-level banner as a fresh thread/session anchor', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'new-topic';
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({ scope: 'chat', chatType: 'group' }), active, refreshCliVersion);
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    expect(active.get(sessionKey(CHAT, APP))).toBeUndefined();
+    const ds = active.get(sessionKey('om_banner_123', APP))!;
+    expect(ds).toBeTruthy();
+    expect(ds.scope).toBe('thread');
+    expect(ds.session.rootMessageId).toBe('om_banner_123');
+  });
+
+  it('shared mode reuses chat scope but pins this exact turn under the banner topic', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'shared';
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({ scope: 'chat', chatType: 'group' }), active, refreshCliVersion);
+
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    const turnId = forkedTurnId();
+    expect(ds.scope).toBe('chat');
+    expect(ds.session.replyTargets?.[turnId]?.rootMessageId).toBe('om_banner_123');
+    expect(ds.currentReplyTarget).toMatchObject({ rootMessageId: 'om_banner_123', turnId });
+  });
+
+  it('a topic group uses the top-level banner as its thread anchor', async () => {
+    getChatModeMock.mockResolvedValue('topic');
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({ scope: 'chat', chatType: 'topic_group' }), active, refreshCliVersion);
+
+    const ds = active.get(sessionKey('om_banner_123', APP))!;
+    expect(ds).toBeTruthy();
+    expect(ds.scope).toBe('thread');
+  });
+
+  it('silent new-topic mode stays silent and chat-scoped because there is no visible trigger anchor', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'new-topic';
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({ scope: 'chat', chatType: 'group', silent: true }), active, refreshCliVersion);
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.scope).toBe('chat');
+    expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
   });
 });
 
@@ -286,29 +419,31 @@ describe('silent scheduled turn lifecycle', () => {
   });
 });
 
-describe('executeScheduledTask — converted-topic anchor regression', () => {
-  it('chat-scope task in a topic-converted group anchors at rootMessageId and promotes to thread scope', async () => {
+describe('executeScheduledTask — explicit position wins over a retained root', () => {
+  it('loud chat-scope task posts at top level even when it retains an old topic root', async () => {
     getChatModeMock.mockResolvedValue('topic');
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ scope: 'chat', rootMessageId: ROOT }), active, refreshCliVersion);
 
-    // banner reply lands in the original thread, session anchors there too
-    expect(replyMessageMock).toHaveBeenCalledTimes(1);
-    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    const ds = active.get(sessionKey('om_banner_123', APP))!;
     expect(ds).toBeTruthy();
-    expect(ds.scope).toBe('thread');            // runtimeScope promotion now reachable
-    expect(active.get(sessionKey(CHAT, APP))).toBeUndefined(); // no chat-anchored duplicate
+    expect(ds.scope).toBe('thread'); // topic-group top-level message is its own topic root
+    expect(ds.session.rootMessageId).toBe('om_banner_123');
+    expect(active.get(sessionKey(ROOT, APP))).toBeUndefined();
   });
 
-  it('silent chat-scope task in a topic-converted group: same anchor, zero messages', async () => {
+  it('silent chat-scope task ignores the retained root and remains truly top-level/chat-scoped', async () => {
     getChatModeMock.mockResolvedValue('topic');
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ scope: 'chat', rootMessageId: ROOT, silent: true }), active, refreshCliVersion);
 
     expect(replyMessageMock).not.toHaveBeenCalled();
     expect(sendMessageMock).not.toHaveBeenCalled();
-    const ds = active.get(sessionKey(ROOT, APP))!;
-    expect(ds.scope).toBe('thread');
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.scope).toBe('chat');
     expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
+    expect(active.get(sessionKey(ROOT, APP))).toBeUndefined();
   });
 });

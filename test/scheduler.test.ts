@@ -227,6 +227,12 @@ describe('extractDeliveryMode (新话题 keyword)', () => {
     expect(extractDeliveryMode('new topic - run build')).toEqual({ deliver: 'new-topic', prompt: 'run build' });
   });
 
+  it('accepts the new group-top-level wording while keeping the compatibility token', () => {
+    expect(extractDeliveryMode('群消息顶层 执行日报')).toEqual({ deliver: 'new-topic', prompt: '执行日报' });
+    expect(extractDeliveryMode('群顶层运行：检查服务')).toEqual({ deliver: 'new-topic', prompt: '检查服务' });
+    expect(extractDeliveryMode('top-level: run build')).toEqual({ deliver: 'new-topic', prompt: 'run build' });
+  });
+
   it('leaves normal prompt as origin, unchanged', () => {
     expect(extractDeliveryMode('帮我看AI新闻')).toEqual({ deliver: 'origin', prompt: '帮我看AI新闻' });
   });
@@ -282,12 +288,32 @@ describe('extractScheduleModifiers (combined keywords)', () => {
   });
 
   it('new-topic only', () => {
-    expect(extractScheduleModifiers('新话题 生成日报')).toEqual({ deliver: 'new-topic', silent: false, prompt: '生成日报' });
+    expect(extractScheduleModifiers('新话题 生成日报')).toEqual({
+      deliver: 'new-topic',
+      executionPosition: 'new-topic',
+      silent: false,
+      prompt: '生成日报',
+    });
   });
 
   it('both keywords, either order (conflict is rejected by callers)', () => {
-    expect(extractScheduleModifiers('静默 新话题 检查服务')).toEqual({ deliver: 'new-topic', silent: true, prompt: '检查服务' });
-    expect(extractScheduleModifiers('新话题 静默 检查服务')).toEqual({ deliver: 'new-topic', silent: true, prompt: '检查服务' });
+    const expected = {
+      deliver: 'new-topic' as const,
+      executionPosition: 'new-topic' as const,
+      silent: true,
+      prompt: '检查服务',
+    };
+    expect(extractScheduleModifiers('静默 新话题 检查服务')).toEqual(expected);
+    expect(extractScheduleModifiers('新话题 静默 检查服务')).toEqual(expected);
+  });
+
+  it('distinguishes group top-level from a fresh topic', () => {
+    expect(extractScheduleModifiers('群消息顶层 执行日报')).toEqual({
+      deliver: 'new-topic',
+      executionPosition: 'top-level',
+      silent: false,
+      prompt: '执行日报',
+    });
   });
 });
 

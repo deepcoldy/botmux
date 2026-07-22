@@ -20,7 +20,7 @@ import { dashboardEventBus } from '../core/dashboard-events.js';
 import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
-import type { ScheduledTask, ParsedSchedule } from '../types.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
 
 // ─── Idempotency types (events doc v0.1.2 §2.2) ─────────────────────────────
 
@@ -81,6 +81,8 @@ export function canonicalScheduleInput(t: {
   chatType?: 'group' | 'p2p' | 'topic_group';
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
+  executionPosition?: ScheduleExecutionPosition;
+  topicTitle?: string;
   larkAppId?: string;
   repeat?: { times: number | null; completed?: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -108,11 +110,13 @@ export function canonicalScheduleInput(t: {
     chatType: t.chatType,
     rootMessageId: t.rootMessageId,
     scope: t.scope,
+    executionPosition: t.executionPosition,
+    topicTitle: t.topicTitle,
     larkAppId: t.larkAppId,
     // Strip `completed` — it mutates after the task starts running, but
     // `times` is the durable user intent.
     repeat: t.repeat ? { times: t.repeat.times } : undefined,
-    deliver: t.deliver ?? 'origin',
+    deliver: t.deliver === 'local' ? 'local' : 'origin',
     // `silent: false`/absent normalizes to undefined (dropped by
     // computeInputHash) so pre-existing tasks keep their canonical hash.
     silent: t.silent === true ? true : undefined,
@@ -173,6 +177,13 @@ function migrate(raw: any): ScheduledTask | null {
     }
   }
 
+  const executionPosition: ScheduleExecutionPosition | undefined =
+    raw.executionPosition === 'top-level' || raw.executionPosition === 'topic' || raw.executionPosition === 'new-topic'
+      ? raw.executionPosition
+      : raw.deliver === 'new-topic'
+        ? 'new-topic'
+        : undefined;
+
   return {
     id: raw.id,
     name: raw.name,
@@ -183,6 +194,10 @@ function migrate(raw: any): ScheduledTask | null {
     chatId: raw.chatId,
     rootMessageId: raw.rootMessageId,
     scope: raw.scope === 'thread' || raw.scope === 'chat' ? raw.scope : undefined,
+    executionPosition,
+    topicTitle: typeof raw.topicTitle === 'string' && raw.topicTitle.trim()
+      ? Array.from(raw.topicTitle.trim()).slice(0, 200).join('')
+      : undefined,
     chatType: raw.chatType,
     larkAppId: raw.larkAppId,
     creatorChatId: raw.creatorChatId,
@@ -196,7 +211,7 @@ function migrate(raw: any): ScheduledTask | null {
     lastError: raw.lastError,
     lastDeliveryError: raw.lastDeliveryError,
     repeat: raw.repeat,
-    deliver: raw.deliver ?? 'origin',
+    deliver: raw.deliver === 'local' ? 'local' : 'origin',
     silent: raw.silent === true ? true : undefined,
   };
 }
@@ -390,6 +405,8 @@ export function createTask(params: {
   chatId: string;
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
+  executionPosition?: ScheduleExecutionPosition;
+  topicTitle?: string;
   chatType?: 'group' | 'p2p' | 'topic_group';
   larkAppId?: string;
   creatorChatId?: string;
@@ -437,6 +454,8 @@ export function createTask(params: {
       chatId: params.chatId,
       rootMessageId: params.rootMessageId,
       scope: params.scope,
+      executionPosition: params.executionPosition,
+      topicTitle: params.topicTitle,
       chatType: params.chatType,
       larkAppId: params.larkAppId,
       creatorChatId: params.creatorChatId,
@@ -446,7 +465,9 @@ export function createTask(params: {
       createdAt: new Date().toISOString(),
       nextRunAt: params.nextRunAt,
       repeat: params.repeat,
-      deliver: params.deliver ?? 'origin',
+      // Legacy `deliver:new-topic` is converted by scheduler.addTask into the
+      // explicit executionPosition field before reaching the store.
+      deliver: params.deliver === 'local' ? 'local' : 'origin',
       silent: params.silent === true ? true : undefined,
     };
     working.set(task.id, task);
@@ -471,13 +492,16 @@ export function removeTask(id: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir'
+    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir'
   >>,
 ): void {
   mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
-    Object.assign(task, updates);
+    Object.assign(
+      task,
+      updates.deliver === 'new-topic' ? { ...updates, deliver: 'origin' as const } : updates,
+    );
     return { result: undefined, changed: true };
   });
 }

@@ -19,7 +19,7 @@ import { readGlobalConfig } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { fallbackTurnId, isSubstituteTurn } from './reply-target.js';
-import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, MessageWithdrawnError } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog, cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
@@ -92,6 +92,7 @@ import { neutralizeLarkAtTags } from '../services/send-policy.js';
 import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-message-store.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
+import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -156,6 +157,13 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
     context: { workerGeneration: number },
+  ) => void | Promise<void>;
+  /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
+   * settled. Transcript-backed CLIs report `terminal`; screen-only/remote
+   * adapters use the existing debounced idle edge as a compatibility fallback. */
+  onDeferredScheduleTurnSettled?: (
+    ds: DaemonSession,
+    context: { turnId: string; source: 'terminal' | 'idle' },
   ) => void | Promise<void>;
   /** A process exit makes every unresolved receipt dispatched to this exact
    *  worker generation ambiguous; the receiver decides retry policy. */
@@ -2134,6 +2142,7 @@ export function forkWorker(
     backendConfig: botCfg.riff,
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
+    deferredScheduleRun: ds.session.deferredScheduleRun,
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
     resume,
@@ -2680,6 +2689,13 @@ function setupWorkerHandlers(
             recordUsageForDaemonSession(ds);
             void finishTurnReactions(ds);
           }
+          if (
+            ds.lastScreenStatus === 'idle'
+            && msg.turnId
+            && ds.session.deferredScheduleRun?.turnId === msg.turnId
+          ) {
+            void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'idle' });
+          }
           // If every over-cap process was busy, the earlier check deliberately
           // left them alone. Re-check on the first idle edge so capacity is
           // reclaimed immediately instead of waiting for the 60s backstop.
@@ -3082,6 +3098,44 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'deferred_topic_materialized': {
+        if (ds.worker !== worker || msg.sessionId !== ds.session.sessionId) {
+          logger.warn(`[${t}] Dropped deferred topic binding from stale/wrong worker`);
+          break;
+        }
+        // Local backends claim through the host-visible sidecar directly. Only
+        // Riff needs the terminal-output relay, and terminal text is agent-
+        // controlled, so never let a fabricated local line create a binding.
+        if ((ds.initConfig?.backendType ?? ds.session.backendType) !== 'riff') {
+          logger.warn(`[${t}] Dropped deferred topic relay from non-Riff backend`);
+          break;
+        }
+        const run = ds.session.deferredScheduleRun;
+        if (!run || msg.turnId !== run.turnId || !msg.rootMessageId.startsWith('om_')) {
+          logger.warn(`[${t}] Dropped deferred topic binding with mismatched run identity`);
+          break;
+        }
+        // Defense in depth for the remote stdout relay: prove the claimed
+        // message actually exists in this run's target chat before persisting
+        // the host-side binding. This fences fabricated/cross-chat message ids.
+        const claimedChatId = await getMessageChatId(ds.larkAppId, msg.rootMessageId);
+        if (claimedChatId !== ds.chatId) {
+          logger.warn(`[${t}] Dropped deferred topic binding outside target chat`);
+          break;
+        }
+        writeDeferredTopicBinding(config.session.dataDir, {
+          sessionId: ds.session.sessionId,
+          turnId: run.turnId,
+          chatId: ds.chatId,
+          larkAppId: ds.larkAppId,
+          routingAnchor: run.routingAnchor,
+          rootMessageId: msg.rootMessageId,
+          createdAt: new Date().toISOString(),
+        });
+        logger.info(`[${t}] Deferred topic root recorded ${msg.rootMessageId.substring(0, 12)}`);
+        break;
+      }
+
       case 'bridge_source_session': {
         if (msg.bridge !== 'hermes') break;
         if (ds.worker !== worker) {
@@ -3140,6 +3194,11 @@ function setupWorkerHandlers(
           // The durable receipt remains non-terminal and can be reconciled;
           // never let a projection/store failure crash the worker IPC loop.
           logger.error(`[${t}] Failed to persist turn_terminal for ${msg.turnId.substring(0, 8)}: ${err.message}`);
+        }
+        try {
+          await cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'terminal' });
+        } catch (err: any) {
+          logger.error(`[${t}] Failed to settle deferred schedule turn ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
         break;
       }

@@ -69,6 +69,20 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out.some(s => s.startsWith('LARK_APP_SECRET='))).toBe(false);
   });
 
+  it('forwards BOTMUX_OWNER_OPEN_ID so custom CLI wrappers see the session owner in tmux panes', () => {
+    // The worker injects the standard owner key alongside the legacy
+    // __OWNER_OPEN_ID; like every injected key it only reaches the pane via
+    // this allowlist.
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_OWNER_OPEN_ID: 'ou_owner',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('BOTMUX_OWNER_OPEN_ID=ou_owner');
+    // Ownerless sessions (foreign-bot auto-create) don't set it → absent.
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('BOTMUX_OWNER_OPEN_ID='))).toBe(false);
+  });
+
   it('forwards CLAUDE_CODE_RESUME_TOKEN_THRESHOLD so the resume-summary bypass reaches the tmux pane (issue #62)', () => {
     // The worker injects this for claude-code to suppress Claude Code 2.1.x's
     // blocking resume-summary menu. Under the tmux backend it ONLY reaches the

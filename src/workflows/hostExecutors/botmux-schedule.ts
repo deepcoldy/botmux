@@ -8,7 +8,7 @@ import {
   IdempotencyConflictError,
 } from '../../services/schedule-store.js';
 import { computeInputHash } from '../../utils/canonical-input-hash.js';
-import type { ParsedSchedule } from '../../types.js';
+import type { ParsedSchedule, ScheduleExecutionPosition } from '../../types.js';
 import type { ProviderReconciler } from '../shared/provider-reconciler.js';
 import { PROVIDER_TTL_MS } from '../shared/provider-reconciler.js';
 import type { SideEffectingExecutor } from './types.js';
@@ -26,6 +26,8 @@ export type ScheduleInput = {
   chatType: 'group' | 'p2p';
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
+  executionPosition?: ScheduleExecutionPosition;
+  topicTitle?: string;
   larkAppId?: string;
   /** `repeat.completed` is intentionally absent — it's a runtime counter
    *  and must not be part of canonical input.  See schedule-store
@@ -61,6 +63,8 @@ const ScheduleInputSchema = z.object({
   chatType: z.enum(['group', 'p2p']).optional(),
   rootMessageId: z.string().optional(),
   scope: z.enum(['thread', 'chat']).optional(),
+  executionPosition: z.enum(['top-level', 'topic', 'new-topic']).optional(),
+  topicTitle: z.string().max(200).optional(),
   larkAppId: z.string().optional(),
   repeat: z.object({ times: z.number().int().positive().nullable() }).optional(),
   deliver: z.enum(['origin', 'local', 'new-topic']).optional(),
@@ -72,6 +76,13 @@ export function parseScheduleInput(input: unknown): ScheduleInput {
   const value = {
     ...parsed,
     chatType: parsed.chatType ?? 'group',
+    executionPosition: parsed.executionPosition
+      ?? (parsed.deliver === 'new-topic'
+        ? 'new-topic' as const
+        : parsed.scope === 'chat' ? 'top-level' as const : parsed.rootMessageId ? 'topic' as const : undefined),
+    topicTitle: parsed.topicTitle?.trim() || undefined,
+    scope: parsed.scope ?? (parsed.deliver === 'new-topic' ? 'chat' as const : undefined),
+    deliver: parsed.deliver === 'local' ? 'local' as const : 'origin' as const,
     // Raw authored/Saved Workflow input derives relative time exactly once at
     // host preparation. Re-validation receives the already-frozen `parsed`
     // sidecar value and therefore never reinterprets "30m" after a restart.
@@ -124,11 +135,11 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
         message: 'v3 schedule host does not support deliver=local in P0',
       };
     }
-    if (input.silent && input.deliver === 'new-topic') {
+    if (input.executionPosition === 'topic' && !input.rootMessageId) {
       return {
         ok: false,
-        errorCode: 'HOST_SCHEDULE_SILENT_NEW_TOPIC_CONFLICT',
-        message: 'silent schedules cannot use deliver=new-topic (a new topic requires a first message)',
+        errorCode: 'HOST_SCHEDULE_TOPIC_ROOT_REQUIRED',
+        message: 'topic execution requires rootMessageId',
       };
     }
     if (input.parsed.kind !== 'once') return { ok: true };
@@ -158,6 +169,8 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
       chatType: input.chatType,
       rootMessageId: input.rootMessageId,
       scope: input.scope,
+      executionPosition: input.executionPosition,
+      topicTitle: input.topicTitle?.trim() || undefined,
       larkAppId: input.larkAppId,
       repeat: input.repeat ? { times: input.repeat.times, completed: 0 } : undefined,
       deliver: input.deliver,

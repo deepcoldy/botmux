@@ -514,6 +514,37 @@ describe('Saved Workflow application service', () => {
     expect(existsSync(join(runsDir, 'missing-param-run'))).toBe(false);
   });
 
+  it('global saved workflow triggered by a non-owner pins the CURRENT actor as run owner (owner ≠ actor)', async () => {
+    // Regression pin for the chatBinding→worker-env chain (PR #552): the
+    // ownerOpenId a workflow CLI child will see under BOTMUX_OWNER_OPEN_ID is
+    // the authenticated actor of THIS run, never the definition creator.
+    const created = await createSavedWorkflow(dataDir, {
+      displayName: '全局周报',
+      owner: OWNER,
+      scope: { kind: 'global' },
+      revision: parameterizedRevision(),
+      publish: true,
+    });
+    expect(created.metadata.owner.openId).not.toBe(OTHER.openId);
+
+    const materialized = await instantiatePublishedSavedWorkflow({
+      dataDir,
+      ref: created.metadata.workflowId,
+      context: context(OTHER, 'oc_other_chat'),
+      rawParams: { city: { kind: 'string', value: '上海' } },
+      bots: [bot()],
+      baseDir: runsDir,
+      runId: 'global-actor-run',
+    });
+
+    expect(materialized.envelope.chatBinding).toMatchObject({
+      larkAppId: OTHER.larkAppId,
+      chatId: 'oc_other_chat',
+      ownerOpenId: OTHER.openId,
+    });
+    expect(materialized.envelope.chatBinding?.ownerOpenId).not.toBe(OWNER.openId);
+  });
+
   it.each(['group', 'p2p'] as const)(
     'carries authenticated %s chatType into a Saved Workflow schedule run',
     async (chatType) => {

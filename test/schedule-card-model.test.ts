@@ -3,11 +3,13 @@ import { describe, expect, it } from 'vitest';
 import type { ParsedSchedule } from '../src/types.js';
 import {
   computeButtonAvailability,
+  computeDeliveryButtonAvailability,
   computeNextNRuns,
   filterAndPaginateSchedules,
   filterSchedules,
   kindCounts,
   paginateSchedules,
+  resolveScheduleExecutionPlacement,
   toScheduleDetailDto,
   toScheduleRowDto,
   type ScheduleCardTaskInput,
@@ -184,6 +186,26 @@ describe('schedule-card-model · computeNextNRuns', () => {
 });
 
 describe('schedule-card-model · invariants', () => {
+  it('derives all three execution placements, including legacy fresh-topic rows', () => {
+    expect(resolveScheduleExecutionPlacement(makeTask({ scope: 'chat', rootMessageId: 'om_old' }))).toBe('chat');
+    expect(resolveScheduleExecutionPlacement(makeTask({ scope: 'thread', rootMessageId: 'om_root' }))).toBe('thread');
+    expect(resolveScheduleExecutionPlacement(makeTask({ executionPosition: 'top-level', rootMessageId: 'om_root' }))).toBe('chat');
+    expect(resolveScheduleExecutionPlacement(makeTask({ executionPosition: 'new-topic', rootMessageId: 'om_root' }))).toBe('new-topic');
+    expect(resolveScheduleExecutionPlacement(makeTask({ deliver: 'new-topic', rootMessageId: 'om_root' }))).toBe('new-topic');
+    expect(resolveScheduleExecutionPlacement(makeTask({ deliver: 'local' }))).toBe('local');
+  });
+
+  it('allows silent execution at every position, including lazy fresh topics', () => {
+    const topLevel = makeTask({ scope: 'chat', rootMessageId: 'om_root', silent: true });
+    expect(computeDeliveryButtonAvailability(topLevel, 'topic')).toEqual({ enabled: true });
+    expect(computeDeliveryButtonAvailability({ ...topLevel, rootMessageId: undefined }, 'topic'))
+      .toEqual({ enabled: false, reasonKey: 'schedules.action.delivery.topicRootRequired' });
+    const topic = makeTask({ scope: 'thread', rootMessageId: 'om_root', silent: true });
+    expect(computeDeliveryButtonAvailability(topic, 'top-level')).toEqual({ enabled: true });
+    expect(computeDeliveryButtonAvailability(topic, 'new-topic'))
+      .toEqual({ enabled: true });
+  });
+
   it('filter / paginate / toRow do not mutate the input list', () => {
     const tasks = [
       makeTask({ id: 'a', enabled: true, parsed: interval(15) }),

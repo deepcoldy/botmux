@@ -130,8 +130,8 @@ import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
-import type { DaemonToWorker, ScheduledTask, ParsedSchedule, Session } from '../types.js';
-import type { DaemonSession } from './types.js';
+import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
+import { sessionAnchorId, type DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 
@@ -1128,7 +1128,7 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
 
   let ds: ReturnType<typeof findActiveBySessionId> = undefined;
   for (const candidate of reg.values()) {
-    const candAnchor = candidate.scope === 'chat' ? candidate.chatId : candidate.session.rootMessageId;
+    const candAnchor = sessionAnchorId(candidate);
     if (candAnchor === sourceAnchor && candidate.larkAppId === cachedLarkAppId) {
       ds = candidate;
       break;
@@ -1241,6 +1241,9 @@ export interface ScheduleRow {
   workingDir: string;
   chatId: string;
   rootMessageId?: string;
+  scope?: 'thread' | 'chat';
+  executionPosition?: ScheduleExecutionPosition;
+  topicTitle?: string;
   larkAppId?: string;
   botName?: string;
   enabled: boolean;
@@ -1264,6 +1267,9 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     workingDir: t.workingDir,
     chatId: t.chatId,
     rootMessageId: t.rootMessageId,
+    scope: t.scope,
+    executionPosition: scheduler.resolveTaskExecutionPosition(t),
+    topicTitle: t.topicTitle,
     larkAppId: t.larkAppId,
     botName: getBotName(),
     enabled: t.enabled,
@@ -1290,9 +1296,24 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
 ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, false)));
 ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
-// Toggle delivery mode between 'origin' (reply in original thread) and
-// 'new-topic' (open a brand-new topic + fresh session on every fire).
-ipcRoute('POST', '/api/schedules/:id/delivery', (_req, res, p) => jsonRes(res, 200, scheduler.toggleDelivery(p.id)));
+// Backward-compatible route used by Lark cards and cached dashboard clients.
+// Modern callers send an exact target; body-less legacy callers keep the
+// historical toggle behavior, now cycling topic → top-level → fresh topic.
+ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const requested = body && typeof body === 'object'
+    ? (body as Record<string, unknown>).executionPosition
+    : undefined;
+  if (requested !== undefined) {
+    if (requested !== 'top-level' && requested !== 'topic' && requested !== 'new-topic') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
+    }
+    const result = scheduler.updateTask(p.id, { executionPosition: requested });
+    return jsonRes(res, 200, result.ok ? { ...result, executionPosition: requested } : result);
+  }
+  return jsonRes(res, 200, scheduler.toggleDelivery(p.id));
+});
 
 // Create a new scheduled task from the dashboard. chatId selects which chat
 // the task fires into; workingDir defaults to the daemon's cwd.
@@ -1309,6 +1330,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   const schedule = typeof b.schedule === 'string' ? b.schedule.trim() : '';
   const prompt = typeof b.prompt === 'string' ? b.prompt : '';
   const chatId = typeof b.chatId === 'string' ? b.chatId.trim() : '';
+  const rootMessageId = typeof b.rootMessageId === 'string' ? b.rootMessageId.trim() : '';
   // Validate silent type — if present, must be boolean (no silent degradation).
   let silent = false;
   if (b.silent !== undefined) {
@@ -1317,20 +1339,38 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
     }
     silent = b.silent;
   }
-  // `local` (log-only, no delivery) is not implemented in the executor —
-  // reject it from the dashboard API rather than silently degrading to origin.
+  let executionPosition: ScheduleExecutionPosition = 'top-level';
+  if (b.executionPosition !== undefined) {
+    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
+    }
+    executionPosition = b.executionPosition;
+  }
+  const topicTitle = typeof b.topicTitle === 'string' ? b.topicTitle.trim() : '';
+  if (b.topicTitle !== undefined && typeof b.topicTitle !== 'string') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'topicTitle' });
+  }
+  if (Array.from(topicTitle).length > 200) {
+    return jsonRes(res, 400, { ok: false, error: 'topic_title_too_long', field: 'topicTitle' });
+  }
+  // Legacy clients sending deliver:new-topic retain the historical meaning:
+  // open a fresh topic/session on every run.
   let deliver: 'origin' | 'new-topic' = 'origin';
   if (b.deliver !== undefined) {
     if (b.deliver !== 'origin' && b.deliver !== 'new-topic') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_deliver', field: 'deliver' });
     }
     deliver = b.deliver;
+    if (b.executionPosition === undefined && deliver === 'new-topic') executionPosition = 'new-topic';
   }
   // Validate required fields are present AND non-empty after trim.
   if (!name) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'name' });
   if (!schedule) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'schedule' });
   if (!prompt.trim()) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'prompt' });
   if (!chatId) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'chatId' });
+  if (executionPosition === 'topic' && !rootMessageId) {
+    return jsonRes(res, 400, { ok: false, error: 'topic_root_required', field: 'rootMessageId' });
+  }
   // Note: bot↔chat membership is intentionally NOT validated here.
   // listChatBotMembers returns [] both when the API is unavailable and when
   // no bot has been observed in the chat yet, so we cannot reliably tell
@@ -1345,7 +1385,10 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       prompt,
       workingDir: typeof b.workingDir === 'string' ? b.workingDir : process.cwd(),
       chatId,
-      scope: 'chat',
+      rootMessageId: rootMessageId || undefined,
+      scope: executionPosition === 'topic' ? 'thread' : 'chat',
+      executionPosition,
+      topicTitle: topicTitle || undefined,
       chatType: 'group',
       larkAppId: cachedLarkAppId,
       deliver,
@@ -1359,7 +1402,8 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   }
 });
 
-// Update editable fields of an existing task (name, prompt, schedule, deliver, silent).
+// Update editable fields of an existing task. Execution position is explicit;
+// topic execution requires a retained/provided topic root message id.
 ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
@@ -1370,6 +1414,7 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
   const updates: {
     name?: string; prompt?: string; schedule?: string;
     deliver?: 'origin' | 'new-topic'; silent?: boolean;
+    executionPosition?: ScheduleExecutionPosition; rootMessageId?: string; topicTitle?: string;
   } = {};
   // If a field is present, it must be the correct type and (for strings)
   // non-empty after trim — otherwise 400, never silently ignore.
@@ -1396,6 +1441,28 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
       return jsonRes(res, 400, { ok: false, error: 'invalid_deliver', field: 'deliver' });
     }
     updates.deliver = b.deliver;
+  }
+  if (b.executionPosition !== undefined) {
+    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
+    }
+    updates.executionPosition = b.executionPosition;
+  }
+  if (b.rootMessageId !== undefined) {
+    if (typeof b.rootMessageId !== 'string') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'rootMessageId' });
+    }
+    updates.rootMessageId = b.rootMessageId.trim();
+  }
+  if (b.topicTitle !== undefined) {
+    if (typeof b.topicTitle !== 'string') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'topicTitle' });
+    }
+    const topicTitle = b.topicTitle.trim();
+    if (Array.from(topicTitle).length > 200) {
+      return jsonRes(res, 400, { ok: false, error: 'topic_title_too_long', field: 'topicTitle' });
+    }
+    updates.topicTitle = topicTitle;
   }
   if (b.silent !== undefined) {
     if (typeof b.silent !== 'boolean') {

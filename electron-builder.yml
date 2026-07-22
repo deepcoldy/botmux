@@ -1,10 +1,13 @@
 appId: com.botmux.desktop
 productName: Botmux
+artifactName: ${productName}-${version}-mac-${arch}.${ext}
+npmRebuild: false
 extraMetadata:
   main: dist/desktop/main.cjs
 asar: true
 files:
   - dist/desktop/**
+  - '!node_modules/**'
 afterPack: build/after-pack.cjs
 mac:
   category: public.app-category.developer-tools

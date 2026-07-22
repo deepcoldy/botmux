@@ -22,7 +22,11 @@ dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 // hook-runner's CLI gate would then mistake the daemon for CLI context and
 // forward every hook event to the daemon itself (/api/hooks/emit) in an
 // infinite self-loop. Scrub unconditionally at boot.
-for (const k of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_CHAT_TYPE', 'BOTMUX_ROOT_MESSAGE_ID']) {
+// BOTMUX_OWNER_OPEN_ID / __OWNER_OPEN_ID additionally leak a stale *identity*:
+// v3 workflow workers spread this process's env into their spawn env, so a
+// restart issued from a bot session would otherwise pin that session's owner
+// onto every workflow CLI child.
+for (const k of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_CHAT_TYPE', 'BOTMUX_ROOT_MESSAGE_ID', 'BOTMUX_OWNER_OPEN_ID', '__OWNER_OPEN_ID']) {
   delete process.env[k];
 }
 // Same vector, session-level CLI data-root pointers (CLAUDE_CONFIG_DIR /
