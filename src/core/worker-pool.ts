@@ -2139,6 +2139,9 @@ export function forkWorker(
     // getSessionPersistentBackendType). A brand-new session (no stamp) resolves
     // from live config, so a dashboard backend switch only affects NEW sessions.
     backendType: resolvePairedSpawnBackendType(agentCfg.cliId, ds.session.backendType, botCfg.backendType, config.daemon.backendType),
+    // Shared Herdr is not derivable from sessionId: preserve the exact host +
+    // managed-agent affinity across daemon/worker replacement.
+    persistentBackendTarget: ds.session.persistentBackendTarget,
     backendConfig: botCfg.riff,
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,

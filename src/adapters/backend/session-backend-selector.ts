@@ -71,7 +71,13 @@ export interface SelectedSessionBackend {
   createdHerdrSessionName?: string;
 }
 
-export function selectSessionBackend(opts: { sessionId: string; backendType: BackendType; backendConfig?: RiffBackendConfig; reuseExistingHerdrSession?: boolean }): SelectedSessionBackend {
+export function selectSessionBackend(opts: {
+  sessionId: string;
+  backendType: BackendType;
+  backendConfig?: RiffBackendConfig;
+  reuseExistingHerdrSession?: boolean;
+  persistentBackendTarget?: PersistentBackendTarget;
+}): SelectedSessionBackend {
   if (opts.backendType === 'riff') {
     if (!opts.backendConfig) {
       throw new Error('riff backend requires backendConfig (baseUrl, etc.)');
@@ -109,6 +115,46 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
 
   if (opts.backendType === 'herdr') {
     const ownedSessionName = HerdrBackend.sessionName(opts.sessionId);
+    // A restarted worker must reattach to the SAME shared host selected by the
+    // prior generation. Re-running preferredRunningSession() here can pick a
+    // newly-current/default workspace, start a duplicate CLI there, and orphan
+    // the still-live managed agent in the recorded host. Isolation/MCP callers
+    // explicitly disable shared reuse, so they intentionally ignore this stamp
+    // and converge back to a bot-owned bmx-* session.
+    const recorded = opts.reuseExistingHerdrSession === false
+      ? undefined
+      : opts.persistentBackendTarget?.backendType === 'herdr'
+        && opts.persistentBackendTarget.agentName
+        ? opts.persistentBackendTarget
+        : undefined;
+    if (recorded) {
+      const hostProbe = HerdrBackend.probeSession(recorded.sessionName);
+      if (hostProbe === 'unknown') {
+        throw new Error(`recorded herdr session ${recorded.sessionName} probe inconclusive`);
+      }
+      if (hostProbe === 'exists') {
+        const agentProbe = HerdrBackend.probeAgent(recorded.sessionName, recorded.agentName!);
+        if (agentProbe === 'unknown') {
+          throw new Error(`recorded herdr agent ${recorded.sessionName}/${recorded.agentName} probe inconclusive`);
+        }
+        const reattach = agentProbe === 'exists';
+        return {
+          backend: new HerdrBackend(recorded.sessionName, {
+            agentName: recorded.agentName,
+            isReattach: reattach,
+            ownsSession: false,
+            ownsAgent: true,
+          }),
+          isTmuxMode: false,
+          isPipeMode: true,
+          isZellijMode: false,
+          persistentSessionName: recorded.sessionName,
+          persistentBackendTarget: recorded,
+          isReattach: reattach,
+        };
+      }
+    }
+
     if (HerdrBackend.hasSession(ownedSessionName)) {
       return {
         backend: new HerdrBackend(ownedSessionName, { isReattach: true }),

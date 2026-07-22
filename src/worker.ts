@@ -5920,6 +5920,7 @@ async function spawnCli(
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
+    persistentBackendTarget: cfg.persistentBackendTarget,
     // Isolation markers and MCP gateway hosts are scoped to a bot-owned
     // persistent session. Never risk their cold-resume path stopping a user's
     // shared herdr session.
@@ -6815,6 +6816,20 @@ async function spawnCli(
     }
   }
 
+  // Publish the exact selected resource BEFORE spawn. This both restores host
+  // affinity for later in-worker restarts and closes the crash window where a
+  // shared Herdr agent could be created but the daemon still knew only bmx-*.
+  // A failed spawn leaving an intent stamp is safe: lifecycle probes see the
+  // missing agent and close/cold-resume instead of leaking an untracked pane.
+  cfg.persistentBackendTarget = selectedBackend.persistentBackendTarget;
+  if (lastInitConfig) {
+    lastInitConfig.persistentBackendTarget = selectedBackend.persistentBackendTarget;
+  }
+  send({
+    type: 'persistent_backend_target',
+    target: selectedBackend.persistentBackendTarget,
+  });
+
   backend.spawn(spawnBin, spawnArgs, {
     cwd: spawnCwd,
     cols: PTY_COLS,
@@ -6822,16 +6837,6 @@ async function spawnCli(
     env: childEnv as Record<string, string>,
     injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
     launchShell: lastInitConfig?.launchShell,
-  });
-
-  // Publish the exact resource selected by this spawn immediately. In shared
-  // Herdr mode the daemon cannot derive the user's host session from the
-  // Botmux session id; persisting it lets worker-less restore/close/wake paths
-  // act on the managed agent instead of a nonexistent bmx-* session. Send on
-  // every in-worker respawn too, because selection may move to another host.
-  send({
-    type: 'persistent_backend_target',
-    target: selectedBackend.persistentBackendTarget,
   });
 
   if (selectedBackend.createdHerdrSessionName) {
