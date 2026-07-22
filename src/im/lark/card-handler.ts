@@ -1846,6 +1846,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.tuiPromptOptions = undefined;
           ds.tuiPromptMultiSelect = undefined;
           ds.tuiToggledIndices = undefined;
+          // If this click resolved a stuck-warning card, clear its marker too
+          if (ds.stuckWarningCardId && cardMessageId === ds.stuckWarningCardId) {
+            ds.stuckWarningCardId = undefined;
+          }
           publishAttentionPatch(ds);
           try { return JSON.parse(buildTuiPromptProcessingCard(finalText, locDs)); } catch { /* fall through */ }
         }

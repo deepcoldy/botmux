@@ -2590,6 +2590,7 @@ function setupWorkerHandlers(
         // CLI reached its prompt — any previously posted stuck warning is stale.
         // Clear it so the next unresolved turn can fire a fresh warning.
         ds.stuckWarningTurnId = undefined;
+        ds.stuckWarningCardId = undefined;
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
         // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
@@ -2925,18 +2926,17 @@ function setupWorkerHandlers(
 
       case 'stuck_warning': {
         // AI-free StuckDetector fired: a written input hasn't produced a
-        // completed turn within the timeout. Warn the user in-thread so they
-        // know the message was delivered but the CLI may be blocked (e.g.
-        // PreToolUse hook review, a [Y/n] prompt, a "Press any key" pause).
+        // completed turn within the timeout AND the PTY has been quiet.
+        // If we matched a known blocking pattern, post an interactive card
+        // so the user can dismiss it with one click (Enter/Esc). Otherwise
+        // post a lightweight text warning — no buttons, to avoid noise from
+        // possible false positives on long legitimate turns.
         if (ds.stuckWarningTurnId === msg.turnId) {
           logger.debug(`[${t}] Stuck warning already posted for turn ${msg.turnId}, skipping duplicate`);
           break;
         }
         ds.stuckWarningTurnId = msg.turnId;
         const secs = Math.round(msg.elapsedMs / 1000);
-        const pattern = msg.matchedPattern ? `\n检测到：${msg.matchedPattern}` : '';
-        const preview = msg.snapshot ? `\n\n终端快照（最近内容）：\n\`\`\`\n${msg.snapshot.slice(-1500)}\n\`\`\`` : '';
-        const text = `⚠️ CLI 似乎卡住了——消息已写入但 ${secs}s 未完成处理，可能在等确认。${pattern}${preview}\n\n可打开终端查看，或直接回复消息继续（会清除此告警）。`;
         logger.info(`[${t}] Stuck warning: turn unresolved for ${secs}s${msg.matchedPattern ? ` (${msg.matchedPattern})` : ''}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'stuck_warning',
@@ -2944,10 +2944,39 @@ function setupWorkerHandlers(
           matchedPattern: msg.matchedPattern,
         });
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
-        try {
-          await scopedReply(text, 'text', msg.turnId);
-        } catch (err: any) {
-          logger.warn(`[${t}] Failed to post stuck warning: ${err}`);
+        if (msg.matchedPattern) {
+          // Interactive card: one-click dismiss via Enter/Esc
+          const description = `⚠️ CLI 似乎卡住了——消息已写入但 ${secs}s 未完成处理。\n检测到：${msg.matchedPattern}\n\n选择操作以继续，或打开终端手动处理：`;
+          const options = [
+            { label: 'Enter', text: '按 Enter 继续', selected: false, type: 'confirm' as const, keys: ['Enter'] },
+            { label: 'Esc', text: '按 Esc 返回', selected: false, type: 'select' as const, keys: ['Escape'] },
+          ];
+          try {
+            const cardJson = buildTuiPromptCard(
+              sessionAnchorId(ds),
+              ds.session.sessionId,
+              description,
+              options,
+              false,
+              undefined,
+              loc,
+            );
+            const cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
+            ds.stuckWarningCardId = cardMsgId;
+            publishAttentionPatch(ds);
+          } catch (err: any) {
+            logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
+          }
+        } else {
+          // No pattern matched — could be a long legitimate turn or an unknown
+          // blocking state. Post a plain text warning without buttons.
+          const preview = msg.snapshot ? `\n\n终端快照（最近内容）：\n\`\`\`\n${msg.snapshot.slice(-1000)}\n\`\`\`` : '';
+          const text = `⚠️ CLI 似乎卡住了——消息已写入但 ${secs}s 未完成处理，且终端无输出。${preview}\n\n可打开终端查看，或直接回复消息继续（会清除此告警）。`;
+          try {
+            await scopedReply(text, 'text', msg.turnId);
+          } catch (err: any) {
+            logger.warn(`[${t}] Failed to post stuck warning: ${err}`);
+          }
         }
         break;
       }

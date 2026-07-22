@@ -20,7 +20,7 @@
  *  genuinely working. Matched against a recent terminal snapshot (ANSI-stripped). */
 const STUCK_PATTERNS: Array<{ re: RegExp; label: string }> = [
   { re: /hook needs review|needs review before it can run|PreToolUse hooks/i, label: 'hook review prompt' },
-  { re: /Press (space|enter|t|any key) to/i, label: 'key-press prompt' },
+  { re: /Press .+ to/i, label: 'key-press prompt' },
   { re: /\[(Y|y)\/(N|n)\]|\[Y\/n\]|\[y\/N\]/, label: 'yes/no confirmation' },
   { re: /trust all|review hooks/i, label: 'trust/review prompt' },
   { re: /Do you want to|Would you like to|Proceed\?|Continue\?/i, label: 'confirmation question' },

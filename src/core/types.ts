@@ -222,6 +222,8 @@ export interface DaemonSession {
   /** turnId of the last stuck_warning posted — dedup so we don't spam the
    *  thread with repeated warnings for the same unresolved turn. */
   stuckWarningTurnId?: string;
+  /** message_id of the stuck_warning interactive card (if active) */
+  stuckWarningCardId?: string;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;

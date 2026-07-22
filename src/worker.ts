@@ -3801,6 +3801,11 @@ function startStuckDetector(): void {
       // InflightInputTracker doesn't expose its queue length; peek via the
       // durable-turn gate which is set when a tracked write is in flight.
       if (!durableTurnInFlight && inflightInputsEmpty()) return false;
+      // Anti-false-positive: if the PTY produced output recently the CLI is
+      // still actively working (model streaming, tool output, spinner) — not
+      // stuck. Require quiescence before firing.
+      const sincePty = Date.now() - lastPtyActivityAtMs;
+      if (sincePty < 15_000) return false;
       return true;
     },
     onStuck: (elapsedMs, matchedLabel) => {
