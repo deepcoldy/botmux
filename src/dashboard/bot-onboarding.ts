@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
-import { existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
@@ -72,6 +73,8 @@ export interface BotOnboardingSnapshot {
   appId?: string;
   appName?: string;
   registrationMode?: 'web' | 'compat';
+  /** Existing onboarding job whose exact App permission setup is being resumed. */
+  recoveryOfJobId?: string;
   brand?: 'feishu' | 'lark';
   // 实际写入的 CLI / 工作目录, 供前端完成页回显
   cliId?: string;
@@ -174,6 +177,16 @@ interface PersistedPendingOnboardingStore {
   version: 1;
   jobs: PersistedPendingOnboardingJob[];
 }
+
+export type StartPermissionRecoveryResult =
+  | { ok: true; job: BotOnboardingJob }
+  | {
+      ok: false;
+      error:
+        | 'permission_recovery_target_missing'
+        | 'permission_recovery_target_ambiguous'
+        | 'permission_recovery_target_invalid';
+    };
 
 export type BotOnboardingSessionStatus =
   | { status: 'ready'; source: string; identity: FeishuWebSessionIdentity }
@@ -327,6 +340,68 @@ export class BotOnboardingManager {
       });
     });
     return { id, done };
+  }
+
+  /**
+   * Resume only Open Platform authorization for one already-persisted Space
+   * Agent. The exact neutral working directory is the durable target anchor:
+   * zero or multiple matching bots fail closed, and this path never creates an
+   * App, registers another Bot, or changes bots.json.
+   */
+  startPermissionRecovery(input: {
+    workingDir: string;
+    predecessorJobId: string;
+  }): StartPermissionRecoveryResult {
+    const candidates = readBotsJsonOrEmpty(this.opts.botsJsonPath).flatMap((bot: any, index) => {
+      if (
+        !bot
+        || typeof bot !== 'object'
+        || bot.cliId !== 'traex'
+        || bot.defaultWorkingDir !== input.workingDir
+      ) {
+        return [];
+      }
+      const appId = typeof bot.larkAppId === 'string' ? bot.larkAppId.trim() : '';
+      if (!appId || !Array.isArray(bot.allowedUsers) || !hasOwnerEntry(bot.allowedUsers)) return [];
+      return [{ appId, brand: bot.brand === 'lark' ? 'lark' as const : 'feishu' as const, index }];
+    });
+    if (candidates.length === 0) return { ok: false, error: 'permission_recovery_target_missing' };
+    if (candidates.length !== 1) return { ok: false, error: 'permission_recovery_target_ambiguous' };
+    if (!input.predecessorJobId || !input.workingDir) {
+      return { ok: false, error: 'permission_recovery_target_invalid' };
+    }
+
+    const existing = [...this.jobs.values()].find(job =>
+      job.recoveryOfJobId === input.predecessorJobId
+      && job.workingDir === input.workingDir,
+    );
+    if (existing) {
+      return { ok: true, job: { id: existing.id, done: Promise.resolve() } };
+    }
+
+    const target = candidates[0];
+    const id = `botperm_${Math.random().toString(36).slice(2)}_${this.now().toString(36)}`;
+    const createdAt = this.now();
+    this.jobs.set(id, {
+      id,
+      status: 'starting',
+      createdAt,
+      updatedAt: createdAt,
+      appId: target.appId,
+      brand: target.brand,
+      cliId: 'traex',
+      workingDir: input.workingDir,
+      registrationMode: 'compat',
+      recoveryOfJobId: input.predecessorJobId,
+    });
+    const done = this.runPermissionRecovery(id, target.appId, target.brand, target.index).catch(err => {
+      this.patch(id, {
+        status: 'failed',
+        error: 'permission_recovery_failed',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    });
+    return { ok: true, job: { id, done } };
   }
 
   get(id: string): BotOnboardingSnapshot | undefined {
@@ -585,8 +660,21 @@ export class BotOnboardingManager {
       workingDir: meta.workingDir,
     });
 
+    const callbacks = {
+      onQrCode: (info: { qrText: string; qrPayload: string }) => {
+        this.patch(id, {
+          status: 'waiting_for_platform_scan',
+          platformQrDataUrl: this.renderQrDataUrl(info.qrPayload),
+        });
+      },
+      onStatus: (msg: string) => {
+        // onStatus follows onQrCode while polling; keep the QR visible.
+        this.patch(id, { permissionStatusMsg: msg });
+      },
+    };
+
     try {
-      return await this.automateOpenPlatform({
+      const first = await this.automateOpenPlatform({
         appId,
         brand,
         // The Feishu primary path must never surprise the user with a second
@@ -594,19 +682,25 @@ export class BotOnboardingManager {
         // manual recovery. Only explicit compatibility mode may scan again.
         disableQrLogin: meta.registrationMode === 'web',
         disableBytedcliFallback: meta.registrationMode === 'web',
-        onQrCode: info => {
-          this.patch(id, {
-            status: 'waiting_for_platform_scan',
-            platformQrDataUrl: this.renderQrDataUrl(info.qrPayload),
-          });
-        },
-        onStatus: msg => {
-          // 只更新进度文案, 不动 status——onStatus 在 onQrCode 之后的轮询里就会
-          // 触发 ('等待飞书扫码'), 若把 status 拨回 configuring_permissions 会瞬间
-          // 把刚弹出的第二个二维码 (waiting_for_platform_scan) 盖掉.
-          this.patch(id, { permissionStatusMsg: msg });
-        },
+        ...callbacks,
       });
+      if (
+        first.ok
+        || meta.registrationMode !== 'compat'
+        || first.reason !== 'owner_session_mismatch'
+      ) {
+        return first;
+      }
+
+      // The SDK scanner owns the new App, while the shared Open Platform cookie
+      // may belong to another operator. Re-authenticate the exact owner without
+      // creating another App or overwriting the global cookie jar.
+      const sessionFilePath = join(
+        dirname(this.opts.botsJsonPath),
+        'onboarding-sessions',
+        `${id}.json`,
+      );
+      return await this.runOwnerPermissionAutomation(id, appId, brand, callbacks, sessionFilePath);
     } catch (err) {
       // automation 不应抛 (内部已结构化返回), 兜底当作失败 → 手动步骤.
       return {
@@ -614,6 +708,53 @@ export class BotOnboardingManager {
         reason: 'api_error',
         message: err instanceof Error ? err.message : String(err),
       };
+    }
+  }
+
+  private async runPermissionRecovery(
+    id: string,
+    appId: string,
+    brand: 'feishu' | 'lark',
+    addedBotIndex: number,
+  ): Promise<void> {
+    this.patch(id, { status: 'configuring_permissions' });
+    const sessionFilePath = join(dirname(this.opts.botsJsonPath), 'onboarding-sessions', `${id}.json`);
+    const auto = await this.runOwnerPermissionAutomation(id, appId, brand, {
+      onQrCode: (info: { qrText: string; qrPayload: string }) => {
+        this.patch(id, {
+          status: 'waiting_for_platform_scan',
+          platformQrDataUrl: this.renderQrDataUrl(info.qrPayload),
+        });
+      },
+      onStatus: (msg: string) => this.patch(id, { permissionStatusMsg: msg }),
+    }, sessionFilePath);
+    if (!auto.ok) {
+      this.finalizePermissions(id, appId, brand, addedBotIndex, auto, 'completed');
+      this.patch(id, { status: 'failed', error: 'permission_recovery_failed' });
+      return;
+    }
+    this.finalizePermissions(id, appId, brand, addedBotIndex, auto, 'completed');
+  }
+
+  private async runOwnerPermissionAutomation(
+    id: string,
+    appId: string,
+    brand: 'feishu' | 'lark',
+    callbacks: Pick<OpenPlatformAutomationOptions, 'onQrCode' | 'onStatus'>,
+    sessionFilePath: string,
+  ): Promise<OpenPlatformAutomationResult> {
+    try {
+      return await this.automateOpenPlatform({
+        appId,
+        brand,
+        sessionFilePath,
+        forceQrLogin: true,
+        disableQrLogin: false,
+        disableBytedcliFallback: true,
+        ...callbacks,
+      });
+    } finally {
+      rmSync(sessionFilePath, { force: true });
     }
   }
 

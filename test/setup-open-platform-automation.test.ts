@@ -612,6 +612,29 @@ describe('automateOpenPlatformSetup', () => {
     expect(readStoredCookiesFromSessionFile(sessionFile)?.find(c => c.name === 'session')?.value).toBe('fresh-cookie');
   });
 
+  it('classifies an exact app access denial as an owner-session mismatch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-owner-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_owner"</script>', { status: 200 });
+      if (href.includes('/scope/all/')) {
+        return Response.json({ code: 10003, msg: '无权限访问' }, { status: 403 });
+      }
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_owner',
+      sessionFilePath: sessionFile,
+      fetchImpl,
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: 'owner_session_mismatch' });
+  });
+
   it('returns login failure so setup can fall back to manual steps without aborting', async () => {
     const fetchImpl = (async () => {
       throw new Error('login down');

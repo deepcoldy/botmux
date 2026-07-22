@@ -132,6 +132,7 @@ export type OpenPlatformAutomationResult =
         | 'qr_expired'
         | 'timeout'
         | 'missing_csrf'
+        | 'owner_session_mismatch'
         | 'scope_mapping_failed'
         | 'network'
         | 'api_error';
@@ -153,7 +154,7 @@ export interface OpenPlatformAutomationOptions {
   sessionFilePath?: string;
   bytedcliFallbackSessionFilePath?: string;
   disableBytedcliFallback?: boolean;
-  /** Ignore cached sessions and require a fresh QR login. */
+  /** Ignore any shared cached account and require the exact App owner to scan. */
   forceQrLogin?: boolean;
   /** Reuse a valid cache or fail instead of presenting another QR. */
   disableQrLogin?: boolean;
@@ -674,7 +675,12 @@ export async function automateOpenPlatformSetup(
   try {
     allScopesPayload = await postJson(`/developers/v1/scope/all/${options.appId}`);
   } catch (err: any) {
-    return { ok: false, reason: 'api_error', message: `读取开放平台 scope 列表失败: ${safeErrorMessage(err)}`, sessionFile };
+    return {
+      ok: false,
+      reason: openPlatformOwnerAccessDenied(err) ? 'owner_session_mismatch' : 'api_error',
+      message: `读取开放平台 scope 列表失败: ${safeErrorMessage(err)}`,
+      sessionFile,
+    };
   }
 
   const manifest = options.scopeManifest ?? readDefaultScopeManifest();
@@ -1580,6 +1586,12 @@ export class OpenPlatformApiError extends Error {
   constructor(message: string, readonly payload: unknown) {
     super(message);
   }
+}
+
+function openPlatformOwnerAccessDenied(error: unknown): boolean {
+  if (!(error instanceof OpenPlatformApiError)) return false;
+  const payload = asRecord(error.payload);
+  return payload.code === 10003;
 }
 
 class FeishuWebSessionError extends Error {

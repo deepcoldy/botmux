@@ -676,6 +676,144 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('forces a command-scoped owner QR when the shared session cannot access the compat app', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-owner-session-'));
+    const gate = deferred<void>();
+    const calls: Array<Parameters<NonNullable<ConstructorParameters<typeof BotOnboardingManager>[0]['automateOpenPlatform']>>[0]> = [];
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      registerApp: async () => ({
+        ok: true,
+        appId: 'cli_owner',
+        appSecret: 'secret',
+        brand: 'feishu',
+        userOpenId: 'ou_owner',
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async (opts) => {
+        calls.push(opts);
+        if (calls.length === 1) {
+          return {
+            ok: false,
+            reason: 'owner_session_mismatch',
+            message: 'the cached account cannot manage this exact app',
+          };
+        }
+        await opts.onQrCode?.({ qrText: 'ascii', qrPayload: '{"qrlogin":{"token":"owner"}}' });
+        await gate.promise;
+        return { ...autoOk(), sessionSource: 'qr_login' };
+      },
+      renderQrDataUrl: payload => `data:image/svg+xml;base64,${Buffer.from(payload).toString('base64')}`,
+    });
+
+    const job = manager.start({ registrationMode: 'compat', cliId: 'traex', workingDir: dir });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatchObject({ disableQrLogin: false, disableBytedcliFallback: false });
+    expect(calls[0].forceQrLogin).toBeUndefined();
+    expect(calls[1]).toMatchObject({
+      forceQrLogin: true,
+      disableQrLogin: false,
+      disableBytedcliFallback: true,
+    });
+    expect(calls[1].sessionFilePath).toMatch(/onboarding-sessions\/[^/]+\.json$/);
+    expect(manager.get(job.id)).toMatchObject({
+      status: 'waiting_for_platform_scan',
+      platformQrDataUrl: expect.stringContaining('data:image/svg+xml;base64,'),
+    });
+
+    gate.resolve();
+    await job.done;
+    expect(manager.get(job.id)?.permission).toMatchObject({ ok: true });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('recovers permissions for the exact existing bot without creating or registering another app', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-permission-recovery-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_existing_owner',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+    }]));
+    const gate = deferred<void>();
+    const createApp = vi.fn();
+    const registerApp = vi.fn();
+    const calls: Array<Parameters<NonNullable<ConstructorParameters<typeof BotOnboardingManager>[0]['automateOpenPlatform']>>[0]> = [];
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      createApp,
+      registerApp,
+      automateOpenPlatform: async (opts) => {
+        calls.push(opts);
+        await opts.onQrCode?.({ qrText: 'ascii', qrPayload: '{"qrlogin":{"token":"recover"}}' });
+        await gate.promise;
+        return { ...autoOk(), sessionSource: 'qr_login' };
+      },
+      renderQrDataUrl: payload => `data:image/svg+xml;base64,${Buffer.from(payload).toString('base64')}`,
+    });
+
+    const started = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(createApp).not.toHaveBeenCalled();
+    expect(registerApp).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      appId: 'cli_existing_owner',
+      forceQrLogin: true,
+      disableQrLogin: false,
+      disableBytedcliFallback: true,
+    });
+    expect(calls[0].sessionFilePath).toMatch(/onboarding-sessions\/[^/]+\.json$/);
+    expect(manager.get(started.job.id)).toMatchObject({
+      status: 'waiting_for_platform_scan',
+      appId: 'cli_existing_owner',
+      cliId: 'traex',
+      workingDir,
+      registrationMode: 'compat',
+      recoveryOfJobId: 'bot_original',
+    });
+
+    gate.resolve();
+    await started.job.done;
+    expect(manager.get(started.job.id)).toMatchObject({
+      status: 'completed',
+      addedBotIndex: 0,
+      permission: { ok: true },
+    });
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))).toHaveLength(1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('fails closed when permission recovery cannot resolve exactly one existing bot', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-permission-recovery-ambiguous-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([
+      { larkAppId: 'cli_one', cliId: 'traex', defaultWorkingDir: workingDir, allowedUsers: ['owner@example.com'] },
+      { larkAppId: 'cli_two', cliId: 'traex', defaultWorkingDir: workingDir, allowedUsers: ['owner@example.com'] },
+    ]));
+    const automateOpenPlatform = vi.fn();
+    const manager = new BotOnboardingManager({ botsJsonPath, automateOpenPlatform });
+
+    expect(manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+    })).toEqual({ ok: false, error: 'permission_recovery_target_ambiguous' });
+    expect(automateOpenPlatform).not.toHaveBeenCalled();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('still adds the bot but falls back to manual steps when auto-permission fails', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-'));
     const manager = new BotOnboardingManager({

@@ -3202,6 +3202,30 @@ const server = createServer(async (req, res) => {
       });
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
     }
+    if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/recover-permissions') {
+      let parsed: { workingDir?: unknown; predecessorJobId?: unknown };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8');
+        parsed = raw ? JSON.parse(raw) : {};
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const workingDir = typeof parsed.workingDir === 'string' ? parsed.workingDir.trim() : '';
+      const predecessorJobId = typeof parsed.predecessorJobId === 'string' ? parsed.predecessorJobId.trim() : '';
+      if (!workingDir || !predecessorJobId || invalidWorkingDirs({ workingDir }).length > 0) {
+        return jsonRes(res, 400, { ok: false, error: 'permission_recovery_target_invalid' });
+      }
+      const recovered = botOnboarding.startPermissionRecovery({ workingDir, predecessorJobId });
+      if (!recovered.ok) {
+        const status = recovered.error === 'permission_recovery_target_missing' ? 404
+          : recovered.error === 'permission_recovery_target_ambiguous' ? 409
+            : 400;
+        return jsonRes(res, status, recovered);
+      }
+      return jsonRes(res, 202, { job: botOnboarding.get(recovered.job.id) });
+    }
     let mOwner: RegExpMatchArray | null;
     if (req.method === 'POST' && (mOwner = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)\/owner$/))) {
       // needs_owner 状态下用户手动提交 owner：扫码人身份验证不了时的兜底入口。
