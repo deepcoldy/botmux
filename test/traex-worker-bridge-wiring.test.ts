@@ -38,4 +38,14 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(follower).toContain('persistCliSessionId(observed.cliSessionId);');
     expect(follower).toContain('codexBridgeNotifyCliSessionId(observed.cliSessionId);');
   });
+
+  it('does not silently swallow completed TRAE turns whose final text is empty', () => {
+    const start = workerSource.indexOf('function emitReadyCodexTurns');
+    const end = workerSource.indexOf('\n}\n\nfunction stopCodexBridge', start);
+    const body = workerSource.slice(start, end);
+
+    expect(body).toContain('shouldEmitEmptyCompletedBridgeFallback');
+    expect(body).toContain('emptyCompletedBridgeFallbackContent()');
+    expect(body).not.toContain('if (!turn.finalText) continue;');
+  });
 });

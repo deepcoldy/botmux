@@ -732,6 +732,7 @@ export const messages: Record<string, string> = {
   'worker.crash_recent_output': 'Recent terminal output:',
   'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
+  'worker.empty_final_completed': '⚠️ {cliName} reported this turn as completed, but botmux did not capture final text from the terminal transcript and did not observe a successful botmux send for this turn. Open the web terminal to inspect the last output, or resend a message to continue the session.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': 'First create a Lark app at: https://open.feishu.cn/app',
