@@ -45,6 +45,7 @@ vi.mock('node:os', () => ({
 }));
 
 import { execFileSync, execSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import {
   discoverAdoptableSessions,
   validateAdoptTarget,
@@ -380,27 +381,37 @@ describe('validateAdoptTarget (herdr branch)', () => {
   });
 
   it('rejects a restored PID when its persisted process-birth identity differs', () => {
-    const procStart = readProcessStartIdentity(process.pid);
-    expect(procStart).toBeTruthy();
-    installHerdrFixture({
-      sessions: [{ name: 'work', running: true }],
-      agentsBySession: { work: [{ pane_id: '1-1', agent: 'pi' }] },
-      processInfoByPane: {
-        '1-1': { foreground_processes: [{ pid: process.pid, name: 'pi' }] },
-      },
-    });
-    const base = {
-      source: 'herdr' as const,
-      herdrSessionName: 'work',
-      herdrPaneId: '1-1',
-      originalCliPid: process.pid,
-      cliId: 'pi' as const,
-      cwd: '/x',
-      paneCols: 200,
-      paneRows: 50,
-    };
-    expect(validateAdoptTargetState({ ...base, originalCliProcStart: procStart })).toBe('alive');
-    expect(validateAdoptTargetState({ ...base, originalCliProcStart: `${procStart}-reused` })).toBe('missing');
+    // Keep this deterministic on both Linux and macOS: the suite mocks fs and
+    // child_process for Herdr, so asking the host `ps` for process.pid would be
+    // unavailable on macOS even though production supports it.
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+    vi.mocked(readFileSync).mockReturnValue(`test (${process.pid}) ${Array(20).fill('4242').join(' ')}` as any);
+    try {
+      const procStart = readProcessStartIdentity(process.pid);
+      expect(procStart).toBe('4242');
+      installHerdrFixture({
+        sessions: [{ name: 'work', running: true }],
+        agentsBySession: { work: [{ pane_id: '1-1', agent: 'pi' }] },
+        processInfoByPane: {
+          '1-1': { foreground_processes: [{ pid: process.pid, name: 'pi' }] },
+        },
+      });
+      const base = {
+        source: 'herdr' as const,
+        herdrSessionName: 'work',
+        herdrPaneId: '1-1',
+        originalCliPid: process.pid,
+        cliId: 'pi' as const,
+        cwd: '/x',
+        paneCols: 200,
+        paneRows: 50,
+      };
+      expect(validateAdoptTargetState({ ...base, originalCliProcStart: procStart })).toBe('alive');
+      expect(validateAdoptTargetState({ ...base, originalCliProcStart: `${procStart}-reused` })).toBe('missing');
+    } finally {
+      if (platformDescriptor) Object.defineProperty(process, 'platform', platformDescriptor);
+    }
   });
 
   it("returns 'missing' when sessionName or paneId is absent", () => {
