@@ -184,6 +184,7 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 - `botmux quoted <message_id>` — 用户用引用 UI @ 机器人时，按需读取被引用的那条消息
 - `botmux bots list` — 查询当前群聊的机器人及 open_id
 - `botmux schedule` — 增删改查定时任务
+- `botmux session close-self` — 在 checkpoint / 回执完成后安全、原子地关闭当前逻辑会话；不接受目标 session ID，调用后应立即退出
 - `botmux-workflow` — 用自然语言或 `/workflow` 编排有界多步任务；成功 run 可保存为 Saved Workflow 并复用
 
 这些能力通过 `--append-system-prompt` 注入和 Skill 描述自动引导 agent 使用。Skill + CLI 的组合相比 Anthropic 官方 Telegram channel 那套 MCP 方案：CLI 启动不用做 MCP 握手、不占用工具列表 token，且对 Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot 通用 —— 只要 CLI 能读 system prompt 跑 shell 命令就行，不依赖任何 MCP 协议支持。

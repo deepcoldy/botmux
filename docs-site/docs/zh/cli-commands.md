@@ -42,3 +42,12 @@ session 信息通过祖先进程标记自动推断，agent 直接调：
 | `botmux history [--limit N]` | 拉会话历史（JSON） |
 | `botmux quoted <message_id>` | 拉被引用的单条消息（JSON） |
 | `botmux schedule add/list/remove/pause/resume/run` | 管理定时任务 |
+| `botmux session close-self` | 安全、原子地关闭当前逻辑会话（不接受目标 ID） |
+
+### 安全自关闭
+
+`botmux session close-self` 只在运行中的 Botmux 会话内可用。命令以当前轮次的 action-scoped capability 证明调用方身份，由 daemon 从 capability 反查唯一会话；请求体不携带也不接受 `sessionId`、机器人 ID 或其他目标选择器。
+
+daemon 会先同步提交逻辑关闭屏障（持久化 `closed`、撤销能力、移除路由），再返回成功并异步清理 worker、后端桥接和订阅。因此同一群聊或话题的下一条消息会创建全新的 Botmux 会话和 provider 会话，不会 resume 已关闭的 provider session。接入（adopt）的会话只断开 Botmux 桥接，不会杀掉用户自己的 tmux pane。
+
+只应在结果 checkpoint、回执或交接信息已经持久化后调用；成功调用后必须立即退出，不再发送消息或执行其他副作用。完全相同的已提交重试会返回 `alreadyClosed`，不会重复执行关闭副作用。

@@ -42,3 +42,12 @@ Session info is inferred automatically from ancestor-process markers, so the age
 | `botmux history [--limit N]` | Pull the session history (JSON) |
 | `botmux quoted <message_id>` | Pull a single quoted message (JSON) |
 | `botmux schedule add/list/remove/pause/resume/run` | Manage scheduled tasks |
+| `botmux session close-self` | Safely and atomically close the current logical session (no target ID accepted) |
+
+### Safe self-close
+
+`botmux session close-self` is available only inside a running Botmux session. It proves the caller with an action-scoped capability for the current turn, and the daemon resolves the one matching session from that capability. The request carries and accepts no `sessionId`, bot ID, or other target selector.
+
+The daemon first commits a synchronous logical-close barrier (persist `closed`, revoke authority, and remove the route), then returns success and asynchronously cleans up the worker, backend bridge, and subscriptions. The next message in the same chat or thread therefore creates a fresh Botmux session and provider session instead of resuming the closed provider session. Adopted sessions only detach the Botmux bridge; the user's tmux pane is not killed.
+
+Call it only after the result checkpoint, receipt, or handoff has been persisted. A successful call must be the caller's final action. An exact retry of an already committed request returns `alreadyClosed` without repeating close side effects.

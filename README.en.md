@@ -329,6 +329,7 @@ When a CLI spawns inside a botmux session it automatically gets
 - `botmux quoted <message_id>` — when the user @ed the bot via Lark's quote-reply UI, fetch the quoted message on demand
 - `botmux bots list` — discover bots + their `open_id`s
 - `botmux schedule` — manage scheduled tasks
+- `botmux session close-self` — safely and atomically close only the current logical session after its checkpoint/receipt; it accepts no target session ID and must be the caller's final action
 - `botmux-workflow` — orchestrate bounded multi-step work with natural language or `/workflow`, then save successful runs for reuse
 
 These capabilities are wired via `--append-system-prompt` and Skill

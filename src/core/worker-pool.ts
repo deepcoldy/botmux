@@ -1456,15 +1456,142 @@ function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number
   });
 }
 
-// ─── Idempotent session close (dashboard IPC) ───────────────────────────────
+// ─── Session close paths ────────────────────────────────────────────────────
+
+export interface CommittedSessionSelfClose {
+  sessionId: string;
+  session: DaemonSession;
+}
 
 /**
- * Idempotent close: kill worker if alive, mark Session status='closed' + closedAt,
- * publish session.exited (if a live worker was killed) and session.update
- * (if the persistence row transitioned to closed).
- *
- * Calling this on an unknown sessionId, an already-closed session, or a session
- * whose worker died asynchronously must still resolve with `{ ok: true }`.
+ * Synchronously commit the self-close barrier. There is deliberately no
+ * `await` in this function: once it returns, routing cannot find the old
+ * DaemonSession, persistence says `closed`, and lifecycle observers have seen
+ * the same transition. Slow worker/backend/subscription cleanup happens only
+ * after the HTTP response is handed off.
+ */
+export function commitSessionSelfClose(ds: DaemonSession): CommittedSessionSelfClose {
+  const sessionId = ds.session.sessionId;
+  if (findActiveBySessionId(sessionId) !== ds) {
+    throw new Error('self-close session lost active ownership before commit');
+  }
+  if (!sessionStore.getSession(sessionId)) {
+    throw new Error('self-close session is missing its persistence row');
+  }
+
+  restartCounts.delete(sessionId);
+  recordUsageForDaemonSession(ds);
+  // Persistence is synchronous. Complete it before mutating the live route so
+  // an ENOSPC/EACCES failure leaves the caller retryable instead of creating a
+  // route-less but non-durable half-close. No inbound message can interleave in
+  // this same event-loop turn.
+  const previousStatus = ds.session.status;
+  const previousClosedAt = ds.session.closedAt;
+  const previousDashboardAttachments = ds.session.dashboardAttachments;
+  const previousQueuedAttachments = ds.session.queuedAttachments;
+  try {
+    sessionStore.closeSession(sessionId);
+  } catch (err) {
+    // session-store mutates its in-memory row before the atomic file write. If
+    // that write fails, restore the live row so the capability remains usable
+    // for a clean retry instead of exposing a half-closed in-memory session.
+    ds.session.status = previousStatus;
+    ds.session.closedAt = previousClosedAt;
+    ds.session.dashboardAttachments = previousDashboardAttachments;
+    ds.session.queuedAttachments = previousQueuedAttachments;
+    throw err;
+  }
+  const after = sessionStore.getSession(sessionId);
+  if (after?.status !== 'closed') {
+    throw new Error('self-close persistence did not reach closed state');
+  }
+  // Revoke authority and evict the route before publishing lifecycle events.
+  // The worker is intentionally still alive until post-response cleanup, but
+  // it can no longer authorize IPC or receive a newly-routed chat turn.
+  ds.managedTurnOrigin = undefined;
+  activeSessionsRegistry?.delete(activeSessionKey(ds));
+
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: {
+      sessionId,
+      patch: {
+        status: 'closed',
+        closedAt: after?.closedAt ? Date.parse(after.closedAt) : Date.now(),
+        tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null,
+      },
+    },
+  });
+  if (!ds.exitEventEmitted) {
+    ds.exitEventEmitted = true;
+    dashboardEventBus.publish({
+      type: 'session.exited',
+      body: { sessionId, reason: 'self-close' },
+    });
+    emitSessionLifecycleHook(ds, 'session.exit', {
+      reason: 'self-close',
+      source: 'self-close',
+    });
+  }
+  logger.info(
+    `[session-close] action=self-close sessionId=${sessionId} `
+    + `larkAppId=${ds.larkAppId} scope=${ds.scope} adopted=${Boolean(ds.adoptedFrom)} `
+    + 'barrier=committed',
+  );
+  return { sessionId, session: ds };
+}
+
+/**
+ * Complete process/backend and external subscription teardown after the
+ * logical barrier. Cleanup failures are observable but never roll a closed
+ * session back to active. Adopted backends are safe because killWorker's
+ * destroy path detaches their bridge without killing the user-owned pane.
+ */
+export async function cleanupCommittedSessionSelfClose(
+  committed: CommittedSessionSelfClose,
+): Promise<void> {
+  const { sessionId, session: ds } = committed;
+  let workerCleanup = 'ok';
+  try {
+    killWorker(ds);
+  } catch (err: any) {
+    workerCleanup = `failed:${err?.message ?? err}`;
+    logger.warn(
+      `[session-close] action=self-close sessionId=${sessionId} `
+      + `worker_cleanup=${workerCleanup}`,
+    );
+  }
+
+  let subscriptionCleanup = 'ok';
+  try {
+    const anchor = sessionAnchorId(ds);
+    const subs = listDocSubscriptionsForSession(config.session.dataDir, ds.larkAppId, anchor);
+    for (const sub of subs) {
+      if (sub.managedBy !== 'watch-comment') {
+        await unsubscribeDocFile(ds.larkAppId, {
+          fileToken: sub.fileToken,
+          fileType: sub.fileType,
+        });
+      }
+      removeDocSubscription(config.session.dataDir, ds.larkAppId, sub.fileToken);
+    }
+  } catch (err: any) {
+    subscriptionCleanup = `failed:${err?.message ?? err}`;
+    logger.warn(
+      `[session-close] action=self-close sessionId=${sessionId} `
+      + `subscription_cleanup=${subscriptionCleanup}`,
+    );
+  }
+
+  logger.info(
+    `[session-close] action=self-close sessionId=${sessionId} `
+    + `worker_cleanup=${workerCleanup} subscription_cleanup=${subscriptionCleanup}`,
+  );
+}
+
+/**
+ * Idempotent dashboard close: kill worker if alive, mark Session closed, and
+ * publish lifecycle updates. Unknown/already-closed ids remain successful.
  */
 export async function closeSession(
   sessionId: string,

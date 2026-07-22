@@ -64,7 +64,19 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker } from './worker-pool.js';
+import {
+  cleanupCommittedSessionSelfClose,
+  closeSession,
+  commitSessionSelfClose,
+  deliverWriteLinkCardToOwners,
+  findActiveBySessionId,
+  forkWorker,
+  getActiveSessionsRegistry,
+  killWorker,
+  listActiveSessions,
+  suspendWorker,
+  transferSession,
+} from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
@@ -127,6 +139,10 @@ import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
+import {
+  authorizeSessionSelfClose,
+  recordCommittedSessionSelfClose,
+} from './session-self-close.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
@@ -233,6 +249,10 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
   if (method === 'POST' && pathname === '/api/asks') return true;
+  // Session self-close accepts only an action-domain-separated capability and
+  // derives its target from the matching live origin. The handler never trusts
+  // loopback, host HMAC, or a caller-selected session id as self identity.
+  if (method === 'POST' && pathname === '/api/sessions/self/close') return true;
   // botmux slash / botmux cd（角色切换）：合法调用方是会话内的 CLI 自身，沙箱 /
   // 读隔离下读不到 host secret。两个 handler 内验证该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
@@ -318,6 +338,84 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
   const closed = sessionStore.listSessions().find(s => s.sessionId === params.sessionId);
   if (closed) return jsonRes(res, 200, { session: composeRowFromClosed(closed) });
   jsonRes(res, 404, { error: 'not_found' });
+});
+
+ipcRoute('POST', '/api/sessions/self/close', async (req, res) => {
+  const body = await readJsonBody<Record<string, unknown>>(req)
+    .catch(() => ({} as Record<string, unknown>));
+  const authorization = authorizeSessionSelfClose(body, listActiveSessions());
+  if (!authorization.ok) {
+    logger.warn(
+      `[session-self-close] capability=denied reason=${authorization.reason}`,
+    );
+    return jsonRes(res, 403, {
+      ok: false,
+      accepted: false,
+      error: 'self_close_denied',
+    });
+  }
+
+  if (authorization.alreadyClosed) {
+    const stored = sessionStore.getSession(authorization.sessionId);
+    logger.info(
+      `[session-self-close] capability=idempotent sessionId=${authorization.sessionId} `
+      + `larkAppId=${stored?.larkAppId ?? '-'} scope=${stored?.scope ?? '-'} `
+      + 'barrier=committed alreadyClosed=true',
+    );
+    return jsonRes(res, 200, {
+      ok: true,
+      accepted: true,
+      sessionId: authorization.sessionId,
+      alreadyClosed: true,
+    });
+  }
+
+  const ds = authorization.session;
+  let committed: ReturnType<typeof commitSessionSelfClose>;
+  try {
+    committed = commitSessionSelfClose(ds);
+  } catch (err: any) {
+    logger.error(
+      `[session-self-close] capability=accepted sessionId=${ds.session.sessionId} `
+      + `larkAppId=${ds.larkAppId} scope=${ds.scope} barrier=failed `
+      + `reason=${err?.message ?? err}`,
+    );
+    return jsonRes(res, 503, {
+      ok: false,
+      accepted: false,
+      error: 'close_barrier_failed',
+    });
+  }
+
+  recordCommittedSessionSelfClose(authorization.claim, committed.sessionId);
+  logger.info(
+    `[session-self-close] capability=accepted sessionId=${committed.sessionId} `
+    + `larkAppId=${ds.larkAppId} scope=${ds.scope} barrier=committed`,
+  );
+
+  // Do not kill the caller while its acceptance response is still being
+  // handed to the loopback socket. `finish` fires after res.end() has flushed
+  // to the kernel; `close` covers an abruptly disconnected caller. The guard
+  // keeps backend/lifecycle cleanup single-shot.
+  let cleanupStarted = false;
+  const startCleanup = (): void => {
+    if (cleanupStarted) return;
+    cleanupStarted = true;
+    void cleanupCommittedSessionSelfClose(committed).catch((err: any) => {
+      logger.error(
+        `[session-self-close] sessionId=${committed.sessionId} `
+        + `cleanup=failed reason=${err?.message ?? err}`,
+      );
+    });
+  };
+  res.once('finish', startCleanup);
+  res.once('close', startCleanup);
+  jsonRes(res, 200, {
+    ok: true,
+    accepted: true,
+    sessionId: committed.sessionId,
+    alreadyClosed: false,
+  });
 });
 
 ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {

@@ -16,6 +16,7 @@
  *   botmux list --plain   — plain table output (for piping / scripts)
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
+ *   botmux session close-self — atomically close only the calling session
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
  *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
@@ -30,6 +31,7 @@ import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
+import { deriveSessionSelfCloseCapability } from './core/session-self-close.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
@@ -4506,6 +4508,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   schedule run <id>                    标记立即执行
 
 飞书消息（在 CLI 会话内自动推断 session）:
+  session close-self                   安全、原子地关闭当前逻辑会话（不接受目标 ID）
   send [content]                       发消息到当前话题（支持 stdin / --content-file）
        --images <path>                 内联图片（可重复）
        --files <path>                  附件（可重复）
@@ -7897,6 +7900,97 @@ async function cmdHook(cliId: string): Promise<void> {
   process.exit(0);
 }
 
+// ─── botmux session close-self ────────────────────────────────────────────────
+//
+// The daemon commits a logical barrier before it acknowledges this final-action
+// command. Identity comes only from the current managed-turn origin; no target
+// session id is accepted or sent.
+async function cmdSessionCloseSelf(args: string[]): Promise<void> {
+  if (args.length > 0) {
+    console.error('用法: botmux session close-self');
+    console.error('close-self 只能关闭当前会话，不接受 sessionId 或其他目标参数。');
+    process.exitCode = 2;
+    return;
+  }
+
+  const context = findAncestorSessionContext();
+  const sessionId = context?.sessionId ?? process.env.BOTMUX_SESSION_ID;
+  const larkAppId = process.env.BOTMUX_LARK_APP_ID;
+  if (!sessionId || !larkAppId) {
+    console.error('✗ 无法定位当前 botmux 会话；close-self 只能在运行中的会话内调用。');
+    process.exitCode = 1;
+    return;
+  }
+
+  const origin = readManagedOriginCapability(
+    resolveDataDir(),
+    sessionId,
+    process.env.BOTMUX_SEND_RELAY,
+  );
+  const turnId = origin?.turnId ?? context?.turnId ?? process.env.BOTMUX_TURN_ID;
+  const envAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
+  const dispatchAttempt = origin?.dispatchAttempt
+    ?? context?.dispatchAttempt
+    ?? (Number.isSafeInteger(envAttempt) && envAttempt > 0 ? envAttempt : undefined);
+  if (!origin || !turnId) {
+    console.error('✗ 当前轮次的 self-close capability 缺失或已过期。');
+    process.exitCode = 1;
+    return;
+  }
+
+  // Select only the owning daemon. Descriptor discovery is preferred on the
+  // host; isolated sessions use the port injected by their own worker. Never
+  // fall back to the first online daemon in a multi-bot deployment.
+  let discoveredPort: number | undefined;
+  try { discoveredPort = findDaemon(larkAppId)?.ipcPort; } catch { /* masked registry */ }
+  const ipcPort = resolveDaemonIpcPort(
+    discoveredPort,
+    process.env.BOTMUX_DAEMON_IPC_PORT,
+  );
+  if (!ipcPort) {
+    console.error('✗ 找不到当前会话所属的 botmux daemon。');
+    process.exitCode = 1;
+    return;
+  }
+
+  const init = {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      capability: deriveSessionSelfCloseCapability(origin.capability),
+      turnId,
+      ...(dispatchAttempt !== undefined
+        ? { dispatchAttempt }
+        : {}),
+    }),
+  } satisfies RequestInit;
+
+  try {
+    // This endpoint intentionally never uses the trusted-host secret. Its only
+    // authority is the current turn's action-domain-separated capability.
+    const res = await fetch(`http://127.0.0.1:${ipcPort}/api/sessions/self/close`, init);
+    const body = await res.json().catch(() => ({})) as {
+      ok?: boolean;
+      accepted?: boolean;
+      sessionId?: string;
+      alreadyClosed?: boolean;
+      error?: string;
+    };
+    if (res.ok && body.ok && body.accepted) {
+      console.log(
+        body.alreadyClosed
+          ? `✓ 会话已经关闭: ${body.sessionId ?? sessionId}`
+          : `✓ 会话关闭已提交: ${body.sessionId ?? sessionId}`,
+      );
+      return;
+    }
+    console.error(`✗ self-close 被拒绝: ${body.error ?? `HTTP ${res.status}`}`);
+  } catch (err: any) {
+    console.error(`✗ self-close 请求失败: ${err?.message ?? err}`);
+  }
+  process.exitCode = 1;
+}
+
 // ─── botmux session-ready ─────────────────────────────────────────────────────
 //
 // Claude 家族（claude/seed）的 SessionStart hook 客户端。Claude 在 TUI 输入框
@@ -9038,6 +9132,16 @@ switch (command) {
   case 'suspend': await cmdSuspend(); break;
   case 'slash':   await cmdSlash(); break;
   case 'cd':      await cmdCd(); break;
+  case 'session': {
+    const sub = process.argv[3] ?? '';
+    if (sub !== 'close-self') {
+      console.error('用法: botmux session close-self');
+      process.exitCode = 2;
+      break;
+    }
+    await cmdSessionCloseSelf(process.argv.slice(4));
+    break;
+  }
   case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'ask': {
